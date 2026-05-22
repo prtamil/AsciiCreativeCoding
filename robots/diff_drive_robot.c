@@ -42,11 +42,30 @@
  *   §3  color        — HUD/HINT plus per-element semantic pairs
  *   §4  coords       — pixel↔cell aspect-ratio bridge
  *   §5  trail        — ring buffer of recent positions
- *   §6  robot        — the heart: state, kinematics, integration
- *   §7  scene        — input → command translation, tick orchestration
- *   §8  render       — draw the robot, wheels, arrows, trail, HUD
+ *   §6  robot        — Pose + WheelSpeeds + Commands sub-structs;
+ *                       Robot root (pose + wheels + cmd + trail + axle);
+ *                       compute_wheels (inverse kin) + step_pose
+ *                       (forward kin) + robot_tick orchestrator
+ *   §7  scene        — World + InputState + SimControls sub-structs;
+ *                       Scene root (world + robot + input + sim);
+ *                       scene_init / _resize / _tick + scene_apply_keys
+ *                       split into apply_full_stop +
+ *                       apply_throttle_ramp_or_decay +
+ *                       apply_turn_ramp_or_decay +
+ *                       apply_spin_in_place_override +
+ *                       clamp_commands_to_physical_limits
+ *   §8  render       — draw the robot, wheels, arrows, trail, HUD;
+ *                       WheelPositions + compute_wheel_positions;
+ *                       render_robot split into paint_glyph_at_cell +
+ *                       paint_heading_arrow + paint_wheel_label;
+ *                       render_hud split into body_linear_velocity +
+ *                       body_angular_velocity +
+ *                       instantaneous_turn_radius_px +
+ *                       radians_to_degrees + format_hud_status +
+ *                       draw_hud_status + draw_hud_hint
  *   §9  screen       — ncurses init / present / HUD spec
- *   §10 app          — signals, resize, variable-dt main loop
+ *   §10 app          — FpsCounter + App; signals, resize, key dispatch,
+ *                       variable-dt main loop (7 numbered phases)
  *
  * Keys:
  *   q / Q / ESC      quit
@@ -91,11 +110,18 @@
  *                 turns those into `vL`, `vR`; (1) turns those into
  *                 a new pose. That's the entire physics loop.
  *
- * Data-structure: One Robot struct holds the pose (px, py, theta),
- *                 the two wheel speeds (vL, vR), the user's command
- *                 inputs (v_cmd, w_cmd), the constant axle width,
- *                 and a ring-buffer Trail of past positions. No
- *                 heap allocation post-init.
+ * Data-structure: Scene = World + Robot + InputState + SimControls,
+ *                 each a named sub-struct (see §7 for the layered-
+ *                 ownership diagram).  Robot itself decomposes into
+ *                 Pose (px, py, θ) + WheelSpeeds (vL, vR) + Commands
+ *                 (v_cmd, w_cmd) + a ring-buffer Trail + the constant
+ *                 axle (§6).  The three Robot sub-structs mirror the
+ *                 kinematic pipeline:
+ *
+ *                   user keys → cmd → wheels → pose
+ *                              (inverse kin)  (forward kin)
+ *
+ *                 No heap allocation post-init.
  *
  * Rendering     : Painter's order with the body always on top.
  *                 Trail dots first (oldest → newest), then wheel
@@ -109,19 +135,78 @@
  *                 Microseconds. ncurses redraw is the dominant
  *                 cost.
  *
- * References    :
- *   Wikipedia, "Differential wheeled robot" — formulas, geometry,
- *     real-world examples.
- *     https://en.wikipedia.org/wiki/Differential_wheeled_robot
- *   Wikipedia, "Nonholonomic system" — why a diff-drive robot
- *     cannot slide sideways even though its wheels are
- *     independent. (A car parallel-parking is the same constraint.)
- *     https://en.wikipedia.org/wiki/Nonholonomic_system
- *   Siegwart, Nourbakhsh & Scaramuzza, "Introduction to Autonomous
- *     Mobile Robots" (MIT Press, 2nd ed.) — chapter 3 covers
- *     differential drive in depth.
- *   This project, robots/walking_robot.c — the legged contrast:
- *     pose comes from foot positions instead of wheel speeds.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── REFERENCES ───────────────────────────────────────────────────────── *
+ *
+ *   ── Differential-drive kinematics (the math in §6) ─────────────
+ *   [1] Wikipedia, "Differential wheeled robot" — formulas, geometry,
+ *       real-world examples (Roomba, tank-style RC, etc.).  Concise
+ *       summary of the same (v, ω) ↔ (vL, vR) maps this file
+ *       implements.
+ *       https://en.wikipedia.org/wiki/Differential_wheeled_robot
+ *   [2] Siegwart, R., Nourbakhsh, I. & Scaramuzza, D. (2011),
+ *       "Introduction to Autonomous Mobile Robots" (2nd ed.), MIT
+ *       Press, Ch. 3 — the textbook reference for differential-
+ *       drive kinematics.  §3.2.2 (pose representation), §3.2.4
+ *       (inverse + forward kinematics) map directly onto this
+ *       file's Pose, Commands, WheelSpeeds sub-structs (§6).
+ *   [3] LaValle, S. M. (2006), "Planning Algorithms", Cambridge
+ *       University Press, §13.1.2 — the UNICYCLE MODEL.  Our (v, ω)
+ *       command pair IS the unicycle's state; the (vL, vR) wheel-
+ *       speed primitives are one realisation.  Free online at
+ *       https://lavalle.pl/planning/
+ *
+ *   ── Why a diff-drive robot can't slide sideways ────────────────
+ *   [4] Wikipedia, "Nonholonomic system" — explains why the robot
+ *       has 3-DOF in CONFIGURATION (x, y, θ) but only 2-DOF in
+ *       VELOCITY (forward + turn).  A car parallel-parking is the
+ *       same constraint.  Without this constraint, the robot
+ *       could just translate sideways — and the simulation would
+ *       lose its character.
+ *       https://en.wikipedia.org/wiki/Nonholonomic_system
+ *   [5] Dudek, G. & Jenkin, M. (2010), "Computational Principles of
+ *       Mobile Robotics" (2nd ed.), Cambridge University Press,
+ *       §4.2 — wheel-speed primitives + nonholonomic constraints
+ *       in the same chapter, from a computational angle.
+ *
+ *   ── Euler integration (the per-tick step_pose math) ────────────
+ *   [6] Hairer, E., Lubich, C. & Wanner, G. (2006), "Geometric
+ *       Numerical Integration" (2nd ed.), Springer — explicit-Euler
+ *       reference.  §6 step_pose uses plain forward Euler:
+ *           x += v · cos(θ) · dt
+ *           y += v · sin(θ) · dt
+ *           θ += ω · dt
+ *       This is non-symplectic but the system has no stiff terms
+ *       (no inertia, ω is prescribed directly), so drift is
+ *       imperceptible at the dt = 1/60 s frame budget.
+ *
+ *   ── Variable-timestep game loop ────────────────────────────────
+ *   [7] Fiedler, G. (2004, updated 2014), "Fix Your Timestep!",
+ *       https://gafferongames.com/post/fix_your_timestep/ — the
+ *       canonical case for FIXED-step physics.  This file
+ *       deliberately uses VARIABLE dt: the diff-drive ODE is
+ *       non-stiff and unconditionally stable under forward Euler.
+ *       Fiedler's DT_CAP rule (100 ms hard cap, DT_CAP_SEC here)
+ *       is the only piece we adopt.
+ *
+ *   ── ncurses rendering substrate ────────────────────────────────
+ *   [8] Raymond, E. S., "NCURSES Programming HOWTO" — §6 (colour
+ *       pairs) for per-element semantic colouring (body / wheels /
+ *       arrows / trail), §11 (output options) for the wnoutrefresh
+ *       + doupdate diff-only write pattern.
+ *
+ *   ── Companion files in this project ────────────────────────────
+ *   See also:
+ *     robots/walking_robot.c       — the LEGGED contrast: pose comes
+ *       from foot positions instead of wheel speeds.  Read this
+ *       second to see how the kinematic pipeline changes when the
+ *       contact model changes.
+ *     animation/hexpod_tripod.c    — 6-leg insect locomotion (gait
+ *       coordination on top of leg kinematics).
+ *     physics/stroke_engine.c      — slider-crank kinematics
+ *       (similar idea: gears/wheels drive position via a
+ *       parametric curve).
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -279,97 +364,6 @@
  *           θ = π/2    → faces DOWN   (+y)
  *           ω > 0      → CLOCKWISE on screen (because y is down)
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Wheel speed clamping. Each wheel is independently capped at
- *    ±V_MAX in `compute_wheels`. If both v_cmd and w_cmd are at
- *    their limits, one wheel would saturate; the clamp ensures
- *    neither goes outside its physical limit even though the
- *    commanded motion may not be exactly achieved.
- *
- *  • Heading wrap-around. After integration, θ may be ±10000° if
- *    you spin for a long time. Wrap into (−π, π] every step so
- *    HUD readout (in degrees) stays sensible and atan2 / lerp
- *    don't drift.
- *
- *  • Toroidal wrap. When the robot leaves the edge it reappears
- *    on the opposite side. Without this it would be hard to
- *    test because long drives go off-screen and you lose it.
- *
- *  • Variable-dt stability. Forward Euler with dt up to 100 ms is
- *    stable here because v and ω are bounded; the worst-case arc
- *    error per step is O((ω·dt)²) — a fraction of a pixel.
- *
- *  • Coordinate convention: y is DOWN. Don't get caught by the
- *    "perpendicular to heading" mistake — in y-down,
- *        left  = ( +sin θ, −cos θ )
- *        right = ( −sin θ, +cos θ )
- *    The math-textbook formulas (which assume y-up) are flipped.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Press W and hold. The yellow heading arrow stays straight; the
- *    body slides along it. The trail forms a straight line. HUD
- *    shows v rising to V_MAX, ω = 0, R = INF.
- *
- *  • Press W and D simultaneously. Body curves right. HUD shows
- *    v > 0, ω > 0, R > 0. Trail is a smooth arc.
- *
- *  • Release D, keep W. ω fades back to 0 over ~0.5 sec; the curve
- *    straightens out.
- *
- *  • Press E (spin right). Body rotates clockwise without
- *    translating. HUD: v = 0, ω = +W_MAX, R = 0. Trail is a single
- *    dot.
- *
- *  • Press space. Robot stops mid-motion. HUD: v = 0, ω = 0.
- *
- *  • Stopwatch test: at v = V_MAX = 180 px/s, the robot crosses a
- *    100-cell-wide screen (= 800 px) in 800/180 ≈ 4.4 sec.
- *
- *  • In-place spin: at ω = W_MAX = 3 rad/s, full rotation (2π) takes
- *    2π/3 ≈ 2.1 sec. Time it.
- *
- *  • Wheel arrow test: hold E. Right wheel arrow turns green
- *    pointing forward (vR > 0); left wheel arrow turns red pointing
- *    backward (vL < 0). They have equal magnitude.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. This is the FOUNDATIONAL robotics file in the
- *      project — read it first if robotics kinematics are new.
- *      walking_robot, moving_jump_spring_leg_robot, perlin_terrain_bot
- *      all assume you understand pose (px, py, theta) integration.
- *   2. §6 robot — THE HEART of this file. Forward kinematics +
- *      inverse kinematics + Euler integration. Read AFTER tutorials
- *      T1-T5 below.
- *   3. §7 scene — input → command translation. The keyboard handler
- *      converts presses into commanded (v_cmd, w_cmd) which §6 then
- *      turns into wheel speeds.
- *   4. §8 render — painter's-order draw with trail, wheel arrows,
- *      heading arrow, and labels.
- *   5. §1-§5, §9-§10 — config / clock / colour / coords / trail /
- *      screen / app loop. Skim if you've seen the framework.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   px, py            body position in pixel space (Vec2 floats).
- *   theta             body heading in radians (0 = +X, π/2 = +Y).
- *   vL, vR            wheel speeds — pixels per second, signed
- *                     (negative = reverse).
- *   v                 body speed = (vL + vR) / 2.
- *   omega             body angular velocity = (vR - vL) / axle.
- *   axle              constant distance between wheel centres.
- *   v_cmd, w_cmd      USER COMMANDS — what the user wants. Differ
- *                     from (v, omega) by an exponential ramp.
- *   V_MAX, W_MAX      command saturation limits.
- *   V_RATE, W_RATE    ramp rates — how fast cmds change per second.
- *   ICC               instantaneous centre of curvature (T3 below).
  *
  * Background you need
  * ───────────────────
@@ -390,216 +384,6 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Five tutorials that build a differential-drive robot from
- * first principles.
- *
- *   T1  Two wheels, no steering — what "differential" means
- *   T2  Forward kinematics — wheels in, body motion out
- *   T3  Inverse kinematics — body command in, wheels out
- *   T4  The nonholonomic constraint — why robots can't slide sideways
- *   T5  Command ramping — separating WANT from CAN
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  TWO WHEELS, NO STEERING — WHAT "DIFFERENTIAL" MEANS
- * ───────────────────────────────────────────────────────
- * A car has FOUR wheels and a STEERING WHEEL. The steering
- * wheel turns the front wheels left/right relative to the body;
- * gas controls all four wheels' rotational speed equally.
- *
- * A differential-drive robot has TWO WHEELS, no steering. Each
- * wheel can be controlled INDEPENDENTLY. Steering is purely
- * the result of running the wheels at different speeds.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │  vL = vR        →   straight                     │
- *      │  vL > vR        →   turn right                   │
- *      │  vL < vR        →   turn left                    │
- *      │  vL = -vR       →   spin in place                │
- *      │  vL = 0, vR > 0 →   pivot around left wheel      │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * "Differential" = "the difference between vR and vL is what
- * causes turning." NOT "differential gear" (which is a
- * mechanical part of cars). The naming is an unfortunate
- * collision.
- *
- * Real-world examples:
- *   - Roomba: two driven wheels + caster wheels for stability.
- *   - Tank-style RC toys: same principle scaled up with treads.
- *   - Power wheelchair: joystick input → independent wheel
- *     speeds.
- *   - Many small lab robots: simple, cheap, agile.
- *
- * Two wheels are SIMPLER to control than four (no steering
- * mechanics) and ROOM-EFFICIENT (small turn radius — can spin
- * in place). They lose to cars on rough terrain (wheels can
- * slip on uneven ground) but win in flat indoor environments.
- *
- * T2  FORWARD KINEMATICS — WHEELS IN, BODY MOTION OUT
- * ───────────────────────────────────────────────────
- * Given vL and vR (current wheel speeds), how does the body
- * move?
- *
- * Two scalars come out:
- *
- *     v     = (vL + vR) / 2          ← linear speed of body centre
- *     omega = (vR - vL) / axle        ← angular speed of body
- *
- * Why these formulas? Treat each wheel as a point at distance
- * axle/2 from the body centre. The body's centre moves at the
- * AVERAGE of the two wheel velocities. The body's rotation
- * rate is the DIFFERENCE between the wheel velocities, divided
- * by the perpendicular distance separating them (= axle).
- *
- * Then standard rigid-body integration:
- *
- *     px += v · cos(theta) · dt
- *     py += v · sin(theta) · dt
- *     theta += omega · dt
- *
- * "Walk forward by v·dt in the direction theta points; rotate
- * by omega·dt." Three lines, the entire integrator.
- *
- * Note: this is FORWARD EULER integration. For high speeds or
- * tight turns it can drift slightly; production robotics uses
- * RUNGE-KUTTA or exact arc integration. At our terminal frame
- * rates the drift is invisible.
- *
- * T3  INVERSE KINEMATICS — BODY COMMAND IN, WHEELS OUT
- * ────────────────────────────────────────────────────
- * The user thinks in BODY COMMANDS: "go forward at speed v,
- * turn right at rate omega." NOT in wheel speeds.
- *
- * Inverse kinematics: given (v, omega), what (vL, vR) achieve
- * them? Solve T2's two equations for vL, vR:
- *
- *     v     = (vL + vR) / 2          →   vL + vR = 2v
- *     omega = (vR - vL) / axle       →   vR - vL = omega · axle
- *
- *     vL = v - omega · axle / 2
- *     vR = v + omega · axle / 2
- *
- * This is THE SECOND HALF of the loop. The user's input gives
- * (v_cmd, w_cmd); inverse kinematics turns those into wheel
- * speeds (vL, vR); forward kinematics integrates wheel speeds
- * into the new pose.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   user input        commanded     wheel       new pose │
- *      │   (keys)        →   (v, omega) →  speeds   →   (px, py, θ) │
- *      │                                                  │
- *      │                     INVERSE KIN     FORWARD KIN  │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * Both directions are TRIVIAL ALGEBRA — no iterative solver,
- * no matrix inversion. That's why diff drive is the simplest
- * mobile-robot kinematic model and a good first lesson.
- *
- * ICC — INSTANTANEOUS CENTRE OF CURVATURE
- * ────────────────────────────────────────
- * When omega ≠ 0, the body follows a circular arc. The centre
- * of that circle (the "ICC") lies on the EXTENSION of the axle
- * line, at distance R from the body centre:
- *
- *     R = v / omega
- *
- *     R > 0   →   ICC is on the LEFT of the body
- *     R < 0   →   ICC is on the RIGHT
- *     R = 0   →   ICC is AT THE BODY CENTRE → spin in place
- *     R = ∞   →   no ICC → straight line
- *
- * The CLOSER WHEEL to the ICC moves slower (it's tracing a
- * smaller circle); the FARTHER wheel moves faster. For pivot
- * (vL = 0, vR > 0), ICC sits at the LEFT WHEEL — that wheel
- * is stationary, the right wheel sweeps the arc.
- *
- * T4  THE NONHOLONOMIC CONSTRAINT — WHY ROBOTS CAN'T SLIDE SIDEWAYS
- * ─────────────────────────────────────────────────────────────────
- * Wheels ROLL — they don't slide laterally. The body of a
- * differential-drive robot can ONLY MOVE IN THE DIRECTION ITS
- * WHEELS ARE POINTING. It cannot translate sideways without
- * first rotating to face that direction.
- *
- * Mathematically:
- *
- *     ẋ · sin θ  −  ẏ · cos θ  =  0        (lateral velocity = 0)
- *
- * "The component of velocity perpendicular to the heading is
- * always zero." This is automatic given our forward kinematics:
- *
- *     ẋ = v · cos θ
- *     ẏ = v · sin θ
- *
- * Substituting: v · cos θ · sin θ − v · sin θ · cos θ = 0. ✓
- *
- * This constraint is called NONHOLONOMIC. Practical
- * consequences:
- *
- *   - Parallel parking is hard. To shift a car body sideways
- *     by 1 metre, you need a sequence of forward + reverse +
- *     turn + forward arcs. There's no "side-step" command.
- *
- *   - Path planning is harder than for omnidirectional robots.
- *     The set of reachable poses from a given start grows
- *     more slowly because of the heading constraint.
- *
- *   - In simulation, you DON'T NEED to enforce the constraint
- *     explicitly — it falls out of the forward kinematics.
- *
- * Compare to OMNIDIRECTIONAL robots (mecanum wheels, omni
- * wheels, holonomic platforms): they CAN slide in any
- * direction independent of heading. Their kinematics have an
- * additional vy term not aligned with theta. Easier to plan,
- * harder to build, more expensive.
- *
- * For 99% of indoor robotics, diff drive (nonholonomic) is the
- * right answer.
- *
- * T5  COMMAND RAMPING — SEPARATING WANT FROM CAN
- * ──────────────────────────────────────────────
- * If the user pressed W and we instantly set v = V_MAX, the
- * robot would JUMP to top speed and back to 0 when released.
- * That's both unrealistic and visually jarring.
- *
- * The fix: separate the user's INTENDED COMMAND (`v_cmd`) from
- * the actual current command. Each frame:
- *
- *     while W is held:
- *       v_cmd += V_RATE · dt
- *     while no throttle key:
- *       v_cmd ramps toward 0 with exponential decay
- *     clamp v_cmd to [-V_MAX, V_MAX]
- *
- * Same for w_cmd with the A/D keys. The result: the robot
- * SMOOTHLY ACCELERATES and SMOOTHLY DECELERATES. Press-and-
- * hold ramps up; release coasts down.
- *
- * V_RATE, W_RATE, V_MAX, W_MAX are knobs:
- *
- *     V_MAX     fastest possible body speed
- *     V_RATE    seconds to reach V_MAX from zero (lower = snappier)
- *     W_MAX     fastest spin rate
- *     W_RATE    seconds to reach W_MAX
- *
- * The "instant spin in place" keys (Z, E) bypass the ramp:
- * they set v_cmd = 0 and w_cmd = ±W_MAX directly. Useful for
- * quick rotations.
- *
- * Lesson: real control systems separate WANTED state from
- * ACTUAL state, with rate limits between them. This is the
- * minimum — production controllers add PID, model
- * compensation, and acceleration profiling. But the basic
- * pattern (cmd → ramped command → physics) is the same
- * everywhere from car cruise control to drone autopilots.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -814,13 +598,63 @@ static inline float clampf(float v, float lo, float hi)
 /* ===================================================================== */
 
 /*
- * Trail keeps the last TRAIL_CAP positions, sampled every
- * TRAIL_SAMPLE_STEP frames so the visible trail stretches further
- * for the same memory budget.
+ * Trail — circular ring buffer of the robot's recent positions.
  *
- * `head` is the index of the NEXT write slot. After the buffer
- * fills, `head` wraps and the oldest entry becomes the next slot
- * to be overwritten — a classic circular buffer.
+ * Intent
+ *   Renders as the fading dot trail behind the robot.  Stores the
+ *   last TRAIL_CAP positions, sampled every TRAIL_SAMPLE_STEP
+ *   frames so the VISIBLE trail length stretches further for the
+ *   same memory budget (sampling at 1/N the frame rate makes the
+ *   trail N× longer in time).
+ *
+ *   Two parallel float arrays (`px[]`, `py[]`) instead of a single
+ *   `Vec2[]` because the read path (render_trail) iterates each
+ *   axis independently — saving one indirection per cell in the
+ *   inner draw loop.
+ *
+ * Why a ring buffer (not a fixed-length array + memmove)
+ *   • O(1) push: just write at `head` and bump.  memmove would be
+ *     O(TRAIL_CAP) per frame — wasteful when only the LATEST entry
+ *     changes.
+ *   • Constant memory: the buffer never grows; old entries are
+ *     silently overwritten by new ones (the "forgetting" is implicit).
+ *   • Wrap-aware iteration: render_trail walks `(head - 1 - k +
+ *     TRAIL_CAP) % TRAIL_CAP` to read newest-first.
+ *
+ * Why subsample (TRAIL_SAMPLE_STEP > 1)
+ *   At 60 fps with TRAIL_CAP = 64, raw 1-sample-per-frame gives a
+ *   trail covering ~1 second of motion — too short to read as a
+ *   trajectory.  TRAIL_SAMPLE_STEP = 4 gives ~4 seconds without
+ *   enlarging the buffer.  Trade: trail dots are placed at
+ *   slightly coarser intervals (fine — render_trail's age-based
+ *   fade hides the discrete spacing).
+ *
+ * Members
+ *   px[TRAIL_CAP]  Past x positions in pixel space, ring-buffered.
+ *   py[TRAIL_CAP]  Past y positions, parallel to px[].
+ *   head           Index of the NEXT write slot.  After the buffer
+ *                  fills, `head` wraps and the oldest entry becomes
+ *                  the next slot to overwrite.
+ *   count          Number of valid entries (∈ [0, TRAIL_CAP]).
+ *                  Grows from 0 to TRAIL_CAP on startup; stays at
+ *                  TRAIL_CAP once the buffer is full.
+ *   skip           Frames since last sample.  When it reaches
+ *                  TRAIL_SAMPLE_STEP, the next position is pushed
+ *                  and skip resets to 0.
+ *
+ * Invariants
+ *   0 ≤ head  < TRAIL_CAP.
+ *   0 ≤ count ≤ TRAIL_CAP.
+ *   0 ≤ skip  < TRAIL_SAMPLE_STEP.
+ *   count < TRAIL_CAP  ⇒  px[0..count-1] are the valid positions
+ *                          (the buffer hasn't wrapped yet).
+ *   count == TRAIL_CAP ⇒  every slot is valid; head points at the
+ *                          OLDEST entry (next to be overwritten).
+ *
+ * References
+ *   Knuth, "The Art of Computer Programming" Vol. 1 §2.2.2 —
+ *     circular buffer ("circular queue") as the canonical bounded
+ *     FIFO data structure.  Same pattern as a ring-shift in DSP.
  */
 typedef struct {
     float px[TRAIL_CAP];
@@ -849,37 +683,146 @@ static void trail_push(Trail *t, float px, float py)
 /* §6  robot — state, inverse and forward kinematics, integration         */
 /* ===================================================================== */
 
-/* ── §6.1 Robot type ──────────────────────────────────────────────── */
+/* ── §6.1 Robot sub-structs ───────────────────────────────────────── */
 
 /*
- * Robot — the entire simulation state.
+ * Pose — robot's position + heading in WORLD pixel space.
  *
- *   Pose:
- *     px, py     position in pixel space (top-left = 0, 0)
- *     theta      heading in radians; 0 = east (+x), π/2 = south
+ * Intent
+ *   The full configuration vector of a 2-D mobile robot:
+ *   (x, y) for position, θ for heading.  Standard SE(2)
+ *   representation [Siegwart §3.2.2].  Every frame, step_pose
+ *   advances this from the current wheel speeds (forward kinematics).
  *
- *   Wheel speeds (pixels/sec, computed every frame from commands):
- *     vL         left wheel
- *     vR         right wheel
+ * Coordinate convention
+ *   Pixel space, top-left origin → +x is RIGHT, +y is DOWN.
+ *   θ = 0 points along +x (east); θ = π/2 points along +y (south).
+ *   This is "graphics convention" — the math-textbook y-axis is
+ *   FLIPPED, which matters for the wheel-offset formulas in
+ *   render_robot.  See [2] Siegwart §3.2.4 for the world-frame
+ *   integration.
  *
- *   User commands (driven by keyboard input):
- *     v_cmd      desired linear speed (pixels/sec)
- *     w_cmd      desired angular speed (radians/sec)
+ * Members
+ *   px, py   Position in WORLD pixel space (top-left = 0, 0).
+ *            Wrapped at world edges by wrap_position to give the
+ *            visual a torus topology (drive off the right edge,
+ *            re-enter from the left).
+ *   theta    Heading in radians; wrapped to (−π, π] each tick by
+ *            wrap_theta to keep printf-able values readable.
  *
- *   Constants:
- *     axle       wheel separation in pixels (set once at init)
+ * Invariants
+ *   0 ≤ px < world.wpx, 0 ≤ py < world.hpx after wrap_position.
+ *   −π < theta ≤ π after wrap_theta.
  *
- *   Trail ring buffer of recent positions.
- *   `paused` freezes physics but lets the renderer keep running
- *   so the HUD updates.
+ * References
+ *   [2] Siegwart §3.2.2 — pose representation for differential-drive.
  */
 typedef struct {
     float px, py, theta;
+} Pose;
+
+/*
+ * WheelSpeeds — current wheel linear speeds (pixels/sec).
+ *
+ * Intent
+ *   The "intermediate" state in the kinematic pipeline:
+ *
+ *     Commands  → INVERSE KINEMATICS → WheelSpeeds
+ *     WheelSpeeds → FORWARD KINEMATICS → Pose
+ *
+ *   Computed every frame by compute_wheels from the user's
+ *   (v_cmd, w_cmd) commands and the axle length.  Read every frame
+ *   by step_pose to advance the Pose.  Reflected in the renderer
+ *   as green/red velocity arrows at each wheel.
+ *
+ * Why store wheel speeds (rather than recompute on demand)
+ *   Two consumers need them: the integrator AND the renderer.
+ *   The renderer wants per-wheel direction arrows whose length
+ *   reads as |vL| / V_MAX and |vR| / V_MAX.  Caching means
+ *   one compute_wheels per frame instead of two.
+ *
+ * Members
+ *   vL   Left wheel  linear speed (pixels/sec).  Positive = forward.
+ *   vR   Right wheel linear speed (pixels/sec).  Positive = forward.
+ *
+ * Invariants
+ *   |vL| ≤ V_MAX, |vR| ≤ V_MAX (clamped in compute_wheels).
+ *
+ * References
+ *   [2] Siegwart §3.2.4 — inverse kinematics for differential-drive.
+ *   [4] Dudek & Jenkin §4.2 — wheel-speed primitives.
+ */
+typedef struct {
     float vL, vR;
+} WheelSpeeds;
+
+/*
+ * Commands — user's high-level (linear, angular) command pair.
+ *
+ * Intent
+ *   What the user is ASKING the robot to do: drive forward at v_cmd
+ *   while turning at w_cmd.  Distinct from WheelSpeeds because this
+ *   is the user-input layer; the robot has to translate it to wheel
+ *   speeds via INVERSE KINEMATICS each frame.
+ *
+ *   The keyboard input handler (scene_apply_keys) ramps these
+ *   smoothly so a key-down doesn't snap the robot to V_MAX instantly.
+ *
+ * Members
+ *   v_cmd    Desired linear speed (pixels/sec).  Updated by W/S
+ *            keys with V_RATE ramp; decays at V_DECAY_PER_SEC.
+ *   w_cmd    Desired angular speed (radians/sec).  Updated by A/D
+ *            keys with W_RATE ramp; decays at W_DECAY_PER_SEC.
+ *
+ * Invariants
+ *   |v_cmd| ≤ V_MAX, |w_cmd| ≤ W_MAX (clamped in scene_apply_keys).
+ *
+ * References
+ *   [2] Siegwart §3.2.4 — (v, ω) is the canonical command pair for
+ *       differential-drive in the unicycle model.
+ */
+typedef struct {
     float v_cmd, w_cmd;
-    float axle;
-    Trail trail;
-    bool  paused;
+} Commands;
+
+/*
+ * Robot — the simulated agent.
+ *
+ * Layered ownership
+ *
+ *     Robot
+ *       ├── pose     : Pose          ← (px, py, θ) configuration
+ *       ├── wheels   : WheelSpeeds   ← (vL, vR) intermediate state
+ *       ├── cmd      : Commands      ← (v_cmd, w_cmd) user inputs
+ *       ├── trail    : Trail         ← ring buffer of past positions
+ *       └── axle     : float         ← wheel separation (config; frozen)
+ *
+ *   Three layered kinematic stages of state:
+ *     INPUT  → cmd   (user keys)
+ *     INVERSE KINEMATICS → wheels  (compute_wheels)
+ *     FORWARD KINEMATICS → pose    (step_pose)
+ *
+ *   This makes the data-flow direction explicit in the struct shape.
+ *
+ * Why `paused` lives on Scene.sim (not on Robot)
+ *   `paused` is a SCENE-level concern (gate for the whole tick), not
+ *   a per-robot property.  Moving it to SimControls keeps Robot
+ *   purely about the simulated agent.
+ *
+ * References
+ *   [2] Siegwart, Nourbakhsh & Scaramuzza (2011),
+ *       "Introduction to Autonomous Mobile Robots" (2nd ed.), MIT
+ *       Press, §3.2 — canonical reference for differential-drive
+ *       kinematics in textbook form.
+ *   [4] Dudek & Jenkin (2010), "Computational Principles of Mobile
+ *       Robotics" (2nd ed.), §4.2 — wheel-speed primitives.
+ */
+typedef struct {
+    Pose        pose;
+    WheelSpeeds wheels;
+    Commands    cmd;
+    Trail       trail;
+    float       axle;
 } Robot;
 
 /* ── §6.2 compute_wheels — INVERSE KINEMATICS (commands → wheels) ── */
@@ -908,8 +851,8 @@ typedef struct {
 static void compute_wheels(Robot *r)
 {
     float half = r->axle * 0.5f;
-    r->vL = clampf(r->v_cmd - r->w_cmd * half, -V_MAX, V_MAX);
-    r->vR = clampf(r->v_cmd + r->w_cmd * half, -V_MAX, V_MAX);
+    r->wheels.vL = clampf(r->cmd.v_cmd - r->cmd.w_cmd * half, -V_MAX, V_MAX);
+    r->wheels.vR = clampf(r->cmd.v_cmd + r->cmd.w_cmd * half, -V_MAX, V_MAX);
 }
 
 /* ── §6.3 step_pose — FORWARD KINEMATICS + Euler integration ──────── */
@@ -937,16 +880,16 @@ static void compute_wheels(Robot *r)
  */
 static void step_pose(Robot *r, float dt)
 {
-    float v     = (r->vL + r->vR) * 0.5f;
-    float omega = (r->vR - r->vL) / r->axle;
+    float v     = (r->wheels.vL + r->wheels.vR) * 0.5f;
+    float omega = (r->wheels.vR - r->wheels.vL) / r->axle;
 
-    r->px    += v     * cosf(r->theta) * dt;
-    r->py    += v     * sinf(r->theta) * dt;
-    r->theta += omega * dt;
+    r->pose.px    += v     * cosf(r->pose.theta) * dt;
+    r->pose.py    += v     * sinf(r->pose.theta) * dt;
+    r->pose.theta += omega * dt;
 
     /* Wrap heading into (−π, π]. */
-    while (r->theta >  (float)M_PI) r->theta -= 2.0f * (float)M_PI;
-    while (r->theta < -(float)M_PI) r->theta += 2.0f * (float)M_PI;
+    while (r->pose.theta >  (float)M_PI) r->pose.theta -= 2.0f * (float)M_PI;
+    while (r->pose.theta < -(float)M_PI) r->pose.theta += 2.0f * (float)M_PI;
 }
 
 /* ── §6.4 wrap_position — toroidal screen edges ──────────────────── */
@@ -959,10 +902,10 @@ static void step_pose(Robot *r, float dt)
  */
 static void wrap_position(Robot *r, int wpx, int hpx)
 {
-    if (r->px <  0.0f)         r->px += (float)wpx;
-    if (r->px >= (float)wpx)   r->px -= (float)wpx;
-    if (r->py <  0.0f)         r->py += (float)hpx;
-    if (r->py >= (float)hpx)   r->py -= (float)hpx;
+    if (r->pose.px <  0.0f)         r->pose.px += (float)wpx;
+    if (r->pose.px >= (float)wpx)   r->pose.px -= (float)wpx;
+    if (r->pose.py <  0.0f)         r->pose.py += (float)hpx;
+    if (r->pose.py >= (float)hpx)   r->pose.py -= (float)hpx;
 }
 
 /* ── §6.5 robot_init / robot_reset ───────────────────────────────── */
@@ -971,9 +914,9 @@ static void robot_init(Robot *r, int wpx, int hpx)
 {
     memset(r, 0, sizeof *r);
     r->axle  = AXLE_PX;
-    r->px    = (float)wpx * 0.5f;
-    r->py    = (float)hpx * 0.5f;
-    r->theta = 0.0f;
+    r->pose.px    = (float)wpx * 0.5f;
+    r->pose.py    = (float)hpx * 0.5f;
+    r->pose.theta = 0.0f;
 }
 
 static void robot_reset(Robot *r, int wpx, int hpx)
@@ -982,32 +925,28 @@ static void robot_reset(Robot *r, int wpx, int hpx)
     float axle = r->axle;
     memset(r, 0, sizeof *r);
     r->axle  = axle;
-    r->px    = (float)wpx * 0.5f;
-    r->py    = (float)hpx * 0.5f;
-    r->theta = 0.0f;
+    r->pose.px    = (float)wpx * 0.5f;
+    r->pose.py    = (float)hpx * 0.5f;
+    r->pose.theta = 0.0f;
 }
 
 /* ── §6.6 robot_tick — one frame of physics ──────────────────────── */
 
 /*
- * The orchestrator. Reads the four commands the user has set
- * (v_cmd, w_cmd already updated), runs inverse kinematics to find
- * the wheel speeds, runs forward kinematics + Euler integration
- * to advance the pose, wraps if we left the screen, and pushes
- * the new position into the trail buffer.
+ * The orchestrator.  Reads the user's (v_cmd, w_cmd), runs
+ * INVERSE KINEMATICS to find wheel speeds, runs FORWARD KINEMATICS
+ * + Euler integration to advance the pose, wraps at the world
+ * boundary, and pushes the new position into the trail buffer.
  *
- * If paused, do nothing — the robot freezes mid-motion and the
- * renderer keeps showing whatever pose it had. The HUD continues
- * to update so the user can inspect numbers while paused.
+ * Pause is handled by the CALLER (scene_tick) so this function is
+ * pure physics — easier to reason about in isolation.
  */
 static void robot_tick(Robot *r, float dt, int wpx, int hpx)
 {
-    if (r->paused) return;
-
     compute_wheels(r);                      /* commands → wheel speeds */
     step_pose     (r, dt);                  /* wheel speeds → new pose */
     wrap_position (r, wpx, hpx);
-    trail_push    (&r->trail, r->px, r->py);
+    trail_push    (&r->trail, r->pose.px, r->pose.py);
 }
 
 /* ===================================================================== */
@@ -1016,38 +955,135 @@ static void robot_tick(Robot *r, float dt, int wpx, int hpx)
 
 /*
  * Keys — one bool per action, set fresh each frame from getch().
- *   fwd, rev      throttle (ramps v_cmd up/down)
- *   left, right   turn (ramps w_cmd left/right)
- *   spin_l, spin_r  instant spin in place at ±W_MAX
- *   stop          full stop (zero both commands)
  *
- * Using a struct of bools (rather than a bitmask) keeps the
- * scene_apply_keys logic readable and lets multiple keys be active
- * simultaneously without bitwise ops.
+ * Intent
+ *   Bit-vector-style snapshot of the keyboard state at the start of
+ *   each tick.  collect_input populates this by draining ncurses'
+ *   input queue; scene_apply_keys consumes it to update Commands.
+ *
+ *   Using a struct of bools (rather than a bitmask) keeps
+ *   scene_apply_keys readable and lets MULTIPLE keys be active
+ *   simultaneously without bitwise ops (e.g. W + A → drive forward
+ *   while turning left).
+ *
+ * Members
+ *   fwd, rev        Throttle (W/S keys) — ramps cmd.v_cmd up/down.
+ *   left, right     Turn (A/D keys) — ramps cmd.w_cmd left/right.
+ *   spin_l, spin_r  Instant spin in place at ±W_MAX (Z/E keys).
+ *   stop            Full-stop override (SPACE) — zeros both commands.
+ *
+ * Invariants
+ *   All fields false at the start of each frame (memset in collect_input).
  */
 typedef struct {
     bool fwd, rev, left, right, spin_l, spin_r, stop;
 } Keys;
 
+/*
+ * InputState — the keyboard input layer.
+ *
+ * Intent
+ *   Single-field wrapper around Keys.  Pedagogically useful as a
+ *   named sub-struct of Scene so the data flow reads as
+ *
+ *       scene.input → scene.robot.cmd → scene.robot.wheels → scene.robot.pose
+ *
+ *   matching the kinematics pipeline (input → commands → wheels → pose).
+ *
+ * Members
+ *   keys   Per-frame keyboard snapshot (see Keys docblock).
+ */
 typedef struct {
-    Robot robot;
-    Keys  keys;
-    int   wpx, hpx;       /* world size in pixels */
+    Keys keys;
+} InputState;
+
+/*
+ * World — pixel-space dimensions of the simulated world.
+ *
+ * Intent
+ *   The simulation operates in PIXEL space (with CELL_W × CELL_H
+ *   sub-pixels per cell — see §4 coords).  World holds the active
+ *   pixel extents, derived from the terminal size minus the two
+ *   HUD rows (one top, one bottom).
+ *
+ * Members
+ *   wpx   World width  in PIXELS (= pw(cols)).
+ *   hpx   World height in PIXELS (= ph(rows - 2); 2 reserved rows
+ *         for HUD + hint strip).
+ *
+ * Invariants
+ *   wpx > 0, hpx > 0 after scene_init.
+ *   Recomputed on every SIGWINCH via scene_resize.
+ *
+ * References
+ *   CLAUDE.md §"Core Architecture / Coordinate / Physics" for the
+ *   pixel ↔ cell coordinate bridge.
+ */
+typedef struct {
+    int wpx, hpx;
+} World;
+
+/*
+ * SimControls — user-facing playback knob.
+ *
+ * Intent
+ *   The `paused` flag gates the tick stage of the simulation loop
+ *   while letting the renderer keep running (so the HUD stays live).
+ *   Lives on Scene (not on Robot) because it's a SCENE-level concern
+ *   — the user pauses THE WORLD, not the robot specifically.
+ *
+ * Members
+ *   paused   true → scene_tick early-returns; rendering continues.
+ *            Toggled by 'p' / 'P' key.
+ */
+typedef struct {
+    bool paused;
+} SimControls;
+
+/*
+ * Scene — owns ALL simulation state for one run.
+ *
+ * Layered ownership
+ *
+ *     Scene
+ *       ├── world    : World        ← wpx + hpx (pixel extent)
+ *       ├── robot    : Robot        ← the simulated agent
+ *       ├── input    : InputState   ← per-frame Keys snapshot
+ *       └── sim      : SimControls  ← paused
+ *
+ *   Data-flow direction (read top-to-bottom):
+ *
+ *       input.keys  → robot.cmd       (scene_apply_keys; user intent)
+ *       robot.cmd   → robot.wheels    (compute_wheels; inverse kinematics)
+ *       robot.wheels → robot.pose     (step_pose; forward kinematics)
+ *       world.wpx/hpx → wrap_position (torus boundary)
+ *
+ *   The struct shape mirrors the data flow: every helper that
+ *   advances one stage takes the relevant sub-struct as a parameter,
+ *   making the "what does this function touch" question answerable
+ *   from the signature.
+ */
+typedef struct {
+    World       world;
+    Robot       robot;
+    InputState  input;
+    SimControls sim;
 } Scene;
 
 static void scene_init(Scene *s, int cols, int rows)
 {
-    s->wpx = pw(cols);
+    s->world.wpx = pw(cols);
     /* Reserve top row for HUD, bottom row for hint strip. */
-    s->hpx = ph(rows - 2);
-    memset(&s->keys, 0, sizeof s->keys);
-    robot_init(&s->robot, s->wpx, s->hpx);
+    s->world.hpx = ph(rows - 2);
+    memset(&s->input.keys, 0, sizeof s->input.keys);
+    s->sim.paused = false;
+    robot_init(&s->robot, s->world.wpx, s->world.hpx);
 }
 
 static void scene_resize(Scene *s, int cols, int rows)
 {
-    s->wpx = pw(cols);
-    s->hpx = ph(rows - 2);
+    s->world.wpx = pw(cols);
+    s->world.hpx = ph(rows - 2);
 }
 
 /*
@@ -1072,35 +1108,85 @@ static void scene_resize(Scene *s, int cols, int rows)
  *
  * All commands clamped to physical limits at the end.
  */
+/* apply_full_stop — SPACE key.  Zeros both commands instantly.
+ * Highest-priority override.  Other keys can still modify the
+ * commands AFTER this in the same frame (e.g. SPACE + W in the
+ * same frame nets to W's ramp). */
+static inline void apply_full_stop(Commands *cmd) {
+    cmd->v_cmd = 0.0f;
+    cmd->w_cmd = 0.0f;
+}
+
+/* apply_throttle_ramp_or_decay — W/S key handling.
+ *
+ *   key_held → ramp v_cmd at ±V_RATE per second (forward Euler).
+ *   no key  → exponential decay v_cmd *= V_DECAY_PER_SEC^dt
+ *             (frame-rate independent — same time-constant at any dt).
+ */
+static inline void apply_throttle_ramp_or_decay(Commands *cmd, const Keys *k,
+                                                 float dt) {
+    if (k->fwd) cmd->v_cmd += V_RATE * dt;
+    if (k->rev) cmd->v_cmd -= V_RATE * dt;
+    if (!k->fwd && !k->rev) cmd->v_cmd *= powf(V_DECAY_PER_SEC, dt);
+}
+
+/* apply_turn_ramp_or_decay — A/D key handling.  Same shape as the
+ * throttle helper but operating on the angular command. */
+static inline void apply_turn_ramp_or_decay(Commands *cmd, const Keys *k,
+                                             float dt) {
+    if (k->right) cmd->w_cmd += W_RATE * dt;
+    if (k->left)  cmd->w_cmd -= W_RATE * dt;
+    if (!k->right && !k->left) cmd->w_cmd *= powf(W_DECAY_PER_SEC, dt);
+}
+
+/* apply_spin_in_place_override — Z/E key handling.  Direct
+ * assignment (NOT a ramp): set v_cmd = 0 and w_cmd = ±W_MAX, so the
+ * robot rotates in place at maximum angular velocity.  Overrides
+ * any throttle/turn ramp from the same frame. */
+static inline void apply_spin_in_place_override(Commands *cmd, const Keys *k) {
+    if (k->spin_r) { cmd->v_cmd = 0.0f; cmd->w_cmd =  W_MAX; }
+    if (k->spin_l) { cmd->v_cmd = 0.0f; cmd->w_cmd = -W_MAX; }
+}
+
+/* clamp_commands_to_physical_limits — final saturation step.  Any
+ * combination of the above can push the commands past V_MAX / W_MAX;
+ * this guarantees the integrator + inverse-kinematics stage sees
+ * values within achievable bounds. */
+static inline void clamp_commands_to_physical_limits(Commands *cmd) {
+    cmd->v_cmd = clampf(cmd->v_cmd, -V_MAX, V_MAX);
+    cmd->w_cmd = clampf(cmd->w_cmd, -W_MAX, W_MAX);
+}
+
+/*
+ * scene_apply_keys — translate the per-frame Keys flags into
+ * updates to Commands.  Order matters:
+ *
+ *   (1) STOP override     — zero both commands if SPACE held
+ *   (2) THROTTLE ramp     — W/S keys ramp v_cmd; decay if neither held
+ *   (3) TURN ramp         — A/D keys ramp w_cmd; decay if neither held
+ *   (4) SPIN override     — Z/E keys force (v_cmd=0, w_cmd=±W_MAX)
+ *   (5) CLAMP             — saturate to V_MAX / W_MAX
+ *
+ * STOP and SPIN apply AFTER the ramps so they win — a user can hit
+ * SPACE to instantly halt regardless of whether throttle is held.
+ */
 static void scene_apply_keys(Scene *s, float dt)
 {
-    Robot *r = &s->robot;
-    Keys  *k = &s->keys;
+    Commands  *cmd = &s->robot.cmd;
+    const Keys *k  = &s->input.keys;
 
-    if (k->stop) { r->v_cmd = 0.0f; r->w_cmd = 0.0f; }
-
-    /* Throttle */
-    if (k->fwd) r->v_cmd += V_RATE * dt;
-    if (k->rev) r->v_cmd -= V_RATE * dt;
-    if (!k->fwd && !k->rev) r->v_cmd *= powf(V_DECAY_PER_SEC, dt);
-
-    /* Turn */
-    if (k->right) r->w_cmd += W_RATE * dt;
-    if (k->left)  r->w_cmd -= W_RATE * dt;
-    if (!k->right && !k->left) r->w_cmd *= powf(W_DECAY_PER_SEC, dt);
-
-    /* Spin in place — direct override */
-    if (k->spin_r) { r->v_cmd = 0.0f; r->w_cmd =  W_MAX; }
-    if (k->spin_l) { r->v_cmd = 0.0f; r->w_cmd = -W_MAX; }
-
-    r->v_cmd = clampf(r->v_cmd, -V_MAX, V_MAX);
-    r->w_cmd = clampf(r->w_cmd, -W_MAX, W_MAX);
+    if (k->stop) apply_full_stop(cmd);                       /* (1) */
+    apply_throttle_ramp_or_decay  (cmd, k, dt);              /* (2) */
+    apply_turn_ramp_or_decay      (cmd, k, dt);              /* (3) */
+    apply_spin_in_place_override  (cmd, k);                  /* (4) */
+    clamp_commands_to_physical_limits(cmd);                  /* (5) */
 }
 
 static void scene_tick(Scene *s, float dt)
 {
+    if (s->sim.paused) return;
     scene_apply_keys(s, dt);
-    robot_tick(&s->robot, dt, s->wpx, s->hpx);
+    robot_tick(&s->robot, dt, s->world.wpx, s->world.hpx);
 }
 
 /* ===================================================================== */
@@ -1240,120 +1326,250 @@ static void render_trail(const Robot *r, int cols, int rows)
 /* ── §8.6 render_robot — body, wheels, arrows ────────────────────── */
 
 /*
- * Painter's order — last write wins:
- *   1. Trail dots
- *   2. Wheel velocity arrows (green/red)
- *   3. Heading arrow (yellow)
- *   4. Wheel labels 'L', 'R'
- *   5. Body '@'   (always on top)
+ * WheelPositions — pixel coordinates of the two wheels.
  *
- * The wheels sit perpendicular to the heading at ±axle/2 from the
- * body centre. In y-down screen coordinates:
+ * Computed from pose + axle: the wheels sit PERPENDICULAR to the
+ * heading at ±axle/2 from the body centre.  In y-down screen
+ * coordinates:
  *
- *     left  = body + ( +sin θ, −cos θ ) · axle/2
- *     right = body + ( −sin θ, +cos θ ) · axle/2
+ *     left_wheel  = body + ( +sin θ, −cos θ ) · axle/2
+ *     right_wheel = body + ( −sin θ, +cos θ ) · axle/2
  *
- * (Common error: math-textbook formulas assume y-up, so they have
- *  the signs flipped. Watch out.)
+ * (Math-textbook formulas assume y-UP, so they have the signs
+ *  flipped.  Watch out — see [2] Siegwart §3.2 figure 3.5.)
+ */
+typedef struct {
+    float lx, ly;   /* left  wheel pixel coordinates */
+    float rx, ry;   /* right wheel pixel coordinates */
+} WheelPositions;
+
+/*
+ * compute_wheel_positions — body pose → wheel pixel positions.
+ *
+ * Forward kinematics for the wheel locations only (the body's
+ * forward kinematics are in step_pose).  Both wheels are
+ * BODY-FIXED — they rotate with the heading, so their positions
+ * are recomputed each frame from the current θ.
+ */
+static inline WheelPositions compute_wheel_positions(const Robot *r) {
+    float sinT = sinf(r->pose.theta);
+    float cosT = cosf(r->pose.theta);
+    float half_axle = r->axle * 0.5f;
+
+    WheelPositions wp;
+    /* left wheel = body + (+sinθ, −cosθ) · axle/2  (y-down convention) */
+    wp.lx = r->pose.px + sinT * half_axle;
+    wp.ly = r->pose.py - cosT * half_axle;
+    /* right wheel = body + (−sinθ, +cosθ) · axle/2 */
+    wp.rx = r->pose.px - sinT * half_axle;
+    wp.ry = r->pose.py + cosT * half_axle;
+    return wp;
+}
+
+/*
+ * paint_glyph_at_cell — attron / mvaddch / attroff sandwich for one
+ * cell, gated on in_bounds.  Centralises the colour-pair setup +
+ * bounds check + chtype cast used across all per-cell paints.
+ */
+static inline void paint_glyph_at_cell(int cx, int cy, chtype glyph,
+                                        int color_pair, attr_t extra_attrs,
+                                        int cols, int rows) {
+    if (!in_bounds(cx, cy, cols, rows)) return;
+    attron (COLOR_PAIR(color_pair) | extra_attrs);
+    mvaddch(cy, cx, glyph | (chtype)COLOR_PAIR(color_pair) | (chtype)extra_attrs);
+    attroff(COLOR_PAIR(color_pair) | extra_attrs);
+}
+
+/*
+ * paint_heading_arrow — yellow dotted line from body centre extending
+ * ARROW_PX pixels along the current heading.  Sub-helpers:
+ *   - draw_line_dotted     — the shaft (dotted line in pixel space)
+ *   - paint_glyph_at_cell  — the arrowhead glyph at the tip
+ * The arrowhead glyph is chosen by tip_char() based on θ — cardinal
+ * directions get sharp arrows (> v < ^); diagonals get 'o'.
+ */
+static inline void paint_heading_arrow(const Robot *r, int cols, int rows) {
+    float cosT = cosf(r->pose.theta), sinT = sinf(r->pose.theta);
+    float tip_x_px = r->pose.px + cosT * ARROW_PX;
+    float tip_y_px = r->pose.py + sinT * ARROW_PX;
+
+    /* shaft */
+    draw_line_dotted(r->pose.px, r->pose.py, tip_x_px, tip_y_px,
+                     CP_HEAD, A_BOLD, cols, rows);
+
+    /* arrowhead at the tip */
+    int tip_cx = px_to_cx(tip_x_px), tip_cy = px_to_cy(tip_y_px);
+    paint_glyph_at_cell(tip_cx, tip_cy, tip_char(r->pose.theta),
+                        CP_HEAD, A_BOLD, cols, rows);
+}
+
+/*
+ * paint_wheel_label — a single 'L' or 'R' glyph at the wheel's
+ * cell position.  Drawn after the velocity arrows but before the
+ * body so the body always wins overlap at the centre.
+ */
+static inline void paint_wheel_label(float wx_px, float wy_px,
+                                      chtype label_glyph, int color_pair,
+                                      int cols, int rows) {
+    paint_glyph_at_cell(px_to_cx(wx_px), px_to_cy(wy_px),
+                        label_glyph, color_pair, A_BOLD, cols, rows);
+}
+
+/*
+ * render_robot — paint the robot at its current pose.
+ *
+ * Painter's order — LAST write wins:
+ *   (1) Trail dots           — oldest at the bottom of the z-stack
+ *   (2) Wheel velocity arrows — green = forward, red = reverse
+ *   (3) Heading arrow         — yellow dotted line from body centre
+ *   (4) Wheel labels 'L', 'R' — anchor points for the user
+ *   (5) Body '@'              — always on top
+ *
+ * Wheel positions come from compute_wheel_positions (body-fixed,
+ * recomputed each frame from θ).
  */
 static void render_robot(const Robot *r, int cols, int rows)
 {
-    int   cx   = px_to_cx(r->px);
-    int   cy   = px_to_cy(r->py);
-    float sinT = sinf(r->theta), cosT = cosf(r->theta);
-    float half = r->axle * 0.5f;
+    WheelPositions wp = compute_wheel_positions(r);
 
-    /* Wheel pixel positions (y-down perpendicular). */
-    float lx_px = r->px + sinT * half,  ly_px = r->py - cosT * half;
-    float rx_px = r->px - sinT * half,  ry_px = r->py + cosT * half;
-
-    /* (1) Trail. */
+    /* (1) Trail dots — oldest first; bottom of the z-stack */
     render_trail(r, cols, rows);
 
-    /* (2) Wheel velocity arrows. */
-    draw_wheel_arrow(lx_px, ly_px, r->vL, r->theta, cols, rows);
-    draw_wheel_arrow(rx_px, ry_px, r->vR, r->theta, cols, rows);
+    /* (2) Wheel velocity arrows — visual encoding of (vL, vR) */
+    draw_wheel_arrow(wp.lx, wp.ly, r->wheels.vL, r->pose.theta, cols, rows);
+    draw_wheel_arrow(wp.rx, wp.ry, r->wheels.vR, r->pose.theta, cols, rows);
 
-    /* (3) Heading arrow from body centre. */
-    {
-        float ex = r->px + cosT * ARROW_PX;
-        float ey = r->py + sinT * ARROW_PX;
-        draw_line_dotted(r->px, r->py, ex, ey, CP_HEAD, A_BOLD, cols, rows);
+    /* (3) Heading arrow from body centre — direction the body faces */
+    paint_heading_arrow(r, cols, rows);
 
-        int tx = px_to_cx(ex), ty = px_to_cy(ey);
-        if (in_bounds(tx, ty, cols, rows))
-            mvaddch(ty, tx, tip_char(r->theta) |
-                            (chtype)COLOR_PAIR(CP_HEAD) | (chtype)A_BOLD);
-    }
+    /* (4) Wheel labels — 'L' / 'R' anchor characters */
+    paint_wheel_label(wp.lx, wp.ly, 'L', CP_WHL_L, cols, rows);
+    paint_wheel_label(wp.rx, wp.ry, 'R', CP_WHL_R, cols, rows);
 
-    /* (4) Wheel labels. */
-    int lx = px_to_cx(lx_px), ly = px_to_cy(ly_px);
-    int rx = px_to_cx(rx_px), ry = px_to_cy(ry_px);
-    if (in_bounds(lx, ly, cols, rows)) {
-        attron (COLOR_PAIR(CP_WHL_L) | A_BOLD);
-        mvaddch(ly, lx, 'L');
-        attroff(COLOR_PAIR(CP_WHL_L) | A_BOLD);
-    }
-    if (in_bounds(rx, ry, cols, rows)) {
-        attron (COLOR_PAIR(CP_WHL_R) | A_BOLD);
-        mvaddch(ry, rx, 'R');
-        attroff(COLOR_PAIR(CP_WHL_R) | A_BOLD);
-    }
-
-    /* (5) Body — drawn last, never occluded. */
-    if (in_bounds(cx, cy, cols, rows)) {
-        attron (COLOR_PAIR(CP_BODY) | A_BOLD);
-        mvaddch(cy, cx, '@');
-        attroff(COLOR_PAIR(CP_BODY) | A_BOLD);
-    }
+    /* (5) Body — drawn last, never occluded */
+    paint_glyph_at_cell(px_to_cx(r->pose.px), px_to_cy(r->pose.py),
+                        '@', CP_BODY, A_BOLD, cols, rows);
 }
 
 /* ── §8.7 render_hud — yellow status row 0, cyan hint bottom row ─── */
 
+/* OMEGA_INFINITESIMAL_THRESHOLD — below this |ω|, the instantaneous
+ * curvature radius is effectively infinite (a straight line).  We
+ * print "INF" in the HUD instead of a numeric R to avoid 10⁹-style
+ * garbage values.  Threshold is in rad/sec; 1e-3 ≈ 0.06 deg/sec,
+ * imperceptible. */
+enum { /* enums can't hold floats — kept as #define-style note */ HUD_FLOAT_NOTES = 0 };
+#define OMEGA_INFINITESIMAL_THRESHOLD 1e-3f   /* rad/sec */
+#define R_INFINITE_DISPLAY_THRESHOLD  9999.0f /* pixels; bigger → render "INF" */
+enum { HUD_TOP_ROW = 0 };
+
+/* body_linear_velocity — average of the two wheel speeds.
+ * Derived from the forward kinematics: v = (vL + vR) / 2. */
+static inline float body_linear_velocity(const Robot *r) {
+    return (r->wheels.vL + r->wheels.vR) * 0.5f;
+}
+
+/* body_angular_velocity — wheel-speed difference / axle.
+ * Derived from the forward kinematics: ω = (vR − vL) / axle. */
+static inline float body_angular_velocity(const Robot *r) {
+    return (r->wheels.vR - r->wheels.vL) / r->axle;
+}
+
+/* instantaneous_turn_radius_px — radius of the instantaneous circle
+ * the body is travelling on.  R = v / ω at non-zero ω; returns a
+ * sentinel large value (1e9) when |ω| is below the infinitesimal
+ * threshold so the caller can detect "straight-line" and print "INF". */
+static inline float instantaneous_turn_radius_px(float v, float omega) {
+    if (fabsf(omega) <= OMEGA_INFINITESIMAL_THRESHOLD) return 1e9f;
+    return v / omega;
+}
+
+/* radians_to_degrees — unit conversion used only by the HUD. */
+static inline float radians_to_degrees(float radians) {
+    return radians * (180.0f / (float)M_PI);
+}
+
+/* hud_paint_text_padded — paint `text` at (row, col) in pair `pair`
+ * + A_BOLD, then pad the rest of the row with spaces so the row's
+ * background colour reaches edge-to-edge (otherwise the terminal's
+ * default bg shows through past the printed text). */
+static inline void hud_paint_text_padded(int row, int col, int pair,
+                                          const char *text,
+                                          int total_cols) {
+    attron (COLOR_PAIR(pair) | A_BOLD);
+    mvprintw(row, col, "%s", text);
+    int used = (int)strlen(text);
+    for (int x = col + used; x < total_cols; x++)
+        mvaddch(row, x, ' ');
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
+/* hud_paint_text — same as above but WITHOUT padding (the bottom
+ * key-hint strip doesn't need to span the full width). */
+static inline void hud_paint_text(int row, int col, int pair,
+                                   const char *text) {
+    attron (COLOR_PAIR(pair) | A_BOLD);
+    mvprintw(row, col, "%s", text);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
+/* format_hud_status — write the top-row status string into `buf`.
+ * Reports fps, pose (px, py, θ°), body velocity v, body angular
+ * velocity ω, instantaneous turn radius R (or "INF" when straight),
+ * the two wheel speeds, and the paused/running tag. */
+static void format_hud_status(const Scene *s, double fps,
+                              char *buf, size_t buflen) {
+    const Robot *r = &s->robot;
+    float v     = body_linear_velocity (r);
+    float omega = body_angular_velocity(r);
+    float R     = instantaneous_turn_radius_px(v, omega);
+    float theta_deg = radians_to_degrees(r->pose.theta);
+    const char *state_label = s->sim.paused ? "PAUSED" : "running";
+
+    bool render_R_as_infinity = (fabsf(R) > R_INFINITE_DISPLAY_THRESHOLD);
+    if (render_R_as_infinity) {
+        snprintf(buf, buflen,
+                 " %5.1f fps  pose:(%.0f,%.0f) %+6.1f°  v:%+6.1fpx/s  "
+                 "ω:%+5.2fr/s  R:INF  L:%+6.1f R:%+6.1f  %s ",
+                 fps, r->pose.px, r->pose.py, theta_deg, v, omega,
+                 r->wheels.vL, r->wheels.vR, state_label);
+    } else {
+        snprintf(buf, buflen,
+                 " %5.1f fps  pose:(%.0f,%.0f) %+6.1f°  v:%+6.1fpx/s  "
+                 "ω:%+5.2fr/s  R:%+6.0f  L:%+6.1f R:%+6.1f  %s ",
+                 fps, r->pose.px, r->pose.py, theta_deg, v, omega, R,
+                 r->wheels.vL, r->wheels.vR, state_label);
+    }
+}
+
+/* draw_hud_status — left-justified status row 0 (PAIR_HUD yellow). */
+static void draw_hud_status(const Scene *s, double fps, int cols) {
+    char buf[HUD_BUF_LEN];
+    format_hud_status(s, fps, buf, sizeof buf);
+    hud_paint_text_padded(HUD_TOP_ROW, 0, PAIR_HUD, buf, cols);
+}
+
+/* draw_hud_hint — bottom-row key bindings strip (PAIR_HINT cyan). */
+static void draw_hud_hint(int rows) {
+    static const char *KEY_HINT =
+        " q:quit  spc:stop  p:pause  r:reset  "
+        "WS:throttle  AD:turn  ZE:spin in place ";
+    hud_paint_text(rows - 1, 0, PAIR_HINT, KEY_HINT);
+}
+
 /*
- * Row 0 (PAIR_HUD, BOLD): fps, body pose, body velocity, ω, turn
- *   radius, and the two wheel speeds. Everything in one
- *   left-justified strip.
+ * render_hud — required HUD per CLAUDE.md spec.
  *
- * Bottom row (PAIR_HINT, BOLD): the full key list. Stays constant.
+ *   Row 0 (PAIR_HUD, BOLD): fps + pose + (v, ω) + R + wheel speeds + state
+ *   Bottom row (PAIR_HINT, BOLD): key bindings strip
  *
  * Both pairs sit on default background (-1) so they remain legible
  * regardless of what the simulation paints behind them.
  */
-static void render_hud(const Robot *r, double fps, int cols, int rows)
+static void render_hud(const Scene *s, double fps, int cols, int rows)
 {
-    float v     = (r->vL + r->vR) * 0.5f;
-    float omega = (r->vR - r->vL) / r->axle;
-    float R     = (fabsf(omega) > 1e-3f) ? (v / omega) : 1e9f;
-    float deg   = r->theta * (180.0f / (float)M_PI);
-
-    char buf[HUD_BUF_LEN];
-    if (fabsf(R) > 9999.0f) {
-        snprintf(buf, sizeof buf,
-                 " %5.1f fps  pose:(%.0f,%.0f) %+6.1f°  v:%+6.1fpx/s  "
-                 "ω:%+5.2fr/s  R:INF  L:%+6.1f R:%+6.1f  %s ",
-                 fps, r->px, r->py, deg, v, omega, r->vL, r->vR,
-                 r->paused ? "PAUSED" : "running");
-    } else {
-        snprintf(buf, sizeof buf,
-                 " %5.1f fps  pose:(%.0f,%.0f) %+6.1f°  v:%+6.1fpx/s  "
-                 "ω:%+5.2fr/s  R:%+6.0f  L:%+6.1f R:%+6.1f  %s ",
-                 fps, r->px, r->py, deg, v, omega, R, r->vL, r->vR,
-                 r->paused ? "PAUSED" : "running");
-    }
-
-    attron (COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 0, "%s", buf);
-    /* Pad the rest of row 0 so theme bg doesn't show through. */
-    int used = (int)strlen(buf);
-    for (int x = used; x < cols; x++) mvaddch(0, x, ' ');
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-    attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(rows - 1, 0,
-             " q:quit  spc:stop  p:pause  r:reset  "
-             "WS:throttle  AD:turn  ZE:spin in place ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    draw_hud_status(s, fps, cols);
+    draw_hud_hint  (rows);
 }
 
 /* ── §8.8 scene_draw — one frame's worth of rendering ────────────── */
@@ -1362,13 +1578,50 @@ static void scene_draw(const Scene *s, double fps, int cols, int rows)
 {
     erase();
     render_robot(&s->robot, cols, rows);
-    render_hud  (&s->robot, fps, cols, rows);
+    render_hud  (s, fps, cols, rows);
 }
 
 /* ===================================================================== */
 /* §9  screen — ncurses init / present                                    */
 /* ===================================================================== */
 
+/*
+ * Screen — terminal cell extent + ncurses lifecycle wrapper.
+ *
+ * Intent
+ *   Tracks the TERMINAL side of the demo: cell dimensions for HUD
+ *   placement and field clipping.  ncurses owns the back buffer;
+ *   this struct is the source-of-truth for CELL-space dimensions,
+ *   refreshed via getmaxyx in screen_init / screen_resize.
+ *
+ *   The simulation lives in PIXEL space (CELL_W × CELL_H sub-pixels
+ *   per cell, see §4 coords).  Scene.world.{wpx, hpx} TRACKS this
+ *   struct (they're the pixel-space view of the same dimensions,
+ *   derived via `pw(cols)` and `ph(rows-2)` in scene_init).  Two
+ *   layers exist because the sim helpers reason in pixel units
+ *   (smooth float positions, sub-cell precision) while the renderer
+ *   reasons in cells.
+ *
+ * Why a tiny 2-field struct (not flat ints on App)
+ *   • Lifecycle isolation: only screen_init / screen_resize /
+ *     screen_free / screen_present touch ncurses' initscr / endwin /
+ *     doupdate.  They all take `Screen *` to make this layer
+ *     explicit at the type level.
+ *   • Symmetry with every other demo in this project — `{cols, rows}`
+ *     is the canonical Screen shape.
+ *
+ * Members
+ *   cols   Terminal width in CELLS (getmaxyx).
+ *   rows   Terminal height in CELLS.  Row 0 hosts the HUD status
+ *          strip; row (rows - 1) hosts the key-hint strip.  The
+ *          simulation paints into rows [1, rows-2].
+ *
+ * Invariants
+ *   cols > 0, rows > 2 (need at least 1 sim row + 2 HUD rows).
+ *   Both refreshed on every SIGWINCH via screen_resize +
+ *   scene_resize (which also recomputes World.wpx/hpx at the new
+ *   extent).
+ */
 typedef struct { int cols, rows; } Screen;
 
 static void screen_init(Screen *s)
@@ -1403,9 +1656,55 @@ static void screen_present(void)
 /* §10  app — signals, resize, variable-dt main loop                      */
 /* ===================================================================== */
 
+/*
+ * FpsCounter — rolling-window frame-rate estimator.
+ *
+ * Per-frame fps would jitter; this accumulates frame_count + elapsed
+ * nanoseconds over a 500 ms window and emits a smoothed `display`
+ * value each time the window fills.  Same shape as the FpsCounter on
+ * every other file in this project.
+ */
+typedef struct {
+    int     frame_count;
+    int64_t window_ns;
+    double  display;
+} FpsCounter;
+
+static void fps_counter_init(FpsCounter *f) {
+    f->frame_count = 0;
+    f->window_ns   = 0;
+    f->display     = 0.0;
+}
+
+static void fps_counter_tick(FpsCounter *f, int64_t dt_ns) {
+    const int64_t FPS_WINDOW_NS = NS_PER_SEC / 2;       /* 500 ms */
+    f->frame_count++;
+    f->window_ns += dt_ns;
+    if (f->window_ns < FPS_WINDOW_NS) return;
+    f->display     = (double)f->frame_count
+                   * (double)NS_PER_SEC / (double)f->window_ns;
+    f->frame_count = 0;
+    f->window_ns   = 0;
+}
+
+/*
+ * App — top-level container for every persistent value.
+ *
+ *   scene         simulation state (World + Robot + InputState + sim)
+ *   screen        terminal cell extent + ncurses lifecycle
+ *   fps           rolling-window fps estimator for HUD
+ *   running       sig_atomic_t flag cleared by SIGINT / SIGTERM + 'q'
+ *   need_resize   sig_atomic_t flag set by SIGWINCH; main reacts at
+ *                 the top of the next iteration
+ *
+ * `g_app` is the program's only file-scope mutable state.  Signal
+ * handlers reach the flags through it; everything else flows via
+ * `App *app` parameter.
+ */
 typedef struct {
     Scene                 scene;
     Screen                screen;
+    FpsCounter            fps;
     volatile sig_atomic_t running;
     volatile sig_atomic_t need_resize;
 } App;
@@ -1424,7 +1723,7 @@ static void cleanup(void)             { endwin(); }
  */
 static void collect_input(App *app)
 {
-    Keys *k = &app->scene.keys;
+    Keys *k = &app->scene.input.keys;
     memset(k, 0, sizeof *k);
 
     int ch;
@@ -1443,12 +1742,12 @@ static void collect_input(App *app)
         case ' ':                           k->stop   = true; break;
 
         case 'p': case 'P':
-            app->scene.robot.paused = !app->scene.robot.paused;
+            app->scene.sim.paused = !app->scene.sim.paused;
             break;
 
         case 'r': case 'R':
             robot_reset(&app->scene.robot,
-                        app->scene.wpx, app->scene.hpx);
+                        app->scene.world.wpx, app->scene.world.hpx);
             trail_clear(&app->scene.robot.trail);
             break;
 
@@ -1457,28 +1756,42 @@ static void collect_input(App *app)
     }
 }
 
+/*
+ * main — variable-dt render loop.
+ *
+ *   (1) atexit + signal handlers
+ *   (2) bring up Screen + App; init Scene at current terminal size
+ *   (3) loop:
+ *       (a) handle pending SIGWINCH
+ *       (b) measure dt (capped to prevent spiral-of-death)
+ *       (c) drain non-blocking input
+ *       (d) advance Scene (apply_keys + robot_tick)
+ *       (e) rolling-window fps counter
+ *       (f) draw + present
+ *       (g) frame cap: sleep so we don't burn the next slot's budget
+ */
 int main(void)
 {
+    /* (1) atexit + signal handlers */
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
+    /* (2) Bring up Screen + App; init Scene */
     App *app     = &g_app;
     app->running = 1;
+    fps_counter_init(&app->fps);
 
     screen_init(&app->screen);
     scene_init (&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t last_ns      = clock_ns();
-    int64_t fps_accum_ns = 0;
-    int     fps_frames   = 0;
-    double  fps_display  = 0.0;
-    const int64_t TICK_NS = NS_PER_SEC / TARGET_FPS;
+    const int64_t FRAME_BUDGET_NS = NS_PER_SEC / TARGET_FPS;
+    int64_t last_ns = clock_ns();
 
     while (app->running) {
 
-        /* (1) handle resize first so subsequent steps see the new size */
+        /* (3a) handle resize first so subsequent steps see the new size */
         if (app->need_resize) {
             screen_resize(&app->screen);
             scene_resize (&app->scene, app->screen.cols, app->screen.rows);
@@ -1486,37 +1799,30 @@ int main(void)
             last_ns = clock_ns();
         }
 
-        /* (2) measure dt, capped to prevent spiral-of-death */
+        /* (3b) measure dt, capped to prevent spiral-of-death */
         int64_t now_ns = clock_ns();
         int64_t dt_ns  = now_ns - last_ns;
         last_ns        = now_ns;
         float   dt     = (float)dt_ns / (float)NS_PER_SEC;
         if (dt > DT_CAP_SEC) dt = DT_CAP_SEC;
 
-        /* (3) drain input */
+        /* (3c) drain input */
         collect_input(app);
 
-        /* (4) advance physics */
+        /* (3d) advance the Scene (apply_keys + robot_tick) */
         scene_tick(&app->scene, dt);
 
-        /* (5) rolling fps display (0.5 s window) */
-        fps_accum_ns += dt_ns;
-        fps_frames++;
-        if (fps_accum_ns >= NS_PER_SEC / 2) {
-            fps_display = (double)fps_frames * 1e9
-                        / (double)fps_accum_ns;
-            fps_accum_ns = 0;
-            fps_frames   = 0;
-        }
+        /* (3e) rolling-window fps counter */
+        fps_counter_tick(&app->fps, dt_ns);
 
-        /* (6) draw + present */
-        scene_draw(&app->scene, fps_display,
+        /* (3f) draw + present */
+        scene_draw(&app->scene, app->fps.display,
                    app->screen.cols, app->screen.rows);
         screen_present();
 
-        /* (7) frame cap — sleep before the NEXT frame's I/O */
+        /* (3g) frame cap — sleep before the NEXT frame's I/O */
         int64_t elapsed = clock_ns() - now_ns;
-        clock_sleep_ns(TICK_NS - elapsed);
+        clock_sleep_ns(FRAME_BUDGET_NS - elapsed);
     }
 
     screen_free(&app->screen);

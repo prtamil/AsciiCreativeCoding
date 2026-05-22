@@ -56,10 +56,31 @@
  *   §5  noise        — 1-D value noise (terrain primitive)
  *   §6  terrain      — height query, slope, surface glyph
  *   §7  trail        — ring buffer of recent body positions
- *   §8  robot        — Phase, Robot, spring physics, per-state ticks
- *   §9  render       — paint terrain, trail, spring, body, PE bar, HUD
+ *   §8  robot/scene  — §8.1 Phase enum + Pose + Velocity + Spring +
+ *                       PhaseFSM + LaunchAim sub-structs (Robot);
+ *                       §8.1b Camera + World + SimControls sub-structs
+ *                       (Scene root); spring physics + per-phase ticks:
+ *                       compress_tick decomposed into
+ *                       compress_progress_fraction +
+ *                       sample_terrain_aim +
+ *                       spring_pe_to_launch_speed +
+ *                       emit_launch_impulse;
+ *                       flight_tick decomposed into
+ *                       integrate_projectile_step +
+ *                       foot_projection_y + commit_landing;
+ *                       scene_tick orchestrator + scene_init / _reset
+ *   §9  render       — paint terrain, trail, spring, body, PE bar, HUD;
+ *                       render_pe_bar decomposed into PeBarGeometry +
+ *                       compute_pe_bar_geometry + pe_ratio_quadratic +
+ *                       paint_pe_label + paint_filled_cell +
+ *                       paint_empty_cell + paint_pe_bar_column;
+ *                       render_hud decomposed into radians_to_degrees +
+ *                       hud_paint_text(_padded) + format_hud_status +
+ *                       draw_hud_status + draw_hud_hint +
+ *                       draw_paused_banner
  *   §10 screen       — ncurses init / present
- *   §11 app          — signals, resize, variable-dt main loop
+ *   §11 app          — FpsCounter + App; signals, resize, key dispatch,
+ *                       variable-dt main loop (7 numbered phases)
  *
  * Keys:
  *   q / Q / ESC      quit
@@ -105,13 +126,19 @@
  *                 keeps the robot pinned at the trigger column —
  *                 producing a smooth follow-cam without snapping.
  *
- * Data-structure: One Robot struct holds: pose (body_px, body_py),
- *                 foot position, velocity (vx, vy), the current
- *                 spring compression in pixels, the phase enum and a
- *                 phase-time accumulator, the cam_x scroll offset,
- *                 the floor mode flag, the speed-level index, the
- *                 trail ring buffer, and a paused flag. No heap
- *                 allocation post-init.
+ * Data-structure: Scene = Robot + World + Camera + SimControls,
+ *                 each a named sub-struct (see §8.1b for the
+ *                 layered-ownership diagram).  Robot itself
+ *                 decomposes into Pose (body + foot anchor
+ *                 points) + Velocity (vx, vy — meaningful only
+ *                 during FLIGHT) + Spring (compression scalar) +
+ *                 PhaseFSM (phase + phase_t) + LaunchAim (cached
+ *                 slope + launch angle) + Trail (ring buffer of
+ *                 past positions).  The five Robot sub-structs
+ *                 mirror the SLIP locomotion model: kinematics
+ *                 (pose) → dynamics (vel + spring) → control
+ *                 (fsm) → targeting (aim).  No heap allocation
+ *                 post-init.
  *
  * Rendering     : Painter's order — last write wins:
  *                 (1) trail dots (oldest first so newest paints over)
@@ -129,19 +156,83 @@
  *                 100 cols × 60 fps that's ~6000 noise samples/sec,
  *                 microseconds. ncurses redraw dominates.
  *
- * References    :
- *   Wikipedia, "Hooke's law" — F = -kx and the quadratic potential
- *     U = ½kx².  https://en.wikipedia.org/wiki/Hooke%27s_law
- *   Wikipedia, "Projectile motion" — derivation of range and peak
- *     for ballistic motion under uniform gravity.
- *     https://en.wikipedia.org/wiki/Projectile_motion
- *   Marc Raibert, "Legged Robots That Balance" (MIT Press, 1986) —
- *     the foundational paper on spring-mass robot locomotion;
- *     the SLIP (Spring-Loaded Inverted Pendulum) model directly
- *     inspires this demo.
- *   Inigo Quilez, "Value noise" — the cosine-interpolated 1-D noise
- *     used here for terrain.  https://iquilezles.org/articles/noise/
- *   This project, robots/diff_drive_robot.c — the wheeled contrast.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── REFERENCES ───────────────────────────────────────────────────────── *
+ *
+ *   ── Legged-robot locomotion (the SLIP model) ───────────────────
+ *   [1] Raibert, M. H. (1986), "Legged Robots That Balance", MIT
+ *       Press — the foundational book on spring-mass robot
+ *       locomotion.  §2 introduces the body-foot state pair (our
+ *       Pose struct); §3 introduces the spring-loaded inverted
+ *       pendulum (SLIP) model (our Spring + PhaseFSM); §4 covers
+ *       terrain-adaptive launch angles (our LaunchAim cached
+ *       during COMPRESS).
+ *   [2] Blickhan, R. (1989), "The spring-mass model for running
+ *       and hopping", J. Biomech. 22(11-12), pp. 1217-1227 — the
+ *       canonical biomechanics formulation of SLIP.  Compact
+ *       reference for the mass-spring-damper analysis of stance
+ *       phase.  This file skips the damper for visual simplicity
+ *       (see "Why no spring damper" note below).
+ *   [3] Geyer, H., Seyfarth, A. & Blickhan, R. (2006), "Compliant
+ *       leg behaviour explains basic dynamics of walking and
+ *       running", Proc. R. Soc. B 273(1603) — extends SLIP to
+ *       running gaits.  Our 3-phase COMPRESS → FLIGHT → LAND
+ *       cycle is the simplest running gait realisation.
+ *
+ *   ── Spring physics + ballistic flight ──────────────────────────
+ *   [4] Hooke's law — F = −k·x; PE = ½·k·x²  (the basis of
+ *       spring_energy in §8.2).  Standard physics result;
+ *       Wikipedia is fine for the formulas.
+ *       https://en.wikipedia.org/wiki/Hooke%27s_law
+ *   [5] Symon, K. R. (1971), "Mechanics" (3rd ed.), Addison-Wesley
+ *       Ch. 3 — classical projectile motion under uniform gravity.
+ *       §8.6 flight_tick is plain forward Euler on this ODE.
+ *
+ *   ── Numerical integration ──────────────────────────────────────
+ *   [6] Hairer, E., Lubich, C. & Wanner, G. (2006), "Geometric
+ *       Numerical Integration" (2nd ed.), Springer — explicit-Euler
+ *       reference.  flight_tick uses forward Euler:
+ *           vy += g · dt
+ *           y  += vy · dt
+ *       Non-symplectic, but each FLIGHT phase is < 1 second and
+ *       energy drift is sub-pixel — invisible at the cell scale.
+ *
+ *   ── Procedural terrain ─────────────────────────────────────────
+ *   [7] Quilez, I., "Value noise" — the cosine-interpolated 1-D
+ *       noise used in §5/§6 for the PERLIN floor mode.  Concise
+ *       online derivation + reference implementation.
+ *       https://iquilezles.org/articles/noise/
+ *   [8] Perlin, K. (1985), "An image synthesizer", ACM SIGGRAPH
+ *       Computer Graphics 19(3) — the original procedural-noise
+ *       paper.  Value noise (Quilez [7]) is a simplification of
+ *       Perlin's gradient noise; we use value noise because 1-D
+ *       gradient noise is overkill for a single height profile.
+ *
+ *   ── Variable-timestep game loop ────────────────────────────────
+ *   [9] Fiedler, G. (2004, updated 2014), "Fix Your Timestep!",
+ *       https://gafferongames.com/post/fix_your_timestep/ — the
+ *       canonical case for FIXED-step physics.  This file
+ *       deliberately uses VARIABLE dt: the ODE is non-stiff (no
+ *       coupled springs in the inner loop — spring loading is
+ *       linear ramp, FLIGHT is ballistic).  Fiedler's DT_CAP rule
+ *       (100 ms hard cap, DT_CAP_SEC here) is the only piece we
+ *       adopt.
+ *
+ *   ── ncurses rendering substrate ────────────────────────────────
+ *   [10] Raymond, E. S., "NCURSES Programming HOWTO" — §6 (colour
+ *        pairs) for per-element semantic colouring (terrain /
+ *        body / spring / trail), §11 (output options) for the
+ *        wnoutrefresh + doupdate diff-only write pattern.
+ *
+ *   ── Companion files in this project ────────────────────────────
+ *   See also:
+ *     robots/diff_drive_robot.c    — the WHEELED contrast: pose
+ *       comes from wheel speeds instead of foot impulses.  Read
+ *       this second to see how the kinematic pipeline changes
+ *       when the contact model changes.
+ *     animation/hexpod_tripod.c    — 6-leg insect locomotion
+ *       (gait coordination on top of leg kinematics).
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -331,98 +422,6 @@
  *   Floor contact test    : foot_proj_y ≥ floor_y_at(body_x)
  *
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Forward-Euler integration. We use plain `vy += g·dt; py += vy·dt`
- *    rather than the more accurate `py += (v0 + v1)/2 · dt`. At 60 fps
- *    the worst-case position error per step is ½·g·dt² = 0.027 px —
- *    invisible. For higher dt or stiffer physics we'd switch to RK4
- *    or Verlet, but here Euler is fine.
- *
- *  • Slope finite difference uses central difference (`floor(x+δ) -
- *    floor(x-δ)`) so it's unbiased and second-order accurate. Don't
- *    accidentally use forward difference — it lags the actual slope.
- *
- *  • `phase_t` accumulates in seconds since the last phase transition.
- *    Reset it to 0 every time you switch phases. A leftover phase_t
- *    from the previous phase causes immediate re-trigger.
- *
- *  • Camera target. We clamp `cam_x ≥ 0` so we don't scroll left of
- *    world origin. The robot can never lose the camera leftward.
- *
- *  • PERLIN mode hashes world_x → height. If you reset the seed
- *    (key 'n') the existing terrain you can already see CHANGES,
- *    because future calls hash the same world_x to a different value.
- *    By design.
- *
- *  • Resize. SIGWINCH triggers screen_resize and rebases base_y so
- *    terrain stays at ~72 % of the new height. Trail and pose are
- *    preserved.
- *
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Press 'r' to reset. Robot spawns near left edge in COMPRESS.
- *    Energy gauge fills quadratically (slow at first, fast at end).
- *
- *  • Stopwatch the COMPRESS phase: should be exactly T_COMPRESS = 0.45 sec.
- *
- *  • At launch, peak height should be ≈ 5 cells above launch (default).
- *    Visually: head reaches about row mid_screen − 5 at apex.
- *
- *  • Range per jump on flat ground: ≈ 35 columns at 1.0× speed.
- *
- *  • Press 'a' to cycle speeds. At 3.0× the range becomes ≈ 105
- *    columns — robot easily leaves the screen each jump and the
- *    camera pans every cycle.
- *
- *  • Switch to PERLIN ('f'): launch angle now visibly adapts to
- *    terrain. Notice the slope readout in the HUD.
- *
- *  • Press 'p' (pause) at apex. The robot freezes mid-arc — verify
- *    that the trail trail is a clean parabola.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read robots/diff_drive_robot.c first (pose
- *      integration); robots/walking_robot.c if state-machine gait
- *      is new. NEW LESSONS here: Hooke's-law spring, projectile
- *      motion, terrain-aware launch, side-scrolling camera.
- *   2. §8 robot — THE HEART. Sub-sections:
- *        - phase enum (COMPRESS / FLIGHT / LAND)
- *        - per-phase tick functions
- *        - launch velocity computation (T2 below)
- *      Read AFTER tutorials T1-T6 below.
- *   3. §6 terrain — height query + slope (T5).
- *   4. §9 render — paint ground, trail, spring, body, energy bar.
- *   5. §1-§5, §7, §10-§11 — config / clock / colour / coords /
- *      noise / trail / screen / app loop. Skim if seen.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   body_px, body_py        body centre position in world pixels.
- *   foot_px, foot_py        foot position. Equals body_py + leg
- *                           length during stance; locked during
- *                           flight.
- *   vx, vy                  body velocity (px/sec).
- *   spring_compress         current compression in pixels, 0 to
- *                           SPRING_COMPRESS_MAX. ENERGY-storing
- *                           variable.
- *   PE                      potential energy stored in spring
- *                           (½ k x²). Visualised by the energy bar.
- *   phase                   COMPRESS, FLIGHT, or LAND enum.
- *   phase_time              seconds spent in current phase.
- *   T_COMPRESS, T_LAND      duration of compress / land phases.
- *   GRAVITY                 downward acceleration (px/sec²).
- *   SPRING_K                spring constant (Hooke's law force =
- *                           -k · x).
- *   cam_x                   horizontal camera offset for scrolling
- *                           (T6 below).
  *
  * Background you need
  * ───────────────────
@@ -443,242 +442,6 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Six tutorials that build a hopping pogo-stick robot from
- * first principles.
- *
- *   T1  The three-phase state machine — COMPRESS / FLIGHT / LAND
- *   T2  Hooke's law — quadratic energy storage
- *   T3  Energy conservation — PE → KE at release
- *   T4  Projectile motion — Euler integration of gravity
- *   T5  Terrain interaction — slope-adapted launch angle
- *   T6  Side-scrolling camera — pin the robot, scroll the world
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  THE THREE-PHASE STATE MACHINE — COMPRESS / FLIGHT / LAND
- * ────────────────────────────────────────────────────────────
- * The robot's behaviour repeats forever in a 3-state cycle:
- *
- *      ┌──────────┐ T_COMPRESS  ┌────────┐  foot hits  ┌──────┐
- *      │ COMPRESS │ ──────────► │ FLIGHT │ ──────────► │ LAND │
- *      │ (load)   │  elapsed    │ (arc)  │  ground     │ (stun)│
- *      └──────────┘             └────────┘             └──────┘
- *           ▲                                                │
- *           │                                                │
- *           └────────── T_LAND elapsed ──────────────────────┘
- *
- *   COMPRESS:
- *     - body sinks toward foot
- *     - spring_compress ramps 0 → MAX over T_COMPRESS sec
- *     - PE accumulates = ½ k · spring_compress²
- *     - at full compression, compute launch velocity (T2)
- *     - transition to FLIGHT
- *
- *   FLIGHT:
- *     - body undergoes projectile motion (T4)
- *     - vx constant, vy += GRAVITY · dt
- *     - body_pos += (vx, vy) · dt
- *     - record body_pos in trail buffer
- *     - when foot reaches terrain, transition to LAND
- *
- *   LAND:
- *     - body locked at landing pose for T_LAND seconds
- *     - flash glyph from '@' to '*' for visual feedback
- *     - after T_LAND, transition back to COMPRESS
- *
- * Each phase has its own TICK FUNCTION in §8. Phase transitions
- * happen at clear, well-defined events (timer expires, geometric
- * contact). Same state-machine pattern as walking_robot's gait,
- * matrix_snowflake's FALL ↔ FLASH, fireworks' IDLE → RISING →
- * EXPLODED.
- *
- * State machines are GREAT for cyclic mechanical processes —
- * the cycle structure becomes EXPLICIT in the code rather than
- * being hidden in nested if/else branches.
- *
- * T2  HOOKE'S LAW — QUADRATIC ENERGY STORAGE
- * ──────────────────────────────────────────
- * A spring resists compression with force PROPORTIONAL to
- * displacement:
- *
- *     F = -k · x          (Hooke's law)
- *
- *   - x = compression distance (positive when squeezed)
- *   - k = spring constant (stiffness)
- *   - F = restoring force (negative = pushing back)
- *
- * The WORK you do compressing the spring is stored as
- * POTENTIAL ENERGY. Integrating F dx from 0 to x:
- *
- *     PE = ∫₀ˣ k · ξ dξ = ½ k x²
- *
- * That's the famous QUADRATIC potential. Properties:
- *
- *   - Compress 2× as far → store 4× as much energy.
- *   - Compress 3× as far → store 9× as much energy.
- *   - Compress to MAX (default 48 px) → store ½ · k · MAX² of PE.
- *
- * In the energy bar visualisation: the bar fills SLOWLY at
- * first (low compression = low PE) and SHOOTS UP near MAX (each
- * additional pixel of compression adds disproportionately
- * more energy).
- *
- * Implementation note: we don't actually integrate Hooke's law
- * as an ODE. We just RAMP spring_compress linearly over
- * T_COMPRESS seconds. This is a SIMPLIFICATION — a real spring
- * would oscillate. For visual purposes the linear ramp is
- * cleaner.
- *
- * T3  ENERGY CONSERVATION — PE → KE AT RELEASE
- * ────────────────────────────────────────────
- * When the spring releases, ALL stored PE converts to KINETIC
- * energy:
- *
- *     ½ k x² = ½ m v²
- *     ⟹    v = x · √(k / m)
- *
- * For our defaults (m = 1, k = SPRING_K, x_max = 48 px):
- *
- *     v_launch = 48 · √k = 240 px/sec   (k = 25)
- *
- * That's the body's TOTAL launch speed. We split it into
- * horizontal and vertical components by the LAUNCH ANGLE θ:
- *
- *     vx = v_launch · cos θ
- *     vy = -v_launch · sin θ          (negative = upward in
- *                                      screen-y-down)
- *
- * The launch angle is computed from terrain slope (T5). Flat
- * ground gives a near-vertical launch (θ ≈ 75°); a steep up-
- * slope gives a more horizontal launch.
- *
- * Why energy conservation matters: it ensures the JUMP HEIGHT
- * scales with k and x_max in physically meaningful ways. Want
- * higher jumps? Increase k (stiffer spring) or x_max (deeper
- * compression). Same scaling as a real pogo stick.
- *
- * T4  PROJECTILE MOTION — EULER INTEGRATION OF GRAVITY
- * ────────────────────────────────────────────────────
- * In FLIGHT, only gravity acts on the body. Two integrators:
- *
- *     vy += GRAVITY · dt          ← gravity accelerates downward
- *     body_py += vy · dt          ← position from velocity
- *     body_px += vx · dt          ← horizontal velocity constant
- *
- * Three lines. That's PROJECTILE MOTION — the same physics
- * a thrown rock follows.
- *
- * Trajectory analytically:
- *
- *     y(t) = y₀ + vy_init · t + ½ · g · t²    ← parabola
- *     x(t) = x₀ + vx · t                       ← linear
- *
- * The locus (x, y(x)) traces a parabola — confirmed by pausing
- * at apex and checking the trail.
- *
- * Termination condition: when the foot's projected position
- * (foot_py = body_py + leg_length) reaches the terrain
- * height_at(foot_px), transition to LAND.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │            O   ← apex (vy = 0)                   │
- *      │           ╱ ╲                                    │
- *      │         ╱     ╲                                  │
- *      │       ╱         ╲                                │
- *      │      ●           ↘                               │
- *      │   launch       ╱   ●  ← landing                  │
- *      │            ↘                                     │
- *      │      _____________________                       │
- *      │      ground                                      │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * Same projectile machinery as fireworks_rain T1 (rocket
- * physics) but applied to the robot body instead of sparks.
- *
- * T5  TERRAIN INTERACTION — SLOPE-ADAPTED LAUNCH ANGLE
- * ────────────────────────────────────────────────────
- * On flat ground the launch angle is fixed (e.g. 75°). On
- * SLOPED terrain the robot needs to lean INTO the slope —
- * launch more horizontally on uphill, more vertically on
- * downhill — to reach a meaningful distance.
- *
- *     slope = (height_at(x + dx) - height_at(x - dx)) / (2 · dx)
- *     slope_angle = atan(slope)
- *
- *     base_angle = LAUNCH_ANGLE_FLAT       (e.g. 75°)
- *     adjusted = base_angle - slope_adjust · slope_angle
- *
- *     vx = v_launch · cos adjusted
- *     vy = -v_launch · sin adjusted
- *
- * The slope_adjust factor controls how much the robot leans —
- * 0.5 to 1.0 typically. Too high and the robot jumps almost
- * along the slope (boring); too low and it gets stuck in
- * valleys.
- *
- * In FLAT mode, terrain is just a horizontal line; slope is
- * always zero, launch angle never changes. In PERLIN mode,
- * terrain comes from 1-D value noise — every reset can give
- * a different landscape (with 'n' = new seed).
- *
- * Real-world animal jumpers do this instinctively: a frog on
- * an incline jumps differently than on flat ground. Boston
- * Dynamics' robots include explicit terrain-perception in
- * their footstep planners.
- *
- * T6  SIDE-SCROLLING CAMERA — PIN THE ROBOT, SCROLL THE WORLD
- * ──────────────────────────────────────────────────────────
- * Without a camera, the robot would jump off the right edge
- * of the screen and disappear. With a camera, the world
- * scrolls past while the robot stays visible.
- *
- * Naive: cam_x = body_px - cols/2 (always centred). Jarring,
- * because the robot then NEVER seems to move horizontally —
- * the world moves underneath it.
- *
- * Better: TRIGGER-ZONE CAMERA. While the robot is in the LEFT
- * 80% of the screen, camera doesn't move (cam_x = 0). Once
- * body_px exceeds 80% of screen_width, the camera CHASES the
- * robot to keep it pinned at the trigger column:
- *
- *     trigger_x = world_x - 0.8 · screen_w
- *     if cam_x < trigger_x:
- *       cam_x = lerp(cam_x, trigger_x, EXP_CHASE_RATE · dt)
- *
- * Result:
- *   - Early jumps: world is fixed, robot visibly moves right.
- *   - At 80%: camera engages, robot stays in same column,
- *     terrain scrolls in from the right.
- *
- * Exponential lerp gives a SMOOTH catch-up rather than an
- * instantaneous snap. Standard side-scroller pattern (Mario,
- * etc.).
- *
- * Same lerp pattern is used everywhere "follow the player but
- * smoothly":
- *   - 3rd-person camera in 3D games
- *   - actual_target tracking in ik_tentacle_seek (T5 there)
- *   - mouse-cursor following in UI
- *
- * Decision tree for camera behaviours:
- *
- *   character moves through fixed world?
- *     → trigger-zone scroll (this file)
- *
- *   character is the centre of attention?
- *     → centred camera, world scrolls
- *
- *   character interacts with map landmarks?
- *     → cinematic / context-aware (more complex)
- *
- * For procedural-terrain endless-jumper simulations, trigger-
- * zone is the clean answer.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -1008,6 +771,37 @@ static float terrain_noise(float world_x)
 /* §6  terrain — height query, slope, surface glyph                       */
 /* ===================================================================== */
 
+/*
+ * FloorMode — selector for the terrain-height function.
+ *
+ * Intent
+ *   Two ways to compute floor_y_at(world_x): a constant baseline
+ *   (FLAT) for testing the physics in isolation, or a value-noise
+ *   profile (PERLIN) for the visually-interesting case where the
+ *   robot has to adapt its launch angle to the local slope.  The
+ *   'f' key cycles between them at runtime so the user can compare
+ *   both behaviours without restarting.
+ *
+ * Members
+ *   FLOOR_FLAT    = 0   Constant baseline at base_y.  Slope = 0
+ *                       everywhere, so the robot always launches at
+ *                       LAUNCH_ANGLE_FLAT.  Useful for debugging
+ *                       the spring + flight physics in isolation.
+ *   FLOOR_PERLIN  = 1   1-D value noise around base_y (see §5/§6).
+ *                       Slope varies with x, so each launch picks
+ *                       up the local terrain tilt via LaunchAim.
+ *   FLOOR_COUNT         Sentinel for modular cycling: `mode = (mode
+ *                       + 1) % FLOOR_COUNT`.
+ *
+ * Why FLOOR_FLAT = 0 deliberately
+ *   memset-initialised Worlds default to FLAT without an explicit
+ *   initialiser; the main loop bumps the default to PERLIN for
+ *   visual interest, but the FLAT default makes scene_reset safe.
+ *
+ * References
+ *   [7] Quilez "Value noise" — the function underlying FLOOR_PERLIN.
+ *   [8] Perlin 1985 — the canonical procedural-noise paper.
+ */
 typedef enum { FLOOR_FLAT = 0, FLOOR_PERLIN, FLOOR_COUNT } FloorMode;
 static const char *FLOOR_NAMES[FLOOR_COUNT] = { "FLAT  ", "PERLIN" };
 
@@ -1064,9 +858,62 @@ static chtype surface_glyph(float dy)
 /* ===================================================================== */
 
 /*
- * Stores the last TRAIL_CAP world positions. Newest at index
- * `(head − 1 + TRAIL_CAP) mod TRAIL_CAP`; oldest at `head` itself
- * once the buffer is full.
+ * Trail — circular ring buffer of the body's recent positions in
+ * WORLD pixel space.
+ *
+ * Intent
+ *   Renders as the fading-dot arc trail behind the robot.  Only
+ *   FLIGHT-phase positions are pushed (flight_tick calls
+ *   trail_push); COMPRESS and LAND don't sample because the body
+ *   isn't moving meaningfully — the result is that the trail
+ *   visualises ONLY the ballistic arcs, making each jump's
+ *   parabolic shape readable.
+ *
+ *   Two parallel float arrays (`wx[]`, `wy[]`) instead of a single
+ *   `Vec2[]` because the read path (render_trail) iterates each
+ *   axis independently — saves one indirection per cell in the
+ *   inner draw loop.
+ *
+ * Why a ring buffer (not a fixed-length array + memmove)
+ *   • O(1) push: just write at `head` and bump.  memmove would be
+ *     O(TRAIL_CAP) per FLIGHT frame.
+ *   • Constant memory: the buffer never grows; old entries are
+ *     silently overwritten by new ones.
+ *   • Wrap-aware iteration: render_trail walks
+ *     `(head − 1 − k + TRAIL_CAP) mod TRAIL_CAP` to read
+ *     newest-first.
+ *
+ * Why WORLD coordinates (not screen / camera-relative)
+ *   The camera scrolls as the robot moves forward.  Storing trail
+ *   positions in WORLD space means they stay anchored to the
+ *   ground regardless of camera pan — the trail "stays behind" as
+ *   the camera follows the robot, exactly as expected for a
+ *   trajectory visualisation.  The renderer applies
+ *   (world_x − cam_x) → screen_x at draw time.
+ *
+ * Members
+ *   wx[TRAIL_CAP]   Past x positions in WORLD pixel space.
+ *   wy[TRAIL_CAP]   Past y positions, parallel to wx[].
+ *   head            Index of the NEXT write slot.  After the
+ *                   buffer fills, `head` wraps and the oldest
+ *                   entry becomes the next slot to overwrite.
+ *   count           Number of valid entries (∈ [0, TRAIL_CAP]).
+ *                   Grows from 0 to TRAIL_CAP after the first
+ *                   TRAIL_CAP FLIGHT frames; stays at TRAIL_CAP
+ *                   thereafter.
+ *
+ * Invariants
+ *   0 ≤ head  < TRAIL_CAP.
+ *   0 ≤ count ≤ TRAIL_CAP.
+ *   count < TRAIL_CAP  ⇒  wx[0..count-1] are valid (pre-wrap).
+ *   count == TRAIL_CAP ⇒  every slot is valid; head points at the
+ *                          OLDEST entry (next to overwrite).
+ *
+ * References
+ *   Knuth, "The Art of Computer Programming" Vol. 1 §2.2.2 —
+ *     circular buffer ("circular queue") as the canonical bounded
+ *     FIFO data structure.  Same pattern used in diff_drive_robot.c
+ *     for its trail.
  */
 typedef struct {
     float wx[TRAIL_CAP];
@@ -1092,8 +939,43 @@ static void trail_push(Trail *t, float wx, float wy)
 /* §8  robot — Phase, Robot, spring physics, per-state ticks              */
 /* ===================================================================== */
 
-/* ── §8.1 Phase + Robot type ──────────────────────────────────────── */
+/* ── §8.1 Phase + Robot sub-structs ──────────────────────────────── */
 
+/*
+ * Phase — the three-phase locomotion FSM driving every jump cycle.
+ *
+ * State diagram
+ *
+ *      ┌────────────────────┐  spring_compress hits SPRING_COMPRESS_MAX
+ *      │  PHASE_COMPRESS    │ ──────────────────────────────────────►
+ *      │  spring loads;     │                                       │
+ *      │  body sinks;       │                                       ▼
+ *      │  slope sampled     │                          ┌────────────────────┐
+ *      └────────────────────┘                          │  PHASE_FLIGHT      │
+ *           ▲                                          │  ballistic arc;    │
+ *           │ phase_t ≥ LAND_HOLD_SEC                  │  v = launch impulse│
+ *           │                                          │  + gravity         │
+ *      ┌────────────────────┐  body_py ≥ terrain      └────────────────────┘
+ *      │  PHASE_LAND        │ ◄──────────────────────────────────── │
+ *      │  impact flash;     │                                       │
+ *      │  body locked;      │                                       │
+ *      │  count = count+1   │                                       │
+ *      └────────────────────┘                                       │
+ *
+ *   PHASE_COMPRESS — spring loads at SPRING_LOAD_RATE; once it
+ *                    reaches SPRING_COMPRESS_MAX, the launch
+ *                    impulse fires and we transition to FLIGHT.
+ *   PHASE_FLIGHT   — Euler-integrated projectile motion under
+ *                    gravity.  Velocity comes from the cached
+ *                    LaunchAim direction × spring potential energy.
+ *   PHASE_LAND     — landing flash for LAND_HOLD_SEC; body is
+ *                    pinned to the new foot position.  When the
+ *                    hold expires, return to COMPRESS for next jump.
+ *
+ * Why PHASE_COMPRESS = 0 deliberately
+ *   memset-initialised Robots start in COMPRESS without an
+ *   explicit initialiser; scene_reset uses this implicitly.
+ */
 typedef enum {
     PHASE_COMPRESS = 0,    /* spring loading, body sinking      */
     PHASE_FLIGHT,          /* projectile arc                    */
@@ -1103,63 +985,292 @@ typedef enum {
 static const char *PHASE_NAMES[] = { "LOAD", "FLY ", "LAND" };
 
 /*
- * Robot — full simulation state.
+ * Pose — kinematic position of the robot.
  *
- *   Pose:
- *     body_px, body_py     centre of body in pixel space
- *     foot_px, foot_py     ground contact point (fixed during
- *                          COMPRESS / LAND, set on landing)
- *     vx, vy               velocity in pixel/sec (only meaningful
- *                          during FLIGHT)
+ * Intent
+ *   The robot has TWO anchor points:
+ *     - foot: ground contact (changes only on LAND)
+ *     - body: centre of mass (computed from foot + spring during
+ *             COMPRESS/LAND, integrated freely during FLIGHT)
  *
- *   Spring:
- *     spring_compress      current compression in pixels
- *                          (0 at rest, SPRING_COMPRESS_MAX at full)
+ *   During FLIGHT body_px/body_py float free under Euler-integrated
+ *   gravity; foot_px/foot_py stay frozen (the previous touchdown
+ *   point).  On LAND, foot is updated to the new touchdown and body
+ *   re-anchors via pose_from_spring.
  *
- *   Phase machinery:
- *     phase                COMPRESS / FLIGHT / LAND
- *     phase_t              seconds since current phase began
+ * Members
+ *   body_px, body_py   Centre of body in WORLD pixel space.
+ *   foot_px, foot_py   Ground contact point in WORLD pixel space.
  *
- *   Camera:
- *     cam_x                world x of left screen edge
+ * Invariants
+ *   foot_py is on the terrain (terrain_y(foot_px) == foot_py) at
+ *   the START of each cycle.
+ *   body_py < foot_py − BODY_HALF_H during COMPRESS (body sits
+ *   above foot).
  *
- *   Cached terrain values (computed during COMPRESS):
- *     slope_angle          atan slope at current foot position
- *     eff_angle            slope-adapted launch angle
- *
- *   World:
- *     base_y               flat-floor y; perlin terrain centred here
- *     floor_mode           FLAT or PERLIN
- *
- *   UI:
- *     speed_level          index into SPEED_MULTS, cycled by 'a'
- *     launch_count         how many jumps so far (HUD readout)
- *     paused               if true, robot_tick returns early
- *
- *   Trail (ring buffer of past positions).
+ * References
+ *   [1] Raibert, "Legged Robots That Balance" (MIT Press 1986) §2 —
+ *       the canonical hopping-robot model.  body + foot is the
+ *       Raibert state pair.
  */
 typedef struct {
-    float     body_px, body_py;
-    float     foot_px, foot_py;
-    float     vx, vy;
-    float     spring_compress;
+    float body_px, body_py;
+    float foot_px, foot_py;
+} Pose;
 
-    Phase     phase;
-    float     phase_t;
+/*
+ * Velocity — body linear velocity (pixels/sec).
+ *
+ * Intent
+ *   Only meaningful during PHASE_FLIGHT.  Set ONCE at the
+ *   COMPRESS → FLIGHT transition (impulse from spring PE × launch
+ *   direction); evolves under gravity each frame.  Zero during
+ *   COMPRESS and LAND.
+ *
+ * Members
+ *   vx, vy   Linear velocity components, pixels per second.
+ *            +x = right, +y = down (screen convention).
+ *
+ * References
+ *   [3] Hairer et al., "Geometric Numerical Integration" — the
+ *       Euler integrator in tick_flight uses:  vy += g · dt;
+ *       y += vy · dt.
+ */
+typedef struct {
+    float vx, vy;
+} Velocity;
 
-    float     cam_x;
-    float     slope_angle;
-    float     eff_angle;
+/*
+ * Spring — the leg spring state.
+ *
+ * Intent
+ *   A single scalar: the current compression of the leg spring
+ *   (Hooke's law model with rest length SPRING_REST and stiffness
+ *   SPRING_K).  During COMPRESS, this ramps from 0 to
+ *   SPRING_COMPRESS_MAX at SPRING_LOAD_RATE.  At launch, the
+ *   stored potential energy (½ · K · compress²) becomes the body's
+ *   kinetic energy along the launch direction.
+ *
+ * Members
+ *   compress   Current compression in pixels (0 at rest,
+ *              SPRING_COMPRESS_MAX at full load).
+ *
+ * Invariants
+ *   0 ≤ compress ≤ SPRING_COMPRESS_MAX.
+ *
+ * References
+ *   [1] Raibert §3 — the spring-loaded inverted pendulum (SLIP)
+ *       model; this struct is its compression state.
+ *   [2] Hooke's law — F = −K·x; PE = ½·K·x²  (see spring_energy).
+ */
+typedef struct {
+    float compress;
+} Spring;
 
-    float     base_y;
-    FloorMode floor_mode;
+/*
+ * PhaseFSM — current phase + phase-timer.
+ *
+ * Intent
+ *   Two pieces of state that always move together: the Phase enum
+ *   + the per-phase elapsed timer.  Bundling them prevents the bug
+ *   of "phase == LAND but phase_t is stale from FLIGHT".
+ *
+ * Members
+ *   phase       Current Phase (COMPRESS / FLIGHT / LAND).
+ *   phase_t     Seconds since the current phase began.  Reset to 0
+ *               at every phase transition.
+ *
+ * Invariants
+ *   phase_t ≥ 0.
+ *   phase == LAND  ⇒ phase_t counts up toward LAND_HOLD_SEC, then
+ *                    the FSM transitions back to COMPRESS.
+ */
+typedef struct {
+    Phase phase;
+    float phase_t;
+} PhaseFSM;
 
-    int       speed_level;
-    int       launch_count;
-    bool      paused;
+/*
+ * LaunchAim — cached launch-direction angles, sampled during
+ * COMPRESS so the launch impulse can re-use them at FLIGHT start.
+ *
+ * Intent
+ *   On flat ground the robot launches at LAUNCH_ANGLE_FLAT
+ *   (typically ~45° for maximum range).  On sloped terrain the
+ *   launch angle ROTATES with the surface normal so the robot's
+ *   "jump direction" feels intuitive.
+ *
+ *   Both values are computed ONCE when the spring is full (the
+ *   COMPRESS → FLIGHT transition) and then frozen until the next
+ *   COMPRESS sample.  This avoids recomputing the slope (which
+ *   queries the noise function) in the inner integrator.
+ *
+ * Members
+ *   slope_angle   atan(dy/dx) of the terrain at the current foot
+ *                 position.  Radians.  Positive = surface tilts
+ *                 down-right.
+ *   eff_angle     The effective launch angle = LAUNCH_ANGLE_FLAT +
+ *                 slope_angle (clamped).  This is what (vx, vy)
+ *                 actually point along at FLIGHT start.
+ *
+ * References
+ *   [1] Raibert §4 — terrain-adaptive hopping uses the leg posture
+ *       to set the launch direction; this struct caches the
+ *       equivalent decision for our simplified planar model.
+ */
+typedef struct {
+    float slope_angle;
+    float eff_angle;
+} LaunchAim;
 
+/*
+ * Robot — the simulated agent.
+ *
+ * Layered ownership
+ *
+ *     Robot
+ *       ├── pose      : Pose         ← body + foot anchor points
+ *       ├── vel       : Velocity     ← (vx, vy) — meaningful during FLIGHT
+ *       ├── spring    : Spring       ← leg compression
+ *       ├── fsm       : PhaseFSM     ← (phase, phase_t) state machine
+ *       ├── aim       : LaunchAim    ← cached slope + launch angle
+ *       └── trail     : Trail        ← ring buffer of past positions
+ *
+ *   Five layered concerns: kinematics (pose), dynamics (vel + spring),
+ *   control (fsm), targeting (aim), history (trail).  Each sub-struct
+ *   names its responsibility, so a reader can answer "what state does
+ *   this helper touch?" from the parameter list alone (e.g.
+ *   spring_energy takes only the Spring; pose_from_spring touches
+ *   Pose + Spring).
+ *
+ * Why no World/Camera/UI fields here
+ *   Scene owns those — see §9 for the layered diagram.  Robot stays
+ *   purely about the agent's own state, not the environment it
+ *   moves through or the controls used to interact with it.
+ *
+ * References
+ *   [1] Raibert, "Legged Robots That Balance" (MIT Press 1986) —
+ *       the SLIP model + 3-phase jump cycle this file implements.
+ */
+typedef struct {
+    Pose      pose;
+    Velocity  vel;
+    Spring    spring;
+    PhaseFSM  fsm;
+    LaunchAim aim;
     Trail     trail;
 } Robot;
+
+/* ── §8.1b Scene sub-structs ─────────────────────────────────────── */
+
+/*
+ * Camera — scrolling viewport into world space.
+ *
+ * Intent
+ *   The world extends well past the terminal width (the robot jumps
+ *   FORWARD continuously).  Camera holds a single scalar — the world
+ *   x of the LEFT screen edge — and scrolls smoothly toward the
+ *   robot via cam_update (low-pass filter, CAM_SPEED time-constant).
+ *
+ *   Pixel → screen conversion: screen_x = world_x − cam_x.  Anything
+ *   off-screen is silently clipped by the renderer's bounds check.
+ *
+ * Members
+ *   cam_x   World x of the left screen edge (pixels).  Always ≥ 0.
+ *           Camera trails the robot at a fixed screen-x offset, so
+ *           the robot stays visually centred.
+ *
+ * Invariants
+ *   cam_x ≥ 0 (clamp in cam_update).
+ */
+typedef struct {
+    float cam_x;
+} Camera;
+
+/*
+ * World — the terrain configuration.
+ *
+ * Intent
+ *   Bundles the two values that describe the ground the robot
+ *   bounces on: which floor algorithm to use (FLAT or PERLIN) and
+ *   the baseline y coordinate around which terrain undulates.
+ *
+ *   floor_mode is user-cyclable via 'f'; base_y is recomputed on
+ *   SIGWINCH (terrain re-centres if the terminal height changes).
+ *
+ * Members
+ *   base_y       Flat-floor y in pixel space.  PERLIN terrain
+ *                undulates around this baseline.  Recomputed from
+ *                screen rows in scene_init / app_do_resize.
+ *   floor_mode   FLAT or PERLIN.  Cycled by 'f' / 'F' keys.
+ *
+ * Invariants
+ *   base_y > 0 after scene_init.
+ *   floor_mode ∈ {FLOOR_FLAT, FLOOR_PERLIN}.
+ */
+typedef struct {
+    float     base_y;
+    FloorMode floor_mode;
+} World;
+
+/*
+ * SimControls — user-facing playback knobs + scene-level counters.
+ *
+ * Intent
+ *   The input handler writes these; scene_tick + render_hud read
+ *   them.  Same shape as the SimControls sub-struct on every other
+ *   demo's Scene in this project.
+ *
+ *   `launch_count` lives here because it's a SCENE-level statistic
+ *   (how many jumps have happened in this session) — not per-Robot.
+ *
+ * Members
+ *   paused         true → scene_tick early-returns; rendering
+ *                  continues.  Toggled by SPACE / p key.
+ *   speed_level    Index into SPEED_MULTS — multiplier on the
+ *                  launch impulse.  Cycled by 'a' key.
+ *   launch_count   Number of jumps since the last reset (HUD
+ *                  readout).  Bumped at every COMPRESS → FLIGHT
+ *                  transition.
+ *
+ * Invariants
+ *   0 ≤ speed_level < SPEED_LEVELS.
+ *   launch_count ≥ 0.
+ */
+typedef struct {
+    bool paused;
+    int  speed_level;
+    int  launch_count;
+} SimControls;
+
+/*
+ * Scene — owns ALL simulation state for one run.
+ *
+ * Layered ownership
+ *
+ *     Scene
+ *       ├── robot    : Robot        ← the simulated agent (§8.1)
+ *       ├── world    : World        ← base_y + floor_mode
+ *       ├── camera   : Camera       ← scrolling viewport
+ *       └── sim      : SimControls  ← paused + speed_level + launch_count
+ *
+ *   Data-flow direction:
+ *
+ *     world      → robot.aim     (slope sampled during COMPRESS)
+ *     robot.pose → camera        (cam tracks body_px in cam_update)
+ *     sim        → robot.vel     (speed_level scales launch impulse)
+ *
+ *   Helpers that touch only one sub-domain take just that sub-struct
+ *   (e.g. spring_energy takes only the Spring; cam_update touches
+ *   Camera + Robot.pose); the "what does this function touch"
+ *   question is answerable from the signature.
+ */
+typedef struct {
+    Robot       robot;
+    World       world;
+    Camera      camera;
+    SimControls sim;
+} Scene;
 
 /* ── §8.2 spring physics — Hooke's law & energy ──────────────────── */
 
@@ -1187,8 +1298,8 @@ static inline float leg_length(float compress)
  */
 static void pose_from_spring(Robot *r)
 {
-    r->body_px = r->foot_px;
-    r->body_py = r->foot_py - leg_length(r->spring_compress) - BODY_HALF_H;
+    r->pose.body_px = r->pose.foot_px;
+    r->pose.body_py = r->pose.foot_py - leg_length(r->spring.compress) - BODY_HALF_H;
 }
 
 /* ── §8.3 effective launch angle (slope-adapted) ─────────────────── */
@@ -1216,18 +1327,18 @@ static float effective_launch_angle(float slope)
  *
  * cam_x is clamped to ≥ 0 so we never scroll left of world origin.
  */
-static void cam_update(Robot *r, float dt, int cols)
+static void cam_update(Scene *s, float dt, int cols)
 {
     float scr_w   = (float)pw(cols);
-    float bot_sx  = r->body_px - r->cam_x;          /* screen x of robot */
+    float bot_sx  = s->robot.pose.body_px - s->camera.cam_x;  /* screen x of robot */
     float trigger = scr_w * CAM_TRIGGER;
 
     if (bot_sx > trigger) {
-        float target  = r->body_px - trigger;
-        r->cam_x     += (target - r->cam_x) * CAM_SPEED * dt;
+        float target = s->robot.pose.body_px - trigger;
+        s->camera.cam_x += (target - s->camera.cam_x) * CAM_SPEED * dt;
     }
 
-    if (r->cam_x < 0.0f) r->cam_x = 0.0f;
+    if (s->camera.cam_x < 0.0f) s->camera.cam_x = 0.0f;
 }
 
 /* ── §8.5 compress_tick — load the spring, then launch ───────────── */
@@ -1247,30 +1358,90 @@ static void cam_update(Robot *r, float dt, int cols)
  * Decompose v into (vx, vy) using the effective launch angle and the
  * horizontal speed multiplier. Clear compress and transition to FLIGHT.
  */
-static void compress_tick(Robot *r)
+/* compress_progress_fraction — phase_t / T_COMPRESS clamped to [0,1].
+ * Names the linear ramp progress so the inner update reads in
+ * English ("compress goes to MAX × progress") rather than naked
+ * division. */
+static inline float compress_progress_fraction(float phase_t) {
+    return clampf(phase_t / T_COMPRESS, 0.0f, 1.0f);
+}
+
+/* sample_terrain_aim — query the terrain slope at the current foot
+ * position and convert it to the effective launch angle.  Stored
+ * back on Robot.aim so flight_tick can read it without re-querying
+ * the noise function (which is the expensive part). */
+static inline void sample_terrain_aim(Scene *s) {
+    Robot *r = &s->robot;
+    r->aim.slope_angle = floor_slope(r->pose.foot_px,
+                                     s->world.floor_mode, s->world.base_y);
+    r->aim.eff_angle   = effective_launch_angle(r->aim.slope_angle);
+}
+
+/* spring_pe_to_launch_speed — convert spring compression into the
+ * outgoing launch speed via energy conservation (m = 1):
+ *
+ *     ½ · m · v²   =   ½ · K · x²
+ *           ↓
+ *     v = x · √(K/m)   =   x · √K     (since m = 1)
+ *
+ * This is the moment the stored spring PE becomes the body's KE.
+ * Reference: [4] Hooke's law + classical energy conservation. */
+static inline float spring_pe_to_launch_speed(float compress) {
+    return compress * sqrtf(SPRING_K);
+}
+
+/* emit_launch_impulse — at the COMPRESS → FLIGHT transition,
+ * convert the loaded spring into a velocity vector along the
+ * cached aim direction, then transition the FSM.
+ *
+ *   vx = + v_launch · cos(eff_angle) · speed_mult       (forward)
+ *   vy = − v_launch · sin(eff_angle)                     (up; y-down)
+ *
+ * The speed_mult is the user's "speed level" knob — scales the
+ * horizontal component (only) so the user can tune horizontal range
+ * without changing the physics. */
+static inline void emit_launch_impulse(Scene *s) {
+    Robot *r = &s->robot;
+    float v_launch  = spring_pe_to_launch_speed(r->spring.compress);
+    float speed_mult = SPEED_MULTS[s->sim.speed_level];
+
+    r->vel.vx =  v_launch * cosf(r->aim.eff_angle) * speed_mult;
+    r->vel.vy = -v_launch * sinf(r->aim.eff_angle);   /* y-down: up = negative */
+
+    r->spring.compress = 0.0f;          /* leg now fully extended */
+    r->fsm.phase       = PHASE_FLIGHT;
+    r->fsm.phase_t     = 0.0f;
+    s->sim.launch_count++;
+}
+
+/*
+ * compress_tick — one frame of PHASE_COMPRESS.
+ *
+ *   (1) Ramp spring.compress linearly from 0 to SPRING_COMPRESS_MAX
+ *       over T_COMPRESS seconds (the body sinks toward the foot
+ *       under the spring's contraction).
+ *   (2) Recompute pose from foot + new compression.
+ *   (3) Sample terrain slope continuously so the launch direction
+ *       reflects the latest aim (foot doesn't move here, but the
+ *       defensive sample is cheap).
+ *   (4) When the spring reaches full compression, emit the launch
+ *       impulse and transition to PHASE_FLIGHT.
+ */
+static void compress_tick(Scene *s)
 {
-    float prog = clampf(r->phase_t / T_COMPRESS, 0.0f, 1.0f);
-    r->spring_compress = SPRING_COMPRESS_MAX * prog;
+    Robot *r = &s->robot;
+
+    /* (1)+(2) ramp compression and re-anchor the body */
+    r->spring.compress = SPRING_COMPRESS_MAX
+                       * compress_progress_fraction(r->fsm.phase_t);
     pose_from_spring(r);
 
-    /* Sample slope continuously during loading so launch sees the
-     * latest terrain (in case the foot has moved — it hasn't here,
-     * but defensive code is cheap). */
-    r->slope_angle = floor_slope(r->foot_px, r->floor_mode, r->base_y);
-    r->eff_angle   = effective_launch_angle(r->slope_angle);
+    /* (3) sample terrain slope into Robot.aim */
+    sample_terrain_aim(s);
 
-    if (r->phase_t >= T_COMPRESS) {
-        float v_launch = r->spring_compress * sqrtf(SPRING_K);
-        float vx_mult  = SPEED_MULTS[r->speed_level];
-
-        r->vx =  v_launch * cosf(r->eff_angle) * vx_mult;
-        r->vy = -v_launch * sinf(r->eff_angle);   /* y-down: up = negative */
-
-        r->spring_compress = 0.0f;                /* leg now fully extended */
-        r->phase           = PHASE_FLIGHT;
-        r->phase_t         = 0.0f;
-        r->launch_count++;
-    }
+    /* (4) full compression → launch */
+    bool fully_loaded = (r->fsm.phase_t >= T_COMPRESS);
+    if (fully_loaded) emit_launch_impulse(s);
 }
 
 /* ── §8.6 flight_tick — projectile motion, detect landing ────────── */
@@ -1287,28 +1458,72 @@ static void compress_tick(Robot *r)
  * "punched into" the ground — time to land. Snap the foot to the
  * surface, zero the velocity, and transition to LAND.
  */
-static void flight_tick(Robot *r, float dt)
+/* integrate_projectile_step — forward-Euler integration of
+ * Newtonian projectile motion under uniform gravity.
+ *
+ *   vy +=  g · dt        (acceleration → velocity)
+ *   x  += vx · dt        (velocity     → position)
+ *   y  += vy · dt
+ *
+ * Non-symplectic (energy drifts upward at long times) but FLIGHT
+ * phases last < 1 s and drift is sub-pixel.  Reference: [6] Hairer
+ * et al. + the file-header References for full discussion. */
+static inline void integrate_projectile_step(Robot *r, float dt) {
+    r->vel.vy       += GRAVITY * dt;
+    r->pose.body_px += r->vel.vx * dt;
+    r->pose.body_py += r->vel.vy * dt;
+}
+
+/* foot_projection_y — the y the foot WOULD HAVE if the leg were
+ * fully extended below the current body position.  Used by the
+ * floor-contact test:
+ *
+ *   foot_proj_y = body_y + BODY_HALF_H + SPRING_REST
+ *
+ * If foot_proj_y ≥ terrain(body_x), the leg has "punched into"
+ * the ground — time to land. */
+static inline float foot_projection_y(const Robot *r) {
+    return r->pose.body_py + BODY_HALF_H + SPRING_REST;
+}
+
+/* commit_landing — snap the foot to the terrain surface beneath
+ * the body, zero everything, and transition the FSM to LAND.
+ * Called once at the FLIGHT → LAND transition. */
+static inline void commit_landing(Robot *r, float ground_y) {
+    r->pose.foot_px    = r->pose.body_px;       /* foot lands directly below body */
+    r->pose.foot_py    = ground_y;
+    r->spring.compress = 0.0f;
+    pose_from_spring(r);
+    r->vel.vx = r->vel.vy = 0.0f;
+
+    r->fsm.phase   = PHASE_LAND;
+    r->fsm.phase_t = 0.0f;
+}
+
+/*
+ * flight_tick — one frame of PHASE_FLIGHT.
+ *
+ *   (1) Integrate projectile motion (Newton + Euler).
+ *   (2) Push the new body position into the trail so the parabolic
+ *       arc is visible.
+ *   (3) Test foot-projection against the terrain under the body.
+ *       If the leg has punched in, commit_landing.
+ */
+static void flight_tick(Scene *s, float dt)
 {
-    /* Newtonian projectile motion. */
-    r->vy      += GRAVITY * dt;
-    r->body_px += r->vx * dt;
-    r->body_py += r->vy * dt;
+    Robot *r = &s->robot;
 
-    trail_push(&r->trail, r->body_px, r->body_py);
+    /* (1) Newtonian projectile motion via forward Euler. */
+    integrate_projectile_step(r, dt);
 
-    /* Floor contact test. */
-    float foot_proj  = r->body_py + BODY_HALF_H + SPRING_REST;
-    float floor_here = floor_y_at(r->body_px, r->floor_mode, r->base_y);
-    if (foot_proj >= floor_here) {
-        r->foot_px         = r->body_px;
-        r->foot_py         = floor_here;
-        r->spring_compress = 0.0f;
-        pose_from_spring(r);
-        r->vx = r->vy = 0.0f;
+    /* (2) Visualise the arc. */
+    trail_push(&r->trail, r->pose.body_px, r->pose.body_py);
 
-        r->phase   = PHASE_LAND;
-        r->phase_t = 0.0f;
-    }
+    /* (3) Floor contact test: would the leg punch into the ground? */
+    float ground_y = floor_y_at(r->pose.body_px,
+                                s->world.floor_mode, s->world.base_y);
+    bool leg_punched_ground = (foot_projection_y(r) >= ground_y);
+    if (leg_punched_ground) commit_landing(r, ground_y);
 }
 
 /* ── §8.7 land_tick — brief stun, then back to COMPRESS ──────────── */
@@ -1321,71 +1536,76 @@ static void flight_tick(Robot *r, float dt)
 static void land_tick(Robot *r)
 {
     pose_from_spring(r);
-    if (r->phase_t >= T_LAND) {
-        r->phase   = PHASE_COMPRESS;
-        r->phase_t = 0.0f;
+    if (r->fsm.phase_t >= T_LAND) {
+        r->fsm.phase   = PHASE_COMPRESS;
+        r->fsm.phase_t = 0.0f;
     }
 }
 
-/* ── §8.8 robot_tick — orchestrator: dispatch on phase ──────────── */
+/* ── §8.8 scene_tick — orchestrator: dispatch on phase ──────────── */
 
 /*
- * One frame. If paused, do nothing — but cam_update STILL runs so
- * the user can pan with input even while frozen (… though we don't
- * have a manual pan key; cam_update under pause is harmless because
- * body_px doesn't change).
+ * One frame.  If sim.paused, do nothing — rendering keeps running
+ * so the HUD stays live.  When unpaused:
  *
- * phase_t is accumulated centrally so each per-state tick can read
- * it without re-implementing the bookkeeping.
+ *   (1) Camera follows the robot (smooth low-pass tracker).
+ *   (2) phase_t is accumulated CENTRALLY so each per-phase tick
+ *       can read it without re-implementing the bookkeeping.
+ *   (3) Dispatch on Robot.fsm.phase to the matching per-phase tick.
  */
-static void robot_tick(Robot *r, float dt, int cols)
+static void scene_tick(Scene *s, float dt, int cols)
 {
-    if (r->paused) return;
+    if (s->sim.paused) return;
 
-    cam_update(r, dt, cols);
-    r->phase_t += dt;
+    cam_update(s, dt, cols);
+    s->robot.fsm.phase_t += dt;
 
-    switch (r->phase) {
-    case PHASE_COMPRESS: compress_tick(r);     break;
-    case PHASE_FLIGHT:   flight_tick(r, dt);   break;
-    case PHASE_LAND:     land_tick(r);         break;
+    switch (s->robot.fsm.phase) {
+    case PHASE_COMPRESS: compress_tick(s);     break;
+    case PHASE_FLIGHT:   flight_tick(s, dt);   break;
+    case PHASE_LAND:     land_tick(&s->robot); break;
     }
 }
 
-/* ── §8.9 robot_init / robot_reset ────────────────────────────────── */
+/* ── §8.9 scene_init / scene_reset ────────────────────────────────── */
 
-static void robot_init(Robot *r, int rows)
+static void scene_init(Scene *s, int rows)
 {
     /* Preserve user-tunable settings across init. */
-    FloorMode fm  = r->floor_mode;
-    int       sl  = r->speed_level;
+    FloorMode saved_floor = s->world.floor_mode;
+    int       saved_speed = s->sim.speed_level;
 
-    memset(r, 0, sizeof *r);
-    r->floor_mode  = fm;
-    r->speed_level = sl;
+    memset(s, 0, sizeof *s);
+    s->world.floor_mode = saved_floor;
+    s->sim.speed_level  = saved_speed;
+    s->sim.paused       = false;
 
     /* Terrain baseline at 72 % of screen height — leaves room above
      * for arcs and energy gauge, room below for terrain-fill. */
-    r->base_y      = (float)ph(rows) * 0.72f;
+    s->world.base_y = (float)ph(rows) * 0.72f;
+
+    Robot *r = &s->robot;
 
     /* Spawn near the left edge, planted on the surface. */
-    r->foot_px     = (float)(CAM_START_COL * CELL_W);
-    r->foot_py     = floor_y_at(r->foot_px, r->floor_mode, r->base_y);
-    r->slope_angle = floor_slope(r->foot_px, r->floor_mode, r->base_y);
-    r->eff_angle   = effective_launch_angle(r->slope_angle);
+    r->pose.foot_px    = (float)(CAM_START_COL * CELL_W);
+    r->pose.foot_py    = floor_y_at(r->pose.foot_px,
+                                    s->world.floor_mode, s->world.base_y);
+    r->aim.slope_angle = floor_slope(r->pose.foot_px,
+                                     s->world.floor_mode, s->world.base_y);
+    r->aim.eff_angle   = effective_launch_angle(r->aim.slope_angle);
 
-    r->phase       = PHASE_COMPRESS;
-    r->phase_t     = 0.0f;
-    r->cam_x       = 0.0f;
+    r->fsm.phase   = PHASE_COMPRESS;
+    r->fsm.phase_t = 0.0f;
+    s->camera.cam_x = 0.0f;
 
     pose_from_spring(r);
 }
 
 /* Light reset for the 'r' key — preserves theme/speed/floor mode. */
-static void robot_reset(Robot *r, int rows)
+static void scene_reset(Scene *s, int rows)
 {
-    trail_clear(&r->trail);
-    robot_init(r, rows);
+    trail_clear(&s->robot.trail);
+    scene_init(s, rows);
 }
 
 /* ===================================================================== */
@@ -1501,13 +1721,13 @@ static void render_trail(const Robot *r, float cam_x, int cols, int rows)
  */
 static void render_spring(const Robot *r, float cam_x, int cols, int rows)
 {
-    int cx       = scr_cx(r->body_px, cam_x);
-    int body_bot = px_to_cy(r->body_py + BODY_HALF_H);
-    int foot_cy  = px_to_cy(r->foot_py);
+    int cx       = scr_cx(r->pose.body_px, cam_x);
+    int body_bot = px_to_cy(r->pose.body_py + BODY_HALF_H);
+    int foot_cy  = px_to_cy(r->pose.foot_py);
 
     if (cx < 0 || cx >= cols) return;
 
-    float ratio = r->spring_compress / SPRING_COMPRESS_MAX;
+    float ratio = r->spring.compress / SPRING_COMPRESS_MAX;
     int    cp   = (ratio < 0.30f) ? CP_SPRING_LO
                 : (ratio < 0.70f) ? CP_SPRING_MD : CP_SPRING_HI;
     attr_t at   = (ratio > 0.70f) ? A_BOLD : A_NORMAL;
@@ -1537,12 +1757,12 @@ static void render_spring(const Robot *r, float cam_x, int cols, int rows)
  */
 static void render_body(const Robot *r, float cam_x, int cols, int rows)
 {
-    int cx = scr_cx(r->body_px, cam_x);
-    int cy = px_to_cy(r->body_py);
+    int cx = scr_cx(r->pose.body_px, cam_x);
+    int cy = px_to_cy(r->pose.body_py);
     if (!in_bounds(cx, cy, cols, rows)) return;
 
     chtype ch; int cp;
-    switch (r->phase) {
+    switch (r->fsm.phase) {
     case PHASE_COMPRESS: ch = '@'; cp = CP_BODY;   break;
     case PHASE_FLIGHT:   ch = 'O'; cp = CP_FLIGHT; break;
     default:             ch = '*'; cp = CP_LAND;   break;
@@ -1556,53 +1776,123 @@ static void render_body(const Robot *r, float cam_x, int cols, int rows)
 /* ── §9.6 render_pe_bar — vertical PE gauge, COMPRESS only ────────── */
 
 /*
- * Visualises stored spring energy. Height of fill ∝ PE / PE_max:
+ * PE-bar layout constants — placement near the right edge of the
+ * sim area + minimum bar height when the terminal is short.
+ */
+enum {
+    PE_BAR_RIGHT_INSET    = 3,   /* cols from right edge to bar left col */
+    PE_BAR_BOTTOM_INSET   = 2,   /* rows from bottom edge to bar bottom  */
+    PE_BAR_VERTICAL_MARGIN = 10, /* rows reserved above/below the bar    */
+    PE_BAR_MIN_HEIGHT     = 4,
+    PE_BAR_WIDTH_CELLS    = 2,   /* bar is 2 cells wide ('||' or '!!')   */
+};
+#define PE_BAR_HIGH_RATIO 0.80f  /* above this, switch to red + '!' tip  */
+
+/* PeBarGeometry — screen-space layout of the PE gauge in one place. */
+typedef struct {
+    int x;        /* left column of the bar (top-left anchor) */
+    int top;      /* topmost simulation row used by the bar   */
+    int bottom;   /* bottom simulation row (just above hint)  */
+    int height;   /* bar height in rows                       */
+} PeBarGeometry;
+
+/* compute_pe_bar_geometry — derive the PE-bar layout from screen
+ * extent.  Returns height=0 if the terminal is too small to fit
+ * even the minimum 4-row bar; caller skips rendering in that case. */
+static inline PeBarGeometry compute_pe_bar_geometry(int cols, int rows) {
+    PeBarGeometry g;
+    g.x      = cols - PE_BAR_RIGHT_INSET;
+    g.bottom = rows - PE_BAR_BOTTOM_INSET;
+    g.height = (rows > PE_BAR_VERTICAL_MARGIN + 2)
+             ? rows - PE_BAR_VERTICAL_MARGIN
+             : PE_BAR_MIN_HEIGHT;
+    g.top    = g.bottom - g.height;
+    return g;
+}
+
+/* pe_ratio_quadratic — PE / PE_max as a quadratic function of
+ * compression:
  *
- *     PE = ½kx²        →  PE / PE_max = (x / x_max)²
+ *     PE = ½·k·x²      →   PE / PE_max = (x / x_max)²
  *
- * So the bar fills SLOWLY at first and ACCELERATES near full
- * compression — a deliberate non-linearity that teaches the
- * quadratic energy law. When the bar tops 80 % we switch the fill
- * colour to red and the topmost cell to '!' for "about to fire".
+ * The quadratic shape is the WHOLE PEDAGOGICAL POINT — bar fills
+ * slowly at first then accelerates near full compression, teaching
+ * the quadratic energy law. */
+static inline float pe_ratio_quadratic(float compress) {
+    return spring_energy(compress) / spring_energy(SPRING_COMPRESS_MAX);
+}
+
+/* paint_pe_label — small "PE" tag above the bar, in HUD yellow. */
+static inline void paint_pe_label(const PeBarGeometry *g) {
+    if (g->top - 1 < 1) return;
+    attron (COLOR_PAIR(PAIR_HUD));
+    mvprintw(g->top - 1, g->x, "PE");
+    attroff(COLOR_PAIR(PAIR_HUD));
+}
+
+/* paint_filled_cell / paint_empty_cell — paint ONE row of the
+ * 2-cell-wide bar.  Filled cells use bar_pair (red CP_SPRING_HI at
+ * high charge, green CP_PE otherwise); empty cells dim down with
+ * the HUD background and a '.' rest pattern. */
+static inline void paint_filled_cell(int row, int x, chtype glyph, int pair) {
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvaddch(row, x,     glyph);
+    mvaddch(row, x + 1, glyph);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+static inline void paint_empty_cell(int row, int x) {
+    attron(COLOR_PAIR(PAIR_HUD));
+    mvaddch(row, x,     '.');
+    mvaddch(row, x + 1, '.');
+    attroff(COLOR_PAIR(PAIR_HUD));
+}
+
+/* paint_pe_bar_column — paint the whole vertical bar.  filled_cells
+ * rows from the bottom up are FILLED; the rest are EMPTY rest dots.
+ * At high charge (ratio > PE_BAR_HIGH_RATIO) the fill switches to
+ * CP_SPRING_HI red and the TOPMOST filled cell becomes '!' instead
+ * of '|' — a "ready-to-fire" visual cue. */
+static inline void paint_pe_bar_column(const PeBarGeometry *g,
+                                        int filled_cells, float ratio,
+                                        int rows) {
+    bool high_charge = (ratio > PE_BAR_HIGH_RATIO);
+    int  fill_pair   = high_charge ? CP_SPRING_HI : CP_PE;
+
+    for (int i = 0; i < g->height; i++) {
+        int row = g->bottom - i;
+        if (row < 1 || row >= rows - 1) continue;     /* HUD-row guard */
+
+        bool   is_filled  = (i < filled_cells);
+        bool   is_top_lit = (i == filled_cells - 1);
+        chtype glyph      = (high_charge && is_top_lit) ? '!' : '|';
+
+        if (is_filled) paint_filled_cell(row, g->x, glyph, fill_pair);
+        else           paint_empty_cell (row, g->x);
+    }
+}
+
+/*
+ * render_pe_bar — vertical "spring potential energy" gauge.
+ *
+ *   Visible during PHASE_COMPRESS only (other phases have no
+ *   stored energy to show).  Anchored at the right edge of the
+ *   simulation area.
+ *
+ *   Bar height ∝ PE / PE_max = (compress / compress_max)²
+ *   — the quadratic shape teaches Hooke's energy law visually.
  */
 static void render_pe_bar(const Robot *r, int cols, int rows)
 {
-    if (r->phase != PHASE_COMPRESS) return;
+    if (r->fsm.phase != PHASE_COMPRESS) return;
 
-    int bar_x   = cols - 3;
-    int bar_bot = rows - 2;
-    int bar_h   = (rows > 12) ? rows - 10 : 4;
-    int bar_top = bar_bot - bar_h;
-    if (bar_x < 0 || bar_top < 1) return;
+    PeBarGeometry geom = compute_pe_bar_geometry(cols, rows);
+    if (geom.x < 0 || geom.top < 1) return;
 
-    float ratio  = spring_energy(r->spring_compress)
-                 / spring_energy(SPRING_COMPRESS_MAX);
-    int   filled = (int)(ratio * (float)bar_h + 0.5f);
+    float ratio        = pe_ratio_quadratic(r->spring.compress);
+    int   filled_cells = (int)(ratio * (float)geom.height + 0.5f);
 
-    /* Label "PE" above the bar. */
-    if (bar_top - 1 >= 1) {
-        attron(COLOR_PAIR(PAIR_HUD));
-        mvprintw(bar_top - 1, bar_x, "PE");
-        attroff(COLOR_PAIR(PAIR_HUD));
-    }
-
-    for (int i = 0; i < bar_h; i++) {
-        int row = bar_bot - i;
-        if (row < 1 || row >= rows - 1) continue;
-        if (i < filled) {
-            int    fcp = (ratio > 0.80f) ? CP_SPRING_HI : CP_PE;
-            chtype fc  = (ratio > 0.80f && i == filled - 1) ? '!' : '|';
-            attron(COLOR_PAIR(fcp) | A_BOLD);
-            mvaddch(row, bar_x,     fc);
-            mvaddch(row, bar_x + 1, fc);
-            attroff(COLOR_PAIR(fcp) | A_BOLD);
-        } else {
-            attron(COLOR_PAIR(PAIR_HUD));
-            mvaddch(row, bar_x,     '.');
-            mvaddch(row, bar_x + 1, '.');
-            attroff(COLOR_PAIR(PAIR_HUD));
-        }
-    }
+    paint_pe_label    (&geom);
+    paint_pe_bar_column(&geom, filled_cells, ratio, rows);
 }
 
 /* ── §9.7 render_hud — yellow status row 0 + cyan hint bottom row ── */
@@ -1618,45 +1908,100 @@ static void render_pe_bar(const Robot *r, int cols, int rows)
  * The 'PAUSED' banner overlays the centre of the screen when the
  * simulation is frozen.
  */
-static void render_hud(const Robot *r, double fps, int cols, int rows)
-{
-    int robot_scr = scr_cx(r->body_px, r->cam_x);
+/* radians_to_degrees — unit conversion used only by the HUD. */
+static inline float radians_to_degrees(float radians) {
+    return radians * (180.0f / (float)M_PI);
+}
 
-    char buf[HUD_BUF_LEN];
-    snprintf(buf, sizeof buf,
+/* hud_paint_text_padded — paint `text` at (row, col) in pair `pair`
+ * + A_BOLD, then pad the rest of the row with spaces so the row's
+ * background colour reaches edge-to-edge (otherwise the terminal's
+ * default bg shows through past the printed text). */
+static inline void hud_paint_text_padded(int row, int col, int pair,
+                                          const char *text, int total_cols) {
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvaddnstr(row, col, text, total_cols - col);
+    int used = (int)strlen(text);
+    for (int x = col + used; x < total_cols; x++)
+        mvaddch(row, x, ' ');
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
+/* hud_paint_text — same as above but WITHOUT padding (the bottom
+ * key-hint strip doesn't need to span the full width). */
+static inline void hud_paint_text(int row, int col, int pair,
+                                   const char *text) {
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvprintw(row, col, "%s", text);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
+/* format_hud_status — write the top-row status string into `buf`.
+ * Reports fps, floor mode, current phase, compression / max, stored
+ * PE, slope angle, effective launch angle, speed multiplier, robot
+ * screen column, camera scroll, jump count, and paused state. */
+static void format_hud_status(const Scene *s, double fps,
+                              char *buf, size_t buflen) {
+    const Robot *r = &s->robot;
+    int robot_scr_col = scr_cx(r->pose.body_px, s->camera.cam_x);
+
+    snprintf(buf, buflen,
              " %5.1f fps  [%s] %-4s  cmp:%3.0f/%3.0f  PE:%5.0f  "
              "slope:%+5.1f°  launch:%4.1f°  spd:%.1fx  col:%-3d  "
              "cam:%5.0f  jumps:%-3d  %s ",
-             fps, FLOOR_NAMES[r->floor_mode], PHASE_NAMES[r->phase],
-             r->spring_compress, SPRING_COMPRESS_MAX,
-             spring_energy(r->spring_compress),
-             r->slope_angle * (180.0f / (float)M_PI),
-             r->eff_angle   * (180.0f / (float)M_PI),
-             SPEED_MULTS[r->speed_level],
-             robot_scr, r->cam_x, r->launch_count,
-             r->paused ? "PAUSED" : "running");
+             fps, FLOOR_NAMES[s->world.floor_mode], PHASE_NAMES[r->fsm.phase],
+             r->spring.compress, SPRING_COMPRESS_MAX,
+             spring_energy(r->spring.compress),
+             radians_to_degrees(r->aim.slope_angle),
+             radians_to_degrees(r->aim.eff_angle),
+             SPEED_MULTS[s->sim.speed_level],
+             robot_scr_col, s->camera.cam_x, s->sim.launch_count,
+             s->sim.paused ? "PAUSED" : "running");
+}
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvaddnstr(0, 0, buf, cols);
-    /* Pad rest of row 0 with spaces so HUD bg is uniform. */
-    int used = (int)strlen(buf);
-    for (int x = used; x < cols; x++) mvaddch(0, x, ' ');
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+/* draw_hud_status — left-justified status row 0 (PAIR_HUD yellow). */
+static void draw_hud_status(const Scene *s, double fps, int cols) {
+    enum { HUD_TOP_ROW = 0 };
+    char buf[HUD_BUF_LEN];
+    format_hud_status(s, fps, buf, sizeof buf);
+    hud_paint_text_padded(HUD_TOP_ROW, 0, PAIR_HUD, buf, cols);
+}
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(rows - 1, 0,
-             " q:quit  spc:pause  r:reset  f:floor  n:new-terrain  "
-             "a:speed ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+/* draw_hud_hint — bottom-row key bindings strip (PAIR_HINT cyan). */
+static void draw_hud_hint(int rows) {
+    static const char *KEY_HINT =
+        " q:quit  spc:pause  r:reset  f:floor  n:new-terrain  a:speed ";
+    hud_paint_text(rows - 1, 0, PAIR_HINT, KEY_HINT);
+}
 
-    if (r->paused) {
-        int mx = cols / 2 - 4;
-        if (mx >= 0) {
-            attron(COLOR_PAIR(CP_LAND) | A_BOLD);
-            mvprintw(rows / 2, mx, " PAUSED ");
-            attroff(COLOR_PAIR(CP_LAND) | A_BOLD);
-        }
-    }
+/* draw_paused_banner — centred " PAUSED " overlay shown when the
+ * simulation is frozen.  Uses CP_LAND (the landing-flash colour)
+ * to repurpose an already-bright pair without adding another
+ * one to color_init. */
+static void draw_paused_banner(int cols, int rows) {
+    static const char *PAUSED_LABEL = " PAUSED ";
+    int label_width = (int)strlen(PAUSED_LABEL);
+    int banner_col  = cols / 2 - label_width / 2;
+    if (banner_col < 0) return;
+    hud_paint_text(rows / 2, banner_col, CP_LAND, PAUSED_LABEL);
+}
+
+/*
+ * render_hud — required HUD per CLAUDE.md spec.
+ *
+ *   Row 0 (PAIR_HUD, BOLD): fps + floor + phase + spring state +
+ *     slope/launch angles + speed + camera + jumps + paused tag
+ *   Bottom row (PAIR_HINT, BOLD): full key list
+ *   PAUSED overlay: centred banner when sim.paused is true
+ *
+ * Both HUD pairs sit on default background (-1) so they stay
+ * legible regardless of theme.
+ */
+static void render_hud(const Scene *s, double fps, int cols, int rows)
+{
+    draw_hud_status(s, fps, cols);
+    draw_hud_hint  (rows);
+    if (s->sim.paused) draw_paused_banner(cols, rows);
 }
 
 /* ── §9.8 scene_draw — paint one frame ───────────────────────────── */
@@ -1670,27 +2015,66 @@ static void render_hud(const Robot *r, double fps, int cols, int rows)
  *   (5) PE bar (only during COMPRESS)
  *   (6) HUD on row 0 + hint strip on bottom row
  */
-static void scene_draw(const Robot *r, double fps, int cols, int rows)
+static void scene_draw(const Scene *s, double fps, int cols, int rows)
 {
     erase();
 
-    float cam_x = r->cam_x;
+    const Robot *r = &s->robot;
+    float cam_x = s->camera.cam_x;
 
     render_trail   (r, cam_x, cols, rows);
-    render_terrain (r->floor_mode, r->base_y, cam_x, cols, rows);
+    render_terrain (s->world.floor_mode, s->world.base_y, cam_x, cols, rows);
 
-    if (r->phase == PHASE_COMPRESS || r->phase == PHASE_LAND)
+    if (r->fsm.phase == PHASE_COMPRESS || r->fsm.phase == PHASE_LAND)
         render_spring(r, cam_x, cols, rows);
 
     render_body    (r, cam_x, cols, rows);
     render_pe_bar  (r, cols, rows);
-    render_hud     (r, fps, cols, rows);
+    render_hud     (s, fps, cols, rows);
 }
 
 /* ===================================================================== */
 /* §10  screen — ncurses init / present                                   */
 /* ===================================================================== */
 
+/*
+ * Screen — terminal cell extent + ncurses lifecycle wrapper.
+ *
+ * Intent
+ *   Tracks the TERMINAL side of the demo: cell dimensions for HUD
+ *   placement and field clipping.  ncurses owns the back buffer;
+ *   this struct is the source-of-truth for CELL-space dimensions,
+ *   refreshed via getmaxyx in screen_init / screen_resize.
+ *
+ *   The simulation lives in WORLD PIXEL space (CELL_W × CELL_H
+ *   sub-pixels per cell, see §4 coords).  Scene.world.base_y is
+ *   derived from `ph(rows)` and recomputed on every SIGWINCH so
+ *   the terrain re-centres when the terminal height changes.
+ *
+ *   The horizontal direction is UNBOUNDED in world space (the robot
+ *   keeps jumping forward) — Scene.camera scrolls the visible
+ *   window through this infinite world; Screen.cols controls how
+ *   much of it is visible at any time.
+ *
+ * Why a tiny 2-field struct (not flat ints on App)
+ *   • Lifecycle isolation: only screen_init / screen_resize /
+ *     screen_free / screen_present touch ncurses' initscr / endwin /
+ *     doupdate.  They all take `Screen *` to make this layer
+ *     explicit at the type level.
+ *   • Symmetry with every other demo in this project — `{cols, rows}`
+ *     is the canonical Screen shape.
+ *
+ * Members
+ *   cols   Terminal width in CELLS (getmaxyx).
+ *   rows   Terminal height in CELLS.  Row 0 hosts the HUD status
+ *          strip; row (rows - 1) hosts the key-hint strip.  The
+ *          simulation paints into rows [1, rows-2].
+ *
+ * Invariants
+ *   cols > 0, rows > 2 (need at least 1 sim row + 2 HUD rows).
+ *   Both refreshed on every SIGWINCH via screen_resize + the main
+ *   loop's `scene->world.base_y = ph(rows) * 0.72f` recompute.
+ */
 typedef struct { int cols, rows; } Screen;
 
 static void screen_init(Screen *s)
@@ -1725,9 +2109,51 @@ static void screen_present(void)
 /* §11  app — signals, resize, variable-dt main loop                      */
 /* ===================================================================== */
 
+/*
+ * FpsCounter — rolling-window frame-rate estimator.
+ *
+ * Per-frame fps would jitter; this accumulates frame_count + elapsed
+ * nanoseconds over a 500 ms window and emits a smoothed `display`
+ * value each time the window fills.  Same shape as the FpsCounter on
+ * every other file in this project.
+ */
 typedef struct {
-    Robot                 robot;
+    int     frame_count;
+    int64_t window_ns;
+    double  display;
+} FpsCounter;
+
+static void fps_counter_init(FpsCounter *f) {
+    f->frame_count = 0;
+    f->window_ns   = 0;
+    f->display     = 0.0;
+}
+
+static void fps_counter_tick(FpsCounter *f, int64_t dt_ns) {
+    const int64_t FPS_WINDOW_NS = NS_PER_SEC / 2;       /* 500 ms */
+    f->frame_count++;
+    f->window_ns += dt_ns;
+    if (f->window_ns < FPS_WINDOW_NS) return;
+    f->display     = (double)f->frame_count
+                   * (double)NS_PER_SEC / (double)f->window_ns;
+    f->frame_count = 0;
+    f->window_ns   = 0;
+}
+
+/*
+ * App — top-level container for every persistent value.
+ *
+ *   scene         simulation state (Robot + World + Camera + sim)
+ *   screen        terminal cell extent + ncurses lifecycle
+ *   fps           rolling-window fps estimator for HUD
+ *   running       sig_atomic_t flag cleared by SIGINT / SIGTERM + 'q'
+ *   need_resize   sig_atomic_t flag set by SIGWINCH; main reacts at
+ *                 the top of the next iteration
+ */
+typedef struct {
+    Scene                 scene;
     Screen                screen;
+    FpsCounter            fps;
     volatile sig_atomic_t running;
     volatile sig_atomic_t need_resize;
 } App;
@@ -1738,25 +2164,35 @@ static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-/* Map one keypress to an action. */
+/*
+ * app_handle_key — process one keystroke.
+ *
+ *   q / Q / ESC      quit
+ *   SPACE / p        toggle paused
+ *   r                reset (re-init scene, keep theme + speed + floor)
+ *   f                cycle floor mode (FLAT ↔ PERLIN)
+ *   n                reseed Perlin noise (new terrain layout)
+ *   a                cycle speed level (launch impulse multiplier)
+ */
 static void app_handle_key(App *app, int ch)
 {
-    Robot *r = &app->robot;
+    Scene *s = &app->scene;
     switch (ch) {
     case 'q': case 'Q': case 27:
         app->running = 0;
         break;
 
     case ' ': case 'p': case 'P':
-        r->paused = !r->paused;
+        s->sim.paused = !s->sim.paused;
         break;
 
     case 'r': case 'R':
-        robot_reset(r, app->screen.rows);
+        scene_reset(s, app->screen.rows);
         break;
 
     case 'f': case 'F':
-        r->floor_mode = (FloorMode)((r->floor_mode + 1) % FLOOR_COUNT);
+        s->world.floor_mode =
+            (FloorMode)((s->world.floor_mode + 1) % FLOOR_COUNT);
         break;
 
     case 'n': case 'N':
@@ -1764,77 +2200,85 @@ static void app_handle_key(App *app, int ch)
         break;
 
     case 'a': case 'A':
-        r->speed_level = (r->speed_level + 1) % SPEED_LEVELS;
+        s->sim.speed_level = (s->sim.speed_level + 1) % SPEED_LEVELS;
         break;
 
     default: break;
     }
 }
 
+/*
+ * main — variable-dt render loop.
+ *
+ *   (1) atexit + signal handlers
+ *   (2) seed Perlin noise; bring up Screen + Scene
+ *   (3) loop:
+ *       (a) handle pending SIGWINCH
+ *       (b) measure dt (capped to prevent spiral-of-death)
+ *       (c) drain non-blocking input
+ *       (d) advance Scene (cam + FSM dispatch)
+ *       (e) rolling-window fps counter
+ *       (f) draw + present
+ *       (g) frame cap: sleep so we don't burn the next slot's budget
+ */
 int main(void)
 {
+    /* (1) atexit + signal handlers */
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
+    /* (2) Perlin seed + Screen + Scene */
     noise_init((unsigned)(clock_ns() & 0xFFFFFFFF));
 
-    App *app     = &g_app;
+    App   *app   = &g_app;
+    Scene *scene = &app->scene;
     app->running = 1;
-    app->robot.floor_mode = FLOOR_PERLIN;       /* default to interesting terrain */
+    fps_counter_init(&app->fps);
+    scene->world.floor_mode = FLOOR_PERLIN;   /* default to interesting terrain */
 
     screen_init(&app->screen);
-    robot_init (&app->robot, app->screen.rows);
+    scene_init (scene, app->screen.rows);
 
-    int64_t last_ns      = clock_ns();
-    int64_t fps_accum_ns = 0;
-    int     fps_frames   = 0;
-    double  fps_display  = 0.0;
-    const int64_t TICK_NS = NS_PER_SEC / TARGET_FPS;
+    const int64_t FRAME_BUDGET_NS = NS_PER_SEC / TARGET_FPS;
+    int64_t last_ns = clock_ns();
 
     while (app->running) {
 
-        /* (1) handle resize first so subsequent steps see the new size */
+        /* (3a) handle resize first so subsequent steps see the new size */
         if (app->need_resize) {
             screen_resize(&app->screen);
-            app->robot.base_y = (float)ph(app->screen.rows) * 0.72f;
-            app->need_resize  = 0;
+            scene->world.base_y = (float)ph(app->screen.rows) * 0.72f;
+            app->need_resize = 0;
             last_ns = clock_ns();
         }
 
-        /* (2) measure dt, capped to prevent spiral-of-death */
+        /* (3b) measure dt, capped to prevent spiral-of-death */
         int64_t now_ns = clock_ns();
         int64_t dt_ns  = now_ns - last_ns;
         last_ns        = now_ns;
         float   dt     = (float)dt_ns / (float)NS_PER_SEC;
         if (dt > DT_CAP_SEC) dt = DT_CAP_SEC;
 
-        /* (3) drain input */
+        /* (3c) drain input */
         int ch;
         while ((ch = getch()) != ERR) app_handle_key(app, ch);
 
-        /* (4) advance physics */
-        robot_tick(&app->robot, dt, app->screen.cols);
+        /* (3d) advance the Scene */
+        scene_tick(scene, dt, app->screen.cols);
 
-        /* (5) rolling fps display (0.5 s window) */
-        fps_accum_ns += dt_ns;
-        fps_frames++;
-        if (fps_accum_ns >= NS_PER_SEC / 2) {
-            fps_display = (double)fps_frames * 1e9
-                        / (double)fps_accum_ns;
-            fps_accum_ns = 0;
-            fps_frames   = 0;
-        }
+        /* (3e) rolling-window fps counter */
+        fps_counter_tick(&app->fps, dt_ns);
 
-        /* (6) draw + present */
-        scene_draw(&app->robot, fps_display,
+        /* (3f) draw + present */
+        scene_draw(scene, app->fps.display,
                    app->screen.cols, app->screen.rows);
         screen_present();
 
-        /* (7) frame cap — sleep before the NEXT frame's I/O */
+        /* (3g) frame cap — sleep before the NEXT frame's I/O */
         int64_t elapsed = clock_ns() - now_ns;
-        clock_sleep_ns(TICK_NS - elapsed);
+        clock_sleep_ns(FRAME_BUDGET_NS - elapsed);
     }
 
     screen_free(&app->screen);

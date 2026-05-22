@@ -53,11 +53,13 @@
  *   §2  clock        — monotonic timer + sleep
  *   §3  color        — HUD/HINT plus body/left/right/feet pairs
  *   §4  coords       — pixel↔cell aspect-ratio bridge
- *   §5  robot        — Robot type, gait math, FK swing, IK stance,
+ *   §5  robot        — Gait / GroundAnchor / FootLocks / Pose / RobotUI
+ *                      composed into Robot; FK swing, IK stance,
  *                      foot-lock, init/reset, tick (sub-sectioned)
  *   §6  render       — draw bones, ground, robot, HUD (sub-sectioned)
  *   §7  screen       — ncurses init / present
- *   §8  app          — signals, resize, variable-dt main loop
+ *   §8  scene        — FrameTimer + Scene container; signals, resize,
+ *                      variable-dt main loop
  *
  * Keys:
  *   q / Q / ESC      quit
@@ -116,12 +118,25 @@
  *                     leg swings forward — this is how humans
  *                     balance angular momentum while walking.
  *
- * Data-structure: One Robot struct holds: motion (x, phase,
- *                 walk_freq, walk_speed, direction), screen-derived
- *                 constants (ground_y, base_hip_y), foot lock data
- *                 (per-leg locked position + on-ground flag), and
- *                 the computed joint positions for the current
- *                 frame. No heap allocation post-init.
+ * Data-structure: A Scene owns the whole program state. Inside it the
+ *                 Robot is composed of five concept-sized sub-structs
+ *                 so each field's role is obvious at the access site:
+ *
+ *                   Gait         — phase, walk_freq, walk_speed, direction
+ *                                    (the cycle that drives everything)
+ *                   GroundAnchor — ground_y, base_hip_y
+ *                                    (screen-derived placement, rebuilt
+ *                                     on resize)
+ *                   FootLocks    — per-leg planted positions + on-ground
+ *                                    flag (key to natural-looking stance)
+ *                   Pose         — hip, torso, head, shoulders, hands,
+ *                                    knees, feet — refreshed every tick
+ *                   RobotUI      — paused / step_once / show_grid
+ *
+ *                 Plus r->x (hip-centre world position) at the top
+ *                 level since it's the single anchor every other
+ *                 position is computed relative to. No heap
+ *                 allocation post-init.
  *
  * Rendering     : Painter's order — ground line first, body parts
  *                 next, then the head and feet on top:
@@ -137,18 +152,61 @@
  *                 line draws. Microseconds; ncurses redraw is the
  *                 dominant cost.
  *
- * References    :
- *   Wikipedia, "Bipedal gait" — phases of walking, swing/stance
- *     classification, double-support periods.
- *     https://en.wikipedia.org/wiki/Bipedal_gait
- *   Wikipedia, "Inverse kinematics" — for the law-of-cosines IK
- *     used here on stance legs.
- *     https://en.wikipedia.org/wiki/Inverse_kinematics
- *   Marc Raibert, "Legged Robots That Balance" (MIT Press, 1986) —
- *     the classic textbook on hopping and walking robot control.
- *   This project, animation/fk_ik_helloworld.c — both forward and
- *     inverse kinematics in a single 3-link arm; walking uses the
- *     same two ideas alternately (FK during swing, IK during stance).
+ * References    : grouped by the concepts this file teaches. Ten
+ *                  entries — one or two strong picks per topic. The
+ *                  in-project cross-reference to fk_ik_helloworld.c
+ *                  is the cheapest place to start.
+ *
+ *   ── Bipedal locomotion & legged robotics (concepts A, B, C) ──────
+ *   Raibert, "Legged Robots That Balance" (MIT Press, 1986). The
+ *     foundational text on hopping and walking robot control. The
+ *     SWING / STANCE phase decomposition used here traces back to
+ *     chapter 2.
+ *   Inman, Ralston & Todd, "Human Walking" (2nd ed., Williams &
+ *     Wilkins, 1994). The canonical biomechanics reference on the
+ *     human gait cycle — touchdown, mid-stance, toe-off, swing.
+ *     Source of the "controlled falling" mental model.
+ *   Winter, "Biomechanics and Motor Control of Human Movement"
+ *     (Wiley, 4th ed., 2009). Quantitative gait analysis — joint
+ *     angle trajectories, COM motion, pelvic bob/sway. The sin(φ)
+ *     and sin(2φ) shapes used in §5 are direct simplifications of
+ *     what Winter measures from real walkers.
+ *
+ *   ── Forward / inverse kinematics (concepts B, C, F) ──────────────
+ *   Parent, "Computer Animation: Algorithms and Techniques" (Morgan
+ *     Kaufmann, 3rd ed., 2012). Chapters 5–6 cover FK and analytical
+ *     2-link IK exactly as used here — same law-of-cosines derivation
+ *     as solve_ik2().
+ *   Buss, "Introduction to Inverse Kinematics with Jacobian
+ *     Transpose, Pseudoinverse and Damped Least Squares" (UCSD
+ *     tech report, 2009). Free PDF, comprehensive treatment of IK
+ *     methods beyond the analytic 2-link case used here.
+ *     https://mathweb.ucsd.edu/~sbuss/ResearchWeb/ikmethods/iksurvey.pdf
+ *   Boulic, Magnenat-Thalmann & Thalmann, "A global human walking
+ *     model with real-time kinematic personification" (The Visual
+ *     Computer 6:344–358, 1990). Procedural walking in computer
+ *     animation — the parametric-trajectory approach this file uses,
+ *     predating mocap-driven character rigs.
+ *   This project, animation/fk_ik_helloworld.c — forward AND inverse
+ *     kinematics in a single 3-link arm; walking_robot.c uses the
+ *     same two ideas ALTERNATELY (FK during swing, IK during stance).
+ *
+ *   ── Rendering (§6) ───────────────────────────────────────────────
+ *   Bresenham, "Algorithm for computer control of a digital plotter"
+ *     (IBM Systems Journal 4(1):25–30, 1965). The line-drawing
+ *     algorithm implemented in draw_bone(). Unusually readable
+ *     original paper.
+ *   Padala, "NCURSES Programming HOWTO" (The Linux Documentation
+ *     Project). Practical reference for the ncurses API used in
+ *     §3 (color_init) and §6 (mvaddch, attron, attroff).
+ *     https://tldp.org/HOWTO/NCURSES-Programming-HOWTO/
+ *
+ *   ── Game loop & numerical timing (§8 main loop) ──────────────────
+ *   Fiedler ("Gaffer on Games"), "Fix Your Timestep!" (2004). The
+ *     canonical write-up of the dt-cap pattern in main() — explains
+ *     why measuring wall-clock dt each frame and capping it is
+ *     enough to keep the gait stable at any frame rate.
+ *     https://gafferongames.com/post/fix_your_timestep/
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -306,98 +364,6 @@
  *   arm_angle    = ARM_SWING · sin(φ + π · arm_offset)
  *
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Sign convention. We use y-DOWN screen coordinates, so positive
- *    y is BELOW. The thigh "forward" in walking direction +x means
- *    the foot is right of the hip; we encode that by:
- *        knee.x = hip.x + L · sin(θ)
- *        knee.y = hip.y + L · cos(θ)
- *    With θ=0 the leg is vertical (knee straight below hip), with
- *    θ=+SWING it points down-forward, with θ=-SWING down-back.
- *
- *  • Foot lock detection — we sample sin(φ_old) and sin(φ_new) each
- *    frame. With variable dt, the cross point may be missed if dt
- *    is huge; we cap dt to avoid that.
- *
- *  • IK domain — the law of cosines fails if hip-to-foot distance
- *    is greater than UPPER_LEG + LOWER_LEG. We clamp the distance
- *    inside solve_ik2 so the leg stretches as a straight line at
- *    the limit instead of NaN-ing.
- *
- *  • Wrapping. When the robot leaves the right edge we shift it
- *    + foot_lock back to the left edge so the simulation continues
- *    seamlessly. Same for the other direction.
- *
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Press 'r' to reverse. The robot walks backward — same gait,
- *    just played in reverse direction.
- *
- *  • Press 'space' to pause. Verify you can see ONE foot planted
- *    ('#') and ONE foot in the air ('*') — they should never both
- *    be in the same state.
- *
- *  • Press '.' (period) repeatedly while paused. Watch one leg
- *    cycle through the four key phases: lift, peak, land, plant.
- *
- *  • Press '+' to max speed. The gait frequency increases too —
- *    the robot's stride length stays roughly the same, it just
- *    cycles faster.
- *
- *  • Watch the arms: when the LEFT leg swings forward, the LEFT
- *    arm swings BACK. Counter-rotation = balancing angular
- *    momentum. Real humans do this without thinking.
- *
- *  • Watch the hip y-coordinate: it rises and falls TWICE per
- *    stride. That's the bob.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read animation/fk_helloworld.c (FK) and
- *      animation/ik_helloworld.c (IK) first if 2-link kinematics
- *      are new — this file uses BOTH alternately.
- *      Read robots/diff_drive_robot.c first if pose integration
- *      (px, py, theta) is new.
- *   2. §5 robot — THE HEART of this file. Sub-sections:
- *        - gait math + phase advance        ← T2 below
- *        - swing-leg FK (T3 below)
- *        - stance-leg IK (T4 below)
- *        - foot-lock at touchdown (T5 below)
- *        - body bob + sway (T6 below)
- *      Read AFTER tutorials T1-T6.
- *   3. §6 render — painter's order draw of stick figure.
- *   4. §1-§4, §7-§8 — config / clock / colour / coords / screen /
- *      app loop. Skim if seen.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   phase                   master clock for the gait, radians.
- *                           Advances at 2π · walk_freq · direction
- *                           per second.
- *   walk_freq               strides per second.
- *   direction               +1 (forward) or -1 (reverse). Flips on
- *                           'r' key. Reverses phase advance.
- *   x                       body x-position in pixel space (the
- *                           hip's horizontal position).
- *   ground_y                world Y of the ground line (constant
- *                           per resize).
- *   base_hip_y              ground_y minus standing leg height —
- *                           where the hip sits at rest pose.
- *   foot_lock[i]            world position of foot i when planted.
- *                           Frozen at touch-down; thawed at toe-off.
- *   on_ground[i]            bool — is foot i currently planted?
- *   SWING_AMP, LIFT_AMP     thigh sweep + knee bend amplitudes
- *                           during swing (radians).
- *   BOB_AMP, SWAY_AMP       body vertical / lateral motion
- *                           amplitudes (pixels).
- *   ARM_SWING               arm angular amplitude (radians).
  *
  * Background you need
  * ───────────────────
@@ -417,251 +383,6 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Six tutorials that build a sinusoidal-gait bipedal walker
- * from first principles.
- *
- *   T1  Walking is alternating swing + stance — half each
- *   T2  The phase clock — one float drives every joint
- *   T3  Swing leg via FK — angles in, foot position out
- *   T4  Stance leg via IK — foot pinned, knee solved
- *   T5  Foot lock at touchdown — the FK→IK handoff
- *   T6  Body motion — bob (2×) and sway (1×) per stride
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  WALKING IS ALTERNATING SWING + STANCE — HALF EACH
- * ─────────────────────────────────────────────────────
- * A walking cycle has two PHASES per leg:
- *
- *   SWING    foot in air, leg moving forward.
- *            Half the cycle. Foot WILL land.
- *
- *   STANCE   foot on ground, body moving over it.
- *            Half the cycle. Foot DOES NOT MOVE in world space.
- *
- * The two legs are 180° OUT OF PHASE: when one is mid-swing,
- * the other is mid-stance. At every moment, AT LEAST ONE leg
- * is on the ground — that's why a walking biped doesn't fall.
- *
- * Each leg gets a phase variable φ_leg:
- *
- *     phi_left  = phase + 0
- *     phi_right = phase + π
- *
- *     if sin(φ_leg) > 0:    leg is in SWING (in air)
- *     if sin(φ_leg) ≤ 0:    leg is in STANCE (planted)
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │  φ:    0      π/2      π      3π/2      2π       │
- *      │       ┌── SWING ──┐ ┌── STANCE ──┐               │
- *      │  L:   start ↑  apex  land  ─body crosses─        │
- *      │                                                  │
- *      │       ┌── STANCE ──┐ ┌── SWING ──┐               │
- *      │  R:   ─body crosses─ start  apex  land           │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * The two phases use DIFFERENT MATH:
- *
- *   - SWING leg: FK (T3) — given hip and joint angles, compute
- *     foot position.
- *   - STANCE leg: IK (T4) — given hip and pinned foot position,
- *     compute the knee.
- *
- * T2  THE PHASE CLOCK — ONE FLOAT DRIVES EVERY JOINT
- * ──────────────────────────────────────────────────
- * The simulation owns ONE float: `phase`. Every joint position
- * is derived from it.
- *
- *     phase += 2π · walk_freq · direction · dt
- *
- * walk_freq is strides per second (default 1.0); direction is
- * ±1; dt is the frame timestep.
- *
- * From phase we derive (per leg):
- *
- *   phi_leg     = phase + (0 or π)              (T1)
- *   thigh_angle = -SWING_AMP · cos(phi_leg)      (T3)
- *   knee_bend   = LIFT_AMP · sin(phi_leg)        (T3, swing only)
- *
- * From phase we derive (body):
- *
- *   hip_y_offset  = BOB_AMP · sin(2 · phase)     (T6)
- *   sway_x_offset = SWAY_AMP · cos(phase)        (T6)
- *
- * From phase we derive (arms):
- *
- *   left_arm  = ARM_SWING · sin(phase + π)       (anti-phase L leg)
- *   right_arm = ARM_SWING · sin(phase + 0)       (anti-phase R leg)
- *
- * Every animated quantity is a closed-form function of phase.
- * Pause the simulation (don't advance phase) and the robot
- * freezes mid-stride.
- *
- * Same pattern as fk_tentacle_forest.c (one wave_time drives
- * every tentacle) and matrix_rain.c (one head_y per stream).
- * Stateless animation = simulation owns minimum state, derives
- * everything else.
- *
- * T3  SWING LEG VIA FK — ANGLES IN, FOOT POSITION OUT
- * ───────────────────────────────────────────────────
- * During swing, the leg is in the air. We choose its joint
- * angles smoothly as functions of phi_leg, then compute joint
- * positions via FK.
- *
- * Two joint angles:
- *
- *   thigh_angle = -SWING_AMP · cos(phi_leg)
- *
- *     φ=0    : -SWING_AMP (leg pointing BACK — toe-off)
- *     φ=π/2  : 0          (vertical, mid-swing)
- *     φ=π    : +SWING_AMP (leg pointing FORWARD — landing)
- *
- *     The thigh sweeps from back to forward across the swing
- *     half-cycle.
- *
- *   knee_bend = LIFT_AMP · sin(phi_leg)         (radians)
- *
- *     φ=0    : 0      (knee straight at toe-off)
- *     φ=π/2  : +LIFT  (knee maximally bent at apex)
- *     φ=π    : 0      (knee straight at landing)
- *
- *     The knee bends to lift the foot over the ground, then
- *     straightens for landing.
- *
- * Forward kinematics (from fk_helloworld T3) gives joint
- * positions:
- *
- *     hip = body_position + leg_local_offset
- *     knee = hip + thigh_length · (cos thigh_angle,
- *                                  sin thigh_angle)
- *     foot = knee + shin_length · (cos (thigh_angle + π/2 − knee_bend),
- *                                  sin (thigh_angle + π/2 − knee_bend))
- *
- * Three lines of FK, twice per leg per frame. Each frame the
- * positions are RECOMPUTED from scratch — no per-frame state
- * needs to be remembered.
- *
- * T4  STANCE LEG VIA IK — FOOT PINNED, KNEE SOLVED
- * ────────────────────────────────────────────────
- * During stance, the foot is PLANTED on the ground (it doesn't
- * move). The body moves OVER it. The knee position is the
- * unknown that satisfies:
- *
- *     |hip - knee| = thigh_length
- *     |knee - foot| = shin_length
- *
- * That's the same triangle problem as ik_helloworld.c (T3-T5).
- * Three sides known (thigh_len, shin_len, distance from hip
- * to foot), find the third corner. Law of cosines:
- *
- *     d = |hip - foot|
- *     cos α = (thigh_len² + d² - shin_len²) / (2 · thigh_len · d)
- *     α = acos(...)
- *     phi = atan2(foot.y - hip.y, foot.x - hip.x)
- *     knee_angle = phi - side · α          (side = +1 forward)
- *     knee = hip + thigh_len · (cos knee_angle, sin knee_angle)
- *
- * Result: as the body advances (and the hip moves forward over
- * the foot), the knee position is RECOMPUTED via IK to keep
- * the leg lengths exact and the foot pinned.
- *
- * Without IK, you'd have to manually choreograph the knee
- * position through stance — error-prone and stiff. IK makes
- * the stance leg motion AUTOMATIC: once you know the foot is
- * locked and the hip is moving, the knee falls out.
- *
- * T5  FOOT LOCK AT TOUCHDOWN — THE FK→IK HANDOFF
- * ──────────────────────────────────────────────
- * The transition from swing (FK) to stance (IK) requires a
- * MOMENT to capture WHERE the foot lands.
- *
- * At the moment of touchdown (sin(phi_leg) crosses from
- * positive to non-positive), record the foot's CURRENT FK
- * position as the locked stance position:
- *
- *     for each leg:
- *       was_in_air = on_ground[leg] == false
- *       in_air     = sin(phi_leg) > 0
- *
- *       if was_in_air and not in_air:
- *         // touchdown
- *         foot_lock[leg] = foot_position_from_FK
- *         on_ground[leg] = true
- *
- *       if not was_in_air and in_air:
- *         // toe-off
- *         on_ground[leg] = false
- *         (foot_lock no longer used)
- *
- * From touchdown until next toe-off, the IK uses
- * foot_lock[leg] as the foot position; the FK that ran during
- * swing is paused.
- *
- * Why this matters: a real walker's foot LANDS somewhere; the
- * body then advances RELATIVE to that planted foot. Without
- * the lock, a stance-leg foot would slide along with the body,
- * which looks like ICE-SKATING — a common bug in cheap
- * walking animations.
- *
- * Verification: in this file's HUD, watch the foot count when
- * it lands — it changes from '*' (swing) to '#' (planted) at
- * the same world coordinate, frame after frame, until toe-off.
- *
- * T6  BODY MOTION — BOB (2×) AND SWAY (1×) PER STRIDE
- * ───────────────────────────────────────────────────
- * The body itself MOVES during walking — not just the legs.
- * Two motions, both purely cosmetic:
- *
- *   BOB (vertical bobbing):
- *
- *     hip_y += BOB_AMP · sin(2 · phase)
- *
- *     2× per stride. The body rises at toe-off (when the
- *     stance leg is vertical and PUSHING UP) and dips at
- *     heel-strike (when the swing leg lands and momentarily
- *     compresses).
- *
- *   SWAY (lateral leaning):
- *
- *     hip_x += SWAY_AMP · cos(phase)
- *
- *     1× per stride. The body leans LEFT when the LEFT foot
- *     is planted and RIGHT when the RIGHT foot is planted —
- *     mimicking real human gait where the torso shifts over
- *     the supporting leg.
- *
- * Without bob and sway, the robot looks STIFF (head glides
- * along a constant line). Adding them makes the silhouette
- * recognisably human.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │   Without bob/sway:   With bob/sway:             │
- *      │                                                  │
- *      │   O O O O O O          O   O                     │
- *      │                       O O O O O O                │
- *      │   robotic glide       human walk                 │
- *      └──────────────────────────────────────────────────┘
- *
- * Arms swing in COUNTER-PHASE to the legs:
- *
- *     left_arm_angle  = ARM_SWING · sin(phase + π)
- *     right_arm_angle = ARM_SWING · sin(phase + 0)
- *
- * Notice left arm is 180° behind left leg phase. Why?
- * Because real humans counter-rotate arms vs legs to balance
- * angular momentum — when the left leg swings forward, the
- * left arm swings backward. We don't simulate angular
- * momentum, but we mimic the geometry for the visual.
- *
- * All these "extras" (bob, sway, arm counter-swing) are pure
- * COSMETIC LAYERS over the gait clock. They cost nothing in
- * complexity and add a lot in visual realism.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -773,6 +494,55 @@ enum {
 /* ── §1.10 HUD layout ─────────────────────────────────────────────── */
 #define HUD_BUF_LEN  120
 
+/* ── §1.11 rest pose & initial conditions ─────────────────────────── */
+
+/* Rest leg extension fraction — base_hip_y sits at (UPPER+LOWER)·this
+ * above the ground line. 0.88 leaves the knees slightly bent, which
+ *   (a) avoids the IK singularity at full extension (cos α → ±1),
+ *   (b) matches relaxed human standing (locked knees ≠ comfortable). */
+#define STAND_LEG_RATIO         0.88f
+
+/* Phase φ at boot — small offset so the first frame isn't in a
+ * singular sin(0) = 0 configuration where touchdown detection would
+ * fire spuriously on tick 1. */
+#define INITIAL_PHASE_RAD       0.30f
+
+/* Seed foot-lock distance as a fraction of one stride period's travel.
+ *   (walk_speed / walk_freq) = stride_length
+ *   seed_offset                = stride_length · FOOT_LOCK_SEED_FRAC
+ * Places each seed foot a quarter-stride from x at boot. */
+#define FOOT_LOCK_SEED_FRAC     0.25f
+
+/* Initial body x as a fraction of screen width (so the bot starts
+ * well inside the frame, not flush with an edge). */
+#define INITIAL_X_FRAC          0.30f
+
+/* Rows reserved at the bottom of the screen so the ground line, the
+ * grid-tick row, and the hint strip don't crowd each other.
+ *   ground_y = (rows - GROUND_BOTTOM_ROWS) · CELL_H */
+#define GROUND_BOTTOM_ROWS      4
+
+/* ── §1.12 toroidal wrap ───────────────────────────────────────────── */
+
+/* When x drifts outside [ −WRAP_MARGIN_PX , screen_w + WRAP_MARGIN_PX ]
+ * the body teleports across by WRAP_TOTAL_PX. The two distances are
+ * intentionally different so the bot WALKS off-screen before popping
+ * in on the opposite side (no visible teleport). */
+#define WRAP_MARGIN_PX         80.0f
+#define WRAP_TOTAL_PX         160.0f
+
+/* ── §1.13 IK numerical safeties ──────────────────────────────────── */
+
+/* Minimum hip → foot distance before solve_ik2() substitutes a tiny
+ * non-zero value, avoiding 1/0 in the cos α denominator when the
+ * limb is degenerately folded. */
+#define IK_DIST_FLOOR          1e-6f
+
+/* Slack added/subtracted from the reachable interval [|U-L|, U+L] so
+ * a foot RIGHT at full extension doesn't push cos α to ±1.0 exactly
+ * and trigger an acos(1) = 0 collapse. */
+#define IK_REACH_SLACK          0.5f
+
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
@@ -815,31 +585,41 @@ static void clock_sleep_ns(int64_t ns)
  * HUD pairs (PAIR_HUD, PAIR_HINT) bind separately on default
  * background per CLAUDE.md HUD spec.
  */
+/*
+ * Palette table — each row maps one role to its 256-mode and 8-mode
+ * foreground codes. color_init() walks this once with the correct
+ * column selected at runtime. Reading the table top-to-bottom gives
+ * the full palette in one glance.
+ */
+typedef struct {
+    short pair;          /* CP_* / PAIR_* id from §1.9               */
+    short fg256;         /* foreground when COLORS >= 256            */
+    short fg8;           /* foreground in 8-colour fallback          */
+} PaletteEntry;
+
+static const PaletteEntry PALETTE[] = {
+    /* pair             256    8-mode-fallback   role                */
+    { CP_BODY,          255,   COLOR_WHITE   }, /* near-white         */
+    { CP_BODY_DIM,      244,   COLOR_WHITE   }, /* dim grey-white     */
+    { CP_LEFT,           82,   COLOR_GREEN   }, /* lime green         */
+    { CP_RIGHT,         201,   COLOR_MAGENTA }, /* magenta            */
+    { CP_FOOT_PLANT,    226,   COLOR_YELLOW  }, /* yellow             */
+    { CP_FOOT_SWING,     51,   COLOR_CYAN    }, /* cyan               */
+    { CP_GROUND,        240,   COLOR_WHITE   }, /* dim grey           */
+    { PAIR_HUD,         226,   COLOR_YELLOW  }, /* yellow on bg       */
+    { PAIR_HINT,         51,   COLOR_CYAN    }, /* cyan on bg         */
+};
+#define PALETTE_LEN  (int)(sizeof PALETTE / sizeof PALETTE[0])
+
 static void color_init(void)
 {
     start_color();
     use_default_colors();
 
-    if (COLORS >= 256) {
-        init_pair(CP_BODY,         255, -1);    /* near-white          */
-        init_pair(CP_BODY_DIM,     244, -1);    /* dim grey-white      */
-        init_pair(CP_LEFT,          82, -1);    /* lime green          */
-        init_pair(CP_RIGHT,        201, -1);    /* magenta             */
-        init_pair(CP_FOOT_PLANT,   226, -1);    /* yellow              */
-        init_pair(CP_FOOT_SWING,    51, -1);    /* cyan                */
-        init_pair(CP_GROUND,       240, -1);    /* dim grey            */
-        init_pair(PAIR_HUD,        226, -1);    /* yellow on bg        */
-        init_pair(PAIR_HINT,        51, -1);    /* cyan on bg          */
-    } else {
-        init_pair(CP_BODY,        COLOR_WHITE,   -1);
-        init_pair(CP_BODY_DIM,    COLOR_WHITE,   -1);
-        init_pair(CP_LEFT,        COLOR_GREEN,   -1);
-        init_pair(CP_RIGHT,       COLOR_MAGENTA, -1);
-        init_pair(CP_FOOT_PLANT,  COLOR_YELLOW,  -1);
-        init_pair(CP_FOOT_SWING,  COLOR_CYAN,    -1);
-        init_pair(CP_GROUND,      COLOR_WHITE,   -1);
-        init_pair(PAIR_HUD,       COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT,      COLOR_CYAN,    -1);
+    bool truecolor = (COLORS >= 256);
+    for (int i = 0; i < PALETTE_LEN; i++) {
+        short fg = truecolor ? PALETTE[i].fg256 : PALETTE[i].fg8;
+        init_pair(PALETTE[i].pair, fg, -1);
     }
 }
 
@@ -866,62 +646,337 @@ static inline float clampf(float v, float lo, float hi)
 /* §5  robot — Robot type, gait math, FK swing, IK stance, foot lock      */
 /* ===================================================================== */
 
-/* ── §5.1 Vec2 + Robot type ──────────────────────────────────────── */
-
-typedef struct { float x, y; } Vec2;
+/* ── §5.1 Vec2 + sub-structs + Robot composition ──────────────────── */
 
 /*
- * Robot — full simulation state.
+ * Vec2 — 2-D pixel-space point.
  *
- *   Motion (the unknowns advanced every frame):
- *     x          hip-centre x in pixel space
- *     phase      walking phase φ (radians, unbounded)
- *     walk_freq  gait frequency in Hz (strides per second)
- *     walk_speed pixel translation rate
- *     direction  +1 forward, -1 backward
+ * INTENT
+ *   Every joint position, foot lock, and screen-derived constant in
+ *   this file lives in the same continuous pixel-space coordinate
+ *   system (CELL_W × CELL_H sub-pixels per character cell). Vec2 is
+ *   the shared currency. Conversion to discrete cell coordinates
+ *   happens once at draw time via px_to_cx / px_to_cy in §4.
  *
- *   Screen-derived constants (rebuilt on resize):
- *     ground_y     y of ground line in pixel space
- *     base_hip_y   y of hip in default standing pose
- *
- *   Per-leg foot-lock state:
- *     foot_lock[2]      world position where the foot was planted
- *     on_ground[2]      true while sin(φ_leg) ≤ 0 (stance)
- *
- *   Computed joints (refreshed every tick):
- *     hip_c, hip_j[2]   pelvis centre + per-leg hip joints
- *     torso_top         top-of-torso point (where shoulders attach)
- *     head_c            head centre
- *     shoulder[2]       per-arm shoulder pivots
- *     hand[2]           per-arm hand tips (single-segment arms)
- *     knee[2]           per-leg knee positions
- *     foot[2]           per-leg foot positions
- *
- *   UI / control:
- *     paused, step_once, show_grid, ...
+ * CONVENTION
+ *   x grows to the right; y grows DOWN (standard screen convention).
+ *   Math that uses y-up (e.g. bone_glyph's angle test) negates dy
+ *   at the boundary.
  */
 typedef struct {
-    /* motion */
-    float x, phase;
-    float walk_freq, walk_speed;
-    int   direction;            /* +1 forward, -1 backward */
+    float x;        /* horizontal, pixels, x grows right            */
+    float y;        /* vertical,   pixels, y grows DOWN (screen)    */
+} Vec2;
 
-    /* screen-derived */
-    float ground_y, base_hip_y;
+/*
+ * The Robot used to be a flat type with twenty-odd fields in five
+ * unrelated groups. The composition below makes each field's role
+ * obvious at the access site:
+ *
+ *      r->x                  hip-centre world position
+ *      r->gait.phase         cycle position (the unknown advanced each tick)
+ *      r->anchor.ground_y    screen-derived placement
+ *      r->locks.pos[i]       per-leg planted position
+ *      r->pose.knee[i]       computed joint position this frame
+ *      r->ui.paused          keyboard flag
+ *
+ * Same data, same algorithm — only the namespace changed.
+ */
 
-    /* foot lock */
-    Vec2  foot_lock[2];
-    bool  on_ground[2];
+/*
+ * §5.1.1 Gait — the cycle that drives every limb motion.
+ *
+ * INTENT
+ *   One float — phase — IS the simulation's state. Every limb angle,
+ *   every body offset, every touchdown event derives from sin/cos of
+ *   this phase. The other three fields parameterise HOW phase advances:
+ *      dφ/dt = 2π · walk_freq · direction
+ *      dx/dt =      walk_speed · direction
+ *
+ * WHY walk_speed IS DERIVED (NOT FREE)
+ *   The body must advance exactly ONE stride length per stride period
+ *   for the legs to look natural. Otherwise the foot lands far ahead
+ *   of the hip and the body never crosses over it during stance —
+ *   producing the "Smooth-Criminal lean" where both legs slope in the
+ *   walk direction. The coupling is:
+ *
+ *      stride_length = 2 · (UPPER_LEG + LOWER_LEG) · sin(SWING_AMP)
+ *      walk_speed    = walk_freq · stride_length
+ *
+ *   ALWAYS set the pace via robot_set_pace() so the two stay coupled.
+ *
+ * ALGORITHM REFERENCES
+ *   Boulic, Magnenat-Thalmann & Thalmann (1990) — phase-driven
+ *     parametric gait, the same single-clock approach used here.
+ *   Inman/Ralston/Todd (1994) — empirical stride-period vs.
+ *     stride-length linearity that motivates the coupling above.
+ */
+typedef struct {
+    float phase;             /* φ, radians. UNBOUNDED — wraps via   *
+                              * sin/cos rather than explicit mod 2π.*
+                              * Advances each frame by              *
+                              *   2π · walk_freq · direction · dt . *
+                              * Init: 0.30 (small offset so the     *
+                              * first frame isn't in a singular     *
+                              * sin(0) = 0 configuration).          */
 
-    /* computed joints */
-    Vec2  hip_c;
-    Vec2  hip_j[2];
-    Vec2  torso_top, head_c;
-    Vec2  shoulder[2], hand[2];
-    Vec2  knee[2], foot[2];
+    float walk_freq;         /* Hz — strides per second, the ONLY  *
+                              * user-tunable pace dial. Clamped to  *
+                              * [WALK_FREQ_MIN, WALK_FREQ_MAX]      *
+                              * = [0.4, 4.5]. Default 1.6 Hz        *
+                              * (calm human walking pace).          */
 
-    /* UI */
-    bool  paused, step_once, show_grid;
+    float walk_speed;        /* px/sec — body translation rate.    *
+                              * NEVER set directly; derived inside *
+                              * robot_set_pace() as                *
+                              *   walk_freq · stride_length .       */
+
+    int   direction;         /* +1 forward, -1 backward. Flipped   *
+                              * by 'r' key. Multiplies dφ/dt and   *
+                              * dx/dt so reversing direction       *
+                              * retrogrades the gait.              */
+} Gait;
+
+/*
+ * §5.1.2 GroundAnchor — screen-derived placement constants.
+ *
+ * INTENT
+ *   The pose math never reads ncurses dimensions directly. Instead,
+ *   these two values are computed once at init (and again on
+ *   SIGWINCH) from the current terminal size, and every joint
+ *   formula reads them from here. Resize handling becomes a 2-field
+ *   write; no other code path needs to know the screen changed.
+ *
+ * RATIONALE FOR 0.88 FACTOR
+ *   base_hip_y sits at  ground_y − (UPPER + LOWER) · 0.88 .
+ *   The legs are NOT fully extended at rest — 88% of full length
+ *   leaves the knees slightly bent, which:
+ *     (a) avoids a divide-by-zero singularity in solve_ik2() when
+ *         both legs are perfectly straight (cos α → ±1, acos → 0
+ *         which would collapse the IK to a degenerate point);
+ *     (b) matches how humans actually stand — locked-straight legs
+ *         are a chronic-pain posture, not a relaxed one.
+ */
+typedef struct {
+    float ground_y;          /* y of ground line in pixel space.    *
+                              * Computed from screen height as     *
+                              *   (rows - 4) · CELL_H .             *
+                              * The 4-row margin leaves room for    *
+                              * HUD row 0 + hint row last +         *
+                              * grid-tick row gy+1. Updated on      *
+                              * SIGWINCH inside robot_tick().       */
+
+    float base_hip_y;        /* y of hip in DEFAULT standing pose, *
+                              * before any bob is applied:          *
+                              *   ground_y − (UPPER+LOWER) · 0.88 .  *
+                              * Every frame's hip_c.y derives from *
+                              * here as  base_hip_y + BOB_AMP·sin(2φ).*/
+} GroundAnchor;
+
+/*
+ * §5.1.3 FootLocks — per-leg planted positions + stance flag.
+ *
+ * INTENT
+ *   The KEY trick for natural-looking walking. At the moment a leg
+ *   transitions from swing → stance (sin(φ_leg) crosses + → -), we
+ *   record where the foot is in the world into pos[i]. From that
+ *   instant until the next swing, IK uses pos[i] as the fixed end-
+ *   effector while the hip slides forward OVER it.
+ *
+ *   Without foot lock, the foot would slide along the ground during
+ *   stance and the robot would look like it was MOONWALKING — toes
+ *   pointed forward but feet drifting back relative to the body.
+ *
+ * STATE MACHINE PER LEG (driven by sin(φ_leg) sign)
+ *
+ *       sin(φ_leg) > 0   →  SWING   : FK from hip drives foot
+ *       sin(φ_leg) ≤ 0   →  STANCE  : pos[i] anchors foot, IK from hip
+ *
+ *   The on_ground[i] flag mirrors the sign so the renderer picks
+ *   the right glyph ('#' planted yellow, '*' swing cyan) and the
+ *   HUD shows STANCE / swing per leg without re-evaluating sin.
+ *
+ * WHY POSITION IS CAPTURED AT TOUCHDOWN (not held constant globally)
+ *   pos[i] needs to advance with the body — every new step plants the
+ *   foot at a NEW world position. Capturing at the touchdown event
+ *   gives us the right cadence automatically: each stride plants one
+ *   foot, and that foot anchors the body for a half-cycle.
+ *
+ * ALGORITHM REFERENCES
+ *   Raibert (1986) — the swing/stance decomposition this struct
+ *     embodies is the central abstraction in legged-robot control.
+ *   Inman/Ralston/Todd (1994) — empirical foot-trajectory data
+ *     that motivates the "lock and let hip cross" model.
+ */
+typedef struct {
+    Vec2 pos[2];             /* world position where leg i is      *
+                              * planted, in pixels. Captured at    *
+                              * the swing → stance transition by   *
+                              * touchdown detection in robot_tick. *
+                              * y is always ground_y (foot rests   *
+                              * on the ground line).               */
+
+    bool on_ground[2];       /* true while leg i is in stance     *
+                              * (sin(φ_leg) ≤ 0). Used by the     *
+                              * renderer for foot glyph + colour  *
+                              * and by the HUD for STANCE/swing.  */
+} FootLocks;
+
+/*
+ * §5.1.4 Pose — every joint position the renderer needs this frame.
+ *
+ * INTENT
+ *   Written entirely by compute_pose(); read-only afterwards. The
+ *   renderer's job is just "draw a line from A to B" for every pair
+ *   of connected joints in this struct. Caching them here means the
+ *   trig math runs once per frame, not once per render-pass.
+ *
+ * KINEMATIC HIERARCHY (built top → bottom inside compute_pose)
+ *
+ *      hip_c                     pelvis centre (= world x, base_y + bob)
+ *        ├── hip_j[0,1]          left/right hip joints (±HIP_W from hip_c)
+ *        │     └── knee[0,1]     FK from hip if swing, IK if stance
+ *        │           └── foot[0,1]  FK from knee, OR locked at FootLocks.pos
+ *        └── torso_top           hip_c + sway, UP by TORSO_LEN
+ *              ├── shoulder[0,1] left/right shoulders (±SHOULDER_W from top)
+ *              │     └── hand[0,1] single-segment arm swing from shoulder
+ *              └── head_c        torso_top, UP by HEAD_R  ('O' glyph)
+ *
+ *   Each parent's position must be known before its children — that's
+ *   why compute_pose() walks the chain strictly top-down.
+ *
+ * WHY CACHED INSTEAD OF RECOMPUTED PER DRAW
+ *   render_robot() makes 10 draw_bone() calls referencing 12 joint
+ *   positions; computing each pair on-demand would either re-evaluate
+ *   the same trig multiple times or require careful sequencing. A
+ *   plain "compute once, read many times" struct is simpler and the
+ *   storage is trivial (≈ 100 bytes).
+ *
+ * ALGORITHM REFERENCES
+ *   Parent (2012) §5–6 — forward-kinematic joint chains in computer
+ *     animation. Same parent-before-child walk.
+ *   Buss (2009) — IK survey covering the stance-leg case
+ *     (the law-of-cosines solver in solve_ik2()).
+ */
+typedef struct {
+    /* — pelvis & torso ————————————————————————————————————————— */
+    Vec2 hip_c;              /* pelvis centre. ROOT of the whole  *
+                              * kinematic chain.                  */
+    Vec2 hip_j[2];           /* per-leg hip joints, ±HIP_W from   *
+                              * hip_c on x. Root for each leg.    */
+    Vec2 torso_top;          /* top of torso. hip_c + lateral     *
+                              * sway, UP by TORSO_LEN. The sway   *
+                              * shift is what makes the upper     *
+                              * body lean over the planted foot.  */
+    Vec2 head_c;             /* head centre. torso_top, UP by    *
+                              * HEAD_R. Rendered as 'O' glyph.   */
+
+    /* — arms ——————————————————————————————————————————————————— */
+    Vec2 shoulder[2];        /* per-arm pivot, ±SHOULDER_W from  *
+                              * torso_top on x.                  */
+    Vec2 hand[2];            /* per-arm hand tip. Single-segment *
+                              * FK from shoulder by ARM_LEN at   *
+                              * arm_angle. Counter-phase to leg  *
+                              * on the same side (angular        *
+                              * momentum balance).               */
+
+    /* — legs ——————————————————————————————————————————————————— */
+    Vec2 knee[2];            /* per-leg knee position. FK from   *
+                              * hip when swinging; IK via        *
+                              * solve_ik2() when in stance.      */
+    Vec2 foot[2];            /* per-leg foot position. FK from   *
+                              * knee when swinging; = locks.pos  *
+                              * when in stance. Clamped above    *
+                              * ground_y so a swing foot can't   *
+                              * punch through the floor.         */
+} Pose;
+
+/*
+ * §5.1.5 RobotUI — keyboard-toggled flags.
+ *
+ * INTENT
+ *   Separate "human input state" from physics state. Whether the
+ *   simulation is paused or the grid is showing has nothing to do
+ *   with the gait — these flags exist purely because there's a
+ *   human at the keyboard. Grouping them in their own sub-struct
+ *   makes that obvious at the type level.
+ *
+ * PRESERVATION ACROSS RESET
+ *   robot_reset() preserves the user-tuned flags (show_grid, plus
+ *   walk_freq and direction from Gait) across resize — pressing
+ *   'r' resets the SIMULATION but not the user's preferences.
+ */
+typedef struct {
+    bool paused;             /* spacebar toggles. When true,       *
+                              * robot_tick() returns immediately   *
+                              * (unless step_once is also set).    */
+
+    bool step_once;          /* '.' key sets this. Lets one tick   *
+                              * happen while paused, then is        *
+                              * cleared inside robot_tick().        *
+                              * Useful for frame-by-frame study.    */
+
+    bool show_grid;          /* 'g' key toggles. When true,        *
+                              * render_ground() draws tick marks   *
+                              * at gy+1 that scroll with x — gives *
+                              * the illusion the world is moving   *
+                              * past while the robot stays mostly  *
+                              * centred on screen.                 */
+} RobotUI;
+
+/*
+ * §5.1.6 Robot — composition of the five concept-sized sub-structs.
+ *
+ * INTENT
+ *   Before the refactor this was a flat type with ~20 fields in five
+ *   unrelated groups. The composition makes the role of every access
+ *   obvious at the use site:
+ *
+ *      r->x                  hip-centre world position
+ *      r->gait.phase         cycle position (the unknown)
+ *      r->anchor.ground_y    screen-derived placement
+ *      r->locks.pos[i]       per-leg planted position
+ *      r->pose.knee[i]       computed joint this frame
+ *      r->ui.paused          keyboard flag
+ *
+ *   Same bytes, same algorithm — only the namespace changed.
+ *
+ * LAYERING (read these in order to understand the simulation)
+ *
+ *   1. Gait         — what is being advanced (φ, and x via walk_speed)
+ *   2. GroundAnchor — where the world floor IS
+ *   3. FootLocks    — which feet are currently PLANTED
+ *   4. Pose         — every joint POSITION (computed each tick)
+ *   5. RobotUI      — human flags
+ *
+ * WHY x IS AT THE TOP LEVEL (NOT INSIDE Gait)
+ *   x is the single ANCHOR every other position derives from. Every
+ *   joint is at some offset relative to x, every foot lock is in
+ *   the same world coordinate system. Keeping it at the top makes
+ *   `r->x` the obvious place to read "where is the robot" — moving
+ *   it inside Gait would imply it's a gait parameter, which it
+ *   isn't (Gait drives HOW x advances, but x itself is world state).
+ */
+typedef struct {
+    float        x;          /* hip-centre x in pixel space (world).*
+                              * Advances each tick by               *
+                              *   walk_speed · direction · dt .     *
+                              * Wrapped toroidally at screen edges  *
+                              * inside robot_tick().                */
+
+    Gait         gait;       /* phase + freq + speed + direction.  *
+                              * See §5.1.1.                         */
+
+    GroundAnchor anchor;     /* ground_y + base_hip_y. Resized on  *
+                              * SIGWINCH. See §5.1.2.              */
+
+    FootLocks    locks;      /* per-leg pos + on_ground flag.     *
+                              * See §5.1.3.                       */
+
+    Pose         pose;       /* every joint position this frame.  *
+                              * Written by compute_pose(). §5.1.4.*/
+
+    RobotUI      ui;         /* keyboard flags. See §5.1.5.      */
 } Robot;
 
 /* ── §5.2 solve_ik2 — 2-link analytical IK (law of cosines) ──────── */
@@ -949,67 +1004,68 @@ typedef struct {
  */
 static Vec2 solve_ik2(Vec2 hip, Vec2 foot, float U, float L)
 {
+    /* (1) hip → foot displacement and distance */
     float dx   = foot.x - hip.x;
     float dy   = foot.y - hip.y;
     float dist = sqrtf(dx*dx + dy*dy);
-    if (dist < 1e-6f) dist = 1e-6f;
+    if (dist < IK_DIST_FLOOR) dist = IK_DIST_FLOOR;
 
-    float min_r = fabsf(U - L) + 0.5f;
-    float max_r = U + L - 0.5f;
-    float clamped = clampf(dist, min_r, max_r);
+    /* (2) clamp distance into the reachable interval with slack to
+     *     avoid the cos α = ±1 collapse at exact full extension. */
+    float min_reach = fabsf(U - L) + IK_REACH_SLACK;
+    float max_reach = U + L        - IK_REACH_SLACK;
+    float reach     = clampf(dist, min_reach, max_reach);
 
-    float phi    = atan2f(dy, dx);
-    float cos_a  = (clamped*clamped + U*U - L*L) / (2.0f * clamped * U);
-    float ang    = phi - acosf(clampf(cos_a, -1.0f, 1.0f));
+    /* (3) law of cosines — angle between (hip → foot) and (hip → knee) */
+    float cos_alpha = (reach*reach + U*U - L*L) / (2.0f * reach * U);
+    float alpha     = acosf(clampf(cos_alpha, -1.0f, 1.0f));
 
-    return (Vec2){ hip.x + U * cosf(ang),
-                   hip.y + U * sinf(ang) };
+    /* (4) knee = hip + U · (cos(φ−α), sin(φ−α))
+     *     φ is the angle of the hip→foot vector; subtracting α
+     *     bends the knee on the chosen side of the line. */
+    float phi       = atan2f(dy, dx);
+    float knee_ang  = phi - alpha;
+    return (Vec2){ hip.x + U * cosf(knee_ang),
+                   hip.y + U * sinf(knee_ang) };
 }
 
-/* ── §5.3 leg_swing_pose — Forward Kinematics during swing ────────── */
+/* ── §5.3 leg_swing_pose — FK helpers + swing pose ────────────────── */
 
-/*
- * SWING phase math.
+/* Forward-kinematic walk down one leg: thigh angle → knee, shin
+ * angle → foot. Y-down screen coordinates use sin for x-offset
+ * (+sin = forward) and cos for y-offset (+cos = down).
  *
- *   thigh_angle = -SWING_AMP · cos(φ_leg)
- *                  φ_leg = 0    →  -SWING (leg back, toe-off)
- *                  φ_leg = π/2  →   0     (vertical, mid-swing)
- *                  φ_leg = π    →  +SWING (leg forward, landing)
- *
- *   knee_bend   =  LIFT_AMP · sin(φ_leg)
- *                  peaks at π/2 (mid-swing) then straightens
- *
- *   shin_angle  =  thigh_angle - knee_bend
- *
- * The MINUS is anatomical. A human knee folds so the heel comes UP
- * toward the butt — the shin rotates BACKWARDS relative to the
- * thigh, not forwards. With (+) the foot would always lead the
- * knee forward and the lower leg would visibly slant in the walk
- * direction (the "Smooth-Criminal lean"). With (-), at mid-swing
- * the foot tucks BEHIND the knee like a real marching step.
- *
- * Knee and foot computed by walking the joint chain forward from
- * the hip. The +sin/+cos pattern places the joint below-and-along
- * the angle (y-down screen convention).
- */
+ * See MENTAL MODEL → "ONE LEG'S WALK CYCLE" for the full sweep of
+ * thigh_angle through the phase, and KEY FORMULAS for the
+ * shin = thigh − bend  derivation (the minus is anatomical: the
+ * heel folds UP toward the butt, not the Smooth-Criminal lean). */
+static Vec2 fk_advance(Vec2 root, float angle, float len)
+{
+    return (Vec2){ root.x + len * sinf(angle),
+                   root.y + len * cosf(angle) };
+}
+
 static void leg_swing_pose(Robot *r, int i, Vec2 hip, float phi_leg, float dir)
 {
-    float thigh = -SWING_AMP * cosf(phi_leg) * dir;
-    float ke    =  LIFT_AMP  * sinf(phi_leg);
-    float shin  =  thigh - ke;
+    /* (1) gait angles from phase
+     *     thigh sweeps -SWING (back) → 0 → +SWING (forward) over swing
+     *     knee bends LIFT at mid-swing then straightens for landing
+     *     shin = thigh - bend (anatomical: heel folds UP toward butt) */
+    float thigh_angle = -SWING_AMP * cosf(phi_leg) * dir;
+    float knee_bend   =  LIFT_AMP  * sinf(phi_leg);
+    float shin_angle  =  thigh_angle - knee_bend;
 
-    Vec2 knee = { hip.x + UPPER_LEG_LEN * sinf(thigh),
-                  hip.y + UPPER_LEG_LEN * cosf(thigh) };
+    /* (2) FK chain — hip → knee → foot */
+    Vec2 knee = fk_advance(hip,  thigh_angle, UPPER_LEG_LEN);
+    Vec2 foot = fk_advance(knee, shin_angle,  LOWER_LEG_LEN);
 
-    Vec2 foot = { knee.x + LOWER_LEG_LEN * sinf(shin),
-                  knee.y + LOWER_LEG_LEN * cosf(shin) };
+    /* (3) Foot clamp — don't let the swinging foot punch through ground */
+    if (foot.y > r->anchor.ground_y) foot.y = r->anchor.ground_y;
 
-    /* Don't let the swinging foot punch through the ground. */
-    if (foot.y > r->ground_y) foot.y = r->ground_y;
-
-    r->knee[i]      = knee;
-    r->foot[i]      = foot;
-    r->on_ground[i] = false;
+    /* (4) publish to Pose + mark this leg as swing */
+    r->pose.knee[i]       = knee;
+    r->pose.foot[i]       = foot;
+    r->locks.on_ground[i] = false;
 }
 
 /* ── §5.4 leg_stance_pose — Inverse Kinematics during stance ─────── */
@@ -1027,12 +1083,12 @@ static void leg_swing_pose(Robot *r, int i, Vec2 hip, float phi_leg, float dir)
  */
 static void leg_stance_pose(Robot *r, int i, Vec2 hip)
 {
-    Vec2 foot = r->foot_lock[i];
-    foot.y    = r->ground_y;
+    Vec2 foot = r->locks.pos[i];
+    foot.y    = r->anchor.ground_y;
 
-    r->knee[i]      = solve_ik2(hip, foot, UPPER_LEG_LEN, LOWER_LEG_LEN);
-    r->foot[i]      = foot;
-    r->on_ground[i] = true;
+    r->pose.knee[i]       = solve_ik2(hip, foot, UPPER_LEG_LEN, LOWER_LEG_LEN);
+    r->pose.foot[i]       = foot;
+    r->locks.on_ground[i] = true;
 }
 
 /* ── §5.5 compute_arm — single-segment arm swing ─────────────────── */
@@ -1055,61 +1111,101 @@ static void compute_arm(Robot *r, int i, float phase, float dir)
     float arm_phase = phase + (i == 0 ? (float)M_PI : 0.0f);
     float angle     = ARM_SWING * sinf(arm_phase) * dir;
 
-    r->hand[i].x = r->shoulder[i].x + ARM_LEN * sinf(angle);
-    r->hand[i].y = r->shoulder[i].y + ARM_LEN * cosf(angle);
+    r->pose.hand[i].x = r->pose.shoulder[i].x + ARM_LEN * sinf(angle);
+    r->pose.hand[i].y = r->pose.shoulder[i].y + ARM_LEN * cosf(angle);
 }
 
-/* ── §5.6 compute_pose — orchestrator (body + arms + legs) ──────── */
+/* ── §5.6 compute_pose — pose helpers + orchestrator ──────────────── */
+
+/* Vertical hip bob — 2× per stride (pelvic bob is the canonical
+ * walking signature; up at toe-off, down at heel-strike). */
+static inline float hip_bob_offset(float phi)
+{
+    return BOB_AMP * sinf(2.0f * phi);
+}
+
+/* Lateral hip sway — 1× per stride. Torso leans over whichever foot
+ * is currently planted (without this the COM falls outside the
+ * support polygon). */
+static inline float torso_sway_offset(float phi, float dir)
+{
+    return SWAY_AMP * cosf(phi) * dir;
+}
+
+/* Per-leg phase = global phase + π for the right leg, so the two
+ * legs are 180° out of phase (one swinging, one planted). */
+static inline float leg_phase(float phi, int i)
+{
+    return phi + (i == 1 ? (float)M_PI : 0.0f);
+}
+
+/* True if a leg's phase puts it in SWING (sin > 0). */
+static inline bool leg_is_swinging(float phi_leg)
+{
+    return sinf(phi_leg) > 0.0f;
+}
+
+/* Step 1 — Place pelvis. hip_c is the body's anchor; the two hip
+ * joints sit ±HIP_W to either side at the same y. */
+static void pose_place_pelvis(Pose *p, float x, float base_y, float bob)
+{
+    p->hip_c    = (Vec2){ x,                 base_y + bob };
+    p->hip_j[0] = (Vec2){ p->hip_c.x - HIP_W, p->hip_c.y  };
+    p->hip_j[1] = (Vec2){ p->hip_c.x + HIP_W, p->hip_c.y  };
+}
+
+/* Step 2 — torso top + head. Sway shifts the upper body laterally
+ * relative to the pelvis. Head sits HEAD_R above torso_top. */
+static void pose_place_torso(Pose *p, float sway)
+{
+    p->torso_top = (Vec2){ p->hip_c.x + sway,   p->hip_c.y - TORSO_LEN };
+    p->head_c    = (Vec2){ p->torso_top.x,      p->torso_top.y - HEAD_R };
+}
+
+/* Step 3 — shoulders. Placed at torso_top, half-shoulder-width apart. */
+static void pose_place_shoulders(Pose *p)
+{
+    p->shoulder[0] = (Vec2){ p->torso_top.x - SHOULDER_W, p->torso_top.y };
+    p->shoulder[1] = (Vec2){ p->torso_top.x + SHOULDER_W, p->torso_top.y };
+}
+
+/* Step 5 — one leg's pose: swing (FK) or stance (IK) by phase sign. */
+static void pose_place_one_leg(Robot *r, int i, float phi, float dir)
+{
+    float phi_leg = leg_phase(phi, i);
+    if (leg_is_swinging(phi_leg))
+        leg_swing_pose (r, i, r->pose.hip_j[i], phi_leg, dir);
+    else
+        leg_stance_pose(r, i, r->pose.hip_j[i]);
+}
 
 /*
- * Build the full pose for the current `phase` and `x`. Order:
- *   1. body: bob + sway → hip_c, hip_j[2]
- *   2. torso top, head
- *   3. shoulders (placed from torso_top + sway)
- *   4. arms (FK from shoulders)
- *   5. legs:
- *        for each leg i:
- *          φ_leg = phase + (i==1 ? π : 0)
- *          if sin(φ_leg) > 0 → leg_swing_pose (FK)
- *          else              → leg_stance_pose (IK)
+ * compute_pose — build the full pose from (x, phase, direction).
  *
- * Sign of `dir` flips angle conventions when walking backward so
- * the limbs visibly retrograde the gait.
+ * Reads as a five-step pipeline (top-down through the kinematic
+ * hierarchy: each child needs its parent's position):
+ *
+ *   1. pelvis  (hip_c, hip_j[2])  — bob places the hip vertically
+ *   2. torso   (torso_top, head)  — sway shifts upper body laterally
+ *   3. shoulders                  — anchored to torso_top
+ *   4. arms                       — FK from shoulders, counter-phase
+ *   5. legs                       — per leg: FK if swing, IK if stance
  */
 static void compute_pose(Robot *r)
 {
-    float phi  = r->phase;
-    float dir  = (float)r->direction;
+    Pose *p   = &r->pose;
+    float phi = r->gait.phase;
+    float dir = (float)r->gait.direction;
 
-    /* (1) body — bob and sway derive hip position. */
-    float bob  = BOB_AMP  * sinf(2.0f * phi);
-    float sway = SWAY_AMP * cosf(phi)   * dir;
+    float bob  = hip_bob_offset(phi);
+    float sway = torso_sway_offset(phi, dir);
 
-    r->hip_c   = (Vec2){ r->x,                 r->base_hip_y + bob };
-    r->hip_j[0]= (Vec2){ r->hip_c.x - HIP_W,   r->hip_c.y          };
-    r->hip_j[1]= (Vec2){ r->hip_c.x + HIP_W,   r->hip_c.y          };
+    pose_place_pelvis   (p, r->x, r->anchor.base_hip_y, bob);
+    pose_place_torso    (p, sway);
+    pose_place_shoulders(p);
 
-    /* (2) torso + head — sway shifts the upper body laterally. */
-    r->torso_top = (Vec2){ r->hip_c.x + sway, r->hip_c.y - TORSO_LEN };
-    r->head_c    = (Vec2){ r->torso_top.x,    r->torso_top.y - HEAD_R };
-
-    /* (3) shoulders — placed at torso_top, half-shoulder-width apart. */
-    r->shoulder[0] = (Vec2){ r->torso_top.x - SHOULDER_W, r->torso_top.y };
-    r->shoulder[1] = (Vec2){ r->torso_top.x + SHOULDER_W, r->torso_top.y };
-
-    /* (4) arms. */
-    for (int i = 0; i < 2; i++)
-        compute_arm(r, i, phi, dir);
-
-    /* (5) legs — phase per leg, then FK or IK. */
-    for (int i = 0; i < 2; i++) {
-        float phi_leg = phi + (i == 1 ? (float)M_PI : 0.0f);
-        if (sinf(phi_leg) > 0.0f) {
-            leg_swing_pose (r, i, r->hip_j[i], phi_leg, dir);
-        } else {
-            leg_stance_pose(r, i, r->hip_j[i]);
-        }
-    }
+    for (int i = 0; i < 2; i++) compute_arm(r, i, phi, dir);
+    for (int i = 0; i < 2; i++) pose_place_one_leg(r, i, phi, dir);
 }
 
 /* ── §5.7 robot_init / robot_reset ───────────────────────────────── */
@@ -1133,112 +1229,186 @@ static void robot_set_pace(Robot *r, float freq)
     if (freq < WALK_FREQ_MIN) freq = WALK_FREQ_MIN;
     if (freq > WALK_FREQ_MAX) freq = WALK_FREQ_MAX;
 
-    float stride = 2.0f * (UPPER_LEG_LEN + LOWER_LEG_LEN) * sinf(SWING_AMP);
-    r->walk_freq  = freq;
-    r->walk_speed = freq * stride;
+    float stride       = 2.0f * (UPPER_LEG_LEN + LOWER_LEG_LEN) * sinf(SWING_AMP);
+    r->gait.walk_freq  = freq;
+    r->gait.walk_speed = freq * stride;
 }
 
+/* Recompute screen-derived anchors from the current row count. Called
+ * by robot_init() at boot and by robot_tick() every frame in case
+ * SIGWINCH changed the row count between frames. */
+static void anchor_update_from_screen(GroundAnchor *a, int rows)
+{
+    a->ground_y   = (float)((rows - GROUND_BOTTOM_ROWS) * CELL_H);
+    a->base_hip_y = a->ground_y
+                  - (UPPER_LEG_LEN + LOWER_LEG_LEN) * STAND_LEG_RATIO;
+}
+
+/* Seed the two foot locks at boot — one step ahead, one step behind
+ * x — so the first stance leg has a sensible plant position to
+ * anchor IK against. */
+static void seed_foot_locks(Robot *r)
+{
+    float stride_len  = r->gait.walk_speed / r->gait.walk_freq;
+    float seed_offset = stride_len * FOOT_LOCK_SEED_FRAC;
+    r->locks.pos[0] = (Vec2){ r->x - seed_offset, r->anchor.ground_y };
+    r->locks.pos[1] = (Vec2){ r->x + seed_offset, r->anchor.ground_y };
+}
+
+/*
+ * robot_init — one-shot startup. Pseudocode pipeline:
+ *   1. zero everything (so memset-zero fields are explicit defaults)
+ *   2. set the pace dial + initial direction + initial phase offset
+ *   3. compute screen-derived anchors (ground + rest hip height)
+ *   4. place the body at INITIAL_X_FRAC of screen width
+ *   5. seed the foot locks ±stride/4 from x
+ *   6. build the first pose so frame 0 already renders correctly
+ */
 static void robot_init(Robot *r, int cols, int rows)
 {
     memset(r, 0, sizeof *r);
 
+    /* (2) initial gait + UI defaults */
     robot_set_pace(r, WALK_FREQ_DEFAULT);
-    r->direction  = +1;
-    r->show_grid  = true;
-    r->phase      = 0.30f;            /* small offset so we don't start in a singular pose */
+    r->gait.direction = +1;
+    r->gait.phase     = INITIAL_PHASE_RAD;
+    r->ui.show_grid   = true;
 
-    r->ground_y   = (float)((rows - 4) * CELL_H);
-    r->base_hip_y = r->ground_y - (UPPER_LEG_LEN + LOWER_LEG_LEN) * 0.88f;
-    r->x          = (float)(cols * CELL_W) * 0.30f;
+    /* (3) screen-derived placement constants */
+    anchor_update_from_screen(&r->anchor, rows);
 
-    /* Seed foot locks so the first stance leg has a sensible plant
-     * position. One step forward, one step back from current x. */
-    float step = (r->walk_speed / r->walk_freq) * 0.25f;
-    r->foot_lock[0] = (Vec2){ r->x - step, r->ground_y };
-    r->foot_lock[1] = (Vec2){ r->x + step, r->ground_y };
+    /* (4) body x */
+    r->x = (float)(cols * CELL_W) * INITIAL_X_FRAC;
 
+    /* (5) seed foot locks */
+    seed_foot_locks(r);
+
+    /* (6) first pose for frame 0 */
     compute_pose(r);
 }
 
 static void robot_reset(Robot *r, int cols, int rows)
 {
     /* Preserve user-tuned settings across reset. */
-    float freq  = r->walk_freq;
-    int   dir   = r->direction;
-    bool  grid  = r->show_grid;
+    float freq  = r->gait.walk_freq;
+    int   dir   = r->gait.direction;
+    bool  grid  = r->ui.show_grid;
 
     robot_init(r, cols, rows);
 
     robot_set_pace(r, freq);
-    r->direction  = dir;
-    r->show_grid  = grid;
+    r->gait.direction = dir;
+    r->ui.show_grid   = grid;
 }
 
-/* ── §5.8 robot_tick — phase advance + foot lock + pose refresh ──── */
+/* ── §5.8 robot_tick — physics helpers + per-frame tick ───────────── */
+
+/* Provisional hip-joint positions for THIS frame's phase, used by
+ * touchdown detection BEFORE compute_pose() has run. Same formula
+ * as pose_place_pelvis but written into a local rather than Pose. */
+static void compute_provisional_hips(const Robot *r, Vec2 hip_j[2])
+{
+    float bob = hip_bob_offset(r->gait.phase);
+    hip_j[0] = (Vec2){ r->x - HIP_W, r->anchor.base_hip_y + bob };
+    hip_j[1] = (Vec2){ r->x + HIP_W, r->anchor.base_hip_y + bob };
+}
+
+/* Is this leg's phase crossing from swing into stance this tick?
+ *   sin(phi_old) > 0   (was swinging)
+ *   sin(phi_new) ≤ 0   (now in stance)
+ *
+ * The crossing event is "touchdown" — the foot is touching the
+ * ground for the first time this stride.                             */
+static inline bool leg_just_touched_down(float phi_old, float phi_new)
+{
+    return sinf(phi_old) > 0.0f && sinf(phi_new) <= 0.0f;
+}
+
+/* At touchdown, knee_bend ≈ 0 (sin(φ_leg) just crossed zero), so a
+ * thigh-only FK gives the foot's landing x. Two LEG_LEN·sin(thigh)
+ * terms because UPPER and LOWER both point the same way when the
+ * knee is straight. y is always ground_y for a planted foot.        */
+static Vec2 fk_landing_foot(Vec2 hip, float thigh_angle, float ground_y)
+{
+    float foot_x = hip.x
+                 + UPPER_LEG_LEN * sinf(thigh_angle)
+                 + LOWER_LEG_LEN * sinf(thigh_angle);
+    return (Vec2){ foot_x, ground_y };
+}
+
+/* Detect touchdown for one leg, and if it happened, capture the new
+ * lock position from FK at the (provisional) hip. */
+static void leg_detect_touchdown(Robot *r, int i,
+                                 float phi_old, Vec2 prov_hip)
+{
+    float dir       = (float)r->gait.direction;
+    float phi_old_l = leg_phase(phi_old,       i);
+    float phi_new_l = leg_phase(r->gait.phase, i);
+
+    if (!leg_just_touched_down(phi_old_l, phi_new_l)) return;
+
+    float thigh_angle = -SWING_AMP * cosf(phi_new_l) * dir;
+    r->locks.pos[i]   = fk_landing_foot(prov_hip, thigh_angle,
+                                        r->anchor.ground_y);
+}
+
+/* Toroidal world wrap. When x walks off one edge of the screen
+ * (plus a small margin so the bot goes fully off-screen first), it
+ * teleports to the other side. Foot locks are shifted with the body
+ * so the leg geometry stays continuous across the seam. */
+static void wrap_world_position(Robot *r, int cols)
+{
+    float screen_w = (float)(cols * CELL_W);
+    float teleport = screen_w + WRAP_TOTAL_PX;
+
+    if (r->x > screen_w + WRAP_MARGIN_PX) {
+        r->x              -= teleport;
+        r->locks.pos[0].x -= teleport;
+        r->locks.pos[1].x -= teleport;
+    }
+    if (r->x < -WRAP_MARGIN_PX) {
+        r->x              += teleport;
+        r->locks.pos[0].x += teleport;
+        r->locks.pos[1].x += teleport;
+    }
+}
 
 /*
- * One frame of physics:
- *   1. Skip if paused (unless single-step).
- *   2. Advance phase and x.
- *   3. Update screen-derived constants in case of resize.
- *   4. Detect touchdown: if sin(phi_old) > 0 and sin(phi_new) ≤ 0,
- *      the leg is entering stance. Lock foot at the FK landing pos
- *      computed from the new phase. (At touchdown, knee_bend ≈ 0
- *      so we just use thigh-only FK for the foot position.)
- *   5. Run compute_pose().
- *   6. Wrap x at screen edges (toroidal world).
+ * robot_tick — one frame of "physics". Pseudocode pipeline:
+ *
+ *   1. early-out if paused (unless step-once)
+ *   2. advance phase + body x at the current pace
+ *   3. refresh screen-derived anchors (handles SIGWINCH mid-tick)
+ *   4. detect per-leg touchdown and capture new lock positions
+ *   5. compute full pose for the renderer
+ *   6. toroidal world wrap so the bot loops back into view
  */
 static void robot_tick(Robot *r, float dt, int cols, int rows)
 {
-    if (r->paused && !r->step_once) return;
-    r->step_once = false;
+    /* (1) pause gate */
+    if (r->ui.paused && !r->ui.step_once) return;
+    r->ui.step_once = false;
 
-    float phi_old = r->phase;
-    float dir     = (float)r->direction;
+    /* (2) advance — single phase float drives everything */
+    float phi_old = r->gait.phase;
+    float dir     = (float)r->gait.direction;
+    r->gait.phase += 2.0f * (float)M_PI * r->gait.walk_freq * dir * dt;
+    r->x          += r->gait.walk_speed * dir * dt;
 
-    /* (2) advance */
-    r->phase += 2.0f * (float)M_PI * r->walk_freq * dir * dt;
-    r->x     += r->walk_speed * dir * dt;
+    /* (3) refresh anchors in case the screen resized between frames */
+    anchor_update_from_screen(&r->anchor, rows);
 
-    /* (3) screen-derived constants */
-    r->ground_y   = (float)((rows - 4) * CELL_H);
-    r->base_hip_y = r->ground_y - (UPPER_LEG_LEN + LOWER_LEG_LEN) * 0.88f;
+    /* (4) touchdown detection — uses provisional hips at NEW phase */
+    Vec2 prov_hip[2];
+    compute_provisional_hips(r, prov_hip);
+    for (int i = 0; i < 2; i++)
+        leg_detect_touchdown(r, i, phi_old, prov_hip[i]);
 
-    /* Pre-compute hip positions so touchdown FK uses the new hip. */
-    float bob = BOB_AMP * sinf(2.0f * r->phase);
-    Vec2 hip_j[2] = {
-        { r->x - HIP_W, r->base_hip_y + bob },
-        { r->x + HIP_W, r->base_hip_y + bob },
-    };
-
-    /* (4) touchdown detection — lock foot at FK landing pos. */
-    for (int i = 0; i < 2; i++) {
-        float phi_old_l = phi_old   + (i == 1 ? (float)M_PI : 0.0f);
-        float phi_new_l = r->phase  + (i == 1 ? (float)M_PI : 0.0f);
-        if (sinf(phi_old_l) > 0.0f && sinf(phi_new_l) <= 0.0f) {
-            float thigh = -SWING_AMP * cosf(phi_new_l) * dir;
-            float foot_x = hip_j[i].x
-                         + UPPER_LEG_LEN * sinf(thigh)
-                         + LOWER_LEG_LEN * sinf(thigh);   /* knee_bend≈0 */
-            r->foot_lock[i] = (Vec2){ foot_x, r->ground_y };
-        }
-    }
-
-    /* (5) full pose */
+    /* (5) full pose for the renderer */
     compute_pose(r);
 
-    /* (6) toroidal wrap so robot stays visible across the screen. */
-    float sw = (float)(cols * CELL_W);
-    if (r->x > sw + 80.0f) {
-        r->x              -= sw + 160.0f;
-        r->foot_lock[0].x -= sw + 160.0f;
-        r->foot_lock[1].x -= sw + 160.0f;
-    }
-    if (r->x < -80.0f) {
-        r->x              += sw + 160.0f;
-        r->foot_lock[0].x += sw + 160.0f;
-        r->foot_lock[1].x += sw + 160.0f;
-    }
+    /* (6) toroidal world wrap */
+    wrap_world_position(r, cols);
 }
 
 /* ===================================================================== */
@@ -1277,62 +1447,83 @@ static chtype bone_glyph(float dx, float dy)
 
 /* ── §6.2 draw_bone — Bresenham line with one bone glyph ─────────── */
 
+/* Skip drawing if the segment is shorter than half a pixel — happens
+ * during transient zero-length configurations and would otherwise
+ * stamp a stray glyph at a degenerate position. */
+#define BONE_MIN_LEN_PX  0.5f
+
 /*
- * Stamp a single bone glyph (from bone_glyph) along a Bresenham
- * line in cell coordinates. Same glyph for every cell — at this
- * resolution, picking a single direction-appropriate glyph reads
- * cleaner than mixing glyphs per sub-segment.
+ * Bresenham line — rasterise (a.x, a.y) → (b.x, b.y) in pixel space
+ * onto character cells, stamping one direction-appropriate glyph
+ * along the way. Classic "stepped error term" algorithm:
+ *
+ *      initial err = |Δrow| − |Δcol|
+ *      each step:  advance whichever axis the error currently favours
+ *                  and adjust err by the OTHER axis's |Δ|.
+ *
+ * See Bresenham (1965) in References.
  */
 static void draw_bone(Vec2 a, Vec2 b, int cp, attr_t at,
                       int rows, int cols)
 {
-    float dx = b.x - a.x;
-    float dy = b.y - a.y;
-    if (sqrtf(dx*dx + dy*dy) < 0.5f) return;
-    chtype g = bone_glyph(dx, dy);
+    /* (1) skip degenerate segments */
+    float dxf = b.x - a.x;
+    float dyf = b.y - a.y;
+    if (sqrtf(dxf*dxf + dyf*dyf) < BONE_MIN_LEN_PX) return;
 
+    /* (2) one glyph for the whole segment, picked from overall slope */
+    chtype glyph = bone_glyph(dxf, dyf);
+
+    /* (3) endpoints in cell space, span + step direction per axis */
     int r0 = px_to_cy(a.y), c0 = px_to_cx(a.x);
     int r1 = px_to_cy(b.y), c1 = px_to_cx(b.x);
     int dr = r1 - r0, dc = c1 - c0;
-    int sr = (r0 < r1) ? 1 : -1;
-    int sc = (c0 < c1) ? 1 : -1;
-    int err = abs(dr) - abs(dc);
-    int r = r0, c = c0;
+    int step_r = (r0 < r1) ? 1 : -1;
+    int step_c = (c0 < c1) ? 1 : -1;
+    int abs_dr = abs(dr), abs_dc = abs(dc);
 
+    /* (4) walk the line, decision variable picks which axis advances */
+    int err = abs_dr - abs_dc;
+    int r = r0, c = c0;
     for (;;) {
         if (in_screen(r, c, rows, cols)) {
             attron (COLOR_PAIR(cp) | at);
-            mvaddch(r, c, g);
+            mvaddch(r, c, glyph);
             attroff(COLOR_PAIR(cp) | at);
         }
         if (r == r1 && c == c1) break;
         int e2 = 2 * err;
-        if (e2 > -abs(dc)) { err -= abs(dc); r += sr; }
-        if (e2 <  abs(dr)) { err += abs(dr); c += sc; }
+        if (e2 > -abs_dc) { err -= abs_dc; r += step_r; }   /* step row */
+        if (e2 <  abs_dr) { err += abs_dr; c += step_c; }   /* step col */
     }
 }
 
 /* ── §6.3 render_ground — line + optional scrolling grid ─────────── */
 
-static void render_ground(const Robot *r, int rows, int cols)
+/* Solid horizontal underscore line marking the ground surface. */
+static void ground_paint_line(int gy, int cols)
 {
-    int gy = px_to_cy(r->ground_y);
-    if (gy < 0 || gy >= rows) return;
-
-    /* Solid ground line. */
     attron (COLOR_PAIR(CP_GROUND) | A_BOLD);
-    for (int c = 0; c < cols; c++)
-        mvaddch(gy, c, '_');
+    for (int c = 0; c < cols; c++) mvaddch(gy, c, '_');
     attroff(COLOR_PAIR(CP_GROUND) | A_BOLD);
+}
 
-    if (!r->show_grid) return;
+/* World column offset to use for the grid pattern, derived from x so
+ * tick marks SCROLL with the robot's motion. mod handles negative x
+ * (when walking backward). */
+static int grid_scroll_offset(float x)
+{
+    int off = (int)(x / (float)CELL_W) % GRID_PERIOD;
+    return off < 0 ? off + GRID_PERIOD : off;
+}
 
-    /* Tick marks at gy+1 — offset scrolls with robot.x so the grid
-     * appears to move past while the robot stays roughly fixed on
-     * screen (toroidal world). */
-    if (gy + 1 >= rows - 1) return;
-    int offset = (int)(r->x / (float)CELL_W) % GRID_PERIOD;
-    if (offset < 0) offset += GRID_PERIOD;
+/* Scrolling tick marks on the row directly below the ground line,
+ * one '|' every GRID_PERIOD cells. The scroll makes the world look
+ * like it's moving past while the bot stays roughly centred. */
+static void ground_paint_grid(int gy, int cols, float x, int rows)
+{
+    if (gy + 1 >= rows - 1) return;        /* no room above hint strip */
+    int offset = grid_scroll_offset(x);
 
     attron(COLOR_PAIR(CP_GROUND) | A_DIM);
     for (int c = 0; c < cols; c++) {
@@ -1342,98 +1533,154 @@ static void render_ground(const Robot *r, int rows, int cols)
     attroff(COLOR_PAIR(CP_GROUND) | A_DIM);
 }
 
-/* ── §6.4 render_robot — body, arms, legs, head, feet ────────────── */
-
-/*
- * Painter's order — last write wins:
- *
- *   1. spine         hip_c → torso_top
- *   2. arms          shoulder → hand   (left green, right magenta)
- *   3. legs          hip → knee → foot (left green, right magenta)
- *   4. hip band      hip_j[0] → hip_j[1]
- *   5. shoulder band shoulder[0] → shoulder[1]
- *   6. head          'O' at head_c
- *   7. feet          '#' planted (yellow) or '*' swing (cyan)
- *
- * The spine goes UNDER everything else so arm and leg bones can
- * cross over it cleanly. Head and feet go on TOP because they're
- * the most distinctive visual elements.
- */
-static void render_robot(const Robot *r, int rows, int cols)
+/* render_ground — ground line first, optional scrolling grid below. */
+static void render_ground(const Robot *r, int rows, int cols)
 {
-    /* (1) spine */
-    draw_bone(r->hip_c, r->torso_top, CP_BODY, A_BOLD, rows, cols);
+    int gy = px_to_cy(r->anchor.ground_y);
+    if (gy < 0 || gy >= rows) return;
 
-    /* (2) arms */
-    draw_bone(r->shoulder[0], r->hand[0], CP_LEFT,  A_BOLD, rows, cols);
-    draw_bone(r->shoulder[1], r->hand[1], CP_RIGHT, A_BOLD, rows, cols);
+    ground_paint_line(gy, cols);
+    if (r->ui.show_grid) ground_paint_grid(gy, cols, r->x, rows);
+}
 
-    /* (3) legs — thigh and shin per side */
-    draw_bone(r->hip_j[0], r->knee[0], CP_LEFT,  A_BOLD, rows, cols);
-    draw_bone(r->knee[0],  r->foot[0], CP_LEFT,  A_BOLD, rows, cols);
-    draw_bone(r->hip_j[1], r->knee[1], CP_RIGHT, A_BOLD, rows, cols);
-    draw_bone(r->knee[1],  r->foot[1], CP_RIGHT, A_BOLD, rows, cols);
+/* ── §6.4 render_robot — body-part painters + driver ──────────────── */
 
-    /* (4) hip band */
-    draw_bone(r->hip_j[0], r->hip_j[1], CP_BODY_DIM, A_DIM, rows, cols);
+/* Stamp a single character at a pixel-space position if in-screen. */
+static void put_glyph(Vec2 pos, chtype glyph, int cp, attr_t at,
+                      int rows, int cols)
+{
+    int cx = px_to_cx(pos.x);
+    int cy = px_to_cy(pos.y);
+    if (!in_screen(cy, cx, rows, cols)) return;
+    attron (COLOR_PAIR(cp) | at);
+    mvaddch(cy, cx, glyph);
+    attroff(COLOR_PAIR(cp) | at);
+}
 
-    /* (5) shoulder band */
-    draw_bone(r->shoulder[0], r->shoulder[1], CP_BODY_DIM, A_DIM, rows, cols);
+/* Bright vertical-ish line from hip centre to torso top. */
+static void paint_spine(const Pose *p, int rows, int cols)
+{
+    draw_bone(p->hip_c, p->torso_top, CP_BODY, A_BOLD, rows, cols);
+}
 
-    /* (6) head — single 'O' glyph, drawn last over neck/collar */
-    {
-        int hcx = px_to_cx(r->head_c.x);
-        int hcy = px_to_cy(r->head_c.y);
-        if (in_screen(hcy, hcx, rows, cols)) {
-            attron (COLOR_PAIR(CP_BODY) | A_BOLD);
-            mvaddch(hcy, hcx, 'O');
-            attroff(COLOR_PAIR(CP_BODY) | A_BOLD);
-        }
-    }
+/* Single-segment arms: shoulder → hand, colour-coded by side. */
+static void paint_arms(const Pose *p, int rows, int cols)
+{
+    draw_bone(p->shoulder[0], p->hand[0], CP_LEFT,  A_BOLD, rows, cols);
+    draw_bone(p->shoulder[1], p->hand[1], CP_RIGHT, A_BOLD, rows, cols);
+}
 
-    /* (7) feet — '#' planted (yellow) or '*' swing (cyan) */
+/* Two-segment legs: hip → knee → foot, colour-coded by side. Thigh
+ * and shin draw as separate bones so each picks its own glyph. */
+static void paint_legs(const Pose *p, int rows, int cols)
+{
+    draw_bone(p->hip_j[0], p->knee[0], CP_LEFT,  A_BOLD, rows, cols);
+    draw_bone(p->knee[0],  p->foot[0], CP_LEFT,  A_BOLD, rows, cols);
+    draw_bone(p->hip_j[1], p->knee[1], CP_RIGHT, A_BOLD, rows, cols);
+    draw_bone(p->knee[1],  p->foot[1], CP_RIGHT, A_BOLD, rows, cols);
+}
+
+/* Thin connector between the two hip joints — visual cue that they
+ * form a single rigid pelvis. */
+static void paint_hip_band(const Pose *p, int rows, int cols)
+{
+    draw_bone(p->hip_j[0], p->hip_j[1], CP_BODY_DIM, A_DIM, rows, cols);
+}
+
+/* Thin connector between the two shoulders. */
+static void paint_shoulder_band(const Pose *p, int rows, int cols)
+{
+    draw_bone(p->shoulder[0], p->shoulder[1], CP_BODY_DIM, A_DIM, rows, cols);
+}
+
+/* Head — single 'O' glyph drawn over the top of any neck/collar line. */
+static void paint_head(const Pose *p, int rows, int cols)
+{
+    put_glyph(p->head_c, 'O', CP_BODY, A_BOLD, rows, cols);
+}
+
+/* Per-foot glyph + colour: '#' yellow if planted, '*' cyan if swing.
+ * Contact state comes from FootLocks.on_ground (the renderer never
+ * re-evaluates sin(φ_leg) — it trusts the physics layer's flag). */
+static void paint_feet(const Robot *r, int rows, int cols)
+{
     for (int i = 0; i < 2; i++) {
-        int fcx = px_to_cx(r->foot[i].x);
-        int fcy = px_to_cy(r->foot[i].y);
-        if (!in_screen(fcy, fcx, rows, cols)) continue;
-        int    cp = r->on_ground[i] ? CP_FOOT_PLANT : CP_FOOT_SWING;
-        chtype ch = r->on_ground[i] ? '#'           : '*';
-        attron (COLOR_PAIR(cp) | A_BOLD);
-        mvaddch(fcy, fcx, ch);
-        attroff(COLOR_PAIR(cp) | A_BOLD);
+        bool   planted = r->locks.on_ground[i];
+        int    cp      = planted ? CP_FOOT_PLANT : CP_FOOT_SWING;
+        chtype glyph   = planted ? '#'           : '*';
+        put_glyph(r->pose.foot[i], glyph, cp, A_BOLD, rows, cols);
     }
 }
 
-/* ── §6.5 render_hud — yellow status row 0 + cyan hint bottom row ── */
-
 /*
- * Row 0: fps, freq, speed, direction, paused/running.
- * Bottom row: full key list.
+ * render_robot — paint the figure in painter's order.
  *
- * Both pairs are bound on default terminal background so they
- * remain legible against any backdrop.
+ *   1. spine        — UNDER everything else so arms/legs cross cleanly
+ *   2. arms         — left green, right magenta
+ *   3. legs         — left green, right magenta (thigh + shin each side)
+ *   4. hip band     — dim connector between the two hip joints
+ *   5. shoulder band — dim connector between the two shoulders
+ *   6. head         — 'O' on top of any neck/collar overlap
+ *   7. feet         — '#' planted (yellow) or '*' swing (cyan)
  */
-static void render_hud(const Robot *r, double fps, int rows, int cols)
+static void render_robot(const Robot *r, int rows, int cols)
 {
-    char buf[HUD_BUF_LEN];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  freq:%.2f Hz  speed:%5.0f px/s  dir:%s  legL:%s  legR:%s  %s ",
-             fps, r->walk_freq, r->walk_speed,
-             r->direction == 1 ? "→ forward" : "← reverse",
-             r->on_ground[0] ? "STANCE" : "swing ",
-             r->on_ground[1] ? "STANCE" : "swing ",
-             r->paused ? "PAUSED" : "running");
+    const Pose *p = &r->pose;
+    paint_spine         (p,    rows, cols);
+    paint_arms          (p,    rows, cols);
+    paint_legs          (p,    rows, cols);
+    paint_hip_band      (p,    rows, cols);
+    paint_shoulder_band (p,    rows, cols);
+    paint_head          (p,    rows, cols);
+    paint_feet          (r,    rows, cols);
+}
 
+/* ── §6.5 render_hud — HUD format + paint helpers + driver ────────── */
+
+/* Build the HUD top-row status string. Order chosen so the eye lands
+ * on fps first, then live gait values, then leg-phase summary. */
+static void hud_format_status(const Robot *r, double fps,
+                              char *buf, size_t n)
+{
+    const char *dir_str  = r->gait.direction == 1 ? "→ forward" : "← reverse";
+    const char *legL_str = r->locks.on_ground[0] ? "STANCE" : "swing ";
+    const char *legR_str = r->locks.on_ground[1] ? "STANCE" : "swing ";
+    const char *run_str  = r->ui.paused ? "PAUSED" : "running";
+
+    snprintf(buf, n,
+             " %5.1f fps  freq:%.2f Hz  speed:%5.0f px/s  "
+             "dir:%s  legL:%s  legR:%s  %s ",
+             fps, r->gait.walk_freq, r->gait.walk_speed,
+             dir_str, legL_str, legR_str, run_str);
+}
+
+/* Paint the HUD top row (yellow bold) and pad to the right edge so
+ * the colour band extends across the whole terminal width. */
+static void hud_paint_status_row(const char *buf, int cols)
+{
     attron (COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvaddnstr(0, 0, buf, cols);
     int used = (int)strlen(buf);
     for (int x = used; x < cols; x++) mvaddch(0, x, ' ');
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
+/* Bottom-row hint strip — lists every interactive key. */
+static void hud_paint_hint_strip(int rows)
+{
     attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(rows - 1, 0,
              " q:quit  spc:pause  r:reverse  ↑/↓:speed  .:step  g:grid ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+/* render_hud — status row 0 + hint strip at rows-1. */
+static void render_hud(const Robot *r, double fps, int rows, int cols)
+{
+    char buf[HUD_BUF_LEN];
+    hud_format_status   (r, fps, buf, sizeof buf);
+    hud_paint_status_row(buf, cols);
+    hud_paint_hint_strip(rows);
 }
 
 /* ── §6.6 scene_draw — paint full frame ──────────────────────────── */
@@ -1450,7 +1697,25 @@ static void scene_draw(const Robot *r, double fps, int rows, int cols)
 /* §7  screen — ncurses init / present                                    */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — the current ncurses window dimensions.
+ *
+ * INTENT
+ *   Single point of truth for "how big is the terminal RIGHT NOW".
+ *   Every renderer that takes (rows, cols) ultimately reads them
+ *   from here via the Scene pointer in main(). SIGWINCH updates
+ *   these two ints and the new geometry propagates everywhere.
+ *
+ * MUTATION RULE
+ *   Modified only inside screen_init() and screen_resize(). Read by
+ *   the main loop, every renderer, and the physics (for the toroidal
+ *   wrap in robot_tick). Never changes mid-frame — physics and
+ *   renderer treat them as immutable for the duration of one tick.
+ */
+typedef struct {
+    int cols;                /* terminal width in character cells   */
+    int rows;                /* terminal height in character cells  */
+} Screen;
 
 static void screen_init(Screen *s)
 {
@@ -1481,122 +1746,283 @@ static void screen_present(void)
 }
 
 /* ===================================================================== */
-/* §8  app — signals, resize, variable-dt main loop                       */
+/* §8  scene — FrameTimer + Scene container; signals, resize, main loop   */
 /* ===================================================================== */
 
+/*
+ * FrameTimer — wall-clock bookkeeping for the main loop.
+ *
+ * INTENT
+ *   Holds the two timing concerns that used to be loose locals in
+ *   main():
+ *     (1) measuring dt between frames so robot_tick() advances by
+ *         exactly the wall-clock interval (with DT_CAP_SEC guard);
+ *     (2) computing a rolling-window fps for the HUD that stays
+ *         legible — instantaneous fps fluctuates wildly.
+ *
+ *   Pulling these into a named struct turns four disconnected locals
+ *   into one object the loop body can read and pass around if the
+ *   loop ever grows.
+ *
+ * WHY A 0.5-SECOND ROLLING WINDOW (not instantaneous fps)
+ *   Per-frame fps fluctuates wildly — one slow frame reads as
+ *   "32 fps", one fast frame as "200 fps". A 0.5-sec smoothing
+ *   window gives a value the human eye can actually read. Shorter
+ *   window = jumpier; longer = stale.
+ *
+ * WHY NO SUB-STEPPING (unlike perlin_terrain_bot.c)
+ *   The walking gait is pure sin/cos evaluation at the current
+ *   phase — there's no forward-Euler integrator that needs small
+ *   dt for stability. A large dt just advances the phase by more,
+ *   and the next frame still draws the correct pose. The DT_CAP_SEC
+ *   guard is enough.
+ *
+ * ALGORITHM REFERENCE
+ *   Glenn Fiedler, "Fix Your Timestep!" (2004) — last_ns is the
+ *   "previous frame timestamp" from that article; the dt-cap
+ *   pattern in main() is the simpler variant of his accumulator
+ *   recipe.
+ */
 typedef struct {
-    Robot                 robot;
-    Screen                screen;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
-} App;
+    int64_t last_ns;         /* clock_ns() reading at the start of *
+                              * the previous frame. Each frame:    *
+                              *   dt_ns   = now - last_ns          *
+                              *   last_ns = now                    *
+                              * Reset after resize so the post-    *
+                              * resize frame doesn't see a huge    *
+                              * dt spike.                          */
 
-static App g_app;
+    int64_t fps_accum_ns;    /* ns elapsed since the last          *
+                              * fps_display update. Resets when    *
+                              * it crosses NS_PER_SEC / 2 = 0.5s.  */
 
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
+    int     fps_frames;      /* count of frames included in        *
+                              * fps_accum_ns.                       *
+                              *   fps = fps_frames · 1e9            *
+                              *      / fps_accum_ns                 */
+
+    double  fps_display;     /* most recent rolling-window fps    *
+                              * reading, shown in the HUD top row.*
+                              * Updated ≈ 2× per second.          */
+} FrameTimer;
+
+/*
+ * Scene — the top-level container.
+ *
+ * INTENT
+ *   One single struct owns every long-lived piece of state the
+ *   program needs. A single global instance (g_scene) replaces what
+ *   used to be a file-scope App. Signal handlers flip the volatile
+ *   flags on this instance; main() reads them. Every render and
+ *   physics function takes Robot* / Screen* / Scene* explicitly so
+ *   data dependencies are visible at the call site — no hidden
+ *   globals anywhere else.
+ *
+ * MEMBERS
+ *
+ *      Robot       — the simulation state (composed of five
+ *                     concept-sized sub-structs; see §5.1.6)
+ *      Screen      — ncurses dimensions, refreshed on SIGWINCH
+ *      FrameTimer  — dt + rolling-fps state
+ *      running     — main-loop continue flag (signal-cleared)
+ *      need_resize — SIGWINCH handler sets this
+ *
+ * WHY A GLOBAL AT ALL
+ *   Signal handlers can't take parameters and must be async-signal-
+ *   safe (POSIX). They need a path to the running / need_resize
+ *   flags. A single file-scope Scene gives them that path without
+ *   polluting the rest of the API (which passes Scene* explicitly
+ *   everywhere else).
+ *
+ * INITIALIZATION ORDER (see main())
+ *   1. screen_init   — bring ncurses up, learn rows/cols
+ *   2. robot_init    — depends on screen dims (for ground_y / x default)
+ *   3. timer.last_ns — seed for dt measurement
+ */
+typedef struct {
+    Robot                 robot;       /* simulation state. See      *
+                                         * §5.1.6 for composition.    */
+
+    Screen                screen;      /* ncurses dimensions, kept   *
+                                         * in sync via SIGWINCH.      */
+
+    FrameTimer            timer;       /* dt + rolling-fps state.    */
+
+    volatile sig_atomic_t running;     /* main-loop continue flag.   *
+                                         * Cleared by SIGINT/SIGTERM  *
+                                         * (on_exit_signal) or by    *
+                                         * 'q' / Q / ESC keys.        *
+                                         * volatile + sig_atomic_t   *
+                                         * for async-signal safety.   */
+
+    volatile sig_atomic_t need_resize; /* set by SIGWINCH handler    *
+                                         * (on_resize_signal). Main   *
+                                         * loop reads + clears it    *
+                                         * at the top of each frame  *
+                                         * and re-syncs screen +     *
+                                         * resets the robot.         */
+} Scene;
+
+static Scene g_scene;
+
+static void on_exit_signal(int sig)   { (void)sig; g_scene.running = 0;     }
+static void on_resize_signal(int sig) { (void)sig; g_scene.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-static void app_handle_key(App *app, int ch)
+/* Spacebar — pause/resume the gait. */
+static void key_pause_toggle(Robot *r) { r->ui.paused = !r->ui.paused; }
+
+/* 'r' — reverse direction. Multiplies dφ/dt and dx/dt so the gait
+ * retrogrades smoothly without resetting phase. */
+static void key_reverse_direction(Robot *r)
 {
-    Robot *r = &app->robot;
+    r->gait.direction = -r->gait.direction;
+}
+
+/* '+' / '-' / arrows — nudge walk frequency. walk_speed is rederived
+ * inside robot_set_pace so stride geometry stays consistent. */
+static void key_pace_nudge(Robot *r, float delta)
+{
+    robot_set_pace(r, r->gait.walk_freq + delta);
+}
+
+/* '.' — advance exactly one tick while paused (cleared by tick). */
+static void key_step_once(Robot *r) { r->ui.step_once = true; }
+
+/* 'g' — toggle the scrolling ground tick marks. */
+static void key_grid_toggle(Robot *r) { r->ui.show_grid = !r->ui.show_grid; }
+
+/*
+ * scene_handle_key — dispatch one keystroke to its named action.
+ * Each case is one helper call; the switch reads as the keymap.
+ */
+static void scene_handle_key(Scene *scene, int ch)
+{
+    Robot *r = &scene->robot;
     switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */:
-        app->running = 0;
-        break;
-
-    case ' ':
-        r->paused = !r->paused;
-        break;
-
-    case 'r': case 'R':
-        r->direction = -r->direction;
-        break;
-
-    case '+': case '=': case KEY_UP:
-        robot_set_pace(r, r->walk_freq + WALK_FREQ_STEP);
-        break;
-
-    case '-': case '_': case KEY_DOWN:
-        robot_set_pace(r, r->walk_freq - WALK_FREQ_STEP);
-        break;
-
-    case '.':
-        r->step_once = true;
-        break;
-
-    case 'g': case 'G':
-        r->show_grid = !r->show_grid;
-        break;
-
-    default: break;
+    case 'q': case 'Q': case 27 /* ESC */:  scene->running = 0;            break;
+    case ' ':                                key_pause_toggle(r);          break;
+    case 'r': case 'R':                      key_reverse_direction(r);     break;
+    case '+': case '=': case KEY_UP:         key_pace_nudge(r, +WALK_FREQ_STEP); break;
+    case '-': case '_': case KEY_DOWN:       key_pace_nudge(r, -WALK_FREQ_STEP); break;
+    case '.':                                key_step_once(r);             break;
+    case 'g': case 'G':                      key_grid_toggle(r);           break;
+    default:                                                               break;
     }
 }
 
+/* Re-sync everything to the new terminal size after SIGWINCH. */
+static void scene_handle_resize(Scene *scene)
+{
+    screen_resize(&scene->screen);
+    robot_reset(&scene->robot, scene->screen.cols, scene->screen.rows);
+    scene->need_resize   = 0;
+    scene->timer.last_ns = clock_ns();   /* avoid huge dt next frame */
+}
+
+/* Measure wall-clock dt since last frame; also writes raw dt_ns back
+ * to *out_dt_ns for the fps accumulator. Returns dt clamped to
+ * DT_CAP_SEC (spiral-of-death guard). */
+static float frame_measure_dt(FrameTimer *tm, int64_t now_ns,
+                              int64_t *out_dt_ns)
+{
+    int64_t dt_ns = now_ns - tm->last_ns;
+    tm->last_ns   = now_ns;
+    *out_dt_ns    = dt_ns;
+    float dt = (float)dt_ns / (float)NS_PER_SEC;
+    if (dt > DT_CAP_SEC) dt = DT_CAP_SEC;
+    return dt;
+}
+
+/* Tick the rolling-fps accumulator. Recomputes fps_display once the
+ * window crosses 0.5 sec (keeps the HUD reading legible to humans). */
+static void frame_tick_fps(FrameTimer *tm, int64_t dt_ns)
+{
+    tm->fps_accum_ns += dt_ns;
+    tm->fps_frames++;
+    if (tm->fps_accum_ns >= NS_PER_SEC / 2) {
+        tm->fps_display  = (double)tm->fps_frames * 1e9
+                         / (double)tm->fps_accum_ns;
+        tm->fps_accum_ns = 0;
+        tm->fps_frames   = 0;
+    }
+}
+
+/* Drain all queued keystrokes into scene_handle_key. */
+static void scene_drain_input(Scene *scene)
+{
+    int ch;
+    while ((ch = getch()) != ERR) scene_handle_key(scene, ch);
+}
+
+/* Sleep the remainder of TICK_NS so we hit TARGET_FPS regardless of
+ * how fast this frame ran. now_ns is the frame's start timestamp. */
+static void frame_cap_to_target_fps(int64_t now_ns, int64_t tick_ns)
+{
+    int64_t elapsed = clock_ns() - now_ns;
+    clock_sleep_ns(tick_ns - elapsed);
+}
+
+/*
+ * main — orchestrator. Reads as the program's lifecycle:
+ *
+ *   SETUP:
+ *     1. install signal handlers + atexit cleanup
+ *     2. initialise screen + robot in dependency order
+ *     3. seed the frame timer
+ *
+ *   LOOP (each frame):
+ *     1. handle any pending resize
+ *     2. measure dt + tick fps
+ *     3. drain keyboard input
+ *     4. advance physics (robot_tick)
+ *     5. draw + present
+ *     6. sleep to hit TARGET_FPS
+ */
 int main(void)
 {
+    /* SETUP — signals + atexit */
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
+    /* SETUP — subsystems in dependency order */
+    Scene *scene   = &g_scene;
+    scene->running = 1;
+    screen_init(&scene->screen);
+    robot_init (&scene->robot, scene->screen.cols, scene->screen.rows);
+    scene->timer.last_ns = clock_ns();
 
-    screen_init(&app->screen);
-    robot_init (&app->robot, app->screen.cols, app->screen.rows);
-
-    int64_t last_ns      = clock_ns();
-    int64_t fps_accum_ns = 0;
-    int     fps_frames   = 0;
-    double  fps_display  = 0.0;
     const int64_t TICK_NS = NS_PER_SEC / TARGET_FPS;
 
-    while (app->running) {
+    /* LOOP */
+    while (scene->running) {
+        /* (1) handle resize first so subsequent steps see new geometry */
+        if (scene->need_resize) scene_handle_resize(scene);
 
-        /* (1) handle resize first so subsequent steps see the new size */
-        if (app->need_resize) {
-            screen_resize(&app->screen);
-            robot_reset(&app->robot, app->screen.cols, app->screen.rows);
-            app->need_resize = 0;
-            last_ns = clock_ns();
-        }
-
-        /* (2) measure dt, capped to prevent spiral-of-death */
+        /* (2) frame timing — dt for physics, raw dt_ns for fps */
         int64_t now_ns = clock_ns();
-        int64_t dt_ns  = now_ns - last_ns;
-        last_ns        = now_ns;
-        float   dt     = (float)dt_ns / (float)NS_PER_SEC;
-        if (dt > DT_CAP_SEC) dt = DT_CAP_SEC;
+        int64_t dt_ns;
+        float dt = frame_measure_dt(&scene->timer, now_ns, &dt_ns);
+        frame_tick_fps(&scene->timer, dt_ns);
 
-        /* (3) drain input */
-        int ch;
-        while ((ch = getch()) != ERR) app_handle_key(app, ch);
+        /* (3) drain queued keystrokes */
+        scene_drain_input(scene);
 
         /* (4) advance physics */
-        robot_tick(&app->robot, dt,
-                   app->screen.cols, app->screen.rows);
+        robot_tick(&scene->robot, dt,
+                   scene->screen.cols, scene->screen.rows);
 
-        /* (5) rolling fps display (0.5 s window) */
-        fps_accum_ns += dt_ns;
-        fps_frames++;
-        if (fps_accum_ns >= NS_PER_SEC / 2) {
-            fps_display = (double)fps_frames * 1e9
-                        / (double)fps_accum_ns;
-            fps_accum_ns = 0;
-            fps_frames   = 0;
-        }
-
-        /* (6) draw + present */
-        scene_draw(&app->robot, fps_display,
-                   app->screen.rows, app->screen.cols);
+        /* (5) draw + present */
+        scene_draw(&scene->robot, scene->timer.fps_display,
+                   scene->screen.rows, scene->screen.cols);
         screen_present();
 
-        /* (7) frame cap — sleep before the NEXT frame's I/O */
-        int64_t elapsed = clock_ns() - now_ns;
-        clock_sleep_ns(TICK_NS - elapsed);
+        /* (6) sleep the remainder of the frame budget */
+        frame_cap_to_target_fps(now_ns, TICK_NS);
     }
 
-    screen_free(&app->screen);
+    screen_free(&scene->screen);
     return 0;
 }

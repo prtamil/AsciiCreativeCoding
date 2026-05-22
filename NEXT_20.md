@@ -10,6 +10,9 @@ grids/
 algorithms/
 animation/
 flocking/
+matrix_rain/
+robots/
+Ai/
  
  completed rest start from scratch
 

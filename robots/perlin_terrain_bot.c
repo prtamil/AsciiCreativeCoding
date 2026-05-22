@@ -58,12 +58,14 @@
  *   §1  config       — every tunable in one place, grouped by concept
  *   §2  clock        — monotonic timer + sleep
  *   §3  color        — HUD/HINT plus per-element semantic pairs
- *   §4  noise        — Perlin noise + fBm (terrain primitive)
- *   §5  terrain      — height query, slope, ring buffer
- *   §6  bot          — Bot type, PID, cart-pole physics, init/reset
+ *   §4  noise        — Noise context (perm table) + Perlin/fBm
+ *   §5  terrain      — Terrain (borrows Noise*); height, slope, ring buf
+ *   §6  bot          — Pendulum / CartPole / PID / Motion / PhaseTrail /
+ *                       BotUI composed into Bot; PID + cart-pole physics
  *   §7  render       — paint terrain, robot, telemetry, equations, phase
  *   §8  screen       — ncurses init / present
- *   §9  app          — signals, resize, variable-dt main loop with substeps
+ *   §9  scene        — FrameTimer + Scene container; signals, resize,
+ *                       variable-dt main loop with substeps
  *
  * Keys:
  *   q / Q / ESC      quit
@@ -111,18 +113,26 @@
  *                 hill — the slope pushes the body, and we ask the
  *                 controller to expect that.
  *
- * Data-structure: One Bot struct holds:
- *                   • pendulum state (θ, ω)
- *                   • cached cart-pole derived values (θ_eff,
- *                     M_eff, ẍ, F) for display
- *                   • PID gains (Kp, Ki, Kd) and integrator state
- *                   • motion (world_x, drive_spd)
- *                   • phase-space history ring buffer
- *                   • UI flags (paused, fallen, view mode, preset)
+ * Data-structure: A Scene owns the entire program state, composed of
+ *                 five concept-sized pieces:
  *
- *                 Terrain is a TBUF-entry ring buffer of heights
- *                 indexed by world column; new columns are filled
- *                 as the bot moves forward.
+ *                   Noise       — Perlin permutation table (was a global)
+ *                   Terrain     — heights ring buffer, borrows Noise*
+ *                   Bot         — six concept-sized sub-structs:
+ *                       Pendulum   the unknowns (θ, ω)
+ *                       CartPole   derived dynamics (θ_eff, ẍ, θ̈, M_eff, F)
+ *                       PID        gains, integrator, setpoint, term outs
+ *                       Motion     world_x, drive_spd, slope α, dist_m
+ *                       PhaseTrail ring buffer of last (θ, ω) samples
+ *                       BotUI      paused, fallen, view, preset_idx
+ *                   Screen      — ncurses dimensions
+ *                   FrameTimer  — dt + rolling-fps bookkeeping
+ *
+ *                 Each sub-struct names ONE concept the reader needs.
+ *                 The Bot type used to be 30 flat fields; the same
+ *                 data now reads as "balancing has six pieces, here
+ *                 they are." Terrain is still a TBUF-entry ring buffer
+ *                 of heights indexed by world column.
  *
  * Rendering     : Painter's order — last write wins:
  *                   (1) Sky (with sparse stars)
@@ -140,20 +150,58 @@
  *                 into N substeps of size ≤ TICK_DT_TARGET = 1/120
  *                 sec, and each substep runs one integration step.
  *
- * References    :
- *   Wikipedia, "Inverted pendulum" — the canonical control problem.
- *     https://en.wikipedia.org/wiki/Inverted_pendulum
- *   Wikipedia, "PID controller" — three-term feedback in industrial
- *     and robotic systems.  https://en.wikipedia.org/wiki/PID_controller
- *   Åström & Hägglund, "Advanced PID Control" (ISA, 2006) — the
+ * References    : grouped by the concepts this file teaches. Ten
+ *                  entries — one or two strong picks per topic. Free
+ *                  PDFs called out where the author has posted them.
+ *
+ *   ── Feedback control & PID  (concepts (B), (C); §6 pid_step) ─────
+ *   Åström & Murray, "Feedback Systems: An Introduction for
+ *     Scientists and Engineers" (Princeton, 2008). Free PDF at
+ *     https://fbsbook.org . The modern intro to feedback — explains
+ *     WHY closing the loop on error works. Read ch. 1, 3, 11.
+ *   Åström & Hägglund, "Advanced PID Control" (ISA, 2006). The
  *     reference text on PID tuning, anti-windup, and feed-forward.
- *   Anderson, "Cart-pole physics" derivation — Lagrangian or Newton-
- *     Euler approach, both give the same equations of motion.
- *   Wikipedia, "Phase space" — the (θ, ω) diagram is a phase
- *     portrait of a 2-D dynamical system.
- *     https://en.wikipedia.org/wiki/Phase_space
- *   Inigo Quilez, "Perlin noise" — the terrain primitive.
- *     https://iquilezles.org/articles/morenoise/
+ *     Every controller you write afterwards is better.
+ *
+ *   ── Cart-pole dynamics  (concept (B); §6.4 cart_pole_step) ───────
+ *   Spong, Hutchinson, Vidyasagar, "Robot Modeling and Control"
+ *     (Wiley, 2006). Lagrangian derivation of the cart-pole
+ *     equations of motion that §6.4 implements. Read §6.5.
+ *
+ *   ── Phase space & dynamical systems  (§7.6 phase portrait) ───────
+ *   Strogatz, "Nonlinear Dynamics and Chaos" (Westview, 2nd ed,
+ *     2014). The standard intro to phase portraits, limit cycles,
+ *     and stability. Chapters 5–6 most relevant; the trajectories
+ *     drawn there look exactly like our (θ, ω) trail.
+ *
+ *   ── Perlin noise & procedural terrain  (concept (A); §4) ─────────
+ *   Perlin, "An Image Synthesizer" (SIGGRAPH 1985). The original
+ *     gradient-noise paper — short, precise, foundational.
+ *   Perlin, "Improving Noise" (SIGGRAPH 2002). Introduces the C²
+ *     quintic fade  fade(t) = 6t⁵ − 15t⁴ + 10t³  used in §4
+ *     (replacing the 1985 cubic to eliminate derivative kinks).
+ *     https://mrl.cs.nyu.edu/~perlin/paper445.pdf
+ *   Ebert, Musgrave, Peachey, Perlin, Worley, "Texturing &
+ *     Modeling: A Procedural Approach" (Morgan Kaufmann, 3rd ed,
+ *     2002). The procedural-textures playbook — fBm, 1/f spectrum,
+ *     terrain synthesis. §4's fbm() follows the recipe in ch. 16.
+ *
+ *   ── Rendering  (§7) ──────────────────────────────────────────────
+ *   Bresenham, "Algorithm for computer control of a digital plotter"
+ *     (IBM Systems Journal 4(1):25–30, 1965). The line-drawing
+ *     algorithm implemented in draw_line(). Unusually readable
+ *     original paper.
+ *   Padala, "NCURSES Programming HOWTO" (The Linux Documentation
+ *     Project). Practical reference for the ncurses API used in
+ *     §3 (color_init) and §7 (put_ch, put_str, draw_line, draw_bar).
+ *     https://tldp.org/HOWTO/NCURSES-Programming-HOWTO/
+ *
+ *   ── Game loop & numerical timing  (§9 main loop) ─────────────────
+ *   Fiedler ("Gaffer on Games"), "Fix Your Timestep!" (2004). The
+ *     canonical write-up of the accumulator + sub-step pattern
+ *     in main() — explains why splitting dt into ≤ TICK_DT_TARGET
+ *     sub-steps keeps the integrator stable at any frame rate.
+ *     https://gafferongames.com/post/fix_your_timestep/
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -345,96 +393,6 @@
  *  6. doupdate; sleep to TARGET_FPS.
  *
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Stiff dynamics. At low frame rates (e.g. 30 fps), forward-Euler
- *    integration can become marginally unstable for the cart-pole.
- *    Sub-stepping each frame at TICK_DT_TARGET = 1/120 sec keeps
- *    the integrator inside the stability region.
- *
- *  • Integrator wind-up. On steep slopes the error is sustained;
- *    ∫e grows without bound and the controller overshoots wildly
- *    when the slope ends. Clamp the integrator at WINDUP_MAX so its
- *    contribution can't exceed about ±F_MAX.
- *
- *  • Slope feed-forward gain. SLOPE_FEED = 1.0 would cancel slope
- *    perfectly, but real terrain noise (Perlin) means α changes
- *    rapidly; using 0.65 leaves headroom for the controller to
- *    smooth out the residual.
- *
- *  • Falling threshold. Above ~60° lean, the cart-pole equations
- *    are still mathematically valid but the bot can't recover with
- *    bounded F. We stop ticking and show a "FALLEN" banner.
- *
- *  • Ring buffer wrap-around. Phase history wraps at HIST_LEN; older
- *    samples are silently overwritten. Drawing newest-first keeps the
- *    fresh tip of the trajectory bright.
- *
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Press 'r' to reset on flat-ish ground. The bot stands upright
- *    immediately. HUD shows θ ≈ 0, F ≈ 0.
- *
- *  • Press 'p' to disable PID. The bot tips over within ~0.5 sec.
- *    That's how unstable an uncontrolled inverted pendulum is.
- *
- *  • Cycle through gain presets with 'g'. Watch:
- *      BALANCED  — clean inward spiral in the phase view.
- *      HIGH Kp   — bot oscillates more, phase trajectory is wider.
- *      NO Kd     — phase trajectory becomes a circle that doesn't
- *                  shrink. Underdamping = perpetual oscillation.
- *      NO Ki     — on a slope, the bot drifts to a steady non-zero
- *                  lean and stays there. Steady-state error.
- *
- *  • Switch to EQUATIONS view ('m'). Read the live numbers; multiply
- *    Kp by e by hand and verify it matches the displayed P term.
- *
- *  • Push drive speed to max with ↑. The bot still balances — slope
- *    feed-forward + PID handles the constantly changing terrain.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. This is the MOST CONTROL-THEORY-HEAVY file in
- *      robots/. Read robots/diff_drive_robot.c first for pose +
- *      command-ramping basics. Read NO other file for the inverted
- *      pendulum, PID, or cart-pole — this file is the canonical
- *      treatment in the project.
- *   2. §6 bot — THE HEART. Sub-sections in order:
- *        - cart-pole physics    ← inverted pendulum equations (T2)
- *        - PID controller       ← three-term feedback (T3)
- *        - tick                 ← integrator + sub-stepping (T6)
- *      Read AFTER tutorials T1-T6 below.
- *   3. §5 terrain — Perlin noise + slope sampling (T5).
- *   4. §7 render — three view modes (TELEMETRY / EQUATIONS / PHASE).
- *   5. §1-§4, §8-§9 — config / clock / colour / noise / screen /
- *      app loop. Skim if seen.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   theta              body lean angle from vertical (rad). 0 =
- *                      perfectly upright; positive = leaning right.
- *   omega              angular velocity = dθ/dt.
- *   theta_eff          theta + terrain slope α. The "effective"
- *                      lean from gravity's perspective.
- *   theta_ref          PID setpoint. Usually 0 (upright) but
- *                      shifts with terrain slope (T5).
- *   error              theta - theta_ref (signed PID input).
- *   integral           accumulated integral term ∫e dt.
- *   prev_error         previous error (for derivative term).
- *   F                  motor force on the cart, computed by PID.
- *   x_acc              horizontal acceleration of cart.
- *   M_eff              effective inertia (M_cart + m_pole·sin²θ).
- *   Kp, Ki, Kd         PID gains.
- *   drive_spd          forward drive speed (px/sec).
- *   world_x            cumulative position along terrain.
- *   alpha              terrain slope at current world_x (rad).
- *   TICK_DT_TARGET     max physics substep size (1/120 sec).
  *
  * Background you need
  * ───────────────────
@@ -456,269 +414,6 @@
  *   - Real-time embedded programming. Single-threaded soft
  *     real-time at 60 fps is plenty.
  *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Six tutorials that build a self-balancing inverted pendulum
- * robot from first principles.
- *
- *   T1  The inverted pendulum problem — instability of upright
- *   T2  Cart-pole coupling — push the BASE to correct the TOP
- *   T3  PID control — three terms that keep the body upright
- *   T4  Tuning the gains — Kp, Ki, Kd in isolation
- *   T5  Terrain feed-forward — leaning into the hill
- *   T6  Sub-stepping — keeping the integrator stable
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  THE INVERTED PENDULUM PROBLEM — INSTABILITY OF UPRIGHT
- * ──────────────────────────────────────────────────────────
- * A pendulum hanging DOWN is naturally STABLE. Disturb it and
- * gravity pulls it back to vertical.
- *
- * A pendulum balanced UPRIGHT is naturally UNSTABLE. Disturb
- * it and gravity AMPLIFIES the disturbance — the angle grows
- * exponentially.
- *
- * Math: for a pendulum of length L, gravity g, the angular
- * acceleration is:
- *
- *     θ̈ = (g / L) · sin θ          ← pendulum
- *
- * For an INVERTED pendulum (gravity tipping it AWAY from
- * vertical):
- *
- *     θ̈ = (g / L) · sin θ          ← inverted pendulum (same form!)
- *
- * Wait, same equation? Yes. The difference is the MEANING of θ:
- *
- *   - Hanging pendulum:  θ = 0 means pointing DOWN; restoring.
- *   - Inverted pendulum: θ = 0 means pointing UP; destabilising.
- *
- * For small θ near 0 (upright):
- *
- *     θ̈ ≈ (g / L) · θ              ← exponential growth
- *
- * Solution: θ(t) = θ_0 · e^(√(g/L) · t)
- *
- * For our defaults (g = 32, L = 1.5), the time constant is
- * √(g/L) = √21.3 ≈ 4.6 rad/sec. A 1° initial lean grows to
- * 90° in less than a second. Without control, the bot falls
- * almost instantly.
- *
- * Real-world examples:
- *   - Broom on your palm (T2 analogy)
- *   - Segway / Ninebot (this file's exact problem)
- *   - SpaceX Falcon 9 booster landing (3-D version)
- *   - Bipedal humanoid robots while standing
- *
- * The interesting question: HOW do you stabilise an unstable
- * system? T2 + T3.
- *
- * T2  CART-POLE COUPLING — PUSH THE BASE TO CORRECT THE TOP
- * ─────────────────────────────────────────────────────────
- * The pendulum is mounted on a CART (the wheel axle here).
- * The cart can be pushed left or right with motor force F.
- *
- * KEY INSIGHT: pushing the CART has an OPPOSITE effect on the
- * POLE's lean. If the pole leans right and you push the cart
- * RIGHT, the pole's TOP gets "left behind" by the
- * acceleration and rotates toward vertical.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   Initial lean       Cart pushed right           │
- *      │                                                  │
- *      │      *  ↘             *  ← top "left behind"     │
- *      │      |                |  → rotates back toward   │
- *      │      |                |    vertical              │
- *      │     [O O]→           [O O] ← cart moved          │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * The cart-pole equations (from Lagrangian mechanics, but you
- * can take them on faith):
- *
- *     M_eff = M_cart + m_pole · sin² θ
- *     ẍ = (F + m_pole · sin θ · (L · ω² − g · cos θ)) / M_eff
- *     θ̈ = (g · sin θ − ẍ · cos θ) / L
- *
- * Note θ̈ depends on ẍ (cart acceleration). That's the
- * COUPLING. By choosing F (motor force), we control ẍ, which
- * controls θ̈.
- *
- * The controller's job: choose F SO THAT θ stays near 0.
- *
- * T3  PID CONTROL — THREE TERMS THAT KEEP THE BODY UPRIGHT
- * ────────────────────────────────────────────────────────
- * PID stands for PROPORTIONAL + INTEGRAL + DERIVATIVE. Three
- * terms summed:
- *
- *     error = theta - theta_ref
- *     integral += error · dt
- *     derivative = (error - prev_error) / dt
- *
- *     F = Kp · error + Ki · integral + Kd · derivative
- *
- *     prev_error = error
- *
- * Each term has a distinct role:
- *
- *   PROPORTIONAL (P)
- *     F responds to current lean. If the bot leans 0.1 rad
- *     right, P pushes the cart with force Kp · 0.1.
- *     Higher Kp → snappier response but tendency to overshoot.
- *
- *   INTEGRAL (I)
- *     F accumulates integrated error over time. If a constant
- *     bias (terrain slope, motor offset) keeps the bot
- *     leaning slightly, P alone reaches a steady-state error;
- *     I notices the persistent error and drives it to zero.
- *
- *   DERIVATIVE (D)
- *     F responds to RATE of error change. If lean is small but
- *     INCREASING fast, D acts as damping — pushes harder
- *     before the lean grows. Critical for stability.
- *
- * The output F is then APPLIED to the cart as motor force,
- * which becomes ẍ via the cart-pole equations (T2), which
- * affects θ̈, which (over time) reduces the error.
- *
- * Together: P pushes proportional to current state, I removes
- * persistent biases, D damps rapid changes. Three knobs;
- * tuning them is an art (T4).
- *
- * PID is the WORKHORSE of industrial control. Cars
- * (cruise control), ovens (temperature), robots (joint
- * angles), HVAC, drones — almost everything that has a
- * setpoint and feedback uses PID or a close variant.
- *
- * T4  TUNING THE GAINS — Kp, Ki, Kd IN ISOLATION
- * ──────────────────────────────────────────────
- * The 'g' key cycles four GAIN PRESETS. Watch each carefully:
- *
- *   BALANCED          all three gains tuned. Bot stays upright
- *                     across slopes. The default.
- *
- *   HIGH-Kp           huge proportional term, no I, no D.
- *                     Bot oscillates wildly — overshoots in
- *                     each direction. Pure P creates a
- *                     pendulum-like ringing.
- *
- *   NO-Kd             P + I but no derivative. No damping.
- *                     Bot oscillates with growing amplitude;
- *                     usually falls within seconds. Why D
- *                     matters.
- *
- *   NO-Ki             P + D but no integral. Bot maintains
- *                     a steady-state lean (especially on
- *                     slopes). Slope feed-forward partly
- *                     compensates but I is still needed for
- *                     residual bias.
- *
- * General tuning recipe (Ziegler-Nichols, simplified):
- *
- *     1. Start with all gains at zero.
- *     2. Slowly increase Kp until the system OSCILLATES
- *        (just barely). Call this Kp_crit.
- *     3. Set Kp = 0.6 · Kp_crit, Kd = Kp · period / 8,
- *        Ki = Kp / period.
- *
- * Real engineers use SIMULATION + TUNING TOOLS (MATLAB,
- * model-predictive optimisation). For this file the gains
- * were hand-tuned by trial and error.
- *
- * 'p' key TOGGLES the entire PID off — watch the bot fall.
- * Confirms it's the controller doing the work, not magic.
- *
- * T5  TERRAIN FEED-FORWARD — LEANING INTO THE HILL
- * ────────────────────────────────────────────────
- * On flat ground, the bot wants to be vertical (θ_ref = 0).
- *
- * On a SLOPE, vertical is the WRONG target. The terrain
- * pushes the bot's wheels along the slope; the body needs to
- * lean INTO the hill to stay aligned with the gravitational
- * vertical, not the local-up-of-the-chassis.
- *
- * Solution: shift the SETPOINT by the terrain slope α:
- *
- *     theta_ref = -SLOPE_FEED · α
- *
- * SLOPE_FEED is a tuning constant (~1.0 means the bot leans
- * exactly with the slope; <1 less responsive; >1 over-leans).
- *
- * Now the PID's error becomes:
- *
- *     error = theta - theta_ref
- *           = theta - (-SLOPE_FEED · α)
- *           = theta + SLOPE_FEED · α
- *
- * On flat ground (α = 0), this reduces to the standard
- * "lean = error". On a slope, the controller's reference
- * shifts — it WANTS the bot to lean with the slope, so the
- * lean is "expected" rather than treated as error.
- *
- * This is FEED-FORWARD CONTROL — using known information
- * (terrain slope from sensor / map) to anticipate the
- * disturbance instead of reacting to it after it shows up
- * in the error. Common in precision robotics: factor out
- * predictable disturbances so the feedback only handles the
- * unpredictable residual.
- *
- * Without slope feed-forward, the integral term eventually
- * compensates for slope-induced lean — but slowly, and with
- * lag. The feed-forward makes slope-handling INSTANTANEOUS.
- *
- * T6  SUB-STEPPING — KEEPING THE INTEGRATOR STABLE
- * ────────────────────────────────────────────────
- * The cart-pole physics is STIFF — the time constant is
- * ~0.2 sec. Forward Euler with a 1/60 sec timestep is OK on
- * flat ground, but at fast drive speed and sharp slopes it
- * can BLOW UP — θ overshoots wildly between integration
- * steps and the controller can't catch up.
- *
- * Solution: SUB-STEPPING. Each frame's dt is divided into
- * smaller substeps:
- *
- *     n_substeps = max(1, ceil(dt / TICK_DT_TARGET))
- *     sub_dt = dt / n_substeps
- *
- *     for _ in n_substeps:
- *       compute_error_and_F(sub_dt)
- *       integrate_cart_pole(sub_dt)
- *
- * TICK_DT_TARGET = 1/120 sec; a 60 fps frame would split
- * into 2 substeps; a 30 fps frame into 4.
- *
- * Each substep is a SHORTER, more accurate Euler step. The
- * controller and physics both run at the smaller timestep,
- * so feedback is tight even when the renderer is slow.
- *
- * Cost: 2-4× more PID + integration calls per frame. At
- * O(20) ops per substep that's nothing.
- *
- * Why TICK_DT_TARGET = 1/120? It's slightly under the time
- * constant of the closed-loop system (controller + physics).
- * Standard rule: SAMPLE AT LEAST 5× FASTER than the system's
- * natural frequency. Our balance ringing is ~3-5 Hz, so we
- * need ≥ 25 Hz sampling — 120 Hz is comfortable margin.
- *
- * Same sub-stepping pattern is used in any STIFF physics
- * simulator: cloth (Verlet with iterations), constraint
- * solvers (Jakobsen), spring-mass chains. Whenever the
- * dynamics are faster than the renderer, split dt.
- *
- * Decision tree for "is sub-stepping needed?":
- *
- *   non-stiff sim (matrix_rain, FK creatures)     → no
- *   stiff but cheap (springs, ragdoll)            → fixed-step
- *                                                    accumulator
- *   STIFF + complex (cart-pole, Verlet cloth)     → sub-stepping
- *                                                    (this file)
- *
- * For balance + procedural terrain, sub-stepping is the
- * cheapest defence.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -884,6 +579,79 @@ enum {
 #define HUD_BUF_LEN  160
 #define PANEL_W       32
 
+/* ── §1.15 PID tuning & initial conditions ───────────────────────── */
+
+/* Tiny seed perturbation applied to θ in bot_init / bot_reset. Small
+ * enough that the bot is "almost upright" at start, large enough
+ * that the controller has a non-zero error to push against on tick 1.
+ * 0.04 rad ≈ 2.3°.                                                   */
+#define INITIAL_LEAN_RAD     0.04f
+
+/* PID derivative numerical floor — when dt < this we skip the
+ * derivative term to avoid 0/0. Below ~1 ns of dt the noise in the
+ * subtraction would swamp any real signal anyway.                    */
+#define PID_DT_FLOOR         1e-9f
+
+/* Manual Kp tuning via '+' / '-' keys.                              */
+#define KP_NUDGE             5.0f    /* keypress step                */
+#define KP_MAX_USER        400.0f    /* clamp ceiling                */
+
+/* ── §1.16 telemetry / HUD display ranges ────────────────────────── */
+
+/* Bar gauge geometry (cells), inside each telemetry row.            */
+#define BAR_WIDTH            14      /* total bar cells (centred)    */
+#define BAR_COL_OFFSET       16      /* bar's left edge relative c0  */
+
+/* Bar full-scale values — what 100% deflection means in physical
+ * units. Pick these to match the typical "alarming" extreme of each
+ * quantity so the bar visually saturates exactly when the regime
+ * becomes interesting.                                              */
+#define THETA_BAR_RANGE_DEG  35.0f   /* lean angle ±°                */
+#define OMEGA_BAR_RANGE       6.0f   /* angular vel ± rad/sec        */
+#define SLOPE_BAR_RANGE_DEG  25.0f   /* terrain slope ±°             */
+#define D_BAR_FRAC            0.4f   /* D bar fills at this·MAX_FORCE*/
+#define SAT_WARN_FRAC         0.85f  /* F warns red past this·F_MAX  */
+
+/* Colour-change thresholds for live readouts (degrees).             */
+#define THETA_WARN_DEG       20.0f   /* lean turns red past this     */
+#define SLOPE_WARN_DEG       15.0f   /* slope turns red past this    */
+
+/* ── §1.17 phase-portrait plot ───────────────────────────────────── */
+
+/* Plot box in character cells, centred inside the side panel.       */
+#define PHASE_PLOT_W         29
+#define PHASE_PLOT_H         12
+
+/* Physical full-range of the plot axes — values outside these clip. */
+#define PHASE_TH_RANGE        0.6f   /* x-axis half-range, rad       */
+#define PHASE_OM_RANGE        5.0f   /* y-axis half-range, rad/sec   */
+
+/* Trail age bands — newest 15% red, next 35% yellow, oldest 50%
+ * dim grey. Encodes time direction in a static portrait.            */
+#define TRAIL_NEW_BAND        0.85f
+#define TRAIL_MID_BAND        0.50f
+
+/* PID regime classification thresholds — read by phase_classify_*. */
+#define KD_UNDERDAMP_LIMIT    1.0f   /* Kd below this → underdamped  */
+#define KD_OVERDAMP_LIMIT    50.0f   /* Kd above this → overdamped   */
+#define CONVERGED_ERR_RAD     0.03f  /* |e| below this → STABLE      */
+
+/* ── §1.18 render misc ───────────────────────────────────────────── */
+
+/* Beacon (body top) pulse — flips bright/dim every 1/(2·HZ) seconds
+ * based on dist_m so the pulse is travel-paced, not wall-clock-paced
+ * (slows when bot stops; makes the visual link bot↔terrain stronger).*/
+#define BEACON_PULSE_HZ       4.0f
+
+/* Terrain surface glyph threshold — when |Δh| over one cell exceeds
+ * this FRACTION of CELL_W, the surface uses '/' or '\\' instead of
+ * '_' to show the slope. (A slope of 0.22 ≈ 12.4°.)                  */
+#define SLOPE_GLYPH_FRAC      0.22f
+
+/* Lean readout label — printed this many cells LEFT of the axle so
+ * "+12.3°" doesn't overlap the bot itself.                          */
+#define LEAN_LABEL_DC         6
+
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
@@ -930,62 +698,105 @@ static void clock_sleep_ns(int64_t ns)
  * HUD pairs (PAIR_HUD, PAIR_HINT) bind separately on default
  * terminal background per CLAUDE.md HUD spec.
  */
+/*
+ * Palette table — each row is one role mapped to its 256-mode and
+ * 8-mode foreground codes. color_init() walks this once with the
+ * correct column selected at runtime. Reading the table top-to-
+ * bottom gives the full palette in one glance.
+ */
+typedef struct {
+    short pair;         /* CP_* / PAIR_* id from §1.12               */
+    short fg256;        /* foreground when COLORS >= 256             */
+    short fg8;          /* foreground in 8-colour fallback           */
+} PaletteEntry;
+
+static const PaletteEntry PALETTE[] = {
+    /* pair         256-mode  8-mode-fallback   role                 */
+    { CP_SKY,         25,     COLOR_BLUE     }, /* dark blue          */
+    { CP_STAR,       226,     COLOR_YELLOW   }, /* yellow             */
+    { CP_SURF,        46,     COLOR_GREEN    }, /* bright green       */
+    { CP_ROCK,        28,     COLOR_GREEN    }, /* dim green          */
+    { CP_CHASSIS,    255,     COLOR_WHITE    }, /* near-white         */
+    { CP_WHEEL,       51,     COLOR_CYAN     }, /* cyan               */
+    { CP_BEACON,     196,     COLOR_RED      }, /* red                */
+    { CP_DIM,        244,     COLOR_WHITE    }, /* grey               */
+    { CP_GOOD,        82,     COLOR_GREEN    }, /* lime               */
+    { CP_WARN,       196,     COLOR_RED      }, /* red                */
+    { CP_VAL,        229,     COLOR_YELLOW   }, /* pale yellow        */
+    { CP_EQ,         159,     COLOR_CYAN     }, /* light cyan         */
+    { CP_BAR_POS,     51,     COLOR_CYAN     }, /* cyan               */
+    { CP_BAR_NEG,    201,     COLOR_MAGENTA  }, /* magenta            */
+    { PAIR_HUD,      226,     COLOR_YELLOW   }, /* yellow on default  */
+    { PAIR_HINT,      51,     COLOR_CYAN     }, /* cyan on default    */
+};
+#define PALETTE_LEN  (int)(sizeof PALETTE / sizeof PALETTE[0])
+
 static void color_init(void)
 {
     start_color();
     use_default_colors();
 
-    if (COLORS >= 256) {
-        init_pair(CP_SKY,       25,  -1);    /* dark blue          */
-        init_pair(CP_STAR,     226,  -1);    /* yellow             */
-        init_pair(CP_SURF,      46,  -1);    /* bright green       */
-        init_pair(CP_ROCK,      28,  -1);    /* dim green          */
-        init_pair(CP_CHASSIS,  255,  -1);    /* near-white         */
-        init_pair(CP_WHEEL,     51,  -1);    /* cyan               */
-        init_pair(CP_BEACON,   196,  -1);    /* red                */
-        init_pair(CP_DIM,      244,  -1);    /* grey               */
-        init_pair(CP_GOOD,      82,  -1);    /* lime               */
-        init_pair(CP_WARN,     196,  -1);    /* red                */
-        init_pair(CP_VAL,      229,  -1);    /* pale yellow        */
-        init_pair(CP_EQ,       159,  -1);    /* light cyan         */
-        init_pair(CP_BAR_POS,   51,  -1);    /* cyan               */
-        init_pair(CP_BAR_NEG,  201,  -1);    /* magenta            */
-        init_pair(PAIR_HUD,    226,  -1);    /* yellow on default  */
-        init_pair(PAIR_HINT,    51,  -1);    /* cyan on default    */
-    } else {
-        init_pair(CP_SKY,      COLOR_BLUE,    -1);
-        init_pair(CP_STAR,     COLOR_YELLOW,  -1);
-        init_pair(CP_SURF,     COLOR_GREEN,   -1);
-        init_pair(CP_ROCK,     COLOR_GREEN,   -1);
-        init_pair(CP_CHASSIS,  COLOR_WHITE,   -1);
-        init_pair(CP_WHEEL,    COLOR_CYAN,    -1);
-        init_pair(CP_BEACON,   COLOR_RED,     -1);
-        init_pair(CP_DIM,      COLOR_WHITE,   -1);
-        init_pair(CP_GOOD,     COLOR_GREEN,   -1);
-        init_pair(CP_WARN,     COLOR_RED,     -1);
-        init_pair(CP_VAL,      COLOR_YELLOW,  -1);
-        init_pair(CP_EQ,       COLOR_CYAN,    -1);
-        init_pair(CP_BAR_POS,  COLOR_CYAN,    -1);
-        init_pair(CP_BAR_NEG,  COLOR_MAGENTA, -1);
-        init_pair(PAIR_HUD,    COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT,   COLOR_CYAN,    -1);
+    bool truecolor = (COLORS >= 256);
+    for (int i = 0; i < PALETTE_LEN; i++) {
+        short fg = truecolor ? PALETTE[i].fg256 : PALETTE[i].fg8;
+        init_pair(PALETTE[i].pair, fg, -1);
     }
 }
 
 /* ===================================================================== */
-/* §4  noise — Perlin 1-D + fBm                                           */
+/* §4  noise — Noise context, Perlin 1-D, fBm                             */
 /* ===================================================================== */
 
 /*
- * Perlin gradient noise over a permutation table. We use a simple
- * 1-D variant with quintic smoothstep:
- *      fade(t) = 6t⁵ − 15t⁴ + 10t³
- * which is C²-continuous, so the resulting surface has continuous
- * curvature (no visible kinks).
+ * Noise — Perlin gradient-noise context.
+ *
+ * INTENT
+ *   Wrap the 512-entry permutation table so terrain generation has
+ *   an explicit, addressable context object rather than a hidden
+ *   file-scope global. Every caller of perlin1() and fbm() holds a
+ *   pointer to one; the dependency is visible at every call site.
+ *
+ * WHY A SEPARATE TYPE
+ *   The 1985 Perlin paper presents noise as a pure function noise(x),
+ *   but every real implementation needs *some* seeded state — the
+ *   permutation table pins down WHICH noise function we got. Hiding
+ *   it in a global made the dependency invisible and only one noise
+ *   field was ever possible; making it a struct lets Scene own it
+ *   (and lets a future demo instantiate independent noise sources
+ *   for, e.g., terrain + clouds).
+ *
+ * INVARIANT
+ *   perm[i] == perm[i & 255]  for i in [256, 512). The table is
+ *   the permutation of [0..255] under a Fisher-Yates shuffle, then
+ *   DOUBLED so the integer-lattice lookup in perlin1() — which
+ *   reads perm[xi] and perm[xi + 1] with xi in [0, 255] — never
+ *   wraps and needs no branch.
+ *
+ * SMOOTHING
+ *   We use Perlin's 2002 quintic fade  fade(t) = 6t⁵ − 15t⁴ + 10t³
+ *   rather than the 1985 cubic. The quintic is C²-continuous, so
+ *   the resulting surface has continuous CURVATURE — no visible
+ *   kinks where derivatives would otherwise jump.
+ *
+ * ALGORITHM REFERENCES
+ *   Perlin (1985), "An Image Synthesizer", SIGGRAPH — original.
+ *   Perlin (2002), "Improving Noise", SIGGRAPH — the C² quintic fade
+ *     used here. https://mrl.cs.nyu.edu/~perlin/paper445.pdf
+ *   Ebert et al. (2002), "Texturing & Modeling", ch. 16 — fBm wrap.
  */
-static unsigned char g_perm[512];
+typedef struct {
+    unsigned char perm[512];   /* perm[0..255]   = Fisher-Yates of   *
+                                * [0..255], seeded by srand(seed)    *
+                                * inside noise_init(); changes only  *
+                                * when noise_init() is called.       *
+                                *                                    *
+                                * perm[256..511] = exact duplicate   *
+                                * of [0..255] so a lattice lookup    *
+                                * `perm[xi + 1]` with xi in [0,255]  *
+                                * never wraps and needs no branch.   */
+} Noise;
 
-static void perlin_init(unsigned int seed)
+static void noise_init(Noise *n, unsigned int seed)
 {
     unsigned char p[256];
     srand(seed);
@@ -994,19 +805,19 @@ static void perlin_init(unsigned int seed)
         int j = rand() % (i + 1);
         unsigned char t = p[i]; p[i] = p[j]; p[j] = t;
     }
-    for (int i = 0; i < 512; i++) g_perm[i] = p[i & 255];
+    for (int i = 0; i < 512; i++) n->perm[i] = p[i & 255];
 }
 
 static inline float fade (float t) { return t*t*t*(t*(t*6.0f - 15.0f) + 10.0f); }
 static inline float lerp (float a, float b, float t) { return a + t * (b - a); }
 static inline float grad1(int h, float x) { return (h & 1) ? x : -x; }
 
-static float perlin1(float x)
+static float perlin1(const Noise *n, float x)
 {
     int   xi = (int)floorf(x) & 255;
     float xf = x - floorf(x);
-    return lerp(grad1(g_perm[xi],     xf       ),
-                grad1(g_perm[xi + 1], xf - 1.0f),
+    return lerp(grad1(n->perm[xi],     xf       ),
+                grad1(n->perm[xi + 1], xf - 1.0f),
                 fade(xf));
 }
 
@@ -1016,11 +827,11 @@ static float perlin1(float x)
  * Each octave doubles frequency and halves amplitude — the classic
  * 1/f spectrum that gives nature-like terrain.
  */
-static float fbm(float x)
+static float fbm(const Noise *n, float x)
 {
     float v = 0.0f, amp = 0.5f, freq = 1.0f;
     for (int i = 0; i < 5; i++) {
-        v   += amp * perlin1(x * freq);
+        v   += amp * perlin1(n, x * freq);
         amp *= 0.5f;
         freq *= 2.0f;
     }
@@ -1032,22 +843,77 @@ static float fbm(float x)
 /* ===================================================================== */
 
 /*
- * Terrain heights are stored in a ring buffer indexed by world
- * column. As the bot moves right, new columns are filled lazily
- * by `terrain_ensure`.
+ * Terrain — scrolling 1-D heightfield, indexed by world column.
+ *
+ * INTENT
+ *   Cache height samples for every world column the bot has reached
+ *   so we never recompute fBm() for a column already drawn. The bot
+ *   moves right; new columns are lazily generated by terrain_ensure()
+ *   and stored in a power-of-two ring buffer indexed by  wc & TMASK.
+ *
+ * WHY A RING BUFFER (not a growing array)
+ *   The bot's world_x grows unbounded, but the screen shows only
+ *   ~cols columns at any moment. Phase-1 rule "no malloc after init"
+ *   forbids a growing buffer; the ring with TBUF=1024 columns is
+ *   sized so the visible window always lies inside it. Old columns
+ *   get overwritten as wc wraps — and we never look at them again
+ *   because the camera has moved on.
+ *
+ * WHY h[] IS PIXEL-SPACE
+ *   Physics is in pixel space (CELL_W × CELL_H sub-pixels per
+ *   character cell). Storing the surface in the same units lets the
+ *   integrator query  h[wc & TMASK]  directly without a coordinate
+ *   transform; the px → cell conversion happens once at draw time
+ *   in §7 via px_to_cy().
+ *
+ * WHY noise IS BORROWED, NOT OWNED
+ *   Scene owns the single Noise instance. Terrain only reads it.
+ *   Marking the pointer  const Noise *  documents both "Terrain
+ *   reads noise, never modifies it" and "Terrain does not free
+ *   noise — that's Scene's job".
+ *
+ * GENERATION ALGORITHM
+ *   h[wc & TMASK] = mid + fbm(noise, wc · T_FREQ) · amp
+ *      mid = rows · T_MID_F · CELL_H        (vertical placement)
+ *      amp = rows · T_AMP_F · CELL_H        (peak-to-peak / 2)
+ *   fbm = sum of 5 Perlin octaves at increasing freq / halving amp
+ *      → "pink-noise" 1/f spectrum that LOOKS like natural terrain.
+ *
+ * ALGORITHM REFERENCES
+ *   Ebert et al. (2002), "Texturing & Modeling", ch. 16 — fBm,
+ *     1/f spectrum, terrain synthesis recipe.
+ *   Mandelbrot (1982), "The Fractal Geometry of Nature" — origin
+ *     of the fBm concept and its self-similar character.
  */
 typedef struct {
-    float h[TBUF];   /* surface height (px from screen top)     */
-    int   gen_col;   /* highest world column already populated  */
-    int   rows;      /* terminal rows; needed for amplitude     */
+    const Noise *noise;     /* borrowed; Scene owns the instance.    *
+                              * Read by terrain_h_at() → fbm().       *
+                              * Never freed by Terrain.               */
+
+    float h[TBUF];          /* surface height per world column, in   *
+                              * pixels measured DOWN from screen top  *
+                              * (larger h → lower point on screen).   *
+                              * Indexed by  wc & TMASK ; TBUF = 1024. *
+                              * Slot c is valid iff c <= gen_col.     *
+                              * Filled lazily by terrain_ensure().    */
+
+    int   gen_col;          /* highest world column already populated.*
+                              * terrain_ensure() fills (gen_col, upto].*
+                              * Init = -1 (no columns yet); grows     *
+                              * monotonically across the run.         */
+
+    int   rows;             /* current terminal height in cells.     *
+                              * Needed for the amplitude/midline      *
+                              * formula above. Updated only when      *
+                              * SIGWINCH arrives — never per-frame.   */
 } Terrain;
 
 /* World y of the surface at a given world column. */
-static float terrain_h_at(int wc, int rows)
+static float terrain_h_at(const Terrain *t, int wc)
 {
-    float mid = (float)rows * T_MID_F * (float)CELL_H;
-    float amp = (float)rows * T_AMP_F * (float)CELL_H;
-    return mid + fbm((float)wc * T_FREQ) * amp;
+    float mid = (float)t->rows * T_MID_F * (float)CELL_H;
+    float amp = (float)t->rows * T_AMP_F * (float)CELL_H;
+    return mid + fbm(t->noise, (float)wc * T_FREQ) * amp;
 }
 
 /*
@@ -1072,12 +938,13 @@ static float terrain_slope_at(const Terrain *t, int wc)
 static void terrain_ensure(Terrain *t, int upto)
 {
     for (int c = t->gen_col + 1; c <= upto; c++)
-        t->h[c & TMASK] = terrain_h_at(c, t->rows);
+        t->h[c & TMASK] = terrain_h_at(t, c);
     if (upto > t->gen_col) t->gen_col = upto;
 }
 
-static void terrain_init(Terrain *t, int rows, int cols)
+static void terrain_init(Terrain *t, const Noise *n, int rows, int cols)
 {
+    t->noise   = n;
     t->rows    = rows;
     t->gen_col = -1;
     terrain_ensure(t, cols + 64);
@@ -1089,11 +956,53 @@ static void terrain_init(Terrain *t, int rows, int cols)
 
 /* ── §6.1 GainPreset (for the 'g' key teaching cycle) ─────────────── */
 
+/*
+ * GainPreset — one entry in the PRESETS[] table that the 'g' key
+ * cycles through. Each preset is a triple of PID gains plus the
+ * two-line lesson the phase-space panel displays so the reader
+ * knows what symptom to expect.
+ *
+ * INTENT
+ *   Make the PID-tuning intuition into something you can SEE:
+ *   pressing 'g' swaps gains and the (θ, ω) trail visibly changes
+ *   character (tight spiral → wide circles → drifting line). The
+ *   lesson strings name the symptom in the user's own words so the
+ *   reader doesn't have to figure out what they're looking at.
+ *
+ * WHY EMBEDDED IN THE FILE (not a config file / CLI flag)
+ *   Pedagogy: showing four contrasting presets in a fixed cycle is
+ *   the textbook way to teach PID tuning. Loading from disk would
+ *   put the lesson out of reach of a first-time reader.
+ *
+ * ALGORITHM REFERENCE
+ *   Åström & Hägglund (2006), "Advanced PID Control" — the
+ *   underdamped / overdamped / steady-state-drift triad shown by
+ *   these presets is the canonical "what each term does" example.
+ */
 typedef struct {
-    const char *name;
-    const char *lesson_l1;
-    const char *lesson_l2;
-    float       kp, ki, kd;
+    const char *name;       /* short label shown in HUD + telemetry,  *
+                              * padded to 8 chars for column alignment.*
+                              * Examples: "BALANCED", "NO Kd   ".      */
+
+    const char *lesson_l1;  /* line 1 of the on-screen mini-lesson    *
+                              * shown in the phase-space panel.        */
+
+    const char *lesson_l2;  /* line 2 — keep both lines ≤ 28 chars so  *
+                              * they fit in PANEL_W = 32 with margin.  */
+
+    float       kp;         /* proportional gain, N / rad.           *
+                              * Higher = stiffer correction, more     *
+                              * overshoot. Default preset uses 120.   */
+
+    float       ki;         /* integral gain, N / (rad·sec).         *
+                              * Higher = faster steady-state-error    *
+                              * removal, more windup risk. Default 0.2.*/
+
+    float       kd;         /* derivative gain, N / (rad/sec).       *
+                              * Higher = more damping, slower         *
+                              * response. Default 18; the "NO Kd"     *
+                              * preset sets this to 0 to make the     *
+                              * underdamped failure mode visible.     */
 } GainPreset;
 
 static const GainPreset PRESETS[] = {
@@ -1119,187 +1028,669 @@ static const GainPreset PRESETS[] = {
 };
 #define N_PRESETS  (int)(sizeof PRESETS / sizeof PRESETS[0])
 
-/* ── §6.2 Bot type ───────────────────────────────────────────────── */
+/* ── §6.2 Bot type — composed from six concept-sized sub-structs ──── */
 
 /*
- * Bot — the entire simulation state.
+ * The old Bot held thirty flat fields with no grouping; the reader
+ * had to remember which fields belonged to which concept. Splitting
+ * the state into six concept-sized sub-structs makes each field's
+ * role obvious at the access site:
  *
- *   Pendulum state (the unknowns):
- *     theta       lean angle from chassis-perpendicular (rad)
- *     omega       angular velocity θ̇ (rad/sec)
+ *      b->pend.theta      — pendulum unknown
+ *      b->pid.kp          — controller gain
+ *      b->mot.world_x     — motion / world position
  *
- *   Cart-pole derived (computed each substep, exposed for display):
- *     theta_eff   θ + α — lean from gravity
- *     theta_ref   PID setpoint = -SLOPE_FEED · α (lean into slope)
- *     theta_ddot  θ̈ this step
- *     x_ddot      ẍ this step (cart's horizontal accel)
- *     M_eff       effective inertia M_cart + m_pole · sin²θ_eff
- *     F           motor force this step
+ * Same data, same algorithm — only the namespace changed.
+ */
+
+/*
+ * §6.2.1 Pendulum — the TWO unknowns the integrator advances.
  *
- *   PID state:
- *     kp, ki, kd   gains
- *     pid_int      integrator accumulator
- *     pid_prev_err previous frame's error (for derivative)
- *     pid_p, pid_i, pid_d, pid_out  per-term outputs (display only)
- *     pid_on       toggle (off → bot tips immediately)
+ * INTENT
+ *   Make explicit that "the state of the dynamical system" is
+ *   exactly (θ, ω) — two floats. Everything else in CartPole is
+ *   bookkeeping intermediates we cache so the equations panel can
+ *   display them; given just (θ, ω, F, α) the whole system is
+ *   determined.
  *
- *   Motion / world:
- *     world_x      pixel-space position along the terrain
- *     drive_spd    forward speed in px/sec
- *     spin_angle   wheel spin (cosmetic; unused now)
- *     alpha        current terrain slope at foot (rad)
+ * STATE VECTOR (control-theory term)
+ *   x = [θ, θ̇]ᵀ = [theta, omega]
+ *   ẋ = [ω, θ̈]ᵀ — the right-hand side comes from cart-pole equations.
  *
- *   Phase ring buffer: last HIST_LEN (θ, ω) samples for the phase
- *     portrait. Newest at idx (head − 1).
+ * SIGN CONVENTION
+ *   θ > 0  → body leans RIGHT (positive x) from chassis-perpendicular.
+ *   ω > 0  → θ is INCREASING (body rotating right faster).
+ *   The controller drives θ → setpoint (and ω → 0 in steady state).
  *
- *   UI:
- *     paused       freeze ticks
- *     fallen       above FALL_ANGLE; stop ticking, show banner
- *     dist_m       cumulative travel in metres (HUD)
- *     view         which side panel is visible
- *     preset_idx   which gain preset is active
+ * ALGORITHM REFERENCE
+ *   Spong/Hutchinson/Vidyasagar (2006) §6.5 — state-space form of
+ *   the cart-pole equations of motion; "Pendulum" here is exactly
+ *   their state vector for the inverted-pendulum-on-cart system.
  */
 typedef struct {
-    float theta, omega;
+    float theta;        /* lean angle from chassis-perpendicular,    *
+                          * radians. Initialised to 0.04 (≈2.3°) so   *
+                          * the controller has something to push       *
+                          * against on startup. |theta_eff| > FALL_ANGLE*
+                          * (≈ 1.05 rad ≈ 60°) triggers the fall      *
+                          * banner.                                    */
 
-    float theta_eff, theta_ref;
-    float theta_ddot, x_ddot, M_eff, F;
-
-    float kp, ki, kd;
-    float pid_int, pid_prev_err;
-    float pid_p, pid_i, pid_d, pid_out;
-    bool  pid_on;
-
-    float world_x, drive_spd;
-    float spin_angle;
-    float alpha;
-
-    float ph_theta[HIST_LEN];
-    float ph_omega[HIST_LEN];
-    int   ph_head, ph_fill;
-
-    bool     paused, fallen;
-    float    dist_m;
-    ViewMode view;
-    int      preset_idx;
-} Bot;
-
-/* ── §6.3 PID controller (single function — easy to read) ──────────── */
+    float omega;        /* angular velocity θ̇, radians/sec. Sign     *
+                          * matches theta. Forward-Euler update each   *
+                          * substep:  ω ← ω + θ̈ · dt . Reset to 0 by  *
+                          * bot_reset() (preserves user toggles only). */
+} Pendulum;
 
 /*
- * Compute the motor force from the current lean error.
+ * §6.2.2 CartPole — quantities DERIVED from (Pendulum, alpha, F)
+ * every substep. Written by cart_pole_step() and pid_step(); read
+ * by the equations panel for the "math with live numbers" display.
  *
- *   e          = θ − θ_ref               error
- *   pid_int   += e · dt                  integral (clamped)
- *   de_dt      = (e − e_prev) / dt       derivative
- *   F          = Kp·e + Ki·∫e + Kd·de_dt clamped to ±MAX_FORCE
+ * INTENT
+ *   These are NOT independent state — given (θ, ω, α, F) you can
+ *   reconstruct every field. They live in the struct only because
  *
- * The three term outputs are stored separately so the equations
- * view can show them broken out.
+ *     (1) the equations panel wants to show them every frame
+ *         without recomputation; and
+ *     (2) keeping intermediates as named fields makes
+ *         cart_pole_step() read line-by-line like the textbook
+ *         equations (no anonymous "tmp1, tmp2" locals).
+ *
+ * EQUATIONS (Lagrangian cart-pole on a sloped surface)
+ *   θ_eff = θ + α                                       effective lean
+ *   M_eff = M_cart + m_pole · sin²θ_eff                 effective inertia
+ *   ẍ      = (F + m_pole·sin θ_eff·(L·ω² − g·cos θ_eff)) / M_eff
+ *   θ̈      = (g·sin θ_eff − ẍ·cos θ_eff) / L
+ *   ω ← ω + θ̈·dt                                       forward Euler
+ *   θ ← θ + ω·dt
+ *
+ * WHY sin²θ_eff IN M_eff
+ *   Some of the pole's mass effectively belongs to the cart's
+ *   inertia (the part being dragged horizontally as the pole
+ *   rotates). That fraction is sin²θ_eff — zero when the pole is
+ *   vertical (M_eff = M_cart) and 1 when the pole is horizontal
+ *   (the whole pole is shoved sideways with the cart).
+ *
+ * ALGORITHM REFERENCES
+ *   Spong/Hutchinson/Vidyasagar (2006) §6.5 — Lagrangian derivation.
+ *   Goldstein/Poole/Safko, "Classical Mechanics" — Lagrangian basics.
+ *   (Newton-Euler derivation gives the same equations; either route
+ *   reproduces the equations above.)
+ */
+typedef struct {
+    float theta_eff;    /* θ + α, radians. The "lean from gravity"   *
+                          * — what the integrator actually uses,      *
+                          * because gravity pulls along world-down,   *
+                          * not along chassis-perpendicular. Fall     *
+                          * test compares |theta_eff| > FALL_ANGLE.   */
+
+    float theta_ddot;   /* θ̈, rad/s². Angular acceleration this step.*
+                          * Comes from gravity torque minus the cart  *
+                          * acceleration's coupling term, divided by  *
+                          * rod length L.                             */
+
+    float x_ddot;       /* ẍ, m/s². Cart's horizontal acceleration   *
+                          * this step. Drives the cart-pole COUPLING: *
+                          * pushing the cart right tilts the body     *
+                          * left (cos sign in θ̈ equation).            */
+
+    float M_eff;        /* M_cart + m_pole·sin²θ_eff, kg. Effective  *
+                          * inertia seen by force F. Always ≥ M_cart; *
+                          * equals M_cart exactly when θ_eff = 0      *
+                          * (pole perfectly vertical).                */
+
+    float F;            /* Motor force applied to the cart this step,*
+                          * Newtons. Written by pid_step(), clamped   *
+                          * to ±MAX_FORCE (200 N). Read by            *
+                          * cart_pole_step(). When PID is off, F = 0  *
+                          * and the bot tips in ≈1 sec.               */
+} CartPole;
+
+/*
+ * §6.2.3 PID — three-term feedback controller state.
+ *
+ * INTENT
+ *   Implement the canonical PID control law
+ *       F = Kp·e + Ki·∫e + Kd·de/dt          where e = θ − θ_ref
+ *   with two practical refinements:
+ *     • ANTI-WINDUP — clamp the integrator to ±WINDUP_MAX so a long
+ *       sustained error (e.g. PID off, then re-enabled) can't make
+ *       the integral dominate the output for many seconds afterward.
+ *     • OUTPUT SATURATION — clamp F to ±MAX_FORCE to model the real
+ *       motor's physical limit.
+ *
+ *   Per-term outputs (p, i, d, out) are stored separately so the
+ *   equations panel can break the sum apart and the reader can
+ *   multiply Kp·e by hand and verify the displayed P term matches.
+ *
+ * WHY SLOPE FEED-FORWARD (in setpoint, not as a fourth term)
+ *   On a slope of α radians, gravity pulls the body away from
+ *   chassis-perpendicular. To stay upright wrt gravity the body must
+ *   lean INTO the slope. Setting setpoint = −SLOPE_FEED·α biases the
+ *   error so the controller targets the right lean directly,
+ *   without the integrator having to drag itself there. The integral
+ *   then only mops up small residuals — much faster than waiting
+ *   for ∫e to grow large enough to cancel slope drift on its own.
+ *
+ * READS / WRITES
+ *   READS:  Pendulum.theta (current lean), Motion.alpha (via setpoint).
+ *   WRITES: CartPole.F (the cart-pole equations consume it next).
+ *
+ * ALGORITHM REFERENCES
+ *   Åström & Hägglund (2006), "Advanced PID Control" — entire book.
+ *     Anti-windup is ch. 3; feed-forward is ch. 6.
+ *   Åström & Murray (2008), "Feedback Systems" ch. 11 — PID from
+ *     first principles. Free PDF at https://fbsbook.org .
+ */
+typedef struct {
+    /* — gains (user-tunable; see PRESETS[] in §6.1) ——————————————— */
+    float kp;               /* proportional, N/rad. Default 120.     *
+                              * Higher → faster correction, more     *
+                              * overshoot. +/- keys nudge by 5,       *
+                              * clamped to [0, 400].                  */
+    float ki;               /* integral, N/(rad·sec). Default 0.20.  *
+                              * Higher → faster drift removal, more   *
+                              * windup risk.                          */
+    float kd;               /* derivative, N/(rad/sec). Default 18.  *
+                              * Higher → more damping, slower         *
+                              * response. The "NO Kd" preset sets     *
+                              * this to 0 to show underdamped chaos.  */
+
+    /* — controller state (written each substep) ——————————————————— */
+    float setpoint;         /* θ_ref = −SLOPE_FEED · α. Slope-aware  *
+                              * lean target so the bot leans INTO    *
+                              * the hill. With SLOPE_FEED = 0.65, on *
+                              * a 20° slope the body leans ≈13° into *
+                              * it. Updated every substep.            */
+
+    float integ;            /* ∫e, units rad·sec. Anti-windup keeps  *
+                              * this in [-WINDUP_MAX, +WINDUP_MAX]    *
+                              * = [-5, +5]. Reset to 0 by:            *
+                              *   bot_reset(), gain-preset change,    *
+                              *   'p' toggle, bot_apply_preset().     */
+
+    float prev_err;         /* e from the previous substep, used by  *
+                              * the derivative term:                  *
+                              *   de/dt ≈ (e − prev_err) / dt         */
+
+    /* — per-term outputs (display only) ——————————————————————————— */
+    float p;                /* = kp · e         instant stiffness    */
+    float i;                /* = ki · integ     drift removal        */
+    float d;                /* = kd · de/dt     damping              */
+    float out;              /* = p + i + d, clamped to ±MAX_FORCE.   *
+                              * Copied to CartPole.F by pid_step().   */
+
+    /* — enable toggle ———————————————————————————————————————————— */
+    bool  on;               /* 'p' key toggles. When false, pid_step *
+                              * forces p = i = d = out = 0 and the   *
+                              * bot runs as a free inverted pendulum *
+                              * (tips over in ≈ 1 sec). Persisted    *
+                              * across bot_reset().                   */
+} PID;
+
+/*
+ * §6.2.4 Motion — world-frame kinematics.
+ *
+ * INTENT
+ *   Decouple "where the bot is in the world" from "how the body is
+ *   posed relative to vertical" (Pendulum). The cart slides forward
+ *   along the terrain at drive_spd — pure kinematics, no force
+ *   integration — while Pendulum and PID handle the balancing.
+ *
+ * WHY pixel-space (not metres) for world_x
+ *   Physics is in pixel-space throughout this codebase (CELL_W ×
+ *   CELL_H sub-pixels per character cell). The terrain ring buffer
+ *   indexes by pixel-column, so storing world_x in pixels lets us
+ *   index directly without conversion:
+ *       wc = (int)(world_x / CELL_W)
+ *   The metres-per-pixel constant PIX_PER_M = 100 is used ONLY for
+ *   HUD display: drive_spd / PIX_PER_M = m/s, dist_m for the odometer.
+ *
+ * SLOPE CONVENTION (used by Motion.alpha)
+ *   alpha > 0  → terrain ascending to the right (uphill)
+ *   alpha < 0  → terrain descending to the right (downhill)
+ *   alpha = 0  → flat. Sampled at the WHEEL CONTACT column, not the
+ *   centre of the chassis, so steep transitions look right.
+ *
+ * ALGORITHM REFERENCE
+ *   Standard rigid-body kinematics — no algorithm needed beyond
+ *   Newton's first law (drive_spd is constant unless the user
+ *   adjusts it).
+ */
+typedef struct {
+    float world_x;          /* horizontal position along the terrain *
+                              * in pixel units. Monotonically grows   *
+                              * (bot only drives forward). Wraps      *
+                              * through the terrain ring buffer; the  *
+                              * camera follows, so wrap is invisible. */
+
+    float drive_spd;        /* forward speed, pixels/sec. Controlled *
+                              * by ↑/↓ keys, clamped to               *
+                              * [DRIVE_MIN, DRIVE_MAX] = [0, 160].    *
+                              * 0 = stopped (pure inverted-pendulum   *
+                              * test). Default DRIVE_DEF = 55 px/sec  *
+                              * (≈ 0.55 m/s after PIX_PER_M scaling). */
+
+    float spin_angle;       /* wheel rotation angle, rad. Cosmetic   *
+                              * only — currently NOT rendered (wheels *
+                              * are static 'O' glyphs). Kept so a     *
+                              * future variant can show visible       *
+                              * spokes without re-plumbing.           */
+
+    float alpha;            /* terrain slope at the wheel-contact    *
+                              * column, radians. Positive = ascending *
+                              * to the right. Updated each substep   *
+                              * from terrain_slope_at(). Feeds:       *
+                              *   CartPole.theta_eff = θ + α          *
+                              *   PID.setpoint = −SLOPE_FEED · α      */
+
+    float dist_m;           /* cumulative travel, metres. HUD       *
+                              * odometer. Incremented each substep:   *
+                              *   dist_m += drive_spd · dt / PIX_PER_M*
+                              * Reset to 0 by bot_reset().            */
+} Motion;
+
+/*
+ * §6.2.5 PhaseTrail — ring buffer of the last HIST_LEN = 240 (θ, ω)
+ * samples, plotted by render_panel_phase() as a 2-D phase portrait.
+ *
+ * INTENT
+ *   Show the controller's CHARACTER as a 2-D trajectory rather than
+ *   two side-by-side time-plots. The shape of the curve IS the
+ *   controller's behaviour:
+ *       inward spiral  →  stable, well-damped
+ *       wide circles   →  underdamped (Kd too small)
+ *       slow line      →  overdamped (Kd too large)
+ *       drift line     →  steady-state error (Ki too small)
+ *   The reader sees what they're trying to learn directly.
+ *
+ * WHY TWO PARALLEL ARRAYS (not array-of-struct)
+ *   We plot the two coordinates independently (θ on x-axis, ω on y).
+ *   At HIST_LEN = 240 the whole buffer is ≈ 2 KB and fits in L1
+ *   trivially, so cache behaviour is the same either way. Parallel
+ *   arrays make the renderer's "walk the indices" loop slightly
+ *   clearer; pick whichever reads better, it's a wash.
+ *
+ * RING SEMANTICS
+ *   head is the index of the NEXT slot to write. The newest valid
+ *   sample is at (head − 1 + HIST_LEN) % HIST_LEN. fill grows from
+ *   0 → HIST_LEN then saturates, so the renderer never plots
+ *   uninitialised slots before the buffer first fills.
+ *
+ * WHY 240 SAMPLES
+ *   At 60 fps and 1 substep/frame in steady state, 240 samples =
+ *   ≈ 4 seconds of history. Long enough to show a complete recovery
+ *   transient, short enough that an old trajectory fades before it
+ *   confuses a new gain change.
+ *
+ * ALGORITHM REFERENCE
+ *   Strogatz (2014), "Nonlinear Dynamics and Chaos", ch. 5-6 —
+ *   phase portraits and trajectories in 2-D dynamical systems.
+ *   The pictures there look exactly like what render_panel_phase()
+ *   draws (see also figs in §MENTAL MODEL → PHASE PORTRAIT above).
+ */
+typedef struct {
+    float theta[HIST_LEN];  /* θ samples, radians. Oldest valid     *
+                              * sample is at slot                    *
+                              *   (head - fill + HIST_LEN) % HIST_LEN *
+                              * newest at  (head - 1) % HIST_LEN .   */
+
+    float omega[HIST_LEN];  /* ω samples, rad/sec. Same indexing as *
+                              * theta[] (parallel arrays).            */
+
+    int   head;             /* index of the NEXT slot to write.     *
+                              * Advances each substep:               *
+                              *   head = (head + 1) % HIST_LEN       *
+                              * Init = 0.                             */
+
+    int   fill;             /* count of valid samples in the buffer *
+                              * so far, clamped to HIST_LEN. Lets    *
+                              * the renderer skip empty slots during *
+                              * the first 4 sec after reset.         */
+} PhaseTrail;
+
+/*
+ * §6.2.6 BotUI — keyboard-driven interactive flags.
+ *
+ * INTENT
+ *   Separate "human input state" from physics state. Whether the
+ *   bot is paused or which panel is showing has nothing to do with
+ *   the dynamics — these flags exist purely because there's a human
+ *   at the keyboard. Grouping them in a separate sub-struct makes
+ *   that obvious at the type level.
+ *
+ * WHY KEEP THESE ACROSS bot_reset()
+ *   When the user presses 'r' to reset, they want the SIMULATION
+ *   to reset — not their personal preferences. So bot_reset()
+ *   memcpys the whole Bot to zero, then explicitly RESTORES the
+ *   BotUI fields (plus pid.on and mot.drive_spd). Putting them in
+ *   their own sub-struct documents that intent at the type level
+ *   and makes the restore code visually obvious.
+ *
+ * WHY 'fallen' IS NOT A PURE PHYSICS FACT
+ *   "Fallen" is a renderer-friendly event flag, not a continuous
+ *   physical quantity: it's TRUE iff the integrator has been told
+ *   to give up. Putting it next to render-relevant flags (paused,
+ *   view) instead of next to (θ, ω) reflects that it's read by the
+ *   renderer, not by the equations of motion.
+ */
+typedef struct {
+    bool     paused;        /* spacebar toggles. When true,           *
+                              * bot_substep() is skipped → the bot     *
+                              * freezes mid-air. Useful for studying   *
+                              * a particular tilt frame, or staging    *
+                              * a screenshot. Cleared on bot_reset().  */
+
+    bool     fallen;        /* set true when |theta_eff| > FALL_ANGLE  *
+                              * (≈ 60°). bot_substep() early-returns,  *
+                              * render_bot() overlays the "FALLEN"     *
+                              * banner. Cleared only on bot_reset();   *
+                              * the user must press 'r' to recover.    */
+
+    ViewMode view;          /* TELEMETRY / EQUATIONS / PHASE — which   *
+                              * right-side panel is visible. Cycled    *
+                              * by 'm' key. Persists across reset      *
+                              * (user's chosen view is preserved).     */
+
+    int      preset_idx;    /* index into PRESETS[] (§6.1). Cycled by  *
+                              * 'g' key, mod N_PRESETS. 0 = BALANCED   *
+                              * (default). Persists across reset.      *
+                              * Changing it via 'g' calls              *
+                              * bot_apply_preset() which clears integ. */
+} BotUI;
+
+/*
+ * §6.2.7 Bot — composition of the six sub-structs above.
+ *
+ * INTENT
+ *   Before the refactor this was 30 flat fields; the reader had to
+ *   remember which field belonged to which concept. The composition
+ *   makes the role of every access obvious at the use site:
+ *
+ *       b->pend.theta   pendulum unknown (the ODE state)
+ *       b->cp.F         cart-pole derived (motor force this step)
+ *       b->pid.kp       controller gain (a tuning parameter)
+ *       b->mot.world_x  motion (where the bot is in the world)
+ *       b->trail.head   phase trail (display ring buffer)
+ *       b->ui.fallen    interactive flag (event marker for renderer)
+ *
+ *   Same bytes, same algorithm — only the namespace changed. The
+ *   payoff is that reading any line of physics now tells you which
+ *   conceptual layer it touches.
+ *
+ * LAYERING (read these in order to understand the simulation)
+ *
+ *   1. Pendulum    — the unknowns: what the ODE is integrating
+ *   2. CartPole    — the equations: what writes those unknowns
+ *   3. PID         — the controller: what drives the equations
+ *   4. Motion      — the cart kinematics: where the controller acts
+ *   5. PhaseTrail  — record/replay of (θ, ω) for the phase panel
+ *   6. BotUI       — human flags, not part of physics
+ *
+ * WRITE ORDERING PER SUBSTEP (see bot_substep in §6.6)
+ *
+ *   1. Motion.world_x  += drive_spd · dt          kinematics
+ *   2. Motion.alpha     = terrain_slope_at(...)    slope sample
+ *   3. CartPole.theta_eff = pend.theta + alpha     effective lean
+ *      PID.setpoint     = -SLOPE_FEED · alpha     slope feed-forward
+ *   4. pid_step          → writes CartPole.F       controller
+ *   5. cart_pole_step    → writes pend.theta/omega dynamics
+ *   6. phase_push        → writes trail.theta/omega trace
+ *
+ *   Each step reads the previous step's writes. The integrator is
+ *   forward Euler — explicit, dt-stable for small dt only, hence
+ *   the sub-stepping in main().
+ */
+typedef struct {
+    Pendulum   pend;        /* the two unknowns (θ, ω). See §6.2.1.   */
+    CartPole   cp;          /* derived dynamics per substep. §6.2.2.  */
+    PID        pid;         /* controller state + gains. §6.2.3.      */
+    Motion     mot;         /* world position + slope cache. §6.2.4.  */
+    PhaseTrail trail;       /* (θ, ω) history ring buffer. §6.2.5.    */
+    BotUI      ui;          /* keyboard-driven flags. §6.2.6.         */
+} Bot;
+
+/* ── §6.3 PID controller — small named helpers + pid_step ─────────── */
+
+/* Saturate a signed value to the symmetric range [-limit, +limit].
+ * Used twice in pid_step: anti-windup on the integrator, output
+ * saturation on the final motor force. */
+static inline float clamp_symmetric(float v, float limit)
+{
+    if (v >  limit) return  limit;
+    if (v < -limit) return -limit;
+    return v;
+}
+
+/* Error signal — what the controller is trying to drive to zero.
+ *      e = θ − θ_ref
+ * Positive e ⇒ "leaning further than the slope-aware setpoint asks
+ * for". Negative e ⇒ "leaning less / opposite direction". */
+static inline float pid_error_signal(float theta, float setpoint)
+{
+    return theta - setpoint;
+}
+
+/* Forward-Euler integrate-and-clamp:  ∫e += e·dt , then anti-windup.
+ * Anti-windup bounds the integrator's accumulated memory so that a
+ * long sustained error can't dominate the output forever once the
+ * regime changes. */
+static inline void pid_accumulate_with_antiwindup(PID *pid, float err, float dt)
+{
+    pid->integ = clamp_symmetric(pid->integ + err * dt, WINDUP_MAX);
+}
+
+/* Backward-difference derivative of error: (e − e_prev) / dt.
+ * Below PID_DT_FLOOR the subtraction becomes numerically meaningless
+ * so we return 0 — losing one frame of D is harmless. */
+static inline float pid_error_derivative(PID *pid, float err, float dt)
+{
+    float de_dt = (dt > PID_DT_FLOOR) ? (err - pid->prev_err) / dt : 0.0f;
+    pid->prev_err = err;
+    return de_dt;
+}
+
+/* When PID is toggled off, every term + the motor output is zero. */
+static inline void pid_zero_outputs(PID *pid)
+{
+    pid->p = pid->i = pid->d = pid->out = 0.0f;
+}
+
+/*
+ * pid_step — one tick of the three-term PID law.
+ *
+ *      F = clamp( Kp·e + Ki·∫e + Kd·de/dt , ±MAX_FORCE )
+ *
+ * Each step is one named helper so the body reads as the textbook
+ * equation, not as a flat block of float arithmetic.
  */
 static void pid_step(Bot *b, float dt)
 {
-    if (!b->pid_on) {
-        b->pid_p = b->pid_i = b->pid_d = b->pid_out = 0.0f;
-        b->F = 0.0f;
+    PID *pid = &b->pid;
+
+    /* (0) controller disengaged → no force, all terms zero */
+    if (!pid->on) {
+        pid_zero_outputs(pid);
+        b->cp.F = 0.0f;
         return;
     }
 
-    float err = b->theta - b->theta_ref;
+    /* (1) error signal */
+    float err = pid_error_signal(b->pend.theta, pid->setpoint);
 
-    b->pid_int += err * dt;
-    if (b->pid_int >  WINDUP_MAX) b->pid_int =  WINDUP_MAX;
-    if (b->pid_int < -WINDUP_MAX) b->pid_int = -WINDUP_MAX;
+    /* (2) integrate (with anti-windup) and differentiate the error */
+    pid_accumulate_with_antiwindup(pid, err, dt);
+    float de_dt = pid_error_derivative(pid, err, dt);
 
-    float deriv = (dt > 1e-9f) ? (err - b->pid_prev_err) / dt : 0.0f;
-    b->pid_prev_err = err;
+    /* (3) three-term sum — each term kept for the equations panel */
+    pid->p   = pid->kp * err;
+    pid->i   = pid->ki * pid->integ;
+    pid->d   = pid->kd * de_dt;
+    pid->out = clamp_symmetric(pid->p + pid->i + pid->d, MAX_FORCE);
 
-    b->pid_p   = b->kp * err;
-    b->pid_i   = b->ki * b->pid_int;
-    b->pid_d   = b->kd * deriv;
-    b->pid_out = b->pid_p + b->pid_i + b->pid_d;
-
-    if (b->pid_out >  MAX_FORCE) b->pid_out =  MAX_FORCE;
-    if (b->pid_out < -MAX_FORCE) b->pid_out = -MAX_FORCE;
-    b->F = b->pid_out;
+    /* (4) publish the motor force to the cart-pole dynamics step */
+    b->cp.F = pid->out;
 }
 
-/* ── §6.4 cart-pole dynamics (Lagrangian) ───────────────────────────── */
+/* ── §6.4 cart-pole dynamics (Lagrangian) — physics helpers + step ── */
 
 /*
- * One forward-Euler step of the cart-pole equations on a sloped
- * surface. See MENTAL MODEL → CART-POLE EQUATIONS for derivation.
- *
- * Inputs:  θ, ω, F      (and the current slope α via theta_eff)
- * Outputs: ẍ, θ̈ stored in b for display; ω, θ updated in place.
+ * Effective inertia seen by the horizontal force F.
+ *      M_eff = M_cart + m_pole · sin²θ_eff
+ * sin²θ_eff is the fraction of the pole's mass being DRAGGED
+ * horizontally as the pole rotates — it adds to the cart's mass.
+ * Equals M_cart when θ_eff = 0, equals M_cart + m_pole when θ_eff =
+ * 90° (pole horizontal, entire pole shoved sideways with the cart).
+ */
+static inline float pole_effective_inertia(float theta_eff)
+{
+    float sin_th = sinf(theta_eff);
+    return MASS_CART + MASS_POLE * sin_th * sin_th;
+}
+
+/*
+ * Horizontal acceleration of the cart axle (the "ẍ" of the Lagrangian).
+ *      ẍ = ( F + m_pole·sinθ_eff·(L·ω² − g·cosθ_eff) ) / M_eff
+ * Middle term is the centripetal/gravitational reaction the rotating
+ * pole exerts back on its own pivot.
+ */
+static inline float cart_horizontal_accel(float F, float theta_eff,
+                                          float omega, float M_eff)
+{
+    float sin_th = sinf(theta_eff);
+    float cos_th = cosf(theta_eff);
+    float pole_reaction = MASS_POLE * sin_th *
+                          (PEND_LEN * omega * omega - GRAVITY * cos_th);
+    return (F + pole_reaction) / M_eff;
+}
+
+/*
+ * Angular acceleration of the pole (the "θ̈" of the Lagrangian).
+ *      θ̈ = ( g·sinθ_eff − ẍ·cosθ_eff ) / L
+ * First term: gravity tips the pole; second term: cart-pole COUPLING
+ * — cart's horizontal acceleration tilts the pole the OTHER way
+ * (because the base translates and the top rotationally lags). This
+ * is the term the controller exploits to recover from a lean.
+ */
+static inline float pole_angular_accel(float theta_eff, float x_ddot)
+{
+    return (GRAVITY * sinf(theta_eff) - x_ddot * cosf(theta_eff)) / PEND_LEN;
+}
+
+/* Forward-Euler step: advance (ω, θ) one timestep at the given θ̈.
+ *      ω ← ω + θ̈ · dt
+ *      θ ← θ + ω · dt
+ * Symplectic-Euler order (update ω before θ) — keeps phase-portrait
+ * spirals tight even with relatively large dt. */
+static inline void pendulum_euler_advance(Pendulum *pe, float theta_ddot,
+                                          float dt)
+{
+    pe->omega += theta_ddot * dt;
+    pe->theta += pe->omega  * dt;
+}
+
+/*
+ * cart_pole_step — one tick of the Lagrangian cart-pole dynamics.
+ * Body reads as the four-line algorithm; each line is one named
+ * physics helper above.
  */
 static void cart_pole_step(Bot *b, float dt)
 {
-    float st = sinf(b->theta_eff);
-    float ct = cosf(b->theta_eff);
+    CartPole *cp = &b->cp;
+    Pendulum *pe = &b->pend;
 
-    b->M_eff      =  MASS_CART + MASS_POLE * st * st;
-    b->x_ddot     = (b->F + MASS_POLE * st *
-                     (PEND_LEN * b->omega * b->omega - GRAVITY * ct))
-                    / b->M_eff;
-    b->theta_ddot = (GRAVITY * st - b->x_ddot * ct) / PEND_LEN;
+    /* (1) effective inertia — how much "mass" the horizontal force sees */
+    cp->M_eff      = pole_effective_inertia(cp->theta_eff);
 
-    b->omega += b->theta_ddot * dt;
-    b->theta += b->omega      * dt;
+    /* (2) cart acceleration — motor force + pole reaction over inertia  */
+    cp->x_ddot     = cart_horizontal_accel(cp->F, cp->theta_eff,
+                                           pe->omega, cp->M_eff);
+
+    /* (3) pole acceleration — gravity tipping − cart's coupling         */
+    cp->theta_ddot = pole_angular_accel(cp->theta_eff, cp->x_ddot);
+
+    /* (4) integrate (ω, θ) forward by dt                                */
+    pendulum_euler_advance(pe, cp->theta_ddot, dt);
 }
 
 /* ── §6.5 phase history push ──────────────────────────────────────── */
 
 static void phase_push(Bot *b)
 {
-    b->ph_theta[b->ph_head] = b->theta;
-    b->ph_omega[b->ph_head] = b->omega;
-    b->ph_head = (b->ph_head + 1) % HIST_LEN;
-    if (b->ph_fill < HIST_LEN) b->ph_fill++;
+    PhaseTrail *tr = &b->trail;
+    tr->theta[tr->head] = b->pend.theta;
+    tr->omega[tr->head] = b->pend.omega;
+    tr->head = (tr->head + 1) % HIST_LEN;
+    if (tr->fill < HIST_LEN) tr->fill++;
 }
 
-/* ── §6.6 bot_substep — one physics step (called N times per frame) ── */
+/* ── §6.6 bot_substep — substep helpers + the six-step physics tick ── */
+
+/* Kinematics — cart slides forward at drive_spd. No forces, just
+ * Newton's first law plus odometer + wheel-spin bookkeeping. */
+static inline void motion_advance(Motion *mo, float dt)
+{
+    mo->world_x    += mo->drive_spd * dt;
+    mo->dist_m     += mo->drive_spd * dt / PIX_PER_M;
+    mo->spin_angle += (mo->drive_spd / WHEEL_R) * dt;
+}
+
+/* World column under the wheel — used to sample terrain.h[]. */
+static inline int wheel_world_column(const Motion *mo)
+{
+    return (int)(mo->world_x / (float)CELL_W);
+}
+
+/* Derive the two slope-dependent inputs the dynamics needs:
+ *      θ_eff    = θ + α        (effective lean from gravity)
+ *      θ_ref   = −SLOPE_FEED · α  (slope-aware PID setpoint)
+ * Both are recomputed every substep because α changes as the bot
+ * traverses new terrain. */
+static inline void apply_slope_feed_forward(Bot *b)
+{
+    float alpha = b->mot.alpha;
+    b->cp.theta_eff = b->pend.theta + alpha;
+    b->pid.setpoint = -alpha * SLOPE_FEED;
+}
+
+/* Fall test — |θ_eff| past FALL_ANGLE means even unbounded F can't
+ * recover in time, so we just stop ticking and show the banner. */
+static inline void detect_fall(Bot *b)
+{
+    if (fabsf(b->cp.theta_eff) > FALL_ANGLE) b->ui.fallen = true;
+}
 
 /*
- * Runs the physics pipeline for one timestep `sub_dt`:
- *   1. Move forward along terrain at drive_spd.
- *   2. Sample slope α at the new world position.
- *   3. Compute θ_eff and the slope-aware setpoint θ_ref.
- *   4. Run PID → motor force F.
- *   5. Run cart-pole dynamics → update θ, ω.
- *   6. Push (θ, ω) into the phase history.
- *   7. Detect fall (|θ_eff| > FALL_ANGLE).
+ * bot_substep — one physics timestep. Six named steps; each step is
+ * either a helper call or one line of cross-layer wiring. The whole
+ * algorithm fits in a screen with no nested logic.
+ *
+ * Called N times per frame from main(), with sub_dt ≤ TICK_DT_TARGET,
+ * so the forward-Euler integrator stays well inside its stability
+ * region regardless of frame rate.
  */
 static void bot_substep(Bot *b, const Terrain *t, float sub_dt)
 {
-    if (b->fallen) return;
+    if (b->ui.fallen) return;
 
-    /* 1. advance along terrain */
-    b->world_x += b->drive_spd * sub_dt;
-    b->dist_m  += b->drive_spd * sub_dt / PIX_PER_M;
-    int wc = (int)(b->world_x / (float)CELL_W);
+    /* (1) advance kinematics; sample slope at the new wheel position */
+    motion_advance(&b->mot, sub_dt);
+    b->mot.alpha = terrain_slope_at(t, wheel_world_column(&b->mot));
 
-    /* 2. sample slope */
-    b->alpha = terrain_slope_at(t, wc);
+    /* (2) derive (θ_eff, setpoint) from the new slope                */
+    apply_slope_feed_forward(b);
 
-    /* 3. effective angle + slope-aware setpoint */
-    b->theta_eff = b->theta + b->alpha;
-    b->theta_ref = -b->alpha * SLOPE_FEED;
-
-    /* spin angle (cosmetic; not currently rendered) */
-    b->spin_angle += (b->drive_spd / WHEEL_R) * sub_dt;
-
-    /* 4. PID → F */
+    /* (3) controller → motor force F                                 */
     pid_step(b, sub_dt);
 
-    /* 5. cart-pole dynamics → updated θ, ω */
+    /* (4) cart-pole dynamics → new (θ, ω)                            */
     cart_pole_step(b, sub_dt);
 
-    /* 6. record phase trajectory */
+    /* (5) record the (θ, ω) sample for the phase portrait            */
     phase_push(b);
 
-    /* 7. fall test */
-    if (fabsf(b->theta_eff) > FALL_ANGLE) b->fallen = true;
+    /* (6) fall test — sets ui.fallen if |θ_eff| > FALL_ANGLE         */
+    detect_fall(b);
 }
 
 /* ── §6.7 init / reset / preset ──────────────────────────────────── */
@@ -1307,42 +1698,72 @@ static void bot_substep(Bot *b, const Terrain *t, float sub_dt)
 static void bot_apply_preset(Bot *b, int idx)
 {
     const GainPreset *p = &PRESETS[idx];
-    b->kp = p->kp;
-    b->ki = p->ki;
-    b->kd = p->kd;
-    b->pid_int = 0.0f;          /* clear integral on gain change */
+    b->pid.kp    = p->kp;
+    b->pid.ki    = p->ki;
+    b->pid.kd    = p->kd;
+    b->pid.integ = 0.0f;        /* clear integral on gain change */
 }
 
+/* The four settings the user can change at runtime and expects to
+ * survive a reset. Carried out of bot_reset() and back in after the
+ * memset, so 'r' resets physics WITHOUT wiping the user's choices. */
+typedef struct {
+    bool     pid_on;
+    float    drive_spd;
+    ViewMode view;
+    int      preset_idx;
+} UserPrefs;
+
+static UserPrefs grab_user_prefs(const Bot *b)
+{
+    return (UserPrefs){
+        .pid_on     = b->pid.on,
+        .drive_spd  = b->mot.drive_spd,
+        .view       = b->ui.view,
+        .preset_idx = b->ui.preset_idx,
+    };
+}
+
+static void restore_user_prefs(Bot *b, UserPrefs p)
+{
+    b->pid.on        = p.pid_on;
+    b->mot.drive_spd = p.drive_spd;
+    b->ui.view       = p.view;
+    b->ui.preset_idx = p.preset_idx;
+}
+
+/*
+ * bot_reset — 'r' key. Resets physics to its boot state but keeps
+ * the user's interactive choices (PID on/off, drive speed, view,
+ * preset). Same body as bot_init, except prefs come from the
+ * existing bot rather than the defaults.
+ */
 static void bot_reset(Bot *b)
 {
-    /* Preserve user-adjustable settings across reset. */
-    bool     pid_on = b->pid_on;
-    float    drive  = b->drive_spd;
-    ViewMode view   = b->view;
-    int      preset = b->preset_idx;
-
+    UserPrefs prefs = grab_user_prefs(b);
     memset(b, 0, sizeof *b);
-
-    b->pid_on      = pid_on;
-    b->drive_spd   = drive;
-    b->view        = view;
-    b->preset_idx  = preset;
-
-    /* Tiny initial lean so the controller has something to work with. */
-    b->theta = 0.04f;
-
-    bot_apply_preset(b, preset);
+    restore_user_prefs(b, prefs);
+    b->pend.theta = INITIAL_LEAN_RAD;
+    bot_apply_preset(b, prefs.preset_idx);
 }
 
+/*
+ * bot_init — one-shot startup. Same shape as bot_reset, but the
+ * "preserved" prefs are the defaults from §1 instead of the
+ * (uninitialised) current bot.
+ */
 static void bot_init(Bot *b)
 {
+    UserPrefs defaults = {
+        .pid_on     = true,
+        .drive_spd  = DRIVE_DEF,
+        .view       = VIEW_TELEMETRY,
+        .preset_idx = 0,
+    };
     memset(b, 0, sizeof *b);
-    b->pid_on      = true;
-    b->drive_spd   = DRIVE_DEF;
-    b->view        = VIEW_TELEMETRY;
-    b->preset_idx  = 0;
-    b->theta       = 0.04f;
-    bot_apply_preset(b, 0);
+    restore_user_prefs(b, defaults);
+    b->pend.theta = INITIAL_LEAN_RAD;
+    bot_apply_preset(b, defaults.preset_idx);
 }
 
 /* ===================================================================== */
@@ -1388,47 +1809,83 @@ static chtype seg_glyph(int dr, int dc)
     return (dr * dc < 0) ? '/' : '\\';
 }
 
+/*
+ * Bresenham line — rasterise (x0,y0)→(x1,y1) pixel-space endpoints
+ * onto character cells, choosing a glyph ONCE from the segment's
+ * overall slope. Classic "stepped error term" algorithm:
+ *
+ *      initial error = |Δrow| − |Δcol|
+ *      each step: advance whichever axis the error currently favours,
+ *                 update the error by the OTHER axis's |Δ|.
+ *
+ * See Bresenham (1965) in References.
+ */
 static void draw_line(float x0, float y0, float x1, float y1,
                       attr_t a, int cp, int rows, int cols)
 {
+    /* (1) Endpoints in cell space */
     int r0 = px_to_cy(y0), c0 = px_to_cx(x0);
     int r1 = px_to_cy(y1), c1 = px_to_cx(x1);
+
+    /* (2) Span and step direction along each axis */
     int dr = r1 - r0, dc = c1 - c0;
-    chtype ch = seg_glyph(dr, dc);
-    int sr = (r0 < r1) ? 1 : -1;
-    int sc = (c0 < c1) ? 1 : -1;
-    int err = abs(dr) - abs(dc);
+    int step_r = (r0 < r1) ? 1 : -1;
+    int step_c = (c0 < c1) ? 1 : -1;
+    int abs_dr = abs(dr), abs_dc = abs(dc);
+
+    /* (3) Pick the glyph from the overall slope (once, not per cell) */
+    chtype glyph = seg_glyph(dr, dc);
+
+    /* (4) Walk the line, decision variable controls which axis steps */
+    int err = abs_dr - abs_dc;
     int r = r0, c = c0;
     for (;;) {
-        put_ch(r, c, ch, a, cp, rows, cols);
+        put_ch(r, c, glyph, a, cp, rows, cols);
         if (r == r1 && c == c1) break;
         int e2 = 2 * err;
-        if (e2 > -abs(dc)) { err -= abs(dc); r += sr; }
-        if (e2 <  abs(dr)) { err += abs(dr); c += sc; }
+        if (e2 > -abs_dc) { err -= abs_dc; r += step_r; }   /* step row */
+        if (e2 <  abs_dr) { err += abs_dr; c += step_c; }   /* step col */
     }
 }
 
-/* Centred horizontal bar gauge in [-1, +1]. */
-static void draw_bar(int r, int c, int W, float v,
-                     int cp_pos, int cp_neg, int rows, int cols)
+/* Empty bar background — W spaces and a centre '|' tick mark. */
+static void bar_paint_track(int r, int c, int W, int mid, int rows, int cols)
 {
-    int half = W / 2;
-    int mid  = c + half;
-    int fill = (int)(fabsf(v) * (float)half);
-    if (fill > half) fill = half;
-
-    /* track */
     attron(COLOR_PAIR(CP_DIM));
     for (int i = 0; i < W; i++) put_ch(r, c + i, ' ', 0, CP_DIM, rows, cols);
     put_ch(r, mid, '|', 0, CP_DIM, rows, cols);
     attroff(COLOR_PAIR(CP_DIM));
+}
 
-    /* fill */
-    int cp = (v >= 0.0f) ? cp_pos : cp_neg;
+/* Filled portion of the bar — `cells` '=' glyphs walking outward from
+ * mid, in `step` direction (+1 for positive v, -1 for negative). */
+static void bar_paint_fill(int r, int mid, int cells, int step, int cp,
+                           int rows, int cols)
+{
     attron(COLOR_PAIR(cp) | A_BOLD);
-    if (v >= 0.0f) for (int i = 0; i < fill; i++) put_ch(r, mid + 1 + i, '=', A_BOLD, cp, rows, cols);
-    else            for (int i = 0; i < fill; i++) put_ch(r, mid - 1 - i, '=', A_BOLD, cp, rows, cols);
+    for (int i = 0; i < cells; i++)
+        put_ch(r, mid + step * (i + 1), '=', A_BOLD, cp, rows, cols);
     attroff(COLOR_PAIR(cp) | A_BOLD);
+}
+
+/*
+ * Centred horizontal bar gauge for v ∈ [-1, +1]. Two passes:
+ *   (1) paint the empty track + midline mark
+ *   (2) paint the filled portion outward from mid in v's sign direction
+ */
+static void draw_bar(int r, int c, int W, float v,
+                     int cp_pos, int cp_neg, int rows, int cols)
+{
+    int half  = W / 2;
+    int mid   = c + half;
+    int cells = (int)(fabsf(v) * (float)half);
+    if (cells > half) cells = half;
+
+    bar_paint_track(r, c, W, mid, rows, cols);
+
+    int step = (v >= 0.0f) ? +1 : -1;
+    int cp   = (v >= 0.0f) ? cp_pos : cp_neg;
+    bar_paint_fill(r, mid, cells, step, cp, rows, cols);
 }
 
 /* ── §7.2 render_terrain — sky, surface, rock fill ───────────────── */
@@ -1441,46 +1898,90 @@ static bool is_star(int r, int c)
     return (h % 60) == 0;
 }
 
+/* Pick the surface glyph for a column based on the local Δh:
+ *   |Δh| > SLOPE_GLYPH_FRAC · CELL_W  →  '/' or '\\' (sloped)
+ *   otherwise                          →  '_'        (near-flat)
+ */
 static chtype surface_glyph(float dh)
 {
-    if (dh > (float)CELL_W * 0.22f)  return '/';
-    if (dh < -(float)CELL_W * 0.22f) return '\\';
+    float thresh = (float)CELL_W * SLOPE_GLYPH_FRAC;
+    if (dh >  thresh) return '/';
+    if (dh < -thresh) return '\\';
     return '_';
 }
 
+/* Sky cell — sparse hash-selected stars on otherwise empty rows. */
+static void paint_sky_cell(int r, int sc, int rows, int cols)
+{
+    if (is_star(r, sc))
+        put_ch(r, sc, '.', A_BOLD, CP_STAR, rows, cols);
+}
+
+/* Surface cell — slope-shaped glyph ( _ / \ ), red if steep. */
+static void paint_surface_cell(int r, int sc, chtype sg, float dh,
+                               int rows, int cols)
+{
+    bool steep = fabsf(dh) > (float)CELL_W * SLOPE_GLYPH_FRAC;
+    int  cp    = steep ? CP_ROCK : CP_SURF;
+    put_ch(r, sc, sg, A_BOLD, cp, rows, cols);
+}
+
+/* Grass row directly below the surface — colon/dot alternation. */
+static void paint_grass_cell(int r, int sc, int rows, int cols)
+{
+    put_ch(r, sc, (sc % 3 == 0) ? ':' : '.', A_DIM, CP_SURF, rows, cols);
+}
+
+/* Rock fill below the grass — sparse '#' over default background. */
+static void paint_rock_cell(int r, int sc, int rows, int cols)
+{
+    put_ch(r, sc, (sc % 2 == 0) ? '#' : ' ', A_DIM, CP_ROCK, rows, cols);
+}
+
+/* Cell-y of the surface for world column wc, clamped so the terrain
+ * never touches the HUD row (row 0) or the hint strip (row rows-1). */
+static int terrain_surface_row(const Terrain *t, int wc, int rows)
+{
+    int surf = px_to_cy(t->h[wc & TMASK]);
+    if (surf < 1)        return 1;
+    if (surf > rows - 2) return rows - 2;
+    return surf;
+}
+
+/* Slope estimate at world column wc (forward difference, pixel units).
+ * Used both for the surface glyph choice and the steep-cell colour. */
+static float terrain_dh_at(const Terrain *t, int wc)
+{
+    return t->h[(wc + 1) & TMASK] - t->h[wc & TMASK];
+}
+
 /*
- * For each on-screen column:
- *   - Sky rows render '.' stars at sparse hash-selected cells.
- *   - Surface row gets a slope-shaped glyph ( _ / \ ).
- *   - Texture row directly below alternates ':' '.' for grass feel.
- *   - Rows further below are the rock fill ('#' alternating).
+ * render_terrain — paint the entire background each frame.
+ *
+ *   For each on-screen column sc:
+ *     1. Map sc → world column wc (camera follows the bot).
+ *     2. Find the surface cell-row and the local slope.
+ *     3. Classify each row as sky / surface / grass / rock and paint.
  */
 static void render_terrain(const Terrain *t, int bot_wc, int bot_sc,
                            int rows, int cols)
 {
     for (int sc = 0; sc < cols; sc++) {
-        int   wc  = bot_wc - bot_sc + sc;
+        /* (1) screen column → world column */
+        int wc = bot_wc - bot_sc + sc;
         if (wc < 0) wc = 0;
-        float h   = t->h[wc & TMASK];
-        float dh  = t->h[(wc + 1) & TMASK] - h;
-        int   surf = px_to_cy(h);
-        if (surf < 1)        surf = 1;
-        if (surf > rows - 2) surf = rows - 2;
 
-        chtype sg = surface_glyph(dh);
+        /* (2) surface row + local slope (drives glyph + colour) */
+        int    surf = terrain_surface_row(t, wc, rows);
+        float  dh   = terrain_dh_at(t, wc);
+        chtype sg   = surface_glyph(dh);
 
+        /* (3) classify each row vertically and paint accordingly */
         for (int r = 0; r < rows; r++) {
-            if (r < surf) {
-                if (is_star(r, sc))
-                    put_ch(r, sc, '.', A_BOLD, CP_STAR, rows, cols);
-            } else if (r == surf) {
-                int cp = (fabsf(dh) > (float)CELL_W * 0.22f) ? CP_ROCK : CP_SURF;
-                put_ch(r, sc, sg, A_BOLD, cp, rows, cols);
-            } else if (r == surf + 1) {
-                put_ch(r, sc, (sc % 3 == 0) ? ':' : '.', A_DIM, CP_SURF, rows, cols);
-            } else {
-                put_ch(r, sc, (sc % 2 == 0) ? '#' : ' ', A_DIM, CP_ROCK, rows, cols);
-            }
+            if      (r <  surf)     paint_sky_cell    (r, sc, rows, cols);
+            else if (r == surf)     paint_surface_cell(r, sc, sg, dh, rows, cols);
+            else if (r == surf + 1) paint_grass_cell  (r, sc, rows, cols);
+            else                    paint_rock_cell   (r, sc, rows, cols);
         }
     }
 }
@@ -1499,375 +2000,622 @@ static void render_terrain(const Terrain *t, int bot_wc, int bot_sc,
  * Total: 6 cells of body + 1 beacon + 3 chassis = ~10 cells.
  * Lean is shown by the body line's actual angle in cell space.
  */
+/*
+ * The four key pixel-space "joint" positions render_bot uses. Building
+ * them all in one place means each draw_line/put_ch below reads from
+ * this struct — no scattered coord math across the renderer.
+ */
+typedef struct {
+    float ax_x, ax_y;   /* axle (cart pivot)  — anchored above terrain */
+    float lw_x, lw_y;   /* left wheel  — rotated by terrain slope α    */
+    float rw_x, rw_y;   /* right wheel — rotated by terrain slope α    */
+    float top_x, top_y; /* body top    — rotated by lean θ_eff         */
+} BotPixels;
+
+/*
+ * Build the bot's four pixel-space joint positions.
+ *   axle:   anchored at bot_sc · CELL_W (screen column), lifted
+ *           WHEEL_R above the terrain surface.
+ *   wheels: rotate the offset (±AXLE_HW, 0) about the axle by the
+ *           TERRAIN SLOPE α so the chassis sits flat on the ground.
+ *   top:    rotate the offset (0, -BODY_H) about the axle by the
+ *           GRAVITY-FRAME LEAN θ_eff so the pole leans relative to
+ *           gravity, NOT relative to the chassis.
+ *
+ * The two rotations use DIFFERENT angles — that distinction (chassis
+ * follows ground, body follows gravity) IS the whole demo.
+ */
+static BotPixels compute_bot_skeleton(const Bot *b, float h_px, int bot_sc)
+{
+    BotPixels px;
+
+    /* Axle anchor — fixed screen column, one wheel-radius above ground */
+    px.ax_x = (float)(bot_sc * CELL_W);
+    px.ax_y = h_px - WHEEL_R;
+
+    /* Wheels — rotate (±AXLE_HW, 0) about axle by terrain slope α */
+    float cos_a = cosf(b->mot.alpha), sin_a = sinf(b->mot.alpha);
+    px.lw_x = px.ax_x - AXLE_HW * cos_a;
+    px.lw_y = px.ax_y + AXLE_HW * sin_a;
+    px.rw_x = px.ax_x + AXLE_HW * cos_a;
+    px.rw_y = px.ax_y - AXLE_HW * sin_a;
+
+    /* Body top — rotate (0, -BODY_H) about axle by gravity-frame lean */
+    float th = b->cp.theta_eff;
+    px.top_x = px.ax_x + BODY_H * sinf(th);
+    px.top_y = px.ax_y - BODY_H * cosf(th);
+
+    return px;
+}
+
+/* Two 'O' wheel glyphs centred on the wheel pixel positions. */
+static void paint_wheels(const BotPixels *px, int rows, int cols)
+{
+    put_ch(px_to_cy(px->lw_y), px_to_cx(px->lw_x),
+           'O', A_BOLD, CP_WHEEL, rows, cols);
+    put_ch(px_to_cy(px->rw_y), px_to_cx(px->rw_x),
+           'O', A_BOLD, CP_WHEEL, rows, cols);
+}
+
+/*
+ * Body-top beacon — '*' that pulses bold/dim every 1/(2·BEACON_PULSE_HZ)
+ * SECONDS OF TRAVEL. Pulse rate scales with dist_m (how far the bot
+ * has moved) rather than wall time — so it slows when the bot stops
+ * and makes the visual link bot↔terrain stronger.
+ */
+static void paint_beacon(const BotPixels *px, float dist_m,
+                         int rows, int cols)
+{
+    int    pulse_phase = (int)(dist_m * BEACON_PULSE_HZ);
+    attr_t pulse_attr  = (pulse_phase & 1) ? A_BOLD : A_DIM;
+    put_ch(px_to_cy(px->top_y), px_to_cx(px->top_x),
+           '*', pulse_attr, CP_BEACON, rows, cols);
+}
+
+/*
+ * Floating "+12.3°" label near the axle — green normally, red past
+ * THETA_WARN_DEG so the reader notices the danger zone at a glance.
+ */
+static void paint_lean_readout(const BotPixels *px, float theta_eff_rad)
+{
+    float deg = theta_eff_rad * (180.0f / (float)M_PI);
+    int   cp  = (fabsf(deg) > THETA_WARN_DEG) ? CP_WARN : CP_GOOD;
+    int   ar  = px_to_cy(px->ax_y);
+    int   ac  = px_to_cx(px->ax_x);
+    attron (COLOR_PAIR(cp));
+    mvprintw(ar, ac - LEAN_LABEL_DC, "%+5.1f°", deg);
+    attroff(COLOR_PAIR(cp));
+}
+
+/* Centre-of-screen banner shown when the fall flag is set. */
+static void paint_fallen_banner(int rows, int cols)
+{
+    int mr = rows / 2;
+    int mc = cols / 2 - 9;
+    if (mc < 0) mc = 0;
+    attron (COLOR_PAIR(CP_WARN) | A_BOLD | A_BLINK);
+    mvprintw(mr, mc, "  !! FALLEN !!  ");
+    attroff(COLOR_PAIR(CP_WARN) | A_BOLD | A_BLINK);
+    attron (COLOR_PAIR(CP_DIM));
+    mvprintw(mr + 1, mc - 1, "g=preset  r=reset");
+    attroff(COLOR_PAIR(CP_DIM));
+}
+
+/*
+ * render_bot — paint the robot in painter's order:
+ *
+ *   1. Compute the four pixel-space joints (axle, two wheels, top).
+ *   2. Draw chassis line (between wheels) + body pole (axle → top).
+ *   3. Stamp wheel glyphs + pulsing body-top beacon.
+ *   4. Overlay decorations: lean readout, fallen banner.
+ */
 static void render_bot(const Bot *b, const Terrain *t, int bot_sc,
                        int rows, int cols)
 {
-    int   wc    = (int)(b->world_x / (float)CELL_W);
-    float h_px  = t->h[wc & TMASK];
+    int   wc   = (int)(b->mot.world_x / (float)CELL_W);
+    float h_px = t->h[wc & TMASK];
 
-    /* Axle in pixel space — just above the surface. */
-    float ax_px = (float)(bot_sc * CELL_W);
-    float ax_py = h_px - WHEEL_R;
+    /* (1) four pixel-space joint positions */
+    BotPixels px = compute_bot_skeleton(b, h_px, bot_sc);
 
-    /* Wheels offset along the slope direction so the chassis sits
-     * "flat" on the terrain. */
-    float ca = cosf(b->alpha), sa = sinf(b->alpha);
-    float lx_px = ax_px - AXLE_HW * ca;
-    float ly_px = ax_py + AXLE_HW * sa;
-    float rx_px = ax_px + AXLE_HW * ca;
-    float ry_px = ax_py - AXLE_HW * sa;
+    /* (2) chassis between wheels, body line from axle to top */
+    draw_line(px.lw_x, px.lw_y, px.rw_x, px.rw_y,
+              A_BOLD, CP_CHASSIS, rows, cols);
+    draw_line(px.ax_x, px.ax_y, px.top_x, px.top_y,
+              A_BOLD, CP_CHASSIS, rows, cols);
 
-    /* Body top in pixel space — tilt by θ_eff. */
-    float te    = b->theta_eff;
-    float bx_px = ax_px + BODY_H * sinf(te);
-    float by_px = ax_py - BODY_H * cosf(te);
+    /* (3) wheels and pulsing beacon */
+    paint_wheels(&px, rows, cols);
+    paint_beacon(&px, b->mot.dist_m, rows, cols);
 
-    /* (1) chassis line — always between the two wheels. */
-    draw_line(lx_px, ly_px, rx_px, ry_px, A_BOLD, CP_CHASSIS, rows, cols);
-
-    /* (2) body line from axle to body top. */
-    draw_line(ax_px, ax_py, bx_px, by_px, A_BOLD, CP_CHASSIS, rows, cols);
-
-    /* (3) wheels — single 'O' each. */
-    int lcx = px_to_cx(lx_px), lcy = px_to_cy(ly_px);
-    int rcx = px_to_cx(rx_px), rcy = px_to_cy(ry_px);
-    put_ch(lcy, lcx, 'O', A_BOLD, CP_WHEEL, rows, cols);
-    put_ch(rcy, rcx, 'O', A_BOLD, CP_WHEEL, rows, cols);
-
-    /* (4) beacon at body top — '*' that pulses slightly so a learner
-     * can easily track "the top of the body" while it leans. */
-    int bcx = px_to_cx(bx_px), bcy = px_to_cy(by_px);
-    attr_t pulse = (((int)(b->dist_m * 4.0f)) & 1) ? A_BOLD : A_DIM;
-    put_ch(bcy, bcx, '*', pulse, CP_BEACON, rows, cols);
-
-    /* (5) lean readout — small floating number near the axle. */
-    {
-        float deg = b->theta_eff * (180.0f / (float)M_PI);
-        int   ar  = px_to_cy(ax_py);
-        int   ac  = px_to_cx(ax_px);
-        int   cp  = (fabsf(deg) > 20.0f) ? CP_WARN : CP_GOOD;
-        char  buf[16];
-        snprintf(buf, sizeof buf, "%+5.1f°", deg);
-        attron (COLOR_PAIR(cp));
-        mvprintw(ar, ac - 6, "%s", buf);
-        attroff(COLOR_PAIR(cp));
-    }
-
-    /* Fallen banner — overlay middle of screen. */
-    if (b->fallen) {
-        int mr = rows / 2;
-        int mc = cols / 2 - 9;
-        if (mc < 0) mc = 0;
-        attron (COLOR_PAIR(CP_WARN) | A_BOLD | A_BLINK);
-        mvprintw(mr, mc, "  !! FALLEN !!  ");
-        attroff(COLOR_PAIR(CP_WARN) | A_BOLD | A_BLINK);
-        attron (COLOR_PAIR(CP_DIM));
-        mvprintw(mr + 1, mc - 1, "g=preset  r=reset");
-        attroff(COLOR_PAIR(CP_DIM));
-    }
+    /* (4) overlays */
+    paint_lean_readout(&px, b->cp.theta_eff);
+    if (b->ui.fallen) paint_fallen_banner(rows, cols);
 }
 
-/* ── §7.4 render_panel_telemetry — live numbers + bar gauges ──────── */
+/* ── §7.4 panel helpers + render_panel_telemetry ──────────────────── */
 
+/* One label-only row in a side panel. Returns the next row to write. */
+static int panel_text_row(int r, int c0, const char *s, attr_t a, int cp,
+                          int rows, int cols)
+{
+    put_str(r, c0, s, a, cp, rows, cols);
+    return r + 1;
+}
+
+/* Label on the left + horizontal bar gauge on the right. The label
+ * is already-formatted text (caller does the snprintf); the bar
+ * shows val_norm in [-1, +1] using the (cp_pos, cp_neg) pair. */
+static int panel_text_bar_row(int r, int c0, const char *s, attr_t a, int cp,
+                              float val_norm, int cp_pos, int cp_neg,
+                              int rows, int cols)
+{
+    put_str(r, c0, s, a, cp, rows, cols);
+    draw_bar(r, c0 + BAR_COL_OFFSET, BAR_WIDTH, val_norm,
+             cp_pos, cp_neg, rows, cols);
+    return r + 1;
+}
+
+/*
+ * render_panel_telemetry — live numeric readouts + bar gauges.
+ *
+ *   Section 1: dynamical state (θ_eff, ω, α) — each with a centred bar
+ *              scaled to the alarming extreme of that quantity.
+ *   Section 2: cart motion (spd, dist) — text only, no bar.
+ *   Section 3: PID per-term outputs (P, I, D) + total F (saturation-warn).
+ *   Section 4: current gain values + active preset name.
+ *
+ * Bars use full-scale ranges from §1.16; warn-colour cutoffs from §1.16.
+ */
 static void render_panel_telemetry(const Bot *b, int rows, int cols, int c0)
 {
-    int r = 0;
-    int bw = 14;
-    int bc = c0 + 16;
+    const PID *pid = &b->pid;
     char buf[64];
+    int  r = 0;
 
-    put_str(r++, c0, " TELEMETRY              ", A_BOLD, CP_VAL, rows, cols);
+    /* ── header ── */
+    r = panel_text_row(r, c0, " TELEMETRY              ",
+                       A_BOLD, CP_VAL, rows, cols);
 
+    /* ── section 1: dynamical state ── */
+    /* θ_eff — gravity-frame lean, ° */
     {
-        float deg = b->theta_eff * (180.0f / (float)M_PI);
-        int   cp  = fabsf(deg) > 20.0f ? CP_WARN : CP_GOOD;
+        float deg     = b->cp.theta_eff * (180.0f / (float)M_PI);
+        int   cp_lean = fabsf(deg) > THETA_WARN_DEG ? CP_WARN : CP_GOOD;
         snprintf(buf, sizeof buf, " theta_eff %+6.2f° ", deg);
-        put_str(r, c0, buf, A_BOLD, cp, rows, cols);
-        draw_bar(r, bc, bw, deg / 35.0f, CP_BAR_POS, CP_BAR_NEG, rows, cols);
-        r++;
+        r = panel_text_bar_row(r, c0, buf, A_BOLD, cp_lean,
+                               deg / THETA_BAR_RANGE_DEG,
+                               CP_BAR_POS, CP_BAR_NEG, rows, cols);
     }
+    /* ω — angular velocity, rad/sec */
     {
-        snprintf(buf, sizeof buf, " omega    %+6.2f  ", b->omega);
-        put_str(r, c0, buf, A_NORMAL, CP_VAL, rows, cols);
-        draw_bar(r, bc, bw, b->omega / 6.0f, CP_BAR_POS, CP_BAR_NEG, rows, cols);
-        r++;
+        snprintf(buf, sizeof buf, " omega    %+6.2f  ", b->pend.omega);
+        r = panel_text_bar_row(r, c0, buf, A_NORMAL, CP_VAL,
+                               b->pend.omega / OMEGA_BAR_RANGE,
+                               CP_BAR_POS, CP_BAR_NEG, rows, cols);
     }
+    /* α — terrain slope, ° (swapped pos/neg pair so uphill colours warm) */
     {
-        float sdeg = b->alpha * (180.0f / (float)M_PI);
-        int   cp   = fabsf(sdeg) > 15.0f ? CP_WARN : CP_VAL;
+        float sdeg     = b->mot.alpha * (180.0f / (float)M_PI);
+        int   cp_slope = fabsf(sdeg) > SLOPE_WARN_DEG ? CP_WARN : CP_VAL;
         snprintf(buf, sizeof buf, " slope α  %+6.2f° ", sdeg);
-        put_str(r, c0, buf, A_NORMAL, cp, rows, cols);
-        draw_bar(r, bc, bw, sdeg / 25.0f, CP_BAR_NEG, CP_BAR_POS, rows, cols);
-        r++;
-    }
-    {
-        float mps = b->drive_spd / PIX_PER_M;
-        snprintf(buf, sizeof buf, " spd  %+5.2f m/s     ", mps);
-        put_str(r++, c0, buf, A_BOLD, CP_VAL, rows, cols);
-    }
-    {
-        snprintf(buf, sizeof buf, " dist %7.1f m       ", b->dist_m);
-        put_str(r++, c0, buf, A_NORMAL, CP_VAL, rows, cols);
+        r = panel_text_bar_row(r, c0, buf, A_NORMAL, cp_slope,
+                               sdeg / SLOPE_BAR_RANGE_DEG,
+                               CP_BAR_NEG, CP_BAR_POS, rows, cols);
     }
 
-    r++;
-    put_str(r++, c0, " PID OUTPUTS            ", A_BOLD, CP_VAL, rows, cols);
+    /* ── section 2: cart motion (text-only, no bars) ── */
+    snprintf(buf, sizeof buf, " spd  %+5.2f m/s     ",
+             b->mot.drive_spd / PIX_PER_M);
+    r = panel_text_row(r, c0, buf, A_BOLD, CP_VAL, rows, cols);
+    snprintf(buf, sizeof buf, " dist %7.1f m       ", b->mot.dist_m);
+    r = panel_text_row(r, c0, buf, A_NORMAL, CP_VAL, rows, cols);
 
-    if (b->pid_on) {
-        snprintf(buf, sizeof buf, " P  Kp·e   %+8.2f ", b->pid_p);
-        put_str(r, c0, buf, A_NORMAL, CP_VAL, rows, cols);
-        draw_bar(r, bc, bw, b->pid_p / MAX_FORCE, CP_BAR_POS, CP_BAR_NEG, rows, cols);
-        r++;
+    /* ── section 3: PID per-term outputs ── */
+    r++;   /* blank line */
+    r = panel_text_row(r, c0, " PID OUTPUTS            ",
+                       A_BOLD, CP_VAL, rows, cols);
+    if (pid->on) {
+        snprintf(buf, sizeof buf, " P  Kp·e   %+8.2f ", pid->p);
+        r = panel_text_bar_row(r, c0, buf, A_NORMAL, CP_VAL,
+                               pid->p / MAX_FORCE,
+                               CP_BAR_POS, CP_BAR_NEG, rows, cols);
 
-        snprintf(buf, sizeof buf, " I  Ki·∫e  %+8.2f ", b->pid_i);
-        put_str(r++, c0, buf, A_NORMAL, CP_VAL, rows, cols);
+        snprintf(buf, sizeof buf, " I  Ki·∫e  %+8.2f ", pid->i);
+        r = panel_text_row(r, c0, buf, A_NORMAL, CP_VAL, rows, cols);
 
-        snprintf(buf, sizeof buf, " D  Kd·θ̇   %+8.2f ", b->pid_d);
-        put_str(r, c0, buf, A_NORMAL, CP_VAL, rows, cols);
-        draw_bar(r, bc, bw, b->pid_d / (MAX_FORCE * 0.4f),
-                 CP_BAR_POS, CP_BAR_NEG, rows, cols);
-        r++;
+        snprintf(buf, sizeof buf, " D  Kd·θ̇   %+8.2f ", pid->d);
+        r = panel_text_bar_row(r, c0, buf, A_NORMAL, CP_VAL,
+                               pid->d / (MAX_FORCE * D_BAR_FRAC),
+                               CP_BAR_POS, CP_BAR_NEG, rows, cols);
 
-        snprintf(buf, sizeof buf, " F total  %+8.2f N", b->pid_out);
-        int cp = fabsf(b->pid_out) > MAX_FORCE * 0.85f ? CP_WARN : CP_GOOD;
-        put_str(r, c0, buf, A_BOLD, cp, rows, cols);
-        draw_bar(r, bc, bw, b->pid_out / MAX_FORCE,
-                 CP_BAR_POS, CP_BAR_NEG, rows, cols);
-        r++;
+        snprintf(buf, sizeof buf, " F total  %+8.2f N", pid->out);
+        int cp_F = fabsf(pid->out) > MAX_FORCE * SAT_WARN_FRAC
+                 ? CP_WARN : CP_GOOD;
+        r = panel_text_bar_row(r, c0, buf, A_BOLD, cp_F,
+                               pid->out / MAX_FORCE,
+                               CP_BAR_POS, CP_BAR_NEG, rows, cols);
     } else {
-        put_str(r++, c0, " PID  DISABLED          ", A_BOLD, CP_WARN, rows, cols);
+        r = panel_text_row(r, c0, " PID  DISABLED          ",
+                           A_BOLD, CP_WARN, rows, cols);
         r += 3;
     }
 
+    /* ── section 4: current gains + active preset ── */
     r++;
-    snprintf(buf, sizeof buf, " Kp:%.0f Ki:%.2f Kd:%.0f  ", b->kp, b->ki, b->kd);
-    put_str(r++, c0, buf, A_NORMAL, CP_DIM, rows, cols);
-
-    snprintf(buf, sizeof buf, " preset: %s ", PRESETS[b->preset_idx].name);
-    put_str(r++, c0, buf, A_BOLD, CP_VAL, rows, cols);
+    snprintf(buf, sizeof buf, " Kp:%.0f Ki:%.2f Kd:%.0f  ",
+             pid->kp, pid->ki, pid->kd);
+    r = panel_text_row(r, c0, buf, A_NORMAL, CP_DIM, rows, cols);
+    snprintf(buf, sizeof buf, " preset: %s ",
+             PRESETS[b->ui.preset_idx].name);
+    r = panel_text_row(r, c0, buf, A_BOLD, CP_VAL, rows, cols);
 }
 
 /* ── §7.5 render_panel_equations — math with live values ─────────── */
 
+/* Two-line "caption: value" block — dim label on top, bright value on
+ * the next row. The whole equations panel is just a stack of these. */
+static int panel_equation_pair(int r, int c0,
+                               const char *caption, const char *value,
+                               attr_t a_val, int cp_val,
+                               int rows, int cols)
+{
+    put_str(r,     c0 + 1, caption, A_DIM, CP_DIM, rows, cols);
+    put_str(r + 1, c0,     value,   a_val, cp_val, rows, cols);
+    return r + 2;
+}
+
 /*
- * Show the cart-pole and PID equations with their current numerical
- * values substituted. The reader can multiply Kp · e by hand and
- * verify it matches the displayed P term — a "cell-level" debugger.
+ * render_panel_equations — show the cart-pole and PID equations with
+ * their current numerical values substituted. The learner can multiply
+ * Kp · e by hand and verify it matches the displayed P term — making
+ * the panel a "cell-level debugger" for the controller.
+ *
+ * Layout: caption row (what the equation IS), then value row (current
+ * numbers). One panel_equation_pair() per concept.
  */
 static void render_panel_equations(const Bot *b, int rows, int cols, int c0)
 {
-    int r = 0;
-    char buf[80];
+    const PID *pid = &b->pid;
+    float err = pid_error_signal(b->pend.theta, pid->setpoint);
+    char  buf[80];
+    int   r = 0;
 
-    put_str(r++, c0, " EQUATIONS               ", A_BOLD, CP_VAL, rows, cols);
+    /* ── header ── */
+    r = panel_text_row(r, c0, " EQUATIONS               ",
+                       A_BOLD, CP_VAL, rows, cols);
 
-    /* Effective lean. */
-    put_str(r++, c0 + 1, "Effective lean from grav:", A_DIM, CP_DIM, rows, cols);
+    /* ── cart-pole derived quantities ── */
     snprintf(buf, sizeof buf, " θ_eff = θ + α = %+5.3f rad (%+5.1f°)",
-             b->theta_eff, b->theta_eff * (180.0f / (float)M_PI));
-    put_str(r++, c0, buf, A_BOLD, CP_VAL, rows, cols);
+             b->cp.theta_eff, b->cp.theta_eff * (180.0f / (float)M_PI));
+    r = panel_equation_pair(r, c0, "Effective lean from grav:", buf,
+                            A_BOLD, CP_VAL, rows, cols);
 
-    /* Cart-pole horizontal accel. */
-    put_str(r++, c0 + 1, "Horizontal accel of base:", A_DIM, CP_DIM, rows, cols);
-    snprintf(buf, sizeof buf, " ẍ = %+6.3f m/s²", b->x_ddot);
-    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+    snprintf(buf, sizeof buf, " ẍ = %+6.3f m/s²", b->cp.x_ddot);
+    r = panel_equation_pair(r, c0, "Horizontal accel of base:", buf,
+                            A_NORMAL, CP_EQ, rows, cols);
 
-    /* Pendulum angular accel. */
-    put_str(r++, c0 + 1, "Pendulum angular accel:", A_DIM, CP_DIM, rows, cols);
-    snprintf(buf, sizeof buf, " θ̈ = %+6.3f rad/s²", b->theta_ddot);
-    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+    snprintf(buf, sizeof buf, " θ̈ = %+6.3f rad/s²", b->cp.theta_ddot);
+    r = panel_equation_pair(r, c0, "Pendulum angular accel:", buf,
+                            A_NORMAL, CP_EQ, rows, cols);
 
+    /* ── PID law, broken into setpoint + error + three terms ── */
     r++;
-    put_str(r++, c0, " PID                    ", A_BOLD, CP_VAL, rows, cols);
+    r = panel_text_row(r, c0, " PID                    ",
+                       A_BOLD, CP_VAL, rows, cols);
 
-    /* Setpoint: lean into slope. */
-    put_str(r++, c0 + 1, "Setpoint (slope feed):",  A_DIM, CP_DIM, rows, cols);
     snprintf(buf, sizeof buf, " θ_ref = -%.2f·α = %+5.3f rad",
-             SLOPE_FEED, b->theta_ref);
-    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+             SLOPE_FEED, pid->setpoint);
+    r = panel_equation_pair(r, c0, "Setpoint (slope feed):", buf,
+                            A_NORMAL, CP_EQ, rows, cols);
 
-    /* Error. */
-    put_str(r++, c0 + 1, "Error drives PID:",       A_DIM, CP_DIM, rows, cols);
-    snprintf(buf, sizeof buf, " e = θ − θ_ref = %+5.3f",
-             b->theta - b->theta_ref);
-    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+    snprintf(buf, sizeof buf, " e = θ − θ_ref = %+5.3f", err);
+    r = panel_equation_pair(r, c0, "Error drives PID:", buf,
+                            A_NORMAL, CP_EQ, rows, cols);
 
-    /* Three terms. */
-    put_str(r++, c0 + 1, "P — instant stiffness:",  A_DIM, CP_DIM, rows, cols);
-    snprintf(buf, sizeof buf, " %.0f · %+.4f = %+.2f",
-             b->kp, b->theta - b->theta_ref, b->pid_p);
-    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+    snprintf(buf, sizeof buf, " %.0f · %+.4f = %+.2f", pid->kp, err, pid->p);
+    r = panel_equation_pair(r, c0, "P — instant stiffness:", buf,
+                            A_NORMAL, CP_EQ, rows, cols);
 
-    put_str(r++, c0 + 1, "I — drift removal:",      A_DIM, CP_DIM, rows, cols);
-    snprintf(buf, sizeof buf, " %.2f · ∫e = %+.2f", b->ki, b->pid_i);
-    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+    snprintf(buf, sizeof buf, " %.2f · ∫e = %+.2f", pid->ki, pid->i);
+    r = panel_equation_pair(r, c0, "I — drift removal:", buf,
+                            A_NORMAL, CP_EQ, rows, cols);
 
-    put_str(r++, c0 + 1, "D — damping:",            A_DIM, CP_DIM, rows, cols);
-    snprintf(buf, sizeof buf, " %.0f · θ̇ = %+.2f", b->kd, b->pid_d);
-    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+    snprintf(buf, sizeof buf, " %.0f · θ̇ = %+.2f", pid->kd, pid->d);
+    r = panel_equation_pair(r, c0, "D — damping:", buf,
+                            A_NORMAL, CP_EQ, rows, cols);
 
-    /* Total F. */
-    int cp = fabsf(b->pid_out) > MAX_FORCE * 0.85f ? CP_WARN : CP_GOOD;
+    /* ── total motor force F (saturation-warning colour) ── */
+    int cp_F = fabsf(pid->out) > MAX_FORCE * SAT_WARN_FRAC
+             ? CP_WARN : CP_GOOD;
     snprintf(buf, sizeof buf, " F = %+.2f N (max ±%.0f)",
-             b->pid_out, MAX_FORCE);
-    put_str(r++, c0, buf, A_BOLD, cp, rows, cols);
+             pid->out, MAX_FORCE);
+    r = panel_text_row(r, c0, buf, A_BOLD, cp_F, rows, cols);
 }
 
 /* ── §7.6 render_panel_phase — phase-space portrait of (θ, ω) ────── */
 
+/* Plot geometry — origin + scale factors for the phase box. */
+typedef struct {
+    int   r0, c0;           /* top-left of plot rectangle (cells)  */
+    int   mid_r, mid_c;     /* (θ=0, ω=0) origin in cell space    */
+    float th_to_cells;      /* cells-per-rad on the θ axis         */
+    float om_to_cells;      /* cells-per-(rad/sec) on the ω axis  */
+} PhasePlot;
+
+/* Configure the plot from its top-left corner. Scale factors map
+ * a value in PHASE_*_RANGE onto half the plot's width/height, so the
+ * trail saturates exactly at the edge of the box. */
+static PhasePlot phase_configure(int plot_r0, int c0)
+{
+    PhasePlot p;
+    p.r0    = plot_r0;
+    p.c0    = c0;
+    p.mid_r = plot_r0 + PHASE_PLOT_H / 2;
+    p.mid_c = c0 + 1 + PHASE_PLOT_W / 2;
+    p.th_to_cells = ((float)PHASE_PLOT_W * 0.5f) / PHASE_TH_RANGE;
+    p.om_to_cells = ((float)PHASE_PLOT_H * 0.5f) / PHASE_OM_RANGE;
+    return p;
+}
+
+/* Cross-hair axes + origin '+' + four axis labels. Painted first so
+ * the trail and current point overlay them. */
+static void phase_draw_axes(const PhasePlot *p, int rows, int cols)
+{
+    /* Vertical θ=0 line, horizontal ω=0 line, origin glyph */
+    for (int i = 0; i < PHASE_PLOT_H; i++)
+        put_ch(p->r0 + i, p->mid_c, '|', A_DIM, CP_DIM, rows, cols);
+    for (int i = 0; i < PHASE_PLOT_W; i++)
+        put_ch(p->mid_r, p->c0 + 1 + i, '-', A_DIM, CP_DIM, rows, cols);
+    put_ch(p->mid_r, p->mid_c, '+', A_DIM, CP_DIM, rows, cols);
+
+    /* Labels at the four extremes */
+    put_str(p->mid_r - 1, p->c0 + 1,                  "-θ", A_DIM, CP_DIM, rows, cols);
+    put_str(p->mid_r - 1, p->c0 + PHASE_PLOT_W,       "+θ", A_DIM, CP_DIM, rows, cols);
+    put_str(p->r0,                p->mid_c - 2,       "+ω", A_DIM, CP_DIM, rows, cols);
+    put_str(p->r0 + PHASE_PLOT_H - 1, p->mid_c - 2,   "-ω", A_DIM, CP_DIM, rows, cols);
+}
+
+/* Map (θ, ω) into cell coordinates inside the plot box. ω's sign
+ * flips because screen-y grows DOWN while ω grows UP.               */
+static inline int phase_plot_col(const PhasePlot *p, float theta)
+{
+    return p->mid_c + (int)(theta * p->th_to_cells);
+}
+static inline int phase_plot_row(const PhasePlot *p, float omega)
+{
+    return p->mid_r - (int)(omega * p->om_to_cells);
+}
+
+/* Pick a trail glyph colour by sample age:
+ *   newest 15%  → red    (age in TRAIL_NEW_BAND .. 1.0)
+ *   middle 35%  → yellow (age in TRAIL_MID_BAND .. TRAIL_NEW_BAND)
+ *   oldest 50%  → dim grey
+ * Encodes time direction in an otherwise static portrait. */
+static inline int trail_color_for_age(float age01)
+{
+    if (age01 > TRAIL_NEW_BAND) return CP_WARN;
+    if (age01 > TRAIL_MID_BAND) return CP_VAL;
+    return CP_DIM;
+}
+
+/* Walk the ring buffer oldest → newest and paint each sample. */
+static void phase_draw_trail(const PhaseTrail *tr, const PhasePlot *p,
+                             int rows, int cols)
+{
+    int n = tr->fill;
+    for (int i = 0; i < n; i++) {
+        int   idx = (tr->head - n + i + HIST_LEN) % HIST_LEN;
+        int   pc  = phase_plot_col(p, tr->theta[idx]);
+        int   pr  = phase_plot_row(p, tr->omega[idx]);
+        float age = (float)i / (float)n;
+        put_ch(pr, pc, '.', A_NORMAL, trail_color_for_age(age), rows, cols);
+    }
+}
+
+/* Stamp the CURRENT (θ, ω) point as a bright '@' on top. */
+static void phase_draw_current_point(const Pendulum *pe, const PhasePlot *p,
+                                     int rows, int cols)
+{
+    int pc = phase_plot_col(p, pe->theta);
+    int pr = phase_plot_row(p, pe->omega);
+    put_ch(pr, pc, '@', A_BOLD, CP_BEACON, rows, cols);
+}
+
+/* Regime classification — one-line label + colour describing what
+ * the trajectory is doing. Order matters: PID-off first, then damping
+ * extremes, then "converged vs settling" by error magnitude. */
+static const char *phase_classify_regime(const Bot *b, int *out_cp)
+{
+    if (!b->pid.on)                     { *out_cp = CP_WARN; return "PID OFF (free fall)";  }
+    if (b->pid.kd < KD_UNDERDAMP_LIMIT) { *out_cp = CP_VAL;  return "UNDERDAMPED (no Kd)";  }
+    if (b->pid.kd > KD_OVERDAMP_LIMIT)  { *out_cp = CP_VAL;  return "OVERDAMPED (high Kd)"; }
+
+    float abs_err = fabsf(b->pend.theta - b->pid.setpoint);
+    if (abs_err < CONVERGED_ERR_RAD)    { *out_cp = CP_GOOD; return "STABLE — converged";   }
+    *out_cp = CP_VAL;                                        return "SETTLING — correcting";
+}
+
 /*
- * Plot the last HIST_LEN samples of (θ, ω) on a small 2-D grid:
+ * render_panel_phase — phase-space portrait of (θ, ω).
  *
- *      ω axis (vertical) — angular velocity in rad/sec
- *      θ axis (horizontal) — lean angle in radians
+ *   stable     →  inward spiral converging to origin
+ *   underdamped →  wide circles slowly shrinking
+ *   overdamped →  slow direct path to origin
+ *   drift      →  trajectory wanders off-axis (steady-state error)
  *
- * A stable controller draws an inward spiral converging to (0, 0).
- * Underdamped systems trace wide circles; overdamped systems trace
- * a slow direct path. The shape IS the controller's character.
+ * Reads as a five-step pipeline: header, axes, trail, current point,
+ * text panel.
  */
 static void render_panel_phase(const Bot *b, int rows, int cols, int c0)
 {
-    int r = 0;
     char buf[64];
+    int  r = 0;
 
-    put_str(r++, c0, " PHASE PORTRAIT         ", A_BOLD, CP_VAL, rows, cols);
-    put_str(r++, c0, " (θ vs ω)               ", A_DIM,  CP_DIM, rows, cols);
+    /* (1) header */
+    r = panel_text_row(r, c0, " PHASE PORTRAIT         ",
+                       A_BOLD, CP_VAL, rows, cols);
+    r = panel_text_row(r, c0, " (θ vs ω)               ",
+                       A_DIM,  CP_DIM, rows, cols);
 
-    /* Plot rectangle. */
-    int plot_r0 = r;
-    int plot_h  = 12;
-    int plot_w  = 29;
-    int mid_r   = plot_r0 + plot_h / 2;
-    int mid_c   = c0 + 1 + plot_w / 2;
+    /* (2) plot geometry + axes */
+    PhasePlot plot = phase_configure(r, c0);
+    phase_draw_axes(&plot, rows, cols);
 
-    /* Axes. */
-    for (int i = 0; i < plot_h; i++)
-        put_ch(plot_r0 + i, mid_c, '|', A_DIM, CP_DIM, rows, cols);
-    for (int i = 0; i < plot_w; i++)
-        put_ch(mid_r, c0 + 1 + i, '-', A_DIM, CP_DIM, rows, cols);
-    put_ch(mid_r, mid_c, '+', A_DIM, CP_DIM, rows, cols);
+    /* (3) trail (oldest → newest, newest paints on top) */
+    phase_draw_trail(&b->trail, &plot, rows, cols);
 
-    /* Axis labels. */
-    put_str(mid_r - 1, c0 + 1,        "-θ", A_DIM, CP_DIM, rows, cols);
-    put_str(mid_r - 1, c0 + plot_w,   "+θ", A_DIM, CP_DIM, rows, cols);
-    put_str(plot_r0,        mid_c - 2, "+ω", A_DIM, CP_DIM, rows, cols);
-    put_str(plot_r0 + plot_h - 1, mid_c - 2, "-ω", A_DIM, CP_DIM, rows, cols);
+    /* (4) current point */
+    phase_draw_current_point(&b->pend, &plot, rows, cols);
 
-    /* Pixel-to-cell scale. */
-    float th_scale = ((float)plot_w * 0.5f) / 0.6f;   /* full range ±0.6 rad */
-    float om_scale = ((float)plot_h * 0.5f) / 5.0f;   /* full range ±5 rad/s */
+    /* (5) text panel below the plot */
+    r = plot.r0 + PHASE_PLOT_H + 1;
 
-    /* Trail (oldest → newest, so newest paints on top). */
-    int n = b->ph_fill;
-    for (int i = 0; i < n; i++) {
-        int   idx = (b->ph_head - n + i + HIST_LEN) % HIST_LEN;
-        float th  = b->ph_theta[idx];
-        float om  = b->ph_omega[idx];
-        int   pc  = mid_c + (int)(th * th_scale);
-        int   pr  = mid_r - (int)(om * om_scale);
-        float age = (float)i / (float)n;
-        int   cp  = (age > 0.85f) ? CP_WARN
-                  : (age > 0.50f) ? CP_VAL  : CP_DIM;
-        put_ch(pr, pc, '.', A_NORMAL, cp, rows, cols);
-    }
+    int regime_cp;
+    const char *regime = phase_classify_regime(b, &regime_cp);
+    r = panel_text_row(r, c0 + 1, regime, A_BOLD, regime_cp, rows, cols);
 
-    /* Current point — bright '@'. */
-    int pc = mid_c + (int)(b->theta * th_scale);
-    int pr = mid_r - (int)(b->omega * om_scale);
-    put_ch(pr, pc, '@', A_BOLD, CP_BEACON, rows, cols);
+    snprintf(buf, sizeof buf, " θ=%+.3f ω=%+.3f",
+             b->pend.theta, b->pend.omega);
+    r = panel_text_row(r, c0, buf, A_NORMAL, CP_VAL, rows, cols);
 
-    r = plot_r0 + plot_h;
+    /* Active preset's mini-lesson — links gain change ↔ trail shape. */
     r++;
-
-    /* Regime classification — tells the user what they're seeing. */
-    {
-        float abs_err = fabsf(b->theta - b->theta_ref);
-        const char *regime;
-        int regime_cp;
-        if (!b->pid_on)              { regime = "PID OFF (free fall)";  regime_cp = CP_WARN; }
-        else if (b->kd < 1.0f)       { regime = "UNDERDAMPED (no Kd)";  regime_cp = CP_VAL; }
-        else if (b->kd > 50.0f)      { regime = "OVERDAMPED (high Kd)"; regime_cp = CP_VAL; }
-        else if (abs_err < 0.03f)    { regime = "STABLE — converged";   regime_cp = CP_GOOD; }
-        else                         { regime = "SETTLING — correcting"; regime_cp = CP_VAL; }
-        put_str(r++, c0 + 1, regime, A_BOLD, regime_cp, rows, cols);
-    }
-
-    snprintf(buf, sizeof buf, " θ=%+.3f ω=%+.3f", b->theta, b->omega);
-    put_str(r++, c0, buf, A_NORMAL, CP_VAL, rows, cols);
-
-    r++;
-    /* Active preset's mini-lesson. */
-    const GainPreset *pp = &PRESETS[b->preset_idx];
+    const GainPreset *pp = &PRESETS[b->ui.preset_idx];
     snprintf(buf, sizeof buf, " [%s]", pp->name);
-    put_str(r++, c0, buf, A_BOLD, CP_VAL, rows, cols);
-    put_str(r++, c0 + 1, pp->lesson_l1, A_DIM, CP_DIM, rows, cols);
-    put_str(r++, c0 + 1, pp->lesson_l2, A_DIM, CP_DIM, rows, cols);
+    r = panel_text_row(r, c0, buf, A_BOLD, CP_VAL, rows, cols);
+    r = panel_text_row(r, c0 + 1, pp->lesson_l1, A_DIM, CP_DIM, rows, cols);
+    r = panel_text_row(r, c0 + 1, pp->lesson_l2, A_DIM, CP_DIM, rows, cols);
 }
 
 /* ── §7.7 render_hud — top-row status + bottom-row hints ────────── */
 
-static void render_hud(const Bot *b, double fps, int rows, int cols)
+/* One-line status string for the HUD top row. Order chosen so the
+ * eye lands on FPS first, then the mode words, then the live numbers. */
+static void hud_format_status(const Bot *b, double fps, char *buf, size_t n)
 {
-    char buf[HUD_BUF_LEN];
-
-    float margin_deg = (FALL_ANGLE - fabsf(b->theta_eff))
+    /* Distance to the fall threshold — "how much margin do I have?". */
+    float margin_deg = (FALL_ANGLE - fabsf(b->cp.theta_eff))
                        * (180.0f / (float)M_PI);
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  %s%s  α=%+5.1f°  margin=%4.1f°  dist=%5.1fm  view=[%s]  preset=%s ",
-             fps,
-             b->paused ? "PAUSED " : (b->fallen ? "FALLEN " : "running"),
-             b->pid_on ? ""        : "  NO-PID ",
-             b->alpha * (180.0f / (float)M_PI),
-             margin_deg, b->dist_m,
-             VIEW_NAMES[b->view], PRESETS[b->preset_idx].name);
 
+    const char *mode = b->ui.paused ? "PAUSED "
+                     : b->ui.fallen ? "FALLEN " : "running";
+    const char *pid_flag = b->pid.on ? "" : "  NO-PID ";
+
+    snprintf(buf, n,
+             " %5.1f fps  %s%s  α=%+5.1f°  margin=%4.1f°  "
+             "dist=%5.1fm  view=[%s]  preset=%s ",
+             fps, mode, pid_flag,
+             b->mot.alpha * (180.0f / (float)M_PI),
+             margin_deg, b->mot.dist_m,
+             VIEW_NAMES[b->ui.view], PRESETS[b->ui.preset_idx].name);
+}
+
+/* Paint the HUD top row (yellow bold), then pad to the right edge so
+ * the colour band extends across the whole terminal width. */
+static void hud_paint_status_row(const char *buf, int cols)
+{
     attron (COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvaddnstr(0, 0, buf, cols);
     int used = (int)strlen(buf);
     for (int x = used; x < cols; x++) mvaddch(0, x, ' ');
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
+/* Bottom-row hint strip — lists every interactive key. */
+static void hud_paint_hint_strip(int rows)
+{
     attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(rows - 1, 0,
-             " q:quit  spc:pause  r:reset  ↑↓:speed  p:PID  m:view  g:preset  +/-:Kp ");
+             " q:quit  spc:pause  r:reset  ↑↓:speed  "
+             "p:PID  m:view  g:preset  +/-:Kp ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+/* render_hud — the two-line UI frame: status row 0, hint row bottom. */
+static void render_hud(const Bot *b, double fps, int rows, int cols)
+{
+    char buf[HUD_BUF_LEN];
+    hud_format_status(b, fps, buf, sizeof buf);
+    hud_paint_status_row(buf, cols);
+    hud_paint_hint_strip(rows);
 }
 
 /* ── §7.8 scene_draw — full frame ─────────────────────────────────── */
 
-static void scene_draw(const Bot *b, const Terrain *t, double fps,
-                       int bot_sc, int rows, int cols)
+/* Left column of the right-side panel — clamped to column 1 if the
+ * terminal is too narrow to fit PANEL_W. */
+static int side_panel_origin_col(int cols)
 {
-    erase();
-
-    int wc = (int)(b->world_x / (float)CELL_W);
-
-    /* (1) terrain (sky + surface + rock) */
-    render_terrain(t, wc, bot_sc, rows, cols);
-
-    /* (2) robot */
-    render_bot(b, t, bot_sc, rows, cols);
-
-    /* (3) right side panel — view-dependent */
     int c0 = cols - PANEL_W;
-    if (c0 < 1) c0 = 1;
+    return c0 < 1 ? 1 : c0;
+}
 
-    switch (b->view) {
+/* Dispatch to the right side-panel renderer for the active view mode. */
+static void render_side_panel(const Bot *b, int rows, int cols)
+{
+    int c0 = side_panel_origin_col(cols);
+    switch (b->ui.view) {
     case VIEW_TELEMETRY: render_panel_telemetry(b, rows, cols, c0); break;
     case VIEW_EQUATIONS: render_panel_equations(b, rows, cols, c0); break;
     case VIEW_PHASE:     render_panel_phase    (b, rows, cols, c0); break;
     default: break;
     }
+}
 
-    /* (4) HUD */
-    render_hud(b, fps, rows, cols);
+/*
+ * scene_draw — one frame, painter's order.
+ *
+ *   1. erase the back buffer
+ *   2. backdrop: terrain (sky + surface + rock fill)
+ *   3. foreground: the robot
+ *   4. right-side panel for the active view mode
+ *   5. HUD frame (status row 0 + hint row last)
+ *
+ * Reads exactly as the rendering pipeline; no scattered coord math.
+ */
+static void scene_draw(const Bot *b, const Terrain *t, double fps,
+                       int bot_sc, int rows, int cols)
+{
+    erase();
+
+    int bot_wc = (int)(b->mot.world_x / (float)CELL_W);
+    render_terrain  (t, bot_wc, bot_sc, rows, cols);   /* (2) */
+    render_bot      (b, t,      bot_sc, rows, cols);   /* (3) */
+    render_side_panel(b,                rows, cols);   /* (4) */
+    render_hud      (b, fps,            rows, cols);   /* (5) */
 }
 
 /* ===================================================================== */
 /* §8  screen — ncurses init / present                                    */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — the current ncurses window dimensions.
+ *
+ * INTENT
+ *   The single point of truth for "how big is the terminal RIGHT
+ *   NOW". Every renderer that takes (rows, cols) parameters
+ *   ultimately reads them from here via the Scene pointer in main().
+ *
+ * WHY A STRUCT FOR TWO INTS
+ *   Two reasons:
+ *     (1) Pairs them — renderers always need both together; passing
+ *         a Screen* is one parameter instead of two.
+ *     (2) Localises resize handling — SIGWINCH writes to one struct,
+ *         every subsequent frame sees the new geometry automatically.
+ *   Same argument applies in reverse to FrameTimer (four loose
+ *   timing ints became one named struct).
+ *
+ * MUTATION RULE
+ *   These two fields change ONLY inside screen_init() and
+ *   screen_resize(). They never change mid-frame — render and
+ *   physics treat them as immutable for the duration of one tick.
+ */
+typedef struct {
+    int cols;               /* terminal width in character cells     */
+    int rows;               /* terminal height in character cells    */
+} Screen;
 
 static void screen_init(Screen *s)
 {
@@ -1898,158 +2646,377 @@ static void screen_present(void)
 }
 
 /* ===================================================================== */
-/* §9  app — signals, resize, variable-dt main loop with substeps         */
+/* §9  scene — FrameTimer + Scene container; signals, resize, main loop   */
 /* ===================================================================== */
 
+/*
+ * FrameTimer — wall-clock bookkeeping for the main loop.
+ *
+ * INTENT
+ *   Holds the two timing concerns that used to be local accumulators
+ *   in main():
+ *     (1) measuring dt between frames so physics can sub-step at a
+ *         fixed maximum integrator step (TICK_DT_TARGET = 1/120 s);
+ *     (2) computing a rolling-window FPS for the HUD that doesn't
+ *         flicker once-per-frame.
+ *
+ *   Pulling these into a named struct turns five disconnected
+ *   variables-in-a-function into one object the loop body can pass
+ *   around or hand off if the loop ever grows.
+ *
+ * WHY A 0.5-SECOND ROLLING WINDOW (not instantaneous fps)
+ *   Per-frame fps fluctuates wildly — one slow frame reads as
+ *   "32 fps", one fast frame as "200 fps". A 0.5-sec window smooths
+ *   this so the HUD value is legible and useful for actual tuning.
+ *   Window length is a tradeoff: shorter = jumpier, longer = stale.
+ *
+ * ALGORITHM REFERENCE
+ *   Glenn Fiedler ("Gaffer on Games"), "Fix Your Timestep!" (2004).
+ *   FrameTimer.last_ns is the "previous frame timestamp" from that
+ *   article; main()'s accumulator + sub-step structure is the
+ *   "free the physics from the renderer" pattern verbatim.
+ *   https://gafferongames.com/post/fix_your_timestep/
+ */
 typedef struct {
-    Bot                   bot;
-    Terrain               terrain;
-    Screen                screen;
-    int                   bot_sc;          /* bot stays at this screen col */
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
-} App;
+    int64_t last_ns;        /* clock_ns() reading at the START of    *
+                              * the previous frame. Each frame:       *
+                              *   dt_ns   = now_ns - last_ns          *
+                              *   last_ns = now_ns                    *
+                              * Reset after resize so the post-resize *
+                              * frame doesn't see a huge dt spike.    */
 
-static App g_app;
+    int64_t fps_accum_ns;   /* sum of frame durations (in ns) since   *
+                              * the last fps_display update. Once it  *
+                              * exceeds NS_PER_SEC / 2 (= 0.5 sec) we *
+                              * compute a new fps_display and reset.  */
 
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
+    int     fps_frames;     /* count of frames included in            *
+                              * fps_accum_ns.                          *
+                              *   fps = fps_frames · 1e9 / fps_accum_ns*
+                              * Reset together with fps_accum_ns.     */
+
+    double  fps_display;    /* most recent rolling-window fps value, *
+                              * shown in the HUD top row. Updated     *
+                              * roughly twice per second; stays       *
+                              * legible to a human glance.            */
+} FrameTimer;
+
+/*
+ * Scene — the top-level container.
+ *
+ * INTENT
+ *   One single struct owns every long-lived piece of state the
+ *   program needs. A single global instance (g_scene) replaces
+ *   what used to be TWO file-scope globals (g_perm + g_app). Signal
+ *   handlers flip the volatile flags on this instance; main() reads
+ *   them. Every render and physics function takes pointers into
+ *   Scene members explicitly, so each function's data dependencies
+ *   are visible at the call site — no hidden globals.
+ *
+ * MEMBERS (in conceptual layer order)
+ *
+ *      Noise       Perlin permutation context (formerly g_perm)
+ *      Terrain     scrolling heightfield, borrows Noise*
+ *      Bot         six concept-sized sub-structs (see §6.2.7)
+ *      Screen      ncurses dimensions, refreshed on SIGWINCH
+ *      FrameTimer  dt + rolling-fps state for the main loop
+ *      bot_sc      camera column (where the bot is drawn on screen)
+ *      running     SIGINT / SIGTERM / ESC clears this
+ *      need_resize SIGWINCH sets this
+ *
+ * WHY A GLOBAL AT ALL
+ *   Signal handlers can't take parameters and must run as fast as
+ *   possible (POSIX async-signal-safety rules). They need a path
+ *   to the running/need_resize flags. A single file-scope Scene
+ *   gives them that without complicating the rest of the API
+ *   (which passes Scene* explicitly everywhere it matters).
+ *
+ * INITIALIZATION ORDER (see main())
+ *   1. noise_init    populate the permutation table from time(NULL)
+ *   2. screen_init   bring ncurses up, learn rows/cols
+ *   3. terrain_init  needs noise AND screen.rows; fills the ring buf
+ *                    ahead of the bot
+ *   4. bot_init      physics state; depends on nothing external
+ *   5. timer.last_ns seed for dt measurement
+ *   6. bot_sc        derived from screen.cols (cols/3)
+ *
+ * INVARIANT
+ *   No render or physics function ever reads a Scene field directly
+ *   via g_scene — they always receive a pointer (Bot*, Terrain*,
+ *   Scene*) so the call graph documents every dependency. The
+ *   global is touched only by signal handlers and by main().
+ */
+typedef struct {
+    Noise                 noise;       /* seeded permutation table — *
+                                         * Scene owns the only        *
+                                         * instance in the program.   */
+
+    Terrain               terrain;     /* heightfield. Holds a       *
+                                         * borrowed `const Noise*`    *
+                                         * pointing back to .noise    *
+                                         * above.                     */
+
+    Bot                   bot;         /* simulation state — six     *
+                                         * concept-sized sub-structs. *
+                                         * See §6.2.7.                */
+
+    Screen                screen;      /* ncurses dimensions, kept   *
+                                         * in sync via SIGWINCH.      */
+
+    FrameTimer            timer;       /* dt + rolling-fps state.    */
+
+    int                   bot_sc;      /* screen column where the    *
+                                         * bot is rendered — the     *
+                                         * camera follows by holding  *
+                                         * the bot at this column.    *
+                                         * Set to cols/3 on init and  *
+                                         * after each resize.         */
+
+    volatile sig_atomic_t running;     /* main-loop continue flag.   *
+                                         * Cleared by SIGINT/SIGTERM  *
+                                         * (on_exit_signal) or by the *
+                                         * 'q' / Q / ESC keys.        *
+                                         * volatile + sig_atomic_t    *
+                                         * for async-signal safety.   */
+
+    volatile sig_atomic_t need_resize; /* set by SIGWINCH handler    *
+                                         * (on_resize_signal). Main   *
+                                         * loop reads + clears it at  *
+                                         * the top of each iteration  *
+                                         * and re-syncs screen/bot_sc.*/
+} Scene;
+
+static Scene g_scene;
+
+static void on_exit_signal(int sig)   { (void)sig; g_scene.running = 0;     }
+static void on_resize_signal(int sig) { (void)sig; g_scene.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-static void app_handle_key(App *app, int ch)
+/* Generic clamp to [lo, hi]. Used by the speed/Kp keyboard nudges so
+ * the bounds check is one line, not a four-line pair of ifs. */
+static inline float clamp_range(float v, float lo, float hi)
 {
-    Bot *b = &app->bot;
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* Toggle the PID controller. Integral is cleared on disable so
+ * re-enabling doesn't see a stale accumulation. */
+static void key_pid_toggle(Bot *b)
+{
+    b->pid.on    = !b->pid.on;
+    b->pid.integ = 0.0f;
+}
+
+/* Cycle through the three side-panel views (TELEMETRY/EQUATIONS/PHASE). */
+static void key_view_cycle(Bot *b)
+{
+    b->ui.view = (ViewMode)((b->ui.view + 1) % VIEW_COUNT);
+}
+
+/* Cycle through gain presets and apply the new one (clears integ). */
+static void key_preset_cycle(Bot *b)
+{
+    b->ui.preset_idx = (b->ui.preset_idx + 1) % N_PRESETS;
+    bot_apply_preset(b, b->ui.preset_idx);
+}
+
+/* Full reset — bot back to initial conditions AND regenerate terrain. */
+static void key_reset_simulation(Scene *scene)
+{
+    bot_reset(&scene->bot);
+    terrain_init(&scene->terrain, &scene->noise,
+                 scene->screen.rows, scene->screen.cols);
+}
+
+/* ↑/↓ — nudge drive speed by ±DRIVE_STEP, clamped to [DRIVE_MIN, MAX]. */
+static void key_drive_speed_nudge(Bot *b, float delta)
+{
+    b->mot.drive_spd = clamp_range(b->mot.drive_spd + delta,
+                                   DRIVE_MIN, DRIVE_MAX);
+}
+
+/* +/- — nudge Kp by ±KP_NUDGE, clamped to [0, KP_MAX_USER]. */
+static void key_kp_nudge(Bot *b, float delta)
+{
+    b->pid.kp = clamp_range(b->pid.kp + delta, 0.0f, KP_MAX_USER);
+}
+
+/*
+ * scene_handle_key — dispatch one keystroke to its named action.
+ * Each case is one helper call; the switch reads as the keymap.
+ */
+static void scene_handle_key(Scene *scene, int ch)
+{
+    Bot *b = &scene->bot;
     switch (ch) {
-    case 'q': case 'Q': case 27:
-        app->running = 0;
-        break;
-
-    case ' ':
-        b->paused = !b->paused;
-        break;
-
-    case 'p': case 'P':
-        b->pid_on  = !b->pid_on;
-        b->pid_int = 0.0f;
-        break;
-
-    case 'r': case 'R':
-        bot_reset(b);
-        terrain_init(&app->terrain, app->screen.rows, app->screen.cols);
-        break;
-
-    case 'm': case 'M':
-        b->view = (ViewMode)((b->view + 1) % VIEW_COUNT);
-        break;
-
-    case 'g': case 'G':
-        b->preset_idx = (b->preset_idx + 1) % N_PRESETS;
-        bot_apply_preset(b, b->preset_idx);
-        break;
-
-    case KEY_UP:
-        b->drive_spd += DRIVE_STEP;
-        if (b->drive_spd > DRIVE_MAX) b->drive_spd = DRIVE_MAX;
-        break;
-
-    case KEY_DOWN:
-        b->drive_spd -= DRIVE_STEP;
-        if (b->drive_spd < DRIVE_MIN) b->drive_spd = DRIVE_MIN;
-        break;
-
-    case '+': case '=':
-        b->kp += 5.0f; if (b->kp > 400.0f) b->kp = 400.0f;
-        break;
-
-    case '-':
-        b->kp -= 5.0f; if (b->kp < 0.0f) b->kp = 0.0f;
-        break;
-
-    default: break;
+    case 'q': case 'Q': case 27:  scene->running = 0;                    break;
+    case ' ':                     b->ui.paused = !b->ui.paused;          break;
+    case 'p': case 'P':           key_pid_toggle(b);                     break;
+    case 'r': case 'R':           key_reset_simulation(scene);           break;
+    case 'm': case 'M':           key_view_cycle(b);                     break;
+    case 'g': case 'G':           key_preset_cycle(b);                   break;
+    case KEY_UP:                  key_drive_speed_nudge(b, +DRIVE_STEP); break;
+    case KEY_DOWN:                key_drive_speed_nudge(b, -DRIVE_STEP); break;
+    case '+': case '=':           key_kp_nudge(b, +KP_NUDGE);            break;
+    case '-':                     key_kp_nudge(b, -KP_NUDGE);            break;
+    default:                                                             break;
     }
 }
 
+/* Re-sync everything to the new terminal size. Called from the main
+ * loop when SIGWINCH has set need_resize. */
+static void scene_handle_resize(Scene *scene)
+{
+    screen_resize(&scene->screen);
+    scene->bot_sc        = scene->screen.cols / 3;
+    scene->terrain.rows  = scene->screen.rows;
+    scene->need_resize   = 0;
+    scene->timer.last_ns = clock_ns();   /* avoid huge dt next frame */
+}
+
+/* Measure wall-clock dt since last frame and feed the rolling-fps
+ * accumulator. Returns dt clamped to DT_CAP_SEC (spiral-of-death
+ * guard) and writes the raw dt_ns to *out_dt_ns for the fps update. */
+static float frame_measure_dt(FrameTimer *tm, int64_t now_ns,
+                              int64_t *out_dt_ns)
+{
+    int64_t dt_ns = now_ns - tm->last_ns;
+    tm->last_ns   = now_ns;
+    *out_dt_ns    = dt_ns;
+
+    float dt = (float)dt_ns / (float)NS_PER_SEC;
+    if (dt > DT_CAP_SEC) dt = DT_CAP_SEC;
+    return dt;
+}
+
+/* Tick the rolling-fps accumulator. Recomputes fps_display once the
+ * window crosses 0.5 sec (keeps the HUD reading legible to humans). */
+static void frame_tick_fps(FrameTimer *tm, int64_t dt_ns)
+{
+    tm->fps_accum_ns += dt_ns;
+    tm->fps_frames++;
+    if (tm->fps_accum_ns >= NS_PER_SEC / 2) {
+        tm->fps_display  = (double)tm->fps_frames * 1e9
+                         / (double)tm->fps_accum_ns;
+        tm->fps_accum_ns = 0;
+        tm->fps_frames   = 0;
+    }
+}
+
+/* Drain all queued keystrokes into scene_handle_key. */
+static void scene_drain_input(Scene *scene)
+{
+    int ch;
+    while ((ch = getch()) != ERR) scene_handle_key(scene, ch);
+}
+
+/* Ensure terrain columns are generated ahead of the camera so the
+ * renderer never reads an uninitialised slot. The "+ 32" margin is
+ * cheap insurance — fbm() is fast and the ring buffer overwrites
+ * old columns we no longer see. */
+static void ensure_terrain_ahead(Scene *scene)
+{
+    int upto = (int)(scene->bot.mot.world_x / (float)CELL_W)
+             + scene->screen.cols + 32;
+    terrain_ensure(&scene->terrain, upto);
+}
+
+/* Advance physics with adaptive sub-stepping for integrator stability.
+ *   n_sub = ceil(dt / TICK_DT_TARGET), capped at MAX_SUBSTEPS so a
+ *   stalled frame can't loop forever. Each substep is ≤ TICK_DT_TARGET,
+ *   which keeps forward-Euler well within its stability region. */
+static void scene_advance_physics(Scene *scene, float dt)
+{
+    int n_sub = (int)ceilf(dt / TICK_DT_TARGET);
+    if (n_sub < 1)            n_sub = 1;
+    if (n_sub > MAX_SUBSTEPS) n_sub = MAX_SUBSTEPS;
+
+    float sub_dt = dt / (float)n_sub;
+    for (int i = 0; i < n_sub; i++)
+        bot_substep(&scene->bot, &scene->terrain, sub_dt);
+}
+
+/* Sleep the remainder of TICK_NS so we hit TARGET_FPS regardless of
+ * how fast this frame ran. now_ns is the frame's start timestamp. */
+static void frame_cap_to_target_fps(int64_t now_ns, int64_t tick_ns)
+{
+    int64_t elapsed = clock_ns() - now_ns;
+    clock_sleep_ns(tick_ns - elapsed);
+}
+
+/*
+ * main — orchestrator. Reads as the program's lifecycle:
+ *
+ *   SETUP:
+ *     1. install signal handlers and atexit cleanup
+ *     2. initialise subsystems in dependency order:
+ *        Noise → Screen → Terrain (needs both) → Bot → camera + timer
+ *
+ *   LOOP (each frame):
+ *     1. handle any pending resize
+ *     2. measure dt (capped) + tick fps
+ *     3. drain keyboard input
+ *     4. ensure terrain is generated ahead of the camera
+ *     5. advance physics (sub-stepped) unless paused/fallen
+ *     6. draw the scene + present
+ *     7. sleep to hit TARGET_FPS
+ */
 int main(void)
 {
+    /* SETUP — signals + atexit */
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
-    perlin_init((unsigned int)time(NULL));
+    /* SETUP — subsystems in dependency order */
+    Scene *scene = &g_scene;
+    scene->running = 1;
 
-    App *app     = &g_app;
-    app->running = 1;
+    noise_init  (&scene->noise, (unsigned int)time(NULL));
+    screen_init (&scene->screen);
+    terrain_init(&scene->terrain, &scene->noise,
+                 scene->screen.rows, scene->screen.cols);
+    bot_init    (&scene->bot);
 
-    screen_init(&app->screen);
-    terrain_init(&app->terrain, app->screen.rows, app->screen.cols);
-    bot_init(&app->bot);
+    scene->bot_sc        = scene->screen.cols / 3;
+    scene->timer.last_ns = clock_ns();
 
-    app->bot_sc = app->screen.cols / 3;     /* bot stays at this screen col */
-
-    int64_t last_ns      = clock_ns();
-    int64_t fps_accum_ns = 0;
-    int     fps_frames   = 0;
-    double  fps_display  = 0.0;
     const int64_t TICK_NS = NS_PER_SEC / TARGET_FPS;
 
-    while (app->running) {
+    /* LOOP */
+    while (scene->running) {
+        /* (1) handle resize before reading anything else */
+        if (scene->need_resize) scene_handle_resize(scene);
 
-        /* (1) handle resize */
-        if (app->need_resize) {
-            screen_resize(&app->screen);
-            app->bot_sc = app->screen.cols / 3;
-            app->terrain.rows = app->screen.rows;
-            app->need_resize = 0;
-            last_ns = clock_ns();
-        }
+        /* (2) frame timing — dt for physics, raw dt_ns for fps */
+        int64_t now_ns;
+        int64_t dt_ns;
+        now_ns = clock_ns();
+        float dt = frame_measure_dt(&scene->timer, now_ns, &dt_ns);
+        frame_tick_fps(&scene->timer, dt_ns);
 
-        /* (2) measure dt, capped */
-        int64_t now_ns = clock_ns();
-        int64_t dt_ns  = now_ns - last_ns;
-        last_ns        = now_ns;
-        float   dt     = (float)dt_ns / (float)NS_PER_SEC;
-        if (dt > DT_CAP_SEC) dt = DT_CAP_SEC;
+        /* (3) drain queued keystrokes */
+        scene_drain_input(scene);
 
-        /* (3) drain input */
-        int ch;
-        while ((ch = getch()) != ERR) app_handle_key(app, ch);
+        /* (4) generate terrain columns ahead of the camera */
+        ensure_terrain_ahead(scene);
 
-        /* (4) ensure terrain is generated ahead of the bot */
-        terrain_ensure(&app->terrain,
-                       (int)(app->bot.world_x / (float)CELL_W)
-                       + app->screen.cols + 32);
+        /* (5) advance physics (paused/fallen → skip) */
+        if (!scene->bot.ui.paused && !scene->bot.ui.fallen)
+            scene_advance_physics(scene, dt);
 
-        /* (5) advance physics in sub-steps for stability */
-        if (!app->bot.paused && !app->bot.fallen) {
-            int   n_sub  = (int)ceilf(dt / TICK_DT_TARGET);
-            if (n_sub < 1)             n_sub = 1;
-            if (n_sub > MAX_SUBSTEPS)  n_sub = MAX_SUBSTEPS;
-            float sub_dt = dt / (float)n_sub;
-            for (int i = 0; i < n_sub; i++)
-                bot_substep(&app->bot, &app->terrain, sub_dt);
-        }
-
-        /* (6) rolling fps display (0.5 s window) */
-        fps_accum_ns += dt_ns;
-        fps_frames++;
-        if (fps_accum_ns >= NS_PER_SEC / 2) {
-            fps_display = (double)fps_frames * 1e9
-                        / (double)fps_accum_ns;
-            fps_accum_ns = 0;
-            fps_frames   = 0;
-        }
-
-        /* (7) draw + present */
-        scene_draw(&app->bot, &app->terrain, fps_display,
-                   app->bot_sc, app->screen.rows, app->screen.cols);
+        /* (6) draw + present */
+        scene_draw(&scene->bot, &scene->terrain, scene->timer.fps_display,
+                   scene->bot_sc, scene->screen.rows, scene->screen.cols);
         screen_present();
 
-        /* (8) frame cap */
-        int64_t elapsed = clock_ns() - now_ns;
-        clock_sleep_ns(TICK_NS - elapsed);
+        /* (7) sleep the remainder of the frame budget */
+        frame_cap_to_target_fps(now_ns, TICK_NS);
     }
 
-    screen_free(&app->screen);
+    screen_free(&scene->screen);
     return 0;
 }

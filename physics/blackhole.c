@@ -72,6 +72,28 @@
  *                  (≠ 0.50 from CELL_W/CELL_H ratio — physical pixels differ.)
  *                  Ensures the event horizon appears circular, not oval.
  *
+ * Data-structure: A single Scene struct owns the whole program state,
+ *                 composed of concept-sized sub-structs so each field's
+ *                 role is obvious at the access site:
+ *
+ *                   Camera        — cam_dist, tilt_deg  (changing either
+ *                                     triggers a lensing-table rebuild)
+ *                   DiskSim       — spin, angle, paused (the per-tick
+ *                                     accretion-disk animation state)
+ *                   RenderConfig  — theme, show_stars   (purely cosmetic;
+ *                                     never triggers a rebuild)
+ *                   Screen        — cols, rows          (ncurses dims)
+ *                   FrameTimer    — sim-tick / render-frame budgets,
+ *                                     accumulator, rolling-fps state
+ *                   table[][]     — precomputed Cell lensing table
+ *                   clumps[]      — N_CLUMPS orbital hot spots
+ *                   color256, running, need_resize, need_rebuild
+ *
+ *                 Single file-static g_scene instance. The Camera and
+ *                 DiskSim split makes the sim/render contract explicit:
+ *                 mutating Camera invalidates the table; mutating
+ *                 RenderConfig must not.
+ *
  * References (cite inline as [n]):
  *
  *   [1] Misner, C. W.; Thorne, K. S.; Wheeler, J. A. — *Gravitation*
@@ -301,6 +323,63 @@
 #define N_CLUMPS 10
 #define CLUMP_RATE_SCALE 0.85f
 
+/* ── §1.1 physics constants (Schwarzschild, geometric units) ────── */
+
+/* Mass parameter in geometric units c = G = 1, r_s = 2M = 1. Used by
+ * Keplerian orbital speed v = √(M/r) and similar. */
+#define SCHWARZSCHILD_M           0.5f
+
+/* "Captured by the horizon" threshold. r < BH_R · HORIZON_FUDGE means
+ * the photon is on the inevitable plunge — we stop integrating before
+ * the singularity would force a divide-by-zero. */
+#define HORIZON_FUDGE             0.92f
+
+/* Doppler beaming factor [(1+β)/(1−β)]^DOPPLER_EXPONENT. The full SR
+ * value is 3 or 4; we use 3/2 to keep the dynamic range inside the
+ * 9-tier disk character ramp (3 would saturate everything to '@' on
+ * the approaching side). */
+#define DOPPLER_EXPONENT          1.5f
+
+/* β clamp — avoid the v → c pole in (1±β)^k. */
+#define DOPPLER_BETA_CLAMP        0.95f
+
+/* ── §1.2 render cutoffs ─────────────────────────────────────────── */
+
+/* Below this brightness the disk pixel paints nothing (skip dim
+ * outer-disk scatter). */
+#define DISK_MIN_VISIBLE          0.07f
+
+/* Photon-ring bloom is only checked for rays whose closest approach
+ * was within this radius — outside the bloom is negligible anyway. */
+#define BLOOM_NEAR_RANGE          4.0f
+
+/* Below this bloom intensity, fall through to lensed-star rendering
+ * (so glyphs never collide). */
+#define BLOOM_MIN_VISIBLE         0.06f
+
+/* ── §1.3 star field ─────────────────────────────────────────────── */
+
+/* Celestial-sphere quantisation for star_lookup: cells per radian.
+ * 30 cells/rad → ~3° per cell, ~5800 cells over the full sphere. */
+#define STAR_GRID_PER_RAD         30.0f
+
+/* Density gate: stars in cells where (hash & 0xFF) < this threshold.
+ * 4 out of 256 ≈ ~1.6%. */
+#define STAR_DENSITY_BUCKET       4u
+
+/* Brightness classification thresholds on the second hash byte. */
+#define STAR_BRIGHT_THRESH      220u
+#define STAR_MID_THRESH         100u
+
+/* ── §1.4 main-loop timing ───────────────────────────────────────── */
+
+/* Cap dt at 100 ms so a process suspension doesn't cause a huge
+ * "catch-up" burst of sim ticks (spiral-of-death prevention). */
+#define DT_CAP_NS         100000000LL
+
+/* Rolling-fps window. fps_display refreshed when fps_acc crosses this. */
+#define FPS_WINDOW_NS     500000000LL
+
 /* ── §2  clock ──────────────────────────────────────────────────────────── */
 
 static long long clock_ns(void) {
@@ -331,21 +410,52 @@ enum {
   CP_COUNT
 };
 
-static int g_256;
+/* Scene is defined in §6 below; theme_apply() reads g_scene.color256.
+ * Forward-declared here so §3 doesn't depend on §6's typedef order. */
+struct Scene_;
+typedef struct Scene_ Scene;
+extern Scene g_scene;
+static inline int scene_is_256_color(void);   /* defined in §6 */
 
 /*
- * Theme — six theme-driven 256-colour cube indices, ring (brightest,
- * inner-disk peak) → dim (outer-disk falloff).  Pairs CP_STAR, CP_HUD,
- * CP_HINT are fixed across all themes so the HUD chrome stays legible
- * regardless of which palette is active.
+ * Theme — one entry in the g_themes[] palette table.
  *
- * Brightness safety (CLAUDE.md): every entry sits at index ≥ 30, or
- * 24-29 / 240-243 only as the lowest ramp tier.  16-23 / 232-239 are
- * forbidden — they vanish on default-background terminals.
+ * INTENT
+ *   A theme is a six-tier 256-colour ramp from ring (brightest, used
+ *   for the photon ring + white-hot inner disk) down to dim (used
+ *   for outer-disk falloff). The 't' key cycles g_scene.render.theme
+ *   through g_themes[]; theme_apply() then rebinds CP_RING .. CP_DIM
+ *   from the selected row. CP_STAR / CP_HUD / CP_HINT use fixed chrome
+ *   constants regardless of theme so HUD/star colours stay legible.
+ *
+ * WHY SIX TIERS (not 4, not 8)
+ *   disk_pair() in §8 selects one of six brightness buckets per pixel.
+ *   Fewer tiers and the inner-to-outer falloff would visibly step;
+ *   more and the per-bucket palette entries become indistinguishable
+ *   on most terminals. Six is the legibility sweet spot for ASCII
+ *   gradients.
+ *
+ * BRIGHTNESS SAFETY (CLAUDE.md theme rule)
+ *   Every entry sits at index ≥ 30, OR 24-29 / 240-243 only as the
+ *   lowest ramp tier. 16-23 / 232-239 are forbidden — they vanish
+ *   against the default terminal background.
+ *
+ * ALGORITHM REFERENCE
+ *   Ware (2020) ch. 4 — perceptually-ordered colour / luminance ramps.
+ *   The six-tier shape mirrors a standard brightness ramp from
+ *   "perception for design" (white-hot → ember). Theme "Blackbody"
+ *   additionally honours Wien's law: inner disk = hot blue, outer = cool
+ *   red (the physically-correct temperature profile for a thin disk).
  */
 typedef struct {
-  const char *name;
-  short ring, hot, warm, mid, cool, dim;
+  const char *name; /* short label shown in the HUD top row.            */
+  short ring;       /* tier 0 — peak white-hot. Photon-ring '#' / '*'   *
+                     * AND the inner-disk peak buckets in disk_pair.    */
+  short hot;        /* tier 1 — inner-disk warm core.                   */
+  short warm;       /* tier 2 — mid-inner band.                         */
+  short mid;        /* tier 3 — disk mid.                               */
+  short cool;       /* tier 4 — outer band.                             */
+  short dim;        /* tier 5 — far-outer disk fade.                    */
 } Theme;
 
 static const Theme g_themes[] = {
@@ -373,36 +483,87 @@ static const Theme g_themes[] = {
 #define CHROME_HUD_256 226  /* bright yellow      */
 #define CHROME_HINT_256 51  /* bright cyan        */
 
+/*
+ * 8-colour fallback palette — theme-independent warm ramp + standard
+ * chrome. Used when COLORS < 256 (basic xterm, tmux without truecolor,
+ * etc). The 6 disk tiers collapse to a warm white→yellow→red gradient.
+ */
+static const struct { short pair; short fg; } FALLBACK_PALETTE[] = {
+    {CP_RING,  COLOR_WHITE },
+    {CP_HOT,   COLOR_YELLOW},
+    {CP_WARM,  COLOR_YELLOW},
+    {CP_MID,   COLOR_RED   },
+    {CP_COOL,  COLOR_RED   },
+    {CP_DIM,   COLOR_RED   },
+    {CP_STAR,  COLOR_WHITE },
+    {CP_HUD,   COLOR_YELLOW},
+    {CP_HINT,  COLOR_CYAN  },
+};
+#define FALLBACK_PALETTE_LEN \
+    (int)(sizeof FALLBACK_PALETTE / sizeof FALLBACK_PALETTE[0])
+
+/* Bind the 6 disk tiers from a 256-mode Theme, then the 3 chrome
+ * pairs that stay constant across all themes. */
+static void theme_apply_256(const Theme *t) {
+  init_pair(CP_RING, t->ring, -1);
+  init_pair(CP_HOT,  t->hot,  -1);
+  init_pair(CP_WARM, t->warm, -1);
+  init_pair(CP_MID,  t->mid,  -1);
+  init_pair(CP_COOL, t->cool, -1);
+  init_pair(CP_DIM,  t->dim,  -1);
+  init_pair(CP_STAR, CHROME_STAR_256, -1);
+  init_pair(CP_HUD,  CHROME_HUD_256,  -1);
+  init_pair(CP_HINT, CHROME_HINT_256, -1);
+}
+
+/* Walk the 8-colour fallback table — same pairs, theme-independent. */
+static void theme_apply_8(void) {
+  for (int i = 0; i < FALLBACK_PALETTE_LEN; i++)
+    init_pair(FALLBACK_PALETTE[i].pair, FALLBACK_PALETTE[i].fg, -1);
+}
+
 static void theme_apply(int idx) {
   const Theme *t = &g_themes[idx % THEME_N];
-  if (g_256) {
-    init_pair(CP_RING, t->ring, -1);
-    init_pair(CP_HOT, t->hot, -1);
-    init_pair(CP_WARM, t->warm, -1);
-    init_pair(CP_MID, t->mid, -1);
-    init_pair(CP_COOL, t->cool, -1);
-    init_pair(CP_DIM, t->dim, -1);
-    init_pair(CP_STAR, CHROME_STAR_256, -1);
-    init_pair(CP_HUD, CHROME_HUD_256, -1);
-    init_pair(CP_HINT, CHROME_HINT_256, -1);
-  } else {
-    /* 8-colour fallback: theme-independent warm ramp + standard chrome. */
-    init_pair(CP_RING, COLOR_WHITE, -1);
-    init_pair(CP_HOT, COLOR_YELLOW, -1);
-    init_pair(CP_WARM, COLOR_YELLOW, -1);
-    init_pair(CP_MID, COLOR_RED, -1);
-    init_pair(CP_COOL, COLOR_RED, -1);
-    init_pair(CP_DIM, COLOR_RED, -1);
-    init_pair(CP_STAR, COLOR_WHITE, -1);
-    init_pair(CP_HUD, COLOR_YELLOW, -1);
-    init_pair(CP_HINT, COLOR_CYAN, -1);
-  }
+  if (scene_is_256_color()) theme_apply_256(t);
+  else                      theme_apply_8();
 }
 
 /* ── §4  V3 math ─────────────────────────────────────────────────────────── */
 
+/*
+ * V3 — 3-D vector in geometric units (c = G = 1, r_s = 2M = 1).
+ *
+ * INTENT
+ *   Shared currency of the geodesic integrator and the camera frame.
+ *   Photon position, photon velocity, camera origin, camera basis
+ *   vectors — all V3s in the same Cartesian frame centred on the
+ *   black hole at the origin.
+ *
+ * COORDINATE CONVENTION
+ *   y is the polar axis (perpendicular to the disk plane). The
+ *   accretion disk lies in the y = 0 plane with cylindrical radius
+ *   √(x² + z²) ∈ [DISK_IN, DISK_OUT]. At tilt = 0 the camera sits
+ *   at (0, 0, −cam_dist); positive tilt lifts it toward +y above
+ *   the equator.
+ *
+ *   A photon's progress is tracked by its squared norm
+ *      r²  = x² + y² + z²
+ *   which appears in the geodesic equation's r^−5 force term.
+ *
+ * UNITS (geometric, c = G = 1, M = 0.5 ⇒ r_s = 1)
+ *   All distances are dimensionless multiples of r_s. Velocity is
+ *   in units where c = 1 (affine-parameter velocity for null
+ *   geodesics, with |vel| ≈ 1 throughout the trace).
+ *
+ * ALGORITHM REFERENCE
+ *   Cartesian embedding of Schwarzschild null geodesics — MTW §25 [1].
+ *   The 3-D Cartesian form d²pos/dλ² = −(3/2)|h|²·pos/r⁵ is derived by
+ *   casting the Binet equation into vector form via h = pos × vel.
+ */
 typedef struct {
-  float x, y, z;
+  float x; /* horizontal (camera-right at tilt = 0), r_s units      */
+  float y; /* polar axis perpendicular to disk plane, r_s units     */
+  float z; /* horizontal (camera-back at tilt = 0), r_s units       */
 } V3;
 
 static inline float v3dot(V3 a, V3 b) {
@@ -450,31 +611,51 @@ static void geo_deriv(V3 pos, V3 vel, V3 *dpos, V3 *dvel) {
   *dvel = v3scale(coef, pos);
 }
 
-/* One RK4 step of size ds */
+/* RK4 weighted average:  (k1 + 2·k2 + 2·k3 + k4) / 6.
+ * The classical 4th-order Runge-Kutta increment. Pulled out so the
+ * step body reads as "average the four slopes" rather than a nested
+ * v3add chain. */
+static V3 rk4_weighted_avg(V3 k1, V3 k2, V3 k3, V3 k4) {
+  V3 sum2 = v3add(v3scale(2.0f, k2), v3scale(2.0f, k3));
+  V3 total = v3add(v3add(k1, k4), sum2);
+  return v3scale(1.0f / 6.0f, total);
+}
+
+/*
+ * geo_step — one RK4 step of size ds along the null geodesic.
+ *
+ *   k1 = f(y)                    slope at current point
+ *   k2 = f(y + ds/2 · k1)        slope at midpoint, using k1
+ *   k3 = f(y + ds/2 · k2)        slope at midpoint, using k2
+ *   k4 = f(y + ds   · k3)        slope at endpoint, using k3
+ *   y_next = y + ds · (k1 + 2·k2 + 2·k3 + k4) / 6
+ *
+ * Reads as four slope samples + a weighted average per state variable.
+ */
 static void geo_step(V3 *pos, V3 *vel, float ds) {
   V3 dp1, dv1, dp2, dv2, dp3, dv3, dp4, dv4;
 
+  /* (1) slope at the current point */
   geo_deriv(*pos, *vel, &dp1, &dv1);
 
+  /* (2) slope at the midpoint, predictor using k1 */
   V3 pa = v3add(*pos, v3scale(0.5f * ds, dp1));
   V3 va = v3add(*vel, v3scale(0.5f * ds, dv1));
   geo_deriv(pa, va, &dp2, &dv2);
 
+  /* (3) slope at the midpoint, corrector using k2 */
   V3 pb = v3add(*pos, v3scale(0.5f * ds, dp2));
   V3 vb = v3add(*vel, v3scale(0.5f * ds, dv2));
   geo_deriv(pb, vb, &dp3, &dv3);
 
+  /* (4) slope at the endpoint, predictor using k3 */
   V3 pc = v3add(*pos, v3scale(ds, dp3));
   V3 vc = v3add(*vel, v3scale(ds, dv3));
   geo_deriv(pc, vc, &dp4, &dv4);
 
-  float k = ds / 6.0f;
-  *pos =
-      v3add(*pos, v3scale(k, v3add(dp1, v3add(v3scale(2, dp2),
-                                              v3add(v3scale(2, dp3), dp4)))));
-  *vel =
-      v3add(*vel, v3scale(k, v3add(dv1, v3add(v3scale(2, dv2),
-                                              v3add(v3scale(2, dv3), dv4)))));
+  /* (5) advance state by ds · weighted-average-slope */
+  *pos = v3add(*pos, v3scale(ds, rk4_weighted_avg(dp1, dp2, dp3, dp4)));
+  *vel = v3add(*vel, v3scale(ds, rk4_weighted_avg(dv1, dv2, dv3, dv4)));
 }
 
 /* ── §6  ray table / scene ───────────────────────────────────────────────── */
@@ -576,82 +757,344 @@ typedef struct {
 } Clump;
 
 /* ─────────────────────────────────────────────────────────────────────── *
- * Scene — state that spans precompute(), render(), clumps_tick(), and
- * the main loop.
  *
- * The struct splits into two clearly-labelled groups:
+ * §6.1 Scalar sub-structs of Scene
  *
- *   Simulation parameters  — consumed by precompute (lensing-table
- *     rebuild) and the per-tick clump / disk-angle advance.  Anything
- *     that affects the PHYSICS (ray outcomes, clump positions, disk
- *     rotation) lives here.  Mutated by physics-affecting keys:
- *     + / - (zoom, rebuilds table), a / A (tilt, rebuilds table),
- *     p (pause), r (reset).
+ * Scene is composed from five concept-sized sub-structs plus the two
+ * large data buffers (table, clumps) and a handful of process flags.
+ * Each sub-struct groups fields that share a mutation pattern, so
+ * "where does this field live?" answers "what kind of state is it?".
  *
- *   Rendering parameters   — consumed by render and screen_hud only.
- *     Toggling any of these while paused must leave the lensing table
- *     and clump positions byte-identical — only colours / overlays
- *     may differ.  Mutated by purely cosmetic keys: t (theme), k (stars).
- *
- * Locality rationale (this contract matters, not the bytes):
- *   The split exists for the READER, not the CPU.  A new flag landing
- *   in the rendering group when it actually triggers a table rebuild
- *   would silently couple display to physics — exactly the bug the
- *   separation prevents.  When adding a field, ask: does this change
- *   what precompute / ray_trace / clumps_tick produces?  If yes,
- *   simulation; if no, rendering.
- *
- * Single instance (file-scope `g_scene`):
- *   The struct embeds the ~3 MB lensing table, so it lives in BSS
- *   as a file-static rather than being passed by pointer.  All
- *   scene state is accessed as `g_scene.<field>` from the few
- *   helpers and the main loop that need it.
- *
- * What stays OUTSIDE this struct (intentionally):
- *   g_run / g_resize   sig_atomic_t flags read by signal handlers;
- *                      must stay at file scope for async-signal safety.
- *   g_256              one-shot color-capability flag set at startup;
- *                      never mutated, no benefit in scene membership.
- *   cols / rows        screen geometry tracked by the main loop;
- *                      Scene stays geometry-agnostic so resize handling
- *                      is the main loop's concern, not the renderer's.
- *   fps / frame_time / sim_accum / ...  main-loop timing bookkeeping;
- *                                       neither physics nor display.
  * ─────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Camera — pinhole-camera parameters that determine which rays get
+ * shot through the precompute loop.
+ *
+ * INTENT
+ *   Together these two scalars fully define the camera's position and
+ *   orientation. The camera sits at distance `cam_dist` from the BH
+ *   on the cone of inclination `tilt_deg` above the equatorial plane,
+ *   always looking at the origin:
+ *
+ *      cam = (0,  cam_dist · sin t,  − cam_dist · cos t)     [t = tilt_rad]
+ *      fwd = normalize(−cam)                                 [toward BH]
+ *      rgt = normalize(fwd × ŷ)                              [screen-right]
+ *      up  = rgt × fwd                                       [screen-up]
+ *
+ *   build_camera_basis() in §7 computes (cam, fwd, rgt, up) from these
+ *   two scalars; every ray direction is then `pinhole_pixel_to_ray()`
+ *   on that basis.
+ *
+ * INVARIANT
+ *   Mutating ANY field here invalidates the entire lensing table —
+ *   different camera position ⇒ different rays ⇒ different outcomes
+ *   at every pixel. The caller MUST set g_scene.need_rebuild = 1
+ *   after writing here; main()'s next loop iteration runs precompute().
+ *
+ * WHY tilt_deg HAS A < 90° CAP
+ *   At tilt = 90° the camera would sit on +ŷ and `fwd` would be
+ *   anti-parallel to world_up (0, 1, 0); the cross product in
+ *   build_camera_basis() collapses and `rgt` becomes undefined.
+ *   TILT_DEG_MAX = 85° keeps us safely away from that singularity.
+ *
+ * WHY cam_dist HAS A MIN (NOT 0)
+ *   CAM_DIST_MIN = 4 keeps the camera outside the ISCO (r = 3) so the
+ *   camera isn't INSIDE the disk plane. Closer than ISCO and the
+ *   disk would visually clip / wrap unpredictably.
+ *
+ * ALGORITHM REFERENCE
+ *   Standard pinhole camera projection (Foley/van Dam/Feiner/Hughes,
+ *   "Computer Graphics: Principles and Practice", §6.4).
+ *   Schwarzschild ray-tracing application — James et al. [3].
+ */
 typedef struct {
-  /* ── Simulation parameters ─────────────────────────────────────── */
-  float cam_dist; /* camera distance from BH, r_s units (+/-).
-                   * Changing invalidates the lensing table —
-                   * caller must set need_rebuild = 1.            */
-  float tilt_deg; /* inclination above equator, degrees (a/A).
-                   * Same rebuild trigger as cam_dist.            */
-  float spin;     /* per-tick rigid disk-texture rotation rate
-                   * (rad/tick).                                  */
-  float disk_ang; /* cumulative disk-texture rotation, [0, 2π);
-                   * advanced by spin each tick when !paused.    */
-  int paused;     /* 1 → freeze the sim; HUD shows PAUSED.        */
+  float cam_dist; /* camera distance from BH, r_s units. Clamped to     *
+                   * [CAM_DIST_MIN, CAM_DIST_MAX] = [4, 72]. +/- keys   *
+                   * nudge by CAM_DIST_STEP = 1.5. Smaller → closer →   *
+                   * bigger Gargantua on screen.                        */
+  float tilt_deg; /* inclination above equatorial plane, degrees.       *
+                   * Clamped to [TILT_DEG_MIN, TILT_DEG_MAX] = [0, 85]. *
+                   * a/A keys nudge by TILT_DEG_STEP = 5°.              *
+                   * 0  = edge-on (disk as a thin line, max Doppler     *
+                   *      asymmetry)                                    *
+                   * 85 = nearly face-on (disk as an annulus around the *
+                   *      shadow; the iconic Gargantua look)            */
+} Camera;
 
-  /* Sim buffers — populated by precompute / clumps_init, read each
-   * frame by render. */
-  Cell table[MAX_ROWS][MAX_COLS]; /* precomputed ray outcomes        */
-  Clump clumps[N_CLUMPS];         /* orbital hot spots               */
+/*
+ * DiskSim — accretion-disk animation state, advanced once per sim tick.
+ *
+ * INTENT
+ *   The disk has TWO motions, layered:
+ *     (1) RIGID-ROTATION TEXTURE — `angle` advances by `spin` each
+ *         tick. Drives the 5-arm spiral_density_texture() pattern,
+ *         which rotates as a single rigid sheet.
+ *     (2) KEPLERIAN HOT-SPOT FLOW — each Clump in Scene.clumps
+ *         advances its own φ at Ω(r) = √(M/r³) (in clumps_tick()),
+ *         so inner clumps visibly lap outer clumps.
+ *
+ *   The rigid texture creates a consistent "spinning record" pattern;
+ *   the clumps create differential motion that breaks the rigid look.
+ *   Together they read as a real accretion disk with structure and
+ *   flow.
+ *
+ * WHY spin IS A USER PARAMETER (not derived)
+ *   Real accretion disks rotate at SIM_FPS-independent rates — the
+ *   visual gait depends on the chosen `spin`. SPIN_DEF = 0.04 rad/tick
+ *   at SIM_FPS = 20 gives ~0.8 rad/sec, a comfortable visual tempo.
+ *   Tied to SIM_FPS rather than wall-clock: physics is fixed-timestep
+ *   in the FrameTimer accumulator pattern, so the rate is per-tick,
+ *   not per-second.
+ *
+ * MUTATION SIDE EFFECTS
+ *   `angle` and `paused` are CHEAP to mutate (no rebuild). `spin` is
+ *   also cheap, but is currently never written at runtime (no
+ *   keyboard binding) — the field is present so adding a "faster/
+ *   slower disk" key is a one-line change.
+ *
+ * ALGORITHM REFERENCES
+ *   Keplerian orbital rate            — MTW §25 [1]
+ *   Hot-spot disk variability         — James et al. [3]
+ *   Spiral density wave pattern       — standard accretion-disk
+ *                                       astrophysics (Pringle 1981)
+ */
+typedef struct {
+  float spin;   /* per-tick rigid disk-texture rotation rate (rad/tick).*
+                 * Default SPIN_DEF = 0.04. Used as both the rigid      *
+                 * texture rate AND as the CLUMP_RATE_SCALE reference   *
+                 * (clump rate at r = 6 ≈ spin, so the two motions      *
+                 * roughly match at the disk midline).                   */
+  float angle;  /* cumulative rigid rotation, [0, 2π). Advanced by spin*
+                 * each sim tick when !paused; wrapped on overflow;     *
+                 * reset to 0 by the 'r' key (re-syncs clumps too).     */
+  int   paused; /* 1 → freeze the simulation entirely (disk angle      *
+                 * frozen AND clumps_tick skipped). HUD shows PAUSED.   *
+                 * spacebar / 'p' toggles.                              */
+} DiskSim;
 
-  /* ── Rendering parameters ──────────────────────────────────────── */
-  int theme;      /* index into g_themes[] (§3); t key cycles.   */
-  int show_stars; /* 1 → render lensed background star field;
-                   * k key toggles, off by default.               */
-} Scene;
+/*
+ * RenderConfig — purely cosmetic flags.
+ *
+ * INTENT
+ *   The "skin" of the renderer. Mutating these MUST leave the lensing
+ *   table and clump positions byte-identical — only colours / overlays
+ *   may differ. The contract is enforced by SEPARATION from Camera
+ *   and DiskSim: a flag here physically can't trigger a rebuild
+ *   because the rebuild path doesn't read RenderConfig.
+ *
+ * INVARIANT (READER GUIDE FOR FUTURE EXTENSIONS)
+ *   When adding a new flag, ask: does this change what precompute() /
+ *   ray_trace() / clumps_tick() produces? If YES, it belongs in
+ *   Camera or DiskSim. If NO (purely changes colour, glyph, opacity,
+ *   or overlay), it belongs here.
+ *
+ * WHY show_stars DEFAULTS OFF
+ *   Stars are visually busy at the wide-angle sides of the FOV; they
+ *   distract from the photon-ring detail. The user opts in via 'k'
+ *   when they want to see the Einstein-ring magnification effect.
+ */
+typedef struct {
+  int theme;      /* index into g_themes[] (§3). 't' key cycles mod    *
+                   * THEME_N. theme_apply() rebinds CP_* on change.    *
+                   * Default THEME_DEF = 10 (Blackbody).               */
+  int show_stars; /* 1 → render lensed background star field via      *
+                   * star_lookup(). 0 → no stars (default). 'k' key.  */
+} RenderConfig;
 
-static Scene g_scene = {
-    .cam_dist = CAM_DIST_DEF,
-    .tilt_deg = TILT_DEG_DEF,
-    .spin = SPIN_DEF,
-    .disk_ang = 0.0f,
-    .paused = 0,
-    .theme = THEME_DEF,
-    .show_stars = 0,
-    /* .table[] and .clumps[] are BSS-zeroed; populated before first read. */
+/*
+ * Screen — current ncurses window dimensions.
+ *
+ * INTENT
+ *   Single point of truth for "how big is the terminal RIGHT NOW".
+ *   precompute() and render() both consult these to bound their loops
+ *   at  min(rows, MAX_ROWS)  and  min(cols, MAX_COLS) , so the lensing
+ *   table is always indexed safely even when the terminal exceeds the
+ *   compiled-in maximum.
+ *
+ * MUTATION RULE
+ *   Modified only inside screen_init() (at startup) and the main
+ *   loop's resize branch (which calls getmaxyx after SIGWINCH). Never
+ *   changes mid-frame — physics and renderer treat them as immutable
+ *   for one tick.
+ *
+ * RESIZE TRIGGERS A FULL TABLE REBUILD
+ *   Different dimensions ⇒ different pixel-to-ray mapping ⇒ different
+ *   ray outcomes per cell. The resize branch in main() calls
+ *   precompute() to rebuild the table from scratch.
+ */
+typedef struct {
+  int cols; /* terminal width in character cells.  Clamped at indexing *
+             * time by min(cols, MAX_COLS) inside precompute / render. */
+  int rows; /* terminal height in character cells. Same clamp via      *
+             * MAX_ROWS.                                                */
+} Screen;
+
+/*
+ * FrameTimer — main-loop timing bookkeeping.
+ *
+ * INTENT
+ *   Pulls seven loose locals out of main() into one named struct so
+ *   the loop body reads as "measure dt → tick physics → draw → sleep"
+ *   without scattered accumulators.
+ *
+ * TWO TIMING SCALES (this struct holds the state for both)
+ *   (1) RENDER scale — frame_ns = 1e9/RENDER_FPS. Each loop iteration
+ *       paints one frame and sleeps the remainder of frame_ns.
+ *   (2) SIM scale — tick_ns = 1e9/SIM_FPS, FIXED. The dt between
+ *       frames is accumulated in sim_accum; whenever it crosses
+ *       tick_ns, one physics tick is consumed. The sim is therefore
+ *       decoupled from the render rate — slow frame → catch-up
+ *       ticks; fast frame → ticks straddle frames cleanly.
+ *
+ * WHY DECOUPLED (renderer != physics)
+ *   Disk rotation pace must be CONSISTENT regardless of how fast the
+ *   renderer is running. A rigid 1-tick-per-frame would make the disk
+ *   spin slower on slow machines, breaking the gait. Fiedler's
+ *   "Fix Your Timestep!" is the canonical write-up of this pattern.
+ *
+ * WHY A 0.5-SEC ROLLING FPS WINDOW
+ *   Per-frame fps fluctuates wildly. A 0.5-sec window gives a HUD
+ *   reading the human eye can actually read. Shorter = jumpier,
+ *   longer = stale.
+ *
+ * ALGORITHM REFERENCE
+ *   Glenn Fiedler, "Fix Your Timestep!" — accumulator pattern.
+ *   https://gafferongames.com/post/fix_your_timestep/
+ */
+typedef struct {
+  long long tick_ns;    /* one sim-tick budget in nanoseconds.         *
+                         * Computed at boot as 1e9/SIM_FPS = 50 ms.    *
+                         * Read-only after init.                       */
+  long long frame_ns;   /* one render-frame budget in nanoseconds.     *
+                         * Computed at boot as 1e9/RENDER_FPS ≈ 16.7ms.*
+                         * Read-only after init.                       */
+  long long sim_accum;  /* dt accumulator for fixed-timestep physics.  *
+                         * Each frame:  sim_accum += dt; while         *
+                         * sim_accum ≥ tick_ns: tick(); sim_accum -=   *
+                         * tick_ns. Reset on resize / rebuild.         */
+  long long frame_time; /* clock_ns() at the start of the previous     *
+                         * frame. dt_this_frame = now - frame_time.    *
+                         * Capped at 100 ms to prevent spiral-of-death *
+                         * when the process is suspended.              */
+  long long fps_acc;    /* rolling-fps window accumulator (ns).        *
+                         * Resets when it crosses 500 ms.              */
+  int       fps_cnt;    /* frames included in fps_acc.                 *
+                         *   fps = fps_cnt · 1e9 / fps_acc             */
+  float     fps;        /* most recent rolling-window fps value.       *
+                         * Updated ≈ 2× per second; displayed in HUD.  */
+} FrameTimer;
+
+/* ─────────────────────────────────────────────────────────────────────── *
+ *
+ * §6.2 Scene — top-level container
+ *
+ * INTENT
+ *   Single file-static instance (g_scene) owns every long-lived piece
+ *   of program state — camera, disk, renderer, screen, timer, the
+ *   ~3 MB lensing table, the clumps, and the few process-level flags.
+ *   Helpers and main() touch state as `g_scene.<sub>.<field>`; no
+ *   parameter threads more than two levels deep.
+ *
+ * WHY A SINGLE GLOBAL (not passed by pointer)
+ *   The lensing table alone is ~3 MB. Passing &g_scene through every
+ *   helper costs nothing at the call site but the file-static gives
+ *   signal handlers a path to running / need_resize without API
+ *   ceremony. The fields outside table[]/clumps[] are all small
+ *   scalars, so the compiler folds the dereference chain efficiently.
+ *
+ * SUB-STRUCT LAYERING (read these in order to understand the program)
+ *
+ *   1. Camera        what the lensing table was BUILT FROM
+ *   2. DiskSim       what advances each tick (and the pause gate)
+ *   3. RenderConfig  cosmetic skin (theme, stars)
+ *   4. Screen        terminal dimensions
+ *   5. FrameTimer    loop pacing (render + sim timebases)
+ *   6. table[][]     the precomputed lensing cache
+ *   7. clumps[]      orbital hot spots
+ *   8. flags         color256, need_rebuild, running, need_resize
+ *
+ * MUTATION CONTRACT (which keys touch which sub-struct)
+ *
+ *   Camera         + / -    cam_dist           → need_rebuild = 1
+ *                  a / A    tilt_deg           → need_rebuild = 1
+ *   DiskSim        p        paused
+ *                  r        angle = 0          (clumps reseeded too)
+ *                  (per tick) angle += spin
+ *   RenderConfig   t        theme              + theme_apply
+ *                  k        show_stars
+ *   clumps[]       (per tick) Keplerian phi advance
+ *                  r        clumps_init        (full reseed)
+ *   running        q / Q / ESC, SIGINT, SIGTERM
+ *   need_resize    SIGWINCH
+ *
+ *   Camera and DiskSim writes trigger physics-relevant changes.
+ *   RenderConfig writes must NOT (contract enforced by separation).
+ *
+ * INITIALIZATION ORDER (see main())
+ *   1. screen_init   — bring ncurses up, learn rows/cols
+ *   2. set color256  — read COLORS, store the capability flag
+ *   3. theme_apply   — bind CP_* from the default theme
+ *   4. clumps_init   — randomise clump positions/intensities
+ *   5. precompute    — fill the lensing table from camera params
+ *   6. timer.tick_ns, frame_ns, frame_time — seed FrameTimer
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+struct Scene_ {
+  /* — Concept-sized sub-structs (small scalars, grouped by mutation) — */
+  Camera       camera;       /* what was the lensing table BUILT FROM.  *
+                              * Mutating triggers need_rebuild = 1.      *
+                              * See §6.1 Camera doc.                     */
+  DiskSim      disk;         /* per-tick disk animation state +         *
+                              * pause gate. See §6.1 DiskSim doc.        */
+  RenderConfig render;       /* cosmetic flags — never trigger rebuild. *
+                              * See §6.1 RenderConfig doc.               */
+  Screen       screen;       /* current ncurses dimensions. See §6.1    *
+                              * Screen doc.                              */
+  FrameTimer   timer;        /* render + sim timebases + rolling fps.   *
+                              * See §6.1 FrameTimer doc.                 */
+
+  /* — Large data buffers (top-level, no wrapper) ———————————————————— *
+   * Kept at top level so per-pixel indexing reads g_scene.table[r][c]
+   * without an extra .cells / .items layer of noise.                    */
+  Cell  table[MAX_ROWS][MAX_COLS];   /* precomputed ray outcomes —      *
+                                      * populated by precompute(),       *
+                                      * read each frame by render().     *
+                                      * ~3 MB at MAX_ROWS×MAX_COLS.      */
+  Clump clumps[N_CLUMPS];            /* orbital hot spots — populated   *
+                                      * by clumps_init(), advanced each *
+                                      * sim tick by clumps_tick().       */
+
+  /* — Process / control flags ————————————————————————————————————— */
+  int  color256;     /* 1 iff COLORS >= 256 at startup. Read by         *
+                      * theme_apply() to pick the truecolour or 8-mode  *
+                      * branch. Written ONCE in main(); read-only after.*/
+  int  need_rebuild; /* deferred work — caller sets to 1 when Camera   *
+                      * is mutated; main()'s next iteration runs       *
+                      * precompute() to rebuild the lensing table.     */
+  volatile sig_atomic_t running;     /* main-loop continue flag.       *
+                                      * Cleared by 'q'/Q/ESC, SIGINT,  *
+                                      * or SIGTERM (on_sigint).        *
+                                      * volatile + sig_atomic_t for    *
+                                      * async-signal safety.           */
+  volatile sig_atomic_t need_resize; /* set by SIGWINCH handler        *
+                                      * (on_sigwinch). Main loop reads *
+                                      * + clears it at the top of each *
+                                      * iteration, re-syncs Screen,    *
+                                      * and rebuilds the table.        */
 };
+
+Scene g_scene = {
+    .camera  = { .cam_dist = CAM_DIST_DEF, .tilt_deg = TILT_DEG_DEF },
+    .disk    = { .spin     = SPIN_DEF,     .angle    = 0.0f,
+                 .paused   = 0 },
+    .render  = { .theme    = THEME_DEF,    .show_stars = 0 },
+    .running = 1,
+    /* screen, timer, table, clumps, color256, need_rebuild,
+     * need_resize are BSS-zeroed; populated before first read.        */
+};
+
+static inline int scene_is_256_color(void) { return g_scene.color256; }
 
 /*
  * Geodesic-loop helpers — each one isolates a single step of the
@@ -687,7 +1130,7 @@ static float adaptive_geodesic_step_size(float r) {
  * the geodesic would integrate them through the singularity if we
  * waited for r < r_s exactly.  This is the "captured by BH" criterion.
  */
-static int fell_through_horizon(float r) { return r < BH_R * 0.92f; }
+static int fell_through_horizon(float r) { return r < BH_R * HORIZON_FUDGE; }
 
 /*
  * escaped_to_far_field — has the photon left the gravitational well?
@@ -954,7 +1397,7 @@ static void clumps_init(void) {
 static void clumps_tick(void) {
   for (int i = 0; i < N_CLUMPS; i++) {
     float r = g_scene.clumps[i].r;
-    float omega = sqrtf(0.5f / (r * r * r));
+    float omega = sqrtf(SCHWARZSCHILD_M / (r * r * r));  /* Keplerian Ω(r) */
     g_scene.clumps[i].phi += omega * CLUMP_RATE_SCALE;
     if (g_scene.clumps[i].phi >= (float)(2.0 * M_PI))
       g_scene.clumps[i].phi -= (float)(2.0 * M_PI);
@@ -966,93 +1409,129 @@ static float fclamp(float v, float lo, float hi) {
 }
 
 /*
- * star_lookup — deterministic background-star sampling on the celestial sphere.
+ * Star-field helpers — deterministic background-star sampling on the
+ * celestial sphere, shared by sky_cell_hash / sky_quantise_direction /
+ * classify_star_brightness / star_lookup below.
  *
  * Each R_ESCAPED cell records the direction (esc_th, esc_ph) the photon
- * escaped TO.  In a backward-traced raytrace that's the direction the
+ * escaped TO. In a backward-traced raytrace that's the direction the
  * photon came FROM at infinity — i.e. the celestial-sphere coordinate
  * for the FAR-FIELD background that the cell is looking at.
  *
- * We quantise (th, ph) onto a ~5800-cell sphere grid (30 cells per
- * radian → ~3° per cell) and hash each grid index with a SplitMix-style
- * mix.  The hash determines:
- *   • density gate  (low 8 bits): ~2% of cells contain a star
+ * We quantise (th, ph) onto a ~5800-cell sphere grid (STAR_GRID_PER_RAD
+ * cells per radian → ~3° per cell) and hash each grid index with a
+ * SplitMix-style mix. The hash determines:
+ *   • density gate  (low 8 bits): ~1.6% of cells contain a star
  *   • brightness    (next 8 bits): split into *, +, . classes
  *
- * Lensing is automatic: rays passing near the photon sphere fan their
+ * LENSING IS AUTOMATIC: rays passing near the photon sphere fan their
  * escape directions across a large angular swath, so a small patch of
  * celestial sphere — including stars directly BEHIND the BH — gets
  * magnified into the Einstein-ring zone just outside the shadow.
- *
- * Returns 1 if there is a star at (th, ph); fills *glyph and *attr.
  */
-static int star_lookup(float th, float ph, char *glyph, attr_t *attr) {
-  unsigned int q_th = (unsigned int)(th * 30.0f);
-  unsigned int q_ph = (unsigned int)((ph + (float)M_PI) * 30.0f);
+
+/*
+ * sky_cell_hash — SplitMix-style mix of the celestial-sphere grid
+ * cell (q_th, q_ph). Stable hash → stars stay put in the same grid
+ * cells across frames, so a star "lives" at a fixed direction on
+ * the celestial sphere.
+ */
+static unsigned int sky_cell_hash(unsigned int q_th, unsigned int q_ph) {
   unsigned int h = q_th * 0x9E3779B9u + q_ph * 0xCC9E2D51u;
   h ^= h >> 16;
   h *= 0x85EBCA6Bu;
   h ^= h >> 13;
   h *= 0xC2B2AE35u;
   h ^= h >> 16;
+  return h;
+}
 
-  if ((h & 0xFFu) > 4u)
-    return 0; /* ~2% density */
+/* Quantise (θ, φ) onto the celestial-sphere grid (STAR_GRID_PER_RAD
+ * cells per radian). Used as the hash input AND as the cell identity
+ * a star is anchored to. */
+static void sky_quantise_direction(float th, float ph,
+                                   unsigned int *q_th, unsigned int *q_ph) {
+  *q_th = (unsigned int)(th * STAR_GRID_PER_RAD);
+  *q_ph = (unsigned int)((ph + (float)M_PI) * STAR_GRID_PER_RAD);
+}
 
-  unsigned int b = (h >> 8) & 0xFFu;
-  if (b > 220u) {
-    *glyph = '*';
-    *attr = A_BOLD;
-  } else if (b > 100u) {
-    *glyph = '+';
-    *attr = A_NORMAL;
-  } else {
-    *glyph = '.';
-    *attr = A_NORMAL;
-  }
+/* Brightness class from the hash's second byte. Stars come in three
+ * visual sizes; the threshold split shapes the rarity ratio
+ * (bright > mid > faint at roughly 14% : 47% : 39%). */
+static void classify_star_brightness(unsigned int hash,
+                                     char *glyph, attr_t *attr) {
+  unsigned int b = (hash >> 8) & 0xFFu;
+  if (b > STAR_BRIGHT_THRESH) { *glyph = '*'; *attr = A_BOLD;   }
+  else if (b > STAR_MID_THRESH) { *glyph = '+'; *attr = A_NORMAL; }
+  else                          { *glyph = '.'; *attr = A_NORMAL; }
+}
+
+static int star_lookup(float th, float ph, char *glyph, attr_t *attr) {
+  /* (1) quantise (θ, φ) onto the celestial-sphere grid */
+  unsigned int q_th, q_ph;
+  sky_quantise_direction(th, ph, &q_th, &q_ph);
+
+  /* (2) hash the grid cell to a stable random value */
+  unsigned int h = sky_cell_hash(q_th, q_ph);
+
+  /* (3) density gate — most cells return "empty" (no star here) */
+  if ((h & 0xFFu) > STAR_DENSITY_BUCKET) return 0;
+
+  /* (4) classify the star's brightness from the next hash byte */
+  classify_star_brightness(h, glyph, attr);
   return 1;
 }
 
+/*
+ * disk_char — 9-tier brightness → glyph ramp. Picks the densest
+ * character whose threshold is below the input brightness, so the
+ * disk reads as a continuous gradient even at low colour depth.
+ *
+ * Ramp order: '@' (densest) → '.' (sparsest), Ware (2020) perceptual
+ * brightness ordering.
+ */
+static const struct { float thresh; char glyph; } DISK_GLYPH_RAMP[] = {
+    {0.92f, '@'}, {0.82f, '#'}, {0.70f, '8'},
+    {0.57f, '0'}, {0.45f, 'O'}, {0.33f, 'o'},
+    {0.21f, '+'}, {0.12f, ':'},
+};
+#define DISK_GLYPH_TIERS  (int)(sizeof DISK_GLYPH_RAMP / sizeof DISK_GLYPH_RAMP[0])
+
 static char disk_char(float b) {
-  if (b > 0.92f)
-    return '@';
-  if (b > 0.82f)
-    return '#';
-  if (b > 0.70f)
-    return '8';
-  if (b > 0.57f)
-    return '0';
-  if (b > 0.45f)
-    return 'O';
-  if (b > 0.33f)
-    return 'o';
-  if (b > 0.21f)
-    return '+';
-  if (b > 0.12f)
-    return ':';
+  for (int i = 0; i < DISK_GLYPH_TIERS; i++)
+    if (b > DISK_GLYPH_RAMP[i].thresh) return DISK_GLYPH_RAMP[i].glyph;
   return '.';
 }
 
+/*
+ * disk_pair — 6-tier brightness → colour-pair + attribute. Mirrors the
+ * Theme.{ring, hot, warm, mid, cool, dim} ramp; A_BOLD applied at the
+ * top of each tier where the perceptual jump benefits from it.
+ *
+ * The ring/hot split uses an inner-disk A_BOLD boost (r_norm < 0.25
+ * = inner quarter of the disk) so the innermost ring of hot material
+ * reads brighter than the outer hot band.
+ */
+#define INNER_DISK_BOLD_FRAC  0.25f
+
+static const struct { float thresh; int cp; } DISK_PAIR_RAMP[] = {
+    {0.85f, CP_RING}, {0.67f, CP_HOT},  {0.50f, CP_WARM},
+    {0.33f, CP_MID},  {0.17f, CP_COOL},
+};
+#define DISK_PAIR_TIERS  (int)(sizeof DISK_PAIR_RAMP / sizeof DISK_PAIR_RAMP[0])
+
 static void disk_pair(float b, float r_norm, int *cp, attr_t *a) {
-  if (b > 0.85f) {
-    *cp = CP_RING;
-    *a = A_BOLD;
-  } else if (b > 0.67f) {
-    *cp = CP_HOT;
-    *a = (r_norm < 0.25f) ? A_BOLD : A_NORMAL;
-  } else if (b > 0.50f) {
-    *cp = CP_WARM;
-    *a = A_NORMAL;
-  } else if (b > 0.33f) {
-    *cp = CP_MID;
-    *a = A_NORMAL;
-  } else if (b > 0.17f) {
-    *cp = CP_COOL;
-    *a = A_NORMAL;
-  } else {
-    *cp = CP_DIM;
-    *a = A_NORMAL; /* no A_DIM darkening */
+  for (int i = 0; i < DISK_PAIR_TIERS; i++) {
+    if (b > DISK_PAIR_RAMP[i].thresh) {
+      *cp = DISK_PAIR_RAMP[i].cp;
+      *a  = (i == 0) ? A_BOLD
+                     : (i == 1 && r_norm < INNER_DISK_BOLD_FRAC) ? A_BOLD
+                                                                  : A_NORMAL;
+      return;
+    }
   }
+  *cp = CP_DIM;
+  *a  = A_NORMAL;  /* no A_DIM — would vanish on default background */
 }
 
 /*
@@ -1085,10 +1564,10 @@ static void disk_pair(float b, float r_norm, int *cp, attr_t *a) {
  */
 static float keplerian_doppler_factor(float disk_r, float phi_rotating,
                                       float cos_tilt) {
-  float v_orb = sqrtf(0.5f / disk_r);
-  float beta = -v_orb * cosf(phi_rotating) * cos_tilt;
-  beta = fclamp(beta, -0.95f, 0.95f);
-  return powf((1.f + beta) / (1.f - beta), 1.5f);
+  float v_orb = sqrtf(SCHWARZSCHILD_M / disk_r);
+  float beta  = -v_orb * cosf(phi_rotating) * cos_tilt;
+  beta = fclamp(beta, -DOPPLER_BETA_CLAMP, DOPPLER_BETA_CLAMP);
+  return powf((1.f + beta) / (1.f - beta), DOPPLER_EXPONENT);
 }
 
 /*
@@ -1214,36 +1693,33 @@ static float photon_ring_bloom(float min_r) {
 }
 
 /*
- * paint_photon_ring_pixel — 4-tier brightness selection for the
- * photon-ring bloom.
+ * Photon-ring brightness → glyph + colour table. Each row gives the
+ * minimum bloom intensity required to use that tier's appearance.
  *
- *   rb > 0.85 : '#'  CP_RING + A_BOLD   (peak)
- *   rb > 0.55 : '*'  CP_RING + A_BOLD   (bright halo)
- *   rb > 0.30 : '+'  CP_HOT             (mid halo)
- *   else      : '.'  CP_WARM            (outer fade)
+ *   peak       '#' CP_RING A_BOLD   (mr right at photon sphere)
+ *   bright     '*' CP_RING A_BOLD   (broad halo)
+ *   mid        '+' CP_HOT  A_NORMAL (mid halo)
+ *   fade       '.' CP_WARM A_NORMAL (outer fade — fallthrough)
  */
+static const struct { float thresh; char ch; int cp; attr_t a; }
+    RING_RAMP[] = {
+        {0.85f, '#', CP_RING, A_BOLD  },
+        {0.55f, '*', CP_RING, A_BOLD  },
+        {0.30f, '+', CP_HOT,  A_NORMAL},
+    };
+#define RING_RAMP_TIERS  (int)(sizeof RING_RAMP / sizeof RING_RAMP[0])
+
 static void paint_photon_ring_pixel(int row, int col, float brightness) {
-  int cp;
-  attr_t a;
-  char ch;
-  if (brightness > 0.85f) {
-    cp = CP_RING;
-    a = A_BOLD;
-    ch = '#';
-  } else if (brightness > 0.55f) {
-    cp = CP_RING;
-    a = A_BOLD;
-    ch = '*';
-  } else if (brightness > 0.30f) {
-    cp = CP_HOT;
-    a = A_NORMAL;
-    ch = '+';
-  } else {
-    cp = CP_WARM;
-    a = A_NORMAL;
-    ch = '.';
+  char   ch = '.';
+  int    cp = CP_WARM;
+  attr_t a  = A_NORMAL;
+  for (int i = 0; i < RING_RAMP_TIERS; i++) {
+    if (brightness > RING_RAMP[i].thresh) {
+      ch = RING_RAMP[i].ch; cp = RING_RAMP[i].cp; a = RING_RAMP[i].a;
+      break;
+    }
   }
-  attron(COLOR_PAIR(cp) | a);
+  attron (COLOR_PAIR(cp) | a);
   mvaddch(row, col, (chtype)(unsigned char)ch);
   attroff(COLOR_PAIR(cp) | a);
 }
@@ -1289,7 +1765,7 @@ static void render_disk_cell(const Cell *c, float disk_angle, float cos_tilt,
 
   bright =
       fclamp(bright + accumulate_clump_bumps(c->disk_r, c->disk_phi), 0.f, 1.f);
-  if (bright < 0.07f)
+  if (bright < DISK_MIN_VISIBLE)
     return; /* trim dim outer-disk scatter */
 
   float r_norm = fclamp((c->disk_r - DISK_IN) / (DISK_OUT - DISK_IN), 0.f, 1.f);
@@ -1309,9 +1785,9 @@ static void render_disk_cell(const Cell *c, float disk_angle, float cos_tilt,
  */
 static void render_escaped_cell(const Cell *c, int row, int col,
                                 int show_stars) {
-  if (c->min_r < 4.0f) {
+  if (c->min_r < BLOOM_NEAR_RANGE) {
     float rb = photon_ring_bloom(c->min_r);
-    if (rb > 0.06f) {
+    if (rb > BLOOM_MIN_VISIBLE) {
       paint_photon_ring_pixel(row, col, rb);
       return;
     }
@@ -1379,20 +1855,19 @@ static void render(float disk_angle, int cols, int rows, float cam_dist,
 
 /* ── §9  screen / HUD ───────────────────────────────────────────────────── */
 
-static volatile sig_atomic_t g_run = 1;
-static volatile sig_atomic_t g_resize = 0;
-
+/* Signal handlers flip the volatile sig_atomic_t flags inside g_scene.
+ * Async-signal-safe because the only access is to a sig_atomic_t scalar.*/
 static void on_sigint(int s) {
   (void)s;
-  g_run = 0;
+  g_scene.running = 0;
 }
 static void on_sigwinch(int s) {
   (void)s;
-  g_resize = 1;
+  g_scene.need_resize = 1;
 }
 static void cleanup(void) { endwin(); }
 
-static void screen_init(int *cols, int *rows) {
+static void screen_init(Screen *s) {
   initscr();
   cbreak();
   noecho();
@@ -1400,7 +1875,7 @@ static void screen_init(int *cols, int *rows) {
   keypad(stdscr, TRUE);
   nodelay(stdscr, TRUE);
   typeahead(-1);
-  getmaxyx(stdscr, *rows, *cols);
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
 /*
@@ -1433,147 +1908,210 @@ static void screen_hud(int cols, int rows, float fps, float cam_dist,
 
 /* ── §10  main ───────────────────────────────────────────────────────────── */
 
-int main(void) {
+/* ── §10.1 setup + per-step main-loop helpers ───────────────────────────── */
+
+/* One-shot setup before the loop: signals, ncurses, palette, clumps,
+ * the first lensing table, and the FrameTimer seed. */
+static void scene_setup(void) {
   srand((unsigned)time(NULL));
   atexit(cleanup);
-  signal(SIGINT, on_sigint);
+  signal(SIGINT,   on_sigint);
   signal(SIGWINCH, on_sigwinch);
 
-  int cols, rows;
-  screen_init(&cols, &rows);
+  /* Dependency order: screen → color caps → theme → clumps → lensing. */
+  screen_init(&g_scene.screen);
   start_color();
   use_default_colors();
-  g_256 = (COLORS >= 256);
+  g_scene.color256 = (COLORS >= 256);
 
-  /* All scene state (cam_dist, tilt_deg, spin, disk_ang, paused, theme,
-   * show_stars, table, clumps) now lives in the file-scope g_scene
-   * struct defined in §6.  The Scene docstring explains the sim/
-   * rendering split and which keys mutate each group.
-   *
-   * Main-loop bookkeeping (timing, FPS, the need_rebuild flag) stays
-   * here as local state — it's not physics, not display, just loop
-   * pacing. */
-  theme_apply(g_scene.theme);
+  theme_apply(g_scene.render.theme);
   clumps_init();
   erase();
-  precompute(cols, rows, g_scene.cam_dist, g_scene.tilt_deg);
+  precompute(g_scene.screen.cols, g_scene.screen.rows,
+             g_scene.camera.cam_dist, g_scene.camera.tilt_deg);
 
-  long long tick_ns = 1000000000LL / SIM_FPS;
-  long long frame_ns = 1000000000LL / RENDER_FPS;
-  long long sim_accum = 0;
-  long long frame_time = clock_ns();
-  long long fps_acc = 0;
-  int fps_cnt = 0;
-  float fps = 0.f;
-  int need_rebuild = 0;
+  /* FrameTimer seed (other fields are BSS-zeroed). */
+  g_scene.timer.tick_ns    = 1000000000LL / SIM_FPS;
+  g_scene.timer.frame_ns   = 1000000000LL / RENDER_FPS;
+  g_scene.timer.frame_time = clock_ns();
+}
 
-  while (g_run) {
+/* Resize OR camera-mutation rebuild — both go through the same code
+ * path: re-read terminal size and rebuild the lensing table from
+ * scratch (cheap, ~0.3-0.8 s, only triggered by user action). */
+static void scene_handle_resize_or_rebuild(void) {
+  g_scene.need_resize  = 0;
+  g_scene.need_rebuild = 0;
+  endwin();
+  refresh();
+  getmaxyx(stdscr, g_scene.screen.rows, g_scene.screen.cols);
+  erase();
+  precompute(g_scene.screen.cols, g_scene.screen.rows,
+             g_scene.camera.cam_dist, g_scene.camera.tilt_deg);
+  g_scene.timer.sim_accum  = 0;
+  g_scene.timer.frame_time = clock_ns();
+}
 
-    /* ── resize ── */
-    if (g_resize || need_rebuild) {
-      g_resize = 0;
-      need_rebuild = 0;
-      endwin();
-      refresh();
-      getmaxyx(stdscr, rows, cols);
-      erase();
-      precompute(cols, rows, g_scene.cam_dist, g_scene.tilt_deg);
-      sim_accum = 0;
-      frame_time = clock_ns();
-    }
+/* Wall-clock dt since the previous frame, capped to DT_CAP_NS so a
+ * stalled process can't dump a giant catch-up burst into the sim. */
+static long long frame_measure_dt(void) {
+  long long now = clock_ns();
+  long long dt  = now - g_scene.timer.frame_time;
+  if (dt > DT_CAP_NS) dt = DT_CAP_NS;
+  g_scene.timer.frame_time = now;
+  return dt;
+}
 
-    /* ── dt ── */
-    long long now = clock_ns();
-    long long dt = now - frame_time;
-    if (dt > 100000000LL)
-      dt = 100000000LL;
-    frame_time = now;
+/* Fixed-timestep sim advance — accumulate dt and consume one full
+ * sim tick whenever the accumulator crosses tick_ns. Decouples disk
+ * pace from render fps. */
+static void scene_advance_physics(long long dt) {
+  if (g_scene.disk.paused) return;
+  FrameTimer *tm = &g_scene.timer;
+  tm->sim_accum += dt;
+  while (tm->sim_accum >= tm->tick_ns) {
+    g_scene.disk.angle += g_scene.disk.spin;
+    if (g_scene.disk.angle >= (float)(2.0 * M_PI))
+      g_scene.disk.angle -= (float)(2.0 * M_PI);
+    clumps_tick();          /* Keplerian flow of hot spots */
+    tm->sim_accum -= tm->tick_ns;
+  }
+}
 
-    /* ── physics ── */
-    if (!g_scene.paused) {
-      sim_accum += dt;
-      while (sim_accum >= tick_ns) {
-        g_scene.disk_ang += g_scene.spin;
-        if (g_scene.disk_ang >= (float)(2.0 * M_PI))
-          g_scene.disk_ang -= (float)(2.0 * M_PI);
-        clumps_tick(); /* Keplerian flow of hot spots */
-        sim_accum -= tick_ns;
-      }
-    }
+/* Rolling-window fps update — refreshes fps_display ~2× per second. */
+static void frame_tick_fps(long long dt) {
+  FrameTimer *tm = &g_scene.timer;
+  tm->fps_acc += dt;
+  tm->fps_cnt++;
+  if (tm->fps_acc >= FPS_WINDOW_NS) {
+    tm->fps     = (float)tm->fps_cnt * 1e9f / (float)tm->fps_acc;
+    tm->fps_acc = 0;
+    tm->fps_cnt = 0;
+  }
+}
 
-    /* ── FPS ── */
-    fps_acc += dt;
-    fps_cnt++;
-    if (fps_acc >= 500000000LL) {
-      fps = (float)fps_cnt * 1e9f / (float)fps_acc;
-      fps_acc = 0;
-      fps_cnt = 0;
-    }
+/* erase → render → HUD → present. Reads scene state, writes ncurses. */
+static void scene_draw_one_frame(void) {
+  erase();
+  render(g_scene.disk.angle,
+         g_scene.screen.cols,  g_scene.screen.rows,
+         g_scene.camera.cam_dist, g_scene.camera.tilt_deg,
+         g_scene.render.show_stars);
+  screen_hud(g_scene.screen.cols, g_scene.screen.rows, g_scene.timer.fps,
+             g_scene.camera.cam_dist, g_scene.camera.tilt_deg,
+             g_scene.render.theme,    g_scene.disk.paused);
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
-    /* ── draw ── */
-    long long t0 = clock_ns();
-    erase();
-    render(g_scene.disk_ang, cols, rows, g_scene.cam_dist, g_scene.tilt_deg,
-           g_scene.show_stars);
-    screen_hud(cols, rows, fps, g_scene.cam_dist, g_scene.tilt_deg,
-               g_scene.theme, g_scene.paused);
-    wnoutrefresh(stdscr);
-    doupdate();
+/* Sleep the remainder of frame_ns so we hit RENDER_FPS regardless of
+ * how fast the rest of the frame ran. frame_start_ns marks the start
+ * of the work we want to budget. */
+static void frame_cap_to_target_fps(long long frame_start_ns) {
+  clock_sleep_ns(g_scene.timer.frame_ns - (clock_ns() - frame_start_ns));
+}
 
-    /* ── input ── */
-    int ch = getch();
-    switch (ch) {
-    case 'q':
-    case 'Q':
-    case 27:
-      g_run = 0;
-      break;
-    case 'p':
-    case 'P':
-      g_scene.paused = !g_scene.paused;
-      break;
-    case 'r':
-    case 'R':
-      g_scene.disk_ang = 0.f;
-      clumps_init(); /* reseed flowing knots */
-      break;
-    case 't':
-    case 'T':
-      g_scene.theme = (g_scene.theme + 1) % THEME_N;
-      theme_apply(g_scene.theme);
-      break;
-    case '+':
-    case '=':
-      /* closer camera → bigger Gargantua on screen */
-      g_scene.cam_dist =
-          fclamp(g_scene.cam_dist - CAM_DIST_STEP, CAM_DIST_MIN, CAM_DIST_MAX);
-      need_rebuild = 1;
-      break;
-    case '-':
-      /* farther camera → smaller Gargantua on screen */
-      g_scene.cam_dist =
-          fclamp(g_scene.cam_dist + CAM_DIST_STEP, CAM_DIST_MIN, CAM_DIST_MAX);
-      need_rebuild = 1;
-      break;
-    case 'a':
-      /* more tilt → more face-on */
-      g_scene.tilt_deg =
-          fclamp(g_scene.tilt_deg + TILT_DEG_STEP, TILT_DEG_MIN, TILT_DEG_MAX);
-      need_rebuild = 1;
-      break;
-    case 'A':
-      /* less tilt → more edge-on */
-      g_scene.tilt_deg =
-          fclamp(g_scene.tilt_deg - TILT_DEG_STEP, TILT_DEG_MIN, TILT_DEG_MAX);
-      need_rebuild = 1;
-      break;
-    case 'k':
-    case 'K':
-      g_scene.show_stars = !g_scene.show_stars;
-      break;
-    }
+/* ── §10.2 keyboard action handlers ─────────────────────────────────────── */
 
-    clock_sleep_ns(frame_ns - (clock_ns() - t0));
+/* Spacebar / 'p' — pause/resume the simulation (renderer keeps running). */
+static void key_pause_toggle(void) {
+  g_scene.disk.paused = !g_scene.disk.paused;
+}
+
+/* 'r' — reset disk angle and reseed clump positions. */
+static void key_reset_disk(void) {
+  g_scene.disk.angle = 0.0f;
+  clumps_init();
+}
+
+/* 't' — cycle theme and rebind CP_RING..CP_DIM. */
+static void key_cycle_theme(void) {
+  g_scene.render.theme = (g_scene.render.theme + 1) % THEME_N;
+  theme_apply(g_scene.render.theme);
+}
+
+/* '+' / '-' — nudge camera distance (smaller dist = closer = bigger
+ * Gargantua). Either change triggers a full lensing-table rebuild. */
+static void key_camera_zoom(float delta) {
+  g_scene.camera.cam_dist = fclamp(g_scene.camera.cam_dist + delta,
+                                   CAM_DIST_MIN, CAM_DIST_MAX);
+  g_scene.need_rebuild = 1;
+}
+
+/* 'a' / 'A' — nudge camera tilt (more = more face-on annular view).
+ * Rebuilds lensing table. */
+static void key_camera_tilt(float delta) {
+  g_scene.camera.tilt_deg = fclamp(g_scene.camera.tilt_deg + delta,
+                                   TILT_DEG_MIN, TILT_DEG_MAX);
+  g_scene.need_rebuild = 1;
+}
+
+/* 'k' — toggle lensed background star field. */
+static void key_toggle_stars(void) {
+  g_scene.render.show_stars = !g_scene.render.show_stars;
+}
+
+/* Read one queued keystroke (non-blocking) and dispatch to its named
+ * action. Each case is one helper call; the switch reads as the keymap. */
+static void scene_handle_one_keystroke(void) {
+  switch (getch()) {
+  case 'q': case 'Q': case 27 /* ESC */: g_scene.running = 0;       break;
+  case 'p': case 'P':                    key_pause_toggle();        break;
+  case 'r': case 'R':                    key_reset_disk();          break;
+  case 't': case 'T':                    key_cycle_theme();         break;
+  case '+': case '=':                    key_camera_zoom(-CAM_DIST_STEP); break;
+  case '-':                              key_camera_zoom(+CAM_DIST_STEP); break;
+  case 'a':                              key_camera_tilt(+TILT_DEG_STEP); break;
+  case 'A':                              key_camera_tilt(-TILT_DEG_STEP); break;
+  case 'k': case 'K':                    key_toggle_stars();        break;
+  default:                                                          break;
+  }
+}
+
+/* ── §10.3 main ─────────────────────────────────────────────────────────── *
+ *
+ * Reads as the program's lifecycle:
+ *
+ *   SETUP:
+ *     scene_setup() — signals, ncurses, palette, clumps, lensing table,
+ *                     FrameTimer seed.
+ *
+ *   LOOP (each frame):
+ *     1. handle pending resize or camera-rebuild
+ *     2. measure wall-clock dt (capped)
+ *     3. advance physics (fixed-timestep sim catches up via accumulator)
+ *     4. tick rolling-fps window
+ *     5. draw the scene
+ *     6. dispatch one keystroke
+ *     7. sleep to hit RENDER_FPS
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+int main(void) {
+  scene_setup();
+
+  while (g_scene.running) {
+    /* (1) deferred work — resize or rebuild lensing table */
+    if (g_scene.need_resize || g_scene.need_rebuild)
+      scene_handle_resize_or_rebuild();
+
+    /* (2) frame timing */
+    long long dt = frame_measure_dt();
+
+    /* (3) advance physics (no-op if paused) */
+    scene_advance_physics(dt);
+
+    /* (4) rolling fps for HUD */
+    frame_tick_fps(dt);
+
+    /* (5) draw — render() + HUD + present */
+    long long frame_start = clock_ns();
+    scene_draw_one_frame();
+
+    /* (6) handle one queued keystroke */
+    scene_handle_one_keystroke();
+
+    /* (7) sleep to target frame rate */
+    frame_cap_to_target_fps(frame_start);
   }
 
   endwin();

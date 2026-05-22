@@ -1,5 +1,7 @@
 These are well formatted code wise
 
+## Completed
+
 raytracer/
 raymarcher/
 raster/
@@ -13,9 +15,16 @@ flocking/
 matrix_rain/
 robots/
 Ai/
- 
+fluid/
+turtle/
+
+## Pending
+
+artistic/
+geometry/
+procedural/
+
  completed rest start from scratch
 
  We are learning not refactoring. make it count
- 
 

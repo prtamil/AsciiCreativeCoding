@@ -21,11 +21,11 @@
  *   §1  config
  *   §2  clock
  *   §3  color
- *   §4  coords   — aspect-ratio correction (CELL_W/CELL_H ≈ 0.5)
- *   §5  entity   — Turtle struct + tick + draw
- *   §6  scene
- *   §7  screen
- *   §8  app
+ *   §4  coords    — aspect-ratio correction (CELL_W/CELL_H ≈ 0.5)
+ *   §5  entity    — Polygon + Pen composed into Turtle; tick + draw
+ *   §6  scene     — turtle pair tick / draw helpers
+ *   §7  screen    — Screen + FrameTimer + Scene container; HUD bars
+ *   §8  app       — signals, key handling, main loop
  * ─────────────────────────────────────────────────────────────────────
  *
  * Keys:
@@ -61,13 +61,50 @@
  *                  edge index advances and the timer resets.  Speed is
  *                  controlled by edges_per_second (eps), adjustable via +/-.
  *
- * References     :
- *   Papert, "Mindstorms: Children, Computers, and Powerful Ideas" (1980)
- *     — the original LOGO turtle, source of the abstraction.
- *   Wikipedia, "Turtle graphics" — formal definition + history.
- *     https://en.wikipedia.org/wiki/Turtle_graphics
- *   Wikipedia, "Regular polygon" — exterior angle = 2π/n derivation.
- *     https://en.wikipedia.org/wiki/Regular_polygon
+ * References     : grouped by the concepts this file teaches. Seven
+ *                  entries — one or two strong picks per topic.
+ *
+ *   ── Turtle graphics (the abstraction this file animates) ─────────
+ *   Papert, "Mindstorms: Children, Computers, and Powerful Ideas"
+ *     (Basic Books, 1980). The original LOGO turtle and the
+ *     foundational text on the pen-with-heading abstraction this
+ *     file builds on.
+ *   Abelson & diSessa, "Turtle Geometry: The Computer as a Medium for
+ *     Exploring Mathematics" (MIT Press, 1981). The canonical book on
+ *     turtle-graphics MATH — covers regular polygons, curves,
+ *     differential geometry by turtle. Chapter 1's "POLY" procedure
+ *     is essentially what duo_poly.c animates.
+ *
+ *   ── Regular polygons (the shapes the turtles draw) ───────────────
+ *   Coxeter, "Regular Polytopes" (Dover, 3rd ed., 1973). The
+ *     canonical reference on regular polygons and their
+ *     higher-dimensional cousins. Chapter 1 covers planar regular
+ *     polygons — the 2π/n exterior-angle derivation that drives the
+ *     turtle's "walk, turn 2π/n, repeat" recipe.
+ *
+ *   ── Line rasterisation (§5 put_seg) ──────────────────────────────
+ *   Newman & Sproull, "Principles of Interactive Computer Graphics"
+ *     (McGraw-Hill, 2nd ed., 1979) ch. 2. The textbook treatment of
+ *     DDA (Digital Differential Analyzer) line drawing — exactly
+ *     what put_seg() implements (step along major axis, interpolate
+ *     the minor).
+ *   Bresenham, "Algorithm for computer control of a digital plotter"
+ *     (IBM Systems Journal 4(1):25–30, 1965). The integer-only
+ *     alternative to DDA. This file uses DDA for simplicity;
+ *     Bresenham is the standard comparison.
+ *
+ *   ── Rendering (§3, §6, §7) ───────────────────────────────────────
+ *   Padala, "NCURSES Programming HOWTO" (The Linux Documentation
+ *     Project). Practical reference for the ncurses API used in
+ *     §3 (color_init) and §7 (mvwaddch, attron, A_BOLD).
+ *     https://tldp.org/HOWTO/NCURSES-Programming-HOWTO/
+ *
+ *   ── Game loop & numerical timing (§8 main loop) ──────────────────
+ *   Fiedler ("Gaffer on Games"), "Fix Your Timestep!" (2004). The
+ *     fixed-timestep accumulator pattern in main() — explains why a
+ *     separate sim_fps from render fps keeps the turtle's drawing
+ *     pace consistent regardless of frame rate.
+ *     https://gafferongames.com/post/fix_your_timestep/
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -82,35 +119,6 @@
  * times."  The turtle never needs to know it's drawing a polygon
  * — the geometry is in the angle.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a person with a pen on graph paper.  They walk one step,
- * turn 120°, walk another step, turn 120°, walk a third step, turn
- * 120°.  After three steps + three turns they're back where they
- * started, facing the original direction — they drew an equilateral
- * triangle without ever planning a triangle.  Same recipe with 90°
- * turns gives a square; with 72° a pentagon; with 30° a dodecagon.
- *
- * The TURNING ANGLE is what controls the shape.  Lower angle =
- * gentler turn = more sides before you close the loop = bigger
- * polygon.  In the limit (angle → 0), the polygon becomes a circle.
- *
- * GEOMETRY DIAGRAM
- * ────────────────
- *
- *      walk →                turn 2π/n
- *
- *      ●─────●                 ●
- *       \                       \
- *        \         turn 2π/n     \
- *         ●                       ●
- *          \      ⇒                \
- *           \                       ●─────●
- *            ●                       ↑
- *             \                  closes the loop after
- *              ●                 n edges + n turns
- *
- *      One edge per tick.  After n ticks, the polygon is complete.
  *
  * ALGORITHM IN STEPS  (per tick, per turtle)
  * ─────────────────────────────────────────
@@ -144,69 +152,6 @@
  *       col = x1 + i·dx/n_steps
  *       row = y1 + i·dy/n_steps
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • ASPECT correction.  Without scaling sin θ by 0.5, a hexagon
- *     looks vertically stretched — terminal cells are ~2:1 tall:wide.
- *     §4 coords applies the correction in one place; everything
- *     downstream is in plain cell coordinates.
- *   • Side-count change mid-draw.  Pressing 'a'/'z' or 's'/'x'
- *     RESETS the affected turtle (clears its current polygon and
- *     starts over with the new side count).  Otherwise the partial
- *     polygon would have stale vertices.
- *   • Both turtles are on independent edge timers — the side counts
- *     can differ (3 + 7, 5 + 11, etc.).  When BOTH finish, the
- *     2-second auto-reset fires for both.
- *   • DDA line glyph picking: the line glyph is decided ONCE per
- *     edge (from the edge's overall direction), not per cell.
- *     Within an edge every cell uses the same glyph.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Default state: turtle A draws a triangle (3 edges over ~2 sec
- *     at eps=1.5), turtle B draws a pentagon (5 edges over ~3.3 sec).
- *     Both pause 2 sec on completion, then advance: A → square,
- *     B → hexagon.
- *   • Press 'a' once.  Turtle A's side count rises by 1; A immediately
- *     resets and starts redrawing with the new count.  Edge count
- *     in the HUD matches.
- *   • Press '+' until eps hits its max (12).  Drawing speed scales
- *     proportionally; a 12-gon takes ~1 sec at eps=12.
- *   • Pause with space.  Both turtles freeze mid-edge; resume with
- *     space and they pick up exactly where they stopped.
- *   • Eyeball test: with n=12, the dodecagon should look round
- *     (not vertically squashed).  Confirms ASPECT correction works.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose.  This is the only file in turtle/.  No prior
- *      knowledge required beyond basic trigonometry (cos / sin /
- *      angle = 2π/n) and a fixed-step main loop.
- *   2. §5 entity — Turtle struct + tick + draw + line walker.
- *      THE HEART of the file.  Read AFTER tutorials T1-T6 below.
- *   3. §4 coords — pixel↔cell mapping with ASPECT correction.
- *      Small but load-bearing — the entire visual depends on it.
- *   4. §6 scene — orchestrator: two turtles, side-count input,
- *      simultaneous reset on completion.
- *   5. §1-§3, §7-§8 — config / clock / colour / screen / app loop.
- *      Skim if you've seen the framework.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   sides              regular polygon side count (3..12 here)
- *   edge_index, k      which edge is currently being drawn (0..n-1)
- *   edge_timer         seconds until the next edge advance
- *   eps                edges per second (drawing speed)
- *   ASPECT             0.5 — terminal cell aspect compensator
- *   vertex[]           cached cell positions for current polygon's n+1
- *                      vertices (last == first to close the loop)
- *   done               bool — has this turtle completed its polygon?
- *   done_timer         seconds since DONE; triggers reset at RESET_DELAY
  *
  * Background you need
  * ───────────────────
@@ -221,235 +166,6 @@
  *   - Bezier / spline curves.  Regular polygons only.
  *   - Subpixel anti-aliasing.  Cell-grid output, no smoothing.
  *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Six tutorials that build a polygon-drawing turtle from first
- * principles.
- *
- *   T1  What is a "turtle"?  Pen + heading + two verbs
- *   T2  Regular polygons via the exterior-angle theorem
- *   T3  Computing vertices analytically (cheaper than turtle stepping)
- *   T4  ASPECT correction — why hexagons need a y-squash
- *   T5  DDA line walking with directional ASCII glyphs
- *   T6  One edge per tick — animating an algorithm
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  WHAT IS A "TURTLE"?  PEN + HEADING + TWO VERBS
- * ──────────────────────────────────────────────────
- * Seymour Papert (LOGO, 1967) introduced the TURTLE — an
- * abstraction with two pieces of state:
- *
- *     position   (x, y)        where am I?
- *     heading    θ             which direction am I facing?
- *
- * And two verbs:
- *
- *     forward(d)               walk distance d in direction θ;
- *                              (x, y) += d · (cos θ, sin θ)
- *     turn(angle)              rotate heading by angle;
- *                              θ += angle
- *
- * If the pen is DOWN, walking draws a line.  That's it.  No
- * coordinates to compute, no shape definitions, no "draw a
- * polygon" command.  Complex shapes emerge from sequencing
- * forward + turn.
- *
- * The pedagogical genius: a 7-year-old who has WALKED can
- * understand what the turtle does.  No abstraction barrier.
- *
- * In this file, we use the IDEA of a turtle but COMPUTE the
- * vertex positions directly (T3) rather than stepping the turtle
- * vertex-by-vertex.  That's faster and avoids cumulative angle
- * drift over many sides.  But the conceptual model — pen,
- * heading, walk — still applies to the rendering.
- *
- * T2  REGULAR POLYGONS VIA THE EXTERIOR-ANGLE THEOREM
- * ───────────────────────────────────────────────────
- * Question: what sequence of forward + turn produces a regular
- * n-gon (equilateral, equiangular)?
- *
- * The EXTERIOR ANGLE of a regular n-gon is the angle the
- * turtle turns at each vertex.  It must satisfy:
- *
- *     n · α = 2π        (after n turns, total rotation = 1 full circle)
- *     α = 2π / n
- *
- * Examples:
- *
- *     n = 3:  α = 120°    (equilateral triangle)
- *     n = 4:  α = 90°     (square)
- *     n = 5:  α = 72°     (regular pentagon)
- *     n = 6:  α = 60°     (regular hexagon)
- *     n = 8:  α = 45°     (regular octagon)
- *     n = 12: α = 30°     (regular dodecagon)
- *
- * The recipe:
- *
- *     repeat n times:
- *       forward(side_length)
- *       turn(2π / n)
- *
- * After n iterations, the turtle is back at its start, facing
- * its original direction.  The drawn path is a closed regular
- * n-gon.
- *
- * Two important variations:
- *
- *   - LEFT vs RIGHT turn determines the polygon's WINDING
- *     (clockwise vs counter-clockwise).  In screen coordinates
- *     (y down), turning by +α is clockwise.
- *   - Halving the angle (α = π/n) gives a STAR POLYGON instead
- *     of a regular polygon — try it as an exercise.
- *
- * T3  COMPUTING VERTICES ANALYTICALLY
- * ───────────────────────────────────
- * Stepping the turtle "forward, turn, forward, turn..." works
- * but accumulates floating-point error in the heading.  After
- * 12 turns of 30°, you might end at 360.001°, leaving the polygon
- * not quite closed.  And the turtle has to be "stepped" to
- * reach each vertex.
- *
- * Cleaner: compute every vertex directly from a circle equation.
- * Inscribe the polygon in a circle of radius R centred at (cx, cy):
- *
- *     for k in 0..n-1:
- *       θ_k = θ_0 + k · (2π / n)
- *       vertex[k].x = cx + R · cos(θ_k)
- *       vertex[k].y = cy + R · sin(θ_k)
- *
- * (Plus θ_0 = -π/2 if you want vertex 0 at the top.)
- *
- * Properties:
- *
- *   - Every vertex is computed independently — no cumulative drift.
- *   - You can ask "where will the turtle be after edge 7?" with one
- *     trig call, no need to simulate edges 0-6.
- *   - The polygon is GUARANTEED closed: vertex[n] = vertex[0]
- *     exactly.
- *
- * §5 turtle_compute_vertices does this once when the side count
- * changes; per-frame just walks the cached vertex array.
- *
- * The "turtle" abstraction is preserved at RENDER TIME: each
- * edge is drawn as if the turtle walked from vertex[k] to
- * vertex[k+1].  The pen's heading for that edge picks the line
- * glyph (T5).
- *
- * T4  ASPECT CORRECTION — WHY HEXAGONS NEED A Y-SQUASH
- * ────────────────────────────────────────────────────
- * Terminal cells are NOT square.  A typical monospace font cell
- * is roughly TWICE AS TALL as it is wide.  If we plot
- *
- *     vertex.x = cx + R · cos θ
- *     vertex.y = cy + R · sin θ          ← naïve
- *
- * the result LOOKS LIKE A VERTICAL ELLIPSE — taller than wide
- * by ~2×.  A "regular" hexagon ends up squashed sideways.
- *
- * Fix: multiply the y-component by an aspect compensator:
- *
- *     vertex.y = cy + R · sin θ · ASPECT
- *
- * Where ASPECT ≈ cell_width / cell_height ≈ 8 / 16 = 0.5.
- * Tune empirically — 0.5 is a good default for most monospace
- * fonts; some "tall" fonts want 0.45.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │  no aspect correction:    with ASPECT = 0.5:     │
- *      │                                                  │
- *      │       . . .                       .              │
- *      │     .       .                  .  .  .           │
- *      │    .         .                .       .          │
- *      │    .         .                .       .          │
- *      │     .       .                  .  .  .           │
- *      │       . . .                       .              │
- *      │                                                  │
- *      │  vertical egg                  round-ish         │
- *      └──────────────────────────────────────────────────┘
- *
- * Same trick is used in artistic/hindu_mandalas.c and any
- * cell-space radial rendering.
- *
- * T5  DDA LINE WALKING WITH DIRECTIONAL ASCII GLYPHS
- * ──────────────────────────────────────────────────
- * Given two vertex cells (x1, y1) and (x2, y2), we need to
- * paint EVERY CELL the line crosses with a glyph that hints
- * at the line's direction.
- *
- * DDA (Digital Differential Analyzer) is the simplest line
- * algorithm:
- *
- *     dx = x2 - x1
- *     dy = y2 - y1
- *     n_steps = max(|dx|, |dy|)
- *     step_x = dx / n_steps
- *     step_y = dy / n_steps
- *     for i in 0..n_steps:
- *       paint cell at (x1 + i·step_x, y1 + i·step_y)
- *
- * Variants like Bresenham's avoid float arithmetic; for our
- * scale DDA is plenty fast and easier to read.
- *
- * GLYPH PICKING from (dx, dy):
- *
- *     |dx| ≫ |dy|   →   '-'    (mostly horizontal)
- *     |dy| ≫ |dx|   →   '|'    (mostly vertical)
- *     dx, dy same sign   →   '\\'   (NW to SE in screen coords)
- *     dx, dy opposite    →   '/'    (SW to NE in screen coords)
- *
- * The glyph is decided ONCE per edge (from edge's overall
- * direction) and stamped at every cell along the way.  This
- * gives clean, consistent line segments.
- *
- * Within-edge glyph variation (e.g. picking glyph PER CELL
- * based on local slope) would add noise without improving
- * legibility — straight edges should look straight.
- *
- * T6  ONE EDGE PER TICK — ANIMATING AN ALGORITHM
- * ──────────────────────────────────────────────
- * The polygon could be drawn instantly, but watching it appear
- * EDGE BY EDGE is the pedagogical point of a turtle.  The
- * animation IS the algorithm.
- *
- * State machine per turtle:
- *
- *     edge_index k = 0
- *     edge_timer  = 1 / eps   ← seconds until next edge
- *
- *     each frame (with dt = frame time, scene paused or not):
- *       if turtle.done:
- *         done_timer += dt
- *         if done_timer >= RESET_DELAY:
- *           reset polygon (advance side count, k = 0)
- *         continue
- *
- *       edge_timer -= dt
- *       if edge_timer <= 0:
- *         draw edge from vertex[k] to vertex[k+1]
- *         k += 1
- *         if k == n:
- *           turtle.done = true
- *         edge_timer = 1 / eps
- *
- * The DRAWING happens in one chunk (all cells of edge k stamped
- * at once when the timer expires).  An alternative would be
- * SUB-EDGE animation — paint cell by cell during edge k's
- * window — for an even smoother visual.  We keep it edge-at-a-
- * time because the edge BOUNDARY clicks (vertex landings) are
- * the most visually informative moments.
- *
- * Same pattern as algorithms/sort_vis.c (one operation per
- * tick) and procedural/generational/maze.c (one cell carved
- * per tick).  Animation = state machine that emits one
- * EVENT per tick.
- *
- * Two turtles run in parallel using TWO INDEPENDENT timers.
- * They can have different side counts and finish at different
- * times.  When both are done, RESET_DELAY fires for both
- * simultaneously and they advance to their next polygons.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -490,11 +206,38 @@ enum {
 #define EPS_DEFAULT   1.5f   /* edges per second (default drawing speed) */
 #define EPS_MIN       0.3f
 #define EPS_MAX      12.0f
+#define EPS_SCALE_FACTOR 1.5f /* + / - keys scale eps geometrically by this */
 #define RESET_DELAY   2.0f   /* seconds to wait after both polygons done */
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
+
+/* ── §1.1 layout fractions (turtle placement on screen) ────────── */
+
+/* The two halves sit at cols * X_FRAC. 0.25 puts the left turtle in
+ * the centre of the left half; 0.75 the right half. */
+#define HALF_LEFT_X_FRAC   0.25f
+#define HALF_RIGHT_X_FRAC  0.75f
+
+/* Polygon radius is the smaller of two bounds (per half-screen):
+ *      x-bound: cols  * POLY_MAX_R_X_FRAC      → margin from divider
+ *      y-bound: rows  * POLY_MAX_R_Y_FRAC / ASPECT
+ *                                              → cell-aspect corrected
+ * Then scaled by POLY_R_FIT_FRAC for breathing room around the label
+ * row and bottom hint strip. */
+#define POLY_MAX_R_X_FRAC  0.21f
+#define POLY_MAX_R_Y_FRAC  0.40f
+#define POLY_R_FIT_FRAC    0.85f
+
+/* ── §1.2 main-loop pacing ─────────────────────────────────────── */
+
+#define RENDER_FPS         60
+#define RENDER_FRAME_NS    (NS_PER_SEC / RENDER_FPS)
+
+/* Cap dt at 100 ms so a process suspension can't dump a huge catch-
+ * up burst of sim ticks (spiral-of-death prevention). */
+#define DT_CAP_NS          (100 * NS_PER_MS)
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -523,34 +266,67 @@ static void clock_sleep_ns(int64_t ns)
 
 /*
  * Color pairs:
- *   1 → cyan      (turtle A edges + label)
- *   2 → magenta   (turtle B edges + label)
- *   3 → yellow    (HUD, completion notice)
- *   4 → green     (polygon names)
- *   5 → red       (DONE flash)
- *   6 → blue      (hint bar, divider)
- *   7 → white     (turtle @ head)
+ *   1  → cyan      (turtle A edges + label)
+ *   2  → magenta   (turtle B edges + label)
+ *   3  → yellow    (DONE / completion banner)
+ *   4  → green     (polygon names)
+ *   5  → red       (reserved, currently unused)
+ *   6  → blue      (vertical divider between halves)
+ *   7  → white     (turtle @ head)
+ *
+ * HUD chrome (canonical CLAUDE.md two-bar spec — on DEFAULT background
+ * so the bars stay legible against any animation, with A_BOLD never A_DIM):
+ *   8  → bright yellow on default bg  (top status row 0)
+ *   9  → bright cyan   on default bg  (bottom hint row last)
  */
+#define PAIR_TURTLE_A      1
+#define PAIR_TURTLE_B      2
+#define PAIR_DONE          3
+#define PAIR_POLY_NAME     4
+#define PAIR_FLASH         5
+#define PAIR_DIVIDER       6
+#define PAIR_HEAD          7
+#define PAIR_HUD           8
+#define PAIR_HINT          9
+
+/*
+ * Palette table — each row is one role mapped to its 256-mode and
+ * 8-mode foreground codes plus its background. HUD chrome (PAIR_HUD /
+ * PAIR_HINT) explicitly uses default background per CLAUDE.md HUD
+ * spec; everything else uses COLOR_BLACK for the on-canvas roles.
+ *
+ * Reading this table top-to-bottom gives the full palette in one
+ * glance — no parallel 256/8-mode branches to keep mentally in sync.
+ */
+typedef struct {
+    short pair;     /* PAIR_* id from §3                              */
+    short fg256;    /* foreground when COLORS >= 256                  */
+    short fg8;      /* foreground in 8-colour fallback                */
+    short bg;       /* background (COLOR_BLACK for canvas, -1 for HUD)*/
+} PaletteEntry;
+
+static const PaletteEntry PALETTE[] = {
+    /* pair             256   8-fallback        bg          role     */
+    { PAIR_TURTLE_A,     51,  COLOR_CYAN,    COLOR_BLACK }, /* cyan        */
+    { PAIR_TURTLE_B,    201,  COLOR_MAGENTA, COLOR_BLACK }, /* magenta     */
+    { PAIR_DONE,        226,  COLOR_YELLOW,  COLOR_BLACK }, /* yellow      */
+    { PAIR_POLY_NAME,    46,  COLOR_GREEN,   COLOR_BLACK }, /* green       */
+    { PAIR_FLASH,       196,  COLOR_RED,     COLOR_BLACK }, /* red         */
+    { PAIR_DIVIDER,      33,  COLOR_BLUE,    COLOR_BLACK }, /* blue        */
+    { PAIR_HEAD,        255,  COLOR_WHITE,   COLOR_BLACK }, /* white       */
+    { PAIR_HUD,         226,  COLOR_YELLOW,  -1          }, /* HUD chrome  */
+    { PAIR_HINT,         51,  COLOR_CYAN,    -1          }, /* HINT chrome */
+};
+#define PALETTE_LEN  (int)(sizeof PALETTE / sizeof PALETTE[0])
+
 static void color_init(void)
 {
     start_color();
     use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(1,  51, COLOR_BLACK);   /* cyan              */
-        init_pair(2, 201, COLOR_BLACK);   /* magenta           */
-        init_pair(3, 226, COLOR_BLACK);   /* yellow            */
-        init_pair(4,  46, COLOR_BLACK);   /* green             */
-        init_pair(5, 196, COLOR_BLACK);   /* red               */
-        init_pair(6, 33, COLOR_BLACK);   /* blue              */
-        init_pair(7, 255, COLOR_BLACK);   /* bright white      */
-    } else {
-        init_pair(1, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(2, COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(3, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(4, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(5, COLOR_RED,     COLOR_BLACK);
-        init_pair(6, COLOR_BLUE,    COLOR_BLACK);
-        init_pair(7, COLOR_WHITE,   COLOR_BLACK);
+    bool truecolor = (COLORS >= 256);
+    for (int i = 0; i < PALETTE_LEN; i++) {
+        short fg = truecolor ? PALETTE[i].fg256 : PALETTE[i].fg8;
+        init_pair(PALETTE[i].pair, fg, PALETTE[i].bg);
     }
 }
 
@@ -590,30 +366,161 @@ static char angle_char(float angle)
 /* ===================================================================== */
 
 /*
- * Turtle — state for one polygon-drawing turtle.
+ * §5.1 Polygon — the shape this turtle is drawing.
  *
- *   cx, cy      polygon center in cell coordinates (cols, rows)
- *   radius      circumradius in columns (aspect-corrected for Y)
- *   sides       number of polygon sides
- *   edge        edges drawn so far: 0 = pen at vertex 0, not started
- *                                   k = k edges drawn, pen at vertex k
- *                                   sides = polygon complete
- *   edge_timer  seconds remaining until next edge is drawn
- *   eps         edges per second (drawing rate)
- *   start_angle first vertex angle (radians); −π/2 places it at the top
- *   cpair       ncurses color pair index
- *   done        true when edge == sides
+ * INTENT
+ *   The "what" of the turtle — its target shape. Vertex k is at:
+ *
+ *      θ_k  = start_angle + k · (2π/sides)
+ *      v.x  = cx + radius · cos(θ_k)
+ *      v.y  = cy + radius · sin(θ_k) · ASPECT     (ASPECT = 0.5)
+ *
+ *   Set once at turtle_init from terminal dimensions; immutable for
+ *   the polygon's lifetime. The animation reads from here; nothing
+ *   writes to it during a polygon's run.
+ *
+ * INVARIANT
+ *   The struct is READ-ONLY between resets. turtle_init re-seeds it
+ *   on resize, full reset ('r'), per-turtle side change (a/z, s/x),
+ *   and at end-of-polygon auto-cycle (sides += 1, wrap at SIDES_MAX).
+ *
+ * WHY SEPARATE FROM Pen
+ *   "What is being drawn" (Polygon, immutable) vs "how far we've
+ *   drawn" (Pen, written each tick) are different concerns. Keeping
+ *   them in separate sub-structs documents at the TYPE LEVEL which
+ *   fields are the SHAPE definition and which are the PROGRESS
+ *   tracker — a learner studying turtle_init / turtle_tick can
+ *   trust the field names to tell them which group a field belongs
+ *   to.
+ *
+ * WHY THE 2:1 ASPECT CORRECTION LIVES IN poly_vertex (not here)
+ *   `radius` is stored in COLUMN units. Y at the use site multiplies
+ *   sin(θ) by ASPECT = 0.5 so the visual circle stays round even
+ *   though terminal cells are ~2× taller than wide. Storing the
+ *   uncorrected radius keeps the trig math clean and lets the
+ *   correction happen once, at draw time.
+ *
+ * ALGORITHM REFERENCES
+ *   Abelson & diSessa (1981), "Turtle Geometry" §1.3 — the POLY
+ *     procedure: "REPEAT n [FORWARD R; LEFT 2π/n]". This struct is
+ *     the data form of that recipe.
+ *   Coxeter (1973), "Regular Polytopes" §1.1 — circumradius +
+ *     equal-angle definition of regular polygons.
  */
 typedef struct {
-    float cx, cy;
-    float radius;
-    int   sides;
-    int   edge;
-    float edge_timer;
-    float eps;
-    float start_angle;
-    int   cpair;
-    bool  done;
+    float cx;            /* polygon centre column (cell-x).            *
+                          * Set by turtle_init from cols * 0.25 or    *
+                          * cols * 0.75 (left/right half).             */
+    float cy;            /* polygon centre row (cell-y).               *
+                          * Approximately rows/2.                      */
+    float radius;        /* circumradius in COLUMN units. Y axis      *
+                          * multiplies sin(θ) by ASPECT at use site.  *
+                          * Chosen by turtle_init to fit the half-    *
+                          * screen with margin (85% of available).    */
+    int   sides;         /* number of polygon sides, [SIDES_MIN, MAX]  *
+                          * = [3, 12]. Cycles 3→4→…→12→3 on auto-     *
+                          * reset; a/z and s/x keys nudge per turtle. */
+    float start_angle;   /* first vertex angle (radians, math frame). *
+                          * Always -π/2 → the first vertex is at the  *
+                          * TOP of the polygon, which reads as the    *
+                          * natural "starting point" to the eye.      */
+} Polygon;
+
+/*
+ * §5.2 Pen — the "what's the pen doing right now?" state.
+ *
+ * INTENT
+ *   Animation progress for one turtle. `edge` advances as each edge
+ *   completes; `edge_timer` counts down the seconds until the next
+ *   advance fires; `done` flips when the polygon is closed. Reset
+ *   to (edge=0, timer=1/eps, done=false) at every launch.
+ *
+ * WHY SEPARATE FROM Polygon
+ *   "What is being drawn" (Polygon, immutable) vs "how far we've
+ *   drawn" (Pen, written each tick) split into two sub-structs so
+ *   reading `t->poly.X` vs `t->pen.X` reveals at a glance which
+ *   group a field belongs to. The animation loop touches Pen
+ *   exclusively; turtle_init touches both.
+ *
+ * STATE MACHINE (per turtle, per generation)
+ *
+ *      edge = 0, timer = 1/eps, done = false        ← launch
+ *      ──tick──►  timer -= dt
+ *      ──timer ≤ 0──►  edge += 1,  timer += 1/eps
+ *      ──edge == sides──►  done = true, edge clamped to sides
+ *
+ * WHY THE while LOOP (not single decrement)
+ *   turtle_tick uses `while (timer ≤ 0) { ... timer += 1/eps; }` so
+ *   a large dt that should cover MULTIPLE edges advances correctly.
+ *   Without the while, a 100 ms dt with eps = 12 (≈83 ms/edge)
+ *   would lose an edge per tick.
+ *
+ * WHY edge IS CAPPED AT sides (not sides+1 or unbounded)
+ *   The closing edge from vertex (sides-1) → vertex 0 is the LAST
+ *   thing drawn. Once edge = sides, the polygon is closed and the
+ *   pen is back at vertex 0 — no more edges to draw. Capping at
+ *   sides means turtle_draw can render edges [0, edge) cleanly.
+ */
+typedef struct {
+    int   edge;          /* edges drawn so far:                       *
+                          *   0       = pen at vertex 0, not started *
+                          *   k       = k edges drawn, pen at v_k    *
+                          *   sides   = polygon complete (capped)    */
+    float edge_timer;    /* seconds remaining until next edge fires. *
+                          * Reset to 1/eps each time it crosses 0.   */
+    float eps;           /* per-turtle drawing rate, edges/second.   *
+                          * Mirrors Scene.eps (the shared global);   *
+                          * could differ in future for per-turtle    *
+                          * speed but the current demo keeps them    *
+                          * equal.                                    */
+    bool  done;          /* true once edge == sides. Skips further  *
+                          * tick work; cleared on launch.            */
+} Pen;
+
+/*
+ * §5.3 Turtle — Polygon + Pen + colour.
+ *
+ * INTENT
+ *   One turtle = one pen-with-heading drawing one polygon. Composes
+ *   the three concept-sized pieces so each access self-documents
+ *   which layer it touches:
+ *
+ *      t->poly.cx          shape definition (immutable this run)
+ *      t->pen.edge         animation progress (changes each tick)
+ *      t->cpair            ncurses colour pair (one per turtle)
+ *
+ * LAYERING (read in this order to understand a turtle)
+ *
+ *      Polygon  — what shape is the turtle going to draw?
+ *      Pen      — where is the pen right now within that polygon?
+ *      cpair    — what colour are we drawing the result?
+ *
+ * WHY cpair IS A TOP-LEVEL FIELD (not in Polygon or Pen)
+ *   cpair belongs to neither the shape ("what is drawn") nor the
+ *   animation ("how far"). It's purely a RENDERING choice — which
+ *   ncurses palette entry to use — so it sits at the Turtle level
+ *   where the renderer reads it.
+ *
+ * SIZE
+ *   Polygon: 5 floats + 1 int                ≈ 24 B
+ *   Pen:     3 floats + 1 int + 1 bool      ≈ 20 B
+ *   cpair:   1 int                          =   4 B
+ *   Turtle:                                 ≈ 48 B per turtle
+ *   Two turtles total ≈ 100 B — fits in a cache line easily.
+ *
+ * ALGORITHM REFERENCE
+ *   Papert (1980), "Mindstorms" — the pen-with-heading turtle
+ *   abstraction. This file's Turtle is a position-and-heading-free
+ *   "geometric turtle" that walks pre-computed vertices, but the
+ *   conceptual lineage is direct.
+ */
+typedef struct {
+    Polygon poly;        /* the shape — set at init, immutable.       *
+                          * Read by poly_vertex, turtle_draw.         */
+    Pen     pen;         /* animation state — written each tick by   *
+                          * turtle_tick; read by turtle_draw.         */
+    int     cpair;       /* ncurses color pair index (PAIR_TURTLE_A  *
+                          * or PAIR_TURTLE_B).                       */
 } Turtle;
 
 /*
@@ -626,24 +533,42 @@ typedef struct {
  *   horizontal: radius ≤ cols * 0.21  (leave margin from divider and edge)
  *   vertical:   radius * ASPECT ≤ (rows-4) * 0.40  → radius ≤ that / ASPECT
  */
+/* Half-screen x centre for left (half == 0) / right (half == 1). */
+static inline float half_screen_centre_x(int cols, int half)
+{
+    return (half == 0) ? (float)cols * HALF_LEFT_X_FRAC
+                       : (float)cols * HALF_RIGHT_X_FRAC;
+}
+
+/* Polygon radius chosen so the shape fits in its half-screen with
+ * margin for the label row and bottom hint strip. The min() picks
+ * the tighter of the two bounds; the *0.85 multiplier leaves breathing
+ * room around the bounds. ASPECT compensates for 2:1 cell shape. */
+static inline float fit_polygon_radius(int cols, int rows)
+{
+    float max_r_x = (float)cols       * POLY_MAX_R_X_FRAC;
+    float max_r_y = (float)(rows - 4) * POLY_MAX_R_Y_FRAC / ASPECT;
+    return fminf(max_r_x, max_r_y) * POLY_R_FIT_FRAC;
+}
+
 static void turtle_init(Turtle *t, int cols, int rows,
                         int half, int sides, int cpair, float eps)
 {
-    float cx = (half == 0) ? (float)cols * 0.25f : (float)cols * 0.75f;
-    float cy = (float)(rows - 2) * 0.5f + 1.5f;
-    float max_r_x = (float)cols * 0.21f;
-    float max_r_y = (float)(rows - 4) * 0.40f / ASPECT;
+    /* (1) polygon — the shape (where + how many sides) */
+    t->poly.cx          = half_screen_centre_x(cols, half);
+    t->poly.cy          = (float)(rows - 2) * 0.5f + 1.5f;
+    t->poly.radius      = fit_polygon_radius(cols, rows);
+    t->poly.sides       = sides;
+    t->poly.start_angle = -(float)M_PI / 2.0f;   /* first vertex at top */
 
-    t->cx          = cx;
-    t->cy          = cy;
-    t->radius      = fminf(max_r_x, max_r_y) * 0.85f;
-    t->sides       = sides;
-    t->edge        = 0;
-    t->eps         = eps;
-    t->edge_timer  = 1.0f / eps;
-    t->start_angle = -(float)M_PI / 2.0f;   /* first vertex at top */
-    t->cpair       = cpair;
-    t->done        = false;
+    /* (2) pen — animation reset to start of edge 0 */
+    t->pen.edge       = 0;
+    t->pen.eps        = eps;
+    t->pen.edge_timer = 1.0f / eps;
+    t->pen.done       = false;
+
+    /* (3) style */
+    t->cpair          = cpair;
 }
 
 /*
@@ -652,16 +577,17 @@ static void turtle_init(Turtle *t, int cols, int rows,
  */
 static void turtle_tick(Turtle *t, float dt)
 {
-    if (t->done) return;
-    t->edge_timer -= dt;
-    while (t->edge_timer <= 0.0f) {
-        t->edge++;
-        if (t->edge >= t->sides) {
-            t->done       = true;
-            t->edge       = t->sides;   /* cap — closing edge is drawn */
+    Pen *p = &t->pen;
+    if (p->done) return;
+    p->edge_timer -= dt;
+    while (p->edge_timer <= 0.0f) {
+        p->edge++;
+        if (p->edge >= t->poly.sides) {
+            p->done = true;
+            p->edge = t->poly.sides;   /* cap — closing edge is drawn */
             break;
         }
-        t->edge_timer += 1.0f / t->eps;
+        p->edge_timer += 1.0f / p->eps;
     }
 }
 
@@ -673,116 +599,315 @@ static void turtle_tick(Turtle *t, float dt)
  */
 static void poly_vertex(const Turtle *t, int i, float *vx, float *vy)
 {
-    float a = t->start_angle + (float)i * 2.0f * (float)M_PI / (float)t->sides;
-    *vx = t->cx + t->radius * cosf(a);
-    *vy = t->cy + t->radius * sinf(a) * ASPECT;
+    const Polygon *g = &t->poly;
+    float a = g->start_angle + (float)i * 2.0f * (float)M_PI / (float)g->sides;
+    *vx = g->cx + g->radius * cosf(a);
+    *vy = g->cy + g->radius * sinf(a) * ASPECT;
+}
+
+/* DDA step count — one stamp per cell along the MAJOR axis (the one
+ * with the larger absolute delta). Guarantees no gaps in the rendered
+ * line at any angle. Minimum 1 so a zero-length segment still tries
+ * once at the start point. */
+static inline int dda_step_count(float dx, float dy)
+{
+    int steps = (int)(fabsf(dx) > fabsf(dy) ? fabsf(dx) : fabsf(dy));
+    return steps < 1 ? 1 : steps;
+}
+
+/* Stamp one DDA-interpolated cell if it's inside the drawable area
+ * (cols × [1, rows-1) — leaves HUD row 0 and hint row rows-1 alone). */
+static inline void dda_stamp_cell(WINDOW *w, float x, float y, char ch,
+                                  chtype attr, int cols, int rows)
+{
+    int col = (int)roundf(x);
+    int row = (int)roundf(y);
+    if (col < 0 || col >= cols || row < 1 || row >= rows - 1) return;
+    wattron (w, attr);
+    mvwaddch(w, row, col, (chtype)(unsigned char)ch);
+    wattroff(w, attr);
 }
 
 /*
- * put_seg() — rasterise a line segment with DDA.
+ * put_seg — rasterise a line segment with DDA (Digital Differential
+ * Analyzer). For each of `steps` intermediate t ∈ [0, 1] points,
+ * compute (col, row) by linear interpolation and stamp one glyph.
  *
- * Fills all cells from (x0,y0) to (x1,y1) using the character that
- * matches the segment angle.  Clips to (0…cols-1, 1…rows-2) to keep
- * drawing away from the HUD row and hint row.
+ *   steps  = max(|Δx|, |Δy|)
+ *   t_i    = i / steps
+ *   col_i  = x0 + dx · t_i
+ *   row_i  = y0 + dy · t_i
+ *
+ * Glyph is chosen ONCE from the segment's overall angle (- | / \) so
+ * the whole edge reads as one straight line, not staircased.
+ *
+ * Algorithm reference: Newman & Sproull (1979) §2, DDA line algorithm.
  */
 static void put_seg(WINDOW *w, float x0, float y0, float x1, float y1,
                     chtype attr, int cols, int rows)
 {
     float dx    = x1 - x0;
     float dy    = y1 - y0;
-    int   steps = (int)(fabsf(dx) > fabsf(dy) ? fabsf(dx) : fabsf(dy));
-    if (steps < 1) steps = 1;
-    char ch = angle_char(atan2f(dy, dx));
+    int   steps = dda_step_count(dx, dy);
+    char  ch    = angle_char(atan2f(dy, dx));
 
     for (int i = 0; i <= steps; i++) {
-        float ft  = (float)i / (float)steps;
-        int   col = (int)roundf(x0 + dx * ft);
-        int   row = (int)roundf(y0 + dy * ft);
-        if (col >= 0 && col < cols && row >= 1 && row < rows - 1) {
-            wattron(w, attr);
-            mvwaddch(w, row, col, (chtype)(unsigned char)ch);
-            wattroff(w, attr);
-        }
+        float t = (float)i / (float)steps;
+        dda_stamp_cell(w, x0 + dx * t, y0 + dy * t,
+                       ch, attr, cols, rows);
     }
 }
 
-/*
- * turtle_draw() — render the turtle's completed edges and current head.
- *
- * Draws edges 0 … edge-1 (each from vertex e to vertex e+1).
- * The turtle head '@' is placed at vertex `edge` — the pen's current
- * position — and is omitted once the polygon is complete.
- */
-static void turtle_draw(const Turtle *t, WINDOW *w, int cols, int rows)
+/* Paint edges [0, pen.edge) — every edge the pen has already finished.
+ * Each edge goes from vertex e to vertex (e+1), rasterised by put_seg
+ * in the turtle's colour pair. */
+static void paint_completed_edges(const Turtle *t, WINDOW *w,
+                                  int cols, int rows)
 {
     chtype attr = (chtype)(COLOR_PAIR(t->cpair) | A_BOLD);
-
-    /* completed edges */
-    for (int e = 0; e < t->edge; e++) {
+    for (int e = 0; e < t->pen.edge; e++) {
         float x0, y0, x1, y1;
         poly_vertex(t, e,     &x0, &y0);
         poly_vertex(t, e + 1, &x1, &y1);
         put_seg(w, x0, y0, x1, y1, attr, cols, rows);
     }
+}
 
-    /* turtle head — drawn after edges so it is always on top */
-    if (!t->done) {
-        float hx, hy;
-        poly_vertex(t, t->edge, &hx, &hy);
-        int ix = (int)roundf(hx);
-        int iy = (int)roundf(hy);
-        if (ix >= 0 && ix < cols && iy >= 1 && iy < rows - 1) {
-            wattron(w, COLOR_PAIR(7) | A_BOLD);
-            mvwaddch(w, iy, ix, '@');
-            wattroff(w, COLOR_PAIR(7) | A_BOLD);
-        }
-    }
+/* Paint the pen-head glyph '@' at the current vertex (the start of
+ * the in-progress edge). Skipped once the polygon is complete so the
+ * closed shape looks settled. */
+static void paint_pen_head(const Turtle *t, WINDOW *w, int cols, int rows)
+{
+    if (t->pen.done) return;
+
+    float hx, hy;
+    poly_vertex(t, t->pen.edge, &hx, &hy);
+    int ix = (int)roundf(hx);
+    int iy = (int)roundf(hy);
+    if (ix < 0 || ix >= cols || iy < 1 || iy >= rows - 1) return;
+
+    wattron (w, COLOR_PAIR(PAIR_HEAD) | A_BOLD);
+    mvwaddch(w, iy, ix, '@');
+    wattroff(w, COLOR_PAIR(PAIR_HEAD) | A_BOLD);
+}
+
+/*
+ * turtle_draw — render the turtle's completed edges and its pen head.
+ *
+ *   1. paint every edge [0, pen.edge) in the turtle's colour
+ *   2. stamp the pen-head '@' at vertex pen.edge (unless done)
+ *
+ * Painter's order: head after edges so it overdraws the edge endpoint
+ * cleanly.
+ */
+static void turtle_draw(const Turtle *t, WINDOW *w, int cols, int rows)
+{
+    paint_completed_edges(t, w, cols, rows);
+    paint_pen_head       (t, w, cols, rows);
 }
 
 /* ===================================================================== */
-/* §6  scene                                                              */
+/* §6  scene — Screen + FrameTimer + Scene container + helpers            */
 /* ===================================================================== */
 
 /*
- * Scene — two turtles, shared drawing speed, and reset countdown.
+ * §6.1 Screen — current ncurses dimensions.
  *
- * When both turtles are done, reset_timer counts up.  At RESET_DELAY
- * seconds both are re-initialised with sides incremented by 1 each.
- * The cycle runs 3 → 4 → … → 12 → 3 indefinitely.
+ * INTENT
+ *   Single point of truth for "how big is the terminal RIGHT NOW".
+ *   turtle_init derives the polygon centre and radius from these;
+ *   every renderer clamps draws to (cols, rows-1) so the bottom
+ *   hint strip stays unobstructed; the HUD reads cols to right-
+ *   align the status string.
+ *
+ * MUTATION RULE
+ *   Modified only inside screen_init() and screen_resize(). Never
+ *   changes mid-frame — physics and renderer treat them as
+ *   immutable for the duration of one tick.
+ *
+ * RESIZE BEHAVIOUR
+ *   On SIGWINCH the main loop calls scene_handle_resize() which
+ *   updates these dims AND re-seeds both turtles so the polygon
+ *   centre + radius re-fit the new geometry. Side counts and pen
+ *   speed are preserved across the resize.
  */
 typedef struct {
-    Turtle tA;           /* left  turtle (cyan)    */
-    Turtle tB;           /* right turtle (magenta) */
-    float  eps;          /* edges per second        */
-    float  reset_timer;  /* seconds since both done */
-    bool   paused;
+    int cols;            /* terminal width in character cells.       */
+    int rows;            /* terminal height in character cells.      */
+} Screen;
+
+/*
+ * §6.2 FrameTimer — main-loop pacing + rolling fps.
+ *
+ * INTENT
+ *   Pulls the timing locals that used to live in main() (frame_time,
+ *   sim_accum, fps_accum, frame_count, fps_display) into one named
+ *   struct. Reading the main loop now means reading "the FrameTimer
+ *   gets ticked" rather than "five disconnected locals get updated
+ *   in scattered places".
+ *
+ * TWO TIMING SCALES
+ *   (1) RENDER scale — every loop iteration paints one frame and
+ *       sleeps the remainder of (NS_PER_SEC / 60). Best-effort.
+ *   (2) SIM scale — tick_ns = 1e9 / sim_fps, FIXED. Each frame's
+ *       dt accumulates into sim_accum; the loop consumes whole
+ *       sim ticks via scene_tick. Disk drawing pace stays constant
+ *       regardless of render rate.
+ *
+ * WHY DECOUPLED (renderer != sim)
+ *   Turtle drawing speed is a USER-CONTROLLED parameter (eps + sim
+ *   Hz). Coupling it to render rate would make the polygon draw
+ *   slower on slow machines, breaking the visual cadence. Fiedler's
+ *   "Fix Your Timestep!" is the canonical write-up of this pattern.
+ *
+ * WHY 500 ms FPS WINDOW
+ *   Per-frame fps fluctuates wildly. A 500 ms accumulation window
+ *   gives a stable, human-readable HUD value. Updated ≈2× per
+ *   second.
+ *
+ * ALGORITHM REFERENCE
+ *   Fiedler, "Fix Your Timestep!" — accumulator pattern.
+ *   https://gafferongames.com/post/fix_your_timestep/
+ */
+typedef struct {
+    int64_t frame_time;   /* clock_ns() at the start of the previous *
+                           * frame. dt = now - frame_time each loop. *
+                           * Reset on resize so the post-resize frame*
+                           * doesn't see a giant dt spike.            */
+    int64_t sim_accum;    /* dt accumulator for fixed-timestep sim.  *
+                           * Each frame: sim_accum += dt; while it   *
+                           * crosses tick_ns: scene_tick once and    *
+                           * sim_accum -= tick_ns. Reset on resize.  */
+    int64_t fps_accum;    /* ns elapsed since the last fps update.   *
+                           * Resets when it crosses 500 ms.           */
+    int     frame_count;  /* frames included in fps_accum.           *
+                           *   fps = frame_count · 1e9 / fps_accum   */
+    double  fps_display;  /* most recent rolling-window fps reading. *
+                           * Updated ≈ 2× per second; shown in HUD.   */
+} FrameTimer;
+
+/*
+ * §6.3 Scene — the top-level container.
+ *
+ * INTENT
+ *   Owns every long-lived piece of program state in one struct: the
+ *   two turtles, their shared drawing speed, the reset countdown,
+ *   the pause flag, screen dimensions, loop timing, sim-tick rate,
+ *   and signal flags. Replaces what used to be a separate Scene
+ *   (turtle pair) wrapped inside an App (Scene + Screen + sim_fps +
+ *   signal flags) plus loose timing locals in main().
+ *
+ * SUB-STRUCT LAYERING (read in this order)
+ *
+ *   1. tA, tB       the duo (Turtle = Polygon + Pen + cpair)
+ *   2. eps          shared drawing speed, propagated to both pens
+ *   3. reset_timer  countdown to "auto-reseed with sides += 1"
+ *   4. paused       UI flag
+ *   5. screen       ncurses dimensions
+ *   6. timer        loop pacing (sim + render scales)
+ *   7. sim_fps      fixed-timestep sim rate
+ *   + running, need_resize    signal-handler flags
+ *
+ * MUTATION CONTRACT (which keys / events touch what)
+ *
+ *   tA / tB        a/z, s/x       reseed via turtle_init
+ *                  r              both re-seeded at current sides
+ *                  (per tick)     pen.edge / pen.edge_timer advance
+ *                  (cycle)        sides += 1 on auto-reset
+ *   eps            + / -          1.5× scale, clamped [MIN, MAX]
+ *   reset_timer    (per tick)     counts up after both pens done;
+ *                                 cleared after scene_cycle_polygons
+ *   paused         space          freeze sim_tick
+ *   sim_fps        [ / ]          fixed-step tick rate, ±SIM_FPS_STEP
+ *   running        q/ESC/SIGINT   clears, main loop exits
+ *   need_resize    SIGWINCH       set; main loop calls resize handler
+ *
+ *   Turtle / eps writes affect what's DRAWN.
+ *   paused / sim_fps writes affect HOW FAST it draws.
+ *   running / need_resize are signal control flags.
+ *
+ * INITIALIZATION ORDER (see main())
+ *   1. install signal handlers + atexit cleanup
+ *   2. running = 1, sim_fps = SIM_FPS_DEFAULT
+ *   3. screen_init       — bring ncurses up, learn rows/cols
+ *   4. scene_init        — seed defaults + both turtles
+ *   5. timer.frame_time  — seed FrameTimer
+ *
+ * WHY A FILE-STATIC GLOBAL (g_scene)
+ *   Signal handlers can't take parameters and must be async-signal-
+ *   safe. They need a path to running / need_resize. A single file-
+ *   scope Scene gives them that without ceremony; everything else
+ *   reaches state through  scene->  pointer parameters.
+ */
+typedef struct Scene_ {
+    /* — turtle pair + their shared scene state — */
+    Turtle tA;            /* left  turtle (PAIR_TURTLE_A, cyan).      *
+                           * Drawn in the left  half: cols * 0.25.   */
+    Turtle tB;            /* right turtle (PAIR_TURTLE_B, magenta).   *
+                           * Drawn in the right half: cols * 0.75.   */
+    float  eps;           /* shared drawing speed (edges/second).     *
+                           * Range [EPS_MIN, EPS_MAX] = [0.3, 12.0]. *
+                           * + / - scales by 1.5×.                    *
+                           * Propagated to each t->pen.eps inside    *
+                           * turtle_init.                             */
+    float  reset_timer;   /* seconds since both polygons completed.   *
+                           * Counts up each tick once both pen.done; *
+                           * at RESET_DELAY (= 2 sec) both turtles   *
+                           * auto-reseed with sides += 1 (wrap at    *
+                           * SIDES_MAX → SIDES_MIN).                  */
+    bool   paused;        /* spacebar — freeze the simulation.       *
+                           * Rendering keeps running so the user can *
+                           * study a frame.                           */
+
+    /* — frame pacing — */
+    Screen     screen;    /* ncurses dimensions; refreshed on resize.*/
+    FrameTimer timer;     /* sim accumulator + rolling-fps state.    */
+    int        sim_fps;   /* fixed-step sim rate (Hz). Clamped to    *
+                           * [SIM_FPS_MIN, SIM_FPS_MAX] = [5, 120].  *
+                           * Default SIM_FPS_DEFAULT = 30.            *
+                           * [ / ] keys nudge by SIM_FPS_STEP = 5.   */
+
+    /* — signal flags — */
+    volatile sig_atomic_t running;     /* cleared by 'q'/ESC/SIGINT */
+    volatile sig_atomic_t need_resize; /* set by SIGWINCH           */
 } Scene;
 
-static void scene_init(Scene *s, int cols, int rows)
+static void scene_init(Scene *s)
 {
-    memset(s, 0, sizeof *s);
-    s->eps    = EPS_DEFAULT;
-    s->paused = false;
-    turtle_init(&s->tA, cols, rows, 0, 3, 1, s->eps);
-    turtle_init(&s->tB, cols, rows, 1, 5, 2, s->eps);
+    s->eps         = EPS_DEFAULT;
+    s->reset_timer = 0.0f;
+    s->paused      = false;
+    turtle_init(&s->tA, s->screen.cols, s->screen.rows,
+                0, 3, PAIR_TURTLE_A, s->eps);
+    turtle_init(&s->tB, s->screen.cols, s->screen.rows,
+                1, 5, PAIR_TURTLE_B, s->eps);
 }
 
-static void scene_tick(Scene *s, float dt, int cols, int rows)
+/* Both turtles complete → wait RESET_DELAY, then re-seed each with
+ * sides += 1 (wrapping SIDES_MAX → SIDES_MIN). Implements the
+ * "3 → 4 → … → 12 → 3" cycle the demo headlines. */
+static void scene_cycle_polygons(Scene *s)
+{
+    int na = (s->tA.poly.sides < SIDES_MAX) ? s->tA.poly.sides + 1 : SIDES_MIN;
+    int nb = (s->tB.poly.sides < SIDES_MAX) ? s->tB.poly.sides + 1 : SIDES_MIN;
+    turtle_init(&s->tA, s->screen.cols, s->screen.rows,
+                0, na, PAIR_TURTLE_A, s->eps);
+    turtle_init(&s->tB, s->screen.cols, s->screen.rows,
+                1, nb, PAIR_TURTLE_B, s->eps);
+    s->reset_timer = 0.0f;
+}
+
+static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
 
     turtle_tick(&s->tA, dt);
     turtle_tick(&s->tB, dt);
 
-    if (s->tA.done && s->tB.done) {
+    if (s->tA.pen.done && s->tB.pen.done) {
         s->reset_timer += dt;
-        if (s->reset_timer >= RESET_DELAY) {
-            int na = (s->tA.sides < SIDES_MAX) ? s->tA.sides + 1 : SIDES_MIN;
-            int nb = (s->tB.sides < SIDES_MAX) ? s->tB.sides + 1 : SIDES_MIN;
-            turtle_init(&s->tA, cols, rows, 0, na, 1, s->eps);
-            turtle_init(&s->tB, cols, rows, 1, nb, 2, s->eps);
-            s->reset_timer = 0.0f;
-        }
+        if (s->reset_timer >= RESET_DELAY)
+            scene_cycle_polygons(s);
     }
 }
 
@@ -802,58 +927,75 @@ static const char *poly_name(int sides)
     return "Polygon";
 }
 
+/* Vertical '|' line at the screen midline separating the two halves. */
+static void paint_half_divider(WINDOW *w, int cols, int rows)
+{
+    wattron(w, COLOR_PAIR(PAIR_DIVIDER) | A_DIM);
+    for (int r = 1; r < rows - 1; r++)
+        mvwaddch(w, r, cols / 2, '|');
+    wattroff(w, COLOR_PAIR(PAIR_DIVIDER) | A_DIM);
+}
+
+/* Polygon name label for one turtle, centred at column cx on row 1.
+ * Format: "Triangle (3)" — name from the static poly_name table. */
+static void paint_poly_label(WINDOW *w, const Turtle *t, int cx, int cpair)
+{
+    char lab[32];
+    snprintf(lab, sizeof lab, "%s (%d)",
+             poly_name(t->poly.sides), t->poly.sides);
+    wattron (w, COLOR_PAIR(cpair) | A_BOLD);
+    mvwprintw(w, 1, cx - (int)strlen(lab) / 2, "%s", lab);
+    wattroff(w, COLOR_PAIR(cpair) | A_BOLD);
+}
+
+/* "DONE — next in Ns" banner centred horizontally at mid-row. Shown
+ * only while both pens are done and the reset_timer is counting up. */
+static void paint_done_banner(WINDOW *w, const Scene *s, int cols, int rows)
+{
+    if (!(s->tA.pen.done && s->tB.pen.done)) return;
+
+    int  sec_left = (int)(RESET_DELAY - s->reset_timer) + 1;
+    char msg[48];
+    snprintf(msg, sizeof msg, "DONE — next in %ds", sec_left);
+
+    int mx = (cols - (int)strlen(msg)) / 2;
+    if (mx < 0) mx = 0;
+
+    wattron (w, COLOR_PAIR(PAIR_DONE) | A_BOLD);
+    mvwprintw(w, rows / 2, mx, "%s", msg);
+    wattroff(w, COLOR_PAIR(PAIR_DONE) | A_BOLD);
+}
+
+/*
+ * scene_draw — paint the canvas content (everything except HUD chrome).
+ *
+ *   1. vertical divider (dim, behind both halves)
+ *   2. both turtles (edges + pen heads)
+ *   3. polygon name labels above each half
+ *   4. "DONE — next in Ns" banner when both polygons finished
+ *
+ * Painter's order: divider first (behind), labels and banner last
+ * (overlay so text is always legible).
+ */
 static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
                        float alpha, float dt_sec)
 {
     (void)alpha; (void)dt_sec;
 
-    /* vertical divider between the two halves */
-    wattron(w, COLOR_PAIR(6) | A_DIM);
-    for (int r = 1; r < rows - 1; r++)
-        mvwaddch(w, r, cols / 2, '|');
-    wattroff(w, COLOR_PAIR(6) | A_DIM);
+    paint_half_divider(w, cols, rows);
 
-    /* draw both turtles */
     turtle_draw(&s->tA, w, cols, rows);
     turtle_draw(&s->tB, w, cols, rows);
 
-    /* polygon name labels (row 1, centred in each half) */
-    char labA[32], labB[32];
-    snprintf(labA, sizeof labA, "%s (%d)", poly_name(s->tA.sides), s->tA.sides);
-    snprintf(labB, sizeof labB, "%s (%d)", poly_name(s->tB.sides), s->tB.sides);
+    paint_poly_label(w, &s->tA, cols / 4,     PAIR_TURTLE_A);
+    paint_poly_label(w, &s->tB, 3 * cols / 4, PAIR_TURTLE_B);
 
-    int cx_a = cols / 4;
-    int cx_b = 3 * cols / 4;
-
-    wattron(w, COLOR_PAIR(1) | A_BOLD);
-    mvwprintw(w, 1, cx_a - (int)strlen(labA) / 2, "%s", labA);
-    wattroff(w, COLOR_PAIR(1) | A_BOLD);
-
-    wattron(w, COLOR_PAIR(2) | A_BOLD);
-    mvwprintw(w, 1, cx_b - (int)strlen(labB) / 2, "%s", labB);
-    wattroff(w, COLOR_PAIR(2) | A_BOLD);
-
-    /* "DONE — next in Xs" banner when both polygons are complete */
-    if (s->tA.done && s->tB.done) {
-        char msg[48];
-        int  sec_left = (int)(RESET_DELAY - s->reset_timer) + 1;
-        snprintf(msg, sizeof msg, "DONE — next in %ds", sec_left);
-        int mx = (cols - (int)strlen(msg)) / 2;
-        if (mx < 0) mx = 0;
-        wattron(w, COLOR_PAIR(3) | A_BOLD);
-        mvwprintw(w, rows / 2, mx, "%s", msg);
-        wattroff(w, COLOR_PAIR(3) | A_BOLD);
-    }
+    paint_done_banner(w, s, cols, rows);
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §7  screen — ncurses init / present + HUD bars                         */
 /* ===================================================================== */
-
-typedef struct {
-    int cols;
-    int rows;
-} Screen;
 
 static void screen_init(Screen *s)
 {
@@ -881,6 +1023,64 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
+/* HUD bars per CLAUDE.md two-bar spec:
+ *   row 0  right    bright yellow + A_BOLD on default bg   live data
+ *   row -1 left     bright cyan   + A_BOLD on default bg   action keys
+ * Out-of-theme colours so the HUD chrome stays legible no matter what
+ * the turtles are drawing behind it; A_BOLD never A_DIM.
+ */
+
+/* Tiny per-turtle progress label: "A:3-gon > 2/3" reads as
+ * "turtle A, 3-sided polygon, 2 edges drawn out of 3" — the '>'
+ * becomes '*' when that polygon completes. */
+static int hud_write_turtle_status(char *dst, size_t cap,
+                                   char letter, const Turtle *t)
+{
+    return snprintf(dst, cap, " %c:%d-gon %s %d/%d ",
+                    letter,
+                    t->poly.sides,
+                    t->pen.done ? "*"  : ">",
+                    t->pen.edge,
+                    t->poly.sides);
+}
+
+/* Build the top-row status string. Order: per-turtle progress first
+ * (the user's eye lands here when watching convergence), then speed /
+ * timing parameters. */
+static void hud_format_status(const Scene *sc, double fps, int sim_fps,
+                              char *buf, size_t n)
+{
+    char a_buf[32], b_buf[32];
+    hud_write_turtle_status(a_buf, sizeof a_buf, 'A', &sc->tA);
+    hud_write_turtle_status(b_buf, sizeof b_buf, 'B', &sc->tB);
+
+    snprintf(buf, n,
+             "%s%s %.1f fps  sim:%d Hz  %.2f eps  %s ",
+             a_buf, b_buf,
+             fps, sim_fps, (double)sc->eps,
+             sc->paused ? "PAUSED " : "drawing");
+}
+
+/* Paint the HUD status string right-justified on row 0. */
+static void hud_paint_status(const char *buf, int cols)
+{
+    int hx = cols - (int)strlen(buf);
+    if (hx < 0) hx = 0;
+    attron (COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, hx, "%s", buf);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
+
+/* Bottom-row hint strip — lists every interactive key. */
+static void hud_paint_hint(int rows)
+{
+    attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(rows - 1, 0,
+             " q:quit  spc:pause  r:reset  "
+             "a/z:A±sides  s/x:B±sides  +/-:speed  [/]:Hz ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
 static void screen_draw(Screen *s, const Scene *sc,
                         double fps, int sim_fps,
                         float alpha, float dt_sec)
@@ -888,22 +1088,10 @@ static void screen_draw(Screen *s, const Scene *sc,
     erase();
     scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
-    /* HUD — top-right */
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf, " %.1f fps  sim:%d Hz  %.2f eps  %s ",
-             fps, sim_fps, sc->eps,
-             sc->paused ? "PAUSED " : "drawing");
-    int hx = s->cols - (int)strlen(buf);
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(3) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(3) | A_BOLD);
-
-    /* hint — bottom-left */
-    attron(COLOR_PAIR(6) | A_DIM);
-    mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  r:reset  a/z:A±  s/x:B±  +/-:speed  [/]:Hz ");
-    attroff(COLOR_PAIR(6) | A_DIM);
+    char buf[160];
+    hud_format_status(sc, fps, sim_fps, buf, sizeof buf);
+    hud_paint_status (buf, s->cols);
+    hud_paint_hint   (s->rows);
 }
 
 static void screen_present(void)
@@ -913,183 +1101,234 @@ static void screen_present(void)
 }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §8  app — signals, key dispatch, main loop                             */
 /* ===================================================================== */
 
-typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
-} App;
+/* The single Scene instance. File-scope so signal handlers can flip
+ * the volatile sig_atomic_t flags inside it without ceremony.        */
+static Scene g_scene;
 
-static App g_app;
-
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
+static void on_exit_signal(int sig)   { (void)sig; g_scene.running = 0;     }
+static void on_resize_signal(int sig) { (void)sig; g_scene.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-static void app_do_resize(App *app)
+/* SIGWINCH handler — re-sync ncurses + reseed turtles to the new
+ * terminal size (radius depends on cols/rows). Side counts and
+ * styles are preserved; only geometry refreshes. */
+static void scene_handle_resize(Scene *s)
 {
-    screen_resize(&app->screen);
-    /* re-init turtles to recompute radius for new terminal size */
-    int sa = app->scene.tA.sides;
-    int sb = app->scene.tB.sides;
-    turtle_init(&app->scene.tA, app->screen.cols, app->screen.rows, 0, sa, 1, app->scene.eps);
-    turtle_init(&app->scene.tB, app->screen.cols, app->screen.rows, 1, sb, 2, app->scene.eps);
-    app->scene.reset_timer = 0.0f;
-    app->need_resize = 0;
+    screen_resize(&s->screen);
+    int sa = s->tA.poly.sides;
+    int sb = s->tB.poly.sides;
+    turtle_init(&s->tA, s->screen.cols, s->screen.rows,
+                0, sa, PAIR_TURTLE_A, s->eps);
+    turtle_init(&s->tB, s->screen.cols, s->screen.rows,
+                1, sb, PAIR_TURTLE_B, s->eps);
+    s->reset_timer    = 0.0f;
+    s->need_resize    = 0;
+    s->timer.frame_time = clock_ns();
+    s->timer.sim_accum  = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
+/* spacebar — freeze the simulation. */
+static void key_pause_toggle(Scene *s) { s->paused = !s->paused; }
+
+/* 'r' — re-init both turtles at current sides. */
+static void key_reset_both(Scene *s)
 {
-    Scene  *sc = &app->scene;
-    Screen *sr = &app->screen;
+    int sa = s->tA.poly.sides, sb = s->tB.poly.sides;
+    turtle_init(&s->tA, s->screen.cols, s->screen.rows,
+                0, sa, PAIR_TURTLE_A, s->eps);
+    turtle_init(&s->tB, s->screen.cols, s->screen.rows,
+                1, sb, PAIR_TURTLE_B, s->eps);
+    s->reset_timer = 0.0f;
+}
 
-    int sa = sc->tA.sides;
-    int sb = sc->tB.sides;
+/* Cycle one turtle's side count by ±1 (wraps SIDES_MAX → SIDES_MIN). */
+static void key_change_sides(Scene *s, Turtle *t, int delta,
+                             int half, int cpair)
+{
+    int n = t->poly.sides + delta;
+    if      (n > SIDES_MAX) n = SIDES_MIN;
+    else if (n < SIDES_MIN) n = SIDES_MAX;
+    turtle_init(t, s->screen.cols, s->screen.rows,
+                half, n, cpair, s->eps);
+    s->reset_timer = 0.0f;
+}
 
+/* '+' / '-' — scale drawing speed by 1.5×; propagate to both pens. */
+static void key_speed_scale(Scene *s, float factor)
+{
+    s->eps *= factor;
+    if (s->eps > EPS_MAX) s->eps = EPS_MAX;
+    if (s->eps < EPS_MIN) s->eps = EPS_MIN;
+    s->tA.pen.eps = s->tB.pen.eps = s->eps;
+}
+
+/* '[' / ']' — nudge sim-tick rate. */
+static void key_sim_fps_nudge(Scene *s, int delta)
+{
+    s->sim_fps += delta;
+    if (s->sim_fps > SIM_FPS_MAX) s->sim_fps = SIM_FPS_MAX;
+    if (s->sim_fps < SIM_FPS_MIN) s->sim_fps = SIM_FPS_MIN;
+}
+
+/* Dispatch one keystroke; returns false on quit. */
+static bool scene_handle_key(Scene *s, int ch)
+{
     switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-
-    case ' ':
-        sc->paused = !sc->paused;
-        break;
-
-    case 'r': case 'R':
-        turtle_init(&sc->tA, sr->cols, sr->rows, 0, sa, 1, sc->eps);
-        turtle_init(&sc->tB, sr->cols, sr->rows, 1, sb, 2, sc->eps);
-        sc->reset_timer = 0.0f;
-        break;
-
-    /* Turtle A sides */
-    case 'a': case 'A':
-        sa = (sa < SIDES_MAX) ? sa + 1 : SIDES_MIN;
-        turtle_init(&sc->tA, sr->cols, sr->rows, 0, sa, 1, sc->eps);
-        sc->reset_timer = 0.0f;
-        break;
-    case 'z': case 'Z':
-        sa = (sa > SIDES_MIN) ? sa - 1 : SIDES_MAX;
-        turtle_init(&sc->tA, sr->cols, sr->rows, 0, sa, 1, sc->eps);
-        sc->reset_timer = 0.0f;
-        break;
-
-    /* Turtle B sides */
-    case 's': case 'S':
-        sb = (sb < SIDES_MAX) ? sb + 1 : SIDES_MIN;
-        turtle_init(&sc->tB, sr->cols, sr->rows, 1, sb, 2, sc->eps);
-        sc->reset_timer = 0.0f;
-        break;
-    case 'x': case 'X':
-        sb = (sb > SIDES_MIN) ? sb - 1 : SIDES_MAX;
-        turtle_init(&sc->tB, sr->cols, sr->rows, 1, sb, 2, sc->eps);
-        sc->reset_timer = 0.0f;
-        break;
-
-    /* Drawing speed */
-    case '=': case '+':
-        sc->eps *= 1.5f;
-        if (sc->eps > EPS_MAX) sc->eps = EPS_MAX;
-        sc->tA.eps = sc->tB.eps = sc->eps;
-        break;
-    case '-':
-        sc->eps /= 1.5f;
-        if (sc->eps < EPS_MIN) sc->eps = EPS_MIN;
-        sc->tA.eps = sc->tB.eps = sc->eps;
-        break;
-
-    /* Simulation Hz */
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
-
+    case 'q': case 'Q': case 27 /* ESC */:  return false;
+    case ' ':            key_pause_toggle(s);                              break;
+    case 'r': case 'R':  key_reset_both(s);                                break;
+    case 'a': case 'A':  key_change_sides(s, &s->tA, +1, 0, PAIR_TURTLE_A); break;
+    case 'z': case 'Z':  key_change_sides(s, &s->tA, -1, 0, PAIR_TURTLE_A); break;
+    case 's': case 'S':  key_change_sides(s, &s->tB, +1, 1, PAIR_TURTLE_B); break;
+    case 'x': case 'X':  key_change_sides(s, &s->tB, -1, 1, PAIR_TURTLE_B); break;
+    case '=': case '+':  key_speed_scale(s, EPS_SCALE_FACTOR);             break;
+    case '-':            key_speed_scale(s, 1.0f / EPS_SCALE_FACTOR);      break;
+    case ']':            key_sim_fps_nudge(s, +SIM_FPS_STEP);              break;
+    case '[':            key_sim_fps_nudge(s, -SIM_FPS_STEP);              break;
     default: break;
     }
     return true;
 }
 
-int main(void)
+/* ───────────────────────────────────────────────────────────────── *
+ *  §8.1 setup + per-step main-loop helpers
+ * ───────────────────────────────────────────────────────────────── */
+
+/* One-shot setup before the loop: signals, scene defaults, ncurses,
+ * turtle pair, FrameTimer seed. */
+static void scene_setup(void)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
-
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+    /* (1) seed defaults */
+    g_scene.running = 1;
+    g_scene.sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+    /* (2) bring subsystems up in dependency order */
+    screen_init(&g_scene.screen);
+    scene_init (&g_scene);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+    /* (3) seed FrameTimer */
+    g_scene.timer.frame_time  = clock_ns();
+    g_scene.timer.fps_display = 0.0;
+}
 
-    while (app->running) {
+/* Measure wall-clock dt since previous frame, capped at DT_CAP_NS so
+ * a stalled process can't dump a giant catch-up burst into the sim. */
+static int64_t frame_measure_dt(FrameTimer *tm)
+{
+    int64_t now = clock_ns();
+    int64_t dt  = now - tm->frame_time;
+    tm->frame_time = now;
+    if (dt > DT_CAP_NS) dt = DT_CAP_NS;
+    return dt;
+}
 
-        /* ── resize ──────────────────────────────────────────────── */
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
+/* Fixed-timestep sim advance — accumulate dt and consume one full
+ * sim tick whenever the accumulator crosses tick_ns. Decouples disk
+ * pace from render fps. Returns the dt_sec used for one tick (needed
+ * by screen_draw for interpolation alpha). */
+static float scene_advance_sim_burst(Scene *s, int64_t dt)
+{
+    int64_t tick_ns = TICK_NS(s->sim_fps);
+    float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
-        /* ── dt ──────────────────────────────────────────────────── */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+    s->timer.sim_accum += dt;
+    while (s->timer.sim_accum >= tick_ns) {
+        scene_tick(s, dt_sec);
+        s->timer.sim_accum -= tick_ns;
+    }
+    return dt_sec;
+}
 
-        /* ── sim accumulator (fixed timestep) ────────────────────── */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+/* Rolling-fps update — recomputes fps_display once the accumulator
+ * crosses FPS_UPDATE_MS (500 ms). */
+static void frame_tick_fps_window(FrameTimer *tm, int64_t dt)
+{
+    tm->frame_count++;
+    tm->fps_accum += dt;
+    if (tm->fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+        tm->fps_display = (double)tm->frame_count
+                        / ((double)tm->fps_accum / (double)NS_PER_SEC);
+        tm->frame_count = 0;
+        tm->fps_accum   = 0;
+    }
+}
 
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec,
-                       app->screen.cols, app->screen.rows);
-            sim_accum -= tick_ns;
-        }
+/* Sleep the remainder of one render frame so we hit RENDER_FPS = 60. */
+static void frame_cap_to_render_fps(int64_t frame_start, int64_t dt)
+{
+    int64_t elapsed = clock_ns() - frame_start + dt;
+    clock_sleep_ns(RENDER_FRAME_NS - elapsed);
+}
 
-        /* ── alpha ───────────────────────────────────────────────── */
-        float alpha = (float)sim_accum / (float)tick_ns;
+/* Drain one keystroke through scene_handle_key; return false on quit. */
+static bool scene_drain_one_key(Scene *s)
+{
+    int ch = getch();
+    if (ch == ERR) return true;
+    return scene_handle_key(s, ch);
+}
 
-        /* ── FPS counter (500 ms window) ─────────────────────────── */
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
+/* ───────────────────────────────────────────────────────────────── *
+ *  §8.2 main
+ *
+ *  Reads as the program's lifecycle:
+ *
+ *    SETUP:
+ *      scene_setup() — signals, defaults, ncurses, turtles, timer
+ *
+ *    LOOP (each frame):
+ *      1. handle pending resize
+ *      2. measure dt (capped)
+ *      3. advance sim by whole ticks (fixed-timestep accumulator)
+ *      4. tick rolling-fps window
+ *      5. sleep to hit RENDER_FPS budget
+ *      6. draw + present
+ *      7. dispatch one keystroke (quit = ESC/q/Q)
+ * ───────────────────────────────────────────────────────────────── */
+int main(void)
+{
+    scene_setup();
 
-        /* ── frame cap — sleep BEFORE render ─────────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+    while (g_scene.running) {
+        /* (1) deferred resize */
+        if (g_scene.need_resize)
+            scene_handle_resize(&g_scene);
 
-        /* ── draw + present ──────────────────────────────────────── */
-        screen_draw(&app->screen, &app->scene,
-                    fps_display, app->sim_fps, alpha, dt_sec);
+        /* (2) frame timing */
+        int64_t frame_start = g_scene.timer.frame_time;
+        int64_t dt          = frame_measure_dt(&g_scene.timer);
+
+        /* (3) fixed-step sim burst */
+        float   dt_sec = scene_advance_sim_burst(&g_scene, dt);
+        float   alpha  = (float)g_scene.timer.sim_accum
+                       / (float)TICK_NS(g_scene.sim_fps);
+
+        /* (4) rolling fps for HUD */
+        frame_tick_fps_window(&g_scene.timer, dt);
+
+        /* (5) sleep before render so frame cap is consistent */
+        frame_cap_to_render_fps(frame_start, dt);
+
+        /* (6) draw + present */
+        screen_draw(&g_scene.screen, &g_scene,
+                    g_scene.timer.fps_display, g_scene.sim_fps,
+                    alpha, dt_sec);
         screen_present();
 
-        /* ── input ───────────────────────────────────────────────── */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+        /* (7) dispatch one keystroke */
+        if (!scene_drain_one_key(&g_scene))
+            g_scene.running = 0;
     }
 
-    screen_free(&app->screen);
+    screen_free(&g_scene.screen);
     return 0;
 }

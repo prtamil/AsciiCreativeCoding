@@ -17,11 +17,11 @@ robots/
 Ai/
 fluid/
 turtle/
+geometry/
 
 ## Pending
 
 artistic/
-geometry/
 procedural/
 
  completed rest start from scratch

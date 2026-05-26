@@ -46,15 +46,19 @@
  *   ./perin_noise_flow_showcase.c   — Perlin-gradient flow.
  *
  * Section map:
- *   §1 config   — grid, patterns, glyph constants, themes
+ *   §1 config   — grid bounds, T constants, themes, HUD widths,
+ *                 sim/render budgets, MOTION-probe parameters
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes
- *   §5 vector   — noise primitives, scalar/gradient/curl helpers
+ *   §3 color    — HUD pairs + 10 themes (PAIR_BAND_BASE+0..3)
+ *   §5 vector   — NoiseField + scalar / gradient / curl primitives
  *   §6 arrow    — 8-direction ASCII arrow picker + magnitude band
- *   §7 patterns — 30 vector field visualisations + dispatch table
- *   §8 scene    — Field (per-cell arrow buffer) + Scene state + tick
- *   §9 screen   — ASCII render; HUD with pattern/tier/theme readout
- *   §10 app     — signals, resize, main loop
+ *   §7 patterns — 30 vector-field visualisations + dispatch table +
+ *                 MOTION layer (motion_probe_position, motion_spiral_dir,
+ *                 pattern_emit_arrow)
+ *   §8 scene    — ArrowGrid + PatternState + PaletteState + Scene;
+ *                 per-frame tick + evaluate
+ *   §9 screen   — viewport + ArrowGrid renderer + HUD layout helpers
+ *   §10 app     — signals, resize, key dispatch, main game loop
  *
  * Keys:
  *   q / ESC    quit
@@ -62,6 +66,10 @@
  *   r          reset (new noise seed)
  *   n / N      next pattern   (p / P previous)
  *   t / T      next / previous theme
+ *   m          toggle MOTION — compose a global stable-spiral
+ *              attractor centred on a noise-driven wandering probe
+ *              with each T1-T5 pattern's static direction; T6
+ *              unaffected (already animated)
  *   + / =      faster animation drift (× 2)
  *   -          slower animation drift (/ 2)
  *   ] / [      raise / lower simulation tick Hz
@@ -112,27 +120,55 @@
  *                    classifies the kinds of critical points (sources,
  *                    sinks, saddles, centres, spirals) that Tiers 2-5
  *                    of this file enumerate by example.
- *                  • Quilez, I. — "2D distance functions" and
- *                    "Curl noise":
- *                    https://iquilezles.org/articles/curlnoise/
+ *                  • Cabral, B. & Leedom, L. C. (1993) — "Imaging
+ *                    Vector Fields Using Line Integral Convolution",
+ *                    SIGGRAPH'93.  The other major vector-field
+ *                    visualisation school (texture advection along
+ *                    streamlines) — useful contrast to the per-cell
+ *                    arrow-glyph approach here.
  *                  • Bridson, R., Hourihan, J., Nordenstam, M. (2007) —
  *                    "Curl-Noise for Procedural Fluid Flow", SIGGRAPH'07.
  *                    Source for Tier 4 CURL_NOISE — divergence-free
  *                    flows from a noise potential via the curl operator.
  *
+ *                  PROCEDURAL NOISE (Tier 1 GRAD_NOISE / Tier 4 CURL_NOISE)
+ *                  • Perlin, K. (1985) — "An Image Synthesizer",
+ *                    SIGGRAPH'85.  Foundational noise paper; value
+ *                    noise (used in §5) is its simpler cousin —
+ *                    hash lattice corners, bilerp with smoothstep.
+ *                  • Quilez, I. — "Curl noise" and "2D distance
+ *                    functions":
+ *                    https://iquilezles.org/articles/curlnoise/
+ *
  *                  DYNAMICAL SYSTEMS (Tier 5)
- *                  • Strogatz, S. (1994) — "Nonlinear Dynamics and
- *                    Chaos".  Standard reference for the phase
+ *                  • Strogatz, S. H. (1994) — "Nonlinear Dynamics
+ *                    and Chaos".  Standard reference for the phase
  *                    portraits drawn in Tier 5 (stable node, spiral,
- *                    Hopf bifurcation, Van der Pol, pendulum).
+ *                    Hopf bifurcation, Van der Pol, pendulum); also
+ *                    the source of the spiral the MOTION layer
+ *                    composes on top of every pattern.
  *                  • Van der Pol, B. (1926) — "On 'relaxation
  *                    oscillations'", Philosophical Magazine.  Original
  *                    paper for the limit-cycle equation in Tier 5.
  *
- *                  ASCII RENDERING
+ *                  CLASSICAL PHYSICS FIELDS (Tier 3)
+ *                  • Griffiths, D. J. — "Introduction to Electro-
+ *                    dynamics" (4th ed.).  Chapter on multipole
+ *                    expansion is the textbook treatment of the
+ *                    POINT_CHARGE, DIPOLE, QUADRUPOLE, and
+ *                    WIRE_MAGNETIC fields enumerated in Tier 3.
+ *
+ *                  ASCII RENDERING (§6 arrow encoder)
  *                  • Bourke, P. — "Character representation of grey
  *                    scale images":
  *                    http://paulbourke.net/dataformats/asciiart/
+ *
+ *                  INTERACTIVE INSPIRATION (MOTION layer)
+ *                  • Treacy, E. — "material-vector-field" p5.js sketch:
+ *                    http://winkervsbecks.github.io/material-vector-field/
+ *                    Direct inspiration for the MOTION spiral compose —
+ *                    same stable-spiral linear field, but parameterised
+ *                    by a noise-driven probe instead of the mouse.
  *
  *                  COMPARE IN PROJECT
  *                  • ./curl_noise_vector_field.c — dedicated curl-noise
@@ -260,6 +296,29 @@ enum {
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
 #define HUD_LEFT_MARGIN          1
 
+/* HUD row-1 column widths — MUST match the printf format-string widths
+ * the corresponding hud_field_* helpers emit, otherwise consecutive
+ * fields overlap or leave gaps. */
+#define HUD_PATTERN_FIELD_W     21
+#define HUD_TIER_FIELD_W        15
+#define HUD_THEME_FIELD_W       17
+#define HUD_PALETTE_LABEL_W      9
+#define HUD_N_PALETTE_BANDS      4
+
+/* Viewport floor — the algorithm needs at least one MS cell, but
+ * anything tinier than this is unreadable. */
+#define MAP_W_MIN               16
+#define MAP_H_MIN                8
+
+/* Render-loop budget — sleep target for the per-frame throttle. */
+#define RENDER_FPS_TARGET       60
+#define RENDER_FRAME_BUDGET_NS  (NS_PER_SEC / RENDER_FPS_TARGET)
+
+/* Spiral-of-death guard for the fixed-timestep accumulator: cap any
+ * single frame's dt so a slow terminal can't trigger unbounded
+ * sim-tick catch-up.  See Fiedler "Fix Your Timestep!". */
+#define SIM_MAX_FRAME_DT_MS    100
+
 /* Drift multiplier — cranked by +/-. */
 #define DRIFT_MULT_MIN      1
 #define DRIFT_MULT_DEF      4
@@ -308,6 +367,38 @@ enum {
 #define BREATHE_PERIOD      4.0f
 #define ORBIT_PERIOD        8.0f
 #define ORBIT_RADIUS_FRAC   0.30f         /* fraction of half-diagonal */
+
+/* ---------- MOTION (m key) — pattern + stable-spiral composition ---- *
+ *
+ * Inspired by Eric Treacy's p5.js material-vector-field sketch
+ *   http://winkervsbecks.github.io/material-vector-field/
+ * but with a NOISE-DRIVEN probe in place of the mouse — hands-free,
+ * organic motion across the entire viewport.
+ *
+ * When MOTION is on, every cell's vector is the (weighted) SUM of two
+ * unit-length contributions:
+ *
+ *   1. pattern_dir  — the static field's direction at this cell
+ *                     (the currently-selected preset's character)
+ *   2. spiral_dir   — direction of a stable-spiral attractor centred
+ *                     on the noise-driven probe
+ *
+ *     out = pattern_dir + MOTION_SPIRAL_WEIGHT · spiral_dir
+ *
+ * Composition (not replacement) is what keeps the active preset
+ * visually distinct under MOTION — a uniform-tilted field plus
+ * spiral looks completely different from a quadrupole plus spiral.
+ *
+ * Spiral math (Eric Treacy's calcVec, eigenvalues -1 ± i):
+ *
+ *     v(dx, dy) = (dy - dx,  -dx - dy)   where (dx, dy) = cell - probe
+ *
+ * Probe position: noise-driven smooth wander across most of the
+ * screen.  Two decorrelated 1D noise channels feed (px, py) so the
+ * probe roams organically, not on a predictable orbit. */
+#define MOTION_SPIRAL_WEIGHT  1.0f         /* spiral vs pattern weight (1.0 = equal mix) */
+#define PROBE_EXTENT_FRAC     0.40f        /* wander within central 80% of screen        */
+#define PROBE_DRIFT_RATE      0.12f        /* noise sample-step per second of t          */
 
 /* Magnitude saturator scales — per pattern.  |v|_norm = |v|/(|v|+s).
  * Larger s → field has to be stronger before saturating to band 3. */
@@ -385,24 +476,69 @@ static const char *pattern_tier(Pattern p);
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
+/*
+ * Theme — a named 4-colour band ramp defining one visual style.
+ *
+ * INTENT
+ *   Decouple "which colours" from "where they're used".  §7 patterns
+ *   emit a band index ∈ {0..3} per cell; theme_apply() in §3 binds
+ *   that index to one of the four xterm-256 colours stored here.
+ *   Cycling themes (t/T) re-binds the ncurses pairs in place — no
+ *   §5/§6/§7/§8 code has to know about colour at all.
+ *
+ * CONTEXT
+ *   themes[N_THEMES] in §3 is the static table.  PaletteState.current
+ *   on Scene is the active index.  theme_apply() pushes this row's
+ *   colours into PAIR_BAND_BASE..+3; the renderer reads via
+ *   COLOR_PAIR(PAIR_BAND_BASE + band).
+ *
+ * PALETTE LOGIC
+ *   The 4 band slots form a perceptual gradient, NOT arbitrary colours:
+ *     band[0] — dim     : low-magnitude cells (field zeros, '.' dots)
+ *     band[1] — low     : weak field cells
+ *     band[2] — mid     : the dominant on-screen brightness
+ *     band[3] — bright  : strong field cells (saturating mag_norm)
+ *   Every entry MUST sit ≥ 39 in the xterm-256 cube so even band 0
+ *   stays clearly visible on default-black with A_BOLD — important
+ *   here because the MOTION layer only changes arrow DIRECTION (not
+ *   magnitude / band), so animation is only legible if even the
+ *   low-magnitude cells are bright enough to see the glyph rotate.
+ *
+ * MEMBER LOGIC
+ *   name    : ≤ 8-char ALL-CAPS label.  Stored as a literal pointer
+ *             (no copy); HUD reads themes[palette.current].name
+ *             directly.
+ *   band[4] : xterm-256 colour indices for bands 0..3.  Monotone-
+ *             brightness ramp; the RELATIVE gradient gives a theme
+ *             its character, not absolute hue.
+ *
+ * REFERENCES
+ *   • xterm-256 colour cube — indices 16..231 = 6×6×6 RGB cube,
+ *     232..255 = 24-step grayscale ramp.
+ *   • ncurses(3X) — start_color, init_pair, COLOR_PAIR.
+ */
 typedef struct {
     const char *name;
-    short       band[4];        /* xterm-256 indices, dark → bright */
+    short       band[4];        /* xterm-256 indices, dim → bright */
 } Theme;
 
 #define N_THEMES 10
 
+/* Every band ≥ 39 in the xterm-256 cube so even band 0 stays clearly
+ * legible — important here because the MOTION probe only changes arrow
+ * DIRECTION (not magnitude/band), so animation is only visible if the
+ * low-magnitude cells aren't lost in the dim end of the palette. */
 static const Theme themes[N_THEMES] = {
-    { "DEFAULT", {  24,   33,  220,  231 } },
-    { "MATRIX",  {  22,   34,   46,  118 } },
-    { "NOVA",    {  53,  129,  201,  219 } },
-    { "MONO",    { 234,  244,  250,  254 } },
-    { "OCEAN",   {  24,   33,   39,   51 } },
-    { "FIRE",    {  52,  124,  208,  226 } },
-    { "EARTH",   {  58,  100,  173,  230 } },
-    { "FOREST",  {  22,   28,   64,  144 } },
-    { "DESERT",  {  94,  130,  173,  222 } },
-    { "ARCTIC",  {  24,   39,  159,  231 } },
+    { "DEFAULT", {  75,  123,  220,  231 } },   /* sky-blue → cyan → yellow → white */
+    { "MATRIX",  {  77,  118,  156,  194 } },   /* bright green ramp                */
+    { "NOVA",    { 135,  171,  207,  219 } },   /* magenta → pink → pale pink       */
+    { "MONO",    { 247,  250,  253,  255 } },   /* light-gray ramp                  */
+    { "OCEAN",   {  81,  117,  159,  195 } },   /* cyan → pale cyan                 */
+    { "FIRE",    { 208,  214,  220,  227 } },   /* orange → yellow → pale yellow    */
+    { "EARTH",   { 143,  179,  215,  222 } },   /* tan → sand → cream               */
+    { "FOREST",  { 114,  150,  157,  194 } },   /* sage → light sage → very light   */
+    { "DESERT",  { 179,  215,  222,  229 } },   /* sand → cream → pale              */
+    { "ARCTIC",  { 117,  159,  195,  231 } },   /* pale blue → near white           */
 };
 
 /* ===================================================================== */
@@ -465,11 +601,54 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * Per-run noise seed for the Tier 1 GRAD_NOISE and Tier 4 CURL_NOISE
- * patterns.  Re-rolled on every r keypress so each reset shows a
- * fresh field topology without reseeding the global rand() state.
+ * NoiseField — per-run hash seed for the value-noise lattice that
+ * backs GRAD_NOISE (Tier 1), CURL_NOISE (Tier 4), and the MOTION
+ * probe's wander path.
+ *
+ * INTENT
+ *   Give "the noise field" an explicit owner on Scene instead of a
+ *   free file-scope global.  Re-rolling the seed on r-press refreshes
+ *   every noise-driven pattern at once without disturbing the global
+ *   rand() state (which would cascade into any other rand() user —
+ *   e.g. the terminal-colour fallback init in §3).
+ *
+ * CONTEXT
+ *   One instance lives on Scene (§8).  Mutated only by
+ *   noise_field_reseed() — at scene_init, scene_reset (r-press),
+ *   and SIGWINCH-driven app_do_resize.  Read implicitly by every
+ *   call to noise_sample() / lattice_scalar() (Tier 1 GRAD_NOISE,
+ *   Tier 4 CURL_NOISE, the MOTION probe) via the file-scope
+ *   g_lattice_seed mirror.
+ *
+ * MEMORY
+ *   One uint32_t.  No allocation.
+ *
+ * IMPLEMENTATION
+ *   The lattice hash inside lattice_scalar() is hot enough that we
+ *   thread the seed through a file-scope variable rather than passing
+ *   a NoiseField pointer through every per-cell ScalarFn2D call.
+ *   noise_field_reseed() is the only writer; g_lattice_seed is
+ *   private to §5.
+ *
+ * MEMBER LOGIC
+ *   seed : 32-bit hash seed mixed into the lattice-corner hash via
+ *          `+ g_lattice_seed`.  Re-rolled at every reset as the xor
+ *          of two rand() draws; the xor diffuses any rand()
+ *          low-bit-quality issues.
+ *
+ * REFERENCES
+ *   • Perlin, K. (1985) — "An Image Synthesizer", SIGGRAPH'85.
+ *     Foundational noise paper.  Value noise (used here) is a simpler
+ *     hash-lattice variant of Perlin's gradient noise.
+ *   • Wang, T. (1997) — "Integer hash function".  hash32() is the
+ *     same family of multiply-xor mixers used in many value-noise
+ *     implementations to avoid storing a permutation table.
  */
-static uint32_t noise_seed = 0;
+typedef struct {
+    uint32_t seed;
+} NoiseField;
+
+static uint32_t g_lattice_seed = 0;     /* set only by noise_field_reseed */
 
 static inline uint32_t hash32(uint32_t x)
 {
@@ -479,13 +658,18 @@ static inline uint32_t hash32(uint32_t x)
     return x;
 }
 
-/* Lattice corner scalar ∈ [0, 1] — same (xi, yi, seed) → same value.
- * The same primitive backs the sibling field showcases. */
+static void noise_field_reseed(NoiseField *nf)
+{
+    nf->seed       = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
+    g_lattice_seed = nf->seed;
+}
+
+/* Lattice corner scalar ∈ [0, 1] — same (xi, yi, seed) → same value. */
 static inline float lattice_scalar(int xi, int yi)
 {
     uint32_t h = (uint32_t)xi * 374761393u
                + (uint32_t)yi * 668265263u
-               + noise_seed;
+               + g_lattice_seed;
     return (float)(hash32(h) >> 8) * (1.0f / 16777215.0f);
 }
 
@@ -612,13 +796,6 @@ static inline uint8_t mag_to_band(float mag_norm)
     return (uint8_t)b;
 }
 
-/* Cell-level emit primitives.  Each pattern function writes via
- * these so the three per-cell outputs are always set together. */
-static inline void cell_skip(float *gl, uint8_t *bn, char *gy)
-{
-    *gl = 0.0f; *bn = 0; *gy = 0;
-}
-
 /* "Field zero" marker — '.' in band 0 — for cells where direction
  * is meaningless because magnitude is tiny.  Visually marks
  * equilibria, nulls, and pattern centres. */
@@ -673,6 +850,95 @@ static inline float grid_half_diag(int w, int h)
     return sqrtf(cx * cx + cy * cy);
 }
 
+/* pattern_is_animated_tier — true iff `p` is Tier 6 (always animates
+ * regardless of MOTION; its parameter IS time).  Dispatcher uses
+ * this to decide whether to gate t to 0 for T1-T5 when MOTION off. */
+static inline bool pattern_is_animated_tier(Pattern p)
+{
+    return p >= PATTERN_ROTATING_DIPOLE;
+}
+
+/* ---------- §7.M — MOTION: wandering probe + spiral composition ---- *
+ *
+ * Three tiny helpers split the MOTION feature into pure pieces:
+ *
+ *   motion_probe_position(t, w, h)         — where the invisible
+ *                                            probe is at sim time t
+ *   motion_spiral_dir   (cell, probe)      — direction of the
+ *                                            stable-spiral field
+ *                                            centred on the probe,
+ *                                            evaluated at one cell
+ *   pattern_emit_arrow  (cell, t, v, mag)  — canonical emit used by
+ *                                            all 30 patterns; folds
+ *                                            the spiral into the
+ *                                            cell's vector when t > 0
+ *
+ * See §1 MOTION docblock for the derivation and the composition rule. */
+
+/* Noise-driven smooth 2-D wander.  Two decorrelated 1-D noise
+ * channels feed x and y, giving a smooth organic trajectory across
+ * the central PROBE_EXTENT_FRAC × 2 fraction of the viewport.
+ * Deterministic given t — same t always gives the same position. */
+static inline void motion_probe_position(float t, int w, int h,
+                                         float *px, float *py)
+{
+    /* y-channel uses a large constant offset so it samples a different
+     * region of noise space → uncorrelated from x → 2-D wander. */
+    float nx = noise_sample(t * PROBE_DRIFT_RATE,        0.0f);
+    float ny = noise_sample(0.0f, t * PROBE_DRIFT_RATE + 13.7f);
+    *px = 0.5f * (float)w + PROBE_EXTENT_FRAC * (float)w * (2.0f * nx - 1.0f);
+    *py = 0.5f * (float)h + PROBE_EXTENT_FRAC * (float)h * (2.0f * ny - 1.0f);
+}
+
+/* Eric Treacy's calcVec — stable-spiral linear field centred on
+ * (px, py), eigenvalues -1 ± i, evaluated at cell (x, y) and
+ * returned as a UNIT vector so it composes with the pattern on
+ * equal magnitude footing. */
+static inline void motion_spiral_dir(int x, int y, float px, float py,
+                                     float *spx, float *spy)
+{
+    float dx = (float)x - px;
+    float dy = (float)y - py;
+    *spx =  dy - dx;
+    *spy = -dx - dy;
+    float m = sqrtf((*spx) * (*spx) + (*spy) * (*spy));
+    if (m > 1e-6f) { *spx /= m; *spy /= m; }
+}
+
+/* pattern_emit_arrow — canonical pattern-side emit.
+ *
+ *   t == 0 (MOTION off): pure static pattern direction (identical
+ *                         to a direct cell_emit_arrow call).
+ *   t  > 0 (MOTION on):  COMPOSE the pattern direction with the
+ *                         spiral direction.  Both unit-normalised
+ *                         first so neither dominates by raw scale:
+ *
+ *     out = unit(vx, vy) + MOTION_SPIRAL_WEIGHT · spiral_dir
+ *
+ * Composition (not replacement) is the key design choice — it keeps
+ * every preset visually distinct under MOTION.  Cells where pattern
+ * and spiral are anti-aligned cancel out and render as '.' (visible
+ * "neutral zones" where the two contributions disagree).
+ *
+ * mag_norm is passed through unchanged — the pattern's own intensity
+ * gradient still drives the colour band. */
+static inline void pattern_emit_arrow(int x, int y, int w, int h, float t,
+                                      float vx, float vy, float mag_norm,
+                                      float *gl, uint8_t *bn, char *gy)
+{
+    if (t > 0.0f) {
+        float px, py;   motion_probe_position(t, w, h, &px, &py);
+        float spx, spy; motion_spiral_dir(x, y, px, py, &spx, &spy);
+
+        float pm = sqrtf(vx * vx + vy * vy);
+        if (pm > 1e-6f) { vx /= pm; vy /= pm; }
+
+        vx += MOTION_SPIRAL_WEIGHT * spx;
+        vy += MOTION_SPIRAL_WEIGHT * spy;
+    }
+    cell_emit_arrow(vx, vy, mag_norm, gl, bn, gy);
+}
+
 /* ---------- Tier 1 — GRADIENT: ∇f for chosen scalars ----------------- */
 
 /* GRAD_PARABOLOID — ∇(x²+y²) = (2x, 2y).  Radial outward; magnitude
@@ -680,13 +946,13 @@ static inline float grid_half_diag(int w, int h)
 static void pattern_grad_paraboloid(int x, int y, int w, int h, float t,
                                     float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float vx, vy;
     scalar_gradient(scalar_paraboloid, (float)x - cx, (float)y - cy, &vx, &vy);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, grid_half_diag(w, h) * SCALE_GRADIENT),
-                    gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, grid_half_diag(w, h) * SCALE_GRADIENT),
+        gl, bn, gy);
 }
 
 /* GRAD_SADDLE — ∇(x²-y²) = (2x, -2y).  Pushes outward along ±x,
@@ -694,13 +960,13 @@ static void pattern_grad_paraboloid(int x, int y, int w, int h, float t,
 static void pattern_grad_saddle(int x, int y, int w, int h, float t,
                                 float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float vx, vy;
     scalar_gradient(scalar_saddle, (float)x - cx, (float)y - cy, &vx, &vy);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, grid_half_diag(w, h) * SCALE_GRADIENT),
-                    gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, grid_half_diag(w, h) * SCALE_GRADIENT),
+        gl, bn, gy);
 }
 
 /* GRAD_PERIODIC — ∇(sin(kx)·cos(ky)).  Periodic grid of maxima/minima
@@ -708,11 +974,11 @@ static void pattern_grad_saddle(int x, int y, int w, int h, float t,
 static void pattern_grad_periodic(int x, int y, int w, int h, float t,
                                   float *gl, uint8_t *bn, char *gy)
 {
-    (void)w; (void)h; (void)t;
     float vx, vy;
     scalar_gradient(scalar_periodic, (float)x, (float)y, &vx, &vy);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_BOUNDED), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_BOUNDED), gl, bn, gy);
 }
 
 /* GRAD_RIPPLE — ∇cos(k·r), where r = √(x²+y²).  Concentric "lake
@@ -720,12 +986,12 @@ static void pattern_grad_periodic(int x, int y, int w, int h, float t,
 static void pattern_grad_ripple(int x, int y, int w, int h, float t,
                                 float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float vx, vy;
     scalar_gradient(scalar_ripple, (float)x - cx, (float)y - cy, &vx, &vy);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_BOUNDED), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_BOUNDED), gl, bn, gy);
 }
 
 /* GRAD_NOISE — ∇(value-noise).  Smooth-but-random gradient field; the
@@ -734,12 +1000,12 @@ static void pattern_grad_ripple(int x, int y, int w, int h, float t,
 static void pattern_grad_noise(int x, int y, int w, int h, float t,
                                float *gl, uint8_t *bn, char *gy)
 {
-    (void)w; (void)h; (void)t;
     float vx, vy;
     scalar_gradient(scalar_noise, (float)x, (float)y, &vx, &vy);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_NOISE_GRAD * NOISE_FREQ),
-                    gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_NOISE_GRAD * NOISE_FREQ),
+        gl, bn, gy);
 }
 
 /* ---------- Tier 2 — ANALYTIC: classical 2-D vector fields ----------- */
@@ -748,24 +1014,24 @@ static void pattern_grad_noise(int x, int y, int w, int h, float t,
 static void pattern_radial_out(int x, int y, int w, int h, float t,
                                float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float vx = (float)x - cx, vy = (float)y - cy;
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, grid_half_diag(w, h) * SCALE_RADIAL_HALFDIAG),
-                    gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, grid_half_diag(w, h) * SCALE_RADIAL_HALFDIAG),
+        gl, bn, gy);
 }
 
 /* RADIAL_IN — v = -(dx, dy).  Pure radial sink; everything inward. */
 static void pattern_radial_in(int x, int y, int w, int h, float t,
                               float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float vx = -((float)x - cx), vy = -((float)y - cy);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, grid_half_diag(w, h) * SCALE_RADIAL_HALFDIAG),
-                    gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, grid_half_diag(w, h) * SCALE_RADIAL_HALFDIAG),
+        gl, bn, gy);
 }
 
 /* ROTATION — v = (-dy, dx).  Textbook math-CCW rotation; on a screen
@@ -773,13 +1039,13 @@ static void pattern_radial_in(int x, int y, int w, int h, float t,
 static void pattern_rotation(int x, int y, int w, int h, float t,
                              float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float dx = (float)x - cx, dy = (float)y - cy;
     float vx = -dy, vy = dx;
     float mag = sqrtf(dx * dx + dy * dy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, grid_half_diag(w, h) * SCALE_RADIAL_HALFDIAG),
-                    gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, grid_half_diag(w, h) * SCALE_RADIAL_HALFDIAG),
+        gl, bn, gy);
 }
 
 /* SHEAR_X — v = (dy, 0).  Top row moves one way, bottom row the
@@ -787,24 +1053,23 @@ static void pattern_rotation(int x, int y, int w, int h, float t,
 static void pattern_shear_x(int x, int y, int w, int h, float t,
                             float *gl, uint8_t *bn, char *gy)
 {
-    (void)x; (void)t; (void)w;
+    (void)x; (void)w;
     float cy = 0.5f * (float)h;
     float vx = (float)y - cy, vy = 0.0f;
     float mag = fabsf(vx);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, 0.5f * (float)h),
-                    gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, 0.5f * (float)h), gl, bn, gy);
 }
 
 /* UNIFORM_TILTED — v = (cos 30°, sin 30°).  Constant flow at 30° below
  * horizontal (mild SE drift).  Sanity-check pattern: every cell
- * should show the same glyph. */
+ * should show the same glyph (until MOTION's probe disturbs locally). */
 static void pattern_uniform_tilted(int x, int y, int w, int h, float t,
                                    float *gl, uint8_t *bn, char *gy)
 {
-    (void)x; (void)y; (void)w; (void)h; (void)t;
     float vx = cosf((float)M_PI / 6.0f);
     float vy = sinf((float)M_PI / 6.0f);
-    cell_emit_arrow(vx, vy, 0.7f, gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy, 0.7f, gl, bn, gy);
 }
 
 /* ---------- Tier 3 — PHYSICS: real-world named fields --------------- */
@@ -815,13 +1080,13 @@ static void pattern_uniform_tilted(int x, int y, int w, int h, float t,
 static void pattern_point_charge(int x, int y, int w, int h, float t,
                                  float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float dx = (float)x - cx, dy = (float)y - cy;
     float r2 = dx * dx + dy * dy + COULOMB_SOFT_EPS * COULOMB_SOFT_EPS;
     float vx = dx / r2, vy = dy / r2;
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_INV_SQ), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_INV_SQ), gl, bn, gy);
 }
 
 /* DIPOLE — two charges at (cx - d, cy) [+1] and (cx + d, cy) [-1].
@@ -830,7 +1095,6 @@ static void pattern_point_charge(int x, int y, int w, int h, float t,
 static void pattern_dipole(int x, int y, int w, int h, float t,
                            float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float d  = DIPOLE_HALF_SEP;
     float eps2 = COULOMB_SOFT_EPS * COULOMB_SOFT_EPS;
@@ -846,7 +1110,8 @@ static void pattern_dipole(int x, int y, int w, int h, float t,
     float vx = ax / ar2 - bx / br2;
     float vy = ay / ar2 - by / br2;
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_INV_SQ), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_INV_SQ), gl, bn, gy);
 }
 
 /* WIRE_MAGNETIC — infinite straight wire carrying current OUT of the
@@ -856,13 +1121,13 @@ static void pattern_dipole(int x, int y, int w, int h, float t,
 static void pattern_wire_magnetic(int x, int y, int w, int h, float t,
                                   float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float dx = (float)x - cx, dy = (float)y - cy;
     float r2 = dx * dx + dy * dy + COULOMB_SOFT_EPS * COULOMB_SOFT_EPS;
     float vx = -dy / r2, vy = dx / r2;
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_INV_R), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_INV_R), gl, bn, gy);
 }
 
 /* GRAVITY — point mass at screen centre.  Attractive inverse-square:
@@ -870,14 +1135,14 @@ static void pattern_wire_magnetic(int x, int y, int w, int h, float t,
 static void pattern_gravity(int x, int y, int w, int h, float t,
                             float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float dx = (float)x - cx, dy = (float)y - cy;
     float r2 = dx * dx + dy * dy + COULOMB_SOFT_EPS * COULOMB_SOFT_EPS;
     float r  = sqrtf(r2);
     float vx = -dx / (r2 * r), vy = -dy / (r2 * r);
     float mag = 1.0f / r2;
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_INV_SQ), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_INV_SQ), gl, bn, gy);
 }
 
 /* QUADRUPOLE — 4 alternating charges at (±d, ±d) with signs:
@@ -888,7 +1153,6 @@ static void pattern_gravity(int x, int y, int w, int h, float t,
 static void pattern_quadrupole(int x, int y, int w, int h, float t,
                                float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float d  = QUADRUPOLE_HALF;
     float eps2 = COULOMB_SOFT_EPS * COULOMB_SOFT_EPS;
@@ -907,7 +1171,8 @@ static void pattern_quadrupole(int x, int y, int w, int h, float t,
         vy += sg[i] * ay / ar2;
     }
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_INV_SQ), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_INV_SQ), gl, bn, gy);
 }
 
 /* ---------- Tier 4 — SOLENOID: divergence-free flows ----------------- */
@@ -918,12 +1183,11 @@ static void pattern_quadrupole(int x, int y, int w, int h, float t,
 static void pattern_curl_noise(int x, int y, int w, int h, float t,
                                float *gl, uint8_t *bn, char *gy)
 {
-    (void)w; (void)h; (void)t;
     float vx, vy;
     scalar_curl_2d(scalar_noise, (float)x, (float)y, &vx, &vy);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_NOISE_GRAD * NOISE_FREQ),
-                    gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_NOISE_GRAD * NOISE_FREQ), gl, bn, gy);
 }
 
 /* Stream function ψ for STREAM_GRID — a 2-D grid of alternating
@@ -939,11 +1203,11 @@ static float scalar_stream_grid(float x, float y)
 static void pattern_stream_grid(int x, int y, int w, int h, float t,
                                 float *gl, uint8_t *bn, char *gy)
 {
-    (void)w; (void)h; (void)t;
     float vx, vy;
     scalar_curl_2d(scalar_stream_grid, (float)x, (float)y, &vx, &vy);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_BOUNDED * 0.3f), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_BOUNDED * 0.3f), gl, bn, gy);
 }
 
 /* VORTEX_PAIR — two opposite rotational centres: one CCW at (cx - d, cy),
@@ -953,7 +1217,6 @@ static void pattern_stream_grid(int x, int y, int w, int h, float t,
 static void pattern_vortex_pair(int x, int y, int w, int h, float t,
                                 float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float d  = DIPOLE_HALF_SEP;
     float eps2 = COULOMB_SOFT_EPS * COULOMB_SOFT_EPS;
@@ -968,7 +1231,8 @@ static void pattern_vortex_pair(int x, int y, int w, int h, float t,
     float vx = (-ay / ar2) + ( by / br2);
     float vy = ( ax / ar2) + (-bx / br2);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_INV_R), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_INV_R), gl, bn, gy);
 }
 
 /* CHANNEL_FLOW — Poiseuille parabolic profile in a channel along x.
@@ -977,11 +1241,11 @@ static void pattern_vortex_pair(int x, int y, int w, int h, float t,
 static void pattern_channel_flow(int x, int y, int w, int h, float t,
                                  float *gl, uint8_t *bn, char *gy)
 {
-    (void)x; (void)w; (void)t;
+    (void)w;
     float u = 2.0f * (float)y / (float)(h - 1) - 1.0f;     /* u ∈ [-1, +1] */
     float vx = 1.0f - u * u;                               /* parabolic */
     float vy = 0.0f;
-    cell_emit_arrow(vx, vy, vx * 0.9f, gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy, vx * 0.9f, gl, bn, gy);
 }
 
 /* NOISY_UNIFORM — v = (1, 0) + small noise gradient.  Uniform
@@ -990,13 +1254,13 @@ static void pattern_channel_flow(int x, int y, int w, int h, float t,
 static void pattern_noisy_uniform(int x, int y, int w, int h, float t,
                                   float *gl, uint8_t *bn, char *gy)
 {
-    (void)w; (void)h; (void)t;
     float nx, ny;
     scalar_gradient(scalar_noise, (float)x, (float)y, &nx, &ny);
     float vx = 1.0f + nx * 4.0f;
     float vy =        ny * 4.0f;
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, 1.5f), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, 1.5f), gl, bn, gy);
 }
 
 /* ---------- Tier 5 — DYNAMICS: 2-D ODE phase portraits -------------- *
@@ -1028,12 +1292,12 @@ static inline void cell_to_phase(int x, int y, int w, int h, float half_extent,
 static void pattern_stable_node(int x, int y, int w, int h, float t,
                                 float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float xp, yp;
     cell_to_phase(x, y, w, h, PHASE_HALF_EXTENT, &xp, &yp);
     float vx = -xp, vy = -yp;
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_PHASE), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_PHASE), gl, bn, gy);
 }
 
 /* STABLE_SPIRAL — dx/dt = -x_p - y_p,  dy/dt =  x_p - y_p.
@@ -1042,13 +1306,13 @@ static void pattern_stable_node(int x, int y, int w, int h, float t,
 static void pattern_stable_spiral(int x, int y, int w, int h, float t,
                                   float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float xp, yp;
     cell_to_phase(x, y, w, h, PHASE_HALF_EXTENT, &xp, &yp);
     float vx = -xp - yp;
     float vy =  xp - yp;
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_PHASE), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_PHASE), gl, bn, gy);
 }
 
 /* HOPF_CYCLE — Hopf normal form:
@@ -1061,7 +1325,6 @@ static void pattern_stable_spiral(int x, int y, int w, int h, float t,
 static void pattern_hopf_cycle(int x, int y, int w, int h, float t,
                                float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float xp, yp;
     cell_to_phase(x, y, w, h, PHASE_HALF_EXTENT, &xp, &yp);
     float r2  = xp * xp + yp * yp;
@@ -1069,7 +1332,8 @@ static void pattern_hopf_cycle(int x, int y, int w, int h, float t,
     float vx = mu_minus_r2 * xp - yp;
     float vy = xp + mu_minus_r2 * yp;
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_PHASE), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_PHASE), gl, bn, gy);
 }
 
 /* VAN_DER_POL — relaxation oscillator (van der Pol 1926):
@@ -1081,13 +1345,13 @@ static void pattern_hopf_cycle(int x, int y, int w, int h, float t,
 static void pattern_van_der_pol(int x, int y, int w, int h, float t,
                                 float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     float xp, yp;
     cell_to_phase(x, y, w, h, PHASE_HALF_EXTENT, &xp, &yp);
     float vx = yp;
     float vy = VDP_MU * (1.0f - xp * xp) * yp - xp;
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_PHASE * 2.0f), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_PHASE * 2.0f), gl, bn, gy);
 }
 
 /* PENDULUM — undamped nonlinear pendulum:
@@ -1102,7 +1366,6 @@ static void pattern_van_der_pol(int x, int y, int w, int h, float t,
 static void pattern_pendulum(int x, int y, int w, int h, float t,
                              float *gl, uint8_t *bn, char *gy)
 {
-    (void)t;
     /* Phase x ∈ [-π, π]; phase y ∈ [-3, 3]. */
     float cx = 0.5f * (float)w, cy = 0.5f * (float)h;
     float xp = ((float)x - cx) * (PENDULUM_X_HALF_EXTENT / cx);
@@ -1110,7 +1373,8 @@ static void pattern_pendulum(int x, int y, int w, int h, float t,
     float vx = yp;
     float vy = -sinf(xp);
     float mag = sqrtf(vx * vx + vy * vy);
-    cell_emit_arrow(vx, vy, mag_saturate(mag, SCALE_PHASE), gl, bn, gy);
+    pattern_emit_arrow(x, y, w, h, t, vx, vy,
+        mag_saturate(mag, SCALE_PHASE), gl, bn, gy);
 }
 
 /* ---------- Tier 6 — ANIMATED: time-varying vector fields ----------- */
@@ -1215,9 +1479,49 @@ static void pattern_drift_curl(int x, int y, int w, int h, float t,
 
 /* ---------- Dispatch table ------------------------------------------- */
 
+/*
+ * VectorPattern — one row of the §7 pattern dispatch table.
+ *
+ * INTENT
+ *   Replace a per-cell switch(Pattern) with a single function-pointer
+ *   indirect call.  arrow_grid_evaluate's hot loop becomes
+ *   `sample(x, y, …)` — no branch on pattern type, one cache-friendly
+ *   table.  Adding a new pattern is a three-line edit: write the fn,
+ *   append a row here, add its enum.  The fixed-size [N_PATTERNS]
+ *   initialiser keyed by enum makes the compiler complain if the
+ *   table is incomplete or mis-ordered.
+ *
+ * CONTEXT
+ *   vector_patterns[N_PATTERNS] in §7 is the singular static table.
+ *   Read by arrow_grid_evaluate (resolves .sample) and by
+ *   pattern_name / pattern_tier (HUD readouts).  Never mutated at
+ *   runtime — defined `const` so it lives in .rodata.
+ *
+ * MEMBER LOGIC
+ *   name   : HUD label, RIGHT-padded to exactly 10 chars so the
+ *            "%-10s" format produces aligned columns when the user
+ *            cycles patterns via n/p.
+ *   tier   : "N-XXXX " 7-char label encoding tier index (1..6) plus
+ *            a 4-char mnemonic (GRAD/ANAL/PHYS/SOLN/DYNS/ANIM).
+ *            Displayed next to the pattern name in the HUD.
+ *   sample : Per-cell function pointer matching VectorPatternFn.
+ *            Called once per cell per sim tick (~11K cells × 60 Hz
+ *            = ~660K calls/sec).  Writes the three output slots
+ *            (glow, band, glyph) in the ArrowGrid via
+ *            pattern_emit_arrow (which folds in the MOTION layer
+ *            when t > 0).
+ *
+ * REFERENCES
+ *   • Designated initialisers (C99 §6.7.9) — `[INDEX] = { … }` lets
+ *     the table be defined out of declaration order while staying
+ *     enum-keyed.
+ *   • Function-pointer dispatch — Bryant & O'Hallaron, "Computer
+ *     Systems: A Programmer's Perspective" §3.10 for the compiled-
+ *     code shape of an indirect call vs a switch.
+ */
 typedef struct {
-    const char      *name;        /* 10-char padded for HUD alignment  */
-    const char      *tier;        /* 7-char "N-LABEL " padded          */
+    const char      *name;        /* 10-char padded for HUD alignment */
+    const char      *tier;        /* 7-char "N-LABEL " padded         */
     VectorPatternFn  sample;
 } VectorPattern;
 
@@ -1273,95 +1577,332 @@ static const char *pattern_tier(Pattern p)
 }
 
 /* ===================================================================== */
-/* §8  scene                                                              */
+/* §8  scene — ArrowGrid + PatternState + PaletteState + Scene            */
 /* ===================================================================== */
 
+/*
+ * ArrowGrid — per-cell render-output buffer (the §7 → §9 hand-off).
+ *
+ * INTENT
+ *   Decouple "compute what to draw" (pattern fn writes a vector per
+ *   cell, then pattern_emit_arrow converts it to glyph + band) from
+ *   "actually draw it" (renderer in §9 reads glyph + band and paints).
+ *   Conceptually the same role as a tile/cell framebuffer in a
+ *   software renderer — only character-cell granularity, not per-pixel.
+ *
+ * CONTEXT
+ *   One instance lives on Scene (§8).  Written by
+ *   arrow_grid_evaluate() once per sim tick (one pattern-fn call per
+ *   cell).  Read by arrow_grid_paint() once per render frame.  Index
+ *   with arrow_grid_idx(grid, x, y) = y · w + x — row-major.
+ *
+ * MEMORY
+ *   glow[] + band[] + glyph[] = 4 + 1 + 1 = 6 bytes/cell × CELLS_MAX
+ *   ≈ 66 KB in BSS.  No allocation.  Cache-cold only at the start
+ *   of each evaluate pass; the (sample, write) cycle stays inside
+ *   the inner loop.
+ *
+ * MEMBER LOGIC
+ *   w, h    : Grid dimensions in cells.  Set by arrow_grid_reset()
+ *             at scene_reset / SIGWINCH.
+ *   count   : w · h, cached for the zero-init loop.
+ *   glow[]  : Per-cell visibility flag: > 0.0 = paint, ≤ 0.0 = skip.
+ *             Stored as float (not bool) so patterns COULD scale it
+ *             for intensity if a future feature needs it; the
+ *             renderer currently just thresholds against 0.
+ *   band[]  : Palette band ∈ {0..3} → PAIR_BAND_BASE + band.  Bottom
+ *             2 bits used (`band & 3` clamps); patterns are expected
+ *             to write a clean value, the mask is defensive.
+ *   glyph[] : ASCII char the renderer emits.  0 also = skip
+ *             (defensive double-gate, in case a pattern set glow > 0
+ *             but forgot to pick a glyph — which would be a bug).
+ *
+ * REFERENCES
+ *   • Deferred-shading pattern — separate "decide what to draw" from
+ *     "draw it" via an intermediate buffer.  Akenine-Möller et al.,
+ *     "Real-Time Rendering" (4th ed.) §20.1.
+ *   • Struct-of-Arrays (three parallel arrays) instead of
+ *     Array-of-Structs (one packed record per cell) — chosen because
+ *     the renderer iterates the three fields in lock-step and the
+ *     SoA layout avoids padding waste on the 1-byte fields.
+ */
 typedef struct {
     int      w, h;
-    int      total_cells;
+    int      count;
+    float    glow [CELLS_MAX];
+    uint8_t  band [CELLS_MAX];
+    char     glyph[CELLS_MAX];
+} ArrowGrid;
 
-    /* Per-cell render outputs — patterns write, §9 reads.
-     *   trail_glow  : 1.0 = paint at this cell, 0.0 = skip
-     *   trail_color : palette band ∈ {0..3} → PAIR_BAND_BASE + band
-     *   trail_glyph : ASCII char to draw; 0 = skip (defensive)
-     */
-    float    trail_glow [CELLS_MAX];
-    uint8_t  trail_color[CELLS_MAX];
-    char     trail_glyph[CELLS_MAX];
-
-    float    field_time;   /* drift accumulator (seconds) — drives Tier 6 */
-} Field;
-
-static inline int field_idx(const Field *f, int x, int y) { return y * f->w + x; }
-
-static void field_reset(Field *f, int w, int h)
+static inline int arrow_grid_idx(const ArrowGrid *g, int x, int y)
 {
-    f->w = w;
-    f->h = h;
-    f->total_cells = w * h;
-    f->field_time  = 0.0f;
-    for (int i = 0; i < f->total_cells; i++) {
-        f->trail_glow[i]  = 0.0f;
-        f->trail_color[i] = 0;
-        f->trail_glyph[i] = 0;
-    }
-    /* Re-roll noise seed so noise-driven patterns refresh on r. */
-    noise_seed = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
+    return y * g->w + x;
 }
 
-/* Dispatch the active pattern at every cell. */
-static void field_render(Field *f, Pattern p)
+static void arrow_grid_reset(ArrowGrid *g, int w, int h)
+{
+    g->w     = w;
+    g->h     = h;
+    g->count = w * h;
+    for (int i = 0; i < g->count; i++) {
+        g->glow [i] = 0.0f;
+        g->band [i] = 0;
+        g->glyph[i] = 0;
+    }
+}
+
+/* arrow_grid_evaluate — sweep every cell, calling the active pattern
+ * fn with the supplied animation time t.  Pure grid-walk dispatch —
+ * the t-gate decision (motion+tier → t=0 or t=field_time) is made by
+ * scene_evaluate above this layer. */
+static void arrow_grid_evaluate(ArrowGrid *g, Pattern p, float t)
 {
     if ((unsigned)p >= (unsigned)N_PATTERNS) return;
     VectorPatternFn sample = vector_patterns[p].sample;
-
-    for (int y = 0; y < f->h; y++) {
-        for (int x = 0; x < f->w; x++) {
-            int idx = field_idx(f, x, y);
-            sample(x, y, f->w, f->h, f->field_time,
-                   &f->trail_glow[idx],
-                   &f->trail_color[idx],
-                   &f->trail_glyph[idx]);
+    for (int y = 0; y < g->h; y++) {
+        for (int x = 0; x < g->w; x++) {
+            int idx = arrow_grid_idx(g, x, y);
+            sample(x, y, g->w, g->h, t,
+                   &g->glow [idx],
+                   &g->band [idx],
+                   &g->glyph[idx]);
         }
     }
 }
 
+/*
+ * PatternState — active pattern + animation clock + drift speed.
+ *
+ * INTENT
+ *   Group the three values that together describe "what's animating
+ *   right now": which pattern is active, how far along the animation
+ *   clock has advanced, and at what speed multiplier.  They change
+ *   together, they are read together, and they all feed the pattern
+ *   dispatcher — one struct centralises the dataflow.
+ *
+ * CONTEXT
+ *   Lives on Scene (§8).  Read by:
+ *     • scene_evaluate() — passes t (gated by motion + tier) to
+ *                          arrow_grid_evaluate.
+ *     • scene_tick()     — advances field_time by drift_mult · dt
+ *                          each tick (via pattern_state_advance_clock).
+ *     • screen_draw()    — HUD readouts (pattern name, t).
+ *   Mutated by app_handle_key():
+ *     • n/p   → current      (modular wraparound through N_PATTERNS)
+ *     • +/-   → drift_mult   (×2 / ÷2, clamped to [MIN, MAX])
+ *
+ * MEMBER LOGIC
+ *   current     : Active pattern enum, indexes vector_patterns[].
+ *                 Defaults to PATTERN_GRAD_PARABOLOID.
+ *   field_time  : Drift accumulator (seconds).  Drives Tier 6
+ *                 animation directly (their parameter IS time) and
+ *                 the MOTION probe's noise sampling when motion is on.
+ *                 Monotonically increasing within a run; reset by r.
+ *   drift_mult  : Power-of-2 speed multiplier ∈ [DRIFT_MULT_MIN,
+ *                 DRIFT_MULT_MAX] that scales field_time advancement.
+ *                 Same convention as sibling showcases.
+ */
 typedef struct {
-    Field   F;
-    bool    paused;
-    int     drift_mult;
-    int     current_theme;
-    Pattern current_pattern;
+    Pattern  current;
+    float    field_time;
+    int      drift_mult;
+} PatternState;
+
+static void pattern_state_init(PatternState *ps)
+{
+    ps->current     = PATTERN_GRAD_PARABOLOID;
+    ps->field_time  = 0.0f;
+    ps->drift_mult  = DRIFT_MULT_DEF;
+}
+
+/* Advance the animation clock by one frame at the current drift_mult. */
+static void pattern_state_advance_clock(PatternState *ps, float dt)
+{
+    ps->field_time += FIELD_DRIFT * (float)ps->drift_mult * dt;
+}
+
+/* Cycle through the pattern enum modulo N_PATTERNS. */
+static void pattern_state_cycle_next(PatternState *ps)
+{
+    ps->current = (Pattern)(((int)ps->current + 1) % N_PATTERNS);
+}
+static void pattern_state_cycle_prev(PatternState *ps)
+{
+    ps->current = (Pattern)(((int)ps->current + N_PATTERNS - 1) % N_PATTERNS);
+}
+
+/* Power-of-2 step on drift_mult, clamped to [DRIFT_MULT_MIN, MAX]. */
+static void pattern_state_drift_faster(PatternState *ps)
+{
+    if (ps->drift_mult < DRIFT_MULT_MAX) ps->drift_mult *= 2;
+    if (ps->drift_mult > DRIFT_MULT_MAX) ps->drift_mult  = DRIFT_MULT_MAX;
+}
+static void pattern_state_drift_slower(PatternState *ps)
+{
+    ps->drift_mult /= 2;
+    if (ps->drift_mult < DRIFT_MULT_MIN) ps->drift_mult = DRIFT_MULT_MIN;
+}
+
+/*
+ * PaletteState — index of the currently-active Theme.
+ *
+ * INTENT
+ *   A one-int wrapper is overkill data-wise but valuable structurally:
+ *   gives "which colour scheme is showing" a stable home on Scene,
+ *   matches the sub-struct convention used by sibling showcases, and
+ *   makes the t/T key handler read as `s->palette.current = …`
+ *   instead of `s->theme_idx = …`.
+ *
+ * CONTEXT
+ *   Lives on Scene (§8).  Mutated by app_handle_key() on t/T (with
+ *   modular wraparound through N_THEMES) and by palette_state_init()
+ *   at reset.  Whenever it changes, theme_apply() (§3) MUST be
+ *   called to push the new Theme's colour indices into the ncurses
+ *   colour pairs — this struct holds the index, ncurses holds the
+ *   actual pair bindings.  Read by screen_draw() for the HUD label.
+ *
+ * MEMBER LOGIC
+ *   current : Index into themes[] ∈ [0, N_THEMES).  Anything outside
+ *             that range is invalid; theme_apply() clamps to 0
+ *             defensively.
+ */
+typedef struct {
+    int current;
+} PaletteState;
+
+static void palette_state_init(PaletteState *p) { p->current = 0; }
+
+static void palette_state_cycle_next(PaletteState *p)
+{
+    p->current = (p->current + 1) % N_THEMES;
+}
+static void palette_state_cycle_prev(PaletteState *p)
+{
+    p->current = (p->current + N_THEMES - 1) % N_THEMES;
+}
+
+/*
+ * Scene — composite owner of ALL mutable simulation state.
+ *
+ * INTENT
+ *   Single root that the main loop (§10), the simulation step
+ *   (scene_tick), and the renderer (§9) all share.  Composes the
+ *   sub-domains as named members so their roles are explicit at the
+ *   type level instead of buried in a flat field list.  Each
+ *   sub-struct owns one concern; Scene owns the composition + the
+ *   two UI gates (paused, motion).
+ *
+ * THE PIPELINE (top to bottom = dataflow order)
+ *
+ *   noise    — value-noise lattice seed                 (the SOURCE)
+ *               ↓ (read by GRAD_NOISE / CURL_NOISE / MOTION probe)
+ *   pattern  — active pattern + field_time + drift_mult (the CONTROL)
+ *               ↓ (drives arrow_grid_evaluate)
+ *   grid     — per-cell (glow, band, glyph) buffer      (the OUTPUT)
+ *               ↓ (read by arrow_grid_paint in §9)
+ *   palette  — active theme index                       (the COLOUR)
+ *               + paused / motion flags                 (the GATES)
+ *
+ * CONTEXT
+ *   One instance, owned by App in §10.  Touched only from the main
+ *   thread — the signal handlers in §10 do NOT reach into Scene;
+ *   they flip volatile flags on App and let the main loop respond
+ *   at the next frame boundary.
+ *
+ * LIFETIME
+ *   scene_init   : zero-init, sub-struct defaults, call scene_reset.
+ *   scene_reset  : re-roll NoiseField, zero ArrowGrid + clocks,
+ *                  paint the initial frame.  Called on r and on
+ *                  SIGWINCH-driven resize.
+ *   scene_tick   : advance pattern clock, re-evaluate the grid.
+ *   No teardown — Scene lives in BSS via App; OS reclaims at exit.
+ *
+ * MEMBER LOGIC
+ *   noise   : NoiseField   — value-noise lattice seed.
+ *   grid    : ArrowGrid    — per-cell render-output buffer.
+ *   pattern : PatternState — active pattern + clocks + drift.
+ *   palette : PaletteState — active theme index.
+ *   paused  : When true, scene_tick early-returns, freezing both
+ *             the field-drift clock and the MOTION probe.  Renderer
+ *             keeps drawing the last computed grid → still frame.
+ *             Toggled by space.
+ *   motion  : When true, scene_evaluate passes t = field_time
+ *             (instead of 0) to T1-T5 patterns, enabling
+ *             pattern_emit_arrow's spiral composition.  Toggled by m.
+ */
+typedef struct {
+    NoiseField   noise;
+    ArrowGrid    grid;
+    PatternState pattern;
+    PaletteState palette;
+    bool         paused;     /* space — freeze sim ticks   */
+    bool         motion;     /* m     — enable probe overlay on T1-T5 */
 } Scene;
+
+/* scene_evaluate — decide t-gate (motion + tier), then dispatch the
+ * active pattern across the grid.  T6 patterns always receive
+ * t = field_time (their own animation drives them); T1-T5 patterns
+ * receive t = 0 unless MOTION is on (the probe needs t > 0 to fire). */
+static void scene_evaluate(Scene *s)
+{
+    Pattern p = s->pattern.current;
+    float   t = (s->motion || pattern_is_animated_tier(p))
+              ? s->pattern.field_time : 0.0f;
+    arrow_grid_evaluate(&s->grid, p, t);
+}
 
 static void scene_reset(Scene *s, int mw, int mh)
 {
-    field_reset(&s->F, mw, mh);
-    field_render(&s->F, s->current_pattern);     /* paint initial frame */
+    noise_field_reseed(&s->noise);
+    arrow_grid_reset  (&s->grid, mw, mh);
+    s->pattern.field_time = 0.0f;
+    scene_evaluate(s);                          /* paint initial frame */
 }
 
 static void scene_init(Scene *s, int mw, int mh)
 {
     memset(s, 0, sizeof *s);
-    s->paused          = false;
-    s->drift_mult      = DRIFT_MULT_DEF;
-    s->current_theme   = 0;
-    s->current_pattern = PATTERN_GRAD_PARABOLOID;
+    pattern_state_init (&s->pattern);
+    palette_state_init (&s->palette);
+    s->paused = false;
+    s->motion = false;
     scene_reset(s, mw, mh);
 }
 
 static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
-    Field *f = &s->F;
-    f->field_time += FIELD_DRIFT * (float)s->drift_mult * dt;
-    field_render(f, s->current_pattern);
+    pattern_state_advance_clock(&s->pattern, dt);
+    scene_evaluate(s);
 }
 
 /* ===================================================================== */
 /* §9  screen                                                             */
 /* ===================================================================== */
 
+/*
+ * Screen — ncurses viewport dimensions cache.
+ *
+ * INTENT
+ *   ncurses owns the terminal state.  We just need to know "how
+ *   wide / tall is the drawable area right now" so arrow_grid_paint
+ *   can centre the grid and the HUD helpers can right-align text
+ *   without re-querying ncurses on every paint.  Updated lazily on
+ *   resize.
+ *
+ * CONTEXT
+ *   One instance lives on App (§10).  Refreshed by screen_init() at
+ *   startup and screen_resize() on SIGWINCH.  Read by every render
+ *   fn that needs to know where edges or centres are.
+ *
+ * MEMBER LOGIC
+ *   cols : Viewport width in character cells.  Source of truth is
+ *          getmaxyx(stdscr, ..., cols) inside screen_init /
+ *          screen_resize.
+ *   rows : Viewport height in character cells.  Includes the HUD
+ *          band — render fns subtract HUD_BAND_RESERVED_ROWS as
+ *          needed to get the drawable interior.
+ */
 typedef struct { int cols, rows; } Screen;
 
 static void screen_init(Screen *s)
@@ -1384,99 +1925,177 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void scene_draw(const Scene *s, int cols, int rows)
+/* ---------- arrow_grid_paint helpers (field painter) ----------------- */
+
+/* viewport_centre_grid_origin — top-left screen cell where a grid of
+ * grid_w × grid_h sits inside cols × rows.  HUD-aware: leaves
+ * HUD_TOP_ROWS reserved above and HUD_BOTTOM_ROWS below.  Clamps to
+ * the HUD edge if the grid is larger than the drawable interior. */
+static void viewport_centre_grid_origin(int cols, int rows,
+                                        int grid_w, int grid_h,
+                                        int *gx0, int *gy0)
 {
-    const Field *f = &s->F;
+    int interior_h = rows - HUD_BAND_RESERVED_ROWS;
+    *gx0 = (cols       - grid_w) / 2;
+    *gy0 = (interior_h - grid_h) / 2 + HUD_TOP_ROWS;
+    if (*gx0 < 0)            *gx0 = 0;
+    if (*gy0 < HUD_TOP_ROWS) *gy0 = HUD_TOP_ROWS;
+}
 
-    /* Centre the field inside the viewport (HUD-aware). */
-    int gx0 = (cols - f->w) / 2;
-    int gy0 = ((rows - HUD_BAND_RESERVED_ROWS) - f->h) / 2 + HUD_TOP_ROWS;
-    if (gx0 < 0)            gx0 = 0;
-    if (gy0 < HUD_TOP_ROWS) gy0 = HUD_TOP_ROWS;
+/* arrow_cell_paint — emit one cell from the ArrowGrid at screen
+ * (sx, sy), gated by glow > 0 and a non-empty glyph. */
+static void arrow_cell_paint(const ArrowGrid *g, int gx, int gy, int sx, int sy)
+{
+    int  idx = arrow_grid_idx(g, gx, gy);
+    if (g->glow[idx] <= 0.0f) return;
+    char glyph = g->glyph[idx];
+    if (glyph == 0 || glyph == ' ') return;
 
-    for (int y = 0; y < f->h; y++) {
+    int pair = PAIR_BAND_BASE + (g->band[idx] & 3);
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
+/* arrow_grid_paint — paint the ArrowGrid's (glow, band, glyph) per-cell
+ * outputs to the terminal.  The patterns decided what each cell looks
+ * like; this renderer just looks it up and paints.
+ *
+ *   STEP 1 — CENTRE the grid inside the viewport (HUD-aware)
+ *   STEP 2 — PAINT every in-bounds cell the patterns marked visible
+ */
+static void arrow_grid_paint(const ArrowGrid *g, int cols, int rows)
+{
+    int gx0, gy0;
+    viewport_centre_grid_origin(cols, rows, g->w, g->h, &gx0, &gy0);
+
+    for (int y = 0; y < g->h; y++) {
         int sy = gy0 + y;
         if (sy < 0 || sy >= rows) continue;
-        for (int x = 0; x < f->w; x++) {
+        for (int x = 0; x < g->w; x++) {
             int sx = gx0 + x;
             if (sx < 0 || sx >= cols) continue;
-
-            int  idx = field_idx(f, x, y);
-            if (f->trail_glow[idx] <= 0.0f) continue;
-            char glyph = f->trail_glyph[idx];
-            if (glyph == 0 || glyph == ' ') continue;
-
-            int pair = PAIR_BAND_BASE + (f->trail_color[idx] & 3);
-            attron(COLOR_PAIR(pair) | A_BOLD);
-            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair) | A_BOLD);
+            arrow_cell_paint(g, x, y, sx, sy);
         }
     }
 }
 
-static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
+/* ---------- screen_draw helpers (HUD layout) ------------------------- */
+
+/* hud_draw_top_left_title — fixed "VECTOR FIELD ARROWS" chip on row 0. */
+static void hud_draw_top_left_title(void)
 {
-    erase();
-    scene_draw(s, sc->cols, sc->rows);
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, HUD_LEFT_MARGIN, " VECTOR FIELD ARROWS ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
-    const Field *f = &s->F;
-    const char *state_str = s->paused
-                          ? "PAUSED    "
-                          : pattern_name(s->current_pattern);
-
-    /* Row 0 right — primary state with [N/M] pattern index. */
+/* hud_draw_top_right_status — fps · sim Hz · state · pattern N/M ·
+ * drift · MOTION flag, right-aligned on row 0. */
+static void hud_draw_top_right_status(int cols, double fps, int sim_fps,
+                                      const char *state_str,
+                                      int current_idx_zero_based,
+                                      int drift_mult, bool motion)
+{
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
-             " %5.1f fps  %3d Hz  %s [%d/%d]  drift:x%-2d ",
+             " %5.1f fps  %3d Hz  %s [%d/%d]  drift:x%-2d  motion:%s ",
              fps, sim_fps, state_str,
-             (int)s->current_pattern + 1, N_PATTERNS,
-             s->drift_mult);
-    int hx = sc->cols - (int)strlen(buf);
+             current_idx_zero_based + 1, N_PATTERNS,
+             drift_mult, motion ? "ON " : "off");
+    int hx = cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
-    /* Row 0 left — title. */
+/* hud_field_bold_label — draw one bold HUD-pair field on row 1
+ * starting at column `x`, advance by `width`, return the new x. */
+static int hud_field_bold_label(int x, const char *fmt,
+                                const char *val, int width)
+{
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, HUD_LEFT_MARGIN, " VECTOR FIELD ARROWS ");
+    mvprintw(1, x, fmt, val);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    return x + width;
+}
 
-    /* Row 1 — pattern + tier + theme + palette swatches + parameters. */
-    int x = HUD_LEFT_MARGIN;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " pattern:%-10s ", pattern_name(s->current_pattern));
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 21;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " tier:%-7s ", pattern_tier(s->current_pattern));
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 15;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " theme:%-8s ", themes[s->current_theme].name);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 17;
+/* hud_field_palette_swatch — "palette:####" segment on row 1: a label
+ * in plain HUD pair, then HUD_N_PALETTE_BANDS '#' chars each in their
+ * own band colour.  Returns the new x. */
+static int hud_field_palette_swatch(int x)
+{
     attron(COLOR_PAIR(PAIR_HUD));
     mvprintw(1, x, " palette:");
     attroff(COLOR_PAIR(PAIR_HUD));
-    x += 9;
-    for (int i = 0; i < 4; i++) {
+    x += HUD_PALETTE_LABEL_W;
+    for (int i = 0; i < HUD_N_PALETTE_BANDS; i++) {
         int p = PAIR_BAND_BASE + i;
         attron(COLOR_PAIR(p) | A_BOLD);
         mvaddch(1, x, '#');
         attroff(COLOR_PAIR(p) | A_BOLD);
         x += 1;
     }
+    return x;
+}
+
+/* hud_field_meta — trailing "t · map dims" on row 1. */
+static void hud_field_meta(int x, float field_time, int grid_w, int grid_h)
+{
     attron(COLOR_PAIR(PAIR_HUD));
     mvprintw(1, x, "  t:%.1fs  map:%dx%d ",
-             (double)f->field_time, f->w, f->h);
+             (double)field_time, grid_w, grid_h);
     attroff(COLOR_PAIR(PAIR_HUD));
+}
 
-    /* Bottom hint — actions only. */
+/* hud_draw_param_row — row 1 dashboard: pattern · tier · theme ·
+ * palette swatch · meta.  Each helper returns the next x so the row
+ * reads as a left-to-right pipeline. */
+static void hud_draw_param_row(const Scene *s)
+{
+    const PatternState *ps = &s->pattern;
+    int x = HUD_LEFT_MARGIN;
+    x = hud_field_bold_label(x, " pattern:%-10s ", pattern_name(ps->current),
+                             HUD_PATTERN_FIELD_W);
+    x = hud_field_bold_label(x, " tier:%-7s ",     pattern_tier(ps->current),
+                             HUD_TIER_FIELD_W);
+    x = hud_field_bold_label(x, " theme:%-8s ",    themes[s->palette.current].name,
+                             HUD_THEME_FIELD_W);
+    x = hud_field_palette_swatch(x);
+    hud_field_meta(x, ps->field_time, s->grid.w, s->grid.h);
+}
+
+/* hud_draw_bottom_hint — single-row key-binding bar at the bottom. */
+static void hud_draw_bottom_hint(int rows)
+{
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " n/p:pattern  t/T:theme  +/-:drift  ]/[:Hz  spc:pause  r:reset  q:quit ");
+    mvprintw(rows - 1, 0,
+             " n/p:pattern  t/T:theme  m:motion  +/-:drift  ]/[:Hz  spc:pause  r:reset  q:quit ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+/* screen_draw — full frame composer.
+ *
+ *   STEP 1 — CLEAR the back buffer
+ *   STEP 2 — PAINT the arrow field
+ *   STEP 3 — OVERLAY the top HUD row (title + right-aligned status)
+ *   STEP 4 — OVERLAY the row-1 parameter dashboard
+ *   STEP 5 — OVERLAY the bottom key-hint bar
+ */
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
+{
+    erase();
+    arrow_grid_paint(&s->grid, sc->cols, sc->rows);
+
+    const PatternState *ps        = &s->pattern;
+    const char         *state_str = s->paused ? "PAUSED    "
+                                              : pattern_name(ps->current);
+    hud_draw_top_left_title();
+    hud_draw_top_right_status(sc->cols, fps, sim_fps, state_str,
+                              (int)ps->current, ps->drift_mult, s->motion);
+    hud_draw_param_row(s);
+    hud_draw_bottom_hint(sc->rows);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -1485,6 +2104,49 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* §10 app                                                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level program state; the BSS root.
+ *
+ * INTENT
+ *   Single owner for the simulation, the screen, the sim-rate
+ *   target, the active map size, and the two volatile signal flags.
+ *   Lives in BSS as g_app (file-scope) for one specific reason:
+ *   POSIX signal handlers can ONLY safely touch global async-signal-
+ *   safe state, so the two sig_atomic_t flags must be reachable
+ *   without arguments.  Everything else on App is touched from the
+ *   main thread only.
+ *
+ * CONTEXT
+ *   Exactly one instance: g_app at file scope.  Built in main(),
+ *   driven by the main game loop, torn down by atexit(cleanup).
+ *   on_exit_signal / on_resize_signal flip the flags; the main loop
+ *   polls them at frame boundaries and reacts (clean exit / lazy
+ *   resize) — keeping all the heavy work off the signal handler.
+ *
+ * MEMBER LOGIC
+ *   scene       : All mutable simulation state (§8).  See Scene doc
+ *                 above for the dataflow pipeline.
+ *   screen      : Viewport dimensions cache (§9).
+ *   sim_fps     : Target simulation Hz ∈ [SIM_FPS_MIN, SIM_FPS_MAX].
+ *                 Drives the fixed-timestep accumulator in main();
+ *                 stepped by ]/[ keys.  Independent of render FPS.
+ *   map_w, map_h: Grid dims chosen by app_pick_map_size() from the
+ *                 current Screen.  Re-derived on resize; clamped to
+ *                 [MAP_W_MIN, MAP_W_MAX] × [MAP_H_MIN, MAP_H_MAX].
+ *   running     : 0 = exit the main loop next iteration.  Cleared by
+ *                 the SIGINT/SIGTERM handlers and by q/ESC in
+ *                 app_handle_key().  sig_atomic_t for handler safety.
+ *   need_resize : Set by the SIGWINCH handler; main loop polls it
+ *                 before the next frame and calls app_do_resize().
+ *                 sig_atomic_t for handler safety.
+ *
+ * REFERENCES
+ *   • Fix Your Timestep! — Glenn Fiedler:
+ *     https://gafferongames.com/post/fix_your_timestep/
+ *     The fixed-timestep accumulator pattern main() uses.
+ *   • POSIX.1-2017 § 2.4.3 — async-signal-safe functions and signal
+ *     handler discipline.  Why running/need_resize are sig_atomic_t.
+ */
 typedef struct {
     Scene                 scene;
     Screen                screen;
@@ -1500,18 +2162,23 @@ static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
+/* app_pick_map_size — derive the arrow grid dims from the current
+ * viewport, leaving HUD_BAND_RESERVED_ROWS for the dashboard, then
+ * clamp to [MAP_*_MIN, MAP_*_MAX] (the BSS cap on samples[]). */
 static void app_pick_map_size(App *app)
 {
     int mw = app->screen.cols;
     int mh = app->screen.rows - HUD_BAND_RESERVED_ROWS;
-    if (mw < 16) mw = 16;
-    if (mh < 8)  mh = 8;
+    if (mw < MAP_W_MIN) mw = MAP_W_MIN;
+    if (mh < MAP_H_MIN) mh = MAP_H_MIN;
     if (mw > MAP_W_MAX) mw = MAP_W_MAX;
     if (mh > MAP_H_MAX) mh = MAP_H_MAX;
     app->map_w = mw;
     app->map_h = mh;
 }
 
+/* app_do_resize — full re-init after SIGWINCH: re-read viewport
+ * dims, re-derive map size, rebuild the scene at the new size. */
 static void app_do_resize(App *app)
 {
     screen_resize(&app->screen);
@@ -1520,63 +2187,184 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
+/* app_sim_rate_faster/slower — step sim_fps by SIM_FPS_STEP, clamped
+ * to [SIM_FPS_MIN, SIM_FPS_MAX].  Bound to ]/[. */
+static void app_sim_rate_faster(App *app)
+{
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
+}
+static void app_sim_rate_slower(App *app)
+{
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
+}
+
+/* app_handle_key — keyboard dispatch.  Each case forwards to a tiny
+ * named mutator on the appropriate Scene sub-state, so the switch
+ * reads as a pseudocode binding table.  Returns false on exit
+ * request (q/Q/ESC); true otherwise. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
     switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':            s->paused = !s->paused; break;
-    case 'r': case 'R':  scene_reset(s, app->map_w, app->map_h); break;
-    case '=': case '+':
-        if (s->drift_mult < DRIFT_MULT_MAX) s->drift_mult *= 2;
-        if (s->drift_mult > DRIFT_MULT_MAX) s->drift_mult = DRIFT_MULT_MAX;
+    case 'q': case 'Q': case 27 /* ESC */:
+        return false;
+
+    case ' ':
+        s->paused = !s->paused;
         break;
-    case '-':
-        s->drift_mult /= 2;
-        if (s->drift_mult < DRIFT_MULT_MIN) s->drift_mult = DRIFT_MULT_MIN;
+    case 'r': case 'R':
+        scene_reset(s, app->map_w, app->map_h);
         break;
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
+    case 'm': case 'M':
+        s->motion = !s->motion;     /* probe overlay on T1-T5 */
         break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+
+    case '=': case '+':  pattern_state_drift_faster(&s->pattern); break;
+    case '-':            pattern_state_drift_slower(&s->pattern); break;
+    case ']':            app_sim_rate_faster       ( app);        break;
+    case '[':            app_sim_rate_slower       ( app);        break;
+    case 'n': case 'N':  pattern_state_cycle_next  (&s->pattern); break;
+    case 'p': case 'P':  pattern_state_cycle_prev  (&s->pattern); break;
+
     case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
-        theme_apply(s->current_theme);
+        palette_state_cycle_next(&s->palette);
+        theme_apply(s->palette.current);
         break;
     case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(s->current_theme);
+        palette_state_cycle_prev(&s->palette);
+        theme_apply(s->palette.current);
         break;
-    case 'n': case 'N':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS);
-        break;
-    case 'p': case 'P':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS);
-        break;
+
     default: break;
     }
     return true;
 }
 
-int main(void)
+/* ---------- main-loop helpers ---------------------------------------- */
+
+/* main_install_signal_handlers — clean exit on SIGINT/SIGTERM, lazy
+ * resize on SIGWINCH.  POSIX async-signal-safe path: handlers touch
+ * only the sig_atomic_t flags on g_app. */
+static void main_install_signal_handlers(void)
 {
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
+}
 
-    App *app     = &g_app;
+/* app_bootstrap — ncurses + viewport + scene initial state. */
+static void app_bootstrap(App *app)
+{
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
-
     screen_init(&app->screen);
     app_pick_map_size(app);
     scene_init(&app->scene, app->map_w, app->map_h);
+}
+
+/* app_handle_pending_resize — if SIGWINCH flagged a resize, do it
+ * and reset the frame clocks so dt doesn't include the resize cost
+ * (which would falsely trigger the spiral-of-death cap below). */
+static void app_handle_pending_resize(App *app,
+                                      int64_t *frame_time,
+                                      int64_t *sim_accum)
+{
+    if (!app->need_resize) return;
+    app_do_resize(app);
+    *frame_time = clock_ns();
+    *sim_accum  = 0;
+}
+
+/* app_compute_frame_dt — clock delta since last frame, clamped at
+ * SIM_MAX_FRAME_DT_MS so a slow terminal can't trigger unbounded
+ * sim-tick catch-up below (spiral-of-death guard). */
+static int64_t app_compute_frame_dt(int64_t *frame_time)
+{
+    int64_t now = clock_ns();
+    int64_t dt  = now - *frame_time;
+    *frame_time = now;
+    int64_t dt_cap = (int64_t)SIM_MAX_FRAME_DT_MS * NS_PER_MS;
+    if (dt > dt_cap) dt = dt_cap;
+    return dt;
+}
+
+/* app_drain_fixed_timestep — Fiedler accumulator: integrate as many
+ * fixed-rate sim ticks as fit into the elapsed dt, so the sim runs
+ * at exactly sim_fps Hz regardless of render FPS jitter. */
+static void app_drain_fixed_timestep(App *app, int64_t dt, int64_t *sim_accum)
+{
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+    *sim_accum += dt;
+    while (*sim_accum >= tick_ns) {
+        scene_tick(&app->scene, dt_sec);
+        *sim_accum -= tick_ns;
+    }
+}
+
+/* app_update_fps_meter — sliding-window average over the last
+ * FPS_UPDATE_MS of wall-clock time. */
+static void app_update_fps_meter(int64_t dt,
+                                 int *frame_count,
+                                 int64_t *fps_accum,
+                                 double *fps_display)
+{
+    (*frame_count)++;
+    *fps_accum += dt;
+    if (*fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+        *fps_display = (double)(*frame_count)
+                     / ((double)(*fps_accum) / (double)NS_PER_SEC);
+        *frame_count = 0;
+        *fps_accum   = 0;
+    }
+}
+
+/* app_throttle_to_render_target — sleep for the remainder of the
+ * RENDER_FRAME_BUDGET so the loop doesn't burn CPU between frames. */
+static void app_throttle_to_render_target(int64_t frame_time, int64_t dt)
+{
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(RENDER_FRAME_BUDGET_NS - elapsed);
+}
+
+/* app_present_frame — render the world + flush ncurses back-buffer. */
+static void app_present_frame(App *app, double fps_display)
+{
+    screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
+    screen_present();
+}
+
+/* app_poll_keyboard — non-blocking getch + dispatch.  Returns false
+ * iff the user requested exit (q / Q / ESC). */
+static bool app_poll_keyboard(App *app)
+{
+    int ch = getch();
+    if (ch == ERR) return true;
+    return app_handle_key(app, ch);
+}
+
+/* main — game-loop driver.
+ *
+ *   STEP 1 — SEED rng + INSTALL signal handlers + BOOTSTRAP app
+ *   STEP 2 — LOOP:
+ *              a. honour any pending resize
+ *              b. compute dt (clamped)
+ *              c. drain fixed-timestep sim ticks
+ *              d. update fps meter
+ *              e. throttle to render budget
+ *              f. present the frame
+ *              g. poll input → maybe exit
+ *   STEP 3 — TEARDOWN screen
+ */
+int main(void)
+{
+    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+    main_install_signal_handlers();
+    App *app = &g_app;
+    app_bootstrap(app);
 
     int64_t frame_time  = clock_ns();
     int64_t sim_accum   = 0;
@@ -1585,45 +2373,13 @@ int main(void)
     double  fps_display = 0.0;
 
     while (app->running) {
-
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
-
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
-        screen_present();
-
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+        app_handle_pending_resize    (app, &frame_time, &sim_accum);
+        int64_t dt = app_compute_frame_dt(&frame_time);
+        app_drain_fixed_timestep     (app, dt, &sim_accum);
+        app_update_fps_meter         (dt, &frame_count, &fps_accum, &fps_display);
+        app_throttle_to_render_target(frame_time, dt);
+        app_present_frame            (app, fps_display);
+        if (!app_poll_keyboard(app)) app->running = 0;
     }
 
     screen_free(&app->screen);

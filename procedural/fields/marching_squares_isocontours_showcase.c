@@ -155,10 +155,16 @@
  *                    definitive textbook treatment; co-authored by
  *                    the original Marching Cubes author.
  *
- *                  ISO-CONTOURING APPLICATIONS
- *                  • Quilez, I. — "2D distance functions" — many of
- *                    the example shapes ARE iso-contours of distance
- *                    fields:
+ *                  PROCEDURAL SOURCE FIELD (§5 ScalarField)
+ *                  • Perlin, K. (1985) — "An Image Synthesizer",
+ *                    SIGGRAPH'85.  Foundational noise paper.  The
+ *                    3-octave fBm value-noise stack feeding §5 is a
+ *                    simpler hash-lattice variant of Perlin's
+ *                    gradient noise — the only "source" the
+ *                    contour extractor sees.
+ *                  • Quilez, I. — "2D distance functions" — useful
+ *                    alternative scalar source: many of the example
+ *                    shapes ARE iso-contours of distance fields:
  *                    https://iquilezles.org/articles/distfunctions2d/
  *
  *                  ASCII RENDERING

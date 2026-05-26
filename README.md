@@ -50,14 +50,11 @@ and their reading order.
 ## Design Choices
 
 **Every file is self-contained — by intention, not by accident.**
-A deliberate rejection of framework reuse. Math, state, update loop, and
-rendering live in one file, readable top-to-bottom — demoscene and UNIX
-tradition. The whole program fits in working memory; cause and effect
-stay adjacent, artefacts trace directly to the equations producing them.
-Even `clamp()` and `lerp()` are re-derived locally so every assumption
-stays visible. The priority is not DRYness but learnability and mutation
-speed: copy a file, mutate aggressively, keep the version that taught
-something.
+I am not interested in building abstraction towers just to satisfy DRY and reuse dogma. Most “clean architecture” eventually becomes indirection layered on indirection until the actual problem disappears behind interfaces, helpers, and generic systems.
+
+I want to understand the problem directly.
+
+With AI assistance, rewriting code is cheaper than mentally unpacking five layers of abstraction written for hypothetical reuse. So math, state, update loop, and rendering stay together, readable top-to-bottom. Cause and effect remain adjacent. Even tiny helpers like clamp() or lerp() are often re-derived locally because hiding simple logic behind utility files actively hurts learning.
 
 **Plain C — `struct`s and functions only.**
 I know C++, Rust, Clojure, and Go. I reach for C anyway. For showcasing

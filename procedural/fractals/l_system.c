@@ -1,107 +1,111 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * l_system.c — L-System Fractal Generator
+ * l_system.c — L-System fractal generator (string rewriting + turtle graphics)
  *
- * String-rewriting L-systems with turtle-graphics rendering.
- * Five presets, each building generation by generation:
+ * FOUR LAYERS, deliberately separated so the fractal logic is trustworthy and
+ * the cosmetic timing is accountable:
  *
- *   0  Dragon Curve      — self-similar fold; 90° turns
- *   1  Hilbert Curve     — space-filling; 90° turns
- *   2  Sierpinski Arrow  — triangle subdivision; 60° turns
- *   3  Branching Plant   — organic fractal tree; 25° turns, branch stack
- *   4  Koch Snowflake    — edge-replacement; 60° turns
+ *   §4 GRAMMAR   — the CORE: pure L-system string rewriting.  Given a preset's
+ *                  axiom + rules it produces generation N's string.  It knows
+ *                  nothing about time, drawing, scale, or colour — so the math
+ *                  that defines the fractal can never be disturbed by a visual
+ *                  tweak.  This is the safe core.
+ *   §5 ANIMATION — the EFFECTS & DELAYS: a dumb timer that tracks how much of the
+ *                  path to reveal (the draw-in) and how long to hold a finished
+ *                  generation.  Pure presentation; it never touches the grammar.
+ *   §6 RENDER    — turtle-walks the string into a 2-D path, fits it to the
+ *                  screen, and draws the revealed portion with the theme colours.
+ *                  Reads the grammar / fit / animation; mutates none of them.
+ *   §7 SCENE     — orchestration: ties grammar + animation + render together and
+ *                  runs the generation state machine (draw -> hold -> advance).
  *
- * Framework: follows framework.c §1–§8 skeleton exactly.
+ * Five presets, each built generation by generation; every generation draws
+ * itself in progressively, holds briefly, then advances — transitions animate
+ * instead of popping between scenes.
  *
- * ─────────────────────────────────────────────────────────────────────
- *  Section map
- * ─────────────────────────────────────────────────────────────────────
- *   §1  config   — presets, constants
- *   §2  clock    — monotonic ns clock + sleep
- *   §3  color    — 7 pairs, one per branch depth
- *   §4  coords   — CELL_W/H aspect correction for isotropic turtle motion
- *   §5  entity   — LSystem: string rewriting + turtle-graphics draw
- *   §6  scene
- *   §7  screen
- *   §8  app
- * ─────────────────────────────────────────────────────────────────────
+ *   0  Dragon Curve      — self-similar fold;        90 turns
+ *   1  Hilbert Curve     — space-filling;            90 turns
+ *   2  Sierpinski Arrow  — triangle subdivision;     60 turns
+ *   3  Branching Plant   — organic fractal tree;     25 turns, branch stack
+ *   4  Koch Snowflake    — edge-replacement;         60 turns
  *
  * L-SYSTEM NOTATION
- * ─────────────────────────────────────────────────────────────────────
- *   Variables: letters rewritten each generation (A–Z, X, Y …)
- *   Constants: symbols that pass through unchanged (+, -, [, ], F …)
- *   Axiom:    starting string (generation 0)
- *   Rules:    variable → expansion string
- *   After n generations: rules applied n times to the axiom.
+ *   Variables : letters rewritten each generation (X, Y, A, B …)
+ *   Constants : symbols passed through unchanged (+, -, [, ], F …)
+ *   Axiom     : the starting string (generation 0)
+ *   Rules     : variable -> expansion string, applied to every match each gen.
  *
  * TURTLE SYMBOLS
- *   F / A / B    move forward one step, draw a segment
- *   f            move forward one step, no draw (lift pen)
- *   +            turn left  by angle δ
- *   -            turn right by angle δ
- *   [            push position + heading onto stack (branch start)
- *   ]            pop  position + heading from stack  (branch end)
- *   X / Y        rewrite-only; no turtle action
+ *   F / A / B   move forward one step, drawing a segment
+ *   +           turn left  by angle delta        -   turn right by angle delta
+ *   [           push position + heading (branch)  ]  pop  position + heading
+ *   X / Y       rewrite-only; no turtle action
  *
- * AUTO-SCALING (the key challenge)
- * ─────────────────────────────────────────────────────────────────────
- *   Each generation the string grows exponentially, so the path grows.
- *   Rather than choosing a fixed step size, we:
- *     1. Dry-run the turtle with step=1 to find the bounding box.
- *     2. Compute scale = min(screen_w / bbox_w, screen_h / bbox_h).
- *     3. Compute centering offsets (cx_off, cy_off).
- *     4. Render with step = scale, offset applied.
- *   Recalculated once per generation change; cached for all frames until
- *   the next advance.
+ * AUTO-SCALING (§6 fit)
+ *   Each generation grows exponentially, so the path is re-fitted: dry-run the
+ *   turtle to find its bounding box, then scale = min(usable_w/bbox_w,
+ *   usable_h/bbox_h) and centre (or bottom-pin the Branching Plant).
  *
- * ASPECT CORRECTION (§4)
- * ─────────────────────────────────────────────────────────────────────
- *   Terminal cells are ~2× taller than wide (CELL_H/CELL_W ≈ 2).
- *   Turtle Y-motion is multiplied by ASPECT = CELL_W/CELL_H ≈ 0.5 so
- *   a right-facing turtle and a down-facing turtle cover equal physical
- *   distances.  Applied consistently in both dry-run and draw passes so
- *   the scale factor is correct.
- *
- * BRANCH DEPTH COLORING
- * ─────────────────────────────────────────────────────────────────────
- *   '[' increments depth; ']' restores previous depth.
- *   depth % N_COLORS selects the ncurses color pair.
- *   Non-branching presets always draw at depth 0 (single color).
+ * ASPECT CORRECTION (§6)
+ *   Terminal cells are ~2x taller than wide, so turtle Y-motion is multiplied by
+ *   ASPECT = CELL_W/CELL_H (~0.5) to keep diagonals isotropic.
  *
  * Keys:
- *   q / ESC    quit
- *   space      pause / resume auto-advance
- *   Enter      advance one generation manually
- *   n / p      next / previous preset
- *   r          restart at generation 0
- *   + / =      faster auto-advance
- *   -          slower auto-advance
- *   ] / [      raise / lower simulation Hz
+ *   q / ESC    quit                     space  pause / resume the draw-in
+ *   Enter      step to next generation   n / p  next / previous preset
+ *   t / T      cycle colour theme        r      restart at generation 0
+ *   + / =      faster draw-in            -      slower draw-in
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra l_system.c -o l_system -lncurses -lm
+ *
+ * Sections
+ * --------
+ *   §1  config    — presets, constants, animation tuning
+ *   §2  clock     — monotonic ns clock + FrameClock (fixed-timestep pacing)
+ *   §3  color     — themeable 7-stop branch-depth ramp (t/T) + HUD pairs
+ *   §4  grammar   — L-system string rewriting (PURE CORE LOGIC)
+ *   §5  animation — reveal draw-in + inter-generation hold (EFFECTS & DELAYS)
+ *   §6  render    — turtle interpreter + screen fit + glyph drawing
+ *   §7  scene     — orchestration: generation state machine
+ *   §8  screen    — ncurses lifecycle + HUD
+ *   §9  app       — main loop
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+/* ── REFERENCES — for the concepts and the rendering ──────────────────── *
  *
- * Algorithm      : String-rewriting L-system with turtle-graphics rendering.
- *                  Each generation replaces every variable in the string using
- *                  a production rule table.  The resulting string is then
- *                  "executed" by a turtle: F=forward, +=turn_left, -=turn_right,
- *                  [=push_state, ]=pop_state.
+ *   L-systems & turtle interpretation  (§4 grammar, §6 turtle)
+ *   ── Lindenmayer, A. (1968). "Mathematical Models for Cellular Interaction
+ *      in Development, I & II." J. Theoretical Biology 18, 280-315.  The origin
+ *      of L-systems: parallel string rewriting (grammar_expand in §4).
+ *   ── Prusinkiewicz, P. & Lindenmayer, A. (1990). "The Algorithmic Beauty of
+ *      Plants." Springer.  The canonical treatment of L-systems + turtle
+ *      graphics — every preset, the [ ] branch stack, and the depth model here.
+ *   ── Prusinkiewicz, P. (1986). "Graphical Applications of L-systems." Proc.
+ *      Graphics Interface '86, 247-253.  Introduced the turtle interpretation
+ *      of L-system strings — exactly turtle_apply() in §6.
+ *   ── Abelson, H. & diSessa, A. (1981). "Turtle Geometry." MIT Press.  The
+ *      foundations of turtle graphics (pose, heading, forward/turn) behind the
+ *      Turtle struct in §6.
  *
- * Math           : L-systems (Lindenmayer, 1968) were invented to model plant
- *                  cell division.  The string length grows exponentially with
- *                  generation: |L_n| = |L_{n-1}| × avg_expansion_factor.
- *                  For the Dragon Curve rule F→F+G, G→F-G: |L_n| = 2ⁿ.
- *                  The limit object (infinite generation) of space-filling L-systems
- *                  (Hilbert, Peano) has Hausdorff dimension = 2 (fills area).
+ *   Fractal curves  (the presets)
+ *   ── Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
+ *      Self-similarity and fractal dimension — why these curves fill space.
+ *   ── von Koch, H. (1904). "Sur une courbe continue sans tangente …" Arkiv
+ *      foer Matematik.  The Koch curve — the Koch Snowflake preset.
+ *   ── Hilbert, D. (1891). "Ueber die stetige Abbildung einer Linie auf ein
+ *      Flaechenstueck." Math. Annalen 38, 459-460.  The space-filling curve —
+ *      the Hilbert Curve preset (Hausdorff dimension 2).
  *
- * Performance    : String length limits: most presets cap at generation 8-12.
- *                  The string is stored in a dynamic buffer; each rewrite step
- *                  O(|string| × max_rule_length) copies characters.
- *                  Aspect correction: forward step is (STEP_PX_COL, STEP_PX_ROW)
- *                  accounting for CELL_W/CELL_H ratio to keep branches isotropic.
+ *   Rendering  (§6 render, §8 screen)
+ *   ── Bresenham, J. E. (1965). "Algorithm for Computer Control of a Digital
+ *      Plotter." IBM Systems Journal 4(1), 25-30.  The DDA line stepping that
+ *      put_segment() uses to fill every cell along a segment.
+ *   ── Foley, van Dam, Feiner & Hughes. "Computer Graphics: Principles and
+ *      Practice."  Window-to-viewport mapping — the basis of fit_compute()'s
+ *      bounding-box-to-screen auto-scale.
+ *   ── Gookin, D. (2007). "Programmer's Guide to NCURSES." Wiley.  The cell-
+ *      drawing API behind §8: init_pair, mvaddch, refresh, resize.
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
@@ -125,106 +129,98 @@
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_MIN     =  5,
-    SIM_FPS_DEFAULT = 20,
-    SIM_FPS_MAX     = 60,
-    SIM_FPS_STEP    =  5,
+    SIM_FPS         = 60,    /* fixed sim tick rate (no continuous physics) */
 
-    N_COLORS        =  7,
+    N_COLORS        =  7,    /* branch-depth colour stops per theme         */
     N_PRESETS       =  5,
-    MAX_RULES       =  4,    /* max rewrite rules per preset             */
-    STACK_MAX       = 128,   /* max branch nesting depth                 */
+    N_THEMES        =  5,    /* colour themes, cycled with t / T            */
+    MAX_RULES       =  4,    /* max rewrite rules per preset                */
+    STACK_MAX       = 128,   /* max branch nesting depth                    */
+    CHAR_RANGE      = 256,   /* byte values — size of the rule lookup table */
 
-    HUD_ROWS        =  2,    /* rows reserved top (HUD) + bottom (hint)  */
+    HUD_TOP_ROWS    =  2,    /* rows 0..1 — data HUD (status + parameters)  */
+    HUD_BOT_ROWS    =  1,    /* last row  — action / key-hint bar           */
+    FIT_MARGIN_COLS =  2,    /* columns kept clear at the sides when scaling */
+
     FPS_UPDATE_MS   = 500,
+    FRAME_DT_CAP_MS = 100,   /* clamp one frame's dt — stops spiral-of-death */
+    RENDER_FPS_CAP  =  60,   /* render-rate ceiling the loop sleeps down to  */
 };
 
-/* Maximum L-system string length.  Stop auto-advancing when the NEXT
- * generation would exceed this. String grows exponentially; 1 MB covers
- * Koch gen 6 (~490 K), Hilbert gen 6 (~490 K), Branching Plant gen 7.  */
+/* Maximum L-system string length.  The string grows exponentially; 1 MB covers
+ * Koch gen 6, Hilbert gen 6, Branching Plant gen 7.  Stop advancing past this. */
 #define MAX_STR  (1 * 1024 * 1024)
+
+/* Animation tuning (the EFFECTS & DELAYS — see §5).  draw_sec is per-preset and
+ * runtime-adjustable; the rest bound how far + / - can push it. */
+#define GEN_HOLD_SEC  0.6f    /* hold each completed generation this long      */
+#define DRAW_SEC_MIN  0.2f    /* fastest draw-in (smallest seconds-per-gen)    */
+#define DRAW_SEC_MAX 10.0f    /* slowest draw-in                               */
+#define DRAW_FASTER   0.75f   /* '+' multiplies draw_sec by this (quicker)     */
+#define DRAW_SLOWER   1.33f   /* '-' multiplies draw_sec by this (slower)      */
+
+/* Render tuning (see §6 fit). */
+#define MIN_SCALE     0.5f    /* never shrink turtle steps below half a cell   */
 
 #define NS_PER_SEC   1000000000LL
 #define NS_PER_MS    1000000LL
 #define TICK_NS(f)   (NS_PER_SEC / (f))
+#define TICK_SEC     (1.0f / (float)SIM_FPS)   /* seconds per fixed sim tick */
 
 /* ── Preset table ──────────────────────────────────────────────────── */
 
-typedef struct { char from; const char *to; } LRule;
-
+/*
+ * LRule — one production of the grammar: rewrite every `from` into `to` each
+ * generation (Lindenmayer 1968).  `from` is a single variable symbol (e.g. 'X');
+ * `to` is the string it expands to.  A symbol with no matching rule is a constant
+ * and passes through unchanged.
+ */
 typedef struct {
-    const char *name;
-    const char *axiom;
+    char        from;   /* the variable symbol this rule rewrites   */
+    const char *to;     /* its expansion (may contain F + - [ ] …)  */
+} LRule;
+
+/*
+ * Preset — a complete L-system + how to draw it (Prusinkiewicz & Lindenmayer
+ * 1990).  The grammar fields (axiom, rules) define the string; the turtle fields
+ * (angle, heading, draw_chars) define how that string becomes a path; the rest is
+ * presentation/pacing.  The whole demo is data-driven from this table — adding a
+ * fractal is one new row, no code.
+ */
+typedef struct {
+    const char *name;         /* shown in the HUD                                 */
+    const char *axiom;        /* the generation-0 string                          */
     LRule       rules[MAX_RULES];
-    int         n_rules;
-    float       angle_deg;   /* turn angle δ (degrees)                  */
-    float       start_deg;   /* initial turtle heading (degrees)         */
-    int         max_gen;     /* stop auto-advancing after this           */
-    float       advance_sec; /* seconds between auto-advances            */
-    const char *draw_chars;  /* chars that move the turtle forward       */
-    bool        bottom;      /* true → pin base of fractal to bottom row */
+    int         n_rules;      /* rules in use (0..MAX_RULES)                       */
+    float       angle_deg;    /* turn delta for + / - (degrees)                   */
+    float       start_deg;    /* initial heading; -90 faces up (screen y grows    *
+                               * downward), used by the Branching Plant           */
+    int         max_gen;      /* last generation to draw (string-size ceiling)    */
+    float       advance_sec;  /* default seconds to draw one generation in        */
+    const char *draw_chars;   /* symbols that move the turtle forward (draw)      */
+    bool        bottom;       /* true -> pin the base to the bottom (plant stem)  */
 } Preset;
 
 /*
- * Preset definitions.  Max neighbours = (2R+1)²-1.
- *
- * Dragon Curve (gen 1–12)
- *   Axiom FX; rules X→X+YF+, Y→-FX-Y; only F draws.
- *   Self-similar folded path; at high gen fills a triangular region.
- *
- * Hilbert Curve (gen 1–6)
- *   Axiom A; rules A→+BF-AFA-FB+, B→-AF+BFB+FA-.  Only F draws.
- *   Space-filling — at gen 6 it visits every cell in a dense grid.
- *
- * Sierpinski Arrow (gen 1–8)
- *   Axiom A; rules A→B-A-B, B→A+B+A.  Both A and B draw forward.
- *   60° turns produce the classic Sierpinski triangle / arrow.
- *
- * Branching Plant (gen 1–6)
- *   Axiom X; X→F+[[X]-X]-F[-FX]+X, F→FF.  F draws; X is structural.
- *   25° branching angle. Stack produces forking branches.
- *   start_deg = -90° (facing up, since screen y increases downward).
- *   bottom = true so the stem sits at the bottom of the screen.
- *
- * Koch Snowflake (gen 1–5)
- *   Axiom F++F++F (equilateral triangle outline).
- *   Rule F→F-F++F-F; 60° turns.  Three Koch curves form the snowflake.
+ * Branching Plant uses start_deg = -90 (facing up; screen y grows downward) and
+ * bottom = true so the stem sits at the bottom.  The non-branching curves draw
+ * entirely at depth 0, so they show only the theme's first colour stop.
  */
 static const Preset PRESETS[N_PRESETS] = {
-    {
-        "Dragon Curve",
-        "FX",
-        { {'X',"X+YF+"}, {'Y',"-FX-Y"} }, 2,
-        90.0f, 0.0f, 12, 1.5f, "F", false
-    },
-    {
-        "Hilbert Curve",
-        "A",
-        { {'A',"+BF-AFA-FB+"}, {'B',"-AF+BFB+FA-"} }, 2,
-        90.0f, 0.0f, 6, 2.0f, "F", false
-    },
-    {
-        "Sierpinski Arrow",
-        "A",
-        { {'A',"B-A-B"}, {'B',"A+B+A"} }, 2,
-        60.0f, 0.0f, 8, 1.5f, "AB", false
-    },
-    {
-        "Branching Plant",
-        "X",
-        { {'X',"F+[[X]-X]-F[-FX]+X"}, {'F',"FF"} }, 2,
-        25.0f, -90.0f, 6, 2.0f, "F", true
-    },
-    {
-        "Koch Snowflake",
-        "F++F++F",
-        { {'F',"F-F++F-F"} }, 1,
-        60.0f, 0.0f, 5, 2.0f, "F", false
-    },
+    { "Dragon Curve",     "FX",
+      { {'X',"X+YF+"}, {'Y',"-FX-Y"} }, 2,            90.0f,   0.0f, 12, 1.5f, "F",  false },
+    { "Hilbert Curve",    "A",
+      { {'A',"+BF-AFA-FB+"}, {'B',"-AF+BFB+FA-"} }, 2, 90.0f,   0.0f,  6, 2.0f, "F",  false },
+    { "Sierpinski Arrow", "A",
+      { {'A',"B-A-B"}, {'B',"A+B+A"} }, 2,            60.0f,   0.0f,  8, 1.5f, "AB", false },
+    { "Branching Plant",  "X",
+      { {'X',"F+[[X]-X]-F[-FX]+X"}, {'F',"FF"} }, 2,  25.0f, -90.0f,  6, 2.0f, "F",  true  },
+    { "Koch Snowflake",   "F++F++F",
+      { {'F',"F-F++F-F"} }, 1,                        60.0f,   0.0f,  5, 2.0f, "F",  false },
 };
 
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  clock — monotonic ns clock + fixed-timestep frame pacing           */
 /* ===================================================================== */
 
 static int64_t clock_ns(void)
@@ -244,42 +240,133 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
-
 /*
- * Seven color pairs, indexed by branch depth % N_COLORS.
- * Depth 0 (pair 1): brightest — used for the trunk and non-branching
- *                   presets (Dragon, Hilbert, Sierpinski, Koch).
- * Depth 1–6: progressively different hues for branch levels.
+ * FrameClock — the fixed-timestep heartbeat.  Real frames arrive irregularly,
+ * but the simulation must advance in equal slices: each frame we bank the
+ * elapsed real time as `sim_debt`, then repay it one TICK_NS step at a time.
+ * The fps_* fields measure a smoothed rate for the HUD.
  */
-static void color_init(void)
+typedef struct {
+    int64_t prev_ns;     /* CLOCK_MONOTONIC stamp at this frame's start          */
+    int64_t sim_debt;    /* unspent ns owed to the fixed step; left in [0,TICK)  */
+    int64_t fps_window;  /* ns elapsed since the last fps sample was emitted     */
+    int     fps_frames;  /* frames counted since the last fps sample             */
+    double  fps;         /* smoothed frames/sec, refreshed every FPS_UPDATE_MS   */
+} FrameClock;
+
+static void frameclock_init(FrameClock *fc)
 {
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(1,  46, COLOR_BLACK);   /* bright green  — depth 0 */
-        init_pair(2,  82, COLOR_BLACK);   /* lime          — depth 1 */
-        init_pair(3, 226, COLOR_BLACK);   /* yellow        — depth 2 */
-        init_pair(4, 208, COLOR_BLACK);   /* orange        — depth 3 */
-        init_pair(5, 196, COLOR_BLACK);   /* red           — depth 4 */
-        init_pair(6, 201, COLOR_BLACK);   /* magenta       — depth 5 */
-        init_pair(7,  51, COLOR_BLACK);   /* cyan          — depth 6+ */
-        init_pair(8, 226, COLOR_BLACK);   /* yellow HUD                */
-    } else {
-        init_pair(1, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(2, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(3, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(4, COLOR_RED,     COLOR_BLACK);
-        init_pair(5, COLOR_RED,     COLOR_BLACK);
-        init_pair(6, COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(7, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(8, COLOR_YELLOW,  COLOR_BLACK);
+    fc->prev_ns    = clock_ns();
+    fc->sim_debt   = 0;
+    fc->fps_window = 0;
+    fc->fps_frames = 0;
+    fc->fps        = 0.0;
+}
+
+static void frameclock_sample_fps(FrameClock *fc, int64_t dt)
+{
+    fc->fps_frames++;
+    fc->fps_window += dt;
+    if (fc->fps_window >= FPS_UPDATE_MS * NS_PER_MS) {
+        fc->fps        = (double)fc->fps_frames
+                       / ((double)fc->fps_window / (double)NS_PER_SEC);
+        fc->fps_frames = 0;
+        fc->fps_window = 0;
     }
 }
 
-/* Map branch depth to ncurses attribute */
+/* Open a frame: measure dt since the last one, clamp a long stall, bank it. */
+static void frameclock_begin_frame(FrameClock *fc)
+{
+    int64_t now = clock_ns();
+    int64_t dt  = now - fc->prev_ns;
+    fc->prev_ns = now;
+
+    int64_t stall_cap = FRAME_DT_CAP_MS * NS_PER_MS;
+    if (dt > stall_cap) dt = stall_cap;
+
+    fc->sim_debt += dt;
+    frameclock_sample_fps(fc, dt);
+}
+
+/* True (and pays down the debt) while a fixed sim step is owed. */
+static bool frameclock_step_due(FrameClock *fc, int64_t tick_ns)
+{
+    if (fc->sim_debt < tick_ns) return false;
+    fc->sim_debt -= tick_ns;
+    return true;
+}
+
+/* Sleep off the remainder of this frame's budget to cap the render rate. */
+static void frameclock_throttle(const FrameClock *fc)
+{
+    int64_t budget  = NS_PER_SEC / RENDER_FPS_CAP;
+    int64_t elapsed = clock_ns() - fc->prev_ns;
+    clock_sleep_ns(budget - elapsed);
+}
+
+/* ===================================================================== */
+/* §3  color — themeable branch-depth ramp + HUD pairs                    */
+/* ===================================================================== */
+
+/*
+ * Pairs 1..N_COLORS are the branch-depth colours, rebound by theme_apply().
+ * depth_attr() picks pair (depth % N_COLORS)+1, with depth 0 (the trunk, and the
+ * single colour of non-branching presets) drawn bold.  Two extra slots hold the
+ * HUD colours, theme-independent so the text stays legible over any fractal.
+ */
+enum { PAIR_HUD = 8, PAIR_HINT = 9 };
+
+/*
+ * Theme — a named 7-stop palette for the branch-depth ramp, cycled with t / T.
+ * fg256[0] (depth 0) is the dominant colour for the non-branching presets; the
+ * higher stops tint the branch levels of the Branching Plant.  Every entry sits
+ * in the bright half of the 256-cube so the strokes stay legible on black.
+ */
+typedef struct {
+    const char *name;
+    int fg256[N_COLORS];   /* xterm-256 codes, depth 0..6 (preferred) */
+    int fg8  [N_COLORS];   /* 8-colour ANSI fallback, same order      */
+} Theme;
+
+static const Theme THEMES[N_THEMES] = {
+    { "Spectrum", {  46,  82, 226, 208, 196, 201,  51 },
+       { COLOR_GREEN, COLOR_GREEN, COLOR_YELLOW, COLOR_YELLOW, COLOR_RED, COLOR_MAGENTA, COLOR_CYAN } },
+    { "Fire",     { 226, 220, 214, 208, 202, 196, 160 },
+       { COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_RED, COLOR_RED, COLOR_RED, COLOR_RED } },
+    { "Ocean",    {  51,  45,  39,  33,  27,  75, 117 },
+       { COLOR_CYAN, COLOR_CYAN, COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN } },
+    { "Neon",     { 201, 207, 171, 141,  99,  51,  87 },
+       { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN, COLOR_CYAN } },
+    { "Mono",     { 231, 252, 250, 248, 246, 245, 244 },
+       { COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE } },
+};
+
+/* theme_apply() — bind the branch-depth pairs (1..N_COLORS) to a theme. */
+static void theme_apply(int theme)
+{
+    const Theme *t = &THEMES[theme];
+    bool truecolor = COLORS >= 256;
+    for (int i = 0; i < N_COLORS; i++)
+        init_pair((short)(i + 1),
+                  (short)(truecolor ? t->fg256[i] : t->fg8[i]), COLOR_BLACK);
+}
+
+static void color_init(void)
+{
+    start_color();
+    /* HUD pairs are theme-independent — yellow data, cyan actions */
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,  226, COLOR_BLACK);
+        init_pair(PAIR_HINT,  51, COLOR_BLACK);
+    } else {
+        init_pair(PAIR_HUD,  COLOR_YELLOW, COLOR_BLACK);
+        init_pair(PAIR_HINT, COLOR_CYAN,   COLOR_BLACK);
+    }
+    theme_apply(0);   /* Spectrum; Scene.theme tracks the active one thereafter */
+}
+
+/* Map branch depth to an ncurses attribute (depth 0 = trunk, drawn bold). */
 static chtype depth_attr(int depth)
 {
     int pair = (depth % N_COLORS) + 1;
@@ -287,205 +374,361 @@ static chtype depth_attr(int depth)
 }
 
 /* ===================================================================== */
-/* §4  coords — aspect-ratio correction for isotropic turtle motion       */
+/* §4  grammar — L-system string rewriting (PURE CORE LOGIC)              */
 /* ===================================================================== */
 
 /*
- * Terminal cells are ~2× taller than wide (CELL_H/CELL_W ≈ 2).
- * Without correction, a turtle moving "right" crosses 1 column but
- * a turtle moving "down" only crosses 0.5 rows for the same physical
- * distance — diagonals look skewed and circles become ellipses.
+ * Grammar — the one piece of state that IS the fractal: the current generation
+ * string (Lindenmayer 1968).  A generation is produced by rewriting every
+ * variable in parallel, so the string grows exponentially —
+ * |L_n| ~ |L_{n-1}| * (average expansion length).  Everything visual is just a
+ * reading of this string; nothing here knows about time, colour, scale, or the
+ * screen, so the rewriting math is safe from any cosmetic change.
  *
- * Fix: multiply Y turtle motion by ASPECT = CELL_W/CELL_H ≈ 0.5.
- * Applied consistently in both the dry-run (bounds computation) and
- * the draw pass so the computed scale is correct for both axes.
+ * cur / nxt are a double buffer: a rewrite fills nxt, then swaps the pointers
+ * (no copy).  Both are MAX_STR bytes, allocated once at startup — a documented
+ * heap exception, since the strings are far too large and variable for the stack.
+ */
+typedef struct {
+    char  *cur;     /* current generation string (NUL-terminated)  */
+    char  *nxt;     /* scratch buffer the next rewrite is built in */
+    size_t len;     /* strlen(cur) — grows exponentially with gen  */
+    int    gen;     /* generation number (0 = the axiom)           */
+} Grammar;
+
+static void grammar_alloc(Grammar *g)
+{
+    g->cur = malloc(MAX_STR);
+    g->nxt = malloc(MAX_STR);
+    if (!g->cur || !g->nxt) { endwin(); exit(1); }
+}
+
+static void grammar_free(Grammar *g)
+{
+    free(g->cur); free(g->nxt);
+    g->cur = g->nxt = NULL;
+}
+
+/* grammar_load() — install the preset's axiom as generation 0. */
+static void grammar_load(Grammar *g, const Preset *p)
+{
+    g->len = strlen(p->axiom);
+    memcpy(g->cur, p->axiom, g->len + 1);
+    g->gen = 0;
+}
+
+/*
+ * build_rule_table() — index the preset's rules by symbol so each character is
+ * looked up in O(1) (a 256-slot table; NULL = no rule, i.e. a constant symbol).
+ */
+static void build_rule_table(const Preset *p, const char *table[])
+{
+    for (int i = 0; i < CHAR_RANGE; i++) table[i] = NULL;
+    for (int i = 0; i < p->n_rules; i++)
+        table[(unsigned char)p->rules[i].from] = p->rules[i].to;
+}
+
+/*
+ * emit() — append `n` bytes to the output buffer at *out, or return false if that
+ * would overflow MAX_STR (the string-size ceiling that caps how deep we expand).
+ */
+static bool emit(char *buf, size_t *out, const char *src, size_t n)
+{
+    if (*out + n >= (size_t)MAX_STR) return false;
+    memcpy(buf + *out, src, n);
+    *out += n;
+    return true;
+}
+
+/*
+ * grammar_expand() — apply the preset's rules once, producing generation N+1.
+ * Reads like the rewrite rule: for each symbol, emit its expansion (or the symbol
+ * itself if it is a constant), swap the double buffer, and bump the generation.
+ * Returns false (leaving the grammar unchanged) if the result would exceed MAX_STR.
+ */
+static bool grammar_expand(Grammar *g, const Preset *p)
+{
+    const char *rule[CHAR_RANGE];
+    build_rule_table(p, rule);
+
+    size_t out = 0;
+    for (size_t i = 0; i < g->len; i++) {
+        unsigned char c   = (unsigned char)g->cur[i];
+        const char   *exp = rule[c];
+        bool ok = exp ? emit(g->nxt, &out, exp, strlen(exp))
+                      : emit(g->nxt, &out, (const char *)&c, 1);
+        if (!ok) return false;                 /* hit the MAX_STR ceiling */
+    }
+    g->nxt[out] = '\0';
+
+    char *tmp = g->cur; g->cur = g->nxt; g->nxt = tmp;   /* swap the double buffer */
+    g->len = out;
+    g->gen++;
+    return true;
+}
+
+/* ===================================================================== */
+/* §5  animation — reveal draw-in + hold (EFFECTS & DELAYS)               */
+/* ===================================================================== */
+
+/*
+ * Animation — the entire cosmetic timing layer, isolated here so it is obvious
+ * what is "the fractal" (§4) and what is "how it appears over time" (this).  It
+ * is a dumb timer: it never reads or writes the grammar.
  *
- * The turtle works in cell coordinates (columns, rows).  It never
- * needs the full pixel↔cell conversion from bounce_ball.c because
- * L-systems have no free-moving physics — the turtle always snaps
- * to the computed step from the auto-scale pass.
+ *   phase      ANIM_DRAW while the path is drawing in, ANIM_HOLD once complete.
+ *   reveal     0..1 fraction of the path the renderer should show (the draw-in).
+ *   hold_timer seconds the completed generation has been held (the delay).
+ *   draw_sec   seconds to draw one whole generation (the speed; + / - tune it).
+ */
+typedef enum { ANIM_DRAW, ANIM_HOLD } AnimPhase;
+
+typedef struct {
+    AnimPhase phase;
+    float     reveal;
+    float     hold_timer;
+    float     draw_sec;
+} Animation;
+
+/* Start drawing a fresh generation from nothing. */
+static void animation_begin(Animation *a)
+{
+    a->phase      = ANIM_DRAW;
+    a->reveal     = 0.0f;
+    a->hold_timer = 0.0f;
+}
+
+/* Jump straight to fully drawn + holding (used for a manual step). */
+static void animation_show_full(Animation *a)
+{
+    a->phase      = ANIM_HOLD;
+    a->reveal     = 1.0f;
+    a->hold_timer = 0.0f;
+}
+
+/*
+ * animation_step() — advance the timing by dt seconds.  Returns true when the
+ * post-draw hold has elapsed (i.e. the caller should advance a generation).
+ *   phase DRAW : grow reveal 0 -> 1 over draw_sec, then switch to HOLD.
+ *   phase HOLD : count hold_timer up to GEN_HOLD_SEC.
+ */
+static bool animation_step(Animation *a, float dt)
+{
+    if (a->phase == ANIM_DRAW) {
+        a->reveal += dt / a->draw_sec;
+        if (a->reveal >= 1.0f) {
+            a->reveal     = 1.0f;
+            a->phase      = ANIM_HOLD;
+            a->hold_timer = 0.0f;
+        }
+        return false;
+    }
+    a->hold_timer += dt;
+    return a->hold_timer >= GEN_HOLD_SEC;
+}
+
+/* anim_speed() — the draw-in RATE shown in the HUD: the inverse of draw_sec (an
+ * interval), so a bigger number means faster, matching the '+' key. */
+static float anim_speed(const Animation *a) { return 1.0f / a->draw_sec; }
+
+/* ===================================================================== */
+/* §6  render — turtle interpreter + screen fit + glyph drawing           */
+/* ===================================================================== */
+
+/*
+ * Terminal cells are ~2x taller than wide, so a turtle moving "down" covers half
+ * the rows that moving "right" covers columns.  Multiplying Y motion by ASPECT
+ * (= CELL_W/CELL_H) keeps diagonals and angles isotropic.  Applied identically
+ * in the measure and draw passes so the computed scale is correct on both axes.
  */
 #define CELL_W   8
 #define CELL_H  16
-#define ASPECT   ((float)CELL_W / (float)CELL_H)   /* ≈ 0.5 */
+#define ASPECT   ((float)CELL_W / (float)CELL_H)   /* ~0.5 */
+
+/* radians() — degrees -> radians, the unit the turtle turns and heads in. */
+static float radians(float deg) { return deg * (float)M_PI / 180.0f; }
+
+/* ── geometry types ──────────────────────────────────────────────────── */
 
 /*
- * angle_char() — pick an ASCII character that best represents the
- * direction of a turtle segment.
- *
- *   0°  (right)      → '-'
- *   45° (down-right) → '\'
- *   90° (down)       → '|'
- *  135° (down-left)  → '/'
- *  180° (left)       → '-'
- *  225° (up-left)    → '\'
- *  270° (up)         → '|'
- *  315° (up-right)   → '/'
- *
- * Modulus π first since '-' and '|' are direction-symmetric.
+ * BBox — an axis-aligned bounding box measured in UNIT-step turtle space (step =
+ * 1), so it is resolution-independent; fit_compute() scales it to the screen
+ * afterwards.  bbox_reset() seeds it inverted (min = +inf, max = -inf) so the
+ * first bbox_extend() always overwrites it.
+ */
+typedef struct {
+    float minx, miny;   /* lowest  x / y any part of the path reaches */
+    float maxx, maxy;   /* highest x / y any part of the path reaches */
+} BBox;
+
+static void bbox_reset(BBox *b)
+{
+    b->minx = b->miny =  1e30f;
+    b->maxx = b->maxy = -1e30f;
+}
+
+static void bbox_extend(BBox *b, float x, float y)
+{
+    if (x < b->minx) b->minx = x;
+    if (x > b->maxx) b->maxx = x;
+    if (y < b->miny) b->miny = y;
+    if (y > b->maxy) b->maxy = y;
+}
+
+/*
+ * Segment — the value a single 'F' produces: a straight move.  Carrying it as a
+ * value is what keeps the turtle (which knows geometry) and the renderer (which
+ * knows the screen) decoupled: turtle_forward() returns one, and the caller
+ * either measures it (bbox) or draws it (put_segment).
+ */
+typedef struct {
+    float x0, y0;    /* start cell — the turtle's pose before the step */
+    float x1, y1;    /* end cell   — its pose after the step           */
+    float angle;     /* heading (radians) — chooses the line glyph     */
+    int   depth;     /* branch depth when drawn — chooses the colour   */
+} Segment;
+
+/*
+ * Fit — the window-to-viewport transform (Foley et al.): maps the path's unit-step
+ * bounding box onto the usable screen band (the screen minus the HUD rows) as a
+ * single uniform scale + offset.  Recomputed per generation, since each one has a
+ * different extent.  n_segments lets the renderer turn the animation's reveal
+ * fraction into a concrete segment count.
+ */
+typedef struct {
+    float scale;       /* screen cells per unit turtle step                */
+    float ox, oy;      /* offset (cells) that centres / pins the path      */
+    int   n_segments;  /* total forward segments in the current generation */
+} Fit;
+
+/* ── the turtle ──────────────────────────────────────────────────────── */
+
+/*
+ * TurtleState — one turtle pose.  This is exactly what '[' saves and ']' restores,
+ * so a branch resumes at the precise position, heading, AND colour depth it forked
+ * from.
+ */
+typedef struct {
+    float x, y;     /* position in turtle space (cells once scaled)     */
+    float angle;    /* heading in radians (0 = +x, increases anticlockwise) */
+    int   depth;    /* branch nesting: 0 = trunk, +1 per enclosing '['  */
+} TurtleState;
+
+/*
+ * Turtle — the drawing agent of turtle graphics (Abelson & diSessa 1981): a
+ * current pose plus a stack of saved poses for branches.  This little machine IS
+ * the L-system interpreter's mechanics (Prusinkiewicz 1986): 'F' steps forward
+ * leaving a Segment, '+'/'-' rotate, '[' saves a pose (start a branch), ']'
+ * restores it (end one).  The push/pop stack makes drawing a depth-first walk of
+ * the fractal's branch tree.
+ */
+typedef struct {
+    TurtleState cur;                /* the turtle's current pose            */
+    TurtleState stack[STACK_MAX];   /* branch stack: poses saved by '['     */
+    int         sp;                 /* stack depth (0..STACK_MAX)           */
+} Turtle;
+
+static void turtle_init(Turtle *t, float heading_deg)
+{
+    t->cur = (TurtleState){ 0.0f, 0.0f, radians(heading_deg), 0 };
+    t->sp  = 0;
+}
+
+static void turtle_turn(Turtle *t, float delta) { t->cur.angle += delta; }
+
+/* '[' — start a branch: save the pose, then descend one depth (for colouring). */
+static void turtle_push(Turtle *t)
+{
+    if (t->sp < STACK_MAX) t->stack[t->sp++] = t->cur;
+    t->cur.depth++;
+}
+
+/* ']' — end a branch: pop back to the saved pose (restoring its depth too). */
+static void turtle_pop(Turtle *t)
+{
+    if (t->sp > 0) t->cur = t->stack[--t->sp];
+}
+
+/* 'F' — step forward by `step`, returning the segment drawn (aspect-corrected). */
+static Segment turtle_forward(Turtle *t, float step)
+{
+    float nx = t->cur.x + cosf(t->cur.angle) * step;
+    float ny = t->cur.y + sinf(t->cur.angle) * step * ASPECT;
+    Segment s = { t->cur.x, t->cur.y, nx, ny, t->cur.angle, t->cur.depth };
+    t->cur.x = nx;
+    t->cur.y = ny;
+    return s;
+}
+
+/*
+ * turtle_apply() — the L-system symbol -> turtle action rule, the heart of the
+ * interpreter.  Returns true and fills *seg when the symbol drew a forward
+ * segment; otherwise it only turned or branched the turtle.  Shared by both
+ * passes so the measure and the draw can never diverge.
+ */
+static bool turtle_apply(Turtle *t, char c, const Preset *p,
+                         float step, float delta, Segment *seg)
+{
+    if (strchr(p->draw_chars, c)) { *seg = turtle_forward(t, step); return true; }
+    if      (c == '+') turtle_turn(t, +delta);
+    else if (c == '-') turtle_turn(t, -delta);
+    else if (c == '[') turtle_push(t);
+    else if (c == ']') turtle_pop(t);
+    /* X, Y, A, B (rewrite-only variables) and unknowns: no turtle action */
+    return false;
+}
+
+/* ── render primitives ───────────────────────────────────────────────── */
+
+/*
+ * angle_char() — the ASCII glyph that best shows a segment's direction.
+ * Modulus pi first, since '-' and '|' are direction-symmetric.
  */
 static char angle_char(float angle)
 {
     float a = fmodf(angle, (float)M_PI);
     if (a < 0.0f) a += (float)M_PI;
-    if (a < (float)M_PI / 8.0f || a >= 7.0f * (float)M_PI / 8.0f)
-        return '-';
-    if (a < 3.0f * (float)M_PI / 8.0f)
-        return '/';
-    if (a < 5.0f * (float)M_PI / 8.0f)
-        return '|';
+    if (a < (float)M_PI / 8.0f || a >= 7.0f * (float)M_PI / 8.0f) return '-';
+    if (a < 3.0f * (float)M_PI / 8.0f)                            return '/';
+    if (a < 5.0f * (float)M_PI / 8.0f)                            return '|';
     return '\\';
 }
 
-/* ===================================================================== */
-/* §5  entity — LSystem                                                   */
-/* ===================================================================== */
-
-/* ── Turtle stack ────────────────────────────────────────────────────── */
-
-typedef struct { float x, y, angle; int depth; } TurtleState;
-
-/* ── LSystem struct ──────────────────────────────────────────────────── */
-
 /*
- * LSystem — all state for the L-system animation.
- *
- * cur / nxt: two heap-allocated buffers of MAX_STR bytes each.
- *   Rule application writes the next generation into nxt, then
- *   swaps the pointers.  No memcpy — just a pointer exchange.
- *
- * bounds_valid: false after each lsys_advance(); true after the first
- *   turtle_compute_scale() call for the new generation.  The draw pass
- *   checks this flag and recomputes if needed.
- *
- * cx_off, cy_off, scale: cached auto-scale result from the dry-run.
- *   Used by turtle_draw() every frame until the next generation.
- *
- * advance_timer: counts down in seconds; reset to preset.advance_sec
- *   after each auto-advance.  scene_tick() decrements it by dt each
- *   fixed tick.
+ * dda_steps() — how many cells a segment spans: the longer of |dx|,|dy| (the DDA
+ * / Bresenham step count).  At least 1, so a zero-length segment still plots one
+ * point.
  */
-typedef struct {
-    char  *cur;            /* current generation string (null-terminated) */
-    char  *nxt;            /* rewrite scratch buffer                      */
-    size_t cur_len;        /* strlen(cur)                                 */
-
-    int    gen;            /* current generation number                   */
-    int    preset;         /* active preset index                         */
-    bool   at_max;         /* true when gen == preset.max_gen             */
-    bool   paused;
-    float  advance_timer;  /* seconds until next auto-advance             */
-    float  advance_sec;    /* current advance interval (user-adjustable)  */
-
-    /* auto-scale cache */
-    bool   bounds_valid;
-    float  cx_off;         /* x offset (columns) for centering            */
-    float  cy_off;         /* y offset (rows)    for centering/alignment  */
-    float  step;           /* scaled step size (columns per F)            */
-} LSystem;
-
-/* ── allocation ──────────────────────────────────────────────────────── */
-
-static void lsys_alloc(LSystem *ls)
+static int dda_steps(float dx, float dy)
 {
-    ls->cur = malloc(MAX_STR);
-    ls->nxt = malloc(MAX_STR);
-    if (!ls->cur || !ls->nxt) { endwin(); exit(1); }
+    int n = (int)(fabsf(dx) > fabsf(dy) ? fabsf(dx) : fabsf(dy));
+    return n < 1 ? 1 : n;
 }
 
-static void lsys_free(LSystem *ls)
+/* in_canvas() — is (cx,cy) inside the drawable band: on screen and clear of the
+ * HUD rows top and bottom? */
+static bool in_canvas(int cx, int cy, int cols, int rows)
 {
-    free(ls->cur); free(ls->nxt);
-    ls->cur = ls->nxt = NULL;
+    return cx >= 0 && cx < cols && cy >= HUD_TOP_ROWS && cy < rows - HUD_BOT_ROWS;
 }
 
-/* ── rule application ────────────────────────────────────────────────── */
-
 /*
- * lsys_advance() — apply preset rules once, producing gen+1.
- *
- * Uses a 256-entry lookup table (rule_map) so each character is
- * expanded in O(1) rather than searching the rules[] array.
- *
- * Returns false if the result would exceed MAX_STR.
- * On false return, ls is unchanged and at_max is set.
- *
- * String budget:
- *   We check (new_len + expansion_len < MAX_STR) before each append.
- *   If the budget would be exceeded we stop, mark at_max, and leave
- *   the current generation displayed indefinitely.
+ * put_segment() — stamp one screen segment with a DDA so every cell along it is
+ * filled (no gaps when the step is large in early generations).  Walks `steps`+1
+ * evenly-spaced points and plots those that land in the canvas.
  */
-static bool lsys_advance(LSystem *ls, const Preset *p)
-{
-    /* Build O(1) rule lookup: rule_map[c] = expansion string or NULL */
-    const char *rule_map[256];
-    memset(rule_map, 0, sizeof rule_map);
-    for (int i = 0; i < p->n_rules; i++)
-        rule_map[(unsigned char)p->rules[i].from] = p->rules[i].to;
-
-    size_t new_len = 0;
-    for (size_t i = 0; i < ls->cur_len; i++) {
-        unsigned char c = (unsigned char)ls->cur[i];
-        const char *exp = rule_map[c];
-        if (exp) {
-            size_t elen = strlen(exp);
-            if (new_len + elen >= (size_t)MAX_STR) {
-                ls->at_max = true;
-                return false;
-            }
-            memcpy(ls->nxt + new_len, exp, elen);
-            new_len += elen;
-        } else {
-            if (new_len + 1 >= (size_t)MAX_STR) {
-                ls->at_max = true;
-                return false;
-            }
-            ls->nxt[new_len++] = (char)c;
-        }
-    }
-    ls->nxt[new_len] = '\0';
-
-    /* Swap pointers — no memcpy */
-    char *tmp  = ls->cur;
-    ls->cur    = ls->nxt;
-    ls->nxt    = tmp;
-    ls->cur_len = new_len;
-    ls->gen++;
-    ls->bounds_valid = false;
-    return true;
-}
-
-/* ── turtle core — shared by dry-run and draw pass ─────────────────── */
-
-/*
- * turtle_step_bounds() and turtle_draw() share the same traversal loop.
- * Rather than duplicating the loop, we write one function parametrised
- * by draw_mode.  In non-draw mode it tracks min/max; in draw mode it
- * calls mvwaddch.  The compiler inlines and optimises each call site.
- *
- * step  : forward movement per F in cell columns (=1 for dry-run,
- *         =ls->step for draw).
- * ox,oy : turtle origin in cell coordinates.
- *
- * Segment drawing uses a DDA (digital differential analyser) to fill
- * all cells along a segment, not just the endpoint.  This ensures no
- * gaps when step > 1 (early generations have large steps).
- */
-
 static void put_segment(WINDOW *w, float x0, float y0, float x1, float y1,
                         chtype attr, float angle, int cols, int rows)
 {
-    float dx   = x1 - x0;
-    float dy   = y1 - y0;
-    int   steps = (int)(fabsf(dx) > fabsf(dy) ? fabsf(dx) : fabsf(dy));
-    if (steps < 1) steps = 1;
-    char ch = angle_char(angle);
+    float dx = x1 - x0, dy = y1 - y0;
+    int   steps = dda_steps(dx, dy);
+    char  ch = angle_char(angle);
 
     for (int i = 0; i <= steps; i++) {
-        float t  = (float)i / (float)steps;
+        float t  = (float)i / (float)steps;          /* 0..1 along the segment */
         int   cx = (int)roundf(x0 + dx * t);
         int   cy = (int)roundf(y0 + dy * t);
-        if (cx >= 0 && cx < cols && cy >= 1 && cy < rows - 1) {
+        if (in_canvas(cx, cy, cols, rows)) {
             wattron(w, attr);
             mvwaddch(w, cy, cx, (chtype)(unsigned char)ch);
             wattroff(w, attr);
@@ -493,240 +736,265 @@ static void put_segment(WINDOW *w, float x0, float y0, float x1, float y1,
     }
 }
 
+/* ── passes: measure (geometry) and draw (render) ────────────────────── */
+
 /*
- * turtle_run() — core turtle interpreter.
- *
- * draw_mode = false: accumulate bounding box into minx/miny/maxx/maxy.
- * draw_mode = true : render segments into WINDOW *w.
- *
- * Always uses step and ox/oy as passed; caller sets these appropriately
- * for the dry-run (step=1, ox=oy=0) and the draw pass.
+ * turtle_measure() — walk the WHOLE string at unit step, reporting the path's
+ * bounding box and forward-segment count.  Pure geometry: no screen, no colour.
+ * Reads like the algorithm — drive the turtle over every symbol, growing the box
+ * around each segment it draws.
  */
-static void turtle_run(const LSystem *ls, const Preset *p,
-                       bool draw_mode,
-                       WINDOW *w, int cols, int rows,
-                       float step, float ox, float oy,
-                       float *minx, float *miny,
-                       float *maxx, float *maxy)
+static void turtle_measure(const Grammar *g, const Preset *p,
+                           BBox *bbox, int *n_segments)
 {
-    TurtleState stack[STACK_MAX];
-    int    sp    = 0;
-    int    depth = 0;
-    float  x     = 0.0f;
-    float  y     = 0.0f;
-    float  angle = p->start_deg * (float)M_PI / 180.0f;
-    float  delta = p->angle_deg * (float)M_PI / 180.0f;
+    Turtle t; turtle_init(&t, p->start_deg);
+    float  delta = radians(p->angle_deg);
+    int    segs  = 0;
 
-    if (!draw_mode) {
-        *minx = *miny =  1e30f;
-        *maxx = *maxy = -1e30f;
-    }
-
-    for (size_t i = 0; i < ls->cur_len; i++) {
-        char c = ls->cur[i];
-
-        if (strchr(p->draw_chars, c)) {
-            float nx = x + cosf(angle) * step;
-            float ny = y + sinf(angle) * step * ASPECT;
-            if (draw_mode) {
-                chtype attr = depth_attr(depth);
-                put_segment(w, ox + x, oy + y, ox + nx, oy + ny,
-                            attr, angle, cols, rows);
-            } else {
-                if (nx < *minx) *minx = nx;
-                if (nx > *maxx) *maxx = nx;
-                if (ny < *miny) *miny = ny;
-                if (ny > *maxy) *maxy = ny;
-                /* also track current pos for the very first segment */
-                if (x < *minx) *minx = x;
-                if (x > *maxx) *maxx = x;
-                if (y < *miny) *miny = y;
-                if (y > *maxy) *maxy = y;
-            }
-            x = nx; y = ny;
-
-        } else if (c == '+') {
-            angle += delta;
-        } else if (c == '-') {
-            angle -= delta;
-        } else if (c == '[') {
-            if (sp < STACK_MAX)
-                stack[sp++] = (TurtleState){ x, y, angle, depth };
-            depth++;
-        } else if (c == ']') {
-            if (sp > 0) {
-                TurtleState s = stack[--sp];
-                x = s.x; y = s.y; angle = s.angle; depth = s.depth;
-            }
+    bbox_reset(bbox);
+    for (size_t i = 0; i < g->len; i++) {
+        Segment s = {0};
+        if (turtle_apply(&t, g->cur[i], p, 1.0f, delta, &s)) {
+            bbox_extend(bbox, s.x0, s.y0);
+            bbox_extend(bbox, s.x1, s.y1);
+            segs++;
         }
-        /* X, Y, A, B (non-draw variables) and unknowns: no action */
     }
+    *n_segments = segs;
 }
 
-/* ── bounds + scale ──────────────────────────────────────────────────── */
+/*
+ * scale_to_fit() — the largest uniform scale that fits a bw x bh box into a
+ * uw x uh area (the smaller of the two axis ratios), floored at MIN_SCALE so the
+ * deepest generations stay visible rather than collapsing to a dot.
+ */
+static float scale_to_fit(float bw, float bh, int uw, int uh)
+{
+    float sx = (float)uw / bw, sy = (float)uh / bh;
+    float s  = (sx < sy) ? sx : sy;
+    return s < MIN_SCALE ? MIN_SCALE : s;
+}
 
 /*
- * lsys_compute_scale() — dry-run the turtle, compute step and offsets
- * that fit the fractal into the usable screen area.
- *
- * Usable area: cols × (rows - HUD_ROWS) after reserving top row (HUD)
- * and bottom row (key hints).
- *
- * scale = min(usable_w / bbox_w, usable_h / bbox_h)  with 2-cell margin.
- *
- * For preset.bottom == true (Branching Plant): pin the stem to the
- * bottom of the usable area instead of centering vertically.
+ * axis_center() — the offset that centres a scaled box within `outer` cells along
+ * one axis.  `extent` is the box size and `origin` its minimum, both in unit
+ * space; the result already cancels the box origin so a cell at `origin` lands
+ * correctly.
  */
-static void lsys_compute_scale(LSystem *ls, const Preset *p,
-                                int cols, int rows)
+static float axis_center(int outer, float extent, float origin, float scale)
 {
-    float minx, miny, maxx, maxy;
-    turtle_run(ls, p, false, NULL, cols, rows,
-               1.0f, 0.0f, 0.0f,
-               &minx, &miny, &maxx, &maxy);
+    return ((float)outer - extent * scale) / 2.0f - origin * scale;
+}
 
-    float bw = maxx - minx;
-    float bh = maxy - miny;
-    if (bw < 1.0f) bw = 1.0f;
+/*
+ * fit_compute() — dry-run the turtle to size the fractal, then choose the scale
+ * and offset that drop it into the usable band.  Reads as named steps: measure,
+ * box size, usable area, scale-to-fit, then centre (or bottom-pin the plant).
+ * Recomputed once per generation change and per resize.
+ */
+static void fit_compute(Fit *fit, const Grammar *g, const Preset *p,
+                        int cols, int rows)
+{
+    BBox b; int segs = 0;
+    turtle_measure(g, p, &b, &segs);
+    fit->n_segments = segs;
+
+    float bw = b.maxx - b.minx, bh = b.maxy - b.miny;
+    if (bw < 1.0f) bw = 1.0f;                        /* avoid a zero-size box */
     if (bh < 1.0f) bh = 1.0f;
 
-    int usable_cols = cols - 2;
-    int usable_rows = rows - HUD_ROWS - 2;   /* -2 for top/bottom margin */
-    if (usable_cols < 1) usable_cols = 1;
-    if (usable_rows < 1) usable_rows = 1;
+    int uw = cols - FIT_MARGIN_COLS;                 /* usable width  (side margins) */
+    int uh = rows - HUD_TOP_ROWS - HUD_BOT_ROWS;     /* usable band between the HUDs */
+    if (uw < 1) uw = 1;
+    if (uh < 1) uh = 1;
 
-    float sx = (float)usable_cols / bw;
-    float sy = (float)usable_rows / bh;
-    float s  = (sx < sy) ? sx : sy;
-    if (s < 0.5f) s = 0.5f;   /* never shrink below half-cell steps */
+    fit->scale = scale_to_fit(bw, bh, uw, uh);
+    fit->ox    = axis_center(cols, bw, b.minx, fit->scale);   /* always centred */
 
-    ls->step = s;
+    if (p->bottom)
+        fit->oy = (float)(rows - HUD_BOT_ROWS - 1) - b.maxy * fit->scale;  /* pin base */
+    else
+        fit->oy = (float)HUD_TOP_ROWS + axis_center(uh, bh, b.miny, fit->scale);
+}
 
-    /* Center horizontally always */
-    ls->cx_off = ((float)cols - bw * s) / 2.0f - minx * s;
+/*
+ * turtle_draw() — walk the string at the fit's scale and render the first `limit`
+ * forward segments through the fit; the progressive reveal stops once `limit`
+ * segments are drawn.  Same drive-the-turtle loop as turtle_measure, but each
+ * segment is painted instead of measured.
+ */
+static void turtle_draw(const Grammar *g, const Preset *p, const Fit *fit,
+                        int limit, WINDOW *w, int cols, int rows)
+{
+    Turtle t; turtle_init(&t, p->start_deg);
+    float  delta = radians(p->angle_deg);
+    int    seg   = 0;
 
-    /* Vertical: pin to bottom for plant, center for all others */
-    if (p->bottom) {
-        /* maxy * s is the bottom of the bounding box in scaled space.
-         * We want that to sit at (rows - 2) (last usable row).         */
-        ls->cy_off = (float)(rows - 2) - maxy * s;
-    } else {
-        ls->cy_off = ((float)(rows - HUD_ROWS) - bh * s) / 2.0f
-                     - miny * s + 1.0f;  /* +1: skip HUD row            */
+    for (size_t i = 0; i < g->len && seg < limit; i++) {
+        Segment s = {0};
+        if (turtle_apply(&t, g->cur[i], p, fit->scale, delta, &s)) {
+            put_segment(w, fit->ox + s.x0, fit->oy + s.y0,
+                           fit->ox + s.x1, fit->oy + s.y1,
+                        depth_attr(s.depth), s.angle, cols, rows);
+            seg++;
+        }
     }
-
-    ls->bounds_valid = true;
 }
 
-/* ── init / set preset ───────────────────────────────────────────────── */
-
-static void lsys_set_preset(LSystem *ls, int p, int cols, int rows);
-
-static void lsys_init(LSystem *ls, int cols, int rows)
+/*
+ * render_fractal() — draw the revealed portion of the current generation.  Reads
+ * the grammar (what), the fit (where on screen), and the animation (how much);
+ * mutates none of them.  The reveal fraction becomes a segment count, clamped to
+ * at least 1 so a fresh generation never flashes blank.
+ */
+static void render_fractal(const Grammar *g, const Preset *p, const Fit *fit,
+                           const Animation *a, WINDOW *w, int cols, int rows)
 {
-    memset(ls, 0, sizeof *ls);
-    lsys_alloc(ls);
-    lsys_set_preset(ls, 0, cols, rows);
-}
-
-static void lsys_set_preset(LSystem *ls, int p, int cols, int rows)
-{
-    ls->preset       = (p + N_PRESETS) % N_PRESETS;
-    ls->gen          = 0;
-    ls->at_max       = false;
-    ls->paused       = false;
-    ls->bounds_valid = false;
-    ls->advance_sec  = PRESETS[ls->preset].advance_sec;
-    ls->advance_timer = ls->advance_sec;
-
-    /* Load axiom as generation 0 */
-    const char *axiom = PRESETS[ls->preset].axiom;
-    ls->cur_len = strlen(axiom);
-    memcpy(ls->cur, axiom, ls->cur_len + 1);
-
-    lsys_compute_scale(ls, &PRESETS[ls->preset], cols, rows);
-}
-
-static void lsys_restart(LSystem *ls, int cols, int rows)
-{
-    lsys_set_preset(ls, ls->preset, cols, rows);
+    int limit = (int)(a->reveal * (float)fit->n_segments + 0.5f);
+    if (limit < 1)               limit = 1;
+    if (limit > fit->n_segments) limit = fit->n_segments;
+    turtle_draw(g, p, fit, limit, w, cols, rows);
 }
 
 /* ===================================================================== */
-/* §6  scene                                                              */
+/* §7  scene — orchestration: the generation state machine                */
 /* ===================================================================== */
 
-typedef struct { LSystem ls; } Scene;
+/*
+ * Scene — the whole picture in one object, composed from the layers above:
+ *   grammar  the CORE string,            anim  the EFFECTS/DELAYS timer,
+ *   fit      the RENDER mapping,          plus the user's selections.
+ *
+ * The state machine is: draw the generation in (anim), hold it (anim), then
+ * advance the grammar and re-fit — or stop at the preset's last generation.
+ */
+typedef struct {
+    Grammar   grammar;     /* §4 core: the string                           */
+    Animation anim;        /* §5 effects: reveal + hold timing              */
+    Fit       fit;         /* §6 render: screen mapping + segment count     */
+
+    int       preset;      /* active preset, 0..N_PRESETS-1 (n / p keys)    */
+    int       theme;       /* active colour theme, 0..N_THEMES-1; persists  *
+                            * across preset changes and restarts (t / T)    */
+    bool      paused;      /* space: freezes the draw-in AND the hold       */
+    bool      at_max;      /* reached the preset's last generation — hold    */
+} Scene;
+
+static void scene_load_preset(Scene *s, int idx, int cols, int rows)
+{
+    s->preset = ((idx % N_PRESETS) + N_PRESETS) % N_PRESETS;
+    const Preset *p = &PRESETS[s->preset];
+
+    s->paused = false;
+    s->at_max = false;
+    grammar_load(&s->grammar, p);
+    fit_compute(&s->fit, &s->grammar, p, cols, rows);
+    s->anim.draw_sec = p->advance_sec;
+    animation_begin(&s->anim);
+}
 
 static void scene_init(Scene *s, int cols, int rows)
 {
     memset(s, 0, sizeof *s);
-    lsys_init(&s->ls, cols, rows);
+    grammar_alloc(&s->grammar);
+    s->theme = 0;                       /* color_init() already applied theme 0 */
+    scene_load_preset(s, 0, cols, rows);
 }
 
-static void scene_free(Scene *s) { lsys_free(&s->ls); }
+static void scene_free(Scene *s) { grammar_free(&s->grammar); }
 
 /*
- * scene_tick() — decrement advance timer; fire lsys_advance when due.
- *
- * dt is the fixed tick duration in seconds (from the accumulator loop).
- * The timer approach decouples the visual advance cadence from sim_fps —
- * the user can adjust advance_sec independently with + / -.
+ * scene_advance() — move to the next generation: expand the grammar, re-fit, and
+ * restart the draw-in.  If there is no next generation (max reached or the string
+ * would overflow), latch at_max so the final form is held.
  */
-static void scene_tick(Scene *s, float dt, int cols, int rows)
+static void scene_advance(Scene *s, int cols, int rows)
 {
-    LSystem *ls = &s->ls;
-    const Preset *p = &PRESETS[ls->preset];
-
-    if (ls->paused || ls->at_max) return;
-
-    ls->advance_timer -= dt;
-    if (ls->advance_timer <= 0.0f) {
-        ls->advance_timer = ls->advance_sec;
-        if (ls->gen < p->max_gen) {
-            if (lsys_advance(ls, p))
-                lsys_compute_scale(ls, p, cols, rows);
-        } else {
-            ls->at_max = true;
-        }
+    const Preset *p = &PRESETS[s->preset];
+    if (s->grammar.gen < p->max_gen && grammar_expand(&s->grammar, p)) {
+        fit_compute(&s->fit, &s->grammar, p, cols, rows);
+        animation_begin(&s->anim);
+    } else {
+        s->at_max = true;
+        animation_show_full(&s->anim);
     }
 }
 
-/*
- * scene_draw() — render the current generation's turtle path.
- *
- * alpha is accepted for framework signature compatibility but unused —
- * the turtle path is a static image for each generation.
- *
- * Recomputes scale if bounds_valid is false (happens after resize or
- * when called before scene_tick has fired the first time).
- */
-static void scene_draw(Scene *s, WINDOW *w, int cols, int rows,
-                       float alpha, float dt_sec)
+/* scene_tick() — one fixed sim step: drive the animation; advance when its hold
+ * elapses.  Paused or finished scenes do nothing (the image just holds). */
+static void scene_tick(Scene *s, float dt, int cols, int rows)
 {
-    (void)alpha; (void)dt_sec;
+    if (s->paused || s->at_max) return;
+    if (animation_step(&s->anim, dt))
+        scene_advance(s, cols, rows);
+}
 
-    LSystem *ls      = &s->ls;
-    const Preset *p  = &PRESETS[ls->preset];
+/* scene_step() — manual single-step (Enter): jump to the next generation, shown
+ * fully drawn.  Most useful while paused. */
+static void scene_step(Scene *s, int cols, int rows)
+{
+    const Preset *p = &PRESETS[s->preset];
+    if (s->at_max || s->grammar.gen >= p->max_gen) return;
+    if (grammar_expand(&s->grammar, p))
+        fit_compute(&s->fit, &s->grammar, p, cols, rows);
+    animation_show_full(&s->anim);
+}
 
-    if (!ls->bounds_valid)
-        lsys_compute_scale(ls, p, cols, rows);
+static void scene_cycle_preset(Scene *s, int dir, int cols, int rows)
+{
+    scene_load_preset(s, s->preset + dir, cols, rows);
+}
 
-    turtle_run(ls, p, true, w, cols, rows,
-               ls->step, ls->cx_off, ls->cy_off,
-               NULL, NULL, NULL, NULL);
+static void scene_restart(Scene *s, int cols, int rows)
+{
+    scene_load_preset(s, s->preset, cols, rows);
+}
+
+/* Theme lives on the Scene (not the per-fractal grammar), so it persists across
+ * preset changes and restarts. */
+static void scene_cycle_theme(Scene *s, int dir)
+{
+    s->theme = (s->theme + dir + N_THEMES) % N_THEMES;
+    theme_apply(s->theme);
+}
+
+static void scene_faster(Scene *s)
+{
+    s->anim.draw_sec *= DRAW_FASTER;
+    if (s->anim.draw_sec < DRAW_SEC_MIN) s->anim.draw_sec = DRAW_SEC_MIN;
+}
+
+static void scene_slower(Scene *s)
+{
+    s->anim.draw_sec *= DRAW_SLOWER;
+    if (s->anim.draw_sec > DRAW_SEC_MAX) s->anim.draw_sec = DRAW_SEC_MAX;
+}
+
+static void scene_refit(Scene *s, int cols, int rows)
+{
+    fit_compute(&s->fit, &s->grammar, &PRESETS[s->preset], cols, rows);
+}
+
+static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows)
+{
+    render_fractal(&s->grammar, &PRESETS[s->preset], &s->fit, &s->anim,
+                   w, cols, rows);
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §8  screen — ncurses lifecycle + HUD                                   */
 /* ===================================================================== */
 
 /*
- * Standard framework screen layer.
- * ONE window (stdscr), ONE flush per frame (doupdate).
- * See framework.c §7 for full double-buffer explanation.
+ * Screen — the terminal as a drawing surface: just its current size, cached from
+ * ncurses (getmaxyx) at startup and after each resize so the hot draw path never
+ * re-queries it.  The ncurses lifecycle this wraps — initscr, colour, resize,
+ * teardown — follows Gookin (2007).
  */
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+    int cols;   /* terminal width  in character columns; valid x are [0,cols) */
+    int rows;   /* terminal height in character rows;    valid y are [0,rows) */
+} Screen;
 
 static void screen_init(Screen *s)
 {
@@ -741,38 +1009,63 @@ static void screen_init(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_free(Screen *s) { (void)s; endwin(); }
-
+static void screen_free(Screen *s)   { (void)s; endwin(); }
 static void screen_resize(Screen *s) { endwin(); refresh(); getmaxyx(stdscr, s->rows, s->cols); }
 
-static void screen_draw(Screen *s, Scene *sc,
-                        double fps, int sim_fps,
-                        float alpha, float dt_sec)
+/* hud_line() — one HUD line, clamped to terminal width so it never wraps. */
+static void hud_line(int row, int x, int pair, attr_t attr, int cols, const char *str)
+{
+    if (x < 0) x = 0;
+    if (x >= cols) return;
+    attron(COLOR_PAIR(pair) | attr);
+    mvprintw(row, x, "%.*s", cols - x, str);
+    attroff(COLOR_PAIR(pair) | attr);
+}
+
+/* hud_status() — row 0, right-aligned + bold: title, fps, speed, run/phase word.
+ * Speed is the draw-in RATE (anim_speed) so a bigger number means faster. */
+static void hud_status(const Screen *s, const Scene *sc, double fps)
+{
+    const char *state = sc->paused ? "PAUSED "
+                      : sc->at_max ? "max gen"
+                      :              "running";
+    char buf[128];
+    snprintf(buf, sizeof buf, " L-System  %5.1f fps  speed:%.2f  %s ",
+             fps, anim_speed(&sc->anim), state);
+    hud_line(0, s->cols - (int)strlen(buf), PAIR_HUD, A_BOLD, s->cols, buf);
+}
+
+/* hud_params() — row 1, left: the live parameter readouts. */
+static void hud_params(const Screen *s, const Scene *sc)
+{
+    const Preset *p = &PRESETS[sc->preset];
+    char buf[128];
+    snprintf(buf, sizeof buf, " %s  gen %d/%d  len:%zu  theme:%s ",
+             p->name, sc->grammar.gen, p->max_gen, sc->grammar.len,
+             THEMES[sc->theme].name);
+    hud_line(1, 0, PAIR_HUD, A_NORMAL, s->cols, buf);
+}
+
+/* hud_keys() — bottom row: every interactive key. */
+static void hud_keys(const Screen *s)
+{
+    hud_line(s->rows - 1, 0, PAIR_HINT, A_BOLD, s->cols,
+             " q:quit  spc:pause  Enter:step  n/p:preset  t:theme  r:restart  +/-:speed ");
+}
+
+/*
+ * HUD layout — data on top, actions on the bottom:
+ *   row 0      (yellow bold,  right)  title, fps, speed, run/phase state
+ *   row 1      (yellow plain, left)   preset, generation, length, theme
+ *   row rows-1 (cyan bold,    left)   every interactive key
+ */
+static void screen_draw(Screen *s, const Scene *sc, double fps)
 {
     erase();
-
-    scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
-
-    const LSystem *ls = &sc->ls;
-    const Preset  *p  = &PRESETS[ls->preset];
-
-    /* HUD — row 0 */
-    char buf[128];
-    snprintf(buf, sizeof buf,
-             " %-20s  gen %d/%d  len:%-7zu  %.1f s/gen  %dHz  %.1ffps  %s ",
-             p->name, ls->gen, p->max_gen, ls->cur_len,
-             ls->advance_sec, sim_fps, fps,
-             ls->paused ? "PAUSED" :
-             ls->at_max ? "MAX GEN" : "running");
-    attron(COLOR_PAIR(8) | A_BOLD);
-    mvprintw(0, 0, "%.*s", s->cols, buf);
-    attroff(COLOR_PAIR(8) | A_BOLD);
-
-    /* hint bar — last row */
-    attron(A_DIM);
-    mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  Enter:step  n/p:preset  r:restart  +/-:speed ");
-    attroff(A_DIM);
+    scene_draw(sc, stdscr, s->cols, s->rows);
+    hud_status(s, sc, fps);
+    hud_params(s, sc);
+    hud_keys(s);
 }
 
 static void screen_present(void)
@@ -782,17 +1075,27 @@ static void screen_present(void)
 }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §9  app — main loop                                                    */
 /* ===================================================================== */
 
+/*
+ * App — the top-level program state: the picture (scene), the surface it draws to
+ * (screen), and the two signal flags.  Everything user-facing is reached through
+ * this one object.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene                 scene;         /* the whole simulation + render state    */
+    Screen                screen;        /* cached terminal size                   */
+    volatile sig_atomic_t running;       /* main-loop flag; cleared by SIGINT/TERM */
+    volatile sig_atomic_t need_resize;   /* set by SIGWINCH, serviced next frame   */
 } App;
 
+/*
+ * The one global.  Signal handlers receive only an int, so the flags they must
+ * touch (running / need_resize) have to be reachable without a parameter.  Those
+ * two are volatile sig_atomic_t — the only kind of object a handler may portably
+ * write and the loop may portably read.  Everything else is passed by pointer.
+ */
 static App g_app;
 
 static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
@@ -802,67 +1105,31 @@ static void cleanup(void)             { endwin(); }
 static void app_do_resize(App *app)
 {
     screen_resize(&app->screen);
-    /* Recompute scale for new dimensions */
-    LSystem *ls = &app->scene.ls;
-    ls->bounds_valid = false;
-    lsys_compute_scale(ls, &PRESETS[ls->preset],
-                       app->screen.cols, app->screen.rows);
+    scene_refit(&app->scene, app->screen.cols, app->screen.rows);
     app->need_resize = 0;
 }
 
 static bool app_handle_key(App *app, int ch)
 {
-    LSystem *ls = &app->scene.ls;
+    Scene *sc = &app->scene;
     int cols = app->screen.cols, rows = app->screen.rows;
-    const Preset *p = &PRESETS[ls->preset];
 
     switch (ch) {
     case 'q': case 'Q': case 27: return false;
 
-    case ' ':
-        ls->paused = !ls->paused;
-        break;
+    case ' ':                sc->paused = !sc->paused;           break;
+    case '\n': case '\r': case KEY_ENTER: scene_step(sc, cols, rows); break;
 
-    case '\n': case KEY_ENTER: case '\r':
-        /* Manual advance one generation */
-        if (!ls->at_max && ls->gen < p->max_gen) {
-            if (lsys_advance(ls, p))
-                lsys_compute_scale(ls, p, cols, rows);
-            ls->advance_timer = ls->advance_sec;
-        }
-        break;
+    case 'n': scene_cycle_preset(sc, +1, cols, rows); break;
+    case 'p': scene_cycle_preset(sc, -1, cols, rows); break;
 
-    case 'n':
-        lsys_set_preset(ls, ls->preset + 1, cols, rows);
-        break;
+    case 't': scene_cycle_theme(sc, +1); break;
+    case 'T': scene_cycle_theme(sc, -1); break;
 
-    case 'p':
-        lsys_set_preset(ls, ls->preset - 1, cols, rows);
-        break;
+    case 'r': case 'R': scene_restart(sc, cols, rows); break;
 
-    case 'r': case 'R':
-        lsys_restart(ls, cols, rows);
-        break;
-
-    case '=': case '+':
-        ls->advance_sec *= 0.75f;
-        if (ls->advance_sec < 0.2f) ls->advance_sec = 0.2f;
-        break;
-
-    case '-':
-        ls->advance_sec *= 1.33f;
-        if (ls->advance_sec > 10.0f) ls->advance_sec = 10.0f;
-        break;
-
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+    case '=': case '+': scene_faster(sc); break;
+    case '-':           scene_slower(sc); break;
 
     default: break;
     }
@@ -871,8 +1138,6 @@ static bool app_handle_key(App *app, int ch)
 
 int main(void)
 {
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
-
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
@@ -880,66 +1145,32 @@ int main(void)
 
     App *app     = &g_app;
     app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
 
     screen_init(&app->screen);
     scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+    FrameClock clock;
+    frameclock_init(&clock);
 
     while (app->running) {
 
-        /* ── resize ──────────────────────────────────────────────── */
         if (app->need_resize) {
             app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
+            frameclock_init(&clock);     /* fresh timing after the resize */
         }
 
-        /* ── dt ──────────────────────────────────────────────────── */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        frameclock_begin_frame(&clock);
 
-        /* ── sim accumulator ─────────────────────────────────────── */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+        /* fixed-timestep: advance the sim in equal slices, however fast we draw */
+        int64_t tick_ns = TICK_NS(SIM_FPS);
+        while (frameclock_step_due(&clock, tick_ns))
+            scene_tick(&app->scene, TICK_SEC, app->screen.cols, app->screen.rows);
 
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec,
-                       app->screen.cols, app->screen.rows);
-            sim_accum -= tick_ns;
-        }
+        frameclock_throttle(&clock);
 
-        /* ── alpha — unused; L-system frames are static images ───── */
-        float alpha = (float)sim_accum / (float)tick_ns;
-
-        /* ── FPS counter ─────────────────────────────────────────── */
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        /* ── frame cap — sleep BEFORE render ─────────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        /* ── draw + present ──────────────────────────────────────── */
-        screen_draw(&app->screen, &app->scene,
-                    fps_display, app->sim_fps, alpha, dt_sec);
+        screen_draw(&app->screen, &app->scene, clock.fps);
         screen_present();
 
-        /* ── input ───────────────────────────────────────────────── */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

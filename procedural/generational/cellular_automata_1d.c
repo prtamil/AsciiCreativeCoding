@@ -6,9 +6,10 @@
  * When the screen fills it holds for 3 seconds then loads the next preset.
  *
  * Layout:
- *   Row 0          — title bar: rule number, name, class (in class colour)
+ *   Row 0          — data bar: rule, name, class, preset, speed, state
+ *                    (coloured by the rule's Wolfram class)
  *   Rows 1 … n-2   — CA area, filling top-down one row at a time
- *   Row n-1        — key-binding strip
+ *   Row n-1        — action bar: the interactive keys
  *
  * Each rule has a Wolfram class, colour-coded:
  *   Class 1 (Fixed)    — grey    — converges to uniform state
@@ -19,22 +20,21 @@
  *
  * Keys:
  *   n / p         next / previous preset
+ *   t / T         next / previous colour theme
  *   a             toggle auto-advance (on by default)
  *   r             reseed — single cell at centre
  *   R             reseed — random initial row
  *   + / =         faster (fewer ticks between rows)
  *   - / _         slower (more ticks between rows)
  *   space         pause / resume
- *   0-9 + Enter   type any rule 0–255 and press Enter to apply
- *   Backspace     erase last typed digit
  *   q / Q         quit
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/cellular_automata_1d.c \
+ *   gcc -std=c11 -O2 -Wall -Wextra procedural/generational/cellular_automata_1d.c \
  *       -o cellular_automata_1d -lncurses
  *
- * Sections: §1 config  §2 clock  §3 color  §4 ca  §5 scene
- *           §6 screen  §7 app
+ * Sections: §1 config  §2 clock  §3 color  §4 model  §5 simulation
+ *           §6 render   §7 app
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -62,6 +62,28 @@
  *                  neighbourhood extraction.  No double buffer needed since
  *                  rows are computed top-to-bottom from the previous row only.
  *
+ * References     :
+ *
+ *   CONCEPTS — elementary cellular automata
+ *   • Wolfram, S. (1983) — "Statistical mechanics of cellular automata",
+ *     *Reviews of Modern Physics* 55:601-644.  The foundational paper: the
+ *     2³→256 rule numbering and the rule-as-lookup-table scheme used here.
+ *   • Wolfram, S. (1984) — "Universality and complexity in cellular
+ *     automata", *Physica D* 10:1-35.  The four behaviour classes
+ *     (fixed / periodic / chaotic / complex) this demo colour-codes
+ *     (we add a 5th "fractal" bucket for Sierpinski-type rules).
+ *   • Cook, M. (2004) — "Universality in Elementary Cellular Automata",
+ *     *Complex Systems* 15(1):1-40.  Proof that Rule 110 is Turing-complete.
+ *   • Wolfram, S. (2002) — *A New Kind of Science*, Wolfram Media.  The
+ *     comprehensive reference; Rule 30 as an RNG, Rule 90 → Sierpinski,
+ *     Rule 110 gliders.  Browseable free at wolframscience.com.
+ *
+ *   RENDERING — terminal output
+ *   • Padala, P. (2005) — "NCURSES Programming HOWTO", TLDP
+ *     (tldp.org/HOWTO/NCURSES-Programming-HOWTO/).  The colour-pair,
+ *     attribute, and double-buffered (wnoutrefresh/doupdate) model used
+ *     in §3/§6.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
@@ -85,16 +107,16 @@
  *
  * ALGORITHM IN STEPS
  * ──────────────────
- *  1. Seed row 0: usually a single live cell at the centre column.
- *  2. To compute row r+1 from row r, for each column c:
+ *  1. Seed generation 0: usually a single live cell at the centre column.
+ *  2. To compute generation g+1 from g, for each column c:
  *       a. Read l = row[c-1], m = row[c], rv = row[c+1] (wrap toroidally).
  *       b. Form the 3-bit index n = (l<<2)|(m<<1)|rv  ∈ [0,7].
- *       c. New cell = (rule >> n) & 1.
- *  3. Each tick of the framework loop adds one row (every g_delay ticks).
- *  4. When row index reaches g_ca_rows-1, freeze the pattern, hold for
- *     PAUSE_TICKS, then auto-advance to the next preset.
- *  5. Render: row r of g_grid maps to terminal row 1+r; class colour is
- *     looked up once per pattern from ca_classify().
+ *       c. New cell = (rule >> n) & 1.              ← cell_next()
+ *  3. Each tick adds one generation (every ctl.delay ticks).
+ *  4. When the last generation is reached, freeze, hold for PAUSE_TICKS,
+ *     then auto-advance to the next preset (if auto is on).
+ *  5. Render: generation g maps to terminal row 1+g; the class colour comes
+ *     from ca_classify().
  *
  * KEY FORMULAS
  * ────────────
@@ -109,12 +131,10 @@
  *    kept in the preset list as visual sanity checks.
  *  • Toroidal wrap means a "centre" seed is only centred for ONE row;
  *    after a few generations the pattern can re-enter from the opposite edge.
- *  • g_grid[r] is computed top-down once; resizing columns invalidates the
- *    seed and forces a re-seed (see screen_resize → ca_seed_center).
+ *  • Each generation is computed top-down once; resizing the terminal re-fits
+ *    the grid and re-centres the seed (app_fit → scene_reseed).
  *  • Random seed (R) populates row 0 with rand()&1 — chaotic rules look
  *    drastically different from centre seed, fixed/fractal ones may not.
- *  • Three-digit rule entry auto-applies at 3 chars; values > 255 silently
- *    rejected so the buffer stays harmless.
  *
  * HOW TO VERIFY
  * ─────────────
@@ -130,9 +150,43 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE — SIMULATION / LOGIC / EFFECTS / DELAYS / RENDER ─────── *
+ *
+ * One rule keeps the layers clear: a function's SIGNATURE says whether it
+ * can change the world.
+ *   • non-const pointer (Automaton*, Scene*, App*) → an EFFECT; may mutate.
+ *   • const pointer / by-value                     → a pure read / render.
+ *
+ * SIMULATION — the automaton itself (§5):
+ *   ca_step         compute one generation from the row above (the effect)
+ *   ca_seed_center / ca_seed_random   lay down generation 0
+ *
+ * LOGIC — stateless rules (§4), no mutation:
+ *   cell_next       the Wolfram lookup: 3-cell neighbourhood → next state
+ *   ca_classify     rule number → Wolfram behaviour class (1..5)
+ *
+ * EFFECTS — everything that mutates state, behind non-const pointers:
+ *   the cell grid + generation counter (ca_step / seeds), and the control
+ *   knobs (scene_set_preset / scene_set_theme / scene_reseed / scene_tick).
+ *
+ * DELAYS — the only time-bending, in the control + main loop:
+ *   row pacing   one new generation every ctl.delay ticks
+ *   hold         freeze a finished pattern for PAUSE_TICKS, then advance
+ *   frame cap    main() sleeps to a fixed TICK_NS (~30 fps)
+ *
+ * RENDERING (§6) is PURE: render_* read a const Scene and write only the
+ * terminal — the data bar (row 0), the CA grid (rows 1..n-2), and the
+ * action bar (row n-1) are three independent draws that mutate nothing.
+ *
+ * PERFORMANCE — modest by design: each generation is O(cols), a single
+ * bitwise pass; no double buffer is needed because every generation is kept
+ * (the grid is the history) and each row is computed once from the one above.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -140,26 +194,44 @@
 #include <stdio.h>
 #include <time.h>
 
-/* ── §1 config ───────────────────────────────────────────────────────── */
+/* ===================================================================== */
+/* §1  config — tunables, presets, colour-pair IDs                        */
+/* ===================================================================== */
 
-#define TICK_NS      33333333LL  /* ~30 fps                               */
-#define MAX_ROWS     128         /* grid depth; must be ≥ terminal rows   */
-#define MAX_COLS     320
-#define DELAY_DEF    3           /* ticks between rows  (~10 rows / sec)  */
-#define DELAY_MIN    1           /* fastest: 1 tick / row  (30 rows/sec)  */
-#define DELAY_MAX    30          /* slowest: 30 ticks / row (1 row/sec)   */
-#define PAUSE_TICKS  90          /* hold complete pattern for 3 s then advance */
+#define TICKS_PER_SEC 30                             /* sim/render tick rate */
+#define TICK_NS      (1000000000LL / TICKS_PER_SEC)  /* ~30 fps frame cap    */
+#define MAX_ROWS     128         /* grid depth; ≥ any terminal height     */
+#define MAX_COLS     320         /* grid width; ≥ any terminal width      */
+#define DELAY_DEF    3           /* ticks between rows (~10 rows/sec)     */
+#define DELAY_MIN    1           /* fastest: 1 tick / row                 */
+#define DELAY_MAX    30          /* slowest: 30 ticks / row               */
+#define PAUSE_TICKS  (3 * TICKS_PER_SEC)  /* hold a finished pattern ~3 s */
 #define LIVE_CHAR    '#'
 
-/* simulation states */
-enum { ST_BUILD = 0, ST_PAUSE };
+/* HUD reserves the top row (data bar) and the bottom row (action bar);
+ * the CA fills the rows between. */
+#define HUD_TOP_ROWS 1
+#define HUD_BOT_ROWS 1
+#define HUD_ROWS     (HUD_TOP_ROWS + HUD_BOT_ROWS)
 
-/* color-pair IDs */
-enum { CP_CL1=1, CP_CL2, CP_CL3, CP_CL4, CP_CL5, CP_HUD };
+/* element count of a fixed array. */
+#define COUNT_OF(a)  ((int)(sizeof (a) / sizeof (a)[0]))
 
-/* Preset bank — visually striking rules */
+/* color-pair IDs: CP_CL1..5 = the five Wolfram classes (data bar + grid);
+ * CP_HINT = the action bar. */
+enum { CP_CL1 = 1, CP_CL2, CP_CL3, CP_CL4, CP_CL5, CP_HINT };
+
+/*
+ * Preset bank — a curated tour of 17 of the 256 rules.  Most rules are
+ * visually dull; these are the famous / striking ones.  n/p step through
+ * this list and auto-advance cycles it; the order is a deliberate tour, not
+ * numeric.  A "preset" is just a rule with a name — see scene_set_preset.
+ */
 #define N_PRESETS 17
-static const struct { int rule; const char *desc; } PRESETS[N_PRESETS] = {
+static const struct {
+    int         rule;   /* the Wolfram rule number 0..255 */
+    const char *desc;   /* short HUD caption              */
+} PRESETS[N_PRESETS] = {
     {  30, "Chaos / RNG"       },
     {  90, "Sierpinski"        },
     { 110, "Turing-complete"   },
@@ -179,45 +251,9 @@ static const struct { int rule; const char *desc; } PRESETS[N_PRESETS] = {
     { 255, "All ones"          },
 };
 
-/* Wolfram class: 1=fixed 2=periodic 3=chaotic 4=complex 5=fractal */
-static int ca_classify(int r)
-{
-    static const int cl5[] = { 18, 60, 90, 105, 150 };
-    static const int cl4[] = { 54, 57, 62, 73, 99, 106, 110 };
-    static const int cl3[] = { 22, 30, 45, 75, 89, 109, 126, 135, 149, 153, 154 };
-    static const int cl1[] = { 0, 8, 32, 40, 128, 136, 160, 168, 255 };
-    for (int i = 0; i < 5;  i++) if (cl5[i] == r) return 5;
-    for (int i = 0; i < 7;  i++) if (cl4[i] == r) return 4;
-    for (int i = 0; i < 11; i++) if (cl3[i] == r) return 3;
-    for (int i = 0; i < 9;  i++) if (cl1[i] == r) return 1;
-    return 2;
-}
-
-static const char *class_name(int cls)
-{
-    switch (cls) {
-        case 1: return "Fixed";
-        case 2: return "Periodic";
-        case 3: return "Chaotic";
-        case 4: return "Complex";
-        case 5: return "Fractal";
-    }
-    return "Unknown";
-}
-
-static int class_cp(int cls)
-{
-    switch (cls) {
-        case 1: return CP_CL1;
-        case 2: return CP_CL2;
-        case 3: return CP_CL3;
-        case 4: return CP_CL4;
-        case 5: return CP_CL5;
-    }
-    return CP_CL2;
-}
-
-/* ── §2 clock ────────────────────────────────────────────────────────── */
+/* ===================================================================== */
+/* §2  clock — the program's frame DELAY lives behind these               */
+/* ===================================================================== */
 
 static long long clock_ns(void)
 {
@@ -232,213 +268,425 @@ static void clock_sleep_ns(long long ns)
     nanosleep(&ts, NULL);
 }
 
-/* ── §3 color ────────────────────────────────────────────────────────── */
+/* ===================================================================== */
+/* §3  color — theme → ncurses pairs (a terminal effect)                  */
+/* ===================================================================== */
+
+/*
+ * Theme — a palette for the five Wolfram classes plus the action bar.  The
+ * colour ENCODES the class (fixed/periodic/chaotic/complex/fractal), so every
+ * theme keeps five distinct entries; cycling t/T changes the mood, not the
+ * meaning.  All entries sit in the bright half of the 256-cube.
+ */
+#define N_THEMES 5
+typedef struct {
+    const char *name;
+    short cls[5];     /* classes 1..5: fixed, periodic, chaotic, complex, fractal */
+    short hint;       /* action-bar colour                                        */
+} Theme;
+
+static const Theme THEMES[N_THEMES] = {
+    { "CLASSIC", { 244,  51, 202,  82, 226 },  51 },  /* grey/cyan/orange/green/yellow */
+    { "NEON   ", { 201,  51, 226,  46, 208 }, 213 },  /* vivid magenta…orange          */
+    { "EMBER  ", { 223, 215, 208, 202, 196 }, 220 },  /* warm light→red ramp           */
+    { "ICE    ", { 195, 159, 123,  87,  51 }, 159 },  /* cool light→cyan ramp          */
+    { "MONO   ", { 242, 246, 250, 253, 255 }, 248 },  /* greyscale tiers               */
+};
+
+/* bind the five class pairs + the hint pair from a 256-colour theme. */
+static void theme_bind_256(const Theme *t)
+{
+    init_pair(CP_CL1, t->cls[0], -1);
+    init_pair(CP_CL2, t->cls[1], -1);
+    init_pair(CP_CL3, t->cls[2], -1);
+    init_pair(CP_CL4, t->cls[3], -1);
+    init_pair(CP_CL5, t->cls[4], -1);
+    init_pair(CP_HINT, t->hint, -1);
+}
+
+/* 8-colour fallback: fixed class hues, theme-independent. */
+static void theme_bind_8(void)
+{
+    init_pair(CP_CL1, COLOR_WHITE,  -1);
+    init_pair(CP_CL2, COLOR_CYAN,   -1);
+    init_pair(CP_CL3, COLOR_RED,    -1);
+    init_pair(CP_CL4, COLOR_GREEN,  -1);
+    init_pair(CP_CL5, COLOR_YELLOW, -1);
+    init_pair(CP_HINT, COLOR_CYAN,  -1);
+}
+
+/* apply theme `idx` to the colour pairs (a terminal effect). */
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    if (COLORS >= 256) theme_bind_256(&THEMES[idx]);
+    else               theme_bind_8();
+}
 
 static void color_init(void)
 {
     start_color();
     use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(CP_CL1, 244, -1);  /* grey   — fixed    */
-        init_pair(CP_CL2,  51, -1);  /* cyan   — periodic */
-        init_pair(CP_CL3, 202, -1);  /* orange — chaotic  */
-        init_pair(CP_CL4,  82, -1);  /* green  — complex  */
-        init_pair(CP_CL5, 226, -1);  /* yellow — fractal  */
-        init_pair(CP_HUD,  82, -1);
-    } else {
-        init_pair(CP_CL1, COLOR_WHITE,   -1);
-        init_pair(CP_CL2, COLOR_CYAN,    -1);
-        init_pair(CP_CL3, COLOR_RED,     -1);
-        init_pair(CP_CL4, COLOR_GREEN,   -1);
-        init_pair(CP_CL5, COLOR_YELLOW,  -1);
-        init_pair(CP_HUD, COLOR_GREEN,   -1);
+    theme_apply(0);
+}
+
+/* ===================================================================== */
+/* §4  model — STATE (Automaton + Control + Scene) and pure reads         */
+/* ===================================================================== */
+
+/* Wolfram's behaviour classes (Wolfram 1984) — what a rule does over time. */
+typedef enum {
+    CLASS_FIXED    = 1,   /* converges to a uniform state         */
+    CLASS_PERIODIC = 2,   /* stable or repeating patterns         */
+    CLASS_CHAOTIC  = 3,   /* pseudo-random, sensitive to the seed */
+    CLASS_COMPLEX  = 4,   /* localised propagating structures     */
+    CLASS_FRACTAL  = 5,   /* Sierpinski-like self-similarity      */
+} WolframClass;
+
+/* how generation 0 is laid down — the initial condition the rule evolves. */
+typedef enum {
+    SEED_CENTER,   /* one live cell at the centre column (the canonical seed) */
+    SEED_RANDOM,   /* every cell a coin-flip (chaotic rules diverge wildly)   */
+} SeedKind;
+
+/*
+ * Automaton — the elementary cellular automaton's state (Wolfram 1983).
+ * `cells` stores the WHOLE run, not just the live row: row g is generation
+ * g.  That doubles as the on-screen image AND removes the need for a double
+ * buffer — each generation is read from the row above and written exactly
+ * once, top to bottom (see ca_step).  Static, sized for the largest terminal.
+ */
+typedef struct {
+    uint8_t cells[MAX_ROWS][MAX_COLS]; /* cells[gen][col] ∈ {0,1}; gen 0 = seed */
+    int     w;     /* live row width = terminal columns (≤ MAX_COLS)         */
+    int     gens;  /* generations that fit = CA area height (≤ MAX_ROWS)     */
+    int     gen;   /* highest generation computed so far (0 right after seed)*/
+    int          rule; /* the active Wolfram rule, 0..255 (the lookup table) */
+    WolframClass cls;  /* its behaviour class, cached so colour is an O(1) lookup */
+} Automaton;
+
+/*
+ * Phase — the two-state run cycle.  BUILD adds one generation per delay
+ * window until the screen fills; HOLD then freezes the finished pattern for
+ * PAUSE_TICKS before the next preset (or a redraw).  scene_tick switches them.
+ */
+typedef enum { PHASE_BUILD, PHASE_HOLD } Phase;
+
+/*
+ * Control — the UI knobs and the phase state machine.  Kept apart from the
+ * Automaton so input mutates THESE while the simulation mutates the grid.
+ */
+typedef struct {
+    int   preset;       /* index into PRESETS                              */
+    int   theme;        /* index into THEMES                               */
+    int   delay;        /* ticks between rows (speed; DELAY_MIN..MAX)       */
+    bool  paused;       /* freeze stepping; render keeps running           */
+    bool  auto_advance; /* on completion: next preset (vs. redraw same)    */
+    Phase phase;        /* BUILD = filling; HOLD = done, counting down     */
+    int   delay_ctr;    /* ticks since the last row was added              */
+    int   hold_ctr;     /* ticks held since the pattern completed          */
+} Control;
+
+/*
+ * Scene — one running instance: the simulated automaton plus the control
+ * that steers it.  This is the unit the effects mutate (Scene*) and the
+ * renderer reads (const Scene*); App wraps it with the terminal/loop state.
+ */
+typedef struct {
+    Automaton ca;    /* the simulation (§5 advances it)  */
+    Control   ctl;   /* the UI knobs + phase machine     */
+} Scene;
+
+/* ── pure reads / logic ──────────────────────────────────────────────── */
+
+/* is rule `r` listed in the class-membership table `set`? */
+static bool rule_in_set(int r, const int *set, int n)
+{
+    for (int i = 0; i < n; i++) if (set[i] == r) return true;
+    return false;
+}
+
+/* Wolfram class of a rule — first matching membership table wins, else periodic. */
+static WolframClass ca_classify(int r)
+{
+    static const int cl5[] = { 18, 60, 90, 105, 150 };
+    static const int cl4[] = { 54, 57, 62, 73, 99, 106, 110 };
+    static const int cl3[] = { 22, 30, 45, 75, 89, 109, 126, 135, 149, 153, 154 };
+    static const int cl1[] = { 0, 8, 32, 40, 128, 136, 160, 168, 255 };
+    if (rule_in_set(r, cl5, COUNT_OF(cl5))) return CLASS_FRACTAL;
+    if (rule_in_set(r, cl4, COUNT_OF(cl4))) return CLASS_COMPLEX;
+    if (rule_in_set(r, cl3, COUNT_OF(cl3))) return CLASS_CHAOTIC;
+    if (rule_in_set(r, cl1, COUNT_OF(cl1))) return CLASS_FIXED;
+    return CLASS_PERIODIC;
+}
+
+static const char *class_name(WolframClass cls)
+{
+    switch (cls) {
+        case CLASS_FIXED:    return "Fixed";
+        case CLASS_PERIODIC: return "Periodic";
+        case CLASS_CHAOTIC:  return "Chaotic";
+        case CLASS_COMPLEX:  return "Complex";
+        case CLASS_FRACTAL:  return "Fractal";
     }
+    return "Unknown";
 }
 
-/* ── §4 CA ───────────────────────────────────────────────────────────── */
-
-/* g_grid[r] = generation r (row 0 = initial seed, row 1 = first step …) */
-static uint8_t g_grid[MAX_ROWS][MAX_COLS];
-
-static int g_rows;        /* terminal rows                               */
-static int g_cols;        /* terminal cols                               */
-static int g_ca_rows;     /* CA area = g_rows - 2  (title + HUD)        */
-static int g_gen;         /* highest computed generation (0 = seeded)   */
-
-static int g_rule;
-static int g_cls;
-static int g_preset;
-
-static int g_delay;       /* ticks between adding one row               */
-static int g_delay_ctr;
-static int g_paused;
-static int g_auto;
-static int g_state;
-static int g_pause_ctr;
-
-static int g_idig[3];     /* digit input buffer                         */
-static int g_ilen;
-
-static const char *rule_desc(void)
+/* the colour pair that encodes a class on the data bar + grid. */
+static int class_cp(WolframClass cls)
 {
-    for (int i = 0; i < N_PRESETS; i++)
-        if (PRESETS[i].rule == g_rule) return PRESETS[i].desc;
-    return "user-defined";
-}
-
-static void ca_seed_center(void)
-{
-    memset(g_grid, 0, sizeof(g_grid));
-    g_gen       = 0;
-    g_state     = ST_BUILD;
-    g_pause_ctr = 0;
-    g_delay_ctr = 0;
-    if (g_cols > 0) g_grid[0][g_cols / 2] = 1;
-}
-
-static void ca_seed_random(void)
-{
-    memset(g_grid, 0, sizeof(g_grid));
-    g_gen       = 0;
-    g_state     = ST_BUILD;
-    g_pause_ctr = 0;
-    g_delay_ctr = 0;
-    for (int c = 0; c < g_cols; c++)
-        g_grid[0][c] = (uint8_t)(rand() & 1);
-}
-
-static void ca_set_rule(int rule)
-{
-    g_rule   = rule;
-    g_cls    = ca_classify(rule);
-    g_preset = -1;
-    for (int i = 0; i < N_PRESETS; i++)
-        if (PRESETS[i].rule == rule) { g_preset = i; break; }
-    ca_seed_center();
-}
-
-static void ca_set_preset(int idx)
-{
-    g_preset = ((idx % N_PRESETS) + N_PRESETS) % N_PRESETS;
-    ca_set_rule(PRESETS[g_preset].rule);
-}
-
-/* Compute the next generation into g_grid[g_gen+1] and advance g_gen. */
-static void ca_advance(void)
-{
-    if (g_gen >= g_ca_rows - 1) return;
-
-    uint8_t *src  = g_grid[g_gen];
-    uint8_t *dst  = g_grid[g_gen + 1];
-    uint8_t  rule = (uint8_t)g_rule;
-    int      cols = g_cols;
-
-    for (int c = 0; c < cols; c++) {
-        uint8_t l  = src[(c - 1 + cols) % cols];
-        uint8_t m  = src[c];
-        uint8_t rv = src[(c + 1)        % cols];
-        dst[c] = (rule >> ((l << 2) | (m << 1) | rv)) & 1;
+    switch (cls) {
+        case CLASS_FIXED:    return CP_CL1;
+        case CLASS_PERIODIC: return CP_CL2;
+        case CLASS_CHAOTIC:  return CP_CL3;
+        case CLASS_COMPLEX:  return CP_CL4;
+        case CLASS_FRACTAL:  return CP_CL5;
     }
-    g_gen++;
+    return CP_CL2;
 }
 
-static void sim_init(void)
+/* pack a left/centre/right neighbourhood into its 3-bit code 0..7. */
+static int neighbourhood_code(uint8_t l, uint8_t m, uint8_t r)
 {
-    g_delay  = DELAY_DEF;
-    g_paused = 0;
-    g_auto   = 1;
-    g_preset = 0;
-    g_ilen   = 0;
-    srand((unsigned)(clock_ns() & 0xFFFFFFFFu));
-    ca_set_preset(0);
+    return (l << 2) | (m << 1) | r;
 }
 
-static void sim_tick(void)
+/* read bit `code` of the rule's 8-bit lookup table → the new centre state. */
+static uint8_t rule_bit(int rule, int code)
 {
-    if (g_paused) return;
+    return (uint8_t)((rule >> code) & 1);
+}
 
-    if (g_state == ST_PAUSE) {
-        g_pause_ctr++;
-        if (g_pause_ctr >= PAUSE_TICKS) {
-            if (g_auto) ca_set_preset(g_preset + 1);
-            else        ca_seed_center();
+/* the Wolfram update for one cell: index the rule by the neighbourhood code. */
+static uint8_t cell_next(uint8_t l, uint8_t m, uint8_t r, int rule)
+{
+    return rule_bit(rule, neighbourhood_code(l, m, r));
+}
+
+/* fold a column index onto the toroidal row — the wrap-around boundary. */
+static int wrap_col(int c, int w) { return (c % w + w) % w; }
+
+/* ===================================================================== */
+/* §5  simulation — EFFECTS that advance the automaton + control          */
+/* ===================================================================== */
+
+static void ca_clear(Automaton *a)
+{
+    memset(a->cells, 0, sizeof a->cells);
+    a->gen = 0;
+}
+
+/* generation 0 = a single live cell at the centre column. */
+static void ca_seed_center(Automaton *a)
+{
+    ca_clear(a);
+    if (a->w > 0) a->cells[0][a->w / 2] = 1;
+}
+
+/* generation 0 = a random row (chaotic rules diverge wildly from centre). */
+static void ca_seed_random(Automaton *a)
+{
+    ca_clear(a);
+    for (int c = 0; c < a->w; c++) a->cells[0][c] = (uint8_t)(rand() & 1);
+}
+
+/* ca_step — compute the next generation from the current top row (toroidal). */
+static void ca_step(Automaton *a)
+{
+    if (a->gen >= a->gens - 1) return;             /* screen full */
+    const uint8_t *src = a->cells[a->gen];
+    uint8_t       *dst = a->cells[a->gen + 1];
+    int w = a->w;
+    for (int c = 0; c < w; c++) {
+        uint8_t l = src[wrap_col(c - 1, w)];
+        uint8_t m = src[c];
+        uint8_t r = src[wrap_col(c + 1, w)];
+        dst[c] = cell_next(l, m, r, a->rule);
+    }
+    a->gen++;
+}
+
+/* (re)seed generation 0 and restart the build phase. */
+static void scene_reseed(Scene *s, SeedKind kind)
+{
+    if (kind == SEED_RANDOM) ca_seed_random(&s->ca);
+    else                     ca_seed_center(&s->ca);
+    s->ctl.phase     = PHASE_BUILD;
+    s->ctl.delay_ctr = 0;
+    s->ctl.hold_ctr  = 0;
+}
+
+/* select a preset: set its rule + class, then reseed from the centre. */
+static void scene_set_preset(Scene *s, int idx)
+{
+    s->ctl.preset = ((idx % N_PRESETS) + N_PRESETS) % N_PRESETS;
+    s->ca.rule    = PRESETS[s->ctl.preset].rule;
+    s->ca.cls     = ca_classify(s->ca.rule);
+    scene_reseed(s, SEED_CENTER);
+}
+
+/* recolour to theme `idx` (does not touch the pattern). */
+static void scene_set_theme(Scene *s, int idx)
+{
+    s->ctl.theme = ((idx % N_THEMES) + N_THEMES) % N_THEMES;
+    theme_apply(s->ctl.theme);
+}
+
+/* one simulation tick: pace the build, or count down the hold. */
+static void scene_tick(Scene *s)
+{
+    Control *c = &s->ctl;
+    if (c->paused) return;
+
+    if (c->phase == PHASE_HOLD) {
+        if (++c->hold_ctr >= PAUSE_TICKS) {
+            /* Auto on → next preset; off → redraw this same rule. */
+            if (c->auto_advance) scene_set_preset(s, c->preset + 1);
+            else                 scene_reseed(s, SEED_CENTER);
         }
         return;
     }
 
-    /* ST_BUILD: add one row every g_delay ticks */
-    if (++g_delay_ctr >= g_delay) {
-        g_delay_ctr = 0;
-        ca_advance();
-        if (g_gen >= g_ca_rows - 1) {
-            g_state     = ST_PAUSE;
-            g_pause_ctr = 0;
+    /* BUILD: add one generation every `delay` ticks. */
+    if (++c->delay_ctr >= c->delay) {
+        c->delay_ctr = 0;
+        ca_step(&s->ca);
+        if (s->ca.gen >= s->ca.gens - 1) {
+            c->phase    = PHASE_HOLD;
+            c->hold_ctr = 0;
         }
     }
 }
 
-/* ── §5 scene ────────────────────────────────────────────────────────── */
-
-static void scene_title(void)
+static void scene_init(Scene *s)
 {
-    int cp = class_cp(g_cls);
-
-    /* full-width reversed title bar in the class colour */
-    attron(COLOR_PAIR(cp) | A_BOLD | A_REVERSE);
-    mvhline(0, 0, ' ', g_cols - 1);
-
-    /* countdown while paused between patterns */
-    char hold[24] = "";
-    if (g_state == ST_PAUSE) {
-        int secs = (PAUSE_TICKS - g_pause_ctr + 29) / 30;
-        snprintf(hold, sizeof(hold), " — next in %ds", secs);
-    }
-
-    mvprintw(0, 1, "Rule %3d: %-18s | %s | preset %d / %d%s",
-             g_rule, rule_desc(), class_name(g_cls),
-             g_preset + 1, N_PRESETS, hold);
-
-    attroff(COLOR_PAIR(cp) | A_BOLD | A_REVERSE);
+    s->ctl.preset       = 0;
+    s->ctl.theme        = 0;
+    s->ctl.delay        = DELAY_DEF;
+    s->ctl.paused       = false;
+    s->ctl.auto_advance = true;
+    scene_set_preset(s, 0);      /* sets rule/class + seeds + resets phase */
 }
 
-static void scene_draw(void)
+/* speed = rows per second: fewer ticks/row is faster, more is slower. */
+static void ctl_speed_up  (Control *c) { if (c->delay > DELAY_MIN) c->delay--; }
+static void ctl_speed_down(Control *c) { if (c->delay < DELAY_MAX) c->delay++; }
+
+/* ===================================================================== */
+/* §6  render — PURE: const Scene → screen                                */
+/* ===================================================================== */
+
+/*
+ * hud_bar — draw one full-width bar on `row`, filled in `attr`, with the
+ * text clipped so it can never wrap onto the CA area.  Leaves the last
+ * column untouched (avoids the bottom-right corner scroll quirk).
+ */
+static void hud_bar(int row, int cols, chtype attr, const char *buf)
 {
-    int cp = class_cp(g_cls);
-    attron(COLOR_PAIR(cp));
-
-    /* only draw rows that have been computed so far */
-    for (int r = 0; r <= g_gen && r < g_ca_rows; r++) {
-        uint8_t *row = g_grid[r];
-        for (int c = 0; c < g_cols - 1; c++)
-            mvaddch(1 + r, c, row[c] ? (chtype)(unsigned char)LIVE_CHAR : ' ');
-    }
-
-    attroff(COLOR_PAIR(cp));
+    if (row < 0 || cols < 2) return;
+    int w = cols - 1;
+    attron(attr);
+    for (int x = 0; x < w; x++) mvaddch(row, x, ' ');
+    mvaddnstr(row, 0, buf, w);
+    attroff(attr);
 }
 
-static void scene_hud(void)
+/* the status tail on the data bar: paused, or the hold countdown in seconds
+ * (empty while building).  hold_ctr counts up in ticks; convert with a
+ * ceil-division to whole seconds. */
+static void phase_status(char *buf, size_t n, const Control *c)
 {
-    if (g_rows < 1) return;
-
-    /* pending digit input */
-    char ibuf[8] = "";
-    if (g_ilen > 0) {
-        ibuf[0] = '>';
-        for (int i = 0; i < g_ilen; i++) ibuf[i + 1] = (char)('0' + g_idig[i]);
-        ibuf[g_ilen + 1] = '_';
+    if (c->paused) {
+        snprintf(buf, n, "  [PAUSED]");
+    } else if (c->phase == PHASE_HOLD) {
+        int secs = (PAUSE_TICKS - c->hold_ctr + TICKS_PER_SEC - 1) / TICKS_PER_SEC;
+        snprintf(buf, n, "  [%s in %ds]", c->auto_advance ? "next" : "redraw", secs);
+    } else {
+        buf[0] = '\0';
     }
-
-    attron(COLOR_PAIR(CP_HUD));
-    mvprintw(g_rows - 1, 0,
-             " n/p:pattern  a:%s  r:seed  R:rand  +/-:speed  "
-             "spc:%s  0-9+Enter:rule#  %s  q:quit",
-             g_auto ? "auto" : "man.",
-             g_paused ? "resume" : "pause",
-             g_ilen > 0 ? ibuf : "");
-    attroff(COLOR_PAIR(CP_HUD));
 }
 
-/* ── §6 screen ───────────────────────────────────────────────────────── */
+/* Top DATA bar (row 0), coloured by the rule's Wolfram class. */
+static void render_data_bar(const Scene *s, int cols)
+{
+    const Automaton *a = &s->ca;
+    const Control   *c = &s->ctl;
+
+    char status[48];
+    phase_status(status, sizeof status, c);
+
+    char buf[220];
+    snprintf(buf, sizeof buf,
+             " 1D_CA  rule:%-3d %-18s class:%-8s  preset:%2d/%d  theme:%s  "
+             "gen:%d/%d  spd:%d  auto:%-3s%s ",
+             a->rule, PRESETS[c->preset].desc, class_name(a->cls),
+             c->preset + 1, N_PRESETS, THEMES[c->theme].name,
+             a->gen, a->gens, c->delay, c->auto_advance ? "on" : "off", status);
+
+    hud_bar(0, cols, COLOR_PAIR(class_cp(a->cls)) | A_BOLD | A_REVERSE, buf);
+}
+
+/* The CA grid: generation g → terminal row 1+g, drawn in the class colour. */
+static void render_grid(const Scene *s, int cols)
+{
+    const Automaton *a = &s->ca;
+    chtype attr = COLOR_PAIR(class_cp(a->cls));
+    int w = a->w < cols ? a->w : cols;
+
+    attron(attr);
+    for (int g = 0; g <= a->gen && g < a->gens; g++) {
+        const uint8_t *row = a->cells[g];
+        for (int c = 0; c < w - 1; c++)
+            mvaddch(HUD_TOP_ROWS + g, c, row[c] ? (chtype)(unsigned char)LIVE_CHAR : ' ');
+    }
+    attroff(attr);
+}
+
+/* Bottom ACTION bar (row n-1): every interactive key. */
+static void render_action_bar(int cols, int rows)
+{
+    static const char *keys =
+        " n/p:preset  t/T:theme  a:auto  r:seed  R:rand  +/-:speed  spc:pause  q:quit ";
+    hud_bar(rows - 1, cols, COLOR_PAIR(CP_HINT) | A_BOLD, keys);
+}
+
+/* one frame: erase → data bar → grid → action bar → flush (one diff write). */
+static void render_frame(const Scene *s, int cols, int rows)
+{
+    erase();
+    render_data_bar(s, cols);
+    render_grid(s, cols);
+    render_action_bar(cols, rows);
+    wnoutrefresh(stdscr);
+    doupdate();
+}
+
+/* ===================================================================== */
+/* §7  app — orchestration: input → effects → delay → render              */
+/* ===================================================================== */
+
+/*
+ * App — the running PROCESS around the Scene: the terminal size and the
+ * loop's flags.  Split from Scene because these describe the program, not
+ * the automaton.  One file-scope instance (g_app) so the signal handler can
+ * reach the flags.
+ */
+typedef struct {
+    Scene scene;               /* the running automaton (§4-§6)              */
+    int   rows, cols;          /* terminal size in character cells           */
+    volatile sig_atomic_t running;     /* main-loop flag, 0 = quit; written by
+                                        * SIGINT/SIGTERM (async-signal-safe)   */
+    volatile sig_atomic_t need_resize; /* set by SIGWINCH, drained atop loop   */
+} App;
+
+static App g_app;
+
+static void sig_handler(int sig)
+{
+    if (sig == SIGWINCH) g_app.need_resize = 1;
+    else                 g_app.running     = 0;
+}
+static void cleanup(void) { endwin(); }
 
 static void screen_init(void)
 {
@@ -452,32 +700,38 @@ static void screen_init(void)
     color_init();
 }
 
-static void screen_resize(void)
+/* read the terminal size and size the CA grid to fit: row width = cols,
+ * generations = the rows between the two HUD bars. */
+static void app_fit(App *app)
 {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
-    if (rows > MAX_ROWS) rows = MAX_ROWS;
-    if (cols > MAX_COLS) cols = MAX_COLS;
-    int old_cols = g_cols;
-    g_rows    = rows;
-    g_cols    = cols;
-    g_ca_rows = rows - 2;
-    if (g_ca_rows < 1) g_ca_rows = 1;
-    if (cols != old_cols) ca_seed_center();
-    erase();
+    app->rows = rows < MAX_ROWS ? rows : MAX_ROWS;
+    app->cols = cols < MAX_COLS ? cols : MAX_COLS;
+    app->scene.ca.w    = app->cols;
+    app->scene.ca.gens = (app->rows - HUD_ROWS < 1) ? 1 : app->rows - HUD_ROWS;
 }
 
-/* ── §7 app ──────────────────────────────────────────────────────────── */
-
-static volatile sig_atomic_t g_running     = 1;
-static volatile sig_atomic_t g_need_resize = 0;
-
-static void sig_handler(int sig)
+/* map a keypress to an intent; some fire §5 effects. */
+static void app_handle_key(App *app, int ch)
 {
-    if (sig == SIGWINCH) g_need_resize = 1;
-    else                 g_running     = 0;
+    Scene   *s = &app->scene;
+    Control *c = &s->ctl;
+    switch (ch) {
+    case 'q': case 'Q': app->running = 0;                    break;
+    case ' ':           c->paused = !c->paused;              break;
+    case 'a': case 'A': c->auto_advance = !c->auto_advance;  break;
+    case 'n':           scene_set_preset(s, c->preset + 1);  break;
+    case 'p':           scene_set_preset(s, c->preset - 1);  break;
+    case 't':           scene_set_theme (s, c->theme + 1);   break;
+    case 'T':           scene_set_theme (s, c->theme - 1);   break;
+    case 'r':           scene_reseed(s, SEED_CENTER);              break;
+    case 'R':           scene_reseed(s, SEED_RANDOM);               break;
+    case '+': case '=': ctl_speed_up(c);                     break;
+    case '-': case '_': ctl_speed_down(c);                   break;
+    default: break;
+    }
 }
-static void cleanup(void) { endwin(); }
 
 int main(void)
 {
@@ -485,72 +739,41 @@ int main(void)
     signal(SIGTERM,  sig_handler);
     signal(SIGWINCH, sig_handler);
     atexit(cleanup);
+    srand((unsigned)(clock_ns() & 0xFFFFFFFFu));
+
+    App *app     = &g_app;
+    app->running = 1;
 
     screen_init();
-    screen_resize();  /* sets g_cols / g_ca_rows before sim_init seeds */
-    sim_init();
+    app_fit(app);                /* terminal size → CA dims (before seeding) */
+    scene_init(&app->scene);     /* control defaults + preset 0 + centre seed */
 
     long long next = clock_ns();
 
-    while (g_running) {
-        if (g_need_resize) {
-            g_need_resize = 0;
+    /*
+     * Fixed-step main loop — each iteration reads as four named steps:
+     *   INPUT   drain getch() → app_handle_key (may fire §5 effects)
+     *   EFFECTS scene_tick — pace one generation / count the hold
+     *   RENDER  render_frame — pure paint
+     *   DELAY   sleep to the next TICK_NS (~30 fps)
+     * On SIGWINCH the grid is re-fitted and re-centred.
+     */
+    while (app->running) {
+        if (app->need_resize) {
+            app->need_resize = 0;
             endwin();
             refresh();
-            screen_resize();
+            app_fit(app);
+            scene_reseed(&app->scene, SEED_CENTER);
         }
 
-        int ch;
-        while ((ch = getch()) != ERR) {
-            switch (ch) {
-            case 'q': case 'Q': g_running = 0;  break;
-            case ' ':           g_paused ^= 1;  break;
-            case 'a': case 'A': g_auto   ^= 1;  break;
-            case 'n':           ca_set_preset(g_preset + 1); break;
-            case 'p':           ca_set_preset(g_preset - 1); break;
-            case 'r':           ca_seed_center();  break;
-            case 'R':           ca_seed_random();  break;
-            case '+': case '=':
-                if (g_delay > DELAY_MIN) g_delay--;
-                break;
-            case '-': case '_':
-                if (g_delay < DELAY_MAX) g_delay++;
-                break;
-            case KEY_BACKSPACE: case 127:
-                if (g_ilen > 0) g_ilen--;
-                break;
-            case '\n': case '\r': case KEY_ENTER:
-                if (g_ilen > 0) {
-                    int val = 0;
-                    for (int i = 0; i < g_ilen; i++)
-                        val = val * 10 + g_idig[i];
-                    if (val <= 255) ca_set_rule(val);
-                    g_ilen = 0;
-                }
-                break;
-            default:
-                if (ch >= '0' && ch <= '9' && g_ilen < 3) {
-                    g_idig[g_ilen++] = ch - '0';
-                    if (g_ilen == 3) {  /* 3 digits → apply immediately */
-                        int val = g_idig[0]*100 + g_idig[1]*10 + g_idig[2];
-                        if (val <= 255) ca_set_rule(val);
-                        g_ilen = 0;
-                    }
-                }
-                break;
-            }
-        }
+        int ch;                                              /* INPUT   */
+        while ((ch = getch()) != ERR) app_handle_key(app, ch);
 
-        sim_tick();
+        scene_tick(&app->scene);                             /* EFFECTS */
+        render_frame(&app->scene, app->cols, app->rows);     /* RENDER  */
 
-        erase();
-        scene_title();
-        scene_draw();
-        scene_hud();
-        wnoutrefresh(stdscr);
-        doupdate();
-
-        next += TICK_NS;
+        next += TICK_NS;                                     /* DELAY   */
         clock_sleep_ns(next - clock_ns());
     }
     return 0;

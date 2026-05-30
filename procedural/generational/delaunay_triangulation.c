@@ -2,16 +2,18 @@
 /*
  * delaunay_triangulation.c — Bowyer-Watson Delaunay, animated.
  *
- * DEMO: Twelve seed points drop onto the map one at a time. Each is
- *       INSERTED into a growing Delaunay triangulation by Bowyer-
- *       Watson's incremental method: the new point invalidates every
- *       triangle whose circumscribed circle contains it; the
- *       resulting "cavity" is re-triangulated by joining the new
- *       point to every boundary edge. New triangles flash their
- *       edges briefly before settling. After all points are
- *       inserted, the super-triangle scaffolding is hidden, leaving
- *       a clean Delaunay mesh — every triangle's circumcircle
- *       contains no other vertex. HOLD; supernova reset; loop.
+ * DEMO: Seed points drop onto the map one at a time (6–30, set by the
+ *       active preset). Each is INSERTED into a growing Delaunay
+ *       triangulation by Bowyer-Watson's incremental method: the new
+ *       point invalidates every triangle whose circumscribed circle
+ *       contains it; the resulting "cavity" is re-triangulated by
+ *       joining the new point to every boundary edge. New triangles
+ *       flash their edges briefly before settling. After all points are
+ *       inserted, the super-triangle scaffolding is hidden, leaving a
+ *       clean Delaunay mesh — every triangle's circumcircle contains no
+ *       other vertex. The build then HOLDS on the finished mesh: no
+ *       auto-restart, no auto style switch. n/p switches preset (15
+ *       styles, varying palette + density); r rebuilds the same one.
  *
  * Study alongside: ./voronoi_region_map.c — the GEOMETRIC DUAL of
  *       Delaunay. Voronoi assigns each cell to its nearest seed;
@@ -25,20 +27,20 @@
  *       verifies the empty-circumcircle property.  This file tells
  *       the story; that one proves the invariant.
  *
- * Section map:
- *   §1 config   — map size, point count, palette, themes
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes (edge/point/flash)
- *   §5 dt       — Point, Triangle, in-circumcircle, Bowyer-Watson
- *   §6 scene    — BUILDING / HOLD state machine
- *   §7 screen   — ASCII line rendering: '-' '|' '/' '\\' edges
- *   §8 app      — signals, resize, main loop
+ * Section map (layered — see ARCHITECTURE below):
+ *   §1 config   — map size, storage caps, 15 presets
+ *   §2 clock    — monotonic timer + sleep (PERFORMANCE / DELAYS infra)
+ *   §3 color    — HUD pairs + preset palette (RENDER setup)
+ *   §5 dt       — STATE · pure LOGIC (geometry) · EFFECTS · SIMULATION
+ *   §6 scene    — orchestration: the one place the layers combine + DONE
+ *   §7 render   — state → ASCII edges/points (pure reads), HUD
+ *   §8 app      — PERFORMANCE loop, signals, resize, input
  *
  * Keys:
  *   q / ESC    quit
  *   space      pause / resume
- *   r          reset (preserves theme)
- *   t / T      next / previous theme
+ *   n / p      next / previous preset (15 styles; each builds then holds)
+ *   r          rebuild (same preset)
  *   + / =      faster (one point inserted sooner)
  *   -          slower
  *   ] / [      raise / lower tick Hz
@@ -106,16 +108,42 @@
  *                  edge scan, ≈ 1 ms per point on modern hardware.
  *                  No allocation post-init.
  *
- * References     : • Bowyer, A. (1981) — "Computing Dirichlet
- *                    tessellations", The Computer Journal.
- *                  • Watson, D.F. (1981) — "Computing the
- *                    n-dimensional Delaunay tessellation".
- *                  • Wikipedia — "Bowyer–Watson algorithm":
+ * References     : ALGORITHM — Delaunay, Bowyer-Watson, the geometric
+ *                  predicates this code rests on
+ *                  • Bowyer, A. (1981) — "Computing Dirichlet
+ *                    tessellations", The Computer Journal 24(2). One of
+ *                    the two namesake papers for the incremental method.
+ *                  • Watson, D.F. (1981) — "Computing the n-dimensional
+ *                    Delaunay tessellation with application to Voronoi
+ *                    polytopes", The Computer Journal 24(2). The other.
+ *                  • de Berg, Cheong, van Kreveld & Overmars —
+ *                    "Computational Geometry: Algorithms and Applications"
+ *                    (3rd ed., Springer 2008), ch. 9. The standard
+ *                    textbook treatment of Delaunay/Voronoi and the
+ *                    empty-circumcircle property.
+ *                  • Guibas & Stolfi (1985) — "Primitives for the
+ *                    Manipulation of General Subdivisions and the
+ *                    Computation of Voronoi Diagrams", ACM TOG 4(2).
+ *                    Origin of the InCircle / orientation predicates that
+ *                    in_circumcircle() implements as a determinant.
+ *                  • Shewchuk, J.R. (1997) — "Adaptive Precision
+ *                    Floating-Point Arithmetic and Fast Robust Geometric
+ *                    Predicates". Why those determinants are sign-fragile
+ *                    and how production code keeps them exact (we sidestep
+ *                    it with 64-bit integer coordinates).
+ *                  • Wikipedia — "Bowyer–Watson algorithm" — concise
+ *                    pseudocode mirror of the insertion loop here:
  *                    https://en.wikipedia.org/wiki/Bowyer%E2%80%93Watson_algorithm
  *                  • Inigo Quilez — "Voronoi/Delaunay duality":
  *                    https://iquilezles.org/articles/voronoilines/
- *                  • Bresenham, J. (1965) — line-drawing algorithm
- *                    used for the edge rendering.
+ *
+ *                  RENDERING — lines + terminal output
+ *                  • Bresenham, J.E. (1965) — "Algorithm for computer
+ *                    control of a digital plotter", IBM Systems Journal
+ *                    4(1). The integer line-stepping used per edge.
+ *                  • Padala, Pradeep — "NCURSES Programming HOWTO" (TLDP)
+ *                    — the erase→draw→doupdate frame model, colour pairs,
+ *                    and non-blocking input this file uses.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -147,11 +175,11 @@
  * is restored.
  *
  * Visible layers:
- *   1. POINTS '@' (theme point colour, bold) — the seed set, growing
- *      from 0 to 12 over the BUILDING phase.
- *   2. EDGES (theme edge colour, slope-aware glyphs '-', '|', '/',
+ *   1. POINTS '@' (preset point colour, bold) — the seed set, growing
+ *      to the preset's target count over the BUILDING phase.
+ *   2. EDGES (preset edge colour, slope-aware glyphs '-', '|', '/',
  *      '\\') — each triangle's three sides drawn cell-by-cell.
- *   3. NEW EDGE FLASH (theme flash colour) — edges that were just
+ *   3. NEW EDGE FLASH (preset flash colour) — edges that were just
  *      created during the most recent insertion glow brightly for
  *      ~0.5 s before fading.
  *
@@ -171,8 +199,9 @@
  *     d. Mark all bad triangles invalid.
  *     e. For every boundary edge (e0, e1), append a new triangle
  *        (e0, e1, P_idx) with new_glow = 1.0.
- *  3. Repeat until n_real_points = N_POINTS.
- *  4. HOLD on the triangulation; reset; loop.
+ *  3. Repeat until n_real_points reaches the preset's target count.
+ *  4. DONE: hold on the finished triangulation. No auto-reset and no auto
+ *     style switch — n/p (switch preset) or r (same preset) rebuilds.
  *
  *  Rendering simply iterates valid triangles whose all 3 vertices
  *  are real (index ≥ 3). Triangles touching a super-triangle vertex
@@ -247,8 +276,42 @@
  *  • Edge count: a Delaunay triangulation of n points in general
  *    position has between 2n−5 and 3n−6 edges. For n=12 that's
  *    19 to 30 edges. Wildly outside that range = bug.
- *  • Different themes change colours but the triangulation is
- *    identical for the same RNG seed (algorithm is theme-independent).
+ *  • A preset's palette and point glyph are pure presentation: for a
+ *    fixed point count the algorithm is colour-independent. (Presets
+ *    also vary the point count, which of course changes the mesh.)
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
+ *
+ * The program is built from SIX layers, kept in separate labelled places so
+ * each can be read without the others — and so a change to one (say the
+ * glow) provably cannot break another (the mesh).
+ *
+ *   LAYER         WHAT IT IS                          WHERE       MUTATES
+ *   ─────────────────────────────────────────────────────────────────────
+ *   LOGIC         pure geometry predicates (signed    §5.2        nothing
+ *                 area, in-circumcircle) + edge_glyph             (by value)
+ *   SIMULATION    Bowyer-Watson: seed, pick a point,  §5.4 §6     Delaunay
+ *                 insert (find cavity, retriangulate)             points/tris
+ *   EFFECTS       per-triangle new_glow flash; its    §5.3 §6     new_glow only
+ *                 exponential fade
+ *   RENDER        mesh → ASCII edges/points → ncurses §3 §7       screen only
+ *                 (Bresenham); pure reads of state
+ *   DELAYS        pause, the insert cooldown, and the §6 §8       timers /
+ *                 BUILDING→DONE hold                              state
+ *   PERFORMANCE   fixed-timestep accumulator + dt cap §8          —
+ *                 + frame-rate cap
+ *
+ * SIGNATURE CONVENTION — a call site tells you whether state changes:
+ *   • const Delaunay * / const Scene * (or Point by value) → a pure read
+ *     (LOGIC or RENDER).
+ *   • non-const pointer → an EFFECT: the function mutates what it points at.
+ *
+ * THE ONE COMBINING POINT is scene_tick() (§6): every per-tick concern
+ * appears there once, in order — DELAY guard → EFFECTS fade → SIMULATION
+ * step → DELAY state transition. Nothing else advances state; the render
+ * path (§7) only reads.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -272,19 +335,24 @@ enum {
     MAP_W_MAX         = 200,
     MAP_H_MAX         =  56,
 
-    /* Real point count + 3 super-triangle scaffold points. */
-    N_REAL_POINTS     =  12,
+    /* Max real points across all presets, + 3 super-triangle scaffold
+     * points. The per-preset point count (mesh density) lives in
+     * presets[]; this only bounds the storage arrays. */
+    N_REAL_MAX        =  32,
     SUPER_TRI_VERTS   =   3,
-    MAX_POINTS        = N_REAL_POINTS + SUPER_TRI_VERTS,
+    MAX_POINTS        = N_REAL_MAX + SUPER_TRI_VERTS,
 
-    /* Triangle storage. Bound: a Delaunay triangulation of n points
-     * has ≤ 2n+1 triangles in general position; with super-triangle
-     * we add a few more during construction. 256 is comfortable. */
-    MAX_TRIS          = 256,
+    /* Triangle + scratch storage, sized for the densest preset. Triangles
+     * are never compacted (removed = valid flag cleared, slot kept for
+     * index stability), so MAX_TRIS bounds the TOTAL ever created — about
+     * 3–6× the point count for random inputs, so 512 is ample for 32. */
+    MAX_TRIS          = 512,
 
-    /* Per-insertion scratch: bad triangle indices + edge dedup buffer. */
-    MAX_BAD_TRIS      =  64,
-    MAX_EDGE_BUF      = 192,
+    /* Per-insertion scratch: bad-triangle cap + edge dedup buffer. Both
+     * sized so neither cap is ever hit at N_REAL_MAX (hitting one would
+     * silently drop cavity edges and corrupt the mesh). */
+    MAX_BAD_TRIS      = 128,
+    MAX_EDGE_BUF      = 256,
 
     /* Min spacing between real points for visual balance. */
     MIN_POINT_DIST    =  10,
@@ -300,54 +368,62 @@ enum {
     SIM_FPS_MAX       = 240,
     SIM_FPS_STEP      =  10,
 
-    HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md.
+     * (3 is intentionally skipped to keep edge/point/flash on 4..6.) */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_BG           =   3,        /* unused — reserved for theme parity */
     PAIR_EDGE         =   4,        /* triangle edges                  */
     PAIR_POINT        =   5,        /* '@' point glyph                 */
     PAIR_FLASH        =   6,        /* new edge flash                  */
-    PAIR_SUPERNOVA    =   7,        /* yellow reset flash              */
 };
 
 /* Glow decay rates. */
 #define EDGE_GLOW_DECAY     2.5f    /* new-edge flash fade ~0.7 s */
-#define SUPERNOVA_DECAY     4.0f
 #define GLOW_THRESHOLD      0.05f
-
-#define HOLD_SECONDS        2.5f
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
 /*
- * Themes — same 10 names as the rest of the procedural showcases.
- * Each theme defines four colours: bg/edge/point/flash. PAIR_BG is
- * reserved (no background pattern is drawn).
+ * Preset — one complete visual style. Switching preset (n/p) changes how
+ * the mesh LOOKS (palette, point glyph) and its DENSITY (how many points
+ * are inserted) — but not the Bowyer-Watson algorithm. Each preset builds
+ * once and then holds; there is no automatic switching.
+ *
+ *   edge/point/flash  xterm-256 colours for the three drawn layers, all in
+ *                     the bright half so they read on the default bg
+ *   n_points          real points to insert (mesh density); ≤ N_REAL_MAX
+ *   point_glyph       ASCII char drawn at each seed point
  */
 typedef struct {
     const char *name;
-    short       bg, edge, point, flash;
-} Theme;
+    short       edge, point, flash;
+    int         n_points;
+    char        point_glyph;
+} Preset;
 
-#define N_THEMES 10
+#define N_PRESETS 15
 
-static const Theme themes[N_THEMES] = {
-    /*           name      bg edge point flash */
-    { "DEFAULT",  240,   51,  231,  220 },   /* grey / cyan / white / gold */
-    { "MATRIX",    22,   46,  118,  226 },   /* greens                     */
-    { "NOVA",      53,  201,  219,  226 },   /* magenta / pink / yellow    */
-    { "MONO",     234,  244,  254,  226 },   /* greyscale + yellow accent  */
-    { "OCEAN",     17,   39,  159,  226 },   /* navy / cyan / ice          */
-    { "FIRE",      52,  208,  226,  196 },   /* orange / yellow / red      */
-    { "EARTH",     58,  173,  230,  220 },   /* brown / cream / gold       */
-    { "FOREST",    22,   82,  154,  226 },   /* greens                     */
-    { "DESERT",    94,  178,  230,  220 },   /* sandy                      */
-    { "ARCTIC",    18,  159,  231,  226 },   /* navy / ice / white         */
+static const Preset presets[N_PRESETS] = {
+  /*  name        edge point flash  pts glyph */
+  { "CLASSIC",   51, 231, 220,  12, '@' },   /* cyan / white / gold        */
+  { "MATRIX",    46, 118, 226,  16, '#' },   /* greens                     */
+  { "NOVA",     201, 219, 226,  10, '*' },   /* magenta / pink / yellow    */
+  { "MONO",     250, 255, 244,  14, 'o' },   /* greyscale                  */
+  { "OCEAN",     39, 159,  51,  18, '@' },   /* navy / ice / cyan          */
+  { "FIRE",     208, 226, 196,  12, '*' },   /* orange / yellow / red      */
+  { "FOREST",    82, 154, 226,  20, '+' },   /* greens                     */
+  { "DESERT",   178, 230, 220,  14, 'o' },   /* sand / cream / gold        */
+  { "ARCTIC",   159, 231,  87,  16, '@' },   /* ice / white / cyan         */
+  { "AMETHYST", 141, 219, 201,  22, '*' },   /* violet / pink / magenta    */
+  { "EMBER",    166, 214, 202,  10, '#' },   /* deep orange embers         */
+  { "NEON",      51, 201, 226,  24, '@' },   /* cyan / magenta / yellow    */
+  { "SPARSE",   244, 252, 220,   6, 'O' },   /* few points, big triangles  */
+  { "DENSE",     45, 195,  51,  30, '.' },   /* many points, fine mesh     */
+  { "REEF",     211, 230, 207,  18, '@' },   /* coral pink / cream         */
 };
 
 /* ===================================================================== */
@@ -375,17 +451,16 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  color                                                              */
 /* ===================================================================== */
 
-static void theme_apply(int idx)
+/* preset_apply — bind the preset's palette into the edge/point/flash pairs. */
+static void preset_apply(int idx)
 {
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    if (idx < 0 || idx >= N_PRESETS) idx = 0;
     if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        init_pair(PAIR_BG,    t->bg,    -1);
-        init_pair(PAIR_EDGE,  t->edge,  -1);
-        init_pair(PAIR_POINT, t->point, -1);
-        init_pair(PAIR_FLASH, t->flash, -1);
+        const Preset *p = &presets[idx];
+        init_pair(PAIR_EDGE,  p->edge,  -1);
+        init_pair(PAIR_POINT, p->point, -1);
+        init_pair(PAIR_FLASH, p->flash, -1);
     } else {
-        init_pair(PAIR_BG,    COLOR_WHITE,   -1);
         init_pair(PAIR_EDGE,  COLOR_CYAN,    -1);
         init_pair(PAIR_POINT, COLOR_WHITE,   -1);
         init_pair(PAIR_FLASH, COLOR_YELLOW,  -1);
@@ -399,76 +474,120 @@ static void color_init(void)
     if (COLORS >= 256) {
         init_pair(PAIR_HUD,        226, -1);
         init_pair(PAIR_HINT,        51, -1);
-        init_pair(PAIR_SUPERNOVA,  226, -1);
     } else {
         init_pair(PAIR_HUD,       COLOR_YELLOW,  -1);
         init_pair(PAIR_HINT,      COLOR_CYAN,    -1);
-        init_pair(PAIR_SUPERNOVA, COLOR_YELLOW,  -1);
     }
-    theme_apply(0);
+    preset_apply(0);
 }
 
 /* ===================================================================== */
-/* §5  dt — Delaunay triangulation                                        */
+/* §5  dt — STATE · LOGIC · EFFECTS · SIMULATION                          */
 /* ===================================================================== */
+/*
+ * The heart of the program, split into four layers (see ARCHITECTURE).
+ * Reading order is dependency order: each layer uses only the ones above.
+ *   5.1 STATE       the data the triangulation lives in
+ *   5.2 LOGIC       pure geometry — no state, no side effects
+ *   5.3 EFFECTS     the cosmetic glow fade — never read by LOGIC
+ *   5.4 SIMULATION  Bowyer-Watson; advances STATE using LOGIC, sets EFFECTS
+ */
+
+/* ── 5.1 STATE ───────────────────────────────────────────────────────── */
 
 /*
- * Point — integer cell position. Indices 0..2 are the super-triangle
- * scaffold; indices 3..MAX_POINTS-1 are real input points.
+ * Point — a vertex, as INTEGER cell coordinates. WHY integer (not float):
+ * the in-circumcircle test is a sign-of-determinant decision (§5.2); with
+ * integer inputs and 64-bit intermediates that sign is computed EXACTLY,
+ * so the algorithm can't flip on floating-point round-off near a
+ * cocircular configuration. Index convention: 0..2 are the super-triangle
+ * scaffold (placed far off-screen), 3..MAX_POINTS-1 are real input points —
+ * the "≥ 3" test is how the renderer tells real from scaffold.
  */
 typedef struct {
-    int x, y;
+    int x, y;          /* cell column, row (grid space)                    */
 } Point;
 
 /*
- * Triangle — three vertex indices into points[], plus state.
+ * Triangle — one face of the mesh: three vertices stored as INDICES into
+ * points[], not coordinates. WHY indices: an edge shared by two triangles
+ * is then the same pair of ints in both, so the cavity walk in
+ * dt_insert_point can match shared edges by value (and a point moving would
+ * update everywhere at once — though here points never move).
  *
- *   p[0..2]   : vertex indices
- *   valid     : false if logically removed (kept in array for index
- *               stability)
- *   new_glow  : 1.0 when freshly created, decays over ~0.7 s
+ * WHY a valid flag instead of deleting: removed triangles keep their slot
+ * (valid=false) so every other triangle's index stays put across an
+ * insertion — no array compaction, no dangling indices. n_tris therefore
+ * counts slots EVER used, not live triangles (the HUD counts live ones).
  */
 typedef struct {
-    int   p[3];
-    bool  valid;
-    float new_glow;
+    int   p[3];        /* SIMULATION: vertex indices into points[]          */
+    bool  valid;       /* SIMULATION: false = logically removed (slot kept) */
+    float new_glow;    /* EFFECTS: 1.0 on creation, faded by fx_decay (~0.7s)*/
 } Triangle;
 
+/* triangle_is_real — true when all three vertices are real input points
+ * (index ≥ SUPER_TRI_VERTS); false for any triangle still touching the
+ * super-triangle scaffold. This is the filter that hides the scaffold —
+ * named once here, reused by every render and HUD-count pass. */
+static inline bool triangle_is_real(const Triangle *t)
+{
+    return t->p[0] >= SUPER_TRI_VERTS
+        && t->p[1] >= SUPER_TRI_VERTS
+        && t->p[2] >= SUPER_TRI_VERTS;
+}
+
+/* triangle_is_flashing — true while a freshly-created triangle's new-edge
+ * glow is still above the visibility threshold (drawn in the accent colour). */
+static inline bool triangle_is_flashing(const Triangle *t)
+{
+    return t->new_glow > GLOW_THRESHOLD;
+}
+
 /*
- * Delaunay — the simulation heart.
+ * Delaunay — the whole triangulation being grown by Bowyer-Watson.
  *
- *   w, h           : map dims
- *   points[]       : 3 super-tri verts followed by real points
- *   n_points       : current point count (3 + n_real)
- *   n_real         : real points already inserted (0..N_REAL_POINTS)
+ * WHY a super-triangle (points 0..2): the incremental method needs an
+ * existing triangulation to insert INTO, so it begins with one huge
+ * triangle that encloses the entire map. Every real point lands inside it;
+ * at the end, triangles touching a scaffold vertex are filtered out at
+ * render time, leaving the Delaunay triangulation of just the real points.
  *
- *   triangles[]    : all triangles ever created; valid-flag tells
- *                    which are alive
- *   n_tris         : total slots used
+ * WHY points[] and triangles[] are append-only (never compacted): indices
+ * must stay stable across an insertion (triangles reference vertices by
+ * index, edges are matched by index), so removal clears a flag rather than
+ * erasing a slot. n_points / n_tris therefore only ever grow within a run.
  *
- *   insert_cooldown: ticks until next insertion fires
- *
- *   supernova_glow_t : single global supernova fade
+ * Ref: Bowyer (1981), Watson (1981); see the References block.
  */
 typedef struct {
-    int       w, h;
-    Point     points[MAX_POINTS];
-    int       n_points;
-    int       n_real;
+    /* SIMULATION state — the mesh itself (the only fields LOGIC reads). */
+    int       w, h;                /* map size in cells                      */
+    Point     points[MAX_POINTS];  /* [0..2] super-tri scaffold, then real   */
+    int       n_points;            /* points placed so far (3 + n_real)      */
+    int       n_real;              /* real points inserted (0..target)       */
+    int       target;             /* real points this run will insert (preset)*/
+    Triangle  triangles[MAX_TRIS]; /* every triangle ever created; see valid */
+    int       n_tris;              /* slots used (live + removed)            */
 
-    Triangle  triangles[MAX_TRIS];
-    int       n_tris;
-
-    int       insert_cooldown;
-
-    float     supernova_glow_t;
+    int       insert_cooldown;     /* DELAYS: ticks until the next insertion */
 } Delaunay;
 
-/* ── ─────────────────────────────────────────────────────────────────── *
- * Geometry helpers — operate on integer Point coordinates. Use 64-bit
- * intermediates throughout so int*int*int doesn't overflow on a
- * 200×200 grid.
+/* ── 5.2 LOGIC (pure — Point by value, mutates nothing) ──────────────── *
+ * Integer geometry predicates. 64-bit intermediates throughout so
+ * int*int*int can't overflow on a 200×200 grid. These take their inputs
+ * by value and touch no state — the part of the program you can verify in
+ * isolation, and that no EFFECT or RENDER bug can reach.
  * ── ─────────────────────────────────────────────────────────────────── */
+
+/* clamp_int — confine v to [lo, hi]. Names the bound-application the keyboard
+ * handler does to every tunable knob. */
+static int clamp_int(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
 
 /*
  * tri_signed_area_2x — returns 2 × signed area of triangle (a,b,c).
@@ -511,37 +630,48 @@ static bool in_circumcircle(Point p, Point a, Point b, Point c)
     return (sign_area > 0) ? (det > 0) : (det < 0);
 }
 
-/* ── ─────────────────────────────────────────────────────────────────── *
- * Delaunay state management.
+/* ── 5.3 EFFECTS (cosmetic glow — writes ONLY the new_glow field) ─────── *
+ * The flash STATE is set inline where the SIMULATION creates a triangle
+ * (Triangle.new_glow = 1); this is the one place it FADES. LOGIC never reads
+ * a glow, so a bug here can dim or brighten the screen but can never corrupt
+ * the mesh.
  * ── ─────────────────────────────────────────────────────────────────── */
 
-/*
- * dt_reset — clear everything, place super-triangle, no real points.
- *
- * Super-triangle vertices sit at (−5W, −5H), (5W, −5H), (W/2, 5H) —
- * far enough that any in-bounds point is well inside, small enough
- * that the determinant doesn't overflow int64.
- */
-static void dt_reset(Delaunay *d, int w, int h)
+/* fx_decay — exponential fade of the per-triangle new-edge glow, once per sim
+ * tick. Pure cosmetic time-evolution; dt is the fixed timestep. */
+static void fx_decay(Delaunay *d, float dt)
 {
-    d->w = w;
-    d->h = h;
-    d->n_points = 0;
-    d->n_real   = 0;
-    d->n_tris   = 0;
-    d->insert_cooldown = 0;
-    d->supernova_glow_t = 1.0f;
+    float edge_k = expf(-EDGE_GLOW_DECAY * dt);
+    for (int i = 0; i < d->n_tris; i++)
+        d->triangles[i].new_glow *= edge_k;
+}
 
-    /* Super-triangle vertices (indices 0..2). */
-    d->points[0] = (Point){ -5 * w,        -5 * h };
-    d->points[1] = (Point){  5 * w,        -5 * h };
-    d->points[2] = (Point){      w / 2,     5 * h };
-    d->n_points = 3;
+/* ── 5.4 SIMULATION (Bowyer-Watson — mutates points/triangles) ───────── */
 
-    /* The single seed triangle. Order picked so it's CCW under the
-     * y-up math convention (which is CW in screen coords — we don't
-     * care about the on-screen orientation since super-tri verts are
-     * off-screen). */
+/*
+ * CavityEdge — one edge of the bad-triangle cavity: the normalised pair
+ * (a ≤ b) of point indices plus how many bad triangles share it. After the
+ * cavity is walked, count == 1 ⇒ BOUNDARY edge (the cavity outline, kept),
+ * count == 2 ⇒ INTERIOR edge (shared by two bad triangles, discarded).
+ */
+typedef struct { int a, b, count; } CavityEdge;
+
+/* place_super_triangle — scaffold vertices 0..2, placed far outside the map
+ * so every in-bounds point lands strictly inside. Far enough to enclose,
+ * small enough that the int64 in-circle determinant cannot overflow. */
+static void place_super_triangle(Delaunay *d)
+{
+    d->points[0] = (Point){ -5 * d->w,     -5 * d->h };
+    d->points[1] = (Point){  5 * d->w,     -5 * d->h };
+    d->points[2] = (Point){      d->w / 2,  5 * d->h };
+    d->n_points = SUPER_TRI_VERTS;
+}
+
+/* seed_initial_triangle — the single triangle (0,1,2) Bowyer-Watson inserts
+ * INTO. Vertex order is CCW in y-up math coords (CW on screen, but the
+ * scaffold verts are off-screen so on-screen orientation doesn't matter). */
+static void seed_initial_triangle(Delaunay *d)
+{
     d->triangles[0] = (Triangle){
         .p = {0, 1, 2},
         .valid = true,
@@ -551,12 +681,47 @@ static void dt_reset(Delaunay *d, int w, int h)
 }
 
 /*
+ * dt_reset — clear everything, place super-triangle, no real points.
+ *
+ * Super-triangle vertices sit at (−5W, −5H), (5W, −5H), (W/2, 5H) —
+ * far enough that any in-bounds point is well inside, small enough
+ * that the determinant doesn't overflow int64.
+ */
+static void dt_reset(Delaunay *d, int w, int h, int target)
+{
+    d->w = w;
+    d->h = h;
+    d->n_points = 0;
+    d->n_real   = 0;
+    d->target   = target;
+    d->n_tris   = 0;
+    d->insert_cooldown = 0;
+
+    place_super_triangle(d);             /* scaffold vertices 0..2            */
+    seed_initial_triangle(d);            /* the one triangle to insert into   */
+}
+
+/* too_close_to_existing — true if (x, y) lies within MIN_POINT_DIST of any
+ * real point already placed. The min-spacing rejection test, in squared
+ * distance so no sqrt is needed. */
+static bool too_close_to_existing(const Delaunay *d, int x, int y)
+{
+    for (int i = SUPER_TRI_VERTS; i < d->n_points; i++) {
+        int dx = x - d->points[i].x;
+        int dy = y - d->points[i].y;
+        if (dx * dx + dy * dy < MIN_POINT_DIST * MIN_POINT_DIST)
+            return true;
+    }
+    return false;
+}
+
+/*
  * dt_pick_real_point — pick a random in-bounds (x, y) with min-distance
  * rejection against existing real points.
  *
  * Falls back to the last candidate even if it's too close — for our
- * 200×56 map and N_REAL=12 we always find a good spot, but the
- * fallback keeps the algorithm running on extreme inputs.
+ * map sizes and preset point counts we always find a good spot, but
+ * the fallback keeps the algorithm running on extreme inputs.
  */
 static void dt_pick_real_point(const Delaunay *d, int *out_x, int *out_y)
 {
@@ -566,105 +731,132 @@ static void dt_pick_real_point(const Delaunay *d, int *out_x, int *out_y)
     for (int attempt = 0; attempt < POINT_PLACE_TRIES; attempt++) {
         int x = margin + (rand() % (d->w - 2 * margin));
         int y = margin + (rand() % (d->h - 2 * margin));
-        bool ok = true;
-        for (int i = 3; i < d->n_points; i++) {
-            int dx = x - d->points[i].x;
-            int dy = y - d->points[i].y;
-            if (dx * dx + dy * dy < MIN_POINT_DIST * MIN_POINT_DIST) {
-                ok = false;
-                break;
-            }
-        }
         best_x = x; best_y = y;
-        if (ok) break;
+        if (!too_close_to_existing(d, x, y)) break;
     }
     *out_x = best_x;
     *out_y = best_y;
 }
 
 /*
- * dt_insert_point — Bowyer-Watson insertion of one new point.
- *
- *   1. Append to points[].
- *   2. Find bad triangles (P in their circumcircle) → mark + collect.
- *   3. Walk every edge of every bad triangle; classify as boundary
- *      (count == 1) or interior (count > 1) using min/max-normalised
- *      edge keys.
- *   4. Invalidate bad triangles.
- *   5. For each boundary edge, append a new triangle (e0, e1, P).
- *
- * Returns true if the point was inserted, false if MAX_TRIS would be
- * exceeded (defensive — shouldn't happen with our caps).
+ * find_bad_triangles — Bowyer-Watson step 1: flag every valid triangle whose
+ * circumcircle contains P. Together they form the "cavity" P will carve out.
+ * is_bad[] is caller-zeroed scratch indexed by triangle slot. The
+ * MAX_BAD_TRIS cap is defensive — at our point counts it is never reached.
  */
-static bool dt_insert_point(Delaunay *d, int x, int y)
+static void find_bad_triangles(const Delaunay *d, Point p, bool is_bad[])
 {
-    if (d->n_points >= MAX_POINTS) return false;
-    int p_idx = d->n_points;
-    d->points[p_idx] = (Point){ x, y };
-    d->n_points++;
-
-    Point P = d->points[p_idx];
-
-    /* Find bad triangles. */
-    bool is_bad[MAX_TRIS] = { false };
     int n_bad = 0;
     for (int i = 0; i < d->n_tris; i++) {
         if (!d->triangles[i].valid) continue;
-        Triangle *t = &d->triangles[i];
-        if (in_circumcircle(P,
+        const Triangle *t = &d->triangles[i];
+        if (in_circumcircle(p,
                             d->points[t->p[0]],
                             d->points[t->p[1]],
                             d->points[t->p[2]])) {
             is_bad[i] = true;
-            n_bad++;
-            if (n_bad >= MAX_BAD_TRIS) break;   /* defensive */
+            if (++n_bad >= MAX_BAD_TRIS) break;   /* defensive */
         }
     }
+}
 
-    /* Collect edges with occurrence counts. We use a flat array of
-     * (p_low, p_high, count) — linear scan is fine, n_bad·3 entries
-     * is small (typically < 50). */
-    typedef struct { int a, b, count; } Edge;
-    Edge edges[MAX_EDGE_BUF];
+/*
+ * cavity_edge_add — register one undirected edge (a,b) into the dedup buffer:
+ * normalise to the canonical key a ≤ b, then bump its occurrence count if the
+ * edge is already present, else append it. Counting is how boundary (count 1)
+ * and interior (count 2) edges are later told apart.
+ */
+static void cavity_edge_add(CavityEdge edges[], int *n_edges, int a, int b)
+{
+    if (a > b) { int tmp = a; a = b; b = tmp; }   /* canonical edge key */
+
+    for (int j = 0; j < *n_edges; j++)
+        if (edges[j].a == a && edges[j].b == b) { edges[j].count++; return; }
+
+    if (*n_edges < MAX_EDGE_BUF) {
+        edges[*n_edges].a     = a;
+        edges[*n_edges].b     = b;
+        edges[*n_edges].count = 1;
+        (*n_edges)++;
+    }
+}
+
+/*
+ * collect_cavity_edges — Bowyer-Watson step 2: walk all three edges of every
+ * bad triangle through cavity_edge_add, producing the deduped edge list.
+ * Returns the edge count; each edge's .count classifies it (1 = boundary).
+ */
+static int collect_cavity_edges(const Delaunay *d, const bool is_bad[],
+                                CavityEdge edges[])
+{
     int n_edges = 0;
-
     for (int i = 0; i < d->n_tris; i++) {
         if (!is_bad[i]) continue;
         for (int e = 0; e < 3; e++) {
             int a = d->triangles[i].p[e];
             int b = d->triangles[i].p[(e + 1) % 3];
-            if (a > b) { int tmp = a; a = b; b = tmp; }
-
-            int found = -1;
-            for (int j = 0; j < n_edges; j++) {
-                if (edges[j].a == a && edges[j].b == b) { found = j; break; }
-            }
-            if (found >= 0) {
-                edges[found].count++;
-            } else if (n_edges < MAX_EDGE_BUF) {
-                edges[n_edges].a = a;
-                edges[n_edges].b = b;
-                edges[n_edges].count = 1;
-                n_edges++;
-            }
+            cavity_edge_add(edges, &n_edges, a, b);
         }
     }
+    return n_edges;
+}
 
-    /* Invalidate bad triangles. */
-    for (int i = 0; i < d->n_tris; i++) {
+/*
+ * invalidate_triangles — Bowyer-Watson step 3: logically remove every bad
+ * triangle by clearing its valid flag (the slot is kept so indices stay
+ * stable across the insertion).
+ */
+static void invalidate_triangles(Delaunay *d, const bool is_bad[])
+{
+    for (int i = 0; i < d->n_tris; i++)
         if (is_bad[i]) d->triangles[i].valid = false;
-    }
+}
 
-    /* Add new triangles for every boundary edge (count == 1). */
+/*
+ * retriangulate_cavity — Bowyer-Watson step 4: fill the cavity by joining the
+ * new point p_idx to every BOUNDARY edge (count == 1), appending one fresh
+ * (glowing) triangle per boundary edge. Returns false if MAX_TRIS would be
+ * exceeded (defensive — shouldn't happen with our caps).
+ */
+static bool retriangulate_cavity(Delaunay *d, const CavityEdge edges[],
+                                 int n_edges, int p_idx)
+{
     for (int j = 0; j < n_edges; j++) {
-        if (edges[j].count != 1) continue;
+        if (edges[j].count != 1) continue;          /* interior edge — skip */
         if (d->n_tris >= MAX_TRIS) return false;
         d->triangles[d->n_tris++] = (Triangle){
             .p = { edges[j].a, edges[j].b, p_idx },
             .valid = true,
-            .new_glow = 1.0f,
+            .new_glow = 1.0f,          /* EFFECT: flash this fresh edge */
         };
     }
+    return true;
+}
+
+/*
+ * dt_insert_point — Bowyer-Watson insertion of one new point, read as its
+ * four textbook steps. Returns false if storage would overflow (defensive).
+ */
+static bool dt_insert_point(Delaunay *d, int x, int y)
+{
+    if (d->n_points >= MAX_POINTS) return false;
+
+    int p_idx = d->n_points;                     /* append P to points[] */
+    d->points[p_idx] = (Point){ x, y };
+    d->n_points++;
+    Point P = d->points[p_idx];
+
+    bool is_bad[MAX_TRIS] = { false };
+    find_bad_triangles(d, P, is_bad);            /* 1. cavity = circumcircle hits */
+
+    CavityEdge edges[MAX_EDGE_BUF];
+    int n_edges = collect_cavity_edges(d, is_bad, edges);  /* 2. cavity edges */
+
+    invalidate_triangles(d, is_bad);             /* 3. demolish bad triangles */
+
+    if (!retriangulate_cavity(d, edges, n_edges, p_idx))   /* 4. refill cavity */
+        return false;
+
     d->n_real++;
     return true;
 }
@@ -676,7 +868,7 @@ static bool dt_insert_point(Delaunay *d, int x, int y)
  */
 static bool dt_step(Delaunay *d)
 {
-    if (d->n_real >= N_REAL_POINTS) return false;
+    if (d->n_real >= d->target) return false;
     if (d->insert_cooldown > 0) {
         d->insert_cooldown--;
         return false;
@@ -689,87 +881,113 @@ static bool dt_step(Delaunay *d)
 }
 
 /* ===================================================================== */
-/* §6  scene                                                              */
+/* §6  scene — orchestration: the one place the layers combine            */
 /* ===================================================================== */
 
 /*
  * Scene state machine:
  *
- *   BUILDING — drop+insert one point per cooldown. When N_REAL points
- *              are inserted, transition to HOLD.
- *   HOLD     — wait HOLD_SECONDS, then dt_reset and back to BUILDING.
+ *   BUILDING — insert one point per cooldown until the preset's target
+ *              count is reached, then transition to DONE.
+ *   DONE     — the triangulation is complete; HOLD on it forever. No
+ *              auto-reset and no auto preset switch — the user starts a
+ *              fresh build with r (same preset) or n/p (switch preset).
  */
 typedef enum {
     SCENE_BUILDING = 0,
-    SCENE_HOLD     = 1,
+    SCENE_DONE     = 1,
 } SceneState;
 
+/*
+ * Control — the user-tunable knobs, gathered in one place: every field is
+ * something a key changes, nothing the algorithm decides on its own. Bounds
+ * for each live in §1 config; app_handle_key clamps to them.
+ */
+typedef struct {
+    int  preset_idx;          /* n/p  visual style, index into presets[]      */
+    int  insert_hold_ticks;   /* +/-  build speed (ticks per point inserted)  */
+    int  sim_fps;             /* [ ]  simulation tick rate (Hz)              */
+    bool paused;              /* space freeze the build                       */
+} Control;
+
+/*
+ * Scene — the whole showcase in one structure, three concerns kept apart:
+ *   d      WHAT is simulated (the Delaunay mesh + its build progress)
+ *   ctrl   HOW the user drives it (the knobs)
+ *   state  WHERE in the lifecycle (BUILDING or DONE)
+ */
 typedef struct {
     Delaunay    d;
+    Control     ctrl;
     SceneState  state;
-    float       hold_timer;
-    bool        paused;
-    int         insert_hold_ticks;     /* exposed to keyboard via +/- */
-    int         current_theme;
 } Scene;
 
 static void scene_reset(Scene *s, int mw, int mh)
 {
-    dt_reset(&s->d, mw, mh);
-    s->d.insert_cooldown = s->insert_hold_ticks;
-    s->state      = SCENE_BUILDING;
-    s->hold_timer = 0.0f;
+    const Preset *p = &presets[s->ctrl.preset_idx];
+    preset_apply(s->ctrl.preset_idx);             /* palette → colour pairs    */
+    dt_reset(&s->d, mw, mh, p->n_points);         /* fresh mesh at preset size */
+    s->d.insert_cooldown = s->ctrl.insert_hold_ticks;
+    s->state = SCENE_BUILDING;
 }
 
+/* scene_init — full setup for startup. Sets the knob defaults once; resize
+ * and rebuilds go through scene_reset, which preserves them. */
 static void scene_init(Scene *s, int mw, int mh)
 {
     memset(s, 0, sizeof *s);
-    s->paused            = false;
-    s->insert_hold_ticks = INSERT_HOLD_TICKS_DEF;
-    s->current_theme     = 0;
+    s->ctrl.preset_idx        = 0;
+    s->ctrl.insert_hold_ticks = INSERT_HOLD_TICKS_DEF;
+    s->ctrl.sim_fps           = SIM_FPS_DEFAULT;
+    s->ctrl.paused            = false;
     scene_reset(s, mw, mh);
 }
 
+/* scene_regrow — rebuild at the current size, keeping the chosen preset and
+ * build speed. Triggered only by the user: r (same preset) or n/p. */
+static void scene_regrow(Scene *s)
+{
+    scene_reset(s, s->d.w, s->d.h);
+}
+
+/*
+ * scene_tick — THE one place the layers combine each tick, in fixed order:
+ * DELAY guard → EFFECTS fade → SIMULATION step → DELAY transition. Nothing
+ * else advances state. dt is the fixed sim timestep.
+ */
 static void scene_tick(Scene *s, float dt)
 {
-    if (s->paused) return;
+    if (s->ctrl.paused) return;            /* DELAY: frozen — nothing advances */
 
-    /* Decay glows on triangles + global supernova. */
-    float edge_d = expf(-EDGE_GLOW_DECAY * dt);
-    float nova_d = expf(-SUPERNOVA_DECAY * dt);
-    for (int i = 0; i < s->d.n_tris; i++) {
-        s->d.triangles[i].new_glow *= edge_d;
-    }
-    s->d.supernova_glow_t *= nova_d;
+    fx_decay(&s->d, dt);                   /* EFFECTS: fade glows (even when DONE,
+                                            * so the last flash settles)        */
 
-    switch (s->state) {
+    if (s->state == SCENE_DONE) return;    /* DELAY: built — hold, no inserts   */
 
-    case SCENE_BUILDING:
-        /* Override the cooldown each tick so the user's adjustment
-         * via +/- takes effect for the NEXT insertion. */
-        if (s->d.insert_cooldown > s->insert_hold_ticks)
-            s->d.insert_cooldown = s->insert_hold_ticks;
-        dt_step(&s->d);
-        if (s->d.n_real >= N_REAL_POINTS) {
-            s->state = SCENE_HOLD;
-            s->hold_timer = HOLD_SECONDS;
-        }
-        break;
+    /* SIMULATION, paced by the insert cooldown (a DELAY): re-clamp the
+     * cooldown so a +/- speed change takes effect on the next insertion. */
+    if (s->d.insert_cooldown > s->ctrl.insert_hold_ticks)
+        s->d.insert_cooldown = s->ctrl.insert_hold_ticks;
+    dt_step(&s->d);
 
-    case SCENE_HOLD:
-        s->hold_timer -= dt;
-        if (s->hold_timer <= 0.0f) {
-            scene_reset(s, s->d.w, s->d.h);
-        }
-        break;
-    }
+    if (s->d.n_real >= s->d.target)        /* DELAY: build complete → hold */
+        s->state = SCENE_DONE;
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §7  render — state → ASCII (pure reads of the simulation)              */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — the terminal's current size, cached from getmaxyx(). WHY cache
+ * it: the dimensions change only on a resize (SIGWINCH → screen_resize
+ * re-reads them), yet every frame needs them to centre the mesh and pin the
+ * HUD bars. Units are character cells — this is cell-space rendering.
+ */
+typedef struct {
+    int cols;   /* terminal width  in character columns */
+    int rows;   /* terminal height in character rows    */
+} Screen;
 
 static void screen_init(Screen *s)
 {
@@ -837,43 +1055,36 @@ static void draw_edge_segment(int x0, int y0, int x1, int y1,
     }
 }
 
-static void scene_draw(const Scene *s, int cols, int rows)
+/*
+ * mesh_origin — top-left screen cell the map's (0,0) maps to, centring the
+ * w×h mesh in the area between the row-0 data bar and the last-row hint.
+ * Clamped so the mesh never overdraws the bars. Written through gx0/gy0.
+ */
+static void mesh_origin(const Delaunay *d, int cols, int rows,
+                        int *gx0, int *gy0)
+{
+    *gx0 = (cols - d->w) / 2;
+    *gy0 = ((rows - 2) - d->h) / 2 + 1;   /* row 0 = data bar, last = hint */
+    if (*gx0 < 0) *gx0 = 0;
+    if (*gy0 < 1) *gy0 = 1;
+}
+
+/*
+ * draw_mesh_edges — pass 1: every real triangle's three sides, drawn cell by
+ * cell with the slope-aware glyph. Scaffold triangles are filtered by
+ * triangle_is_real; flashing ones use the accent colour + bold. Edges shared
+ * by two triangles are drawn twice — harmless overdraw.
+ */
+static void draw_mesh_edges(const Scene *s, int gx0, int gy0,
+                            int cols, int rows)
 {
     const Delaunay *d = &s->d;
-
-    int gx0 = (cols - d->w) / 2;
-    int gy0 = ((rows - 3) - d->h) / 2 + 2;
-    if (gx0 < 0) gx0 = 0;
-    if (gy0 < 2) gy0 = 2;
-
-    /* Sparse supernova flash — only paint when active so we don't
-     * iterate the full screen most frames. */
-    if (d->supernova_glow_t > GLOW_THRESHOLD) {
-        attron(COLOR_PAIR(PAIR_SUPERNOVA) | A_BOLD);
-        for (int y = 0; y < d->h; y++) {
-            int sy = gy0 + y;
-            if (sy < 0 || sy >= rows) continue;
-            for (int x = 0; x < d->w; x++) {
-                int sx = gx0 + x;
-                if (sx < 0 || sx >= cols) continue;
-                if (((x ^ y) & 3) == 0) mvaddch(sy, sx, '*');
-            }
-        }
-        attroff(COLOR_PAIR(PAIR_SUPERNOVA) | A_BOLD);
-    }
-
-    /* Pass 1 — draw EDGES. We iterate triangles, drawing each of the
-     * 3 edges. Edges shared by two triangles get drawn twice; that's
-     * fine (overdraw is cheap). Triangles touching super-tri vertices
-     * (indices < 3) are skipped — that's the on-the-fly filtering
-     * that hides the scaffold. */
     for (int i = 0; i < d->n_tris; i++) {
         const Triangle *t = &d->triangles[i];
-        if (!t->valid) continue;
-        if (t->p[0] < 3 || t->p[1] < 3 || t->p[2] < 3) continue;
+        if (!t->valid || !triangle_is_real(t)) continue;
 
-        int pair = (t->new_glow > GLOW_THRESHOLD) ? PAIR_FLASH : PAIR_EDGE;
-        int attr = (t->new_glow > GLOW_THRESHOLD) ? A_BOLD : A_NORMAL;
+        int pair = triangle_is_flashing(t) ? PAIR_FLASH : PAIR_EDGE;
+        int attr = triangle_is_flashing(t) ? A_BOLD     : A_NORMAL;
 
         attron(COLOR_PAIR(pair) | attr);
         for (int e = 0; e < 3; e++) {
@@ -885,91 +1096,121 @@ static void scene_draw(const Scene *s, int cols, int rows)
         }
         attroff(COLOR_PAIR(pair) | attr);
     }
+}
 
-    /* Pass 2 — points '@' on top, in theme point colour. */
+/* draw_seed_points — pass 2: the real seed points' glyph on top of the edges,
+ * in the preset's point colour. */
+static void draw_seed_points(const Scene *s, int gx0, int gy0,
+                             int cols, int rows)
+{
+    const Delaunay *d = &s->d;
+    char point_glyph = presets[s->ctrl.preset_idx].point_glyph;
+
     attron(COLOR_PAIR(PAIR_POINT) | A_BOLD);
-    for (int i = 3; i < d->n_points; i++) {
+    for (int i = SUPER_TRI_VERTS; i < d->n_points; i++) {
         int sx = gx0 + d->points[i].x;
         int sy = gy0 + d->points[i].y;
         if (sx < 0 || sx >= cols) continue;
         if (sy < 0 || sy >= rows) continue;
-        mvaddch(sy, sx, (chtype)(unsigned char)'@');
+        mvaddch(sy, sx, (chtype)(unsigned char)point_glyph);
     }
     attroff(COLOR_PAIR(PAIR_POINT) | A_BOLD);
 }
 
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
+/*
+ * scene_draw — the mesh, as two named passes over a centred origin:
+ * edges (background) → seed points (foreground).
+ */
+static void scene_draw(const Scene *s, int cols, int rows)
+{
+    int gx0, gy0;
+    mesh_origin(&s->d, cols, rows, &gx0, &gy0);
+
+    draw_mesh_edges(s, gx0, gy0, cols, rows);
+    draw_seed_points(s, gx0, gy0, cols, rows);
+}
+
+/*
+ * hud_bar — paint one full-width status bar on `row`: fill the row with
+ * spaces in `pair`, then write `buf` clipped to the terminal width with
+ * mvaddnstr. Clipping (not mvprintw) is what keeps an over-long string from
+ * wrapping down onto the mesh. Drives both the data bar and the action bar.
+ */
+static void hud_bar(int row, int cols, int pair, const char *buf)
+{
+    if (row < 0 || cols < 1) return;
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    for (int x = 0; x < cols; x++) mvaddch(row, x, ' ');
+    mvaddnstr(row, 0, buf, cols);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
+/* count_real_triangles — live (valid) triangles that belong to the mesh,
+ * scaffold-touching ones filtered out. The HUD's tris:N figure. */
+static int count_real_triangles(const Delaunay *d)
+{
+    int n = 0;
+    for (int i = 0; i < d->n_tris; i++)
+        if (d->triangles[i].valid && triangle_is_real(&d->triangles[i]))
+            n++;
+    return n;
+}
+
+static void screen_draw(const Screen *sc, const Scene *s, double fps)
 {
     erase();
     scene_draw(s, sc->cols, sc->rows);
 
     const Delaunay *d = &s->d;
+    const Control  *c = &s->ctrl;
     const char *state_str =
-        s->paused                       ? "PAUSED   " :
-        (s->state == SCENE_BUILDING)    ? "BUILDING " :
-                                          "HOLD     ";
+        c->paused                    ? "PAUSED"   :
+        (s->state == SCENE_BUILDING) ? "BUILDING" :
+                                       "DONE";
 
-    /* Visible triangle count — for HUD, only count real ones. */
-    int n_visible = 0;
-    int n_valid   = 0;
-    for (int i = 0; i < d->n_tris; i++) {
-        if (!d->triangles[i].valid) continue;
-        n_valid++;
-        if (d->triangles[i].p[0] >= 3
-            && d->triangles[i].p[1] >= 3
-            && d->triangles[i].p[2] >= 3) n_visible++;
-    }
+    /* Visible (real) triangle count — scaffold triangles are filtered. */
+    int n_visible = count_real_triangles(d);
 
-    /* Row 0 right — primary state. */
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  %3d Hz  %s  pts:%d/%d  tris:%d ",
-             fps, sim_fps, state_str,
-             d->n_real, N_REAL_POINTS, n_visible);
-    int hx = sc->cols - (int)strlen(buf);
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    /* Row 0 — DATA: identity, active preset, live state, one clipped line. */
+    char data[200];
+    snprintf(data, sizeof data,
+             " DELAUNAY B-W  %-8s  %s (%d/%d)  pts:%d/%d  tris:%d  "
+             "hold:%-3d  %5.1f fps  %3d Hz ",
+             state_str, presets[c->preset_idx].name,
+             c->preset_idx + 1, N_PRESETS,
+             d->n_real, d->target, n_visible,
+             c->insert_hold_ticks, fps, c->sim_fps);
 
-    /* Row 0 left — title. */
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 1, " DELAUNAY TRIANGULATION ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    /* Last row — ACTIONS only: every interactive key, nothing else. */
+    static const char *keys =
+        " q:quit  spc:pause  n/p:preset  r:reset  +/-:speed  [/]:Hz ";
 
-    /* Row 1 left — theme name + algorithm parameters. */
-    int x = 1;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " theme:%-8s ", themes[s->current_theme].name);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 17;
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x,
-             " bowyer-watson  hold-ticks:%-3d  valid-tris:%d  map:%dx%d ",
-             s->insert_hold_ticks, n_valid, d->w, d->h);
-    attroff(COLOR_PAIR(PAIR_HUD));
-
-    /* Bottom hint. */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " @:point  -|/\\:edge  *:flash | t/T:theme  r:reset  spc:pause  +/-:speed  q:quit ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    hud_bar(0,            sc->cols, PAIR_HUD,  data);
+    hud_bar(sc->rows - 1, sc->cols, PAIR_HINT, keys);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §8  app — PERFORMANCE loop (fixed timestep) + signals + input          */
 /* ===================================================================== */
 
+/*
+ * App — the top-level program object: the showcase, the screen, the derived
+ * map size, and the two signal flags. WHY a single g_app global: POSIX
+ * signal handlers take no user pointer, so the handlers below reach the
+ * program through this one well-known instance — the only global, by
+ * design; everything else is passed by pointer.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    int                   map_w, map_h;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene                 scene;          /* the showcase (mesh + control)    */
+    Screen                screen;         /* cached terminal size             */
+    int                   map_w, map_h;   /* mesh size chosen to fit the
+                                           * screen, clamped to MAP_W/H_MAX    */
+    volatile sig_atomic_t running;        /* 0 ⇒ exit main loop (SIGINT/TERM).
+                                           * volatile sig_atomic_t: the only
+                                           * type safe to touch in a handler   */
+    volatile sig_atomic_t need_resize;    /* 1 ⇒ re-read size (SIGWINCH)        */
 } App;
 
 static App g_app;
@@ -981,7 +1222,7 @@ static void cleanup(void)             { endwin(); }
 static void app_pick_map_size(App *app)
 {
     int mw = app->screen.cols;
-    int mh = app->screen.rows - 3;
+    int mh = app->screen.rows - 2;
     if (mw < 16) mw = 16;
     if (mh < 8)  mh = 8;
     if (mw > MAP_W_MAX) mw = MAP_W_MAX;
@@ -1000,42 +1241,41 @@ static void app_do_resize(App *app)
 
 static bool app_handle_key(App *app, int ch)
 {
-    Scene *s = &app->scene;
+    Scene   *s = &app->scene;
+    Control *c = &s->ctrl;
     switch (ch) {
     case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':     s->paused = !s->paused; break;
-    case 'r': case 'R':
-        scene_reset(s, app->map_w, app->map_h);
+    case ' ':     c->paused = !c->paused; break;
+
+    case 'n': case 'N':   /* next preset */
+        c->preset_idx = (c->preset_idx + 1) % N_PRESETS;
+        scene_regrow(s);
         break;
-    case '=': case '+':
-        /* Faster = SHORTER cooldown. */
-        if (s->insert_hold_ticks > INSERT_HOLD_TICKS_MIN)
-            s->insert_hold_ticks /= 2;
-        if (s->insert_hold_ticks < INSERT_HOLD_TICKS_MIN)
-            s->insert_hold_ticks = INSERT_HOLD_TICKS_MIN;
-        break;
-    case '-':
-        if (s->insert_hold_ticks < INSERT_HOLD_TICKS_MAX)
-            s->insert_hold_ticks *= 2;
-        if (s->insert_hold_ticks > INSERT_HOLD_TICKS_MAX)
-            s->insert_hold_ticks = INSERT_HOLD_TICKS_MAX;
-        break;
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
+    case 'p': case 'P':   /* previous preset */
+        c->preset_idx = (c->preset_idx + N_PRESETS - 1) % N_PRESETS;
+        scene_regrow(s);
         break;
 
-    case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
-        theme_apply(s->current_theme);
+    case 'r': case 'R':   /* rebuild, same preset */
+        scene_regrow(s);
         break;
-    case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(s->current_theme);
+    case '=': case '+':   /* faster = SHORTER cooldown (halve, clamped) */
+        c->insert_hold_ticks = clamp_int(c->insert_hold_ticks / 2,
+                                         INSERT_HOLD_TICKS_MIN,
+                                         INSERT_HOLD_TICKS_MAX);
+        break;
+    case '-':             /* slower = LONGER cooldown (double, clamped) */
+        c->insert_hold_ticks = clamp_int(c->insert_hold_ticks * 2,
+                                         INSERT_HOLD_TICKS_MIN,
+                                         INSERT_HOLD_TICKS_MAX);
+        break;
+    case ']':
+        c->sim_fps = clamp_int(c->sim_fps + SIM_FPS_STEP,
+                               SIM_FPS_MIN, SIM_FPS_MAX);
+        break;
+    case '[':
+        c->sim_fps = clamp_int(c->sim_fps - SIM_FPS_STEP,
+                               SIM_FPS_MIN, SIM_FPS_MAX);
         break;
 
     default: break;
@@ -1043,21 +1283,27 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-int main(void)
+/* install_signals — clean exit on SIGINT/SIGTERM, resize flag on SIGWINCH,
+ * and endwin() via atexit so even a crash restores the terminal. */
+static void install_signals(void)
 {
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
+}
+
+int main(void)
+{
+    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+    install_signals();
 
     App *app     = &g_app;
     app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
 
     screen_init(&app->screen);
     app_pick_map_size(app);
-    scene_init(&app->scene, app->map_w, app->map_h);
+    scene_init(&app->scene, app->map_w, app->map_h);   /* sets ctrl.sim_fps */
 
     int64_t frame_time  = clock_ns();
     int64_t sim_accum   = 0;
@@ -1078,7 +1324,7 @@ int main(void)
         frame_time  = now;
         if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
 
-        int64_t tick_ns = TICK_NS(app->sim_fps);
+        int64_t tick_ns = TICK_NS(app->scene.ctrl.sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
         sim_accum += dt;
@@ -1099,7 +1345,7 @@ int main(void)
         int64_t elapsed = clock_ns() - frame_time + dt;
         clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
-        screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
+        screen_draw(&app->screen, &app->scene, fps_display);
         screen_present();
 
         int ch = getch();

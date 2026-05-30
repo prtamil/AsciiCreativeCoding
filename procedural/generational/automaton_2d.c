@@ -2,7 +2,7 @@
 /*
  * automaton_2d.c — Larger-than-Life / Extended 2-D Cellular Automaton
  *
- * Generalised CA with configurable neighbourhood radius R (1–5),
+ * Generalised CA with configurable neighbourhood radius R (1–10),
  * birth/survival count thresholds, and up to 8 cell states.
  *
  * Extends life.c (Conway's GoL with R=1 bitmask rules) to arbitrary R.
@@ -10,16 +10,16 @@
  * "blobs" that are impossible with R=1.
  *
  * ─────────────────────────────────────────────────────────────────────
- *  Section map  (follows framework.c §1–§8 skeleton)
+ *  Section map
  * ─────────────────────────────────────────────────────────────────────
- *   §1  config
- *   §2  clock
- *   §3  color
- *   §4  coords   (reference template; CA lives entirely in cell space)
- *   §5  entity   — CA grid, Rule struct, prefix-sum machinery, step
- *   §6  scene
- *   §7  screen
- *   §8  app
+ *   §1  config    — tunables, presets, themes (named constants)
+ *   §2  clock     — monotonic time + sleep (the simulation/render DELAYS)
+ *   §3  color     — theme → ncurses pairs (a terminal effect)
+ *   §4  model     — STATE: Grid (cells), Rule, Settings; pure reads
+ *   §5  areatable — PERFORMANCE: summed-area table for O(1) neighbour sums
+ *   §6  sim       — the CA rule logic (pure) + seeding/step (effects)
+ *   §7  render    — PURE: const Scene → screen
+ *   §8  app       — orchestration: input → effects → delay → render
  * ─────────────────────────────────────────────────────────────────────
  *
  * KEY ALGORITHM — 2-D Prefix Sum for O(1) neighbourhood queries
@@ -78,23 +78,24 @@
  *                             decay by 1 each generation
  *   State 0 = dead
  *
- * Presets:
- *   Bosco  R=5 N=2 B=34..58 S=34..58  — amoeba-like blobs
- *   Bugs   R=5 N=6 B=34..45 S=34..58  — colorful bugs with trails
- *   Gnarl  R=1 N=2 B=1..1  S=1..1   — chaotic fractal growth
- *   Amoeba R=2 N=5 B=9..16 S=5..14   — organic flowing shapes
+ * Presets (15, cycle with n/p; full table in §1):
+ *   BOSCO BUGS GNARL AMOEBA WAFFLE GLOBE BUGSMOVIE BRAIN STARWARS
+ *   FROGS STICKS CORAL CRYSTAL MAJORITY NEBULA
+ *   — drifting blobs, lattices, banded globes, Brian's-Brain gliders,
+ *     coral reefs, crystal growth, coarsening domains, multi-hue nebulae.
  *
  * Keys:
  *   q / ESC    quit
  *   space      pause / resume
  *   r          re-randomise grid
- *   n / p      next / previous preset
+ *   n / p      next / previous preset (rule)
+ *   t / T      next / previous theme (colour)
  *   + / =      more generations per tick
  *   -          fewer generations per tick
  *   ] / [      raise / lower simulation Hz
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra automaton_2d.c -o automaton_2d -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra automaton_2d.c -o automaton_2d -lncurses
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -118,19 +119,86 @@
  *
  * Performance    : O(W×H) per generation with prefix-sum optimisation.
  *                  Without it: O(W×H×R²); at R=5, W=200, H=50 → 1.2M vs 10K ops.
+ *
+ * References     :
+ *
+ *   CONCEPTS — cellular automata, Larger-than-Life & Generations
+ *   • Gardner, M. (1970) — "Mathematical Games: the fantastic combinations
+ *     of John Conway's new solitaire game 'life'", *Scientific American*
+ *     223(4):120-123.  The origin of Conway's Life — the R=1 case this
+ *     file generalises.
+ *   • Evans, K. M. (2001) — "Larger than Life: threshold-range scaling of
+ *     Life's coherent structures", *Physica D* 159:54-67.  The canonical
+ *     LtL paper: how birth/survival windows scale with radius R, and why
+ *     "bugs" and blobs emerge (the BOSCO/BUGS/GLOBE family here).
+ *   • Wojtowicz, M. (2001) — "Mirek's Cellebration (MCell)" rule-family
+ *     reference, mirekw.com/ca/.  Documents the Generations multi-state
+ *     trail rules used by BRAIN (Brian's Brain), STARWARS, FROGS, STICKS.
+ *   • Griffeath, D. & Moore, C., eds. (2003) — *New Constructions in
+ *     Cellular Automata*, Santa Fe Institute / Oxford.  Survey including
+ *     LtL self-organisation and pattern formation.
+ *
+ *   MATH — the summed-area table (the O(1) neighbourhood trick)
+ *   • Crow, F. C. (1984) — "Summed-area tables for texture mapping",
+ *     *SIGGRAPH '84*, Computer Graphics 18(3):207-212.  Origin of the
+ *     2-D prefix sum used to turn an O((2R+1)²) neighbourhood count into
+ *     one 4-corner O(1) query.
+ *   • Viola, P. & Jones, M. (2001) — "Rapid object detection using a
+ *     boosted cascade of simple features", *CVPR 2001*.  Popularised the
+ *     same table as the "integral image" for constant-time rectangle sums.
+ *
+ *   RENDERING — ASCII intensity ramps & terminal output
+ *   • Bourke, P. (1997) — "Character representation of grey-scale images",
+ *     paulbourke.net/dataformats/asciiart/.  The luminance→glyph idea
+ *     behind mapping cell state to a bright/dim character.
+ *   • Padala, P. (2005) — "NCURSES Programming HOWTO", TLDP
+ *     (tldp.org/HOWTO/NCURSES-Programming-HOWTO/).  The colour-pair,
+ *     attribute, and double-buffered (wnoutrefresh/doupdate) model used
+ *     in §3/§7.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── ARCHITECTURE — SIMULATION / PERFORMANCE / EFFECTS / DELAYS / RENDER ─ *
+ *
+ * One rule keeps the layers honest: a function's SIGNATURE says whether it
+ * can change the world.
+ *   • non-const pointer (Grid*, AreaTable*, Scene*, App*) → an EFFECT.
+ *   • const pointer / by-value                            → a pure READ.
+ *
+ * SIMULATION — the cellular automaton itself (§6):
+ *   cell_next   pure rule logic: birth / survival / decay for one cell.
+ *   sim_step    one generation: count neighbours, write nxt, swap (effect).
+ *   scene_tick  one sim tick = `gens` generations (effect).
+ *
+ * PERFORMANCE — the optimisation that makes large R cheap (§5):
+ *   AreaTable + area_build  build a toroidal-padded summed-area table once
+ *                           per generation — O(W×H), independent of R.
+ *   area_count              O(1) (2R+1)² neighbour sum via 4 corner lookups.
+ *   Without this the step would be O(W×H×R²).  It is the ONLY reason R can
+ *   reach 10; it changes performance, never the result.
+ *
+ * EFFECTS — everything that mutates state, all behind non-const pointers:
+ *   the cur/nxt buffer swap + generation counter (sim_step), seeding,
+ *   preset/theme switches, and the alloc/resize lifecycle.
+ *
+ * DELAYS — the only time-bending, both inside main() (§8):
+ *   sim accumulator  advances the CA at sim_fps Hz, decoupled from render.
+ *   frame cap        sleeps so the screen refreshes at most RENDER_FPS.
+ *
+ * RENDERING (§7) is PURE: render_grid / render_hud read a const Scene and
+ * write only the terminal.  Read main() top to bottom to see exactly when
+ * each effect and delay fires — and that the draw at the end touches none.
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
-#include <math.h>
 #include <ncurses.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ===================================================================== */
 /* §1  config                                                             */
@@ -141,26 +209,152 @@ enum {
     SIM_FPS_DEFAULT = 20,    /* CA ticks slower than physics animations  */
     SIM_FPS_MAX     = 60,
     SIM_FPS_STEP    =  5,
+    RENDER_FPS      = 60,    /* screen refresh cap (independent of sim)  */
 
-    HUD_ROW         =  0,    /* HUD drawn on row 0, top of screen        */
     FPS_UPDATE_MS   = 500,
+    DT_CAP_MS       = 100,   /* clamp a long frame gap (spiral guard)    */
 
-    N_PRESETS       =  4,
-    R_MAX           =  5,    /* max radius; sets allocation upper bound  */
+    HUD_TOP_ROWS    =  1,    /* top row reserved for the data bar        */
+    HUD_BOT_ROWS    =  1,    /* bottom row reserved for the hint bar     */
+    HUD_ROWS        = HUD_TOP_ROWS + HUD_BOT_ROWS,
+
+    PAIR_HUD        =  8,    /* top data bar (theme-tinted)              */
+    PAIR_HINT       =  9,    /* bottom action bar (fixed bright cyan)    */
+
+    N_PRESETS       = 15,
+    N_THEMES        =  6,
+    R_MAX           = 10,    /* max radius; sets allocation upper bound  */
     N_MAX           =  8,    /* max states                               */
 
     GENS_DEF        =  1,    /* CA generations per sim tick              */
     GENS_MAX        = 16,
 
-    SEED_DENSITY    = 30,    /* alive probability at init (percent)      */
+    SEED_BLOCK_NUM  =  3,    /* central seed block spans 3/5 of each axis */
+    SEED_BLOCK_DEN  =  5,    /* (locally dense, globally sparse)          */
 };
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS   1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
+#define CELL_GLYPH  '#'
+
+/*
+ * Interval — a closed integer interval [lo, hi].  The entire Larger-than-
+ * Life rule reduces to two membership tests: "is the live-neighbour count
+ * inside the birth interval / inside the survival interval?"  An EMPTY
+ * interval (lo > hi) means "never" — that is how BRAIN gets its no-survival
+ * Brian's-Brain behaviour.
+ */
+typedef struct {
+    int lo;   /* inclusive lower bound — smallest count that passes    */
+    int hi;   /* inclusive upper bound — hi < lo encodes the empty set */
+} Interval;
+static bool interval_has(Interval iv, int n) { return n >= iv.lo && n <= iv.hi; }
+
+/* ── Rule: the Larger-than-Life / Generations parameters ─────────────── */
+
+/*
+ * Rule — one Larger-than-Life / Generations rule: the neighbourhood size,
+ * the state count, and the two count-intervals that decide birth and
+ * survival.  This struct IS the algorithm's parameter vector — the same
+ * numbers as Evans's LtL "Rstring" notation Rr,Cn,M0,Sₛ,Bᵦ (Evans 2001);
+ * multi-state (N>2) rules add a Generations-style dying trail (Wojtowicz,
+ * MCell).  It is pure DATA — the dynamics live in cell_next (§6) — so the
+ * whole preset catalogue is a static table and switching rules is a single
+ * assignment with no reallocation.
+ */
+typedef struct {
+    int         radius;     /* R: Chebyshev/Moore radius 1..R_MAX.  The
+                             * neighbourhood is the (2R+1)² square, so the
+                             * max live-neighbour count is (2R+1)²−1.        */
+    int         states;     /* N: 2 = binary; N>2 adds an (N−2)-step dying
+                             * trail (states N−2…1) for the comet effect.    */
+    Interval    birth;      /* a DEAD cell is born iff its live-neighbour
+                             * count ∈ birth.                                */
+    Interval    survive;    /* an ALIVE cell persists iff its count ∈
+                             * survive; empty ⇒ never (Brian's Brain).       */
+    int         seed_pct;   /* 0..100 alive probability at (re)seed, tuned
+                             * per rule to land in its stable density band.  */
+    bool        seed_block; /* true → dense central block (narrow-window
+                             * rules); false → uniform fill (chaotic ones).  */
+    const char *name;       /* 9-char fixed-width HUD label.                 */
+} Rule;
+
+/*
+ * Preset table — 15 rules spanning the Larger-than-Life / Generations
+ * families.  Max neighbours = (2R+1)² − 1 (centre excluded), so the count
+ * windows scale with R:  R1→8, R2→24, R3→48, R4→80, R5→120, R6→168,
+ * R7→224, R8→288, R10→440.  Each rule carries its own seed recipe because
+ * narrow-window LtL rules collapse from a uniform random fill (a dense
+ * central BLOCK keeps the boundary inside the stable density band — see
+ * grid_seed_block); chaotic and Generations rules prefer a sparse FILL.
+ *
+ * An empty survive interval (lo > hi) means "never survive" — that is how
+ * BRAIN reproduces Brian's Brain (every live cell dies after one step).
+ *
+ * (Thresholds for the large-R rules were tuned against a headless
+ * population/activity test so they sustain and stay active rather than
+ * collapsing to empty or freezing into a still-life.)
+ */
+static const Rule PRESETS[N_PRESETS] = {
+    /*   R   N    birth       survive    seed% block  name        */
+    {    5,  2, { 34,  58}, { 34,  58},   30, false, "BOSCO    " }, /* classic drifting blobs   */
+    {    5,  6, { 34,  45}, { 34,  58},   40, true,  "BUGS     " }, /* colourful chasing bugs   */
+    {    1,  4, {  1,   1}, {  1,   1},    5, false, "GNARL    " }, /* fractal growth, 3-step fade */
+    {    2,  5, {  9,  16}, {  5,  14},   25, false, "AMOEBA   " }, /* soft organic teardrops   */
+    {    7,  2, { 75, 170}, {100, 200},   45, true,  "WAFFLE   " }, /* rigid waffle lattice     */
+    {    8,  4, { 68, 116}, { 68, 139},   40, true,  "GLOBE    " }, /* huge smooth drifting orbs */
+    {   10,  2, {104, 177}, {104, 213},   40, true,  "BUGSMOVIE" }, /* giant drifting organism  */
+    {    1,  3, {  2,   2}, {  1,   0},   25, false, "BRAIN    " }, /* survive {1,0}=never → Brian's Brain */
+    {    1,  4, {  2,   2}, {  3,   5},   28, false, "STARWARS " }, /* spaceships & oscillators */
+    {    1,  3, {  3,   4}, {  1,   2},   30, false, "FROGS    " }, /* hopping speckle texture  */
+    {    1,  6, {  2,   2}, {  3,   6},   22, false, "STICKS   " }, /* growing trailing sticks  */
+    {    3,  2, { 13,  23}, { 13,  23},   28, false, "CORAL    " }, /* static coral / reef      */
+    {    4,  4, { 22,  38}, { 22,  40},   30, true,  "CRYSTAL  " }, /* faceted crystal growth   */
+    {    4,  2, { 41,  81}, { 40,  80},   50, false, "MAJORITY " }, /* coarsening vote domains  */
+    {    6,  7, { 47,  90}, { 47, 110},   35, true,  "NEBULA   " }, /* huge multi-hue nebula    */
+};
+
+/* ── Theme: the colour gradient (decoupled from the rule) ────────────── */
+
+/*
+ * A THEME supplies the colour gradient; the PRESET supplies the rule.  The
+ * two cycle independently — n/p change the rule, t/T recolour it.  Pairs
+ * 1..N-1 hold the per-state gradient (pair 1 = fully alive, bold; pairs
+ * 2..N-1 = the dying trail, dimmed).  Every entry sits in the bright half
+ * of the 256-cube per the "Theme Palette Brightness" rule, so the A_DIM
+ * dying states stay legible.  8-colour terminals collapse to one colour.
+ */
+typedef struct {
+    const char *name;        /* HUD label                                  */
+    short       grad[N_MAX]; /* [0..N_MAX-2] state gradient (alive→dying),  */
+                             /* [N_MAX-1] = HUD tint                        */
+    short       fb8;         /* single colour for the 8-colour fallback    */
+} Theme;
+
+static const Theme THEMES[N_THEMES] = {
+    { "OCEAN  ", {  51,  45,  39,  44,  74, 117, 159, 226 }, COLOR_CYAN    },
+    { "FIRE   ", { 226, 220, 208, 202, 196, 166, 130, 226 }, COLOR_YELLOW  },
+    { "MATRIX ", {  46,  47,  41,  40,  35,  34,  71, 226 }, COLOR_GREEN   },
+    { "VIOLET ", { 207, 201, 171, 141, 135,  99, 105, 226 }, COLOR_MAGENTA },
+    { "ICE    ", { 231, 195, 159, 123,  87,  81,  75,  51 }, COLOR_WHITE   },
+    { "AMBER  ", { 229, 223, 221, 215, 214, 208, 202, 226 }, COLOR_YELLOW  },
+};
+
+/* wrap an index into [0, n) the long way (handles negative steps). */
+static int wrap_idx(int i, int n) { i %= n; if (i < 0) i += n; return i; }
+
+/* fold an index onto a torus of circumference n (handles negatives) — the
+ * wrap-around that gives the grid its periodic (toroidal) boundary. */
+static int wrap_torus(int i, int n) { return ((i % n) + n) % n; }
+
+/* clamp v to [lo, hi]; smaller of two ints — keep range-limits named. */
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static int imin(int a, int b) { return a < b ? a : b; }
+
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  clock — the program's two timebases live behind these             */
 /* ===================================================================== */
 
 static int64_t clock_ns(void)
@@ -181,38 +375,8 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  color  (a terminal effect: rewrites ncurses colour pairs)          */
 /* ===================================================================== */
-
-/*
- * Color strategy for multi-state CAs:
- *
- * We define 8 pairs (indices 1..8).  Pairs 1..N_MAX cover the state
- * gradient from fully alive (pair 1) to almost dead (pair N_MAX-1).
- * Pair 8 is reserved for HUD text.
- *
- * ca_set_preset() calls color_set_palette() to redefine pairs 1..(N-1)
- * with the preset's colour scheme whenever the user switches rules.
- * Redefining pairs mid-run is safe and does not flicker on any modern
- * terminal.
- *
- * Fallback: 8-color terminals receive a single colour (green/cyan/etc.)
- * for all alive states — no gradient but still correct behaviour.
- */
-
-/* 256-color palettes, one per preset: palettes[p][state_index] */
-/* state_index 0 = fully alive (state N-1), 1 = dying-1, ... */
-static const short PALETTES_256[N_PRESETS][N_MAX] = {
-/*  alive   d1     d2     d3     d4     d5     d6  hud */
-    { 75,   75,    75,    75,    75,    75,    75,  226 },  /* Bosco  light-blue  */
-    { 226,  208,   196,   124,   88,    52,    52,  226 },  /* Bugs   fire  */
-    { 51,   51,    51,    51,    51,    51,    51,  51  },  /* Gnarl  cyan  */
-    { 255,  153,   117,   81,    45,    45,    45,  46  },  /* Amoeba white→blue */
-};
-
-static const short PALETTES_8[N_PRESETS] = {
-    COLOR_BLUE, COLOR_YELLOW, COLOR_CYAN, COLOR_WHITE,
-};
 
 static int g_n256 = 0;   /* set in color_init */
 
@@ -221,550 +385,529 @@ static void color_init(void)
     start_color();
     use_default_colors();
     g_n256 = (COLORS >= 256);
-    /* Pairs 1..8 will be set by color_set_palette(); zero-init now */
-    for (int i = 1; i <= 8; i++)
+    /* state pairs (1..N-1) and HUD are set by palette_apply(); seed white */
+    for (int i = 1; i <= PAIR_HINT; i++)
         init_pair((short)i, COLOR_WHITE, COLOR_BLACK);
+    /* the hint bar is theme-independent: bright cyan on default bg */
+    init_pair(PAIR_HINT, g_n256 ? 51 : COLOR_CYAN, -1);
 }
 
 /*
- * color_set_palette() — redefine pairs 1..(N-1) for a preset.
- * Pair 8 is always the HUD color (yellow or green depending on preset).
+ * palette_apply() — bind the theme's gradient to the state pairs (1..N-1)
+ * and the HUD tint to PAIR_HUD.  Called on every preset OR theme change;
+ * redefining pairs mid-run is flicker-free on modern terminals.
  */
-static void color_set_palette(int preset, int N)
+/* bind the full 256-colour gradient: one pair per live/dying state tier. */
+static void palette_bind_256(const Theme *t, int N)
 {
-    const short *pal = PALETTES_256[preset];
-    if (g_n256) {
-        for (int i = 0; i < N - 1 && i < N_MAX; i++)
-            init_pair((short)(i + 1), pal[i], COLOR_BLACK);
-        init_pair(8, pal[7], COLOR_BLACK);   /* HUD */
-    } else {
-        short c = PALETTES_8[preset];
-        for (int i = 1; i <= N - 1; i++)
-            init_pair((short)i, c, COLOR_BLACK);
-        init_pair(8, COLOR_YELLOW, COLOR_BLACK);
-    }
+    for (int i = 0; i < N - 1 && i < N_MAX - 1; i++)
+        init_pair((short)(i + 1), t->grad[i], COLOR_BLACK);
+    init_pair(PAIR_HUD, t->grad[N_MAX - 1], -1);
 }
 
-/* Map cell state to ncurses attribute (pair + bold/dim) */
-static chtype state_attr(int state, int N)
+/* 8-colour fallback: collapse every state to the theme's single colour. */
+static void palette_bind_8(const Theme *t, int N)
 {
-    if (state == N - 1)
-        return (chtype)(COLOR_PAIR(1) | A_BOLD);       /* fully alive: bright */
-    /* dying states: dim, map to pairs 2..N-1 */
-    int idx = (N - 1 - state);   /* 1 = barely dying, N-2 = almost dead */
-    if (idx >= N_MAX - 1) idx = N_MAX - 2;
-    return (chtype)(COLOR_PAIR(idx + 1) | A_DIM);
+    for (int i = 1; i <= N - 1; i++)
+        init_pair((short)i, t->fb8, COLOR_BLACK);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+}
+
+static void palette_apply(int theme, int N)
+{
+    const Theme *t = &THEMES[theme];
+    if (g_n256) palette_bind_256(t, N);
+    else        palette_bind_8(t, N);
 }
 
 /* ===================================================================== */
-/* §4  coords — pixel↔cell reference (CA works entirely in cell space)   */
+/* §4  model — STATE: Grid (cells) + Rule + Settings                      */
+/*                                                                        */
+/* Plain data and the functions that only LOOK at it.  The grid is the    */
+/* simulated world; everything that mutates it lives in §6.               */
 /* ===================================================================== */
 
 /*
- * This CA simulation operates directly in cell (terminal) coordinates.
- * Each grid cell corresponds to one terminal character cell.
- * No pixel↔cell conversion is needed.
- *
- * §4 is retained as the reference template entry point for any future
- * animation derived from this file that adds continuous-motion physics.
- *
- * When you add motion (e.g. a ball ejected from a CA explosion):
- *   • Store the ball's position in PIXEL SPACE (below).
- *   • Convert to cell space ONLY in scene_draw via px_to_cell_x/y.
- *   • See bounce_ball.c §4 for the full explanation.
+ * Cell-state vocabulary.  A cell is one byte:
+ *   CELL_DEAD (0)        empty
+ *   cell_alive(N) = N-1  fully alive — the ONLY state counted as a neighbour
+ *   1 .. N-2             the "dying trail": fading ghosts that decay one tier
+ *                        per generation and do NOT count as neighbours
+ * Naming these keeps the rule logic (§6) and the renderer (§7) in domain
+ * terms instead of bare "N-1" arithmetic.
  */
-#define CELL_W   8
-#define CELL_H  16
-
-static inline int px_to_cell_x(float px)
-{
-    return (int)floorf(px / (float)CELL_W + 0.5f);
-}
-static inline int px_to_cell_y(float py)
-{
-    return (int)floorf(py / (float)CELL_H + 0.5f);
-}
-
-/* ===================================================================== */
-/* §5  entity — CA (Cellular Automaton)                                   */
-/* ===================================================================== */
-
-/* ── Rule ────────────────────────────────────────────────────────────── */
-
-typedef struct {
-    int         radius;   /* R: Moore neighbourhood radius 1..5        */
-    int         states;   /* N: number of cell states 2..N_MAX         */
-    int         b_min;    /* minimum alive-neighbour count for birth    */
-    int         b_max;    /* maximum alive-neighbour count for birth    */
-    int         s_min;    /* minimum alive-neighbour count for survival */
-    int         s_max;    /* maximum alive-neighbour count for survival */
-    const char *name;
-} Rule;
+enum { CELL_DEAD = 0 };
+static uint8_t cell_alive(int states) { return (uint8_t)(states - 1); }
 
 /*
- * Preset table.  Max neighbours = (2R+1)² - 1 (centre excluded).
- *   R=1 → 8 neighbours
- *   R=2 → 24 neighbours
- *   R=5 → 120 neighbours
+ * Grid — the cellular state, DOUBLE-BUFFERED.  A CA updates every cell
+ * "simultaneously": each next-state is computed from `cur` and written to
+ * `nxt`, then the two are swapped (grid_swap).  Without two buffers an
+ * in-place update would let a freshly-changed cell pollute its neighbours'
+ * counts — the classic CA implementation pitfall (Toffoli & Margolus,
+ * "Cellular Automata Machines", 1987).
  *
- * Bosco  (R=5 N=2): birth/survive at 34–58 of 120 ≈ 28–48%.  Classic
- *         LtL blobs that drift, split, and merge like amoebas.
- *
- * Bugs   (R=5 N=6): same neighbourhood as Bosco but 6 states.  Alive
- *         cells leave a 4-step dying trail — colorful "bugs" chase
- *         each other, each trailing orange→red fading ghost pixels.
- *
- * Gnarl  (R=1 N=2): born/survive only when exactly 1 alive neighbour.
- *         Chaotic growth from a random seed; spiderweb / fractal texture.
- *
- * Amoeba (R=2 N=5): birth at 9–16 of 24, survive at 5–14.  Organic
- *         teardrop shapes flow and morph; the 4-step dying trail gives
- *         them soft, glowing edges.
- */
-static const Rule PRESETS[N_PRESETS] = {
-    { 5, 2, 34, 58, 34, 58, "Bosco  R=5 N=2  (blobs)"    },
-    { 5, 6, 34, 45, 34, 58, "Bugs   R=5 N=6  (trails)"   },
-    { 1, 2,  1,  1,  1,  1, "Gnarl  R=1 N=2  (chaos)"    },
-    { 2, 5,  9, 16,  5, 14, "Amoeba R=2 N=5  (organic)"  },
-};
-
-/* ── CA struct ───────────────────────────────────────────────────────── */
-
-/*
- * CA — all state for the cellular automaton.
- *
- * Memory layout:
- *   cur, nxt : flat [gh × gw] byte arrays — double-buffered grid
- *   pad      : flat [(gh + 2R) × (gw + 2R)] int32 — toroidal padding
- *   psum     : flat [(gh+2R+1) × (gw+2R+1)] int32 — 2-D prefix sum
- *
- * cur/nxt are swapped each generation (pointer swap, no memcpy).
- * pad and psum are scratch space rebuilt each generation in ca_step().
- *
- * Allocation uses R_MAX=5 for pad/psum so they never need reallocation
- * when a preset changes radius. cur/nxt are reallocated on resize.
+ * Heap-allocated (not BSS) because the grid tracks the resizable terminal —
+ * a documented exception to the no-malloc rule; it allocates only at
+ * init/resize, never per frame.
  */
 typedef struct {
-    uint8_t *cur;        /* current generation                          */
-    uint8_t *nxt;        /* next generation (scratch)                   */
-    int32_t *pad;        /* padded alive-indicator grid                 */
-    int32_t *psum;       /* 2-D prefix sum of pad                       */
-    int      gw, gh;     /* grid width = cols, height = rows            */
-    int      gen;        /* generation counter                          */
-    int      preset;     /* active preset index                         */
-    int      gens;       /* CA generations per sim tick                 */
-    bool     paused;
-    Rule     rule;       /* copy of active rule (may be user-tweaked)   */
-} CA;
+    uint8_t *cur;        /* current generation, row-major h×w; each byte a
+                          * state in [CELL_DEAD … cell_alive(N)].          */
+    uint8_t *nxt;        /* next-generation scratch; undefined between
+                          * steps — fully overwritten each sim_step.       */
+    int      w, h;       /* grid extent in cells = cols × (rows − HUD_ROWS).*/
+    long     generation; /* generations since the last seed (HUD "gen:").
+                          * long: climbs for minutes at 16×/tick.          */
+} Grid;
 
-/* ── allocation ──────────────────────────────────────────────────────── */
+/* swap the double buffer: the freshly-written nxt becomes cur (the O(1)
+ * "ping-pong" that gives every cell a simultaneous, atomic update). */
+static void grid_swap(Grid *g) { uint8_t *t = g->cur; g->cur = g->nxt; g->nxt = t; }
 
 /*
- * ca_alloc() — (re)allocate all CA buffers for a given grid size.
- *
- * pad and psum are allocated for R_MAX regardless of current rule.radius
- * so preset switches never reallocate.  cur/nxt are allocated exactly
- * gw×gh; they must be reallocated on resize.
- *
- * Called from ca_init() and ca_resize().
+ * Settings — the user-facing knobs, kept apart from the simulated Grid so
+ * input mutates THESE while the CA mutates the cells.  preset/theme are
+ * stored as indices (not the live values) so n/p and t/T wrap cleanly and
+ * the HUD can show "current/total"; the live Rule is copied into Scene.rule
+ * on a preset switch.
  */
-static void ca_alloc(CA *ca, int cols, int rows)
+typedef struct {
+    int  preset;     /* index into PRESETS, 0..N_PRESETS-1 (the rule).     */
+    int  theme;      /* index into THEMES, 0..N_THEMES-1 (colour only).    */
+    int  gens;       /* generations advanced per sim tick, 1..GENS_MAX — a
+                      * speed multiplier independent of the sim Hz.        */
+    bool paused;     /* freeze stepping; render + input keep running.      */
+} Settings;
+
+/* ===================================================================== */
+/* §5  areatable — PERFORMANCE: the summed-area table                     */
+/*                                                                        */
+/* This whole section exists only to make a (2R+1)² neighbourhood count   */
+/* O(1) instead of O(R²).  It holds NO simulation state — `pad`/`sat` are  */
+/* scratch rebuilt from the Grid every generation.  Delete it and the CA   */
+/* would still be correct, just O(W·H·R²) slower.                          */
+/* ===================================================================== */
+
+/*
+ * AreaTable — toroidal-padded summed-area table (a.k.a. integral image,
+ * Crow 1984).  `pad` is the alive-indicator grid padded by R on every side
+ * with wrap-around copies (so a query never crosses an edge).  `sat` is its
+ * 2-D prefix sum.  Both are sized for R_MAX so a radius change never
+ * reallocates; `pw`/`psw` record the strides for the ACTIVE radius.
+ */
+typedef struct {
+    int32_t *pad;   /* alive-indicator (0/1) grid, padded by R on every side
+                     * with wrap-around copies — folds the torus topology
+                     * into a flat rectangle so a query never crosses an edge.*/
+    int32_t *sat;   /* 2-D prefix sum of pad: sat[i][j] = Σ pad[0..i-1][0..j-1],
+                     * 1-indexed with a zero first row/column (sat[0][*]=
+                     * sat[*][0]=0) so the 4-corner query needs no edge cases.*/
+    int      pw;    /* active padded width  = w + 2R   (set by area_build).  */
+    int      psw;   /* active sat row stride = pw + 1.                        */
+} AreaTable;
+
+static void area_alloc(AreaTable *a, int w, int h)
 {
-    free(ca->cur);  free(ca->nxt);
-    free(ca->pad);  free(ca->psum);
-
-    ca->gw = cols;
-    ca->gh = rows;
-
-    ca->cur  = calloc((size_t)(rows * cols), 1);
-    ca->nxt  = calloc((size_t)(rows * cols), 1);
-
-    /* Pad allocated for worst-case R=R_MAX on all 4 sides */
-    int pw   = cols + 2 * R_MAX;
-    int ph   = rows + 2 * R_MAX;
-    int psw  = pw + 1;
-    int psh  = ph + 1;
-    ca->pad  = calloc((size_t)(ph  * pw ), sizeof(int32_t));
-    ca->psum = calloc((size_t)(psh * psw), sizeof(int32_t));
+    free(a->pad);  free(a->sat);
+    int pw = w + 2 * R_MAX, ph = h + 2 * R_MAX;     /* worst-case padding  */
+    a->pad = calloc((size_t)pw * ph, sizeof(int32_t));
+    a->sat = calloc((size_t)(pw + 1) * (ph + 1), sizeof(int32_t));
+    /* pw/psw strides are set per-radius by area_build, not here. */
 }
 
-/* ── seeding ─────────────────────────────────────────────────────────── */
-
-/*
- * ca_seed_fill() — fill the whole grid with uniform random density (%).
- * Used by Bosco and Amoeba which are stable from random starts.
- */
-static void ca_seed_fill(CA *ca, int density)
+static void area_free(AreaTable *a)
 {
-    int N     = ca->rule.states;
-    int total = ca->gw * ca->gh;
-    for (int i = 0; i < total; i++)
-        ca->cur[i] = (rand() % 100 < density) ? (uint8_t)(N - 1) : 0;
-    ca->gen = 0;
-}
-
-/*
- * ca_seed_block() — seed a dense central rectangle, rest empty.
- *
- * WHY Bugs needs this instead of ca_seed_fill:
- *   Bugs (R=5, B=34..45, S=34..58, max_neighbours=120) has a narrow
- *   stable density window.  From a uniform 30% random seed:
- *     Gen 0 → 30% alive (E[count]=36, inside B range for dead cells)
- *     Gen 1 → ~63% alive (mass birth spike — dead cells flood into life)
- *     Gen 2 → ~0%  alive (all live cells see ~76 neighbours > S_max=58)
- *   The cascade collapses the grid in two steps.
- *
- *   A central block starts locally dense but globally sparse.  Cells
- *   inside the block interior die naturally (too many neighbours), while
- *   the block BOUNDARY — where live cells meet empty space — sits in the
- *   stable density window.  The boundary is exactly where Bugs patterns
- *   form: moving blobs that drift outward from the shrinking interior.
- */
-static void ca_seed_block(CA *ca, int density)
-{
-    int N  = ca->rule.states;
-    int bw = ca->gw * 3 / 5;   /* central block: 60% of screen width  */
-    int bh = ca->gh * 3 / 5;   /*                60% of screen height */
-    int ox = (ca->gw - bw) / 2;
-    int oy = (ca->gh - bh) / 2;
-
-    memset(ca->cur, 0, (size_t)(ca->gw * ca->gh));
-    for (int r = oy; r < oy + bh; r++) {
-        for (int c = ox; c < ox + bw; c++) {
-            if (rand() % 100 < density)
-                ca->cur[r * ca->gw + c] = (uint8_t)(N - 1);
-        }
-    }
-    ca->gen = 0;
+    free(a->pad);  free(a->sat);
+    a->pad = NULL; a->sat = NULL;
 }
 
 /*
- * ca_seed_random() — dispatch to the appropriate seed strategy per preset.
- *
- * Also called from app_handle_key 'r', so pressing 'r' always re-seeds
- * in the style that makes each preset look its best.
- *
- *   Bosco  → uniform 30% fill  (stable from random noise)
- *   Bugs   → 40% central block (avoids density-cascade collapse)
- *   Gnarl  → sparse 5% fill    (fractal growth from small clusters;
- *                                30% causes every cell to flip every
- *                                tick — visible flicker, no structure)
- *   Amoeba → uniform 25% fill  (within amoeba stability window)
+ * area_stamp_indicator — pass 1: stamp pad[pr][pc]=1 where the toroidally-
+ * wrapped source cell is fully alive, else 0.  The wrap copies make every
+ * later neighbourhood query land inside the padded rectangle, so the hot
+ * loop needs no boundary branching or modular arithmetic.
  */
-static void ca_seed_random(CA *ca)
+static void area_stamp_indicator(AreaTable *a, const Grid *g, int R,
+                                 uint8_t alive, int pw, int ph)
 {
-    switch (ca->preset) {
-    case 0:  ca_seed_fill(ca,  30); break;   /* Bosco  */
-    case 1:  ca_seed_block(ca, 40); break;   /* Bugs   */
-    case 2:  ca_seed_fill(ca,   5); break;   /* Gnarl  */
-    case 3:  ca_seed_fill(ca,  25); break;   /* Amoeba */
-    default: ca_seed_fill(ca, SEED_DENSITY); break;
-    }
-}
-
-/* ── preset switching ────────────────────────────────────────────────── */
-
-static void ca_set_preset(CA *ca, int p)
-{
-    ca->preset = (p + N_PRESETS) % N_PRESETS;
-    ca->rule   = PRESETS[ca->preset];
-    color_set_palette(ca->preset, ca->rule.states);
-    ca_seed_random(ca);
-}
-
-/* ── prefix sum builder ──────────────────────────────────────────────── */
-
-/*
- * ca_build_psum() — build the toroidal-padded prefix sum for one step.
- *
- * Step 1: Fill padded grid.
- *   Only FULLY ALIVE cells (state == N-1) contribute to the count.
- *   Dying cells (states 1..N-2) do NOT count as live neighbours — this
- *   gives multi-state rules their trailing "ghost" effect rather than
- *   making dying cells interfere with births.
- *   pad[pr][pc] = 1 if padded cell is fully alive, 0 otherwise.
- *
- *   Toroidal wrap: padded position (pr, pc) maps to original cell
- *     row = (pr - R + gh) % gh
- *     col = (pc - R + gw) % gw
- *
- * Step 2: Build 2-D prefix sum on the padded grid.
- *   P[i][j] = sum of pad[0..i-1][0..j-1]  (1-indexed, P[0][*] = 0)
- *
- *   Standard recurrence:
- *     P[i][j] = pad[i-1][j-1] + P[i-1][j] + P[i][j-1] - P[i-1][j-1]
- */
-static void ca_build_psum(const CA *ca)
-{
-    int R   = ca->rule.radius;
-    int N   = ca->rule.states;
-    int gw  = ca->gw, gh = ca->gh;
-    int pw  = gw + 2 * R;
-    int ph  = gh + 2 * R;
-    int psw = pw + 1;
-
-    /* ── step 1: fill padded alive indicator ── */
+    int w = g->w, h = g->h;
     for (int pr = 0; pr < ph; pr++) {
-        int sr = ((pr - R) % gh + gh) % gh;   /* source row, wrapped  */
+        int sr = wrap_torus(pr - R, h);               /* toroidal source row */
         for (int pc = 0; pc < pw; pc++) {
-            int sc = ((pc - R) % gw + gw) % gw;
-            ca->pad[pr * pw + pc] =
-                (ca->cur[sr * gw + sc] == (uint8_t)(N - 1)) ? 1 : 0;
+            int sc = wrap_torus(pc - R, w);
+            a->pad[pr * pw + pc] = (g->cur[sr * w + sc] == alive) ? 1 : 0;
         }
     }
+}
 
-    /* ── step 2: 2-D prefix sum ── */
-    /* P[0][*] = 0  and  P[*][0] = 0 already from calloc / previous zero */
-    /* Re-zero the boundary columns/rows that may be stale */
-    for (int i = 0; i <= ph; i++) ca->psum[i * psw]      = 0;
-    for (int j = 0; j <= pw; j++) ca->psum[j]             = 0;
+/*
+ * area_prefix_sum — pass 2: accumulate pad into the summed-area table by
+ * the 2-D prefix-sum recurrence.  Each entry = its own value plus the sums
+ * ABOVE and to the LEFT, minus the doubly-counted CORNER (inclusion-
+ * exclusion).  Row 0 / column 0 stay zero so the 4-corner query never has
+ * to special-case an edge.
+ */
+static void area_prefix_sum(AreaTable *a, int pw, int ph)
+{
+    int psw = a->psw;
+    for (int i = 0; i <= ph; i++) a->sat[i * psw] = 0;  /* zero left column */
+    for (int j = 0; j <= pw; j++) a->sat[j]       = 0;  /* zero top row     */
 
     for (int i = 1; i <= ph; i++) {
         for (int j = 1; j <= pw; j++) {
-            ca->psum[i * psw + j] =
-                ca->pad[(i-1) * pw + (j-1)]
-              + ca->psum[(i-1) * psw + j]
-              + ca->psum[ i   * psw + (j-1)]
-              - ca->psum[(i-1) * psw + (j-1)];
+            int here   = a->pad[(i - 1) * pw  + (j - 1)];
+            int above  = a->sat[(i - 1) * psw +  j     ];
+            int left   = a->sat[ i      * psw + (j - 1)];
+            int corner = a->sat[(i - 1) * psw + (j - 1)];
+            a->sat[i * psw + j] = here + above + left - corner;
         }
     }
 }
 
-/*
- * psum_query() — sum of alive cells in padded rectangle [r0..r1]×[c0..c1].
- *
- * Uses the standard 4-corner inclusion-exclusion on the prefix sum P.
- * Coordinates are in PADDED space (add R before calling for original coords).
- * r0,c0 are the TOP-LEFT corner; r1,c1 are the BOTTOM-RIGHT (inclusive).
- *
- * The formula:
- *   sum(r0..r1, c0..c1)
- *     = P[r1+1][c1+1] - P[r0][c1+1] - P[r1+1][c0] + P[r0][c0]
- *
- * Because P[i][j] = sum of [0..i-1][0..j-1], to include row r0 we
- * use row index r0 (not r0+1) for the subtraction, and r1+1 for the
- * addition.  The +1/-1 offsets cancel out the 1-based indexing.
- */
-static inline int psum_query(const int32_t *P, int psw,
-                              int r0, int c0, int r1, int c1)
+/* rebuild the table for one generation (a perf-scratch EFFECT; reads the
+ * Grid const).  Two passes — alive indicator, then its prefix sum. */
+static void area_build(AreaTable *a, const Grid *g, int R, uint8_t alive)
 {
-    return P[(r1+1) * psw + (c1+1)]
-         - P[ r0   * psw + (c1+1)]
-         - P[(r1+1) * psw +  c0  ]
-         + P[ r0   * psw +  c0  ];
+    int pw = g->w + 2 * R, ph = g->h + 2 * R;
+    a->pw = pw; a->psw = pw + 1;
+    area_stamp_indicator(a, g, R, alive, pw, ph);
+    area_prefix_sum(a, pw, ph);
 }
-
-/* ── one CA generation ───────────────────────────────────────────────── */
 
 /*
- * ca_step() — advance the CA by one generation.
- *
- * Algorithm:
- *   1. ca_build_psum() — pad grid, compute prefix sum  O(W×H)
- *   2. For each cell (r, c):                           O(W×H)
- *      a. Query (2R+1)×(2R+1) sum from prefix sum     O(1)
- *      b. Subtract centre cell to get neighbour count  O(1)
- *      c. Apply LtL birth / survival / decay rules     O(1)
- *      d. Write result into nxt[]
- *   3. Swap cur ↔ nxt pointers
- *
- * Total: O(W×H), independent of R.
- *
- * State machine (per cell):
- *
- *   state = 0 (dead):
- *     count in [b_min, b_max]  → born:  next = N-1
- *     otherwise                → stays dead: next = 0
- *
- *   state = N-1 (fully alive):
- *     count in [s_min, s_max]  → survives: next = N-1
- *     N=2 otherwise            → dies:     next = 0
- *     N>2 otherwise            → starts dying: next = N-2
- *
- *   state = 1..N-2 (dying):
- *     always decays:           next = state - 1
- *     (dying cells do not participate in birth/survival logic)
+ * area_count() — alive cells in the (2R+1)×(2R+1) window centred on grid
+ * cell (r,c), via one 4-corner inclusion-exclusion (pure read).  The cell
+ * sits at padded (r+R, c+R), so its window spans padded rows/cols [r..r+2R]
+ * — passed here as the rectangle (r,c)→(r+2R,c+2R) in padded space.
  */
-static void ca_step(CA *ca)
+static int area_count(const AreaTable *a, int r, int c, int R)
 {
-    int R   = ca->rule.radius;
-    int N   = ca->rule.states;
-    int gw  = ca->gw, gh = ca->gh;
-    int pw  = gw + 2 * R;
-    int psw = pw + 1;
-
-    ca_build_psum(ca);
-
-    for (int r = 0; r < gh; r++) {
-        for (int c = 0; c < gw; c++) {
-            /*
-             * In padded coords, this cell's neighbourhood rectangle:
-             *   rows [r .. r + 2R],  cols [c .. c + 2R]
-             * (padded position of this cell is (r+R, c+R), so the
-             *  (2R+1)×(2R+1) window starts at padded (r, c))
-             */
-            int count = psum_query(ca->psum, psw,
-                                   r, c, r + 2*R, c + 2*R);
-
-            /* Subtract centre cell (if it is fully alive) */
-            if (ca->cur[r * gw + c] == (uint8_t)(N - 1))
-                count--;
-
-            uint8_t state = ca->cur[r * gw + c];
-            uint8_t next;
-
-            if (state == 0) {
-                /* Dead → birth? */
-                next = (count >= ca->rule.b_min &&
-                        count <= ca->rule.b_max)
-                       ? (uint8_t)(N - 1) : 0;
-            } else if (state == (uint8_t)(N - 1)) {
-                /* Fully alive → survive or start dying? */
-                if (count >= ca->rule.s_min && count <= ca->rule.s_max) {
-                    next = (uint8_t)(N - 1);        /* survives */
-                } else {
-                    next = (N > 2) ? (uint8_t)(N - 2) : 0;  /* decay */
-                }
-            } else {
-                /* Dying cell → always decay by 1 */
-                next = state - 1;
-            }
-
-            ca->nxt[r * gw + c] = next;
-        }
-    }
-
-    /* Swap buffers — O(1) pointer swap, no memcpy */
-    uint8_t *tmp = ca->cur;
-    ca->cur = ca->nxt;
-    ca->nxt = tmp;
-
-    ca->gen++;
-}
-
-/* ── init / free / resize ────────────────────────────────────────────── */
-
-static void ca_init(CA *ca, int cols, int rows)
-{
-    memset(ca, 0, sizeof *ca);
-    ca->gens   = GENS_DEF;
-    ca->paused = false;
-    ca_alloc(ca, cols, rows);
-    ca_set_preset(ca, 0);
-}
-
-static void ca_free(CA *ca)
-{
-    free(ca->cur);  free(ca->nxt);
-    free(ca->pad);  free(ca->psum);
-    memset(ca, 0, sizeof *ca);
-}
-
-static void ca_resize(CA *ca, int cols, int rows)
-{
-    int preset = ca->preset;
-    int gens   = ca->gens;
-    ca_free(ca);
-    ca->gens = gens;
-    ca_alloc(ca, cols, rows);
-    ca_set_preset(ca, preset);
+    const int32_t *P = a->sat;
+    int psw = a->psw;
+    int r1 = r + 2 * R, c1 = c + 2 * R;       /* window (r,c)..(r+2R,c+2R) */
+    int br = P[(r1 + 1) * psw + (c1 + 1)];    /* bottom-right corner */
+    int tr = P[ r       * psw + (c1 + 1)];    /* top-right    corner */
+    int bl = P[(r1 + 1) * psw +  c      ];    /* bottom-left  corner */
+    int tl = P[ r       * psw +  c      ];    /* top-left     corner */
+    return br - tr - bl + tl;                 /* inclusion-exclusion */
 }
 
 /* ===================================================================== */
-/* §6  scene                                                              */
+/* §6  sim — the CA rule logic (pure) + the effects that advance it       */
 /* ===================================================================== */
 
+/*
+ * Scene — the whole automaton in one value: the cellular state, the perf
+ * scratch that accelerates it, the active rule, and the UI knobs.  This is
+ * the single composition that effects mutate (Scene*) and the renderer
+ * reads (const Scene*).  Member order mirrors a tick's data flow: read
+ * `grid` under `rule`, rebuild `area`, write `grid`; `cfg` steers it all.
+ */
 typedef struct {
-    CA ca;
+    Grid      grid;     /* §4 — the cellular state (double-buffered)      */
+    AreaTable area;     /* §5 — perf scratch, rebuilt every generation    */
+    Rule      rule;     /* active rule, a copy of PRESETS[cfg.preset]      */
+    Settings  cfg;      /* §4 — pattern/theme/speed/pause knobs           */
 } Scene;
 
-static void scene_init(Scene *s, int cols, int rows)
+/*
+ * cell_next — the entire Larger-than-Life / Generations rule for ONE cell,
+ * as a pure function of its state and live-neighbour count:
+ *
+ *   dead (CELL_DEAD)  born if count ∈ birth interval     → alive, else dead
+ *   alive (N-1)       survive if count ∈ survive interval → alive
+ *                     else N=2 → dead, N>2 → N-2 (start the dying trail)
+ *   dying (1..N-2)    always decay one tier               → state-1
+ *
+ * Dying cells do NOT count as neighbours (that is what makes the trail a
+ * fading ghost rather than interfering with births).
+ */
+static uint8_t cell_next(uint8_t state, int neighbours, const Rule *r)
+{
+    uint8_t alive = cell_alive(r->states);
+
+    if (state == CELL_DEAD)                                  /* birth?   */
+        return interval_has(r->birth, neighbours) ? alive : CELL_DEAD;
+
+    if (state == alive)                                     /* survive? */
+        return interval_has(r->survive, neighbours) ? alive
+             : (r->states > 2 ? (uint8_t)(alive - 1) : CELL_DEAD);
+
+    return (uint8_t)(state - 1);                             /* dying → decay */
+}
+
+/*
+ * live_neighbours — fully-alive cells around (r,c), CENTRE EXCLUDED.  This
+ * is the value the birth/survival intervals are tested against: area_count
+ * sums the whole (2R+1)² window in O(1), then the centre is subtracted if
+ * it is itself alive (dying-trail centres were never counted to begin with).
+ */
+static int live_neighbours(const Scene *s, int r, int c)
+{
+    int     R     = s->rule.radius;
+    uint8_t alive = cell_alive(s->rule.states);
+    int     count = area_count(&s->area, r, c, R);
+    if (s->grid.cur[r * s->grid.w + c] == alive) count--;   /* drop centre */
+    return count;
+}
+
+/* sim_step — advance the grid one generation (EFFECT), three named steps. */
+static void sim_step(Scene *s)
+{
+    Grid *g = &s->grid;
+
+    /* 1. PERF: rebuild the summed-area table so each count below is O(1). */
+    area_build(&s->area, g, s->rule.radius, cell_alive(s->rule.states));
+
+    /* 2. write every cell's next state from its live-neighbour count. */
+    for (int r = 0; r < g->h; r++)
+        for (int c = 0; c < g->w; c++)
+            g->nxt[r * g->w + c] = cell_next(g->cur[r * g->w + c],
+                                             live_neighbours(s, r, c), &s->rule);
+
+    /* 3. publish the new generation (double-buffer swap). */
+    grid_swap(g);
+    g->generation++;
+}
+
+/* one sim TICK = `gens` generations (EFFECT).  No-op while paused. */
+static void scene_tick(Scene *s)
+{
+    if (s->cfg.paused) return;
+    for (int i = 0; i < s->cfg.gens; i++) sim_step(s);
+}
+
+/* ── seeding (effects) ───────────────────────────────────────────────── */
+
+/* a Bernoulli trial: true with probability pct% (the seeding coin-flip). */
+static bool chance_pct(int pct) { return rand() % 100 < pct; }
+
+/* fill the whole grid with uniform random density (%). */
+static void grid_seed_fill(Grid *g, uint8_t alive, int pct)
+{
+    int total = g->w * g->h;
+    for (int i = 0; i < total; i++)
+        g->cur[i] = chance_pct(pct) ? alive : CELL_DEAD;
+    g->generation = 0;
+}
+
+/*
+ * grid_seed_block — seed a dense central rectangle, rest empty.  Narrow-
+ * window LtL rules collapse from a uniform fill (the global density sweeps
+ * out of the stable band in one or two steps); a block starts locally dense
+ * but globally sparse, so its BOUNDARY sits in the stable band and that is
+ * where the moving structures nucleate.
+ */
+static void grid_seed_block(Grid *g, uint8_t alive, int pct)
+{
+    int bw = g->w * SEED_BLOCK_NUM / SEED_BLOCK_DEN;   /* central block size */
+    int bh = g->h * SEED_BLOCK_NUM / SEED_BLOCK_DEN;
+    int ox = (g->w - bw) / 2, oy = (g->h - bh) / 2;    /* centred origin     */
+    memset(g->cur, CELL_DEAD, (size_t)g->w * g->h);
+    for (int r = oy; r < oy + bh; r++)
+        for (int c = ox; c < ox + bw; c++)
+            if (chance_pct(pct)) g->cur[r * g->w + c] = alive;
+    g->generation = 0;
+}
+
+/* (re)seed using the active rule's own recipe (also bound to the 'r' key). */
+static void sim_seed(Scene *s)
+{
+    uint8_t alive = cell_alive(s->rule.states);
+    if (s->rule.seed_block) grid_seed_block(&s->grid, alive, s->rule.seed_pct);
+    else                    grid_seed_fill (&s->grid, alive, s->rule.seed_pct);
+}
+
+/* ── preset / theme switches (effects) ───────────────────────────────── */
+
+static void sim_set_preset(Scene *s, int p)
+{
+    s->cfg.preset = wrap_idx(p, N_PRESETS);
+    s->rule       = PRESETS[s->cfg.preset];
+    palette_apply(s->cfg.theme, s->rule.states);
+    sim_seed(s);
+}
+
+/* switch colour theme only — no reseed, rule/geometry unchanged. */
+static void sim_set_theme(Scene *s, int t)
+{
+    s->cfg.theme = wrap_idx(t, N_THEMES);
+    palette_apply(s->cfg.theme, s->rule.states);
+}
+
+/* ── allocation lifecycle (effects) ──────────────────────────────────── */
+
+static void scene_alloc(Scene *s, int w, int h)
+{
+    /* grid buffers are exact-sized; area buffers carry R_MAX padding */
+    free(s->grid.cur);  free(s->grid.nxt);
+    s->grid.w = w;  s->grid.h = h;  s->grid.generation = 0;
+    s->grid.cur = calloc((size_t)w * h, 1);
+    s->grid.nxt = calloc((size_t)w * h, 1);
+    area_alloc(&s->area, w, h);
+}
+
+static void scene_init(Scene *s, int w, int h)
 {
     memset(s, 0, sizeof *s);
-    ca_init(&s->ca, cols, rows);
+    s->cfg.gens   = GENS_DEF;
+    s->cfg.paused = false;
+    s->cfg.preset = 0;
+    s->cfg.theme  = 0;
+    scene_alloc(s, w, h);
+    sim_set_preset(s, 0);    /* loads rule, palette, and seeds the grid */
 }
 
 static void scene_free(Scene *s)
 {
-    ca_free(&s->ca);
+    free(s->grid.cur);  free(s->grid.nxt);
+    s->grid.cur = s->grid.nxt = NULL;
+    area_free(&s->area);
 }
 
-/*
- * scene_tick() — advance the CA by ca->gens generations per sim tick.
- *
- * ca->gens is user-controlled (+/- keys) for speed without changing Hz.
- * cols/rows unused (CA grid matches terminal size; no pixel physics).
- * alpha/dt_sec are omitted from tick because the CA is not interpolated
- * — it lives entirely in discrete cell/generation space.
- */
-static void scene_tick(Scene *s, float dt, int cols, int rows)
+/* terminal resize: reallocate at the new size, then re-seed the preset. */
+static void scene_resize(Scene *s, int w, int h)
 {
-    (void)dt; (void)cols; (void)rows;
-    if (s->ca.paused) return;
-    for (int i = 0; i < s->ca.gens; i++)
-        ca_step(&s->ca);
+    scene_alloc(s, w, h);
+    sim_set_preset(s, s->cfg.preset);
 }
 
-/*
- * scene_draw() — render the CA grid to WINDOW *w.
- *
- * alpha is unused: the CA is a discrete automaton; there is no
- * sub-tick position to interpolate.  The parameter is accepted to
- * preserve the standard scene_draw signature.
- *
- * Drawing:
- *   For each cell with state > 0, write '#' with the state-appropriate
- *   color pair (bright for alive, dimming pairs for dying states).
- *   Cells with state 0 are left blank (erase() already cleared them).
- *
- * This is the ONLY function that calls mvwaddch.  All CA logic stays
- * in §5; all ncurses calls stay in §6 scene_draw and §7 screen_draw.
- */
-static void scene_draw(const Scene *s, WINDOW *w,
-                       int cols, int rows,
-                       float alpha, float dt_sec)
-{
-    (void)alpha; (void)dt_sec;
+/* ===================================================================== */
+/* §7  render — PURE: const Scene → screen                                */
+/*                                                                        */
+/* Reads state and paints it; takes only const pointers and touches only  */
+/* the terminal.  Grid row r maps to screen row r + HUD_TOP_ROWS, leaving  */
+/* row 0 for the data bar and the last row for the hint bar.              */
+/* ===================================================================== */
 
-    const CA *ca = &s->ca;
-    int N = ca->rule.states;
-    int gw = ca->gw < cols ? ca->gw : cols;
-    int gh = ca->gh < rows ? ca->gh : rows;
+/*
+ * cell_attr — map a cell's state to its ncurses attribute (the on-screen
+ * "intensity ramp"): fully alive = bright pair 1 + A_BOLD; each dying tier
+ * steps down a colour pair and uses A_DIM, so the trail fades to black.
+ */
+static chtype cell_attr(int state, int N)
+{
+    if (state == cell_alive(N))
+        return (chtype)(COLOR_PAIR(1) | A_BOLD);     /* fully alive */
+    int idx = (N - 1 - state);                       /* 1 = barely dying … */
+    if (idx >= N_MAX - 1) idx = N_MAX - 2;
+    return (chtype)(COLOR_PAIR(idx + 1) | A_DIM);    /* dying trail */
+}
+
+static void render_grid(const Scene *s, int rows)
+{
+    const Grid *g   = &s->grid;
+    int         N   = s->rule.states;
+    int         top = HUD_TOP_ROWS;            /* grid row r → screen r+top */
+    int         gh  = imin(g->h, rows - HUD_ROWS);   /* clip to play area  */
 
     for (int r = 0; r < gh; r++) {
-        for (int c = 0; c < gw; c++) {
-            uint8_t state = ca->cur[r * ca->gw + c];
-            if (state == 0) continue;
-            chtype attr = state_attr(state, N);
-            wattron(w, attr);
-            mvwaddch(w, r, c, '#');
-            wattroff(w, attr);
+        for (int c = 0; c < g->w; c++) {
+            uint8_t state = g->cur[r * g->w + c];
+            if (state == CELL_DEAD) continue;
+            chtype attr = cell_attr(state, N);
+            attron(attr);
+            mvaddch(r + top, c, (chtype)(unsigned char)CELL_GLYPH);
+            attroff(attr);
         }
     }
 }
 
+/* draw one full-width HUD bar: fill the row, then write the text clipped
+ * to `cols` so a long string never wraps onto the grid. */
+static void hud_bar(int row, int cols, int pair, const char *buf)
+{
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    for (int x = 0; x < cols; x++) mvaddch(row, x, ' ');
+    mvaddnstr(row, 0, buf, cols);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
+/* format the top-bar readout: preset/theme (each with current/total), the
+ * rule's R/N, the generation count, the speed multiplier, and timing. */
+static void hud_status_line(char *buf, size_t n, const Scene *s,
+                            int sim_fps, double fps)
+{
+    const Rule     *rule = &s->rule;
+    const Settings *cfg  = &s->cfg;
+    snprintf(buf, n,
+             " AUTOMATON_2D  preset:%s (%d/%d)  R%d N%d  theme:%s (%d/%d)  "
+             "gen:%-6ld  %dx/tick  %dHz  %4.1ffps  %s ",
+             rule->name, cfg->preset + 1, N_PRESETS,
+             rule->radius, rule->states,
+             THEMES[cfg->theme].name, cfg->theme + 1, N_THEMES,
+             s->grid.generation, cfg->gens, sim_fps, fps,
+             cfg->paused ? "PAUSED" : "running");
+}
+
+static void render_hud(const Scene *s, int cols, int rows,
+                       int sim_fps, double fps)
+{
+    char status[160];
+    hud_status_line(status, sizeof status, s, sim_fps, fps);
+
+    const char *keys =
+        " q:quit  spc:pause  r:reset  n/p:preset  t/T:theme  "
+        "+/-:speed  [/]:Hz ";
+
+    hud_bar(0,        cols, PAIR_HUD,  status);  /* top: live data  */
+    hud_bar(rows - 1, cols, PAIR_HINT, keys);    /* bottom: actions */
+}
+
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §8  app — orchestration: input → effects → delay → render              */
 /* ===================================================================== */
 
 /*
- * Screen — the ncurses display layer.  ONE window, ONE flush per frame.
- *
- * Frame sequence (same in every animation):
- *   erase()              — clear newscr
- *   scene_draw(…)        — write CA content
- *   HUD mvprintw(…)      — written last so always on top
- *   wnoutrefresh(stdscr) — mark newscr ready
- *   doupdate()           — one diff write to terminal
- *
- * See framework.c §7 for full explanation of ncurses double-buffer model.
+ * FpsMeter — a rolling frame-rate average over FPS_UPDATE_MS, so the HUD
+ * number is readable rather than flickering every frame.  Banks elapsed
+ * time + frame count, divides once per window, then resets.
  */
 typedef struct {
-    int cols;
-    int rows;
-} Screen;
+    int64_t accum_ns;   /* nanoseconds banked since the last readout    */
+    int     frames;     /* frames banked since the last readout         */
+    double  value;      /* last computed fps, shown in the HUD          */
+} FpsMeter;
 
-static void screen_init(Screen *s)
+static void fps_meter_tick(FpsMeter *m, int64_t dt)
+{
+    m->frames++;
+    m->accum_ns += dt;
+    if (m->accum_ns >= FPS_UPDATE_MS * NS_PER_MS) {
+        m->value    = (double)m->frames / ((double)m->accum_ns / (double)NS_PER_SEC);
+        m->frames   = 0;
+        m->accum_ns = 0;
+    }
+}
+
+/*
+ * App — the running PROCESS around the Scene: the simulated world plus the
+ * loop's own bookkeeping (terminal size, sim pacing, the timing
+ * accumulator, the fps meter, and the signal flags).  Split from Scene
+ * because these describe the program, not the simulation.  One file-scope
+ * instance (g_app) so the async signal handlers can reach the flags.
+ */
+typedef struct {
+    Scene                 scene;       /* the simulated world (§4-§7)         */
+    int                   cols, rows;  /* terminal size in cells              */
+    int                   sim_fps;     /* CA tick rate (Hz); the render rate
+                                        * is capped separately at RENDER_FPS.  */
+    int64_t               sim_accum;   /* fixed-step accumulator: banks real
+                                        * dt, spent in whole sim ticks.        */
+    FpsMeter              fps;          /* rolling render-rate readout.         */
+    volatile sig_atomic_t running;     /* main-loop flag, 0 = quit.  volatile
+                                        * sig_atomic_t: written by SIGINT/TERM. */
+    volatile sig_atomic_t need_resize; /* set by SIGWINCH, drained atop loop.  */
+} App;
+
+static App g_app;
+
+static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
+static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
+static void cleanup(void)             { endwin(); }
+
+static void screen_init(void)
 {
     initscr();
     noecho();
@@ -774,121 +917,54 @@ static void screen_init(Screen *s)
     keypad(stdscr, TRUE);
     typeahead(-1);
     color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_free(Screen *s) { (void)s; endwin(); }
-
-static void screen_resize(Screen *s)
+/* terminal resize: re-read size, rebuild the scene at the new grid size. */
+static void app_resize(App *app)
 {
     endwin();
     refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
-}
-
-static void screen_draw(Screen *s, const Scene *sc,
-                        double fps, int sim_fps,
-                        float alpha, float dt_sec)
-{
-    erase();
-
-    scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
-
-    /* HUD — top row, always on top */
-    const CA *ca = &sc->ca;
-    char buf[128];
-    snprintf(buf, sizeof buf,
-             " %-28s  R=%d N=%d  gen:%-6d  %dx/tick  %dHz  %4.1ffps  %s ",
-             ca->rule.name,
-             ca->rule.radius, ca->rule.states,
-             ca->gen,
-             ca->gens,
-             sim_fps,
-             fps,
-             ca->paused ? "PAUSED" : "      ");
-
-    attron(COLOR_PAIR(8) | A_BOLD);
-    mvprintw(HUD_ROW, 0, "%.*s", s->cols, buf);
-    attroff(COLOR_PAIR(8) | A_BOLD);
-
-    /* hint bar — bottom row */
-    attron(A_DIM);
-    mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  r:reset  n/p:preset  +/-:speed  [/]:Hz ");
-    attroff(A_DIM);
-}
-
-static void screen_present(void)
-{
-    wnoutrefresh(stdscr);
-    doupdate();
-}
-
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
-
-typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
-} App;
-
-static App g_app;
-
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
-
-static void app_do_resize(App *app)
-{
-    screen_resize(&app->screen);
-    ca_resize(&app->scene.ca, app->screen.cols, app->screen.rows - 2);
+    getmaxyx(stdscr, app->rows, app->cols);
+    int gh = app->rows - HUD_ROWS;
+    if (gh < 1) gh = 1;
+    scene_resize(&app->scene, app->cols, gh);
+    app->sim_accum   = 0;
     app->need_resize = 0;
 }
 
+/* step the speed (generations/tick) and the sim Hz one notch, each clamped. */
+static void settings_nudge_gens(Settings *c, int d)
+{
+    c->gens = clampi(c->gens + d, 1, GENS_MAX);
+}
+static void app_nudge_fps(App *app, int d)
+{
+    app->sim_fps = clampi(app->sim_fps + d, SIM_FPS_MIN, SIM_FPS_MAX);
+}
+
+/* map a keypress to an intent; some intents fire §6 effects.
+ * returns false only on quit. */
 static bool app_handle_key(App *app, int ch)
 {
-    CA *ca = &app->scene.ca;
-
+    Scene    *s   = &app->scene;
+    Settings *cfg = &s->cfg;
     switch (ch) {
-    case 'q': case 'Q': case 27: return false;
+    case 'q': case 'Q': case 27 /* ESC */: return false;
 
-    case ' ':
-        ca->paused = !ca->paused;
-        break;
+    case ' ':           cfg->paused = !cfg->paused;          break;
+    case 'r': case 'R': sim_seed(s);                         break;
 
-    case 'r': case 'R':
-        ca_seed_random(ca);
-        break;
+    case 'n':           sim_set_preset(s, cfg->preset + 1);  break;
+    case 'p':           sim_set_preset(s, cfg->preset - 1);  break;
 
-    case 'n':
-        ca_set_preset(ca, ca->preset + 1);
-        break;
+    case 't':           sim_set_theme(s, cfg->theme + 1);    break;
+    case 'T':           sim_set_theme(s, cfg->theme - 1);    break;
 
-    case 'p':
-        ca_set_preset(ca, ca->preset - 1);
-        break;
+    case '=': case '+': settings_nudge_gens(cfg, +1);        break;
+    case '-':           settings_nudge_gens(cfg, -1);        break;
 
-    case '=': case '+':
-        if (ca->gens < GENS_MAX) ca->gens++;
-        break;
-
-    case '-':
-        if (ca->gens > 1) ca->gens--;
-        break;
-
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+    case ']':           app_nudge_fps(app, +SIM_FPS_STEP);   break;
+    case '[':           app_nudge_fps(app, -SIM_FPS_STEP);   break;
 
     default: break;
     }
@@ -896,25 +972,50 @@ static bool app_handle_key(App *app, int ch)
 }
 
 /*
- * main() — the game loop (identical structure to framework.c §8).
- *
- * See framework.c main() for full annotated walk-through.
- * Summary of per-frame steps:
- *
- *   ① RESIZE      — handle SIGWINCH, re-read terminal dims, reallocate CA
- *   ② dt          — measure wall-clock elapsed; cap at 100 ms
- *   ③ ACCUMULATOR — drain fixed-step ticks (scene_tick per tick)
- *   ④ ALPHA       — sub-tick interpolation factor (unused by CA, kept
- *                    in signature for framework consistency)
- *   ⑤ FPS counter — 500 ms sliding window
- *   ⑥ FRAME CAP   — sleep BEFORE render to cap at 60 fps output
- *   ⑦ DRAW        — erase → scene_draw → HUD → wnoutrefresh → doupdate
- *   ⑧ INPUT       — non-blocking getch
+ * EFFECTS step: drain the fixed-step accumulator.  The CA advances one
+ * tick (= gens generations) every 1/sim_fps seconds of real time, so the
+ * simulation rate is decoupled from the render rate.
  */
+static void app_advance(App *app, int64_t dt)
+{
+    int64_t tick = TICK_NS(app->sim_fps);
+    app->sim_accum += dt;
+    while (app->sim_accum >= tick) {
+        scene_tick(&app->scene);
+        app->sim_accum -= tick;
+    }
+}
+
+/* RENDER step: pure paint of the current state. */
+static void app_draw(const App *app)
+{
+    erase();
+    render_grid(&app->scene, app->rows);
+    render_hud(&app->scene, app->cols, app->rows, app->sim_fps, app->fps.value);
+    wnoutrefresh(stdscr);
+    doupdate();
+}
+
+/* TIME step: dt since the last frame, clamped so one stall can't
+ * fast-forward the simulation (spiral-of-death guard). */
+static int64_t frame_delta(int64_t *frame_time)
+{
+    int64_t now = clock_ns();
+    int64_t dt  = now - *frame_time;
+    *frame_time = now;
+    return dt > DT_CAP_MS * NS_PER_MS ? DT_CAP_MS * NS_PER_MS : dt;
+}
+
+/* DELAY step: sleep so the screen refreshes at most RENDER_FPS. */
+static void app_pace_frame(int64_t frame_start, int64_t dt)
+{
+    int64_t elapsed = clock_ns() - frame_start + dt;
+    clock_sleep_ns(TICK_NS(RENDER_FPS) - elapsed);
+}
+
 int main(void)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
-
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
@@ -924,73 +1025,40 @@ int main(void)
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    /* Reserve top row for HUD, bottom row for hints */
-    int grid_rows = app->screen.rows - 2;
-    if (grid_rows < 1) grid_rows = 1;
-    scene_init(&app->scene, app->screen.cols, grid_rows);
+    screen_init();
+    getmaxyx(stdscr, app->rows, app->cols);
+    int gh = app->rows - HUD_ROWS;
+    if (gh < 1) gh = 1;
+    scene_init(&app->scene, app->cols, gh);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+    int64_t frame_time = clock_ns();
 
+    /*
+     * Fixed-step main loop — each iteration reads as five named steps:
+     *   INPUT   poll a key (may fire §6 effects: reset, preset, theme)
+     *   TIME    dt since last frame, clamped (spiral-of-death guard)
+     *   EFFECTS app_advance() — drain the sim accumulator at sim_fps Hz
+     *   DELAY   sleep so the screen refreshes at most RENDER_FPS
+     *   RENDER  app_draw() — pure paint, mutates nothing
+     */
     while (app->running) {
-
-        /* ── ① resize ────────────────────────────────────────────── */
         if (app->need_resize) {
-            app_do_resize(app);
+            app_resize(app);
             frame_time = clock_ns();
-            sim_accum  = 0;
         }
 
-        /* ── ② dt ────────────────────────────────────────────────── */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        int ch = getch();                                  /* INPUT   */
+        if (ch != ERR && !app_handle_key(app, ch)) app->running = 0;
 
-        /* ── ③ sim accumulator ───────────────────────────────────── */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+        int64_t dt = frame_delta(&frame_time);             /* TIME    */
 
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec,
-                       app->screen.cols, app->screen.rows - 2);
-            sim_accum -= tick_ns;
-        }
-
-        /* ── ④ alpha (sub-tick offset — unused for discrete CA) ──── */
-        float alpha = (float)sim_accum / (float)tick_ns;
-
-        /* ── ⑤ FPS counter ───────────────────────────────────────── */
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= 500 * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        /* ── ⑥ frame cap — sleep BEFORE render ───────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        /* ── ⑦ draw + present ────────────────────────────────────── */
-        screen_draw(&app->screen, &app->scene,
-                    fps_display, app->sim_fps, alpha, dt_sec);
-        screen_present();
-
-        /* ── ⑧ input ─────────────────────────────────────────────── */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+        app_advance(app, dt);                              /* EFFECTS */
+        fps_meter_tick(&app->fps, dt);
+        app_pace_frame(frame_time, dt);                    /* DELAY   */
+        app_draw(app);                                     /* RENDER  */
     }
 
     scene_free(&app->scene);
-    screen_free(&app->screen);
+    endwin();
     return 0;
 }

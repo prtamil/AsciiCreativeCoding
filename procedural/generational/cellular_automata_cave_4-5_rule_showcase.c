@@ -21,14 +21,14 @@
  *       very different: drunkard's walk grows from a centre,
  *       cellular automata reorganises the entire grid in parallel.
  *
- * Section map:
- *   §1 config   — map size, fill ratio, iterations, themes, glow rates
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 cave themes
- *   §5 ca       — CACave struct, neighbour counter, sweep step
- *   §6 scene    — ITERATING / HOLD state machine
- *   §7 screen   — ASCII render: wavefront sweep, # walls, . floors
- *   §8 app      — signals, resize, main loop
+ * Section map (layered — see ARCHITECTURE below):
+ *   §1 config   — map size, fill ratio, iterations, threshold, themes
+ *   §2 clock    — monotonic timer + sleep (PERFORMANCE / DELAYS infra)
+ *   §3 color    — HUD pairs + 10 cave themes (RENDER setup)
+ *   §5 model    — STATE · pure LOGIC (4-5 rule) · EFFECTS glow · SIMULATION
+ *   §6 scene    — orchestration: the one place the layers combine + HOLD
+ *   §7 render   — state → ASCII: wavefront sweep, # walls, . floors, HUD
+ *   §8 app      — PERFORMANCE loop, signals, resize, input
  *
  * Keys:
  *   q / ESC    quit
@@ -91,16 +91,37 @@
  *                  generation plays out over ~5–8 s on a typical
  *                  200×53 map.
  *
- * References     : • RogueBasin — "Cellular Automata Method for Generating
- *                    Random Cave-Like Levels":
+ * References     : ALGORITHM — the 4-5 rule and CA cave generation
+ *                  • Johnson, Yannakakis & Togelius (2010) — "Cellular
+ *                    Automata for Real-time Generation of Infinite Cave
+ *                    Levels", Proc. Workshop on PCG in Games (PCGames'10),
+ *                    ACM. The seminal paper: the exact birth/survival
+ *                    smoothing rule used here, applied to roguelike caves.
+ *                  • RogueBasin — "Cellular Automata Method for Generating
+ *                    Random Cave-Like Levels" — the practical, code-first
+ *                    tutorial this demo follows most closely:
  *                    http://www.roguebasin.com/index.php?title=Cellular_Automata_Method_for_Generating_Random_Cave-Like_Levels
- *                  • Stephenson, Wesley M. — "Procedural Cave Generation
- *                    using Cellular Automata":
- *                    https://web.archive.org/web/20180614050304/http://pcg.wikidot.com/pcg-algorithm:cellular-automata
- *                  • Wikipedia — "Cellular automaton":
+ *                  • Shaker, Togelius & Nelson (2016) — "Procedural
+ *                    Content Generation in Games", Springer (free at
+ *                    pcgbook.com). The PCG textbook; CA caves sit in the
+ *                    wider map-generation landscape here.
+ *                  • Wolfram, Stephen (2002) — "A New Kind of Science",
+ *                    Wolfram Media (free at wolframscience.com). The
+ *                    foundational study of why simple local rules on
+ *                    grids produce complex global structure.
+ *                  • Gardner, Martin (1970) — "Mathematical Games: The
+ *                    fantastic combinations of John Conway's new solitaire
+ *                    game 'life'", Scientific American 223. Origin of the
+ *                    Moore-neighbourhood birth/survival machinery; Life's
+ *                    B3/S23 is the same engine, a different rule.
+ *
+ *                  RENDERING — terminal / ASCII output
+ *                  • Padala, Pradeep — "NCURSES Programming HOWTO" (TLDP).
+ *                    The reference for the erase→draw→doupdate frame model,
+ *                    colour pairs, and non-blocking input this file uses.
+ *                  • Wikipedia — "Cellular automaton" — quick reference for
+ *                    neighbourhood definitions and rule notation:
  *                    https://en.wikipedia.org/wiki/Cellular_automaton
- *                  • Compare — Conway's Game of Life, B3/S23 — same
- *                    Moore-neighbourhood machinery, different rule.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -216,6 +237,40 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
+ *
+ * This program is built from SIX layers, kept in separate labelled places
+ * so each can be read without the others — and so a change to one (say the
+ * glow) provably cannot break another (the cave).
+ *
+ *   LAYER         WHAT IT IS                          WHERE      MUTATES
+ *   ─────────────────────────────────────────────────────────────────────
+ *   LOGIC         the pure 4-5 rule + neighbour       §5.2       nothing
+ *                 count — a decision, no state                   (const in)
+ *   SIMULATION    advancing the cave: seed, sweep,    §5.4 §6    tiles[],
+ *                 double-buffer swap, progress                   progress
+ *   EFFECTS       cosmetic glow (flip flash, reset    §5.3 §6    glow[] only
+ *                 supernova) + its exponential decay
+ *   RENDER        state → glyph/colour → ncurses,     §3  §7     screen only
+ *                 pure reads of the simulation
+ *   DELAYS        pause, post-convergence HOLD, and   §6  §8     timers
+ *                 the inter-frame sleep
+ *   PERFORMANCE   ops_per_tick work throttle +        §6  §8     —
+ *                 fixed-timestep accumulator + dt cap
+ *
+ * SIGNATURE CONVENTION — a call site tells you whether state changes:
+ *   • const Grid * / const Cave * / const Scene *  → a pure read (LOGIC
+ *                                       or RENDER).
+ *   • non-const pointer               → an EFFECT: the function mutates
+ *                                       what it points at.
+ *
+ * THE ONE COMBINING POINT is scene_tick() (§6): every per-step concern
+ * appears there once, in order — DELAY guard → EFFECTS decay → SIMULATION
+ * (under the PERFORMANCE throttle) → DELAY state machine. Nothing else
+ * advances state; the render path (§7) only reads.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -237,9 +292,19 @@ enum {
     MAP_H_MAX         =  56,
     CELLS_MAX         = MAP_W_MAX * MAP_H_MAX,
 
+    /* Smallest playable cave; below this a tiny terminal would give a
+     * degenerate grid. app_pick_map_size clamps to [MIN, MAX]. */
+    MAP_W_MIN         =  16,
+    MAP_H_MIN         =   8,
+
     /* How many smoothing passes. 4 is the textbook value; below 3
      * looks noisy, above 6 dissolves small features. */
     N_ITERATIONS      =   4,
+
+    /* The rule's only knob: a cell becomes WALL when at least this many
+     * of its 8 Moore neighbours are walls (else FLOOR). 5 = "wall is the
+     * local majority". Lower → walls spread; higher → walls erode. */
+    WALL_THRESHOLD    =   5,
 
     SIM_FPS_MIN       =  10,
     SIM_FPS_DEFAULT   =  60,
@@ -254,8 +319,19 @@ enum {
     OPS_PER_TICK_DEF  = 128,
     OPS_PER_TICK_MAX  = 2048,
 
-    HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
+
+    /* Rows reserved for the HUD: one data bar (top) + one action bar
+     * (bottom). The cave is centred in the band between them. */
+    HUD_ROW_TOP       =   1,
+    HUD_ROW_BOTTOM    =   1,
+
+    /* Frame pacing. RENDER_FPS_CAP throttles screen redraws and is
+     * independent of the simulation tick rate (Control.sim_fps). DT_CAP_MS
+     * clamps one frame's measured dt so a long stall (debugger, resize)
+     * can't accumulate into a spiral of death. */
+    RENDER_FPS_CAP    =  60,
+    DT_CAP_MS         = 100,
 
     /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
     PAIR_HUD          =   1,
@@ -286,17 +362,31 @@ enum { TILE_FLOOR = 0, TILE_WALL = 1 };
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
 /*
- * Themes — 10 named palettes. Same 10 names as the other procedural
- * showcases for consistency. Each theme defines four colours:
- *   wall   — the resting stone (dim, low contrast)
- *   floor  — carved cells (brighter than wall)
- *   change — cells that just flipped state (bright accent)
- *   scan   — the wavefront sweep highlight (currently unused;
- *            reserved so themes stay swappable with cave_walk file)
+ * Theme — one named colour palette for the cave, cycled live with t/T.
+ *
+ * WHY a struct (not loose colour constants): the algorithm is wholly
+ * colour-independent (same seed ⇒ same cave shape under any theme), so the
+ * palette is data, swapped at runtime without touching a line of logic.
+ * Keeping the four roles together as one record is what makes themes[]
+ * below a flat, eyeball-able table.
+ *
+ * VALUE LOGIC: every short is an xterm-256 colour index (0..255), fed to
+ * init_pair() in theme_apply(). Per the project's palette-brightness rule
+ * (CLAUDE.md), even the darkest tier must sit in the bright half of the
+ * cube — indices < ~24 / grays < ~240 vanish against the default-black
+ * background under A_DIM. The four roles form a low→high contrast ramp.
+ *
+ * Ref: 256-colour cube layout & escape-time/density colouring —
+ *      documentation/COLOR.md.
  */
 typedef struct {
-    const char *name;
-    short       wall, floor, change, scan;
+    const char *name;   /* HUD label shown as "theme:NAME (i/N)"            */
+    short       wall;    /* resting stone — lowest contrast, the bulk tier  */
+    short       floor;   /* carved/open cells — one step brighter than wall */
+    short       change;  /* freshly-flipped cells — bright accent flash     */
+    short       scan;    /* wavefront-sweep highlight; UNUSED here, kept so
+                          * these palettes stay drop-in with the sibling
+                          * drunkards_walk_cave_showcase.c theme table      */
 } Theme;
 
 #define N_THEMES 10
@@ -376,159 +466,314 @@ static void color_init(void)
 }
 
 /* ===================================================================== */
-/* §5  ca — Cellular Automata cave                                        */
+/* §5  model — STATE · LOGIC · EFFECTS · SIMULATION                       */
 /* ===================================================================== */
-
 /*
- * CACave — the simulation heart.
+ * The heart of the program, split into four layers (see ARCHITECTURE).
+ * Reading order is dependency order: each layer uses only the ones above.
+ *   5.1 STATE       the data the cave lives in
+ *   5.2 LOGIC       the pure rule — no state, no side effects
+ *   5.3 EFFECTS     the cosmetic glow — never read by the rule
+ *   5.4 SIMULATION  the machine that advances STATE using LOGIC + EFFECTS
+ */
+
+/* ── 5.1 STATE — the data structures the cave is built from ──────────── *
+ * Three small abstractions, each named for its concept and readable on its
+ * own, then composed into one Cave:
  *
- *   tiles[]      : current state (read from during the sweep)
- *   next_tiles[] : next-iteration state (written to during the sweep)
- *   change_glow[]: per-cell accent flash on cells that flipped
- *   supernova_glow[]: per-cell reset flash
+ *   Grid  — a DOUBLE BUFFER of tiles: the rule reads read[] and writes
+ *           write[], then grid_commit() makes write[] the new read[].
+ *           Separating reads from writes is what lets a whole generation
+ *           update "at once" (MENTAL MODEL: double buffering).
+ *   Glow  — a DECAYING per-cell scalar field in [0,1]. Pure cosmetics,
+ *           used twice (flip accent, reset supernova). The rule never
+ *           reads a Glow — that is what makes the EFFECTS layer safe.
+ *   Sweep — the WAVEFRONT CURSOR: which pass we are on, and how far the
+ *           top-left → bottom-right scan has reached within it.
+ */
+/*
+ * Grid — the cave's tiles held as a DOUBLE BUFFER, the defining data
+ * structure of a synchronous cellular automaton.
  *
- *   iteration  : 0..N_ITERATIONS, the smoothing pass we're on
- *   sweep_idx  : 0..total_cells, position within current iteration
- *   wall_count : number of WALL cells in the current state — updated
- *                incrementally during the sweep, recomputed at swap
- *   done       : true once iteration == N_ITERATIONS
+ * WHY two buffers: the 4-5 rule must see the WHOLE previous generation
+ * while computing the next one. If it wrote back into the same array, a
+ * cell processed early would corrupt the neighbour counts of cells
+ * processed later, biasing the result toward traversal order. Reading
+ * read[] and writing write[], then committing, makes every cell update as
+ * if "simultaneously" — order no longer matters (MENTAL MODEL: double
+ * buffering; EDGE CASES: "double buffering is essential").
+ *
+ * WHY memcpy commit (grid_commit), not a pointer swap: the renderer shows
+ * a mid-sweep MIX of both buffers (write[] for cells already processed,
+ * read[] for the rest), so both must stay valid contiguous arrays; a swap
+ * of pointers would also work but flat arrays keep indexing trivial.
+ *
+ * Ref: Johnson, Yannakakis & Togelius (2010); RogueBasin CA caves — see
+ *      the References block at the top of the file.
  */
 typedef struct {
-    int     w, h;
-    int     total_cells;
-
-    uint8_t tiles     [CELLS_MAX];
-    uint8_t next_tiles[CELLS_MAX];
-    float   change_glow   [CELLS_MAX];
-    float   supernova_glow[CELLS_MAX];
-
-    int     iteration;
-    int     sweep_idx;
-    int     wall_count;
-    bool    done;
-} CACave;
-
-static inline int ca_idx(const CACave *c, int x, int y) { return y * c->w + x; }
+    int     w, h, n;               /* width, height, n = w*h (cached count)   */
+    uint8_t read [CELLS_MAX];      /* current generation  — LOGIC reads this  */
+    uint8_t write[CELLS_MAX];      /* next generation     — SIMULATION writes */
+} Grid;
 
 /*
- * ca_count_wall_neighbours — count WALL cells in the 8-cell Moore
- * neighbourhood of (x, y). Reads from tiles[] (the current state, not
- * next_tiles[]). Out-of-grid neighbours count as WALL — keeps the
- * border solid so caves don't reach the map edge.
+ * Glow — a per-cell scalar "brightness" field in [0,1] that fades over time.
+ *
+ * WHY a whole field: the flash is per-cell and time-based, so each cell
+ * carries its own intensity. WHY exponential decay (glow_decay multiplies
+ * by exp(-rate·dt) each tick): it is frame-rate independent and never
+ * reaches exactly 0, so the renderer uses a small GLOW_THRESHOLD cutoff.
+ * 1.0 = just lit, 0 = fully faded. Purely cosmetic — the rule never reads
+ * it, which is precisely what lets the EFFECTS layer stay decoupled.
  */
-static int ca_count_wall_neighbours(const CACave *c, int x, int y)
+typedef struct {
+    float v[CELLS_MAX];            /* per-cell intensity in [0,1], decays → 0 */
+} Glow;
+
+/*
+ * Sweep — the WAVEFRONT CURSOR: a serial scan position used to ANIMATE the
+ * (conceptually parallel) generation update one cell at a time.
+ *
+ * WHY it exists: the algorithm itself has no traversal order (the double
+ * buffer guarantees that). The sweep is a presentation choice — walking
+ * cells in row-major order makes a visible boundary crawl across the map
+ * so the viewer watches the smoothing happen instead of seeing it pop.
+ */
+typedef struct {
+    int  iteration;                /* 0..N_ITERATIONS — which smoothing pass  */
+    int  idx;                      /* 0..Grid.n       — cell within this pass */
+    bool done;                     /* true once every pass has run            */
+} Sweep;
+
+/*
+ * Cave — the simulation model: the double-buffered Grid, the two cosmetic
+ * Glow fields, the Sweep cursor, and the live wall tally. Each member is a
+ * named abstraction, so "what is being simulated" reads at a glance. The
+ * split mirrors the layers: grid+sweep+wall_count are SIMULATION/PROGRESS;
+ * flip+nova are EFFECTS.
+ */
+typedef struct {
+    Grid  grid;          /* tiles (double buffer) — SIMULATION              */
+    Glow  flip;          /* EFFECTS: accent on a freshly-flipped cell       */
+    Glow  nova;          /* EFFECTS: supernova flash, lit on every re-seed  */
+    Sweep sweep;         /* PROGRESS: wavefront cursor                      */
+    int   wall_count;    /* walls in the DISPLAYED mix; drives HUD walls%.
+                          * Maintained incrementally as cells flip so the
+                          * readout is correct mid-sweep, not just at end. */
+} Cave;
+
+/* Grid ops — indexing and the double-buffer commit (end-of-pass swap). */
+static inline int  grid_idx   (const Grid *g, int x, int y) { return y * g->w + x; }
+static inline void grid_commit(Grid *g) { memcpy(g->read, g->write, g->n); }
+
+/* Glow ops — the decaying-field primitives, shared by both Glow instances. */
+static inline void  glow_light(Glow *f, int idx)       { f->v[idx] = 1.0f; }
+static inline float glow_at   (const Glow *f, int idx) { return f->v[idx]; }
+static void glow_fill (Glow *f, int n, float value) { for (int i = 0; i < n; i++) f->v[i] = value; }
+static void glow_decay(Glow *f, int n, float rate, float dt)
+{
+    float k = expf(-rate * dt);
+    for (int i = 0; i < n; i++) f->v[i] *= k;
+}
+
+/* ── 5.2 LOGIC (pure — const Grid*, mutates nothing) ─────────────────── */
+
+/*
+ * moore_wall_count — count WALL cells in the 8-cell MOORE neighbourhood of
+ * (x, y), reading the CURRENT generation (grid->read, never write[]).
+ * Out-of-grid neighbours count as WALL so the border stays solid. Pure
+ * read: takes a const pointer, changes nothing.
+ */
+static int moore_wall_count(const Grid *g, int x, int y)
 {
     int n = 0;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0) continue;
             int nx = x + dx, ny = y + dy;
-            if (nx < 0 || nx >= c->w || ny < 0 || ny >= c->h) {
-                n++;                    /* out-of-grid → WALL */
-            } else if (c->tiles[ca_idx(c, nx, ny)] == TILE_WALL) {
+            if (nx < 0 || nx >= g->w || ny < 0 || ny >= g->h)
+                n++;                              /* out-of-grid → WALL */
+            else if (g->read[grid_idx(g, nx, ny)] == TILE_WALL)
                 n++;
-            }
         }
     }
     return n;
 }
 
 /*
- * ca_step_one_cell — apply the 4-5 rule to a single cell at sweep_idx
- * and advance sweep_idx. Caller loops to do many cells per scene_tick.
+ * ca_rule — THE rule, as a pure function: a cell's next kind is decided
+ * solely by how many of its 8 neighbours are walls. Walls in the local
+ * majority (>= WALL_THRESHOLD of 8) → WALL, else FLOOR. This one
+ * expression IS the algorithm; everything else is scheduling and
+ * presentation. Read it in isolation and check it against the spec.
  *
- * Returns true if a cell was processed; false when the algorithm has
- * fully converged (all iterations done).
+ * Note: the canonical RogueBasin "4-5 rule" uses an easier survival
+ * threshold than birth (a wall survives on >=4, a floor is born on >=5).
+ * This file applies a single >=5 threshold to both, independent of the
+ * current state — simpler, and what these visuals were tuned against.
  */
-static bool ca_step_one_cell(CACave *c)
+static inline uint8_t ca_rule(int wall_neighbours)
 {
-    if (c->done) return false;
+    return (wall_neighbours >= WALL_THRESHOLD) ? TILE_WALL : TILE_FLOOR;
+}
 
-    /* End of current iteration — swap buffers and advance. */
-    if (c->sweep_idx >= c->total_cells) {
-        memcpy(c->tiles, c->next_tiles, c->total_cells);
-        c->iteration++;
-        c->sweep_idx = 0;
-        if (c->iteration >= N_ITERATIONS) {
-            c->done = true;
-            return false;
-        }
-        return true;                    /* "did work" — bumped iteration */
+/* ── 5.3 EFFECTS (cosmetic — writes ONLY the cave's Glow fields) ─────── *
+ * Cave-level effect verbs, each composing the Glow primitives above. LOGIC
+ * never reads a Glow, so a bug here can dim or brighten the screen but can
+ * never corrupt the cave. That isolation is why they live in one place.
+ */
+
+/* cave_flash_flip — light the flip accent on one cell (fired by SIMULATION
+ * when a cell changes kind). */
+static inline void cave_flash_flip(Cave *cave, int idx) { glow_light(&cave->flip, idx); }
+
+/* cave_flash_supernova — clear stale flip glow and light the reset flash on
+ * every cell. Fired once per re-seed. */
+static void cave_flash_supernova(Cave *cave)
+{
+    glow_fill(&cave->flip, cave->grid.n, 0.0f);
+    glow_fill(&cave->nova, cave->grid.n, 1.0f);
+}
+
+/* cave_decay_glow — fade both cosmetic fields by one sim tick, each at its
+ * own rate. Pure cosmetic time-evolution; dt is the fixed sim timestep. */
+static void cave_decay_glow(Cave *cave, float dt)
+{
+    glow_decay(&cave->flip, cave->grid.n, CHANGE_GLOW_DECAY, dt);
+    glow_decay(&cave->nova, cave->grid.n, SUPERNOVA_DECAY,   dt);
+}
+
+/* ── 5.4 SIMULATION (state advance — mutates Grid / Sweep / tally) ───── */
+
+/* roll_wall — one Bernoulli trial: returns true with probability
+ * FILL_RATIO. Each cell draws independently — this is the salt-and-pepper
+ * noise the smoothing rule then organises into caverns. */
+static inline bool roll_wall(void)
+{
+    return ((float)rand() / (float)RAND_MAX) < FILL_RATIO;
+}
+
+/*
+ * cave_seed — start a fresh cave: random salt-and-pepper fill at FILL_RATIO
+ * walls, Sweep and wall tally reset. SIMULATION state ONLY (Grid + Sweep +
+ * count) — it does not touch the Glow fields (the caller fires
+ * cave_flash_supernova for the flash), keeping the layers separable.
+ */
+static void cave_seed(Cave *cave, int w, int h)
+{
+    Grid *g = &cave->grid;
+    g->w = w;
+    g->h = h;
+    g->n = w * h;
+
+    cave->sweep.iteration = 0;
+    cave->sweep.idx       = 0;
+    cave->sweep.done      = false;
+    cave->wall_count      = 0;
+
+    for (int i = 0; i < g->n; i++) {
+        bool wall = roll_wall();
+        g->read[i]  = wall ? TILE_WALL : TILE_FLOOR;
+        g->write[i] = g->read[i];
+        if (wall) cave->wall_count++;
+    }
+}
+
+/*
+ * cave_advance — advance the simulation by one unit of work; return true if
+ * work was done, false once fully converged. A unit is either:
+ *   • one cell — apply LOGIC (ca_rule on the Moore count), write the
+ *     grid's write buffer, keep wall_count in step, and on a flip fire
+ *     the EFFECTS flash; then step the Sweep cursor; or
+ *   • one iteration boundary — grid_commit() the double buffer and bump
+ *     the pass (the double buffer is why traversal order doesn't matter).
+ * The caller loops this ops_per_tick times (the PERFORMANCE throttle).
+ */
+static bool cave_advance(Cave *cave)
+{
+    Grid  *g  = &cave->grid;
+    Sweep *sw = &cave->sweep;
+
+    if (sw->done) return false;
+
+    /* Iteration boundary: commit the buffer, start the next pass. */
+    if (sw->idx >= g->n) {
+        grid_commit(g);
+        sw->iteration++;
+        sw->idx = 0;
+        if (sw->iteration >= N_ITERATIONS) sw->done = true;
+        return !sw->done;               /* still work left? */
     }
 
-    int idx = c->sweep_idx;
-    int x   = idx % c->w;
-    int y   = idx / c->w;
+    int x = sw->idx % g->w;
+    int y = sw->idx / g->w;
 
-    int n = ca_count_wall_neighbours(c, x, y);
-    uint8_t was     = c->tiles[idx];
-    uint8_t becomes = (n >= 5) ? TILE_WALL : TILE_FLOOR;
-    c->next_tiles[idx] = becomes;
+    uint8_t was     = g->read[sw->idx];
+    uint8_t becomes = ca_rule(moore_wall_count(g, x, y));   /* LOGIC */
+    g->write[sw->idx] = becomes;
 
     if (becomes != was) {
-        c->change_glow[idx] = 1.0f;
-        /* wall_count maintenance — accurate for the displayed mix
-         * (which uses next for processed cells, tiles for the rest). */
-        if (becomes == TILE_WALL) c->wall_count++;
-        else                       c->wall_count--;
+        /* wall_count tracks the displayed mix (write[] for processed
+         * cells, read[] for the rest) so the HUD reads true mid-sweep. */
+        cave->wall_count += (becomes == TILE_WALL) ? +1 : -1;   /* SIMULATION */
+        cave_flash_flip(cave, sw->idx);                         /* EFFECT     */
     }
-    c->sweep_idx++;
+    sw->idx++;
     return true;
 }
 
-/*
- * ca_reset — random seed at FILL_RATIO walls, supernova flash on every
- * cell. Also resets iteration counters.
- */
-static void ca_reset(CACave *c, int w, int h)
-{
-    c->w = w;
-    c->h = h;
-    c->total_cells = w * h;
-    c->iteration   = 0;
-    c->sweep_idx   = 0;
-    c->done        = false;
-    c->wall_count  = 0;
-
-    for (int i = 0; i < c->total_cells; i++) {
-        bool wall = (((float)rand() / (float)RAND_MAX) < FILL_RATIO);
-        c->tiles[i]          = wall ? TILE_WALL : TILE_FLOOR;
-        c->next_tiles[i]     = c->tiles[i];
-        c->change_glow[i]    = 0.0f;
-        c->supernova_glow[i] = 1.0f;
-        if (wall) c->wall_count++;
-    }
-}
-
 /* ===================================================================== */
-/* §6  scene                                                              */
+/* §6  scene — orchestration: where the layers combine                    */
 /* ===================================================================== */
 
 /*
- * Scene state machine:
- *
- *   ITERATING — call ca_step_one_cell up to ops_per_tick times. When
- *               ca_step_one_cell returns false (done==true), transition
- *               to HOLD.
- *   HOLD      — wait HOLD_SECONDS, then ca_reset and back to ITERATING.
+ * SceneState — the two phases of the show, i.e. the DELAYS layer's outer
+ * shape. WHY a state machine at all: generation is finite (it converges
+ * after N_ITERATIONS), so the program alternates "build a cave" with
+ * "show it off, then start over" rather than running forever.
  */
 typedef enum {
-    SCENE_ITERATING = 0,
-    SCENE_HOLD      = 1,
+    SCENE_ITERATING = 0,  /* building: advance SIMULATION ops_per_tick cells
+                           * per tick; on cave_advance convergence → HOLD   */
+    SCENE_HOLD      = 1,  /* finished: linger HOLD_SECONDS on the result,
+                           * then re-seed and return to ITERATING            */
 } SceneState;
 
+/*
+ * Control — the user-tunable knobs, gathered in one place: every field is
+ * something a key changes, nothing the algorithm decides on its own.
+ * Separating these from the Cave makes one fact obvious — turning any knob
+ * changes the PACE or the COLOUR of the show, never the cave it produces.
+ * Bounds for each live in §1 config; app_handle_key clamps to them.
+ */
 typedef struct {
-    CACave      c;
-    SceneState  state;
-    float       hold_timer;
-    bool        paused;
-    int         ops_per_tick;
-    int         current_theme;
+    bool paused;          /* space — freeze: scene_tick early-returns       */
+    int  ops_per_tick;    /* +/-   — PERFORMANCE throttle, cells per tick;
+                           *         OPS_PER_TICK_MIN..MAX, doubles/halves   */
+    int  sim_fps;         /* [ ]   — sim tick rate Hz; SIM_FPS_MIN..MAX.
+                           *         Sets the fixed timestep, NOT render fps */
+    int  theme;           /* t/T   — index 0..N_THEMES-1 into themes[]       */
+} Control;
+
+/*
+ * Scene — the whole animated showcase in one structure, the natural home
+ * for what would otherwise be scattered globals. Three concerns, kept
+ * apart so each reads cleanly: WHAT is simulated, HOW the user drives it,
+ * and WHERE we are in the build/show cycle.
+ */
+typedef struct {
+    Cave        cave;        /* WHAT is simulated: Grid + Glow + Sweep + tally */
+    Control     ctrl;        /* HOW the user drives it: the knobs              */
+    SceneState  state;       /* ITERATING or HOLD                              */
+    float       hold_timer;  /* seconds left in HOLD; counts down by dt, and
+                              * at <=0 triggers a re-seed (unused in ITERATING) */
 } Scene;
 
 static void scene_reset(Scene *s, int mw, int mh)
 {
-    ca_reset(&s->c, mw, mh);
+    cave_seed(&s->cave, mw, mh);        /* SIMULATION: fresh random cave      */
+    cave_flash_supernova(&s->cave);     /* EFFECTS:    reset flash everywhere */
     s->state      = SCENE_ITERATING;
     s->hold_timer = 0.0f;
 }
@@ -536,31 +781,33 @@ static void scene_reset(Scene *s, int mw, int mh)
 static void scene_init(Scene *s, int mw, int mh)
 {
     memset(s, 0, sizeof *s);
-    s->paused        = false;
-    s->ops_per_tick  = OPS_PER_TICK_DEF;
-    s->current_theme = 0;
+    s->ctrl.paused       = false;
+    s->ctrl.ops_per_tick = OPS_PER_TICK_DEF;
+    s->ctrl.sim_fps      = SIM_FPS_DEFAULT;
+    s->ctrl.theme        = 0;
     scene_reset(s, mw, mh);
 }
 
+/*
+ * scene_tick — THE one place the layers combine, in fixed order. Read top
+ * to bottom and you have the whole per-step behaviour, each line a single
+ * concern: DELAY guard → EFFECTS → SIMULATION (under the PERFORMANCE
+ * throttle) → DELAY state machine. dt is the fixed sim timestep.
+ */
 static void scene_tick(Scene *s, float dt)
 {
-    if (s->paused) return;
+    if (s->ctrl.paused) return;          /* DELAY: frozen — nothing advances */
 
-    /* Decay glows. */
-    float change_d = expf(-CHANGE_GLOW_DECAY * dt);
-    float nova_d   = expf(-SUPERNOVA_DECAY   * dt);
-    int n = s->c.total_cells;
-    for (int i = 0; i < n; i++) {
-        s->c.change_glow[i]    *= change_d;
-        s->c.supernova_glow[i] *= nova_d;
-    }
+    cave_decay_glow(&s->cave, dt);       /* EFFECTS: fade both glow layers   */
 
     switch (s->state) {
 
     case SCENE_ITERATING:
-        for (int i = 0; i < s->ops_per_tick; i++) {
-            if (!ca_step_one_cell(&s->c)) {
-                s->state      = SCENE_HOLD;
+        /* PERFORMANCE throttle: bounded work per tick so the sweep plays
+         * out over seconds rather than finishing in a single frame. */
+        for (int i = 0; i < s->ctrl.ops_per_tick; i++) {
+            if (!cave_advance(&s->cave)) {       /* SIMULATION */
+                s->state      = SCENE_HOLD;      /* DELAY: linger on result */
                 s->hold_timer = HOLD_SECONDS;
                 break;
             }
@@ -568,19 +815,29 @@ static void scene_tick(Scene *s, float dt)
         break;
 
     case SCENE_HOLD:
-        s->hold_timer -= dt;
+        s->hold_timer -= dt;                     /* DELAY countdown */
         if (s->hold_timer <= 0.0f) {
-            scene_reset(s, s->c.w, s->c.h);
+            scene_reset(s, s->cave.grid.w, s->cave.grid.h);
         }
         break;
     }
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §7  render — state → ASCII (pure reads of the simulation)              */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — the terminal's current size, cached from getmaxyx(). WHY cache
+ * it rather than query per draw: the dimensions only change on a resize
+ * (SIGWINCH → screen_resize re-reads them), and every frame needs them to
+ * centre the map and right-/bottom-pin the HUD. cols/rows are in character
+ * cells — this is cell-space rendering, no sub-pixel coordinates.
+ */
+typedef struct {
+    int cols;   /* terminal width  in character columns */
+    int rows;   /* terminal height in character rows    */
+} Screen;
 
 static void screen_init(Screen *s)
 {
@@ -603,168 +860,178 @@ static void screen_resize(Screen *s)
 }
 
 /*
- * tile_state_for_render — for cell idx, return the tile state that
- * should be displayed: NEW (next_tiles) if the sweep has already
- * processed it this iteration, OLD (tiles) otherwise.
+ * cave_view_tile — the tile to DISPLAY at idx: the NEW state (grid.write)
+ * if the sweep has already passed this cell, else the OLD state (grid.read).
  *
- * This is the wavefront trick: during a sweep, the user sees a clear
- * boundary between processed and unprocessed regions. After the swap
- * (end of iteration), tiles == next_tiles so the distinction is moot
- * until the next iteration starts.
+ * This mid-sweep mix IS the wavefront: a clear boundary between processed
+ * and unprocessed cells crawls across the map. After grid_commit (end of
+ * pass) read == write, so the distinction is moot until the next pass.
  */
-static inline uint8_t tile_state_for_render(const CACave *c, int idx)
+static inline uint8_t cave_view_tile(const Cave *cave, int idx)
 {
-    return (idx < c->sweep_idx) ? c->next_tiles[idx] : c->tiles[idx];
+    return (idx < cave->sweep.idx) ? cave->grid.write[idx] : cave->grid.read[idx];
 }
 
 /*
- * tile_has_floor_neighbour_using_view — 8-connected check using the
- * "current visible state" (mid-sweep mix of tiles[] and next_tiles[]).
- * Used to decide whether a wall cell should render as '#' (next to a
- * floor) or as ' ' (interior void).
+ * cave_view_has_floor_neighbour — does (x,y) touch a FLOOR in the currently
+ * displayed mix? Decides whether a wall renders as '#' (a cave face) or is
+ * left blank (interior rock). Pure read of the view, not the raw buffers.
  */
-static bool tile_has_floor_neighbour_using_view(const CACave *c, int x, int y)
+static bool cave_view_has_floor_neighbour(const Cave *cave, int x, int y)
 {
+    const Grid *g = &cave->grid;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0) continue;
             int nx = x + dx, ny = y + dy;
-            if (nx < 0 || nx >= c->w || ny < 0 || ny >= c->h) continue;
-            if (tile_state_for_render(c, ca_idx(c, nx, ny)) == TILE_FLOOR)
+            if (nx < 0 || nx >= g->w || ny < 0 || ny >= g->h) continue;
+            if (cave_view_tile(cave, grid_idx(g, nx, ny)) == TILE_FLOOR)
                 return true;
         }
     }
     return false;
 }
 
+/*
+ * CellLook — how one cell should appear: colour pair, attributes, glyph,
+ * and whether to draw it at all. Separating "decide appearance" (cell_look,
+ * pure — it READS the Glow fields) from "stamp a glyph" (scene_draw, dumb
+ * ncurses blit) keeps the EFFECTS↔RENDER boundary crisp.
+ */
+typedef struct {
+    short pair;    /* COLOR_PAIR index (PAIR_WALL/FLOOR/CHANGE/SUPERNOVA)   */
+    int   attr;    /* ncurses attribute mask: A_BOLD / A_DIM / A_NORMAL     */
+    char  glyph;   /* ASCII tile: '#' wall, '.' floor, '*' flash, ' ' void  */
+    bool  draw;    /* false ⇒ skip entirely (interior rock); leaves the
+                    * cell blank so caverns read as empty, not solid grey   */
+} CellLook;
+
+/* cell_look — appearance priority: supernova flash > flip accent > floor >
+ * cave-face wall. Interior rock (a wall with no floor neighbour) is skipped. */
+static CellLook cell_look(const Cave *cave, int x, int y)
+{
+    int     idx = grid_idx(&cave->grid, x, y);
+    uint8_t k   = cave_view_tile(cave, idx);
+
+    if (glow_at(&cave->nova, idx) > GLOW_THRESHOLD)
+        return (CellLook){ PAIR_SUPERNOVA, A_BOLD, '*', true };
+
+    if (glow_at(&cave->flip, idx) > GLOW_THRESHOLD)
+        return (CellLook){ PAIR_CHANGE, A_BOLD, (k == TILE_FLOOR) ? '.' : '#', true };
+
+    if (k == TILE_FLOOR)
+        return (CellLook){ PAIR_FLOOR, A_DIM, '.', true };
+
+    if (cave_view_has_floor_neighbour(cave, x, y))
+        return (CellLook){ PAIR_WALL, A_NORMAL, '#', true };
+
+    return (CellLook){ 0, A_NORMAL, ' ', false };   /* interior rock — skip */
+}
+
+/* scene_draw — pure positioning + blit: centre the grid, then stamp each
+ * cell's CellLook. No appearance logic here; that all lives in cell_look. */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
-    const CACave *c = &s->c;
+    const Cave *cave = &s->cave;
+    const Grid *g    = &cave->grid;
 
-    int gx0 = (cols - c->w) / 2;
-    int gy0 = ((rows - 3) - c->h) / 2 + 2;   /* row 0+1 HUD, last row hint */
-    if (gx0 < 0) gx0 = 0;
-    if (gy0 < 2) gy0 = 2;
+    /* Centre the grid in the band between the two HUD bars. */
+    int draw_rows = rows - HUD_ROW_TOP - HUD_ROW_BOTTOM;
+    int gx0 = (cols - g->w) / 2;
+    int gy0 = HUD_ROW_TOP + (draw_rows - g->h) / 2;
+    if (gx0 < 0)           gx0 = 0;
+    if (gy0 < HUD_ROW_TOP) gy0 = HUD_ROW_TOP;
 
-    for (int y = 0; y < c->h; y++) {
+    for (int y = 0; y < g->h; y++) {
         int sy = gy0 + y;
         if (sy < 0 || sy >= rows) continue;
-        for (int x = 0; x < c->w; x++) {
+        for (int x = 0; x < g->w; x++) {
             int sx = gx0 + x;
             if (sx < 0 || sx >= cols) continue;
 
-            int idx = ca_idx(c, x, y);
-            float ng = c->supernova_glow[idx];
-            float cg = c->change_glow[idx];
-            uint8_t k = tile_state_for_render(c, idx);
+            CellLook look = cell_look(cave, x, y);
+            if (!look.draw) continue;
 
-            int  pair = -1, attr = A_NORMAL;
-            char glyph = ' ';
-
-            if (ng > GLOW_THRESHOLD) {
-                pair = PAIR_SUPERNOVA;
-                attr = A_BOLD;
-                glyph = '*';
-            } else if (cg > GLOW_THRESHOLD) {
-                /* Cell flipped during this iteration — bright accent. */
-                pair = PAIR_CHANGE;
-                attr = A_BOLD;
-                glyph = (k == TILE_FLOOR) ? '.' : '#';
-            } else if (k == TILE_FLOOR) {
-                pair = PAIR_FLOOR;
-                attr = A_DIM;
-                glyph = '.';
-            } else {
-                /* WALL — only render where adjacent to floor (using
-                 * the current view, not raw tiles[]). */
-                if (tile_has_floor_neighbour_using_view(c, x, y)) {
-                    pair = PAIR_WALL;
-                    attr = A_NORMAL;
-                    glyph = '#';
-                } else {
-                    continue;
-                }
-            }
-
-            attron(COLOR_PAIR(pair) | attr);
-            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair) | attr);
+            attron(COLOR_PAIR(look.pair) | look.attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)look.glyph);
+            attroff(COLOR_PAIR(look.pair) | look.attr);
         }
     }
 }
 
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
+/*
+ * hud_bar — paint one full-width status bar on `row`: fill the row with
+ * spaces in `pair`, then write `buf` clipped to the terminal width with
+ * mvaddnstr. Clipping (not mvprintw) is what keeps an over-long string
+ * from wrapping down onto the cave below. One helper drives both the
+ * top data bar and the bottom action bar.
+ */
+static void hud_bar(int row, int cols, int pair, const char *buf)
+{
+    if (row < 0 || cols < 1) return;
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    for (int x = 0; x < cols; x++) mvaddch(row, x, ' ');
+    mvaddnstr(row, 0, buf, cols);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
+static void screen_draw(Screen *sc, const Scene *s, double fps)
 {
     erase();
     scene_draw(s, sc->cols, sc->rows);
 
-    const CACave *c = &s->c;
+    const Cave    *cave = &s->cave;
+    const Control *ctrl = &s->ctrl;
+    int n = cave->grid.n;
     const char *state_str =
-        s->paused                       ? "PAUSED   " :
-        (s->state == SCENE_ITERATING)   ? "ITERATING" :
-                                          "HOLD     ";
+        ctrl->paused                  ? "PAUSED"    :
+        (s->state == SCENE_ITERATING) ? "ITERATING" :
+                                        "HOLD";
+    int sweep_pct = (n > 0) ? (100 * cave->sweep.idx  / n) : 0;
+    int wall_pct  = (n > 0) ? (100 * cave->wall_count / n) : 0;
 
-    /* Sweep progress within current iteration. */
-    int sweep_pct = (c->total_cells > 0)
-                  ? (100 * c->sweep_idx / c->total_cells)
-                  : 0;
+    /* Row 0 — DATA: identity, live state, and every readout that used to
+     * be split across two rows + the action bar, on one clipped line. */
+    char data[200];
+    snprintf(data, sizeof data,
+             " CA_CAVE B5678/S45678  %-9s  theme:%s (%d/%d)  iter:%d/%d  "
+             "sweep:%3d%%  walls:%3d%%  ops:%-4d  %5.1f fps  %3d Hz ",
+             state_str, themes[ctrl->theme].name,
+             ctrl->theme + 1, N_THEMES,
+             cave->sweep.iteration, N_ITERATIONS,
+             sweep_pct, wall_pct, ctrl->ops_per_tick, fps, ctrl->sim_fps);
 
-    /* Row 0 right — primary state. */
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  %3d Hz  ops:%-3d  %s  iter %d/%d  %3d%% ",
-             fps, sim_fps, s->ops_per_tick, state_str,
-             c->iteration, N_ITERATIONS, sweep_pct);
-    int hx = sc->cols - (int)strlen(buf);
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    /* Last row — ACTIONS only: every interactive key, nothing else. */
+    static const char *keys =
+        " q:quit  spc:pause  r:reset  t/T:theme  +/-:speed  [/]:Hz ";
 
-    /* Row 0 left — title. */
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 1, " CA CAVE 4-5 RULE ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-    /* Row 1 left — theme + algorithm parameters. */
-    int x = 1;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " theme:%-8s ", themes[s->current_theme].name);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 17;
-
-    /* Wall percentage of TOTAL cells — shows how the rule shifts the
-     * mix away from FILL_RATIO with each iteration. */
-    int wall_pct = (c->total_cells > 0)
-                 ? (100 * c->wall_count / c->total_cells)
-                 : 0;
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x,
-             " rule:B5678/S45678  iters:%d  fill-init:%d%%  walls:%d%%  map:%dx%d ",
-             N_ITERATIONS, (int)(FILL_RATIO * 100.0f), wall_pct, c->w, c->h);
-    attroff(COLOR_PAIR(PAIR_HUD));
-
-    /* Bottom hint. */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " #:wall  .:floor  *:flip-flash | t/T:theme  r:reset  spc:pause  +/-:speed  q:quit ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    hud_bar(0,            sc->cols, PAIR_HUD,  data);
+    hud_bar(sc->rows - 1, sc->cols, PAIR_HINT, keys);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §8  app — PERFORMANCE loop (fixed timestep) + signals + input          */
 /* ===================================================================== */
 
+/*
+ * App — the top-level program object: the simulation, the screen, the
+ * derived map size, and the two signal flags. WHY a single g_app global:
+ * POSIX signal handlers take no user pointer, so the handlers below reach
+ * the program through this one well-known instance — the only global, by
+ * design, so everything else stays passed-by-pointer.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    int                   map_w, map_h;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene                 scene;          /* the showcase (model + control)   */
+    Screen                screen;         /* cached terminal size             */
+    int                   map_w, map_h;   /* cave size chosen to fit screen,
+                                           * clamped to MAP_W/H_MAX (§1)       */
+    volatile sig_atomic_t running;        /* 0 ⇒ exit main loop (SIGINT/TERM).
+                                           * volatile sig_atomic_t: the only
+                                           * type safe to touch in a handler   */
+    volatile sig_atomic_t need_resize;    /* 1 ⇒ re-read size next frame
+                                           * (set by SIGWINCH handler)         */
 } App;
 
 static App g_app;
@@ -775,10 +1042,11 @@ static void cleanup(void)             { endwin(); }
 
 static void app_pick_map_size(App *app)
 {
+    /* Cave fills the width, and the height left after the two HUD rows. */
     int mw = app->screen.cols;
-    int mh = app->screen.rows - 3;
-    if (mw < 16) mw = 16;
-    if (mh < 8)  mh = 8;
+    int mh = app->screen.rows - HUD_ROW_TOP - HUD_ROW_BOTTOM;
+    if (mw < MAP_W_MIN) mw = MAP_W_MIN;
+    if (mh < MAP_H_MIN) mh = MAP_H_MIN;
     if (mw > MAP_W_MAX) mw = MAP_W_MAX;
     if (mh > MAP_H_MAX) mh = MAP_H_MAX;
     app->map_w = mw;
@@ -795,42 +1063,75 @@ static void app_do_resize(App *app)
 
 static bool app_handle_key(App *app, int ch)
 {
-    Scene *s = &app->scene;
+    Control *ctrl = &app->scene.ctrl;
     switch (ch) {
     case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':     s->paused = !s->paused; break;
+    case ' ':     ctrl->paused = !ctrl->paused; break;
     case 'r': case 'R':
-        scene_reset(s, app->map_w, app->map_h);
+        scene_reset(&app->scene, app->map_w, app->map_h);
         break;
     case '=': case '+':
-        if (s->ops_per_tick < OPS_PER_TICK_MAX) s->ops_per_tick *= 2;
-        if (s->ops_per_tick > OPS_PER_TICK_MAX) s->ops_per_tick = OPS_PER_TICK_MAX;
+        ctrl->ops_per_tick *= 2;
+        if (ctrl->ops_per_tick > OPS_PER_TICK_MAX) ctrl->ops_per_tick = OPS_PER_TICK_MAX;
         break;
     case '-':
-        s->ops_per_tick /= 2;
-        if (s->ops_per_tick < OPS_PER_TICK_MIN) s->ops_per_tick = OPS_PER_TICK_MIN;
+        ctrl->ops_per_tick /= 2;
+        if (ctrl->ops_per_tick < OPS_PER_TICK_MIN) ctrl->ops_per_tick = OPS_PER_TICK_MIN;
         break;
     case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
+        ctrl->sim_fps += SIM_FPS_STEP;
+        if (ctrl->sim_fps > SIM_FPS_MAX) ctrl->sim_fps = SIM_FPS_MAX;
         break;
     case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
+        ctrl->sim_fps -= SIM_FPS_STEP;
+        if (ctrl->sim_fps < SIM_FPS_MIN) ctrl->sim_fps = SIM_FPS_MIN;
         break;
 
     case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
-        theme_apply(s->current_theme);
+        ctrl->theme = (ctrl->theme + 1) % N_THEMES;
+        theme_apply(ctrl->theme);
         break;
     case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(s->current_theme);
+        ctrl->theme = (ctrl->theme + N_THEMES - 1) % N_THEMES;
+        theme_apply(ctrl->theme);
         break;
 
     default: break;
     }
     return true;
+}
+
+/*
+ * app_step_simulation — FIXED-TIMESTEP update: bank the frame's real
+ * elapsed time, then spend it one whole TICK at a time (rate = sim_fps),
+ * leaving the sub-tick remainder in *sim_accum for next frame. This is
+ * what decouples simulation speed from render speed: the cave advances the
+ * same amount per wall-clock second no matter the frame rate.
+ */
+static void app_step_simulation(App *app, int64_t dt, int64_t *sim_accum)
+{
+    int64_t tick_ns = TICK_NS(app->scene.ctrl.sim_fps);
+    float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+
+    *sim_accum += dt;
+    while (*sim_accum >= tick_ns) {
+        scene_tick(&app->scene, dt_sec);
+        *sim_accum -= tick_ns;
+    }
+}
+
+/*
+ * app_pace_frame — sleep so each rendered frame lasts about one
+ * RENDER_FPS_CAP period, regardless of how long this frame's work took.
+ * frame_start = when this iteration began; frame_dt = the previous frame's
+ * measured length. Sleeping the leftover budget holds a steady cap and
+ * keeps the process off a busy-spin.
+ */
+static void app_pace_frame(int64_t frame_start, int64_t frame_dt)
+{
+    int64_t budget_ns  = NS_PER_SEC / RENDER_FPS_CAP;
+    int64_t elapsed_ns = clock_ns() - frame_start + frame_dt;
+    clock_sleep_ns(budget_ns - elapsed_ns);
 }
 
 int main(void)
@@ -843,7 +1144,6 @@ int main(void)
 
     App *app     = &g_app;
     app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
 
     screen_init(&app->screen);
     app_pick_map_size(app);
@@ -857,26 +1157,24 @@ int main(void)
 
     while (app->running) {
 
+        /* 1. Adopt a new terminal size if SIGWINCH asked for one. */
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns();
             sim_accum  = 0;
         }
 
+        /* 2. Measure this frame's real elapsed time, capped so a long
+         *    stall can't trigger a spiral of death; advance the clock. */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        if (dt > DT_CAP_MS * NS_PER_MS) dt = DT_CAP_MS * NS_PER_MS;
 
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+        /* 3. Advance the simulation by that much real time. */
+        app_step_simulation(app, dt, &sim_accum);
 
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
-
+        /* 4. Update the FPS readout once per FPS_UPDATE_MS window. */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -886,12 +1184,12 @@ int main(void)
             fps_accum   = 0;
         }
 
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
+        /* 5. Sleep to the frame cap, THEN draw (steady pacing). */
+        app_pace_frame(frame_time, dt);
+        screen_draw(&app->screen, &app->scene, fps_display);
         screen_present();
 
+        /* 6. Drain one input event. */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

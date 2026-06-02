@@ -3,7 +3,7 @@
  * wfc_learn.c — Wave Function Collapse, slowed down so you can see it think.
  *
  * DEMO: A 50×20 grid starts in full superposition (every cell could be any
- *       of 12 box-drawing pipe tiles). Each tick the algorithm performs ONE
+ *       of 12 ASCII pipe tiles). Each tick the algorithm performs ONE
  *       atomic operation — either collapsing the lowest-entropy cell, or
  *       popping one cell off the propagation queue and tightening its
  *       neighbours. You watch the constraint wave ripple outward in yellow,
@@ -12,16 +12,15 @@
  *
  * Study alongside: ../../matrix_rain/matrix_rain.c (cell-space sim reference)
  *
- * Section map:
- *   §1 config   — grid size, tile count, glow rates, colors
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — ncurses pairs (entropy gradient + flash colors)
- *   §5 wfc      — Tile table, compat table, Grid, collapse + propagate
- *   §6 scene    — one operation per tick; glow decay; entropy stats
- *   §7 screen   — UTF-8 box-drawing render via mvaddstr
- *   §8 app      — signals, resize, main loop
+ * Section map (layers — see ARCHITECTURE block below):
+ *   §1 config       — grid/tile sizes, glow + timing constants, colour pairs
+ *   §2 performance  — monotonic timer + sleep (frame-cap helpers)
+ *   §3 simulation   — WFC core: tiles, compat table, Grid, collapse + propagate
+ *   §4 simulation   — scene & the ONE per-tick combine (glow decay + ops)
+ *   §5 render       — palette, entropy heatmap, ASCII pipe grid, HUD
+ *   §6 app          — signals, resize, key events, fixed-timestep main loop
  *
- * (No §4 — this is a cell-space simulation. Position IS cell index.)
+ * Position IS cell index (cell-space sim) — no pixel-space coordinate layer.
  *
  * Keys:
  *   q / ESC    quit
@@ -63,8 +62,8 @@
  *                  of tiles that can sit on the d-side of `tile`, so the
  *                  inner propagation step is just a few OR/AND ops.
  *
- * Rendering      : Collapsed cells render as their UTF-8 box-drawing glyph
- *                  in cyan. Uncollapsed cells render as a digit (1–9, A–C)
+ * Rendering      : Collapsed cells render as their ASCII pipe glyph
+ *                  (' ' '-' '|' '+') in cyan. Uncollapsed cells render as a digit (1–9, A–C)
  *                  showing remaining options, coloured along an entropy
  *                  gradient (high=dim blue → low=bright orange). Two glow
  *                  buffers (float per cell, decay each frame): collapse_glow
@@ -79,16 +78,33 @@
  *                  per tick (user-tunable) so the human can FOLLOW the
  *                  algorithm. No dynamic allocation after init.
  *
- * References     : • Gumin 2016 — "WaveFunctionCollapse" GitHub repo and
- *                    accompanying README (the canonical reference):
- *                    https://github.com/mxgmn/WaveFunctionCollapse
- *                  • Karth & Smith 2017 — "WaveFunctionCollapse is
- *                    Constraint Solving in the Wild" (academic framing):
- *                    proceedings of FDG 2017.
- *                  • Robert Heaton — "WaveFunctionCollapse explained":
- *                    https://robertheaton.com/2018/12/17/wavefunction-collapse-algorithm/
- *                  • Boris the Brave — "WFC tile-based tutorial":
+ * References     : Concept —
+ *                  • Gumin (2016) — "WaveFunctionCollapse" repo + README, the
+ *                    canonical reference that named and popularised the
+ *                    algorithm: https://github.com/mxgmn/WaveFunctionCollapse
+ *                  • Merrell (2007) — "Example-Based Model Synthesis", I3D
+ *                    2007: the tile-adjacency constraint method WFC generalises.
+ *                    This demo is closer to Merrell's tiled model than to
+ *                    Gumin's overlapping-pattern variant.
+ *                  • Karth & Smith (2017) — "WaveFunctionCollapse is Constraint
+ *                    Solving in the Wild", FDG 2017: frames WFC as a CSP and is
+ *                    why the propagate step below is an arc-consistency sweep.
+ *                  • Mackworth (1977) — "Consistency in Networks of Relations":
+ *                    AC-3 arc consistency — exactly what propagate does (shrink
+ *                    a neighbour's domain to edge-compatible tiles, recurse).
+ *                  • Boris the Brave (2020) — "WFC tile-based, explained": the
+ *                    adjacency-tile formulation this file implements.
  *                    https://www.boristhebrave.com/2020/04/13/wave-function-collapse-explained/
+ *                  • Robert Heaton (2018) — "WaveFunctionCollapse explained":
+ *                    a gentle from-scratch walkthrough.
+ *                  Rendering —
+ *                  • Bourke — "Colour Ramping for Data Visualisation": the
+ *                    entropy heatmap's high→low remaining-options gradient.
+ *                  • Padala — "NCURSES Programming HOWTO", TLDP: colour pairs,
+ *                    glyph output, non-blocking input, resize handling.
+ *                  • xterm 256-colour palette — the entropy-gradient + glow
+ *                    indices the renderer draws from:
+ *                    https://jonasjacek.github.io/colors/
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -191,6 +207,49 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
+ *
+ * State is module-global (typed structs arrive in step 5).  Each layer owns
+ * one concern; this table says what each mutates:
+ *
+ *   Layer        Section  Mutates
+ *   ─────────────────────────────────────────────────────────────────────
+ *   PERFORMANCE  §2       nothing — reads the clock / sleeps
+ *   SIMULATION   §3,§4    the Grid (per-cell mask[], the propagation queue +
+ *                         in_queue[], qhead/qtail, collapsed_count, done/bad)
+ *                         and Scene's run state; compat[] is filled once at init.
+ *   RENDER       §5       the terminal only — reads Grid + glows, never writes
+ *                         them; screen_resize re-fits Screen dims (USER EVENT).
+ *   APP          §6       run knobs (auto/paused/show_entropy/ops_per_tick,
+ *                         sim_fps), grid size, signal flags.
+ *
+ *   LOGIC is real but NOT a separate section — the pure decisions are small
+ *     helpers kept beside the data they serve: dir_dx/dir_dy/opposite,
+ *     popcount16, grid_idx, grid_in_bounds (all no-mutation, no-I/O), plus the
+ *     render-side pure mappings entropy_glyph / entropy_color_pair.  Hoisting
+ *     these one-liners out would only hurt locality. (grid_pick_min_entropy is
+ *     a read-only scan but draws rand() for tie-breaks, so it sits in §3.)
+ *   EFFECTS  is real STATE, not functions: Grid.collapse_glow[] (red flash on
+ *     a deliberate collapse) and Grid.prop_glow[] (yellow propagation wave).
+ *     The sim ops WRITE them (collapse→collapse_glow, propagate→prop_glow);
+ *     scene_tick DECAYS them; render READS them.  They never feed back into the
+ *     algorithm, so deleting all glow code would not change the WFC result.
+ *   No DELAYS layer — 'space' (paused) and 'a' (auto) gate how many ops run in
+ *     scene_tick; 's' injects one extra; the only real wait is the §2 frame cap.
+ *
+ * PER-TICK COMBINE — scene_tick (§4) is the ONE place sim state advances,
+ * in fixed order:
+ *     1. EFFECTS decay  — multiply both glow buffers by exp(-rate·dt).
+ *     2. SIMULATION     — run (paused?0:ops_per_tick) (+1 if 's') grid_step
+ *                         calls; each is one propagation pop, else one collapse.
+ *   RENDER (scene_draw + HUD) then PERFORMANCE (frame cap) run once per frame in
+ *   main, OUTSIDE the tick.
+ *
+ * USER EVENTS are NOT the tick: keys (pause/reset/step/auto/entropy/speed/Hz)
+ * and resize mutate state directly in §6 — reset and resize call scene_reset;
+ * resize re-fits the grid — but only scene_tick advances the simulation.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <locale.h>
@@ -228,9 +287,9 @@ enum {
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    N_TILES           =  12,    /* size of tile alphabet — see §5 tiles[] */
+    N_TILES           =  12,    /* size of tile alphabet — see §3 tiles[] */
 
-    /* Color pair indices — defined in §3 color_init() */
+    /* Color pair indices — defined in §5 color_init() */
     PAIR_TILE         =   1,    /* collapsed cell glyph (cyan)        */
     PAIR_FLASH        =   2,    /* collapse_glow (red)                */
     PAIR_WAVE         =   3,    /* prop_glow (yellow)                 */
@@ -258,8 +317,15 @@ enum {
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
+/* Render frame cap: the wall-clock loop never spins faster than this,
+ * independent of the (possibly higher) simulation tick rate. */
+#define RENDER_CAP_FPS  60
+/* Spiral-of-death guard: clamp a stalled frame's elapsed time so the
+ * fixed-timestep accumulator never tries to catch up forever. */
+#define MAX_FRAME_NS  (100 * NS_PER_MS)
+
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  performance — monotonic clock + sleep (the frame-cap helpers)      */
 /* ===================================================================== */
 
 /*
@@ -289,46 +355,7 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
-
-/*
- * color_init() — define color pairs used by the renderer.
- *
- * The entropy gradient (PAIR_ENT_HI → MID → LO) deliberately runs from
- * a calm cool blue at high entropy to a hot orange at low entropy: the
- * cell is "heating up" as its options shrink toward 1. This is the
- * standard simulated-annealing / Boltzmann visual metaphor.
- */
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_TILE,    87,  -1);   /* light cyan (distinct from HINT) */
-        init_pair(PAIR_FLASH,  196,  -1);   /* hot red            */
-        init_pair(PAIR_WAVE,   220,  -1);   /* gold (distinct from HUD)        */
-        init_pair(PAIR_HUD,    226,  -1);   /* bright yellow — reserved        */
-        init_pair(PAIR_HINT,    51,  -1);   /* bright cyan   — reserved        */
-        init_pair(PAIR_BORDER, 240,  -1);   /* mid grey           */
-        init_pair(PAIR_ENT_HI,  27,  -1);   /* deep blue (cool)   */
-        init_pair(PAIR_ENT_MID, 99,  -1);   /* purple             */
-        init_pair(PAIR_ENT_LO, 208,  -1);   /* orange (hot)       */
-    } else {
-        init_pair(PAIR_TILE,    COLOR_WHITE,   -1);
-        init_pair(PAIR_FLASH,   COLOR_RED,     -1);
-        init_pair(PAIR_WAVE,    COLOR_YELLOW,  -1);
-        init_pair(PAIR_HUD,     COLOR_YELLOW,  -1);   /* reserved */
-        init_pair(PAIR_HINT,    COLOR_CYAN,    -1);   /* reserved */
-        init_pair(PAIR_BORDER,  COLOR_WHITE,   -1);
-        init_pair(PAIR_ENT_HI,  COLOR_BLUE,    -1);
-        init_pair(PAIR_ENT_MID, COLOR_MAGENTA, -1);
-        init_pair(PAIR_ENT_LO,  COLOR_GREEN,   -1);
-    }
-}
-
-/* ===================================================================== */
-/* §5  wfc — the Wave Function Collapse algorithm                         */
+/* §3  simulation — WFC core: tiles, compat table, Grid, collapse+propagate */
 /* ===================================================================== */
 
 /*
@@ -347,19 +374,25 @@ static inline int dir_dy(int d) { return (d == DIR_S) ? 1 : (d == DIR_N) ? -1 : 
 static inline int opposite(int d) { return (d + 2) & 3; }
 
 /*
- * Tile — one entry in our 12-element pipe alphabet.
+ * Tile — one entry in the 12-element pipe alphabet: the building block of the
+ * adjacency-tiled WFC (Merrell 2007; see CONCEPTS).  A tile is fully described
+ * by WHERE it connects, so just two fields:
  *
- * `glyph` is a NUL-terminated UTF-8 string; we render via mvaddstr because
- * box-drawing characters (U+2500 block) are multi-byte. ASCII fallbacks
- * are NOT provided — if the user's terminal can't display UTF-8 the
- * lines look wrong but the algorithm still runs.
+ *   glyph   : the 1-char ASCII string drawn for this tile (' ', '-', '|', '+').
+ *             A string, not a char, so it goes out through mvaddstr uniformly.
+ *             All 9 junction tiles share '+' — connectivity is invisible on
+ *             screen but fully tracked in edge[]; colour/animation carry the
+ *             rest (the project's ASCII-only rule, CLAUDE.md).
+ *   edge[d] : 1 if the tile connects on side d, indexed [N, E, S, W].  This is
+ *             the ENTIRE adjacency rule — two tiles a,b may sit across
+ *             direction d iff  a.edge[d] == b.edge[opposite(d)]  (a stub meets
+ *             a stub, or a wall meets a wall).  wfc_build_compat compiles these
+ *             flags into the fast compat[][] lookup the propagator uses.
  *
- * `edge[d]` = 1 if this tile connects on side d. Two tiles match across
- * direction d iff  a.edge[d] == b.edge[opposite(d)].
- *
- * The 12 tiles cover every edge-pattern WHERE the connection count is
- * 0, 2, 3, or 4 — i.e. no single-stub "dead ends". This guarantees a
- * fully connected pipe network with no dangling lines.
+ * WHY exactly these 12: they are every edge-pattern with connection count
+ * 0, 2, 3, or 4 — i.e. every tile that is NOT a single dangling stub (count 1
+ * is deliberately excluded).  Banning dead-ends is what guarantees the
+ * collapsed result is a fully-connected pipe network with no loose ends.
  */
 typedef struct {
     const char *glyph;
@@ -432,19 +465,56 @@ static inline int popcount16(uint16_t m)
     return c;
 }
 
+/* nth_set_tile — index of the n'th (0-based) set bit in `mask`, i.e. the n'th
+ * still-possible tile.  Used to turn a uniform random draw into a tile choice. */
+static int nth_set_tile(uint16_t mask, int n)
+{
+    for (int t = 0; t < N_TILES; t++) {
+        if (mask & (1u << t)) {
+            if (n == 0) return t;
+            n--;
+        }
+    }
+    return -1;   /* unreachable when n < popcount(mask) */
+}
+
+/* allowed_in_dir — the arc-consistency core (AC-3): given a cell whose options
+ * are `mask`, the set of tiles a neighbour in direction d could legally be is
+ * the union of compat[t][d] over every tile t still possible here.
+ *   allowed[d] = ⋃ over t ∈ mask of compat[t][d]   (KEY FORMULAS) */
+static uint16_t allowed_in_dir(uint16_t mask, int d)
+{
+    uint16_t allowed = 0;
+    while (mask) {
+        int t = __builtin_ctz(mask);   /* index of lowest set bit */
+        allowed |= compat[t][d];
+        mask &= (uint16_t)(mask - 1);
+    }
+    return allowed;
+}
+
 /*
- * Grid — the simulation heart.
+ * Grid — the WFC working state: the "wave" (Gumin 2016) plus the machinery that
+ * collapses it.  Each cell's `mask` is its SUPERPOSITION — a bitmask of the
+ * tiles still possible there (bit i set ⇒ tile i still allowed); popcount(mask)
+ * is the cell's entropy.  The algorithm only ever CLEARS bits, never sets them
+ * — this monotone shrinking is what guarantees WFC terminates.
  *
- * Stored as 1-D arrays addressed by  idx = y*w + x.  Two pieces of
- * persistent state per cell:
- *   mask          — uint16_t bitmask of remaining tile options
+ * Stored as 1-D arrays addressed by  idx = y*w + x.  Per-cell state:
+ *   mask          — uint16_t bitmask of remaining tile options (the wave)
  *   collapse_glow — float [0..1] painting the cell red, decays each frame
  *   prop_glow     — float [0..1] painting the cell yellow, decays
+ * (collapse_glow/prop_glow are the EFFECTS layer — cosmetic only; they ride on
+ *  the grid because they are per-cell and share `mask`'s index, and never feed
+ *  back into the algorithm.)
  *
- * Plus a propagation queue: cell IDs scheduled for outward update.
- * A queued cell may already have been processed since enqueue (its
- * neighbours might re-enqueue it); we re-process and that's harmless,
- * because tightening a mask is idempotent.
+ * Plus a propagation queue (queue/in_queue/qhead/qtail): the BFS frontier of
+ * cells whose shrink still has to ripple outward — this is arc-consistency
+ * (Mackworth 1977, AC-3) made concrete.  A queued cell may already have been
+ * processed since enqueue (its neighbours might re-enqueue it); re-processing
+ * is harmless because tightening a mask is idempotent.  in_queue[] caps the
+ * queue at one entry per cell (without it, a cell could be queued up to
+ * N_TILES-1 times and overflow a total_cells-sized buffer).
  *
  * `done` becomes true once every cell has popcount=1.
  * `bad`  becomes true if any cell mask is 0 (contradiction — no tile
@@ -537,13 +607,13 @@ static int grid_pick_min_entropy(const Grid *g)
     int n_cells  = g->total_cells;
 
     for (int i = 0; i < n_cells; i++) {
-        int p = popcount16(g->mask[i]);
-        if (p <= 1) continue;            /* skip collapsed and contradicted */
-        if (p < best_n) {
-            best_n = p;
+        int entropy = popcount16(g->mask[i]);   /* options left = entropy */
+        if (entropy <= 1) continue;             /* skip collapsed and contradicted */
+        if (entropy < best_n) {
+            best_n = entropy;
             chosen = i;
             tied   = 1;
-        } else if (p == best_n) {
+        } else if (entropy == best_n) {
             /* Reservoir sampling: keep `chosen` with probability 1/(tied+1). */
             tied++;
             if ((rand() % tied) == 0) chosen = i;
@@ -570,38 +640,46 @@ static void grid_collapse_cell(Grid *g, int idx)
     int n = popcount16(m);
     if (n <= 1) return;
 
-    int pick = rand() % n;
+    int chosen_tile = nth_set_tile(m, rand() % n);   /* uniform pick among options */
 
-    /* Walk the bits to find the pick'th one. */
-    int chosen_tile = -1;
-    for (int t = 0; t < N_TILES; t++) {
-        if (m & (1u << t)) {
-            if (pick == 0) { chosen_tile = t; break; }
-            pick--;
-        }
-    }
-    g->mask[idx] = (uint16_t)(1u << chosen_tile);
-    g->collapse_glow[idx] = 1.0f;
+    g->mask[idx] = (uint16_t)(1u << chosen_tile);    /* mask → a single tile */
+    g->collapse_glow[idx] = 1.0f;                    /* EFFECTS: red flash */
     g->collapsed_count++;
-    grid_enqueue(g, idx);
+    grid_enqueue(g, idx);                            /* schedule its neighbours */
 }
 
 /*
- * grid_propagate_one() — pop ONE cell from the queue and tighten its
- * four neighbours.
- *
- * For each direction d:
- *   1. allowed = OR over set bits t of compat[t][d]
- *      = "tiles a neighbour in direction d could possibly be"
- *   2. new = neighbour.mask & allowed
- *      = intersect with what the neighbour ALREADY allowed
- *   3. if changed: write back, paint prop_glow, push neighbour
- *      onto the queue so the constraint propagates further
- *
- * We process exactly ONE pop per call. The caller can loop to drain
- * faster; this granularity is what makes the wavefront visible.
- *
- * Returns true if any work happened (queue had something).
+ * tighten_neighbour() — apply arc-consistency to ONE neighbour: intersect its
+ * options with what `my_mask` permits across direction d.  If it shrank, paint
+ * the wavefront, record the effect (contradiction / implicit collapse), and
+ * re-enqueue it so the constraint keeps propagating.
+ */
+static void tighten_neighbour(Grid *g, int nidx, uint16_t my_mask, int d)
+{
+    uint16_t before = g->mask[nidx];
+    uint16_t after  = before & allowed_in_dir(my_mask, d);
+    if (after == before) return;            /* neighbour unaffected */
+
+    g->mask[nidx] = after;
+    g->prop_glow[nidx] = 1.0f;              /* EFFECTS: paint the wavefront */
+
+    if (after == 0) {
+        /* Contradiction — no tile fits. Flag it; the app refuses further
+         * ops until the user presses 'r'. */
+        g->bad = true;
+    } else if (popcount16(after) == 1 && popcount16(before) > 1) {
+        /* Neighbour "collapsed itself" by elimination. Count it but DON'T
+         * flash the red collapse glow — that's reserved for the deliberate
+         * min-entropy pick, so the user can tell intentional from cascade. */
+        g->collapsed_count++;
+    }
+    grid_enqueue(g, nidx);
+}
+
+/*
+ * grid_propagate_one() — pop ONE cell off the queue and tighten its four
+ * neighbours.  Exactly one pop per call: that granularity is what makes the
+ * wavefront visible.  Returns true if the queue had work.
  */
 static bool grid_propagate_one(Grid *g)
 {
@@ -609,44 +687,15 @@ static bool grid_propagate_one(Grid *g)
 
     int idx = g->queue[g->qhead++];
     g->in_queue[idx] = false;
-    int x = idx % g->w;
+    int x = idx % g->w;                     /* unpack flat cell index */
     int y = idx / g->w;
     uint16_t my_mask = g->mask[idx];
 
-    /* Pre-compute "what can my d-neighbour be?" for each direction. */
     for (int d = 0; d < N_DIRS; d++) {
         int nx = x + dir_dx(d);
         int ny = y + dir_dy(d);
         if (!grid_in_bounds(g, nx, ny)) continue;
-        int nidx = grid_idx(g, nx, ny);
-
-        uint16_t allowed = 0;
-        uint16_t m = my_mask;
-        while (m) {
-            int t = __builtin_ctz(m);   /* index of lowest set bit */
-            allowed |= compat[t][d];
-            m &= (uint16_t)(m - 1);
-        }
-
-        uint16_t before = g->mask[nidx];
-        uint16_t after  = before & allowed;
-        if (after != before) {
-            g->mask[nidx] = after;
-            g->prop_glow[nidx] = 1.0f;
-            if (after == 0) {
-                /* Contradiction — no tile fits. Algorithm has hit a
-                 * dead end. We flag it; the app loop will pause input
-                 * and the user can press 'r' to start over. */
-                g->bad = true;
-            } else if (popcount16(after) == 1 && popcount16(before) > 1) {
-                /* Neighbour "collapsed itself" by elimination. Count it
-                 * but don't flash the red collapse glow — that's reserved
-                 * for the deliberate min-entropy pick, so the user can
-                 * tell intentional collapses from cascade collapses. */
-                g->collapsed_count++;
-            }
-            grid_enqueue(g, nidx);
-        }
+        tighten_neighbour(g, grid_idx(g, nx, ny), my_mask, d);
     }
     return true;
 }
@@ -673,31 +722,31 @@ static bool grid_step(Grid *g)
 }
 
 /* ===================================================================== */
-/* §6  scene                                                              */
+/* §4  simulation — scene & the ONE per-tick combine (glow decay + ops)   */
 /* ===================================================================== */
 
 /*
- * Scene wraps the Grid plus user-facing modes:
- *
- *   auto         — true: keep stepping every tick. false: only on 's'.
- *   paused       — frozen if true; 's' still single-steps.
- *   show_entropy — true: uncollapsed cells render as digits.
- *                  false: uncollapsed cells render as blank space.
- *   ops_per_tick — how many grid_step() calls per scene_tick.
- *                  Higher = faster but the wave blurs together.
- *   step_request — set true by the 's' key; consumed by next tick.
+ * Scene — the running showcase, read top-to-bottom as a table of contents.
+ * Grouped by concept, NOT by which key changes them:
+ *   WHAT   — g: the Grid being collapsed (the simulation proper).
+ *   HOW    — auto_run (step every tick vs only on 's'), paused (freeze),
+ *            ops_per_tick (grid_step calls per tick — faster but the wave
+ *            blurs), step_request (one extra op, set by 's', consumed next tick).
+ *   RENDER — show_entropy: digits vs blank for uncollapsed cells.  A display
+ *            toggle, so it is grouped apart from the sim knobs even though a
+ *            key drives it.
+ *   STATS  — total_collapses / total_propagations: cumulative HUD read-outs,
+ *            reset on scene_reset; never steer the algorithm.
  */
 typedef struct {
-    Grid   g;
-    bool   auto_run;
-    bool   paused;
-    bool   show_entropy;
-    int    ops_per_tick;
-    bool   step_request;
-
-    /* Cumulative counters for HUD — reset on grid_reset. */
-    long   total_collapses;
-    long   total_propagations;
+    Grid   g;              /* WHAT:   the grid of superpositions          */
+    bool   auto_run;       /* HOW:    keep stepping vs single-step on 's'  */
+    bool   paused;         /* HOW:    freeze the tick                      */
+    bool   show_entropy;   /* RENDER: show option counts vs blank         */
+    int    ops_per_tick;   /* HOW:    grid_step calls per tick            */
+    bool   step_request;   /* HOW:    one extra op, set by 's'            */
+    long   total_collapses;     /* STATS: HUD read-out                    */
+    long   total_propagations;  /* STATS: HUD read-out                    */
 } Scene;
 
 static void scene_reset(Scene *s, int gw, int gh)
@@ -727,16 +776,21 @@ static void scene_init(Scene *s, int gw, int gh)
  * tick lands on a freshly-decayed buffer and shows up at full intensity
  * for one frame, the way a flash should look.
  */
+/* EFFECTS: fade both per-cell glow buffers toward 0 this tick.  exp(-rate*dt)
+ * is the textbook RC-circuit decay; computed directly since dt is small. */
+static void decay_glows(Grid *g, float dt)
+{
+    float decay = expf(-GLOW_DECAY_RATE * dt);
+    int n = g->total_cells;
+    for (int i = 0; i < n; i++) {
+        g->collapse_glow[i] *= decay;
+        g->prop_glow[i]     *= decay;
+    }
+}
+
 static void scene_tick(Scene *s, float dt)
 {
-    /* Decay glows. exp(-rate*dt) is the textbook RC-circuit decay; we
-     * just compute it directly because dt is small and bounded. */
-    float decay = expf(-GLOW_DECAY_RATE * dt);
-    int n = s->g.total_cells;
-    for (int i = 0; i < n; i++) {
-        s->g.collapse_glow[i] *= decay;
-        s->g.prop_glow[i]     *= decay;
-    }
+    decay_glows(&s->g, dt);          /* EFFECTS: fade flashes before new ops */
 
     int ops = 0;
     if (!s->paused && s->auto_run) ops = s->ops_per_tick;
@@ -751,22 +805,60 @@ static void scene_tick(Scene *s, float dt)
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §5  render — palette, entropy heatmap, ASCII pipe grid, HUD            */
 /* ===================================================================== */
 
 /*
- * Screen — the ncurses display layer.
+ * color_init() — define color pairs used by the renderer.
  *
- * Same canonical pattern as framework.c §7:
- *   erase → scene_draw → HUD → wnoutrefresh(stdscr) → doupdate
+ * The entropy gradient (PAIR_ENT_HI → MID → LO) deliberately runs from
+ * a calm cool blue at high entropy to a hot orange at low entropy: the
+ * cell is "heating up" as its options shrink toward 1. This is the
+ * standard simulated-annealing / Boltzmann visual metaphor.
+ */
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    if (COLORS >= 256) {
+        init_pair(PAIR_TILE,    87,  -1);   /* light cyan (distinct from HINT) */
+        init_pair(PAIR_FLASH,  196,  -1);   /* hot red            */
+        init_pair(PAIR_WAVE,   220,  -1);   /* gold (distinct from HUD)        */
+        init_pair(PAIR_HUD,    226,  -1);   /* bright yellow — reserved        */
+        init_pair(PAIR_HINT,    51,  -1);   /* bright cyan   — reserved        */
+        init_pair(PAIR_BORDER, 240,  -1);   /* mid grey           */
+        init_pair(PAIR_ENT_HI,  27,  -1);   /* deep blue (cool)   */
+        init_pair(PAIR_ENT_MID, 99,  -1);   /* purple             */
+        init_pair(PAIR_ENT_LO, 208,  -1);   /* orange (hot)       */
+    } else {
+        init_pair(PAIR_TILE,    COLOR_WHITE,   -1);
+        init_pair(PAIR_FLASH,   COLOR_RED,     -1);
+        init_pair(PAIR_WAVE,    COLOR_YELLOW,  -1);
+        init_pair(PAIR_HUD,     COLOR_YELLOW,  -1);   /* reserved */
+        init_pair(PAIR_HINT,    COLOR_CYAN,    -1);   /* reserved */
+        init_pair(PAIR_BORDER,  COLOR_WHITE,   -1);
+        init_pair(PAIR_ENT_HI,  COLOR_BLUE,    -1);
+        init_pair(PAIR_ENT_MID, COLOR_MAGENTA, -1);
+        init_pair(PAIR_ENT_LO,  COLOR_GREEN,   -1);
+    }
+}
+
+/*
+ * Screen — the terminal viewport: its current size in cells.  A render-target
+ * concept kept as its own narrow type so the §5 functions take Screen* alone
+ * and never reach for the whole App (keeps render decoupled from app/sim).
  *
- * The grid is drawn with a 1-cell margin from the edges, framed by a
- * dim border, with the HUD on top and key hints at the bottom.
+ * The canonical per-frame pattern (framework.c §7):
+ *   erase → scene_draw → HUD → wnoutrefresh(stdscr) → doupdate.
+ * The grid is centred with a 1-cell margin, framed by a dim ASCII border, HUD
+ * on top, key hints at the bottom.
  *
- * UTF-8 rendering: the box-drawing tile glyphs are multi-byte UTF-8
- * strings. We use mvaddstr(y, x, glyph) (not mvaddch — that takes a
- * single 8-bit chtype). setlocale(LC_ALL,"") in screen_init activates
- * the user's UTF-8 locale so the bytes pass through unmangled.
+ * Glyphs go out via mvaddstr (a string, uniform across tiles) rather than
+ * mvaddch.  setlocale(LC_ALL,"") in screen_init keeps output byte-safe; the
+ * current tile alphabet is ASCII (see Tile), so this is belt-and-braces.
+ *
+ *   cols, rows : the terminal dimensions, refreshed on resize; used to centre
+ *                the grid and place the HUD rows.
  */
 typedef struct {
     int cols, rows;
@@ -774,9 +866,9 @@ typedef struct {
 
 static void screen_init(Screen *s)
 {
-    /* CRITICAL — without this, mvaddstr emits raw bytes the terminal
-     * may interpret as Latin-1 and you get "â” â" garbage. Activates
-     * whatever LC_ALL/LANG the user has set (typically en_US.UTF-8). */
+    /* Activate the user's locale.  The tile alphabet is ASCII (see Tile), so
+     * this is belt-and-braces today; it keeps mvaddstr output byte-safe should
+     * a future alphabet use multi-byte glyphs. */
     setlocale(LC_ALL, "");
 
     initscr();
@@ -831,75 +923,53 @@ static int entropy_color_pair(int p)
 }
 
 /*
- * scene_draw() — render the grid + glows + tiles into stdscr.
- *
- * The grid is centered with a dim ASCII border (+ - |). For each cell:
- *
- *   if collapse_glow > threshold    → bright red, draw entropy digit
- *                                     (or the tile glyph if collapsed)
- *   else if prop_glow > threshold   → bright yellow, same
- *   else if collapsed (popcount=1)  → cyan, tile glyph
- *   else if show_entropy            → entropy-graded color, digit
- *   else                            → space
- *
- * Note we deliberately DRAW the new glyph even for the propagation
- * wave so the user sees the option count change in real time.
+ * scene_draw_border() — frame the grid with a dim ASCII border (+ - |),
+ * drawn just outside the cell area and clipped to the screen.
  */
-static void scene_draw(const Scene *s, int cols, int rows)
+static void scene_draw_border(int gx0, int gy0, int gw, int gh, int cols, int rows)
+{
+    attron(COLOR_PAIR(PAIR_BORDER) | A_DIM);
+    for (int x = -1; x <= gw; x++) {
+        if (gx0 + x >= 0 && gx0 + x < cols) {
+            if (gy0 - 1 >= 0)       mvaddch(gy0 - 1,  gx0 + x, '-');
+            if (gy0 + gh < rows)    mvaddch(gy0 + gh, gx0 + x, '-');
+        }
+    }
+    for (int y = 0; y < gh; y++) {
+        if (gy0 + y >= 0 && gy0 + y < rows) {
+            if (gx0 - 1 >= 0)       mvaddch(gy0 + y, gx0 - 1,  '|');
+            if (gx0 + gw < cols)    mvaddch(gy0 + y, gx0 + gw, '|');
+        }
+    }
+    if (gx0 - 1 >= 0 && gy0 - 1 >= 0)        mvaddch(gy0 - 1,  gx0 - 1,  '+');
+    if (gx0 + gw < cols && gy0 - 1 >= 0)     mvaddch(gy0 - 1,  gx0 + gw, '+');
+    if (gx0 - 1 >= 0 && gy0 + gh < rows)     mvaddch(gy0 + gh, gx0 - 1,  '+');
+    if (gx0 + gw < cols && gy0 + gh < rows)  mvaddch(gy0 + gh, gx0 + gw, '+');
+    attroff(COLOR_PAIR(PAIR_BORDER) | A_DIM);
+}
+
+/*
+ * draw_cell() — paint one cell at screen (sy,sx).  Colour priority is
+ * flash > wave > collapsed > entropy-heatmap; glyph is the tile (if
+ * collapsed) else the entropy digit (if shown or flashing) else blank.
+ * We deliberately draw the digit under the wave so the option count is
+ * visible changing in real time.
+ */
+static void draw_cell(const Scene *s, int idx, int sy, int sx)
 {
     const Grid *g = &s->g;
+    uint16_t  m   = g->mask[idx];
+    int       p   = popcount16(m);
+    float     cg  = g->collapse_glow[idx];
+    float     pg  = g->prop_glow[idx];
+    bool      collapsed = (p == 1);
 
-    /* Center the grid; account for 1-cell border on each side and HUD. */
-    int gx0 = (cols - g->w) / 2;
-    int gy0 = (rows - g->h) / 2;
-    if (gx0 < 1) gx0 = 1;
-    if (gy0 < 1) gy0 = 1;
-
-    /* ── border ─────────────────────────────────────────────────────── */
-    attron(COLOR_PAIR(PAIR_BORDER) | A_DIM);
-    for (int x = -1; x <= g->w; x++) {
-        if (gx0 + x >= 0 && gx0 + x < cols) {
-            if (gy0 - 1 >= 0)         mvaddch(gy0 - 1,    gx0 + x, '-');
-            if (gy0 + g->h < rows)    mvaddch(gy0 + g->h, gx0 + x, '-');
-        }
-    }
-    for (int y = 0; y < g->h; y++) {
-        if (gy0 + y >= 0 && gy0 + y < rows) {
-            if (gx0 - 1 >= 0)         mvaddch(gy0 + y, gx0 - 1, '|');
-            if (gx0 + g->w < cols)    mvaddch(gy0 + y, gx0 + g->w, '|');
-        }
-    }
-    if (gx0 - 1 >= 0 && gy0 - 1 >= 0)
-        mvaddch(gy0 - 1, gx0 - 1, '+');
-    if (gx0 + g->w < cols && gy0 - 1 >= 0)
-        mvaddch(gy0 - 1, gx0 + g->w, '+');
-    if (gx0 - 1 >= 0 && gy0 + g->h < rows)
-        mvaddch(gy0 + g->h, gx0 - 1, '+');
-    if (gx0 + g->w < cols && gy0 + g->h < rows)
-        mvaddch(gy0 + g->h, gx0 + g->w, '+');
-    attroff(COLOR_PAIR(PAIR_BORDER) | A_DIM);
-
-    /* ── cells ──────────────────────────────────────────────────────── */
-    for (int y = 0; y < g->h; y++) {
-        int sy = gy0 + y;
-        if (sy < 0 || sy >= rows) continue;
-        for (int x = 0; x < g->w; x++) {
-            int sx = gx0 + x;
-            if (sx < 0 || sx >= cols) continue;
-
-            int       idx = grid_idx(g, x, y);
-            uint16_t  m   = g->mask[idx];
-            int       p   = popcount16(m);
-            float     cg  = g->collapse_glow[idx];
-            float     pg  = g->prop_glow[idx];
-            bool      collapsed = (p == 1);
-
-            /* Decide the foreground colour (priority: flash > wave > base). */
-            int color_pair;
-            int attr = A_NORMAL;
-            if (cg > GLOW_FLASH_THRESHOLD) {
-                color_pair = PAIR_FLASH;
-                attr = A_BOLD;
+    /* Decide the foreground colour (priority: flash > wave > base). */
+    int color_pair;
+    int attr = A_NORMAL;
+    if (cg > GLOW_FLASH_THRESHOLD) {
+        color_pair = PAIR_FLASH;
+        attr = A_BOLD;
             } else if (pg > GLOW_FLASH_THRESHOLD) {
                 color_pair = PAIR_WAVE;
                 attr = A_BOLD;
@@ -910,39 +980,69 @@ static void scene_draw(const Scene *s, int cols, int rows)
                 attr = A_DIM;
             }
 
-            /* Decide the glyph. */
-            attron(COLOR_PAIR(color_pair) | attr);
-            if (collapsed) {
-                int t = __builtin_ctz(m);
-                mvaddstr(sy, sx, tiles[t].glyph);
-            } else if (s->show_entropy || cg > GLOW_FLASH_THRESHOLD
-                                       || pg > GLOW_FLASH_THRESHOLD) {
-                mvaddch(sy, sx, (chtype)(unsigned char)entropy_glyph(p));
-            } else {
-                mvaddch(sy, sx, ' ');
-            }
-            attroff(COLOR_PAIR(color_pair) | attr);
+    /* Decide the glyph. */
+    attron(COLOR_PAIR(color_pair) | attr);
+    if (collapsed) {
+        int t = __builtin_ctz(m);
+        mvaddstr(sy, sx, tiles[t].glyph);
+    } else if (s->show_entropy || cg > GLOW_FLASH_THRESHOLD
+                               || pg > GLOW_FLASH_THRESHOLD) {
+        mvaddch(sy, sx, (chtype)(unsigned char)entropy_glyph(p));
+    } else {
+        mvaddch(sy, sx, ' ');
+    }
+    attroff(COLOR_PAIR(color_pair) | attr);
+}
+
+/*
+ * scene_draw() — render the framed grid.  Centre it, draw the border, then
+ * draw every on-screen cell.
+ */
+static void scene_draw(const Scene *s, int cols, int rows)
+{
+    const Grid *g = &s->g;
+
+    /* Centre the grid, leaving room for the 1-cell border + HUD rows. */
+    int gx0 = (cols - g->w) / 2;
+    int gy0 = (rows - g->h) / 2;
+    if (gx0 < 1) gx0 = 1;
+    if (gy0 < 1) gy0 = 1;
+
+    scene_draw_border(gx0, gy0, g->w, g->h, cols, rows);
+
+    for (int y = 0; y < g->h; y++) {
+        int sy = gy0 + y;
+        if (sy < 0 || sy >= rows) continue;
+        for (int x = 0; x < g->w; x++) {
+            int sx = gx0 + x;
+            if (sx < 0 || sx >= cols) continue;
+            draw_cell(s, grid_idx(g, x, y), sy, sx);
         }
     }
+}
+
+/* mode_label() — the current run state as a fixed-width HUD label. */
+static const char *mode_label(const Scene *s)
+{
+    if (s->g.bad)    return "CONTRADICTION";
+    if (s->g.done)   return "DONE         ";
+    if (s->paused)   return "PAUSED       ";
+    if (s->auto_run) return "AUTO         ";
+    return                  "STEP         ";
 }
 
 /*
  * screen_draw() — one full frame: erase, scene, HUD, hint strip.
  * Called once per render. No flush yet — that's screen_present().
  */
-static void screen_draw(Screen *sc, const Scene *s,
+static void screen_draw(const Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
     erase();
     scene_draw(s, sc->cols, sc->rows);
 
     const Grid *g = &s->g;
-    const char *mode_str =
-        g->bad         ? "CONTRADICTION" :
-        g->done        ? "DONE         " :
-        s->paused      ? "PAUSED       " :
-        s->auto_run    ? "AUTO         " :
-                         "STEP         ";
+    const char *mode_str = mode_label(s);
 
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
@@ -971,16 +1071,27 @@ static void screen_draw(Screen *sc, const Scene *s,
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §6  app — signals, key/resize events, fixed-timestep main loop         */
 /* ===================================================================== */
 
+/*
+ * App — the running program: the Scene being animated, the terminal it draws
+ * to, and the loop/lifecycle state that is neither simulation nor render.
+ * Kept distinct from Scene so the render layer can take Screen* alone, and so
+ * the signal handler can reach the run flags via the single g_app instance.
+ *   DOMAIN    — scene + screen: the simulation and its draw target.
+ *   PACING    — sim_fps: fixed-timestep rate (the [ / ] knob).
+ *   GEOMETRY  — grid_w/grid_h: chosen grid size, re-fit to the terminal on
+ *               resize (clamped to GRID_*_MAX so the queue can't overflow).
+ *   LIFECYCLE — running/need_resize: signal-written flags (sig_atomic_t).
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    int                   grid_w, grid_h;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene                 scene;        /* DOMAIN:    the simulation       */
+    Screen                screen;       /* DOMAIN:    its draw target      */
+    int                   sim_fps;      /* PACING:    fixed-timestep rate  */
+    int                   grid_w, grid_h; /* GEOMETRY: chosen grid size    */
+    volatile sig_atomic_t running;      /* LIFECYCLE: clear to exit        */
+    volatile sig_atomic_t need_resize;  /* LIFECYCLE: set by SIGWINCH      */
 } App;
 
 static App g_app;
@@ -1108,7 +1219,7 @@ int main(void)
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        if (dt > MAX_FRAME_NS) dt = MAX_FRAME_NS;   /* spiral-of-death guard */
 
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
@@ -1129,7 +1240,7 @@ int main(void)
         }
 
         int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+        clock_sleep_ns(TICK_NS(RENDER_CAP_FPS) - elapsed);
 
         screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
         screen_present();
@@ -1143,5 +1254,5 @@ int main(void)
     return 0;
 }
 
-/* ── end §8 — to see this same algorithm scaled up for spectacle,
+/* ── end §6 — to see this same algorithm scaled up for spectacle,
  *   read wfc_showcase.c (next file in this folder). ── */

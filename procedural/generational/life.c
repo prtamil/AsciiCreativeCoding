@@ -12,19 +12,21 @@
  *   Morley    B368/S245   — chaotic; moving structures
  *   2×2       B36/S125    — tiles of 2×2 blocks grow and divide
  *
- * Seeding:  r random · g glider · G Gosper gun · p R-pentomino · a acorn
+ * Seeding:  r random · g glider · G Gosper gun · e R-pentomino · a acorn
  *
  * Layout:
- *   Rows 0 … n-5   — grid (toroidal)
+ *   Row  0         — data HUD (rule, preset index, generation, speed)
+ *   Rows 1 … n-5   — grid (toroidal)
  *   Rows n-4 … n-2 — scrolling population histogram (3 rows, bar chart)
- *   Row  n-1       — HUD
+ *   Row  n-1       — action HUD (key hints)
  *
  * Keys:
  *   n / p       next / previous rule
+ *   t / T       next / previous colour theme (live cells coloured by crowding)
  *   r           random seed (~30 % density)
  *   g           single glider at centre
  *   G           Gosper glider gun
- *   p           R-pentomino
+ *   e           R-pentomino
  *   a           Acorn
  *   + / =       more steps per frame
  *   - / _       fewer steps per frame
@@ -32,10 +34,10 @@
  *   q / Q       quit
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/life.c -o life -lncurses
+ *   gcc -std=c11 -O2 -Wall -Wextra procedural/generational/life.c -o life -lncurses
  *
- * Sections: §1 config  §2 clock  §3 color  §4 grid  §5 scene
- *           §6 screen  §7 app
+ * Sections: §1 config+types  §2 performance  §3 logic
+ *           §4 simulation  §5 render  §6 app
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -54,11 +56,33 @@
  *
  * Data-structure : Population histogram ring buffer — last HIST_LEN
  *                  generation counts stored; drawn as a 3-row bar chart
- *                  using a 4-level block character ramp (▁▂▄█).
+ *                  of '#' (filled) / '.' (empty) cells, taller = busier.
  *
  * Performance    : Per-step cost: O(rows × cols) neighbour-count evaluation.
- *                  Steps per frame adjustable (1–16) to allow fast-forward
+ *                  Steps per frame adjustable (1–STEPS_MAX) to allow fast-fwd
  *                  to interesting evolved states (e.g., Gosper gun period 30).
+ *
+ * References     : Concept —
+ *                  [1] Gardner, "Mathematical Games: …Conway's new solitaire
+ *                      game 'life'", Scientific American 223, Oct 1970.
+ *                      The origin; first published the B3/S23 rule.
+ *                  [2] Berlekamp, Conway & Guy, "Winning Ways for Your
+ *                      Mathematical Plays", vol. 4, 2nd ed. 2004 — Life's
+ *                      theory, oscillators/spaceships, Turing-completeness.
+ *                  [3] LifeWiki — conwaylife.com/wiki.  Catalogue of the
+ *                      patterns seeded here: glider, Gosper glider gun,
+ *                      R-pentomino, Acorn (both famous methuselahs).
+ *                  [4] "Life-like cellular automaton" (LifeWiki) + Eppstein,
+ *                      "Growth and Decay in Life-Like CAs", 2010 — the B/S
+ *                      rule family: HighLife, Day&Night, Seeds, Morley, 2x2.
+ *                  [5] Wolfram, "A New Kind of Science", 2002 — CA rule
+ *                      space and how local rules yield global complexity.
+ *                  Rendering —
+ *                  [6] Padala, "NCURSES Programming HOWTO", TLDP.
+ *                      Colour pairs, erase/refresh, non-blocking input.
+ *                  [7] Bourke, "Colour Ramping for Data Visualisation",
+ *                      paulbourke.net/texture_colour/colourramp — mapping a
+ *                      scalar (here: neighbour count) onto a colour ramp.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -96,15 +120,16 @@
  *        cur ? (survive & bit) ? 1 : 0
  *            : (birth   & bit) ? 1 : 0;
  *     Write into the OTHER board.
- *  4. Swap boards (`g_buf = 1 - g_buf`); increment generation; record
- *     population in the ring history buffer.
- *  5. Repeat steps 2-4 `g_steps` times per frame for fast-forward.
- *  6. Render: draw '#' for live cells (top g_ca_rows rows), draw the
- *     scrolling population histogram (3 rows), HUD on bottom row.
+ *  4. Swap boards (`board.buf = 1 - board.buf`); increment board.gen;
+ *     record population into the history ring (history_record).
+ *  5. Repeat steps 2-4 `scene.steps` times per frame for fast-forward.
+ *  6. Render: draw live cells coloured by neighbour count (board.h rows
+ *     under the data HUD), draw the scrolling population histogram (3
+ *     rows), data HUD on row 0 and action HUD on the bottom row.
  *
  * KEY FORMULAS
  * ────────────
- *  n = sum over 8 neighbours of g_grid[buf][r±1 mod R][c±1 mod C]
+ *  n = sum over 8 neighbours of board.cells[buf][r±1 mod R][c±1 mod C]
  *                                                   neighbour count 0..8
  *  bit = 1u << n                                    9-bit position flag
  *  next = cur ? (S & bit) != 0
@@ -125,12 +150,12 @@
  *    explosions survive.  Looks like everything is broken until you
  *    see the rule name.
  *  • Gosper gun period — the canonical pattern emits one glider every
- *    30 ticks.  At g_steps=3 you see a glider every 10 frames; at
- *    g_steps=30 you see one every frame.
+ *    30 ticks.  At scene.steps=3 you see a glider every 10 frames; at
+ *    scene.steps=30 you see one every frame.
  *  • Steps-per-frame * grid size — at MAX_COLS=320, MAX_ROWS=128, and
  *    STEPS_MAX=30, that's ~1.2M cell updates/frame.  Still well under
- *    16ms on modern CPUs but watch the histogram ring buffer width
- *    matches g_cols, not HIST_LEN.
+ *    16ms on modern CPUs.  The histogram walks board.w columns of the
+ *    ring (HIST_LEN samples), so board.w must stay ≤ HIST_LEN.
  *
  * HOW TO VERIFY
  * ─────────────
@@ -149,6 +174,36 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
+ *
+ * All data hangs off one Scene (§1), but functions take the NARROWEST type
+ * they need, so aggregating on Scene never re-couples the layers:
+ *
+ *   Layer        Section  Takes                          Mutates
+ *   ─────────────────────────────────────────────────────────────────────
+ *   PERFORMANCE  §2       (scalars)                      nothing — time / sleep
+ *   LOGIC        §3       const Board* / count list      NOTHING — pure, no I/O
+ *   SIMULATION   §4       Board*, const Rule*, Scene*    Board (cells/buf/gen)
+ *   RENDER       §5       const Board/History/Scene*     the terminal only
+ *   APP          §6       Scene*                         Scene; drives the above
+ *
+ *   EFFECTS — the PopulationHistory ring buffer (Scene.history): cosmetic
+ *             state read only by draw_histogram (§5).  No logic of its own —
+ *             scene_tick records one sample per step as the board advances.
+ *   DELAYS  — trivial: 'space' toggles Scene.paused (a flag the tick reads);
+ *             the only wait is the fixed-timestep frame cap (§2 / TICK_NS).
+ *
+ * PER-TICK COMBINE — one place advances state (§6 main), in order:
+ *     1. SIMULATION : scene_tick()  — board_step() × steps, recording each
+ *                     step's population into the EFFECTS history
+ *     2. RENDER     : scene_draw()  — draw_board → draw_histogram → draw_hud
+ *     3. PERFORMANCE: sleep until the next TICK_NS boundary
+ *
+ * USER EVENTS are NOT the tick: keys and resize mutate Scene directly in §6
+ * (reseeding via the seed_* resets, rebuilding colours, refitting the board)
+ * but none of them call scene_tick()/board_step().
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>
@@ -158,44 +213,132 @@
 #include <signal.h>
 #include <time.h>
 
-/* ── §1 config ───────────────────────────────────────────────────────── */
+/* ── §1 config + types   (the ONLY place data is declared) ────────────── */
 
 #define TICK_NS     33333333LL
 #define MAX_ROWS    128
 #define MAX_COLS    320
 #define HIST_LEN    512    /* population history ring buffer length        */
 #define HIST_ROWS   3      /* screen rows used by histogram                */
+#define HUD_TOP     1      /* row 0: data HUD                              */
+#define HUD_BOT     1      /* bottom row: action HUD                       */
 #define STEPS_DEF   3
 #define STEPS_MAX   30
 #define LIVE_CHAR   '#'
+#define RAMP_LEN    9      /* live-cell colour ramp = one tier per neighbour count 0..8 */
 
-enum { CP_LIVE=1, CP_HIST, CP_HUD };
+/* ncurses colour-pair IDs.  CP_RAMP..CP_RAMP+8 are the live-cell ramp,
+ * indexed by neighbour count (assigned per theme in color_apply); CP_HIST is
+ * the histogram, CP_HUD/CP_HINT the two HUD rows.  Numbered from 1 because
+ * ncurses reserves pair 0 for the terminal's default colours. */
+enum {
+    CP_RAMP = 1,                   /* ramp occupies CP_RAMP .. CP_RAMP+RAMP_LEN-1 */
+    CP_HIST = CP_RAMP + RAMP_LEN,  /* pairs after the ramp                        */
+    CP_HUD,
+    CP_HINT
+};
 
-/* B/S rule encoded as bitmasks (bit N = "when count equals N") */
-#define B(...)  rule_mask((int[]){__VA_ARGS__}, \
-                          sizeof((int[]){__VA_ARGS__})/sizeof(int))
-static uint16_t rule_mask(const int *ns, int len)
-{
-    uint16_t m = 0;
-    for (int i = 0; i < len; i++) m |= (uint16_t)(1u << ns[i]);
-    return m;
-}
-
+/* Rule — a "life-like" cellular-automaton rule in Golly's B/S notation.
+ *
+ * WHY bitmasks: the transition depends only on the live-neighbour count n
+ * (0..8), so each of birth/survive is a 9-bit set — "is n a member?".  Storing
+ * them as masks turns the per-cell decision into one shift + AND ((mask>>n)&1),
+ * which is why the same inner loop runs every variant unchanged.  E.g. Conway
+ * B3/S23: birth = 1<<3, survive = (1<<2)|(1<<3).
+ * (Life-like CA family: LifeWiki [4]; Conway's original B3/S23: Gardner [1].) */
+typedef struct {
+    uint16_t birth;     /* bit n set ⇒ a DEAD cell with n live neighbours is born   */
+    uint16_t survive;   /* bit n set ⇒ a LIVE cell with n live neighbours survives  */
+    const char *name;   /* HUD label, e.g. "Conway B3/S23"                          */
+} Rule;
 #define N_RULES 6
-typedef struct { uint16_t birth, survive; const char *name; short color256; } Rule;
-static Rule RULES[N_RULES];
+static Rule RULES[N_RULES];   /* catalogue, built by rules_init (§4); Scene.rule_idx selects */
 
-static void rules_init(void)
-{
-    RULES[0] = (Rule){ B(3),         B(2,3),         "Conway B3/S23",       51 };
-    RULES[1] = (Rule){ B(3,6),       B(2,3),         "HighLife B36/S23",    82 };
-    RULES[2] = (Rule){ B(3,6,7,8),   B(3,4,6,7,8),   "Day&Night B3678/S34678", 201 };
-    RULES[3] = (Rule){ B(2),         0,               "Seeds B2/S",          226 };
-    RULES[4] = (Rule){ B(3,6,8),     B(2,4,5),        "Morley B368/S245",    202 };
-    RULES[5] = (Rule){ B(3,6),       B(1,2,5),        "2x2 B36/S125",        45  };
-}
+/* Theme — a live-cell colour palette, cycled with t/T.
+ *
+ * WHY a ramp, not one colour: Life cells are binary, so there is no intensity
+ * to show — but a cell's live-neighbour count (0..8) is a free local scalar.
+ * Mapping that count onto a colour ramp makes crowding visible: lone cells and
+ * dense clusters read as different hues, so gliders and still-lifes stand out
+ * from soup.  (Scalar→colour ramp: Bourke [7].)
+ *
+ * Every entry sits in the bright half of the 256-colour space (per project
+ * palette rules) so even the lowest tier stays visible on a black terminal. */
+typedef struct {
+    const char *name;          /* HUD label, e.g. "OCEAN"                       */
+    short       ramp[RAMP_LEN]; /* ramp[n] = xterm-256 colour for count n (0..8),
+                                * dim→bright as the neighbourhood gets denser    */
+} Theme;
 
-/* ── §2 clock ────────────────────────────────────────────────────────── */
+static const Theme THEMES[] = {
+    { "OCEAN",  {  25,  26,  27,  32,  38,  44,  45,  51, 159 } },
+    { "FIRE",   {  88, 124, 160, 166, 196, 202, 208, 214, 226 } },
+    { "MATRIX", {  28,  34,  40,  46,  82, 118, 154, 191, 194 } },
+    { "AMBER",  {  94, 130, 136, 166, 172, 178, 214, 220, 229 } },
+    { "MONO",   { 244, 246, 247, 249, 250, 251, 252, 253, 255 } },
+};
+#define N_THEMES 5
+
+/* Board — the world: Conway's cellular grid, double-buffered and toroidal.
+ *
+ * WHY double-buffered: a generation is SIMULTANEOUS — every cell must see its
+ * neighbours' OLD values.  So a step reads cells[buf] and writes cells[1-buf],
+ * then flips buf; updating in place would let already-written cells corrupt
+ * the neighbours still being computed (the classic Life bug — gliders smear).
+ *
+ * WHY toroidal: neighbour indices wrap modulo h/w (see board_neighbors), so
+ * the edges join into a torus — a glider leaving the right side re-enters on
+ * the left, with no boundary walls to perturb patterns.  (Conway 1970 [1].) */
+typedef struct {
+    /* the two boards: cells[buf] live, cells[1-buf] scratch; 0 = dead, 1 = live */
+    uint8_t cells[2][MAX_ROWS][MAX_COLS];
+    /* which buffer holds the current generation (0 or 1); flips every step */
+    int     buf;
+    /* generations elapsed since the last reset — shown in the HUD as gen= */
+    long    gen;
+    /* active region actually simulated, ≤ the fixed MAX backing store; fitted
+     * to the terminal each resize so a small window doesn't iterate dead cells */
+    int     h, w;
+} Board;
+
+/* PopulationHistory — the cosmetic population trail (EFFECTS), plotted by the
+ * scrolling histogram.  Write-only from the simulation's view: it records the
+ * live-cell count but never feeds back into the rule, so it can be cleared or
+ * resized without affecting evolution.
+ *
+ * WHY a ring buffer: the chart shows only the most recent w columns of an
+ * unbounded stream of per-step counts.  A ring overwrites the oldest sample in
+ * O(1) with no shifting; `head` marks the next write slot, and the renderer
+ * walks backwards from head to lay the newest sample at the right edge. */
+typedef struct {
+    long samples[HIST_LEN];  /* population (live-cell count) after each recorded step */
+    int  head;               /* next write index; wraps modulo HIST_LEN              */
+} PopulationHistory;
+
+/* The whole simulation in one aggregate, passed to the §6 orchestrators
+ * (init / reset / tick).  Read as a table of contents:
+ *   WHAT is simulated — board.  EFFECTS — history (the population trail).
+ *   HOW it is driven  — rule_idx + steps-per-frame + paused.
+ *   RENDER selection  — theme.   WHERE — rows (terminal height).
+ * Width is board.w (a board spans the full terminal width), so there is no
+ * separate cols.  Knobs are loose scalars: each is too thin for its own type. */
+typedef struct {
+    Board             board;     /* WHAT: the cell grid being evolved              */
+    PopulationHistory history;   /* EFFECTS: cosmetic population trail (the chart)  */
+    int rule_idx;                /* HOW: which rule is live, 0..N_RULES-1 → RULES   */
+    int steps;                   /* HOW: generations per frame, 1..STEPS_MAX (fast-fwd) */
+    int paused;                  /* HOW: 0/1 — when 1, scene_tick is a no-op         */
+    int theme;                   /* RENDER: active palette, 0..N_THEMES-1 → THEMES   */
+    int rows;                    /* WHERE: terminal height; bottom HUD sits at rows-1 */
+} Scene;
+
+static Scene g_scene = { .steps = STEPS_DEF };
+
+/* Signal-handler ↔ main-loop flags — not Scene data, so kept file-scope. */
+static volatile sig_atomic_t g_running     = 1;
+static volatile sig_atomic_t g_need_resize = 0;
+
+/* ── §2 performance   (frame clock + fixed-timestep cap; the only DELAY) ─ */
 
 static long long clock_ns(void)
 {
@@ -210,82 +353,120 @@ static void clock_sleep_ns(long long ns)
     nanosleep(&ts, NULL);
 }
 
-/* ── §3 color ────────────────────────────────────────────────────────── */
+/* ── §3 logic   (pure decisions: read-only, no I/O — cannot be corrupted) ─ */
 
-static int g_rule_idx = 0;
+/* Toroidal index wrap: map i back into [0,n) so the grid edges join into a
+ * torus.  Adding n once suffices because every caller passes i ≥ -n. */
+static int wrap(int i, int n) { return (i + n) % n; }
 
-static void color_apply(void)
+/* Build a B/S bitmask from a list of neighbour counts (bit N per count N). */
+static uint16_t rule_mask(const int *ns, int len)
 {
-    start_color();
-    use_default_colors();
-    short lc = (COLORS >= 256) ? RULES[g_rule_idx].color256 : COLOR_GREEN;
-    init_pair(CP_LIVE, lc, -1);
-    init_pair(CP_HIST, (COLORS >= 256) ? 240 : COLOR_WHITE, -1);
-    init_pair(CP_HUD,  (COLORS >= 256) ?  82 : COLOR_GREEN, -1);
+    uint16_t m = 0;
+    for (int i = 0; i < len; i++) m |= (uint16_t)(1u << ns[i]);
+    return m;
 }
 
-/* ── §4 grid ─────────────────────────────────────────────────────────── */
-
-static uint8_t g_grid[2][MAX_ROWS][MAX_COLS];
-static int     g_buf;          /* active buffer index (0 or 1)           */
-static int     g_rows, g_cols;
-static int     g_ca_rows;      /* grid display rows = g_rows - HIST_ROWS - 1 */
-static long    g_gen;
-static int     g_steps, g_paused;
-
-/* population history */
-static long    g_pop_hist[HIST_LEN];
-static int     g_hist_head;
-
-static void grid_clear(void)
+/* Live-neighbour count (0..8) of cell (r,c) on the live buffer, toroidal.
+ * The single neighbour counter — used by both the step and the renderer. */
+static int board_neighbors(const Board *b, int r, int c)
 {
-    memset(g_grid, 0, sizeof(g_grid));
-    g_gen = 0;
-    memset(g_pop_hist, 0, sizeof(g_pop_hist));
-    g_hist_head = 0;
+    int rn = wrap(r + 1, b->h), rp = wrap(r - 1, b->h);
+    int cn = wrap(c + 1, b->w), cp = wrap(c - 1, b->w);
+    return b->cells[b->buf][rp][cp] + b->cells[b->buf][rp][c] +
+           b->cells[b->buf][rp][cn] + b->cells[b->buf][r ][cp] +
+           b->cells[b->buf][r ][cn] + b->cells[b->buf][rn][cp] +
+           b->cells[b->buf][rn][c ] + b->cells[b->buf][rn][cn];
 }
 
-static void seed_random(void)
+/* Apply the B/S rule: does a cell with `n` live neighbours live next gen?
+ * One shift+AND tests membership in the survive set (live cell) or birth set
+ * (dead cell) — the entire transition, identical across every variant. */
+static int cell_next_state(const Rule *ru, int alive, int n)
 {
-    grid_clear();
-    for (int r = 0; r < g_ca_rows; r++)
-        for (int c = 0; c < g_cols; c++)
-            g_grid[g_buf][r][c] = (rand() % 10 < 3) ? 1 : 0;
+    uint16_t bit = (uint16_t)(1u << n);
+    return alive ? ((ru->survive & bit) ? 1 : 0)
+                 : ((ru->birth   & bit) ? 1 : 0);
 }
 
-static void place(const int cells[][2], int n, int r0, int c0)
+/* Normalise a population to a histogram bar height in [0, HIST_ROWS].  The
+ * ×2 makes a half-full board reach a full bar, so the busy low range stays
+ * readable (counts above 50 % all saturate). */
+static int bar_level(long pop, long max_pop)
+{
+    int level = (int)((float)pop / (float)max_pop * HIST_ROWS * 2.0f);
+    return level > HIST_ROWS ? HIST_ROWS : level;
+}
+
+/* ── §4 simulation   (advances state: mutates the Board, resets the Scene) ─ */
+
+/* Rule-table sugar: B(3,6) → mask with bits 3 and 6 set (via rule_mask, §3). */
+#define B(...)  rule_mask((int[]){__VA_ARGS__}, \
+                          sizeof((int[]){__VA_ARGS__})/sizeof(int))
+
+static void rules_init(void)
+{
+    RULES[0] = (Rule){ B(3),         B(2,3),         "Conway B3/S23"          };
+    RULES[1] = (Rule){ B(3,6),       B(2,3),         "HighLife B36/S23"       };
+    RULES[2] = (Rule){ B(3,6,7,8),   B(3,4,6,7,8),   "Day&Night B3678/S34678" };
+    RULES[3] = (Rule){ B(2),         0,              "Seeds B2/S"             };
+    RULES[4] = (Rule){ B(3,6,8),     B(2,4,5),       "Morley B368/S245"       };
+    RULES[5] = (Rule){ B(3,6),       B(1,2,5),       "2x2 B36/S125"           };
+}
+
+/* Reset the simulation to empty: clear the board and restart the history.
+ * Invoked by the seed_* user events, not by the per-tick combine. */
+static void scene_clear(Scene *sc)
+{
+    memset(sc->board.cells, 0, sizeof sc->board.cells);
+    sc->board.gen = 0;
+    memset(sc->history.samples, 0, sizeof sc->history.samples);
+    sc->history.head = 0;
+}
+
+/* Stamp a list of (dr,dc) live cells onto the board, toroidally, at (r0,c0). */
+static void place(Board *b, const int cells[][2], int n, int r0, int c0)
 {
     for (int i = 0; i < n; i++) {
-        int r = (r0 + cells[i][0] + g_ca_rows) % g_ca_rows;
-        int c = (c0 + cells[i][1] + g_cols)    % g_cols;
-        g_grid[g_buf][r][c] = 1;
+        int r = wrap(r0 + cells[i][0], b->h);
+        int c = wrap(c0 + cells[i][1], b->w);
+        b->cells[b->buf][r][c] = 1;
     }
 }
 
-static void seed_glider(void)
+static void seed_random(Scene *sc)
 {
-    grid_clear();
+    scene_clear(sc);
+    Board *b = &sc->board;
+    for (int r = 0; r < b->h; r++)
+        for (int c = 0; c < b->w; c++)
+            b->cells[b->buf][r][c] = (rand() % 10 < 3) ? 1 : 0;
+}
+
+static void seed_glider(Scene *sc)
+{
+    scene_clear(sc);
     static const int G[][2] = {{0,1},{1,2},{2,0},{2,1},{2,2}};
-    place(G, 5, g_ca_rows/2 - 1, g_cols/2 - 1);
+    place(&sc->board, G, 5, sc->board.h/2 - 1, sc->board.w/2 - 1);
 }
 
-static void seed_rpentomino(void)
+static void seed_rpentomino(Scene *sc)
 {
-    grid_clear();
+    scene_clear(sc);
     static const int P[][2] = {{0,1},{0,2},{1,0},{1,1},{2,1}};
-    place(P, 5, g_ca_rows/2 - 1, g_cols/2 - 1);
+    place(&sc->board, P, 5, sc->board.h/2 - 1, sc->board.w/2 - 1);
 }
 
-static void seed_acorn(void)
+static void seed_acorn(Scene *sc)
 {
-    grid_clear();
+    scene_clear(sc);
     static const int A[][2] = {{0,1},{1,3},{2,0},{2,1},{2,4},{2,5},{2,6}};
-    place(A, 7, g_ca_rows/2 - 1, g_cols/2 - 3);
+    place(&sc->board, A, 7, sc->board.h/2 - 1, sc->board.w/2 - 3);
 }
 
-static void seed_gosper(void)
+static void seed_gosper(Scene *sc)
 {
-    grid_clear();
+    scene_clear(sc);
     static const int GG[][2] = {
         {0,24},
         {1,22},{1,24},
@@ -297,100 +478,136 @@ static void seed_gosper(void)
         {7,11},{7,15},
         {8,12},{8,13},
     };
-    int roff = g_ca_rows / 4;
-    int coff = (g_cols > 40) ? 5 : 0;
-    place(GG, 36, roff, coff);
+    int roff = sc->board.h / 4;
+    int coff = (sc->board.w > 40) ? 5 : 0;
+    place(&sc->board, GG, 36, roff, coff);
 }
 
-static long grid_step(void)
+/* One Life generation under rule `ru`: count neighbours, apply B/S, swap
+ * buffers.  THE state advance.  Returns the new population. */
+static long board_step(Board *b, const Rule *ru)
 {
-    int next = 1 - g_buf;
-    long pop  = 0;
-    const Rule *ru = &RULES[g_rule_idx];
+    int next = 1 - b->buf;
+    long pop = 0;
 
-    for (int r = 0; r < g_ca_rows; r++) {
-        int rn = (r + 1)              % g_ca_rows;
-        int rp = (r - 1 + g_ca_rows) % g_ca_rows;
-        for (int c = 0; c < g_cols; c++) {
-            int cn = (c + 1)            % g_cols;
-            int cp = (c - 1 + g_cols)   % g_cols;
-            int n = g_grid[g_buf][rp][cp] + g_grid[g_buf][rp][c] +
-                    g_grid[g_buf][rp][cn] + g_grid[g_buf][r ][cp] +
-                    g_grid[g_buf][r ][cn] + g_grid[g_buf][rn][cp] +
-                    g_grid[g_buf][rn][c ] + g_grid[g_buf][rn][cn];
-            uint16_t bit = (uint16_t)(1u << n);
-            uint8_t  cur = g_grid[g_buf][r][c];
-            uint8_t  nxt = cur ? ((ru->survive & bit) ? 1 : 0)
-                               : ((ru->birth   & bit) ? 1 : 0);
-            g_grid[next][r][c] = nxt;
+    for (int r = 0; r < b->h; r++)
+        for (int c = 0; c < b->w; c++) {
+            int n = board_neighbors(b, r, c);                       /* live neighbours 0..8 */
+            uint8_t nxt = (uint8_t)cell_next_state(ru, b->cells[b->buf][r][c], n);
+            b->cells[next][r][c] = nxt;
             pop += nxt;
         }
-    }
-    g_buf = next;
-    g_gen++;
+
+    b->buf = next;   /* swap: the buffer we just wrote becomes live */
+    b->gen++;
     return pop;
 }
 
-static void sim_tick(void)
+/* Push one population sample into the ring, advancing the write head. */
+static void history_record(PopulationHistory *h, long pop)
 {
-    if (g_paused) return;
-    for (int s = 0; s < g_steps; s++) {
-        long pop = grid_step();
-        g_pop_hist[g_hist_head] = pop;
-        g_hist_head = (g_hist_head + 1) % HIST_LEN;
+    h->samples[h->head] = pop;
+    h->head = (h->head + 1) % HIST_LEN;
+}
+
+/* The per-tick combine: advance `steps` generations under the active rule,
+ * recording each step's population into the EFFECTS history. */
+static void scene_tick(Scene *sc)
+{
+    if (sc->paused) return;
+    const Rule *ru = &RULES[sc->rule_idx];
+    for (int s = 0; s < sc->steps; s++) {
+        long pop = board_step(&sc->board, ru);
+        history_record(&sc->history, pop);
     }
 }
 
-/* ── §5 scene ────────────────────────────────────────────────────────── */
+/* ── §5 render   (state → screen: reads state, mutates only the terminal) ─ */
 
-static void scene_grid(void)
+static void color_apply(const Theme *th)
 {
-    attron(COLOR_PAIR(CP_LIVE));
-    for (int r = 0; r < g_ca_rows; r++) {
-        uint8_t *row = g_grid[g_buf][r];
-        for (int c = 0; c < g_cols - 1; c++)
-            mvaddch(r, c, row[c] ? (chtype)(unsigned char)LIVE_CHAR : ' ');
+    start_color();
+    use_default_colors();
+    /* live-cell ramp from the given theme (or flat green in 8-colour mode) */
+    for (int i = 0; i < RAMP_LEN; i++) {
+        short col = (COLORS >= 256) ? th->ramp[i] : COLOR_GREEN;
+        init_pair((short)(CP_RAMP + i), col, -1);
     }
-    attroff(COLOR_PAIR(CP_LIVE));
+    init_pair(CP_HIST, (COLORS >= 256) ? 240 : COLOR_WHITE,  -1);
+    init_pair(CP_HUD,  (COLORS >= 256) ? 226 : COLOR_YELLOW, -1);  /* top data row    */
+    init_pair(CP_HINT, (COLORS >= 256) ?  51 : COLOR_CYAN,   -1);  /* bottom key hints */
 }
 
-static void scene_histogram(void)
+static void draw_board(const Board *b)
 {
-    long max_pop = (long)g_ca_rows * g_cols;
+    for (int r = 0; r < b->h; r++) {
+        const uint8_t *row = b->cells[b->buf][r];
+        for (int c = 0; c < b->w - 1; c++) {
+            if (!row[c]) { mvaddch(r + HUD_TOP, c, ' '); continue; }
+            int pair = CP_RAMP + board_neighbors(b, r, c);   /* colour by crowding */
+            attron(COLOR_PAIR(pair));
+            mvaddch(r + HUD_TOP, c, (chtype)(unsigned char)LIVE_CHAR);
+            attroff(COLOR_PAIR(pair));
+        }
+    }
+}
+
+static void draw_histogram(const PopulationHistory *h, const Board *b)
+{
+    long max_pop = (long)b->h * b->w;
     if (max_pop == 0) return;
 
     attron(COLOR_PAIR(CP_HIST));
-    for (int c = 0; c < g_cols - 1; c++) {
-        int idx = (g_hist_head - (g_cols - 1 - c) + HIST_LEN * 2) % HIST_LEN;
-        long pop = g_pop_hist[idx];
-        /* normalize to [0, HIST_ROWS] */
-        int level = (int)((float)pop / (float)max_pop * HIST_ROWS * 2.0f);
-        if (level > HIST_ROWS) level = HIST_ROWS;
+    for (int c = 0; c < b->w - 1; c++) {
+        /* sample shown at column c: walk back (w-1-c) steps from the head */
+        int idx = (h->head - (b->w - 1 - c) + HIST_LEN * 2) % HIST_LEN;
+        int level = bar_level(h->samples[idx], max_pop);
         for (int hr = 0; hr < HIST_ROWS; hr++) {
-            /* hr=0 is top row of histogram area */
-            int sr = g_ca_rows + hr;
-            /* bar grows upward: bottom row fills first */
-            char ch = (level >= HIST_ROWS - hr) ? '#' : '.';
+            int sr = HUD_TOP + b->h + hr;                     /* histogram screen row */
+            char ch = (level >= HIST_ROWS - hr) ? '#' : '.';  /* bar grows upward     */
             mvaddch(sr, c, (chtype)(unsigned char)ch);
         }
     }
     attroff(COLOR_PAIR(CP_HIST));
 }
 
-static void scene_hud(void)
+/* Draw one HUD row left-aligned at `row`, clipped to `width` so it can never
+ * overflow onto the grid. */
+static void draw_hud_row(int row, int pair, int width, const char *text)
 {
-    attron(COLOR_PAIR(CP_HUD));
-    mvprintw(g_rows - 1, 0,
-             " %-22s  gen=%ld  spd=%d  %s"
-             "  n/p:rule  r:rand g:glider G:gun p:pento a:acorn  +/-:spd  q:quit",
-             RULES[g_rule_idx].name, g_gen, g_steps,
-             g_paused ? "PAUSED " : "       ");
-    attroff(COLOR_PAIR(CP_HUD));
+    char buf[128];
+    snprintf(buf, sizeof buf, "%s", text);
+    if ((int)strlen(buf) > width) buf[width] = '\0';
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvprintw(row, 0, "%s", buf);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* ── §6 screen ───────────────────────────────────────────────────────── */
+/* Top row = live parameters (data); bottom row = key hints (actions). */
+static void draw_hud(const Scene *sc)
+{
+    char data[128];
+    snprintf(data, sizeof data,
+             " Life  %-22s [%d/%d]  %s  gen=%ld  spd=%dx  %s",
+             RULES[sc->rule_idx].name, sc->rule_idx + 1, N_RULES,
+             THEMES[sc->theme].name, sc->board.gen, sc->steps,
+             sc->paused ? "PAUSED" : "running");
+    draw_hud_row(0, CP_HUD, sc->board.w, data);
+    draw_hud_row(sc->rows - 1, CP_HINT, sc->board.w,
+                 " q:quit  spc:pause  n/p:rule  t:theme  r:rand  g:glider  G:gun  e:pento  a:acorn  +/-:spd ");
+}
 
-static void screen_init(void)
+/* Reads the whole scene (const → cannot mutate state, so no re-coupling). */
+static void scene_draw(const Scene *sc)
+{
+    draw_board(&sc->board);
+    draw_histogram(&sc->history, &sc->board);
+    draw_hud(sc);
+}
+
+/* ── §6 app   (terminal setup, user events, and the per-tick combine) ──── */
+
+static void screen_init(const Scene *sc)
 {
     initscr();
     cbreak();
@@ -399,27 +616,23 @@ static void screen_init(void)
     keypad(stdscr, TRUE);
     curs_set(0);
     typeahead(-1);
-    color_apply();
+    color_apply(&THEMES[sc->theme]);
 }
 
-static void screen_resize(void)
+/* USER EVENT: terminal resized — refit the board and reseed (not a tick). */
+static void screen_resize(Scene *sc)
 {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     if (rows > MAX_ROWS) rows = MAX_ROWS;
     if (cols > MAX_COLS) cols = MAX_COLS;
-    g_rows    = rows;
-    g_cols    = cols;
-    g_ca_rows = rows - HIST_ROWS - 1;
-    if (g_ca_rows < 1) g_ca_rows = 1;
-    seed_random();
+    sc->rows    = rows;
+    sc->board.w = cols;
+    sc->board.h = rows - HIST_ROWS - HUD_TOP - HUD_BOT;
+    if (sc->board.h < 1) sc->board.h = 1;
+    seed_random(sc);
     erase();
 }
-
-/* ── §7 app ──────────────────────────────────────────────────────────── */
-
-static volatile sig_atomic_t g_running     = 1;
-static volatile sig_atomic_t g_need_resize = 0;
 
 static void sig_handler(int sig)
 {
@@ -428,64 +641,83 @@ static void sig_handler(int sig)
 }
 static void cleanup(void) { endwin(); }
 
-int main(void)
+static void install_signals(void)
 {
     signal(SIGINT,   sig_handler);
     signal(SIGTERM,  sig_handler);
     signal(SIGWINCH, sig_handler);
-    atexit(cleanup);
+}
 
+/* Consume a pending resize: reset ncurses, then refit the board. */
+static void handle_resize(Scene *sc)
+{
+    g_need_resize = 0;
+    endwin(); refresh();
+    screen_resize(sc);
+}
+
+/* USER EVENT: dispatch one key press — mutates the scene, never a tick. */
+static void handle_key(Scene *sc, int ch)
+{
+    switch (ch) {
+    case 'q': case 'Q': g_running = 0; break;
+    case ' ':           sc->paused ^= 1; break;
+    case 'n':
+        sc->rule_idx = (sc->rule_idx + 1) % N_RULES;
+        seed_random(sc); break;
+    case 'p':
+        sc->rule_idx = (sc->rule_idx - 1 + N_RULES) % N_RULES;
+        seed_random(sc); break;
+    case 't':
+        sc->theme = (sc->theme + 1) % N_THEMES;
+        color_apply(&THEMES[sc->theme]); break;
+    case 'T':
+        sc->theme = (sc->theme - 1 + N_THEMES) % N_THEMES;
+        color_apply(&THEMES[sc->theme]); break;
+    case 'r':  seed_random(sc);     break;
+    case 'g':  seed_glider(sc);     break;
+    case 'G':  seed_gosper(sc);     break;
+    /* 'p' already used for prev-rule; use 'e' for R-pentomino */
+    case 'e':  seed_rpentomino(sc); break;
+    case 'a':  seed_acorn(sc);      break;
+    case '+': case '=':
+        if (sc->steps < STEPS_MAX) sc->steps++;
+        break;
+    case '-': case '_':
+        if (sc->steps > 1) sc->steps--;
+        break;
+    }
+}
+
+/* RENDER: clear, draw the scene, flush in one diff write. */
+static void frame_render(const Scene *sc)
+{
+    erase();
+    scene_draw(sc);
+    wnoutrefresh(stdscr);
+    doupdate();
+}
+
+int main(void)
+{
+    install_signals();
+    atexit(cleanup);
     rules_init();
-    screen_init();
-    g_steps = STEPS_DEF;
-    g_buf   = 0;
+    screen_init(&g_scene);
     srand((unsigned)(clock_ns() & 0xFFFFFFFFu));
-    screen_resize();
+    screen_resize(&g_scene);
 
     long long next = clock_ns();
-
     while (g_running) {
-        if (g_need_resize) {
-            g_need_resize = 0;
-            endwin(); refresh();
-            screen_resize();
-        }
+        if (g_need_resize) handle_resize(&g_scene);
 
         int ch;
-        while ((ch = getch()) != ERR) {
-            switch (ch) {
-            case 'q': case 'Q': g_running = 0; break;
-            case ' ':           g_paused ^= 1; break;
-            case 'n':
-                g_rule_idx = (g_rule_idx + 1) % N_RULES;
-                color_apply(); seed_random(); break;
-            case 'p':
-                g_rule_idx = (g_rule_idx - 1 + N_RULES) % N_RULES;
-                color_apply(); seed_random(); break;
-            case 'r':  seed_random();    break;
-            case 'g':  seed_glider();    break;
-            case 'G':  seed_gosper();    break;
-            /* 'p' already used for prev-rule; use 'e' for R-pentomino */
-            case 'e':  seed_rpentomino(); break;
-            case 'a':  seed_acorn();     break;
-            case '+': case '=':
-                if (g_steps < STEPS_MAX) g_steps++;
-                break;
-            case '-': case '_':
-                if (g_steps > 1) g_steps--;
-                break;
-            }
-        }
+        while ((ch = getch()) != ERR) handle_key(&g_scene, ch);
 
-        sim_tick();
-        erase();
-        scene_grid();
-        scene_histogram();
-        scene_hud();
-        wnoutrefresh(stdscr);
-        doupdate();
+        scene_tick(&g_scene);                  /* advance simulation (per-tick combine) */
+        frame_render(&g_scene);                /* board + histogram + HUD → screen      */
 
-        next += TICK_NS;
+        next += TICK_NS;                       /* PERFORMANCE: fixed-timestep frame cap */
         clock_sleep_ns(next - clock_ns());
     }
     return 0;

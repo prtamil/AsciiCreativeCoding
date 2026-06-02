@@ -12,19 +12,19 @@
  *   simulations driven by an iterative state machine, and both
  *   colour-code the activity wave on top of a static field.
  *   maze_backtracker.c (same folder) — fancier showcase of the same
- *   carver with Unicode walls, glow effects, and a longest-path
+ *   carver with glow effects, colour themes, and a longest-path
  *   (diameter) solver instead of this file's BFS shortest-path.
  *
  * Section map:
- *   §1 config   — sizes, wall bits, phase enum, color pair IDs
- *   §2 clock    — monotonic timer + nanosleep
- *   §3 color    — wall/frontier/path/hud/hint pairs
- *   §5 maze     — wall bitmask + iterative DFS carver
- *   §6 solve    — BFS flood + parent-array path reconstruction
- *   §7 scene    — mark_cell helper + draw_grid + draw_hud
- *   §8 app      — signals, resize, main loop
+ *   §1 config+types — sizes, wall bits, phases, colour IDs, Theme, Maze, Scene
+ *   §2 performance  — monotonic clock + frame cap
+ *   §3 logic        — calc_dims (pure terminal→maze sizing)
+ *   §4 simulation   — DFS carve + BFS solve on the Maze, and the per-tick combine
+ *   §5 render       — theme palette, mark_cell, draw grid + HUD
+ *   §6 app          — signals, resize, key events, main loop
  *
  * Keys:  q/ESC quit   r regen   space skip-to-solve   p pause   1/2/3 sizes
+ *        t/T next/prev colour theme
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra procedural/generational/maze.c \
@@ -58,12 +58,26 @@
  *                  algorithm is O(W·H) — even MAZE_H_MAX·MAZE_W_MAX is
  *                  well under 3000 cells.
  *
- * References     : Reiter (2011), "Maze Generation Algorithms",
- *                    https://weblog.jamisbuck.org/2011/2/7/
- *                  Wikipedia, "Maze generation algorithm",
- *                    https://en.wikipedia.org/wiki/Maze_generation_algorithm
- *                  Red Blob Games, "Introduction to A* / BFS",
- *                    https://www.redblobgames.com/pathfinding/a-star/introduction.html
+ * References     : Concept —
+ *                  [1] Buck, Jamis — "Mazes for Programmers" (Pragmatic
+ *                      Bookshelf, 2015).  The book: recursive backtracker
+ *                      and many other algorithms, with working code.
+ *                  [2] Buck — "Maze Generation: Recursive Backtracking"
+ *                      (the carver this file animates):
+ *                      https://weblog.jamisbuck.org/2010/12/27/maze-generation-recursive-backtracking
+ *                  [3] Wikipedia — "Maze generation algorithm":
+ *                      https://en.wikipedia.org/wiki/Maze_generation_algorithm
+ *                  [4] Cormen, Leiserson, Rivest & Stein — "Introduction to
+ *                      Algorithms" (CLRS): BFS/DFS, the basis of both the
+ *                      carve and the shortest-path solve.
+ *                  Rendering —
+ *                  [5] Red Blob Games — "Introduction to A* / BFS", the model
+ *                      for the flood-fill + path visualisation:
+ *                      https://www.redblobgames.com/pathfinding/a-star/introduction.html
+ *                  [6] Padala — "NCURSES Programming HOWTO", TLDP: colour
+ *                      pairs, glyph output, non-blocking input, resize.
+ *                  [7] xterm 256-colour palette — the index the Theme
+ *                      palettes draw from: https://jonasjacek.github.io/colors/
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -123,8 +137,8 @@
  *  • Skip-to-solve.  Pressing space during generation must run the DFS
  *    to completion BEFORE starting BFS, otherwise BFS sees half-carved
  *    walls and finds no goal.
- *  • Resize.  SIGWINCH recomputes (g_mh, g_mw) and resets the maze;
- *    holding the carve state through a resize would point off-grid.
+ *  • Resize.  SIGWINCH recomputes maze.w/maze.h (calc_dims) and resets the
+ *    maze; holding the carve state through a resize would point off-grid.
  *  • A_DIM on grayscale wall colours would make them disappear on a
  *    black terminal.  All wall/frontier/path pairs sit in the bright
  *    half of the 256-colour cube and use A_BOLD to stay visible.
@@ -132,7 +146,7 @@
  * HOW TO VERIFY
  * ─────────────
  *  • Every cell becomes visited.  By the time generation finishes,
- *    g_dfs_top == 0 and g_vis is all 1s; visually no '#' tiles remain.
+ *    maze.stack_top == 0 and maze.vis is all 1s; visually no '#' remain.
  *  • Path length equals BFS depth at the goal.  Count the '*' cells:
  *    on a 40×10 maze it should be at least 50 (start to far corner is
  *    >= mh+mw–1 cells, often more because the unique tree path
@@ -145,6 +159,37 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
+ *
+ * All maze data lives in one Maze; Scene wraps it with the render/run
+ * scalars.  Functions take the NARROWEST type — Maze* (mutate) / const Maze*
+ * + ints (read) for the deep work; only the orchestrators take Scene*.
+ *
+ *   Layer        Section  Mutates
+ *   ─────────────────────────────────────────────────────────────────────
+ *   PERFORMANCE  §2       nothing — reads the clock / sleeps
+ *   LOGIC        §3       NOTHING — calc_dims is pure (out-params, no state)
+ *   SIMULATION   §4       Maze (walls, vis, stack, phase, BFS scratch, queue)
+ *   RENDER       §5       the terminal only — reads the Maze, never writes it
+ *   APP          §6       Scene (theme, paused, dims) + g_quit/g_resize; events
+ *
+ *   No EFFECTS — nothing cosmetic is stored.  The '@' frontier is read from
+ *     the DFS stack top, the '.' flood from maze.bfs_vis, the '*' path from
+ *     maze.on_path — all SIMULATION state, inspected at render time.
+ *   DELAYS — trivial: 'p' sets Scene.paused (freezes the tick); the only wait
+ *     is the PERFORMANCE frame cap (§2).  'space' skip-to-solve is not a delay
+ *     — it runs the algorithm straight to completion.
+ *
+ * PER-TICK COMBINE — step_simulation(Scene*) (§4) is the ONE place state
+ * advances: GENERATE → GEN_STEPS × gen_step (at stack-empty: solve_start →
+ * SOLVE); SOLVE → SOL_STEPS × solve_step (at goal / queue-empty → DONE).
+ * RENDER (scene_draw) then PERFORMANCE (frame cap) run every frame, after.
+ *
+ * USER EVENTS are NOT the tick: keys (handle_key) and resize mutate the Scene
+ * directly in §6 — reset, resize re-fit, theme/size cycles, skip-to-solve —
+ * but only step_simulation runs the per-frame tick.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <signal.h>
@@ -154,7 +199,7 @@
 #include <time.h>
 
 /* ===================================================================== */
-/* §1  config                                                             */
+/* §1  config + types                                                     */
 /* ===================================================================== */
 
 #define MAZE_W_MAX    90
@@ -174,10 +219,17 @@
 #define WALL_S  4
 #define WALL_W  8
 
+#define N_DIRS  4   /* four cardinal directions, indexed 0..3 = N, E, S, W */
+
+/* The run's lifecycle.  GENERATE → SOLVE happens automatically when the
+ * carve stack empties; SOLVE → DONE when the BFS reaches the goal (or its
+ * queue drains).  The renderer keys its glyph set off this phase. */
 enum Phase { PH_GENERATE, PH_SOLVE, PH_DONE };
 
-/* Color pair IDs.  HUD pairs are reserved 8/9 across all demos so the
- * status line and key hint are stylistically identical everywhere. */
+/* Colour-pair IDs — one per semantic layer the renderer draws.  The six maze
+ * layers (PAIR_WALL..PAIR_UNVISIT) are recoloured per Theme; PAIR_HUD/HINT are
+ * reserved 8/9 across all demos so the status line and hint look identical
+ * everywhere, and stay fixed yellow/cyan against any theme. */
 enum {
     PAIR_WALL = 1,   /* solid maze walls and corners                 */
     PAIR_VISIT,      /* carved cell interior                         */
@@ -189,8 +241,85 @@ enum {
     PAIR_HINT  = 9   /* bottom-left key hint    (cyan,   A_BOLD)     */
 };
 
+/*
+ * Theme — recolours the maze's six activity layers.  The HUD pairs stay fixed
+ * bright yellow/cyan for legibility against any theme.  Cycled with t/T.
+ *
+ * WHY every index is HIGH (≥30, and ≥244 for greys): the resting interior and
+ * uncarved fill are drawn plain/dim, and the bottom of the colour cube / grey
+ * ramp vanishes on a black terminal (project palette rule); the head/flood/
+ * path glyphs are A_BOLD and can run hotter.  Indices: xterm-256 palette [7].
+ */
+typedef struct {
+    const char *name;  /* HUD label, e.g. "CLASSIC"                          */
+    short wall;        /* the maze wall lattice (+ - |)                      */
+    short visit;       /* carved-but-resting interior (drawn as a blank cell)*/
+    short front;       /* the DFS carve head '@'                             */
+    short bfs;         /* the BFS flood '.'                                  */
+    short path;        /* the final shortest path '*'                        */
+    short unvisit;     /* not-yet-carved fill '#'                            */
+} Theme;
+
+static const Theme THEMES[] = {
+    /*  name        wall  visit  head  flood  path  unvis */
+    { "CLASSIC",    251,  244,   226,  117,    46,   240 },
+    { "OCEAN",      245,   67,    51,   39,   231,    24 },
+    { "EMBER",      244,  130,   226,  208,   196,    52 },
+    { "FOREST",     244,   71,   154,   40,   226,    28 },
+    { "MONO",       250,  245,   231,  248,   255,   240 },
+};
+#define N_THEMES  ((int)(sizeof THEMES / sizeof THEMES[0]))
+
+/*
+ * Maze — the grid plus all working storage to carve it (DFS) and then solve
+ * it (BFS).  A "perfect maze" is a uniform spanning tree of the grid graph:
+ * every cell reachable, exactly one route between any pair, no loops (Buck
+ * [1][2]).  The tree itself lives in walls[]; everything else is the two
+ * algorithms' scratch (CLRS [4] for DFS/BFS).
+ *
+ * WHY walls are a BITMASK stored on BOTH sides of each edge: a cell's 4 bits
+ * answer "is side d open?" in one test, and carving clears the bit on the
+ * cell AND on its neighbour (the shared edge), so a wall query is correct
+ * from either cell — at the cost of always clearing the twin bits together.
+ */
+typedef struct {
+    /* ── structure: the spanning tree itself ── */
+    int w, h;                                      /* active size in cells (≤ MAZE_*_MAX)    */
+    unsigned char walls[MAZE_H_MAX][MAZE_W_MAX];   /* 4-bit mask N=1 E=2 S=4 W=8; set=closed */
+    enum Phase    phase;                           /* which algorithm is running             */
+
+    /* ── DFS carve frontier ── */
+    unsigned char vis[MAZE_H_MAX][MAZE_W_MAX];     /* 1 once the carve has reached a cell    */
+    /* explicit recursion stack of (r,c); sized W·H+1 because one long snaking
+     * corridor can stack every cell before the first backtrack (+1 = paranoia). */
+    struct { int r, c; } stack[MAZE_H_MAX * MAZE_W_MAX + 1];
+    int  stack_top;                                /* depth; 0 ⇒ carve finished              */
+
+    /* ── BFS solve scratch (start = (0,0), goal = bottom-right) ── */
+    int           parent [MAZE_H_MAX][MAZE_W_MAX]; /* predecessor, encoded r*MAZE_W_MAX+c; -1 = none */
+    unsigned char bfs_vis[MAZE_H_MAX][MAZE_W_MAX]; /* 1 once the flood has reached a cell    */
+    unsigned char on_path[MAZE_H_MAX][MAZE_W_MAX]; /* 1 if on the reconstructed shortest path */
+    struct { int r, c; } queue[MAZE_H_MAX * MAZE_W_MAX];  /* BFS FIFO of cells still to expand */
+    int  q_head, q_tail;                           /* FIFO: pop at head, push at tail        */
+} Maze;
+
+/*
+ * Scene — the animated maze run, as a table of contents:
+ *   WHAT  : maze — the grid being carved and solved.
+ *   HOW   : theme — the active colour palette (render selection).
+ *   when  : paused — freeze the tick.   WHERE : rows, cols — terminal size.
+ */
+typedef struct {
+    Maze maze;        /* WHAT: the maze being carved + solved   */
+    int  theme;       /* RENDER: index into THEMES              */
+    bool paused;      /* run-state: freeze the per-tick combine */
+    int  rows, cols;  /* WHERE: terminal size in characters     */
+} Scene;
+
+static Scene g_scene;
+
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  performance   (monotonic clock + frame-cap sleep)                  */
 /* ===================================================================== */
 
 static long long clock_ns(void)
@@ -208,30 +337,215 @@ static void clock_sleep_ns(long long ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  logic   (pure decisions: no mutation, no I/O — readable alone)     */
+/* ===================================================================== */
+
+/* Largest maze (in cells) whose (2w+1)×(2h+1) frame fits the terminal,
+ * leaving HUD_ROWS at the top and 1 hint row at the bottom; clamped to the
+ * static maxima and a 2×2 floor.  Pure: writes only the mh, mw out-params. */
+static void calc_dims(int rows, int cols, int *mh, int *mw)
+{
+    *mh = (rows - HUD_ROWS - 1) / 2;
+    *mw = (cols - 1) / 2;
+    if (*mh > MAZE_H_MAX) *mh = MAZE_H_MAX;
+    if (*mw > MAZE_W_MAX) *mw = MAZE_W_MAX;
+    if (*mh < 2) *mh = 2;
+    if (*mw < 2) *mw = 2;
+}
+
+/* True if cell (r,c) is inside the active w×h maze. */
+static bool in_grid(const Maze *m, int r, int c)
+{
+    return r >= 0 && r < m->h && c >= 0 && c < m->w;
+}
+
+/* True if (r,c) is the cell the DFS carver is standing on (its stack top) —
+ * the '@' frontier the renderer highlights during generation. */
+static bool is_carve_head(const Maze *m, int r, int c)
+{
+    return m->stack_top > 0 &&
+           m->stack[m->stack_top - 1].r == r &&
+           m->stack[m->stack_top - 1].c == c;
+}
+
+/* ===================================================================== */
+/* §4  simulation   (advances the Maze: DFS carve, BFS solve, tick combine) */
+/* ===================================================================== */
+
+/* Direction tables: index 0..3 = N, E, S, W. */
+static const int DR[N_DIRS]     = { -1,  0,  1,  0 };
+static const int DC[N_DIRS]     = {  0,  1,  0, -1 };
+static const int D_WALL[N_DIRS] = { WALL_N, WALL_E, WALL_S, WALL_W };
+static const int D_OPP[N_DIRS]  = { WALL_S, WALL_W, WALL_N, WALL_E };
+
+/* Fisher-Yates shuffle of the four direction indices — randomises which
+ * neighbour the carver tries first, which is what makes each maze unique. */
+static void shuffle_dirs(int dirs[N_DIRS])
+{
+    for (int i = N_DIRS - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int t = dirs[i]; dirs[i] = dirs[j]; dirs[j] = t;
+    }
+}
+
+/* Carve the wall between cell (r,c) and its neighbour in direction d (both
+ * sides), mark the neighbour visited, and push it — one forward DFS step. */
+static void carve_into(Maze *m, int r, int c, int d)
+{
+    int nr = r + DR[d], nc = c + DC[d];
+    m->vis[nr][nc] = 1;
+    m->walls[r ][c ] &= (unsigned char)~D_WALL[d];
+    m->walls[nr][nc] &= (unsigned char)~D_OPP [d];
+    m->stack[m->stack_top].r = nr;
+    m->stack[m->stack_top].c = nc;
+    m->stack_top++;
+}
+
+static void maze_reset(Maze *m)
+{
+    memset(m->walls, 0x0F, sizeof m->walls); /* every wall closed */
+    memset(m->vis,   0,    sizeof m->vis);
+    m->stack[0].r = 0;
+    m->stack[0].c = 0;
+    m->stack_top  = 1;
+    m->vis[0][0]  = 1;
+    m->phase      = PH_GENERATE;
+}
+
+/*
+ * gen_step() — advance the recursive backtracker by one node.
+ *
+ * We pick a random unvisited neighbour of the stack-top cell, carve
+ * the wall between them, push the neighbour, and return.  If the top
+ * cell has no unvisited neighbour, we pop (backtrack).  Returns false
+ * once the stack empties — the maze is complete.
+ */
+static bool gen_step(Maze *m)
+{
+    if (m->stack_top == 0) return false;        /* stack empty → carve complete */
+
+    int r = m->stack[m->stack_top - 1].r;
+    int c = m->stack[m->stack_top - 1].c;
+
+    int dirs[N_DIRS] = { 0, 1, 2, 3 };
+    shuffle_dirs(dirs);
+    for (int k = 0; k < N_DIRS; k++) {
+        int d  = dirs[k];
+        int nr = r + DR[d], nc = c + DC[d];
+        if (in_grid(m, nr, nc) && !m->vis[nr][nc]) {
+            carve_into(m, r, c, d);             /* advance the frontier */
+            return true;
+        }
+    }
+    m->stack_top--;                             /* boxed in → backtrack */
+    return true;
+}
+
+static void solve_start(Maze *m)
+{
+    memset(m->bfs_vis, 0, sizeof m->bfs_vis);
+    memset(m->on_path, 0, sizeof m->on_path);
+    memset(m->parent, -1, sizeof m->parent);
+    m->q_head = m->q_tail = 0;
+    m->queue[m->q_tail].r = 0;
+    m->queue[m->q_tail].c = 0;
+    m->q_tail++;
+    m->bfs_vis[0][0] = 1;
+    m->phase = PH_SOLVE;
+}
+
+/*
+ * trace_path() — walk the parent chain back from the goal cell to the
+ * start, marking each cell along the way as on the shortest path.
+ */
+static void trace_path(Maze *m, int gr, int gc)
+{
+    int pr = gr, pc = gc;
+    while (pr >= 0 && pc >= 0) {
+        m->on_path[pr][pc] = 1;
+        int enc = m->parent[pr][pc];
+        if (enc < 0) break;
+        pr = enc / MAZE_W_MAX;
+        pc = enc % MAZE_W_MAX;
+    }
+}
+
+/* Enqueue every not-yet-flooded neighbour of (r,c) reachable through an open
+ * wall, recording (r,c) as its BFS parent — one expansion of the flood. */
+static void bfs_expand(Maze *m, int r, int c)
+{
+    for (int d = 0; d < N_DIRS; d++) {
+        if (m->walls[r][c] & D_WALL[d]) continue;          /* wall closed → no edge */
+        int nr = r + DR[d], nc = c + DC[d];
+        if (!in_grid(m, nr, nc) || m->bfs_vis[nr][nc]) continue;
+        m->bfs_vis[nr][nc] = 1;
+        m->parent [nr][nc] = r * MAZE_W_MAX + c;
+        m->queue[m->q_tail].r = nr;
+        m->queue[m->q_tail].c = nc;
+        m->q_tail++;
+    }
+}
+
+static bool solve_step(Maze *m)
+{
+    if (m->q_head >= m->q_tail) { m->phase = PH_DONE; return false; }  /* no route */
+
+    int r = m->queue[m->q_head].r;
+    int c = m->queue[m->q_head].c;
+    m->q_head++;
+
+    if (r == m->h - 1 && c == m->w - 1) {       /* reached the bottom-right goal */
+        trace_path(m, r, c);
+        m->phase = PH_DONE;
+        return false;
+    }
+
+    bfs_expand(m, r, c);
+    return true;
+}
+
+/*
+ * step_simulation() — THE per-tick combine.  The one place state advances:
+ * GENERATE runs GEN_STEPS carves (auto-starting the solve when the carve
+ * finishes); SOLVE runs SOL_STEPS BFS pops.  `paused` freezes it.
+ */
+static void step_simulation(Scene *s)
+{
+    if (s->paused) return;
+    Maze *m = &s->maze;
+    if (m->phase == PH_GENERATE) {
+        for (int i = 0; i < GEN_STEPS; i++)
+            if (!gen_step(m)) { solve_start(m); break; }
+    } else if (m->phase == PH_SOLVE) {
+        for (int i = 0; i < SOL_STEPS; i++)
+            if (!solve_step(m)) break;
+    }
+}
+
+/* ===================================================================== */
+/* §5  render   (state → screen: reads the Maze, mutates only the terminal) */
 /* ===================================================================== */
 
 /*
- * color_init() — every pair uses bg = -1 (terminal default) so the
- * maze blends into any wallpaper, and every fg colour sits in the
- * bright half of the 256-colour cube so A_BOLD/A_DIM render legibly.
- * Walls in light grey, frontier in yellow, BFS flood in cyan, final
- * path in matrix green — high contrast from each other and from the
- * yellow/cyan HUD pair so nothing camouflages.
+ * color_apply() — install the active theme's palette.  Every pair uses
+ * bg = -1 (terminal default) so the maze blends into any wallpaper.  The
+ * six maze layers come from `th`; the HUD/hint pairs stay fixed bright
+ * yellow/cyan so the status line is legible against every theme.  Called
+ * once at startup and again on each t/T cycle.
  */
-static void color_init(void)
+static void color_apply(const Theme *th)
 {
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(PAIR_WALL,    251, -1);   /* light grey walls          */
-        init_pair(PAIR_VISIT,   244, -1);   /* dim grey carved interior  */
-        init_pair(PAIR_FRONT,   226, -1);   /* bright yellow DFS head    */
-        init_pair(PAIR_BFS,     117, -1);   /* light blue BFS flood      */
-        init_pair(PAIR_PATH,     46, -1);   /* matrix green path         */
-        init_pair(PAIR_UNVISIT, 240, -1);   /* near-black unvisited fill */
-        init_pair(PAIR_HUD,     226, -1);   /* yellow status (A_BOLD)    */
-        init_pair(PAIR_HINT,     51, -1);   /* cyan hint   (A_BOLD)      */
+        init_pair(PAIR_WALL,    th->wall,    -1);
+        init_pair(PAIR_VISIT,   th->visit,   -1);
+        init_pair(PAIR_FRONT,   th->front,   -1);
+        init_pair(PAIR_BFS,     th->bfs,     -1);
+        init_pair(PAIR_PATH,    th->path,    -1);
+        init_pair(PAIR_UNVISIT, th->unvisit, -1);
+        init_pair(PAIR_HUD,     226, -1);   /* fixed yellow status (A_BOLD) */
+        init_pair(PAIR_HINT,     51, -1);   /* fixed cyan hint     (A_BOLD) */
     } else {
         init_pair(PAIR_WALL,    COLOR_WHITE,  -1);
         init_pair(PAIR_VISIT,   COLOR_WHITE,  -1);
@@ -244,160 +558,17 @@ static void color_init(void)
     }
 }
 
-/* ===================================================================== */
-/* §5  maze generation (iterative DFS)                                    */
-/* ===================================================================== */
-
-static unsigned char g_walls[MAZE_H_MAX][MAZE_W_MAX]; /* per-cell bitmask */
-static unsigned char g_vis  [MAZE_H_MAX][MAZE_W_MAX]; /* DFS visited      */
-static int g_mh, g_mw;                                /* live maze size   */
-
-/* DFS stack of (r,c) frontier positions */
-static struct { int r, c; } g_dfs[MAZE_H_MAX * MAZE_W_MAX + 1];
-static int g_dfs_top;
-
-static enum Phase g_phase;
-static bool       g_paused;
-
-/* Direction tables: index 0..3 = N, E, S, W. */
-static const int DR[4]     = { -1,  0,  1,  0 };
-static const int DC[4]     = {  0,  1,  0, -1 };
-static const int D_WALL[4] = { WALL_N, WALL_E, WALL_S, WALL_W };
-static const int D_OPP[4]  = { WALL_S, WALL_W, WALL_N, WALL_E };
-
-static void maze_reset(void)
-{
-    memset(g_walls, 0x0F, sizeof g_walls); /* every wall closed */
-    memset(g_vis,   0,    sizeof g_vis);
-    g_dfs[0].r = 0;
-    g_dfs[0].c = 0;
-    g_dfs_top  = 1;
-    g_vis[0][0] = 1;
-    g_phase    = PH_GENERATE;
-}
-
-/*
- * gen_step() — advance the recursive backtracker by one node.
- *
- * We pick a random unvisited neighbour of the stack-top cell, carve
- * the wall between them, push the neighbour, and return.  If the top
- * cell has no unvisited neighbour, we pop (backtrack).  Returns false
- * once the stack empties — the maze is complete.
- */
-static bool gen_step(void)
-{
-    if (g_dfs_top == 0) return false;
-
-    int r = g_dfs[g_dfs_top - 1].r;
-    int c = g_dfs[g_dfs_top - 1].c;
-
-    int dirs[4] = { 0, 1, 2, 3 };
-    for (int i = 3; i > 0; i--) {
-        int j = rand() % (i + 1);
-        int t = dirs[i]; dirs[i] = dirs[j]; dirs[j] = t;
-    }
-
-    for (int k = 0; k < 4; k++) {
-        int d  = dirs[k];
-        int nr = r + DR[d], nc = c + DC[d];
-        if (nr < 0 || nr >= g_mh || nc < 0 || nc >= g_mw) continue;
-        if (g_vis[nr][nc]) continue;
-
-        g_vis[nr][nc] = 1;
-        g_walls[r ][c ] &= (unsigned char)~D_WALL[d];
-        g_walls[nr][nc] &= (unsigned char)~D_OPP [d];
-        g_dfs[g_dfs_top].r = nr;
-        g_dfs[g_dfs_top].c = nc;
-        g_dfs_top++;
-        return true;
-    }
-    g_dfs_top--;   /* backtrack */
-    return true;
-}
-
-/* ===================================================================== */
-/* §6  BFS solve                                                          */
-/* ===================================================================== */
-
-static int           g_parent  [MAZE_H_MAX][MAZE_W_MAX]; /* enc r*W+c    */
-static unsigned char g_bfs_vis [MAZE_H_MAX][MAZE_W_MAX];
-static unsigned char g_on_path [MAZE_H_MAX][MAZE_W_MAX];
-static struct { int r, c; } g_bq[MAZE_H_MAX * MAZE_W_MAX];
-static int g_bq_head, g_bq_tail;
-
-static void solve_start(void)
-{
-    memset(g_bfs_vis, 0, sizeof g_bfs_vis);
-    memset(g_on_path, 0, sizeof g_on_path);
-    memset(g_parent, -1, sizeof g_parent);
-    g_bq_head = g_bq_tail = 0;
-    g_bq[g_bq_tail].r = 0;
-    g_bq[g_bq_tail].c = 0;
-    g_bq_tail++;
-    g_bfs_vis[0][0] = 1;
-    g_phase = PH_SOLVE;
-}
-
-/*
- * trace_path() — walk the parent chain back from the goal cell to the
- * start, marking each cell along the way as on the shortest path.
- */
-static void trace_path(int gr, int gc)
-{
-    int pr = gr, pc = gc;
-    while (pr >= 0 && pc >= 0) {
-        g_on_path[pr][pc] = 1;
-        int enc = g_parent[pr][pc];
-        if (enc < 0) break;
-        pr = enc / MAZE_W_MAX;
-        pc = enc % MAZE_W_MAX;
-    }
-}
-
-static bool solve_step(void)
-{
-    if (g_bq_head >= g_bq_tail) { g_phase = PH_DONE; return false; }
-
-    int r = g_bq[g_bq_head].r;
-    int c = g_bq[g_bq_head].c;
-    g_bq_head++;
-
-    if (r == g_mh - 1 && c == g_mw - 1) {
-        trace_path(r, c);
-        g_phase = PH_DONE;
-        return false;
-    }
-
-    for (int d = 0; d < 4; d++) {
-        if (g_walls[r][c] & D_WALL[d]) continue;
-        int nr = r + DR[d], nc = c + DC[d];
-        if (nr < 0 || nr >= g_mh || nc < 0 || nc >= g_mw) continue;
-        if (g_bfs_vis[nr][nc]) continue;
-        g_bfs_vis[nr][nc] = 1;
-        g_parent [nr][nc] = r * MAZE_W_MAX + c;
-        g_bq[g_bq_tail].r = nr;
-        g_bq[g_bq_tail].c = nc;
-        g_bq_tail++;
-    }
-    return true;
-}
-
-/* ===================================================================== */
-/* §7  scene                                                              */
-/* ===================================================================== */
-
-static int g_rows, g_cols;
-
 /*
  * mark_cell() — bounds-checked mvaddch with the canonical
  * (chtype)(unsigned char) double-cast that prevents sign-extension
  * corruption on glyphs above 0x7F.  All maze drawing routes through
- * this single helper so clipping logic lives in exactly one place.
+ * this single helper, so clipping (against the rows/cols viewport) lives
+ * in exactly one place.
  */
-static void mark_cell(int sr, int sc, char ch, int pair, int attr)
+static void mark_cell(int sr, int sc, char ch, int pair, int attr, int rows, int cols)
 {
-    if (sr < 0 || sr >= g_rows) return;
-    if (sc < 0 || sc >= g_cols) return;
+    if (sr < 0 || sr >= rows) return;
+    if (sc < 0 || sc >= cols) return;
     chtype c = (chtype)(unsigned char)ch;
     if (pair) c |= (chtype)COLOR_PAIR(pair);
     if (attr) c |= (chtype)attr;
@@ -415,7 +586,7 @@ static void mark_cell(int sr, int sc, char ch, int pair, int attr)
  *   (odd,even)  → vertical wall   '|' or open ' '
  *   (odd,odd)   → cell interior
  */
-static void draw_lattice_pixel(int pr, int pc)
+static void draw_lattice_pixel(const Maze *m, int pr, int pc, int rows, int cols)
 {
     int sr = pr + HUD_ROWS;
     bool corner = !(pr & 1) && !(pc & 1);
@@ -423,50 +594,45 @@ static void draw_lattice_pixel(int pr, int pc)
     bool vwall  =  (pr & 1) && !(pc & 1);
 
     if (corner) {
-        mark_cell(sr, pc, '+', PAIR_WALL, A_BOLD);
+        mark_cell(sr, pc, '+', PAIR_WALL, A_BOLD, rows, cols);
         return;
     }
     if (hwall) {
         int r = pr / 2 - 1, c = pc / 2;
-        bool open = (r >= 0) && !(g_walls[r][c] & WALL_S);
-        if (open) mark_cell(sr, pc, ' ', 0, 0);
-        else      mark_cell(sr, pc, '-', PAIR_WALL, A_BOLD);
+        bool open = (r >= 0) && !(m->walls[r][c] & WALL_S);
+        if (open) mark_cell(sr, pc, ' ', 0, 0, rows, cols);
+        else      mark_cell(sr, pc, '-', PAIR_WALL, A_BOLD, rows, cols);
         return;
     }
     if (vwall) {
         int r = pr / 2, c = pc / 2 - 1;
-        bool open = (c >= 0) && !(g_walls[r][c] & WALL_E);
-        if (open) mark_cell(sr, pc, ' ', 0, 0);
-        else      mark_cell(sr, pc, '|', PAIR_WALL, A_BOLD);
+        bool open = (c >= 0) && !(m->walls[r][c] & WALL_E);
+        if (open) mark_cell(sr, pc, ' ', 0, 0, rows, cols);
+        else      mark_cell(sr, pc, '|', PAIR_WALL, A_BOLD, rows, cols);
     }
 }
 
 /* Pick the glyph + colour for the interior of a maze cell. */
-static void draw_cell_interior(int r, int c, int sr, int sc)
+static void draw_cell_interior(const Maze *m, int r, int c, int sr, int sc,
+                               int rows, int cols)
 {
-    if (g_phase == PH_GENERATE) {
-        if (g_dfs_top > 0 &&
-            g_dfs[g_dfs_top - 1].r == r &&
-            g_dfs[g_dfs_top - 1].c == c) {
-            mark_cell(sr, sc, '@', PAIR_FRONT, A_BOLD);
-        } else if (g_vis[r][c]) {
-            mark_cell(sr, sc, ' ', PAIR_VISIT, 0);
-        } else {
-            mark_cell(sr, sc, '#', PAIR_UNVISIT, 0);
-        }
+    if (m->phase == PH_GENERATE) {
+        if (is_carve_head(m, r, c)) mark_cell(sr, sc, '@', PAIR_FRONT, A_BOLD, rows, cols);
+        else if (m->vis[r][c])      mark_cell(sr, sc, ' ', PAIR_VISIT, 0, rows, cols);
+        else                        mark_cell(sr, sc, '#', PAIR_UNVISIT, 0, rows, cols);
         return;
     }
     /* PH_SOLVE or PH_DONE */
-    if (g_on_path[r][c])      mark_cell(sr, sc, '*', PAIR_PATH, A_BOLD);
-    else if (g_bfs_vis[r][c]) mark_cell(sr, sc, '.', PAIR_BFS,  0);
-    else if (g_vis[r][c])     mark_cell(sr, sc, ' ', PAIR_VISIT, 0);
-    else                      mark_cell(sr, sc, '#', PAIR_UNVISIT, 0);
+    if (m->on_path[r][c])      mark_cell(sr, sc, '*', PAIR_PATH, A_BOLD, rows, cols);
+    else if (m->bfs_vis[r][c]) mark_cell(sr, sc, '.', PAIR_BFS,  0, rows, cols);
+    else if (m->vis[r][c])     mark_cell(sr, sc, ' ', PAIR_VISIT, 0, rows, cols);
+    else                       mark_cell(sr, sc, '#', PAIR_UNVISIT, 0, rows, cols);
 }
 
-static void draw_grid(void)
+static void draw_grid(const Maze *m, int rows, int cols)
 {
-    int max_pr = 2 * g_mh;
-    int max_pc = 2 * g_mw;
+    int max_pr = 2 * m->h;
+    int max_pc = 2 * m->w;
     for (int pr = 0; pr <= max_pr; pr++) {
         for (int pc = 0; pc <= max_pc; pc++) {
             bool inside = (pr & 1) && (pc & 1);
@@ -474,44 +640,46 @@ static void draw_grid(void)
                 int r  = pr / 2;
                 int c  = pc / 2;
                 int sr = pr + HUD_ROWS;
-                draw_cell_interior(r, c, sr, pc);
+                draw_cell_interior(m, r, c, sr, pc, rows, cols);
             } else {
-                draw_lattice_pixel(pr, pc);
+                draw_lattice_pixel(m, pr, pc, rows, cols);
             }
         }
     }
 }
 
-static void draw_hud(void)
+static void draw_hud(const Scene *s)
 {
+    const Maze *m = &s->maze;
     const char *phase_str =
-        (g_phase == PH_GENERATE) ? "carving (DFS)" :
-        (g_phase == PH_SOLVE)    ? "solving (BFS)" :
-                                   "done";
+        (m->phase == PH_GENERATE) ? "carving (DFS)" :
+        (m->phase == PH_SOLVE)    ? "solving (BFS)" :
+                                    "done";
     char status[80];
-    snprintf(status, sizeof status, " maze %dx%d  %s  %s ",
-             g_mw, g_mh, phase_str, g_paused ? "PAUSED" : "running");
+    snprintf(status, sizeof status, " maze %dx%d  %s  %s  %s ",
+             m->w, m->h, THEMES[s->theme].name, phase_str,
+             s->paused ? "PAUSED" : "running");
 
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    int pad = g_cols - (int)strlen(status);
+    int pad = s->cols - (int)strlen(status);
     if (pad < 0) pad = 0;
     mvprintw(0, pad, "%s", status);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(g_rows - 1, 0,
-        " q:quit  r:regen  spc:skip-to-solve  p:pause  1/2/3:size ");
+    mvprintw(s->rows - 1, 0,
+        " q:quit  r:regen  spc:skip-to-solve  p:pause  1/2/3:size  t:theme ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void scene_draw(void)
+static void scene_draw(const Scene *s)
 {
-    draw_grid();
-    draw_hud();
+    draw_grid(&s->maze, s->rows, s->cols);
+    draw_hud(s);
 }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §6  app   (signals, user events, and the main loop)                    */
 /* ===================================================================== */
 
 static volatile sig_atomic_t g_quit   = 0;
@@ -525,47 +693,51 @@ static void sig_h(int s)
 
 static void cleanup(void) { endwin(); }
 
-static void calc_dims(int rows, int cols, int *mh, int *mw)
+static void install_signals(void)
 {
-    *mh = (rows - HUD_ROWS - 1) / 2;
-    *mw = (cols - 1) / 2;
-    if (*mh > MAZE_H_MAX) *mh = MAZE_H_MAX;
-    if (*mw > MAZE_W_MAX) *mw = MAZE_W_MAX;
-    if (*mh < 2) *mh = 2;
-    if (*mw < 2) *mw = 2;
+    signal(SIGINT,  sig_h);
+    signal(SIGTERM, sig_h);
+    signal(SIGWINCH, sig_h);
 }
 
-static void handle_key(int ch)
+/* Put the terminal into raw, non-blocking, no-cursor mode for animation. */
+static void terminal_init(void)
+{
+    initscr();
+    cbreak(); noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
+    typeahead(-1);
+}
+
+static void handle_key(Scene *s, int ch)
 {
     switch (ch) {
     case 'q': case 'Q': case 27: g_quit = 1; break;
-    case 'r': case 'R': maze_reset(); break;
-    case 'p': case 'P': g_paused = !g_paused; break;
+    case 'r': case 'R': maze_reset(&s->maze); break;
+    case 'p': case 'P': s->paused = !s->paused; break;
+    case 't':
+        s->theme = (s->theme + 1) % N_THEMES;
+        color_apply(&THEMES[s->theme]);
+        break;
+    case 'T':
+        s->theme = (s->theme - 1 + N_THEMES) % N_THEMES;
+        color_apply(&THEMES[s->theme]);
+        break;
     case ' ':
-        if (g_phase == PH_GENERATE) {
-            while (gen_step()) {}
-            solve_start();
-        } else if (g_phase == PH_SOLVE) {
-            while (solve_step()) {}
-            g_phase = PH_DONE;
+        if (s->maze.phase == PH_GENERATE) {
+            while (gen_step(&s->maze)) {}
+            solve_start(&s->maze);
+        } else if (s->maze.phase == PH_SOLVE) {
+            while (solve_step(&s->maze)) {}
+            s->maze.phase = PH_DONE;
         }
         break;
-    case '1': g_mh = 10;          g_mw = 40;          maze_reset(); break;
-    case '2': calc_dims(g_rows, g_cols, &g_mh, &g_mw); maze_reset(); break;
-    case '3': g_mh = MAZE_H_MAX;  g_mw = MAZE_W_MAX;  maze_reset(); break;
+    case '1': s->maze.h = 10;          s->maze.w = 40;          maze_reset(&s->maze); break;
+    case '2': calc_dims(s->rows, s->cols, &s->maze.h, &s->maze.w); maze_reset(&s->maze); break;
+    case '3': s->maze.h = MAZE_H_MAX;  s->maze.w = MAZE_W_MAX;  maze_reset(&s->maze); break;
     default: break;
-    }
-}
-
-static void step_simulation(void)
-{
-    if (g_paused) return;
-    if (g_phase == PH_GENERATE) {
-        for (int s = 0; s < GEN_STEPS; s++)
-            if (!gen_step()) { solve_start(); break; }
-    } else if (g_phase == PH_SOLVE) {
-        for (int s = 0; s < SOL_STEPS; s++)
-            if (!solve_step()) break;
     }
 }
 
@@ -573,40 +745,35 @@ int main(void)
 {
     srand((unsigned)time(NULL));
     atexit(cleanup);
-    signal(SIGINT,  sig_h);
-    signal(SIGTERM, sig_h);
-    signal(SIGWINCH, sig_h);
+    install_signals();
+    terminal_init();
+    color_apply(&THEMES[g_scene.theme]);
 
-    initscr();
-    cbreak(); noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    color_init();
-
-    getmaxyx(stdscr, g_rows, g_cols);
-    calc_dims(g_rows, g_cols, &g_mh, &g_mw);
-    maze_reset();
+    getmaxyx(stdscr, g_scene.rows, g_scene.cols);
+    calc_dims(g_scene.rows, g_scene.cols, &g_scene.maze.h, &g_scene.maze.w);
+    maze_reset(&g_scene.maze);
 
     while (!g_quit) {
         long long frame_start = clock_ns();
 
+        /* USER EVENT: resize — re-fit and reset (not a tick) */
         if (g_resize) {
             g_resize = 0;
             endwin(); refresh();
-            getmaxyx(stdscr, g_rows, g_cols);
-            calc_dims(g_rows, g_cols, &g_mh, &g_mw);
-            maze_reset();
+            getmaxyx(stdscr, g_scene.rows, g_scene.cols);
+            calc_dims(g_scene.rows, g_scene.cols, &g_scene.maze.h, &g_scene.maze.w);
+            maze_reset(&g_scene.maze);
         }
 
+        /* USER EVENT: keys */
         int ch = getch();
-        if (ch != ERR) handle_key(ch);
+        if (ch != ERR) handle_key(&g_scene, ch);
 
-        step_simulation();
+        step_simulation(&g_scene);   /* PER-TICK COMBINE (see ARCHITECTURE) */
 
+        /* RENDER then PERFORMANCE frame cap */
         erase();
-        scene_draw();
+        scene_draw(&g_scene);
         wnoutrefresh(stdscr);
         doupdate();
 

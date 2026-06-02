@@ -12,8 +12,8 @@
  *       additions, and 'o' resting points fill the interior. After
  *       a couple of seconds the frontier collapses and the screen
  *       is covered in a "blue-noise" point cloud — uniformly
- *       distributed but with no two points closer than r. HOLD;
- *       supernova reset; loop forever.
+ *       distributed but with no two points closer than r, coloured as a
+ *       radial gradient from the seed.  Holds, then resets and loops.
  *
  * Study alongside: ./drunkards_walk_cave_showcase.c — both grow from
  *       a centre seed but the math is opposite. Drunkard's walk is a
@@ -24,13 +24,12 @@
  *       even but never aligned to a grid.
  *
  * Section map:
- *   §1 config   — map size, radius, attempts, themes, glow rates
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 cave themes
- *   §5 poisson  — Sample, Poisson, background grid, step
- *   §6 scene    — GROWING / HOLD state machine
- *   §7 screen   — ASCII render: o, O, * point glyphs
- *   §8 app      — signals, resize, main loop
+ *   §1 config+types — sizes, radius, attempts, themes, and all struct types
+ *   §2 performance  — monotonic clock + frame cap
+ *   §3 logic        — pure grid-index + candidate-distance checks
+ *   §4 simulation   — Bridson step, reset, and the per-tick combine
+ *   §5 render       — theme palette, ASCII point cloud, HUD
+ *   §6 app          — signals, resize, key events, main loop
  *
  * Keys:
  *   q / ESC    quit
@@ -96,18 +95,27 @@
  *                  distance query: each candidate checks at most
  *                  25 cells, not every existing point.
  *
- * References     : • Bridson, R. (2007) — "Fast Poisson Disk Sampling
- *                    in Arbitrary Dimensions". The original paper:
- *                    https://www.cs.ubc.ca/~rbridson/docs/bridson-siggraph07-poissondisk.pdf
- *                  • Wikipedia — "Poisson distribution sampling
- *                    (Poisson disk)":
- *                    https://en.wikipedia.org/wiki/Supersampling#Poisson_disc
- *                  • Inigo Quilez — "Voronoi distances on a regular
- *                    grid" (related blue-noise techniques):
- *                    https://iquilezles.org/articles/voronoilines/
- *                  • Mike Bostock — "Visualizing Algorithms"
- *                    (animated Poisson disk explainer):
- *                    https://bost.ocks.org/mike/algorithms/
+ * References     : Concept —
+ *                  [1] Bridson, R. (2007) — "Fast Poisson Disk Sampling in
+ *                      Arbitrary Dimensions" (SIGGRAPH sketches).  The paper
+ *                      this file animates; source of the r/√2 grid + K=30:
+ *                      https://www.cs.ubc.ca/~rbridson/docs/bridson-siggraph07-poissondisk.pdf
+ *                  [2] Wikipedia — "Supersampling" (Poisson-disc section):
+ *                      https://en.wikipedia.org/wiki/Supersampling#Poisson_disc
+ *                  [3] Bostock, Mike — "Visualizing Algorithms" (animated
+ *                      Poisson-disk + blue-noise explainer):
+ *                      https://bost.ocks.org/mike/algorithms/
+ *                  [4] Quilez, Inigo — "Voronoi distances" (related blue-noise
+ *                      / point-distribution techniques):
+ *                      https://iquilezles.org/articles/voronoilines/
+ *                  Rendering —
+ *                  [5] Bourke, Paul — "Colour Ramping for Data Visualisation",
+ *                      the model for colouring points by distance from the
+ *                      seed: paulbourke.net/texture_colour/colourramp
+ *                  [6] Padala — "NCURSES Programming HOWTO", TLDP: colour
+ *                      pairs, glyph output, non-blocking input, resize.
+ *                  [7] xterm 256-colour palette — the index the Theme ramps
+ *                      draw from: https://jonasjacek.github.io/colors/
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -131,12 +139,12 @@
  * it can't find a clear spot after 30 throws, it stops trying.
  *
  * Three layers in the visible:
- *   1. RESTING POINTS 'o' (theme point colour) — accepted samples
- *      that have already exhausted their attempts.
+ *   1. RESTING POINTS 'o' (theme gradient, coloured by distance from the
+ *      seed) — accepted samples that have exhausted their attempts.
  *   2. ACTIVE FRONTIER 'O' (theme active colour, brighter) — points
  *      still on the active list, each still throwing darts.
- *   3. FLASH '*' (theme flash colour, gold-bold) — the bright pop of
- *      a fresh acceptance.
+ *   3. FLASH '*' (theme flash colour, bold) — the bright pop of a
+ *      fresh acceptance.
  *
  * The active frontier shrinks over time: as the cloud fills in,
  * points lose their elbow room and stop accepting candidates,
@@ -170,7 +178,7 @@
  *     h. If P.attempts_left == 0 → swap-remove from active_queue:
  *        active_queue[qi] = active_queue[--n_active].
  *  3. Repeat 2 until done.
- *  4. HOLD on the cloud, supernova reset, goto 1 with new seed.
+ *  4. HOLD on the cloud, then reset and goto 1 with a new seed.
  *
  * KEY FORMULAS
  * ────────────
@@ -233,6 +241,40 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
+ *
+ * All data lives in the types in §1 (Sample, Poisson, Scene, Screen, App).
+ * Every other section is functions for ONE concern:
+ *
+ *   Layer        Section  Mutates
+ *   ─────────────────────────────────────────────────────────────────────
+ *   PERFORMANCE  §2       nothing — reads the clock / sleeps
+ *   LOGIC        §3       NOTHING — pure reads (poisson_grid_idx,
+ *                         poisson_candidate_valid): no mutation, no I/O
+ *   SIMULATION   §4       Poisson (samples, bg grid, active queue, counts)
+ *                         + Scene state / hold timer; the per-tick combine
+ *   RENDER       §5       the terminal only — reads the Scene, never writes
+ *   APP          §6       App (sim_fps, map size, flags) + Scene knobs; events
+ *
+ *   EFFECTS — the per-sample `glow` (the fresh-add '*' flash).  Cosmetic
+ *     only: read by the renderer, never by a sim/logic decision.  Set to 1.0
+ *     when a sample is accepted (poisson_step) and decayed each tick at the
+ *     top of scene_tick.  (The old full-screen "supernova" flash was removed.)
+ *   DELAYS — the HOLD phase: scene_tick counts hold_timer down from
+ *     HOLD_SECONDS, then resets.  `paused` freezes the whole tick.  Both live
+ *     inside scene_tick; no separate timer machinery.
+ *
+ * PER-TICK COMBINE — scene_tick (§4) is the ONE place state advances:
+ *     1. EFFECTS    : decay every sample's glow by exp(-rate·dt)
+ *     2. SIMULATION : GROWING → ops_per_tick × poisson_step; at active-empty
+ *                     enter HOLD.  HOLD → count hold_timer down; at 0, reset.
+ *   RENDER (scene_draw + HUD) then PERFORMANCE (frame cap) run every frame.
+ *
+ * USER EVENTS are NOT the tick: keys (app_handle_key) and resize
+ * (app_do_resize) mutate App/Scene directly in §6 — reset, refit, theme /
+ * speed / Hz changes — but none of them call scene_tick().
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -251,7 +293,7 @@
 #include <time.h>
 
 /* ===================================================================== */
-/* §1  config                                                             */
+/* §1  config + types                                                     */
 /* ===================================================================== */
 
 enum {
@@ -279,23 +321,26 @@ enum {
     OPS_PER_TICK_DEF  =  64,
     OPS_PER_TICK_MAX  = 4096,
 
-    HUD_COLS          =  72,
+    RENDER_CAP_FPS    =  60,        /* hard cap on rendered frames/sec (sim ticks run at sim_fps) */
+    MAX_FRAME_MS      = 100,        /* clamp one frame's dt — spiral-of-death guard after a stall */
     FPS_UPDATE_MS     = 500,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Colour-pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md.
+     * Resting points are drawn along a RAMP_LEN-step gradient
+     * (PAIR_RAMP_0 .. PAIR_RAMP_0+RAMP_LEN-1); the active frontier and the
+     * fresh-add flash get one accent pair each. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_BG           =   3,        /* dim background hint (unused glyph) */
-    PAIR_POINT        =   4,        /* 'o' resting samples                */
-    PAIR_ACTIVE       =   5,        /* 'O' active frontier samples        */
-    PAIR_FLASH        =   6,        /* '*' fresh acceptance flash         */
-    PAIR_FLASHHUD     =   7,        /* HUD glow accent                    */
-    PAIR_SUPERNOVA    =   8,        /* yellow reset flash                 */
+    PAIR_ACTIVE       =   3,        /* 'O' active frontier samples */
+    PAIR_FLASH        =   4,        /* '*' fresh-add flash         */
+    PAIR_RAMP_0       =   5,        /* 'o' resting gradient base   */
 };
 
-/* Glow decay rates. */
-#define POINT_GLOW_DECAY    2.5f    /* fresh-add flash duration ~0.7 s */
-#define SUPERNOVA_DECAY     4.0f
+#define RAMP_LEN      6            /* resting-point gradient steps (seed → edge) */
+#define PAIR_RAMP(k)  (PAIR_RAMP_0 + (k))
+
+/* Glow decay rate for the fresh-add '*' flash (~0.7 s). */
+#define POINT_GLOW_DECAY    2.5f
 #define GLOW_THRESHOLD      0.05f
 
 #define HOLD_SECONDS        2.5f
@@ -304,39 +349,142 @@ enum {
  * (sparse, easy to read individual points). Smaller r → denser cloud
  * but harder to distinguish individual points. */
 #define POISSON_R           4.0f
+#define SQRT2               1.41421356f   /* bg-grid cell = r / √2 (Bridson) */
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
 /*
- * Themes — same 10 names as the other procedural showcases. Each
- * theme defines four colours: bg/point/active/flash. PAIR_BG is
- * reserved but currently unused (no background pattern is drawn).
+ * Theme — the cloud's colour scheme, cycled with t/T.
+ *
+ * WHY a `ramp` for resting points: a finished Poisson-disk cloud is otherwise
+ * a flat field of identical dots.  Colouring each resting point by its
+ * distance from the seed turns the cloud into expanding colour rings that
+ * reveal the growth order (scalar→colour ramp, Bourke [5]).  `active`/`flash`
+ * are bright accents drawn on top.  Every index sits in the bright half of the
+ * 256-colour cube (palette rule); indices follow the xterm-256 chart [7].
  */
 typedef struct {
-    const char *name;
-    short       bg, point, active, flash;
+    const char *name;             /* HUD label, e.g. "AURORA"                 */
+    short       ramp[RAMP_LEN];   /* resting 'o' gradient, seed centre → edge */
+    short       active;           /* 'O' active frontier (bright accent)      */
+    short       flash;            /* '*' fresh-add pop (brightest)            */
 } Theme;
 
 #define N_THEMES 10
 
 static const Theme themes[N_THEMES] = {
-    /*           name      bg point active flash */
-    { "DEFAULT",  240,   67,  117,  220 },   /* grey / blue / cyan / gold     */
-    { "MATRIX",    22,   34,  118,   46 },   /* greens                        */
-    { "NOVA",      53,  129,  213,  219 },   /* purples                       */
-    { "MONO",     234,  244,  250,  254 },   /* greyscale                     */
-    { "OCEAN",     17,   33,   51,   39 },   /* navy / cyan                   */
-    { "FIRE",      52,  124,  208,  226 },   /* dark red / orange / yellow    */
-    { "EARTH",     58,  137,  173,  230 },   /* brown / cream                 */
-    { "FOREST",    22,   64,   82,  144 },   /* greens to tan                 */
-    { "DESERT",    94,  222,  178,  230 },   /* sandy                         */
-    { "ARCTIC",    18,   39,  159,  231 },   /* navy / ice / white            */
+    /*  name        ramp: seed ───────────────────► edge      active flash */
+    { "AURORA", {  33,  39,  45,  51, 123, 195 },              226,  231 },
+    { "MATRIX", {  28,  34,  40,  46,  82, 120 },              190,  231 },
+    { "NOVA",   {  54,  92, 128, 164, 200, 219 },              213,  231 },
+    { "MONO",   { 240, 244, 247, 250, 253, 255 },              231,  255 },
+    { "OCEAN",  {  24,  31,  38,  45,  51, 123 },              159,  231 },
+    { "FIRE",   {  88, 124, 160, 202, 214, 226 },              214,  231 },
+    { "EARTH",  {  94, 130, 136, 179, 180, 230 },              222,  231 },
+    { "FOREST", {  28,  64,  70, 106, 148, 190 },              226,  231 },
+    { "DESERT", { 137, 143, 179, 185, 221, 230 },              223,  231 },
+    { "ARCTIC", {  25,  31,  39,  45, 123, 195 },              159,  231 },
 };
 
+/*
+ * Sample — one accepted point of the blue-noise set (Bridson [1]).
+ *
+ * WHY positions are CONTINUOUS (float), not grid cells: the algorithm reasons
+ * in real coordinates and only rounds to a character cell at render time, so
+ * the "≥ r apart" guarantee is exact, not quantised to the display grid.
+ */
+typedef struct {
+    float x, y;          /* continuous position, in cell units                  */
+    int   attempts_left; /* Bridson's K budget: counts K→0, then this point
+                          * leaves the active queue (its neighbourhood is full) */
+    float glow;          /* EFFECTS: fresh-add flash, 1.0 on accept → 0 (~0.7s) */
+} Sample;
+
+/*
+ * Poisson — the sampler: the accepted point set plus the two structures
+ * Bridson's algorithm needs to grow it fast (Bridson [1]).
+ *
+ * WHY the BACKGROUND GRID: the costly step is "is this candidate ≥ r from
+ * every existing point?".  Sizing each cell r/√2 means a cell can hold at most
+ * one sample, so that O(N) query collapses to scanning a fixed 5×5 cell box —
+ * O(1).  bg_grid[cell] is the sample index living there, or -1.
+ *
+ * WHY the ACTIVE QUEUE: candidates only ever spawn near recently-added points,
+ * so the algorithm keeps a list of points "still throwing darts"; a point that
+ * misses K times in a row is swap-removed (O(1)).  When the queue empties the
+ * cloud is complete.
+ */
+typedef struct {
+    /* ── geometry + spatial-acceleration grid ── */
+    int    w, h;                  /* map size in cell units                       */
+    float  radius;                /* exclusion distance r between any two points  */
+    float  cell_size;             /* bg-grid cell = r/√2 (⇒ ≤ 1 sample per cell)  */
+    int    gw, gh;                /* bg-grid dimensions in cells                  */
+    int    bg_grid[MAX_GRID];     /* per cell: the sample index there, or -1      */
+
+    /* ── the accepted point set, in arrival order ── */
+    Sample samples[MAX_SAMPLES];
+    int    n_samples;
+
+    /* ── Bridson active list: indices of points still spawning candidates ── */
+    int    active_queue[MAX_SAMPLES];
+    int    n_active;              /* 0 ⇒ the algorithm has finished               */
+} Poisson;
+
+/*
+ * Scene state machine:
+ *
+ *   GROWING — call poisson_step up to ops_per_tick times. Transitions
+ *             to HOLD when the active queue is empty.
+ *   HOLD    — wait HOLD_SECONDS, then poisson_reset and back to GROWING.
+ */
+typedef enum {
+    SCENE_GROWING = 0,
+    SCENE_HOLD    = 1,
+} SceneState;
+
+/* Scene — the animated sampling run, as a table of contents:
+ *   WHAT      : p — the Poisson sampler being grown.
+ *   HOW       : ops_per_tick — Bridson attempts advanced per frame.
+ *   run-state : state + hold_timer (the GROWING→HOLD→reset lifecycle), paused.
+ *   RENDER    : current_theme — the active palette. */
+typedef struct {
+    Poisson     p;              /* WHAT: the sampler being grown            */
+    SceneState  state;          /* run-state: GROWING / HOLD                */
+    float       hold_timer;     /* run-state: HOLD-phase countdown, seconds */
+    bool        paused;         /* run-state: freeze the tick               */
+    int         ops_per_tick;   /* HOW: Bridson attempts per frame          */
+    int         current_theme;  /* RENDER: index into themes[]              */
+} Scene;
+
+/* Screen — the terminal viewport (size in character cells).  The receiver for
+ * terminal setup/resize and the renderers, so they take a Screen (not the
+ * whole App) and stay decoupled from app-level state. */
+typedef struct { int cols, rows; } Screen;
+
+/* App — the whole program: the animated Scene plus the terminal and the
+ * app-level loop state.
+ *   subsystems : the sampling scene + the terminal viewport.
+ *   tuning     : sim_fps (tick rate).   geometry : map_w/map_h, fitted to fit.
+ *   lifecycle  : signal-driven quit / resize flags. */
+typedef struct {
+    /* subsystems */
+    Scene                 scene;
+    Screen                screen;
+    /* tuning + derived geometry */
+    int                   sim_fps;       /* simulation ticks per second    */
+    int                   map_w, map_h;  /* cells, fitted to the terminal  */
+    /* lifecycle flags (set by signal handlers) */
+    volatile sig_atomic_t running;
+    volatile sig_atomic_t need_resize;
+} App;
+
+static App g_app;
+
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  performance   (monotonic clock + frame-cap sleep)                  */
 /* ===================================================================== */
 
 static int64_t clock_ns(void)
@@ -357,101 +505,8 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  logic   (pure decisions: read-only, no I/O — cannot be corrupted)  */
 /* ===================================================================== */
-
-static void theme_apply(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        init_pair(PAIR_BG,     t->bg,     -1);
-        init_pair(PAIR_POINT,  t->point,  -1);
-        init_pair(PAIR_ACTIVE, t->active, -1);
-        init_pair(PAIR_FLASH,  t->flash,  -1);
-    } else {
-        init_pair(PAIR_BG,     COLOR_WHITE,   -1);
-        init_pair(PAIR_POINT,  COLOR_BLUE,    -1);
-        init_pair(PAIR_ACTIVE, COLOR_CYAN,    -1);
-        init_pair(PAIR_FLASH,  COLOR_YELLOW,  -1);
-    }
-}
-
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,        226, -1);
-        init_pair(PAIR_HINT,        51, -1);
-        init_pair(PAIR_FLASHHUD,   220, -1);
-        init_pair(PAIR_SUPERNOVA,  226, -1);
-    } else {
-        init_pair(PAIR_HUD,       COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT,      COLOR_CYAN,    -1);
-        init_pair(PAIR_FLASHHUD,  COLOR_YELLOW,  -1);
-        init_pair(PAIR_SUPERNOVA, COLOR_YELLOW,  -1);
-    }
-    theme_apply(0);
-}
-
-/* ===================================================================== */
-/* §5  poisson                                                            */
-/* ===================================================================== */
-
-/*
- * Sample — one accepted point.
- *
- *   x, y         : continuous position in cell units
- *   attempts_left: K → 0; when 0 the sample falls off the active queue
- *   glow         : flash-on-add, decays over ~0.7 s
- */
-typedef struct {
-    float x, y;
-    int   attempts_left;
-    float glow;
-} Sample;
-
-/*
- * Poisson — the simulation heart.
- *
- *   w, h         : map dims in cell units
- *   radius       : minimum distance r between any two samples
- *   cell_size    : background grid cell size = r / √2
- *   gw, gh       : background grid dims in cells
- *   bg_grid[]    : per bg cell, the sample index living there or -1
- *
- *   samples[]    : every accepted sample, in arrival order
- *   n_samples    : sample count
- *
- *   active_queue[]: indices into samples[] of points still attempting
- *   n_active     : queue length
- *
- *   attempts_total / attempts_succ : HUD stats
- *   done         : true once the active queue empties
- *   supernova_glow_t : a single-float global supernova fade
- */
-typedef struct {
-    int    w, h;
-    float  radius;
-    float  cell_size;
-    int    gw, gh;
-    int    bg_grid[MAX_GRID];
-
-    Sample samples[MAX_SAMPLES];
-    int    n_samples;
-
-    int    active_queue[MAX_SAMPLES];
-    int    n_active;
-
-    int    attempts_total;
-    int    attempts_succ;
-    bool   done;
-
-    float  supernova_glow_t;
-} Poisson;
-
-static inline float rand_unit(void) { return (float)rand() / (float)RAND_MAX; }
 
 /*
  * poisson_grid_idx — linear index into bg_grid[] for a continuous (x, y).
@@ -502,64 +557,85 @@ static bool poisson_candidate_valid(const Poisson *p, float cx, float cy)
 }
 
 /*
- * poisson_step — one Bridson attempt. Picks a random active point,
- * generates one annulus candidate, accepts it if valid. Removes the
- * picked point from the active queue if its attempt budget is exhausted.
+ * ramp_index — gradient tier (0..RAMP_LEN-1) for a resting point, by its
+ * distance from the seed normalised to the map half-diagonal (`inv_maxd` =
+ * 1/half-diagonal).  This is the radial-gradient mapping the renderer uses.
+ */
+static int ramp_index(const Sample *sm, const Sample *seed, float inv_maxd)
+{
+    float dx = sm->x - seed->x, dy = sm->y - seed->y;
+    int k = (int)(sqrtf(dx * dx + dy * dy) * inv_maxd * RAMP_LEN);
+    if (k < 0) k = 0;
+    if (k >= RAMP_LEN) k = RAMP_LEN - 1;
+    return k;
+}
+
+/* ===================================================================== */
+/* §4  simulation   (advances the Poisson state + the per-tick combine)   */
+/* ===================================================================== */
+
+static inline float rand_unit(void) { return (float)rand() / (float)RAND_MAX; }
+
+/* A uniformly random candidate in the annulus [r, 2r] around `seed` —
+ * Bridson's spawn: uniform angle, uniform distance in [r, 2r]. */
+static void annulus_candidate(const Sample *seed, float r, float *cx, float *cy)
+{
+    float a  = 2.0f * (float)M_PI * rand_unit();
+    float dr = r + r * rand_unit();
+    *cx = seed->x + cosf(a) * dr;
+    *cy = seed->y + sinf(a) * dr;
+}
+
+/* Add an accepted candidate to the point set, the bg grid, and the active
+ * queue (fresh K budget + a flash glow). */
+static void poisson_accept(Poisson *p, float cx, float cy)
+{
+    if (p->n_samples >= MAX_SAMPLES) return;
+    int new_idx = p->n_samples++;
+    p->samples[new_idx] = (Sample){
+        .x = cx, .y = cy,
+        .attempts_left = ATTEMPTS_PER_POINT,
+        .glow = 1.0f,
+    };
+    p->bg_grid[poisson_grid_idx(p, cx, cy)] = new_idx;
+    p->active_queue[p->n_active++] = new_idx;
+}
+
+/*
+ * poisson_step — one Bridson attempt: pick a random active point, throw a dart
+ * into its annulus, accept it if it clears every neighbour, and retire the
+ * point if its attempt budget is exhausted.
  *
  * Returns true if work was done; false when the active queue is empty
  * (algorithm finished).
  */
 static bool poisson_step(Poisson *p)
 {
-    if (p->n_active <= 0) {
-        p->done = true;
+    if (p->n_active <= 0)
         return false;
-    }
-
-    p->attempts_total++;
 
     int qi = rand() % p->n_active;
-    int si = p->active_queue[qi];
-    Sample *seed = &p->samples[si];
+    Sample *seed = &p->samples[p->active_queue[qi]];
     seed->attempts_left--;
 
-    /* Generate candidate in annulus [r, 2r] around the seed. */
-    float a  = 2.0f * (float)M_PI * rand_unit();
-    float dr = p->radius + p->radius * rand_unit();
-    float cx = seed->x + cosf(a) * dr;
-    float cy = seed->y + sinf(a) * dr;
+    float cx, cy;
+    annulus_candidate(seed, p->radius, &cx, &cy);
+    if (poisson_candidate_valid(p, cx, cy))
+        poisson_accept(p, cx, cy);
 
-    if (poisson_candidate_valid(p, cx, cy)) {
-        if (p->n_samples < MAX_SAMPLES) {
-            int new_idx = p->n_samples++;
-            p->samples[new_idx] = (Sample){
-                .x = cx, .y = cy,
-                .attempts_left = ATTEMPTS_PER_POINT,
-                .glow = 1.0f,
-            };
-            p->bg_grid[poisson_grid_idx(p, cx, cy)] = new_idx;
-            p->active_queue[p->n_active++] = new_idx;
-            p->attempts_succ++;
-        }
-    }
-
-    if (seed->attempts_left <= 0) {
-        /* Swap-remove from active queue — O(1). */
-        p->active_queue[qi] = p->active_queue[--p->n_active];
-    }
+    if (seed->attempts_left <= 0)              /* neighbourhood saturated → retire */
+        p->active_queue[qi] = p->active_queue[--p->n_active];  /* O(1) swap-remove */
     return true;
 }
 
-/*
- * poisson_reset — clear everything, drop one seed point near the
- * centre, paint a global supernova fade.
- */
-static void poisson_reset(Poisson *p, int w, int h)
+/* Size the background grid (cell = r/√2, so ≤ 1 sample per cell) for a w×h
+ * map and clear every cell to -1 (empty). */
+static void poisson_init_grid(Poisson *p, int w, int h)
 {
     p->w = w;
     p->h = h;
     p->radius = POISSON_R;
-    p->cell_size = p->radius / 1.41421356f;
+    p->cell_size = p->radius / SQRT2;
     p->gw = (int)ceilf((float)w / p->cell_size) + 1;
     p->gh = (int)ceilf((float)h / p->cell_size) + 1;
     if (p->gw * p->gh > MAX_GRID) {
@@ -567,22 +643,18 @@ static void poisson_reset(Poisson *p, int w, int h)
         p->gw = MAX_GRID / p->gh;
     }
     for (int i = 0; i < p->gw * p->gh; i++) p->bg_grid[i] = -1;
+}
 
-    p->n_samples = 0;
-    p->n_active = 0;
-    p->attempts_total = 0;
-    p->attempts_succ  = 0;
-    p->done = false;
-    p->supernova_glow_t = 1.0f;
-
-    /* Seed with one random point near the centre — small jitter so
-     * runs don't all start on the same exact pixel. */
-    float sx = (float)w / 2.0f + ((float)(rand() % 7) - 3.0f);
-    float sy = (float)h / 2.0f + ((float)(rand() % 5) - 2.0f);
-    if (sx < 1.0f)              sx = 1.0f;
-    if (sx >= (float)w - 1.0f)  sx = (float)w - 1.5f;
-    if (sy < 1.0f)              sy = 1.0f;
-    if (sy >= (float)h - 1.0f)  sy = (float)h - 1.5f;
+/* Drop the single seed point near the map centre (small jitter so runs don't
+ * all start on the same pixel) and prime the sample set + active queue. */
+static void poisson_seed_center(Poisson *p)
+{
+    float sx = (float)p->w / 2.0f + ((float)(rand() % 7) - 3.0f);
+    float sy = (float)p->h / 2.0f + ((float)(rand() % 5) - 2.0f);
+    if (sx < 1.0f)                 sx = 1.0f;
+    if (sx >= (float)p->w - 1.0f)  sx = (float)p->w - 1.5f;
+    if (sy < 1.0f)                 sy = 1.0f;
+    if (sy >= (float)p->h - 1.0f)  sy = (float)p->h - 1.5f;
 
     p->samples[0] = (Sample){
         .x = sx, .y = sy,
@@ -595,30 +667,16 @@ static void poisson_reset(Poisson *p, int w, int h)
     p->n_active = 1;
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
-
 /*
- * Scene state machine:
- *
- *   GROWING — call poisson_step up to ops_per_tick times. Transitions
- *             to HOLD when the active queue is empty.
- *   HOLD    — wait HOLD_SECONDS, then poisson_reset and back to GROWING.
+ * poisson_reset — size a fresh grid, clear the counts, and drop one seed.
  */
-typedef enum {
-    SCENE_GROWING = 0,
-    SCENE_HOLD    = 1,
-} SceneState;
-
-typedef struct {
-    Poisson     p;
-    SceneState  state;
-    float       hold_timer;
-    bool        paused;
-    int         ops_per_tick;
-    int         current_theme;
-} Scene;
+static void poisson_reset(Poisson *p, int w, int h)
+{
+    poisson_init_grid(p, w, h);
+    p->n_samples = 0;
+    p->n_active  = 0;
+    poisson_seed_center(p);     /* → n_samples = 1, n_active = 1 */
+}
 
 static void scene_reset(Scene *s, int mw, int mh)
 {
@@ -640,14 +698,10 @@ static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
 
-    /* Decay glows. The supernova is a single global value; per-sample
-     * glows decay individually. */
+    /* Decay each fresh-add flash individually (~0.7 s). */
     float decay_pt = expf(-POINT_GLOW_DECAY * dt);
-    float decay_nv = expf(-SUPERNOVA_DECAY  * dt);
-    for (int i = 0; i < s->p.n_samples; i++) {
+    for (int i = 0; i < s->p.n_samples; i++)
         s->p.samples[i].glow *= decay_pt;
-    }
-    s->p.supernova_glow_t *= decay_nv;
 
     switch (s->state) {
 
@@ -671,10 +725,32 @@ static void scene_tick(Scene *s, float dt)
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §5  render   (state → screen: reads the Scene, mutates only the terminal) */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/* Install one theme's palette: the resting-point ramp + the active/flash
+ * accents (the HUD pairs are fixed, set in color_init). */
+static void theme_apply(const Theme *t)
+{
+    if (COLORS >= 256) {
+        for (int k = 0; k < RAMP_LEN; k++) init_pair(PAIR_RAMP(k), t->ramp[k], -1);
+        init_pair(PAIR_ACTIVE, t->active, -1);
+        init_pair(PAIR_FLASH,  t->flash,  -1);
+    } else {
+        for (int k = 0; k < RAMP_LEN; k++) init_pair(PAIR_RAMP(k), COLOR_BLUE, -1);
+        init_pair(PAIR_ACTIVE, COLOR_CYAN,   -1);
+        init_pair(PAIR_FLASH,  COLOR_YELLOW, -1);
+    }
+}
+
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    init_pair(PAIR_HUD,  (COLORS >= 256) ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, (COLORS >= 256) ?  51 : COLOR_CYAN,   -1);
+    theme_apply(&themes[0]);
+}
 
 static void screen_init(Screen *s)
 {
@@ -701,29 +777,16 @@ static void scene_draw(const Scene *s, int cols, int rows)
     const Poisson *p = &s->p;
 
     int gx0 = (cols - p->w) / 2;
-    int gy0 = ((rows - 3) - p->h) / 2 + 2;   /* row 0+1 HUD, last row hint */
+    int gy0 = ((rows - 3) - p->h) / 2 + 2;   /* rows 0+1 HUD, last row hint */
     if (gx0 < 0) gx0 = 0;
     if (gy0 < 2) gy0 = 2;
 
-    /* Supernova flash — paint ONLY when active so we don't iterate
-     * the full screen most frames. */
-    if (p->supernova_glow_t > GLOW_THRESHOLD) {
-        attron(COLOR_PAIR(PAIR_SUPERNOVA) | A_BOLD);
-        for (int y = 0; y < p->h; y++) {
-            int sy = gy0 + y;
-            if (sy < 0 || sy >= rows) continue;
-            for (int x = 0; x < p->w; x++) {
-                int sx = gx0 + x;
-                if (sx < 0 || sx >= cols) continue;
-                /* Sparse pattern so it looks like a flash, not solid. */
-                if (((x ^ y) & 3) == 0) mvaddch(sy, sx, '*');
-            }
-        }
-        attroff(COLOR_PAIR(PAIR_SUPERNOVA) | A_BOLD);
-    }
+    /* Resting points are coloured by their distance from the seed, so the
+     * blue-noise cloud reads as a radial gradient expanding outward.  The
+     * active frontier and the fresh-add flash render on top in accent colours. */
+    const Sample *seed = &p->samples[0];
+    float inv_maxd = 1.0f / (0.5f * sqrtf((float)(p->w * p->w + p->h * p->h)) + 1.0f);
 
-    /* Render samples. Each sample at (x, y) rounds to a cell; with
-     * radius ≥ 4 cells, no two samples ever round to the same cell. */
     for (int i = 0; i < p->n_samples; i++) {
         const Sample *sm = &p->samples[i];
         int sx = gx0 + (int)(sm->x + 0.5f);
@@ -734,16 +797,16 @@ static void scene_draw(const Scene *s, int cols, int rows)
         int  pair, attr;
         char glyph;
 
-        if (sm->glow > GLOW_THRESHOLD) {
+        if (sm->glow > GLOW_THRESHOLD) {            /* fresh acceptance pop */
             pair  = PAIR_FLASH;
             attr  = A_BOLD;
             glyph = '*';
-        } else if (sm->attempts_left > 0) {
+        } else if (sm->attempts_left > 0) {         /* still on the frontier */
             pair  = PAIR_ACTIVE;
             attr  = A_BOLD;
             glyph = 'O';
-        } else {
-            pair  = PAIR_POINT;
+        } else {                                    /* resting → gradient by radius */
+            pair  = PAIR_RAMP(ramp_index(sm, seed, inv_maxd));
             attr  = A_NORMAL;
             glyph = 'o';
         }
@@ -754,7 +817,18 @@ static void scene_draw(const Scene *s, int cols, int rows)
     }
 }
 
-static void screen_draw(Screen *sc, const Scene *s,
+/* Draw one HUD row left-aligned at `row`, clipped to the terminal width. */
+static void draw_hud_row(const Screen *sc, int row, int pair, int attr, const char *text)
+{
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", text);
+    if ((int)strlen(buf) > sc->cols) buf[sc->cols] = '\0';
+    attron(COLOR_PAIR(pair) | attr);
+    mvprintw(row, 0, "%s", buf);
+    attroff(COLOR_PAIR(pair) | attr);
+}
+
+static void screen_draw(const Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
     erase();
@@ -766,65 +840,31 @@ static void screen_draw(Screen *sc, const Scene *s,
         (s->state == SCENE_GROWING)   ? "GROWING" :
                                         "HOLD   ";
 
-    /* Acceptance rate — useful debugging stat showing how saturated
-     * the cloud is (drops from ~70% early to <5% near the end). */
-    int accept_pct = (p->attempts_total > 0)
-                   ? (100 * p->attempts_succ / p->attempts_total)
-                   : 0;
+    char line[256];
 
-    /* Row 0 right — primary state. */
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  %3d Hz  ops:%-3d  %s  pts:%-4d  active:%-3d ",
-             fps, sim_fps, s->ops_per_tick, state_str,
-             p->n_samples, p->n_active);
-    int hx = sc->cols - (int)strlen(buf);
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    /* top row 0: data — title, theme, state, live counts, frame/sim rates */
+    snprintf(line, sizeof line,
+             " Poisson Disk  %s  %s  pts:%d  active:%d  %.1f fps  %d Hz ",
+             themes[s->current_theme].name, state_str,
+             p->n_samples, p->n_active, fps, sim_fps);
+    draw_hud_row(sc, 0, PAIR_HUD, A_BOLD, line);
 
-    /* Row 0 left — title. */
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 1, " POISSON DISK SAMPLING ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    /* top row 1: algorithm parameters */
+    snprintf(line, sizeof line,
+             " r:%.1f  K:%d  ops/tick:%d  map:%dx%d ",
+             p->radius, ATTEMPTS_PER_POINT, s->ops_per_tick, p->w, p->h);
+    draw_hud_row(sc, 1, PAIR_HUD, A_NORMAL, line);
 
-    /* Row 1 left — theme + algorithm parameters. */
-    int x = 1;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " theme:%-8s ", themes[s->current_theme].name);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 17;
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x,
-             " r:%.1f  K:%d  attempts:%d  accept:%d%%  map:%dx%d ",
-             p->radius, ATTEMPTS_PER_POINT,
-             p->attempts_total, accept_pct, p->w, p->h);
-    attroff(COLOR_PAIR(PAIR_HUD));
-
-    /* Bottom hint. */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " o:done  O:active  *:flash | t/T:theme  r:reset  spc:pause  +/-:speed  q:quit ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    /* bottom row: actions — every interactive key */
+    draw_hud_row(sc, sc->rows - 1, PAIR_HINT, A_BOLD,
+                 " q:quit  spc:pause  r:reset  t:theme  +/-:speed  [/]:Hz ");
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §6  app   (signals, user events, and the main loop)                    */
 /* ===================================================================== */
-
-typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    int                   map_w, map_h;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
-} App;
-
-static App g_app;
 
 static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
@@ -878,11 +918,11 @@ static bool app_handle_key(App *app, int ch)
 
     case 't':
         s->current_theme = (s->current_theme + 1) % N_THEMES;
-        theme_apply(s->current_theme);
+        theme_apply(&themes[s->current_theme]);
         break;
     case 'T':
         s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(s->current_theme);
+        theme_apply(&themes[s->current_theme]);
         break;
 
     default: break;
@@ -890,21 +930,32 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
+static void install_signals(void)
+{
+    signal(SIGINT,   on_exit_signal);
+    signal(SIGTERM,  on_exit_signal);
+    signal(SIGWINCH, on_resize_signal);
+}
+
+/* One-time setup: flags + tick rate, bring up the terminal, fit the map to it,
+ * and build the first sampler. */
+static void app_init(App *app)
+{
+    app->running = 1;
+    app->sim_fps = SIM_FPS_DEFAULT;
+    screen_init(&app->screen);
+    app_pick_map_size(app);
+    scene_init(&app->scene, app->map_w, app->map_h);
+}
+
 int main(void)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+    install_signals();
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
-
-    screen_init(&app->screen);
-    app_pick_map_size(app);
-    scene_init(&app->scene, app->map_w, app->map_h);
+    App *app = &g_app;
+    app_init(app);
 
     int64_t frame_time  = clock_ns();
     int64_t sim_accum   = 0;
@@ -914,6 +965,7 @@ int main(void)
 
     while (app->running) {
 
+        /* USER EVENT: resize (handled outside the tick) */
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns();
@@ -923,11 +975,12 @@ int main(void)
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        if (dt > MAX_FRAME_MS * NS_PER_MS) dt = MAX_FRAME_MS * NS_PER_MS;
 
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
+        /* PER-TICK COMBINE: fixed-timestep accumulator drives scene_tick */
         sim_accum += dt;
         while (sim_accum >= tick_ns) {
             scene_tick(&app->scene, dt_sec);
@@ -943,12 +996,16 @@ int main(void)
             fps_accum   = 0;
         }
 
+        /* PERFORMANCE: frame cap to 60 fps */
+        /* PERFORMANCE: cap rendered frames to RENDER_CAP_FPS */
         int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+        clock_sleep_ns(TICK_NS(RENDER_CAP_FPS) - elapsed);
 
+        /* RENDER (reads state only) */
         screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
         screen_present();
 
+        /* USER EVENT: keys */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

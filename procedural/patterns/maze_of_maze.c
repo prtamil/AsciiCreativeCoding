@@ -46,15 +46,17 @@
  *      — also tiling on a grid, but with edge-colour adjacency
  *        instead of carved passages.
  *
- * Section map:
- *   §1 config     — maze sizes per pattern, themes, glyph styles
- *   §2 clock      — monotonic timer + sleep
- *   §3 color      — HUD reserved + 10 themes (8-step ramp + accents)
- *   §5 maze       — hash, perlin/fBm, Maze struct, DFS carve,
- *                   maze-of-maze generation + rendering helpers
- *   §6 scene      — state, regenerate on pattern change / reseed
- *   §7 screen     — render outer + inner mazes with brightness drift
- *   §8 app        — signals, resize, fixed-step main loop
+ * Section map (re-cut into single-responsibility layers — see ARCHITECTURE):
+ *   §1 config      — immutable data tables & constants (no functions)
+ *   §2 logic       — pure decisions: hash, perlin/fBm, brightness sample,
+ *                    pattern/glyph/style selectors (no mutation, no I/O)
+ *   §3 performance — monotonic timer + sleep
+ *   §4 platform    — ncurses colour setup (HUD reserved + 10 themes)
+ *   §5 generation  — Maze struct, DFS carve, maze-of-maze + noise basis;
+ *                    runs on init / reseed / pattern change only
+ *   §6 effects     — per-tick cosmetic advance (brightness drift, flash)
+ *   §7 render      — outer + inner mazes → screen, brightness-modulated
+ *   §8 app         — signals, resize, fixed-step main loop, event routing
  *
  * Keys:
  *   q / ESC    quit
@@ -130,15 +132,37 @@
  *                  10 % of a CPU core at 240×80 × 60 fps.
  *
  * References     :
- *   • Wikipedia — Maze generation algorithm
+ *   CONCEPTS — maze carving, DFS, spanning trees
+ *   • Buck, Jamis — "Mazes for Programmers" (Pragmatic Bookshelf,
+ *     2015). The definitive practical guide; the recursive
+ *     backtracker (this file's dfs_carve) is Chapter 5, and the
+ *     spanning-tree framing of "perfect maze" runs throughout.
+ *   • Cormen, Leiserson, Rivest, Stein — "Introduction to
+ *     Algorithms" (4th ed., MIT Press, 2022). §20 Depth-First
+ *     Search and §21 Minimum Spanning Trees — the graph-theory
+ *     foundation: a perfect maze IS a spanning tree of the grid
+ *     graph, and DFS carving is a randomized spanning-tree walk.
+ *   • Pullen, Walter — "Think Labyrinth: Maze Algorithms" — the
+ *     most complete catalogue of carving algorithms and their
+ *     bias/texture trade-offs. http://www.astrolog.org/labyrnth/algrithm.htm
+ *   • Wikipedia — "Maze generation algorithm" (quick survey) and
+ *     "Depth-first search" (the traversal dfs_carve specializes).
  *     https://en.wikipedia.org/wiki/Maze_generation_algorithm
- *   • Buck, Jamis — Mazes for Programmers (Pragmatic Bookshelf, 2015).
- *     The definitive guide to maze algorithms; recursive backtracker
- *     is chapter 1.
- *   • Think Labyrinth — comprehensive maze-algorithm reference
- *     http://www.astrolog.org/labyrnth/algrithm.htm
- *   • Wikipedia — Depth-first search
- *     https://en.wikipedia.org/wiki/Depth-first_search
+ *
+ *   RENDERING — the drifting brightness field + grid drawing
+ *   • Perlin, Ken — "Improving Noise", SIGGRAPH 2002. The exact
+ *     gradient-noise variant implemented here in perlin2d()/grad2()
+ *     (improved fade curve 6t^5-15t^4+10t^3, 256-entry perm table).
+ *   • Ebert, Musgrave, Peachey, Perlin, Worley — "Texturing &
+ *     Modeling: A Procedural Approach" (3rd ed., Morgan Kaufmann,
+ *     2003). Ch. 2–3 derive fractional Brownian motion (fbm2's
+ *     octave/amplitude/lacunarity summation that drives the
+ *     A_DIM/A_NORMAL/A_BOLD brightness modulation).
+ *   • Patel, Amit (Red Blob Games) — "Making maps with noise
+ *     functions" and the grid/maze guides. Practical reference for
+ *     using fBm as a spatial field over a cell grid and for the
+ *     screen-coordinate maze rendering done in render_maze().
+ *     https://www.redblobgames.com/maps/terrain-from-noise/
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -311,6 +335,57 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
+ *
+ * This file was re-cut from a single combined flow into single-
+ * responsibility layers. Each top-level §-section maps to exactly one
+ * layer. "Mutates" is the ONLY state a layer is permitted to write;
+ * everything else it reads. (Const-pointer signatures that would make
+ * this read/mutate split self-evident are deferred to step 5, where the
+ * types exist to express it — they are not faked on the current data.)
+ *
+ *   LAYER         SECTION          MUTATES
+ *   ───────────   ──────────────   ─────────────────────────────────────
+ *   CONFIG        §1 config        nothing — compile-time data only
+ *   LOGIC         §2 logic         nothing — pure functions, no I/O
+ *   PERFORMANCE   §3 performance   nothing — wall-clock read + sleep
+ *   PLATFORM      §4 platform      ncurses colour pairs (init / theme key)
+ *   GENERATION    §5 generation    perm[]; Maze/MazeOfMaze cells; Scene
+ *                                  (seed, mom, bright.flash_t) EVENT/INIT
+ *   EFFECTS       §6 effects       Scene.bright (time_secs, wind_x,
+ *                                  flash_t) — the only per-tick advance
+ *   RENDER        §7 render        screen cells only — never Scene
+ *   APP           §8 app           App.running/need_resize/sim_fps + the
+ *                                  frame timers; routes user/OS events
+ *
+ * LOGIC is provably uncorruptable by EFFECTS or RENDER: it mutates nothing
+ * and does no I/O, so deleting or reordering any render/effects code
+ * cannot change a LOGIC result. (perlin2d/fbm2 READ the global perm[]
+ * table that §5 builds, but never write it — sampling stays pure.)
+ *
+ * SIMULATION — absent. The maze layout never evolves; once carved it is a
+ *   static artifact. The only state that advances per tick is the cosmetic
+ *   brightness field, which is EFFECTS, not simulation. No SIMULATION
+ *   section exists rather than a hollow one.
+ *
+ * DELAYS — trivial. No holds or countdown timers exist; a single `paused`
+ *   flag (toggled by the user) gates the EFFECTS advance, and the reseed
+ *   flash is a continuous decay (EFFECTS), not a timed hold. Folded into
+ *   §6 rather than given its own section.
+ *
+ * PER-TICK COMBINE ORDER — the ONE place state advances is the §8 main
+ * loop; nothing else advances simulation state:
+ *   1. PERFORMANCE  measure dt, clamp to 100 ms, accumulate
+ *   2. EFFECTS      while (accum >= TICK) scene_tick()   ← only advance
+ *   3. PERFORMANCE  fps accounting + sleep to the frame cap
+ *   4. RENDER       screen_draw() → present   (reads state, writes screen)
+ *
+ * NOT PART OF THE TICK — user/OS events mutate state directly, OUTSIDE the
+ * accumulator: key handling (app_handle_key → scene_reseed / regenerate /
+ * theme_apply / pattern+glyph+speed changes) and resize (app_do_resize).
+ * These reach GENERATION/PLATFORM only, never EFFECTS.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -323,12 +398,8 @@
 #include <string.h>
 #include <time.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 /* ===================================================================== */
-/* §1  config                                                             */
+/* §1  config       — immutable data tables & constants (no functions) */
 /* ===================================================================== */
 
 enum {
@@ -358,9 +429,7 @@ enum {
     PAIR_HUD            =   1,
     PAIR_HINT           =   2,
     PAIR_RAMP_BASE      =   3,    /* +0..+7 = 8 brightness/colour tints */
-    PAIR_HOT            =  11,
-    PAIR_COLD           =  12,
-    PAIR_FLASH          =  13,
+    PAIR_FLASH          =  11,
 };
 
 #define NS_PER_SEC      1000000000LL
@@ -391,20 +460,69 @@ enum {
 #define OUTER_RAMP           7
 #define INNER_RAMP           5
 
+/* Layout geometry — all in terminal character cells. */
+enum {
+    HUD_TOP_ROWS   = 2,   /* rows 0-1 reserved for the HUD; maze starts row 2  */
+    MIN_OUTER_CW   = 6,   /* floor on an outer cell's width  (keep it usable)  */
+    MIN_OUTER_CH   = 4,   /* floor on an outer cell's height                   */
+    MIN_INNER_CELL = 2,   /* floor on an inner cell, both axes; <2 = invisible */
+};
+
+/* Brightness -> ncurses intensity thresholds, on the [0,1] fBm sample. */
+#define BRIGHT_HI            0.65f   /* above this -> A_BOLD                    */
+#define BRIGHT_LO            0.35f   /* below this -> A_DIM (unless no_dim)     */
+
+/* Reseed flash overlay. */
+#define FLASH_VISIBLE_MIN    0.05f   /* drop the overlay once the envelope dips below */
+#define FLASH_PHASE_RATE  1000.0f    /* time_secs -> integer sparkle phase, per second */
+#define FLASH_GLYPH          '*'
+enum { FLASH_SPARSITY_MASK = 7 };    /* (x^y^phase)&mask==0 -> ~1 cell in 8 sparkles  */
+
+/* Maze carving. */
+#define ALL_WALLS            0xFu        /* every wall up — a cell's pre-carve state */
+#define KNUTH_HASH32  2654435761u        /* round(2^32 / phi); multiplicative seed mix */
+#define INNER_SEED_SALT      0xBEEF      /* salts each room's inner-maze seed         */
+
+/* Linear congruential generator step (Numerical Recipes constants) — the
+ * per-maze shuffle RNG: next = state * LCG_MUL + LCG_ADD. */
+#define LCG_MUL       1664525u
+#define LCG_ADD    1013904223u
+
+/* Main-loop timing. */
+enum {
+    MAX_FRAME_MS = 100,   /* dt clamp: caps catch-up after a stall (no spiral) */
+    RENDER_FPS   =  60,   /* render frame cap, independent of the sim tick Hz  */
+};
+
 /*
- * Pattern enum — different (outer, inner) maze size combos.
+ * Pattern — a named preset in the maze-of-maze size trade-space.
+ *
+ * Nesting has two free scales: how many OUTER rooms tile the screen, and
+ * how many INNER cells fill each room. They trade against each other — on a
+ * fixed screen, more rooms makes every room (and its inner maze) smaller.
+ * These four presets sample useful corners of that space so the user flips
+ * between "few big detailed rooms" and "many small coarse rooms" with one
+ * key instead of tuning four numbers. The value indexes PATTERN_CFG[].
  */
 typedef enum {
-    PATTERN_CLASSIC = 0,
-    PATTERN_WIDE    = 1,
-    PATTERN_DENSE   = 2,
-    PATTERN_EVEN    = 3,
-    N_PATTERNS      = 4,
+    PATTERN_CLASSIC = 0,   /* 6x3 rooms / 6x4 inner — balanced default         */
+    PATTERN_WIDE    = 1,   /* 4x2 rooms / 10x6 inner — most detail per room    */
+    PATTERN_DENSE   = 2,   /* 8x4 rooms / 4x3 inner — most rooms, sparse inner */
+    PATTERN_EVEN    = 3,   /* 5x3 rooms / 8x5 inner — even split of both       */
+    N_PATTERNS      = 4,   /* element count; also the modulus for n/p cycling  */
 } Pattern;
 
+/*
+ * PatternCfg — the concrete cell counts behind one Pattern (one row of
+ * PATTERN_CFG[]). All four numbers are in MAZE CELLS, never screen
+ * characters: the on-screen pixel size of a cell is derived per-frame in
+ * scene_draw() from the live terminal size, so one config reads correctly
+ * at any window size. Each axis is clamped to MAX_MAZE_W/H (the Maze.walls[]
+ * capacity) before use in mom_generate().
+ */
 typedef struct {
-    int outer_w, outer_h;
-    int inner_w, inner_h;
+    int outer_w, outer_h;   /* outer grid — rooms across / down               */
+    int inner_w, inner_h;   /* inner grid inside each room — cells across/down */
 } PatternCfg;
 
 static const PatternCfg PATTERN_CFG[N_PATTERNS] = {
@@ -414,6 +532,77 @@ static const PatternCfg PATTERN_CFG[N_PATTERNS] = {
     [PATTERN_DENSE  ] = { 8, 4,   4, 3 },
     [PATTERN_EVEN   ] = { 5, 3,   8, 5 },
 };
+
+
+/*
+ * GlyphSet — which ASCII wall glyphs to draw with. PURE presentation: the
+ * carved maze is byte-for-byte identical across all three; only
+ * outer_style_for()/inner_style_for() turn this into a WallStyle. MIXED
+ * draws the outer level thick and the inner level thin on purpose, to
+ * exaggerate the two-scale hierarchy the eye is meant to read. ASCII-only
+ * per the project rule (no Unicode box-drawing — renders the same on every
+ * locale).
+ */
+typedef enum {
+    GLYPH_LINES  = 0,   /* '-' '|' '+' at both levels — clean line art       */
+    GLYPH_BLOCKS = 1,   /* '#' everywhere — chunky / solid                   */
+    GLYPH_MIXED  = 2,   /* outer '#', inner '-|+' — maximal scale contrast   */
+    N_GLYPH_SETS = 3,   /* element count; modulus for g/G cycling            */
+} GlyphSet;
+
+/*
+ * WallStyle — the resolved glyph triple one render pass stamps for one
+ * level (outer or inner). outer_style_for()/inner_style_for() collapse the
+ * user's GlyphSet down to this, so render_maze() never branches on the mode
+ * — it just writes these three glyphs. Three is exactly what a grid drawing
+ * needs: a run in each axis plus the lattice crossings.
+ */
+typedef struct {
+    char h_wall;     /* horizontal wall run (a cell's north / south edge)    */
+    char v_wall;     /* vertical wall run (a cell's east / west edge)        */
+    char corner;     /* glyph at every grid intersection (drawn last, on top)*/
+} WallStyle;
+
+static const WallStyle STYLE_LINES  = { '-', '|', '+' };
+static const WallStyle STYLE_BLOCKS = { '#', '#', '#' };
+
+/*
+ * Theme — one named 256-colour palette. The renderer never names a raw
+ * colour; it indexes this palette through ncurses colour pairs, so
+ * re-tinting the entire demo is a single theme swap (theme_apply() reloads
+ * the pairs on a t/T keypress).
+ *
+ * Every value sits in the BRIGHT half of the xterm-256 cube on purpose: a
+ * dim wall (A_DIM) on a bottom-of-cube colour is invisible on a black
+ * terminal. The theme's character comes from the RELATIVE gradient, not
+ * absolute darkness. See "Theme Palette Brightness" / COLOR.md.
+ */
+typedef struct {
+    const char *name;     /* HUD label shown while cycling with t/T           */
+    short       ramp[8];  /* brightness ramp, dark ramp[0] -> bright ramp[7]. */
+                          /*   Walls read fixed slots (INNER_RAMP/OUTER_RAMP);*/
+                          /*   the fBm field only shifts A_DIM/BOLD on top.   */
+} Theme;
+
+#define N_THEMES 10
+
+static const Theme themes[N_THEMES] = {
+    /* name       0    1    2    3    4    5    6    7 */
+    { "DEFAULT",{ 24,  31,  39,  70,  76, 137, 215, 230 } },
+    { "MATRIX", { 28,  34,  40,  46,  76, 118, 154, 192 } },
+    { "NOVA",   { 60,  91, 134, 165, 207, 213, 219, 231 } },
+    { "MONO",   {240, 243, 245, 247, 249, 251, 253, 255 } },
+    { "OCEAN",  { 24,  25,  31,  38,  45,  51, 117, 195 } },
+    { "FIRE",   { 88, 124, 130, 166, 202, 208, 214, 226 } },
+    { "EARTH",  { 94, 130, 137, 173, 179, 215, 222, 230 } },
+    { "FOREST", { 28,  34,  40,  70,  76, 112, 156, 192 } },
+    { "DESERT", {130, 137, 143, 173, 179, 215, 222, 229 } },
+    { "ARCTIC", { 24,  31,  67, 110, 117, 153, 195, 231 } },
+};
+
+/* ===================================================================== */
+/* §2  logic        — pure decisions: no mutation, no I/O; readable alone */
+/* ===================================================================== */
 
 static const char *pattern_name(Pattern p)
 {
@@ -426,14 +615,6 @@ static const char *pattern_name(Pattern p)
     }
 }
 
-/* GlyphSet — wall rendering style. */
-typedef enum {
-    GLYPH_LINES  = 0,
-    GLYPH_BLOCKS = 1,
-    GLYPH_MIXED  = 2,
-    N_GLYPH_SETS = 3,
-} GlyphSet;
-
 static const char *glyph_set_name(GlyphSet g)
 {
     switch (g) {
@@ -443,16 +624,6 @@ static const char *glyph_set_name(GlyphSet g)
     default:           return "?    ";
     }
 }
-
-/* WallStyle — three glyphs that describe how to draw a maze level. */
-typedef struct {
-    char h_wall;     /* horizontal-segment glyph */
-    char v_wall;     /* vertical-segment glyph   */
-    char corner;     /* intersection glyph       */
-} WallStyle;
-
-static const WallStyle STYLE_LINES  = { '-', '|', '+' };
-static const WallStyle STYLE_BLOCKS = { '#', '#', '#' };
 
 static WallStyle outer_style_for(GlyphSet g)
 {
@@ -474,100 +645,6 @@ static WallStyle inner_style_for(GlyphSet g)
     }
 }
 
-/*
- * Themes — every entry sits in the bright half of the 256-colour
- * cube so even A_DIM cells stay legible against a default-black
- * terminal.  See "Theme Palette Brightness" in /CLAUDE.md.
- */
-typedef struct {
-    const char *name;
-    short       ramp[8];
-    short       hot;
-    short       cold;
-} Theme;
-
-#define N_THEMES 10
-
-static const Theme themes[N_THEMES] = {
-    /* name       0    1    2    3    4    5    6    7   hot cold */
-    { "DEFAULT",{ 24,  31,  39,  70,  76, 137, 215, 230 }, 196,  39 },
-    { "MATRIX", { 28,  34,  40,  46,  76, 118, 154, 192 }, 226,  39 },
-    { "NOVA",   { 60,  91, 134, 165, 207, 213, 219, 231 }, 196,  39 },
-    { "MONO",   {240, 243, 245, 247, 249, 251, 253, 255 }, 226,  39 },
-    { "OCEAN",  { 24,  25,  31,  38,  45,  51, 117, 195 }, 196,  21 },
-    { "FIRE",   { 88, 124, 130, 166, 202, 208, 214, 226 }, 226,  21 },
-    { "EARTH",  { 94, 130, 137, 173, 179, 215, 222, 230 }, 196,  39 },
-    { "FOREST", { 28,  34,  40,  70,  76, 112, 156, 192 }, 196,  39 },
-    { "DESERT", {130, 137, 143, 173, 179, 215, 222, 229 }, 196,  21 },
-    { "ARCTIC", { 24,  31,  67, 110, 117, 153, 195, 231 }, 196,  39 },
-};
-
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
-
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
-}
-
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
-}
-
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
-
-static void theme_apply(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
-        init_pair(PAIR_HOT,  t->hot,  -1);
-        init_pair(PAIR_COLD, t->cold, -1);
-    } else {
-        static const short fb[8] = {
-            COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,   COLOR_CYAN,
-            COLOR_GREEN, COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE,
-        };
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), fb[i], -1);
-        init_pair(PAIR_HOT,  COLOR_RED,  -1);
-        init_pair(PAIR_COLD, COLOR_CYAN, -1);
-    }
-}
-
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,   226, -1);
-        init_pair(PAIR_HINT,   51, -1);
-        init_pair(PAIR_FLASH, 226, -1);
-    } else {
-        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
-        init_pair(PAIR_FLASH, COLOR_YELLOW, -1);
-    }
-    theme_apply(0);
-}
-
-/* ===================================================================== */
-/* §5  maze — hash, perlin, DFS carve, render helpers                     */
-/* ===================================================================== */
-
 /* hash3 — same routine as other showcases. */
 static inline uint32_t hash3(int wx, int wy, int wz)
 {
@@ -584,22 +661,6 @@ static inline uint32_t hash3(int wx, int wy, int wz)
 
 /* Perlin scaffold — copied inline per the self-contained-file rule. */
 static uint8_t perm[512];
-
-static void perm_shuffle(int seed)
-{
-    uint8_t base[256];
-    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
-    uint32_t st = (uint32_t)seed * 2654435761u;
-    for (int i = 255; i > 0; i--) {
-        st = st * 1664525u + 1013904223u;
-        int j = (int)(st >> 16) % (i + 1);
-        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
-    }
-    for (int i = 0; i < 256; i++) {
-        perm[i      ] = base[i];
-        perm[i + 256] = base[i];
-    }
-}
 
 static inline float fade_q(float t)
 {
@@ -641,13 +702,183 @@ static float fbm2(float x, float y)
     return (total / max_amp) * 0.5f + 0.5f;     /* → [0, 1] */
 }
 
+/*
+ * bright_at — slow drifting fBm spotlight value at a screen cell.
+ * Returns [0, 1]. Used to modulate per-cell A_DIM/A_NORMAL/A_BOLD.
+ */
+static inline float bright_at(int sx, int sy, float wind_x)
+{
+    float nx = (float)sx * BRIGHT_SCALE_X + wind_x;
+    float ny = (float)sy * BRIGHT_SCALE_Y * ASPECT_Y_F;
+    float b  = fbm2(nx, ny);
+    if (b < 0.0f) b = 0.0f;
+    if (b > 1.0f) b = 1.0f;
+    return b;
+}
+
+/* brightness_attr — map a [0,1] brightness sample to an ncurses intensity.
+ * no_dim raises the floor to A_NORMAL (inner walls, so they stay legible
+ * even where the fBm field is darkest). */
+static inline int brightness_attr(float b, bool no_dim)
+{
+    if (b > BRIGHT_HI)            return A_BOLD;
+    if (b < BRIGHT_LO && !no_dim) return A_DIM;
+    return A_NORMAL;
+}
+
+/* flash_active — is the reseed-flash envelope still bright enough to draw? */
+static inline bool flash_active(float flash_t) { return flash_t > FLASH_VISIBLE_MIN; }
+
+/* inner_seed — deterministic seed for the inner maze of outer cell (ox,oy):
+ * the base seed mixed with the cell's hashed coordinates, so the whole nest
+ * reproduces from one seed yet every room differs. */
+static inline int inner_seed(int base_seed, int ox, int oy)
+{
+    return base_seed ^ (int)hash3(ox, oy, INNER_SEED_SALT);
+}
+
+/* imin — integer minimum; used to clamp a requested size down to capacity. */
+static inline int imin(int a, int b) { return a < b ? a : b; }
+
+/* cycle_next / cycle_prev — step an index forward / back around a ring of
+ * n items (modular wrap), for t/n/g-style option cycling. */
+static inline int cycle_next(int i, int n) { return (i + 1) % n; }
+static inline int cycle_prev(int i, int n) { return (i + n - 1) % n; }
+
+/* fit_cell_size — largest cell size (chars) such that n_cells cells plus
+ * their shared far border fit within span, floored at min_cell so a cell
+ * never collapses to nothing. */
+static inline int fit_cell_size(int span, int n_cells, int min_cell)
+{
+    int size = (span - 1) / n_cells;     /* -1 leaves room for the far border */
+    return size < min_cell ? min_cell : size;
+}
+
+/* grid_span — on-screen extent of an n_cells grid at cell_size: the cells
+ * plus the one trailing border line (mirrors fit_cell_size's -1). */
+static inline int grid_span(int cell_size, int n_cells) { return cell_size * n_cells + 1; }
+
+/* center_offset — offset that centres `content` within `avail`, never below
+ * `origin` (an oversized grid clips at the origin, not off-screen). */
+static inline int center_offset(int avail, int content, int origin)
+{
+    int off = origin + (avail - content) / 2;
+    return off < origin ? origin : off;
+}
+
+/* ===================================================================== */
+/* §3  performance  — wall-clock read + sleep (frame pacing: §8 loop) */
+/* ===================================================================== */
+
+static int64_t clock_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+}
+
+static void clock_sleep_ns(int64_t ns)
+{
+    if (ns <= 0) return;
+    struct timespec req = {
+        .tv_sec  = (time_t)(ns / NS_PER_SEC),
+        .tv_nsec = (long)  (ns % NS_PER_SEC),
+    };
+    nanosleep(&req, NULL);
+}
+
+/* ===================================================================== */
+/* §4  platform     — ncurses colour setup (init + theme key)         */
+/* ===================================================================== */
+
+/* load_theme_pairs — bind the 8 ramp pairs to a theme's 256-colour palette. */
+static void load_theme_pairs(const Theme *t)
+{
+    for (int i = 0; i < 8; i++)
+        init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
+}
+
+/* load_fallback_pairs — the 8/16-colour fallback ramp, for terminals without
+ * the 256-colour cube. */
+static void load_fallback_pairs(void)
+{
+    static const short fb[8] = {
+        COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,   COLOR_CYAN,
+        COLOR_GREEN, COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE,
+    };
+    for (int i = 0; i < 8; i++)
+        init_pair((short)(PAIR_RAMP_BASE + i), fb[i], -1);
+}
+
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    if (COLORS >= 256) load_theme_pairs(&themes[idx]);
+    else               load_fallback_pairs();
+}
+
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,   226, -1);
+        init_pair(PAIR_HINT,   51, -1);
+        init_pair(PAIR_FLASH, 226, -1);
+    } else {
+        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
+        init_pair(PAIR_FLASH, COLOR_YELLOW, -1);
+    }
+    theme_apply(0);
+}
+
+/* ===================================================================== */
+/* §5  generation   — builds static maze + noise basis; EVENT/INIT only */
+/* ===================================================================== */
+
+static void perm_shuffle(int seed)
+{
+    uint8_t base[256];
+    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
+    uint32_t st = (uint32_t)seed * KNUTH_HASH32;
+    for (int i = 255; i > 0; i--) {
+        st = st * LCG_MUL + LCG_ADD;
+        int j = (int)(st >> 16) % (i + 1);
+        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
+    }
+    /* mirror the 256-entry table into the upper half so perlin2d can index
+     * perm[X]+perm[X+1] (offsets up to 511) without a wrap test */
+    for (int i = 0; i < 256; i++) {
+        perm[i      ] = base[i];
+        perm[i + 256] = base[i];
+    }
+}
+
 /* ----------------------------------------------------------------------- *
  * Maze + DFS carve.                                                        *
  * ----------------------------------------------------------------------- */
 
+/*
+ * Maze — one "perfect" maze: a grid in which exactly one path connects any
+ * two cells (a SPANNING TREE of the grid graph — no loops, no unreachable
+ * cells). maze_generate() carves it with the RECURSIVE BACKTRACKER
+ * (randomised depth-first search): start with every wall up, walk to a
+ * random unvisited neighbour knocking down the shared wall, and backtrack
+ * at dead ends until all cells are visited.
+ *   refs: Buck, "Mazes for Programmers" ch.5; perfect maze == spanning
+ *         tree, CLRS §20 (DFS) / §21 (spanning trees).
+ *
+ * Representation — ONE byte per cell holding four wall bits, N=1 E=2 S=4
+ * W=8 (WALL_N..WALL_W); 0xF = all walls up, the pre-carve state. An
+ * interior wall is shared by two cells and stored REDUNDANTLY in both
+ * (carving clears the bit on each side); the redundancy is deliberate so
+ * the renderer can read any cell in isolation without consulting its
+ * neighbours. Flat row-major: cell (x,y) is walls[y*w + x].
+ */
 typedef struct {
-    int     w, h;
-    uint8_t walls[MAX_MAZE_CELLS];
+    int     w, h;                   /* grid size in cells, each <= MAX_MAZE_W/H */
+    uint8_t walls[MAX_MAZE_CELLS];  /* per-cell 4-bit wall mask, row-major      */
 } Maze;
 
 /* Direction tables, clockwise from N. */
@@ -662,7 +893,7 @@ static const uint8_t WALL_BIT[4] = { WALL_N, WALL_E, WALL_S, WALL_W };
  */
 static inline uint32_t lcg_next(uint32_t *st)
 {
-    *st = (*st) * 1664525u + 1013904223u;
+    *st = (*st) * LCG_MUL + LCG_ADD;
     return *st;
 }
 
@@ -672,6 +903,27 @@ static void shuffle4(int *a, uint32_t *st)
         int j = (int)(lcg_next(st) >> 16) % (i + 1);
         int t = a[i]; a[i] = a[j]; a[j] = t;
     }
+}
+
+/* cell_idx — flat row-major index of cell (x, y) in a w*h grid. */
+static inline int cell_idx(const Maze *m, int x, int y) { return y * m->w + x; }
+
+/* in_bounds — is (x, y) a real cell of this maze grid? */
+static inline bool in_bounds(const Maze *m, int x, int y)
+{
+    return x >= 0 && x < m->w && y >= 0 && y < m->h;
+}
+
+/*
+ * remove_wall_between — knock down the wall shared by cell (x, y) and its
+ * neighbour in direction d. The wall is stored REDUNDANTLY in both cells, so
+ * clear the bit on each side: our wall d, their wall OPP[d].
+ */
+static inline void remove_wall_between(Maze *m, int x, int y, int d)
+{
+    int nx = x + DX[d], ny = y + DY[d];
+    m->walls[cell_idx(m, x,  y )] &= (uint8_t)~WALL_BIT[d];
+    m->walls[cell_idx(m, nx, ny)] &= (uint8_t)~WALL_BIT[OPP[d]];
 }
 
 /*
@@ -686,32 +938,42 @@ static void shuffle4(int *a, uint32_t *st)
  */
 static void dfs_carve(Maze *m, int x, int y, bool *visited, uint32_t *st)
 {
-    visited[y * m->w + x] = true;
+    visited[cell_idx(m, x, y)] = true;
     int order[4] = { 0, 1, 2, 3 };
     shuffle4(order, st);
     for (int i = 0; i < 4; i++) {
         int d  = order[i];
         int nx = x + DX[d];
         int ny = y + DY[d];
-        if (nx < 0 || nx >= m->w || ny < 0 || ny >= m->h) continue;
-        if (visited[ny * m->w + nx]) continue;
-        m->walls[y  * m->w + x ] &= (uint8_t)~WALL_BIT[d];
-        m->walls[ny * m->w + nx] &= (uint8_t)~WALL_BIT[OPP[d]];
+        if (!in_bounds(m, nx, ny))           continue;
+        if (visited[cell_idx(m, nx, ny)])    continue;
+        remove_wall_between(m, x, y, d);
         dfs_carve(m, nx, ny, visited, st);
     }
+}
+
+/* lcg_seed_from — mix a maze seed into a NONZERO LCG state. The LCG
+ * degenerates to a constant-zero stream if ever seeded with 0, so force the
+ * state away from zero. */
+static inline uint32_t lcg_seed_from(int seed)
+{
+    uint32_t st = (uint32_t)seed * KNUTH_HASH32 + 1u;
+    return st ? st : 1u;
 }
 
 static void maze_generate(Maze *m, int seed)
 {
     int total = m->w * m->h;
     if (total > MAX_MAZE_CELLS) return;     /* should never happen */
+
+    /* reset to the pre-carve state: every wall up, no cell visited */
     bool visited[MAX_MAZE_CELLS];
     for (int i = 0; i < total; i++) {
-        m->walls[i] = (uint8_t)0xF;
+        m->walls[i] = ALL_WALLS;
         visited[i]  = false;
     }
-    uint32_t st = (uint32_t)seed * 2654435761u + 1u;
-    if (st == 0) st = 1;
+
+    uint32_t st = lcg_seed_from(seed);
     dfs_carve(m, 0, 0, visited, &st);
 }
 
@@ -719,52 +981,92 @@ static void maze_generate(Maze *m, int seed)
  * Maze of maze.                                                            *
  * ----------------------------------------------------------------------- */
 
+/*
+ * MazeOfMaze — the nested structure: one OUTER maze, plus an INNER maze
+ * carved independently inside every outer cell. Two perfect mazes at two
+ * scales, visible at once — a self-similar, fractal-flavoured layout (the
+ * "maze of mazes"). mom_generate() seeds each inner maze from
+ * base_seed ^ hash3(ox,oy,..), so the whole nest is reproducible from the
+ * single Scene.seed yet no two rooms share a layout. The two levels are
+ * deliberately INDEPENDENT — inner walls do not line up across room
+ * boundaries — which is what makes the eye read two distinct scales.
+ */
 typedef struct {
-    Maze outer;
-    Maze inner[MAX_OUTER_CELLS];
-    int  outer_count;          /* outer.w * outer.h, cached            */
+    Maze outer;                    /* the big maze; its cells ARE the rooms   */
+    Maze inner[MAX_OUTER_CELLS];   /* one inner maze per outer cell, row-major */
+    int  outer_count;              /* live outer.w*outer.h; bounds the inner[]*/
+                                   /*   loop so stale cells are never drawn   */
 } MazeOfMaze;
 
 static void mom_generate(MazeOfMaze *mom, const PatternCfg *cfg, int seed)
 {
-    int ow = cfg->outer_w, oh = cfg->outer_h;
-    int iw = cfg->inner_w, ih = cfg->inner_h;
-    if (ow > MAX_MAZE_W) ow = MAX_MAZE_W;
-    if (oh > MAX_MAZE_H) oh = MAX_MAZE_H;
-    if (iw > MAX_MAZE_W) iw = MAX_MAZE_W;
-    if (ih > MAX_MAZE_H) ih = MAX_MAZE_H;
+    int ow = imin(cfg->outer_w, MAX_MAZE_W);   /* clamp request to walls[] cap */
+    int oh = imin(cfg->outer_h, MAX_MAZE_H);
+    int iw = imin(cfg->inner_w, MAX_MAZE_W);
+    int ih = imin(cfg->inner_h, MAX_MAZE_H);
 
+    /* 1. carve the outer maze — its cells become the rooms */
     mom->outer.w = ow;
     mom->outer.h = oh;
     maze_generate(&mom->outer, seed);
 
+    /* 2. carve one independent inner maze per room, each seeded from its
+     *    (ox,oy) so the nest is reproducible from `seed` yet every room differs */
     mom->outer_count = ow * oh;
     for (int oy = 0; oy < oh; oy++) {
         for (int ox = 0; ox < ow; ox++) {
-            int idx = oy * ow + ox;
-            mom->inner[idx].w = iw;
-            mom->inner[idx].h = ih;
-            int inner_seed = seed ^ (int)hash3(ox, oy, 0xBEEF);
-            maze_generate(&mom->inner[idx], inner_seed);
+            Maze *room = &mom->inner[oy * ow + ox];
+            room->w = iw;
+            room->h = ih;
+            maze_generate(room, inner_seed(seed, ox, oy));
         }
     }
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
-
+/*
+ * Brightness — the slow fractal-noise (fBm) light wash that drifts over the
+ * otherwise STATIC maze, giving motion without changing a single wall.
+ * bright_at() samples a value in [0,1] per screen cell from this state, and
+ * render thresholds it to A_DIM / A_NORMAL / A_BOLD. The field itself is
+ * never stored — only the drift phase below — so the type costs a handful
+ * of bytes.
+ *   refs: Perlin, "Improving Noise" (the perlin2d gradient noise);
+ *         Ebert et al., "Texturing & Modeling" (fBm = sum of noise octaves).
+ *
+ *   drift : a clock plus a horizontal "wind" offset that scrolls the noise
+ *           field sideways each tick (so the wash appears to blow across the
+ *           maze), plus a reseed-flash envelope that fades 1 -> 0.
+ *   speed : user multiplier on the wind — how fast the wash drifts.
+ */
 typedef struct {
-    MazeOfMaze mom;
-    bool       paused;
-    int        speed;
-    int        current_theme;
-    Pattern    current_pattern;
-    GlyphSet   current_glyph;
-    int        seed;
-    float      time_secs;
-    float      wind_x;
-    float      flash_t;
+    float time_secs;   /* elapsed seconds, advanced each tick; doubles as    */
+                       /*   reseed entropy and the flash sparkle's phase     */
+    float wind_x;      /* fBm horizontal scroll offset (the "wind") — the    */
+                       /*   only term that makes the static maze shimmer     */
+    float flash_t;     /* reseed-flash envelope: set 1.0 on regen, decays    */
+                       /*   exp(-4*dt) -> 0; gates the '*' sparkle overlay   */
+    int   speed;       /* drift rate SPEED_MIN..SPEED_MAX (+/- keys, x2 /2)  */
+} Brightness;
+
+/*
+ * Scene — the whole demo state as a table of contents: the maze being
+ * shown, the inputs that pick and paint it, and the cosmetic light over it.
+ * Fields are grouped by CONCEPT, not by the key that changes them (a colour
+ * theme is a render concept even though a key toggles it). Two boundaries
+ * to keep in mind: changing `seed` or `current_pattern` forces a recarve
+ * (scene_regenerate); `current_glyph`/`current_theme` are render-only and
+ * need none. And only the init/reset/tick orchestrators take Scene* — leaf
+ * functions take the narrowest sub-type (render takes Brightness*), so the
+ * aggregate never re-couples the layers.
+ */
+typedef struct {
+    MazeOfMaze mom;             /* WHAT  — the nested maze (static once carved) */
+    Pattern    current_pattern; /* which maze: outer/inner cell-count combo     */
+    int        seed;            /* which maze: RNG instance selector            */
+    GlyphSet   current_glyph;   /* how drawn: wall glyph style                  */
+    int        current_theme;   /* how drawn: palette index into themes[]       */
+    Brightness bright;          /* the drifting light wash + reseed flash       */
+    bool       paused;          /* run-state: freezes the drift                 */
 } Scene;
 
 /*
@@ -772,22 +1074,22 @@ typedef struct {
  * (seed, pattern) pair so the brightness field changes per pattern.
  * Same trick as truchet_tiles.c / wang_tiles.c / penrose_tiling.c.
  */
-static void apply_perm(const Scene *s)
+static void apply_perm(int seed, Pattern pattern)
 {
-    perm_shuffle(s->seed ^ ((int)s->current_pattern * 0xA5A5A5));
+    perm_shuffle(seed ^ ((int)pattern * 0xA5A5A5));
 }
 
 static void scene_regenerate(Scene *s)
 {
-    apply_perm(s);
+    apply_perm(s->seed, s->current_pattern);
     mom_generate(&s->mom, &PATTERN_CFG[s->current_pattern], s->seed);
-    s->flash_t = 1.0f;
+    s->bright.flash_t = 1.0f;
 }
 
 static void scene_reseed(Scene *s)
 {
-    s->seed = (int)hash3((int)(s->time_secs * 1000.0f),
-                         (int)(s->wind_x * 100.0f), 0xC0FFEE);
+    s->seed = (int)hash3((int)(s->bright.time_secs * 1000.0f),
+                         (int)(s->bright.wind_x * 100.0f), 0xC0FFEE);
     scene_regenerate(s);
 }
 
@@ -795,7 +1097,7 @@ static void scene_init(Scene *s)
 {
     memset(s, 0, sizeof *s);
     s->paused          = false;
-    s->speed           = SPEED_DEF;
+    s->bright.speed    = SPEED_DEF;
     s->current_theme   = 0;
     s->current_pattern = PATTERN_CLASSIC;
     s->current_glyph   = GLYPH_LINES;
@@ -803,26 +1105,38 @@ static void scene_init(Scene *s)
     scene_regenerate(s);
 }
 
+/* ===================================================================== */
+/* §6  effects      — cosmetic per-tick state advance (only simulation) */
+/* ===================================================================== */
+
 /*
  * scene_tick — advance brightness wind. Maze layout is static until
  * the user reseeds or changes pattern.
  */
 static void scene_tick(Scene *s, float dt)
 {
-    s->time_secs += dt;
-    s->flash_t   *= expf(-4.0f * dt);
+    s->bright.time_secs += dt;
+    s->bright.flash_t   *= expf(-4.0f * dt);
     if (s->paused) return;
 
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    s->wind_x += WIND_X_BASE * speed_mul * dt;
+    float speed_mul = (float)s->bright.speed / (float)SPEED_DEF;
+    s->bright.wind_x += WIND_X_BASE * speed_mul * dt;
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §7  render       — state -> screen; reads only, never mutates Scene */
 /* ===================================================================== */
 
+/*
+ * Screen — the terminal viewport, measured in character cells. Re-read from
+ * getmaxyx() at init and on every SIGWINCH (screen_resize), so all
+ * rendering bounds-checks against the LIVE size and a resize never corrupts
+ * the display. Passed const to draw functions; scene_draw() is the single
+ * place that converts these dimensions into the per-cell pixel sizes of the
+ * maze grid (the one terminal-size -> cell-size conversion point).
+ */
 typedef struct {
-    int cols, rows;
+    int cols, rows;   /* viewport width, height in characters (cols=x, rows=y)*/
 } Screen;
 
 static void screen_init(Screen *s)
@@ -846,20 +1160,6 @@ static void screen_resize(Screen *s)
 }
 
 /*
- * bright_at — slow drifting fBm spotlight value at a screen cell.
- * Returns [0, 1]. Used to modulate per-cell A_DIM/A_NORMAL/A_BOLD.
- */
-static inline float bright_at(int sx, int sy, float wind_x)
-{
-    float nx = (float)sx * BRIGHT_SCALE_X + wind_x;
-    float ny = (float)sy * BRIGHT_SCALE_Y * ASPECT_Y_F;
-    float b  = fbm2(nx, ny);
-    if (b < 0.0f) b = 0.0f;
-    if (b > 1.0f) b = 1.0f;
-    return b;
-}
-
-/*
  * draw_wall_cell — write one wall-segment glyph at (sy, sx) with
  * brightness modulation. Bounds-checks against the screen (rows-1
  * reserved for HUD).
@@ -869,208 +1169,219 @@ static inline float bright_at(int sx, int sy, float wind_x)
  * brightness field is at its dim end. Outer walls leave it false so
  * the dim/normal/bold contrast still animates the outer scale.
  */
-static inline void draw_wall_cell(const Screen *sc, const Scene *s,
+static inline void draw_wall_cell(const Screen *sc, const Brightness *br,
                                   int sx, int sy, char glyph,
                                   int pair, int extra_attr, bool no_dim)
 {
-    if (sy < 2 || sy >= sc->rows - 1) return;
-    if (sx < 0 || sx >= sc->cols)     return;
-    float b = bright_at(sx, sy, s->wind_x);
-    int b_attr;
-    if      (b > 0.65f)             b_attr = A_BOLD;
-    else if (b < 0.35f && !no_dim)  b_attr = A_DIM;
-    else                            b_attr = A_NORMAL;
-    int attr = b_attr | extra_attr;
+    if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) return;
+    if (sx < 0 || sx >= sc->cols)                return;
+    int attr = brightness_attr(bright_at(sx, sy, br->wind_x), no_dim) | extra_attr;
     attron(COLOR_PAIR(pair) | attr);
     mvaddch(sy, sx, (chtype)(unsigned char)glyph);
     attroff(COLOR_PAIR(pair) | attr);
 }
 
 /*
- * render_maze — draw all walls of one maze at (gx, gy) with the
- * given cell dimensions and wall style. Adjacent cells share walls;
- * we draw both copies (idempotent same-colour write).
- *
- * Corners (intersections at all (mx · cw, my · ch)) are drawn LAST
- * so they overlay any wall-segment glyph at that cell — keeps the
- * '+' visible at every intersection.
+ * draw_cell_walls — stamp the present edges of one maze cell whose top-left
+ * corner is at screen (sx, sy) and which spans cw x ch chars. Endpoints
+ * (dx/dy from 1) are skipped: the lattice crossings are drawn afterwards by
+ * draw_grid_corners so '+' always lands on top.
  */
-static void render_maze(const Screen *sc, const Scene *s,
+static void draw_cell_walls(const Screen *sc, const Brightness *br,
+                            int sx, int sy, int cw, int ch, uint8_t walls,
+                            WallStyle style, int pair, int extra_attr, bool no_dim)
+{
+    if (walls & WALL_N)
+        for (int dx = 1; dx < cw; dx++)
+            draw_wall_cell(sc, br, sx + dx, sy, style.h_wall, pair, extra_attr, no_dim);
+    if (walls & WALL_E)
+        for (int dy = 1; dy < ch; dy++)
+            draw_wall_cell(sc, br, sx + cw, sy + dy, style.v_wall, pair, extra_attr, no_dim);
+    if (walls & WALL_S)
+        for (int dx = 1; dx < cw; dx++)
+            draw_wall_cell(sc, br, sx + dx, sy + ch, style.h_wall, pair, extra_attr, no_dim);
+    if (walls & WALL_W)
+        for (int dy = 1; dy < ch; dy++)
+            draw_wall_cell(sc, br, sx, sy + dy, style.v_wall, pair, extra_attr, no_dim);
+}
+
+/*
+ * draw_grid_corners — stamp the intersection glyph at every lattice point
+ * of the maze grid, after the edges, so corners are never overwritten.
+ */
+static void draw_grid_corners(const Screen *sc, const Brightness *br,
+                              const Maze *m, int gx, int gy, int cw, int ch,
+                              WallStyle style, int pair, int extra_attr, bool no_dim)
+{
+    for (int my = 0; my <= m->h; my++)
+        for (int mx = 0; mx <= m->w; mx++)
+            draw_wall_cell(sc, br, gx + mx * cw, gy + my * ch,
+                           style.corner, pair, extra_attr, no_dim);
+}
+
+/*
+ * render_maze — draw one maze at screen (gx, gy) with cw x ch cells in the
+ * given style. Adjacent cells share a wall and both draw it (idempotent,
+ * same colour). Reads as two passes: edges, then crossings on top.
+ */
+static void render_maze(const Screen *sc, const Brightness *br,
                         const Maze *m, int gx, int gy,
                         int cw, int ch,
                         WallStyle style, int pair, int extra_attr,
                         bool no_dim)
 {
-    /* Wall segments. */
-    for (int my = 0; my < m->h; my++) {
-        for (int mx = 0; mx < m->w; mx++) {
-            uint8_t w  = m->walls[my * m->w + mx];
-            int     sx = gx + mx * cw;
-            int     sy = gy + my * ch;
+    for (int my = 0; my < m->h; my++)
+        for (int mx = 0; mx < m->w; mx++)
+            draw_cell_walls(sc, br, gx + mx * cw, gy + my * ch, cw, ch,
+                            m->walls[my * m->w + mx],
+                            style, pair, extra_attr, no_dim);
 
-            if (w & WALL_N) {
-                for (int dx = 1; dx < cw; dx++)
-                    draw_wall_cell(sc, s, sx + dx, sy,
-                                   style.h_wall, pair, extra_attr, no_dim);
-            }
-            if (w & WALL_E) {
-                for (int dy = 1; dy < ch; dy++)
-                    draw_wall_cell(sc, s, sx + cw, sy + dy,
-                                   style.v_wall, pair, extra_attr, no_dim);
-            }
-            if (w & WALL_S) {
-                for (int dx = 1; dx < cw; dx++)
-                    draw_wall_cell(sc, s, sx + dx, sy + ch,
-                                   style.h_wall, pair, extra_attr, no_dim);
-            }
-            if (w & WALL_W) {
-                for (int dy = 1; dy < ch; dy++)
-                    draw_wall_cell(sc, s, sx, sy + dy,
-                                   style.v_wall, pair, extra_attr, no_dim);
-            }
-        }
-    }
+    draw_grid_corners(sc, br, m, gx, gy, cw, ch, style, pair, extra_attr, no_dim);
+}
 
-    /* Corners — at every grid intersection, regardless of walls. */
-    for (int my = 0; my <= m->h; my++) {
-        for (int mx = 0; mx <= m->w; mx++) {
-            int sx = gx + mx * cw;
-            int sy = gy + my * ch;
-            draw_wall_cell(sc, s, sx, sy, style.corner, pair, extra_attr, no_dim);
+/*
+ * MazeLayout — the computed on-screen geometry of one maze-of-maze frame,
+ * all in terminal character cells. layout_fit() derives it once per frame
+ * from the live screen size and the pattern, so scene_draw and its draw
+ * helpers share one consistent placement.
+ */
+typedef struct {
+    int gx, gy;                         /* top-left corner of the outer grid  */
+    int cw_outer, ch_outer;             /* one outer cell (a room), in chars  */
+    int cw_inner, ch_inner;             /* one inner cell, in chars           */
+    int inner_margin_x, inner_margin_y; /* inset of an inner maze in its room */
+} MazeLayout;
+
+/*
+ * layout_fit — size and centre the nested grid for the current screen.
+ * Outer cells fill the area below the HUD; inner cells fill each room's
+ * interior (the room minus its 1-char wall ring), with both mazes centred
+ * in their boxes so nothing sits flush against a corner.
+ */
+static MazeLayout layout_fit(const Screen *sc, const PatternCfg *cfg)
+{
+    int avail_w = sc->cols;
+    int avail_h = sc->rows - 1 - HUD_TOP_ROWS;   /* between HUD top and hint row */
+
+    MazeLayout L;
+    L.cw_outer = fit_cell_size(avail_w, cfg->outer_w, MIN_OUTER_CW);
+    L.ch_outer = fit_cell_size(avail_h, cfg->outer_h, MIN_OUTER_CH);
+    L.gx = center_offset(avail_w, grid_span(L.cw_outer, cfg->outer_w), 0);
+    L.gy = center_offset(avail_h, grid_span(L.ch_outer, cfg->outer_h), HUD_TOP_ROWS);
+
+    int interior_w = L.cw_outer - 1;             /* room interior = room minus */
+    int interior_h = L.ch_outer - 1;             /*   its outer wall ring      */
+    L.cw_inner = fit_cell_size(interior_w, cfg->inner_w, MIN_INNER_CELL);
+    L.ch_inner = fit_cell_size(interior_h, cfg->inner_h, MIN_INNER_CELL);
+    L.inner_margin_x = center_offset(interior_w, grid_span(L.cw_inner, cfg->inner_w), 0);
+    L.inner_margin_y = center_offset(interior_h, grid_span(L.ch_inner, cfg->inner_h), 0);
+    return L;
+}
+
+/*
+ * draw_inner_mazes — render every room's inner maze, inset within the room.
+ * Drawn FIRST so the outer walls (next) overlay any inner cell that lands on
+ * a room boundary. no_dim keeps inner walls at >= A_NORMAL so they stay
+ * legible where the fBm field is darkest.
+ */
+static void draw_inner_mazes(const Screen *sc, const Scene *s,
+                             const PatternCfg *cfg, const MazeLayout *L)
+{
+    WallStyle style = inner_style_for(s->current_glyph);
+    int pair = PAIR_RAMP_BASE + INNER_RAMP;
+    for (int oy = 0; oy < cfg->outer_h; oy++) {
+        for (int ox = 0; ox < cfg->outer_w; ox++) {
+            int idx = oy * cfg->outer_w + ox;
+            if (idx >= s->mom.outer_count) break;
+            int igx = L->gx + ox * L->cw_outer + 1 + L->inner_margin_x;
+            int igy = L->gy + oy * L->ch_outer + 1 + L->inner_margin_y;
+            render_maze(sc, &s->bright, &s->mom.inner[idx], igx, igy,
+                        L->cw_inner, L->ch_inner, style, pair, A_NORMAL, true);
         }
     }
 }
 
 /*
- * scene_draw — render the maze of mazes. Inner mazes drawn first;
- * the outer maze drawn LAST so its boundary walls overlay any
- * inner-maze drawing that happened to land on the outer-cell edge.
+ * draw_outer_maze — render the outer maze over the inner ones; A_BOLD and
+ * full brightness modulation make the large scale dominant.
+ */
+static void draw_outer_maze(const Screen *sc, const Scene *s, const MazeLayout *L)
+{
+    WallStyle style = outer_style_for(s->current_glyph);
+    int pair = PAIR_RAMP_BASE + OUTER_RAMP;
+    render_maze(sc, &s->bright, &s->mom.outer, L->gx, L->gy,
+                L->cw_outer, L->ch_outer, style, pair, A_BOLD, false);
+}
+
+/*
+ * draw_reseed_flash — the brief sparkle wash after a regenerate. A sparse
+ * XOR pattern (~1 cell in 8) whose phase is advanced by time, so it shimmers.
+ */
+static void draw_reseed_flash(const Screen *sc, const Scene *s)
+{
+    int phase = (int)(s->bright.time_secs * FLASH_PHASE_RATE);
+    attron(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
+    for (int sy = HUD_TOP_ROWS; sy < sc->rows - 1; sy += 2)
+        for (int sx = 0; sx < sc->cols; sx += 2)
+            if (((sx ^ sy ^ phase) & FLASH_SPARSITY_MASK) == 0)
+                mvaddch(sy, sx, FLASH_GLYPH);
+    attroff(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
+}
+
+/*
+ * scene_draw — render one frame of the maze of mazes: inner mazes first,
+ * outer walls over the top, then the post-regenerate flash if it is fading.
  */
 static void scene_draw(const Screen *sc, const Scene *s)
 {
     const PatternCfg *cfg = &PATTERN_CFG[s->current_pattern];
-    int outer_w = cfg->outer_w;
-    int outer_h = cfg->outer_h;
-    int inner_w = cfg->inner_w;
-    int inner_h = cfg->inner_h;
+    MazeLayout layout = layout_fit(sc, cfg);
 
-    int top    = 2;
-    int bottom = sc->rows - 1;
-    int avail_w = sc->cols;
-    int avail_h = bottom - top;
-
-    /* Compute outer cell screen size. We need the outer maze grid
-     * (outer_w · cw + 1 cells) to fit inside avail_w × avail_h. */
-    int cw_outer = (avail_w - 1) / outer_w;
-    int ch_outer = (avail_h - 1) / outer_h;
-    if (cw_outer < 6) cw_outer = 6;
-    if (ch_outer < 4) ch_outer = 4;
-
-    /* Centre the maze of mazes on screen. */
-    int total_w = cw_outer * outer_w + 1;
-    int total_h = ch_outer * outer_h + 1;
-    int gx = (avail_w - total_w) / 2;
-    int gy = top + (avail_h - total_h) / 2;
-    if (gx < 0)   gx = 0;
-    if (gy < top) gy = top;
-
-    /* Inner cell sizing — inside the outer cell, leaving 1 cell on
-     * each side for the outer wall. The inner maze's RENDERED size
-     * is (cw_inner · inner_w + 1) cells wide (the trailing +1 is the
-     * maze's own far-edge border), so we divide (interior - 1) by
-     * the cell count rather than `interior / inner_*`.  Without
-     * this off-by-one the inner border doesn't fit and `inner_fits`
-     * silently bails out, leaving only the outer maze on screen.
-     *
-     * We further centre the inner maze inside the outer cell's
-     * interior so it doesn't sit flush against an arbitrary corner. */
-    int interior_w = cw_outer - 1;
-    int interior_h = ch_outer - 1;
-    int cw_inner = (interior_w - 1) / inner_w;
-    int ch_inner = (interior_h - 1) / inner_h;
-    if (cw_inner < 2) cw_inner = 2;
-    if (ch_inner < 2) ch_inner = 2;
-
-    int inner_total_w = cw_inner * inner_w + 1;
-    int inner_total_h = ch_inner * inner_h + 1;
-    int inner_margin_x = (interior_w - inner_total_w) / 2;
-    int inner_margin_y = (interior_h - inner_total_h) / 2;
-    if (inner_margin_x < 0) inner_margin_x = 0;
-    if (inner_margin_y < 0) inner_margin_y = 0;
-
-    WallStyle outer_st = outer_style_for(s->current_glyph);
-    WallStyle inner_st = inner_style_for(s->current_glyph);
-    int outer_pair = PAIR_RAMP_BASE + OUTER_RAMP;
-    int inner_pair = PAIR_RAMP_BASE + INNER_RAMP;
-
-    /* Inner mazes first. We always attempt to draw — if the inner
-     * maze slightly overflows its outer cell (because inner cell size
-     * had to be clamped to the minimum), the outer maze drawn next
-     * overdraws the overflow at the boundary. The renderer's bounds
-     * check inside draw_wall_cell handles screen-edge overflow.
-     *
-     * `no_dim=true` keeps inner walls at A_NORMAL minimum so they
-     * remain visible even where the brightness fBm field is at its
-     * dim end. */
-    for (int oy = 0; oy < outer_h; oy++) {
-        for (int ox = 0; ox < outer_w; ox++) {
-            int idx = oy * outer_w + ox;
-            if (idx >= s->mom.outer_count) break;
-            const Maze *inner = &s->mom.inner[idx];
-            int igx = gx + ox * cw_outer + 1 + inner_margin_x;
-            int igy = gy + oy * ch_outer + 1 + inner_margin_y;
-            render_maze(sc, s, inner, igx, igy,
-                        cw_inner, ch_inner,
-                        inner_st, inner_pair, A_NORMAL, true);
-        }
-    }
-
-    /* Outer maze on top — full brightness modulation (no_dim=false)
-     * so the outer-scale animation reads. */
-    render_maze(sc, s, &s->mom.outer, gx, gy, cw_outer, ch_outer,
-                outer_st, outer_pair, A_BOLD, false);
-
-    /* Reseed flash overlay. */
-    if (s->flash_t > 0.05f) {
-        int seed = (int)(s->time_secs * 1000.0f);
-        attron(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
-        for (int sy = 2; sy < sc->rows - 1; sy += 2) {
-            for (int sx = 0; sx < sc->cols; sx += 2) {
-                if (((sx ^ sy ^ seed) & 7) == 0)
-                    mvaddch(sy, sx, '*');
-            }
-        }
-        attroff(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
-    }
+    draw_inner_mazes(sc, s, cfg, &layout);
+    draw_outer_maze(sc, s, &layout);
+    if (flash_active(s->bright.flash_t))
+        draw_reseed_flash(sc, s);
 }
 
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
+/* draw_ramp_swatch — the 8 palette tiers as a glyph strip (dark -> bright)
+ * starting at column x; returns the column just past it. */
+static int draw_ramp_swatch(int x)
 {
-    erase();
-    scene_draw(sc, s);
+    static const char ramp_glyphs[8] = { '`', '.', ',', ':', '-', 'o', '#', '@' };
+    for (int i = 0; i < 8; i++) {
+        attron(COLOR_PAIR(PAIR_RAMP_BASE + i) | A_BOLD);
+        mvaddch(1, x, (chtype)(unsigned char)ramp_glyphs[i]);
+        attroff(COLOR_PAIR(PAIR_RAMP_BASE + i) | A_BOLD);
+        x++;
+    }
+    return x;
+}
 
-    const PatternCfg *cfg = &PATTERN_CFG[s->current_pattern];
+/* draw_hud_status — row 0: fps / tick rate / state / speed (right), title (left) */
+static void draw_hud_status(const Screen *sc, const Scene *s, double fps, int sim_fps)
+{
     const char *state_str = s->paused ? "PAUSED" : "DRIFT ";
-
-    /* Row 0 right — primary status. */
     char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  %3d Hz  %s  speed:%-3d ",
-             fps, sim_fps, state_str, s->speed);
+    snprintf(buf, sizeof buf, " %5.1f fps  %3d Hz  %s  speed:%-3d ",
+             fps, sim_fps, state_str, s->bright.speed);
     int hx = sc->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* Row 0 left — title. */
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, 1, " MAZE OF MAZE ");
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
-    /* Row 1 — pattern + glyph + theme + sizes + ramp swatch. */
+/* draw_hud_params — row 1: pattern / glyph / theme / palette swatch / sizes.
+ * x advances by each printed field's width plus a gap (cursor bookkeeping). */
+static void draw_hud_params(const Scene *s)
+{
+    const PatternCfg *cfg = &PATTERN_CFG[s->current_pattern];
     int x = 1;
+
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(1, x, " pattern:%-7s ", pattern_name(s->current_pattern));
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1090,40 +1401,55 @@ static void screen_draw(Screen *sc, const Scene *s,
     mvprintw(1, x, " ramp:");
     attroff(COLOR_PAIR(PAIR_HUD));
     x += 6;
-    static const char ramp_glyphs[8] = { '`', '.', ',', ':', '-', 'o', '#', '@' };
-    for (int i = 0; i < 8; i++) {
-        int p = PAIR_RAMP_BASE + i;
-        attron(COLOR_PAIR(p) | A_BOLD);
-        mvaddch(1, x, (chtype)(unsigned char)ramp_glyphs[i]);
-        attroff(COLOR_PAIR(p) | A_BOLD);
-        x++;
-    }
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x,
-             "  outer:%dx%d  inner:%dx%d ",
-             cfg->outer_w, cfg->outer_h,
-             cfg->inner_w, cfg->inner_h);
-    attroff(COLOR_PAIR(PAIR_HUD));
 
-    /* Bottom hint. */
+    x = draw_ramp_swatch(x);
+
+    attron(COLOR_PAIR(PAIR_HUD));
+    mvprintw(1, x, "  outer:%dx%d  inner:%dx%d ",
+             cfg->outer_w, cfg->outer_h, cfg->inner_w, cfg->inner_h);
+    attroff(COLOR_PAIR(PAIR_HUD));
+}
+
+/* draw_hud_hint — bottom row: every interactive key */
+static void draw_hud_hint(const Screen *sc)
+{
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(sc->rows - 1, 0,
              " n/p:pattern  g/G:glyph  t/T:theme  +/-:drift  spc:pause  r:reseed  q:quit ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
+static void screen_draw(Screen *sc, const Scene *s,
+                        double fps, int sim_fps)
+{
+    erase();
+    scene_draw(sc, s);
+    draw_hud_status(sc, s, fps, sim_fps);
+    draw_hud_params(s);
+    draw_hud_hint(sc);
+}
+
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §8  app          — events + the one tick-combine point + main loop */
 /* ===================================================================== */
 
+/*
+ * App — the top-level runtime: the simulation (Scene), the viewport
+ * (Screen), and the main-loop control state. A single global instance
+ * (g_app) exists ONLY so the async signal handlers can reach it. The two
+ * sig_atomic_t flags are written from signal context and polled by the loop
+ * — hence volatile + the async-signal-safe type, which guarantees an
+ * untorn read without locks. sim_fps is the fixed-timestep TICK rate and is
+ * decoupled from the ~60 fps render cap (see the accumulator in main()).
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene                 scene;        /* WHAT runs — the demo state          */
+    Screen                screen;       /* WHERE it draws — terminal viewport  */
+    int                   sim_fps;      /* fixed tick rate, ]/[ keys; != render*/
+    volatile sig_atomic_t running;      /* SIGINT/TERM clear it -> loop exits  */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH sets it -> re-query size   */
 } App;
 
 static App g_app;
@@ -1147,12 +1473,12 @@ static bool app_handle_key(App *app, int ch)
     case 'r': case 'R': scene_reseed(s);                               break;
 
     case '=': case '+':
-        if (s->speed < SPEED_MAX) s->speed *= 2;
-        if (s->speed > SPEED_MAX) s->speed  = SPEED_MAX;
+        if (s->bright.speed < SPEED_MAX) s->bright.speed *= 2;
+        if (s->bright.speed > SPEED_MAX) s->bright.speed  = SPEED_MAX;
         break;
     case '-':
-        s->speed /= 2;
-        if (s->speed < SPEED_MIN) s->speed  = SPEED_MIN;
+        s->bright.speed /= 2;
+        if (s->bright.speed < SPEED_MIN) s->bright.speed  = SPEED_MIN;
         break;
 
     case ']':
@@ -1165,33 +1491,97 @@ static bool app_handle_key(App *app, int ch)
         break;
 
     case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
+        s->current_theme = cycle_next(s->current_theme, N_THEMES);
         theme_apply(s->current_theme);
         break;
     case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
+        s->current_theme = cycle_prev(s->current_theme, N_THEMES);
         theme_apply(s->current_theme);
         break;
 
     case 'n': case 'N':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS);
+        s->current_pattern = (Pattern)cycle_next(s->current_pattern, N_PATTERNS);
         scene_regenerate(s);
         break;
     case 'p': case 'P':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS);
+        s->current_pattern = (Pattern)cycle_prev(s->current_pattern, N_PATTERNS);
         scene_regenerate(s);
         break;
 
     case 'g':
-        s->current_glyph = (GlyphSet)(((int)s->current_glyph + 1) % N_GLYPH_SETS);
+        s->current_glyph = (GlyphSet)cycle_next(s->current_glyph, N_GLYPH_SETS);
         break;
     case 'G':
-        s->current_glyph = (GlyphSet)(((int)s->current_glyph + N_GLYPH_SETS - 1) % N_GLYPH_SETS);
+        s->current_glyph = (GlyphSet)cycle_prev(s->current_glyph, N_GLYPH_SETS);
         break;
 
     default: break;
     }
     return true;
+}
+
+/*
+ * frame_dt — measure one frame's elapsed time and roll the clock forward.
+ * The delta is CLAMPED to MAX_FRAME_MS so a stall (debugger, hung terminal)
+ * can't hand the sim a huge dt and trigger a catch-up spiral. On return,
+ * *frame_time holds this frame's start instant.
+ */
+static int64_t frame_dt(int64_t *frame_time)
+{
+    int64_t now = clock_ns();
+    int64_t dt  = now - *frame_time;
+    *frame_time = now;
+    if (dt > MAX_FRAME_MS * NS_PER_MS) dt = MAX_FRAME_MS * NS_PER_MS;
+    return dt;
+}
+
+/*
+ * frame_sleep — hold the render cap: sleep off whatever is left of this
+ * frame's budget (1/RENDER_FPS) after the work already done since
+ * frame_start. Sleeping BEFORE terminal I/O keeps the cap stable regardless
+ * of how long the write takes.
+ */
+static void frame_sleep(int64_t frame_start, int64_t dt)
+{
+    int64_t elapsed = clock_ns() - frame_start + dt;
+    clock_sleep_ns(NS_PER_SEC / RENDER_FPS - elapsed);
+}
+
+/*
+ * FpsCounter — a rolling frame-rate estimate. Frames and elapsed time
+ * accumulate until FPS_UPDATE_MS has passed, then `value` is republished and
+ * the window resets (so the HUD reading is steady, not jittering per frame).
+ */
+typedef struct {
+    int     count;     /* frames since the last publish */
+    int64_t accum;     /* ns since the last publish      */
+    double  value;     /* last published frames-per-second */
+} FpsCounter;
+
+/* fps_tick — fold one frame of duration dt into the counter; republish the
+ * rate once the measurement window fills. */
+static void fps_tick(FpsCounter *f, int64_t dt)
+{
+    f->count++;
+    f->accum += dt;
+    if (f->accum >= FPS_UPDATE_MS * NS_PER_MS) {
+        f->value = (double)f->count / ((double)f->accum / (double)NS_PER_SEC);
+        f->count = 0;
+        f->accum = 0;
+    }
+}
+
+/*
+ * advance_sim — drain the fixed-timestep accumulator, stepping the sim at
+ * exactly sim Hz no matter the render rate (decouples animation speed from
+ * frame rate). `accum` carries leftover time between frames.
+ */
+static void advance_sim(Scene *s, int64_t *accum, int64_t tick_ns, float dt_sec)
+{
+    while (*accum >= tick_ns) {
+        scene_tick(s, dt_sec);
+        *accum -= tick_ns;
+    }
 }
 
 int main(void)
@@ -1209,11 +1599,9 @@ int main(void)
     screen_init(&app->screen);
     scene_init(&app->scene);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+    int64_t    frame_time = clock_ns();
+    int64_t    sim_accum  = 0;
+    FpsCounter fps        = { 0, 0, 0.0 };
 
     while (app->running) {
 
@@ -1223,33 +1611,17 @@ int main(void)
             sim_accum  = 0;
         }
 
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
+        int64_t dt      = frame_dt(&frame_time);
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
         sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
+        advance_sim(&app->scene, &sim_accum, tick_ns, dt_sec);
 
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
+        fps_tick(&fps, dt);
+        frame_sleep(frame_time, dt);
 
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
+        screen_draw(&app->screen, &app->scene, fps.value, app->sim_fps);
         screen_present();
 
         int ch = getch();
@@ -1260,3 +1632,4 @@ int main(void)
     screen_free(&app->screen);
     return 0;
 }
+

@@ -47,7 +47,7 @@
  * are distinguishable without explicit edge drawing.
  *
  * Keys:
- *   q/ESC quit   space pause   r reset angle   ] / [  sim Hz up / down
+ *   q/ESC quit   space pause   r reset angle   +/- speed   ] / [  sim Hz
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra penrose.c -o penrose -lncurses -lm
@@ -100,8 +100,19 @@ enum {
     SIM_FPS_MAX     = 60,
     SIM_FPS_STEP    = 10,
     FPS_UPDATE_MS   = 500,
-    N_COLORS        = 12,
+
+    /* Rotation-speed multiplier level (+/- keys; halve / double around    */
+    /* SPEED_DEF, so SPEED_DEF == 1x of ROTATE_SPEED).                     */
+    SPEED_MIN       =  1,
+    SPEED_DEF       =  8,
+    SPEED_MAX       = 64,
+
+    HUD_TOP_ROWS    =  2,   /* rows 0-1 = data band; tiling starts at row 2 */
 };
+
+/* HUD colour pairs — reuse the tiling palette (see color_init). */
+#define HUD_DATA   8        /* yellow — top data band                      */
+#define HUD_LABEL  4        /* cyan   — title + bottom action bar          */
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS   1000000LL
@@ -161,34 +172,23 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(1,  196, COLOR_BLACK);   /* red          */
-        init_pair(2,  208, COLOR_BLACK);   /* orange       */
-        init_pair(3,  226, COLOR_BLACK);   /* yellow       */
-        init_pair(4,   46, COLOR_BLACK);   /* green        */
-        init_pair(5,   51, COLOR_BLACK);   /* cyan         */
-        init_pair(6,   75, COLOR_BLACK);   /* light blue   */
-        init_pair(7,  201, COLOR_BLACK);   /* magenta      */
-        /* penrose-specific warm/cool palette */
-        init_pair(8,  220, COLOR_BLACK);   /* gold         */
-        init_pair(9,  214, COLOR_BLACK);   /* amber        */
-        init_pair(10,  87, COLOR_BLACK);   /* aqua         */
-        init_pair(11, 147, COLOR_BLACK);   /* lavender     */
-        init_pair(12, 228, COLOR_BLACK);   /* pale yellow  */
-        init_pair(13, 226, COLOR_BLACK);   /* yellow — HUD */
+        init_pair(1, 226, COLOR_BLACK);   /* yellow     — thick fill / centre   */
+        init_pair(2, 220, COLOR_BLACK);   /* gold       — thick fill            */
+        init_pair(3, 214, COLOR_BLACK);   /* amber      — thick fill            */
+        init_pair(4,  51, COLOR_BLACK);   /* cyan       — thin fill / HUD label  */
+        init_pair(5,  75, COLOR_BLACK);   /* light blue — thin fill             */
+        init_pair(6,  87, COLOR_BLACK);   /* aqua       — thin fill             */
+        init_pair(7, 201, COLOR_BLACK);   /* magenta    — tile edges            */
+        init_pair(8, 226, COLOR_BLACK);   /* yellow     — HUD data band         */
     } else {
-        init_pair(1,  COLOR_RED,     COLOR_BLACK);
-        init_pair(2,  COLOR_RED,     COLOR_BLACK);
-        init_pair(3,  COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(4,  COLOR_GREEN,   COLOR_BLACK);
-        init_pair(5,  COLOR_CYAN,    COLOR_BLACK);
-        init_pair(6,  COLOR_BLUE,    COLOR_BLACK);
-        init_pair(7,  COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(8,  COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(9,  COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(10, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(11, COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(12, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(13, COLOR_YELLOW,  COLOR_BLACK);   /* HUD */
+        init_pair(1, COLOR_YELLOW,  COLOR_BLACK);
+        init_pair(2, COLOR_YELLOW,  COLOR_BLACK);
+        init_pair(3, COLOR_YELLOW,  COLOR_BLACK);
+        init_pair(4, COLOR_CYAN,    COLOR_BLACK);
+        init_pair(5, COLOR_BLUE,    COLOR_BLACK);
+        init_pair(6, COLOR_CYAN,    COLOR_BLACK);
+        init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
+        init_pair(8, COLOR_YELLOW,  COLOR_BLACK);
     }
 }
 
@@ -222,19 +222,22 @@ static const float SIN5[5] = {
 
 typedef struct {
     float angle;   /* current view rotation (radians)                    */
+    int   speed;   /* rotation-speed level SPEED_MIN..SPEED_MAX (+/- keys) */
     bool  paused;
 } Penrose;
 
 static void penrose_init(Penrose *p)
 {
     p->angle  = 0.0f;
+    p->speed  = SPEED_DEF;
     p->paused = false;
 }
 
 static void penrose_tick(Penrose *p, float dt)
 {
     if (p->paused) return;
-    p->angle += ROTATE_SPEED * dt;
+    float speed_mul = (float)p->speed / (float)SPEED_DEF;
+    p->angle += ROTATE_SPEED * speed_mul * dt;
     /* Keep in [0, 2π) to avoid float drift */
     if (p->angle >= 2.0f * (float)M_PI)
         p->angle -= 2.0f * (float)M_PI;
@@ -263,11 +266,11 @@ static void penrose_draw(const Penrose *p, WINDOW *w, int cols, int rows)
     float sa = sinf(p->angle);
 
     /* Warm colours for thick-tile interiors: yellow, gold, amber */
-    static const int WARM[3] = { 3, 8, 9 };
+    static const int WARM[3] = { 1, 2, 3 };
     /* Cool colours for thin-tile interiors: cyan, light-blue, aqua */
-    static const int COOL[3] = { 5, 6, 10 };
+    static const int COOL[3] = { 4, 5, 6 };
 
-    for (int row = 1; row < rows - 1; row++) {
+    for (int row = HUD_TOP_ROWS; row < rows - 1; row++) {
         float py = ((float)row - cy) * (float)CELL_H;
 
         for (int col = 0; col < cols; col++) {
@@ -340,10 +343,10 @@ static void penrose_draw(const Penrose *p, WINDOW *w, int cols, int rows)
 
     /* 5-fold axis marker at screen centre */
     int cc = (int)cx, cr = (int)cy;
-    if (cc >= 0 && cc < cols && cr >= 1 && cr < rows - 1) {
-        wattron(w, COLOR_PAIR(3) | A_BOLD);
+    if (cc >= 0 && cc < cols && cr >= HUD_TOP_ROWS && cr < rows - 1) {
+        wattron(w, COLOR_PAIR(1) | A_BOLD);
         mvwaddch(w, cr, cc, 'O');
-        wattroff(w, COLOR_PAIR(3) | A_BOLD);
+        wattroff(w, COLOR_PAIR(1) | A_BOLD);
     }
 }
 
@@ -389,6 +392,25 @@ static void screen_init(Screen *s)
 
 static void screen_free(Screen *s) { (void)s; endwin(); }
 
+/*
+ * hud_print — draw a HUD string at (y, x) clipped to the terminal width, so a
+ * narrow window can never wrap HUD text down into the tiling. Right-aligned
+ * callers pass x = cols - len; a negative x is pinned to 0 and the text is
+ * truncated to whatever space remains.
+ */
+static void hud_print(int y, int x, int cols, int pair, int attr, const char *s)
+{
+    if (x < 0) x = 0;
+    int avail = cols - x;
+    if (avail <= 0) return;
+    char tmp[128];
+    snprintf(tmp, sizeof tmp, "%s", s);
+    if ((int)strlen(tmp) > avail) tmp[avail] = '\0';   /* clip to fit */
+    attron(COLOR_PAIR(pair) | attr);
+    mvprintw(y, x, "%s", tmp);
+    attroff(COLOR_PAIR(pair) | attr);
+}
+
 static void screen_draw(Screen *s, const Scene *sc,
                         double fps, int sim_fps, float alpha, float dt_sec)
 {
@@ -396,27 +418,24 @@ static void screen_draw(Screen *s, const Scene *sc,
     scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
     const Penrose *p = &sc->penrose;
-    char buf[80];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  sim:%3d Hz  angle:%.1f°  %s ",
-             fps, sim_fps,
-             (double)(p->angle * 180.0f / (float)M_PI),
-             p->paused ? "PAUSED" : "");
-    int hx = s->cols - (int)strlen(buf);
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(3) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(3) | A_BOLD);
 
-    attron(COLOR_PAIR(5) | A_BOLD);
-    mvprintw(0, 1, " PENROSE P3 ");
-    attroff(COLOR_PAIR(5) | A_BOLD);
+    /* ── top band: data (rows 0-1) ──────────────────────────────────── */
+    hud_print(0, 1, s->cols, HUD_LABEL, A_BOLD, " PENROSE P3 ");
 
-    attron(COLOR_PAIR(13) | A_BOLD);
-    mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  r:reset angle  [/]:Hz "
-             "  *=thick(gold)  .=thin(cyan)  |/\\-=edges ");
-    attroff(COLOR_PAIR(13) | A_BOLD);
+    char status[80];
+    snprintf(status, sizeof status, " %5.1f fps  %3d Hz  speed:%-3d  %s ",
+             fps, sim_fps, p->speed, p->paused ? "PAUSED " : "running");
+    hud_print(0, s->cols - (int)strlen(status), s->cols, HUD_DATA, A_BOLD, status);
+
+    char data[80];
+    snprintf(data, sizeof data,
+             " angle:%5.1f deg   *=thick(warm)  .=thin(cool)  /|\\-=edges ",
+             (double)(p->angle * 180.0f / (float)M_PI));
+    hud_print(1, 1, s->cols, HUD_DATA, 0, data);
+
+    /* ── bottom band: actions (last row) ────────────────────────────── */
+    hud_print(s->rows - 1, 0, s->cols, HUD_LABEL, A_BOLD,
+              " q:quit  spc:pause  r:reset  +/-:speed  [/]:Hz ");
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -446,6 +465,14 @@ static bool app_handle_key(App *app, int ch)
     case 'q': case 'Q': case 27: return false;
     case ' ': p->paused = !p->paused; break;
     case 'r': case 'R': p->angle = 0.0f; break;
+    case '=': case '+':
+        if (p->speed < SPEED_MAX) p->speed *= 2;
+        if (p->speed > SPEED_MAX) p->speed  = SPEED_MAX;
+        break;
+    case '-':
+        p->speed /= 2;
+        if (p->speed < SPEED_MIN) p->speed  = SPEED_MIN;
+        break;
     case ']':
         app->sim_fps += SIM_FPS_STEP;
         if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;

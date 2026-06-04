@@ -15,12 +15,18 @@
  *       at small scales but breaks into intricate symmetric stars at
  *       large.
  *
- *       PATTERN (n / N) — number of waves N:
+ *       PATTERN (n / p) — cycle a gallery of 15 presets, shown in the
+ *       top HUD as "i/15 NAME".  Each preset tunes the wave count N
+ *       (rotational symmetry) and the wavelength λ (density); a few
+ *       repeat the most striking orders at fine/giant scales:
  *
- *         TRI       N=3 — periodic hexagonal crystal (for contrast)
- *         PENTA     N=5 — 10-fold quasicrystal, Penrose-flavoured
- *         HEPTA     N=7 — 14-fold quasicrystal, denser stars
- *         UNDECA    N=11 — extremely intricate, near-cloud detail
+ *         HEX-3 .. STAR-13   N = 3..13 sweep (periodic 3/4/6/12
+ *                            crystals interleaved with 5/7/8/9/10/11/13
+ *                            quasicrystals for contrast)
+ *         FINE-5 / GIANT-5   the 10-fold look, dense vs huge
+ *         WEAVE-7 / NOVA-11  dense septagonal weave vs big 11-fold rosettes
+ *
+ *       See the presets[] table in §1 for the exact N / λ of each.
  *
  *       GLYPH (g / G) — how the intensity field is rendered:
  *
@@ -43,22 +49,20 @@
  *        Both produce smooth scalar fields; cosine sums uniquely give
  *        rotational long-range order.
  *
- * Section map:
- *   §1 config        — wavelength, wave counts, themes
- *   §2 clock         — monotonic timer + sleep
- *   §3 color         — HUD reserved + 10 themes (8-step ramp + accents)
- *   §5 quasicrystal  — hash, wave-direction precompute, intensity
- *                      sampler, level mapper
- *   §6 scene         — state, scene_tick (advance time + phase)
- *   §7 screen        — per-cell render through chosen glyph set + HUD
- *   §8 app           — signals, resize, fixed-step main loop
+ * Section map (cut by CONCERN, not by subsystem — see ARCHITECTURE below):
+ *   §1 CONFIG       — constants, presets, glyph/theme tables (data only)
+ *   §2 PERFORMANCE  — monotonic timer + sleep (accumulator/frame-cap in §6 main)
+ *   §3 LOGIC        — pure decisions: glyph name, hash, intensity→glyph
+ *   §4 SIMULATION   — wave vectors, intensity sampler, Scene, scene_tick
+ *   §5 RENDER       — colour/themes, screen, field + flash + HUD draw
+ *   §6 APP          — signals, resize, input, fixed-step combine (main)
  *
  * Keys:
  *   q / ESC    quit
  *   space      pause / resume phase drift
  *   r          randomise phase offset (snap to new state)
- *   n / N      next pattern  (TRI → PENTA → HEPTA → UNDECA)
- *   p / P      previous pattern
+ *   n / N      next preset     (cycles the 15-preset gallery)
+ *   p / P      previous preset
  *   g / G      next / previous glyph set
  *   t / T      next / previous theme
  *   + / =      faster phase drift
@@ -115,10 +119,11 @@
  *                  periodicity, the defining property of a
  *                  quasicrystal.
  *
- * Data-structure : Two precomputed arrays — wave_cos[N], wave_sin[N]
- *                  — refreshed when the pattern (and thus N) changes.
- *                  Plus the global Scene state. No grid is stored;
- *                  every cell is recomputed each frame.
+ * Data-structure : A WaveVectors struct — N precomputed unit wave vectors
+ *                  (parallel cos_theta[]/sin_theta[] arrays) — refreshed when
+ *                  the pattern (and thus N) changes, held on the Scene.  No
+ *                  grid is stored; every cell's intensity is recomputed each
+ *                  frame.
  *
  * Rendering      : ASCII only. Per cell: N cos calls + a few
  *                  multiplies for the dot product with each wave
@@ -132,22 +137,47 @@
  *                  per wave, but the straightforward version is
  *                  already fast enough at terminal resolutions.
  *
- * References     :
- *   • Shechtman, D. et al. (1984) — "Metallic Phase with Long-Range
- *     Orientational Order and No Translational Symmetry",
- *     Phys. Rev. Lett. 53(20):1951.  Original quasicrystal
- *     observation; Shechtman's 2011 Nobel Prize.
- *   • Wikipedia — Quasicrystal
- *     https://en.wikipedia.org/wiki/Quasicrystal
- *   • Wikipedia — Crystallographic Restriction Theorem
+ * References     : Theory first, then how to construct & draw it.
+ *
+ *   CONCEPTS — quasicrystals & aperiodic order
+ *   • Levine, D. & Steinhardt, P.J. (1984) — "Quasicrystals: A New
+ *     Class of Ordered Structures", Phys. Rev. Lett. 53(26):2477.
+ *     Coined "quasicrystal" and modelled the density as a SUM OF
+ *     PLANE WAVES — the exact picture this file renders.  Best
+ *     starting point for the algorithm.
+ *   • Shechtman, D., Blech, I., Gratias, D. & Cahn, J.W. (1984) —
+ *     "Metallic Phase with Long-Range Orientational Order and No
+ *     Translational Symmetry", Phys. Rev. Lett. 53(20):1951.  The
+ *     experimental discovery; Shechtman's 2011 Nobel Prize.
+ *   • Senechal, M. (1995) — "Quasicrystals and Geometry", Cambridge
+ *     Univ. Press.  Definitive geometry/symmetry text — why 5-, 7-,
+ *     11-fold order cannot be periodic.
+ *   • Baake, M. & Grimm, U. (2013) — "Aperiodic Order, Vol. 1: A
+ *     Mathematical Invitation", Cambridge Univ. Press.  Modern,
+ *     comprehensive reference for the whole field.
+ *   • Grünbaum, B. & Shephard, G.C. (1987) — "Tilings and Patterns",
+ *     W.H. Freeman, ch. 10.  Penrose tilings & aperiodicity (the
+ *     real-space cousin of these interference patterns).
+ *   • Wikipedia — "Crystallographic restriction theorem"
  *     https://en.wikipedia.org/wiki/Crystallographic_restriction_theorem
- *   • Penrose, R. (1974) — "The Role of Aesthetics in Pure and
- *     Applied Mathematical Research", Bulletin of the IMA 10:266.
- *     The Penrose tiling.
- *   • Mike Bostock — "Quasicrystals" (interactive)
- *     https://bl.ocks.org/mbostock/3019563
- *   • Shadertoy — many quasicrystal shaders
- *     https://www.shadertoy.com/results?query=quasicrystal
+ *     Short proof that periodic lattices admit only 1,2,3,4,6-fold
+ *     symmetry — the rule that makes N = 5,7,11… aperiodic.
+ *
+ *   RENDERING — building the pattern from summed waves
+ *   • McAllister, K. (2011) — "Quasicrystals as sums of waves in the
+ *     plane", mainisusuallyafunction.blogspot.com/2011/10/ .  A
+ *     step-by-step build of exactly this cosine-sum-of-N-plane-waves
+ *     animation; the closest match to the code here.
+ *   • Bostock, M. — "Quasicrystals" (interactive D3 demo)
+ *     https://gist.github.com/mbostock/3019563 .  Live sliders for N
+ *     and phase; good for building intuition before reading code.
+ *   • Bourke, P. — "Character representation of grey scale images",
+ *     https://paulbourke.net/dataformats/asciiart/ .  The intensity→
+ *     ASCII-ramp mapping behind RAMP_GLYPHS.
+ *   • De Bruijn, N.G. (1981) — "Algebraic theory of Penrose's
+ *     non-periodic tilings of the plane, I & II", Indag. Math.
+ *     43:39-66.  The dual multigrid construction — the OTHER way to
+ *     generate the same N-fold symmetry.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -188,15 +218,15 @@
  *
  * ALGORITHM IN STEPS
  * ──────────────────
- *  1. CHOOSE N (the wave count). Precompute wave_cos[m],
- *     wave_sin[m] for m = 0..N-1 with angle m·π/N.
+ *  1. CHOOSE N (the wave count). Precompute the WaveVectors:
+ *     cos_theta[m], sin_theta[m] for m = 0..N-1 with angle m·π/N.
  *  2. EACH FRAME:
  *     a. Advance global time t.
  *     b. For every screen cell (sx, sy):
  *        i.   x = sx;  y = sy · ASPECT_Y      // aspect correction
  *        ii.  intensity = 0
  *        iii. For each wave m:
- *               wx     = x · wave_cos[m] + y · wave_sin[m]
+ *               wx     = x · cos_theta[m] + y · sin_theta[m]
  *               φ_m    = (t + offset) · (r_base + m · r_delta)
  *               intensity += cos( ω·wx + φ_m )
  *        iv.  intensity /= N                  // → ≈ [-1, +1]
@@ -236,10 +266,10 @@
  *    quasicrystals. The rule: N must be coprime with the divisors
  *    of 12 (for 2-D Bravais). 5, 7, 11 work; 3 doesn't.
  *
- *  • COSINE COUNT AT N=11. 11 cosines per cell × 19 200 cells × 60
- *    fps ≈ 12.7 M cos calls/s. Modern CPUs handle it (~6 % of one
- *    core). If you push N to 31 just to see what happens, expect
- *    framerate to drop noticeably.
+ *  • COSINE COUNT AT HIGH N. The densest preset, STAR-13, runs 13
+ *    cosines per cell × 19 200 cells × 60 fps ≈ 15 M cos calls/s.
+ *    Modern CPUs handle it (~7 % of one core). If you raise
+ *    N_WAVES_MAX and push N higher, expect framerate to drop.
  *
  *  • ASPECT CORRECTION. Multiply screen y by ASPECT_Y_F (=2) when
  *    sampling so the pattern's circles look round on terminals
@@ -248,9 +278,9 @@
  *
  *  • PHASE-RATE SPREAD. If all waves drift at the SAME rate, the
  *    pattern just translates rigidly across the screen — no
- *    morphing. A small per-wave delta (k · 0.07) makes the relative
- *    phases shift, so the pattern visibly REORGANISES, which is
- *    much more interesting.
+ *    morphing. A small per-wave delta (k · rate_delta, per preset)
+ *    makes the relative phases shift, so the pattern visibly
+ *    REORGANISES, which is much more interesting.
  *
  *  • CONTOUR THRESHOLD AT N=11. With 11 waves the intensity field
  *    has very fine-scale structure; |I|<0.05 leaves visible gaps in
@@ -267,23 +297,23 @@
  *  • PAUSE (space). Pattern freezes. Resume: drift continues from
  *    exactly where it stopped. Verifies the time accumulator.
  *
- *  • PENTA pattern. Look for 10-pointed stars (5-fold symmetry, but
+ *  • PENROSE-5 preset. Look for 10-pointed stars (5-fold symmetry, but
  *    cosine doubles it). Counting points around the brightest peak
  *    near the centre should give 10. The Penrose-tiling kinship is
  *    visible.
  *
- *  • HEPTA pattern. Stars now have 14 points. The pattern is
- *    visibly denser and finer than PENTA at the same wavelength.
+ *  • SEPTA-7 preset. Stars now have 14 points. The pattern is
+ *    visibly denser and finer than PENROSE-5 at the same wavelength.
  *
- *  • UNDECA pattern. Visual density makes individual stars hard to
+ *  • UNDECA-11 preset. Visual density makes individual stars hard to
  *    count, but rotational symmetry is still perfect about any
  *    centre. Pause and rotate your head 360°/22 ≈ 16.4° — the
  *    pattern looks the same.
  *
- *  • TRI (N=3) pattern. You'll see HEXAGONAL periodic structure —
+ *  • HEX-3 preset (N=3). You'll see HEXAGONAL periodic structure —
  *    cells repeat in a tilable lattice. This is NOT a quasicrystal;
  *    it's included for comparison so the difference is visible
- *    when you switch to PENTA.
+ *    when you switch to PENROSE-5.
  *
  *  • CONTOUR glyph. The drawn lines should form a network of
  *    closed curves — these are the level sets I = 0 of the cosine
@@ -296,6 +326,48 @@
  *  • Theme cycle (t / T). Each theme should produce visible
  *    contrast. RAMP and WAVES use the full ramp[0..7]; PEAKS uses
  *    ramp[3..7]; CONTOUR uses bright slots.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
+ *
+ * The file is cut into six concern-layers.  Each layer owns a section and a
+ * well-defined right to mutate state; nothing reaches across.
+ *
+ *   LAYER         SECTION   MUTATES
+ *   ───────────   ───────   ─────────────────────────────────────────────
+ *   CONFIG        §1        nothing — const tables (presets, themes, ramp)
+ *   PERFORMANCE   §2 + §6   main-local timing only (frame_time, sim_accum,
+ *                           fps_accum, frame_count); never Scene
+ *   LOGIC         §3        nothing — pure functions (args → value / out-
+ *                           params); no globals written, no I/O
+ *   SIMULATION    §4        Scene.{time_secs, phase_offset, flash_t} via
+ *                           scene_tick / scene_reseed; Scene.waves
+ *                           (WaveVectors) via waves_init
+ *   RENDER        §5        ncurses screen + colour pairs only; Screen.{cols,
+ *                           rows} on init/resize.  NEVER mutates Scene
+ *   APP/EVENTS    §6        Scene.{paused, speed, current_*}, App.{sim_fps,
+ *                           running, need_resize} via keys/signals
+ *
+ * Two concerns are too small for their own section (documented, not faked):
+ *   EFFECTS — one cosmetic scalar, Scene.flash_t (the reseed flash).  Set in
+ *             scene_reseed, decayed in scene_tick (SIMULATION), drawn as an
+ *             overlay in scene_draw (RENDER).  No trail/glow buffers exist.
+ *   DELAYS  — one pause gate, Scene.paused, checked at the top of scene_tick.
+ *             No holds, countdowns, or timed transitions.
+ *
+ * compute_intensity (§4) is a PURE LOGIC sampler — no mutation, no I/O — now
+ * that it takes the WaveVectors as a const parameter it reads no globals at
+ * all.  It is listed under LOGIC's guarantees, only physically grouped beside
+ * the WaveVectors type it samples.
+ *
+ * PER-TICK COMBINE ORDER (the ONE place state advances — main, §6):
+ *   1. PERFORMANCE  measure real dt (clock_ns), clamp to 100 ms
+ *   2. SIMULATION   drain the fixed-step accumulator → scene_tick(dt) ×K
+ *   3. PERFORMANCE  fps accounting + sleep to the 60 fps frame cap
+ *   4. RENDER       screen_draw (field + flash + HUD) → screen_present
+ * User events — resize (SIGWINCH), keys (app_handle_key) — mutate state but
+ * are NOT part of the tick; they run before/after it, never inside scene_tick.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -316,7 +388,7 @@
 #endif
 
 /* ===================================================================== */
-/* §1  config                                                             */
+/* §1  CONFIG — constants, presets, glyph/theme tables (data only)        */
 /* ===================================================================== */
 
 enum {
@@ -325,6 +397,11 @@ enum {
     SIM_FPS_MAX         = 240,
     SIM_FPS_STEP        =  10,
 
+    /* Render-loop pacing (main).  The sim runs at sim_fps; the DRAW loop is
+     * capped separately so a fast machine doesn't spin redrawing. */
+    RENDER_FPS_CAP      =  60,    /* hard frame-rate cap (Hz) — per-frame sleep target  */
+    MAX_FRAME_DT_MS     = 100,    /* clamp a stalled frame's dt to dodge the spiral of death */
+
     SPEED_MIN           =   1,
     SPEED_DEF           =   8,
     SPEED_MAX           =  64,
@@ -332,15 +409,13 @@ enum {
     HUD_COLS            =  80,
     FPS_UPDATE_MS       = 500,
 
-    /* Maximum wave count we'll ever use — sized for the UNDECA pattern. */
-    N_WAVES_MAX         =  11,
+    /* Maximum wave count we'll ever use — sized for the STAR-13 preset. */
+    N_WAVES_MAX         =  13,
 
     /* Color pair indices.  PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
     PAIR_HUD            =   1,
     PAIR_HINT           =   2,
     PAIR_RAMP_BASE      =   3,    /* +0..+7 = 8 intensity tints       */
-    PAIR_HOT            =  11,    /* peak accent                      */
-    PAIR_COLD           =  12,    /* trough accent                    */
     PAIR_FLASH          =  13,    /* phase-randomise flash            */
 };
 
@@ -351,81 +426,89 @@ enum {
 #define ASPECT_Y_F           2.0f
 
 /*
- * Spatial wavelength (in cell units) at which each wave oscillates.
- * Smaller = denser, more wave fronts visible; larger = bigger features.
- * 14 strikes a good balance for terminal resolutions.
+ * Reseed flash (EFFECTS).  'r' sets flash_t = 1.0; it then decays each tick and
+ * the twinkle overlay is drawn while it stays bright.
+ *   FLASH_DECAY_RATE   — exponential fade rate (1/sec); flash_t *= e^(-rate·dt)
+ *   FLASH_VISIBLE_MIN  — draw the overlay only while flash_t exceeds this
  */
-#define WAVELENGTH           14.0f
-#define BASE_FREQ            (2.0f * (float)M_PI / WAVELENGTH)
+#define FLASH_DECAY_RATE     4.0f
+#define FLASH_VISIBLE_MIN    0.05f
 
 /*
- * Per-wave phase drift.
- *   ANIMATION_RATE_BASE  — radians per second the WHOLE pattern drifts
- *                          (uniform across waves; rigid translation).
- *   ANIMATION_RATE_DELTA — per-wave INCREMENT on top of the base rate.
- *                          Without this all waves shift in lockstep
- *                          and the pattern only translates; with it
- *                          the relative phases evolve so the pattern
- *                          MORPHS (much more interesting).
+ * Preset — one showcase configuration of the plane-wave sum.  The whole
+ * visual identity of a preset is four numbers, so the gallery is a flat
+ * table and adding/retuning a look touches exactly one row:
+ *
+ *   n_waves    — the SYMMETRY driver.  N waves at θ_m = m·π/N give 2N-fold
+ *                rotational symmetry.  N ∈ {3,4,6,12} are PERIODIC crystals
+ *                (Bravais-compatible); N ∈ {5,7,8,9,10,11,13} are APERIODIC
+ *                quasicrystals (Crystallographic Restriction Theorem — see
+ *                CONCEPTS).  Bounded by N_WAVES_MAX.
+ *   wavelength — the DENSITY driver, in cell units.  Smaller = tighter, more
+ *                wave fronts; larger = big sweeping features.  Two presets at
+ *                the same N but different λ look completely different, which
+ *                is how the table reaches 15 distinct looks from ~11 symmetries.
+ *   rate_base  — radians/sec the WHOLE pattern drifts (uniform; rigid glide).
+ *   rate_delta — per-wave INCREMENT on rate_base.  Without it all waves drift
+ *                in lockstep and the pattern merely translates; with it the
+ *                relative phases evolve so the pattern MORPHS in place.
+ *
+ * A Preset is the parameterisation of one density-wave quasicrystal: the
+ * (N, λ, drift) triple is exactly what Levine & Steinhardt (1984) vary to
+ * generate different quasicrystalline orders.  Ref: CONCEPTS + References block.
  */
-#define ANIMATION_RATE_BASE  0.50f
-#define ANIMATION_RATE_DELTA 0.07f
+typedef struct {
+    const char *name;       /* HUD label, also the i/N gallery entry          */
+    int         n_waves;    /* N — symmetry order (2N-fold); see CRT note above */
+    float       wavelength; /* λ in cells — feature size / density             */
+    float       rate_base;  /* uniform phase drift rate (rad/s)                */
+    float       rate_delta; /* per-wave drift increment → in-place morphing    */
+} Preset;
+
+#define N_PRESETS 15
 
 /*
- * Pattern enum — one entry per wave count we showcase. The "TRI"
- * (N=3) pattern is included for CONTRAST: it's hexagonal periodic,
- * not a quasicrystal, and gives the eye a clear reference for what
- * "periodic" looks like before flipping to PENTA / HEPTA / UNDECA.
+ * The gallery.  Curated for a wide spread of symmetry AND density: a sweep of
+ * N = 3..13 (periodic crystals interleaved with quasicrystals for contrast),
+ * plus fine/giant density variants of the most striking orders (5, 7, 11).
+ * Default boot is PENROSE-5, the canonical 10-fold quasicrystal.
+ */
+static const Preset presets[N_PRESETS] = {
+    /* name         N   λ     base  delta */
+    { "HEX-3",      3, 16.0f, 0.50f, 0.07f },  /* periodic hexagon — the reference */
+    { "SQUARE-4",   4, 16.0f, 0.45f, 0.06f },  /* 8-fold, square-ish weave         */
+    { "PENROSE-5",  5, 14.0f, 0.50f, 0.07f },  /* 10-fold, Penrose-flavoured       */
+    { "FLOWER-6",   6, 18.0f, 0.40f, 0.05f },  /* periodic hexagonal rosettes      */
+    { "SEPTA-7",    7, 13.0f, 0.55f, 0.08f },  /* 14-fold, denser stars            */
+    { "OCTA-8",     8, 14.0f, 0.50f, 0.06f },  /* 16-fold octagonal                */
+    { "ENNEA-9",    9, 12.0f, 0.55f, 0.07f },  /* 18-fold                          */
+    { "DECA-10",   10, 13.0f, 0.50f, 0.06f },  /* 20-fold                          */
+    { "UNDECA-11", 11, 12.0f, 0.60f, 0.08f },  /* 22-fold, near-cloud detail       */
+    { "DODECA-12", 12, 13.0f, 0.45f, 0.05f },  /* 24-fold, near-periodic           */
+    { "STAR-13",   13, 11.0f, 0.60f, 0.09f },  /* 26-fold, extremely intricate     */
+    { "FINE-5",     5,  8.0f, 0.70f, 0.10f },  /* tight decagonal lattice          */
+    { "GIANT-5",    5, 22.0f, 0.30f, 0.04f },  /* huge slow 10-pointed stars       */
+    { "WEAVE-7",    7,  9.0f, 0.65f, 0.10f },  /* dense septagonal weave           */
+    { "NOVA-11",   11, 20.0f, 0.35f, 0.05f },  /* big intricate 11-fold rosettes   */
+};
+
+/*
+ * GlyphSet — how the scalar intensity field I ∈ [-1,+1] is turned into ASCII
+ * (cycled by g/G).  Pure RENDER choice: it changes nothing in the field, only
+ * which feature of it the eye sees.  Each mode answers a different question:
+ *   RAMP    — the full field as a density gradient (the default "see it all")
+ *   PEAKS   — only crests (I > 0); the bright star pattern, troughs blanked
+ *   CONTOUR — only the zero-crossings |I|≈0; the wave-front network (level set)
+ *   WAVES   — bipolar: crests bright, troughs dim — emphasises the +/- structure
+ * Decoded by intensity_to_glyph (§3); the trailing N_GLYPH_SETS bounds the cycle.
  */
 typedef enum {
-    PATTERN_TRI    = 0,    /* N = 3   (hexagonal, periodic)            */
-    PATTERN_PENTA  = 1,    /* N = 5   (10-fold quasicrystal)           */
-    PATTERN_HEPTA  = 2,    /* N = 7   (14-fold quasicrystal)           */
-    PATTERN_UNDECA = 3,    /* N = 11  (22-fold quasicrystal)           */
-    N_PATTERNS     = 4,
-} Pattern;
-
-static int pattern_n_waves(Pattern p)
-{
-    switch (p) {
-    case PATTERN_TRI:    return 3;
-    case PATTERN_PENTA:  return 5;
-    case PATTERN_HEPTA:  return 7;
-    case PATTERN_UNDECA: return 11;
-    default:             return 5;
-    }
-}
-
-static const char *pattern_name(Pattern p)
-{
-    switch (p) {
-    case PATTERN_TRI:    return "TRI   ";
-    case PATTERN_PENTA:  return "PENTA ";
-    case PATTERN_HEPTA:  return "HEPTA ";
-    case PATTERN_UNDECA: return "UNDECA";
-    default:             return "?     ";
-    }
-}
-
-/* GlyphSet — how the [-1, +1] intensity is rendered. */
-typedef enum {
-    GLYPH_RAMP    = 0,
-    GLYPH_PEAKS   = 1,
-    GLYPH_CONTOUR = 2,
-    GLYPH_WAVES   = 3,
-    N_GLYPH_SETS  = 4,
+    GLYPH_RAMP    = 0,    /* density ramp over the whole [-1,+1] range */
+    GLYPH_PEAKS   = 1,    /* positive intensity only (highlights)       */
+    GLYPH_CONTOUR = 2,    /* zero-crossing band only (wave fronts)      */
+    GLYPH_WAVES   = 3,    /* bipolar peaks-bright / troughs-dim          */
+    N_GLYPH_SETS  = 4,    /* count — bounds the g/G cycle, not a mode    */
 } GlyphSet;
-
-static const char *glyph_set_name(GlyphSet g)
-{
-    switch (g) {
-    case GLYPH_RAMP:    return "ramp ";
-    case GLYPH_PEAKS:   return "peaks";
-    case GLYPH_CONTOUR: return "cntr ";
-    case GLYPH_WAVES:   return "waves";
-    default:            return "?    ";
-    }
-}
 
 /* Density-ramp glyphs (low → high intensity). Used by RAMP / PEAKS /
  * WAVES; CONTOUR uses a single thresholded glyph.  ASCII-only. */
@@ -436,36 +519,45 @@ static const char RAMP_GLYPHS[8] = { '`', '.', ',', ':', '-', 'o', '#', '@' };
 #define CONTOUR_BAND_HALF    0.20f
 
 /*
- * Themes — every entry sits in the bright half of the 256-colour
- * cube so even A_DIM cells stay legible against a default-black
- * terminal.  See "Theme Palette Brightness" in /CLAUDE.md.
+ * Theme — one named colour palette, cycled live by the t/T keys.  WHY a struct
+ * (not loose arrays): a theme is the whole look in one row of the themes[]
+ * table, so adding/editing a palette touches exactly one line and theme_apply()
+ * just blits the row into ncurses colour pairs.  Every value is a 256-colour-
+ * cube index; the CLAUDE.md "Theme Palette Brightness" rule forces them all into
+ * the bright half so even A_DIM cells stay legible on a default-black terminal.
+ *
+ *   name — HUD label, the only part the user reads.
+ *   ramp — an 8-tier dark→bright GRADIENT, the heart of the palette.  Loaded
+ *          into pairs PAIR_RAMP_BASE+0..+7 and indexed by the intensity level
+ *          (0..7) that intensity_to_glyph computes, so the perceived theme is
+ *          the RELATIVE gradient across the eight tiers, not any one colour.
  */
 typedef struct {
-    const char *name;
-    short       ramp[8];
-    short       hot;
-    short       cold;
+    const char *name;      /* HUD label, cycled by t/T                       */
+    short       ramp[8];   /* 8-tier dark→bright gradient (256-cube indices)  */
 } Theme;
 
 #define N_THEMES 10
 
 static const Theme themes[N_THEMES] = {
-    /* name       0    1    2    3    4    5    6    7   hot cold */
-    { "DEFAULT",{ 24,  31,  39,  70,  76, 137, 215, 230 }, 196,  39 },
-    { "MATRIX", { 28,  34,  40,  46,  76, 118, 154, 192 }, 226,  39 },
-    { "NOVA",   { 60,  91, 134, 165, 207, 213, 219, 231 }, 196,  39 },
-    { "MONO",   {240, 243, 245, 247, 249, 251, 253, 255 }, 226,  39 },
-    { "OCEAN",  { 24,  25,  31,  38,  45,  51, 117, 195 }, 196,  21 },
-    { "FIRE",   { 88, 124, 130, 166, 202, 208, 214, 226 }, 226,  21 },
-    { "EARTH",  { 94, 130, 137, 173, 179, 215, 222, 230 }, 196,  39 },
-    { "FOREST", { 28,  34,  40,  70,  76, 112, 156, 192 }, 196,  39 },
-    { "DESERT", {130, 137, 143, 173, 179, 215, 222, 229 }, 196,  21 },
-    { "ARCTIC", { 24,  31,  67, 110, 117, 153, 195, 231 }, 196,  39 },
+    /* name       0    1    2    3    4    5    6    7  */
+    { "DEFAULT",{ 24,  31,  39,  70,  76, 137, 215, 230 } },
+    { "MATRIX", { 28,  34,  40,  46,  76, 118, 154, 192 } },
+    { "NOVA",   { 60,  91, 134, 165, 207, 213, 219, 231 } },
+    { "MONO",   {240, 243, 245, 247, 249, 251, 253, 255 } },
+    { "OCEAN",  { 24,  25,  31,  38,  45,  51, 117, 195 } },
+    { "FIRE",   { 88, 124, 130, 166, 202, 208, 214, 226 } },
+    { "EARTH",  { 94, 130, 137, 173, 179, 215, 222, 230 } },
+    { "FOREST", { 28,  34,  40,  70,  76, 112, 156, 192 } },
+    { "DESERT", {130, 137, 143, 173, 179, 215, 222, 229 } },
+    { "ARCTIC", { 24,  31,  67, 110, 117, 153, 195, 231 } },
 };
 
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  PERFORMANCE — timing primitives                                    */
 /* ===================================================================== */
+/* Monotonic clock + sleep.  The fixed-timestep accumulator, fps counter   */
+/* and 60 fps frame cap that USE them live at the combine point in §6 main. */
 
 static int64_t clock_ns(void)
 {
@@ -485,49 +577,47 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  LOGIC — pure decisions (no mutation, no I/O)                       */
 /* ===================================================================== */
+/* Results depend only on arguments; these write no globals and touch no    */
+/* screen, so reordering or deleting any RENDER/EFFECTS code cannot change   */
+/* their output.  compute_intensity is also pure but lives in §4 beside the  */
+/* WaveVectors type it reads (see ARCHITECTURE).                             */
 
-static void theme_apply(int idx)
+static const char *glyph_set_name(GlyphSet g)
 {
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
-        init_pair(PAIR_HOT,  t->hot,  -1);
-        init_pair(PAIR_COLD, t->cold, -1);
-    } else {
-        static const short fb[8] = {
-            COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,   COLOR_CYAN,
-            COLOR_GREEN, COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE,
-        };
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), fb[i], -1);
-        init_pair(PAIR_HOT,  COLOR_RED,  -1);
-        init_pair(PAIR_COLD, COLOR_CYAN, -1);
+    switch (g) {
+    case GLYPH_RAMP:    return "ramp ";
+    case GLYPH_PEAKS:   return "peaks";
+    case GLYPH_CONTOUR: return "cntr ";
+    case GLYPH_WAVES:   return "waves";
+    default:            return "?    ";
     }
 }
 
-static void color_init(void)
+/* wrap_inc / wrap_dec — step an index forward/backward through [0, n) with
+ * wraparound: the "next/previous in a cyclic list" the key handler uses to
+ * cycle preset / theme / glyph.  wrap_dec adds n before the modulo so the
+ * result is never negative. */
+static inline int wrap_inc(int v, int n) { return (v + 1) % n; }
+static inline int wrap_dec(int v, int n) { return (v + n - 1) % n; }
+
+/* clamp_level — pin a raw index into the valid [0, 7] ramp-gradient range. */
+static inline int clamp_level(int level)
 {
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,   226, -1);
-        init_pair(PAIR_HINT,   51, -1);
-        init_pair(PAIR_FLASH, 226, -1);
-    } else {
-        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
-        init_pair(PAIR_FLASH, COLOR_YELLOW, -1);
-    }
-    theme_apply(0);
+    if (level < 0) return 0;
+    if (level > 7) return 7;
+    return level;
 }
 
-/* ===================================================================== */
-/* §5  quasicrystal — wave precompute, intensity sampler                  */
-/* ===================================================================== */
+/* ramp_attr — emphasise the gradient ENDS: brightest tiers bold, darkest dim,
+ * mid-tiers plain.  Lifts the read of high/low intensity out of A_DIM mush. */
+static inline int ramp_attr(int level)
+{
+    if (level >= 6) return A_BOLD;
+    if (level <= 1) return A_DIM;
+    return A_NORMAL;
+}
 
 /* hash3 — only used for the reseed-flash overlay. */
 static inline uint32_t hash3(int wx, int wy, int wz)
@@ -544,130 +634,6 @@ static inline uint32_t hash3(int wx, int wy, int wz)
 }
 
 /*
- * Per-wave direction tables. Refilled on pattern change so the
- * intensity sampler can iterate without recomputing trig per cell.
- */
-static float wave_cos[N_WAVES_MAX];
-static float wave_sin[N_WAVES_MAX];
-
-static void waves_init(int n)
-{
-    if (n < 1) n = 1;
-    if (n > N_WAVES_MAX) n = N_WAVES_MAX;
-    for (int k = 0; k < n; k++) {
-        float angle = (float)k * (float)M_PI / (float)n;
-        wave_cos[k] = cosf(angle);
-        wave_sin[k] = sinf(angle);
-    }
-}
-
-/*
- * compute_intensity — sum N plane waves at the screen cell.
- *
- *   x  = sx                        (screen x in cell units)
- *   y  = sy * ASPECT_Y_F          (aspect-corrected screen y)
- *   I  = (1/N) Σ cos(ω(x·cos θ_k + y·sin θ_k) + φ_k(t))
- *
- * Returns roughly [-1, +1] (exact bounds depend on phase alignment;
- * the maximum is 1.0 when all N waves constructively interfere).
- */
-static float compute_intensity(int sx, int sy, float t, int n_waves)
-{
-    float fx = (float)sx;
-    float fy = (float)sy * ASPECT_Y_F;
-    float sum = 0.0f;
-    for (int k = 0; k < n_waves; k++) {
-        float wx    = fx * wave_cos[k] + fy * wave_sin[k];
-        float phase = t * (ANIMATION_RATE_BASE
-                         + (float)k * ANIMATION_RATE_DELTA);
-        sum += cosf(BASE_FREQ * wx + phase);
-    }
-    return sum / (float)n_waves;
-}
-
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
-
-typedef struct {
-    bool     paused;
-    int      speed;
-    int      current_theme;
-    Pattern  current_pattern;
-    GlyphSet current_glyph;
-    float    time_secs;
-    float    phase_offset;       /* added to time; randomised by 'r' */
-    float    flash_t;
-} Scene;
-
-static void scene_pattern_changed(Scene *s)
-{
-    waves_init(pattern_n_waves(s->current_pattern));
-}
-
-static void scene_reseed(Scene *s)
-{
-    /* Randomise the phase offset — pattern snaps to a new state. */
-    uint32_t h = hash3((int)(s->time_secs * 1000.0f),
-                       (int)(s->phase_offset * 100.0f), 0xDECAF);
-    s->phase_offset = ((float)(h & 0xFFFFu) / 65536.0f) * 2.0f * (float)M_PI;
-    s->flash_t = 1.0f;
-}
-
-static void scene_init(Scene *s)
-{
-    memset(s, 0, sizeof *s);
-    s->paused          = false;
-    s->speed           = SPEED_DEF;
-    s->current_theme   = 0;
-    s->current_pattern = PATTERN_PENTA;
-    s->current_glyph   = GLYPH_RAMP;
-    s->phase_offset    = 0.0f;
-    scene_pattern_changed(s);
-}
-
-/*
- * scene_tick — advance time and decay the flash overlay. Speed
- * scales the time advance, so fast/slow drift is just a multiplier
- * on the phase rate.
- */
-static void scene_tick(Scene *s, float dt)
-{
-    s->flash_t *= expf(-4.0f * dt);
-    if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    s->time_secs += dt * speed_mul;
-}
-
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
-
-typedef struct {
-    int cols, rows;
-} Screen;
-
-static void screen_init(Screen *s)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
-}
-static void screen_free(Screen *s) { (void)s; endwin(); }
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
-}
-
-/*
  * intensity_to_glyph — choose (glyph, ramp_idx, attr) from the
  * intensity value and the active GlyphSet. Returns false when the
  * cell should be left blank (e.g., negative intensity in PEAKS mode,
@@ -680,41 +646,33 @@ static bool intensity_to_glyph(float intensity, GlyphSet g,
 
     switch (g) {
     case GLYPH_RAMP: {
-        /* [-1, +1] → [0, 7] */
-        int level = (int)((intensity + 1.0f) * 4.0f);
-        if (level < 0) level = 0;
-        if (level > 7) level = 7;
+        /* full bipolar field [-1,+1] → 8-step ramp [0,7] */
+        int level = clamp_level((int)((intensity + 1.0f) * 4.0f));
         *glyph = RAMP_GLYPHS[level];
         *ramp_idx = level;
-        if (level >= 6) *attr = A_BOLD;
-        else if (level <= 1) *attr = A_DIM;
+        *attr = ramp_attr(level);
         return true;
     }
 
     case GLYPH_PEAKS: {
-        /* Only positive intensity; brighter the closer to +1. */
+        /* crests only: troughs blank, [0,+1] → ramp [0,7] */
         if (intensity < 0.0f) return false;
-        int level = (int)(intensity * 8.0f);
-        if (level < 0) level = 0;
-        if (level > 7) level = 7;
+        int level = clamp_level((int)(intensity * 8.0f));
         *glyph = RAMP_GLYPHS[level];
         *ramp_idx = level;
-        if (level >= 6) *attr = A_BOLD;
-        else if (level <= 1) *attr = A_DIM;
+        *attr = ramp_attr(level);
         return true;
     }
 
     case GLYPH_CONTOUR: {
-        /* Zero-crossing band: brighter the closer to I=0. */
+        /* zero-crossing band: drawn only near I=0, brighter toward it */
         float dist = fabsf(intensity);
         if (dist > CONTOUR_BAND_HALF) return false;
-        float strength = 1.0f - dist / CONTOUR_BAND_HALF;     /* [0, 1] */
-        int level = (int)(strength * 8.0f);
-        if (level < 0) level = 0;
-        if (level > 7) level = 7;
+        float strength = 1.0f - dist / CONTOUR_BAND_HALF;     /* [0,1], 1 at I=0 */
+        int level = clamp_level((int)(strength * 8.0f));
         *glyph = (strength > 0.65f) ? '*' : (strength > 0.30f) ? '.' : '`';
         *ramp_idx = level;
-        if (level >= 6) *attr = A_BOLD;
+        if (level >= 6) *attr = A_BOLD;   /* no dim floor: faint contour stays plain */
         return true;
     }
 
@@ -740,22 +698,237 @@ static bool intensity_to_glyph(float intensity, GlyphSet g,
     return false;
 }
 
-static void scene_draw(const Screen *sc, const Scene *s)
+/* ===================================================================== */
+/* §4  SIMULATION — wave vectors, intensity sampler, Scene, scene_tick     */
+/* ===================================================================== */
+/* The only state that advances.  waves_init fills the wave vectors on       */
+/* pattern change; scene_tick advances time_secs each tick.  Folded in here   */
+/* (too small for their own section): EFFECTS = the flash_t decay; DELAYS =   */
+/* the `paused` gate at the top of scene_tick.                                */
+
+/*
+ * WaveVectors — the N unit wave vectors k̂_m = (cos θ_m, sin θ_m) the field is
+ * summed over (θ_m = m·π/N).  This IS the quasicrystal's defining data: the
+ * density-wave model builds the pattern as the interference of N plane waves
+ * in these directions, and N coprime with the Bravais orders forces aperiodic
+ * long-range order (Levine & Steinhardt 1984; Crystallographic Restriction
+ * Theorem — see the References block).
+ *
+ * Precomputed on preset change so the per-cell sampler (compute_intensity)
+ * never recomputes trig.  Stored as PARALLEL arrays, not an array-of-Vec2, so
+ * the inner loop streams cos_theta[]/sin_theta[] contiguously — the hot path
+ * touches this N times per cell.
+ *   count                  — N, the number of active vectors (≤ N_WAVES_MAX)
+ *   cos_theta / sin_theta  — the x / y components, valid for index 0..count-1;
+ *                            slots ≥ count are stale and must not be read
+ */
+typedef struct {
+    int   count;                    /* N — active wave-vector count          */
+    float cos_theta[N_WAVES_MAX];   /* x-components of k̂_m (0..count-1)      */
+    float sin_theta[N_WAVES_MAX];   /* y-components of k̂_m (0..count-1)      */
+} WaveVectors;
+
+/* waves_init — fill `w` with the N wave vectors θ_m = m·π/N. Mutator. */
+static void waves_init(WaveVectors *w, int n)
+{
+    if (n < 1) n = 1;
+    if (n > N_WAVES_MAX) n = N_WAVES_MAX;
+    w->count = n;
+    for (int k = 0; k < n; k++) {
+        float angle = (float)k * (float)M_PI / (float)n;
+        w->cos_theta[k] = cosf(angle);
+        w->sin_theta[k] = sinf(angle);
+    }
+}
+
+/*
+ * compute_intensity — sum the plane waves at one cell.  PURE: reads only its
+ * arguments (the WaveVectors included) — no globals, no I/O — so it is true
+ * LOGIC, placed here only to sit beside the WaveVectors type it reads.
+ *
+ *   x  = sx                        (screen x in cell units)
+ *   y  = sy * ASPECT_Y_F          (aspect-corrected screen y)
+ *   ω  = freq = 2π / λ            (spatial frequency, from the preset)
+ *   I  = (1/N) Σ cos(ω(x·cos θ_k + y·sin θ_k) + φ_k(t))
+ *
+ * freq, rate_base and rate_delta come from the active Preset.  Returns roughly
+ * [-1, +1] (the maximum is 1.0 when all N waves constructively interfere).
+ */
+static float compute_intensity(const WaveVectors *w, int sx, int sy, float t,
+                               float freq, float rate_base, float rate_delta)
+{
+    float fx = (float)sx;
+    float fy = (float)sy * ASPECT_Y_F;
+    float sum = 0.0f;
+    for (int k = 0; k < w->count; k++) {
+        float wx    = fx * w->cos_theta[k] + fy * w->sin_theta[k];
+        float phase = t * (rate_base + (float)k * rate_delta);
+        sum += cosf(freq * wx + phase);
+    }
+    return sum / (float)w->count;
+}
+
+/*
+ * Scene — the whole simulated world plus the knobs that drive it, laid out as
+ * a table of contents.  Render/HUD read it; only the tick orchestrators (init /
+ * reseed / pattern_changed / tick) take a Scene* — every other function takes
+ * the narrowest sub-type (const WaveVectors*, const Screen*, …).
+ */
+typedef struct {
+    /* WHAT is simulated — the wave vectors the field is summed over. */
+    WaveVectors waves;
+
+    /* HOW the user drives the SIMULATION. */
+    int      current_preset;     /* index into presets[] — which pattern    */
+    int      speed;              /* drift-speed multiplier (+/- keys)        */
+
+    /* WHERE in the animation we are — the drift clock + this run's phase. */
+    float    time_secs;          /* simulation clock (advanced by speed)     */
+    float    phase_offset;       /* random phase added to the clock ('r')    */
+    bool     paused;             /* DELAYS: run gate, checked in scene_tick   */
+    float    flash_t;            /* EFFECTS: reseed flash, decays each tick   */
+
+    /* Display options — RENDER concepts, merely toggled by keys. */
+    GlyphSet current_glyph;      /* how intensity maps to a glyph            */
+    int      current_theme;      /* active Theme index                       */
+} Scene;
+
+static void scene_pattern_changed(Scene *s)
+{
+    waves_init(&s->waves, presets[s->current_preset].n_waves);
+}
+
+static void scene_reseed(Scene *s)
+{
+    /* Randomise the phase offset — pattern snaps to a new state. */
+    uint32_t h = hash3((int)(s->time_secs * 1000.0f),
+                       (int)(s->phase_offset * 100.0f), 0xDECAF);
+    s->phase_offset = ((float)(h & 0xFFFFu) / 65536.0f) * 2.0f * (float)M_PI;
+    s->flash_t = 1.0f;
+}
+
+static void scene_init(Scene *s)
+{
+    memset(s, 0, sizeof *s);
+    s->paused          = false;
+    s->speed           = SPEED_DEF;
+    s->current_theme   = 0;
+    s->current_preset  = 2;          /* PENROSE-5 — the canonical 10-fold look */
+    s->current_glyph   = GLYPH_RAMP;
+    s->phase_offset    = 0.0f;
+    scene_pattern_changed(s);
+}
+
+/*
+ * scene_tick — advance time and decay the flash overlay. Speed
+ * scales the time advance, so fast/slow drift is just a multiplier
+ * on the phase rate.
+ */
+static void scene_tick(Scene *s, float dt)
+{
+    s->flash_t *= expf(-FLASH_DECAY_RATE * dt);
+    if (s->paused) return;
+    float speed_mul = (float)s->speed / (float)SPEED_DEF;
+    s->time_secs += dt * speed_mul;
+}
+
+/* ===================================================================== */
+/* §5  RENDER — state → screen (reads only, never mutates the model)      */
+/* ===================================================================== */
+/* Colour/theme setup, screen geometry, then the field + flash + HUD draw.  */
+/* Reads Scene and the wave field; writes only ncurses (screen + colour      */
+/* pairs) and Screen.{cols,rows} on init/resize.  Never mutates Scene.        */
+
+/* ---- colour: load a theme's ramp + accents into ncurses pairs ----------- */
+
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    if (COLORS >= 256) {
+        const Theme *t = &themes[idx];
+        for (int i = 0; i < 8; i++)
+            init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
+    } else {
+        static const short fb[8] = {
+            COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,   COLOR_CYAN,
+            COLOR_GREEN, COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE,
+        };
+        for (int i = 0; i < 8; i++)
+            init_pair((short)(PAIR_RAMP_BASE + i), fb[i], -1);
+    }
+}
+
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,   226, -1);
+        init_pair(PAIR_HINT,   51, -1);
+        init_pair(PAIR_FLASH, 226, -1);
+    } else {
+        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
+        init_pair(PAIR_FLASH, COLOR_YELLOW, -1);
+    }
+    theme_apply(0);
+}
+
+/* ---- screen: terminal viewport ------------------------------------------ */
+
+/*
+ * Screen — the terminal viewport, just its size in character cells.  WHY a
+ * type for two ints: it is the narrowest read-only handle the render functions
+ * (scene_draw, screen_draw) need for geometry, so they take `const Screen*`
+ * instead of the whole App — keeping RENDER decoupled from simulation/runtime
+ * state.  Captured by getmaxyx at init and refreshed on every SIGWINCH resize;
+ * scene_draw derives the field's centre/extent from it each frame.
+ */
+typedef struct {
+    int cols, rows;   /* current terminal width / height in cells */
+} Screen;
+
+static void screen_init(Screen *s)
+{
+    initscr();
+    noecho();
+    cbreak();
+    curs_set(0);
+    nodelay(stdscr, TRUE);
+    keypad(stdscr, TRUE);
+    typeahead(-1);
+    color_init();
+    getmaxyx(stdscr, s->rows, s->cols);
+}
+static void screen_free(Screen *s) { (void)s; endwin(); }
+static void screen_resize(Screen *s)
+{
+    endwin();
+    refresh();
+    getmaxyx(stdscr, s->rows, s->cols);
+}
+
+/*
+ * draw_field — the render hot path: sample the quasicrystal at every cell and
+ * ink it through the active glyph set.  The field is centred so its rotational-
+ * symmetry point sits mid-screen; each cell's value is one compute_intensity.
+ */
+static void draw_field(const Screen *sc, const Scene *s)
 {
     int top = 2, bottom = sc->rows - 1;
-    int n = pattern_n_waves(s->current_pattern);
-    float t = s->time_secs + s->phase_offset;
-
-    /* Centre the field on the screen so the rotational symmetry
-     * point sits at the middle of the renderable area. */
-    int cx = sc->cols / 2;
-    int cy = (top + bottom) / 2;
+    const Preset *ps = &presets[s->current_preset];
+    float freq = 2.0f * (float)M_PI / ps->wavelength;   /* ω = 2π/λ */
+    float t    = s->time_secs + s->phase_offset;
+    int   cx   = sc->cols / 2;
+    int   cy   = (top + bottom) / 2;
 
     for (int sy = top; sy < bottom; sy++) {
         int rel_y = sy - cy;
         for (int sx = 0; sx < sc->cols; sx++) {
             int rel_x = sx - cx;
-            float intensity = compute_intensity(rel_x, rel_y, t, n);
+            float intensity = compute_intensity(&s->waves, rel_x, rel_y, t,
+                                                freq, ps->rate_base,
+                                                ps->rate_delta);
 
             char glyph;
             int  ramp_idx, attr;
@@ -768,30 +941,44 @@ static void scene_draw(const Screen *sc, const Scene *s)
             attroff(COLOR_PAIR(pair) | attr);
         }
     }
-
-    /* Reseed flash overlay. */
-    if (s->flash_t > 0.05f) {
-        int seed = (int)(s->time_secs * 1000.0f);
-        attron(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
-        for (int sy = top; sy < bottom; sy += 2) {
-            for (int sx = 0; sx < sc->cols; sx += 2) {
-                if (((sx ^ sy ^ seed) & 7) == 0)
-                    mvaddch(sy, sx, '*');
-            }
-        }
-        attroff(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
-    }
 }
 
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
+/*
+ * draw_reseed_flash — brief sparse twinkle overlaid after 'r', while the flash
+ * envelope is still bright.  A hash-sparse star field (1-in-8 of a 2×2 grid)
+ * that animates by mixing the millisecond clock into the cell test.
+ */
+static void draw_reseed_flash(const Screen *sc, const Scene *s)
 {
-    erase();
-    scene_draw(sc, s);
+    int seed = (int)(s->time_secs * 1000.0f);
+    attron(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
+    for (int sy = 2; sy < sc->rows - 1; sy += 2) {
+        for (int sx = 0; sx < sc->cols; sx += 2) {
+            if (((sx ^ sy ^ seed) & 7) == 0)
+                mvaddch(sy, sx, '*');
+        }
+    }
+    attroff(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
+}
 
+/* scene_draw — the field, then the reseed flash on top while it is still bright. */
+static void scene_draw(const Screen *sc, const Scene *s)
+{
+    draw_field(sc, s);
+    if (s->flash_t > FLASH_VISIBLE_MIN)
+        draw_reseed_flash(sc, s);
+}
+
+/*
+ * hud_draw_status_line — row 0: live status on the right (fps / tick Hz /
+ * DRIFT|PAUSED / speed) and, on the left, the title plus the preset counter
+ * "i/N NAME" so the active gallery entry is always visible.
+ */
+static void hud_draw_status_line(const Screen *sc, const Scene *s,
+                                 double fps, int sim_fps)
+{
     const char *state_str = s->paused ? "PAUSED" : "DRIFT ";
 
-    /* Row 0 right — primary status. */
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
              " %5.1f fps  %3d Hz  %s  speed:%-3d ",
@@ -799,21 +986,22 @@ static void screen_draw(Screen *sc, const Scene *s,
     int hx = sc->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
+    mvprintw(0, hx, "%s", buf);                  /* right-aligned status */
+    mvprintw(0, 1, " QUASICRYSTAL  %2d/%d %-9s ", /* left title + preset */
+             s->current_preset + 1, N_PRESETS,
+             presets[s->current_preset].name);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
-    /* Row 0 left — title. */
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 1, " QUASICRYSTAL ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-    /* Row 1 — pattern + glyph + theme + ramp swatch + N. */
+/*
+ * hud_draw_param_line — row 1: the parameters the keys control — glyph mode,
+ * theme name, a live swatch of the 8 ramp colours, and the wave count / drift
+ * phase readout.  Each field prints, then `x` advances past its column width.
+ */
+static void hud_draw_param_line(const Screen *sc, const Scene *s)
+{
+    (void)sc;
     int x = 1;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " pattern:%-6s ", pattern_name(s->current_pattern));
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 17;
-
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(1, x, " glyph:%-5s ", glyph_set_name(s->current_glyph));
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -824,6 +1012,7 @@ static void screen_draw(Screen *sc, const Scene *s,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     x += 17;
 
+    /* Ramp swatch — paint each of the 8 gradient tiers in its own pair. */
     attron(COLOR_PAIR(PAIR_HUD));
     mvprintw(1, x, " ramp:");
     attroff(COLOR_PAIR(PAIR_HUD));
@@ -835,32 +1024,63 @@ static void screen_draw(Screen *sc, const Scene *s,
         attroff(COLOR_PAIR(p) | A_BOLD);
         x++;
     }
+
     attron(COLOR_PAIR(PAIR_HUD));
     mvprintw(1, x,
              "  N=%d  phase:%5.2f ",
-             pattern_n_waves(s->current_pattern),
+             presets[s->current_preset].n_waves,
              (double)(s->time_secs + s->phase_offset));
     attroff(COLOR_PAIR(PAIR_HUD));
+}
 
-    /* Bottom hint. */
+/* hud_draw_key_hints — bottom row: the full interactive key legend. */
+static void hud_draw_key_hints(const Screen *sc)
+{
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(sc->rows - 1, 0,
              " n/p:pattern  g/G:glyph  t/T:theme  +/-:drift  spc:pause  r:reseed  q:quit ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
+static void screen_draw(const Screen *sc, const Scene *s,
+                        double fps, int sim_fps)
+{
+    erase();
+    scene_draw(sc, s);                          /* the field + flash */
+    hud_draw_status_line(sc, s, fps, sim_fps);  /* row 0: title + preset + fps/state */
+    hud_draw_param_line(sc, s);                 /* row 1: glyph/theme/ramp/N/phase */
+    hud_draw_key_hints(sc);                     /* bottom row: key legend */
+}
+
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §6  APP — signals, resize, input + the per-tick combine                */
 /* ===================================================================== */
+/* main is the ONE place the layers combine per tick (PERFORMANCE →         */
+/* SIMULATION → PERFORMANCE → RENDER; see ARCHITECTURE).  Signals and        */
+/* app_handle_key mutate state OUTSIDE the tick, never inside scene_tick.    */
 
+/*
+ * App — the running program: the simulated Scene plus the screen and the loop
+ * runtime that the tick and the signal handlers share.  It is the root the
+ * combine point (main) owns; sub-layers still take the narrowest type, so
+ * bundling everything here does not re-couple them.
+ *
+ *   scene / screen — WHAT advances + WHERE it draws (see those types).
+ *   sim_fps        — fixed-timestep tick rate ([ / ] keys); sets TICK_NS.
+ *   running        — 0 = quit; cleared by SIGINT/SIGTERM.
+ *   need_resize    — 1 = a SIGWINCH is pending; serviced before the next tick.
+ * running/need_resize are written from async signal handlers, so they are
+ * `volatile sig_atomic_t` — the only type a handler may portably touch and the
+ * only way the compiler won't optimise the flag-read out of the loop.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene                 scene;        /* WHAT advances — the simulated field */
+    Screen                screen;       /* WHERE it draws — viewport size      */
+    int                   sim_fps;      /* fixed tick rate (Hz), [ / ] keys    */
+    volatile sig_atomic_t running;      /* 0 = quit; set by SIGINT/SIGTERM     */
+    volatile sig_atomic_t need_resize;  /* 1 = SIGWINCH pending; serviced in loop */
 } App;
 
 static App g_app;
@@ -875,6 +1095,8 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
+/* app_handle_key — user EVENT, not part of the tick.  May mutate Scene knobs
+ * and App fields directly; it never advances simulation state (no scene_tick). */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
@@ -902,28 +1124,28 @@ static bool app_handle_key(App *app, int ch)
         break;
 
     case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
+        s->current_theme = wrap_inc(s->current_theme, N_THEMES);
         theme_apply(s->current_theme);
         break;
     case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
+        s->current_theme = wrap_dec(s->current_theme, N_THEMES);
         theme_apply(s->current_theme);
         break;
 
     case 'n': case 'N':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS);
+        s->current_preset = wrap_inc(s->current_preset, N_PRESETS);
         scene_pattern_changed(s);
         break;
     case 'p': case 'P':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS);
+        s->current_preset = wrap_dec(s->current_preset, N_PRESETS);
         scene_pattern_changed(s);
         break;
 
     case 'g':
-        s->current_glyph = (GlyphSet)(((int)s->current_glyph + 1) % N_GLYPH_SETS);
+        s->current_glyph = (GlyphSet)wrap_inc((int)s->current_glyph, N_GLYPH_SETS);
         break;
     case 'G':
-        s->current_glyph = (GlyphSet)(((int)s->current_glyph + N_GLYPH_SETS - 1) % N_GLYPH_SETS);
+        s->current_glyph = (GlyphSet)wrap_dec((int)s->current_glyph, N_GLYPH_SETS);
         break;
 
     default: break;
@@ -931,7 +1153,10 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-int main(void)
+/* app_init — bring the program up: seed the RNG, install signal handlers and
+ * the endwin() atexit hook, set the loop's starting state, then open the screen
+ * and the scene.  Everything that happens once, before the per-frame loop. */
+static void app_init(App *app)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
@@ -939,41 +1164,52 @@ int main(void)
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
-
     screen_init(&app->screen);
     scene_init(&app->scene);
+}
+
+int main(void)
+{
+    App *app = &g_app;
+    app_init(app);
 
     int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
+    int64_t sim_accum   = 0;   /* unspent real time owed to the fixed-step sim */
+    int64_t fps_accum   = 0;   /* real time accumulated in the current fps window */
     int     frame_count = 0;
     double  fps_display = 0.0;
 
+    const int64_t max_dt_ns    = (int64_t)MAX_FRAME_DT_MS * NS_PER_MS;
+    const int64_t frame_cap_ns = NS_PER_SEC / RENDER_FPS_CAP;
+
     while (app->running) {
 
+        /* EVENT (not the tick): service a pending resize before timing. */
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns();
             sim_accum  = 0;
         }
 
+        /* 1. PERFORMANCE — measure real elapsed time, clamp a stall. */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        if (dt > max_dt_ns) dt = max_dt_ns;
 
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
+        /* 2. SIMULATION — drain the fixed-step accumulator. */
         sim_accum += dt;
         while (sim_accum >= tick_ns) {
             scene_tick(&app->scene, dt_sec);
             sim_accum -= tick_ns;
         }
 
+        /* 3. PERFORMANCE — fps accounting + sleep to the frame cap. */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -984,11 +1220,13 @@ int main(void)
         }
 
         int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+        clock_sleep_ns(frame_cap_ns - elapsed);
 
+        /* 4. RENDER — read-only draw of the field + flash + HUD. */
         screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
         screen_present();
 
+        /* EVENT (not the tick): drain one key. */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

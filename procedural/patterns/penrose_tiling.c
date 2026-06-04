@@ -35,8 +35,10 @@
  *                    (acute = mid tint, obtuse = bright tint)
  *         BOTH       edges + dim centroids
  *
- *       'r' randomises the tile orientation/seed offset and re-runs
- *       the deflation. 'space' pauses brightness drift.
+ *       The tiling BUILDS ITSELF on screen: it starts at the seed and
+ *       deflates one level at a time, holds at full depth, then loops.
+ *       'r' randomises the orientation/seed and restarts the build;
+ *       'space' pauses the deflation animation.
  *
  * Study alongside:
  *   ../patterns/quasicrystal.c
@@ -49,26 +51,23 @@
  *        constraint is in the GEOMETRY (matching edge lengths and
  *        angles after subdivision) rather than coloured edges.
  *
- * Section map:
- *   §1 config        — geometry constants, themes, pattern enum
- *   §2 clock         — monotonic timer + sleep
- *   §3 color         — HUD reserved + 10 themes (8-step ramp + accents)
- *   §5 penrose       — hash, perlin/fBm, triangle struct,
- *                      deflation rule, seed configurations,
- *                      Bresenham rasteriser
- *   §6 scene         — state, regenerate on pattern change / reseed
- *   §7 screen        — render all triangles + brightness modulation
- *   §8 app           — signals, resize, fixed-step main loop
+ * Section map (layers — see the ARCHITECTURE block below):
+ *   §1 CONFIG        — constants, themes, Pattern/Glyph enums (data only)
+ *   §2 PERFORMANCE   — monotonic timer + sleep (frame cap lives in §6 main)
+ *   §3 LOGIC         — pure decisions: enum name/depth, hash3, edge glyph
+ *   §4 SIMULATION    — triangle buffers, deflation rule, seeds, scene tick
+ *   §5 RENDER        — colour/theme, layout, triangle drawing, HUD
+ *   §6 APP           — signals, resize, input, fixed-step main loop
  *
  * Keys:
  *   q / ESC    quit
- *   space      pause / resume light-field drift
+ *   space      pause / resume the deflation animation
  *   r          reseed (rotate tiling, keep same algorithm)
  *   n / N      next pattern
  *   p / P      previous pattern
  *   g / G      next / previous glyph set
  *   t / T      next / previous theme
- *   + / =      faster light drift
+ *   + / =      faster deflation
  *   -          slower
  *   ] / [      raise / lower tick Hz
  *
@@ -119,11 +118,11 @@
  *                  Coloured by triangle type — acute and obtuse
  *                  picked from different ramp slots.
  *
- *                  PLUS a slow-drifting fBm BRIGHTNESS field
- *                  (same trick as truchet_tiles.c / wang_tiles.c)
- *                  modulates per-cell A_DIM/A_NORMAL/A_BOLD over the
- *                  static tiling, giving the pattern subtle motion
- *                  without retiling.
+ *                  ANIMATION — the tiling is BUILT ON SCREEN one
+ *                  deflation level at a time: start at the seed, apply
+ *                  one substitution round every STEP_INTERVAL_SEC so the
+ *                  viewer watches it subdivide, hold at full depth, then
+ *                  loop back to the seed (see scene_tick).
  *
  * Data-structure : Two flat arrays of Triangle structs (double-buffered
  *                  so the next iteration writes into the inactive
@@ -138,24 +137,38 @@
  *                  — plenty fast at 60 fps.
  *
  * Performance    : Generation (K=6 from STAR seed): ~17 000 triangles
- *                  written across 6 iterations; runs in milliseconds.
- *                  Per-frame render: ~100 K mvaddch calls. The
- *                  brightness-fBm overlay adds one fBm per cell on top.
- *                  Total ~10 % of one CPU core at 240×80×60 fps.
+ *                  written across 6 iterations; one iteration runs per
+ *                  animation step in microseconds.  Per-frame render:
+ *                  ~100 K mvaddch calls at full depth.  Total ~10 % of
+ *                  one CPU core at 240×80×60 fps.
  *
- * References     :
- *   • Penrose, R. (1974) — "The Role of Aesthetics in Pure and
- *     Applied Mathematical Research", Bulletin of the IMA 10:266.
- *   • Grünbaum & Shephard (1986) — "Tilings and Patterns".
- *     Definitive reference; chapter on Penrose tilings.
+ * References     : Concept — Robinson-triangle deflation & aperiodicity.
+ *   • Penrose, R. (1974) — "The Role of Aesthetics in Pure and Applied
+ *     Mathematical Research", Bulletin of the IMA 10:266-271.  Original
+ *     P3 thick/thin rhombus tiling.
+ *   • Gardner, M. (1977) — "Extraordinary nonperiodic tiling that
+ *     enriches the theory of tiles", Scientific American 236(1):110-121.
+ *     The popular article that made Penrose tiles famous; best first read.
+ *   • Grünbaum, B. & Shephard, G.C. (1987) — "Tilings and Patterns",
+ *     W.H. Freeman, ch. 10.  Definitive treatment; Robinson triangles,
+ *     substitution/deflation, and the matching rules this file uses.
+ *   • Senechal, M. (1995) — "Quasicrystals and Geometry", Cambridge
+ *     Univ. Press.  Why the deflation limit is aperiodic yet ordered.
  *   • De Bruijn, N.G. (1981) — "Algebraic theory of Penrose's
- *     non-periodic tilings of the plane", Indagationes Math 43.
- *   • Wikipedia — Penrose tiling
- *     https://en.wikipedia.org/wiki/Penrose_tiling
- *   • Preshing, Jeff — "Penrose Tiling Explained"
- *     https://preshing.com/20110831/penrose-tiling-explained/
+ *     non-periodic tilings of the plane, I & II", Indagationes Math
+ *     43:39-66.  The dual/pentagrid construction — the OTHER way to
+ *     build the same tiling (cf. penrose_pentagrid.c).
+ *
+ *                  Rendering — drawing the deflated tiling.
+ *   • Preshing, J. (2011) — "Penrose Tiling Explained",
+ *     https://preshing.com/20110831/penrose-tiling-explained/  Hands-on
+ *     deflation-by-subdivision walkthrough; closest match to this code.
  *   • Bresenham, J. (1965) — "Algorithm for computer control of a
- *     digital plotter", IBM Systems Journal 4(1):25–30.
+ *     digital plotter", IBM Systems Journal 4(1):25-30.  The integer
+ *     line rasteriser used for every triangle edge (see draw_line_styled).
+ *   • Wikipedia — "Penrose tiling",
+ *     https://en.wikipedia.org/wiki/Penrose_tiling  Quick reference with
+ *     figures of both the rhombus and triangle (P2/P3) forms.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -204,9 +217,9 @@
  *     for its 3 edges; choose a colour from the active theme based
  *     on triangle type (acute vs obtuse) and direction-glyph from
  *     edge slope.
- *  5. ANIMATE by overlaying a slow fBm brightness field that
- *     modulates per-cell A_DIM/A_NORMAL/A_BOLD without changing the
- *     underlying tiling.
+ *  5. ANIMATE by replaying the deflation: show the seed, then apply
+ *     one round every STEP_INTERVAL_SEC so the tiling visibly
+ *     subdivides; hold at full depth and loop back to the seed.
  *
  * KEY FORMULAS
  * ────────────
@@ -295,11 +308,11 @@
  *
  * HOW TO VERIFY
  * ─────────────
- *  • PAUSE (space). The brightness wave freezes; the static tiling
- *    is unchanged. Resume: drift continues from where it stopped.
+ *  • PAUSE (space). The deflation animation freezes at the current
+ *    level. Resume: it continues building from where it stopped.
  *
- *  • Press 'r'. The flash fires and the tiling rotates / re-orients
- *    around the centre. Same pattern, different orientation.
+ *  • Press 'r'. The tiling rotates / re-orients around the centre and
+ *    rebuilds from the seed. Same pattern, different orientation.
  *
  *  • STAR pattern. Look at the centre — you should see 10 triangles
  *    meeting at one point, creating perfect 5-fold rotational
@@ -319,8 +332,8 @@
  *    "pointillist" version with one dot per triangle. BOTH overlays.
  *
  *  • Theme cycle (t). Colours for acute vs obtuse should be visibly
- *    distinct in every theme. The brightness drift should be
- *    legible against every theme's ramp.
+ *    distinct in every theme, and the edge lines should stay legible
+ *    against the default-black background.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -340,8 +353,47 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
+ *
+ * The tiling is a FIXED deterministic structure (the deflation of a seed);
+ * the only thing that "runs" is the animation that builds it up one level at
+ * a time and loops.  Concerns are cut into labelled layers:
+ *
+ *   LAYER        SECTION        MUTATES
+ *   ──────────   ─────────────  ───────────────────────────────────────────
+ *   PERFORMANCE  §2 + loop §6   frame_time, sim_accum, fps_accum (main locals)
+ *   LOGIC        §3             nothing — pure functions (enum→value, hash,
+ *                               edge-direction→glyph)
+ *   SIMULATION   §4             Scene.tiling buffers (deflate_step, seeds) and
+ *                               Scene.{defl_level,step_timer,time_secs,seed,rot}
+ *                               (scene_tick / begin_cycle / reseed)
+ *   RENDER       §5             nothing in the model — reads Scene + triangle
+ *                               buffers, writes only the ncurses screen and
+ *                               colour pairs
+ *   APP/EVENTS   §6             Scene.{paused,speed,current_*}, App.sim_fps via
+ *                               keys; App.running/need_resize via signals
+ *
+ * Concerns ABSENT or trivial here — no hollow section is created:
+ *   EFFECTS — none.  Every glyph's colour comes straight from its triangle
+ *             type; nothing cosmetic is stored or decayed.
+ *   DELAYS  — folded into SIMULATION: scene_tick paces growth with
+ *             STEP_INTERVAL_SEC and holds at full depth for HOLD_SEC; the
+ *             `paused` flag is a one-bit gate.  No separate timer layer.
+ *   world_to_screen is a PURE LOGIC mapping but lives in §5 RENDER because it
+ *   needs the Screen type (its only caller); flagged there.
+ *
+ * PER-TICK COMBINE ORDER (the ONE place state advances — main, §6):
+ *   1. PERFORMANCE  dt = now - frame_time, clamp to 100 ms, sim_accum += dt
+ *   2. SIMULATION   while (sim_accum >= tick_ns) scene_tick(); sim_accum -= …
+ *   3. PERFORMANCE  fps bookkeeping, then sleep to cap the frame at 60 fps
+ *   4. RENDER       screen_draw() + screen_present()   (reads only)
+ *   User events (keys / reseed / pattern / resize / signal) mutate state
+ *   OUTSIDE this order and are NOT part of the tick — see app_handle_key and
+ *   the resize block at the top of the loop.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ===================================================================== */
-/* §1  config                                                             */
+/* §1  CONFIG — constants, themes, enums (data only)                      */
 /* ===================================================================== */
 
 enum {
@@ -349,6 +401,11 @@ enum {
     SIM_FPS_DEFAULT     =  60,
     SIM_FPS_MAX         = 240,
     SIM_FPS_STEP        =  10,
+
+    /* Render-loop pacing (main).  The sim runs at sim_fps; the DRAW loop is
+     * capped separately so a fast machine doesn't spin redrawing. */
+    RENDER_FPS_CAP      =  60,    /* hard frame-rate cap (Hz) — per-frame sleep target  */
+    MAX_FRAME_DT_MS     = 100,    /* clamp a stalled frame's dt to dodge the spiral of death */
 
     SPEED_MIN           =   1,
     SPEED_DEF           =   8,
@@ -365,9 +422,6 @@ enum {
     PAIR_HUD            =   1,
     PAIR_HINT           =   2,
     PAIR_RAMP_BASE      =   3,    /* +0..+7 = 8 brightness/colour tints */
-    PAIR_HOT            =  11,
-    PAIR_COLD           =  12,
-    PAIR_FLASH          =  13,
 };
 
 #define NS_PER_SEC      1000000000LL
@@ -376,14 +430,18 @@ enum {
 
 #define ASPECT_Y_F           2.0f
 
-/* Brightness fBm parameters — slow drift over the static tiling. */
-#define BRIGHT_SCALE_X       0.040f
-#define BRIGHT_SCALE_Y       0.080f
-#define WIND_X_BASE          3.0f
-#define FBM_OCTAVES          3
+/*
+ * Deflation animation pacing (see scene_tick).  The tiling is built one
+ * deflation level at a time so the viewer watches the substitution rule act;
+ * STEP_INTERVAL_SEC paces the growth, HOLD_SEC pauses on the finished tiling
+ * before looping back to the seed.  Both are in "animation seconds" — the
+ * +/- speed multiplier scales real time into this clock.
+ */
+#define STEP_INTERVAL_SEC    0.60f   /* seconds shown per deflation level */
+#define HOLD_SEC             2.50f   /* hold at full depth before looping  */
 
-/* Golden ratio and its inverse — drives the deflation step length. */
-#define PHI                  1.6180339887498949f
+/* Inverse golden ratio 1/φ — the fraction along each edge where the Penrose
+ * substitution cuts (see phi_split / deflate_step). */
 #define INV_PHI              0.6180339887498949f
 
 /* Triangle types. */
@@ -391,16 +449,129 @@ enum {
 #define TRI_OBTUSE           1
 
 /*
- * Pattern enum — what to deflate, and how deep. STAR + DEEP differ
- * only in iteration count; THIN and THICK use single-rhombus seeds.
+ * Pattern — the user-selectable starting configuration (cycled by a key).
+ *
+ * WHY four entries: a deflation tiling is fully determined by two choices —
+ * (1) the SEED, the coarse arrangement of triangles you start from, and
+ * (2) K, how many substitution rounds to apply (deflation depth).  These four
+ * cover the two seeds that read well centred on screen, each at a useful depth.
+ *
+ *   • The value is BOTH a seed selector and a depth selector: scene_begin_cycle
+ *     maps it to a seed_*() builder, and pattern_depth() maps it to the target K
+ *     that scene_tick animates up to.  STAR and DEEP build the IDENTICAL
+ *     10-triangle wheel seed (seed_star) and differ ONLY in K — DEEP just runs
+ *     one more round, giving a denser figure from the same symmetry.
+ *   • THIN / THICK start from a SINGLE Robinson half-rhombus (seed_thin /
+ *     seed_thick) instead of the wheel, so the 5-fold symmetry is absent and
+ *     you watch one rhombus fan out — the clearest view of the bare
+ *     substitution rule (cf. deflate_step).
+ *
+ * K is bounded by MAX_TRIANGLES; see the Data-structure note in the file header
+ * for why K=6 (DEEP) is the practical ceiling. Ref: Grünbaum & Shephard ch. 10.
  */
 typedef enum {
-    PATTERN_STAR  = 0,    /* 10-triangle star, K=5  */
-    PATTERN_DEEP  = 1,    /* 10-triangle star, K=6  */
-    PATTERN_THIN  = 2,    /* single thin rhombus,  K=5 */
-    PATTERN_THICK = 3,    /* single thick rhombus, K=5 */
-    N_PATTERNS    = 4,
+    PATTERN_STAR  = 0,    /* seed_star  wheel, K=5 — the default 5-fold figure   */
+    PATTERN_DEEP  = 1,    /* seed_star  wheel, K=6 — same seed, one round denser */
+    PATTERN_THIN  = 2,    /* seed_thin  single acute  half-rhombus, K=5          */
+    PATTERN_THICK = 3,    /* seed_thick single obtuse half-rhombus, K=5          */
+    N_PATTERNS    = 4,    /* count — NOT a pattern; bounds the cycle, never built*/
 } Pattern;
+
+/*
+ * GlyphSet — which features of each triangle the renderer draws (cycled by a
+ * key).  Pure RENDER choice: it changes nothing in the tiling, only how the
+ * SAME triangles are inked.  EDGES traces the three sides (Bresenham, the
+ * rhombus outline you normally picture); CENTERS drops one marker at each
+ * triangle's centroid (a dot field that exposes the underlying point pattern);
+ * BOTH overlays the two.  Edge vs centre also pick different ramp slots
+ * (ACUTE/OBTUSE _EDGE_/_CENTER_RAMP) so the layers stay visually distinct.
+ */
+typedef enum {
+    GLYPH_EDGES   = 0,    /* triangle outlines only       */
+    GLYPH_CENTERS = 1,    /* centroid markers only         */
+    GLYPH_BOTH    = 2,    /* outlines + centroid markers   */
+    N_GLYPH_SETS  = 3,    /* count — bounds the cycle      */
+} GlyphSet;
+
+/* Triangle-type → ramp slot. Acute uses a mid tint; obtuse uses a
+ * brighter tint so the two types read as distinct colours regardless
+ * of the active theme. Centroid markers get a slightly different
+ * pair so they don't merge visually with the edges. */
+#define ACUTE_EDGE_RAMP      4
+#define OBTUSE_EDGE_RAMP     6
+#define ACUTE_CENTER_RAMP    5
+#define OBTUSE_CENTER_RAMP   7
+
+/*
+ * Theme — one named colour palette, cycled live by the t/T keys.
+ *
+ * WHY a struct (not loose arrays): a theme is the whole look in one row of the
+ * `themes[]` table, so adding/editing a palette touches exactly one line and
+ * theme_apply() just blits the row into ncurses colour pairs.  Every value is a
+ * 256-colour-cube index; the file's CLAUDE.md "Theme Palette Brightness" rule
+ * forces them all into the bright half so even A_DIM cells stay legible on a
+ * default-black terminal.
+ *
+ *   name    — label shown in the HUD; the only thing the user reads.
+ *   ramp[8] — an 8-tier dark→bright GRADIENT, the heart of the palette.  Loaded
+ *             into pairs PAIR_RAMP_BASE+0..+7; the draw code indexes it by
+ *             triangle role via the *_RAMP slot constants (ACUTE_EDGE_RAMP=4,
+ *             OBTUSE_EDGE_RAMP=6, ACUTE_CENTER_RAMP=5, OBTUSE_CENTER_RAMP=7).
+ *             So the perceived theme comes from the RELATIVE gradient across
+ *             slots 4–7, not from any one colour. Slots 0–3 are the darker tail,
+ *             reserved headroom for future depth/age shading.
+ */
+typedef struct {
+    const char *name;      /* HUD label, cycled by t/T                       */
+    short       ramp[8];   /* 8-tier dark→bright gradient (256-cube indices) */
+} Theme;
+
+#define N_THEMES 10
+
+static const Theme themes[N_THEMES] = {
+    /* name       0    1    2    3    4    5    6    7  */
+    { "DEFAULT",{ 24,  31,  39,  70,  76, 137, 215, 230 } },
+    { "MATRIX", { 28,  34,  40,  46,  76, 118, 154, 192 } },
+    { "NOVA",   { 60,  91, 134, 165, 207, 213, 219, 231 } },
+    { "MONO",   {240, 243, 245, 247, 249, 251, 253, 255 } },
+    { "OCEAN",  { 24,  25,  31,  38,  45,  51, 117, 195 } },
+    { "FIRE",   { 88, 124, 130, 166, 202, 208, 214, 226 } },
+    { "EARTH",  { 94, 130, 137, 173, 179, 215, 222, 230 } },
+    { "FOREST", { 28,  34,  40,  70,  76, 112, 156, 192 } },
+    { "DESERT", {130, 137, 143, 173, 179, 215, 222, 229 } },
+    { "ARCTIC", { 24,  31,  67, 110, 117, 153, 195, 231 } },
+};
+
+/* ===================================================================== */
+/* §2  PERFORMANCE — timing primitives                                    */
+/* ===================================================================== */
+/* Monotonic clock + sleep.  The fixed-timestep accumulator, fps counter   */
+/* and 60 fps frame cap that USE them live at the combine point in §6 main. */
+
+static int64_t clock_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+}
+
+static void clock_sleep_ns(int64_t ns)
+{
+    if (ns <= 0) return;
+    struct timespec req = {
+        .tv_sec  = (time_t)(ns / NS_PER_SEC),
+        .tv_nsec = (long)  (ns % NS_PER_SEC),
+    };
+    nanosleep(&req, NULL);
+}
+
+/* ===================================================================== */
+/* §3  LOGIC — pure decisions & mappings (no mutation, no I/O)            */
+/* ===================================================================== */
+/* Pure functions shared across layers — they read only their arguments,   */
+/* so reordering or deleting render/effects code cannot change their result.*/
+/* (world_to_screen is also a pure mapping but lives in §5 RENDER, where    */
+/* the Screen type it needs is defined.)                                    */
 
 static const char *pattern_name(Pattern p)
 {
@@ -424,14 +595,6 @@ static int pattern_depth(Pattern p)
     }
 }
 
-/* Glyph enum — how the tiling is rendered. */
-typedef enum {
-    GLYPH_EDGES   = 0,
-    GLYPH_CENTERS = 1,
-    GLYPH_BOTH    = 2,
-    N_GLYPH_SETS  = 3,
-} GlyphSet;
-
 static const char *glyph_set_name(GlyphSet g)
 {
     switch (g) {
@@ -442,111 +605,15 @@ static const char *glyph_set_name(GlyphSet g)
     }
 }
 
-/* Triangle-type → ramp slot. Acute uses a mid tint; obtuse uses a
- * brighter tint so the two types read as distinct colours regardless
- * of the active theme. Centroid markers get a slightly different
- * pair so they don't merge visually with the edges. */
-#define ACUTE_EDGE_RAMP      4
-#define OBTUSE_EDGE_RAMP     6
-#define ACUTE_CENTER_RAMP    5
-#define OBTUSE_CENTER_RAMP   7
+/* wrap_inc / wrap_dec — step an index forward/backward through [0, n) with
+ * wraparound, the "next/previous in a cyclic list" operation the key handler uses
+ * to cycle pattern / theme / glyph.  wrap_dec adds n before the modulo so the
+ * result never goes negative. */
+static inline int wrap_inc(int v, int n) { return (v + 1) % n; }
+static inline int wrap_dec(int v, int n) { return (v + n - 1) % n; }
 
-/*
- * Themes — every entry sits in the bright half of the 256-colour
- * cube so even A_DIM cells stay legible against a default-black
- * terminal.  See "Theme Palette Brightness" in /CLAUDE.md.
- */
-typedef struct {
-    const char *name;
-    short       ramp[8];
-    short       hot;
-    short       cold;
-} Theme;
-
-#define N_THEMES 10
-
-static const Theme themes[N_THEMES] = {
-    /* name       0    1    2    3    4    5    6    7   hot cold */
-    { "DEFAULT",{ 24,  31,  39,  70,  76, 137, 215, 230 }, 196,  39 },
-    { "MATRIX", { 28,  34,  40,  46,  76, 118, 154, 192 }, 226,  39 },
-    { "NOVA",   { 60,  91, 134, 165, 207, 213, 219, 231 }, 196,  39 },
-    { "MONO",   {240, 243, 245, 247, 249, 251, 253, 255 }, 226,  39 },
-    { "OCEAN",  { 24,  25,  31,  38,  45,  51, 117, 195 }, 196,  21 },
-    { "FIRE",   { 88, 124, 130, 166, 202, 208, 214, 226 }, 226,  21 },
-    { "EARTH",  { 94, 130, 137, 173, 179, 215, 222, 230 }, 196,  39 },
-    { "FOREST", { 28,  34,  40,  70,  76, 112, 156, 192 }, 196,  39 },
-    { "DESERT", {130, 137, 143, 173, 179, 215, 222, 229 }, 196,  21 },
-    { "ARCTIC", { 24,  31,  67, 110, 117, 153, 195, 231 }, 196,  39 },
-};
-
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
-
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
-}
-
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
-}
-
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
-
-static void theme_apply(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
-        init_pair(PAIR_HOT,  t->hot,  -1);
-        init_pair(PAIR_COLD, t->cold, -1);
-    } else {
-        static const short fb[8] = {
-            COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,   COLOR_CYAN,
-            COLOR_GREEN, COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE,
-        };
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), fb[i], -1);
-        init_pair(PAIR_HOT,  COLOR_RED,  -1);
-        init_pair(PAIR_COLD, COLOR_CYAN, -1);
-    }
-}
-
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,   226, -1);
-        init_pair(PAIR_HINT,   51, -1);
-        init_pair(PAIR_FLASH, 226, -1);
-    } else {
-        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
-        init_pair(PAIR_FLASH, COLOR_YELLOW, -1);
-    }
-    theme_apply(0);
-}
-
-/* ===================================================================== */
-/* §5  penrose — hash, perlin, triangle deflation, Bresenham              */
-/* ===================================================================== */
-
-/* hash3 — same routine as other showcases. Drives the reseed flash
- * and (indirectly via the perm shuffle) the brightness field. */
+/* hash3 — same routine as other showcases. Drives the reseed: derives a
+ * fresh seed value and tiling rotation when the user presses 'r'. */
 static inline uint32_t hash3(int wx, int wy, int wz)
 {
     uint32_t h = (uint32_t)wx * 73856093u
@@ -560,84 +627,81 @@ static inline uint32_t hash3(int wx, int wy, int wz)
     return h;
 }
 
-/* Perlin scaffold — copied inline per the self-contained-file rule. */
-static uint8_t perm[512];
-
-static void perm_shuffle(int seed)
+/* line_glyph_for — pick the ASCII slope that best matches an edge whose
+ * screen delta is (dx, dy).  Pure decision used by the triangle renderer. */
+static inline char line_glyph_for(int dx, int dy)
 {
-    uint8_t base[256];
-    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
-    uint32_t st = (uint32_t)seed * 2654435761u;
-    for (int i = 255; i > 0; i--) {
-        st = st * 1664525u + 1013904223u;
-        int j = (int)(st >> 16) % (i + 1);
-        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
-    }
-    for (int i = 0; i < 256; i++) {
-        perm[i      ] = base[i];
-        perm[i + 256] = base[i];
-    }
+    int adx = abs(dx), ady = abs(dy);
+    if (adx >= 2 * ady) return '-';
+    if (ady >= 2 * adx) return '|';
+    if ((dx > 0) == (dy > 0)) return '\\';
+    return '/';
 }
 
-static inline float fade_q(float t)
-{
-    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
-}
-static inline float lerp_f(float a, float b, float t) { return a + t * (b - a); }
-static inline float grad2(int hash, float x, float y)
-{
-    int h = hash & 7;
-    float u = (h < 4) ? x : y;
-    float v = (h < 4) ? y : x;
-    return ((h & 1) ? -u : u) + ((h & 2) ? -2.0f * v : 2.0f * v);
-}
-
-static float perlin2d(float x, float y)
-{
-    int X = (int)floorf(x) & 255;
-    int Y = (int)floorf(y) & 255;
-    x -= floorf(x); y -= floorf(y);
-    float u = fade_q(x), v = fade_q(y);
-    int A = perm[X    ] + Y;
-    int B = perm[X + 1] + Y;
-    float n00 = grad2(perm[A    ], x,        y       );
-    float n10 = grad2(perm[B    ], x - 1.0f, y       );
-    float n01 = grad2(perm[A + 1], x,        y - 1.0f);
-    float n11 = grad2(perm[B + 1], x - 1.0f, y - 1.0f);
-    return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
-}
-
-static float fbm2(float x, float y)
-{
-    float total = 0.0f, amp = 1.0f, freq = 1.0f, max_amp = 0.0f;
-    for (int o = 0; o < FBM_OCTAVES; o++) {
-        total   += amp * perlin2d(x * freq, y * freq);
-        max_amp += amp;
-        amp     *= 0.5f;
-        freq    *= 2.0f;
-    }
-    return (total / max_amp) * 0.5f + 0.5f;     /* → [0, 1] */
-}
+/* ===================================================================== */
+/* §4  SIMULATION — triangle state, deflation rule, seeds, scene tick     */
+/* ===================================================================== */
+/* The only state that advances.  deflate_step and the seeds mutate the    */
+/* triangle buffers; scene_tick paces the build and loops it.  DELAYS live  */
+/* here: STEP_INTERVAL_SEC growth pacing + the HOLD_SEC hold + `paused`.    */
 
 /* ----------------------------------------------------------------------- *
  * Triangle struct + double-buffered deflation.                            *
  * ----------------------------------------------------------------------- */
 
+/*
+ * Triangle — one Robinson triangle: the half-rhombus that is the ATOM of P3
+ * deflation.  Two of these glued along their long edge form a Penrose rhombus,
+ * so working in half-rhombi (rather than whole rhombi) makes the substitution
+ * rule a clean self-map — triangles deflate into triangles. Ref: Grünbaum &
+ * Shephard, "Tilings and Patterns" ch. 10 (Robinson triangles); file header.
+ *
+ * WHY vertices are ORDERED, not a bag of three points: the deflation rule is
+ * stated relative to the apex, so which vertex is the apex carries meaning the
+ * geometry alone can't recover.
+ *   kind  — ACUTE (36°-36°-108°, the "thin" half) vs OBTUSE (72°-72°-36°, the
+ *           "thick" half).  Picks both the deflation rule applied (see
+ *           deflate_step) and the colour ramp slot (ACUTE/OBTUSE_*_RAMP).
+ *   ax,ay — APEX: the sharp pivot vertex the substitution measures from. Every
+ *           φ-division in deflate_step is anchored here, so it must stay the
+ *           apex slot, never be reordered with the base pair.
+ *   bx,by / cx,cy — the two BASE vertices (the long edge two half-rhombi share).
+ *
+ * Coordinates are WORLD units (the seed lives on the unit circle); world→screen
+ * happens once, in world_to_screen (§5).
+ */
 typedef struct {
-    int   color;          /* TRI_ACUTE or TRI_OBTUSE */
-    float ax, ay;         /* apex */
-    float bx, by;         /* base 1 */
-    float cx, cy;         /* base 2 */
+    int   kind;           /* TRI_ACUTE or TRI_OBTUSE — shape + deflation rule + ramp */
+    float ax, ay;         /* apex   — pivot vertex the φ-divisions anchor on         */
+    float bx, by;         /* base 1 — endpoint of the shared long edge               */
+    float cx, cy;         /* base 2 — other endpoint of the shared long edge         */
 } Triangle;
 
-static Triangle tri_buf[2][MAX_TRIANGLES];
-static int      tri_n  [2];
-static int      tri_active = 0;
+/*
+ * Tiling — the Penrose tiling as a flat SET of triangles (no adjacency graph:
+ * deflation is a context-free per-triangle rewrite, so a bare array is all the
+ * structure it needs).  DOUBLE-BUFFERED because one substitution round reads
+ * EVERY parent while emitting its children — writing children back into the
+ * same array would clobber parents not yet processed.  So deflate_step reads
+ * the active buffer, streams the next finer level into the other, then flips
+ * `active` (a ping-pong swap, O(1), no copy-back). Both buffers are pre-sized to
+ * MAX_TRIANGLES and live inline so the hot path never allocates (see file
+ * header "Memory Allocation").
+ *   buf[2] — the two ping-pong triangle arrays (one parents, one children)
+ *   n[2]   — live triangle count in each buffer (buf[i] valid for [0, n[i]))
+ *   active — index of the buffer currently displayed and read from next round;
+ *            1-active is the scratch target deflate_step writes into
+ */
+typedef struct {
+    Triangle buf[2][MAX_TRIANGLES];   /* ping-pong level buffers, pre-allocated */
+    int      n[2];                    /* triangles currently in buf[0] / buf[1] */
+    int      active;                  /* 0 or 1 — which buffer is the live level */
+} Tiling;
 
 /*
- * deflate_step — one round of the Penrose substitution rule.
- * Reads from tri_active buffer, writes to the inactive one, then
- * swaps. After the call, tri_active points to the new tiling.
+ * deflate_step — one round of the Penrose substitution rule on tiling `tl`.
+ * Reads from tl's active buffer, writes the next, finer level into the
+ * inactive one, then flips tl->active to point at the new tiling.
  *
  * Acute deflation:
  *   ACUTE(A, B, C):
@@ -656,71 +720,91 @@ static int      tri_active = 0;
  * Capped at MAX_TRIANGLES; any further children are silently dropped
  * so the renderer never reads past the buffer.
  */
-static void deflate_step(void)
+
+/*
+ * phi_split — the golden-ratio division point of the segment A→B:
+ *     P = A + (B - A)·INV_PHI   (i.e. A + (B - A)/φ).
+ * Every Penrose substitution cut lands on one of these points; naming it lets
+ * deflate_step read as the rule rather than as raw lerp arithmetic.  Out-param
+ * style mirrors world_to_screen, the file's other pure point mapping.
+ */
+static inline void phi_split(float ax, float ay, float bx, float by,
+                             float *px, float *py)
 {
-    int from = tri_active;
-    int to   = 1 - tri_active;
-    int n_in = tri_n[from];
+    *px = ax + (bx - ax) * INV_PHI;
+    *py = ay + (by - ay) * INV_PHI;
+}
+
+/*
+ * emit_child — append one child triangle to the level being built in buf[to],
+ * unless the MAX_TRIANGLES cap is already reached (then silently drop, so the
+ * renderer never reads past the buffer).  Advances *n_out on success.  Vertices
+ * are passed apex-first to match the Triangle layout and the rule pseudocode.
+ */
+static inline void emit_child(Tiling *tl, int to, int *n_out, int kind,
+                              float ax, float ay,
+                              float bx, float by,
+                              float cx, float cy)
+{
+    if (*n_out >= MAX_TRIANGLES) return;
+    Triangle *o = &tl->buf[to][(*n_out)++];
+    o->kind = kind;
+    o->ax = ax; o->ay = ay;
+    o->bx = bx; o->by = by;
+    o->cx = cx; o->cy = cy;
+}
+
+static void deflate_step(Tiling *tl)
+{
+    int from  = tl->active;
+    int to    = 1 - tl->active;   /* scratch buffer for the finer level */
+    int n_in  = tl->n[from];
     int n_out = 0;
 
     for (int i = 0; i < n_in; i++) {
-        const Triangle *t = &tri_buf[from][i];
+        const Triangle *t = &tl->buf[from][i];   /* parent = (A=apex, B, C) */
 
-        if (t->color == TRI_ACUTE) {
-            float px = t->ax + (t->bx - t->ax) * INV_PHI;
-            float py = t->ay + (t->by - t->ay) * INV_PHI;
-
-            if (n_out < MAX_TRIANGLES) {
-                Triangle *o = &tri_buf[to][n_out++];
-                o->color = TRI_ACUTE;
-                o->ax = t->cx; o->ay = t->cy;
-                o->bx = px;    o->by = py;
-                o->cx = t->bx; o->cy = t->by;
-            }
-            if (n_out < MAX_TRIANGLES) {
-                Triangle *o = &tri_buf[to][n_out++];
-                o->color = TRI_OBTUSE;
-                o->ax = px;    o->ay = py;
-                o->bx = t->cx; o->by = t->cy;
-                o->cx = t->ax; o->cy = t->ay;
-            }
+        if (t->kind == TRI_ACUTE) {
+            /* ACUTE(A,B,C): cut at P = phi_split(A,B) → 1 acute + 1 obtuse. */
+            float px, py;
+            phi_split(t->ax, t->ay, t->bx, t->by, &px, &py);
+            emit_child(tl, to, &n_out, TRI_ACUTE,
+                       t->cx, t->cy,  px,    py,    t->bx, t->by);
+            emit_child(tl, to, &n_out, TRI_OBTUSE,
+                       px,    py,     t->cx, t->cy, t->ax, t->ay);
         } else {
-            float qx = t->bx + (t->ax - t->bx) * INV_PHI;
-            float qy = t->by + (t->ay - t->by) * INV_PHI;
-            float rx = t->bx + (t->cx - t->bx) * INV_PHI;
-            float ry = t->by + (t->cy - t->by) * INV_PHI;
-
-            if (n_out < MAX_TRIANGLES) {
-                Triangle *o = &tri_buf[to][n_out++];
-                o->color = TRI_OBTUSE;
-                o->ax = rx;    o->ay = ry;
-                o->bx = t->cx; o->by = t->cy;
-                o->cx = t->ax; o->cy = t->ay;
-            }
-            if (n_out < MAX_TRIANGLES) {
-                Triangle *o = &tri_buf[to][n_out++];
-                o->color = TRI_OBTUSE;
-                o->ax = qx;    o->ay = qy;
-                o->bx = rx;    o->by = ry;
-                o->cx = t->bx; o->cy = t->by;
-            }
-            if (n_out < MAX_TRIANGLES) {
-                Triangle *o = &tri_buf[to][n_out++];
-                o->color = TRI_ACUTE;
-                o->ax = rx;    o->ay = ry;
-                o->bx = qx;    o->by = qy;
-                o->cx = t->ax; o->cy = t->ay;
-            }
+            /* OBTUSE(A,B,C): cut at Q = phi_split(B,A), R = phi_split(B,C)
+             *                → 2 obtuse + 1 acute. */
+            float qx, qy, rx, ry;
+            phi_split(t->bx, t->by, t->ax, t->ay, &qx, &qy);
+            phi_split(t->bx, t->by, t->cx, t->cy, &rx, &ry);
+            emit_child(tl, to, &n_out, TRI_OBTUSE,
+                       rx,    ry,     t->cx, t->cy, t->ax, t->ay);
+            emit_child(tl, to, &n_out, TRI_OBTUSE,
+                       qx,    qy,     rx,    ry,    t->bx, t->by);
+            emit_child(tl, to, &n_out, TRI_ACUTE,
+                       rx,    ry,     qx,    qy,    t->ax, t->ay);
         }
     }
 
-    tri_n[to]  = n_out;
-    tri_active = to;
+    tl->n[to]  = n_out;
+    tl->active = to;
 }
 
 /* ----------------------------------------------------------------------- *
  * Seed configurations — one per pattern.                                   *
  * ----------------------------------------------------------------------- */
+
+/* rotate2d — rotate point (x,y) about the origin by the angle whose cosine /
+ * sine are (cr,sr).  Standard 2x2 rotation matrix; cr,sr are precomputed once
+ * per seed so all four vertices share them.  Used to orient each seed by the
+ * cycle's random `rot`. */
+static inline void rotate2d(float x, float y, float cr, float sr,
+                            float *ox, float *oy)
+{
+    *ox = x * cr - y * sr;
+    *oy = x * sr + y * cr;
+}
 
 /*
  * seed_star — 10 acute triangles arranged so all 36° apexes meet at
@@ -728,15 +812,15 @@ static void deflate_step(void)
  * "(i & 1)" flip) so the deflation rule produces a globally
  * consistent tiling at every shared edge.
  */
-static void seed_star(float rot)
+static void seed_star(Tiling *tl, float rot)
 {
     int n = 0;
-    Triangle *out = tri_buf[0];
+    Triangle *out = tl->buf[0];
     for (int i = 0; i < 10; i++) {
         float a0 = (float)i * 2.0f * (float)M_PI / 10.0f + rot;
         float a1 = (float)(i + 1) * 2.0f * (float)M_PI / 10.0f + rot;
         Triangle *t = &out[n++];
-        t->color = TRI_ACUTE;
+        t->kind = TRI_ACUTE;
         t->ax = 0.0f; t->ay = 0.0f;
         if ((i & 1) == 0) {
             t->bx = cosf(a0); t->by = sinf(a0);
@@ -746,8 +830,8 @@ static void seed_star(float rot)
             t->cx = cosf(a0); t->cy = sinf(a0);
         }
     }
-    tri_n[0] = n;
-    tri_active = 0;
+    tl->n[0] = n;
+    tl->active = 0;
 }
 
 /*
@@ -755,7 +839,7 @@ static void seed_star(float rot)
  * SHORT diagonal into 2 ACUTE Robinson triangles. Verifies the acute
  * deflation rule in isolation.
  */
-static void seed_thin(float rot)
+static void seed_thin(Tiling *tl, float rot)
 {
     /* Thin rhombus oriented with 36° apex at top, 36° at bottom,
      * 144° vertices on left/right. */
@@ -768,32 +852,27 @@ static void seed_thin(float rot)
     float v_rt_x  =  s18,         v_rt_y  = 0.0f;      /* 144° */
     float v_lf_x  = -s18,         v_lf_y  = 0.0f;      /* 144° */
 
-    /* Apply rotation. */
+    /* Apply this cycle's rotation to every vertex. */
     float cr = cosf(rot), sr = sinf(rot);
-    #define ROT(X, Y, OX, OY) do { \
-        OX = (X) * cr - (Y) * sr; \
-        OY = (X) * sr + (Y) * cr; \
-    } while (0)
     float tx, ty, bx, by, rx, ry, lx, ly;
-    ROT(v_top_x, v_top_y, tx, ty);
-    ROT(v_bot_x, v_bot_y, bx, by);
-    ROT(v_rt_x,  v_rt_y,  rx, ry);
-    ROT(v_lf_x,  v_lf_y,  lx, ly);
-    #undef ROT
+    rotate2d(v_top_x, v_top_y, cr, sr, &tx, &ty);
+    rotate2d(v_bot_x, v_bot_y, cr, sr, &bx, &by);
+    rotate2d(v_rt_x,  v_rt_y,  cr, sr, &rx, &ry);
+    rotate2d(v_lf_x,  v_lf_y,  cr, sr, &lx, &ly);
 
     /* Split by short diagonal (left-right): two acute triangles. */
-    Triangle *out = tri_buf[0];
+    Triangle *out = tl->buf[0];
     out[0] = (Triangle){ TRI_ACUTE, tx, ty, rx, ry, lx, ly };  /* top half */
     out[1] = (Triangle){ TRI_ACUTE, bx, by, lx, ly, rx, ry };  /* bottom — flipped chirality */
-    tri_n[0]  = 2;
-    tri_active = 0;
+    tl->n[0]  = 2;
+    tl->active = 0;
 }
 
 /*
  * seed_thick — single thick rhombus (angles 72° + 108°), split by its
  * LONG diagonal into 2 OBTUSE Robinson triangles.
  */
-static void seed_thick(float rot)
+static void seed_thick(Tiling *tl, float rot)
 {
     /* Place rhombus with 72° vertices on left/right, 108° vertices
      * on top/bottom. Side length 1. */
@@ -806,130 +885,78 @@ static void seed_thick(float rot)
     float v_bt_x =  0.0f,        v_bt_y = -s36;        /* 108° */
 
     float cr = cosf(rot), sr = sinf(rot);
-    #define ROT(X, Y, OX, OY) do { \
-        OX = (X) * cr - (Y) * sr; \
-        OY = (X) * sr + (Y) * cr; \
-    } while (0)
     float lx, ly, rx, ry, tx, ty, bx, by;
-    ROT(v_lf_x, v_lf_y, lx, ly);
-    ROT(v_rt_x, v_rt_y, rx, ry);
-    ROT(v_tp_x, v_tp_y, tx, ty);
-    ROT(v_bt_x, v_bt_y, bx, by);
-    #undef ROT
+    rotate2d(v_lf_x, v_lf_y, cr, sr, &lx, &ly);
+    rotate2d(v_rt_x, v_rt_y, cr, sr, &rx, &ry);
+    rotate2d(v_tp_x, v_tp_y, cr, sr, &tx, &ty);
+    rotate2d(v_bt_x, v_bt_y, cr, sr, &bx, &by);
 
     /* Split by long diagonal (left-right between 72° verts): two
      * obtuse triangles, apex at the 108° vertex of each half. */
-    Triangle *out = tri_buf[0];
+    Triangle *out = tl->buf[0];
     out[0] = (Triangle){ TRI_OBTUSE, tx, ty, lx, ly, rx, ry };  /* top half */
     out[1] = (Triangle){ TRI_OBTUSE, bx, by, rx, ry, lx, ly };  /* bottom half */
-    tri_n[0]  = 2;
-    tri_active = 0;
+    tl->n[0]  = 2;
+    tl->active = 0;
 }
 
 /* ----------------------------------------------------------------------- *
- * Bresenham line plotter.                                                  *
+ * Scene — animation state + per-tick advance.                             *
  * ----------------------------------------------------------------------- */
 
-static inline char line_glyph_for(int dx, int dy)
-{
-    int adx = abs(dx), ady = abs(dy);
-    if (adx >= 2 * ady) return '-';
-    if (ady >= 2 * adx) return '|';
-    if ((dx > 0) == (dy > 0)) return '\\';
-    return '/';
-}
-
 /*
- * draw_line_styled — Bresenham line from (x0, y0) to (x1, y1).
- * Glyph is fixed (chosen by the caller from edge direction); the
- * caller also passes pair / attr. Bounds-checks every cell against
- * the screen (cols, rows-1 reserved for HUD) — the algorithm
- * doesn't know about the HUD strip.
+ * Scene — the whole simulated world plus the knobs and progress that drive it,
+ * laid out as a table of contents.  The render and HUD code reads it; only the
+ * tick orchestrators (init / reseed / begin_cycle / tick) take a Scene* — every
+ * other function takes the narrowest sub-type (Tiling*, Triangle*, …).
  */
-static void draw_line_styled(int x0, int y0, int x1, int y1,
-                             int rows, int cols,
-                             int pair, int attr, char glyph)
-{
-    int dx_abs = abs(x1 - x0);
-    int dy_abs = abs(y1 - y0);
-    int sx     = (x0 < x1) ?  1 : -1;
-    int sy     = (y0 < y1) ?  1 : -1;
-    int dx     =  dx_abs;
-    int dy     = -dy_abs;
-    int err    = dx + dy;
-    int x = x0, y = y0;
-
-    while (1) {
-        if (y >= 2 && y < rows - 1 && x >= 0 && x < cols) {
-            attron(COLOR_PAIR(pair) | attr);
-            mvaddch(y, x, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair) | attr);
-        }
-        if (x == x1 && y == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x += sx; }
-        if (e2 <= dx) { err += dx; y += sy; }
-    }
-}
-
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
-
 typedef struct {
-    bool     paused;
-    int      speed;
-    int      current_theme;
-    Pattern  current_pattern;
-    GlyphSet current_glyph;
-    int      seed;
-    float    rot;            /* extra rotation applied to the seed */
-    float    time_secs;
-    float    wind_x;
-    float    flash_t;
+    /* WHAT is simulated — the tiling being deflated (see Tiling). */
+    Tiling   tiling;
+
+    /* HOW the user drives the deflation. */
+    Pattern  current_pattern;   /* which seed + how deep to deflate           */
+    int      speed;             /* deflation animation speed (+/- keys)       */
+
+    /* WHERE in the build we are — animation progress + this cycle's seed. */
+    int      defl_level;        /* deflation depth currently shown (0..target) */
+    float    step_timer;        /* animation time accrued toward the next step */
+    float    time_secs;         /* wall-clock seconds, for reseed variety      */
+    float    rot;               /* this cycle's seed rotation                  */
+    int      seed;              /* this cycle's RNG seed (orientation)         */
+    bool     paused;            /* run gate: freezes the animation             */
+
+    /* Render display options — a RENDER concept, merely toggled by keys. */
+    int      current_theme;     /* active Theme index                         */
+    GlyphSet current_glyph;     /* how triangles are drawn                    */
 } Scene;
 
 /*
- * apply_perm — reshuffle the Perlin perm[] for the current
- * (seed, pattern) pair so the brightness field changes per pattern.
- * Same trick as truchet_tiles.c / wang_tiles.c.
+ * scene_begin_cycle — lay down the seed configuration for the current pattern
+ * and reset the animation to level 0.  The tiling is NOT deflated here;
+ * scene_tick grows it one level at a time.  Called on init, reseed, and
+ * pattern change, and by scene_tick to loop back to the seed at full depth.
  */
-static void apply_perm(const Scene *s)
+static void scene_begin_cycle(Scene *s)
 {
-    perm_shuffle(s->seed ^ ((int)s->current_pattern * 0xA5A5A5));
-}
-
-/*
- * scene_regenerate — set the seed configuration, run K deflation
- * iterations, leave the result in tri_buf[tri_active].
- */
-static void scene_regenerate(Scene *s)
-{
-    apply_perm(s);
-
     switch (s->current_pattern) {
     case PATTERN_STAR:
-    case PATTERN_DEEP:  seed_star (s->rot); break;
-    case PATTERN_THIN:  seed_thin (s->rot); break;
-    case PATTERN_THICK: seed_thick(s->rot); break;
+    case PATTERN_DEEP:  seed_star (&s->tiling, s->rot); break;
+    case PATTERN_THIN:  seed_thin (&s->tiling, s->rot); break;
+    case PATTERN_THICK: seed_thick(&s->tiling, s->rot); break;
     case N_PATTERNS:    break;
     }
-
-    int k = pattern_depth(s->current_pattern);
-    for (int i = 0; i < k; i++) {
-        deflate_step();
-    }
-    s->flash_t = 1.0f;
+    s->defl_level = 0;
+    s->step_timer = 0.0f;
 }
 
 static void scene_reseed(Scene *s)
 {
     /* Pick a fresh rotation and seed value. */
-    s->seed = (int)hash3((int)(s->time_secs * 1000.0f),
-                         (int)(s->wind_x * 100.0f), 0xC0FFEE);
+    s->seed = (int)hash3((int)(s->time_secs * 1000.0f), s->defl_level, 0xC0FFEE);
     uint32_t h = hash3(s->seed, 0, 1);
     s->rot = ((float)(h & 0xFFFFu) / 65536.0f) * 2.0f * (float)M_PI;
-    scene_regenerate(s);
+    scene_begin_cycle(s);
 }
 
 static void scene_init(Scene *s)
@@ -942,32 +969,95 @@ static void scene_init(Scene *s)
     s->current_glyph   = GLYPH_EDGES;
     s->seed            = 0xCAFE;
     s->rot             = 0.0f;
-    scene_regenerate(s);
-    s->flash_t = 1.0f;
+    scene_begin_cycle(s);
 }
 
 /*
- * scene_tick — advance brightness wind. The tiling itself is static
- * until the user reseeds or changes pattern.
+ * scene_tick — drive the deflation animation.  While below the pattern's
+ * target depth, one deflation level is applied every STEP_INTERVAL_SEC so the
+ * tiling visibly subdivides; once at full depth it holds for HOLD_SEC, then
+ * restarts from the seed and loops.  The +/- speed multiplier scales real time
+ * into the animation clock.  The tiling never changes while paused.
  */
 static void scene_tick(Scene *s, float dt)
 {
     s->time_secs += dt;
-    s->flash_t   *= expf(-4.0f * dt);
     if (s->paused) return;
 
     float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    s->wind_x += WIND_X_BASE * speed_mul * dt;
+    s->step_timer += dt * speed_mul;
+
+    int target = pattern_depth(s->current_pattern);
+    if (s->defl_level < target) {
+        if (s->step_timer >= STEP_INTERVAL_SEC) {
+            s->step_timer -= STEP_INTERVAL_SEC;
+            deflate_step(&s->tiling);
+            s->defl_level++;
+        }
+    } else {
+        if (s->step_timer >= HOLD_SEC) {
+            s->step_timer = 0.0f;
+            scene_begin_cycle(s);   /* silent loop back to the seed */
+        }
+    }
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §5  RENDER — state → screen (reads only, never mutates the model)      */
 /* ===================================================================== */
+/* Colour/theme setup, screen geometry, and triangle drawing.  Reads the   */
+/* Scene and the triangle buffers; writes only the ncurses screen and       */
+/* colour pairs.  EFFECTS: none — no glow/trail/flash state; each glyph's    */
+/* colour comes straight from its triangle type.                            */
 
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    if (COLORS >= 256) {
+        const Theme *t = &themes[idx];
+        for (int i = 0; i < 8; i++)
+            init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
+    } else {
+        static const short fb[8] = {
+            COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,   COLOR_CYAN,
+            COLOR_GREEN, COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE,
+        };
+        for (int i = 0; i < 8; i++)
+            init_pair((short)(PAIR_RAMP_BASE + i), fb[i], -1);
+    }
+}
+
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,   226, -1);
+        init_pair(PAIR_HINT,   51, -1);
+    } else {
+        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
+    }
+    theme_apply(0);
+}
+
+/*
+ * Screen — the terminal viewport plus the one world→cell transform the renderer
+ * needs.  WHY it caches cx/cy/scale instead of recomputing per glyph: those
+ * three are a function of the window size alone, so screen_layout derives them
+ * ONCE per resize and world_to_screen (§5) then maps thousands of vertices with
+ * cheap multiply-adds — no per-vertex division or bounds math.  Recomputed on
+ * SIGWINCH; nothing here is part of the simulation, it is pure RENDER geometry.
+ *
+ * The world is centred on the unit circle, so the seed spans roughly [-1,1] in
+ * both axes; screen_layout sizes `scale` so that disc fills ~90% of the smaller
+ * terminal dimension, and divides y by ASPECT_Y_F to correct for cells being
+ * ~twice as tall as wide — without it the 5-fold figure looks squashed.
+ */
 typedef struct {
-    int cols, rows;
-    int cx, cy;             /* screen centre — origin of the tiling */
-    float scale;            /* world-unit → screen-cell scale       */
+    int cols, rows;         /* current terminal size (cells), refreshed on resize */
+    int cx, cy;             /* centre cell — screen origin the tiling radiates from */
+    float scale;            /* world-unit → screen-cell factor (y also ÷ ASPECT_Y_F) */
 } Screen;
 
 static void screen_layout(Screen *s)
@@ -1012,7 +1102,8 @@ static void screen_resize(Screen *s)
 }
 
 /*
- * world_to_screen — apply scale + aspect + centre offset.
+ * world_to_screen — apply scale + aspect + centre offset.  Pure mapping
+ * (LOGIC); kept here because it needs the Screen type defined just above.
  */
 static inline void world_to_screen(const Screen *sc, float wx, float wy,
                                     int *sx, int *sy)
@@ -1022,73 +1113,69 @@ static inline void world_to_screen(const Screen *sc, float wx, float wy,
 }
 
 /*
- * bright_at — slow drifting fBm spotlight value, [0, 1].
+ * draw_line_styled — Bresenham line from (x0, y0) to (x1, y1).
+ * Glyph is fixed (chosen by the caller from edge direction); the
+ * caller also passes pair / attr. Bounds-checks every cell against
+ * the screen (cols, rows-1 reserved for HUD) — the algorithm
+ * doesn't know about the HUD strip.
  */
-static inline float bright_at(int sx, int sy, float wind_x)
+static void draw_line_styled(int x0, int y0, int x1, int y1,
+                             int rows, int cols,
+                             int pair, int attr, char glyph)
 {
-    float nx = (float)sx * BRIGHT_SCALE_X + wind_x;
-    float ny = (float)sy * BRIGHT_SCALE_Y * ASPECT_Y_F;
-    float b  = fbm2(nx, ny);
-    if (b < 0.0f) b = 0.0f;
-    if (b > 1.0f) b = 1.0f;
-    return b;
-}
+    int dx_abs = abs(x1 - x0);
+    int dy_abs = abs(y1 - y0);
+    int sx     = (x0 < x1) ?  1 : -1;
+    int sy     = (y0 < y1) ?  1 : -1;
+    int dx     =  dx_abs;
+    int dy     = -dy_abs;
+    int err    = dx + dy;
+    int x = x0, y = y0;
 
-static int level_to_attr(float b)
-{
-    if (b > 0.65f) return A_BOLD;
-    if (b < 0.35f) return A_DIM;
-    return A_NORMAL;
+    while (1) {
+        if (y >= 2 && y < rows - 1 && x >= 0 && x < cols) {
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(y, x, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+        if (x == x1 && y == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x += sx; }
+        if (e2 <= dx) { err += dx; y += sy; }
+    }
 }
 
 /*
- * draw_triangle — render one triangle's three edges via Bresenham,
- * with per-cell brightness modulation. Acute and obtuse use different
- * ramp slots so the two types remain visually distinct.
+ * draw_triangle_edges — render one triangle's three edges via Bresenham at
+ * uniform brightness.  Acute and obtuse use different ramp slots so the two
+ * Robinson triangle types stay visually distinct; A_BOLD keeps the line art
+ * crisp against the default-black terminal.
  */
-static void draw_triangle_edges(const Screen *sc, const Scene *s,
-                                const Triangle *t)
+static void draw_triangle_edges(const Screen *sc, const Triangle *t)
 {
     int ax, ay, bx, by, cx, cy;
     world_to_screen(sc, t->ax, t->ay, &ax, &ay);
     world_to_screen(sc, t->bx, t->by, &bx, &by);
     world_to_screen(sc, t->cx, t->cy, &cx, &cy);
 
-    int ramp = (t->color == TRI_ACUTE) ? ACUTE_EDGE_RAMP : OBTUSE_EDGE_RAMP;
+    int ramp = (t->kind == TRI_ACUTE) ? ACUTE_EDGE_RAMP : OBTUSE_EDGE_RAMP;
     int pair = PAIR_RAMP_BASE + ramp;
+    int attr = A_BOLD;
 
-    /* For each edge, pick glyph from direction, apply brightness from
-     * a sample at the edge midpoint (cheap approximation; fully
-     * per-cell would require duplicating the Bresenham loop with
-     * variable attr). */
-    int mx, my;
-    int attr;
-
-    /* AB */
-    char glyph_ab = line_glyph_for(bx - ax, by - ay);
-    mx = (ax + bx) / 2; my = (ay + by) / 2;
-    attr = level_to_attr(bright_at(mx, my, s->wind_x));
-    draw_line_styled(ax, ay, bx, by, sc->rows, sc->cols, pair, attr, glyph_ab);
-
-    /* BC */
-    char glyph_bc = line_glyph_for(cx - bx, cy - by);
-    mx = (bx + cx) / 2; my = (by + cy) / 2;
-    attr = level_to_attr(bright_at(mx, my, s->wind_x));
-    draw_line_styled(bx, by, cx, cy, sc->rows, sc->cols, pair, attr, glyph_bc);
-
-    /* CA */
-    char glyph_ca = line_glyph_for(ax - cx, ay - cy);
-    mx = (cx + ax) / 2; my = (cy + ay) / 2;
-    attr = level_to_attr(bright_at(mx, my, s->wind_x));
-    draw_line_styled(cx, cy, ax, ay, sc->rows, sc->cols, pair, attr, glyph_ca);
+    /* one glyph per edge, chosen from the edge's screen direction */
+    draw_line_styled(ax, ay, bx, by, sc->rows, sc->cols, pair, attr,
+                     line_glyph_for(bx - ax, by - ay));
+    draw_line_styled(bx, by, cx, cy, sc->rows, sc->cols, pair, attr,
+                     line_glyph_for(cx - bx, cy - by));
+    draw_line_styled(cx, cy, ax, ay, sc->rows, sc->cols, pair, attr,
+                     line_glyph_for(ax - cx, ay - cy));
 }
 
 /*
  * draw_triangle_centroid — render a single coloured glyph at the
  * triangle's centroid, in the centre-tint ramp slot.
  */
-static void draw_triangle_centroid(const Screen *sc, const Scene *s,
-                                   const Triangle *t)
+static void draw_triangle_centroid(const Screen *sc, const Triangle *t)
 {
     float wcx = (t->ax + t->bx + t->cx) / 3.0f;
     float wcy = (t->ay + t->by + t->cy) / 3.0f;
@@ -1097,62 +1184,52 @@ static void draw_triangle_centroid(const Screen *sc, const Scene *s,
     if (sy < 2 || sy >= sc->rows - 1) return;
     if (sx < 0 || sx >= sc->cols)     return;
 
-    int ramp = (t->color == TRI_ACUTE)
+    int ramp = (t->kind == TRI_ACUTE)
              ? ACUTE_CENTER_RAMP
              : OBTUSE_CENTER_RAMP;
     int pair = PAIR_RAMP_BASE + ramp;
-    char glyph = (t->color == TRI_ACUTE) ? '.' : 'o';
-    int attr = level_to_attr(bright_at(sx, sy, s->wind_x));
-    if (t->color == TRI_OBTUSE) attr |= A_BOLD;
+    char glyph = (t->kind == TRI_ACUTE) ? '.' : 'o';
+    int attr = (t->kind == TRI_OBTUSE) ? A_BOLD : A_NORMAL;
 
     attron(COLOR_PAIR(pair) | attr);
     mvaddch(sy, sx, (chtype)(unsigned char)glyph);
     attroff(COLOR_PAIR(pair) | attr);
 }
 
-static void scene_draw(const Screen *sc, const Scene *s)
+static void scene_draw(const Screen *sc, const Tiling *tl, GlyphSet glyph)
 {
-    int n = tri_n[tri_active];
-    const Triangle *T = tri_buf[tri_active];
+    int n = tl->n[tl->active];
+    const Triangle *T = tl->buf[tl->active];
 
-    bool draw_edges   = (s->current_glyph == GLYPH_EDGES
-                      || s->current_glyph == GLYPH_BOTH);
-    bool draw_centers = (s->current_glyph == GLYPH_CENTERS
-                      || s->current_glyph == GLYPH_BOTH);
+    bool draw_edges   = (glyph == GLYPH_EDGES
+                      || glyph == GLYPH_BOTH);
+    bool draw_centers = (glyph == GLYPH_CENTERS
+                      || glyph == GLYPH_BOTH);
 
     if (draw_edges) {
         for (int i = 0; i < n; i++)
-            draw_triangle_edges(sc, s, &T[i]);
+            draw_triangle_edges(sc, &T[i]);
     }
     if (draw_centers) {
         for (int i = 0; i < n; i++)
-            draw_triangle_centroid(sc, s, &T[i]);
-    }
-
-    /* Reseed flash overlay. */
-    if (s->flash_t > 0.05f) {
-        int seed = (int)(s->time_secs * 1000.0f);
-        attron(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
-        for (int sy = 2; sy < sc->rows - 1; sy += 2) {
-            for (int sx = 0; sx < sc->cols; sx += 2) {
-                if (((sx ^ sy ^ seed) & 7) == 0)
-                    mvaddch(sy, sx, '*');
-            }
-        }
-        attroff(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
+            draw_triangle_centroid(sc, &T[i]);
     }
 }
 
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
+/*
+ * hud_draw_status_line — row 0: title on the left, live status on the right.
+ * The status word reports which phase of the animation loop we are in:
+ * PAUSED (frozen), GROW (still deflating up to target depth), or HOLD
+ * (sitting at full depth before the loop restarts).
+ */
+static void hud_draw_status_line(const Screen *sc, const Scene *s,
+                                 double fps, int sim_fps)
 {
-    erase();
-    scene_draw(sc, s);
+    bool growing = s->defl_level < pattern_depth(s->current_pattern);
+    const char *state_str = s->paused ? "PAUSED"
+                          : growing    ? "GROW  "
+                                       : "HOLD  ";
 
-    int n = tri_n[tri_active];
-    const char *state_str = s->paused ? "PAUSED" : "DRIFT ";
-
-    /* Row 0 right — primary status. */
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
              " %5.1f fps  %3d Hz  %s  speed:%-3d ",
@@ -1160,16 +1237,23 @@ static void screen_draw(Screen *sc, const Scene *s,
     int hx = sc->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
+    mvprintw(0, hx, "%s", buf);          /* right-aligned status */
+    mvprintw(0, 1, " PENROSE TILING ");  /* left title          */
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
-    /* Row 0 left — title. */
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 1, " PENROSE TILING ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-    /* Row 1 — pattern + glyph + theme + ramp swatch + N triangles. */
+/*
+ * hud_draw_param_line — row 1: the simulation parameters the keys control —
+ * pattern, glyph mode, theme name, a live swatch of the 8 ramp colours, and
+ * the depth / triangle-count readout (K=level/target, N=triangles).  Each
+ * field is printed then `x` advances past its fixed column width.
+ */
+static void hud_draw_param_line(const Screen *sc, const Scene *s)
+{
+    (void)sc;
+    int n = s->tiling.n[s->tiling.active];
     int x = 1;
+
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(1, x, " pattern:%-5s ", pattern_name(s->current_pattern));
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1185,6 +1269,7 @@ static void screen_draw(Screen *sc, const Scene *s,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     x += 17;
 
+    /* Ramp swatch — paint each of the 8 gradient tiers in its own pair. */
     attron(COLOR_PAIR(PAIR_HUD));
     mvprintw(1, x, " ramp:");
     attroff(COLOR_PAIR(PAIR_HUD));
@@ -1197,31 +1282,54 @@ static void screen_draw(Screen *sc, const Scene *s,
         attroff(COLOR_PAIR(p) | A_BOLD);
         x++;
     }
+
     attron(COLOR_PAIR(PAIR_HUD));
     mvprintw(1, x,
-             "  K=%d  N=%d ",
-             pattern_depth(s->current_pattern), n);
+             "  K=%d/%d  N=%d ",
+             s->defl_level, pattern_depth(s->current_pattern), n);
     attroff(COLOR_PAIR(PAIR_HUD));
+}
 
-    /* Bottom hint. */
+/* hud_draw_key_hints — bottom row: the full interactive key legend. */
+static void hud_draw_key_hints(const Screen *sc)
+{
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(sc->rows - 1, 0,
-             " n/p:pattern  g/G:glyph  t/T:theme  +/-:drift  spc:pause  r:reseed  q:quit ");
+             " n/p:pattern  g/G:glyph  t/T:theme  +/-:speed  spc:pause  r:reseed  q:quit ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+static void screen_draw(const Screen *sc, const Scene *s,
+                        double fps, int sim_fps)
+{
+    erase();
+    scene_draw(sc, &s->tiling, s->current_glyph);   /* the tiling itself */
+    hud_draw_status_line(sc, s, fps, sim_fps);      /* row 0: title + fps/state */
+    hud_draw_param_line(sc, s);                     /* row 1: pattern/glyph/theme/ramp/counts */
+    hud_draw_key_hints(sc);                          /* bottom row: key legend */
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §6  APP — user events + per-tick combine                              */
 /* ===================================================================== */
+/* main is the ONE place the layers combine per tick (PERFORMANCE →        */
+/* SIMULATION → PERFORMANCE → RENDER; see the ARCHITECTURE block).  Signals */
+/* and app_handle_key mutate state OUTSIDE the tick.                        */
 
+/*
+ * App — the running program: the scene plus the loop/runtime state that the
+ * tick and the signal handlers share.  sim_fps is the fixed-timestep rate
+ * ([ / ] keys); running/need_resize are flags set asynchronously by signals
+ * (volatile sig_atomic_t — the only access a handler may safely make).
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene                 scene;        /* WHAT advances — the simulated tiling   */
+    Screen                screen;       /* WHERE it draws — viewport + transform  */
+    int                   sim_fps;      /* fixed-timestep tick rate ([ / ] keys)  */
+    volatile sig_atomic_t running;      /* 0 = quit; cleared by SIGINT/SIGTERM    */
+    volatile sig_atomic_t need_resize;  /* 1 = SIGWINCH pending; serviced in loop */
 } App;
 
 static App g_app;
@@ -1263,28 +1371,28 @@ static bool app_handle_key(App *app, int ch)
         break;
 
     case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
+        s->current_theme = wrap_inc(s->current_theme, N_THEMES);
         theme_apply(s->current_theme);
         break;
     case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
+        s->current_theme = wrap_dec(s->current_theme, N_THEMES);
         theme_apply(s->current_theme);
         break;
 
     case 'n': case 'N':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS);
-        scene_regenerate(s);
+        s->current_pattern = (Pattern)wrap_inc((int)s->current_pattern, N_PATTERNS);
+        scene_begin_cycle(s);
         break;
     case 'p': case 'P':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS);
-        scene_regenerate(s);
+        s->current_pattern = (Pattern)wrap_dec((int)s->current_pattern, N_PATTERNS);
+        scene_begin_cycle(s);
         break;
 
     case 'g':
-        s->current_glyph = (GlyphSet)(((int)s->current_glyph + 1) % N_GLYPH_SETS);
+        s->current_glyph = (GlyphSet)wrap_inc((int)s->current_glyph, N_GLYPH_SETS);
         break;
     case 'G':
-        s->current_glyph = (GlyphSet)(((int)s->current_glyph + N_GLYPH_SETS - 1) % N_GLYPH_SETS);
+        s->current_glyph = (GlyphSet)wrap_dec((int)s->current_glyph, N_GLYPH_SETS);
         break;
 
     default: break;
@@ -1292,7 +1400,10 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-int main(void)
+/* app_init — bring the program up: seed the RNG, install signal handlers and
+ * the endwin() atexit hook, set the loop's starting state, then open the screen
+ * and the scene.  Everything that happens once, before the per-frame loop. */
+static void app_init(App *app)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
@@ -1300,41 +1411,51 @@ int main(void)
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
-
     screen_init(&app->screen);
     scene_init(&app->scene);
+}
+
+int main(void)
+{
+    App *app = &g_app;
+    app_init(app);
 
     int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
+    int64_t sim_accum   = 0;   /* unspent real time owed to the fixed-step sim */
+    int64_t fps_accum   = 0;   /* real time accumulated in the current fps window */
     int     frame_count = 0;
     double  fps_display = 0.0;
 
+    const int64_t max_dt_ns      = (int64_t)MAX_FRAME_DT_MS * NS_PER_MS;
+    const int64_t frame_cap_ns   = NS_PER_SEC / RENDER_FPS_CAP;
+
     while (app->running) {
 
+        /* Service a pending resize before timing this frame. */
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns();
             sim_accum  = 0;
         }
 
+        /* Measure real elapsed time, clamped so a stall can't spiral. */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        if (dt > max_dt_ns) dt = max_dt_ns;
 
+        /* Advance the simulation in fixed ticks, draining the accumulator. */
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
         sim_accum += dt;
         while (sim_accum >= tick_ns) {
             scene_tick(&app->scene, dt_sec);
             sim_accum -= tick_ns;
         }
 
+        /* Refresh the displayed fps once per FPS_UPDATE_MS window. */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1344,12 +1465,14 @@ int main(void)
             fps_accum   = 0;
         }
 
+        /* Sleep to hold the render frame cap, then draw and present. */
         int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+        clock_sleep_ns(frame_cap_ns - elapsed);
 
         screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
         screen_present();
 
+        /* Drain one key event. */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

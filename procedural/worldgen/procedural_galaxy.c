@@ -4,24 +4,6 @@
  *   — A rotating procedural galaxy: logarithmic spiral arms perturbed
  *     by Perlin/fBm noise, sampled per cell with no stored stars.
  *
- * DEMO: A galaxy fills the screen and slowly rotates. Bright stars
- *       cluster along curved spiral arms; the dense yellow bulge sits
- *       at the centre. Outside the arms, the disk thins into a sparse
- *       blue halo. Cycle through four cosmic morphologies:
- *
- *         SPIRAL      4-arm logarithmic spiral (the default)
- *         BARRED      2 arms emerging from a long central bar
- *                     (this is what the Milky Way actually looks like)
- *         ELLIPTICAL  no arms — a smooth Gaussian "ball" of stars,
- *                     for visual contrast with the spiral patterns
- *         NEBULA      spiral arms with visible glowing dust clouds
- *                     painted in the gaps between stars (fBm noise)
- *
- *       Nothing is stored. For every screen cell we (a) rotate it into
- *       galaxy-frame coordinates, (b) evaluate a closed-form density
- *       function at that point, (c) hash to decide whether a star
- *       lives there, and (d) draw or skip. The galaxy is therefore
- *       infinite-resolution, deterministic, and free of allocations.
  *
  * Study alongside:
  *   ../worldgen/procedural_star_field_parallax_noise_showcase.c
@@ -35,20 +17,21 @@
  *        in §5 is copied inline from there per the self-contained-file
  *        rule.
  *
- * Section map:
- *   §1 config    — galaxy geometry, patterns, themes, scroll knobs
- *   §2 clock     — monotonic timer + sleep
- *   §3 color     — HUD reserved + 10 themes (4 star + 4 nebula tints)
- *   §5 galaxy    — hash3, perlin/fbm, density(r, θ, pattern)
- *   §6 scene     — Scene state, scene_tick (rotation + noise drift)
- *   §7 screen    — per-cell density gating, glyph + colour selection
- *   §8 app       — signals, resize, fixed-step main loop
+ * Section map (re-cut by CONCERN — see ARCHITECTURE block below):
+ *   §1 CONFIG       — constants, data tables (glyphs, themes), Pattern enum
+ *   §2 PERFORMANCE  — timing primitives (throttle policy lives in main)
+ *   §3 LOGIC        — pure: hash, perlin/fbm, the whole density field, colour
+ *   §4 SIMULATION   — scene_tick (rotation + noise drift) + reset/reseed
+ *   §5 EFFECTS      — cosmetic-only state (one-line note: none stored)
+ *   §6 DELAYS       — pauses, holds, timers (one-line note: pause only)
+ *   §7 RENDER       — per-cell density projection + HUD; reads only
+ *   §8 APP          — user events + per-tick combine + main loop
  *
  * Keys:
  *   q / ESC    quit
  *   space      pause / resume
  *   r          reset angle, reseed noise
- *   n / N      next pattern  (SPIRAL → BARRED → ELLIPTICAL → NEBULA)
+ *   n / N      next / prev pattern  (cycles all 15 morphologies)
  *   p / P      previous pattern
  *   t / T      next / previous theme
  *   + / =      faster rotation
@@ -125,9 +108,9 @@
  *                    density bucket → A_BOLD '#'/'O'/'*'  (high)
  *                                     A_NORMAL '*'/'+'/'o' (mid)
  *                                     A_DIM '.'/'`'/','/'\''
- *                  In NEBULA cells the fBm value, gated on density,
- *                  paints '#'/'*'/'.' nebula glyphs in a separate
- *                  4-tint palette.
+ *                  In the dusty patterns (NEBULA / FLOCCULENT / STARBURST)
+ *                  the fBm value, gated on density, paints '#'/'*'/'.'
+ *                  cloud glyphs in a separate 4-tint palette.
  *
  * Performance    : O(W·H) per frame. For each cell:
  *                    1 cos/sin + 1 sqrt + 1 atan2 + 1 log + 1 exp +
@@ -137,210 +120,33 @@
  *                  the loop, no I/O, no branches that depend on state.
  *
  * References     :
- *   • Wikipedia — Logarithmic spiral
+ *
+ *   Galaxy structure & morphology (the concepts) —
+ *   • Wikipedia — "Galaxy morphological classification". The Hubble sequence
+ *     (elliptical → lenticular → spiral / barred → irregular) plus ring and
+ *     special types: the map the 15 presets are drawn from.
+ *     https://en.wikipedia.org/wiki/Galaxy_morphological_classification
+ *   • Wikipedia — "Logarithmic spiral" (the arm curve r = a·e^{bθ})
  *     https://en.wikipedia.org/wiki/Logarithmic_spiral
- *   • Wikipedia — Spiral galaxy / pitch angle
+ *   • Wikipedia — "Spiral galaxy" / pitch angle
  *     https://en.wikipedia.org/wiki/Spiral_galaxy
- *   • Wikipedia — Density wave theory (why arms exist at all)
+ *   • Lin & Shu (1964) — "On the spiral structure of disk galaxies", ApJ 140,
+ *     646: density-wave theory, why arms persist. See also
  *     https://en.wikipedia.org/wiki/Density_wave_theory
- *   • Lin & Shu (1964) — On the spiral structure of disk galaxies
- *     ApJ 140, 646 — the classic density-wave paper.
- *   • Perlin, K. (2002) — Improving Noise (quintic fade)
+ *   • Sérsic (1963) bulge + Freeman (1970) exponential-disk surface-brightness
+ *     laws — what the radial bulge_factor / disk_envelope approximate (with
+ *     Gaussians here, for cheapness).  https://en.wikipedia.org/wiki/Sersic_profile
+ *
+ *   Procedural noise & rendering —
+ *   • Perlin, K. (2002) — "Improving Noise" (the quintic-fade gradient noise)
  *     https://mrl.cs.nyu.edu/~perlin/paper445.pdf
- *   • Inigo Quilez — "Painting a galaxy" (procedural galaxy shader)
+ *   • Inigo Quilez — "Painting a galaxy" (closed-form procedural galaxy shader)
  *     https://iquilezles.org/articles/warp/
- *   • Red Blob Games — Map generation with noise
+ *   • Red Blob Games — "Making maps with noise functions"
  *     https://www.redblobgames.com/articles/noise/introduction.html
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A galaxy is not stars; a galaxy is a DENSITY FIELD over the plane.
- * Where the field is high you sprinkle bright stars; where it's medium
- * you sprinkle dim stars; where it's zero you sprinkle nothing. The
- * shape of the field — bulge plus disk plus arms — is determined by
- * a handful of closed-form Gaussian terms, with the spiral arms coming
- * from one elegant equation: the logarithmic spiral. Add slight noise
- * for organicness, rotate the whole thing slowly for life, and you
- * have a galaxy that fits in 1 KB of code.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture the screen as a piece of black paper. You hold a stencil
- * in front of it — the stencil is opaque except for the shape of the
- * galaxy: a bright disc in the middle, two or four curved slits going
- * outward, and a sparse halo at the edges. You spray-paint white
- * through the stencil. Where the stencil is transparent, lots of
- * paint specks land; where it's nearly opaque, very few do. The
- * resulting picture LOOKS like a galaxy because the stencil shape
- * encodes "a galaxy".
- *
- * Now replace the stencil with a function. density(r, θ) returns a
- * number in [0, 1] for any point on the paper — this is the local
- * "transparency". Replace the spray-paint with a hash: for each pixel,
- * roll a fair die and place a star iff the die-roll falls under the
- * density value. The galaxy emerges automatically. Rotate the
- * function (substitute θ → θ + ωt) and the galaxy turns.
- *
- * The LOGARITHMIC SPIRAL part is the one piece of geometry you have
- * to internalise. Every point (r, θ) on the spiral satisfies
- *   θ = ln(r) / b + 2πk/N
- * for some integer k. The MAGIC of doing math in (r, θ) instead of
- * (x, y) is that "distance to the nearest arm" becomes a one-line
- * formula: subtract ln(r)/b from θ, wrap into one period, multiply
- * by r. That's the arc-length to the arm. Plug into a Gaussian and
- * you have arm density. No iteration, no nearest-point search, no
- * data structure — pure trigonometry.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Each frame, advance the rotation angle: angle += ω · dt.
- *  2. For every visible screen cell (sx, sy):
- *     a. Translate so (cx, cy) is the galaxy centre:
- *          fx = sx − cx
- *          fy = (sy − cy) · 2          // aspect: cells are 2× tall
- *     b. Rotate INTO the galaxy frame (inverse of the screen rotation)
- *        by the current angle:
- *          gx =  fx·cos(angle) + fy·sin(angle)
- *          gy = −fx·sin(angle) + fy·cos(angle)
- *     c. Normalise to galaxy-radius units:
- *          gnx = gx / R0     (R0 = galaxy half-width in cells)
- *          gny = gy / R0
- *     d. Polar:
- *          r  = √(gnx² + gny²)
- *          θ  = atan2(gny, gnx)
- *        If r > DISK_MAX, this cell is outside the galaxy — skip.
- *     e. Sample fBm(gnx, gny, noise_time) — used to perturb the arm
- *        width and (in NEBULA) drive the cloud overlay.
- *     f. Compute density per the active pattern (see §5).
- *     g. Quantise the galaxy-frame coords to integer "world cells",
- *        hash, normalise to a uniform fraction h_unit ∈ [0, 1).
- *     h. If h_unit < density · STAR_PROB_SCALE → STAR:
- *          – pick colour from r-bucket (warm centre → cool edge)
- *          – pick glyph + brightness from density bucket
- *          – mvaddch
- *        Else if pattern == NEBULA and density > 0.05 and fBm > T:
- *          – pick nebula tint, paint cloud glyph
- *        Else: leave cell black.
- *  3. Draw HUD, present, sleep.
- *
- * KEY FORMULAS
- * ────────────
- *  Logarithmic spiral (one arm, k = 0):
- *    r = a · exp(b · θ)            ⇔    θ = ln(r/a) / b
- *
- *  N-arm spiral — angular distance from (r, θ) to the nearest arm:
- *    α    = θ − ln(r) / b                                      // raw phase
- *    seg  = 2π / N
- *    α    = α − seg · round(α / seg)        // wrap to [-seg/2, +seg/2]
- *    arc  = α · r                            // arc-length to arm
- *
- *  Arm density (Gaussian falloff with optional noise modulation):
- *    W    = ARM_WIDTH · (1 + 0.2 · (fbm − 0.5) · 2)
- *    arm  = exp(-arc² / W²)
- *
- *  Bulge / disk (Gaussian envelopes):
- *    bulge(r) = exp(-r² / σ_b²)
- *    disk(r)  = exp(-r² / σ_d²)
- *
- *  Bar (BARRED pattern only) — elliptical core, oriented along x:
- *    bar(x, y) = exp(-x² / B_x² − y² / B_y²)
- *
- *  Composite density:
- *    SPIRAL/NEBULA :  bulge + disk · arm
- *    BARRED        :  bulge·0.6 + bar·BAR_AMP + disk·arm·(1−bar)
- *    ELLIPTICAL    :  bulge·0.9 + halo·0.45                  // no θ
- *
- *  Star gate:
- *    h_unit = (hash3(qx, qy, pat) & 0xFFFFFF) / 2²⁴
- *    is_star = h_unit < density · STAR_PROB_SCALE
- *
- *  Rotation (rigid — every point rotates at the same angular speed):
- *    angle' = angle + ω · dt
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • LOG SINGULARITY. ln(r) → −∞ as r → 0. Clamp r to a small floor
- *    (≈ 0.04) before computing the spiral phase, OR let the bulge term
- *    dominate at small r so the arm term's behaviour at the singularity
- *    doesn't matter. Both — clamp AND let bulge dominate.
- *
- *  • ASPECT RATIO. Terminal cells are ~2× taller than wide. Without
- *    multiplying (sy − cy) by 2 in fy, the galaxy renders as a flat
- *    horizontal ellipse rather than a circle. Always correct in the
- *    rendering math. Use floor(gy/2) when quantising for the hash so
- *    the integer galaxy cells stay roughly square.
- *
- *  • RIGID VS DIFFERENTIAL ROTATION. Real galaxy arms are density
- *    waves — the stars passing through them rotate at different angu-
- *    lar speeds at different radii (Ω(r) ∝ 1/r approximately). If you
- *    rotate the density field rigidly (ω constant in r), the visual
- *    arms STAY the same shape; if you let ω depend on r, the arms
- *    wind up infinitely tight in finite time (the "winding problem"
- *    that motivated density-wave theory). For this demo we use rigid
- *    rotation — the field IS the arms, so they don't wind.
- *
- *  • HASH JITTER UNDER ROTATION. floor(gx), floor(gy) jump by 1 as
- *    the rotated coord crosses an integer line. So as the galaxy
- *    turns, individual stars STEP between adjacent cells rather than
- *    sliding smoothly. This is unavoidable in cell-based rendering.
- *    The eye reads it as scintillation — actually adds to the
- *    "starlight" illusion.
- *
- *  • PATTERN-DEPENDENT HASH. We pass the pattern index as the third
- *    arg to hash3 so each pattern has its own star arrangement.
- *    Otherwise switching from SPIRAL to ELLIPTICAL with the same
- *    rotation angle would leave many of the same stars visible —
- *    looks like a half-collapsed transition rather than a genuinely
- *    different galaxy.
- *
- *  • OFF-SCREEN R. After rotation+aspect correction a screen-corner
- *    cell can have r > 1.5. Skip these immediately (with r² > some
- *    cutoff²) to save the log/exp work on cells that will never have
- *    a star.
- *
- *  • ATAN2 BRANCH CUT. atan2 returns θ ∈ (−π, π]. The arm wrap
- *    (`α − seg · round(α/seg)`) takes care of branch-cut wrap, so
- *    you don't need to remap θ first. (Simple θ + 2π only when α
- *    range exceeds [-2π, 2π], which it doesn't here.)
- *
- *  • PROB SCALE. With density ≈ 1.0 at the bulge centre, the gate
- *    h_unit < density places stars in EVERY cell at the bulge —
- *    there are not enough free cells. Multiply density by a small
- *    constant (STAR_PROB_SCALE ≈ 0.15) so the *peak* per-cell prob
- *    is ~15 %; gives a satisfyingly dense bulge without saturation.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Pause (space): the galaxy freezes in place. Press space again:
- *    rotation resumes from the same angle. Verifies fixed-step time.
- *  • Press r: rotation snaps to angle 0 and the noise re-seeds. The
- *    overall galaxy SHAPE is unchanged (same density function), only
- *    the specific star positions rearrange. Verifies hash/density
- *    separation.
- *  • SPIRAL: count arms. Should be 4. The arms should be CURVED, not
- *    straight, with a clear sense of "winding" outward. If they look
- *    like spokes on a wheel, SPIRAL_PITCH is too high — the formula
- *    has degenerated into θ = constant lines.
- *  • BARRED: a bright bar should run horizontally through the centre
- *    (when angle = 0). Two arms should emerge from its END points,
- *    not from the centre. If they emerge from the centre, the bar
- *    factor isn't suppressing the inner arm region.
- *  • ELLIPTICAL: should look like a fuzzy round ball with no visible
- *    structure. If you see arms, the pattern dispatch is broken.
- *  • NEBULA: in the gaps between visible stars, you should see soft
- *    coloured cloud puffs that drift slowly (noise time advancing).
- *    The clouds should ONLY appear inside the visible disk, not in
- *    the outer halo or background.
- *  • Speed +/-: pressing + should make rotation noticeably faster.
- *    Pressing - should slow it down. The user-facing speed value in
- *    the HUD updates on each press. Halving the speed should halve
- *    the visible angular velocity exactly.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -358,8 +164,58 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
+ *
+ * Re-cut from first principles into separated concern-layers (a SEPARATION
+ * pass: RELOCATE + LABEL only — every function body is byte-identical, nothing
+ * renamed). This galaxy is unusual in that almost all the "algorithm" is PURE:
+ * the picture is a stateless function of three numbers, so §3 LOGIC is large
+ * and §4 SIMULATION is tiny. Layer → section → what it mutates:
+ *
+ *   LAYER        §   MUTATES
+ *   ─────────────────────────────────────────────────────────────────────
+ *   CONFIG       §1  nothing — compile-time constants + const data tables
+ *                    (star/dust glyph rows, themes) + the Pattern enum.
+ *   PERFORMANCE  §2  nothing — clock_ns / clock_sleep_ns are pure timers; the
+ *                    frame cap + fixed-timestep accumulator are POLICY in main.
+ *   LOGIC        §3  nothing — the spatial hash (+ its hash_unit [0,1) roll),
+ *                    the Perlin/fBm samplers, the entire density field
+ *                    (spiral/arm/bulge/disk/ring/bar → density_at), and the pure
+ *                    cell deciders (star_color_idx radius→tint, pattern_has_dust).
+ *                    All pure; perm[] is a stable table reseeded only from §4, so
+ *                    no RENDER/EFFECTS reorder can corrupt a LOGIC result.
+ *   SIMULATION   §4  Scene.{angle,noise_time,paused,speed,current_theme,
+ *                    current_pattern} + the global perm[] noise table. scene_tick
+ *                    advances rotation+drift; scene_reset/init/perm_shuffle seed.
+ *                    The ONLY writers of sim state.
+ *   EFFECTS      §5  (none) — no stored cosmetic buffer; the dust glow is
+ *                    derived at render time. One-line section, not a real layer.
+ *   DELAYS       §6  (none) — only Scene.paused (early-returns scene_tick); no
+ *                    holds/dwells, the galaxy rotates continuously.
+ *   RENDER       §7  ncurses back buffer + colour-pair table only (theme_apply,
+ *                    color_init, scene_draw + draw_star/dust_cell, screen_draw +
+ *                    the HUD draw_* helpers). Reads §4 state and re-evaluates §3
+ *                    per cell; never writes simulation state.
+ *   APP          §8  App.{running,need_resize,sim_fps}; drives Scene via the
+ *                    combine + user events.
+ *
+ * PER-TICK COMBINE (the one place state advances — main(), §8):
+ *
+ *     while (sim_accum >= tick_ns)        // PERFORMANCE: fixed timestep
+ *         scene_tick()                    //   SIMULATION (rotation + drift)
+ *     scene_draw() ; screen_draw()        // RENDER (reads only; density re-derived)
+ *     screen_present()
+ *     getch() → app_handle_key()          // USER EVENTS — see below
+ *
+ * Nothing other than scene_tick() advances simulation state. User events
+ * (app_handle_key / app_do_resize) mutate Scene/Screen on a keypress or
+ * SIGWINCH — and 'r' reseeds the noise via perm_shuffle — but they run once per
+ * frame OUTSIDE the accumulator loop, not as part of the tick.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ===================================================================== */
-/* §1  config                                                             */
+/* §1  CONFIG  -- constants, data tables (glyphs, themes), Pattern enum  */
 /* ===================================================================== */
 
 enum {
@@ -386,7 +242,6 @@ enum {
     PAIR_HINT           =   2,
     PAIR_STAR_BASE      =   3,    /* +0..+3 = 4 star tints           */
     PAIR_NEBULA_BASE    =   7,    /* +0..+3 = 4 nebula tints         */
-    PAIR_FLASH          =  11,    /* reset flash                     */
 };
 
 #define NS_PER_SEC      1000000000LL
@@ -428,6 +283,26 @@ enum {
 #define ELLIPTICAL_SIGMA   0.50f
 #define ELLIPTICAL_AMP     0.55f
 
+/*
+ * Extra-pattern parameters — the wider 15-galaxy catalogue. Each new
+ * morphology reuses the primitives (bulge / disk / spiral / bar / ring /
+ * noise) with its own arm count, winding pitch and width.
+ *   PITCH smaller  → more tightly wound arms (TIGHT < PINWHEEL < default < GRAND)
+ *   RING_*         → bright Gaussian shell radius/width (RING, CARTWHEEL)
+ *   SOMBRERO_THIN  → vertical half-thickness of an edge-on disk
+ *   NUCLEUS_SIGMA  → tiny brilliant active nucleus (SEYFERT)
+ */
+#define N_ARMS_GRAND       2           /* two bold "grand design" arms (M51) */
+#define N_ARMS_PINWHEEL    6           /* many fine arms (M101)              */
+#define PITCH_GRAND        0.34f       /* loosely wound, sweeping            */
+#define PITCH_PINWHEEL     0.22f       /* tighter                            */
+#define PITCH_TIGHT        0.15f       /* very tightly coiled               */
+#define ARM_WIDTH_GRAND    0.30f       /* wide, high-contrast arms           */
+#define RING_R             0.58f       /* ring-galaxy shell radius           */
+#define RING_W             0.12f       /* ring shell half-width              */
+#define SOMBRERO_THIN      0.10f       /* edge-on disk vertical half-thick   */
+#define NUCLEUS_SIGMA      0.045f      /* Seyfert point-nucleus radius       */
+
 /* Noise — fBm parameters. NOISE_FREQ is the "feature frequency" in
  * normalised galaxy units; 1.5 gives lobes ~0.7 galaxy-radius wide. */
 #define NOISE_FREQ         1.5f
@@ -439,6 +314,15 @@ enum {
 /* Star-density gate. Density at peak ≈ 1.0; this scalar caps per-
  * cell star probability so the bulge doesn't saturate every cell. */
 #define STAR_PROB_SCALE    0.18f
+
+/* Per-cell render thresholds (density d ∈ [0,1], dust intensity ∈ [0,1]). */
+#define CELL_CULL_MARGIN   0.05f       /* slack on the r² disk-cull test     */
+#define DENS_EMPTY         0.01f       /* below this a cell is empty space    */
+#define STAR_DENS_BRIGHT   0.55f       /* density → glyph brightness tiers    */
+#define STAR_DENS_MID      0.20f
+#define DUST_DENS_MIN      0.05f       /* min density for a dust-cloud cell   */
+#define DUST_INTENS_BRIGHT 0.65f       /* dust fbm-intensity → glyph tiers     */
+#define DUST_INTENS_MID    0.30f
 
 /* Rotation rate at speed = SPEED_DEF, in radians per second. The
  * galaxy completes one revolution every 2π / ROTATION_RATE seconds.
@@ -453,37 +337,56 @@ static const char STAR_BRIGHT[4] = { '*', 'O', '+', '#' };
 static const char STAR_MID   [4] = { '*', '+', 'o', '.' };
 static const char STAR_DIM   [4] = { '.', '`', ',', '\'' };
 
-/*
- * Pattern — four ways to assemble the density field. Cycle with n / p.
+/* ── Pattern ───────────────────────────────────────────────────────────── *
+ * Fifteen ways to assemble the SAME density field. The intent: a galaxy's
+ * "type" is not different data — it is a different closed-form recipe over one
+ * shared set of primitives (bulge + disk + log-spiral arms + bar + ring +
+ * noise). So a morphology is just a branch in density_at(), and switching
+ * patterns costs nothing (no rebuild, no allocation). Each value is a real
+ * galaxy class from the Hubble sequence + special types, differing only in arm
+ * count, winding pitch, ring/bar/edge-on geometry and how much noise it mixes
+ * in. The enum value also salts the star-placement hash, so each pattern gets a
+ * distinct star arrangement. The first four keep their original indices (and
+ * exact look); the rest extend the catalogue.
+ * REFS: Hubble sequence — Wikipedia "Galaxy morphological classification";
+ *       see the file-header References block.
  */
 typedef enum {
-    PATTERN_SPIRAL     = 0,
-    PATTERN_BARRED     = 1,
-    PATTERN_ELLIPTICAL = 2,
-    PATTERN_NEBULA     = 3,
-    N_PATTERNS         = 4,
+    PATTERN_SPIRAL     = 0,   /* 4-arm logarithmic spiral (the classic)   */
+    PATTERN_BARRED,           /* central bar + 2 trailing arms            */
+    PATTERN_ELLIPTICAL,       /* smooth featureless Gaussian blob (E0-ish)*/
+    PATTERN_NEBULA,           /* 4-arm spiral + glowing dust clouds       */
+    PATTERN_GRAND,            /* 2 bold sweeping arms (grand design, M51) */
+    PATTERN_PINWHEEL,         /* 6 fine arms (M101)                       */
+    PATTERN_TIGHT,            /* 2 very tightly coiled arms               */
+    PATTERN_FLOCCULENT,       /* patchy, noise-fragmented arms            */
+    PATTERN_LENTICULAR,       /* bulge + smooth armless disk (S0)         */
+    PATTERN_RING,             /* bright ring, faint centre (Hoag's Object)*/
+    PATTERN_CARTWHEEL,        /* ring + central bar spokes (collision)    */
+    PATTERN_SOMBRERO,         /* edge-on disk + bulge + dust lane         */
+    PATTERN_STARBURST,        /* blazing core + patchy star-forming bursts*/
+    PATTERN_SEYFERT,          /* brilliant point nucleus + faint disk (AGN)*/
+    PATTERN_IRREGULAR,        /* clumpy, asymmetric (dwarf irregular)     */
+    N_PATTERNS,
 } Pattern;
 
-static const char *pattern_name(Pattern p)
-{
-    switch (p) {
-    case PATTERN_SPIRAL:     return "SPIRAL    ";
-    case PATTERN_BARRED:     return "BARRED    ";
-    case PATTERN_ELLIPTICAL: return "ELLIPTICAL";
-    case PATTERN_NEBULA:     return "NEBULA    ";
-    default:                 return "?         ";
-    }
-}
-
-/*
- * Themes — same 10-name menu as the rest of the procedural showcases.
- * Star tints are ordered warm (bulge) → cool (halo). Nebula tints are
- * the cloud palette used in PATTERN_NEBULA.
- */
+/* ── Theme ─────────────────────────────────────────────────────────────── *
+ * WHAT  One named colour palette (10 ship; t/T cycles). theme_apply() loads its
+ *       codes into the ncurses pairs. Same 10-name menu as the sibling showcases.
+ *
+ * VALUE LOGIC  Two 4-entry ramps, indexed the way the renderer buckets a cell:
+ *       star[4]   — by RADIUS, ordered warm → cool to mimic the real stellar-
+ *                   population gradient (old yellow-red bulge stars in the
+ *                   centre, young blue-white disk stars outward; star[0]=core …
+ *                   star[3]=halo). Indexed by star_color_idx(r).
+ *       nebula[4] — the dust-cloud palette, indexed by hash bits, used only by
+ *                   the dusty patterns (NEBULA / FLOCCULENT / STARBURST).
+ *       Every code sits in the bright half of the 256-colour cube so even A_DIM
+ *       cells stay legible on default-black. REFS: documentation/COLOR.md. */
 typedef struct {
-    const char *name;
-    short       star  [4];
-    short       nebula[4];
+    const char *name;       /* HUD label (t/T cycles)                       */
+    short       star  [4];  /* star tints, core→halo (by star_color_idx)    */
+    short       nebula[4];  /* dust-cloud tints (dusty patterns only)       */
 } Theme;
 
 #define N_THEMES 10
@@ -503,8 +406,12 @@ static const Theme themes[N_THEMES] = {
 };
 
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  PERFORMANCE  -- timing primitives (throttle policy in main, §8)   */
 /* ===================================================================== */
+
+/* Timing primitives only. The 60 fps frame cap and the fixed-timestep
+ * accumulator that decide how many scene_tick()s run per frame are POLICY,
+ * applied in main() (§8). */
 
 static int64_t clock_ns(void)
 {
@@ -524,49 +431,31 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  LOGIC  -- pure decisions: hash, noise, density field, colour      */
 /* ===================================================================== */
 
-static void theme_apply(int idx)
+/* Pure functions — the bulk of the algorithm. Given their arguments (and the
+ * read-only noise table / theme data) each returns a value with NO mutation
+ * and NO I/O: the spatial hash (+ hash_unit, its [0,1) roll), the Perlin/fBm
+ * samplers, the whole density field (spiral / arm / bulge / disk / ring / bar
+ * factors → density_at), and the pure cell deciders (star_color_idx,
+ * pattern_has_dust). The glyph-picking + drawing itself lives in §7.
+ *
+ * The one piece of data here, perm[], is a stable lookup table reseeded ONLY
+ * by perm_shuffle (§4, on reset) — never by RENDER/EFFECTS — so a frame's
+ * render order cannot change any LOGIC result. density_at is evaluated fresh
+ * per cell by the renderer; it is decision, not stored state. */
+
+/* 10-char padded names so the HUD field width stays fixed. */
+static const char *pattern_name(Pattern p)
 {
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        for (int i = 0; i < 4; i++) {
-            init_pair((short)(PAIR_STAR_BASE   + i), t->star  [i], -1);
-            init_pair((short)(PAIR_NEBULA_BASE + i), t->nebula[i], -1);
-        }
-    } else {
-        static const short fb_star[4]   = { COLOR_WHITE,   COLOR_YELLOW,
-                                            COLOR_CYAN,    COLOR_BLUE };
-        static const short fb_nebula[4] = { COLOR_MAGENTA, COLOR_RED,
-                                            COLOR_BLUE,    COLOR_CYAN };
-        for (int i = 0; i < 4; i++) {
-            init_pair((short)(PAIR_STAR_BASE   + i), fb_star  [i], -1);
-            init_pair((short)(PAIR_NEBULA_BASE + i), fb_nebula[i], -1);
-        }
-    }
+    static const char *names[N_PATTERNS] = {
+        "SPIRAL    ", "BARRED    ", "ELLIPTICAL", "NEBULA    ", "GRANDDSGN ",
+        "PINWHEEL  ", "TIGHTCOIL ", "FLOCCULENT", "LENTICULAR", "RING      ",
+        "CARTWHEEL ", "SOMBRERO  ", "STARBURST ", "SEYFERT   ", "IRREGULAR ",
+    };
+    return ((int)p >= 0 && (int)p < N_PATTERNS) ? names[p] : "?         ";
 }
-
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,   226, -1);
-        init_pair(PAIR_HINT,   51, -1);
-        init_pair(PAIR_FLASH, 226, -1);
-    } else {
-        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
-        init_pair(PAIR_FLASH, COLOR_YELLOW, -1);
-    }
-    theme_apply(0);
-}
-
-/* ===================================================================== */
-/* §5  galaxy — hash, perlin/fbm, density(r, θ, pattern)                  */
-/* ===================================================================== */
 
 /*
  * hash3 — stateless 3-int → 32-bit avalanche hash.
@@ -590,25 +479,26 @@ static inline uint32_t hash3(int wx, int wy, int wz)
     return h;
 }
 
+/* Uniform fraction in [0, 1) from the low 24 bits of a hash (24 bits → exactly
+ * representable as a float). This is the roll the per-cell star gate compares
+ * against the star probability. */
+static inline float hash_unit(uint32_t h)
+{
+    return (float)(h & 0xFFFFFFu) / 16777216.0f;     /* 2^24 */
+}
+
 /*
  * Perlin / fBm — copied inline per the self-contained-file rule.
  * See ../fields/perin_noise_flow_showcase.c for the full derivation.
+ *
+ * perm[] — the noise permutation table: a shuffle of 0..255 DUPLICATED into a
+ * 512-entry array (perm[i] == perm[i+256]). The doubling is the classic Perlin
+ * trick: gradient lookups add two indices in 0..255 and read perm[A+1] etc.,
+ * which can reach 510 — duplicating lets that happen without a wrap/mask in the
+ * hot path. Reseeded by perm_shuffle (§4 SIMULATION) on reset; read-only to the
+ * §3 samplers, which is why the noise field is deterministic between reseeds.
  */
 static uint8_t perm[512];
-
-static void perm_shuffle(void)
-{
-    uint8_t base[256];
-    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
-    for (int i = 255; i > 0; i--) {
-        int j = rand() % (i + 1);
-        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
-    }
-    for (int i = 0; i < 256; i++) {
-        perm[i      ] = base[i];
-        perm[i + 256] = base[i];
-    }
-}
 
 static inline float fade_q(float t)
 {
@@ -671,27 +561,37 @@ static float fbm2(float x, float y)
  * term swamps the arm contribution at the centre, so the result of
  * this function near r=0 has negligible visual effect.
  */
-static float spiral_arc(float r, float theta, int n_arms)
+/* spiral_arc_p — like spiral_arc but with an explicit winding pitch, so the
+ * tighter (TIGHT, PINWHEEL) and looser (GRAND) spirals can share the math. */
+static float spiral_arc_p(float r, float theta, int n_arms, float pitch)
 {
     float r_safe = (r < 0.04f) ? 0.04f : r;
     float seg = 2.0f * (float)M_PI / (float)n_arms;
-    float psi = logf(r_safe) / SPIRAL_PITCH;
+    float psi = logf(r_safe) / pitch;
     float alpha = theta - psi;
     alpha = alpha - seg * floorf(alpha / seg + 0.5f);   /* wrap to [-seg/2, +seg/2] */
     return alpha * r;
 }
+static float spiral_arc(float r, float theta, int n_arms)
+{
+    return spiral_arc_p(r, theta, n_arms, SPIRAL_PITCH);
+}
 
 /*
- * arm_factor — Gaussian falloff in arc-length space, with the arm
- * width perturbed by ±ARM_NOISE_AMP based on a centred fBm sample.
- * The noise modulation breaks the perfect mathematical regularity
- * of the analytic spiral, giving the arms an organic, irregular look.
+ * arm_factor_w — Gaussian falloff in arc-length space at an explicit base
+ * width, with the width perturbed by ±ARM_NOISE_AMP from a centred fBm sample.
+ * The noise modulation breaks the perfect mathematical regularity of the
+ * analytic spiral, giving the arms an organic, irregular look.
  */
-static float arm_factor(float arc_dist, float fbm_centered)
+static float arm_factor_w(float arc_dist, float fbm_centered, float base_width)
 {
-    float w = ARM_WIDTH * (1.0f + ARM_NOISE_AMP * fbm_centered);
+    float w = base_width * (1.0f + ARM_NOISE_AMP * fbm_centered);
     if (w < 0.05f) w = 0.05f;
     return expf(-arc_dist * arc_dist / (w * w));
+}
+static float arm_factor(float arc_dist, float fbm_centered)
+{
+    return arm_factor_w(arc_dist, fbm_centered, ARM_WIDTH);
 }
 
 static inline float bulge_factor(float r)
@@ -701,6 +601,14 @@ static inline float bulge_factor(float r)
 static inline float disk_envelope(float r)
 {
     return expf(-r * r / (DISK_SIGMA * DISK_SIGMA));
+}
+
+/* ring_factor — a bright Gaussian shell peaking at radius ring_r (for ring
+ * galaxies like Hoag's Object and the collisional Cartwheel). */
+static inline float ring_factor(float r, float ring_r, float ring_w)
+{
+    float d = r - ring_r;
+    return expf(-d * d / (ring_w * ring_w));
 }
 
 /*
@@ -729,16 +637,19 @@ static float density_at(float r, float theta, float fbm_val, Pattern p)
 {
     if (r > DISK_R_MAX) return 0.0f;
     float fbm_c = (fbm_val - 0.5f) * 2.0f;             /* [-1, 1]    */
+    float patch = 0.5f + 0.5f * fbm_c;                 /* [ 0, 1] noise gate */
     float bulge = bulge_factor(r);
+    float disk  = disk_envelope(r);
 
-    if (p == PATTERN_ELLIPTICAL) {
+    switch (p) {
+
+    case PATTERN_ELLIPTICAL: {
         float halo = expf(-r * r / (ELLIPTICAL_SIGMA * ELLIPTICAL_SIGMA));
         return bulge * 0.9f + halo * ELLIPTICAL_AMP;
     }
 
-    if (p == PATTERN_BARRED) {
+    case PATTERN_BARRED: {
         float bar  = bar_factor(r, theta);
-        float disk = disk_envelope(r);
         float arc  = spiral_arc(r, theta, N_ARMS_BARRED);
         float arm  = arm_factor(arc, fbm_c);
         /* Bar suppresses arms in the central region — multiply by
@@ -748,12 +659,71 @@ static float density_at(float r, float theta, float fbm_val, Pattern p)
              + disk  * arm * (1.0f - bar) * DISK_AMP;
     }
 
-    /* SPIRAL or NEBULA — both share the 4-arm structure. */
-    {
-        float disk = disk_envelope(r);
+    case PATTERN_GRAND: {           /* 2 bold, wide, loosely-wound arms */
+        float arm = arm_factor_w(spiral_arc_p(r, theta, N_ARMS_GRAND, PITCH_GRAND),
+                                 fbm_c, ARM_WIDTH_GRAND);
+        return bulge * BULGE_AMP + disk * arm * DISK_AMP * 1.10f;
+    }
+
+    case PATTERN_PINWHEEL: {        /* 6 fine, tighter arms */
+        float arm = arm_factor(spiral_arc_p(r, theta, N_ARMS_PINWHEEL, PITCH_PINWHEEL),
+                               fbm_c);
+        return bulge * 0.70f + disk * arm * DISK_AMP;
+    }
+
+    case PATTERN_TIGHT: {           /* 2 very tightly coiled arms */
+        float arm = arm_factor(spiral_arc_p(r, theta, 2, PITCH_TIGHT), fbm_c);
+        return bulge * BULGE_AMP + disk * arm * DISK_AMP;
+    }
+
+    case PATTERN_FLOCCULENT: {      /* 4 arms shredded by noise into patches */
+        float arm = arm_factor(spiral_arc(r, theta, N_ARMS_SPIRAL), fbm_c);
+        return bulge * 0.60f + disk * arm * patch * DISK_AMP * 1.30f;
+    }
+
+    case PATTERN_LENTICULAR:        /* smooth bulge + armless disk (S0) */
+        return bulge * BULGE_AMP + disk * DISK_AMP * 0.55f;
+
+    case PATTERN_RING: {            /* bright shell, faint centre */
+        float ring = ring_factor(r, RING_R, RING_W);
+        return bulge * 0.22f + ring * DISK_AMP;
+    }
+
+    case PATTERN_CARTWHEEL: {       /* ring + central bar spokes */
+        float ring = ring_factor(r, RING_R, RING_W);
+        float bar  = bar_factor(r, theta);
+        return bulge * 0.40f + ring * DISK_AMP + bar * BAR_AMP * 0.70f;
+    }
+
+    case PATTERN_SOMBRERO: {        /* edge-on: thin disk + bulge + dust lane */
+        float gx   = r * cosf(theta);
+        float gy   = r * sinf(theta);
+        float thin = expf(-(gy * gy) / (SOMBRERO_THIN * SOMBRERO_THIN));
+        float span = expf(-(gx * gx) / (DISK_SIGMA * DISK_SIGMA));
+        return bulge * BULGE_AMP + thin * span * DISK_AMP;
+    }
+
+    case PATTERN_STARBURST: {       /* blazing core + patchy bursts */
+        float arm = arm_factor(spiral_arc(r, theta, N_ARMS_SPIRAL), fbm_c);
+        return bulge * 1.10f + disk * arm * patch * DISK_AMP * 1.10f;
+    }
+
+    case PATTERN_SEYFERT: {         /* brilliant point nucleus + faint disk */
+        float nucleus = expf(-r * r / (NUCLEUS_SIGMA * NUCLEUS_SIGMA));
+        float arm = arm_factor(spiral_arc(r, theta, N_ARMS_SPIRAL), fbm_c);
+        return nucleus * 1.20f + bulge * 0.30f + disk * arm * DISK_AMP * 0.50f;
+    }
+
+    case PATTERN_IRREGULAR:         /* clumpy, asymmetric — noise-driven */
+        return disk * patch * patch * DISK_AMP * 1.40f + bulge * 0.20f;
+
+    case PATTERN_SPIRAL:
+    case PATTERN_NEBULA:
+    default: {                      /* both share the classic 4-arm structure */
         float arc  = spiral_arc(r, theta, N_ARMS_SPIRAL);
         float arm  = arm_factor(arc, fbm_c);
         return bulge * BULGE_AMP + disk * arm * DISK_AMP;
+    }
     }
 }
 
@@ -771,42 +741,63 @@ static int star_color_idx(float r)
     else                return 3;     /* halo — faint                */
 }
 
+/* Which morphologies paint the glowing dust-cloud overlay (the NEBULA effect):
+ * the nebula itself plus the two patchy, gas-rich types. */
+static bool pattern_has_dust(Pattern p)
+{
+    return p == PATTERN_NEBULA || p == PATTERN_FLOCCULENT || p == PATTERN_STARBURST;
+}
+
 /* ===================================================================== */
-/* §6  scene — state + tick                                               */
+/* §4  SIMULATION  -- advances state (only writers of sim state)         */
 /* ===================================================================== */
 
+/* The ONLY writers of simulation state. scene_tick advances the two continuous
+ * floats — the rotation angle and the noise-time drift — once per tick;
+ * scene_reset / scene_init (with perm_shuffle, the noise reseed) set them on
+ * reset. Mutates: Scene.{angle,noise_time,paused,speed,current_theme,
+ * current_pattern} and the global perm[] table. scene_tick() is the single
+ * per-tick entry point (called only from main, §8); user events (key/resize)
+ * also mutate Scene but are NOT part of the tick -- see §8. */
+
+static void perm_shuffle(void)
+{
+    uint8_t base[256];
+    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
+    for (int i = 255; i > 0; i--) {
+        int j = rand() % (i + 1);
+        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
+    }
+    for (int i = 0; i < 256; i++) {
+        perm[i      ] = base[i];
+        perm[i + 256] = base[i];
+    }
+}
+
 /*
- * Scene — the entire animated state. There is no per-cell array,
- * no entity pool. Every frame the renderer derives the picture from
- * just these few floats and the active pattern.
- *
- *   angle           : galaxy rotation (radians, accumulating)
- *   noise_time      : drifts fBm so the cloud / arm-perturbation
- *                     pattern slowly evolves
- *   time_secs       : wall clock for the reset-flash overlay
- *   paused          : freeze-on-space
- *   speed           : 1..SPEED_MAX user knob; ω scales linearly
- *   current_theme   : 0..N_THEMES-1
- *   current_pattern : SPIRAL / BARRED / ELLIPTICAL / NEBULA
- *   flash_t         : 0..1 reset-flash intensity, decays each tick
+ * Scene — the entire animated state, as a table of contents. There is no
+ * per-cell array and no entity pool: the whole galaxy is a pure function of
+ * these few numbers (the renderer re-derives every pixel each frame). Fields
+ * group by concept, not by which key changes them. scene_tick() (§4) is the
+ * only per-tick writer; user events set the knobs/selections.
  */
 typedef struct {
-    float   angle;
-    float   noise_time;
-    float   time_secs;
-    bool    paused;
-    int     speed;
-    int     current_theme;
-    Pattern current_pattern;
-    float   flash_t;
+    /* WHAT is simulated — the galaxy's two evolving phases */
+    float   angle;            /* rotation, radians, accumulating          */
+    float   noise_time;       /* fBm drift phase — clouds/arms slowly move */
+    /* HOW the user drives it — the tunable simulation knob */
+    int     speed;            /* 1..SPEED_MAX; rotation + drift scale by it */
+    /* WHAT we are looking at — RENDER selections, not simulation */
+    Pattern current_pattern;  /* active morphology (n/p); salts the star hash */
+    int     current_theme;    /* index into themes[] (t/T)                */
+    /* WHEN we are — run-state */
+    bool    paused;           /* freeze rotation/drift (render continues)  */
 } Scene;
 
 static void scene_reset(Scene *s)
 {
     s->angle      = 0.0f;
     s->noise_time = 0.0f;
-    s->time_secs  = 0.0f;
-    s->flash_t    = 1.0f;
     perm_shuffle();
 }
 
@@ -831,8 +822,6 @@ static void scene_init(Scene *s)
  */
 static void scene_tick(Scene *s, float dt)
 {
-    s->time_secs += dt;
-    s->flash_t   *= expf(-4.0f * dt);
     if (s->paused) return;
 
     float speed_mul = (float)s->speed / (float)SPEED_DEF;
@@ -841,19 +830,80 @@ static void scene_tick(Scene *s, float dt)
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §5  EFFECTS  -- cosmetic-only state                                   */
 /* ===================================================================== */
 
-/*
- * Screen — terminal dimensions plus the derived galaxy-frame layout.
- *   cx, cy : galaxy centre, in screen-cell coordinates
- *   r0     : galaxy half-width, in HORIZONTAL cells. The vertical
- *            extent on screen is r0/ASPECT_Y cells, so the rendered
- *            galaxy is 2·r0 wide and r0 tall.
- */
+/* No EFFECTS layer. Nothing cosmetic is stored: the NEBULA / FLOCCULENT /
+ * STARBURST dust glow is derived at render time from the fBm sample inside
+ * scene_draw (§7), gated on density — there is no buffer to advance. (The
+ * yellow reset flash was removed earlier, taking its flash_t state with it.) */
+
+/* ===================================================================== */
+/* §6  DELAYS  -- pauses, holds, timers                                  */
+/* ===================================================================== */
+
+/* No separate layer. The only timing control is the pause toggle
+ * (Scene.paused), which early-returns scene_tick (§4). There are no holds or
+ * per-phase dwells — the galaxy rotates continuously. */
+
+/* ===================================================================== */
+/* §7  RENDER  -- state -> screen (reads only, never mutates sim)        */
+/* ===================================================================== */
+
+/* state -> screen. Each frame scene_draw projects the simulation (angle,
+ * noise_time, pattern) onto the grid by evaluating the §3 density/noise
+ * functions per cell; screen_draw lays the HUD over it; theme_apply /
+ * color_init load the colour table. Reads Scene / Screen + §3 LOGIC; writes
+ * ONLY the ncurses back buffer and colour pairs, never simulation state. */
+
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    if (COLORS >= 256) {
+        const Theme *t = &themes[idx];
+        for (int i = 0; i < 4; i++) {
+            init_pair((short)(PAIR_STAR_BASE   + i), t->star  [i], -1);
+            init_pair((short)(PAIR_NEBULA_BASE + i), t->nebula[i], -1);
+        }
+    } else {
+        static const short fb_star[4]   = { COLOR_WHITE,   COLOR_YELLOW,
+                                            COLOR_CYAN,    COLOR_BLUE };
+        static const short fb_nebula[4] = { COLOR_MAGENTA, COLOR_RED,
+                                            COLOR_BLUE,    COLOR_CYAN };
+        for (int i = 0; i < 4; i++) {
+            init_pair((short)(PAIR_STAR_BASE   + i), fb_star  [i], -1);
+            init_pair((short)(PAIR_NEBULA_BASE + i), fb_nebula[i], -1);
+        }
+    }
+}
+
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,   226, -1);
+        init_pair(PAIR_HINT,   51, -1);
+    } else {
+        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
+    }
+    theme_apply(0);
+}
+
+/* ── Screen ────────────────────────────────────────────────────────────── *
+ * The terminal viewport plus the derived galaxy-frame mapping — pure
+ * presentation geometry, holding NO simulation state. Recomputed by
+ * screen_layout() at startup and on every SIGWINCH. It is the bridge the
+ * renderer inverts per cell: screen cell (sx,sy) → physical offset from the
+ * centre → (÷ r0) → unit-radius galaxy coords (r ≤ 1 at the disk edge) that
+ * feed density_at(). r0 is measured in HORIZONTAL cells; because terminal cells
+ * are ~2× tall (ASPECT_Y), the vertical extent is r0/ASPECT_Y, so the disk reads
+ * as a circle, 2·r0 wide and r0 tall. */
 typedef struct {
-    int cols, rows;
-    int cx, cy, r0;
+    int cols, rows;     /* full terminal size (getmaxyx)                    */
+    int cx, cy;         /* galaxy centre, in screen-cell coords             */
+    int r0;             /* galaxy half-width in horizontal cells (the r=1 scale) */
 } Screen;
 
 static void screen_layout(Screen *s)
@@ -883,7 +933,9 @@ static void screen_init(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
     screen_layout(s);
 }
+
 static void screen_free(Screen *s) { (void)s; endwin(); }
+
 static void screen_resize(Screen *s)
 {
     endwin();
@@ -892,219 +944,223 @@ static void screen_resize(Screen *s)
     screen_layout(s);
 }
 
+/* Draw one STAR cell: tint by radius (stellar-population gradient), glyph and
+ * brightness by density tier. Hash bits choose the glyph variant. */
+static void draw_star_cell(int sy, int sx, float r, float dens, uint32_t h)
+{
+    int  glyph_idx = (int)((h >> 8) & 3u);
+    int  attr;
+    char glyph;
+    if      (dens > STAR_DENS_BRIGHT) { attr = A_BOLD;   glyph = STAR_BRIGHT[glyph_idx]; }
+    else if (dens > STAR_DENS_MID)    { attr = A_NORMAL; glyph = STAR_MID   [glyph_idx]; }
+    else                              { attr = A_DIM;    glyph = STAR_DIM   [glyph_idx]; }
+
+    int pair = PAIR_STAR_BASE + star_color_idx(r);
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+    attroff(COLOR_PAIR(pair) | attr);
+}
+
+/* Draw one DUST cell of the cloud overlay: glyph by fBm intensity above the
+ * cloud threshold, tint chosen from the nebula palette by hash bits. */
+static void draw_dust_cell(int sy, int sx, float fbm_val, uint32_t h)
+{
+    float intensity = (fbm_val - NEBULA_THRESH) / (1.0f - NEBULA_THRESH);  /* → [0,1] */
+    int   attr;
+    char  glyph;
+    if      (intensity > DUST_INTENS_BRIGHT) { attr = A_BOLD;   glyph = '#'; }
+    else if (intensity > DUST_INTENS_MID)    { attr = A_NORMAL; glyph = '*'; }
+    else                                     { attr = A_DIM;    glyph = '.'; }
+
+    int pair = PAIR_NEBULA_BASE + (int)((h >> 16) & 3u);
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+    attroff(COLOR_PAIR(pair) | attr);
+}
+
 /*
- * scene_draw — per-cell density gating, glyph + colour selection, draw.
+ * scene_draw — project the galaxy onto the screen. For each cell: map it into
+ * the galaxy frame (centre + aspect-correct → rotate by inverse(angle) →
+ * normalise by r0), cull cells outside the disk, sample the fBm-perturbed
+ * density field, then either place a star (hash gate vs density) or, for dusty
+ * morphologies, a cloud glyph. A pure projection of (angle, noise_time,
+ * pattern) onto the screen — no state mutation.
  *
- * Per cell:
- *   1. Translate to galaxy-centre, apply aspect correction (y × 2).
- *   2. Rotate INTO the galaxy frame by inverse(angle).
- *   3. Normalise by R0 → unit-radius galaxy coordinates.
- *   4. Cheap rejection: if r² > DISK_R_MAX² + ε, skip.
- *   5. Sample fBm for arm-width perturbation (and NEBULA cloud).
- *   6. Compute density per pattern.
- *   7. Hash quantised galaxy coords for star gate; on hit, pick
- *      colour by radius and glyph/attr by density tier.
- *   8. NEBULA pattern only: empty cells with density > 0.05 and
- *      fbm > NEBULA_THRESH render a cloud glyph in the nebula tint.
- *
- * The whole function is a pure projection of (angle, noise_time,
- * pattern) onto the screen — there is no state mutation.
+ * Render leaf, NOT a tick orchestrator: takes only the three numbers it draws
+ * from, never the whole Scene.
  */
-static void scene_draw(const Screen *sc, const Scene *s)
+static void scene_draw(const Screen *sc, float angle, float noise_time, Pattern pattern)
 {
     int top    = 2;
     int bottom = sc->rows - 1;
 
-    float cosA = cosf(s->angle);
-    float sinA = sinf(s->angle);
+    float cosA = cosf(angle);
+    float sinA = sinf(angle);
 
-    bool pat_nebula = (s->current_pattern == PATTERN_NEBULA);
+    bool has_dust = pattern_has_dust(pattern);
 
     for (int sy = top; sy < bottom; sy++) {
         for (int sx = 0; sx < sc->cols; sx++) {
 
-            /* (a) screen-cell offset → physical (aspect-corrected) */
+            /* Project screen cell → galaxy frame: centre + aspect-correct,
+             * rotate by inverse(angle), normalise by r0 to unit-radius coords. */
             float fx = (float)(sx - sc->cx);
             float fy = (float)(sy - sc->cy) * ASPECT_Y;
-
-            /* (b) rotate into the galaxy reference frame */
             float gx_phys =  fx * cosA + fy * sinA;
             float gy_phys = -fx * sinA + fy * cosA;
-
-            /* (c) normalise to galaxy-radius units */
             float gnx = gx_phys / (float)sc->r0;
             float gny = gy_phys / (float)sc->r0;
 
+            /* Cull cells outside the disk. */
             float r2 = gnx * gnx + gny * gny;
-            if (r2 > DISK_R_MAX * DISK_R_MAX + 0.05f) continue;
+            if (r2 > DISK_R_MAX * DISK_R_MAX + CELL_CULL_MARGIN) continue;
 
             float r     = sqrtf(r2);
             float theta = atan2f(gny, gnx);
 
-            /* (d) fBm — feeds both arm perturbation and nebula */
-            float fbm_val = fbm2(gnx * NOISE_FREQ,
-                                 gny * NOISE_FREQ + s->noise_time);
+            /* Sample the density field (fBm perturbs the arms). */
+            float fbm_val = fbm2(gnx * NOISE_FREQ, gny * NOISE_FREQ + noise_time);
+            float dens    = density_at(r, theta, fbm_val, pattern);
+            if (dens < DENS_EMPTY) continue;
 
-            /* (e) density */
-            float dens = density_at(r, theta, fbm_val, s->current_pattern);
-            if (dens < 0.01f) continue;
+            /* Star gate: hash the quantised galaxy cell (pattern salts it so
+             * each morphology has its own arrangement) and roll against the
+             * density-scaled probability. */
+            uint32_t h = hash3((int)floorf(gx_phys),
+                               (int)floorf(gy_phys / ASPECT_Y), (int)pattern);
 
-            /* (f) hash gate. Quantise gx_phys / gy_phys so that one
-             *     "galaxy world cell" ≈ one screen cell (with aspect
-             *     correction so the integer cells stay roughly square).
-             *     Pattern index salts the hash so each pattern has a
-             *     distinct star arrangement. */
-            int qx = (int)floorf(gx_phys);
-            int qy = (int)floorf(gy_phys / ASPECT_Y);
-            uint32_t h = hash3(qx, qy, (int)s->current_pattern);
-
-            float h_unit = (float)(h & 0xFFFFFFu) / 16777216.0f;
-            float prob   = dens * STAR_PROB_SCALE;
-
-            if (h_unit < prob) {
-                /* STAR */
-                int  color_idx = star_color_idx(r);
-                int  glyph_idx = (int)((h >> 8) & 3u);
-                int  attr;
-                char glyph;
-                if      (dens > 0.55f) { attr = A_BOLD;   glyph = STAR_BRIGHT[glyph_idx]; }
-                else if (dens > 0.20f) { attr = A_NORMAL; glyph = STAR_MID   [glyph_idx]; }
-                else                    { attr = A_DIM;    glyph = STAR_DIM   [glyph_idx]; }
-
-                int pair = PAIR_STAR_BASE + color_idx;
-                attron(COLOR_PAIR(pair) | attr);
-                mvaddch(sy, sx, (chtype)(unsigned char)glyph);
-                attroff(COLOR_PAIR(pair) | attr);
-                continue;
-            }
-
-            /* (g) NEBULA cloud overlay. Empty cells inside the disk
-             *     with high fbm pick up a coloured cloud glyph. */
-            if (pat_nebula && dens > 0.05f && fbm_val > NEBULA_THRESH) {
-                float intensity = (fbm_val - NEBULA_THRESH)
-                                / (1.0f - NEBULA_THRESH);
-                int   color_idx = (int)((h >> 16) & 3u);
-                int   attr;
-                char  glyph;
-                if      (intensity > 0.65f) { attr = A_BOLD;   glyph = '#'; }
-                else if (intensity > 0.30f) { attr = A_NORMAL; glyph = '*'; }
-                else                         { attr = A_DIM;    glyph = '.'; }
-
-                int pair = PAIR_NEBULA_BASE + color_idx;
-                attron(COLOR_PAIR(pair) | attr);
-                mvaddch(sy, sx, (chtype)(unsigned char)glyph);
-                attroff(COLOR_PAIR(pair) | attr);
-            }
+            if (hash_unit(h) < dens * STAR_PROB_SCALE)
+                draw_star_cell(sy, sx, r, dens, h);
+            else if (has_dust && dens > DUST_DENS_MIN && fbm_val > NEBULA_THRESH)
+                draw_dust_cell(sy, sx, fbm_val, h);
         }
     }
 
-    /* Reset flash — sparse '*' overlay that fades quickly. */
-    if (s->flash_t > 0.05f) {
-        int seed = (int)(s->time_secs * 1000.0f);
-        attron(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
-        for (int sy = top; sy < bottom; sy += 2) {
-            for (int sx = 0; sx < sc->cols; sx += 2) {
-                if (((sx ^ sy ^ seed) & 7) == 0)
-                    mvaddch(sy, sx, '*');
-            }
-        }
-        attroff(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
-    }
 }
 
-/*
- * screen_draw — clear, draw scene, draw HUD.
- *   row 0 : title (left) + fps/Hz/state/speed (right)
- *   row 1 : pattern + theme + 4-colour palettes + r0
- *   bottom: key-hint strip (PAIR_HINT, A_BOLD)
- */
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
+/* Draw a 4-tint palette swatch at row 1, col x; returns the next free column. */
+static int draw_swatch(int x, int base_pair, char glyph, int attr)
 {
-    erase();
-    scene_draw(sc, s);
+    for (int i = 0; i < 4; i++) {
+        attron(COLOR_PAIR(base_pair + i) | attr);
+        mvaddch(1, x, (chtype)(unsigned char)glyph);
+        attroff(COLOR_PAIR(base_pair + i) | attr);
+        x++;
+    }
+    return x;
+}
 
-    const char *state_str = s->paused
-                          ? "PAUSED    "
-                          : pattern_name(s->current_pattern);
-
-    /* row 0 right: status */
+/* Row 0 right — primary status: fps, sim Hz, phase/pause, speed. Right-aligned. */
+static void draw_status_line(const Screen *sc, const Scene *s, double fps, int sim_fps)
+{
+    const char *state_str = s->paused ? "PAUSED    " : pattern_name(s->current_pattern);
     char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  %3d Hz  %s  speed:%-3d ",
+    snprintf(buf, sizeof buf, " %5.1f fps  %3d Hz  %s  speed:%-3d ",
              fps, sim_fps, state_str, s->speed);
     int hx = sc->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
-    /* row 0 left: title */
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 1, " PROCEDURAL GALAXY ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-    /* row 1 left: pattern + theme + palettes + radius */
+/* Row 1 — pattern (n/N counter), theme, the star + nebula tint swatches, and
+ * the galaxy stats (radius, arm count, pitch). Fixed left-aligned layout. */
+static void draw_param_line(const Screen *sc, const Scene *s)
+{
     int x = 1;
+    char pbuf[40];
+    snprintf(pbuf, sizeof pbuf, " pattern:%s %2d/%-2d ",
+             pattern_name(s->current_pattern),
+             (int)s->current_pattern + 1, (int)N_PATTERNS);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " pattern:%-10s ", pattern_name(s->current_pattern));
+    mvprintw(1, x, "%s", pbuf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 21;
+    x += (int)strlen(pbuf);
 
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(1, x, " theme:%-8s ", themes[s->current_theme].name);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     x += 17;
 
+    attron(COLOR_PAIR(PAIR_HUD));  mvprintw(1, x, " stars:");  attroff(COLOR_PAIR(PAIR_HUD));
+    x = draw_swatch(x + 7, PAIR_STAR_BASE, '*', A_BOLD);
+    attron(COLOR_PAIR(PAIR_HUD));  mvprintw(1, x, " neb:");    attroff(COLOR_PAIR(PAIR_HUD));
+    x = draw_swatch(x + 5, PAIR_NEBULA_BASE, '#', A_NORMAL);
+
     attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x, " stars:");
-    attroff(COLOR_PAIR(PAIR_HUD));
-    x += 7;
-    for (int i = 0; i < 4; i++) {
-        int p = PAIR_STAR_BASE + i;
-        attron(COLOR_PAIR(p) | A_BOLD);
-        mvaddch(1, x, '*');
-        attroff(COLOR_PAIR(p) | A_BOLD);
-        x++;
-    }
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x, " neb:");
-    attroff(COLOR_PAIR(PAIR_HUD));
-    x += 5;
-    for (int i = 0; i < 4; i++) {
-        int p = PAIR_NEBULA_BASE + i;
-        attron(COLOR_PAIR(p));
-        mvaddch(1, x, '#');
-        attroff(COLOR_PAIR(p));
-        x++;
-    }
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x,
-             "  r0:%-3d  arms:%d  pitch:%.2f ",
+    mvprintw(1, x, "  r0:%-3d  arms:%d  pitch:%.2f ",
              sc->r0,
              s->current_pattern == PATTERN_BARRED ? N_ARMS_BARRED : N_ARMS_SPIRAL,
              SPIRAL_PITCH);
     attroff(COLOR_PAIR(PAIR_HUD));
+}
 
-    /* bottom: key-hint strip */
+/* Bottom row — the key legend. Lists every interactive key (HUD standard). */
+static void draw_hint(const Screen *sc)
+{
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(sc->rows - 1, 0,
              " n/p:pattern  t/T:theme  +/-:speed  ]/[:tickHz  spc:pause  r:reset  q:quit ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
+/*
+ * screen_draw — clear, draw scene, then lay the HUD over it (status, title,
+ * params, hint).
+ *
+ * The one render function that takes the whole Scene (read-only): the HUD's
+ * concept IS whole-scene status — pattern, theme, speed, run-state. A const
+ * read can't re-couple the layers; scene_draw and the leaf decisions stay narrow.
+ */
+static void screen_draw(const Screen *sc, const Scene *s,
+                        double fps, int sim_fps)
+{
+    erase();
+    scene_draw(sc, s->angle, s->noise_time, s->current_pattern);
+
+    draw_status_line(sc, s, fps, sim_fps);
+
+    /* row 0 left: title */
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, 1, " PROCEDURAL GALAXY ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    draw_param_line(sc, s);
+    draw_hint(sc);
+}
+
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §8  APP  -- events + per-tick combine + main loop                     */
 /* ===================================================================== */
 
+/* Owns the App aggregate, signal flags, user-event handlers and the main
+ * loop. main() is the ONE place that combines the layers per tick, in fixed
+ * order:  scene_tick (SIM) -> scene_draw + screen_draw (RENDER) ->
+ * screen_present -> input. app_handle_key() / app_do_resize() mutate state on
+ * USER EVENTS (a keypress or SIGWINCH) and are deliberately OUTSIDE the tick. */
+
+/* ── App ───────────────────────────────────────────────────────────────── *
+ * Top-level harness binding the simulation (scene) to the terminal (screen),
+ * plus the loop's PERFORMANCE knob and the async signal flags. A single static
+ * instance (g_app) exists ONLY so the signal handlers — which may fire between
+ * any two instructions — can reach the flags; everything else passes App
+ * explicitly. Only init + the main loop touch it whole. The fixed-timestep rate
+ * (sim_fps) decouples simulation cadence from frame rate (Fiedler, "Fix Your
+ * Timestep!"; §8 main()). */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* the two worlds it binds */
+    Scene                 scene;        /* WHAT is simulated + shown        */
+    Screen                screen;       /* WHERE it is drawn                */
+    /* loop control */
+    int                   sim_fps;      /* fixed-timestep rate, SIM_FPS_* Hz*/
+    /* volatile sig_atomic_t: written from signal handlers, so the compiler
+     * must re-read them each loop and the write is atomic w.r.t. the
+     * interrupted code. */
+    volatile sig_atomic_t running;      /* cleared by SIGINT/SIGTERM → exit */
+    volatile sig_atomic_t need_resize;  /* set by SIGWINCH, served next loop*/
 } App;
 
 static App g_app;

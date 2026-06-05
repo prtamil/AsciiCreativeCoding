@@ -16,32 +16,46 @@
  *       "is there a star at world coordinates (wx, wy) on layer L?",
  *       and the answer is deterministic and infinite — fly the camera
  *       for an hour and the same hash returns the same star at the
- *       same world coord every time. Cycle through four patterns:
+ *       same world coord every time. Cycle through FIFTEEN modes — the
+ *       first four render the parallax field, the rest add new motion,
+ *       timed rings, meteors, a galaxy band, and full-screen field effects:
  *
  *         STARFIELD  pure parallax stars
  *         TWINKLE    each star pulses with its own hashed phase
  *         NEBULA     stars over a slow-drifting fBm cloud backdrop
  *         WARP       stars stretched into trailing streaks (5x speed)
+ *         TUNNEL     radial fly-through — streaks shoot from the centre
+ *         STARFALL   stars rain downward with vertical trails
+ *         WORMHOLE   the whole field spirals into the centre
+ *         REDSHIFT   stars tinted by depth (a near→far Doppler gradient)
+ *         PULSAR     concentric brightness rings march outward
+ *         SUPERNOVA  a few sites detonate into fading shock rings
+ *         METEORS    sparse fast diagonal streaks over a calm field
+ *         MILKYWAY   a luminous diagonal dust band of dense stars
+ *         PLASMA     full-screen animated interference field
+ *         AURORA     flowing vertical noise curtains
+ *         QUASAR     a brilliant nucleus with two vertical jets
  *
  * Study alongside: ../fields/perin_noise_flow_showcase.c — that file
  *       uses a Perlin field to STEER particles. This file uses a hash
  *       to PLACE stars and uses Perlin/fBm only for the nebula. The
  *       distinction is "noise as motion" vs "noise as content".
  *
- * Section map:
- *   §1 config    — N_LAYERS, layer speeds & density, glyphs, themes
- *   §2 clock     — monotonic timer + sleep
- *   §3 color     — HUD reserved + 10 themes (4 star + 4 nebula tints)
- *   §5 starfield — int hash, star_at(wx,wy,L), perlin2d + fbm
- *   §6 scene     — Camera, Scene state, scene_tick (camera advance)
- *   §7 screen    — per-cell layer scan, pattern dispatch, HUD
- *   §8 app       — signals, resize, fixed-step main loop
+ * Section map (re-cut by CONCERN — see ARCHITECTURE block below):
+ *   §1 CONFIG       — constants, data tables (layers, glyphs, themes), Pattern
+ *   §2 PERFORMANCE  — timing primitives (throttle policy lives in main)
+ *   §3 LOGIC        — pure: int hash, star_at, perlin2d/fbm, name map
+ *   §4 SIMULATION   — scene_tick (camera + clock advance) + reset/reseed
+ *   §5 EFFECTS      — cosmetic-only state (one-line note: none stored)
+ *   §6 DELAYS       — pauses, holds, timers (one-line note: pause only)
+ *   §7 RENDER       — pattern dispatch: layer scan / field modes / overlays + HUD
+ *   §8 APP          — user events + per-tick combine + main loop
  *
  * Keys:
  *   q / ESC    quit
  *   space      pause / resume
  *   r          reset camera to origin, reseed
- *   n / N      next pattern  (STARFIELD → TWINKLE → NEBULA → WARP → ...)
+ *   n / N      next / prev pattern  (cycles all 15 modes)
  *   p / P      previous pattern
  *   t / T      next / previous theme
  *   + / =      faster scroll
@@ -115,18 +129,29 @@
  *                  per-tick allocation and no I/O inside the loop;
  *                  the renderer is a pure function of camera state.
  *
- * References     : • Perlin, K. (1985)  An Image Synthesizer, SIGGRAPH
- *                    https://mrl.cs.nyu.edu/~perlin/paper445.pdf
- *                  • Perlin, K. (2002)  Improving Noise (quintic fade)
- *                    https://mrl.cs.nyu.edu/~perlin/paper445.pdf
- *                  • Wikipedia — Parallax scrolling
- *                    https://en.wikipedia.org/wiki/Parallax_scrolling
- *                  • Wikipedia — Perlin noise
- *                    https://en.wikipedia.org/wiki/Perlin_noise
- *                  • Inigo Quilez — Hash without Sine, smooth integer noise
- *                    https://iquilezles.org/articles/morenoise/
- *                  • Red Blob Games — Noise functions and map generation
- *                    https://www.redblobgames.com/articles/noise/introduction.html
+ * References     :
+ *
+ *   Procedural placement & noise (the concepts) —
+ *   • Teschner, M. et al. (2003) — "Optimized Spatial Hashing for Collision
+ *     Detection of Deformable Objects", VMV. Source of hash3's large-prime
+ *     multipliers and the whole placement trick: a star exists at (wx,wy,L)
+ *     iff hash3(wx,wy,L) mod density == 0.
+ *   • Perlin, K. (1985) — "An Image Synthesizer", SIGGRAPH. Gradient noise.
+ *   • Perlin, K. (2002) — "Improving Noise" (the quintic fade used in fade_q)
+ *     https://mrl.cs.nyu.edu/~perlin/paper445.pdf
+ *   • Ebert, Musgrave, Peachey, Perlin & Worley — "Texturing & Modeling: A
+ *     Procedural Approach". fBm (stacked octaves) → NEBULA / AURORA / MILKYWAY.
+ *   • Wikipedia — "Perlin noise"  https://en.wikipedia.org/wiki/Perlin_noise
+ *
+ *   Rendering & real-time effects —
+ *   • Wikipedia — "Parallax scrolling" (depth from per-layer scroll speed)
+ *     https://en.wikipedia.org/wiki/Parallax_scrolling
+ *   • Lode Vandevenne — "Lode's Computer Graphics Tutorial" (plasma, tunnel,
+ *     starfield)  https://lodev.org/cgtutor/  — the PLASMA / TUNNEL / AURORA modes.
+ *   • Inigo Quilez — "Hash without Sine" / integer noise
+ *     https://iquilezles.org/articles/morenoise/
+ *   • Red Blob Games — "Noise functions and map generation"
+ *     https://www.redblobgames.com/articles/noise/introduction.html
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -325,8 +350,57 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
+ *
+ * Re-cut from first principles into separated concern-layers (a SEPARATION
+ * pass: RELOCATE + LABEL only — every function body is byte-identical, nothing
+ * renamed). Like the galaxy showcase, this is a pure-function renderer: the
+ * picture is a stateless function of a camera + a clock + a mode selector, so
+ * §3 LOGIC is large and §4 SIMULATION is tiny. Layer → section → what it mutates:
+ *
+ *   LAYER        §   MUTATES
+ *   ─────────────────────────────────────────────────────────────────────
+ *   CONFIG       §1  nothing — compile-time constants + const data tables
+ *                    (LAYER_SPEEDS/DENSITY/GLYPHS, themes) + the Pattern enum.
+ *   PERFORMANCE  §2  nothing — clock_ns / clock_sleep_ns are pure timers; the
+ *                    frame cap + fixed-timestep accumulator are POLICY in main.
+ *   LOGIC        §3  nothing — the spatial hash, star_at (a star exists iff
+ *                    hash3(wx,wy,L) mod density == 0), the Perlin/fBm samplers,
+ *                    pattern_name, and the small pure math (twinkle_brightness,
+ *                    swirl_cell). All pure; perm[] is a stable table
+ *                    reseeded only from §4, so no RENDER/EFFECTS reorder can
+ *                    corrupt a LOGIC result.
+ *   SIMULATION   §4  Scene.{cam,paused,speed,current_theme,current_pattern,
+ *                    time_secs} + the global perm[] noise table. scene_tick
+ *                    advances the camera + clock; scene_reset/init/perm_shuffle
+ *                    seed. The ONLY writers of sim state.
+ *   EFFECTS      §5  (none) — no stored cosmetic buffer; trails / twinkle /
+ *                    rings are derived at render time. One line, not a layer.
+ *   DELAYS       §6  (none) — only Scene.paused (early-returns scene_tick); the
+ *                    field scrolls continuously, no holds/dwells.
+ *   RENDER       §7  ncurses back buffer + colour-pair table only (theme_apply,
+ *                    color_init, the draw_ / overlay_ family, scene_draw dispatch,
+ *                    screen_draw). Reads §4 state, re-evaluates §3 per cell;
+ *                    never writes simulation state.
+ *   APP          §8  App.{running,need_resize,sim_fps}; drives Scene via the
+ *                    combine + user events.
+ *
+ * PER-TICK COMBINE (the one place state advances — main(), §8):
+ *
+ *     while (sim_accum >= tick_ns)        // PERFORMANCE: fixed timestep
+ *         scene_tick()                    //   SIMULATION (camera + clock)
+ *     screen_draw() ; screen_present()    // RENDER (reads only; field re-derived)
+ *     getch() → app_handle_key()          // USER EVENTS — see below
+ *
+ * Nothing other than scene_tick() advances simulation state. User events
+ * (app_handle_key / app_do_resize) mutate Scene/Screen on a keypress or
+ * SIGWINCH — and 'r' reseeds the noise via perm_shuffle — but they run once per
+ * frame OUTSIDE the accumulator loop, not as part of the tick.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ===================================================================== */
-/* §1  config                                                             */
+/* §1  CONFIG  -- constants, data tables (layers, glyphs, themes), Pattern*/
 /* ===================================================================== */
 
 enum {
@@ -360,7 +434,6 @@ enum {
     PAIR_HINT           =   2,
     PAIR_STAR_BASE      =   3,    /* +0..+3 = 4 star tints           */
     PAIR_NEBULA_BASE    =   7,    /* +0..+3 = 4 nebula tints         */
-    PAIR_FLASH          =  11,    /* reset flash                     */
 };
 
 #define NS_PER_SEC      1000000000LL
@@ -446,32 +519,86 @@ static const char WARP_GLYPHS[4] = { '=', '-', '~', '>' };
 #define NEBULA_HI_THRESH    0.74f
 
 /*
- * Pattern — four ways of rendering the same parallax field. Cycle
- * with n / p.
+ * Cell aspect (terminal cells are ~2× taller than wide) — multiply a vertical
+ * cell-distance by this when measuring radius/angle so circles, rings and
+ * radial streaks look round instead of squashed.
+ */
+#define SF_ASPECT           2.0f
+
+/* TUNNEL — radial fly-through: foreground stars streak outward from the centre,
+ * longer toward the edges (the vanishing-point illusion). */
+#define TUNNEL_STREAK_MAX   7
+
+/* STARFALL — stars rain downward with a short vertical trail. */
+#define FALL_STREAK_LEN     4
+
+/* WORMHOLE — spiral swirl: how hard the field twists as it nears the centre. */
+#define WORM_SWIRL          5.0f
+#define WORM_SPIN           0.30f      /* swirl rotation speed (rad/sec)     */
+#define WORM_FALLOFF        0.08f      /* how fast the twist decays with radius */
+
+/* PULSAR — concentric brightness rings marching outward from the centre. */
+#define PULSAR_SPEED        24.0f      /* ring expansion, cells/sec          */
+#define PULSAR_SPACING      14.0f      /* gap between rings, cells           */
+#define PULSAR_RING_W        1.6f      /* ring half-thickness, cells         */
+
+/* SUPERNOVA — a few sites that detonate into an expanding, fading shock ring. */
+#define NOVA_SITES           3
+#define NOVA_PERIOD          3.6f      /* seconds between re-detonations     */
+#define NOVA_SPEED          22.0f      /* shock expansion, cells/sec         */
+#define NOVA_RING_W          1.8f
+
+/* METEORS — sparse fast diagonal streaks over a calm field. */
+#define METEOR_COUNT         6
+#define METEOR_LEN          12
+#define METEOR_PERIOD        2.2f      /* seconds per meteor cycle           */
+
+/* MILKYWAY — a luminous diagonal dust band across the field. */
+#define BAND_HALF_W          6.0f      /* band half-thickness, aspect cells  */
+#define BAND_SLOPE           0.5f      /* band tilt (dy per dx)              */
+
+/* PLASMA — full-screen animated interference field (sum of sines). */
+#define PLASMA_SCALE         0.13f
+#define PLASMA_SPEED         1.4f
+
+/* AURORA — flowing horizontal noise curtains. */
+#define AURORA_SCALE         0.07f
+#define AURORA_SPEED         0.6f
+
+/* QUASAR — brilliant nucleus with two vertical relativistic jets. */
+#define QUASAR_CORE_R        4.0f      /* bright core radius, aspect cells   */
+#define QUASAR_JET_HALF_W    1.5f      /* jet beam half-width, cells         */
+
+/*
+ * Pattern — fifteen ways of rendering (or replacing) the parallax field, each a
+ * distinct cosmic phenomenon. Cycle with n / p. The first four are the original
+ * field modes (kept exactly); the rest add radial/vertical/swirl motion,
+ * timed pulse + shock rings, meteors, a Milky-Way band, and full-screen field
+ * effects (plasma, aurora, quasar) that stand in for the star scan.
  */
 typedef enum {
-    PATTERN_STARFIELD = 0,
-    PATTERN_TWINKLE   = 1,
-    PATTERN_NEBULA    = 2,
-    PATTERN_WARP      = 3,
-    N_PATTERNS        = 4,
+    PATTERN_STARFIELD = 0,    /* classic parallax scroll                  */
+    PATTERN_TWINKLE,          /* stars pulse in/out                       */
+    PATTERN_NEBULA,           /* drifting fBm dust clouds + stars         */
+    PATTERN_WARP,             /* linear hyperspace streaks                */
+    PATTERN_TUNNEL,           /* radial fly-through (streaks from centre) */
+    PATTERN_STARFALL,         /* vertical star rain                       */
+    PATTERN_WORMHOLE,         /* spiral swirl of the whole field          */
+    PATTERN_REDSHIFT,         /* stars tinted by depth (near→far gradient)*/
+    PATTERN_PULSAR,           /* expanding concentric brightness rings    */
+    PATTERN_SUPERNOVA,        /* detonating, fading shock rings           */
+    PATTERN_METEORS,          /* sparse fast diagonal meteor streaks      */
+    PATTERN_MILKYWAY,         /* luminous diagonal dust band              */
+    PATTERN_PLASMA,           /* full-screen interference plasma          */
+    PATTERN_AURORA,           /* flowing horizontal noise curtains        */
+    PATTERN_QUASAR,           /* nucleus + vertical relativistic jets     */
+    N_PATTERNS,
 } Pattern;
-
-static const char *pattern_name(Pattern p)
-{
-    switch (p) {
-    case PATTERN_STARFIELD: return "STARFIELD";
-    case PATTERN_TWINKLE:   return "TWINKLE  ";
-    case PATTERN_NEBULA:    return "NEBULA   ";
-    case PATTERN_WARP:      return "WARP     ";
-    default:                return "?        ";
-    }
-}
 
 /*
  * Themes — same 10-name menu as the rest of the procedural showcases.
  * Each theme provides 4 STAR tints (one per star colour bucket) and
- * 4 NEBULA tints (one per density band). PAIR_HUD/HINT/FLASH stay
+ * 4 NEBULA tints (one per density band). PAIR_HUD/HINT stay
  * theme-independent.
  */
 typedef struct {
@@ -497,8 +624,12 @@ static const Theme themes[N_THEMES] = {
 };
 
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  PERFORMANCE  -- timing primitives (throttle policy in main, §8)   */
 /* ===================================================================== */
+
+/* Timing primitives only. The 60 fps frame cap and the fixed-timestep
+ * accumulator that decide how many scene_tick()s run per frame are POLICY,
+ * applied in main() (§8). */
 
 static int64_t clock_ns(void)
 {
@@ -518,50 +649,30 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  LOGIC  -- pure decisions: hash, star test, perlin/fbm, name map   */
 /* ===================================================================== */
 
-static void theme_apply(int idx)
+/* Pure functions — the bulk of the algorithm. Given their arguments (and the
+ * read-only noise table) each returns a value with NO mutation and NO I/O: the
+ * spatial hash, the star-existence test (a star is at (wx,wy,L) iff
+ * hash3 mod density == 0), the Perlin/fBm samplers, the enum→name map, and the
+ * small per-cell math (twinkle_brightness, the WORMHOLE swirl_cell).
+ *
+ * The one piece of data here, perm[], is a stable lookup table reseeded ONLY
+ * by perm_shuffle (§4, on reset) — never by RENDER/EFFECTS — so a frame's
+ * render order cannot change any LOGIC result. star_at / the noise are
+ * evaluated fresh per cell by the renderer; they are decisions, not state. */
+
+/* 9-char padded names so the HUD field width stays fixed. */
+static const char *pattern_name(Pattern p)
 {
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        for (int i = 0; i < 4; i++) {
-            init_pair((short)(PAIR_STAR_BASE   + i), t->star  [i], -1);
-            init_pair((short)(PAIR_NEBULA_BASE + i), t->nebula[i], -1);
-        }
-    } else {
-        /* 8-color fallback — distinct hues that work on every term. */
-        static const short fb_star[4]   = { COLOR_WHITE,   COLOR_YELLOW,
-                                            COLOR_CYAN,    COLOR_BLUE };
-        static const short fb_nebula[4] = { COLOR_BLUE,    COLOR_BLUE,
-                                            COLOR_MAGENTA, COLOR_CYAN };
-        for (int i = 0; i < 4; i++) {
-            init_pair((short)(PAIR_STAR_BASE   + i), fb_star  [i], -1);
-            init_pair((short)(PAIR_NEBULA_BASE + i), fb_nebula[i], -1);
-        }
-    }
+    static const char *names[N_PATTERNS] = {
+        "STARFIELD", "TWINKLE  ", "NEBULA   ", "WARP     ", "TUNNEL   ",
+        "STARFALL ", "WORMHOLE ", "REDSHIFT ", "PULSAR   ", "SUPERNOVA",
+        "METEORS  ", "MILKYWAY ", "PLASMA   ", "AURORA   ", "QUASAR   ",
+    };
+    return ((int)p >= 0 && (int)p < N_PATTERNS) ? names[p] : "?        ";
 }
-
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,   226, -1);
-        init_pair(PAIR_HINT,   51, -1);
-        init_pair(PAIR_FLASH, 226, -1);
-    } else {
-        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
-        init_pair(PAIR_FLASH, COLOR_YELLOW, -1);
-    }
-    theme_apply(0);
-}
-
-/* ===================================================================== */
-/* §5  starfield — hash, star_at, perlin/fbm                              */
-/* ===================================================================== */
 
 /*
  * hash3 — stateless 3-int → 32-bit avalanche hash.
@@ -618,20 +729,6 @@ static inline bool star_at(int wx, int wy, int L, uint32_t *out_h)
  * perlin2d : returns roughly [-1, 1]
  */
 static uint8_t perm[512];
-
-static void perm_shuffle(void)
-{
-    uint8_t base[256];
-    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
-    for (int i = 255; i > 0; i--) {
-        int j = rand() % (i + 1);
-        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
-    }
-    for (int i = 0; i < 256; i++) {
-        perm[i      ] = base[i];
-        perm[i + 256] = base[i];
-    }
-}
 
 static inline float fade_q(float t)
 {
@@ -693,9 +790,54 @@ static float fbm2(float x, float y)
     return (total / max_amp) * 0.5f + 0.5f;
 }
 
+/* twinkle_brightness — per-star scintillation in [0,1]: a sine driven by the
+ * star's OWN hashed phase, so neighbouring stars pulse out of sync. */
+static inline float twinkle_brightness(uint32_t h, float time_secs)
+{
+    float phase = ((float)((h >> 24) & 0xFFu) / 255.0f) * 2.0f * (float)M_PI;
+    return 0.5f + 0.5f * sinf(2.0f * (float)M_PI * TWINKLE_HZ * time_secs + phase);
+}
+
+/* swirl_cell — WORMHOLE distortion: rotate a screen cell around the centre by
+ * an angle that grows toward the centre (and drifts with time), so the sampled
+ * field spirals inward. Writes the swirled sample position to *esx, *esy. */
+static inline void swirl_cell(int sx, int sy, float cx, float cy, float time_secs,
+                              float *esx, float *esy)
+{
+    float dx = (float)sx - cx, dy = ((float)sy - cy) * SF_ASPECT;
+    float rr = sqrtf(dx * dx + dy * dy);
+    float ang = atan2f(dy, dx)
+              + WORM_SWIRL / (rr * WORM_FALLOFF + 1.0f)
+              + time_secs * WORM_SPIN;
+    *esx = cx + rr * cosf(ang);
+    *esy = cy + rr * sinf(ang) / SF_ASPECT;
+}
+
 /* ===================================================================== */
-/* §6  scene — camera + state + tick                                      */
+/* §4  SIMULATION  -- advances state (only writers of sim state)         */
 /* ===================================================================== */
+
+/* The ONLY writers of simulation state. scene_tick advances the camera
+ * (cam.x/y by velocity × speed × dt) and the wall clock (time_secs) once per
+ * tick; scene_reset / scene_init (with perm_shuffle, the noise reseed) set them
+ * on reset. Mutates: Scene.{cam,paused,speed,current_theme,current_pattern,
+ * time_secs} and the global perm[] noise table. scene_tick() is the single
+ * per-tick entry point (called only from main, §8); user events (key/resize)
+ * also mutate Scene but are NOT part of the tick -- see §8. */
+
+static void perm_shuffle(void)
+{
+    uint8_t base[256];
+    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
+    for (int i = 255; i > 0; i--) {
+        int j = rand() % (i + 1);
+        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
+    }
+    for (int i = 0; i < 256; i++) {
+        perm[i      ] = base[i];
+        perm[i + 256] = base[i];
+    }
+}
 
 /*
  * Camera — continuous (float) position in world units, plus a velocity
@@ -713,32 +855,29 @@ typedef struct {
 } Camera;
 
 /*
- * Scene — all the state that survives across ticks. There is no per-
- * cell array: the rendering function reads camera + pattern + theme
- * and computes everything else from the hash / Perlin functions.
- *
- *   cam              : where the camera is
- *   paused           : freeze advance
- *   speed            : 1..SCROLL_SPEED_MAX, multiplies cam.v on tick
- *   current_theme    : 0..N_THEMES-1
- *   current_pattern  : STARFIELD / TWINKLE / NEBULA / WARP
- *   time_secs        : accumulator for TWINKLE phase
- *   flash_t          : 0..1 reset-flash intensity, decays each tick
+ * Scene — all the state that survives across ticks, as a table of contents.
+ * There is no per-cell array: the renderer reads camera + pattern + clock and
+ * computes every pixel from the hash / Perlin functions. Fields group by
+ * concept, not by which key changes them. scene_tick() (§4) is the only
+ * per-tick writer; user events set the knobs / selections.
  */
 typedef struct {
-    Camera  cam;
-    bool    paused;
-    int     speed;
-    int     current_theme;
-    Pattern current_pattern;
-    float   time_secs;
-    float   flash_t;
+    /* WHAT is simulated — the moving viewpoint flying through the field */
+    Camera  cam;              /* position + velocity (world units)        */
+    /* HOW the user drives it — the tunable simulation knob */
+    int     speed;            /* scroll-speed multiplier, 1..SCROLL_SPEED_MAX */
+    /* WHAT we are looking at — RENDER selections, not simulation */
+    Pattern current_pattern;  /* active render mode (n/p)                 */
+    int     current_theme;    /* index into themes[] (t/T)                */
+    /* WHEN we are — wall clock + run-state */
+    float   time_secs;        /* accumulating clock (drives twinkle/effects) */
+    bool    paused;           /* freeze camera + clock; rendering continues */
 } Scene;
 
 /*
- * scene_reset — snap the camera to the origin, reseed the Perlin
- * permutation, raise the flash. This is the "press r" behaviour and
- * is also the one-time init-the-world call.
+ * scene_reset — snap the camera to the origin and reseed the Perlin
+ * permutation. This is the "press r" behaviour and is also the one-time
+ * init-the-world call.
  */
 static void scene_reset(Scene *s)
 {
@@ -750,7 +889,6 @@ static void scene_reset(Scene *s)
     s->cam.vx = 1.00f;
     s->cam.vy = 0.18f;
     s->time_secs = 0.0f;
-    s->flash_t   = 1.0f;
     perm_shuffle();
 }
 
@@ -781,12 +919,71 @@ static void scene_tick(Scene *s, float dt)
     s->cam.y += s->cam.vy * speed_mul * dt;
 
     s->time_secs += dt;
-    s->flash_t   *= expf(-4.0f * dt);   /* ~0.25 s decay */
 }
 
 /* ===================================================================== */
-/* §7  screen — per-cell layer scan, pattern dispatch, HUD                */
+/* §5  EFFECTS  -- cosmetic-only state                                   */
 /* ===================================================================== */
+
+/* No EFFECTS layer. Nothing cosmetic is stored: the WARP / TUNNEL / STARFALL
+ * motion trails, the TWINKLE pulse, and the pulsar/supernova/meteor overlays
+ * are all DERIVED at render time from the star position + time_secs (§7) —
+ * there is no trail/glow buffer to advance. */
+
+/* ===================================================================== */
+/* §6  DELAYS  -- pauses, holds, timers                                  */
+/* ===================================================================== */
+
+/* No separate layer. The only timing control is the pause toggle
+ * (Scene.paused), which early-returns scene_tick (§4). There are no holds or
+ * dwells — the camera scrolls (and the effects animate) continuously. */
+
+/* ===================================================================== */
+/* §7  RENDER  -- state -> screen (reads only, never mutates sim)        */
+/* ===================================================================== */
+
+/* state -> screen. scene_draw dispatches the active pattern: full-screen field
+ * modes (plasma/aurora/quasar) replace the scan, the rest render the parallax
+ * star field (draw_star_field → star_at + draw_star_at, with NEBULA/MILKYWAY
+ * dust) then layer a timed overlay (pulsar/supernova/meteors); screen_draw lays
+ * the HUD over it. Reads Scene/Screen + §3 LOGIC; writes ONLY the ncurses back
+ * buffer and the colour-pair table (theme_apply/color_init). Never mutates sim. */
+
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    if (COLORS >= 256) {
+        const Theme *t = &themes[idx];
+        for (int i = 0; i < 4; i++) {
+            init_pair((short)(PAIR_STAR_BASE   + i), t->star  [i], -1);
+            init_pair((short)(PAIR_NEBULA_BASE + i), t->nebula[i], -1);
+        }
+    } else {
+        /* 8-color fallback — distinct hues that work on every term. */
+        static const short fb_star[4]   = { COLOR_WHITE,   COLOR_YELLOW,
+                                            COLOR_CYAN,    COLOR_BLUE };
+        static const short fb_nebula[4] = { COLOR_BLUE,    COLOR_BLUE,
+                                            COLOR_MAGENTA, COLOR_CYAN };
+        for (int i = 0; i < 4; i++) {
+            init_pair((short)(PAIR_STAR_BASE   + i), fb_star  [i], -1);
+            init_pair((short)(PAIR_NEBULA_BASE + i), fb_nebula[i], -1);
+        }
+    }
+}
+
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,   226, -1);
+        init_pair(PAIR_HINT,   51, -1);
+    } else {
+        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
+    }
+    theme_apply(0);
+}
 
 typedef struct { int cols, rows; } Screen;
 
@@ -812,49 +1009,89 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
+/* draw_warp_trail — WARP: a fading linear streak in +x behind a foreground
+ * star (the world slides -x as the camera moves +x). */
+static void draw_warp_trail(int sy, int sx, int pair, int cols)
+{
+    for (int d = 1; d <= WARP_STREAK_LEN; d++) {
+        int tx = sx + d;
+        if (tx >= cols) break;
+        char tg = (d == 1) ? '-' : (d == 2) ? '~' : '.';
+        int  ta = (d == 1) ? A_BOLD : (d == 2) ? A_NORMAL : A_DIM;
+        attron(COLOR_PAIR(pair) | ta);
+        mvaddch(sy, tx, (chtype)(unsigned char)tg);
+        attroff(COLOR_PAIR(pair) | ta);
+    }
+}
+
+/* draw_tunnel_trail — TUNNEL: a radial streak pointing OUTWARD from the centre,
+ * lengthening toward the edges (the fly-through vanishing-point illusion). */
+static void draw_tunnel_trail(int sy, int sx, int pair, float cx, float cy,
+                              int rows, int cols)
+{
+    float dx = (float)sx - cx, dy = (float)sy - cy;
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len <= 0.5f) return;
+    float ux = dx / len, uy = dy / len;
+    float maxlen = sqrtf(cx * cx + cy * cy) + 1.0f;
+    int slen = 1 + (int)(len / maxlen * TUNNEL_STREAK_MAX);
+    for (int d = 1; d <= slen; d++) {
+        int tx = sx + (int)lroundf(ux * (float)d);
+        int ty = sy + (int)lroundf(uy * (float)d);
+        if (tx < 0 || tx >= cols || ty < 2 || ty >= rows - 1) break;
+        char tg = (d <= 1) ? '-' : (d <= 3) ? ':' : '.';
+        int  ta = (d <= 1) ? A_BOLD : (d <= 3) ? A_NORMAL : A_DIM;
+        attron(COLOR_PAIR(pair) | ta);
+        mvaddch(ty, tx, (chtype)(unsigned char)tg);
+        attroff(COLOR_PAIR(pair) | ta);
+    }
+}
+
+/* draw_fall_trail — STARFALL: a short downward trail (stars raining). */
+static void draw_fall_trail(int sy, int sx, int pair, int rows)
+{
+    for (int d = 1; d <= FALL_STREAK_LEN; d++) {
+        int ty = sy + d;
+        if (ty >= rows - 1) break;
+        char tg = (d == 1) ? '|' : (d == 2) ? ':' : '.';
+        int  ta = (d == 1) ? A_NORMAL : A_DIM;
+        attron(COLOR_PAIR(pair) | ta);
+        mvaddch(ty, sx, (chtype)(unsigned char)tg);
+        attroff(COLOR_PAIR(pair) | ta);
+    }
+}
+
 /*
- * draw_star_at — paint the glyph + colour for ONE detected star. Fac-
- * tored out so the four patterns share the colour/glyph encoding logic.
+ * draw_star_at — paint ONE detected star: decode its tint/glyph from the hash,
+ * apply the per-mode modifier (REDSHIFT depth-tint, WARP glyph, TWINKLE
+ * brightness), draw it, then add the mode's motion trail. Returns false only
+ * when TWINKLE has this star off-cycle, so the caller scans the layers behind.
  *
- *   sy, sx       : where on the screen
- *   layer        : 0..N_LAYERS-1
- *   h            : the full 32-bit hash returned by star_at()
- *   pattern      : determines glyph table + brightness modifier
- *   time_secs    : for TWINKLE
- *
- * Returns false if the star ended up "off" (TWINKLE pattern,
- * brightness below TWINKLE_OFF_THRESH) — the caller can then continue
- * scanning deeper layers behind it.
+ *   sy, sx : screen cell    layer : 0..N_LAYERS-1    h : the star's hash
  */
 static bool draw_star_at(int sy, int sx, int layer, uint32_t h,
                          Pattern pattern, float time_secs,
-                         int rows, int cols)
+                         int rows, int cols, float cx, float cy)
 {
     int color_idx = (int)((h >> 16) & 3u);
     int glyph_idx = (int)((h >>  8) & 3u);
 
-    /* Default attribute by layer — depth cue via brightness. */
+    /* Depth cue: brightness by layer; REDSHIFT instead tints by depth. */
     int attr = A_NORMAL;
     if      (layer == 0) attr = A_BOLD;
     else if (layer == 3) attr = A_DIM;
+    if (pattern == PATTERN_REDSHIFT) color_idx = layer;
 
-    /* Glyph: pattern-specific. */
-    char glyph;
-    if (pattern == PATTERN_WARP && layer == 0) {
-        glyph = WARP_GLYPHS[glyph_idx];
-    } else {
-        glyph = LAYER_GLYPHS[layer][glyph_idx];
-    }
+    /* Glyph: WARP foreground stars become streak heads. */
+    char glyph = (pattern == PATTERN_WARP && layer == 0)
+               ? WARP_GLYPHS[glyph_idx] : LAYER_GLYPHS[layer][glyph_idx];
 
-    /* TWINKLE: per-star phase modulates brightness. Off-cycle stars
-     * return false so layers behind them can show through. */
+    /* TWINKLE: off-cycle stars return false so layers behind show through. */
     if (pattern == PATTERN_TWINKLE) {
-        float phase = ((float)((h >> 24) & 0xFFu) / 255.0f) * 2.0f * (float)M_PI;
-        float b = 0.5f + 0.5f * sinf(2.0f * (float)M_PI * TWINKLE_HZ
-                                     * time_secs + phase);
-        if (b < TWINKLE_OFF_THRESH)        return false;
-        else if (b < TWINKLE_BOLD_THRESH)  attr = A_DIM;
-        else                                attr = A_BOLD;
+        float b = twinkle_brightness(h, time_secs);
+        if (b < TWINKLE_OFF_THRESH)       return false;
+        else if (b < TWINKLE_BOLD_THRESH) attr = A_DIM;
+        else                              attr = A_BOLD;
     }
 
     int pair = PAIR_STAR_BASE + color_idx;
@@ -862,22 +1099,11 @@ static bool draw_star_at(int sy, int sx, int layer, uint32_t h,
     mvaddch(sy, sx, (chtype)(unsigned char)glyph);
     attroff(COLOR_PAIR(pair) | attr);
 
-    /* WARP: paint a 3-cell trailing streak behind the foreground star.
-     * The streak extends in the +x direction (the camera is moving in
-     * +x, so the world appears to slide in -x — the star's previous
-     * positions are at higher screen-x). Fades over the streak length. */
-    if (pattern == PATTERN_WARP && layer == 0) {
-        for (int d = 1; d <= WARP_STREAK_LEN; d++) {
-            int tx = sx + d;
-            if (tx >= cols) break;
-            char tg = (d == 1) ? '-' : (d == 2) ? '~' : '.';
-            int  ta = (d == 1) ? A_BOLD : (d == 2) ? A_NORMAL : A_DIM;
-            attron(COLOR_PAIR(pair) | ta);
-            mvaddch(sy, tx, (chtype)(unsigned char)tg);
-            attroff(COLOR_PAIR(pair) | ta);
-        }
-    }
-    (void)rows;
+    /* Foreground motion trail — direction depends on the mode. */
+    if      (pattern == PATTERN_WARP     && layer == 0) draw_warp_trail(sy, sx, pair, cols);
+    else if (pattern == PATTERN_TUNNEL   && layer == 0) draw_tunnel_trail(sy, sx, pair, cx, cy, rows, cols);
+    else if (pattern == PATTERN_STARFALL && layer <= 1) draw_fall_trail(sy, sx, pair, rows);
+
     return true;
 }
 
@@ -914,20 +1140,256 @@ static void draw_nebula_cell(int sy, int sx, float wx, float wy)
     attroff(COLOR_PAIR(pair) | attr);
 }
 
+/* draw_band_cell — MILKYWAY dust confined to a tilted diagonal band: fBm dust
+ * that fades out away from the band centre-line. */
+static void draw_band_cell(int sy, int sx, float wx, float wy, float cx, float cy)
+{
+    float dband = ((float)sy - cy) * SF_ASPECT - BAND_SLOPE * ((float)sx - cx);
+    if (fabsf(dband) > BAND_HALF_W) return;
+    float falloff = 1.0f - fabsf(dband) / BAND_HALF_W;           /* 1 at centre */
+    float n = fbm2(wx * NEBULA_SCALE * 1.6f, wy * NEBULA_SCALE * 1.6f) * falloff;
+    if (n < 0.28f) return;
+
+    char glyph; int color_idx, attr = A_NORMAL;
+    if      (n < 0.42f) { glyph = '.'; color_idx = 0; attr = A_DIM;  }
+    else if (n < 0.55f) { glyph = '*'; color_idx = 1;               }
+    else                { glyph = '#'; color_idx = 3; attr = A_BOLD; }
+    int pair = PAIR_NEBULA_BASE + color_idx;
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+    attroff(COLOR_PAIR(pair) | attr);
+}
+
 /*
- * scene_draw — the heart of the renderer. For every visible cell,
- * scan layers front-to-back; the first hit wins. Empty cells in
- * NEBULA pattern fall through to draw_nebula_cell.
- *
- * Why front-to-back with break? Two reasons:
- *   1. Correctness — foreground stars must occlude deeper ones.
- *   2. Speed — typical cell terminates on layer 0 or 1 (foreground
- *      density ~5%, layer-1 density ~6%; combined ~11% of cells
- *      hit before reaching layer 2). The deeper, denser layers are
- *      only reached for the empty ~89% of cells, where they fill in
- *      the sprinkle.
+ * draw_star_field — the parallax scan shared by every star-based mode. For
+ * each cell, scan layers front-to-back; the first hit wins (foreground stars
+ * occlude deeper ones, and most cells terminate on layer 0/1). WORMHOLE twists
+ * the sample position around the centre (swirl_cell); NEBULA / MILKYWAY fill
+ * empty cells with dust. For the plain modes it is just the parallax scan.
  */
-static void scene_draw(const Scene *s, int cols, int rows)
+static void draw_star_field(const Camera *cam, Pattern pattern, float time_secs,
+                            int top, int bottom, int width, int rows, int cols)
+{
+    Pattern p = pattern;
+    float cx = (float)width * 0.5f;
+    float cy = (float)(top + bottom) * 0.5f;
+
+    for (int sy = top; sy < bottom; sy++) {
+        for (int sx = 0; sx < width; sx++) {
+
+            /* The cell we sample the field at — WORMHOLE swirls it inward. */
+            float esx = (float)sx, esy = (float)sy;
+            if (p == PATTERN_WORMHOLE)
+                swirl_cell(sx, sy, cx, cy, time_secs, &esx, &esy);
+
+            bool drew = false;
+            for (int L = 0; L < N_LAYERS; L++) {
+                /* Per-layer world coord — FLOOR (not cast) to avoid a jump at 0. */
+                float wxf = esx + cam->x * LAYER_SPEEDS[L];
+                float wyf = esy + cam->y * LAYER_SPEEDS[L];
+                int   wx  = (int)floorf(wxf);
+                int   wy  = (int)floorf(wyf);
+
+                uint32_t h;
+                if (!star_at(wx, wy, L, &h)) continue;
+
+                if (draw_star_at(sy, sx, L, h, p, time_secs,
+                                 rows, cols, cx, cy)) {
+                    drew = true;
+                    break;          /* foreground wins */
+                }
+                /* TWINKLE off-cycle: continue scanning behind. */
+            }
+
+            if (!drew && p == PATTERN_NEBULA) {
+                float wxf = (float)sx + cam->x * NEBULA_SCROLL;
+                float wyf = (float)sy + cam->y * NEBULA_SCROLL;
+                draw_nebula_cell(sy, sx, wxf, wyf);
+            } else if (!drew && p == PATTERN_MILKYWAY) {
+                float wxf = (float)sx + cam->x * NEBULA_SCROLL;
+                float wyf = (float)sy + cam->y * NEBULA_SCROLL;
+                draw_band_cell(sy, sx, wxf, wyf, cx, cy);
+            }
+        }
+    }
+}
+
+/* overlay_pulsar — concentric brightness rings marching outward from centre. */
+static void overlay_pulsar(float time_secs, int top, int bottom, int width)
+{
+    float cx = (float)width * 0.5f, cy = (float)(top + bottom) * 0.5f;
+    float march = fmodf(time_secs * PULSAR_SPEED, PULSAR_SPACING);
+    for (int sy = top; sy < bottom; sy++) {
+        for (int sx = 0; sx < width; sx++) {
+            float dx = (float)sx - cx, dy = ((float)sy - cy) * SF_ASPECT;
+            float rr = sqrtf(dx * dx + dy * dy);
+            float ph = fmodf(rr - march, PULSAR_SPACING);
+            if (ph < 0.0f) ph += PULSAR_SPACING;
+            if (ph < PULSAR_RING_W || ph > PULSAR_SPACING - PULSAR_RING_W) {
+                int  pair  = PAIR_STAR_BASE + ((int)(rr / PULSAR_SPACING) & 3);
+                char glyph = (ph < PULSAR_RING_W * 0.5f
+                              || ph > PULSAR_SPACING - PULSAR_RING_W * 0.5f) ? 'O' : 'o';
+                attron(COLOR_PAIR(pair) | A_BOLD);
+                mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+                attroff(COLOR_PAIR(pair) | A_BOLD);
+            }
+        }
+    }
+}
+
+/* overlay_supernova — a few hashed sites, each detonating into an expanding,
+ * fading shock ring on its own clock. */
+static void overlay_supernova(float time_secs, int top, int bottom, int width)
+{
+    int span_w = width > 1 ? width : 1;
+    int span_h = (bottom - top) > 1 ? (bottom - top) : 1;
+    for (int k = 0; k < NOVA_SITES; k++) {
+        uint32_t hs = hash3(k * 97 + 13, k * 61 + 7, 1234);
+        float sxc = (float)(hs % (uint32_t)span_w);
+        float syc = (float)(top + (int)((hs >> 8) % (uint32_t)span_h));
+        float age = fmodf(time_secs + (float)(hs & 0xFFu) / 255.0f * NOVA_PERIOD,
+                          NOVA_PERIOD);
+        float ring_r = age * NOVA_SPEED;
+        float fade   = 1.0f - age / NOVA_PERIOD;       /* 1 (fresh) → 0 (faded) */
+        if (fade < 0.10f) continue;
+
+        for (int sy = top; sy < bottom; sy++) {
+            for (int sx = 0; sx < width; sx++) {
+                float dx = (float)sx - sxc, dy = ((float)sy - syc) * SF_ASPECT;
+                float rr = sqrtf(dx * dx + dy * dy);
+                if (fabsf(rr - ring_r) >= NOVA_RING_W) continue;
+                int  attr  = fade > 0.6f ? A_BOLD : fade > 0.3f ? A_NORMAL : A_DIM;
+                char glyph = fade > 0.6f ? '#'    : fade > 0.3f ? '*'      : '.';
+                int  pair  = PAIR_NEBULA_BASE + (k & 3);
+                attron(COLOR_PAIR(pair) | attr);
+                mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+                attroff(COLOR_PAIR(pair) | attr);
+            }
+        }
+    }
+}
+
+/* overlay_meteors — sparse fast diagonal streaks, each on its own phase clock. */
+static void overlay_meteors(float time_secs, int top, int bottom, int width)
+{
+    int span_h = (bottom - top) > 1 ? (bottom - top) : 1;
+    for (int m = 0; m < METEOR_COUNT; m++) {
+        uint32_t hm = hash3(m * 131 + 5, m * 89 + 3, 77);
+        float phase   = (float)(hm & 0xFFFFu) / 65535.0f;
+        float t       = fmodf(time_secs / METEOR_PERIOD + phase, 1.0f);  /* 0..1 */
+        float head_x  = t * (float)(width + METEOR_LEN) - (float)METEOR_LEN;
+        float start_y = (float)(top + (int)((hm >> 16) % (uint32_t)span_h));
+        float head_y  = start_y + t * 6.0f;                                  /* slight fall */
+        for (int d = 0; d < METEOR_LEN; d++) {
+            int tx = (int)(head_x - (float)d);
+            int ty = (int)(head_y - (float)d * 0.4f);
+            if (tx < 0 || tx >= width || ty < top || ty >= bottom) continue;
+            char glyph = d == 0 ? '@' : d < 3 ? '*' : d < 6 ? '-' : '.';
+            int  attr  = d == 0 ? A_BOLD : d < 6 ? A_NORMAL : A_DIM;
+            int  pair  = PAIR_STAR_BASE + (m & 3);
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(ty, tx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* draw_plasma — full-screen animated interference field (sum of sines). Fills
+ * every cell, so there is no star scan; colour + glyph track the field value. */
+static void draw_plasma(float time_secs, int top, int bottom, int width)
+{
+    float t = time_secs * PLASMA_SPEED;
+    for (int sy = top; sy < bottom; sy++) {
+        for (int sx = 0; sx < width; sx++) {
+            float fx = (float)sx * PLASMA_SCALE, fy = (float)sy * PLASMA_SCALE;
+            float v = sinf(fx + t)
+                    + sinf(fy * 1.3f + t * 0.9f)
+                    + sinf((fx + fy) * 0.7f + t * 1.1f)
+                    + sinf(sqrtf(fx * fx + fy * fy) * 0.9f + t);
+            float u = (v + 4.0f) / 8.0f;                     /* → [0,1] */
+            int  idx   = (int)(u * 3.999f);
+            char glyph = u < 0.25f ? '.' : u < 0.50f ? '*' : u < 0.75f ? '#' : '@';
+            int  attr  = u < 0.30f ? A_DIM : u > 0.70f ? A_BOLD : A_NORMAL;
+            int  pair  = PAIR_NEBULA_BASE + (idx & 3);
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* draw_aurora — flowing vertical curtains: fBm stretched tall and drifting
+ * upward, modulated by a horizontal shimmer. Dark sky shows between curtains. */
+static void draw_aurora(float time_secs, int top, int bottom, int width)
+{
+    float t = time_secs * AURORA_SPEED;
+    for (int sy = top; sy < bottom; sy++) {
+        for (int sx = 0; sx < width; sx++) {
+            float n = fbm2((float)sx * AURORA_SCALE,
+                           (float)sy * AURORA_SCALE * 3.0f - t);
+            float shimmer = 0.5f + 0.5f * sinf((float)sx * 0.08f + t * 2.0f + n * 4.0f);
+            float v = n * shimmer;
+            if (v < 0.18f) continue;
+            int  idx   = v < 0.30f ? 0 : v < 0.45f ? 1 : v < 0.60f ? 2 : 3;
+            char glyph = v < 0.30f ? '.' : v < 0.45f ? ':' : v < 0.60f ? '|' : '#';
+            int  attr  = v < 0.30f ? A_DIM : v > 0.60f ? A_BOLD : A_NORMAL;
+            int  pair  = PAIR_NEBULA_BASE + idx;
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* draw_quasar — a brilliant nucleus with two vertical pulsing jets, a faint
+ * accretion sprinkle filling the rest. */
+static void draw_quasar(float time_secs, int top, int bottom, int width)
+{
+    float cx = (float)width * 0.5f, cy = (float)(top + bottom) * 0.5f;
+    float span = (float)(bottom - top);
+    for (int sy = top; sy < bottom; sy++) {
+        for (int sx = 0; sx < width; sx++) {
+            float dx = (float)sx - cx, dy = ((float)sy - cy) * SF_ASPECT;
+            float rr = sqrtf(dx * dx + dy * dy);
+
+            if (rr < QUASAR_CORE_R) {                         /* nucleus */
+                int  attr  = rr < QUASAR_CORE_R * 0.5f ? A_BOLD : A_NORMAL;
+                char glyph = rr < QUASAR_CORE_R * 0.5f ? '@' : '#';
+                attron(COLOR_PAIR(PAIR_STAR_BASE) | attr);
+                mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+                attroff(COLOR_PAIR(PAIR_STAR_BASE) | attr);
+            } else if (fabsf((float)sx - cx) < QUASAR_JET_HALF_W) {   /* jets */
+                float jf    = 1.0f - rr / span;
+                float pulse = 0.5f + 0.5f * sinf(rr * 0.3f - time_secs * 4.0f);
+                float b     = jf * pulse;
+                if (b > 0.08f) {
+                    int  attr  = b > 0.4f ? A_BOLD : b > 0.2f ? A_NORMAL : A_DIM;
+                    char glyph = b > 0.4f ? '|' : ':';
+                    attron(COLOR_PAIR(PAIR_NEBULA_BASE + 3) | attr);
+                    mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+                    attroff(COLOR_PAIR(PAIR_NEBULA_BASE + 3) | attr);
+                }
+            } else {                                          /* faint sprinkle */
+                uint32_t h = hash3(sx, sy, 909);
+                if ((h % 40u) == 0u) {
+                    int pair = PAIR_STAR_BASE + (int)((h >> 8) & 3u);
+                    attron(COLOR_PAIR(pair) | A_DIM);
+                    mvaddch(sy, sx, '.');
+                    attroff(COLOR_PAIR(pair) | A_DIM);
+                }
+            }
+        }
+    }
+}
+
+/*
+ * scene_draw — dispatch the active pattern. Full-screen field modes (plasma /
+ * aurora / quasar) replace the star scan entirely; everything else renders the
+ * parallax star field, then layers a timed overlay (pulsar / supernova /
+ * meteors) on top.
+ */
+static void scene_draw(const Camera *cam, Pattern pattern, float time_secs,
+                       int cols, int rows)
 {
     /* Reserve top 2 rows for HUD, bottom 1 for hint. */
     int top    = 2;
@@ -936,139 +1398,124 @@ static void scene_draw(const Scene *s, int cols, int rows)
     if (width  > MAP_W_MAX) width  = MAP_W_MAX;
     if (bottom - top > MAP_H_MAX) bottom = top + MAP_H_MAX;
 
-    for (int sy = top; sy < bottom; sy++) {
-        for (int sx = 0; sx < width; sx++) {
-
-            bool drew = false;
-
-            for (int L = 0; L < N_LAYERS; L++) {
-                /* Per-layer world coord — the FLOOR is essential here:
-                 * (int) cast would discontinuity-jump at zero. */
-                float wxf = (float)sx + s->cam.x * LAYER_SPEEDS[L];
-                float wyf = (float)sy + s->cam.y * LAYER_SPEEDS[L];
-                int   wx  = (int)floorf(wxf);
-                int   wy  = (int)floorf(wyf);
-
-                uint32_t h;
-                if (!star_at(wx, wy, L, &h)) continue;
-
-                if (draw_star_at(sy, sx, L, h,
-                                 s->current_pattern, s->time_secs,
-                                 rows, cols)) {
-                    drew = true;
-                    break;          /* foreground wins */
-                }
-                /* TWINKLE off-cycle: continue scanning behind. */
-            }
-
-            /* Empty cells: optional nebula backdrop. */
-            if (!drew && s->current_pattern == PATTERN_NEBULA) {
-                float wxf = (float)sx + s->cam.x * NEBULA_SCROLL;
-                float wyf = (float)sy + s->cam.y * NEBULA_SCROLL;
-                draw_nebula_cell(sy, sx, wxf, wyf);
-            }
-        }
+    switch (pattern) {
+    case PATTERN_PLASMA: draw_plasma(time_secs, top, bottom, width); return;
+    case PATTERN_AURORA: draw_aurora(time_secs, top, bottom, width); return;
+    case PATTERN_QUASAR: draw_quasar(time_secs, top, bottom, width); return;
+    default: break;
     }
 
-    /* Reset flash — sparse '*' overlay that fades quickly. */
-    if (s->flash_t > 0.05f) {
-        int seed = (int)(s->time_secs * 1000.0f);
-        attron(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
-        for (int sy = top; sy < bottom; sy += 2) {
-            for (int sx = 0; sx < width; sx += 2) {
-                if (((sx ^ sy ^ seed) & 7) == 0)
-                    mvaddch(sy, sx, '*');
-            }
-        }
-        attroff(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
+    draw_star_field(cam, pattern, time_secs, top, bottom, width, rows, cols);
+
+    switch (pattern) {
+    case PATTERN_PULSAR:    overlay_pulsar   (time_secs, top, bottom, width); break;
+    case PATTERN_SUPERNOVA: overlay_supernova(time_secs, top, bottom, width); break;
+    case PATTERN_METEORS:   overlay_meteors  (time_secs, top, bottom, width); break;
+    default: break;
     }
 }
 
-/*
- * screen_draw — clears, draws scene, draws HUD.
- *
- *   row 0 : title (left) + fps/Hz/state/speed (right)
- *   row 1 : pattern + theme + 4-colour palette swatch + camera coords
- *   bottom: key-hint strip (PAIR_HINT, A_BOLD)
- */
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
+/* Draw a 4-tint palette swatch at row 1, col x; returns the next free column. */
+static int draw_swatch(int x, int base_pair, char glyph, int attr)
 {
-    erase();
-    scene_draw(s, sc->cols, sc->rows);
+    for (int i = 0; i < 4; i++) {
+        attron(COLOR_PAIR(base_pair + i) | attr);
+        mvaddch(1, x, (chtype)(unsigned char)glyph);
+        attroff(COLOR_PAIR(base_pair + i) | attr);
+        x++;
+    }
+    return x;
+}
 
-    const char *state_str = s->paused
-                          ? "PAUSED   "
-                          : pattern_name(s->current_pattern);
-
-    /* Row 0 right — primary status. */
+/* Row 0 right — primary status: fps, sim Hz, mode/pause, speed. Right-aligned. */
+static void draw_status_line(const Screen *sc, const Scene *s, double fps, int sim_fps)
+{
+    const char *state_str = s->paused ? "PAUSED   " : pattern_name(s->current_pattern);
     char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  %3d Hz  %s  speed:%-3d ",
+    snprintf(buf, sizeof buf, " %5.1f fps  %3d Hz  %s  speed:%-3d ",
              fps, sim_fps, state_str, s->speed);
     int hx = sc->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
-    /* Row 0 left — title. */
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 1, " STAR FIELD / PARALLAX ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-    /* Row 1 left — pattern, theme, palette swatches, camera. */
+/* Row 1 — pattern (n/N counter), theme, the star + nebula tint swatches, and
+ * the camera position. Fixed left-aligned layout. */
+static void draw_param_line(const Scene *s)
+{
     int x = 1;
+    char pbuf[40];
+    snprintf(pbuf, sizeof pbuf, " pattern:%s %d/%d ",
+             pattern_name(s->current_pattern),
+             (int)s->current_pattern + 1, (int)N_PATTERNS);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " pattern:%-9s ", pattern_name(s->current_pattern));
+    mvprintw(1, x, "%s", pbuf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 20;
+    x += (int)strlen(pbuf);
 
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(1, x, " theme:%-8s ", themes[s->current_theme].name);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     x += 17;
 
+    attron(COLOR_PAIR(PAIR_HUD));  mvprintw(1, x, " stars:");  attroff(COLOR_PAIR(PAIR_HUD));
+    x = draw_swatch(x + 7, PAIR_STAR_BASE, '*', A_BOLD);
+    attron(COLOR_PAIR(PAIR_HUD));  mvprintw(1, x, " neb:");    attroff(COLOR_PAIR(PAIR_HUD));
+    x = draw_swatch(x + 5, PAIR_NEBULA_BASE, '#', A_NORMAL);
+
     attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x, " stars:");
-    attroff(COLOR_PAIR(PAIR_HUD));
-    x += 7;
-    for (int i = 0; i < 4; i++) {
-        int p = PAIR_STAR_BASE + i;
-        attron(COLOR_PAIR(p) | A_BOLD);
-        mvaddch(1, x, '*');
-        attroff(COLOR_PAIR(p) | A_BOLD);
-        x++;
-    }
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x, " neb:");
-    attroff(COLOR_PAIR(PAIR_HUD));
-    x += 5;
-    for (int i = 0; i < 4; i++) {
-        int p = PAIR_NEBULA_BASE + i;
-        attron(COLOR_PAIR(p));
-        mvaddch(1, x, '#');
-        attroff(COLOR_PAIR(p));
-        x++;
-    }
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x,
-             "  cam:(%7.1f,%6.1f)  layers:%d ",
+    mvprintw(1, x, "  cam:(%7.1f,%6.1f)  layers:%d ",
              (double)s->cam.x, (double)s->cam.y, N_LAYERS);
     attroff(COLOR_PAIR(PAIR_HUD));
+}
 
-    /* Bottom hint. */
+/* Bottom row — the key legend. Lists every interactive key (HUD standard). */
+static void draw_hint(const Screen *sc)
+{
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(sc->rows - 1, 0,
              " n/p:pattern  t/T:theme  +/-:speed  ]/[:tickHz  spc:pause  r:reset  q:quit ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
+/*
+ * screen_draw — clear, draw the scene, then lay the HUD over it (status, title,
+ * params, hint).
+ *
+ * The one render function that takes the whole Scene (read-only): the HUD's
+ * concept IS whole-scene status — pattern, theme, speed, camera, run-state. A
+ * const read can't re-couple the layers; scene_draw and the renderers stay narrow.
+ */
+static void screen_draw(const Screen *sc, const Scene *s,
+                        double fps, int sim_fps)
+{
+    erase();
+    scene_draw(&s->cam, s->current_pattern, s->time_secs, sc->cols, sc->rows);
+
+    draw_status_line(sc, s, fps, sim_fps);
+
+    /* Row 0 left — title. */
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, 1, " STAR FIELD / PARALLAX ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    draw_param_line(s);
+    draw_hint(sc);
+}
+
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §8  APP  -- events + per-tick combine + main loop                     */
 /* ===================================================================== */
+
+/* Owns the App aggregate, signal flags, user-event handlers and the main
+ * loop. main() is the ONE place that combines the layers per tick, in fixed
+ * order:  scene_tick (SIM) -> screen_draw (RENDER) -> screen_present -> input.
+ * app_handle_key() / app_do_resize() mutate state on USER EVENTS (a keypress or
+ * SIGWINCH; 'r' also reseeds the noise) and are deliberately OUTSIDE the tick. */
 
 typedef struct {
     Scene                 scene;

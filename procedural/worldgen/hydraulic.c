@@ -15,7 +15,8 @@
  *       slope deepens and a CHANNEL forms. After ~10 seconds the
  *       initial blobby hills have been carved into a recognisable
  *       fluvial landscape: dendritic river networks running down
- *       to broad, silt-filled deltas. Cycle four views with n / p:
+ *       to broad, silt-filled deltas. Cycle fifteen views with n / p;
+ *       the four analytic ones:
  *
  *         TERRAIN    biome map of the current heightmap (deep ocean
  *                    → sea → coast → plains → hills → mountains →
@@ -30,9 +31,14 @@
  *         SLOPE      gradient-magnitude heatmap with arrow glyphs
  *                    pointing downhill (the direction water flows).
  *
+ *       The other eleven (RELIEF, CONTOUR, HYPSO, ASPECT, RIDGES,
+ *       CANYONS, BATHY, PLASMA, NIGHT, FLOW, HEAT) layer hillshading,
+ *       contours, structure detection and animation on the SAME three
+ *       arrays — see the Pattern enum in §1 for a one-line each.
+ *
  *       After ~8 000 droplets the simulation holds for a few
- *       seconds; then a flash, regenerate, and the cycle repeats
- *       on a fresh map.
+ *       seconds, then regenerates on a fresh map and the cycle
+ *       repeats.
  *
  * Study alongside:
  *   ../worldgen/tectonic.c
@@ -45,21 +51,23 @@
  *        in-a-field idea; here the field is the heightmap gradient
  *        rather than a Perlin angle.
  *
- * Section map:
- *   §1 config     — geometry, droplet physics, themes
- *   §2 clock      — monotonic timer + sleep
- *   §3 color      — HUD reserved + 10 themes (8-step ramp + accents)
- *   §5 hydraulic  — hash, perlin/fbm, heightmap gen, droplet sim,
- *                   erode brush, gradient + biome helpers
- *   §6 scene      — phase machine (eroding → holding → regen)
- *   §7 screen     — four pattern renderers + HUD
- *   §8 app        — signals, resize, fixed-step main loop
+ * Section map (re-cut by CONCERN — see ARCHITECTURE block below):
+ *   §1 CONFIG       — constants, data tables, core state types
+ *   §2 PERFORMANCE  — timing primitives (throttle policy lives in main)
+ *   §3 LOGIC        — pure decisions: no mutation, no I/O
+ *   §4 SIMULATION   — advances state (the only writers of sim state)
+ *   §5 EFFECTS      — cosmetic-only state (one-line note: it's woven in)
+ *   §6 DELAYS       — pauses, holds, timers (one-line note: woven in)
+ *   §7 RENDER       — state → screen; reads only, never mutates
+ *   §8 APP          — user events + per-tick combine + main loop
  *
  * Keys:
  *   q / ESC    quit
  *   space      pause / resume
  *   r          regenerate fresh terrain + restart erosion
- *   n / N      next pattern  (TERRAIN → DROPLETS → EROSION → SLOPE)
+ *   n / N      next pattern  (cycles all 15: TERRAIN, DROPLETS,
+ *              EROSION, SLOPE, RELIEF, CONTOUR, HYPSO, ASPECT,
+ *              RIDGES, CANYONS, BATHY, PLASMA, NIGHT, FLOW, HEAT)
  *   p / P      previous pattern
  *   t / T      next / previous theme
  *   + / =      more droplets per tick (faster erosion)
@@ -158,18 +166,38 @@
  *                  of a current CPU. Per-frame render is O(W·H).
  *
  * References     :
+ *
+ *   Erosion algorithm —
  *   • Beyer, H. (2015) — "Implementation of a method for hydraulic
- *     erosion", Bachelor thesis (TU München).
+ *     erosion", Bachelor thesis (TU München). The exact droplet model
+ *     this file implements (capacity, erode/deposit, brush).
  *     https://www.firespark.de/resources/downloads/implementation%20of%20a%20methode%20for%20hydraulic%20erosion.pdf
- *   • Lague, S. (2019) — "Coding Adventure: Hydraulic Erosion"
+ *   • Lague, S. (2019) — "Coding Adventure: Hydraulic Erosion".
+ *     The 20-minute video walkthrough of the same model.
  *     https://www.youtube.com/watch?v=eaXk97ujbPQ
  *   • Mei, X., Decaudin, P., Hu, B-G. (2007) — "Fast Hydraulic
  *     Erosion Simulation and Visualization on GPU", Pacific Graphics.
  *     The grid-based "virtual pipes" alternative.
- *   • Wikipedia — Erosion / Stream power law
- *     https://en.wikipedia.org/wiki/Erosion
- *   • Perlin, K. (2002) — Improving Noise (the fBm scaffold)
+ *   • Perlin, K. (2002) — "Improving Noise" (the fBm scaffold in §5).
  *     https://mrl.cs.nyu.edu/~perlin/paper445.pdf
+ *
+ *   Rendering & cartographic visualization (§7 presets) —
+ *   • Imhof, E. (1982) — "Cartographic Relief Presentation" (ESRI Press
+ *     reprint 2007). The canonical book on hillshading, hypsometric
+ *     tints and contour lines → RELIEF, HYPSO, CONTOUR, FLOW.
+ *   • Horn, B.K.P. (1981) — "Hill Shading and the Reflectance Map",
+ *     Proc. IEEE 69(1):14-47. The Lambert-from-gradient hillshade in
+ *     cell_shade() → RELIEF, CANYONS, BATHY, NIGHT.
+ *     https://doi.org/10.1109/PROC.1981.11918
+ *   • Wilson, J.P. & Gallant, J.C. (2000) — "Terrain Analysis:
+ *     Principles and Applications" (Wiley). Slope, aspect and
+ *     curvature from a DEM → SLOPE, ASPECT, RIDGES.
+ *   • Bourke, P. (1997) — "Character representation of grey scale
+ *     images". The luminance→ASCII density ramp behind ELEV_RAMP.
+ *     http://paulbourke.net/dataformats/asciiart/
+ *   • Vandevenne, L. — "Lode's Computer Graphics Tutorial: Plasma".
+ *     Sum-of-sines colour/height fields → PLASMA, BATHY caustics.
+ *     https://lodev.org/cgtutor/plasma.html
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -332,8 +360,8 @@
  *    Arrow glyphs at every cell point downhill — water flows from
  *    high to low.
  *
- *  • Press 'r'. Flash, regen. The HUD's "droplets" counter resets
- *    to 0; the world is fresh; erosion starts over.
+ *  • Press 'r'. The terrain regenerates: the HUD's "droplets" counter
+ *    resets to 0, the world is fresh, and erosion starts over.
  *
  *  • Run with 'speed' = 64 (much faster); the simulation reaches
  *    8 000 droplets in a couple of seconds and holds. Drop speed to
@@ -358,14 +386,70 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
+ *
+ * This file was re-cut from first principles into separated concern-layers
+ * (a SEPARATION pass: RELOCATE + LABEL only — every function body is
+ * byte-identical to before, nothing renamed). Layer → section → what it
+ * mutates:
+ *
+ *   LAYER        §   MUTATES
+ *   ─────────────────────────────────────────────────────────────────────
+ *   CONFIG       §1  nothing — compile-time constants + const data tables
+ *                    + the Heightmap struct (core state type, relocated up
+ *                    so the pure §3 helpers can see it).
+ *   PERFORMANCE  §2  nothing — clock_ns / clock_sleep_ns are pure timers.
+ *                    The frame cap + fixed-timestep accumulator are POLICY
+ *                    and live in main() (§8), not here.
+ *   LOGIC        §3  nothing — pure reads. Given their args (+ the read-only
+ *                    perm[] / PATTERN_NAMES tables) they return a value with
+ *                    no mutation and no I/O, so no RENDER/EFFECTS reordering
+ *                    can corrupt them: the noise stack, the grid samplers
+ *                    (hidx, h_bilinear, h_at, bed_sample, cell_gradient,
+ *                    cell_shade, cell_laplacian) and the classifiers/mappers
+ *                    (height_to_biome, shade_to_level, sediment_capacity,
+ *                    erosion_complete, brush_weight, flow_arrow, contour_glyph,
+ *                    downhill_sector, pattern_name).
+ *   SIMULATION   §4  Heightmap.{height,initial,water_trail,seed,droplets_done}
+ *                    and perm[]; Scene.{time_secs,hold_countdown}. The ONLY
+ *                    writers of simulation state.
+ *   EFFECTS      §5  (none of its own) — water_trail[] is written/decayed in
+ *                    §4; every other glow is derived at render time. One-line
+ *                    section; not a real layer here.
+ *   DELAYS       §6  (none of its own) — hold_countdown / paused are handled
+ *                    inside scene_tick (§4). One-line section.
+ *   RENDER       §7  ncurses back buffer + colour-pair table only. Reads
+ *                    Scene/Heightmap; never writes simulation state.
+ *   APP          §8  App.{running,need_resize,sim_fps}; drives Scene via the
+ *                    combine + user events.
+ *
+ * PER-TICK COMBINE (the one place state advances — main(), §8):
+ *
+ *     sim_accum += dt                     // PERFORMANCE: bank elapsed time
+ *     run_pending_ticks(...)              //   scene_tick() ×N (SIM+EFFECTS+DELAYS)
+ *     screen_draw() ; screen_present()    // RENDER (reads only)
+ *     getch() → app_handle_key()          // USER EVENTS — see below
+ *
+ * Nothing other than scene_tick() advances simulation state. User events
+ * (app_handle_key / app_do_resize) may mutate Scene/Screen in response to a
+ * keypress or SIGWINCH, but they are NOT part of the tick — they run once
+ * per frame, outside the accumulator loop.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ===================================================================== */
-/* §1  config                                                             */
+/* §1  CONFIG  -- constants, data tables, core state types               */
 /* ===================================================================== */
 
 enum {
     MAP_W_MAX           = 240,
     MAP_H_MAX           =  80,
     CELLS_MAX           = MAP_W_MAX * MAP_H_MAX,
+
+    /* Smallest usable map — floor so a tiny terminal still gets a field. */
+    MAP_W_MIN           =  16,
+    MAP_H_MIN           =   8,
+    HUD_TOP_ROWS        =   2,    /* rows 0–1 reserved for the HUD     */
 
     /* Droplet physics. */
     DROPLET_MAX_STEPS   =  32,
@@ -399,12 +483,19 @@ enum {
     PAIR_HOT            =  11,    /* eroded / convergent accent       */
     PAIR_COLD           =  12,    /* deposited / divergent accent     */
     PAIR_WATER          =  13,    /* live water trail                 */
-    PAIR_FLASH          =  14,    /* regen flash                      */
 };
 
 #define NS_PER_SEC      1000000000LL
 #define NS_PER_MS          1000000LL
 #define TICK_NS(f)      (NS_PER_SEC / (f))
+
+/* Render frame-rate cap (Hz) — the present rate; the SIMULATION rate is
+ * separate (SIM_FPS_*). */
+#define FRAME_CAP_FPS   60
+/* Clamp one frame's dt so a long stall (process suspended, terminal blocked)
+ * can't make the accumulator simulate a huge burst at once — the classic
+ * "spiral of death" guard. */
+#define MAX_FRAME_NS    (100 * NS_PER_MS)
 
 /* Cell aspect — y in noise / gradient sampling is multiplied by this
  * so terrain features look right on terminals where cells are 2x
@@ -428,6 +519,9 @@ enum {
 #define GRAVITY              4.0f
 #define INITIAL_WATER        1.0f
 #define INITIAL_SPEED        1.0f
+/* Below this steering-vector length the droplet has stalled on a flat and
+ * its path ends (avoids a divide-by-~0 when normalising the heading). */
+#define DROPLET_STALL_LEN    1e-4f
 
 /* Water trail decay per tick (DROPLETS pattern). 0.92 → ~30 ticks ≈
  * 0.5 s visible after a single visit. */
@@ -442,7 +536,28 @@ enum {
 /* SLOPE pattern — slope magnitude to ramp-level mapping factor. */
 #define SLOPE_SCALE           18.0f
 
-/* Biome buckets — eight categories from deep ocean to peaks. */
+/* RELIEF / CANYONS / BATHY / NIGHT — Lambert hillshade. Fixed top-left
+ * light; gradient is exaggerated so even gentle relief reads as 3-D. */
+#define RELIEF_LIGHT_X       -0.55f
+#define RELIEF_LIGHT_Y       -0.55f
+#define RELIEF_LIGHT_Z        0.63f
+#define RELIEF_EXAGGERATE     7.0f
+
+/* CONTOUR / FLOW — elevation quantised into this many height bands; a
+ * cell sits on a contour where its band differs from a neighbour. */
+#define CONTOUR_LEVELS        16
+
+/* RIDGES — |Laplacian| above this marks a ridge (peak side) or valley. */
+#define RIDGE_THRESH          0.006f
+
+/* ── Biome ─────────────────────────────────────────────────────────────── *
+ * Eight elevation bands, deep ocean (0) → peaks (7), assigned by
+ * height_to_biome() from fixed thresholds on the [0,1] elevation (≈0.30 sea
+ * level/coast, ≈0.85 snow line). Intent: a single ordinal that DOUBLES AS AN
+ * INDEX — the same biome value offsets into Theme.ramp[], BIOME_GLYPHS[] and
+ * the PAIR_RAMP_BASE colour pairs, so buckets, ramp colours and glyph pairs
+ * always stay aligned. N_BIOMES (8) is therefore the shared length of all
+ * three tables; changing it means re-tuning every one of them. */
 typedef enum {
     BIOME_DEEP_OCEAN = 0,
     BIOME_OCEAN      = 1,
@@ -475,42 +590,57 @@ static const char ELEV_RAMP[N_BIOMES] = {
     '`', '.', ',', ':', '-', '^', '#', '@'
 };
 
-/* Pattern — four ways to render the same heightmap. */
+/* Pattern — fifteen ways to render the same heightmap. The first four
+ * are the original analytic views; the rest layer shading, contours,
+ * structure detection and animation on the same three float arrays. */
 typedef enum {
-    PATTERN_TERRAIN  = 0,
-    PATTERN_DROPLETS = 1,
-    PATTERN_EROSION  = 2,
-    PATTERN_SLOPE    = 3,
-    N_PATTERNS       = 4,
+    PATTERN_TERRAIN  = 0,   /* biome glyph map                         */
+    PATTERN_DROPLETS,       /* live water trails over dim terrain      */
+    PATTERN_EROSION,        /* cut/fill diff vs initial                */
+    PATTERN_SLOPE,          /* gradient magnitude + flow arrows        */
+    PATTERN_RELIEF,         /* colour hillshade — looks 3-D            */
+    PATTERN_CONTOUR,        /* topographic isolines                    */
+    PATTERN_HYPSO,          /* filled hypsometric tint                 */
+    PATTERN_ASPECT,         /* slope-facing compass (8 hues)           */
+    PATTERN_RIDGES,         /* ridge / valley skeleton                 */
+    PATTERN_CANYONS,        /* carved channels glow over shaded land   */
+    PATTERN_BATHY,          /* animated ocean caustics, calm land      */
+    PATTERN_PLASMA,         /* animated colour field over the shape    */
+    PATTERN_NIGHT,          /* dark sea, lit ridges, glowing peaks     */
+    PATTERN_FLOW,           /* contour bands sweeping downhill         */
+    PATTERN_HEAT,           /* two-tone thermal elevation map          */
+    N_PATTERNS,
 } Pattern;
 
-static const char *pattern_name(Pattern p)
-{
-    switch (p) {
-    case PATTERN_TERRAIN:  return "TERRAIN ";
-    case PATTERN_DROPLETS: return "DROPLETS";
-    case PATTERN_EROSION:  return "EROSION ";
-    case PATTERN_SLOPE:    return "SLOPE   ";
-    default:               return "?       ";
-    }
-}
+/* 8-char padded names so the HUD field width stays fixed. */
+static const char *PATTERN_NAMES[N_PATTERNS] = {
+    "TERRAIN ", "DROPLETS", "EROSION ", "SLOPE   ", "RELIEF  ",
+    "CONTOUR ", "HYPSO   ", "ASPECT  ", "RIDGES  ", "CANYONS ",
+    "BATHY   ", "PLASMA  ", "NIGHT   ", "FLOW    ", "HEAT    ",
+};
 
-/*
- * Themes — same 10-name menu as the rest of the procedural showcases.
- * Each theme provides:
- *   ramp[8]  — gradient from deepest/coldest to highest/brightest
- *   hot      — accent for eroded cells (stream cuts) and peaks
- *   cold     — accent for deposited cells (deltas) and water trails
+/* ── Theme ─────────────────────────────────────────────────────────────── *
+ * WHAT  One named colour palette (10 ship; t/T cycles). A theme maps the
+ *       abstract elevation/erosion quantities onto concrete 256-colour codes;
+ *       theme_apply() loads those into ncurses colour pairs. Same 10-name
+ *       menu as the sibling procedural showcases, for muscle memory.
  *
- * All entries are picked from the brighter half of the 256-colour
- * cube so even A_DIM cells stay legible against a default-black
- * terminal.
- */
+ * VALUE LOGIC  ramp[] is a hypsometric tint — a MONOTONIC gradient from the
+ *       deepest/coldest (index 0) to the highest/brightest (7), one entry per
+ *       Biome bucket; renderers index it by biome or by a derived 0..7 level.
+ *       hot/cold are a DIVERGENT accent pair straddling the no-change point:
+ *       hot = eroded cuts & peaks, cold = deposits & water. Every code sits in
+ *       the BRIGHT half of the cube (≥24 / ≥244, per CLAUDE.md "Theme Palette
+ *       Brightness") so even A_DIM cells stay legible on default-black.
+ *
+ * REFS  Hypsometric tinting + divergent relief palettes — Imhof,
+ *       "Cartographic Relief Presentation" (1982). Project palette notes —
+ *       documentation/COLOR.md. */
 typedef struct {
-    const char *name;
-    short       ramp[N_BIOMES];
-    short       hot;
-    short       cold;
+    const char *name;            /* HUD label (t/T cycles)                   */
+    short       ramp[N_BIOMES];  /* hypsometric tint, low→high (256-colour)  */
+    short       hot;             /* divergent accent: cuts / peaks           */
+    short       cold;            /* divergent accent: deposits / water       */
 } Theme;
 
 #define N_THEMES 10
@@ -534,9 +664,60 @@ static const Theme themes[N_THEMES] = {
     { "ARCTIC", { 24,  31,  67, 110, 117, 153, 195, 231 }, 196,  39 },
 };
 
+/* ── Heightmap ─────────────────────────────────────────────────────────── *
+ * WHAT  The terrain under simulation: a w×h grid of scalar elevations, stored
+ *       row-major in flat arrays (cell (x,y) at index y*w+x — always via
+ *       hidx() so the stride is never hand-rolled). It is the single domain
+ *       object — each of the 15 views is just a different READING of these
+ *       arrays — and SIMULATION (§4) is its ONLY writer.
+ *
+ * WHY STRUCT-OF-ARRAYS  One array per quantity (not an array of per-cell
+ *       structs): the hot loops (erode_brush, every renderer) sweep ONE
+ *       quantity at a time, so contiguous height[] / initial[] keep the cache
+ *       warm. Sizes are static (CELLS_MAX) — nothing is malloc'd on the hot
+ *       path (project "Memory Allocation" rule).
+ *
+ * REFS  Droplet erosion model — Beyer, "Implementation of a method for
+ *       hydraulic erosion" (TU München, 2015); Lague, "Coding Adventure:
+ *       Hydraulic Erosion" (2019). Base terrain — Perlin fBm (Perlin,
+ *       "Improving Noise", 2002). Full citations in the file-header block. */
+typedef struct {
+    /* ── grid extent (cells); clamped to ≤ MAP_W_MAX × MAP_H_MAX at layout ─ */
+    int    w, h;
+
+    /* ── elevation: TWO snapshots, both [0,1] (fBm output, gamma-sharpened) ─
+     * height[] is mutated as droplets cut and fill; initial[] is the frozen
+     * pre-erosion copy taken at generation. Keeping both lets render_erosion /
+     * canyons / deltas show the SIGNED difference (height − initial) as a
+     * cut(−)/fill(+) map — the actual subject of an erosion demo, not just the
+     * terrain. EROSION_THRESH_LOW/HIGH pick where that diff starts colouring. */
+    float  height     [CELLS_MAX];   /* current eroded elevation [0,1]   */
+    float  initial    [CELLS_MAX];   /* pre-erosion copy (for cut/fill)  */
+
+    /* ── cosmetic EFFECTS overlay (§5) — NOT physics ──────────────────────
+     * Stamped to 1.0 by droplet_simulate() at each visited cell, then decayed
+     * ×WATER_TRAIL_DECAY (0.92) per tick → a fading "a droplet just passed
+     * here" glow (~30 ticks ≈ 0.5 s). Read ONLY by render_droplets; deleting
+     * it changes no elevation. WATER_TRAIL_HIGH/MID slice it into brightness
+     * tiers. */
+    float  water_trail[CELLS_MAX];   /* decaying recent-visit indicator  */
+
+    /* ── this generation's erosion run ────────────────────────────────────
+     * seed selects which fBm terrain (feeds perm_shuffle, re-hashed from the
+     * clock at each regen so worlds differ). droplets_done counts particles
+     * simulated and drives the phase machine: < DROPLETS_PER_GEN = ERODING,
+     * == = SETTLED → arm HOLD (see Scene.hold_countdown / §4 scene_tick). */
+    int    seed;                     /* which terrain (fBm permutation)  */
+    int    droplets_done;            /* run progress [0 .. DROPLETS_PER_GEN] */
+} Heightmap;
+
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  PERFORMANCE  -- timing primitives (throttle policy in main, §8)   */
 /* ===================================================================== */
+
+/* Timing primitives only. The 60 fps frame cap and the fixed-timestep
+ * accumulator that decides how many scene_tick()s run per frame are
+ * POLICY -- they live in main() (§8), the single per-tick combine point. */
 
 static int64_t clock_ns(void)
 {
@@ -556,51 +737,20 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  LOGIC  -- pure decisions: no mutation, no I/O                     */
 /* ===================================================================== */
 
-static void theme_apply(int idx)
+/* Every function below is a pure read: it takes its inputs as parameters
+ * (or the read-only perm[] / PATTERN_NAMES tables) and returns a value
+ * with NO mutation and NO I/O. Deleting or reordering any RENDER / EFFECTS
+ * code cannot change what these return -- corruption-proof by construction.
+ * Shared by SIMULATION (§4) and RENDER (§7). */
+
+static const char *pattern_name(Pattern p)
 {
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        for (int i = 0; i < N_BIOMES; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
-        init_pair(PAIR_HOT,   t->hot,    -1);
-        init_pair(PAIR_COLD,  t->cold,   -1);
-        init_pair(PAIR_WATER, 51, -1);          /* bright cyan      */
-    } else {
-        static const short fb[N_BIOMES] = {
-            COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,   COLOR_GREEN,
-            COLOR_GREEN, COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE,
-        };
-        for (int i = 0; i < N_BIOMES; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), fb[i], -1);
-        init_pair(PAIR_HOT,   COLOR_RED,  -1);
-        init_pair(PAIR_COLD,  COLOR_BLUE, -1);
-        init_pair(PAIR_WATER, COLOR_CYAN, -1);
-    }
+    return ((int)p >= 0 && (int)p < N_PATTERNS) ? PATTERN_NAMES[p]
+                                                : "?       ";
 }
-
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,   226, -1);
-        init_pair(PAIR_HINT,   51, -1);
-        init_pair(PAIR_FLASH, 226, -1);
-    } else {
-        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
-        init_pair(PAIR_FLASH, COLOR_YELLOW, -1);
-    }
-    theme_apply(0);
-}
-
-/* ===================================================================== */
-/* §5  hydraulic — hash, perlin/fbm, heightmap, droplet sim               */
-/* ===================================================================== */
 
 /* hash3 — same as other showcases. */
 static inline uint32_t hash3(int wx, int wy, int wz)
@@ -618,22 +768,6 @@ static inline uint32_t hash3(int wx, int wy, int wz)
 
 /* Perlin scaffold — copied inline per the self-contained-file rule. */
 static uint8_t perm[512];
-
-static void perm_shuffle(int seed)
-{
-    uint8_t base[256];
-    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
-    uint32_t st = (uint32_t)seed * 2654435761u;
-    for (int i = 255; i > 0; i--) {
-        st = st * 1664525u + 1013904223u;
-        int j = (int)(st >> 16) % (i + 1);
-        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
-    }
-    for (int i = 0; i < 256; i++) {
-        perm[i      ] = base[i];
-        perm[i + 256] = base[i];
-    }
-}
 
 static inline float fade_q(float t)
 {
@@ -675,45 +809,7 @@ static float fbm2(float x, float y)
     return (total / max_amp) * 0.5f + 0.5f;     /* → [0, 1] */
 }
 
-/* ----------------------------------------------------------------------- *
- * Heightmap — three flat float arrays.                                    *
- * ----------------------------------------------------------------------- */
-
-typedef struct {
-    int    w, h;
-    float  height     [CELLS_MAX];   /* current eroded heightmap        */
-    float  initial    [CELLS_MAX];   /* pre-erosion copy (for diff)     */
-    float  water_trail[CELLS_MAX];   /* decaying recent-visit indicator */
-    int    seed;
-    int    droplets_done;            /* progress this generation        */
-} Heightmap;
-
 static inline int hidx(const Heightmap *hm, int x, int y) { return y * hm->w + x; }
-
-/*
- * heightmap_generate — sample fBm noise into height + initial, zero
- * out water_trail. Aspect-corrected y so blob features look round
- * on screen.
- */
-static void heightmap_generate(Heightmap *hm, int seed)
-{
-    hm->seed = seed;
-    hm->droplets_done = 0;
-    perm_shuffle(seed);
-
-    for (int y = 0; y < hm->h; y++) {
-        for (int x = 0; x < hm->w; x++) {
-            float nx = (float)x * FBM_SCALE_X;
-            float ny = (float)y * FBM_SCALE_Y;
-            float n  = fbm2(nx, ny);
-            n = powf(n, FBM_GAMMA);                /* sharpen highs */
-            int idx = hidx(hm, x, y);
-            hm->height[idx]      = n;
-            hm->initial[idx]     = n;
-            hm->water_trail[idx] = 0.0f;
-        }
-    }
-}
 
 /* Bilinear height sample at fractional (x, y). Caller must guarantee
  * 0 ≤ xi+1 < w and 0 ≤ yi+1 < h — we don't bounds-check here because
@@ -731,145 +827,13 @@ static inline float h_bilinear(const Heightmap *hm, float x, float y)
          + (h01 * (1.0f - fx) + h11 * fx) * fy;
 }
 
-/* ----------------------------------------------------------------------- *
- * Erosion brush — disc-weighted height subtract.                          *
- * ----------------------------------------------------------------------- */
-
-static void erode_brush(Heightmap *hm, float fx, float fy, float amount)
+/* Height at an integer cell with edges clamped — for contour / ridge
+ * renderers that sample neighbours right at the map border. */
+static inline float h_at(const Heightmap *hm, int x, int y)
 {
-    int cx = (int)fx, cy = (int)fy;
-    float total_w = 0.0f;
-
-    /* First pass — sum weights inside the disc. */
-    for (int dy = -EROSION_BRUSH_R; dy <= EROSION_BRUSH_R; dy++) {
-        for (int dx = -EROSION_BRUSH_R; dx <= EROSION_BRUSH_R; dx++) {
-            float d = sqrtf((float)(dx * dx + dy * dy));
-            if (d > (float)EROSION_BRUSH_R) continue;
-            total_w += 1.0f - d / (float)EROSION_BRUSH_R;
-        }
-    }
-    if (total_w < 1e-6f) return;
-
-    /* Second pass — subtract weighted amount from each disc cell. */
-    for (int dy = -EROSION_BRUSH_R; dy <= EROSION_BRUSH_R; dy++) {
-        int ny = cy + dy;
-        if (ny < 0 || ny >= hm->h) continue;
-        for (int dx = -EROSION_BRUSH_R; dx <= EROSION_BRUSH_R; dx++) {
-            int nx = cx + dx;
-            if (nx < 0 || nx >= hm->w) continue;
-            float d = sqrtf((float)(dx * dx + dy * dy));
-            if (d > (float)EROSION_BRUSH_R) continue;
-            float w = 1.0f - d / (float)EROSION_BRUSH_R;
-            hm->height[hidx(hm, nx, ny)] -= amount * w / total_w;
-        }
-    }
-}
-
-/* ----------------------------------------------------------------------- *
- * Droplet — particle-based erosion.                                       *
- * ----------------------------------------------------------------------- */
-
-typedef struct {
-    float x, y;
-    float dx, dy;
-    float speed;
-    float water;
-    float sediment;
-} Droplet;
-
-static void droplet_simulate(Heightmap *hm, Droplet *d)
-{
-    for (int step = 0; step < DROPLET_MAX_STEPS; step++) {
-        int xi = (int)d->x, yi = (int)d->y;
-        if (xi < 0 || xi >= hm->w - 1 || yi < 0 || yi >= hm->h - 1) return;
-
-        /* Stamp a water trail at the visited cell. */
-        hm->water_trail[hidx(hm, xi, yi)] = 1.0f;
-
-        /* Bilinear gradient. */
-        float fx = d->x - (float)xi, fy = d->y - (float)yi;
-        int idx = hidx(hm, xi, yi);
-        float h00 = hm->height[idx];
-        float h10 = hm->height[idx + 1];
-        float h01 = hm->height[idx + hm->w];
-        float h11 = hm->height[idx + hm->w + 1];
-        float gx  = (h10 - h00) * (1.0f - fy) + (h11 - h01) * fy;
-        float gy  = (h01 - h00) * (1.0f - fx) + (h11 - h10) * fx;
-
-        /* Steering — keep some inertia, blend in -gradient. */
-        d->dx = d->dx * INERTIA - gx * (1.0f - INERTIA);
-        d->dy = d->dy * INERTIA - gy * (1.0f - INERTIA);
-
-        /* Normalise to unit step length. */
-        float len = sqrtf(d->dx * d->dx + d->dy * d->dy);
-        if (len < 1e-4f) return;
-        d->dx /= len; d->dy /= len;
-
-        float new_x = d->x + d->dx;
-        float new_y = d->y + d->dy;
-
-        int new_xi = (int)new_x, new_yi = (int)new_y;
-        if (new_xi < 0 || new_xi >= hm->w - 1 ||
-            new_yi < 0 || new_yi >= hm->h - 1) return;
-
-        float old_h = h00 * (1 - fx) * (1 - fy) + h10 * fx * (1 - fy)
-                    + h01 * (1 - fx) *      fy  + h11 * fx *      fy;
-        float new_h = h_bilinear(hm, new_x, new_y);
-        float dh    = new_h - old_h;
-
-        /* Carrying capacity. */
-        float cap = (-dh) * d->speed * d->water * SEDIMENT_CAPACITY_K;
-        if (cap < MIN_CAPACITY) cap = MIN_CAPACITY;
-
-        if (d->sediment > cap || dh > 0.0f) {
-            /* DEPOSIT.
-             * - Going uphill (dh > 0): drop ≤ dh worth of sediment to
-             *   fill the rise.
-             * - Going downhill but oversaturated: shed (sed - cap)·rate. */
-            float amount;
-            if (dh > 0.0f) {
-                amount = (dh < d->sediment) ? dh : d->sediment;
-            } else {
-                amount = (d->sediment - cap) * DEPOSIT_RATE;
-            }
-            d->sediment -= amount;
-
-            /* Bilinear deposit at the four-corner footprint. */
-            hm->height[idx]              += amount * (1.0f - fx) * (1.0f - fy);
-            hm->height[idx + 1]          += amount *         fx  * (1.0f - fy);
-            hm->height[idx + hm->w]      += amount * (1.0f - fx) *         fy;
-            hm->height[idx + hm->w + 1]  += amount *         fx  *         fy;
-        } else {
-            /* ERODE — disc-weighted, capped at |dh|. */
-            float wanted = (cap - d->sediment) * ERODE_RATE;
-            float amount = (wanted < -dh) ? wanted : -dh;
-            erode_brush(hm, d->x, d->y, amount);
-            d->sediment += amount;
-        }
-
-        /* Energetics. */
-        float v_sq = d->speed * d->speed - dh * GRAVITY;
-        d->speed = (v_sq > 0.0f) ? sqrtf(v_sq) : 0.0f;
-        d->water *= (1.0f - EVAPORATE_RATE);
-
-        d->x = new_x;
-        d->y = new_y;
-    }
-}
-
-/*
- * droplet_spawn — pick a random in-bounds cell and initialise. Uses
- * rand() so different droplets land in different places (rand() is
- * srand()-seeded once in main from the wall clock).
- */
-static void droplet_spawn(Droplet *d, int w, int h)
-{
-    d->x = 1.0f + (float)(rand() % (w - 2));
-    d->y = 1.0f + (float)(rand() % (h - 2));
-    d->dx = 0.0f;  d->dy = 0.0f;
-    d->speed    = INITIAL_SPEED;
-    d->water    = INITIAL_WATER;
-    d->sediment = 0.0f;
+    if (x < 0) x = 0; else if (x >= hm->w) x = hm->w - 1;
+    if (y < 0) y = 0; else if (y >= hm->h) y = hm->h - 1;
+    return hm->height[hidx(hm, x, y)];
 }
 
 /* ----------------------------------------------------------------------- *
@@ -903,19 +867,360 @@ static inline void cell_gradient(const Heightmap *hm, int x, int y,
     *gy = (hm->height[hidx(hm, x, yp)] - hm->height[hidx(hm, x, ym)]) * 0.5f / ASPECT_Y_F;
 }
 
+/* Lambert hillshade in [0, 1]: surface normal (−gx, −gy, 1) dotted with
+ * a fixed top-left light. Gradient is exaggerated first so subtle relief
+ * still casts visible shading. Shared by RELIEF/CANYONS/BATHY/NIGHT. */
+static inline float cell_shade(const Heightmap *hm, int x, int y)
+{
+    float gx, gy;
+    cell_gradient(hm, x, y, &gx, &gy);
+    gx *= RELIEF_EXAGGERATE;
+    gy *= RELIEF_EXAGGERATE;
+    float inv = 1.0f / sqrtf(gx * gx + gy * gy + 1.0f);
+    float s = (-gx * RELIEF_LIGHT_X - gy * RELIEF_LIGHT_Y
+               + RELIEF_LIGHT_Z) * inv;
+    if (s < 0.0f) s = 0.0f;
+    if (s > 1.0f) s = 1.0f;
+    return s;
+}
+
+/* Shade level 0..7 from a Lambert value — index into ELEV_RAMP. */
+static inline int shade_to_level(float sh)
+{
+    int l = (int)(sh * 7.0f + 0.5f);
+    return l < 0 ? 0 : l > 7 ? 7 : l;
+}
+
+/* Disc-falloff weight of a brush cell at offset (dx,dy): 1 at the centre,
+ * linearly to 0 at radius EROSION_BRUSH_R, exactly 0 outside. The erosion
+ * brush spreads a droplet's bite over this disc so cuts aren't single-cell
+ * spikes (Beyer 2015, "radius" brush). */
+static inline float brush_weight(int dx, int dy)
+{
+    float d = sqrtf((float)(dx * dx + dy * dy));
+    return (d > (float)EROSION_BRUSH_R) ? 0.0f
+                                        : 1.0f - d / (float)EROSION_BRUSH_R;
+}
+
+/* Sediment carrying capacity of a droplet on a step of height change dh<0
+ * (descending). Proportional to drop steepness × speed × water (Lague 2019;
+ * Beyer 2015, eq. "c = ..."), floored at MIN_CAPACITY so a near-flat step
+ * still lets a trickle of erosion happen. */
+static inline float sediment_capacity(float dh, float speed, float water)
+{
+    float cap = (-dh) * speed * water * SEDIMENT_CAPACITY_K;
+    return (cap < MIN_CAPACITY) ? MIN_CAPACITY : cap;
+}
+
+/* Sample the bed directly under a droplet at fractional (x,y): returns the
+ * bilinearly interpolated height and writes the bilinear forward-difference
+ * slope into (*gx,*gy). One read shared by steering and the dh calculation,
+ * so both see exactly the same four corners. Caller guarantees xi+1,yi+1 are
+ * in range (droplet_simulate bounds-checks each step). */
+static inline float bed_sample(const Heightmap *hm, float x, float y,
+                               float *gx, float *gy)
+{
+    int xi = (int)x, yi = (int)y;
+    float fx = x - (float)xi, fy = y - (float)yi;
+    int idx = hidx(hm, xi, yi);
+    float h00 = hm->height[idx];
+    float h10 = hm->height[idx + 1];
+    float h01 = hm->height[idx + hm->w];
+    float h11 = hm->height[idx + hm->w + 1];
+    *gx = (h10 - h00) * (1.0f - fy) + (h11 - h01) * fy;
+    *gy = (h01 - h00) * (1.0f - fx) + (h11 - h10) * fx;
+    return h00 * (1 - fx) * (1 - fy) + h10 * fx * (1 - fy)
+         + h01 * (1 - fx) *      fy  + h11 * fx *      fy;
+}
+
+/* True once this generation has spent its whole droplet budget — the
+ * ERODING → SETTLED transition of the scene phase machine. */
+static inline bool erosion_complete(const Heightmap *hm)
+{
+    return hm->droplets_done >= DROPLETS_PER_GEN;
+}
+
+/* Downhill flow arrow for a cell: the gradient points UPHILL, so water flows
+ * the opposite way — pick the cardinal arrow of −gradient. Shared by the
+ * SLOPE and CANYONS views. */
+static inline char flow_arrow(float gx, float gy)
+{
+    if (fabsf(gx) > fabsf(gy)) return (gx > 0) ? '<' : '>';
+    else                       return (gy > 0) ? '^' : 'v';
+}
+
+/* Contour-line glyph for a cell: an isoline runs PERPENDICULAR to the
+ * gradient, so a mostly-horizontal gradient draws a vertical bar and vice
+ * versa, with diagonals in between. Shared by the CONTOUR and FLOW views. */
+static inline char contour_glyph(float gx, float gy)
+{
+    if      (fabsf(gx) > 2.0f * fabsf(gy)) return '|';
+    else if (fabsf(gy) > 2.0f * fabsf(gx)) return '-';
+    else    return (gx * gy > 0.0f) ? '\\' : '/';
+}
+
+/* Which of 8 compass sectors the downhill direction (−gradient) falls in,
+ * 0..7 starting at east and turning CCW. Used by the ASPECT view to colour
+ * and arrow each cell by the way its slope faces. */
+static inline int downhill_sector(float gx, float gy)
+{
+    float ang = atan2f(-gy, -gx);
+    return (int)floorf((ang + (float)M_PI) / (2.0f * (float)M_PI) * 8.0f) & 7;
+}
+
+/* Discrete Laplacian (∇²) at a cell — the 4-neighbour curvature of the
+ * height field. Strongly negative = a convex ridge crest, strongly positive
+ * = a concave valley floor. Used by the RIDGES view. */
+static inline float cell_laplacian(const Heightmap *hm, int x, int y)
+{
+    return h_at(hm, x - 1, y) + h_at(hm, x + 1, y)
+         + h_at(hm, x, y - 1) + h_at(hm, x, y + 1) - 4.0f * h_at(hm, x, y);
+}
+
 /* ===================================================================== */
-/* §6  scene                                                              */
+/* §4  SIMULATION  -- advances state (only writers of sim state)         */
 /* ===================================================================== */
 
+/* The ONLY writers of simulation state. Mutates: Heightmap.height[],
+ * .initial[], .water_trail[], .seed, .droplets_done (and perm[] via
+ * perm_shuffle); Scene.time_secs, .hold_countdown. scene_tick() is the
+ * single per-tick entry point, called only from main (§8). User events
+ * (key / resize) also mutate Scene but are NOT part of the tick -- see §8. */
+
+static void perm_shuffle(int seed)
+{
+    uint8_t base[256];
+    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
+    uint32_t st = (uint32_t)seed * 2654435761u;
+    for (int i = 255; i > 0; i--) {
+        st = st * 1664525u + 1013904223u;
+        int j = (int)(st >> 16) % (i + 1);
+        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
+    }
+    for (int i = 0; i < 256; i++) {
+        perm[i      ] = base[i];
+        perm[i + 256] = base[i];
+    }
+}
+
+/*
+ * heightmap_generate — sample fBm noise into height + initial, zero
+ * out water_trail. Aspect-corrected y so blob features look round
+ * on screen.
+ */
+static void heightmap_generate(Heightmap *hm, int seed)
+{
+    hm->seed = seed;
+    hm->droplets_done = 0;
+    perm_shuffle(seed);
+
+    for (int y = 0; y < hm->h; y++) {
+        for (int x = 0; x < hm->w; x++) {
+            float nx = (float)x * FBM_SCALE_X;
+            float ny = (float)y * FBM_SCALE_Y;
+            float n  = fbm2(nx, ny);
+            n = powf(n, FBM_GAMMA);                /* sharpen highs */
+            int idx = hidx(hm, x, y);
+            hm->height[idx]      = n;
+            hm->initial[idx]     = n;
+            hm->water_trail[idx] = 0.0f;
+        }
+    }
+}
+
+/* ----------------------------------------------------------------------- *
+ * Erosion brush — disc-weighted height subtract.                          *
+ * ----------------------------------------------------------------------- */
+
+static void erode_brush(Heightmap *hm, float fx, float fy, float amount)
+{
+    int cx = (int)fx, cy = (int)fy;
+
+    /* First pass — total disc weight, so the bite is normalised to `amount`
+     * regardless of how much of the disc is clipped at the map edge. */
+    float total_w = 0.0f;
+    for (int dy = -EROSION_BRUSH_R; dy <= EROSION_BRUSH_R; dy++)
+        for (int dx = -EROSION_BRUSH_R; dx <= EROSION_BRUSH_R; dx++)
+            total_w += brush_weight(dx, dy);
+    if (total_w < 1e-6f) return;
+
+    /* Second pass — subtract each in-bounds cell's share of `amount`. */
+    for (int dy = -EROSION_BRUSH_R; dy <= EROSION_BRUSH_R; dy++) {
+        int ny = cy + dy;
+        if (ny < 0 || ny >= hm->h) continue;
+        for (int dx = -EROSION_BRUSH_R; dx <= EROSION_BRUSH_R; dx++) {
+            int nx = cx + dx;
+            if (nx < 0 || nx >= hm->w) continue;
+            float w = brush_weight(dx, dy);
+            hm->height[hidx(hm, nx, ny)] -= amount * w / total_w;
+        }
+    }
+}
+
+/* ── Droplet ───────────────────────────────────────────────────────────── *
+ * WHAT  One water particle in particle-based ("droplet") hydraulic erosion.
+ *       The sim never carves rivers directly: it drops thousands of these and
+ *       lets each trace a downhill path, eroding the bed where it accelerates
+ *       and depositing where it slows or oversaturates. Stream networks EMERGE
+ *       as the sum of many paths — no river is ever drawn deliberately.
+ *
+ * LIFETIME  Stack-local, never stored: spawned (droplet_spawn), walked for
+ *       ≤ DROPLET_MAX_STEPS (32) steps (droplet_simulate), discarded. Its only
+ *       lasting trace is the height[] it edited and the water_trail[] it lit.
+ *
+ * REFS  Heading + carrying-capacity model — Beyer (2015, "The droplet");
+ *       Lague (2019). Tuning constants in §1 (INERTIA, SEDIMENT_CAPACITY_K,
+ *       MIN_CAPACITY, ERODE_RATE, DEPOSIT_RATE, EVAPORATE_RATE, GRAVITY). */
 typedef struct {
+    /* ── where it is / where it's heading ─────────────────────────────────
+     * (x,y) is a FRACTIONAL position in cell space (bilinearly sampled, never
+     * snapped to a cell). (dx,dy) is the heading, renormalised to unit length
+     * each step: dx = dx·INERTIA − gx·(1−INERTIA). With INERTIA = 0.05 it is
+     * ~95% downhill −gradient + 5% memory — enough momentum to cross flats
+     * without jittering, not enough to climb. */
+    float x, y;          /* position in cell space          */
+    float dx, dy;        /* unit heading (steered downhill) */
+
+    /* ── the load it transports ───────────────────────────────────────────
+     * Carrying capacity each step:  cap = max(−dh · speed · water ·
+     * SEDIMENT_CAPACITY_K, MIN_CAPACITY).  sediment < cap on a descent →
+     * ERODE (take min(cap−sediment)·ERODE_RATE, −dh); sediment > cap or going
+     * uphill → DEPOSIT. speed grows on descents (v² += −dh·GRAVITY), boosting
+     * capacity; water starts at INITIAL_WATER and decays ×(1−EVAPORATE_RATE)
+     * each step, steadily shrinking capacity so the droplet must finally drop
+     * its load. */
+    float speed;         /* kinetic energy → carrying capacity */
+    float water;         /* evaporates along the path          */
+    float sediment;      /* mass currently suspended           */
+} Droplet;
+
+/* Drop `amount` of sediment back onto the bed under a droplet at fractional
+ * (x,y), bilinearly split across the four corner cells — the inverse of the
+ * brush bite, so a slowing droplet lays its load down smoothly. */
+static void deposit_sediment(Heightmap *hm, float x, float y, float amount)
+{
+    int xi = (int)x, yi = (int)y;
+    float fx = x - (float)xi, fy = y - (float)yi;
+    int idx = hidx(hm, xi, yi);
+    hm->height[idx]              += amount * (1.0f - fx) * (1.0f - fy);
+    hm->height[idx + 1]          += amount *         fx  * (1.0f - fy);
+    hm->height[idx + hm->w]      += amount * (1.0f - fx) *         fy;
+    hm->height[idx + hm->w + 1]  += amount *         fx  *         fy;
+}
+
+/* Walk one droplet across the bed for up to DROPLET_MAX_STEPS, eroding and
+ * depositing as it goes. Reads top-to-bottom as the per-step algorithm; the
+ * physics of each step lives in the named helpers (bed_sample,
+ * sediment_capacity, erode_brush, deposit_sediment). */
+static void droplet_simulate(Heightmap *hm, Droplet *d)
+{
+    for (int step = 0; step < DROPLET_MAX_STEPS; step++) {
+        /* Stop if the droplet (or its next cell) would leave the grid. */
+        int xi = (int)d->x, yi = (int)d->y;
+        if (xi < 0 || xi >= hm->w - 1 || yi < 0 || yi >= hm->h - 1) return;
+
+        /* Mark the visited cell for the cosmetic water trail (§5). */
+        hm->water_trail[hidx(hm, xi, yi)] = 1.0f;
+
+        /* Sample the bed here: height under the droplet + downhill slope. */
+        float gx, gy;
+        float old_h = bed_sample(hm, d->x, d->y, &gx, &gy);
+
+        /* Steer: blend old heading with −gradient (INERTIA), renormalise. */
+        d->dx = d->dx * INERTIA - gx * (1.0f - INERTIA);
+        d->dy = d->dy * INERTIA - gy * (1.0f - INERTIA);
+        float len = sqrtf(d->dx * d->dx + d->dy * d->dy);
+        if (len < DROPLET_STALL_LEN) return;        /* stalled on a flat */
+        d->dx /= len; d->dy /= len;
+
+        /* Take a unit step; stop if it lands off-grid. */
+        float new_x = d->x + d->dx;
+        float new_y = d->y + d->dy;
+        int new_xi = (int)new_x, new_yi = (int)new_y;
+        if (new_xi < 0 || new_xi >= hm->w - 1 ||
+            new_yi < 0 || new_yi >= hm->h - 1) return;
+
+        /* Height change over the step decides erode vs deposit. */
+        float dh  = h_bilinear(hm, new_x, new_y) - old_h;
+        float cap = sediment_capacity(dh, d->speed, d->water);
+
+        if (d->sediment > cap || dh > 0.0f) {
+            /* DEPOSIT: fill an uphill rise (≤ dh), or shed the excess above
+             * capacity at DEPOSIT_RATE. */
+            float amount = (dh > 0.0f)
+                         ? (dh < d->sediment ? dh : d->sediment)
+                         : (d->sediment - cap) * DEPOSIT_RATE;
+            d->sediment -= amount;
+            deposit_sediment(hm, d->x, d->y, amount);
+        } else {
+            /* ERODE: take the capacity deficit at ERODE_RATE, capped at the
+             * drop so the brush never digs below the step it is descending. */
+            float wanted = (cap - d->sediment) * ERODE_RATE;
+            float amount = (wanted < -dh) ? wanted : -dh;
+            erode_brush(hm, d->x, d->y, amount);
+            d->sediment += amount;
+        }
+
+        /* Energetics: speed gains kinetic energy on descents, water evaporates. */
+        float v_sq = d->speed * d->speed - dh * GRAVITY;
+        d->speed = (v_sq > 0.0f) ? sqrtf(v_sq) : 0.0f;
+        d->water *= (1.0f - EVAPORATE_RATE);
+
+        d->x = new_x;
+        d->y = new_y;
+    }
+}
+
+/*
+ * droplet_spawn — pick a random in-bounds cell and initialise. Uses
+ * rand() so different droplets land in different places (rand() is
+ * srand()-seeded once in main from the wall clock).
+ */
+static void droplet_spawn(Droplet *d, int w, int h)
+{
+    d->x = 1.0f + (float)(rand() % (w - 2));
+    d->y = 1.0f + (float)(rand() % (h - 2));
+    d->dx = 0.0f;  d->dy = 0.0f;
+    d->speed    = INITIAL_SPEED;
+    d->water    = INITIAL_WATER;
+    d->sediment = 0.0f;
+}
+
+/* ── Scene ─────────────────────────────────────────────────────────────── *
+ * WHAT  The whole simulated-and-shown world: one eroding Heightmap plus the
+ *       few knobs and clocks that drive and time it. Reads top-to-bottom like
+ *       a table of contents (WHAT / HOW / view / WHEN). The loose scalars are
+ *       each too thin to deserve their own type, so they live here grouped by
+ *       the CONCEPT they belong to — not by which key toggles them (a colour
+ *       theme is a RENDER concept even though a key flips it, NOT a sim knob).
+ *
+ * PHASE MACHINE  hm.droplets_done + hold_countdown encode a 3-state cycle, run
+ *       once per tick by scene_tick(): ERODING (spawn droplets) → SETTLED
+ *       (budget reached → arm HOLD) → HOLDING (count down) → regenerate. This
+ *       is why the two counters live one level apart: progress is a property
+ *       of the terrain (Heightmap), the hold timer is a property of the run. */
+typedef struct {
+    /* WHAT is simulated — the domain object. */
     Heightmap hm;
-    bool      paused;
-    int       speed;
-    int       current_theme;
-    Pattern   current_pattern;
-    float     time_secs;
-    float     flash_t;
-    int       hold_countdown;     /* set when budget reached, counts to 0 */
+
+    /* HOW the user drives it — the one tunable simulation knob.
+     * Spawn rate = DROPLETS_PER_TICK_DEF · speed / SPEED_DEF (clamped ≥ 1);
+     * speed ∈ [SPEED_MIN..SPEED_MAX] = 1..64, doubled/halved by +/−. Trades
+     * watchability (speed 1: follow one trail) for throughput (speed 64). */
+    int       speed;            /* droplets spawned per tick (scaled)        */
+
+    /* WHAT we are looking at — render selections (RENDER, not simulation).
+     * Changing either never touches physics: same heightmap, different read. */
+    Pattern   current_pattern;  /* which of the 15 views is drawn (n/p)      */
+    int       current_theme;    /* index into themes[] (t/T), 0..N_THEMES-1  */
+
+    /* WHEN we are — run clock + state (the DELAYS concept, §6, woven into §4).
+     * time_secs accumulates dt every tick: it both phases all animated views
+     * and is hashed into the next seed at regen, so each world differs.
+     * hold_countdown is armed to HOLD_TICKS (~6 s) when erosion completes. */
+    float     time_secs;        /* simulated seconds; animation + reseed     */
+    int       hold_countdown;   /* ticks left in the post-erosion HOLD       */
+    bool      paused;           /* simulation frozen; rendering continues    */
 } Scene;
 
 static void scene_rebuild(Scene *s)
@@ -924,7 +1229,6 @@ static void scene_rebuild(Scene *s)
                           s->hm.w, s->hm.h ^ 0x9E3779B9);
     heightmap_generate(&s->hm, seed);
     s->hold_countdown = 0;
-    s->flash_t        = 1.0f;
 }
 
 static void scene_init(Scene *s, int map_w, int map_h)
@@ -946,64 +1250,144 @@ static void scene_resize_to(Scene *s, int map_w, int map_h)
     scene_rebuild(s);
 }
 
-/*
- * scene_tick — three phases per generation:
- *   ERODING  : droplets_done < DROPLETS_PER_GEN. Each tick:
- *              decay water_trail, then run K droplets.
- *   COMPLETE : droplets_done == budget. Decay continues; arm hold.
- *   HOLDING  : count down. When 0, regenerate.
- *
- * Speed knob scales droplets-per-tick linearly. With SPEED_DEF=8 →
- * 12 per tick → 720/sec → ~11 s to reach 8 000.
- */
+/* Fade every cell's water trail one tick toward zero (EFFECTS, §5). Runs
+ * whether or not we are still eroding, so trails keep decaying after the
+ * last droplet lands. */
+static void decay_water_trails(Heightmap *hm)
+{
+    int total = hm->w * hm->h;
+    for (int i = 0; i < total; i++)
+        hm->water_trail[i] *= WATER_TRAIL_DECAY;
+}
+
+/* Spawn and run one tick's worth of droplets. Count scales linearly with the
+ * speed knob (SPEED_DEF=8 → 12/tick → ~720/s → ~11 s to spend the budget),
+ * and the loop also stops the instant the per-generation budget is hit. */
+static void run_erosion_batch(Heightmap *hm, int speed)
+{
+    int per_tick = DROPLETS_PER_TICK_DEF * speed / SPEED_DEF;
+    if (per_tick < 1) per_tick = 1;
+    for (int i = 0; i < per_tick && !erosion_complete(hm); i++) {
+        Droplet d;
+        droplet_spawn(&d, hm->w, hm->h);
+        droplet_simulate(hm, &d);
+        hm->droplets_done++;
+    }
+}
+
+/* One simulation step = the scene phase machine (§6 DELAYS woven in):
+ *   ERODING  → spawn a batch; when the budget is spent, arm the HOLD.
+ *   HOLDING  → count the HOLD down.
+ *   ELAPSED  → regenerate a fresh terrain and start over.
+ * Paused freezes the machine but not the wall clock. */
 static void scene_tick(Scene *s, float dt)
 {
     s->time_secs += dt;
-    s->flash_t   *= expf(-4.0f * dt);
     if (s->paused) return;
 
-    Heightmap *hm = &s->hm;
-    int total = hm->w * hm->h;
+    decay_water_trails(&s->hm);
 
-    /* Decay trails every tick (whether or not we're still eroding). */
-    for (int i = 0; i < total; i++) {
-        hm->water_trail[i] *= WATER_TRAIL_DECAY;
-    }
-
-    if (hm->droplets_done < DROPLETS_PER_GEN) {
-        int per_tick = DROPLETS_PER_TICK_DEF * s->speed / SPEED_DEF;
-        if (per_tick < 1) per_tick = 1;
-        for (int i = 0; i < per_tick && hm->droplets_done < DROPLETS_PER_GEN; i++) {
-            Droplet d;
-            droplet_spawn(&d, hm->w, hm->h);
-            droplet_simulate(hm, &d);
-            hm->droplets_done++;
-        }
-        if (hm->droplets_done >= DROPLETS_PER_GEN) {
-            s->hold_countdown = HOLD_TICKS;
-        }
+    if (!erosion_complete(&s->hm)) {
+        run_erosion_batch(&s->hm, s->speed);
+        if (erosion_complete(&s->hm))
+            s->hold_countdown = HOLD_TICKS;     /* just settled → hold */
+    } else if (s->hold_countdown > 0) {
+        s->hold_countdown--;
     } else {
-        if (s->hold_countdown > 0) {
-            s->hold_countdown--;
-        } else {
-            scene_rebuild(s);
-        }
+        scene_rebuild(s);
     }
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §5  EFFECTS  -- cosmetic-only state                                   */
 /* ===================================================================== */
 
+/* No separate layer -- one line, as the SEPARATION audit requires when a
+ * concern is trivial. The only cosmetic-only state is Heightmap.water_trail[]
+ * (the fading droplet trails behind the DROPLETS view): WRITTEN by
+ * droplet_simulate() and faded each tick by decay_water_trails() (both §4),
+ * READ only by render_droplets() (§7). Every other glow -- peak twinkle,
+ * plasma, caustics, night glints -- is derived at render time from
+ * height/time, never stored. */
+
+/* ===================================================================== */
+/* §6  DELAYS  -- pauses, holds, timers                                  */
+/* ===================================================================== */
+
+/* No separate layer -- one line. The post-erosion HOLD before regeneration
+ * is a single int, Scene.hold_countdown: armed to HOLD_TICKS when the droplet
+ * budget is reached and counted down inside scene_tick() (§4); at 0 the scene
+ * regenerates. The pause toggle (Scene.paused) early-returns scene_tick().
+ * Both are trivial and woven into the simulation tick. */
+
+/* ===================================================================== */
+/* §7  RENDER  -- state -> screen (reads only, never mutates sim)        */
+/* ===================================================================== */
+
+/* state -> screen. Reads Scene / Heightmap, writes ONLY the ncurses back
+ * buffer (and the colour-pair table at init). Never touches simulation
+ * state, so a frame may be dropped or rebuilt with no effect on the sim. */
+
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    if (COLORS >= 256) {
+        const Theme *t = &themes[idx];
+        for (int i = 0; i < N_BIOMES; i++)
+            init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
+        init_pair(PAIR_HOT,   t->hot,    -1);
+        init_pair(PAIR_COLD,  t->cold,   -1);
+        init_pair(PAIR_WATER, 51, -1);          /* bright cyan      */
+    } else {
+        static const short fb[N_BIOMES] = {
+            COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,   COLOR_GREEN,
+            COLOR_GREEN, COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE,
+        };
+        for (int i = 0; i < N_BIOMES; i++)
+            init_pair((short)(PAIR_RAMP_BASE + i), fb[i], -1);
+        init_pair(PAIR_HOT,   COLOR_RED,  -1);
+        init_pair(PAIR_COLD,  COLOR_BLUE, -1);
+        init_pair(PAIR_WATER, COLOR_CYAN, -1);
+    }
+}
+
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,   226, -1);
+        init_pair(PAIR_HINT,   51, -1);
+    } else {
+        init_pair(PAIR_HUD,   COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT,  COLOR_CYAN,   -1);
+    }
+    theme_apply(0);
+}
+
+/* ── Screen ────────────────────────────────────────────────────────────── *
+ * WHAT  The terminal viewport: its full character size, the heightmap
+ *       rectangle chosen to fit inside it, and the top-left offset where that
+ *       rectangle is centred. Pure presentation geometry — holds NO simulation
+ *       state — recomputed by screen_layout() at startup and on every SIGWINCH.
+ *
+ * WHY  This is the project's ONE coordinate bridge: map cell (x,y) draws at
+ *       terminal (gy0 + y, gx0 + x), computed in exactly one place so no
+ *       renderer hand-rolls the offset (see documentation/Architecture.md,
+ *       coordinate model). map_w/map_h are clamped to [16..MAP_W_MAX] ×
+ *       [8..MAP_H_MAX]: the upper bound stops a huge terminal from indexing
+ *       past the static CELLS_MAX store; the lower keeps a tiny one usable.
+ *       Rows 0–1 are the HUD and the last row the hint line, so gy0 starts at
+ *       row 2 and the field is inset to avoid overwriting them. */
 typedef struct {
-    int cols, rows;
-    int map_w, map_h;
-    int gx0, gy0;
+    int cols, rows;      /* full terminal size (getmaxyx)        */
+    int map_w, map_h;    /* heightmap rectangle that fits inside */
+    int gx0, gy0;        /* its top-left origin on screen        */
 } Screen;
 
 static void screen_layout(Screen *s)
 {
-    int top = 2, bottom = s->rows - 1;
+    int top = HUD_TOP_ROWS, bottom = s->rows - 1;   /* HUD top, hint bottom */
     int avail_h = bottom - top;
     int avail_w = s->cols;
 
@@ -1011,8 +1395,8 @@ static void screen_layout(Screen *s)
     int mh = avail_h;
     if (mw > MAP_W_MAX) mw = MAP_W_MAX;
     if (mh > MAP_H_MAX) mh = MAP_H_MAX;
-    if (mw < 16) mw = 16;
-    if (mh < 8)  mh = 8;
+    if (mw < MAP_W_MIN) mw = MAP_W_MIN;
+    if (mh < MAP_H_MIN) mh = MAP_H_MIN;
 
     s->map_w = mw;
     s->map_h = mh;
@@ -1049,14 +1433,13 @@ static void screen_resize(Screen *s)
  * ----------------------------------------------------------------------- */
 
 /* Terrain — eroded heightmap as a biome map. Peaks twinkle. */
-static void render_terrain(const Screen *sc, const Scene *s)
+static void render_terrain(const Screen *sc, const Heightmap *hm, float t)
 {
-    const Heightmap *hm = &s->hm;
-    int twinkle_t = (int)s->time_secs;
+    int twinkle_t = (int)t;
 
     for (int y = 0; y < hm->h; y++) {
         int sy = sc->gy0 + y;
-        if (sy < 2 || sy >= sc->rows - 1) continue;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
         for (int x = 0; x < hm->w; x++) {
             int sx = sc->gx0 + x;
             if (sx < 0 || sx >= sc->cols) continue;
@@ -1071,7 +1454,7 @@ static void render_terrain(const Screen *sc, const Scene *s)
             if (bi <= BIOME_OCEAN) {
                 /* Slow water shimmer on ocean cells. */
                 static const char waves[4] = { '~', '_', '~', ',' };
-                int phase = (x + y * 2 + (int)(s->time_secs * 3.0f)) & 3;
+                int phase = (x + y * 2 + (int)(t * 3.0f)) & 3;
                 glyph = waves[phase];
                 if (bi == BIOME_DEEP_OCEAN) attr = A_DIM;
             } else {
@@ -1093,13 +1476,12 @@ static void render_terrain(const Screen *sc, const Scene *s)
 }
 
 /* Droplets — terrain dimmed + bright water trails on top. */
-static void render_droplets(const Screen *sc, const Scene *s)
+static void render_droplets(const Screen *sc, const Heightmap *hm)
 {
-    const Heightmap *hm = &s->hm;
 
     for (int y = 0; y < hm->h; y++) {
         int sy = sc->gy0 + y;
-        if (sy < 2 || sy >= sc->rows - 1) continue;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
         for (int x = 0; x < hm->w; x++) {
             int sx = sc->gx0 + x;
             if (sx < 0 || sx >= sc->cols) continue;
@@ -1139,13 +1521,12 @@ static void render_droplets(const Screen *sc, const Scene *s)
 }
 
 /* Erosion — cut/fill diff vs initial heightmap. */
-static void render_erosion(const Screen *sc, const Scene *s)
+static void render_erosion(const Screen *sc, const Heightmap *hm)
 {
-    const Heightmap *hm = &s->hm;
 
     for (int y = 0; y < hm->h; y++) {
         int sy = sc->gy0 + y;
-        if (sy < 2 || sy >= sc->rows - 1) continue;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
         for (int x = 0; x < hm->w; x++) {
             int sx = sc->gx0 + x;
             if (sx < 0 || sx >= sc->cols) continue;
@@ -1182,13 +1563,12 @@ static void render_erosion(const Screen *sc, const Scene *s)
 
 /* Slope — gradient magnitude as a heatmap; arrow glyph for direction
  * of -gradient (downhill = the way water flows). */
-static void render_slope(const Screen *sc, const Scene *s)
+static void render_slope(const Screen *sc, const Heightmap *hm)
 {
-    const Heightmap *hm = &s->hm;
 
     for (int y = 0; y < hm->h; y++) {
         int sy = sc->gy0 + y;
-        if (sy < 2 || sy >= sc->rows - 1) continue;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
         for (int x = 0; x < hm->w; x++) {
             int sx = sc->gx0 + x;
             if (sx < 0 || sx >= sc->cols) continue;
@@ -1200,15 +1580,7 @@ static void render_slope(const Screen *sc, const Scene *s)
             if (level < 0)         level = 0;
             if (level >= N_BIOMES) level = N_BIOMES - 1;
 
-            char glyph;
-            if (mag < 1e-4f) {
-                glyph = '.';
-            } else if (fabsf(gx) > fabsf(gy)) {
-                /* gradient points uphill; water flows opposite. */
-                glyph = (gx > 0) ? '<' : '>';
-            } else {
-                glyph = (gy > 0) ? '^' : 'v';
-            }
+            char glyph = (mag < 1e-4f) ? '.' : flow_arrow(gx, gy);
 
             int pair = PAIR_RAMP_BASE + level;
             int attr = (level >= 6) ? A_BOLD
@@ -1222,111 +1594,528 @@ static void render_slope(const Screen *sc, const Scene *s)
     }
 }
 
-static void scene_draw(const Screen *sc, const Scene *s)
+/* Relief — colour by elevation (biome ramp), brightness by hillshade.
+ * Reads as a lit 3-D surface. */
+static void render_relief(const Screen *sc, const Heightmap *hm)
 {
-    switch (s->current_pattern) {
-    case PATTERN_TERRAIN:  render_terrain (sc, s);  break;
-    case PATTERN_DROPLETS: render_droplets(sc, s);  break;
-    case PATTERN_EROSION:  render_erosion (sc, s);  break;
-    case PATTERN_SLOPE:    render_slope   (sc, s);  break;
-    case N_PATTERNS:       break;       /* unreachable sentinel */
-    }
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
 
-    /* Regenerate flash. */
-    if (s->flash_t > 0.05f) {
-        int seed = (int)(s->time_secs * 1000.0f);
-        attron(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
-        for (int sy = 2; sy < sc->rows - 1; sy += 2) {
-            for (int sx = 0; sx < sc->cols; sx += 2) {
-                if (((sx ^ sy ^ seed) & 7) == 0)
-                    mvaddch(sy, sx, '*');
-            }
+            float sh  = cell_shade(hm, x, y);
+            int   bi  = height_to_biome(hm->height[hidx(hm, x, y)]);
+            char  glyph = ELEV_RAMP[shade_to_level(sh)];
+            int   pair  = PAIR_RAMP_BASE + bi;
+            int   attr  = sh > 0.70f ? A_BOLD : sh < 0.22f ? A_DIM : A_NORMAL;
+
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
         }
-        attroff(COLOR_PAIR(PAIR_FLASH) | A_BOLD);
     }
 }
 
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
+/* Contour — bright isolines where the quantised height band changes;
+ * line glyph orients perpendicular to the gradient. Ocean faint, land
+ * between lines left blank for a clean topographic-sheet look. */
+static void render_contour(const Screen *sc, const Heightmap *hm)
 {
-    erase();
-    scene_draw(sc, s);
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
 
-    const Heightmap *hm = &s->hm;
-    bool eroding = (hm->droplets_done < DROPLETS_PER_GEN);
-    const char *state_str;
-    if (s->paused)        state_str = "PAUSED  ";
-    else if (eroding)     state_str = "ERODING ";
-    else                  state_str = "SETTLED ";
+            float e   = h_at(hm, x, y);
+            int   lv  = (int)(e * CONTOUR_LEVELS);
+            int   lvr = (int)(h_at(hm, x + 1, y) * CONTOUR_LEVELS);
+            int   lvd = (int)(h_at(hm, x, y + 1) * CONTOUR_LEVELS);
+            char  glyph;
+            int   pair, attr;
 
-    /* Row 0 right — primary status. */
+            if (lv != lvr || lv != lvd) {
+                float gx, gy;
+                cell_gradient(hm, x, y, &gx, &gy);
+                glyph = contour_glyph(gx, gy);
+                int bi = lv * N_BIOMES / (CONTOUR_LEVELS + 1);
+                if (bi > 7) bi = 7;
+                pair = PAIR_RAMP_BASE + bi;
+                attr = A_BOLD;
+            } else if (height_to_biome(e) <= BIOME_OCEAN) {
+                glyph = '~';
+                pair  = PAIR_RAMP_BASE + height_to_biome(e);
+                attr  = A_DIM;
+            } else {
+                continue;       /* land between lines: leave blank */
+            }
+
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* Hypso — solid filled hypsometric tint: every cell a bold block in its
+ * elevation colour. The clean "painted map" complement to TERRAIN. */
+static void render_hypso(const Screen *sc, const Heightmap *hm)
+{
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
+
+            int  bi    = height_to_biome(hm->height[hidx(hm, x, y)]);
+            char glyph = (bi <= BIOME_OCEAN) ? '~' : '#';
+            int  pair  = PAIR_RAMP_BASE + bi;
+
+            attron(COLOR_PAIR(pair) | A_BOLD);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | A_BOLD);
+        }
+    }
+}
+
+/* Aspect — which compass direction each slope faces. Downhill bearing is
+ * binned into 8 sectors, each a distinct ramp hue + arrow glyph. */
+static void render_aspect(const Screen *sc, const Heightmap *hm)
+{
+    static const char dirg[8] = { '>', '/', '^', '\\', '<', '/', 'v', '\\' };
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
+
+            float gx, gy;
+            cell_gradient(hm, x, y, &gx, &gy);
+            float mag = sqrtf(gx * gx + gy * gy);
+            char  glyph;
+            int   pair, attr;
+
+            if (mag < 5e-4f) {
+                glyph = '.';  pair = PAIR_RAMP_BASE;  attr = A_DIM;
+            } else {
+                int sect = downhill_sector(gx, gy);
+                glyph = dirg[sect];
+                pair  = PAIR_RAMP_BASE + sect;
+                attr  = mag > 0.02f ? A_BOLD : A_NORMAL;
+            }
+
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* Ridges — discrete Laplacian skeleton: strongly convex cells are ridge
+ * crests (warm '^'), strongly concave are valleys (cool 'v'), the rest a
+ * dim biome backdrop. Exposes the drainage structure. */
+static void render_ridges(const Screen *sc, const Heightmap *hm)
+{
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
+
+            float e   = hm->height[hidx(hm, x, y)];
+            float lap = cell_laplacian(hm, x, y);
+            char  glyph;
+            int   pair, attr;
+
+            if (lap < -RIDGE_THRESH) {
+                glyph = '^';  pair = PAIR_HOT;   attr = A_BOLD;
+            } else if (lap > RIDGE_THRESH) {
+                glyph = 'v';  pair = PAIR_COLD;  attr = A_NORMAL;
+            } else {
+                int bi = height_to_biome(e);
+                glyph = BIOME_GLYPHS[bi][hash3(x, y, hm->seed) & 1];
+                pair  = PAIR_RAMP_BASE + bi;
+                attr  = A_DIM;
+            }
+
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* Canyons — cells the droplets carved below their initial height glow as
+ * cyan river arrows (deeper cut = brighter); untouched land is a dim 3-D
+ * hillshade so the channel network stands out in relief. */
+static void render_canyons(const Screen *sc, const Heightmap *hm)
+{
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
+
+            int   idx  = hidx(hm, x, y);
+            float diff = hm->height[idx] - hm->initial[idx];
+            char  glyph;
+            int   pair, attr;
+
+            if (diff < -EROSION_THRESH_LOW) {
+                float gx, gy;
+                cell_gradient(hm, x, y, &gx, &gy);
+                glyph = flow_arrow(gx, gy);
+                pair = PAIR_WATER;
+                attr = (diff < -EROSION_THRESH_HIGH) ? A_BOLD : A_NORMAL;
+            } else {
+                glyph = ELEV_RAMP[shade_to_level(cell_shade(hm, x, y))];
+                pair  = PAIR_RAMP_BASE + height_to_biome(hm->height[idx]);
+                attr  = A_DIM;
+            }
+
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* Bathy — underwater focus: shallows-to-deep ocean ramp with animated
+ * caustic shimmer; land is a calm dim hillshade so the eye stays on the
+ * living sea. */
+static void render_bathy(const Screen *sc, const Heightmap *hm, float t)
+{
+    static const char cg[4] = { '.', '~', '-', '=' };
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
+
+            float e  = hm->height[hidx(hm, x, y)];
+            int   bi = height_to_biome(e);
+            char  glyph;
+            int   pair, attr;
+
+            if (bi <= BIOME_COAST) {
+                float caustic = sinf(x * 0.35f + y * 0.22f + t * 2.3f)
+                              + sinf(x * 0.13f - y * 0.31f + t * 1.7f);
+                int ci = (int)((caustic + 2.0f) / 4.0f * 3.99f);
+                if (ci < 0) ci = 0;
+                if (ci > 3) ci = 3;
+                int depth = (int)((0.40f - e) * 16.0f);
+                if (depth < 0) depth = 0;
+                if (depth > 5) depth = 5;
+                glyph = cg[ci];
+                pair  = PAIR_RAMP_BASE + (5 - depth);   /* shallow=bright */
+                attr  = ci >= 3 ? A_BOLD : ci == 0 ? A_DIM : A_NORMAL;
+            } else {
+                glyph = ELEV_RAMP[shade_to_level(cell_shade(hm, x, y))];
+                pair  = PAIR_RAMP_BASE + bi;
+                attr  = A_DIM;
+            }
+
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* Plasma — pure eye-candy: a colour phase advances with elevation, two
+ * sine waves and time, cycling the 8 ramp hues so colour bands flow
+ * across the terrain shape. */
+static void render_plasma(const Screen *sc, const Heightmap *hm, float t)
+{
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
+
+            float e = hm->height[hidx(hm, x, y)];
+            float v = e * 7.0f + t * 0.8f
+                    + sinf(x * 0.10f + t) * 0.8f
+                    + cosf(y * 0.13f - t) * 0.8f;
+            int idx = (int)v % N_BIOMES;
+            if (idx < 0) idx += N_BIOMES;
+            char glyph = ELEV_RAMP[idx];
+            int  pair  = PAIR_RAMP_BASE + idx;
+
+            attron(COLOR_PAIR(pair) | A_BOLD);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | A_BOLD);
+        }
+    }
+}
+
+/* Night — atmospheric mood: black sea with rare moon glints, dim land,
+ * hillshade-lit ridgelines, and snow peaks that glow and twinkle. */
+static void render_night(const Screen *sc, const Heightmap *hm, float t)
+{
+    int glint_t   = (int)(t * 2.0f);
+    int twinkle_t = (int)(t * 3.0f);
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
+
+            float e   = hm->height[hidx(hm, x, y)];
+            int   bi  = height_to_biome(e);
+            char  glyph;
+            int   pair, attr;
+
+            if (bi <= BIOME_OCEAN) {
+                if ((hash3(x, y, glint_t) % 80u) != 0u) continue;  /* black */
+                glyph = '.';  pair = PAIR_RAMP_BASE + bi;  attr = A_DIM;
+            } else if (bi >= BIOME_HIGHLANDS) {
+                glyph = BIOME_GLYPHS[bi][hash3(x, y, hm->seed) & 1];
+                if (bi == BIOME_PEAKS && (hash3(x, y, twinkle_t) % 40u) == 0u)
+                    glyph = '*';
+                pair = PAIR_RAMP_BASE + 7;  attr = A_BOLD;
+            } else if (cell_shade(hm, x, y) > 0.62f) {
+                glyph = '^';  pair = PAIR_RAMP_BASE + 5;  attr = A_NORMAL;
+            } else {
+                glyph = BIOME_GLYPHS[bi][hash3(x, y, hm->seed) & 1];
+                pair  = PAIR_RAMP_BASE + bi;  attr = A_DIM;
+            }
+
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* Flow — animated contours: the same isoline test as CONTOUR but the
+ * bands scroll downhill over time, so bright lines appear to cascade
+ * from peaks to sea like sheet flow. */
+static void render_flow(const Screen *sc, const Heightmap *hm, float t)
+{
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
+
+            float e     = h_at(hm, x, y);
+            float phase = e * CONTOUR_LEVELS - t * 2.0f;
+            float frac  = phase - floorf(phase);
+            char  glyph;
+            int   pair, attr;
+
+            if (frac < 0.18f) {
+                float gx, gy;
+                cell_gradient(hm, x, y, &gx, &gy);
+                glyph = contour_glyph(gx, gy);
+                int bi = (int)(e * 7.99f);
+                if (bi > 7) bi = 7;
+                pair = PAIR_RAMP_BASE + bi;  attr = A_BOLD;
+            } else {
+                int bi = height_to_biome(e);
+                glyph = (bi <= BIOME_OCEAN) ? '~' : '.';
+                pair  = PAIR_RAMP_BASE + bi;  attr = A_DIM;
+            }
+
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* Heat — two-tone thermal map: warm accent above mid-elevation, cool
+ * below, density glyph by height. A stark cartographer's heat readout. */
+static void render_heat(const Screen *sc, const Heightmap *hm)
+{
+    for (int y = 0; y < hm->h; y++) {
+        int sy = sc->gy0 + y;
+        if (sy < HUD_TOP_ROWS || sy >= sc->rows - 1) continue;
+        for (int x = 0; x < hm->w; x++) {
+            int sx = sc->gx0 + x;
+            if (sx < 0 || sx >= sc->cols) continue;
+
+            float e   = hm->height[hidx(hm, x, y)];
+            int   lvl = (int)(e * 7.99f);
+            if (lvl < 0) lvl = 0;
+            if (lvl > 7) lvl = 7;
+            char glyph = ELEV_RAMP[lvl];
+            int  pair  = (e >= 0.5f) ? PAIR_HOT : PAIR_COLD;
+            int  attr  = (lvl >= 6 || lvl <= 1) ? A_BOLD : A_NORMAL;
+
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sy, sx, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+static void scene_draw(const Screen *sc, const Heightmap *hm,
+                       Pattern pattern, float t)
+{
+    switch (pattern) {
+    case PATTERN_TERRAIN:  render_terrain (sc, hm, t);  break;
+    case PATTERN_DROPLETS: render_droplets(sc, hm);     break;
+    case PATTERN_EROSION:  render_erosion (sc, hm);     break;
+    case PATTERN_SLOPE:    render_slope   (sc, hm);     break;
+    case PATTERN_RELIEF:   render_relief  (sc, hm);     break;
+    case PATTERN_CONTOUR:  render_contour (sc, hm);     break;
+    case PATTERN_HYPSO:    render_hypso   (sc, hm);     break;
+    case PATTERN_ASPECT:   render_aspect  (sc, hm);     break;
+    case PATTERN_RIDGES:   render_ridges  (sc, hm);     break;
+    case PATTERN_CANYONS:  render_canyons (sc, hm);     break;
+    case PATTERN_BATHY:    render_bathy   (sc, hm, t);  break;
+    case PATTERN_PLASMA:   render_plasma  (sc, hm, t);  break;
+    case PATTERN_NIGHT:    render_night   (sc, hm, t);  break;
+    case PATTERN_FLOW:     render_flow    (sc, hm, t);  break;
+    case PATTERN_HEAT:     render_heat    (sc, hm);     break;
+    case N_PATTERNS:       break;       /* unreachable sentinel */
+    }
+}
+
+/* Draw the 8-swatch colour-ramp legend at (row,x); returns the x past it. */
+static int draw_ramp_legend(int row, int x)
+{
+    for (int i = 0; i < N_BIOMES; i++) {
+        attron(COLOR_PAIR(PAIR_RAMP_BASE + i) | A_BOLD);
+        mvaddch(row, x, (chtype)(unsigned char)ELEV_RAMP[i]);
+        attroff(COLOR_PAIR(PAIR_RAMP_BASE + i) | A_BOLD);
+        x++;
+    }
+    return x;
+}
+
+/* Row 0 right — primary status: fps, sim Hz, phase, speed. Right-aligned. */
+static void draw_status_line(const Screen *sc, const Scene *s,
+                             double fps, int sim_fps)
+{
+    const char *phase = s->paused                 ? "PAUSED  "
+                      : erosion_complete(&s->hm)  ? "SETTLED "
+                                                  : "ERODING ";
     char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  %3d Hz  %s  speed:%-3d ",
-             fps, sim_fps, state_str, s->speed);
+    snprintf(buf, sizeof buf, " %5.1f fps  %3d Hz  %s  speed:%-3d ",
+             fps, sim_fps, phase, s->speed);
     int hx = sc->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
 
-    /* Row 0 left — title. */
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 1, " HYDRAULIC EROSION ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-    /* Row 1 — pattern + theme + ramp + counters. */
+/* Row 1 — pattern (with n/N counter), theme, ramp legend, droplet progress.
+ * Fixed left-aligned layout, so it needs the Scene but not the Screen. */
+static void draw_param_line(const Scene *s)
+{
     int x = 1;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " pattern:%-8s ", pattern_name(s->current_pattern));
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 19;
 
+    char pbuf[40];
+    snprintf(pbuf, sizeof pbuf, " pattern:%s %2d/%-2d ",
+             pattern_name(s->current_pattern),
+             (int)s->current_pattern + 1, (int)N_PATTERNS);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(1, x, " theme:%-8s ", themes[s->current_theme].name);
+    mvprintw(1, x, "%s", pbuf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    x += 17;
+    x += (int)strlen(pbuf);
+
+    char tbuf[32];
+    snprintf(tbuf, sizeof tbuf, " theme:%-8s ", themes[s->current_theme].name);
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(1, x, "%s", tbuf);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    x += (int)strlen(tbuf);
 
     attron(COLOR_PAIR(PAIR_HUD));
     mvprintw(1, x, " ramp:");
     attroff(COLOR_PAIR(PAIR_HUD));
     x += 6;
-    for (int i = 0; i < N_BIOMES; i++) {
-        int p = PAIR_RAMP_BASE + i;
-        attron(COLOR_PAIR(p) | A_BOLD);
-        mvaddch(1, x, (chtype)(unsigned char)ELEV_RAMP[i]);
-        attroff(COLOR_PAIR(p) | A_BOLD);
-        x++;
-    }
+    x = draw_ramp_legend(1, x);
 
     int pct = (DROPLETS_PER_GEN > 0)
-            ? (hm->droplets_done * 100) / DROPLETS_PER_GEN : 100;
+            ? (s->hm.droplets_done * 100) / DROPLETS_PER_GEN : 100;
     if (pct > 100) pct = 100;
     attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, x,
-             "  droplets:%5d/%-5d  %3d%% ",
-             hm->droplets_done, (int)DROPLETS_PER_GEN, pct);
+    mvprintw(1, x, "  droplets:%5d/%-5d  %3d%% ",
+             s->hm.droplets_done, (int)DROPLETS_PER_GEN, pct);
     attroff(COLOR_PAIR(PAIR_HUD));
+}
 
-    /* Bottom hint. */
+/* Bottom row — the key legend. Lists every interactive key (HUD standard). */
+static void draw_hint(const Screen *sc)
+{
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(sc->rows - 1, 0,
              " n/p:pattern  t/T:theme  +/-:speed  ]/[:tickHz  spc:pause  r:regen  q:quit ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
+/* The one render function that takes the whole Scene (read-only): the HUD's
+ * concept IS whole-scene status — pattern, theme, speed, progress, run-state.
+ * A const read can't re-couple the layers; the leaf renderers stay narrow.
+ * Reads as: draw the chosen view, then lay the HUD over it. */
+static void screen_draw(const Screen *sc, const Scene *s,
+                        double fps, int sim_fps)
+{
+    erase();
+    scene_draw(sc, &s->hm, s->current_pattern, s->time_secs);
+
+    draw_status_line(sc, s, fps, sim_fps);
+
+    /* Row 0 left — title. */
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, 1, " HYDRAULIC EROSION ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    draw_param_line(s);
+    draw_hint(sc);
+}
+
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §8  APP  -- events + per-tick combine + main loop                     */
 /* ===================================================================== */
 
+/* Owns the App aggregate, signal flags, user-event handlers and the main
+ * loop. main() is the ONE place that combines the layers per tick, in fixed
+ * order:  scene_tick (SIM + EFFECTS + DELAYS) -> screen_draw (RENDER) ->
+ * screen_present -> input. app_handle_key() / app_do_resize() mutate state
+ * in response to USER EVENTS and are deliberately OUTSIDE the tick. */
+
+/* ── App ───────────────────────────────────────────────────────────────── *
+ * WHAT  Top-level harness binding the simulation (scene) to the terminal
+ *       (screen), plus the loop's PERFORMANCE knob and the async signal flags.
+ *       A single static instance (g_app) exists ONLY so the signal handlers —
+ *       which may fire between any two instructions — can reach the flags;
+ *       everything else passes App explicitly. Just init + the main loop touch
+ *       App whole; every other function takes the narrowest sub-type (§5).
+ *
+ * REFS  Fixed-timestep accumulator — sim_fps decouples the simulation rate
+ *       from the render frame rate, so physics is deterministic regardless of
+ *       terminal speed (Fiedler, "Fix Your Timestep!"; §8 main()). */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* the two worlds it binds */
+    Scene                 scene;        /* WHAT is simulated + shown         */
+    Screen                screen;       /* WHERE it is drawn                 */
+
+    /* loop control */
+    int                   sim_fps;      /* fixed-timestep rate, SIM_FPS_* Hz */
+    /* volatile sig_atomic_t: written from signal handlers, so the compiler
+     * must re-read them each loop and the write must be atomic w.r.t. the
+     * interrupted code. */
+    volatile sig_atomic_t running;      /* cleared by SIGINT/SIGTERM → exit  */
+    volatile sig_atomic_t need_resize;  /* set by SIGWINCH, served next loop */
 } App;
 
 static App g_app;
@@ -1389,6 +2178,20 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
+/* Fixed-timestep catch-up: run as many simulation ticks as the accumulated
+ * real time (*sim_accum) allows, each advancing the scene by one fixed dt,
+ * draining the accumulator as it goes. Decoupling the sim rate from the frame
+ * rate keeps physics deterministic regardless of how fast frames are drawn
+ * (Fiedler, "Fix Your Timestep!"). */
+static void run_pending_ticks(Scene *s, int64_t *sim_accum,
+                              int64_t tick_ns, float dt_sec)
+{
+    while (*sim_accum >= tick_ns) {
+        scene_tick(s, dt_sec);
+        *sim_accum -= tick_ns;
+    }
+}
+
 int main(void)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
@@ -1421,16 +2224,13 @@ int main(void)
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        if (dt > MAX_FRAME_NS) dt = MAX_FRAME_NS;   /* spiral-of-death guard */
 
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
         sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
+        run_pending_ticks(&app->scene, &sim_accum, tick_ns, dt_sec);
 
         frame_count++;
         fps_accum += dt;
@@ -1442,7 +2242,7 @@ int main(void)
         }
 
         int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+        clock_sleep_ns(NS_PER_SEC / FRAME_CAP_FPS - elapsed);
 
         screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
         screen_present();

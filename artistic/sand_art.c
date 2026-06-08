@@ -228,66 +228,7 @@
  *    bulb shape — a hourglass IS naturally taller than wide.  But
  *    a "circular bulb top" would need correction: not used here.
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • SCAN ORDER vs MOVEMENT DIRECTION.  If we scanned top-to-bottom
- *    while gravity points down, a grain that just moved down would
- *    be processed AGAIN at its new row → it could fall multiple
- *    cells per tick uncontrollably.  Bottom-to-top scan ensures
- *    each grain moves at most once per tick (except via momentum,
- *    which is explicit).  Same logic in reverse for flipped gravity.
  *
- *  • NECK BOTTLENECK is a feature not a bug.  Only NECK_HALF·2 cells
- *    wide; many grains compete; angle-of-repose dynamics naturally
- *    queue them up.  Time-to-empty depends on NECK_HALF + total
- *    sand volume + momentum cap.
- *
- *  • DIAGONAL BIAS.  Always trying left-first creates pile asymmetry.
- *    Random order per-cell-per-tick fixes it.
- *
- *  • MOMENTUM RESET.  When a grain hits a wall or piles up, reset to
- *    0 immediately — otherwise it'd "phantom-jump" through the pile.
- *
- *  • REFILL WITH FLIPPED GRAVITY.  `r` always refills the bulb that's
- *    "up" relative to current gravity.  That's the user-intuitive
- *    behaviour ("more sand!") regardless of orientation.
- *
- *  • DUAL_FLOW pattern starts with sand in BOTH bulbs.  Flipping
- *    means the larger bulb avalanches; the smaller bulb fills more.
- *    No "drained empty" state.
- *
- *  • PAUSE freezes simulation but not input — flip / theme / pattern
- *    cycle still respond.  Resume picks up cleanly.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • At startup, top bulb is full of stratified colour bands; a thin
- *    stream begins flowing through the neck into the bottom bulb.
- *
- *  • Bottom bulb fills as a CONE (sand piles centred under the neck,
- *    spreading at the angle of repose).  The cone's apex sits
- *    directly under the neck.
- *
- *  • Press space → gravity flips.  Sand currently in the top bulb
- *    avalanches downward (which is now upward in flipped frame); the
- *    lower bulb's pile starts emptying upward through the neck.
- *
- *  • HUD: `Time: NN%` rises monotonically until 100, then plateaus
- *    until you flip.  `Flips: N` increments on every space press.
- *
- *  • Press `r` → bulb refills (whichever is "up" per current gravity)
- *    with fresh stratified layers; transfer count resets to 0.
- *
- *  • Press `n` to RAINBOW → 16 thinner layers visible in the top bulb.
- *
- *  • Press `n` to DUAL_FLOW → both bulbs start half-full; flipping
- *    moves sand the OTHER way without ever fully draining either.
- *
- *  • Press `t` cycles theme.  Hourglass shape unchanged; only colours.
- *
- *  • Watch the NECK during heavy flow.  You should see a visible
- *    streaming column with lighter (faster-moving) glyphs in the
- *    middle and denser (resting) glyphs at the pile boundaries.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

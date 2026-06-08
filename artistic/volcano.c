@@ -263,68 +263,6 @@
  *  Aspect correction (any 2-D shape that should look round in pixels):
  *    dy_pixels = dy_cells · CELL_ASPECT
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • POOL EXHAUSTION.  Spawn rate · lifetime > pool size → newest
- *    spawns drop on the floor.  We ALSO clamp per-frame spawn so a
- *    pause-then-resume doesn't dump the entire pool in one frame.
- *
- *  • CRATER BORDER.  The crater dip in `silhouette_y` makes a small
- *    bowl at the peak; particles spawn from the bowl's bottom row,
- *    not from the cone's mathematical peak.  This is the visible
- *    "crater glow" anchor point.
- *
- *  • SLOPE LAVA AT CRATER.  Lava flows are pre-traced from the crater
- *    rim DOWN one or both sides.  We don't simulate fluid dynamics —
- *    just paint cells along the precomputed path.
- *
- *  • PLUME CONE.  Without the `cone_falloff` term, fBm density would
- *    spread the plume across the whole sky.  The cone restricts it to
- *    a roughly conical region above the crater, widening with altitude.
- *
- *  • WIND DRIFT.  Plume noise samples at `(x − wind·time)`, so the
- *    pattern flows in +x consistently; the column appears to drift
- *    sideways as it rises.  Same trick used for cloud demos.
- *
- *  • PAUSE freezes ALL physics — bombs hang in mid-air, plume stops
- *    drifting.  Resume picks up cleanly.
- *
- *  • THEME CYCLE doesn't reset the particle pool, just re-applies
- *    colour pairs.  Active particles immediately take new colours.
- *
- *  • INVERTED THEME (NEGATIVE).  Pre-fill white "paper" before drawing,
- *    use dark fg pairs, disable A_BOLD/A_DIM (would invert intent on
- *    light fg over white bg).  Standard repo recipe.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • At default (STROMBOLIAN, DAY) you should see a mountain with
- *    ~30 bombs in arcs, ~200 embers in plume, ~150 ash, plus crater
- *    glow and a steady column rising upward.
- *
- *  • Press space.  Everything freezes — bombs in mid-air, plume frozen.
- *    Resume — clean continuation.
- *
- *  • Press `n` to VULCANIAN.  Within a few seconds you'll see a
- *    violent burst — 60+ bombs erupt simultaneously, then quiet again
- *    for 4-6 sec, then another burst.
- *
- *  • Press `n` to PLINIAN.  Plume becomes huge — ash count triples,
- *    column reaches near top of screen, bombs less frequent.
- *
- *  • Press `n` to HAWAIIAN.  Lava flows down slopes brighten; bombs
- *    arc lower (modest fountain); ash drops considerably.
- *
- *  • Press `t` cycles theme.  Mountain silhouette stays the same;
- *    only colours swap.  NIGHT is most dramatic — bright lava on
- *    dark sky.
- *
- *  • Press `r`.  Mountain regenerates with a different surface profile
- *    + crater position; particles clear and respawn.
- *
- *  • Press `+`.  Spawn rates increase; particle count rises until the
- *    pool saturates.  Press `-` to back down.
- *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

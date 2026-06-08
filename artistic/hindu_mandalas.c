@@ -19,24 +19,25 @@
  *       colour themes; +/- resizes; r toggles slow rotation; space
  *       pauses.  Press 0 to reset.
  *
- *       The lesson: "twenty different mandalas" is really "one
- *       parametric draw function with twenty parameter sets."
+ *       The lesson: "thirty different mandalas" is really "one
+ *       parametric draw function with thirty parameter sets."
  *
- * Phase-1 size note: this file is ~780 lines, above the 250-450
- * typical phase-1 budget.  The over-spend buys 30 named preset
- * entries (one line each), six primitive draw functions, and a
- * progressive build animation (each ring + its features fill in
- * over time).  No single section is doing too much.
+ * Size note: this file is ~890 lines, well above the 250-450 typical
+ * phase-1 budget.  The over-spend buys 30 named preset entries (one
+ * line each), six primitive draw functions, a progressive build
+ * animation, and the layered/documented structure of the later
+ * refactor passes.  No single section is doing too much.
  *
- * Section map:
- *   §1 config   — preset table + rendering constants + themes
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — themed palettes + HUD/HINT pairs
- *   §4 polar    — polar↔cell mapping with aspect correction
- *   §5 mandala  — Ring + Preset types, primitive draws, draw_mandala
- *   §6 scene    — Scene state, input, tick, draw
- *   §7 screen   — ncurses init / present
- *   §8 app      — signals, resize, main loop
+ * Section map (cut by layer — see ARCHITECTURE):
+ *   §1 config       — preset table + Ring/Preset types + constants + themes
+ *   §2 performance  — monotonic clock + sleep
+ *   §3 logic        — pure maps & queries (polar↔cell, line glyph, build math)
+ *   §4 data         — Scene runtime state
+ *   §5 simulation   — scene_tick: advance the build animation + rotation
+ *   §6 render       — colour, primitives, draw_mandala, scene_draw + HUD
+ *   §7 init/reset   — scene reset / restart / init
+ *   §8 events       — keys, signals, screen setup
+ *   §9 app          — the frame loop (the per-tick combine)
  *
  * Keys:
  *   q / Q / ESC     quit
@@ -70,13 +71,13 @@
  *                 so it always wins the centre cell).  Rendering a
  *                 mandala iterates the ring list and paints each
  *                 primitive at its specified relative radius around
- *                 a shared centre.  Twenty PRESETS pick different
- *                 combinations to produce twenty named mandalas.
+ *                 a shared centre.  Thirty PRESETS pick different
+ *                 combinations to produce thirty named mandalas.
  *
- * Data-structure: PRESETS[20] of MandalaPreset = (name, up to 6 Rings,
- *                 bindu flag).  Each Ring = (type, count, density,
+ * Data-structure: PRESETS[30] of MandalaPreset = (name, up to MAX_RINGS
+ *                 Rings, bindu flag).  Each Ring = (type, count, density,
  *                 relative_radius).  No heap allocation.  The preset
- *                 table is a single C array literal — twenty lines,
+ *                 table is a single C array literal — thirty lines,
  *                 one per preset, defined via a compact R(...) macro.
  *
  * Rendering     : Polar→cell mapping with terminal aspect correction
@@ -93,91 +94,77 @@
  *                 ~2300 paints per frame, microseconds.
  *
  * References    :
- *   Khanna, "Yantra: The Tantric Symbol of Cosmic Unity" (1979) —
- *     symbolic + geometric analysis of Hindu yantras and mandalas.
- *   Tucci, "The Theory and Practice of the Mandala" (1961) —
- *     scholarly treatment of mandala geometry.
- *   Wikipedia, "Yantra", "Sri Yantra", "Mandala" — accessible
- *     introductions to the geometric motifs simulated here.
- *     https://en.wikipedia.org/wiki/Yantra
- *   Coxeter, "Regular Polytopes" (1973) — star polygons (n/d
- *     notation), gcd-based enumeration of stars vs polygons.
+ *   Mandala & yantra symbolism / geometry (the preset forms):
+ *     Khanna, "Yantra: The Tantric Symbol of Cosmic Unity" (1979) —
+ *       symbolic + geometric analysis of Hindu yantras and mandalas.
+ *     Tucci, "The Theory and Practice of the Mandala" (1961) —
+ *       scholarly treatment of mandala geometry.
+ *     Kulaichev, "Sriyantra and its mathematical properties" (Indian J.
+ *       Hist. Sci. 1984) — the precise interlocking-triangle construction
+ *       behind the Sri Yantra preset.
+ *     Wikipedia, "Yantra", "Sri Yantra", "Mandala" — accessible
+ *       introductions to the geometric motifs simulated here.
+ *       https://en.wikipedia.org/wiki/Yantra
+ *
+ *   Geometry & rendering (primitives, line rasterization, polar layout):
+ *     Coxeter, "Regular Polytopes" (1973) — star polygons {n/d}, the
+ *       gcd-based split of STAR vs POLYGON rings.
+ *     Bresenham, "Algorithm for computer control of a digital plotter"
+ *       (IBM Syst. J. 1965) — the integer line walk behind the cell-by-cell
+ *       segment drawing (POLYGON / STAR / RAYS rings).
+ *     Foley, van Dam, Feiner & Hughes, "Computer Graphics: Principles and
+ *       Practice" — polar / parametric primitives and 2-D raster line
+ *       drawing behind §3's polar→cell mapping and the §6 ring draws.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+
+/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
  *
- * CORE IDEA
- * ─────────
- * A mandala is a SYMMETRIC RADIAL DESIGN built from a small alphabet
- * of primitives — petals, rings, star polygons, dotted circles, rays.
- * Twenty named Hindu mandalas turn out to be twenty parameter
- * combinations of THE SAME draw function.
+ * The file is cut into LAYERS by concern. All runtime state lives on one Scene
+ * (§4); each layer reads and/or mutates a named slice of it. Functions take the
+ * NARROWEST type they need — const Scene* to read, Scene* to mutate — so the
+ * layers never re-couple. The split is by SECTION; this table lists what each
+ * mutates.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a cake decorator's wheel.  They have a fixed kit of stamps
- * (8-petal lotus, 16-petal lotus, hexagram, 8-pointed star, ray
- * spokes, dotted ring, square frame) and they LAYER 2-5 stamps at
- * different radii to produce a specific named mandala.  Two stamps
- * + bindu = simple Padma 8.  Five stamps = Sri Yantra.  Same kit;
- * different recipe.
+ *   Layer        Section            Mutates
+ *   ─────────────────────────────────────────────────────────────────────
+ *   PERFORMANCE  §2 performance     nothing (reads OS clock, sleeps)
+ *   LOGIC        §3 logic           nothing (pure maps & queries)
+ *   DATA         §4 data            — Scene declaration + the instance —
+ *   SIMULATION   §5 simulation      scene.build_time, .build_complete, .rot
+ *   RENDER       §6 render          the screen + the colour pairs; never Scene
+ *   INIT/RESET   §7 init            ALL of Scene (defaults / build restart)
+ *   EVENTS       §8 events          scene.{preset_idx, theme_idx, scale, ...}
+ *   —            §9 app             the per-frame driver (combines layers)
  *
- * ALGORITHM IN STEPS  (per frame)
- * ───────────────────────────────
- *   1. Find screen centre (cx, cy) and base radius from
- *      min(cols/2, rows/(2·ASPECT)) · scale.
- *   2. For each ring in the preset (until RING_NONE sentinel):
- *      a. absolute radius r = ring.radius · base_r
- *      b. dispatch on ring.type to draw_circle / draw_dots /
- *         draw_petals / draw_star_polygon (handles polygon &
- *         star) / draw_rays.
- *   3. Paint the bindu '@' at (cx, cy) on top.
- *   4. HUD row + hint strip.
+ * SIMULATION is THIN here: the mandala is a STATIC parametric drawing, so the
+ * only state that advances per tick is the build-reveal timer (build_time) and
+ * the rotation angle (rot) — cosmetic ANIMATION, not physics.
  *
- * KEY FORMULAS
- * ────────────
- *   Polar→cell:
- *     col = cx + r·cos θ
- *     row = cy + r·sin θ · ASPECT      (ASPECT ≈ 0.5)
+ * No separate EFFECTS layer: that cosmetic animation state IS the per-tick state
+ * (build_time / rot), advanced by SIMULATION and read by RENDER; there is no
+ * extra stored effect (glow / trail / flash) on top of it.
  *
- *   Star polygon (n vertices, density d):
- *     for i in 0..n-1: line from vertex[i] to vertex[(i+d) mod n]
- *     gcd(n, d) = 1 → single connected star
- *     gcd(n, d) > 1 → multi-graph (e.g. 6/2 hexagram = 2 triangles)
+ * No separate DELAYS layer: pause is a single flag (scene.paused) tested once at
+ * the top of scene_tick; the build reveal is a timer (build_time) owned by
+ * SIMULATION; the fps window is a PERFORMANCE counter in main.
  *
- *   Petals: angular position θ_k = rot + 2π·k/N
+ * LOGIC (polar_to_cell, line_glyph, progress_to_count, preset_ring_count,
+ * preset_build_duration) does no mutation and no I/O — it maps inputs to a
+ * value — so reordering or deleting RENDER cannot change a LOGIC result.
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Star density d=1 → polygon; d=2 with even n → multi-graph
- *     (hexagram = 6/2 → 2 disjoint triangles).  Both visually
- *     useful; we accept either as valid mandala geometry.
- *   • Aspect: terminal cells are roughly 2:1 tall.  ASPECT = 0.5
- *     applied to sin keeps circles ROUND on screen, not egg-
- *     shaped.
- *   • Small radii: at very small r (zoomed out, or innermost
- *     rings), petals collapse onto each other.  We clip rings
- *     with absolute radius < 0.5 cells to avoid centre noise.
- *   • Resize: SIGWINCH triggers a re-init.  All geometry re-
- *     derives from new (cols, rows) automatically.
+ * PER-TICK COMBINE — main's loop (§9) advances state in ONE place, in order:
+ *   1. scene_tick(dt)   — advance build animation + rotation        (SIMULATION)
+ *   2. scene_draw()     — project the preset's rings to screen + HUD (RENDER)
  *
- * HOW TO VERIFY
- * ─────────────
- *   • Press n through all 20 presets — each visually distinct
- *     from its neighbours; names match the displayed geometry.
- *   • Press 'r' to start rotation — every primitive rotates as
- *     one rigid unit (the bindu and circles, both rotation-
- *     symmetric, look unchanged).
- *   • Press '+' or '-' — design grows / shrinks while staying
- *     centred; no clipping at small scale.
- *   • Press 't' through all 4 themes — palette changes; every
- *     ring type stays legible against default-black even with
- *     A_DIM (per project theme-brightness rule).
- *   • Sri Yantra preset (#13): visible interlocking star pattern
- *     at centre, 8-petal lotus around it, square frame outside.
+ * User events (quit, next/prev preset, theme, size, rotate, pause, replay,
+ * reset, resize) DO mutate state but are NOT part of the tick — they run in
+ * main's input/resize handling (scene_input, §8), before scene_tick. Reset (0)
+ * and preset change re-invoke the INIT-style restarts in §7.
  *
  * ─────────────────────────────────────────────────────────────────────── */
+
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -202,7 +189,6 @@
 
 enum {
     TARGET_FPS    = 60,
-    HUD_COLS      = 96,
     FPS_UPDATE_MS = 500,
 
     MAX_RINGS = 8,    /* enough for complex presets (Maha Yantra uses 7) */
@@ -236,13 +222,49 @@ enum {
 #define BINDU_AT       0.10f
 #define RING_BUILD_DUR 0.55f
 
+/* Primitive geometry */
+#define CIRCLE_OVERSAMPLE  1.4f   /* '.' samples per cell of circle circumference */
+#define CIRCLE_SAMPLES_MIN 24     /* clamp so small circles still read as a ring  */
+#define CIRCLE_SAMPLES_MAX 360    /* and large ones don't oversample pointlessly  */
+#define PETAL_FLANK_LO     0.85f  /* inner flank dot of a petal cluster (× ring r) */
+#define PETAL_FLANK_HI     1.15f  /* outer flank dot of a petal cluster (× ring r) */
+#define RAY_INNER_FRAC     0.10f  /* rays start this far out → a centre gap        */
+
+/* Layout */
+#define SCREEN_MARGIN      4      /* cells kept clear around the mandala (HUD rows) */
+#define MANDALA_MIN_R      2.0f   /* never shrink the mandala below this radius     */
+
 /* §1.1 Ring + Preset types ------------------------------------------- */
 
+/* RingType — the six RADIAL PRIMITIVES every mandala in this file is built from.
+ * A mandala is a concentric stack of rings, each one of these laid out around a
+ * shared centre; combining a handful at different radii reproduces the canonical
+ * yantra/mandala motifs (Khanna; Tucci). RING_NONE is the array SENTINEL — the
+ * first one ends a preset's ring list.
+ *   RING_NONE    : end-of-list marker (value 0 so {0}-init terminates a preset)
+ *   RING_CIRCLE  : a continuous dotted ring ('.')
+ *   RING_DOTS    : N evenly-spaced 'o' beads
+ *   RING_PETALS  : N petal clusters (lotus / padma)
+ *   RING_POLYGON : N vertices joined edge-to-edge (a regular n-gon)
+ *   RING_STAR    : N vertices joined with a skip stride (a star polygon {n/d})
+ *   RING_RAYS    : N spokes from an inner gap to the rim (a chakra) */
 typedef enum {
     RING_NONE = 0, RING_CIRCLE, RING_DOTS, RING_PETALS,
     RING_POLYGON, RING_STAR, RING_RAYS,
 } RingType;
 
+/* Ring — one concentric layer of a mandala: a single RingType primitive drawn N
+ * times around the centre at a relative radius. WHY four fields and no more: a
+ * ring is fully specified by WHICH primitive, HOW MANY of it, the star skip, and
+ * WHERE (radius) — colour and glyph follow from the type. The (n, density) pair
+ * is the star-polygon {n/d} notation (Coxeter, "Regular Polytopes"): density is
+ * the stride joining vertex i to vertex (i+d) mod n, so d=1 is a plain polygon
+ * and d>=2 is a star — e.g. {6/2} is a hexagram (two overlaid triangles).
+ *   type    : a RingType (stored as int; an array of these ends at RING_NONE).
+ *   n       : feature count — beads / petals / vertices / rays (0 for CIRCLE,
+ *             whose sample count is derived from its radius at draw time).
+ *   density : star-polygon stride d; <2 draws a polygon, >=2 draws a star.
+ *   radius  : radius as a FRACTION of the mandala's base radius, in (0, 1]. */
 typedef struct {
     int   type;     /* RingType */
     int   n;        /* feature count (or 0 for RING_CIRCLE) */
@@ -250,6 +272,18 @@ typedef struct {
     float radius;   /* relative to base_r ∈ (0, 1] */
 } Ring;
 
+/* MandalaPreset — one named mandala as a RECIPE: a centre flag plus an ordered
+ * list of Rings. This is the file's central lesson — "thirty different mandalas"
+ * is really ONE parametric draw function fed thirty parameter sets. The named
+ * forms (Sri Yantra, Sahasrara, Padma, ...) are canonical yantras/mandalas
+ * (Khanna; Tucci; Kulaichev for the Sri Yantra); each is reproduced by choosing
+ * rings at chosen radii. The rings[] order is innermost-to-outermost and also
+ * drives the build-in ANIMATION — ring i reveals during its time window.
+ *   name   : label shown in the HUD.
+ *   rings  : up to MAX_RINGS layers; the list ends at the first RING_NONE entry,
+ *            so short presets {0}-pad the remainder.
+ *   bindu  : draw the central '@' point — the BINDU, the seed-point of the
+ *            mandala — painted last so it always wins the centre cell. */
 typedef struct {
     const char *name;
     Ring rings[MAX_RINGS];
@@ -314,8 +348,10 @@ static const int   THEME_BINDU[N_THEMES] = { 230, 195, 195, 230 };
 static const char *THEME_NAME [N_THEMES] = { "Saffron", "Ocean", "Forest", "Cosmic" };
 
 /* ===================================================================== */
-/* §2  clock                                                               */
-/* ===================================================================== */
+/* §2  PERFORMANCE — clock                                                 */
+/* ===================================================================== *
+ * Monotonic clock + sleep. Mutates nothing. The frame cap, dt clamp and fps
+ * window that use these live in main's loop (§9).                            */
 
 static int64_t clock_ns(void) {
     struct timespec ts;
@@ -330,33 +366,28 @@ static void clock_sleep_ns(int64_t ns) {
 }
 
 /* ===================================================================== */
-/* §3  color                                                               */
-/* ===================================================================== */
+/* §3  LOGIC — pure maps & queries (no mutation, no I/O)                   */
+/* ===================================================================== *
+ * Each maps its inputs to a value (or out-params); no globals, no screen. So
+ * reordering or deleting RENDER cannot change a result here.                 */
 
-static void color_init(void) {
-    use_default_colors();
-    init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
-    init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
-}
-
-static void theme_apply(int idx) {
-    init_pair(PAIR_BINDU,   THEME_BINDU  [idx],     -1);
-    init_pair(PAIR_CIRCLE,  THEME_PALETTE[idx][0],  -1);
-    init_pair(PAIR_DOTS,    THEME_PALETTE[idx][1],  -1);
-    init_pair(PAIR_PETALS,  THEME_PALETTE[idx][2],  -1);
-    init_pair(PAIR_POLYGON, THEME_PALETTE[idx][3],  -1);
-    init_pair(PAIR_STAR,    THEME_PALETTE[idx][4],  -1);
-    init_pair(PAIR_RAYS,    THEME_PALETTE[idx][5],  -1);
-}
-
-/* ===================================================================== */
-/* §4  polar — polar↔cell mapping with terminal aspect correction         */
-/* ===================================================================== */
-
+/* polar→cell with terminal aspect correction (sin scaled by ASPECT). */
 static inline void polar_to_cell(int cx, int cy, float r, float theta,
                                  int *col, int *row) {
     *col = cx + (int)roundf(r * cosf(theta));
     *row = cy + (int)roundf(r * sinf(theta) * ASPECT);
+}
+
+/* angle of the i-th of n features evenly spaced around the circle, plus rot. */
+static inline float feature_angle(int i, int n, float rot) {
+    return rot + (float)i / (float)n * 2.0f * (float)M_PI;
+}
+
+/* valid star-polygon stride d: 1 (a plain polygon) unless 2 <= d < n (a star). */
+static int star_stride(int density, int n) {
+    int d = (density < 2) ? 1 : density;
+    if (d >= n) d = 1;
+    return d;
 }
 
 /* Pick an ASCII line glyph that matches a (dx, dy) direction in cells. */
@@ -371,21 +402,6 @@ static char line_glyph(int dx, int dy) {
     if (r > 2.0f) return '|';
     /* Diagonals: in screen coords y points DOWN.  Same-sign dx,dy = '\'. */
     return ((dx > 0) == (dy > 0)) ? '\\' : '/';
-}
-
-/* ===================================================================== */
-/* §5  mandala — primitives + dispatch                                    */
-/* ===================================================================== */
-
-/* paint_cell: bounds-checked stamp.  Reserves rows 0 and rows-1 for HUD. */
-static void paint_cell(int col, int row, char ch, int pair, int attr) {
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    if (col < 0 || col >= cols)        return;
-    if (row < 1 || row >= rows - 1)    return;
-    attron (COLOR_PAIR(pair) | attr);
-    mvaddch(row, col, (chtype)(unsigned char)ch);
-    attroff(COLOR_PAIR(pair) | attr);
 }
 
 /* progress_to_count — how many of `n` features to draw at this build
@@ -407,44 +423,178 @@ static int progress_to_count(int n, float progress) {
     return k;
 }
 
-/* §5.1 circle — many '.' samples around a continuous ring */
+/* build-animation progress of ring i in [0,1]; <= 0 before its reveal window
+ * opens. Ring i's window is [BINDU_AT + i·RING_BUILD_DUR, +RING_BUILD_DUR]. */
+static float ring_build_progress(int i, float build_time) {
+    float ring_start = BINDU_AT + (float)i * RING_BUILD_DUR;
+    float prog = (build_time - ring_start) / RING_BUILD_DUR;
+    if (prog > 1.0f) prog = 1.0f;
+    return prog;
+}
+
+/* ring count + total build duration for a preset */
+static int preset_ring_count(const MandalaPreset *p) {
+    int n = 0;
+    for (int i = 0; i < MAX_RINGS; i++) {
+        if (p->rings[i].type == RING_NONE) break;
+        n++;
+    }
+    return n;
+}
+
+static float preset_build_duration(const MandalaPreset *p) {
+    return BINDU_AT + (float)preset_ring_count(p) * RING_BUILD_DUR;
+}
+
+/* base mandala radius that fits the screen (minus the HUD margin), scaled by the
+ * user size; the ×0.5 and /ASPECT make it round in 2:1 terminal cells. */
+static float mandala_base_radius(int rows, int cols, float scale) {
+    float max_r_x = (float)(cols - SCREEN_MARGIN) * 0.5f;
+    float max_r_y = (float)(rows - SCREEN_MARGIN) * 0.5f / ASPECT;
+    float base_r  = fminf(max_r_x, max_r_y) * scale;
+    if (base_r < MANDALA_MIN_R) base_r = MANDALA_MIN_R;
+    return base_r;
+}
+
+/* ===================================================================== */
+/* §4  DATA — Scene runtime state                                          */
+/* ===================================================================== *
+ * Declaration + the single instance; no behaviour. Mutated by SIMULATION (§5)
+ * / INIT (§7) / EVENTS (§8) and read by RENDER (§6).                         */
+
+/* Scene — the whole runtime view in one aggregate, read like a table of
+ * contents. Functions take the NARROWEST slice they need (const Scene* to read,
+ * Scene* to mutate); only the orchestrators (scene_init / scene_reset /
+ * scene_tick) and the event handler take Scene*, so the layers never re-couple.
+ *   WHAT   — preset_idx: which of the PRESETS[] mandalas is on screen.
+ *   HOW    — the user-tunable knobs: scale (size), rotation_on (spin toggle).
+ *   WHEN   — the cosmetic animation advanced per tick: build_time +
+ *            build_complete (the ring-by-ring reveal) and rot (rotation angle);
+ *            paused freezes both.
+ *   RENDER — theme_idx: the selected colour-palette index.
+ *   FPS    — a sliding-window frame-rate meter, shown in the HUD only. */
+typedef struct {
+    /* WHAT — the mandala on screen */
+    int     preset_idx;       /* index into PRESETS[]  [0..N_PRESETS)          */
+    /* HOW — user-tunable knobs */
+    float   scale;            /* size multiplier  [SCALE_MIN..SCALE_MAX]       */
+    bool    rotation_on;      /* slow rotation enabled?                        */
+    /* WHEN — cosmetic animation + run state */
+    float   build_time;       /* seconds into the ring-by-ring build reveal    */
+    bool    build_complete;   /* true once build_time >= the preset's duration */
+    float   rot;              /* current rotation angle (radians)              */
+    bool    paused;           /* 1 freezes the build + rotation                */
+    /* RENDER — palette selection */
+    int     theme_idx;        /* index into THEME_*  [0..N_THEMES)             */
+    /* FPS — sliding-window frame-rate meter (HUD only) */
+    float   fps;              /* last computed frames/sec                      */
+    int64_t fps_window_start; /* clock_ns at the window's start                */
+    int     frames_in_window; /* frames counted since the window start         */
+} Scene;
+
+static Scene g_scene;
+
+/* ===================================================================== */
+/* §5  SIMULATION — scene_tick (advance the build animation + rotation)    */
+/* ===================================================================== *
+ * The ONLY per-tick state advance. The mandala is a static drawing, so the only
+ * state that moves is cosmetic ANIMATION: the build-reveal timer (build_time /
+ * build_complete) and the rotation angle (rot). Paused short-circuits both.    */
+
+static void scene_tick(Scene *s, float dt) {
+    if (s->paused) return;
+
+    /* Advance build_time until the preset is complete; clamp on completion. */
+    if (!s->build_complete) {
+        const MandalaPreset *p = &PRESETS[s->preset_idx];
+        float dur = preset_build_duration(p);
+        s->build_time += dt;
+        if (s->build_time >= dur) {
+            s->build_time     = dur;
+            s->build_complete = true;
+        }
+    }
+
+    if (s->rotation_on) {
+        s->rot += ROT_RATE * dt;
+        const float TWO_PI = 2.0f * (float)M_PI;
+        while (s->rot >  TWO_PI) s->rot -= TWO_PI;
+        while (s->rot < -TWO_PI) s->rot += TWO_PI;
+    }
+}
+
+/* ===================================================================== */
+/* §6  RENDER — colour setup, primitives, draw_mandala, scene_draw         */
+/* ===================================================================== *
+ * State → screen (reads only, never mutates Scene). colour_init/theme_apply
+ * load pairs; the draw_* primitives stamp cells via paint_cell; draw_mandala
+ * dispatches a preset's rings; scene_draw composes the frame + HUD.           */
+
+static void color_init(void) {
+    use_default_colors();
+    init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
+    init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
+}
+
+static void theme_apply(int idx) {
+    init_pair(PAIR_BINDU,   THEME_BINDU  [idx],     -1);
+    init_pair(PAIR_CIRCLE,  THEME_PALETTE[idx][0],  -1);
+    init_pair(PAIR_DOTS,    THEME_PALETTE[idx][1],  -1);
+    init_pair(PAIR_PETALS,  THEME_PALETTE[idx][2],  -1);
+    init_pair(PAIR_POLYGON, THEME_PALETTE[idx][3],  -1);
+    init_pair(PAIR_STAR,    THEME_PALETTE[idx][4],  -1);
+    init_pair(PAIR_RAYS,    THEME_PALETTE[idx][5],  -1);
+}
+
+/* paint_cell: bounds-checked stamp.  Reserves rows 0 and rows-1 for HUD. */
+static void paint_cell(int col, int row, char ch, int pair, int attr) {
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    if (col < 0 || col >= cols)        return;
+    if (row < 1 || row >= rows - 1)    return;
+    attron (COLOR_PAIR(pair) | attr);
+    mvaddch(row, col, (chtype)(unsigned char)ch);
+    attroff(COLOR_PAIR(pair) | attr);
+}
+
+/* circle — many '.' samples around a continuous ring */
 static void draw_circle(int cx, int cy, float r, float progress) {
     if (progress <= 0.0f || r < 0.5f) return;
-    int n = (int)(2.0f * (float)M_PI * r * 1.4f);
-    if (n < 24)  n = 24;
-    if (n > 360) n = 360;
+    int n = (int)(2.0f * (float)M_PI * r * CIRCLE_OVERSAMPLE);
+    if (n < CIRCLE_SAMPLES_MIN) n = CIRCLE_SAMPLES_MIN;
+    if (n > CIRCLE_SAMPLES_MAX) n = CIRCLE_SAMPLES_MAX;
     int n_done = progress_to_count(n, progress);
     for (int i = 0; i < n_done; i++) {
-        float t = (float)i / (float)n * 2.0f * (float)M_PI;
+        float t = feature_angle(i, n, 0.0f);
         int col, row;
         polar_to_cell(cx, cy, r, t, &col, &row);
         paint_cell(col, row, '.', PAIR_CIRCLE, A_NORMAL);
     }
 }
 
-/* §5.2 dots — N evenly-spaced 'o' glyphs */
+/* dots — N evenly-spaced 'o' glyphs */
 static void draw_dots(int cx, int cy, float r, int n, float rot, float progress) {
     if (n < 1 || progress <= 0.0f) return;
     int n_done = progress_to_count(n, progress);
     for (int i = 0; i < n_done; i++) {
-        float t = rot + (float)i / (float)n * 2.0f * (float)M_PI;
+        float t = feature_angle(i, n, rot);
         int col, row;
         polar_to_cell(cx, cy, r, t, &col, &row);
         paint_cell(col, row, 'o', PAIR_DOTS, A_BOLD);
     }
 }
 
-/* §5.3 petals — N petal-clusters: bold '*' centre + dim '.' flanks */
+/* petals — N petal-clusters: bold '*' centre + dim '.' flanks */
 static void draw_petals(int cx, int cy, float r, int n, float rot, float progress) {
     if (n < 1 || progress <= 0.0f) return;
     int n_done = progress_to_count(n, progress);
     for (int i = 0; i < n_done; i++) {
-        float t = rot + (float)i / (float)n * 2.0f * (float)M_PI;
+        float t = feature_angle(i, n, rot);
         int col, row;
         /* radial flanks read as a small petal cluster */
-        polar_to_cell(cx, cy, r * 0.85f, t, &col, &row);
+        polar_to_cell(cx, cy, r * PETAL_FLANK_LO, t, &col, &row);
         paint_cell(col, row, '.', PAIR_PETALS, A_DIM);
-        polar_to_cell(cx, cy, r * 1.15f, t, &col, &row);
+        polar_to_cell(cx, cy, r * PETAL_FLANK_HI, t, &col, &row);
         paint_cell(col, row, '.', PAIR_PETALS, A_DIM);
         /* central glyph painted last so it dominates the cluster */
         polar_to_cell(cx, cy, r, t, &col, &row);
@@ -452,7 +602,7 @@ static void draw_petals(int cx, int cy, float r, int n, float rot, float progres
     }
 }
 
-/* §5.4 line walker — paint cells along a straight line in cell coords */
+/* line walker — paint cells along a straight line in cell coords */
 static void draw_line(int x1, int y1, int x2, int y2, int pair, int attr) {
     int dx = x2 - x1, dy = y2 - y1;
     int adx = abs(dx), ady = abs(dy);
@@ -467,19 +617,18 @@ static void draw_line(int x1, int y1, int x2, int y2, int pair, int attr) {
     }
 }
 
-/* §5.5 star_polygon — handles RING_POLYGON (d<=1) and RING_STAR (d>=2).
+/* star_polygon — handles RING_POLYGON (d<=1) and RING_STAR (d>=2).
  * Connects vertex[i] to vertex[(i + d) mod n] for every i.  When
  * gcd(n, d) > 1, the result is a MULTI-GRAPH (e.g. 6/2 = two triangles
  * = hexagram) — visually correct for that case. */
 static void draw_star_polygon(int cx, int cy, float r, int n, int density,
                               float rot, int pair, float progress) {
     if (n < 3 || progress <= 0.0f) return;
-    int d = (density < 2) ? 1 : density;
-    if (d >= n) d = 1;
+    int d = star_stride(density, n);
     int n_done = progress_to_count(n, progress);
     for (int i = 0; i < n_done; i++) {
-        float t1 = rot + (float)i             / (float)n * 2.0f * (float)M_PI;
-        float t2 = rot + (float)((i + d) % n) / (float)n * 2.0f * (float)M_PI;
+        float t1 = feature_angle(i,           n, rot);
+        float t2 = feature_angle((i + d) % n, n, rot);
         int x1, y1, x2, y2;
         polar_to_cell(cx, cy, r, t1, &x1, &y1);
         polar_to_cell(cx, cy, r, t2, &x2, &y2);
@@ -487,34 +636,20 @@ static void draw_star_polygon(int cx, int cy, float r, int n, int density,
     }
 }
 
-/* §5.6 rays — N lines from inner gap to outer radius */
+/* rays — N lines from inner gap to outer radius */
 static void draw_rays(int cx, int cy, float r, int n, float rot, float progress) {
     if (n < 1 || progress <= 0.0f) return;
     int n_done = progress_to_count(n, progress);
     for (int i = 0; i < n_done; i++) {
-        float t = rot + (float)i / (float)n * 2.0f * (float)M_PI;
+        float t = feature_angle(i, n, rot);
         int x1, y1, x2, y2;
-        polar_to_cell(cx, cy, r * 0.10f, t, &x1, &y1);
-        polar_to_cell(cx, cy, r,         t, &x2, &y2);
+        polar_to_cell(cx, cy, r * RAY_INNER_FRAC, t, &x1, &y1);
+        polar_to_cell(cx, cy, r,                  t, &x2, &y2);
         draw_line(x1, y1, x2, y2, PAIR_RAYS, A_BOLD);
     }
 }
 
-/* §5.7 ring count + total build duration for a preset */
-static int preset_ring_count(const MandalaPreset *p) {
-    int n = 0;
-    for (int i = 0; i < MAX_RINGS; i++) {
-        if (p->rings[i].type == RING_NONE) break;
-        n++;
-    }
-    return n;
-}
-
-static float preset_build_duration(const MandalaPreset *p) {
-    return BINDU_AT + (float)preset_ring_count(p) * RING_BUILD_DUR;
-}
-
-/* §5.8 dispatcher — render rings up to current build_time, bindu on top.
+/* dispatcher — render rings up to current build_time, bindu on top.
  * Each ring has a time window [BINDU_AT + i·RING_BUILD_DUR,
  * BINDU_AT + (i+1)·RING_BUILD_DUR]; within that window features fill in. */
 static void draw_mandala(const MandalaPreset *p,
@@ -522,14 +657,11 @@ static void draw_mandala(const MandalaPreset *p,
                          float build_time) {
     for (int i = 0; i < MAX_RINGS; i++) {
         const Ring *ring = &p->rings[i];
-        if (ring->type == RING_NONE) break;
-        float ring_start = BINDU_AT + (float)i * RING_BUILD_DUR;
-        if (build_time <= ring_start) continue;
-        float prog = (build_time - ring_start) / RING_BUILD_DUR;
-        if (prog > 1.0f) prog = 1.0f;
-
+        if (ring->type == RING_NONE) break;          /* end of the ring list  */
+        float prog = ring_build_progress(i, build_time);
+        if (prog <= 0.0f) continue;                  /* reveal window not open */
         float r = ring->radius * base_r;
-        if (r < 0.5f) continue;
+        if (r < 0.5f) continue;                      /* sub-cell — nothing to draw */
         switch (ring->type) {
             case RING_CIRCLE:  draw_circle      (cx, cy, r,                         prog); break;
             case RING_DOTS:    draw_dots        (cx, cy, r, ring->n,           rot, prog); break;
@@ -545,128 +677,21 @@ static void draw_mandala(const MandalaPreset *p,
     }
 }
 
-/* ===================================================================== */
-/* §6  scene                                                               */
-/* ===================================================================== */
-
-typedef struct {
-    int     preset_idx;
-    int     theme_idx;
-    float   scale;
-    bool    rotation_on;
-    bool    paused;
-    float   rot;
-    float   build_time;       /* seconds since current preset started */
-    bool    build_complete;   /* true once build_time >= preset's duration */
-    float   fps;
-    int64_t fps_window_start;
-    int     frames_in_window;
-} Scene;
-
-static Scene g_scene;
-
-/* Restart the build animation for the current preset. */
-static void scene_restart_build(void) {
-    g_scene.build_time     = 0.0f;
-    g_scene.build_complete = false;
-}
-
-static void scene_reset(void) {
-    g_scene.preset_idx       = 0;
-    g_scene.theme_idx        = 0;
-    g_scene.scale            = SCALE_DEFAULT;
-    g_scene.rotation_on      = false;
-    g_scene.paused           = false;
-    g_scene.rot              = 0.0f;
-    scene_restart_build();
-    theme_apply(g_scene.theme_idx);
-}
-
-static void scene_init(void) {
-    g_scene.fps               = 0.0f;
-    g_scene.fps_window_start  = clock_ns();
-    g_scene.frames_in_window  = 0;
-    scene_reset();
-}
-
-static void scene_input(int ch) {
-    switch (ch) {
-        case 'n': case KEY_RIGHT:
-            g_scene.preset_idx = (g_scene.preset_idx + 1) % N_PRESETS;
-            scene_restart_build();
-            break;
-        case 'p': case KEY_LEFT:
-            g_scene.preset_idx = (g_scene.preset_idx + N_PRESETS - 1) % N_PRESETS;
-            scene_restart_build();
-            break;
-        case 't': case 'T':
-            g_scene.theme_idx = (g_scene.theme_idx + 1) % N_THEMES;
-            theme_apply(g_scene.theme_idx);
-            break;
-        case '+': case '=':
-            g_scene.scale = fminf(SCALE_MAX, g_scene.scale + SCALE_STEP); break;
-        case '-':
-            g_scene.scale = fmaxf(SCALE_MIN, g_scene.scale - SCALE_STEP); break;
-        case 'r': case 'R':
-            g_scene.rotation_on = !g_scene.rotation_on; break;
-        case ' ':
-            g_scene.paused = !g_scene.paused; break;
-        case 'b': case 'B':
-            scene_restart_build(); break;     /* replay build animation */
-        case '0':
-            scene_reset(); break;
-        default: break;
-    }
-}
-
-static void scene_tick(float dt) {
-    if (g_scene.paused) return;
-
-    /* Advance build_time until the preset is complete; clamp on completion. */
-    if (!g_scene.build_complete) {
-        const MandalaPreset *p = &PRESETS[g_scene.preset_idx];
-        float dur = preset_build_duration(p);
-        g_scene.build_time += dt;
-        if (g_scene.build_time >= dur) {
-            g_scene.build_time     = dur;
-            g_scene.build_complete = true;
-        }
-    }
-
-    if (g_scene.rotation_on) {
-        g_scene.rot += ROT_RATE * dt;
-        const float TWO_PI = 2.0f * (float)M_PI;
-        while (g_scene.rot >  TWO_PI) g_scene.rot -= TWO_PI;
-        while (g_scene.rot < -TWO_PI) g_scene.rot += TWO_PI;
-    }
-}
-
-static void scene_draw(void) {
-    erase();
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    int cx = cols / 2;
-    int cy = rows / 2;
-
-    /* base radius bounded by both axes (with HUD reservation). */
-    float max_r_x = (float)(cols - 4) * 0.5f;
-    float max_r_y = (float)(rows - 4) * 0.5f / ASPECT;
-    float base_r  = fminf(max_r_x, max_r_y) * g_scene.scale;
-    if (base_r < 2.0f) base_r = 2.0f;
-
-    const MandalaPreset *p = &PRESETS[g_scene.preset_idx];
-    draw_mandala(p, cx, cy, base_r, g_scene.rot, g_scene.build_time);
+/* draw_hud — the two HUD bars: a top-right yellow data line (fps / preset /
+ * theme / size / build-status / rotation) and a bottom cyan key legend. */
+static void draw_hud(const Scene *s, int rows, int cols) {
+    const MandalaPreset *p = &PRESETS[s->preset_idx];
 
     /* Build-progress string: "build  47%" while assembling, "complete"
      * once finished, "paused" if held mid-build. */
     char build_str[24];
-    if (g_scene.build_complete) {
+    if (s->build_complete) {
         snprintf(build_str, sizeof build_str, "complete");
-    } else if (g_scene.paused) {
+    } else if (s->paused) {
         snprintf(build_str, sizeof build_str, "PAUSED  ");
     } else {
         float dur = preset_build_duration(p);
-        int   pct = (int)(100.0f * g_scene.build_time / dur);
+        int   pct = (int)(100.0f * s->build_time / dur);
         if (pct < 0)   pct = 0;
         if (pct > 99)  pct = 99;
         snprintf(build_str, sizeof build_str, "build %2d%%", pct);
@@ -676,13 +701,13 @@ static void scene_draw(void) {
     char buf[160];
     snprintf(buf, sizeof buf,
              " %5.1f fps  preset %2d/%d: %-12s  theme: %s  size: %.2f  %s  rot: %s ",
-             (double)g_scene.fps,
-             g_scene.preset_idx + 1, N_PRESETS,
-             PRESETS[g_scene.preset_idx].name,
-             THEME_NAME[g_scene.theme_idx],
-             (double)g_scene.scale,
+             (double)s->fps,
+             s->preset_idx + 1, N_PRESETS,
+             PRESETS[s->preset_idx].name,
+             THEME_NAME[s->theme_idx],
+             (double)s->scale,
              build_str,
-             g_scene.rotation_on ? "ON " : "OFF");
+             s->rotation_on ? "ON " : "OFF");
     int hud_len = (int)strlen(buf);
     int hud_x   = cols - hud_len;
     if (hud_x < 0) hud_x = 0;
@@ -696,14 +721,83 @@ static void scene_draw(void) {
     attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(rows - 1, 0, "%s", hint);
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+static void scene_draw(const Scene *s) {
+    erase();
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    int cx = cols / 2, cy = rows / 2;
+
+    float base_r = mandala_base_radius(rows, cols, s->scale);
+    draw_mandala(&PRESETS[s->preset_idx], cx, cy, base_r, s->rot, s->build_time);
+    draw_hud(s, rows, cols);
 
     wnoutrefresh(stdscr);
     doupdate();
 }
 
 /* ===================================================================== */
-/* §7  screen                                                              */
+/* §7  INIT/RESET — scene defaults & build restart (NOT part of the tick)  */
 /* ===================================================================== */
+
+/* Restart the build animation for the current preset. */
+static void scene_restart_build(Scene *s) {
+    s->build_time     = 0.0f;
+    s->build_complete = false;
+}
+
+static void scene_reset(Scene *s) {
+    s->preset_idx       = 0;
+    s->theme_idx        = 0;
+    s->scale            = SCALE_DEFAULT;
+    s->rotation_on      = false;
+    s->paused           = false;
+    s->rot              = 0.0f;
+    scene_restart_build(s);
+    theme_apply(s->theme_idx);
+}
+
+static void scene_init(Scene *s) {
+    s->fps               = 0.0f;
+    s->fps_window_start  = clock_ns();
+    s->frames_in_window  = 0;
+    scene_reset(s);
+}
+
+/* ===================================================================== */
+/* §8  EVENTS — keys, signals, screen setup (mutate state, NOT the tick)   */
+/* ===================================================================== */
+
+static void scene_input(Scene *s, int ch) {
+    switch (ch) {
+        case 'n': case KEY_RIGHT:
+            s->preset_idx = (s->preset_idx + 1) % N_PRESETS;
+            scene_restart_build(s);
+            break;
+        case 'p': case KEY_LEFT:
+            s->preset_idx = (s->preset_idx + N_PRESETS - 1) % N_PRESETS;
+            scene_restart_build(s);
+            break;
+        case 't': case 'T':
+            s->theme_idx = (s->theme_idx + 1) % N_THEMES;
+            theme_apply(s->theme_idx);
+            break;
+        case '+': case '=':
+            s->scale = fminf(SCALE_MAX, s->scale + SCALE_STEP); break;
+        case '-':
+            s->scale = fmaxf(SCALE_MIN, s->scale - SCALE_STEP); break;
+        case 'r': case 'R':
+            s->rotation_on = !s->rotation_on; break;
+        case ' ':
+            s->paused = !s->paused; break;
+        case 'b': case 'B':
+            scene_restart_build(s); break;     /* replay build animation */
+        case '0':
+            scene_reset(s); break;
+        default: break;
+    }
+}
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_resize  = 0;
@@ -733,7 +827,7 @@ static void screen_cleanup(void) {
 }
 
 /* ===================================================================== */
-/* §8  app                                                                 */
+/* §9  app — the frame loop (the per-tick combine)                         */
 /* ===================================================================== */
 
 int main(void) {
@@ -744,7 +838,7 @@ int main(void) {
     screen_init();
     atexit(screen_cleanup);
 
-    scene_init();
+    scene_init(&g_scene);
 
     int64_t prev_ns = clock_ns();
     const int64_t frame_ns = NS_PER_SEC / TARGET_FPS;
@@ -767,12 +861,12 @@ int main(void) {
                 g_running = 0;
                 break;
             }
-            scene_input(ch);
+            scene_input(&g_scene, ch);
             ch = getch();
         }
 
-        scene_tick(dt);
-        scene_draw();
+        scene_tick(&g_scene, dt);
+        scene_draw(&g_scene);
 
         /* fps update ~every FPS_UPDATE_MS */
         g_scene.frames_in_window++;

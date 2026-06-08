@@ -24,12 +24,13 @@
  *   q/ESC   quit         p/Space  pause/resume     r  reset current arms
  *   a       more arms (2→3→4→2)   A  fewer arms
  *   t/T     next/prev theme        +/-  orbit speed faster/slower
- *   ]/[     FPS up/down
+ *   ]/[     FPS up/down            </>  steps per frame
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra artistic/galaxy.c -o galaxy -lncurses -lm
  *
- * Sections: §1 config  §2 clock  §3 color  §4 galaxy  §5 draw  §6 screen  §7 app
+ * Sections (cut by layer — see ARCHITECTURE):  §1 config  §2 clock  §3 data
+ *   §4 logic  §5 sim  §6 init  §7 render  §8 events  §9 screen  §10 app
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -53,102 +54,79 @@
  *                  correction.  Density → glyph ramp (. , : o O 0 @).
  *                  Radial zone (CORE/DISK/HALO) determines colour pair.
  *
+ * References     :
+ *   Galaxy dynamics (rotation curve, differential rotation, spiral arms):
+ *     Binney & Tremaine, "Galactic Dynamics" (2nd ed., Princeton 2008) — the
+ *       standard text: rotation curves, differential rotation, log-spiral arms.
+ *     Rubin & Ford, "Rotation of the Andromeda Nebula…" (ApJ 1970) — the flat
+ *       rotation curve / dark-matter evidence; the constant-V0 law this sim uses.
+ *     Lin & Shu, "On the Spiral Structure of Disk Galaxies" (ApJ 1964) —
+ *       density-wave theory; why REAL arms persist instead of winding up — the
+ *       counterpoint to this kinematic model, which deliberately winds up.
+ *     Toomre, "Theories of Spiral Structure" (ARA&A 1977) — review including the
+ *       winding dilemma this file demonstrates.
+ *
+ *   Rendering & numerics:
+ *     Bourke, "Character representation of greyscale images" — the density →
+ *       glyph ramp (. , : o O 0 @) used in scene_draw.
+ *     Box & Muller, "A Note on the Generation of Random Normal Deviates"
+ *       (Ann. Math. Stat. 1958) — the Gaussian sampling for the bulge (rng_gauss).
+ *     Marsaglia, "Xorshift RNGs" (J. Stat. Soft. 2003) — the xorshift32 generator
+ *       (rng_next), a fast deterministic PRNG for reproducible seeding.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+
+/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
  *
- * CORE IDEA
- * ─────────
- * The visible spiral arms are NOT a structure — they are an artefact of
- * statistical placement plus shear.  Seed 3000 stars on logarithmic
- * spiral curves, give every star the SAME tangential speed (flat
- * rotation curve), and let inner stars (small r) accumulate angle
- * faster than outer ones (ω = V0 / r).  After thousands of ticks the
- * arms wind up like spaghetti around a fork.  The "winding problem" of
- * real galaxy theory is the whole demo.
+ * The file is cut into LAYERS by concern. The simulation/render state lives on
+ * one Galaxy aggregate (§3 DATA); the orchestrators (galaxy_init / galaxy_step /
+ * scene_draw) take Galaxy* and everything else takes the narrowest value it
+ * needs, so the layers never re-couple. PRNG state (g_rng), the 256-colour flag
+ * (g_has_256) and the signal flags (g_resize/g_quit) stay module-global —
+ * infrastructure, not galaxy data.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine many runners on circular tracks of different radii, all
- * moving at the same forward SPEED in metres/second.  The runner on the
- * inner track laps the outer one constantly because their track is
- * shorter.  Now line them up at t=0 along a straight radial line — a
- * "starting gate".  Run for an hour.  The line bends into a spiral.
- * That is exactly what each arm is doing here, except the seed line is
- * already a logarithmic spiral, which the differential rotation keeps
- * tightening forever.
+ *   Layer        Section            Mutates
+ *   ─────────────────────────────────────────────────────────────────────
+ *   PERFORMANCE  §2 clock           nothing (reads OS clock, sleeps)
+ *   DATA         §3 data            — Galaxy aggregate + type declarations —
+ *   LOGIC        §4 logic           g_rng only (its own PRNG word); pure maps
+ *   SIMULATION   §5 galaxy_step     galaxy.stars[].theta (orbits) + .bright (trail)
+ *   INIT/RESET   §6 galaxy_init     galaxy.stars[], .bright, .narms (full reseed)
+ *   RENDER       §7 render          the screen, + galaxy.bright decay (see note)
+ *   EVENTS       §8 events          g_resize, g_quit, galaxy.rows, galaxy.cols
+ *   —            §9 screen          ncurses init / palette load
+ *   —            §10 app            signals, the frame loop, key events
  *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Init: split N_STARS into 20% bulge / 70% arms / 10% halo.  Bulge
- *     stars get half-Gaussian small radii.  Arm stars are placed along
- *     N_ARMS log-spirals: θ = arm·(2π/N) + WINDING·ln(r/r_min) + jitter.
- *     Halo stars get uniform large radii.  Each star caches ω = V0 / r.
- *  2. Each frame, run g_steps physics sub-steps:
- *       For every star: θ += ω · g_speed
- *       Convert (r, θ) to screen (sx, sy) with rx = 0.44·cols and
- *       ry = 0.5·rx (terminal aspect correction).
- *       Add 1/g_steps to g_bright[sy][sx].
- *  3. Each render frame: multiply g_bright[][] by DECAY=0.82 — this is
- *     a one-line exponential moving average that gives the trail look.
- *  4. Find b_max over the visible region; normalise t = b / b_max.
- *  5. Pick glyph by t threshold (".,:oO0@") and pick colour pair by
- *     normalised radius rn = sqrt((dx/rx)² + (dy/ry)²):
- *       rn < 0.10 → CP_CORE,  < 0.65 → CP_DISK,  else CP_HALO.
- *  6. Always paint a '*' at the centre so the galactic nucleus is
- *     visible regardless of star density.
+ * EFFECTS is woven in, not a standalone layer: galaxy.bright is cosmetic-only
+ * trail state (a per-cell brightness accumulator with an exponential fade), but
+ * its two mutations are inline — galaxy_step ACCUMULATES star splats into it (§5)
+ * and scene_draw FADES it once per frame (bright *= DECAY at the top of §7).
+ * Extracting the fade into its own EFFECTS step is deferred; for now it is the
+ * single, deliberate place RENDER mutates state, called out here so it is not a
+ * surprise. The stars' physics (r, theta, omega) never reads bright, so the
+ * trail can never affect the orbits.
  *
- * KEY FORMULAS
- * ────────────
- *  Flat rotation     v_circ = V0 = const     (independent of r)
- *  Angular vel       ω(r) = V0 / r            (Keplerian decay)
- *  Log spiral seed   θ₀(r) = arm·(2π/N) + WINDING · ln(r / r_min)
- *  Tick update       θ ← θ + ω · g_speed
- *  Polar→screen      sx = cx + r·cosθ · rx,  sy = cy + r·sinθ · ry
- *  Aspect fix        ry = 0.5 · rx           (cells are 2× taller)
- *  Decay model       B(t+1) = B(t) · DECAY + new_stars
- *  Steady state      B_ss = f / (1 - DECAY) = f · 5.56
- *  Box-Muller        z = sqrt(-2 ln u₁) · cos(2π u₂)   (bulge sampling)
- *  Glyph ramp        t < 0.12 .  < 0.25 ,  < 0.40 :  < 0.55 o
- *                    < 0.70 O  < 0.85 0(bold)  else @(bold)
+ * LOGIC (rng_next / rng_float / rng_gauss) does no I/O and touches only its own
+ * PRNG word g_rng — it never reads the Galaxy or the screen — so reordering or
+ * deleting RENDER/EFFECTS cannot change a LOGIC result.
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • DECAY=0.82 is the steady-state controller; cranking it to 0.95
- *    makes trails persist for ~20 frames (very smeary), 0.5 makes them
- *    barely visible.  Set DECAY=1.0 and the buffer never clears — the
- *    arms blur into a uniform disc within a minute.
- *  • Resize triggers galaxy_init — winding state is LOST every resize.
- *    The arms re-emerge fresh.  Pressing 'r' has the same effect.
- *  • g_steps is multiplicative on physics-per-frame; raising it to 16
- *    makes one rendered frame compress 16 ticks of winding, so the
- *    galaxy ages 16× faster (visually).
- *  • Bulge radius is hard-clamped to [0.004, 0.20] to prevent ω = V0 / r
- *    from blowing up at r → 0; without the floor the centre stars
- *    teleport.
- *  • The ARM_SCATTER=0.25 jitter adds (rng-0.5)·0.5 rad to each star;
- *    setting it to 0 produces RAZOR-thin arms that look unnaturally
- *    geometric.
- *  • Halo stars have NO arm structure; if you raise their fraction past
- *    ~30% the spiral shape gets washed out completely.
- *  • The peak-normalising step makes brightness adaptive — a sparse
- *    galaxy still looks bright because b_max scales with density.
+ * No DELAYS layer: pause is a single flag (galaxy.paused) tested once in main
+ * before the tick. The sim-rate gate (run galaxy.steps galaxy_steps only when
+ * now >= next_tick) is PERFORMANCE, living in main's loop (§10), not a hold.
  *
- * HOW TO VERIFY
- * ─────────────
- *  • At default speed (1×) and 2 arms, count: 2 spiral arms should be
- *    clearly visible at t = ~50 ticks; by tick ~500 they wrap multiple
- *    times around the centre.
- *  • Press 'r' to reset, then 'a' twice — arm count should cycle
- *    2→3→4→2; each reset shows the new symmetry.
- *  • Set speed to MAX (5×) — winding visibly accelerates 5×.
- *  • Press 't' through all 5 themes; CORE/DISK/HALO colour zones
- *    should differ for each, but the structure is unchanged.
- *  • Pause — counts of bright pixels should NOT decay further (decay
- *    runs in scene_draw which still runs but galaxy_step does not, so
- *    new stars never refresh — they fade until floor).
+ * PER-TICK COMBINE — main's loop (§10) is the ONLY place sim state advances, in
+ * order, and only when not paused and the sim-clock is due:
+ *   1. for s in 0..galaxy.steps: galaxy_step(&galaxy)  (orbits + trail accumulate)
+ *   then every frame:  scene_draw(&galaxy)             (trail fade + project + HUD)
+ *
+ * User events (quit, pause, reset r, arms a/A, theme t/T, speed +/-, fps [/],
+ * steps </>, resize) DO mutate state but are NOT part of the tick — they run in
+ * main's input/resize handling, before the gated simulate step. Reset r, arm
+ * change, and resize re-invoke INIT (galaxy_init, §6).
  *
  * ─────────────────────────────────────────────────────────────────────── */
+
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -207,8 +185,10 @@
 static const float PI = 3.14159265358979f;
 
 /* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* §2  PERFORMANCE — clock                                                 */
+/* ===================================================================== *
+ * Monotonic clock + sleep. Mutates nothing. The sim-rate gate (TICK_NS,
+ * next_tick) and frame sleep that use these live in main's loop (§10).      */
 
 static int64_t clock_ns(void)
 {
@@ -225,19 +205,35 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color / theme                                                      */
-/* ===================================================================== */
+/* §3  DATA — types, palette table & the Galaxy aggregate                 */
+/* ===================================================================== *
+ * Declarations only; no behaviour. The Galaxy aggregate is mutated by
+ * SIMULATION (§5) / INIT (§6) / RENDER (§7, the trail fade) / EVENTS (§8) and
+ * read by RENDER; the infra globals (g_has_256, g_rng) sit alongside it.       */
 
-/*
- * Three radial colour zones:
- *   CP_CORE — bright stellar bulge (innermost ~10% of radius)
- *   CP_DISK — spiral arms and disc  (10%..65% of radius)
- *   CP_HALO — outer diffuse halo    (> 65% of radius)
- *
- * Character encodes local density; colour encodes radial position.
- */
-enum { CP_CORE=1, CP_DISK, CP_HALO, CP_HUD };
+/* Colour-pair ids (ncurses pairs are 1-BASED — pair 0 is the reserved default).
+ * The display is a TWO-CHANNEL encoding: the GLYPH carries local brightness (a
+ * Bourke-style density ramp), the COLOUR carries the star's radial ZONE — so a
+ * reader sees structure (bulge vs arms vs halo) and density at the same time.
+ * The three star zones mirror the morphology of a real disc galaxy and split at
+ * fixed fractions of the normalised radius (r_core=0.10, r_disk=0.65 in
+ * scene_draw):
+ *   CP_CORE — stellar bulge        (innermost < 10% of radius)
+ *   CP_DISK — spiral arms and disc (10%..65%)
+ *   CP_HALO — outer diffuse halo   (> 65%)
+ *   CP_HUD / CP_HINT — the two HUD bars (yellow data row, cyan action row). */
+enum { CP_CORE=1, CP_DISK, CP_HALO, CP_HUD, CP_HINT };
 
+/* Theme — one named RENDER palette: a foreground colour for each of the three
+ * radial zones (core / disk / halo), data-driven so the whole look swaps at
+ * runtime (t/T cycles k_themes) with zero code change. Two PARALLEL sets are
+ * stored — xterm-256 indices (16..231 = 6×6×6 colour cube, 232..255 = grays)
+ * and an 8-colour fallback — so theme_apply can pick by terminal capability
+ * (g_has_256). Foregrounds are always on a black bg (deep space). The live
+ * choice is Galaxy.theme; one row per theme.
+ *   core256/disk256/halo256 : 256-colour fg per zone (bulge / arms / halo)
+ *   core8/disk8/halo8       : 8-colour fallback for the same three zones
+ *   name                    : label shown in the HUD */
 typedef struct {
     short core256, disk256, halo256;   /* 256-colour fg on black bg */
     short core8,   disk8,   halo8;     /* 8-colour fg fallback */
@@ -257,63 +253,80 @@ static const Theme k_themes[N_THEMES] = {
     { 231,  46,  28,  COLOR_WHITE,  COLOR_GREEN,   COLOR_GREEN,   "Aurora" },
 };
 
-static bool g_has_256;
-static int  g_theme = 0;
+static bool g_has_256;   /* terminal 256-colour capability (render infra, set once) */
 
-static void theme_apply(int ti)
-{
-    const Theme *t = &k_themes[ti];
-    if (g_has_256) {
-        init_pair(CP_CORE, t->core256, COLOR_BLACK);
-        init_pair(CP_DISK, t->disk256, COLOR_BLACK);
-        init_pair(CP_HALO, t->halo256, COLOR_BLACK);
-    } else {
-        init_pair(CP_CORE, t->core8, COLOR_BLACK);
-        init_pair(CP_DISK, t->disk8, COLOR_BLACK);
-        init_pair(CP_HALO, t->halo8, COLOR_BLACK);
-    }
-    init_pair(CP_HUD, g_has_256 ? 255 : COLOR_WHITE,
-                      g_has_256 ? 236 : COLOR_BLACK);
-}
-
-/* ===================================================================== */
-/* §4  galaxy — stars and simulation                                      */
-/* ===================================================================== */
-
-/*
- * Each star is a point mass in a fixed circular orbit.
- *   r     — orbital radius, normalised so 1.0 = edge of the display
- *   theta — current angle (radians)
- *   omega — angular velocity (rad/step) = V0 / r
- *
- * No mutual gravitational interaction; the spiral pattern comes entirely
- * from the initial placement and the radial dependence of omega.
- */
+/* Star — one point mass on a FIXED circular orbit (no N-body gravity). INTENT /
+ * the physics it encodes: a FLAT ROTATION CURVE — every star has the same
+ * tangential speed V0 regardless of radius, the hallmark of real spiral galaxies
+ * (Rubin & Ford 1970; explained by dark-matter halos). With constant V0 the
+ * angular velocity is omega = V0/r (Binney & Tremaine, "Galactic Dynamics"), so
+ * inner stars sweep round faster than outer ones — DIFFERENTIAL ROTATION, which
+ * is exactly why the arms wind up over time (the winding problem; Toomre 1977).
+ * The spiral is NOT computed from forces: it emerges purely from the initial
+ * logarithmic-spiral placement (galaxy_init) plus this radial dependence of
+ * omega. omega is precomputed at spawn and never changes — only theta advances.
+ *   r     : orbital radius, normalised so 1.0 = edge of the display.
+ *   theta : current orbital angle (radians); the ONLY field a tick advances.
+ *   omega : angular velocity (rad/step) = V0/r, fixed at spawn. */
 typedef struct {
     float r;
     float theta;
     float omega;
 } Star;
 
-static Star  g_stars[N_STARS];
-static int   g_narms  = ARMS_DEF;
-static float g_v0     = V0_DEF;
-static float g_speed  = SPEED_DEF;
-static int   g_rows, g_cols;
-static int   g_steps  = STEPS_DEF;
-static int   g_sim_fps = SIM_FPS_DEF;
-static long  g_tick   = 0;
-static bool  g_paused = false;
-
 /*
- * g_bright[r][c] — accumulated star density at each screen cell.
- * Added to each step (weighted by 1/g_steps so total per frame is constant).
- * Multiplied by DECAY once per rendered frame → exponential fade trail.
+ * Galaxy — the whole simulation in one aggregate, read like a table of
+ * contents. WHY one aggregate: state lives in one place, yet the orchestrators
+ * (galaxy_init / galaxy_step / scene_draw) take Galaxy* while utilities take the
+ * narrowest value they need, so the layers never re-couple. (PRNG state, the
+ * 256-colour flag and the signal flags stay module-global — infrastructure, not
+ * galaxy data.)
+ *   WHAT   — stars[]: the orbiting star pool;  bright[][]: the per-cell
+ *            brightness accumulator the galaxy is drawn from — splatted each
+ *            step, faded each frame (the cosmetic trail; see ARCHITECTURE).
+ *   WHERE  — rows, cols: the galaxy grid extent in cells, sized from the
+ *            terminal at startup/resize.
+ *   HOW    — the user-tunable knobs: narms (spiral arm count), v0 (flat-
+ *            rotation-curve speed), speed (orbit multiplier), steps (physics
+ *            sub-steps per frame), sim_fps (simulation rate, Hz).
+ *   WHEN   — paused (1 freezes the per-tick advance; rendering continues).
+ *   RENDER — theme: the selected k_themes[] palette index (a render choice
+ *            cycled by t/T, kept here so resize preserves it).
  */
-static float g_bright[ROWS_MAX][COLS_MAX];
+typedef struct {
+    /* WHAT — the simulated objects */
+    Star  stars[N_STARS];                /* the orbiting star pool (seeded in galaxy_init)     */
+    float bright[ROWS_MAX][COLS_MAX];    /* per-cell brightness accumulator (the fade trail)   */
+    /* WHERE — display geometry */
+    int   rows, cols;                    /* galaxy grid extent in cells (<= ROWS_MAX/COLS_MAX)  */
+    /* HOW — user-tunable simulation knobs */
+    int   narms;                         /* spiral arm count [ARMS_MIN..ARMS_MAX]               */
+    float v0;                            /* flat rotation-curve speed (norm. radius / step)     */
+    float speed;                         /* orbit-speed multiplier [SPEED_MIN..SPEED_MAX]       */
+    int   steps;                         /* physics sub-steps per frame [STEPS_MIN..STEPS_MAX]  */
+    int   sim_fps;                       /* simulation rate, Hz [SIM_FPS_MIN..SIM_FPS_MAX]      */
+    /* WHEN — run state */
+    bool  paused;                        /* 1 freezes the per-tick advance (render continues)   */
+    /* RENDER — palette selection */
+    int   theme;                         /* index into k_themes[]  [0..N_THEMES)                */
+} Galaxy;
 
-/* xorshift32 RNG */
+static Galaxy g_galaxy = {
+    .narms   = ARMS_DEF,
+    .v0      = V0_DEF,
+    .speed   = SPEED_DEF,
+    .steps   = STEPS_DEF,
+    .sim_fps = SIM_FPS_DEF,
+    /* bright/stars/rows/cols/paused/theme → zero-init */
+};
+
+/* xorshift32 PRNG state (seeded in main; advanced only by §4 LOGIC) */
 static uint32_t g_rng = 12345u;
+
+/* ===================================================================== */
+/* §4  LOGIC — RNG & sampling (pure: no I/O, touches only g_rng)           */
+/* ===================================================================== */
+
 static inline uint32_t rng_next(void)
 {
     g_rng ^= g_rng << 13;
@@ -334,13 +347,55 @@ static float rng_gauss(void)
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * PI * u2);
 }
 
-/* ------------------------------------------------------------------ */
+/* ===================================================================== */
+/* §5  SIMULATION — galaxy_step (advances orbits + accumulates the trail)  */
+/* ===================================================================== *
+ * The ONLY function that advances simulation state. Mutates g->stars[].theta
+ * (each orbit) and splats live stars into g->bright (the EFFECTS trail). The
+ * per-tick combine in main runs this g->steps times when the sim-clock is due. */
 
-static void galaxy_init(int narms)
+static void galaxy_step(Galaxy *g)
 {
-    g_narms = narms;
-    memset(g_bright, 0, sizeof g_bright);
-    g_tick = 0;
+    /*
+     * Screen centre and scale factors.
+     * ry = rx * 0.5 corrects for terminal cells being ~2× taller than wide,
+     * making the galaxy appear circular rather than vertically stretched.
+     */
+    int   cx = g->cols / 2, cy = g->rows / 2;
+    float rx = g->cols * 0.44f;
+    float ry = rx * 0.50f;
+
+    /*
+     * Weight per star per step: dividing by g->steps keeps total brightness
+     * per frame constant regardless of how many physics steps we compute.
+     */
+    float w = 1.0f / (float)g->steps;
+
+    for (int i = 0; i < N_STARS; i++) {
+        /* Advance along circular orbit */
+        g->stars[i].theta += g->stars[i].omega * g->speed;
+
+        /* Convert polar → Cartesian → screen coordinates */
+        float x = g->stars[i].r * cosf(g->stars[i].theta);
+        float y = g->stars[i].r * sinf(g->stars[i].theta);
+        int   sx = cx + (int)(x * rx + 0.5f);
+        int   sy = cy + (int)(y * ry + 0.5f);
+
+        if (sx >= 0 && sx < g->cols && sy >= 0 && sy < g->rows)
+            g->bright[sy][sx] += w;
+    }
+}
+
+/* ===================================================================== */
+/* §6  INIT/RESET — galaxy_init (full reseed, NOT part of the tick)        */
+/* ===================================================================== *
+ * Mutates g->stars / g->bright / g->narms wholesale. Called at startup and on
+ * 'r', arm change (a/A), and resize — all outside the gated simulate step.   */
+
+static void galaxy_init(Galaxy *g, int narms)
+{
+    g->narms = narms;
+    memset(g->bright, 0, sizeof g->bright);
 
     int n = 0;
 
@@ -354,7 +409,7 @@ static void galaxy_init(int narms)
         float r = fabsf(rng_gauss() * 0.07f);
         if (r < 0.004f) r = 0.004f;
         if (r > 0.20f)  r = 0.20f;
-        g_stars[n++] = (Star){ r, rng_float() * 2.0f * PI, g_v0 / r };
+        g->stars[n++] = (Star){ r, rng_float() * 2.0f * PI, g->v0 / r };
     }
 
     /*
@@ -370,7 +425,7 @@ static void galaxy_init(int narms)
         float r     = 0.08f + rng_float() * 0.87f;   /* 0.08 .. 0.95 */
         float theta = a_off + WINDING * logf(r / 0.08f)
                       + (rng_float() - 0.5f) * (2.0f * ARM_SCATTER);
-        g_stars[n++] = (Star){ r, theta, g_v0 / r };
+        g->stars[n++] = (Star){ r, theta, g->v0 / r };
     }
 
     /*
@@ -380,50 +435,34 @@ static void galaxy_init(int narms)
     while (n < N_STARS) {
         float r = 0.35f + rng_float() * 0.70f;
         if (r > 1.05f) r = 1.05f;
-        g_stars[n++] = (Star){ r, rng_float() * 2.0f * PI, g_v0 / r };
+        g->stars[n++] = (Star){ r, rng_float() * 2.0f * PI, g->v0 / r };
     }
 }
 
-/* ------------------------------------------------------------------ */
+/* ===================================================================== */
+/* §7  RENDER — palette load + state → screen                             */
+/* ===================================================================== *
+ * theme_apply loads colour pairs; scene_draw projects state to the screen and
+ * draws the HUD. scene_draw ALSO fades the trail (g->bright *= DECAY) at the top
+ * — the single, deliberate place RENDER mutates state (see ARCHITECTURE).      */
 
-static void galaxy_step(void)
+static void theme_apply(int ti)
 {
-    /*
-     * Screen centre and scale factors.
-     * ry = rx * 0.5 corrects for terminal cells being ~2× taller than wide,
-     * making the galaxy appear circular rather than vertically stretched.
-     */
-    int   cx = g_cols / 2, cy = g_rows / 2;
-    float rx = g_cols * 0.44f;
-    float ry = rx * 0.50f;
-
-    /*
-     * Weight per star per step: dividing by g_steps keeps total brightness
-     * per frame constant regardless of how many physics steps we compute.
-     */
-    float w = 1.0f / (float)g_steps;
-
-    for (int i = 0; i < N_STARS; i++) {
-        /* Advance along circular orbit */
-        g_stars[i].theta += g_stars[i].omega * g_speed;
-
-        /* Convert polar → Cartesian → screen coordinates */
-        float x = g_stars[i].r * cosf(g_stars[i].theta);
-        float y = g_stars[i].r * sinf(g_stars[i].theta);
-        int   sx = cx + (int)(x * rx + 0.5f);
-        int   sy = cy + (int)(y * ry + 0.5f);
-
-        if (sx >= 0 && sx < g_cols && sy >= 0 && sy < g_rows)
-            g_bright[sy][sx] += w;
+    const Theme *t = &k_themes[ti];
+    if (g_has_256) {
+        init_pair(CP_CORE, t->core256, COLOR_BLACK);
+        init_pair(CP_DISK, t->disk256, COLOR_BLACK);
+        init_pair(CP_HALO, t->halo256, COLOR_BLACK);
+    } else {
+        init_pair(CP_CORE, t->core8, COLOR_BLACK);
+        init_pair(CP_DISK, t->disk8, COLOR_BLACK);
+        init_pair(CP_HALO, t->halo8, COLOR_BLACK);
     }
-    g_tick++;
+    init_pair(CP_HUD,  g_has_256 ? 226 : COLOR_YELLOW, -1);  /* bright yellow — top data bar    */
+    init_pair(CP_HINT, g_has_256 ?  51 : COLOR_CYAN,   -1);  /* bright cyan   — bottom action bar */
 }
 
-/* ===================================================================== */
-/* §5  draw                                                               */
-/* ===================================================================== */
-
-static void scene_draw(void)
+static void scene_draw(Galaxy *g)
 {
     /*
      * Decay the brightness grid once per rendered frame.
@@ -431,15 +470,15 @@ static void scene_draw(void)
      *   B_ss = f / (1 - DECAY)
      * With DECAY=0.82, B_ss = f * 5.56  →  bright core, faint halo.
      */
-    for (int r = 0; r < g_rows; r++)
-        for (int c = 0; c < g_cols; c++)
-            g_bright[r][c] *= DECAY;
+    for (int r = 0; r < g->rows; r++)
+        for (int c = 0; c < g->cols; c++)
+            g->bright[r][c] *= DECAY;
 
     erase();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
-    int draw_rows = (g_rows < rows - 2) ? g_rows : rows - 2;
-    int draw_cols = (g_cols < cols)     ? g_cols : cols;
+    int draw_rows = (g->rows < rows - 2) ? g->rows : rows - 2;
+    int draw_cols = (g->cols < cols)     ? g->cols : cols;
 
     /*
      * Find peak brightness so we can normalise to [0,1].
@@ -448,17 +487,17 @@ static void scene_draw(void)
     float b_max = 0.1f;
     for (int r = 0; r < draw_rows; r++)
         for (int c = 0; c < draw_cols; c++)
-            if (g_bright[r][c] > b_max) b_max = g_bright[r][c];
+            if (g->bright[r][c] > b_max) b_max = g->bright[r][c];
 
     /* Radial colour zone boundaries (normalised galaxy radius) */
-    int   cx = g_cols / 2, cy = g_rows / 2;
-    float rx = g_cols * 0.44f, ry = rx * 0.50f;
+    int   cx = g->cols / 2, cy = g->rows / 2;
+    float rx = g->cols * 0.44f, ry = rx * 0.50f;
     float r_core = 0.10f;    /* < 10% → core colour */
     float r_disk = 0.65f;    /* 10%..65% → disk colour; > 65% → halo */
 
     for (int r = 0; r < draw_rows; r++) {
         for (int c = 0; c < draw_cols; c++) {
-            float b = g_bright[r][c];
+            float b = g->bright[r][c];
             if (b < 0.02f * b_max) continue;   /* below noise floor — skip */
 
             /* Normalised brightness 0..1 → character */
@@ -482,7 +521,7 @@ static void scene_draw(void)
                                    : CP_HALO;
 
             attron(COLOR_PAIR(cp) | bold);
-            mvaddch(r, c, (chtype)ch);
+            mvaddch(r + 1, c, (chtype)ch);   /* +1: row 0 is the top HUD bar */
             attroff(COLOR_PAIR(cp) | bold);
         }
     }
@@ -490,31 +529,41 @@ static void scene_draw(void)
     /* Galactic centre — always mark even when no stars land exactly here */
     if (cy < draw_rows && cx < draw_cols) {
         attron(COLOR_PAIR(CP_CORE) | A_BOLD);
-        mvaddch(cy, cx, '*');
+        mvaddch(cy + 1, cx, '*');            /* +1: row 0 is the top HUD bar */
         attroff(COLOR_PAIR(CP_CORE) | A_BOLD);
     }
 
-    /* ── HUD row 1 ── */
+    /* ── HUD (standard two bars) ──────────────────────────────────────── *
+     * Top row 0      DATA    — title (left) + sim stats (right-aligned, yellow).
+     * Bottom rows-1  ACTIONS — the key legend (cyan).
+     * Both rows are filled first, then clipped with "%.*s" so a narrow terminal
+     * can neither overflow nor wrap. */
+    char left[20], right[80];
+    snprintf(left,  sizeof left,  " SPIRAL GALAXY ");
+    snprintf(right, sizeof right,
+             " arms:%d  speed:%.1fx  theme:%s  fps:%d  steps:%d  %s ",
+             g->narms, g->speed, k_themes[g->theme].name,
+             g->sim_fps, g->steps, g->paused ? "PAUSED" : "running");
+    int stat_x = cols - (int)strlen(right);      /* right-aligned stats column */
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvprintw(rows - 2, 0,
-        " Spiral Galaxy  arms:%d  speed:%.1fx  theme:%-10s"
-        "  tick:%-6ld  fps:%d  steps:%d  %s",
-        g_narms, g_speed, k_themes[g_theme].name,
-        g_tick, g_sim_fps, g_steps,
-        g_paused ? "[PAUSED]" : "inner orbits faster -- watch arms wind up");
+    for (int c = 0; c < cols; c++) mvaddch(0, c, ' ');
+    if (stat_x >= 0) {
+        mvprintw(0, 0,      "%.*s", stat_x, left);  /* title clipped clear of stats */
+        mvprintw(0, stat_x, "%s", right);
+    } else {
+        mvprintw(0, 0,  "%.*s", cols, right);    /* too narrow: data only */
+    }
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    /* ── HUD row 2 ── */
-    attron(COLOR_PAIR(CP_HUD));
-    mvprintw(rows - 1, 0,
-        "  [a/A]arms  [+/-]speed  []/[]fps  [t/T]theme  "
-        "[r]reset  [p]pause  [q]quit   "
-        "Chars: .=sparse  @=dense   Colour: CORE/DISK/HALO");
-    attroff(COLOR_PAIR(CP_HUD));
+    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+    for (int c = 0; c < cols; c++) mvaddch(rows - 1, c, ' ');
+    mvprintw(rows - 1, 0, "%.*s", cols,
+             " q:quit  p:pause  r:reset  a/A:arms  t/T:theme  +/-:speed  [/]:fps  </>:steps ");
+    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
-/* §6  screen                                                             */
+/* §8  EVENTS — signals & resize (mutate state, NOT part of the tick)      */
 /* ===================================================================== */
 
 static volatile sig_atomic_t g_resize = 0;
@@ -523,28 +572,33 @@ static volatile sig_atomic_t g_quit   = 0;
 static void handle_sigwinch(int s) { (void)s; g_resize = 1; }
 static void handle_sigterm (int s) { (void)s; g_quit   = 1; }
 
-static void screen_init(void)
+static void screen_resize(Galaxy *g)
+{
+    endwin(); refresh();
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    g->rows = (rows - 2 < ROWS_MAX) ? rows - 2 : ROWS_MAX;
+    g->cols = (cols      < COLS_MAX) ? cols      : COLS_MAX;
+    g_resize = 0;
+}
+
+/* ===================================================================== */
+/* §9  screen — ncurses init / palette load                               */
+/* ===================================================================== */
+
+static void screen_init(int theme)
 {
     initscr(); cbreak(); noecho();
     keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
     curs_set(0); typeahead(-1);
     start_color();
+    use_default_colors();
     g_has_256 = (COLORS >= 256);
-    theme_apply(g_theme);
-}
-
-static void screen_resize(void)
-{
-    endwin(); refresh();
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    g_rows = (rows - 2 < ROWS_MAX) ? rows - 2 : ROWS_MAX;
-    g_cols = (cols      < COLS_MAX) ? cols      : COLS_MAX;
-    g_resize = 0;
+    theme_apply(theme);
 }
 
 /* ===================================================================== */
-/* §7  app                                                                */
+/* §10  app — signals, the frame loop, key events (the per-tick combine)   */
 /* ===================================================================== */
 
 int main(void)
@@ -554,13 +608,13 @@ int main(void)
     signal(SIGINT,   handle_sigterm);
 
     g_rng = (uint32_t)time(NULL) ^ 0xC0DE4A1Au;
-    screen_init();
+    screen_init(g_galaxy.theme);
 
     { int rows, cols; getmaxyx(stdscr, rows, cols);
-      g_rows = (rows - 2 < ROWS_MAX) ? rows - 2 : ROWS_MAX;
-      g_cols = (cols      < COLS_MAX) ? cols      : COLS_MAX; }
+      g_galaxy.rows = (rows - 2 < ROWS_MAX) ? rows - 2 : ROWS_MAX;
+      g_galaxy.cols = (cols      < COLS_MAX) ? cols      : COLS_MAX; }
 
-    galaxy_init(g_narms);
+    galaxy_init(&g_galaxy, g_galaxy.narms);
     int64_t next_tick = clock_ns();
 
     while (!g_quit) {
@@ -570,62 +624,62 @@ int main(void)
         while ((ch = getch()) != ERR) {
             switch (ch) {
             case 'q': case 27: g_quit = 1; break;
-            case 'p': case ' ': g_paused = !g_paused; break;
-            case 'r': galaxy_init(g_narms); break;
+            case 'p': case ' ': g_galaxy.paused = !g_galaxy.paused; break;
+            case 'r': galaxy_init(&g_galaxy, g_galaxy.narms); break;
 
             case 'a':
-                g_narms = (g_narms < ARMS_MAX) ? g_narms + 1 : ARMS_MIN;
-                galaxy_init(g_narms);
+                g_galaxy.narms = (g_galaxy.narms < ARMS_MAX) ? g_galaxy.narms + 1 : ARMS_MIN;
+                galaxy_init(&g_galaxy, g_galaxy.narms);
                 break;
             case 'A':
-                g_narms = (g_narms > ARMS_MIN) ? g_narms - 1 : ARMS_MAX;
-                galaxy_init(g_narms);
+                g_galaxy.narms = (g_galaxy.narms > ARMS_MIN) ? g_galaxy.narms - 1 : ARMS_MAX;
+                galaxy_init(&g_galaxy, g_galaxy.narms);
                 break;
 
             case 't':
-                g_theme = (g_theme + 1) % N_THEMES;
-                theme_apply(g_theme);
+                g_galaxy.theme = (g_galaxy.theme + 1) % N_THEMES;
+                theme_apply(g_galaxy.theme);
                 break;
             case 'T':
-                g_theme = (g_theme + N_THEMES - 1) % N_THEMES;
-                theme_apply(g_theme);
+                g_galaxy.theme = (g_galaxy.theme + N_THEMES - 1) % N_THEMES;
+                theme_apply(g_galaxy.theme);
                 break;
 
             case '+': case '=':
-                if (g_speed < SPEED_MAX - 0.01f) g_speed += SPEED_STEP;
+                if (g_galaxy.speed < SPEED_MAX - 0.01f) g_galaxy.speed += SPEED_STEP;
                 break;
             case '-':
-                if (g_speed > SPEED_MIN + 0.01f) g_speed -= SPEED_STEP;
+                if (g_galaxy.speed > SPEED_MIN + 0.01f) g_galaxy.speed -= SPEED_STEP;
                 break;
 
             case ']':
-                if (g_sim_fps < SIM_FPS_MAX) g_sim_fps += SIM_FPS_STEP;
+                if (g_galaxy.sim_fps < SIM_FPS_MAX) g_galaxy.sim_fps += SIM_FPS_STEP;
                 break;
             case '[':
-                if (g_sim_fps > SIM_FPS_MIN) g_sim_fps -= SIM_FPS_STEP;
+                if (g_galaxy.sim_fps > SIM_FPS_MIN) g_galaxy.sim_fps -= SIM_FPS_STEP;
                 break;
 
             case '>':
-                if (g_steps < STEPS_MAX) g_steps++;
+                if (g_galaxy.steps < STEPS_MAX) g_galaxy.steps++;
                 break;
             case '<':
-                if (g_steps > STEPS_MIN) g_steps--;
+                if (g_galaxy.steps > STEPS_MIN) g_galaxy.steps--;
                 break;
             }
         }
 
         /* ── resize ── */
-        if (g_resize) { screen_resize(); galaxy_init(g_narms); }
+        if (g_resize) { screen_resize(&g_galaxy); galaxy_init(&g_galaxy, g_galaxy.narms); }
 
         /* ── simulate ── */
         int64_t now = clock_ns();
-        if (!g_paused && now >= next_tick) {
-            for (int s = 0; s < g_steps; s++) galaxy_step();
-            next_tick = now + TICK_NS(g_sim_fps);
+        if (!g_galaxy.paused && now >= next_tick) {
+            for (int s = 0; s < g_galaxy.steps; s++) galaxy_step(&g_galaxy);
+            next_tick = now + TICK_NS(g_galaxy.sim_fps);
         }
 
         /* ── render ── */
-        scene_draw();
+        scene_draw(&g_galaxy);
         wnoutrefresh(stdscr);
         doupdate();
 

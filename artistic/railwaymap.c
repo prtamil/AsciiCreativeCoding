@@ -114,45 +114,6 @@
  *  Path templates    Z = H+V+H,  REV_Z = V+H+V,  DOUBLE_Z = H+V+H+V+H
  *  Legend grid       3 rows × 5 cols, entry_w = (cols<100 ? 14 : 16)
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Z_SHAPE picks two distinct grid rows by do-while reroll; a
- *    coincidence (gr1 == gr2) would degenerate into a straight H.
- *  • DOUBLE_Z requires gc_b2 > gc_b1 — defensive clamp_gc fallback
- *    guards against the rand() corner case where they collide.
- *  • CANVAS_ROWS = 90 / CANVAS_COLS = 320 are ceiling.  Terminals
- *    larger than this would draw outside; bounds checks at the
- *    canvas-paint stage prevent out-of-array writes.
- *  • The h_cp/v_cp store as `unsigned char` — colour pair 0 means
- *    "no track here".  Pairs 1..15 are line colours.  Cell h_cp=0,
- *    v_cp=0 is empty.
- *  • At a junction where both lines exist, the H-line colour wins
- *    on the ACS_PLUS character; this is asymmetric but legible.
- *  • Station name placement clamps to [1, cols-len-1] / [1, rows-5];
- *    a station near the screen edge may have its name shifted away
- *    from the dot — looks fine but isn't truly perpendicular.
- *  • Trains use A_REVERSE for solid-block look: if your terminal
- *    doesn't honour A_REVERSE properly, trains appear as plain text.
- *  • Station name rendered AFTER trains, so a train passing through
- *    a station temporarily covers part of the name — intentional
- *    "vehicle in motion" effect.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • HUD shows e.g. "13 lines  37 stations  6 interchange" — sum of
- *    template counts (3+3+3+2+1=12, plus 0–3 fillers).  Verify by
- *    counting coloured legend entries.
- *  • Press 'r' repeatedly: each refresh produces a different layout
- *    but the SAME line-count distribution.
- *  • Junction cells: find a place where two coloured lines visibly
- *    cross and confirm a '+' sits there (not '─' or '│').
- *  • Trains: should bounce at line endpoints — observe one running
- *    long enough to reverse direction; the head/body glyph order
- *    flips ('## 0' becomes '0 ##').
- *  • Theme cycling 't': all line colours change in unison, station
- *    'O'/'o' colour shifts, HUD bar stays bright yellow.
- *  • At small terminals (< 40 cols), step_c clamp keeps nodes from
- *    overlapping; map shrinks but lines stay readable.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

@@ -213,63 +213,6 @@
  *      T    *= exp(-COOL · dt)
  *      life -= dt    (sparks only; body-FREE has no life cap)
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Phase transition snaps temp — moving COLLAPSE → ASH could leave a
- *    body particle that was still BOUND with a high temp.  The first
- *    ASH frame force-flips it to FREE without resetting temp, so it
- *    integrates with the right initial heat and cools naturally — no
- *    visual snap.
- *
- *  • REBIRTH growth_frac = 0 — at frame 0 of REBIRTH, ONLY the seed
- *    anchor (alive_at = 0) is alive.  Body particles trying to capture
- *    will only ever pick that anchor.  Hence the visual: a single
- *    bright dot appears at the seed and grows outward.
- *
- *  • REBIRTH ends mid-growth — if T_REBIRTH is lowered or dt jumps,
- *    growth_frac may not reach 1.0 by phase end.  We snap growth to
- *    1.0 on the PERCH transition so the owl finishes complete; this
- *    is a one-frame visual catch-up but always reads cleaner than a
- *    half-built bird suddenly settling.
- *
- *  • Resize — owl x,y are recomputed from rows/cols at init/resize.
- *    Currently active free particles keep absolute coords; after a
- *    big shrink some will drift off-screen and recycle naturally.
- *
- *  • Ignition heating uniform — IGNITE heats every anchor at the same
- *    rate.  If you wanted "fire spreading from beak outward", you
- *    could reuse the same alive_at trick with a different seed and
- *    delay each anchor's heat ramp by alive_at; the framework
- *    supports it, current build keeps the simpler uniform heating for
- *    legibility.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • PERCH: owl visible, dim, eyes (high base_temp) read brighter than
- *    body.  Gentle vertical bob (BREATH_AMP·sin) — 1 cycle ≈ 4s.
- *
- *  • IGNITE: in 2s the silhouette fades from feather tints to bright
- *    flame.  Sparks start to appear above the bird.
- *
- *  • BLAZE: ~3s of full-bright fire.  Silhouette still owl-shaped but
- *    glyphs are `@` and `%`, all bright.
- *
- *  • COLLAPSE: silhouette dissolves bottom-up because bottom anchors
- *    have higher anchor weight × COLLAPSE_RELEASE rate, so they tend
- *    to release first.  Released particles fall and drift.
- *
- *  • ASH: no silhouette, just embers drifting up + falling toward the
- *    perch.  Smoke characters (bucket 0, dim grey) dominate.
- *
- *  • REBIRTH: a single white dot at the head centre.  Over 3s an
- *    expanding circle of fire grows outward; eyes appear first, then
- *    body, then ear tufts and wing edges.  Feels like a sphere
- *    expanding.
- *
- *  • Press `s` to skip phases — verify all 6 phases in sequence.
- *
- *  • Press `t` to cycle theme — palette tints change but heat ramp
- *    structure (bucket count, glyphs) stays identical.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

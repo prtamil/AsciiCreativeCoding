@@ -107,39 +107,6 @@
  *                         else  '\\' if sign(dx)==sign(dy) else '/'
  *  Render interpolate  :  draw_pos = pos + vel · alpha · dt
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • PAUSE retraction subtracts 1 from tlen PER TICK — at SIM_FPS=120
- *    trails empty in 48/120 ≈ 0.4 s.  At SIM_FPS=10 it takes 4.8 s,
- *    longer than PAUSE_DUR=0.7 s; trails may still be visible at the
- *    moment of relaunch.  trail_clear() inside relaunch fixes this.
- *  • Workers that fail to exit the screen during DIVERGE (e.g. queen
- *    near edge, ray heading inward) park wherever their velocity dies
- *    — those become short rays.
- *  • Trail tip direction uses CURRENT vel (vx,vy), not segment delta;
- *    after a worker parks (v=0), the LAST glyph's slope equals zero,
- *    falling into the '/' branch.  Visually negligible.
- *  • Cross-swarm overdraw: if rendering swarm-by-swarm, a later swarm's
- *    DIM tail can hide an earlier swarm's BRIGHT tip.  Three-pass order
- *    fixes this — never collapse the loop nesting.
- *  • Resize updates max_px/max_py but not in-flight workers; some may
- *    suddenly be outside, will instantly park on next diverge_tick.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • One full cycle takes DIVERGE_DUR + PAUSE_DUR + CONVERGE_DUR +
- *    PAUSE_DUR = 8.4 s.  Watch the HUD label cycle DIVERGE → PAUSE →
- *    CONVERGE → PAUSE.
- *  • Workers per swarm: N_WORKERS = 20.  Press `+` to increase swarms
- *    1..5; total visible rays = 20 · n_swarms.
- *  • In CONVERGE every ray points straight at the queen — pause and
- *    sight along any ray to confirm.
- *  • During PAUSE, trails shrink: count visible trail length immediately
- *    after entering PAUSE vs just before exiting; should be approximately
- *    TRAIL_LEN − PAUSE_DUR · sim_fps.
- *  • Reset (`r`) resets all swarms to a fresh DIVERGE; queen positions
- *    randomize.
- *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

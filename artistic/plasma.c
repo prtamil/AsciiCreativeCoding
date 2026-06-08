@@ -102,44 +102,6 @@
  *  fp.s*    angular speed     rad/sec            grand 0.3-0.5
  *  CYCLE_HZ = 0.20            full cycle every 5s
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Aspect correction: if you forget the `dy * 2.0f` multiplier in
- *    dist, the radial term produces vertical ovals instead of round
- *    rings — terminal rows are roughly twice as tall as columns are
- *    wide.  The factor 2 is fixed for typical fonts; on square fonts
- *    drop it to 1.
- *  • Sum-to-[0,1] normalisation: if any sine amplitude were not 1,
- *    `(v + 4) / 8` would not span [0,1] cleanly and the palette
- *    would clamp at the extremes.  All four sines have amplitude 1
- *    so the math is exact.
- *  • Palette bands: N_PAL=14 is small.  At very low spatial frequencies
- *    ("grand" preset, f≈0.1) you can see horizontal banding because
- *    many adjacent cells round to the same idx.
- *  • Float drift: t grows without bound.  After hours of runtime sinf
- *    arguments become large enough to lose precision.  In practice
- *    the demo runs on the order of minutes and this never matters.
- *  • Theme palette uses pair indices 1..7 — the same indices used by
- *    HUD attron/attroff calls.  HUD prints AFTER scene_draw so it
- *    overwrites those cells; no risk of HUD characters being drawn
- *    in plasma colours.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Pause (space): all motion freezes; pattern stays static.  Resume:
- *    motion continues from the same phase — no jump.
- *  • Cycle test: at CYCLE_HZ=0.20 the palette completes one full
- *    rotation every 5 seconds.  Pick any cell; its colour should
- *    return to the same hue exactly 5s later.
- *  • Frequency preset 'f': cycling through gentle → energetic →
- *    grand → turbulent should visibly change wave wavelength.
- *    "Grand" stretches features across the whole screen; "turbulent"
- *    packs many wavelengths per row.
- *  • Theme 'p': cycling rainbow → fire → ocean → matrix swaps the
- *    palette without changing wave shape.  Same pattern, recoloured.
- *  • Centre symmetry: the radial term is centred at (cols/2, rows/2).
- *    At preset 0 you should see a soft circular bullseye superposed
- *    on the moving stripes; never a centre offset.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

@@ -30,7 +30,9 @@
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra artistic/dna.c -o dna -lncurses -lm
  *
- * §1 config  §2 clock  §3 color  §4 draw  §5 scene  §6 screen  §7 app
+ * Sections (single-concern layers — see ARCHITECTURE below):
+ *   §1 config   §2 clock=PERFORMANCE   §3 color=RENDER-setup   §4 draw=RENDER
+ *   §5 scene=STATE+events   §6 simulation   §7 render   §8 app=events+PERFORMANCE
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -52,116 +54,87 @@
  *   color_apply_theme() registers 5 ncurses pairs once at theme change.
  *   Falls back to 8 basic colors on terminals with COLORS < 256.
  *
+ * References:
+ *   Structural biology (the CONCEPTS — what each of the 10 forms is) —
+ *   • Watson, J. D. & Crick, F. H. C. — "Molecular Structure of Nucleic
+ *     Acids", *Nature* 171 (1953).  The B-DNA double helix, base pairing
+ *     and right-handedness that scenes 0/6/9 visualise.
+ *   • Wang, A. H. J. et al. — "Molecular structure of a left-handed double
+ *     helical DNA fragment at atomic resolution", *Nature* 282 (1979).  The
+ *     Z-DNA zigzag (scene 2); contrast with A-DNA geometry.
+ *   • Sen, D. & Gilbert, W. — "Formation of parallel four-stranded
+ *     complexes by guanine-rich motifs", *Nature* 334 (1988).  The
+ *     G-quadruplex / G-tetrad with central K+ (scene 4).
+ *   • Alberts et al. — *Molecular Biology of the Cell* (6th ed., 2014),
+ *     ch. 4-5.  Textbook reference for the replication fork, Okazaki
+ *     fragments, cruciforms, plasmids, triple/Hoogsteen pairing and RNA
+ *     stem-loops (scenes 3,5,6,7,8).
+ *   • Saenger, W. — *Principles of Nucleic Acid Structure* (Springer,
+ *     1984).  Quantitative A/B/Z helix parameters: pitch, rise, groove
+ *     width — the numbers behind each scene's `pitch` and `amp`.
+ *
+ *   Rendering (the parametric projection + terminal output) —
+ *   • Foley, van Dam, Feiner & Hughes — *Computer Graphics: Principles and
+ *     Practice* (2nd ed., 1990), ch. 5-6.  Parametric curves and the
+ *     parallel projection of a 3-D helix to 2-D screen columns; the depth
+ *     cue z = sin(phase) → front/back ordering is the painter's algorithm.
+ *   • Bourke, P. — "Parametric equations of a helix / circle"
+ *     (paulbourke.net).  The x = cx + A·cos(θ), z = sin(θ) backbone and the
+ *     CELL_AR aspect correction (ry = rx·CELL_AR) used by every scene.
+ *   • Strang, G. — *Introduction to Linear Algebra* (5th ed.), §8 on
+ *     rotations.  The phase term `row·k·hand + t` is a rotation about the
+ *     helix axis; `hand = ±1` flips chirality.
+ *   • Raymond, E. S. & Ben-Halim, Z. — *Writing Programs with NCURSES*.
+ *     attrset / COLOR_PAIR / A_BOLD / A_DIM (front=bold, back=dim) and the
+ *     init_pair theme model in §3.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+/* ── ARCHITECTURE (separated layers) ──────────────────────────────────── *
  *
- * CORE IDEA
- * ─────────
- * A 3-D helix collapses to a 2-D screen as TWO sinusoidal column
- * trajectories that mirror each other (cos and -cos), parameterised by
- * row.  The strand currently AT THE FRONT (sin(phase) ≥ 0) is drawn
- * bold; the back strand is drawn dim.  Add a horizontal '-' connector
- * every bstep rows, sprinkle a colour theme on top, and that single
- * idea — one cosine and one depth test — produces every helical scene
- * in the gallery.  Non-helix scenes (plasmid, hairpin, ladder) reuse
- * the same trick on different parameter spaces (angle around a circle,
- * vertical stem with looping arc, etc.).
+ * This is a RENDER-dominated program: ten draw routines turn ONE scalar of
+ * state (a phase clock) into pictures.  Almost everything is RENDER; the only
+ * per-tick state advance is incrementing that clock.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine looking sideways at a spiral staircase.  The two banisters
- * weave past each other in your view — at any height, one is closer
- * (in front), the other farther (behind).  Your brain reads "spiral"
- * because the banister positions oscillate in lockstep with their
- * apparent depth.  The '-' rungs between them are the steps you can
- * still see edge-on.  Every helix scene here is exactly that staircase
- * with different pitch, amplitude, handedness, and theme paint.
- * Cruciform is two such staircases crossed at right angles; the
- * plasmid is a staircase rolled into a circle.
+ *   LAYER        SECTION              MUTATES
+ *   ─────        ───────              ───────
+ *   PERFORMANCE  §2 clock, §8 app     loop timing / fps counter / target fps —
+ *                                     never scene state
+ *   RENDER       §3 color (setup),    the ncurses screen + colour pairs ONLY;
+ *                §4 draw, §7 render   reads Scene (dna_type, theme, t, rows, cols),
+ *                                     writes no state
+ *   SIMULATION   §6 simulation        Scene.t — the phase clock; the ONLY
+ *                                     per-tick state advance (scene_tick)
  *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Each frame: t += dt, erase the screen.
- *  2. Apply the active theme (5 xterm-256 indices → ncurses pairs CP_S1,
- *     CP_S2, CP_S3, CP_BD, CP_LB).
- *  3. Dispatch to draw_fns[dna_type] with (cx = cols/2, t, rows, cols).
- *  4. For helix-type scenes:
- *       a. Loop row from 1 to draw_rows-1.
- *       b. phase = (TAU / pitch) · row · hand + t   (hand = +1 right,
- *          -1 left).
- *       c. x1 = cx + amp·cos(phase), x2 = cx - amp·cos(phase).
- *       d. depth z = sin(phase).  s1f = (z ≥ 0).  Front = bright bold;
- *          back = dim.
- *       e. Every bstep rows draw '-' from min(x1,x2)+1 to max(x1,x2)-1
- *          using CP_BD (the rung).
- *       f. Z-DNA picks slope glyphs '/', '\\', '|' by comparing x to
- *          previous row's x.  Triple Helix sorts three strands by depth.
- *  5. Plasmid: 360 angular samples; outer ellipse (rx, ry=rx·CELL_AR),
- *     inner at 0.82· that radius.  Sector = (a / 2π) · 4 picks gene
- *     colour.
- *  6. Ladder, hairpin, fork, cruciform, gquad each have their own
- *     specialised draw, but all reuse sput() with the same depth / bond
- *     / theme conventions.
- *  7. HUD: top bar shows DNA name + theme + fps; bottom bar shows keys.
+ *   LOGIC   — no standalone layer.  The helix math (phase, x1/x2 backbone,
+ *             depth z = sin(phase), the triple-strand depth sort) is pure, but
+ *             it is computed INLINE inside the RENDER draws and never stored —
+ *             nothing to isolate or corrupt.
+ *   EFFECTS — none stored.  Pulses, front/back bold-vs-dim, Okazaki-fragment
+ *             gaps and the ladder scroll are all DERIVED at draw time from
+ *             Scene.t and the row index; no cosmetic state survives a frame.
+ *   DELAYS  — trivial.  The only "timer" is the `paused` flag in main(): while
+ *             set, scene_tick is skipped so Scene.t freezes (draws still run).
  *
- * KEY FORMULAS
- * ────────────
- *  Helix backbone   x1 = cx + amp · cos(phase)
- *                   x2 = cx − amp · cos(phase)
- *  Phase            phase = (TAU / pitch) · row · hand + t
- *  Depth            z = sin(phase)   ∈ [-1, 1]; ≥ 0 means "front"
- *  Aspect fix       pitch_h = pitch_v / CELL_AR   (CELL_AR = 0.5)
- *                   amp_h   = amp_v · CELL_AR     (cruciform)
- *  Rung interval    bstep = round(pitch / 5)      (≥ 2)
- *  Triple offsets   ph3 = {0, 2π/3, 4π/3}         (radial 120°)
- *  Plasmid ring     r_outer = (rx · cos a, ry · sin a),  ry = rx · CELL_AR
- *  Plasmid inner    r_inner = (0.82·rx · cos a, 0.82·ry · sin a)
- *  Ladder scroll    scroll = floor(t · 1.8) mod (rung_step · n_seq)
- *  Replication fork fork_row = 1 + (0.35 + 0.15·sin(0.25·t)) · (rows-3)
- *  G-quadruplex     pulse = sin(2π · row/30 + t) > 0  → A_BOLD
+ * PER-TICK COMBINE — main() (§8) is the ONE place the layers meet, in this
+ * fixed per-frame order; nothing else advances Scene.t:
+ *     (resize?) → drain input → scene_tick (SIM, unless paused)
+ *               → erase + scene_draw + screen_hud + present (RENDER)
+ *               → sleep to frame cap + sample fps (PERFORMANCE)
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Z-DNA's slope glyph picks '/' or '\\' by comparing x1 to the
- *    previous row's x1.  At the inflection points x is the same as the
- *    previous → '|', producing a vertical "kink" that is real, not a
- *    bug.
- *  • Hand = -1 negates the phase increment per row but cos is even, so
- *    x1/x2 trajectories LOOK the same.  The visible "left-handedness"
- *    comes from the zigzag glyphs — without zigzag=true the hand flag
- *    is invisible.
- *  • Plasmid uses ry = rx · CELL_AR = rx · 0.5 to compensate the 2:1
- *    cell aspect.  If you remove that, the circle becomes an ellipse
- *    twice as wide as tall.
- *  • Cruciform skips drawing in 6-cell horizontal and 3-row vertical
- *    bands around the junction; without these the bonds clash.
- *  • Resize redraws into rows-2 (HUD reserved); a very narrow terminal
- *    (cols < 30) makes amp larger than half-width and strands wrap or
- *    clip.  sput() bounds-checks but the visual is broken.
- *  • The ladder scrolls by adjusting which rung is "due"; a base pair
- *    appears to climb upward at 1.8 rows/sec.  Setting fps too low
- *    makes the scroll jerky because adj jumps by more than 1.
- *  • Pause stops scene_tick → s->t freezes; helix phase becomes
- *    stationary but draws still run every frame.
+ * USER EVENTS (NOT part of the tick) mutate state on input/resize only — the
+ * main switch (§8) and scene_init/scene_resize (§5):
+ *     n / p      Scene.dna_type (+ reset Scene.t = 0)
+ *     t          Scene.theme (+ re-bind colour pairs via color_apply_theme, §3)
+ *     space      paused
+ *     ] / [      target fps (PERFORMANCE knob)
+ *     SIGWINCH   scene_resize
  *
- * HOW TO VERIFY
- * ─────────────
- *  • Press 'n' to cycle 0..9 — name in top bar should match the visual.
- *  • B-DNA pitch=20: count rows between two rungs → 4 (since bstep=4).
- *  • A-DNA pitch=13: rungs every ~3 rows; the helix is denser than
- *    B-DNA at the same height.
- *  • Z-DNA: zigzag '/' and '\\' visible on the strands, not 'o'.
- *  • Triple helix shows three colours interleaving; pause and confirm
- *    the third strand cycles between front-most and back-most.
- *  • Plasmid: rotate is t·0.08 rad/s — one full revolution every
- *    ~78 seconds.  Pause and verify the labels stay put.
- *  • Theme cycling 't' should change all five colours simultaneously
- *    on the next frame; HUD shows the active theme name.
- *  • Ladder: G-C pairs render '=' (triple bond), A-T render '-' (double
- *    bond).  Pause to inspect.
+ * (The const-pointer read/mutate signature convention is deferred to step 5;
+ *  here the roles are documented only.)
  *
  * ─────────────────────────────────────────────────────────────────────── */
+
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -183,62 +156,63 @@
 
 #define CELL_AR     0.5f   /* col_width / row_height terminal aspect ratio */
 #define TAU         6.28318530f
+#define RUNGS_PER_PITCH 5.f /* base-pair rungs per helical pitch → rung every
+                             * pitch/RUNGS_PER_PITCH rows (see rung_interval)  */
 
+/*
+ * Compile-time sizes and bounds.  The N_* counts size the catalog tables AND
+ * bound the cycle keys — n/p wrap mod N_DNA_TYPES, t wraps mod N_THEMES.
+ * THEME_COLS is the palette width: the 5 colour roles per theme, matching the
+ * CP_S1..CP_LB pairs.  HUD_ROWS rows are reserved for the HUD (row 0 + the
+ * last row), so each scene draws into rows 1 .. rows-HUD_ROWS-1.  SIM_FPS_*
+ * bound the [/] frame-rate cap (a render throttle, not simulation accuracy —
+ * the phase clock advances by real dt regardless).
+ */
 enum {
-    N_DNA_TYPES   = 10,
-    N_THEMES      = 6,
-    THEME_COLS    = 5,     /* s1, s2, s3, bond, label                     */
-    HUD_ROWS      = 2,     /* top title bar + bottom key-hint bar          */
+    N_DNA_TYPES   = 10,    /* structures in the gallery; n/p cycle mod this   */
+    N_THEMES      =  6,    /* colour themes; t cycles mod this                */
+    THEME_COLS    =  5,    /* palette width: strand1, strand2, strand3, bond, label */
+    HUD_ROWS      =  2,    /* rows reserved for HUD (top bar + bottom bar)    */
 
-    SIM_FPS_MIN   =  5,
+    SIM_FPS_MIN   =  5,    /* frame-cap bounds + step for the [ / ] keys      */
     SIM_FPS_DEF   = 30,
     SIM_FPS_MAX   = 60,
     SIM_FPS_STEP  =  5,
-
-    NS_PER_SEC_I  = 1,     /* placeholder for enum; real value is #define  */
 };
 
 #define NS_PER_SEC  1000000000LL
 
-static const char *dna_names[N_DNA_TYPES] = {
-    "B-DNA Double Helix",
-    "A-DNA Double Helix",
-    "Z-DNA (Left-handed)",
-    "Triple Helix",
-    "G-Quadruplex",
-    "RNA Hairpin",
-    "Replication Fork",
-    "Cruciform",
-    "Plasmid (Circular DNA)",
-    "DNA Ladder",
-};
+/*
+ * Theme — a named colour scheme: the five hues a structure is painted in, as a
+ * 256-colour palette with an 8-colour fallback.  Indexed by Scene.theme;
+ * color_apply_theme() binds the active palette to ncurses pairs CP_S1..CP_LB
+ * (init_pair model — Raymond & Ben-Halim, *Writing Programs with NCURSES*).
+ * WHY two palettes: the rich xterm-256 hues are chosen bright so strands read
+ * over the default dark bg (front strand bold, back dim — see helix_draw); on a
+ * <256-colour terminal the 8-colour row substitutes the nearest basic colour.
+ * The five slots are, in order: strand1, strand2, strand3, bond, label.
+ * (dna_names[] is gone — names now live on DnaStructure beside their renderer.)
+ */
+typedef struct {
+    const char *name;                /* HUD label                                */
+    short       pal256[THEME_COLS];  /* xterm-256 hues, used when COLORS >= 256   */
+    short       pal8[THEME_COLS];    /* basic-8 fallback (bond/label often white) */
+} Theme;
 
-static const char *theme_names[N_THEMES] = {
-    "BioLab", "Neon", "Ocean", "Fire", "Cosmic", "Mono",
-};
-
-/* xterm-256 color indices: s1, s2, s3, bond, label */
-static const int theme_256[N_THEMES][THEME_COLS] = {
-    {  46, 118,  51, 250, 243 },   /* BioLab: green, lime, cyan, lgray, dgray */
-    { 201, 213, 226, 255, 245 },   /* Neon:   magenta, pink, yellow, white, gray */
-    {  27,  51, 159, 195, 240 },   /* Ocean:  blue, cyan, sky, pale, dim       */
-    { 196, 208, 226, 255, 243 },   /* Fire:   red, orange, yellow, white, gray */
-    {  93, 129, 171, 219, 240 },   /* Cosmic: purple, violet, lavender, pink   */
-    { 255, 231, 195, 244, 236 },   /* Mono:   white, pale, cream, mid, dark    */
-};
-
-static const int theme_8[N_THEMES][THEME_COLS] = {
-    { COLOR_GREEN,   COLOR_CYAN,    COLOR_GREEN,   COLOR_WHITE, COLOR_WHITE },
-    { COLOR_MAGENTA, COLOR_YELLOW,  COLOR_RED,     COLOR_WHITE, COLOR_WHITE },
-    { COLOR_BLUE,    COLOR_CYAN,    COLOR_WHITE,   COLOR_WHITE, COLOR_WHITE },
-    { COLOR_RED,     COLOR_YELLOW,  COLOR_MAGENTA, COLOR_WHITE, COLOR_WHITE },
-    { COLOR_MAGENTA, COLOR_BLUE,    COLOR_CYAN,    COLOR_WHITE, COLOR_WHITE },
-    { COLOR_WHITE,   COLOR_WHITE,   COLOR_WHITE,   COLOR_WHITE, COLOR_WHITE },
+static const Theme themes[N_THEMES] = {
+    /*  name        256: s1   s2   s3  bond  lbl     8-colour fallback (s1,s2,s3,bond,label)             */
+    { "BioLab", {  46, 118,  51, 250, 243 }, { COLOR_GREEN,   COLOR_CYAN,   COLOR_GREEN,   COLOR_WHITE, COLOR_WHITE } },
+    { "Neon",   { 201, 213, 226, 255, 245 }, { COLOR_MAGENTA, COLOR_YELLOW, COLOR_RED,     COLOR_WHITE, COLOR_WHITE } },
+    { "Ocean",  {  27,  51, 159, 195, 240 }, { COLOR_BLUE,    COLOR_CYAN,   COLOR_WHITE,   COLOR_WHITE, COLOR_WHITE } },
+    { "Fire",   { 196, 208, 226, 255, 243 }, { COLOR_RED,     COLOR_YELLOW, COLOR_MAGENTA, COLOR_WHITE, COLOR_WHITE } },
+    { "Cosmic", {  93, 129, 171, 219, 240 }, { COLOR_MAGENTA, COLOR_BLUE,   COLOR_CYAN,    COLOR_WHITE, COLOR_WHITE } },
+    { "Mono",   { 255, 231, 195, 244, 236 }, { COLOR_WHITE,   COLOR_WHITE,  COLOR_WHITE,   COLOR_WHITE, COLOR_WHITE } },
 };
 
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  clock                       PERFORMANCE — monotonic time + sleep   */
 /* ===================================================================== */
+/* Timing primitives only.  Mutate nothing; read by the §8 main loop.     */
 
 static int64_t clock_ns(void)
 {
@@ -258,25 +232,40 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  color                       RENDER setup — theme → colour pairs    */
 /* ===================================================================== */
+/* Mutates ncurses colour pairs only (boot / 't' key).  No scene state.    */
 
+/*
+ * ColorPair IDs — the ncurses colour-pair slots this program registers.  They
+ * start at 1 because pair 0 is the terminal default and cannot be redefined
+ * (Raymond & Ben-Halim, init_pair).  CP_S1..CP_LB are the 5 themed roles, in
+ * the same order as a Theme's palette (THEME_COLS); color_apply_theme rebinds
+ * them on every theme change.  CP_HUD is fixed (never themed) so the HUD stays
+ * legible under all themes.
+ *   S1/S2/S3 = the three strands   BD = base-pair bond rung   LB = label/marker
+ */
 enum { CP_S1 = 1, CP_S2, CP_S3, CP_BD, CP_LB, CP_HUD };
 
-static void color_apply_theme(int theme)
+static void color_apply_theme(const Theme *th)
 {
     start_color();
     use_default_colors();
-    for (int i = 0; i < THEME_COLS; i++) {
-        int fg = (COLORS >= 256) ? theme_256[theme][i] : theme_8[theme][i];
-        init_pair(CP_S1 + i, fg, -1);
-    }
-    init_pair(CP_HUD, (COLORS >= 256) ? 240 : COLOR_WHITE, -1);
+    bool hi = (COLORS >= 256);
+    for (int i = 0; i < THEME_COLS; i++)
+        init_pair(CP_S1 + i, hi ? th->pal256[i] : th->pal8[i], -1);
+    init_pair(CP_HUD, hi ? 252 : COLOR_WHITE, -1);
 }
 
 /* ===================================================================== */
-/* §4  draw                                                               */
+/* §4  draw                        RENDER — scene → screen (the 10 draws)  */
 /* ===================================================================== */
+/*
+ * Reads scene parameters (cx, t, rows, cols) and writes the ncurses screen via
+ * sput / mvaddch / mvprintw ONLY; never mutates scene state.  The helix math
+ * (phase, x1/x2 backbone, depth ordering) is pure but computed inline here —
+ * there is no separate LOGIC layer to store it in.
+ */
 
 /* safe cell write — silently clamps to drawable interior */
 static inline void sput(int r, int c, chtype ch, int rows, int cols)
@@ -285,52 +274,82 @@ static inline void sput(int r, int c, chtype ch, int rows, int cols)
         mvaddch(r, c, ch);
 }
 
+/* backbone_pos — screen coordinate of a helix backbone at a given phase:
+ * centre + amp·cos(phase), rounded to a cell.  Pass -amp for the mirror strand.
+ * The parametric helix projection (Bourke; Foley/van Dam). */
+static inline int backbone_pos(float center, float amp, float phase)
+{
+    return (int)roundf(center + amp * cosf(phase));
+}
+
+/* rung_interval — rows between base-pair rungs at a given pitch (≈
+ * RUNGS_PER_PITCH rungs per pitch); helix scenes draw a rung every Nth row. */
+static inline int rung_interval(float pitch)
+{
+    return (int)(pitch / RUNGS_PER_PITCH + 0.5f);
+}
+
+/* slope_glyph — the leaning glyph for a Z-DNA strand: which way it stepped
+ * since the previous row ('/' rightward, '\' leftward, '|' at a turn). */
+static inline char slope_glyph(int x, int px)
+{
+    return (x > px) ? '/' : (x < px ? '\\' : '|');
+}
+
+/* draw_rung — a base-pair bond: a CP_BD '-' run bridging the gap between two
+ * backbone columns xa..xb on this row (interior only, not over the strands). */
+static void draw_rung(int row, int xa, int xb, int rows, int cols)
+{
+    int lo = (xa < xb ? xa : xb) + 1;
+    int hi = (xa > xb ? xa : xb) - 1;
+    attrset(COLOR_PAIR(CP_BD));
+    for (int c = lo; c <= hi; c++)
+        sput(row, c, '-', rows, cols);
+}
+
 /*
- * helix_draw — shared backbone for B-DNA, A-DNA, Z-DNA
- *   cx, amp, pitch, hand (+1 right / -1 left), t, base_step_div
+ * helix_draw — shared backbone for B-DNA, A-DNA, Z-DNA.  Params:
+ *   cx     centre column           amp    backbone amplitude (cells)
+ *   pitch  rows per full turn       hand   +1 right-handed / -1 left-handed
+ *   t      phase clock              rows, cols   viewport
+ *   zigzag true → Z-DNA lean glyphs ('/','\'), false → round beads
+ * Rung spacing is derived from pitch (rung_interval); there is no separate knob.
  */
 static void helix_draw(int cx, float amp, float pitch, float hand,
                        float t, int rows, int cols, bool zigzag)
 {
-    float k = TAU / pitch * hand;
-    int   bstep = (int)(pitch / 5.f + 0.5f);
+    float k = TAU / pitch * hand;            /* signed per-row phase step (handedness) */
+    int   bstep = rung_interval(pitch);
     if (bstep < 2) bstep = 2;
-    int draw_rows = rows - HUD_ROWS - 1;
+    int   draw_rows = rows - HUD_ROWS - 1;
 
     for (int row = 1; row < draw_rows; row++) {
         float phase = k * (float)row + t;
         float prev  = k * (float)(row - 1) + t;
-        int   x1 = (int)roundf((float)cx + amp * cosf(phase));
-        int   x2 = (int)roundf((float)cx - amp * cosf(phase));
-        float z1 = sinf(phase);
-        bool  s1f = (z1 >= 0.f);
-        bool  bp  = ((row % bstep) == 0);
+        int   x1 = backbone_pos((float)cx,  amp, phase);
+        int   x2 = backbone_pos((float)cx, -amp, phase);
+        bool  front_left = (sinf(phase) >= 0.f);   /* strand 1 nearer the viewer? */
+        bool  is_rung    = ((row % bstep) == 0);
 
-        /* base pair connector */
-        if (bp) {
-            int lo = (x1 < x2 ? x1 : x2) + 1;
-            int hi = (x1 > x2 ? x1 : x2) - 1;
-            attrset(COLOR_PAIR(CP_BD));
-            for (int c = lo; c <= hi; c++)
-                sput(row, c, '-', rows, cols);
-        }
+        if (is_rung)
+            draw_rung(row, x1, x2, rows, cols);
 
-        /* choose characters */
+        /* strand glyphs: Z-DNA leans ('/','\'), others are round beads */
         chtype ch1, ch2;
         if (zigzag) {
-            int px1 = (int)roundf((float)cx + amp * cosf(prev));
-            ch1 = (x1 > px1) ? '/' : (x1 < px1 ? '\\' : '|');
-            ch2 = (ch1 == '/') ? '\\' : (ch1 == '\\' ? '/' : '|');
+            int px1 = backbone_pos((float)cx, amp, prev);
+            ch1 = slope_glyph(x1, px1);
+            ch2 = (ch1 == '/') ? '\\' : (ch1 == '\\' ? '/' : '|');  /* opposite lean */
         } else {
-            ch1 = ch2 = bp ? 'O' : 'o';
+            ch1 = ch2 = is_rung ? 'O' : 'o';
         }
 
-        /* back strand dim, front strand bright */
-        attrset(COLOR_PAIR(s1f ? CP_S2 : CP_S1) | A_DIM);
-        sput(row, s1f ? x2 : x1, s1f ? ch2 : ch1, rows, cols);
+        /* paint back strand dim, then front strand bright (bold on a rung) */
+        attrset(COLOR_PAIR(front_left ? CP_S2 : CP_S1) | A_DIM);
+        sput(row, front_left ? x2 : x1, front_left ? ch2 : ch1, rows, cols);
 
-        attrset(COLOR_PAIR(s1f ? CP_S1 : CP_S2) | (bp ? A_BOLD : A_NORMAL));
-        sput(row, s1f ? x1 : x2, s1f ? ch1 : ch2, rows, cols);
+        attrset(COLOR_PAIR(front_left ? CP_S1 : CP_S2) | (is_rung ? A_BOLD : A_NORMAL));
+        sput(row, front_left ? x1 : x2, front_left ? ch1 : ch2, rows, cols);
     }
     attrset(A_NORMAL);
 }
@@ -359,7 +378,7 @@ static void draw_triple(int cx, float t, int rows, int cols)
     float pitch = 21.f;
     float amp   = 9.f;
     float k     = TAU / pitch;
-    int   bstep = (int)(pitch / 5.f + 0.5f);
+    int   bstep = rung_interval(pitch);
     int   draw_rows = rows - HUD_ROWS - 1;
 
     static const float ph3[3] = { 0.f, 2.094395f, 4.188790f };
@@ -371,21 +390,23 @@ static void draw_triple(int cx, float t, int rows, int cols)
 
         /* bond between strand 0 and strand 1 */
         if (bp) {
-            int xa = (int)roundf((float)cx + amp * cosf(base_phase + ph3[0]));
-            int xb = (int)roundf((float)cx + amp * cosf(base_phase + ph3[1]));
-            int lo = (xa < xb ? xa : xb) + 1;
-            int hi = (xa > xb ? xa : xb) - 1;
-            attrset(COLOR_PAIR(CP_BD));
-            for (int c = lo; c <= hi; c++)
-                sput(row, c, '-', rows, cols);
+            int xa = backbone_pos((float)cx, amp, base_phase + ph3[0]);
+            int xb = backbone_pos((float)cx, amp, base_phase + ph3[1]);
+            draw_rung(row, xa, xb, rows, cols);
         }
 
-        /* sort 3 strands by depth (back-to-front) */
+        /*
+         * Sv — one strand's vertex on this row: its screen column x, its depth
+         * z = sin(phase) ∈ [-1,1] (>0 = nearer the viewer), and its colour pair
+         * cp.  The three strands are insertion-sorted by z and painted back-to-
+         * front so the nearest over-draws the others — the painter's algorithm
+         * (Foley/van Dam), the same depth cue helix_draw uses for two strands.
+         */
         typedef struct { int x; float z; int cp; } Sv;
         Sv sv[3];
         for (int i = 0; i < 3; i++) {
             float ph  = base_phase + ph3[i];
-            sv[i].x   = (int)roundf((float)cx + amp * cosf(ph));
+            sv[i].x   = backbone_pos((float)cx, amp, ph);
             sv[i].z   = sinf(ph);
             sv[i].cp  = cp3[i];
         }
@@ -524,17 +545,13 @@ static void draw_rfork(int cx, float t, int rows, int cols)
     /* parent double helix above fork */
     for (int row = 1; row < fork_row && row < draw_rows; row++) {
         float phase = k * (float)row + t;
-        int   x1 = (int)roundf((float)cx + amp * cosf(phase));
-        int   x2 = (int)roundf((float)cx - amp * cosf(phase));
+        int   x1 = backbone_pos((float)cx,  amp, phase);
+        int   x2 = backbone_pos((float)cx, -amp, phase);
         float z1 = sinf(phase);
         bool  s1f = (z1 >= 0.f);
         bool  bp  = ((row % 4) == 0);
 
-        if (bp) {
-            int lo=(x1<x2?x1:x2)+1, hi=(x1>x2?x1:x2)-1;
-            attrset(COLOR_PAIR(CP_BD));
-            for (int c=lo; c<=hi; c++) sput(row,c,'-',rows,cols);
-        }
+        if (bp) draw_rung(row, x1, x2, rows, cols);
         attrset(COLOR_PAIR(s1f?CP_S2:CP_S1)|A_DIM);
         sput(row, s1f?x2:x1, bp?'O':'o', rows, cols);
         attrset(COLOR_PAIR(s1f?CP_S1:CP_S2)|(bp?A_BOLD:A_NORMAL));
@@ -558,13 +575,13 @@ static void draw_rfork(int cx, float t, int rows, int cols)
 
         /* leading strand — left */
         float ph_l = k * (float)row + t;
-        int   xl   = (int)roundf((float)cx - div + amp * 0.5f * cosf(ph_l));
+        int   xl   = backbone_pos((float)cx - div, amp * 0.5f, ph_l);
         attrset(COLOR_PAIR(CP_S1) | A_NORMAL);
         sput(row, xl, 'o', rows, cols);
 
         /* lagging strand — right, with Okazaki fragment gaps */
         float ph_r  = k * (float)row + t + (float)M_PI;
-        int   xr    = (int)roundf((float)cx + div + amp * 0.5f * cosf(ph_r));
+        int   xr    = backbone_pos((float)cx + div, amp * 0.5f, ph_r);
         int   frag  = (int)(depth) % 10;
         attr_t fattr = (frag < 7) ? A_NORMAL : A_DIM;
         chtype fch   = (frag < 7) ? 'o' : '.';
@@ -598,17 +615,13 @@ static void draw_cruciform(int cx, float t, int rows, int cols)
     for (int row = 1; row < draw_rows; row++) {
         if (abs(row - cy) < 3) continue;
         float phase = kv * (float)row + t;
-        int   x1 = (int)roundf((float)cx + amp_v * cosf(phase));
-        int   x2 = (int)roundf((float)cx - amp_v * cosf(phase));
+        int   x1 = backbone_pos((float)cx,  amp_v, phase);
+        int   x2 = backbone_pos((float)cx, -amp_v, phase);
         float z1 = sinf(phase);
         bool  s1f = (z1 >= 0.f);
         bool  bp  = ((row % 4) == 0);
 
-        if (bp) {
-            int lo=(x1<x2?x1:x2)+1, hi=(x1>x2?x1:x2)-1;
-            attrset(COLOR_PAIR(CP_BD));
-            for (int c=lo; c<=hi; c++) sput(row,c,'-',rows,cols);
-        }
+        if (bp) draw_rung(row, x1, x2, rows, cols);
         attrset(COLOR_PAIR(s1f?CP_S2:CP_S1)|A_DIM);
         sput(row, s1f?x2:x1, 'o', rows, cols);
         attrset(COLOR_PAIR(s1f?CP_S1:CP_S2)|(bp?A_BOLD:A_NORMAL));
@@ -771,22 +784,63 @@ static void draw_ladder(int cx, float t, int rows, int cols)
     attrset(A_NORMAL);
 }
 
-/* dispatch table */
+/*
+ * DnaStructure — one entry in the gallery: a display name and the routine that
+ * renders it.  Indexed by Scene.dna_type; scene_draw calls .draw, screen_hud
+ * shows .name.  Replaces the old parallel dna_names[] + draw_fns[], so the
+ * label and its renderer can never drift out of order.  The set of forms (A/B/Z
+ * helices, triplex, G4, cruciform, plasmid, fork, hairpin) is the structural
+ * taxonomy of Saenger, *Principles of Nucleic Acid Structure*, and Alberts et
+ * al., *Molecular Biology of the Cell* (see References).
+ *
+ * DrawFn — a scene renderer.  cx = centre column, t = the phase clock (animates
+ * the helix), rows/cols = the terminal viewport.  Pure RENDER: reads these,
+ * writes the screen, mutates no state.
+ */
 typedef void (*DrawFn)(int cx, float t, int rows, int cols);
-static const DrawFn draw_fns[N_DNA_TYPES] = {
-    draw_bdna, draw_adna, draw_zdna, draw_triple, draw_gquad,
-    draw_hairpin, draw_rfork, draw_cruciform, draw_plasmid, draw_ladder,
+typedef struct {
+    const char *name;   /* HUD label for this form                       */
+    DrawFn      draw;   /* the §4 routine that paints it                 */
+} DnaStructure;
+
+static const DnaStructure dna_structures[N_DNA_TYPES] = {
+    { "B-DNA Double Helix",     draw_bdna      },
+    { "A-DNA Double Helix",     draw_adna      },
+    { "Z-DNA (Left-handed)",    draw_zdna      },
+    { "Triple Helix",           draw_triple    },
+    { "G-Quadruplex",           draw_gquad     },
+    { "RNA Hairpin",            draw_hairpin   },
+    { "Replication Fork",       draw_rfork     },
+    { "Cruciform",              draw_cruciform },
+    { "Plasmid (Circular DNA)", draw_plasmid   },
+    { "DNA Ladder",             draw_ladder    },
 };
 
 /* ===================================================================== */
-/* §5  scene                                                              */
+/* §5  scene                       STATE + USER EVENTS                    */
 /* ===================================================================== */
+/*
+ * Scene holds all per-instance state.  scene_init / scene_resize mutate it on
+ * boot and on SIGWINCH — USER EVENTS, NOT part of the per-frame tick.
+ * scene_init also binds the initial theme (color_apply_theme, §3).
+ */
 
+/*
+ * Scene — the whole visualisation state, read as a table of contents:
+ *   WHAT is shown — dna_type, an index into dna_structures[] (n/p cycles it).
+ *   HOW it looks  — theme, an index into themes[] (t cycles it).
+ *   WHEN          — t, the phase clock every scene scrolls by (the sim state).
+ *   WHERE         — rows, cols: the terminal viewport.
+ * scene_tick advances t; scene_init / scene_resize set the rest on boot / resize.
+ * `t` is the phase term added to every backbone angle (phase = row·k·hand + t,
+ * cf. KEY FORMULAS): advancing it rotates the helices — a parametric sweep in
+ * the sense of Foley/van Dam and Bourke (see References).
+ */
 typedef struct {
-    int   dna_type;
-    int   theme;
-    float t;
-    int   rows, cols;
+    int   dna_type;   /* WHAT:  index into dna_structures[]            */
+    int   theme;      /* HOW:   index into themes[]                    */
+    float t;          /* WHEN:  phase clock, seconds; the helix angle  */
+    int   rows, cols; /* WHERE: viewport in cells                      */
 } Scene;
 
 static void scene_init(Scene *s, int rows, int cols)
@@ -796,7 +850,7 @@ static void scene_init(Scene *s, int rows, int cols)
     s->t        = 0.f;
     s->rows     = rows;
     s->cols     = cols;
-    color_apply_theme(s->theme);
+    color_apply_theme(&themes[s->theme]);
 }
 
 static void scene_resize(Scene *s, int rows, int cols)
@@ -805,20 +859,31 @@ static void scene_resize(Scene *s, int rows, int cols)
     s->cols = cols;
 }
 
+/* ===================================================================== */
+/* §6  simulation                  SIMULATION — the only state advance    */
+/* ===================================================================== */
+/* Advances Scene.t (the phase clock that scrolls every helix) and nothing  */
+/* else.  Called once per frame from main (§8), and skipped while paused —  */
+/* this is the entire per-tick state advance.                               */
 static void scene_tick(Scene *s, float dt)
 {
     s->t += dt;
 }
 
+/* ===================================================================== */
+/* §7  render                      RENDER — scene → screen + terminal I/O */
+/* ===================================================================== */
+/*
+ * scene_draw dispatches to the active §4 draw; screen_init brings up the
+ * terminal (once); screen_hud overlays the two HUD bars; screen_present flushes.
+ * All read-only on scene state — they write the ncurses screen only.
+ */
+
 static void scene_draw(const Scene *s)
 {
     int cx = s->cols / 2;
-    draw_fns[s->dna_type](cx, s->t, s->rows, s->cols);
+    dna_structures[s->dna_type].draw(cx, s->t, s->rows, s->cols);
 }
-
-/* ===================================================================== */
-/* §6  screen                                                             */
-/* ===================================================================== */
 
 static void screen_init(void)
 {
@@ -830,25 +895,45 @@ static void screen_init(void)
     curs_set(0);
 }
 
-static void screen_hud(const Scene *s, int fps, float actual_fps)
+/*
+ * screen_hud — two fixed bars over the scene:
+ *   top    row 0      DATA    — DNA index + name (left) and theme / fps / state
+ *                              (right-aligned).
+ *   bottom row rows-1 ACTIONS — the key legend.
+ * Both bars are filled first, then text is clipped with "%.*s" — the left data
+ * is kept clear of the right block, and nothing overruns the terminal width.
+ */
+static void screen_hud(const Scene *s, int target_fps, float actual_fps,
+                       bool paused)
 {
     int cols = s->cols;
+    if (cols < 1) return;
 
-    /* top bar */
-    attrset(COLOR_PAIR(CP_HUD));
+    /* ── Top row: DATA — name (left) + theme / fps / state (right). ── */
+    attrset(COLOR_PAIR(CP_HUD) | A_BOLD);
     mvhline(0, 0, ' ', cols);
-    mvprintw(0, 1, "DNA: %s", dna_names[s->dna_type]);
-    char right_buf[48];
-    snprintf(right_buf, sizeof(right_buf), "Theme: %s  %d/%d fps  %.0f",
-             theme_names[s->theme], s->dna_type + 1, N_DNA_TYPES, actual_fps);
-    int rlen = (int)strlen(right_buf);
-    if (cols - rlen - 1 > 0)
-        mvprintw(0, cols - rlen - 1, "%s", right_buf);
 
-    /* bottom bar */
-    mvhline(s->rows - 1, 0, ' ', cols);
-    mvprintw(s->rows - 1, 1,
-             "n/p:type  t:theme  spc:pause  q:quit  ]/[:fps(%d)", fps);
+    char left[64], right[48];
+    snprintf(left,  sizeof left,  " DNA %d/%d: %s ",
+             s->dna_type + 1, N_DNA_TYPES, dna_structures[s->dna_type].name);
+    snprintf(right, sizeof right, " %s  %.0f/%d fps  %s ",
+             themes[s->theme].name, actual_fps, target_fps,
+             paused ? "PAUSED" : "running");
+    int rx = cols - (int)strlen(right);          /* right-aligned column */
+    if (rx >= 0) {
+        mvprintw(0, 0,  "%.*s", rx, left);       /* left clipped clear of right */
+        mvprintw(0, rx, "%s", right);
+    } else {
+        mvprintw(0, 0,  "%.*s", cols, left);     /* too narrow: data only */
+    }
+
+    /* ── Bottom row: ACTIONS — every interactive key. ── */
+    int brow = s->rows - 1;
+    if (brow > 0) {
+        mvhline(brow, 0, ' ', cols);
+        mvprintw(brow, 0, "%.*s", cols,
+                 " n/p:type  t:theme  spc:pause  ]/[:fps  q:quit ");
+    }
     attrset(A_NORMAL);
 }
 
@@ -858,8 +943,13 @@ static void screen_present(void)
 }
 
 /* ===================================================================== */
-/* §7  app                                                                */
+/* §8  app                         USER EVENTS + PERFORMANCE combine      */
 /* ===================================================================== */
+/*
+ * Signal handlers + main().  main() is the ONE per-tick combine point (see
+ * ARCHITECTURE): resize → input → scene_tick (SIM) → RENDER → sleep/fps (PERF).
+ * Input and resize mutate state but are USER EVENTS, NOT part of the tick.
+ */
 
 static volatile sig_atomic_t g_resize = 0;
 static volatile sig_atomic_t g_quit   = 0;
@@ -914,7 +1004,7 @@ int main(void)
             break;
         case 't':
             s.theme = (s.theme + 1) % N_THEMES;
-            color_apply_theme(s.theme);
+            color_apply_theme(&themes[s.theme]);
             break;
         case ']':
             fps = fps + SIM_FPS_STEP <= SIM_FPS_MAX ? fps + SIM_FPS_STEP : SIM_FPS_MAX;
@@ -935,7 +1025,7 @@ int main(void)
         /* draw */
         erase();
         scene_draw(&s);
-        screen_hud(&s, fps, actual_fps);
+        screen_hud(&s, fps, actual_fps, paused);
         screen_present();
 
         /* sleep to hit target fps */

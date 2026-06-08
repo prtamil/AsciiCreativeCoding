@@ -110,31 +110,6 @@
  *  digit width  = FONT_C × g_sx     pixels in cells
  *  particle target count: g_dtn[d] = (#-pixels) × g_suby × g_subx
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Greedy NN is not optimal — the Hungarian algorithm would minimise
- *    total travel, but greedy is O(P·T) and visually indistinguishable.
- *  • If a digit has more targets than N_PARTS, surplus targets go unfilled.
- *    Worst case: digit 8 with 39 '#' × 12 sub = 468 < 500. Safe margin.
- *  • Pressing 'n' mid-morph forces g_morph_t = 1 — particles teleport to
- *    current targets, then immediately get reassigned to the next digit.
- *  • Resize triggers do_resize → targets_precompute → digit_assign; the
- *    snapshot is taken from old positions so the morph still looks smooth.
- *  • g_subx/g_suby clamp to SUB_*_MAX so very large terminals don't try to
- *    spawn more than N_PARTS particles per digit.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Pause during a morph; particles should be motionless (parts_update
- *    is gated on !paused in the main loop, not inside parts_update).
- *  • Trigger '1' (sparse digit, ~9 '#' pixels): about 100 active dots,
- *    rest gliding to centre and fading.
- *  • Sequence 0→8→0: returning to 0 should reuse the same target pixels;
- *    after a few cycles each particle tends to cycle through the same slot.
- *  • Decreasing morph_frames with 'f' should make the slide visibly snap
- *    faster; the smoothstep S-curve remains visible.
- *  • Idle particles must not appear after g_morph_t == 1 — they're skipped
- *    by the `continue` in parts_draw.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

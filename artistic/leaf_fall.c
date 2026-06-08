@@ -90,37 +90,6 @@
  *  LCG step       :  s = s · 1664525 + 1013904223
  *  Trunk height   :  h = (TRUNK_H_MIN..MAX) · g_rows  (≈45–65 % of screen)
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • RESET_NS uses the same g_state_t timer as DISPLAY/FALLING — if
- *    all_done() fires before any tick, RESET reads `elapsed` from the
- *    OLD state's timestamp; the code resets g_state_t when entering
- *    ST_RESET to avoid that.
- *  • MAX_LEAVES is hard-capped at 4096; large terminals with high
- *    foliage density can saturate this and silently drop leaves —
- *    add_leaf simply returns if the pool is full.
- *  • BSTACK_MAX = 512 limits recursion depth × branch count; the code
- *    guards every push with `bsp < BSTACK_MAX-3`.  Excess branches
- *    are silently dropped, never crashing.
- *  • The trail draw skips j when (head_row − j) < orig_row, so a leaf
- *    just starting still shows as a single white head on its own cell
- *    without a phantom tail above it.
- *  • set_cell on the trunk skips overwrite if cell is already CP_TRUNK
- *    in draw_branch_line — protects the 2-cell-wide trunk from being
- *    eaten by branches.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • DISPLAY phase: count distinct foliage characters in `*@&#%o~`
- *    (7 leaf glyphs).  All seven should appear in a healthy canopy.
- *  • Press space mid-DISPLAY → leaves immediately begin falling.
- *  • Press `r` → an entirely different tree (new seed) appears; trunk
- *    height varies between ~45 % and ~65 % of screen rows.
- *  • Watch one column carefully — head is bright white-bold, body is
- *    bright green for up to TRAIL_LEN=7 cells above it, then nothing.
- *  • When head_row > rows + TRAIL_LEN, the entire column should be
- *    blank — no lingering tail.
- *  • g_cycle in HUD increments by 1 per generated tree.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

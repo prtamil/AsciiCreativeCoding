@@ -1,6 +1,6 @@
 # Terminal Animation Framework — Architecture
 
-Reference implementation: `basics/bounce_ball.c`
+Reference implementation: `physics/bounce_ball.c`
 
 ---
 
@@ -75,7 +75,7 @@ Reference implementation: `basics/bounce_ball.c`
     - [Plasma — plasma.c](#plasma--plasmac)
 39. [Penrose Tiling — procedural/patterns/penrose_pentagrid.c](#39-penrose-tiling--procedural/fractals & chaospenrosec)
 40. [Diamond-Square Terrain — procedural/worldgen/terrain.c](#40-diamond-square-terrain--procedural/fractals & chaosterrainc)
-41. [Forest Fire CA — misc/forest_fire.c](#41-forest-fire-ca--miscforest_firec)
+41. [Forest Fire CA — procedural/generational/forest_fire.c](#41-forest-fire-ca--miscforest_firec)
 42. [Lattice Gas — fluid/lattice_gas.c](#42-lattice-gas--fluidlattice_gasc)
 43. [Galaxy — artistic/galaxy.c](#43-galaxy--artisticgalaxyc)
 44. [Barnes-Hut — physics/barnes_hut.c](#44-barnes-hut--physicsbarnes_hutc)
@@ -87,23 +87,23 @@ Reference implementation: `basics/bounce_ball.c`
 50. [DLA Extended — procedural/generational/diffusion_map.c](#50-dla-extended--procedural/fractals & chaosdiffusion_mapc)
 51. [DBM Tree — procedural/fractals/tree_la.c](#51-dbm-tree--procedural/fractals & chaostree_lac)
 52. [Lyapunov Fractal — procedural/fractals/lyapunov.c](#52-lyapunov-fractal--procedural/fractals & chaoslyapunovc)
-53. [Ant Colony Optimization — artistic/ant_colony.c](#53-ant-colony-optimization--artisticant_colonyc)
+53. [Ant Colony Optimization — procedural/generational/ant_colony.c](#53-ant-colony-optimization--artisticant_colonyc)
 54. [Dune Rocket — artistic/dune_rocket.c](#54-dune-rocket--artisticdune_rocketc)
 55. [Dune Sandworm — artistic/dune_sandworm.c](#55-dune-sandworm--artisticdune_sandwormc)
 56. [FFT Visualiser — artistic/fft_vis.c](#56-fft-visualiser--artisticfft_visc)
 57. [Fourier Draw — artistic/fourier_draw.c](#57-fourier-draw--artisticfourier_drawc)
 58. [Gear — artistic/gear.c](#58-gear--artisticgearc)
 59. [Graph Search — artistic/graph_search.c](#59-graph-search--artisticgraph_searchc)
-60. [Hex Life — artistic/hex_life.c](#60-hex-life--artistichex_lifec)
+60. [Hex Life — procedural/generational/hex_life.c](#60-hex-life--artistichex_lifec)
 61. [Jellyfish — artistic/jellyfish.c](#61-jellyfish--artisticjellyfish)
 62. [Network SIR Simulation — artistic/network_sim.c](#62-network-sir-simulation--artisticnetwork_simc)
 63. [Railway Map — artistic/railwaymap.c](#63-railway-map--artisticrailwaymapc)
 64. [Sand Art — artistic/sand_art.c](#64-sand-art--artisticsand_artc)
 65. [X-Ray Swarm — artistic/xrayswarm.c](#65-x-ray-swarm--artisticxrayswarm)
 66. [Shepherd Herding — flocking/shepherd.c](#66-shepherd-herding--flockingshepherdc)
-67. [Excitable Medium — fluid/excitable.c](#67-excitable-medium--fluidexcitablec)
+67. [Excitable Medium — procedural/generational/excitable.c](#67-excitable-medium--fluidexcitablec)
 68. [SPH Fluid — fluid/fluid_sph.c](#68-sph-fluid--fluidfluid_sphc)
-69. [Lenia — fluid/lenia.c](#69-lenia--fluidleniac)
+69. [Lenia — procedural/generational/lenia.c](#69-lenia--fluidleniac)
 70. [Marching Squares — fluid/marching_squares.c](#70-marching-squares--fluidmarching_squaresc)
 71. [Stable Fluids (Navier-Stokes) — fluid/navier_stokes.c](#71-stable-fluids-navier-stokes--fluidnavier_stokesc)
 72. [FitzHugh-Nagumo Reaction Wave — fluid/reaction_wave.c](#72-fitzhugh-nagumo-reaction-wave--fluidreaction_wavec)
@@ -124,7 +124,7 @@ Reference implementation: `basics/bounce_ball.c`
 87. [Fireworks Rain — matrix_rain/fireworks_rain.c](#87-fireworks-rain--matrix_rainfireworks_rainc)
 88. [Pulsar Rain — matrix_rain/pulsar_rain.c](#88-pulsar-rain--matrix_rainpulsar_rainc)
 89. [Sun Rain — matrix_rain/sun_rain.c](#89-sun-rain--matrix_rainsun_rainc)
-90. [Maze — misc/maze.c](#90-maze--miscmazec)
+90. [Maze — procedural/generational/maze.c](#90-maze--miscmazec)
 91. [Sort Visualiser — misc/sort_vis.c](#91-sort-visualiser--miscsort_visc)
 92. [Aspect Ratio Demo — ncurses_basics/aspect_ratio.c](#92-aspect-ratio-demo--ncurses_basicsaspect_ratioc)
 93. [Lines and Cols Query — ncurses_basics/tst_lines_cols.c](#93-lines-and-cols-query--ncurses_basicstst_lines_colsc)
@@ -1975,7 +1975,7 @@ Small shifts in (f, k) produce radically different patterns. The 7 presets span 
 
 ---
 
-## 25. Chaotic Double Pendulum — physics/double_pendulum.c
+## 25. Chaotic Double Pendulum — procedural/chaos/double_pendulum.c
 
 `double_pendulum.c` integrates the exact Lagrangian equations of motion for a double pendulum (equal masses, equal arm lengths).
 
@@ -2104,7 +2104,7 @@ Each thread is drawn as a straight line using `mvaddch`. The character is chosen
 
 ---
 
-## 29. 1-D Wolfram Cellular Automata — artistic/cellular_automata_1d.c
+## 29. 1-D Wolfram Cellular Automata — procedural/generational/cellular_automata_1d.c
 
 `cellular_automata_1d.c` animates all 256 Wolfram elementary rules as a build-down pattern that grows from a single cell at the top.
 
@@ -2137,7 +2137,7 @@ Typing 1–3 digits accumulates a rule number. After 3 digits (or pressing Enter
 
 ---
 
-## 30. Conway's Game of Life + Variants — artistic/life.c
+## 30. Conway's Game of Life + Variants — procedural/generational/life.c
 
 `life.c` runs Conway's Game of Life and five rule variants on a toroidal grid with a population histogram.
 
@@ -2171,7 +2171,7 @@ A `HIST_LEN = 512` entry ring buffer stores population counts. The bottom 3 rows
 
 ---
 
-## 31. Langton's Ant + Turmites — artistic/langton.c
+## 31. Langton's Ant + Turmites — procedural/generational/langton.c
 
 `langton.c` simulates Langton's Ant and multi-colour turmites: automata where an ant walks a grid, changes cell states, and turns based on a rule string.
 
@@ -2235,7 +2235,7 @@ Classic (cyan/red), Ocean (blue/teal), Ember (orange/dark-red), Neon (green/mage
 
 ---
 
-## 33. Wa-Tor Predator-Prey — artistic/wator.c
+## 33. Wa-Tor Predator-Prey — procedural/generational/wator.c
 
 `wator.c` simulates Alexander Dewdney's 1984 Wa-Tor ocean: fish and sharks on a toroidal grid with local breed/starve rules producing global population oscillations.
 
@@ -2709,7 +2709,7 @@ Material flows downhill when slope exceeds the `TALUS` angle. Mountains slowly c
 
 ---
 
-## 41. Forest Fire CA — misc/forest_fire.c
+## 41. Forest Fire CA — procedural/generational/forest_fire.c
 
 Implements the **Drossel-Schwabl (1992)** 3-state probabilistic cellular automaton modelling forest fire ecology. Each cell is EMPTY, TREE, or FIRE; all cells update simultaneously based on two parameters: `p` (growth probability) and `f` (lightning probability).
 
@@ -2740,7 +2740,7 @@ EMPTY → EMPTY   otherwise
 
 **Code organisation after CLAUDE.md compliance pass:** `grid_step` extracts `has_fire_neighbor(r, c, eight)` so the spread test is a clean predicate, and the per-cell switch fits in 30 lines. `scene_draw` decomposes into `mark_cell` + `draw_grid` + `draw_hud`. PAIR_HUD (yellow 226 + A_BOLD) and PAIR_HINT (cyan 51 + A_BOLD) are theme-independent and registered once in `color_init`; the 5 themed pairs (CP_TREE/CP_FIRE1/CP_FIRE2/CP_ASH plus default-bg empty) re-register on `t/T` cycle via `theme_apply(ti)`. Empty-cell background is `-1` (terminal default) so the burned-down state inherits the user's wallpaper. Theme palettes were curated to sit at ≥24 in the colour cube — earlier grayscale 232–239 entries became invisible under A_DIM and were replaced.
 
-*Files: `misc/forest_fire.c`*
+*Files: `procedural/generational/forest_fire.c`*
 
 ---
 
@@ -3124,7 +3124,7 @@ The b-axis is inverted: row 0 = `b_max`, row ROWS-1 = `b_min`. This matches the 
 
 ---
 
-## 53. Ant Colony Optimization — artistic/ant_colony.c
+## 53. Ant Colony Optimization — procedural/generational/ant_colony.c
 
 Stigmergic pathfinding on an 8-directional grid. Ants deposit pheromone on traversed cells; shorter paths accumulate stronger trails before evaporation erases them. The colony converges to the near-optimal path without central coordination — Deneubourg's double-bridge experiment, run live in the terminal.
 
@@ -3167,7 +3167,7 @@ Earlier versions read input ONCE per render frame AFTER running `speed`-many sim
 
 The pheromone field `g_ph[GRID_H][GRID_W]` (float) is the colony's shared memory. 80 ants, 4-tier glyph ramp (`. : + #`), 8-connected movement. O(N_ants + grid_area·evap) per tick — trivially fast past 60 fps with multi-tick speed multipliers.
 
-*Files: `artistic/ant_colony.c`*
+*Files: `procedural/generational/ant_colony.c`*
 *Cross-references: §175 Phoenix (anchor-template silhouette pattern from a different domain — particles around a body instead of foragers around food).*
 
 ---
@@ -3266,7 +3266,7 @@ Source and goal are chosen as the farthest-apart pair. Node colors encode state:
 
 ---
 
-## 60. Hex Life — artistic/hex_life.c
+## 60. Hex Life — procedural/generational/hex_life.c
 
 Conway's Game of Life adapted to a hexagonal grid. Each cell has 6 neighbors (offset-row layout) rather than 8. Rule B2/S34 produces qualitatively different behavior — more isotropic growth, different oscillators and gliders.
 
@@ -3278,7 +3278,7 @@ Two neighbor offset tables, one per row parity (even/odd offset rows). Double-bu
 
 For each cell, count 6 neighbors. Apply: dead cell with exactly 2 live neighbors → born (B2); live cell with 3 or 4 live neighbors → survives (S34). The 6-neighbor symmetry eliminates the diagonal artifacts of square-grid CAs and makes boundary patterns more isotropic.
 
-*Files: `artistic/hex_life.c`*
+*Files: `procedural/generational/hex_life.c`*
 
 ---
 
@@ -3414,7 +3414,7 @@ Sheep glyph: `o` calm (white), `O` panicking (bold red). Pen boundary: dashed `*
 
 ---
 
-## 67. Excitable Medium — fluid/excitable.c
+## 67. Excitable Medium — procedural/generational/excitable.c
 
 Greenberg-Hastings N-state cellular automaton modeling excitable media such as cardiac muscle. State 0 = resting; state 1 = excited; states 2..N-1 = refractory.
 
@@ -3426,7 +3426,7 @@ Von Neumann neighborhood (4 orthogonal neighbors), periodic boundary. Rule: `if 
 
 Four initial conditions: SPIRAL (broken wave front curling into rotation), DOUBLE (two counter-rotating spirals), RINGS (radially periodic concentric targets), CHAOS (5% random seeding → turbulent multi-spiral). Double-buffering ensures each cell's next state depends only on current-tick neighbors. STEP_NS = 1/15 s, RENDER_NS = 1/30 s — CA runs at half display rate.
 
-*Files: `fluid/excitable.c`*
+*Files: `procedural/generational/excitable.c`*
 
 ---
 
@@ -3446,7 +3446,7 @@ GCELL=3 ≥ SMOOTH_RADIUS=2.2 ensures all neighbors within H lie in the 3×3 sur
 
 ---
 
-## 69. Lenia — fluid/lenia.c
+## 69. Lenia — procedural/generational/lenia.c
 
 Continuous cellular automaton generalizing Conway's Life to real-valued states and smooth ring kernels. Each step: convolve state grid with kernel K, apply growth function G, update state.
 
@@ -3456,7 +3456,7 @@ Ring kernel K: nonzero only in an annular ring at radius R, using the bump funct
 
 The parameter pair (μ, σ) defines a "species." Preset creatures — Orbium (μ=0.15, σ=0.015, R=13), Aquarium (μ=0.26, σ=0.036, R=10), Scutium (μ=0.17, σ=0.015, R=8) — exhibit autonomous locomotion and division. The kernel is precomputed as a sparse list of (dr, dc, weight) entries after threshold pruning, stored in `g_kw`/`g_kdr`/`g_kdc`. Toroidal boundaries avoid edge artifacts.
 
-*Files: `fluid/lenia.c`*
+*Files: `procedural/generational/lenia.c`*
 
 ---
 
@@ -3728,7 +3728,7 @@ Stream direction angle `θ = k×π/90` for k=0…179. Position: `col = cx + r·c
 
 ---
 
-## 90. Maze — misc/maze.c
+## 90. Maze — procedural/generational/maze.c
 
 Recursive-backtracker DFS maze generation with animated BFS solve. A W×H grid of cells with 4-bit wall bitmasks (N=1, E=2, S=4, W=8) is carved into a perfect maze (spanning tree), then solved for the shortest path.
 
@@ -3746,7 +3746,7 @@ Pixel parities decide which lattice element to draw — `(0,0)` corner `+`, `(0,
 
 `mark_cell()` is the single ncurses-output choke point with the canonical `(chtype)(unsigned char)` double-cast. `scene_draw` decomposes into `draw_lattice_pixel` (corner/wall classification by parity) + `draw_cell_interior` (frontier vs visited vs unvisited per phase) + `draw_grid` + `draw_hud`. The main loop extracts `handle_key` and `step_simulation` so the render pipeline is one straight `erase → scene_draw → wnoutrefresh → doupdate` block. Frame cap uses a `frame_start = clock_ns()` snapshot at top-of-loop; the earlier `clock_ns() - frame_time + dt` form cancelled the cap and pegged CPU at 100%.
 
-*Files: `misc/maze.c`*
+*Files: `procedural/generational/maze.c`*
 
 ---
 
@@ -5794,8 +5794,11 @@ Multi-octave fBm scalar field defines glowing gas density across the screen. Two
 The `procedural/` tree holds the project's procedural-generation
 showcases. All of these follow the standard §1–§8 framework
 architecture; the algorithm-specific code lives in §5 (state) and §6
-(state machine + scheduling). Two sub-folders separate the two
-families.
+(state machine + scheduling). Sub-folders group the families:
+`generational/` (discrete one-shot builders), `fields/` (continuous
+noise / flow), `chaos/` (dynamical systems), `worldgen/` (seeded worlds)
+and `patterns/` (tilings); the escape-time `fractals/` set is covered in
+§22.
 
 ### `procedural/generational/` — discrete, one-shot generators
 
@@ -5821,9 +5824,10 @@ on the finished result before resetting. State machines typically run
 ### `procedural/fields/` — continuous noise + flow fields
 
 These animate **continuously** — there is no discrete "build" phase,
-the field evolves forever via time drift. Five patterns per file
-(navigated with `n`/`p`), 10 themes (`t`/`T`), and most include the
-slim→fat glyph-set selector (`g`/`G`).
+the field evolves forever via time drift. Five patterns per file — the
+four `*_showcase.c` files instead sweep 30 patterns across six
+complexity tiers — navigated with `n`/`p`; 10 themes (`t`/`T`), and most
+include the slim→fat glyph-set selector (`g`/`G`).
 
 | File | Algorithm |
 |---|---|
@@ -5836,6 +5840,10 @@ slim→fat glyph-set selector (`g`/`G`).
 | `reaction_diffusion_gray_scott.c` | Gray-Scott PDE (explicit Euler + 5-point Laplacian, NEUMANN boundary). 5 morphology presets from Pearson 1993: SPOTS / STRIPES / MAZES / CORAL / WORMS |
 | `simplex_noise_clouds.c` | Ken Perlin's 2001 simplex noise — isotropic alternative to Perlin. 5 cloud patterns: CLOUDS / WISPS / TURBULENCE / BILLOW / RIDGED |
 | `worley_cellular_noise.c` | Steven Worley's cellular noise via 3×3 tile-grid lookup. 5 patterns: F1 / F2_F1 / F2 / MANHATTAN / CELL_ID |
+| `value_noise_showcase.c` | Lance Williams / Perlin value noise — random scalars on a lattice + interpolation, the 1980s ancestor of gradient noise. 30 patterns across 6 complexity tiers |
+| `marching_squares_isocontours_showcase.c` | Iso-contour extraction from a scalar field (the 2-D ancestor of marching cubes). 30 views: single iso-lines, multi-threshold topographic maps, case-aware joins |
+| `vector_field_arrows_showcase.c` | 2-D vector fields f(x,y)→(u,v) drawn as ASCII arrows. 30 patterns: gradient, analytic, physics, divergence-free, and dynamical-system phase fields |
+| `signed_distance_field_jfa_showcase.c` | Euclidean distance field via the Jump Flood Algorithm (Rong & Tan, 2006), visualised 30 ways across 6 tiers |
 
 ### Shared UX skeleton (all `procedural/fields/`)
 
@@ -5849,13 +5857,30 @@ state; row 1 left = pattern + theme + 4-colour palette swatches; row 1
 right = glyph-set indicator with 3-char preview; bottom = key hints in
 PAIR_HINT.
 
-### Documentation cross-reference
-
-Per-algorithm concept docs live at
-`documentation/learning/concept_procedural_index.md` (master index)
-plus individual `concept_*.md` files for each technique.
-
 *Files: `procedural/generational/*.c`, `procedural/fields/*.c`*
+
+### `procedural/chaos/` — dynamical systems & deterministic chaos
+
+ODE integrators and iterated maps that expose the hallmarks of chaos:
+strange attractors, fractal basins of attraction, Poincaré sections,
+the period-doubling cascade, and sensitive dependence on initial
+conditions. (The flagship Lorenz system, the logistic-map bifurcation
+and the double pendulum have their own sections above; the gallery
+below collects the rest.)
+
+| File | Algorithm |
+|---|---|
+| `magnetic_pendulum.c` | Damped pendulum over three triangular magnets (softened 1/r² pull); which magnet wins is a fractal function of the start position — the basins-of-attraction classic |
+| `duffing_oscillator.c` | Driven double-well nonlinear oscillator; the textbook period-doubling route to chaos |
+| `rossler_attractor.c` | Rössler attractor — Lorenz's simpler cousin: a 3-D ODE with a single nonlinear term, yet a band-shaped strange attractor |
+| `henon_heiles.c` | 2-DoF Hénon-Heiles Hamiltonian (1964 galactic-orbit model); energy E is the bifurcation parameter |
+| `sensitive_dependence.c` | The "butterfly effect" made literal: two Lorenz trajectories started ε≈10⁻⁶ apart, diverging after a Lyapunov time |
+| `poincare_section.c` | Poincaré section of the Lorenz ODE — a continuous 3-D trajectory reduced to a 2-D point cloud at plane crossings |
+| `standard_map.c` | Chirikov-Taylor standard map: an area-preserving torus map showing Hamiltonian (conservative) chaos as the parameter K grows |
+| `cobweb_diagram.c` | Cobweb / staircase construction of a 1-D iterated map x_{n+1}=f(x_n) — the geometric mechanism behind one bifurcation slice |
+| `recurrence_plot.c` | Recurrence plot R(i,j)=1 when states at times i,j are within ε; the texture distinguishes periodic, chaotic, and noisy dynamics |
+
+*Files: `procedural/chaos/*.c`*
 
 ### `procedural/worldgen/` — pure-function worlds at scale
 
@@ -6212,6 +6237,30 @@ Cube (12 tris), tetrahedron (4 tris), octahedron (8 tris) — total 24 + 2 floor
 
 *Files: `raster/neon_edges.c`*
 *References: Sobel & Feldman, "A 3×3 Isotropic Gradient Operator for Image Processing" (SAIL, 1968); Mitchell et al., "Real-Time Rendering Tricks for Ambient Occlusion and Edge Detection," GDC '07; LearnOpenGL "Bloom" tutorial.*
+
+---
+
+## 187. DNA and RNA Structures — artistic/dna.c
+
+Ten DNA/RNA structure types cycle with `n`/`p`: B-, A-, and Z-form double helices (right-handed, wide-grooved, and left-handed zigzag), a Hoogsteen triple helix, a four-strand G-quadruplex, an RNA stem-loop hairpin, a Y-shaped replication fork, a cruciform inverted-repeat, a closed circular plasmid, and an unrolled educational base-pair ladder. Each type is its own parametric 2-D draw routine over a shared vocabulary of strand / bond / label primitives — backbones traced as sine or arc paths with rungs hatched between them. Six colour themes (BioLab, Neon, Ocean, Fire, Cosmic, Mono) each supply five complementary colours (strand1, strand2, strand3, bond, label). The lesson: one "two backbones plus base-pair rungs" idea, re-parameterised into ten recognisable nucleic-acid forms.
+
+*Files: `artistic/dna.c`*
+
+---
+
+## 188. Hindu Mandalas — artistic/hindu_mandalas.c
+
+Thirty parametric Hindu mandalas (20 simple + 10 complex) drawn from six radial primitives — petals, rings, star polygons, regular polygons, rays, dots, and a central bindu. Each preset is a parameter set choosing which primitives appear, at which radii, and over how many concentric rings: 1–4 rings for the simple forms (Bindu, Padma 8/12/16/32, Shatkona, Ashtakona, Sri Yantra …) and 5–7 for the complex ones (Sahasrara, Kalachakra, Mahakali, Sudarshana …). `n`/`p` (or arrows) cycle presets, `t` cycles themes, `+`/`-` resize, `r` toggles slow rotation. The lesson: "thirty different mandalas" is really one parametric draw function driven by thirty parameter sets.
+
+*Files: `artistic/hindu_mandalas.c`*
+
+---
+
+## 189. Islamic Geometric Patterns — artistic/islamic_mandalas.c
+
+Thirty parametric Islamic geometric patterns (20 simple + 10 complex), and a clean worked example of the project's refactored layer architecture: §1 holds the preset table plus the Ring/Preset types and themes, §3 is pure logic (polar↔cell maps, line-glyph selection, build math), §5 is the simulation tick that advances a ring-by-ring build animation and rotation, and §6 renders. Each preset is a table of rings assembled by a shared `draw_mandala` routine; `b` replays the build animation, `t` cycles themes, `+`/`-` scale. Same parametric-preset lesson as the Hindu set, here animated as a progressive construction.
+
+*Files: `artistic/islamic_mandalas.c`*
 
 ---
 

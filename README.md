@@ -17,7 +17,7 @@
  ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
-**327 programs. Pure C. ncurses. No GUI. Each file complete in itself.**
+**337 programs. Pure C. ncurses. No GUI. Each file complete in itself.**
 
 ---
 
@@ -135,13 +135,13 @@ per-program algorithm notes in [DEMOS.md](DEMOS.md).
 | Folder | Files | Summary |
 |--------|------:|---------|
 | `fluid/` | 11 | Stam stable fluids, lattice Boltzmann, FDTD wave, Gray-Scott reaction-diffusion, FitzHugh-Nagumo excitable medium, SPH, falling sand, vorticity-streamfunction, CFL stability explorer |
-| `physics/` | 36 | Lorenz / N-body / cloth / Ising / Schrödinger; Schwarzschild black hole; quaternion gyroscope; PBD chains; rigid-body, soft-body; Barnes-Hut O(N log N) gravity; mass-spring lattice; CG and multigrid visualisers; RK1/2/4 comparison |
-| `procedural/` | 69 | Six sub-folders: chaos, fields, fractals, generational, patterns, worldgen — Mandelbrot / Julia / Buddhabrot / Newton; Barnsley IFS; DLA; Lyapunov; logistic; Apollonian; L-systems; Lorenz; Truchet/Wang/quasicrystal/Penrose; star fields, galaxies, hydraulic erosion, fBm clouds |
+| `physics/` | 33 | Lorenz / N-body / cloth / Ising / Schrödinger; Schwarzschild black hole; quaternion gyroscope; PBD chains; rigid-body, soft-body; Barnes-Hut O(N log N) gravity; mass-spring lattice; CG and multigrid visualisers; RK1/2/4 comparison |
+| `procedural/` | 82 | Six sub-folders: chaos (12), fields (13), fractals (17), generational (25), patterns (6), worldgen (9) — Mandelbrot / Julia / Buddhabrot / Newton; Barnsley IFS; DLA; Lyapunov; logistic; Apollonian; L-systems; Lorenz; Truchet/Wang/quasicrystal/Penrose; star fields, galaxies, hydraulic erosion, fBm clouds |
 | `grids/` | 76 | Four families (rect/hex/tri/polar) × *drawing* + *placement*. Triangular covers regular tilings (1–6), recursive fractals (7–9), aperiodic substitution (10, 12), and Delaunay (11). See [grids/README.md](grids/README.md) |
 | `raster/` | 14 | Software rasteriser: cube/sphere/torus, deferred pipeline, shadow mapping, SSAO, bloom, neon edges, marching cubes, Mandelbulb raster, the spinning ASCII donut |
 | `raymarcher/` | 8 | Sphere tracing on SDFs: primitives, CSG atlas, blend/twist/repeat composition gallery, metaballs, KIFS fractal, Mandelbulb |
 | `raytracing/` | 10 | Analytic ray↔primitive: sphere/cube/torus/capsule; tunnel, forest god rays, solar eclipse, ringed Saturn; Cornell-box Monte Carlo path tracer |
-| `artistic/` | 23 | Aesthetic effects: galaxy, aurora, mandalas, plasma, Hindu / Islamic geometric patterns, Penrose pentagrid, cymatics, transit map, bonsai gallery, jellyfish, DNA helix |
+| `artistic/` | 23 | Aesthetic effects: galaxy, aurora, nebula, plasma, lava lamp; Hindu / Islamic geometric mandalas; volcano, fire tornado, hurricane, phoenix; dune rocket & sandworm; bonsai, jellyfish, DNA helix, leaf fall, sand art, LED / particle number-morph, railway transit map, ray swarm |
 | `animation/` | 14 | Forward + inverse kinematics, ragdoll, Verlet ropes, easing curves, snake / centipede / tentacle / medusa |
 | `flocking/` | 7 | Reynolds boids, shepherd herding, crowd steering, faction battle, ant-colony pheromone, predator-prey, Physarum slime mould |
 | `robots/` | 4 | Hexapod tripod gait, biped, spring-leg jumper, self-balancing Perlin-terrain bot |
@@ -192,6 +192,9 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c         -o raymarcher    
 - [DEMOS.md](DEMOS.md) — per-program algorithm notes
 - [documentation/Architecture.md](documentation/Architecture.md) — framework
   design, loop mechanics, coordinate model, per-subsystem deep dives
+- [documentation/Framework.md](documentation/Framework.md) — line-by-line
+  beginner's guide to the canonical animation framework
+  (`ncurses_basics/framework.c`)
 - [documentation/Master.md](documentation/Master.md) — every technique used
   in the project explained from first principles, with source files and
   canonical references

@@ -7,9 +7,9 @@ Based on `ncurses_basics/framework.c` — the canonical template for every anima
 
 ## Who This Document Is For
 
-You just wrote your first C program. You understand variables, loops, functions, and maybe structs. Now you want to make something move on the terminal screen. You look at `framework.c` and see 860 lines split into 8 numbered sections, signal handlers, nanosecond clocks, accumulator loops, interpolation factors — and it feels overwhelming.
+You just wrote your first C program. You understand variables, loops, functions, and maybe structs. Now you want to make something move on the terminal screen. You look at `framework.c` and see 1,369 lines split into 8 numbered sections, signal handlers, nanosecond clocks, accumulator loops, interpolation factors — and it feels overwhelming.
 
-This document explains every single piece. Not just *what* it does, but *why* it exists, *what breaks* if you remove it, and *how* it connects to the pieces around it. Read it top to bottom once. Then open `framework.c` and read it again alongside this guide. By the end you will understand not just this file, but the architecture used by every one of the 170+ animations in this project.
+This document explains every single piece. Not just *what* it does, but *why* it exists, *what breaks* if you remove it, and *how* it connects to the pieces around it. Read it top to bottom once. Then open `framework.c` and read it again alongside this guide. By the end you will understand not just this file, but the architecture used by every one of the 337 animations in this project.
 
 ---
 
@@ -81,7 +81,7 @@ This means when you want to add a new entity type, you only touch §5. When you 
 
 **What happens if you don't separate?**
 
-If you mix physics update and drawing in the same function, every change to how something moves requires touching the drawing code, and vice versa. The file becomes spaghetti. In a 300-line file this is annoying. In an 800-line file it is a maintenance nightmare. In a project with 170 files, every one of which a different student might study, it becomes impossible to understand.
+If you mix physics update and drawing in the same function, every change to how something moves requires touching the drawing code, and vice versa. The file becomes spaghetti. In a 300-line file this is annoying. In an 800-line file it is a maintenance nightmare. In a project with 337 files, every one of which a different student might study, it becomes impossible to understand.
 
 The sections also create a **dependency order**:
 
@@ -1421,7 +1421,7 @@ static void scene_draw(const Scene *s, WINDOW *w,
 
 The main loop, signal handlers, ncurses setup, clock functions — all unchanged. The framework handles everything. You only wrote the physics (§5) and plugged it into the scene (§6).
 
-This is the power of the architecture: 80% of the code is identical across all 170+ simulations. Only §5 and the simulation-specific parts of §6 differ.
+This is the power of the architecture: 80% of the code is identical across all 337 simulations. Only §5 and the simulation-specific parts of §6 differ.
 
 ---
 
@@ -1479,7 +1479,7 @@ This is the power of the architecture: 80% of the code is identical across all 1
 
 ## Conclusion
 
-`framework.c` is 860 lines, but the core ideas are five:
+`framework.c` is 1,369 lines, but the core ideas are five:
 
 1. **Fixed timestep accumulator** — physics always runs at the same speed, regardless of render rate or hardware. This makes simulations deterministic, stable, and comparable across machines.
 
@@ -1489,7 +1489,7 @@ This is the power of the architecture: 80% of the code is identical across all 1
 
 4. **ncurses double buffer via wnoutrefresh+doupdate** — only changed cells are sent to the terminal each frame. Animations run smoothly even over slow SSH connections.
 
-5. **Layered architecture (§1–§8)** — each section has one responsibility. The main loop and signal handlers never change. Only §5 (the physics entity) and §6 (the scene) differ between the 170+ animations in this project.
+5. **Layered architecture (§1–§8)** — each section has one responsibility. The main loop and signal handlers never change. Only §5 (the physics entity) and §6 (the scene) differ between the 337 animations in this project.
 
 Master these five ideas and you understand not just `framework.c`, but every simulation in this repository — and the architecture used in game engines, physics simulators, and real-time visualisation systems everywhere.
 

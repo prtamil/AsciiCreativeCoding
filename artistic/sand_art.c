@@ -33,15 +33,16 @@
  *         ALIEN        multicolour neon, glowing
  *         NEGATIVE     white-paper bg + dark sand (inverted)
  *
- * Section map:
- *   §1 config    — themes, patterns, hourglass + frame geometry
- *   §2 clock     — monotonic timer + sleep
- *   §3 color     — 8-tier sand palette per theme
- *   §4 utilities — RNG, hashes
- *   §5 hourglass — curved bulb mask, frame decoration coords
- *   §6 sand      — grid + CA + momentum tick + flip + transfer count
- *   §7 scene     — compose render passes
- *   §8 screen + app
+ * Section map (layers):
+ *   §1 config        — themes, patterns, hourglass + frame geometry
+ *   §2 performance   — monotonic timer + sleep (frame cap in §9)
+ *   §3 color         — RENDER setup: palette pairs (startup + theme cycle)
+ *   §4 logic         — pure RNG step + hash
+ *   §5 simulation    — hourglass cavity mask (built on reset)
+ *   §6 simulation    — sand grid + CA momentum tick + flip + transfer count
+ *   §7 simulation    — scene control: rebuild / refill / cycle / per-tick
+ *   §8 render        — draw passes (frame / walls / sand / HUD) + screen
+ *   §9 app           — combine loop, signals, key + resize handling
  *
  * Keys:
  *   q / ESC      quit
@@ -124,14 +125,24 @@
  *                  trivial at 60 Hz.
  *
  * References     :
- *   • Toffoli, T. & Margolus, N. (1987) — *Cellular Automata Machines*
- *     §7 (sand pile / falling sand CA).
- *   • Bak, P., Tang, C. & Wiesenfeld, K. (1988) — "Self-Organized
- *     Criticality", *Phys. Rev. A* 38.  The angle-of-repose physics
- *     emerges from the same diagonal-fall rule we use.
- *   • Niksic, P. — "Powder Toy" (2008+).  Modern interactive falling-
- *     sand sandbox; the per-cell momentum accumulator we use is from
- *     this lineage of CA games.
+ *   Falling-sand cellular automaton (§6 sand tick)
+ *     [1] Toffoli & Margolus, "Cellular Automata Machines" (1987) §7 — the
+ *         sand-pile / falling-sand CA this is built on.
+ *     [2] "The Powder Toy" (2008+) — the interactive falling-sand sandbox
+ *         lineage the per-cell momentum accumulator comes from.
+ *   Granular physics — piles, repose, flow (§6 diagonal fall, §5 neck)
+ *     [3] Bak, Tang & Wiesenfeld, "Self-Organized Criticality," Phys. Rev. A 38
+ *         (1988) — the angle-of-repose behaviour the diagonal-fall rule yields.
+ *     [4] Jaeger, Nagel & Behringer, "Granular solids, liquids, and gases,"
+ *         Rev. Mod. Phys. 68 (1996) — the standard review of pile/flow physics.
+ *     [5] Beverloo, Leniger & van de Velde, "The flow of granular solids through
+ *         orifices," Chem. Eng. Sci. 15 (1961) — discharge through a narrow
+ *         opening: why the neck bottlenecks the flow (the hourglass timer).
+ *   ASCII / terminal rendering (§3 colour, §7 render)
+ *     [6] Bourke, "Character representation of grey scale images" (1997) — the
+ *         momentum → glyph-density ramp ('.' '+' '*' '#' '@').
+ *     [7] Padala, "NCURSES Programming HOWTO" (TLDP) — colour pairs and the
+ *         erase → draw → refresh frame model.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -244,9 +255,50 @@
 #include <string.h>
 #include <time.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
+ *
+ *   LAYER        SECTION   MUTATES
+ *   ────────────────────────────────────────────────────────────────────
+ *   PERFORMANCE  §2        nothing — clock primitives (fixed-timestep
+ *                            accumulator, frame cap and fps live in §9 main)
+ *   LOGIC        §4        nothing — pure RNG step (lcg_*) and hash3.  The
+ *                            lcg_* helpers advance a CALLER-OWNED state word,
+ *                            never global state; hash3 is a pure function.
+ *   SIMULATION   §5,§6,§7  the Scene aggregate: the cavity mask (Scene.hg) +
+ *                            the sand grids (Scene.sand: sand/mom/counters) +
+ *                            the control fields.  §5 builds the mask, §6
+ *                            advances/flips the sand, §7 orchestrates (rebuild /
+ *                            refill / cycle / tick).
+ *   RENDER       §3,§8     §3 sets up colour pairs; §8 draws (frame / walls /
+ *                            sand / HUD) and owns the terminal.  Reads Scene.hg /
+ *                            Scene.sand; never writes simulation state.
+ *
+ *   EFFECTS  : ABSENT — a grain's glyph (dense at rest, light while streaming)
+ *              is derived at render from its momentum (Scene.sand.mom); no
+ *              separate cosmetic state is stored.
+ *   DELAYS   : the only pause is Scene.paused (scene_tick early-returns); the
+ *              auto-flip "settle / stall" holds are idle_frames counters folded
+ *              into the sand sim, not a separate timer module.
+ *
+ * Note: §3 colour is RENDER but sits early because it defines the colour pairs
+ * that startup AND the theme-cycle event (scene_cycle_theme, §7) both invoke;
+ * LOGIC (§4) does no mutation/I/O so no render/effect can corrupt it.
+ *
+ * Per-tick combine order — main() (§9) is the only place that advances state:
+ *     1. PERFORMANCE  measure dt (capped); fixed-timestep accumulator   §9
+ *     2. SIMULATION   scene_tick(dt) per fixed step  [skipped if paused] §7
+ *                       → sand_tick, then the auto-flip check
+ *     3. PERFORMANCE  fps tally + sleep to the 60 fps cap                §9
+ *     4. RENDER       screen_draw() + present  (read-only)               §8
+ *
+ * RESET (NOT a tick): scene_rebuild / scene_refill rebuild the mask + sand —
+ * triggered at startup, by r / n / N / resize, never inside the per-tick step.
+ *
+ * User events (keys: flip / auto / refill / pattern / theme / pause / Hz;
+ * SIGWINCH resize) mutate the Scene/sand but are handled in app_handle_key and
+ * the resize block (§9), outside the tick.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 /* ===================================================================== */
 /* §1  config                                                             */
@@ -315,7 +367,10 @@ enum {
 #define AUTO_FLIP_SETTLE     30     /* settle frames after completion    */
 #define AUTO_FLIP_STALL     180     /* hard stall fallback (~3 sec)      */
 
-/* Pattern enum + per-pattern params. */
+/* Pattern — identity of each sand-art preset; indexes the patterns[] table.
+ * Each preset differs in BOTH fill (colours / layering) AND glass shape, so
+ * cycling n/N is visibly distinct, not a recolour.  Scene.current_pattern
+ * stores the active index. */
 typedef enum {
     PAT_NORMAL     = 0,
     PAT_RAINBOW    = 1,
@@ -324,22 +379,47 @@ typedef enum {
     N_PATTERNS     = 4,
 } Pattern;
 
+/* PatternParams — the recipe for one pattern, in two halves.
+ *
+ * FILL: layer_count = how many stratified colour bands fill the up-bulb (8 vs
+ * 16 → coarse vs fine strata); irregular jitters band thickness for a
+ * geological look; dual_fill seeds BOTH bulbs so sand flows perpetually.
+ * GLASS: height_frac / full_frac / neck_half reshape the cavity per pattern
+ * (tall-narrow vs short-wide vs fat-neck) — so each preset is its own
+ * silhouette.  Consumed by sand_fill_layers (fill) and hourglass_build (glass);
+ * one row per Pattern. */
 typedef struct {
     const char *name;
     int         layer_count;       /* 1..LAYER_MAX                       */
     bool        irregular;         /* layer thicknesses random?           */
     bool        dual_fill;         /* both bulbs filled at start?         */
+    /* Per-pattern glass geometry — gives each pattern a distinct silhouette
+     * so cycling n/N is obviously different, not just a recolour. */
+    float       height_frac;       /* glass height as frac of rows_eff    */
+    float       full_frac;         /* bulb half-width as frac of cols      */
+    float       neck_half;         /* neck half-width in cells             */
 } PatternParams;
 
 static const PatternParams patterns[N_PATTERNS] = {
-    /* name           layers  irregular  dual */
-    { "NORMAL    ",    8,      false,    false },
-    { "RAINBOW   ",   16,      false,    false },
-    { "GEOLOGICAL",    8,      true,     false },
-    { "DUAL_FLOW ",    8,      false,    true  },
+    /* name           layers irreg  dual    height          full          neck */
+    /* classic slim, tall glass */
+    { "NORMAL    ",    8,    false, false, HG_HEIGHT_FRAC, HG_FULL_FRAC, HG_NECK_HALF },
+    /* short & wide — shows off all 16 colour bands */
+    { "RAINBOW   ",   16,    false, false, 0.70f,          0.24f,        1.0f         },
+    /* tall, narrow tower — deep geological strata */
+    { "GEOLOGICAL",    8,    true,  false, 0.94f,          0.12f,        1.0f         },
+    /* medium with a fat neck — both bulbs drain fast */
+    { "DUAL_FLOW ",    8,    false, true,  0.80f,          0.20f,        2.0f         },
 };
 
-/* Theme. */
+/* Theme — a colour palette for the scene.
+ *
+ * WHY a colour PER layer: the stratified fill only reads as distinct geological
+ * bands if adjacent layers contrast — so a theme is up to 16 hand-picked sand
+ * colours (indexed by layer-1) plus the frame and glass-wall accents.  `inverted`
+ * flips to a white-paper background (the NEGATIVE theme), drawn via a separate
+ * PAIR_PAPER fill.  All entries sit in the bright half of the 256 cube so they
+ * read on the default background. */
 typedef struct {
     const char *name;
     short       sand[16];         /* up to LAYER_MAX colours              */
@@ -402,7 +482,7 @@ static const char SAND_FAST[]      = ".,";
 #define FRAME_CORNER       '+'
 
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  performance — monotonic clock + sleep (frame cap in §9 main)        */
 /* ===================================================================== */
 
 static int64_t clock_ns(void)
@@ -423,7 +503,7 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  color — RENDER setup: palette pairs (startup + theme-cycle invoke it)  */
 /* ===================================================================== */
 
 static void theme_apply(int idx)
@@ -474,7 +554,7 @@ static void color_init(void)
 }
 
 /* ===================================================================== */
-/* §4  utilities                                                          */
+/* §4  logic — pure RNG step + hash (no mutation of global state, no I/O)    */
 /* ===================================================================== */
 
 static uint32_t g_rng = 0x12345678u;
@@ -508,9 +588,22 @@ static inline uint32_t hash3(int a, int b, int c)
 }
 
 /* ===================================================================== */
-/* §5  hourglass — curved bulb mask + frame decoration                    */
+/* §5  simulation — hourglass cavity mask (built on reset; read by §6/§8)   */
 /* ===================================================================== */
 
+/* Hourglass — the static glass geometry: a cavity mask plus the bulb / neck /
+ * frame coordinates derived from it.
+ *
+ * WHY a mask separate from the sand: the glass never changes during a run, only
+ * the grains move — so the cavity is built ONCE (hourglass_build, a reset op)
+ * and the CA just tests it each tick.  Each bulb wall follows a QUARTER-ELLIPSE
+ * profile, half_w(p) = NECK_HALF + (FULL_HALF−NECK_HALF)·√(1−(1−p)²), for the
+ * iconic rounded silhouette; the narrow neck is what bottlenecks the flow and
+ * makes the timer (granular discharge through an orifice, ref [5]).
+ *
+ * VALUE LOGIC: hg_top..hg_bot bound the glass rows; hg_neck_top..hg_neck_bot the
+ * constant-width waist; hg_cx the centre column; hg_full_half / hg_neck_half the
+ * bulb / neck half-widths; frame_* the wooden-frame decoration coords. */
 typedef struct {
     /* cavity[r][c] = 1 if inside the hourglass cavity (sand-able);
      *               0 if outside (impassable / wall / outside-frame).
@@ -534,8 +627,6 @@ typedef struct {
     int frame_right_col;
 } Hourglass;
 
-static Hourglass g_hg;
-
 /*
  * hourglass_build — generate the cavity mask.
  *
@@ -552,22 +643,42 @@ static Hourglass g_hg;
  * which is just a quarter-ellipse with semi-axes
  * `(FULL_HALF − NECK_HALF, bulb_height)`.
  */
-static void hourglass_build(Hourglass *hg, int cols, int rows_eff)
+/* bulb_half_width — the QUARTER-ELLIPSE wall profile: half-width of a bulb at
+ * `d` rows from the neck (d=0) out to the cap (d = bulb_h-1).
+ *   half_w(p) = neck + (full−neck)·√(1−(1−p)²),  p = d/(bulb_h−1). */
+static int bulb_half_width(int d, int bulb_h, int neck_half, int full_half)
 {
-    /* Clear mask. */
-    for (int r = 0; r < rows_eff && r < SCREEN_MAX_H; r++)
-        for (int c = 0; c < cols && c < SCREEN_MAX_W; c++)
-            hg->cavity[r][c] = 0;
+    float p = (bulb_h > 1) ? (float)d / (float)(bulb_h - 1) : 0.0f;
+    float q = 1.0f - p;
+    float hw_f = (float)neck_half + (float)(full_half - neck_half) * sqrtf(1.0f - q * q);
+    int hw = (int)(hw_f + 0.5f);
+    if (hw < neck_half) hw = neck_half;
+    return hw;
+}
 
-    /* Hourglass dimensions. */
-    int hg_height = (int)((float)rows_eff * HG_HEIGHT_FRAC);
+/* carve_row — open a horizontal span of cavity (centre cx, half-width hw). */
+static void carve_row(Hourglass *hg, int r, int cx, int hw, int cols)
+{
+    for (int dx = -hw; dx <= hw; dx++) {
+        int c = cx + dx;
+        if (c < 0 || c >= cols) continue;
+        hg->cavity[r][c] = 1;
+    }
+}
+
+/* compute_glass_dims — derive every bounding row/col of the glass + frame from
+ * the window size and the pattern's geometry fracs (clamped to stay on-screen). */
+static void compute_glass_dims(Hourglass *hg, int cols, int rows_eff,
+                               const PatternParams *pp)
+{
+    int hg_height = (int)((float)rows_eff * pp->height_frac);
     if (hg_height < 12) hg_height = (rows_eff > 12) ? 12 : rows_eff - 4;
     if (hg_height < 8)  hg_height = 8;
-    int half_w = (int)((float)cols * HG_FULL_FRAC);
+    int half_w = (int)((float)cols * pp->full_frac);
     if (half_w < 6)  half_w = 6;
     if (half_w > cols / 2 - 3) half_w = cols / 2 - 3;
     if (half_w < 3)  half_w = 3;
-    int neck_half = (int)HG_NECK_HALF;
+    int neck_half = (int)pp->neck_half;
 
     int top    = (rows_eff - hg_height) / 2;
     int bot    = top + hg_height - 1;
@@ -598,63 +709,55 @@ static void hourglass_build(Hourglass *hg, int cols, int rows_eff)
     if (hg->frame_bot_row >= rows_eff)      hg->frame_bot_row = rows_eff - 1;
     if (hg->frame_left_col < 0)             hg->frame_left_col = 0;
     if (hg->frame_right_col >= cols)        hg->frame_right_col = cols - 1;
+}
 
-    /* Carve top bulb (rows top..neck_top-1) — quarter-ellipse profile. */
-    int top_h = neck_top - top;
-    if (top_h < 1) top_h = 1;
-    for (int r = top; r < neck_top; r++) {
-        /* p = 0 at the neck (r = neck_top - 1), p = 1 at the bulb top
-         * (r = top).  So p = (neck_top - 1 - r) / (top_h - 1). */
-        float p = (top_h > 1) ? (float)(neck_top - 1 - r) / (float)(top_h - 1)
-                              : 0.0f;
-        float q = 1.0f - p;
-        float hw_f = (float)neck_half
-                   + (float)(half_w - neck_half) * sqrtf(1.0f - q * q);
-        int hw = (int)(hw_f + 0.5f);
-        if (hw < neck_half) hw = neck_half;
-        for (int dx = -hw; dx <= hw; dx++) {
-            int c = cx + dx;
-            if (c < 0 || c >= cols) continue;
-            hg->cavity[r][c] = 1;
-        }
-    }
+static void hourglass_build(Hourglass *hg, int cols, int rows_eff,
+                            const PatternParams *pp)
+{
+    /* Clear mask. */
+    for (int r = 0; r < rows_eff && r < SCREEN_MAX_H; r++)
+        for (int c = 0; c < cols && c < SCREEN_MAX_W; c++)
+            hg->cavity[r][c] = 0;
 
-    /* Carve neck rows (constant width). */
-    for (int r = neck_top; r <= neck_bot; r++) {
-        for (int dx = -neck_half; dx <= neck_half; dx++) {
-            int c = cx + dx;
-            if (c < 0 || c >= cols) continue;
-            hg->cavity[r][c] = 1;
-        }
-    }
+    compute_glass_dims(hg, cols, rows_eff, pp);
 
-    /* Carve bottom bulb (rows neck_bot+1..bot) — mirror profile. */
-    int bot_h = bot - neck_bot;
-    if (bot_h < 1) bot_h = 1;
-    for (int r = neck_bot + 1; r <= bot; r++) {
-        float p = (bot_h > 1) ? (float)(r - neck_bot - 1) / (float)(bot_h - 1)
-                              : 0.0f;
-        float q = 1.0f - p;
-        float hw_f = (float)neck_half
-                   + (float)(half_w - neck_half) * sqrtf(1.0f - q * q);
-        int hw = (int)(hw_f + 0.5f);
-        if (hw < neck_half) hw = neck_half;
-        for (int dx = -hw; dx <= hw; dx++) {
-            int c = cx + dx;
-            if (c < 0 || c >= cols) continue;
-            hg->cavity[r][c] = 1;
-        }
-    }
+    int top = hg->hg_top, bot = hg->hg_bot;
+    int neck_top = hg->hg_neck_top, neck_bot = hg->hg_neck_bot;
+    int cx = hg->hg_cx, half_w = hg->hg_full_half, neck_half = hg->hg_neck_half;
+
+    /* Carve top bulb (neck at the bottom end), the constant-width neck, then the
+     * mirrored bottom bulb — each row a quarter-ellipse half-width. */
+    int top_h = neck_top - top;     if (top_h < 1) top_h = 1;
+    int bot_h = bot - neck_bot;     if (bot_h < 1) bot_h = 1;
+
+    for (int r = top; r < neck_top; r++)
+        carve_row(hg, r, cx, bulb_half_width(neck_top - 1 - r, top_h, neck_half, half_w), cols);
+
+    for (int r = neck_top; r <= neck_bot; r++)
+        carve_row(hg, r, cx, neck_half, cols);
+
+    for (int r = neck_bot + 1; r <= bot; r++)
+        carve_row(hg, r, cx, bulb_half_width(r - neck_bot - 1, bot_h, neck_half, half_w), cols);
 }
 
 /* ===================================================================== */
-/* §6  sand — grid + CA tick + flip + transfer counter                    */
+/* §6  simulation — sand grid + CA tick + flip + transfer counter           */
 /* ===================================================================== */
 
-/*
- * sand[row][col] = 0 (empty) or 1..LAYER_MAX (colour layer index).
- * mom[row][col]  = 0..MOMENTUM_MAX (vertical speed accumulator).
- */
+/* Sand — the grains plus the simulation's running state (falling-sand cellular
+ * automaton, ref [1]; the per-cell momentum accumulator is from the Powder-Toy
+ * lineage, ref [2]).
+ *
+ * WHY two parallel grids: `sand` is WHAT colour sits in a cell, `mom` is HOW
+ * FAST it is falling.  A pure 1-cell-per-tick CA can't show the neck stream
+ * accelerating; accumulating momentum lets free-falling grains advance several
+ * cells per tick, so the waist visibly speeds up (granular discharge, ref [5]).
+ * The diagonal-fall rule yields the angle of repose for free (refs [3], [4]).
+ *
+ * VALUE LOGIC: sand[r][c] = 0 empty / 1..LAYER_MAX colour; mom[r][c] =
+ * 0..MOMENTUM_MAX; gravity_dir = +1 down / −1 up; transferred / total_grains
+ * drive the Time% HUD; flip_count counts user flips; frame is the hash tick;
+ * moves_this_tick + idle_frames detect settling that triggers auto-flip. */
 typedef struct {
     uint8_t sand[SCREEN_MAX_H][SCREEN_MAX_W];
     uint8_t mom [SCREEN_MAX_H][SCREEN_MAX_W];
@@ -671,8 +774,6 @@ typedef struct {
     int     idle_frames;       /* consecutive frames with zero moves     */
 } Sand;
 
-static Sand g_sand;
-
 static void sand_clear(Sand *s)
 {
     memset(s->sand, 0, sizeof s->sand);
@@ -682,6 +783,25 @@ static void sand_clear(Sand *s)
     s->total_grains = 0;
     s->flip_count   = 0;
     s->frame        = 0;
+}
+
+/* fill_layer_band — fill the cavity cells of rows [row_a,row_b] with `color`,
+ * skipping already-filled cells; returns how many grains were placed. */
+static int fill_layer_band(Sand *s, const Hourglass *hg, int row_a, int row_b,
+                           uint8_t color, int cols, int rows_eff)
+{
+    int n = 0;
+    for (int r = row_a; r <= row_b; r++) {
+        if (r < 0 || r >= rows_eff) continue;
+        for (int c = 0; c < cols; c++) {
+            if (!hg->cavity[r][c]) continue;
+            if (s->sand[r][c] != 0) continue;     /* don't overwrite */
+            s->sand[r][c] = color;
+            s->mom [r][c] = 0;
+            n++;
+        }
+    }
+    return n;
 }
 
 /*
@@ -751,16 +871,9 @@ static void sand_fill_layers(Sand *s, const Hourglass *hg,
         }
         if (row_a > row_b) { int t = row_a; row_a = row_b; row_b = t; }
 
-        for (int r = row_a; r <= row_b; r++) {
-            if (r < 0 || r >= rows_eff) continue;
-            for (int c = 0; c < cols; c++) {
-                if (!hg->cavity[r][c]) continue;
-                if (s->sand[r][c] != 0) continue;     /* don't overwrite */
-                s->sand[r][c] = (uint8_t)(L + 1);     /* 1-based         */
-                s->mom [r][c] = 0;
-                filled_count++;
-            }
-        }
+        /* layer L → colour L+1 (1-based) */
+        filled_count += fill_layer_band(s, hg, row_a, row_b,
+                                        (uint8_t)(L + 1), cols, rows_eff);
     }
 
     /* DUAL_FLOW: also fill the OTHER bulb to half its height, with
@@ -790,17 +903,9 @@ static void sand_fill_layers(Sand *s, const Hourglass *hg,
                     row_b = dn_bot - (int)(t0 * (float)dn_fill);
                 }
                 if (row_a > row_b) { int t = row_a; row_a = row_b; row_b = t; }
-                for (int r = row_a; r <= row_b; r++) {
-                    if (r < 0 || r >= rows_eff) continue;
-                    for (int c = 0; c < cols; c++) {
-                        if (!hg->cavity[r][c]) continue;
-                        if (s->sand[r][c] != 0) continue;
-                        /* Reverse layer order in the secondary bulb. */
-                        s->sand[r][c] = (uint8_t)(layers - L);
-                        s->mom [r][c] = 0;
-                        filled_count++;
-                    }
-                }
+                /* Reverse layer order in the secondary bulb. */
+                filled_count += fill_layer_band(s, hg, row_a, row_b,
+                                                (uint8_t)(layers - L), cols, rows_eff);
             }
         }
     }
@@ -810,16 +915,121 @@ static void sand_fill_layers(Sand *s, const Hourglass *hg,
     s->frame        = 0;
 }
 
+/* count_neck_crossing — a grain that moved from from_r to to_r crossed the neck
+ * midline this step; bump the transfer counter that drives the Time% HUD. */
+static void count_neck_crossing(Sand *s, int from_r, int to_r, int dir,
+                                int neck_mid)
+{
+    bool crossed = (dir > 0) ? (from_r <= neck_mid && to_r > neck_mid)
+                             : (from_r >= neck_mid && to_r < neck_mid);
+    if (crossed) s->transferred++;
+}
+
+/* grain_bonus_drops — a fast grain (momentum ≥ 2) advances 1–2 EXTRA cells this
+ * tick, so a free-falling stream accelerates instead of creeping one cell/tick
+ * (the streaming neck, ref [5]).  Starts from `from_r`; stops at the first wall
+ * or occupied cell. */
+static void grain_bonus_drops(Sand *s, const Hourglass *hg, int from_r, int c,
+                              uint8_t mom, int dir, int neck_mid, int rows_eff)
+{
+    if (mom < 2) return;
+    int extra = (mom >= 3) ? 2 : 1;
+    int rr = from_r;
+    for (int k = 0; k < extra; k++) {
+        int nr = rr + dir;
+        if (nr < 0 || nr >= rows_eff)  break;
+        if (!hg->cavity[nr][c])         break;
+        if (s->sand[nr][c] != 0)        break;
+        s->sand[nr][c] = s->sand[rr][c];
+        s->sand[rr][c] = 0;
+        s->mom [nr][c] = s->mom[rr][c];
+        s->mom [rr][c] = 0;
+        s->moves_this_tick++;
+        count_neck_crossing(s, rr, nr, dir, neck_mid);
+        rr = nr;
+    }
+}
+
+/* grain_fall_straight — try to fall one cell straight ahead; on success the
+ * grain gains momentum and a fast grain also takes its bonus drops.  Returns
+ * true iff the grain moved. */
+static bool grain_fall_straight(Sand *s, const Hourglass *hg, int r, int c,
+                                int dir, int neck_mid, int rows_eff)
+{
+    int dest_r = r + dir;
+    if (!hg->cavity[dest_r][c] || s->sand[dest_r][c] != 0) return false;
+
+    uint8_t mom_now = s->mom[r][c];
+    s->sand[dest_r][c] = s->sand[r][c];
+    s->sand[r][c]      = 0;
+    uint8_t new_mom = (mom_now < MOMENTUM_MAX) ? mom_now + 1 : MOMENTUM_MAX;
+    s->mom[dest_r][c] = new_mom;
+    s->mom[r][c]      = 0;
+    s->moves_this_tick++;
+    count_neck_crossing(s, r, dest_r, dir, neck_mid);
+
+    grain_bonus_drops(s, hg, dest_r, c, new_mom, dir, neck_mid, rows_eff);
+    return true;
+}
+
+/* grain_slide_diagonal — try to slide one cell diagonally with gravity, in a
+ * per-cell-random L/R order (hash3) so piles settle at the angle of repose
+ * (refs [3],[4]).  Diagonals reset momentum.  Returns true iff the grain moved. */
+static bool grain_slide_diagonal(Sand *s, const Hourglass *hg, int r, int c,
+                                 int dir, int neck_mid, int cols)
+{
+    int dest_r = r + dir;
+    int prefer_left = (hash3(r, c, s->frame) & 1u) ? 1 : 0;
+    int dx_a = prefer_left ? -1 : +1;
+    int dx_b = prefer_left ? +1 : -1;
+
+    for (int try = 0; try < 2; try++) {
+        int dx = (try == 0) ? dx_a : dx_b;
+        int nc = c + dx;
+        if (nc < 0 || nc >= cols)                continue;
+        if (!hg->cavity[dest_r][nc])             continue;
+        if (s->sand[dest_r][nc] != 0)            continue;
+        /* Require the same-row neighbour non-blocking (the grain can "see" the
+         * diagonal cell); else sand would tunnel through walls. */
+        if (!hg->cavity[r][nc] && s->sand[r][nc] != 0) continue;
+
+        s->sand[dest_r][nc] = s->sand[r][c];
+        s->sand[r][c]       = 0;
+        s->mom[dest_r][nc]  = 0;     /* diagonals reset speed   */
+        s->mom[r][c]        = 0;
+        s->moves_this_tick++;
+        count_neck_crossing(s, r, dest_r, dir, neck_mid);
+        return true;
+    }
+    return false;
+}
+
 /*
- * sand_tick — one CA step.  Scan order depends on gravity direction:
- *
- *   gravity_dir = +1 (down): scan rows BOTTOM → TOP
- *   gravity_dir = -1 (up):   scan rows TOP → BOTTOM
- *
- * For each filled cell, try to move WITH gravity (1 cell, plus
- * momentum-bonus cells if accumulated).  If blocked, try diagonals
- * (random L/R order via hash3).  If still blocked, settle (momentum
- * = 0).
+ * sand_move_grain — advance ONE grain at (r,c) one CA step with gravity `dir`,
+ * trying each move in order until one succeeds:
+ *     fall straight (+ momentum bonus) → slide diagonally → settle in place.
+ */
+static void sand_move_grain(Sand *s, const Hourglass *hg, int r, int c,
+                            int dir, int neck_mid, int cols, int rows_eff)
+{
+    if (s->sand[r][c] == 0) return;            /* empty cell */
+
+    int dest_r = r + dir;
+    if (dest_r < 0 || dest_r >= rows_eff) {    /* would fall off the end */
+        s->mom[r][c] = 0;
+        return;
+    }
+
+    if (grain_fall_straight(s, hg, r, c, dir, neck_mid, rows_eff)) return;
+    if (grain_slide_diagonal(s, hg, r, c, dir, neck_mid, cols))    return;
+
+    s->mom[r][c] = 0;                           /* blocked → settle */
+}
+
+/*
+ * sand_tick — one CA step.  Scan rows AGAINST gravity (bottom → top when
+ * falling down) so a grain isn't moved twice in a tick, advance each grain,
+ * then update the settling counter that drives auto-flip.
  */
 static void sand_tick(Sand *s, const Hourglass *hg, int cols, int rows_eff)
 {
@@ -827,113 +1037,21 @@ static void sand_tick(Sand *s, const Hourglass *hg, int cols, int rows_eff)
     int neck_mid_row = (hg->hg_neck_top + hg->hg_neck_bot) / 2;
 
     int r_start, r_end, r_step;
-    if (dir > 0) {
-        /* scan bottom up */
-        r_start = rows_eff - 1; r_end = -1; r_step = -1;
-    } else {
-        r_start = 0; r_end = rows_eff; r_step = +1;
-    }
+    if (dir > 0) { r_start = rows_eff - 1; r_end = -1;       r_step = -1; }
+    else         { r_start = 0;            r_end = rows_eff; r_step = +1; }
 
     s->frame++;
     s->moves_this_tick = 0;
 
     for (int r = r_start; r != r_end; r += r_step) {
         if (r < 0 || r >= SCREEN_MAX_H) continue;
-        for (int c = 0; c < cols && c < SCREEN_MAX_W; c++) {
-            uint8_t cell = s->sand[r][c];
-            if (cell == 0) continue;
-
-            int dest_r = r + dir;
-            if (dest_r < 0 || dest_r >= rows_eff) {
-                s->mom[r][c] = 0;       /* would fall off — clamp */
-                continue;
-            }
-
-            uint8_t mom_now = s->mom[r][c];
-
-            /* 1. Try straight movement. */
-            if (hg->cavity[dest_r][c] && s->sand[dest_r][c] == 0) {
-                s->sand[dest_r][c] = cell;
-                s->sand[r][c]      = 0;
-                uint8_t new_mom = (mom_now < MOMENTUM_MAX) ? mom_now + 1
-                                                            : MOMENTUM_MAX;
-                s->mom[dest_r][c] = new_mom;
-                s->mom[r][c]      = 0;
-                s->moves_this_tick++;
-
-                /* Track neck crossings for time-progress HUD. */
-                if (dir > 0 && r <= neck_mid_row && dest_r > neck_mid_row)
-                    s->transferred++;
-                else if (dir < 0 && r >= neck_mid_row && dest_r < neck_mid_row)
-                    s->transferred++;
-
-                /* Momentum bonus: high-mom cells fall multiple cells. */
-                if (new_mom >= 2) {
-                    int extra = (new_mom >= 3) ? 2 : 1;
-                    int rr = dest_r;
-                    for (int k = 0; k < extra; k++) {
-                        int nr = rr + dir;
-                        if (nr < 0 || nr >= rows_eff)         break;
-                        if (!hg->cavity[nr][c])                break;
-                        if (s->sand[nr][c] != 0)               break;
-                        s->sand[nr][c] = s->sand[rr][c];
-                        s->sand[rr][c] = 0;
-                        s->mom [nr][c] = s->mom[rr][c];
-                        s->mom [rr][c] = 0;
-                        s->moves_this_tick++;
-                        if (dir > 0 && rr <= neck_mid_row && nr > neck_mid_row)
-                            s->transferred++;
-                        else if (dir < 0 && rr >= neck_mid_row && nr < neck_mid_row)
-                            s->transferred++;
-                        rr = nr;
-                    }
-                }
-                continue;
-            }
-
-            /* 2. Try diagonals.  Random order per cell via hash. */
-            int prefer_left = (hash3(r, c, s->frame) & 1u) ? 1 : 0;
-            int dx_a = prefer_left ? -1 : +1;
-            int dx_b = prefer_left ? +1 : -1;
-
-            int moved = 0;
-            for (int try = 0; try < 2 && !moved; try++) {
-                int dx = (try == 0) ? dx_a : dx_b;
-                int nc = c + dx;
-                if (nc < 0 || nc >= cols)                continue;
-                if (!hg->cavity[dest_r][nc])             continue;
-                if (s->sand[dest_r][nc] != 0)            continue;
-                /* Also require the same-row neighbour to be
-                 * non-blocking (i.e. the grain can "see" the diagonal
-                 * cell); otherwise sand would tunnel through walls. */
-                if (!hg->cavity[r][nc] && s->sand[r][nc] != 0) continue;
-
-                s->sand[dest_r][nc] = cell;
-                s->sand[r][c]       = 0;
-                s->mom[dest_r][nc]  = 0;     /* diagonals reset speed   */
-                s->mom[r][c]        = 0;
-                s->moves_this_tick++;
-                /* Track neck crossings on diagonals too. */
-                if (dir > 0 && r <= neck_mid_row && dest_r > neck_mid_row)
-                    s->transferred++;
-                else if (dir < 0 && r >= neck_mid_row && dest_r < neck_mid_row)
-                    s->transferred++;
-                moved = 1;
-            }
-
-            if (!moved) {
-                /* Settled: momentum decays. */
-                s->mom[r][c] = 0;
-            }
-        }
+        for (int c = 0; c < cols && c < SCREEN_MAX_W; c++)
+            sand_move_grain(s, hg, r, c, dir, neck_mid_row, cols, rows_eff);
     }
 
-    /* End-of-tick: update idle-frames counter for auto-flip detection. */
-    if (s->moves_this_tick == 0) {
-        s->idle_frames++;
-    } else {
-        s->idle_frames = 0;
-    }
+    /* End-of-tick: zero moves → settling toward auto-flip. */
+    if (s->moves_this_tick == 0) s->idle_frames++;
+    else                         s->idle_frames = 0;
 }
 
 static void sand_flip(Sand *s)
@@ -947,25 +1065,36 @@ static void sand_flip(Sand *s)
 }
 
 /* ===================================================================== */
-/* §7  scene — compose render passes                                      */
+/* §7  simulation — scene control: rebuild / refill / cycle / per-tick      */
 /* ===================================================================== */
 
+/* Scene — the whole hourglass in one aggregate, a table of contents:
+ *   WHAT  : hg (the cavity mask) + sand (the grains, momentum and counters).
+ *   HOW   : current_pattern / current_theme / auto_flip — the user knobs.
+ *   WHERE : cols/rows (terminal), seed (the run's RNG), paused (run-state).
+ * Functions still take the narrowest sub-type (Sand* / const Hourglass*); only
+ * the scene_* orchestrators take Scene*. */
 typedef struct {
-    bool       paused;
-    int        cols, rows;
-    uint32_t   seed;
+    /* WHAT — the simulated objects. */
+    Hourglass  hg;
+    Sand       sand;
+    /* HOW — simulation knobs (keys n/N, t/T, a). */
     int        current_pattern;
     int        current_theme;
     bool       auto_flip;          /* auto-flip when fully drained?      */
+    /* WHERE / when. */
+    int        cols, rows;
+    uint32_t   seed;
+    bool       paused;
 } Scene;
 
 static void scene_rebuild(Scene *s)
 {
     int rows_eff = s->rows - 1;
     if (rows_eff < 8) rows_eff = 8;
-    hourglass_build(&g_hg, s->cols, rows_eff);
-    sand_clear(&g_sand);
-    sand_fill_layers(&g_sand, &g_hg, s->cols, rows_eff,
+    hourglass_build(&s->hg, s->cols, rows_eff, &patterns[s->current_pattern]);
+    sand_clear(&s->sand);
+    sand_fill_layers(&s->sand, &s->hg, s->cols, rows_eff,
                      &patterns[s->current_pattern], s->seed);
 }
 
@@ -994,9 +1123,9 @@ static void scene_refill(Scene *s)
     s->seed = (uint32_t)clock_ns() ^ 0xA5A5A5A5u;
     g_rng   = s->seed ^ 0xBEEFu;
     /* Keep current gravity direction; just refill the up-bulb. */
-    sand_clear(&g_sand);
+    sand_clear(&s->sand);
     int rows_eff = s->rows - 1;
-    sand_fill_layers(&g_sand, &g_hg, s->cols, rows_eff,
+    sand_fill_layers(&s->sand, &s->hg, s->cols, rows_eff,
                      &patterns[s->current_pattern], s->seed);
 }
 
@@ -1020,7 +1149,7 @@ static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
     int rows_eff = s->rows - 1;
-    sand_tick(&g_sand, &g_hg, s->cols, rows_eff);
+    sand_tick(&s->sand, &s->hg, s->cols, rows_eff);
 
     /*
      * Auto-flip — two trigger conditions:
@@ -1035,18 +1164,22 @@ static void scene_tick(Scene *s, float dt)
      *       neck and would never drain on their own.  Flip anyway —
      *       the avalanche unsticks them.
      */
-    if (s->auto_flip && g_sand.total_grains > 0) {
-        bool fully_drained = (g_sand.transferred >= g_sand.total_grains);
+    if (s->auto_flip && s->sand.total_grains > 0) {
+        bool fully_drained = (s->sand.transferred >= s->sand.total_grains);
         bool short_settled = fully_drained
-                          && g_sand.idle_frames >= AUTO_FLIP_SETTLE;
-        bool long_stalled  = (g_sand.idle_frames >= AUTO_FLIP_STALL)
-                          && (g_sand.transferred > 0);
+                          && s->sand.idle_frames >= AUTO_FLIP_SETTLE;
+        bool long_stalled  = (s->sand.idle_frames >= AUTO_FLIP_STALL)
+                          && (s->sand.transferred > 0);
         if (short_settled || long_stalled) {
-            sand_flip(&g_sand);
+            sand_flip(&s->sand);
         }
     }
     (void)dt;
 }
+
+/* ===================================================================== */
+/* §8  render — draw passes (frame / walls / sand / HUD); reads only        */
+/* ===================================================================== */
 
 /*
  * draw_frame — wooden frame around the hourglass.  Top + bottom caps
@@ -1055,7 +1188,7 @@ static void scene_tick(Scene *s, float dt)
 static void draw_frame(const Scene *s, bool inverted)
 {
     (void)inverted;
-    const Hourglass *hg = &g_hg;
+    const Hourglass *hg = &s->hg;
     attron(COLOR_PAIR(PAIR_FRAME) | A_BOLD);
 
     int top_row = hg->frame_top_row;
@@ -1100,7 +1233,7 @@ static void draw_frame(const Scene *s, bool inverted)
 static void draw_walls(const Scene *s, bool inverted)
 {
     (void)inverted;
-    const Hourglass *hg = &g_hg;
+    const Hourglass *hg = &s->hg;
     int rows_eff = s->rows - 1;
     int cols     = s->cols;
 
@@ -1167,9 +1300,9 @@ static void draw_sand(const Scene *s, bool inverted)
 
     for (int r = 0; r < rows_eff && r < SCREEN_MAX_H; r++) {
         for (int c = 0; c < cols && c < SCREEN_MAX_W; c++) {
-            uint8_t layer = g_sand.sand[r][c];
+            uint8_t layer = s->sand.sand[r][c];
             if (layer == 0) continue;
-            uint8_t mom = g_sand.mom[r][c];
+            uint8_t mom = s->sand.mom[r][c];
 
             char g;
             if (mom == 0)
@@ -1221,9 +1354,11 @@ static void scene_render(const Scene *s)
 }
 
 /* ===================================================================== */
-/* §8  screen + app                                                       */
+/* §8  render (cont'd) — screen surface + HUD                              */
 /* ===================================================================== */
 
+/* Screen — the ncurses display surface: cached terminal size in cells, re-read
+ * at init and on every SIGWINCH so the layout tracks window resizes. */
 typedef struct { int cols, rows; } Screen;
 
 static void screen_init(Screen *sc)
@@ -1246,40 +1381,56 @@ static void screen_resize_curses(Screen *sc)
     getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-static void screen_draw(Screen *sc, const Scene *s,
+static void screen_draw(const Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
     erase();
     scene_render(s);
 
-    int total = g_sand.total_grains;
+    int total = s->sand.total_grains;
     if (total < 1) total = 1;
-    int pct = 100 * g_sand.transferred / total;
+    int pct = 100 * s->sand.transferred / total;
     if (pct > 100) pct = 100;
 
-    char buf[220];
+    /* ── top row: data readout (yellow), clipped so it never wraps ── */
+    char buf[200];
     snprintf(buf, sizeof buf,
              " SANDS OF TIME   %s   pat:%s   theme:%s   "
-             "Time:%3d%%   Flips:%2d   grav:%s   auto:%s   "
-             "%5.1f fps  %3d Hz   "
-             "spc:flip  a:auto  r:refill  n/N:pat  t/T:theme  p:pause  q:quit ",
+             "Time:%3d%%   Flips:%2d   grav:%s   auto:%s   %5.1f fps  %3d Hz ",
              s->paused ? "PAUSED " : "FLOWING",
              patterns[s->current_pattern].name,
              themes[s->current_theme].name,
-             pct, g_sand.flip_count,
-             g_sand.gravity_dir > 0 ? "DOWN" : "UP  ",
+             pct, s->sand.flip_count,
+             s->sand.gravity_dir > 0 ? "DOWN" : "UP  ",
              s->auto_flip ? "ON " : "OFF",
              fps, sim_fps);
-
-    int row = sc->rows - 1;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
-    mvprintw(row, 0, "%s", buf);
+    for (int x = 0; x < sc->cols; x++) mvaddch(0, x, ' ');
+    mvprintw(0, 0, "%.*s", sc->cols, buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    /* ── bottom row: action keys (cyan), clipped ── */
+    int row = sc->rows - 1;
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
+    mvprintw(row, 0, "%.*s", sc->cols,
+             " spc:flip  a:auto  r:refill  n/N:pat  t/T:theme  p:pause  [/]:Hz  q:quit ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
+/* ===================================================================== */
+/* §9  app — combine point (per-tick order) + user events + frame cap       */
+/* ===================================================================== */
+
+/* App — process-level glue: the scene, its display, the sim-rate knob, and the
+ * two signal flags.
+ *
+ * WHY global (g_app): POSIX signal handlers take no user-data argument, so the
+ * SIGINT/SIGTERM/SIGWINCH handler reaches running / need_resize through a
+ * file-scope object; volatile sig_atomic_t is the one type the C standard
+ * guarantees is safe to write in a handler and read in the loop. */
 typedef struct {
     Scene                 scene;
     Screen                screen;
@@ -1309,7 +1460,7 @@ static bool app_handle_key(App *app, int ch)
     case 'p': case 'P': s->paused = !s->paused;                       break;
     case 'r': case 'R': scene_refill(s);                              break;
     case ' ': case 'f': case 'F':
-        sand_flip(&g_sand);
+        sand_flip(&s->sand);
         break;
     case 'a': case 'A':
         s->auto_flip = !s->auto_flip;

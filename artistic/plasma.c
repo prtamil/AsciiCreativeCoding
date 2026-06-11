@@ -13,14 +13,17 @@
  * cycles/second — colours flow across the screen without physics.
  *
  * Four frequency presets ('f') give distinct wave structures.
- * Four colour themes ('p') select different palette mappings.
+ * Four colour themes ('t') select different palette mappings.
  *
  * Keys:
- *   q/ESC quit   space pause   p next palette   f next frequencies
+ *   q/ESC quit   space/p pause   t next theme   f next frequencies
  *   ] / [   sim Hz up / down
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra plasma.c -o plasma -lncurses -lm
+ *
+ * §1 config       §2 performance   §3 types
+ * §4 logic        §5 simulation     §6 render        §7 app
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -44,6 +47,22 @@
  *                  different phase of the same frequency → smooth hue cycle).
  *                  256-colour terminal required for smooth gradients; 8-colour
  *                  fallback uses colour pair cycling.
+ *
+ * References     :
+ *   Plasma effect & wave superposition (§4 plasma_value)
+ *     [1] Vandevenne, "Lode's Computer Graphics Tutorial — Plasma"
+ *         (lodev.org) — the canonical sum-of-sines plasma this file follows.
+ *     [2] Hecht, "Optics" — superposition / interference of travelling sine
+ *         waves, the physics the four added terms imitate.
+ *   Palette cycling animation (§6 colour pairs, phase rotate)
+ *     [3] Ferrari, "8-bit colour cycling" (Effect Games, 2010; technique from
+ *         1990s games) — animating by rotating the palette rather than the
+ *         pixels, which is exactly the CYCLE_HZ phase shift here.
+ *   ASCII rendering substrate (§6 PalEntry glyphs)
+ *     [4] Bourke, "Character representation of grey scale images" (1997) — the
+ *         value → glyph ramp ('.' ':' '+' '*' '#' '@').
+ *     [5] Padala, "NCURSES Programming HOWTO" (TLDP) — colour pairs and the
+ *         erase → draw → refresh frame model.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -120,6 +139,43 @@
 #include <time.h>
 #include <stdio.h>
 
+/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
+ *
+ * Three real layers; three are intentionally absent/trivial.
+ *
+ *   LAYER        SECTION  MUTATES
+ *   ────────────────────────────────────────────────────────────────────
+ *   PERFORMANCE  §2       nothing — clock primitives (the fixed-timestep
+ *                           accumulator, frame cap and fps live in §7 main)
+ *   LOGIC        §4       nothing — pure plasma_value(col,row,t,preset) → the
+ *                           cell's [0,1] field value.  No mutation, no I/O.
+ *   SIMULATION   §5       Plasma.time only — plasma_tick does `time += dt`.
+ *                           Plasma is otherwise stateless (analytic).
+ *   RENDER       §6       the terminal + colour pairs only; READS the Plasma
+ *                           (time/theme/preset), never writes it.
+ *
+ *   EFFECTS  : ABSENT — plasma is stateless; every cell's glyph/colour is
+ *              recomputed fresh from plasma_value each frame, nothing stored.
+ *   DELAYS   : the only pause is Plasma.paused (plasma_tick early-returns);
+ *              there are no timers or holds.
+ *   No coordinate layer: plasma works directly in terminal cell space (the
+ *              only correction is the ×2 on dy, inline in plasma_value).
+ *
+ * LOGIC (§4) is provably uncorruptable from RENDER: it does no mutation and no
+ * I/O, so deleting or reordering any draw cannot change plasma_value.
+ *
+ * Per-tick combine order — main() (§7) is the only place that advances state:
+ *     1. PERFORMANCE  measure dt (capped); fixed-timestep accumulator    §7
+ *     2. SIMULATION   scene_tick(dt) per fixed step  [skipped if paused]  §5
+ *     3. PERFORMANCE  fps tally + sleep to the 60 fps cap                §7
+ *     4. RENDER       screen_draw() + present  (read-only)               §6
+ *
+ * User events (keys: pause/theme/freq/Hz; SIGWINCH resize) mutate Plasma /
+ * sim_fps but are NOT part of the tick — handled after render, in the getch
+ * branch and the resize block (§7).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ===================================================================== */
 /* §1  config                                                             */
 /* ===================================================================== */
@@ -129,8 +185,8 @@ enum {
     SIM_FPS_DEFAULT = 30,   /* plasma recomputes every cell; 30 is plenty */
     SIM_FPS_MAX     = 60,
     SIM_FPS_STEP    = 10,
+    FRAME_CAP_FPS   = 60,   /* hard render frame cap, independent of sim Hz */
     FPS_UPDATE_MS   = 500,
-    N_COLORS        = 7,
     N_FREQ_PRESETS  = 4,
     N_THEMES        = 4,
     N_PAL           = 14,   /* palette entries per theme                  */
@@ -143,7 +199,7 @@ enum {
 #define CYCLE_HZ    0.20f   /* palette phase cycles per second            */
 
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  performance — timing primitives (frame cap / fixed step in §7)      */
 /* ===================================================================== */
 
 static int64_t clock_ns(void)
@@ -164,7 +220,163 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  types                                                              */
+/* ===================================================================== */
+
+/* PalEntry — one stop in a plasma colour palette: an ncurses colour pair, a
+ * brightness attribute, and the glyph to draw.
+ *
+ * WHY a baked table (not computed colour): mapping a value to a colour for every
+ * cell every frame must be cheap, so each theme is a precomputed array of N_PAL
+ * stops and the value just indexes it.  Rotating that index by a phase each frame
+ * is the classic palette-cycling animation (Ferrari, ref [3]) — the screen
+ * appears to flow though no pixel moves.  Glyph density rising along the ramp
+ * ('.' → '@') is the ASCII-luminance trick (Bourke, ref [4]).
+ *
+ * VALUE LOGIC: pair → a §6 color_init hue; attr ∈ {A_DIM, 0, A_BOLD} shades that
+ * hue darker → brighter; ch is the stop's glyph. */
+typedef struct {
+    int    pair;   /* ncurses colour-pair id (see §6 color_init)   */
+    chtype attr;   /* A_DIM / 0 / A_BOLD — brightness within a hue  */
+    char   ch;     /* glyph (density rises along the ramp)          */
+} PalEntry;
+
+/* FreqPreset — the parameters of the four superposed plasma waves (wave
+ * superposition, Hecht ref [2]; the plasma technique, ref [1]): a spatial
+ * frequency and a time speed for the horizontal, vertical, diagonal and radial
+ * terms of plasma_value.
+ *
+ * WHY presets: the same four-sine formula yields wildly different patterns from
+ * the frequency/speed mix — low+slow reads as a "grand" swell, high+fast as
+ * "turbulent".  Bundling a curated mix as a named preset lets 'f' swap the whole
+ * look at once.
+ *
+ * VALUE LOGIC: f* are spatial frequencies (rad/cell, ~0.08–0.45) — higher = more
+ * ripples per screen; s* are time speeds (rad/s, ~0.3–2.2) — higher = faster
+ * shimmer.  name labels the preset in the HUD. */
+typedef struct {
+    float f1, f2, f3, f4;   /* spatial frequencies, rad/cell */
+    float s1, s2, s3, s4;   /* time speeds, rad/s            */
+    const char *name;
+} FreqPreset;
+
+/* Plasma — the entire effect's state.  It is STATELESS in the demoscene sense
+ * (Vandevenne, ref [1]): there is no pixel grid or per-cell history — every cell
+ * is recomputed from (col, row, time) each frame, so the whole "object" is a
+ * clock plus three user choices.
+ *
+ * WHY so little: that's the point of plasma — it ran in fixed time per pixel on a
+ * C64 with zero buffers.  Only `time` advances; the rest are knobs the user sets.
+ *
+ * VALUE LOGIC: time (s) feeds the wave phases AND the palette cycle; freq_preset
+ * indexes FREQ_PRESETS (the wave maths); theme indexes THEMES (the palette — a
+ * render choice, kept here only because it's a one-key toggle); paused freezes
+ * the clock so the pattern holds still. */
+typedef struct {
+    float time;          /* seconds elapsed — the sole advancing state   */
+    int   freq_preset;   /* index into FREQ_PRESETS (wave parameters)     */
+    int   theme;         /* index into THEMES (palette — a render choice) */
+    bool  paused;        /* freezes the time advance                      */
+} Plasma;
+
+/* Scene — the framework's "what is simulated" slot.  For plasma that is just the
+ * one Plasma effect (no other entities); kept as a named aggregate for symmetry
+ * with the other demos. */
+typedef struct { Plasma plasma; } Scene;
+
+/* Screen — the ncurses display surface: the cached terminal size in cells.
+ * ncurses owns the real frame buffer (stdscr); this just keeps cols×rows so the
+ * hot path and HUD don't call getmaxyx() — refreshed at init and on SIGWINCH. */
+typedef struct { int cols, rows; } Screen;
+
+/* App — process-level glue binding the scene to its terminal.
+ *
+ * WHY global (g_app): POSIX signal handlers take no user-data argument, so the
+ * SIGINT/SIGTERM/SIGWINCH handler reaches the run/resize flags through a
+ * file-scope object; volatile sig_atomic_t is the one type the C standard
+ * guarantees is safe to write in a handler and read in the loop. */
+typedef struct {
+    Scene                 scene;
+    Screen                screen;
+    int                   sim_fps;       /* fixed-timestep rate (] / [ keys)  */
+    volatile sig_atomic_t running;       /* cleared by SIGINT/SIGTERM → exit  */
+    volatile sig_atomic_t need_resize;   /* set by SIGWINCH → loop re-reads   */
+} App;
+
+/* ===================================================================== */
+/* §4  logic — pure plasma field value: no mutation, no I/O               */
+/* ===================================================================== */
+
+/*
+ * plasma_value — evaluate the plasma formula at one cell.
+ *
+ * Four sinusoid terms:
+ *   • horizontal wave
+ *   • vertical wave
+ *   • diagonal wave
+ *   • radial wave (aspect-corrected: dy × 2 so rings look circular)
+ * Sum ∈ [−4, +4]; normalise to [0, 1].
+ */
+static float plasma_value(int col, int row, int cols, int rows,
+                          float t, const FreqPreset *fp)
+{
+    float cx   = (float)cols * 0.5f;
+    float cy   = (float)rows * 0.5f;
+    float dx   = (float)col - cx;
+    float dy   = ((float)row - cy) * 2.0f;  /* aspect correction */
+    float dist = sqrtf(dx * dx + dy * dy);
+
+    float v = sinf((float)col * fp->f1 + t * fp->s1)
+            + sinf((float)row * fp->f2 + t * fp->s2)
+            + sinf(((float)(col + row)) * fp->f3 + t * fp->s3)
+            + sinf(dist * fp->f4 + t * fp->s4);
+
+    return (v + 4.0f) * 0.125f;   /* [0, 1] */
+}
+
+/* palette_index — map a plasma value (plus the global cycle phase) to a palette
+ * stop 0..N_PAL-1.  Adding `phase` before the wrap is what scrolls the colours
+ * across the screen each frame (palette cycling, ref [3]). */
+static int palette_index(float v, float phase)
+{
+    float vs = fmodf(v + phase, 1.0f);
+    int   idx = (int)(vs * (float)N_PAL);
+    if (idx < 0)      idx = 0;
+    if (idx >= N_PAL) idx = N_PAL - 1;
+    return idx;
+}
+
+/* ===================================================================== */
+/* §5  simulation — advances state (Plasma.time only; otherwise stateless) */
+/* ===================================================================== */
+
+static void plasma_init(Plasma *p)
+{
+    p->time        = 0.0f;
+    p->freq_preset = 0;
+    p->theme       = 0;
+    p->paused      = false;
+}
+
+static void plasma_tick(Plasma *p, float dt)
+{
+    if (p->paused) return;
+    p->time += dt;
+}
+
+static void scene_init(Scene *s)
+{
+    memset(s, 0, sizeof *s);
+    plasma_init(&s->plasma);
+}
+
+static void scene_tick(Scene *s, float dt)
+{
+    plasma_tick(&s->plasma, dt);
+}
+
+/* ===================================================================== */
+/* §6  render — state → screen; reads only, never mutates sim state        */
 /* ===================================================================== */
 
 static void color_init(void)
@@ -190,27 +402,6 @@ static void color_init(void)
     }
 }
 
-/* ===================================================================== */
-/* §4  coords — plasma works directly in cell space                       */
-/* ===================================================================== */
-
-/* ===================================================================== */
-/* §5  entity — Plasma                                                    */
-/* ===================================================================== */
-
-typedef struct {
-    int    pair;
-    chtype attr;
-    char   ch;
-} PalEntry;
-
-/* Spatial frequencies (rad/cell) and time speeds (rad/s) */
-typedef struct {
-    float f1, f2, f3, f4;
-    float s1, s2, s3, s4;
-    const char *name;
-} FreqPreset;
-
 static const FreqPreset FREQ_PRESETS[N_FREQ_PRESETS] = {
     { 0.20f, 0.25f, 0.15f, 0.18f,  1.0f, 0.80f, 1.2f, 0.90f, "gentle"    },
     { 0.40f, 0.35f, 0.30f, 0.22f,  1.5f, 1.30f, 1.8f, 1.20f, "energetic" },
@@ -225,7 +416,7 @@ static const char *THEME_NAMES[N_THEMES] = {
 /*
  * Palette entries per theme.  N_PAL=14 entries arranged so that cycling
  * the plasma phase at CYCLE_HZ makes colours flow smoothly across the
- * screen.  Pair numbers map to §3 color_init() definitions.
+ * screen.  Pair numbers map to §6 color_init() definitions.
  */
 static const PalEntry THEMES[N_THEMES][N_PAL] = {
     /* 0: rainbow — blue → cyan → green → yellow → orange → red → magenta */
@@ -270,54 +461,6 @@ static const PalEntry THEMES[N_THEMES][N_PAL] = {
     },
 };
 
-typedef struct {
-    float time;
-    int   freq_preset;
-    int   theme;
-    bool  paused;
-} Plasma;
-
-static void plasma_init(Plasma *p)
-{
-    p->time        = 0.0f;
-    p->freq_preset = 0;
-    p->theme       = 0;
-    p->paused      = false;
-}
-
-static void plasma_tick(Plasma *p, float dt)
-{
-    if (p->paused) return;
-    p->time += dt;
-}
-
-/*
- * plasma_value — evaluate the plasma formula at one cell.
- *
- * Four sinusoid terms:
- *   • horizontal wave
- *   • vertical wave
- *   • diagonal wave
- *   • radial wave (aspect-corrected: dy × 2 so rings look circular)
- * Sum ∈ [−4, +4]; normalise to [0, 1].
- */
-static float plasma_value(int col, int row, int cols, int rows,
-                          float t, const FreqPreset *fp)
-{
-    float cx   = (float)cols * 0.5f;
-    float cy   = (float)rows * 0.5f;
-    float dx   = (float)col - cx;
-    float dy   = ((float)row - cy) * 2.0f;  /* aspect correction */
-    float dist = sqrtf(dx * dx + dy * dy);
-
-    float v = sinf((float)col * fp->f1 + t * fp->s1)
-            + sinf((float)row * fp->f2 + t * fp->s2)
-            + sinf(((float)(col + row)) * fp->f3 + t * fp->s3)
-            + sinf(dist * fp->f4 + t * fp->s4);
-
-    return (v + 4.0f) * 0.125f;   /* [0, 1] */
-}
-
 static void plasma_draw(const Plasma *p, WINDOW *w, int cols, int rows)
 {
     const FreqPreset *fp  = &FREQ_PRESETS[p->freq_preset];
@@ -326,13 +469,8 @@ static void plasma_draw(const Plasma *p, WINDOW *w, int cols, int rows)
 
     for (int row = 1; row < rows - 1; row++) {
         for (int col = 0; col < cols; col++) {
-            float v  = plasma_value(col, row, cols, rows, p->time, fp);
-            float vs = fmodf(v + phase, 1.0f);
-            int   idx = (int)(vs * (float)N_PAL);
-            if (idx < 0)      idx = 0;
-            if (idx >= N_PAL) idx = N_PAL - 1;
-
-            const PalEntry *e = &pal[idx];
+            float v = plasma_value(col, row, cols, rows, p->time, fp);
+            const PalEntry *e = &pal[palette_index(v, phase)];
             wattron(w, COLOR_PAIR(e->pair) | e->attr);
             mvwaddch(w, row, col, (chtype)(unsigned char)e->ch);
             wattroff(w, COLOR_PAIR(e->pair) | e->attr);
@@ -340,37 +478,10 @@ static void plasma_draw(const Plasma *p, WINDOW *w, int cols, int rows)
     }
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
-
-typedef struct { Plasma plasma; } Scene;
-
-static void scene_init(Scene *s, int cols, int rows)
+static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows)
 {
-    (void)cols; (void)rows;
-    memset(s, 0, sizeof *s);
-    plasma_init(&s->plasma);
-}
-
-static void scene_tick(Scene *s, float dt, int cols, int rows)
-{
-    (void)cols; (void)rows;
-    plasma_tick(&s->plasma, dt);
-}
-
-static void scene_draw(const Scene *s, WINDOW *w,
-                       int cols, int rows, float alpha, float dt_sec)
-{
-    (void)alpha; (void)dt_sec;
     plasma_draw(&s->plasma, w, cols, rows);
 }
-
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
-
-typedef struct { int cols, rows; } Screen;
 
 static void screen_init(Screen *s)
 {
@@ -382,46 +493,39 @@ static void screen_init(Screen *s)
 
 static void screen_free(Screen *s) { (void)s; endwin(); }
 
-static void screen_draw(Screen *s, const Scene *sc,
-                        double fps, int sim_fps, float alpha, float dt_sec)
+/* HUD — data readout top-right (yellow), action keys bottom-left (cyan). */
+static void draw_hud(const Plasma *p, int cols, int rows, double fps, int sim_fps)
 {
-    erase();
-    scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
-
-    const Plasma *p = &sc->plasma;
     char buf[80];
-    snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  theme:%s  freq:%s ",
+    snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  theme:%s  freq:%s  %s ",
              fps, sim_fps, THEME_NAMES[p->theme],
-             FREQ_PRESETS[p->freq_preset].name);
-    int hx = s->cols - (int)strlen(buf);
+             FREQ_PRESETS[p->freq_preset].name,
+             p->paused ? "PAUSED " : "running");
+    int hx = cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(3) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
     attroff(COLOR_PAIR(3) | A_BOLD);
 
     attron(COLOR_PAIR(5) | A_BOLD);
-    mvprintw(0, 1, " PLASMA ");
+    mvprintw(rows - 1, 0,
+             " q:quit  spc/p:pause  t:theme  f:frequencies  [/]:Hz ");
     attroff(COLOR_PAIR(5) | A_BOLD);
+}
 
-    attron(COLOR_PAIR(6) | A_DIM);
-    mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  p:palette  f:frequencies  [/]:Hz ");
-    attroff(COLOR_PAIR(6) | A_DIM);
+static void screen_draw(const Screen *s, const Scene *sc,
+                        double fps, int sim_fps)
+{
+    erase();
+    scene_draw(sc, stdscr, s->cols, s->rows);
+    draw_hud(&sc->plasma, s->cols, s->rows, fps, sim_fps);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §7  app — combine point (per-tick order) + user events + frame cap      */
 /* ===================================================================== */
-
-typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
-} App;
 
 static App g_app;
 
@@ -429,13 +533,14 @@ static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
+/* User event — mutates the Plasma / sim_fps, but NOT part of the tick. */
 static bool app_handle_key(App *app, int ch)
 {
     Plasma *p = &app->scene.plasma;
     switch (ch) {
     case 'q': case 'Q': case 27: return false;
-    case ' ': p->paused = !p->paused; break;
-    case 'p': case 'P':
+    case ' ': case 'p': case 'P': p->paused = !p->paused; break;
+    case 't': case 'T':
         p->theme = (p->theme + 1) % N_THEMES;
         break;
     case 'f': case 'F':
@@ -467,7 +572,7 @@ int main(void)
     app->sim_fps = SIM_FPS_DEFAULT;
 
     screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+    scene_init(&app->scene);
 
     int64_t frame_time  = clock_ns();
     int64_t sim_accum   = 0;
@@ -476,6 +581,7 @@ int main(void)
     double  fps_display = 0.0;
 
     while (app->running) {
+        /* USER EVENT (out of tick): resize */
         if (app->need_resize) {
             endwin(); refresh();
             getmaxyx(stdscr, app->screen.rows, app->screen.cols);
@@ -484,6 +590,7 @@ int main(void)
             sim_accum  = 0;
         }
 
+        /* 1. PERFORMANCE — measure dt (capped), then fixed-timestep accumulate */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
@@ -492,15 +599,14 @@ int main(void)
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
+        /* 2. SIMULATION — advance one fixed step per accumulated tick */
         sim_accum += dt;
         while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec,
-                       app->screen.cols, app->screen.rows);
+            scene_tick(&app->scene, dt_sec);
             sim_accum -= tick_ns;
         }
 
-        float alpha = (float)sim_accum / (float)tick_ns;
-
+        /* 3. PERFORMANCE — fps tally + sleep to the 60 fps frame cap */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -511,12 +617,14 @@ int main(void)
         }
 
         int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+        clock_sleep_ns(NS_PER_SEC / FRAME_CAP_FPS - elapsed);
 
+        /* 4. RENDER — read-only */
         screen_draw(&app->screen, &app->scene,
-                    fps_display, app->sim_fps, alpha, dt_sec);
+                    fps_display, app->sim_fps);
         screen_present();
 
+        /* USER EVENT (out of tick): key handling */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

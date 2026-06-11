@@ -30,13 +30,8 @@
  *   gcc -std=c11 -O2 -Wall -Wextra particle_number_morph.c \
  *       -o particle_number_morph -lncurses -lm
  *
- * §1  config & font
- * §2  clock
- * §3  color / themes
- * §4  target precomputation
- * §5  particles  (lerp)
- * §6  draw
- * §7  app / main
+ * §1  config & font     §2  performance    §3  logic
+ * §4  simulation        §5  render          §6  app
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -60,6 +55,25 @@
  * Rendering      : Particle colour based on proximity to target: settled
  *                  particles show theme colour; particles in flight fade
  *                  through a gradient based on interpolation progress t.
+ *
+ * References     :
+ *   Particle→target matching & morph (§4 digit_assign, parts_update)
+ *     [1] Kuhn, "The Hungarian Method for the Assignment Problem," Naval
+ *         Research Logistics Quarterly 2 (1955) — the optimal particle↔target
+ *         assignment; this file uses the cheap O(P·T) greedy approximation.
+ *     [2] Reeves, "Particle Systems — A Technique for Modeling a Class of
+ *         Fuzzy Objects," ACM TOG 2(2) (1983) — the pool-of-points model whose
+ *         collective motion forms the digit.
+ *   Easing (§3 smoothstep)
+ *     [3] Penner, "Robert Penner's Easing Functions" (2002) — the S-curve
+ *         ease-in/ease-out used to glide particles between shapes.
+ *     [4] Perlin, "Improving Noise," ACM SIGGRAPH (2002) — the cubic Hermite
+ *         smoothstep 3t²−2t³ (and its smootherstep cousin) behind the easing.
+ *   ASCII rendering substrate (§5 parts_draw)
+ *     [5] Bourke, "Character representation of grey scale images" (1997) — the
+ *         progress → glyph ramp ('.' → '+' → '#' → '@').
+ *     [6] Padala, "NCURSES Programming HOWTO" (TLDP) — colour pairs and the
+ *         erase → draw → refresh frame model.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -87,10 +101,10 @@
  * ──────────────────
  *  1. Precompute targets: for each digit 0..9, walk the 9×7 bitmap, expand
  *     every '#' pixel into a sub-grid of g_suby × g_subx points, store in
- *     g_dtx/g_dty[d][0..g_dtn[d]-1].
+ *     g_targets[d].x/.y[0..g_targets[d].n-1].
  *  2. On digit change (digit_assign):
  *       a. Snapshot every particle's current (x,y) into (ox,oy).
- *       b. For each of n=g_dtn[digit] targets, scan all unclaimed
+ *       b. For each of n=g_targets[digit].n targets, scan all unclaimed
  *          particles, pick the one with smallest squared distance, mark
  *          claimed and write target.
  *       c. Unclaimed particles are sent to (cx,cy) and marked inactive.
@@ -108,7 +122,7 @@
  *  x(t) = ox + smoothstep(t)·(tx−ox)  per-axis lerp from snapshot to target
  *  greedy match cost: argmin_p ‖p − target_t‖²    O(P·T) per transition
  *  digit width  = FONT_C × g_sx     pixels in cells
- *  particle target count: g_dtn[d] = (#-pixels) × g_suby × g_subx
+ *  particle target count: g_targets[d].n = (#-pixels) × g_suby × g_subx
  *
  *
  * ─────────────────────────────────────────────────────────────────────── */
@@ -122,6 +136,47 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
+ *
+ * Four real layers; two are intentionally absent.
+ *
+ *   LAYER        SECTION  MUTATES
+ *   ────────────────────────────────────────────────────────────────────
+ *   PERFORMANCE  §2       nothing — clock primitives (frame cap + fps in §6)
+ *   LOGIC        §3       nothing — pure smoothstep (eased t)
+ *   SIMULATION   §4       scene geometry (g_rows/g_cols, the scale & sub-grid
+ *                           sizes), the digit target tables (g_targets[]),
+ *                           the particle pool
+ *                           g_parts[] and the morph clock g_morph_t; advances
+ *                           the PRNG g_lcg.
+ *   RENDER       §5       the terminal + colour pairs only; READS the particles,
+ *                           never writes them.
+ *
+ *   EFFECTS  : ABSENT — a particle's glyph ('.'→'+'→'#'→'@') and the idle fade
+ *              are derived at render time from the morph progress
+ *              (smoothstep(g_morph_t)), never stored as cosmetic state.
+ *   DELAYS   : the morph clock g_morph_t and the post-morph hold timer
+ *              (hold_tick → hold_max) plus the pause flag are inline counters in
+ *              §4 / §6, not a module.
+ *
+ * LOGIC (§3) is provably uncorruptable from RENDER: it does no mutation and no
+ * I/O, so deleting or reordering any draw cannot change smoothstep.
+ *
+ * Per-tick combine order — main() (§6) is the only place that advances state:
+ *     1. PERFORMANCE  frame_start timestamp                       §6
+ *     2. SIMULATION   parts_update()  (lerp)  [skipped if paused]  §4
+ *     3. DELAYS       after the morph completes, hold_tick++ →
+ *                       digit_assign(next) when it overflows        §6 + §4
+ *     4. RENDER       parts_draw + hud_draw                        §5
+ *     5. PERFORMANCE  fps tally + sleep to RENDER_NS               §6
+ *
+ * User events (keys: quit/pause/next/hold/speed/theme; SIGWINCH resize) mutate
+ * state but are NOT part of the tick — handled before it (§6 input drain and the
+ * g_need_resize block, which re-run scale_compute / targets_precompute and
+ * digit_assign).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 /* ===================================================================== */
 /* §1  config & font                                                      */
@@ -172,18 +227,27 @@ static const char k_font[10][FONT_R][FONT_C + 1] = {
 #define HOLD_DEF    60    /* frames to hold after morph completes */
 #define HOLD_MAX   200
 
+/* Layout / scatter */
+#define FONT_HEIGHT_FRAC 0.65f  /* digit fills this fraction of screen height */
+#define SCATTER_SPAN     1.5f   /* initial scatter box = this × digit box     */
+
+/* Render glyph ramp by morph progress st (parts_draw) */
+#define GLYPH_SETTLED    0.92f  /* st > this: '@' settled                     */
+#define GLYPH_NEAR       0.55f  /* st > this: '#' nearly there                */
+#define GLYPH_MID        0.20f  /* st > this: '+' mid-flight; else '.'        */
+
 #define N_THEMES  5
 
 /* Color pairs */
 enum {
-    CP_HUD  = 1,
-    CP_D0   = 2,    /* CP_D0 + digit → per-digit color */
-    CP_IDLE = 12,   /* in-transit idle particles */
-    CP_MOV  = 13,   /* active particles mid-lerp */
+    CP_HUD  = 1,    /* top HUD: data readout (yellow)   */
+    CP_D0   = 2,    /* CP_D0 + digit → per-digit color  */
+    CP_IDLE = 12,   /* in-transit idle particles        */
+    CP_HINT = 14,   /* bottom HUD: action keys (cyan)    */
 };
 
 /* ===================================================================== */
-/* §2  clock                                                              */
+/* §2  performance — timing primitives (frame cap applied in §6)          */
 /* ===================================================================== */
 
 static int64_t clock_ns(void)
@@ -203,6 +267,23 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
+/* ===================================================================== */
+/* §3  logic — pure decisions: no mutation, no I/O                        */
+/* ===================================================================== */
+
+/* Smoothstep easing: starts and ends gently, fast through the middle */
+static float smoothstep(float t)
+{
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return t * t * (3.0f - 2.0f * t);
+}
+
+/* ===================================================================== */
+/* §4  simulation — advances state (geometry, targets, particles, morph)  */
+/* ===================================================================== */
+
+/* PRNG — mutates g_lcg, so NOT pure (not §3 logic). */
 static uint32_t g_lcg = 12345u;
 static float lcg_f(void)
 {
@@ -210,55 +291,14 @@ static float lcg_f(void)
     return (float)(g_lcg >> 8) / (float)(1u << 24);
 }
 
-/* ===================================================================== */
-/* §3  color / themes                                                     */
-/* ===================================================================== */
-
-static const struct {
-    const char *name;
-    short       dig[10];
-    short       idle;
-    short       mov;
-} k_themes[N_THEMES] = {
-    { "Neon",   { 51,231,226,208,46,201,196,117,255,220 }, 237, 244 },
-    { "Fire",   { 124,196,202,208,214,220,226,228,231,222 }, 52, 130 },
-    { "Ice",    { 17,21,27,33,39,44,51,87,123,159 }, 18, 26 },
-    { "Plasma", { 54,93,129,165,201,207,213,219,225,231 }, 53, 91 },
-    { "Mono",   { 255,255,255,255,255,255,255,255,255,255 }, 237, 247 },
-};
-
-static void theme_apply(int t)
-{
-    for (int d = 0; d < 10; d++)
-        init_pair((short)(CP_D0 + d),
-                  (COLORS >= 256) ? k_themes[t].dig[d] : COLOR_WHITE,
-                  COLOR_BLACK);
-    init_pair(CP_IDLE, (COLORS >= 256) ? k_themes[t].idle : COLOR_BLACK, COLOR_BLACK);
-    init_pair(CP_MOV,  (COLORS >= 256) ? k_themes[t].mov  : COLOR_WHITE, COLOR_BLACK);
-}
-
-static void colors_init(int theme)
-{
-    start_color();
-    init_pair(CP_HUD, 51, COLOR_BLACK);
-    theme_apply(theme);
-}
-
-/* ===================================================================== */
-/* §4  target precomputation                                              */
-/* ===================================================================== */
-
-static float g_dtx[10][N_PARTS];
-static float g_dty[10][N_PARTS];
-static int   g_dtn[10];
-
+/* Scene geometry, derived from the terminal at init/resize. */
 static int g_rows, g_cols;
 static int g_sy, g_sx;
 static int g_suby, g_subx;
 
 static void scale_compute(void)
 {
-    g_sy = (int)((float)g_rows * 0.65f / (float)FONT_R);
+    g_sy = (int)((float)g_rows * FONT_HEIGHT_FRAC / (float)FONT_R);
     if (g_sy < 1) g_sy = 1;
     if (g_sy > 8) g_sy = 8;
     g_sx = g_sy * 2;
@@ -266,6 +306,18 @@ static void scale_compute(void)
     g_suby = (g_sy < SUB_Y_MAX) ? g_sy : SUB_Y_MAX;
     g_subx = (g_sx < SUB_X_MAX) ? g_sx : SUB_X_MAX;
 }
+
+/* DigitTargets — the set of target pixel positions for one digit: n points at
+ * (x[i], y[i]).  Precomputed once per scale by expanding the bitmap font;
+ * digit_assign matches particles onto these points.  Struct-of-arrays, one per
+ * digit 0..9. */
+typedef struct {
+    float x[N_PARTS];       /* target x per point                          */
+    float y[N_PARTS];       /* target y per point                          */
+    int   n;                /* valid point count (#pixels × sub-grid size) */
+} DigitTargets;
+
+static DigitTargets g_targets[10];
 
 static void targets_precompute(float cx, float cy)
 {
@@ -285,20 +337,16 @@ static void targets_precompute(float cx, float cy)
                 float by = orig_y + (float)(fr * g_sy);
                 for (int py = 0; py < g_suby && n < N_PARTS; py++) {
                     for (int px = 0; px < g_subx && n < N_PARTS; px++) {
-                        g_dtx[d][n] = bx + off_x + (float)px * step_x;
-                        g_dty[d][n] = by + off_y + (float)py * step_y;
+                        g_targets[d].x[n] = bx + off_x + (float)px * step_x;
+                        g_targets[d].y[n] = by + off_y + (float)py * step_y;
                         n++;
                     }
                 }
             }
         }
-        g_dtn[d] = n;
+        g_targets[d].n = n;
     }
 }
-
-/* ===================================================================== */
-/* §5  particles  (lerp)                                                  */
-/* ===================================================================== */
 
 /*
  * Each particle stores:
@@ -318,25 +366,33 @@ static Particle g_parts[N_PARTS];
 static float    g_morph_t     = 1.0f;   /* 0 = just triggered, 1 = done */
 static int      g_morph_frames = MORPH_FRAMES_DEF;
 
-/* Smoothstep easing: starts and ends gently, fast through the middle */
-static float smoothstep(float t)
-{
-    if (t <= 0.0f) return 0.0f;
-    if (t >= 1.0f) return 1.0f;
-    return t * t * (3.0f - 2.0f * t);
-}
-
 static void parts_init(float cx, float cy)
 {
     for (int i = 0; i < N_PARTS; i++) {
-        g_parts[i].x  = cx + (lcg_f() - 0.5f) * (float)(FONT_C * g_sx) * 1.5f;
-        g_parts[i].y  = cy + (lcg_f() - 0.5f) * (float)(FONT_R * g_sy) * 1.5f;
+        g_parts[i].x  = cx + (lcg_f() - 0.5f) * (float)(FONT_C * g_sx) * SCATTER_SPAN;
+        g_parts[i].y  = cy + (lcg_f() - 0.5f) * (float)(FONT_R * g_sy) * SCATTER_SPAN;
         g_parts[i].ox = g_parts[i].x;
         g_parts[i].oy = g_parts[i].y;
         g_parts[i].tx = cx;
         g_parts[i].ty = cy;
         g_parts[i].active = false;
     }
+}
+
+/* Greedy nearest-neighbour: index of the closest particle not yet claimed by a
+ * target (by squared distance), or -1 if none remain. */
+static int nearest_unclaimed(float tx, float ty, const bool *used)
+{
+    float best_d2 = 1e18f;
+    int   best_p  = -1;
+    for (int p = 0; p < N_PARTS; p++) {
+        if (used[p]) continue;
+        float dx = g_parts[p].x - tx;
+        float dy = g_parts[p].y - ty;
+        float d2 = dx*dx + dy*dy;
+        if (d2 < best_d2) { best_d2 = d2; best_p = p; }
+    }
+    return best_p;
 }
 
 /*
@@ -346,42 +402,30 @@ static void parts_init(float cx, float cy)
  */
 static void digit_assign(int digit, float cx, float cy)
 {
-    int   n    = g_dtn[digit];
+    const DigitTargets *tg = &g_targets[digit];
     bool  used[N_PARTS];
     memset(used, 0, sizeof used);
 
     /* Mark all inactive first */
     for (int i = 0; i < N_PARTS; i++) g_parts[i].active = false;
 
-    /* Greedy NN: each target gets the nearest unassigned particle */
-    for (int t = 0; t < n; t++) {
-        float ttx = g_dtx[digit][t];
-        float tty = g_dty[digit][t];
-        float best_d2 = 1e18f;
-        int   best_p  = -1;
-        for (int p = 0; p < N_PARTS; p++) {
-            if (used[p]) continue;
-            float dx = g_parts[p].x - ttx;
-            float dy = g_parts[p].y - tty;
-            float d2 = dx*dx + dy*dy;
-            if (d2 < best_d2) { best_d2 = d2; best_p = p; }
-        }
-        if (best_p >= 0) {
-            used[best_p] = true;
-            g_parts[best_p].active = true;
-            g_parts[best_p].tx = ttx;
-            g_parts[best_p].ty = tty;
-        }
+    /* Greedy match: each target claims its nearest free particle */
+    for (int t = 0; t < tg->n; t++) {
+        int p = nearest_unclaimed(tg->x[t], tg->y[t], used);
+        if (p < 0) continue;
+        used[p] = true;
+        g_parts[p].active = true;
+        g_parts[p].tx = tg->x[t];
+        g_parts[p].ty = tg->y[t];
     }
 
-    /* Idle particles: send to centre so they disappear cleanly */
+    /* Unclaimed particles glide to centre; snapshot every origin for the lerp */
     for (int i = 0; i < N_PARTS; i++) {
         if (!used[i]) {
             g_parts[i].active = false;
             g_parts[i].tx = cx;
             g_parts[i].ty = cy;
         }
-        /* Snapshot current position as lerp origin */
         g_parts[i].ox = g_parts[i].x;
         g_parts[i].oy = g_parts[i].y;
     }
@@ -410,16 +454,58 @@ static void parts_update(void)
 }
 
 /* ===================================================================== */
-/* §6  draw                                                               */
+/* §5  render — state → screen; reads only, never mutates sim state        */
 /* ===================================================================== */
+
+/* Theme — one named colour preset: a per-digit palette (dig[0..9]) plus the
+ * colour for in-transit idle particles.  t/T cycle the presets. */
+typedef struct {
+    const char *name;       /* label shown in the HUD                     */
+    short       dig[10];    /* foreground colour per digit 0..9           */
+    short       idle;       /* idle (gliding-to-centre) particle colour   */
+} Theme;
+
+static const Theme k_themes[N_THEMES] = {
+    { "Neon",   { 51,231,226,208,46,201,196,117,255,220 }, 237 },
+    { "Fire",   { 124,196,202,208,214,220,226,228,231,222 }, 52 },
+    { "Ice",    { 17,21,27,33,39,44,51,87,123,159 }, 18 },
+    { "Plasma", { 54,93,129,165,201,207,213,219,225,231 }, 53 },
+    { "Mono",   { 255,255,255,255,255,255,255,255,255,255 }, 237 },
+};
+
+static void theme_apply(int t)
+{
+    for (int d = 0; d < 10; d++)
+        init_pair((short)(CP_D0 + d),
+                  (COLORS >= 256) ? k_themes[t].dig[d] : COLOR_WHITE,
+                  COLOR_BLACK);
+    init_pair(CP_IDLE, (COLORS >= 256) ? k_themes[t].idle : COLOR_BLACK, COLOR_BLACK);
+}
+
+static void colors_init(int theme)
+{
+    start_color();
+    init_pair(CP_HUD,  (COLORS >= 256) ? 226 : COLOR_YELLOW, COLOR_BLACK);
+    init_pair(CP_HINT, (COLORS >= 256) ? 51  : COLOR_CYAN,   COLOR_BLACK);
+    theme_apply(theme);
+}
+
+/* Glyph for a settling particle by morph progress: dot → plus → hash → solid. */
+static char morph_glyph(float st)
+{
+    if (st > GLYPH_SETTLED) return '@';
+    if (st > GLYPH_NEAR)    return '#';
+    if (st > GLYPH_MID)     return '+';
+    return '.';
+}
 
 static void parts_draw(int digit)
 {
     attr_t a_bright = (attr_t)COLOR_PAIR(CP_D0 + digit) | A_BOLD;
     attr_t a_idle   = (attr_t)COLOR_PAIR(CP_IDLE);
 
-    /* Character varies with lerp progress; color is always the digit color */
-    float st = smoothstep(g_morph_t);
+    /* Character tracks lerp progress (same for all); colour is the digit colour */
+    char glyph = morph_glyph(smoothstep(g_morph_t));
 
     for (int i = 0; i < N_PARTS; i++) {
         Particle *p = &g_parts[i];
@@ -429,13 +515,8 @@ static void parts_draw(int digit)
         if (col < 0 || col >= g_cols)     continue;
 
         if (p->active) {
-            chtype ch;
-            if      (st > 0.92f) ch = '@';   /* settled   */
-            else if (st > 0.55f) ch = '#';   /* nearly there */
-            else if (st > 0.20f) ch = '+';   /* mid-flight */
-            else                 ch = '.';   /* just started */
             attron(a_bright);
-            mvaddch(row, col, ch);
+            mvaddch(row, col, (chtype)(unsigned char)glyph);
             attroff(a_bright);
         } else {
             /* Idle: visible only during the lerp, invisible once at centre */
@@ -447,46 +528,29 @@ static void parts_draw(int digit)
     }
 }
 
-static void hud_draw(int digit, int hold_tick, int hold_max,
-                     int theme, bool paused, double fps)
+static void hud_draw(int digit, int hold_max, int theme, bool paused, double fps)
 {
-    /* Morph/hold progress bar */
-    int  bar_w = g_cols / 5;
-    if (bar_w < 4) bar_w = 4;
-
-    char prog[64];
-    memset(prog, '-', (size_t)bar_w);
-    prog[bar_w] = '\0';
-
-    int filled;
-    if (g_morph_t < 1.0f) {
-        /* During morph: show morph progress */
-        filled = (int)(g_morph_t * (float)bar_w);
-        for (int i = 0; i < filled && i < bar_w; i++) prog[i] = '~';
-    } else {
-        /* During hold: show hold progress */
-        filled = hold_max > 0 ? hold_tick * bar_w / hold_max : 0;
-        for (int i = 0; i < filled && i < bar_w; i++) prog[i] = '=';
-    }
-
-    char bar[256];
-    snprintf(bar, sizeof bar,
-             " %d  [q]quit [n]next [t]%s [p]%s [f/F]spd [%s] %.0ffps ",
-             digit, k_themes[theme].name,
-             paused ? "RESUME" : "PAUSE",
-             prog, fps);
-
-    int blen = (int)strlen(bar);
-    int bx   = (g_cols - blen) / 2;
-    if (bx < 0) bx = 0;
-
+    /* Top-right: data readout */
+    char buf[160];
+    snprintf(buf, sizeof buf,
+             " digit:%d  theme:%s  morph:%d  hold:%d  %.0f fps  %s ",
+             digit, k_themes[theme].name, g_morph_frames, hold_max, fps,
+             paused ? "PAUSED " : "running");
+    int x = g_cols - (int)strlen(buf);
+    if (x < 0) x = 0;
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvprintw(g_rows - 1, bx, "%s", bar);
+    mvprintw(0, x, "%s", buf);
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+
+    /* Bottom-left: action keys */
+    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+    mvprintw(g_rows - 1, 0,
+             " q:quit  p:pause  n:next  ]/[:hold  f/F:speed  t/T:theme ");
+    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
-/* §7  app / main                                                         */
+/* §6  app / main — combine point + user events + frame cap               */
 /* ===================================================================== */
 
 static volatile sig_atomic_t g_running     = 1;
@@ -550,14 +614,16 @@ int main(void)
 
     while (g_running) {
 
+        /* USER EVENT (out of tick): resize → re-derive geometry + targets */
         if (g_need_resize) {
             do_resize(&cx, &cy);
             digit_assign(cur_digit, cx, cy);
         }
 
+        /* 1. PERFORMANCE — frame start timestamp */
         int64_t frame_start = clock_ns();
 
-        /* --- input --- */
+        /* USER EVENT (out of tick): input — quit/pause/next/hold/speed/theme */
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
@@ -599,10 +665,10 @@ int main(void)
         }
 
         if (!paused) {
-            /* Advance the lerp every frame */
+            /* 2. SIMULATION — advance the lerp every frame */
             parts_update();
 
-            /* Hold timer only runs after morph completes */
+            /* 3. DELAYS — hold timer runs only after the morph completes */
             if (g_morph_t >= 1.0f) {
                 hold_tick++;
                 if (hold_tick >= hold_max) {
@@ -613,14 +679,14 @@ int main(void)
             }
         }
 
-        /* --- draw --- */
+        /* 4. RENDER — read-only */
         erase();
         parts_draw(cur_digit);
-        hud_draw(cur_digit, hold_tick, hold_max, theme, paused, fps);
+        hud_draw(cur_digit, hold_max, theme, paused, fps);
         wnoutrefresh(stdscr);
         doupdate();
 
-        /* FPS counter */
+        /* 5. PERFORMANCE — fps tally + sleep to the frame cap */
         frame_cnt++;
         int64_t now = clock_ns();
         if (now - fps_clock >= 500LL * NS_PER_MS) {

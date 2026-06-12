@@ -146,7 +146,7 @@ per-program algorithm notes in [DEMOS.md](DEMOS.md).
 | `flocking/` | 7 | Reynolds boids, shepherd herding, crowd steering, faction battle, ant-colony pheromone, predator-prey, Physarum slime mould |
 | `robots/` | 4 | Hexapod tripod gait, biped, spring-leg jumper, self-balancing Perlin-terrain bot |
 | `algorithms/` | 11 | Quadtree / k-d / BSP; convex hull, Voronoi, visibility; BFS/DFS/A\*; sort visualiser; SIR epidemic |
-| `geometry/` | 4 | Lissajous, spirograph, string-art, Delaunay |
+| `geometry/` | 4 | Lissajous, spirograph, Maurer rose, Delaunay triangulation |
 | `signal/` | 10 | DFT, FFT, IDFT, convolution, sampling, time-domain filters, 2-D Fourier |
 | `particle_systems/` | 18 | Fire (3 algos), smoke, fireworks, kaboom shockwave, fountain, comet, rain, snow, constellation network |
 | `matrix_rain/` | 5 | Classic Matrix rain + snowflake / pulsar / sun-mask / freeze variants |
@@ -190,8 +190,10 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c         -o raymarcher    
 - [CLAUDE.md](CLAUDE.md) — full project conventions: section maps, comment
   standards, CONCEPTS / MENTAL MODEL block format, build rules
 - [DEMOS.md](DEMOS.md) — per-program algorithm notes
-- [documentation/Architecture.md](documentation/Architecture.md) — framework
-  design, loop mechanics, coordinate model, per-subsystem deep dives
+- [documentation/Architecture.md](documentation/Architecture.md) — the
+  recurring techniques and patterns explained in plain language (the
+  fixed-timestep loop, particle pools, cellular automata, fields/PDEs, noise,
+  raymarching, rasterisation, raytracing, kinematics, preset tables)
 - [documentation/Framework.md](documentation/Framework.md) — line-by-line
   beginner's guide to the canonical animation framework
   (`ncurses_basics/framework.c`)

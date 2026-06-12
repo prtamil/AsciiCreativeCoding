@@ -277,7 +277,7 @@ you would consult to extend the technique past what is implemented here.
 
 #### A2 Internal Double Buffer — newscr / curscr / doupdate
 ncurses maintains two virtual screens internally: `curscr` (what the terminal currently shows) and `newscr` (what you are building). `doupdate()` computes the diff and sends only the changed cells as escape codes — one atomic write per frame. You never need a manual front/back buffer; adding one breaks the diff engine and produces ghost trails.
-*Files: all files — explicitly used in `bounce.c`, `matrix_rain.c`, all raster files*
+*Files: all files — explicitly used in `bounce_ball.c`, `matrix_rain.c`, all raster files*
 
 #### A3 erase() vs clear()
 `erase()` wipes ncurses' internal `newscr` buffer with no terminal I/O; the diff engine will still send only what changed. `clear()` schedules a full `\e[2J` escape — every cell is retransmitted regardless of whether it changed, causing a full repaint every frame and visible flicker. Always use `erase()` in the render loop.
@@ -313,7 +313,7 @@ The OS sends `SIGWINCH` when the terminal window is resized. The handler sets a 
 
 #### B2 Fixed-timestep Accumulator
 Wall-clock `dt` is added to a nanosecond bucket each frame; physics is stepped in fixed-size chunks until the bucket is exhausted. This decouples simulation accuracy from render frame rate — the physics always integrates at exactly `SIM_FPS` steps per second regardless of how long rendering takes, making it deterministic and numerically stable.
-*Files: `bounce.c`, `matrix_rain.c`, `spring_pendulum.c`*
+*Files: `bounce_ball.c`, `matrix_rain.c`, `spring_pendulum.c`*
 
 #### B3 dt Cap — Spiral-of-death Prevention
 If the process was paused (debugger, OS suspend) and then resumed, the measured `dt` would be enormous and the accumulator would drain thousands of ticks in one frame. Clamping `dt` to 100 ms means the simulation appears to pause rather than fast-forward; the cap value is chosen to be imperceptible as lag but large enough to absorb any reasonable stall.
@@ -325,11 +325,11 @@ The sleep that limits output to 60 fps must happen *before* the terminal I/O (`d
 
 #### B5 Render Interpolation — Alpha
 After draining the accumulator, `sim_accum` holds the leftover nanoseconds into the next unfired tick. `alpha = sim_accum / tick_ns` ∈ [0,1). Drawing objects at `pos + vel × alpha × dt` instead of at `pos` removes the 0–16 ms lag between physics state and wall-clock "now", eliminating micro-stutter.
-*Files: `bounce.c`, `matrix_rain.c`, `spring_pendulum.c`*
+*Files: `bounce_ball.c`, `matrix_rain.c`, `spring_pendulum.c`*
 
 #### B6 Forward Extrapolation vs Lerp
 For constant-velocity motion (bouncing balls, falling characters), extrapolating forward by `alpha` is numerically identical to lerping between `prev` and `current` — and requires no extra storage. For non-linear forces (spring, pendulum), extrapolation diverges; the correct approach is storing `prev_r`, `prev_theta` and lerping: `draw = prev + (current - prev) × alpha`.
-*Files: `bounce.c` (extrapolation), `spring_pendulum.c` (lerp)*
+*Files: `bounce_ball.c` (extrapolation), `spring_pendulum.c` (lerp)*
 
 #### B7 FPS Counter — Rolling Average
 Counting frames and accumulating time over a 500 ms window gives a display FPS that updates twice per second — stable enough to read without being laggy. Per-frame FPS (1/dt) oscillates too wildly to be useful; the rolling average smooths it.
@@ -341,11 +341,11 @@ Counting frames and accumulating time over a 500 ms window gives a display FPS t
 
 #### C1 Pixel Space vs Cell Space
 Terminal cells are physically ~2× taller than wide (8 px wide × 16 px tall). Storing ball positions in cell coordinates and moving by `(1,1)` per tick travels twice as far horizontally in real pixels — circles become ellipses. The fix is to live in pixel space (`pos × CELL_W / CELL_H`) for physics and convert only at draw time.
-*Files: `bounce.c`, `spring_pendulum.c`*
+*Files: `bounce_ball.c`, `spring_pendulum.c`*
 
 #### C2 px_to_cell — Round-half-up vs roundf
 `floorf(px / CELL_W + 0.5f)` is "round half up" — always deterministic. `roundf` uses banker's rounding (round-half-to-even): when `px/CELL_W` is exactly 0.5, it may round to 0 on one call and 1 on the next depending on FPU state, causing a ball on a cell boundary to flicker between two cells every frame.
-*Files: `bounce.c`, `matrix_rain.c`*
+*Files: `bounce_ball.c`, `matrix_rain.c`*
 
 #### C3 Aspect Ratio in Projection Matrices
 The perspective matrix receives `aspect = (cols × CELL_W) / (rows × CELL_H)` — the physical pixel aspect ratio, not just `cols/rows`. Without this, a rendered sphere appears as a vertical ellipse because terminal cells are taller than wide. All raster files use `CELL_W=8`, `CELL_H=16`.
@@ -361,7 +361,7 @@ In the raymarcher, the ray direction's Y component is divided by `CELL_ASPECT = 
 
 #### D1 Euler Integration
 The simplest integrator: `pos += vel × dt`, `vel += accel × dt`. It is first-order accurate and adds energy to oscillating systems over time (the orbit spirals outward). Used in particle systems and fire where energy drift doesn't matter because particles have finite lifetimes.
-*Files: `fireworks.c`, `brust.c`, `kaboom.c`*
+*Files: `fireworks.c`, `burst.c`, `kaboom.c`*
 *References: Press et al., "Numerical Recipes" 3e ch. 17; Hairer, Nørsett, Wanner, "Solving Ordinary Differential Equations I" (1993).*
 
 #### D2 Semi-implicit (Symplectic) Euler
@@ -371,12 +371,12 @@ Update velocity *before* position: `vel += accel × dt; pos += vel × dt`. This 
 
 #### D3 Wall Bounce — Elastic Reflection
 When a ball crosses a boundary, clamp position to the boundary and negate the relevant velocity component. Doing it in the correct order (clamp then flip) prevents the ball from getting stuck inside the wall on the next tick. The raster files' `CAM_DIST_MIN/MAX` zoom clamp uses the same pattern. `sparks.c` extends this with a per-pattern **coefficient of restitution** `e ∈ (0, 1)` so each bounce loses energy: `vy' = −e · vy`. Bounce `n` reaches a height proportional to `e^(2n)` of the original — three bounces with `e = 0.55` reach ~9% of the initial height.
-*Files: `bounce.c`, `fireworks.c`, `particle_systems/sparks.c`*
+*Files: `bounce_ball.c`, `fireworks.c`, `particle_systems/sparks.c`*
 *References: Wikipedia, "Coefficient of restitution"; Millington, "Game Physics Engine Development" §7 (Particle Contacts).*
 
 #### D4 Gravity & Drag (Particle Systems)
 Gravity adds a constant downward acceleration each tick (`vy += GRAVITY × dt`). Drag multiplies velocity by a factor less than 1 each tick (`vx *= 0.98`), simulating air resistance and preventing particles from flying off-screen forever. Exponential decay of `life` (`life *= DECAY`) drives the particle's visual fade. `sparks.c` uses the **frame-rate-independent** form `v *= exp(−drag_coeff · dt)` instead of a hard-coded per-tick multiplier, so changing the sim Hz with `]/[` doesn't change the visual damping. `embers.c` is the inverse — buoyancy is gravity with the sign flipped (always negative).
-*Files: `fireworks.c`, `brust.c`, `particle_systems/sparks.c`, `particle_systems/embers.c`*
+*Files: `fireworks.c`, `burst.c`, `particle_systems/sparks.c`, `particle_systems/embers.c`*
 
 #### D5 Spring-Pendulum — Lagrangian Mechanics
 The Lagrangian formulation derives equations of motion from kinetic minus potential energy, handling the coupling between spring extension and pendulum angle automatically. The result is two coupled second-order ODEs for `r̈` and `θ̈` that are integrated numerically each tick — more principled than writing forces by hand.
@@ -385,15 +385,15 @@ The Lagrangian formulation derives equations of motion from kinetic minus potent
 
 #### D6 Lifetime & Exponential Decay
 `life -= dt / lifetime_sec` counts down linearly; when it reaches 0 the particle is recycled. Multiplying by a `decay` factor less than 1 each tick gives exponential decay — the particle fades quickly at first then more slowly, matching the visual feel of embers cooling. `sparks.c` and `embers.c` use the linear `age / life` form to drive a `temperature ∈ [0, 1]` value that picks both the heat-ramp colour pair and the glyph-density slot (cool = sparse, hot = dense), so the visual "cooling" is encoded once and re-used for two visual axes.
-*Files: `fireworks.c`, `brust.c`, `matrix_rain.c` (trail fade), `particle_systems/sparks.c`, `particle_systems/embers.c`*
+*Files: `fireworks.c`, `burst.c`, `matrix_rain.c` (trail fade), `particle_systems/sparks.c`, `particle_systems/embers.c`*
 
 #### D7 Particle Pool — Fixed Array, No Allocation
 All particle arrays are statically sized at init (`Particle pool[MAX]`). An `active` flag or lifetime <= 0 marks slots as free. Burst functions scan for inactive slots rather than calling `malloc`/`free` per particle — avoids heap fragmentation and allocation stalls in a 60 fps loop.
-*Files: `fireworks.c`, `brust.c`, `kaboom.c`, `particle_systems/sparks.c`, `particle_systems/embers.c`*
+*Files: `fireworks.c`, `burst.c`, `kaboom.c`, `particle_systems/sparks.c`, `particle_systems/embers.c`*
 
 #### D8 State Machines in Physics Objects
 Rockets cycle through `IDLE → RISING → EXPLODED`; fire columns have `COLD / HOT`; matrix columns have `ACTIVE / FADING`. A state machine makes transitions explicit and prevents illegal state combinations (e.g., exploding a rocket that hasn't launched). Each state drives a different code path in the tick function.
-*Files: `fireworks.c`, `brust.c`, `matrix_rain.c`*
+*Files: `fireworks.c`, `burst.c`, `matrix_rain.c`*
 
 #### D27 Motion-Blur Trails — Per-Particle Position History
 Each particle stores `TRAIL_LEN` of its previous positions in a small ring (shifted each tick: drop oldest, push current as newest prev). At draw time, two passes paint the scene: pass 1 draws every spark's trail history with progressively cooler/dimmer ramp slots so older points fade behind the head; pass 2 draws every spark's head with the brightest ramp slot. The two-pass order matters — if heads and trails were interleaved per-spark, spark A's trail would overwrite spark B's head when their paths crossed. Trail history is initialised at spawn to the spawn position so a fresh particle never inherits a streak from a previous pool occupant. The technique is independent of the physics: any cell-space particle that wants a fading streak can adopt it by adding `trail_x[N] / trail_y[N]` to its struct and a shift-then-store step in its tick.
@@ -475,7 +475,7 @@ A Linear Congruential Generator (`state = state × A + C mod 2³²`) produces a 
 
 #### F5 Rejection Sampling — Isotropic Random Direction
 Generating `(vx, vy)` as two independent uniform `[-1,1]` randoms and normalizing gives a non-uniform distribution — diagonal directions are more likely. The fix is to sample a point inside the unit circle by rejection: generate random `(x,y)` until `x² + y² <= 1`, then normalize. The result is a perfectly uniform angle distribution.
-*Files: `bounce.c`*
+*Files: `bounce_ball.c`*
 *References: Devroye, "Non-Uniform Random Variate Generation" (1986) §I.4 — the canonical treatment of rejection sampling on the unit disc.*
 
 ---
@@ -698,8 +698,8 @@ To randomise the column scan order in `sand.c` each tick: fill an array `[0..col
 *References: Fisher & Yates, "Statistical Tables for Biological, Agricultural and Medical Research" (1938) §XVIII; Knuth, "The Art of Computer Programming" Vol. 2 §3.4.2 (Algorithm P).*
 
 #### L6 Callback / Function Pointer Patterns
-`brust.c` passes a `scorch` function pointer into `burst_tick`; the raster pipeline invokes `sh->vert` and `sh->frag` through `ShaderProgram`; `flowfield.c` maps colours through a theme function. Function pointers turn hardcoded behaviour into pluggable strategies — new displacement modes, new shaders, new themes — without touching the pipeline code.
-*Files: `brust.c`, all raster files*
+`burst.c` passes a `scorch` function pointer into `burst_tick`; the raster pipeline invokes `sh->vert` and `sh->frag` through `ShaderProgram`; `flowfield.c` maps colours through a theme function. Function pointers turn hardcoded behaviour into pluggable strategies — new displacement modes, new shaders, new themes — without touching the pipeline code.
+*Files: `burst.c`, all raster files*
 
 #### L7 Lookup Table (LUT)
 Precomputing an array of results and indexing into it at runtime turns repeated expensive computations into a single memory access. `fire.c` precomputes the decay table; `raymarcher.c` precomputes the ASCII character ramp; `aafire_port.c` precomputes the per-row heat decay value. LUTs trade memory for speed and are especially valuable inside inner loops.
@@ -735,7 +735,7 @@ Shader functions accept `const void *uni` and cast it to the specific struct the
 
 #### M6 memset for Zero-init
 `memset(s, 0, sizeof *s)` zeroes every byte of a struct at once, including padding bytes. This is faster than a designated initializer for large structs and ensures no field is left uninitialised. In C, zeroing a float gives `0.0f`, zeroing a pointer gives `NULL`, and zeroing a bool gives `false` — reliably, because IEEE 754 zero is all-zero bits.
-*Files: all raster files, `bounce.c`*
+*Files: all raster files, `bounce_ball.c`*
 
 #### M7 size_t Casts in malloc
 `malloc((size_t)(n) * sizeof(T))` — the `size_t` cast is critical when `n` is a signed `int`. If `n` is large, `n * sizeof(T)` overflows `int` (signed integer overflow is undefined behaviour in C) before the implicit conversion to `size_t` happens. Casting first makes the multiplication happen in unsigned 64-bit, preventing both UB and silent underallocation.
@@ -768,7 +768,7 @@ if (p->life > 0.65f) attr |= A_BOLD;
 ```
 
 Building the attribute bitmask into an `attr_t` variable before calling `attron()` allows conditional logic without nested calls. The result is passed as a single OR to `wattron(w, attr)`. All attribute flags (`A_BOLD`, `A_DIM`, `A_REVERSE`, `A_UNDERLINE`, `A_BLINK`, `A_ITALIC`) live in the upper bits of the `chtype`/`attr_t` word; `COLOR_PAIR(n)` occupies a different bit region, so the OR is always safe.
-*Files: `brust.c`, `aafire_port.c`, `constellation.c`*
+*Files: `burst.c`, `aafire_port.c`, `constellation.c`*
 
 #### A13 Dynamic Color — Re-registering Pairs Mid-animation
 
@@ -813,8 +813,8 @@ The first line to visit a cell claims it; all others silently skip. Dense connec
 
 #### G9 Scorch Mark Persistence
 
-`brust.c` maintains a `scorch[]` array that persists between explosion cycles. When a particle lands, its character and position are saved into the scorch array. Each frame, scorch marks are drawn with `A_DIM` (faded appearance) before drawing active particles. This creates visual history without any image compositing — the screen accumulates past explosions as progressively dimmer marks.
-*Files: `brust.c`*
+`burst.c` maintains a `scorch[]` array that persists between explosion cycles. When a particle lands, its character and position are saved into the scorch array. Each frame, scorch marks are drawn with `A_DIM` (faded appearance) before drawing active particles. This creates visual history without any image compositing — the screen accumulates past explosions as progressively dimmer marks.
+*Files: `burst.c`*
 
 #### G10 Bright Hue-varying Theme Palette
 
@@ -1176,7 +1176,7 @@ The along/perp offsets are rotated into world space using the group's flight ang
 
 **Key insight:** Placing children at the origin (departure cell) rather than the destination (arrival cell) is the rule that prevents newborns from acting in the same tick as they are born — origin was already processed, destination may not have been.
 
-*Files: `artistic/wator.c`*
+*Files: `procedural/generational/wator.c`*
 *References: Dewdney, "Sharks and fish wage an ecological war on the toroidal planet Wa-Tor" *Scientific American* "Computer Recreations" (Dec 1984).*
 
 ---
@@ -1240,7 +1240,7 @@ float sdf_scene(Vec3 p, ...) {
 
 #### P12 De Bruijn Pentagrid — Penrose Tiling
 
-`penrose.c` uses de Bruijn's algebraic duality to identify which Penrose rhombus contains each terminal cell in O(1), without storing any tiles.
+`penrose_pentagrid.c` uses de Bruijn's algebraic duality to identify which Penrose rhombus contains each terminal cell in O(1), without storing any tiles.
 
 **Five families of parallel lines:** Family j has direction `e_j = (cos(2πj/5), sin(2πj/5))`. For point (wx,wy) in pentagrid space: `k_j = floor(wx·cos_j + wy·sin_j)`. The 5-tuple (k_0…k_4) uniquely identifies which rhombus contains the point.
 
@@ -1304,7 +1304,7 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 
 `voronoi.c` moves seeds via `v += (−DAMP·v + NOISE·ξ)·dt` (Langevin dynamics). Per-cell nearest-seed search tracks d1 and d2; `d2−d1 < BORDER_PX` identifies Voronoi edges without Fortune's algorithm.
 
-*Files: `geometry/voronoi.c`*
+*Files: `algorithms/voronoi.c`*
 *References: Voronoi, "Nouvelles applications des paramètres continus à la théorie des formes quadratiques" *J. reine angew. Math.* 133 (1908); Aurenhammer, "Voronoi diagrams — a survey of a fundamental geometric data structure" *ACM Computing Surveys* 23 (1991).*
 
 ---
@@ -1538,7 +1538,7 @@ The per-cell cost drops from `sqrt + mul + cos` to just `cos + sub` per source p
 
 **Signed 8-level ramp:** `sum ∈ [-1,+1]` maps to 8 color pairs: 3 negative (blue), 1 neutral, 3 positive (red), 1 white peak. This directly visualises the wave physics — destructive interference = blue, constructive = red/white.
 
-*Files: `fluid/wave_interference.c`*
+*Files: `physics/waves.c`*
 
 ---
 
@@ -1823,7 +1823,6 @@ The three-body problem has no general closed-form solution. Specific initial con
 The initial conditions must be specified to high precision (five or more significant figures) because the orbit is only marginally stable — small perturbations cause the bodies to diverge on the Lyapunov timescale. RK4 with small `dt = 0.001` in natural units preserves the orbit for hundreds of visible periods; Velocity Verlet at the same step size drifts and eventually breaks the choreography.
 
 The centre-of-mass frame correction — subtracting the mean velocity each step — keeps the simulation centred on screen. Without it, momentum imbalance from floating-point rounding causes the whole system to drift off screen over time. The `x` key in the implementation adds a random perturbation to one body, instantly revealing the underlying chaotic dynamics hiding beneath the symmetric orbit.
-*Files: `physics/orbit_3body.c`*
 *References: Chenciner & Montgomery, "A remarkable periodic solution of the three-body problem in the case of equal masses" *Annals of Mathematics* 152 (2000); Moore, "Braids in classical dynamics" *Phys. Rev. Lett.* 70 (1993).*
 
 ---
@@ -1943,7 +1942,7 @@ int nbr_odd[6][2]  = {{-1,-1},{-1,0},{0,-1},{0,1},{1,-1},{1,0}};
 ```
 
 The rule bitmask is indexed by neighbour count `n ∈ {0..6}`: `(BIRTH_MASK >> n) & 1` for dead cells, `(SURVIVE_MASK >> n) & 1` for live cells. This compact representation makes it trivial to explore the 2⁷ × 2⁷ rule space. The B2/S34 rule produces gliders and stable oscillators with qualitatively different shapes than square-grid Life — the 6-neighbour topology is more isotropic, eliminating diagonal propagation artefacts. On screen, alternate rows are displayed offset by one column, so the character grid visually matches the honeycomb geometry.
-*Files: `artistic/hex_life.c`*
+*Files: `procedural/generational/hex_life.c`*
 
 ---
 
@@ -1960,7 +1959,7 @@ A(x,t+dt) = clamp(A + dt·G(U), 0, 1) ← state update
 The growth function `G` reaches +1 when the local density matches the species parameter `μ` exactly, and falls to −1 when density is too low or too high. This "sweet-spot" mechanism produces self-organising creatures analogous to biological cells responding to chemical gradient cues.
 
 Precomputing the kernel once as a flat list of (row-offset, col-offset, weight) triples amortises the O(R²) cost and enables cache-friendly inner loops. Different parameter pairs `(μ, σ, R)` define distinct "species": the Orbium (μ=0.15, σ=0.015, R=13) moves coherently like a glider; the Aquarium produces a rich soup of interacting blobs.
-*Files: `fluid/lenia.c`*
+*Files: `procedural/generational/lenia.c`*
 *References: Chan, "Lenia — Biology of Artificial Life" *Complex Systems* 28 (2019); Chan's interactive notebook (chakazul.github.io/lenia.html).*
 
 ---
@@ -1972,7 +1971,7 @@ The Greenberg-Hastings model is a three-state CA (resting → excited → refrac
 The FitzHugh-Nagumo variant used in `reaction_wave.c` extends this to continuous values with two coupled PDE fields: activator `u` (fast membrane voltage) and inhibitor `v` (slow recovery variable). The activator has a cubic nonlinearity `u³/3` that creates the excitation threshold; the inhibitor rises after each spike and suppresses re-excitation during the refractory period. Diffusion via the 5-point Laplacian stencil spreads the wavefront spatially.
 
 Spiral waves require a broken wavefront for initiation: create a planar wave, then make a section of the medium refractory (blocking that half). The free end of the planar wave curls into a rotating spiral. Once established, spirals are self-sustaining — they do not require continuous external forcing, and two counter-rotating spirals can annihilate each other on contact.
-*Files: `fluid/excitable.c`, `fluid/reaction_wave.c`*
+*Files: `procedural/generational/excitable.c`, `fluid/reaction_wave.c`*
 *References: Greenberg & Hastings, "Spatial patterns for discrete models of diffusion in excitable media" *SIAM J. Appl. Math.* 34 (1978); FitzHugh, "Impulses and physiological states in theoretical models of nerve membrane" *Biophys. J.* 1 (1961); Nagumo, Arimoto & Yoshizawa, "An active pulse transmission line simulating nerve axon" *Proc. IRE* 50 (1962).*
 
 ---
@@ -1989,7 +1988,7 @@ crossing = a + t · (b − a)
 Two ambiguous cases exist (patterns 5 and 10 — diagonally opposite corners both inside) where the topology is underdetermined. The standard disambiguation tests the field value at the cell centre to decide which of two possible contour topologies applies.
 
 For ASCII rendering, the crossing direction (the slope of the line segment through the cell) maps to a character: nearly horizontal → `─`, nearly vertical → `│`, diagonals → `/` `\`, corners → `+`. The metaball potential field `f(x,y) = Σ Aᵢ / rᵢ²` (gravitational potential of multiple point masses) is the canonical test signal — two nearby blobs produce an organic "peanut" contour that merges into a single blob as they approach.
-*Files: `fluid/marching_squares.c`*
+*Files: `algorithms/marching_squares.c`*
 *References: Lorensen & Cline, "Marching cubes: A high resolution 3D surface construction algorithm" SIGGRAPH (1987) — the 3D progenitor; Maple & Rouse, "Geometric Algorithms and Combinatorial Optimization" (1988) for the 2D case.*
 
 ---
@@ -2005,7 +2004,7 @@ The convex hull of N points is the smallest convex polygon containing all points
 **Jarvis march / gift wrapping (O(N·h)):** Start at the leftmost point. At each step, find the most counter-clockwise point from the current hull vertex by comparing all pairs with the cross product. Add it and advance. Stop when the hull closes. Optimal when `h ≪ N`; degrades to O(N²) when all points are on the hull.
 
 The cross product `(A→B) × (A→C) = (Bx−Ax)(Cy−Ay) − (By−Ay)(Cx−Ax)` is the foundation of all computational geometry predicates: positive → left turn (CCW), zero → collinear, negative → right turn (CW). Floating-point near-collinear points may give wrong signs — robust implementations use exact arithmetic or add a small epsilon to the comparison.
-*Files: `geometry/convex_hull.c`*
+*Files: `algorithms/convex_hull.c`*
 *References: Graham, "An efficient algorithm for determining the convex hull of a finite planar set" *Information Processing Letters* 1 (1972); Jarvis, "On the identification of the convex hull of a finite set of points in the plane" *Information Processing Letters* 2 (1973); de Berg et al., "Computational Geometry" 3e ch. 1.*
 
 ---
@@ -2017,7 +2016,7 @@ Three graph traversal algorithms with distinct data structures drive their front
 For grid graphs, the Manhattan distance heuristic `h = |nx − gx| + |ny − gy|` is admissible (never overestimates) for 4-directional movement. Euclidean distance is admissible for 8-directional or graph-node layouts. When `h = 0`, A* degenerates to Dijkstra's algorithm. When `h` overestimates, the path may be suboptimal but finds it faster.
 
 Force-directed layout (Fruchterman-Reingold) positions graph nodes by simulating repulsive forces between all pairs and attractive spring forces along edges: `F_repel ∝ k²/d`, `F_attract ∝ d²/k`, where `k = √(area/N)`. Iterating to equilibrium produces visually legible layouts where connected nodes cluster and unconnected nodes separate.
-*Files: `artistic/graph_search.c`*
+*Files: `algorithms/graph_search.c`*
 *References: Hart, Nilsson & Raphael, "A Formal Basis for the Heuristic Determination of Minimum Cost Paths" *IEEE Trans. SSC* 4 (1968) — the A* algorithm; Cormen, Leiserson, Rivest & Stein, "Introduction to Algorithms" 4e ch. 22 (BFS/DFS); Fruchterman & Reingold, "Graph drawing by force-directed placement" *Software: Practice and Experience* 21 (1991).*
 
 ---
@@ -2029,7 +2028,7 @@ A perfect maze (exactly one path between any two cells) is a spanning tree of th
 Walls are stored as a 4-bit bitmask per cell (N=1, E=2, S=4, W=8). Carving a wall clears the corresponding bit in the current cell and sets the opposite bit in the neighbour — ensuring symmetric representation. Animated generation processes `GEN_STEPS` DFS steps per frame so the maze grows visibly. BFS solving is then run on the completed maze, using the carved-wall bitmask as the adjacency test: a move from `(r,c)` to `(r-1,c)` is valid if `walls[r][c] & N`.
 
 DFS mazes have long winding corridors with few dead ends — they are visually "river-like." Wilson's algorithm produces uniformly random spanning trees (all spanning trees equally likely), producing mazes with shorter average path lengths and more dead ends.
-*Files: `misc/maze.c`*
+*Files: `procedural/generational/maze.c`*
 
 ---
 
@@ -2043,16 +2042,16 @@ bool bubble_step(SortState *s, int *arr, int n); /* returns false when done */
 ```
 
 The outer animation loop calls `step()` at a controlled rate, updating `highlight[cmp1, cmp2]` to show the currently active pair in a contrasting color. This gives the user control over animation speed (steps per frame) without restructuring the algorithm itself. Each of the five algorithms (bubble, insertion, selection, quicksort with explicit stack, heapsort) is a separate state machine — they can run concurrently in split-screen mode since each has independent state.
-*Files: `misc/sort_vis.c`*
+*Files: `algorithms/sort_vis.c`*
 
 ---
 
 #### L13 Hexagonal Grid Coordinate Systems
 
-Hexagonal grids have three common coordinate systems. **Offset coordinates** (used in `hex_life.c` and `hex_grid.c`) store cells in a rectangular 2D array with alternate rows shifted — easy to store but awkward for neighbour arithmetic that depends on row parity. **Axial / cube coordinates** use three axes `(q, r, s)` with the constraint `q + r + s = 0`, allowing all six neighbours to be expressed as constant offsets regardless of position: the six directions are `(±1,∓1,0)`, `(±1,0,∓1)`, `(0,±1,∓1)`. Ring distance is `max(|q|,|r|,|s|)`.
+Hexagonal grids have three common coordinate systems. **Offset coordinates** (used in `hex_life.c` and the `grids/hex_grids/` family) store cells in a rectangular 2D array with alternate rows shifted — easy to store but awkward for neighbour arithmetic that depends on row parity. **Axial / cube coordinates** use three axes `(q, r, s)` with the constraint `q + r + s = 0`, allowing all six neighbours to be expressed as constant offsets regardless of position: the six directions are `(±1,∓1,0)`, `(±1,0,∓1)`, `(0,±1,∓1)`. Ring distance is `max(|q|,|r|,|s|)`.
 
 Converting between axial and screen coordinates: `screen_col = q + (r - (r & 1)) / 2`, `screen_row = r`. The terminal aspect correction applies: a hexagonal "circle" of radius `R` in axial space appears on screen as an ellipse of width `2R` columns and `R` rows, because cells are twice as tall as wide. Scaling axial `q` by `CELL_H / CELL_W ≈ 2` before screen conversion produces visually round hex grids.
-*Files: `geometry/hex_grid.c`, `artistic/hex_life.c`*
+*Files: `grids/hex_grids/*.c`, `procedural/generational/hex_life.c`*
 
 ---
 
@@ -2103,7 +2102,7 @@ Ant Colony Optimization (ACO) solves combinatorial optimisation problems by simu
 The pheromone update rule is: `τ(t+1) = (1-ρ)·τ(t) + Σ Δτᵏ` where `ρ` is the evaporation rate and `Δτᵏ = Q/L_k` for each ant that used the edge. Evaporation is essential — without it, pheromone only accumulates and the system cannot forget suboptimal paths. Movement probability is `P(i→j) ∝ τᵢⱼᵅ · ηᵢⱼᵝ` where `η = 1/distance` is the heuristic and `α, β` control the exploitation/exploration balance.
 
 The terminal implementation uses a 2D grid rather than a complete graph, making ant movement visual: trails form as visible density gradients in the pheromone field. The pheromone concentration at each cell maps directly to the Bourke ASCII density ramp — denser trails appear as denser characters, making the path selection dynamics directly observable.
-*Files: `artistic/ant_colony.c`*
+*Files: `procedural/generational/ant_colony.c`*
 *References: Dorigo, "Optimization, Learning and Natural Algorithms" PhD thesis, Politecnico di Milano (1992); Dorigo & Stützle, "Ant Colony Optimization" MIT Press (2004).*
 
 ---
@@ -2204,7 +2203,7 @@ An involute gear tooth profile is derived from the involute of the base circle: 
 Sparks emitted from tooth tips carry the tangential surface velocity `v_tang = −sin(θ) × ω × R` where `θ` is the tooth tip angle and `ω` is the angular velocity. At low `ω` sparks fly nearly radially; at high `ω` the tangential component dominates and sparks sweep in wide arcs that track the rotation direction. This is a physically accurate model of grinding sparks — the same phenomenon seen on angle grinders and lathes.
 
 Wireframe rendering without rasterization: each terminal cell is tested for proximity to circular arc or radial edge features using polar coordinates `(rad, ang)`. Circle arcs use `|rad − R_target| < THRESH_CIRC`; radial edges use the angle from the nearest tooth centre. This avoids any polygon rasterization — the gear is defined by distance-to-feature inequalities evaluated per-cell.
-*Files: `artistic/gear.c`*
+*Files: `physics/gear.c`*
 
 ---
 
@@ -2222,7 +2221,7 @@ X[k+N/2] = E[k] − W_N^k · O[k]
 The iterative bottom-up implementation avoids stack overhead. Input samples are reordered by bit-reversal permutation first (so index `n` appears at position `bit_reverse(n)`), then the butterfly stages process groups of increasing span `m = 2, 4, 8, …, N`. Complexity: O(N log₂ N) vs O(N²) for the naive DFT — for N=256 that is 2048 vs 65536 multiplications.
 
 Only the first N/2 bins are displayed (the upper half are complex conjugates of the lower half for real-valued inputs — the Nyquist theorem). Bin `k` represents frequency `k·f_sample/N`. Adding a pure sine of frequency `f` to the signal produces a spike at bin `f` — the DFT is linear, so a sum of three sines produces three spikes. Spectral leakage appears when a sine frequency falls between two bins: energy "leaks" into adjacent bins and the spike becomes a wide lobe. Multiplying the input by a window function (Hann, Hamming) reduces leakage at the cost of frequency resolution.
-*Files: `artistic/fft_vis.c`*
+*Files: `signal/fft_vis.c`*
 *References: Cooley & Tukey, "An algorithm for the machine calculation of complex Fourier series" *Math. Comp.* 19 (1965); Oppenheim & Schafer, "Discrete-Time Signal Processing" 3e ch. 9.*
 
 ---
@@ -2238,7 +2237,7 @@ Z[n] = Σ_{k=0}^{N-1} z[k] · exp(−2πikn/N)
 Reconstruction at time `t ∈ [0,1]` is `z(t) = Σ_n (Z[n]/N)·exp(2πint)` — the sum of N rotating arms. Sorting arms by decreasing amplitude `|Z[n]|` gives the energy-optimal partial approximation: the first `M` arms reconstruct the dominant shape, successive arms add finer detail. Parseval's theorem ensures the cumulative power fraction `Σ_{k=0}^{M} |Z[k]|² / Σ |Z[k]|²` rises monotonically from 0 to 1 as `M` increases.
 
 The Gibbs phenomenon is visible on shapes with sharp corners (squares, arrows): the partial Fourier sum overshoots the true value by approximately 9% at each discontinuity, regardless of how many terms are included. This overshoot does not decrease with more terms — it merely concentrates into a narrower spike. Aspect correction is applied to the `x` coordinates before the DFT so the reconstructed shape appears undistorted on the non-square terminal grid.
-*Files: `artistic/fourier_draw.c`*
+*Files: `signal/fourier_draw.c`*
 
 ---
 
@@ -2258,7 +2257,7 @@ u[t+1][i][j] = 2u[t][i][j] − u[t−1][i][j]
 The CFL stability condition for 2D is `c·dt/dx ≤ 1/√2`. Violating it causes exponential blow-up within a few steps. Only two time levels (`t` and `t−1`) are needed despite the second-order time derivative — the stencil computes `t+1` from both, then the old `t−1` buffer is overwritten with `t+1`.
 
 A sponge (absorbing) boundary layer at the grid edges suppresses reflections that would otherwise create a standing-wave "box mode." Within `BORDER_W` cells of each edge, the damping coefficient ramps up from zero at the interior boundary to a maximum at the wall. This is far simpler to implement than a Perfectly Matched Layer (PML) and sufficient for terminal-resolution wave visualisation. Point sources are driven as `u[row][col] += A·sin(2π·f·t)`, creating circular wave-fronts; multiple sources create interference patterns where constructive and destructive interference alternate spatially.
-*Files: `fluid/wave_2d.c`*
+*Files: `physics/waves.c`*
 *References: Yee, "Numerical solution of initial boundary value problems involving Maxwell's equations in isotropic media" *IEEE Trans. Antennas Propag.* 14 (1966) — the FDTD scheme; Courant, Friedrichs & Lewy, "Über die partiellen Differenzengleichungen der mathematischen Physik" *Math. Ann.* 100 (1928) — the CFL stability condition.*
 
 ---
@@ -2290,7 +2289,7 @@ The FitzHugh-Nagumo equations model excitable media such as cardiac muscle and n
 The cubic term `u³/3` creates the excitation threshold: small perturbations decay back to rest; perturbations above threshold trigger a full spike. The inhibitor `v` rises after each spike (refractory period) and prevents re-excitation — this is why action potentials travel as one-way waves rather than reflecting back. The `ε ≪ 1` timescale ratio makes `v` much slower than `u`, producing the characteristic fast-rise, slow-decay shape of an action potential.
 
 Explicit Euler integration with `STEPS_PER_FRAME = 8` sub-steps maintains the CFL stability condition `DT·D/dx² < 0.25` while displaying at 30 fps. Spiral waves initiate from a broken planar wavefront: create a horizontal wave then make the lower half of the medium refractory. The free end curls into a rotating spiral that sustains itself indefinitely. Two counter-rotating spirals that collide annihilate each other — a direct simulation of cardiac re-entry arrhythmia termination.
-*Files: `fluid/reaction_wave.c`, `fluid/excitable.c`*
+*Files: `fluid/reaction_wave.c`, `procedural/generational/excitable.c`*
 *References: FitzHugh, "Impulses and physiological states in theoretical models of nerve membrane" *Biophys. J.* 1 (1961); Nagumo, Arimoto & Yoshizawa, "An active pulse transmission line simulating nerve axon" *Proc. IRE* 50 (1962); Keener & Sneyd, "Mathematical Physiology" 2e ch. 6.*
 
 ---
@@ -2616,7 +2615,6 @@ The STFT trades frequency resolution for time resolution relative to the full-si
 - AM: `(1 + m·cos(2πfm·t))·cos(2πfc·t)` → carrier at fc + sidebands at fc±fm of amplitude m/2. Visible as three peaks in the spectrogram.
 - FM: `cos(2πfc·t + β·sin(2πfm·t))` → Bessel function sideband amplitudes J_n(β) at fc±n·fm. Large β (wideband FM, β=75) gives many visible sidebands. Small β (narrowband FM) approximates AM.
 
-*Files: `physics/spectrogram_visualizer.c`*
 *References: Allen & Rabiner, "A unified approach to short-time Fourier analysis and synthesis" *Proc. IEEE* 65 (1977); Gabor, "Theory of Communication" *J. IEE* 93 (1946) — the time-frequency uncertainty bound; Harris, "On the use of windows for harmonic analysis" *Proc. IEEE* 66 (1978) — window function catalogue.*
 
 ---
@@ -2665,9 +2663,9 @@ The Laplacian `∇²u` is the spatial second derivative summed over both axes. O
 
 **Initial condition matters.** A pixel-sharp delta excites every wavenumber up to Nyquist; the highest wavenumbers are exactly the unstable modes the discrete Laplacian cannot represent. A Gaussian tap of half-width 2 cells filters them out, giving a clean ring without ringing artifacts.
 
-The `physics/nuke.c` simulation drives a coordinated visual from this single field: ring shockwave (the field itself), terrain heave (per-column displacement reading `u` at the surface row), debris/dust particle pools (spawned at blast and ring-sweep events), screen shake (integer cell offset at the `mvaddch` boundary), full-screen flash (alpha overlay).
+The `fluid/nuke.c` simulation drives a coordinated visual from this single field: ring shockwave (the field itself), terrain heave (per-column displacement reading `u` at the surface row), debris/dust particle pools (spawned at blast and ring-sweep events), screen shake (integer cell offset at the `mvaddch` boundary), full-screen flash (alpha overlay).
 
-*Files: `physics/nuke.c`*
+*Files: `fluid/nuke.c`*
 
 ---
 

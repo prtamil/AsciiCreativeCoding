@@ -29,7 +29,17 @@
 
 ## Overview
 
-> *"All art is quite useless."* — Oscar Wilde
+> *"It is in working within limits that the master reveals himself."* — Goethe
+>
+> *"The enemy of art is the absence of limitations."* — Orson Welles
+>
+> *"The more constraints one imposes, the more one frees oneself."* — Igor Stravinsky
+
+The terminal is the constraint. A character grid, a handful of colors, no
+graphics API to hide behind. Forcing a path tracer or a Navier-Stokes solver
+through 80×24 cells leaves nowhere to bluff — you either understand the math
+well enough to render it as text, or you don't. The restriction is what makes
+the learning go deep.
 
 ---
 

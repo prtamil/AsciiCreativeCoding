@@ -81,12 +81,15 @@ it, which I'm trying to inherit:
 
 These aren't features of the language. They're the spirit it carries.
 
-**Copying is the intended workflow.**
+**No automated build — single-file compilation by design.**
 ```bash
 gcc filename.c -lncurses -lm && ./a.out
 ```
-That is the workflow. No build system, no CMake, no Makefile, no package
-manager. A single file is a single program.
+There is deliberately no build system: no CMake, no Makefile, no package
+manager, no incremental build graph. Each program is one self-contained source
+file compiled directly, and copying a file is the intended way to start a new
+one. Keeping every program independent — rather than wiring them into a shared
+build — is what lets any file be read, compiled, and modified in isolation.
 
 **POSIX terminal only.**
 No Windows, no GUI. Forcing a Navier-Stokes solver or a path tracer through

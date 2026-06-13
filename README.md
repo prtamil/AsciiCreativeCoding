@@ -1,5 +1,9 @@
 # ASCII Creative Coding
 
+<p align="center">
+  <img src="coding.gif" alt="Showcase of ASCII terminal demos" width="100%">
+</p>
+
 ```
  ╔══════════════════════════════════════════════════════════════════════╗
  ║                                                                      ║

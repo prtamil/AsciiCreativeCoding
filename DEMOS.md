@@ -7,7 +7,8 @@ section. **337 programs across 19 top-level folders.**
 
 For a high-level overview by folder, see the **Demos** section in
 [README.md](README.md). For the underlying framework, see
-[documentation/Architecture.md](documentation/Architecture.md).
+[documentation/Framework.md](documentation/Framework.md); for the works each
+program cites, see [documentation/Reference.md](documentation/Reference.md).
 
 Build any single program with:
 

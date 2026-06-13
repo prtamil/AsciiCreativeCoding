@@ -1779,7 +1779,7 @@ If the sleep happens AFTER `doupdate()`, the sleep budget must compensate for un
 
 By sleeping first (measuring only physics computation), the terminal write is "free time" that cannot destabilize the cap.
 
-*Files: all files — the ordering is documented in Architecture.md as a critical correctness property*
+*Files: all files — this sleep-before-I/O ordering is a critical correctness property of the canonical loop (see [Framework.md](Framework.md)).*
 
 ---
 
@@ -2187,4 +2187,4 @@ explicit deviations from it.
 
 ---
 
-*This document is the single reference for all ncurses techniques used across the C files in this project. For fractal algorithms and IFS theory, see Master.md §P and §Q. For the overall loop architecture and subsystem details, see Architecture.md. For color-specific techniques, see COLOR.md. For procedural generation algorithms specifically, see Master.md §X.*
+*This document is the single reference for all ncurses techniques used across the C files in this project. For the canonical loop and framework walkthrough, see [Framework.md](Framework.md). For color-specific techniques, see [COLOR.md](COLOR.md). For the works each demo cites (fractals, IFS, procedural generation, and the rest), see [Reference.md](Reference.md).*

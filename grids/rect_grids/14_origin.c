@@ -63,7 +63,6 @@
  * References     :
  *   Cartesian coordinates — en.wikipedia.org/wiki/Cartesian_coordinate_system
  *   Quadrants — en.wikipedia.org/wiki/Quadrant_(plane_geometry)
- *   Screen-space Y flip — this project's documentation/Architecture.md §4
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

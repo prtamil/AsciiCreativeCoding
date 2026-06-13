@@ -291,8 +291,7 @@ No dynamic allocation after init. Allocate everything in init phase (or BSS via 
 | File | Contents |
 |---|---|
 | `documentation/Authoring.md` | Phase-1 file templates: header, CONCEPTS, MENTAL MODEL, code structure rules |
-| `documentation/Architecture.md` | Framework design, loop mechanics, coordinate model, per-subsystem deep dives |
-| `documentation/Master.md` | Long-form essays on algorithms, physics, visual techniques |
+| `documentation/Reference.md` | Consolidated bibliography — every work cited across the source files, grouped by domain |
 | `documentation/Visual.md` | ncurses field guide — V1–V9, Quick-Reference Matrix, Technique Index |
 | `documentation/COLOR.md` | Color tricks — palettes, escape-time/density coloring, 256-color patterns |
 | `.claude/skills/default-refactor/SKILL.md` | DEFAULT_REFACTOR 3-step doctrine — competent-learner standard; the default for ~80 % of files (auto-invoked by trigger word) |

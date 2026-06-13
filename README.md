@@ -154,25 +154,25 @@ per-program algorithm notes in [DEMOS.md](DEMOS.md).
 
 | Folder | Files | Summary |
 |--------|------:|---------|
-| `fluid/` | 11 | Stam stable fluids, lattice Boltzmann, FDTD wave, Gray-Scott reaction-diffusion, FitzHugh-Nagumo excitable medium, SPH, falling sand, vorticity-streamfunction, CFL stability explorer |
-| `physics/` | 33 | Lorenz / N-body / cloth / Ising / Schrödinger; Schwarzschild black hole; quaternion gyroscope; PBD chains; rigid-body, soft-body; Barnes-Hut O(N log N) gravity; mass-spring lattice; CG and multigrid visualisers; RK1/2/4 comparison |
-| `procedural/` | 82 | Six sub-folders: chaos (12), fields (13), fractals (17), generational (25), patterns (6), worldgen (9) — Mandelbrot / Julia / Buddhabrot / Newton; Barnsley IFS; DLA; Lyapunov; logistic; Apollonian; L-systems; Lorenz; Truchet/Wang/quasicrystal/Penrose; star fields, galaxies, hydraulic erosion, fBm clouds |
+| `fluid/` | 11 | Stam stable fluids, FHP lattice gas, SPH, Gray-Scott reaction-diffusion, FitzHugh-Nagumo excitable medium, shallow-water & vorticity-streamfunction solvers, Perlin/complex flow fields, volumetric mushroom-cloud (`nuke`), CFL stability explorer |
+| `physics/` | 33 | Lorenz / N-body / cloth / Ising / Schrödinger; Schwarzschild black hole; quaternion gyroscope; PBD chains & soft bodies; rigid-body stacks; Barnes-Hut O(N log N) gravity; D2Q9 lattice Boltzmann; bubble chamber, beam bending, stroke engine, gear, Chladni cymatics; CG / multigrid / RK-comparison solvers |
+| `procedural/` | 82 | Six sub-folders: chaos (12), fields (13), fractals (17), generational (25), patterns (6), worldgen (9) — Mandelbrot/Julia/Buddhabrot/Newton, Barnsley IFS, DLA, Lyapunov, Apollonian, L-systems; Perlin/simplex/worley/value noise, curl-noise, SDF/JFA fields; Game of Life & rule variants, Langton, WFC, mazes (backtracker/Wilson), Wa-Tor, sandpile; Truchet/Wang/quasicrystal/Penrose tilings; star fields, galaxies, plate tectonics, hydraulic erosion, fBm clouds & cities |
 | `grids/` | 76 | Four families (rect/hex/tri/polar) × *drawing* + *placement*. Triangular covers regular tilings (1–6), recursive fractals (7–9), aperiodic substitution (10, 12), and Delaunay (11). See [grids/README.md](grids/README.md) |
-| `raster/` | 14 | Software rasteriser: cube/sphere/torus, deferred pipeline, shadow mapping, SSAO, bloom, neon edges, marching cubes, Mandelbulb raster, the spinning ASCII donut |
+| `raster/` | 14 | Software rasteriser: cube/sphere/torus, displacement mesh, wireframe; deferred pipeline, shadow mapping, SSAO, bloom, neon edges; marching cubes, Mandelbulb raster, screen-space sun, the spinning ASCII donut |
 | `raymarcher/` | 8 | Sphere tracing on SDFs: primitives, CSG atlas, blend/twist/repeat composition gallery, metaballs, KIFS fractal, Mandelbulb |
-| `raytracing/` | 10 | Analytic ray↔primitive: sphere/cube/torus/capsule; tunnel, forest god rays, solar eclipse, ringed Saturn; Cornell-box Monte Carlo path tracer |
-| `artistic/` | 23 | Aesthetic effects: galaxy, aurora, nebula, plasma, lava lamp; Hindu / Islamic geometric mandalas; volcano, fire tornado, hurricane, phoenix; dune rocket & sandworm; bonsai, jellyfish, DNA helix, leaf fall, sand art, LED / particle number-morph, railway transit map, ray swarm |
-| `animation/` | 14 | Forward + inverse kinematics, ragdoll, Verlet ropes, easing curves, snake / centipede / tentacle / medusa |
-| `flocking/` | 7 | Reynolds boids, shepherd herding, crowd steering, faction battle, ant-colony pheromone, predator-prey, Physarum slime mould |
-| `robots/` | 4 | Hexapod tripod gait, biped, spring-leg jumper, self-balancing Perlin-terrain bot |
-| `algorithms/` | 11 | Quadtree / k-d / BSP; convex hull, Voronoi, visibility; BFS/DFS/A\*; sort visualiser; SIR epidemic |
+| `raytracing/` | 10 | Analytic ray↔primitive: sphere/cube/torus/capsule; tunnel, forest & window god rays, solar eclipse, ringed Saturn; Cornell-box Monte Carlo path tracer |
+| `artistic/` | 23 | Aesthetic effects: galaxy, aurora, nebula, plasma, lava lamp; Hindu / Islamic geometric mandalas; volcano, fire tornado, hurricane, phoenix; dune rocket & sandworm; bonsai, jellyfish, DNA helix, leaf fall, sand art, LED / particle number-morph, railway transit map, ray swarm, bat colony |
+| `animation/` | 14 | Forward & inverse kinematics (analytical 2-link + FABRIK); hexapod tripod gait, spider, scorpion; ragdoll figure & Verlet ropes; snake (FK & IK), centipede, tentacle forest |
+| `flocking/` | 7 | Reynolds boids & 800-bird murmuration, shepherd herding, crowd steering, two-faction battle, digit-forming swarm, Physarum slime mould |
+| `robots/` | 4 | Differential-drive robot, spring-leg pogo jumper, procedural biped walker, self-balancing Perlin-terrain bot |
+| `algorithms/` | 11 | Quadtree / k-d / BSP trees; convex hull, Voronoi, visibility polygon; BFS/DFS/A\* graph search; sort visualiser; marching squares; SIR small-world epidemic |
 | `geometry/` | 4 | Lissajous, spirograph, Maurer rose, Delaunay triangulation |
-| `signal/` | 10 | DFT, FFT, IDFT, convolution, sampling, time-domain filters, 2-D Fourier |
-| `particle_systems/` | 18 | Fire (3 algos), smoke, fireworks, kaboom shockwave, fountain, comet, rain, snow, constellation network |
-| `matrix_rain/` | 5 | Classic Matrix rain + snowflake / pulsar / sun-mask / freeze variants |
+| `signal/` | 10 | Naive DFT / Cooley-Tukey FFT / IDFT, epicycle Fourier drawing & shapes, convolution, FIR filter design, aliasing/Nyquist, spectrogram |
+| `particle_systems/` | 18 | Fire (3 algos) & aalib port, smoke, embers, sparks, fireworks, kaboom shockwave, burst, fountain, comet, rain, snow, falling sand, curl-noise & vortex fields, pixel-dissolve text, generic particle engine, constellation network |
+| `matrix_rain/` | 5 | Classic Matrix rain + snowflake-accumulation, pulsar-beam, solar-corona, and fireworks-arc variants |
 | `Ai/` | 2 | Genetic Smart Rockets, feed-forward neural-net visualiser |
-| `turtle/` | 1 | Logo-style turtle polygon animator |
-| `ncurses_basics/` | 4 | Framework reference programs |
+| `turtle/` | 1 | Dual-turtle Logo-style polygon animator |
+| `ncurses_basics/` | 4 | Framework reference: animation template, key generator, aspect-ratio & terminal-size probes |
 
 ---
 
@@ -193,15 +193,20 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c         -o raymarcher    
 
 ## Keys (Common)
 
+Conventions shared across most demos. Not every program uses every key — each
+one's bottom HUD line lists its exact controls.
+
 | Key | Action |
 |-----|--------|
 | `q` / `ESC` | quit |
-| `p` | pause / resume |
-| `r` | reset |
-| `+` / `-` | increase / decrease primary parameter |
-| Arrow keys | move / steer (where applicable) |
-| `1`–`5` | switch preset / mode |
-| `Space` | trigger event / advance state |
+| `Space` | pause / resume (or trigger an event in effect demos) |
+| `r` | reset / reseed |
+| `+` / `-` | increase / decrease the primary parameter |
+| `t` / `T` | cycle colour theme (forward / back) |
+| `n` / `N` | cycle pattern / preset |
+| `g` / `G` | cycle glyph set (pattern demos) |
+| Arrow keys / `hjkl` | move or steer cursor / camera |
+| `1`–`9` | jump directly to a preset or mode |
 
 ---
 
@@ -210,16 +215,12 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c         -o raymarcher    
 - [CLAUDE.md](CLAUDE.md) — full project conventions: section maps, comment
   standards, CONCEPTS / MENTAL MODEL block format, build rules
 - [DEMOS.md](DEMOS.md) — per-program algorithm notes
-- [documentation/Architecture.md](documentation/Architecture.md) — the
-  recurring techniques and patterns explained in plain language (the
-  fixed-timestep loop, particle pools, cellular automata, fields/PDEs, noise,
-  raymarching, rasterisation, raytracing, kinematics, preset tables)
+- [documentation/Reference.md](documentation/Reference.md) — consolidated
+  bibliography: every paper, book, and article cited across the source files,
+  grouped by domain so each section doubles as a reading list
 - [documentation/Framework.md](documentation/Framework.md) — line-by-line
   beginner's guide to the canonical animation framework
   (`ncurses_basics/framework.c`)
-- [documentation/Master.md](documentation/Master.md) — every technique used
-  in the project explained from first principles, with source files and
-  canonical references
 - [documentation/Visual.md](documentation/Visual.md) — ncurses field guide
 - [documentation/COLOR.md](documentation/COLOR.md) — palettes, escape-time
   colouring, 256-colour patterns

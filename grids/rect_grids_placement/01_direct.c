@@ -54,7 +54,6 @@
  *
  * References     :
  *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
- *   Grid coordinate systems — this project documentation/Architecture.md §4
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

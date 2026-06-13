@@ -57,7 +57,6 @@
  *
  * References     :
  *   Cartesian coordinate system — en.wikipedia.org/wiki/Cartesian_coordinate_system
- *   Terminal grid model — this project's documentation/Architecture.md §4
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

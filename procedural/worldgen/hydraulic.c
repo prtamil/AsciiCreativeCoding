@@ -1373,8 +1373,7 @@ static void color_init(void)
  *
  * WHY  This is the project's ONE coordinate bridge: map cell (x,y) draws at
  *       terminal (gy0 + y, gx0 + x), computed in exactly one place so no
- *       renderer hand-rolls the offset (see documentation/Architecture.md,
- *       coordinate model). map_w/map_h are clamped to [16..MAP_W_MAX] ×
+ *       renderer hand-rolls the offset. map_w/map_h are clamped to [16..MAP_W_MAX] ×
  *       [8..MAP_H_MAX]: the upper bound stops a huge terminal from indexing
  *       past the static CELLS_MAX store; the lower keeps a tiny one usable.
  *       Rows 0–1 are the HUD and the last row the hint line, so gy0 starts at

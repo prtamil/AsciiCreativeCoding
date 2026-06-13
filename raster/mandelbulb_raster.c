@@ -731,8 +731,8 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
 }
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
-  Vec3 r = v3_norm(v3(f.z * up.y - f.y * up.z, f.x * up.z - f.z * up.x,
-                      f.y * up.x - f.x * up.y));
+  Vec3 r = v3_norm(v3(f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
+                      f.x * up.y - f.y * up.x));
   Vec3 u =
       v3(r.y * f.z - r.z * f.y, r.z * f.x - r.x * f.z, r.x * f.y - r.y * f.x);
   Mat4 m = m4_identity();
@@ -1115,7 +1115,8 @@ static Mesh tessellate_mandelbulb(float power) {
   }
 
   /* Step 2 — stitch quads from valid neighbouring grid vertices.
-   * CCW winding matches cube_raster.c (area > 0 = front face). */
+   * CCW winding matches cube_raster.c (after the Y-flip, front faces have
+   * area < 0; the cull keeps area < 0). */
   for (int i = 0; i < NLAT - 1; i++) {
     for (int j = 0; j < NLON; j++) {
       int j1 = (j + 1) % NLON;
@@ -1310,10 +1311,11 @@ static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
       sz[vi] = vo[vi].clip_pos.z / w;
     }
 
-    /* back-face cull */
+    /* back-face cull: front faces (CCW from outside) have NEGATIVE screen
+     * area after the Y-flip, so keep area < 0 and cull area >= 0. */
     float area =
         (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (cull_backface && area <= 0.f)
+    if (cull_backface && area >= 0.f)
       continue;
 
     /* bounding box */

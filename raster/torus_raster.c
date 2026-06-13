@@ -696,8 +696,8 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
 
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
-  Vec3 r = v3_norm((Vec3){f.z * up.y - f.y * up.z, f.x * up.z - f.z * up.x,
-                          f.y * up.x - f.x * up.y});
+  Vec3 r = v3_norm((Vec3){f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
+                          f.x * up.y - f.y * up.x});
   Vec3 u = (Vec3){r.y * f.z - r.z * f.y, r.z * f.x - r.x * f.z,
                   r.x * f.y - r.y * f.x};
   Mat4 m = m4_identity();
@@ -1125,24 +1125,55 @@ static void color_init(void) {
 }
 
 /*
- * luma_to_cell — convert [0,1] luminance to a terminal Cell.
- *
- * Step 1 — Bayer 4×4 ordered dither:
- *   Adds a position-dependent threshold offset so gradients render
- *   as spatial density rather than abrupt luminance steps.
- *   The dither amplitude (0.15) is tuned to be visible but not noisy.
- *
- * Step 2 — Paul Bourke ramp:
- *   Maps dithered luma linearly into k_bourke[].
- *   Low luma → sparse character (space, dot).
- *   High luma → dense character (#, @).
- *
- * Step 3 — color pair:
- *   Bright regions get warmer color pairs (reds/yellows).
- *   Dark regions get cooler pairs (blues/magentas).
- *   This replicates the color gradient from raymarching_primitives.c.
+ * hue_to_pair — nearest of the 7 palette hues (pairs 1..7: red, orange,
+ * yellow, green, cyan, blue, magenta) for a colour. Returns -1 when the colour
+ * is too desaturated to have a meaningful hue (caller falls back to the luma
+ * ramp) — e.g. the near-white wireframe fragments.
  */
-static Cell luma_to_cell(float luma, int px, int py) {
+static int hue_to_pair(Vec3 c) {
+  float mx = fmaxf(c.x, fmaxf(c.y, c.z));
+  float mn = fminf(c.x, fminf(c.y, c.z));
+  float chroma = mx - mn;
+  if (chroma < 0.08f)
+    return -1;
+  float h;
+  if (mx == c.x)
+    h = 60.f * fmodf((c.y - c.z) / chroma, 6.f);
+  else if (mx == c.y)
+    h = 60.f * ((c.z - c.x) / chroma + 2.f);
+  else
+    h = 60.f * ((c.x - c.y) / chroma + 4.f);
+  if (h < 0.f)
+    h += 360.f;
+  static const float pal[7] = {0.f, 30.f, 60.f, 120.f, 180.f, 240.f, 300.f};
+  int best = 0;
+  float bd = 1e9f;
+  for (int i = 0; i < 7; i++) {
+    float d = fabsf(h - pal[i]);
+    if (d > 180.f)
+      d = 360.f - d;
+    if (d < bd) {
+      bd = d;
+      best = i;
+    }
+  }
+  return best + 1;
+}
+
+/*
+ * rgb_to_cell — convert a fragment COLOUR to a terminal Cell.
+ *
+ * GLYPH  — from luminance: Bayer 4×4 ordered dither (amplitude 0.15 hides
+ *          banding) → Paul Bourke ramp (sparse '.' → dense '@').
+ * COLOUR — from the fragment's HUE (hue_to_pair). This is the key to the
+ *          shader cycle reading distinctly: frag_normals maps direction → RGB,
+ *          so it renders as a rainbow, while frag_phong is the single material
+ *          hue. Desaturated fragments fall back to the luma ramp (warm→cool).
+ *          (Previously this used luminance alone, so every shader collapsed to
+ *          the same brightness ramp and normals looked identical to phong.)
+ */
+static Cell rgb_to_cell(Vec3 col, int px, int py) {
+  float luma = 0.2126f * col.x + 0.7152f * col.y + 0.0722f * col.z;
   float thr = k_bayer[py & 3][px & 3];
   float d = luma + (thr - 0.5f) * 0.15f;
   d = d < 0.f ? 0.f : d > 1.f ? 1.f : d;
@@ -1150,9 +1181,12 @@ static Cell luma_to_cell(float luma, int px, int py) {
   int idx = (int)(d * (BOURKE_LEN - 1));
   char ch = k_bourke[idx];
 
-  int cp = 1 + (int)(d * 6.f);
-  if (cp > 7)
-    cp = 7;
+  int cp = hue_to_pair(col);
+  if (cp < 0) {
+    cp = 1 + (int)(d * 6.f); /* desaturated → luma ramp (warm→cool) */
+    if (cp > 7)
+      cp = 7;
+  }
   bool bold = d > 0.6f;
   return (Cell){ch, cp, bold};
 }
@@ -1342,9 +1376,7 @@ static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
         if (fsout.discard)
           continue;
 
-        float luma = 0.2126f * fsout.color.x + 0.7152f * fsout.color.y +
-                     0.0722f * fsout.color.z;
-        fb->cbuf[idx] = luma_to_cell(luma, px, py);
+        fb->cbuf[idx] = rgb_to_cell(fsout.color, px, py);
       }
     }
   }

@@ -615,7 +615,9 @@ enum {
 
 /* §1.6 lighting — sun direction is universal; sun colour, ambient,
  * rim strength, and ball palette all come from the active theme below. */
-static const float SUN_DIR[3] = {-0.55f, -0.85f, 0.30f};
+/* key light in FRONT (negative z) so camera-facing faces are lit; was +z
+ * (behind), which only looked right under the old flipped m4_lookat. */
+static const float SUN_DIR[3] = {-0.55f, -0.85f, -0.30f};
 #define SHININESS 18.0f
 #define SPEC_GAIN 0.28f
 #define RIM_POWER 2.5f /* falloff exponent for rim/Fresnel */
@@ -835,8 +837,8 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
 
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
-  Vec3 r = v3_norm(v3(f.z * up.y - f.y * up.z, f.x * up.z - f.z * up.x,
-                      f.y * up.x - f.x * up.y));
+  Vec3 r = v3_norm(v3(f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
+                      f.x * up.y - f.y * up.x));
   Vec3 u =
       v3(r.y * f.z - r.z * f.y, r.z * f.x - r.x * f.z, r.x * f.y - r.y * f.x);
   Mat4 m = m4_identity();

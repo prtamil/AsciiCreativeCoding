@@ -785,8 +785,8 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
 
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
-  Vec3 r = v3_norm(v3(f.z * up.y - f.y * up.z, f.x * up.z - f.z * up.x,
-                      f.y * up.x - f.x * up.y));
+  Vec3 r = v3_norm(v3(f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
+                      f.x * up.y - f.y * up.x));
   Vec3 u =
       v3(r.y * f.z - r.z * f.y, r.z * f.x - r.x * f.z, r.x * f.y - r.y * f.x);
   Mat4 m = m4_identity();
@@ -1346,6 +1346,14 @@ static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
         vo[vi].custom[0] = wu[vi];
         vo[vi].custom[1] = wv[vi];
         vo[vi].custom[2] = 1.f - wu[vi] - wv[vi];
+        /* Suppress the shared quad diagonal so the wireframe shows real cube
+         * edges only. mesh_add_quad splits each face into tris (0,1,2)+(0,2,3);
+         * the diagonal is edge v0-v2 = custom[1]≈0 in the first tri, custom[2]≈0
+         * in the second. Inflate that channel so frag_wire never draws it. */
+        if (ti & 1)
+          vo[vi].custom[2] += 10.f;
+        else
+          vo[vi].custom[1] += 10.f;
       }
     }
 
@@ -1366,10 +1374,12 @@ static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
       sz[vi] = vo[vi].clip_pos.z / w;
     }
 
-    /* (4) Back-face cull (after Y-flip, CCW = positive area). */
+    /* (4) Back-face cull. After the Y-flip a front face (CCW from outside)
+     * has NEGATIVE screen-space signed area, so we keep area < 0 and cull
+     * area >= 0 (back faces + zero-area degenerates). */
     float area =
         (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (cull_backface && area <= 0.f)
+    if (cull_backface && area >= 0.f)
       continue;
 
     /* (5) Screen-space bounding box (clamped to framebuffer). */

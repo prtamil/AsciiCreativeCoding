@@ -592,7 +592,10 @@ enum {
  * AO scales the AMBIENT term only. Make ambient bright enough that
  * the AO darkening is visible against the lit surface. The sun is
  * direct and unaffected by AO. */
-static const float SUN_DIR[3] = {-0.55f, -0.85f, 0.30f};
+/* Key light: above, slightly to one side, and IN FRONT (negative z) so the
+ * camera-facing faces are lit. (Was +z — behind the structure — which only
+ * looked right under the old flipped m4_lookat; the camera saw the back.) */
+static const float SUN_DIR[3] = {-0.55f, -0.85f, -0.30f};
 static const float SUN_COL[3] = {0.95f, 0.85f, 0.65f};
 static const float AMBIENT_COL[3] = {0.46f, 0.50f, 0.56f};
 #define SHININESS 24.0f
@@ -770,8 +773,11 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
 
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
-  Vec3 r = v3_norm(v3(f.z * up.y - f.y * up.z, f.x * up.z - f.z * up.x,
-                      f.y * up.x - f.x * up.y));
+  /* right = f × up (gluLookAt convention). Using up × f here negates BOTH
+   * right and up — a 180° roll that renders the scene upside-down and
+   * mirrored (world +y maps to the bottom of the screen). */
+  Vec3 r = v3_norm(v3(f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
+                      f.x * up.y - f.y * up.x));
   Vec3 u =
       v3(r.y * f.z - r.z * f.y, r.z * f.x - r.x * f.z, r.x * f.y - r.y * f.x);
   Mat4 m = m4_identity();
@@ -1118,10 +1124,12 @@ static void rasterize_object(const Mesh *mesh, Vec3 albedo, Mat4 mvp,
       sz[vi] = clip[vi].z / w;
     }
 
-    /* Back-face cull: positive screen-space area = CCW = front. */
+    /* Back-face cull. Meshes are wound CCW-as-seen-from-outside; the Y-flip
+     * in the screen mapping above makes a front face's signed area NEGATIVE,
+     * so we keep area < 0 and cull the back faces (area >= 0). */
     float area =
         (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (area <= 0.f)
+    if (area >= 0.f)
       continue;
 
     int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));

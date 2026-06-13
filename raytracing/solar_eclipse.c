@@ -1,4 +1,2506 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <math.h>
+#include <ncurses.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* ── §0 TYPES — forward type declarations (V3 / RGB)
+ * ────────────────────────────────────────────────── *
+ *
+ * V3 (a 3-D float vector) and RGB (three colour channels) are declared
+ * here — at the very top — because §1.16 (the stellar-classes table)
+ * embeds RGB literals when set up with explicit colour fields, and
+ * because keeping these definitions early lets the rest of the file
+ * use them anywhere. The math operators that consume V3 / RGB live in
+ * §3; only the type tags appear here.
+ *
+ * No methods, no constructors — these are POD bags of three floats.
+ * Throughout the file V3 represents a position OR a direction (the
+ * difference is which one the variable name describes), and RGB
+ * represents an HDR colour (channels can exceed 1.0 — tone-mapping
+ * happens in §5).
+ * Ref: Shirley, "Ray Tracing in One Weekend"; Foley & van Dam (vectors);
+ *      PBR radiometry (RGB as linear HDR radiance).
+ */
+
+typedef struct {
+  float x, y, z; /* position OR direction in world space   */
+} V3;
+typedef struct {
+  float r, g, b; /* linear HDR colour (tone-mapped in §5)   */
+} RGB;
+
+/* ── §1 CONFIG — constants, ramp, enums (data only)
+ * ────────────────────────────────────────────────── *
+ *
+ * Every tunable in the simulation is a named #define here, with a
+ * comment explaining what it controls and what changes when you nudge
+ * it. The §1 sub-sections below mirror the GUIDED TUTORIAL topics —
+ * if you've read Tutorial 6 (transmittance LUT), §1.8's LUT_SIZE is
+ * the parameter you'd touch.
+ *
+ * No magic numbers anywhere else in this file. If you find one in §11
+ * or further down, it's a bug — please rename and move it here.
+ */
+
+/* §1.1 frame-rate and orbit-speed knobs.
+ *
+ * The main loop runs a fixed-timestep simulation tick at SIM_FPS_DEFAULT
+ * Hz, decoupled from the render rate. Pressing ] / [ adjusts the tick
+ * rate at runtime; +/- multiplies / divides the orbital speed of the
+ * moon (so you can dial in slow motion at a totality boundary).
+ *
+ * SPEED_DEF is the baseline — 1× orbit; SPEED_MAX is 8× faster than
+ * that, SPEED_MIN is 1/8×. The scale is multiplicative.
+ */
+enum {
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 30,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
+
+  SPEED_MIN = 1,
+  SPEED_DEF = 8,
+  SPEED_MAX = 64,
+};
+
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
+#define DT_CAP_NS (100 * NS_PER_MS) /* spiral-of-death guard */
+
+/* §1.2 view geometry and zoom.
+ *
+ * FOV_H_BASE is tan(half horizontal field of view). The effective FOV
+ * during rendering is `FOV_H_BASE / zoom` — larger zoom → smaller FOV
+ * → bigger objects on screen. ASPECT_Y compensates for terminal cells
+ * being roughly twice as tall as wide, so spheres render round.
+ *
+ * At zoom = 1, with the geometry below (sun_R = 3.5, sun_Z = 50), the
+ * sun's apparent angular radius is ~7% of the screen half-width — a
+ * compact, vivid disc. Zooming to 4× or 8× brings totality details
+ * (chromosphere ring, prominences, beads) into focus.
+ */
+#define ASPECT_Y 2.0f
+#define FOV_H_BASE 0.40f
+#define ZOOM_MIN 0.25f
+#define ZOOM_MAX 8.0f
+#define ZOOM_STEP 1.25f
+
+/* §1.3 scene geometry — sun far, moon close.
+ *
+ * Apparent angular radii at default geometry:
+ *   sun_α   = atan(SUN_R  / SUN_Z ) = atan(3.5 / 50.0) ≈ 4.0°
+ *   moon_α  = atan(0.62  / 5.0)    ≈ 7.1°
+ *   ratio   = moon_α / sun_α       ≈ 1.76
+ *
+ * Setting moon clearly larger than sun (1.76×) makes totality read
+ * unambiguously: the moon's silhouette dominates, with corona visible
+ * in a halo around it. Were the ratio close to 1 the eye would read
+ * the bright sun + corona as one disc and the moon as a small dark
+ * intrusion — visually wrong.
+ *
+ * Three pattern-specific moon sizes are predefined; pattern_set
+ * (§12.2) picks one when n / p is pressed. The user-controlled
+ * `moon_scale` (in Scene, §12.1) multiplies on top of these.
+ *
+ * MOON_ORBIT_X_FRAC controls how far the moon swings horizontally —
+ * the full orbit reaches MOON_ORBIT_X_FRAC × (sun_α + moon_α) on
+ * either side of centre. Setting it < 1 gives a near-miss; 1.5 gives
+ * a clean enter/exit cycle.
+ */
+#define SUN_Z 50.0f
+#define SUN_R 3.5f
+#define MOON_Z 5.0f
+#define MOON_BASE_R_TOTAL 0.62f
+#define MOON_BASE_R_ANNULAR 0.32f
+#define MOON_BASE_R_TRANSIT 0.04f
+
+#define MOON_SCALE_MIN 0.5f
+#define MOON_SCALE_MAX 2.0f
+#define MOON_SCALE_STEP 1.10f
+
+#define ECLIPSE_PERIOD_S 30.0f
+#define MOON_ORBIT_X_FRAC 1.5f
+#define PARTIAL_Y_OFFSET 0.025f
+
+/* §1.4 corona scattering coefficient.
+ *
+ * The corona's electron density falls roughly as r^(-2.5) (the K-corona
+ * power law) — we use 3.0 here for a slightly steeper falloff that
+ * keeps the visible glow tight to the limb. CORONA_SIGMA0 is σ at
+ * exactly r = R_sun (the photospheric boundary). CORONA_REACH bounds
+ * the medium: outside r > REACH·R_sun, σ ≡ 0 and the path tracer can
+ * coarse-stride harmlessly.
+ *
+ * Real-world coronal optical depth across one solar radius is ~10^-9.
+ * For an LDR ASCII display we scale all σ values up by a uniform
+ * representational factor so τ along visible chords lands in the
+ * [0.05, 0.6] range — this is a display scaling, not a physics hack;
+ * the radial decay shape stays correct.
+ */
+#define CORONA_REACH 8.0f
+#define CORONA_SIGMA0 0.18f
+#define CORONA_DECAY 3.0f
+
+/* §1.5 chromosphere shell.
+ *
+ * The chromosphere is a thin layer above the photosphere — real-world
+ * thickness ~0.3% of R_sun, we use 2.5% so it's visible at low
+ * resolution. CHROMOS_SIGMA0 is its peak σ (much higher than corona's
+ * — chromosphere is optically thick at Hα core).
+ *
+ * Outer edge falls off as (1 − h)⁴ where h = (r − R_sun) / thickness ∈
+ * [0,1] — sharper than a quadratic, reads as a thin band rather than
+ * a soft glow.
+ */
+#define CHROMOS_THICK 0.025f
+#define CHROMOS_SIGMA0 6.0f
+
+/* §1.6 chromosphere spicule fBm.
+ *
+ * Spicules are radial jet-like structures in the chromosphere (~tens
+ * of thousands of them on the real sun). We approximate the texture
+ * by sampling 2-D fBm in spherical surface coordinates (theta, phi).
+ * The patches extend radially through the thin shell, producing
+ * visible streak-like texture rather than a smooth ring.
+ *
+ *   spicule_factor = SPICULE_BASE + SPICULE_AMP · fBm(phi · 12,
+ *                                                     theta · 6)
+ *
+ * The factor multiplies chromos_emission. Hot peaks (high fBm) shift
+ * the Hα colour toward yellow for thermal variation.
+ */
+#define SPICULE_FREQ_PHI 12.0f
+#define SPICULE_FREQ_TH 6.0f
+#define SPICULE_BASE 0.5f
+#define SPICULE_AMP 1.2f
+
+/* §1.7 prominences — dense Hα loops.
+ *
+ * Prominences are arcs of cool dense plasma rooted in the chromosphere.
+ * We place PROM_COUNT of them at random angular positions per seed,
+ * each with its own height (up to PROM_HEIGHT × R_sun above the
+ * photosphere) and lateral angular width. Their density adds onto the
+ * chromosphere shell — they are NOT spherically symmetric, so they
+ * don't contribute to the radial transmittance LUT (only to the
+ * additive emission term).
+ */
+#define PROM_COUNT 5
+#define PROM_HEIGHT 0.18f
+#define PROM_LATERAL 0.18f
+#define PROM_SIGMA0 8.0f
+
+/* §1.8 path tracer parameters.
+ *
+ * MARCH_STEPS is the budget of fine-step samples between t=0 and
+ * t_max (per pixel). Adaptive marching uses these inside the corona's
+ * radial extent and 4× coarser strides outside; the 96 fine-step
+ * count gives Δt ≈ 0.83 in world units when t_max ≈ 80, which is
+ * fine enough to step into the chromosphere shell (thickness 0.125)
+ * with at least one sample inside.
+ *
+ * IN_SCATTER_GAIN scales corona radiance to the LDR display range
+ * (real corona is ~10⁶× dimmer than photosphere; we compress that to
+ * a factor of ~14 so Reinhard maps it to visibly distinct cells).
+ *
+ * SUN_EMIT_HDR is the photosphere radiance multiplier: high enough
+ * that even after eye-ray extinction (T ≈ 0.6) the photosphere
+ * saturates the tone-map at the disc centre.
+ *
+ * HA_EMIT_GAIN does the same job for chromosphere and prominence Hα
+ * line emission — relative to corona scatter.
+ *
+ * LUT_SIZE / LUT_R_MAX define the radial transmittance table. 256
+ * samples from R_sun to (REACH+2)·R_sun is plenty given the smooth
+ * power-law σ — bilinear interpolation has sub-cell accuracy.
+ */
+#define MARCH_STEPS 96
+#define MARCH_T_MAX (SUN_Z + SUN_R * 6.0f)
+#define LUT_SIZE 256
+#define LUT_R_MAX (SUN_R * (CORONA_REACH + 2.0f))
+#define IN_SCATTER_GAIN 14.0f
+#define SUN_EMIT_HDR 8.0f
+#define HA_EMIT_GAIN 3.0f
+#define MARCH_COARSE_MULT                                                      \
+  4.0f /* coarse step = 4x fine outside corona reach    */
+#define CORONA_FINE_MARGIN                                                     \
+  0.5f /* extra R_sun margin: keep chromosphere fine    */
+#define TRANSMITTANCE_CUTOFF                                                   \
+  1e-3f                   /* stop the march when this little light remains */
+#define DENSITY_EPS 1e-6f /* skip scatter+emission below this density      */
+#define VIS_EPS 1e-4f     /* skip in-scatter below this sun-disc fraction  */
+
+/* §1.9 eye-adaptation gate.
+ *
+ * Multiplier applied to corona and chromosphere emission. Computed
+ * once per frame from the camera's view of the sun:
+ *
+ *   gate = CORONA_GATE_FLOOR + CORONA_GATE_RANGE · (1 − vis_cam_sun)
+ *
+ * FLOOR=0 means no halo on an unblocked sun (this file). FLOOR=0.15
+ * preserves a faint baseline glow always — change one constant to
+ * switch behaviour. See Tutorial 10.
+ */
+#define CORONA_GATE_FLOOR 0.00f
+#define CORONA_GATE_RANGE 1.00f
+
+/* §1.10 surface BRDF parameters.
+ *
+ * LIMB_AMBIENT and LIMB_GAIN parameterise the photosphere's Eddington-
+ * style limb darkening: I(μ) = AMBIENT + GAIN · μ where μ = N · V is
+ * the cosine of the view angle. The disc edge (μ ≈ 0) reads at 40% of
+ * the central brightness — close to real solar physics.
+ *
+ * Moon is Lambertian with a low albedo (lunar Bond albedo ≈ 0.12).
+ * EARTH_ALBEDO_BLUE is the blue channel of the Earth's averaged
+ * Rayleigh-tinted reflectance — the cool-blue tint the moon picks up
+ * via earthshine. EARTHSHINE_GAIN scales the constant ambient term we
+ * apply.
+ */
+#define LIMB_AMBIENT 0.40f
+#define LIMB_GAIN 0.60f
+#define MOON_ALBEDO 0.12f
+#define EARTH_ALBEDO_BLUE 0.45f
+#define EARTHSHINE_GAIN 0.10f
+
+/* §1.11 lunar terrain — Bailey's-bead silhouette perturbation.
+ *
+ * Two scales of valleys:
+ *   • 14 macro valleys, ~2% deep, 0.06 rad wide, ASYMMETRIC.
+ *     One per seed gets a 2.5× depth boost (the diamond ring).
+ *   • 30 micro valleys, ~1% deep, 0.025 rad wide, SYMMETRIC.
+ *
+ * Both bake into a single 512-entry angular LUT once per seed. Bigger
+ * LUT size resolves narrow micro valleys without bilinear blur.
+ *
+ * The asymmetry: each macro valley has a per-seed coin-flip choosing
+ * which side is sharp (narrower Gaussian) and which is gradual. Beads
+ * "pop in" sharply on the sharp side and fade out on the gradual side,
+ * mimicking real mountain shadows.
+ */
+#define LUNAR_VALLEY_COUNT 14
+#define LUNAR_VALLEY_DEPTH 0.020f
+#define LUNAR_VALLEY_WIDTH 0.06f
+#define LUNAR_VALLEY_ASYM 0.45f
+#define LUNAR_DIAMOND_BOOST 2.5f
+
+#define LUNAR_MICRO_COUNT 30
+#define LUNAR_MICRO_DEPTH 0.010f
+#define LUNAR_MICRO_WIDTH 0.025f
+
+#define LUNAR_LUT_SIZE 512
+
+/* §1.12 background stars.
+ *
+ * Sparse pinpoint stars visible only during totality (drowned by
+ * photosphere otherwise). Each star samples a blackbody at random
+ * Kelvin in [STAR_K_MIN, STAR_K_MAX], log-uniform — so the field has
+ * the warm-orange to cool-blue colour spread of real stars rather
+ * than uniform white.
+ *
+ * STAR_DENSITY = 250 means roughly 1 star per 250 sky cells; tune
+ * down for a denser field, up for sparser.
+ */
+#define STAR_DENSITY 250
+#define STAR_OCC_VISIBLE 0.85f
+#define STAR_K_MIN 3000.0f
+#define STAR_K_MAX 30000.0f
+#define STAR_LUMA_MAX 0.04f  /* only sprinkle stars on cells dimmer than this  \
+                              */
+#define STAR_BRIGHT_MIN 0.6f /* dimmest star brightness */
+#define STAR_BRIGHT_RANGE                                                      \
+  0.4f /* brightness spread above the minimum           */
+
+/* §1.13 framebuffer dimensions.
+ *
+ * Static — no malloc anywhere in the hot path. BUF_MAX_W/H bound the
+ * per-frame g_buf array; if your terminal is bigger than that you'll
+ * see clipping (rare; 400×200 is generous).
+ */
+#define BUF_MAX_W 400
+#define BUF_MAX_H 200
+
+/* §1.14 ncurses pair IDs and ASCII glyph ramp.
+ *
+ * PAIR_HUD / PAIR_HINT match the project HUD convention. The cube
+ * pairs occupy IDs 16..231 (216 cells of the xterm 6×6×6 cube).
+ *
+ * The density ramp ` .'`,-_:;~=+*oO0` uses only OPEN glyphs — no
+ * filled blocks. Bright cells become points of light, not solid
+ * pixels. `#` and `@` are deliberately absent.
+ */
+enum {
+  PAIR_HUD = 1,
+  PAIR_HINT = 2,
+  PAIR_SUN_FALLBACK = 3,
+  PAIR_EVENT_HOT = 4,
+  PAIR_CUBE_BASE = 16,
+};
+
+static const char k_ramp[] = " .'`,-_:;~=+*oO0";
+#define RAMP_LEN ((int)(sizeof k_ramp - 1))
+
+/* §1.15 patterns enum.
+ *
+ * Four moon-size / orbit-offset configurations. pattern_set (§12.2)
+ * applies the corresponding moon radius and y-offset.
+ */
+typedef enum {
+  PATTERN_TOTAL = 0,   /* moon fully covers the sun → corona + beads      */
+  PATTERN_PARTIAL = 1, /* moon offset in y → a bite out of the disc       */
+  PATTERN_ANNULAR = 2, /* moon smaller than sun → ring of fire            */
+  PATTERN_TRANSIT = 3, /* tiny moon → a dot crossing the disc             */
+  N_PATTERNS = 4,      /* count — enables % N_PATTERNS wraparound         */
+} Pattern;
+
+static const char *pattern_name(Pattern p) {
+  switch (p) {
+  case PATTERN_TOTAL:
+    return "TOTAL  ";
+  case PATTERN_PARTIAL:
+    return "PARTIAL";
+  case PATTERN_ANNULAR:
+    return "ANNULAR";
+  case PATTERN_TRANSIT:
+    return "TRANSIT";
+  default:
+    return "?      ";
+  }
+}
+
+/* §1.16 stellar classes — main-sequence spectral types.
+ *
+ * Each entry is a single number (Kelvin temperature). Every visible
+ * colour in the scene derives from this:
+ *   photosphere = blackbody(K)
+ *   corona      = scattered photosphere = same chromaticity
+ *   chromos/Hα  = fixed wavelength (independent of K)
+ *
+ * No artistic palettes here. M-DWARF gives a deep red sun, B-STAR
+ * a hot blue one — these are real spectral types.
+ */
+typedef struct {
+  const char *name;
+  float kelvin;
+} Star;
+
+static const Star STARS[] = {
+    {"M-DWARF", 3500.0f}, {"K-STAR ", 4500.0f},  {"G-STAR ", 5778.0f},
+    {"A-STAR ", 9500.0f}, {"B-STAR ", 18000.0f},
+};
+#define N_STARS ((int)(sizeof STARS / sizeof STARS[0]))
+
+/* ── §2 PERFORMANCE — monotonic clock + sleep
+ * ──────────────────────────────────────────────── *
+ *
+ * Two primitives: read the monotonic clock as nanoseconds, sleep for
+ * a duration in nanoseconds. Both use POSIX functions; nanosleep
+ * blocks the calling thread until the time elapses. We use the
+ * monotonic clock (not wall clock) so suspend/resume of the laptop
+ * doesn't produce frame jumps.
+ */
+
+/*
+ * clock_ns — nanoseconds since an arbitrary monotonic epoch.
+ *
+ * Purpose:    return a steadily-increasing time value that doesn't
+ *             jump when wall-clock changes happen (NTP, DST).
+ * Returns:    int64_t, ns since epoch (the value's absolute meaning
+ *             doesn't matter; only differences are meaningful).
+ * Why:        the simulation's accumulator-based loop in §16 needs
+ *             a robust dt source. CLOCK_MONOTONIC is that.
+ */
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+}
+
+/*
+ * clock_sleep_ns — sleep for `ns` nanoseconds, no-op for non-positive.
+ *
+ * Purpose:    yield CPU until ns have elapsed. Returns early on signal
+ *             interruption (we don't care; the main loop re-paces).
+ * Inputs:     ns  duration to sleep (nanoseconds). Negative or zero
+ *                 returns immediately.
+ * Why:        used by the main loop to cap the maximum FPS — without
+ *             it we'd burn 100% of a CPU core.
+ */
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
+}
+
+/* ── §3 LOGIC: math + colour helpers + tone map (pure)
+ * ────────────────────────────────────────────────── *
+ *
+ * Vector arithmetic on V3, channel-wise arithmetic on RGB, plus tone-
+ * mapping helpers and a blackbody-temperature → RGB approximation.
+ * Everything is `static inline` because all of these are called in
+ * tight loops — the path tracer dispatches thousands of v3_dot, v3_sub
+ * calls per frame.
+ *
+ * We use sqrtf (single-precision) throughout. The path tracer doesn't
+ * benefit from double-precision accuracy in this resolution regime.
+ */
+
+/* §3.1 V3 ops — geometric primitives.
+ *
+ * Constructor, addition, subtraction, scalar multiplication, dot
+ * product, length, normalisation. v3_norm clamps zero-length vectors
+ * to (0,0,0) instead of dividing by zero — used in a few places where
+ * a chord might collapse during the orbit.
+ */
+
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3_add(V3 a, V3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline V3 v3_sub(V3 a, V3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline V3 v3_scl(V3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+static inline float v3_dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3_len(V3 a) { return sqrtf(v3_dot(a, a)); }
+static inline V3 v3_norm(V3 a) {
+  float l = v3_len(a);
+  if (l < 1e-12f)
+    return v3(0, 0, 0);
+  return v3_scl(a, 1.0f / l);
+}
+
+/* §3.2 RGB ops — channel-wise arithmetic.
+ *
+ * RGB is HDR (channels can exceed 1.0). rgb_mul is component-wise
+ * multiplication, used for things like "sun colour × Earth albedo →
+ * earthshine tint".
+ */
+
+static inline RGB rgb_make(float r, float g, float b) { return (RGB){r, g, b}; }
+static inline RGB rgb_add(RGB a, RGB b) {
+  return rgb_make(a.r + b.r, a.g + b.g, a.b + b.b);
+}
+static inline RGB rgb_mul(RGB a, RGB b) {
+  return rgb_make(a.r * b.r, a.g * b.g, a.b * b.b);
+}
+static inline RGB rgb_scl(RGB a, float s) {
+  return rgb_make(a.r * s, a.g * s, a.b * s);
+}
+
+/* §3.3 tone-map + gamma + luma.
+ *
+ * Reinhard tone-map: c' = c / (1+c). Maps [0, ∞) → [0, 1) — saturates
+ * toward 1 as input grows. Gamma 1/2.2 is the standard sRGB encoding
+ * approximation. luma_of uses Rec.601 weights to convert RGB to a
+ * single brightness.
+ *
+ * These are the FINAL pipeline stage between HDR-radiance and the
+ * 6×6×6 cube + glyph. paint_cell (§5.2) is the only call site.
+ */
+
+static inline float clamp01(float x) {
+  return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
+}
+/* wrap_pi - fold an angle into (-pi, pi]. The buried concept behind the
+ * `while (dphi > pi) dphi -= 2pi` idiom repeated by the lunar LUT (§7) and
+ * the prominence sum (§9): periodic angular distance on a circle. */
+static inline float wrap_pi(float a) {
+  while (a > (float)M_PI)
+    a -= 2.0f * (float)M_PI;
+  while (a < -(float)M_PI)
+    a += 2.0f * (float)M_PI;
+  return a;
+}
+static inline float reinhard(float x) { return x / (1.f + x); }
+static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
+static inline float luma_of(RGB c) {
+  return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+}
+
+/* §3.4 blackbody → RGB (Tanner Helland approximation).
+ *
+ * Purpose:     convert a temperature in Kelvin to an sRGB chromaticity.
+ *              Used for the photosphere (sun_em), background star
+ *              colours, and indirectly the corona (it scatters
+ *              photospheric light unchanged in chromaticity).
+ * Inputs:      kelvin  temperature, K. Useful range 1000–40000.
+ * Returns:     RGB ∈ [0, 1] — chromaticity, NOT photometric brightness.
+ *
+ * Why:         every colour in the scene comes from this function. The
+ *              piecewise approximation is from Tanner Helland (2012),
+ *              accurate enough for visual chromaticity given the 6×6×6
+ *              cube's quantisation budget. Higher precision (Planck
+ *              integrated against CIE matching functions) wouldn't
+ *              survive cube quantisation.
+ *
+ * Pseudocode:
+ *      K = kelvin / 100   (scaled, for the piecewise)
+ *      r = 1                                    if K ≤ 66
+ *          329.7 · (K-60)^(-0.1332)             otherwise   (cap at 1)
+ *      g = piecewise log/power formulae
+ *      b = 0   if K ≤ 19
+ *          1   if K ≥ 66
+ *          piecewise log formula otherwise
+ *      return clamp01(r), clamp01(g), clamp01(b)
+ */
+static RGB blackbody_rgb(float kelvin) {
+  float K = kelvin / 100.0f;
+  float r, g, b;
+
+  if (K <= 66.0f)
+    r = 1.0f;
+  else
+    r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
+
+  if (K <= 66.0f)
+    g = (99.47f * logf(K) - 161.12f) / 255.0f;
+  else
+    g = 288.12f * powf(K - 60.0f, -0.0755f) / 255.0f;
+
+  if (K >= 66.0f)
+    b = 1.0f;
+  else if (K <= 19.0f)
+    b = 0.0f;
+  else
+    b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
+
+  return rgb_make(clamp01(r), clamp01(g), clamp01(b));
+}
+
+/* ── §4 LOGIC: rng + noise — Perlin/fBm (pure); perm_shuffle seeds the table at
+ * init/reseed ──────────────────────────────────────────────────── *
+ *
+ * Two RNG primitives: a 3-D integer hash for deterministic per-cell /
+ * per-seed values (used for star positions, lunar valley parameters,
+ * prominence layouts), and Perlin noise / fBm for the chromosphere
+ * spicule texture (§9.4).
+ *
+ * The Perlin permutation table `perm[]` is shuffled per seed so the
+ * spicule pattern changes when the user presses 'r'.
+ */
+
+/* §4.1 integer hash → uint32 / float.
+ *
+ * hash3 mixes three 32-bit integers into one. Used pervasively for
+ * "give me a deterministic pseudo-random number for this combination
+ * of indices and seed". Same inputs always produce the same output;
+ * different inputs produce well-distributed outputs.
+ */
+
+static inline uint32_t hash3(int wx, int wy, int wz) {
+  uint32_t h = (uint32_t)wx * 73856093u ^ (uint32_t)wy * 19349663u ^
+               (uint32_t)wz * 83492791u;
+  h ^= h >> 16;
+  h *= 0x85ebca6bu;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35u;
+  h ^= h >> 16;
+  return h;
+}
+
+static inline float hash01(uint32_t h) {
+  return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
+}
+
+/* §4.2 Perlin noise.
+ *
+ * Standard 2-D Perlin noise. The permutation table `perm[]` is filled
+ * by perm_shuffle from a seed; perlin2d does gradient-based smooth
+ * interpolation via fade_q (the quintic 6t⁵-15t⁴+10t³ smoothstep).
+ *
+ * Output range: roughly (-1, 1); we re-scale to (0, 1) inside fbm2.
+ */
+
+static uint8_t perm[512];
+
+static void perm_shuffle(int seed) {
+  uint8_t base[256];
+  for (int i = 0; i < 256; i++)
+    base[i] = (uint8_t)i;
+  uint32_t st = (uint32_t)seed * 2654435761u;
+  for (int i = 255; i > 0; i--) {
+    st = st * 1664525u + 1013904223u;
+    int j = (int)(st >> 16) % (i + 1);
+    uint8_t t = base[i];
+    base[i] = base[j];
+    base[j] = t;
+  }
+  for (int i = 0; i < 256; i++) {
+    perm[i] = base[i];
+    perm[i + 256] = base[i];
+  }
+}
+
+static inline float fade_q(float t) {
+  return t * t * t * (t * (t * 6.f - 15.f) + 10.f);
+}
+static inline float lerp_f(float a, float b, float t) {
+  return a + t * (b - a);
+}
+static inline float grad2(int hash, float x, float y) {
+  int h = hash & 7;
+  float u = (h < 4) ? x : y;
+  float v = (h < 4) ? y : x;
+  return ((h & 1) ? -u : u) + ((h & 2) ? -2.f * v : 2.f * v);
+}
+
+static float perlin2d(float x, float y) {
+  int X = (int)floorf(x) & 255;
+  int Y = (int)floorf(y) & 255;
+  x -= floorf(x);
+  y -= floorf(y);
+  float u = fade_q(x), v = fade_q(y);
+  int A = perm[X] + Y;
+  int B = perm[X + 1] + Y;
+  float n00 = grad2(perm[A], x, y);
+  float n10 = grad2(perm[B], x - 1.f, y);
+  float n01 = grad2(perm[A + 1], x, y - 1.f);
+  float n11 = grad2(perm[B + 1], x - 1.f, y - 1.f);
+  return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
+}
+
+/* §4.3 fractal Brownian motion (fBm).
+ *
+ * Three octaves of Perlin summed with halving amplitude and doubling
+ * frequency — the standard cloud-noise recipe. Returns a value in
+ * [0, 1]. Used by emission_at (§9.4) for chromosphere spicule
+ * texture.
+ */
+
+static float fbm2(float x, float y) {
+  float total = 0.f, amp = 1.f, freq = 1.f, max_amp = 0.f;
+  for (int o = 0; o < 3; o++) {
+    total += amp * perlin2d(x * freq, y * freq);
+    max_amp += amp;
+    amp *= 0.5f;
+    freq *= 2.0f;
+  }
+  return (total / max_amp) * 0.5f + 0.5f;
+}
+
+/* ── §5 RENDER: terminal painting — colour init + cell paint
+ * ────────────────────────────────────────────── *
+ *
+ * Final stage of the pipeline: take an HDR RGB radiance value and
+ * write a glyph-with-colour to the terminal cell. Two functions:
+ * color_init sets up the ncurses pair table at startup; paint_cell
+ * does the per-cell tone-map → cube-quantise → glyph-pick at the end
+ * of every frame.
+ *
+ * On 256-colour terminals we use a 6×6×6 RGB cube (216 pairs) plus
+ * four named pairs for the HUD. On 8-colour terminals we fall back to
+ * a single yellow-on-default pair for the whole scene — the eclipse
+ * still works visually, just mono-yellow.
+ */
+
+static int g_256; /* 1 if terminal supports 256 colours */
+
+/*
+ * color_init — set up ncurses pair table.
+ *
+ * Purpose:     define COLOR_PAIR ids 1..231 with sensible foreground
+ *              colours. Called once at startup from screen_init.
+ * Inputs:      none (uses the global ncurses state set by start_color).
+ * Why:         paint_cell needs the cube pairs pre-defined; the HUD
+ *              uses PAIR_HUD / PAIR_HINT / PAIR_EVENT_HOT. Doing this
+ *              once keeps the per-cell paint cheap.
+ */
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  g_256 = (COLORS >= 256);
+  if (g_256) {
+    for (int i = 0; i < 216; i++)
+      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
+    init_pair(PAIR_HUD, 226, -1);
+    init_pair(PAIR_HINT, 51, -1);
+    init_pair(PAIR_EVENT_HOT, 196, -1);
+  } else {
+    init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+    init_pair(PAIR_EVENT_HOT, COLOR_RED, -1);
+  }
+}
+
+/*
+ * paint_cell — write one terminal cell from an HDR RGB value.
+ *
+ * Purpose:     end-of-pipeline conversion of HDR float radiance to a
+ *              coloured glyph in the terminal at (sx, sy).
+ * Inputs:      sx, sy   screen position (cell coordinates)
+ *              col      HDR RGB radiance (channels can exceed 1.0)
+ *
+ * Pseudocode:
+ *      r,g,b = gamma_enc(reinhard(col.{r,g,b}))
+ *      luma  = 0.2126·r + 0.7152·g + 0.0722·b
+ *      glyph = k_ramp[ round(luma · (RAMP_LEN − 1)) ]
+ *      r5,g5,b5 = round(r/g/b · 5)        ∈ [0,5]
+ *      pair  = PAIR_CUBE_BASE + r5·36 + g5·6 + b5
+ *      attr  = A_BOLD if luma > 0.85 else A_DIM if luma < 0.15 else 0
+ *      mvaddch(sy, sx, glyph) with COLOR_PAIR(pair) | attr
+ *
+ * Mental model: we're projecting an HDR point in colour space onto
+ * one of 216 cube cells, then choosing a brightness glyph and a font
+ * weight based on luma. The cube pair governs hue; the glyph governs
+ * brightness; A_BOLD/A_DIM bumps brightness slightly at the extremes.
+ *
+ * Why: the only place HDR meets the terminal. If you want to add a
+ * bloom pass or post-process, this is where it would land — but
+ * currently we go straight from g_buf to mvaddch.
+ */
+static void paint_cell(int sx, int sy, RGB col) {
+  float r = gamma_enc(reinhard(col.r));
+  float g = gamma_enc(reinhard(col.g));
+  float b = gamma_enc(reinhard(col.b));
+  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  int ri = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
+  if (ri < 0)
+    ri = 0;
+  if (ri >= RAMP_LEN)
+    ri = RAMP_LEN - 1;
+
+  if (g_256) {
+    int r5 = (int)(r * 5.f + 0.5f);
+    if (r5 > 5)
+      r5 = 5;
+    if (r5 < 0)
+      r5 = 0;
+    int g5 = (int)(g * 5.f + 0.5f);
+    if (g5 > 5)
+      g5 = 5;
+    if (g5 < 0)
+      g5 = 0;
+    int b5 = (int)(b * 5.f + 0.5f);
+    if (b5 > 5)
+      b5 = 5;
+    if (b5 < 0)
+      b5 = 0;
+    int pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
+    int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(pair) | attr);
+  } else {
+    attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
+  }
+}
+
+/* ── §6 LOGIC: ray-sphere intersection (pure)
+ * ──────────────────────────────────────── *
+ *
+ * Analytic intersection of a unit-length ray with a sphere. The math
+ * is the quadratic in disguise (Tutorial 3); this is the workhorse of
+ * the path tracer's primary-ray hit test against the photosphere
+ * sphere. The moon uses a perturbed variant in §7 that calls into the
+ * lunar terrain LUT.
+ *
+ * If the ray misses or both hit-times are behind the camera, returns
+ * false and *out_t is unchanged. Otherwise *out_t is the nearest hit
+ * t-value (t > 1e-3 to keep us off self-intersection at the surface).
+ */
+
+/*
+ * ray_sphere — analytic ray-vs-sphere with unit direction.
+ *
+ * Purpose:     test whether a ray from `ro` in direction `rd` (|rd|=1)
+ *              hits the sphere of radius `r` centred at `c`, and if
+ *              so, return the nearest valid hit-time.
+ *
+ * Pseudocode:
+ *      oc = ro − c
+ *      b  = oc · rd
+ *      cc = oc·oc − r·r
+ *      disc = b·b − cc
+ *      if disc < 0: miss
+ *      sq = √disc
+ *      t  = −b − sq                ← near intersection
+ *      if t < ε: t = −b + sq       ← try far intersection
+ *      if t < ε: still behind     → miss
+ *      *out_t = t; return true
+ *
+ * Inputs:      ro      ray origin (world units)
+ *              rd      ray direction, must be unit length
+ *              c       sphere centre (world)
+ *              r       sphere radius (world units)
+ *              out_t   filled with hit parameter on hit
+ * Returns:     true on hit, false on miss or all-behind
+ *
+ * Why: the photosphere is the only purely-spherical primitive we hit
+ * in the eye-ray pass. The moon needs a perturbed variant — see §7.
+ */
+static bool ray_sphere(V3 ro, V3 rd, V3 c, float r, float *out_t) {
+  V3 oc = v3_sub(ro, c);
+  float b = v3_dot(oc, rd);
+  float cc = v3_dot(oc, oc) - r * r;
+  float disc = b * b - cc;
+  if (disc < 0)
+    return false;
+  float sq = sqrtf(disc);
+  float t = -b - sq;
+  if (t < 1e-3f)
+    t = -b + sq;
+  if (t < 1e-3f)
+    return false;
+  *out_t = t;
+  return true;
+}
+
+/* ── §7 WORLDGEN + LOGIC: lunar terrain — build_lunar_lut seeds the bead
+ * silhouette (init/reseed); lunar_R_at/ray_moon pure ─────────────────────── *
+ *
+ * The moon isn't a perfect sphere visually — it has mountains and
+ * valleys around its limb. Real Bailey's beads come from light
+ * leaking through valleys at the totality boundary. We model this
+ * with a per-direction radius perturbation (Tutorial 8):
+ *
+ *      moon_R(direction) = moon_R_base · (1 − valley_depth(phi))
+ *
+ * `phi` is the angle from +x axis to the perpendicular projection of
+ * `direction` onto the moon's silhouette plane (the xy plane in world
+ * coordinates, since we look down +z). 14+30 valleys are baked into a
+ * 512-entry LUT once per seed.
+ *
+ * §7 has three pieces:
+ *   §7.1 build_lunar_lut — construct the LUT from per-seed valley params
+ *   §7.2 lunar_R_at      — runtime O(1) lookup with bilinear interp
+ *   §7.3 ray_moon        — perturbed ray-sphere using the LUT
+ */
+
+static float lunar_lut[LUNAR_LUT_SIZE];
+
+/* §7.1 build_lunar_lut.
+ *
+ * Purpose:     bake 14 macro + 30 micro valleys into a single 512-entry
+ *              angular table. After this, lunar_R_at is a constant-time
+ *              lookup with no exp() calls.
+ *
+ * Pseudocode:
+ *      pick a per-seed diamond-ring index ∈ [0, 14)
+ *      for each macro k ∈ [0, 14):
+ *          phi_k       = random angle around limb
+ *          base_width  = LUNAR_VALLEY_WIDTH · (0.5..1.5)
+ *          asym_sign   = ±1 (per seed)
+ *          w_left      = base_width · (1 + asym · 0.45)
+ *          w_right     = base_width · (1 − asym · 0.45)
+ *          depth       = LUNAR_VALLEY_DEPTH · (0.4..1.0)
+ *          if k == diamond_idx:
+ *              depth *= LUNAR_DIAMOND_BOOST
+ *      for each micro k ∈ [0, 30):
+ *          ... narrower symmetric Gaussians ...
+ *      for each LUT cell i:
+ *          phi   = ((i / LUT_SIZE) · 2π) − π
+ *          total = sum over macros (asym Gaussian) + sum over micros
+ *          lunar_lut[i] = total
+ *
+ * Inputs:      seed   integer; same seed produces same valley layout.
+ * Why:         baking once at reseed makes the runtime cost zero, and
+ *              the bilinear interp at lookup gives sub-cell precision
+ *              when the 0.06-rad valleys are ~10 LUT cells wide.
+ */
+static void build_lunar_lut(int seed) {
+  /* Macro valleys (wide, asymmetric, the main silhouette features). */
+  float phi_v[LUNAR_VALLEY_COUNT];
+  float w2_left_v[LUNAR_VALLEY_COUNT];
+  float w2_right_v[LUNAR_VALLEY_COUNT];
+  float d_v[LUNAR_VALLEY_COUNT];
+
+  /* Pick which macro valley is the diamond-ring (extra depth). */
+  uint32_t dr_h = hash3(0, seed, 0xD1A47000u);
+  int diamond_idx = (int)(hash01(dr_h) * (float)LUNAR_VALLEY_COUNT);
+  if (diamond_idx >= LUNAR_VALLEY_COUNT)
+    diamond_idx = LUNAR_VALLEY_COUNT - 1;
+
+  for (int k = 0; k < LUNAR_VALLEY_COUNT; k++) {
+    uint32_t h = hash3(k, seed, 0x1A11E1);
+    phi_v[k] = (hash01(h) - 0.5f) * 2.0f * (float)M_PI;
+    float w_base = LUNAR_VALLEY_WIDTH * (0.5f + 1.0f * hash01(h ^ 0xE1u));
+
+    /* Asymmetry: one side narrower (sharp), one wider (gradual).
+     * `asym_sign` ∈ {-1, +1} chooses which side is sharp per seed. */
+    float asym_sign = (hash01(h ^ 0xAA00u) > 0.5f) ? 1.0f : -1.0f;
+    float w_left = w_base * (1.0f + asym_sign * LUNAR_VALLEY_ASYM);
+    float w_right = w_base * (1.0f - asym_sign * LUNAR_VALLEY_ASYM);
+    w2_left_v[k] = w_left * w_left;
+    w2_right_v[k] = w_right * w_right;
+
+    float d_k = LUNAR_VALLEY_DEPTH * (0.4f + 0.6f * hash01(h ^ 0xD0u));
+    if (k == diamond_idx)
+      d_k *= LUNAR_DIAMOND_BOOST;
+    d_v[k] = d_k;
+  }
+
+  /* Micro valleys (narrow, symmetric — sharper beads). */
+  float phi_s[LUNAR_MICRO_COUNT];
+  float w2_s[LUNAR_MICRO_COUNT];
+  float d_s[LUNAR_MICRO_COUNT];
+  for (int k = 0; k < LUNAR_MICRO_COUNT; k++) {
+    uint32_t h = hash3(k, seed, 0xCAFEBABEu);
+    phi_s[k] = (hash01(h) - 0.5f) * 2.0f * (float)M_PI;
+    float w_k = LUNAR_MICRO_WIDTH * (0.6f + 0.8f * hash01(h ^ 0xE2u));
+    w2_s[k] = w_k * w_k;
+    d_s[k] = LUNAR_MICRO_DEPTH * (0.5f + 0.7f * hash01(h ^ 0xD1u));
+  }
+
+  for (int i = 0; i < LUNAR_LUT_SIZE; i++) {
+    float phi = ((float)i / (float)LUNAR_LUT_SIZE) * 2.0f * (float)M_PI -
+                (float)M_PI; /* phi ∈ [-π, π) */
+
+    float total = 0.0f;
+    /* Macro contribution — asymmetric Gaussian. */
+    for (int k = 0; k < LUNAR_VALLEY_COUNT; k++) {
+      float dphi = wrap_pi(phi - phi_v[k]);
+      float w2 = (dphi < 0.0f) ? w2_left_v[k] : w2_right_v[k];
+      total += d_v[k] * expf(-(dphi * dphi) / w2);
+    }
+    /* Micro contribution — symmetric. */
+    for (int k = 0; k < LUNAR_MICRO_COUNT; k++) {
+      float dphi = wrap_pi(phi - phi_s[k]);
+      total += d_s[k] * expf(-(dphi * dphi) / w2_s[k]);
+    }
+    lunar_lut[i] = total;
+  }
+}
+
+/* §7.2 lunar_R_at.
+ *
+ * Purpose:     given a unit vector pointing from moon centre toward a
+ *              chord's closest-approach point, return the moon's
+ *              effective radius along that direction.
+ *
+ * Pseudocode:
+ *      phi   = atan2(from_centre.y, from_centre.x)
+ *      u     = (phi + π) / (2π) · LUT_SIZE         ← LUT index, real
+ *      i0    = floor(u);  i1 = (i0 + 1) mod LUT_SIZE
+ *      depth = lunar_lut[i0]·(1−frac) + lunar_lut[i1]·frac
+ *      return moon_R_base · (1 − depth)
+ *
+ * Inputs:      from_centre  unit V3; the silhouette direction
+ *              moon_R_base  unperturbed radius (world units)
+ *              seed         unused at runtime (baked into the LUT)
+ *
+ * Why: the cost-aware wrapper around the LUT. Called from ray_moon
+ * (§7.3) at the closest-approach point of a chord. Bilinear lookup
+ * ensures smooth transitions between LUT cells.
+ */
+static float lunar_R_at(V3 from_centre, float moon_R_base, int seed) {
+  (void)seed; /* baked into the LUT at build time */
+  float phi = atan2f(from_centre.y, from_centre.x); /* (-π, π] */
+  float u = (phi + (float)M_PI) / (2.0f * (float)M_PI) * (float)LUNAR_LUT_SIZE;
+  if (u < 0.0f)
+    u += (float)LUNAR_LUT_SIZE;
+  if (u >= LUNAR_LUT_SIZE)
+    u -= (float)LUNAR_LUT_SIZE;
+  int i0 = (int)u;
+  int i1 = (i0 + 1) % LUNAR_LUT_SIZE;
+  float fr = u - (float)i0;
+  float depth = lunar_lut[i0] * (1.0f - fr) + lunar_lut[i1] * fr;
+  return moon_R_base * (1.0f - depth);
+}
+
+/* §7.3 ray_moon — perturbed ray-vs-moon intersection.
+ *
+ * Purpose:     test a ray against the moon, using the lunar terrain LUT
+ *              to vary the moon's effective radius with direction.
+ *
+ * The fast path:
+ *      Compute b, oc² as in ray_sphere.
+ *      Test against the UNPERTURBED moon_R_base sphere first.
+ *      If miss → return false (cheap reject — no LUT lookup).
+ *      Since lunar valleys only REDUCE radius (depth ≥ 0), missing the
+ *      base sphere implies missing any perturbed variant.
+ *
+ * If the cheap reject doesn't fire, do the perturbed test:
+ *      Compute closest-approach point along the chord to moon centre.
+ *      Use it as the silhouette direction → lunar_R_at returns r_eff.
+ *      Test against r_eff sphere. If hit, return nearest valid t.
+ *
+ * Without the cheap reject, every NEE chord would do a 14+30 = 44-
+ * Gaussian evaluation on the LUT lookup path. With it, ~80% of NEE
+ * chords miss the unperturbed sphere and never touch the LUT.
+ *
+ * Inputs:      ro            ray origin
+ *              rd            ray direction (unit)
+ *              c             moon centre (world)
+ *              moon_R_base   unperturbed moon radius
+ *              seed          unused at runtime
+ *              out_t         filled with hit parameter on hit
+ * Returns:     true on hit (perturbed sphere), false on miss.
+ *
+ * Why: the EYE-RAY hit test for the moon. The NEE penumbra calculation
+ * uses §8 instead — there the moon-disc-vs-sun-disc geometry is the
+ * point, and the penumbra formula handles partial coverage analytically.
+ */
+static bool ray_moon(V3 ro, V3 rd, V3 c, float moon_R_base, int seed,
+                     float *out_t) {
+  V3 oc = v3_sub(ro, c);
+  float b = v3_dot(oc, rd);
+
+  /* Cheap reject against base sphere. */
+  float oc2 = v3_dot(oc, oc);
+  float r2 = moon_R_base * moon_R_base;
+  float disc = b * b - (oc2 - r2);
+  if (disc < 0)
+    return false;
+  float sq = sqrtf(disc);
+  float t_far = -b + sq;
+  if (t_far < 1e-3f)
+    return false;
+
+  /* Now evaluate perturbation. */
+  V3 nearest = v3_add(ro, v3_scl(rd, -b));
+  V3 radial = v3_sub(nearest, c);
+  float r_eff = lunar_R_at(v3_norm(radial), moon_R_base, seed);
+
+  float cc_p = oc2 - r_eff * r_eff;
+  float disc_p = b * b - cc_p;
+  if (disc_p < 0)
+    return false;
+  float sq_p = sqrtf(disc_p);
+  float t = -b - sq_p;
+  if (t < 1e-3f)
+    t = -b + sq_p;
+  if (t < 1e-3f)
+    return false;
+  *out_t = t;
+  return true;
+}
+
+/* ── §8 LOGIC: penumbra — analytic visible sun-disc fraction (pure)
+ * ─────────────── *
+ *
+ * The path tracer's NEE step (§11) needs to know, at every scatter
+ * point, how much of the sun's apparent disc is unblocked by the
+ * moon. A binary "is the moon between me and the sun?" test would
+ * give a hard cliff at the moon's edge — wrong; real penumbra is a
+ * smooth gradient. We compute the gradient analytically as the
+ * fraction of the sun's apparent disc area not covered by the moon's.
+ *
+ * From a scatter point p, both sun and moon look like circular discs
+ * on the unit sphere around p. For small angular extents (a few
+ * degrees, true here) the spherical geometry approximates well as
+ * planar circles in a tangent plane — circle-circle intersection has
+ * a closed form.
+ */
+
+/*
+ * visible_fraction_sun — analytic [0..1] visibility of the sun.
+ *
+ * Purpose:     return the unobstructed fraction of the sun's apparent
+ *              disc as seen from world point p, given the moon
+ *              partially occludes it. Replaces a binary moon-block
+ *              test in NEE — gives smooth penumbra.
+ *
+ * Math:
+ *      α_sun  = asin(SUN_R  / |sun − p|)        sun's angular radius
+ *      α_moon = asin(moon_R / |moon − p|)       moon's
+ *      γ      = angle between (sun − p) and (moon − p)
+ *
+ *      γ ≥ α_sun + α_moon                     → visible = 1
+ *      γ ≤ |α_sun − α_moon| AND α_moon ≥ α_sun → visible = 0    (total)
+ *      γ ≤ |α_sun − α_moon| AND α_moon <  α_sun → visible = 1−(α_moon/α_sun)²
+ *                                                               (annular)
+ *      else: partial overlap → overlap = circle_overlap_area(γ, α_sun, α_moon)
+ *                              visible = 1 − overlap / (π · α_sun²)
+ *
+ * Inputs:      p          world point we're sampling visibility from
+ *              sun_pos    sun centre (world)
+ *              moon_pos   moon centre (world)
+ *              moon_R     moon radius (world; pass scene_moon_r value)
+ * Returns:     visible fraction ∈ [0, 1]; clamped on output.
+ *
+ * Why: Bailey's beads come from EYE-RAY perturbations (§7.3); penumbra
+ * comes from NEE scattering. Different physics, different code paths,
+ * but they compose: the eye ray hits the perturbed moon (beads); the
+ * NEE-from-corona chords use the unperturbed disc here (smooth
+ * penumbra). Trying to combine both into one function gives tangled
+ * formulas; separate is cleaner.
+ */
+
+/* circle_overlap_area - area of the lens where two circles overlap: radii
+ * r1/r2 with centre-distance d (angle units here). Closed-form circle-circle
+ * intersection = two circular segments minus the shared triangle (the Heron
+ * product under the root). Caller guarantees the partial regime
+ * |r1-r2| < d < r1+r2. Ref: circle-circle intersection area. */
+static float circle_overlap_area(float d, float r1, float r2) {
+  float r1s = r1 * r1, r2s = r2 * r2;
+  float a1_arg = (d * d + r1s - r2s) / (2.0f * d * r1);
+  float a2_arg = (d * d + r2s - r1s) / (2.0f * d * r2);
+  if (a1_arg > 1.0f)
+    a1_arg = 1.0f;
+  if (a1_arg < -1.0f)
+    a1_arg = -1.0f;
+  if (a2_arg > 1.0f)
+    a2_arg = 1.0f;
+  if (a2_arg < -1.0f)
+    a2_arg = -1.0f;
+  float A1 = r1s * acosf(a1_arg);
+  float A2 = r2s * acosf(a2_arg);
+
+  float t1 = -d + r1 + r2;
+  float t2 = d + r1 - r2;
+  float t3 = d - r1 + r2;
+  float t4 = d + r1 + r2;
+  float prod = t1 * t2 * t3 * t4;
+  if (prod < 0.0f)
+    prod = 0.0f;
+  float A3 = 0.5f * sqrtf(prod);
+
+  return A1 + A2 - A3;
+}
+
+static float visible_fraction_sun(V3 p, V3 sun_pos, V3 moon_pos, float moon_R) {
+  V3 to_sun_v = v3_sub(sun_pos, p);
+  V3 to_moon_v = v3_sub(moon_pos, p);
+  float dist_sun = v3_len(to_sun_v);
+  float dist_moon = v3_len(to_moon_v);
+  if (dist_sun < SUN_R + 1e-3f)
+    return 0.0f;
+  if (dist_moon < moon_R + 1e-3f)
+    return 0.0f;
+
+  float a_sun = asinf(SUN_R / dist_sun);
+  float a_moon = asinf(moon_R / dist_moon);
+
+  V3 d_sun = v3_scl(to_sun_v, 1.0f / dist_sun);
+  V3 d_moon = v3_scl(to_moon_v, 1.0f / dist_moon);
+  float cos_g = v3_dot(d_sun, d_moon);
+  if (cos_g > 1.0f)
+    cos_g = 1.0f;
+  if (cos_g < -1.0f)
+    cos_g = -1.0f;
+  float gamma = acosf(cos_g);
+
+  if (gamma >= a_sun + a_moon)
+    return 1.0f;
+  if (gamma <= fabsf(a_sun - a_moon)) {
+    if (a_moon >= a_sun)
+      return 0.0f;
+    float r = a_moon / a_sun;
+    return 1.0f - r * r;
+  }
+
+  /* Partial overlap: visible = 1 - (lens area / sun-disc area), in angle space.
+   */
+  float overlap = circle_overlap_area(gamma, a_sun, a_moon);
+  float sun_a = (float)M_PI * a_sun * a_sun;
+  if (sun_a < 1e-9f)
+    return 1.0f;
+  return clamp01(1.0f - overlap / sun_a);
+}
+
+/* ── §9 LOGIC + DATA: coronal medium — Medium params + density/emission (pure)
+ * ───────────────────────────────────────────────── *
+ *
+ * The medium has two parts: a spherically-symmetric component (corona +
+ * chromosphere shell) and an anisotropic component (prominences). The
+ * separation matters because:
+ *   • The 1-D radial transmittance LUT (§10) only sees the symmetric
+ *     part. Prominences are too small/sparse to affect it visibly.
+ *   • Per-frame medium state (Medium struct) holds prominence parameters
+ *     that change with seed; the symmetric part is hard-coded and
+ *     identical every frame.
+ *
+ * §9 has four pieces:
+ *   §9.1 Medium struct
+ *   §9.2 sigma_sph         spherical scattering coefficient at radius r
+ *   §9.3 sigma_prom        anisotropic prominence contribution
+ *   §9.4 density_total + emission_at  — combined hot-path entry points
+ */
+
+/* §9.1 Medium struct.
+ *
+ * Per-frame state for the coronal medium. The kelvin field is stamped
+ * by scene_draw with the current stellar class. Prominence parameters
+ * are filled in by medium_reseed (§12.3) when 'r' is pressed.
+ * Ref: solar K-corona Thomson scattering; chromosphere & prominences (solar
+ *      physics); blackbody photosphere colour (§3).
+ */
+typedef struct {
+  float kelvin;                  /* photosphere temperature        */
+  float prom_phi[PROM_COUNT];    /* angular position (rad)         */
+  float prom_height[PROM_COUNT]; /* angular reach × R_sun          */
+  float prom_amp[PROM_COUNT];    /* density multiplier             */
+} Medium;
+
+/* §9.2 sigma_sph — spherically-symmetric σ at radius r.
+ *
+ * Purpose:     return the local scattering coefficient at distance r
+ *              from the sun centre, as the sum of corona power-law
+ *              and chromosphere shell.
+ *
+ * Pseudocode:
+ *      if r < R_sun  or  r > REACH·R_sun:  return 0
+ *      corona = SIGMA0 · (R_sun / r)^DECAY
+ *      h     = (r − R_sun) / (CHROMOS_THICK · R_sun)         ∈ [0, ?]
+ *      if h ∈ [0, 1]:
+ *          chromos = CHROMOS_SIGMA0 · (1−h)²        ← peaks at shell base
+ *      else:
+ *          chromos = 0
+ *      return corona + chromos
+ *
+ * Inputs:      r   distance from sun centre (world units)
+ * Returns:     σ at this radius, units 1/world-unit.
+ *
+ * Why: the only function the trans_lut (§10) integrates. Spherical
+ * symmetry is what makes the LUT possible — a 1-D table τ(r). Adding
+ * anisotropy here would force a 2-D or 3-D LUT with proportionally
+ * larger memory; instead we keep prominences in §9.3, where they
+ * contribute to the volume rendering integral as additive emission
+ * but not to the radial transmittance.
+ */
+static float sigma_sph(float r) {
+  if (r < SUN_R)
+    return 0.0f;
+  if (r > SUN_R * CORONA_REACH)
+    return 0.0f;
+
+  float u = SUN_R / r;
+  float cor = CORONA_SIGMA0 * powf(u, CORONA_DECAY);
+
+  float h = (r - SUN_R) / (SUN_R * CHROMOS_THICK);
+  float chrom = 0.0f;
+  if (h >= 0.0f && h <= 1.0f) {
+    float fade = 1.0f - h;
+    chrom = CHROMOS_SIGMA0 * fade * fade;
+  }
+  return cor + chrom;
+}
+
+/* §9.3 sigma_prom — additive prominence density.
+ *
+ * Purpose:     return extra σ at point p_local from prominence loops.
+ *              Each prominence is a 2-D Gaussian in (phi, h_above)
+ *              centred at a fixed angular position with random height
+ *              and amplitude.
+ *
+ * Pseudocode:
+ *      r       = |p_local|
+ *      if r < R_sun or r > (1+PROM_HEIGHT)·R_sun: return 0
+ *      h_above = (r − R_sun) / R_sun         ∈ [0, PROM_HEIGHT]
+ *      phi     = atan2(p_local.x, p_local.z)
+ *      total   = 0
+ *      for k ∈ [0, PROM_COUNT):
+ *          dphi    = wrap(phi − prom_phi[k]) ∈ (−π, π]
+ *          lateral = exp(−dphi² / PROM_LATERAL²)
+ *          radial  = (1 − h_above/prom_height[k])² if in range else 0
+ *          total += prom_amp[k] · lateral · radial
+ *      return PROM_SIGMA0 · total
+ *
+ * Inputs:      m         medium with seed-dependent prominence params
+ *              p_local   point in sun-centred coords
+ * Returns:     additional σ from prominences, ≥ 0.
+ *
+ * Why: lets us paint a few thick "loops" of cool plasma rising from
+ * the chromosphere without breaking spherical symmetry of σ_sph.
+ * Prominences emit Hα strongly (see emission_at) — they're the
+ * brightest features at totality apart from the photosphere itself.
+ */
+static float sigma_prom(const Medium *m, V3 p_local) {
+  float r = v3_len(p_local);
+  if (r < SUN_R)
+    return 0.0f;
+  if (r > SUN_R * (1.0f + PROM_HEIGHT))
+    return 0.0f;
+
+  float phi = atan2f(p_local.x, p_local.z);
+  float h_above = (r - SUN_R) / SUN_R;
+  if (h_above > PROM_HEIGHT)
+    return 0.0f;
+
+  float total = 0.0f;
+  for (int k = 0; k < PROM_COUNT; k++) {
+    float reach_k = m->prom_height[k];
+    if (h_above > reach_k)
+      continue;
+    float dphi = wrap_pi(phi - m->prom_phi[k]);
+    float lat = expf(-(dphi * dphi) / (PROM_LATERAL * PROM_LATERAL));
+    float t_rad = h_above / reach_k;
+    float rad = (1.0f - t_rad) * (1.0f - t_rad);
+    total += m->prom_amp[k] * lat * rad;
+  }
+  return PROM_SIGMA0 * total;
+}
+
+/* §9.4 density_total + emission_at — the path tracer's entry points.
+ *
+ * density_total just sums sigma_sph(r) and sigma_prom(p) — the path
+ * tracer asks for "total σ at this point" once per active step.
+ *
+ * emission_at returns the Hα emission radiance at p — chromosphere
+ * plus prominence contributions. The chromosphere part has spicule
+ * texture (fBm in spherical coords) and a hot-peak hue shift; the
+ * prominence part stays at the cool baseline Hα colour.
+ */
+
+static float density_total(const Medium *m, V3 p_local) {
+  float r = v3_len(p_local);
+  return sigma_sph(r) + sigma_prom(m, p_local);
+}
+
+/*
+ * emission_at — local volumetric emission per unit length at p_local.
+ *
+ * Purpose:     return the radiance emitted per metre by the chromos-
+ *              phere + prominences at world-point p_local. The corona
+ *              itself doesn't emit — it only scatters photospheric
+ *              light, which is handled in the path tracer's NEE step.
+ *
+ * Pseudocode:
+ *      r = |p_local|
+ *      if outside chromos+prom range: return (0,0,0)
+ *      ha_cool = (1.00, 0.18, 0.12)        cool Hα baseline
+ *      ha_hot  = (1.00, 0.45, 0.18)        hot peak (yellow-shifted)
+ *      h = (r − R_sun) / (CHROMOS_THICK · R_sun)
+ *      chr_em = 0,  spicule_n = 0
+ *      if h ∈ [0, 1]:
+ *          fade   = (1 − h)^4               sharp outer edge
+ *          theta  = acos(p_local.y / r)
+ *          phi    = atan2(p_local.x, p_local.z)
+ *          spicule_n = fbm2(phi · 12, theta · 6)        ∈ [0, 1]
+ *          spicule_factor = SPICULE_BASE + SPICULE_AMP · spicule_n
+ *          chr_em = CHROMOS_SIGMA0 · fade · spicule_factor
+ *      pr_em = sigma_prom(m, p_local)
+ *      chr_col = lerp(ha_cool, ha_hot, spicule_n)        hot-peak shift
+ *      return chr_col · chr_em + ha_cool · pr_em
+ *
+ * Inputs:      m         medium
+ *              p_local   world point in sun-centred coords
+ * Returns:     RGB radiance per unit length (HDR).
+ *
+ * Why: chromosphere isn't smooth — it's textured by spicules. fBm in
+ * (theta, phi) gives radial-streak patches that map to vertical
+ * streaks on the visible chromos ring. Hot peaks lean yellow because
+ * real spicule heating shifts emission lines.
+ */
+static RGB emission_at(const Medium *m, V3 p_local) {
+  float r = v3_len(p_local);
+  if (r < SUN_R)
+    return rgb_make(0, 0, 0);
+  if (r > SUN_R * (1.0f + PROM_HEIGHT))
+    return rgb_make(0, 0, 0);
+
+  RGB ha_cool = rgb_make(1.00f, 0.18f, 0.12f);
+  RGB ha_hot = rgb_make(1.00f, 0.45f, 0.18f);
+
+  float chr_em = 0.0f;
+  float spicule_n = 0.0f;
+  float h = (r - SUN_R) / (SUN_R * CHROMOS_THICK);
+  if (h >= 0.0f && h <= 1.0f) {
+    float fade = 1.0f - h;
+    fade = fade * fade * fade * fade;
+
+    float r_safe = fmaxf(r, 1e-6f);
+    float yy = p_local.y / r_safe;
+    if (yy > 1.0f)
+      yy = 1.0f;
+    if (yy < -1.0f)
+      yy = -1.0f;
+    float theta = acosf(yy);
+    float phi = atan2f(p_local.x, p_local.z);
+    spicule_n = fbm2(phi * SPICULE_FREQ_PHI, theta * SPICULE_FREQ_TH);
+    float spicule_factor = SPICULE_BASE + SPICULE_AMP * spicule_n;
+
+    chr_em = CHROMOS_SIGMA0 * fade * spicule_factor;
+  }
+
+  float pr_em = sigma_prom(m, p_local);
+
+  RGB chr_col = rgb_make(ha_cool.r + (ha_hot.r - ha_cool.r) * spicule_n,
+                         ha_cool.g + (ha_hot.g - ha_cool.g) * spicule_n,
+                         ha_cool.b + (ha_hot.b - ha_cool.b) * spicule_n);
+
+  RGB out = rgb_scl(chr_col, chr_em);
+  out = rgb_add(out, rgb_scl(ha_cool, pr_em));
+  return out;
+}
+
+/* ── §10 WORLDGEN + LOGIC: transmittance LUT — build_trans_lut precomputes
+ * (init); lookup pure ───────────────────────────────────────────── *
+ *
+ * The realtime trick. The path tracer needs, at every active scatter
+ * point, the transmittance from that point to the photosphere along
+ * the radial inward chord. Computing it by ray-marching at runtime
+ * would be O(steps²) per pixel — unaffordable. Spherical symmetry of
+ * σ_sph saves us: the optical depth along the radial chord from r to
+ * R_sun depends only on r. Tabulate τ(r) once at startup, lookup at
+ * runtime.
+ */
+
+static float trans_lut[LUT_SIZE];
+
+/* §10.1 build_trans_lut — precompute τ(r) at LUT_SIZE radii.
+ *
+ * Purpose:     fill `trans_lut[]` with the cumulative radial optical
+ *              depth from R_sun out to LUT_R_MAX. Called once at
+ *              startup; not seed-dependent (σ_sph doesn't change with
+ *              seed).
+ *
+ * Pseudocode:
+ *      trans_lut[0] = 0                 ← τ at r = R_sun
+ *      r_prev = R_sun
+ *      for i ∈ [1, LUT_SIZE):
+ *          r_curr = R_sun + (LUT_R_MAX − R_sun) · (i / (LUT_SIZE − 1))
+ *          ds     = (r_curr − r_prev) / N_INT       fine sub-step
+ *          tau    = trans_lut[i−1]
+ *          for j ∈ [0, N_INT):
+ *              s    = r_prev + (j + 0.5) · ds
+ *              tau += sigma_sph(s) · ds
+ *          trans_lut[i] = tau
+ *          r_prev = r_curr
+ *
+ * Inputs:      none (uses globals LUT_SIZE, LUT_R_MAX, σ_sph).
+ * Why: cumulative storage means lookup_transmittance can do a
+ * one-bilinear-interp constant-time fetch.
+ */
+static void build_trans_lut(void) {
+  const int N_INT = 32;
+  trans_lut[0] = 0.0f;
+  float r_prev = SUN_R;
+  for (int i = 1; i < LUT_SIZE; i++) {
+    float r_curr =
+        SUN_R + (LUT_R_MAX - SUN_R) * ((float)i / (float)(LUT_SIZE - 1));
+    float ds = (r_curr - r_prev) / (float)N_INT;
+    float tau = trans_lut[i - 1];
+    for (int j = 0; j < N_INT; j++) {
+      float s = r_prev + (j + 0.5f) * ds;
+      tau += sigma_sph(s) * ds;
+    }
+    trans_lut[i] = tau;
+    r_prev = r_curr;
+  }
+}
+
+/* §10.2 lookup_transmittance — fetch Tr at world point p_local.
+ *
+ * Purpose:     return exp(−τ(|p_local|)) by bilinear lookup. p_local
+ *              is in sun-centred coordinates.
+ *
+ * Pseudocode:
+ *      r = |p_local|
+ *      if r < R_sun:                  return 0    (inside sun)
+ *      if r > LUT_R_MAX:              return 1    (clear)
+ *      fr = (r − R_sun)/(LUT_R_MAX − R_sun) · (LUT_SIZE − 1)
+ *      ir = floor(fr); frac = fr − ir
+ *      tau = trans_lut[ir] · (1−frac) + trans_lut[ir+1] · frac
+ *      return exp(−tau)
+ *
+ * Inputs:      p_local   point in sun-centred coords.
+ * Returns:     Tr ∈ [0, 1].
+ *
+ * Why: the inner-loop call from trace_ray's NEE. One memory access,
+ * three multiplies, one expf — that's the entire NEE-transmittance
+ * cost per active step.
+ */
+static float lookup_transmittance(V3 p_local) {
+  float r = v3_len(p_local);
+  if (r < SUN_R)
+    return 0.0f;
+  if (r > LUT_R_MAX)
+    return 1.0f;
+
+  float fr = (r - SUN_R) / (LUT_R_MAX - SUN_R) * (float)(LUT_SIZE - 1);
+  int ir = (int)fr;
+  if (ir < 0)
+    ir = 0;
+  if (ir > LUT_SIZE - 2)
+    ir = LUT_SIZE - 2;
+  float t = fr - (float)ir;
+  float tau = trans_lut[ir] * (1.0f - t) + trans_lut[ir + 1] * t;
+  return expf(-tau);
+}
+
+/* ── §11 LOGIC: path tracer — trace_ray (THE CORE, pure)
+ * ─────────────────────────────────────────────────── *
+ *
+ * The kernel. One function — trace_ray — handles a complete primary
+ * ray: cast it from the camera, find the nearest opaque surface,
+ * march through the medium accumulating in-scattered + emitted
+ * radiance, then add the surface contribution.
+ *
+ * The volume rendering equation (Tutorial 4) becomes:
+ *
+ *   radiance_accum = ∫₀^t_max T(t) · [emission(t) + scatter(t)] dt
+ *                  + T(t_max) · L_surface
+ *
+ * where T(t) = exp(−∫₀^t σ(s) ds) is the transmittance from camera to
+ * march parameter t. We approximate the integral with a Riemann sum
+ * (adaptive step size; fine inside the corona's reach, 4× coarse
+ * outside).
+ *
+ * §11 has six pieces — trace_ray plus the five helpers it composes:
+ *   §11.1 thomson_phase      Thomson scattering phase function
+ *   §11.2 sun_solid_angle    sun-disc solid angle (NEE geometric weight)
+ *   §11.3 shade_sun_surface  photosphere limb-darkened radiance
+ *   §11.4 shade_moon_surface moon Lambertian + earthshine radiance
+ *   §11.5 march_medium       volumetric ray-march (in-scatter + emission)
+ *   §11.6 trace_ray          the kernel — composes the above
+ */
+
+/* §11.1 thomson_phase.
+ *
+ * Purpose:     Thomson scattering phase function at angle θ between
+ *              incident and outgoing directions. Wavelength-flat
+ *              (achromatic) — that's why the corona's hue follows the
+ *              photosphere's exactly.
+ *
+ *      P_T(θ) = (3/16π) · (1 + cos²θ)
+ *
+ * Inputs:      cos_theta   cos of scatter angle ∈ [-1, 1]
+ * Returns:     phase value, 1/sr.
+ *
+ * Why: NEE computes scatter-toward-eye via this phase function. Other
+ * media (Mie scattering for clouds, Rayleigh for blue sky) would use
+ * different phases here. Thomson is correct for free electrons in
+ * the K-corona.
+ */
+static inline float thomson_phase(float cos_theta) {
+  return (3.0f / (16.0f * (float)M_PI)) * (1.0f + cos_theta * cos_theta);
+}
+
+/* §11.2 sun_solid_angle - solid angle Omega subtended by the photosphere disc
+ * at distance dist_sun. Omega = 2pi(1 - cos a), sin a = R_sun / dist: the cone
+ * of directions from a corona sample that actually see the sun, i.e. the
+ * geometric weight on single-scattered sunlight (NEE). */
+static inline float sun_solid_angle(float dist_sun) {
+  float sin_a = SUN_R / fmaxf(dist_sun, SUN_R + 1e-3f);
+  if (sin_a > 1.0f)
+    sin_a = 1.0f;
+  float cos_a = sqrtf(fmaxf(1.0f - sin_a * sin_a, 0.0f));
+  return 2.0f * (float)M_PI * (1.0f - cos_a);
+}
+
+/* §11.3 shade_sun_surface - photosphere radiance for an eye ray that hits the
+ * sun at t_sun. Emissive with Eddington limb darkening I(mu)=AMBIENT+GAIN*mu,
+ * mu = -rd.N. Returns radiance BEFORE the remaining-transmittance factor. */
+static RGB shade_sun_surface(V3 ro, V3 rd, V3 sun_pos, float t_sun,
+                             RGB sun_em) {
+  V3 p = v3_add(ro, v3_scl(rd, t_sun));
+  V3 N = v3_norm(v3_sub(p, sun_pos));
+  float mu = -v3_dot(N, rd);
+  if (mu < 0.f)
+    mu = 0.f;
+  float lim = LIMB_AMBIENT + LIMB_GAIN * mu;
+  return rgb_scl(sun_em, lim);
+}
+
+/* §11.4 shade_moon_surface - moon radiance for an eye ray that hits the moon at
+ * t_moon. Direct Lambertian sunlight is ~0 in eclipse geometry (the near face
+ * points away from the sun), so earthshine - a cool-blue ambient - fills the
+ * night side. Returns radiance BEFORE the remaining-transmittance factor. */
+static RGB shade_moon_surface(V3 ro, V3 rd, V3 sun_pos, V3 moon_pos,
+                              float t_moon, RGB sun_em, RGB earth_tint) {
+  V3 p = v3_add(ro, v3_scl(rd, t_moon));
+  V3 N = v3_norm(v3_sub(p, moon_pos));
+  V3 to_sun_v = v3_sub(sun_pos, p);
+  float dist_sun = v3_len(to_sun_v);
+  V3 to_sun = v3_scl(to_sun_v, 1.0f / fmaxf(dist_sun, 1e-6f));
+  float cos_sn = v3_dot(N, to_sun);
+
+  RGB direct = rgb_make(0.f, 0.f, 0.f);
+  if (cos_sn > 0.0f) {
+    float Lf = MOON_ALBEDO / (float)M_PI * cos_sn;
+    direct = rgb_scl(sun_em, Lf);
+  }
+  RGB earth = rgb_scl(earth_tint, EARTHSHINE_GAIN);
+  return rgb_add(direct, earth);
+}
+
+/* §11.5 march_medium - ray-march the coronal volume from the eye to t_max,
+ * accumulating single-scattered sunlight (NEE) + local Halpha emission,
+ * attenuated by Beer-Lambert transmittance. *transmittance enters at the eye's
+ * value and is left at the fraction surviving to t_max for the surface term.
+ * Returns the accumulated in-scatter + emission radiance. */
+static RGB march_medium(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
+                        float moon_R, float t_max, RGB sun_em,
+                        float corona_gate, float *transmittance) {
+  /* Adaptive step: fine inside corona reach, coarse through empty space.
+   * Outside (CORONA_REACH + margin)*R_sun, sigma_sph == 0, so coarse strides
+   * through truly empty space contribute nothing regardless of length. */
+  float dt_fine = t_max / (float)MARCH_STEPS;
+  float dt_coarse = dt_fine * MARCH_COARSE_MULT;
+  float corona_outer = SUN_R * (CORONA_REACH + CORONA_FINE_MARGIN);
+  float corona_outer_R2 = corona_outer * corona_outer;
+
+  RGB radiance_accum = rgb_make(0.f, 0.f, 0.f);
+  float t_along_ray = 0.0f;
+
+  while (t_along_ray < t_max && *transmittance > TRANSMITTANCE_CUTOFF) {
+    /* Step size from distance to sun at the start of the step. */
+    V3 p_now = v3_add(ro, v3_scl(rd, t_along_ray));
+    V3 p_now_loc = v3_sub(p_now, sun_pos);
+    float r2_now = v3_dot(p_now_loc, p_now_loc);
+    float dt = (r2_now < corona_outer_R2) ? dt_fine : dt_coarse;
+    if (t_along_ray + dt > t_max)
+      dt = t_max - t_along_ray;
+
+    /* Sample density at the step midpoint. */
+    float t_mid = t_along_ray + 0.5f * dt;
+    V3 p = v3_add(ro, v3_scl(rd, t_mid));
+    V3 p_local = v3_sub(p, sun_pos);
+    float density = density_total(m, p_local);
+
+    if (density >= DENSITY_EPS) {
+      V3 to_sun_v = v3_sub(sun_pos, p);
+      float dist_sun = v3_len(to_sun_v);
+      V3 to_sun = v3_scl(to_sun_v, 1.0f / fmaxf(dist_sun, 1e-6f));
+
+      /* Single-scatter sunlight toward the eye (NEE), soft moon shadow. */
+      float vis = visible_fraction_sun(p, sun_pos, moon_pos, moon_R);
+      if (vis > VIS_EPS) {
+        float omega = sun_solid_angle(dist_sun);
+        float tr_to_sun = lookup_transmittance(p_local);
+        float cos_th = v3_dot(rd, to_sun);
+        float phase = thomson_phase(cos_th);
+        float in_sc = density * phase * tr_to_sun * omega * vis *
+                      IN_SCATTER_GAIN * dt * corona_gate;
+        radiance_accum = rgb_add(
+            radiance_accum, rgb_scl(rgb_scl(sun_em, in_sc), *transmittance));
+      }
+
+      /* Local Halpha emission (chromosphere + prominences). */
+      RGB em = emission_at(m, p_local);
+      if (em.r + em.g + em.b > 0.f) {
+        radiance_accum = rgb_add(
+            radiance_accum,
+            rgb_scl(em, *transmittance * dt * HA_EMIT_GAIN * corona_gate));
+      }
+
+      /* Beer-Lambert extinction across this step. */
+      *transmittance *= expf(-density * dt);
+    }
+    t_along_ray += dt;
+  }
+  return radiance_accum;
+}
+
+/* §11.6 trace_ray — the path tracer kernel.
+ *
+ * Purpose:     return the HDR radiance for a single eye ray from the
+ *              camera through the medium, ending at sun / moon / sky.
+ *
+ * Inputs:
+ *      ro              ray origin (= camera position, the world origin)
+ *      rd              ray direction, unit length
+ *      m               medium with this frame's prominence parameters
+ *      sun_pos         world sun centre
+ *      moon_pos        world moon centre
+ *      moon_R          moon radius (after user-applied moon_scale)
+ *      seed            shared with lunar terrain LUT (purely for
+ *                      readability — actual data is baked into
+ *                      lunar_lut at reseed time)
+ *      sun_em          photospheric blackbody radiance (HDR; usually
+ *                      ~SUN_EMIT_HDR × blackbody chromaticity)
+ *      earth_tint      earthshine colour (blue-tinted sun_em)
+ *      corona_gate     eye-adaptation multiplier ∈ [0, 1] for this frame
+ *
+ * Returns:     RGB pixel radiance (HDR).
+ *
+ * Pseudocode:
+ *      hit_sun,  t_sun  = ray_sphere(ro, rd, sun_pos, SUN_R)
+ *      hit_moon, t_moon = ray_moon (ro, rd, moon_pos, moon_R, seed)
+ *      pick (t_max, surf_type) by nearest hit (sky -> MARCH_T_MAX)
+ *
+ *      transmittance = 1
+ *      radiance = march_medium(...)   integrate the volume; leaves
+ *                                     transmittance at the fraction of
+ *                                     light still reaching t_max
+ *      if hit sun:  radiance += transmittance * shade_sun_surface(...)
+ *      if hit moon: radiance += transmittance * shade_moon_surface(...)
+ *      return radiance                (sky: no surface term)
+ *
+ * Why: this is THE function. Everything else in the file is in service
+ * of feeding it the right inputs and rendering its output. Read it
+ * after Tutorials 4, 5, 6, 7, and 10.
+ */
+static RGB trace_ray(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
+                     float moon_R, int seed, RGB sun_em, RGB earth_tint,
+                     float corona_gate) {
+  /* Surface intersections — moon uses perturbed-radius variant for
+   * Bailey's-bead-correct silhouette (see Tutorial 8). */
+  float t_sun = 0.f, t_moon = 0.f;
+  bool hit_sun = ray_sphere(ro, rd, sun_pos, SUN_R, &t_sun);
+  bool hit_moon = ray_moon(ro, rd, moon_pos, moon_R, seed, &t_moon);
+
+  float t_max;
+  int surf_type = 0; /* 0 sky · 1 sun · 2 moon */
+  if (hit_moon && (!hit_sun || t_moon < t_sun)) {
+    t_max = t_moon;
+    surf_type = 2;
+  } else if (hit_sun) {
+    t_max = t_sun;
+    surf_type = 1;
+  } else {
+    t_max = MARCH_T_MAX;
+    surf_type = 0;
+  }
+
+  /* March the coronal volume; transmittance is left at the fraction of light
+   * still reaching the eye at t_max, used by the surface term below. */
+  float transmittance = 1.0f;
+  RGB radiance_accum = march_medium(ro, rd, m, sun_pos, moon_pos, moon_R, t_max,
+                                    sun_em, corona_gate, &transmittance);
+
+  /* Surface term - radiance from the hit surface, dimmed by the light that
+   * survived the march to reach it. */
+  if (surf_type == 1) {
+    RGB surf = shade_sun_surface(ro, rd, sun_pos, t_sun, sun_em);
+    radiance_accum = rgb_add(radiance_accum, rgb_scl(surf, transmittance));
+  } else if (surf_type == 2) {
+    RGB surf = shade_moon_surface(ro, rd, sun_pos, moon_pos, t_moon, sun_em,
+                                  earth_tint);
+    radiance_accum = rgb_add(radiance_accum, rgb_scl(surf, transmittance));
+  }
+  /* Sky case: no surface term. */
+
+  return radiance_accum;
+}
+
+/* ── §12 SIMULATION: scene state + orbit — scene_tick advances;
+ * init/reseed/pattern are user events
+ * ─────────────────────────────────────────────────── *
+ *
+ * Per-frame state container: which pattern is active, current
+ * stellar class, zoom and moon-scale knob positions, simulation time,
+ * RNG seed, and the medium struct (with prominence parameters for
+ * this seed). `pattern_set` and `*_reseed` mutate the scene; `scene_*`
+ * read it.
+ *
+ * §12 has four sub-sections:
+ *   §12.1 PatternParams + Scene structs
+ *   §12.2 pattern_set
+ *   §12.3 medium_reseed, scene_reseed, scene_init, scene_tick
+ *   §12.4 scene_moon_r, scene_moon_pos, scene_occlusion
+ */
+
+/* §12.1 PatternParams + Scene.
+ *
+ * PatternParams holds the geometric configuration of the current
+ * pattern: moon's world radius, optional y-offset (PARTIAL only),
+ * gating booleans for HUD events. Scene wraps PatternParams plus all
+ * the user-controllable knobs and the Medium.
+ *
+ * No bitfields, no unions — flat structs, easy to read.
+ */
+
+typedef struct {
+  float moon_world_r;     /* moon radius in world units (sets coverage)   */
+  float moon_y_world;     /* vertical offset (PARTIAL bites the disc)      */
+  bool totality_possible; /* can this pattern reach totality? (HUD gate)   */
+  bool show_corona;       /* unused at runtime, kept for HUD              */
+} PatternParams;
+
+/*
+ * Scene — the simulation's table of contents: WHAT is shown (which eclipse, the
+ * moon geometry, the coronal medium, the procedural identity), the clock that
+ * advances the eclipse, and HOW the user drives / views it. Held by App (§16);
+ * the lifecycle orchestrators scene_init / scene_reseed / scene_tick /
+ * pattern_set take Scene*, while pure readers take only the fields (or
+ * sub-types like Medium) they need.
+ */
+typedef struct {
+  /* WHAT is shown — the eclipse */
+  Pattern current_pattern; /* which eclipse (TOTAL/PARTIAL/ANNULAR/…)     */
+  PatternParams pp;        /* moon geometry derived from the pattern       */
+  Medium medium;           /* coronal corona + prominence parameters       */
+  int seed;                /* RNG seed for the medium + lunar terrain       */
+  float seed_phase;        /* procedural phase (orbit start offset)         */
+
+  /* WHAT evolves — the clock */
+  float time_secs; /* eclipse clock; scene_tick advances it         */
+
+  /* HOW the user drives / views it */
+  bool paused;      /* DELAYS: freeze the eclipse                    */
+  int speed;        /* sim time multiplier (relative to SPEED_DEF)   */
+  int star_idx;     /* stellar class → sun blackbody colour          */
+  float zoom;       /* effective FOV = FOV_H_BASE / zoom             */
+  float moon_scale; /* live moon-radius multiplier                   */
+} Scene;
+
+/* §12.2 pattern_set.
+ *
+ * Purpose:     apply the geometric defaults for a pattern enum. Called
+ *              when n / p is pressed.
+ *
+ * Pseudocode:
+ *      pp = (defaults: TOTAL moon radius, no offset)
+ *      switch p:
+ *          TOTAL    → totality_possible = true
+ *          PARTIAL  → moon offset above midline by PARTIAL_Y_OFFSET·MOON_Z
+ *          ANNULAR  → moon radius = MOON_BASE_R_ANNULAR (smaller)
+ *          TRANSIT  → moon radius = MOON_BASE_R_TRANSIT (tiny)
+ *
+ * Why: rather than hard-coding pattern-specific bits in the path
+ * tracer, we change the world geometry. Same kernel renders all four
+ * patterns by reading current Scene state.
+ */
+static void pattern_set(Scene *s, Pattern p) {
+  s->current_pattern = p;
+  PatternParams *pp = &s->pp;
+  pp->moon_world_r = MOON_BASE_R_TOTAL;
+  pp->moon_y_world = 0.0f;
+  pp->totality_possible = false;
+  pp->show_corona = true;
+  switch (p) {
+  case PATTERN_TOTAL:
+    pp->moon_world_r = MOON_BASE_R_TOTAL;
+    pp->totality_possible = true;
+    break;
+  case PATTERN_PARTIAL:
+    pp->moon_world_r = MOON_BASE_R_TOTAL;
+    pp->moon_y_world = PARTIAL_Y_OFFSET * MOON_Z;
+    break;
+  case PATTERN_ANNULAR:
+    pp->moon_world_r = MOON_BASE_R_ANNULAR;
+    break;
+  case PATTERN_TRANSIT:
+    pp->moon_world_r = MOON_BASE_R_TRANSIT;
+    break;
+  case N_PATTERNS:
+    break;
+  }
+}
+
+/* §12.3 reseeding + init + tick.
+ *
+ * medium_reseed regenerates the prominence positions and rebuilds the
+ * lunar terrain LUT and Perlin permutation. scene_reseed picks a new
+ * orbit phase and seed, then delegates. scene_init zeroes the Scene
+ * and calls medium_reseed once. scene_tick advances simulation time
+ * proportional to user-set speed.
+ */
+
+static void medium_reseed(Medium *m, int seed) {
+  /* Random prominence positions (angle, height, amplitude). */
+  for (int k = 0; k < PROM_COUNT; k++) {
+    uint32_t h = hash3(k, seed, 0xF1A3E);
+    m->prom_phi[k] = hash01(h) * 2.0f * (float)M_PI;
+    m->prom_height[k] = PROM_HEIGHT * (0.40f + 0.60f * hash01(h ^ 0xA1u));
+    m->prom_amp[k] = 0.50f + 0.50f * hash01(h ^ 0xB2u);
+  }
+  /* Bake the moon's silhouette perturbation. */
+  build_lunar_lut(seed);
+
+  /* Shuffle Perlin permutation table for spicule fBm. */
+  perm_shuffle(seed);
+}
+
+static void scene_reseed(Scene *s) {
+  uint32_t h = hash3((int)(s->time_secs * 1000.0f),
+                     (int)(s->seed_phase * 100.0f), 0xC0FFEE);
+  s->seed_phase = ((float)(h & 0xFFFFu) / 65536.0f) * 2.0f * (float)M_PI;
+  s->seed = (int)(h ^ 0x5A5A5A5Au);
+  medium_reseed(&s->medium, s->seed);
+}
+
+static void scene_init(Scene *s) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->speed = SPEED_DEF;
+  s->star_idx = 2; /* G-STAR (the Sun) by default */
+  s->zoom = 1.0f;
+  s->moon_scale = 1.0f;
+  s->seed_phase = 0.0f;
+  s->seed = 0xDECAF;
+  medium_reseed(&s->medium, s->seed);
+  pattern_set(s, PATTERN_TOTAL);
+}
+
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  float speed_mul = (float)s->speed / (float)SPEED_DEF;
+  s->time_secs += dt * speed_mul;
+}
+
+/* §12.4 derived geometry queries.
+ *
+ * scene_moon_r returns the EFFECTIVE moon radius (base × user scale).
+ * scene_moon_pos returns the current moon world position from orbit
+ * parameters (sin curve over ECLIPSE_PERIOD_S seconds). scene_occlusion
+ * returns the fraction of the sun's apparent disc covered by the moon
+ * AS SEEN FROM THE CAMERA — used by the HUD progress bar and by the
+ * background-stars gate (§14.2).
+ *
+ * Note: scene_occlusion is the "binary occlusion" formula appropriate
+ * for the camera's view (it includes the annular-cap case). The path
+ * tracer uses visible_fraction_sun (§8) for the inverse — fraction
+ * NOT covered, returned as a continuous value.
+ */
+
+static inline float scene_moon_r(const Scene *s) {
+  return s->pp.moon_world_r * s->moon_scale;
+}
+
+static V3 scene_moon_pos(const Scene *s) {
+  float sun_a = atanf(SUN_R / SUN_Z);
+  float moon_a = atanf(scene_moon_r(s) / MOON_Z);
+  float orbit_x_world = MOON_Z * (sun_a + moon_a) * MOON_ORBIT_X_FRAC;
+  float omega = 2.0f * (float)M_PI / ECLIPSE_PERIOD_S;
+  float phase = omega * s->time_secs + s->seed_phase;
+  float mx = orbit_x_world * sinf(phase);
+  return v3(mx, s->pp.moon_y_world, MOON_Z);
+}
+
+static float scene_occlusion(const Scene *s) {
+  V3 sun_pos = v3(0, 0, SUN_Z);
+  V3 moon_pos = scene_moon_pos(s);
+  V3 sun_dir = v3_norm(sun_pos);
+  V3 moon_dir = v3_norm(moon_pos);
+  float cos_b = v3_dot(sun_dir, moon_dir);
+  if (cos_b > 1.f)
+    cos_b = 1.f;
+  if (cos_b < -1.f)
+    cos_b = -1.f;
+  float sep = acosf(cos_b);
+  float sun_a = atanf(SUN_R / SUN_Z);
+  float moon_a = atanf(scene_moon_r(s) / MOON_Z);
+  float sum = sun_a + moon_a;
+  float dif = fabsf(sun_a - moon_a);
+  if (sep >= sum)
+    return 0.f;
+  if (sep <= dif) {
+    if (moon_a >= sun_a)
+      return 1.f;
+    return (moon_a / sun_a) * (moon_a / sun_a);
+  }
+  float t = (sum - sep) / (2.0f * fminf(sun_a, moon_a));
+  if (moon_a >= sun_a)
+    return t;
+  return t * (moon_a / sun_a) * (moon_a / sun_a);
+}
+
+/* ── §13 LOGIC: camera — pinhole ray generation (pure)
+ * ──────────────────────────────────────────────────────── *
+ *
+ * Camera is a tiny struct holding origin, fov values, and screen
+ * dimensions. camera_make stamps in the per-frame fov (computed from
+ * the user's zoom in scene_draw). camera_ray converts a (col, row)
+ * cell coordinate to a world-space unit direction using the pinhole
+ * formula in Tutorial 2.
+ * Ref: pinhole camera model — Shirley, "Fundamentals of Computer Graphics".
+ */
+
+typedef struct {
+  V3 pos;             /* eye position (world space)                    */
+  float fov_h, fov_v; /* horizontal / vertical field of view (tan)     */
+  int cols, rows;     /* image-plane resolution                        */
+} Camera;
+
+static void camera_make(Camera *c, int cols, int rows, float fov_h) {
+  c->cols = cols;
+  c->rows = rows;
+  c->pos = v3(0, 0, 0);
+  c->fov_h = fov_h;
+  c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
+}
+
+static V3 camera_ray(const Camera *c, int sx, int sy) {
+  float u =
+      ((2.0f * (float)sx + 1.0f) - (float)c->cols) / (float)c->cols * c->fov_h;
+  float v =
+      -((2.0f * (float)sy + 1.0f) - (float)c->rows) / (float)c->rows * c->fov_v;
+  return v3_norm(v3(u, v, 1.0f));
+}
+
+/* ── §14 RENDER: screen + scene_draw → framebuffer → screen
+ * ─────────────────────────────────────────── *
+ *
+ * Per-frame orchestration. screen_init / screen_resize manage the
+ * ncurses window. scene_draw is the per-frame entry point: build the
+ * camera, set up the medium and emission constants, then iterate
+ * every cell calling trace_ray and storing the result in a
+ * framebuffer; finally paint the framebuffer to the terminal.
+ *
+ * §14 has two pieces:
+ *   §14.1 screen_init / screen_resize
+ *   §14.2 scene_draw
+ */
+
+/*
+ * Screen — the terminal output surface this frame draws to: just its current
+ * size, re-read on SIGWINCH so render and HUD always match the real window. Two
+ * fields, but its own concept (the output surface), passed to every RENDER fn.
+ */
+typedef struct {
+  int cols, rows; /* terminal size in character cells (refreshed on resize) */
+} Screen;
+
+/* §14.1 screen lifecycle.
+ *
+ * screen_init configures ncurses for a non-blocking, no-echo, key-
+ * captured, cursor-hidden TUI. typeahead(-1) is a small but important
+ * call: it makes ncurses accept all queued input on every refresh
+ * rather than blocking. screen_resize is called from the SIGWINCH
+ * handler in §16.
+ */
+
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, s->rows, s->cols);
+}
+
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
+}
+
+/* §14.2 scene_draw — per-frame orchestration.
+ *
+ * Purpose:     for each cell in the visible window, dispatch a
+ *              path-traced ray; store the HDR result in g_buf; then
+ *              paint the buffer to the terminal.
+ *
+ * Pseudocode:
+ *      compute working rows/cols within bounds (BUF_MAX_*)
+ *      build camera with fov_h = FOV_H_BASE / zoom
+ *      stamp medium.kelvin from current Star
+ *      sun_em      = SUN_EMIT_HDR · blackbody_rgb(kelvin)
+ *      earth_alb   = (0.30, 0.45, EARTH_ALBEDO_BLUE)
+ *      earth_tint  = sun_em · earth_alb               (componentwise)
+ *      cam_vis_sun = visible_fraction_sun(camera, sun, moon, moon_R)
+ *      corona_gate = FLOOR + RANGE · (1 − cam_vis_sun)
+ *
+ *      PASS 1 — for each (r, c):
+ *          ray = camera_ray(c, r)
+ *          col = trace_ray(camera_origin, ray, medium,
+ *                          sun_pos, moon_pos, moon_R, seed,
+ *                          sun_em, earth_tint, corona_gate)
+ *          if col is dark and totality:
+ *              maybe add a background star at (c, r) from per-cell hash
+ *          g_buf[r][c] = col
+ *
+ *      PASS 2 — paint g_buf to terminal via paint_cell
+ *
+ * Why: keeps trace_ray pure (it doesn't know about the eye-adapt
+ * gate, the framebuffer, or the stars). All per-frame setup happens
+ * here, leaving the kernel free of bookkeeping.
+ */
+
+static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
+
+/* §14.1 background_star - colour contribution of a star at sky cell (c,r), or
+ * black if this cell rolls no star. A per-cell hash gives frame-stable
+ * positions; 1-in-STAR_DENSITY cells host a star whose Kelvin is log-uniform
+ * over [STAR_K_MIN, STAR_K_MAX] for a warm-to-cool chromaticity spread. */
+static RGB background_star(int c, int r, int seed) {
+  uint32_t h = hash3(c, r, seed);
+  if ((h % STAR_DENSITY) != 0u)
+    return rgb_make(0.f, 0.f, 0.f);
+  float br = STAR_BRIGHT_MIN + hash01(h >> 8) * STAR_BRIGHT_RANGE;
+  float u_K = hash01(h ^ 0xC0DEC0DEu);
+  float kK = STAR_K_MIN * powf(STAR_K_MAX / STAR_K_MIN, u_K);
+  return rgb_scl(blackbody_rgb(kK), br);
+}
+
+static void scene_draw(const Screen *sc, const Scene *s) {
+  int rows_eff = sc->rows - 2;
+  int row_off = 1;
+  if (rows_eff < 4) {
+    rows_eff = sc->rows;
+    row_off = 0;
+  }
+  if (rows_eff > BUF_MAX_H)
+    rows_eff = BUF_MAX_H;
+  int cols_eff = sc->cols;
+  if (cols_eff > BUF_MAX_W)
+    cols_eff = BUF_MAX_W;
+
+  Camera cam;
+  camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
+
+  V3 sun_pos = v3(0, 0, SUN_Z);
+  V3 moon_pos = scene_moon_pos(s);
+  float moon_R = scene_moon_r(s);
+
+  Medium m_local = s->medium;
+  m_local.kelvin = STARS[s->star_idx].kelvin;
+
+  RGB sun_chrom = blackbody_rgb(m_local.kelvin);
+  RGB sun_em = rgb_scl(sun_chrom, SUN_EMIT_HDR);
+
+  /* Earthshine: rough Earth-as-mirror with Rayleigh-blue albedo. */
+  RGB earth_alb = rgb_make(0.30f, 0.45f, EARTH_ALBEDO_BLUE);
+  RGB earth_tint = rgb_mul(sun_em, earth_alb);
+
+  /* Eye-adaptation gate — one number per frame. */
+  float cam_vis_sun = visible_fraction_sun(cam.pos, sun_pos, moon_pos, moon_R);
+  float corona_gate =
+      CORONA_GATE_FLOOR + CORONA_GATE_RANGE * (1.0f - cam_vis_sun);
+
+  /* PASS 1 — path tracer for each cell. */
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      V3 ray_d = camera_ray(&cam, c, r);
+      RGB col = trace_ray(cam.pos, ray_d, &m_local, sun_pos, moon_pos, moon_R,
+                          s->seed, sun_em, earth_tint, corona_gate);
+
+      /* Background stars - only on dim "sky" cells at near-totality. */
+      if (luma_of(col) < STAR_LUMA_MAX && scene_occlusion(s) > STAR_OCC_VISIBLE)
+        col = rgb_add(col, background_star(c, r, s->seed));
+
+      g_buf[r][c] = col;
+    }
+  }
+
+  /* PASS 2 — paint to screen. */
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      paint_cell(c, r + row_off, g_buf[r][c]);
+    }
+  }
+}
+
+/* ── §15 RENDER: HUD → screen
+ * ─────────────────────────────────────────────────────────── *
+ *
+ * One row at the top with status, plus a TOTALITY event flash, plus a
+ * key-hint strip at the bottom. Per project convention everything is
+ * bright yellow on default background (PAIR_HUD) for the status, with
+ * the bottom strip in cyan A_BOLD (PAIR_HINT) and the event flash in
+ * red A_BOLD (PAIR_EVENT_HOT).
+ *
+ * The status string packs in a lot:
+ *   fps, simulation Hz, pattern, stellar class, sun and moon angular
+ *   radii (degrees), occlusion progress bar, zoom, moon-scale, speed.
+ */
+
+/*
+ * hud_draw — render the top status row + bottom hint strip.
+ *
+ * Purpose:     draw the per-frame status overlay. Read-only on Scene.
+ *
+ * Inputs:      sc        Screen with current cols, rows
+ *              s         Scene to read state from
+ *              fps       measured render fps
+ *              sim_fps   current simulation tick rate
+ *
+ * Why: separated from scene_draw so the path tracer's framebuffer
+ * doesn't need to know about the HUD's row reservation.
+ */
+static void hud_draw(const Screen *sc, const Scene *s, double fps,
+                     int sim_fps) {
+  float occ = scene_occlusion(s);
+
+  int bar_w = 10;
+  int bar_fill = (int)(occ * (float)bar_w + 0.5f);
+  if (bar_fill > bar_w)
+    bar_fill = bar_w;
+  if (bar_fill < 0)
+    bar_fill = 0;
+  char bar[16] = {0};
+  for (int i = 0; i < bar_w; i++)
+    bar[i] = (i < bar_fill) ? '#' : '.';
+
+  const Star *st = &STARS[s->star_idx];
+  float sun_a = atanf(SUN_R / SUN_Z) * 180.f / (float)M_PI;
+  float moon_a = atanf(scene_moon_r(s) / MOON_Z) * 180.f / (float)M_PI;
+  char buf[300];
+  snprintf(
+      buf, sizeof buf,
+      " %5.1f fps %3d Hz  %s  %s %5.0fK  s:%4.2f m:%4.2f deg  [%s] %3.0f%%  "
+      "z:%3.1fx mz:%3.1fx  spd:%d ",
+      fps, sim_fps, s->paused ? "PAUSED " : pattern_name(s->current_pattern),
+      st->name, (double)st->kelvin, (double)sun_a, (double)moon_a, bar,
+      (double)(occ * 100.0f), (double)s->zoom, (double)s->moon_scale, s->speed);
+  int len = (int)strlen(buf);
+  if (len > sc->cols)
+    len = sc->cols;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sc->cols - len, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(0, 0, " SOLAR-ECLIPSE-PT · PATH-TRACED ");
+  attroff(COLOR_PAIR(PAIR_HUD));
+
+  /* Totality event flash. */
+  if (s->pp.totality_possible && occ > 0.99f) {
+    const char *lab = " [ TOTALITY ] ";
+    int elen = (int)strlen(lab);
+    attron(COLOR_PAIR(PAIR_EVENT_HOT) | A_BOLD);
+    mvprintw(0, sc->cols - len - elen - 1, "%s", lab);
+    attroff(COLOR_PAIR(PAIR_EVENT_HOT) | A_BOLD);
+  }
+
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(sc->rows - 1, 0,
+           " q:quit  spc:pause  n/p:pat  t/T:star  z/Z:zoom  m/M:moon  +/-:spd "
+           " []:Hz  r:reseed ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  scene_draw(sc, s);
+  hud_draw(sc, s, fps, sim_fps);
+}
+
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
+
+/* ── §16 APP / TICK — signals, input, the per-tick combine (see ARCHITECTURE)
+ * ────────────────────────── *
+ *
+ * Standard project pattern:
+ *   • Signal handlers set volatile flags; the main loop polls them.
+ *   • atexit registers cleanup (endwin) so the terminal is restored
+ *     even if we crash.
+ *   • Fixed-step accumulator advances simulation time at SIM_FPS;
+ *     render runs at whatever rate the rest of the loop achieves.
+ *   • Frame-pacing sleeps target ~60 fps render budget.
+ *
+ * §16 has three pieces:
+ *   §16.1 signals + cleanup
+ *   §16.2 app_handle_key
+ *   §16.3 app_init / app_run / main
+ */
+
+/*
+ * App — the application harness: the whole running program's state in one place
+ * (WHERE/when we are, vs Scene's WHAT/HOW). Holds the simulation, the output
+ * surface, the performance knob and the signal-driven run flags. app_init /
+ * app_run take App*; everything below takes a sub-type.
+ */
+typedef struct {
+  Scene scene;                   /* the simulation (WHAT + HOW) — see Scene */
+  Screen screen;                 /* the output surface — see Screen         */
+  int sim_fps;                   /* fixed-timestep rate ([ / ])             */
+  volatile sig_atomic_t running; /* 0 = quit (set by signal or `q`)         */
+  volatile sig_atomic_t need_resize; /* 1 = SIGWINCH pending */
+} App;
+
+static App g_app;
+
+/* §16.1 signal handlers. Set flags, return immediately — the main loop
+ * checks them after the next getch() / scene_tick. */
+
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
+
+/* §16.2 app_handle_key — process one key.
+ *
+ * Returns true to keep running, false to quit. The cases mirror the
+ * "Keys" section of the file header — one switch case per key.
+ */
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reseed(s);
+    break;
+
+  case '=':
+  case '+':
+    if (s->speed < SPEED_MAX)
+      s->speed *= 2;
+    if (s->speed > SPEED_MAX)
+      s->speed = SPEED_MAX;
+    break;
+  case '-':
+  case '_':
+    s->speed /= 2;
+    if (s->speed < SPEED_MIN)
+      s->speed = SPEED_MIN;
+    break;
+
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
+
+  case 't':
+    s->star_idx = (s->star_idx + 1) % N_STARS;
+    break;
+  case 'T':
+    s->star_idx = (s->star_idx + N_STARS - 1) % N_STARS;
+    break;
+
+  case 'z':
+    s->zoom *= ZOOM_STEP;
+    if (s->zoom > ZOOM_MAX)
+      s->zoom = ZOOM_MAX;
+    break;
+  case 'Z':
+    s->zoom /= ZOOM_STEP;
+    if (s->zoom < ZOOM_MIN)
+      s->zoom = ZOOM_MIN;
+    break;
+
+  case 'm':
+    s->moon_scale /= MOON_SCALE_STEP;
+    if (s->moon_scale < MOON_SCALE_MIN)
+      s->moon_scale = MOON_SCALE_MIN;
+    break;
+  case 'M':
+    s->moon_scale *= MOON_SCALE_STEP;
+    if (s->moon_scale > MOON_SCALE_MAX)
+      s->moon_scale = MOON_SCALE_MAX;
+    break;
+
+  case 'n':
+  case 'N':
+    pattern_set(s, (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS));
+    break;
+  case 'p':
+  case 'P':
+    pattern_set(
+        s, (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS));
+    break;
+  }
+  return true;
+}
+
+/* §16.3 app_init / app_run / main.
+ *
+ * app_init zeros the App, sets up Scene + Screen, builds the
+ * transmittance LUT (only place we call it — once, at startup).
+ * app_run is the main loop: poll input, advance simulation in
+ * fixed-step ticks, render once per loop iteration, sleep to pace.
+ * main wires it all up.
+ */
+
+static void app_init(App *app) {
+  memset(app, 0, sizeof *app);
+  scene_init(&app->scene);
+  screen_init(&app->screen);
+  app->sim_fps = SIM_FPS_DEFAULT;
+  app->running = 1;
+  build_trans_lut();
+}
+
+static void app_run(App *app) {
+  int64_t prev = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t frame_count = 0;
+  int64_t fps_window_start = prev;
+  double fps_meas = 0.0;
+
+  struct sigaction sa = {0};
+  sa.sa_handler = on_exit_signal;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sa.sa_handler = on_resize_signal;
+  sigaction(SIGWINCH, &sa, NULL);
+  atexit(cleanup);
+
+  while (app->running) {
+    /* USER EVENTS — drain all pending keys (mutate Scene knobs / quit);
+     * NOT part of the tick. */
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (!app_handle_key(app, ch)) {
+        app->running = 0;
+        break;
+      }
+    }
+    if (!app->running)
+      break;
+    /* USER EVENT — apply pending SIGWINCH (control state, not the tick). */
+    if (app->need_resize) {
+      screen_resize(&app->screen);
+      app->need_resize = 0;
+    }
+
+    /* PERFORMANCE — wall-clock dt with spiral-of-death cap. */
+    int64_t now = clock_ns();
+    int64_t dt = now - prev;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
+    prev = now;
+
+    /* SIMULATION (fixed timestep) — drain the accumulator: scene_tick advances
+     * the eclipse clock (the per-tick sim writer); paused gate inside = DELAYS.
+     */
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
+      sim_accum -= tick_ns;
+    }
+
+    /* RENDER combine — the ONE place state → screen: scene_draw + HUD, then
+     * present. Reads scene, never writes it. */
+    screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
+    screen_present();
+
+    /* PERFORMANCE — rolling fps measure (display only). */
+    frame_count++;
+    if (now - fps_window_start >= NS_PER_SEC) {
+      fps_meas = (double)frame_count * (double)NS_PER_SEC /
+                 (double)(now - fps_window_start);
+      frame_count = 0;
+      fps_window_start = now;
+    }
+
+    /* PERFORMANCE — frame cap (sleep the remainder of the render budget). */
+    int64_t target = clock_ns();
+    int64_t left = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
+    if (left > 0)
+      clock_sleep_ns(left);
+  }
+}
+
+int main(void) {
+  app_init(&g_app);
+  app_run(&g_app);
+  cleanup();
+  return 0;
+}
+
 /*
  * solar_eclipse.c — a path-traced solar eclipse, rendered into ASCII at
  * a low resolution but with real volumetric physics. The corona, the
@@ -681,2416 +3183,50 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
-#define _POSIX_C_SOURCE 200809L
-
-#include <math.h>
-#include <ncurses.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-/* ── §0 forward types ────────────────────────────────────────────────── *
- *
- * V3 (a 3-D float vector) and RGB (three colour channels) are declared
- * here — at the very top — because §1.16 (the stellar-classes table)
- * embeds RGB literals when set up with explicit colour fields, and
- * because keeping these definitions early lets the rest of the file
- * use them anywhere. The math operators that consume V3 / RGB live in
- * §3; only the type tags appear here.
- *
- * No methods, no constructors — these are POD bags of three floats.
- * Throughout the file V3 represents a position OR a direction (the
- * difference is which one the variable name describes), and RGB
- * represents an HDR colour (channels can exceed 1.0 — tone-mapping
- * happens in §5).
- */
-
-typedef struct {
-  float x, y, z;
-} V3;
-typedef struct {
-  float r, g, b;
-} RGB;
-
-/* ── §1 configuration ────────────────────────────────────────────────── *
- *
- * Every tunable in the simulation is a named #define here, with a
- * comment explaining what it controls and what changes when you nudge
- * it. The §1 sub-sections below mirror the GUIDED TUTORIAL topics —
- * if you've read Tutorial 6 (transmittance LUT), §1.8's LUT_SIZE is
- * the parameter you'd touch.
- *
- * No magic numbers anywhere else in this file. If you find one in §11
- * or further down, it's a bug — please rename and move it here.
- */
-
-/* §1.1 frame-rate and orbit-speed knobs.
- *
- * The main loop runs a fixed-timestep simulation tick at SIM_FPS_DEFAULT
- * Hz, decoupled from the render rate. Pressing ] / [ adjusts the tick
- * rate at runtime; +/- multiplies / divides the orbital speed of the
- * moon (so you can dial in slow motion at a totality boundary).
- *
- * SPEED_DEF is the baseline — 1× orbit; SPEED_MAX is 8× faster than
- * that, SPEED_MIN is 1/8×. The scale is multiplicative.
- */
-enum {
-  SIM_FPS_MIN = 10,
-  SIM_FPS_DEFAULT = 30,
-  SIM_FPS_MAX = 120,
-  SIM_FPS_STEP = 10,
-
-  SPEED_MIN = 1,
-  SPEED_DEF = 8,
-  SPEED_MAX = 64,
-};
-
-#define NS_PER_SEC 1000000000LL
-#define NS_PER_MS 1000000LL
-#define TICK_NS(f) (NS_PER_SEC / (f))
-#define DT_CAP_NS (100 * NS_PER_MS) /* spiral-of-death guard */
-
-/* §1.2 view geometry and zoom.
- *
- * FOV_H_BASE is tan(half horizontal field of view). The effective FOV
- * during rendering is `FOV_H_BASE / zoom` — larger zoom → smaller FOV
- * → bigger objects on screen. ASPECT_Y compensates for terminal cells
- * being roughly twice as tall as wide, so spheres render round.
- *
- * At zoom = 1, with the geometry below (sun_R = 3.5, sun_Z = 50), the
- * sun's apparent angular radius is ~7% of the screen half-width — a
- * compact, vivid disc. Zooming to 4× or 8× brings totality details
- * (chromosphere ring, prominences, beads) into focus.
- */
-#define ASPECT_Y 2.0f
-#define FOV_H_BASE 0.40f
-#define ZOOM_MIN 0.25f
-#define ZOOM_MAX 8.0f
-#define ZOOM_STEP 1.25f
-
-/* §1.3 scene geometry — sun far, moon close.
- *
- * Apparent angular radii at default geometry:
- *   sun_α   = atan(SUN_R  / SUN_Z ) = atan(3.5 / 50.0) ≈ 4.0°
- *   moon_α  = atan(0.62  / 5.0)    ≈ 7.1°
- *   ratio   = moon_α / sun_α       ≈ 1.76
- *
- * Setting moon clearly larger than sun (1.76×) makes totality read
- * unambiguously: the moon's silhouette dominates, with corona visible
- * in a halo around it. Were the ratio close to 1 the eye would read
- * the bright sun + corona as one disc and the moon as a small dark
- * intrusion — visually wrong.
- *
- * Three pattern-specific moon sizes are predefined; pattern_set
- * (§12.2) picks one when n / p is pressed. The user-controlled
- * `moon_scale` (in Scene, §12.1) multiplies on top of these.
- *
- * MOON_ORBIT_X_FRAC controls how far the moon swings horizontally —
- * the full orbit reaches MOON_ORBIT_X_FRAC × (sun_α + moon_α) on
- * either side of centre. Setting it < 1 gives a near-miss; 1.5 gives
- * a clean enter/exit cycle.
- */
-#define SUN_Z 50.0f
-#define SUN_R 3.5f
-#define MOON_Z 5.0f
-#define MOON_BASE_R_TOTAL 0.62f
-#define MOON_BASE_R_ANNULAR 0.32f
-#define MOON_BASE_R_TRANSIT 0.04f
-
-#define MOON_SCALE_MIN 0.5f
-#define MOON_SCALE_MAX 2.0f
-#define MOON_SCALE_STEP 1.10f
-
-#define ECLIPSE_PERIOD_S 30.0f
-#define MOON_ORBIT_X_FRAC 1.5f
-#define PARTIAL_Y_OFFSET 0.025f
-
-/* §1.4 corona scattering coefficient.
- *
- * The corona's electron density falls roughly as r^(-2.5) (the K-corona
- * power law) — we use 3.0 here for a slightly steeper falloff that
- * keeps the visible glow tight to the limb. CORONA_SIGMA0 is σ at
- * exactly r = R_sun (the photospheric boundary). CORONA_REACH bounds
- * the medium: outside r > REACH·R_sun, σ ≡ 0 and the path tracer can
- * coarse-stride harmlessly.
- *
- * Real-world coronal optical depth across one solar radius is ~10^-9.
- * For an LDR ASCII display we scale all σ values up by a uniform
- * representational factor so τ along visible chords lands in the
- * [0.05, 0.6] range — this is a display scaling, not a physics hack;
- * the radial decay shape stays correct.
- */
-#define CORONA_REACH 8.0f
-#define CORONA_SIGMA0 0.18f
-#define CORONA_DECAY 3.0f
-
-/* §1.5 chromosphere shell.
- *
- * The chromosphere is a thin layer above the photosphere — real-world
- * thickness ~0.3% of R_sun, we use 2.5% so it's visible at low
- * resolution. CHROMOS_SIGMA0 is its peak σ (much higher than corona's
- * — chromosphere is optically thick at Hα core).
- *
- * Outer edge falls off as (1 − h)⁴ where h = (r − R_sun) / thickness ∈
- * [0,1] — sharper than a quadratic, reads as a thin band rather than
- * a soft glow.
- */
-#define CHROMOS_THICK 0.025f
-#define CHROMOS_SIGMA0 6.0f
-
-/* §1.6 chromosphere spicule fBm.
- *
- * Spicules are radial jet-like structures in the chromosphere (~tens
- * of thousands of them on the real sun). We approximate the texture
- * by sampling 2-D fBm in spherical surface coordinates (theta, phi).
- * The patches extend radially through the thin shell, producing
- * visible streak-like texture rather than a smooth ring.
- *
- *   spicule_factor = SPICULE_BASE + SPICULE_AMP · fBm(phi · 12,
- *                                                     theta · 6)
- *
- * The factor multiplies chromos_emission. Hot peaks (high fBm) shift
- * the Hα colour toward yellow for thermal variation.
- */
-#define SPICULE_FREQ_PHI 12.0f
-#define SPICULE_FREQ_TH 6.0f
-#define SPICULE_BASE 0.5f
-#define SPICULE_AMP 1.2f
-
-/* §1.7 prominences — dense Hα loops.
- *
- * Prominences are arcs of cool dense plasma rooted in the chromosphere.
- * We place PROM_COUNT of them at random angular positions per seed,
- * each with its own height (up to PROM_HEIGHT × R_sun above the
- * photosphere) and lateral angular width. Their density adds onto the
- * chromosphere shell — they are NOT spherically symmetric, so they
- * don't contribute to the radial transmittance LUT (only to the
- * additive emission term).
- */
-#define PROM_COUNT 5
-#define PROM_HEIGHT 0.18f
-#define PROM_LATERAL 0.18f
-#define PROM_SIGMA0 8.0f
-
-/* §1.8 path tracer parameters.
- *
- * MARCH_STEPS is the budget of fine-step samples between t=0 and
- * t_max (per pixel). Adaptive marching uses these inside the corona's
- * radial extent and 4× coarser strides outside; the 96 fine-step
- * count gives Δt ≈ 0.83 in world units when t_max ≈ 80, which is
- * fine enough to step into the chromosphere shell (thickness 0.125)
- * with at least one sample inside.
- *
- * IN_SCATTER_GAIN scales corona radiance to the LDR display range
- * (real corona is ~10⁶× dimmer than photosphere; we compress that to
- * a factor of ~14 so Reinhard maps it to visibly distinct cells).
- *
- * SUN_EMIT_HDR is the photosphere radiance multiplier: high enough
- * that even after eye-ray extinction (T ≈ 0.6) the photosphere
- * saturates the tone-map at the disc centre.
- *
- * HA_EMIT_GAIN does the same job for chromosphere and prominence Hα
- * line emission — relative to corona scatter.
- *
- * LUT_SIZE / LUT_R_MAX define the radial transmittance table. 256
- * samples from R_sun to (REACH+2)·R_sun is plenty given the smooth
- * power-law σ — bilinear interpolation has sub-cell accuracy.
- */
-#define MARCH_STEPS 96
-#define MARCH_T_MAX (SUN_Z + SUN_R * 6.0f)
-#define LUT_SIZE 256
-#define LUT_R_MAX (SUN_R * (CORONA_REACH + 2.0f))
-#define IN_SCATTER_GAIN 14.0f
-#define SUN_EMIT_HDR 8.0f
-#define HA_EMIT_GAIN 3.0f
-
-/* §1.9 eye-adaptation gate.
- *
- * Multiplier applied to corona and chromosphere emission. Computed
- * once per frame from the camera's view of the sun:
- *
- *   gate = CORONA_GATE_FLOOR + CORONA_GATE_RANGE · (1 − vis_cam_sun)
- *
- * FLOOR=0 means no halo on an unblocked sun (this file). FLOOR=0.15
- * preserves a faint baseline glow always — change one constant to
- * switch behaviour. See Tutorial 10.
- */
-#define CORONA_GATE_FLOOR 0.00f
-#define CORONA_GATE_RANGE 1.00f
-
-/* §1.10 surface BRDF parameters.
- *
- * LIMB_AMBIENT and LIMB_GAIN parameterise the photosphere's Eddington-
- * style limb darkening: I(μ) = AMBIENT + GAIN · μ where μ = N · V is
- * the cosine of the view angle. The disc edge (μ ≈ 0) reads at 40% of
- * the central brightness — close to real solar physics.
- *
- * Moon is Lambertian with a low albedo (lunar Bond albedo ≈ 0.12).
- * EARTH_ALBEDO_BLUE is the blue channel of the Earth's averaged
- * Rayleigh-tinted reflectance — the cool-blue tint the moon picks up
- * via earthshine. EARTHSHINE_GAIN scales the constant ambient term we
- * apply.
- */
-#define LIMB_AMBIENT 0.40f
-#define LIMB_GAIN 0.60f
-#define MOON_ALBEDO 0.12f
-#define EARTH_ALBEDO_BLUE 0.45f
-#define EARTHSHINE_GAIN 0.10f
-
-/* §1.11 lunar terrain — Bailey's-bead silhouette perturbation.
- *
- * Two scales of valleys:
- *   • 14 macro valleys, ~2% deep, 0.06 rad wide, ASYMMETRIC.
- *     One per seed gets a 2.5× depth boost (the diamond ring).
- *   • 30 micro valleys, ~1% deep, 0.025 rad wide, SYMMETRIC.
- *
- * Both bake into a single 512-entry angular LUT once per seed. Bigger
- * LUT size resolves narrow micro valleys without bilinear blur.
- *
- * The asymmetry: each macro valley has a per-seed coin-flip choosing
- * which side is sharp (narrower Gaussian) and which is gradual. Beads
- * "pop in" sharply on the sharp side and fade out on the gradual side,
- * mimicking real mountain shadows.
- */
-#define LUNAR_VALLEY_COUNT 14
-#define LUNAR_VALLEY_DEPTH 0.020f
-#define LUNAR_VALLEY_WIDTH 0.06f
-#define LUNAR_VALLEY_ASYM 0.45f
-#define LUNAR_DIAMOND_BOOST 2.5f
-
-#define LUNAR_MICRO_COUNT 30
-#define LUNAR_MICRO_DEPTH 0.010f
-#define LUNAR_MICRO_WIDTH 0.025f
-
-#define LUNAR_LUT_SIZE 512
-
-/* §1.12 background stars.
- *
- * Sparse pinpoint stars visible only during totality (drowned by
- * photosphere otherwise). Each star samples a blackbody at random
- * Kelvin in [STAR_K_MIN, STAR_K_MAX], log-uniform — so the field has
- * the warm-orange to cool-blue colour spread of real stars rather
- * than uniform white.
- *
- * STAR_DENSITY = 250 means roughly 1 star per 250 sky cells; tune
- * down for a denser field, up for sparser.
- */
-#define STAR_DENSITY 250
-#define STAR_OCC_VISIBLE 0.85f
-#define STAR_K_MIN 3000.0f
-#define STAR_K_MAX 30000.0f
-
-/* §1.13 framebuffer dimensions.
- *
- * Static — no malloc anywhere in the hot path. BUF_MAX_W/H bound the
- * per-frame g_buf array; if your terminal is bigger than that you'll
- * see clipping (rare; 400×200 is generous).
- */
-#define BUF_MAX_W 400
-#define BUF_MAX_H 200
-
-/* §1.14 ncurses pair IDs and ASCII glyph ramp.
- *
- * PAIR_HUD / PAIR_HINT match the project HUD convention. The cube
- * pairs occupy IDs 16..231 (216 cells of the xterm 6×6×6 cube).
- *
- * The density ramp ` .'`,-_:;~=+*oO0` uses only OPEN glyphs — no
- * filled blocks. Bright cells become points of light, not solid
- * pixels. `#` and `@` are deliberately absent.
- */
-enum {
-  PAIR_HUD = 1,
-  PAIR_HINT = 2,
-  PAIR_SUN_FALLBACK = 3,
-  PAIR_EVENT_HOT = 4,
-  PAIR_CUBE_BASE = 16,
-};
-
-static const char k_ramp[] = " .'`,-_:;~=+*oO0";
-#define RAMP_LEN ((int)(sizeof k_ramp - 1))
-
-/* §1.15 patterns enum.
- *
- * Four moon-size / orbit-offset configurations. pattern_set (§12.2)
- * applies the corresponding moon radius and y-offset.
- */
-typedef enum {
-  PATTERN_TOTAL = 0,
-  PATTERN_PARTIAL = 1,
-  PATTERN_ANNULAR = 2,
-  PATTERN_TRANSIT = 3,
-  N_PATTERNS = 4,
-} Pattern;
-
-static const char *pattern_name(Pattern p) {
-  switch (p) {
-  case PATTERN_TOTAL:
-    return "TOTAL  ";
-  case PATTERN_PARTIAL:
-    return "PARTIAL";
-  case PATTERN_ANNULAR:
-    return "ANNULAR";
-  case PATTERN_TRANSIT:
-    return "TRANSIT";
-  default:
-    return "?      ";
-  }
-}
-
-/* §1.16 stellar classes — main-sequence spectral types.
- *
- * Each entry is a single number (Kelvin temperature). Every visible
- * colour in the scene derives from this:
- *   photosphere = blackbody(K)
- *   corona      = scattered photosphere = same chromaticity
- *   chromos/Hα  = fixed wavelength (independent of K)
- *
- * No artistic palettes here. M-DWARF gives a deep red sun, B-STAR
- * a hot blue one — these are real spectral types.
- */
-typedef struct {
-  const char *name;
-  float kelvin;
-} Star;
-
-static const Star STARS[] = {
-    {"M-DWARF", 3500.0f}, {"K-STAR ", 4500.0f},  {"G-STAR ", 5778.0f},
-    {"A-STAR ", 9500.0f}, {"B-STAR ", 18000.0f},
-};
-#define N_STARS ((int)(sizeof STARS / sizeof STARS[0]))
-
-/* ── §2 monotonic clock ──────────────────────────────────────────────── *
- *
- * Two primitives: read the monotonic clock as nanoseconds, sleep for
- * a duration in nanoseconds. Both use POSIX functions; nanosleep
- * blocks the calling thread until the time elapses. We use the
- * monotonic clock (not wall clock) so suspend/resume of the laptop
- * doesn't produce frame jumps.
- */
-
 /*
- * clock_ns — nanoseconds since an arbitrary monotonic epoch.
+ * ════════════════════════════════════════════════════════════════════
+ *  ARCHITECTURE — concern layers (step-4 separation pass)
+ * ════════════════════════════════════════════════════════════════════
  *
- * Purpose:    return a steadily-increasing time value that doesn't
- *             jump when wall-clock changes happen (NTP, DST).
- * Returns:    int64_t, ns since epoch (the value's absolute meaning
- *             doesn't matter; only differences are meaningful).
- * Why:        the simulation's accumulator-based loop in §16 needs
- *             a robust dt source. CLOCK_MONOTONIC is that.
+ *  Labelled, separated layers. LOGIC is pure (no mutation, no I/O), so
+ *  reordering or deleting RENDER can never change a LOGIC result.
+ *
+ *  LAYER        SECTION(S)                       MUTATES
+ *  ----------   ------------------------------   ------------------------------
+ *  TYPES/CONFIG §0, §1                           nothing — forward types,
+ *                                                constants, ramp, enums (data)
+ *  PERFORMANCE  §2; app_run dt/accum/fps/cap     OS sleep + loop-local timers
+ *  LOGIC        §3, §4 (noise), §6, §7 (read),   nothing — pure functions:
+ * math, §8, §9, §10 (lookup), §11, §13,  colour, noise, ray-sphere, lunar
+ *               scene_moon_* / occlusion (§12)   silhouette, penumbra, medium
+ *                                                density/emission,
+ * transmittance lookup, trace_ray (the core), camera rays, moon-orbit math
+ *  RENDER       §5, §14, §15                     the SCREEN (ncurses cells) +
+ *                                                g_buf framebuffer + g_256;
+ * reads scene, never writes it SIMULATION   scene_tick (§12) Scene.time_secs —
+ * the eclipse clock, the only PER-TICK state. Worldgen at init / `r` reseed:
+ *                                                perm_shuffle (§4),
+ * build_lunar_lut (§7), medium_reseed (§9), plus the one-time build_trans_lut
+ * (§10). DELAYS       Scene.paused gate (§12)          nothing — pause
+ * early-returns scene_tick; no holds/timers EFFECTS      — none — no stored
+ * cosmetic state; the corona/beads/penumbra are traced fresh every frame (g_buf
+ * is per-frame scratch, not temporal)
+ *
+ *  Timestep note: PERFORMANCE uses a FIXED-TIMESTEP accumulator (app_run:
+ *  sim_accum += dt; while (sim_accum >= TICK_NS) scene_tick()), with a spiral-
+ *  of-death dt cap and a frame-cap sleep. sim_fps is user-tunable ( [ / ] ),
+ *  decoupling the sim rate from the render rate.
+ *
+ *  PER-TICK COMBINE ORDER (app_run — the one place layers meet):
+ *    drain input   USER EVENTS  app_handle_key: mutate Scene knobs / quit
+ *    resize        USER EVENT   apply pending SIGWINCH
+ *    dt            PERFORMANCE  wall-clock dt, capped
+ *    accumulate    SIMULATION   scene_tick() per fixed step (skipped if paused)
+ *    draw          RENDER       scene_draw -> screen_present (reads only)
+ *    fps + sleep   PERFORMANCE  rolling fps measure, then frame cap
+ *
+ *  User events (key input, SIGWINCH resize, the `r` reseed, signal handlers)
+ *  mutate Scene knobs, reseed the LUTs / medium, and set running / need_resize.
+ *  They are NOT the tick; the only per-tick simulation write is scene_tick.
+ * ════════════════════════════════════════════════════════════════════
  */
-static int64_t clock_ns(void) {
-  struct timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
-}
-
-/*
- * clock_sleep_ns — sleep for `ns` nanoseconds, no-op for non-positive.
- *
- * Purpose:    yield CPU until ns have elapsed. Returns early on signal
- *             interruption (we don't care; the main loop re-paces).
- * Inputs:     ns  duration to sleep (nanoseconds). Negative or zero
- *                 returns immediately.
- * Why:        used by the main loop to cap the maximum FPS — without
- *             it we'd burn 100% of a CPU core.
- */
-static void clock_sleep_ns(int64_t ns) {
-  if (ns <= 0)
-    return;
-  struct timespec req = {
-      .tv_sec = (time_t)(ns / NS_PER_SEC),
-      .tv_nsec = (long)(ns % NS_PER_SEC),
-  };
-  nanosleep(&req, NULL);
-}
-
-/* ── §3 math + colour ────────────────────────────────────────────────── *
- *
- * Vector arithmetic on V3, channel-wise arithmetic on RGB, plus tone-
- * mapping helpers and a blackbody-temperature → RGB approximation.
- * Everything is `static inline` because all of these are called in
- * tight loops — the path tracer dispatches thousands of v3_dot, v3_sub
- * calls per frame.
- *
- * We use sqrtf (single-precision) throughout. The path tracer doesn't
- * benefit from double-precision accuracy in this resolution regime.
- */
-
-/* §3.1 V3 ops — geometric primitives.
- *
- * Constructor, addition, subtraction, scalar multiplication, dot
- * product, length, normalisation. v3_norm clamps zero-length vectors
- * to (0,0,0) instead of dividing by zero — used in a few places where
- * a chord might collapse during the orbit.
- */
-
-static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
-static inline V3 v3_add(V3 a, V3 b) {
-  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-static inline V3 v3_sub(V3 a, V3 b) {
-  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
-}
-static inline V3 v3_scl(V3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
-static inline float v3_dot(V3 a, V3 b) {
-  return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-static inline float v3_len(V3 a) { return sqrtf(v3_dot(a, a)); }
-static inline V3 v3_norm(V3 a) {
-  float l = v3_len(a);
-  if (l < 1e-12f)
-    return v3(0, 0, 0);
-  return v3_scl(a, 1.0f / l);
-}
-
-/* §3.2 RGB ops — channel-wise arithmetic.
- *
- * RGB is HDR (channels can exceed 1.0). rgb_mul is component-wise
- * multiplication, used for things like "sun colour × Earth albedo →
- * earthshine tint".
- */
-
-static inline RGB rgb_make(float r, float g, float b) { return (RGB){r, g, b}; }
-static inline RGB rgb_add(RGB a, RGB b) {
-  return rgb_make(a.r + b.r, a.g + b.g, a.b + b.b);
-}
-static inline RGB rgb_mul(RGB a, RGB b) {
-  return rgb_make(a.r * b.r, a.g * b.g, a.b * b.b);
-}
-static inline RGB rgb_scl(RGB a, float s) {
-  return rgb_make(a.r * s, a.g * s, a.b * s);
-}
-
-/* §3.3 tone-map + gamma + luma.
- *
- * Reinhard tone-map: c' = c / (1+c). Maps [0, ∞) → [0, 1) — saturates
- * toward 1 as input grows. Gamma 1/2.2 is the standard sRGB encoding
- * approximation. luma_of uses Rec.601 weights to convert RGB to a
- * single brightness.
- *
- * These are the FINAL pipeline stage between HDR-radiance and the
- * 6×6×6 cube + glyph. paint_cell (§5.2) is the only call site.
- */
-
-static inline float clamp01(float x) {
-  return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
-}
-static inline float reinhard(float x) { return x / (1.f + x); }
-static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
-static inline float luma_of(RGB c) {
-  return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
-}
-
-/* §3.4 blackbody → RGB (Tanner Helland approximation).
- *
- * Purpose:     convert a temperature in Kelvin to an sRGB chromaticity.
- *              Used for the photosphere (sun_em), background star
- *              colours, and indirectly the corona (it scatters
- *              photospheric light unchanged in chromaticity).
- * Inputs:      kelvin  temperature, K. Useful range 1000–40000.
- * Returns:     RGB ∈ [0, 1] — chromaticity, NOT photometric brightness.
- *
- * Why:         every colour in the scene comes from this function. The
- *              piecewise approximation is from Tanner Helland (2012),
- *              accurate enough for visual chromaticity given the 6×6×6
- *              cube's quantisation budget. Higher precision (Planck
- *              integrated against CIE matching functions) wouldn't
- *              survive cube quantisation.
- *
- * Pseudocode:
- *      K = kelvin / 100   (scaled, for the piecewise)
- *      r = 1                                    if K ≤ 66
- *          329.7 · (K-60)^(-0.1332)             otherwise   (cap at 1)
- *      g = piecewise log/power formulae
- *      b = 0   if K ≤ 19
- *          1   if K ≥ 66
- *          piecewise log formula otherwise
- *      return clamp01(r), clamp01(g), clamp01(b)
- */
-static RGB blackbody_rgb(float kelvin) {
-  float K = kelvin / 100.0f;
-  float r, g, b;
-
-  if (K <= 66.0f)
-    r = 1.0f;
-  else
-    r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
-
-  if (K <= 66.0f)
-    g = (99.47f * logf(K) - 161.12f) / 255.0f;
-  else
-    g = 288.12f * powf(K - 60.0f, -0.0755f) / 255.0f;
-
-  if (K >= 66.0f)
-    b = 1.0f;
-  else if (K <= 19.0f)
-    b = 0.0f;
-  else
-    b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
-
-  return rgb_make(clamp01(r), clamp01(g), clamp01(b));
-}
-
-/* ── §4 rng + noise ──────────────────────────────────────────────────── *
- *
- * Two RNG primitives: a 3-D integer hash for deterministic per-cell /
- * per-seed values (used for star positions, lunar valley parameters,
- * prominence layouts), and Perlin noise / fBm for the chromosphere
- * spicule texture (§9.4).
- *
- * The Perlin permutation table `perm[]` is shuffled per seed so the
- * spicule pattern changes when the user presses 'r'.
- */
-
-/* §4.1 integer hash → uint32 / float.
- *
- * hash3 mixes three 32-bit integers into one. Used pervasively for
- * "give me a deterministic pseudo-random number for this combination
- * of indices and seed". Same inputs always produce the same output;
- * different inputs produce well-distributed outputs.
- */
-
-static inline uint32_t hash3(int wx, int wy, int wz) {
-  uint32_t h = (uint32_t)wx * 73856093u ^ (uint32_t)wy * 19349663u ^
-               (uint32_t)wz * 83492791u;
-  h ^= h >> 16;
-  h *= 0x85ebca6bu;
-  h ^= h >> 13;
-  h *= 0xc2b2ae35u;
-  h ^= h >> 16;
-  return h;
-}
-
-static inline float hash01(uint32_t h) {
-  return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
-}
-
-/* §4.2 Perlin noise.
- *
- * Standard 2-D Perlin noise. The permutation table `perm[]` is filled
- * by perm_shuffle from a seed; perlin2d does gradient-based smooth
- * interpolation via fade_q (the quintic 6t⁵-15t⁴+10t³ smoothstep).
- *
- * Output range: roughly (-1, 1); we re-scale to (0, 1) inside fbm2.
- */
-
-static uint8_t perm[512];
-
-static void perm_shuffle(int seed) {
-  uint8_t base[256];
-  for (int i = 0; i < 256; i++)
-    base[i] = (uint8_t)i;
-  uint32_t st = (uint32_t)seed * 2654435761u;
-  for (int i = 255; i > 0; i--) {
-    st = st * 1664525u + 1013904223u;
-    int j = (int)(st >> 16) % (i + 1);
-    uint8_t t = base[i];
-    base[i] = base[j];
-    base[j] = t;
-  }
-  for (int i = 0; i < 256; i++) {
-    perm[i] = base[i];
-    perm[i + 256] = base[i];
-  }
-}
-
-static inline float fade_q(float t) {
-  return t * t * t * (t * (t * 6.f - 15.f) + 10.f);
-}
-static inline float lerp_f(float a, float b, float t) {
-  return a + t * (b - a);
-}
-static inline float grad2(int hash, float x, float y) {
-  int h = hash & 7;
-  float u = (h < 4) ? x : y;
-  float v = (h < 4) ? y : x;
-  return ((h & 1) ? -u : u) + ((h & 2) ? -2.f * v : 2.f * v);
-}
-
-static float perlin2d(float x, float y) {
-  int X = (int)floorf(x) & 255;
-  int Y = (int)floorf(y) & 255;
-  x -= floorf(x);
-  y -= floorf(y);
-  float u = fade_q(x), v = fade_q(y);
-  int A = perm[X] + Y;
-  int B = perm[X + 1] + Y;
-  float n00 = grad2(perm[A], x, y);
-  float n10 = grad2(perm[B], x - 1.f, y);
-  float n01 = grad2(perm[A + 1], x, y - 1.f);
-  float n11 = grad2(perm[B + 1], x - 1.f, y - 1.f);
-  return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
-}
-
-/* §4.3 fractal Brownian motion (fBm).
- *
- * Three octaves of Perlin summed with halving amplitude and doubling
- * frequency — the standard cloud-noise recipe. Returns a value in
- * [0, 1]. Used by emission_at (§9.4) for chromosphere spicule
- * texture.
- */
-
-static float fbm2(float x, float y) {
-  float total = 0.f, amp = 1.f, freq = 1.f, max_amp = 0.f;
-  for (int o = 0; o < 3; o++) {
-    total += amp * perlin2d(x * freq, y * freq);
-    max_amp += amp;
-    amp *= 0.5f;
-    freq *= 2.0f;
-  }
-  return (total / max_amp) * 0.5f + 0.5f;
-}
-
-/* ── §5 terminal painting ────────────────────────────────────────────── *
- *
- * Final stage of the pipeline: take an HDR RGB radiance value and
- * write a glyph-with-colour to the terminal cell. Two functions:
- * color_init sets up the ncurses pair table at startup; paint_cell
- * does the per-cell tone-map → cube-quantise → glyph-pick at the end
- * of every frame.
- *
- * On 256-colour terminals we use a 6×6×6 RGB cube (216 pairs) plus
- * four named pairs for the HUD. On 8-colour terminals we fall back to
- * a single yellow-on-default pair for the whole scene — the eclipse
- * still works visually, just mono-yellow.
- */
-
-static int g_256; /* 1 if terminal supports 256 colours */
-
-/*
- * color_init — set up ncurses pair table.
- *
- * Purpose:     define COLOR_PAIR ids 1..231 with sensible foreground
- *              colours. Called once at startup from screen_init.
- * Inputs:      none (uses the global ncurses state set by start_color).
- * Why:         paint_cell needs the cube pairs pre-defined; the HUD
- *              uses PAIR_HUD / PAIR_HINT / PAIR_EVENT_HOT. Doing this
- *              once keeps the per-cell paint cheap.
- */
-static void color_init(void) {
-  start_color();
-  use_default_colors();
-  g_256 = (COLORS >= 256);
-  if (g_256) {
-    for (int i = 0; i < 216; i++)
-      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
-    init_pair(PAIR_HUD, 226, -1);
-    init_pair(PAIR_HINT, 51, -1);
-    init_pair(PAIR_EVENT_HOT, 196, -1);
-  } else {
-    init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
-    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
-    init_pair(PAIR_HINT, COLOR_CYAN, -1);
-    init_pair(PAIR_EVENT_HOT, COLOR_RED, -1);
-  }
-}
-
-/*
- * paint_cell — write one terminal cell from an HDR RGB value.
- *
- * Purpose:     end-of-pipeline conversion of HDR float radiance to a
- *              coloured glyph in the terminal at (sx, sy).
- * Inputs:      sx, sy   screen position (cell coordinates)
- *              col      HDR RGB radiance (channels can exceed 1.0)
- *
- * Pseudocode:
- *      r,g,b = gamma_enc(reinhard(col.{r,g,b}))
- *      luma  = 0.2126·r + 0.7152·g + 0.0722·b
- *      glyph = k_ramp[ round(luma · (RAMP_LEN − 1)) ]
- *      r5,g5,b5 = round(r/g/b · 5)        ∈ [0,5]
- *      pair  = PAIR_CUBE_BASE + r5·36 + g5·6 + b5
- *      attr  = A_BOLD if luma > 0.85 else A_DIM if luma < 0.15 else 0
- *      mvaddch(sy, sx, glyph) with COLOR_PAIR(pair) | attr
- *
- * Mental model: we're projecting an HDR point in colour space onto
- * one of 216 cube cells, then choosing a brightness glyph and a font
- * weight based on luma. The cube pair governs hue; the glyph governs
- * brightness; A_BOLD/A_DIM bumps brightness slightly at the extremes.
- *
- * Why: the only place HDR meets the terminal. If you want to add a
- * bloom pass or post-process, this is where it would land — but
- * currently we go straight from g_buf to mvaddch.
- */
-static void paint_cell(int sx, int sy, RGB col) {
-  float r = gamma_enc(reinhard(col.r));
-  float g = gamma_enc(reinhard(col.g));
-  float b = gamma_enc(reinhard(col.b));
-  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-  int ri = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
-  if (ri < 0)
-    ri = 0;
-  if (ri >= RAMP_LEN)
-    ri = RAMP_LEN - 1;
-
-  if (g_256) {
-    int r5 = (int)(r * 5.f + 0.5f);
-    if (r5 > 5)
-      r5 = 5;
-    if (r5 < 0)
-      r5 = 0;
-    int g5 = (int)(g * 5.f + 0.5f);
-    if (g5 > 5)
-      g5 = 5;
-    if (g5 < 0)
-      g5 = 0;
-    int b5 = (int)(b * 5.f + 0.5f);
-    if (b5 > 5)
-      b5 = 5;
-    if (b5 < 0)
-      b5 = 0;
-    int pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
-    int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
-    attron(COLOR_PAIR(pair) | attr);
-    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-    attroff(COLOR_PAIR(pair) | attr);
-  } else {
-    attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
-    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-    attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
-  }
-}
-
-/* ── §6 ray-sphere intersection ──────────────────────────────────────── *
- *
- * Analytic intersection of a unit-length ray with a sphere. The math
- * is the quadratic in disguise (Tutorial 3); this is the workhorse of
- * the path tracer's primary-ray hit test against the photosphere
- * sphere. The moon uses a perturbed variant in §7 that calls into the
- * lunar terrain LUT.
- *
- * If the ray misses or both hit-times are behind the camera, returns
- * false and *out_t is unchanged. Otherwise *out_t is the nearest hit
- * t-value (t > 1e-3 to keep us off self-intersection at the surface).
- */
-
-/*
- * ray_sphere — analytic ray-vs-sphere with unit direction.
- *
- * Purpose:     test whether a ray from `ro` in direction `rd` (|rd|=1)
- *              hits the sphere of radius `r` centred at `c`, and if
- *              so, return the nearest valid hit-time.
- *
- * Pseudocode:
- *      oc = ro − c
- *      b  = oc · rd
- *      cc = oc·oc − r·r
- *      disc = b·b − cc
- *      if disc < 0: miss
- *      sq = √disc
- *      t  = −b − sq                ← near intersection
- *      if t < ε: t = −b + sq       ← try far intersection
- *      if t < ε: still behind     → miss
- *      *out_t = t; return true
- *
- * Inputs:      ro      ray origin (world units)
- *              rd      ray direction, must be unit length
- *              c       sphere centre (world)
- *              r       sphere radius (world units)
- *              out_t   filled with hit parameter on hit
- * Returns:     true on hit, false on miss or all-behind
- *
- * Why: the photosphere is the only purely-spherical primitive we hit
- * in the eye-ray pass. The moon needs a perturbed variant — see §7.
- */
-static bool ray_sphere(V3 ro, V3 rd, V3 c, float r, float *out_t) {
-  V3 oc = v3_sub(ro, c);
-  float b = v3_dot(oc, rd);
-  float cc = v3_dot(oc, oc) - r * r;
-  float disc = b * b - cc;
-  if (disc < 0)
-    return false;
-  float sq = sqrtf(disc);
-  float t = -b - sq;
-  if (t < 1e-3f)
-    t = -b + sq;
-  if (t < 1e-3f)
-    return false;
-  *out_t = t;
-  return true;
-}
-
-/* ── §7 lunar terrain — Bailey's-bead silhouette ─────────────────────── *
- *
- * The moon isn't a perfect sphere visually — it has mountains and
- * valleys around its limb. Real Bailey's beads come from light
- * leaking through valleys at the totality boundary. We model this
- * with a per-direction radius perturbation (Tutorial 8):
- *
- *      moon_R(direction) = moon_R_base · (1 − valley_depth(phi))
- *
- * `phi` is the angle from +x axis to the perpendicular projection of
- * `direction` onto the moon's silhouette plane (the xy plane in world
- * coordinates, since we look down +z). 14+30 valleys are baked into a
- * 512-entry LUT once per seed.
- *
- * §7 has three pieces:
- *   §7.1 build_lunar_lut — construct the LUT from per-seed valley params
- *   §7.2 lunar_R_at      — runtime O(1) lookup with bilinear interp
- *   §7.3 ray_moon        — perturbed ray-sphere using the LUT
- */
-
-static float lunar_lut[LUNAR_LUT_SIZE];
-
-/* §7.1 build_lunar_lut.
- *
- * Purpose:     bake 14 macro + 30 micro valleys into a single 512-entry
- *              angular table. After this, lunar_R_at is a constant-time
- *              lookup with no exp() calls.
- *
- * Pseudocode:
- *      pick a per-seed diamond-ring index ∈ [0, 14)
- *      for each macro k ∈ [0, 14):
- *          phi_k       = random angle around limb
- *          base_width  = LUNAR_VALLEY_WIDTH · (0.5..1.5)
- *          asym_sign   = ±1 (per seed)
- *          w_left      = base_width · (1 + asym · 0.45)
- *          w_right     = base_width · (1 − asym · 0.45)
- *          depth       = LUNAR_VALLEY_DEPTH · (0.4..1.0)
- *          if k == diamond_idx:
- *              depth *= LUNAR_DIAMOND_BOOST
- *      for each micro k ∈ [0, 30):
- *          ... narrower symmetric Gaussians ...
- *      for each LUT cell i:
- *          phi   = ((i / LUT_SIZE) · 2π) − π
- *          total = sum over macros (asym Gaussian) + sum over micros
- *          lunar_lut[i] = total
- *
- * Inputs:      seed   integer; same seed produces same valley layout.
- * Why:         baking once at reseed makes the runtime cost zero, and
- *              the bilinear interp at lookup gives sub-cell precision
- *              when the 0.06-rad valleys are ~10 LUT cells wide.
- */
-static void build_lunar_lut(int seed) {
-  /* Macro valleys (wide, asymmetric, the main silhouette features). */
-  float phi_v[LUNAR_VALLEY_COUNT];
-  float w2_left_v[LUNAR_VALLEY_COUNT];
-  float w2_right_v[LUNAR_VALLEY_COUNT];
-  float d_v[LUNAR_VALLEY_COUNT];
-
-  /* Pick which macro valley is the diamond-ring (extra depth). */
-  uint32_t dr_h = hash3(0, seed, 0xD1A47000u);
-  int diamond_idx = (int)(hash01(dr_h) * (float)LUNAR_VALLEY_COUNT);
-  if (diamond_idx >= LUNAR_VALLEY_COUNT)
-    diamond_idx = LUNAR_VALLEY_COUNT - 1;
-
-  for (int k = 0; k < LUNAR_VALLEY_COUNT; k++) {
-    uint32_t h = hash3(k, seed, 0x1A11E1);
-    phi_v[k] = (hash01(h) - 0.5f) * 2.0f * (float)M_PI;
-    float w_base = LUNAR_VALLEY_WIDTH * (0.5f + 1.0f * hash01(h ^ 0xE1u));
-
-    /* Asymmetry: one side narrower (sharp), one wider (gradual).
-     * `asym_sign` ∈ {-1, +1} chooses which side is sharp per seed. */
-    float asym_sign = (hash01(h ^ 0xAA00u) > 0.5f) ? 1.0f : -1.0f;
-    float w_left = w_base * (1.0f + asym_sign * LUNAR_VALLEY_ASYM);
-    float w_right = w_base * (1.0f - asym_sign * LUNAR_VALLEY_ASYM);
-    w2_left_v[k] = w_left * w_left;
-    w2_right_v[k] = w_right * w_right;
-
-    float d_k = LUNAR_VALLEY_DEPTH * (0.4f + 0.6f * hash01(h ^ 0xD0u));
-    if (k == diamond_idx)
-      d_k *= LUNAR_DIAMOND_BOOST;
-    d_v[k] = d_k;
-  }
-
-  /* Micro valleys (narrow, symmetric — sharper beads). */
-  float phi_s[LUNAR_MICRO_COUNT];
-  float w2_s[LUNAR_MICRO_COUNT];
-  float d_s[LUNAR_MICRO_COUNT];
-  for (int k = 0; k < LUNAR_MICRO_COUNT; k++) {
-    uint32_t h = hash3(k, seed, 0xCAFEBABEu);
-    phi_s[k] = (hash01(h) - 0.5f) * 2.0f * (float)M_PI;
-    float w_k = LUNAR_MICRO_WIDTH * (0.6f + 0.8f * hash01(h ^ 0xE2u));
-    w2_s[k] = w_k * w_k;
-    d_s[k] = LUNAR_MICRO_DEPTH * (0.5f + 0.7f * hash01(h ^ 0xD1u));
-  }
-
-  for (int i = 0; i < LUNAR_LUT_SIZE; i++) {
-    float phi = ((float)i / (float)LUNAR_LUT_SIZE) * 2.0f * (float)M_PI -
-                (float)M_PI; /* phi ∈ [-π, π) */
-
-    float total = 0.0f;
-    /* Macro contribution — asymmetric Gaussian. */
-    for (int k = 0; k < LUNAR_VALLEY_COUNT; k++) {
-      float dphi = phi - phi_v[k];
-      while (dphi > (float)M_PI)
-        dphi -= 2.0f * (float)M_PI;
-      while (dphi < -(float)M_PI)
-        dphi += 2.0f * (float)M_PI;
-      float w2 = (dphi < 0.0f) ? w2_left_v[k] : w2_right_v[k];
-      total += d_v[k] * expf(-(dphi * dphi) / w2);
-    }
-    /* Micro contribution — symmetric. */
-    for (int k = 0; k < LUNAR_MICRO_COUNT; k++) {
-      float dphi = phi - phi_s[k];
-      while (dphi > (float)M_PI)
-        dphi -= 2.0f * (float)M_PI;
-      while (dphi < -(float)M_PI)
-        dphi += 2.0f * (float)M_PI;
-      total += d_s[k] * expf(-(dphi * dphi) / w2_s[k]);
-    }
-    lunar_lut[i] = total;
-  }
-}
-
-/* §7.2 lunar_R_at.
- *
- * Purpose:     given a unit vector pointing from moon centre toward a
- *              chord's closest-approach point, return the moon's
- *              effective radius along that direction.
- *
- * Pseudocode:
- *      phi   = atan2(from_centre.y, from_centre.x)
- *      u     = (phi + π) / (2π) · LUT_SIZE         ← LUT index, real
- *      i0    = floor(u);  i1 = (i0 + 1) mod LUT_SIZE
- *      depth = lunar_lut[i0]·(1−frac) + lunar_lut[i1]·frac
- *      return moon_R_base · (1 − depth)
- *
- * Inputs:      from_centre  unit V3; the silhouette direction
- *              moon_R_base  unperturbed radius (world units)
- *              seed         unused at runtime (baked into the LUT)
- *
- * Why: the cost-aware wrapper around the LUT. Called from ray_moon
- * (§7.3) at the closest-approach point of a chord. Bilinear lookup
- * ensures smooth transitions between LUT cells.
- */
-static float lunar_R_at(V3 from_centre, float moon_R_base, int seed) {
-  (void)seed; /* baked into the LUT at build time */
-  float phi = atan2f(from_centre.y, from_centre.x); /* (-π, π] */
-  float u = (phi + (float)M_PI) / (2.0f * (float)M_PI) * (float)LUNAR_LUT_SIZE;
-  if (u < 0.0f)
-    u += (float)LUNAR_LUT_SIZE;
-  if (u >= LUNAR_LUT_SIZE)
-    u -= (float)LUNAR_LUT_SIZE;
-  int i0 = (int)u;
-  int i1 = (i0 + 1) % LUNAR_LUT_SIZE;
-  float fr = u - (float)i0;
-  float depth = lunar_lut[i0] * (1.0f - fr) + lunar_lut[i1] * fr;
-  return moon_R_base * (1.0f - depth);
-}
-
-/* §7.3 ray_moon — perturbed ray-vs-moon intersection.
- *
- * Purpose:     test a ray against the moon, using the lunar terrain LUT
- *              to vary the moon's effective radius with direction.
- *
- * The fast path:
- *      Compute b, oc² as in ray_sphere.
- *      Test against the UNPERTURBED moon_R_base sphere first.
- *      If miss → return false (cheap reject — no LUT lookup).
- *      Since lunar valleys only REDUCE radius (depth ≥ 0), missing the
- *      base sphere implies missing any perturbed variant.
- *
- * If the cheap reject doesn't fire, do the perturbed test:
- *      Compute closest-approach point along the chord to moon centre.
- *      Use it as the silhouette direction → lunar_R_at returns r_eff.
- *      Test against r_eff sphere. If hit, return nearest valid t.
- *
- * Without the cheap reject, every NEE chord would do a 14+30 = 44-
- * Gaussian evaluation on the LUT lookup path. With it, ~80% of NEE
- * chords miss the unperturbed sphere and never touch the LUT.
- *
- * Inputs:      ro            ray origin
- *              rd            ray direction (unit)
- *              c             moon centre (world)
- *              moon_R_base   unperturbed moon radius
- *              seed          unused at runtime
- *              out_t         filled with hit parameter on hit
- * Returns:     true on hit (perturbed sphere), false on miss.
- *
- * Why: the EYE-RAY hit test for the moon. The NEE penumbra calculation
- * uses §8 instead — there the moon-disc-vs-sun-disc geometry is the
- * point, and the penumbra formula handles partial coverage analytically.
- */
-static bool ray_moon(V3 ro, V3 rd, V3 c, float moon_R_base, int seed,
-                     float *out_t) {
-  V3 oc = v3_sub(ro, c);
-  float b = v3_dot(oc, rd);
-
-  /* Cheap reject against base sphere. */
-  float oc2 = v3_dot(oc, oc);
-  float r2 = moon_R_base * moon_R_base;
-  float disc = b * b - (oc2 - r2);
-  if (disc < 0)
-    return false;
-  float sq = sqrtf(disc);
-  float t_far = -b + sq;
-  if (t_far < 1e-3f)
-    return false;
-
-  /* Now evaluate perturbation. */
-  V3 nearest = v3_add(ro, v3_scl(rd, -b));
-  V3 radial = v3_sub(nearest, c);
-  float r_eff = lunar_R_at(v3_norm(radial), moon_R_base, seed);
-
-  float cc_p = oc2 - r_eff * r_eff;
-  float disc_p = b * b - cc_p;
-  if (disc_p < 0)
-    return false;
-  float sq_p = sqrtf(disc_p);
-  float t = -b - sq_p;
-  if (t < 1e-3f)
-    t = -b + sq_p;
-  if (t < 1e-3f)
-    return false;
-  *out_t = t;
-  return true;
-}
-
-/* ── §8 penumbra — analytic visible-fraction-of-sun-disc ─────────────── *
- *
- * The path tracer's NEE step (§11) needs to know, at every scatter
- * point, how much of the sun's apparent disc is unblocked by the
- * moon. A binary "is the moon between me and the sun?" test would
- * give a hard cliff at the moon's edge — wrong; real penumbra is a
- * smooth gradient. We compute the gradient analytically as the
- * fraction of the sun's apparent disc area not covered by the moon's.
- *
- * From a scatter point p, both sun and moon look like circular discs
- * on the unit sphere around p. For small angular extents (a few
- * degrees, true here) the spherical geometry approximates well as
- * planar circles in a tangent plane — circle-circle intersection has
- * a closed form.
- */
-
-/*
- * visible_fraction_sun — analytic [0..1] visibility of the sun.
- *
- * Purpose:     return the unobstructed fraction of the sun's apparent
- *              disc as seen from world point p, given the moon
- *              partially occludes it. Replaces a binary moon-block
- *              test in NEE — gives smooth penumbra.
- *
- * Math:
- *      α_sun  = asin(SUN_R  / |sun − p|)        sun's angular radius
- *      α_moon = asin(moon_R / |moon − p|)       moon's
- *      γ      = angle between (sun − p) and (moon − p)
- *
- *      γ ≥ α_sun + α_moon                     → visible = 1
- *      γ ≤ |α_sun − α_moon| AND α_moon ≥ α_sun → visible = 0    (total)
- *      γ ≤ |α_sun − α_moon| AND α_moon <  α_sun → visible = 1−(α_moon/α_sun)²
- *                                                               (annular)
- *      else: partial overlap, area formula:
- *          A1 = α_sun² · acos((γ²+α_sun²−α_moon²)/(2γα_sun))
- *          A2 = α_moon² · acos((γ²+α_moon²−α_sun²)/(2γα_moon))
- *          A3 = ½ · √(prod of side-length-Heron factors)
- *          overlap = A1 + A2 − A3
- *          visible = 1 − overlap / (π · α_sun²)
- *
- * Inputs:      p          world point we're sampling visibility from
- *              sun_pos    sun centre (world)
- *              moon_pos   moon centre (world)
- *              moon_R     moon radius (world; pass scene_moon_r value)
- * Returns:     visible fraction ∈ [0, 1]; clamped on output.
- *
- * Why: Bailey's beads come from EYE-RAY perturbations (§7.3); penumbra
- * comes from NEE scattering. Different physics, different code paths,
- * but they compose: the eye ray hits the perturbed moon (beads); the
- * NEE-from-corona chords use the unperturbed disc here (smooth
- * penumbra). Trying to combine both into one function gives tangled
- * formulas; separate is cleaner.
- */
-static float visible_fraction_sun(V3 p, V3 sun_pos, V3 moon_pos, float moon_R) {
-  V3 to_sun_v = v3_sub(sun_pos, p);
-  V3 to_moon_v = v3_sub(moon_pos, p);
-  float dist_sun = v3_len(to_sun_v);
-  float dist_moon = v3_len(to_moon_v);
-  if (dist_sun < SUN_R + 1e-3f)
-    return 0.0f;
-  if (dist_moon < moon_R + 1e-3f)
-    return 0.0f;
-
-  float a_sun = asinf(SUN_R / dist_sun);
-  float a_moon = asinf(moon_R / dist_moon);
-
-  V3 d_sun = v3_scl(to_sun_v, 1.0f / dist_sun);
-  V3 d_moon = v3_scl(to_moon_v, 1.0f / dist_moon);
-  float cos_g = v3_dot(d_sun, d_moon);
-  if (cos_g > 1.0f)
-    cos_g = 1.0f;
-  if (cos_g < -1.0f)
-    cos_g = -1.0f;
-  float gamma = acosf(cos_g);
-
-  if (gamma >= a_sun + a_moon)
-    return 1.0f;
-  if (gamma <= fabsf(a_sun - a_moon)) {
-    if (a_moon >= a_sun)
-      return 0.0f;
-    float r = a_moon / a_sun;
-    return 1.0f - r * r;
-  }
-
-  /* Partial overlap: circle-circle intersection area in angle space. */
-  float d = gamma;
-  float r1 = a_sun, r2 = a_moon;
-  float r1s = r1 * r1, r2s = r2 * r2;
-  float a1_arg = (d * d + r1s - r2s) / (2.0f * d * r1);
-  float a2_arg = (d * d + r2s - r1s) / (2.0f * d * r2);
-  if (a1_arg > 1.0f)
-    a1_arg = 1.0f;
-  if (a1_arg < -1.0f)
-    a1_arg = -1.0f;
-  if (a2_arg > 1.0f)
-    a2_arg = 1.0f;
-  if (a2_arg < -1.0f)
-    a2_arg = -1.0f;
-  float A1 = r1s * acosf(a1_arg);
-  float A2 = r2s * acosf(a2_arg);
-
-  float t1 = -d + r1 + r2;
-  float t2 = d + r1 - r2;
-  float t3 = d - r1 + r2;
-  float t4 = d + r1 + r2;
-  float prod = t1 * t2 * t3 * t4;
-  if (prod < 0.0f)
-    prod = 0.0f;
-  float A3 = 0.5f * sqrtf(prod);
-
-  float overlap = A1 + A2 - A3;
-  float sun_a = (float)M_PI * r1s;
-  if (sun_a < 1e-9f)
-    return 1.0f;
-  float vis = 1.0f - overlap / sun_a;
-  if (vis < 0.0f)
-    vis = 0.0f;
-  if (vis > 1.0f)
-    vis = 1.0f;
-  return vis;
-}
-
-/* ── §9 coronal medium ───────────────────────────────────────────────── *
- *
- * The medium has two parts: a spherically-symmetric component (corona +
- * chromosphere shell) and an anisotropic component (prominences). The
- * separation matters because:
- *   • The 1-D radial transmittance LUT (§10) only sees the symmetric
- *     part. Prominences are too small/sparse to affect it visibly.
- *   • Per-frame medium state (Medium struct) holds prominence parameters
- *     that change with seed; the symmetric part is hard-coded and
- *     identical every frame.
- *
- * §9 has four pieces:
- *   §9.1 Medium struct
- *   §9.2 sigma_sph         spherical scattering coefficient at radius r
- *   §9.3 sigma_prom        anisotropic prominence contribution
- *   §9.4 density_total + emission_at  — combined hot-path entry points
- */
-
-/* §9.1 Medium struct.
- *
- * Per-frame state for the coronal medium. The kelvin field is stamped
- * by scene_draw with the current stellar class. Prominence parameters
- * are filled in by medium_reseed (§12.3) when 'r' is pressed.
- */
-typedef struct {
-  float kelvin;                  /* photosphere temperature        */
-  float prom_phi[PROM_COUNT];    /* angular position (rad)         */
-  float prom_height[PROM_COUNT]; /* angular reach × R_sun          */
-  float prom_amp[PROM_COUNT];    /* density multiplier             */
-} Medium;
-
-/* §9.2 sigma_sph — spherically-symmetric σ at radius r.
- *
- * Purpose:     return the local scattering coefficient at distance r
- *              from the sun centre, as the sum of corona power-law
- *              and chromosphere shell.
- *
- * Pseudocode:
- *      if r < R_sun  or  r > REACH·R_sun:  return 0
- *      corona = SIGMA0 · (R_sun / r)^DECAY
- *      h     = (r − R_sun) / (CHROMOS_THICK · R_sun)         ∈ [0, ?]
- *      if h ∈ [0, 1]:
- *          chromos = CHROMOS_SIGMA0 · (1−h)²        ← peaks at shell base
- *      else:
- *          chromos = 0
- *      return corona + chromos
- *
- * Inputs:      r   distance from sun centre (world units)
- * Returns:     σ at this radius, units 1/world-unit.
- *
- * Why: the only function the trans_lut (§10) integrates. Spherical
- * symmetry is what makes the LUT possible — a 1-D table τ(r). Adding
- * anisotropy here would force a 2-D or 3-D LUT with proportionally
- * larger memory; instead we keep prominences in §9.3, where they
- * contribute to the volume rendering integral as additive emission
- * but not to the radial transmittance.
- */
-static float sigma_sph(float r) {
-  if (r < SUN_R)
-    return 0.0f;
-  if (r > SUN_R * CORONA_REACH)
-    return 0.0f;
-
-  float u = SUN_R / r;
-  float cor = CORONA_SIGMA0 * powf(u, CORONA_DECAY);
-
-  float h = (r - SUN_R) / (SUN_R * CHROMOS_THICK);
-  float chrom = 0.0f;
-  if (h >= 0.0f && h <= 1.0f) {
-    float fade = 1.0f - h;
-    chrom = CHROMOS_SIGMA0 * fade * fade;
-  }
-  return cor + chrom;
-}
-
-/* §9.3 sigma_prom — additive prominence density.
- *
- * Purpose:     return extra σ at point p_local from prominence loops.
- *              Each prominence is a 2-D Gaussian in (phi, h_above)
- *              centred at a fixed angular position with random height
- *              and amplitude.
- *
- * Pseudocode:
- *      r       = |p_local|
- *      if r < R_sun or r > (1+PROM_HEIGHT)·R_sun: return 0
- *      h_above = (r − R_sun) / R_sun         ∈ [0, PROM_HEIGHT]
- *      phi     = atan2(p_local.x, p_local.z)
- *      total   = 0
- *      for k ∈ [0, PROM_COUNT):
- *          dphi    = wrap(phi − prom_phi[k]) ∈ (−π, π]
- *          lateral = exp(−dphi² / PROM_LATERAL²)
- *          radial  = (1 − h_above/prom_height[k])² if in range else 0
- *          total += prom_amp[k] · lateral · radial
- *      return PROM_SIGMA0 · total
- *
- * Inputs:      m         medium with seed-dependent prominence params
- *              p_local   point in sun-centred coords
- * Returns:     additional σ from prominences, ≥ 0.
- *
- * Why: lets us paint a few thick "loops" of cool plasma rising from
- * the chromosphere without breaking spherical symmetry of σ_sph.
- * Prominences emit Hα strongly (see emission_at) — they're the
- * brightest features at totality apart from the photosphere itself.
- */
-static float sigma_prom(const Medium *m, V3 p_local) {
-  float r = v3_len(p_local);
-  if (r < SUN_R)
-    return 0.0f;
-  if (r > SUN_R * (1.0f + PROM_HEIGHT))
-    return 0.0f;
-
-  float phi = atan2f(p_local.x, p_local.z);
-  float h_above = (r - SUN_R) / SUN_R;
-  if (h_above > PROM_HEIGHT)
-    return 0.0f;
-
-  float total = 0.0f;
-  for (int k = 0; k < PROM_COUNT; k++) {
-    float reach_k = m->prom_height[k];
-    if (h_above > reach_k)
-      continue;
-    float dphi = phi - m->prom_phi[k];
-    while (dphi > (float)M_PI)
-      dphi -= 2.0f * (float)M_PI;
-    while (dphi < -(float)M_PI)
-      dphi += 2.0f * (float)M_PI;
-    float lat = expf(-(dphi * dphi) / (PROM_LATERAL * PROM_LATERAL));
-    float t_rad = h_above / reach_k;
-    float rad = (1.0f - t_rad) * (1.0f - t_rad);
-    total += m->prom_amp[k] * lat * rad;
-  }
-  return PROM_SIGMA0 * total;
-}
-
-/* §9.4 density_total + emission_at — the path tracer's entry points.
- *
- * density_total just sums sigma_sph(r) and sigma_prom(p) — the path
- * tracer asks for "total σ at this point" once per active step.
- *
- * emission_at returns the Hα emission radiance at p — chromosphere
- * plus prominence contributions. The chromosphere part has spicule
- * texture (fBm in spherical coords) and a hot-peak hue shift; the
- * prominence part stays at the cool baseline Hα colour.
- */
-
-static float density_total(const Medium *m, V3 p_local) {
-  float r = v3_len(p_local);
-  return sigma_sph(r) + sigma_prom(m, p_local);
-}
-
-/*
- * emission_at — local volumetric emission per unit length at p_local.
- *
- * Purpose:     return the radiance emitted per metre by the chromos-
- *              phere + prominences at world-point p_local. The corona
- *              itself doesn't emit — it only scatters photospheric
- *              light, which is handled in the path tracer's NEE step.
- *
- * Pseudocode:
- *      r = |p_local|
- *      if outside chromos+prom range: return (0,0,0)
- *      ha_cool = (1.00, 0.18, 0.12)        cool Hα baseline
- *      ha_hot  = (1.00, 0.45, 0.18)        hot peak (yellow-shifted)
- *      h = (r − R_sun) / (CHROMOS_THICK · R_sun)
- *      chr_em = 0,  spicule_n = 0
- *      if h ∈ [0, 1]:
- *          fade   = (1 − h)^4               sharp outer edge
- *          theta  = acos(p_local.y / r)
- *          phi    = atan2(p_local.x, p_local.z)
- *          spicule_n = fbm2(phi · 12, theta · 6)        ∈ [0, 1]
- *          spicule_factor = SPICULE_BASE + SPICULE_AMP · spicule_n
- *          chr_em = CHROMOS_SIGMA0 · fade · spicule_factor
- *      pr_em = sigma_prom(m, p_local)
- *      chr_col = lerp(ha_cool, ha_hot, spicule_n)        hot-peak shift
- *      return chr_col · chr_em + ha_cool · pr_em
- *
- * Inputs:      m         medium
- *              p_local   world point in sun-centred coords
- * Returns:     RGB radiance per unit length (HDR).
- *
- * Why: chromosphere isn't smooth — it's textured by spicules. fBm in
- * (theta, phi) gives radial-streak patches that map to vertical
- * streaks on the visible chromos ring. Hot peaks lean yellow because
- * real spicule heating shifts emission lines.
- */
-static RGB emission_at(const Medium *m, V3 p_local) {
-  float r = v3_len(p_local);
-  if (r < SUN_R)
-    return rgb_make(0, 0, 0);
-  if (r > SUN_R * (1.0f + PROM_HEIGHT))
-    return rgb_make(0, 0, 0);
-
-  RGB ha_cool = rgb_make(1.00f, 0.18f, 0.12f);
-  RGB ha_hot = rgb_make(1.00f, 0.45f, 0.18f);
-
-  float chr_em = 0.0f;
-  float spicule_n = 0.0f;
-  float h = (r - SUN_R) / (SUN_R * CHROMOS_THICK);
-  if (h >= 0.0f && h <= 1.0f) {
-    float fade = 1.0f - h;
-    fade = fade * fade * fade * fade;
-
-    float r_safe = fmaxf(r, 1e-6f);
-    float yy = p_local.y / r_safe;
-    if (yy > 1.0f)
-      yy = 1.0f;
-    if (yy < -1.0f)
-      yy = -1.0f;
-    float theta = acosf(yy);
-    float phi = atan2f(p_local.x, p_local.z);
-    spicule_n = fbm2(phi * SPICULE_FREQ_PHI, theta * SPICULE_FREQ_TH);
-    float spicule_factor = SPICULE_BASE + SPICULE_AMP * spicule_n;
-
-    chr_em = CHROMOS_SIGMA0 * fade * spicule_factor;
-  }
-
-  float pr_em = sigma_prom(m, p_local);
-
-  RGB chr_col = rgb_make(ha_cool.r + (ha_hot.r - ha_cool.r) * spicule_n,
-                         ha_cool.g + (ha_hot.g - ha_cool.g) * spicule_n,
-                         ha_cool.b + (ha_hot.b - ha_cool.b) * spicule_n);
-
-  RGB out = rgb_scl(chr_col, chr_em);
-  out = rgb_add(out, rgb_scl(ha_cool, pr_em));
-  return out;
-}
-
-/* ── §10 transmittance LUT ───────────────────────────────────────────── *
- *
- * The realtime trick. The path tracer needs, at every active scatter
- * point, the transmittance from that point to the photosphere along
- * the radial inward chord. Computing it by ray-marching at runtime
- * would be O(steps²) per pixel — unaffordable. Spherical symmetry of
- * σ_sph saves us: the optical depth along the radial chord from r to
- * R_sun depends only on r. Tabulate τ(r) once at startup, lookup at
- * runtime.
- */
-
-static float trans_lut[LUT_SIZE];
-
-/* §10.1 build_trans_lut — precompute τ(r) at LUT_SIZE radii.
- *
- * Purpose:     fill `trans_lut[]` with the cumulative radial optical
- *              depth from R_sun out to LUT_R_MAX. Called once at
- *              startup; not seed-dependent (σ_sph doesn't change with
- *              seed).
- *
- * Pseudocode:
- *      trans_lut[0] = 0                 ← τ at r = R_sun
- *      r_prev = R_sun
- *      for i ∈ [1, LUT_SIZE):
- *          r_curr = R_sun + (LUT_R_MAX − R_sun) · (i / (LUT_SIZE − 1))
- *          ds     = (r_curr − r_prev) / N_INT       fine sub-step
- *          tau    = trans_lut[i−1]
- *          for j ∈ [0, N_INT):
- *              s    = r_prev + (j + 0.5) · ds
- *              tau += sigma_sph(s) · ds
- *          trans_lut[i] = tau
- *          r_prev = r_curr
- *
- * Inputs:      none (uses globals LUT_SIZE, LUT_R_MAX, σ_sph).
- * Why: cumulative storage means lookup_transmittance can do a
- * one-bilinear-interp constant-time fetch.
- */
-static void build_trans_lut(void) {
-  const int N_INT = 32;
-  trans_lut[0] = 0.0f;
-  float r_prev = SUN_R;
-  for (int i = 1; i < LUT_SIZE; i++) {
-    float r_curr =
-        SUN_R + (LUT_R_MAX - SUN_R) * ((float)i / (float)(LUT_SIZE - 1));
-    float ds = (r_curr - r_prev) / (float)N_INT;
-    float tau = trans_lut[i - 1];
-    for (int j = 0; j < N_INT; j++) {
-      float s = r_prev + (j + 0.5f) * ds;
-      tau += sigma_sph(s) * ds;
-    }
-    trans_lut[i] = tau;
-    r_prev = r_curr;
-  }
-}
-
-/* §10.2 lookup_transmittance — fetch Tr at world point p_local.
- *
- * Purpose:     return exp(−τ(|p_local|)) by bilinear lookup. p_local
- *              is in sun-centred coordinates.
- *
- * Pseudocode:
- *      r = |p_local|
- *      if r < R_sun:                  return 0    (inside sun)
- *      if r > LUT_R_MAX:              return 1    (clear)
- *      fr = (r − R_sun)/(LUT_R_MAX − R_sun) · (LUT_SIZE − 1)
- *      ir = floor(fr); frac = fr − ir
- *      tau = trans_lut[ir] · (1−frac) + trans_lut[ir+1] · frac
- *      return exp(−tau)
- *
- * Inputs:      p_local   point in sun-centred coords.
- * Returns:     Tr ∈ [0, 1].
- *
- * Why: the inner-loop call from trace_ray's NEE. One memory access,
- * three multiplies, one expf — that's the entire NEE-transmittance
- * cost per active step.
- */
-static float lookup_transmittance(V3 p_local) {
-  float r = v3_len(p_local);
-  if (r < SUN_R)
-    return 0.0f;
-  if (r > LUT_R_MAX)
-    return 1.0f;
-
-  float fr = (r - SUN_R) / (LUT_R_MAX - SUN_R) * (float)(LUT_SIZE - 1);
-  int ir = (int)fr;
-  if (ir < 0)
-    ir = 0;
-  if (ir > LUT_SIZE - 2)
-    ir = LUT_SIZE - 2;
-  float t = fr - (float)ir;
-  float tau = trans_lut[ir] * (1.0f - t) + trans_lut[ir + 1] * t;
-  return expf(-tau);
-}
-
-/* ── §11 path tracer ─────────────────────────────────────────────────── *
- *
- * The kernel. One function — trace_ray — handles a complete primary
- * ray: cast it from the camera, find the nearest opaque surface,
- * march through the medium accumulating in-scattered + emitted
- * radiance, then add the surface contribution.
- *
- * The volume rendering equation (Tutorial 4) becomes:
- *
- *   radiance_accum = ∫₀^t_max T(t) · [emission(t) + scatter(t)] dt
- *                  + T(t_max) · L_surface
- *
- * where T(t) = exp(−∫₀^t σ(s) ds) is the transmittance from camera to
- * march parameter t. We approximate the integral with a Riemann sum
- * (adaptive step size; fine inside the corona's reach, 4× coarse
- * outside).
- *
- * §11 has two pieces:
- *   §11.1 thomson_phase  Thomson scattering phase function
- *   §11.2 trace_ray      the kernel
- */
-
-/* §11.1 thomson_phase.
- *
- * Purpose:     Thomson scattering phase function at angle θ between
- *              incident and outgoing directions. Wavelength-flat
- *              (achromatic) — that's why the corona's hue follows the
- *              photosphere's exactly.
- *
- *      P_T(θ) = (3/16π) · (1 + cos²θ)
- *
- * Inputs:      cos_theta   cos of scatter angle ∈ [-1, 1]
- * Returns:     phase value, 1/sr.
- *
- * Why: NEE computes scatter-toward-eye via this phase function. Other
- * media (Mie scattering for clouds, Rayleigh for blue sky) would use
- * different phases here. Thomson is correct for free electrons in
- * the K-corona.
- */
-static inline float thomson_phase(float cos_theta) {
-  return (3.0f / (16.0f * (float)M_PI)) * (1.0f + cos_theta * cos_theta);
-}
-
-/* §11.2 trace_ray — the path tracer kernel.
- *
- * Purpose:     return the HDR radiance for a single eye ray from the
- *              camera through the medium, ending at sun / moon / sky.
- *
- * Inputs:
- *      ro              ray origin (= camera position, the world origin)
- *      rd              ray direction, unit length
- *      m               medium with this frame's prominence parameters
- *      sun_pos         world sun centre
- *      moon_pos        world moon centre
- *      moon_R          moon radius (after user-applied moon_scale)
- *      seed            shared with lunar terrain LUT (purely for
- *                      readability — actual data is baked into
- *                      lunar_lut at reseed time)
- *      sun_em          photospheric blackbody radiance (HDR; usually
- *                      ~SUN_EMIT_HDR × blackbody chromaticity)
- *      earth_tint      earthshine colour (blue-tinted sun_em)
- *      corona_gate     eye-adaptation multiplier ∈ [0, 1] for this frame
- *
- * Returns:     RGB pixel radiance (HDR).
- *
- * Pseudocode:
- *      hit_sun, t_sun  = ray_sphere(ro, rd, sun_pos, SUN_R)
- *      hit_moon, t_moon = ray_moon (ro, rd, moon_pos, moon_R, seed)
- *      pick (t_max, surf_type) by nearest hit (or sky)
- *
- *      transmittance = 1
- *      radiance_accum = (0, 0, 0)
- *      t_along_ray = 0
- *      while t_along_ray < t_max and transmittance > 1e-3:
- *          dt = fine_step if inside corona reach else 4× coarse
- *          midpoint p = ro + (t_along_ray + dt/2)·rd
- *          density = density_total(m, p − sun_pos)
- *          if density >= 1e-6:
- *              vis  = visible_fraction_sun(p, sun, moon, moon_R)
- *              if vis > 0:
- *                  omega   = 2π·(1 − cos α);  sin α = SUN_R/dist_sun
- *                  Tr      = lookup_transmittance(p − sun_pos)
- *                  ph      = thomson_phase(rd · (sun_pos−p)/dist_sun)
- *                  in_sc   = density · ph · Tr · omega · vis · gain · dt
- *                          · corona_gate
- *                  radiance_accum += transmittance · sun_em · in_sc
- *              em = emission_at(m, p − sun_pos)
- *              radiance_accum += transmittance · em · dt · HA_GAIN
- *                                              · corona_gate
- *              transmittance *= exp(−density · dt)
- *          t_along_ray += dt
- *
- *      surface contribution at t_max (multiplied by remaining T):
- *          sun_hit:   sun_em · (LIMB_AMBIENT + LIMB_GAIN · μ),
- *                     μ = −rd · sphere_normal_at_hit
- *          moon_hit:  Lambertian (sun direct, ≈ 0 in eclipse geometry)
- *                   + Earthshine (constant ambient · earth_tint)
- *          sky:       (no extra term)
- *      return radiance_accum
- *
- * Why: this is THE function. Everything else in the file is in service
- * of feeding it the right inputs and rendering its output. Read it
- * after Tutorials 4, 5, 6, 7, and 10.
- */
-static RGB trace_ray(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
-                     float moon_R, int seed, RGB sun_em, RGB earth_tint,
-                     float corona_gate) {
-  /* Surface intersections — moon uses perturbed-radius variant for
-   * Bailey's-bead-correct silhouette (see Tutorial 8). */
-  float t_sun = 0.f, t_moon = 0.f;
-  bool hit_sun = ray_sphere(ro, rd, sun_pos, SUN_R, &t_sun);
-  bool hit_moon = ray_moon(ro, rd, moon_pos, moon_R, seed, &t_moon);
-
-  float t_max;
-  int surf_type = 0; /* 0 sky · 1 sun · 2 moon */
-  if (hit_moon && (!hit_sun || t_moon < t_sun)) {
-    t_max = t_moon;
-    surf_type = 2;
-  } else if (hit_sun) {
-    t_max = t_sun;
-    surf_type = 1;
-  } else {
-    t_max = MARCH_T_MAX;
-    surf_type = 0;
-  }
-
-  /* Adaptive step size: fine inside corona reach, 4× coarse outside.
-   * Outside CORONA_REACH·R_sun, σ_sph ≡ 0 (and prominences live
-   * close to the photosphere too) — coarse strides through truly
-   * empty space contribute nothing regardless of length. The 0.5×
-   * margin in the boundary keeps the chromosphere shell on the
-   * fine-step side. */
-  float dt_fine = t_max / (float)MARCH_STEPS;
-  float dt_coarse = dt_fine * 4.0f;
-  float corona_outer = SUN_R * (CORONA_REACH + 0.5f);
-  float corona_outer_R2 = corona_outer * corona_outer;
-
-  RGB radiance_accum = rgb_make(0.f, 0.f, 0.f);
-  float transmittance = 1.0f;
-  float t_along_ray = 0.0f;
-
-  while (t_along_ray < t_max && transmittance > 1e-3f) {
-    /* Pick step size based on distance from sun at the start of
-     * the step. */
-    V3 p_now = v3_add(ro, v3_scl(rd, t_along_ray));
-    V3 p_now_loc = v3_sub(p_now, sun_pos);
-    float r2_now = v3_dot(p_now_loc, p_now_loc);
-    float dt = (r2_now < corona_outer_R2) ? dt_fine : dt_coarse;
-    if (t_along_ray + dt > t_max)
-      dt = t_max - t_along_ray;
-
-    /* Sample at midpoint of this step. */
-    float t_mid = t_along_ray + 0.5f * dt;
-    V3 p = v3_add(ro, v3_scl(rd, t_mid));
-    V3 p_local = v3_sub(p, sun_pos);
-    float density = density_total(m, p_local);
-
-    if (density >= 1e-6f) {
-      V3 to_sun_v = v3_sub(sun_pos, p);
-      float dist_sun = v3_len(to_sun_v);
-      V3 to_sun = v3_scl(to_sun_v, 1.0f / fmaxf(dist_sun, 1e-6f));
-
-      /* Continuous penumbra — soft moon shadow at the edge. */
-      float vis = visible_fraction_sun(p, sun_pos, moon_pos, moon_R);
-
-      if (vis > 1e-4f) {
-        float sin_a = SUN_R / fmaxf(dist_sun, SUN_R + 1e-3f);
-        if (sin_a > 1.0f)
-          sin_a = 1.0f;
-        float cos_a = sqrtf(fmaxf(1.0f - sin_a * sin_a, 0.0f));
-        float omega = 2.0f * (float)M_PI * (1.0f - cos_a);
-
-        float tr_to_sun = lookup_transmittance(p_local);
-        float cos_th = v3_dot(rd, to_sun);
-        float phase = thomson_phase(cos_th);
-        float in_sc = density * phase * tr_to_sun * omega * vis *
-                      IN_SCATTER_GAIN * dt * corona_gate;
-        radiance_accum = rgb_add(
-            radiance_accum, rgb_scl(rgb_scl(sun_em, in_sc), transmittance));
-      }
-
-      RGB em = emission_at(m, p_local);
-      if (em.r + em.g + em.b > 0.f) {
-        radiance_accum = rgb_add(
-            radiance_accum,
-            rgb_scl(em, transmittance * dt * HA_EMIT_GAIN * corona_gate));
-      }
-
-      transmittance *= expf(-density * dt);
-    }
-    t_along_ray += dt;
-  }
-
-  /* Surface contribution. */
-  if (surf_type == 1) {
-    /* Photosphere — emissive with Eddington limb darkening. */
-    V3 p = v3_add(ro, v3_scl(rd, t_sun));
-    V3 N = v3_norm(v3_sub(p, sun_pos));
-    float mu = -v3_dot(N, rd);
-    if (mu < 0.f)
-      mu = 0.f;
-    float lim = LIMB_AMBIENT + LIMB_GAIN * mu;
-    radiance_accum =
-        rgb_add(radiance_accum, rgb_scl(rgb_scl(sun_em, lim), transmittance));
-  } else if (surf_type == 2) {
-    /* Moon — Lambertian. In eclipse geometry cos(N, sun) ≤ 0 (moon
-     * faces away from sun), so direct Lambertian sun-light is
-     * essentially zero. Earthshine fills the dim cool-blue glow on
-     * the moon's night side. */
-    V3 p = v3_add(ro, v3_scl(rd, t_moon));
-    V3 N = v3_norm(v3_sub(p, moon_pos));
-    V3 to_sun_v = v3_sub(sun_pos, p);
-    float dist_sun = v3_len(to_sun_v);
-    V3 to_sun = v3_scl(to_sun_v, 1.0f / fmaxf(dist_sun, 1e-6f));
-    float cos_sn = v3_dot(N, to_sun);
-
-    RGB direct = rgb_make(0.f, 0.f, 0.f);
-    if (cos_sn > 0.0f) {
-      float Lf = MOON_ALBEDO / (float)M_PI * cos_sn;
-      direct = rgb_scl(sun_em, Lf);
-    }
-    RGB earth = rgb_scl(earth_tint, EARTHSHINE_GAIN);
-    radiance_accum =
-        rgb_add(radiance_accum, rgb_scl(rgb_add(direct, earth), transmittance));
-  }
-  /* Sky case: no extra surface term. */
-
-  return radiance_accum;
-}
-
-/* ── §12 scene state ─────────────────────────────────────────────────── *
- *
- * Per-frame state container: which pattern is active, current
- * stellar class, zoom and moon-scale knob positions, simulation time,
- * RNG seed, and the medium struct (with prominence parameters for
- * this seed). `pattern_set` and `*_reseed` mutate the scene; `scene_*`
- * read it.
- *
- * §12 has four sub-sections:
- *   §12.1 PatternParams + Scene structs
- *   §12.2 pattern_set
- *   §12.3 medium_reseed, scene_reseed, scene_init, scene_tick
- *   §12.4 scene_moon_r, scene_moon_pos, scene_occlusion
- */
-
-/* §12.1 PatternParams + Scene.
- *
- * PatternParams holds the geometric configuration of the current
- * pattern: moon's world radius, optional y-offset (PARTIAL only),
- * gating booleans for HUD events. Scene wraps PatternParams plus all
- * the user-controllable knobs and the Medium.
- *
- * No bitfields, no unions — flat structs, easy to read.
- */
-
-typedef struct {
-  float moon_world_r;
-  float moon_y_world;
-  bool totality_possible;
-  bool show_corona; /* unused at runtime, kept for HUD */
-} PatternParams;
-
-typedef struct {
-  bool paused;
-  int speed;
-  int star_idx;
-  float zoom;       /* effective FOV = FOV_H_BASE / zoom */
-  float moon_scale; /* live moon-radius multiplier */
-  Pattern current_pattern;
-  PatternParams pp;
-  float time_secs;
-  float seed_phase;
-  int seed;
-  Medium medium;
-} Scene;
-
-/* §12.2 pattern_set.
- *
- * Purpose:     apply the geometric defaults for a pattern enum. Called
- *              when n / p is pressed.
- *
- * Pseudocode:
- *      pp = (defaults: TOTAL moon radius, no offset)
- *      switch p:
- *          TOTAL    → totality_possible = true
- *          PARTIAL  → moon offset above midline by PARTIAL_Y_OFFSET·MOON_Z
- *          ANNULAR  → moon radius = MOON_BASE_R_ANNULAR (smaller)
- *          TRANSIT  → moon radius = MOON_BASE_R_TRANSIT (tiny)
- *
- * Why: rather than hard-coding pattern-specific bits in the path
- * tracer, we change the world geometry. Same kernel renders all four
- * patterns by reading current Scene state.
- */
-static void pattern_set(Scene *s, Pattern p) {
-  s->current_pattern = p;
-  PatternParams *pp = &s->pp;
-  pp->moon_world_r = MOON_BASE_R_TOTAL;
-  pp->moon_y_world = 0.0f;
-  pp->totality_possible = false;
-  pp->show_corona = true;
-  switch (p) {
-  case PATTERN_TOTAL:
-    pp->moon_world_r = MOON_BASE_R_TOTAL;
-    pp->totality_possible = true;
-    break;
-  case PATTERN_PARTIAL:
-    pp->moon_world_r = MOON_BASE_R_TOTAL;
-    pp->moon_y_world = PARTIAL_Y_OFFSET * MOON_Z;
-    break;
-  case PATTERN_ANNULAR:
-    pp->moon_world_r = MOON_BASE_R_ANNULAR;
-    break;
-  case PATTERN_TRANSIT:
-    pp->moon_world_r = MOON_BASE_R_TRANSIT;
-    break;
-  case N_PATTERNS:
-    break;
-  }
-}
-
-/* §12.3 reseeding + init + tick.
- *
- * medium_reseed regenerates the prominence positions and rebuilds the
- * lunar terrain LUT and Perlin permutation. scene_reseed picks a new
- * orbit phase and seed, then delegates. scene_init zeroes the Scene
- * and calls medium_reseed once. scene_tick advances simulation time
- * proportional to user-set speed.
- */
-
-static void medium_reseed(Medium *m, int seed) {
-  /* Random prominence positions (angle, height, amplitude). */
-  for (int k = 0; k < PROM_COUNT; k++) {
-    uint32_t h = hash3(k, seed, 0xF1A3E);
-    m->prom_phi[k] = hash01(h) * 2.0f * (float)M_PI;
-    m->prom_height[k] = PROM_HEIGHT * (0.40f + 0.60f * hash01(h ^ 0xA1u));
-    m->prom_amp[k] = 0.50f + 0.50f * hash01(h ^ 0xB2u);
-  }
-  /* Bake the moon's silhouette perturbation. */
-  build_lunar_lut(seed);
-
-  /* Shuffle Perlin permutation table for spicule fBm. */
-  perm_shuffle(seed);
-}
-
-static void scene_reseed(Scene *s) {
-  uint32_t h = hash3((int)(s->time_secs * 1000.0f),
-                     (int)(s->seed_phase * 100.0f), 0xC0FFEE);
-  s->seed_phase = ((float)(h & 0xFFFFu) / 65536.0f) * 2.0f * (float)M_PI;
-  s->seed = (int)(h ^ 0x5A5A5A5Au);
-  medium_reseed(&s->medium, s->seed);
-}
-
-static void scene_init(Scene *s) {
-  memset(s, 0, sizeof *s);
-  s->paused = false;
-  s->speed = SPEED_DEF;
-  s->star_idx = 2; /* G-STAR (the Sun) by default */
-  s->zoom = 1.0f;
-  s->moon_scale = 1.0f;
-  s->seed_phase = 0.0f;
-  s->seed = 0xDECAF;
-  medium_reseed(&s->medium, s->seed);
-  pattern_set(s, PATTERN_TOTAL);
-}
-
-static void scene_tick(Scene *s, float dt) {
-  if (s->paused)
-    return;
-  float speed_mul = (float)s->speed / (float)SPEED_DEF;
-  s->time_secs += dt * speed_mul;
-}
-
-/* §12.4 derived geometry queries.
- *
- * scene_moon_r returns the EFFECTIVE moon radius (base × user scale).
- * scene_moon_pos returns the current moon world position from orbit
- * parameters (sin curve over ECLIPSE_PERIOD_S seconds). scene_occlusion
- * returns the fraction of the sun's apparent disc covered by the moon
- * AS SEEN FROM THE CAMERA — used by the HUD progress bar and by the
- * background-stars gate (§14.2).
- *
- * Note: scene_occlusion is the "binary occlusion" formula appropriate
- * for the camera's view (it includes the annular-cap case). The path
- * tracer uses visible_fraction_sun (§8) for the inverse — fraction
- * NOT covered, returned as a continuous value.
- */
-
-static inline float scene_moon_r(const Scene *s) {
-  return s->pp.moon_world_r * s->moon_scale;
-}
-
-static V3 scene_moon_pos(const Scene *s) {
-  float sun_a = atanf(SUN_R / SUN_Z);
-  float moon_a = atanf(scene_moon_r(s) / MOON_Z);
-  float orbit_x_world = MOON_Z * (sun_a + moon_a) * MOON_ORBIT_X_FRAC;
-  float omega = 2.0f * (float)M_PI / ECLIPSE_PERIOD_S;
-  float phase = omega * s->time_secs + s->seed_phase;
-  float mx = orbit_x_world * sinf(phase);
-  return v3(mx, s->pp.moon_y_world, MOON_Z);
-}
-
-static float scene_occlusion(const Scene *s) {
-  V3 sun_pos = v3(0, 0, SUN_Z);
-  V3 moon_pos = scene_moon_pos(s);
-  V3 sun_dir = v3_norm(sun_pos);
-  V3 moon_dir = v3_norm(moon_pos);
-  float cos_b = v3_dot(sun_dir, moon_dir);
-  if (cos_b > 1.f)
-    cos_b = 1.f;
-  if (cos_b < -1.f)
-    cos_b = -1.f;
-  float sep = acosf(cos_b);
-  float sun_a = atanf(SUN_R / SUN_Z);
-  float moon_a = atanf(scene_moon_r(s) / MOON_Z);
-  float sum = sun_a + moon_a;
-  float dif = fabsf(sun_a - moon_a);
-  if (sep >= sum)
-    return 0.f;
-  if (sep <= dif) {
-    if (moon_a >= sun_a)
-      return 1.f;
-    return (moon_a / sun_a) * (moon_a / sun_a);
-  }
-  float t = (sum - sep) / (2.0f * fminf(sun_a, moon_a));
-  if (moon_a >= sun_a)
-    return t;
-  return t * (moon_a / sun_a) * (moon_a / sun_a);
-}
-
-/* ── §13 camera ──────────────────────────────────────────────────────── *
- *
- * Camera is a tiny struct holding origin, fov values, and screen
- * dimensions. camera_make stamps in the per-frame fov (computed from
- * the user's zoom in scene_draw). camera_ray converts a (col, row)
- * cell coordinate to a world-space unit direction using the pinhole
- * formula in Tutorial 2.
- */
-
-typedef struct {
-  V3 pos;
-  float fov_h, fov_v;
-  int cols, rows;
-} Camera;
-
-static void camera_make(Camera *c, int cols, int rows, float fov_h) {
-  c->cols = cols;
-  c->rows = rows;
-  c->pos = v3(0, 0, 0);
-  c->fov_h = fov_h;
-  c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
-}
-
-static V3 camera_ray(const Camera *c, int sx, int sy) {
-  float u =
-      ((2.0f * (float)sx + 1.0f) - (float)c->cols) / (float)c->cols * c->fov_h;
-  float v =
-      -((2.0f * (float)sy + 1.0f) - (float)c->rows) / (float)c->rows * c->fov_v;
-  return v3_norm(v3(u, v, 1.0f));
-}
-
-/* ── §14 screen + scene_draw ─────────────────────────────────────────── *
- *
- * Per-frame orchestration. screen_init / screen_resize manage the
- * ncurses window. scene_draw is the per-frame entry point: build the
- * camera, set up the medium and emission constants, then iterate
- * every cell calling trace_ray and storing the result in a
- * framebuffer; finally paint the framebuffer to the terminal.
- *
- * §14 has two pieces:
- *   §14.1 screen_init / screen_resize
- *   §14.2 scene_draw
- */
-
-typedef struct {
-  int cols, rows;
-} Screen;
-
-/* §14.1 screen lifecycle.
- *
- * screen_init configures ncurses for a non-blocking, no-echo, key-
- * captured, cursor-hidden TUI. typeahead(-1) is a small but important
- * call: it makes ncurses accept all queued input on every refresh
- * rather than blocking. screen_resize is called from the SIGWINCH
- * handler in §16.
- */
-
-static void screen_init(Screen *s) {
-  initscr();
-  noecho();
-  cbreak();
-  curs_set(0);
-  nodelay(stdscr, TRUE);
-  keypad(stdscr, TRUE);
-  typeahead(-1);
-  color_init();
-  getmaxyx(stdscr, s->rows, s->cols);
-}
-
-static void screen_resize(Screen *s) {
-  endwin();
-  refresh();
-  getmaxyx(stdscr, s->rows, s->cols);
-}
-
-/* §14.2 scene_draw — per-frame orchestration.
- *
- * Purpose:     for each cell in the visible window, dispatch a
- *              path-traced ray; store the HDR result in g_buf; then
- *              paint the buffer to the terminal.
- *
- * Pseudocode:
- *      compute working rows/cols within bounds (BUF_MAX_*)
- *      build camera with fov_h = FOV_H_BASE / zoom
- *      stamp medium.kelvin from current Star
- *      sun_em      = SUN_EMIT_HDR · blackbody_rgb(kelvin)
- *      earth_alb   = (0.30, 0.45, EARTH_ALBEDO_BLUE)
- *      earth_tint  = sun_em · earth_alb               (componentwise)
- *      cam_vis_sun = visible_fraction_sun(camera, sun, moon, moon_R)
- *      corona_gate = FLOOR + RANGE · (1 − cam_vis_sun)
- *
- *      PASS 1 — for each (r, c):
- *          ray = camera_ray(c, r)
- *          col = trace_ray(camera_origin, ray, medium,
- *                          sun_pos, moon_pos, moon_R, seed,
- *                          sun_em, earth_tint, corona_gate)
- *          if col is dark and totality:
- *              maybe add a background star at (c, r) from per-cell hash
- *          g_buf[r][c] = col
- *
- *      PASS 2 — paint g_buf to terminal via paint_cell
- *
- * Why: keeps trace_ray pure (it doesn't know about the eye-adapt
- * gate, the framebuffer, or the stars). All per-frame setup happens
- * here, leaving the kernel free of bookkeeping.
- */
-
-static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
-
-static void scene_draw(const Screen *sc, const Scene *s) {
-  int rows_eff = sc->rows - 2;
-  int row_off = 1;
-  if (rows_eff < 4) {
-    rows_eff = sc->rows;
-    row_off = 0;
-  }
-  if (rows_eff > BUF_MAX_H)
-    rows_eff = BUF_MAX_H;
-  int cols_eff = sc->cols;
-  if (cols_eff > BUF_MAX_W)
-    cols_eff = BUF_MAX_W;
-
-  Camera cam;
-  camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
-
-  V3 sun_pos = v3(0, 0, SUN_Z);
-  V3 moon_pos = scene_moon_pos(s);
-  float moon_R = scene_moon_r(s);
-
-  Medium m_local = s->medium;
-  m_local.kelvin = STARS[s->star_idx].kelvin;
-
-  RGB sun_chrom = blackbody_rgb(m_local.kelvin);
-  RGB sun_em = rgb_scl(sun_chrom, SUN_EMIT_HDR);
-
-  /* Earthshine: rough Earth-as-mirror with Rayleigh-blue albedo. */
-  RGB earth_alb = rgb_make(0.30f, 0.45f, EARTH_ALBEDO_BLUE);
-  RGB earth_tint = rgb_mul(sun_em, earth_alb);
-
-  /* Eye-adaptation gate — one number per frame. */
-  float cam_vis_sun = visible_fraction_sun(cam.pos, sun_pos, moon_pos, moon_R);
-  float corona_gate =
-      CORONA_GATE_FLOOR + CORONA_GATE_RANGE * (1.0f - cam_vis_sun);
-
-  /* PASS 1 — path tracer for each cell. */
-  for (int r = 0; r < rows_eff; r++) {
-    for (int c = 0; c < cols_eff; c++) {
-      V3 ray_d = camera_ray(&cam, c, r);
-      RGB col = trace_ray(cam.pos, ray_d, &m_local, sun_pos, moon_pos, moon_R,
-                          s->seed, sun_em, earth_tint, corona_gate);
-
-      /* Background stars — only at near-totality and only for
-       * "sky" cells (luma below threshold from the path
-       * tracer). Per-cell hash keeps positions stable across
-       * frames; per-star Kelvin is log-uniform in [3000, 30000]
-       * for a chromaticity spread. */
-      if (luma_of(col) < 0.04f && scene_occlusion(s) > STAR_OCC_VISIBLE) {
-        uint32_t h = hash3(c, r, s->seed);
-        if ((h % STAR_DENSITY) == 0u) {
-          float br = 0.6f + hash01(h >> 8) * 0.4f;
-          float u_K = hash01(h ^ 0xC0DEC0DEu);
-          float kK = STAR_K_MIN * powf(STAR_K_MAX / STAR_K_MIN, u_K);
-          col = rgb_add(col, rgb_scl(blackbody_rgb(kK), br));
-        }
-      }
-
-      g_buf[r][c] = col;
-    }
-  }
-
-  /* PASS 2 — paint to screen. */
-  for (int r = 0; r < rows_eff; r++) {
-    for (int c = 0; c < cols_eff; c++) {
-      paint_cell(c, r + row_off, g_buf[r][c]);
-    }
-  }
-}
-
-/* ── §15 hud ─────────────────────────────────────────────────────────── *
- *
- * One row at the top with status, plus a TOTALITY event flash, plus a
- * key-hint strip at the bottom. Per project convention everything is
- * bright yellow on default background (PAIR_HUD) for the status, with
- * the bottom strip in cyan A_BOLD (PAIR_HINT) and the event flash in
- * red A_BOLD (PAIR_EVENT_HOT).
- *
- * The status string packs in a lot:
- *   fps, simulation Hz, pattern, stellar class, sun and moon angular
- *   radii (degrees), occlusion progress bar, zoom, moon-scale, speed.
- */
-
-/*
- * hud_draw — render the top status row + bottom hint strip.
- *
- * Purpose:     draw the per-frame status overlay. Read-only on Scene.
- *
- * Inputs:      sc        Screen with current cols, rows
- *              s         Scene to read state from
- *              fps       measured render fps
- *              sim_fps   current simulation tick rate
- *
- * Why: separated from scene_draw so the path tracer's framebuffer
- * doesn't need to know about the HUD's row reservation.
- */
-static void hud_draw(const Screen *sc, const Scene *s, double fps,
-                     int sim_fps) {
-  float occ = scene_occlusion(s);
-
-  int bar_w = 10;
-  int bar_fill = (int)(occ * (float)bar_w + 0.5f);
-  if (bar_fill > bar_w)
-    bar_fill = bar_w;
-  if (bar_fill < 0)
-    bar_fill = 0;
-  char bar[16] = {0};
-  for (int i = 0; i < bar_w; i++)
-    bar[i] = (i < bar_fill) ? '#' : '.';
-
-  const Star *st = &STARS[s->star_idx];
-  float sun_a = atanf(SUN_R / SUN_Z) * 180.f / (float)M_PI;
-  float moon_a = atanf(scene_moon_r(s) / MOON_Z) * 180.f / (float)M_PI;
-  char buf[300];
-  snprintf(
-      buf, sizeof buf,
-      " %5.1f fps %3d Hz  %s  %s %5.0fK  s:%4.2f m:%4.2f deg  [%s] %3.0f%%  "
-      "z:%3.1fx mz:%3.1fx  spd:%d ",
-      fps, sim_fps, s->paused ? "PAUSED " : pattern_name(s->current_pattern),
-      st->name, (double)st->kelvin, (double)sun_a, (double)moon_a, bar,
-      (double)(occ * 100.0f), (double)s->zoom, (double)s->moon_scale, s->speed);
-  int len = (int)strlen(buf);
-  if (len > sc->cols)
-    len = sc->cols;
-  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-  mvprintw(0, sc->cols - len, "%s", buf);
-  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-  attron(COLOR_PAIR(PAIR_HUD));
-  mvprintw(0, 0, " SOLAR-ECLIPSE-PT · PATH-TRACED ");
-  attroff(COLOR_PAIR(PAIR_HUD));
-
-  /* Totality event flash. */
-  if (s->pp.totality_possible && occ > 0.99f) {
-    const char *lab = " [ TOTALITY ] ";
-    int elen = (int)strlen(lab);
-    attron(COLOR_PAIR(PAIR_EVENT_HOT) | A_BOLD);
-    mvprintw(0, sc->cols - len - elen - 1, "%s", lab);
-    attroff(COLOR_PAIR(PAIR_EVENT_HOT) | A_BOLD);
-  }
-
-  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-  mvprintw(sc->rows - 1, 0,
-           " q:quit  spc:pause  n/p:pat  t/T:star  z/Z:zoom  m/M:moon  +/-:spd "
-           " []:Hz  r:reseed ");
-  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-}
-
-static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
-  erase();
-  scene_draw(sc, s);
-  hud_draw(sc, s, fps, sim_fps);
-}
-
-static void screen_present(void) {
-  wnoutrefresh(stdscr);
-  doupdate();
-}
-
-/* ── §16 app — signals + fixed-step main loop ────────────────────────── *
- *
- * Standard project pattern:
- *   • Signal handlers set volatile flags; the main loop polls them.
- *   • atexit registers cleanup (endwin) so the terminal is restored
- *     even if we crash.
- *   • Fixed-step accumulator advances simulation time at SIM_FPS;
- *     render runs at whatever rate the rest of the loop achieves.
- *   • Frame-pacing sleeps target ~60 fps render budget.
- *
- * §16 has three pieces:
- *   §16.1 signals + cleanup
- *   §16.2 app_handle_key
- *   §16.3 app_init / app_run / main
- */
-
-typedef struct {
-  Scene scene;
-  Screen screen;
-  int sim_fps;
-  volatile sig_atomic_t running;
-  volatile sig_atomic_t need_resize;
-} App;
-
-static App g_app;
-
-/* §16.1 signal handlers. Set flags, return immediately — the main loop
- * checks them after the next getch() / scene_tick. */
-
-static void on_exit_signal(int sig) {
-  (void)sig;
-  g_app.running = 0;
-}
-static void on_resize_signal(int sig) {
-  (void)sig;
-  g_app.need_resize = 1;
-}
-static void cleanup(void) { endwin(); }
-
-/* §16.2 app_handle_key — process one key.
- *
- * Returns true to keep running, false to quit. The cases mirror the
- * "Keys" section of the file header — one switch case per key.
- */
-static bool app_handle_key(App *app, int ch) {
-  Scene *s = &app->scene;
-  switch (ch) {
-  case 'q':
-  case 'Q':
-  case 27 /* ESC */:
-    return false;
-  case ' ':
-    s->paused = !s->paused;
-    break;
-  case 'r':
-  case 'R':
-    scene_reseed(s);
-    break;
-
-  case '=':
-  case '+':
-    if (s->speed < SPEED_MAX)
-      s->speed *= 2;
-    if (s->speed > SPEED_MAX)
-      s->speed = SPEED_MAX;
-    break;
-  case '-':
-  case '_':
-    s->speed /= 2;
-    if (s->speed < SPEED_MIN)
-      s->speed = SPEED_MIN;
-    break;
-
-  case ']':
-    app->sim_fps += SIM_FPS_STEP;
-    if (app->sim_fps > SIM_FPS_MAX)
-      app->sim_fps = SIM_FPS_MAX;
-    break;
-  case '[':
-    app->sim_fps -= SIM_FPS_STEP;
-    if (app->sim_fps < SIM_FPS_MIN)
-      app->sim_fps = SIM_FPS_MIN;
-    break;
-
-  case 't':
-    s->star_idx = (s->star_idx + 1) % N_STARS;
-    break;
-  case 'T':
-    s->star_idx = (s->star_idx + N_STARS - 1) % N_STARS;
-    break;
-
-  case 'z':
-    s->zoom *= ZOOM_STEP;
-    if (s->zoom > ZOOM_MAX)
-      s->zoom = ZOOM_MAX;
-    break;
-  case 'Z':
-    s->zoom /= ZOOM_STEP;
-    if (s->zoom < ZOOM_MIN)
-      s->zoom = ZOOM_MIN;
-    break;
-
-  case 'm':
-    s->moon_scale /= MOON_SCALE_STEP;
-    if (s->moon_scale < MOON_SCALE_MIN)
-      s->moon_scale = MOON_SCALE_MIN;
-    break;
-  case 'M':
-    s->moon_scale *= MOON_SCALE_STEP;
-    if (s->moon_scale > MOON_SCALE_MAX)
-      s->moon_scale = MOON_SCALE_MAX;
-    break;
-
-  case 'n':
-  case 'N':
-    pattern_set(s, (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS));
-    break;
-  case 'p':
-  case 'P':
-    pattern_set(
-        s, (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS));
-    break;
-  }
-  return true;
-}
-
-/* §16.3 app_init / app_run / main.
- *
- * app_init zeros the App, sets up Scene + Screen, builds the
- * transmittance LUT (only place we call it — once, at startup).
- * app_run is the main loop: poll input, advance simulation in
- * fixed-step ticks, render once per loop iteration, sleep to pace.
- * main wires it all up.
- */
-
-static void app_init(App *app) {
-  memset(app, 0, sizeof *app);
-  scene_init(&app->scene);
-  screen_init(&app->screen);
-  app->sim_fps = SIM_FPS_DEFAULT;
-  app->running = 1;
-  build_trans_lut();
-}
-
-static void app_run(App *app) {
-  int64_t prev = clock_ns();
-  int64_t sim_accum = 0;
-  int64_t frame_count = 0;
-  int64_t fps_window_start = prev;
-  double fps_meas = 0.0;
-
-  struct sigaction sa = {0};
-  sa.sa_handler = on_exit_signal;
-  sigaction(SIGINT, &sa, NULL);
-  sigaction(SIGTERM, &sa, NULL);
-  sa.sa_handler = on_resize_signal;
-  sigaction(SIGWINCH, &sa, NULL);
-  atexit(cleanup);
-
-  while (app->running) {
-    int ch;
-    while ((ch = getch()) != ERR) {
-      if (!app_handle_key(app, ch)) {
-        app->running = 0;
-        break;
-      }
-    }
-    if (!app->running)
-      break;
-    if (app->need_resize) {
-      screen_resize(&app->screen);
-      app->need_resize = 0;
-    }
-
-    int64_t now = clock_ns();
-    int64_t dt = now - prev;
-    if (dt > DT_CAP_NS)
-      dt = DT_CAP_NS;
-    prev = now;
-
-    int64_t tick_ns = TICK_NS(app->sim_fps);
-    sim_accum += dt;
-    while (sim_accum >= tick_ns) {
-      scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
-      sim_accum -= tick_ns;
-    }
-
-    screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
-    screen_present();
-
-    frame_count++;
-    if (now - fps_window_start >= NS_PER_SEC) {
-      fps_meas = (double)frame_count * (double)NS_PER_SEC /
-                 (double)(now - fps_window_start);
-      frame_count = 0;
-      fps_window_start = now;
-    }
-
-    int64_t target = clock_ns();
-    int64_t left = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
-    if (left > 0)
-      clock_sleep_ns(left);
-  }
-}
-
-int main(void) {
-  app_init(&g_app);
-  app_run(&g_app);
-  cleanup();
-  return 0;
-}

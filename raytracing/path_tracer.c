@@ -1,4 +1,1343 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
+
+#define _POSIX_C_SOURCE 199309L
+#include <math.h>
+#include <ncurses.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* ── §1 CONFIG — constants, ramp, enums (data only)
+ * ──────────────────────────────────────────────────────── */
+
+/* §1.1 frame rate. PT is compute-heavy so we target 30 Hz, not 60. */
+#define TARGET_FPS 30
+#define DT_CAP_NS 200000000LL /* 0.2 s — spiral-of-death cap */
+
+/* §1.2 view geometry. */
+#define ASPECT 0.47f  /* terminal cell W/H ratio    */
+#define FOV_DEG 66.0f /* horizontal FOV             */
+
+/* §1.3 path tracing. */
+#define MAX_DEPTH 7   /* hard depth cap per path     */
+#define RR_DEPTH 3    /* RR starts at this depth     */
+#define SPP_DEFAULT 2 /* samples per pixel per frame */
+#define SPP_MIN 1
+#define SPP_MAX 8
+#define ACCUM_CAP 8192 /* auto-pause once converged   */
+#define RAY_EPS 1e-4f  /* origin offset along N       */
+
+#define MAX_W 320 /* static accumulator width    */
+#define MAX_H 100 /* static accumulator height   */
+
+/*
+ * §1.4 Cornell box coordinate system:
+ *   x ∈ [-1, 1]   left (red) → right (green)
+ *   y ∈ [-1, 1]   floor → ceiling
+ *   z ∈ [ 0, 2]   open front → back wall
+ *   Camera at (0, 0.05, -1.5) looking toward +Z. The front face
+ *   (z = 0) is open so the camera sees in.
+ */
+#define CAM_X 0.00f
+#define CAM_Y 0.05f
+#define CAM_Z -1.50f
+
+/* §1.5 character ramp — Paul Bourke 92-char density ladder. */
+static const char k_ramp[] =
+    " `.-':_,^=;><+!rc*/"
+    "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
+#define RAMP_LEN ((int)(sizeof k_ramp - 1))
+
+/* §1.6 ncurses pair IDs. */
+#define PAIR_CUBE_BASE 1   /* + 0..215 = 6×6×6 cube       */
+#define PAIR_HUD 217       /* yellow row 0 status         */
+#define PAIR_HINT 218      /* cyan bottom hint strip      */
+#define PAIR_BAR_FILL 219  /* progress-bar filled cells   */
+#define PAIR_BAR_EMPTY 220 /* progress-bar empty cells    */
+
+/* §1.7 shade-mode enum (cycled with 'd'). See T12 + §14.
+ *
+ *   MODE_PT      full progressive Monte Carlo path tracer (default).
+ *                Uses passes 1-7.
+ *   MODE_NORMAL  first-hit surface normal as RGB. Passes 1+2 only.
+ *   MODE_ALBEDO  first-hit material colour. Passes 1+2+3 only.
+ *   MODE_DEPTH   first-hit 1/(1+t) gray. Passes 1+2 only.
+ *
+ * NORMAL/ALBEDO/DEPTH are deterministic — they converge in 1 sample
+ * because no randomness is involved. Switching modes resets the
+ * accumulator (their output ranges differ; mixing them under one
+ * average would produce incoherent results).
+ */
+typedef enum {
+  MODE_PT = 0,     /* full path tracing — the real Monte-Carlo render  */
+  MODE_NORMAL = 1, /* AOV: first-hit normal as RGB (passes 1-2)        */
+  MODE_ALBEDO = 2, /* AOV: first-hit material colour (passes 1-3)      */
+  MODE_DEPTH = 3,  /* AOV: first-hit 1/(1+t) gray (passes 1-2)         */
+  MODE_N = 4,      /* count — enables % MODE_N wraparound              */
+} ShadeMode;
+
+static const char *shade_mode_name(ShadeMode m) {
+  switch (m) {
+  case MODE_PT:
+    return "PT    ";
+  case MODE_NORMAL:
+    return "NORMAL";
+  case MODE_ALBEDO:
+    return "ALBEDO";
+  case MODE_DEPTH:
+    return "DEPTH ";
+  default:
+    return "?     ";
+  }
+}
+
+/* ── §2 PERFORMANCE — monotonic clock + sleep
+ * ───────────────────────────────────────────────────────── */
+
+/*
+ * clock_ns — wall-clock time in nanoseconds, monotonic.
+ *
+ * Why CLOCK_MONOTONIC: we care about ELAPSED real time (for animation
+ * dt), not wall date. CLOCK_MONOTONIC never goes backward across NTP
+ * adjustments, DST shifts, or system clock changes.
+ */
+static long long clock_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/*
+ * clock_sleep_ns — best-effort sleep for the requested nanoseconds.
+ *
+ * The main loop uses this to cap render rate without burning the CPU
+ * at 100%; we subtract elapsed work time from the target frame and
+ * sleep the remainder.
+ */
+static void clock_sleep_ns(long long ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
+}
+
+/* ── §3 LOGIC: vec3 math (pure)
+ * ────────────────────────────────────────────────────────── *
+ *
+ * V3 — three floats by value. All vector helpers are inline to avoid
+ * call overhead in the per-bounce loop.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * V3 — a point or direction in 3-D world space, and (reused) a linear-HDR RGB
+ * colour, since both are three floats under the same algebra. By value: 12
+ * bytes in registers, keeping the helpers pure and cheap in the per-bounce
+ * loop. No homogeneous w — path tracing intersects analytically, with no
+ * projective divide. Ref: Shirley, "Ray Tracing in One Weekend"; Foley & van
+ * Dam, vectors ch.
+ */
+typedef struct {
+  float x, y,
+      z; /* Cartesian components — or linear R,G,B when used as colour */
+} V3;
+
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3add(V3 a, V3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline V3 v3sub(V3 a, V3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline V3 v3mul(V3 a, V3 b) {
+  return v3(a.x * b.x, a.y * b.y, a.z * b.z);
+}
+static inline V3 v3s(float s, V3 a) { return v3(s * a.x, s * a.y, s * a.z); }
+static inline float v3dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3len(V3 a) { return sqrtf(v3dot(a, a)); }
+static inline V3 v3norm(V3 a) {
+  float length = v3len(a);
+  return length > 1e-9f ? v3s(1.f / length, a) : v3(0, 1, 0);
+}
+static inline V3 v3cross(V3 a, V3 b) {
+  return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x);
+}
+
+/* v3maxc — maximum channel of a V3. Used by Russian roulette to pick
+ * the survival probability (T9: max, not mean, to keep paths whose
+ * energy is concentrated in a single colour band). */
+static inline float v3maxc(V3 a) {
+  return a.x > a.y ? (a.x > a.z ? a.x : a.z) : (a.y > a.z ? a.y : a.z);
+}
+
+/* ── §4 LOGIC: RNG — xorshift32, decorrelated per pixel/frame (pure given seed)
+ * ──────────── *
+ *
+ * Path tracing needs LOTS of random numbers (sub-pixel jitter + 2 per
+ * cosine-hemisphere sample × MAX_DEPTH bounces × SPP × cols × rows).
+ * Quality matters less than throughput: we use xorshift32, a single-
+ * register PRNG with a period of 2³² − 1 — plenty for a single frame.
+ *
+ * Decorrelation: every (pixel, frame) gets an independent seed via a
+ * small hash. Without that, neighbouring pixels would receive
+ * correlated sequences and the noise would form visible streaks.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * Rng — a 32-bit xorshift PRNG state (one word). Each pixel-frame gets an
+ * independent seed (rng_seed) so neighbours don't share a sequence and the
+ * noise stays unstructured; rng_f advances it and returns a float in [0,1).
+ * Threaded by pointer through the path, so the LOGIC layer has no hidden global
+ * RNG. Ref: Marsaglia (2003) "Xorshift RNGs", J. Statistical Software 8(14).
+ */
+typedef uint32_t Rng;
+
+/*
+ * rng_f — uniform float in [0, 1) via xorshift32.
+ *
+ * The shift triple (13, 17, 5) is Marsaglia's, with the upper bit
+ * masked off (>>1) so the result is non-negative when reinterpreted
+ * via the integer-to-float divide.
+ */
+static float rng_f(Rng *rng_state) {
+  *rng_state ^= *rng_state << 13;
+  *rng_state ^= *rng_state >> 17;
+  *rng_state ^= *rng_state << 5;
+  return (float)(*rng_state >> 1) * (1.f / (float)0x7FFFFFFF);
+}
+
+/*
+ * rng_seed — produce an independent seed for (px, py, frame).
+ *
+ * The three large primes + xorshift warm-up scramble the components
+ * so adjacent pixels and adjacent frames don't share correlated
+ * sequences. Without decorrelation, neighbouring pixels would receive
+ * the same sample sequence and the noise would form visible streaks.
+ */
+static Rng rng_seed(int pixel_x, int pixel_y, int frame) {
+  uint32_t s = (uint32_t)(pixel_x * 1973 + pixel_y * 9277 + frame * 26699 + 1);
+  s ^= s << 13;
+  s ^= s >> 7;
+  s ^= s << 17;
+  return s ? s : 1u;
+}
+
+/* ── §5 CONFIG/DATA + LOGIC: Cornell-box scene — Mat/Quad/Sphere types + scene
+ * data + mat_is_light ─────────────────────────────────────────── *
+ *
+ * The Cornell Box has just three primitive types:
+ *   §5.1 Material (Lambertian diffuse only)
+ *   §5.2 Quad (axis-aligned rectangle)
+ *   §5.3 Sphere
+ *
+ * Six quads form the walls (floor, ceiling, back, left, right, plus
+ * the small ceiling light). Two spheres sit on the floor. That's the
+ * entire geometry — six rectangles and two balls.
+ *
+ * See tutorial T11 for the scene's history and what it specifically
+ * tests.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* §5.1 ── Material ──────────────────────────────────────────────────── */
+
+/*
+ * Mat — a surface material: Lambertian diffuse reflectance plus optional
+ * emission. The only material model in this Cornell box.
+ * With Lambertian BRDF f_r = albedo/π and cosine-weighted hemisphere sampling
+ * p(ω) = cosθ/π (T6), the Monte-Carlo estimator simplifies to weight = albedo —
+ * which is why "throughput *= albedo" is the ENTIRE bounce update (§10 + §12).
+ * Ref: Kajiya (1986) "The Rendering Equation"; Lambert's cosine law.
+ */
+typedef struct {
+  V3 albedo; /* diffuse reflectance per channel, [0,1]³        */
+  V3 emit;   /* emitted radiance (light sources only; else 0)  */
+} Mat;
+
+static const Mat k_mats[] = {
+    /* 0  white  */ {{0.73f, 0.73f, 0.73f}, {0, 0, 0}},
+    /* 1  red    */ {{0.65f, 0.05f, 0.05f}, {0, 0, 0}},
+    /* 2  green  */ {{0.12f, 0.45f, 0.15f}, {0, 0, 0}},
+    /* 3  light  */ {{0, 0, 0}, {15.f, 14.f, 11.f}}, /* warm */
+    /* 4  gold   */ {{0.80f, 0.58f, 0.18f}, {0, 0, 0}},
+    /* 5  indigo */ {{0.22f, 0.28f, 0.82f}, {0, 0, 0}},
+};
+
+static inline bool mat_is_light(const Mat *m) {
+  return m->emit.x > 0.f || m->emit.y > 0.f || m->emit.z > 0.f;
+}
+
+/* §5.2 ── Quad (axis-aligned rectangular plane) ───────────────────── */
+
+/*
+ * Quad — an axis-aligned rectangle: a Cornell-box wall / floor / ceiling, or
+ * the light. Encoding a wall as "fixed coordinate on one axis + bounds on the
+ * other two" makes the ray test a single divide + two range checks (§7.1) — far
+ * cheaper than a triangle, and exact.
+ *   axis = 0 → X-plane (lo/hi bound Y,Z); 1 → Y-plane (X,Z); 2 → Z-plane (X,Y)
+ * Ref: ray vs axis-aligned plane — Shirley, "Fundamentals of Computer
+ * Graphics".
+ */
+typedef struct {
+  int axis;           /* 0=X plane, 1=Y plane, 2=Z plane              */
+  float pos;          /* coordinate of the plane on its fixed axis    */
+  float lo[2], hi[2]; /* bounds in the two free axes                  */
+  int mat;            /* material index into k_mats                   */
+} Quad;
+
+/*
+ * Cornell-box quads. The light at y = 0.98 sits just below the ceiling
+ * (y = 1.0); rays going UP through the light's XZ footprint hit it
+ * before the ceiling (smaller t) and pick up the emission.
+ */
+static const Quad k_quads[] = {
+    /* floor    y=-1   x∈[-1,1] z∈[0,2] */ {
+        1, -1.0f, {-1.f, 0.f}, {1.f, 2.f}, 0},
+    /* ceiling  y=+1   x∈[-1,1] z∈[0,2] */
+    {1, 1.0f, {-1.f, 0.f}, {1.f, 2.f}, 0},
+    /* back     z=+2   x∈[-1,1] y∈[-1,1]*/
+    {2, 2.0f, {-1.f, -1.f}, {1.f, 1.f}, 0},
+    /* left     x=-1   y∈[-1,1] z∈[0,2] */
+    {0, -1.0f, {-1.f, 0.f}, {1.f, 2.f}, 1},
+    /* right    x=+1   y∈[-1,1] z∈[0,2] */
+    {0, 1.0f, {-1.f, 0.f}, {1.f, 2.f}, 2},
+    /* light    y=0.98 centred overhead */
+    {1, 0.98f, {-0.36f, 0.62f}, {0.36f, 1.38f}, 3},
+};
+#define N_QUADS ((int)(sizeof k_quads / sizeof k_quads[0]))
+
+/* §5.3 ── Sphere ───────────────────────────────────────────────────── */
+
+/*
+ * Sphere — a diffuse sphere primitive (the two balls on the floor), intersected
+ * by the textbook ray-sphere quadratic (§7.2).
+ * The two sit with bottoms at y ≈ -0.98 (floor at y = -1.0): a small gap that
+ * avoids numerical self-intersection between sphere and floor.
+ * Ref: ray-sphere intersection — Shirley, "Ray Tracing in One Weekend".
+ */
+typedef struct {
+  V3 c;    /* centre (world space)        */
+  float r; /* radius                      */
+  int mat; /* material index into k_mats  */
+} Sphere;
+
+static const Sphere k_spheres[] = {
+    {{-0.46f, -0.60f, 0.82f}, 0.38f, 4}, /* gold  , left  */
+    {{0.44f, -0.60f, 1.16f}, 0.38f, 5},  /* indigo, right */
+};
+#define N_SPHERES ((int)(sizeof k_spheres / sizeof k_spheres[0]))
+
+/* ── §6 LOGIC: PASS 1 — camera ray generation (pure)
+ * ──────────────────────────────── *
+ *
+ * Pass 1 turns a pixel index (col, row) into a world-space Ray.
+ *
+ * The camera is a pinhole at (CAM_X, CAM_Y, CAM_Z) looking down +Z.
+ * Each pixel maps to a screen-space (u, v) which we offset with sub-
+ * pixel jitter for free anti-aliasing.
+ *
+ *      pixel (col, row)              world-space ray
+ *      ┌─────┐                       ┌─────────────────────────┐
+ *      │     │                       │ origin: camera position │
+ *      │  +  │   ──── camera_ray ──▶ │ dir   : norm(forward    │
+ *      │     │                       │              + u·right  │
+ *      └─────┘                       │              + v·up   ) │
+ *                                    └─────────────────────────┘
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * Ray — a parametric half-line P(t) = origin + t·dir (t ≥ 0), the unit of work
+ * every intersection test consumes. dir is kept unit-length so t reads as world
+ * distance. Ref: parametric ray — Shirley, "Ray Tracing in One Weekend".
+ */
+typedef struct {
+  V3 origin; /* ray origin (camera, or a bounce point)  */
+  V3 dir;    /* unit direction; P(t) = origin + t·dir   */
+} Ray;
+
+/*
+ * camera_ray — produce a primary ray for pixel (col, row).
+ *
+ * Pseudocode:
+ *   centre_x = cols / 2          centre_y = rows / 2
+ *   tan_half = tan(FOV / 2)
+ *   u =  ((col + jitter_x) - centre_x) / centre_x  *  tan_half
+ *   v = -((row + jitter_y) - centre_y) / centre_x  *  tan_half / ASPECT
+ *   ray.origin = camera position
+ *   ray.dir    = norm(forward + u·right + v·up)
+ *
+ * Why divide v by centre_x (NOT centre_y): we want square pixels in
+ * world space — equal angular extent per cell on both axes. Then we
+ * correct for the terminal cell's aspect ratio (cells are taller
+ * than wide) by a final /ASPECT.
+ *
+ * Why the negative sign on v: row indices increase downward (y-down)
+ * but world-space "up" is +Y (y-up). Negate so the world's +Y maps
+ * to the top of the screen (lower row numbers).
+ *
+ * jitter_x, jitter_y ∈ [-0.5, +0.5] gives free anti-aliasing — each
+ * sample's primary ray pierces a slightly different sub-pixel point;
+ * averaging filters out staircase aliasing along edges.
+ */
+static Ray camera_ray(int col, int row, int cols, int rows, float jitter_x,
+                      float jitter_y) {
+  (void)rows; /* v normalised by cols */
+  float centre_x = cols * 0.5f;
+  float centre_y = rows * 0.5f;
+  float tan_half = tanf(FOV_DEG * (float)M_PI / 360.f);
+
+  float u = ((col + jitter_x) - centre_x) / centre_x * tan_half;
+  float v = -((row + jitter_y) - centre_y) / centre_x * tan_half / ASPECT;
+
+  V3 forward = v3(0, 0, 1);
+  V3 right = v3(1, 0, 0);
+  V3 up = v3(0, 1, 0);
+
+  Ray ray;
+  ray.origin = v3(CAM_X, CAM_Y, CAM_Z);
+  ray.dir = v3norm(v3add(forward, v3add(v3s(u, right), v3s(v, up))));
+  return ray;
+}
+
+/* ── §7 LOGIC: PASS 2 — scene intersection (pure)
+ * ─────────────────────────────────── *
+ *
+ * Pass 2 finds the closest surface a Ray hits.
+ *
+ * Three short tests:
+ *   §7.1 ray_quad    — ray vs axis-aligned rectangle
+ *   §7.2 ray_sphere  — ray vs sphere (textbook quadratic)
+ *   §7.3 scene_hit   — try every primitive, keep the nearest
+ *
+ * No spatial structures — N is small (8 primitives). A real renderer
+ * would put a BVH here; we keep it brute-force for clarity.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * Hit — the intersection record: where the ray met the nearest surface and what
+ * it is. The normal N is oriented TOWARD the incoming ray, so §9's hemisphere
+ * sampling always yields outgoing directions without a later flip.
+ * Ref: ray-scene hit record — Shirley, "Ray Tracing in One Weekend".
+ */
+typedef struct {
+  float t; /* ray parameter of the hit (world distance)  */
+  V3 P, N; /* hit position; normal (oriented toward ray) */
+  int mat; /* material index into k_mats                 */
+} Hit;
+
+/* §7.1 ── ray vs axis-aligned quad ─────────────────────────────────── */
+
+/*
+ * ray_quad — analytic intersection of a ray with one axis-aligned
+ *            rectangle.
+ *
+ * Pseudocode:
+ *   On the FIXED axis, find t at which the ray crosses the plane:
+ *     dir_a, origin_a = ray.dir[axis], ray.origin[axis]
+ *     if |dir_a| < ε:   ray is parallel → MISS
+ *     t = (q->pos - origin_a) / dir_a
+ *     if t < t_min:     behind us → MISS
+ *
+ *   Compute the hit point's two FREE-axis coordinates and check
+ *   against the rectangle's bounds:
+ *     hit_point = ray.origin + t · ray.dir
+ *     u, v      = hit_point's two free-axis components
+ *     if u or v outside [lo, hi]:   MISS
+ *
+ *   The outward normal is the basis vector of the FIXED axis with
+ *   sign chosen to FACE the incoming ray (so subsequent hemisphere
+ *   sampling puts directions on the outgoing side automatically).
+ */
+static int ray_quad(Ray ray, const Quad *quad, float t_min, float *out_t,
+                    V3 *out_normal) {
+  float dir_a, origin_a;
+  switch (quad->axis) {
+  case 0:
+    dir_a = ray.dir.x;
+    origin_a = ray.origin.x;
+    break;
+  case 1:
+    dir_a = ray.dir.y;
+    origin_a = ray.origin.y;
+    break;
+  default:
+    dir_a = ray.dir.z;
+    origin_a = ray.origin.z;
+    break;
+  }
+  if (fabsf(dir_a) < 1e-9f)
+    return 0; /* parallel to plane */
+
+  float t = (quad->pos - origin_a) / dir_a;
+  if (t < t_min)
+    return 0;
+
+  float hit_x = ray.origin.x + t * ray.dir.x;
+  float hit_y = ray.origin.y + t * ray.dir.y;
+  float hit_z = ray.origin.z + t * ray.dir.z;
+
+  float free_axis_u, free_axis_v;
+  switch (quad->axis) {
+  case 0:
+    free_axis_u = hit_y;
+    free_axis_v = hit_z;
+    break;
+  case 1:
+    free_axis_u = hit_x;
+    free_axis_v = hit_z;
+    break;
+  default:
+    free_axis_u = hit_x;
+    free_axis_v = hit_y;
+    break;
+  }
+  if (free_axis_u < quad->lo[0] || free_axis_u > quad->hi[0] ||
+      free_axis_v < quad->lo[1] || free_axis_v > quad->hi[1])
+    return 0;
+
+  /* Outward normal: basis vector of fixed axis, sign opposing ray. */
+  V3 normal = {0, 0, 0};
+  switch (quad->axis) {
+  case 0:
+    normal.x = (dir_a > 0.f) ? -1.f : 1.f;
+    break;
+  case 1:
+    normal.y = (dir_a > 0.f) ? -1.f : 1.f;
+    break;
+  default:
+    normal.z = (dir_a > 0.f) ? -1.f : 1.f;
+    break;
+  }
+  *out_t = t;
+  *out_normal = normal;
+  return 1;
+}
+
+/* §7.2 ── ray vs sphere ─────────────────────────────────────────────── */
+
+/*
+ * ray_sphere — analytic intersection via the textbook quadratic.
+ *
+ * Setup: |ray.origin + t·ray.dir − centre|² = radius². With unit-
+ * length ray.dir, this expands to
+ *
+ *     t² + 2·b·t + (|origin_to_centre|² − radius²) = 0
+ *
+ * where b = ray.dir · origin_to_centre.
+ *
+ * Discriminant disc = b² − (|origin_to_centre|² − radius²).
+ * Roots t = -b ± √disc. We pick the nearest root that's beyond
+ * t_min (front face for an outside ray; far root only if the ray
+ * starts INSIDE the sphere, which can't happen here — diffuse
+ * surfaces don't let rays in).
+ */
+static int ray_sphere(Ray ray, const Sphere *sphere, float t_min,
+                      float *out_t) {
+  V3 origin_to_centre = v3sub(ray.origin, sphere->c);
+  float b = v3dot(ray.dir, origin_to_centre);
+  float disc =
+      b * b - v3dot(origin_to_centre, origin_to_centre) + sphere->r * sphere->r;
+  if (disc < 0.f)
+    return 0;
+
+  float sq = sqrtf(disc);
+  float t = -b - sq;
+  if (t < t_min)
+    t = -b + sq;
+  if (t < t_min)
+    return 0;
+  *out_t = t;
+  return 1;
+}
+
+/* §7.3 ── scene_hit (find nearest surface) ─────────────────────────── */
+
+/*
+ * scene_hit — loop over all primitives, keep the smallest valid t.
+ *
+ * For 6 quads + 2 spheres this brute-force test is fine; a real
+ * renderer would put a BVH here, but BVH belongs in a separate
+ * teaching file (raymarcher.c uses spatial structures).
+ *
+ * The sphere normal is computed AFTER selection: an outward normal
+ * `(P − centre)/r`, then flipped if it points away from the ray
+ * (ensuring the hemisphere sampler gets a normal on the outgoing
+ * side, regardless of front/back hit).
+ */
+static int scene_hit(Ray ray, float t_min, Hit *out_hit) {
+  float t_best = 1e30f;
+  int any = 0;
+
+  for (int i = 0; i < N_QUADS; i++) {
+    float t;
+    V3 normal;
+    if (ray_quad(ray, &k_quads[i], t_min, &t, &normal) && t < t_best) {
+      t_best = t;
+      out_hit->t = t;
+      out_hit->P = v3add(ray.origin, v3s(t, ray.dir));
+      out_hit->N = normal;
+      out_hit->mat = k_quads[i].mat;
+      any = 1;
+    }
+  }
+  for (int i = 0; i < N_SPHERES; i++) {
+    float t;
+    if (ray_sphere(ray, &k_spheres[i], t_min, &t) && t < t_best) {
+      t_best = t;
+      out_hit->t = t;
+      out_hit->P = v3add(ray.origin, v3s(t, ray.dir));
+      V3 outward_n = v3norm(v3sub(out_hit->P, k_spheres[i].c));
+      /* Flip outward normal to face the incoming ray. */
+      out_hit->N =
+          (v3dot(outward_n, ray.dir) < 0.f) ? outward_n : v3s(-1.f, outward_n);
+      out_hit->mat = k_spheres[i].mat;
+      any = 1;
+    }
+  }
+  return any;
+}
+
+/* ── §8 LOGIC: PASS 3 — shading decision (pure)
+ * ───────────────────────────────────── *
+ *
+ * Pass 3 looks up the Material at a hit point. Trivial here (it's
+ * just an array index) but factored into a named function so the
+ * spine of the algorithm reads as "every pass = one operation".
+ *
+ * In a real renderer this is where you'd dispatch on material type:
+ * diffuse vs specular vs glass vs subsurface. We have one type
+ * (Lambertian) so it's a one-liner — but the conceptual stage is
+ * real and the orchestrator (§12) calls it explicitly.
+ *
+ * The actual shading DECISION ("emissive? then accumulate and stop;
+ * otherwise prepare to bounce") happens in path_trace using the
+ * Material this function returns. That decision belongs with the
+ * orchestrator, not with the lookup.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+static const Mat *shade_at_hit(const Hit *hit) { return &k_mats[hit->mat]; }
+
+/* ── §9 LOGIC: PASS 4 — bounce direction sampling (pure; advances threaded RNG)
+ * ──────────────────────────── *
+ *
+ * Pass 4 picks a random new direction from the BRDF's importance-
+ * sampled distribution. For Lambertian we use cosine-weighted
+ * hemisphere sampling via Malley's method (T6, T7).
+ *
+ * Two helper functions:
+ *   §9.1 onb              — orthonormal basis around a normal
+ *   §9.2 sample_bounce    — Malley's method (was cos_sample_hemi)
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* §9.1 ── onb: orthonormal basis around a normal ────────────────────── */
+
+/*
+ * onb — construct two perpendicular unit vectors so {u, v, n} is a
+ *       right-handed orthonormal basis.
+ *
+ * Used by the cosine-hemisphere sampler to translate "local +Z =
+ * normal" samples into world coordinates.
+ *
+ * The "pick non-parallel up" trick: if n is mostly along X (|n.x| ≥
+ * 0.9) use Y as the seed; otherwise use X. Either way `up × n` is
+ * non-zero, so v3cross produces a valid perpendicular.
+ */
+static void onb(V3 normal, V3 *out_u, V3 *out_v) {
+  V3 up = (fabsf(normal.x) < 0.9f) ? v3(1, 0, 0) : v3(0, 1, 0);
+  *out_u = v3norm(v3cross(up, normal));
+  *out_v = v3cross(normal, *out_u);
+}
+
+/* §9.2 ── sample_bounce: cosine-weighted hemisphere sample ──────────── */
+
+/*
+ * sample_bounce — Malley's method (1988): the 2-D uniform-disk
+ *                 sampling distribution, lifted to a hemisphere via
+ *                 z = √(1 − r²), produces a 3-D distribution whose
+ *                 density is exactly cosθ/π — exactly what we need.
+ *
+ *   r1 ∈ [0, 1)  →  φ = 2π · r1                  azimuth
+ *   r2 ∈ [0, 1)  →  in-plane radius = √r2        (uniform on disc)
+ *                   z              = √(1 − r2)   (lift onto hemisphere)
+ *
+ * Local sample is (cosφ·√r2, sinφ·√r2, √(1−r2)). Transform to world
+ * using the (u, v, n) basis from §9.1.
+ *
+ * Why this beats rejection sampling:
+ *   • Always two RNG calls — no loop with worst-case unbounded retries.
+ *   • Numerically stable at grazing angles where rejection thrashes.
+ *   • PDF analytically known and matches the Lambertian BRDF — the
+ *     algebraic cancellation in T6 hinges on this.
+ *
+ * See tutorial T7 for the diagram.
+ */
+static V3 sample_bounce(V3 normal, Rng *rng_state) {
+  float r1 = rng_f(rng_state);
+  float r2 = rng_f(rng_state);
+  float phi = 2.f * (float)M_PI * r1;
+  float sr2 = sqrtf(r2); /* sinθ */
+  float local_x = cosf(phi) * sr2;
+  float local_y = sinf(phi) * sr2;
+  float local_z = sqrtf(1.f - r2); /* cosθ */
+  V3 basis_u, basis_v;
+  onb(normal, &basis_u, &basis_v);
+  return v3norm(v3add(v3s(local_x, basis_u),
+                      v3add(v3s(local_y, basis_v), v3s(local_z, normal))));
+}
+
+/* ── §10 LOGIC: PASS 5 — throughput chain (pure)
+ * ──────────────────────────────────── *
+ *
+ * Pass 5 is one line of arithmetic: throughput *= albedo.
+ *
+ * Why it deserves its own §-section: this single multiplication is
+ * the entire BRDF evaluation in our path tracer. Cosine-weighted
+ * hemisphere sampling cancelled the cosθ and the π (T6), leaving
+ * just "multiply by albedo" as the bounce update. Every other path
+ * tracer has a more elaborate update; ours is one of the most
+ * stripped-down possible.
+ *
+ * After N bounces:
+ *   throughput = albedo_1 · albedo_2 · … · albedo_N
+ *
+ * That product encodes "what fraction of any light we eventually
+ * find will reach the camera through this exact path". When the
+ * path finally hits an emissive surface, multiplying its emission
+ * by this throughput gives the contribution of this random walk —
+ * see T8's worked example.
+ *
+ * The function below is an inline one-liner; in a textbook this
+ * might be a paragraph of comment with no code at all. Naming it
+ * makes Pass 5 greppable.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+static inline V3 throughput_chain(V3 throughput, V3 albedo) {
+  return v3mul(throughput, albedo);
+}
+
+/* ── §11 LOGIC: PASS 6 — Russian-roulette termination (pure; advances threaded
+ * RNG) ───────────────────────────────────────── *
+ *
+ * Pass 6 decides when to stop bouncing. Two mechanisms:
+ *
+ *   (a) HARD DEPTH CAP — an outer for-loop bound (MAX_DEPTH). After
+ *       MAX_DEPTH bounces, force-stop even if RR didn't kill us.
+ *       Belt-and-braces: keeps bad RR luck from running forever.
+ *
+ *   (b) RUSSIAN ROULETTE — probabilistic kill, unbiased. Used after
+ *       depth ≥ RR_DEPTH so early high-energy bounces aren't killed.
+ *       See T9.
+ *
+ * russian_roulette() implements (b). The depth cap (a) is a loop
+ * bound in path_trace, not a separate function.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * russian_roulette — unbiased path termination.
+ *
+ * Pseudocode:
+ *   p = max(throughput.r, throughput.g, throughput.b)
+ *   if p < ε:                       throughput is dead anyway → kill
+ *   if random() > p:                kill with probability (1 − p)
+ *   throughput *= 1 / p             (compensate survivors → unbiased)
+ *   return survived?
+ *
+ * Returning false means the caller should break out of the bounce
+ * loop. Returning true means the caller continues — and the
+ * throughput has already been scaled in-place to compensate.
+ *
+ * Why MAX channel and not MEAN: a path with throughput (0.5, 0, 0)
+ * is meaningful in the red channel; killing it because the average
+ * is 0.17 would erase real red contributions.
+ */
+static bool russian_roulette(V3 *throughput, Rng *rng_state) {
+  float p = v3maxc(*throughput);
+  if (p < 1e-4f)
+    return false; /* throughput too low */
+  if (rng_f(rng_state) > p)
+    return false;                          /* rolled the kill   */
+  *throughput = v3s(1.f / p, *throughput); /* compensate       */
+  return true;                             /* survived         */
+}
+
+/* ── §12 LOGIC: path_trace — THE CORE (pure; combines passes 2-6)
+ * ─────────────── *
+ *
+ * THE CORE. This function is small — one for-loop, ~25 lines of body —
+ * but every line is one of the seven passes. Read it slowly.
+ *
+ * INPUT  : a primary Ray (produced by Pass 1 in the caller)
+ *          plus a per-pixel-per-frame RNG state.
+ * OUTPUT : V3 radiance contribution from this single random walk.
+ *          Many such walks averaged form the converged image (Pass 7).
+ *
+ * Algorithm in steps (matches the 7-pass spine):
+ *   throughput = (1, 1, 1)            what's left of the photon's energy
+ *   color      = (0, 0, 0)            accumulated radiance
+ *   for depth = 0 .. MAX_DEPTH:
+ *     PASS 2: hit ← scene_hit(ray)
+ *             if MISS: break (background = black)
+ *     PASS 3: mat ← shade_at_hit(hit)
+ *             if mat is emissive:
+ *               color += throughput · emission       contribute
+ *               break                                 (T4 step 11)
+ *     PASS 6: if depth ≥ RR_DEPTH:
+ *               if !russian_roulette(throughput): break
+ *     PASS 5: throughput = throughput_chain(throughput, mat.albedo)
+ *     PASS 4: ray.dir   ← sample_bounce(hit.N)
+ *             ray.origin ← hit.P + ε · hit.N         self-int. push
+ *   return color
+ *
+ * Iterative, not recursive. Iterative is clearer pedagogically because
+ * the throughput chain (Pass 5) is a single line you can point at —
+ * `throughput = throughput_chain(throughput, mat.albedo)`. With
+ * recursion the same chain is hidden in the call/return structure.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+static V3 path_trace(Ray ray, Rng *rng_state) {
+  V3 color = v3(0, 0, 0);
+  V3 throughput = v3(1, 1, 1);
+
+  for (int depth = 0; depth < MAX_DEPTH; depth++) {
+
+    /* PASS 2 — SCENE INTERSECTION. */
+    Hit hit;
+    if (!scene_hit(ray, RAY_EPS, &hit))
+      break;
+
+    /* PASS 3 — SHADING DECISION. */
+    const Mat *mat = shade_at_hit(&hit);
+    if (mat_is_light(mat)) {
+      /* Emissive: contribute throughput · emission and stop. */
+      color = v3add(color, v3mul(throughput, mat->emit));
+      break;
+    }
+
+    /* PASS 6 — TERMINATION (Russian roulette after depth warm-up). */
+    if (depth >= RR_DEPTH && !russian_roulette(&throughput, rng_state))
+      break;
+
+    /* PASS 5 — THROUGHPUT CHAIN. */
+    throughput = throughput_chain(throughput, mat->albedo);
+
+    /* PASS 4 — BOUNCE DIRECTION SAMPLING.  Push origin off surface. */
+    ray.dir = sample_bounce(hit.N, rng_state);
+    ray.origin = v3add(hit.P, v3s(RAY_EPS, hit.N));
+  }
+  return color;
+}
+
+/* ── §13 SIMULATION + RENDER + LOGIC: accumulator — accum_add_frame (SIM)
+ * writes g_accum; accum_draw (RENDER) reads it; tone map (LOGIC)
+ * ───────────────────────── *
+ *
+ * Pass 7 averages many samples per pixel into a clean image and
+ * presents the result to the screen.
+ *
+ * Three sub-stages:
+ *   §13.1 accumulator buffer + reset
+ *   §13.2 accum_add_frame   — cast `spp` fresh samples per cell
+ *   §13.3 tone-map + draw   — divide, tone-map, ASCII-quantise, paint
+ *
+ * The accumulator stays in LINEAR HDR space at all times. Tone
+ * mapping happens only at draw time, AFTER dividing by sample count
+ * (T10). Static arrays (no malloc) sized to the largest terminal
+ * we'll encounter; on resize we reset rather than reallocate — the
+ * previous accumulator is meaningless at the new resolution anyway.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* §13.1 ── accumulator + reset ──────────────────────────────────────── */
+
+/*
+ * Accumulator — the progressive render target: a per-pixel running SUM of HDR
+ * radiance plus the number of samples folded in. A pixel's displayed colour is
+ * sum / samples, so the two always travel together — that pairing is the whole
+ * reason this is one type and not two globals. Kept in LINEAR HDR space; tone
+ * mapping happens only at draw time, AFTER the divide.
+ *   sum      [row][col][rgb] running sum of sample radiance (linear HDR)
+ *   samples  total samples folded into every pixel so far (the divisor)
+ * Ref: progressive Monte-Carlo rendering — PBRT (Pharr/Jakob/Humphreys), Film.
+ */
+typedef struct {
+  float sum[MAX_H][MAX_W][3]; /* per-pixel running radiance sum (linear HDR) */
+  int samples;                /* samples folded into each pixel so far       */
+} Accumulator;
+
+static Accumulator g_accum;
+
+static void accum_reset(Accumulator *a) {
+  memset(a->sum, 0, sizeof a->sum);
+  a->samples = 0;
+}
+
+/* forward declaration — debug overlays defined in §14. */
+static V3 first_hit_viz(Ray ray, ShadeMode mode);
+
+/*
+ * sample_pixel — one Monte-Carlo radiance sample for pixel (col,row): seed a
+ * decorrelated RNG, jitter the ray within the pixel for free anti-aliasing,
+ * generate the primary ray (PASS 1), and trace it — full path (PASSES 2-6) in
+ * MODE_PT, or a deterministic debug AOV otherwise. Pure given sample_idx.
+ */
+static V3 sample_pixel(int col, int row, int cols, int rows, int sample_idx,
+                       ShadeMode mode) {
+  Rng rng_state = rng_seed(col, row, sample_idx);
+  float jitter_x = rng_f(&rng_state) - 0.5f; /* sub-pixel AA */
+  float jitter_y = rng_f(&rng_state) - 0.5f;
+  Ray primary = camera_ray(col, row, cols, rows, jitter_x, jitter_y);
+  return (mode == MODE_PT) ? path_trace(primary, &rng_state)
+                           : first_hit_viz(primary, mode);
+}
+
+/* §13.2 ── accum_add_frame: cast `spp` samples per pixel ────────────── */
+
+/*
+ * accum_add_frame — one frame of additional samples.
+ *
+ * Pseudocode:
+ *   for each row:
+ *     for each col:
+ *       sample_sum = (0, 0, 0)
+ *       for s = 0 .. spp − 1:
+ *         sample_sum += sample_pixel(col, row, ..., frame_idx*spp + s, mode)
+ *       a->sum[row][col] += sample_sum                   PASS 7 (sum)
+ *   a->samples += spp                                    PASS 7 (count)
+ *
+ * sample_pixel does PASS 1 (jittered primary ray) + PASSES 2-6 (or a debug
+ * AOV); kept separate so this loop reads as "sum spp samples per pixel".
+ *
+ * No tone-mapping here — that happens in accum_draw so we keep the
+ * accumulator in linear HDR space. Tone-mapping the running sum each
+ * frame would compound: the right place is "after divide".
+ *
+ * Frame-decorrelated seed (frame * spp + s) ensures back-to-back
+ * frames don't redraw the same noise pattern.
+ */
+static void accum_add_frame(Accumulator *a, int cols, int rows, int spp,
+                            int frame_idx, ShadeMode mode) {
+  for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
+    for (int col = 0; col < cols && col < MAX_W; col++) {
+      float sum_r = 0.f, sum_g = 0.f, sum_b = 0.f;
+
+      for (int s = 0; s < spp; s++) {
+        V3 radiance =
+            sample_pixel(col, row, cols, rows, frame_idx * spp + s, mode);
+        sum_r += radiance.x;
+        sum_g += radiance.y;
+        sum_b += radiance.z;
+      }
+
+      a->sum[row][col][0] += sum_r;
+      a->sum[row][col][1] += sum_g;
+      a->sum[row][col][2] += sum_b;
+    }
+  }
+  a->samples += spp;
+}
+
+/* §13.3 ── tone-mapping + draw ──────────────────────────────────────── */
+
+static inline float reinhard(float x) { return x / (1.f + x); }
+static inline float gamma_enc(float x) {
+  return powf(x < 0.f ? 0.f : (x > 1.f ? 1.f : x), 1.f / 2.2f);
+}
+static inline float rec601_luma(float r, float g, float b) {
+  return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+/* luma_to_ramp_char — map perceptual brightness [0,1] to a Bourke density
+ * glyph (denser char = brighter), clamped to the ramp's bounds. */
+static char luma_to_ramp_char(float luma) {
+  int ramp_index = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
+  if (ramp_index < 0)
+    ramp_index = 0;
+  if (ramp_index >= RAMP_LEN)
+    ramp_index = RAMP_LEN - 1;
+  return k_ramp[ramp_index];
+}
+
+/* rgb_to_cube_pair — quantise an sRGB triple to the nearest 6x6x6 xterm colour
+ * cube and return its ncurses pair id (each channel rounded to 0..5). */
+static int rgb_to_cube_pair(float r, float g, float b) {
+  int red_5bit = (int)(r * 5.f + 0.5f);
+  int green_5bit = (int)(g * 5.f + 0.5f);
+  int blue_5bit = (int)(b * 5.f + 0.5f);
+  if (red_5bit > 5)
+    red_5bit = 5;
+  if (red_5bit < 0)
+    red_5bit = 0;
+  if (green_5bit > 5)
+    green_5bit = 5;
+  if (green_5bit < 0)
+    green_5bit = 0;
+  if (blue_5bit > 5)
+    blue_5bit = 5;
+  if (blue_5bit < 0)
+    blue_5bit = 0;
+  return PAIR_CUBE_BASE + red_5bit * 36 + green_5bit * 6 + blue_5bit;
+}
+
+/*
+ * accum_draw — paint the running average to screen.
+ *
+ * Per cell:
+ *   1. linear average:    L = accum / samples            (T10)
+ *   2. Reinhard tone-map: L' = L / (1 + L)               (HDR → [0, 1))
+ *   3. gamma encode:      out = L'^(1/2.2)               (linear → sRGB)
+ *   4. luminance → ASCII density char
+ *   5. RGB → nearest 6×6×6 xterm cube colour pair
+ *
+ * Step 1 must happen BEFORE tone-mapping — tone-mapping a sum of N
+ * samples is not the same as N times the tone-map of a single sample.
+ * (Tone-map is non-linear.)
+ */
+static void accum_draw(const Accumulator *a, int cols, int rows) {
+  if (a->samples == 0)
+    return;
+  float inv_samples = 1.f / (float)a->samples;
+
+  for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
+    for (int col = 0; col < cols && col < MAX_W; col++) {
+      float r = a->sum[row][col][0] * inv_samples;
+      float g = a->sum[row][col][1] * inv_samples;
+      float b = a->sum[row][col][2] * inv_samples;
+
+      r = gamma_enc(reinhard(r));
+      g = gamma_enc(reinhard(g));
+      b = gamma_enc(reinhard(b));
+
+      char ch = luma_to_ramp_char(rec601_luma(r, g, b));
+      int pair_index = rgb_to_cube_pair(r, g, b);
+      attron(COLOR_PAIR(pair_index) | A_BOLD);
+      mvaddch(row, col, (chtype)(unsigned char)ch);
+      attroff(COLOR_PAIR(pair_index) | A_BOLD);
+    }
+  }
+}
+
+/* ── §14 LOGIC: debug overlays — first_hit_viz (pure) ───────────────── *
+ *
+ * The debug modes short-circuit the path tracer at the FIRST hit and
+ * paint an intermediate quantity. Each mode lets you SEE the output
+ * of one or two passes in isolation:
+ *
+ *   MODE_NORMAL  Pass 1 + Pass 2:   (N + 1) / 2 as RGB
+ *   MODE_ALBEDO  Pass 1 + 2 + 3:    material albedo (no lighting)
+ *   MODE_DEPTH   Pass 1 + Pass 2:   1 / (1 + t) as gray
+ *
+ * No bounces, no randomness — these modes converge in a single
+ * sample. Cycle them with `d` to compare against the full PT result.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+static V3 first_hit_viz(Ray ray, ShadeMode mode) {
+  Hit hit;
+  if (!scene_hit(ray, RAY_EPS, &hit))
+    return v3(0, 0, 0); /* miss */
+
+  const Mat *mat = shade_at_hit(&hit);
+
+  switch (mode) {
+  case MODE_NORMAL:
+    /* Encode normal as RGB ∈ [0, 1]³ — each component −1..1 → 0..1. */
+    return v3(hit.N.x * 0.5f + 0.5f, hit.N.y * 0.5f + 0.5f,
+              hit.N.z * 0.5f + 0.5f);
+
+  case MODE_ALBEDO:
+    /* Material body colour. Lights show as a clamped slice of
+     * emission so they read bright but don't blow out the cube. */
+    if (mat_is_light(mat)) {
+      return v3(fminf(mat->emit.x * 0.06f, 1.f),
+                fminf(mat->emit.y * 0.06f, 1.f),
+                fminf(mat->emit.z * 0.06f, 1.f));
+    }
+    return mat->albedo;
+
+  case MODE_DEPTH: {
+    /* 1 / (1 + t): closer surfaces brighter, distant darker.
+     * Output as gray (R=G=B). */
+    float v = 1.f / (1.f + hit.t);
+    return v3(v, v, v);
+  }
+
+  default:
+    return v3(0, 0, 0);
+  }
+}
+
+/* ── §15 RENDER: screen — colour init, progress bar, HUD, cell paint
+ * ─────────────────────────────────────────────────────── */
+
+static int g_have_256 = 0;
+
+/* §15.1 ── color_init: 6×6×6 cube + reserved HUD/HINT/bar pairs ────── */
+
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  g_have_256 = (COLORS >= 256);
+
+  if (g_have_256) {
+    /* 216-colour xterm cube: pairs PAIR_CUBE_BASE..+215. */
+    for (int i = 0; i < 216; i++)
+      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
+    init_pair(PAIR_HUD, 226, -1);       /* bright yellow         */
+    init_pair(PAIR_HINT, 51, -1);       /* bright cyan           */
+    init_pair(PAIR_BAR_FILL, 46, -1);   /* bright green (filled) */
+    init_pair(PAIR_BAR_EMPTY, 240, -1); /* dim grey (empty)      */
+  } else {
+    init_pair(PAIR_CUBE_BASE, COLOR_WHITE, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+    init_pair(PAIR_BAR_FILL, COLOR_GREEN, -1);
+    init_pair(PAIR_BAR_EMPTY, COLOR_WHITE, -1);
+  }
+}
+
+/* §15.2 ── progress bar (samples / ACCUM_CAP) ───────────────────────── */
+
+/*
+ * draw_progress_bar — visualise convergence as samples / ACCUM_CAP.
+ *
+ * The bar fills as samples accumulate; once full, the HUD shows
+ * "CONVERGED" and the main loop stops adding new samples (so the CPU
+ * doesn't burn refining a converged image past visual gain).
+ *
+ * Width scales to ≈ cols/3 with bounds [8, 60] so it stays useful on
+ * both narrow and wide terminals.
+ */
+static void draw_progress_bar(int row, int cols, int samples) {
+  int bar_width = cols / 3;
+  if (bar_width < 8)
+    bar_width = 8;
+  if (bar_width > 60)
+    bar_width = 60;
+  int filled = (int)((float)samples / (float)ACCUM_CAP * bar_width);
+  if (filled > bar_width)
+    filled = bar_width;
+
+  int x = 1;
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvaddch(row, x++, '[');
+  for (int i = 0; i < bar_width; i++) {
+    bool on = (i < filled);
+    int pair = on ? PAIR_BAR_FILL : PAIR_BAR_EMPTY;
+    int attr = on ? A_BOLD : A_DIM;
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(row, x++, (chtype)(unsigned char)(on ? '=' : '-'));
+    attroff(COLOR_PAIR(pair) | attr);
+  }
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvaddch(row, x++, ']');
+  attroff(COLOR_PAIR(PAIR_HUD));
+}
+
+/* §15.3 ── hud_draw (HUD spec compliant) ────────────────────────────── */
+
+/*
+ * hud_draw — three HUD elements:
+ *
+ *   row 0 (top, yellow + BOLD)         status: fps / spp / samples /
+ *                                      mode / state
+ *   row 1 (top, yellow + progress bar) convergence visualisation
+ *   row rows-1 (bottom, cyan + BOLD)   key hint strip
+ */
+static void hud_draw(int cols, int rows, float fps, int spp, int samples,
+                     ShadeMode mode, bool paused) {
+  /* §15.3.1 status — top-right. */
+  char buf[140];
+  snprintf(buf, sizeof buf, " %5.1f fps  spp:%d  samples:%-5d  mode:%s  %s ",
+           (double)fps, spp, samples, shade_mode_name(mode),
+           paused                 ? "PAUSED   "
+           : (mode != MODE_PT)    ? "instant  "
+           : samples >= ACCUM_CAP ? "CONVERGED"
+                                  : "tracing  ");
+  int len = (int)strlen(buf);
+  if (len > cols)
+    len = cols;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, cols - len, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+  /* §15.3.2 title — top-left, same row. */
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(0, 0, " PATH TRACER · CORNELL BOX ");
+  attroff(COLOR_PAIR(PAIR_HUD));
+
+  /* §15.3.3 progress bar — row 1. Only meaningful in PT mode (debug
+   * modes converge in 1 sample so the bar would just show "tiny
+   * progress, full bar"). Hide it in debug modes. */
+  if (rows > 4 && mode == MODE_PT)
+    draw_progress_bar(1, cols, samples);
+
+  /* §15.3.4 hint — bottom row, cyan + BOLD. */
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(rows - 1, 0, " q:quit  spc/p:pause  r:reset  d:mode  +/-:spp ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+/* ── §16 APP / TICK — signals, input, the per-tick combine (see ARCHITECTURE)
+ * ────────────────────────────────────────────────────────── */
+
+static volatile sig_atomic_t g_run = 1;
+static volatile sig_atomic_t g_resize = 0;
+static void on_sigint(int s) {
+  (void)s;
+  g_run = 0;
+}
+static void on_sigwinch(int s) {
+  (void)s;
+  g_resize = 1;
+}
+static void cleanup(void) { endwin(); }
+
+int main(void) {
+  signal(SIGINT, on_sigint);
+  signal(SIGTERM, on_sigint);
+  signal(SIGWINCH, on_sigwinch);
+  atexit(cleanup);
+
+  initscr();
+  cbreak();
+  noecho();
+  curs_set(0);
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  typeahead(-1); /* prevent input tearing */
+
+  int cols, rows;
+  getmaxyx(stdscr, rows, cols);
+  color_init();
+  accum_reset(&g_accum);
+
+  int spp = SPP_DEFAULT;
+  bool paused = false;
+  ShadeMode mode = MODE_PT;
+  float fps = 0.f;
+  long long fps_acc = 0;
+  int fps_cnt = 0;
+  long long frame_ns = 1000000000LL / TARGET_FPS;
+  long long last = clock_ns();
+  int frame_idx = 0;
+
+  while (g_run) {
+
+    /* §16.1 USER EVENT — apply pending SIGWINCH: reset accumulator + frame
+     *         index (control state, NOT part of the tick). */
+    if (g_resize) {
+      g_resize = 0;
+      endwin();
+      refresh();
+      getmaxyx(stdscr, rows, cols);
+      accum_reset(&g_accum);
+      frame_idx = 0;
+    }
+
+    /* §16.2 PERFORMANCE — wall-clock dt with spiral-of-death cap. */
+    long long now = clock_ns();
+    long long dt = now - last;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
+    last = now;
+
+    /* §16.3 PERFORMANCE — fps rolling average over half-second windows. */
+    fps_acc += dt;
+    fps_cnt++;
+    if (fps_acc >= 500000000LL) {
+      fps = (float)fps_cnt * 1e9f / (float)fps_acc;
+      fps_acc = 0;
+      fps_cnt = 0;
+    }
+
+    /* §16.4 SIMULATION — add one frame of samples to the accumulator: the ONLY
+     *         per-tick state advance. Skipped while paused or once converged
+     *         (g_accum.samples >= ACCUM_CAP) — that gate is the DELAYS layer.
+     * Debug modes are deterministic, so they add one frame and then hold. */
+    bool can_sample =
+        !paused && (mode != MODE_PT ? (g_accum.samples == 0)
+                                    : (g_accum.samples < ACCUM_CAP));
+    if (can_sample)
+      accum_add_frame(&g_accum, cols, rows, spp, frame_idx++, mode);
+
+    /* §16.5 RENDER combine — the ONE place state -> screen: erase -> accum_draw
+     *         -> hud_draw -> doupdate. Reads g_accum, never writes it. */
+    long long frame_start = clock_ns();
+    erase();
+    accum_draw(&g_accum, cols, rows);
+    hud_draw(cols, rows, fps, spp, g_accum.samples, mode, paused);
+    wnoutrefresh(stdscr);
+    doupdate();
+
+    /* §16.6 USER EVENTS — mutate spp / mode / pause and reset the accumulator
+     *         (r resets; +/- change SPP; d changes mode — each resets because
+     * the running average can't mix different sampling rates / ranges). NOT
+     *         part of the tick, never advance simulation. */
+    int ch = getch();
+    switch (ch) {
+    case 'q':
+    case 'Q':
+    case 27 /* ESC */:
+      g_run = 0;
+      break;
+    case ' ':
+    case 'p':
+    case 'P':
+      paused = !paused;
+      break;
+    case 'r':
+    case 'R':
+      accum_reset(&g_accum);
+      frame_idx = 0;
+      break;
+    case '+':
+    case '=':
+      if (spp < SPP_MAX)
+        spp++;
+      accum_reset(&g_accum);
+      frame_idx = 0;
+      break;
+    case '-':
+    case '_':
+      if (spp > SPP_MIN)
+        spp--;
+      accum_reset(&g_accum);
+      frame_idx = 0;
+      break;
+    case 'd':
+    case 'D':
+      mode = (ShadeMode)((mode + 1) % MODE_N);
+      accum_reset(&g_accum);
+      frame_idx = 0;
+      break;
+    default:
+      break;
+    }
+
+    /* §16.7 PERFORMANCE — frame cap. */
+    clock_sleep_ns(frame_ns - (clock_ns() - frame_start));
+  }
+  return 0;
+}
+
 /*
  * path_tracer.c — progressive Monte Carlo path tracer · Cornell Box
  *
@@ -139,13 +1478,12 @@
  *                  algorithm. Memorise them and you can read any path
  *                  tracer (smallpt, pbrt, mitsuba, cycles).
  *
- * Data-structure : Static per-pixel accumulator
- *                    g_accum[MAX_H][MAX_W][3]   — sum of radiance
- *                                                  over ALL samples
- *                                                  ever cast at this
- *                                                  pixel.
- *                    g_samples                  — total samples count.
- *                    Display = g_accum / g_samples, tone-mapped.
+ * Data-structure : the Accumulator (g_accum) — a static per-pixel buffer
+ *                  holding, for every pixel:
+ *                    sum[MAX_H][MAX_W][3]  — radiance summed over ALL
+ *                                            samples ever cast there
+ *                    samples               — total sample count
+ *                    Display = sum / samples, tone-mapped.
  *                  Resetting accum_reset() zeroes both. The buffer IS
  *                  the convergence record — each frame just adds more
  *                  samples to the running sum.
@@ -787,9 +2125,9 @@
  * and a global COUNT. Display = sum / count. Adding more samples
  * just refines that average:
  *
- *     g_accum[r][c] += new_sample;
- *     g_samples     += 1;
- *     display       = g_accum[r][c] / g_samples;
+ *     accum.sum[r][c] += new_sample;
+ *     accum.samples   += 1;
+ *     display          = accum.sum[r][c] / accum.samples;
  *
  * That's PROGRESSIVE refinement. The user sees:
  *
@@ -898,1276 +2236,51 @@
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-#define _POSIX_C_SOURCE 199309L
-#include <math.h>
-#include <ncurses.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-/* ── §1 config ──────────────────────────────────────────────────────── */
-
-/* §1.1 frame rate. PT is compute-heavy so we target 30 Hz, not 60. */
-#define TARGET_FPS 30
-#define DT_CAP_NS 200000000LL /* 0.2 s — spiral-of-death cap */
-
-/* §1.2 view geometry. */
-#define ASPECT 0.47f  /* terminal cell W/H ratio    */
-#define FOV_DEG 66.0f /* horizontal FOV             */
-
-/* §1.3 path tracing. */
-#define MAX_DEPTH 7   /* hard depth cap per path     */
-#define RR_DEPTH 3    /* RR starts at this depth     */
-#define SPP_DEFAULT 2 /* samples per pixel per frame */
-#define SPP_MIN 1
-#define SPP_MAX 8
-#define ACCUM_CAP 8192 /* auto-pause once converged   */
-#define RAY_EPS 1e-4f  /* origin offset along N       */
-
-#define MAX_W 320 /* static accumulator width    */
-#define MAX_H 100 /* static accumulator height   */
-
 /*
- * §1.4 Cornell box coordinate system:
- *   x ∈ [-1, 1]   left (red) → right (green)
- *   y ∈ [-1, 1]   floor → ceiling
- *   z ∈ [ 0, 2]   open front → back wall
- *   Camera at (0, 0.05, -1.5) looking toward +Z. The front face
- *   (z = 0) is open so the camera sees in.
+ * ════════════════════════════════════════════════════════════════════
+ *  ARCHITECTURE — concern layers (step-4 separation pass)
+ * ════════════════════════════════════════════════════════════════════
+ *
+ *  Labelled, separated layers. LOGIC is pure: the passes only READ the scene
+ *  and advance a THREADED rng (never a global), so reordering or deleting
+ *  RENDER can never change a LOGIC result.
+ *
+ *  LAYER        SECTION(S)                       MUTATES
+ *  ----------   ------------------------------   ------------------------------
+ *  CONFIG       §1, §5 (scene data)              nothing — constants, ramp,
+ * enums, Cornell-box geometry (compile-time) PERFORMANCE  §2; main §16.2/.3/.7
+ * OS sleep + loop-local timers; no scene state LOGIC        §3, §4, §5
+ * (intersection),       nothing global — pure functions: §6-§12, §13 (tone
+ * map), §14      vec3, RNG, ray-quad/sphere, scene_hit, camera ray, bounce
+ *                                                sampling, throughput,
+ * roulette, path_trace (the core), tone map, debug viz. sample_bounce/roulette/
+ *                                                rng_f advance the PASSED-IN
+ * Rng. SIMULATION   accum_add_frame (§13)            the Accumulator g_accum —
+ * the progressive image; each tick adds one frame of samples. accum_reset
+ *                                                clears it, but only on user
+ * events. RENDER       accum_draw (§13), §15            the SCREEN (ncurses
+ * cells) + g_have_256; reads g_accum, never writes it DELAYS       `paused`
+ * gate + converged hold   nothing — once g_accum.samples reaches (§16.4)
+ * ACCUM_CAP (or paused), sampling stops; no other holds/timers EFFECTS      —
+ * none —                         no stored cosmetic state; the accumulator is
+ * SIMULATION state (the converging image), not a glow
+ *
+ *  Timestep note: PERFORMANCE uses a VARIABLE wall-clock dt with a spiral-of-
+ *  death cap (§16.2) and a frame-cap sleep (§16.7) — NOT a fixed-timestep
+ *  accumulator. The image converges by ADDING samples each frame until
+ *  g_accum.samples hits ACCUM_CAP, then holds (progressive Monte-Carlo render).
+ *
+ *  PER-TICK COMBINE ORDER (main loop — the one place layers meet):
+ *    §16.1 resize   USER EVENT   apply SIGWINCH -> accum_reset
+ *    §16.2 dt       PERFORMANCE  wall-clock dt, capped
+ *    §16.3 fps      PERFORMANCE  rolling average
+ *    §16.4 sample   SIMULATION   accum_add_frame (skipped if paused/converged)
+ *    §16.5 paint    RENDER       erase -> accum_draw -> hud_draw -> doupdate
+ *    §16.6 input    USER EVENTS  spp/mode/pause + accum_reset (NOT the tick)
+ *    §16.7 sleep    PERFORMANCE  frame cap
+ *
+ *  User events (§16.1 resize, §16.6 keys, the signal handlers) mutate
+ *  spp/mode/paused, reset the accumulator, and set g_run/g_resize. They are
+ *  NOT the tick; the only per-tick simulation write is accum_add_frame.
+ * ════════════════════════════════════════════════════════════════════
  */
-#define CAM_X 0.00f
-#define CAM_Y 0.05f
-#define CAM_Z -1.50f
-
-/* §1.5 character ramp — Paul Bourke 92-char density ladder. */
-static const char k_ramp[] =
-    " `.-':_,^=;><+!rc*/"
-    "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
-#define RAMP_LEN ((int)(sizeof k_ramp - 1))
-
-/* §1.6 ncurses pair IDs. */
-#define PAIR_CUBE_BASE 1   /* + 0..215 = 6×6×6 cube       */
-#define PAIR_HUD 217       /* yellow row 0 status         */
-#define PAIR_HINT 218      /* cyan bottom hint strip      */
-#define PAIR_BAR_FILL 219  /* progress-bar filled cells   */
-#define PAIR_BAR_EMPTY 220 /* progress-bar empty cells    */
-
-/* §1.7 shade-mode enum (cycled with 'd'). See T12 + §14.
- *
- *   MODE_PT      full progressive Monte Carlo path tracer (default).
- *                Uses passes 1-7.
- *   MODE_NORMAL  first-hit surface normal as RGB. Passes 1+2 only.
- *   MODE_ALBEDO  first-hit material colour. Passes 1+2+3 only.
- *   MODE_DEPTH   first-hit 1/(1+t) gray. Passes 1+2 only.
- *
- * NORMAL/ALBEDO/DEPTH are deterministic — they converge in 1 sample
- * because no randomness is involved. Switching modes resets the
- * accumulator (their output ranges differ; mixing them under one
- * average would produce incoherent results).
- */
-typedef enum {
-  MODE_PT = 0,
-  MODE_NORMAL = 1,
-  MODE_ALBEDO = 2,
-  MODE_DEPTH = 3,
-  MODE_N = 4,
-} ShadeMode;
-
-static const char *shade_mode_name(ShadeMode m) {
-  switch (m) {
-  case MODE_PT:
-    return "PT    ";
-  case MODE_NORMAL:
-    return "NORMAL";
-  case MODE_ALBEDO:
-    return "ALBEDO";
-  case MODE_DEPTH:
-    return "DEPTH ";
-  default:
-    return "?     ";
-  }
-}
-
-/* ── §2 clock ───────────────────────────────────────────────────────── */
-
-/*
- * clock_ns — wall-clock time in nanoseconds, monotonic.
- *
- * Why CLOCK_MONOTONIC: we care about ELAPSED real time (for animation
- * dt), not wall date. CLOCK_MONOTONIC never goes backward across NTP
- * adjustments, DST shifts, or system clock changes.
- */
-static long long clock_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return ts.tv_sec * 1000000000LL + ts.tv_nsec;
-}
-
-/*
- * clock_sleep_ns — best-effort sleep for the requested nanoseconds.
- *
- * The main loop uses this to cap render rate without burning the CPU
- * at 100%; we subtract elapsed work time from the target frame and
- * sleep the remainder.
- */
-static void clock_sleep_ns(long long ns) {
-  if (ns <= 0)
-    return;
-  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
-  nanosleep(&ts, NULL);
-}
-
-/* ── §3 vec3 ────────────────────────────────────────────────────────── *
- *
- * V3 — three floats by value. All vector helpers are inline to avoid
- * call overhead in the per-bounce loop.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-typedef struct {
-  float x, y, z;
-} V3;
-
-static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
-static inline V3 v3add(V3 a, V3 b) {
-  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-static inline V3 v3sub(V3 a, V3 b) {
-  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
-}
-static inline V3 v3mul(V3 a, V3 b) {
-  return v3(a.x * b.x, a.y * b.y, a.z * b.z);
-}
-static inline V3 v3s(float s, V3 a) { return v3(s * a.x, s * a.y, s * a.z); }
-static inline float v3dot(V3 a, V3 b) {
-  return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-static inline float v3len(V3 a) { return sqrtf(v3dot(a, a)); }
-static inline V3 v3norm(V3 a) {
-  float length = v3len(a);
-  return length > 1e-9f ? v3s(1.f / length, a) : v3(0, 1, 0);
-}
-static inline V3 v3cross(V3 a, V3 b) {
-  return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
-            a.x * b.y - a.y * b.x);
-}
-
-/* v3maxc — maximum channel of a V3. Used by Russian roulette to pick
- * the survival probability (T9: max, not mean, to keep paths whose
- * energy is concentrated in a single colour band). */
-static inline float v3maxc(V3 a) {
-  return a.x > a.y ? (a.x > a.z ? a.x : a.z) : (a.y > a.z ? a.y : a.z);
-}
-
-/* ── §4 RNG (xorshift32, decorrelated per pixel per frame) ──────────── *
- *
- * Path tracing needs LOTS of random numbers (sub-pixel jitter + 2 per
- * cosine-hemisphere sample × MAX_DEPTH bounces × SPP × cols × rows).
- * Quality matters less than throughput: we use xorshift32, a single-
- * register PRNG with a period of 2³² − 1 — plenty for a single frame.
- *
- * Decorrelation: every (pixel, frame) gets an independent seed via a
- * small hash. Without that, neighbouring pixels would receive
- * correlated sequences and the noise would form visible streaks.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-typedef uint32_t Rng;
-
-/*
- * rng_f — uniform float in [0, 1) via xorshift32.
- *
- * The shift triple (13, 17, 5) is Marsaglia's, with the upper bit
- * masked off (>>1) so the result is non-negative when reinterpreted
- * via the integer-to-float divide.
- */
-static float rng_f(Rng *rng_state) {
-  *rng_state ^= *rng_state << 13;
-  *rng_state ^= *rng_state >> 17;
-  *rng_state ^= *rng_state << 5;
-  return (float)(*rng_state >> 1) * (1.f / (float)0x7FFFFFFF);
-}
-
-/*
- * rng_seed — produce an independent seed for (px, py, frame).
- *
- * The three large primes + xorshift warm-up scramble the components
- * so adjacent pixels and adjacent frames don't share correlated
- * sequences. Without decorrelation, neighbouring pixels would receive
- * the same sample sequence and the noise would form visible streaks.
- */
-static Rng rng_seed(int pixel_x, int pixel_y, int frame) {
-  uint32_t s = (uint32_t)(pixel_x * 1973 + pixel_y * 9277 + frame * 26699 + 1);
-  s ^= s << 13;
-  s ^= s >> 7;
-  s ^= s << 17;
-  return s ? s : 1u;
-}
-
-/* ── §5 scene (Cornell box) ─────────────────────────────────────────── *
- *
- * The Cornell Box has just three primitive types:
- *   §5.1 Material (Lambertian diffuse only)
- *   §5.2 Quad (axis-aligned rectangle)
- *   §5.3 Sphere
- *
- * Six quads form the walls (floor, ceiling, back, left, right, plus
- * the small ceiling light). Two spheres sit on the floor. That's the
- * entire geometry — six rectangles and two balls.
- *
- * See tutorial T11 for the scene's history and what it specifically
- * tests.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* §5.1 ── Material ──────────────────────────────────────────────────── */
-
-/*
- * Lambertian diffuse only.
- *   albedo ∈ [0, 1]³ — fraction of light reflected per channel
- *   emit             — radiance emitted (zero for non-emissive)
- *
- * With Lambertian BRDF f_r = albedo/π and cosine-weighted hemisphere
- * sampling p(ω) = cosθ/π (T6), the Monte Carlo estimator simplifies
- * to weight = albedo. This is why "throughput *= albedo" is the
- * entire bounce update (§10 + §12).
- */
-typedef struct {
-  V3 albedo;
-  V3 emit;
-} Mat;
-
-static const Mat k_mats[] = {
-    /* 0  white  */ {{0.73f, 0.73f, 0.73f}, {0, 0, 0}},
-    /* 1  red    */ {{0.65f, 0.05f, 0.05f}, {0, 0, 0}},
-    /* 2  green  */ {{0.12f, 0.45f, 0.15f}, {0, 0, 0}},
-    /* 3  light  */ {{0, 0, 0}, {15.f, 14.f, 11.f}}, /* warm */
-    /* 4  gold   */ {{0.80f, 0.58f, 0.18f}, {0, 0, 0}},
-    /* 5  indigo */ {{0.22f, 0.28f, 0.82f}, {0, 0, 0}},
-};
-
-static inline bool mat_is_light(const Mat *m) {
-  return m->emit.x > 0.f || m->emit.y > 0.f || m->emit.z > 0.f;
-}
-
-/* §5.2 ── Quad (axis-aligned rectangular plane) ───────────────────── */
-
-/*
- * A Cornell-box wall is an axis-aligned rectangle.
- *   axis = 0 → X-plane: lo/hi are bounds in (Y, Z)
- *   axis = 1 → Y-plane: lo/hi are bounds in (X, Z)
- *   axis = 2 → Z-plane: lo/hi are bounds in (X, Y)
- *
- * Encoding the wall as "fixed coordinate + 2-axis bounds" lets the
- * intersection test be a single divide + two range checks (§7.1) —
- * far cheaper than a triangle.
- */
-typedef struct {
-  int axis;           /* 0=X plane, 1=Y plane, 2=Z plane              */
-  float pos;          /* coordinate of the plane on its fixed axis    */
-  float lo[2], hi[2]; /* bounds in the two free axes                  */
-  int mat;            /* material index into k_mats                   */
-} Quad;
-
-/*
- * Cornell-box quads. The light at y = 0.98 sits just below the ceiling
- * (y = 1.0); rays going UP through the light's XZ footprint hit it
- * before the ceiling (smaller t) and pick up the emission.
- */
-static const Quad k_quads[] = {
-    /* floor    y=-1   x∈[-1,1] z∈[0,2] */ {
-        1, -1.0f, {-1.f, 0.f}, {1.f, 2.f}, 0},
-    /* ceiling  y=+1   x∈[-1,1] z∈[0,2] */
-    {1, 1.0f, {-1.f, 0.f}, {1.f, 2.f}, 0},
-    /* back     z=+2   x∈[-1,1] y∈[-1,1]*/
-    {2, 2.0f, {-1.f, -1.f}, {1.f, 1.f}, 0},
-    /* left     x=-1   y∈[-1,1] z∈[0,2] */
-    {0, -1.0f, {-1.f, 0.f}, {1.f, 2.f}, 1},
-    /* right    x=+1   y∈[-1,1] z∈[0,2] */
-    {0, 1.0f, {-1.f, 0.f}, {1.f, 2.f}, 2},
-    /* light    y=0.98 centred overhead */
-    {1, 0.98f, {-0.36f, 0.62f}, {0.36f, 1.38f}, 3},
-};
-#define N_QUADS ((int)(sizeof k_quads / sizeof k_quads[0]))
-
-/* §5.3 ── Sphere ───────────────────────────────────────────────────── */
-
-/*
- * Two diffuse spheres just above the floor. Bottom at y ≈ -0.98 with
- * floor at y = -1.0, leaving a small gap to avoid numerical
- * self-intersection between sphere and floor.
- */
-typedef struct {
-  V3 c;
-  float r;
-  int mat;
-} Sphere;
-
-static const Sphere k_spheres[] = {
-    {{-0.46f, -0.60f, 0.82f}, 0.38f, 4}, /* gold  , left  */
-    {{0.44f, -0.60f, 1.16f}, 0.38f, 5},  /* indigo, right */
-};
-#define N_SPHERES ((int)(sizeof k_spheres / sizeof k_spheres[0]))
-
-/* ── §6 PASS 1 — CAMERA RAY GENERATION ──────────────────────────────── *
- *
- * Pass 1 turns a pixel index (col, row) into a world-space Ray.
- *
- * The camera is a pinhole at (CAM_X, CAM_Y, CAM_Z) looking down +Z.
- * Each pixel maps to a screen-space (u, v) which we offset with sub-
- * pixel jitter for free anti-aliasing.
- *
- *      pixel (col, row)              world-space ray
- *      ┌─────┐                       ┌─────────────────────────┐
- *      │     │                       │ origin: camera position │
- *      │  +  │   ──── camera_ray ──▶ │ dir   : norm(forward    │
- *      │     │                       │              + u·right  │
- *      └─────┘                       │              + v·up   ) │
- *                                    └─────────────────────────┘
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-typedef struct {
-  V3 origin;
-  V3 dir;
-} Ray;
-
-/*
- * camera_ray — produce a primary ray for pixel (col, row).
- *
- * Pseudocode:
- *   centre_x = cols / 2          centre_y = rows / 2
- *   tan_half = tan(FOV / 2)
- *   u =  ((col + jitter_x) - centre_x) / centre_x  *  tan_half
- *   v = -((row + jitter_y) - centre_y) / centre_x  *  tan_half / ASPECT
- *   ray.origin = camera position
- *   ray.dir    = norm(forward + u·right + v·up)
- *
- * Why divide v by centre_x (NOT centre_y): we want square pixels in
- * world space — equal angular extent per cell on both axes. Then we
- * correct for the terminal cell's aspect ratio (cells are taller
- * than wide) by a final /ASPECT.
- *
- * Why the negative sign on v: row indices increase downward (y-down)
- * but world-space "up" is +Y (y-up). Negate so the world's +Y maps
- * to the top of the screen (lower row numbers).
- *
- * jitter_x, jitter_y ∈ [-0.5, +0.5] gives free anti-aliasing — each
- * sample's primary ray pierces a slightly different sub-pixel point;
- * averaging filters out staircase aliasing along edges.
- */
-static Ray camera_ray(int col, int row, int cols, int rows, float jitter_x,
-                      float jitter_y) {
-  (void)rows; /* v normalised by cols */
-  float centre_x = cols * 0.5f;
-  float centre_y = rows * 0.5f;
-  float tan_half = tanf(FOV_DEG * (float)M_PI / 360.f);
-
-  float u = ((col + jitter_x) - centre_x) / centre_x * tan_half;
-  float v = -((row + jitter_y) - centre_y) / centre_x * tan_half / ASPECT;
-
-  V3 forward = v3(0, 0, 1);
-  V3 right = v3(1, 0, 0);
-  V3 up = v3(0, 1, 0);
-
-  Ray ray;
-  ray.origin = v3(CAM_X, CAM_Y, CAM_Z);
-  ray.dir = v3norm(v3add(forward, v3add(v3s(u, right), v3s(v, up))));
-  return ray;
-}
-
-/* ── §7 PASS 2 — SCENE INTERSECTION ─────────────────────────────────── *
- *
- * Pass 2 finds the closest surface a Ray hits.
- *
- * Three short tests:
- *   §7.1 ray_quad    — ray vs axis-aligned rectangle
- *   §7.2 ray_sphere  — ray vs sphere (textbook quadratic)
- *   §7.3 scene_hit   — try every primitive, keep the nearest
- *
- * No spatial structures — N is small (8 primitives). A real renderer
- * would put a BVH here; we keep it brute-force for clarity.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * Hit record: position, surface normal (oriented toward the ray), and
- * the material index. The normal-toward-ray convention means the
- * hemisphere sampling in §9 always produces directions on the
- * outgoing side without needing a flip later.
- */
-typedef struct {
-  float t;
-  V3 P, N;
-  int mat;
-} Hit;
-
-/* §7.1 ── ray vs axis-aligned quad ─────────────────────────────────── */
-
-/*
- * ray_quad — analytic intersection of a ray with one axis-aligned
- *            rectangle.
- *
- * Pseudocode:
- *   On the FIXED axis, find t at which the ray crosses the plane:
- *     dir_a, origin_a = ray.dir[axis], ray.origin[axis]
- *     if |dir_a| < ε:   ray is parallel → MISS
- *     t = (q->pos - origin_a) / dir_a
- *     if t < t_min:     behind us → MISS
- *
- *   Compute the hit point's two FREE-axis coordinates and check
- *   against the rectangle's bounds:
- *     hit_point = ray.origin + t · ray.dir
- *     u, v      = hit_point's two free-axis components
- *     if u or v outside [lo, hi]:   MISS
- *
- *   The outward normal is the basis vector of the FIXED axis with
- *   sign chosen to FACE the incoming ray (so subsequent hemisphere
- *   sampling puts directions on the outgoing side automatically).
- */
-static int ray_quad(Ray ray, const Quad *quad, float t_min, float *out_t,
-                    V3 *out_normal) {
-  float dir_a, origin_a;
-  switch (quad->axis) {
-  case 0:
-    dir_a = ray.dir.x;
-    origin_a = ray.origin.x;
-    break;
-  case 1:
-    dir_a = ray.dir.y;
-    origin_a = ray.origin.y;
-    break;
-  default:
-    dir_a = ray.dir.z;
-    origin_a = ray.origin.z;
-    break;
-  }
-  if (fabsf(dir_a) < 1e-9f)
-    return 0; /* parallel to plane */
-
-  float t = (quad->pos - origin_a) / dir_a;
-  if (t < t_min)
-    return 0;
-
-  float hit_x = ray.origin.x + t * ray.dir.x;
-  float hit_y = ray.origin.y + t * ray.dir.y;
-  float hit_z = ray.origin.z + t * ray.dir.z;
-
-  float free_axis_u, free_axis_v;
-  switch (quad->axis) {
-  case 0:
-    free_axis_u = hit_y;
-    free_axis_v = hit_z;
-    break;
-  case 1:
-    free_axis_u = hit_x;
-    free_axis_v = hit_z;
-    break;
-  default:
-    free_axis_u = hit_x;
-    free_axis_v = hit_y;
-    break;
-  }
-  if (free_axis_u < quad->lo[0] || free_axis_u > quad->hi[0] ||
-      free_axis_v < quad->lo[1] || free_axis_v > quad->hi[1])
-    return 0;
-
-  /* Outward normal: basis vector of fixed axis, sign opposing ray. */
-  V3 normal = {0, 0, 0};
-  switch (quad->axis) {
-  case 0:
-    normal.x = (dir_a > 0.f) ? -1.f : 1.f;
-    break;
-  case 1:
-    normal.y = (dir_a > 0.f) ? -1.f : 1.f;
-    break;
-  default:
-    normal.z = (dir_a > 0.f) ? -1.f : 1.f;
-    break;
-  }
-  *out_t = t;
-  *out_normal = normal;
-  return 1;
-}
-
-/* §7.2 ── ray vs sphere ─────────────────────────────────────────────── */
-
-/*
- * ray_sphere — analytic intersection via the textbook quadratic.
- *
- * Setup: |ray.origin + t·ray.dir − centre|² = radius². With unit-
- * length ray.dir, this expands to
- *
- *     t² + 2·b·t + (|origin_to_centre|² − radius²) = 0
- *
- * where b = ray.dir · origin_to_centre.
- *
- * Discriminant disc = b² − (|origin_to_centre|² − radius²).
- * Roots t = -b ± √disc. We pick the nearest root that's beyond
- * t_min (front face for an outside ray; far root only if the ray
- * starts INSIDE the sphere, which can't happen here — diffuse
- * surfaces don't let rays in).
- */
-static int ray_sphere(Ray ray, const Sphere *sphere, float t_min,
-                      float *out_t) {
-  V3 origin_to_centre = v3sub(ray.origin, sphere->c);
-  float b = v3dot(ray.dir, origin_to_centre);
-  float disc =
-      b * b - v3dot(origin_to_centre, origin_to_centre) + sphere->r * sphere->r;
-  if (disc < 0.f)
-    return 0;
-
-  float sq = sqrtf(disc);
-  float t = -b - sq;
-  if (t < t_min)
-    t = -b + sq;
-  if (t < t_min)
-    return 0;
-  *out_t = t;
-  return 1;
-}
-
-/* §7.3 ── scene_hit (find nearest surface) ─────────────────────────── */
-
-/*
- * scene_hit — loop over all primitives, keep the smallest valid t.
- *
- * For 6 quads + 2 spheres this brute-force test is fine; a real
- * renderer would put a BVH here, but BVH belongs in a separate
- * teaching file (raymarcher.c uses spatial structures).
- *
- * The sphere normal is computed AFTER selection: an outward normal
- * `(P − centre)/r`, then flipped if it points away from the ray
- * (ensuring the hemisphere sampler gets a normal on the outgoing
- * side, regardless of front/back hit).
- */
-static int scene_hit(Ray ray, float t_min, Hit *out_hit) {
-  float t_best = 1e30f;
-  int any = 0;
-
-  for (int i = 0; i < N_QUADS; i++) {
-    float t;
-    V3 normal;
-    if (ray_quad(ray, &k_quads[i], t_min, &t, &normal) && t < t_best) {
-      t_best = t;
-      out_hit->t = t;
-      out_hit->P = v3add(ray.origin, v3s(t, ray.dir));
-      out_hit->N = normal;
-      out_hit->mat = k_quads[i].mat;
-      any = 1;
-    }
-  }
-  for (int i = 0; i < N_SPHERES; i++) {
-    float t;
-    if (ray_sphere(ray, &k_spheres[i], t_min, &t) && t < t_best) {
-      t_best = t;
-      out_hit->t = t;
-      out_hit->P = v3add(ray.origin, v3s(t, ray.dir));
-      V3 outward_n = v3norm(v3sub(out_hit->P, k_spheres[i].c));
-      /* Flip outward normal to face the incoming ray. */
-      out_hit->N =
-          (v3dot(outward_n, ray.dir) < 0.f) ? outward_n : v3s(-1.f, outward_n);
-      out_hit->mat = k_spheres[i].mat;
-      any = 1;
-    }
-  }
-  return any;
-}
-
-/* ── §8 PASS 3 — SHADING DECISION ───────────────────────────────────── *
- *
- * Pass 3 looks up the Material at a hit point. Trivial here (it's
- * just an array index) but factored into a named function so the
- * spine of the algorithm reads as "every pass = one operation".
- *
- * In a real renderer this is where you'd dispatch on material type:
- * diffuse vs specular vs glass vs subsurface. We have one type
- * (Lambertian) so it's a one-liner — but the conceptual stage is
- * real and the orchestrator (§12) calls it explicitly.
- *
- * The actual shading DECISION ("emissive? then accumulate and stop;
- * otherwise prepare to bounce") happens in path_trace using the
- * Material this function returns. That decision belongs with the
- * orchestrator, not with the lookup.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-static const Mat *shade_at_hit(const Hit *hit) { return &k_mats[hit->mat]; }
-
-/* ── §9 PASS 4 — BOUNCE DIRECTION SAMPLING ──────────────────────────── *
- *
- * Pass 4 picks a random new direction from the BRDF's importance-
- * sampled distribution. For Lambertian we use cosine-weighted
- * hemisphere sampling via Malley's method (T6, T7).
- *
- * Two helper functions:
- *   §9.1 onb              — orthonormal basis around a normal
- *   §9.2 sample_bounce    — Malley's method (was cos_sample_hemi)
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* §9.1 ── onb: orthonormal basis around a normal ────────────────────── */
-
-/*
- * onb — construct two perpendicular unit vectors so {u, v, n} is a
- *       right-handed orthonormal basis.
- *
- * Used by the cosine-hemisphere sampler to translate "local +Z =
- * normal" samples into world coordinates.
- *
- * The "pick non-parallel up" trick: if n is mostly along X (|n.x| ≥
- * 0.9) use Y as the seed; otherwise use X. Either way `up × n` is
- * non-zero, so v3cross produces a valid perpendicular.
- */
-static void onb(V3 normal, V3 *out_u, V3 *out_v) {
-  V3 up = (fabsf(normal.x) < 0.9f) ? v3(1, 0, 0) : v3(0, 1, 0);
-  *out_u = v3norm(v3cross(up, normal));
-  *out_v = v3cross(normal, *out_u);
-}
-
-/* §9.2 ── sample_bounce: cosine-weighted hemisphere sample ──────────── */
-
-/*
- * sample_bounce — Malley's method (1988): the 2-D uniform-disk
- *                 sampling distribution, lifted to a hemisphere via
- *                 z = √(1 − r²), produces a 3-D distribution whose
- *                 density is exactly cosθ/π — exactly what we need.
- *
- *   r1 ∈ [0, 1)  →  φ = 2π · r1                  azimuth
- *   r2 ∈ [0, 1)  →  in-plane radius = √r2        (uniform on disc)
- *                   z              = √(1 − r2)   (lift onto hemisphere)
- *
- * Local sample is (cosφ·√r2, sinφ·√r2, √(1−r2)). Transform to world
- * using the (u, v, n) basis from §9.1.
- *
- * Why this beats rejection sampling:
- *   • Always two RNG calls — no loop with worst-case unbounded retries.
- *   • Numerically stable at grazing angles where rejection thrashes.
- *   • PDF analytically known and matches the Lambertian BRDF — the
- *     algebraic cancellation in T6 hinges on this.
- *
- * See tutorial T7 for the diagram.
- */
-static V3 sample_bounce(V3 normal, Rng *rng_state) {
-  float r1 = rng_f(rng_state);
-  float r2 = rng_f(rng_state);
-  float phi = 2.f * (float)M_PI * r1;
-  float sr2 = sqrtf(r2); /* sinθ */
-  float local_x = cosf(phi) * sr2;
-  float local_y = sinf(phi) * sr2;
-  float local_z = sqrtf(1.f - r2); /* cosθ */
-  V3 basis_u, basis_v;
-  onb(normal, &basis_u, &basis_v);
-  return v3norm(v3add(v3s(local_x, basis_u),
-                      v3add(v3s(local_y, basis_v), v3s(local_z, normal))));
-}
-
-/* ── §10 PASS 5 — THROUGHPUT CHAIN ──────────────────────────────────── *
- *
- * Pass 5 is one line of arithmetic: throughput *= albedo.
- *
- * Why it deserves its own §-section: this single multiplication is
- * the entire BRDF evaluation in our path tracer. Cosine-weighted
- * hemisphere sampling cancelled the cosθ and the π (T6), leaving
- * just "multiply by albedo" as the bounce update. Every other path
- * tracer has a more elaborate update; ours is one of the most
- * stripped-down possible.
- *
- * After N bounces:
- *   throughput = albedo_1 · albedo_2 · … · albedo_N
- *
- * That product encodes "what fraction of any light we eventually
- * find will reach the camera through this exact path". When the
- * path finally hits an emissive surface, multiplying its emission
- * by this throughput gives the contribution of this random walk —
- * see T8's worked example.
- *
- * The function below is an inline one-liner; in a textbook this
- * might be a paragraph of comment with no code at all. Naming it
- * makes Pass 5 greppable.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-static inline V3 throughput_chain(V3 throughput, V3 albedo) {
-  return v3mul(throughput, albedo);
-}
-
-/* ── §11 PASS 6 — TERMINATION ───────────────────────────────────────── *
- *
- * Pass 6 decides when to stop bouncing. Two mechanisms:
- *
- *   (a) HARD DEPTH CAP — an outer for-loop bound (MAX_DEPTH). After
- *       MAX_DEPTH bounces, force-stop even if RR didn't kill us.
- *       Belt-and-braces: keeps bad RR luck from running forever.
- *
- *   (b) RUSSIAN ROULETTE — probabilistic kill, unbiased. Used after
- *       depth ≥ RR_DEPTH so early high-energy bounces aren't killed.
- *       See T9.
- *
- * russian_roulette() implements (b). The depth cap (a) is a loop
- * bound in path_trace, not a separate function.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * russian_roulette — unbiased path termination.
- *
- * Pseudocode:
- *   p = max(throughput.r, throughput.g, throughput.b)
- *   if p < ε:                       throughput is dead anyway → kill
- *   if random() > p:                kill with probability (1 − p)
- *   throughput *= 1 / p             (compensate survivors → unbiased)
- *   return survived?
- *
- * Returning false means the caller should break out of the bounce
- * loop. Returning true means the caller continues — and the
- * throughput has already been scaled in-place to compensate.
- *
- * Why MAX channel and not MEAN: a path with throughput (0.5, 0, 0)
- * is meaningful in the red channel; killing it because the average
- * is 0.17 would erase real red contributions.
- */
-static bool russian_roulette(V3 *throughput, Rng *rng_state) {
-  float p = v3maxc(*throughput);
-  if (p < 1e-4f)
-    return false; /* throughput too low */
-  if (rng_f(rng_state) > p)
-    return false;                          /* rolled the kill   */
-  *throughput = v3s(1.f / p, *throughput); /* compensate       */
-  return true;                             /* survived         */
-}
-
-/* ── §12 path_trace (orchestrator: combines passes 2-6) ─────────────── *
- *
- * THE CORE. This function is small — one for-loop, ~25 lines of body —
- * but every line is one of the seven passes. Read it slowly.
- *
- * INPUT  : a primary Ray (produced by Pass 1 in the caller)
- *          plus a per-pixel-per-frame RNG state.
- * OUTPUT : V3 radiance contribution from this single random walk.
- *          Many such walks averaged form the converged image (Pass 7).
- *
- * Algorithm in steps (matches the 7-pass spine):
- *   throughput = (1, 1, 1)            what's left of the photon's energy
- *   color      = (0, 0, 0)            accumulated radiance
- *   for depth = 0 .. MAX_DEPTH:
- *     PASS 2: hit ← scene_hit(ray)
- *             if MISS: break (background = black)
- *     PASS 3: mat ← shade_at_hit(hit)
- *             if mat is emissive:
- *               color += throughput · emission       contribute
- *               break                                 (T4 step 11)
- *     PASS 6: if depth ≥ RR_DEPTH:
- *               if !russian_roulette(throughput): break
- *     PASS 5: throughput = throughput_chain(throughput, mat.albedo)
- *     PASS 4: ray.dir   ← sample_bounce(hit.N)
- *             ray.origin ← hit.P + ε · hit.N         self-int. push
- *   return color
- *
- * Iterative, not recursive. Iterative is clearer pedagogically because
- * the throughput chain (Pass 5) is a single line you can point at —
- * `throughput = throughput_chain(throughput, mat.albedo)`. With
- * recursion the same chain is hidden in the call/return structure.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-static V3 path_trace(Ray ray, Rng *rng_state) {
-  V3 color = v3(0, 0, 0);
-  V3 throughput = v3(1, 1, 1);
-
-  for (int depth = 0; depth < MAX_DEPTH; depth++) {
-
-    /* PASS 2 — SCENE INTERSECTION. */
-    Hit hit;
-    if (!scene_hit(ray, RAY_EPS, &hit))
-      break;
-
-    /* PASS 3 — SHADING DECISION. */
-    const Mat *mat = shade_at_hit(&hit);
-    if (mat_is_light(mat)) {
-      /* Emissive: contribute throughput · emission and stop. */
-      color = v3add(color, v3mul(throughput, mat->emit));
-      break;
-    }
-
-    /* PASS 6 — TERMINATION (Russian roulette after depth warm-up). */
-    if (depth >= RR_DEPTH && !russian_roulette(&throughput, rng_state))
-      break;
-
-    /* PASS 5 — THROUGHPUT CHAIN. */
-    throughput = throughput_chain(throughput, mat->albedo);
-
-    /* PASS 4 — BOUNCE DIRECTION SAMPLING.  Push origin off surface. */
-    ray.dir = sample_bounce(hit.N, rng_state);
-    ray.origin = v3add(hit.P, v3s(RAY_EPS, hit.N));
-  }
-  return color;
-}
-
-/* ── §13 PASS 7 — ACCUMULATION + TONE MAPPING ───────────────────────── *
- *
- * Pass 7 averages many samples per pixel into a clean image and
- * presents the result to the screen.
- *
- * Three sub-stages:
- *   §13.1 accumulator buffer + reset
- *   §13.2 accum_add_frame   — cast `spp` fresh samples per cell
- *   §13.3 tone-map + draw   — divide, tone-map, ASCII-quantise, paint
- *
- * The accumulator stays in LINEAR HDR space at all times. Tone
- * mapping happens only at draw time, AFTER dividing by sample count
- * (T10). Static arrays (no malloc) sized to the largest terminal
- * we'll encounter; on resize we reset rather than reallocate — the
- * previous accumulator is meaningless at the new resolution anyway.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* §13.1 ── accumulator + reset ──────────────────────────────────────── */
-
-static float g_accum[MAX_H][MAX_W][3];
-static int g_samples = 0;
-
-static void accum_reset(void) {
-  memset(g_accum, 0, sizeof g_accum);
-  g_samples = 0;
-}
-
-/* forward declaration — debug overlays defined in §14. */
-static V3 first_hit_viz(Ray ray, ShadeMode mode);
-
-/* §13.2 ── accum_add_frame: cast `spp` samples per pixel ────────────── */
-
-/*
- * accum_add_frame — one frame of additional samples.
- *
- * Pseudocode:
- *   for each row:
- *     for each col:
- *       sample_sum = (0, 0, 0)
- *       for s = 0 .. spp − 1:
- *         seed     = rng_seed(col, row, frame_idx * spp + s)
- *         jitter_x = uniform(-0.5, +0.5)         sub-pixel anti-aliasing
- *         jitter_y = uniform(-0.5, +0.5)
- *         primary  = camera_ray(col, row, ..., jx, jy)   PASS 1
- *         radiance = (mode == PT)
- *                    ? path_trace(primary, &seed)        PASSES 2-6
- *                    : first_hit_viz(primary, mode)      debug
- *         sample_sum += radiance
- *       g_accum[row][col] += sample_sum                  PASS 7 (sum)
- *   g_samples += spp                                     PASS 7 (count)
- *
- * No tone-mapping here — that happens in accum_draw so we keep the
- * accumulator in linear HDR space. Tone-mapping the running sum each
- * frame would compound: the right place is "after divide".
- *
- * Frame-decorrelated seed (frame * spp + s) ensures back-to-back
- * frames don't redraw the same noise pattern.
- */
-static void accum_add_frame(int cols, int rows, int spp, int frame_idx,
-                            ShadeMode mode) {
-  for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
-    for (int col = 0; col < cols && col < MAX_W; col++) {
-      float sum_r = 0.f, sum_g = 0.f, sum_b = 0.f;
-
-      for (int s = 0; s < spp; s++) {
-        Rng rng_state = rng_seed(col, row, frame_idx * spp + s);
-
-        /* Sub-pixel jitter for free anti-aliasing. */
-        float jitter_x = rng_f(&rng_state) - 0.5f;
-        float jitter_y = rng_f(&rng_state) - 0.5f;
-
-        /* PASS 1 — primary ray. */
-        Ray primary = camera_ray(col, row, cols, rows, jitter_x, jitter_y);
-
-        /* PASSES 2-6 (or debug short-circuit). */
-        V3 radiance = (mode == MODE_PT) ? path_trace(primary, &rng_state)
-                                        : first_hit_viz(primary, mode);
-        sum_r += radiance.x;
-        sum_g += radiance.y;
-        sum_b += radiance.z;
-      }
-
-      g_accum[row][col][0] += sum_r;
-      g_accum[row][col][1] += sum_g;
-      g_accum[row][col][2] += sum_b;
-    }
-  }
-  g_samples += spp;
-}
-
-/* §13.3 ── tone-mapping + draw ──────────────────────────────────────── */
-
-static inline float reinhard(float x) { return x / (1.f + x); }
-static inline float gamma_enc(float x) {
-  return powf(x < 0.f ? 0.f : (x > 1.f ? 1.f : x), 1.f / 2.2f);
-}
-static inline float rec601_luma(float r, float g, float b) {
-  return 0.2126f * r + 0.7152f * g + 0.0722f * b;
-}
-
-/*
- * accum_draw — paint the running average to screen.
- *
- * Per cell:
- *   1. linear average:    L = accum / samples            (T10)
- *   2. Reinhard tone-map: L' = L / (1 + L)               (HDR → [0, 1))
- *   3. gamma encode:      out = L'^(1/2.2)               (linear → sRGB)
- *   4. luminance → ASCII density char
- *   5. RGB → nearest 6×6×6 xterm cube colour pair
- *
- * Step 1 must happen BEFORE tone-mapping — tone-mapping a sum of N
- * samples is not the same as N times the tone-map of a single sample.
- * (Tone-map is non-linear.)
- */
-static void accum_draw(int cols, int rows) {
-  if (g_samples == 0)
-    return;
-  float inv_samples = 1.f / (float)g_samples;
-
-  for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
-    for (int col = 0; col < cols && col < MAX_W; col++) {
-      float r = g_accum[row][col][0] * inv_samples;
-      float g = g_accum[row][col][1] * inv_samples;
-      float b = g_accum[row][col][2] * inv_samples;
-
-      r = gamma_enc(reinhard(r));
-      g = gamma_enc(reinhard(g));
-      b = gamma_enc(reinhard(b));
-
-      float luma = rec601_luma(r, g, b);
-      int ramp_index = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
-      if (ramp_index < 0)
-        ramp_index = 0;
-      if (ramp_index >= RAMP_LEN)
-        ramp_index = RAMP_LEN - 1;
-      char ch = k_ramp[ramp_index];
-
-      int red_5bit = (int)(r * 5.f + 0.5f);
-      int green_5bit = (int)(g * 5.f + 0.5f);
-      int blue_5bit = (int)(b * 5.f + 0.5f);
-      if (red_5bit > 5)
-        red_5bit = 5;
-      if (red_5bit < 0)
-        red_5bit = 0;
-      if (green_5bit > 5)
-        green_5bit = 5;
-      if (green_5bit < 0)
-        green_5bit = 0;
-      if (blue_5bit > 5)
-        blue_5bit = 5;
-      if (blue_5bit < 0)
-        blue_5bit = 0;
-      int pair_index =
-          PAIR_CUBE_BASE + red_5bit * 36 + green_5bit * 6 + blue_5bit;
-      attron(COLOR_PAIR(pair_index) | A_BOLD);
-      mvaddch(row, col, (chtype)(unsigned char)ch);
-      attroff(COLOR_PAIR(pair_index) | A_BOLD);
-    }
-  }
-}
-
-/* ── §14 debug overlays (visualise individual passes) ───────────────── *
- *
- * The debug modes short-circuit the path tracer at the FIRST hit and
- * paint an intermediate quantity. Each mode lets you SEE the output
- * of one or two passes in isolation:
- *
- *   MODE_NORMAL  Pass 1 + Pass 2:   (N + 1) / 2 as RGB
- *   MODE_ALBEDO  Pass 1 + 2 + 3:    material albedo (no lighting)
- *   MODE_DEPTH   Pass 1 + Pass 2:   1 / (1 + t) as gray
- *
- * No bounces, no randomness — these modes converge in a single
- * sample. Cycle them with `d` to compare against the full PT result.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-static V3 first_hit_viz(Ray ray, ShadeMode mode) {
-  Hit hit;
-  if (!scene_hit(ray, RAY_EPS, &hit))
-    return v3(0, 0, 0); /* miss */
-
-  const Mat *mat = shade_at_hit(&hit);
-
-  switch (mode) {
-  case MODE_NORMAL:
-    /* Encode normal as RGB ∈ [0, 1]³ — each component −1..1 → 0..1. */
-    return v3(hit.N.x * 0.5f + 0.5f, hit.N.y * 0.5f + 0.5f,
-              hit.N.z * 0.5f + 0.5f);
-
-  case MODE_ALBEDO:
-    /* Material body colour. Lights show as a clamped slice of
-     * emission so they read bright but don't blow out the cube. */
-    if (mat_is_light(mat)) {
-      return v3(fminf(mat->emit.x * 0.06f, 1.f),
-                fminf(mat->emit.y * 0.06f, 1.f),
-                fminf(mat->emit.z * 0.06f, 1.f));
-    }
-    return mat->albedo;
-
-  case MODE_DEPTH: {
-    /* 1 / (1 + t): closer surfaces brighter, distant darker.
-     * Output as gray (R=G=B). */
-    float v = 1.f / (1.f + hit.t);
-    return v3(v, v, v);
-  }
-
-  default:
-    return v3(0, 0, 0);
-  }
-}
-
-/* ── §15 screen ─────────────────────────────────────────────────────── */
-
-static int g_have_256 = 0;
-
-/* §15.1 ── color_init: 6×6×6 cube + reserved HUD/HINT/bar pairs ────── */
-
-static void color_init(void) {
-  start_color();
-  use_default_colors();
-  g_have_256 = (COLORS >= 256);
-
-  if (g_have_256) {
-    /* 216-colour xterm cube: pairs PAIR_CUBE_BASE..+215. */
-    for (int i = 0; i < 216; i++)
-      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
-    init_pair(PAIR_HUD, 226, -1);       /* bright yellow         */
-    init_pair(PAIR_HINT, 51, -1);       /* bright cyan           */
-    init_pair(PAIR_BAR_FILL, 46, -1);   /* bright green (filled) */
-    init_pair(PAIR_BAR_EMPTY, 240, -1); /* dim grey (empty)      */
-  } else {
-    init_pair(PAIR_CUBE_BASE, COLOR_WHITE, -1);
-    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
-    init_pair(PAIR_HINT, COLOR_CYAN, -1);
-    init_pair(PAIR_BAR_FILL, COLOR_GREEN, -1);
-    init_pair(PAIR_BAR_EMPTY, COLOR_WHITE, -1);
-  }
-}
-
-/* §15.2 ── progress bar (samples / ACCUM_CAP) ───────────────────────── */
-
-/*
- * draw_progress_bar — visualise convergence as samples / ACCUM_CAP.
- *
- * The bar fills as samples accumulate; once full, the HUD shows
- * "CONVERGED" and the main loop stops adding new samples (so the CPU
- * doesn't burn refining a converged image past visual gain).
- *
- * Width scales to ≈ cols/3 with bounds [8, 60] so it stays useful on
- * both narrow and wide terminals.
- */
-static void draw_progress_bar(int row, int cols, int samples) {
-  int bar_width = cols / 3;
-  if (bar_width < 8)
-    bar_width = 8;
-  if (bar_width > 60)
-    bar_width = 60;
-  int filled = (int)((float)samples / (float)ACCUM_CAP * bar_width);
-  if (filled > bar_width)
-    filled = bar_width;
-
-  int x = 1;
-  attron(COLOR_PAIR(PAIR_HUD));
-  mvaddch(row, x++, '[');
-  for (int i = 0; i < bar_width; i++) {
-    bool on = (i < filled);
-    int pair = on ? PAIR_BAR_FILL : PAIR_BAR_EMPTY;
-    int attr = on ? A_BOLD : A_DIM;
-    attron(COLOR_PAIR(pair) | attr);
-    mvaddch(row, x++, (chtype)(unsigned char)(on ? '=' : '-'));
-    attroff(COLOR_PAIR(pair) | attr);
-  }
-  attron(COLOR_PAIR(PAIR_HUD));
-  mvaddch(row, x++, ']');
-  attroff(COLOR_PAIR(PAIR_HUD));
-}
-
-/* §15.3 ── hud_draw (HUD spec compliant) ────────────────────────────── */
-
-/*
- * hud_draw — three HUD elements:
- *
- *   row 0 (top, yellow + BOLD)         status: fps / spp / samples /
- *                                      mode / state
- *   row 1 (top, yellow + progress bar) convergence visualisation
- *   row rows-1 (bottom, cyan + BOLD)   key hint strip
- */
-static void hud_draw(int cols, int rows, float fps, int spp, int samples,
-                     ShadeMode mode, bool paused) {
-  /* §15.3.1 status — top-right. */
-  char buf[140];
-  snprintf(buf, sizeof buf, " %5.1f fps  spp:%d  samples:%-5d  mode:%s  %s ",
-           (double)fps, spp, samples, shade_mode_name(mode),
-           paused                 ? "PAUSED   "
-           : (mode != MODE_PT)    ? "instant  "
-           : samples >= ACCUM_CAP ? "CONVERGED"
-                                  : "tracing  ");
-  int len = (int)strlen(buf);
-  if (len > cols)
-    len = cols;
-  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-  mvprintw(0, cols - len, "%s", buf);
-  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-  /* §15.3.2 title — top-left, same row. */
-  attron(COLOR_PAIR(PAIR_HUD));
-  mvprintw(0, 0, " PATH TRACER · CORNELL BOX ");
-  attroff(COLOR_PAIR(PAIR_HUD));
-
-  /* §15.3.3 progress bar — row 1. Only meaningful in PT mode (debug
-   * modes converge in 1 sample so the bar would just show "tiny
-   * progress, full bar"). Hide it in debug modes. */
-  if (rows > 4 && mode == MODE_PT)
-    draw_progress_bar(1, cols, samples);
-
-  /* §15.3.4 hint — bottom row, cyan + BOLD. */
-  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-  mvprintw(rows - 1, 0, " q:quit  spc/p:pause  r:reset  d:mode  +/-:spp ");
-  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-}
-
-/* ── §16 app ────────────────────────────────────────────────────────── */
-
-static volatile sig_atomic_t g_run = 1;
-static volatile sig_atomic_t g_resize = 0;
-static void on_sigint(int s) {
-  (void)s;
-  g_run = 0;
-}
-static void on_sigwinch(int s) {
-  (void)s;
-  g_resize = 1;
-}
-static void cleanup(void) { endwin(); }
-
-int main(void) {
-  signal(SIGINT, on_sigint);
-  signal(SIGTERM, on_sigint);
-  signal(SIGWINCH, on_sigwinch);
-  atexit(cleanup);
-
-  initscr();
-  cbreak();
-  noecho();
-  curs_set(0);
-  keypad(stdscr, TRUE);
-  nodelay(stdscr, TRUE);
-  typeahead(-1); /* prevent input tearing */
-
-  int cols, rows;
-  getmaxyx(stdscr, rows, cols);
-  color_init();
-  accum_reset();
-
-  int spp = SPP_DEFAULT;
-  bool paused = false;
-  ShadeMode mode = MODE_PT;
-  float fps = 0.f;
-  long long fps_acc = 0;
-  int fps_cnt = 0;
-  long long frame_ns = 1000000000LL / TARGET_FPS;
-  long long last = clock_ns();
-  int frame_idx = 0;
-
-  while (g_run) {
-
-    /* §16.1 resize — invalidate accumulator, restart frame indexing. */
-    if (g_resize) {
-      g_resize = 0;
-      endwin();
-      refresh();
-      getmaxyx(stdscr, rows, cols);
-      accum_reset();
-      frame_idx = 0;
-    }
-
-    /* §16.2 timing — wall clock dt with cap. */
-    long long now = clock_ns();
-    long long dt = now - last;
-    if (dt > DT_CAP_NS)
-      dt = DT_CAP_NS;
-    last = now;
-
-    /* §16.3 fps rolling average over half-second windows. */
-    fps_acc += dt;
-    fps_cnt++;
-    if (fps_acc >= 500000000LL) {
-      fps = (float)fps_cnt * 1e9f / (float)fps_acc;
-      fps_acc = 0;
-      fps_cnt = 0;
-    }
-
-    /* §16.4 add samples — auto-pause once converged in PT mode.
-     *
-     * Debug modes (NORMAL/ALBEDO/DEPTH) are deterministic so we
-     * add one frame's worth and stop (no point re-rendering the
-     * same image every frame). */
-    bool can_sample = !paused && (mode != MODE_PT ? (g_samples == 0)
-                                                  : (g_samples < ACCUM_CAP));
-    if (can_sample)
-      accum_add_frame(cols, rows, spp, frame_idx++, mode);
-
-    /* §16.5 paint frame. */
-    long long frame_start = clock_ns();
-    erase();
-    accum_draw(cols, rows);
-    hud_draw(cols, rows, fps, spp, g_samples, mode, paused);
-    wnoutrefresh(stdscr);
-    doupdate();
-
-    /* §16.6 input. Resetting the accumulator on +/- (SPP changes)
-     * and on 'd' (mode changes) because the average mixes paths
-     * with different sampling rates / output ranges otherwise. */
-    int ch = getch();
-    switch (ch) {
-    case 'q':
-    case 'Q':
-    case 27 /* ESC */:
-      g_run = 0;
-      break;
-    case ' ':
-    case 'p':
-    case 'P':
-      paused = !paused;
-      break;
-    case 'r':
-    case 'R':
-      accum_reset();
-      frame_idx = 0;
-      break;
-    case '+':
-    case '=':
-      if (spp < SPP_MAX)
-        spp++;
-      accum_reset();
-      frame_idx = 0;
-      break;
-    case '-':
-    case '_':
-      if (spp > SPP_MIN)
-        spp--;
-      accum_reset();
-      frame_idx = 0;
-      break;
-    case 'd':
-    case 'D':
-      mode = (ShadeMode)((mode + 1) % MODE_N);
-      accum_reset();
-      frame_idx = 0;
-      break;
-    default:
-      break;
-    }
-
-    /* §16.7 frame cap. */
-    clock_sleep_ns(frame_ns - (clock_ns() - frame_start));
-  }
-  return 0;
-}

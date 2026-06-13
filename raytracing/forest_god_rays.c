@@ -1,4 +1,1627 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <math.h>
+#include <ncurses.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* ── §1 CONFIG — constants, presets, ramp, enums (data only)
+ * ──────────────────────────────────────────────────────── */
+
+/* §1.1 frame-rate and motion knobs. */
+enum {
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 30,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
+
+  SPEED_MIN = 1,
+  SPEED_DEF = 8,
+  SPEED_MAX = 64,
+};
+
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
+#define DT_CAP_NS (100 * NS_PER_MS)
+
+/* §1.2 view geometry — pinhole camera, no pitch.
+ *
+ * Camera at world origin, eye-height above ground. Looking straight
+ * down +Z. Unlike god_rays_silhouette.c (which pitches up to centre
+ * the windows), this scene has no fixed feature to centre on — the
+ * sun moves, the trees vary per seed — so we keep the camera straight
+ * and let the sun drift through the upper part of the frame.
+ */
+#define ASPECT_Y 2.0f
+#define FOV_H_BASE 0.55f
+#define ZOOM_MIN 0.25f
+#define ZOOM_MAX 4.0f
+#define ZOOM_STEP 1.25f
+
+#define CAMERA_HEIGHT 1.6f /* eye level above ground (m)       */
+
+/* §1.3 sun (treated as DIRECTIONAL — at infinity, T9).
+ *
+ * Sun above horizon (el ≈ 0.22 rad ≈ 12.6°). Drifts in azimuth and
+ * elevation on different sin periods so the trajectory doesn't
+ * visibly repeat for minutes. Each oscillation amplitude is small
+ * (±2.5° elevation, ±5° azimuth) for a calm sunrise feel.
+ *
+ * SUN_DIST is unused for direction calculations (the sun is treated
+ * as directional) but kept as a hint for ray_cylinder block tests:
+ * SUN_NEE_DIST = 50 m caps the block test, which is well within sun
+ * distance and well beyond TREE_Z_MAX.
+ *
+ * SUN_ANG_RADIUS is exaggerated from real (0.5°/0.0087 rad) so the
+ * disc registers at terminal resolution.
+ */
+#define SUN_DIST 1000.0f
+#define SUN_ANG_RADIUS 0.07f /* rad — ~4° apparent disc          */
+#define SUN_EMIT_HDR 14.0f   /* HDR brightness multiplier        */
+
+#define SUN_EL_BASE 0.22f /* rad — ~12.6° median elevation   */
+#define SUN_EL_AMP 0.044f /* rad — ±2.5°                     */
+#define SUN_AZ_BASE 0.0f
+#define SUN_AZ_AMP 0.087f /* rad — ±5° azimuth               */
+#define SUN_EL_PERIOD_S 200.0f
+#define SUN_AZ_PERIOD_S 280.0f
+
+/* §1.4 trees — bare cylinder trunks, jittered grid + probabilistic
+ * gaps (T7).
+ *
+ * 5 azimuth bins × 4 depth bins = 20 cells total. Each cell
+ * INDEPENDENTLY decides: place a tree with TREE_FILL_PROB = 0.70?
+ * On average ~14 of 20 cells get trees; the 30% empty cells leave
+ * gaps where the sun-shafts can be seen.
+ *
+ * Depth bins are LOG-spaced (close cells short, far cells long) so
+ * apparent screen-density of trees stays roughly constant across the
+ * depth range.
+ *
+ * TREE_Z_MIN = 3.5 m — closer than that, a single trunk dominates
+ * the frame. TREE_Z_MAX = 28 m sets the visible far range.
+ */
+#define N_AZIM_BINS 5
+#define N_DEPTH_BINS 4
+#define N_TREES (N_AZIM_BINS * N_DEPTH_BINS)
+#define TREE_FILL_PROB 0.70f /* per-cell probability of tree     */
+#define TREE_Z_MIN 3.5f
+#define TREE_Z_MAX 28.0f
+#define AZIMUTH_HALF 0.55f /* rad (~31°), wider than camera FOV */
+#define TREE_R_MIN 0.08f
+#define TREE_R_MAX 0.22f
+#define TREE_H_MIN 4.5f
+#define TREE_H_MAX 9.0f
+
+/* §1.5 ground plane — flat horizontal plane at y = 0. */
+#define GROUND_Y 0.0f
+#define GROUND_ALBEDO_R 0.18f
+#define GROUND_ALBEDO_G 0.13f
+#define GROUND_ALBEDO_B 0.08f
+#define GROUND_AMBIENT_FAC                                                     \
+  0.25f /* sky-ambient strength on the ground            */
+/* trunk colour — deliberately near-black so trees read as silhouettes. */
+#define TRUNK_COLOR_R 0.025f
+#define TRUNK_COLOR_G 0.020f
+#define TRUNK_COLOR_B 0.015f
+
+/* §1.6 atmospheric medium — height-decaying mist (T2).
+ *
+ *   σ_e(p) = MIST_SIGMA · exp(-p.y / MIST_SCALE_H)
+ *
+ * Densest at the ground, falls off exponentially with height. The
+ * closed-form Tr_to_sun (§7.3) requires this exponential shape —
+ * if σ varied differently with height (linear, gaussian, etc.) we'd
+ * need a numerical integral inside Tr_to_sun, costing 24× more.
+ *
+ * MARCH_STEPS = 32 across at most FAR_CLIP world units (~40 m) gives
+ * step_length ≈ 1.25 m — coarse but the mist profile is smooth
+ * enough that finer steps don't add much. HG_G = 0.55 — moderate
+ * forward bias; cones get geometric definition from tree gaps so
+ * the phase function doesn't have to do all the work.
+ */
+#define MIST_SIGMA 0.25f  /* peak σ at y = 0                   */
+#define MIST_SCALE_H 1.0f /* e-folding height (m)              */
+#define HG_G 0.55f        /* HG anisotropy in (-1, 1)          */
+#define MARCH_STEPS 32
+#define FAR_CLIP 40.0f       /* march t_max for sky-bound rays    */
+#define SUN_NEE_DIST 50.0f   /* tree-block test distance to sun   */
+#define INSCATTER_GAIN 2.25f /* shaft visibility multiplier        */
+#define EXTINCTION_EPS 1e-6f /* below this σ_e a step is vacuum — skip      */
+#define TRANSMITTANCE_CUTOFF                                                   \
+  1e-3f /* stop marching once the eye ray is ~opaque   */
+
+/* §1.7 sky gradient — orange near horizon, deep blue overhead (T8). */
+#define SKY_ZENITH_R 0.08f
+#define SKY_ZENITH_G 0.12f
+#define SKY_ZENITH_B 0.22f
+#define SKY_HORIZON_FAC 0.40f /* horizon = sun_chrom · this        */
+
+/* §1.8 buffer and ncurses pair-id reservations. */
+#define BUF_MAX_W 400
+#define BUF_MAX_H 200
+
+enum {
+  PAIR_HUD = 1,
+  PAIR_HINT = 2,
+  PAIR_SUN_FALLBACK = 3,
+  PAIR_CUBE_BASE = 16, /* + 0..215 = 6×6×6 cube           */
+};
+
+/* §1.9 ASCII glyph ramp (16 levels). */
+static const char k_ramp[] = " .'`,-_:;~=+*oO0";
+#define RAMP_LEN ((int)(sizeof k_ramp - 1))
+
+/* §1.10 kelvin presets (T9). */
+/*
+ * KelvinPreset — a named sun colour temperature. The sun's chromaticity is
+ * derived from `kelvin` via the Tanner-Helland blackbody approximation
+ * (blackbody_rgb, §5); `name` is only the HUD label. Cycling t/T walks the
+ * scene from a 2000 K dawn to a 5500 K noon.
+ * Ref: Tanner Helland, "How to Convert Temperature (K) to RGB"; Planck's law.
+ */
+typedef struct {
+  const char *name; /* HUD label (fixed width)                      */
+  float kelvin;     /* colour temperature → blackbody_rgb() chroma  */
+} KelvinPreset;
+
+static const KelvinPreset KELVINS[] = {
+    {"DAWN  ", 2000.0f},
+    {"GOLDEN", 3500.0f},
+    {"NOON  ", 5500.0f},
+    {"DUSK  ", 2500.0f},
+};
+#define N_KELVINS ((int)(sizeof KELVINS / sizeof KELVINS[0]))
+
+/* §1.11 debug-overlay enum (T11). Cycled with `d'.
+ *
+ *   MODE_NORMAL     full render (in-scatter + surface · T_far)
+ *   MODE_SCATTER    in-scatter only — shafts float in pure black
+ *   MODE_SURFACE    surface only (no in-scatter, no extinction)
+ *   MODE_TR         gray-scale eye-ray transmittance at far hit
+ */
+typedef enum {
+  MODE_NORMAL = 0,  /* full render: in-scatter + surface · T_far     */
+  MODE_SCATTER = 1, /* in-scatter only — the shafts in pure black     */
+  MODE_SURFACE = 2, /* surface radiance only (no medium)             */
+  MODE_TR = 3,      /* eye-ray transmittance T_far as grayscale       */
+  MODE_N = 4,       /* count — enables % MODE_N wraparound            */
+} DebugMode;
+
+static const char *debug_mode_name(DebugMode m) {
+  switch (m) {
+  case MODE_NORMAL:
+    return "NORMAL ";
+  case MODE_SCATTER:
+    return "SCATTER";
+  case MODE_SURFACE:
+    return "SURFACE";
+  case MODE_TR:
+    return "TR     ";
+  default:
+    return "?      ";
+  }
+}
+
+/* ── §2 PERFORMANCE — monotonic clock + sleep
+ * ───────────────────────────────────────────────────────── */
+
+/*
+ * clock_ns — monotonic wall time in nanoseconds.
+ *
+ * CLOCK_MONOTONIC never goes backward across NTP / DST / suspend;
+ * the right choice for animation dt and fps measurement.
+ */
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+}
+
+/*
+ * clock_sleep_ns — best-effort sleep. Used to cap render rate
+ * without burning CPU at 100%; subtract elapsed work and sleep
+ * the remainder.
+ */
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
+}
+
+/* ── §3 LOGIC: vec3 math (pure)
+ * ────────────────────────────────────────────────────── *
+ *
+ * V3 — three floats by value. All helpers inlined to avoid call
+ * overhead in the per-pixel inner loop.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * V3 — a point or direction in 3-D world space (camera, rays, sun, tree bases
+ * all live here). By value: 12 bytes in registers, keeping the vector helpers
+ * pure and cheap inside the per-pixel march. No homogeneous w — this is a path
+ * tracer with analytic intersections, not a projective rasteriser, so there is
+ * no perspective divide needing a 4th component.
+ * Ref: Shirley, "Ray Tracing in One Weekend"; Foley & van Dam, vectors ch.
+ */
+typedef struct {
+  float x, y, z; /* Cartesian world-space components */
+} V3;
+
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3_add(V3 a, V3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline V3 v3_sub(V3 a, V3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline V3 v3_scl(V3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+static inline float v3_dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3_len(V3 a) { return sqrtf(v3_dot(a, a)); }
+
+/*
+ * v3_norm — return a unit vector in the same direction as `a',
+ * or (0,0,0) if `a' is zero-length (avoids NaN propagation).
+ */
+static inline V3 v3_norm(V3 a) {
+  float length = v3_len(a);
+  if (length < 1e-12f)
+    return v3(0, 0, 0);
+  return v3_scl(a, 1.0f / length);
+}
+
+/* ── §4 LOGIC: rgb math (pure)
+ * ─────────────────────────────────────────────────────── *
+ *
+ * RGB — three linear-space floats. NOT clamped to [0,1]; HDR until
+ * the tone-map stage in §10.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * RGB — a LINEAR (not gamma-encoded) radiance/colour triple, kept distinct
+ * from V3 on purpose: these channels are LIGHT being added and multiplied
+ * along a ray (HDR, may exceed 1.0 before tone mapping), not a position — the
+ * separate type stops the two from being confused. Tone map + gamma happen
+ * once, at the very end, in paint_cell.
+ * Ref: Pharr, Jakob & Humphreys, "Physically Based Rendering" (radiometry);
+ *      Reinhard et al. (2002) tone mapping.
+ */
+typedef struct {
+  float r, g, b; /* linear-light channels (HDR; tone-mapped at paint time) */
+} RGB;
+
+static inline RGB rgb_make(float r, float g, float b) { return (RGB){r, g, b}; }
+static inline RGB rgb_add(RGB a, RGB b) {
+  return rgb_make(a.r + b.r, a.g + b.g, a.b + b.b);
+}
+static inline RGB rgb_mul(RGB a, RGB b) {
+  return rgb_make(a.r * b.r, a.g * b.g, a.b * b.b);
+}
+static inline RGB rgb_scl(RGB a, float s) {
+  return rgb_make(a.r * s, a.g * s, a.b * s);
+}
+static inline RGB rgb_lerp(RGB a, RGB b, float t) {
+  return rgb_make(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
+                  a.b + (b.b - a.b) * t);
+}
+
+static inline float clamp01(float x) {
+  return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
+}
+static inline float luma_of(RGB c) {
+  return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+}
+
+/* ── §5 LOGIC: blackbody colour — Tanner-Helland (pure)
+ * ──────────────────────────────────── *
+ *
+ * Map a colour temperature in kelvin to an approximate sRGB
+ * chromaticity. The Tanner-Helland fit (2012) uses three piecewise
+ * polynomials per channel — accurate to within a few percent over
+ * 1000K-12000K, and CHEAP (a few transcendentals).
+ *
+ * Used by §15 sky_radiance and the HUD; the chosen kelvin preset
+ * also drives sun_em (sun emission HDR) and the sky horizon tint.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * blackbody_rgb — Planckian-locus chromaticity at `kelvin'.
+ *
+ * Pseudocode:
+ *   K = kelvin / 100
+ *   r = 1.0                                     if K <= 66
+ *       329.7  · pow(K-60, -0.1332) / 255       otherwise
+ *   g = 99.47 · log(K)         - 161.12 / 255   if K <= 66
+ *       288.12 · pow(K-60, -0.0755) / 255       otherwise
+ *   b = 1.0                                     if K >= 66
+ *       0                                       if K <= 19
+ *       138.52 · log(K-10)     - 305.04 / 255   otherwise
+ *   return clamp01((r, g, b))
+ */
+static RGB blackbody_rgb(float kelvin) {
+  float K = kelvin / 100.0f;
+  float r, g, b;
+
+  if (K <= 66.0f)
+    r = 1.0f;
+  else
+    r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
+
+  if (K <= 66.0f)
+    g = (99.47f * logf(K) - 161.12f) / 255.0f;
+  else
+    g = 288.12f * powf(K - 60.0f, -0.0755f) / 255.0f;
+
+  if (K >= 66.0f)
+    b = 1.0f;
+  else if (K <= 19.0f)
+    b = 0.0f;
+  else
+    b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
+
+  return rgb_make(clamp01(r), clamp01(g), clamp01(b));
+}
+
+/* ── §6 LOGIC: tone map (pure)
+ * ─────────────────────────────────────────────────────── *
+ *
+ * Reinhard L/(1+L) compresses HDR → [0, 1); 1/2.2 gamma converts
+ * linear → sRGB. Applied per channel inside paint_cell (§10).
+ *
+ * Tone-mapping happens ONCE per cell at paint time, after all
+ * accumulation. NEVER tone-map during the volumetric sum: Reinhard
+ * is non-linear, tonemap(sum) ≠ sum(tonemap).
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+static inline float reinhard(float x) { return x / (1.f + x); }
+static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
+
+/* ── §7 LOGIC: atmospheric medium — density + transmittance (pure)
+ * ───────────────────────────────────────────── *
+ *
+ * Two helpers:
+ *
+ *   §7.1  sigma_e_at  — height-decaying extinction coefficient
+ *   §7.2  Tr_to_sun   — analytic transmittance from a point along
+ *                       the sun-direction chord through the medium
+ *                       (closed form because σ_e is exponential in y)
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* §7.1 ── sigma_e_at: extinction coefficient at a point ────────────── */
+
+/*
+ * sigma_e_at — extinction at world point p.
+ *
+ *   σ_e(p) = MIST_SIGMA · exp(-y / MIST_SCALE_H)        y >= 0
+ *
+ * Below ground (y < 0) we clamp y to 0 to avoid the formula blowing
+ * up. In practice scatter points always have y >= 0 in our scene
+ * (camera at y = 1.6, ground at y = 0).
+ */
+static inline float sigma_e_at(V3 scatter_point) {
+  float y = (scatter_point.y < 0.f) ? 0.f : scatter_point.y;
+  return MIST_SIGMA * expf(-y / MIST_SCALE_H);
+}
+
+/* §7.2 ── Tr_to_sun: medium transmittance from p toward sun ────────── */
+
+/*
+ * tr_to_sun — analytic transmittance from p along sun_dir, integrated
+ *             through the height-decaying mist column (T2).
+ *
+ * Pseudocode:
+ *   if sun_dir.y < ε:           sun on/below horizon → 0 (chord
+ *                               traverses infinite low-altitude mist)
+ *   y = max(p.y, 0)
+ *   τ = MIST_SIGMA · exp(-y/H) · H / sun_dir.y
+ *   return exp(-τ)
+ *
+ * Derivation (T2):
+ *   Tr = exp(-∫₀^∞ MIST_SIGMA · exp(-(p.y + s·sun_dir.y)/H) ds)
+ *      = exp(-MIST_SIGMA · exp(-p.y/H) · H/sun_dir.y)
+ *      = exp(-σ_e(p) · H / sun_dir.y)
+ *
+ * One closed-form transcendental call. NO second march required.
+ * The cheap closed form is what makes this scene affordable; if σ
+ * varied differently (linearly, gaussian) we'd need a numerical
+ * integral here.
+ */
+static inline float tr_to_sun(V3 scatter_point, V3 sun_dir) {
+  if (sun_dir.y < 1e-3f)
+    return 0.0f;
+  float y = (scatter_point.y < 0.f) ? 0.f : scatter_point.y;
+  float optical_depth =
+      MIST_SIGMA * expf(-y / MIST_SCALE_H) * MIST_SCALE_H / sun_dir.y;
+  return expf(-optical_depth);
+}
+
+/* ── §8 LOGIC: phase function — Henyey-Greenstein (pure)
+ * ───────────────────────────────────────────────── *
+ *
+ * Henyey-Greenstein (T4):
+ *
+ *   P(cosθ; g) = (1 − g²) / [4π · (1 + g² − 2g·cosθ)^1.5]
+ *
+ * g > 0 forward-biased; tuned to HG_G = 0.55. In trace_ray the phase
+ * value is computed ONCE per pixel — it depends only on the (eye, sun)
+ * angle.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * hg_phase — HG phase value for cos(angle between two directions).
+ *
+ * Pseudocode:
+ *   g²    = HG_G · HG_G
+ *   denom = 1 + g² − 2g·cosθ
+ *   return (1 − g²) / (4π · denom^1.5)
+ *
+ * Returns a number ≥ 0; INTEGRATES to 1 over the full sphere — so
+ * the value at any one angle is a DENSITY, not a probability.
+ */
+static inline float hg_phase(float cos_angle_eye_to_sun) {
+  float g = HG_G;
+  float g2 = g * g;
+  float denom = 1.0f + g2 - 2.0f * g * cos_angle_eye_to_sun;
+  if (denom < 1e-9f)
+    denom = 1e-9f;
+  return (1.0f - g2) / (4.0f * (float)M_PI * powf(denom, 1.5f));
+}
+
+/* ── §9 LOGIC: hash RNG — forest layout (pure) ───────────────────── *
+ *
+ * The path tracer is DETERMINISTIC (no Monte Carlo at runtime). The
+ * only randomness is the per-seed forest layout (place_trees in §13).
+ * hash3 is a small integer hash; hash01 maps its high bits to [0, 1).
+ * Pure functions — no global state.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * hash3 — mix three integer keys into a 32-bit hash. Three large
+ * odd primes followed by xorshift-mul rounds. Standard recipe.
+ */
+static inline uint32_t hash3(int kx, int ky, int kz) {
+  uint32_t h = (uint32_t)kx * 73856093u ^ (uint32_t)ky * 19349663u ^
+               (uint32_t)kz * 83492791u;
+  h ^= h >> 16;
+  h *= 0x85ebca6bu;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35u;
+  h ^= h >> 16;
+  return h;
+}
+
+/*
+ * hash01 — uniform float in [0, 1). Drops the top byte of a 32-bit
+ * hash to avoid the rounding-to-1 issue on extreme values.
+ */
+static inline float hash01(uint32_t h) {
+  return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
+}
+
+/* ── §10 RENDER: ncurses paint — colour init + cell painter
+ * ───────────────────────────────────────────────── *
+ *
+ * One cell = (cube colour pair, glyph from ramp, A_BOLD / A_DIM /
+ * A_NORMAL). Tone-map happens HERE — single application per cell.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+static int g_have_256;
+
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  g_have_256 = (COLORS >= 256);
+  if (g_have_256) {
+    for (int i = 0; i < 216; i++)
+      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
+    init_pair(PAIR_HUD, 226, -1);
+    init_pair(PAIR_HINT, 51, -1);
+  } else {
+    init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
+}
+
+/*
+ * paint_cell — tone-map and paint one cell.
+ *
+ * Pseudocode:
+ *   r' = gamma(reinhard(c.r))                   per channel
+ *   g' = gamma(reinhard(c.g))
+ *   b' = gamma(reinhard(c.b))
+ *   luma  = 0.2126 r' + 0.7152 g' + 0.0722 b'   Rec.601
+ *   glyph = k_ramp[ round(luma · (RAMP_LEN-1)) ]
+ *   if 256 colour:
+ *     (r5, g5, b5) = round((r', g', b') · 5)
+ *     pair = PAIR_CUBE_BASE + r5·36 + g5·6 + b5
+ *     attr = A_BOLD if luma > 0.85 else A_DIM if luma < 0.15 else NORMAL
+ *   else:
+ *     pair = PAIR_SUN_FALLBACK
+ *   draw glyph at (sx, sy) with pair + attr
+ */
+static void paint_cell(int sx, int sy, RGB col) {
+  float r = gamma_enc(reinhard(col.r));
+  float g = gamma_enc(reinhard(col.g));
+  float b = gamma_enc(reinhard(col.b));
+  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  int ri = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
+  if (ri < 0)
+    ri = 0;
+  if (ri >= RAMP_LEN)
+    ri = RAMP_LEN - 1;
+
+  if (g_have_256) {
+    int r5 = (int)(r * 5.f + 0.5f);
+    if (r5 > 5)
+      r5 = 5;
+    if (r5 < 0)
+      r5 = 0;
+    int g5 = (int)(g * 5.f + 0.5f);
+    if (g5 > 5)
+      g5 = 5;
+    if (g5 < 0)
+      g5 = 0;
+    int b5 = (int)(b * 5.f + 0.5f);
+    if (b5 > 5)
+      b5 = 5;
+    if (b5 < 0)
+      b5 = 0;
+    int pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
+    int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(pair) | attr);
+  } else {
+    attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
+  }
+}
+
+/* ── §11 LOGIC: ray-plane intersection (pure)
+ * ─────────────────────────────────────── *
+ *
+ * Ray vs horizontal plane y = const. Used by the ground (GROUND_Y = 0).
+ * The plane is solid from above only.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * ray_plane_y — intersect ray with horizontal plane at y = plane_y.
+ *
+ * Pseudocode:
+ *   if ray_dir.y > -ε:               ray going up or parallel → MISS
+ *   t = (plane_y − ray_origin.y) / ray_dir.y
+ *   if t < ε:                        behind us → MISS
+ *   *out_t = t; HIT
+ *
+ * The `ray_dir.y > -ε' guard means we register hits ONLY where the
+ * ray is heading DOWN through the plane. If the camera is above the
+ * plane and the ray goes up, no hit.
+ */
+static bool ray_plane_y(V3 ray_origin, V3 ray_dir, float plane_y,
+                        float *out_t) {
+  if (ray_dir.y > -1e-6f)
+    return false;
+  float t = (plane_y - ray_origin.y) / ray_dir.y;
+  if (t < 1e-3f)
+    return false;
+  *out_t = t;
+  return true;
+}
+
+/* ── §12 LOGIC: ray-cylinder intersection (pure) — T6
+ * ─────────────────────────────── *
+ *
+ * Ray vs vertical finite-height cylinder (a tree trunk).
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * ray_cylinder — ray vs vertical cylinder of radius r, base at
+ *                `base', finite height h.
+ *
+ * Pseudocode (T6 derivation):
+ *   δx = ray_origin.x − base.x        offset on x
+ *   δz = ray_origin.z − base.z        offset on z
+ *   a  = ray_dir.x² + ray_dir.z²       quadratic coefficients...
+ *   if a < ε:  ray purely vertical → MISS
+ *   b  = 2·(δx·ray_dir.x + δz·ray_dir.z)
+ *   c  = δx² + δz² − r²
+ *   disc = b² − 4ac
+ *   if disc < 0:  no real roots → MISS
+ *   √disc; t0 = (-b - √)/2a;   t1 = (-b + √)/2a
+ *   if t1 < ε:  cylinder behind us → MISS
+ *
+ *   try near root first; if its y is outside [base.y, base.y + h]
+ *   try far root; if that's also outside, MISS.
+ *
+ *   *out_t = the valid hit
+ *
+ * The "try far root if near misses height range" handles the case
+ * where the ray enters the side ABOVE the cylinder's top and exits
+ * below — physically inside the cylinder column but missing the
+ * trunk because the trunk is shorter than the column.
+ */
+static bool ray_cylinder(V3 ray_origin, V3 ray_dir, V3 base, float r, float h,
+                         float *out_t) {
+  float dx = ray_origin.x - base.x;
+  float dz = ray_origin.z - base.z;
+  float a = ray_dir.x * ray_dir.x + ray_dir.z * ray_dir.z;
+  if (a < 1e-9f)
+    return false;
+  float b = 2.0f * (dx * ray_dir.x + dz * ray_dir.z);
+  float c = dx * dx + dz * dz - r * r;
+  float disc = b * b - 4.0f * a * c;
+  if (disc < 0)
+    return false;
+  float sq = sqrtf(disc);
+  float t_near = (-b - sq) / (2.0f * a);
+  float t_far = (-b + sq) / (2.0f * a);
+  if (t_far < 1e-3f)
+    return false;
+
+  /* Try near intersection first; fall back to far if near is
+   * outside the height range (e.g. ray crosses the cylinder
+   * column above or below the trunk's top/base). */
+  float t = (t_near >= 1e-3f) ? t_near : t_far;
+  float y_at = ray_origin.y + t * ray_dir.y;
+  if (y_at < base.y || y_at > base.y + h) {
+    if (t == t_near) {
+      t = t_far;
+      y_at = ray_origin.y + t * ray_dir.y;
+      if (y_at < base.y || y_at > base.y + h)
+        return false;
+    } else {
+      return false;
+    }
+  }
+  *out_t = t;
+  return true;
+}
+
+/* ── §13 WORLDGEN + LOGIC: forest — place_trees builds g_forest.trees
+ * (init/reseed); sun-block test is pure ──────────────────────── *
+ *
+ *   §13.1  Tree struct + globals
+ *   §13.2  place_trees       — jittered grid + probabilistic gaps
+ *   §13.3  HitType / Hit
+ *   §13.4  scene_blocked_to_sun — NEE shadow-ray block test
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* §13.1 ── Tree / Hit types + the Forest global ────────────────────── */
+
+/*
+ * Tree — one trunk, modelled as a vertical cylinder rooted on the ground
+ * plane. That is the WHOLE geometry of the forest: every shadow- and eye-ray
+ * intersects trunks via the ray-cylinder test (§12). No foliage is modelled —
+ * the god rays come from the GAPS between trunks, so trunks are all that
+ * matter to the light field.
+ * Ref: ray-cylinder intersection — Shirley, "Fundamentals of Computer
+ *      Graphics"; Quilez intersectors.
+ */
+typedef struct {
+  V3 base;      /* (x, 0, z) — foot of the trunk on the ground (y=0)   */
+  float radius; /* trunk radius (world units)                          */
+  float height; /* trunk height; the cylinder spans y ∈ [0, height]    */
+} Tree;
+
+/*
+ * HitType / Hit — the eye-ray "hit record": which of the scene's three things
+ * the ray struck first, and where. scene_hit (§14) fills it; trace_ray's
+ * surface stage reads it to choose a shader. SKY is the miss case (the ray
+ * escapes to the sky dome). Ref: ray-scene intersection record — Shirley,
+ * RTiOW. type      which primitive: SKY (miss) / TREE / GROUND t         ray
+ * parameter of the hit (distance along the unit ray) tree_idx  index into
+ * g_forest.trees, valid ONLY when type == HIT_TREE
+ */
+typedef enum { HIT_SKY = 0, HIT_TREE = 1, HIT_GROUND = 2 } HitType;
+
+typedef struct {
+  HitType type; /* which primitive: SKY (miss) / TREE / GROUND          */
+  float t;      /* ray parameter of the hit (distance along unit ray)   */
+  int tree_idx; /* index into g_forest.trees — valid iff type==HIT_TREE */
+} Hit;
+
+/*
+ * Forest — the stand of trees the rays travel through: a fixed-capacity array
+ * plus the count actually placed. place_trees packs the live trees into the
+ * front, so [0, count) are valid. The only piece of world geometry; rebuilt
+ * at init and on `r` reseed, then read-only for every ray that frame.
+ *   trees  placed trees, valid in [0, count)
+ *   count  number actually placed (≤ N_TREES; gaps are skipped, not stored)
+ */
+typedef struct {
+  Tree trees[N_TREES];
+  int count;
+} Forest;
+
+static Forest g_forest;
+
+/* §13.2 ── place_trees: jittered grid layout ───────────────────────── */
+
+/*
+ * place_trees — populate g_forest.trees[] using a jittered grid with
+ *               probabilistic per-cell empties (T7).
+ *
+ * Pseudocode:
+ *   idx = 0
+ *   for each (azim_bin, depth_bin) cell:
+ *     fill = hash01(hash3(ax, dz, seed^FILL))
+ *     if fill > TREE_FILL_PROB: skip (empty cell)
+ *     z   = log-uniform within cell's depth range
+ *     az  = uniform within cell's azimuth range
+ *     x   = z · tan(az)
+ *     r   = uniform [TREE_R_MIN, TREE_R_MAX]
+ *     h   = uniform [TREE_H_MIN, TREE_H_MAX]
+ *     g_forest.trees[idx++] = Tree{base=(x, 0, z), r, h}
+ *   g_forest.count = idx
+ *
+ * Five separate hash calls per cell so all draws are statistically
+ * independent (a single hash for "this cell" would correlate the
+ * draws and produce visible patterns).
+ */
+static void place_trees(int seed) {
+  int idx = 0;
+  for (int dz = 0; dz < N_DEPTH_BINS; dz++) {
+    for (int ax = 0; ax < N_AZIM_BINS; ax++) {
+      uint32_t fill_hash = hash3(ax, dz, seed ^ 0x05000);
+      float fill = hash01(fill_hash);
+      if (fill > TREE_FILL_PROB)
+        continue;
+
+      uint32_t z_hash = hash3(ax, dz, seed ^ 0x10000);
+      uint32_t a_hash = hash3(ax, dz, seed ^ 0x20000);
+      uint32_t r_hash = hash3(ax, dz, seed ^ 0x30000);
+      uint32_t h_hash = hash3(ax, dz, seed ^ 0x40000);
+
+      /* Log-spaced depth bin: closer cells span small ranges,
+       * far cells span large ranges. */
+      float u_z0 = (float)dz / (float)N_DEPTH_BINS;
+      float u_z1 = (float)(dz + 1) / (float)N_DEPTH_BINS;
+      float z0 = TREE_Z_MIN * powf(TREE_Z_MAX / TREE_Z_MIN, u_z0);
+      float z1 = TREE_Z_MIN * powf(TREE_Z_MAX / TREE_Z_MIN, u_z1);
+      float jz = hash01(z_hash);
+      float z = z0 + jz * (z1 - z0);
+
+      /* Linear azimuth bin within ±AZIMUTH_HALF. */
+      float u_a0 = ((float)(ax) / (float)N_AZIM_BINS - 0.5f) * 2.0f;
+      float u_a1 = ((float)(ax + 1) / (float)N_AZIM_BINS - 0.5f) * 2.0f;
+      float ja = hash01(a_hash);
+      float u_a = u_a0 + ja * (u_a1 - u_a0);
+      float angle = u_a * AZIMUTH_HALF;
+      float x = z * tanf(angle);
+
+      float u_r = hash01(r_hash);
+      float u_h = hash01(h_hash);
+
+      g_forest.trees[idx].base = v3(x, 0.0f, z);
+      g_forest.trees[idx].radius = TREE_R_MIN + u_r * (TREE_R_MAX - TREE_R_MIN);
+      g_forest.trees[idx].height = TREE_H_MIN + u_h * (TREE_H_MAX - TREE_H_MIN);
+      idx++;
+    }
+  }
+  g_forest.count = idx;
+}
+
+/* §13.4 ── scene_blocked_to_sun: NEE shadow-ray block test ─────────── */
+
+/*
+ * scene_blocked_to_sun — does any tree intersect the chord from
+ *                        scatter_point in direction sun_dir, within
+ *                        max_distance? (T5)
+ *
+ * Pseudocode:
+ *   for each tree:
+ *     if ray_cylinder(p, sun_dir, tree.base, tree.r, tree.h)
+ *        gives 1e-3 < t < max_distance:
+ *           return true  (blocked)
+ *   return false  (clear path to sun)
+ *
+ * Iterates EVERY tree — brute-force O(N_trees) per call. With ~14
+ * trees this is fine; a real renderer would put a 2D BVH on the
+ * trees but the speedup at this scale isn't worth the complexity.
+ *
+ * Used by:
+ *   §16.1  shade_ground   for direct-sun shadow on the ground
+ *   §17    trace_ray      at every march step (the in-scatter NEE)
+ */
+static bool scene_blocked_to_sun(V3 scatter_point, V3 sun_dir,
+                                 float max_distance) {
+  for (int i = 0; i < g_forest.count; i++) {
+    float t_tree;
+    if (ray_cylinder(scatter_point, sun_dir, g_forest.trees[i].base,
+                     g_forest.trees[i].radius, g_forest.trees[i].height,
+                     &t_tree)) {
+      if (t_tree > 1e-3f && t_tree < max_distance)
+        return true;
+    }
+  }
+  return false;
+}
+
+/* ── §14 LOGIC: scene_hit — nearest of {tree, ground, sky} (pure)
+ * ────────────── */
+
+/*
+ * scene_hit — return the nearest scene hit.
+ *
+ * Pseudocode:
+ *   start with HIT_SKY, t = INF
+ *   try ray_plane_y vs ground   → if closer, set HIT_GROUND
+ *   for each tree:
+ *     try ray_cylinder          → if closer, set HIT_TREE
+ *   return best
+ *
+ * Sky is the FALLBACK — represents "the ray exits the scene without
+ * hitting tree or ground". Always reaches t = INF in that case.
+ */
+static Hit scene_hit(V3 ray_origin, V3 ray_dir) {
+  Hit hit = {HIT_SKY, 1e30f, -1};
+
+  /* Ground. */
+  float t_ground;
+  if (ray_plane_y(ray_origin, ray_dir, GROUND_Y, &t_ground)) {
+    if (t_ground < hit.t) {
+      hit.type = HIT_GROUND;
+      hit.t = t_ground;
+      hit.tree_idx = -1;
+    }
+  }
+
+  /* Trees. */
+  for (int i = 0; i < g_forest.count; i++) {
+    float t_tree;
+    if (ray_cylinder(ray_origin, ray_dir, g_forest.trees[i].base,
+                     g_forest.trees[i].radius, g_forest.trees[i].height,
+                     &t_tree)) {
+      if (t_tree < hit.t) {
+        hit.type = HIT_TREE;
+        hit.t = t_tree;
+        hit.tree_idx = i;
+      }
+    }
+  }
+
+  return hit;
+}
+
+/* ── §15 LOGIC: sky / sun radiance (pure) — T8
+ * ────────────────────────────────────── *
+ *
+ * Two components:
+ *   1. Vertical gradient from horizon (warm, kelvin-tinted) to
+ *      zenith (cool blue).
+ *   2. Sun disc — additive bright spot when the ray points within
+ *      SUN_ANG_RADIUS of sun_dir.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * sky_radiance — radiance from a ray pointed at the sky.
+ *
+ * Pseudocode:
+ *   h     = clamp01(ray_dir.y)                  0 = horizon, 1 = zenith
+ *   sky   = lerp(horizon_col, ZENITH, h)
+ *   if cos(ray_dir, sun_dir) > cos(SUN_ANG_RADIUS):
+ *     edge = ramp from 0 at edge to 1 at centre
+ *     sky += sun_em · edge
+ *   return sky
+ */
+static RGB sky_radiance(V3 ray_dir, V3 sun_dir, RGB sun_em, RGB horizon_col) {
+  float h = ray_dir.y;
+  if (h < 0.f)
+    h = 0.f;
+  if (h > 1.f)
+    h = 1.f;
+
+  RGB zenith = rgb_make(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
+  RGB sky = rgb_lerp(horizon_col, zenith, h);
+
+  float cos_ray_to_sun = v3_dot(ray_dir, sun_dir);
+  float cos_disc_edge = cosf(SUN_ANG_RADIUS);
+  if (cos_ray_to_sun > cos_disc_edge) {
+    float t_edge = (cos_ray_to_sun - cos_disc_edge) / (1.0f - cos_disc_edge);
+    if (t_edge > 1.f)
+      t_edge = 1.f;
+    sky = rgb_add(sky, rgb_scl(sun_em, t_edge));
+  }
+  return sky;
+}
+
+/* ── §16 LOGIC: surface shading (pure)
+ * ─────────────────────────────────────────────── *
+ *
+ * Two BRDFs:
+ *   §16.1  shade_ground   Lambertian + NEE direct sun + sky ambient
+ *   §16.2  shade_tree     constant near-black wood
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* §16.1 ── shade_ground ────────────────────────────────────────────── */
+
+/*
+ * shade_ground — Lambertian floor with NEE direct sun + sky ambient.
+ *
+ * Pseudocode:
+ *   albedo  = (GROUND_R, GROUND_G, GROUND_B)
+ *   cos_NL  = max(0, sun_dir.y)                  ground normal = +Y
+ *   direct  = (cos_NL > 0 and not blocked-to-sun)
+ *               ? sun_em · albedo · cos_NL / π
+ *               : 0
+ *   ambient = horizon_col · albedo · 0.25         faint sky term
+ *   return direct + ambient
+ *
+ * The block-to-sun test uses scene_blocked_to_sun — the ground stays
+ * in its own shadow zone where any tree blocks the chord-to-sun.
+ */
+static RGB shade_ground(V3 ground_point, V3 sun_dir, RGB sun_em,
+                        RGB horizon_col) {
+  RGB albedo = rgb_make(GROUND_ALBEDO_R, GROUND_ALBEDO_G, GROUND_ALBEDO_B);
+  float cos_normal_to_sun = sun_dir.y;
+  if (cos_normal_to_sun < 0.f)
+    cos_normal_to_sun = 0.f;
+
+  RGB direct = rgb_make(0.f, 0.f, 0.f);
+  if (cos_normal_to_sun > 0.f) {
+    bool blocked = scene_blocked_to_sun(ground_point, sun_dir, SUN_DIST);
+    if (!blocked) {
+      float lambert = cos_normal_to_sun / (float)M_PI;
+      direct = rgb_scl(rgb_mul(sun_em, albedo), lambert);
+    }
+  }
+  RGB ambient = rgb_scl(rgb_mul(horizon_col, albedo), GROUND_AMBIENT_FAC);
+  return rgb_add(direct, ambient);
+}
+
+/* §16.2 ── shade_tree ───────────────────────────────────────────────── */
+
+/*
+ * shade_tree — constant near-black wood colour.
+ *
+ * Trunks are deliberately very dark so they read as silhouettes
+ * against the bright shafts behind them. A more sophisticated
+ * version could add subtle rim lighting from earthshine on the lit
+ * side, but the silhouette is what matters for the demo.
+ */
+static RGB shade_tree(int tree_idx) {
+  (void)tree_idx;
+  return rgb_make(TRUNK_COLOR_R, TRUNK_COLOR_G, TRUNK_COLOR_B);
+}
+
+/* ── §17 LOGIC: trace_ray (pure) — THE CORE, volumetric path tracer
+ * ──────────────── *
+ *
+ * One pixel's worth of light, in three named steps (each its own function):
+ *
+ *   march_in_scatter  loop MARCH_STEPS samples, accumulating the in-scatter
+ *                     shafts (T3 Stages 3-6) and the surviving eye
+ * transmittance shade_hit         the surface/sky behind the mist (T3 Stage 7)
+ *   trace_ray         find the hit + march distance (T3 Stage 2), call the two
+ *                     helpers above, then combine: in_scatter + surface · T_far
+ *
+ * trace_ray returns a Radiance with all components separated, so the debug
+ * overlays in §20 can paint each on its own; MODE_NORMAL sums them (T1's
+ * equation). ──────────────────────────────────────────────────────── */
+
+/*
+ * Radiance — the result of one eye ray, with the radiative-transfer terms kept
+ * SEPARATE so the debug overlays (§20) can show each alone. Single-scattering
+ * volumetric transport gives, along the ray:
+ *     L = ∫ T(0,s)·σ_s·phase·sun_visibility ds   (in-scatter — the shafts)
+ *         + surface · T(0, march_distance)        (attenuated background)
+ * trace_ray integrates the first term by ray-marching and adds the second.
+ *   total                in_scatter + surface · t_far_transmittance
+ * (MODE_NORMAL) in_scatter           the shaft term alone (god rays float in
+ * black) surface              background/surface radiance, un-attenuated
+ *   t_far_transmittance  T(0, march_distance) — fraction of background that
+ * survives Ref: Max (1995) "Optical Models for Direct Volume Rendering"; Pharr,
+ * Jakob & Humphreys, "PBR" (volumetric transport); Henyey & Greenstein (1941).
+ */
+typedef struct {
+  RGB total;                 /* in_scatter + surface · T_far     */
+  RGB in_scatter;            /* in-scatter accumulator only      */
+  RGB surface;               /* surface radiance (un-dimmed)     */
+  float t_far_transmittance; /* T(0, march_distance)             */
+} Radiance;
+
+/*
+ * march_in_scatter — integrate the single-scattering in-scatter term along the
+ * eye ray (the shafts). Ray-marches MARCH_STEPS samples; at each, if the medium
+ * is dense and the sun is NOT tree-blocked (next-event estimation), it adds
+ * σ_e · phase · Tr_to_sun · gain weighted by the eye-ray transmittance so far,
+ * then attenuates that transmittance (Beer-Lambert). Returns the accumulated
+ * in-scatter and reports the surviving eye-ray transmittance via out-param.
+ * Ref: Max (1995); Pharr/Jakob/Humphreys "PBR" volumetric transport.
+ */
+static RGB march_in_scatter(V3 ray_origin, V3 ray_dir, V3 sun_dir, RGB sun_em,
+                            float march_distance, float phase_value,
+                            float *out_transmittance) {
+  float step_length = march_distance / (float)MARCH_STEPS;
+  RGB in_scatter_radiance = rgb_make(0.f, 0.f, 0.f);
+  float transmittance_along_eye = 1.0f;
+
+  for (int i = 0; i < MARCH_STEPS; i++) {
+    if (transmittance_along_eye <= TRANSMITTANCE_CUTOFF)
+      break; /* eye ray is essentially opaque — nothing more gets through */
+
+    float step_t = ((float)i + 0.5f) * step_length;
+    V3 scatter_point = v3_add(ray_origin, v3_scl(ray_dir, step_t));
+    float extinction = sigma_e_at(scatter_point);
+
+    if (extinction > EXTINCTION_EPS) {
+      /* NEE: does any trunk block the chord from here to the sun? */
+      bool blocked = scene_blocked_to_sun(scatter_point, sun_dir, SUN_NEE_DIST);
+
+      if (!blocked) {
+        float transmittance_to_sun = tr_to_sun(scatter_point, sun_dir);
+        float step_contribution = extinction * phase_value *
+                                  transmittance_to_sun * INSCATTER_GAIN *
+                                  step_length;
+        RGB add = rgb_scl(rgb_scl(sun_em, step_contribution),
+                          transmittance_along_eye);
+        in_scatter_radiance = rgb_add(in_scatter_radiance, add);
+      }
+
+      /* attenuate the eye ray across this step (Beer-Lambert). */
+      transmittance_along_eye *= expf(-extinction * step_length);
+    }
+  }
+  *out_transmittance = transmittance_along_eye;
+  return in_scatter_radiance;
+}
+
+/*
+ * shade_hit — surface/sky radiance for whatever the eye ray hit: a dark trunk,
+ * the lit ground, or the sky dome. The background term that the in-scatter
+ * march sits in front of. Pure read of the hit record.
+ */
+static RGB shade_hit(const Hit *hit, V3 ray_origin, V3 ray_dir, V3 sun_dir,
+                     RGB sun_em, RGB horizon_col) {
+  switch (hit->type) {
+  case HIT_TREE:
+    return shade_tree(hit->tree_idx);
+  case HIT_GROUND: {
+    V3 ground_point = v3_add(ray_origin, v3_scl(ray_dir, hit->t));
+    return shade_ground(ground_point, sun_dir, sun_em, horizon_col);
+  }
+  case HIT_SKY:
+  default:
+    return sky_radiance(ray_dir, sun_dir, sun_em, horizon_col);
+  }
+}
+
+static Radiance trace_ray(V3 ray_origin, V3 ray_dir, V3 sun_dir, RGB sun_em,
+                          RGB horizon_col) {
+  /* what the eye ray hits, and how far to march: a surface hit's distance, or
+   * FAR_CLIP for a sky-bound ray (sky rays still march the near-camera mist).
+   */
+  Hit hit = scene_hit(ray_origin, ray_dir);
+  float march_distance = (hit.type == HIT_SKY) ? FAR_CLIP : hit.t;
+  if (march_distance > FAR_CLIP)
+    march_distance = FAR_CLIP;
+
+  /* integrate the in-scatter shafts; the march also reports how much of the far
+   * background still reaches the eye. */
+  float cos_eye_to_sun = v3_dot(ray_dir, sun_dir);
+  float phase_value = hg_phase(cos_eye_to_sun);
+  float transmittance_along_eye;
+  RGB in_scatter_radiance =
+      march_in_scatter(ray_origin, ray_dir, sun_dir, sun_em, march_distance,
+                       phase_value, &transmittance_along_eye);
+
+  /* the background behind the mist, dimmed by the surviving transmittance. */
+  RGB surface_radiance =
+      shade_hit(&hit, ray_origin, ray_dir, sun_dir, sun_em, horizon_col);
+  RGB total = rgb_add(in_scatter_radiance,
+                      rgb_scl(surface_radiance, transmittance_along_eye));
+
+  Radiance result = {
+      .total = total,
+      .in_scatter = in_scatter_radiance,
+      .surface = surface_radiance,
+      .t_far_transmittance = transmittance_along_eye,
+  };
+  return result;
+}
+
+/* ── §18 SIMULATION: scene state + sun motion — scene_tick advances;
+ * init/reseed are user events ───────────────────────────────────── */
+
+/*
+ * Scene — the simulation's table of contents: WHAT is evolving (the sun clock
+ * and the forest seed) and HOW the user drives / views it. Held by App (§22);
+ * the lifecycle orchestrators scene_init / scene_reseed / scene_tick take
+ * Scene*, while pure readers take only the fields they need.
+ */
+typedef struct {
+  /* WHAT is simulated — evolving state */
+  float time_secs; /* the sun clock; scene_tick advances it           */
+  int seed;        /* RNG seed that determines the forest layout       */
+
+  /* HOW the user drives the simulation */
+  bool paused; /* DELAYS: freeze the sun clock                     */
+  int speed;   /* sim time multiplier (relative to SPEED_DEF)      */
+
+  /* HOW the user views it (render knobs, not simulation) */
+  int kelvin_idx;       /* sun colour-temperature preset, index into KELVINS */
+  float zoom;           /* FOV zoom factor                                  */
+  DebugMode debug_mode; /* which radiance component the overlay shows       */
+} Scene;
+
+/*
+ * scene_sun_dir — current sun direction (unit vector, points FROM
+ *                 any scene point TOWARD the sun) for time t.
+ *
+ * Pseudocode:
+ *   ω_el = 2π / SUN_EL_PERIOD_S
+ *   ω_az = 2π / SUN_AZ_PERIOD_S
+ *   el   = SUN_EL_BASE + SUN_EL_AMP · sin(ω_el · t)
+ *   az   = SUN_AZ_BASE + SUN_AZ_AMP · sin(ω_az · t)
+ *   return norm(sin(az)·cos(el), sin(el), cos(az)·cos(el))
+ *
+ * For this scene the sun is always above the horizon
+ * (el_min = SUN_EL_BASE − SUN_EL_AMP > 0).
+ */
+static V3 scene_sun_dir(const Scene *s) {
+  float omega_el = 2.0f * (float)M_PI / SUN_EL_PERIOD_S;
+  float omega_az = 2.0f * (float)M_PI / SUN_AZ_PERIOD_S;
+  float el = SUN_EL_BASE + SUN_EL_AMP * sinf(omega_el * s->time_secs);
+  float az = SUN_AZ_BASE + SUN_AZ_AMP * sinf(omega_az * s->time_secs);
+  float ce = cosf(el);
+  return v3_norm(v3(sinf(az) * ce, sinf(el), cosf(az) * ce));
+}
+
+/*
+ * scene_reseed — pick a new seed and re-place trees.
+ *
+ * Mixes the current time into the new seed so successive presses
+ * of `r' don't repeat layouts.
+ */
+static void scene_reseed(Scene *s) {
+  uint32_t h = hash3((int)(s->time_secs * 1000.0f), s->seed, 0xC0FFEE);
+  s->seed = (int)(h ^ 0x5A5A5A5Au);
+  place_trees(s->seed);
+}
+
+static void scene_init(Scene *s) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->speed = SPEED_DEF;
+  s->kelvin_idx = 1; /* GOLDEN by default */
+  s->zoom = 1.0f;
+  s->seed = 0xF0E57u;
+  s->debug_mode = MODE_NORMAL;
+  place_trees(s->seed);
+}
+
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  float speed_mul = (float)s->speed / (float)SPEED_DEF;
+  s->time_secs += dt * speed_mul;
+}
+
+/* ── §19 LOGIC: camera — pinhole ray generation (pure)
+ * ─────────────────────────────────── */
+
+/*
+ * Camera — a pinhole camera fixed at eye height, looking straight down +Z with
+ * no pitch (so the drifting sun sweeps the upper frame naturally). camera_ray
+ * (§19) maps a screen cell to a world ray through it; fov_v is derived from
+ * fov_h and the cell aspect so shapes aren't stretched by tall terminal cells.
+ * Ref: pinhole camera model — Shirley, "Fundamentals of Computer Graphics".
+ */
+typedef struct {
+  V3 pos;             /* eye position (0, CAMERA_HEIGHT, 0)             */
+  float fov_h, fov_v; /* horizontal / vertical field of view (radians) */
+  int cols, rows;     /* image-plane resolution this camera renders to */
+} Camera;
+
+/*
+ * camera_make — set up a horizontally-looking pinhole camera.
+ *   pos       = (0, CAMERA_HEIGHT, 0)
+ *   fov_v     = fov_h · rows · ASPECT_Y / cols
+ *
+ * Looking straight down +Z with no pitch — the sun drifts naturally
+ * through the upper part of the frame.
+ */
+static void camera_make(Camera *c, int cols, int rows, float fov_h) {
+  c->cols = cols;
+  c->rows = rows;
+  c->pos = v3(0.0f, CAMERA_HEIGHT, 0.0f);
+  c->fov_h = fov_h;
+  c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
+}
+
+/*
+ * camera_ray — pixel (sx, sy) → world-space ray direction.
+ *
+ * Pseudocode:
+ *   u =  ((2·sx + 1) − cols) / cols  ·  fov_h         normalised x
+ *   v = -((2·sy + 1) − rows) / rows  ·  fov_v         normalised y (flipped)
+ *   return normalize(u, v, 1)
+ *
+ * The flip on v converts from "screen y down" to "world y up".
+ */
+static V3 camera_ray(const Camera *c, int sx, int sy) {
+  float u =
+      ((2.0f * (float)sx + 1.0f) - (float)c->cols) / (float)c->cols * c->fov_h;
+  float v =
+      -((2.0f * (float)sy + 1.0f) - (float)c->rows) / (float)c->rows * c->fov_v;
+  return v3_norm(v3(u, v, 1.0f));
+}
+
+/* ── §20 RENDER: screen + scene_draw → framebuffer → screen
+ * ──────────────────── */
+
+/*
+ * Screen — the terminal output surface this frame draws to: just its current
+ * size, re-read on SIGWINCH so render and HUD always match the real window.
+ * Two fields, but its own concept (the output surface) passed to every RENDER
+ * function, so it earns a name rather than loose int pairs.
+ */
+typedef struct {
+  int cols, rows; /* terminal size in character cells (refreshed on resize) */
+} Screen;
+
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, s->rows, s->cols);
+}
+
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
+}
+
+static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
+
+/*
+ * radiance_component — pick which part of a traced Radiance the active debug
+ * overlay shows: the full image, just the shafts, just the surface, or the
+ * eye-ray transmittance as grayscale. Pure mapping (Radiance, mode) → colour.
+ */
+static RGB radiance_component(const Radiance *rad, DebugMode mode) {
+  switch (mode) {
+  default:
+  case MODE_NORMAL:
+    return rad->total;
+  case MODE_SCATTER:
+    return rad->in_scatter;
+  case MODE_SURFACE:
+    return rad->surface;
+  case MODE_TR: {
+    float t = rad->t_far_transmittance;
+    return rgb_make(t, t, t);
+  }
+  }
+}
+
+/*
+ * scene_draw — render one frame.
+ *
+ * Pseudocode:
+ *   for each pixel (r, c):
+ *     ray   = camera_ray(c, r)
+ *     rad   = trace_ray(...)
+ *     g_buf[r][c] = SELECT(scene.debug_mode, rad)
+ *   for each pixel: paint_cell(c, r + offset, g_buf[r][c])
+ *
+ * The SELECT step is what makes the debug overlays cheap — trace_ray
+ * has already produced all four components, we just decide which
+ * one(s) to display.
+ */
+static void scene_draw(const Screen *sc, const Scene *s) {
+  int rows_eff = sc->rows - 2;
+  int row_off = 1;
+  if (rows_eff < 4) {
+    rows_eff = sc->rows;
+    row_off = 0;
+  }
+  if (rows_eff > BUF_MAX_H)
+    rows_eff = BUF_MAX_H;
+  int cols_eff = sc->cols;
+  if (cols_eff > BUF_MAX_W)
+    cols_eff = BUF_MAX_W;
+
+  Camera cam;
+  camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
+
+  V3 sun_dir = scene_sun_dir(s);
+  float kelvin = KELVINS[s->kelvin_idx].kelvin;
+  RGB sun_chrom = blackbody_rgb(kelvin);
+  RGB sun_em = rgb_scl(sun_chrom, SUN_EMIT_HDR);
+  RGB horizon = rgb_scl(sun_chrom, SKY_HORIZON_FAC);
+
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      V3 ray_dir = camera_ray(&cam, c, r);
+      Radiance rad = trace_ray(cam.pos, ray_dir, sun_dir, sun_em, horizon);
+      g_buf[r][c] = radiance_component(&rad, s->debug_mode);
+    }
+  }
+
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      paint_cell(c, r + row_off, g_buf[r][c]);
+    }
+  }
+}
+
+/* ── §21 RENDER: HUD → screen
+ * ────────────────────────────────────────────────────────── */
+
+/*
+ * hud_draw — three HUD elements:
+ *   row 0 right    yellow status (fps, Hz, paused, kelvin, sun
+ *                  el/az deg, zoom, speed, debug mode)
+ *   row 0 left     yellow title (subtitle banner)
+ *   bottom row     cyan key-hint strip (BOLD, ASCII only)
+ */
+static void hud_draw(const Screen *sc, const Scene *s, double fps,
+                     int sim_fps) {
+  const KelvinPreset *k = &KELVINS[s->kelvin_idx];
+  V3 sd = scene_sun_dir(s);
+  float el_deg = asinf(sd.y) * 180.0f / (float)M_PI;
+  float az_deg = atan2f(sd.x, sd.z) * 180.0f / (float)M_PI;
+
+  char buf[256];
+  snprintf(buf, sizeof buf,
+           " %5.1f fps %3d Hz  %s  %s %5.0fK  sun:el%4.1f deg az%+5.1f deg  "
+           "z:%3.1fx  spd:%d  %s ",
+           fps, sim_fps, s->paused ? "PAUSED" : "      ", k->name,
+           (double)k->kelvin, (double)el_deg, (double)az_deg, (double)s->zoom,
+           s->speed, debug_mode_name(s->debug_mode));
+  int len = (int)strlen(buf);
+  if (len > sc->cols)
+    len = sc->cols;
+
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sc->cols - len, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(0, 0, " FOREST-GOD-RAYS · VOLUMETRIC PT ");
+  attroff(COLOR_PAIR(PAIR_HUD));
+
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(sc->rows - 1, 0,
+           " q:quit  spc:pause  r:reseed  d:debug  t/T:kelvin  z/Z:zoom  "
+           "+/-:spd  []:Hz ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  scene_draw(sc, s);
+  hud_draw(sc, s, fps, sim_fps);
+}
+
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
+
+/* ── §22 APP / TICK — signals, input, the per-tick combine (see ARCHITECTURE)
+ * ───────────────────────────────────── */
+
+/*
+ * App — the application harness: the whole running program's state in one place
+ * (WHERE/when we are, vs Scene's WHAT/HOW). Holds the simulation, the output
+ * surface, the performance knob and the signal-driven run flags. The top-level
+ * orchestrators app_init / app_run take App*; everything below takes a
+ * sub-type.
+ */
+typedef struct {
+  Scene scene;   /* the simulation (WHAT + HOW) — see Scene  */
+  Screen screen; /* the output surface — see Screen          */
+  int sim_fps;   /* fixed-timestep rate ([ / ]); decouples   */
+                 /* sim rate from render rate                */
+  volatile sig_atomic_t running; /* 0 = quit (set by signal or `q`)          */
+  volatile sig_atomic_t
+      need_resize; /* 1 = SIGWINCH pending, consumed next tick */
+} App;
+
+static App g_app;
+
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
+
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reseed(s);
+    break;
+
+  case 'd':
+  case 'D':
+    s->debug_mode = (DebugMode)((s->debug_mode + 1) % MODE_N);
+    break;
+
+  case '=':
+  case '+':
+    if (s->speed < SPEED_MAX)
+      s->speed *= 2;
+    break;
+  case '-':
+  case '_':
+    s->speed /= 2;
+    if (s->speed < SPEED_MIN)
+      s->speed = SPEED_MIN;
+    break;
+
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
+
+  case 't':
+    s->kelvin_idx = (s->kelvin_idx + 1) % N_KELVINS;
+    break;
+  case 'T':
+    s->kelvin_idx = (s->kelvin_idx + N_KELVINS - 1) % N_KELVINS;
+    break;
+
+  case 'z':
+    s->zoom *= ZOOM_STEP;
+    if (s->zoom > ZOOM_MAX)
+      s->zoom = ZOOM_MAX;
+    break;
+  case 'Z':
+    s->zoom /= ZOOM_STEP;
+    if (s->zoom < ZOOM_MIN)
+      s->zoom = ZOOM_MIN;
+    break;
+  }
+  return true;
+}
+
+static void app_init(App *app) {
+  memset(app, 0, sizeof *app);
+  scene_init(&app->scene);
+  screen_init(&app->screen);
+  app->sim_fps = SIM_FPS_DEFAULT;
+  app->running = 1;
+}
+
+static void app_run(App *app) {
+  int64_t prev = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t frame_count = 0;
+  int64_t fps_window_start = prev;
+  double fps_meas = 0.0;
+
+  struct sigaction sa = {0};
+  sa.sa_handler = on_exit_signal;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sa.sa_handler = on_resize_signal;
+  sigaction(SIGWINCH, &sa, NULL);
+  atexit(cleanup);
+
+  while (app->running) {
+    /* USER EVENTS — drain all pending keys (mutate Scene knobs / quit);
+     * NOT part of the tick. */
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (!app_handle_key(app, ch)) {
+        app->running = 0;
+        break;
+      }
+    }
+    if (!app->running)
+      break;
+    /* USER EVENT — apply pending SIGWINCH (control state, not the tick). */
+    if (app->need_resize) {
+      screen_resize(&app->screen);
+      app->need_resize = 0;
+    }
+
+    /* PERFORMANCE — wall-clock dt with spiral-of-death cap. */
+    int64_t now = clock_ns();
+    int64_t dt = now - prev;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
+    prev = now;
+
+    /* SIMULATION (fixed timestep) — drain the accumulator: scene_tick() is the
+     * ONLY per-tick state writer; the paused gate inside it is the DELAYS
+     * layer. */
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
+      sim_accum -= tick_ns;
+    }
+
+    /* RENDER combine — the ONE place state → screen: scene_draw + HUD, then
+     * present. Reads scene, never writes it. */
+    screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
+    screen_present();
+
+    /* PERFORMANCE — rolling fps measure (display only). */
+    frame_count++;
+    if (now - fps_window_start >= NS_PER_SEC) {
+      fps_meas = (double)frame_count * (double)NS_PER_SEC /
+                 (double)(now - fps_window_start);
+      frame_count = 0;
+      fps_window_start = now;
+    }
+
+    /* PERFORMANCE — frame cap (sleep the remainder of the render budget). */
+    int64_t target = clock_ns();
+    int64_t left = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
+    if (left > 0)
+      clock_sleep_ns(left);
+  }
+}
+
+int main(void) {
+  app_init(&g_app);
+  app_run(&g_app);
+  cleanup();
+  return 0;
+}
+
 /*
  * forest_god_rays.c — volumetric path tracer · bare forest with low sun
  *
@@ -525,7 +2148,7 @@
  *            ray → nearest hit ∈ {tree, ground, sky}. Sets
  *            march_distance.
  *
- *   Stage 3  EYE-RAY MARCH                 (§17 main loop)
+ *   Stage 3  EYE-RAY MARCH                 (§17 march_in_scatter)
  *            split [0, march_distance] into MARCH_STEPS pieces.
  *            Visit the midpoint of each.
  *
@@ -534,18 +2157,18 @@
  *            chord toward the sun? This IS the trick that produces
  *            the visible shafts.
  *
- *   Stage 5  IN-SCATTER CONTRIBUTION       (§17 inner block)
+ *   Stage 5  IN-SCATTER CONTRIBUTION       (§17 march_in_scatter)
  *            σ · phase · Tr_to_sun · L_sun · dt · T(0, t).
  *            Henyey-Greenstein (§8) supplies phase; the closed-form
  *            height-decaying transmittance (§7.3) supplies Tr_to_sun.
  *
- *   Stage 6  EYE-RAY TRANSMITTANCE UPDATE  (§17 main loop)
+ *   Stage 6  EYE-RAY TRANSMITTANCE UPDATE  (§17 march_in_scatter)
  *            T(0, t) *= exp(-σ · step_length). The contribution at
  *            step i used the T BEFORE this step's attenuation;
  *            we update it AFTER, so step i+1 sees the correct
  *            cumulative.
  *
- *   Stage 7  SURFACE CONTRIBUTION + TONE MAP   (§17 tail + §10)
+ *   Stage 7  SURFACE CONTRIBUTION + TONE MAP   (§17 shade_hit + §10)
  *            L_surface (tree/ground/sky) × T(0, march_distance).
  *            Sum with in-scatter; Reinhard + gamma + cube + glyph.
  *
@@ -694,7 +2317,7 @@
  *     single hash for "this cell" would produce noticeable patterns
  *     (taller trees correlated with darker trees etc).
  *
- * Active trees pack into the front of g_trees[] so ray_scene_hit
+ * Active trees pack into the front of g_forest.trees[] so ray_scene_hit
  * iterates only the populated entries. See §13 for the implementation.
  *
  * T8  SKY GRADIENT + SUN DISC — OUTDOOR SKY MODEL
@@ -810,1491 +2433,53 @@
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-#define _POSIX_C_SOURCE 200809L
-
-#include <math.h>
-#include <ncurses.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-/* ── §1 config ──────────────────────────────────────────────────────── */
-
-/* §1.1 frame-rate and motion knobs. */
-enum {
-  SIM_FPS_MIN = 10,
-  SIM_FPS_DEFAULT = 30,
-  SIM_FPS_MAX = 120,
-  SIM_FPS_STEP = 10,
-
-  SPEED_MIN = 1,
-  SPEED_DEF = 8,
-  SPEED_MAX = 64,
-};
-
-#define NS_PER_SEC 1000000000LL
-#define NS_PER_MS 1000000LL
-#define TICK_NS(f) (NS_PER_SEC / (f))
-#define DT_CAP_NS (100 * NS_PER_MS)
-
-/* §1.2 view geometry — pinhole camera, no pitch.
- *
- * Camera at world origin, eye-height above ground. Looking straight
- * down +Z. Unlike god_rays_silhouette.c (which pitches up to centre
- * the windows), this scene has no fixed feature to centre on — the
- * sun moves, the trees vary per seed — so we keep the camera straight
- * and let the sun drift through the upper part of the frame.
- */
-#define ASPECT_Y 2.0f
-#define FOV_H_BASE 0.55f
-#define ZOOM_MIN 0.25f
-#define ZOOM_MAX 4.0f
-#define ZOOM_STEP 1.25f
-
-#define CAMERA_HEIGHT 1.6f /* eye level above ground (m)       */
-
-/* §1.3 sun (treated as DIRECTIONAL — at infinity, T9).
- *
- * Sun above horizon (el ≈ 0.22 rad ≈ 12.6°). Drifts in azimuth and
- * elevation on different sin periods so the trajectory doesn't
- * visibly repeat for minutes. Each oscillation amplitude is small
- * (±2.5° elevation, ±5° azimuth) for a calm sunrise feel.
- *
- * SUN_DIST is unused for direction calculations (the sun is treated
- * as directional) but kept as a hint for ray_cylinder block tests:
- * SUN_NEE_DIST = 50 m caps the block test, which is well within sun
- * distance and well beyond TREE_Z_MAX.
- *
- * SUN_ANG_RADIUS is exaggerated from real (0.5°/0.0087 rad) so the
- * disc registers at terminal resolution.
- */
-#define SUN_DIST 1000.0f
-#define SUN_ANG_RADIUS 0.07f /* rad — ~4° apparent disc          */
-#define SUN_EMIT_HDR 14.0f   /* HDR brightness multiplier        */
-
-#define SUN_EL_BASE 0.22f /* rad — ~12.6° median elevation   */
-#define SUN_EL_AMP 0.044f /* rad — ±2.5°                     */
-#define SUN_AZ_BASE 0.0f
-#define SUN_AZ_AMP 0.087f /* rad — ±5° azimuth               */
-#define SUN_EL_PERIOD_S 200.0f
-#define SUN_AZ_PERIOD_S 280.0f
-
-/* §1.4 trees — bare cylinder trunks, jittered grid + probabilistic
- * gaps (T7).
- *
- * 5 azimuth bins × 4 depth bins = 20 cells total. Each cell
- * INDEPENDENTLY decides: place a tree with TREE_FILL_PROB = 0.70?
- * On average ~14 of 20 cells get trees; the 30% empty cells leave
- * gaps where the sun-shafts can be seen.
- *
- * Depth bins are LOG-spaced (close cells short, far cells long) so
- * apparent screen-density of trees stays roughly constant across the
- * depth range.
- *
- * TREE_Z_MIN = 3.5 m — closer than that, a single trunk dominates
- * the frame. TREE_Z_MAX = 28 m sets the visible far range.
- */
-#define N_AZIM_BINS 5
-#define N_DEPTH_BINS 4
-#define N_TREES (N_AZIM_BINS * N_DEPTH_BINS)
-#define TREE_FILL_PROB 0.70f /* per-cell probability of tree     */
-#define TREE_Z_MIN 3.5f
-#define TREE_Z_MAX 28.0f
-#define AZIMUTH_HALF 0.55f /* rad (~31°), wider than camera FOV */
-#define TREE_R_MIN 0.08f
-#define TREE_R_MAX 0.22f
-#define TREE_H_MIN 4.5f
-#define TREE_H_MAX 9.0f
-
-/* §1.5 ground plane — flat horizontal plane at y = 0. */
-#define GROUND_Y 0.0f
-#define GROUND_ALBEDO_R 0.18f
-#define GROUND_ALBEDO_G 0.13f
-#define GROUND_ALBEDO_B 0.08f
-
-/* §1.6 atmospheric medium — height-decaying mist (T2).
- *
- *   σ_e(p) = MIST_SIGMA · exp(-p.y / MIST_SCALE_H)
- *
- * Densest at the ground, falls off exponentially with height. The
- * closed-form Tr_to_sun (§7.3) requires this exponential shape —
- * if σ varied differently with height (linear, gaussian, etc.) we'd
- * need a numerical integral inside Tr_to_sun, costing 24× more.
- *
- * MARCH_STEPS = 32 across at most FAR_CLIP world units (~40 m) gives
- * step_length ≈ 1.25 m — coarse but the mist profile is smooth
- * enough that finer steps don't add much. HG_G = 0.55 — moderate
- * forward bias; cones get geometric definition from tree gaps so
- * the phase function doesn't have to do all the work.
- */
-#define MIST_SIGMA 0.25f  /* peak σ at y = 0                   */
-#define MIST_SCALE_H 1.0f /* e-folding height (m)              */
-#define HG_G 0.55f        /* HG anisotropy in (-1, 1)          */
-#define MARCH_STEPS 32
-#define FAR_CLIP 40.0f       /* march t_max for sky-bound rays    */
-#define SUN_NEE_DIST 50.0f   /* tree-block test distance to sun   */
-#define INSCATTER_GAIN 2.25f /* shaft visibility multiplier        */
-
-/* §1.7 sky gradient — orange near horizon, deep blue overhead (T8). */
-#define SKY_ZENITH_R 0.08f
-#define SKY_ZENITH_G 0.12f
-#define SKY_ZENITH_B 0.22f
-#define SKY_HORIZON_FAC 0.40f /* horizon = sun_chrom · this        */
-
-/* §1.8 buffer and ncurses pair-id reservations. */
-#define BUF_MAX_W 400
-#define BUF_MAX_H 200
-
-enum {
-  PAIR_HUD = 1,
-  PAIR_HINT = 2,
-  PAIR_SUN_FALLBACK = 3,
-  PAIR_CUBE_BASE = 16, /* + 0..215 = 6×6×6 cube           */
-};
-
-/* §1.9 ASCII glyph ramp (16 levels). */
-static const char k_ramp[] = " .'`,-_:;~=+*oO0";
-#define RAMP_LEN ((int)(sizeof k_ramp - 1))
-
-/* §1.10 kelvin presets (T9). */
-typedef struct {
-  const char *name;
-  float kelvin;
-} KelvinPreset;
-
-static const KelvinPreset KELVINS[] = {
-    {"DAWN  ", 2000.0f},
-    {"GOLDEN", 3500.0f},
-    {"NOON  ", 5500.0f},
-    {"DUSK  ", 2500.0f},
-};
-#define N_KELVINS ((int)(sizeof KELVINS / sizeof KELVINS[0]))
-
-/* §1.11 debug-overlay enum (T11). Cycled with `d'.
- *
- *   MODE_NORMAL     full render (in-scatter + surface · T_far)
- *   MODE_SCATTER    in-scatter only — shafts float in pure black
- *   MODE_SURFACE    surface only (no in-scatter, no extinction)
- *   MODE_TR         gray-scale eye-ray transmittance at far hit
- */
-typedef enum {
-  MODE_NORMAL = 0,
-  MODE_SCATTER = 1,
-  MODE_SURFACE = 2,
-  MODE_TR = 3,
-  MODE_N = 4,
-} DebugMode;
-
-static const char *debug_mode_name(DebugMode m) {
-  switch (m) {
-  case MODE_NORMAL:
-    return "NORMAL ";
-  case MODE_SCATTER:
-    return "SCATTER";
-  case MODE_SURFACE:
-    return "SURFACE";
-  case MODE_TR:
-    return "TR     ";
-  default:
-    return "?      ";
-  }
-}
-
-/* ── §2 clock ───────────────────────────────────────────────────────── */
-
 /*
- * clock_ns — monotonic wall time in nanoseconds.
+ * ════════════════════════════════════════════════════════════════════
+ *  ARCHITECTURE — concern layers (step-4 separation pass)
+ * ════════════════════════════════════════════════════════════════════
  *
- * CLOCK_MONOTONIC never goes backward across NTP / DST / suspend;
- * the right choice for animation dt and fps measurement.
+ *  Labelled, separated layers. LOGIC is pure (no mutation, no I/O), so
+ *  reordering or deleting RENDER cannot change a LOGIC result.
+ *
+ *  LAYER        SECTION(S)                       MUTATES
+ *  ----------   ------------------------------   ------------------------------
+ *  CONFIG       §1                               nothing — constants, presets,
+ *                                                ramp, enums (compile-time
+ * data) PERFORMANCE  §2; app_run dt/accum/fps/cap     OS sleep + loop-local
+ * timers; no scene state LOGIC        §3-§9, §11, §12, §14-§17, §19,   nothing
+ * — pure functions: vec/ scene_blocked_to_sun (§13),      rgb math, blackbody,
+ * tone map, scene_sun_dir (§18)              medium, phase, hashes,
+ *                                                intersections, scene_hit,
+ *                                                radiance, shading, trace_ray
+ *                                                (the core), camera rays
+ *  RENDER       §10, §20, §21                    the SCREEN (ncurses cells) +
+ *                                                the g_buf framebuffer +
+ *                                                g_have_256; reads scene, never
+ *                                                writes it
+ *  SIMULATION   scene_tick (§18)                 Scene.time_secs — the sun
+ * clock, the only PER-TICK state. Worldgen place_trees (§13) writes
+ * g_forest.trees, but only at init / `r` reseed. DELAYS       Scene.paused gate
+ * (§18)          nothing — pause makes scene_tick early-return; no holds/timers
+ *  EFFECTS      — none —                         no stored cosmetic state: the
+ *                                                god rays / glow are integrated
+ *                                                fresh every frame in
+ * trace_ray, never stored between frames
+ *
+ *  Timestep note: PERFORMANCE uses a FIXED-TIMESTEP accumulator (app_run:
+ *  sim_accum += dt; while (sim_accum >= TICK_NS) scene_tick()), with a
+ *  spiral-of-death dt cap and a frame-cap sleep. sim_fps is user-tunable
+ *  ( [ / ] ), so the simulation rate is decoupled from the render rate.
+ *
+ *  PER-TICK COMBINE ORDER (app_run — the one place layers meet):
+ *    drain input   USER EVENTS  app_handle_key: mutate Scene knobs / quit
+ *    resize        USER EVENT   apply pending SIGWINCH
+ *    dt            PERFORMANCE  wall-clock dt, capped
+ *    accumulate    SIMULATION   scene_tick() per fixed step (skipped if paused)
+ *    draw          RENDER       scene_draw -> screen_present (reads only)
+ *    fps + sleep   PERFORMANCE  rolling fps measure, then frame cap
+ *
+ *  User events (key input, SIGWINCH resize, the `r` reseed, signal handlers)
+ *  mutate control/view state, g_forest.trees (reseed), running / need_resize.
+ * They are NOT the tick; the only per-tick simulation write is scene_tick.
+ * ════════════════════════════════════════════════════════════════════
  */
-static int64_t clock_ns(void) {
-  struct timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
-}
-
-/*
- * clock_sleep_ns — best-effort sleep. Used to cap render rate
- * without burning CPU at 100%; subtract elapsed work and sleep
- * the remainder.
- */
-static void clock_sleep_ns(int64_t ns) {
-  if (ns <= 0)
-    return;
-  struct timespec req = {
-      .tv_sec = (time_t)(ns / NS_PER_SEC),
-      .tv_nsec = (long)(ns % NS_PER_SEC),
-  };
-  nanosleep(&req, NULL);
-}
-
-/* ── §3 vec3 math ────────────────────────────────────────────────────── *
- *
- * V3 — three floats by value. All helpers inlined to avoid call
- * overhead in the per-pixel inner loop.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-typedef struct {
-  float x, y, z;
-} V3;
-
-static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
-static inline V3 v3_add(V3 a, V3 b) {
-  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-static inline V3 v3_sub(V3 a, V3 b) {
-  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
-}
-static inline V3 v3_scl(V3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
-static inline float v3_dot(V3 a, V3 b) {
-  return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-static inline float v3_len(V3 a) { return sqrtf(v3_dot(a, a)); }
-
-/*
- * v3_norm — return a unit vector in the same direction as `a',
- * or (0,0,0) if `a' is zero-length (avoids NaN propagation).
- */
-static inline V3 v3_norm(V3 a) {
-  float length = v3_len(a);
-  if (length < 1e-12f)
-    return v3(0, 0, 0);
-  return v3_scl(a, 1.0f / length);
-}
-
-/* ── §4 rgb math ─────────────────────────────────────────────────────── *
- *
- * RGB — three linear-space floats. NOT clamped to [0,1]; HDR until
- * the tone-map stage in §10.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-typedef struct {
-  float r, g, b;
-} RGB;
-
-static inline RGB rgb_make(float r, float g, float b) { return (RGB){r, g, b}; }
-static inline RGB rgb_add(RGB a, RGB b) {
-  return rgb_make(a.r + b.r, a.g + b.g, a.b + b.b);
-}
-static inline RGB rgb_mul(RGB a, RGB b) {
-  return rgb_make(a.r * b.r, a.g * b.g, a.b * b.b);
-}
-static inline RGB rgb_scl(RGB a, float s) {
-  return rgb_make(a.r * s, a.g * s, a.b * s);
-}
-static inline RGB rgb_lerp(RGB a, RGB b, float t) {
-  return rgb_make(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
-                  a.b + (b.b - a.b) * t);
-}
-
-static inline float clamp01(float x) {
-  return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
-}
-static inline float luma_of(RGB c) {
-  return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
-}
-
-/* ── §5 blackbody (Tanner-Helland) ──────────────────────────────────── *
- *
- * Map a colour temperature in kelvin to an approximate sRGB
- * chromaticity. The Tanner-Helland fit (2012) uses three piecewise
- * polynomials per channel — accurate to within a few percent over
- * 1000K-12000K, and CHEAP (a few transcendentals).
- *
- * Used by §15 sky_radiance and the HUD; the chosen kelvin preset
- * also drives sun_em (sun emission HDR) and the sky horizon tint.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * blackbody_rgb — Planckian-locus chromaticity at `kelvin'.
- *
- * Pseudocode:
- *   K = kelvin / 100
- *   r = 1.0                                     if K <= 66
- *       329.7  · pow(K-60, -0.1332) / 255       otherwise
- *   g = 99.47 · log(K)         - 161.12 / 255   if K <= 66
- *       288.12 · pow(K-60, -0.0755) / 255       otherwise
- *   b = 1.0                                     if K >= 66
- *       0                                       if K <= 19
- *       138.52 · log(K-10)     - 305.04 / 255   otherwise
- *   return clamp01((r, g, b))
- */
-static RGB blackbody_rgb(float kelvin) {
-  float K = kelvin / 100.0f;
-  float r, g, b;
-
-  if (K <= 66.0f)
-    r = 1.0f;
-  else
-    r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
-
-  if (K <= 66.0f)
-    g = (99.47f * logf(K) - 161.12f) / 255.0f;
-  else
-    g = 288.12f * powf(K - 60.0f, -0.0755f) / 255.0f;
-
-  if (K >= 66.0f)
-    b = 1.0f;
-  else if (K <= 19.0f)
-    b = 0.0f;
-  else
-    b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
-
-  return rgb_make(clamp01(r), clamp01(g), clamp01(b));
-}
-
-/* ── §6 tone map ─────────────────────────────────────────────────────── *
- *
- * Reinhard L/(1+L) compresses HDR → [0, 1); 1/2.2 gamma converts
- * linear → sRGB. Applied per channel inside paint_cell (§10).
- *
- * Tone-mapping happens ONCE per cell at paint time, after all
- * accumulation. NEVER tone-map during the volumetric sum: Reinhard
- * is non-linear, tonemap(sum) ≠ sum(tonemap).
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-static inline float reinhard(float x) { return x / (1.f + x); }
-static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
-
-/* ── §7 atmospheric medium ───────────────────────────────────────────── *
- *
- * Two helpers:
- *
- *   §7.1  sigma_e_at  — height-decaying extinction coefficient
- *   §7.2  Tr_to_sun   — analytic transmittance from a point along
- *                       the sun-direction chord through the medium
- *                       (closed form because σ_e is exponential in y)
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* §7.1 ── sigma_e_at: extinction coefficient at a point ────────────── */
-
-/*
- * sigma_e_at — extinction at world point p.
- *
- *   σ_e(p) = MIST_SIGMA · exp(-y / MIST_SCALE_H)        y >= 0
- *
- * Below ground (y < 0) we clamp y to 0 to avoid the formula blowing
- * up. In practice scatter points always have y >= 0 in our scene
- * (camera at y = 1.6, ground at y = 0).
- */
-static inline float sigma_e_at(V3 scatter_point) {
-  float y = (scatter_point.y < 0.f) ? 0.f : scatter_point.y;
-  return MIST_SIGMA * expf(-y / MIST_SCALE_H);
-}
-
-/* §7.2 ── Tr_to_sun: medium transmittance from p toward sun ────────── */
-
-/*
- * tr_to_sun — analytic transmittance from p along sun_dir, integrated
- *             through the height-decaying mist column (T2).
- *
- * Pseudocode:
- *   if sun_dir.y < ε:           sun on/below horizon → 0 (chord
- *                               traverses infinite low-altitude mist)
- *   y = max(p.y, 0)
- *   τ = MIST_SIGMA · exp(-y/H) · H / sun_dir.y
- *   return exp(-τ)
- *
- * Derivation (T2):
- *   Tr = exp(-∫₀^∞ MIST_SIGMA · exp(-(p.y + s·sun_dir.y)/H) ds)
- *      = exp(-MIST_SIGMA · exp(-p.y/H) · H/sun_dir.y)
- *      = exp(-σ_e(p) · H / sun_dir.y)
- *
- * One closed-form transcendental call. NO second march required.
- * The cheap closed form is what makes this scene affordable; if σ
- * varied differently (linearly, gaussian) we'd need a numerical
- * integral here.
- */
-static inline float tr_to_sun(V3 scatter_point, V3 sun_dir) {
-  if (sun_dir.y < 1e-3f)
-    return 0.0f;
-  float y = (scatter_point.y < 0.f) ? 0.f : scatter_point.y;
-  float optical_depth =
-      MIST_SIGMA * expf(-y / MIST_SCALE_H) * MIST_SCALE_H / sun_dir.y;
-  return expf(-optical_depth);
-}
-
-/* ── §8 phase function ───────────────────────────────────────────────── *
- *
- * Henyey-Greenstein (T4):
- *
- *   P(cosθ; g) = (1 − g²) / [4π · (1 + g² − 2g·cosθ)^1.5]
- *
- * g > 0 forward-biased; tuned to HG_G = 0.55. In trace_ray the phase
- * value is computed ONCE per pixel — it depends only on the (eye, sun)
- * angle.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * hg_phase — HG phase value for cos(angle between two directions).
- *
- * Pseudocode:
- *   g²    = HG_G · HG_G
- *   denom = 1 + g² − 2g·cosθ
- *   return (1 − g²) / (4π · denom^1.5)
- *
- * Returns a number ≥ 0; INTEGRATES to 1 over the full sphere — so
- * the value at any one angle is a DENSITY, not a probability.
- */
-static inline float hg_phase(float cos_angle_eye_to_sun) {
-  float g = HG_G;
-  float g2 = g * g;
-  float denom = 1.0f + g2 - 2.0f * g * cos_angle_eye_to_sun;
-  if (denom < 1e-9f)
-    denom = 1e-9f;
-  return (1.0f - g2) / (4.0f * (float)M_PI * powf(denom, 1.5f));
-}
-
-/* ── §9 RNG (hash3 / hash01 — forest layout only) ───────────────────── *
- *
- * The path tracer is DETERMINISTIC (no Monte Carlo at runtime). The
- * only randomness is the per-seed forest layout (place_trees in §13).
- * hash3 is a small integer hash; hash01 maps its high bits to [0, 1).
- * Pure functions — no global state.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * hash3 — mix three integer keys into a 32-bit hash. Three large
- * odd primes followed by xorshift-mul rounds. Standard recipe.
- */
-static inline uint32_t hash3(int kx, int ky, int kz) {
-  uint32_t h = (uint32_t)kx * 73856093u ^ (uint32_t)ky * 19349663u ^
-               (uint32_t)kz * 83492791u;
-  h ^= h >> 16;
-  h *= 0x85ebca6bu;
-  h ^= h >> 13;
-  h *= 0xc2b2ae35u;
-  h ^= h >> 16;
-  return h;
-}
-
-/*
- * hash01 — uniform float in [0, 1). Drops the top byte of a 32-bit
- * hash to avoid the rounding-to-1 issue on extreme values.
- */
-static inline float hash01(uint32_t h) {
-  return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
-}
-
-/* ── §10 ncurses paint ───────────────────────────────────────────────── *
- *
- * One cell = (cube colour pair, glyph from ramp, A_BOLD / A_DIM /
- * A_NORMAL). Tone-map happens HERE — single application per cell.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-static int g_have_256;
-
-static void color_init(void) {
-  start_color();
-  use_default_colors();
-  g_have_256 = (COLORS >= 256);
-  if (g_have_256) {
-    for (int i = 0; i < 216; i++)
-      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
-    init_pair(PAIR_HUD, 226, -1);
-    init_pair(PAIR_HINT, 51, -1);
-  } else {
-    init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
-    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
-    init_pair(PAIR_HINT, COLOR_CYAN, -1);
-  }
-}
-
-/*
- * paint_cell — tone-map and paint one cell.
- *
- * Pseudocode:
- *   r' = gamma(reinhard(c.r))                   per channel
- *   g' = gamma(reinhard(c.g))
- *   b' = gamma(reinhard(c.b))
- *   luma  = 0.2126 r' + 0.7152 g' + 0.0722 b'   Rec.601
- *   glyph = k_ramp[ round(luma · (RAMP_LEN-1)) ]
- *   if 256 colour:
- *     (r5, g5, b5) = round((r', g', b') · 5)
- *     pair = PAIR_CUBE_BASE + r5·36 + g5·6 + b5
- *     attr = A_BOLD if luma > 0.85 else A_DIM if luma < 0.15 else NORMAL
- *   else:
- *     pair = PAIR_SUN_FALLBACK
- *   draw glyph at (sx, sy) with pair + attr
- */
-static void paint_cell(int sx, int sy, RGB col) {
-  float r = gamma_enc(reinhard(col.r));
-  float g = gamma_enc(reinhard(col.g));
-  float b = gamma_enc(reinhard(col.b));
-  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-  int ri = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
-  if (ri < 0)
-    ri = 0;
-  if (ri >= RAMP_LEN)
-    ri = RAMP_LEN - 1;
-
-  if (g_have_256) {
-    int r5 = (int)(r * 5.f + 0.5f);
-    if (r5 > 5)
-      r5 = 5;
-    if (r5 < 0)
-      r5 = 0;
-    int g5 = (int)(g * 5.f + 0.5f);
-    if (g5 > 5)
-      g5 = 5;
-    if (g5 < 0)
-      g5 = 0;
-    int b5 = (int)(b * 5.f + 0.5f);
-    if (b5 > 5)
-      b5 = 5;
-    if (b5 < 0)
-      b5 = 0;
-    int pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
-    int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
-    attron(COLOR_PAIR(pair) | attr);
-    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-    attroff(COLOR_PAIR(pair) | attr);
-  } else {
-    attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
-    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-    attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
-  }
-}
-
-/* ── §11 ray-plane intersection ─────────────────────────────────────── *
- *
- * Ray vs horizontal plane y = const. Used by the ground (GROUND_Y = 0).
- * The plane is solid from above only.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * ray_plane_y — intersect ray with horizontal plane at y = plane_y.
- *
- * Pseudocode:
- *   if ray_dir.y > -ε:               ray going up or parallel → MISS
- *   t = (plane_y − ray_origin.y) / ray_dir.y
- *   if t < ε:                        behind us → MISS
- *   *out_t = t; HIT
- *
- * The `ray_dir.y > -ε' guard means we register hits ONLY where the
- * ray is heading DOWN through the plane. If the camera is above the
- * plane and the ray goes up, no hit.
- */
-static bool ray_plane_y(V3 ray_origin, V3 ray_dir, float plane_y,
-                        float *out_t) {
-  if (ray_dir.y > -1e-6f)
-    return false;
-  float t = (plane_y - ray_origin.y) / ray_dir.y;
-  if (t < 1e-3f)
-    return false;
-  *out_t = t;
-  return true;
-}
-
-/* ── §12 ray-cylinder intersection (T6) ─────────────────────────────── *
- *
- * Ray vs vertical finite-height cylinder (a tree trunk).
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * ray_cylinder — ray vs vertical cylinder of radius r, base at
- *                `base', finite height h.
- *
- * Pseudocode (T6 derivation):
- *   δx = ray_origin.x − base.x        offset on x
- *   δz = ray_origin.z − base.z        offset on z
- *   a  = ray_dir.x² + ray_dir.z²       quadratic coefficients...
- *   if a < ε:  ray purely vertical → MISS
- *   b  = 2·(δx·ray_dir.x + δz·ray_dir.z)
- *   c  = δx² + δz² − r²
- *   disc = b² − 4ac
- *   if disc < 0:  no real roots → MISS
- *   √disc; t0 = (-b - √)/2a;   t1 = (-b + √)/2a
- *   if t1 < ε:  cylinder behind us → MISS
- *
- *   try near root first; if its y is outside [base.y, base.y + h]
- *   try far root; if that's also outside, MISS.
- *
- *   *out_t = the valid hit
- *
- * The "try far root if near misses height range" handles the case
- * where the ray enters the side ABOVE the cylinder's top and exits
- * below — physically inside the cylinder column but missing the
- * trunk because the trunk is shorter than the column.
- */
-static bool ray_cylinder(V3 ray_origin, V3 ray_dir, V3 base, float r, float h,
-                         float *out_t) {
-  float dx = ray_origin.x - base.x;
-  float dz = ray_origin.z - base.z;
-  float a = ray_dir.x * ray_dir.x + ray_dir.z * ray_dir.z;
-  if (a < 1e-9f)
-    return false;
-  float b = 2.0f * (dx * ray_dir.x + dz * ray_dir.z);
-  float c = dx * dx + dz * dz - r * r;
-  float disc = b * b - 4.0f * a * c;
-  if (disc < 0)
-    return false;
-  float sq = sqrtf(disc);
-  float t_near = (-b - sq) / (2.0f * a);
-  float t_far = (-b + sq) / (2.0f * a);
-  if (t_far < 1e-3f)
-    return false;
-
-  /* Try near intersection first; fall back to far if near is
-   * outside the height range (e.g. ray crosses the cylinder
-   * column above or below the trunk's top/base). */
-  float t = (t_near >= 1e-3f) ? t_near : t_far;
-  float y_at = ray_origin.y + t * ray_dir.y;
-  if (y_at < base.y || y_at > base.y + h) {
-    if (t == t_near) {
-      t = t_far;
-      y_at = ray_origin.y + t * ray_dir.y;
-      if (y_at < base.y || y_at > base.y + h)
-        return false;
-    } else {
-      return false;
-    }
-  }
-  *out_t = t;
-  return true;
-}
-
-/* ── §13 scene layout — trees + sun-block test ──────────────────────── *
- *
- *   §13.1  Tree struct + globals
- *   §13.2  place_trees       — jittered grid + probabilistic gaps
- *   §13.3  HitType / Hit
- *   §13.4  scene_blocked_to_sun — NEE shadow-ray block test
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* §13.1 ── Tree struct + globals ───────────────────────────────────── */
-
-typedef struct {
-  V3 base; /* (x, 0, z) — rooted on ground plane          */
-  float radius;
-  float height;
-} Tree;
-
-typedef enum { HIT_SKY = 0, HIT_TREE = 1, HIT_GROUND = 2 } HitType;
-
-typedef struct {
-  HitType type;
-  float t;
-  int tree_idx; /* valid iff type == HIT_TREE              */
-} Hit;
-
-static Tree g_trees[N_TREES];
-static int g_n_trees_placed;
-
-/* §13.2 ── place_trees: jittered grid layout ───────────────────────── */
-
-/*
- * place_trees — populate g_trees[] using a jittered grid with
- *               probabilistic per-cell empties (T7).
- *
- * Pseudocode:
- *   idx = 0
- *   for each (azim_bin, depth_bin) cell:
- *     fill = hash01(hash3(ax, dz, seed^FILL))
- *     if fill > TREE_FILL_PROB: skip (empty cell)
- *     z   = log-uniform within cell's depth range
- *     az  = uniform within cell's azimuth range
- *     x   = z · tan(az)
- *     r   = uniform [TREE_R_MIN, TREE_R_MAX]
- *     h   = uniform [TREE_H_MIN, TREE_H_MAX]
- *     g_trees[idx++] = Tree{base=(x, 0, z), r, h}
- *   g_n_trees_placed = idx
- *
- * Five separate hash calls per cell so all draws are statistically
- * independent (a single hash for "this cell" would correlate the
- * draws and produce visible patterns).
- */
-static void place_trees(int seed) {
-  int idx = 0;
-  for (int dz = 0; dz < N_DEPTH_BINS; dz++) {
-    for (int ax = 0; ax < N_AZIM_BINS; ax++) {
-      uint32_t fill_hash = hash3(ax, dz, seed ^ 0x05000);
-      float fill = hash01(fill_hash);
-      if (fill > TREE_FILL_PROB)
-        continue;
-
-      uint32_t z_hash = hash3(ax, dz, seed ^ 0x10000);
-      uint32_t a_hash = hash3(ax, dz, seed ^ 0x20000);
-      uint32_t r_hash = hash3(ax, dz, seed ^ 0x30000);
-      uint32_t h_hash = hash3(ax, dz, seed ^ 0x40000);
-
-      /* Log-spaced depth bin: closer cells span small ranges,
-       * far cells span large ranges. */
-      float u_z0 = (float)dz / (float)N_DEPTH_BINS;
-      float u_z1 = (float)(dz + 1) / (float)N_DEPTH_BINS;
-      float z0 = TREE_Z_MIN * powf(TREE_Z_MAX / TREE_Z_MIN, u_z0);
-      float z1 = TREE_Z_MIN * powf(TREE_Z_MAX / TREE_Z_MIN, u_z1);
-      float jz = hash01(z_hash);
-      float z = z0 + jz * (z1 - z0);
-
-      /* Linear azimuth bin within ±AZIMUTH_HALF. */
-      float u_a0 = ((float)(ax) / (float)N_AZIM_BINS - 0.5f) * 2.0f;
-      float u_a1 = ((float)(ax + 1) / (float)N_AZIM_BINS - 0.5f) * 2.0f;
-      float ja = hash01(a_hash);
-      float u_a = u_a0 + ja * (u_a1 - u_a0);
-      float angle = u_a * AZIMUTH_HALF;
-      float x = z * tanf(angle);
-
-      float u_r = hash01(r_hash);
-      float u_h = hash01(h_hash);
-
-      g_trees[idx].base = v3(x, 0.0f, z);
-      g_trees[idx].radius = TREE_R_MIN + u_r * (TREE_R_MAX - TREE_R_MIN);
-      g_trees[idx].height = TREE_H_MIN + u_h * (TREE_H_MAX - TREE_H_MIN);
-      idx++;
-    }
-  }
-  g_n_trees_placed = idx;
-}
-
-/* §13.4 ── scene_blocked_to_sun: NEE shadow-ray block test ─────────── */
-
-/*
- * scene_blocked_to_sun — does any tree intersect the chord from
- *                        scatter_point in direction sun_dir, within
- *                        max_distance? (T5)
- *
- * Pseudocode:
- *   for each tree:
- *     if ray_cylinder(p, sun_dir, tree.base, tree.r, tree.h)
- *        gives 1e-3 < t < max_distance:
- *           return true  (blocked)
- *   return false  (clear path to sun)
- *
- * Iterates EVERY tree — brute-force O(N_trees) per call. With ~14
- * trees this is fine; a real renderer would put a 2D BVH on the
- * trees but the speedup at this scale isn't worth the complexity.
- *
- * Used by:
- *   §16.1  shade_ground   for direct-sun shadow on the ground
- *   §17    trace_ray      at every march step (the in-scatter NEE)
- */
-static bool scene_blocked_to_sun(V3 scatter_point, V3 sun_dir,
-                                 float max_distance) {
-  for (int i = 0; i < g_n_trees_placed; i++) {
-    float t_tree;
-    if (ray_cylinder(scatter_point, sun_dir, g_trees[i].base, g_trees[i].radius,
-                     g_trees[i].height, &t_tree)) {
-      if (t_tree > 1e-3f && t_tree < max_distance)
-        return true;
-    }
-  }
-  return false;
-}
-
-/* ── §14 scene_hit (find nearest of {tree, ground, sky}) ────────────── */
-
-/*
- * scene_hit — return the nearest scene hit.
- *
- * Pseudocode:
- *   start with HIT_SKY, t = INF
- *   try ray_plane_y vs ground   → if closer, set HIT_GROUND
- *   for each tree:
- *     try ray_cylinder          → if closer, set HIT_TREE
- *   return best
- *
- * Sky is the FALLBACK — represents "the ray exits the scene without
- * hitting tree or ground". Always reaches t = INF in that case.
- */
-static Hit scene_hit(V3 ray_origin, V3 ray_dir) {
-  Hit hit = {HIT_SKY, 1e30f, -1};
-
-  /* Ground. */
-  float t_ground;
-  if (ray_plane_y(ray_origin, ray_dir, GROUND_Y, &t_ground)) {
-    if (t_ground < hit.t) {
-      hit.type = HIT_GROUND;
-      hit.t = t_ground;
-      hit.tree_idx = -1;
-    }
-  }
-
-  /* Trees. */
-  for (int i = 0; i < g_n_trees_placed; i++) {
-    float t_tree;
-    if (ray_cylinder(ray_origin, ray_dir, g_trees[i].base, g_trees[i].radius,
-                     g_trees[i].height, &t_tree)) {
-      if (t_tree < hit.t) {
-        hit.type = HIT_TREE;
-        hit.t = t_tree;
-        hit.tree_idx = i;
-      }
-    }
-  }
-
-  return hit;
-}
-
-/* ── §15 sky / sun radiance (T8) ────────────────────────────────────── *
- *
- * Two components:
- *   1. Vertical gradient from horizon (warm, kelvin-tinted) to
- *      zenith (cool blue).
- *   2. Sun disc — additive bright spot when the ray points within
- *      SUN_ANG_RADIUS of sun_dir.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * sky_radiance — radiance from a ray pointed at the sky.
- *
- * Pseudocode:
- *   h     = clamp01(ray_dir.y)                  0 = horizon, 1 = zenith
- *   sky   = lerp(horizon_col, ZENITH, h)
- *   if cos(ray_dir, sun_dir) > cos(SUN_ANG_RADIUS):
- *     edge = ramp from 0 at edge to 1 at centre
- *     sky += sun_em · edge
- *   return sky
- */
-static RGB sky_radiance(V3 ray_dir, V3 sun_dir, RGB sun_em, RGB horizon_col) {
-  float h = ray_dir.y;
-  if (h < 0.f)
-    h = 0.f;
-  if (h > 1.f)
-    h = 1.f;
-
-  RGB zenith = rgb_make(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
-  RGB sky = rgb_lerp(horizon_col, zenith, h);
-
-  float cos_ray_to_sun = v3_dot(ray_dir, sun_dir);
-  float cos_disc_edge = cosf(SUN_ANG_RADIUS);
-  if (cos_ray_to_sun > cos_disc_edge) {
-    float t_edge = (cos_ray_to_sun - cos_disc_edge) / (1.0f - cos_disc_edge);
-    if (t_edge > 1.f)
-      t_edge = 1.f;
-    sky = rgb_add(sky, rgb_scl(sun_em, t_edge));
-  }
-  return sky;
-}
-
-/* ── §16 surface shading ─────────────────────────────────────────────── *
- *
- * Two BRDFs:
- *   §16.1  shade_ground   Lambertian + NEE direct sun + sky ambient
- *   §16.2  shade_tree     constant near-black wood
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* §16.1 ── shade_ground ────────────────────────────────────────────── */
-
-/*
- * shade_ground — Lambertian floor with NEE direct sun + sky ambient.
- *
- * Pseudocode:
- *   albedo  = (GROUND_R, GROUND_G, GROUND_B)
- *   cos_NL  = max(0, sun_dir.y)                  ground normal = +Y
- *   direct  = (cos_NL > 0 and not blocked-to-sun)
- *               ? sun_em · albedo · cos_NL / π
- *               : 0
- *   ambient = horizon_col · albedo · 0.25         faint sky term
- *   return direct + ambient
- *
- * The block-to-sun test uses scene_blocked_to_sun — the ground stays
- * in its own shadow zone where any tree blocks the chord-to-sun.
- */
-static RGB shade_ground(V3 ground_point, V3 sun_dir, RGB sun_em,
-                        RGB horizon_col) {
-  RGB albedo = rgb_make(GROUND_ALBEDO_R, GROUND_ALBEDO_G, GROUND_ALBEDO_B);
-  float cos_normal_to_sun = sun_dir.y;
-  if (cos_normal_to_sun < 0.f)
-    cos_normal_to_sun = 0.f;
-
-  RGB direct = rgb_make(0.f, 0.f, 0.f);
-  if (cos_normal_to_sun > 0.f) {
-    bool blocked = scene_blocked_to_sun(ground_point, sun_dir, SUN_DIST);
-    if (!blocked) {
-      float lambert = cos_normal_to_sun / (float)M_PI;
-      direct = rgb_scl(rgb_mul(sun_em, albedo), lambert);
-    }
-  }
-  RGB ambient = rgb_scl(rgb_mul(horizon_col, albedo), 0.25f);
-  return rgb_add(direct, ambient);
-}
-
-/* §16.2 ── shade_tree ───────────────────────────────────────────────── */
-
-/*
- * shade_tree — constant near-black wood colour.
- *
- * Trunks are deliberately very dark so they read as silhouettes
- * against the bright shafts behind them. A more sophisticated
- * version could add subtle rim lighting from earthshine on the lit
- * side, but the silhouette is what matters for the demo.
- */
-static RGB shade_tree(int tree_idx) {
-  (void)tree_idx;
-  return rgb_make(0.025f, 0.020f, 0.015f);
-}
-
-/* ── §17 trace_ray (THE CORE — volumetric path tracer) ──────────────── *
- *
- * One pixel's worth of light, computed by:
- *
- *   1. Find what the eye ray hits  → march_distance (Stage 2 of T3)
- *   2. Loop MARCH_STEPS times, accumulating in-scatter (Stages 3-6)
- *   3. Add surface contribution dimmed by remaining transmittance
- *      (Stage 7)
- *
- * Returns a Radiance struct with all components separated, so the
- * debug overlays in §20 can paint each on its own. The default
- * MODE_NORMAL display sums them as in T1's equation.
- *
- * Read the inner loop body carefully — every line is one of the
- * seven stages of T3. ────────────────────────────────────────────── */
-
-typedef struct {
-  RGB total;                 /* in_scatter + surface · T_far     */
-  RGB in_scatter;            /* in-scatter accumulator only      */
-  RGB surface;               /* surface radiance (un-dimmed)     */
-  float t_far_transmittance; /* T(0, march_distance)             */
-} Radiance;
-
-/*
- * trace_ray — volumetric path tracer for one eye ray.
- *
- * Pseudocode (mirrors the inner loop body 1:1):
- *   hit = scene_hit(ray)                         Stage 2
- *   march_distance = (hit type)
- *                    ? hit.t
- *                    : FAR_CLIP   (sky)
- *   step_length = march_distance / MARCH_STEPS
- *   phase_value = hg_phase(cos(ray_dir, sun_dir))  Stage 4 (constant)
- *   transmittance_along_eye = 1
- *   in_scatter = (0, 0, 0)
- *   for i = 0 .. MARCH_STEPS-1:
- *     if transmittance_along_eye < 1e-3: break   early-out
- *     scatter_point = ray + ((i + 0.5) · step_length)
- *     extinction    = sigma_e_at(scatter_point)
- *     if extinction > 0:
- *       if NOT scene_blocked_to_sun(scatter_point, ...):     Stage 4
- *         tr_to_sun = closed-form transmittance (§7.2)        Stage 5
- *         step_factor = extinction · phase_value
- *                     · tr_to_sun · INSCATTER_GAIN · step_length
- *         in_scatter += sun_em · step_factor
- *                     · transmittance_along_eye
- *       transmittance_along_eye *= exp(-extinction · step_length) Stage 6
- *   surface_radiance = shade_(tree|ground|sky)(...)            Stage 7
- *   total = in_scatter + surface_radiance · transmittance_along_eye
- *   return Radiance{total, in_scatter, surface_radiance,
- *                   transmittance_along_eye}
- *
- * Iterative, not recursive — the for-loop is the integrator. The
- * NEE check inside the inner block is the entire shafts trick.
- */
-static Radiance trace_ray(V3 ray_origin, V3 ray_dir, V3 sun_dir, RGB sun_em,
-                          RGB horizon_col) {
-  /* Stage 2 — scene intersection. */
-  Hit scene_hit_record = scene_hit(ray_origin, ray_dir);
-
-  /* march_distance: surface hit, or FAR_CLIP for a sky-bound ray.
-   * (Sky-bound rays still march so we accumulate scatter through
-   * the whole near-camera mist column.) */
-  float march_distance =
-      (scene_hit_record.type == HIT_SKY) ? FAR_CLIP : scene_hit_record.t;
-  if (march_distance > FAR_CLIP)
-    march_distance = FAR_CLIP;
-
-  /* Stage 3 — march setup. */
-  float step_length = march_distance / (float)MARCH_STEPS;
-  float cos_eye_to_sun = v3_dot(ray_dir, sun_dir);
-  float phase_value = hg_phase(cos_eye_to_sun);
-
-  RGB in_scatter_radiance = rgb_make(0.f, 0.f, 0.f);
-  float transmittance_along_eye = 1.0f;
-
-  /* Stages 3-6 — march loop. */
-  for (int i = 0; i < MARCH_STEPS; i++) {
-    if (transmittance_along_eye <= 1e-3f)
-      break; /* early out */
-
-    float step_t = ((float)i + 0.5f) * step_length;
-    V3 scatter_point = v3_add(ray_origin, v3_scl(ray_dir, step_t));
-    float extinction = sigma_e_at(scatter_point);
-
-    if (extinction > 1e-6f) {
-      /* Stage 4 — NEE: any tree blocks the chord to the sun? */
-      bool blocked = scene_blocked_to_sun(scatter_point, sun_dir, SUN_NEE_DIST);
-
-      if (!blocked) {
-        /* Stage 5 — in-scatter contribution. */
-        float transmittance_to_sun = tr_to_sun(scatter_point, sun_dir);
-        float step_contribution = extinction * phase_value *
-                                  transmittance_to_sun * INSCATTER_GAIN *
-                                  step_length;
-        RGB add = rgb_scl(rgb_scl(sun_em, step_contribution),
-                          transmittance_along_eye);
-        in_scatter_radiance = rgb_add(in_scatter_radiance, add);
-      }
-
-      /* Stage 6 — eye-ray transmittance update. */
-      transmittance_along_eye *= expf(-extinction * step_length);
-    }
-  }
-
-  /* Stage 7 — surface contribution at the far end. */
-  RGB surface_radiance;
-  switch (scene_hit_record.type) {
-  case HIT_TREE:
-    surface_radiance = shade_tree(scene_hit_record.tree_idx);
-    break;
-  case HIT_GROUND: {
-    V3 ground_point = v3_add(ray_origin, v3_scl(ray_dir, scene_hit_record.t));
-    surface_radiance = shade_ground(ground_point, sun_dir, sun_em, horizon_col);
-    break;
-  }
-  case HIT_SKY:
-  default:
-    surface_radiance = sky_radiance(ray_dir, sun_dir, sun_em, horizon_col);
-    break;
-  }
-
-  /* Final radiance = in-scatter + surface · remaining T. */
-  RGB total = rgb_add(in_scatter_radiance,
-                      rgb_scl(surface_radiance, transmittance_along_eye));
-
-  Radiance result = {
-      .total = total,
-      .in_scatter = in_scatter_radiance,
-      .surface = surface_radiance,
-      .t_far_transmittance = transmittance_along_eye,
-  };
-  return result;
-}
-
-/* ── §18 scene state + sun motion ───────────────────────────────────── */
-
-typedef struct {
-  bool paused;
-  int speed;
-  int kelvin_idx;
-  float zoom;
-  float time_secs;
-  int seed;
-  DebugMode debug_mode;
-} Scene;
-
-/*
- * scene_sun_dir — current sun direction (unit vector, points FROM
- *                 any scene point TOWARD the sun) for time t.
- *
- * Pseudocode:
- *   ω_el = 2π / SUN_EL_PERIOD_S
- *   ω_az = 2π / SUN_AZ_PERIOD_S
- *   el   = SUN_EL_BASE + SUN_EL_AMP · sin(ω_el · t)
- *   az   = SUN_AZ_BASE + SUN_AZ_AMP · sin(ω_az · t)
- *   return norm(sin(az)·cos(el), sin(el), cos(az)·cos(el))
- *
- * For this scene the sun is always above the horizon
- * (el_min = SUN_EL_BASE − SUN_EL_AMP > 0).
- */
-static V3 scene_sun_dir(const Scene *s) {
-  float omega_el = 2.0f * (float)M_PI / SUN_EL_PERIOD_S;
-  float omega_az = 2.0f * (float)M_PI / SUN_AZ_PERIOD_S;
-  float el = SUN_EL_BASE + SUN_EL_AMP * sinf(omega_el * s->time_secs);
-  float az = SUN_AZ_BASE + SUN_AZ_AMP * sinf(omega_az * s->time_secs);
-  float ce = cosf(el);
-  return v3_norm(v3(sinf(az) * ce, sinf(el), cosf(az) * ce));
-}
-
-/*
- * scene_reseed — pick a new seed and re-place trees.
- *
- * Mixes the current time into the new seed so successive presses
- * of `r' don't repeat layouts.
- */
-static void scene_reseed(Scene *s) {
-  uint32_t h = hash3((int)(s->time_secs * 1000.0f), s->seed, 0xC0FFEE);
-  s->seed = (int)(h ^ 0x5A5A5A5Au);
-  place_trees(s->seed);
-}
-
-static void scene_init(Scene *s) {
-  memset(s, 0, sizeof *s);
-  s->paused = false;
-  s->speed = SPEED_DEF;
-  s->kelvin_idx = 1; /* GOLDEN by default */
-  s->zoom = 1.0f;
-  s->seed = 0xF0E57u;
-  s->debug_mode = MODE_NORMAL;
-  place_trees(s->seed);
-}
-
-static void scene_tick(Scene *s, float dt) {
-  if (s->paused)
-    return;
-  float speed_mul = (float)s->speed / (float)SPEED_DEF;
-  s->time_secs += dt * speed_mul;
-}
-
-/* ── §19 camera (pinhole, no pitch) ─────────────────────────────────── */
-
-typedef struct {
-  V3 pos;
-  float fov_h, fov_v;
-  int cols, rows;
-} Camera;
-
-/*
- * camera_make — set up a horizontally-looking pinhole camera.
- *   pos       = (0, CAMERA_HEIGHT, 0)
- *   fov_v     = fov_h · rows · ASPECT_Y / cols
- *
- * Looking straight down +Z with no pitch — the sun drifts naturally
- * through the upper part of the frame.
- */
-static void camera_make(Camera *c, int cols, int rows, float fov_h) {
-  c->cols = cols;
-  c->rows = rows;
-  c->pos = v3(0.0f, CAMERA_HEIGHT, 0.0f);
-  c->fov_h = fov_h;
-  c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
-}
-
-/*
- * camera_ray — pixel (sx, sy) → world-space ray direction.
- *
- * Pseudocode:
- *   u =  ((2·sx + 1) − cols) / cols  ·  fov_h         normalised x
- *   v = -((2·sy + 1) − rows) / rows  ·  fov_v         normalised y (flipped)
- *   return normalize(u, v, 1)
- *
- * The flip on v converts from "screen y down" to "world y up".
- */
-static V3 camera_ray(const Camera *c, int sx, int sy) {
-  float u =
-      ((2.0f * (float)sx + 1.0f) - (float)c->cols) / (float)c->cols * c->fov_h;
-  float v =
-      -((2.0f * (float)sy + 1.0f) - (float)c->rows) / (float)c->rows * c->fov_v;
-  return v3_norm(v3(u, v, 1.0f));
-}
-
-/* ── §20 screen + scene_draw (with debug overlays) ──────────────────── */
-
-typedef struct {
-  int cols, rows;
-} Screen;
-
-static void screen_init(Screen *s) {
-  initscr();
-  noecho();
-  cbreak();
-  curs_set(0);
-  nodelay(stdscr, TRUE);
-  keypad(stdscr, TRUE);
-  typeahead(-1);
-  color_init();
-  getmaxyx(stdscr, s->rows, s->cols);
-}
-
-static void screen_resize(Screen *s) {
-  endwin();
-  refresh();
-  getmaxyx(stdscr, s->rows, s->cols);
-}
-
-static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
-
-/*
- * scene_draw — render one frame.
- *
- * Pseudocode:
- *   for each pixel (r, c):
- *     ray   = camera_ray(c, r)
- *     rad   = trace_ray(...)
- *     g_buf[r][c] = SELECT(scene.debug_mode, rad)
- *   for each pixel: paint_cell(c, r + offset, g_buf[r][c])
- *
- * The SELECT step is what makes the debug overlays cheap — trace_ray
- * has already produced all four components, we just decide which
- * one(s) to display.
- */
-static void scene_draw(const Screen *sc, const Scene *s) {
-  int rows_eff = sc->rows - 2;
-  int row_off = 1;
-  if (rows_eff < 4) {
-    rows_eff = sc->rows;
-    row_off = 0;
-  }
-  if (rows_eff > BUF_MAX_H)
-    rows_eff = BUF_MAX_H;
-  int cols_eff = sc->cols;
-  if (cols_eff > BUF_MAX_W)
-    cols_eff = BUF_MAX_W;
-
-  Camera cam;
-  camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
-
-  V3 sun_dir = scene_sun_dir(s);
-  float kelvin = KELVINS[s->kelvin_idx].kelvin;
-  RGB sun_chrom = blackbody_rgb(kelvin);
-  RGB sun_em = rgb_scl(sun_chrom, SUN_EMIT_HDR);
-  RGB horizon = rgb_scl(sun_chrom, SKY_HORIZON_FAC);
-
-  for (int r = 0; r < rows_eff; r++) {
-    for (int c = 0; c < cols_eff; c++) {
-      V3 ray_dir = camera_ray(&cam, c, r);
-      Radiance rad = trace_ray(cam.pos, ray_dir, sun_dir, sun_em, horizon);
-
-      /* Debug-overlay selection (T11). */
-      switch (s->debug_mode) {
-      default:
-      case MODE_NORMAL:
-        g_buf[r][c] = rad.total;
-        break;
-      case MODE_SCATTER:
-        g_buf[r][c] = rad.in_scatter;
-        break;
-      case MODE_SURFACE:
-        g_buf[r][c] = rad.surface;
-        break;
-      case MODE_TR: {
-        float t = rad.t_far_transmittance;
-        g_buf[r][c] = rgb_make(t, t, t);
-        break;
-      }
-      }
-    }
-  }
-
-  for (int r = 0; r < rows_eff; r++) {
-    for (int c = 0; c < cols_eff; c++) {
-      paint_cell(c, r + row_off, g_buf[r][c]);
-    }
-  }
-}
-
-/* ── §21 HUD ────────────────────────────────────────────────────────── */
-
-/*
- * hud_draw — three HUD elements:
- *   row 0 right    yellow status (fps, Hz, paused, kelvin, sun
- *                  el/az deg, zoom, speed, debug mode)
- *   row 0 left     yellow title (subtitle banner)
- *   bottom row     cyan key-hint strip (BOLD, ASCII only)
- */
-static void hud_draw(const Screen *sc, const Scene *s, double fps,
-                     int sim_fps) {
-  const KelvinPreset *k = &KELVINS[s->kelvin_idx];
-  V3 sd = scene_sun_dir(s);
-  float el_deg = asinf(sd.y) * 180.0f / (float)M_PI;
-  float az_deg = atan2f(sd.x, sd.z) * 180.0f / (float)M_PI;
-
-  char buf[256];
-  snprintf(buf, sizeof buf,
-           " %5.1f fps %3d Hz  %s  %s %5.0fK  sun:el%4.1f deg az%+5.1f deg  "
-           "z:%3.1fx  spd:%d  %s ",
-           fps, sim_fps, s->paused ? "PAUSED" : "      ", k->name,
-           (double)k->kelvin, (double)el_deg, (double)az_deg, (double)s->zoom,
-           s->speed, debug_mode_name(s->debug_mode));
-  int len = (int)strlen(buf);
-  if (len > sc->cols)
-    len = sc->cols;
-
-  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-  mvprintw(0, sc->cols - len, "%s", buf);
-  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-  attron(COLOR_PAIR(PAIR_HUD));
-  mvprintw(0, 0, " FOREST-GOD-RAYS · VOLUMETRIC PT ");
-  attroff(COLOR_PAIR(PAIR_HUD));
-
-  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-  mvprintw(sc->rows - 1, 0,
-           " q:quit  spc:pause  r:reseed  d:debug  t/T:kelvin  z/Z:zoom  "
-           "+/-:spd  []:Hz ");
-  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-}
-
-static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
-  erase();
-  scene_draw(sc, s);
-  hud_draw(sc, s, fps, sim_fps);
-}
-
-static void screen_present(void) {
-  wnoutrefresh(stdscr);
-  doupdate();
-}
-
-/* ── §22 app (signals, main loop) ───────────────────────────────────── */
-
-typedef struct {
-  Scene scene;
-  Screen screen;
-  int sim_fps;
-  volatile sig_atomic_t running;
-  volatile sig_atomic_t need_resize;
-} App;
-
-static App g_app;
-
-static void on_exit_signal(int sig) {
-  (void)sig;
-  g_app.running = 0;
-}
-static void on_resize_signal(int sig) {
-  (void)sig;
-  g_app.need_resize = 1;
-}
-static void cleanup(void) { endwin(); }
-
-static bool app_handle_key(App *app, int ch) {
-  Scene *s = &app->scene;
-  switch (ch) {
-  case 'q':
-  case 'Q':
-  case 27 /* ESC */:
-    return false;
-  case ' ':
-    s->paused = !s->paused;
-    break;
-  case 'r':
-  case 'R':
-    scene_reseed(s);
-    break;
-
-  case 'd':
-  case 'D':
-    s->debug_mode = (DebugMode)((s->debug_mode + 1) % MODE_N);
-    break;
-
-  case '=':
-  case '+':
-    if (s->speed < SPEED_MAX)
-      s->speed *= 2;
-    break;
-  case '-':
-  case '_':
-    s->speed /= 2;
-    if (s->speed < SPEED_MIN)
-      s->speed = SPEED_MIN;
-    break;
-
-  case ']':
-    app->sim_fps += SIM_FPS_STEP;
-    if (app->sim_fps > SIM_FPS_MAX)
-      app->sim_fps = SIM_FPS_MAX;
-    break;
-  case '[':
-    app->sim_fps -= SIM_FPS_STEP;
-    if (app->sim_fps < SIM_FPS_MIN)
-      app->sim_fps = SIM_FPS_MIN;
-    break;
-
-  case 't':
-    s->kelvin_idx = (s->kelvin_idx + 1) % N_KELVINS;
-    break;
-  case 'T':
-    s->kelvin_idx = (s->kelvin_idx + N_KELVINS - 1) % N_KELVINS;
-    break;
-
-  case 'z':
-    s->zoom *= ZOOM_STEP;
-    if (s->zoom > ZOOM_MAX)
-      s->zoom = ZOOM_MAX;
-    break;
-  case 'Z':
-    s->zoom /= ZOOM_STEP;
-    if (s->zoom < ZOOM_MIN)
-      s->zoom = ZOOM_MIN;
-    break;
-  }
-  return true;
-}
-
-static void app_init(App *app) {
-  memset(app, 0, sizeof *app);
-  scene_init(&app->scene);
-  screen_init(&app->screen);
-  app->sim_fps = SIM_FPS_DEFAULT;
-  app->running = 1;
-}
-
-static void app_run(App *app) {
-  int64_t prev = clock_ns();
-  int64_t sim_accum = 0;
-  int64_t frame_count = 0;
-  int64_t fps_window_start = prev;
-  double fps_meas = 0.0;
-
-  struct sigaction sa = {0};
-  sa.sa_handler = on_exit_signal;
-  sigaction(SIGINT, &sa, NULL);
-  sigaction(SIGTERM, &sa, NULL);
-  sa.sa_handler = on_resize_signal;
-  sigaction(SIGWINCH, &sa, NULL);
-  atexit(cleanup);
-
-  while (app->running) {
-    int ch;
-    while ((ch = getch()) != ERR) {
-      if (!app_handle_key(app, ch)) {
-        app->running = 0;
-        break;
-      }
-    }
-    if (!app->running)
-      break;
-    if (app->need_resize) {
-      screen_resize(&app->screen);
-      app->need_resize = 0;
-    }
-
-    int64_t now = clock_ns();
-    int64_t dt = now - prev;
-    if (dt > DT_CAP_NS)
-      dt = DT_CAP_NS;
-    prev = now;
-
-    int64_t tick_ns = TICK_NS(app->sim_fps);
-    sim_accum += dt;
-    while (sim_accum >= tick_ns) {
-      scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
-      sim_accum -= tick_ns;
-    }
-
-    screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
-    screen_present();
-
-    frame_count++;
-    if (now - fps_window_start >= NS_PER_SEC) {
-      fps_meas = (double)frame_count * (double)NS_PER_SEC /
-                 (double)(now - fps_window_start);
-      frame_count = 0;
-      fps_window_start = now;
-    }
-
-    int64_t target = clock_ns();
-    int64_t left = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
-    if (left > 0)
-      clock_sleep_ns(left);
-  }
-}
-
-int main(void) {
-  app_init(&g_app);
-  app_run(&g_app);
-  cleanup();
-  return 0;
-}

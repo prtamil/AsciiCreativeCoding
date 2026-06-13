@@ -92,7 +92,7 @@ one. Keeping every program independent — rather than wiring them into a shared
 build — is what lets any file be read, compiled, and modified in isolation.
 
 **POSIX terminal only.**
-No Windows, no GUI. Forcing a Navier-Stokes solver or a path tracer through
+Forcing a Navier-Stokes solver or a path tracer through
 a character grid demands a sharper understanding of the underlying math
 than reaching for a graphics API would. The terminal is not a limitation —
 it is the whole point.

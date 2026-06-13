@@ -217,4 +217,3 @@ one's bottom HUD line lists its exact controls.
 - `libncurses` (`sudo apt install libncurses5-dev` or equivalent)
 - `libm` (standard)
 
-Nothing else. No CMake, no package manager, no runtime dependencies.

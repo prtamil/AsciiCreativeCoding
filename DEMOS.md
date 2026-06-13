@@ -2,7 +2,8 @@
 
 Per-program reference for every simulation in the repo. Each entry names the
 algorithm, key data structures, and any non-obvious design choices. Programs
-are grouped by topic; folder location is given at the start of each section.
+are grouped by topic folder; the folder location is given at the start of each
+section. **337 programs across 19 top-level folders.**
 
 For a high-level overview by folder, see the **Demos** section in
 [README.md](README.md). For the underlying framework, see
@@ -20,147 +21,179 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 
 | Program | Algorithm |
 |---------|-----------|
-| `lattice_gas` | FHP-I lattice gas — 6-direction bit-packed hex grid; 64-entry collision lookup (head-on 2-particle + symmetric 3-particle); streaming with bounce-back walls; momentum-colored display; 4 presets (cylinder/double-slit/channel/free), 5 themes |
-| `navier_stokes` | Jos Stam stable fluid — Gauss-Seidel diffusion, semi-Lagrangian advection, divergence-free projection |
-| `reaction_diffusion` | Gray-Scott model — 7 species presets (Mitosis, Coral, Stripes, Maze…) |
-| `lenia` | Continuous Game of Life — smooth kernel convolution, organic moving creatures |
-| `wave` | FDTD 2D wave PDE — CFL-stable, 5 interference sources, 4 color themes |
-| `wave_2d` | 2D scalar wave PDE — Huygens interference, multiple point sources, signed amplitude colour map |
-| `reaction_wave` | FitzHugh-Nagumo excitable medium — activator/inhibitor PDE, spiral waves, 4 color themes |
-| `excitable` | Greenberg-Hastings N-state CA — resting/excited/refractory rule; 4 presets (Spiral/Double/Rings/Chaos); N adjustable 5–20 controls refractory depth and wave spacing; broken-front spiral nucleation; radially periodic IC for target rings; 5 themes; `spc` manual pulse |
-| `wave_interference` | Analytic N-source wave interference — precomputed k·r phase table, aspect-corrected pixel distance, 8-level signed amplitude colour ramp; 4 presets (Double Slit/Ripple Tank/Beat/Radial); 5 themes; interactive source move/add/delete, ω and λ control |
-| `fluid_sph` | SPH particle fluid — kernel density estimation, pressure + viscosity forces, symplectic Euler, O(N·k) spatial grid, 5 scenes, 8 themes |
-| `flowfield` | Perlin fBm vector field — bilinear sampling, 8-direction particle trails |
-| `complex_flowfield` | Complex-function vector field — conformal mapping, Joukowski transform, 6 field presets, 5 themes |
-| `marching_squares` | Isosurface extraction — 16-case 4-bit lookup, linear edge interpolation, animated metaball scalar field |
-| `sand` | Falling-sand cellular automaton — gravity, sliding, density sorting |
-| `shallow_water_solver` | Shallow water equations — height + velocity fields, reflective boundaries, interactive wave injection |
-| `vorticity_streamfunction_solver` | 2D incompressible flow — vorticity-streamfunction formulation, Jacobi-iterated Poisson solve, obstacle boundary |
-| `cfl_stability_explorer` | CFL condition visualiser — live sweep of Courant number across FDTD schemes; shows stable vs unstable regimes |
+| `cfl_stability_explorer` | 2-D scalar wave equation via leapfrog finite differences; observes CFL stability bound (cfl ≤ 1.0) with eigenmode and Gaussian-drop initialisation |
+| `complex_flowfield` | Lagrangian particle advection through four physics-generated velocity fields (curl-noise, vortex lattice, sine waves, radial spiral) via function-pointer dispatch |
+| `flowfield` | Perlin noise → angle grid via `atan2(noise, noise)`; particles drift along the field; fractional Brownian motion for smooth evolution |
+| `fluid_sph` | Smoothed Particle Hydrodynamics: 800–3000 particles with spatial-hash grid; density estimation + pressure/viscosity forces; symplectic Euler integration |
+| `lattice_gas` | FHP-I cellular automaton: hexagonal grid, 6 bits per cell (one per direction); collision lookup table + streaming step; Navier-Stokes emerges from averaging |
+| `navier_stokes` | Stam's stable fluids (1999): operator splitting (diffuse→project→advect→project); unconditionally stable; dye as passive scalar; EMA shade anti-flicker |
+| `nuke` | Axisymmetric 2-D Stam fluids (temperature/density) with volumetric raymarching via Beer-Lambert; buoyancy-driven hot gas rising into a mushroom cloud |
+| `reaction_diffusion` | Gray-Scott Turing patterns: forward Euler with 9-point isotropic Laplacian; seven (f, k) presets for spots/stripes/mazes/solitons |
+| `reaction_wave` | FitzHugh-Nagumo excitable medium: cubic activator + slow inhibitor + diffusion; target rings, spirals, plane waves via impulse initial conditions |
+| `shallow_water_solver` | Linearised 2-D SWE: height + (u,v) velocity fields; forward differences ∇h → momentum, backward ∇·v → continuity; 4 scenarios (dam break/radial/channel/obstacle) |
+| `vorticity_streamfunction_solver` | 2-D Navier-Stokes via vorticity ω + streamfunction ψ (pressure-free); SOR Poisson solve for ψ; 4 scenarios (Kármán street, lid cavity, jet, step) with tracer particles |
 
 ## Physics  (`physics/`)
 
 | Program | Algorithm |
 |---------|-----------|
-| `lorenz` | RK4 integration — rotating 3D projection, Lyapunov ghost trajectory |
-| `double_pendulum` | Chaos via RK4 — 500-slot trail, real-time divergence metric |
-| `nbody` | Velocity Verlet gravity — 20 bodies, softened 1/r², optional black hole |
-| `cloth` | Spring-mass network — Hooke's law, symplectic Euler, 3 boundary modes |
-| `orbit_3body` | Figure-8 stable orbit → chaos on perturbation |
-| `pendulum_wave` | 15 harmonic pendulums — analytic ω_n, re-sync at T=60s |
-| `elastic_collision` | Hard-sphere billiards — Maxwell-Boltzmann distribution emerges |
-| `ising` | 2D Ising model — Metropolis MCMC spin flips, exp(−ΔE/kT) acceptance, phase transition at T_c |
-| `schrodinger` | 1D Schrödinger — Crank-Nicolson tridiagonal (Thomas algorithm), tunneling, 4 presets |
-| `blackhole` | Gargantua 3D (Interstellar) — exact Schwarzschild null geodesics via RK4, precomputed lensing table; photon ring from min-radius tracking, primary + secondary disk images, relativistic Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift; dynamic clip radius scales with cam_dist; 11 themes; `+/-` zoom |
-| `magnetic_field` | 2D dipole field lines — Biot-Savart superposition of magnetic monopoles, RK4 streamline tracing from N-pole seeds, 4 presets (Dipole/Quadrupole/Attract/Repel), incremental reveal animation, 5 themes |
-| `bubble_chamber` | Charged particles in a magnetic field — Lorentz force via exact velocity rotation R(ω), ionisation drag spirals orbits inward; 5 particle types (e⁻ e⁺ μ π p) with tuned q/m for visible curvature; age-faded trail ring buffers; `n` burst from centre, `e` burst from edge, `b/B` field strength, `Space` flip field, `t/T` particle type |
-| `chain` | Hanging chain & swinging rope — Position-Based Dynamics (Verlet + iterative distance-constraint projection), tension-coloured links, 4 presets (Hanging/Pendulum/Bridge/Wave), trail ring-buffer, 5 themes |
-| `rigid_body` | 2D rigid body physics — cubes + spheres, all pairs resolved with single AABB overlap function; spheres use aspect-corrected AABB `hw=r, hh=2r` to match terminal cell ratio; two-pass resolution: positional correction always fires (fixes overlap even when `vn=0`), velocity impulse only when approaching; adaptive restitution `e_eff=0` at low speed kills floor micro-bounce; spawn overlap check; sleep counter; `c` add cube, `s` add sphere, `x` remove last, `r` reset |
-| `soft_body` | Jelly blob — 7×7 spring-mass mesh; structural + shear + bending springs (Hooke + velocity damping); Newtonian pressure from shoelace area vs target; scan-line fill rendering; symplectic Euler integration; 4 presets (Blob/Heavy/Bouncy/Two), 5 themes |
-| `barnes_hut` | Barnes–Hut O(N log N) gravity — 800-body galaxy with quadtree force approximation (s/d < θ=0.5 criterion); static node pool (no malloc); flat rotation curve disk via M_enc∝r; Box-Muller Gaussian bulge; logarithmic spiral arms; brightness accumulator glow with DECAY=0.84; quadtree overlay (depth ≤ 3); 3 presets (Galaxy/Cluster/Binary), 5 themes |
-| `gyroscope` | 3D rigid-body gyroscope — quaternion orientation (no gimbal lock), Gram-Schmidt re-ortho safeguard; 3 presets: Euler's Top (torque-free symmetric, angular momentum cone), Gravity Top (precession + nutation, wobble tightens with spin), Dzhanibekov (asymmetric torque-free, flip instability) |
-| `spring_pendulum` | Spring pendulum — Lagrangian polar-coordinate EOM (r, θ); energy exchange resonance when ω_spring ≈ 2×ω_pendulum; rosette path tracing |
-| `stroke_engine` | Internal combustion engine gallery — runtime switch between 2-stroke (Schnürle scavenging), 4-stroke (Otto cycle), and 6-stroke (Crower water injection); shared slider-crank kinematics; per-type head geometry (wall ports vs poppet valves vs valves + water injector); per-phase gas chemistry above piston; bracketed stroke timeline below the engine showing 2 / 4 / 6 blocks with a position caret; 10 themes |
-| `nuke` | 2D shockwave demo — scalar wave PDE (∂²u/∂t² = c²∇²u − γ∂u/∂t) with 5-point Laplacian, CFL-stable substepping (CFL ≈ 0.33); cylindrical 1/√r decay + γ damping; terrain heave-and-settle ripples; debris arc + ground-dust pool; decaying sinusoidal screen shake; full-screen flash; 6 themes (`t` to cycle) |
-| `beam_bending` | Euler-Bernoulli beam — 9 BC×load combos; analytical w(x) + M(x); curvature-shaded ASCII render + moment panel; dynamic modal superposition (4 eigenmodes, exact damped transition matrix) |
-| `diff_drive_robot` | Differential drive robot — two named functions `compute_wheels` (inverse kinematics) and `step_pose` (forward kinematics + Euler); nonholonomic constraint by construction; pixel-space variable-dt integration; 600-slot ring-buffer trail with wrap-interp suppression; heading + wheel velocity arrows drawn with `.o0` dot progression |
-| `acoustic_wavesolver` | Acoustic pressure wave solver — 2D FDTD on staggered pressure/velocity grid; absorbing PML boundary; interactive source placement |
-| `lattice_boltzman_fluid_simulator` | Lattice Boltzmann fluid — D2Q9 BGK collision, streaming, bounce-back walls; density + velocity visualised; multiple obstacle presets |
-| `mass_spring_lattice` | 2D mass-spring lattice — rectangular mesh of springs; symplectic Euler; wave packet injection; spring constant and damping tunable |
-| `membrane` | 2D membrane vibration — FDTD wave equation on fixed-boundary grid; modal initialisation; aspect-correct pixel display |
-| `conjugate_gradient_linear_solver` | Conjugate-gradient visualiser — animated convergence of CG solving Ax=b; residual norm display; comparison with Gauss-Seidel |
-| `multigrid_solver_visualizer` | Multigrid solver — V-cycle Poisson solver; per-level residual animated; shows restriction and prolongation operators |
-| `rk_method_comparision` | RK integrator comparison — RK1/2/4 side-by-side on same ODE; global error vs step-size; phase-space trajectories |
-| `spectrogram_visualizer` | Spectrogram — real-time STFT with Hann window; frequency × time heat-map; 3-component sine mixer |
-| `bounce_ball` | Reference implementation — single bouncing ball with gravity and floor restitution; the simplest complete framework example |
+| `acoustic_wavesolver` | FDTD scalar pressure field — reflecting/absorbing boundaries, CFL stability, standing-wave room modes |
+| `barnes_hut` | Barnes–Hut O(N log N) gravity — quadtree node aggregation, softened force, Keplerian orbits |
+| `beam_bending` | Euler-Bernoulli FEM — modal superposition, 10 boundary/load combos, unconditionally stable time integration |
+| `blackhole` | RK4 null-geodesic ray tracing — Schwarzschild metric, lensing lookup table, Doppler beaming |
+| `bounce_ball` | Reference implementation — elastic bouncing in pixel-space physics, render interpolation, two coordinate spaces, cell aspect correction |
+| `bubble_chamber` | Exact rotation matrix for Lorentz force — cyclotron spirals, ionisation drag, 5 particle species |
+| `chain` | Position-Based Dynamics (PBD) with Verlet — iterative constraint projection, 10 presets, wind forcing |
+| `charged_particles` | Naive O(N²) Coulomb force — bipolar 8-step charge palette, soft singularities, 4 patterns |
+| `cloth` | Symplectic Euler spring-mass with 3 spring types — structural/shear/bend springs, 10 presets, 14 themes |
+| `conjugate_gradient_linear_solver` | CG vs steepest descent on a 2-D energy bowl — iso-contour rendering, eigenmode panel, spectral view |
+| `cymatics` | Analytic Chladni figures — Z(x,y) = cos(mπx)cos(nπy) − cos(nπx)cos(mπy), band thresholding |
+| `elastic_collision` | Impulse-based hard-sphere collisions — conservation of momentum + energy, mass ∝ r², impulse formula |
+| `gear` | Analytic polar gear + particle sparks — involute tooth approximation, 7-stage cooling pipeline |
+| `gyroscope` | RK4 Euler equations + quaternion tracking — 8 presets (symmetric/asymmetric tops, gravity), 10 themes |
+| `ising` | Metropolis Monte Carlo 2-D ferromagnetism — phase transition at Tc = 2.2692, domain walls, 10 patterns |
+| `lattice_boltzman_fluid_simulator` | D2Q9 BGK lattice Boltzmann — Kármán vortex street, viscosity τ control, Reynolds tuning, 10 obstacles |
+| `lorenz` | RK4 Lorenz attractor — 5 ε-offset ghost trajectories, Lyapunov chaos, depth cueing, lobe/density modes |
+| `magnetic_field` | RK4 magnetic dipole field lines — monopole approximation, null points, 3-tier brightness ramp |
+| `mass_spring_lattice` | Hooke's law + symplectic Euler — stress field rendering (rest = invisible), 4 strike scenarios |
+| `membrane` | Explicit FD wave equation solver — 5-point Laplacian, 3 BC types, modal excitation, CFL monitoring |
+| `multigrid_solver_visualizer` | V-cycle Poisson solver — Gauss-Seidel smoothing, grid hierarchy restrict/prolong, convergence tracking |
+| `nbody` | Velocity Verlet softened gravity — 10 presets (Kepler to Galaxy Merger), O(N²) brute force |
+| `pendulum` | RK4 N-link chaotic pendulum — Lagrangian mechanics, linear solver for accelerations, Lyapunov ghost |
+| `pendulum_wave` | Analytic simple harmonic motion — integer-ratio frequencies, Berg–Marshall clap synchrony |
+| `rigid_body` | Iterative impulse + Baumgarte stabilisation — AABB collisions, sleeping system, 10 themes |
+| `rigid_multiple_bodies` | Same impulse solver with presets — 4 canned scenes (brick wall, beams, tower, pyramid), projectile firing |
+| `rk_method_comparision` | Euler/RK2/RK4/Verlet side-by-side — phase portrait vs time series, stability limits, symplectic energy conservation |
+| `schrodinger` | Crank-Nicolson TDSE + Thomas tridiagonal — complex wavefunction, phase-coloured bars, 4 potentials |
+| `soft_body` | PBD mesh + point-in-polygon collision — Jordan-curve ray casting, Newton's 3rd law position split |
+| `soft_multiple_bodies` | PBD + breakable distance constraints — kinematic pinning, fracture propagation, 4 destructible presets |
+| `spring_pendulum` | Polar-coordinate spring pendulum — symplectic Euler, 2:1 parametric resonance, 10 modes |
+| `stroke_engine` | Slider-crank kinematics + cycle state machine — 2/4/6-stroke thermodynamics, valve timing, 10 themes |
+| `waves` | FDTD vs analytic closed-form superposition — source array, interference patterns, 5 presets (double-slit to ripple tank) |
 
-## Fractals & Chaos  (`procedural/`)
+## Procedural  (`procedural/`)
 
-| Program | Algorithm |
-|---------|-----------|
-| `mandelbrot` / `julia` | Escape-time iteration, Fisher-Yates random reveal, 6 zoom presets |
-| `julia_explorer` | Interactive Julia explorer — split screen: Mandelbrot map (left, precomputed) with crosshair, Julia set (right, per-frame recompute); arrow keys / HJKL move c; auto-wander orbits the Mandelbrot boundary; z/Z zoom Julia view; 5 themes |
-| `barnsley` | IFS chaos game — 5 presets (Barnsley Fern/Sierpinski/Levy C/Dragon/Fractal Tree); probability-weighted affine transform selection; log-density hit accumulator rendered with 4 char levels; 5 themes |
-| `diffusion_map` | Diffusion-Limited Aggregation — on-lattice random walk with launch circle + kill radius; Eden growth toggle (direct frontier pick); age-gradient coloring 5 levels; 5 themes (Coral/Ice/Lava/Plasma/Mono) |
-| `tree_la` | Dielectric Breakdown Model — Gauss-Seidel Laplace relaxation, frontier growth probability ∝ φ^η; 3 presets (Tree/Lightning/Coral); live η control with `e`/`E` |
-| `lyapunov` | Lyapunov fractal — alternating a/b logistic map sequences per pixel; λ sign determines stability (blue=stable, red=chaos); progressive row rendering; 6 sequences; 2 themes |
-| `buddhabrot` | Two-pass orbit density accumulation, log-normalized nebula palette |
-| `newton_fractal` | Complex Newton-Raphson on z⁴−1, basin coloring |
-| `strange_attractor` | Clifford/de Jong/Ikeda density maps, log-normalized hit grid |
-| `burning_ship` | Modified Mandelbrot with abs() trick |
-| `bifurcation` | Logistic map, Feigenbaum period-doubling route to chaos |
-| `apollonian` | Descartes' circle theorem, recursive circle packing |
-| `l_system` | General L-system — 5 presets (Dragon Curve, Hilbert Curve, Sierpinski Arrow, Branching Plant, Koch Snowflake); string rewrite production rules; turtle graphics rendering; generation-by-generation growth animation |
-| `lorenz` | Strange attractor — RK4, rotating projection |
+Six sub-folders: chaos, fields, fractals, generational, patterns, worldgen.
 
-## Cellular Automata & Life  (`misc/`, `fluid/`)
+### Chaos  (`procedural/chaos/`)
 
 | Program | Algorithm |
 |---------|-----------|
-| `life` | Conway GoL + 5 rule variants (HighLife/Seeds/Day&Night…) |
-| `cellular_automata_1d` | Wolfram 256 rules, 5 complexity classes color-coded |
-| `langton` | Langton's ant + 7 multi-color turmite variants |
-| `lenia` | Continuous CA — smooth kernel, real organisms |
-| `hex_life` | Game of Life on hexagonal grid (6-neighbor offset layout) |
-| `automaton_2d` | General 2D outer-totalistic CA with rule editing |
+| `bifurcation` | Logistic map, Feigenbaum period-doubling route to chaos; density rendering, cosine-gradient palette with log-tier mapping |
+| `cobweb_diagram` | Logistic map f(x)=r·x(1−x) on unit square; cobweb (staircase) construction with age-banded segment ring buffer; 30 presets across the period-doubling cascade |
+| `double_pendulum` | Lagrangian 4-D nonlinear ODE (θ₁,θ₂,ω₁,ω₂), RK4 integration; 30 presets across six behavioural classes; Bresenham rods, 4-band trail fade |
+| `duffing_oscillator` | Driven nonlinear oscillator ẍ + γẋ − x + x³ = A·cos(ωt), RK4 with phase-space trail; 30 presets period-doubling to strange attractor |
+| `henon_heiles` | 2-DOF Hamiltonian flow with cubic-saddle potential; Poincaré section at x=0; RK4 over an ensemble of orbits; 7 presets low-E regular → high-E chaotic sea with KAM islands |
+| `magnetic_pendulum` | Damped pendulum above three magnets with softened 1/r² attraction; RK4 basin-of-attraction animation; 2 presets (weak/strong damping) showing fractal → Voronoi basins |
+| `poincare_section` | Lorenz ODE (σ=10, ρ=28, β=8/3) with z-plane crossing detector; Poincaré section as a 2-D density histogram; 8-tier glyph ramp |
+| `recurrence_plot` | Recurrence matrix R(i,j)=1 if \|xᵢ−xⱼ\|<ε, built progressively over N samples; 30 presets from trivial to Lorenz/Hénon/logistic chaos; texture classification |
+| `rossler_attractor` | Rössler ODE with one nonlinear term, RK4; rotating 3-D camera (yaw/pitch); 16 presets fixed-point → chaos and exotic topologies (funnel/screw) |
+| `sensitive_dependence` | 2–3 Lorenz trajectories seeded ε apart, parallel RK4 showing exponential divergence; 10 presets varying projection, perturbation size, and layout (overlay/split/log\|δ\|) |
+| `standard_map` | Chirikov-Taylor area-preserving map on the 2-torus; 900-trajectory ensemble with density accumulation; 5 presets KAM tori → chaotic sea; 100-level intensity |
+| `strange_attractor` | 10-preset zoo: 9 discrete 2-D chaotic maps (Hénon, Hopalong, Clifford, de Jong…) plus the Lorenz ODE; rotating 3-D projection with ghosts, depth-cued comet trail, starfield parallax |
 
-## Rendering & 3D  (`raster/`, `raymarcher/`)
-
-| Program | Algorithm |
-|---------|-----------|
-| `raymarcher` | Sphere-marching SDF — Blinn-Phong, gamma correction |
-| `raymarcher_cube` | SDF box — finite-difference normals, shadow ray |
-| `raymarcher_primitives` | SDF boolean composition (min/max) — sphere/box/torus/capsule/cone |
-| `sdf_gallery` | SDF composition gallery — 5 scenes: smooth-union blend, boolean ops, twist deformation, domain repetition, organic sculpt; 3 lighting modes (N·V / Phong / Flat); 5 themes |
-| `mandelbulb` | 3D Mandelbulb raymarcher — clean ground-up build for terminal low-res. Spherical-power DE (power 8), Hubbard-Douady distance estimator `½·log(r)·r/dr`, central-difference normals, smooth-iter coloring drives palette, Phong + Christensen soft shadow + step-count AO. Auto-orbit + arrow-key manual override; 5 themes (CLASSIC / ICE / PLASMA / MONO / NEGATIVE) |
-| `mandelbulb_raster` | Mandelbulb rasterizer — UV-sphere tessellation (~1800 triangles) built once at startup; MVP + z-buffer; per-vertex smooth-iter + normal; HSV fragment shaders; 4 shader modes (hue/normals/depth/Phong) |
-| `torus_raster` | UV rasterizer — Phong/toon/normal/wireframe shaders, back-face cull |
-| `cube_raster` / `sphere_raster` | Full software rasterizer pipeline |
-| `displace_raster` | Real-time vertex displacement, central-difference normal recompute |
-| `donut` | Parametric torus projection — the original spinning donut |
-| `wireframe` | 3D Bresenham edge projection, slope-to-character line drawing |
-| `sun_solar` | Clean 2-D screen-space sun with arc flares — radial classifier (disc / corona / empty), Eddington 1-coefficient limb darkening, animated fBm granulation + sunspots, parabolic-arc flares with `sin(πs)·life_envelope` lifecycle additively overlaid, exponential corona falloff. 5 themes (SOLAR / BLUE_GIANT / RED_DWARF / ALIEN / NEGATIVE) |
-| `nuke` (raymarcher) | Volumetric mushroom cloud — proper 2-D axisymmetric Boussinesq Navier-Stokes (Stam stable fluids): semi-Lagrangian advection of velocity/temperature/density, 40-iter Jacobi pressure projection for ∇·v=0, buoyancy `vy += β·(T−T₀)·dt`. Cap, vortex roll, and fall all EMERGE from the simulation — no scripted timeline. Beer–Lambert volumetric raymarcher samples the 2-D field at radius `√(x²+z²)`. 5 blast presets (TACTICAL/STANDARD/MEGATON/AIR_BURST/GROUND), 5 themes |
-
-## Analytic Ray Tracing  (`raytracing/`)
+### Fields  (`procedural/fields/`)
 
 | Program | Algorithm |
 |---------|-----------|
-| `sphere_raytrace` | Quadratic ray-sphere — foundational raytrace demo; orbiting camera, 3-light Phong (KEY/FILL/RIM split into named functions), Fresnel glass mode, 6×6×6 RGB cube + Bourke 92-char ramp paint pipeline, 6 themes |
-| `cube_raytrace` | AABB slab method — `slab_test` per-axis + `ray_aabb` dispatcher; inverse-rotation ray transform, face-normal colour, wireframe edge mode, 6 themes |
-| `torus_raytrace` | Quartic intersection (Horner-form polynomial + scan + bisect — numerically stable vs Ferrari closed-form) — ring in XZ plane, closest-point geometric normal, Fresnel, 6 themes |
-| `capsule_raytrace` | Cylinder + hemisphere caps — `cylinder_test` + `cap_test` decomposition; Quílez no-division form; inverse-rotation transform, 6 themes |
-| `path_tracer` | Monte Carlo path tracer — Lambertian BRDF, cosine hemisphere sampling (Malley's method), Russian roulette termination, progressive per-pixel accumulator, Reinhard tone map + gamma, 6×6×6 cube + Bourke ramp paint, Cornell Box scene with color bleeding |
-| `saturn_with_rings` | Iconic ringed planet — analytic ray-sphere (planet) + ray-plane annulus (rings); CONTINUOUS RGB pipeline with limb darkening + atmospheric rim, soft-shadow penumbra (8-cone-sample), forward-scattering ring glow (backlight^3 — the Cassini look), sub-pixel anti-aliasing (SPP 1/2/4); 3 shade modes (LIT/FLAT/NORMAL); 4 patterns (SATURN/URANUS/RINGED-EARTH/EXOPLANET) |
-| `solar_eclipse` | Two ray-sphere tests + 5 cinematic shading layers — limb-darkened photosphere with fBm GRANULATION (sphere-stable surface coords), STREAMER-structured corona (fBm in angle×radius space → polar plumes + helmet streamers), CHROMOSPHERE Hα ring at totality edge, MULTIPLE BAILEY'S BEADS at totality boundary (5 beads at random angles around limb), 5×5 Gaussian BLOOM on bright cells; 5 BLACKBODY star presets (1500K-10000K via Tanner Helland approximation); 4 patterns (TOTAL/PARTIAL/ANNULAR/TRANSIT) |
-| `god_rays_silhouette` | Volumetric light shafts via per-cell screen-space ray-march — Beer-Lambert weighted samples toward sun; CONTINUOUS RGB pipeline with BLACKBODY temperature presets (8 from EMBER 1500K to BLUE 8500K — no preset themes), CINEMATIC SUN (CORE + CORONA halo + 4 LENS-FLARE STREAKS), BLOOM (5×5 bright-pass), DUST PARTICLES with motion-blur trails and Perlin WIND GUSTS; 3 shade modes (LIT/MASK/VIS); curated airy 16-glyph open-symbol density ramp (no `#` `@` blocks); 5 silhouette patterns (ARCHWAY/MOUNTAIN/COLUMN/WINDOWS/TREE) |
+| `curl_noise_vector_field` | Divergence-free curl-of-noise v = (∂ψ/∂y, −∂ψ/∂x) with ψ a Perlin/fBm potential; 5 views (particles/vectors/potential/curl-magnitude/warped); central finite-difference gradient |
+| `domain_warped_noise_iq_style` | Inigo Quilez domain warping f(x + g(x)) through 1–3 nesting levels plus a ridged variant; static fields drifting via time offset; 5 patterns, colour decoupled from intensity |
+| `flow_field_particles` | 256 particles through 30 closed-form 2-D vector fields: rotational (vortices/spirals), radial (saddles/magnets), waves, nonlinear oscillators (Duffing/Van der Pol/Lotka); attractors mark singularities |
+| `magnetic_fields` | Inverse-square monopole fields B(r)=Σ qᵢ(r−rᵢ)/\|r−rᵢ\|³; 30 configurations dipole → multipole grids/coils; iron-filings particle flow with N/S markers |
+| `marching_squares_isocontours_showcase` | Marching squares: 4-bit per-cell classification, 16-case lookup, linear edge interpolation; 30 visualisations across single/multi/pair/topology/region/animated iso-contours |
+| `midpoint_displacement_coastline` | 1-D midpoint-displacement fractal: recursive subdivision with halving jitter; Brownian output; 30 silhouette patterns (single line → multi-stack terraces); morphs between keyframes |
+| `perin_noise_flow_showcase` | Perlin gradient noise (1985) with quintic fade; 30 patterns: flow, height, ridge/billow/zebra, domain warps, fBm stacks, texture composites (marble/wood/fire/clouds/caves) |
+| `reaction_diffusion_gray_scott` | Gray-Scott PDE with 5-point Laplacian stencil; 30 (F,k) presets drawn from the Pearson phase diagram (spots/stripes/mazes to chaos) |
+| `signed_distance_field_jfa_showcase` | Jump Flood Algorithm: log₂N passes of nearest-seed propagation → Euclidean distance field; 30 patterns from raw SDF to rings/Voronoi/contours/animated; wobbling seeds |
+| `simplex_noise_clouds` | Simplex noise (Perlin 2001) on a triangular lattice, 3-vertex barycentric, isotropic; 30 patterns in 6 tiers (raw/mapped/turbulence/warped/composite/masked) |
+| `value_noise_showcase` | Value noise: random scalars on a lattice + interpolation; 5 interpolation modes (smooth/linear/blocky/quintic/cosine); 30 patterns exposing axis-aligned grid artefacts |
+| `vector_field_arrows_showcase` | 8-direction ASCII arrows via `atan2(vy,vx)`; 30 patterns: scalar gradients, analytic fields (radial/shear), physics (Coulomb/dipole), divergence-free flows, ODE portraits, animated |
+| `worley_cellular_noise` | Worley/cellular noise: hashed feature points, 3×3 tile lookup for F1/F2/F3; 30 patterns from raw Fₙ to multi-metric (Manhattan/Chebyshev/anisotropic) and fBm stacks |
 
-## Emergent Systems  (`flocking/`)
-
-| Program | Algorithm |
-|---------|-----------|
-| `flocking` | Reynolds boids — 5 modes (classic/leader/Vicsek/orbit/predator-prey) |
-| `shepherd` | User-controlled herding — flee force, panic zone, flee-radius ring |
-| `crowd` | Reynolds steering crowd — 6 live-switchable behaviours (WANDER/FLOCK/PANIC/GATHER/FOLLOW/QUEUE); up to 150 agents; seek/flee/separate/align/cohesion forces |
-| `war` | Two-faction battle (GONDOR vs MORDOR) — melee + archer units; travelling `-` arrow projectiles (flat pool, 220 px/s); 4-state FSM (ADVANCE/COMBAT/FLEE/DEAD); 6 live battle strategies |
-| `swarm_gen_numbers` | Reynolds steering digit swarm — 25 agents form digits 0–9 via 10 strategies (DRIFT/RUSH/FLOW/ORBIT/FLOCK/PULSE/VORTEX/GRAVITY/SPRING/WAVE); greedy slot assignment; Hooke's law spring steering |
-| `ant_colony` | Pheromone ACO — stigmergic path optimization on an 8-dir grid (Deneubourg double-bridge); 80 ants, SEARCHING / RETURNING state machine; 14 food-source patterns (DOUBLE/SINGLE/QUAD/LINE/HEXAGON/CROSS/TRIANGLE/CIRCLE/DIAGONAL/CLUSTER/DISTANT/PERIMETER/GRID/RANDOM) cycle with `n/N`; 6 themes incl. SUMI_E NEGATIVE; modern fixed-step loop reads input every frame, `+/-` scales sim ticks per render frame (1×–16×) without losing key responsiveness |
-| `wator` | Wa-Tor predator-prey ecosystem |
-| `network_sim` | SIR epidemic + spring-force graph layout |
-| `slime_mold` | Physarum polycephalum — Jeff Jones (2010) agent model; 3-sensor sense→rotate→move→deposit loop; double-buffered trail diffusion + decay; emergent minimum Steiner tree networks connecting food sources; 4 presets, 5 themes |
-
-## Turtle Graphics  (`turtle/`)
+### Fractals  (`procedural/fractals/`)
 
 | Program | Algorithm |
 |---------|-----------|
-| `duo_poly` | Dual turtle polygon animator — two turtles (cyan A / magenta B) draw regular polygons step-by-step; each tick advances one edge; aspect-corrected Y keeps shapes visually round; auto-cycles 3→12 sides; `a/z` `s/x` sides, `+/-` speed |
+| `apollonian` | Descartes Circle Theorem, recursive gap-filling, 7 depth levels, fill/outline toggle, hue-cycle animation |
+| `barnsley` | IFS chaos game, 30 presets (ferns, trees, Sierpinski, dragons, curves), log-tone density mapping, 4-tier glyphs |
+| `buddhabrot` | Escape-time Mandelbrot orbit accumulation, Buddha/Anti-Buddha mode, 5-tier log-tone density, random c sampling |
+| `burning_ship` | Escape-time with absolute-value fold, 5 zoom presets, Fisher-Yates random reveal, 7 themes |
+| `dragon_curve` | Paper-folding sequence generation (recursive rewriting), 13 generations max, turtle-traced segments, 7 colour bands |
+| `fern` | IFS chaos game (single-point iteration), 4 fern variants, 80k iterations per cycle, colour by height, 8 themes |
+| `julia` | Escape-time fixed-c Julia sets, 6 parameter presets, Fisher-Yates random reveal, 5 colour bands, 5 themes |
+| `julia_explorer` | Split-screen Mandelbrot/Julia duality, interactive cursor + auto-wander, shared escape engine, cached left panel |
+| `koch` | Edge-replacement snowflake subdivision, 5 levels (12→3072 segments), parametric curve→cell projection, 5 themes |
+| `lightning` | Recursive tip branching (not DLA), 3 active tips, lean bias + fork probability, glow halo + shimmer, 5 themes |
+| `l_system` | L-system string rewriting (Dragon, Hilbert, Sierpinski, Tree, Koch), turtle interpretation, auto-fit scaling |
+| `lyapunov` | Logistic map with alternating parameter pair, Lyapunov-exponent classification, 6 symbol sequences, progressive scanline build |
+| `mandelbrot` | Escape-time iteration z²+c, Fisher-Yates random reveal, 6 zoom presets, 10 themes |
+| `newton_fractal` | Newton's method for z⁴−1, 4 root basins, convergence-speed banding, 5-theme palette, pan/zoom explorer |
+| `sierpinski` | Recursive triangle subdivision (3^depth leaves), 7 depth levels, corner-colour triadic ramp, 10 themes |
+| `snowflake` | Deterministic 6-fold dendritic branching, ±60° side branches, 6 depths, Bresenham line strokes |
+| `tree_la` | Dielectric Breakdown Model (Laplace growth), Gauss-Seidel solver, 5 presets (Tree/Lightning/Coral/Frost/Discharge), η tunable 1–4 |
+
+### Generational  (`procedural/generational/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `ant_colony` | Ant Colony Optimisation — stigmergic pheromone trails; 12+ food patterns; 6 themes |
+| `automaton_2d` | Larger-than-Life 2-D CA — neighbourhood radius R=1–10; 15 preset rules via summed-area table O(1) queries |
+| `bsp_dungeon_showcase` | Binary Space Partition dungeon — recursive rectangle splitting; carve + corridor phases; BFS diameter solution |
+| `cellular_automata_1d` | Wolfram elementary CA — 256 rules; 5 classes (fixed/periodic/chaotic/complex/fractal) |
+| `cellular_automata_cave_4-5_rule_showcase` | CA cave (4-5 rule) — B5678/S45678 smoothing via double-buffer; animated wavefront sweep |
+| `coral` | Radial DLA — particles drift inward, stick on contact; fractal branching D≈1.71; 15 presets |
+| `delaunay_triangulation` | Bowyer-Watson incremental Delaunay — bad-triangle removal + recavitation; 15 presets |
+| `diamond_square_heightmap_showcase` | Diamond-Square fractal heightmap — midpoint displacement + roughness decay; 6 terrain biomes; per-frame normalisation |
+| `diffusion_map` | DLA vs Eden modes — fractal (D≈1.71) vs direct frontier (D→2); age-based colouring; 5 themes |
+| `drunkards_walk_cave_showcase` | Drunkard's Walk cave — random walkers carve floors; multi-walker overlap forms caverns; respawn after MAX_AGE |
+| `excitable` | Greenberg-Hastings excitable medium — N-state CA (N=5–20); refractory period tunes wave speed; 4 presets (spiral/double/rings/chaos) |
+| `forest_fire` | Drossel–Schwabl forest-fire CA — 3-state (empty/tree/fire); self-organised criticality at critical p/f; 4 ecological presets |
+| `hex_life` | Hexagonal Game of Life — B2/S34 on a 6-neighbour hex grid; offset rows; glow-based smooth birth/death |
+| `langton` | Langton's Ant (Turmite) — 2-D Turing machine; rule string encodes turn per cell colour; 8 presets; highway emerges |
+| `lenia` | Lenia (continuous Life) — convolution kernel + Gaussian growth; 3 self-organising creatures (Orbium/Aquarium/Scutium) |
+| `life` | Conway's Game of Life + 5 rule variants — B/S bitmask rules; 6 presets (HighLife/Day&Night/Seeds/Morley/2×2); population histogram |
+| `maze_backtracker` | Recursive-backtracker DFS maze — stack-based carving; 2× BFS diameter solver; 10 size presets |
+| `maze` | Recursive-backtracker + BFS solver — 4-bit wall bitmask per cell; animated carve then solve; 3 sizes |
+| `poission_disk_sampling_showcase` | Bridson fast Poisson-disk sampling — active list + background grid (r/√2 cells); K=30 attempts; blue-noise distribution |
+| `sandpile` | Bak-Tang-Wiesenfeld Abelian sandpile — toppling threshold 4; self-organised criticality; 4-fold mandala symmetry; bloom/wave modes |
+| `voronoi_region_map` | Brute-force nearest-seed Voronoi — O(W·H·N) compute; distance-order reveal animation; 8 seeds |
+| `wator` | Wa-Tor predator-prey CA — fish breed/swim, sharks hunt/breed/starve; shuffled update; Lotka-Volterra oscillations; 4 regimes |
+| `wfc_learn` | Wave Function Collapse (pedagogical) — 12-tile alphabet; entropy-heuristic collapse + constraint propagation; single-step mode |
+| `wfc_showcase` | Wave Function Collapse (spectacle) — 34-tile ASCII pipes; 4-valued edge states; 5 seed ripples; 10 themes |
+| `wilsons_algorithms_maze_showcase` | Wilson's algorithm — loop-erased random walks → uniform spanning tree; 2× BFS diameter solver; glow animations |
+
+### Patterns  (`procedural/patterns/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `maze_of_maze` | Recursive-backtracker DFS at two scales — outer maze contains an independent inner maze per cell; brightness-field animation; 4 patterns, 3 glyph sets |
+| `penrose_pentagrid` | De Bruijn pentagrid dual method for P3 rhombuses; five families of parallel lines classify tiles by k-tuple parity; rotating viewport reveals aperiodicity |
+| `penrose_tiling` | Penrose P3 deflation via Robinson triangles; acute/obtuse substitution scaled by golden ratio; animated subdivision with Bresenham raster |
+| `quasicrystal` | Plane-wave interference at N directions; aperiodic long-range rotational order; 4 patterns by wave count (TRI/PENTA/HEPTA/UNDECA) × 4 glyph sets |
+| `truchet_tiles` | Truchet tiling via per-cell rotation from a noise field; 4 distribution modes (random/fBm/bands/Voronoi) × 12 glyph sets = 48 combinations |
+| `wang_tiles` | Wang edge-matching constraint solver; 16-tile complete set (2 colours/axis); placement biased by noise/sinusoid/swirl; 3 glyph styles (edges/blocks/wires) |
+
+### Worldgen  (`procedural/worldgen/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `cloud` | 15 fBm cloud presets (scale/octaves/warp/threshold); wind drift scrolls morphology (cumulus/cirrus/stratus/storm); pure-function per cell, no storage |
+| `hydraulic` | Hydraulic erosion via Lagrangian droplets on an fBm heightmap; gradient descent + carrying capacity + bilinear erosion brush; dendritic networks self-organise; 15 view modes |
+| `perlin_landscape` | Three-layer parallax fBm landscape (far/mid/near speeds); octave stacking with gain/lacunarity; deterministic star field; painter's-algorithm compositing |
+| `procedural_city` | L-system BSP of rectangle blocks; stochastic H/V split biased by aspect ratio; per-lot zoning gradient; build animation follows derivation depth; window-light twinkle |
+| `procedural_constellation` | Poisson-jittered anchor stars; 15 graph topologies (MST/chain/loop/spoke/wheel/fan/spiral…); Bresenham line-trace animation; procedural Latin-flavoured naming |
+| `procedural_galaxy` | Logarithmic spiral arms modulated by bulge/disk/proximity density; hash-gate star placement; 15 morphologies (spiral/barred/elliptical/starburst…); optional fBm arm roughening |
+| `procedural_star_field_parallax_noise_showcase` | Hash-based infinite parallax star field across 4 depth layers; 15 modes (starfield/twinkle/nebula/warp/tunnel/wormhole/pulsar/supernova…); fBm nebula backdrop |
+| `tectonic` | Plate tectonics — Voronoi plate assignment, boundary classification (convergent/divergent/transform), elevation via distance-to-boundary + fBm, 8 biome bins; 15 cartographic views |
+| `terrain` | Diamond-square midpoint displacement (65×65 grid); thermal weathering (talus threshold, slope transport); height-to-contour rasterisation with bilinear interpolation |
 
 ## Grid Systems  (`grids/`)
 
 All major grid families are split into two parallel sub-folders: a **display**
 folder showing the bare grid, and a **placement** folder where a cursor can
-deposit objects on that grid. Eight families: rectangular (14 displays + 4
+deposit objects on that grid. Four families: rectangular (14 displays + 4
 unified placement editors), polar (7 + 4), hex (7 + 4), and triangular (12 + 24).
+See [grids/README.md](grids/README.md) for the reading order.
 
 ### Background Grid Displays  (`grids/rect_grids/`)
 
@@ -287,130 +320,212 @@ fractals; cycle-through-triangles for Delaunay.
 | `06_hex_subdivision_path` | Line-of-sight path on hex-subdivision; pixel walk + sector_of() classifier per sample |
 | `06_hex_subdivision_scatter` | Distance-colored scatter on hex-subdivision; cube-distance + sector-circular distance |
 
+## Rasterizer  (`raster/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `bloom_finale` | Deferred shading + SSAO + bloom; G-buffer (pos/normal/albedo/emissive), per-pixel hemisphere AO, separable Gaussian blur on bright pixels |
+| `cube_raster` | Forward rasterisation (MVP→divide→screen→cull→barycentric→z-test); flat-normal cube; 4 shader modes (phong/toon/normals/wireframe); 6×6×6 RGB cube + Bourke ramp |
+| `deferred_rendering_pipeline` | Two-pass deferred: geometry pass writes G-buffer (pos/normal/albedo); light pass accumulates per-light Blinn-Phong; up to 8 point lights |
+| `displace_raster` | Vertex displacement along surface normal via scalar field; central-difference normal recompute; 4 field modes (ripple/wave/pulse/spiky); barycentric raster |
+| `donut` | Analytic torus point-sampling; (θ,φ) walk with Lambertian shading; perspective projection with K1/K2 scaling; 6 themes; z-buffer + glyph store — the original spinning donut |
+| `mandelbulb_raster` | Hybrid raymarch-then-rasterise: UV-sphere ray-march from outside inward to build a mesh, then forward rasteriser; power 2–16 |
+| `marching_cubes` | Marching cubes isosurface extraction from a metaball scalar field every frame; 256-case lookup tables (EDGE_TABLE/TRI_TABLE); real-time topology changes; 7 themes |
+| `neon_edges` | Screen-space edge detection via Sobel on G-buffer depth + normal channels; flagged edges drive HDR neon colour into the bloom pipeline |
+| `shadow_mapping` | Two-pass shadow mapping (Williams 1978): light-view depth pass → shadow map, camera pass does depth compare + PCF; orthographic light view |
+| `sphere_raster` | Forward rasterisation of a UV-tessellated sphere; smooth per-vertex normals; 4 shaders (phong/toon/normals/wireframe); barycentric interpolation |
+| `ssao_pipeline` | Screen-space ambient occlusion: K hemisphere samples per pixel projected to screen + depth lookup; 3×3 blur; modulates ambient only |
+| `sun_solar` | 2-D screen-space distance-to-centre classifier; Eddington limb darkening, fBm convection granulation, sunspots; exponential corona; parabolic flares; 5 themes |
+| `torus_raster` | Forward rasterisation of a UV-tessellated torus; closed-form normals (subtract ring centre); 4 shaders (phong/toon/normals/wireframe) |
+| `wireframe` | Wireframe rendering: vertex/edge tables → Bresenham line drawing; perspective projection with aspect correction; 4 shapes (cube/sphere/pyramid/torus) |
+
+## Raymarcher  (`raymarcher/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `csg_atlas` | 13 CSG boolean operators (hard/smooth/round/chamfer × union/intersect/subtract/xor); animated operands; 4 debug overlays |
+| `kifs_fractal` | Kaleidoscopic IFS fractals: fold-then-contract iteration; 3 presets (Sierpinski tetrahedron/Menger sponge/rotating crystal); orbit-trap colouring |
+| `mandelbulb` | 3-D Mandelbulb (power 8 canonical); distance estimator with derivative tracking; smooth-iteration colouring; soft shadows + AO via march step count |
+| `metaballs` | Six orbiting spheres blended with polynomial smooth-min; curvature-based colour bands; 2×2 SSAA option; soft shadows via Quílez penumbra |
+| `raymarcher` | Textbook sphere trace (Hart 1996): single sphere SDF; 4 debug overlays; closed-form normal; Phong shading |
+| `raymarcher_cube` | Sphere-traced box SDF; tetrahedral 4-tap normal; same March loop as `raymarcher.c`; rotated via point transformation |
+| `raymarcher_primitives` | 17 SDF primitive catalogue (sphere/box/torus/cone/capsule/octahedron…); function-pointer dispatch; Floyd-Steinberg dithering; 92-char Bourke ramp |
+| `sdf_gallery` | 5 scenes of SDF composition: blend/boolean/twist/repeat/sculpt; 3 lighting modes (N·V/Phong/Flat); 4 debug overlays; per-frame trig cache |
+
+## Analytic Ray Tracing  (`raytracing/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `capsule_raytrace` | Ray-capsule: decomposed into cylinder body + 2 spherical caps; quadratic solve per part; 4 shading modes; 3 debug overlays; 20 PBR materials |
+| `cube_raytrace` | Slab method: ray vs 3 axis-aligned slabs, interval overlap; 4 shading modes; wireframe via face-edge distance; 20 PBR materials |
+| `forest_god_rays` | Volumetric path tracer: march through height-decaying mist; NEE asks if sun is visible from each sample (tree occlusion); Henyey-Greenstein phase; 4 Kelvin presets |
+| `god_rays_window` | Volumetric path tracer: uniform interior mist; slit-aware wall test (pointed-arch openings); 10 windows per 2 rows; NEE + phase function |
+| `path_tracer` | Progressive Monte Carlo path tracer: 7 passes (camera ray → intersect → shade → bounce → throughput → terminate → accumulate); Cornell Box; 4 debug overlays |
+| `saturn_with_rings` | Ray-sphere + ray-ring; limb darkening + atmospheric rim; soft ring shadows + forward-scatter; Cassini gap; 4 patterns (Saturn/Uranus/Ringed-Earth/Exoplanet) |
+| `solar_eclipse` | Volume-rendered eclipse: photosphere + corona (∝r⁻³) + chromosphere + prominences; lunar terrain with per-seed Bailey's-bead valleys; penumbra via disc overlap; eye adaptation |
+| `sphere_raytrace` | Quadratic ray-sphere intersection; 3-point lighting (key/fill/rim); 4 shading modes (phong/normals/fresnel/depth); 20 PBR materials |
+| `torus_raytrace` | Quartic ray-torus: Horner-form polynomial + scan-and-bisect solver; closest-point normal formula; 4 shading modes; 20 PBR materials |
+| `tunnel` | Ray-cylinder (closed-form quadratic); cylindrical UV mapping; 4 patterns (rings/checker/spokes/grid); distance fog; sway + roll camera; 6 themes |
+
+## Artistic  (`artistic/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `aurora` | Aurora borealis — closed-form side-view scene (no state grid), per-cell function of (col,row,time,seed); 18-colour ramp with colour-wave, drapery folds, shimmer, stateless stars; 4 themes |
+| `bat` | V-formation particle system — 3 formations burst outward; triangular Pascal rows; 4-frame wing cycle; 6 preset headings; dynamic `+/-` rows (1–6) |
+| `bonsai` | Two-pass procedural tree — stochastic recursive skeleton (5 styles: chokkan/moyogi/shakan/kengai/bunjin); Bresenham raster + aspect-corrected ellipse foliage; per-frame wind rustle |
+| `dna` | 10 DNA/RNA structures — parametric helix rendering (B/A/Z-DNA, triple helix, G-quadruplex, hairpin, replication fork, cruciform, plasmid, ladder); depth-cued backbone sinusoids; 6 themes |
+| `dune_rocket` | Homing missiles — proportional-navigation steering; ballistic acceleration; trail ring buffer; explosion sparks with gravity; terrain heightmap + scorch decay; 28 rockets max |
+| `dune_sandworm` | Segmented worm — chain-of-circles follower (constraint relaxation), 50 segments; underground sinusoidal path + parabolic breach arc; sand ripples + spray; direction-dependent glyphs |
+| `fire_tornado` | Three layered systems — rotating ember pool (cylindrical particles), 1-D base heat mat with diffusion/injection, spark pool with gravity; wind sway; 5-stop heat ramp |
+| `galaxy` | Spiral galaxy — 3000 stars on 2–4 logarithmic arms; flat rotation curve; differential rotation (ω∝1/r) winds arms over time; brightness-decay trails; density→glyph ramp; 3 zones |
+| `hindu_mandalas` | 30 parametric Hindu mandalas — 6 radial primitives (circle/dots/petals/polygon/star/rays) layered as rings; 20 simple + 10 complex forms; progressive build; 4 themes |
+| `hurricane` | Rankine vortex top-view — cloud particles orbit in polar coords; solid-body rotation inside eye, 1/r decay outside; radial inflow recycling; 15 presets; 3 radial zones |
+| `islamic_mandalas` | 30 parametric Islamic patterns — 6 primitives (circle/polygon/star-polygon/star-shape/interlock/rays); 20 simple + 10 complex; progressive reveal; 4 themes (Iznik/Persian/Andalusian/Mamluk) |
+| `jellyfish` | Physics pulse locomotion — FSM (IDLE/CONTRACT/GLIDE/EXPAND); parametric half-ellipse bell with time-varying radii; tapered tentacle-chain followers; jet thrust + gravity + drag |
+| `lava_lamp` | Metaball scalar field — N blobs with temperature T; field f=Σ rᵢ²/dᵢ²; threshold-fill interior; buoyancy physics; blob merging/splitting; heat ramp; 3–10 blobs |
+| `leaf_fall` | Two-phase — stochastic recursive tree (branching DFS) seeded into grid, then matrix-rain leaf fall with per-column streamers (white head, green trail); 4096-leaf pool with stagger |
+| `led_number_morph` | Spring-mass particle morphing — 336 particles form 7-segment digits; per-particle spring-to-target with critical damping; active/inactive → spread/centre drift; orientation-aware glyphs; 5 themes |
+| `nebula` | Multi-octave fBm gas field — value noise with 2 parallax layers; star catalogue with twinkle; shock-wave birth events (radial expansion, age-fade); 50–400 stars |
+| `particle_number_morph` | Greedy nearest-neighbour matching + LERP — 9×7 bitmap font expanded to 500 particles; on digit change snapshot/match/lerp with smoothstep (no springs); idle fade to centre; 5 themes |
+| `phoenix` | Two particle systems + FSM — body particles snap to an anchor template (6-phase: PERCH/IGNITE/BLAZE/COLLAPSE/ASH/REBIRTH); free-flight fire physics (buoyancy/shear/drag/cool); spark pool; 4 themes |
+| `plasma` | Analytic plasma — sum of 4 sinusoids at varying spatial/temporal frequencies; aspect-corrected radial term; phase rotates at CYCLE_HZ; palette cycling; 4 frequency presets |
+| `railwaymap` | Procedural transit map — 5 path templates routed on an 8×6 logical grid; canvas cell stores h/v line → junction detection; 12–15 animated trains; perpendicular station naming; 10 themes |
+| `sand_art` | Falling-sand CA with momentum — per-cell vertical velocity; quarter-ellipse curved hourglass cavity; diagonal fall when blocked; auto-flip + time tracking; 4 patterns × 6 themes |
+| `volcano` | Five-layer composition — sky gradient, fBm mountain silhouette, lava flows, fBm plume column, 1024-particle pool (bombs/embers/ash/sparks); 4 eruption patterns; 6 themes |
+| `xrayswarm` | Ray swarm — queen wanders (Brownian); 20 workers per swarm DIVERGE outward, pause, CONVERGE back (homing); 48-slot brightness-fading rays; 3-pass render; 1–5 swarms |
+
+## Animation & Kinematics  (`animation/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `fk_centipede` | Path-following FK body (trail buffer) + sinusoidal stateless FK legs/antennae; contralateral antiphase gait with travelling-wave phase offsets; Reynolds boundary repulsion |
+| `fk_helloworld` | Forward kinematics — given joint angles θ1, θ2, compose rotations to find positions; deterministic hand position; no iterations |
+| `fk_ik_helloworld` | Toggle FK (forward propagation) vs 3-link hybrid IK (2-link analytical + L3 wrist aim); the 2+1 split mirrors real animation rigs |
+| `fk_tentacle_forest` | Stateless FK for fixed-root chains; per-segment cumulative-angle bend with per-strand phase offset + frequency detuning to break lockstep; no trail buffer |
+| `hexpod_tripod` | Interlocking tripod gait (two tripods alternate planted/swinging); 2-joint analytical IK (law of cosines) per leg; knee-side sign flip for left/right splay |
+| `ik_arm_reach` | FABRIK iterative IK (forward/backward passes); Lissajous figure-8 autonomous target (1:2 ratio); reachability check with reach-horizon visualisation |
+| `ik_helloworld` | Analytical 2-link IK via law of cosines; one sqrt + one acos + one atan2; two valid solutions (elbow up/down flip) |
+| `ik_scorpin` | Hybrid — trail-buffer body FK + 2-joint analytical IK legs + per-leg autonomous gait + stateless FK tail with cumulative base curl + sin sway |
+| `ik_spider` | Three systems — path-following FK body (trail buffer), 2-joint IK legs (reachable-annulus clamp), per-leg autonomous gait (max N_LEGS/2 airborne) |
+| `ik_tentacle_seek` | FABRIK with per-joint angle constraints (~63° max bend); backward/forward passes with clamping; Lissajous 1:1.7 target + low-pass velocity smoothing |
+| `ragdoll_figure` | Position-Verlet + distance-constraint projection (Jakobsen, 8 passes); gravity + wind; slanted-platform collisions via position clamp + reflection |
+| `ragdoll_ropes` | Verlet particles + iterative distance constraints; sinusoidal lateral wind with per-rope phase offset (Mexican-wave sway); 6 constraint passes per tick |
+| `snake_forward_kinematics` | Path-following FK (trail-buffer arc-length sampler); sinusoidal auto-steering + Reynolds-style edge-bias soft fence (quadratic falloff) |
+| `snake_inverse_kinematics` | IK goal-seeking head (atan2 + step toward wander target) + path-following FK body; wander target = sum of 3 incommensurable sines + billiard-ball edge bounce |
+
+## Robots  (`robots/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `diff_drive_robot` | Two-step kinematics — inverse: map (v_cmd, ω_cmd) to wheel speeds with accel ramps; forward: integrate body speed v=(vL+vR)/2 and spin ω=(vR−vL)/axle into pose; nonholonomic by construction |
+| `moving_jump_spring_leg_robot` | Three-phase FSM — COMPRESS (spring loads quadratically), RELEASE (energy → upward velocity), FLIGHT (parabolic arc under gravity); terrain-adaptive launch angle; value-noise terrain |
+| `perlin_terrain_bot` | Self-balancing wheel bot — 5-octave fBm terrain + inverted pendulum + PID controller (with slope feed-forward); 4× sub-stepping keeps stiff dynamics stable |
+| `walking_robot` | Procedural sinusoidal gait — SWING uses FK (thigh/knee phase functions), STANCE uses 2-link IK with locked foot contact; alternating legs at π offset |
+
+## Flocking & Emergence  (`flocking/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `crowd` | Reynolds steering forces (seek/flee/separate/align/cohere) with six switchable behaviours (wander/flock/panic/gather/follow/queue) |
+| `flocking` | Five flocking modes across three leader-led flocks: boids, chase, Vicsek (align+noise), orbit formation, predator-prey |
+| `murmuration` | 800 boids + spatial-hash O(N·k) force accumulation; density-field rendering (glyph ramp `.,:;oO*#@`) instead of per-bird; hawk DIVE mechanic |
+| `shepherd` | Strömbom border-collie algorithm — dog positions itself outside outlier sheep relative to pen centre; 5 compound shapes (circle→square→triangle→hexagon→octagon) |
+| `slime_mold` | Jeff Jones (2010) Physarum model — 3-sensor sense→rotate→move→deposit loop; grid diffuse/decay; self-organising Steiner-tree networks |
+| `swarm_gen_numbers` | Reynolds swarm with greedy slot assignment — 120 agents form digits 0–9 via 3×3 slot subdivision; 10 strategies (drift/rush/flow/orbit/flock/pulse/vortex/gravity/spring/wave) |
+| `war` | Two-faction melee+archer battle — 4-state FSM (ADVANCE/COMBAT/FLEE/DEAD); real projectile arrows; 6 strategy presets |
+
+## Algorithms  (`algorithms/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `bsp_tree` | Binary Space Partition tree — axis-alternating midpoint splits, O(log N) balance; O(√N + k) range queries via AABB pruning; ancestor of Doom/Quake rendering |
+| `convex_hull` | Graham scan (polar sort + stack sweep, O(N log N)) and Jarvis march (O(N·h)) raced side-by-side; cross product determines turn direction |
+| `graph_search` | BFS (queue), DFS (stack), A* (priority queue + Euclidean heuristic) on a Fruchterman-Reingold force-directed graph layout |
+| `kd_tree` | K-D tree with alternating-axis splits; single point per node as split plane; O(log N) insert, O(√N + k) range query; bounding-box pruning |
+| `marching_squares` | Marching squares — 4-bit corner classification + 16-case edge-crossing table + interpolation; metaball potential field with aspect correction |
+| `network_sim` | SIR epidemic on a Watts-Strogatz small-world network (K=4 ring, 15% rewiring); R0 threshold; network ring + stacked epidemic curve |
+| `quad_tree_helloworld` | Quadtree fundamentals — INSERT/SUBDIVIDE (NW/NE/SW/SE)/QUERY with AABB pruning; pool allocator (no malloc); phase-machine demo |
+| `quadtree` | Quadtree library — leaf ≤4 points, subdivides into four equal children; AABB pruning → O(log N + k) range queries; half-open intervals avoid midpoint ambiguity |
+| `sort_vis` | Five coroutine-style sorts (one op per frame): Bubble, Insertion, Selection, Quicksort (Lomuto), Heapsort; colour codes compare/swap/sorted |
+| `visibility_polygon` | Angular-sweep visibility polygon — cast 3 rays per endpoint (θ−ε, θ, θ+ε), sort hits by angle, join; ray-segment intersection via cross product; aspect-corrected |
+| `voronoi` | Brute-force Voronoi (O(cells × seeds)/frame); Langevin (Ornstein-Uhlenbeck) seed drift; border detection via distance gap; small N ≤ 30 |
+
 ## Geometry  (`geometry/`)
 
 | Program | Algorithm |
 |---------|-----------|
-| `rect_grid` | Rectangular character grid — per-cell random rate, dual sinusoidal colour waves, 6 themes |
-| `polar_grid` | Polar character grid — concentric rings, alternating rotation, colour by ring, 6 themes |
-| `hex_grid` | Hexagonal character grid — offset-row tiling, cube-coordinate ring distance for colour bands |
-| `grid_proper` | Unified grid explorer — all grid types in a single interactive switcher |
-| `lissajous` | Harmonograph/Lissajous — two damped perpendicular oscillators, phase drift |
-| `spirograph` | Hypotrochoid parametric curves — 3 simultaneous with parameter drift |
-| `string_art` | Modular arithmetic i→⌊i×k⌋ mod N, morphing cardioid/nephroid/astroid |
-| `voronoi` | Brute-force nearest-neighbor, Langevin seed motion, d2−d1 edge detection |
-| `convex_hull` | Graham scan + Jarvis march — simultaneous race |
-| `delaunay_triangulation` | Bowyer-Watson incremental Delaunay — circumcircle insertion, edge flip to fix violations |
-| `kd_tree` | k-d tree — 2D median-split BSP; nearest-neighbour and range-query animated; static pool |
-| `visibility_polygon` | Visibility polygon — radial sweep, endpoint sort, shadow casting from a point light |
-| `quad_tree_helloworld` | Animated quadtree — INSERT phase (random points, live subdivision) → QUERY phase (drifting rectangle, AABB pruning visible); static node pool, depth-coloured borders, scrolling info panel |
-| `quadtree` | Quadtree pure-C demo — 8-step walkthrough: fill root, trigger VERTICAL+HORIZONTAL subdivisions, range query; ANSI-coloured ASCII grid; malloc-based nodes |
-| `bsp_tree` | BSP tree pure-C demo — alternating VERTICAL (!) / HORIZONTAL (=) splits, front/back children, AABB range query with full right-half pruning; 8-step walkthrough |
+| `delaunay_triangulation` | Bowyer-Watson incremental insertion — find bad triangles, trace boundary hole, refill with the new point; empty-circumcircle property; O(N log N) |
+| `lissajous` | Damped Lissajous figures — x=sin(fx·t+φ)·e^(−λt), y=sin(fy·t)·e^(−λt); rational ratios close; phase drifts; 4 brightness levels; 8 named ratio shapes |
+| `maurer_rose` | Discrete-sample rose r=cos(n·θ) at fixed d-degree intervals joined by chords; density buffer with sqrt-scaled brightness tiers; theme palettes; parameter drift near integer presets |
+| `spirograph` | Hypotrochoid parametric curves; float canvas with per-tick fade; three simultaneous curves with slow r drift |
 
-## Mathematical Art  (`artistic/`)
+## Signal Processing  (`signal/`)
 
 | Program | Algorithm |
 |---------|-----------|
-| `epicycles` | DFT epicycles — sorted-by-amplitude arm chain, convergence animation |
-| `fourier_art` | User-drawn path → Fourier reconstruction — draw any shape with cursor keys, arc-length resample to 256 pts, O(N²) DFT, epicycle arm chain replay with auto-add convergence, 5 themes |
-| `fft_vis` | Cooley-Tukey FFT visualiser — bit-reversal permutation, radix-2 butterfly O(N log N), live time-domain + frequency-domain dual panel, twiddle factors W_N^k = exp(−2πik/N), 3-component sine mixer |
-| `cymatics` | Chladni figures — 2D standing wave nodal lines, 20 modes |
-| `plasma` | Demoscene: 4-component sin-sum, palette cycling |
-| `aurora` | Multi-octave sinusoidal curtains, deterministic star hash |
-| `penrose` | de Bruijn pentagrid duality — aperiodic tiling, slow rotation |
-| `terrain` | Diamond-square heightmap — thermal erosion, 7 contour levels |
-| `perlin_landscape` | Perlin fBm — 3 parallax terrain layers, 5-octave noise, painter's algorithm |
-
-## Animation & Kinematics  (`animation/`, `robots/`)
-
-| Program | Algorithm |
-|---------|-----------|
-| `hexpod_tripod` | 6-legged robot — tripod gait (alternating support triangles), 2-joint analytical IK (law of cosines), 4-direction steering with angular interpolation, toroidal wrap |
-| `ik_helloworld` | Hello-world IK — 2-link arm, analytical inverse kinematics via law of cosines, single moveable target, elbow-flip key for the two-solution ambiguity, target clamped to reach disc |
-| `fk_helloworld` | Hello-world FK — 2-link arm driven by joint angles, cumulative-angle forward kinematics, hand position computed as deterministic output |
-| `fk_ik_helloworld` | Hello-world hybrid — 3-link arm with FK and IK modes toggled by 'm'; FK uses cumulative angles; IK uses 2+1 hybrid (2-link analytical IK + last-link aimed at target) |
-| `ik_spider` | IK spider — sinusoidal body locomotion, 2-joint IK per limb, step-trigger gait |
-| `ik_arm_reach` | 2-joint arm — FABRIK IK reach with elbow-side toggle, Lissajous target path |
-| `ik_tentacle_seek` | Seeking tentacles — FABRIK solver on wandering target, per-segment reach tolerance, multiple independent chains |
-| `ragdoll_figure` | Ragdoll stick figure — constraint-projected Verlet joints, momentum carry-over |
-| `ragdoll_ropes` | Multi-rope Verlet chains — damping, phase-offset anchors, iterative constraint relaxation |
-| `snake_forward_kinematics` | FK snake — circular trail-buffer chain, sinusoidal heading, bead rendering, 10 themes |
-| `snake_inverse_kinematics` | FABRIK inverse kinematics snake — iterative forward/backward reach solver |
-| `fk_centipede` | Centipede — trail-buffer FK body, stateless sinusoidal FK legs, contralateral antiphase gait |
-| `fk_tentacle_forest` | Tentacle forest — pure stateless sinusoidal FK; per-tentacle phase/frequency/amplitude parameters |
-| `walking_robot` | Procedural bipedal walk — sinusoidal FK during swing, 2-joint analytical IK during stance, foot contact locking at touchdown; one-phase oscillator drives gait + bob + sway + arm swing; walk_speed COUPLED to walk_freq via `stride_length = 2·(U+L)·sin(SWING_AMP)` so the body crosses the planted foot exactly once per stance; `shin = thigh − knee_bend` (anatomical fold) prevents the "Smooth Criminal" forward lean |
-| `moving_jump_spring_leg_robot` | Spring-leg pogo robot — 3-state FSM (COMPRESS/FLIGHT/LAND) with one tick function per phase; energy-conserving launch `½kx² = ½mv²`; projectile motion under gravity in cells/s²; brief LAND fuse for visual readability; right-edge follow camera over Perlin terrain |
-| `perlin_terrain_bot` | Self-balancing wheel bot — Lagrangian cart-pole on Perlin slope, stabilised by PID with anti-windup clamp + slope feed-forward cascade; sub-stepping (4×) inside each frame keeps the stiff dynamics stable; six gain presets demonstrate distinct PID failure modes; three swappable views (telemetry / equations / phase portrait) |
-
-## Artistic / Biological  (`artistic/`, `matrix_rain/`)
-
-| Program | Algorithm |
-|---------|-----------|
-| `galaxy` | Spiral galaxy — 3000 stars in circular orbits with flat rotation curve (ω = v₀/r); logarithmic spiral arm initialization; brightness accumulator grid with per-frame decay creates natural trails; normalised density → char (`.,:oO0@`); radial colour zones (core/disk/halo); 2–4 arms, 5 themes |
-| `jellyfish` | Physics pulse locomotion — IDLE sink → CONTRACT jet → GLIDE coast → EXPAND bloom; asymmetric bell (width × height axes); tentacle inertia lag |
-| `xrayswarm` | Multi-swarm radial pulse — DIVERGE → PAUSE → CONVERGE; workers park at screen edge, retrace exact origin path; 4-pass rendering prevents trail cancellation |
-| `gear` | Wireframe rotating gear — proximity-based edge detection, tangential surface-velocity sparks, speed-proportional emission, 10 color themes (fire/matrix/plasma/nova/poison/ocean/gold/neon/arctic/lava) |
-| `railwaymap` | Procedural transit map — H/V/Z grid-aligned line templates, canvas-based ACS junction detection, station interchange, 10 themes |
-| `fireworks_rain` | Fireworks with matrix-rain arc trails — each of 72 sparks per explosion grows a 16-slot position-history trail; chars shimmer ~75 % per frame; physical units (cells/sec, cells/sec²); IDLE→RISING→EXPLODED state machine; 5 themes (vivid/matrix/fire/ice/plasma) |
-| `matrix_rain` | Classic digital rain — per-column streams with float head positions for sub-cell smooth motion at any frame rate; per-stream glyph cache rerolls at SHIMMER_HZ; speed scale & density tunable; 4 themes |
-| `matrix_snowflake` | Matrix rain accumulating as snow — streams fall from the top; each glyph that reaches the top of its column's pile freezes there; pile grows up column-by-column with per-column rates; when every column is full the pile flashes bright then clears; 5 themes (Classic/Inferno/Nebula/Toxic/Gold) |
-| `pulsar_rain` | Rotating pulsar neutron star — N-beam (1–16) lighthouse sweep; angular wake cache with pre-computed direction vectors; spin in rotations/sec (physical, stopwatch-verifiable); 5 themes |
-| `sun_rain` | Solar-corona radial rain — 180 evenly-spaced rays radiate outward from a fixed `@` core; per-ray staggered emergence and randomised speed; ASPECT-corrected polar projection so the corona reads as round; 5 themes (solar/green/nova/plasma/fire) |
-| `led_number_morph` | Particle digit morphing — 168 particles form a scaled 7-segment LED display; particles belong permanently to one segment and spring to their targets when the segment is lit, drift to centre when dark; orientation-aware chars ('-' horizontal, '|' vertical) for formed segments; scales with terminal height; 5 themes with per-digit colours; `n` skip, `]`/`[` speed |
-| `particle_number_morph` | Solid filled particle morphing — up to 500 particles densely pack the full interior of a 9×7 bitmap font digit; greedy nearest-neighbour matching routes every particle to its closest target; positions lerp with smoothstep easing (no spring/velocity) for a clean deterministic glide; idle particles glide to centre and vanish; `f`/`F` morph speed, `]`/`[` hold time; 5 themes |
-| `dune_rocket` | Dune-universe rocket launch — particle exhaust trails, `+/-` launch rate, `Space` salvo burst |
-| `dune_sandworm` | Dune sandworm — sinusoidal body locomotion, surface breach animation, `Space` trigger breach, `+/-` speed |
-| `sand_art` | Sands of time — curved quarter-elliptical hourglass with decorative frame; falling-sand CA + per-cell momentum so neck-stream grains visibly accelerate; auto-flip when bulb fully drains (with stall-fallback for stuck grains); time-progress HUD; 4 patterns (NORMAL/RAINBOW/GEOLOGICAL/DUAL_FLOW) × 6 themes incl. NEGATIVE inverted |
-| `bat` | Bat silhouette animation — flapping wing kinematics, Bézier curve body outline, moth-hunt targeting |
-| `bonsai` | Bonsai tree gallery — static still-life rendering of 5 classical styles (CHOKKAN/MOYOGI/SHAKAN/KENGAI/BUNJIN) with recursive procedural skeleton; aspect-corrected foliage clouds; subtle hash-gated wind rustle on leaves; 6 themes (SPRING/SUMMER/AUTUMN/WINTER/CHERRY/SUMI_E inverted ink-painting) |
-| `phoenix` | Perched phoenix self-immolation cycle — 6-phase lifecycle FSM `PERCH (12s) → IGNITE (2s) → BLAZE (3s) → COLLAPSE (2s) → ASH (4s) → REBIRTH (3s)`; owl silhouette painted by ~360 anchor-bound body particles + ~220 free-flight sparks; realistic fire physics (Boussinesq buoyancy + sin/cos shear turbulence + drag + exponential cooling); REBIRTH grows the bird outward from a head-centre seed via per-anchor `alive_at` thresholds; 4 themes (CLASSIC brown / IRIS purple / JADE green / GOLD copper); `s` skip phase, `i` ignite now |
-| `leaf_fall` | Falling leaves — Euler-angle tumbling with aerodynamic torque, ground accumulation |
-| `dna` | DNA double helix — parametric strand animation, base-pair rungs, rotation and colour cycling |
+| `aliasing` | Nyquist/sampling-theorem demo — true frequency sweeps past fs/2, sampled version folds back; fold-back arithmetic; continuous + sampled panels with Bresenham reconstruction |
+| `convolution_helloworld` | 1-D convolution slide-multiply-sum; six kernels (Identity/Box/Gaussian/Edge/Sharpen/Inverse); five inputs; live multiply-and-sum overlay |
+| `dft_helloworld` | Naive O(N²) DFT — double-loop projection onto complex exponentials; spectrum bar chart with auto-sweep or manual frequency; phase + bin-info debug panels |
+| `epicycles` | DFT on 2-D closed curves — coefficients become rotating arms; 20 parametric shapes; sort by amplitude → animate chain; auto-grow toggle |
+| `fft_helloworld` | Cooley-Tukey radix-2 FFT — bit-reversal permutation + log₂N butterfly stages; every frame verifies FFT against the DFT reference (error < 1e-4) |
+| `fft_vis` | FFT visualiser — three panels (waveform / magnitude spectrum / spectrogram waterfall); seven signals; four windows (Rectangular/Hann/Hamming/Blackman) |
+| `fir_filter` | FIR design by recipe — ideal sinc → truncate to K=21 taps → spectral inversion/difference → window taper; low/high/band-pass; linear phase response |
+| `fourier_draw` | Interactive Fourier drawing — trace a path with arrow keys, ENTER → DFT → epicycle chain redraws it; arc-length resampling; theme palettes |
+| `fourier_shapes` | Epicycle chain over 21 preset parametric shapes; Parseval energy bar (cumulative power captured by M arms); tier labels by convergence speed |
+| `idft_helloworld` | Inverse DFT — five modes: round-trip verify, low-pass/high-pass via zeroed bins, magnitude-only, phase-only; shows that phase carries shape |
 
 ## Particle Systems  (`particle_systems/`)
 
 | Program | Algorithm |
 |---------|-----------|
-| `fire` | Fire — 3 switchable algorithms: CA heat diffusion, upward particle splat, plasma sine sum; shared Floyd-Steinberg + LUT pipeline |
-| `smoke` | Smoke — 3 algorithms: CA diffusion, particle Gaussian splat, Perlin-driven curl; shared density→char pipeline |
-| `fireworks` | Fireworks — 3-state rocket FSM (LAUNCH/BURST/FALL); shell burst to N sparks; gravity + drag |
-| `kaboom` | Explosion — deterministic LCG ring expansion, shock-front char ramp, debris scatter |
-| `particles` | General particle sandbox — spawn, gravity, bounce, colour-by-age |
-| `aafire_port` | AAlib fire port — classic fire algorithm adapted for ncurses; bottom-row heat source, upward diffusion, char-density palette |
-| `brust` | Staggered burst waves — multiple expanding rings with phase offset, echo decay |
-| `constellation` | Constellation network — proximity-linked stars, Delaunay-style edge pruning, slow drift |
+| `aafire_port` | aalib cellular automaton — 5-neighbour stencil; gamma + Floyd-Steinberg dithering + perceptual LUT to 9 glyphs; 10 themes + 4 debug overlays |
+| `burst` | Radial bursts with 3-state FSM (IDLE→FLASH→LIVE); wave-staggered fan emission; exponential drag + life-keyed ramp; persistent scorch grid; 10 themes |
+| `comet` | Moving-emitter trails — particles spawn with no inherited velocity; Bresenham fractional emission; impact detonation with radial fan; 3 patterns; data-driven engine |
+| `constellation` | Proximity graph (O(N²) pair scan/frame); bounded random walk (Ornstein-Uhlenbeck); Bresenham line render; pixel/cell split physics; render lerp; 7 themes |
+| `curl_noise_particles` | Particles advected by 2-D curl-noise velocity (∂N/∂y, −∂N/∂x); divergence-free Perlin fBm + finite-difference curl; 4 patterns (CALM/TURBULENT/HURRICANE/WIND_TUNNEL) |
+| `embers` | Heat-rising particles with constant buoyancy; temperature-driven colour ramp; per-tick turbulence in vx; 4 patterns (BONFIRE/FORGE/DRAGON/HEARTH); 10 themes |
+| `fire` | Three switchable algorithms — Doom-CA, Lagrangian particle splat, plasma sine-sum; shared heat grid + gamma Floyd-Steinberg + 9-glyph LUT; 6 tints; wind + fuel control |
+| `fireworks` | Two-phase rocket + burst — LAUNCH (parabolic arc with drag) → BURST (radial sparks, Gaussian speed); explicit Euler; 7-colour palette per rocket; fixed pool |
+| `fountain` | Pool-based two-species (drops + splashes); cone ejection with jitter; constant gravity; 4 patterns (GEYSER/FOUNTAIN/WATERFALL/VOLCANIC); height-based ramp |
+| `kaboom` | Two-layer 3-D explosion — wave layer (scalar field with petal lobes) + blob layer (800 unit-sphere dirs via pinhole camera); closed-form position(t); depth-bucketed glyph; 6 ramps |
+| `particle_engine` | Symplectic Euler + modular force accumulation (gravity/drag); 3 boundary policies (BOUNCE/KILL/WRAP); 4 render modes; preset library (fountain/fireworks/rain/explosion) |
+| `pixel_dissolve` | Bitmap-font particles (5×7 glyphs, one per "on" pixel); 3-phase (ASSEMBLE→HOLD→DISSOLVE); damped harmonic spring; 4 dissolve patterns; horizontal colour gradient |
+| `rain` | Pool-based drops + splashes; motion-blur streak with slope-picked glyph; gravity; splash arcs on impact; 4 patterns (DRIZZLE/SHOWER/STORM/MONSOON); wind control |
+| `sand` | Probabilistic CA (bottom-to-top); two-diagonal slide (~45° repose); wind-drift for unsettled grains; per-grain age encodes compaction; 10 themes |
+| `smoke` | Five physics algorithms — particle puffs, vortex advection, curl-noise advection, buoyancy plume, breeze; semi-Lagrangian backtrace for 1–4; Floyd-Steinberg + 9-glyph LUT; 10 themes |
+| `snow` | Pool-based flakes + 1-D pile-height array; sin-sway per flake; contact detection + valley-fill deposit (neighbours roll down); 3 patterns; 8-step glyph ramp |
+| `sparks` | High-speed particles with elastic floor bounce; motion-blur trail history; 10 patterns incl. SPARKLER (mid-flight splits) and SPINNER (rotating wheel); heat-ramp themes |
+| `vortex` | Polar-coordinate particles (r, θ); inflow + angular momentum (1/r); log-spiral + constant-rotation modes; 10 patterns (WHIRLPOOL/TORNADO/BLACK_HOLE/GALAXY…); tangent trail render |
 
-## Algorithms  (`misc/`)
-
-| Program | Algorithm |
-|---------|-----------|
-| `sort_vis` | 5 sort algorithms — animated bar chart, comparison+swap counters |
-| `maze` | DFS generation + BFS/A* animated solve |
-| `graph_search` | BFS/DFS/A* on grid — animated frontier expansion |
-| `forest_fire` | Drossel-Schwabl CA — 3-state (EMPTY/TREE/FIRE) probabilistic update; neighbour-spread + lightning ignition; ratio p/f controls cluster size and self-organised criticality; 4-way/8-way spread, 4 presets, 5 themes |
-
-## Procedural Worldgen  (`procedural/worldgen/`)
-
-Pure-function world generators — every cell is a deterministic function of (x, y, seed, time). No grid storage; the world is recomputed every frame from a few floats. All files share the standard 8-step ramp + 10 themes; `n`/`p` cycles patterns, `r` reseeds, brightness fBm overlay drifts under most.
-
-| Program | Algorithm |
-|---------|-----------|
-| `procedural_star_field_parallax_noise_showcase` | Procedural infinite star field with depth-cued parallax. 4 layers at speeds {1.0, 0.45, 0.18, 0.06}; per-cell `hash3(world_x, world_y, layer)` decides "is there a star here?"; same hash bits drive glyph, colour, twinkle phase. 4 patterns: STARFIELD / TWINKLE / NEBULA (fBm dust) / WARP (5× speed + streak glyphs) |
-| `procedural_galaxy` | Logarithmic spiral + Perlin noise. `r = a·exp(b·θ)` arms; closed-form density `bulge(r) + disk(r)·arm(r,θ)`; hash gate `h_unit < density·SCALE` places stars; aspect-corrected polar transform; rigid rotation. 4 patterns: SPIRAL / BARRED (with bar term) / ELLIPTICAL / NEBULA (fBm clouds in arm gaps) |
-| `procedural_city` | L-system framing for recursive BSP subdivision. `B → HSplit B B \| VSplit B B \| Lot`; aspect-aware split-axis choice; ±33 % jittered split position. Animated build (depth-tagged step counter ramps up); window-twinkle + 28 directional-arrow cars (`> < ^ v`) drive on the road network after BUILT. 4 patterns: GRID / ORGANIC / DISTRICTS (zoning gradient) / PARKS |
-| `procedural_constellation` | Anchor-star placement (jittered grid) + 4 graph topologies + Bresenham line trace + procedural Latin name. 4 patterns: TREE (Prim's MST) / CHAIN (sort-by-x sequential) / LOOP (polar-sort cycle) / SPOKE (centroid hub). Phase machine: DRAW_STARS → DRAW_EDGES (animated Bresenham) → HOLD (name fades in, underline grows) → FADE → regen |
-| `tectonic` | Plate tectonics. Voronoi-assigned plates (oceanic / continental); relative velocity at each boundary classifies CONVERGENT / DIVERGENT / TRANSFORM; aspect-corrected R=6 distance from boundary modulates elevation; 4-octave fBm adds organic detail; 8-bucket biome binning. 4 patterns: WORLD (biome map with shimmering water + volcanic spark) / PLATES (Voronoi + seed markers) / STRESS (boundary heatmap) / ELEVATION (gradient) |
-| `hydraulic` | Particle-based hydraulic erosion (Beyer 2015 / Lague). Droplets walk fBm heightmap; bilinear gradient steers; carrying capacity `C = max(−Δh·speed·water·K, C_min)`; disc-weighted erosion brush; deposit when oversaturated or going uphill; energetics + evaporation. 4 patterns: TERRAIN / DROPLETS (live water-trail visualisation) / EROSION (cut/fill diff) / SLOPE (gradient + downhill arrows). Phase machine: ERODING → SETTLED → regen |
-| `cloud` | Plane fBm cloud layers — morphology via sampling shape. 4 patterns: CUMULUS (domain-warped fBm) / CIRRUS (high-freq, anisotropic stretched) / STRATUS (low-freq, banded) / STACKED (cirrus + cumulus + stratus rendered in altitude order, with `/` lightning where stratus AND cumulus both exceed STORM_THRESH). Wind drift + per-wave phase shift; no regen cycle |
-
-## Procedural Patterns  (`procedural/patterns/`)
-
-Tile / interference / substitution patterns. Decoupled axes: `n`/`p` cycles **pattern** (the underlying distribution rule), `g`/`G` cycles **glyph set** (the visual character family). Brightness fBm "spotlight" drifts over static tilings. All files use the same bright-half theme palette (per CLAUDE.md "Theme Palette Brightness").
+## Matrix Rain  (`matrix_rain/`)
 
 | Program | Algorithm |
 |---------|-----------|
-| `truchet_tiles` | Per-cell randomly-rotated tile (Truchet 1704) + fBm brightness modulation. 4 patterns (genuinely structural distributions): RANDOM / NOISE (fBm) / BANDS (sin) / VORONOI (jittered seeds). 12 glyph sets across three structural families: 2-orient × 1-cell (diag/lens/brkt/wave), 4-orient × 1-cell (axis/cross/arrow/dots), 2-orient × 2-cell (slope/tri/wcurv/wbrkt). 48 distinct combinations |
-| `wang_tiles` | 16-tile complete set (2 edge colours per axis, all `(N,E,S,W) ∈ {0,1}⁴`); constraint-propagation placement (W edge = left.E, N edge = above.S); 4 placement-bias patterns: RANDOM / NOISE (fBm) / STRIPES (sin-y) / SWIRL (atan2 around centre). 3 glyph sets: EDGES / BLOCKS / MIXED |
-| `quasicrystal` | Plane-wave interference: `I = (1/N)·Σ cos(ω·k̂_m·(x,y) + φ_m(t))` with N waves at θ_m = m·π/N; per-wave phase drift gives morphing animation. 4 patterns by wave count: TRI (3, periodic hex) / PENTA (5, 10-fold quasicrystal) / HEPTA (7, 14-fold) / UNDECA (11, 22-fold). 4 glyph sets: RAMP / PEAKS (positive only) / CONTOUR (zero-crossings) / WAVES (bipolar) |
-| `penrose_tiling` | Robinson-triangle deflation. Acute → 1A + 1B; obtuse → 2B + 1A; each child scaled by 1/φ. 4 seeds: STAR (10 acutes around centre, K=5) / DEEP (K=6) / THIN (single thin rhombus) / THICK (single thick rhombus). 3 glyph sets: EDGES (Bresenham line edges, glyph by direction) / CENTERS (centroid dots) / BOTH. Acute and obtuse render in different ramp slots |
-| `maze_of_maze` | DFS recursive-backtracker carving applied at TWO scales — outer maze + independent inner maze per outer cell. 4 patterns: CLASSIC (6×3 outer × 6×4 inner) / WIDE (4×2 × 10×6) / DENSE (8×4 × 4×3) / EVEN (5×3 × 8×5). 3 glyph sets: LINES / BLOCKS / MIXED. Outer walls A_BOLD + ramp[7]; inner A_NORMAL + ramp[5] with `no_dim` clamp so they stay readable through the brightness drift |
+| `fireworks_rain` | Rockets (IDLE→RISING→EXPLODED FSM) burst into 72 sparks; each spark trails its last 16 head positions in a ring buffer; glyph reroll every frame for shimmer |
+| `matrix_rain` | Per-column streams with float head position advancing by speed·dt; 8-slot glyph cache rerolls each tick; 5-band fade (HOT→BRIGHT→MID→DARK→FADE) |
+| `matrix_snowflake` | Rain streams freeze into a per-column snow pile when the head reaches its top; varied column speeds; pile resets when full; FALL↔FLASH state machine |
+| `pulsar_rain` | N rotating beams (1–16) sweep from an `@` core with an angular wake of rerolled glyphs; radial samples walk outward; dim-first painter prevents overwrites |
+| `sun_rain` | 180 radial rays shoot from an `@` core at random speeds with stagger offsets; trail fades (HOT→5 shades→FADE); rays recycle at the horizon |
+
+## AI  (`Ai/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `genetic_rocket` | Holland GA (1975) — rockets carry a fixed-lifespan genome of 2-D force vectors; fitness = 1/(distance+1) with hit/crash bonuses; fitness-proportional mating + single-point crossover + per-gene mutation |
+| `neural_net_vis` | Feed-forward network layout — layer i at an x-fraction, neuron j at a y-fraction, full connectivity; particles hop edge-by-edge; linear interpolation for line draw; O(L·N²) connections |
+
+## Turtle Graphics  (`turtle/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `duo_poly` | Regular n-gon via turtle — vertices at θ_k = θ₀ + k·(2π/n); DDA line raster; aspect fix (ASPECT=0.5); two turtles cycle 3–12 sides with a 2-second pause |
+
+## ncurses Basics  (`ncurses_basics/`)
+
+| Program | Algorithm |
+|---------|-----------|
+| `aspect_ratio` | Parametric circle x=cx+r·cos θ, y=cy+r·sin θ; X scaled by ASPECT (≈2) to compensate for the 2:1 cell height-to-width ratio |
+| `framework` | Reference template — fixed-step accumulator (sim_accum drains in SIM_TICK_NS steps); alpha-lerp render interpolation; ncurses double-buffer with doupdate diff |
+| `test_framework` | Framework variant with a key generator cycling random ASCII characters; canonical 8-section structure |
+| `tst_lines_cols` | Minimal demo — reads ncurses globals LINES and COLS via `initscr()`; updates on KEY_RESIZE |

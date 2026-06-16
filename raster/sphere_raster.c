@@ -1,457 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * sphere_raster.c — software rasteriser of a smooth-shaded UV sphere
+ * sphere_raster.c — a little planet spinning in coloured ASCII in the terminal.
+ * It builds a sphere out of triangles, draws them one by one, and colours each
+ * cell by brightness through a switchable palette ("theme"). Keys: s = shading
+ * look, t = colour theme, c = show inside faces, +/- = zoom, space = pause.
  *
- * DEMO: A blue UV-tessellated sphere rotates slowly under a single
- *       point light, demonstrating four classic real-time shaders on
- *       the canonical smooth-surface primitive. Cycle 's' through:
- *
- *         phong      Blinn-Phong with a sharp specular highlight.
- *                    The highlight glides across the sphere as it
- *                    spins — proof that smooth normals are working.
- *         toon       4-band quantised diffuse + hard specular.
- *                    Concentric latitudinal rings track the light.
- *         normals    World normal RGB visualisation. The full RGB
- *                    cube wraps once around the sphere — every
- *                    surface direction gets a unique hue.
- *         wireframe  Barycentric edge detection. Reveals the UV grid:
- *                    TESS_U meridians × TESS_V parallels, with the
- *                    iconic pole-fan singularity.
- *
- *       Toggle 'c' to disable back-face culling — the inner surface
- *       becomes visible and you can see triangle winding from below.
- *
- *       Pipeline is identical to cube_raster.c — only §1 config and
- *       §4 tessellation differ. The sphere is the best showcase for
- *       the pipeline because every shader has something distinct to
- *       say about a continuously curved surface.
- *
- * Study alongside:
- *   raster/cube_raster.c     — same pipeline, single mesh primitive
- *   raster/torus_raster.c    — same pipeline, parametric torus
- *   raster/displace_raster.c — same UV sphere, animated displacement
- *
- * Section map:
- *   §1  config       — frame, view, sphere, tessellation, ramp, dither
- *   §2  math         — V3 / V4 / Mat4 helpers
- *   §3  shaders      — VS / FS types + uniforms + 1 base VS + 4 FS
- *   §4  mesh         — UV sphere tessellation (smooth normals + poles)
- *   §5  framebuffer  — zbuf + cbuf + Bourke ramp + Bayer dither + blit
- *   §6  pipeline     — vertex transform → cull → barycentric raster → FS
- *   §7  scene        — Scene struct, uniforms wiring, tick, draw, swap
- *   §8  screen       — ncurses init / resize / HUD / present
- *   §9  app          — main loop, signals, resize, cleanup
- *
- * Keys:
- *   s / S     cycle shader  (phong → toon → normals → wireframe)
- *   c / C     toggle back-face culling
- *   + / =     zoom in
- *   -         zoom out
- *   space     pause / resume rotation
- *   q / ESC   quit
- *
+ * Sister file raster/cube_raster.c is the same renderer on a cube and the best
+ * starting point; the theme-palette idea is borrowed from raymarcher/raymarcher.c.
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raster/sphere_raster.c -o sphere \
- *       -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra raster/sphere_raster.c -o sphere -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Standard forward rasterisation. Tessellate the
- *                  sphere once at init into a static triangle mesh
- *                  with smooth per-vertex normals (= position / R for
- *                  the unit sphere). Each frame transforms vertices
- *                  through MVP, runs back-face culling, walks each
- *                  triangle's bounding box with barycentric weights,
- *                  z-tests, and runs a fragment shader. The sphere's
- *                  smooth normals + barycentric interpolation are
- *                  what produce the continuous Phong highlight.
- *
- *                  UV parameterisation:
- *                    pos = (R·sin φ·cos θ, R·cos φ, R·sin φ·sin θ)
- *                    nrm = pos / R
- *                  φ ∈ [0, π] is latitude (0 = north pole),
- *                  θ ∈ [0, 2π) is longitude.
- *
- * Data-structure : One Mesh = flat arrays of vertices and triangles,
- *                  sized at compile time:
- *                    verts = (TESS_U+1) × (TESS_V+1)
- *                    tris  = TESS_U × TESS_V × 2 (two per quad cell)
- *                  Plus a Framebuffer (zbuf + cbuf) re-allocated on
- *                  each resize. No dynamic state changes per frame
- *                  except rotation matrices.
- *
- * Rendering      : Standard forward pipeline matching cube_raster.c:
- *                    vert shader → near-clip reject → perspective
- *                    divide → screen mapping (with cell-aspect fix)
- *                    → back-face cull → bounding-box raster +
- *                    barycentric interp → frag shader → luma →
- *                    Bayer dither → Bourke ramp glyph + colour pair.
- *
- * Performance    : Tessellation is one-shot at init. Per-frame cost
- *                  is O(N_tris × pixels_per_tri). Smooth normals let
- *                  TESS_U × TESS_V stay modest (36 × 24 = 1728 tris)
- *                  while the surface still looks round — coarse
- *                  tessellation is "hidden" by the smooth shading.
- *
- * References     : Phong, "Illumination for Computer Generated
- *                    Pictures," CACM '75 (the original Phong model).
- *                  Blinn, "Models of Light Reflection for Computer
- *                    Synthesised Pictures," SIGGRAPH '77 (Blinn-Phong).
- *                  Möller, "Fast Triangle Rasterization by
- *                    Interpolating Edge Functions," GPG (2000).
- *                  RTRender 4ed, §16.1 (sphere tessellation
- *                    schemes — UV vs icosphere comparison).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A sphere in the terminal is a CHAIN of transforms ending in luma.
- * Tessellate once into a UV grid, then per frame: every vertex →
- * MVP transform → screen-space coordinates; every triangle → bbox
- * raster with barycentric weights; every covered cell → a fragment
- * shader → an RGB colour → a luma → a Bayer-dithered Bourke glyph.
- * Four shaders demonstrate the pipeline isn't sphere-specific —
- * only §4 changes if you swap the mesh.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Peel a globe into a flat rectangular grid (latitude × longitude),
- * then re-paste it in 3-D using (sin φ cos θ, cos φ, sin φ sin θ).
- * That's the mesh. The camera takes a 3-D photograph, but instead
- * of film the negative is a Z-buffered grid of cells: nearer
- * fragments win, brighter fragments pick a denser glyph, with a
- * bit of ordered noise (Bayer) so smooth gradients don't band.
- * The four shaders are four "exposure recipes" on the same negative.
- *
- *      ┌──────────────────────────────────────────────┐
- *      │  vertex shader        rasteriser             │
- *      │      ▾                     ▾                 │
- *      │  pos → MVP → clip → /w → screen              │
- *      │                            ▾                 │
- *      │  tri  → bbox → bary → z-test → fragment      │
- *      │                                  ▾           │
- *      │  RGB → luma → bayer → bourke glyph + pair    │
- *      └──────────────────────────────────────────────┘
- *
- * DRAWING METHOD  /  ALGORITHM IN STEPS
- * ─────────────────────────────────────
- *  1. scene_tick — angle_x, angle_y += ROT · dt; build
- *       model = Ry · Rx; mvp = proj · view · model;
- *       norm_mat = cofactor(model 3×3).
- *
- *  2. fb_clear — zbuf := FLT_MAX, cbuf := all-zero cells.
- *
- *  3. pipeline_draw_mesh — per triangle:
- *        a. Run vert shader on each of the 3 vertices → VSOut
- *           (clip_pos + world_pos + world_nrm + custom[]).
- *        b. Reject if all 3 clip.w < ε (behind near plane).
- *        c. Perspective divide: sx = (clip.x/w + 1) · cols/2,
- *                              sy = (−clip.y/w + 1) · rows/2,
- *                              sz = clip.z / w.
- *        d. Back-face cull if signed area ≤ 0 (CCW front).
- *        e. Walk integer bbox; per cell compute barycentric (b0,b1,b2);
- *           skip if any negative; z-test against zbuf; on win write z.
- *        f. Build FSIn by interpolating world_pos / world_nrm /
- *           u / v / custom[]; run frag shader → FSOut.
- *        g. luma = 0.2126·R + 0.7152·G + 0.0722·B (Rec. 709).
- *        h. luma_to_cell: bayer dither → Bourke glyph + colour pair.
- *
- *  4. fb_blit — walk cbuf, mvaddch each non-empty cell.
- *
- * KEY FORMULAS
- * ────────────
- *   UV parameterisation
- *     pos = (R · sin φ · cos θ,  R · cos φ,  R · sin φ · sin θ)
- *     φ ∈ [0, π], θ ∈ [0, 2π)
- *   Vertex normal       N = pos / R          (unit sphere shortcut)
- *   Pole degeneracy     if sin φ < 1e-6,  N = (0, ±1, 0) explicitly
- *   Mesh sizes          V = (TESS_U+1) · (TESS_V+1)        = 925
- *                       T = TESS_U · TESS_V · 2            = 1728
- *   Perspective divide  sx = ( ndc.x + 1)/2 · cols
- *                       sy = (−ndc.y + 1)/2 · rows         (Y-flip)
- *   Aspect              cols · CELL_W / (rows · CELL_H)
- *   Phong               diff = max(0, N · L)
- *                       spec = max(0, N · H)^shininess
- *                       out  = ambient + obj·light·diff + 0.5·spec
- *   Toon                banded = ⌊diff · bands⌋ / bands     (bands = 4)
- *   Normal viz          RGB = N · 0.5 + 0.5
- *   Wire edge           edge = min(b0, b1, b2);  discard if > WIRE_THRESH
- *   Luma → glyph        d = clamp01(luma + (bayer − 0.5) · 0.15)
- *                       glyph = k_bourke[(int)(d · (BOURKE_LEN−1))]
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Pole singularity. sin φ = 0 makes the normalised position
- *     degenerate. tessellate_sphere overrides the normal to
- *     (0, ±1, 0) at the poles to avoid divide-by-zero.
- *
- *   • Wireframe relies on custom[0..2] = barycentric coords being
- *     written by the pipeline AFTER the vertex shader runs. If you
- *     swap the order, the wire shader silently sees zeros and
- *     discards everything.
- *
- *   • Cell aspect. CELL_W / CELL_H = 8/16 = 0.5 in the projection
- *     aspect ratio — without it the sphere stretches into an egg.
- *
- *   • Sub-pixel triangles. When |signed area| < 1e-6 the
- *     barycentric helper returns -1s; the triangle silently
- *     disappears. Acceptable at the poles where many tiny tris meet.
- *
- *   • Back-face cull works because no negative scale is applied.
- *     Press 'c' to disable and study the inner-surface winding.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Pause (space). Phong: a single bright highlight over the
- *     upper-right hemisphere (light at (3, 4, 3)).
- *   • Toon: four concentric latitudinal bands tracking the light.
- *   • Normals: smooth RGB across the sphere — +X red, +Y green,
- *     +Z blue. The full RGB cube wraps once.
- *   • Wireframe: ~1728 triangle outlines forming a clean lat/long
- *     grid with the iconic pole-fan singularity.
- *   • Toggle 'c': inner surface becomes visible at the silhouette;
- *     watch how triangles wind from the back side.
- *   • Zoom in to CAM_DIST_MIN = 1.0 — the sphere fills (and exceeds)
- *     the screen; the wireframe is still legible up close.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read raster/cube_raster.c FIRST if you don't yet
- *      know the 7-stage raster pipeline; this file inherits it
- *      directly. Sphere only adds tessellation + smooth normals.
- *   2. §1 config — every constant has a unit-bearing comment.
- *   3. §4 mesh — UV sphere tessellation. Read AFTER tutorials
- *      T2-T4. The pole-singularity workaround in §4 is a classic
- *      gotcha worth understanding.
- *   4. §6 pipeline — same as cube_raster.c. Skim if already familiar.
- *   5. §3 shaders — reuses cube_raster.c's four FS pairs, adapted
- *      for smooth-normal interpolation. Read AFTER T6.
- *   6. §5 / §7 / §8 / §9 — infrastructure; skip on first read.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   Same as cube_raster.c (V3 / V4 / Mat4 / mvp / norm_mat / sx / sy /
- *   b0/b1/b2 / zbuf / cbuf / VSIn / VSOut / FSIn).
- *   Sphere-specific:
- *     TESS_U                   number of longitude segments (meridians)
- *     TESS_V                   number of latitude segments (parallels)
- *     phi  (φ)                 latitude angle ∈ [0, π]; 0 = north pole
- *     theta (θ)                longitude angle ∈ [0, 2π)
- *     ring_idx, slice_idx      grid coordinates in the UV tessellation
- *
- * Background you need
- * ───────────────────
- *   - cube_raster.c's pipeline (read it first if unfamiliar).
- *   - Spherical coordinates: (radius, latitude, longitude) → (x, y, z).
- *   - Why a unit-sphere normal equals its position vector.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Icosphere subdivision (we use simpler UV grid; T5 explains).
- *   - Geodesic / projection distortion (only matters for textures;
- *     this file uses no texture).
- *   - Quaternions for rotation — Euler angles suffice here.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
- *
- * Six short tutorials. Read in order; each builds on the previous.
- *
- *   T1  The shared raster pipeline — reference cube_raster.c
- *   T2  UV-sphere parameterisation — lat/lon → 3-D point
- *   T3  Smooth normals — why N = pos / R for a unit sphere
- *   T4  The pole singularity — sin(0) = 0 problem and the workaround
- *   T5  UV-sphere vs icosphere — why the simpler grid wins here
- *   T6  Same four shaders as cube — what changes with smooth normals
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  THE SHARED RASTER PIPELINE
- * ───────────────────────────────
- * This file implements the SAME 7-stage pipeline as cube_raster.c:
- * vertex shader → perspective divide → screen mapping → back-face
- * cull → bounding-box raster + barycentric → z-test → fragment
- * shader. Read cube_raster.c tutorials T1-T6 for the pipeline; here
- * we focus only on what's SPHERE-specific.
- *
- * What changes between cube and sphere:
- *
- *   §4 mesh tessellation            cube: 24 verts / 12 tris (hand-listed)
- *                                   sphere: 925 verts / 1728 tris
- *                                           (procedurally tessellated)
- *
- *   §3 vertex normals               cube: face-normal duplicated to 4
- *                                         vertices per face → flat shading
- *                                   sphere: each vertex gets its own
- *                                           outward-pointing normal →
- *                                           smooth shading via interpolation
- *
- * Everything else (pipeline, shaders, framebuffer, paint, scene,
- * screen, app) is identical. The same FS function pointers (phong /
- * toon / normals / wire) plug into either mesh without modification.
- *
- * T2  UV-SPHERE PARAMETERISATION — LAT/LON → 3-D POINT
- * ─────────────────────────────────────────────────────
- * A UV sphere is a SPHERICAL-COORDINATES grid:
- *
- *     for ring (latitude)  in 0 .. TESS_V:
- *       φ = π · ring / TESS_V             ∈ [0, π]
- *       for slice (longitude) in 0 .. TESS_U:
- *         θ = 2π · slice / TESS_U          ∈ [0, 2π)
- *         pos.x = R · sin(φ) · cos(θ)
- *         pos.y = R · cos(φ)
- *         pos.z = R · sin(φ) · sin(θ)
- *
- * φ (phi) is LATITUDE measured from the +Y axis (north pole). At
- * φ = 0 we're at the north pole (pos = (0, R, 0)); at φ = π we're
- * at the south pole. cos(φ) sweeps from +1 to -1, giving the y
- * coordinate; sin(φ) is the radius of the latitude circle in the
- * XZ plane.
- *
- * θ (theta) is LONGITUDE around the Y axis. Parameterises the
- * latitude circle: cos(θ) for x, sin(θ) for z.
- *
- * Each (ring, slice) cell of the grid corresponds to a 2-triangle
- * QUAD on the sphere's surface. For TESS_U=36, TESS_V=24:
- *
- *     vertices = (TESS_U+1) · (TESS_V+1) = 37 · 25 = 925
- *     triangles = TESS_U · TESS_V · 2     = 36 · 24 · 2 = 1728
- *
- * The +1 on each grid axis is the SEAM repetition: the slice at
- * θ = 0 is duplicated at θ = 2π so triangles can index it without
- * a modular wrap. Same for the poles.
- *
- * Read §4 tessellate_sphere — the implementation is ~30 lines.
- *
- * T3  SMOOTH NORMALS — WHY N = POS / R FOR A UNIT SPHERE
- * ───────────────────────────────────────────────────────
- * The OUTWARD NORMAL at any point on a sphere centred at origin
- * with radius R is simply the position vector divided by R:
- *
- *     N = pos / R     (which is just `pos` if R = 1)
- *
- * Why: a sphere is the locus of points equidistant from the centre.
- * The surface tangent at any point is perpendicular to the radius
- * vector (which is `pos - centre = pos` for centre at origin).
- * Therefore the outward normal IS the radius direction.
- *
- * For our unit sphere (R = 1):
- *
- *     N = pos                              (unit-length already)
- *
- * Per-vertex smooth normals are what produce the continuous Phong
- * highlight that GLIDES across the sphere as it rotates. Compare to
- * cube_raster.c where each face has 4 vertices with the SAME flat
- * normal — there the highlight has hard edges at every face boundary.
- *
- * Smoothness is INTERPOLATED by the rasteriser. At each pixel inside
- * a triangle:
- *
- *     N_pixel = b0 · N_v0 + b1 · N_v1 + b2 · N_v2
- *
- * (linear interpolation via barycentric weights — see cube_raster.c
- * T5). Because the three vertex normals point slightly differently,
- * the interpolated normal varies smoothly across the triangle —
- * letting the FS produce a continuous gradient.
- *
- * Subtle but important: the interpolated normal isn't unit-length
- * after interpolation. Most FS code re-normalises before lighting:
- *
- *     N = normalize(N_pixel)
- *
- * T4  THE POLE SINGULARITY — SIN(0) = 0 AND THE WORKAROUND
- * ─────────────────────────────────────────────────────────
- * At the poles (φ = 0 or φ = π), sin(φ) = 0. The position formula
- * collapses:
- *
- *     pos.x = R · 0 · cos(θ) = 0
- *     pos.y = R · cos(φ)     = ±R
- *     pos.z = R · 0 · sin(θ) = 0
- *
- * So all TESS_U+1 vertices around the pole map to the same
- * (0, ±R, 0). Geometrically that's correct (the pole is one point).
- * BUT the formula N = pos / R becomes degenerate at the pole if you
- * try to compute it from a non-pole position approaching zero —
- * floating-point rounding can produce undefined directions.
- *
- * Workaround in §4 tessellate_sphere:
- *
- *     if sin(φ) < 1e-6:
- *       N = (0, +1, 0)  if φ ≈ 0  (north pole)
- *       N = (0, -1, 0)  if φ ≈ π  (south pole)
- *     else:
- *       N = pos / R     (the normal formula, well-defined)
- *
- * This explicit override avoids divide-by-near-zero NaN that would
- * propagate through the FS and produce a black hole at the pole.
- *
- * Visually, the wireframe shader makes the singularity OBVIOUS:
- * many tiny triangles fan out from the pole, all sharing the same
- * pole vertex. That's the famous "pole pinch" of UV spheres.
- *
- * T5  UV-SPHERE VS ICOSPHERE — WHY THE SIMPLER GRID WINS HERE
- * ────────────────────────────────────────────────────────────
- * Two ways to tessellate a sphere:
- *
- *   UV-SPHERE        Lat/lon grid. Parametric, easy to compute,
- *                    O(TESS_U · TESS_V) triangles. Suffers from pole
- *                    singularity and uneven triangle sizes (huge
- *                    near equator, tiny near poles).
- *
- *   ICOSPHERE        Subdivide an icosahedron. Uniform triangle
- *                    sizes, no pole singularity, no UV seam. But
- *                    requires recursive subdivision logic and
- *                    indirect indexing.
- *
- * For TEACHING purposes UV-sphere wins:
- *   1. Parametric formula is two lines of code (sin·cos·sin·cos).
- *   2. The pole singularity IS pedagogically interesting — it
- *      teaches about coordinate-system degeneracies.
- *   3. The grid structure makes the wireframe shader produce a
- *      clean lat/lon grid that obviously reads as a sphere.
- *
- * For PRODUCTION (game engines, GPU compute) icosphere is usually
- * preferred because uniform triangles play nicer with most lighting
- * + LOD systems. We're not production; we're learners. UV wins.
- *
- * T6  SAME FOUR SHADERS AS CUBE — WHAT CHANGES WITH SMOOTH NORMALS
- * ────────────────────────────────────────────────────────────────
- * The four FS pairs (phong / toon / normals / wire) are LITERALLY
- * the same code as cube_raster.c. The pipeline is the same too. So
- * what's different on a sphere?
- *
- *   PHONG    Smooth interpolated normals → smooth diffuse gradient
- *            and a SLIDING specular highlight. The highlight glides
- *            across the surface as the sphere rotates — the most
- *            obvious payoff of smooth normals.
- *
- *   TOON     Diffuse banded into 4 levels. Because normals smooth-
- *            interpolate, the bands form CONCENTRIC RINGS centred on
- *            the light direction. (On a cube each face was a single
- *            band; on a sphere each ring corresponds to one band.)
- *
- *   NORMALS  RGB = (N + 1) / 2 visualised. The full RGB cube wraps
- *            once around the sphere — every direction gets a unique
- *            colour. (On a cube, only 6 distinct face colours.)
- *
- *   WIRE     Barycentric edge detection. Reveals the UV grid:
- *            TESS_U meridians × TESS_V parallels, with the iconic
- *            pole fan singularity (T4).
- *
- * Cycle `s` to compare. Press `c` to disable back-face culling and
- * see the inner-surface winding direction.
- *
- * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -466,86 +24,117 @@
 #include <string.h>
 #include <time.h>
 
-/* ── §1 config ───────────────────────────────────────────────────────── */
+/* ── §1 settings — every number you'd tweak, named in one place ── */
 
 enum {
   FPS_TARGET = 60,
-  FPS_UPDATE_MS = 500,
-  HUD_COLS = 80,
+  FPS_UPDATE_MS = 500, /* how often the fps readout refreshes */
+  HUD_COLS = 80,       /* max width of the status string      */
 };
 
+/* §1.1 the camera — how wide a view, and how far back we sit (zoom). */
 #define CAM_FOV (55.0f * 3.14159265f / 180.0f)
 #define CAM_NEAR 0.1f
 #define CAM_FAR 100.0f
-#define CAM_DIST 2.6f      /* default camera Z distance */
-#define CAM_DIST_MIN 1.0f  /* closest zoom              */
-#define CAM_DIST_MAX 8.0f  /* furthest zoom             */
-#define CAM_ZOOM_STEP 0.2f /* distance change per keypress */
+#define CAM_DIST 2.6f      /* starting distance      */
+#define CAM_DIST_MIN 1.0f  /* closest zoom           */
+#define CAM_DIST_MAX 8.0f  /* furthest zoom          */
+#define CAM_ZOOM_STEP 0.2f /* step per +/- keypress  */
 
-/*
- * Sphere radius.
- * 1.0 fills the terminal well at CAM_DIST=2.6 with FOV=55°.
- */
+/* §1.2 the ball's size — 1.0 fills the view nicely at the default zoom. */
 #define SPHERE_R 1.0f
 
-/*
- * Tessellation resolution.
- * TESS_U: longitude slices (around the equator).
- * TESS_V: latitude  stacks (pole to pole).
- *
- * Higher = rounder sphere, more triangles, slower fill.
- * At terminal resolution 36×24 is a good balance:
- *   - 36 slices → ~10° per slice, smooth silhouette
- *   - 24 stacks → ~7.5° per stack, smooth top/bottom caps
- *   - Total triangles: 36*24*2 = 1728
- *
- * Wireframe at this resolution shows clear latitude/longitude lines
- * without being too dense to read.
- */
+/* §1.3 how finely the ball is chopped into triangles, like a globe's grid:
+ * U = lines around (longitude), V = lines pole to pole (latitude). More =
+ * rounder but slower; 36×24 looks smooth without much cost. */
 #define TESS_U 36
 #define TESS_V 24
 
 /*
- * Rotation speeds.
- * Slow X tilt so the poles are visible but the sphere mostly
- * shows its equatorial band — best view for Phong highlight.
+ * The sphere spins under a fixed sun and a fixed camera. A smooth ball looks
+ * identical from every angle, so to make the spin actually visible the surface
+ * carries a little procedural planet (see planet_albedo) whose continents
+ * scroll past as it turns. That — not a moving light — is what reads as a
+ * spinning sphere.
  */
-#define ROT_Y 0.50f /* radians / second */
-#define ROT_X 0.20f
+#define ROT_Y 0.40f /* spin speed around the vertical axis, rad/s */
+#define ROT_X 0.10f /* slight tilt so the poles drift into view   */
 
 /*
- * Wireframe edge threshold.
- * Sphere triangles are smaller than cube faces in screen space,
- * so a slightly larger threshold (0.09) keeps lines visible.
+ * Lighting: one warm sun plus a cool "atmosphere" glow around the rim. The sun
+ * gives a broad day side fading to a dim night side — that terminator sweeping
+ * over the continents is the spin cue — and the rim glow outlines the globe.
  */
-#define WIRE_THRESH 0.09f
+#define SPEC_GAIN 0.35f /* sun glint on the surface                          */
+#define RIM_POWER 2.5f  /* atmosphere thickness (higher = thinner band)      */
+#define RIM_GAIN 0.45f  /* atmosphere brightness                            */
+#define ATMO_R 0.35f    /* atmosphere colour — cool blue                     */
+#define ATMO_G 0.60f
+#define ATMO_B 1.00f
 
-/* Paul Bourke ASCII density ramp — darkest → brightest */
+/* Glass shader look (see frag_glass): clear centre, bright rim, sharp glint. */
+#define GLASS_FRESNEL_POWER 2.5f /* how tight the bright rim is (higher = thinner) */
+#define GLASS_BODY 0.10f         /* faint tint of the see-through centre           */
+#define GLASS_SHININESS 150.0f   /* very tight, glassy glint                       */
+#define GLASS_SPEC_GAIN 0.9f     /* glint brightness                              */
+
+/* Toon shader steps (see frag_toon). */
+#define TOON_SPEC_CUT 0.94f /* N·H above this gets a hard white highlight   */
+#define TOON_SPEC 0.7f      /* that highlight's brightness                  */
+#define TOON_FLOOR 0.12f    /* dimmest band, so the shaded side isn't black */
+
+/* Rasteriser guards (see §6). */
+#define NEAR_CLIP_W 0.001f /* a corner this close behind the eye counts as off-screen */
+#define W_DIVIDE_EPS 1e-6f /* never divide by anything smaller than this              */
+
+/* The characters we draw with, ordered darkest → brightest by how much ink
+ * each one has (Paul Bourke's ramp). */
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define BOURKE_LEN (int)(sizeof k_bourke - 1)
 
-/* Bayer 4×4 ordered dither matrix */
+/* Colour themes. Rather than paint the ball's own colour, we take how bright
+ * each shaded cell came out and look it up in an 8-step colour gradient — so
+ * the whole ball glows in one palette, switchable with 't'. Every step is kept
+ * in the bright half of the palette so even the darkest stays visible on black. */
+#define LUMI_N 8 /* colour pairs 1..8 hold the active theme's gradient */
+typedef struct {
+  const char *name;
+  short ramp[LUMI_N]; /* 256-colour ids, dark → bright */
+} Theme;
+static const Theme THEMES[] = {
+    {"CLASSIC", {235, 238, 241, 244, 247, 250, 253, 255}},
+    {"AMBER  ", {130, 136, 166, 172, 178, 208, 214, 220}},
+    {"MATRIX ", {28, 34, 40, 46, 82, 118, 154, 190}},
+    {"NEON   ", {53, 91, 129, 165, 201, 207, 213, 227}},
+    {"ICE    ", {25, 31, 38, 45, 51, 87, 123, 159}},
+    {"COPPER ", {94, 130, 136, 166, 172, 208, 214, 220}},
+};
+#define THEME_COUNT ((int)(sizeof THEMES / sizeof THEMES[0]))
+#define PAIR_HUD (LUMI_N + 1)  /* 9 : status row — yellow + bold */
+#define PAIR_HINT (LUMI_N + 2) /* 10: key-hint row — cyan + bold */
+
+/* Dither pattern — a tiny repeating grid of brightness nudges that scatters
+ * the line between two characters, so flat areas don't show hard bands. */
 static const float k_bayer[4][4] = {
     {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
     {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
     {3 / 16.f, 11 / 16.f, 1 / 16.f, 9 / 16.f},
     {15 / 16.f, 7 / 16.f, 13 / 16.f, 5 / 16.f},
 };
+#define DITHER_AMP 0.15f /* brightness wobble that hides ramp banding */
+#define BOLD_LUMA 0.85f  /* brighter than this ⇒ draw the cell bold   */
 
-/*
- * CELL_W / CELL_H — terminal cell aspect ratio correction.
- * Passed to m4_perspective as (cols*CELL_W)/(rows*CELL_H).
- * Without this the sphere appears vertically stretched.
- */
+/* A terminal character is taller than it is wide (~8×16 px). We tell the camera
+ * about that so the sphere comes out round instead of squashed. */
 #define CELL_W 8
 #define CELL_H 16
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 
-/* ── §2 math (V3, V4, Mat4) ──────────────────────────────────────────── */
+/* ── §2 math — points, vectors, and 4×4 transforms (all pure helpers) ── */
 
 typedef struct {
   float x, y, z;
@@ -579,9 +168,20 @@ static inline Vec3 v3_norm(Vec3 a) {
 static inline Vec3 v3_reflect(Vec3 d, Vec3 n) {
   return v3_sub(d, v3_scale(n, 2.f * v3_dot(d, n)));
 }
+/* blend three corner values by weights that add up to 1 */
 static inline Vec3 v3_bary(Vec3 a, Vec3 b, Vec3 c, float u, float v, float w) {
   return v3(u * a.x + v * b.x + w * c.x, u * a.y + v * b.y + w * c.y,
             u * a.z + v * b.z + w * c.z);
+}
+/* mix from a to b — t=0 gives a, t=1 gives b */
+static inline Vec3 v3_lerp(Vec3 a, Vec3 b, float t) {
+  return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+}
+/* a soft 0→1 ramp between lo and hi — eases in and out, no hard edge */
+static inline float smoothstep01(float lo, float hi, float x) {
+  float t = (x - lo) / (hi - lo);
+  t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+  return t * t * (3.f - 2.f * t);
 }
 
 static inline Vec4 v4(float x, float y, float z, float w) {
@@ -632,6 +232,7 @@ static Mat4 m4_rotate_x(float a) {
   m.m[2][2] = cosf(a);
   return m;
 }
+/* The camera lens: makes far things look smaller, like a normal 3-D view. */
 static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   Mat4 m = {{{0}}};
   float f = 1.f / tanf(fovy * .5f);
@@ -642,6 +243,8 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   m.m[3][2] = -1.f;
   return m;
 }
+/* Aim an eye at a target: builds the transform that puts the world in front of
+ * it, looking down its line of sight. */
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
   Vec3 r = v3_norm(v3(f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
@@ -664,12 +267,9 @@ static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   return m;
 }
 
-/*
- * m4_normal_mat — cofactor of upper-left 3×3.
- * Correctly transforms normals under non-uniform scale.
- * For a sphere with uniform scale this equals the rotation block,
- * but computing it properly means adding squash/stretch later just works.
- */
+/* The matrix that rotates "which way the surface faces" along with the model.
+ * For our evenly-scaled sphere it's just the rotation, but doing it the proper
+ * way means it'd still be right if we ever squashed or stretched the shape. */
 static Mat4 m4_normal_mat(Mat4 m) {
   Mat4 n = m4_identity();
   n.m[0][0] = m.m[1][1] * m.m[2][2] - m.m[1][2] * m.m[2][1];
@@ -684,14 +284,59 @@ static Mat4 m4_normal_mat(Mat4 m) {
   return n;
 }
 
-/* ── §3 shaders — VS/FS types + uniforms + 1 base VS + 4 FS ──────────── */
+/* For a point on the screen, work out three "blend weights" — one per triangle
+ * corner — saying how much each corner counts there. If any is negative the
+ * point is outside the triangle; otherwise the weights blend the corners. */
+static void barycentric(const float sx[3], const float sy[3], float px,
+                        float py, float b[3]) {
+  float d =
+      (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2]);
+  if (fabsf(d) < 1e-6f) {
+    b[0] = b[1] = b[2] = -1.f;
+    return;
+  }
+  b[0] = ((sy[1] - sy[2]) * (px - sx[2]) + (sx[2] - sx[1]) * (py - sy[2])) / d;
+  b[1] = ((sy[2] - sy[0]) * (px - sx[2]) + (sx[0] - sx[2]) * (py - sy[2])) / d;
+  b[2] = 1.f - b[0] - b[1];
+}
 
+/* True when the point sits inside the triangle (no weight went negative). */
+static bool bary_inside(const float b[3]) {
+  return b[0] >= 0.f && b[1] >= 0.f && b[2] >= 0.f;
+}
+
+/* True when the triangle faces away from us, so we can skip drawing its back.
+ * (Its corners wind the "wrong" way on screen, which shows up as area ≤ 0.) */
+static bool is_back_facing(const float sx[3], const float sy[3]) {
+  float area =
+      (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+  return area <= 0.f;
+}
+
+/* The little box of cells a triangle could touch, clipped to the screen, so the
+ * fill loop only visits cells near the triangle instead of the whole screen. */
+static void triangle_bbox(const float sx[3], const float sy[3], int cols,
+                          int rows, int *x0, int *x1, int *y0, int *y1) {
+  *x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
+  *x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
+  *y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
+  *y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+}
+
+/* ── §3 shaders — work out each surface point's colour ── */
+
+/* VSIn — one mesh vertex entering the vertex stage: where it is, which way the
+ * surface faces there, and its (u,v) spot on the sphere's UV grid. */
 typedef struct {
   Vec3 pos;
   Vec3 normal;
   float u, v;
 } VSIn;
 
+/* VSOut — a vertex after the vertex stage: clip-space position for the
+ * rasteriser, plus world position/normal and (u,v) for the fragment stage.
+ * custom[] is spare per-vertex payload the rasteriser interpolates (the normals
+ * shader stashes the world normal there). */
 typedef struct {
   Vec4 clip_pos;
   Vec3 world_pos;
@@ -700,6 +345,8 @@ typedef struct {
   float custom[4];
 } VSOut;
 
+/* FSIn — the inputs to one fragment (one covered cell): the VSOut fields
+ * blended across the triangle to this pixel, plus its screen position. */
 typedef struct {
   Vec3 world_pos;
   Vec3 world_nrm;
@@ -708,11 +355,15 @@ typedef struct {
   int px, py;
 } FSIn;
 
+/* FSOut — what a fragment shader hands back: a colour, or discard to skip it. */
 typedef struct {
   Vec3 color;
   bool discard;
 } FSOut;
 
+/* ShaderProgram — a paired vertex + fragment shader plus the read-only data
+ * each one reads. The data is void* so a shader can take whatever uniform
+ * struct it wants (phong/normals/glass read Uniforms; toon reads ToonUniforms). */
 typedef void (*VertShaderFn)(const VSIn *in, VSOut *out, const void *uni);
 typedef void (*FragShaderFn)(const FSIn *in, FSOut *out, const void *uni);
 typedef struct {
@@ -724,32 +375,36 @@ typedef struct {
 
 /* ── uniforms ─────────────────────────────────────────────────────── */
 
+/* Uniforms — everything the shaders read for one frame, in three groups: the
+ * transform stack that places the sphere on screen, the single light, and the
+ * surface material. The scene rebuilds these each tick; shaders only read them.
+ * (No separate Light/Material types — each is one or two fields, so they sit
+ * here with the rest of what a shader reads rather than as thin wrappers.) */
 typedef struct {
+  /* transforms + camera — rebuilt every tick by the scene */
   Mat4 model, view, proj, mvp, norm_mat;
-  Vec3 light_pos, light_col, ambient, cam_pos, obj_color;
+  Vec3 cam_pos;
+  /* the one light */
+  Vec3 light_pos, light_col, ambient;
+  /* the surface material */
+  Vec3 obj_color;
   float shininess;
 } Uniforms;
 
+/* ToonUniforms — what the toon shader reads: all of Uniforms plus how many
+ * flat brightness steps to break the shading into. */
 typedef struct {
   Uniforms base;
   int bands;
 } ToonUniforms;
 
-/* ── vertex shaders ──────────────────────────────────────────────── *
+/* ── vertex shaders — place each corner, hand its data downstream ── *
  *
- * All three vertex shaders share the same MVP transform — they only
- * differ in what they pack into out->custom[]. vert_base does the
- * common work; vert_normals + vert_wire wrap it and add their per-
- * shader payload. (vert_wire leaves custom[] at zero; the pipeline
- * overwrites it with barycentric coords AFTER this runs.)
- */
+ * Both do the same placement work (vert_base); they differ only in the extra
+ * payload they stash in custom[] for the rasteriser to blend. */
 
-/* Common transform: MVP for the rasteriser, world pos + world normal
- * for the fragment stage. Reads like its formula:
- *   clip = MVP · (pos, 1)
- *   wpos = model    · pos
- *   wnrm = norm_mat · nrm,   then normalised
- */
+/* Move one corner from the model's own space to where it lands on screen, and
+ * also note its world position and which way it faces — the lighting needs those. */
 static void vert_base(const VSIn *in, VSOut *out, const Uniforms *u) {
   out->clip_pos = m4_mul_v4(u->mvp, v4(in->pos.x, in->pos.y, in->pos.z, 1.f));
   out->world_pos = m4_pt(u->model, in->pos);
@@ -763,9 +418,8 @@ static void vert_default(const VSIn *in, VSOut *out, const void *u_) {
   vert_base(in, out, (const Uniforms *)u_);
 }
 
-/* Same as default, but additionally packs world normal into
- * custom[0..2] so frag_normals can read it without barycentric
- * loss. */
+/* Same, but also tucks the facing direction into custom[] so the normals
+ * shader can read it back per pixel. */
 static void vert_normals(const VSIn *in, VSOut *out, const void *u_) {
   vert_base(in, out, (const Uniforms *)u_);
   out->custom[0] = out->world_nrm.x;
@@ -773,48 +427,63 @@ static void vert_normals(const VSIn *in, VSOut *out, const void *u_) {
   out->custom[2] = out->world_nrm.z;
 }
 
-/* Same as default, custom[] left at zero — the pipeline writes
- * barycentric coordinates into custom[0..2] after this runs. */
-static void vert_wire(const VSIn *in, VSOut *out, const void *u_) {
-  vert_base(in, out, (const Uniforms *)u_);
-}
-
 /* ── fragment shaders ────────────────────────────────────────────── */
 
-/*
- * frag_phong — Blinn-Phong shading with gamma correction.
- *
- * The sphere's smooth normals produce a continuous specular lobe —
- * the highlight glides across the surface as it rotates, which is
- * the classic "shiny ball" look.  At terminal resolution the dither
- * LUT gives the highlight a pleasing grain rather than a hard step.
- */
+/* How lit a surface is, softened: a plain "facing the sun?" test makes the
+ * shaded side go flat, so this keeps a gentle gradient round the back — a broad
+ * day-to-night falloff that still reads on the chunky grid. (Valve's trick.) */
+static float half_lambert(float ndotl) {
+  float wrap = 0.5f * ndotl + 0.5f;
+  return wrap * wrap;
+}
+
+/* The base colour at a point on the surface — a little procedural planet. A few
+ * low-frequency waves carve "continents" (green) out of "ocean" (blue), with
+ * bright ice caps near the poles. It's built from the UV coords, so it turns
+ * with the sphere — that scrolling is what makes a smooth ball read as spinning. */
+static Vec3 planet_albedo(float u, float v) {
+  float lon = u * 6.2831853f; /* longitude, 0..2π around    */
+  float lat = v * 3.1415927f; /* latitude,  0..π pole-to-pole */
+  float f = sinf(lon + 1.7f) * 0.6f + sinf(lon * 2.f + lat * 2.f) * 0.5f +
+            sinf(lon * 3.f - lat + 4.f) * 0.35f + cosf(lat * 3.f) * 0.3f;
+  float land = smoothstep01(0.0f, 0.5f, f);
+  Vec3 col = v3_lerp(v3(0.08f, 0.28f, 0.68f),  /* ocean */
+                     v3(0.32f, 0.52f, 0.20f),  /* land  */
+                     land);
+  float ice = smoothstep01(0.80f, 0.97f, fabsf(v - 0.5f) * 2.f); /* near the poles */
+  return v3_lerp(col, v3(0.92f, 0.95f, 1.0f), ice);
+}
+
+/* The headline look: a sunlit planet. Day/night from one sun (broad wrap
+ * falloff), a soft sun glint, and a cool atmosphere glow at the rim. The
+ * continents come from planet_albedo and scroll as the sphere spins. */
 static void frag_phong(const FSIn *in, FSOut *out, const void *u_) {
   const Uniforms *u = (const Uniforms *)u_;
   Vec3 N = v3_norm(in->world_nrm);
-  Vec3 L = v3_norm(v3_sub(u->light_pos, in->world_pos));
   Vec3 V = v3_norm(v3_sub(u->cam_pos, in->world_pos));
+  Vec3 L = v3_norm(v3_sub(u->light_pos, in->world_pos));
   Vec3 H = v3_norm(v3_add(L, V));
-  float diff = fmaxf(0.f, v3_dot(N, L));
-  float spec = powf(fmaxf(0.f, v3_dot(N, H)), u->shininess);
-  Vec3 c = u->obj_color;
-  float r = u->ambient.x + c.x * u->light_col.x * diff + spec * 0.5f;
-  float g = u->ambient.y + c.y * u->light_col.y * diff + spec * 0.5f;
-  float b = u->ambient.z + c.z * u->light_col.z * diff + spec * 0.5f;
+
+  float day = half_lambert(v3_dot(N, L)); /* broad day → night falloff */
+  float spec = powf(fmaxf(0.f, v3_dot(N, H)), u->shininess) * SPEC_GAIN;
+  float rim = powf(1.f - fmaxf(0.f, v3_dot(N, V)), RIM_POWER) * RIM_GAIN;
+
+  Vec3 base = planet_albedo(in->u, in->v);
+  Vec3 atmo = v3(ATMO_R, ATMO_G, ATMO_B);
+
+  /* ambient + sunlit surface + a sun glint + the atmosphere rim glow */
+  float r = u->ambient.x + base.x * u->light_col.x * day + spec * u->light_col.x + atmo.x * rim;
+  float g = u->ambient.y + base.y * u->light_col.y * day + spec * u->light_col.y + atmo.y * rim;
+  float b = u->ambient.z + base.z * u->light_col.z * day + spec * u->light_col.z + atmo.z * rim;
   out->color.x = powf(fminf(r, 1.f), 1.f / 2.2f);
   out->color.y = powf(fminf(g, 1.f), 1.f / 2.2f);
   out->color.z = powf(fminf(b, 1.f), 1.f / 2.2f);
   out->discard = false;
 }
 
-/*
- * frag_toon — 4-band quantised diffuse + hard specular.
- *
- * On the sphere the bands form horizontal rings that track the
- * light direction — as the sphere rotates the rings sweep across
- * the surface.  More bands = finer steps; fewer = more graphic.
- * 4 bands at terminal resolution looks clean without being too coarse.
- */
+/* Cartoon look: snap the shading into a few flat brightness steps instead of a
+ * smooth fade, so the surface reads as banded rings, plus a hard white spot
+ * where it catches the light. */
 static void frag_toon(const FSIn *in, FSOut *out, const void *u_) {
   const ToonUniforms *tu = (const ToonUniforms *)u_;
   const Uniforms *u = &tu->base;
@@ -824,22 +493,17 @@ static void frag_toon(const FSIn *in, FSOut *out, const void *u_) {
   Vec3 H = v3_norm(v3_add(L, V));
   float diff = fmaxf(0.f, v3_dot(N, L));
   float banded = floorf(diff * (float)tu->bands) / (float)tu->bands;
-  float spec = (v3_dot(N, H) > 0.94f) ? 0.7f : 0.f;
-  Vec3 c = u->obj_color;
-  out->color.x = fminf(c.x * (banded + 0.12f) + spec, 1.f);
-  out->color.y = fminf(c.y * (banded + 0.12f) + spec, 1.f);
-  out->color.z = fminf(c.z * (banded + 0.12f) + spec, 1.f);
+  float spec = (v3_dot(N, H) > TOON_SPEC_CUT) ? TOON_SPEC : 0.f;
+  Vec3 c = planet_albedo(in->u, in->v);
+  out->color.x = fminf(c.x * (banded + TOON_FLOOR) + spec, 1.f);
+  out->color.y = fminf(c.y * (banded + TOON_FLOOR) + spec, 1.f);
+  out->color.z = fminf(c.z * (banded + TOON_FLOOR) + spec, 1.f);
   out->discard = false;
 }
 
-/*
- * frag_normals — world normal [-1,1] → RGB [0,1].
- *
- * The sphere is the ideal showcase for this shader: every surface
- * direction is represented, so the full RGB colour cube appears
- * mapped continuously across the surface.  As the sphere rotates
- * the colours shift smoothly — every orientation has a unique hue.
- */
+/* Debug view: colour each point by which way its surface faces. Good for
+ * eyeballing the geometry. (The §5 theme palette then collapses it to
+ * brightness, so on screen it reads as a gradient rather than full colour.) */
 static void frag_normals(const FSIn *in, FSOut *out, const void *u_) {
   (void)u_;
   Vec3 N = v3_norm(in->world_nrm);
@@ -848,70 +512,77 @@ static void frag_normals(const FSIn *in, FSOut *out, const void *u_) {
 }
 
 /*
- * frag_wire — barycentric edge detection.
+ * frag_glass — a glassy / soap-bubble look.
  *
- * On the sphere wireframe shows the UV latitude/longitude grid —
- * TESS_V horizontal rings and TESS_U vertical meridians.
- * The poles converge to a fan of triangles rather than a clean ring;
- * this is inherent to UV tessellation and is part of the aesthetic.
- * An icosphere would give uniform triangles but no clean lat/lon lines.
+ * Real glass is almost see-through when you look straight into it, but lights
+ * up like a mirror around the rim where your line of sight grazes the surface
+ * (the Fresnel effect). We fake that: a faint tinted body, a bright coloured
+ * rim that flares toward the silhouette, and a tiny sharp glint where it
+ * catches the light head-on. The dark centre with a glowing edge reads as a
+ * hollow glass ball, and the surface pattern drifting under the fixed
+ * catch-light shows the spin.
  */
-static void frag_wire(const FSIn *in, FSOut *out, const void *u_) {
-  (void)u_;
-  float b0 = in->custom[0], b1 = in->custom[1], b2 = in->custom[2];
-  float edge = fminf(b0, fminf(b1, b2));
-  if (edge > WIRE_THRESH) {
-    out->discard = true;
-    return;
-  }
-  float t = edge / WIRE_THRESH;
-  out->color = v3(0.9f - t * 0.3f, 0.9f - t * 0.3f, 0.9f - t * 0.3f);
+static void frag_glass(const FSIn *in, FSOut *out, const void *u_) {
+  const Uniforms *u = (const Uniforms *)u_;
+  Vec3 N = v3_norm(in->world_nrm);
+  Vec3 L = v3_norm(v3_sub(u->light_pos, in->world_pos));
+  Vec3 V = v3_norm(v3_sub(u->cam_pos, in->world_pos));
+  Vec3 H = v3_norm(v3_add(L, V));
+
+  float ndv = fmaxf(0.f, v3_dot(N, V));
+  float fres = powf(1.f - ndv, GLASS_FRESNEL_POWER); /* 0 centre → 1 at the rim */
+  float glint = powf(fmaxf(0.f, v3_dot(N, H)), GLASS_SHININESS) * GLASS_SPEC_GAIN;
+
+  Vec3 c = planet_albedo(in->u, in->v);
+  float edge = GLASS_BODY + fres; /* faint body that flares bright at the rim */
+  float r = u->ambient.x + c.x * edge + glint;
+  float g = u->ambient.y + c.y * edge + glint;
+  float b = u->ambient.z + c.z * edge + glint;
+  out->color.x = powf(fminf(r, 1.f), 1.f / 2.2f);
+  out->color.y = powf(fminf(g, 1.f), 1.f / 2.2f);
+  out->color.z = powf(fminf(b, 1.f), 1.f / 2.2f);
   out->discard = false;
 }
 
-typedef enum { SH_PHONG = 0, SH_TOON, SH_NORMALS, SH_WIRE, SH_COUNT } ShaderIdx;
-static const char *k_shader_names[] = {"phong", "toon", "normals", "wire"};
+typedef enum { SH_PHONG = 0, SH_TOON, SH_NORMALS, SH_GLASS, SH_COUNT } ShaderIdx;
+static const char *k_shader_names[] = {"phong", "toon", "normals", "glass"};
 
-/* ── §4 mesh — UV sphere tessellation ────────────────────────────────── */
+/* ── §4 mesh — build the ball out of triangles (done once at startup) ── */
 
+/* Vertex — one corner of the mesh: position, the way the surface faces there
+ * (its normal), and its (u,v) coordinate on the sphere's UV grid. */
 typedef struct {
   Vec3 pos;
   Vec3 normal;
   float u, v;
 } Vertex;
+/* Triangle — three indices into the vertex list above. */
 typedef struct {
   int v[3];
 } Triangle;
+/* Mesh — a whole shape: a bag of vertices and the triangles joining them. Both
+ * arrays are malloc'd by tessellate_sphere; mesh_free releases them. */
 typedef struct {
   Vertex *verts;
-  int nvert;
+  int nvert; /* how many vertices are filled in */
   Triangle *tris;
-  int ntri;
+  int ntri; /* how many triangles are filled in */
 } Mesh;
 
+/* Frees the two arrays tessellate_sphere allocated and zeroes the struct, so a
+ * leftover pointer can't be reused by mistake. */
 static void mesh_free(Mesh *m) {
   free(m->verts);
   free(m->tris);
   *m = (Mesh){0};
 }
 
-/*
- * tessellate_sphere — generate the UV-sphere mesh.
- *
- * Walks an (nu+1) × (nv+1) UV grid:
- *   φ = (j / nv) · π            // latitude:  0 = north pole, π = south
- *   θ = (i / nu) · 2π           // longitude: 0 .. 2π
- *   pos = (R · sin φ · cos θ,  R · cos φ,  R · sin φ · sin θ)
- *   nrm = pos / R               // unit-sphere shortcut
- *
- * Pole handling: when sin φ ≈ 0 the normalised position is degenerate;
- * we override the normal to (0, ±1, 0) so the poles don't get black
- * bands from divide-by-zero.
- *
- * Triangulation: each quad cell (i, j)..(i+1, j+1) emits two CCW
- * triangles (r0, r2, r1) and (r1, r2, r3). The winding is what
- * "outward = front" depends on for back-face culling.
- */
+/* Build the ball like a globe: walk a grid of latitude rings × longitude lines,
+ * drop a point at each crossing, and stitch each grid square into two triangles.
+ * On a sphere, "which way the surface faces" at a point is just the direction
+ * from the centre out to it — except right at the poles, where that's undefined,
+ * so we set it straight up/down by hand. The corner order (winding) is what lets
+ * back-face culling tell front from back. */
 static Mesh tessellate_sphere(void) {
   int nu = TESS_U;
   int nv = TESS_V;
@@ -928,7 +599,7 @@ static Mesh tessellate_sphere(void) {
   m.nvert = 0;
   m.ntri = 0;
 
-  /* Step 1 — emit (nu+1) × (nv+1) vertices on the parameterised sphere. */
+  /* Step 1 — place a point at every grid crossing. */
   for (int j = 0; j <= nv; j++) {
     float v = (float)j / (float)nv;
     float phi = v * PI; /* latitude  */
@@ -948,9 +619,9 @@ static Mesh tessellate_sphere(void) {
     }
   }
 
-  /* Step 2 — stitch each quad into two CCW triangles.
-   *   r0 = top-left      r1 = top-right
-   *   r2 = bot-left      r3 = bot-right                            */
+  /* Step 2 — stitch each grid square into two triangles.
+   *   r0 = top-left   r1 = top-right
+   *   r2 = bot-left   r3 = bot-right */
   for (int j = 0; j < nv; j++) {
     for (int i = 0; i < nu; i++) {
       int r0 = j * (nu + 1) + i, r1 = r0 + 1;
@@ -963,13 +634,18 @@ static Mesh tessellate_sphere(void) {
   return m;
 }
 
-/* ── §5 framebuffer — zbuf + cbuf + Bourke ramp + dither + blit ──────── */
+/* ── §5 framebuffer — the off-screen image, theme colours, and blit ── */
 
+/* Cell — one finished character on screen: which glyph, which colour pair, and
+ * whether to draw it bold. */
 typedef struct {
   char ch;
   int color_pair;
   bool bold;
 } Cell;
+/* Framebuffer — the off-screen image we build before showing it: a depth value
+ * per cell (zbuf — remembers the nearest surface so closer wins) and the
+ * finished Cell per cell (cbuf). Both are cols×rows, re-allocated on resize. */
 typedef struct {
   float *zbuf;
   Cell *cbuf;
@@ -993,73 +669,50 @@ static void fb_clear(Framebuffer *fb) {
   memset(fb->cbuf, 0, (size_t)(fb->cols * fb->rows) * sizeof(Cell));
 }
 
+/* Point colour pairs 1..8 at the chosen theme's gradient. Called once at start
+ * and again every time 't' switches theme. */
+static void theme_apply(int idx) {
+  if (idx < 0)
+    idx = 0;
+  if (idx >= THEME_COUNT)
+    idx = THEME_COUNT - 1;
+  for (int i = 0; i < LUMI_N; i++) {
+    if (COLORS >= 256)
+      init_pair((short)(i + 1), THEMES[idx].ramp[i], COLOR_BLACK);
+    else /* 8-colour terminals can't theme — fall back to white */
+      init_pair((short)(i + 1), COLOR_WHITE, COLOR_BLACK);
+  }
+}
+
+/* Set up colours once: the two HUD pairs, then the starting theme. On an
+ * 8-colour terminal themes can't show, so theme_apply falls back to white. */
 static void color_init(void) {
   start_color();
+  use_default_colors();
   if (COLORS >= 256) {
-    init_pair(1, 196, COLOR_BLACK);
-    init_pair(2, 208, COLOR_BLACK);
-    init_pair(3, 226, COLOR_BLACK);
-    init_pair(4, 46, COLOR_BLACK);
-    init_pair(5, 51, COLOR_BLACK);
-    init_pair(6, 33, COLOR_BLACK);
-    init_pair(7, 201, COLOR_BLACK);
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
   } else {
-    init_pair(1, COLOR_RED, COLOR_BLACK);
-    init_pair(2, COLOR_RED, COLOR_BLACK);
-    init_pair(3, COLOR_YELLOW, COLOR_BLACK);
-    init_pair(4, COLOR_GREEN, COLOR_BLACK);
-    init_pair(5, COLOR_CYAN, COLOR_BLACK);
-    init_pair(6, COLOR_BLUE, COLOR_BLACK);
-    init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
   }
+  theme_apply(0);
 }
 
-static int hue_to_pair(Vec3 c) {
-  float mx = fmaxf(c.x, fmaxf(c.y, c.z));
-  float mn = fminf(c.x, fminf(c.y, c.z));
-  float chroma = mx - mn;
-  if (chroma < 0.08f)
-    return -1;
-  float h;
-  if (mx == c.x)
-    h = 60.f * fmodf((c.y - c.z) / chroma, 6.f);
-  else if (mx == c.y)
-    h = 60.f * ((c.z - c.x) / chroma + 2.f);
-  else
-    h = 60.f * ((c.x - c.y) / chroma + 4.f);
-  if (h < 0.f)
-    h += 360.f;
-  static const float pal[7] = {0.f, 30.f, 60.f, 120.f, 180.f, 240.f, 300.f};
-  int best = 0;
-  float bd = 1e9f;
-  for (int i = 0; i < 7; i++) {
-    float d = fabsf(h - pal[i]);
-    if (d > 180.f)
-      d = 360.f - d;
-    if (d < bd) {
-      bd = d;
-      best = i;
-    }
-  }
-  return best + 1;
-}
-
-/* rgb_to_cell — GLYPH from luminance (Bayer-dithered Bourke ramp); COLOUR PAIR
- * from the fragment HUE so the normals shader reads as a rainbow, distinct from
- * the material-coloured phong shader. Desaturated fragments (wireframe) fall
- * back to the luma ramp. (Was luma-only, which made normals look like phong.) */
+/* rgb_to_cell — read the shaded cell's BRIGHTNESS and turn it into a glyph
+ * (denser = brighter) plus a band of the active colour theme. Hue is ignored on
+ * purpose: the theme palette, not the material, decides the colour — that's what
+ * gives the whole ball one glowing gradient. A little ordered dither hides the
+ * banding in the smooth falloff. */
 static Cell rgb_to_cell(Vec3 col, int px, int py) {
   float luma = 0.2126f * col.x + 0.7152f * col.y + 0.0722f * col.z;
-  float d = luma + (k_bayer[py & 3][px & 3] - 0.5f) * 0.15f;
+  float d = luma + (k_bayer[py & 3][px & 3] - 0.5f) * DITHER_AMP;
   d = d < 0.f ? 0.f : d > 1.f ? 1.f : d;
-  int idx = (int)(d * (BOURKE_LEN - 1));
-  int cp = hue_to_pair(col);
-  if (cp < 0) {
-    cp = 1 + (int)(d * 6.f);
-    if (cp > 7)
-      cp = 7;
-  }
-  return (Cell){k_bourke[idx], cp, d > 0.6f};
+  int idx = (int)(d * (BOURKE_LEN - 1)); /* glyph */
+  int slot = (int)(d * LUMI_N);          /* theme band 0..7 */
+  if (slot >= LUMI_N)
+    slot = LUMI_N - 1;
+  return (Cell){k_bourke[idx], slot + 1, d > BOLD_LUMA};
 }
 
 static void fb_blit(const Framebuffer *fb) {
@@ -1076,101 +729,97 @@ static void fb_blit(const Framebuffer *fb) {
   }
 }
 
-/* ── §6 pipeline — vertex transform → cull → barycentric raster → FS ─── */
+/* ── §6 the rasteriser — turn triangles into coloured cells ── */
 
-static void barycentric(const float sx[3], const float sy[3], float px,
-                        float py, float b[3]) {
-  float d =
-      (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2]);
-  if (fabsf(d) < 1e-6f) {
-    b[0] = b[1] = b[2] = -1.f;
-    return;
+/* Run the vertex shader on a triangle's three corners → screen + world data. */
+static void run_vertex_stage(const Mesh *mesh, const Triangle *tri,
+                             const ShaderProgram *sh, VSOut vo[3]) {
+  for (int vi = 0; vi < 3; vi++) {
+    const Vertex *vtx = &mesh->verts[tri->v[vi]];
+    VSIn in;
+    in.pos = vtx->pos;
+    in.normal = vtx->normal;
+    in.u = vtx->u;
+    in.v = vtx->v;
+    memset(&vo[vi], 0, sizeof vo[vi]);
+    sh->vert(&in, &vo[vi], sh->vert_uni);
   }
-  b[0] = ((sy[1] - sy[2]) * (px - sx[2]) + (sx[2] - sx[1]) * (py - sy[2])) / d;
-  b[1] = ((sy[2] - sy[0]) * (px - sx[2]) + (sx[0] - sx[2]) * (py - sy[2])) / d;
-  b[2] = 1.f - b[0] - b[1];
 }
 
+/* True if all three corners sit behind the near plane (skip the whole tri). */
+static bool behind_near_plane(const VSOut vo[3]) {
+  return vo[0].clip_pos.w < NEAR_CLIP_W && vo[1].clip_pos.w < NEAR_CLIP_W &&
+         vo[2].clip_pos.w < NEAR_CLIP_W;
+}
+
+/* Turn each corner from camera-math coordinates into actual screen cells
+ * (Y-flipped), keeping a depth value. Dividing by w is what makes far things
+ * look smaller. */
+static void project_to_screen(const VSOut vo[3], float sx[3], float sy[3],
+                              float sz[3], int cols, int rows) {
+  for (int vi = 0; vi < 3; vi++) {
+    float w = vo[vi].clip_pos.w;
+    if (fabsf(w) < W_DIVIDE_EPS)
+      w = W_DIVIDE_EPS;
+    sx[vi] = (vo[vi].clip_pos.x / w + 1.f) * 0.5f * (float)cols;
+    sy[vi] = (-vo[vi].clip_pos.y / w + 1.f) * 0.5f * (float)rows;
+    sz[vi] = vo[vi].clip_pos.z / w;
+  }
+}
+
+/* Blend the three corners' attributes by their weights to get this pixel's
+ * shading inputs. */
+static void fragment_from_bary(const VSOut vo[3], const float b[3], int px,
+                               int py, FSIn *out) {
+  out->world_pos = v3_bary(vo[0].world_pos, vo[1].world_pos, vo[2].world_pos,
+                           b[0], b[1], b[2]);
+  out->world_nrm = v3_norm(v3_bary(vo[0].world_nrm, vo[1].world_nrm,
+                                   vo[2].world_nrm, b[0], b[1], b[2]));
+  out->u = b[0] * vo[0].u + b[1] * vo[1].u + b[2] * vo[2].u;
+  out->v = b[0] * vo[0].v + b[1] * vo[1].v + b[2] * vo[2].v;
+  out->px = px;
+  out->py = py;
+  for (int c = 0; c < 4; c++)
+    out->custom[c] = b[0] * vo[0].custom[c] + b[1] * vo[1].custom[c] +
+                     b[2] * vo[2].custom[c];
+}
+
+/* Draw the whole mesh: push each triangle through the pipeline — place its
+ * corners, drop ones off-screen or facing away, then fill its covered cells
+ * (nearest wins) and shade each one. */
 static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
-                               ShaderProgram *sh, bool is_wire,
-                               bool cull_backface) {
+                               const ShaderProgram *sh, bool cull_backface) {
   int cols = fb->cols, rows = fb->rows;
-  static const float wu[3] = {1.f, 0.f, 0.f};
-  static const float wv[3] = {0.f, 1.f, 0.f};
 
   for (int ti = 0; ti < mesh->ntri; ti++) {
-    const Triangle *tri = &mesh->tris[ti];
     VSOut vo[3];
-
-    for (int vi = 0; vi < 3; vi++) {
-      const Vertex *vtx = &mesh->verts[tri->v[vi]];
-      VSIn in;
-      in.pos = vtx->pos;
-      in.normal = vtx->normal;
-      in.u = is_wire ? wu[vi] : vtx->u;
-      in.v = is_wire ? wv[vi] : vtx->v;
-      memset(&vo[vi], 0, sizeof vo[vi]);
-      sh->vert(&in, &vo[vi], sh->vert_uni);
-      if (is_wire) {
-        vo[vi].custom[0] = wu[vi];
-        vo[vi].custom[1] = wv[vi];
-        vo[vi].custom[2] = 1.f - wu[vi] - wv[vi];
-      }
-    }
-
-    /* near clip reject */
-    if (vo[0].clip_pos.w < 0.001f && vo[1].clip_pos.w < 0.001f &&
-        vo[2].clip_pos.w < 0.001f)
+    run_vertex_stage(mesh, &mesh->tris[ti], sh, vo);
+    if (behind_near_plane(vo))
       continue;
 
-    /* perspective divide → screen */
     float sx[3], sy[3], sz[3];
-    for (int vi = 0; vi < 3; vi++) {
-      float w = vo[vi].clip_pos.w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (vo[vi].clip_pos.x / w + 1.f) * 0.5f * (float)cols;
-      sy[vi] = (-vo[vi].clip_pos.y / w + 1.f) * 0.5f * (float)rows;
-      sz[vi] = vo[vi].clip_pos.z / w;
-    }
-
-    /* back-face cull — skipped when cull_backface is false */
-    float area =
-        (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (cull_backface && area <= 0.f)
+    project_to_screen(vo, sx, sy, sz, cols, rows);
+    if (cull_backface && is_back_facing(sx, sy))
       continue;
 
-    /* bounding box */
-    int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
-    int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
-    int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
-    int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+    int x0, x1, y0, y1;
+    triangle_bbox(sx, sy, cols, rows, &x0, &x1, &y0, &y1);
 
     for (int py = y0; py <= y1; py++) {
       for (int px = x0; px <= x1; px++) {
         float b[3];
         barycentric(sx, sy, px + 0.5f, py + 0.5f, b);
-        if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
+        if (!bary_inside(b))
           continue;
 
         float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
         int idx = py * cols + px;
         if (z >= fb->zbuf[idx])
-          continue;
+          continue; /* something nearer is already here */
         fb->zbuf[idx] = z;
 
         FSIn fsin;
-        fsin.world_pos = v3_bary(vo[0].world_pos, vo[1].world_pos,
-                                 vo[2].world_pos, b[0], b[1], b[2]);
-        fsin.world_nrm = v3_norm(v3_bary(vo[0].world_nrm, vo[1].world_nrm,
-                                         vo[2].world_nrm, b[0], b[1], b[2]));
-        fsin.u = b[0] * vo[0].u + b[1] * vo[1].u + b[2] * vo[2].u;
-        fsin.v = b[0] * vo[0].v + b[1] * vo[1].v + b[2] * vo[2].v;
-        fsin.px = px;
-        fsin.py = py;
-        for (int c = 0; c < 4; c++)
-          fsin.custom[c] = b[0] * vo[0].custom[c] + b[1] * vo[1].custom[c] +
-                           b[2] * vo[2].custom[c];
+        fragment_from_bary(vo, b, px, py, &fsin);
 
         FSOut fsout;
         fsout.discard = false;
@@ -1184,19 +833,44 @@ static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
   }
 }
 
-/* ── §7 scene — Scene struct, uniforms wiring, tick, draw, swap ──────── */
+/* ── §7 scene — what's in the world and how it changes each frame ── */
 
+/* Scene — the whole spinning-sphere world, as a table of contents:
+ *   WHAT  — the sphere mesh.
+ *   HOW (simulation knobs) — spin angles, zoom, pause.
+ *   HOW (render choices)   — which shader, which colour theme, cull on/off.
+ *                            (Kept apart from the sim knobs on purpose: a
+ *                            render toggle isn't a simulation knob just because
+ *                            both ride the keyboard — no catch-all "Controls".)
+ *   DERIVED — the active shader and the uniforms it reads, rebuilt each tick. */
 typedef struct {
-  Mesh mesh;
-  float angle_x, angle_y;
-  float cam_dist; /* current zoom distance — changed by +/- */
-  bool paused;
-  bool cull_backface; /* c toggles — false shows inner surface  */
-  ShaderIdx shade_idx;
-  ShaderProgram shader;
-  Uniforms uni;
-  ToonUniforms toon_uni;
+  Mesh mesh; /* WHAT is shown */
+
+  float angle_x, angle_y; /* spin angles, advanced each tick */
+  float cam_dist;         /* zoom distance — +/-             */
+  bool paused;            /* freezes the spin (space)        */
+
+  ShaderIdx shade_idx;    /* which shader look ('s')         */
+  int theme_idx;          /* which colour theme ('t')        */
+  bool cull_backface;     /* hide inner faces? ('c')         */
+
+  ShaderProgram shader;   /* the active shader (from shade_idx) */
+  Uniforms uni;           /* what that shader reads (rebuilt each tick) */
+  ToonUniforms toon_uni;  /* toon's uniforms (uni + band count) */
 } Scene;
+
+/* Rebuild the combined "model → screen" transform whenever the spin, zoom, or
+ * window size changed. Takes just the uniforms it edits. */
+static void uniforms_update_mvp(Uniforms *u) {
+  u->mvp = m4_mul(u->proj, m4_mul(u->view, u->model));
+}
+
+/* Place the (fixed) camera straight back along +Z at the current zoom. */
+static void scene_set_view(Scene *s) {
+  s->uni.cam_pos = v3(0.f, 0.f, s->cam_dist);
+  s->uni.view = m4_lookat(s->uni.cam_pos, v3(0, 0, 0), v3(0, 1, 0));
+  uniforms_update_mvp(&s->uni);
+}
 
 static void scene_build_shader(Scene *s) {
   switch (s->shade_idx) {
@@ -1211,8 +885,8 @@ static void scene_build_shader(Scene *s) {
   case SH_NORMALS:
     s->shader = (ShaderProgram){vert_normals, frag_normals, &s->uni, &s->uni};
     break;
-  case SH_WIRE:
-    s->shader = (ShaderProgram){vert_wire, frag_wire, &s->uni, &s->uni};
+  case SH_GLASS:
+    s->shader = (ShaderProgram){vert_default, frag_glass, &s->uni, &s->uni};
     break;
   default:
     break;
@@ -1226,47 +900,50 @@ static void scene_init(Scene *s, int cols, int rows) {
   s->cam_dist = CAM_DIST;
   s->cull_backface = true;
 
-  s->uni.light_pos = v3(3.f, 4.f, 3.f);
-  s->uni.light_col = v3(1.f, 1.f, 1.f);
-  s->uni.ambient = v3(0.07f, 0.07f, 0.07f);
-  s->uni.shininess = 80.f; /* higher shininess = tighter highlight */
-  s->uni.cam_pos = v3(0.f, 0.f, s->cam_dist);
-  s->uni.obj_color = v3(0.25f, 0.55f, 0.95f); /* cool blue */
+  s->uni.light_pos = v3(4.f, 3.f, 3.f);       /* the sun — fixed up-and-right */
+  s->uni.light_col = v3(1.0f, 0.96f, 0.86f);  /* warm sunlight */
+  s->uni.ambient = v3(0.05f, 0.06f, 0.10f);   /* faint skylight so the night side isn't pure black */
+  s->uni.shininess = 30.f;                    /* broad, soft sun sheen */
+  s->uni.obj_color = v3(0.25f, 0.55f, 0.95f); /* (lit shaders use planet_albedo instead) */
 
-  s->uni.view = m4_lookat(s->uni.cam_pos, v3(0, 0, 0), v3(0, 1, 0));
+  s->uni.model = m4_identity(); /* a valid pose before the first tick */
+  s->uni.norm_mat = m4_normal_mat(s->uni.model);
+
   float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
   s->uni.proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
+  scene_set_view(s);
 
   scene_build_shader(s);
 }
 
-static void scene_set_zoom(Scene *s) {
-  s->uni.cam_pos = v3(0.f, 0.f, s->cam_dist);
-  s->uni.view = m4_lookat(s->uni.cam_pos, v3(0, 0, 0), v3(0, 1, 0));
-}
+static void scene_set_zoom(Scene *s) { scene_set_view(s); }
 
 static void scene_rebuild_proj(Scene *s, int cols, int rows) {
   float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
   s->uni.proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
+  uniforms_update_mvp(&s->uni); /* proj changed → refresh mvp (works paused too) */
 }
 
+/* The one place the world moves forward each frame: nudge the spin and rebuild
+ * the transforms. `paused` freezes it; key presses change other fields, but
+ * only this advances things over time. */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
+  /* spin the sphere; the camera and light stay put */
   s->angle_y += ROT_Y * dt;
   s->angle_x += ROT_X * dt;
-  Mat4 ry = m4_rotate_y(s->angle_y);
-  Mat4 rx = m4_rotate_x(s->angle_x);
-  s->uni.model = m4_mul(ry, rx);
-  s->uni.mvp = m4_mul(s->uni.proj, m4_mul(s->uni.view, s->uni.model));
+  s->uni.model = m4_mul(m4_rotate_y(s->angle_y), m4_rotate_x(s->angle_x));
   s->uni.norm_mat = m4_normal_mat(s->uni.model);
+  uniforms_update_mvp(&s->uni);
   s->toon_uni.base = s->uni;
 }
 
-static void scene_draw(Scene *s, Framebuffer *fb) {
+/* Paint one frame from the current scene into the framebuffer. Takes the scene
+ * read-only (const) — it draws from the scene but never changes it. */
+static void scene_draw(const Scene *s, Framebuffer *fb) {
   fb_clear(fb);
-  pipeline_draw_mesh(fb, &s->mesh, &s->shader, (s->shade_idx == SH_WIRE),
-                     s->cull_backface);
+  pipeline_draw_mesh(fb, &s->mesh, &s->shader, s->cull_backface);
   fb_blit(fb);
 }
 
@@ -1275,8 +952,10 @@ static void scene_next_shader(Scene *s) {
   scene_build_shader(s);
 }
 
-/* ── §8 screen — ncurses init / resize / HUD / present ────────────────── */
+/* ── §8 screen — set up the terminal, draw the HUD, push the frame ── */
 
+/* Screen — the terminal we draw into: its size in character cells, refreshed
+ * on startup and on resize. */
 typedef struct {
   int cols, rows;
 } Screen;
@@ -1288,7 +967,7 @@ static void screen_init(Screen *s) {
   curs_set(0);
   nodelay(stdscr, TRUE);
   keypad(stdscr, TRUE);
-  typeahead(-1);
+  typeahead(-1); /* don't let pending keypresses interrupt our drawing */
   color_init();
   getmaxyx(stdscr, s->rows, s->cols);
 }
@@ -1296,28 +975,22 @@ static void screen_free(Screen *s) {
   (void)s;
   endwin();
 }
+/* ncurses only picks up the terminal's new size after an endwin()+refresh(). */
 static void screen_resize(Screen *s) {
   endwin();
   refresh();
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* HUD layout (CLAUDE.md spec):
- *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
- *   row rows-1     PAIR_HINT (cyan + bold)   — key hint
- *
- * The 7-pair luma palette uses pair 3 (yellow) and pair 5 (cyan) at
- * the right brightness for HUD text — we alias them as named constants
- * so the HUD code reads "yellow / cyan" instead of "magic 3 / 5". */
-#define PAIR_HUD 3  /* yellow */
-#define PAIR_HINT 5 /* cyan   */
-
+/* Draw the two overlay strips: status across the top, key hints along the
+ * bottom. Colour pairs come from §1. */
 static void screen_draw_hud(const Screen *s, const Scene *sc, double fps) {
   char status[HUD_COLS + 1];
   snprintf(status, sizeof status,
-           " %5.1f fps  shader:%s  zoom:%.1f  cull:%s%s ", fps,
-           k_shader_names[sc->shade_idx], sc->cam_dist,
-           sc->cull_backface ? "on " : "off", sc->paused ? " PAUSED" : "");
+           " %5.1f fps  shader:%s  theme:%s  zoom:%.1f  cull:%s%s ", fps,
+           k_shader_names[sc->shade_idx], THEMES[sc->theme_idx].name,
+           sc->cam_dist, sc->cull_backface ? "on " : "off",
+           sc->paused ? " PAUSED" : "");
   int slen = (int)strlen(status);
   if (slen > s->cols)
     slen = s->cols;
@@ -1328,7 +1001,8 @@ static void screen_draw_hud(const Screen *s, const Scene *sc, double fps) {
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
   attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-  mvprintw(s->rows - 1, 0, " q:quit  spc:pause  s:shader  c:cull  +/-:zoom ");
+  mvprintw(s->rows - 1, 0,
+           " q:quit  spc:pause  s:shader  t:theme  c:cull  +/-:zoom ");
   attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
@@ -1337,8 +1011,11 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §9 app — main loop, signals, resize, cleanup ─────────────────────── */
+/* ── §9 app — wire it all together and run the loop ── */
 
+/* App — the top-level holder the program runs on: the simulated Scene, the
+ * terminal it's shown in, the off-screen Framebuffer, and two flags the signal
+ * handlers poke (quit / window-resized). */
 typedef struct {
   Scene scene;
   Screen screen;
@@ -1347,6 +1024,7 @@ typedef struct {
   volatile sig_atomic_t need_resize;
 } App;
 
+/* Global so the signal handlers (which take no arguments) can reach the flags. */
 static App g_app;
 static void on_exit(int sig) {
   (void)sig;
@@ -1379,6 +1057,14 @@ static bool app_handle_key(App *app, int ch) {
   case 's':
   case 'S':
     scene_next_shader(s);
+    break;
+  case 't':
+    s->theme_idx = (s->theme_idx + 1) % THEME_COUNT;
+    theme_apply(s->theme_idx);
+    break;
+  case 'T':
+    s->theme_idx = (s->theme_idx + THEME_COUNT - 1) % THEME_COUNT;
+    theme_apply(s->theme_idx);
     break;
   case 'c':
   case 'C':
@@ -1436,11 +1122,13 @@ int main(void) {
 
   while (app->running) {
 
+    /* window resized? rebuild the buffers at the new size */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
     }
 
+    /* time since last frame; capped so a long stall can't make the spin jump */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
@@ -1448,6 +1136,7 @@ int main(void) {
       dt = 100 * NS_PER_MS;
     float dt_sec = (float)dt / (float)NS_PER_SEC;
 
+    /* one frame: move the world forward, then draw it */
     scene_tick(&app->scene, dt_sec);
 
     fps_cnt++;
@@ -1458,16 +1147,20 @@ int main(void) {
       fps_acc = 0;
     }
 
+    /* draw the sphere, then the HUD on top */
     erase();
     scene_draw(&app->scene, &app->fb);
     screen_draw_hud(&app->screen, &app->scene, fps_disp);
     screen_present();
 
+    /* handle one key press — these just flip settings, they don't run a frame */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;
 
-    int64_t elapsed = clock_ns() - frame_time + dt;
+    /* nap for the rest of this frame's time budget to hold a steady rate; don't
+     * re-add dt (doing so once ran the loop at about twice the target speed). */
+    int64_t elapsed = clock_ns() - frame_time;
     clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
   }
 

@@ -1,476 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * shadow_mapping.c — software directional-light shadow mapping
+ * shadow_mapping.c — draws a floor, a cube, and a sphere lit by a sun, and
+ * paints the shadows they cast, all in coloured ASCII in the terminal.
+ * Press 's' to drop the shadows and watch every face get full sun even
+ * where something is in the way.
  *
- * DEMO: A square slate floor with one warm sandstone cube and one
- *       cool grey sphere. A directional sun lights from the upper
- *       right. Each object casts a hard shadow (PCF-softened) onto
- *       the floor; where their light-projections overlap the shadows
- *       blend on each other. Camera orbits slowly. Press 's' to
- *       toggle the shadows — without them every lit face gets full
- *       sun even where another object is in the way.
+ * The shadow trick (Williams 1978): first look at the scene from the sun's
+ * side and note how far away the nearest thing is in each direction — that
+ * record is the "shadow map". Then, for each spot the camera sees, if
+ * something was nearer to the sun, that spot must be sitting in shadow.
  *
- * Section map:
- *   §1  config   — frame, view, sun, shadow map, scene, ramp
- *   §2  clock    — monotonic timer + sleep
- *   §3  math     — V3, V4, Mat4, perspective / ortho / lookAt
- *   §4  paint    — 216-pair RGB cube + Bourke ramp + paint_cell
- *   §5  mesh     — Vertex/Triangle/Mesh + quad / box builders
- *   §6  gbuffer  — camera-view geometry pass (pos, normal, albedo, z)
- *   §7  shadow   — light-view depth-only pass (the shadow map)
- *   §8  lightpass — Blinn-Phong + shadow lookup
- *   §9  scene    — Scene struct, init, tick
- *   §10 screen   — render_scene + HUD
- *   §11 app      — signals, resize, main loop
- *
- * Keys:
- *   s / S     toggle shadow on/off
- *   space     pause / resume camera orbit
- *   + / =     zoom in
- *   - / _     zoom out
- *   r / R     reset camera
- *   q / ESC   quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raster/shadow_mapping.c \
- *       -o shadow -lncurses -lm
+ * Builds on the plain triangle renderer in raster/cube_raster.c. Build:
+ *   gcc -std=c11 -O2 -Wall -Wextra raster/shadow_mapping.c -o shadow -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────── *
- *
- * Algorithm     : Shadow mapping (Williams 1978). Two passes per frame:
- *                 (1) render the scene FROM THE LIGHT's POV, writing only
- *                 NDC depth into a 2-D buffer (the shadow map).
- *                 (2) render normally from the camera; for each fragment
- *                 project its world position into the light's clip space,
- *                 look up the shadow map, and compare. If the stored
- *                 depth is smaller than the fragment's, something closer
- *                 to the light was already there → fragment is in shadow.
- *
- * Data          : One 256×256 float buffer = the shadow map.
- *                 Standard G-buffer (pos / normal / albedo / zbuf / valid)
- *                 sized for the terminal.
- *                 Three meshes: floor quad + cube + UV-sphere.
- *
- * Rendering     : Continuous RGB → Reinhard tone-map → 6×6×6 cube + 92-
- *                 char Bourke ramp + Bayer 4×4 dither. Same paint
- *                 pipeline as every other raster file.
- *
- * Performance   : Trivial — a few dozen triangles, sub-millisecond per
- *                 pass.
- *
- * References    : Williams, "Casting Curved Shadows on Curved Surfaces,"
- *                   SIGGRAPH '78.
- *                 Möller, "Fast Triangle Rasterization by Interpolating
- *                   Edge Functions," GPG (2000).
- *                 Reinhard et al., "Photographic Tone Reproduction for
- *                   Digital Images," SIGGRAPH '02.
- *                 LearnOpenGL, "Shadow Mapping" tutorial.
- *
- * ──────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ──────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * "Is point P in shadow of light L?" = "is some surface closer to L
- * than P along the ray P → L?". A depth buffer rendered FROM L records
- * exactly that — the closest surface in every direction the light
- * sees. Render the scene from L once, then every shading fragment
- * just LOOKS UP the answer instead of tracing.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- *
- *      sun ──── ▶
- *                 ┌──┐                    shadow_map[u,v] = depth
- *                 │██│                     of the closest surface
- *           ──────┴──┴─────────  floor     the light sees
- *
- *      For floor fragment F under the cube:
- *        project F into light space → (u, v, z_F)
- *        if shadow_map[u,v] + bias < z_F:
- *          something closer than F is between F and the sun
- *          → F is in shadow
- *
- * ALGORITHM IN STEPS  (per frame)
- * ──────────────────────────────
- *  1. Build  light_view = lookAt(light_eye, origin, +Y)
- *           light_proj = orthographic(±OH, ±OH, near, far)
- *     where light_eye = -SUN_DIR · LIGHT_DISTANCE.
- *  2. SHADOW PASS — for each object, rasterise into the shadow map
- *     using light_proj · light_view · model. Write only NDC depth.
- *  3. G-BUFFER PASS — for each object, rasterise into the main
- *     G-buffer using camera_proj · camera_view · model. Write
- *     world pos, world normal, albedo, NDC depth.
- *  4. LIGHT PASS — per visible pixel:
- *        ambient = AMBIENT · albedo                 always present
- *        project P into light NDC; sample shadow map
- *        shadow = (shadow_map[u,v] + BIAS < light_ndc.z) ? 1 : 0
- *        diffuse  = albedo · sun_col · max(0, N·L)
- *        specular = sun_col · max(0, N·H)^SHININESS · SPEC_GAIN
- *        out      = ambient + (1 − shadow) · (diffuse + specular)
- *
- * KEY FORMULAS
- * ────────────
- *  Light eye:    light_eye = -SUN_DIR · LIGHT_DISTANCE
- *  Light MVP:    L = light_proj · light_view · model
- *  Light NDC:    ndc = (L · v).xyz / (L · v).w
- *  Shadow UV:    u = ( ndc.x + 1)/2 · SHADOW_W
- *                v = (-ndc.y + 1)/2 · SHADOW_H        (Y-flip)
- *  Test:         shadow_map[v][u] + SHADOW_BIAS < ndc.z   → in shadow
- *  Composite:    out = ambient + (1 − shadow) · (diffuse + specular)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Outside the light's frustum → shadow = 0 (lit). Otherwise a
- *    huge halo would form anywhere the ortho frustum doesn't cover.
- *  • Shadow acne — bias too small → flat lit surfaces self-shadow
- *    in a striping pattern. Bias too large → shadows DETACH from
- *    casters (peter-panning). 0.002 NDC works for this scene.
- *  • PCF (3×3 average) softens both shadow EDGES (stair-step → 3-cell
- *    gradient) and per-texel popping during camera movement. The
- *    interior darkness is unchanged — only edges feather.
- *  • Back-face culling is DISABLED on both passes for this scene.
- *    On a closed convex mesh the z-buffer / shadow-map depth-test
- *    already keep the right surface; turning cull off lets reverse-
- *    wound triangles still appear instead of vanishing silently.
- *  • Bayer dither amp 0.04 (not the default 0.10) keeps the floor's
- *    flat luma from forming visible 4-cell wallpaper bands.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Toggle 's': cube + sphere shadows on the floor appear/disappear.
- *  • As the camera orbits, both shadows stay ATTACHED at their casters'
- *    bases (no peter-panning) and have softly feathered edges (PCF).
- *  • The cube's right face (away from sun) and the sphere's lower-
- *    right hemisphere drop to ambient only.
- *  • Where the cube's and sphere's light-projections overlap at certain
- *    sun angles, you should see the same shadow region — no extra
- *    darkening (a single shadow can't go below "fully shadowed" = 1).
- *
- * ──────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ─────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read raster/cube_raster.c first if you don't yet
- *      know the 7-stage forward pipeline; this file runs that
- *      pipeline TWICE per frame, once from the sun and once from
- *      the camera.
- *   2. §1 config — every constant has a unit-bearing comment.
- *   3. §7 shadow_pass + §8 lightpass are THE TWO HEART functions.
- *      Read AFTER tutorials T1-T4. The shadow pass is a stripped-
- *      down rasteriser (depth only, no normal/colour); the light
- *      pass does the per-fragment shadow lookup with PCF.
- *   4. §3 math — projections (perspective + orthographic + lookAt).
- *      Orthographic is unique to this file; T2 explains why.
- *   5. §6 gbuffer — same pattern as the other deferred files.
- *      Read AFTER cube_raster.c if you haven't.
- *   6. §4 paint + §9-§11 — infrastructure; skip on first read.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   light_view / light_proj / light_mvp   matrices for the SUN's
- *                                         camera (pass 1)
- *   shadow_map[v][u]                      flat 2-D float buffer of
- *                                         depths from the sun's POV
- *   light_ndc / light_clip                fragment's position projected
- *                                         into the sun's clip / NDC space
- *   shadow                                ∈ [0, 1]; 0 = unshadowed,
- *                                         1 = fully shadowed
- *   SHADOW_BIAS                           tiny offset added to the
- *                                         comparison threshold to
- *                                         avoid self-shadowing acne
- *   PCF                                   "Percentage-Closer Filtering"
- *                                         — the 3×3 average soft-shadow
- *                                         trick
- *
- * Background you need
- * ───────────────────
- *   - The 7-stage rasteriser (cube_raster.c).
- *   - Orthographic projection: parallel-ray analogue of perspective.
- *     Same final NDC mapping; no perspective divide effect.
- *   - Why a depth buffer (z-buffer) records the closest surface per
- *     pixel.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Variance shadow maps, exponential shadow maps — we use plain
- *     hard-test + PCF, the simplest variant.
- *   - Cascaded shadow maps (sun across an entire game world) — we
- *     have one ortho frustum, scene fits in it.
- *   - Shadow volumes (a different algorithm using stencil buffers).
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ───────────────────────────────────────────────── *
- *
- * Eight short tutorials that build shadow mapping from first
- * principles. Read in order; each builds on the previous.
- *
- *   T1  The shadow-mapping principle — render twice, compare depth
- *   T2  Orthographic projection — why a directional sun uses ortho
- *   T3  Pass 1: depth-only rasterisation from the light's POV
- *   T4  Pass 2: per-fragment shadow lookup
- *   T5  Shadow acne and the bias workaround (Peter-Panning trade)
- *   T6  PCF — 3×3 average for soft shadow edges
- *   T7  Outside-the-frustum and other defensible defaults
- *   T8  Why this scene disables back-face culling
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  THE SHADOW-MAPPING PRINCIPLE — RENDER TWICE, COMPARE DEPTH
- * ───────────────────────────────────────────────────────────────
- * "Is point P in shadow of light L?" is exactly the same question
- * as "is some surface closer to L than P along the ray P → L?"
- * Tracing that ray every frame from every pixel is expensive.
- *
- * Williams (1978) realised: when you render the scene FROM L's
- * point of view, the depth buffer at each light-pixel ALREADY
- * stores the distance to the closest surface in that direction.
- * That's a precomputed answer to the shadow question for every
- * direction the light sees.
- *
- * Algorithm:
- *
- *   1. Render the scene from L's POV. Output: a depth buffer
- *      called the SHADOW MAP.
- *   2. Render the scene from the camera's POV. For each fragment F:
- *      a. Project F's world position INTO the light's clip space.
- *      b. Look up the shadow map at F's (u, v) light-space pixel.
- *      c. Compare the stored depth against F's light-space depth.
- *      d. If the stored depth is SMALLER, something closer to L
- *         was already there → F is in shadow.
- *
- * One render of the scene from L's POV. One depth comparison per
- * fragment in the main render. No rays, no bounce, no recursion.
- *
- * Two passes, two cameras, one comparison. That's the entire
- * algorithm. Everything below is implementation details.
- *
- * T2  ORTHOGRAPHIC PROJECTION — WHY A DIRECTIONAL SUN USES ORTHO
- * ───────────────────────────────────────────────────────────────
- * The camera uses PERSPECTIVE projection — a frustum that narrows
- * toward the eye. Rays from a perspective camera DIVERGE outward.
- *
- * The SUN is treated as DIRECTIONAL — infinitely far away, all rays
- * parallel, no convergence point. The right projection for a
- * directional light is ORTHOGRAPHIC:
- *
- *   PERSPECTIVE   frustum, narrows at eye, divides by w
- *   ORTHOGRAPHIC  rectangular box (no narrowing); after the divide,
- *                 x/w = x because w = 1 throughout
- *
- * Mathematically, the ortho matrix maps a 3-D box [l, r] × [b, t] ×
- * [n, f] into NDC [-1, +1]³ via translate-and-scale only:
- *
- *     m[0][0] =  2 / (r - l)         m[0][3] = -(r + l) / (r - l)
- *     m[1][1] =  2 / (t - b)         m[1][3] = -(t + b) / (t - b)
- *     m[2][2] = -2 / (f - n)         m[2][3] = -(f + n) / (f - n)
- *     m[3][3] =  1
- *
- * Apply it to (x, y, z, 1) and you get clip coords with w = 1
- * (no divide ever does anything). The "depth" stored in the shadow
- * map is just the z component of the result.
- *
- * Geometrically: the light's frustum is a BOX, big enough to
- * contain every shadow-casting object in the scene. The box's
- * cross-section maps to the shadow map's (u, v) grid; the box's
- * length along the light direction is mapped to z and stored.
- *
- * Read §1 LIGHT_ORTHO_HALF + §3 m4_orthographic for the constants
- * and matrix builder.
- *
- * T3  PASS 1: DEPTH-ONLY RASTERISATION FROM THE LIGHT'S POV
- * ─────────────────────────────────────────────────────────
- * The shadow pass is the standard rasteriser STRIPPED DOWN — we
- * write only depth, no colour, no normal:
- *
- *   shadow_pass(scene, light_view, light_proj):
- *     shadow_map[*][*] = +1.0                  (clear to far plane)
- *     for each triangle:
- *       v0, v1, v2 = light_proj · light_view · vertex_world_pos
- *       if all three behind near plane: skip
- *       (sx, sy, sz) = NDC mapping (with Y-flip)
- *       for each cell in triangle's bbox:
- *         compute barycentric (b0, b1, b2)
- *         if any < 0: outside, skip
- *         z = b0·sz0 + b1·sz1 + b2·sz2          (interpolated NDC z)
- *         if z < shadow_map[v][u]:              (closer than current)
- *           shadow_map[v][u] = z
- *
- * No fragment shader, no surface attributes, no lighting. The
- * output is a 2-D buffer of depth values from the light's POV.
- *
- * For our 256² shadow map and a few hundred triangles this pass is
- * sub-millisecond.
- *
- * Read §7 shadow_pass + rasterize_object_shadow.
- *
- * T4  PASS 2: PER-FRAGMENT SHADOW LOOKUP
- * ───────────────────────────────────────
- * The main render goes through the standard pipeline (G-buffer +
- * Blinn-Phong from cube_raster.c et al). The new step is in the
- * lightpass: per fragment, compute "am I in shadow?" and use that
- * to gate the direct lighting.
- *
- * lightpass per pixel:
- *
- *   P     = g_pos[r][c]                       fragment world pos
- *   N     = g_normal[r][c]                    fragment normal
- *   albedo = g_albedo[r][c]
- *
- *   ambient = AMBIENT · albedo                always present
- *
- *   light_clip = light_proj · light_view · (P, 1)
- *   light_ndc  = light_clip / light_clip.w        (≈ light_clip — ortho)
- *
- *   if light_ndc outside [-1, +1]³:
- *     shadow = 0                              not in light's frustum
- *   else:
- *     shadow = PCF_3x3 average over neighbourhood (T6)
- *
- *   diffuse  = albedo · sun_col · max(0, N · L)
- *   specular = sun_col · max(0, N · H)^SHININESS · SPEC_GAIN
- *
- *   direct = (diffuse + specular) · (1 - shadow)
- *
- *   out = ambient + direct
- *
- * Note that ambient is NEVER multiplied by (1 - shadow) — even
- * shadowed fragments still pick up indirect/skylight illumination,
- * just not the sun's direct rays.
- *
- * Read §8 render_lightpass.
- *
- * T5  SHADOW ACNE AND THE BIAS WORKAROUND
- * ────────────────────────────────────────
- * Without bias, a flat surface like the floor casts a shadow ON
- * ITSELF. Why?
- *
- * The shadow map records depth from the light's POV. When we test
- * a floor fragment F, we project F into light space and compare
- * its depth against shadow_map[u][v]. But the shadow map at (u, v)
- * recorded a DIFFERENT FLOOR PIXEL — the one that the light's ray
- * happened to land on at the centre of that texel.
- *
- *   shadow_map[u][v] ≈ floor depth at the texel centre
- *   F's depth        ≈ floor depth at F's exact light-space position
- *
- * For a flat floor these should be identical. With float jitter,
- * SOMETIMES the recorded value is slightly less than F's; SOMETIMES
- * slightly more. The result is striped "shadow acne" — alternating
- * lit/shadow pixels across the floor.
- *
- * The fix: add a SMALL POSITIVE BIAS to the recorded value before
- * comparing:
- *
- *   if stored + BIAS < light_ndc.z:  shadow
- *
- * This shifts the comparison so flat surfaces reliably read NOT
- * shadowed. SHADOW_BIAS = 0.002 is enough for our scene.
- *
- * Trade-off — PETER-PANNING:
- *   too much bias → shadows DETACH from their casters. The cube
- *   appears to FLOAT above its own shadow. Looks wrong. We saw
- *   this at SHADOW_BIAS = 0.008 during phase-2 iteration; 0.002
- *   is the smallest value that hides acne in this scene.
- *
- * T6  PCF — 3×3 AVERAGE FOR SOFT SHADOW EDGES
- * ────────────────────────────────────────────
- * Hard shadow mapping returns 0 or 1 — every fragment is either
- * fully lit or fully shadowed. The shadow EDGE is therefore a
- * stair-step at the shadow-map's resolution.
- *
- * Worse: when the CAMERA moves (orbit, zoom) but the SUN stays
- * fixed, fragments project to slightly different shadow-map cells
- * each frame. The boundary "pops" between texels — a wobble that
- * makes the shadow look detached from its caster even when the
- * geometry is right.
- *
- * Percentage-Closer Filtering (Reeves, Salesin & Cook 1987) softens
- * the edge by averaging multiple shadow tests:
- *
- *   pcf:
- *     hits = 0
- *     for dy ∈ {-1, 0, +1}:
- *       for dx ∈ {-1, 0, +1}:
- *         u' = u + dx;  v' = v + dy
- *         if shadow_map[v'][u'] + BIAS < light_ndc.z: hits++
- *     shadow = hits / 9.0                       ∈ [0, 1] in 1/9 steps
- *
- * Now the edge feathers from 0/9 (lit) through 1/9, 2/9, ..., 8/9
- * to 9/9 (fully shadowed). The transition is 3 shadow-map texels
- * wide — soft enough to read as a real penumbra at terminal scale.
- *
- * INTERIOR shadow darkness is unchanged (every cell of the 3×3
- * block agrees → 9/9). Only the EDGE softens. PCF also smooths
- * the camera-motion popping into a gentler shimmer.
- *
- * Cost: 9 shadow-map reads per fragment instead of 1. Trivial at
- * terminal resolution.
- *
- * T7  OUTSIDE-THE-FRUSTUM AND OTHER DEFENSIBLE DEFAULTS
- * ──────────────────────────────────────────────────────
- * What if a fragment projects to (u, v) OUTSIDE the shadow map?
- *
- *   light_ndc.x or .y outside [-1, +1]   →   off the shadow texture
- *   light_ndc.z outside [-1, +1]         →   beyond the light's near
- *                                            or far plane
- *
- * The wrong default: clamp (u, v) to the edge and use the edge
- * texel. Border texels would create a HUGE BLACK HALO around any
- * fragment behind the light's frustum.
- *
- * The right default: shadow = 0. "If the fragment isn't even in
- * the light's view, the light can't possibly know whether
- * something occludes it — assume not in shadow."
- *
- * This is the usual convention in real shadow-mapping implementations
- * (often via a "border texture" or "outside-clamp = white" mode in
- * the texture sampler). For our software version it's a simple early
- * return:
- *
- *   if light_ndc.x or .y outside [-1, +1]: return 0
- *   if light_ndc.z outside [-1, +1]:       return 0
- *
- * The safest thing the algorithm can do when it doesn't have data.
- *
- * T8  WHY THIS SCENE DISABLES BACK-FACE CULLING
- * ──────────────────────────────────────────────
- * The classic forward rasteriser (cube_raster.c) culls back-facing
- * triangles via signed area test in screen space. After Y-flip, the
- * convention is "keep negative-area triangles, reject non-negative."
- *
- * This file DISABLES that cull on both passes. Why?
- *
- * For a CLOSED CONVEX MESH (cube, sphere) and a properly-wound
- * triangle list, back-face culling is purely an optimisation —
- * back-facing triangles are always occluded by their front-facing
- * counterparts via the z-buffer / shadow-map depth test. Removing
- * the cull does not change the visible image.
- *
- * What removing the cull DOES is make the renderer ROBUST to
- * inverted winding. If a face's triangles are wound the "wrong"
- * way (e.g. by an artist authoring error or a buggy mesh
- * generator), the cull would silently skip them and produce a
- * missing face. With cull off, the depth test still keeps the
- * correct surface — and any winding errors become visually obvious
- * via incorrect lighting (normal pointing into the surface
- * instead of away) rather than as silent gaps.
- *
- * For a teaching / experimentation file this is worth the slight
- * extra rasterisation cost. The shadow pass also has cull
- * disabled for the same reason — if the camera pass and the
- * shadow pass disagreed on which faces to keep, the shadow could
- * be cast from a different surface than the visible one.
- *
- * Production renderers normally KEEP cull on for performance.
- *
- * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -489,14 +31,14 @@
 #include <string.h>
 #include <time.h>
 
-/* ── §1 config ─────────────────────────────────────────────────────── */
+/* ── §1 settings — every number you'd tweak, named in one place ── */
 
 enum {
   FPS_TARGET = 60,
-  HUD_ROWS = 2,
+  HUD_ROWS = 2, /* rows reserved at the bottom for the readout */
 };
 
-/* §1.1 view + camera. */
+/* §1.1 the camera — where we watch from and how wide a view. */
 #define CAM_FOV (50.0f * 3.14159265f / 180.0f)
 #define CAM_NEAR 0.1f
 #define CAM_FAR 100.0f
@@ -506,83 +48,79 @@ enum {
 #define CAM_ZOOM_STEP 0.25f
 #define CAM_HEIGHT 1.6f
 #define CAM_LOOK_Y 0.5f
-#define CAM_ORBIT_RAD_PER_SEC 0.30f
-#define CELL_W 8
-#define CELL_H 16
+#define CELL_W 8  /* a terminal cell is roughly 8 wide × 16 tall in pixels; */
+#define CELL_H 16 /* we account for that so the picture isn't squashed      */
 
-/* §1.2 sun (directional) + ambient. */
-static const float SUN_DIR[3] = {-0.55f, -0.55f, 0.30f}; /* light's
-                                                            travel direction */
-static const float SUN_COL[3] = {0.98f, 0.88f, 0.68f};
-static const float AMBIENT_COL[3] = {0.18f, 0.20f, 0.26f};
-#define SHININESS 24.0f
-#define SPEC_GAIN 0.30f
+/* §1.2 the sun. It sits up and to one side and slowly rocks left-to-right
+ * (like a lazy sundial), so the shadows sweep across the floor on their own
+ * while the camera and floor stay put. It's kept on the camera's side so we
+ * see lit faces, and off to one side so each shadow falls clear of its
+ * object instead of hiding behind it. */
+static const float SUN_DIR[3] = {0.40f, -0.54f, -0.74f}; /* which way its light travels */
+#define LIGHT_ARC_HALF 0.40f          /* how far it rocks each way (radians, ~23°) */
+#define LIGHT_ORBIT_RAD_PER_SEC 0.40f /* how fast it rocks */
+static const float SUN_COL[3] = {0.98f, 0.88f, 0.68f};     /* warm sunlight colour */
+static const float AMBIENT_COL[3] = {0.18f, 0.20f, 0.26f}; /* cool fill so shadows aren't pure black */
+#define SHININESS 24.0f /* bigger = a tighter, smaller shiny highlight */
+#define SPEC_GAIN 0.30f /* how bright that highlight is */
 
-/* §1.3 shadow map.
+/* §1.3 the shadow map — the snapshot of distances taken from the sun's side.
  *
- * The light is treated as orthographic (parallel rays). LIGHT_EYE
- * sits at -SUN_DIR · LIGHT_DISTANCE looking back at the origin.
- * The orthographic frustum is a box of half-extent OH in light's
- * right & up axes, with depth from NEAR to FAR along light's forward.
+ * Since the sun's rays are treated as parallel, we look at the scene through a
+ * straight-sided box (not a cone). LIGHT_ORTHO_HALF is half that box's width;
+ * it has to cover the whole floor, or shadows landing past the edge get cut
+ * off in a hard straight line. DISTANCE/NEAR/FAR just place the box.
  *
- * SHADOW_BIAS in NDC z. With FAR-NEAR ≈ 10, NDC step 0.002 ≈ 0.01
- * world units — enough to defeat acne while keeping shadows attached
- * to the cube's base (no peter-panning). */
+ * The bias numbers are a small fudge so a flat lit surface doesn't shadow
+ * itself (which shows up as ugly stripes). We nudge the compared distance by a
+ * hair — a bit more when the sun grazes at a shallow angle — but cap it, or
+ * shadows start drifting away from the objects that cast them. */
 #define LIGHT_DISTANCE 6.0f
-#define LIGHT_ORTHO_HALF 3.0f
+#define LIGHT_ORTHO_HALF 4.0f
 #define LIGHT_NEAR 0.5f
 #define LIGHT_FAR 11.0f
-#define SHADOW_W 256
-#define SHADOW_H 256
-#define SHADOW_BIAS 0.002f
+#define SHADOW_W 384 /* shadow snapshot size; bigger = crisper shadow edges */
+#define SHADOW_H 384
+#define SHADOW_BIAS 0.0015f      /* base nudge for surfaces facing the sun head-on */
+#define SHADOW_SLOPE_BIAS 0.007f /* extra nudge as the sun grazes at a shallow angle */
+#define SHADOW_BIAS_MAX 0.020f   /* cap, so shadows don't drift off their objects */
 
-/* §1.4 scene geometry — floor + cube + sphere.
- *
- *                  sun ─── ▶ ▼
- *                            │
- *                ┌─┐                ●     ← sphere
- *                │█│  cube
- *                └─┘
- *           ─────────────────────────  floor
- *
- * Both objects sit on the floor (y = 0); their shadows fall away
- * from the sun onto the floor and onto each other where their
- * light-projections overlap. */
+/* §1.4 where things sit. The floor is a flat square at height 0; the cube
+ * and sphere rest on top of it, one to each side. Everything is in world
+ * units (the floor reaches 2.5 out from the centre in each direction). */
 #define FLOOR_HALF_X 2.5f
 #define FLOOR_HALF_Z 2.5f
 
 #define CUBE_HALF 0.55f
 #define CUBE_CX -0.75f
-#define CUBE_CY (CUBE_HALF)
+#define CUBE_CY (CUBE_HALF) /* lifted half its height so its base meets the floor */
 #define CUBE_CZ -0.20f
 
 #define SPHERE_R 0.55f
-#define SPHERE_RINGS 12
+#define SPHERE_RINGS 12 /* how finely the ball is tessellated (more = rounder) */
 #define SPHERE_SEGS 18
 #define SPHERE_CX 0.85f
-#define SPHERE_CY (SPHERE_R)
+#define SPHERE_CY (SPHERE_R) /* lifted by its radius so it rests on the floor */
 #define SPHERE_CZ 0.30f
 
 enum { OBJ_FLOOR = 0, OBJ_CUBE, OBJ_SPHERE, N_OBJECTS };
 
-/* §1.5 G-buffer dims. Static; sized for the largest terminal we expect. */
+/* §1.5 the biggest screen we'll handle — the off-screen buffers below are
+ * sized once to this, so we never reallocate as the window changes. */
 #define GBUF_MAX_W 400
 #define GBUF_MAX_H 200
 
-/* §1.6 ASCII glyph ramp (Paul Bourke 92-char). */
+/* §1.6 the characters we draw with, darkest to brightest — ordered by how
+ * much ink each one has (Paul Bourke's 92-character ramp). */
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
-/* §1.7 Bayer 4×4 dither.
- *
- * DITHER_AMP scales the per-cell luma perturbation. With the 92-char
- * Bourke ramp each step is ~0.011 luma; AMP=0.10 produces a ±5-step
- * swing per cell that becomes visible on large FLAT regions (the
- * floor) as a 4×4 wallpaper pattern. AMP=0.04 keeps the dither
- * subtle on flat areas while still breaking up banding on smooth
- * gradients (cube silhouette + lit-to-shadow transition). */
+/* §1.7 dither — a tiny repeating checkerboard of brightness nudges. Without
+ * it, a big flat area snaps to one character and shows ugly bands; the nudges
+ * scatter the boundary so it reads as a smooth gradient. DITHER_AMP is how
+ * strong the nudge is — kept small so the floor doesn't look like wallpaper. */
 static const float k_bayer[4][4] = {
     {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
     {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
@@ -591,12 +129,22 @@ static const float k_bayer[4][4] = {
 };
 #define DITHER_AMP 0.04f
 
-/* §1.8 ncurses pair IDs. */
-#define PAIR_CUBE_BASE 1 /* + 0..215 = 6×6×6 cube     */
+/* §1.8 colour slots — ncurses refers to each foreground/background pairing
+ * by a number; these reserve the ranges we use. */
+#define PAIR_CUBE_BASE 1 /* slots 1..216 hold the 6×6×6 colour cube */
 #define PAIR_HUD 217
 #define PAIR_HINT 218
+#define CUBE_SIZE 6 /* 6 shades per channel → 6×6×6 = 216 colours */
 
-/* ── §2 clock ──────────────────────────────────────────────────────── */
+/* §1.9 small safety numbers and thresholds, named so the code below reads in
+ * words instead of bare digits. */
+#define CLIP_W_MIN 0.001f   /* a vertex this far behind the eye counts as off-screen */
+#define W_DIVIDE_EPS 1e-6f  /* never divide by anything smaller than this */
+#define NDL_BIAS_FLOOR 0.1f /* floor on the sun-angle term so the bias math can't blow up */
+#define PCF_RADIUS 1        /* shadow softening reaches 1 cell out → a 3×3 block */
+#define BOLD_LUMA 0.85f     /* brighter than this and we draw the cell bold */
+
+/* ── §2 timing — read a steady clock, and sleep for a while ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -612,7 +160,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ── §3 math (V3, V4, Mat4) ────────────────────────────────────────── */
+/* ── §3 math — 3D points, 4×4 transforms, and small geometry helpers ── */
 
 typedef struct {
   float x, y, z;
@@ -636,6 +184,9 @@ static inline Vec3 v3_sub(Vec3 a, Vec3 b) {
 }
 static inline Vec3 v3_scale(Vec3 a, float s) {
   return v3(a.x * s, a.y * s, a.z * s);
+}
+static inline Vec3 v3_mul(Vec3 a, Vec3 b) { /* multiply part-by-part — tint one colour by another */
+  return v3(a.x * b.x, a.y * b.y, a.z * b.z);
 }
 static inline float v3_dot(Vec3 a, Vec3 b) {
   return a.x * b.x + a.y * b.y + a.z * b.z;
@@ -683,9 +234,8 @@ static Vec3 m4_pt(Mat4 m, Vec3 p) {
   return v3(r.x, r.y, r.z);
 }
 
-/* Transform a direction (e.g. surface normal) by the upper 3×3 of m.
- * Correct for orthonormal rotations + uniform scale; for non-uniform
- * scale you'd want the inverse-transpose. We use rotation only. */
+/* Rotate a direction — like "which way a surface faces" — without shifting it.
+ * Safe here because we only ever rotate and scale evenly, never squash. */
 static Vec3 m4_dir(Mat4 m, Vec3 d) {
   return v3(m.m[0][0] * d.x + m.m[0][1] * d.y + m.m[0][2] * d.z,
             m.m[1][0] * d.x + m.m[1][1] * d.y + m.m[1][2] * d.z,
@@ -700,6 +250,7 @@ static Mat4 m4_translate(float x, float y, float z) {
   return m;
 }
 
+/* The camera's lens: makes far things look smaller, like a normal 3D view. */
 static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   float f = 1.f / tanf(fovy * 0.5f);
   Mat4 m = {0};
@@ -711,6 +262,7 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   return m;
 }
 
+/* The sun's "lens": no shrinking with distance, since its rays run parallel. */
 static Mat4 m4_orthographic(float l, float r, float b, float t, float n,
                             float f) {
   Mat4 m = m4_identity();
@@ -723,6 +275,8 @@ static Mat4 m4_orthographic(float l, float r, float b, float t, float n,
   return m;
 }
 
+/* Aim an eye at a target: builds the transform that puts the world in front
+ * of it, looking straight down its gaze. */
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
   Vec3 s = v3_norm(v3_cross(f, up));
@@ -746,13 +300,66 @@ static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
 static inline float clamp01(float x) {
   return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
 }
+static inline int clampi(int x, int lo, int hi) {
+  return x < lo ? lo : (x > hi ? hi : x);
+}
 static inline float reinhard(float x) { return x / (1.f + x); }
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
 
-/* ── §4 paint (216 RGB cube + Bourke ramp) ─────────────────────────── */
+/* For a point on the screen, work out three "blend weights" — one per triangle
+ * corner — saying how much each corner counts at that point. If any comes out
+ * negative the point is outside the triangle; otherwise the weights let us
+ * blend the corners' depth and colour. Used by both passes (§6, §7). */
+static inline void barycentric(float sx[3], float sy[3], float px, float py,
+                               float b[3]) {
+  float d =
+      (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2]);
+  if (fabsf(d) < 1e-9f) {
+    b[0] = b[1] = b[2] = -1.f;
+    return;
+  }
+  b[0] = ((sy[1] - sy[2]) * (px - sx[2]) + (sx[2] - sx[1]) * (py - sy[2])) / d;
+  b[1] = ((sy[2] - sy[0]) * (px - sx[2]) + (sx[0] - sx[2]) * (py - sy[2])) / d;
+  b[2] = 1.f - b[0] - b[1];
+}
+
+/* Turn a triangle's three corners from camera-math coordinates into actual
+ * screen cells, plus a depth value per corner. Dividing by w is what makes
+ * farther points crowd together — i.e. look smaller. w/h is the target size. */
+static void clip_to_screen(const Vec4 clip[3], float sx[3], float sy[3],
+                           float sz[3], int w, int h) {
+  for (int vi = 0; vi < 3; vi++) {
+    float cw = clip[vi].w;
+    if (fabsf(cw) < W_DIVIDE_EPS)
+      cw = W_DIVIDE_EPS;
+    sx[vi] = (clip[vi].x / cw + 1.f) * 0.5f * (float)w;
+    sy[vi] = (-clip[vi].y / cw + 1.f) * 0.5f * (float)h;
+    sz[vi] = clip[vi].z / cw;
+  }
+}
+
+/* The small rectangle of cells a triangle could touch, clipped to the screen,
+ * so we only test cells near the triangle instead of the whole screen. */
+static void triangle_bbox(const float sx[3], const float sy[3], int w, int h,
+                          int *x0, int *x1, int *y0, int *y1) {
+  *x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
+  *x1 = (int)fminf(w - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
+  *y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
+  *y1 = (int)fminf(h - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+}
+
+/* True when the point sits inside the triangle (no weight went negative). */
+static inline bool bary_inside(const float b[3]) {
+  return b[0] >= 0.f && b[1] >= 0.f && b[2] >= 0.f;
+}
+
+/* ── §4 paint — turn a colour into a character + colour on the screen ── */
 
 static int g_256;
 
+/* Set up the colour palette once. Modern terminals give 256 colours, so we map
+ * the 216-colour cube straight in; on an 8-colour terminal we fall back to
+ * plain white text so the demo still runs. */
 static void color_init(void) {
   start_color();
   use_default_colors();
@@ -769,70 +376,82 @@ static void color_init(void) {
   }
 }
 
+/* Squeeze a bright, open-ended colour down into the 0..1 range a screen can
+ * show, then gamma-correct it so the mid-tones look right to the eye. */
+static Vec3 tonemap(Vec3 c) {
+  return v3(gamma_enc(reinhard(c.x)), gamma_enc(reinhard(c.y)),
+            gamma_enc(reinhard(c.z)));
+}
+
+/* How bright a colour looks to us — green counts most, blue least. */
+static float rec709_luma(Vec3 c) {
+  return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
+
+/* Snap a colour to the nearest of the 216 terminal colours (6 shades each of
+ * red, green, blue) and return its slot number, 0..215. */
+static int rgb_to_cube6(float r, float g, float b) {
+  int r5 = clampi((int)(r * (CUBE_SIZE - 1) + 0.5f), 0, CUBE_SIZE - 1);
+  int g5 = clampi((int)(g * (CUBE_SIZE - 1) + 0.5f), 0, CUBE_SIZE - 1);
+  int b5 = clampi((int)(b * (CUBE_SIZE - 1) + 0.5f), 0, CUBE_SIZE - 1);
+  return r5 * (CUBE_SIZE * CUBE_SIZE) + g5 * CUBE_SIZE + b5;
+}
+
+/* Pick which character to draw: brighter spots get a denser-looking glyph. */
+static int ramp_index(float luma) {
+  return clampi((int)(luma * (BOURKE_LEN - 1) + 0.5f), 0, BOURKE_LEN - 1);
+}
+
+/* Draw one cell: its character comes from how bright the colour is, its colour
+ * from the colour itself. */
 static void paint_cell(int sx, int sy, Vec3 col) {
-  float r = gamma_enc(reinhard(col.x));
-  float g = gamma_enc(reinhard(col.y));
-  float b = gamma_enc(reinhard(col.z));
+  Vec3 disp = tonemap(col); /* make the colour screen-ready */
 
-  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  float luma = rec709_luma(disp);
   float dith = (k_bayer[sy & 3][sx & 3] - 0.5f) * DITHER_AMP;
-  float lum_d = clamp01(luma + dith);
+  float lum_d = clamp01(luma + dith); /* nudge to avoid flat bands */
 
-  int pair;
-  if (g_256) {
-    int r5 = (int)(r * 5.f + 0.5f);
-    if (r5 > 5)
-      r5 = 5;
-    if (r5 < 0)
-      r5 = 0;
-    int g5 = (int)(g * 5.f + 0.5f);
-    if (g5 > 5)
-      g5 = 5;
-    if (g5 < 0)
-      g5 = 0;
-    int b5 = (int)(b * 5.f + 0.5f);
-    if (b5 > 5)
-      b5 = 5;
-    if (b5 < 0)
-      b5 = 0;
-    pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
-  } else {
-    pair = PAIR_CUBE_BASE;
-  }
+  int pair = g_256 ? PAIR_CUBE_BASE + rgb_to_cube6(disp.x, disp.y, disp.z)
+                   : PAIR_CUBE_BASE;
+  int glyph = ramp_index(lum_d);
 
-  int idx = (int)(lum_d * (BOURKE_LEN - 1) + 0.5f);
-  if (idx < 0)
-    idx = 0;
-  if (idx >= BOURKE_LEN)
-    idx = BOURKE_LEN - 1;
-
-  int attr = (luma > 0.85f) ? A_BOLD : A_NORMAL;
+  int attr = (luma > BOLD_LUMA) ? A_BOLD : A_NORMAL;
   attron(COLOR_PAIR(pair) | attr);
-  mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[idx]);
+  mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[glyph]);
   attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* ── §5 mesh ───────────────────────────────────────────────────────── */
+/* ── §5 shapes — build the floor, cube, and sphere out of triangles ── */
 
+/* One corner point of a shape: where it is, and which way the surface faces
+ * there (its "normal" — we use that to work out how much light it catches). */
 typedef struct {
   Vec3 pos;
   Vec3 normal;
 } Vertex;
+
+/* One triangle, given as three positions in the vertex list above. */
 typedef struct {
   int v[3];
 } Triangle;
+
+/* A whole shape: a bag of corner points and the triangles that join them. The
+ * two arrays are malloc'd by the mesh_* builders below; mesh_free releases them. */
 typedef struct {
   Vertex *verts;
   Triangle *tris;
-  int nvert, ntri;
+  int nvert, ntri; /* how many of each are actually filled in */
 } Mesh;
 
+/* Frees what a builder allocated and zeroes the struct, so a leftover pointer
+ * can't be reused by mistake. */
 static void mesh_free(Mesh *m) {
   free(m->verts);
   free(m->tris);
   *m = (Mesh){0};
 }
 
+/* Add one flat rectangle as two triangles, all facing the same way. */
 static void mesh_add_quad(Mesh *m, Vec3 origin, Vec3 e1, Vec3 e2, Vec3 nrm) {
   int v0 = m->nvert;
   m->verts[v0 + 0] = (Vertex){origin, nrm};
@@ -875,11 +494,11 @@ static Mesh mesh_box(float hx, float hy, float hz) {
   return m;
 }
 
-/* UV-sphere tessellation: rings × segs grid + 2 triangles per cell.
- * Smooth per-vertex normals = position / radius (= position for unit
- * sphere). At the poles sin(phi) = 0 collapses many vertices to one
- * point; we override the normal to (0, ±1, 0) explicitly to avoid a
- * divide-by-near-zero. */
+/* Build a ball like a globe: step down in rings (latitude) and around in
+ * segments (longitude), drop a point at each crossing, and stitch each little
+ * grid square into two triangles. On a ball, "which way the surface faces" at
+ * a point is just the direction from the centre out to it — except right at
+ * the poles, where that's undefined, so we set it straight up/down by hand. */
 static Mesh mesh_sphere(float radius, int rings, int segs) {
   int nv = (rings + 1) * (segs + 1);
   int nt = rings * segs * 2;
@@ -911,40 +530,66 @@ static Mesh mesh_sphere(float radius, int rings, int segs) {
   return m;
 }
 
-/* ── Barycentric helper (Möller signed-area form) ──────────────────── */
+/* ── §5b the things in the scene — gathered into Scene (§9) ── */
 
-static inline void barycentric(float sx[3], float sy[3], float px, float py,
-                               float b[3]) {
-  float d =
-      (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2]);
-  if (fabsf(d) < 1e-9f) {
-    b[0] = b[1] = b[2] = -1.f;
-    return;
-  }
-  b[0] = ((sy[1] - sy[2]) * (px - sx[2]) + (sx[2] - sx[1]) * (py - sy[2])) / d;
-  b[1] = ((sy[2] - sy[0]) * (px - sx[2]) + (sx[0] - sx[2]) * (py - sy[2])) / d;
-  b[2] = 1.f - b[0] - b[1];
-}
+/* One thing in the scene: its shape, its plain colour, and where it sits. The
+ * floor, cube, and sphere are three of these. */
+typedef struct {
+  Mesh mesh;   /* the shape, as triangles                       */
+  Vec3 albedo; /* its colour before any light hits it           */
+  Mat4 model;  /* where it sits / how it's turned, in the world */
+} SceneObject;
 
-/* ── §6 G-buffer (camera-view geometry pass) ───────────────────────── */
+/* Where we watch from. You steer it with two knobs — how far back (zoom) and
+ * the angle — and from those we work out the eye position and the transforms
+ * used to draw. */
+typedef struct {
+  Mat4 view, proj; /* the draw transforms, rebuilt when a knob changes */
+  Vec3 pos;        /* where the eye ends up in the world               */
+  float dist;      /* how far back we sit — the zoom knob              */
+  float yaw;       /* the angle we sit at                              */
+} Camera;
 
-static Vec3 g_pos[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_normal[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_albedo[GBUF_MAX_H][GBUF_MAX_W];
-static float g_zbuf[GBUF_MAX_H][GBUF_MAX_W];
-static int g_valid[GBUF_MAX_H][GBUF_MAX_W];
+/* The sun, treated as a far-off light whose rays all run parallel. It has a
+ * direction and a colour, plus an angle that slowly rocks the direction so the
+ * shadows drift across the floor. */
+typedef struct {
+  Vec3 dir;   /* which way the light travels (set from yaw) */
+  Vec3 color; /* the light's colour                         */
+  float yaw;  /* the rocking angle, nudged each frame       */
+} Sun;
 
-static void gbuffer_clear(int cols, int rows) {
+/* ── §6 the camera pass — find what's visible at each screen cell ── */
+
+/* For every screen cell, what the camera sees there — filled by this pass and
+ * used by the lighting pass next. We record raw facts now and work out colours
+ * in a second step, instead of all at once while drawing triangles. The depth
+ * field doubles as the z-buffer: it remembers the nearest thing at each cell so
+ * closer surfaces hide farther ones. (This bundle is known as a "G-buffer".) */
+typedef struct {
+  Vec3 pos[GBUF_MAX_H][GBUF_MAX_W];     /* the 3D spot shown at this cell       */
+  Vec3 normal[GBUF_MAX_H][GBUF_MAX_W];  /* which way the surface faces there    */
+  Vec3 albedo[GBUF_MAX_H][GBUF_MAX_W];  /* its plain colour                     */
+  float depth[GBUF_MAX_H][GBUF_MAX_W];  /* nearest distance seen here (z-buffer) */
+  int valid[GBUF_MAX_H][GBUF_MAX_W];    /* did anything get drawn at this cell?  */
+} GBuffer;
+
+static GBuffer g_gbuf;
+
+static void gbuffer_clear(GBuffer *g, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      g_zbuf[r][c] = 1.f;
-      g_valid[r][c] = 0;
+      g->depth[r][c] = 1.f;
+      g->valid[r][c] = 0;
     }
   }
 }
 
-static void rasterize_object(const Mesh *mesh, Vec3 albedo, Mat4 mvp,
-                             Mat4 model, int cols, int rows) {
+/* Draw one object's triangles into the buffer, keeping whichever surface is
+ * nearest at each cell. */
+static void rasterize_object(const SceneObject *obj, Mat4 mvp, GBuffer *g,
+                             int cols, int rows) {
+  const Mesh *mesh = &obj->mesh;
   for (int ti = 0; ti < mesh->ntri; ti++) {
     const Triangle *tri = &mesh->tris[ti];
     Vec4 clip[3];
@@ -952,77 +597,79 @@ static void rasterize_object(const Mesh *mesh, Vec3 albedo, Mat4 mvp,
     for (int vi = 0; vi < 3; vi++) {
       const Vertex *v = &mesh->verts[tri->v[vi]];
       clip[vi] = m4_mul_v4(mvp, v4(v->pos.x, v->pos.y, v->pos.z, 1.f));
-      wpos[vi] = m4_pt(model, v->pos);
-      wnrm[vi] = v3_norm(m4_dir(model, v->normal));
+      wpos[vi] = m4_pt(obj->model, v->pos);
+      wnrm[vi] = v3_norm(m4_dir(obj->model, v->normal));
     }
-    if (clip[0].w < 0.001f && clip[1].w < 0.001f && clip[2].w < 0.001f)
-      continue;
+    if (clip[0].w < CLIP_W_MIN && clip[1].w < CLIP_W_MIN &&
+        clip[2].w < CLIP_W_MIN)
+      continue; /* whole triangle behind the near plane */
 
     float sx[3], sy[3], sz[3];
-    for (int vi = 0; vi < 3; vi++) {
-      float w = clip[vi].w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
-      sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows;
-      sz[vi] = clip[vi].z / w;
-    }
+    clip_to_screen(clip, sx, sy, sz, cols, rows);
 
-    /* Back-face cull DISABLED on the camera pass — every triangle
-     * (including the cube's far faces) gets rasterised. The
-     * z-buffer still hides occluded fragments, so a closed cube
-     * looks identical from outside; if a triangle is wound the
-     * "wrong" way, leaving culling off lets it still appear.
-     * The shadow pass (§7) keeps culling because shadow casters
-     * write only their light-facing surfaces. */
-    int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
-    int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
-    int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
-    int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+    /* We don't bother skipping triangles that face away from us. For a closed
+     * shape it wouldn't change the picture (the nearest-surface test hides
+     * them anyway), and leaving them in means a shape whose triangles were
+     * built facing the wrong way still shows up instead of vanishing. */
+    int x0, x1, y0, y1;
+    triangle_bbox(sx, sy, cols, rows, &x0, &x1, &y0, &y1);
 
     for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
       for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
         float b[3];
         barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
-        if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
+        if (!bary_inside(b))
           continue;
 
         float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
-        if (z >= g_zbuf[py][px])
-          continue;
+        if (z >= g->depth[py][px])
+          continue; /* something nearer is already here — skip */
 
-        g_zbuf[py][px] = z;
-        g_pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
-        g_normal[py][px] =
+        /* record this surface at this cell */
+        g->depth[py][px] = z;
+        g->pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
+        g->normal[py][px] =
             v3_norm(v3_bary(wnrm[0], wnrm[1], wnrm[2], b[0], b[1], b[2]));
-        g_albedo[py][px] = albedo;
-        g_valid[py][px] = 1;
+        g->albedo[py][px] = obj->albedo;
+        g->valid[py][px] = 1;
       }
     }
   }
 }
 
-static void render_gbuffer(const Mesh *meshes, const Vec3 *albedos,
-                           const Mat4 *models, int n_objects, Mat4 view,
-                           Mat4 proj, int cols, int rows) {
-  gbuffer_clear(cols, rows);
+/* Clear the buffer, then draw every object from the camera's viewpoint. */
+static void render_gbuffer(const SceneObject *objs, int n_objects,
+                           const Camera *cam, GBuffer *g, int cols, int rows) {
+  gbuffer_clear(g, cols, rows);
   for (int oi = 0; oi < n_objects; oi++) {
-    Mat4 mvp = m4_mul(m4_mul(proj, view), models[oi]);
-    rasterize_object(&meshes[oi], albedos[oi], mvp, models[oi], cols, rows);
+    Mat4 mvp = m4_mul(m4_mul(cam->proj, cam->view), objs[oi].model);
+    rasterize_object(&objs[oi], mvp, g, cols, rows);
   }
 }
 
-/* ── §7 shadow (light-view depth-only pass) ────────────────────────── */
+/* ── §7 the sun's view — build the shadow map, and read it back ── */
 
-static float g_shadow_zbuf[SHADOW_H][SHADOW_W];
+/* The scene as the sun sees it: for each cell of the sun's view, how far the
+ * nearest thing is. We stash the sun's own draw transforms right next to that
+ * picture, so checking whether a spot is shadowed needs nothing but this. This
+ * is the classic shadow map (Williams 1978). */
+typedef struct {
+  Mat4 view, proj;                 /* the sun's draw transforms               */
+  float depth[SHADOW_H][SHADOW_W]; /* nearest distance the sun sees, per cell  */
+} ShadowMap;
 
-static void shadow_clear(void) {
+static ShadowMap g_shadow;
+
+static void shadowmap_clear(ShadowMap *sm) {
   for (int r = 0; r < SHADOW_H; r++)
     for (int c = 0; c < SHADOW_W; c++)
-      g_shadow_zbuf[r][c] = 1.f;
+      sm->depth[r][c] = 1.f;
 }
 
-static void rasterize_object_shadow(const Mesh *mesh, Mat4 light_mvp) {
+/* Like the camera pass, but from the sun and recording only distances, no
+ * colour — that's all the shadow map needs. */
+static void rasterize_object_shadow(const Mesh *mesh, Mat4 light_mvp,
+                                    ShadowMap *sm) {
   for (int ti = 0; ti < mesh->ntri; ti++) {
     const Triangle *tri = &mesh->tris[ti];
     Vec4 clip[3];
@@ -1031,90 +678,73 @@ static void rasterize_object_shadow(const Mesh *mesh, Mat4 light_mvp) {
       clip[vi] = m4_mul_v4(light_mvp, v4(v->pos.x, v->pos.y, v->pos.z, 1.f));
     }
     float sx[3], sy[3], sz[3];
-    for (int vi = 0; vi < 3; vi++) {
-      float w = clip[vi].w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)SHADOW_W;
-      sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)SHADOW_H;
-      sz[vi] = clip[vi].z / w;
-    }
-    /* Back-face cull DISABLED on the shadow pass too (matching the
-     * camera pass). All cube triangles, front and back from the
-     * light's POV, write their depth to the shadow map. The
-     * `z < g_shadow_zbuf[py][px]` test still keeps the smallest
-     * depth per texel, so for a closed convex cube the shadow is
-     * unchanged — only difference is uncullled triangles also
-     * cast shadow (matters for non-closed or reverse-wound meshes). */
-    int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
-    int x1 =
-        (int)fminf(SHADOW_W - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
-    int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
-    int y1 =
-        (int)fminf(SHADOW_H - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+    clip_to_screen(clip, sx, sy, sz, SHADOW_W, SHADOW_H);
+
+    /* Same as the camera pass: we don't skip away-facing triangles. The
+     * nearest-distance test sorts it out, and it keeps oddly-built shapes
+     * casting shadows instead of quietly dropping them. */
+    int x0, x1, y0, y1;
+    triangle_bbox(sx, sy, SHADOW_W, SHADOW_H, &x0, &x1, &y0, &y1);
 
     for (int py = y0; py <= y1; py++) {
       for (int px = x0; px <= x1; px++) {
         float b[3];
         barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
-        if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
+        if (!bary_inside(b))
           continue;
         float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
-        if (z < g_shadow_zbuf[py][px])
-          g_shadow_zbuf[py][px] = z;
+        if (z < sm->depth[py][px])
+          sm->depth[py][px] = z; /* remember the nearest thing the sun sees here */
       }
     }
   }
 }
 
-static void shadow_pass(const Mesh *meshes, const Mat4 *models, int n_objects,
-                        Mat4 light_view, Mat4 light_proj) {
-  shadow_clear();
+/* Make this frame's shadow map: aim a straight-sided "camera" from the sun
+ * back at the scene, keep its transforms in the map, then draw every object
+ * into it recording only distances. */
+static void shadow_pass(const SceneObject *objs, int n_objects, Vec3 sun_dir,
+                        ShadowMap *sm) {
+  Vec3 light_eye = v3_scale(sun_dir, -LIGHT_DISTANCE);
+  sm->view = m4_lookat(light_eye, v3(0, 0, 0), v3(0, 1, 0));
+  sm->proj = m4_orthographic(-LIGHT_ORTHO_HALF, LIGHT_ORTHO_HALF,
+                             -LIGHT_ORTHO_HALF, LIGHT_ORTHO_HALF, LIGHT_NEAR,
+                             LIGHT_FAR);
+  shadowmap_clear(sm);
   for (int oi = 0; oi < n_objects; oi++) {
-    Mat4 mvp = m4_mul(m4_mul(light_proj, light_view), models[oi]);
-    rasterize_object_shadow(&meshes[oi], mvp);
+    Mat4 mvp = m4_mul(m4_mul(sm->proj, sm->view), objs[oi].model);
+    rasterize_object_shadow(&objs[oi].mesh, mvp, sm);
   }
 }
 
-/* shadow_sample — project a world point into light NDC, then look up
- * the shadow map with 3×3 PCF averaging.
- *
- * Why PCF: a single binary depth test gives stair-stepped shadow
- * edges (one shadow-map texel per fragment = pixel resolution at
- * the texel level). Averaging the binary test over a 3×3 cell
- * neighbourhood softens the edge to a 3-cell gradient — looks like
- * a real penumbra and hides per-texel popping when the camera
- * moves between frames. Cost: 9 shadow-map reads per fragment.
- */
-static float shadow_sample(Vec3 world_pos, Mat4 light_view, Mat4 light_proj) {
-  Vec4 clip = m4_mul_v4(m4_mul(light_proj, light_view),
-                        v4(world_pos.x, world_pos.y, world_pos.z, 1.f));
-  if (clip.w < 1e-6f)
-    return 0.f;
-  Vec3 ndc = v3(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+/* Is this point inside the slab of space the sun can actually see? */
+static inline bool inside_ndc(Vec3 ndc) {
+  return ndc.x >= -1.f && ndc.x <= 1.f && ndc.y >= -1.f && ndc.y <= 1.f &&
+         ndc.z >= -1.f && ndc.z <= 1.f;
+}
 
-  /* Outside the light's frustum → not visible to the light → not in shadow. */
-  if (ndc.x < -1.f || ndc.x > 1.f || ndc.y < -1.f || ndc.y > 1.f ||
-      ndc.z < -1.f || ndc.z > 1.f)
-    return 0.f;
+/* How big a fudge to allow when comparing distances. A surface the sun barely
+ * grazes needs a bigger nudge to stop it speckling itself with fake shadow; one
+ * facing the sun head-on needs almost none. Capped so shadows don't float off. */
+static float shadow_slope_bias(float ndl) {
+  float c = fmaxf(ndl, NDL_BIAS_FLOOR);     /* keep it above zero       */
+  float slope_tan = sqrtf(1.f - c * c) / c; /* steeper grazing → bigger */
+  float bias = SHADOW_BIAS + SHADOW_SLOPE_BIAS * slope_tan;
+  return (bias > SHADOW_BIAS_MAX) ? SHADOW_BIAS_MAX : bias;
+}
 
-  int ix = (int)((ndc.x + 1.f) * 0.5f * (float)SHADOW_W);
-  int iy = (int)((-ndc.y + 1.f) * 0.5f * (float)SHADOW_H);
-  if (ix < 0 || ix >= SHADOW_W || iy < 0 || iy >= SHADOW_H)
-    return 0.f;
-
-  /* 3×3 PCF: average the binary occluder test over a 9-cell
-   * neighbourhood around the lookup centre. Result ∈ {0, 1/9,
-   * 2/9, ..., 9/9}: a soft transition instead of a stair-step. */
-  float z_frag = ndc.z;
-  int hits = 0;
-  int count = 0;
-  for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -1; dx <= 1; dx++) {
+/* Soften the shadow edge: instead of a flat yes/no, test a little block of
+ * neighbouring cells and return the fraction that are blocked. That gives a
+ * smooth fade at the rim instead of a hard, jagged step. */
+static float pcf_occlusion(const ShadowMap *sm, int ix, int iy, float z_frag,
+                           float bias) {
+  int hits = 0, count = 0;
+  for (int dy = -PCF_RADIUS; dy <= PCF_RADIUS; dy++) {
+    for (int dx = -PCF_RADIUS; dx <= PCF_RADIUS; dx++) {
       int rr = iy + dy, cc = ix + dx;
       if (rr < 0 || rr >= SHADOW_H || cc < 0 || cc >= SHADOW_W)
         continue;
-      if (g_shadow_zbuf[rr][cc] + SHADOW_BIAS < z_frag)
+      if (sm->depth[rr][cc] + bias < z_frag)
         hits++;
       count++;
     }
@@ -1122,134 +752,170 @@ static float shadow_sample(Vec3 world_pos, Mat4 light_view, Mat4 light_proj) {
   return (count > 0) ? ((float)hits / (float)count) : 0.f;
 }
 
-/* ── §8 lightpass (Blinn-Phong + shadow lookup) ────────────────────── */
+/* Is this spot in shadow? Find where it lands in the sun's view and compare its
+ * distance against what the sun recorded there. Anything outside the sun's view
+ * counts as lit. Returns 0 (full sun) up to 1 (full shadow). */
+static float shadow_sample(const ShadowMap *sm, Vec3 world_pos, float ndl) {
+  Vec4 clip = m4_mul_v4(m4_mul(sm->proj, sm->view),
+                        v4(world_pos.x, world_pos.y, world_pos.z, 1.f));
+  if (clip.w < W_DIVIDE_EPS)
+    return 0.f;
+  Vec3 ndc = v3(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+  if (!inside_ndc(ndc))
+    return 0.f; /* not in the light's view → assume lit */
 
+  int ix = (int)((ndc.x + 1.f) * 0.5f * (float)SHADOW_W);
+  int iy = (int)((-ndc.y + 1.f) * 0.5f * (float)SHADOW_H);
+  if (ix < 0 || ix >= SHADOW_W || iy < 0 || iy >= SHADOW_H)
+    return 0.f;
+
+  return pcf_occlusion(sm, ix, iy, ndc.z, shadow_slope_bias(ndl));
+}
+
+/* ── §8 the lighting pass — colour each cell from light and shadow ── */
+
+/* How lit a surface is, softened. A plain "is it facing the sun?" check makes
+ * the shaded side go flat and muddy; this keeps a gentle gradient round the
+ * back so curved things still read as curved. Faces aimed at the sun are
+ * unchanged. (Valve's "half-Lambert" trick.) */
+static float half_lambert(float ndl) {
+  float wrap = 0.5f * ndl + 0.5f;
+  return wrap * wrap;
+}
+
+/* The bright pinpoint highlight — strongest where the surface is angled to
+ * bounce the sun straight back at the camera. */
+static float blinn_spec(Vec3 N, Vec3 V, Vec3 L) {
+  Vec3 H = v3_norm(v3_add(L, V));
+  return powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN;
+}
+
+/* The finished colour for every cell — filled here, drawn to screen by §10. */
 static Vec3 g_light[GBUF_MAX_H][GBUF_MAX_W];
 
-static void render_lightpass(Vec3 cam_pos, Mat4 light_view, Mat4 light_proj,
-                             bool shadows_on, int cols, int rows) {
-  Vec3 sun_dir = v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
-  Vec3 sun_col = v3(SUN_COL[0], SUN_COL[1], SUN_COL[2]);
+/* Walk every cell the camera filled in and work out its final colour:
+ * background fill light + the sun's light, blocked where it's in shadow. */
+static void render_lightpass(const GBuffer *g, const ShadowMap *sm,
+                             const Sun *sun, const Camera *cam, bool shadows_on,
+                             int cols, int rows) {
+  Vec3 sun_col = sun->color;
   Vec3 ambient = v3(AMBIENT_COL[0], AMBIENT_COL[1], AMBIENT_COL[2]);
-  Vec3 L = v3_norm(v3_neg(sun_dir));
+  Vec3 L = v3_norm(v3_neg(sun->dir));
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
+      if (!g->valid[r][c]) {
         g_light[r][c] = v3(0, 0, 0);
         continue;
       }
 
-      Vec3 P = g_pos[r][c];
-      Vec3 N = g_normal[r][c];
-      Vec3 albedo = g_albedo[r][c];
+      Vec3 P = g->pos[r][c];
+      Vec3 N = g->normal[r][c];
+      Vec3 albedo = g->albedo[r][c];
 
-      Vec3 amb =
-          v3(ambient.x * albedo.x, ambient.y * albedo.y, ambient.z * albedo.z);
+      /* final = fill light + (sun's direct light, switched off in shadow). The
+       * fill is never shadowed, so dark spots aren't pitch black. */
+      float ndl = v3_dot(N, L);
+      Vec3 amb = v3_mul(ambient, albedo);
+      Vec3 dif = v3_scale(v3_mul(albedo, sun_col), half_lambert(ndl));
+      Vec3 V = v3_norm(v3_sub(cam->pos, P));
+      Vec3 sp = v3_scale(sun_col, blinn_spec(N, V, L));
 
-      float diff = fmaxf(0.f, v3_dot(N, L));
-      Vec3 dif = v3(albedo.x * sun_col.x * diff, albedo.y * sun_col.y * diff,
-                    albedo.z * sun_col.z * diff);
-
-      Vec3 V = v3_norm(v3_sub(cam_pos, P));
-      Vec3 H = v3_norm(v3_add(L, V));
-      float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN;
-      Vec3 sp = v3(sun_col.x * spec, sun_col.y * spec, sun_col.z * spec);
-
-      float shadow =
-          shadows_on ? shadow_sample(P, light_view, light_proj) : 0.f;
+      float shadow = shadows_on ? shadow_sample(sm, P, ndl) : 0.f;
       float lit = 1.f - shadow;
 
-      g_light[r][c] =
-          v3(amb.x + lit * (dif.x + sp.x), amb.y + lit * (dif.y + sp.y),
-             amb.z + lit * (dif.z + sp.z));
+      g_light[r][c] = v3_add(amb, v3_scale(v3_add(dif, sp), lit));
     }
   }
 }
 
-/* ── §9 scene ──────────────────────────────────────────────────────── */
+/* ── §9 the scene — what exists, and how it changes over time ── */
 
+/* Everything that makes up the world, in one place: the things in it, the
+ * camera and sun that show it, and a couple of flags. The big drawing buffers
+ * (g_gbuf, g_shadow, g_light) live on their own as scratch space, not here. */
 typedef struct {
-  Mesh meshes[N_OBJECTS];
-  Vec3 albedos[N_OBJECTS];
-  Mat4 models[N_OBJECTS];
+  SceneObject objects[N_OBJECTS]; /* the floor, cube, and sphere      */
+  Camera cam;                     /* where we watch from              */
+  Sun sun;                        /* the light that casts the shadows */
 
-  Mat4 view, proj;
-  Vec3 cam_pos;
-  float cam_dist;
-  float cam_yaw;
-
-  Mat4 light_view, light_proj;
-
-  bool shadows_on;
-  bool paused;
-  int scene_cols;
+  bool shadows_on; /* 's' turns shadows on and off         */
+  bool paused;     /* space freezes the sun's slow rocking  */
+  int scene_cols;  /* drawing area size, in cells           */
   int scene_rows;
 } Scene;
 
-static void scene_rebuild_proj(Scene *s, int cols, int rows) {
+static void camera_rebuild_proj(Camera *cam, int cols, int rows) {
   float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
-  s->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
+  cam->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 }
 
-static void scene_rebuild_view(Scene *s) {
-  float r = s->cam_dist;
-  s->cam_pos = v3(sinf(s->cam_yaw) * r, CAM_HEIGHT, cosf(s->cam_yaw) * r);
-  s->view = m4_lookat(s->cam_pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
+static void camera_rebuild_view(Camera *cam) {
+  float r = cam->dist;
+  cam->pos = v3(sinf(cam->yaw) * r, CAM_HEIGHT, cosf(cam->yaw) * r);
+  cam->view = m4_lookat(cam->pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
 }
 
-static void scene_build_light(Scene *s) {
-  Vec3 sun_dir = v3_norm(v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]));
-  Vec3 light_eye = v3_scale(sun_dir, -LIGHT_DISTANCE);
-  s->light_view = m4_lookat(light_eye, v3(0, 0, 0), v3(0, 1, 0));
-  s->light_proj =
-      m4_orthographic(-LIGHT_ORTHO_HALF, LIGHT_ORTHO_HALF, -LIGHT_ORTHO_HALF,
-                      LIGHT_ORTHO_HALF, LIGHT_NEAR, LIGHT_FAR);
+/* Point the sun for this frame: take its resting direction and swing it a
+ * little to the side based on the rocking angle, so the shadows slide across
+ * the floor without the light ever ending up behind everything. */
+static void sun_aim(Sun *sun) {
+  Vec3 d = v3_norm(v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]));
+  float az = LIGHT_ARC_HALF * sinf(sun->yaw);
+  float ca = cosf(az), sa = sinf(az);
+  sun->dir = v3(d.x * ca + d.z * sa, d.y, -d.x * sa + d.z * ca);
 }
 
+/* Build the whole world from scratch. Also the resize path, so it first frees
+ * any shapes left from a previous build. */
 static void scene_init(Scene *s, int total_cols, int total_rows) {
   for (int i = 0; i < N_OBJECTS; i++)
-    mesh_free(&s->meshes[i]);
+    mesh_free(&s->objects[i].mesh);
 
   memset(s, 0, sizeof *s);
   s->scene_cols = total_cols;
   s->scene_rows = total_rows - HUD_ROWS;
   s->shadows_on = true;
-  s->cam_dist = CAM_DIST_DEF;
-  s->cam_yaw = 0.f;
 
-  s->meshes[OBJ_FLOOR] = mesh_floor(FLOOR_HALF_X, FLOOR_HALF_Z);
-  s->albedos[OBJ_FLOOR] = v3(0.32f, 0.36f, 0.42f); /* dark slate */
-  s->models[OBJ_FLOOR] = m4_identity();
+  s->cam.dist = CAM_DIST_DEF;
+  s->cam.yaw = 0.f;
 
-  s->meshes[OBJ_CUBE] = mesh_box(CUBE_HALF, CUBE_HALF, CUBE_HALF);
-  s->albedos[OBJ_CUBE] = v3(0.78f, 0.62f, 0.42f); /* sandstone */
-  s->models[OBJ_CUBE] = m4_translate(CUBE_CX, CUBE_CY, CUBE_CZ);
+  s->sun.color = v3(SUN_COL[0], SUN_COL[1], SUN_COL[2]);
+  s->sun.yaw = 0.f;
 
-  s->meshes[OBJ_SPHERE] = mesh_sphere(SPHERE_R, SPHERE_RINGS, SPHERE_SEGS);
-  s->albedos[OBJ_SPHERE] = v3(0.78f, 0.78f, 0.82f); /* cool grey */
-  s->models[OBJ_SPHERE] = m4_translate(SPHERE_CX, SPHERE_CY, SPHERE_CZ);
+  s->objects[OBJ_FLOOR].mesh = mesh_floor(FLOOR_HALF_X, FLOOR_HALF_Z);
+  s->objects[OBJ_FLOOR].albedo = v3(0.32f, 0.36f, 0.42f); /* dark slate */
+  s->objects[OBJ_FLOOR].model = m4_identity();
 
-  scene_rebuild_proj(s, total_cols, s->scene_rows);
-  scene_rebuild_view(s);
-  scene_build_light(s);
+  s->objects[OBJ_CUBE].mesh = mesh_box(CUBE_HALF, CUBE_HALF, CUBE_HALF);
+  s->objects[OBJ_CUBE].albedo = v3(0.78f, 0.62f, 0.42f); /* sandstone */
+  s->objects[OBJ_CUBE].model = m4_translate(CUBE_CX, CUBE_CY, CUBE_CZ);
+
+  s->objects[OBJ_SPHERE].mesh = mesh_sphere(SPHERE_R, SPHERE_RINGS, SPHERE_SEGS);
+  s->objects[OBJ_SPHERE].albedo = v3(0.78f, 0.78f, 0.82f); /* cool grey */
+  s->objects[OBJ_SPHERE].model = m4_translate(SPHERE_CX, SPHERE_CY, SPHERE_CZ);
+
+  camera_rebuild_proj(&s->cam, total_cols, s->scene_rows);
+  camera_rebuild_view(&s->cam);
+  sun_aim(&s->sun);
 }
 
+/* The one spot where the world moves forward each frame: nudge the sun's
+ * rocking angle (unless paused) and re-point it. Everything else is drawing. */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
-  s->cam_yaw += CAM_ORBIT_RAD_PER_SEC * dt;
-  scene_rebuild_view(s);
+  s->sun.yaw += LIGHT_ORBIT_RAD_PER_SEC * dt; /* orbit the sun, not the camera */
+  sun_aim(&s->sun);
 }
 
-/* ── §10 screen ────────────────────────────────────────────────────── */
+/* ── §10 to the screen — draw the finished colours and the readout ── */
 
-static void render_scene(const Scene *s) {
-  int cols = s->scene_cols;
-  int rows = s->scene_rows;
+/* Draw every filled-in cell's colour to the terminal. */
+static void render_scene(const GBuffer *g, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++)
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++)
-      if (g_valid[r][c])
+      if (g->valid[r][c])
         paint_cell(c, r, g_light[r][c]);
 }
 
@@ -1259,7 +925,7 @@ static void hud_draw(const Scene *s, double fps) {
 
   char status[120];
   snprintf(status, sizeof status, " %5.1f fps  shadow=%s  zoom=%.1f ", fps,
-           s->shadows_on ? "on " : "off", (double)s->cam_dist);
+           s->shadows_on ? "on " : "off", (double)s->cam.dist);
   int slen = (int)strlen(status);
   if (slen > cols)
     slen = cols;
@@ -1282,8 +948,10 @@ static void hud_draw(const Scene *s, double fps) {
   attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* ── §11 app ───────────────────────────────────────────────────────── */
+/* ── §11 the program — set up the terminal, then loop ── */
 
+/* Poked by the signal handlers below; this odd type is the only thing a
+ * handler is allowed to touch safely. */
 static volatile sig_atomic_t g_run = 1;
 static volatile sig_atomic_t g_resize = 0;
 static void on_sigint(int s) {
@@ -1308,7 +976,7 @@ int main(void) {
   curs_set(0);
   keypad(stdscr, TRUE);
   nodelay(stdscr, TRUE);
-  typeahead(-1);
+  typeahead(-1); /* don't let waiting keypresses interrupt our drawing */
   color_init();
 
   int cols, rows;
@@ -1325,6 +993,7 @@ int main(void) {
   int64_t frame_ns = 1000000000LL / FPS_TARGET;
 
   while (g_run) {
+    /* window resized? rebuild everything at the new size */
     if (g_resize) {
       g_resize = 0;
       endwin();
@@ -1333,6 +1002,7 @@ int main(void) {
       scene_init(&s, cols, rows);
     }
 
+    /* time since the last frame; capped so a long pause can't make us lurch */
     int64_t now = clock_ns();
     int64_t dt = now - prev;
     if (dt > 100000000LL)
@@ -1347,21 +1017,25 @@ int main(void) {
       fps_cnt = 0;
     }
 
-    scene_tick(&s, (float)dt * 1e-9f);
+    /* one frame, in order: move the world, then draw it */
+    scene_tick(&s, (float)dt * 1e-9f); /* move the sun a little */
 
+    /* draw it: shadow map from the sun, then the camera's view, then colours */
     if (s.shadows_on)
-      shadow_pass(s.meshes, s.models, N_OBJECTS, s.light_view, s.light_proj);
-    render_gbuffer(s.meshes, s.albedos, s.models, N_OBJECTS, s.view, s.proj,
-                   s.scene_cols, s.scene_rows);
-    render_lightpass(s.cam_pos, s.light_view, s.light_proj, s.shadows_on,
+      shadow_pass(s.objects, N_OBJECTS, s.sun.dir, &g_shadow);
+    render_gbuffer(s.objects, N_OBJECTS, &s.cam, &g_gbuf, s.scene_cols,
+                   s.scene_rows);
+    render_lightpass(&g_gbuf, &g_shadow, &s.sun, &s.cam, s.shadows_on,
                      s.scene_cols, s.scene_rows);
 
+    /* push it all to the screen */
     erase();
-    render_scene(&s);
+    render_scene(&g_gbuf, s.scene_cols, s.scene_rows);
     hud_draw(&s, fps);
     wnoutrefresh(stdscr);
     doupdate();
 
+    /* handle key presses — these just flip settings, they don't run a frame */
     int ch;
     while ((ch = getch()) != ERR) {
       switch (ch) {
@@ -1379,27 +1053,30 @@ int main(void) {
         break;
       case 'r':
       case 'R':
-        s.cam_dist = CAM_DIST_DEF;
-        s.cam_yaw = 0.f;
-        scene_rebuild_view(&s);
+        s.cam.dist = CAM_DIST_DEF;
+        s.cam.yaw = 0.f;
+        s.sun.yaw = 0.f;
+        camera_rebuild_view(&s.cam);
+        sun_aim(&s.sun); /* reset the sun's orbit even while paused */
         break;
       case '+':
       case '=':
-        s.cam_dist -= CAM_ZOOM_STEP;
-        if (s.cam_dist < CAM_DIST_MIN)
-          s.cam_dist = CAM_DIST_MIN;
-        scene_rebuild_view(&s);
+        s.cam.dist -= CAM_ZOOM_STEP;
+        if (s.cam.dist < CAM_DIST_MIN)
+          s.cam.dist = CAM_DIST_MIN;
+        camera_rebuild_view(&s.cam);
         break;
       case '-':
       case '_':
-        s.cam_dist += CAM_ZOOM_STEP;
-        if (s.cam_dist > CAM_DIST_MAX)
-          s.cam_dist = CAM_DIST_MAX;
-        scene_rebuild_view(&s);
+        s.cam.dist += CAM_ZOOM_STEP;
+        if (s.cam.dist > CAM_DIST_MAX)
+          s.cam.dist = CAM_DIST_MAX;
+        camera_rebuild_view(&s.cam);
         break;
       }
     }
 
+    /* nap for whatever time is left, to hold a steady frame rate */
     int64_t target = clock_ns();
     int64_t left = frame_ns - (target - now);
     if (left > 0)
@@ -1407,6 +1084,6 @@ int main(void) {
   }
 
   for (int i = 0; i < N_OBJECTS; i++)
-    mesh_free(&s.meshes[i]);
+    mesh_free(&s.objects[i].mesh);
   return 0;
 }

@@ -1,523 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * ssao_pipeline.c — software screen-space ambient occlusion (SSAO)
+ * ssao_pipeline.c — a stepped pyramid + a sphere on a floor, in coloured ASCII,
+ * showing ambient occlusion: the soft darkening that gathers where surfaces
+ * meet (under the sphere, in the step corners, around each base). It's worked
+ * out from the screen alone — hence "screen-space" AO (Crytek, 2007).
  *
- * DEMO: A small three-step ziggurat (warm sandstone) with a pale
- *       cream sphere resting on its top, on a cool slate floor. The
- *       camera orbits slowly. Press 'a' to cycle three modes:
+ * Press 'a' to compare three views — the grayscale "where is it dark" map, the
+ * lighting without AO, and the lighting with AO. Pause (space) and toggle to
+ * see exactly what AO adds; '['/']' grow/shrink it.
  *
- *         AO_ONLY     grayscale "crevice map" — bright everywhere
- *                     except FOUR dark features:
- *                       1. floor halo around the bottom step
- *                       2. step-0 top, around step-1's footprint
- *                       3. step-1 top, around step-2's footprint
- *                       4. circular halo on step-2 under the sphere
- *
- *         LIT_NO_AO   full Blinn-Phong, NO occlusion. Corners stay
- *                     bright, the sphere looks pasted onto the step.
- *
- *         LIT_WITH_AO ambient × AO + direct light. Same four corners
- *                     darken; the sphere "sits" on the step and the
- *                     pyramid steps gain depth.
- *
- *       Toggling LIT_NO_AO ↔ LIT_WITH_AO with the orbit paused is
- *       the cleanest way to see what SSAO contributes — only the
- *       four corner regions change. Flat faces are pixel-identical.
- *
- *       Press '[' / ']' to shrink / grow the SSAO radius — watch
- *       every dark band narrow / widen as the sample neighbourhood
- *       does. The sphere's halo is the smallest feature; the floor
- *       halo is the largest. Both scale together with radius.
- *
- * Study alongside:
- *   raster/deferred_rendering_pipeline.c — same G-buffer, no AO
- *   raster/cube_raster.c                 — single-mesh forward raster
- *
- * Section map:
- *   §1  config     — frame, view, scene, SSAO, lighting, ramp, pairs
- *   §2  clock      — monotonic timer + sleep
- *   §3  math       — V3, V4, Mat4 + perspective / lookat / normal mat
- *   §4  paint      — 216-pair RGB cube + Bourke ramp + paint_cell
- *   §5  mesh       — Vertex / Triangle types + box / quad / sphere
- *   §6  gbuffer    — geometry pass (pos, normal, albedo, NDC + view-z)
- *   §7  ssao       — kernel + per-pixel sample loop + 3×3 blur
- *   §8  lightpass  — Blinn-Phong; ambient is scaled by blurred AO
- *   §9  scene      — Mode enum, Scene struct, init / view / tick
- *   §10 screen     — render_scene + HUD (CLAUDE.md spec)
- *   §11 app        — signals, resize, fixed-step main loop
- *
- * Keys:
- *   a / A     cycle output mode (AO_ONLY → LIT_NO_AO → LIT_WITH_AO)
- *   [         shrink SSAO radius
- *   ]         grow   SSAO radius
- *   + / =     zoom in   (decrease camera distance)
- *   - / _     zoom out  (increase camera distance)
- *   space     pause / resume camera orbit
- *   r / R     reset
- *   q / ESC   quit
- *
- * Build:
+ * Sister files: raster/deferred_rendering_pipeline.c (same G-buffer, no AO) and
+ * raster/cube_raster.c (the plain triangle renderer this builds on). Build:
  *   gcc -std=c11 -O2 -Wall -Wextra raster/ssao_pipeline.c -o ssao -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Screen-Space Ambient Occlusion. For each visible
- *                  pixel, take K samples in the upper hemisphere along
- *                  the surface normal, project them back to the screen,
- *                  and ask the depth buffer "is some surface in front
- *                  of this sample?" The fraction of YES answers is the
- *                  occlusion factor; (1 − occluded) scales the ambient
- *                  illumination term so corners darken without affecting
- *                  direct light.
- *
- *                  A pure screen-space heuristic — no rays, no GI. It
- *                  cannot see geometry behind objects or off-screen.
- *                  But it costs O(pixels × K) and produces the iconic
- *                  "dark crevice" look every modern real-time engine
- *                  ships with.
- *
- * Data-structure : The G-buffer arrays from deferred rendering
- *                    g_pos, g_normal, g_albedo, g_zbuf, g_z_view, g_valid
- *                  plus AO arrays
- *                    g_ao, g_ao_blur
- *                  All static; no malloc on the hot path.
- *
- *                  Plus a precomputed kernel:
- *                    k_ssao[VARIANTS][SAMPLES]
- *                  Each pixel picks ONE variant by (c & 1) | ((r & 1) << 1)
- *                  so the 2×2 tile uses every variant once. The 3×3
- *                  blur smooths the resulting checkerboard.
- *
- * Rendering      : Four passes per frame (subset by mode):
- *                    1. render_gbuffer   — pos / normal / albedo / depth
- *                    2. ssao_pass        — K samples per pixel → g_ao
- *                    3. ssao_blur        — 3×3 box average → g_ao_blur
- *                    4. render_lightpass — Blinn-Phong, ambient × AO
- *
- *                  Output paint pipeline matches every other raster
- *                  file: per-pixel V3 RGB → Reinhard tone-map → gamma
- *                  → 6×6×6 cube + 92-char Bourke ramp.
- *
- * Performance    : SSAO is O(pixels × K). At terminal resolution
- *                  (≈80×40 ≈ 3 000 pixels × 12 samples) that's ~36k
- *                  ops per frame — trivial. Real engines run SSAO at
- *                  half resolution + bilateral upsample to amortise.
- *
- * References     : Mittring, "Finding Next Gen — CryEngine 2,"
- *                    SIGGRAPH '07 course notes (the original SSAO).
- *                  LearnOpenGL, "SSAO" tutorial:
- *                    https://learnopengl.com/Advanced-Lighting/SSAO
- *                  Bavoil & Sainz, "Multi-Layer Dual-Resolution
- *                    Screen-Space Ambient Occlusion," SIGGRAPH '09.
- *                  Möller, "Fast Triangle Rasterization by
- *                    Interpolating Edge Functions," GPG (2000).
- *                  Reinhard et al., "Photographic Tone Reproduction
- *                    for Digital Images," SIGGRAPH '02.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * If a surface point has lots of OTHER surface crowding it in 3-D, it
- * must be tucked into a corner — and corners darken in real life
- * because less ambient light reaches them. SSAO doesn't trace any
- * light; it just asks, for each pixel, "what fraction of the
- * hemisphere above this surface is blocked by nearby geometry?" That
- * fraction multiplies the ambient term ONLY. Direct lighting stays
- * untouched.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine each visible pixel sticks K little antennas into the air,
- * each pointing in a random direction in the upper hemisphere along
- * the surface normal. Each antenna asks its tip: "is there a closer
- * surface between you and the camera?" Open-sky antennas say NO and
- * the pixel stays bright. Antennas pointing into a wall say YES and
- * the pixel darkens. The output is (1 − occluded / total).
- *
- *      ┌──────────────────────────────────────────────┐
- *      │       open surface          inside corner    │
- *      │       \   |   /                  ┌──         │
- *      │        \  |  /                   │           │
- *      │   ──────P──────              ────P──         │
- *      │   K rays into sky           K rays into wall │
- *      │   → 0/K occluded            → many/K         │
- *      │   → AO = 1.0  (bright)      → AO ≈ 0.3 (dim) │
- *      └──────────────────────────────────────────────┘
- *
- * DRAWING METHOD  /  ALGORITHM IN STEPS
- * ─────────────────────────────────────
- * (per frame, after render_gbuffer has filled g_pos / g_normal / g_zbuf)
- *
- *   1. SSAO pass — for each valid pixel (r, c):
- *       a. P = g_pos[r][c],  N = g_normal[r][c]
- *       b. variant = (c & 1) | ((r & 1) << 1)
- *       c. for each direction dir in k_ssao[variant]:
- *             if dot(dir, N) < 0:  dir = −dir         // hemisphere flip
- *             S         = P + dir · radius             // antenna tip
- *             clip      = VP · (S, 1)
- *             if clip.w < ε:  skip                     // behind camera
- *             sx, sy    = NDC → screen(clip)
- *             if (sx, sy) outside or g_valid = 0: skip
- *             dz        = | g_z_view[r][c] − g_z_view[sy][sx] |
- *             attn      = max(0, 1 − dz / radius)      // range falloff
- *             total_w  += attn
- *             if g_zbuf[sy][sx] < ndc_z(S) − BIAS:     // depth test
- *                 occlude_w += attn
- *       d. g_ao[r][c] = 1 − occlude_w / max(total_w, ε)
- *
- *   2. Blur pass — 3×3 box average over g_valid only:
- *        g_ao_blur[r][c] = mean(g_ao[r±1][c±1] where g_valid = 1)
- *
- *   3. Light pass — for each valid pixel:
- *        ambient_lit = AMBIENT · albedo · g_ao_blur[r][c]    ← AO HERE
- *        direct_lit  = blinn_phong(P, N, albedo, sun, cam)
- *        g_light[r][c] = clamp01(ambient_lit + direct_lit)
- *
- * KEY FORMULAS
- * ────────────
- *   Hemisphere flip:   if (dir · N) < 0  then dir ← −dir
- *   Sample point:      S = P + dir · radius
- *   Projection:        clip = VP · (S, 1);  ndc = clip / clip.w
- *                      sx = ( ndc.x + 1) / 2 · cols
- *                      sy = (−ndc.y + 1) / 2 · rows         (Y-flip)
- *   Range falloff:     attn = max(0, 1 − |Δz_view| / radius)
- *   Depth test:        g_zbuf[sy][sx] < ndc_z(S) − BIAS  → occluded
- *   AO factor:         AO = 1 − Σ(occl · attn) / max(Σ attn, ε)
- *   Box blur:          AO′[r][c] = mean(AO[r±1][c±1])
- *   Composite:         col = AMBIENT · albedo · AO′ + diffuse + spec
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Off-screen samples — projected (sx, sy) outside the G-buffer
- *     OR landing on g_valid = 0: SKIP (don't count). Failing to skip
- *     creates a dark halo around every silhouette.
- *
- *   • Self-occlusion bias — a flat surface's samples sit just above
- *     itself; without BIAS the depth test teeters on the edge and
- *     float jitter darkens flat regions into noisy gray. BIAS pushes
- *     the comparison plane slightly in front of the surface.
- *
- *   • Range check — without it, distant background "occludes" through
- *     the air and produces fake AO. attn zeroes out samples whose
- *     view-space Z is more than RADIUS from the centre pixel.
- *
- *   • Per-pixel kernel discontinuity — neighbouring pixels using
- *     different variants form a 2×2 checkerboard of AO values. The
- *     3×3 box blur smooths the checker.
- *
- *   • Normal correctness — if g_normal points the wrong way, every
- *     sample reads BEHIND the surface and the pixel goes 100 %
- *     occluded. Verify normals via a debug view if AO looks wrong.
- *
- *   • RADIUS too large — samples leave the local neighbourhood and
- *     SSAO becomes a soft global darkening, not crevice shadows.
- *     Too small — samples never leave the surface, AO ≈ 1.0.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • In AO_ONLY: bright everywhere except FOUR features:
- *       (1) floor halo around step 0's perimeter
- *       (2) step 0 top, where step 1's footprint sits
- *       (3) step 1 top, where step 2's footprint sits
- *       (4) circular halo on step 2 around the sphere base
- *     Count them — expect four, two of them concentric on top.
- *
- *   • Toggle LIT_NO_AO ↔ LIT_WITH_AO with orbit paused: only the
- *     four corner regions change brightness. Flat top faces of each
- *     step are pixel-identical between the two modes.
- *
- *   • Press '[' a few times: every dark band narrows (the sphere's
- *     halo first, since it's the smallest feature). Press ']': all
- *     bands widen together.
- *
- *   • Pause the orbit (space): the AO pattern is rock-stable per
- *     frame — no shimmer. Shimmer means the kernel variants are
- *     cycling instead of being deterministic.
- *
- *   • The HUD's "K=… R=…" readouts always match SSAO_SAMPLES and
- *     s->ssao_radius.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read raster/deferred_rendering_pipeline.c FIRST —
- *      SSAO is built on top of the deferred G-buffer, and you need
- *      to understand g_pos / g_normal / g_zbuf before you can read
- *      the AO loop.
- *   2. §1 config — every constant has a unit-bearing comment.
- *   3. §7 ssao — THE HEART. Read AFTER tutorials T1-T5. The
- *      ~30-line per-pixel sample loop is the entire algorithm.
- *   4. §8 lightpass — minimal change from deferred: one extra
- *      multiplier on the ambient term.
- *   5. §6 gbuffer — same pattern as deferred. Skim if familiar.
- *      Note the addition of g_z_view (view-space Z) used by the
- *      range-falloff calculation.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   g_pos / g_normal / g_albedo / g_zbuf / g_valid / g_light — same
- *     G-buffer layout as deferred_rendering_pipeline.c
- *   g_z_view[r][c]      view-space depth (linear distance from camera)
- *                       added for the range-falloff math
- *   g_ao[r][c]          raw AO factor ∈ [0, 1] from §7 ssao_pass
- *   g_ao_blur[r][c]     blurred AO ∈ [0, 1] from §7 ssao_blur
- *   k_ssao[V][K]        precomputed kernel: V variants × K samples
- *   variant             pixel chooses one variant by 2×2 tile pattern
- *   SSAO_RADIUS         physical radius (world units) of the
- *                       hemisphere we sample
- *   SSAO_BIAS           tiny depth offset to prevent self-occlusion
- *
- * Background you need
- * ───────────────────
- *   - Deferred rendering's G-buffer (deferred_rendering_pipeline.c).
- *   - Hemisphere sampling: K random unit vectors clustered around
- *     the surface normal.
- *   - Why AO multiplies AMBIENT and not direct light (T6).
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - HBAO, GTAO, voxel AO — variants and refinements; we use
- *     vanilla Crytek-style SSAO (the original).
- *   - Cosine-weighted vs uniform hemisphere sampling — both work;
- *     we use uniform-ish.
- *   - Bilateral upsample — relevant when SSAO runs at half res; we
- *     run at full terminal res so plain box blur suffices.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
- *
- * Eight short tutorials. Read in order; each builds on the previous.
- *
- *   T1  What ambient occlusion IS — and why it darkens corners
- *   T2  Why "screen-space" — the cost trade vs ray-traced AO
- *   T3  Hemisphere sampling — K antennas pointed at the sky
- *   T4  The depth test — "is this antenna blocked?"
- *   T5  Range falloff — keeping AO local
- *   T6  Modulating AMBIENT only — never direct light
- *   T7  The 3×3 blur — denoising the per-pixel checkerboard
- *   T8  Three modes — AO_ONLY / LIT_NO_AO / LIT_WITH_AO
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  WHAT AMBIENT OCCLUSION IS — AND WHY IT DARKENS CORNERS
- * ───────────────────────────────────────────────────────────
- * Real-world surfaces in CORNERS look DARKER than identical surfaces
- * in the OPEN. Why? Ambient light (sky, indirect bounce) reaches an
- * open surface from a full hemisphere of directions. A surface
- * tucked into a corner has much of that hemisphere BLOCKED by
- * neighbouring geometry — less ambient light arrives, so the corner
- * darkens.
- *
- *      open: full sky access     corner: half sky blocked by wall
- *           ╲ │ ╱                            ┌──
- *            ╲│╱                             │
- *      ───────P───              ─────────────P──
- *                                              │ all sky from this
- *                                              │ side BLOCKED
- *
- * Ambient occlusion (AO) is the FRACTION OF THE HEMISPHERE that
- * remains UNblocked. AO = 1.0 → fully open, normal ambient. AO = 0.0
- * → fully enclosed, no ambient. The result multiplies the ambient
- * lighting term.
- *
- * Computing AO exactly requires casting many rays per pixel into the
- * hemisphere and asking each "does it hit something?" That's
- * expensive. SSAO is a CHEAP HEURISTIC that approximates the answer
- * using only the depth buffer of the current view (T2).
- *
- * T2  WHY "SCREEN-SPACE" — THE COST TRADE VS RAY-TRACED AO
- * ─────────────────────────────────────────────────────────
- * RAY-TRACED AO: cast K rays per pixel, intersect each with the full
- * scene geometry. Cost: O(pixels × K × scene_complexity). Slow.
- *
- * SCREEN-SPACE AO: cast K rays per pixel BUT only test against the
- * existing depth buffer — the per-pixel "depth from camera" data
- * computed during the geometry pass. Cost: O(pixels × K × 1). Fast.
- *
- * What you give up:
- *   - Off-screen geometry doesn't occlude (the depth buffer doesn't
- *     have it).
- *   - Geometry behind objects doesn't occlude either (the depth buffer
- *     stores only the closest surface per pixel).
- *
- * What you gain:
- *   - O(K) per pixel, completely independent of scene complexity.
- *   - Trivial to integrate into a deferred pipeline (just sample the
- *     depth buffer that's already there).
- *
- * For most scenes the cheating is invisible — corners and crevices
- * darken correctly because their occluders are visible to the camera
- * and therefore in the depth buffer. SSAO is now standard in every
- * real-time engine since CryEngine 2 shipped it (Mittring 2007).
- *
- * T3  HEMISPHERE SAMPLING — K ANTENNAS POINTED AT THE SKY
- * ────────────────────────────────────────────────────────
- * For each visible pixel with surface point P and normal N, generate
- * K sample directions clustered in the upper hemisphere along N:
- *
- *     for k in 0 .. K-1:
- *       dir = pre-computed random unit vector
- *       if dot(dir, N) < 0: dir = -dir       hemisphere flip
- *       sample_point = P + dir · SSAO_RADIUS
- *
- * `dir` is from a precomputed kernel of K unit vectors with random
- * orientations — uploaded once at startup (§1 + §7). The "if dot < 0,
- * flip" trick is cheaper than generating cosine-weighted samples
- * directly and works fine for AO.
- *
- * Each sample_point is "an antenna sticking up from P into the
- * hemisphere above the surface." We're going to ask each antenna
- * "is there a closer surface between you and the camera?" (T4).
- *
- * Per-pixel kernel variation: each pixel picks a kernel from
- * VARIANTS = 4 different precomputed sets, indexed by the 2×2 tile
- * pattern `(c & 1) | ((r & 1) << 1)`. This breaks the directional
- * banding that would result from EVERY pixel using the SAME K
- * samples. The result is a per-pixel checkerboard of AO values —
- * cleaned up by the 3×3 blur (T7).
- *
- * Read §1 k_ssao kernel + §7 ssao_pass.
- *
- * T4  THE DEPTH TEST — "IS THIS ANTENNA BLOCKED?"
- * ────────────────────────────────────────────────
- * For each sample_point S, project it back to the screen and read
- * the depth buffer at that pixel:
- *
- *     clip       = VP · (S, 1)
- *     ndc.z      = clip.z / clip.w
- *     (sx, sy)   = ( ndc.x + 1)/2 · cols, (-ndc.y + 1)/2 · rows
- *
- *     if g_zbuf[sy][sx] < ndc.z - BIAS:
- *       OCCLUDED        (something closer than S is at this pixel)
- *     else:
- *       NOT OCCLUDED    (S is the closest, or close enough)
- *
- * The intuition: if the depth buffer at S's projected pixel
- * recorded a CLOSER surface than where S actually sits, then
- * something occludes the path from camera to S.
- *
- * BIAS prevents self-occlusion. Without it, samples just above a
- * flat surface read the surface's own depth — float jitter then
- * randomly says "occluded" half the time, producing noisy gray
- * across flat regions. BIAS pushes the comparison threshold
- * slightly in front of the surface to fix this.
- *
- * Trade with bias: too small → acne, too large → AO disappears
- * inside thin features. SSAO_BIAS = 0.0008 in §1 is calibrated
- * for this scene's worst-case depth gradient.
- *
- * T5  RANGE FALLOFF — KEEPING AO LOCAL
- * ─────────────────────────────────────
- * Without falloff, a distant background object occludes a foreground
- * pixel — producing fake AO darkening that bears no relation to the
- * real corner geometry.
- *
- * Range falloff: weight each sample by HOW CLOSE the occluder is in
- * VIEW-SPACE Z:
- *
- *     dz_view = | g_z_view[r][c] - g_z_view[sy][sx] |
- *     attn    = max(0, 1 - dz_view / SSAO_RADIUS)
- *
- *     if SAMPLE_OCCLUDED:  occluded_weight += attn
- *     total_weight += attn
- *
- * AO = 1 - occluded_weight / total_weight
- *
- * Now an occluder more than SSAO_RADIUS from the surface contributes
- * 0 (attn = 0). Only LOCAL geometry can cast an AO darkening.
- *
- * SSAO_RADIUS becomes the "size of the AO halo" — small radius
- * gives tight crevice shadows; large radius gives fluffy soft
- * darkening that extends across object boundaries. Pressing `[' /
- * `]' adjusts it live.
- *
- * Note we use g_z_view (linear view-space Z) not g_zbuf (NDC z).
- * View-space Z varies linearly with distance; NDC z compresses
- * heavily near the far plane. Range-falloff math is much cleaner
- * with linear Z.
- *
- * T6  MODULATING AMBIENT ONLY — NEVER DIRECT LIGHT
- * ─────────────────────────────────────────────────
- * Crucial design choice: AO multiplies the AMBIENT lighting term
- * ONLY. Direct lighting (sun, point lights) is UNTOUCHED.
- *
- *     lit = AMBIENT · albedo · g_ao_blur     ← AO modulates this
- *         + diffuse · sun_col · max(0, N·L)  ← unchanged
- *         + specular · ...                   ← unchanged
- *
- * Why? Ambient light is the diffuse SKY/INDIRECT contribution from
- * the full hemisphere. That's exactly what "fraction of hemisphere
- * occluded" should affect — less hemisphere visible to the surface,
- * less ambient reaches it.
- *
- * Direct light (sun) reaches the surface from a SINGLE specific
- * direction. If the ray from the surface to the sun is BLOCKED, that's
- * a SHADOW (handled by shadow_mapping.c, not AO). If the ray is
- * UNBLOCKED, the sun fully reaches the surface regardless of how
- * many other directions are blocked — AO has nothing to say about it.
- *
- * Multiplying everything by AO would over-darken corners because
- * sun light would get blocked by ambient occlusion that doesn't
- * actually obstruct the sun's specific direction. Wrong physics.
- *
- * Read §8 render_lightpass — only the ambient line picks up AO.
- *
- * T7  THE 3×3 BLUR — DENOISING THE PER-PIXEL CHECKERBOARD
- * ────────────────────────────────────────────────────────
- * Per-pixel kernel variation (T3) means neighbouring pixels use
- * different K-sample sets. Each AO value is therefore a stochastic
- * estimate; neighbouring pixels can have noticeably different AO
- * values even on a flat surface.
- *
- * 3×3 box blur averages g_ao over the 3×3 neighbourhood:
- *
- *     g_ao_blur[r][c] = mean(g_ao[r±1][c±1] for valid pixels)
- *
- * Every pixel ends up sharing samples with its 8 neighbours →
- * checkerboard collapses into a smooth gradient. A 3×3 average is
- * sufficient because the variation is small and short-range.
- *
- * Edge handling: skip pixels where g_valid = 0 (sky pixels).
- * Otherwise the blur would pull AO toward the sky's default value
- * across silhouettes.
- *
- * Read §7 ssao_blur for the implementation.
- *
- * T8  THREE MODES — AO_ONLY / LIT_NO_AO / LIT_WITH_AO
- * ────────────────────────────────────────────────────
- * Cycling `a' switches between three OUTPUT MODES, each emphasising
- * a different aspect of the algorithm:
- *
- *   AO_ONLY      Grayscale visualisation of g_ao_blur. Bright
- *                everywhere except crevices and corners. Diagnostic:
- *                "is the AO map producing correct dark features?"
- *
- *   LIT_NO_AO    Full Blinn-Phong, AMBIENT term unmultiplied. The
- *                sphere "floats" above the step (no contact halo);
- *                the pyramid corners are bright; the floor under
- *                the bottom step is plain.
- *
- *   LIT_WITH_AO  Full Blinn-Phong, AMBIENT × AO. The sphere SITS on
- *                the step (visible contact halo); pyramid corners
- *                darken; floor under the bottom step has a faint
- *                surrounding shadow ring. The PROOF that AO adds
- *                grounding/depth.
- *
- * Toggling LIT_NO_AO ↔ LIT_WITH_AO with the orbit paused is the
- * cleanest way to see what SSAO contributes. Only the four corner
- * regions change. Flat faces are pixel-identical. The lighting
- * itself doesn't change — only the AMBIENT modulation.
- *
- * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -535,24 +30,24 @@
 #include <string.h>
 #include <time.h>
 
-/* ── §1 config ───────────────────────────────────────────────────────── */
+/* ── §1 settings — every number you'd tweak, named in one place ── */
 
-/* §1.1 frame rate + UI */
+/* §1.1 frame rate + readout. */
 enum {
   FPS_TARGET = 60,
-  FPS_UPDATE_MS = 500,
-  HUD_ROWS = 5, /* row 0 + 3 edu rows + cyan hint */
+  FPS_UPDATE_MS = 500,            /* how often the fps number refreshes */
+  HUD_ROWS = 5, /* rows reserved at the bottom: title + 3 info rows + key hint */
 };
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define DT_CAP_NS (100 * NS_PER_MS)
 
-/* §1.2 G-buffer dimensions (static; sized for a large terminal). */
+/* §1.2 biggest screen we handle — the off-screen buffers are sized once to this. */
 #define GBUF_MAX_W 300
 #define GBUF_MAX_H 80
 
-/* §1.3 view geometry — eye orbits the scene at fixed elevation. */
+/* §1.3 the camera — it orbits the scene at a fixed height, looking at the middle. */
 #define CAM_FOV (55.0f * (float)M_PI / 180.0f)
 #define CAM_NEAR 0.1f
 #define CAM_FAR 50.0f
@@ -568,58 +63,52 @@ enum {
 #define CELL_W 8
 #define CELL_H 16
 
-/* §1.4 SSAO parameters
+/* §1.4 the SSAO knobs.
  *
- * RADIUS  — how far in WORLD units the sampler looks. Small radius
- *           catches only tight inside-corners; large radius gives a
- *           soft global darkening. Default sized to ~step height.
- * BIAS    — small NDC-z offset so flat surfaces don't self-occlude.
- * SAMPLES × VARIANTS — 12 samples per pixel × 4 distinct kernels in
- *           a 2×2 tile = 48 directions sampled across each tile. The
- *           blur then averages over a 3×3 = 9-cell neighbourhood, so
- *           every blurred pixel is smoothed by 100+ contributions.
- */
+ * RADIUS — how far out (in world units) we look for nearby surfaces. Small =
+ *   only tight corners darken; large = a soft overall shade. Sized ~one step.
+ * BIAS — a tiny fudge so a flat surface doesn't darken itself. Measured in
+ *   real (linear) distance, which behaves the same near and far; an earlier
+ *   version measured it in screen depth and left random blotches crawling on
+ *   the far floor.
+ * SAMPLES × VARIANTS — 12 probe directions per cell, in 4 different sets spread
+ *   over a 2×2 tile (48 directions across the tile); the later 3×3 blur then
+ *   averages neighbours, so each result is smoothed by 100+ probes. */
 #define SSAO_SAMPLES 12
 #define SSAO_KERNEL_VARIANTS 4
-#define SSAO_RADIUS_DEF 0.45f
+#define SSAO_RADIUS_DEF 0.60f /* a touch wide so the dark bands read at terminal res */
 #define SSAO_RADIUS_MIN 0.10f
 #define SSAO_RADIUS_MAX 1.40f
 #define SSAO_RADIUS_STEP 0.05f
-#define SSAO_BIAS 0.0008f
+#define SSAO_BIAS 0.02f /* in real distance, not screen depth */
 
-/* §1.5 lighting — single warm sun + cool ambient.
+/* §1.4b rasteriser guards (see §3/§6). */
+#define CLIP_W_MIN 0.001f  /* a vertex/sample with w below this is behind the eye */
+#define W_DIVIDE_EPS 1e-6f /* never divide by a w smaller than this */
+
+/* §1.5 lighting — one warm sun plus a soft fill light from all around.
  *
- * AO scales the AMBIENT term only. Make ambient bright enough that
- * the AO darkening is visible against the lit surface. The sun is
- * direct and unaffected by AO. */
-/* Key light: above, slightly to one side, and IN FRONT (negative z) so the
- * camera-facing faces are lit. (Was +z — behind the structure — which only
- * looked right under the old flipped m4_lookat; the camera saw the back.) */
+ * AO scales the AMBIENT term only — bright enough that the darkening shows, not
+ * so bright it flattens the picture. The fill isn't one flat colour: it fades
+ * from a cool "sky" tint on upward faces to a warm "bounce" tint on downward
+ * ones, so the flat faces look lit by an environment instead of one dead grey.
+ * (That's the AO-safe bit of nicer lighting — a rim glow or a fill light would
+ * brighten exactly the crevices SSAO is trying to darken.) The sun is direct
+ * and unaffected by AO. */
+/* The sun's direction: up high, a little to one side, and toward the camera so
+ * the faces we actually see are the lit ones. Aim it the other way and only the
+ * unseen back of the structure gets lit. */
 static const float SUN_DIR[3] = {-0.55f, -0.85f, -0.30f};
 static const float SUN_COL[3] = {0.95f, 0.85f, 0.65f};
-static const float AMBIENT_COL[3] = {0.46f, 0.50f, 0.56f};
+static const float AMBIENT_SKY[3] = {0.34f, 0.40f, 0.50f};    /* fill from above — cool   */
+static const float AMBIENT_GROUND[3] = {0.30f, 0.27f, 0.23f}; /* fill from below — warm   */
 #define SHININESS 24.0f
 #define SPEC_GAIN 0.30f
 
-/* §1.6 scene geometry — stepped pyramid + sphere on a floor.
- *
- *                    sphere (r=0.35, centre y=2.75)
- *                       ●
- *                    ┌─┴┴─┐    step 2  (1.10 wide × 0.80 tall, y 1.6–2.4)
- *                  ┌─┴────┴─┐  step 1  (2.00 wide × 0.80 tall, y 0.8–1.6)
- *                ┌─┴────────┴─┐  step 0 (3.00 wide × 0.80 tall, y 0.0–0.8)
- *               ─┴────────────┴────────  floor (y = 0)
- *
- * Each step sits ON the previous step's top face — the y boundaries
- * coincide. The sphere's bottom touches the top of step 2 (y = 2.4),
- * giving the iconic round-on-flat contact halo for AO.
- *
- * Four AO features the demo highlights:
- *   1. floor halo around step 0's footprint
- *   2. step 0 top, around step 1's footprint
- *   3. step 1 top, around step 2's footprint
- *   4. step 2 top, circular halo under the sphere
- */
+/* §1.6 where things sit: a floor at height 0, three square steps stacked into a
+ * little pyramid (each resting exactly on the one below), and a sphere sitting
+ * on the top step. The four spots SSAO darkens are the floor around the base
+ * step, each step-top around the next step's edge, and a ring under the sphere. */
 #define FLOOR_HALF_X 4.0f
 #define FLOOR_HALF_Z 4.0f
 
@@ -646,14 +135,15 @@ enum {
   N_OBJECTS,
 };
 
-/* §1.7 character ramp — Paul Bourke 92-char density ladder. */
+/* §1.7 the characters we draw with, darkest → brightest by how much ink each
+ * one has (Paul Bourke's ramp). */
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
-/* §1.8 Bayer 4×4 dither — added to luma at paint time so neighbouring
- * cells with similar brightness pick different ramp characters. */
+/* §1.8 dither — a tiny repeating grid of brightness nudges so big flat areas
+ * don't all snap to one character and show hard bands. */
 static const float k_bayer[4][4] = {
     {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
     {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
@@ -661,13 +151,16 @@ static const float k_bayer[4][4] = {
     {15 / 16.f, 7 / 16.f, 13 / 16.f, 5 / 16.f},
 };
 #define DITHER_AMP 0.10f
+#define BOLD_LUMA 0.85f /* brighter than this ⇒ draw the cell bold */
+#define DIM_LUMA 0.15f  /* darker than this ⇒ draw it dim          */
 
-/* §1.9 ncurses pair IDs — 216 RGB cube + yellow HUD + cyan hint. */
+/* §1.9 colour-slot numbers (ncurses refers to each colour by a number). */
 #define PAIR_CUBE_BASE 1
 #define PAIR_HUD 217
 #define PAIR_HINT 218
+#define CUBE_SIZE 6 /* 6 steps per channel → 6×6×6 = 216 colours we can draw */
 
-/* ── §2 clock ────────────────────────────────────────────────────────── */
+/* ── §2 clock — a steady timer and a sleep, to pace the frames ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -683,7 +176,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ── §3 math (V3, V4, Mat4) ──────────────────────────────────────────── */
+/* ── §3 math — vectors, 4×4 matrices, and the camera transforms ── */
 
 typedef struct {
   float x, y, z;
@@ -758,8 +251,8 @@ static inline Vec3 m4_dir(Mat4 m, Vec3 d) {
   return v3(r.x, r.y, r.z);
 }
 
-/* OpenGL-style perspective. After m4_mul_v4, clip.w = -z_view; the
- * perspective divide x/w, y/w shrinks far things on screen. */
+/* The perspective lens. It sets things up so that dividing by w (done later)
+ * shrinks far-away things on screen, the way real distance does. */
 static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   Mat4 m = {{{0}}};
   float f = 1.f / tanf(fovy * 0.5f);
@@ -773,9 +266,9 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
 
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
-  /* right = f × up (gluLookAt convention). Using up × f here negates BOTH
-   * right and up — a 180° roll that renders the scene upside-down and
-   * mirrored (world +y maps to the bottom of the screen). */
+  /* "right" is forward crossed with up, in this order. Flip the order and you
+   * also flip up, which rolls the whole view 180° — the scene comes out
+   * upside-down and mirrored. */
   Vec3 r = v3_norm(v3(f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
                       f.x * up.y - f.y * up.x));
   Vec3 u =
@@ -796,8 +289,9 @@ static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   return m;
 }
 
-/* Cofactor of upper-left 3×3 — correct normal transform under
- * non-uniform scale; equals the rotation for pure rotation. */
+/* The matrix that transforms a surface's normal (its "which way am I facing"
+ * arrow). You can't just reuse the model matrix: stretching an object more in
+ * one direction would tilt the arrows the wrong way. This fixes that. */
 static Mat4 m4_normal_mat(Mat4 m) {
   Mat4 n = m4_identity();
   n.m[0][0] = m.m[1][1] * m.m[2][2] - m.m[1][2] * m.m[2][1];
@@ -820,7 +314,72 @@ static Mat4 m4_translate(float x, float y, float z) {
   return m;
 }
 
-/* ── §4 paint (216 RGB cube + Bourke ramp) ───────────────────────────── */
+/* For one point and one triangle, how much each of the three corners "owns"
+ * that point (three weights that add up to 1). These weights both tell us if
+ * the point is inside and let us blend the corners' colours/depths. Returns
+ * -1s for a zero-area triangle so the caller skips it. */
+static void barycentric(const float sx[3], const float sy[3], float px,
+                        float py, float b[3]) {
+  float d =
+      (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2]);
+  if (fabsf(d) < 1e-6f) {
+    b[0] = b[1] = b[2] = -1.f;
+    return;
+  }
+  b[0] = ((sy[1] - sy[2]) * (px - sx[2]) + (sx[2] - sx[1]) * (py - sy[2])) / d;
+  b[1] = ((sy[2] - sy[0]) * (px - sx[2]) + (sx[0] - sx[2]) * (py - sy[2])) / d;
+  b[2] = 1.f - b[0] - b[1];
+}
+
+/* All three weights non-negative means the point is inside the triangle. */
+static bool bary_inside(const float b[3]) {
+  return b[0] >= 0.f && b[1] >= 0.f && b[2] >= 0.f;
+}
+
+/* Turn a triangle's three transformed corners into actual screen positions:
+ * divide by w (this is what makes distant things smaller), flip Y so up is up,
+ * and keep a depth value per corner for sorting near vs far later. */
+static void clip_to_screen(const Vec4 clip[3], float sx[3], float sy[3],
+                           float sz[3], int cols, int rows) {
+  for (int vi = 0; vi < 3; vi++) {
+    float w = clip[vi].w;
+    if (fabsf(w) < W_DIVIDE_EPS)
+      w = W_DIVIDE_EPS;
+    sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
+    sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows;
+    sz[vi] = clip[vi].z / w;
+  }
+}
+
+/* Is this triangle facing away from us? We never see the back of a solid
+ * object, so we skip those to save work. The trick: with our corner ordering
+ * and Y-flip, a triangle facing us comes out with negative area; zero or
+ * positive means it's turned away. */
+static bool is_back_facing(const float sx[3], const float sy[3]) {
+  float area =
+      (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+  return area >= 0.f;
+}
+
+/* The smallest screen rectangle that contains the triangle (clamped to the
+ * screen edges), so the fill loop only checks cells the triangle could cover
+ * instead of the whole screen. */
+static void triangle_bbox(const float sx[3], const float sy[3], int cols,
+                          int rows, int *x0, int *x1, int *y0, int *y1) {
+  *x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
+  *x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
+  *y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
+  *y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+}
+
+/* When SSAO probes the area around a point, it should only look outward from the
+ * surface, not down into it. If a probe direction points into the surface, flip
+ * it to point out (N is the surface's outward direction). */
+static Vec3 hemisphere_flip(Vec3 dir, Vec3 N) {
+  return (v3_dot(dir, N) < 0.f) ? v3_neg(dir) : dir;
+}
+
+/* ── §4 paint — turn a colour + brightness into a terminal colour + glyph ── */
 
 static int g_256;
 
@@ -844,66 +403,59 @@ static void color_init(void) {
 static inline float clamp01(float x) {
   return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
 }
-static inline float reinhard(float x) { return x / (1.f + x); }
+static inline int clampi(int x, int lo, int hi) {
+  return x < lo ? lo : (x > hi ? hi : x);
+}
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
 
+/* rec709_luma — perceived brightness (green counts most, blue least). */
+static float rec709_luma(Vec3 c) {
+  return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
+
+/* rgb_to_cube6 — snap display RGB to the nearest of the 216 terminal colours
+ * (6 shades each of R/G/B) and return its slot, 0..215. */
+static int rgb_to_cube6(float r, float g, float b) {
+  int r5 = clampi((int)(r * (CUBE_SIZE - 1) + 0.5f), 0, CUBE_SIZE - 1);
+  int g5 = clampi((int)(g * (CUBE_SIZE - 1) + 0.5f), 0, CUBE_SIZE - 1);
+  int b5 = clampi((int)(b * (CUBE_SIZE - 1) + 0.5f), 0, CUBE_SIZE - 1);
+  return r5 * (CUBE_SIZE * CUBE_SIZE) + g5 * CUBE_SIZE + b5;
+}
+
+/* ramp_index — map a luma in [0,1] to a glyph index in the Bourke ramp. */
+static int ramp_index(float luma) {
+  return clampi((int)(luma * (BOURKE_LEN - 1) + 0.5f), 0, BOURKE_LEN - 1);
+}
+
 /*
- * paint_cell — RGB → terminal pipeline used for every visible cell:
- *   1. Reinhard tone-map per channel
- *   2. gamma encode 1/2.2
- *   3. Bayer 4×4 dither on luma
- *   4. quantise to 6×6×6 RGB cube → pair id
- *   5. pick density glyph from 92-char Bourke ramp by Rec.709 luma
- *   6. A_BOLD on bright cells, A_DIM on dark
+ * Draw one screen cell given its final colour. The steps: adjust the colour so
+ * it looks right to the eye, nudge it with the dither grid, pick the closest
+ * terminal colour, choose a character by how bright it is, and make very bright
+ * cells bold / very dark ones dim.
  *
- * Tone-map BEFORE quantisation — quantising linear HDR puts every
- * bright pixel into one cube cell; Reinhard opens the dynamic range.
+ * We only do the gamma adjustment, not a fancy tone-map: the lighting here never
+ * gets very bright or very dark, so a tone-map would just squash everything into
+ * the dark characters. Plain gamma keeps the full range of characters in use,
+ * which matters on a terminal with only a handful of brightness steps.
  */
 static void paint_cell(int sx, int sy, Vec3 col) {
-  float r = gamma_enc(reinhard(col.x));
-  float g = gamma_enc(reinhard(col.y));
-  float b = gamma_enc(reinhard(col.z));
+  Vec3 disp = v3(gamma_enc(col.x), gamma_enc(col.y), gamma_enc(col.z));
 
-  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  float luma = rec709_luma(disp);
   float dith = (k_bayer[sy & 3][sx & 3] - 0.5f) * DITHER_AMP;
-  float lum_d = clamp01(luma + dith);
+  float lum_d = clamp01(luma + dith); /* dither breaks up flat banding */
 
-  int pair;
-  if (g_256) {
-    int r5 = (int)(r * 5.f + 0.5f);
-    if (r5 > 5)
-      r5 = 5;
-    if (r5 < 0)
-      r5 = 0;
-    int g5 = (int)(g * 5.f + 0.5f);
-    if (g5 > 5)
-      g5 = 5;
-    if (g5 < 0)
-      g5 = 0;
-    int b5 = (int)(b * 5.f + 0.5f);
-    if (b5 > 5)
-      b5 = 5;
-    if (b5 < 0)
-      b5 = 0;
-    pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
-  } else {
-    pair = PAIR_CUBE_BASE;
-  }
+  int pair = g_256 ? PAIR_CUBE_BASE + rgb_to_cube6(disp.x, disp.y, disp.z)
+                   : PAIR_CUBE_BASE;
+  int glyph = ramp_index(lum_d);
 
-  int idx = (int)(lum_d * (BOURKE_LEN - 1) + 0.5f);
-  if (idx < 0)
-    idx = 0;
-  if (idx >= BOURKE_LEN)
-    idx = BOURKE_LEN - 1;
-
-  int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
-
+  int attr = (luma > BOLD_LUMA) ? A_BOLD : (luma < DIM_LUMA) ? A_DIM : A_NORMAL;
   attron(COLOR_PAIR(pair) | attr);
-  mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[idx]);
+  mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[glyph]);
   attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* ── §5 mesh ─────────────────────────────────────────────────────────── */
+/* ── §5 mesh — build the shapes out of triangles, once at startup ── */
 
 typedef struct {
   Vec3 pos;
@@ -926,13 +478,11 @@ static void mesh_free(Mesh *m) {
 }
 
 /*
- * mesh_add_quad — append one flat quad (4 verts, 2 CCW tris) to a Mesh.
- *
- * Walk origin → +e1 → +e1+e2 → +e2 in CCW order viewed from outside
- * the surface (i.e. looking down the +nrm direction). Caller must
- * arrange e1 and e2 so e1 × e2 has the same sign as nrm — otherwise
- * the face is back-face-culled. tessellate_box verifies the sign per
- * face in the comments.
+ * Add one flat rectangle (as two triangles) to a mesh. You give a starting
+ * corner and two edge directions; it walks the four corners around the rectangle
+ * and records which way the surface faces. The caller has to pick the two edge
+ * directions in the right order, or the rectangle ends up facing inward and gets
+ * skipped as a back face (tessellate_box notes the correct order per face).
  */
 static void mesh_add_quad(Mesh *m, Vec3 origin, Vec3 e1, Vec3 e2, Vec3 nrm) {
   int v0 = m->nvert;
@@ -949,11 +499,10 @@ static void mesh_add_quad(Mesh *m, Vec3 origin, Vec3 e1, Vec3 e2, Vec3 nrm) {
 }
 
 /*
- * tessellate_box — axis-aligned cuboid centred at the origin. 24
- * vertices (4 per face × 6 faces) so each face has its own flat
- * normal. Sharing 8 corner verts would average normals across faces
- * and round the cube into a smoothed lump — useless for SSAO where
- * flat faces and hard edges are the whole point.
+ * Build a box centred at the origin. Each of the 6 faces gets its own 4 corners
+ * (24 in total) instead of sharing the 8 box corners. Sharing would blend the
+ * facing directions at the corners and make the box look rounded — but this demo
+ * is all about flat faces and sharp edges, so we keep them crisp.
  */
 static Mesh tessellate_box(float hx, float hy, float hz) {
   Mesh m;
@@ -983,7 +532,7 @@ static Mesh tessellate_box(float hx, float hy, float hz) {
   return m;
 }
 
-/* tessellate_quad — one rectangle (4 verts, 2 tris). Used for the floor. */
+/* A single flat rectangle on its own — used for the floor. */
 static Mesh tessellate_quad(Vec3 origin, Vec3 e1, Vec3 e2, Vec3 nrm) {
   Mesh m;
   m.verts = malloc(4 * sizeof(Vertex));
@@ -995,17 +544,14 @@ static Mesh tessellate_quad(Vec3 origin, Vec3 e1, Vec3 e2, Vec3 nrm) {
 }
 
 /*
- * tessellate_sphere — UV sphere, smooth normals.
+ * Build a sphere, like a globe made of rows (rings) and columns (segments). We
+ * march down from the north pole to the south pole and around each ring, placing
+ * a grid of points on the surface and joining them into triangles.
  *
- * Vertices on a (rings+1) × (segs+1) grid in spherical coords:
- *   theta ∈ [0, π] polar angle,  phi ∈ [0, 2π] azimuth.
- *   pos = R · (sin θ · cos φ, cos θ, sin θ · sin φ)
- *   nrm = pos / R   (unit normal = unit position vector)
- *
- * Smooth shading: each vertex's normal points outward radially. The
- * rasteriser barycentric-blends them per pixel, so the AO pass sees
- * a smooth normal field on the sphere — and the contact halo bends
- * smoothly around the sphere's curve.
+ * Each corner's facing direction points straight out from the centre. Because
+ * the renderer blends these directions across each triangle, the sphere shades
+ * as a smooth curve rather than showing flat facets — so its contact shadow
+ * curves smoothly around it too.
  */
 static Mesh tessellate_sphere(float radius, int rings, int segs) {
   int n_verts = (rings + 1) * (segs + 1);
@@ -1045,60 +591,70 @@ static Mesh tessellate_sphere(float radius, int rings, int segs) {
   return m;
 }
 
-/* ── §6 G-buffer — geometry pass ─────────────────────────────────────── */
+/* ── §5b scene pieces — the small types the render passes below take ── */
 
-static Vec3 g_pos[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_normal[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_albedo[GBUF_MAX_H][GBUF_MAX_W];
-static float g_zbuf[GBUF_MAX_H][GBUF_MAX_W];   /* NDC z (-1 near, +1 far) */
-static float g_z_view[GBUF_MAX_H][GBUF_MAX_W]; /* view-space z (linear)   */
-static uint8_t g_valid[GBUF_MAX_H][GBUF_MAX_W];
+/* One thing in the scene: its shape (mesh), its plain colour (albedo), and where
+ * it sits in the world (model). The floor, the three steps, and the sphere are
+ * each one of these. */
+typedef struct {
+  Mesh mesh;
+  Vec3 albedo;
+  Mat4 model;
+} SceneObject;
 
-static void gbuffer_clear(int cols, int rows) {
+/* The eye we view from. It holds where the eye is in the world plus the
+ * ready-made transforms (built from the orbit angle and zoom) that move a point
+ * from the world onto the screen. */
+typedef struct {
+  Mat4 view, proj, vp;
+  Vec3 pos;
+  float dist; /* how far back the eye sits — zoom */
+  float yaw;  /* how far around the scene it has turned */
+} Camera;
+
+/* ── §6 first pass — draw the scene into per-cell buffers (no colour yet) ── */
+
+/* Instead of lighting each triangle as we draw it, we first record, for every
+ * screen cell, the facts a later step will need: the surface's world position,
+ * which way it faces, its plain colour, and how far away it is. SSAO and the
+ * lighting step then work from these buffers. We keep two distances: a quick one
+ * for deciding what's in front, and a true (evenly-spaced) one that SSAO needs
+ * to judge nearby surfaces correctly. (This split-into-passes idea is called
+ * deferred shading.) */
+typedef struct {
+  Vec3 pos[GBUF_MAX_H][GBUF_MAX_W];      /* where the surface is, in the world */
+  Vec3 normal[GBUF_MAX_H][GBUF_MAX_W];   /* which way it faces */
+  Vec3 albedo[GBUF_MAX_H][GBUF_MAX_W];   /* its plain colour, before lighting */
+  float zbuf[GBUF_MAX_H][GBUF_MAX_W];    /* quick depth, for deciding what's in front */
+  float z_view[GBUF_MAX_H][GBUF_MAX_W];  /* true distance from the eye, used by SSAO */
+  uint8_t valid[GBUF_MAX_H][GBUF_MAX_W]; /* did anything get drawn at this cell? */
+} GBuffer;
+
+static GBuffer g_gbuf;
+
+static void gbuffer_clear(GBuffer *g, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      g_zbuf[r][c] = 1.0f;
-      g_z_view[r][c] = -CAM_FAR;
-      g_valid[r][c] = 0;
+      g->zbuf[r][c] = 1.0f;
+      g->z_view[r][c] = -CAM_FAR;
+      g->valid[r][c] = 0;
     }
   }
 }
 
 /*
- * Möller signed-area barycentrics. Returns -1s for degenerate
- * triangles so the caller skips the pixel.
- */
-static void barycentric(const float sx[3], const float sy[3], float px,
-                        float py, float b[3]) {
-  float d =
-      (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2]);
-  if (fabsf(d) < 1e-6f) {
-    b[0] = b[1] = b[2] = -1.f;
-    return;
-  }
-  b[0] = ((sy[1] - sy[2]) * (px - sx[2]) + (sx[2] - sx[1]) * (py - sy[2])) / d;
-  b[1] = ((sy[2] - sy[0]) * (px - sx[2]) + (sx[0] - sx[2]) * (py - sy[2])) / d;
-  b[2] = 1.f - b[0] - b[1];
-}
-
-/*
- * rasterize_object — three-stage GPU-style pipeline:
- *   1. vertex transform: clip = mvp·pos, world = model·pos,
- *      world_nrm = norm_mat·nrm, view_z = (view·model·pos).z
- *   2. perspective divide → screen + back-face cull
- *   3. barycentric interpolate, z-test, write G-buffer
- *
- * SSAO needs view-space Z (linear) for its range check, NOT NDC-z
- * (non-linear after perspective). g_z_view is the parallel buffer
- * that records linear depth.
+ * Draw one object into the per-cell buffers. For each of its triangles: move the
+ * corners into place and onto the screen, drop triangles facing away, then for
+ * every cell the triangle covers, work out the surface details there and store
+ * them — but only if this triangle is closer than whatever was stored before.
  */
 static void rasterize_object(const Mesh *mesh, Vec3 albedo, Mat4 mvp,
                              Mat4 model, Mat4 modelview, Mat4 norm_mat,
-                             int cols, int rows) {
+                             GBuffer *g, int cols, int rows) {
   for (int ti = 0; ti < mesh->ntri; ti++) {
     const Triangle *tri = &mesh->tris[ti];
 
-    /* STAGE 1: vertex transform. */
+    /* Step 1: move each corner into world space and toward the screen. */
     Vec4 clip[3];
     Vec3 wpos[3], wnrm[3];
     float vz[3];
@@ -1110,87 +666,72 @@ static void rasterize_object(const Mesh *mesh, Vec3 albedo, Mat4 mvp,
       vz[vi] = m4_pt(modelview, v->pos).z;
     }
 
-    if (clip[0].w < 0.001f && clip[1].w < 0.001f && clip[2].w < 0.001f)
-      continue;
+    if (clip[0].w < CLIP_W_MIN && clip[1].w < CLIP_W_MIN &&
+        clip[2].w < CLIP_W_MIN)
+      continue; /* whole triangle behind the eye */
 
-    /* STAGE 2: perspective divide → screen. */
+    /* Step 2: finish the screen positions, then skip it if it faces away. */
     float sx[3], sy[3], sz[3];
-    for (int vi = 0; vi < 3; vi++) {
-      float w = clip[vi].w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
-      sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows;
-      sz[vi] = clip[vi].z / w;
-    }
-
-    /* Back-face cull. Meshes are wound CCW-as-seen-from-outside; the Y-flip
-     * in the screen mapping above makes a front face's signed area NEGATIVE,
-     * so we keep area < 0 and cull the back faces (area >= 0). */
-    float area =
-        (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (area >= 0.f)
+    clip_to_screen(clip, sx, sy, sz, cols, rows);
+    if (is_back_facing(sx, sy))
       continue;
 
-    int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
-    int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
-    int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
-    int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+    int x0, x1, y0, y1;
+    triangle_bbox(sx, sy, cols, rows, &x0, &x1, &y0, &y1);
 
-    /* STAGE 3: fragment / G-buffer write. */
+    /* Step 3: for each covered cell, record its surface details. */
     for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
       for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
         float b[3];
         barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
-        if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
+        if (!bary_inside(b))
           continue;
 
         float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
-        if (z >= g_zbuf[py][px])
-          continue;
+        if (z >= g->zbuf[py][px])
+          continue; /* something nearer already here */
 
-        g_zbuf[py][px] = z;
-        g_z_view[py][px] = b[0] * vz[0] + b[1] * vz[1] + b[2] * vz[2];
-        g_pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
-        g_normal[py][px] =
+        g->zbuf[py][px] = z;
+        g->z_view[py][px] = b[0] * vz[0] + b[1] * vz[1] + b[2] * vz[2];
+        g->pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
+        g->normal[py][px] =
             v3_norm(v3_bary(wnrm[0], wnrm[1], wnrm[2], b[0], b[1], b[2]));
-        g_albedo[py][px] = albedo;
-        g_valid[py][px] = 1;
+        g->albedo[py][px] = albedo;
+        g->valid[py][px] = 1;
       }
     }
   }
 }
 
-static void render_gbuffer(const Mesh *meshes, const Vec3 *albedos,
-                           const Mat4 *models, int n_objects, Mat4 view,
-                           Mat4 proj, int cols, int rows) {
-  gbuffer_clear(cols, rows);
+static void render_gbuffer(const SceneObject *objs, int n_objects,
+                           const Camera *cam, GBuffer *g, int cols, int rows) {
+  gbuffer_clear(g, cols, rows);
   for (int oi = 0; oi < n_objects; oi++) {
-    Mat4 mv = m4_mul(view, models[oi]);
-    Mat4 mvp = m4_mul(proj, mv);
-    Mat4 nmat = m4_normal_mat(models[oi]);
-    rasterize_object(&meshes[oi], albedos[oi], mvp, models[oi], mv, nmat, cols,
-                     rows);
+    Mat4 mv = m4_mul(cam->view, objs[oi].model);
+    Mat4 mvp = m4_mul(cam->proj, mv);
+    Mat4 nmat = m4_normal_mat(objs[oi].model);
+    rasterize_object(&objs[oi].mesh, objs[oi].albedo, mvp, objs[oi].model, mv,
+                     nmat, g, cols, rows);
   }
 }
 
-/* ── §7 ssao — per-pixel hemisphere sampling ─────────────────────────── */
+/* ── §7 ssao — measure how shut-in each cell is, and smooth the result ── */
 
 /*
- * §7.1 ── kernel ───────────────────────────────────────────────────────
+ * §7.1 the probe directions.
  *
- * VARIANTS sets of SAMPLES unit-ish vectors. Each pixel picks one
- * variant by (c & 1) | ((r & 1) << 1) — every 2×2 tile uses every
- * variant once. The 3×3 blur in §7.4 averages over a 9-cell
- * neighbourhood, so the final blurred AO is smooth.
+ * To measure how enclosed a point is, we shoot a handful of short feeler
+ * directions out around it and see how many bump into nearby surfaces. We
+ * pre-make several sets of these directions; neighbouring cells use different
+ * sets, and the later blur averages neighbours together, so the result looks
+ * smooth instead of speckled.
  *
- * Vector LENGTHS are biased toward the surface: scale = 0.1 + 0.9·t²
- * with t = i/SAMPLES. Early samples sit very close (catching tight
- * crevices); late samples reach toward RADIUS. That's why nearby
- * corners darken more than distant flat surfaces.
+ * The feelers are mostly short, with a few longer ones: most stay very close to
+ * catch tight crevices, a few reach out toward the full radius. That's why snug
+ * corners darken more than open flat areas.
  *
- * Generated with a deterministic LCG so the kernel is identical
- * every run, regardless of when scene_init / main are called.
+ * We build them with a simple repeatable random generator so the directions come
+ * out the same on every run.
  */
 static Vec3 k_ssao[SSAO_KERNEL_VARIANTS][SSAO_SAMPLES];
 
@@ -1208,7 +749,8 @@ static void ssao_init_kernel(void) {
   for (int v = 0; v < SSAO_KERNEL_VARIANTS; v++) {
     for (int i = 0; i < SSAO_SAMPLES; i++) {
 
-      /* (1) rejection-sample a unit vector inside the unit sphere. */
+      /* (1) pick a random direction: keep guessing random points in a cube
+       *     until one lands inside the unit ball, then point at it. */
       float dx, dy, dz, len2;
       do {
         dx = 2.f * lcg_unit(&seed) - 1.f;
@@ -1220,7 +762,7 @@ static void ssao_init_kernel(void) {
       float inv = 1.f / sqrtf(len2);
       Vec3 dir = v3(dx * inv, dy * inv, dz * inv);
 
-      /* (2) bias length toward the surface (quadratic curve). */
+      /* (2) make the early feelers short and later ones longer. */
       float t = (float)i / (float)SSAO_SAMPLES;
       float scale = 0.1f + 0.9f * t * t;
 
@@ -1229,74 +771,85 @@ static void ssao_init_kernel(void) {
   }
 }
 
-/* §7.2 ── AO buffers ────────────────────────────────────────────────── */
+/* §7.2 the darkening amount per cell — before and after smoothing. */
 
-static float g_ao[GBUF_MAX_H][GBUF_MAX_W];      /* raw, noisy   */
-static float g_ao_blur[GBUF_MAX_H][GBUF_MAX_W]; /* 3×3 averaged */
+static float g_ao[GBUF_MAX_H][GBUF_MAX_W];      /* straight from the probes, speckled */
+static float g_ao_blur[GBUF_MAX_H][GBUF_MAX_W]; /* after averaging neighbours, smooth */
+
+/* Follow one feeler out from point P and ask: is there a surface in the way? We
+ * step to the feeler's tip, find which screen cell it lands on, and compare its
+ * distance with what's drawn there. Reports whether that cell blocks the feeler,
+ * and how much this answer should count (a far-away surface counts for less, and
+ * something off-screen counts for nothing). center_view_z is P's own distance,
+ * used to fade out far blockers. */
+static float ssao_sample(const GBuffer *g, Vec3 P, Vec3 dir, float radius,
+                         float center_view_z, Mat4 vp, Mat4 view, int cols,
+                         int rows, bool *occluded) {
+  *occluded = false;
+
+  Vec3 S = v3_add(P, v3_scale(dir, radius)); /* the feeler's tip, out in the world */
+
+  Vec4 clip = m4_mul_v4(vp, v4(S.x, S.y, S.z, 1.f));
+  if (clip.w < CLIP_W_MIN)
+    return 0.f;
+  int ix = (int)((clip.x / clip.w + 1.f) * 0.5f * (float)cols);
+  int iy = (int)((-clip.y / clip.w + 1.f) * 0.5f * (float)rows);
+  if (ix < 0 || ix >= cols || ix >= GBUF_MAX_W || iy < 0 || iy >= rows ||
+      iy >= GBUF_MAX_H)
+    return 0.f;
+  if (!g->valid[iy][ix])
+    return 0.f;
+
+  /* a blocker much nearer or farther than P shouldn't count — fade it by how
+   * far off in distance it is, and ignore it entirely past the radius */
+  float dz = fabsf(center_view_z - g->z_view[iy][ix]);
+  float attn = 1.f - dz / radius;
+  if (attn <= 0.f)
+    return 0.f;
+
+  /* blocked if the surface drawn here sits in front of the feeler's tip */
+  float s_view_z = m4_pt(view, S).z;
+  if (g->z_view[iy][ix] > s_view_z + SSAO_BIAS)
+    *occluded = true;
+  return attn;
+}
 
 /*
- * §7.3 ── ssao_pass — the per-pixel sample loop ──────────────────────
- *
- * Mirrors MENTAL MODEL → ALGORITHM IN STEPS exactly. Each step in
- * the prose has one labelled block of code below — read either side,
- * the lines should match 1:1.
+ * §7.3 the main loop: for each visible cell, fan its feelers out around the way
+ * the surface faces, ask each whether something blocks it, and combine the
+ * answers into one "how shut-in is this" number (1 = open, 0 = fully boxed in).
  */
-static void ssao_pass(Mat4 vp, float radius, int cols, int rows) {
+static void ssao_pass(const GBuffer *g, Mat4 vp, Mat4 view, float radius,
+                      int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
+      if (!g->valid[r][c]) {
         g_ao[r][c] = 1.f;
         continue;
       }
 
-      /* (a) read surface point and normal */
-      Vec3 P = g_pos[r][c];
-      Vec3 N = g_normal[r][c];
+      /* (a) where this cell's surface is, and which way it faces */
+      Vec3 P = g->pos[r][c];
+      Vec3 N = g->normal[r][c];
 
-      /* (b) pick this pixel's kernel variant from the 2×2 tile */
+      /* (b) pick which set of feelers to use, alternating across a 2×2 tile */
       int variant = (c & 1) | ((r & 1) << 1);
 
-      /* (c) accumulate weighted occlusion over K samples */
+      /* (c) tally up the blocked feelers against the total that counted */
       float occlude_w = 0.f;
       float total_w = 0.f;
 
       for (int i = 0; i < SSAO_SAMPLES; i++) {
-
-        /* hemisphere flip — sample must point ABOVE N */
-        Vec3 dir = k_ssao[variant][i];
-        if (v3_dot(dir, N) < 0.f)
-          dir = v3_neg(dir);
-
-        /* antenna tip in world space */
-        Vec3 S = v3_add(P, v3_scale(dir, radius));
-
-        /* project S to screen via VP */
-        Vec4 clip = m4_mul_v4(vp, v4(S.x, S.y, S.z, 1.f));
-        if (clip.w < 0.001f)
-          continue;
-        float sx = (clip.x / clip.w + 1.f) * 0.5f * (float)cols;
-        float sy = (-clip.y / clip.w + 1.f) * 0.5f * (float)rows;
-        int ix = (int)sx;
-        int iy = (int)sy;
-        if (ix < 0 || ix >= cols || iy < 0 || iy >= rows)
-          continue;
-        if (!g_valid[iy][ix])
-          continue;
-
-        /* range falloff — view-space z difference, linear */
-        float dz = fabsf(g_z_view[r][c] - g_z_view[iy][ix]);
-        float attn = 1.f - dz / radius;
-        if (attn <= 0.f)
-          continue;
-        total_w += attn;
-
-        /* depth test — is some surface in front of S? */
-        float ndc_z_S = clip.z / clip.w;
-        if (g_zbuf[iy][ix] < ndc_z_S - SSAO_BIAS)
-          occlude_w += attn;
+        Vec3 dir = hemisphere_flip(k_ssao[variant][i], N);
+        bool occluded;
+        float w = ssao_sample(g, P, dir, radius, g->z_view[r][c], vp, view, cols,
+                              rows, &occluded);
+        total_w += w;
+        if (occluded)
+          occlude_w += w;
       }
 
-      /* (d) AO factor; fully lit if no usable samples */
+      /* (d) the darkening amount; treat "no feeler counted" as fully open */
       float ao = (total_w > 1e-6f) ? (1.f - occlude_w / total_w) : 1.f;
       g_ao[r][c] = clamp01(ao);
     }
@@ -1304,20 +857,15 @@ static void ssao_pass(Mat4 vp, float radius, int cols, int rows) {
 }
 
 /*
- * §7.4 ── ssao_blur — 3×3 box average ────────────────────────────────
- *
- * Smooths the per-pixel kernel-variant noise. Skips invalid cells in
- * both source and target (a "valid mask" blur), so silhouettes don't
- * bleed AO from off-pixel onto the object.
- *
- * Box blur is good enough at terminal res; a real engine uses a
- * bilateral blur (depth/normal-aware) to preserve edges between
- * adjacent objects.
+ * §7.4 smooth the result by replacing each cell with the average of itself and
+ * its 8 neighbours. This evens out the speckle left by neighbouring cells using
+ * different feeler sets. Empty cells are left out of the average so the
+ * darkening doesn't smear past an object's outline onto the background.
  */
-static void ssao_blur(int cols, int rows) {
+static void ssao_blur(const GBuffer *g, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
+      if (!g->valid[r][c]) {
         g_ao_blur[r][c] = 1.f;
         continue;
       }
@@ -1329,7 +877,7 @@ static void ssao_blur(int cols, int rows) {
           int rr = r + dr, cc = c + dc;
           if (rr < 0 || rr >= rows || cc < 0 || cc >= cols)
             continue;
-          if (!g_valid[rr][cc])
+          if (!g->valid[rr][cc])
             continue;
           sum += g_ao[rr][cc];
           count++;
@@ -1340,47 +888,60 @@ static void ssao_blur(int cols, int rows) {
   }
 }
 
-/* ── §8 lightpass — Blinn-Phong with AO-scaled ambient ───────────────── *
+/* ── §8 lighting — work out the final colour of every cell ── *
  *
- *   ambient = AMBIENT_COL · albedo · AO        ← AO HERE
- *   diffuse = albedo · sun_col · max(0, N · L)
- *   spec    = sun_col · max(0, N · H)^SHININESS · SPEC_GAIN
- *   out     = clamp01(ambient + diffuse + spec)
+ * Each cell's colour adds up three things: a soft fill light that reaches
+ * everywhere (ambient), the direct sun where it actually shines on the surface
+ * (diffuse), and a bright highlight where the sun glints toward the eye
+ * (specular).
  *
- * AO scales ONLY the ambient term — direct sun light is NOT darkened
- * in crevices. Multiplying direct light by AO would be physically
- * wrong (a corner can still receive direct sunlight) and would mute
- * the LIT_NO_AO ↔ LIT_WITH_AO toggle.                                   */
-static Vec3 g_light[GBUF_MAX_H][GBUF_MAX_W];
+ * The AO darkening is applied ONLY to the soft fill light, not to the direct
+ * sun. That's the whole point: a crevice still catches direct sunlight, but
+ * gets less of the bounced-around fill light — so it reads as gently shaded,
+ * not blacked out. Dimming the sun too would also flatten the with-AO /
+ * without-AO comparison the demo is built around. */
+static Vec3 g_light[GBUF_MAX_H][GBUF_MAX_W]; /* the lit colour per cell */
 
-static void render_lightpass(Vec3 cam_pos, bool use_ao, int cols, int rows) {
+static void render_lightpass(const GBuffer *g, Vec3 cam_pos, bool use_ao,
+                             int cols, int rows) {
   Vec3 sun_dir = v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
   Vec3 sun_col = v3(SUN_COL[0], SUN_COL[1], SUN_COL[2]);
-  Vec3 ambient = v3(AMBIENT_COL[0], AMBIENT_COL[1], AMBIENT_COL[2]);
+  Vec3 sky = v3(AMBIENT_SKY[0], AMBIENT_SKY[1], AMBIENT_SKY[2]);
+  Vec3 ground = v3(AMBIENT_GROUND[0], AMBIENT_GROUND[1], AMBIENT_GROUND[2]);
   Vec3 L = v3_norm(v3_neg(sun_dir));
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
+      if (!g->valid[r][c]) {
         g_light[r][c] = v3(0, 0, 0);
         continue;
       }
 
-      Vec3 P = g_pos[r][c];
-      Vec3 N = g_normal[r][c];
-      Vec3 albedo = g_albedo[r][c];
+      Vec3 P = g->pos[r][c];
+      Vec3 N = g->normal[r][c];
+      Vec3 albedo = g->albedo[r][c];
       float ao = use_ao ? g_ao_blur[r][c] : 1.f;
 
-      Vec3 amb = v3(ambient.x * albedo.x * ao, ambient.y * albedo.y * ao,
-                    ambient.z * albedo.z * ao);
+      /* the soft fill: a cool sky tint on surfaces facing up, a warm bounced
+       * tint on those facing down — gentler than one flat fill colour */
+      float up = clamp01(N.y * 0.5f + 0.5f);
+      Vec3 acol = v3(ground.x + (sky.x - ground.x) * up,
+                     ground.y + (sky.y - ground.y) * up,
+                     ground.z + (sky.z - ground.z) * up);
+      Vec3 amb = v3(acol.x * albedo.x * ao, acol.y * albedo.y * ao,
+                    acol.z * albedo.z * ao);
 
       float diff = fmaxf(0.f, v3_dot(N, L));
       Vec3 dif = v3(albedo.x * sun_col.x * diff, albedo.y * sun_col.y * diff,
                     albedo.z * sun_col.z * diff);
 
+      /* Specular only where the sun actually reaches the surface (N·L > 0);
+       * otherwise a face turned away from the light could still flash a stray
+       * highlight when its half-vector lined up by chance. */
       Vec3 V = v3_norm(v3_sub(cam_pos, P));
       Vec3 H = v3_norm(v3_add(L, V));
-      float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN;
+      float spec = (diff > 0.f) ? powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN
+                                : 0.f;
       Vec3 sp = v3(sun_col.x * spec, sun_col.y * spec, sun_col.z * spec);
 
       Vec3 sum = v3_add(v3_add(amb, dif), sp);
@@ -1390,8 +951,10 @@ static void render_lightpass(Vec3 cam_pos, bool use_ao, int cols, int rows) {
   }
 }
 
-/* ── §9 scene ────────────────────────────────────────────────────────── */
+/* ── §9 scene — everything the world is made of, and how it changes ── */
 
+/* The three things the 'a' key cycles between: just the darkening map on its own,
+ * the full lighting without it, and the full lighting with it. */
 typedef enum {
   MODE_AO_ONLY = 0,
   MODE_LIT_NO_AO,
@@ -1405,113 +968,108 @@ static const char *k_mode_names[MODE_COUNT] = {
     "LIT_WITH_AO",
 };
 
+/* The whole world in one place: the things in it, the eye looking at them, and
+ * the few settings the keys change. The big working buffers (the per-cell
+ * buffers, the darkening maps, the lit colours) are kept separately, not here,
+ * because they're scratch space the drawing code owns. */
 typedef struct {
-  /* renderable objects — three parallel arrays indexed by OBJ_* */
-  Mesh meshes[N_OBJECTS];
-  Vec3 albedos[N_OBJECTS];
-  Mat4 models[N_OBJECTS];
+  SceneObject objects[N_OBJECTS]; /* floor, three steps, sphere        */
+  Camera cam;                     /* the eye looking at them           */
 
-  /* camera + projection (vp = proj·view, rebuilt each tick) */
-  Mat4 view, proj, vp;
-  Vec3 cam_pos;
-  float cam_dist;
-  float cam_yaw;
+  float ssao_radius; /* how far the darkening reaches — the [ and ] keys */
+  Mode mode;         /* which of the three views to show — the 'a' key   */
+  bool paused;       /* is the orbit frozen? — the space key             */
 
-  /* SSAO + UI */
-  float ssao_radius;
-  Mode mode;
-  bool paused;
-
-  int scene_cols;
-  int scene_rows;
+  int scene_cols, scene_rows; /* size of the drawing area, in cells    */
 } Scene;
 
 static void scene_rebuild_proj(Scene *s, int cols, int rows) {
-  /* Aspect from PIXEL counts — cell sizes 8×16 are non-square. */
+  /* Work out the width-to-height ratio from pixels, not cells: a terminal cell
+   * is taller than it is wide (8×16), so counting cells would stretch the view. */
   float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
-  s->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
+  s->cam.proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 }
 
 /*
- * scene_rebuild_view — eye orbits scene centre at fixed elevation.
- *   cam_pos = ( sin(yaw)·dist,  CAM_EYE_Y,  cos(yaw)·dist )
- *
- * Called every tick (orbit) AND on +/- zoom. Rebuilds vp = proj·view
- * so the SSAO and lighting passes use a consistent camera.
+ * Place the eye for the current orbit angle and zoom, then rebuild the combined
+ * transform from it. Run every frame as the view turns and whenever you zoom, so
+ * the drawing, darkening, and lighting all agree on where the eye is.
  */
 static void scene_rebuild_view(Scene *s) {
-  float r = s->cam_dist;
-  s->cam_pos = v3(sinf(s->cam_yaw) * r, CAM_EYE_Y, cosf(s->cam_yaw) * r);
-  s->view = m4_lookat(s->cam_pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
-  s->vp = m4_mul(s->proj, s->view);
+  float r = s->cam.dist;
+  s->cam.pos = v3(sinf(s->cam.yaw) * r, CAM_EYE_Y, cosf(s->cam.yaw) * r);
+  s->cam.view = m4_lookat(s->cam.pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
+  s->cam.vp = m4_mul(s->cam.proj, s->cam.view);
 }
 
 /*
- * scene_init — build floor + 3 stacked steps + sphere from scratch.
- *
- * Each step's centre y is chosen so its bottom touches the previous
- * step's top exactly (no float overlap); the sphere's centre y puts
- * its south pole on step 2's top face.
+ * Build the scene from scratch: the floor, three steps stacked into a pyramid,
+ * and the sphere on top. The heights are picked so each step rests exactly on
+ * the one below with no gap or overlap, and the sphere sits right on the top
+ * step.
  */
 static void scene_init(Scene *s, int total_cols, int total_rows) {
   for (int i = 0; i < N_OBJECTS; i++)
-    mesh_free(&s->meshes[i]);
+    mesh_free(&s->objects[i].mesh);
 
   memset(s, 0, sizeof *s);
   s->scene_cols = total_cols;
   s->scene_rows = total_rows - HUD_ROWS;
   s->mode = MODE_LIT_WITH_AO;
+  s->paused = true;       /* open paused so the 'a' AO compare is easy first thing */
   s->ssao_radius = SSAO_RADIUS_DEF;
-  s->cam_dist = CAM_DIST;
-  s->cam_yaw = 0.f;
+  s->cam.dist = CAM_DIST;
+  s->cam.yaw = 0.55f;     /* 3/4 view — shows the front, a side, and the step tops */
 
   /* OBJ_FLOOR — large quad at y = 0, normal up. */
-  s->meshes[OBJ_FLOOR] = tessellate_quad(
+  s->objects[OBJ_FLOOR].mesh = tessellate_quad(
       v3(-FLOOR_HALF_X, 0.f, FLOOR_HALF_Z), v3(2 * FLOOR_HALF_X, 0.f, 0.f),
       v3(0.f, 0.f, -2 * FLOOR_HALF_Z), v3(0.f, 1.f, 0.f));
-  s->albedos[OBJ_FLOOR] = v3(0.42f, 0.46f, 0.50f); /* slate */
-  s->models[OBJ_FLOOR] = m4_identity();
+  s->objects[OBJ_FLOOR].albedo = v3(0.42f, 0.46f, 0.50f); /* slate */
+  s->objects[OBJ_FLOOR].model = m4_identity();
 
-  /* OBJ_STEP0..2 — same warm sandstone, decreasing footprints. */
-  Vec3 stone = v3(0.78f, 0.62f, 0.42f);
+  /* OBJ_STEP0..2 — same warm sandstone, decreasing footprints.
+   * Deeper than a literal sandstone so the lit faces don't blow out to near-
+   * white on the terminal's bright end. */
+  Vec3 stone = v3(0.60f, 0.46f, 0.30f);
 
-  s->meshes[OBJ_STEP0] = tessellate_box(STEP0_HX, STEP_HY, STEP0_HX);
-  s->albedos[OBJ_STEP0] = stone;
-  s->models[OBJ_STEP0] = m4_translate(0.f, STEP0_CY, 0.f);
+  s->objects[OBJ_STEP0].mesh = tessellate_box(STEP0_HX, STEP_HY, STEP0_HX);
+  s->objects[OBJ_STEP0].albedo = stone;
+  s->objects[OBJ_STEP0].model = m4_translate(0.f, STEP0_CY, 0.f);
 
-  s->meshes[OBJ_STEP1] = tessellate_box(STEP1_HX, STEP_HY, STEP1_HX);
-  s->albedos[OBJ_STEP1] = stone;
-  s->models[OBJ_STEP1] = m4_translate(0.f, STEP1_CY, 0.f);
+  s->objects[OBJ_STEP1].mesh = tessellate_box(STEP1_HX, STEP_HY, STEP1_HX);
+  s->objects[OBJ_STEP1].albedo = stone;
+  s->objects[OBJ_STEP1].model = m4_translate(0.f, STEP1_CY, 0.f);
 
-  s->meshes[OBJ_STEP2] = tessellate_box(STEP2_HX, STEP_HY, STEP2_HX);
-  s->albedos[OBJ_STEP2] = stone;
-  s->models[OBJ_STEP2] = m4_translate(0.f, STEP2_CY, 0.f);
+  s->objects[OBJ_STEP2].mesh = tessellate_box(STEP2_HX, STEP_HY, STEP2_HX);
+  s->objects[OBJ_STEP2].albedo = stone;
+  s->objects[OBJ_STEP2].model = m4_translate(0.f, STEP2_CY, 0.f);
 
   /* OBJ_SPHERE — cream, sits on step 2's top. */
-  s->meshes[OBJ_SPHERE] =
+  s->objects[OBJ_SPHERE].mesh =
       tessellate_sphere(SPHERE_RADIUS, SPHERE_RINGS, SPHERE_SEGS);
-  s->albedos[OBJ_SPHERE] = v3(0.90f, 0.84f, 0.74f);
-  s->models[OBJ_SPHERE] = m4_translate(0.f, SPHERE_CY, 0.f);
+  s->objects[OBJ_SPHERE].albedo = v3(0.68f, 0.61f, 0.50f); /* deeper cream */
+  s->objects[OBJ_SPHERE].model = m4_translate(0.f, SPHERE_CY, 0.f);
 
   scene_rebuild_proj(s, total_cols, s->scene_rows);
   scene_rebuild_view(s);
 }
 
-/* The geometry is static — only the camera orbits. AO recomputes
- * every frame against the current view; if you pause the orbit the
- * AO map should be perfectly stable. */
+/* The one thing that changes on its own over time: the eye creeps a little
+ * further around its orbit each frame. Nothing else moves, and pausing freezes
+ * it. The darkening is recomputed every frame for the current view, so when
+ * paused the picture holds perfectly still. */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
-  s->cam_yaw += CAM_ORBIT_RAD_PER_SEC * dt;
+  s->cam.yaw += CAM_ORBIT_RAD_PER_SEC * dt;
   scene_rebuild_view(s);
 }
 
-/* mode_to_rgb — what to paint per pixel. The main loop runs only the
- * passes the active mode needs (see dispatch_passes), so g_light
- * already holds the right thing here. */
-static Vec3 mode_to_rgb(Mode mode, int r, int c) {
-  if (!g_valid[r][c])
+/* The colour to draw at one cell for the current view. The main loop has already
+ * run whichever steps this view needs, so the right values are waiting here. */
+static Vec3 mode_to_rgb(const GBuffer *g, Mode mode, int r, int c) {
+  if (!g->valid[r][c])
     return v3(0, 0, 0);
 
   switch (mode) {
@@ -1527,26 +1085,26 @@ static Vec3 mode_to_rgb(Mode mode, int r, int c) {
   }
 }
 
-/* ── §10 screen — render_scene + HUD ─────────────────────────────────── */
+/* ── §10 screen — draw every cell, then the readout on top ── */
 
-static void render_scene(const Scene *s) {
+static void render_scene(const Scene *s, const GBuffer *g) {
   int cols = s->scene_cols;
   int rows = s->scene_rows;
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c])
+      if (!g->valid[r][c])
         continue;
-      Vec3 col = mode_to_rgb(s->mode, r, c);
+      Vec3 col = mode_to_rgb(g, s->mode, r, c);
       paint_cell(c, r, col);
     }
   }
 }
 
 /*
- * hud_draw — CLAUDE.md HUD spec layout (row 0 yellow+bold status,
- * bottom row cyan+bold hint) plus three educational rows in PAIR_HUD
- * (no bold) for: pipeline cost, mode explanation, what to look for.
+ * Draw the text overlay: a yellow status line along the top, a cyan key-hint
+ * along the bottom, and three dimmer rows that explain the current view and
+ * point out what to look for.
  */
 static void hud_draw(const Scene *s, double fps) {
   int hr = s->scene_rows;
@@ -1554,14 +1112,14 @@ static void hud_draw(const Scene *s, double fps) {
 
   int total_tris = 0;
   for (int i = 0; i < N_OBJECTS; i++)
-    total_tris += s->meshes[i].ntri;
+    total_tris += s->objects[i].mesh.ntri;
 
   /* Row 0: title + status. */
   char status[140];
   snprintf(status, sizeof status,
            " %5.1f fps  mode:%s  K=%d  R=%.2f  zoom:%.1f  tris:%d  %s ", fps,
            k_mode_names[s->mode], SSAO_SAMPLES, (double)s->ssao_radius,
-           (double)s->cam_dist, total_tris, s->paused ? "PAUSED" : "running");
+           (double)s->cam.dist, total_tris, s->paused ? "PAUSED" : "running");
   int slen = (int)strlen(status);
   if (slen > cols)
     slen = cols;
@@ -1616,8 +1174,11 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §11 app ─────────────────────────────────────────────────────────── */
+/* ── §11 app — set up the terminal, run the loop, handle keys ── */
 
+/* Everything the running program needs to keep around: the scene, the terminal
+ * size, and two flags the OS sets for us — one to quit, one to notice the
+ * window was resized. */
 typedef struct {
   Scene scene;
   int total_cols;
@@ -1645,7 +1206,7 @@ static void screen_init(void) {
   curs_set(0);
   nodelay(stdscr, TRUE);
   keypad(stdscr, TRUE);
-  typeahead(-1);
+  typeahead(-1); /* don't let waiting keypresses interrupt drawing (avoids tearing) */
   color_init();
 }
 
@@ -1687,16 +1248,16 @@ static bool app_handle_key(App *app, int ch) {
     break;
   case '=':
   case '+':
-    s->cam_dist -= CAM_ZOOM_STEP;
-    if (s->cam_dist < CAM_DIST_MIN)
-      s->cam_dist = CAM_DIST_MIN;
+    s->cam.dist -= CAM_ZOOM_STEP;
+    if (s->cam.dist < CAM_DIST_MIN)
+      s->cam.dist = CAM_DIST_MIN;
     scene_rebuild_view(s);
     break;
   case '-':
   case '_':
-    s->cam_dist += CAM_ZOOM_STEP;
-    if (s->cam_dist > CAM_DIST_MAX)
-      s->cam_dist = CAM_DIST_MAX;
+    s->cam.dist += CAM_ZOOM_STEP;
+    if (s->cam.dist > CAM_DIST_MAX)
+      s->cam.dist = CAM_DIST_MAX;
     scene_rebuild_view(s);
     break;
   default:
@@ -1706,27 +1267,25 @@ static bool app_handle_key(App *app, int ch) {
 }
 
 /*
- * dispatch_passes — run only the passes the active mode actually needs.
- *   AO_ONLY      → gbuffer + ssao + blur
- *   LIT_NO_AO    → gbuffer + lightpass(use_ao = false)
- *   LIT_WITH_AO  → gbuffer + ssao + blur + lightpass(use_ao = true)
- *
- * Skipping unused passes makes the toggle keys feel snappy and proves
- * the teaching point: SSAO and lighting are independent passes that
- * can each be enabled or disabled at will.
+ * Run only the steps the current view needs. The first step (drawing the scene
+ * into the per-cell buffers) always runs; the darkening and the lighting are
+ * each skipped when the view doesn't show them. Skipping keeps the toggle keys
+ * responsive, and shows that the darkening and the lighting are independent
+ * steps you can turn on or off separately.
  */
 static void dispatch_passes(Scene *s) {
-  render_gbuffer(s->meshes, s->albedos, s->models, N_OBJECTS, s->view, s->proj,
-                 s->scene_cols, s->scene_rows);
+  render_gbuffer(s->objects, N_OBJECTS, &s->cam, &g_gbuf, s->scene_cols,
+                 s->scene_rows);
 
   if (s->mode != MODE_LIT_NO_AO) {
-    ssao_pass(s->vp, s->ssao_radius, s->scene_cols, s->scene_rows);
-    ssao_blur(s->scene_cols, s->scene_rows);
+    ssao_pass(&g_gbuf, s->cam.vp, s->cam.view, s->ssao_radius, s->scene_cols,
+              s->scene_rows);
+    ssao_blur(&g_gbuf, s->scene_cols, s->scene_rows);
   }
 
   if (s->mode != MODE_AO_ONLY) {
     bool use_ao = (s->mode == MODE_LIT_WITH_AO);
-    render_lightpass(s->cam_pos, use_ao, s->scene_cols, s->scene_rows);
+    render_lightpass(&g_gbuf, s->cam.pos, use_ao, s->scene_cols, s->scene_rows);
   }
 }
 
@@ -1752,11 +1311,13 @@ int main(void) {
 
   while (app->running) {
 
+    /* If the window was resized, rebuild the scene for the new size. */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
     }
 
+    /* How long since the last frame? Cap it so a hiccup can't jump the orbit. */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
@@ -1764,8 +1325,10 @@ int main(void) {
       dt = DT_CAP_NS;
     float dt_sec = (float)dt / (float)NS_PER_SEC;
 
-    scene_tick(&app->scene, dt_sec);
+    /* One frame, in order: move, time it, draw, then read input. */
+    scene_tick(&app->scene, dt_sec); /* nudge the eye along its orbit */
 
+    /* Update the fps number, then sleep off any spare time to hold the rate. */
     fps_cnt++;
     fps_acc += dt;
     if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1777,20 +1340,22 @@ int main(void) {
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
 
+    /* Draw: run the steps this view needs, paint the cells, add the overlay. */
     Scene *s = &app->scene;
     erase();
     dispatch_passes(s);
-    render_scene(s);
+    render_scene(s, &g_gbuf);
     hud_draw(s, fps_display);
     screen_present();
 
+    /* Read one keypress, if any, and act on it. */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;
   }
 
   for (int i = 0; i < N_OBJECTS; i++)
-    mesh_free(&app->scene.meshes[i]);
+    mesh_free(&app->scene.objects[i].mesh);
 
   endwin();
   return 0;

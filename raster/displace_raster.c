@@ -1,515 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * displace_raster.c — software vertex displacement on a UV sphere
+ * displace_raster.c — a sphere whose surface really moves: every frame each
+ * point is pushed in or out by a rippling/waving/pulsing/spiky pattern, and the
+ * surface's facing is recomputed so the lighting follows the new shape (not a
+ * fake bump-map — the silhouette genuinely deforms). Press 'd' for the four
+ * patterns, 's' for the four looks (phong, toon, normals, glass), c/+/-/space/q.
  *
- * DEMO: A UV sphere whose vertices are pushed along their normals every
- *       frame by a time-varying scalar field. The geometry actually
- *       changes — this isn't a normal-map fake, the surface really
- *       moves. Cycle 'd' through four modes:
- *
- *         RIPPLE  concentric rings sweep from the equator outward
- *         WAVE    a diagonal travelling wave deforms the whole ball
- *         PULSE   the sphere breathes, biggest at the equator
- *         SPIKY   a porcupine of moving spikes
- *
- *       Cycle 's' through four shaders (phong → toon → normals → wire)
- *       to see HOW the deformed surface is being lit. The fragment
- *       shaders are unchanged from any other file in the folder —
- *       what makes the demo "react" to the deformation is the VERTEX
- *       pass recomputing each surface normal numerically (central
- *       difference) at every frame. Without that, the highlights
- *       would still hug the original sphere while the visible surface
- *       heaved underneath.
- *
- * Study alongside:
- *   raster/sphere_raster.c  — same UV sphere, no displacement
- *   raster/cube_raster.c    — same shader-program scaffolding
- *
- * Section map:
- *   §1  config       — frame, view, sphere, displacement, ramp, dither
- *   §2  math         — Vec3 / Vec4 / Mat4 helpers
- *   §3  displace     — four mode functions + tangent basis + central-diff
- *   §4  shaders      — VSIn / VSOut / FSIn / FSOut + 1 vert × 4 frag
- *   §5  mesh         — UV sphere tessellation (poles handled explicitly)
- *   §6  framebuffer  — zbuf + cbuf, Bayer dither, Bourke ramp, blit
- *   §7  pipeline     — vertex transform → cull → barycentric raster → FS
- *   §8  scene        — uniforms wiring, tick, draw, mode/shader swap
- *   §9  screen       — ncurses init / resize / HUD / present
- *   §10 app          — dt loop, input, resize, cleanup
- *
- * Keys:
- *   d / D     cycle displacement mode  (ripple → wave → pulse → spiky)
- *   s / S     cycle shader             (phong → toon → normals → wire)
- *   c / C     toggle back-face culling
- *   + / =     zoom in
- *   -         zoom out
- *   space     pause / resume animation
- *   q / ESC   quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raster/displace_raster.c -o displace \
- *       -lncurses -lm
+ * Read sphere_raster.c first — this is that same renderer with one extra step in
+ * the per-corner stage. The only new idea here is "move the point, then re-figure
+ * which way it faces."
+ * Ideas from: displacement shaders (Cook, SIGGRAPH '84); the central-difference
+ *   trick for recomputing a surface's facing; z-buffer (Catmull 1974).
+ * Build: gcc -std=c11 -O2 -Wall -Wextra raster/displace_raster.c -o displace -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Vertex displacement. Push every mesh vertex along its
- *                  surface normal by a scalar function f(p, t) — the
- *                  "displacement field". Then recompute the surface
- *                  normal numerically so lighting follows the deformed
- *                  shape, not the original. The fragment shaders never
- *                  see the displacement; they read whatever world
- *                  position + normal arrived from the vertex stage.
- *
- *                  Field formulas (all return a scalar offset along N):
- *                    RIPPLE   f = A·sin(ω·t + k·r) · taper(y),  r = √(x²+z²)
- *                    WAVE     f = A·sin(ω·t + k·(x + 0.8y + 0.5z))
- *                    PULSE    f = A·sin(ω·t)·exp(−γ·r)
- *                    SPIKY    f = A·|sin(kx)·sin(ky)·sin(kz)|^0.6
- *
- *                  Normal recomputation (central difference): pick two
- *                  tangent directions T, B perpendicular to N; sample
- *                  f at p ± εT and p ± εB; reconstruct the displaced
- *                  tangent vectors and cross-product them.
- *
- * Data-structure : One static UV sphere mesh (TESS_U × TESS_V quads,
- *                  pole vertices handled explicitly), tessellated once
- *                  at init. Per-frame the vertex shader re-derives
- *                  position + normal from the base sphere; the mesh
- *                  buffer never changes. Fragment outputs land in a
- *                  zbuf + cbuf framebuffer the same shape as cube_raster.
- *
- * Rendering      : Standard forward pipeline. Per triangle: vertex
- *                  shader runs (displace + normal recompute) → clip →
- *                  perspective divide → screen → back-face cull →
- *                  bounding-box raster with barycentric interp →
- *                  fragment shader → luma → Bayer dither → Bourke ramp.
- *
- * Performance    : O(N_verts) displacement evaluations per frame. The
- *                  normal pass adds 4 extra f() calls per vertex (2
- *                  tangent dirs × ±ε). With TESS_U=48, TESS_V=32 →
- *                  ~3000 vertices × 5 = 15 k field evals per frame —
- *                  trivial at 60 fps in a terminal.
- *
- * References     : Cook, "Shade Trees," SIGGRAPH '84 (the original
- *                    "displacement shader" concept).
- *                  RenderMan Companion §13 — central difference is
- *                    the canonical RenderMan technique for derived
- *                    normals.
- *                  Akenine-Möller et al., Real-Time Rendering 4ed,
- *                    §16.2.4 (modern displacement on the GPU).
- *                  Möller, "Fast Triangle Rasterization by
- *                    Interpolating Edge Functions," GPG (2000).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Tessellate the sphere ONCE. Every frame the vertex shader pushes
- * each vertex along its (original) normal by f(p, t). Moving the
- * vertex invalidates its normal — the surface has bent — so we
- * recompute the normal numerically by sampling f at four nearby
- * points and crossing the resulting tangent vectors. That single
- * trick is what makes the four fragment shaders react to the
- * moving geometry without knowing it moved.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Pushing thumbtacks into and out of a balloon under a torch:
- * displacement = "move the thumbtacks"; normal recompute = "tell
- * the torch where the new face is." If you only move thumbtacks,
- * the highlight stays where it was while the surface heaves
- * underneath — wrong. Recomputing the normal puts the highlight
- * where the new face actually points.
- *
- *      ┌──────────────────────────────────────────────┐
- *      │   undisplaced              displaced         │
- *      │                                              │
- *      │      ↑ N (sphere)            ↑ N′ (recomputed)│
- *      │       \                       \              │
- *      │    ────●────             ─────●──╲           │
- *      │      sphere                deformed surface  │
- *      └──────────────────────────────────────────────┘
- *
- * DRAWING METHOD  /  ALGORITHM IN STEPS
- * ─────────────────────────────────────
- *  1. Tessellate once at init: TESS_U × TESS_V quads, normals = unit
- *     positions, poles handled explicitly.
- *
- *  2. Per frame, vert_displace runs for every vertex:
- *       N    = normalize(pos)                    // sphere normal
- *       d    = disp_fn(pos, time, amp, freq)     // scalar offset
- *       p′   = pos + N · d                       // displaced pos
- *       N′   = displaced_normal(pos, N, ...)     // central diff
- *       clip = MVP · (p′, 1)                     // for rasteriser
- *       wpos = model    · p′                     // for lighting
- *       wnrm = norm_mat · N′                     // for lighting
- *
- *  3. displaced_normal builds a tangent frame (T, B) at pos and
- *     samples f at pos ± εT and pos ± εB. The displaced tangents are
- *       T′ = 2εT + N · (f(+εT) − f(−εT))
- *       B′ = 2εB + N · (f(+εB) − f(−εB))
- *     and N′ = normalize(T′ × B′).
- *
- *  4. Rasteriser barycentric-interpolates world_pos, world_nrm,
- *     u/v, and custom[] across each triangle; z-test → fragment
- *     shader → Vec3 colour.
- *
- *  5. luma_to_cell quantises the Vec3 to a Bayer-dithered Bourke
- *     glyph + colour pair.
- *
- * KEY FORMULAS
- * ────────────
- *   Displacement    p′ = p + N · f(p, t)
- *   Tangent basis   T = norm(cross(up, N)),  B = cross(N, T)
- *                   up = (0, 1, 0) if |N.y| < 0.9 else (1, 0, 0)
- *   Central diff    ∂f/∂T ≈ (f(p+εT) − f(p−εT)) / (2ε)
- *   Displaced T′    T′ = 2εT + N · ΔfT
- *   New normal      N′ = normalize(T′ × B′)
- *   CD epsilon      ε = 0.03 · R    (3 % of radius — sweet spot)
- *   Bayer dither    d ← luma + (B[py%4][px%4] − 0.5) · 0.15
- *   Luma            Y = 0.2126·R + 0.7152·G + 0.0722·B
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • CD_EPS too small → float noise dominates the difference,
- *     normals jitter, lighting flickers. Too large → normal lags
- *     curvature, high-freq spikes get softened. 0.03 · R is the
- *     tuned sweet spot.
- *
- *   • Tangent basis at the poles: if N ≈ ±Y, cross(Y, N) is
- *     degenerate. make_tangent_basis falls back to up = (1, 0, 0).
- *
- *   • DisplaceUniforms leads with `Uniforms base` so &disp_uni casts
- *     cleanly to const Uniforms* inside the fragment shaders. The
- *     vert_uni / frag_uni split in ShaderProgram is the alternative
- *     for shaders that need a different uniform struct (toon).
- *
- *   • Pole vertex normals are hard-coded to (0, ±1, 0) in
- *     tessellate_sphere — sin(phi) = 0 makes v3_norm degenerate.
- *
- *   • Back-face cull is by signed-area sign in screen space. A deep
- *     concave displacement (big negative d) can flip a triangle's
- *     winding; press 'c' to disable culling if it happens.
- *
- *   • Wireframe shader reads barycentric coords from custom[0..2];
- *     the pipeline writes those AFTER vert_displace_wire runs.
- *
- *   • Time advances only while !paused; rotation does too.
- *     Resize does NOT reset time, so animation continues smoothly.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Switch to NORMALS shader: the RGB hue at each pixel is the
- *     world normal at that fragment. Wave crests rotate the hue;
- *     spikes show needle-tip swirls. If hue stayed static while
- *     the silhouette heaved, normal recompute would be broken.
- *
- *   • Pause + cycle 'd': at t = 0, ripple/wave/pulse are zero
- *     (sin(0) = 0) so the sphere is undeformed. SPIKY has permanent
- *     peaks because |sin · sin · sin| > 0 for most positions.
- *
- *   • Toon shader: the band boundaries follow the wave crests, not
- *     the original sphere outline — confirms the displaced normal
- *     is what reaches the fragment.
- *
- *   • Wireframe: lat/long grid ripples with the surface. SPIKY mode
- *     makes porcupine-quill distortions of the grid.
- *
- *   • Press 'c' to disable culling — on big PULSE inflations you
- *     should see the interior surface poke through.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. Read CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL as prose. Read
- *      raster/sphere_raster.c first if you don't yet know the
- *      forward 7-stage pipeline; this file changes ONLY the vertex
- *      shader, everything downstream is the same.
- *   2. §1 config — every constant has a unit-bearing comment.
- *   3. §3 displace — the four displacement fields + tangent basis +
- *      central-difference normal recompute. THIS IS THE HEART of
- *      the file. Every other section exists to feed §3 and consume
- *      its output.
- *   4. §4 shaders — one vertex shader (vert_displace) + four fragment
- *      shaders (phong, toon, normals, wire). Notice the fragment
- *      shaders are unmodified copies from cube_raster.c et al —
- *      they have no idea the geometry is moving.
- *   5. §5 mesh — UV-sphere tessellation, identical to sphere_raster.c.
- *   6. §6 framebuffer + §7 pipeline + §8-§10 — infrastructure;
- *      skim on first read.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   pos                base sphere position (unit sphere · SPHERE_R)
- *   N                  base sphere normal = pos / |pos|
- *   T, B               tangent and bi-tangent at pos (perpendicular
- *                      to N, perpendicular to each other)
- *   eps / CD_EPS       central-difference step length (along T or B)
- *   d, ΔfT, ΔfB        displacement scalar at the sample points
- *   p_displaced        pos + N · d
- *   N_displaced        normalize(T_displaced × B_displaced)
- *   amp / freq         per-mode amplitude and spatial frequency
- *
- * Background you need
- * ───────────────────
- *   - The 7-stage rasteriser (cube_raster.c).
- *   - Why a unit sphere's surface normal at p is just p̂.
- *   - Cross product as "perpendicular to both" — this is how T × B
- *     reconstructs a normal from two displaced tangents.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Tessellation shaders / hardware tessellation. We do CPU vertex
- *     displacement on a fixed mesh; modern GPUs subdivide adaptively.
- *   - Analytic normal derivation. We use the universal numeric trick
- *     (central difference); the analytic version requires a separate
- *     gradient function per displacement field.
- *   - Bump / normal maps. Those FAKE the lighting; we genuinely move
- *     the geometry.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Eight tutorials that build vertex displacement from first principles.
- *
- *   T1  Genuine displacement vs. fake displacement
- *   T2  Why moving a vertex BREAKS its normal
- *   T3  Building a tangent frame (T, B, N)
- *   T4  Central difference: a numerical derivative without algebra
- *   T5  Reconstructing the displaced normal from displaced tangents
- *   T6  The four displacement fields — anatomy
- *   T7  Choosing ε — the noise-vs-lag trade
- *   T8  Why fragment shaders never see the displacement
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  GENUINE DISPLACEMENT VS. FAKE DISPLACEMENT
- * ──────────────────────────────────────────────
- * There are two ways to make a sphere LOOK like it has bumps:
- *
- *   FAKE  (normal mapping / bump mapping):
- *     The geometry stays a perfect sphere. The fragment shader
- *     reads a texture of fake normals and lights AS IF the surface
- *     were bumpy. The silhouette is still smooth — peek at the
- *     edge and you'll see a circle, not bumps.
- *
- *   REAL (vertex displacement):
- *     The vertices actually move outward (or inward). The
- *     silhouette changes — bumps poke into the outline, valleys
- *     dent it. You can see displacement; you can only INFER bump.
- *
- * This file does the REAL kind. Press 'd' until SPIKY: the
- * silhouette is genuinely jagged, not just shaded jagged.
- *
- *      ┌─────────────────────────────────────────────────────┐
- *      │   FAKE (bump map)            REAL (displacement)    │
- *      │                                                     │
- *      │       _______                    _M_M_M_            │
- *      │      /       \                  / W   W \           │
- *      │     |  bumpy  |                |  bumpy  |          │
- *      │     |  shading|                |  shaded |          │
- *      │      \_______/                  \_W_M_W_/           │
- *      │                                                     │
- *      │ silhouette: smooth circle    silhouette: jagged     │
- *      └─────────────────────────────────────────────────────┘
- *
- * T2  WHY MOVING A VERTEX BREAKS ITS NORMAL
- * ─────────────────────────────────────────
- * A surface normal is "the direction perpendicular to the
- * surface at this point." If you move the surface, the
- * perpendicular changes too.
- *
- * Concretely: a sphere's normal at p is just p̂ (the position
- * is the normal because the centre is at origin). After we
- * push p outward by f(p), the surface no longer matches the
- * sphere — it bulges where f is big and dimples where f is
- * small. The new perpendicular DEPENDS on how f varies in the
- * neighbourhood of p.
- *
- *   At a peak       N′ still points outward (peak is locally a
- *                   small dome → almost the original N).
- *   On a slope      N′ tilts in the direction f is increasing.
- *   At a valley     N′ also points outward (valley is locally a
- *                   small dome from above).
- *   On a ridge edge N′ tilts sharply where f changes fast.
- *
- * The slope case is what kills naïve renderers: if you forget
- * to update N, the highlight stays where it was on the original
- * sphere and the ridges look painted-on rather than physical.
- *
- * The job of §3 displaced_normal is to compute N′ correctly.
- *
- * T3  BUILDING A TANGENT FRAME (T, B, N)
- * ──────────────────────────────────────
- * To detect "how does f vary near p?" we need TWO directions
- * along the surface (perpendicular to N) so we can sample both.
- *
- * The standard trick:
- *
- *     pick an "up-ish" reference vector U (normally world-Y)
- *     T = normalize(cross(U, N))   ← perpendicular to both U and N
- *     B = cross(N, T)              ← perpendicular to T and N
- *
- * (T, B, N) is a right-handed orthonormal frame: three mutually
- * perpendicular unit vectors anchored at p. T and B span the
- * tangent plane — the local "ground" at p; N is the local "up."
- *
- * Pole degeneracy: if N happens to BE Y (north pole), cross(Y, N)
- * is zero — Y and N are parallel, no perpendicular direction
- * exists. We detect that with |N.y| > 0.9 and fall back to
- * U = (1, 0, 0).
- *
- *      ┌──────────────────────────────────────┐
- *      │           N                          │
- *      │           │                          │
- *      │           │                          │
- *      │     ──────●──────  T                 │
- *      │          /                           │
- *      │         /                            │
- *      │        B  (out of page)              │
- *      └──────────────────────────────────────┘
- *
- * T4  CENTRAL DIFFERENCE: NUMERICAL DERIVATIVE WITHOUT ALGEBRA
- * ────────────────────────────────────────────────────────────
- * To know how fast f changes along T, the analytic answer is
- * "compute ∂f/∂T symbolically." That requires a separate
- * derivative function per displacement field — annoying, and
- * brittle if you swap fields.
- *
- * The numeric answer is CENTRAL DIFFERENCE:
- *
- *       ∂f       f(p + εT) − f(p − εT)
- *      ──── ≈   ─────────────────────────
- *       ∂T              2ε
- *
- * Sample f at TWO points slightly along ±T, take the difference,
- * divide by the step. Forward difference (sample at p and p+εT)
- * works too but is less accurate; central differences cancel
- * the leading O(ε) error term, leaving O(ε²).
- *
- * Cost: 2 extra f() evaluations per direction, 4 total per
- * vertex. We don't actually do the divide here — we'll fold it
- * into the cross product in T5.
- *
- * Same trick along B gives ∂f/∂B. Two field samples per
- * direction, four samples per vertex normal.
- *
- * T5  RECONSTRUCTING THE DISPLACED NORMAL FROM DISPLACED TANGENTS
- * ───────────────────────────────────────────────────────────────
- * The point p moves to p′ = p + N·f(p). What about a neighbour
- * p + εT? It moves to (p + εT) + N′·f(p+εT) where N′ is its
- * own normal — but for small ε, N′ ≈ N, so:
- *
- *     (p + εT) + N · f(p + εT)
- *
- * The vector from p′ to that displaced neighbour is therefore:
- *
- *     T_displaced = εT + N·(f(p+εT) − f(p))      forward diff
- *
- * For central difference with the symmetric pair:
- *
- *     T_displaced = 2εT + N·(f(p+εT) − f(p−εT))
- *
- * This is the tangent vector AFTER displacement — pointing along
- * the displaced surface in the original T direction. Same recipe
- * for B_displaced.
- *
- * Two vectors lying in the new tangent plane → cross-product →
- * vector perpendicular to that plane → the new normal:
- *
- *     N_displaced = normalize(T_displaced × B_displaced)
- *
- * Notice the "÷ 2ε" we postponed in T4 cancels: the cross product
- * is bilinear, scaling both inputs by the same factor scales the
- * result by that factor squared, and we normalise anyway. So the
- * code drops the divide entirely.
- *
- * T6  THE FOUR DISPLACEMENT FIELDS — ANATOMY
- * ──────────────────────────────────────────
- * Each mode picks a scalar function f(p, t). That's it — change
- * f, get a different deformation. The renderer doesn't change.
- *
- *   RIPPLE   f = A · sin(ω·t + k·r) · taper(y)
- *            r = √(x² + z²) is distance from the polar axis;
- *            taper(y) = 1 − y² damps near the poles. Reads as
- *            concentric rings travelling outward from the
- *            equator.
- *
- *   WAVE     f = A · sin(ω·t + k·(x + 0.8y + 0.5z))
- *            One global plane wave, travelling along a fixed
- *            diagonal direction. Whole sphere undulates as one.
- *
- *   PULSE    f = A · sin(ω·t) · exp(−γ·r)
- *            No spatial term other than a radial decay; the whole
- *            sphere breathes in/out, biggest near the equator,
- *            smallest near the poles.
- *
- *   SPIKY    f = A · |sin(kx)·sin(ky)·sin(kz)|^0.6
- *            Three sine waves multiplied — each axis contributes
- *            zeros where its sin vanishes, so f stays at zero
- *            along entire sin-gridlines and peaks at the cell
- *            centres. The 0.6 power compresses the dynamic range
- *            so peaks aren't too sharp. Result: a porcupine.
- *
- * The four fields cost O(1) each. The vertex pass is dominated by
- * the FOUR f() calls for normal recompute, not the one for the
- * displacement.
- *
- * T7  CHOOSING ε — THE NOISE-VS-LAG TRADE
- * ───────────────────────────────────────
- * Central difference's error is O(ε²) for smooth f. But with
- * floating-point arithmetic, very small ε hits a different wall:
- *
- *   ε too LARGE  → step crosses real curvature; the difference
- *                  reports the AVERAGE slope, not the local one.
- *                  Sharp peaks get rounded off in the lighting.
- *
- *   ε too SMALL  → f(p+εT) ≈ f(p−εT) to within float precision.
- *                  Their difference is dominated by float noise;
- *                  N′ jitters frame to frame even when t doesn't
- *                  move. Lighting flickers.
- *
- * "Sweet spot" depends on the field's frequency. For our four
- * fields with their default amplitudes/frequencies, ε = 0.03·R
- * is small enough to track the highest-frequency variation
- * (SPIKY) and large enough to dominate float noise. Drop to
- * 0.01·R if you cut amplitudes; raise to 0.05·R if you push k
- * higher.
- *
- * T8  WHY FRAGMENT SHADERS NEVER SEE THE DISPLACEMENT
- * ───────────────────────────────────────────────────
- * The fragment shader receives:
- *
- *   world_pos    interpolated p′ (the DISPLACED position)
- *   world_nrm    interpolated N′ (the DISPLACED normal)
- *   uv, custom   barycentric-interpolated whatever the vert wrote
- *
- * It does NOT receive:
- *   - the base sphere position
- *   - the displacement amplitude
- *   - the time
- *   - which mode is active
- *
- * From the fragment shader's perspective, it's just shading a
- * surface with the position and normal it was handed. That's
- * why phong / toon / normals / wire are unmodified copies from
- * cube_raster.c — none of them know about displacement, and yet
- * they all visibly REACT to it.
- *
- * This is the cleanest way to add per-vertex effects to a forward
- * pipeline: own the vertex shader, leave fragment shaders alone.
- * The vert/frag uniform split (DisplaceUniforms leads with a base
- * Uniforms struct) is what makes &disp_uni cast cleanly to const
- * Uniforms* inside the fragment shaders.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -531,13 +34,9 @@ enum {
   FPS_UPDATE_MS = 500,
   HUD_COLS = 80,
 
-  /*
-   * Tessellation resolution.
-   * Higher = smoother base sphere, better displacement detail.
-   * 48×32 gives 3072 triangles — fast enough at 60fps in a terminal,
-   * detailed enough that the displacement waves look smooth.
-   * Drop to 36×24 if fps is low on your terminal.
-   */
+  /* How finely the sphere is chopped into triangles: more = smoother and shows
+   * finer ripples, but slower. 48×32 ≈ 3000 triangles, smooth at 60fps in a
+   * terminal. Drop to 36×24 if it's sluggish on yours. */
   TESS_U = 48,
   TESS_V = 32,
 };
@@ -546,39 +45,78 @@ enum {
 #define CAM_NEAR 0.1f
 #define CAM_FAR 100.0f
 #define CAM_DIST 3.2f
-#define CAM_DIST_MIN 1.2f
+/* Closest the camera may get. Kept far enough back that even a fully-grown spike
+ * never reaches the camera — a point that crosses behind the lens can't be drawn
+ * and would smear across the screen. */
+#define CAM_DIST_MIN 1.8f
 #define CAM_DIST_MAX 8.0f
 #define CAM_ZOOM_STEP 0.2f
+#define NEAR_W_EPS 0.001f /* a corner closer to the eye than this is behind it */
 
 #define SPHERE_R 1.0f
 
-/* Rotation — slow tumble so displacement detail is visible */
+/*
+ * Lighting, tuned for the chunky terminal grid where one cell is one brightness.
+ * Three tweaks from textbook lighting, all so the shape (and its rippling) stays
+ * readable when everything is so coarse:
+ *   • a wide highlight, spread over several cells instead of one tiny dot;
+ *   • light that wraps a bit past the edge of shadow, so the dark side keeps
+ *     some shading instead of going flat black;
+ *   • an edge glow that brightens the rim, popping the outline and the bumps
+ *     you see along it.
+ */
+#define LIGHT_SHININESS 24.0f /* lower = a wider highlight                   */
+#define SPEC_STRENGTH 0.6f    /* how strong the highlight is                */
+#define RIM_STRENGTH 0.5f     /* how bright the edge glow is                */
+#define RIM_POWER 2.5f        /* lower = a wider edge glow                  */
+
+/* The toon (flat cartoon) look, also tuned for the terminal. */
+#define TOON_SPEC_THRESH 0.94f  /* angle this sharp gets a hard bright dot */
+#define TOON_SPEC 0.7f          /* how bright that dot is                  */
+#define TOON_AMBIENT_LIFT 0.12f /* a floor on every band, so none is black */
+
+/* How fast it tumbles — slow, so you can watch the surface ripple. */
 #define ROT_Y 0.30f
 #define ROT_X 0.12f
 
-/* Wireframe threshold — sphere triangles are small, needs 0.09+ */
-#define WIRE_THRESH 0.09f
+/*
+ * The glass look — fake "see-through" glass. There's nothing actually behind the
+ * sphere, so it bends your line of sight through the surface and reads a made-up
+ * stripe pattern with it; because the bent surface steers that, the stripes
+ * swirl over every ripple and spike. The edges turn mirror-like and the middle
+ * stays clearer, the way real glass looks.
+ */
+#define GLASS_ETA 0.6667f     /* how much glass bends light (air→glass)   */
+#define GLASS_F0 0.04f        /* how reflective it is head-on             */
+#define GLASS_ENV_FREQ 6.0f   /* how dense the made-up stripes are        */
+#define GLASS_GLINT_MULT 2.0f /* makes the glossy glint tighter           */
 
 /*
- * Central difference epsilon for normal recomputation.
- * Too small → floating point noise in the normal.
- * Too large → normal lags the actual surface curvature.
- * 0.03 * SPHERE_R is a good balance for all four displacement modes.
+ * The little step used to re-figure which way the bent surface faces (we sample
+ * the pattern a hair to each side and see how it changed). Too small and float
+ * rounding swamps it (the lighting flickers); too big and it lags the real
+ * curvature (sharp spikes get rounded off). 3% of the radius works for all four
+ * patterns.
  */
 #define CD_EPS (0.03f * SPHERE_R)
 
-/* Paul Bourke ramp */
+/* The brightness-to-character ladder, sparse to dense (Paul Bourke's). */
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define BOURKE_LEN (int)(sizeof k_bourke - 1)
 
+/* A fixed 4×4 nudge pattern so neighbours of similar brightness pick different
+ * characters, hiding the steps in a smooth gradient. */
 static const float k_bayer[4][4] = {
     {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
     {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
     {3 / 16.f, 11 / 16.f, 1 / 16.f, 9 / 16.f},
     {15 / 16.f, 7 / 16.f, 13 / 16.f, 5 / 16.f},
 };
+#define DITHER_AMP 0.15f      /* how strong that nudge is                  */
+#define LUMA_BOLD_ABOVE 0.6f  /* brighter than this → draw the cell bold    */
+#define CHROMA_MIN 0.08f      /* greyer than this → treat it as plain grey  */
 
 #define CELL_W 8
 #define CELL_H 16
@@ -587,7 +125,7 @@ static const float k_bayer[4][4] = {
 #define NS_PER_MS 1000000LL
 #define PI 3.14159265f
 
-/* ── §2 math (V3, V4, Mat4) ──────────────────────────────────────────── */
+/* ── §2 math — vectors and 4×4 matrices ────────────────────────────────── */
 
 typedef struct {
   float x, y, z;
@@ -624,6 +162,18 @@ static inline Vec3 v3_cross(Vec3 a, Vec3 b) {
 static inline Vec3 v3_bary(Vec3 a, Vec3 b, Vec3 c, float u, float v, float w) {
   return v3(u * a.x + v * b.x + w * c.x, u * a.y + v * b.y + w * c.y,
             u * a.z + v * b.z + w * c.z);
+}
+
+/* Bends a ray as it passes through a surface, the way light bends entering
+ * water or glass (how much is set by eta). Used by the glass look to bend your
+ * line of sight through the bumpy surface. Returns zero in the rare case the ray
+ * can't get through (it would bounce back instead). */
+static inline Vec3 v3_refract(Vec3 I, Vec3 N, float eta) {
+  float ndi = v3_dot(N, I);
+  float k = 1.f - eta * eta * (1.f - ndi * ndi);
+  if (k < 0.f)
+    return v3(0, 0, 0);
+  return v3_sub(v3_scale(I, eta), v3_scale(N, eta * ndi + sqrtf(k)));
 }
 
 static inline Vec4 v4(float x, float y, float z, float w) {
@@ -719,64 +269,68 @@ static Mat4 m4_normal_mat(Mat4 m) {
   return n;
 }
 
-/* ── §3 displacement — the four mode functions + normal recompute ────── */
+/* Clamps a number to 0..1. */
+static inline float clamp01(float x) { return x < 0.f ? 0.f : x > 1.f ? 1.f : x; }
+
+/* Brightness correction for the screen, with an upper clamp so a too-bright sum
+ * doesn't wrap past white. */
+static inline float gamma_encode(float x) {
+  return powf(fminf(x, 1.f), 1.f / 2.2f);
+}
+
+static inline Vec3 v3_gamma(Vec3 c) {
+  return v3(gamma_encode(c.x), gamma_encode(c.y), gamma_encode(c.z));
+}
+
+/* ── §3 displacement — how the surface moves, and which way it then faces ── */
 
 /*
- * Displacement modes — each returns a scalar offset to apply along
- * the surface normal.  Positive = push outward, negative = push inward.
+ * The four patterns. Each one takes a point on the sphere and the time, and
+ * returns how far to push that point — positive pushes it out, negative pushes
+ * it in. (amp and freq scale how big and how dense the pattern is.)
  *
- * All functions receive:
- *   pos   — point on unit sphere in model space
- *   time  — seconds since start
- *   amp   — amplitude scale (from uniforms)
- *   freq  — frequency scale (from uniforms)
- *
- * They are pure functions — same inputs always produce same output.
- * This is required for the central difference normal recomputation
- * to work correctly: we call them at pos±eps and the delta must be
- * a genuine derivative of the function, not a stateful value.
+ * They must be pure — the same inputs always give the same answer — because to
+ * find which way the bent surface faces, we sample each one a hair to either
+ * side of a point and compare. That only works if the answer depends on the
+ * point alone, with no hidden state.
  */
 
-typedef enum { DM_RIPPLE = 0, DM_WAVE, DM_PULSE, DM_SPIKY, DM_COUNT } DispMode;
+/*
+ * DispMode — which pattern is active; the 'd' key cycles through them. The idea
+ * of "swap the push pattern, keep the renderer" is Cook's displacement shader
+ * (SIGGRAPH '84). They're numbered from 0 in a row so 'd' can step through them
+ * and so they double as indices into the tables below.
+ */
+typedef enum {
+  DM_RIPPLE = 0, /* rings sweeping out from the equator           */
+  DM_WAVE,       /* one diagonal wave rolling across              */
+  DM_PULSE,      /* the whole ball breathes, biggest at the middle */
+  DM_SPIKY,      /* a porcupine of moving spikes                  */
+  DM_COUNT,      /* how many patterns there are (for cycling)     */
+} DispMode;
 
+/* Display label per mode, indexed by DispMode; shown in the HUD. */
 static const char *k_disp_names[] = {"ripple", "wave", "pulse", "spiky"};
 
-/*
- * displace_ripple — concentric rings radiating from the equator.
- *
- * r = distance from Y axis in XZ plane.
- * sin(time + r*freq) produces rings that travel inward over time.
- * Multiplied by (1 - |y|) to taper off at the poles — prevents
- * the poles from having large displacements that look broken.
- */
+/* Rings that ride outward from the equator. The push rises and falls with
+ * distance from the axis (that's the rings) and creeps over time (they travel);
+ * it's eased off near the poles so they don't look broken. */
 static float displace_ripple(Vec3 pos, float time, float amp, float freq) {
   float r = sqrtf(pos.x * pos.x + pos.z * pos.z);
   float taper = 1.f - fabsf(pos.y) * 0.6f;
   return sinf(time * 2.5f + r * freq) * amp * taper;
 }
 
-/*
- * displace_wave — diagonal travelling wave across the surface.
- *
- * Uses a combination of X and Y position as the wave phase, producing
- * a wave that travels diagonally across the sphere.
- * Adding 0.7*pos.z gives the wave a slight depth twist so it does
- * not look flat from any viewing angle.
- */
+/* One wave rolling across the whole ball on a slant — the push depends on a
+ * slanted mix of the point's x/y/z, so the whole surface undulates as one. */
 static float displace_wave(Vec3 pos, float time, float amp, float freq) {
   float phase = pos.x * freq + pos.y * freq * 0.8f + pos.z * freq * 0.5f;
   return sinf(time * 2.0f + phase) * amp;
 }
 
-/*
- * displace_pulse — whole sphere breathes in and out.
- *
- * sin(time) gives a smooth oscillation at ~0.5 Hz.
- * Adding a secondary sin at 3x frequency gives the breath a slight
- * "catch" — it does not feel perfectly mechanical.
- * exp(-r * falloff) concentrates the pulse at the equator, making
- * the poles stable anchors that contrast the heaving equatorial band.
- */
+/* The whole ball breathing in and out. Two sine waves of time (a slow one plus a
+ * faster wobble so it isn't too mechanical), eased down toward the poles so the
+ * middle heaves the most and the poles stay put. */
 static float displace_pulse(Vec3 pos, float time, float amp, float freq) {
   float r = sqrtf(pos.x * pos.x + pos.z * pos.z);
   float breathe = sinf(time * 1.5f) * 0.85f + sinf(time * 4.5f) * 0.15f;
@@ -784,15 +338,9 @@ static float displace_pulse(Vec3 pos, float time, float amp, float freq) {
   return breathe * amp * falloff;
 }
 
-/*
- * displace_spiky — spiky ball driven by product of three sine waves.
- *
- * |sin(x*f) * sin(y*f) * sin(z*f)| produces spikes at positions where
- * all three waves are simultaneously at their peaks.
- * The time term slowly rotates the spike pattern so it animates.
- * powf(..., 0.6) softens the product so spikes have a smooth base
- * rather than a pinched needle tip.
- */
+/* A spiky ball. Three sine waves (one per axis) multiplied together spike up
+ * only where all three happen to peak at once; the time terms drift the spikes
+ * around, and the 0.6 power gives each spike a rounded base instead of a needle. */
 static float displace_spiky(Vec3 pos, float time, float amp, float freq) {
   float f = freq * 1.4f;
   float t = time * 0.8f;
@@ -801,8 +349,13 @@ static float displace_spiky(Vec3 pos, float time, float amp, float freq) {
   return powf(val, 0.6f) * amp;
 }
 
-/* Dispatch table — indexed by DispMode */
+/* A pointer to whichever pattern is active. Swapping it is the whole trick — the
+ * renderer never changes, you just point at a different push function. Must be
+ * pure (see above), since the surface-facing recompute samples it either side of
+ * a point. */
 typedef float (*DispFn)(Vec3, float, float, float);
+
+/* Dispatch table — k_disp_fn[mode] is the active field. Indexed by DispMode. */
 static const DispFn k_disp_fn[DM_COUNT] = {
     displace_ripple,
     displace_wave,
@@ -810,44 +363,35 @@ static const DispFn k_disp_fn[DM_COUNT] = {
     displace_spiky,
 };
 
-/*
- * make_tangent_basis — compute two orthogonal tangent vectors for a
- * point on the sphere given its outward normal.
- *
- * We need two vectors tangent to the sphere surface so we can step
- * along them for the central difference normal computation.
- *
- * Method: pick an arbitrary "up" vector that is not parallel to N,
- * then use cross products to build an orthonormal frame.
- *
- *   T = normalize(cross(N, up))     ← tangent
- *   B = cross(N, T)                 ← bitangent (already unit length)
- *
- * The choice of "up" does not matter for correctness — it only affects
- * the orientation of the tangent frame, not the resulting normal.
- * We avoid (0,1,0) when N is nearly vertical to prevent degenerate cross.
- */
+/* Finds two directions that lie flat along the surface at a point (both at right
+ * angles to the way it faces, and to each other) — the two directions we'll step
+ * in to feel out how the surface tilts. Built from the facing with cross
+ * products; near the poles it picks a different reference so the math doesn't
+ * collapse. */
 static void make_tangent_basis(Vec3 N, Vec3 *T, Vec3 *B) {
   Vec3 up = (fabsf(N.y) < 0.9f) ? v3(0, 1, 0) : v3(1, 0, 0);
   *T = v3_norm(v3_cross(up, N));
-  *B = v3_cross(N, *T); /* already unit since N and T are */
+  *B = v3_cross(N, *T); /* already unit length since N and T are */
+}
+
+/* How much the push changes as you step a little to each side of a point: sample
+ * the pattern just ahead and just behind and subtract. (Sampling both sides,
+ * rather than just one, cancels most of the error.) */
+static float central_diff(DispFn fn, Vec3 pos, Vec3 dir, float eps, float time,
+                          float amp, float freq) {
+  float fp = fn(v3_add(pos, v3_scale(dir, eps)), time, amp, freq);
+  float fm = fn(v3_add(pos, v3_scale(dir, -eps)), time, amp, freq);
+  return fp - fm;
 }
 
 /*
- * displaced_normal — recompute the surface normal at `pos` after
- * the displacement field f has deformed the surface, using central
- * differences in the surface's tangent plane.
- *
- *   1. Build a tangent frame (T, B) at pos.
- *   2. Sample f at four neighbours: pos ± εT and pos ± εB.
- *   3. Reconstruct the displaced tangent vectors:
- *        T′ = 2εT + N · (f(p+εT) − f(p−εT))
- *        B′ = 2εB + N · (f(p+εB) − f(p−εB))
- *   4. N′ = normalize(T′ × B′).
- *
- * Works for ANY scalar displacement function — no analytic gradient
- * required. ε = CD_EPS (~3 % of radius) is the empirical sweet spot
- * for all four modes here.
+ * Re-figures which way the surface faces after the push has bent it — the trick
+ * that makes the lighting follow the new shape. Moving a point changes how the
+ * surface tilts around it, so the old "straight out from the centre" facing is
+ * wrong. We feel out the new tilt: step a little along the two flat directions,
+ * see how much the push rose or fell each way, rebuild the two now-tilted
+ * directions, and the way that faces is the new facing. Works for any pattern,
+ * no calculus needed.
  */
 static Vec3 displaced_normal(Vec3 pos, Vec3 N, DispFn fn, float time, float amp,
                              float freq) {
@@ -856,96 +400,123 @@ static Vec3 displaced_normal(Vec3 pos, Vec3 N, DispFn fn, float time, float amp,
 
   float eps = CD_EPS;
 
-  /* Sample the displacement field at four tangent-plane neighbours. */
-  float f_Tp = fn(v3_add(pos, v3_scale(T, eps)), time, amp, freq);
-  float f_Tm = fn(v3_add(pos, v3_scale(T, -eps)), time, amp, freq);
-  float f_Bp = fn(v3_add(pos, v3_scale(B, eps)), time, amp, freq);
-  float f_Bm = fn(v3_add(pos, v3_scale(B, -eps)), time, amp, freq);
+  /* how much the surface rises/falls as we step each way */
+  float df_T = central_diff(fn, pos, T, eps, time, amp, freq);
+  float df_B = central_diff(fn, pos, B, eps, time, amp, freq);
 
-  /* Central differences — how much the surface rises/falls along each. */
-  float df_T = f_Tp - f_Tm;
-  float df_B = f_Bp - f_Bm;
-
-  /* Reconstruct the deformed tangent vectors. */
+  /* tilt each flat direction by that rise/fall, then the direction at right
+   * angles to both is the new facing */
   Vec3 T_disp = v3_add(v3_scale(T, 2.f * eps), v3_scale(N, df_T));
   Vec3 B_disp = v3_add(v3_scale(B, 2.f * eps), v3_scale(N, df_B));
 
   return v3_norm(v3_cross(T_disp, B_disp));
 }
 
-/* ── §4 shaders — VS/FS types, uniforms, vertex pass, four frag passes ─ */
+/* ── §4 shaders — the per-corner and per-pixel steps ───────────────────── */
 
+/*
+ * The four little records that flow between the drawing steps, copying how a GPU
+ * works: the per-corner step turns a VSIn into a VSOut; the rasteriser blends
+ * the VSOuts across a triangle into one FSIn per pixel; the per-pixel step turns
+ * that into an FSOut (a colour).
+ */
+
+/* VSIn — one corner going into the per-corner step, in the sphere's own space. */
 typedef struct {
-  Vec3 pos;
-  Vec3 normal;
-  float u, v;
+  Vec3 pos;    /* the corner's position                 */
+  Vec3 normal; /* which way it faces                    */
+  float u, v;  /* texture coords (0..1)                 */
 } VSIn;
 
+/* VSOut — what the per-corner step produces: where the corner lands on screen,
+ * plus the info that gets blended across the triangle (world spot, facing, uv). */
 typedef struct {
-  Vec4 clip_pos;
-  Vec3 world_pos;
-  Vec3 world_nrm;
-  float u, v;
-  float custom[4];
+  Vec4 clip_pos;  /* where it lands, before the divide-by-distance */
+  Vec3 world_pos; /* its spot in the world, for the lighting       */
+  Vec3 world_nrm; /* which way it faces in the world               */
+  float u, v;     /* texture coords                                */
 } VSOut;
 
+/* FSIn — one pixel going into the per-pixel step: the VSOut info blended to this
+ * pixel, plus which cell it is (px,py), used by the dither. */
 typedef struct {
-  Vec3 world_pos;
-  Vec3 world_nrm;
-  float u, v;
-  float custom[4];
-  int px, py;
+  Vec3 world_pos; /* this pixel's spot in the world */
+  Vec3 world_nrm; /* which way the surface faces here */
+  float u, v;     /* blended texture coords */
+  int px, py;     /* which screen cell this is */
 } FSIn;
 
+/* FSOut — what the per-pixel step produces: a colour, or "skip me". No current
+ * look sets discard, but it stays as an escape hatch for cutout effects. */
 typedef struct {
-  Vec3 color;
-  bool discard;
+  Vec3 color;   /* the colour for this pixel               */
+  bool discard; /* true = leave the cell as-is             */
 } FSOut;
 
+/* The two steps as function pointers; the trailing pointer is the step's shared
+ * data (cast to the right type inside). */
 typedef void (*VertShaderFn)(const VSIn *, VSOut *, const void *);
 typedef void (*FragShaderFn)(const FSIn *, FSOut *, const void *);
 
 /*
- * ShaderProgram — separate uniform pointers for vertex and fragment.
- *
- * WHY SPLIT:
- *   vert_displace always needs DisplaceUniforms (disp_fn, time, amp, freq).
- *   frag_toon needs ToonUniforms (bands).  These are different structs.
- *   A single void* uniforms cannot satisfy both simultaneously without
- *   casting to the wrong type — which is exactly what caused the crash.
- *   Separate pointers cost one extra pointer and fix the entire problem.
+ * ShaderProgram — one look: its per-corner step, its per-pixel step, and a
+ * separate data pointer for each. They're separate because the per-corner step
+ * always needs the displacement settings while the per-pixel step (toon) may
+ * need its own different settings — one shared pointer couldn't be both types.
  */
 typedef struct {
   VertShaderFn vert;
   FragShaderFn frag;
-  const void *vert_uni; /* passed to vert() — always &scene.disp_uni */
-  const void *frag_uni; /* passed to frag() — &disp_uni or &toon_uni */
+  const void *vert_uni; /* handed to the per-corner step — always the disp data */
+  const void *frag_uni; /* handed to the per-pixel step — disp or toon data     */
 } ShaderProgram;
 
-/* ── uniforms ─────────────────────────────────────────────────────── */
+/* ── the shared data the steps read ───────────────────────────────────── */
 
+/*
+ * Uniforms — the values that stay the same for a whole frame and that every step
+ * reads. Two groups: the transforms (rebuilt each frame by scene_tick) and the
+ * lighting (set once at startup).
+ *   model/view/proj/mvp — the transforms: place the sphere, look from the camera,
+ *                         apply perspective, all chained into mvp
+ *   norm_mat            — the matrix for rotating surface-facing directions
+ *   light_pos/_col      — where the light is and its colour
+ *   ambient             — a little light everywhere
+ *   cam_pos             — where the eye is (for highlights)
+ *   obj_color/shininess — the surface's colour and how glossy it is
+ */
 typedef struct {
-  Mat4 model, view, proj, mvp, norm_mat;
-  Vec3 light_pos, light_col, ambient, cam_pos, obj_color;
+  /* the transforms (rebuilt each frame) */
+  Mat4 model;
+  Mat4 view;
+  Mat4 proj;
+  Mat4 mvp;
+  Mat4 norm_mat;
+  /* the lighting (set once at startup) */
+  Vec3 light_pos;
+  Vec3 light_col;
+  Vec3 ambient;
+  Vec3 cam_pos;
+  Vec3 obj_color;
   float shininess;
 } Uniforms;
 
+/* ToonUniforms — the usual Uniforms plus how many flat steps the cartoon look
+ * snaps to. Starts with `base` so a pointer to it can also be read as a plain
+ * Uniforms. */
 typedef struct {
-  Uniforms base;
-  int bands;
+  Uniforms base; /* the usual shared data            */
+  int bands;     /* how many flat shading steps      */
 } ToonUniforms;
 
-/*
- * DisplaceUniforms — extends Uniforms with displacement parameters.
- *
- * Leading with Uniforms base so &disp_uni casts cleanly to
- * const Uniforms* inside vert_default and all fragment shaders.
- *
- * disp_fn    — pointer to active displacement function
- * time       — seconds since start, updated every frame
- * amplitude  — displacement magnitude (fraction of sphere radius)
- * frequency  — spatial frequency of the wave pattern
- * mode       — active DispMode (for display only)
+/* DisplaceUniforms — the usual Uniforms plus the push settings the per-corner
+ * step needs. Starts with `base` so a pointer to it can also be read as a plain
+ * Uniforms (which the lighting steps want).
+ *   disp_fn   — the active push pattern
+ *   time      — seconds since start (the animation clock)
+ *   amplitude — how big the push is
+ *   frequency — how dense the pattern is
+ *   mode      — the active pattern, for the HUD label only
  */
 typedef struct {
   Uniforms base;
@@ -956,32 +527,24 @@ typedef struct {
   DispMode mode;
 } DisplaceUniforms;
 
-/* ── vertex shaders ──────────────────────────────────────────────── */
+/* ── the per-corner step ───────────────────────────────────────────── */
 
 /*
- * vert_displace — the heart of the demo. Reads like its formula:
- *
- *   N    = normalize(pos)                         // sphere normal
- *   d    = disp_fn(pos, time, amp, freq)          // scalar offset
- *   p′   = pos + N · d                            // displaced pos
- *   N′   = displaced_normal(pos, N, ...)          // central diff
- *   clip = MVP · (p′, 1)                          // for raster
- *   wpos = model    · p′                          // for FS lighting
- *   wnrm = norm_mat · N′                          // for FS lighting
- *
- * The fragment shaders never learn the displacement happened —
- * they only see whatever world_pos / world_nrm arrived. That's why
- * all four FSes (phong / toon / normals / wire) work unchanged.
+ * The heart of the demo. For each corner: figure how far the pattern pushes it,
+ * move it that far along its facing, re-figure which way the moved surface faces,
+ * then hand the moved spot and new facing down to the per-pixel step. The
+ * per-pixel looks never learn the surface moved — they just shade whatever spot
+ * and facing they're handed, which is why all four work on it unchanged.
  */
 static void vert_displace(const VSIn *in, VSOut *out, const void *u_) {
   const DisplaceUniforms *du = (const DisplaceUniforms *)u_;
   const Uniforms *u = &du->base;
 
-  Vec3 N = v3_norm(in->pos); /* sphere normal     */
+  Vec3 N = v3_norm(in->pos); /* on a sphere, the facing is just the direction out */
   float d = du->disp_fn(in->pos, du->time, du->amplitude, du->frequency);
-  Vec3 dpos = v3_add(in->pos, v3_scale(N, d)); /* displaced pos     */
+  Vec3 dpos = v3_add(in->pos, v3_scale(N, d)); /* moved spot */
   Vec3 dnrm = displaced_normal(in->pos, N, du->disp_fn, du->time, du->amplitude,
-                               du->frequency);
+                               du->frequency); /* new facing */
 
   out->clip_pos = m4_mul_v4(u->mvp, v4(dpos.x, dpos.y, dpos.z, 1.f));
   out->world_pos = m4_pt(u->model, dpos);
@@ -989,56 +552,40 @@ static void vert_displace(const VSIn *in, VSOut *out, const void *u_) {
 
   out->u = in->u;
   out->v = in->v;
-  out->custom[0] = out->custom[1] = out->custom[2] = out->custom[3] = 0.f;
 }
 
-/* Variant that also packs the world normal into custom[0..2] so
- * frag_normals can read it directly without barycentric loss. */
-static void vert_displace_normals(const VSIn *in, VSOut *out, const void *u_) {
-  vert_displace(in, out, u_);
-  out->custom[0] = out->world_nrm.x;
-  out->custom[1] = out->world_nrm.y;
-  out->custom[2] = out->world_nrm.z;
-}
+/* ── the per-pixel steps (the four looks) ──────────────────────────── */
 
-/* Variant that leaves custom[0..2] free; the pipeline writes
- * barycentric coordinates there for wireframe edge detection. */
-static void vert_displace_wire(const VSIn *in, VSOut *out, const void *u_) {
-  vert_displace(in, out, u_);
-}
-
-/* ── fragment shaders ────────────────────────────────────────────── */
-
-/*
- * frag_phong — Blinn-Phong + gamma.
- * On the displaced sphere the highlight dances across the waves
- * and spikes, making the deformation clearly visible even on the
- * lit side of the sphere.
- */
+/* The normal lit look, tuned for the coarse grid (see §1 lighting): light that
+ * wraps past the shadow edge, a wide highlight, and an edge glow. Together they
+ * let the highlight glide visibly across the ripples and spikes instead of
+ * shrinking to one invisible dot. */
 static void frag_phong(const FSIn *in, FSOut *out, const void *u_) {
   const Uniforms *u = (const Uniforms *)u_;
   Vec3 N = v3_norm(in->world_nrm);
   Vec3 L = v3_norm(v3_sub(u->light_pos, in->world_pos));
   Vec3 V = v3_norm(v3_sub(u->cam_pos, in->world_pos));
   Vec3 H = v3_norm(v3_add(L, V));
-  float diff = fmaxf(0.f, v3_dot(N, L));
-  float spec = powf(fmaxf(0.f, v3_dot(N, H)), u->shininess);
+
+  /* wrap the light past the shadow edge so the dark side keeps some shading */
+  float wrap = 0.5f * v3_dot(N, L) + 0.5f;
+  float diff = wrap * wrap;
+
+  /* the highlight and the edge glow, both kept wide so they show on the grid */
+  float spec = powf(fmaxf(0.f, v3_dot(N, H)), u->shininess) * SPEC_STRENGTH;
+  float rim = powf(1.f - fmaxf(0.f, v3_dot(N, V)), RIM_POWER) * RIM_STRENGTH;
+
   Vec3 c = u->obj_color;
-  float r = u->ambient.x + c.x * u->light_col.x * diff + spec * 0.5f;
-  float g = u->ambient.y + c.y * u->light_col.y * diff + spec * 0.5f;
-  float b = u->ambient.z + c.z * u->light_col.z * diff + spec * 0.5f;
-  out->color.x = powf(fminf(r, 1.f), 1.f / 2.2f);
-  out->color.y = powf(fminf(g, 1.f), 1.f / 2.2f);
-  out->color.z = powf(fminf(b, 1.f), 1.f / 2.2f);
+  float r = u->ambient.x + c.x * u->light_col.x * diff + spec + rim;
+  float g = u->ambient.y + c.y * u->light_col.y * diff + spec + rim;
+  float b = u->ambient.z + c.z * u->light_col.z * diff + spec + rim;
+  out->color = v3_gamma(v3(r, g, b));
   out->discard = false;
 }
 
-/*
- * frag_toon — 4-band quantised Phong.
- * On the displaced sphere the band boundaries follow the wave
- * crests and troughs — the toon shading reacts to the geometry,
- * not just the overall sphere curvature.
- */
+/* The flat cartoon look: snap the lighting to a few flat steps, so you see hard
+ * bands. On the bumpy sphere the band edges hug the wave crests, so the cartoon
+ * shading reacts to the moving surface, not just the overall ball. */
 static void frag_toon(const FSIn *in, FSOut *out, const void *u_) {
   const ToonUniforms *tu = (const ToonUniforms *)u_;
   const Uniforms *u = &tu->base;
@@ -1046,22 +593,21 @@ static void frag_toon(const FSIn *in, FSOut *out, const void *u_) {
   Vec3 L = v3_norm(v3_sub(u->light_pos, in->world_pos));
   Vec3 V = v3_norm(v3_sub(u->cam_pos, in->world_pos));
   Vec3 H = v3_norm(v3_add(L, V));
-  float diff = fmaxf(0.f, v3_dot(N, L));
+  /* wrap the light around so the bands span the whole ball, not just the lit half */
+  float diff = 0.5f * v3_dot(N, L) + 0.5f;
   float banded = floorf(diff * (float)tu->bands) / (float)tu->bands;
-  float spec = (v3_dot(N, H) > 0.94f) ? 0.7f : 0.f;
+  float spec = (v3_dot(N, H) > TOON_SPEC_THRESH) ? TOON_SPEC : 0.f;
   Vec3 c = u->obj_color;
-  out->color.x = fminf(c.x * (banded + 0.12f) + spec, 1.f);
-  out->color.y = fminf(c.y * (banded + 0.12f) + spec, 1.f);
-  out->color.z = fminf(c.z * (banded + 0.12f) + spec, 1.f);
+  out->color.x = fminf(c.x * (banded + TOON_AMBIENT_LIFT) + spec, 1.f);
+  out->color.y = fminf(c.y * (banded + TOON_AMBIENT_LIFT) + spec, 1.f);
+  out->color.z = fminf(c.z * (banded + TOON_AMBIENT_LIFT) + spec, 1.f);
   out->discard = false;
 }
 
-/*
- * frag_normals — world normal → RGB.
- * On the displaced sphere this shows the recomputed deformed normals
- * directly — the wave crests appear as rotating hue bands, making
- * the central difference calculation visually verifiable.
- */
+/* A debugging view: paint each pixel by which way the surface faces, turned into
+ * a colour. On the bumpy sphere this shows the recomputed facings directly —
+ * the wave crests show up as swirling colour bands, so you can see the
+ * facing-recompute is working. */
 static void frag_normals(const FSIn *in, FSOut *out, const void *u_) {
   (void)u_;
   Vec3 N = v3_norm(in->world_nrm);
@@ -1069,42 +615,80 @@ static void frag_normals(const FSIn *in, FSOut *out, const void *u_) {
   out->discard = false;
 }
 
-/*
- * frag_wire — barycentric edge detection.
- * On the displaced sphere the wireframe shows the UV grid deformed
- * by the displacement — latitude lines ripple in and out, the spiky
- * mode makes the grid look like a porcupine.
- */
-static void frag_wire(const FSIn *in, FSOut *out, const void *u_) {
-  (void)u_;
-  float edge = fminf(in->custom[0], fminf(in->custom[1], in->custom[2]));
-  if (edge > WIRE_THRESH) {
-    out->discard = true;
-    return;
-  }
-  float t = edge / WIRE_THRESH;
-  out->color = v3(0.9f - t * 0.3f, 0.9f - t * 0.3f, 0.9f - t * 0.3f);
+/* The fake-glass look. With nothing actually behind the sphere, we bend the line
+ * of sight through the surface and read a made-up stripe pattern with it; since
+ * the bumpy surface steers that, the stripes swirl over every wave and spike —
+ * that swirling IS the "see-through" effect. The edges turn mirror-bright and
+ * the centre stays clearer (like real glass), with a tight glint on top. */
+static void frag_glass(const FSIn *in, FSOut *out, const void *u_) {
+  const Uniforms *u = (const Uniforms *)u_;
+  Vec3 N = v3_norm(in->world_nrm);
+  Vec3 V = v3_norm(v3_sub(u->cam_pos, in->world_pos)); /* toward the eye */
+  Vec3 L = v3_norm(v3_sub(u->light_pos, in->world_pos));
+  Vec3 H = v3_norm(v3_add(L, V));
+
+  /* how mirror-like this spot is: nearly clear head-on, full mirror at the edge */
+  float ndv = fmaxf(0.f, v3_dot(N, V));
+  float fres = GLASS_F0 + (1.f - GLASS_F0) * powf(1.f - ndv, 5.f);
+
+  /* bend the line of sight through the surface and read the stripes with it */
+  Vec3 R = v3_refract(v3_scale(V, -1.f), N, GLASS_ETA);
+  float stripes = 0.5f + 0.5f * sinf((R.x + R.y) * GLASS_ENV_FREQ);
+  Vec3 tint = v3(0.45f, 0.80f, 0.95f); /* cool cyan glass */
+  Vec3 refr = v3_scale(tint, 0.25f + 0.75f * stripes);
+
+  /* the mirror part: a bright near-white edge plus a tight glint */
+  float spec = powf(fmaxf(0.f, v3_dot(N, H)), u->shininess * GLASS_GLINT_MULT);
+  Vec3 refl = v3(0.90f, 0.95f, 1.0f);
+
+  /* mix: see-through in the centre, mirror at the rim, glint on top */
+  Vec3 c = v3_add(v3_scale(refr, 1.f - fres), v3_scale(refl, fres));
+  c = v3_add(c, v3(spec, spec, spec));
+
+  out->color = v3_gamma(c);
   out->discard = false;
 }
 
-typedef enum { SH_PHONG = 0, SH_TOON, SH_NORMALS, SH_WIRE, SH_COUNT } ShaderIdx;
-static const char *k_shader_names[] = {"phong", "toon", "normals", "wire"};
+/*
+ * ShaderIdx — which look is showing; the 's' key cycles through them. Numbered
+ * from 0 in a row so 's' can step through and so they double as labels.
+ */
+typedef enum {
+  SH_PHONG = 0, /* normal realistic lighting          */
+  SH_TOON,      /* flat cartoon shading               */
+  SH_NORMALS,   /* facing-as-colour debug view         */
+  SH_GLASS,     /* fake see-through glass              */
+  SH_COUNT,     /* how many looks there are (for cycling) */
+} ShaderIdx;
 
-/* ── §5 mesh — UV sphere tessellation ────────────────────────────────── */
+/* HUD label per shader, indexed by ShaderIdx. */
+static const char *k_shader_names[] = {"phong", "toon", "normals", "glass"};
 
+/* ── §5 mesh — building the sphere once at startup ─────────────────────── */
+
+/*
+ * Vertex / Triangle / Mesh — a shape made of triangles. To avoid storing the
+ * same corner over and over, the corners live once in one list and each triangle
+ * just points at three of them by their slot number.
+ *
+ * Each corner carries which way it faces so the surface shades smoothly; on the
+ * plain sphere that's the direction straight out, but the per-corner step
+ * overwrites it each frame with the bent-surface facing. Mesh owns its two lists
+ * on the heap — the only memory the program allocates, built once.
+ */
 typedef struct {
-  Vec3 pos;
-  Vec3 normal;
-  float u, v;
+  Vec3 pos;    /* the corner's position (on the plain, un-pushed sphere) */
+  Vec3 normal; /* which way it faces                                     */
+  float u, v;  /* its place around/along the sphere (0..1)               */
 } Vertex;
 typedef struct {
-  int v[3];
+  int v[3]; /* three corner-slots, counter-clockwise from outside */
 } Triangle;
 typedef struct {
-  Vertex *verts;
-  int nvert;
-  Triangle *tris;
-  int ntri;
+  Vertex *verts;  /* the corner list (heap, built once)   */
+  int nvert;      /* how many corners are filled in        */
+  Triangle *tris; /* the triangle list (heap, built once) */
+  int ntri;       /* how many triangles are filled in      */
 } Mesh;
 
 static void mesh_free(Mesh *m) {
@@ -1113,38 +697,52 @@ static void mesh_free(Mesh *m) {
   *m = (Mesh){0};
 }
 
-/*
- * tessellate_sphere — identical to sphere_raster.c.
- * Normal = normalised position (unit sphere).
- * Pole normals set explicitly to avoid sin(phi)=0 degenerate case.
- * Winding: (r0,r2,r1) and (r1,r2,r3) — CCW from outside.
- */
+/* The corners sit on a grid of rows (top to bottom) and columns (around). This
+ * finds the slot for one (row, col). Each row keeps one extra column so the seam
+ * where it wraps lines up cleanly. */
+static inline int grid_index(int row, int col, int nu) {
+  return row * (nu + 1) + col;
+}
+
+/* Places one corner on the sphere, like a point at a given latitude (row) and
+ * longitude (column) on a globe. It faces straight out — except right at the two
+ * poles, where "straight out" is undefined, so we pin it to up / down. */
+static Vertex sphere_vertex(int j, int i, int nu, int nv) {
+  float v = (float)j / nv;
+  float u = (float)i / nu;
+  float phi = v * PI;
+  float theta = u * 2.f * PI;
+  float sp = sinf(phi), cp = cosf(phi);
+  Vec3 pos = v3(SPHERE_R * sp * cosf(theta), SPHERE_R * cp,
+                SPHERE_R * sp * sinf(theta));
+  Vec3 nrm =
+      (sp < 1e-6f) ? ((j == 0) ? v3(0, 1, 0) : v3(0, -1, 0)) : v3_norm(pos);
+  return (Vertex){pos, nrm, u, v};
+}
+
+/* Builds the ball: place every corner on the grid, then stitch each little grid
+ * square into two triangles (wound counter-clockwise so the renderer can tell
+ * front from back). Built once at startup. */
 static Mesh tessellate_sphere(void) {
   int nu = TESS_U, nv = TESS_V;
-  float R = SPHERE_R, PI2 = 2.f * PI;
   Mesh m;
   m.verts = malloc((size_t)(nu + 1) * (nv + 1) * sizeof(Vertex));
   m.tris = malloc((size_t)nu * nv * 2 * sizeof(Triangle));
   m.nvert = 0;
   m.ntri = 0;
 
-  for (int j = 0; j <= nv; j++) {
-    float v = (float)j / nv;
-    float phi = v * PI;
-    float sp = sinf(phi), cp = cosf(phi);
-    for (int i = 0; i <= nu; i++) {
-      float u = (float)i / nu;
-      float theta = u * PI2;
-      Vec3 pos = v3(R * sp * cosf(theta), R * cp, R * sp * sinf(theta));
-      Vec3 nrm =
-          (sp < 1e-6f) ? ((j == 0) ? v3(0, 1, 0) : v3(0, -1, 0)) : v3_norm(pos);
-      m.verts[m.nvert++] = (Vertex){pos, nrm, u, v};
-    }
-  }
+  /* place every corner on the grid */
+  for (int j = 0; j <= nv; j++)
+    for (int i = 0; i <= nu; i++)
+      m.verts[m.nvert++] = sphere_vertex(j, i, nu, nv);
+
+  /* stitch each grid square into two triangles */
   for (int j = 0; j < nv; j++) {
     for (int i = 0; i < nu; i++) {
-      int r0 = j * (nu + 1) + i, r1 = r0 + 1;
-      int r2 = r0 + (nu + 1), r3 = r2 + 1;
+      int r0 = grid_index(j, i, nu);
+      int r1 = grid_index(j, i + 1, nu);
+      int r2 = grid_index(j + 1, i, nu);
+      int r3 = grid_index(j + 1, i + 1, nu);
       m.tris[m.ntri++] = (Triangle){{r0, r2, r1}};
       m.tris[m.ntri++] = (Triangle){{r1, r2, r3}};
     }
@@ -1152,17 +750,33 @@ static Mesh tessellate_sphere(void) {
   return m;
 }
 
-/* ── §6 framebuffer — zbuf + cbuf + Bourke ramp + dither + blit ──────── */
+/* ── §6 framebuffer — where we draw before showing it ──────────────────── */
 
+/*
+ * Cell — one finished character on screen: which character, what colour, and
+ * whether it's bold. The colour has already been boiled down to these, so the
+ * copy-to-screen step just emits them. ch=0 means the cell was never touched.
+ */
 typedef struct {
-  char ch;
-  int color_pair;
-  bool bold;
+  char ch;        /* the character (0 = empty, skipped when shown) */
+  int color_pair; /* which colour                                  */
+  bool bold;      /* bold for bright cells                         */
 } Cell;
+
+/*
+ * Framebuffer — our own off-screen page, the size of the terminal, that we draw
+ * into and then copy out all at once. Two grids of cols×rows:
+ *   cbuf — the finished character + colour for each cell
+ *   zbuf — how near the closest thing drawn at each cell is, so a farther
+ *          surface can't paint over a nearer one (the classic z-buffer, Catmull
+ *          1974; empty cells start "infinitely far")
+ * Keeping cbuf as plain data means the drawing math never touches ncurses —
+ * fb_blit is the one place that does.
+ */
 typedef struct {
-  float *zbuf;
-  Cell *cbuf;
-  int cols, rows;
+  float *zbuf;    /* nearness per cell (FLT_MAX = empty); nearest wins */
+  Cell *cbuf;     /* finished character/colour per cell                */
+  int cols, rows; /* size, = the terminal size                        */
 } Framebuffer;
 
 static void fb_alloc(Framebuffer *fb, int c, int r) {
@@ -1203,12 +817,22 @@ static void color_init(void) {
   }
 }
 
-static int hue_to_pair(Vec3 c) {
+/* How bright a colour looks to the eye (green counts most, blue least). */
+static inline float rec709_luma(Vec3 c) {
+  return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
+
+/* Picks the character for a given brightness (0..1): faint for dim, dense for bright. */
+static inline int ramp_index(float v) { return (int)(v * (BOURKE_LEN - 1)); }
+
+/* Which colour a colour is — its spot on the colour wheel, in degrees. Returns
+ * -1 if it's too greyish to have a real colour. */
+static float rgb_hue(Vec3 c) {
   float mx = fmaxf(c.x, fmaxf(c.y, c.z));
   float mn = fminf(c.x, fminf(c.y, c.z));
   float chroma = mx - mn;
-  if (chroma < 0.08f)
-    return -1;
+  if (chroma < CHROMA_MIN)
+    return -1.f;
   float h;
   if (mx == c.x)
     h = 60.f * fmodf((c.y - c.z) / chroma, 6.f);
@@ -1218,11 +842,17 @@ static int hue_to_pair(Vec3 c) {
     h = 60.f * ((c.x - c.y) / chroma + 4.f);
   if (h < 0.f)
     h += 360.f;
+  return h;
+}
+
+/* Snaps a colour-wheel position to the nearest of our 7 colours (going the short
+ * way around the wheel) and returns its pair number. */
+static int nearest_palette_pair(float hue) {
   static const float pal[7] = {0.f, 30.f, 60.f, 120.f, 180.f, 240.f, 300.f};
   int best = 0;
   float bd = 1e9f;
   for (int i = 0; i < 7; i++) {
-    float d = fabsf(h - pal[i]);
+    float d = fabsf(hue - pal[i]);
     if (d > 180.f)
       d = 360.f - d;
     if (d < bd) {
@@ -1233,22 +863,30 @@ static int hue_to_pair(Vec3 c) {
   return best + 1;
 }
 
-/* rgb_to_cell — GLYPH from luminance (Bayer-dithered Bourke ramp); COLOUR PAIR
- * from the fragment HUE so the normals shader reads as a rainbow, distinct from
- * the material-coloured phong shader. Desaturated fragments (wireframe) fall
- * back to the luma ramp. (Was luma-only, which made normals look like phong.) */
+/* Picks a colour for a pixel by its colour-wheel position, or -1 if it's grey. */
+static int hue_to_pair(Vec3 c) {
+  float hue = rgb_hue(c);
+  if (hue < 0.f)
+    return -1;
+  return nearest_palette_pair(hue);
+}
+
+/* Turns a pixel's colour into a finished cell: the character comes from its
+ * brightness (with a dither nudge so gradients stay smooth), and the colour from
+ * its hue — so the facing-view reads as a rainbow, not just shades of one colour.
+ * Greyish pixels fall back to brightness-based shades. */
 static Cell rgb_to_cell(Vec3 col, int px, int py) {
-  float luma = 0.2126f * col.x + 0.7152f * col.y + 0.0722f * col.z;
-  float d = luma + (k_bayer[py & 3][px & 3] - 0.5f) * 0.15f;
-  d = d < 0.f ? 0.f : d > 1.f ? 1.f : d;
-  int idx = (int)(d * (BOURKE_LEN - 1));
-  int cp = hue_to_pair(col);
-  if (cp < 0) {
-    cp = 1 + (int)(d * 6.f);
-    if (cp > 7)
-      cp = 7;
+  float dithered =
+      clamp01(rec709_luma(col) + (k_bayer[py & 3][px & 3] - 0.5f) * DITHER_AMP);
+  int glyph = ramp_index(dithered);
+
+  int pair = hue_to_pair(col);
+  if (pair < 0) { /* greyish → shade it by brightness instead */
+    pair = 1 + (int)(dithered * 6.f);
+    if (pair > 7)
+      pair = 7;
   }
-  return (Cell){k_bourke[idx], cp, d > 0.6f};
+  return (Cell){k_bourke[glyph], pair, dithered > LUMA_BOLD_ABOVE};
 }
 
 static void fb_blit(const Framebuffer *fb) {
@@ -1265,8 +903,12 @@ static void fb_blit(const Framebuffer *fb) {
   }
 }
 
-/* ── §7 pipeline — vertex transform → cull → barycentric raster → FS ── */
+/* ── §7 pipeline — drawing the triangles ───────────────────────────────── */
 
+/* For a pixel and a triangle, returns three weights (one per corner) saying how
+ * much each corner pulls on that pixel. They tell us if the pixel is inside (all
+ * three positive) and how to blend the corners' values there. A degenerate
+ * (zero-area) triangle returns negatives so the caller skips it. */
 static void barycentric(const float sx[3], const float sy[3], float px,
                         float py, float b[3]) {
   float d =
@@ -1280,160 +922,189 @@ static void barycentric(const float sx[3], const float sy[3], float px,
   b[2] = 1.f - b[0] - b[1];
 }
 
-static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
-                               ShaderProgram *sh, bool is_wire,
-                               bool cull_backface) {
+/* Runs the per-corner step on a triangle's three corners. */
+static void run_vertex_shader(const Mesh *mesh, const Triangle *tri,
+                              ShaderProgram *sh, VSOut vo[3]) {
+  for (int vi = 0; vi < 3; vi++) {
+    const Vertex *vtx = &mesh->verts[tri->v[vi]];
+    VSIn in;
+    in.pos = vtx->pos;
+    in.normal = vtx->normal;
+    in.u = vtx->u;
+    in.v = vtx->v;
+    memset(&vo[vi], 0, sizeof vo[vi]);
+    sh->vert(&in, &vo[vi], sh->vert_uni);
+  }
+}
+
+/* True when all three corners are behind the camera — the whole triangle is
+ * off-screen, so skip it. */
+static bool all_behind_near_plane(const VSOut vo[3]) {
+  return vo[0].clip_pos.w < NEAR_W_EPS && vo[1].clip_pos.w < NEAR_W_EPS &&
+         vo[2].clip_pos.w < NEAR_W_EPS;
+}
+
+/* Finishes the corners onto the screen: divide by distance (far = smaller),
+ * scale into cells, and flip y because screen rows count downward but up should
+ * be up. */
+static void project_to_screen(const VSOut vo[3], int cols, int rows,
+                              float sx[3], float sy[3], float sz[3]) {
+  for (int vi = 0; vi < 3; vi++) {
+    float w = vo[vi].clip_pos.w;
+    if (fabsf(w) < 1e-6f)
+      w = 1e-6f;
+    sx[vi] = (vo[vi].clip_pos.x / w + 1.f) * 0.5f * (float)cols;
+    sy[vi] = (-vo[vi].clip_pos.y / w + 1.f) * 0.5f * (float)rows;
+    sz[vi] = vo[vi].clip_pos.z / w;
+  }
+}
+
+/* Measures the triangle's signed area on screen; its sign tells which way the
+ * triangle faces. After the y-flip, front faces come out positive, so culling
+ * keeps the positive ones. */
+static float signed_area(const float sx[3], const float sy[3]) {
+  return (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+}
+
+/* Walks the cells the triangle covers; for each one inside it and nearer than
+ * whatever's there, blends the corners to that pixel, runs the per-pixel step,
+ * and stores the cell. */
+static void rasterize_fragments(Framebuffer *fb, const VSOut vo[3],
+                                const float sx[3], const float sy[3],
+                                const float sz[3], ShaderProgram *sh) {
   int cols = fb->cols, rows = fb->rows;
-  static const float wu[3] = {1.f, 0.f, 0.f};
-  static const float wv[3] = {0.f, 1.f, 0.f};
+  int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
+  int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
+  int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
+  int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
 
-  for (int ti = 0; ti < mesh->ntri; ti++) {
-    const Triangle *tri = &mesh->tris[ti];
-    VSOut vo[3];
-    for (int vi = 0; vi < 3; vi++) {
-      const Vertex *vtx = &mesh->verts[tri->v[vi]];
-      VSIn in;
-      in.pos = vtx->pos;
-      in.normal = vtx->normal;
-      in.u = is_wire ? wu[vi] : vtx->u;
-      in.v = is_wire ? wv[vi] : vtx->v;
-      memset(&vo[vi], 0, sizeof vo[vi]);
-      sh->vert(&in, &vo[vi], sh->vert_uni);
-      if (is_wire) {
-        vo[vi].custom[0] = wu[vi];
-        vo[vi].custom[1] = wv[vi];
-        vo[vi].custom[2] = 1.f - wu[vi] - wv[vi];
-      }
-    }
+  for (int py = y0; py <= y1; py++) {
+    for (int px = x0; px <= x1; px++) {
+      float b[3];
+      barycentric(sx, sy, px + .5f, py + .5f, b);
+      if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
+        continue;
 
-    if (vo[0].clip_pos.w < 0.001f && vo[1].clip_pos.w < 0.001f &&
-        vo[2].clip_pos.w < 0.001f)
-      continue;
+      float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
+      int idx = py * cols + px;
+      if (z >= fb->zbuf[idx])
+        continue;
+      fb->zbuf[idx] = z;
 
-    float sx[3], sy[3], sz[3];
-    for (int vi = 0; vi < 3; vi++) {
-      float w = vo[vi].clip_pos.w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (vo[vi].clip_pos.x / w + 1.f) * 0.5f * (float)cols;
-      sy[vi] = (-vo[vi].clip_pos.y / w + 1.f) * 0.5f * (float)rows;
-      sz[vi] = vo[vi].clip_pos.z / w;
-    }
+      FSIn fsin;
+      fsin.world_pos = v3_bary(vo[0].world_pos, vo[1].world_pos,
+                               vo[2].world_pos, b[0], b[1], b[2]);
+      fsin.world_nrm = v3_norm(v3_bary(vo[0].world_nrm, vo[1].world_nrm,
+                                       vo[2].world_nrm, b[0], b[1], b[2]));
+      fsin.u = b[0] * vo[0].u + b[1] * vo[1].u + b[2] * vo[2].u;
+      fsin.v = b[0] * vo[0].v + b[1] * vo[1].v + b[2] * vo[2].v;
+      fsin.px = px;
+      fsin.py = py;
 
-    float area =
-        (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (cull_backface && area <= 0.f)
-      continue;
+      FSOut fsout;
+      fsout.discard = false;
+      sh->frag(&fsin, &fsout, sh->frag_uni);
+      if (fsout.discard)
+        continue;
 
-    int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
-    int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
-    int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
-    int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
-
-    for (int py = y0; py <= y1; py++) {
-      for (int px = x0; px <= x1; px++) {
-        float b[3];
-        barycentric(sx, sy, px + .5f, py + .5f, b);
-        if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
-          continue;
-
-        float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
-        int idx = py * cols + px;
-        if (z >= fb->zbuf[idx])
-          continue;
-        fb->zbuf[idx] = z;
-
-        FSIn fsin;
-        fsin.world_pos = v3_bary(vo[0].world_pos, vo[1].world_pos,
-                                 vo[2].world_pos, b[0], b[1], b[2]);
-        fsin.world_nrm = v3_norm(v3_bary(vo[0].world_nrm, vo[1].world_nrm,
-                                         vo[2].world_nrm, b[0], b[1], b[2]));
-        fsin.u = b[0] * vo[0].u + b[1] * vo[1].u + b[2] * vo[2].u;
-        fsin.v = b[0] * vo[0].v + b[1] * vo[1].v + b[2] * vo[2].v;
-        fsin.px = px;
-        fsin.py = py;
-        for (int c = 0; c < 4; c++)
-          fsin.custom[c] = b[0] * vo[0].custom[c] + b[1] * vo[1].custom[c] +
-                           b[2] * vo[2].custom[c];
-
-        FSOut fsout;
-        fsout.discard = false;
-        sh->frag(&fsin, &fsout, sh->frag_uni);
-        if (fsout.discard)
-          continue;
-
-        fb->cbuf[idx] = rgb_to_cell(fsout.color, px, py);
-      }
+      fb->cbuf[idx] = rgb_to_cell(fsout.color, px, py);
     }
   }
 }
 
-/* ── §8 scene — uniforms wiring, tick, draw, mode/shader swap ────────── */
+/* Draws the whole sphere, one triangle at a time: run the per-corner step, drop
+ * it if it's behind the camera or facing away, then fill the cells it covers. */
+static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
+                               ShaderProgram *sh, bool cull_backface) {
+  int cols = fb->cols, rows = fb->rows;
 
-/*
- * Per-mode amplitude and frequency tuning.
- * Each mode looks best at different scales — these are the values
- * that make each mode look visually distinct and dramatic.
- *
- * amp  — fraction of sphere radius to displace
- * freq — spatial frequency of the wave pattern
- */
+  for (int ti = 0; ti < mesh->ntri; ti++) {
+    const Triangle *tri = &mesh->tris[ti];
+
+    VSOut vo[3];
+    run_vertex_shader(mesh, tri, sh, vo);
+    if (all_behind_near_plane(vo))
+      continue;
+
+    float sx[3], sy[3], sz[3];
+    project_to_screen(vo, cols, rows, sx, sy, sz);
+    if (cull_backface && signed_area(sx, sy) <= 0.f)
+      continue;
+
+    rasterize_fragments(fb, vo, sx, sy, sz, sh);
+  }
+}
+
+/* ── §8 scene — the sphere, the clock, and the chosen settings ─────────── */
+
+/* How big and how dense each pattern is — hand-tuned so each one looks its best.
+ * amp = how far to push (as a fraction of the radius); freq = how dense. */
 static const float k_amp[DM_COUNT] = {0.22f, 0.18f, 0.30f, 0.35f};
 static const float k_freq[DM_COUNT] = {8.0f, 5.0f, 4.0f, 4.5f};
 
+/*
+ * Scene — everything about what's on screen and how the viewer is steering it.
+ * Only three things actually change on their own each frame — the clock and the
+ * two tumble angles, all advanced by scene_tick; from those it rebuilds the
+ * transforms and the shared-data blocks. The rest is what the keys set (pause,
+ * cull, which look, which pattern, zoom) or the drawing wiring.
+ *
+ * There are three shared-data blocks because different steps want different
+ * types: `uni` is the master copy scene_tick fills, and disp_uni / toon_uni are
+ * copied from it so the steps that need extra fields have them.
+ */
 typedef struct {
-  Mesh mesh;
-  float angle_x, angle_y;
-  float cam_dist;
-  bool paused;
-  bool cull_backface;
-  ShaderIdx shade_idx;
-  DispMode disp_idx;
-  ShaderProgram shader;
-  Uniforms uni;
-  ToonUniforms toon_uni;
-  DisplaceUniforms disp_uni;
-  float time;
+  /* the shape */
+  Mesh mesh; /* the sphere, built once at startup */
+  /* the only things that change on their own each frame */
+  float angle_x, angle_y; /* tumble angles                    */
+  float time;             /* the animation clock (seconds)    */
+  /* what the keys set */
+  float cam_dist;      /* zoom distance (+/-)                  */
+  bool paused;         /* space freezes everything             */
+  bool cull_backface;  /* 'c' shows/hides the inside faces     */
+  ShaderIdx shade_idx; /* 's' which look                       */
+  DispMode disp_idx;   /* 'd' which pattern                    */
+  /* the drawing wiring (rebuilt from the above) */
+  ShaderProgram shader;      /* the active look + its data pointers */
+  Uniforms uni;              /* the master shared data              */
+  ToonUniforms toon_uni;     /* uni + band count, for the toon look */
+  DisplaceUniforms disp_uni; /* uni + push settings, for every look */
 } Scene;
 
+/* §8.1 ── rebuild the drawing wiring from the current settings ────────── */
+
+/* Points the active look's slots at the right pair of steps and data for the
+ * shader the user picked. Every look uses the same per-corner step (it needs the
+ * push settings); the per-pixel step and its data are what differ. The toon look
+ * needs its own data with the band count; the others just reuse the push data,
+ * which the lighting steps can read as plain shared data because it starts with
+ * that. */
 static void scene_build_shader(Scene *s) {
-  /*
-   * vert_uni is ALWAYS &disp_uni — every vertex shader variant is a
-   * form of vert_displace and needs DisplaceUniforms to call disp_fn.
-   *
-   * frag_uni points to the struct the fragment shader actually needs:
-   *   frag_phong   → Uniforms*    — cast from &disp_uni (base is first member)
-   *   frag_toon    → ToonUniforms* — needs bands field
-   *   frag_normals → unused       — (void)u_ so either pointer is fine
-   *   frag_wire    → unused       — (void)u_ so either pointer is fine
-   *
-   * DisplaceUniforms leads with Uniforms base so &disp_uni casts cleanly
-   * to const Uniforms* inside frag_phong — same zero-offset rule as before.
-   */
   switch (s->shade_idx) {
   case SH_PHONG:
     s->shader.vert = vert_displace;
     s->shader.frag = frag_phong;
     s->shader.vert_uni = &s->disp_uni;
-    s->shader.frag_uni = &s->disp_uni; /* Uniforms* cast from Disp* */
+    s->shader.frag_uni = &s->disp_uni;
     break;
   case SH_TOON:
     s->toon_uni.base = s->disp_uni.base;
     s->toon_uni.bands = 4;
     s->shader.vert = vert_displace;
     s->shader.frag = frag_toon;
-    s->shader.vert_uni = &s->disp_uni; /* vert needs disp params    */
-    s->shader.frag_uni = &s->toon_uni; /* frag needs bands          */
+    s->shader.vert_uni = &s->disp_uni; /* the per-corner step needs the push   */
+    s->shader.frag_uni = &s->toon_uni; /* the toon step needs the band count   */
     break;
   case SH_NORMALS:
-    s->shader.vert = vert_displace_normals;
+    s->shader.vert = vert_displace;
     s->shader.frag = frag_normals;
     s->shader.vert_uni = &s->disp_uni;
     s->shader.frag_uni = &s->disp_uni;
     break;
-  case SH_WIRE:
-    s->shader.vert = vert_displace_wire;
-    s->shader.frag = frag_wire;
+  case SH_GLASS:
+    s->shader.vert = vert_displace;
+    s->shader.frag = frag_glass;
     s->shader.vert_uni = &s->disp_uni;
     s->shader.frag_uni = &s->disp_uni;
     break;
@@ -1442,16 +1113,9 @@ static void scene_build_shader(Scene *s) {
   }
 }
 
+/* Copies the master shared data into the push block and refreshes the push
+ * settings — called every frame so the transforms and the clock stay current. */
 static void scene_sync_disp(Scene *s) {
-  /*
-   * Copy current base uniforms into disp_uni and update displacement
-   * params.  Called every frame from scene_tick so time, mvp, and
-   * norm_mat stay current.
-   *
-   * toon_uni.base is updated in scene_build_shader when the toon
-   * shader is selected, and again here every frame so the lighting
-   * matrices stay current when the toon shader is active.
-   */
   s->disp_uni.base = s->uni;
   s->disp_uni.disp_fn = k_disp_fn[s->disp_idx];
   s->disp_uni.time = s->time;
@@ -1459,11 +1123,12 @@ static void scene_sync_disp(Scene *s) {
   s->disp_uni.frequency = k_freq[s->disp_idx];
   s->disp_uni.mode = s->disp_idx;
 
-  /* keep toon base matrices current if toon shader is active */
+  /* keep the toon block's transforms current too, when that look is active */
   if (s->shade_idx == SH_TOON)
     s->toon_uni.base = s->uni;
 }
 
+/* §8.2 ── build the sphere and set the starting state ─────────────────── */
 static void scene_init(Scene *s, int cols, int rows) {
   memset(s, 0, sizeof *s);
   s->mesh = tessellate_sphere();
@@ -1476,7 +1141,7 @@ static void scene_init(Scene *s, int cols, int rows) {
   s->uni.light_pos = v3(4.f, 5.f, 3.f);
   s->uni.light_col = v3(1.f, 1.f, 1.f);
   s->uni.ambient = v3(0.06f, 0.06f, 0.06f);
-  s->uni.shininess = 60.f;
+  s->uni.shininess = LIGHT_SHININESS;
   s->uni.cam_pos = v3(0.f, 0.f, s->cam_dist);
   s->uni.obj_color = v3(0.2f, 0.7f, 0.95f); /* ocean blue */
 
@@ -1488,16 +1153,9 @@ static void scene_init(Scene *s, int cols, int rows) {
   scene_build_shader(s);
 }
 
-static void scene_set_zoom(Scene *s) {
-  s->uni.cam_pos = v3(0.f, 0.f, s->cam_dist);
-  s->uni.view = m4_lookat(s->uni.cam_pos, v3(0, 0, 0), v3(0, 1, 0));
-}
-
-static void scene_rebuild_proj(Scene *s, int cols, int rows) {
-  float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
-  s->uni.proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
-}
-
+/* §8.3 ── the one place the scene moves forward each frame ─────────────── */
+/* Advances the clock and the tumble (unless paused), then rebuilds the
+ * transforms and refreshes the shared data from them. */
 static void scene_tick(Scene *s, float dt) {
   if (!s->paused) {
     s->time += dt;
@@ -1510,18 +1168,20 @@ static void scene_tick(Scene *s, float dt) {
   s->uni.mvp = m4_mul(s->uni.proj, m4_mul(s->uni.view, s->uni.model));
   s->uni.norm_mat = m4_normal_mat(s->uni.model);
   scene_sync_disp(s);
-  /*
-   * No shader.uniforms fixup here — vert_uni/frag_uni are set once in
-   * scene_build_shader and remain valid for the lifetime of that shader
-   * selection.  scene_sync_disp keeps the pointed-to structs current.
-   */
 }
 
-static void scene_draw(Scene *s, Framebuffer *fb) {
-  fb_clear(fb);
-  pipeline_draw_mesh(fb, &s->mesh, &s->shader, (s->shade_idx == SH_WIRE),
-                     s->cull_backface);
-  fb_blit(fb);
+/* §8.4 ── responding to keys (these don't advance the animation) ──────── */
+
+/* Moves the camera in/out for the new zoom and refreshes its look-from transform. */
+static void scene_set_zoom(Scene *s) {
+  s->uni.cam_pos = v3(0.f, 0.f, s->cam_dist);
+  s->uni.view = m4_lookat(s->uni.cam_pos, v3(0, 0, 0), v3(0, 1, 0));
+}
+
+/* Rebuilds the perspective for a new window size so the sphere isn't stretched. */
+static void scene_rebuild_proj(Scene *s, int cols, int rows) {
+  float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
+  s->uni.proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 }
 
 static void scene_next_shader(Scene *s) {
@@ -1535,8 +1195,18 @@ static void scene_next_disp(Scene *s) {
   scene_build_shader(s);
 }
 
-/* ── §9 screen — ncurses init / resize / HUD / present ───────────────── */
+/* ── §9 screen · RENDER — scene_draw + ncurses init / resize / HUD ────── */
 
+/* Draws one frame: wipe the page, draw the sphere through the current look, copy
+ * it to the screen. Reads the scene, writes only the page — never the scene. */
+static void scene_draw(Scene *s, Framebuffer *fb) {
+  fb_clear(fb);
+  pipeline_draw_mesh(fb, &s->mesh, &s->shader, s->cull_backface);
+  fb_blit(fb);
+}
+
+/* Screen — the terminal window's current size in cells, re-read on every resize.
+ * The page and the perspective are rebuilt from it whenever it changes. */
 typedef struct {
   int cols, rows;
 } Screen;
@@ -1562,14 +1232,13 @@ static void screen_resize(Screen *s) {
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* HUD layout (CLAUDE.md spec):
- *   row 0          PAIR_HUD (yellow + bold)  — title left, status right
- *   row rows-1     PAIR_HINT (cyan + bold)   — key hint */
-#define PAIR_HUD 3  /* yellow — see color_init() palette        */
-#define PAIR_HINT 5 /* cyan                                     */
+/* The two overlay lines: a yellow status across the top, a cyan key reminder
+ * along the bottom. */
+#define PAIR_HUD 3  /* yellow */
+#define PAIR_HINT 5 /* cyan   */
 
 static void screen_draw_hud(const Screen *s, const Scene *sc, double fps) {
-  /* Right-aligned status. */
+  /* the status, pinned to the right */
   char status[HUD_COLS + 1];
   snprintf(status, sizeof status,
            " %5.1f fps  disp:%s  shader:%s  zoom:%.1f  cull:%s%s ", fps,
@@ -1596,14 +1265,21 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §10 app — main loop, signals, resize, cleanup ───────────────────── */
+/* ── §10 app — setup, the main loop, and keypresses ────────────────────── */
 
+/*
+ * App — the whole running program: the scene, the terminal size, the drawing
+ * page, and two flags the signal handlers set. One shared instance (g_app) so
+ * the handlers, which take no arguments, can reach it. The two flags are marked
+ * volatile sig_atomic_t because a signal can set them at any moment, so the
+ * compiler must always read/write them for real.
+ */
 typedef struct {
-  Scene scene;
-  Screen screen;
-  Framebuffer fb;
-  volatile sig_atomic_t running;
-  volatile sig_atomic_t need_resize;
+  Scene scene;       /* everything drawn                  */
+  Screen screen;     /* terminal size                     */
+  Framebuffer fb;    /* the off-screen page               */
+  volatile sig_atomic_t running;     /* cleared to stop the loop          */
+  volatile sig_atomic_t need_resize; /* set when the window was resized   */
 } App;
 
 static App g_app;
@@ -1617,6 +1293,7 @@ static void on_resize(int sig) {
 }
 static void cleanup(void) { endwin(); }
 
+/* Re-reads the new window size and rebuilds the page and perspective to match. */
 static void app_do_resize(App *app) {
   screen_resize(&app->screen);
   fb_free(&app->fb);
@@ -1666,6 +1343,7 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
+/* Reads the clock and sleeps, for timing and the frame-rate cap. */
 static int64_t clock_ns(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
@@ -1699,11 +1377,13 @@ int main(void) {
 
   while (app->running) {
 
+    /* handle a window resize if one happened */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
     }
 
+    /* how long since the last frame (capped, so a hiccup doesn't lurch things) */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
@@ -1711,8 +1391,10 @@ int main(void) {
       dt = 100 * NS_PER_MS;
     float dt_sec = (float)dt / (float)NS_PER_SEC;
 
+    /* move the animation forward */
     scene_tick(&app->scene, dt_sec);
 
+    /* update the fps readout */
     fps_cnt++;
     fps_acc += dt;
     if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1721,15 +1403,18 @@ int main(void) {
       fps_acc = 0;
     }
 
+    /* draw the frame and show it */
     erase();
     scene_draw(&app->scene, &app->fb);
     screen_draw_hud(&app->screen, &app->scene, fps_disp);
     screen_present();
 
+    /* handle a keypress (pause / look / pattern / cull / zoom / quit) */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;
 
+    /* wait out the rest of the frame to hold a steady rate */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
   }

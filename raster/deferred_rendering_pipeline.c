@@ -1,511 +1,24 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * deferred_rendering_pipeline.c — software deferred rendering
+ * deferred_rendering_pipeline.c — a white sphere lit by red, green, and blue
+ * lights orbiting around it; where two pools overlap you get yellow/cyan/magenta,
+ * where all three meet, white. It shows off "deferred" rendering: draw the
+ * surface ONCE into a few per-pixel tables, then add up the lights in a separate
+ * pass — so an extra light (press 'l', up to 8) costs almost nothing.
  *
- * DEMO: A WHITE SPHERE lit by RED, GREEN, and BLUE point lights
- *       orbiting at 120° apart on a horizontal ring. You watch each
- *       pure-RGB pool slide across the sphere; where two pools overlap
- *       the secondary colour appears (yellow / cyan / magenta); where
- *       all three meet you see white. That's additive light made
- *       visible — and it's exactly what deferred lighting computes,
- *       one light pass at a time.
- *
- *       Each light is one DEFERRED LIGHTING PASS. The sphere's
- *       geometry buffers (g_pos, g_normal, g_albedo) are computed
- *       ONCE per frame in the geometry pass; then each light reads
- *       them and accumulates its contribution into g_light. Three
- *       lights → three accumulations → final colour = sum.
- *
- *       Press 'l' to enable extra lights (up to 8). The geometry
- *       pass cost stays fixed; only g_light's accumulation grows.
- *       That's the deferred-shading guarantee — geometry once,
- *       lighting per-light, never per-(object × light).
- *
- *       Cycle 'g' through 4 G-buffer layers (POSITION / NORMAL /
- *       ALBEDO / LIGHTING). Only LIGHTING re-shades when you add
- *       lights — POSITION / NORMAL / ALBEDO are light-agnostic.
- *
- *       This is a software port of the technique used by Unity HDRP,
- *       Unreal Engine 5 (default deferred path), and OpenGL/Vulkan
- *       Multiple Render Targets — but written in C for ASCII output.
- *
- * Study alongside:
- *   raster/cube_raster.c          — single-mesh forward rasterisation
- *   raster/sphere_raster.c        — same skeleton, smooth normals
- *   raster/torus_raster.c         — same skeleton, parametric tessellation
- *   raster/displace_raster.c      — same skeleton + vertex displacement
- *   raytracing/path_tracer.c      — same RGB cube + Bourke ramp paint
- *
- * Section map:
- *   §1 config     — frame rate, FOV, geometry, ramp, ncurses pairs
- *   §2 clock      — monotonic timer + sleep
- *   §3 math       — V3, V4, Mat4 + perspective / lookat / normal mat
- *   §4 paint      — 216-pair RGB cube + Bourke ramp + paint_cell
- *                   (same as cube_raster / raytracers)
- *   §5 mesh       — Vertex / Triangle types + UV-sphere tessellator
- *   §6 gbuffer    — geometry pass: rasterise meshes into per-pixel arrays
- *                   §6.1 buffers (g_pos, g_normal, g_albedo, g_zbuf, ...)
- *                   §6.2 barycentric (Möller signed-area form)
- *                   §6.3 rasterize_object (vert → cull → raster → write)
- *                   §6.4 render_gbuffer (loop over scene objects)
- *   §7 lightpass  — Blinn-Phong shading per pixel × per light
- *                   §7.1 PointLight type
- *                   §7.2 blinn_phong (one light's contribution)
- *                   §7.3 render_lightpass (accumulate over all lights)
- *   §8 scene      — Scene state, init/tick, mode_to_rgb
- *                   §8.1 GBufMode + Scene type   (no Object struct;
- *                                                 parallel arrays only)
- *                   §8.2 LIGHT_PRESETS table
- *                   §8.3 scene_init / scene_tick
- *                   §8.4 mode_to_rgb (G-buffer layer → RGB)
- *   §9 screen     — render_scene (paint each pixel) + HUD (spec compliant)
- *   §10 app       — signals, resize, fixed-step main loop
- *
- * Keys:
- *   g / G     cycle G-buffer layer (POSITION → NORMAL → ALBEDO → LIGHTING)
- *   l / L     add a point light (wraps to 1 after MAX_LIGHTS)
- *   + / =     zoom in   (decrease camera distance)
- *   - / _     zoom out  (increase camera distance)
- *   space     pause / resume animation
- *   r / R     reset scene
- *   q / ESC   quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raster/deferred_rendering_pipeline.c \
- *       -o deferred -lncurses -lm
+ * Keys: g layer view · l add light · +/- zoom · space pause · r reset · q quit
+ * Read raster/cube_raster.c first — this is the same renderer split into two
+ * passes. The same trick powers Unity HDRP and Unreal's default path.
+ * Ideas from: the G-buffer (Saito & Takahashi, SIGGRAPH '90); Blinn-Phong
+ *   lighting (Blinn 1977); Reinhard tone-map (SIGGRAPH '02).
+ * Build: gcc -std=c11 -O2 -Wall -Wextra raster/deferred_rendering_pipeline.c -o deferred -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two-pass deferred rendering. Pass 1 (geometry/G-buffer):
- *                  rasterise every mesh into per-pixel arrays of position,
- *                  normal, and albedo — NO lighting at all. Pass 2 (lighting):
- *                  loop over pixels and run Blinn-Phong against every light,
- *                  using the buffered surface data. Cost goes from
- *                  O(objects × lights) (forward rendering) to
- *                  O(objects) + O(pixels × lights) (deferred).
- *
- *                  The second pass NEVER touches mesh data — geometry has
- *                  been "flattened" into per-pixel surface properties.
- *                  That's why adding lights doesn't change POSITION,
- *                  NORMAL, or ALBEDO views: those layers are produced
- *                  ONCE in Pass 1, before any light is considered.
- *
- *                  Output paint pipeline matches the rest of the folder:
- *                  per-pixel V3 RGB → Reinhard tone-map → gamma → 6×6×6
- *                  cube quantise + 92-char Bourke density ramp.
- *
- * Data-structure : Six parallel grids of size [GBUF_MAX_ROWS][GBUF_MAX_COLS]:
- *                  g_pos, g_normal, g_albedo, g_zbuf, g_valid, g_light.
- *                  Same scheme as Unity HDRP and Unreal's GBufferA/B/C
- *                  layout — different packing details, same idea.
- *                  Statically allocated; no malloc in the hot render path.
- *
- * Rendering      : Pass 1 (render_gbuffer) walks each object's triangles
- *                  through vertex transform → perspective divide → back-face
- *                  cull → barycentric raster → G-buffer write. Pass 2
- *                  (render_lightpass) walks the screen and accumulates
- *                  Blinn-Phong from every active light into g_light.
- *                  render_scene picks ONE G-buffer layer per pixel
- *                  (POSITION / NORMAL / ALBEDO / LIGHTING), produces a
- *                  V3 RGB, and routes through the unified paint_cell.
- *
- * Performance    : Geometry pass touches each surface pixel ONCE.
- *                  Adding lights only grows the lighting pass —
- *                  geometry pass is invariant. The HUD shows the
- *                  forward (obj × lights) vs deferred (obj + lights)
- *                  draw-call comparison so the difference is visible.
- *
- * References     : Saito & Takahashi, "Comprehensible Rendering of 3-D
- *                    Shapes," SIGGRAPH '90 (G-buffer concept).
- *                  LearnOpenGL, "Deferred Shading" tutorial:
- *                    https://learnopengl.com/Advanced-Lighting/Deferred-Shading
- *                  Unreal Engine 5 GBuffer documentation.
- *                  Unity HDRP "Forward and Deferred Rendering" docs.
- *                  Möller, "Fast Triangle Rasterization by Interpolating
- *                    Edge Functions," Game Programming Gems (2000).
- *                  Reinhard et al., "Photographic Tone Reproduction for
- *                    Digital Images," SIGGRAPH '02.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Stop trying to shade a pixel "while you draw it". Instead, draw every
- * surface FIRST and dump its position / normal / colour into per-pixel
- * arrays. THEN, only after the geometry phase is over, walk the screen
- * pixel-by-pixel and run lighting against those arrays. Lights can no
- * longer see triangles — only the flattened surface data — so adding
- * a light costs another pass over PIXELS, never over geometry.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine taking a Polaroid photograph of the scene where every pixel
- * of the photo carries three pieces of metadata in invisible ink:
- *   - WHERE the surface was in 3-D (g_pos)
- *   - WHICH WAY it faced              (g_normal)
- *   - WHAT COLOUR the paint was       (g_albedo)
- *
- * A second person can later look at the Polaroid, read the metadata,
- * and compute lighting — never seeing the scene itself. The 'g' key
- * swaps the visible "ink" so you can see each metadata layer; pressing
- * 'l' adds another lightbulb, which only the second person notices.
- *
- *      ┌──────────────────────────────────────────────┐
- *      │       FORWARD                  DEFERRED      │
- *      ├──────────────────────────────────────────────┤
- *      │   for each obj:                              │
- *      │     for each light:        for each obj:     │
- *      │       shade(obj, lite)       write_gbuffer   │
- *      │                                              │
- *      │                            for each pixel:   │
- *      │                              for each lite:  │
- *      │                                shade_gbuf    │
- *      ├──────────────────────────────────────────────┤
- *      │ O(objects × lights)   O(objects + pix×lits)  │
- *      └──────────────────────────────────────────────┘
- *
- * ALGORITHM IN STEPS  (per frame)
- * ──────────────────────────────
- *  1. gbuffer_clear: g_zbuf = +1.0 (NDC far), g_valid = 0 everywhere.
- *  2. PASS 1 — render_gbuffer:
- *       For each object:
- *         build mvp = proj · view · model; norm_mat = cofactor(model).
- *         For each triangle:
- *           - Vertex stage: clip[i] = mvp·pos; world_pos = model·pos;
- *             world_nrm  = normalize(norm_mat · normal).
- *           - Perspective divide: ndc = clip.xyz / clip.w.
- *           - Screen-space + back-face cull (signed area > 0 = front).
- *           - For each pixel in the screen-space bounding box:
- *               barycentric weights → in/out test
- *               z-test (< g_zbuf)
- *               write g_pos, g_normal, g_albedo, g_zbuf, g_valid.
- *  3. PASS 2 — render_lightpass:
- *       For each pixel where g_valid = 1:
- *         result = ambient · albedo
- *         For each active light:
- *           result += blinn_phong(P, N, albedo, light, cam)
- *         clamp to [0,1]; store in g_light.
- *  4. PASS 3 — render_scene:
- *       For each pixel: produce a V3 RGB based on the active mode
- *       (POSITION / NORMAL / ALBEDO / LIGHTING) and route through
- *       the unified paint_cell (Reinhard → gamma → 6×6×6 cube + ramp).
- *
- * KEY FORMULAS
- * ────────────
- *  mvp = P · V · M                          clip-space transform
- *  norm = cofactor(M_3×3) · n                correct under non-uniform scale
- *  sx, sy = ((±ndc + 1)/2) · dim             NDC → pixel
- *  area = (x1-x0)(y2-y0) - (x2-x0)(y1-y0)    back-face cull (CCW: area>0)
- *  bary: b·v0 + b·v1 + b·v2, Σb = 1          per-pixel attribute interp
- *  Blinn-Phong:
- *    L  = normalize(light_pos - P)
- *    V  = normalize(cam_pos   - P)
- *    H  = normalize(L + V)
- *    diff = max(0, N · L)
- *    spec = max(0, N · H)^shininess
- *    col  = ambient·albedo + albedo·light_col·diff + light_col·spec·0.35
- *
- *  forward cost ∝ obj·lights;  deferred ∝ obj + pix·lights
- *
- *  Mode → RGB mapping (mode_to_rgb):
- *    POSITION:  warm-near → cool-far gradient based on z
- *    NORMAL:    (N + 1) / 2  (each component remapped to [0,1])
- *    ALBEDO:    g_albedo[r][c]    raw flat colour
- *    LIGHTING:  g_light[r][c]     final shaded result
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Triangles with all w < 0.001 are entirely behind the near plane.
- *    Skip BEFORE perspective divide or you divide by ~0.
- *  • Back-face cull uses screen-space signed area, NOT view-space dot.
- *    CCW triangles produce positive area after Y-flip; cull negative.
- *  • g_zbuf MUST be reset to +1.0 each frame. The test is `z < g_zbuf`,
- *    so forgetting reset locks the buffer at last frame's depths.
- *  • g_valid gates ALL reads in lighting + display. Without it,
- *    lighting accumulates onto bare clear pixels.
- *  • Adding a light updates ONLY g_light. POSITION / NORMAL / ALBEDO
- *    must be pixel-perfect identical — that's the whole point.
- *  • Static G-buffer arrays are GBUF_MAX_W × GBUF_MAX_H. Resizing past
- *    those silently clips the render area.
- *  • Tone-map at paint time. The lighting pass clamps to [0,1] after
- *    summing all lights (poor man's tone-map); paint_cell additionally
- *    Reinhard-tone-maps. Without that, sums of bright lights produce
- *    one cube cell after quantising.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Switch to ALBEDO ('g'): cube is solid orange, sphere solid blue,
- *    floor grey. Pressing 'l' must NOT change this view.
- *  • In NORMAL view, cube faces show 6 distinct constant colours
- *    (flat normals); sphere shows a smooth gradient (smooth normals).
- *  • In LIGHTING view, adding a 2nd light should immediately re-shade
- *    every visible pixel without requiring scene rotation.
- *  • The HUD's "fwd vs def" counters should diverge as you add lights:
- *    fwd grows by N_objects per light, def by 1 per light.
- *  • POSITION view: warm tones near the camera, cooler tones at the
- *    back of the scene (depth gradient).
- *  • +/- zoom: sphere grows / shrinks, but the three coloured pools
- *    stay in the same triangular arrangement on its surface. The HUD's
- *    "zoom" readout matches s->cam_dist, clamped to [MIN, MAX].
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read raster/cube_raster.c first if you don't yet
- *      know forward rendering — deferred is a REORGANISATION of the
- *      same pipeline. The point is best appreciated by contrast.
- *   2. §1 config — every constant has a unit-bearing comment.
- *   3. §6 gbuffer + §7 lightpass — the TWO HEART sections. Read
- *      AFTER tutorials T1-T4. §6 is the geometry pass (writes per-
- *      pixel attributes); §7 is the lighting pass (reads them).
- *   4. §8 scene + LIGHT_PRESETS — three orbiting RGB lights.
- *   5. §3 math, §4 paint, §9-§10 — same as cube_raster; skim.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   g_pos[r][c]            world-space surface position per pixel
- *   g_normal[r][c]          world-space surface normal per pixel
- *   g_albedo[r][c]          surface base colour per pixel
- *   g_zbuf[r][c]            NDC depth per pixel
- *   g_valid[r][c]           1 if pixel has surface data, 0 = sky
- *   g_light[r][c]           accumulated lit colour from PASS 2
- *   GBufMode                which g_* buffer is being shown
- *
- * Background you need
- * ───────────────────
- *   - cube_raster.c's 7-stage forward pipeline.
- *   - The pain of "shade objects per light" in forward — N objects
- *     × M lights = N·M shading invocations.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - GPU memory bandwidth tradeoffs (relevant for real GPUs;
- *     this is software, no MRT cost).
- *   - Tile-based deferred / clustered shading (advanced variants).
- *   - Anti-aliasing in the deferred path (TAA, MSAA-with-deferred);
- *     we just write last-wins per pixel.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
- *
- * Six short tutorials. Read in order; each builds on the previous.
- *
- *   T1  Forward vs deferred — the cost equation that motivates everything
- *   T2  The G-buffer concept — flatten geometry into per-pixel arrays
- *   T3  Pass 1: writing to the G-buffer
- *   T4  Pass 2: per-pixel lighting accumulation
- *   T5  Many lights cheaply — what changes when you press 'l'
- *   T6  G-buffer visualisation — POSITION / NORMAL / ALBEDO / LIGHTING
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  FORWARD VS DEFERRED — THE COST EQUATION
- * ────────────────────────────────────────────
- * In a FORWARD renderer (cube_raster.c, sphere_raster.c, etc), the
- * loop structure is:
- *
- *     for each object O in scene:
- *       for each pixel P covered by O:
- *         for each light L:
- *           accumulate shading(O, P, L)
- *
- * Total shading invocations ≈ (covered pixels) × (lights). For a
- * scene with M objects and N lights you do M·N shader calls per
- * pixel — even though most light/object combinations contribute
- * nothing (a light far away from one object barely lights it).
- *
- * In a DEFERRED renderer, the loops are SWAPPED and DECOUPLED:
- *
- *     PASS 1 (geometry):
- *       for each object O:
- *         for each pixel P covered by O:
- *           write surface data (pos, normal, albedo) at P     ← ONCE
- *
- *     PASS 2 (lighting):
- *       for each pixel P with valid surface data:
- *         for each light L:
- *           accumulate shading(P_data, L)                      ← N×pixels
- *
- * Total: M (geometry) + pixels × N (lighting). For dense scenes
- * with many lights, deferred wins because:
- *   - Geometry pass cost is INVARIANT to N (number of lights)
- *   - Adding a 10th light only costs `pixels` more shader invocations,
- *     not `M × pixels` more
- *
- * That guarantee — "geometry once, lighting per-light" — is the
- * entire point of deferred rendering and what real-time engines
- * (Unity HDRP, Unreal default deferred) exploit.
- *
- * Trade-offs (good to know):
- *   - Memory: 4-6 buffers worth of per-pixel data (g_pos, g_normal,
- *     g_albedo, g_zbuf, g_valid, g_light here) instead of just one
- *     framebuffer.
- *   - Transparency: deferred handles transparency POORLY (per-pixel
- *     g_pos overwrites). Real engines fall back to forward for glass.
- *   - Anti-aliasing: harder in deferred (need TAA or MSAA-with-
- *     resolve). We don't AA here.
- *
- * For TEACHING purposes the cost-equation flip is the WHOLE point.
- *
- * T2  THE G-BUFFER — FLATTEN GEOMETRY INTO PER-PIXEL ARRAYS
- * ──────────────────────────────────────────────────────────
- * The G-BUFFER is a set of parallel 2-D arrays, one per surface
- * attribute, storing the CLOSEST surface's data at each pixel
- * position. Standard layout (varies between engines):
- *
- *   g_pos[r][c]      Vec3   world-space hit position
- *   g_normal[r][c]   Vec3   world-space surface normal
- *   g_albedo[r][c]   Vec3   base material colour
- *   g_zbuf[r][c]     float  NDC depth (for hidden-surface removal)
- *   g_valid[r][c]   bool    1 = pixel has surface, 0 = sky
- *
- * After PASS 1, every pixel that hits a surface has its full surface
- * properties recorded — and the geometry data is no longer needed.
- *
- * The G-buffer is the INTERFACE between the two passes. Pass 1
- * writes; Pass 2 only reads. This is what enables independent
- * scaling.
- *
- * The "G" stands for GEOMETRY (Saito & Takahashi 1990). Modern
- * engines call the same thing GBufferA, GBufferB, GBufferC...
- *
- * In code we declare them as static arrays sized for the maximum
- * resolution we expect:
- *
- *     static Vec3  g_pos    [GBUF_MAX_ROWS][GBUF_MAX_COLS];
- *     static Vec3  g_normal [GBUF_MAX_ROWS][GBUF_MAX_COLS];
- *     static Vec3  g_albedo [GBUF_MAX_ROWS][GBUF_MAX_COLS];
- *     static float g_zbuf   [GBUF_MAX_ROWS][GBUF_MAX_COLS];
- *     static int   g_valid  [GBUF_MAX_ROWS][GBUF_MAX_COLS];
- *     static Vec3  g_light  [GBUF_MAX_ROWS][GBUF_MAX_COLS];   pass-2 output
- *
- * Read §6.1 for the full declaration.
- *
- * T3  PASS 1: WRITING TO THE G-BUFFER
- * ────────────────────────────────────
- * Pass 1 is the standard rasteriser (cube_raster.c) BUT with the
- * fragment shader replaced by "write surface data, don't compute
- * lighting":
- *
- *   render_gbuffer(scene, view, proj):
- *     gbuffer_clear()
- *     for each object O:
- *       mvp     = proj · view · O.model
- *       nrm_mat = cofactor(O.model)
- *       for each triangle:
- *         clip[i] = mvp · vertex[i].pos
- *         if all behind near plane: skip
- *         (sx, sy, sz) = perspective divide + screen mapping
- *         if back-facing (signed area ≤ 0): skip
- *         for each pixel in screen bbox:
- *           (b0, b1, b2) = barycentric
- *           if any < 0: skip                        outside triangle
- *           z = b0·sz0 + b1·sz1 + b2·sz2            interpolated NDC z
- *           if z >= g_zbuf[r][c]: skip              z-test
- *           g_zbuf  [r][c] = z
- *           g_pos   [r][c] = b0·world_pos0 + b1·world_pos1 + b2·world_pos2
- *           g_normal[r][c] = b0·world_nrm0 + ... (then normalise)
- *           g_albedo[r][c] = O.albedo
- *           g_valid [r][c] = 1
- *
- * Same machinery as the forward pipeline, just with different output.
- * No lighting — that's pass 2's job. Read §6.3 + §6.4.
- *
- * T4  PASS 2: PER-PIXEL LIGHTING ACCUMULATION
- * ────────────────────────────────────────────
- * Pass 2 walks every VALID pixel of the G-buffer and accumulates
- * lighting:
- *
- *   render_lightpass(scene, cam_pos, lights):
- *     for r in 0..rows:
- *       for c in 0..cols:
- *         if not g_valid[r][c]: continue        sky pixel
- *         P      = g_pos    [r][c]
- *         N      = g_normal [r][c]
- *         albedo = g_albedo [r][c]
- *         result = AMBIENT · albedo               base illumination
- *         for each light L:
- *           result += blinn_phong(P, N, albedo, L, cam_pos)
- *         g_light[r][c] = clamp01(result)
- *
- * blinn_phong is the standard sum: ambient + diffuse·max(N·L) +
- * specular·max(N·H)^shininess. The pass NEVER touches mesh data —
- * just per-pixel surface attributes from the G-buffer.
- *
- * Read §7 for the full implementation.
- *
- * T5  MANY LIGHTS CHEAPLY — WHAT CHANGES WHEN YOU PRESS 'L'
- * ──────────────────────────────────────────────────────────
- * Pressing `l' adds another light to the scene. What's the cost
- * impact?
- *
- *   FORWARD:  M·N → M·(N+1)
- *             extra cost = M · pixels covered by ALL objects
- *
- *   DEFERRED: M + pixels·N → M + pixels·(N+1)
- *             extra cost = pixels (only the lighting loop grows)
- *
- * For this scene (M ≈ 1 sphere, N starts at 3, pixels ≈ 3000):
- *   forward extra: 3000 (per object, per added light)
- *   deferred extra: 3000 (just per added light)
- *
- * They look similar with M=1. With M=20 cube_raster-style scenes:
- *   forward extra: 20 · 3000 = 60,000
- *   deferred extra: 3000
- *
- * That's the deferred advantage — INDEPENDENT of geometry complexity
- * once you're in the lighting pass.
- *
- * The HUD shows the math live: pressing `l' adds light, the cost
- * line shows current forward (M·N) vs deferred (M+pixels·N). At
- * MAX_LIGHTS=8 deferred is significantly cheaper.
- *
- * T6  G-BUFFER VISUALISATION — POSITION / NORMAL / ALBEDO / LIGHTING
- * ───────────────────────────────────────────────────────────────────
- * Cycling `g' switches between four DEBUG VIEWS of the G-buffer:
- *
- *   POSITION   warm-near, cool-far gradient based on z. Identifies
- *              "where in 3-D is each pixel?" Useful for verifying
- *              the perspective divide and screen mapping.
- *
- *   NORMAL     (N + 1) / 2 visualised as RGB. +X red, +Y green,
- *              +Z blue. Smooth gradients over a sphere → smooth
- *              normals working; faceted → flat normals.
- *
- *   ALBEDO     raw material colour, no lighting at all. The
- *              sphere appears as a flat untextured disc. Sets a
- *              baseline for what the lighting is adding.
- *
- *   LIGHTING   the actual lit output (g_light). RED + GREEN +
- *              BLUE point lights painting their colours onto the
- *              sphere; overlaps make secondary colours; full
- *              overlap = white.
- *
- * KEY OBSERVATION: only LIGHTING re-shades when you press `l'. The
- * other three layers are computed BEFORE any light is applied, so
- * they're invariant to light count — proof that the geometry pass
- * doesn't care about lighting.
- *
- * This is the deferred-rendering DEMO point. Press `l' multiple
- * times in NORMAL mode — nothing changes. Switch to LIGHTING — the
- * sphere lights up differently with each new light.
- *
- * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-#include <float.h>
 #include <math.h>
 #include <ncurses.h>
 #include <signal.h>
@@ -531,8 +44,8 @@ enum {
 #define NS_PER_MS 1000000LL
 #define DT_CAP_NS (100 * NS_PER_MS)
 
-/* §1.2 G-buffer dimensions (static, no malloc).
- * Sized for the largest expected terminal. Pixels outside are skipped. */
+/* §1.2 size of the per-pixel tables. Fixed-size (no malloc), big enough for a
+ * large terminal; anything past the edge is skipped. */
 #define GBUF_MAX_W 300
 #define GBUF_MAX_H 80
 
@@ -540,6 +53,7 @@ enum {
 #define CAM_FOV (55.0f * (float)M_PI / 180.0f)
 #define CAM_NEAR 0.1f
 #define CAM_FAR 20.0f
+#define NEAR_W_EPS 0.001f /* a corner closer to the eye than this is behind it */
 
 /* CAM_DIST is the DEFAULT eye Z distance; +/- keys slide the eye between
  * CAM_DIST_MIN (close-up — sphere fills the screen) and CAM_DIST_MAX
@@ -556,34 +70,35 @@ enum {
 #define CELL_H 16 /* terminal cell height (pixels)              */
 
 /* §1.4 lighting */
-#define SHININESS 32.0f
-#define AMBIENT_STR 0.06f
+#define SHININESS 32.0f        /* how tight the shiny highlight is (bigger = tighter) */
+#define AMBIENT_STR 0.06f      /* a little light everywhere, so nothing is pure black */
+#define AMBIENT_BLUE_BIAS 1.1f /* tint that base light slightly cool                  */
+#define SPEC_GAIN 0.35f        /* how strong the shiny highlight is                   */
 
-/* §1.5 RGB-lights demo geometry (world units) */
+/* §1.5 the scene's sizes (world units) */
 
-/* WHITE SPHERE — the SINGLE object in the scene. Big enough to fill
- * roughly 60% of the screen so the three coloured pools have plenty
- * of room to be visible. Pure-white albedo (1, 1, 1) means coloured
- * lights show as their UNFILTERED hue — red light × white surface =
- * pure red, never pink-tinted-by-the-surface. */
+/* The one and only object: a white sphere. Big enough to fill most of the screen
+ * so the coloured pools have room to show. White means the coloured lights show
+ * up as their true colour — red light on white = pure red, not a pinkish mix. */
 #define BALL_RADIUS 0.95f
 #define BALL_RINGS 16
 #define BALL_SEGS 24
 
-/* CAMERA — fixed pose, looking straight at the sphere from +Z, slight
- * elevation. When the only things moving are the LIGHTS, the eye
- * locks onto their coloured pools instead of tracking the viewpoint.
- * Pixel changes between frames ⇒ LIGHTING changes, never camera. */
-#define CAM_EYE_Y 0.30f /* slight elevation for some depth    */
-#define CAM_LOOK_Y 0.0f /* aim straight at sphere centre      */
+/* The camera sits still, looking at the sphere from the front with a slight tilt.
+ * Since only the lights move, anything that changes on screen is the lighting,
+ * not the viewpoint — which is the whole point of the demo. */
+#define CAM_EYE_Y 0.30f /* slight tilt up, for a sense of depth */
+#define CAM_LOOK_Y 0.0f /* aimed at the sphere's centre        */
 
-/* §1.6 character ramp — Paul Bourke 92-char density ladder. */
+/* §1.6 the brightness-to-character ladder, sparse to dense (Paul Bourke's). */
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
-/* §1.7 Bayer 4×4 dither (k_bayer[py%4][px%4] in [0,1)). */
+/* §1.7 a fixed 4×4 nudge pattern (values 0..1). Added to each cell's brightness
+ * so neighbours of similar brightness pick different characters, hiding the
+ * steps in a smooth gradient. */
 static const float k_bayer[4][4] = {
     {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
     {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
@@ -592,15 +107,18 @@ static const float k_bayer[4][4] = {
 };
 #define DITHER_AMP 0.12f
 
-/* §1.8 ncurses pair IDs.
- * Same layout as cube_raster / raytracers: 216 RGB cube pairs at
- * PAIR_CUBE_BASE, plus yellow PAIR_HUD and cyan PAIR_HINT for the
- * CLAUDE.md HUD spec. */
+/* §1.7b a cell brighter than this is drawn bold, darker than the other is drawn
+ * dim, in between is normal — so only highlights pop and only near-black recedes. */
+#define LUMA_BOLD_ABOVE 0.85f
+#define LUMA_DIM_BELOW 0.15f
+
+/* §1.8 ncurses colour-pair numbers: 216 for the RGB cube, plus a yellow for the
+ * status bar and a cyan for the hint line. */
 #define PAIR_CUBE_BASE 1
 #define PAIR_HUD 217
 #define PAIR_HINT 218
 
-/* ── §2 clock ────────────────────────────────────────────────────────── */
+/* ── §2 clock — reading the time and sleeping ──────────────────────────── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -616,7 +134,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ── §3 math (V3, V4, Mat4) ──────────────────────────────────────────── */
+/* ── §3 math — vectors and 4×4 matrices ────────────────────────────────── */
 
 typedef struct {
   float x, y, z;
@@ -680,30 +198,21 @@ static inline Mat4 m4_mul(Mat4 a, Mat4 b) {
   return r;
 }
 
-/* m4_pt  — point  transform (w=1, translation applies). */
+/* Transforms a point (translation counts). */
 static inline Vec3 m4_pt(Mat4 m, Vec3 p) {
   Vec4 r = m4_mul_v4(m, v4(p.x, p.y, p.z, 1.f));
   return v3(r.x, r.y, r.z);
 }
 
-/* m4_dir — direction transform (w=0, translation does not apply). */
+/* Transforms a direction (translation doesn't count — directions don't have a
+ * location). */
 static inline Vec3 m4_dir(Mat4 m, Vec3 d) {
   Vec4 r = m4_mul_v4(m, v4(d.x, d.y, d.z, 0.f));
   return v3(r.x, r.y, r.z);
 }
 
-/*
- * m4_perspective — OpenGL-style perspective projection.
- *
- *   m[0][0] = (1/tan(fov/2)) / aspect   horizontal scale
- *   m[1][1] =  1/tan(fov/2)              vertical scale
- *   m[2][2] = (far + near) / (near - far) depth remapping
- *   m[2][3] = (2·far·near) / (near - far) depth bias
- *   m[3][2] = -1                          enables perspective divide
- *
- * After m4_mul_v4, clip.w = -z_view; dividing x,y,z by w is the
- * perspective divide that makes far things smaller.
- */
+/* Builds the perspective transform — the one that makes far things smaller, the
+ * usual way 3-D looks on a screen. */
 static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   Mat4 m = {{{0}}};
   float f = 1.f / tanf(fovy * 0.5f);
@@ -737,13 +246,9 @@ static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   return m;
 }
 
-/*
- * m4_normal_mat — cofactor (adjugate) of the upper-left 3×3.
- *
- * Correctly transforms normals under non-uniform scale. For a pure
- * rotation this equals the rotation matrix; for non-uniform scale it
- * differs in a way that preserves perpendicularity to the surface.
- */
+/* Makes the matrix for rotating surface-facing directions (normals). You can't
+ * just reuse the object's own matrix: if a shape were stretched unevenly its
+ * normals would come out skewed; this keeps them pointing straight out. */
 static Mat4 m4_normal_mat(Mat4 m) {
   Mat4 n = m4_identity();
   n.m[0][0] = m.m[1][1] * m.m[2][2] - m.m[1][2] * m.m[2][1];
@@ -758,15 +263,13 @@ static Mat4 m4_normal_mat(Mat4 m) {
   return n;
 }
 
-/* ── §4 paint (216 RGB cube + Bourke ramp) ───────────────────────────── */
+/* ── §4 paint — turning a colour into one terminal cell ────────────────── */
 
 static int g_256;
 
-/*
- * color_init — allocate 216 ncurses pairs as a 6×6×6 RGB cube + reserve
- * yellow PAIR_HUD and cyan PAIR_HINT for the HUD spec, plus PAIR_HUD_DIM
- * for the educational mid-rows of this file's verbose HUD.
- */
+/* Sets up our colours: 216 of them as a 6×6×6 cube of reds × greens × blues,
+ * plus a yellow for the status bar and a cyan for the hint line. Falls back to
+ * plain white if the terminal can't do 256 colours. */
 static void color_init(void) {
   start_color();
   use_default_colors();
@@ -790,80 +293,89 @@ static inline float clamp01(float x) {
 static inline float reinhard(float x) { return x / (1.f + x); }
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
 
-/*
- * paint_cell — full RGB → terminal pipeline (matches cube_raster / raytracers).
- *
- *   1. Reinhard tone-map per channel.
- *   2. Gamma encode 1/2.2.
- *   3. Bayer 4×4 dither on the luma so neighbouring cells with similar
- *      brightness pick different ramp characters → smoother gradients
- *      on the coarse glyph grid.
- *   4. Quantise to 6×6×6 RGB cube → pair id.
- *   5. Pick density glyph from 92-char Bourke ramp by Rec.709 luma.
- *   6. A_BOLD on bright cells, A_DIM on dark cells.
- *
- * Tone-mapping must run BEFORE cube quantisation. Quantising linear
- * HDR puts every bright pixel into one cube cell; Reinhard opens the
- * dynamic range so colours spread.
- */
+/* Snaps one colour channel (0..1) to one of the cube's 6 steps (0..5). */
+static inline int quantize_unit_to_5(float x) {
+  int q = (int)(x * 5.f + 0.5f);
+  return q < 0 ? 0 : (q > 5 ? 5 : q);
+}
+
+/* How bright a colour looks to the eye (green counts most, blue least). */
+static inline float rec709_luma(float r, float g, float b) {
+  return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+/* Picks the character for a given brightness (0..1): faint chars for dim,
+ * dense chars for bright. */
+static inline int ramp_index(float luma) {
+  int idx = (int)(luma * (BOURKE_LEN - 1) + 0.5f);
+  return idx < 0 ? 0 : (idx >= BOURKE_LEN ? BOURKE_LEN - 1 : idx);
+}
+
+/* Draws one terminal cell from a colour — the last stop in the whole pipeline.
+ * Brings the colour into screen range, then picks the closest cube colour and a
+ * character for the brightness (with a dither nudge so gradients stay smooth),
+ * and bolds the bright cells / dims the dark ones. The range-fix must come first:
+ * skip it and every bright colour would slam into the same brightest cube cell. */
 static void paint_cell(int sx, int sy, Vec3 col) {
+  /* bring each channel into screen range (roll off the too-bright, then correct) */
   float r = gamma_enc(reinhard(col.x));
   float g = gamma_enc(reinhard(col.y));
   float b = gamma_enc(reinhard(col.z));
 
-  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-  float dith = (k_bayer[sy & 3][sx & 3] - 0.5f) * DITHER_AMP;
-  float lum_d = clamp01(luma + dith);
+  /* nudge the brightness so neighbours don't all pick the same character */
+  float luma = rec709_luma(r, g, b);
+  float dither = (k_bayer[sy & 3][sx & 3] - 0.5f) * DITHER_AMP;
+  float luma_dithered = clamp01(luma + dither);
 
-  int pair;
-  if (g_256) {
-    int r5 = (int)(r * 5.f + 0.5f);
-    if (r5 > 5)
-      r5 = 5;
-    if (r5 < 0)
-      r5 = 0;
-    int g5 = (int)(g * 5.f + 0.5f);
-    if (g5 > 5)
-      g5 = 5;
-    if (g5 < 0)
-      g5 = 0;
-    int b5 = (int)(b * 5.f + 0.5f);
-    if (b5 > 5)
-      b5 = 5;
-    if (b5 < 0)
-      b5 = 0;
-    pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
-  } else {
-    pair = PAIR_CUBE_BASE;
-  }
+  /* the closest cube colour */
+  int pair = PAIR_CUBE_BASE;
+  if (g_256)
+    pair += quantize_unit_to_5(r) * 36 + quantize_unit_to_5(g) * 6 +
+            quantize_unit_to_5(b);
 
-  int idx = (int)(lum_d * (BOURKE_LEN - 1) + 0.5f);
-  if (idx < 0)
-    idx = 0;
-  if (idx >= BOURKE_LEN)
-    idx = BOURKE_LEN - 1;
-
-  int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
+  /* the character (from the nudged brightness) and bold/dim (from the real one) */
+  int glyph = ramp_index(luma_dithered);
+  int attr = (luma > LUMA_BOLD_ABOVE)  ? A_BOLD
+             : (luma < LUMA_DIM_BELOW) ? A_DIM
+                                       : A_NORMAL;
 
   attron(COLOR_PAIR(pair) | attr);
-  mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[idx]);
+  mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[glyph]);
   attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* ── §5 mesh ─────────────────────────────────────────────────────────── */
+/* ── §5 mesh — building the sphere at startup ──────────────────────────── */
 
+/*
+ * Vertex / Triangle / Mesh — a shape made of triangles. To avoid storing the
+ * same corner over and over, the corners live once in one list and each triangle
+ * just points at three of them by their slot number.
+ *
+ * Vertex is one corner. It carries which way the surface faces there; on the
+ * sphere that's just the direction from the centre out to the corner, and since
+ * neighbouring corners face slightly different ways, the in-between pixels blend
+ * smoothly and the ball looks round (not faceted). The texture coords are filled
+ * in but unused — this demo has no images.
+ *
+ * Triangle is three corner-slots, listed counter-clockwise seen from outside;
+ * the "skip faces turned away" check relies on that ordering.
+ *
+ * Mesh owns its two lists on the heap — the only memory the program allocates,
+ * done once when the sphere is built; the per-frame drawing never allocates.
+ */
 typedef struct {
-  Vec3 pos;
-  Vec3 normal;
-  float u, v;
+  Vec3 pos;    /* the corner's position, in the shape's own coordinates */
+  Vec3 normal; /* which way the surface faces here                      */
+  float u, v;  /* texture coords, unused here                           */
 } Vertex;
 typedef struct {
-  int v[3];
+  int v[3]; /* three corner-slots, counter-clockwise from outside */
 } Triangle;
 typedef struct {
-  Vertex *verts;
-  Triangle *tris;
-  int nvert, ntri;
+  Vertex *verts;  /* the corner list (heap, built once)   */
+  Triangle *tris; /* the triangle list (heap, built once) */
+  int nvert;      /* how many corners are filled in        */
+  int ntri;       /* how many triangles are filled in      */
 } Mesh;
 
 static void mesh_free(Mesh *m) {
@@ -872,20 +384,27 @@ static void mesh_free(Mesh *m) {
   *m = (Mesh){0};
 }
 
-/* §5 ── tessellate_sphere: UV sphere with smooth normals ────────────── */
+/* The sphere's corners sit on a grid of rings (top to bottom) and segments
+ * (around). This finds the slot for one (ring, segment). Each ring keeps one
+ * extra column so the seam where it wraps lines up cleanly. */
+static inline int grid_index(int i, int j, int segs) {
+  return i * (segs + 1) + j;
+}
 
-/*
- * Vertices on a (rings+1) × (segs+1) grid in spherical coords:
- *
- *   theta = π · i / rings        polar angle (0 = north, π = south)
- *   phi   = 2π · j / segs        azimuth angle
- *
- *   pos = R · (sin θ · cos φ,  cos θ,  sin θ · sin φ)
- *
- * Normal at each vertex equals the unit position vector (smooth
- * shading): adjacent vertices have slightly different normals, and
- * barycentric interpolation in the rasteriser blends them per-pixel.
- */
+/* Places one corner on the sphere, like a point at a given latitude (ring) and
+ * longitude (segment) on a globe. It faces straight out from the centre. */
+static Vertex sphere_vertex(float radius, int i, int j, int rings, int segs) {
+  float theta = (float)M_PI * (float)i / (float)rings;
+  float phi = 2.f * (float)M_PI * (float)j / (float)segs;
+  float st = sinf(theta), ct = cosf(theta);
+  Vec3 pos = v3(radius * st * cosf(phi), radius * ct, radius * st * sinf(phi));
+  Vec3 nrm = v3(pos.x / radius, pos.y / radius, pos.z / radius);
+  return (Vertex){pos, nrm, (float)j / (float)segs, (float)i / (float)rings};
+}
+
+/* Builds the ball out of rings and segments, like a globe's latitude and
+ * longitude lines, then stitches each little grid square into two triangles.
+ * Every corner faces straight out from the centre, so the ball shades smoothly. */
 static Mesh tessellate_sphere(float radius, int rings, int segs) {
   int n_verts = (rings + 1) * (segs + 1);
   int n_tris = rings * segs * 2;
@@ -895,29 +414,18 @@ static Mesh tessellate_sphere(float radius, int rings, int segs) {
   m.nvert = 0;
   m.ntri = 0;
 
-  for (int i = 0; i <= rings; i++) {
-    float theta = (float)M_PI * (float)i / (float)rings;
-    float st = sinf(theta), ct = cosf(theta);
-    for (int j = 0; j <= segs; j++) {
-      float phi = 2.f * (float)M_PI * (float)j / (float)segs;
-      float x = radius * st * cosf(phi);
-      float y = radius * ct;
-      float z = radius * st * sinf(phi);
-      Vec3 pos = v3(x, y, z);
-      Vec3 nrm = v3(x / radius, y / radius, z / radius);
-      float u = (float)j / (float)segs;
-      float vv = (float)i / (float)rings;
-      m.verts[m.nvert++] = (Vertex){pos, nrm, u, vv};
-    }
-  }
+  /* place every corner on the grid */
+  for (int i = 0; i <= rings; i++)
+    for (int j = 0; j <= segs; j++)
+      m.verts[m.nvert++] = sphere_vertex(radius, i, j, rings, segs);
 
-  /* Wire vertex grid into quads, each split into 2 CCW triangles. */
+  /* stitch each grid square into two triangles */
   for (int i = 0; i < rings; i++) {
     for (int j = 0; j < segs; j++) {
-      int v00 = i * (segs + 1) + j;
-      int v10 = (i + 1) * (segs + 1) + j;
-      int v11 = (i + 1) * (segs + 1) + (j + 1);
-      int v01 = i * (segs + 1) + (j + 1);
+      int v00 = grid_index(i, j, segs);
+      int v10 = grid_index(i + 1, j, segs);
+      int v11 = grid_index(i + 1, j + 1, segs);
+      int v01 = grid_index(i, j + 1, segs);
       m.tris[m.ntri++] = (Triangle){{v00, v10, v01}};
       m.tris[m.ntri++] = (Triangle){{v10, v11, v01}};
     }
@@ -925,65 +433,61 @@ static Mesh tessellate_sphere(float radius, int rings, int segs) {
   return m;
 }
 
-/* ── §6 G-buffer — geometry pass ─────────────────────────────────────── */
+/* ── §6 G-buffer — drawing the surface into per-pixel tables ───────────── */
 
-/* §6.1 ── G-buffer arrays ───────────────────────────────────────────── */
-
-/*
- * Six parallel grids storing per-pixel surface data.
- *
- *   g_pos    — world-space position of frontmost surface
- *   g_normal — world-space unit normal
- *   g_albedo — flat surface colour (no lighting)
- *   g_zbuf   — NDC-z depth; reset to +1.0 each frame
- *   g_valid  — 1 if any geometry has touched this pixel
- *   g_light  — output of lighting pass (Pass 2)
- *
- * In a real GPU engine these would be GL_TEXTURE_2D render targets
- * bound as MRT (Multiple Render Targets):
- *   layout(location=0) out vec4 gPosition;
- *   layout(location=1) out vec4 gNormal;
- *   layout(location=2) out vec4 gAlbedo;
- *
- * Unity HDRP packs them as: Albedo+Roughness, Normal+Metallic,
- * Spec+AO, Emissive — same idea, more channels.
- */
-static Vec3 g_pos[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_normal[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_albedo[GBUF_MAX_H][GBUF_MAX_W];
-static float g_zbuf[GBUF_MAX_H][GBUF_MAX_W];
-static uint8_t g_valid[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_light[GBUF_MAX_H][GBUF_MAX_W];
+/* §6.1 ── the tables ──────────────────────────────────────────────────── */
 
 /*
- * gbuffer_clear — reset depth + valid flags before each frame.
+ * GBuffer — a set of full-screen tables describing the surface seen at each
+ * cell. This is the heart of "deferred" rendering (Saito & Takahashi 1990): pass
+ * 1 (render_gbuffer) fills the surface tables, pass 2 (render_lightpass) reads
+ * them and fills `light`, pass 3 (render_scene) shows whichever table the 'g'
+ * key has selected. One global instance (g_gbuf) holds it all.
  *
- * g_pos / g_normal / g_albedo don't need clearing because g_valid
- * gates ALL reads in render_lightpass and render_scene.
+ *   the surface facts  (filled by pass 1, for the nearest surface at each cell)
+ *     pos     — where the surface is in the world
+ *     normal  — which way it faces
+ *     albedo  — its plain colour, before any light
+ *     zbuf    — how near it is, so a farther surface can't paint over a nearer
+ *               one (starts each frame at "infinitely far")
+ *     valid   — 1 if a surface was drawn here, 0 for empty background
+ *   the lit result     (filled by pass 2)
+ *     light   — the colour after adding up all the lights
  *
- * OpenGL equivalent: glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT)
+ * Kept as its own global, not part of the Scene: it's wiped and refilled every
+ * frame and the scene never reads it, so the scene and the pixels stay separate.
  */
-static void gbuffer_clear(int cols, int rows) {
+typedef struct {
+  /* the surface facts — filled by pass 1, nearest surface at each cell */
+  Vec3 pos[GBUF_MAX_H][GBUF_MAX_W];      /* where it is in the world      */
+  Vec3 normal[GBUF_MAX_H][GBUF_MAX_W];   /* which way it faces            */
+  Vec3 albedo[GBUF_MAX_H][GBUF_MAX_W];   /* its plain colour, no light    */
+  float zbuf[GBUF_MAX_H][GBUF_MAX_W];    /* how near (for keeping closest) */
+  uint8_t valid[GBUF_MAX_H][GBUF_MAX_W]; /* 1 = surface here, 0 = empty    */
+  /* the lit result — filled by pass 2 */
+  Vec3 light[GBUF_MAX_H][GBUF_MAX_W]; /* colour after adding up the lights */
+} GBuffer;
+
+static GBuffer g_gbuf;
+
+/* Wipes the depth and the "is there a surface" flag before each frame. The
+ * pos/normal/albedo tables don't need wiping — nothing reads a cell unless its
+ * valid flag says a surface was drawn there. */
+static void gbuffer_clear(GBuffer *gb, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      g_zbuf[r][c] = 1.0f; /* NDC far plane */
-      g_valid[r][c] = 0;
+      gb->zbuf[r][c] = 1.0f; /* farthest */
+      gb->valid[r][c] = 0;
     }
   }
 }
 
-/* §6.2 ── barycentric (Möller signed-area form) ─────────────────────── */
+/* §6.2 ── filling a triangle ──────────────────────────────────────────── */
 
-/*
- * Compute barycentric weights of point (px, py) inside triangle.
- *
- *   d  = (y1-y2)(x0-x2) + (x2-x1)(y0-y2)         signed area · 2
- *   b0 = ((y1-y2)(px-x2) + (x2-x1)(py-y2)) / d
- *   b1 = ((y2-y0)(px-x2) + (x0-x2)(py-y2)) / d
- *   b2 = 1 − b0 − b1
- *
- * If d ≈ 0 (degenerate triangle), return -1s so caller skips the pixel.
- */
+/* For a pixel and a triangle, returns three weights (one per corner) saying how
+ * much each corner pulls on that pixel. They tell us if the pixel is inside (all
+ * three positive) and how to blend the corners' values there. A degenerate
+ * (zero-area) triangle returns negatives so the caller skips it. */
 static void barycentric(const float sx[3], const float sy[3], float px,
                         float py, float b[3]) {
   float d =
@@ -997,166 +501,162 @@ static void barycentric(const float sx[3], const float sy[3], float px,
   b[2] = 1.f - b[0] - b[1];
 }
 
-/* §6.3 ── rasterize_object — vertex → cull → raster → G-buffer write ── */
+/* §6.3 ── drawing one object's triangles into the tables ──────────────── */
 
-/*
- * Software equivalent of the GPU vertex + rasterisation pipeline.
- * Three conceptual stages:
- *
- *   STAGE 1: VERTEX TRANSFORM       (GPU: Vertex Shader)
- *     Multiply position by MVP; multiply normal by norm_mat.
- *     Save world-space pos and normal for G-buffer writes.
- *
- *   STAGE 2: PERSPECTIVE DIVIDE + RASTERISATION SETUP   (GPU: fixed)
- *     Divide clip x,y,z by w → NDC.
- *     Map NDC to screen pixels (with Y-flip).
- *     Back-face cull via signed area.
- *
- *   STAGE 3: FRAGMENT / G-BUFFER WRITE  (GPU: Fragment Shader → MRT)
- *     For each pixel in the bounding box:
- *       barycentric → in-triangle test
- *       z-test → frontmost surface wins
- *       write g_pos, g_normal, g_albedo, g_zbuf, g_valid
- *
- * NO LIGHTING IS DONE HERE — that's what makes deferred rendering
- * deferred. The mesh is rasterised once; lighting is a separate pass.
- */
-static void rasterize_object(const Mesh *mesh, Vec3 albedo, Mat4 mvp,
-                             Mat4 model, Mat4 norm_mat, int cols, int rows) {
-  for (int ti = 0; ti < mesh->ntri; ti++) {
-    const Triangle *tri = &mesh->tris[ti];
+/* This is the whole first pass for one object, split into small named steps so
+ * rasterize_object below reads like a checklist: place the corners, drop the
+ * triangle if it's behind us or facing away, then fill the cells it covers. No
+ * lighting happens here at all — that's what makes it "deferred". */
 
-    /* STAGE 1: vertex transform. */
-    Vec4 clip[3];
-    Vec3 wpos[3], wnrm[3];
-    for (int vi = 0; vi < 3; vi++) {
-      const Vertex *v = &mesh->verts[tri->v[vi]];
-      clip[vi] = m4_mul_v4(mvp, v4(v->pos.x, v->pos.y, v->pos.z, 1.f));
-      wpos[vi] = m4_pt(model, v->pos);
-      wnrm[vi] = v3_norm(m4_dir(norm_mat, v->normal));
-    }
+/* Works out, for a triangle's 3 corners, where each lands on screen plus where
+ * it sits in the world and which way it faces (the fill step blends these). */
+static void transform_vertices(const Mesh *mesh, const Triangle *tri, Mat4 mvp,
+                               Mat4 model, Mat4 norm_mat, Vec4 clip[3],
+                               Vec3 wpos[3], Vec3 wnrm[3]) {
+  for (int vi = 0; vi < 3; vi++) {
+    const Vertex *v = &mesh->verts[tri->v[vi]];
+    clip[vi] = m4_mul_v4(mvp, v4(v->pos.x, v->pos.y, v->pos.z, 1.f));
+    wpos[vi] = m4_pt(model, v->pos);
+    wnrm[vi] = v3_norm(m4_dir(norm_mat, v->normal));
+  }
+}
 
-    /* Skip triangles entirely behind the near plane. */
-    if (clip[0].w < 0.001f && clip[1].w < 0.001f && clip[2].w < 0.001f)
-      continue;
+/* True when all three corners are behind the camera — the whole triangle is
+ * off-screen, so skip it. */
+static bool all_behind_near_plane(const Vec4 clip[3]) {
+  return clip[0].w < NEAR_W_EPS && clip[1].w < NEAR_W_EPS &&
+         clip[2].w < NEAR_W_EPS;
+}
 
-    /* STAGE 2: perspective divide → screen. */
-    float sx[3], sy[3], sz[3];
-    for (int vi = 0; vi < 3; vi++) {
-      float w = clip[vi].w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
-      sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows; /* Y-flip */
-      sz[vi] = clip[vi].z / w;
-    }
+/* Finishes the corners onto the screen: divide by distance (far = smaller),
+ * scale into cells, and flip y because screen rows count downward but up should
+ * be up. */
+static void project_to_screen(const Vec4 clip[3], int cols, int rows,
+                              float sx[3], float sy[3], float sz[3]) {
+  for (int vi = 0; vi < 3; vi++) {
+    float w = clip[vi].w;
+    if (fabsf(w) < 1e-6f)
+      w = 1e-6f;
+    sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
+    sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows; /* flip y */
+    sz[vi] = clip[vi].z / w;
+  }
+}
 
-    /* Back-face cull: positive area = CCW = front face. */
-    float area =
-        (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (area <= 0.f)
-      continue;
+/* True if this triangle is turned away from us (the back of the sphere), so we
+ * can skip it. The trick: measure its signed area on screen; with our corner
+ * ordering and the y-flip, faces toward us come out negative, so zero-or-positive
+ * is facing away. */
+static bool is_back_facing(const float sx[3], const float sy[3]) {
+  float area =
+      (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+  return area >= 0.f;
+}
 
-    /* Bounding box clamped to G-buffer. */
-    int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
-    int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
-    int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
-    int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+/* Walks the cells the triangle covers; for each one inside it and nearer than
+ * whatever's there, records the surface's facts into the tables. */
+static void rasterize_fragments(GBuffer *gb, const float sx[3],
+                                const float sy[3], const float sz[3],
+                                const Vec3 wpos[3], const Vec3 wnrm[3],
+                                Vec3 albedo, int cols, int rows) {
+  int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
+  int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
+  int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
+  int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
 
-    /* STAGE 3: fragment / G-buffer write. */
-    for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
-      for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
-        float b[3];
-        barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
-        if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
-          continue;
+  for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
+    for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
+      float b[3];
+      barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
+      if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
+        continue;
 
-        float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
-        if (z >= g_zbuf[py][px])
-          continue;
+      float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
+      if (z >= gb->zbuf[py][px])
+        continue;
 
-        g_zbuf[py][px] = z;
-        g_pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
-        g_normal[py][px] =
-            v3_norm(v3_bary(wnrm[0], wnrm[1], wnrm[2], b[0], b[1], b[2]));
-        g_albedo[py][px] = albedo;
-        g_valid[py][px] = 1;
-      }
+      gb->zbuf[py][px] = z;
+      gb->pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
+      gb->normal[py][px] =
+          v3_norm(v3_bary(wnrm[0], wnrm[1], wnrm[2], b[0], b[1], b[2]));
+      gb->albedo[py][px] = albedo;
+      gb->valid[py][px] = 1;
     }
   }
 }
 
-/* §6.4 ── render_gbuffer — geometry pass over all scene objects ────── */
+static void rasterize_object(GBuffer *gb, const Mesh *mesh, Vec3 albedo,
+                             Mat4 mvp, Mat4 model, Mat4 norm_mat, int cols,
+                             int rows) {
+  for (int ti = 0; ti < mesh->ntri; ti++) {
+    const Triangle *tri = &mesh->tris[ti];
 
-/*
- * After this returns, the G-buffer holds frontmost surface data at
- * every pixel — INDEPENDENT of how many lights exist. Adding lights
- * does not require re-running this function.
- *
- * OpenGL equivalent:
- *   glBindFramebuffer(GL_FRAMEBUFFER, gBuffer);
- *   glDrawBuffers(3, {GL_COLOR_ATTACHMENT0,1,2});
- *   for each object: glDrawElements(GL_TRIANGLES, ...);
- *   glBindFramebuffer(GL_FRAMEBUFFER, 0);
- */
-static void render_gbuffer(const Mesh *meshes, const Vec3 *albedos,
+    Vec4 clip[3];
+    Vec3 wpos[3], wnrm[3];
+    transform_vertices(mesh, tri, mvp, model, norm_mat, clip, wpos, wnrm);
+    if (all_behind_near_plane(clip))
+      continue;
+
+    float sx[3], sy[3], sz[3];
+    project_to_screen(clip, cols, rows, sx, sy, sz);
+    if (is_back_facing(sx, sy))
+      continue;
+
+    rasterize_fragments(gb, sx, sy, sz, wpos, wnrm, albedo, cols, rows);
+  }
+}
+
+/* §6.4 ── pass 1: draw every object into the tables ───────────────────── */
+
+/* Fills the tables with the nearest surface at every cell. This is the same no
+ * matter how many lights there are — adding a light never re-runs it, which is
+ * the whole win of deferred rendering. */
+static void render_gbuffer(GBuffer *gb, const Mesh *meshes, const Vec3 *albedos,
                            const Mat4 *models, int n_objects, const Mat4 *view,
                            const Mat4 *proj, int cols, int rows) {
-  gbuffer_clear(cols, rows);
+  gbuffer_clear(gb, cols, rows);
   for (int oi = 0; oi < n_objects; oi++) {
     Mat4 mv = m4_mul(*view, models[oi]);
     Mat4 mvp = m4_mul(*proj, mv);
     Mat4 nmat = m4_normal_mat(models[oi]);
-    rasterize_object(&meshes[oi], albedos[oi], mvp, models[oi], nmat, cols,
+    rasterize_object(gb, &meshes[oi], albedos[oi], mvp, models[oi], nmat, cols,
                      rows);
   }
 }
 
-/* ── §7 lightpass — Blinn-Phong shading ─────────────────────────────── */
+/* ── §7 lightpass — pass 2: add up the lights ──────────────────────────── */
 
-/* §7.1 ── PointLight type ───────────────────────────────────────────── */
+/* §7.1 ── one light ───────────────────────────────────────────────────── */
 
 /*
- * Each light orbits the origin in the XZ plane (horizontal ring) at a
- * given radius and height. pos is recomputed each tick by scene_tick:
- *   pos = (radius·cos θ,  height,  radius·sin θ)        with θ = orbit_angle.
- * Light variety comes from differing radius / speed / height / phase —
- * not from different orbit planes. Simpler, and easier to predict.
+ * PointLight — one coloured light circling the sphere. It rides a horizontal
+ * ring; each tick scene_tick nudges its angle around the ring and recomputes
+ * where it is. The first five fields are set once and don't change; only pos is
+ * recomputed every frame. Its colour tints both the soft lighting and the shiny
+ * highlight. Ref: Blinn-Phong lighting (Blinn, SIGGRAPH '77).
+ *   color        — its colour (pure red/green/blue for the main three)
+ *   orbit_radius — how wide its ring is
+ *   orbit_speed  — how fast it goes around
+ *   height       — how high its ring sits
+ *   orbit_angle  — where it currently is on the ring
+ *   pos          — its actual spot, worked out from the four above
  */
 typedef struct {
-  Vec3 color;
-  float orbit_radius;
-  float orbit_speed; /* radians / second                   */
-  float height;      /* y-coord of the orbit ring          */
-  float orbit_angle; /* current θ, accumulated each tick   */
-  Vec3 pos;          /* world-space position (derived)     */
+  Vec3 color;         /* its colour                            */
+  float orbit_radius; /* how wide its ring is (world units)    */
+  float orbit_speed;  /* how fast it circles (radians/second)  */
+  float height;       /* how high its ring sits (world units)  */
+  float orbit_angle;  /* where it is on the ring right now      */
+  Vec3 pos;           /* its actual spot, from the four above   */
 } PointLight;
 
-/* §7.2 ── blinn_phong — one light's contribution at a pixel ────────── */
+/* §7.2 ── one light's contribution at one pixel ───────────────────────── */
 
-/*
- * BLINN-PHONG MODEL:
- *
- *   L = normalize(light_pos − P)         surface → light
- *   V = normalize(cam_pos   − P)         surface → camera
- *   H = normalize(L + V)                  halfway vector
- *
- *   diff = max(0, N · L)                  Lambertian
- *   spec = max(0, N · H)^SHININESS        Blinn-Phong specular
- *
- *   contrib = albedo · light_col · diff + light_col · spec · 0.35
- *
- * Albedo modulates diffuse but NOT specular — specular reflects the
- * light's colour, not the surface's. 0.35 is the spec gain.
- *
- * GLSL equivalent (the fragment shader used in the lighting pass):
- *   vec3 L = normalize(light.pos - fragPos);
- *   vec3 V = normalize(camPos    - fragPos);
- *   vec3 H = normalize(L + V);
- *   float diff = max(dot(N, L), 0.0);
- *   float spec = pow(max(dot(N, H), 0.0), shininess);
- *   color += albedo * light.color * diff + light.color * spec * 0.35;
- */
+/* Works out how much one light brightens one surface point: more where the
+ * surface faces the light (soft light), plus a shiny highlight where the angle
+ * lines up with the eye. The surface colour tints the soft light but not the
+ * highlight — a highlight reflects the light's own colour. The classic
+ * Blinn-Phong model. */
 static Vec3 blinn_phong(Vec3 P, Vec3 N, Vec3 albedo, Vec3 light_pos,
                         Vec3 light_col, Vec3 cam_pos) {
   Vec3 L = v3_norm(v3_sub(light_pos, P));
@@ -1166,69 +666,73 @@ static Vec3 blinn_phong(Vec3 P, Vec3 N, Vec3 albedo, Vec3 light_pos,
   float diff = fmaxf(0.f, v3_dot(N, L));
   float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS);
 
-  return v3(albedo.x * light_col.x * diff + light_col.x * spec * 0.35f,
-            albedo.y * light_col.y * diff + light_col.y * spec * 0.35f,
-            albedo.z * light_col.z * diff + light_col.z * spec * 0.35f);
+  return v3(albedo.x * light_col.x * diff + light_col.x * spec * SPEC_GAIN,
+            albedo.y * light_col.y * diff + light_col.y * spec * SPEC_GAIN,
+            albedo.z * light_col.z * diff + light_col.z * spec * SPEC_GAIN);
 }
 
-/* §7.3 ── render_lightpass — accumulate Blinn-Phong over G-buffer ──── */
+/* §7.3 ── add up every light across the screen ────────────────────────── */
 
-/*
- * The "full-screen quad fragment shader" in software. For each
- * G-buffer pixel where g_valid = 1:
- *   1. ambient = AMBIENT_STR · albedo (small uniform base illumination)
- *   2. for each active light: add blinn_phong contribution
- *   3. clamp to [0, 1] (poor-man's tone-map; paint_cell does Reinhard
- *      proper tone mapping at draw time)
- *
- * This function is INVARIANT to mesh data — the geometry has been
- * reduced to per-pixel surface properties. Adding a light costs ONE
- * more iteration of the inner loop, NOT another mesh rasterisation.
- */
-static void render_lightpass(const PointLight *lights, int n_lights,
-                             Vec3 cam_pos, int cols, int rows) {
-  Vec3 ambient = v3(AMBIENT_STR, AMBIENT_STR, AMBIENT_STR * 1.1f);
+/* The colour of one surface cell: the little base light, plus every active
+ * light's contribution added on top. Notice this never touches the triangles —
+ * it only reads the per-pixel tables, so an extra light is just one more trip
+ * around the inner loop, not another whole redraw. */
+static Vec3 shade_pixel(const GBuffer *gb, int r, int c,
+                        const PointLight *lights, int n_lights, Vec3 cam_pos,
+                        Vec3 ambient) {
+  Vec3 P = gb->pos[r][c];
+  Vec3 N = gb->normal[r][c];
+  Vec3 albedo = gb->albedo[r][c];
+
+  Vec3 lit =
+      v3(ambient.x * albedo.x, ambient.y * albedo.y, ambient.z * albedo.z);
+
+  for (int li = 0; li < n_lights; li++) {
+    Vec3 contrib =
+        blinn_phong(P, N, albedo, lights[li].pos, lights[li].color, cam_pos);
+    lit.x += contrib.x;
+    lit.y += contrib.y;
+    lit.z += contrib.z;
+  }
+
+  return v3(fminf(1.f, lit.x), fminf(1.f, lit.y), fminf(1.f, lit.z));
+}
+
+static void render_lightpass(GBuffer *gb, const PointLight *lights,
+                             int n_lights, Vec3 cam_pos, int cols, int rows) {
+  Vec3 ambient = v3(AMBIENT_STR, AMBIENT_STR, AMBIENT_STR * AMBIENT_BLUE_BIAS);
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
-        g_light[r][c] = v3(0, 0, 0);
+      if (!gb->valid[r][c]) {
+        gb->light[r][c] = v3(0, 0, 0); /* empty background — nothing to light */
         continue;
       }
-
-      Vec3 P = g_pos[r][c];
-      Vec3 N = g_normal[r][c];
-      Vec3 albedo = g_albedo[r][c];
-
-      Vec3 lit =
-          v3(ambient.x * albedo.x, ambient.y * albedo.y, ambient.z * albedo.z);
-
-      for (int li = 0; li < n_lights; li++) {
-        Vec3 contrib = blinn_phong(P, N, albedo, lights[li].pos,
-                                   lights[li].color, cam_pos);
-        lit.x += contrib.x;
-        lit.y += contrib.y;
-        lit.z += contrib.z;
-      }
-
-      g_light[r][c] =
-          v3(fminf(1.f, lit.x), fminf(1.f, lit.y), fminf(1.f, lit.z));
+      gb->light[r][c] =
+          shade_pixel(gb, r, c, lights, n_lights, cam_pos, ambient);
     }
   }
 }
 
-/* ── §8 scene ────────────────────────────────────────────────────────── */
+/* ── §8 scene — the sphere, the orbiting lights, the camera ────────────── */
 
-/* §8.1 ── GBufMode + Scene ──────────────────────────────────────────── */
+/* §8.1 ── the view mode, the camera, the scene ────────────────────────── */
 
+/*
+ * GBufMode — which table the 'g' key is currently showing. The first three are
+ * debugging views (and they prove the point: adding lights never changes them);
+ * the fourth is the real lit picture. They're numbered from 0 in a row so the
+ * 'g' key can step through them and so they double as labels (k_mode_names).
+ */
 typedef enum {
-  MODE_POSITION = 0,
-  MODE_NORMAL,
-  MODE_ALBEDO,
-  MODE_LIGHTING,
-  MODE_COUNT,
+  MODE_POSITION = 0, /* the depth table as a near→far colour gradient   */
+  MODE_NORMAL,       /* the facing table shown as colour                */
+  MODE_ALBEDO,       /* the plain surface colour, no lighting           */
+  MODE_LIGHTING,     /* the real lit result (pass 2's output)           */
+  MODE_COUNT,        /* how many modes there are (for cycling)          */
 } GBufMode;
 
+/* HUD label per mode, indexed by GBufMode (excludes the MODE_COUNT sentinel). */
 static const char *k_mode_names[MODE_COUNT] = {
     "POSITION",
     "NORMAL",
@@ -1236,47 +740,27 @@ static const char *k_mode_names[MODE_COUNT] = {
     "LIGHTING",
 };
 
-/* Scene holds three parallel arrays describing every renderable object:
- *   meshes[i]  — the triangle data
- *   albedos[i] — its flat surface colour
- *   models[i]  — its world-space transform
- * That's everything render_gbuffer needs. We never had per-object spin
- * or per-object position state in this demo; the previous Object struct
- * just added indirection. */
-
-/* §8.2 ── LIGHT_PRESETS — 3 RGB primaries + 5 'l'-key progression extras.
+/* §8.2 ── the 8 light presets: 3 main + 5 you add with 'l'.
  *
- * THE PEDAGOGY:
+ * The first three are pure red, green, and blue — the three primary colours of
+ * light, the classic three-flashlights demo. They share one ring but start a
+ * third of the way apart, so they keep an even triangle as they circle. On the
+ * white sphere you see a red pool, a green pool, and a blue pool slide around;
+ * where two overlap you get yellow / cyan / magenta, and where all three meet,
+ * white. That's the lighting pass made visible: each pixel = the sum of the
+ * lights hitting it.
  *
- *   Lights 0..2 are PURE RED, PURE GREEN, PURE BLUE — the additive-
- *   colour primaries every physics class shows with three flashlights.
- *   They share the same orbit (radius, speed, height) but start at
- *   angles 0°, 120°, 240° → they maintain a perfect equilateral
- *   triangle as they sweep around the sphere.
- *
- *   What you see on the white sphere:
- *     Pure RED patch slides across,  pure GREEN patch slides across,
- *     pure BLUE patch slides across — and where two patches overlap
- *     you get YELLOW (R+G), CYAN (G+B), or MAGENTA (R+B); where
- *     all three overlap you get WHITE.
- *
- *   That's the deferred-shading lighting pass made literally visible:
- *   each pixel's final colour = sum of every light's contribution.
- *
- *   Lights 3..7 are "deferred-cost-story" extras (yellow, cyan,
- *   magenta, white, orange) at varied orbits. Press 'l' to enable
- *   them one at a time. The G-buffer never re-renders; only the
- *   lighting accumulation grows.
+ * The other five (yellow, cyan, magenta, white, orange) are there for the cost
+ * story — press 'l' to switch them on one at a time. The surface tables never
+ * get redrawn; only the adding-up grows.
  */
 static const struct {
-  Vec3 color;
-  float orbit_radius, orbit_speed, height;
-  float angle_start;
+  Vec3 color;                              /* this light's colour            */
+  float orbit_radius, orbit_speed, height; /* its ring: width, speed, height */
+  float angle_start;                       /* where it starts on the ring    */
 } LIGHT_PRESETS[MAX_LIGHTS] = {
-    /* ── The three primaries — same orbit, 120° apart on a horizontal
-     * ring just above the sphere's equator. The equilateral arrangement
-     * is preserved as they sweep, so you always see the three coloured
-     * pools in a clear triangular relationship. ── */
+    /* the three primaries — same ring, evenly spaced, so the pools always sit
+     * in a clear triangle as they sweep */
     {{1.00f, 0.00f, 0.00f}, 1.55f, 0.45f, 0.40f, 0.0000f}, /* RED   @ 0°  */
     {{0.00f, 1.00f, 0.00f},
      1.55f,
@@ -1289,10 +773,8 @@ static const struct {
      0.40f,
      4.1888f}, /* BLUE  @ 240° (4π/3) */
 
-    /* ── Progression extras — 'l'-key adds one at a time. Variety comes
-     * from differing radius / speed / height / phase. Press 'l' until
-     * 8 lights are active — the geometry pass cost stays fixed; only
-     * the lighting accumulation grows. ── */
+    /* the extras — 'l' switches them on one at a time, each on a slightly
+     * different ring so they don't overlap; drawing cost stays fixed */
     {{1.00f, 1.00f, 0.00f}, 1.30f, 0.65f, -0.30f, 1.000f}, /* YELLOW   */
     {{0.00f, 1.00f, 1.00f}, 1.30f, 0.65f, -0.30f, 3.000f}, /* CYAN     */
     {{1.00f, 0.00f, 1.00f}, 1.30f, 0.65f, -0.30f, 5.000f}, /* MAGENTA  */
@@ -1300,103 +782,83 @@ static const struct {
     {{1.00f, 0.55f, 0.00f}, 1.20f, 0.80f, 0.00f, 2.500f},  /* ORANGE   */
 };
 
+/*
+ * Camera — the eye, plus the transforms worked out from it. The eye sits still
+ * looking at the sphere; only `dist` (the zoom) changes, with +/-. `pos` and
+ * `view` are recomputed from `dist`, and `proj` from the window shape, so they
+ * just need rebuilding once on a zoom rather than every frame.
+ *   dist — how far back the eye is; the +/- keys change it
+ *   pos  — the eye's actual spot, from dist
+ *   view — the "look from the eye toward the sphere" transform
+ *   proj — the perspective (makes far things smaller), matched to the window
+ */
 typedef struct {
-  /* Renderable objects — three parallel arrays. */
-  Mesh meshes[MAX_OBJECTS];
-  Vec3 albedos[MAX_OBJECTS];
-  Mat4 models[MAX_OBJECTS];
-  int n_objects;
+  Mat4 view;
+  Mat4 proj;
+  Vec3 pos;
+  float dist;
+} Camera;
 
-  /* Lights. */
-  PointLight lights[MAX_LIGHTS];
-  int n_lights;
+/*
+ * Scene — everything the demo is about, in one place. The drawing passes read it
+ * but never change it. It answers: what's drawn, how it's lit, from where, plus
+ * a little display state.
+ *
+ * The objects are held in three side-by-side arrays read together: object i is
+ * mesh meshes[i], colour albedos[i], placed by models[i]. (There's only one
+ * object — the sphere — but the arrays make adding more painless.)
+ */
+typedef struct {
+  /* what's drawn — three side-by-side arrays, one entry per object */
+  Mesh meshes[MAX_OBJECTS];  /* each object's shape   */
+  Vec3 albedos[MAX_OBJECTS]; /* each object's colour  */
+  Mat4 models[MAX_OBJECTS];  /* where each one sits   */
+  int n_objects;             /* how many (just 1 here) */
 
-  /* Camera + projection. Pose is fixed except for +/- zoom, which
-   * slides cam_pos along +Z (the eye axis). cam_dist is the live Z
-   * distance — modifying it and calling scene_set_zoom() rebuilds
-   * cam_pos and the view matrix. */
-  Mat4 view, proj;
-  Vec3 cam_pos;
-  float cam_dist;
+  /* how it's lit — the lights added up in pass 2 */
+  PointLight lights[MAX_LIGHTS]; /* all 8 ready; only the first n_lights are on */
+  int n_lights;                  /* how many are on; 'l' steps it 3 → 8         */
 
-  /* UI / framing. */
-  GBufMode mode;
-  bool paused;
-  int scene_cols;
-  int scene_rows;
+  /* from where */
+  Camera cam;
+
+  /* display state */
+  GBufMode mode;  /* which table is shown ('g' cycles)                 */
+  bool paused;    /* space freezes the light orbits                    */
+  int scene_cols; /* how many cells wide the scene gets                */
+  int scene_rows; /* how many tall (the rest is the HUD at the bottom) */
 } Scene;
 
-/* §8.3 ── scene_init / scene_set_zoom / scene_tick ──────────────────── */
+/* §8.3 ── setting up and advancing the scene ──────────────────────────── */
 
-static void scene_rebuild_proj(Scene *s, int cols, int rows) {
-  /* Aspect from PIXEL counts (cols·CELL_W, rows·CELL_H), NOT cell counts.
-   * Without this the cube renders as a vertically squashed rectangle. */
+/* Rebuilds the perspective for a new window size so the sphere isn't stretched
+ * (terminal cells are taller than they are wide, which it accounts for). */
+static void camera_rebuild_proj(Camera *cam, int cols, int rows) {
   float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
-  s->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
+  cam->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 }
 
-/*
- * scene_set_zoom — push cam_dist into cam_pos + view matrix.
- *
- * Zoom slides the eye along +Z only; the sphere stays at the origin
- * and the three coloured pools keep their relative arrangement on its
- * surface. Both the rasteriser (mvp = proj·view·model) and the lighting
- * pass (V = normalize(cam_pos − P) inside blinn_phong) read cam_pos and
- * view, so this single rebuild is enough to make the next frame's
- * geometry pass AND specular highlights track the new viewpoint.
- *
- * Equivalent to scene_set_zoom() in raster/cube_raster.c.
- */
-static void scene_set_zoom(Scene *s) {
-  s->cam_pos = v3(0.f, CAM_EYE_Y, s->cam_dist);
-  s->view = m4_lookat(s->cam_pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
+/* Moves the eye in/out for the new zoom and refreshes its look-from transform,
+ * so the next frame (both the drawing and the highlights) uses the new spot. */
+static void camera_set_zoom(Camera *cam) {
+  cam->pos = v3(0.f, CAM_EYE_Y, cam->dist);
+  cam->view = m4_lookat(cam->pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
 }
 
-/*
- * scene_init — build the RGB-LIGHTS DEMO from scratch.
- *
- * Layout:
- *   meshes[0]               :  one white sphere at the origin
- *   models[0]               :  identity (sphere stays at origin)
- *   lights[0..2]            :  RED, GREEN, BLUE primaries (active by default)
- *   lights[3..7]            :  reserved progression extras (press 'l' to
- * enable)
- *
- * Why this minimal layout? A single white sphere + three saturated
- * primaries is the canonical "additive light" demo every graphics
- * textbook draws. Only here it's real-time software-rendered, and you
- * can see the deferred lighting pass accumulate one light at a time
- * by pressing 'l'.
- */
-static void scene_init(Scene *s, int total_cols, int total_rows) {
-  /* Free meshes from previous scene (reset / resize). */
-  for (int i = 0; i < s->n_objects; i++)
-    mesh_free(&s->meshes[i]);
+/* Changes the zoom by delta, kept within range. delta < 0 moves closer. */
+static void camera_zoom(Camera *cam, float delta) {
+  cam->dist += delta;
+  if (cam->dist < CAM_DIST_MIN)
+    cam->dist = CAM_DIST_MIN;
+  if (cam->dist > CAM_DIST_MAX)
+    cam->dist = CAM_DIST_MAX;
+  camera_set_zoom(cam);
+}
 
-  memset(s, 0, sizeof *s);
-  s->scene_cols = total_cols;
-  s->scene_rows = total_rows - HUD_ROWS;
-  s->mode = MODE_LIGHTING;
-
-  /* Camera — pose is fixed except for +/- zoom. cam_dist lives in
-   * Scene so the user can move the eye at runtime; scene_set_zoom
-   * derives cam_pos and the view matrix from it. */
-  s->cam_dist = CAM_DIST;
-  scene_set_zoom(s);
-  scene_rebuild_proj(s, total_cols, s->scene_rows);
-
-  /* ── The one and only object: a white sphere at the origin. ── */
-  s->meshes[0] = tessellate_sphere(BALL_RADIUS, BALL_RINGS, BALL_SEGS);
-  s->albedos[0] = v3(1.0f, 1.0f, 1.0f); /* pure white — no filtering  */
-  s->models[0] = m4_identity();         /* at origin, no rotation     */
-  s->n_objects = 1;
-
-  /* ── Three RGB primaries active by default. Press 'l' to enable
-   * one more (up to MAX_LIGHTS). ── */
-  s->n_lights = 3;
-
-  /* Seed every preset's state — even the inactive extras, so 'l' just
-   * bumps n_lights without re-seeding mid-animation. */
+/* Copies every preset into a live light — including the ones that are off — so
+ * pressing 'l' later just turns the next one on without disturbing the others
+ * mid-animation. */
+static void seed_lights(Scene *s) {
   for (int li = 0; li < MAX_LIGHTS; li++) {
     PointLight *l = &s->lights[li];
     l->color = LIGHT_PRESETS[li].color;
@@ -1407,13 +869,40 @@ static void scene_init(Scene *s, int total_cols, int total_rows) {
   }
 }
 
-/*
- * scene_tick — advance simulation by dt seconds.
- *
- * The only moving things are the lights. Sphere is static, camera is
- * static. The whole tick is just: each light's angle += speed·dt, then
- * rebuild its (x, y, z) position from (radius, angle, height).
- */
+static void scene_init(Scene *s, int total_cols, int total_rows) {
+  /* Free meshes from previous scene (reset / resize). */
+  for (int i = 0; i < s->n_objects; i++)
+    mesh_free(&s->meshes[i]);
+
+  memset(s, 0, sizeof *s);
+  s->scene_cols = total_cols;
+  s->scene_rows = total_rows - HUD_ROWS;
+  s->mode = MODE_LIGHTING;
+
+  /* Camera — pose is fixed except for +/- zoom. cam.dist lives in
+   * Scene so the user can move the eye at runtime; camera_set_zoom
+   * derives cam.pos and the view matrix from it. */
+  s->cam.dist = CAM_DIST;
+  camera_set_zoom(&s->cam);
+  camera_rebuild_proj(&s->cam, total_cols, s->scene_rows);
+
+  /* the one object: a white sphere at the centre */
+  s->meshes[0] = tessellate_sphere(BALL_RADIUS, BALL_RINGS, BALL_SEGS);
+  s->albedos[0] = v3(1.0f, 1.0f, 1.0f); /* pure white */
+  s->models[0] = m4_identity();         /* at the centre, no rotation */
+  s->n_objects = 1;
+
+  /* the three primaries on by default; 'l' turns on more */
+  s->n_lights = 3;
+  seed_lights(s);
+}
+
+/* Works out where a light is on its ring, given how far around it's gone. */
+static inline Vec3 orbit_position(float radius, float angle, float height) {
+  return v3(radius * cosf(angle), height, radius * sinf(angle));
+}
+
+/* The only thing that moves: nudge each light a bit further around its ring. */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
@@ -1421,117 +910,129 @@ static void scene_tick(Scene *s, float dt) {
   for (int li = 0; li < MAX_LIGHTS; li++) {
     PointLight *l = &s->lights[li];
     l->orbit_angle += l->orbit_speed * dt;
-    float r = l->orbit_radius;
-    l->pos = v3(r * cosf(l->orbit_angle), l->height, r * sinf(l->orbit_angle));
+    l->pos = orbit_position(l->orbit_radius, l->orbit_angle, l->height);
   }
 }
 
-/* §8.4 ── mode_to_rgb — G-buffer layer → RGB at one pixel ───────────── */
+/* ── §9 screen — pick a colour per cell, paint it, draw the HUD ────────── */
 
-/*
- * Each mode produces a V3 RGB at the cell. The unified paint_cell
- * (§4) handles tone-mapping, gamma, cube quantise, and ramp char.
- *
- *   POSITION  — depth gradient: warm-near (z=-1) → cool-far (z=+1).
- *               R=high near, B=high far, G=middle for visual gradient.
- *   NORMAL    — (N + 1) / 2 mapping. Each face gets a unique RGB
- *               tint; sphere shows a smooth gradient across the
- *               surface. The classic "world-normal-as-color" debug.
- *   ALBEDO    — raw g_albedo, no lighting at all.
- *   LIGHTING  — final shaded result from g_light.
- */
-static Vec3 mode_to_rgb(GBufMode mode, int r, int c) {
-  if (!g_valid[r][c])
+/* §9.1 ── which colour to show for the active mode ────────────────────── */
+
+/* Turns the chosen table into a colour at one cell; paint_cell (§4) then turns
+ * that colour into an actual character. Position shows a near→far gradient,
+ * normal shows the facing as colour, albedo is the plain colour, lighting is the
+ * real lit result. */
+
+/* Remaps the depth (near…far) to a plain 0..1 number. */
+static float ndc_depth_to_unit(float z) {
+  float t = (z + 1.f) * 0.5f;
+  return t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+}
+
+/* A hand-tuned warm-near → cool-far colour ramp over 0..1: reds fade out, blue
+ * rises, green peaks in the middle. */
+static Vec3 depth_gradient_rgb(float t) {
+  return v3(0.95f - t * 0.7f, 0.55f - t * 0.3f + (1.f - t) * 0.2f,
+            0.30f + t * 0.65f);
+}
+
+static Vec3 mode_to_rgb(const GBuffer *gb, GBufMode mode, int r, int c) {
+  if (!gb->valid[r][c])
     return v3(0, 0, 0);
 
   switch (mode) {
-  case MODE_POSITION: {
-    /* NDC-z ranges from -1 (near) to +1 (far). Remap to t∈[0,1]. */
-    float t = (g_zbuf[r][c] + 1.f) * 0.5f;
-    if (t < 0.f)
-      t = 0.f;
-    if (t > 1.f)
-      t = 1.f;
-    /* Warm (red/yellow) near, cool (blue) far. */
-    return v3(0.95f - t * 0.7f, 0.55f - t * 0.3f + (1.f - t) * 0.2f,
-              0.30f + t * 0.65f);
-  }
+  case MODE_POSITION:
+    return depth_gradient_rgb(ndc_depth_to_unit(gb->zbuf[r][c]));
   case MODE_NORMAL: {
-    Vec3 N = g_normal[r][c];
+    /* show the facing direction as a colour */
+    Vec3 N = gb->normal[r][c];
     return v3(N.x * 0.5f + 0.5f, N.y * 0.5f + 0.5f, N.z * 0.5f + 0.5f);
   }
   case MODE_ALBEDO:
-    return g_albedo[r][c];
+    return gb->albedo[r][c];
   case MODE_LIGHTING:
-    return g_light[r][c];
+    return gb->light[r][c];
   default:
     return v3(0, 0, 0);
   }
 }
 
-/* ── §9 screen — render_scene + HUD spec compliance ──────────────────── */
+/* §9.2 ── painting the scene and the HUD ──────────────────────────────── */
 
-/*
- * render_scene — paint every pixel via the unified paint_cell pipeline.
- *
- * The active G-buffer mode produces a V3 RGB; paint_cell handles
- * Reinhard tone-map + gamma + 6×6×6 cube quantise + Bourke ramp char
- * + A_BOLD/A_DIM. Same paint pipeline as cube_raster + every raytracer.
- *
- * Pressing 'l' to add lights changes ONLY g_light. The POSITION,
- * NORMAL, and ALBEDO views are pixel-perfect identical to before —
- * that's the deferred-rendering guarantee, plainly visible.
- */
-static void render_scene(const Scene *s) {
+/* Paints every cell: ask for its colour in the current mode, hand it to
+ * paint_cell. Adding lights changes only the lighting table — the position,
+ * normal, and albedo views look exactly the same, which is the demo's whole
+ * point, plainly visible. */
+static void render_scene(const Scene *s, const GBuffer *gb) {
   int cols = s->scene_cols;
   int rows = s->scene_rows;
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c])
+      if (!gb->valid[r][c])
         continue;
-      Vec3 col = mode_to_rgb(s->mode, r, c);
+      Vec3 col = mode_to_rgb(gb, s->mode, r, c);
       paint_cell(c, r, col);
     }
   }
 }
 
-/*
- * cube_pair — quantise a Vec3 RGB into one of the 216 cube pairs.
- *
- * Used by the HUD to render light swatches in each light's own colour.
- * Same 6×6×6 cube mapping as paint_cell, factored out so the swatch
- * loop doesn't re-derive (r5, g5, b5) twice (once for attron, once
- * for attroff — the previous version had that dual-derivation bug).
- */
+/* Finds the closest of our 216 colours to this RGB — used by the HUD to draw
+ * each light's swatch in its own colour. */
 static int cube_pair(Vec3 col) {
-  int r5 = (int)(clamp01(col.x) * 5.f + 0.5f);
-  int g5 = (int)(clamp01(col.y) * 5.f + 0.5f);
-  int b5 = (int)(clamp01(col.z) * 5.f + 0.5f);
-  return PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
+  return PAIR_CUBE_BASE + quantize_unit_to_5(col.x) * 36 +
+         quantize_unit_to_5(col.y) * 6 + quantize_unit_to_5(col.z);
 }
 
-/*
- * hud_draw — CLAUDE.md HUD spec + 3 educational rows in between.
- *
- * Layout (HUD_ROWS = 5):
- *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
- *   scene_rows + 0 PAIR_HUD                  — algorithm cost summary
- *   scene_rows + 1 PAIR_HUD                  — mode-specific explanation
- *   scene_rows + 2 PAIR_HUD                  — light colour swatches
- *   scene_rows + 3 PAIR_HUD                  — blank spacer (gives breathing
- * room) scene_rows + 4 PAIR_HINT (cyan + bold)   — key hint
- */
+/* Draws the overlay: a yellow status line on top, three teaching lines plus the
+ * coloured light dots near the bottom, and a cyan key reminder on the last row. */
+
+/* count_total_triangles — sum of triangle counts across all live objects. */
+static int count_total_triangles(const Scene *s) {
+  int total = 0;
+  for (int i = 0; i < s->n_objects; i++)
+    total += s->meshes[i].ntri;
+  return total;
+}
+
+/* mode_explanation — one-line teaching caption for the active G-buffer view. */
+static const char *mode_explanation(GBufMode mode) {
+  switch (mode) {
+  case MODE_POSITION:
+    return "POSITION: warm-near → cool-far depth. 3-D layout BEFORE lighting.";
+  case MODE_NORMAL:
+    return "NORMAL: (N+1)/2 RGB. Smooth sphere → smooth gradient.";
+  case MODE_ALBEDO:
+    return "ALBEDO: flat surface colour, NO lighting. 'l' never changes this.";
+  case MODE_LIGHTING:
+    return "LIGHTING: Blinn-Phong over G-buffer. 'l' adds a light, geometry "
+           "stays.";
+  default:
+    return "";
+  }
+}
+
+/* hud_draw_swatches — one '@' per active light at `row`, each painted in
+ * that light's own cube colour (red light → red glyph, etc.). */
+static void hud_draw_swatches(const Scene *s, int row) {
+  int cols = s->scene_cols;
+  int lx = 9;
+  for (int li = 0; li < s->n_lights && lx < cols - 2; li++) {
+    int pair = cube_pair(s->lights[li].color);
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvaddch(row, lx, (chtype)(unsigned char)'@');
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+    lx += 2;
+  }
+}
+
 static void hud_draw(const Scene *s, double fps) {
   int hr = s->scene_rows; /* first HUD row = first row past scene */
   int cols = s->scene_cols;
 
-  int total_tris = 0;
-  for (int i = 0; i < s->n_objects; i++)
-    total_tris += s->meshes[i].ntri;
-
-  int fwd_calls = s->n_objects * s->n_lights;   /* obj × lights    */
-  int defer_calls = s->n_objects + s->n_lights; /* obj + lights    */
+  int total_tris = count_total_triangles(s);
+  int fwd_calls = s->n_objects * s->n_lights;   /* forward:  obj × lights */
+  int defer_calls = s->n_objects + s->n_lights; /* deferred: obj + lights */
   int saved_pct =
       fwd_calls > 0 ? 100 * (fwd_calls - defer_calls) / fwd_calls : 0;
 
@@ -1539,7 +1040,7 @@ static void hud_draw(const Scene *s, double fps) {
   char status[120];
   snprintf(status, sizeof status,
            " %5.1f fps  mode:%s  lights:%d  zoom:%.1f  tris:%d  %s ", fps,
-           k_mode_names[s->mode], s->n_lights, (double)s->cam_dist, total_tris,
+           k_mode_names[s->mode], s->n_lights, (double)s->cam.dist, total_tris,
            s->paused ? "PAUSED" : "running");
   int slen = (int)strlen(status);
   if (slen > cols)
@@ -1552,45 +1053,14 @@ static void hud_draw(const Scene *s, double fps) {
   /* ── Educational rows (yellow, no bold so they sit under the
    *    primary status row visually). ── */
   attron(COLOR_PAIR(PAIR_HUD));
-
   mvprintw(hr + 0, 1,
            "fwd = %d (obj × lights)   def = %d (obj + lights)   saved = %d%%",
            fwd_calls, defer_calls, saved_pct);
-
-  const char *explain = "";
-  switch (s->mode) {
-  case MODE_POSITION:
-    explain =
-        "POSITION: warm-near → cool-far depth. 3-D layout BEFORE lighting.";
-    break;
-  case MODE_NORMAL:
-    explain = "NORMAL: (N+1)/2 RGB. Smooth sphere → smooth gradient.";
-    break;
-  case MODE_ALBEDO:
-    explain =
-        "ALBEDO: flat surface colour, NO lighting. 'l' never changes this.";
-    break;
-  case MODE_LIGHTING:
-    explain = "LIGHTING: Blinn-Phong over G-buffer. 'l' adds a light, geometry "
-              "stays.";
-    break;
-  default:
-    break;
-  }
-  mvprintw(hr + 1, 1, "%s", explain);
-
-  /* Light swatch — one '@' per active light, painted in that light's
-   * own colour pair so red light shows red, green shows green, etc. */
+  mvprintw(hr + 1, 1, "%s", mode_explanation(s->mode));
   mvprintw(hr + 2, 1, "Lights:");
   attroff(COLOR_PAIR(PAIR_HUD));
-  int lx = 9;
-  for (int li = 0; li < s->n_lights && lx < cols - 2; li++) {
-    int pair = cube_pair(s->lights[li].color);
-    attron(COLOR_PAIR(pair) | A_BOLD);
-    mvaddch(hr + 2, lx, (chtype)(unsigned char)'@');
-    attroff(COLOR_PAIR(pair) | A_BOLD);
-    lx += 2;
-  }
+
+  hud_draw_swatches(s, hr + 2);
 
   /* ── Cyan hint bottom row (per spec: A_BOLD, never A_DIM). ── */
   attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -1604,14 +1074,24 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §10 app ─────────────────────────────────────────────────────────── */
+/* ── §10 app — setup, the main loop, and keypresses ────────────────────── */
 
+/*
+ * App — the whole running program: the scene plus the terminal size and two
+ * flags the signal handlers set. One shared instance (g_app) so the handlers,
+ * which take no arguments, can still reach it.
+ *
+ * running / need_resize are marked volatile sig_atomic_t because a signal can
+ * set them at any moment, so the compiler must always read/write them for real.
+ * total_cols/rows are the full terminal; the scene gets all but the few HUD rows
+ * at the bottom, recomputed on every resize.
+ */
 typedef struct {
-  Scene scene;
-  int total_cols;
-  int total_rows;
-  volatile sig_atomic_t running;
-  volatile sig_atomic_t need_resize;
+  Scene scene;                       /* everything drawn                   */
+  int total_cols;                    /* full terminal width  (cells)      */
+  int total_rows;                    /* full terminal height (cells)      */
+  volatile sig_atomic_t running;     /* cleared to stop the loop          */
+  volatile sig_atomic_t need_resize; /* set when the window was resized   */
 } App;
 
 static App g_app;
@@ -1669,17 +1149,11 @@ static bool app_handle_key(App *app, int ch) {
     break;
   case '=':
   case '+':
-    s->cam_dist -= CAM_ZOOM_STEP;
-    if (s->cam_dist < CAM_DIST_MIN)
-      s->cam_dist = CAM_DIST_MIN;
-    scene_set_zoom(s);
+    camera_zoom(&s->cam, -CAM_ZOOM_STEP); /* closer */
     break;
   case '-':
   case '_':
-    s->cam_dist += CAM_ZOOM_STEP;
-    if (s->cam_dist > CAM_DIST_MAX)
-      s->cam_dist = CAM_DIST_MAX;
-    scene_set_zoom(s);
+    camera_zoom(&s->cam, +CAM_ZOOM_STEP); /* farther */
     break;
   default:
     break;
@@ -1687,8 +1161,21 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
+/* Draws one whole frame: pass 1 fills the surface tables, pass 2 adds up the
+ * lights, pass 3 paints the chosen table, then the HUD goes on top. Reads the
+ * scene, writes only the tables and the terminal. */
+static void render_frame(const Scene *s, double fps) {
+  erase();
+  render_gbuffer(&g_gbuf, s->meshes, s->albedos, s->models, s->n_objects,
+                 &s->cam.view, &s->cam.proj, s->scene_cols, s->scene_rows);
+  render_lightpass(&g_gbuf, s->lights, s->n_lights, s->cam.pos, s->scene_cols,
+                   s->scene_rows);
+  render_scene(s, &g_gbuf);
+  hud_draw(s, fps);
+  screen_present();
+}
+
 int main(void) {
-  srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
   atexit(cleanup);
   signal(SIGINT, on_exit_signal);
   signal(SIGTERM, on_exit_signal);
@@ -1708,13 +1195,13 @@ int main(void) {
 
   while (app->running) {
 
-    /* §10.1 resize. */
+    /* handle a window resize if one happened */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
     }
 
-    /* §10.2 timing. */
+    /* how long since the last frame (capped, so a hiccup doesn't lurch things) */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
@@ -1722,10 +1209,10 @@ int main(void) {
       dt = DT_CAP_NS;
     float dt_sec = (float)dt / (float)NS_PER_SEC;
 
-    /* §10.3 advance scene. */
+    /* move the lights along */
     scene_tick(&app->scene, dt_sec);
 
-    /* §10.4 fps rolling average. */
+    /* update the fps readout */
     fps_cnt++;
     fps_acc += dt;
     if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1734,28 +1221,14 @@ int main(void) {
       fps_acc = 0;
     }
 
-    /* §10.5 frame cap. */
+    /* wait out the rest of the frame to hold a steady rate */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
 
-    /* §10.6 THE FULL DEFERRED RENDERING PIPELINE.
-     *
-     *   PASS 1 — render_gbuffer:   geometry → G-buffer (pos/normal/albedo)
-     *   PASS 2 — render_lightpass: G-buffer + lights → g_light
-     *   PASS 3 — render_scene:     mode_to_rgb per pixel → paint_cell
-     *   PASS 4 — hud_draw:         yellow status + cyan hint + edu rows
-     */
-    Scene *s = &app->scene;
-    erase();
-    render_gbuffer(s->meshes, s->albedos, s->models, s->n_objects, &s->view,
-                   &s->proj, s->scene_cols, s->scene_rows);
-    render_lightpass(s->lights, s->n_lights, s->cam_pos, s->scene_cols,
-                     s->scene_rows);
-    render_scene(s);
-    hud_draw(s, fps_display);
-    screen_present();
+    /* draw everything */
+    render_frame(&app->scene, fps_display);
 
-    /* §10.7 input. */
+    /* handle a keypress (pause / reset / mode / lights / zoom / quit) */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;

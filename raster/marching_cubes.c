@@ -1,544 +1,20 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * marching_cubes.c — animated metaballs + marching cubes isosurface
+ * marching_cubes.c — four coloured blobs ("metaballs") orbit inside a box; where
+ * their combined glow is strong enough a smooth surface appears, and that surface
+ * is rebuilt from scratch every frame. As blobs drift apart you see separate
+ * shapes; as they pass close they merge, their colours blending in the seam.
  *
- * DEMO: Four colored metaballs (red, green, blue, yellow) orbit at
- *       different speeds and heights inside a cube of empty space.
- *       Wherever their combined "density" exceeds a threshold, a
- *       smooth surface appears — and that surface is RE-EXTRACTED
- *       from scratch every frame. As the metaballs drift apart you
- *       see four separate blobs; as they pass close they MERGE into
- *       a single smooth shape, with their colours blending in the
- *       seam. The geometry itself is animated — most demos shade
- *       static meshes; this one rebuilds the mesh 60 times a second.
+ * The trick (marching cubes): chop space into a grid of little cubes and, for
+ * each cube, look up from a table which triangles approximate the surface passing
+ * through it. The rest is an ordinary triangle renderer — the same path as
+ * ssao_pipeline.c / deferred_rendering_pipeline.c.
  *
- *       Watch the topology change: a hole opens between two blobs as
- *       they pull apart, then closes as they slide back together.
- *       Genus changes in real time. That's marching cubes — extract
- *       the level set f(p) = THRESHOLD by visiting each cube of a
- *       voxel grid and stitching together the triangles that
- *       approximate the surface inside that cube.
- *
- *       Camera orbits slowly so you see the surface from every side
- *       and confirm the gradient-derived normals shade correctly.
- *
- * Study alongside:
- *   raster/ssao_pipeline.c              — same G-buffer + raster path
- *   raster/deferred_rendering_pipeline.c — same MVP / lighting setup
- *
- * Section map:
- *   §1  config     — frame, view, MC grid, metaballs, lighting, ramp
- *   §2  clock      — monotonic timer + sleep
- *   §3  math       — V3, V4, Mat4 helpers
- *   §4  paint      — 216-pair RGB cube + Bourke ramp + paint_cell
- *   §5  metaballs  — Metaball type, scalar field eval, gradient, color
- *   §6  mc         — marching cubes
- *                    §6.1  cube corner / edge geometry
- *                    §6.2  EDGE_TABLE  — 256-case edge mask
- *                    §6.3  TRI_TABLE   — 256-case triangulation
- *                    §6.4  vertex pool — dynamic per-frame mesh
- *                    §6.5  mc_extract  — the algorithm
- *   §7  gbuffer    — geometry pass (per-vertex color barycentric blend)
- *   §8  lightpass  — Blinn-Phong, sun + ambient
- *   §9  scene      — Scene struct, init / view / tick
- *   §10 screen     — render_scene + HUD (CLAUDE.md spec)
- *   §11 app        — signals, resize, fixed-step main loop
- *
- * Keys:
- *   space     pause / resume metaball orbits + camera
- *   n / N     cycle colour theme (PRIMARY → LAVA → PLASMA → MATRIX
- *                                 → OCEAN  → SUNSET → NEON → wrap)
- *   + / =     zoom in
- *   - / _     zoom out
- *   t / T     raise threshold (smaller, tighter blobs)
- *   g / G     lower threshold (bigger, fatter blobs)
- *   r / R     reset
- *   q / ESC   quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raster/marching_cubes.c -o mc -lncurses -lm
+ * Keys: space pause · n theme · +/- zoom · t/g threshold (tighter/fatter) · r reset · q quit
+ * Refs: marching cubes — Lorensen & Cline, SIGGRAPH '87; case tables — Paul
+ *   Bourke, https://paulbourke.net/geometry/polygonise/
+ * Build: gcc -std=c11 -O2 -Wall -Wextra raster/marching_cubes.c -o mc -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Marching cubes (Lorensen & Cline, 1987). Walk a
- *                  voxel grid; for each cube, classify its 8 corners
- *                  as inside/outside the level set; look up which
- *                  edges are crossed and how to triangulate them
- *                  from a 256-case table. Linear-interpolate the
- *                  crossings, emit triangles. The scalar field here
- *                  is a sum-of-blobs:
- *                      f(p) = Σ s_i / (|p − c_i|² + ε)
- *                  Each term peaks at a metaball centre and falls
- *                  off as 1/r²; the sum smoothly merges blobs whose
- *                  level sets intersect.
- *
- * Data-structure : 24×24×24 voxel grid → 25³ corner field samples.
- *                  Recomputed every frame from the moving metaballs.
- *                  Output is a flat triangle pool (no shared verts) of
- *                  up to MC_MAX_VERTS positions/normals/colours.
- *
- * Rendering      : Same G-buffer + Blinn-Phong path as ssao_pipeline,
- *                  but PER-VERTEX colour: each MC vertex blends the
- *                  metaball palette by influence weights at that
- *                  point, and the rasterizer barycentric-interpolates
- *                  the colour across each triangle. That's why the
- *                  seam between two merging blobs shows their two
- *                  colours bleeding into each other.
- *
- * Performance    : 24³ = 13 824 cubes × 8 corner reads per frame.
- *                  Most cubes are entirely inside or entirely outside
- *                  → case 0 or 255 → emit 0 triangles. Only surface-
- *                  adjacent cubes (≈ 24² ≈ 600 of them) emit any
- *                  geometry. Typical output: 1–3 k triangles/frame.
- *
- * References     : Lorensen & Cline, "Marching Cubes: A High
- *                    Resolution 3D Surface Construction Algorithm,"
- *                    SIGGRAPH '87.
- *                  Paul Bourke, "Polygonising a scalar field":
- *                    https://paulbourke.net/geometry/polygonise/
- *                  Inigo Quilez, "Distance functions" + "Smin":
- *                    https://iquilezles.org/articles/distfunctions/
- *                  Möller, "Fast Triangle Rasterization by
- *                    Interpolating Edge Functions," GPG (2000).
- *                  Reinhard et al., "Photographic Tone Reproduction
- *                    for Digital Images," SIGGRAPH '02.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Don't try to mesh a curved surface directly. Instead, slice space
- * into tiny cubes and ASK each one: "of my eight corners, which are
- * inside the shape?" There are 2^8 = 256 possible answers, and for
- * every one of them we precomputed where to draw the triangles.
- * Visit every cube, look up its case, emit triangles. The continuous
- * surface emerges from a discrete lookup.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a 3-D heightmap, but instead of "above sea level vs below"
- * the question is "above density threshold vs below". A cube whose
- * eight corners are all OUT contributes nothing. A cube whose eight
- * corners are all IN is buried inside the shape and contributes
- * nothing either. Only cubes with a MIX of in/out corners straddle
- * the surface — and for each such mix, the table tells you exactly
- * which edges to slice and how to weave triangles between them.
- *
- *      ┌──────────────────────────────────────────────┐
- *      │         one cube, case 1 (corner 0 in)       │
- *      │                                              │
- *      │           7────────6                         │
- *      │          /│       /│                         │
- *      │         4─┼──────5 │                         │
- *      │         │ 3──────┼─2     ← three edges       │
- *      │         │/       │/         touch corner 0   │
- *      │         0────────1                           │
- *      │                                              │
- *      │   In corners: {0}      Edges crossed: 0,3,8  │
- *      │   Triangle:   (e0, e8, e3)                   │
- *      └──────────────────────────────────────────────┘
- *
- * DRAWING METHOD  /  ALGORITHM IN STEPS
- * ─────────────────────────────────────
- * (per frame)
- *
- *   1. Move metaballs along their orbits.
- *   2. For every corner (i, j, k) of the voxel grid:
- *        g_field[k][j][i] = Σ s_n / (|p − c_n|² + ε)
- *   3. For every cube (i, j, k) with i, j, k in [0, GRID-1]:
- *        a. Read the 8 corner values f[0..7].
- *        b. case = bitset where bit n is set iff f[n] > threshold.
- *        c. emask = EDGE_TABLE[case]  (which of the 12 edges cross)
- *        d. For each set bit e in emask:
- *             interpolate t = (T − f[a]) / (f[b] − f[a])
- *             vert_pos[e]    = lerp(p_a, p_b, t)        ← world pos
- *             vert_normal[e] = outward_gradient(vert_pos[e])
- *             vert_color[e]  = palette_blend(vert_pos[e])
- *        e. Walk TRI_TABLE[case] in groups of 3 until you hit −1:
- *             emit a triangle from vert_pos[group[0..2]],
- *                 with their normals and colours.
- *   4. Hand the triangle pool to the standard G-buffer + Blinn-Phong
- *      pipeline; barycentric-blend the per-vertex colours.
- *
- * KEY FORMULAS
- * ────────────
- *   Field:        f(p) = Σ s_i / (|p − c_i|² + ε)
- *   Cube case:    case = Σ (f[n] > T) << n      , n ∈ [0, 8)
- *   Edge interp:  t = (T − f[a]) / (f[b] − f[a]),  p = lerp(p_a, p_b, t)
- *   Outward N:    N = normalize( Σ s_i (p − c_i) / (|p − c_i|² + ε)² )
- *   Colour blend: c = Σ w_i c_i / Σ w_i,  w_i = s_i / (|p − c_i|² + ε)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Ambiguous cases — when the surface enters and leaves the same
- *     face the topology of TRI_TABLE matters; we use Bourke's table
- *     which picks one consistent resolution.
- *   • Threshold-touching corners — if f[n] equals T exactly, tiny
- *     float jitter can flip the case bit. The implicit ε in the
- *     metaball formula prevents the field from going singular at the
- *     centres but not on the iso-line itself; in practice it's fine.
- *   • Vertex pool overflow — we cap at MC_MAX_VERTS triangles. If a
- *     metaball sits perfectly at a corner the surface area can spike;
- *     we silently drop excess triangles.
- *   • Normals from gradient — at saddle points the gradient magnitude
- *     can dip near zero. v3_norm's safety fallback (return up) keeps
- *     the rasterizer from dividing by zero.
- *   • EDGE_TABLE / TRI_TABLE consistency — at startup we verify that
- *     the bitwise OR of every edge mentioned in TRI_TABLE for case c
- *     equals EDGE_TABLE[c]. A typo is fatal at boot, not silent at
- *     runtime.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Pause (space): the surface should be perfectly smooth — no
- *     visible cube grid. Smoothness comes from gradient normals
- *     evaluated at the actual interpolated vertex position, NOT from
- *     the cube corners.
- *   • Watch two metaballs approach: a thin "neck" forms first, then
- *     the topology changes (the gap closes) — you should see one
- *     fused blob with TWO colours visibly blending in the seam.
- *   • Press 't' to raise the threshold: blobs shrink and may split
- *     apart. Press 'g' to lower: they grow and merge faster. The HUD
- *     shows the live threshold value.
- *   • Triangle count in the HUD oscillates as the surface area grows
- *     and shrinks with merging — it should never be zero (the
- *     metaballs always meet the threshold somewhere) and never
- *     exceed MC_MAX_VERTS / 3.
- *   • If the program prints "MC table mismatch" at startup and
- *     exits, the embedded TRI_TABLE has a typo for the printed case;
- *     check that case against Bourke's reference table.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read raster/deferred_rendering_pipeline.c first if
- *      you don't yet know the G-buffer pattern; the rendering half
- *      of this file is the same. The NEW half is §6 mc.
- *   2. §1 config — every constant has a unit-bearing comment.
- *      Note especially MC_GRID (resolution), MC_DEFAULT_THRESHOLD,
- *      and MC_MAX_VERTS (triangle pool cap).
- *   3. §6 mc — THE HEART of this file. Read AFTER tutorials T1-T6.
- *      In order:
- *        §6.1 cube corner / edge geometry  ← labels
- *        §6.2 EDGE_TABLE  (256 entries)    ← which edges crossed
- *        §6.3 TRI_TABLE   (256 × ≤16)      ← how to triangulate
- *        §6.4 vertex pool                  ← per-frame allocator
- *        §6.5 mc_extract                   ← the algorithm
- *      Bourke's reference page has the same labelling — keep it open
- *      next to the file.
- *   4. §5 metaballs — the scalar field. Independent of MC; you could
- *      swap in any f: ℝ³ → ℝ and the extractor wouldn't change.
- *   5. §7 gbuffer + §8 lightpass — same as deferred_rendering.
- *   6. §3 math + §4 paint + §9-§11 — infrastructure; skip on first
- *      read.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   GRID, GRID+1            cube count vs. corner count along each
- *                           axis. 24 cubes in x = 25 corners in x.
- *   g_field[k][j][i]        scalar value at corner (i, j, k).
- *   case_idx                8-bit cube index — bit n set iff
- *                           corner n is INSIDE the level set.
- *   emask                   12-bit mask — bit e set iff edge e
- *                           crosses the iso-surface in this case.
- *   t                       lerp parameter ∈ [0, 1] for the edge's
- *                           crossing position.
- *   T (or threshold)        the iso-value: f(p) = T defines the
- *                           surface.
- *   blob colour             palette colour of an individual metaball;
- *                           per-vertex colour is the blended average
- *                           weighted by metaball influence.
- *
- * Background you need
- * ───────────────────
- *   - The 7-stage forward rasteriser (cube_raster.c).
- *   - G-buffer / deferred shading (deferred_rendering_pipeline.c).
- *   - Linear interpolation: lerp(a, b, t) = a + t·(b − a).
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Dual contouring or extended marching cubes. Plain MC has well-
- *     known ambiguity-case wobbles; we accept them at this scale.
- *   - SDF / level-set theory at depth — we just need "field value
- *     above threshold = inside" and "below = outside."
- *   - Octree spatial decomposition / sparse voxels. Our 24³ grid is
- *     small enough to scan exhaustively every frame.
- *   - GPU compute / parallel MC. The CPU version at 24³ is plenty
- *     fast for terminal output.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Eight tutorials that build marching cubes + animated metaballs
- * from first principles.
- *
- *   T1  The level-set problem — what's an isosurface?
- *   T2  Why CUBES instead of a smooth equation?
- *   T3  The 256 cases — how an 8-bit index encodes corner state
- *   T4  EDGE_TABLE and TRI_TABLE — the precomputed lookup
- *   T5  Linear edge interpolation — placing a vertex on a crossed edge
- *   T6  Gradient normals — smooth shading without per-vertex authoring
- *   T7  The metaball field — animated topology for free
- *   T8  Per-vertex colour blending — why merging blobs show their seam
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  THE LEVEL-SET PROBLEM — WHAT'S AN ISOSURFACE?
- * ─────────────────────────────────────────────────
- * Take any function f: ℝ³ → ℝ that returns a real number for every
- * 3-D point. Pick a threshold T. The set of points where f(p) = T
- * is a 2-D surface (almost everywhere) called the LEVEL SET or
- * ISOSURFACE of f at T.
- *
- *   f(p) = x² + y² + z² − 1   →   level T = 0 is a unit sphere.
- *   f(p) = density of clouds  →   level T = 0.5 is the cloud's
- *                                 visible boundary.
- *   f(p) = signed distance    →   level T = 0 is the surface itself.
- *
- * The CHALLENGE: there's no closed-form list of triangles for an
- * arbitrary level set. Even for the unit sphere, the formula
- * doesn't TELL you where to put the triangles — only which points
- * are on the sphere.
- *
- * Marching cubes solves this for ANY scalar field: it produces a
- * triangle approximation of f(p) = T from a discrete grid of
- * sample values, no analytic surface-finding required.
- *
- * T2  WHY CUBES INSTEAD OF A SMOOTH EQUATION?
- * ───────────────────────────────────────────
- * The trick: don't try to mesh the surface DIRECTLY. Instead,
- * partition all of space into tiny cubes (a regular voxel grid).
- * Inside each cube, ask a much simpler question:
- *
- *     "Of my 8 corners, which are INSIDE the surface
- *      (f(corner) > T) and which are OUTSIDE?"
- *
- * Eight corners, each binary → 2⁸ = 256 possible patterns. The
- * surface inside that one cube is approximated by triangles
- * connecting the EDGES that cross from inside-to-outside.
- *
- * For each of the 256 cases, ONE triangle layout is enough (with
- * a couple of ambiguity tweaks). Lorensen & Cline (1987) tabulated
- * all 256 — that's EDGE_TABLE and TRI_TABLE in §6.2 / §6.3.
- *
- * The whole continuous surface emerges from doing this lookup at
- * EVERY cube of the grid. No global meshing — every cube acts
- * independently and the triangles automatically meet at shared
- * edges because the interpolation is consistent.
- *
- *      ┌──────────────────────────────────────────────┐
- *      │  surface threading through a cube grid:      │
- *      │                                              │
- *      │  ┌───┬───┬───┬───┐                           │
- *      │  │   │ ╱ │ ╲ │   │   each cube emits         │
- *      │  ├───┼─/─┼─\─┼───┤   triangles based on      │
- *      │  │ ╱ │   │   │ ╲ │   which corners are in    │
- *      │  ├─/─┼───┼───┼─\─┤                           │
- *      │  │   │   │   │   │                           │
- *      │  └───┴───┴───┴───┘                           │
- *      └──────────────────────────────────────────────┘
- *
- * T3  THE 256 CASES — HOW AN 8-BIT INDEX ENCODES CORNER STATE
- * ───────────────────────────────────────────────────────────
- * Number the cube's 8 corners 0..7 in a fixed labelling
- * convention. Bourke's labelling (which we use):
- *
- *     0: (0, 0, 0)        4: (0, 0, 1)
- *     1: (1, 0, 0)        5: (1, 0, 1)
- *     2: (1, 1, 0)        6: (1, 1, 1)
- *     3: (0, 1, 0)        7: (0, 1, 1)
- *
- * Build an 8-bit index by setting bit n if corner n is INSIDE:
- *
- *     case_idx = 0
- *     for n in 0..7:
- *       if f[n] > T: case_idx |= (1 << n)
- *
- * Examples:
- *     case 0   = 0000 0000   all 8 corners outside  → no triangles
- *     case 1   = 0000 0001   only corner 0 inside   → one triangle
- *     case 255 = 1111 1111   all 8 corners inside   → no triangles
- *     case 11  = 0000 1011   corners 0,1,3 inside   → small wedge
- *
- * 256 cases sounds large but most are uninteresting: cases 0 and
- * 255 emit nothing (cube is entirely out or entirely in). Most
- * surface-adjacent cubes hit the SAME small handful of cases
- * (cases 1, 2, 4, 8, 16, 32, 64, 128 are the "single corner
- * inside" cases — symmetric rotations of one another).
- *
- * Lorensen & Cline noted that of 256 cases, only 15 are unique
- * up to rotation/reflection. Some MC implementations exploit
- * that with smaller tables; we use the full 256-entry table for
- * clarity.
- *
- * T4  EDGE_TABLE AND TRI_TABLE — THE PRECOMPUTED LOOKUP
- * ─────────────────────────────────────────────────────
- * Two tables drive the algorithm:
- *
- *   EDGE_TABLE[256]
- *     12-bit value per case. Bit e set iff edge e is crossed by
- *     the surface in this case. A "crossed edge" has one corner
- *     inside and one outside, so the surface must pass through
- *     somewhere along that edge.
- *
- *   TRI_TABLE[256][16]
- *     For each case, a list of edge indices in groups of three,
- *     terminated by -1. Each triple says "make a triangle from
- *     the vertices placed on these three edges, in this winding
- *     order." Up to 5 triangles per case = 15 indices + sentinel.
- *
- * The algorithm becomes:
- *
- *     case = (8-bit corner-inside bitset)
- *     emask = EDGE_TABLE[case]
- *     for each set bit e in emask:
- *       compute vert_pos[e] by linear interpolation along edge e
- *     for each triangle indices in TRI_TABLE[case] until -1:
- *       emit triangle (vert_pos[i], vert_pos[j], vert_pos[k])
- *
- * Two table reads, one short loop per cube. The complexity is in
- * the OFFLINE construction of the tables; the online algorithm
- * is trivial.
- *
- * Sanity check (we do this at startup): EDGE_TABLE[c] must equal
- * the bitwise-OR of every edge mentioned in TRI_TABLE[c]. A typo
- * in either table produces a fatal "MC table mismatch" exit.
- *
- * T5  LINEAR EDGE INTERPOLATION — PLACING A VERTEX ON A CROSSED EDGE
- * ──────────────────────────────────────────────────────────────────
- * Suppose edge e connects corner a (value f[a]) and corner b
- * (value f[b]) with f[a] < T < f[b]. The surface passes through
- * SOMEWHERE along that edge. WHERE exactly?
- *
- * Approximation: assume f varies LINEARLY along the edge. Then
- * the surface crosses where the linear interpolant equals T:
- *
- *     f[a] + t · (f[b] − f[a]) = T
- *     t = (T − f[a]) / (f[b] − f[a])
- *     vert_pos = lerp(p_a, p_b, t)
- *
- * This is the "magic" smoothness step. Without it, you'd snap
- * vertices to the centre of every crossed edge (t = 0.5
- * always), and the resulting mesh would be cube-shaped — you
- * could see every voxel boundary.
- *
- * With t computed properly, vertices slide along their edges to
- * track the actual crossing position, and adjacent cubes' shared
- * edges produce IDENTICAL t-values (since both see the same
- * f[a] and f[b]). Result: triangles meet seamlessly at edges
- * and the cube grid is invisible in the output.
- *
- * Caveat: the interpolation is linear, not quadratic — fine for
- * smooth fields but CAN produce visible kinks where the field
- * curves sharply within a single cube. Increase MC_GRID to
- * shrink each cube and the kinks shrink too.
- *
- * T6  GRADIENT NORMALS — SMOOTH SHADING WITHOUT PER-VERTEX AUTHORING
- * ──────────────────────────────────────────────────────────────────
- * Each triangle vertex needs a normal for lighting. Two options:
- *
- *   PER-FACE  Compute one normal per triangle (cross-product of
- *             two edges). Cheap, but produces faceted shading —
- *             you'd see every triangle.
- *
- *   PER-VERTEX  Each vertex gets its own normal, the rasteriser
- *             interpolates across the triangle, lighting smooths
- *             over face boundaries. The result LOOKS curved.
- *
- * Per-vertex needs a normal at each vertex. For an isosurface
- * the answer is built in: the GRADIENT of the field f is
- * perpendicular to the surface at every point.
- *
- *     N(p) = ∇f / |∇f|
- *
- * For our metaball field f(p) = Σ s_i / (|p − c_i|² + ε), each
- * blob contributes a radial gradient outward from its centre,
- * weighted by the blob's strength. We have an analytic
- * expression — no need for finite differences:
- *
- *     ∇f = − Σ s_i · 2(p − c_i) / (|p − c_i|² + ε)²
- *
- * (negative sign because as p moves AWAY from c_i, f decreases).
- * Negate again to get the OUTWARD normal — points where f exceeds
- * T are "inside", so outward means in the direction f decreases.
- *
- * §5 metaball_gradient computes this; mc_extract evaluates it at
- * every emitted vertex.
- *
- * T7  THE METABALL FIELD — ANIMATED TOPOLOGY FOR FREE
- * ───────────────────────────────────────────────────
- * The scalar field is a sum of "metaballs" (Blinn 1982):
- *
- *     f(p) = Σ s_i / (|p − c_i|² + ε)
- *
- * Each term:
- *   - peaks at the centre c_i (≈ s_i / ε near c_i)
- *   - falls off as 1/r² with distance
- *   - blends ADDITIVELY with other metaballs
- *
- * Because the contributions add, two nearby metaballs raise the
- * field in the gap between them. If the gap-raised value crosses
- * T, the level set MERGES — one connected component instead of
- * two.
- *
- *      ┌──────────────────────────────────────────────┐
- *      │  far apart            close together         │
- *      │                                              │
- *      │   ⌐⌐⌐    ⌐⌐⌐         ⌐⌐⌐⌐⌐⌐⌐⌐                │
- *      │  / 1 \  / 2 \         /         \            │
- *      │  \___/  \___/        \_1______2_/            │
- *      │                                              │
- *      │  two blobs           one merged shape        │
- *      │  genus 0 + genus 0   genus 0                 │
- *      └──────────────────────────────────────────────┘
- *
- * As the metaballs orbit, the surface's TOPOLOGY changes — holes
- * open and close, components merge and separate. Marching cubes
- * handles all of this without special-casing: each frame extracts
- * the level set of the CURRENT field, whatever its topology.
- *
- * That's the demo's value proposition: most rendering files
- * shade a STATIC mesh; this one rebuilds the mesh 60 times a
- * second from a moving field, and topology evolves naturally.
- *
- * T8  PER-VERTEX COLOUR BLENDING — WHY MERGING BLOBS SHOW THEIR SEAM
- * ──────────────────────────────────────────────────────────────────
- * Each metaball has a colour. At every emitted vertex p, blend
- * the metaball colours by their INFLUENCE WEIGHTS at that point:
- *
- *     w_i  = s_i / (|p − c_i|² + ε)         ← same as the field
- *     vert_colour(p) = Σ w_i · colour_i / Σ w_i
- *
- * Properties:
- *   - Right next to ball 1: w_1 ≫ all others → vertex looks
- *     ball-1's colour.
- *   - In the middle of a "neck" between ball 1 and ball 2: w_1
- *     and w_2 are comparable → blended colour.
- *   - Far from any ball (shouldn't happen on the surface): all
- *     w_i small but the normalisation by Σ w_i keeps the result
- *     well-defined.
- *
- * The fragment shader (in §8 lightpass) reads the barycentric-
- * interpolated vertex colour and uses it as the surface albedo.
- * Result: the SEAM between two merging blobs visibly mixes their
- * two source colours, while the bulks of each blob retain their
- * own colour. Merging is BOTH topological (one mesh component
- * instead of two) AND chromatic (colour mixing in the seam).
- *
- * This is the cheap way to fake "material blending" without any
- * texturing: per-vertex attribute + barycentric interpolation in
- * the rasteriser. Same machinery as Gouraud shading, just used
- * for colour instead of intensity.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -569,14 +45,18 @@ enum {
 #define NS_PER_MS 1000000LL
 #define DT_CAP_NS (100 * NS_PER_MS)
 
-/* §1.2 G-buffer dimensions (static; sized for a large terminal). */
+/* §1.2 size of the per-pixel screen tables — fixed, big enough for a large
+ * terminal; anything past the edge is skipped. */
 #define GBUF_MAX_W 300
 #define GBUF_MAX_H 80
 
-/* §1.3 view geometry — eye orbits the metaball volume. */
+/* §1.3 the camera — it slowly circles the box of blobs. */
 #define CAM_FOV (55.0f * (float)M_PI / 180.0f)
 #define CAM_NEAR 0.1f
 #define CAM_FAR 50.0f
+/* A corner this close to the eye (or behind it) is off-screen; a triangle with
+ * all three there is dropped before the divide-by-distance step blows up. */
+#define NEAR_W_EPS 0.001f
 
 #define CAM_DIST 3.4f
 #define CAM_DIST_MIN 1.6f
@@ -589,62 +69,54 @@ enum {
 #define CELL_W 8
 #define CELL_H 16
 
-/* §1.4 marching cubes grid
+/* §1.4 the grid of little cubes the surface is carved from.
  *
- * GRID_DIM cubes per axis → (GRID_DIM+1)³ corner samples.
- * Bigger = smoother but slower. 24 is a sweet spot at terminal res.
- *
- * The volume spans WORLD_HALF on each side (so x, y, z ∈ [−H, +H]).
- * Cube edge length = 2·H / GRID_DIM. */
+ * GRID_DIM cubes along each axis (so one more sample point in each direction).
+ * More = a smoother surface but slower; 24 looks good at terminal resolution.
+ * The box runs from -WORLD_HALF to +WORLD_HALF on each axis. */
 #define GRID_DIM 24
 #define WORLD_HALF 1.50f
 
+/* The cutoff that decides where the surface is: the surface forms where the
+ * blobs' combined glow crosses this. Higher = tighter blobs; the t/g keys move
+ * it between the min and max. */
 #define MC_THRESHOLD_DEF 1.00f
 #define MC_THRESHOLD_MIN 0.30f
 #define MC_THRESHOLD_MAX 3.00f
 #define MC_THRESHOLD_STEP 0.05f
 
-/* Triangle pool capacity. Each emitted triangle stores 3 verts.
- * Surface area for 4 metaballs in the volume is well under this. */
+/* How many triangle corners the mesh can hold (3 per triangle). Four blobs
+ * never make a surface anywhere near this big. */
 #define MC_MAX_VERTS 18000
 
-/* §1.5 metaballs — count, strength, orbit, palette */
+/* §1.5 the blobs themselves. */
 #define N_METABALLS 4
-#define BALL_STRENGTH 0.18f /* s_i in the field formula  */
-#define BALL_EPSILON 0.05f  /* ε prevents division spike  */
+#define BALL_STRENGTH 0.18f /* how strongly each blob glows         */
+#define BALL_EPSILON 0.05f  /* keeps the glow from spiking to infinity at the centre */
 
-/* §1.6 lighting — sun direction is universal; sun colour, ambient,
- * rim strength, and ball palette all come from the active theme below. */
-/* key light in FRONT (negative z) so camera-facing faces are lit; was +z
- * (behind), which only looked right under the old flipped m4_lookat. */
+/* §1.6 lighting — the sun shines from one fixed direction (shared by all
+ * themes); its colour, the fill light, the rim glow, and the blob colours all
+ * come from the active theme. The sun points from in front so the side facing
+ * the camera is the lit one. */
 static const float SUN_DIR[3] = {-0.55f, -0.85f, -0.30f};
-#define SHININESS 18.0f
-#define SPEC_GAIN 0.28f
-#define RIM_POWER 2.5f /* falloff exponent for rim/Fresnel */
+#define SHININESS 18.0f /* how tight the glossy highlight is (bigger = tighter) */
+#define SPEC_GAIN 0.28f /* how strong the highlight is                          */
+#define RIM_POWER 2.5f  /* lower = a wider edge glow                            */
 
-/* §1.7 themes — preset palettes + atmosphere.
- *
- * Each theme bundles four metaball colours, an ambient colour, a sun
- * colour, and a rim-light strength. Two of these knobs are what give
- * a theme its 3-D feel:
- *
- *   - LOW ambient → strong contrast between lit and shadow sides
- *     (the blob's "back" goes dark, the silhouette pops).
- *   - HIGH rim_strength → bright Fresnel-like edge along the
- *     silhouette where the surface curves away from view; turns
- *     each blob into a clearly-rounded shape instead of a flat
- *     coloured disc.
- *
- * Press 'n' to cycle. The scene re-applies metaball albedos and the
- * lightpass swaps ambient / sun / rim live. Per CLAUDE.md theme rules
- * every entry sits in the bright half of the 256-colour cube so the
- * darkest tone is still visible against a black terminal background. */
+/* §1.7 themes — a preset look: four blob colours plus the lighting mood. Two
+ * knobs set the 3-D feel:
+ *   - low ambient → strong light/shadow contrast (the back goes dark, the
+ *     outline pops)
+ *   - high rim_strength → a bright glow along the outline where the surface
+ *     curves out of view, so each blob reads as round, not a flat disc
+ * 'n' cycles through them, swapping the colours and the lighting live. Every
+ * colour is kept bright enough to show on a black background, even the darkest. */
 typedef struct {
-  const char *name;
-  float ball_colors[N_METABALLS][3];
-  float ambient[3];
-  float sun_col[3];
-  float rim_strength;
+  const char *name;                  /* HUD label                       */
+  float ball_colors[N_METABALLS][3]; /* one RGB per blob                */
+  float ambient[3];                  /* the everywhere fill light       */
+  float sun_col[3];                  /* the sun's colour                */
+  float rim_strength;                /* how bright the outline glow is  */
 } Theme;
 
 static const Theme THEMES[] = {
@@ -720,27 +192,30 @@ static const Theme THEMES[] = {
 };
 #define N_THEMES ((int)(sizeof(THEMES) / sizeof(THEMES[0])))
 
-/* §1.8 character ramp — Paul Bourke 92-char density ladder. */
+/* §1.8 the brightness-to-character ladder, dim → bright (Paul Bourke's). */
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
-/* §1.9 Bayer 4×4 dither. */
+/* §1.9 a fixed 4×4 nudge pattern added to each cell's brightness so neighbours
+ * of similar brightness pick different characters, hiding the steps in a smooth
+ * gradient. */
 static const float k_bayer[4][4] = {
     {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
     {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
     {3 / 16.f, 11 / 16.f, 1 / 16.f, 9 / 16.f},
     {15 / 16.f, 7 / 16.f, 13 / 16.f, 5 / 16.f},
 };
-#define DITHER_AMP 0.10f
+#define DITHER_AMP 0.10f /* how strong that nudge is */
 
-/* §1.10 ncurses pair IDs — 216 cube + yellow HUD + cyan hint. */
+/* §1.10 ncurses colour-pair numbers: 216 for the RGB cube, plus a yellow for
+ * the status bar and a cyan for the hint line. */
 #define PAIR_CUBE_BASE 1
 #define PAIR_HUD 217
 #define PAIR_HINT 218
 
-/* ── §2 clock ────────────────────────────────────────────────────────── */
+/* ── §2 clock — reading the time and sleeping ──────────────────────────── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -756,7 +231,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ── §3 math (V3, V4, Mat4) ──────────────────────────────────────────── */
+/* ── §3 math — vectors and 4×4 matrices ────────────────────────────────── */
 
 typedef struct {
   float x, y, z;
@@ -824,6 +299,7 @@ static inline Mat4 m4_mul(Mat4 a, Mat4 b) {
   return r;
 }
 
+/* Builds the perspective transform — the one that makes far things smaller. */
 static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   Mat4 m = {{{0}}};
   float f = 1.f / tanf(fovy * 0.5f);
@@ -835,6 +311,7 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   return m;
 }
 
+/* Builds the "stand at eye, look toward at" camera transform. */
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
   Vec3 r = v3_norm(v3(f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
@@ -857,10 +334,13 @@ static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   return m;
 }
 
-/* ── §4 paint (216 RGB cube + Bourke ramp) ───────────────────────────── */
+/* ── §4 paint — turning a colour into one terminal cell ────────────────── */
 
 static int g_256;
 
+/* Sets up our colours: 216 of them as a 6×6×6 cube of reds × greens × blues,
+ * plus a yellow for the status bar and a cyan for the hint line. Falls back to
+ * plain white if the terminal can't do 256 colours. */
 static void color_init(void) {
   start_color();
   use_default_colors();
@@ -881,14 +361,14 @@ static void color_init(void) {
 static inline float clamp01(float x) {
   return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
 }
+/* reinhard — roll an over-bright value gently toward white instead of clipping. */
 static inline float reinhard(float x) { return x / (1.f + x); }
+/* gamma_enc — brightness correction so the colour looks right on screen. */
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
 
-/*
- * paint_cell — RGB → terminal pipeline (same as every other raster
- * file): Reinhard tone-map → gamma → Bayer dither → 6×6×6 cube + Bourke
- * ramp char + A_BOLD/A_DIM by luma.
- */
+/* Draws one terminal cell from a colour: bring it into screen range, pick the
+ * closest of our 216 colours, and pick a character for its brightness (with a
+ * dither nudge so gradients stay smooth); brightest cells go bold, darkest dim. */
 static void paint_cell(int sx, int sy, Vec3 col) {
   float r = gamma_enc(reinhard(col.x));
   float g = gamma_enc(reinhard(col.y));
@@ -933,18 +413,29 @@ static void paint_cell(int sx, int sy, Vec3 col) {
   attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* ── §5 metaballs ────────────────────────────────────────────────────── */
+/* ── §5 metaballs — the glow, the facing, and the colour at a point ───── */
 
+/* Metaball — one glowing blob. Each frame it slides around a horizontal circle;
+ * the "field" functions below read its position to work out the glow, surface
+ * facing, and colour at any point in space.
+ *   pos        — where it is right now (moved by scene_tick)
+ *   color      — its colour from the theme
+ *   orbit_r    — how wide its circle is
+ *   orbit_speed— how fast it goes around (and which way; negative = reversed)
+ *   orbit_y    — how high its circle sits
+ *   phase      — where it currently is on the circle */
 typedef struct {
-  Vec3 pos;          /* current world position (set by scene_tick) */
-  Vec3 color;        /* palette entry                              */
-  float orbit_r;     /* horizontal orbit radius                    */
-  float orbit_speed; /* radians per second                         */
-  float orbit_y;     /* fixed y of this orbit                      */
-  float phase;       /* current angle, advanced each tick          */
+  Vec3 pos;
+  Vec3 color;
+  float orbit_r;
+  float orbit_speed;
+  float orbit_y;
+  float phase;
 } Metaball;
 
-/* Eval scalar field Σ s / (|p − c|² + ε) at world point p. */
+/* The total glow at a point: each blob adds glow that's strongest up close and
+ * fades with distance, and they simply add up — which is what lets two blobs
+ * merge into one surface where their glows overlap. */
 static float metaball_field(Vec3 p, const Metaball *balls, int n) {
   float sum = 0.f;
   for (int i = 0; i < n; i++) {
@@ -955,11 +446,9 @@ static float metaball_field(Vec3 p, const Metaball *balls, int n) {
   return sum;
 }
 
-/*
- * metaball_outward_normal — outward iso-surface normal at p.
- *   ∇f      = Σ −2s(p−c)/(d²+ε)²       points TOWARD metaballs
- *   N ∝ −∇f = Σ  s(p−c)/(d²+ε)²       points AWAY from metaballs
- */
+/* Which way the surface faces at a point — its outward direction. The glow
+ * drops off as you move away from the blobs, so "downhill" points inward;
+ * the outward facing is just the other way (away from the blobs). */
 static Vec3 metaball_outward_normal(Vec3 p, const Metaball *balls, int n) {
   Vec3 g = v3(0, 0, 0);
   for (int i = 0; i < n; i++) {
@@ -971,11 +460,9 @@ static Vec3 metaball_outward_normal(Vec3 p, const Metaball *balls, int n) {
   return v3_norm(g);
 }
 
-/*
- * metaball_color — influence-weighted palette blend at p.
- *   c = Σ w_i · color_i / Σ w_i,  w_i = s_i / (|p − c_i|² + ε)
- * Smooth mix through the merge zone where two blobs overlap.
- */
+/* The colour at a point: a blend of the blob colours, each weighted by how much
+ * it glows here — so the closest blob dominates, and the seam where two meet
+ * fades smoothly from one colour to the other. */
 static Vec3 metaball_color(Vec3 p, const Metaball *balls, int n) {
   Vec3 c = v3(0, 0, 0);
   float total_w = 0.f;
@@ -989,13 +476,14 @@ static Vec3 metaball_color(Vec3 p, const Metaball *balls, int n) {
   return total_w > 1e-6f ? v3_scale(c, 1.f / total_w) : v3(1, 1, 1);
 }
 
-/* ── §6 marching cubes ───────────────────────────────────────────────── */
+/* ── §6 marching cubes — building the surface mesh each frame ──────────── *
+ * The heart of the demo: turn the blobs' glow into actual triangles. This is
+ * where the surface mesh (g_mesh) gets rebuilt from scratch every frame. */
 
-/* §6.1 ── cube corner / edge geometry ──────────────────────────────── *
+/* §6.1 ── how a cube's 8 corners and 12 edges are numbered ──────────── *
  *
- * Standard Paul Bourke convention. Corner offsets (in unit cube
- * coords) and the 12 edges connecting them — these *must* match the
- * encoding of EDGE_TABLE / TRI_TABLE.
+ * The numbering MUST match the lookup tables below (it's Paul Bourke's standard
+ * layout). Corner offsets are within a unit cube; the 12 edges connect them:
  *
  *           7────────6              corners 0..3 = bottom face (y = 0)
  *          /│       /│              corners 4..7 = top    face (y = 1)
@@ -1014,12 +502,12 @@ static const int k_edge[12][2] = {
     {0, 4}, {1, 5}, {2, 6}, {3, 7}, /* vertical pillars */
 };
 
-/* §6.2 ── EDGE_TABLE ───────────────────────────────────────────────── *
+/* §6.2 ── which edges the surface crosses, per case ────────────────── *
  *
- * For each of the 256 in/out combinations, a 12-bit mask telling
- * which of the 12 cube edges are crossed by the iso-surface. Bit e
- * is set iff edge e has one endpoint inside (f > T) and one outside.
- * Used to know which edges need an interpolated vertex.            */
+ * A cube has 8 corners, each either inside or outside the surface — 256
+ * combinations. For each one, this is a 12-bit mask: bit e is set when edge e
+ * has one end inside and one end outside, i.e. the surface crosses it and we'll
+ * need a vertex there. (Paul Bourke's reference table.) */
 static const unsigned short EDGE_TABLE[256] = {
     0x000, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c, 0x80c, 0x905, 0xa0f,
     0xb06, 0xc0a, 0xd03, 0xe09, 0xf00, 0x190, 0x099, 0x393, 0x29a, 0x596, 0x49f,
@@ -1047,11 +535,12 @@ static const unsigned short EDGE_TABLE[256] = {
     0x203, 0x109, 0x000,
 };
 
-/* §6.3 ── TRI_TABLE ───────────────────────────────────────────────── *
+/* §6.3 ── how to connect those crossings into triangles, per case ──── *
  *
- * For each case, a sequence of edge indices (0..11) read in groups
- * of 3 to form CCW triangles. Sequence is terminated by −1. Up to 5
- * triangles (15 indices) per case. From Bourke's reference table.    */
+ * For each of the 256 cases, the edges to join into triangles: read in groups
+ * of 3 (each number is an edge from §6.1), with -1 marking the end. Up to 5
+ * triangles per cube. The corner ordering makes the triangles face outward.
+ * (Paul Bourke's reference table.) */
 static const int TRI_TABLE[256][16] = {
     {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
     {0, 8, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
@@ -1311,15 +800,10 @@ static const int TRI_TABLE[256][16] = {
     {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
 };
 
-/*
- * mc_verify_tables — at startup, check that EDGE_TABLE is internally
- * consistent with TRI_TABLE: for each case, the bitwise OR of every
- * edge index appearing in TRI_TABLE for that case must equal the
- * EDGE_TABLE entry. Catches typos in the embedded tables before the
- * algorithm runs against silently-wrong data.
- *
- * Returns -1 on success, or the offending case index on mismatch.
- */
+/* A startup sanity check that the two big tables above agree (the triangles a
+ * case uses should reference exactly the edges it marks as crossed) — catches a
+ * typo in the tables before it silently corrupts the surface. Returns -1 if all
+ * 256 cases are fine, or the first bad case number. */
 static int mc_verify_tables(void) {
   for (int c = 0; c < 256; c++) {
     unsigned derived = 0;
@@ -1331,38 +815,42 @@ static int mc_verify_tables(void) {
   return -1;
 }
 
-/* §6.4 ── vertex pool ───────────────────────────────────────────────── *
- *
- * Each frame mc_extract clears g_mc and appends triangles. Every
- * triangle is three independent vertices (no index buffer) — wastes
- * memory but keeps the mesh format identical to the rasterizer's
- * Vertex layout and trivially debuggable.                             */
+/* §6.4 ── the mesh the surface gets built into ──────────────────────── */
+
+/* MCVertex — one corner of one triangle, carrying everything the renderer needs
+ * to blend across a face: its position, which way the surface faces there, and
+ * its colour. */
 typedef struct {
   Vec3 pos;
   Vec3 normal;
   Vec3 color;
 } MCVertex;
 
-static MCVertex g_mc[MC_MAX_VERTS];
-static int g_mc_count; /* number of vertices in use */
+/* Mesh — the surface, rebuilt from scratch each frame: a flat list of corners (3
+ * per triangle, no shared corners) plus how many are filled in. The renderer
+ * reads it as count/3 triangles. The flat list wastes a little memory but keeps
+ * the format dead simple — and the count belongs with the list it counts. */
+typedef struct {
+  MCVertex verts[MC_MAX_VERTS]; /* the list; verts[0 .. count) are filled in */
+  int count;                    /* how many corners (= 3 × triangles)        */
+} Mesh;
 
-/* §6.5 ── mc_extract — the algorithm ────────────────────────────────── */
+static Mesh g_mesh;
 
-/*
- * Sample the metaball field at every grid corner once, then walk the
- * cubes. The corner field array is reused for adjacent cubes — each
- * corner is shared by up to 8 cubes and we evaluate it once per
- * frame, not eight times.
- */
+/* §6.5 ── extracting the surface ────────────────────────────────────── */
+
+/* g_field — scratch: the blobs' total glow sampled at every grid corner. We fill
+ * it once per frame (here) and reuse it across cubes, since each corner is shared
+ * by up to 8 neighbouring cubes — computing it once instead of eight times. */
 static float g_field[GRID_DIM + 1][GRID_DIM + 1][GRID_DIM + 1];
 
-/* Map integer corner index in [0, GRID_DIM] to world-space coordinate
- * in [-WORLD_HALF, +WORLD_HALF].  step = 2·H / GRID. */
+/* Turns a grid corner index (0..GRID_DIM) into its world coordinate. */
 static inline float grid_to_world(int i) {
   const float step = 2.f * WORLD_HALF / (float)GRID_DIM;
   return -WORLD_HALF + (float)i * step;
 }
 
+/* Fill the whole field grid by sampling the blobs' glow at every corner. */
 static void mc_compute_field(const Metaball *balls, int n) {
   for (int k = 0; k <= GRID_DIM; k++) {
     float wz = grid_to_world(k);
@@ -1376,21 +864,21 @@ static void mc_compute_field(const Metaball *balls, int n) {
   }
 }
 
-/* Append one vertex (pos interpolated; normal+colour evaluated at
- * pos). Returns false if the pool is full. */
-static bool mc_push_vertex(Vec3 pos, const Metaball *balls, int n) {
-  if (g_mc_count >= MC_MAX_VERTS)
+/* Add one corner to the mesh, working out its facing and colour from the blobs.
+ * Returns false if the mesh list is full. */
+static bool mc_push_vertex(Mesh *mesh, Vec3 pos, const Metaball *balls, int n) {
+  if (mesh->count >= MC_MAX_VERTS)
     return false;
-  MCVertex *v = &g_mc[g_mc_count++];
+  MCVertex *v = &mesh->verts[mesh->count++];
   v->pos = pos;
   v->normal = metaball_outward_normal(pos, balls, n);
   v->color = metaball_color(pos, balls, n);
   return true;
 }
 
-/* Iso-crossing on the edge a→b:
- *   t = (T − fa) / (fb − fa),  p = lerp(pa, pb, t)
- * t is clamped to [0, 1] against numerical noise. */
+/* Find the point along an edge where the glow exactly hits the threshold — the
+ * surface crosses there. Slides between the two ends based on how far each end's
+ * glow is from the threshold (clamped to the edge against rounding noise). */
 static Vec3 mc_edge_lerp(Vec3 pa, float fa, Vec3 pb, float fb,
                          float threshold) {
   float denom = fb - fa;
@@ -1402,82 +890,125 @@ static Vec3 mc_edge_lerp(Vec3 pa, float fa, Vec3 pb, float fb,
   return v3_lerp(pa, pb, t);
 }
 
+/* Read one cube's 8 corner field values (fv) and world positions (pv). */
+static void mc_sample_cube(int i, int j, int k, float fv[8], Vec3 pv[8]) {
+  for (int c = 0; c < 8; c++) {
+    int ci = i + k_corner[c][0];
+    int cj = j + k_corner[c][1];
+    int ck = k + k_corner[c][2];
+    fv[c] = g_field[ck][cj][ci];
+    pv[c] = v3(grid_to_world(ci), grid_to_world(cj), grid_to_world(ck));
+  }
+}
+
+/* Classify the 8 corners inside/outside into the 8-bit case index: bit c is set
+ * when corner c is INSIDE the surface (its field exceeds the threshold). */
+static int mc_cube_case(const float fv[8], float threshold) {
+  int cube_case = 0;
+  for (int c = 0; c < 8; c++)
+    if (fv[c] > threshold)
+      cube_case |= (1 << c);
+  return cube_case;
+}
+
+/* Put a vertex on each edge the surface crosses (the ones EDGE_TABLE marks),
+ * each at the exact spot along the edge where the glow hits the threshold. */
+static void mc_interpolate_edges(const float fv[8], const Vec3 pv[8],
+                                 unsigned emask, float threshold,
+                                 Vec3 edge_pos[12]) {
+  for (int e = 0; e < 12; e++) {
+    if (!(emask & (1u << e)))
+      continue;
+    int a = k_edge[e][0];
+    int b = k_edge[e][1];
+    edge_pos[e] = mc_edge_lerp(pv[a], fv[a], pv[b], fv[b], threshold);
+  }
+}
+
+/* Append the triangles TRI_TABLE lists for this case (groups of 3 edge
+ * vertices). Returns false if the mesh pool filled up mid-cube. */
+static bool mc_emit_triangles(Mesh *mesh, const int *tri,
+                              const Vec3 edge_pos[12], const Metaball *balls,
+                              int n) {
+  for (int t = 0; tri[t] != -1; t += 3) {
+    if (!mc_push_vertex(mesh, edge_pos[tri[t]], balls, n))
+      return false;
+    if (!mc_push_vertex(mesh, edge_pos[tri[t + 1]], balls, n))
+      return false;
+    if (!mc_push_vertex(mesh, edge_pos[tri[t + 2]], balls, n))
+      return false;
+  }
+  return true;
+}
+
 /*
- * mc_extract — for each cube in the grid:
- *   1. read 8 corner values, build case bitset
- *   2. look up EDGE_TABLE[case] → which edges to interpolate
- *   3. interpolate one vertex per crossed edge
- *   4. walk TRI_TABLE[case] in groups of 3 → emit triangles
+ * Rebuild the whole surface mesh. Sample the glow once at every grid corner,
+ * then for each little cube: decide which corners are inside, look up which
+ * edges the surface crosses, put a vertex on each, and add that cube's triangles.
  */
-static void mc_extract(const Metaball *balls, int n, float threshold) {
-  g_mc_count = 0;
+static void mc_extract(Mesh *mesh, const Metaball *balls, int n,
+                       float threshold) {
+  mesh->count = 0;
   mc_compute_field(balls, n);
 
   for (int k = 0; k < GRID_DIM; k++) {
     for (int j = 0; j < GRID_DIM; j++) {
       for (int i = 0; i < GRID_DIM; i++) {
-
-        /* (1) read the 8 corner values + world positions. */
         float fv[8];
         Vec3 pv[8];
-        int cube_case = 0;
-        for (int c = 0; c < 8; c++) {
-          int ci = i + k_corner[c][0];
-          int cj = j + k_corner[c][1];
-          int ck = k + k_corner[c][2];
-          fv[c] = g_field[ck][cj][ci];
-          pv[c] = v3(grid_to_world(ci), grid_to_world(cj), grid_to_world(ck));
-          if (fv[c] > threshold)
-            cube_case |= (1 << c);
-        }
+        mc_sample_cube(i, j, k, fv, pv);
 
-        /* (2) cubes entirely in or out have no crossings. */
+        int cube_case = mc_cube_case(fv, threshold);
         unsigned emask = EDGE_TABLE[cube_case];
         if (emask == 0)
-          continue;
+          continue; /* cube entirely inside or outside — no surface crosses it */
 
-        /* (3) one vertex per crossed edge. */
         Vec3 edge_pos[12];
-        for (int e = 0; e < 12; e++) {
-          if (!(emask & (1u << e)))
-            continue;
-          int a = k_edge[e][0];
-          int b = k_edge[e][1];
-          edge_pos[e] = mc_edge_lerp(pv[a], fv[a], pv[b], fv[b], threshold);
-        }
+        mc_interpolate_edges(fv, pv, emask, threshold, edge_pos);
 
-        /* (4) emit triangles from TRI_TABLE[cube_case]. */
-        const int *tri = TRI_TABLE[cube_case];
-        for (int t = 0; tri[t] != -1; t += 3) {
-          if (!mc_push_vertex(edge_pos[tri[t]], balls, n))
-            return;
-          if (!mc_push_vertex(edge_pos[tri[t + 1]], balls, n))
-            return;
-          if (!mc_push_vertex(edge_pos[tri[t + 2]], balls, n))
-            return;
-        }
+        if (!mc_emit_triangles(mesh, TRI_TABLE[cube_case], edge_pos, balls, n))
+          return; /* mesh pool full */
       }
     }
   }
 }
 
-/* ── §7 G-buffer — geometry pass ─────────────────────────────────────── */
+/* ── §7 G-buffer — drawing the surface into per-cell tables ────────────── */
 
-static Vec3 g_pos[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_normal[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_albedo[GBUF_MAX_H][GBUF_MAX_W];
-static float g_zbuf[GBUF_MAX_H][GBUF_MAX_W];
-static uint8_t g_valid[GBUF_MAX_H][GBUF_MAX_W];
+/* GBuffer — a set of full-screen tables describing the surface seen at each
+ * cell. We draw the triangles once, recording each cell's facts here, then light
+ * each cell from those facts (the classic two-step "deferred" approach — Saito &
+ * Takahashi, 1987). Six tables, all read as [row][col]:
+ *   pos / normal / albedo — where the surface is, which way it faces, its colour
+ *   zbuf                  — how near it is, so a farther surface can't paint over
+ *                           a nearer one (starts at 1.0 = farthest, smaller wins)
+ *   valid                 — 1 where a triangle was drawn, 0 for empty background
+ *   light                 — the final lit colour (filled by render_lightpass) */
+typedef struct {
+  Vec3 pos[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 normal[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 albedo[GBUF_MAX_H][GBUF_MAX_W];
+  float zbuf[GBUF_MAX_H][GBUF_MAX_W];
+  uint8_t valid[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 light[GBUF_MAX_H][GBUF_MAX_W];
+} GBuffer;
 
-static void gbuffer_clear(int cols, int rows) {
+static GBuffer g_gbuf;
+
+/* Wipe the tables for a new frame: every cell empty and "farthest". */
+static void gbuffer_clear(GBuffer *gb, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      g_zbuf[r][c] = 1.0f;
-      g_valid[r][c] = 0;
+      gb->zbuf[r][c] = 1.0f;
+      gb->valid[r][c] = 0;
     }
   }
 }
 
+/* For a pixel and a triangle, returns three weights (one per corner) saying how
+ * much each corner pulls on that pixel — they tell us if the pixel is inside
+ * (all three ≥ 0) and how to blend the corners' values there. A degenerate
+ * (zero-area) triangle returns negatives so the caller skips it. */
 static void barycentric(const float sx[3], const float sy[3], float px,
                         float py, float b[3]) {
   float d =
@@ -1491,152 +1022,209 @@ static void barycentric(const float sx[3], const float sy[3], float px,
   b[2] = 1.f - b[0] - b[1];
 }
 
-/*
- * rasterize_mc_pool — the camera raster, but with PER-VERTEX colour.
- * Barycentric-blends each triangle's three colours into g_albedo, so
- * the merge seam between two metaballs reads as a smooth blend
- * instead of a hard edge.
- *
- * Geometry is g_mc[] (3 verts per triangle, no index buffer); the
- * model matrix is identity (mc_extract emits in world space).
- */
-static void rasterize_mc_pool(Mat4 mvp, int cols, int rows) {
-  int n_tri = g_mc_count / 3;
+/* Drop the 3 corners onto the cell grid: divide by distance (far things shrink),
+ * scale into cells, and flip y because screen rows count downward but up should
+ * be up. Returns each corner's screen x/y and a depth value. */
+static void project_to_screen(const Vec4 clip[3], int cols, int rows,
+                              float sx[3], float sy[3], float sz[3]) {
+  for (int vi = 0; vi < 3; vi++) {
+    float w = clip[vi].w;
+    if (fabsf(w) < 1e-6f)
+      w = 1e-6f;
+    sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
+    sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows; /* flip y */
+    sz[vi] = clip[vi].z / w;
+  }
+}
+
+/* True when all three corners are behind the camera — the whole triangle is
+ * off-screen, so skip it. */
+static bool all_behind_near_plane(const Vec4 clip[3]) {
+  return clip[0].w < NEAR_W_EPS && clip[1].w < NEAR_W_EPS &&
+         clip[2].w < NEAR_W_EPS;
+}
+
+/* True if the triangle faces away from us (so we can skip it). The trick:
+ * measure its signed area on screen; with our corner order and the y-flip,
+ * faces toward us come out positive, so zero-or-less is facing away. */
+static bool is_back_facing(const float sx[3], const float sy[3]) {
+  float area =
+      (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+  return area <= 0.f;
+}
+
+/* Fill the cells one triangle covers: walk its bounding box, keep the cells
+ * inside it and nearer than whatever's there, and record the blended surface
+ * sample — position, facing, and the per-corner colour that smooths the seam
+ * where two blobs merge. */
+static void rasterize_fragments(GBuffer *gb, const MCVertex *v0,
+                                const MCVertex *v1, const MCVertex *v2,
+                                const float sx[3], const float sy[3],
+                                const float sz[3], int cols, int rows) {
+  int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
+  int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
+  int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
+  int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+
+  for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
+    for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
+      float b[3];
+      barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
+      if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
+        continue;
+
+      float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
+      if (z >= gb->zbuf[py][px])
+        continue;
+
+      gb->zbuf[py][px] = z;
+      gb->pos[py][px] = v3_bary(v0->pos, v1->pos, v2->pos, b[0], b[1], b[2]);
+      gb->normal[py][px] = v3_norm(
+          v3_bary(v0->normal, v1->normal, v2->normal, b[0], b[1], b[2]));
+      gb->albedo[py][px] =
+          v3_bary(v0->color, v1->color, v2->color, b[0], b[1], b[2]);
+      gb->valid[py][px] = 1;
+    }
+  }
+}
+
+/* Draw the whole mesh into the tables, one triangle at a time: move its corners
+ * onto the screen, drop it if it's off-screen or facing away, then fill the
+ * cells it covers. (The mesh is already in world coordinates, so there's no
+ * separate "place the object" step.) */
+static void rasterize_mc_pool(GBuffer *gb, const Mesh *mesh, Mat4 mvp, int cols,
+                              int rows) {
+  int n_tri = mesh->count / 3;
   for (int ti = 0; ti < n_tri; ti++) {
-    const MCVertex *v0 = &g_mc[ti * 3 + 0];
-    const MCVertex *v1 = &g_mc[ti * 3 + 1];
-    const MCVertex *v2 = &g_mc[ti * 3 + 2];
+    const MCVertex *v0 = &mesh->verts[ti * 3 + 0];
+    const MCVertex *v1 = &mesh->verts[ti * 3 + 1];
+    const MCVertex *v2 = &mesh->verts[ti * 3 + 2];
 
-    Vec4 clip[3];
-    clip[0] = m4_mul_v4(mvp, v4(v0->pos.x, v0->pos.y, v0->pos.z, 1.f));
-    clip[1] = m4_mul_v4(mvp, v4(v1->pos.x, v1->pos.y, v1->pos.z, 1.f));
-    clip[2] = m4_mul_v4(mvp, v4(v2->pos.x, v2->pos.y, v2->pos.z, 1.f));
-
-    if (clip[0].w < 0.001f && clip[1].w < 0.001f && clip[2].w < 0.001f)
+    Vec4 clip[3] = {
+        m4_mul_v4(mvp, v4(v0->pos.x, v0->pos.y, v0->pos.z, 1.f)),
+        m4_mul_v4(mvp, v4(v1->pos.x, v1->pos.y, v1->pos.z, 1.f)),
+        m4_mul_v4(mvp, v4(v2->pos.x, v2->pos.y, v2->pos.z, 1.f)),
+    };
+    if (all_behind_near_plane(clip))
       continue;
 
     float sx[3], sy[3], sz[3];
-    for (int vi = 0; vi < 3; vi++) {
-      float w = clip[vi].w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
-      sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows;
-      sz[vi] = clip[vi].z / w;
-    }
-
-    float area =
-        (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (area <= 0.f)
+    project_to_screen(clip, cols, rows, sx, sy, sz);
+    if (is_back_facing(sx, sy))
       continue;
 
-    int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
-    int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
-    int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
-    int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
-
-    for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
-      for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
-        float b[3];
-        barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
-        if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
-          continue;
-
-        float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
-        if (z >= g_zbuf[py][px])
-          continue;
-
-        g_zbuf[py][px] = z;
-        g_pos[py][px] = v3_bary(v0->pos, v1->pos, v2->pos, b[0], b[1], b[2]);
-        g_normal[py][px] = v3_norm(
-            v3_bary(v0->normal, v1->normal, v2->normal, b[0], b[1], b[2]));
-        g_albedo[py][px] =
-            v3_bary(v0->color, v1->color, v2->color, b[0], b[1], b[2]);
-        g_valid[py][px] = 1;
-      }
-    }
+    rasterize_fragments(gb, v0, v1, v2, sx, sy, sz, cols, rows);
   }
 }
 
-static void render_gbuffer(Mat4 view, Mat4 proj, int cols, int rows) {
-  gbuffer_clear(cols, rows);
-  Mat4 mvp = m4_mul(proj, view); /* model = identity */
-  rasterize_mc_pool(mvp, cols, rows);
+static void render_gbuffer(GBuffer *gb, const Mesh *mesh, Mat4 view, Mat4 proj,
+                           int cols, int rows) {
+  gbuffer_clear(gb, cols, rows);
+  Mat4 mvp = m4_mul(proj, view); /* the mesh is already placed in the world */
+  rasterize_mc_pool(gb, mesh, mvp, cols, rows);
 }
 
-/* ── §8 lightpass — Blinn-Phong + rim, themed ────────────────────────── *
- *
- *   ambient = theme.ambient · albedo
- *   diffuse = albedo · theme.sun_col · max(0, N · L)
- *   spec    = theme.sun_col · max(0, N · H)^SHININESS · SPEC_GAIN
- *   rim     = theme.sun_col · (1 − max(0, N · V))^RIM_POWER · rim_strength
- *   out     = clamp01( ambient + diffuse + spec + rim )
- *
- * The rim term ramps up at the silhouette (N·V → 0), giving each
- * blob a Fresnel halo that reads as 3-D curvature even on the unlit
- * side. */
-static Vec3 g_light[GBUF_MAX_H][GBUF_MAX_W];
+/* ── §8 lightpass — colour every surface cell from the light ──────────── *
+ * Reads the surface tables, writes the lit colour into the light table. Two
+ * choices keep the shape readable on the coarse terminal grid:
+ *   - the light wraps a bit past the edge of shadow (half-Lambert), so the side
+ *     facing away from the sun keeps a soft gradient instead of going flat —
+ *     otherwise that patch reads as a featureless blob;
+ *   - a bright glow along the outline, so each blob reads as round even where it
+ *     curves out of the light. */
 
-static void render_lightpass(Vec3 cam_pos, const Theme *theme, int cols,
-                             int rows) {
-  Vec3 sun_dir = v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
+/* The lit colour of one surface cell: a little fill light everywhere, plus more
+ * where it faces the sun (wrapped so the dark side keeps a gradient), plus a
+ * glossy highlight, plus the outline glow — clamped to what the screen can show.
+ * Pure: the per-frame light setup (sun direction, colour, fill, glow strength)
+ * is passed in, worked out once by render_lightpass. */
+static Vec3 shade_surface(Vec3 P, Vec3 N, Vec3 albedo, Vec3 L, Vec3 sun_col,
+                          Vec3 ambient, float rim_str, Vec3 cam_pos) {
+  Vec3 amb =
+      v3(ambient.x * albedo.x, ambient.y * albedo.y, ambient.z * albedo.z);
+
+  /* wrap the light past the edge of shadow so the dark side keeps a gradient */
+  float wrap = 0.5f * v3_dot(N, L) + 0.5f;
+  float diff = wrap * wrap;
+  Vec3 dif = v3(albedo.x * sun_col.x * diff, albedo.y * sun_col.y * diff,
+                albedo.z * sun_col.z * diff);
+
+  Vec3 V = v3_norm(v3_sub(cam_pos, P));
+  Vec3 H = v3_norm(v3_add(L, V));
+  float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN;
+  Vec3 sp = v3(sun_col.x * spec, sun_col.y * spec, sun_col.z * spec);
+
+  float facing = fmaxf(0.f, v3_dot(N, V));
+  float rim = powf(1.f - facing, RIM_POWER) * rim_str;
+  Vec3 rm = v3(sun_col.x * rim, sun_col.y * rim, sun_col.z * rim);
+
+  Vec3 sum = v3_add(v3_add(v3_add(amb, dif), sp), rm);
+  return v3(fminf(1.f, sum.x), fminf(1.f, sum.y), fminf(1.f, sum.z));
+}
+
+static void render_lightpass(GBuffer *gb, Vec3 cam_pos, const Theme *theme,
+                             int cols, int rows) {
+  /* per-frame light environment, constant across the whole pass */
   Vec3 sun_col = v3(theme->sun_col[0], theme->sun_col[1], theme->sun_col[2]);
   Vec3 ambient = v3(theme->ambient[0], theme->ambient[1], theme->ambient[2]);
   float rim_str = theme->rim_strength;
-  Vec3 L = v3_norm(v3_neg(sun_dir));
+  Vec3 L = v3_norm(v3_neg(v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2])));
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
-        g_light[r][c] = v3(0, 0, 0);
+      if (!gb->valid[r][c]) {
+        gb->light[r][c] = v3(0, 0, 0); /* background — nothing to light */
         continue;
       }
-
-      Vec3 P = g_pos[r][c];
-      Vec3 N = g_normal[r][c];
-      Vec3 albedo = g_albedo[r][c];
-
-      Vec3 amb =
-          v3(ambient.x * albedo.x, ambient.y * albedo.y, ambient.z * albedo.z);
-
-      float diff = fmaxf(0.f, v3_dot(N, L));
-      Vec3 dif = v3(albedo.x * sun_col.x * diff, albedo.y * sun_col.y * diff,
-                    albedo.z * sun_col.z * diff);
-
-      Vec3 V = v3_norm(v3_sub(cam_pos, P));
-      Vec3 H = v3_norm(v3_add(L, V));
-      float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN;
-      Vec3 sp = v3(sun_col.x * spec, sun_col.y * spec, sun_col.z * spec);
-
-      float facing = fmaxf(0.f, v3_dot(N, V));
-      float rim = powf(1.f - facing, RIM_POWER) * rim_str;
-      Vec3 rm = v3(sun_col.x * rim, sun_col.y * rim, sun_col.z * rim);
-
-      Vec3 sum = v3_add(v3_add(v3_add(amb, dif), sp), rm);
-      g_light[r][c] =
-          v3(fminf(1.f, sum.x), fminf(1.f, sum.y), fminf(1.f, sum.z));
+      gb->light[r][c] =
+          shade_surface(gb->pos[r][c], gb->normal[r][c], gb->albedo[r][c], L,
+                        sun_col, ambient, rim_str, cam_pos);
     }
   }
 }
 
-/* ── §9 scene ────────────────────────────────────────────────────────── */
+/* ── §9 scene — the blobs, the camera, and the chosen settings ─────────── */
 
+/* Camera — the eye circling the scene, plus the transforms worked out from it.
+ * Only yaw and dist are "set" (the orbit nudges yaw each frame; +/- change dist);
+ * pos, view, and proj are recomputed from those by camera_rebuild_view / _proj.
+ *   yaw  — how far around the scene the eye has swung
+ *   dist — how far back the eye is (the zoom)
+ *   pos  — the eye's actual spot, from yaw + dist
+ *   view — the "look from the eye toward the centre" transform
+ *   proj — the perspective (makes far things smaller), matched to the window */
 typedef struct {
+  float yaw;
+  float dist;
+  Vec3 pos;
+  Mat4 view;
+  Mat4 proj;
+} Camera;
+
+/* Scene — everything the demo is about, in one place:
+ *   WHAT  — the four orbiting blobs
+ *   HOW   — the knobs the keys change (surface threshold, theme, pause)
+ *   WHERE — the camera
+ * plus how big the drawing area is. Written only by scene_init / scene_tick and
+ * the key handler; the drawing passes read it but never change it. */
+typedef struct {
+  /* what's simulated */
   Metaball balls[N_METABALLS];
-  Mat4 view, proj;
-  Vec3 cam_pos;
-  float cam_dist;
-  float cam_yaw;
-  float threshold;
-  int theme_idx; /* index into THEMES[]               */
-  bool paused;
-  int scene_cols;
-  int scene_rows;
+
+  /* what the keys change */
+  float threshold; /* where the surface forms — higher = tighter blobs (t / g) */
+  int theme_idx;   /* which colour theme (n)                                   */
+  bool paused;     /* freeze the blobs + camera (space)                        */
+
+  /* where we view from */
+  Camera cam;
+
+  /* drawing area in cells (full width; height minus the HUD band) */
+  int scene_cols, scene_rows;
 } Scene;
 
-/* theme_apply — copy the active theme's palette onto each ball.
- * Lighting (ambient/sun/rim) isn't cached — render_lightpass reads
- * THEMES[s->theme_idx] live every frame. */
+/* Copies the active theme's colours onto the blobs. (The lighting colours aren't
+ * copied anywhere — the light pass reads the active theme directly each frame.) */
 static void theme_apply(Scene *s) {
   const Theme *t = &THEMES[s->theme_idx];
   for (int i = 0; i < N_METABALLS; i++) {
@@ -1645,26 +1233,30 @@ static void theme_apply(Scene *s) {
   }
 }
 
-static void scene_rebuild_proj(Scene *s, int cols, int rows) {
+/* Rebuilds the perspective for a new window size so the scene isn't stretched
+ * (terminal cells are taller than they are wide, which it accounts for). */
+static void camera_rebuild_proj(Camera *cam, int cols, int rows) {
   float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
-  s->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
+  cam->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 }
 
-static void scene_rebuild_view(Scene *s) {
-  float r = s->cam_dist;
-  s->cam_pos = v3(sinf(s->cam_yaw) * r, CAM_EYE_Y, cosf(s->cam_yaw) * r);
-  s->view = m4_lookat(s->cam_pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
+/* Places the eye on its circle (from yaw + dist) and refreshes the look-from
+ * transform. */
+static void camera_rebuild_view(Camera *cam) {
+  float r = cam->dist;
+  cam->pos = v3(sinf(cam->yaw) * r, CAM_EYE_Y, cosf(cam->yaw) * r);
+  cam->view = m4_lookat(cam->pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
 }
 
-/* scene_init — four metaballs on non-resonant orbits (ratios picked
- * so the configuration drifts continuously and never visibly repeats). */
+/* Sets up the scene: four blobs on circles whose speeds don't line up, so the
+ * arrangement keeps drifting and never settles into a repeating pattern. */
 static void scene_init(Scene *s, int total_cols, int total_rows) {
   memset(s, 0, sizeof *s);
   s->scene_cols = total_cols;
   s->scene_rows = total_rows - HUD_ROWS;
   s->threshold = MC_THRESHOLD_DEF;
-  s->cam_dist = CAM_DIST;
-  s->cam_yaw = 0.f;
+  s->cam.dist = CAM_DIST;
+  s->cam.yaw = 0.f;
   s->theme_idx = 0;
 
   static const struct {
@@ -1686,8 +1278,8 @@ static void scene_init(Scene *s, int total_cols, int total_rows) {
   }
 
   theme_apply(s);
-  scene_rebuild_proj(s, total_cols, s->scene_rows);
-  scene_rebuild_view(s);
+  camera_rebuild_proj(&s->cam, total_cols, s->scene_rows);
+  camera_rebuild_view(&s->cam);
 }
 
 static void scene_tick(Scene *s, float dt) {
@@ -1701,38 +1293,39 @@ static void scene_tick(Scene *s, float dt) {
                 b->orbit_r * sinf(b->phase));
   }
 
-  s->cam_yaw += CAM_ORBIT_RAD_PER_SEC * dt;
-  scene_rebuild_view(s);
+  s->cam.yaw += CAM_ORBIT_RAD_PER_SEC * dt;
+  camera_rebuild_view(&s->cam);
 }
 
-/* ── §10 screen — render_scene + HUD ─────────────────────────────────── */
+/* ── §10 screen — painting the cells and the HUD ───────────────────────── */
 
-static void render_scene(const Scene *s) {
+/* Paints every surface cell to the terminal from the light table. */
+static void render_scene(const Scene *s, const GBuffer *gb) {
   int cols = s->scene_cols;
   int rows = s->scene_rows;
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c])
+      if (!gb->valid[r][c])
         continue;
-      paint_cell(c, r, g_light[r][c]);
+      paint_cell(c, r, gb->light[r][c]);
     }
   }
 }
 
-static void hud_draw(const Scene *s, double fps) {
+static void hud_draw(const Scene *s, const Mesh *mesh, double fps) {
   int hr = s->scene_rows;
   int cols = s->scene_cols;
 
-  int n_tri = g_mc_count / 3;
+  int n_tri = mesh->count / 3;
 
-  /* Row 0: title + status. */
+  /* top row — title on the left, live status on the right */
   char status[160];
   snprintf(
       status, sizeof status,
       " %5.1f fps  theme:%s  grid:%dx%dx%d  T=%.2f  tris:%d  zoom:%.1f  %s ",
       fps, THEMES[s->theme_idx].name, GRID_DIM, GRID_DIM, GRID_DIM,
-      (double)s->threshold, n_tri, (double)s->cam_dist,
+      (double)s->threshold, n_tri, (double)s->cam.dist,
       s->paused ? "PAUSED" : "running");
   int slen = (int)strlen(status);
   if (slen > cols)
@@ -1766,14 +1359,19 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §11 app ─────────────────────────────────────────────────────────── */
+/* ── §11 app — setup, the main loop, and keypresses ────────────────────── */
 
+/* App — the whole running program: the scene plus the terminal size and two
+ * flags the signal handlers set. One shared instance (g_app) so the handlers,
+ * which take no arguments, can reach it. The two flags are marked volatile
+ * sig_atomic_t because a signal can set them at any moment, so the compiler must
+ * always read/write them for real. */
 typedef struct {
   Scene scene;
   int total_cols;
   int total_rows;
-  volatile sig_atomic_t running;
-  volatile sig_atomic_t need_resize;
+  volatile sig_atomic_t running;     /* cleared to stop the loop        */
+  volatile sig_atomic_t need_resize; /* set when the window was resized */
 } App;
 
 static App g_app;
@@ -1840,17 +1438,17 @@ static bool app_handle_key(App *app, int ch) {
     break;
   case '=':
   case '+':
-    s->cam_dist -= CAM_ZOOM_STEP;
-    if (s->cam_dist < CAM_DIST_MIN)
-      s->cam_dist = CAM_DIST_MIN;
-    scene_rebuild_view(s);
+    s->cam.dist -= CAM_ZOOM_STEP;
+    if (s->cam.dist < CAM_DIST_MIN)
+      s->cam.dist = CAM_DIST_MIN;
+    camera_rebuild_view(&s->cam);
     break;
   case '-':
   case '_':
-    s->cam_dist += CAM_ZOOM_STEP;
-    if (s->cam_dist > CAM_DIST_MAX)
-      s->cam_dist = CAM_DIST_MAX;
-    scene_rebuild_view(s);
+    s->cam.dist += CAM_ZOOM_STEP;
+    if (s->cam.dist > CAM_DIST_MAX)
+      s->cam.dist = CAM_DIST_MAX;
+    camera_rebuild_view(&s->cam);
     break;
   default:
     break;
@@ -1858,8 +1456,8 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
-/* Sum the edge bits TRI_TABLE actually uses for `cube_case`, so the
- * boot-time error message can show what the derived edge mask was. */
+/* The set of edges TRI_TABLE actually uses for a case — so the startup error
+ * message can show what it found, if the tables disagree. */
 static unsigned tri_table_derived_edges(int cube_case) {
   unsigned d = 0;
   for (int i = 0; i < 16 && TRI_TABLE[cube_case][i] != -1; i++)
@@ -1868,8 +1466,8 @@ static unsigned tri_table_derived_edges(int cube_case) {
 }
 
 int main(void) {
-  /* Fail loudly at boot if the embedded MC tables disagree —
-   * a typo there would silently break surface topology. */
+  /* bail at startup if the two big tables disagree — a typo there would
+   * silently produce a broken surface */
   int bad = mc_verify_tables();
   if (bad >= 0) {
     fprintf(stderr,
@@ -1898,11 +1496,13 @@ int main(void) {
 
   while (app->running) {
 
+    /* handle a window resize if one happened */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
     }
 
+    /* how long since the last frame (capped, so a hiccup doesn't lurch things) */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
@@ -1910,8 +1510,10 @@ int main(void) {
       dt = DT_CAP_NS;
     float dt_sec = (float)dt / (float)NS_PER_SEC;
 
+    /* move the blobs and the camera along */
     scene_tick(&app->scene, dt_sec);
 
+    /* update the fps readout */
     fps_cnt++;
     fps_acc += dt;
     if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1920,19 +1522,24 @@ int main(void) {
       fps_acc = 0;
     }
 
+    /* wait out the rest of the frame to hold a steady rate */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
 
+    /* draw the frame: rebuild the surface → fill the tables → light them →
+     * paint → HUD → show it */
     Scene *s = &app->scene;
     erase();
-    mc_extract(s->balls, N_METABALLS, s->threshold);
-    render_gbuffer(s->view, s->proj, s->scene_cols, s->scene_rows);
-    render_lightpass(s->cam_pos, &THEMES[s->theme_idx], s->scene_cols,
+    mc_extract(&g_mesh, s->balls, N_METABALLS, s->threshold);
+    render_gbuffer(&g_gbuf, &g_mesh, s->cam.view, s->cam.proj, s->scene_cols,
+                   s->scene_rows);
+    render_lightpass(&g_gbuf, s->cam.pos, &THEMES[s->theme_idx], s->scene_cols,
                      s->scene_rows);
-    render_scene(s);
-    hud_draw(s, fps_display);
+    render_scene(s, &g_gbuf);
+    hud_draw(s, &g_mesh, fps_display);
     screen_present();
 
+    /* handle a keypress (pause / reset / theme / threshold / zoom / quit) */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;

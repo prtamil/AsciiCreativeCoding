@@ -1,503 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * bloom_finale.c — deferred + SSAO + bloom capstone
+ * bloom_finale.c — the folder's capstone. One frame runs three image tricks
+ * back to back: deferred shading, SSAO contact shadows, and bloom. The scene is
+ * a dark floor, two sandstone cubes, and a glowing orb; the orb is brighter than
+ * the screen can show, and that extra brightness leaks out around it as a soft
+ * halo (the bloom). SSAO darkens the creases where the cubes meet the floor.
  *
- * DEMO: A dark slate floor with two warm sandstone cubes on it, and
- *       a small glowing orb floating between them. The orb is the
- *       only emissive object — its surface "outputs" more light than
- *       a normal albedo can reflect — and that excess HDR brightness
- *       is what bloom feeds on. Around the orb you see a soft warm
- *       halo bleeding several cells past its silhouette; that halo
- *       is the bloom contribution. The cube corners and floor halos
- *       are darkened by SSAO. Direct sunlight from the upper-left
- *       picks out the cube faces and the orb's own surface.
- *
- *       Press 'b' to toggle bloom — the halo around the orb appears
- *       and disappears. Without bloom the orb is just a bright disc
- *       with a hard silhouette; with bloom it reads as a real light
- *       source. Press 'a' to toggle SSAO — the dark contact halos
- *       under the cubes vanish and the scene flattens.
- *
- *       Together: this file runs every technique developed in the
- *       earlier files of the folder back-to-back in one frame.
- *
- * Study alongside:
- *   raster/deferred_rendering_pipeline.c — the deferred / G-buffer base
- *   raster/ssao_pipeline.c               — the SSAO sampling + blur
- *   raster/shadow_mapping.c              — same lookAt + cull conventions
- *
- * Section map:
- *   §1  config     — frame, view, scene, SSAO, bloom, lighting, ramp
- *   §2  clock      — monotonic timer + sleep
- *   §3  math       — V3, V4, Mat4 + perspective / lookat
- *   §4  paint      — 216-pair RGB cube + Bourke ramp + paint_cell
- *   §5  mesh       — Vertex / Triangle types + box / quad / sphere
- *   §6  gbuffer    — geometry pass (pos, normal, albedo, emissive, depths)
- *   §7  ssao       — kernel + per-pixel sample loop + 3×3 blur
- *   §8  lightpass  — Blinn-Phong + emissive (HDR output)
- *   §9  bloom      — extract → separable Gaussian (H + V) → composite
- *   §10 scene      — Scene struct, init / view / tick
- *   §11 screen     — render_scene + HUD (CLAUDE.md spec)
- *   §12 app        — signals, resize, fixed-step main loop
- *
- * Keys:
- *   b / B     toggle bloom on/off
- *   a / A     toggle SSAO  on/off
- *   + / =     zoom in
- *   - / _     zoom out
- *   space     pause / resume camera orbit
- *   r / R     reset
- *   q / ESC   quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raster/bloom_finale.c -o bloom -lncurses -lm
+ * Keys: b bloom · a SSAO · +/- zoom · space pause · r reset · q/ESC quit
+ * Builds on: deferred_rendering_pipeline.c (the G-buffer), ssao_pipeline.c (AO).
+ * Ideas from: Reinhard tone-map (SIGGRAPH '02); separable Gaussian bloom
+ *   (LearnOpenGL, "Bloom"); Floyd–Steinberg dithering; Blinn-Phong (1977).
+ * Build: gcc -std=c11 -O2 -Wall -Wextra raster/bloom_finale.c -o bloom -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Three image-space techniques composed into one
- *                  frame. (1) Deferred shading: rasterise once into a
- *                  G-buffer of per-pixel surface properties, then run
- *                  Blinn-Phong over the G-buffer in a separate pass.
- *                  (2) SSAO: per-pixel hemisphere sampling against the
- *                  same G-buffer, modulating only the ambient term.
- *                  (3) Bloom: copy the BRIGHT pixels from the lit
- *                  buffer into a separate buffer, blur it with a
- *                  separable Gaussian, then add the blurred result
- *                  back on top. Bright sources gain a soft halo —
- *                  the visual signature of a real camera or eye
- *                  responding to over-exposed light.
- *
- * Data-structure : G-buffer parallels (pos, normal, albedo, emissive,
- *                  zbuf, z_view, valid) + AO buffers (raw + blurred)
- *                  + bloom buffers (bright + blurred). All static at
- *                  GBUF_MAX_W × GBUF_MAX_H. Lightpass output g_light
- *                  is HDR (channels can exceed 1.0 thanks to emissive
- *                  surfaces) — bloom WANTS the HDR; if lightpass
- *                  clamped to [0,1] there'd be no excess to bleed.
- *
- * Rendering      : Per frame:
- *                    1. render_gbuffer  — pos / normal / albedo /
- *                                         emissive / depth
- *                    2. ssao_pass + ssao_blur (if enabled)
- *                    3. render_lightpass — HDR Blinn-Phong + emissive
- *                    4. bloom_extract → bloom_blur_h → bloom_blur_v
- *                       → bloom_composite (if enabled)
- *                    5. render_scene → paint_cell (Reinhard tone-map
- *                       finally collapses HDR to terminal-friendly
- *                       brightness)
- *
- * Performance    : SSAO ≈ pixels × K samples; bloom ≈ pixels × kernel
- *                  taps × 2 passes. Both trivial at terminal resolution.
- *
- * References     : Saito & Takahashi, "Comprehensible Rendering of
- *                    3-D Shapes," SIGGRAPH '90 (G-buffer concept).
- *                  Mittring, "Finding Next Gen — CryEngine 2,"
- *                    SIGGRAPH '07 course notes (SSAO).
- *                  James & O'Rorke, "Real-Time Glow," GPU Gems (2004).
- *                  LearnOpenGL, "Bloom" tutorial:
- *                    https://learnopengl.com/Advanced-Lighting/Bloom
- *                  Reinhard et al., "Photographic Tone Reproduction
- *                    for Digital Images," SIGGRAPH '02.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Render in HDR (don't clamp to white), then pull just the OVER-WHITE
- * pixels into a separate image, blur them so they spread, and add
- * them back. That extra glow only appears around things that were
- * already too bright for the display — exactly what your eye sees
- * staring at a candle in a dark room.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * The lit buffer can hold values like (3.0, 1.6, 0.7) for an
- * emissive surface even though the screen can only show up to
- * (1.0, 1.0, 1.0). That extra "1.0 + 0.6 + 1.0 + 0.7" of light
- * energy isn't lost — it gets siphoned into a side buffer, blurred,
- * and added on top. After tone-mapping, the original surface still
- * peaks at white, but its blurred ghost now bleeds into the
- * neighbouring pixels.
- *
- *      ┌──────────────────────────────────────────────┐
- *      │   HDR lit:        bright extract:            │
- *      │   ░░░░░░░         ░░░░░░░                    │
- *      │   ░░███░░    →    ░░███░░     blur →   ░██░░ │
- *      │   ░██▒██░         ░██▒██░              ████░ │
- *      │   ░░███░░         ░░███░░              ░██░░ │
- *      │                                              │
- *      │   composite = lit + blurred_extract          │
- *      │   tone-map → terminal cells                  │
- *      └──────────────────────────────────────────────┘
- *
- * DRAWING METHOD  /  ALGORITHM IN STEPS
- * ─────────────────────────────────────
- *  1. G-BUFFER PASS — write pos / normal / albedo / EMISSIVE / depth.
- *     Emissive is the new bit: most surfaces have (0, 0, 0); the orb
- *     has a HDR colour like (3, 1.6, 0.7).
- *
- *  2. SSAO PASS (optional) — same as the SSAO file: hemisphere
- *     samples against the G-buffer, output AO ∈ [0, 1] per pixel.
- *
- *  3. LIGHT PASS — for each valid pixel:
- *       lit = AMBIENT · albedo · AO         (modulated by SSAO)
- *           + albedo · sun · max(0, N·L)
- *           + sun · max(0, N·H)^SHININESS · SPEC_GAIN
- *           + EMISSIVE                       (pure energy out)
- *     NOT clamped to 1.0 — emissive can push channels past white.
- *
- *  4. BLOOM (optional) — four cheap passes:
- *       a. EXTRACT     g_bloom[r][c] = lit if luma > THRESHOLD else 0
- *       b. BLUR_H      horizontal Gaussian into g_bloom_temp
- *       c. BLUR_V      vertical   Gaussian back into g_bloom
- *       d. COMPOSITE   g_light += BLOOM_INTENSITY · g_bloom
- *
- *  5. PAINT — Reinhard tone-map collapses HDR to [0,1] inside
- *     paint_cell, then 6×6×6 cube quantise + Bourke ramp.
- *
- * KEY FORMULAS
- * ────────────
- *   Emissive:       lit += emissive   (no diffuse/spec, just emit)
- *   Bright extract: bright = lit · step(THRESHOLD, luma(lit))
- *   Gaussian:       g(x) = exp(-x²/(2σ²)) / (σ√(2π))
- *   Sep blur (H):   out[r][c] = Σ kernel[k] · in[r][c+k-RADIUS]
- *   Sep blur (V):   out[r][c] = Σ kernel[k] · in[r+k-RADIUS][c]
- *   Composite:      lit += BLOOM_INTENSITY · bloom_blurred
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Clamping in lightpass — the moment you write `min(1, sum)` the
- *     bloom pass has nothing to extract. Lightpass MUST write HDR.
- *
- *   • Bloom threshold — too low and dimly-lit surfaces start
- *     glowing (everything looks foggy); too high and only the
- *     emissive core itself triggers, halo barely visible.
- *
- *   • Separable validity — Gaussian is separable: a 2-D blur equals
- *     H pass then V pass with the SAME 1-D kernel. This is what
- *     makes the cost O(taps) instead of O(taps²).
- *
- *   • Boundary handling — at the edges of the screen the kernel
- *     reaches off-buffer. We clamp the read coordinate to [0, W-1]
- *     so the edge values get duplicated outward (no halo gets
- *     cut off at the screen boundary).
- *
- *   • SSAO + bloom interaction — SSAO modulates only the AMBIENT
- *     term; emissive contributes directly. So an emissive surface
- *     in a deep corner stays bright (correct — it emits its own
- *     light, doesn't reflect ambient).
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Toggle 'b' off: orb becomes a hard-edged bright disc, no
- *     halo. Toggle on: soft warm bleed extends 3-4 cells past the
- *     silhouette. The diff is exactly the bloom contribution.
- *
- *   • Toggle 'a' off: cube corners go uniformly bright; toggle on
- *     and the contact halos under each cube + the corner where
- *     they sit on the floor visibly darken.
- *
- *   • The HUD's "bloom" / "ssao" tags show whether each pass ran.
- *
- *   • Pause (space) and toggle 'b' repeatedly — only the pixels
- *     near the orb change, the rest of the scene is pixel-identical.
- *     That's how you know bloom only affects bright neighbourhoods.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read raster/deferred_rendering_pipeline.c first if
- *      you don't yet know the G-buffer pattern, and ssao_pipeline.c
- *      if you don't yet know the AO pass; this file COMPOSES both
- *      of those plus a new bloom stage.
- *   2. §1 config — every constant has a unit-bearing comment. The
- *      bloom block (THRESHOLD, INTENSITY, RADIUS, σ) is what tunes
- *      the halo's strength and width.
- *   3. §9 bloom — THE NEW HEART of this file. Read AFTER tutorials
- *      T1-T6. The four functions (extract / blur_h / blur_v /
- *      composite) line up 1:1 with the algorithm steps.
- *   4. §6 gbuffer + §7 ssao + §8 lightpass — copies of the earlier
- *      files. Skim if you've read those. Notice §8 outputs HDR
- *      (no clamp before bloom).
- *   5. §3 math + §4 paint + §10-§12 — infrastructure; skip on
- *      first read. paint_cell does the Reinhard tone-map at the
- *      very end — that's the line that finally collapses HDR into
- *      terminal-friendly brightness.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   g_light[r][c]       HDR lit colour, components may exceed 1.0.
- *   g_bloom[r][c]       buffer that holds the bright-extract,
- *                       then the blurred halo. Reused across
- *                       passes.
- *   g_bloom_temp[r][c]  scratch buffer for separable-blur
- *                       intermediate (after H pass, before V).
- *   luma                Rec.709 luminance: 0.2126 R + 0.7152 G
- *                       + 0.0722 B.
- *   THRESHOLD           luminance above which a pixel counts as
- *                       "bright enough to bloom."
- *   RADIUS / σ          Gaussian kernel radius (in pixels) and
- *                       standard deviation. Controls halo size.
- *   INTENSITY           composite scale factor on the blurred
- *                       bloom buffer.
- *
- * Background you need
- * ───────────────────
- *   - Deferred shading (deferred_rendering_pipeline.c) — the
- *     G-buffer pattern.
- *   - SSAO (ssao_pipeline.c) — hemisphere sampling + AO blur.
- *   - Convolution: 1-D and 2-D image kernels.
- *   - HDR vs. LDR: HDR keeps brightness > 1.0 around so it can
- *     be processed; LDR clamps at 1.0 (white).
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Lens-flare or anamorphic-streak bloom variants. We do
- *     plain isotropic Gaussian bloom.
- *   - Multi-scale bloom (mip-chain pyramid). Real engines blur at
- *     several resolutions and add them; we do one scale, which is
- *     plenty for the orb-sized bloom in this scene.
- *   - Filmic tone-mapping (ACES, Hable). We use Reinhard
- *     (x / (1 + x)), the simplest curve that does the job.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Eight tutorials that build bloom + tone-mapping from first
- * principles.
- *
- *   T1  Why bloom even exists — over-exposed light bleeding
- *   T2  HDR vs. LDR — the absolute prerequisite
- *   T3  Emissive surfaces — the source of the excess light
- *   T4  Bright extract — luminance threshold + smooth knee
- *   T5  The Gaussian kernel — what σ and RADIUS mean
- *   T6  Separable blur — O(taps) instead of O(taps²)
- *   T7  Composite + tone-map — the final HDR-to-LDR collapse
- *   T8  Why DITHER_AMP was tuned to 0.04 (phase-2 finding)
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  WHY BLOOM EVEN EXISTS — OVER-EXPOSED LIGHT BLEEDING
- * ───────────────────────────────────────────────────────
- * Look at a candle in a dark room. The flame doesn't end at a
- * crisp silhouette — there's a soft halo bleeding outward,
- * fading over a few millimetres of dark surroundings. That halo
- * is real. Two physical sources:
- *
- *   - The eye (or camera lens) imperfectly focuses bright light;
- *     a fraction scatters across nearby retinal cells / sensor
- *     photosites.
- *   - Tiny dust on the lens, micro-scratches in your eye's
- *     vitreous humour, etc., diffract the brightest light over
- *     a wider area than its source.
- *
- * The brain reads "bleed around brightness" as "this thing is
- * very bright." Without the bleed, a digital image of a candle
- * looks like a sticker. WITH bloom, even a 256-colour terminal
- * cell can read as a real light source.
- *
- * Bloom in rendering is ONE technique that fakes both effects in
- * one pass: blur the bright parts of the image and add the blur
- * back on top.
- *
- * T2  HDR VS. LDR — THE ABSOLUTE PREREQUISITE
- * ───────────────────────────────────────────
- * "Bright" is meaningless without a notion of brightness ABOVE
- * full white. A standard 8-bit-per-channel image saturates at
- * (1.0, 1.0, 1.0). That's LOW DYNAMIC RANGE.
- *
- * In LDR, an emissive flame and a perfectly white piece of paper
- * read as the same pixel value: (1, 1, 1). They look identical.
- * No bloom can fix that — the over-bright information was
- * destroyed when the renderer clamped to 1.0.
- *
- * In HIGH DYNAMIC RANGE, lit values are stored as floats with no
- * upper limit. The flame might be (3.0, 1.6, 0.7); the paper
- * (0.95, 0.95, 0.95). The bloom pass can now distinguish them by
- * looking at luma > 1.0.
- *
- * The lightpass in this file emits HDR — no clamp:
- *
- *     lit = ambient·albedo·AO + diffuse + specular + emissive
- *     g_light[r][c] = lit          (NOT clamp01(lit))
- *
- * Tone mapping (T7) collapses HDR to LDR ONLY at the very last
- * step, after bloom has had its chance to operate.
- *
- * T3  EMISSIVE SURFACES — THE SOURCE OF THE EXCESS LIGHT
- * ──────────────────────────────────────────────────────
- * The G-buffer in this file has an extra channel: g_emissive.
- * For most surfaces it's (0, 0, 0). For the orb it's a HDR
- * colour like (3.0, 1.6, 0.7) — meaning "this surface emits
- * light at 3 units of red, 1.6 of green, 0.7 of blue."
- *
- * "Emit" here means: contribute to the lit buffer WITHOUT
- * needing diffuse / specular reflection. Emissive surfaces
- * appear bright even with the sun off, even in a deep corner
- * (SSAO doesn't darken them — they make their OWN light, they
- * don't reflect ambient).
- *
- * In the lightpass:
- *
- *     lit = ambient·albedo·AO              ← reflected ambient
- *         + albedo · sun · max(0, N·L)     ← diffuse
- *         + spec_term                      ← specular
- *         + emissive                       ← direct emission
- *
- * The orb's emissive (3, 1.6, 0.7) puts its lit value well above
- * 1.0 in red. That's the over-bright signal bloom will detect.
- *
- * Without an emissive channel you can still bloom, but only the
- * brightest specular highlights would trigger — a much subtler
- * effect.
- *
- * T4  BRIGHT EXTRACT — LUMINANCE THRESHOLD + SMOOTH KNEE
- * ──────────────────────────────────────────────────────
- * The first bloom step copies only the BRIGHT pixels of g_light
- * into g_bloom, leaving everything else at zero:
- *
- *     for each pixel:
- *       Y = luma(g_light[r][c])
- *       w = smoothstep(THRESHOLD - KNEE, THRESHOLD + KNEE, Y)
- *       g_bloom[r][c] = g_light[r][c] · w
- *
- * Why luminance instead of channel-wise brightness? Because the
- * eye perceives green as much brighter than blue at the same
- * value. Rec.709 weights:
- *
- *     Y = 0.2126·R + 0.7152·G + 0.0722·B
- *
- * Why smoothstep instead of a hard threshold? Same reason as
- * neon_edges T7: a hard cut-off makes single-pixel aliasing.
- * smoothstep ramps over a small KNEE-width band so dim halos
- * blend in.
- *
- * After this step, g_bloom looks like the original lit buffer
- * but with all the dim regions blacked out — a sparse map of
- * bright spots.
- *
- * T5  THE GAUSSIAN KERNEL — WHAT σ AND RADIUS MEAN
- * ────────────────────────────────────────────────
- * To "spread" the bright spots, convolve g_bloom with a
- * Gaussian kernel. The 1-D Gaussian is:
- *
- *     g(x) = exp(-x² / (2σ²)) / (σ · √(2π))
- *
- * Two parameters:
- *
- *   σ (sigma)    standard deviation, controls the WIDTH of the
- *                bell curve. Bigger σ = wider, softer halo.
- *
- *   RADIUS       how many pixels of the kernel to actually use.
- *                The Gaussian extends to ±∞, but past about ±3σ
- *                the values are < 1% of the peak; we truncate.
- *                RULE: RADIUS ≥ 3σ.
- *
- * For this file: σ ≈ 3.0, RADIUS = 6, so the kernel has 13 taps
- * (from -6 to +6 inclusive). The taps are precomputed once in
- * §9 bloom_kernel_init and stored in a static array.
- *
- * The kernel is normalised so its taps sum to 1.0. Convolving by
- * a normalised kernel preserves the average brightness — we move
- * energy around, we don't add or remove it.
- *
- * T6  SEPARABLE BLUR — O(TAPS) INSTEAD OF O(TAPS²)
- * ────────────────────────────────────────────────
- * A naïve 2-D blur with a (2R+1)² kernel costs (2R+1)² reads per
- * pixel. For our R = 6 that's 169 reads per pixel — wasteful.
- *
- * Crucial property of Gaussians: they are SEPARABLE.
- *
- *     G_2D(x, y) = G_1D(x) · G_1D(y)
- *
- * That means a 2-D Gaussian blur EQUALS:
- *
- *     blur_horizontal(image, kernel_1D)   →  intermediate
- *     blur_vertical (intermediate, kernel_1D)  →  output
- *
- * Two 1-D passes, each with (2R+1) reads per pixel. For R = 6
- * that's 13 + 13 = 26 reads — 6× fewer than the naïve
- * implementation, and it gets MORE valuable as R grows.
- *
- * §9 bloom_blur_h and bloom_blur_v are the two 1-D passes. They
- * use the same precomputed kernel; they differ only in whether
- * they walk pixels horizontally or vertically.
- *
- * Boundary handling: when the kernel reaches off-screen, we
- * CLAMP the read coordinate to [0, W-1]. This is "edge
- * extension" — pretends the pixel at the boundary repeats. The
- * alternative ("zero outside the image") would create a dark
- * fringe at the screen edges where bright objects approached
- * the boundary. Edge extension hides that.
- *
- * T7  COMPOSITE + TONE-MAP — THE FINAL HDR-TO-LDR COLLAPSE
- * ────────────────────────────────────────────────────────
- * After both blur passes, g_bloom holds a soft halo around every
- * bright source. Composite is just adding it back into g_light:
- *
- *     g_light[r][c] += BLOOM_INTENSITY · g_bloom[r][c]
- *
- * BLOOM_INTENSITY < 1 keeps the halo subtle; > 1 makes everything
- * super-shiny.
- *
- * g_light is STILL HDR — adding the bloom can only make it
- * brighter. So we cannot send g_light directly to a 256-colour
- * terminal. The final step is TONE MAPPING — collapsing HDR
- * floats into LDR [0, 1] in a way that preserves visual
- * relationships:
- *
- *     ldr = hdr / (1 + hdr)        ← Reinhard, applied per channel
- *
- * Properties:
- *   - hdr = 0     → ldr = 0
- *   - hdr = 1     → ldr = 0.5
- *   - hdr = ∞     → ldr = 1
- *
- * Continuous, monotone, never clips. The dim parts of the scene
- * stay roughly linear (small hdr → ldr ≈ hdr); the very bright
- * parts get smoothly compressed toward 1.0 instead of clamped.
- *
- * Reinhard happens per channel inside paint_cell, JUST before the
- * 6×6×6 cube quantise + Bourke ramp. That's the FIRST and ONLY
- * place HDR gets crushed. By that point bloom has already done
- * its work in HDR space.
- *
- * T8  WHY DITHER_AMP WAS TUNED TO 0.04 (PHASE-2 FINDING)
- * ──────────────────────────────────────────────────────
- * The Bourke ramp gives ~92 distinct brightness glyphs. The
- * 6×6×6 RGB cube gives 6 levels per channel. Together that's
- * still discrete — you'll see banding on smooth dim ramps like
- * the floor unless you DITHER.
- *
- * Bayer dithering adds a deterministic 4×4 noise pattern to the
- * brightness BEFORE quantising:
- *
- *     y_dithered = y + (BAYER[r%4][c%4] - 0.5) · DITHER_AMP
- *
- * DITHER_AMP controls how strong the dither is. Phase-2
- * iteration on this file:
- *
- *   0.10  → "wallpaper bands" — the 4×4 Bayer pattern is too
- *            visible against the dim floor.
- *
- *   0.04  → enough dither to break the banding on the floor
- *            without making the Bayer texture itself visible.
- *
- * The constant lives in §1 config with that history noted. Any
- * scene where the bloom-darkened ambient occupies a large area
- * of the screen will benefit from low DITHER_AMP for the same
- * reason; scenes with brighter overall illumination tolerate
- * higher dither without visible patterning.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -536,6 +50,10 @@ enum {
 #define CAM_FOV (55.0f * (float)M_PI / 180.0f)
 #define CAM_NEAR 0.1f
 #define CAM_FAR 50.0f
+/* Anything closer to the eye than this (or behind it) is thrown away. The step
+ * that makes far things smaller divides by distance, and that blows up for a
+ * point sitting right on top of the camera. */
+#define CLIP_W_MIN 0.001f
 
 #define CAM_DIST 5.5f
 #define CAM_DIST_MIN 3.0f
@@ -548,42 +66,66 @@ enum {
 #define CELL_W 8
 #define CELL_H 16
 
-/* §1.4 lighting — single warm sun + cool ambient. */
-static const float SUN_DIR[3] = {-0.55f, -0.65f, 0.30f};
-static const float SUN_COL[3] = {0.95f, 0.85f, 0.65f};
+/* §1.4 lighting — the glowing orb is the main light: it sits at one spot and
+ * throws light outward (a "point" light). A dim, far-away "sun" pointing one
+ * fixed direction, plus a little all-over ambient, keep the sides facing away
+ * from the orb from going pure black. */
+static const float SUN_DIR[3] = {-0.55f, -0.65f, 0.30f}; /* fill direction   */
+static const float SUN_COL[3] = {0.95f, 0.85f, 0.65f};   /* fill base colour */
 static const float AMBIENT_COL[3] = {0.18f, 0.20f, 0.25f};
+#define FILL_GAIN 0.30f /* scales the directional sun down to a dim fill */
 #define SHININESS 24.0f
 #define SPEC_GAIN 0.30f
 
-/* §1.5 SSAO parameters
+/* The orb doubles as a real light that lights the scene. Its colour is scaled
+ * up by intensity when used, and it gets dimmer the farther a surface is from
+ * it — so it lays down a bright pool that fades across the floor. That fade is a
+ * strong depth cue a terminal shows off far better than flat, even lighting. */
+static const float POINT_LIGHT_COL[3] = {1.00f, 0.62f, 0.30f}; /* warm, orb-like */
+#define POINT_LIGHT_INTENSITY 6.0f
+#define POINT_ATTEN_LINEAR 0.10f
+#define POINT_ATTEN_QUAD 0.25f
+/* Just a visual aid: the sun has a direction but no position, so we drop a glyph
+ * this far from the scene centre in the direction the sunlight comes from, to
+ * eyeball that the shading lines up. */
+#define SUN_MARKER_DIST 4.5f
+
+/* §1.5 SSAO — fake soft shadows in nooks and crannies (corners, contact lines).
  *
- * Same kernel design as ssao_pipeline.c: 12 unit-ish hemisphere
- * samples × 4 variants picked per-pixel by (c&1 | (r&1)<<1), then a
- * 3×3 box blur to denoise. Modulates the ambient term only. */
+ * Same recipe as ssao_pipeline.c: around each surface point, poke 12 little test
+ * points into the air just above it and count how many are blocked by nearby
+ * geometry — more blocked means a tighter nook, so darken it. We keep 4 slightly
+ * different sets of test points and pick one per cell so the pattern doesn't
+ * line up into stripes, then a 3×3 average smooths the leftover speckle. Only
+ * the ambient (fill-everywhere) light gets darkened. */
 #define SSAO_SAMPLES 12
 #define SSAO_KERNEL_VARIANTS 4
 #define SSAO_RADIUS 0.45f
 #define SSAO_BIAS 0.0008f
+/* The closest test point sits this fraction of the way out; the rest fan out
+ * faster (as t²) so most of them cluster near the surface, where blocking
+ * actually matters. */
+#define SSAO_SAMPLE_MIN 0.1f
 
-/* §1.6 bloom parameters
+/* §1.6 bloom — the soft glow around very bright things.
  *
- * THRESHOLD — luma above this counts as "over-bright" and gets
- *   extracted into the bloom buffer. Set just above 1.0 so only
- *   HDR (emissive) pixels trigger; ordinary lit surfaces stay calm.
- * INTENSITY — multiplier on the blurred bright buffer when adding
- *   it back into g_light. 1.0 is a strong glow.
- * KERNEL    — a 1-D Gaussian; applied separably (H then V).
- *   13-tap with σ ≈ 3.0 spreads the halo ~6 cells out from the
- *   bright source. The previous 7-tap (σ ≈ 1.5, ~3 cells) was too
- *   tight to read as a glow at terminal resolution — the halo
- *   barely cleared the orb's silhouette. Wider σ + more taps gives
- *   an actual halo with a visible falloff. */
+ * THRESHOLD — how bright a pixel must be to glow. Set just above full white so
+ *   only the orb (which is brighter than white) blooms; normal lit surfaces
+ *   stay calm.
+ * INTENSITY — how much of the blurred glow we add back on top. 1.0 is strong.
+ * KERNEL    — the blur shape: a bell curve (Gaussian) of weights, run once
+ *   sideways and once up/down (cheaper than a full 2-D blur, same result).
+ *   13 weights spread the glow ~6 cells past the orb. An earlier 7-weight
+ *   version was too tight to read as a glow on the coarse terminal grid — the
+ *   halo barely cleared the orb's edge. Wider + more weights gives a real,
+ *   visibly-fading halo. */
 #define BLOOM_THRESHOLD 1.00f
 #define BLOOM_INTENSITY 1.00f
-#define BLOOM_RADIUS 6                    /* taps each side  */
-#define BLOOM_TAPS (2 * BLOOM_RADIUS + 1) /* = 13            */
+#define BLOOM_RADIUS 6                    /* weights each side */
+#define BLOOM_TAPS (2 * BLOOM_RADIUS + 1) /* = 13             */
 static const float BLOOM_KERNEL[BLOOM_TAPS] = {
-    /* Gaussian weights for σ = 3.0, normalised to sum 1.0. */
+    /* bell-curve weights (width 3.0), scaled so they add up to 1.0 — blurring
+     * moves brightness around without adding or losing any. */
     0.0185f, 0.0342f, 0.0563f, 0.0831f, 0.1097f, 0.1296f, 0.1370f,
     0.1296f, 0.1097f, 0.0831f, 0.0563f, 0.0342f, 0.0185f};
 
@@ -611,8 +153,9 @@ static const float BLOOM_KERNEL[BLOOM_TAPS] = {
 #define ORB_CX 0.0f
 #define ORB_CY 0.95f
 #define ORB_CZ 0.05f
-/* HDR emissive — channels exceed 1.0 so the orb glows past white
- * and bloom has something to extract. (1.0 wouldn't trigger.) */
+/* The orb's own glow. These numbers go above 1.0 (brighter than the screen can
+ * show) on purpose — that's the "extra" brightness bloom looks for. A value of
+ * 1.0 would just be plain white and wouldn't bloom. */
 static const float ORB_EMISSIVE[3] = {3.20f, 1.80f, 0.80f};
 
 enum {
@@ -623,40 +166,41 @@ enum {
   N_OBJECTS,
 };
 
-/* §1.8 character ramp — 18-char dense-low-end ladder.
+/* §1.8 character ramp — darkest to brightest, 18 characters, no faint ones.
  *
- * Replaces the 92-char Bourke ramp because Bourke's bottom ~25 chars
- * (` `, '`', '.', ''', '`', '-', '_', ',', ':', etc) are visually
- * thin/sparse on terminal fonts — at the luma values bloom halos
- * actually produce (~0.05-0.15), they read as scattered DOTS rather
- * than a smooth glow.
+ * Brightness is drawn by character: a space for black, up through busier
+ * characters to '#'/'$' for the brightest. The usual long 92-character ramp has
+ * a bunch of nearly-blank characters at the dim end ('.', '`', ',', etc.). At
+ * the faint brightness a bloom halo actually has (~0.05-0.15) those look like
+ * scattered dots, not a smooth glow.
  *
- * This ramp skips the sparse single-pixel glyphs entirely. The lowest
- * non-space character is `:` (two visible marks), so even very dim
- * halo cells render as a clearly-visible mark instead of a phantom
- * dot. Top end keeps the dense '%@#$' for over-bright cells.
+ * So this short ramp drops the blank-looking characters entirely. Its dimmest
+ * non-space is ':' — two clear dots — so even a faint halo cell shows a visible
+ * mark instead of a near-invisible speck. The bright end keeps the dense
+ * '%&@#$'.
  *
- * Trade: less fine gradation (18 levels vs 92) — but the 6×6×6 cube
- * already limits us to ~6 effective brightness levels per channel,
- * so 18 ramp entries is plenty.                                        */
+ * Trade-off: fewer brightness steps (18 vs 92) — but the 216-colour cube
+ * already limits us to about 6 steps per colour anyway, so 18 is plenty. */
 static const char k_bourke[] = " .:;~-+*coxOQ0%&@#$";
 #define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
-/* §1.9 Bayer 4×4 dither. */
-static const float k_bayer[4][4] = {
-    {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
-    {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
-    {3 / 16.f, 11 / 16.f, 1 / 16.f, 9 / 16.f},
-    {15 / 16.f, 7 / 16.f, 13 / 16.f, 5 / 16.f},
-};
-#define DITHER_AMP 0.10f
+/* §1.9 dithering — done in render_scene (§11). We only have a few colours and
+ * characters to work with, so a smooth gradient would otherwise show ugly steps.
+ * The fix (Floyd–Steinberg): when we round a cell to the nearest colour we keep
+ * track of how far off we were, and pass that leftover on to the next-door cells
+ * so the error averages out. No knob to tune — it just smooths the banding. */
 
 /* §1.10 ncurses pair IDs — 216 cube + yellow HUD + cyan hint. */
 #define PAIR_CUBE_BASE 1
 #define PAIR_HUD 217
 #define PAIR_HINT 218
 
-/* ── §2 clock ────────────────────────────────────────────────────────── */
+/* §1.11 turning a colour into a terminal cell — see paint_cell (§4). */
+#define CUBE_LEVELS 6             /* 6 steps per channel → 6×6×6 = 216 colours   */
+#define DISPLAY_GAMMA 2.2f        /* screen-brightness correction, applied last   */
+#define BOLD_LUMA_THRESHOLD 0.85f /* brighter than this → draw the cell in bold   */
+
+/* ── §2 clock — reading the time and sleeping ──────────────────────────── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -672,14 +216,16 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ── §3 math (V3, V4, Mat4) ──────────────────────────────────────────── */
+/* ── §3 math — vectors and 4×4 matrices ────────────────────────────────── */
 
 typedef struct {
   float x, y, z;
 } Vec3;
+
 typedef struct {
   float x, y, z, w;
 } Vec4;
+
 typedef struct {
   float m[4][4];
 } Mat4;
@@ -761,7 +307,8 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   return m;
 }
 
-/* m4_lookat — standard glm convention (cross(forward, up)). */
+/* Builds the "stand at eye, look toward at, with up roughly up" camera
+ * transform — the usual way to point a camera at something. */
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
   Vec3 r = v3_norm(v3(f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
@@ -806,7 +353,7 @@ static Mat4 m4_translate(float x, float y, float z) {
   return m;
 }
 
-/* ── §4 paint (216 RGB cube + Bourke ramp) ───────────────────────────── */
+/* ── §4 paint — turning a colour into one terminal cell ────────────────── */
 
 static int g_256;
 
@@ -831,72 +378,131 @@ static inline float clamp01(float x) {
   return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
 }
 static inline float reinhard(float x) { return x / (1.f + x); }
-static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
+static inline float gamma_enc(float x) {
+  return powf(clamp01(x), 1.f / DISPLAY_GAMMA);
+}
 
-/* paint_cell — the only place that collapses HDR to display range.
- * Reinhard tone-map → gamma → Bayer dither → 6×6×6 cube + Bourke
- * ramp + A_BOLD/A_DIM. Emissive HDR (channels > 1.0) is fine; Reinhard
- * compresses it to [0, 1) before quantisation. */
-static void paint_cell(int sx, int sy, Vec3 col) {
-  float r = gamma_enc(reinhard(col.x));
-  float g = gamma_enc(reinhard(col.y));
-  float b = gamma_enc(reinhard(col.z));
+/* Squashes a too-bright colour down into what the screen can show: first the
+ * x/(1+x) curve (gently rolls big values toward white instead of clipping), then
+ * a brightness correction for the display. This is the one and only place the
+ * over-bright values get brought back into range. */
+static inline Vec3 tonemap_encode(Vec3 hdr) {
+  return v3(gamma_enc(reinhard(hdr.x)), gamma_enc(reinhard(hdr.y)),
+            gamma_enc(reinhard(hdr.z)));
+}
 
-  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-  float dith = (k_bayer[sy & 3][sx & 3] - 0.5f) * DITHER_AMP;
-  float lum_d = clamp01(luma + dith);
+/* Snaps a 0..1 value to the nearest of `levels` evenly-spaced steps, and reports
+ * back through *err how far the snap missed by — that leftover is what dithering
+ * hands to the neighbouring cells. */
+static inline int quantize_level(float v, int levels, float *err) {
+  int lvl = (int)(v * (float)(levels - 1) + 0.5f);
+  if (lvl < 0)
+    lvl = 0;
+  if (lvl > levels - 1)
+    lvl = levels - 1;
+  *err = v - (float)lvl / (float)(levels - 1);
+  return lvl;
+}
 
-  int pair;
-  if (g_256) {
-    int r5 = (int)(r * 5.f + 0.5f);
-    if (r5 > 5)
-      r5 = 5;
-    if (r5 < 0)
-      r5 = 0;
-    int g5 = (int)(g * 5.f + 0.5f);
-    if (g5 > 5)
-      g5 = 5;
-    if (g5 < 0)
-      g5 = 0;
-    int b5 = (int)(b * 5.f + 0.5f);
-    if (b5 > 5)
-      b5 = 5;
-    if (b5 < 0)
-      b5 = 0;
-    pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
-  } else {
-    pair = PAIR_CUBE_BASE;
+/* Scratch for the dithering: a grid of "leftover error so far" per cell, one
+ * grid for each thing we round — red, green, blue, and overall brightness (which
+ * picks the character). render_scene wipes them each frame, then every cell adds
+ * its rounding miss into the cells it hasn't drawn yet, so gradients dither
+ * smoothly instead of stepping. */
+static float g_err_r[GBUF_MAX_H][GBUF_MAX_W];
+static float g_err_g[GBUF_MAX_H][GBUF_MAX_W];
+static float g_err_b[GBUF_MAX_H][GBUF_MAX_W];
+static float g_err_y[GBUF_MAX_H][GBUF_MAX_W];
+
+/* Hands this cell's rounding leftover to the cells we'll draw next, split with
+ * the classic Floyd–Steinberg weights (7,3,5,1 out of 16):
+ *        .   X   7        (X = this cell, just drawn)
+ *        3   5   1        (the row below)
+ * Only cells ahead of us get a share, so drawing left→right, top→bottom means
+ * each cell has collected all its handed-down error before we reach it. */
+static inline void diffuse_error(float buf[GBUF_MAX_H][GBUF_MAX_W], int sx,
+                                 int sy, int cols, int rows, float err) {
+  if (sx + 1 < cols)
+    buf[sy][sx + 1] += err * (7.f / 16.f);
+  if (sy + 1 < rows) {
+    if (sx - 1 >= 0)
+      buf[sy + 1][sx - 1] += err * (3.f / 16.f);
+    buf[sy + 1][sx] += err * (5.f / 16.f);
+    if (sx + 1 < cols)
+      buf[sy + 1][sx + 1] += err * (1.f / 16.f);
   }
+}
 
-  int idx = (int)(lum_d * (BOURKE_LEN - 1) + 0.5f);
-  if (idx < 0)
-    idx = 0;
-  if (idx >= BOURKE_LEN)
-    idx = BOURKE_LEN - 1;
+/* Turns a red/green/blue step (each 0..5) into the ncurses colour-pair number
+ * for that colour in the 216-colour set. */
+static inline int cube_pair(int r5, int g5, int b5) {
+  return PAIR_CUBE_BASE + r5 * (CUBE_LEVELS * CUBE_LEVELS) + g5 * CUBE_LEVELS +
+         b5;
+}
 
-  /* Bloom halo cells land in luma ≈ 0.05-0.15. A_DIM previously
-   * kicked in there and HALVED their brightness on most terminals
-   * — making the halo nearly invisible despite the bloom math
-   * producing a clean Gaussian. Drop A_DIM so low-luma cells paint
-   * at their actual computed brightness. A_BOLD on the bright orb
-   * stays so it still pops over the halo. */
-  int attr = (luma > 0.85f) ? A_BOLD : A_NORMAL;
+/* Draws one terminal cell from a colour — the last stop in the whole pipeline.
+ * Reads top to bottom: squash the colour into screen range → measure its
+ * brightness → snap red/green/blue to the colour set and brightness to a
+ * character, mixing in the dither leftovers and passing the new leftovers on →
+ * draw it. cols/rows just bound where the leftover error may be pushed. */
+static void paint_cell(int sx, int sy, int cols, int rows, Vec3 col) {
+  Vec3 rgb = tonemap_encode(col);
+  float luma = v3_luma(rgb); /* un-dithered, used for the bold decision below */
+
+  /* snap each value, folding in the error handed down by earlier cells */
+  float er, eg, eb, ey;
+  int r5 = quantize_level(clamp01(rgb.x + g_err_r[sy][sx]), CUBE_LEVELS, &er);
+  int g5 = quantize_level(clamp01(rgb.y + g_err_g[sy][sx]), CUBE_LEVELS, &eg);
+  int b5 = quantize_level(clamp01(rgb.z + g_err_b[sy][sx]), CUBE_LEVELS, &eb);
+  int idx = quantize_level(clamp01(luma + g_err_y[sy][sx]), BOURKE_LEN, &ey);
+
+  /* pass each snap's leftover on to the cells we'll draw next */
+  diffuse_error(g_err_r, sx, sy, cols, rows, er);
+  diffuse_error(g_err_g, sx, sy, cols, rows, eg);
+  diffuse_error(g_err_b, sx, sy, cols, rows, eb);
+  diffuse_error(g_err_y, sx, sy, cols, rows, ey);
+
+  int pair = g_256 ? cube_pair(r5, g5, b5) : PAIR_CUBE_BASE;
+
+  /* Deliberately no "dim" attribute on dark cells: most terminals halve its
+   * brightness, which made the faint bloom halo (brightness ~0.05-0.15) nearly
+   * vanish. Only the bright orb goes bold, so it still pops over its halo. */
+  int attr = (luma > BOLD_LUMA_THRESHOLD) ? A_BOLD : A_NORMAL;
 
   attron(COLOR_PAIR(pair) | attr);
   mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[idx]);
   attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* ── §5 mesh ─────────────────────────────────────────────────────────── */
+/* ── §5 mesh — building the shapes at startup ──────────────────────────── */
 
+/* Vertex — one corner of a triangle, given in the object's own coordinates (the
+ * object's model matrix places it into the world later). Fields:
+ *   pos    — where the corner is (object's own units; meshes are built ~1 wide)
+ *   normal — which way the surface faces here. Points straight out from the
+ *            centre for the sphere (so it looks smooth) and straight out from
+ *            each flat face for the box (so it looks faceted); the lighting
+ *            blends it across the triangle, corner to corner.
+ * No texture coordinates here — this demo doesn't use any images. */
 typedef struct {
   Vec3 pos;
   Vec3 normal;
-  float u, v;
 } Vertex;
+
+/* Triangle — one face, stored as three slot-numbers into its Mesh's vertex list
+ * (so shared corners live once and faces just point at them). Its corners are
+ * listed counter-clockwise as seen from the front; the "don't draw faces turned
+ * away from us" check in rasterize_object relies on that ordering. */
 typedef struct {
   int v[3];
 } Triangle;
+
+/* Mesh — a whole shape: a list of corners plus the triangles that connect them.
+ * Allocated on the heap (one of the allowed mallocs — built once in scene_init,
+ * freed by mesh_free) because each shape needs a different size: a flat quad is
+ * 4 corners / 2 triangles, the sphere far more.
+ *   verts / tris — the owned lists (freed by mesh_free)
+ *   nvert / ntri — how many are filled in; also the write position while building */
 typedef struct {
   Vertex *verts;
   Triangle *tris;
@@ -915,16 +521,17 @@ static void mesh_add_quad(Mesh *m, Vec3 origin, Vec3 e1, Vec3 e2, Vec3 nrm) {
   Vec3 p1 = v3_add(origin, e1);
   Vec3 p2 = v3_add(origin, v3_add(e1, e2));
   Vec3 p3 = v3_add(origin, e2);
-  m->verts[m->nvert++] = (Vertex){p0, nrm, 0.f, 0.f};
-  m->verts[m->nvert++] = (Vertex){p1, nrm, 1.f, 0.f};
-  m->verts[m->nvert++] = (Vertex){p2, nrm, 1.f, 1.f};
-  m->verts[m->nvert++] = (Vertex){p3, nrm, 0.f, 1.f};
+  m->verts[m->nvert++] = (Vertex){p0, nrm};
+  m->verts[m->nvert++] = (Vertex){p1, nrm};
+  m->verts[m->nvert++] = (Vertex){p2, nrm};
+  m->verts[m->nvert++] = (Vertex){p3, nrm};
   m->tris[m->ntri++] = (Triangle){{v0, v0 + 1, v0 + 2}};
   m->tris[m->ntri++] = (Triangle){{v0, v0 + 2, v0 + 3}};
 }
 
-/* tessellate_box — axis-aligned cuboid centred at origin, 24 verts
- * (4 per face × 6 faces) so each face has its own flat normal. */
+/* Builds a box centred on the origin. 24 corners (4 per face × 6 faces) rather
+ * than 8 shared ones, so each face can face its own flat direction and look
+ * crisp instead of rounded. */
 static Mesh tessellate_box(float hx, float hy, float hz) {
   Mesh m;
   m.verts = malloc(24 * sizeof(Vertex));
@@ -957,7 +564,15 @@ static Mesh tessellate_quad(Vec3 origin, Vec3 e1, Vec3 e2, Vec3 nrm) {
   return m;
 }
 
-/* UV sphere with smooth normals (radial outward). */
+/* The sphere's corners sit on a grid of rings (top to bottom) and segments
+ * (around). This finds the slot for one (ring, segment). Each ring keeps one
+ * extra column so the seam where it wraps around lines up cleanly. */
+static inline int sphere_vertex_index(int ring, int seg, int segs) {
+  return ring * (segs + 1) + seg;
+}
+
+/* Builds a ball out of rings and segments, like a globe's lat/long lines, with
+ * each corner facing straight out from the centre so it shades smoothly. */
 static Mesh tessellate_sphere(float radius, int rings, int segs) {
   int n_verts = (rings + 1) * (segs + 1);
   int n_tris = rings * segs * 2;
@@ -977,18 +592,16 @@ static Mesh tessellate_sphere(float radius, int rings, int segs) {
       float z = radius * st * sinf(phi);
       Vec3 pos = v3(x, y, z);
       Vec3 nrm = v3(x / radius, y / radius, z / radius);
-      float u = (float)j / (float)segs;
-      float vv = (float)i / (float)rings;
-      m.verts[m.nvert++] = (Vertex){pos, nrm, u, vv};
+      m.verts[m.nvert++] = (Vertex){pos, nrm};
     }
   }
 
   for (int i = 0; i < rings; i++) {
     for (int j = 0; j < segs; j++) {
-      int v00 = i * (segs + 1) + j;
-      int v10 = (i + 1) * (segs + 1) + j;
-      int v11 = (i + 1) * (segs + 1) + (j + 1);
-      int v01 = i * (segs + 1) + (j + 1);
+      int v00 = sphere_vertex_index(i, j, segs);
+      int v10 = sphere_vertex_index(i + 1, j, segs);
+      int v11 = sphere_vertex_index(i + 1, j + 1, segs);
+      int v01 = sphere_vertex_index(i, j + 1, segs);
       m.tris[m.ntri++] = (Triangle){{v00, v10, v01}};
       m.tris[m.ntri++] = (Triangle){{v10, v11, v01}};
     }
@@ -996,26 +609,140 @@ static Mesh tessellate_sphere(float radius, int rings, int segs) {
   return m;
 }
 
-/* ── §6 G-buffer — geometry pass ─────────────────────────────────────── */
+/* ── named value types · (Material / Camera / SceneObject / PointLight) ── *
+ * A few small types the drawing passes (§6-§9) read. They're defined up here
+ * just because C needs a type written down before it's used. Material, Camera,
+ * and SceneObject describe the scene (the Scene owns them, §10); PointLight is
+ * built fresh each frame inside the lighting pass (§8) and parked here so the
+ * small types sit together. (The big GBuffer type lives next to its use, §6.) */
 
-static Vec3 g_pos[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_normal[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_albedo[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_emissive[GBUF_MAX_H][GBUF_MAX_W]; /* HDR per surface  */
-static float g_zbuf[GBUF_MAX_H][GBUF_MAX_W];    /* NDC z            */
-static float g_z_view[GBUF_MAX_H][GBUF_MAX_W];  /* linear view-z    */
-static uint8_t g_valid[GBUF_MAX_H][GBUF_MAX_W];
+/* Material — what a surface is made of, light-wise: how it bounces light and
+ * whether it gives off any of its own. One per object, fed to the lighting (§8):
+ *   albedo   — its base colour, i.e. how much red/green/blue it bounces back,
+ *              each 0..1 (0 = black, 1 = bounces all of it). Floor ≈ slate
+ *              (0.32,0.36,0.42), cubes ≈ sandstone (0.78,0.62,0.42), orb ≈ dark
+ *              (0.20) since it mostly glows rather than reflects.
+ *   emissive — light the surface gives off by itself, and it's allowed to go
+ *              above 1.0 (brighter than the screen). Added straight in, so it
+ *              shines even with no light on it or in a shadow, and SSAO never
+ *              dims it. Zero for everything but the orb (≈3.2,1.8,0.8); those
+ *              over-1.0 numbers are exactly what bloom grabs (§9). Ref: emissive
+ *              + bloom, LearnOpenGL "Bloom".
+ *   spec     — how shiny it is, 0..1: 1 = glossy, catches a bright hotspot (the
+ *              cubes); 0 = matte (the floor, kept flat so it doesn't look like a
+ *              wet metal plate and steal attention from the cubes and orb). */
+typedef struct {
+  Vec3 albedo;
+  Vec3 emissive;
+  float spec;
+} Material;
 
-static void gbuffer_clear(int cols, int rows) {
+/* Camera — the eye circling the scene, plus the transforms worked out from it.
+ * Only two things are really "set" — the distance and the angle; everything else
+ * is recomputed from them (by camera_rebuild_view / _proj) and is just a cache:
+ *   dist  — how far the eye is from the centre; the +/- keys change it, kept
+ *           within [CAM_DIST_MIN, CAM_DIST_MAX]. Farther back = scene looks
+ *           smaller.
+ *   yaw   — how far around the scene the eye has swung; scene_tick keeps nudging
+ *           it so the view slowly orbits. dist + yaw together place the eye.
+ *   pos   — the eye's actual spot, worked out from dist + yaw; also where the
+ *           shininess highlight is measured from (§8).
+ *   view  — the "look from the eye toward the centre" transform (from m4_lookat).
+ *   proj  — the perspective transform that makes far things smaller (from
+ *           m4_perspective), matched to the screen's shape.
+ *   vp    — view and proj rolled into one, for dropping any world point onto the
+ *           screen (the SSAO test points, the sun marker). */
+typedef struct {
+  float dist;
+  float yaw;
+  Vec3 pos;
+  Mat4 view, proj, vp;
+} Camera;
+
+/* SceneObject — one thing in the scene, with everything needed to draw it kept
+ * together (instead of scattered across separate arrays):
+ *   mesh     — its shape, in its own coordinates (owned; see Mesh)
+ *   material — what it's made of (see Material)
+ *   model    — where to put it in the world. Each frame render_gbuffer combines
+ *              this with the camera to know where it lands on screen. */
+typedef struct {
+  Mesh mesh;
+  Material material;
+  Mat4 model;
+} SceneObject;
+
+/* PointLight — a light that sits at one spot and shines in every direction, here
+ * the glowing orb. Unlike the far-off sun, it gets dimmer with distance
+ * (point_attenuation, §8), so it pools bright nearby and fades out — strong
+ * contrast a coarse terminal shows off well.
+ *   pos        — where it is (the orb's centre)
+ *   color      — its colour, already turned up by its brightness (can exceed 1.0)
+ *   lin, quad  — the two dials that set how fast it fades with distance */
+typedef struct {
+  Vec3 pos;
+  Vec3 color;
+  float lin, quad;
+} PointLight;
+
+/* ── §6 G-buffer — drawing each surface's facts into the tables ────────── */
+
+/* GBuffer — a set of full-screen tables describing the surface seen at each
+ * cell, the heart of "deferred" shading (Saito & Takahashi, SIGGRAPH '90). The
+ * idea: split "WHICH surface shows up at this cell" from "HOW is it lit". We
+ * draw every object ONCE, recording its facts here per cell; then the lighting
+ * pass (§8) goes cell by cell and lights each one from these facts. So lighting
+ * runs once per cell instead of once per (cell × triangle) — and, the reason
+ * this file needs it, SSAO and bloom can read the surface straight off the
+ * screen without touching the 3-D shapes again.
+ *
+ * One table per fact (rather than one fat record per cell) so each pass can run
+ * straight down a single table. All sized to the biggest terminal we support and
+ * read as [row][col]:
+ *   pos      — where the surface point is in the world. Used by SSAO and for
+ *              the shininess highlight.
+ *   normal   — which way the surface faces here (blended across the triangle,
+ *              then re-straightened to unit length).
+ *   albedo   — the surface's base colour here (from its Material).
+ *   emissive — the surface's own glow here (can be >1.0; the orb's is bloom's
+ *              only source, §9).
+ *   spec     — how shiny it is here, 0 matte … 1 glossy.
+ *   zbuf     — how near this cell's surface is, used to keep only the closest:
+ *              a new surface is written only if it's nearer than what's there
+ *              (starts at 1.0 = farthest).
+ *   z_view   — the surface's true distance from the eye. SSAO compares these
+ *              because they grow evenly with distance; the zbuf number doesn't,
+ *              and would skew SSAO's range check.
+ *   valid    — 1 where some object was drawn, 0 for empty background. Every
+ *              later pass skips the empty cells. */
+typedef struct {
+  Vec3 pos[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 normal[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 albedo[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 emissive[GBUF_MAX_H][GBUF_MAX_W]; /* the surface's own glow      */
+  float spec[GBUF_MAX_H][GBUF_MAX_W];    /* shininess 0..1              */
+  float zbuf[GBUF_MAX_H][GBUF_MAX_W];    /* nearness, for keeping closest */
+  float z_view[GBUF_MAX_H][GBUF_MAX_W];  /* true distance from the eye   */
+  uint8_t valid[GBUF_MAX_H][GBUF_MAX_W];
+} GBuffer;
+
+/* The one G-buffer. It's a drawing scratchpad, kept here rather than inside the
+ * Scene because it's wiped and refilled every frame and the scene never reads
+ * it — so the scene and the pixels stay cleanly separate. */
+static GBuffer g_gbuf;
+
+static void gbuffer_clear(GBuffer *gb, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      g_zbuf[r][c] = 1.0f;
-      g_z_view[r][c] = -CAM_FAR;
-      g_valid[r][c] = 0;
+      gb->zbuf[r][c] = 1.0f;
+      gb->z_view[r][c] = -CAM_FAR;
+      gb->valid[r][c] = 0;
     }
   }
 }
 
+/* For a point (px,py) and a triangle, returns three weights saying how much each
+ * corner pulls on that point — they tell us if the point is inside (all three
+ * positive) and how to blend the corners' values there. */
 static void barycentric(const float sx[3], const float sy[3], float px,
                         float py, float b[3]) {
   float d =
@@ -1029,18 +756,41 @@ static void barycentric(const float sx[3], const float sy[3], float px,
   b[2] = 1.f - b[0] - b[1];
 }
 
-/*
- * rasterize_object — vertex transform → perspective divide + cull →
- * barycentric raster + z-test → write full G-buffer including the
- * EMISSIVE channel. Most surfaces have emissive=(0,0,0); the orb's
- * emissive carries the HDR colour that bloom will pick up.
- */
-static void rasterize_object(const Mesh *mesh, Vec3 albedo, Vec3 emissive,
+/* Takes a corner the camera has already transformed and finishes the job: divide
+ * by distance (so farther is smaller), then scale into screen cells. Returns
+ * (screen x, screen y, depth); y is flipped because screen rows count downward
+ * but up should be up. */
+static inline Vec3 project_to_screen(Vec4 clip, int cols, int rows) {
+  float w = clip.w;
+  if (fabsf(w) < 1e-6f)
+    w = 1e-6f;
+  return v3((clip.x / w + 1.f) * 0.5f * (float)cols,
+            (-clip.y / w + 1.f) * 0.5f * (float)rows, clip.z / w);
+}
+
+/* True if this triangle is turned away from us (the back of the shape), so we
+ * can skip drawing it. The trick: measure the triangle's signed area on screen;
+ * with our corner ordering and the y-flip, faces toward us come out negative, so
+ * anything zero-or-positive is facing away. */
+static inline bool is_back_facing(const float sx[3], const float sy[3]) {
+  float area =
+      (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+  return area >= 0.f;
+}
+
+/* Draws one object's triangles into the G-buffer tables. Per triangle: move its
+ * corners onto the screen, drop it if it's behind us or facing away, then for
+ * every cell it covers and is the nearest thing seen so far, record the surface
+ * facts there (position, facing, colour, glow, shininess). The orb's glow is the
+ * one that's above white and that bloom later picks up. */
+static void rasterize_object(GBuffer *gb, const Mesh *mesh, Material mat,
                              Mat4 mvp, Mat4 model, Mat4 modelview,
                              Mat4 norm_mat, int cols, int rows) {
   for (int ti = 0; ti < mesh->ntri; ti++) {
     const Triangle *tri = &mesh->tris[ti];
 
+    /* work out each corner's screen spot, plus its world position, its facing,
+     * and its distance from the eye — the per-cell fill below blends these */
     Vec4 clip[3];
     Vec3 wpos[3], wnrm[3];
     float vz[3];
@@ -1052,79 +802,81 @@ static void rasterize_object(const Mesh *mesh, Vec3 albedo, Vec3 emissive,
       vz[vi] = m4_pt(modelview, v->pos).z;
     }
 
-    if (clip[0].w < 0.001f && clip[1].w < 0.001f && clip[2].w < 0.001f)
+    /* skip a triangle that's entirely behind the camera */
+    if (clip[0].w < CLIP_W_MIN && clip[1].w < CLIP_W_MIN &&
+        clip[2].w < CLIP_W_MIN)
       continue;
 
+    /* finish each corner onto the screen */
     float sx[3], sy[3], sz[3];
     for (int vi = 0; vi < 3; vi++) {
-      float w = clip[vi].w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
-      sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows;
-      sz[vi] = clip[vi].z / w;
+      Vec3 s = project_to_screen(clip[vi], cols, rows);
+      sx[vi] = s.x;
+      sy[vi] = s.y;
+      sz[vi] = s.z;
     }
 
-    /* Back-face cull. Screen Y-flip turns OpenGL CCW front faces
-     * into NEGATIVE signed area; keep negative, reject the rest. */
-    float area =
-        (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (area >= 0.f)
+    if (is_back_facing(sx, sy))
       continue;
 
+    /* the small box of cells the triangle could touch, clipped to the screen */
     int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
     int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
     int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
     int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
 
+    /* walk those cells: is the cell inside the triangle, and is it nearer than
+     * whatever's already there? if so, record this surface's facts */
     for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
       for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
         float b[3];
         barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
         if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
-          continue;
+          continue; /* outside the triangle */
 
         float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
-        if (z >= g_zbuf[py][px])
-          continue;
+        if (z >= gb->zbuf[py][px])
+          continue; /* something nearer is already here */
 
-        g_zbuf[py][px] = z;
-        g_z_view[py][px] = b[0] * vz[0] + b[1] * vz[1] + b[2] * vz[2];
-        g_pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
-        g_normal[py][px] =
+        gb->zbuf[py][px] = z;
+        gb->z_view[py][px] = b[0] * vz[0] + b[1] * vz[1] + b[2] * vz[2];
+        gb->pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
+        gb->normal[py][px] =
             v3_norm(v3_bary(wnrm[0], wnrm[1], wnrm[2], b[0], b[1], b[2]));
-        g_albedo[py][px] = albedo;
-        g_emissive[py][px] = emissive;
-        g_valid[py][px] = 1;
+        gb->albedo[py][px] = mat.albedo;
+        gb->emissive[py][px] = mat.emissive;
+        gb->spec[py][px] = mat.spec;
+        gb->valid[py][px] = 1;
       }
     }
   }
 }
 
-static void render_gbuffer(const Mesh *meshes, const Vec3 *albedos,
-                           const Vec3 *emissives, const Mat4 *models,
-                           int n_objects, Mat4 view, Mat4 proj, int cols,
+static void render_gbuffer(GBuffer *gb, const SceneObject *objects,
+                           int n_objects, const Camera *cam, int cols,
                            int rows) {
-  gbuffer_clear(cols, rows);
+  gbuffer_clear(gb, cols, rows);
   for (int oi = 0; oi < n_objects; oi++) {
-    Mat4 mv = m4_mul(view, models[oi]);
-    Mat4 mvp = m4_mul(proj, mv);
-    Mat4 nmat = m4_normal_mat(models[oi]);
-    rasterize_object(&meshes[oi], albedos[oi], emissives[oi], mvp, models[oi],
-                     mv, nmat, cols, rows);
+    Mat4 mv = m4_mul(cam->view, objects[oi].model);
+    Mat4 mvp = m4_mul(cam->proj, mv);
+    Mat4 nmat = m4_normal_mat(objects[oi].model);
+    rasterize_object(gb, &objects[oi].mesh, objects[oi].material, mvp,
+                     objects[oi].model, mv, nmat, cols, rows);
   }
 }
 
-/* ── §7 ssao ─────────────────────────────────────────────────────────── *
+/* ── §7 ssao · RENDER ─────────────────────────────────────────────────────────── *
  *
- * Same algorithm as ssao_pipeline.c. For each visible pixel sample K
- * directions in the upper hemisphere along N; project each sample
- * back to the screen and ask the depth buffer "is something closer
- * to the camera than my sample?" Average the YES answers → AO ∈ [0,1]
- * darkening factor. 3×3 box blur smooths the per-pixel kernel noise. */
+ * Same idea as ssao_pipeline.c. For each visible cell, scatter a handful of test
+ * points into the air just above the surface, and for each one ask the screen
+ * "is there already something drawn in front of where this floated to?" The more
+ * yes-answers, the more tucked-away the spot is, so the darker we shade it. A
+ * 3×3 average at the end smooths out the speckle from using only a few points. */
 
 static Vec3 k_ssao[SSAO_KERNEL_VARIANTS][SSAO_SAMPLES];
 
+/* A tiny do-it-yourself random number generator (so the test points are the same
+ * every run). lcg_step gives the next number; lcg_unit maps it to 0..1. */
 static unsigned lcg_step(unsigned *s) {
   *s = *s * 1664525u + 1013904223u;
   return *s;
@@ -1133,6 +885,9 @@ static float lcg_unit(unsigned *s) {
   return (lcg_step(s) >> 8) / (float)0x01000000;
 }
 
+/* Picks the SSAO test points once at startup: random directions, then pushed out
+ * to various distances, with most kept close to the surface. Four separate sets
+ * so neighbouring cells can use different ones (see kernel_variant). */
 static void ssao_init_kernel(void) {
   unsigned seed = 0xC0FFEE5Au;
   for (int v = 0; v < SSAO_KERNEL_VARIANTS; v++) {
@@ -1146,7 +901,8 @@ static void ssao_init_kernel(void) {
       } while (len2 > 1.f || len2 < 1e-6f);
       float inv = 1.f / sqrtf(len2);
       float t = (float)i / (float)SSAO_SAMPLES;
-      float scale = 0.1f + 0.9f * t * t; /* bias toward surface */
+      float scale =
+          SSAO_SAMPLE_MIN + (1.f - SSAO_SAMPLE_MIN) * t * t; /* keep most near */
       k_ssao[v][i] = v3_scale(v3(dx * inv, dy * inv, dz * inv), scale);
     }
   }
@@ -1155,43 +911,61 @@ static void ssao_init_kernel(void) {
 static float g_ao[GBUF_MAX_H][GBUF_MAX_W];
 static float g_ao_blur[GBUF_MAX_H][GBUF_MAX_W];
 
-static void ssao_pass(Mat4 vp, int cols, int rows) {
+/* Which of the 4 test-point sets this cell uses, in a 2×2 checker by row/column.
+ * Giving neighbours different sets turns what would be visible stripes into fine
+ * speckle, which the 3×3 average then cleans up. */
+static inline int kernel_variant(int r, int c) {
+  return (c & 1) | ((r & 1) << 1);
+}
+
+/* Flips a test point to the side the surface faces, so it always pokes out into
+ * the open air rather than down into the surface. */
+static inline Vec3 hemisphere_dir(Vec3 dir, Vec3 N) {
+  return v3_dot(dir, N) < 0.f ? v3_neg(dir) : dir;
+}
+
+static void ssao_pass(const GBuffer *gb, const Camera *cam, int cols,
+                      int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
+      if (!gb->valid[r][c]) {
         g_ao[r][c] = 1.f;
         continue;
       }
 
-      Vec3 P = g_pos[r][c];
-      Vec3 N = g_normal[r][c];
-      int variant = (c & 1) | ((r & 1) << 1);
+      Vec3 P = gb->pos[r][c];
+      Vec3 N = gb->normal[r][c];
+      int variant = kernel_variant(r, c);
 
       float occlude_w = 0.f, total_w = 0.f;
       for (int i = 0; i < SSAO_SAMPLES; i++) {
-        Vec3 dir = k_ssao[variant][i];
-        if (v3_dot(dir, N) < 0.f)
-          dir = v3_neg(dir); /* hemisphere */
+        /* float a test point just off the surface */
+        Vec3 dir = hemisphere_dir(k_ssao[variant][i], N);
         Vec3 S = v3_add(P, v3_scale(dir, SSAO_RADIUS));
 
-        Vec4 clip = m4_mul_v4(vp, v4(S.x, S.y, S.z, 1.f));
-        if (clip.w < 0.001f)
+        /* find where that point lands on screen, to see what's drawn there */
+        Vec4 clip = m4_mul_v4(cam->vp, v4(S.x, S.y, S.z, 1.f));
+        if (clip.w < CLIP_W_MIN)
           continue;
         int ix = (int)((clip.x / clip.w + 1.f) * 0.5f * (float)cols);
         int iy = (int)((-clip.y / clip.w + 1.f) * 0.5f * (float)rows);
         if (ix < 0 || ix >= cols || iy < 0 || iy >= rows)
           continue;
-        if (!g_valid[iy][ix])
+        if (!gb->valid[iy][ix])
           continue;
 
-        float dz = fabsf(g_z_view[r][c] - g_z_view[iy][ix]);
+        /* ignore blockers that are way deeper — they're a different surface, not
+         * a nearby nook, so they shouldn't cast a dark halo */
+        float dz = fabsf(gb->z_view[r][c] - gb->z_view[iy][ix]);
         float attn = 1.f - dz / SSAO_RADIUS;
         if (attn <= 0.f)
           continue;
         total_w += attn;
 
+        /* if what's drawn there is nearer than our floated point, the point is
+         * blocked — count it toward the darkening */
         float ndc_z_S = clip.z / clip.w;
-        if (g_zbuf[iy][ix] < ndc_z_S - SSAO_BIAS)
+        if (gb->zbuf[iy][ix] < ndc_z_S - SSAO_BIAS)
           occlude_w += attn;
       }
       float ao = (total_w > 1e-6f) ? (1.f - occlude_w / total_w) : 1.f;
@@ -1200,10 +974,10 @@ static void ssao_pass(Mat4 vp, int cols, int rows) {
   }
 }
 
-static void ssao_blur(int cols, int rows) {
+static void ssao_blur(const GBuffer *gb, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
+      if (!gb->valid[r][c]) {
         g_ao_blur[r][c] = 1.f;
         continue;
       }
@@ -1214,7 +988,7 @@ static void ssao_blur(int cols, int rows) {
           int rr = r + dr, cc = c + dc;
           if (rr < 0 || rr >= rows || cc < 0 || cc >= cols)
             continue;
-          if (!g_valid[rr][cc])
+          if (!gb->valid[rr][cc])
             continue;
           sum += g_ao[rr][cc];
           count++;
@@ -1225,75 +999,119 @@ static void ssao_blur(int cols, int rows) {
   }
 }
 
-/* ── §8 lightpass — Blinn-Phong + emissive (HDR output) ──────────────── *
+/* ── §8 lightpass · RENDER — orb light + sun fill + glow ────────────────────── *
  *
- *   ambient  = AMBIENT · albedo · AO       (AO modulates ambient only)
- *   diffuse  = albedo · sun · max(0, N · L)
- *   spec     = sun · max(0, N · H)^SHININESS · SPEC_GAIN
- *   lit      = ambient + diffuse + spec + EMISSIVE
+ * Adds up the light at each cell:
+ *   ambient — a little base light everywhere, the only part SSAO darkens
+ *   orb     — the warm orb as a real light, fading with distance
+ *   sun     — a dim far-off fill so the orb's shadow side isn't pitch black
+ *   glow    — the surface's own light (the orb), added straight in
  *
- * NOT clamped to [0,1] — emissive can push channels past white, and
- * bloom needs that excess to extract. Tone-mapping happens at paint
- * time only. */
+ * The total is deliberately NOT capped at white — the orb's glow and bright pool
+ * are meant to go over, because that's what bloom feeds on. The squashing-back-
+ * into-range happens later, at paint time. */
 static Vec3 g_light[GBUF_MAX_H][GBUF_MAX_W];
 
-static void render_lightpass(Vec3 cam_pos, bool ssao_enabled, int cols,
-                             int rows) {
-  Vec3 sun_dir = v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
-  Vec3 sun_col = v3(SUN_COL[0], SUN_COL[1], SUN_COL[2]);
+/* How much a point light dims at distance d — strong up close, weaker far away.
+ * The leading 1 keeps it sane when something is right on top of the light. */
+static inline float point_attenuation(float d, float lin, float quad) {
+  return 1.f / (1.f + lin * d + quad * d * d);
+}
+
+/* Works out the colour of one surface cell: base light + the orb's light + the
+ * dim sun + the surface's own glow. Left un-capped so the glow and the bright
+ * pool can go over white for bloom to catch. The orb's light fades with distance
+ * (a pool that falls off); the sun is a steady dim fill so faces turned away from
+ * the orb still show their shape. SSAO only dims the base light; the glow is
+ * added raw, so the orb stays bright even though it faces away from its own
+ * light. Ref: Blinn-Phong highlight (Blinn, '77). */
+static Vec3 shade_surface(Vec3 P, Vec3 N, Material mat, float ao, Vec3 cam_pos,
+                          const PointLight *key, Vec3 fill_L, Vec3 fill_col,
+                          Vec3 ambient) {
+  /* base light — present everywhere; the only part SSAO darkens */
+  Vec3 amb = v3(ambient.x * mat.albedo.x * ao, ambient.y * mat.albedo.y * ao,
+                ambient.z * mat.albedo.z * ao);
+
+  /* the orb's light — brighter the more the surface faces it, fading with how
+   * far away the orb is */
+  Vec3 to_light = v3_sub(key->pos, P);
+  float dist = v3_len(to_light);
+  Vec3 L = v3_scale(to_light, 1.f / fmaxf(dist, 1e-4f));
+  float atten = point_attenuation(dist, key->lin, key->quad);
+  float kdiff = fmaxf(0.f, v3_dot(N, L)) * atten;
+  Vec3 dif = v3(mat.albedo.x * key->color.x * kdiff,
+                mat.albedo.y * key->color.y * kdiff,
+                mat.albedo.z * key->color.z * kdiff);
+
+  Vec3 V = v3_norm(v3_sub(cam_pos, P));
+  Vec3 H = v3_norm(v3_add(L, V));
+  /* the shiny hotspot, only on glossy surfaces: 0 → matte floor, 1 → glossy cube */
+  float kspec =
+      powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN * atten * mat.spec;
+  Vec3 sp =
+      v3(key->color.x * kspec, key->color.y * kspec, key->color.z * kspec);
+
+  /* the dim sun, so the side away from the orb isn't solid black */
+  float fdiff = fmaxf(0.f, v3_dot(N, fill_L));
+  Vec3 fil = v3(mat.albedo.x * fill_col.x * fdiff,
+                mat.albedo.y * fill_col.y * fdiff,
+                mat.albedo.z * fill_col.z * fdiff);
+
+  return v3(amb.x + dif.x + sp.x + fil.x + mat.emissive.x,
+            amb.y + dif.y + sp.y + fil.y + mat.emissive.y,
+            amb.z + dif.z + sp.z + fil.z + mat.emissive.z);
+}
+
+static void render_lightpass(const GBuffer *gb, const Camera *cam,
+                             bool ssao_enabled, int cols, int rows) {
+  /* the orb as a warm light that fades with distance */
+  PointLight key = {.pos = v3(ORB_CX, ORB_CY, ORB_CZ),
+                    .color = v3(POINT_LIGHT_COL[0] * POINT_LIGHT_INTENSITY,
+                                POINT_LIGHT_COL[1] * POINT_LIGHT_INTENSITY,
+                                POINT_LIGHT_COL[2] * POINT_LIGHT_INTENSITY),
+                    .lin = POINT_ATTEN_LINEAR,
+                    .quad = POINT_ATTEN_QUAD};
+
+  /* the dim sun: one direction and colour shared by the whole frame */
+  Vec3 fill_L = v3_norm(v3_neg(v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2])));
+  Vec3 fill_col = v3(SUN_COL[0] * FILL_GAIN, SUN_COL[1] * FILL_GAIN,
+                     SUN_COL[2] * FILL_GAIN);
   Vec3 ambient = v3(AMBIENT_COL[0], AMBIENT_COL[1], AMBIENT_COL[2]);
-  Vec3 L = v3_norm(v3_neg(sun_dir));
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
-        g_light[r][c] = v3(0, 0, 0);
+      if (!gb->valid[r][c]) {
+        g_light[r][c] = v3(0, 0, 0); /* background stays black */
         continue;
       }
 
-      Vec3 P = g_pos[r][c];
-      Vec3 N = g_normal[r][c];
-      Vec3 albedo = g_albedo[r][c];
-      Vec3 emit = g_emissive[r][c];
+      Material mat = {.albedo = gb->albedo[r][c],
+                      .emissive = gb->emissive[r][c],
+                      .spec = gb->spec[r][c]};
       float ao = ssao_enabled ? g_ao_blur[r][c] : 1.f;
 
-      Vec3 amb = v3(ambient.x * albedo.x * ao, ambient.y * albedo.y * ao,
-                    ambient.z * albedo.z * ao);
-
-      float diff = fmaxf(0.f, v3_dot(N, L));
-      Vec3 dif = v3(albedo.x * sun_col.x * diff, albedo.y * sun_col.y * diff,
-                    albedo.z * sun_col.z * diff);
-
-      Vec3 V = v3_norm(v3_sub(cam_pos, P));
-      Vec3 H = v3_norm(v3_add(L, V));
-      float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN;
-      Vec3 sp = v3(sun_col.x * spec, sun_col.y * spec, sun_col.z * spec);
-
-      /* HDR output — emissive can push past 1.0 per channel. */
-      g_light[r][c] =
-          v3(amb.x + dif.x + sp.x + emit.x, amb.y + dif.y + sp.y + emit.y,
-             amb.z + dif.z + sp.z + emit.z);
+      g_light[r][c] = shade_surface(gb->pos[r][c], gb->normal[r][c], mat, ao,
+                                    cam->pos, &key, fill_L, fill_col, ambient);
     }
   }
 }
 
-/* ── §9 bloom — extract → blur → composite ───────────────────────────── *
+/* ── §9 bloom · RENDER — pull out the bright bits, blur, add back ─────────────── *
  *
- * Four small passes, each one statement-per-step:
+ * The glow, in four little passes:
  *
- *   bloom_extract(threshold) — copy bright pixels of g_light into
- *     g_bloom; everything below threshold becomes (0, 0, 0).
+ *   bloom_extract — copy only the over-bright pixels into a side buffer;
+ *     everything dimmer becomes black.
  *
- *   bloom_blur_h() / bloom_blur_v() — 1-D Gaussian along x then y.
- *     Separable: 2-D blur via two 1-D passes is mathematically
- *     equivalent to a 2-D blur with a square kernel, but cheap.
+ *   bloom_blur_h / bloom_blur_v — smear that side buffer sideways, then up/down.
+ *     Doing it in two one-direction passes gives the same result as one big
+ *     2-D blur but is much cheaper.
  *
- *   bloom_composite(intensity) — add INTENSITY · g_bloom back into
- *     g_light. Now g_light contains the original lit pixels plus a
- *     soft halo around each bright source. */
+ *   bloom_composite — add the blurred glow back on top of the lit image. Now
+ *     each bright source wears a soft halo. */
 
-static Vec3 g_bloom[GBUF_MAX_H][GBUF_MAX_W];     /* current bloom buffer */
-static Vec3 g_bloom_tmp[GBUF_MAX_H][GBUF_MAX_W]; /* horizontal-pass scratch */
+static Vec3 g_bloom[GBUF_MAX_H][GBUF_MAX_W];     /* the glow buffer */
+static Vec3 g_bloom_tmp[GBUF_MAX_H][GBUF_MAX_W]; /* scratch between the two blurs */
 
 static void bloom_extract(float threshold, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
@@ -1304,8 +1122,8 @@ static void bloom_extract(float threshold, int cols, int rows) {
   }
 }
 
-/* Clamp a coordinate to [0, max-1] so the kernel sampling at the
- * screen edge duplicates the boundary value (no halo cut-off). */
+/* Keeps a coordinate inside the screen, so a blur reaching off the edge just
+ * reuses the edge pixel instead of running off and clipping the halo. */
 static inline int clamp_ix(int v, int max) {
   return v < 0 ? 0 : (v >= max ? max - 1 : v);
 }
@@ -1348,18 +1166,24 @@ static void bloom_composite(float intensity, int cols, int rows) {
   }
 }
 
-/* ── §10 scene ───────────────────────────────────────────────────────── */
+/* ── §10 scene — the world and the camera ──────────────────────────────── */
 
+/* Scene — everything about WHAT we're showing and HOW the viewer is steering it,
+ * in one place. It holds only the scene itself — the big drawing buffers live
+ * elsewhere as their own globals — so reading Scene tells you about the world,
+ * not the pixels. Only scene_init, scene_tick, and the keypress handler write it;
+ * the drawing passes never do.
+ *   objects          — the things in the scene, in fixed order: floor, cube A,
+ *                      cube B, orb (the N_OBJECTS list, §1.7)
+ *   camera           — the orbiting eye
+ *   bloom_on/ssao_on — the b / a on-off switches; render_frame checks them to
+ *                      skip those effects when off (which is how you compare)
+ *   paused           — when true, the orbit freezes (space toggles it)
+ *   scene_cols/_rows — how many cells the scene gets: the full width, and the
+ *                      height minus the few rows saved at the bottom for the HUD */
 typedef struct {
-  Mesh meshes[N_OBJECTS];
-  Vec3 albedos[N_OBJECTS];
-  Vec3 emissives[N_OBJECTS];
-  Mat4 models[N_OBJECTS];
-
-  Mat4 view, proj, vp;
-  Vec3 cam_pos;
-  float cam_dist;
-  float cam_yaw;
+  SceneObject objects[N_OBJECTS];
+  Camera camera;
 
   bool bloom_on;
   bool ssao_on;
@@ -1368,78 +1192,123 @@ typedef struct {
   int scene_rows;
 } Scene;
 
-static void scene_rebuild_proj(Scene *s, int cols, int rows) {
+/* Rebuilds the perspective so the scene isn't stretched — it accounts for the
+ * screen's shape and that terminal cells are taller than they are wide. */
+static void camera_rebuild_proj(Camera *cam, int cols, int rows) {
   float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
-  s->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
+  cam->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 }
 
-static void scene_rebuild_view(Scene *s) {
-  float r = s->cam_dist;
-  s->cam_pos = v3(sinf(s->cam_yaw) * r, CAM_EYE_Y, cosf(s->cam_yaw) * r);
-  s->view = m4_lookat(s->cam_pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
-  s->vp = m4_mul(s->proj, s->view);
+/* Moves the eye to its spot on the orbit (from distance + angle) and refreshes
+ * the look-from-here transforms. Call after the projection is set, so the
+ * combined one picks it up. */
+static void camera_rebuild_view(Camera *cam) {
+  float r = cam->dist;
+  cam->pos = v3(sinf(cam->yaw) * r, CAM_EYE_Y, cosf(cam->yaw) * r);
+  cam->view = m4_lookat(cam->pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
+  cam->vp = m4_mul(cam->proj, cam->view);
 }
 
-/* scene_init — floor + 2 cubes + 1 emissive orb. The orb is the
- * only object with non-zero emissive; bloom feeds on its HDR pixels. */
+/* Builds the scene: a floor, two cubes, and the glowing orb. The orb is the only
+ * thing that glows on its own, and that glow is what bloom feeds on. */
 static void scene_init(Scene *s, int total_cols, int total_rows) {
   for (int i = 0; i < N_OBJECTS; i++)
-    mesh_free(&s->meshes[i]);
+    mesh_free(&s->objects[i].mesh);
 
   memset(s, 0, sizeof *s);
   s->scene_cols = total_cols;
   s->scene_rows = total_rows - HUD_ROWS;
   s->bloom_on = true;
   s->ssao_on = true;
-  s->cam_dist = CAM_DIST;
-  s->cam_yaw = 0.f;
+  s->camera.dist = CAM_DIST;
+  s->camera.yaw = 0.f;
 
-  s->meshes[OBJ_FLOOR] = tessellate_quad(
+  s->objects[OBJ_FLOOR].mesh = tessellate_quad(
       v3(-FLOOR_HALF_X, 0.f, FLOOR_HALF_Z), v3(2 * FLOOR_HALF_X, 0.f, 0.f),
       v3(0.f, 0.f, -2 * FLOOR_HALF_Z), v3(0.f, 1.f, 0.f));
-  s->albedos[OBJ_FLOOR] = v3(0.32f, 0.36f, 0.42f); /* dark slate */
-  s->emissives[OBJ_FLOOR] = v3(0, 0, 0);
-  s->models[OBJ_FLOOR] = m4_identity();
+  s->objects[OBJ_FLOOR].material =
+      (Material){.albedo = v3(0.32f, 0.36f, 0.42f), /* dark slate */
+                 .emissive = v3(0, 0, 0),
+                 .spec = 0.f}; /* matte: no metallic highlight on the floor */
+  s->objects[OBJ_FLOOR].model = m4_identity();
 
-  s->meshes[OBJ_CUBE_A] = tessellate_box(CUBE_HALF, CUBE_HALF, CUBE_HALF);
-  s->albedos[OBJ_CUBE_A] = v3(0.78f, 0.62f, 0.42f); /* sandstone  */
-  s->emissives[OBJ_CUBE_A] = v3(0, 0, 0);
-  s->models[OBJ_CUBE_A] = m4_translate(CUBE_A_CX, CUBE_A_CY, CUBE_A_CZ);
+  s->objects[OBJ_CUBE_A].mesh = tessellate_box(CUBE_HALF, CUBE_HALF, CUBE_HALF);
+  s->objects[OBJ_CUBE_A].material =
+      (Material){.albedo = v3(0.78f, 0.62f, 0.42f), /* sandstone */
+                 .emissive = v3(0, 0, 0),
+                 .spec = 1.f}; /* glossy: cubes catch the orb's highlight */
+  s->objects[OBJ_CUBE_A].model = m4_translate(CUBE_A_CX, CUBE_A_CY, CUBE_A_CZ);
 
-  s->meshes[OBJ_CUBE_B] = tessellate_box(CUBE_HALF, CUBE_HALF, CUBE_HALF);
-  s->albedos[OBJ_CUBE_B] = v3(0.78f, 0.62f, 0.42f);
-  s->emissives[OBJ_CUBE_B] = v3(0, 0, 0);
-  s->models[OBJ_CUBE_B] = m4_translate(CUBE_B_CX, CUBE_B_CY, CUBE_B_CZ);
+  s->objects[OBJ_CUBE_B].mesh = tessellate_box(CUBE_HALF, CUBE_HALF, CUBE_HALF);
+  s->objects[OBJ_CUBE_B].material =
+      (Material){.albedo = v3(0.78f, 0.62f, 0.42f),
+                 .emissive = v3(0, 0, 0),
+                 .spec = 1.f};
+  s->objects[OBJ_CUBE_B].model = m4_translate(CUBE_B_CX, CUBE_B_CY, CUBE_B_CZ);
 
-  s->meshes[OBJ_ORB] = tessellate_sphere(ORB_RADIUS, ORB_RINGS, ORB_SEGS);
-  s->albedos[OBJ_ORB] = v3(0.20f, 0.20f, 0.20f); /* mostly emit */
-  s->emissives[OBJ_ORB] = v3(ORB_EMISSIVE[0], ORB_EMISSIVE[1], ORB_EMISSIVE[2]);
-  s->models[OBJ_ORB] = m4_translate(ORB_CX, ORB_CY, ORB_CZ);
+  s->objects[OBJ_ORB].mesh = tessellate_sphere(ORB_RADIUS, ORB_RINGS, ORB_SEGS);
+  s->objects[OBJ_ORB].material =
+      (Material){.albedo = v3(0.20f, 0.20f, 0.20f), /* mostly emit */
+                 .emissive = v3(ORB_EMISSIVE[0], ORB_EMISSIVE[1], ORB_EMISSIVE[2]),
+                 .spec = 0.f}; /* emissive source; its surface stays matte */
+  s->objects[OBJ_ORB].model = m4_translate(ORB_CX, ORB_CY, ORB_CZ);
 
-  scene_rebuild_proj(s, total_cols, s->scene_rows);
-  scene_rebuild_view(s);
+  camera_rebuild_proj(&s->camera, total_cols, s->scene_rows);
+  camera_rebuild_view(&s->camera);
 }
 
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
-  s->cam_yaw += CAM_ORBIT_RAD_PER_SEC * dt;
-  scene_rebuild_view(s);
+  s->camera.yaw += CAM_ORBIT_RAD_PER_SEC * dt;
+  camera_rebuild_view(&s->camera);
 }
 
-/* ── §11 screen — render_scene + HUD ─────────────────────────────────── */
+/* ── §11 screen — painting the frame, the marker, and the HUD ──────────── */
 
-static void render_scene(const Scene *s) {
-  int cols = s->scene_cols;
-  int rows = s->scene_rows;
+static void render_scene(const GBuffer *gb, int cols, int rows) {
+  int C = cols < GBUF_MAX_W ? cols : GBUF_MAX_W;
+  int R = rows < GBUF_MAX_H ? rows : GBUF_MAX_H;
 
-  for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
-    for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c])
+  /* wipe the dither leftovers so each frame starts fresh — otherwise last
+   * frame's error would faintly ghost into this one */
+  memset(g_err_r, 0, sizeof g_err_r);
+  memset(g_err_g, 0, sizeof g_err_g);
+  memset(g_err_b, 0, sizeof g_err_b);
+  memset(g_err_y, 0, sizeof g_err_y);
+
+  /* go left→right, top→bottom — the order the dither hands its error forward */
+  for (int r = 0; r < R; r++) {
+    for (int c = 0; c < C; c++) {
+      if (!gb->valid[r][c])
         continue;
-      paint_cell(c, r, g_light[r][c]);
+      paint_cell(c, r, C, R, g_light[r][c]);
     }
   }
+}
+
+/* Drops a little '*' in the sky to show where the dim sun is shining from — just
+ * a visual aid, since the sun has a direction but nowhere you can point at. (The
+ * orb light you can already see; this is only for the fill.) Drawn on top of the
+ * scene and not part of the lighting or bloom. */
+static void sun_marker_draw(const Camera *cam, int cols, int rows) {
+  Vec3 to_sun = v3_norm(v3_neg(v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2])));
+  Vec3 world =
+      v3_add(v3(0.f, CAM_LOOK_Y, 0.f), v3_scale(to_sun, SUN_MARKER_DIST));
+
+  Vec4 clip = m4_mul_v4(cam->vp, v4(world.x, world.y, world.z, 1.f));
+  if (clip.w < 0.001f)
+    return;
+  int sx = (int)((clip.x / clip.w + 1.f) * 0.5f * (float)cols);
+  int sy = (int)((-clip.y / clip.w + 1.f) * 0.5f * (float)rows);
+  if (sx < 0 || sx >= cols || sy < 0 || sy >= rows)
+    return;
+
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvaddch(sy, sx, (chtype)(unsigned char)'*');
+  if (sx + 5 < cols)
+    mvprintw(sy, sx + 1, "sun");
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
 static void hud_draw(const Scene *s, double fps) {
@@ -1448,13 +1317,13 @@ static void hud_draw(const Scene *s, double fps) {
 
   int total_tris = 0;
   for (int i = 0; i < N_OBJECTS; i++)
-    total_tris += s->meshes[i].ntri;
+    total_tris += s->objects[i].mesh.ntri;
 
   char status[160];
   snprintf(status, sizeof status,
            " %5.1f fps  bloom:%s  ssao:%s  zoom:%.1f  tris:%d  %s ", fps,
            s->bloom_on ? "ON " : "OFF", s->ssao_on ? "ON " : "OFF",
-           (double)s->cam_dist, total_tris, s->paused ? "PAUSED" : "running");
+           (double)s->camera.dist, total_tris, s->paused ? "PAUSED" : "running");
   int slen = (int)strlen(status);
   if (slen > cols)
     slen = cols;
@@ -1487,8 +1356,46 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §12 app ─────────────────────────────────────────────────────────── */
+/* Runs the whole drawing pipeline for one frame, in order, each step feeding the
+ * next: record the surfaces, (optionally) work out the SSAO shadows, light
+ * everything, then (optionally) add the bloom glow. Reads the scene but changes
+ * only the drawing buffers, never the scene itself. */
+static void render_frame(const Scene *s) {
+  GBuffer *gb = &g_gbuf;
+  render_gbuffer(gb, s->objects, N_OBJECTS, &s->camera, s->scene_cols,
+                 s->scene_rows);
 
+  if (s->ssao_on) {
+    ssao_pass(gb, &s->camera, s->scene_cols, s->scene_rows);
+    ssao_blur(gb, s->scene_cols, s->scene_rows);
+  }
+
+  render_lightpass(gb, &s->camera, s->ssao_on, s->scene_cols, s->scene_rows);
+
+  if (s->bloom_on) {
+    bloom_extract(BLOOM_THRESHOLD, s->scene_cols, s->scene_rows);
+    bloom_blur_h(s->scene_cols, s->scene_rows);
+    bloom_blur_v(s->scene_cols, s->scene_rows);
+    bloom_composite(BLOOM_INTENSITY, s->scene_cols, s->scene_rows);
+  }
+}
+
+/* ── §12 app — setup, the main loop, and keypresses ────────────────────── */
+
+/* App — the whole running program: the scene plus the bits the main loop and the
+ * signal handlers need. It's not part of the 3-D world — it's the process — and
+ * it exists as one shared object (g_app) so the signal handlers can reach it
+ * without being handed a pointer.
+ *   scene                 — the scene we're drawing (see Scene)
+ *   total_cols/total_rows — the full terminal size; the HUD takes a few rows at
+ *                           the bottom and the scene gets the rest.
+ *   running               — the main loop keeps going while this is set; cleared
+ *                           by Ctrl-C / kill or the q/ESC key.
+ *   need_resize           — set when the terminal is resized, handled at the top
+ *                           of the next frame (re-measure and rebuild the scene).
+ * running/need_resize are marked volatile sig_atomic_t because a signal can set
+ * them at any moment, and that tells the compiler to always read/write them for
+ * real rather than optimise the access away. */
 typedef struct {
   Scene scene;
   int total_cols;
@@ -1552,47 +1459,22 @@ static bool app_handle_key(App *app, int ch) {
     break;
   case '=':
   case '+':
-    s->cam_dist -= CAM_ZOOM_STEP;
-    if (s->cam_dist < CAM_DIST_MIN)
-      s->cam_dist = CAM_DIST_MIN;
-    scene_rebuild_view(s);
+    s->camera.dist -= CAM_ZOOM_STEP;
+    if (s->camera.dist < CAM_DIST_MIN)
+      s->camera.dist = CAM_DIST_MIN;
+    camera_rebuild_view(&s->camera);
     break;
   case '-':
   case '_':
-    s->cam_dist += CAM_ZOOM_STEP;
-    if (s->cam_dist > CAM_DIST_MAX)
-      s->cam_dist = CAM_DIST_MAX;
-    scene_rebuild_view(s);
+    s->camera.dist += CAM_ZOOM_STEP;
+    if (s->camera.dist > CAM_DIST_MAX)
+      s->camera.dist = CAM_DIST_MAX;
+    camera_rebuild_view(&s->camera);
     break;
   default:
     break;
   }
   return true;
-}
-
-/*
- * One-frame pipeline. Reads as plain pseudocode — each named pass
- * does exactly what its name says, conditionally, in dependency
- * order. SSAO blur depends on SSAO pass; lightpass depends on the
- * G-buffer (and optionally on AO); bloom depends on lightpass.
- */
-static void render_frame(const Scene *s) {
-  render_gbuffer(s->meshes, s->albedos, s->emissives, s->models, N_OBJECTS,
-                 s->view, s->proj, s->scene_cols, s->scene_rows);
-
-  if (s->ssao_on) {
-    ssao_pass(s->vp, s->scene_cols, s->scene_rows);
-    ssao_blur(s->scene_cols, s->scene_rows);
-  }
-
-  render_lightpass(s->cam_pos, s->ssao_on, s->scene_cols, s->scene_rows);
-
-  if (s->bloom_on) {
-    bloom_extract(BLOOM_THRESHOLD, s->scene_cols, s->scene_rows);
-    bloom_blur_h(s->scene_cols, s->scene_rows);
-    bloom_blur_v(s->scene_cols, s->scene_rows);
-    bloom_composite(BLOOM_INTENSITY, s->scene_cols, s->scene_rows);
-  }
 }
 
 int main(void) {
@@ -1617,11 +1499,13 @@ int main(void) {
 
   while (app->running) {
 
+    /* handle a terminal resize if one happened */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
     }
 
+    /* how long since last frame (capped, so a hiccup doesn't lurch the orbit) */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
@@ -1629,8 +1513,10 @@ int main(void) {
       dt = DT_CAP_NS;
     float dt_sec = (float)dt / (float)NS_PER_SEC;
 
+    /* advance the scene (just nudges the camera's orbit) */
     scene_tick(&app->scene, dt_sec);
 
+    /* update the fps readout and wait to hold a steady frame rate */
     fps_cnt++;
     fps_acc += dt;
     if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1642,20 +1528,23 @@ int main(void) {
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
 
+    /* draw the frame: run the pipeline, paint it, add the marker and HUD */
     Scene *s = &app->scene;
     erase();
     render_frame(s);
-    render_scene(s);
+    render_scene(&g_gbuf, s->scene_cols, s->scene_rows);
+    sun_marker_draw(&s->camera, s->scene_cols, s->scene_rows);
     hud_draw(s, fps_display);
     screen_present();
 
+    /* handle a keypress (pause / reset / toggles / zoom / quit) */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;
   }
 
   for (int i = 0; i < N_OBJECTS; i++)
-    mesh_free(&app->scene.meshes[i]);
+    mesh_free(&app->scene.objects[i].mesh);
 
   endwin();
   return 0;

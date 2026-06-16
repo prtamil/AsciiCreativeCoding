@@ -1,560 +1,23 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * neon_edges.c — Tron-style edge glow via Sobel + bloom
+ * neon_edges.c — Tron-style glowing outlines on dark shapes
  *
- * DEMO: Three low-poly platonic-style shapes — a cube, a tetrahedron,
- *       and an octahedron — float on a near-black floor in deep
- *       atmosphere. Their surfaces are barely lit (the scene is
- *       intentionally dark), but their SILHOUETTES and CREASE EDGES
- *       glow bright cyan, with a soft halo bleeding outward. Each
- *       shape spins slowly on its own axis as the camera orbits.
+ * A cube, a tetrahedron, and an octahedron drift on a near-black floor, barely
+ * lit — but their outlines and the creases between their faces glow bright cyan
+ * with a soft halo, while the camera orbits and each shape slowly spins. The
+ * trick: draw the scene normally into per-pixel tables, then hunt for cells
+ * where depth jumps suddenly (an outline against empty space) or the surface
+ * suddenly faces a new direction (a crease) — paint those with a bright colour
+ * and let the bloom blur spread the glow.
  *
- *       The glow comes from a Sobel filter applied to the G-buffer's
- *       depth + normal channels: any pixel whose neighbours have a
- *       big depth jump (silhouette) or a big normal change (crease)
- *       is flagged as an edge. The edge mask drives a HDR neon
- *       colour into a side buffer, that buffer gets added to the lit
- *       output, and the existing bloom pipeline does the rest.
- *
- *       Press 'e' to toggle edge detection — the shapes go dark
- *       outside their dim direct-lit areas, and you see what the
- *       algorithm contributes. Press 'b' to toggle bloom — edges
- *       become hard-pixel lines without the soft glow.
- *
- * Study alongside:
- *   raster/bloom_finale.c                — same lightpass + bloom pipeline
- *   raster/ssao_pipeline.c               — same G-buffer (with z_view)
- *   raster/deferred_rendering_pipeline.c — same MVP setup
- *
- * Section map:
- *   §1  config     — frame, view, scene, edge, bloom, lighting, ramp
- *   §2  clock      — monotonic timer + sleep
- *   §3  math       — V3, V4, Mat4 + perspective / lookat
- *   §4  paint      — 216-pair RGB cube + Bourke ramp + paint_cell
- *   §5  mesh       — Vertex / Triangle types + box / tetra / octa / quad
- *   §6  gbuffer    — geometry pass (pos, normal, albedo, depth, view-z)
- *   §7  edge       — Sobel on z_view + normal → g_edge (HDR neon)
- *   §8  lightpass  — Blinn-Phong + g_edge (HDR output)
- *   §9  bloom      — extract → separable Gaussian (H + V) → composite
- *   §10 scene      — Scene struct, init / view / tick (per-object spin)
- *   §11 screen     — render_scene + HUD (CLAUDE.md spec)
- *   §12 app        — signals, resize, fixed-step main loop
- *
- * Keys:
- *   e / E     toggle edge detection on/off
- *   b / B     toggle bloom on/off
- *   + / =     zoom in
- *   - / _     zoom out
- *   space     pause / resume rotation + camera orbit
- *   r / R     reset
- *   q / ESC   quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raster/neon_edges.c -o neon -lncurses -lm
+ * Keys: e edges on/off · b bloom on/off · +/- zoom · space pause · r reset · q quit
+ * Read raster/bloom_finale.c first — same lighting + bloom; this adds the edge
+ * step in front. Sister files: ssao_pipeline.c (same depth tables),
+ * deferred_rendering_pipeline.c (same camera setup).
+ * Ideas from: the Sobel edge filter (Sobel & Feldman, 1968); screen-space
+ *   outlines (Mitchell et al., GDC 2007); Reinhard tone-map (SIGGRAPH '02).
+ * Build: gcc -std=c11 -O2 -Wall -Wextra raster/neon_edges.c -o neon -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Screen-space edge detection via Sobel filter on the
- *                  G-buffer, fed into the bloom pipeline. Sobel is a
- *                  3×3 image convolution that approximates the spatial
- *                  gradient of a scalar field; large gradient = edge.
- *                  We run it on TWO sources: linear view-space z (to
- *                  catch silhouettes against the void), and each
- *                  component of the world normal (to catch creases
- *                  where adjacent faces meet at an angle). Combine
- *                  the two magnitudes, smooth-threshold, multiply by
- *                  a HDR neon colour. The bloom pipeline then bleeds
- *                  it into a soft glow.
- *
- * Data-structure : Existing G-buffer (g_pos, g_normal, g_albedo,
- *                  g_zbuf, g_z_view, g_valid) + one new HDR buffer
- *                  g_edge holding the neon colour per pixel + the
- *                  bloom buffers (g_bloom, g_bloom_tmp). All static.
- *
- * Rendering      : Per frame:
- *                    1. render_gbuffer  — pos / normal / albedo /
- *                                         NDC-z / view-z / valid
- *                    2. edge_pass       — Sobel → g_edge (HDR)
- *                    3. render_lightpass — dim Blinn-Phong + g_edge
- *                    4. bloom_extract → bloom_blur_h → bloom_blur_v
- *                       → bloom_composite
- *                    5. paint_cell — Reinhard tone-map collapses HDR
- *
- * Performance    : Edge pass is O(pixels × 9 reads × 4 channels) =
- *                  trivial at terminal resolution. Bloom is the same
- *                  cost as bloom_finale.c.
- *
- * References     : Sobel & Feldman, "A 3×3 Isotropic Gradient
- *                    Operator for Image Processing," talk at SAIL
- *                    (1968). The original Sobel filter.
- *                  Mitchell et al., "Real-Time Rendering Tricks for
- *                    Ambient Occlusion and Edge Detection," GDC 2007.
- *                  James & O'Rorke, "Real-Time Glow," GPU Gems (2004).
- *                  LearnOpenGL, "Bloom" tutorial:
- *                    https://learnopengl.com/Advanced-Lighting/Bloom
- *                  Reinhard et al., "Photographic Tone Reproduction
- *                    for Digital Images," SIGGRAPH '02.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Don't model edge geometry. Detect edges in the IMAGE after the
- * scene is rendered. Two things define a visual edge: a place where
- * depth jumps suddenly (silhouette) or where the surface normal
- * suddenly flips (crease between two faces). Both show up as a high
- * spatial gradient in the G-buffer. Sobel measures that gradient in
- * one cheap convolution; threshold it; colour the result; let bloom
- * bleed it into a glow.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine running your finger across the depth buffer. On a smooth
- * surface, the depth slides under your finger smoothly — small
- * derivative. At a silhouette, the depth abruptly drops to the void
- * (or the next surface) — large derivative. At a crease, the normal
- * flips abruptly — large derivative on the normal field. Sobel is
- * just "compute that derivative magnitude per pixel". Bright where
- * the derivative is large = exactly the edges.
- *
- *      ┌──────────────────────────────────────────────┐
- *      │  flat surface       silhouette       crease  │
- *      │                                              │
- *      │   ── ── ──         ── ──        ────┐        │
- *      │                          ╲             ╲     │
- *      │                           ╲              ╲   │
- *      │                                                  │
- *      │  ∇z ≈ 0          ∇z = HUGE        ∇z small  │
- *      │  ∇N ≈ 0          ∇N = small       ∇N = HUGE │
- *      └──────────────────────────────────────────────┘
- *
- * DRAWING METHOD  /  ALGORITHM IN STEPS
- * ─────────────────────────────────────
- *  1. G-BUFFER PASS — pos / normal / albedo / NDC-z / view-z. View-z
- *     is the linear depth Sobel needs (NDC-z is non-linear after
- *     perspective and would skew the gradient).
- *
- *  2. EDGE PASS — for each visible pixel (r, c):
- *       a. Sample 3×3 neighbourhood of view-z. If any neighbour has
- *          g_valid=0, treat it as -CAM_FAR — that creates a HUGE
- *          gradient at silhouettes against the void.
- *       b. depth_grad = magnitude of Sobel on view-z.
- *       c. For each normal component (Nx, Ny, Nz): take the Sobel
- *          magnitude, sum.
- *       d. edge = max(depth_grad · DEPTH_SCALE,
- *                     normal_grad · NORMAL_SCALE)
- *       e. t = smoothstep(THRESHOLD, THRESHOLD + KNEE, edge)
- *       f. g_edge[r][c] = NEON · t · INTENSITY
- *
- *  3. LIGHT PASS — dim Blinn-Phong:
- *       lit = ambient·albedo + albedo·sun·max(0, N·L)
- *           + sun·spec_falloff
- *           + g_edge[r][c]                 ← HDR edge contribution
- *     Sun + ambient are intentionally dim, so the EDGES dominate the
- *     visual energy. lit is HDR — the bloom pipeline expects that.
- *
- *  4. BLOOM — extract pixels above THRESHOLD, separable Gaussian
- *     blur, composite. Same as bloom_finale.c.
- *
- *  5. PAINT — Reinhard tone-map + 6×6×6 cube + Bourke ramp.
- *
- * KEY FORMULAS
- * ────────────
- *   Sobel kernels (3×3):
- *     Sx = | -1  0  1 |     Sy = | -1 -2 -1 |
- *          | -2  0  2 |          |  0  0  0 |
- *          | -1  0  1 |          |  1  2  1 |
- *
- *   gx = Σ Sx_ij · field_neighbour_ij
- *   gy = Σ Sy_ij · field_neighbour_ij
- *   |∇field| = sqrt(gx² + gy²)
- *
- *   Edge magnitude:
- *     depth_e   = |∇ z_view|
- *     normal_e  = |∇ N.x| + |∇ N.y| + |∇ N.z|
- *     edge      = max(depth_e · DEPTH_SCALE, normal_e · NORMAL_SCALE)
- *
- *   Smooth threshold:
- *     t = clamp01((edge − THRESHOLD) / KNEE)
- *     t = t² · (3 − 2t)             (smoothstep)
- *
- *   Edge buffer:
- *     g_edge = NEON_COLOR · t · INTENSITY
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Linear depth, NOT NDC-z — NDC-z is non-linear after perspective
- *     and gives spurious gradients on receding flat surfaces. We use
- *     g_z_view (linear, in view space) for Sobel.
- *
- *   • Invalid neighbours — at the silhouette, a 3×3 neighbourhood
- *     straddles the object boundary; some samples fall on g_valid=0
- *     pixels (the void). Substituting -CAM_FAR for those creates a
- *     large depth jump → silhouette correctly detected.
- *
- *   • Subdivision crease noise — a smooth surface tessellated into
- *     many flat triangles has small normal jumps at every triangle
- *     boundary. NORMAL_SCALE × THRESHOLD must reject those. Tuned
- *     here so only "hard" creases (~30°+ between faces) trigger.
- *
- *   • Bloom threshold — must be below the dim ambient + diffuse
- *     baseline so it ONLY fires on edges, not on faintly-lit faces.
- *     Set just below NEON · INTENSITY so even partial edges glow.
- *
- *   • Ambient must stay LOW or the scene drowns the edges. Tron
- *     atmosphere = near-black canvas, glowing wireframe. We use
- *     AMBIENT ~ 0.03 — almost zero.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Toggle 'e' off: shapes go nearly invisible (only the dim
- *     Blinn-Phong remains). The bright cyan outlines and creases
- *     vanish — that's exactly the edge detection's contribution.
- *
- *   • Toggle 'b' off: edges become hard pixel-precise lines, no
- *     soft halo. Toggle on: a 3-cell-wide cyan glow blooms outward.
- *
- *   • Pause (space): cube creases stay sharp, octahedron silhouette
- *     traces its 8 outward triangle edges, tetrahedron shows its
- *     four faces' creases. Each face of each shape has constant
- *     normal, so the FACE INTERIORS don't trigger — only the
- *     boundaries between faces.
- *
- *   • Watch a face rotate edge-on to the camera: depth gradient
- *     near the silhouette grows large → silhouette glow. Watch a
- *     face rotate to face the camera directly: silhouette is now
- *     at the perimeter of a flat disc, normal gradient near zero
- *     in the interior → only the rim glows.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read raster/bloom_finale.c first if you don't yet
- *      know the bloom (extract → blur → composite) pipeline; this
- *      file ADDS an edge stage in front of the bloom rather than
- *      replacing it.
- *   2. §1 config — every constant has a unit-bearing comment.
- *      Note the SCALE / THRESHOLD / KNEE triple — those are the
- *      knobs that decide WHAT counts as an edge.
- *   3. §7 edge — the Sobel pass. THE HEART of this file. Read
- *      AFTER tutorials T1-T4. The G-buffer it reads is identical
- *      to ssao_pipeline.c's; the buffer it writes (g_edge) is
- *      consumed only by §8 lightpass.
- *   4. §6 gbuffer — same forward rasteriser as everywhere else.
- *      Skim if you've seen cube_raster.c.
- *   5. §8 lightpass + §9 bloom — read AFTER bloom_finale.c.
- *      The only addition here is the line that adds g_edge into
- *      the lit HDR sum.
- *   6. §3 math + §4 paint + §10-§12 — infrastructure; skip on
- *      first read.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   g_z_view[r][c]      LINEAR view-space depth (positive = away).
- *                       Sobel must run on this, NOT on g_zbuf
- *                       (which is non-linear NDC-z).
- *   g_valid[r][c]       1 = a triangle wrote here this frame, 0 =
- *                       background (void).
- *   g_edge[r][c]        HDR cyan colour added to the lit output;
- *                       0 = no edge.
- *   gx, gy              Sobel x/y partial sums for one channel.
- *   depth_grad          √(gx² + gy²) on z_view.
- *   normal_grad         sum of three √(gx² + gy²) on Nx, Ny, Nz.
- *   edge                Combined gradient before threshold.
- *   t                   smoothstep((edge − THRESHOLD) / KNEE).
- *
- * Background you need
- * ───────────────────
- *   - The G-buffer pattern (deferred_rendering_pipeline.c).
- *   - Convolution: a kernel (3×3 weights) applied at every pixel
- *     to produce a new pixel.
- *   - Bloom basics (bloom_finale.c) — extract → Gaussian blur →
- *     composite.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Stencil-buffer outline tricks. Those operate during the
- *     forward pass and require multiple draws per object; we do
- *     it once in screen space.
- *   - Geometry shader / inverted-hull outlines. Same — those
- *     require GPU geometry-stage features we don't have.
- *   - The full Canny edge-detection pipeline (Sobel + non-max
- *     suppression + double threshold + hysteresis). We use only
- *     Sobel — for real-time stylised edges that's enough.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Eight tutorials that build screen-space edge detection from
- * first principles.
- *
- *   T1  Two kinds of edges — silhouette and crease
- *   T2  Why screen-space edge detection at all
- *   T3  The Sobel kernel — what those numbers MEAN
- *   T4  Combining depth and normal gradients
- *   T5  Linear depth (z_view) vs. non-linear depth (z_NDC)
- *   T6  The void problem — borrowing -CAM_FAR for invalid samples
- *   T7  Smooth thresholding — why a hard cut-off looks bad
- *   T8  Plugging into bloom — edges as HDR contributors
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  TWO KINDS OF EDGES — SILHOUETTE AND CREASE
- * ──────────────────────────────────────────────
- * A pencil sketch of a cube has two visually distinct line types:
- *
- *   SILHOUETTE   the outline against the empty page — separates
- *                "object" from "no object." Crosses the boundary
- *                between cube depth and infinite background depth.
- *
- *   CREASE       the lines BETWEEN faces. The depth varies
- *                smoothly across a crease (small jump), but the
- *                surface ORIENTATION (normal) flips sharply.
- *
- * A robust outline detector must catch BOTH. One signal can't
- * cover both because:
- *
- *   - Silhouette has huge depth jump, small normal change at the
- *     boundary (you're sliding off into the void).
- *   - Crease has small depth jump, huge normal change.
- *
- * Solution: run two detectors and combine them with `max`. Any
- * pixel that hits either condition gets glow.
- *
- *      ┌─────────────────────────────────────────────────────┐
- *      │                                                     │
- *      │       silhouette                  crease            │
- *      │                                                     │
- *      │       ┌────────                  ┌─────             │
- *      │       │  cube                    │face1│            │
- *      │       │ (foreground)             │     │            │
- *      │       │                          ├─ ─ ─┤            │
- *      │       │                          │face2│            │
- *      │       └────────                  └─────             │
- *      │                                                     │
- *      │  ∇z = HUGE                  ∇z ≈ 0                  │
- *      │  ∇N ≈ 0                     ∇N = HUGE               │
- *      └─────────────────────────────────────────────────────┘
- *
- * T2  WHY SCREEN-SPACE EDGE DETECTION AT ALL
- * ──────────────────────────────────────────
- * Several other ways to draw outlines exist:
- *
- *   GEOMETRIC      For each silhouette edge in 3-D, find adjacent
- *                  triangles, test whether one faces the camera and
- *                  the other away, draw a line in 3-D. Heavy CPU
- *                  topology work; per-frame; fragile under deforming
- *                  meshes.
- *
- *   INVERTED HULL  Draw the model twice: a slightly-fat black copy
- *                  with reversed winding, then the normal model on
- *                  top. The black halo peeks out at silhouettes.
- *                  Cheap but only does silhouettes; no creases.
- *
- *   STENCIL        Mark pixels covered by the model in the stencil
- *                  buffer; expand the mark by one pixel; XOR with
- *                  the original. Same constraint — silhouettes only.
- *
- *   SCREEN-SPACE   Render the scene normally → look at the resulting
- *                  G-buffer → find pixels where depth or normal
- *                  changes fast → tag those pixels.
- *
- * Screen-space wins on three axes for our use case:
- *
- *   1. ONE pass for everything in the scene, regardless of mesh
- *      complexity or topology.
- *   2. Catches BOTH silhouettes and creases for free (just look at
- *      different G-buffer channels).
- *   3. Works downstream of the regular pipeline — every other shader
- *      stays unchanged.
- *
- * Cost: nine G-buffer reads per pixel (the 3×3 neighbourhood).
- * Trivial.
- *
- * T3  THE SOBEL KERNEL — WHAT THOSE NUMBERS MEAN
- * ──────────────────────────────────────────────
- * Sobel is a 3×3 convolution that approximates the spatial gradient.
- * Two kernels — one for x, one for y:
- *
- *     Sx = | -1  0  +1 |       Sy = | -1 -2 -1 |
- *          | -2  0  +2 |            |  0  0  0 |
- *          | -1  0  +1 |            | +1 +2 +1 |
- *
- * To apply Sx at pixel p, you take its 8 neighbours + itself, weight
- * each by the kernel, sum:
- *
- *     gx = -1·NW + 0·N + 1·NE
- *          -2·W  + 0·P + 2·E
- *          -1·SW + 0·S + 1·SE
- *
- * Read in plain English: "how much darker is the LEFT side than the
- * RIGHT side, with the MIDDLE row counting double?" That's the rate
- * of change in x. Sy does the same vertically.
- *
- * Why double the middle? Two reasons:
- *
- *   - The middle row is on the same y-line as P; it gives the most
- *     direct measurement of the x-gradient AT P.
- *   - The corner samples are √2 farther from P than the edge
- *     samples; downweighting them by 2× compensates for the larger
- *     distance, making the response approximately rotationally
- *     invariant.
- *
- * The combined gradient magnitude is √(gx² + gy²) — Pythagorean
- * length of the gradient vector.
- *
- * Sobel is just one specific 3×3 derivative kernel. Variants
- * (Prewitt, Scharr) tweak the weights for slightly different
- * isotropy properties. For our purpose Sobel is plenty.
- *
- * T4  COMBINING DEPTH AND NORMAL GRADIENTS
- * ────────────────────────────────────────
- * We compute four Sobel magnitudes per pixel:
- *
- *     |∇ z_view|     ← scalar, one number
- *     |∇ Nx|         ← Sobel on the X component of the world normal
- *     |∇ Ny|
- *     |∇ Nz|
- *
- * The depth gradient gives silhouettes. The three normal gradients
- * combine into one number:
- *
- *     normal_grad = |∇ Nx| + |∇ Ny| + |∇ Nz|
- *
- * (This is the L¹ norm of the per-component gradient. Could equally
- * use L²; L¹ is cheaper and slightly noisier — fine here.)
- *
- * Final edge magnitude is the bigger of the two:
- *
- *     edge = max(depth_grad  · DEPTH_SCALE,
- *                normal_grad · NORMAL_SCALE)
- *
- * The two SCALE constants exist because the two signals have
- * incomparable units. depth_grad is in view-space units (≈ scene
- * size). normal_grad is dimensionless (normals are unit length).
- * The scales are tuned so a "real" silhouette and a "real" crease
- * produce roughly the same edge magnitude — that way one
- * THRESHOLD value works for both.
- *
- * T5  LINEAR DEPTH (z_view) VS. NON-LINEAR DEPTH (z_NDC)
- * ──────────────────────────────────────────────────────
- * The G-buffer has TWO depth fields:
- *
- *   g_zbuf[r][c]      NDC z, in [-1, +1]. Used by the rasteriser
- *                     for z-test. After perspective divide, NDC z
- *                     is HEAVILY non-linear: 90% of the [-1, +1]
- *                     range is occupied by the near 10% of the
- *                     scene. Tiny depth changes near the camera
- *                     produce huge NDC changes; large depth
- *                     changes far away produce tiny NDC changes.
- *
- *   g_z_view[r][c]    Linear view-space z, in scene units. A
- *                     surface 1 unit farther always reads 1 unit
- *                     bigger.
- *
- * Sobel needs LINEAR. Otherwise:
- *
- *   - A flat floor receding into the distance has zero real depth
- *     gradient (it's flat) but a NON-zero NDC-z gradient (NDC is
- *     non-linear). Sobel on NDC-z would draw bright lines along
- *     receding floor stripes — false silhouettes everywhere.
- *
- *   - A real silhouette at the back of the scene has small NDC-z
- *     change (because the non-linearity has already saturated at
- *     the far plane). Sobel on NDC-z would miss it.
- *
- * Linear z_view solves both. Cost: one extra float per G-buffer
- * pixel.
- *
- * T6  THE VOID PROBLEM — BORROWING -CAM_FAR FOR INVALID SAMPLES
- * ─────────────────────────────────────────────────────────────
- * At a silhouette, the 3×3 neighbourhood STRADDLES the object
- * boundary. Some samples land on the object (g_valid = 1, real
- * z_view), others fall on the empty background (g_valid = 0, no
- * real depth — never written to).
- *
- * If we feed 0.0 in for the void samples, Sobel sees a TINY depth
- * jump and the silhouette doesn't trigger. If we feed +∞, the
- * gradient overflows. The fix is to substitute a SENTINEL value
- * that is both far away and finite:
- *
- *     z_void = -CAM_FAR
- *
- * (Negative because in our convention, view-space looks down -Z,
- * so a far point has z_view < 0.)
- *
- * Now the silhouette pixel sees neighbours at depth roughly equal
- * to its own actual depth on one side, and at -CAM_FAR on the
- * other. The Sobel sum is enormous → silhouette correctly flagged.
- *
- * Same trick for the normal field: void neighbours contribute a
- * sentinel normal (we use (0, 0, 0)), creating a gradient at the
- * boundary. The exact sentinel doesn't matter much for the normal
- * — any value distinct from the surface normal triggers detection.
- *
- * T7  SMOOTH THRESHOLDING — WHY A HARD CUT-OFF LOOKS BAD
- * ──────────────────────────────────────────────────────
- * After computing edge magnitude, we want a per-pixel "edge-ness"
- * in [0, 1]. The naïve approach is a hard cut-off:
- *
- *     t = (edge >= THRESHOLD) ? 1 : 0
- *
- * This produces aliased, jagged edges — every pixel is either
- * fully glowing or fully off. At the boundary you'd see 1-pixel
- * stair-stepping.
- *
- * SMOOTHSTEP softens the transition over a small range:
- *
- *     x = clamp01((edge − THRESHOLD) / KNEE)
- *     t = x² · (3 − 2x)               ← Hermite ease curve
- *
- * Now t ramps from 0 (below threshold) through 0.5 (at midpoint)
- * to 1 (well past threshold). Visually: edges fade in over KNEE
- * units of magnitude, eliminating the binary stair-step.
- *
- * KNEE is the WIDTH of the transition zone. Wide KNEE = soft, ramp-
- * like edges. Narrow KNEE = sharp but anti-aliased. Tuned here so
- * the transition is just wide enough to hide single-pixel aliasing
- * without losing sharpness.
- *
- * T8  PLUGGING INTO BLOOM — EDGES AS HDR CONTRIBUTORS
- * ────────────────────────────────────────────────────
- * The lightpass for this scene is intentionally DIM:
- *
- *     ambient ≈ 0.03 (very low)
- *     diffuse + spec lit by a weak sun
- *     lit_total = ambient·albedo + sun·albedo·max(0, N·L) + ...
- *
- * Add the edge contribution at the END:
- *
- *     lit_total += g_edge[r][c]
- *
- * g_edge is HDR — its components can exceed 1.0. The bloom
- * pipeline (see bloom_finale.c T6) extracts pixels above its own
- * threshold and Gaussian-blurs them. Because the surfaces are
- * dim, only edge pixels exceed bloom threshold, and the bleed
- * traces the outline.
- *
- * Composition: the soft cyan halo around each shape is the bloom
- * stage doing its normal job on a HDR signal that happens to be
- * concentrated along screen-space edges. None of the bloom code
- * is changed from bloom_finale.c — only the source of the bright
- * pixels is.
- *
- * Toggling 'b' OFF leaves the edge contribution but skips the
- * blur stage — you see hard pixel-precise lines. Toggling 'e'
- * OFF skips the edge stage entirely — only the dim Phong lighting
- * remains. The pair gives a clean A/B for what each stage adds.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -585,14 +48,16 @@ enum {
 #define NS_PER_MS 1000000LL
 #define DT_CAP_NS (100 * NS_PER_MS)
 
-/* §1.2 G-buffer dimensions (static; sized for a large terminal). */
+/* §1.2 size of the per-pixel tables — fixed (no malloc), big enough for a large
+ * terminal; anything past the edge is skipped. */
 #define GBUF_MAX_W 300
 #define GBUF_MAX_H 80
 
-/* §1.3 view geometry — eye orbits the scene. */
+/* §1.3 the orbiting camera. */
 #define CAM_FOV (55.0f * (float)M_PI / 180.0f)
 #define CAM_NEAR 0.1f
 #define CAM_FAR 50.0f
+#define NEAR_W_EPS 0.001f /* a corner closer to the eye than this is behind it */
 
 #define CAM_DIST 5.5f
 #define CAM_DIST_MIN 3.0f
@@ -605,35 +70,23 @@ enum {
 #define CELL_W 8
 #define CELL_H 16
 
-/* §1.4 lighting — intentionally DIM so edges dominate.
- *
- * Tron atmosphere: near-black canvas with glowing wireframe. If
- * AMBIENT or SUN_COL push too high, the dim faces compete with the
- * edges and the demo loses its aesthetic punch. Keep both well
- * under 0.2 per channel. */
+/* §1.4 lighting — kept deliberately dim. The whole look is a near-black scene
+ * with glowing outlines; if the sun or the fill light get too bright the lit
+ * faces start competing with the glow. Keep every channel well under 0.2. */
 static const float SUN_DIR[3] = {-0.55f, -0.65f, 0.30f};
 static const float SUN_COL[3] = {0.10f, 0.12f, 0.14f};
 static const float AMBIENT_COL[3] = {0.03f, 0.04f, 0.06f};
 #define SHININESS 24.0f
 #define SPEC_GAIN 0.20f
 
-/* §1.5 edge detection
- *
- * NEON_COLOR is HDR (channels exceed 1.0). On a fully-lit edge
- * pixel, g_edge = NEON_COLOR · INTENSITY = (0.75, 3.0, 3.75) for
- * the cyan default — well above 1.0 → bloom triggers.
- *
- * THRESHOLD/KNEE shape the smoothstep that turns the raw gradient
- * magnitude into a [0, 1] edge factor:
- *   edge ≤ THRESHOLD              → t = 0   (no glow)
- *   edge ≥ THRESHOLD + KNEE       → t = 1   (full glow)
- *   in between                    → smooth interpolation
- *
- * DEPTH_SCALE/NORMAL_SCALE balance the two signals. Silhouettes
- * naturally produce huge depth gradients (because the Sobel sample
- * outside the silhouette is -CAM_FAR), so DEPTH_SCALE can stay
- * small. Creases produce normal gradients of order 1; NORMAL_SCALE
- * scales those into the threshold range. */
+/* §1.5 edge glow. NEON_COLOR is deliberately over-bright (channels above 1.0)
+ * so a finished edge sails past the bloom threshold and gets a halo.
+ *   THRESHOLD / KNEE — how strong a depth-or-crease jump has to be before it
+ *     counts as an edge, and how gently the glow fades in around that cutoff
+ *     (a soft fade hides single-pixel stair-stepping).
+ *   DEPTH_SCALE / NORMAL_SCALE — the two edge signals come in different units,
+ *     so each is scaled until a real outline and a real crease end up about
+ *     equally bright and one threshold works for both. */
 static const float NEON_COLOR[3] = {0.50f, 2.00f, 2.50f};
 #define EDGE_INTENSITY 1.50f
 #define EDGE_THRESHOLD 0.75f
@@ -641,11 +94,8 @@ static const float NEON_COLOR[3] = {0.50f, 2.00f, 2.50f};
 #define DEPTH_SCALE 0.05f
 #define NORMAL_SCALE 0.40f
 
-/* §1.6 bloom parameters
- *
- * Same separable Gaussian as bloom_finale.c. Threshold low enough
- * that any partially-lit edge bleeds; intensity high enough that
- * the halo extends a few cells past the edge. */
+/* §1.6 bloom — the soft halo. Threshold low enough that even a faint edge
+ * bleeds; intensity high enough that the glow reaches a few cells out. */
 #define BLOOM_THRESHOLD 0.90f
 #define BLOOM_INTENSITY 1.50f
 #define BLOOM_RADIUS 3
@@ -653,12 +103,8 @@ static const float NEON_COLOR[3] = {0.50f, 2.00f, 2.50f};
 static const float BLOOM_KERNEL[BLOOM_TAPS] = {
     0.0702f, 0.1311f, 0.1907f, 0.2161f, 0.1907f, 0.1311f, 0.0702f};
 
-/* §1.7 scene geometry — three low-poly platonic-style shapes.
- *
- *               (cube)        (tetrahedron)      (octahedron)
- *                ▢                ▲                  ◆
- *           ──────────────────────────────────────────────
- *                              floor (near-black)              */
+/* §1.7 where each shape sits and how big it is — a cube, a tetrahedron, and an
+ * octahedron spaced left to right on the floor. */
 #define FLOOR_HALF_X 3.0f
 #define FLOOR_HALF_Z 3.0f
 
@@ -685,13 +131,15 @@ enum {
   N_OBJECTS,
 };
 
-/* §1.8 character ramp — Paul Bourke 92-char density ladder. */
+/* §1.8 characters ordered faint-to-dense, so brightness picks a glyph: a space
+ * for near-black up to '@' for the brightest cells (Paul Bourke's ramp). */
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
-/* §1.9 Bayer 4×4 dither. */
+/* §1.9 a 4×4 grid of dither thresholds. Nudging each cell's brightness by its
+ * grid value before picking a glyph stops smooth gradients from banding. */
 static const float k_bayer[4][4] = {
     {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
     {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
@@ -699,13 +147,16 @@ static const float k_bayer[4][4] = {
     {15 / 16.f, 7 / 16.f, 13 / 16.f, 5 / 16.f},
 };
 #define DITHER_AMP 0.10f
+#define LUMA_BOLD_ABOVE 0.85f /* glyph drawn A_BOLD above this brightness */
+#define LUMA_DIM_BELOW 0.15f  /* glyph drawn A_DIM below this brightness  */
 
-/* §1.10 ncurses pair IDs — 216 cube + yellow HUD + cyan hint. */
+/* §1.10 colour-pair slots: the 216 RGB-cube colours, plus the HUD's yellow and
+ * the hint line's cyan. */
 #define PAIR_CUBE_BASE 1
 #define PAIR_HUD 217
 #define PAIR_HINT 218
 
-/* ── §2 clock ────────────────────────────────────────────────────────── */
+/* ── §2 clock — a steady timer and a sleep, for pacing frames ────────── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -721,7 +172,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ── §3 math (V3, V4, Mat4) ──────────────────────────────────────────── */
+/* ── §3 math — 3-D vectors and 4×4 matrices, the usual graphics toolkit ─ */
 
 typedef struct {
   float x, y, z;
@@ -810,7 +261,8 @@ static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
   return m;
 }
 
-/* m4_lookat — standard glm convention (cross(forward, up)). */
+/* Builds the camera's view from where it sits (eye), what it looks at, and which
+ * way is up — the standard glm recipe. */
 static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   Vec3 f = v3_norm(v3_sub(at, eye));
   Vec3 r = v3_norm(v3(f.y * up.z - f.z * up.y, f.z * up.x - f.x * up.z,
@@ -833,6 +285,9 @@ static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   return m;
 }
 
+/* When a shape is rotated or scaled, the little "which way the surface faces"
+ * arrows can't ride the same matrix or they'd stop being square to the surface.
+ * This builds the corrected matrix for them (the inverse-transpose). */
 static Mat4 m4_normal_mat(Mat4 m) {
   Mat4 n = m4_identity();
   n.m[0][0] = m.m[1][1] * m.m[2][2] - m.m[1][2] * m.m[2][1];
@@ -875,7 +330,7 @@ static Mat4 m4_rotate_y(float a) {
   return m;
 }
 
-/* ── §4 paint (216 RGB cube + Bourke ramp) ───────────────────────────── */
+/* ── §4 paint — turn an HDR colour into one coloured terminal character ─ */
 
 static int g_256;
 
@@ -902,60 +357,74 @@ static inline float clamp01(float x) {
 static inline float reinhard(float x) { return x / (1.f + x); }
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
 
+/* How bright a colour looks to the eye (green counts most, blue least). */
+static inline float rec709_luma(float r, float g, float b) {
+  return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+/* Snap one colour channel (0..1) to one of the 216-cube's 6 steps (0..5). */
+static inline int quantize_unit_to_5(float x) {
+  int q = (int)(x * 5.f + 0.5f);
+  return q < 0 ? 0 : (q > 5 ? 5 : q);
+}
+
+/* ncurses pair for the nearest 216-cube colour to `col` (gamma-encoded
+ * channels), or the single white fallback pair on an 8-colour terminal. */
+static int cube_pair(float r, float g, float b) {
+  if (!g_256)
+    return PAIR_CUBE_BASE;
+  return PAIR_CUBE_BASE + quantize_unit_to_5(r) * 36 + quantize_unit_to_5(g) * 6 +
+         quantize_unit_to_5(b);
+}
+
+/* Pick the Bourke ramp character for a brightness (0..1): faint chars for dim
+ * cells, dense chars for bright ones. */
+static inline int ramp_index(float luma) {
+  int idx = (int)(luma * (BOURKE_LEN - 1) + 0.5f);
+  return idx < 0 ? 0 : (idx >= BOURKE_LEN ? BOURKE_LEN - 1 : idx);
+}
+
 static void paint_cell(int sx, int sy, Vec3 col) {
+  /* bring each HDR channel into displayable 0..1 range (roll off, then gamma) */
   float r = gamma_enc(reinhard(col.x));
   float g = gamma_enc(reinhard(col.y));
   float b = gamma_enc(reinhard(col.z));
 
-  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  /* nudge brightness with an ordered dither so neighbours don't all snap to the
+   * same glyph */
+  float luma = rec709_luma(r, g, b);
   float dith = (k_bayer[sy & 3][sx & 3] - 0.5f) * DITHER_AMP;
-  float lum_d = clamp01(luma + dith);
+  float luma_dithered = clamp01(luma + dith);
 
-  int pair;
-  if (g_256) {
-    int r5 = (int)(r * 5.f + 0.5f);
-    if (r5 > 5)
-      r5 = 5;
-    if (r5 < 0)
-      r5 = 0;
-    int g5 = (int)(g * 5.f + 0.5f);
-    if (g5 > 5)
-      g5 = 5;
-    if (g5 < 0)
-      g5 = 0;
-    int b5 = (int)(b * 5.f + 0.5f);
-    if (b5 > 5)
-      b5 = 5;
-    if (b5 < 0)
-      b5 = 0;
-    pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
-  } else {
-    pair = PAIR_CUBE_BASE;
-  }
-
-  int idx = (int)(lum_d * (BOURKE_LEN - 1) + 0.5f);
-  if (idx < 0)
-    idx = 0;
-  if (idx >= BOURKE_LEN)
-    idx = BOURKE_LEN - 1;
-
-  int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
+  int pair = cube_pair(r, g, b);
+  int glyph = ramp_index(luma_dithered); /* character from the dithered value */
+  int attr = (luma > LUMA_BOLD_ABOVE)  ? A_BOLD /* bold/dim from the true value */
+             : (luma < LUMA_DIM_BELOW) ? A_DIM
+                                       : A_NORMAL;
 
   attron(COLOR_PAIR(pair) | attr);
-  mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[idx]);
+  mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[glyph]);
   attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* ── §5 mesh ─────────────────────────────────────────────────────────── */
+/* ── §5 mesh — build each shape's triangles once, at startup ──────────── */
 
+/* One corner of a triangle: where it is, which way the surface faces there, and
+ * a texture coordinate we carry along but don't really use. */
 typedef struct {
   Vec3 pos;
   Vec3 normal;
   float u, v;
 } Vertex;
+
+/* One triangle, as three positions into the mesh's vertex array. */
 typedef struct {
   int v[3];
 } Triangle;
+
+/* A whole shape: its corners and the triangles joining them. Both arrays are
+ * malloc'd once when the shape is built and freed by mesh_free; nvert / ntri are
+ * how many of each are actually filled in. */
 typedef struct {
   Vertex *verts;
   Triangle *tris;
@@ -982,13 +451,10 @@ static void mesh_add_quad(Mesh *m, Vec3 origin, Vec3 e1, Vec3 e2, Vec3 nrm) {
   m->tris[m->ntri++] = (Triangle){{v0, v0 + 2, v0 + 3}};
 }
 
-/*
- * tessellate_polyhedron — given an array of unique vertex positions
- * and an array of triangle face indices (CCW from outside), produce
- * a Mesh with one FLAT face normal per triangle. Each face writes 3
- * fresh vertices so adjacent faces don't share a normal — exactly
- * what we want for crease detection.
- */
+/* Builds a faceted shape from its corner points and a list of triangles. Each
+ * triangle gets its own three fresh corners so neighbouring faces never share a
+ * facing direction — that hard break is exactly what makes the creases between
+ * faces light up. Caller frees the returned mesh with mesh_free. */
 static Mesh tessellate_polyhedron(const Vec3 *verts, int n_verts,
                                   const int (*faces)[3], int n_faces) {
   (void)n_verts;
@@ -1037,12 +503,8 @@ static Mesh tessellate_box(float hx, float hy, float hz) {
   return m;
 }
 
-/*
- * tessellate_tetrahedron — regular tetrahedron centred at origin,
- * each face has its own flat normal. 4 faces, 4 sharp creases.
- *   verts: alternating corners of the (±1, ±1, ±1) cube with even
- *          parity (signs multiply to +1).
- */
+/* A 4-sided pyramid (tetrahedron) centred on the origin. Its corners are four
+ * alternating corners of a cube, which happen to be evenly spaced. */
 static Mesh tessellate_tetrahedron(float r) {
   float s = r / sqrtf(3.f);
   Vec3 verts[4] = {
@@ -1060,11 +522,8 @@ static Mesh tessellate_tetrahedron(float r) {
   return tessellate_polyhedron(verts, 4, faces, 4);
 }
 
-/*
- * tessellate_octahedron — 6 axis-point vertices, 8 triangular faces
- * (one per octant). Each face has its own flat normal pointing
- * outward in (sx, sy, sz) direction.
- */
+/* An 8-faced diamond (octahedron): one point sticking out along each direction
+ * of each axis, with a triangle filling in each of the eight corners between. */
 static Mesh tessellate_octahedron(float r) {
   Vec3 verts[6] = {
       v3(r, 0, 0), v3(-r, 0, 0), /* 0=+X, 1=-X */
@@ -1088,25 +547,65 @@ static Mesh tessellate_quad(Vec3 origin, Vec3 e1, Vec3 e2, Vec3 nrm) {
   return m;
 }
 
-/* ── §6 G-buffer — geometry pass ─────────────────────────────────────── */
+/* SceneObject — one thing in the scene: its shape, its colour, where it sits +
+ * how it is turned, and how it spins. model is rebuilt from spin_angle each tick
+ * (the floor has spin_speed 0, so it never turns). The Scene owns an array of
+ * these (§10); defined here because it bundles a Mesh and the geometry pass
+ * needs the type. */
+typedef struct {
+  Mesh mesh;        /* geometry, built once at init (freed by scene_init) */
+  Vec3 albedo;      /* flat surface colour                                */
+  Mat4 model;       /* where it sits in the world (rebuilt each tick)     */
+  float spin_angle; /* current spin angle (radians)                       */
+  float spin_speed; /* spin rate (rad/s; 0 = static, e.g. the floor)      */
+} SceneObject;
 
-static Vec3 g_pos[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_normal[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3 g_albedo[GBUF_MAX_H][GBUF_MAX_W];
-static float g_zbuf[GBUF_MAX_H][GBUF_MAX_W];
-static float g_z_view[GBUF_MAX_H][GBUF_MAX_W]; /* linear, for Sobel */
-static uint8_t g_valid[GBUF_MAX_H][GBUF_MAX_W];
+/* ── §6 G-buffer — draw the shapes once into per-cell tables ──────────── */
 
-static void gbuffer_clear(int cols, int rows) {
+/* One big set of tables, one entry per screen cell, remembering everything we
+ * learned about the surface drawn there — its place, which way it faces, its
+ * colour, how near it is — so the later passes can light it and find its edges
+ * without touching the triangles again. (The classic "G-buffer" of Saito &
+ * Takahashi, 1987.) The drawing pass fills the surface tables; the later passes
+ * fill the two colour-output tables. Every table is [row][col]:
+ *   what's drawn here (the drawing pass)
+ *     pos / normal / albedo — where it is in the world, which way it faces, its
+ *                             plain colour
+ *     zbuf   — how near it is, used to keep only the closest surface (smaller =
+ *              nearer; starts at 1.0 meaning "nothing/far")
+ *     z_view — a second, evenly-spaced distance. The edge finder uses THIS one
+ *              because equal steps of real distance give equal steps here, while
+ *              zbuf is all bunched up near the camera and would mislead it
+ *     valid  — did anything get drawn in this cell this frame? (0 = background)
+ *   the finished colours (the later passes)
+ *     edge   — the bright glow colour for this cell (filled in §7)
+ *     light  — the finished lit colour, with the halo mixed in (§8) */
+typedef struct {
+  Vec3 pos[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 normal[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 albedo[GBUF_MAX_H][GBUF_MAX_W];
+  float zbuf[GBUF_MAX_H][GBUF_MAX_W];
+  float z_view[GBUF_MAX_H][GBUF_MAX_W];
+  uint8_t valid[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 edge[GBUF_MAX_H][GBUF_MAX_W];
+  Vec3 light[GBUF_MAX_H][GBUF_MAX_W];
+} GBuffer;
+
+static GBuffer g_gbuf;
+
+static void gbuffer_clear(GBuffer *gb, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      g_zbuf[r][c] = 1.0f;
-      g_z_view[r][c] = -CAM_FAR;
-      g_valid[r][c] = 0;
+      gb->zbuf[r][c] = 1.0f;
+      gb->z_view[r][c] = -CAM_FAR;
+      gb->valid[r][c] = 0;
     }
   }
 }
 
+/* For a point inside a screen triangle, work out its three "blend weights" — how
+ * much each corner counts — so we can mix the corners' depth, colour, and facing
+ * at that exact spot. Returns negative weights when the point is outside. */
 static void barycentric(const float sx[3], const float sy[3], float px,
                         float py, float b[3]) {
   float d =
@@ -1120,8 +619,89 @@ static void barycentric(const float sx[3], const float sy[3], float px,
   b[2] = 1.f - b[0] - b[1];
 }
 
-static void rasterize_object(const Mesh *mesh, Vec3 albedo, Mat4 mvp,
-                             Mat4 model, Mat4 modelview, Mat4 norm_mat,
+/* For each of the triangle's three corners, work out the forms the later steps
+ * need: a projected position (for placing it on screen and checking it faces
+ * us), its spot and facing out in the world (for lighting), and how far back it
+ * sits (for the edge finder). */
+static void transform_vertices(const Mesh *mesh, const Triangle *tri, Mat4 mvp,
+                               Mat4 model, Mat4 modelview, Mat4 norm_mat,
+                               Vec4 clip[3], Vec3 wpos[3], Vec3 wnrm[3],
+                               float vz[3]) {
+  for (int vi = 0; vi < 3; vi++) {
+    const Vertex *v = &mesh->verts[tri->v[vi]];
+    clip[vi] = m4_mul_v4(mvp, v4(v->pos.x, v->pos.y, v->pos.z, 1.f));
+    wpos[vi] = m4_pt(model, v->pos);
+    wnrm[vi] = v3_norm(m4_dir(norm_mat, v->normal));
+    vz[vi] = m4_pt(modelview, v->pos).z;
+  }
+}
+
+/* All three corners are behind the camera (or too close in front of it) — none
+ * of this triangle can be seen, so the caller skips it. */
+static bool all_behind_near_plane(const Vec4 clip[3]) {
+  return clip[0].w < NEAR_W_EPS && clip[1].w < NEAR_W_EPS &&
+         clip[2].w < NEAR_W_EPS;
+}
+
+/* Turn each corner into a spot on the cell grid, making farther things land
+ * closer together so the scene looks 3-D. The up/down value is flipped because
+ * screen rows count downward while the math counts up. */
+static void project_to_screen(const Vec4 clip[3], int cols, int rows,
+                              float sx[3], float sy[3], float sz[3]) {
+  for (int vi = 0; vi < 3; vi++) {
+    float w = clip[vi].w;
+    if (fabsf(w) < 1e-6f)
+      w = 1e-6f;
+    sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
+    sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows;
+    sz[vi] = clip[vi].z / w;
+  }
+}
+
+/* Is this triangle the back side of a shape, turned away from us? We check which
+ * way its corners wind on screen; with our setup the away-facing ones wind the
+ * "wrong" way, and we drop them so we don't draw hidden back faces. */
+static bool is_back_facing(const float sx[3], const float sy[3]) {
+  float area =
+      (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+  return area >= 0.f;
+}
+
+/* Walk the cells the screen triangle covers; for each one inside it and nearer
+ * than what's already there, record the surface's facts into the G-buffer. */
+static void rasterize_fragments(GBuffer *gb, const float sx[3], const float sy[3],
+                                const float sz[3], const float vz[3],
+                                const Vec3 wpos[3], const Vec3 wnrm[3],
+                                Vec3 albedo, int cols, int rows) {
+  int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
+  int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
+  int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
+  int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+
+  for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
+    for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
+      float b[3];
+      barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
+      if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
+        continue;
+
+      float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
+      if (z >= gb->zbuf[py][px])
+        continue;
+
+      gb->zbuf[py][px] = z;
+      gb->z_view[py][px] = b[0] * vz[0] + b[1] * vz[1] + b[2] * vz[2];
+      gb->pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
+      gb->normal[py][px] =
+          v3_norm(v3_bary(wnrm[0], wnrm[1], wnrm[2], b[0], b[1], b[2]));
+      gb->albedo[py][px] = albedo;
+      gb->valid[py][px] = 1;
+    }
+  }
+}
+
+static void rasterize_object(GBuffer *gb, const Mesh *mesh, Vec3 albedo,
+                             Mat4 mvp, Mat4 model, Mat4 modelview, Mat4 norm_mat,
                              int cols, int rows) {
   for (int ti = 0; ti < mesh->ntri; ti++) {
     const Triangle *tri = &mesh->tris[ti];
@@ -1129,81 +709,39 @@ static void rasterize_object(const Mesh *mesh, Vec3 albedo, Mat4 mvp,
     Vec4 clip[3];
     Vec3 wpos[3], wnrm[3];
     float vz[3];
-    for (int vi = 0; vi < 3; vi++) {
-      const Vertex *v = &mesh->verts[tri->v[vi]];
-      clip[vi] = m4_mul_v4(mvp, v4(v->pos.x, v->pos.y, v->pos.z, 1.f));
-      wpos[vi] = m4_pt(model, v->pos);
-      wnrm[vi] = v3_norm(m4_dir(norm_mat, v->normal));
-      vz[vi] = m4_pt(modelview, v->pos).z;
-    }
-
-    if (clip[0].w < 0.001f && clip[1].w < 0.001f && clip[2].w < 0.001f)
+    transform_vertices(mesh, tri, mvp, model, modelview, norm_mat, clip, wpos,
+                       wnrm, vz);
+    if (all_behind_near_plane(clip))
       continue;
 
     float sx[3], sy[3], sz[3];
-    for (int vi = 0; vi < 3; vi++) {
-      float w = clip[vi].w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
-      sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows;
-      sz[vi] = clip[vi].z / w;
-    }
-
-    /* Back-face cull. Screen Y-flip turns OpenGL CCW front faces
-     * into NEGATIVE signed area; keep negative, reject the rest. */
-    float area =
-        (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (area >= 0.f)
+    project_to_screen(clip, cols, rows, sx, sy, sz);
+    if (is_back_facing(sx, sy))
       continue;
 
-    int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
-    int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
-    int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
-    int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
-
-    for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
-      for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
-        float b[3];
-        barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
-        if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
-          continue;
-
-        float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
-        if (z >= g_zbuf[py][px])
-          continue;
-
-        g_zbuf[py][px] = z;
-        g_z_view[py][px] = b[0] * vz[0] + b[1] * vz[1] + b[2] * vz[2];
-        g_pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
-        g_normal[py][px] =
-            v3_norm(v3_bary(wnrm[0], wnrm[1], wnrm[2], b[0], b[1], b[2]));
-        g_albedo[py][px] = albedo;
-        g_valid[py][px] = 1;
-      }
-    }
+    rasterize_fragments(gb, sx, sy, sz, vz, wpos, wnrm, albedo, cols, rows);
   }
 }
 
-static void render_gbuffer(const Mesh *meshes, const Vec3 *albedos,
-                           const Mat4 *models, int n_objects, Mat4 view,
-                           Mat4 proj, int cols, int rows) {
-  gbuffer_clear(cols, rows);
+static void render_gbuffer(GBuffer *gb, const SceneObject *objects,
+                           int n_objects, Mat4 view, Mat4 proj, int cols,
+                           int rows) {
+  gbuffer_clear(gb, cols, rows);
   for (int oi = 0; oi < n_objects; oi++) {
-    Mat4 mv = m4_mul(view, models[oi]);
+    Mat4 model = objects[oi].model;
+    Mat4 mv = m4_mul(view, model);
     Mat4 mvp = m4_mul(proj, mv);
-    Mat4 nmat = m4_normal_mat(models[oi]);
-    rasterize_object(&meshes[oi], albedos[oi], mvp, models[oi], mv, nmat, cols,
-                     rows);
+    Mat4 nmat = m4_normal_mat(model);
+    rasterize_object(gb, &objects[oi].mesh, objects[oi].albedo, mvp, model, mv,
+                     nmat, cols, rows);
   }
 }
 
-/* ── §7 edge — Sobel on z_view + normal ──────────────────────────────── */
+/* ── §7 edge — find the cells where depth or facing changes sharply ───── */
 
-static Vec3 g_edge[GBUF_MAX_H][GBUF_MAX_W]; /* HDR neon per pixel */
-
-/* Sobel magnitude on a 3×3 sample window stored row-major in `field[9]`.
- *   field[0..2] = top row, field[3..5] = middle, field[6..8] = bottom.  */
+/* Measures how fast the nine values in a little 3×3 patch are changing — a big
+ * number means a sharp jump, which is what an edge looks like. (The Sobel
+ * filter.) The patch is laid out row by row: 0-2 top, 3-5 middle, 6-8 bottom. */
 static float sobel_magnitude(const float field[9]) {
   float gx = (field[2] + 2.f * field[5] + field[8]) -
              (field[0] + 2.f * field[3] + field[6]);
@@ -1216,33 +754,33 @@ static inline int clamp_ix(int v, int max) {
   return v < 0 ? 0 : (v >= max ? max - 1 : v);
 }
 
-/* Sample a 3×3 neighbourhood of g_z_view at (r, c). Invalid neighbours
- * (outside the screen or g_valid=0) are recorded as -CAM_FAR — that
- * gap creates a HUGE Sobel gradient at silhouettes, which is exactly
- * how we detect them. */
-static void sample_zview_3x3(int r, int c, int cols, int rows, float out[9]) {
+/* Grab the depths of a cell and its 8 neighbours. Any neighbour that's empty
+ * background counts as "very far away" — so at the outline of a shape, where
+ * background meets surface, the depths jump hugely and the edge stands out. */
+static void sample_zview_3x3(const GBuffer *gb, int r, int c, int cols, int rows,
+                             float out[9]) {
   for (int dr = -1; dr <= 1; dr++) {
     for (int dc = -1; dc <= 1; dc++) {
       int rr = clamp_ix(r + dr, rows);
       int cc = clamp_ix(c + dc, cols);
       out[(dr + 1) * 3 + (dc + 1)] =
-          g_valid[rr][cc] ? g_z_view[rr][cc] : -CAM_FAR;
+          gb->valid[rr][cc] ? gb->z_view[rr][cc] : -CAM_FAR;
     }
   }
 }
 
-/* Sample 3×3 of one normal component (axis 0=x, 1=y, 2=z). Invalid
- * neighbours record 0 — the Sobel gradient on creases is normal-flip
- * driven, not silhouette driven (silhouettes are caught by depth). */
-static void sample_normal_3x3(int r, int c, int axis, int cols, int rows,
-                              float out[9]) {
+/* Grab one piece of the facing direction (x, y, or z) for a cell and its 8
+ * neighbours. Empty background counts as 0; creases show up as a sharp change in
+ * facing between two faces, and outlines are already handled by depth. */
+static void sample_normal_3x3(const GBuffer *gb, int r, int c, int axis,
+                              int cols, int rows, float out[9]) {
   for (int dr = -1; dr <= 1; dr++) {
     for (int dc = -1; dc <= 1; dc++) {
       int rr = clamp_ix(r + dr, rows);
       int cc = clamp_ix(c + dc, cols);
       float v = 0.f;
-      if (g_valid[rr][cc]) {
-        Vec3 n = g_normal[rr][cc];
+      if (gb->valid[rr][cc]) {
+        Vec3 n = gb->normal[rr][cc];
         v = (axis == 0) ? n.x : (axis == 1) ? n.y : n.z;
       }
       out[(dr + 1) * 3 + (dc + 1)] = v;
@@ -1250,8 +788,8 @@ static void sample_normal_3x3(int r, int c, int axis, int cols, int rows,
   }
 }
 
-/* GLSL-style smoothstep on x ∈ [edge0, edge1] → [0, 1] with a smooth
- * cubic falloff at both ends. */
+/* A soft on-switch: returns 0 below edge0, 1 above edge1, and eases smoothly
+ * between — used so edges fade in instead of popping on with jagged stair-steps. */
 static float smoothstep(float edge0, float edge1, float x) {
   float t = (x - edge0) / (edge1 - edge0);
   if (t < 0.f)
@@ -1261,55 +799,97 @@ static float smoothstep(float edge0, float edge1, float x) {
   return t * t * (3.f - 2.f * t);
 }
 
-/*
- * edge_pass — the Sobel post-process. For each visible pixel:
- *
- *   1. depth_grad  = Sobel magnitude of g_z_view.
- *   2. normal_grad = Σ Sobel magnitudes of N.x, N.y, N.z.
- *   3. edge        = max(depth_grad · DEPTH_SCALE,
- *                        normal_grad · NORMAL_SCALE).
- *   4. t           = smoothstep(THRESHOLD, THRESHOLD+KNEE, edge).
- *   5. g_edge      = NEON_COLOR · t · INTENSITY.
- *
- * Lightpass adds g_edge straight into the HDR g_light, then bloom
- * extracts pixels above its own threshold and bleeds them outward.
- */
-static void edge_pass(int cols, int rows) {
+/* How strongly this cell sits on an outline: how much the depth jumps around it. */
+static float depth_gradient(const GBuffer *gb, int r, int c, int cols,
+                            int rows) {
+  float field[9];
+  sample_zview_3x3(gb, r, c, cols, rows, field);
+  return sobel_magnitude(field);
+}
+
+/* How strongly this cell sits on a crease: how much the surface's facing
+ * direction changes around it, totalled over all three direction components. */
+static float normal_gradient(const GBuffer *gb, int r, int c, int cols,
+                             int rows) {
+  float field[9];
+  float total = 0.f;
+  for (int axis = 0; axis < 3; axis++) {
+    sample_normal_3x3(gb, r, c, axis, cols, rows, field);
+    total += sobel_magnitude(field);
+  }
+  return total;
+}
+
+/* For every drawn cell, score how outline-like and how crease-like it is, take
+ * whichever is stronger, fade it softly above the cutoff, and store that much
+ * over-bright cyan in the edge table. Empty cells get no glow. The lightpass
+ * adds this straight into the lit colour, and bloom turns it into a halo. */
+static void edge_pass(GBuffer *gb, int cols, int rows) {
   Vec3 neon = v3(NEON_COLOR[0], NEON_COLOR[1], NEON_COLOR[2]);
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
-        g_edge[r][c] = v3(0, 0, 0);
+      if (!gb->valid[r][c]) {
+        gb->edge[r][c] = v3(0, 0, 0);
         continue;
       }
 
-      float field[9];
+      float depth_grad = depth_gradient(gb, r, c, cols, rows);
+      float normal_grad = normal_gradient(gb, r, c, cols, rows);
 
-      sample_zview_3x3(r, c, cols, rows, field);
-      float depth_grad = sobel_magnitude(field);
-
-      sample_normal_3x3(r, c, 0, cols, rows, field);
-      float nx_grad = sobel_magnitude(field);
-      sample_normal_3x3(r, c, 1, cols, rows, field);
-      float ny_grad = sobel_magnitude(field);
-      sample_normal_3x3(r, c, 2, cols, rows, field);
-      float nz_grad = sobel_magnitude(field);
-
-      float normal_grad = nx_grad + ny_grad + nz_grad;
       float edge = fmaxf(depth_grad * DEPTH_SCALE, normal_grad * NORMAL_SCALE);
       float t = smoothstep(EDGE_THRESHOLD, EDGE_THRESHOLD + EDGE_KNEE, edge);
 
-      g_edge[r][c] = v3_scale(neon, t * EDGE_INTENSITY);
+      gb->edge[r][c] = v3_scale(neon, t * EDGE_INTENSITY);
     }
   }
 }
 
-/* ── §8 lightpass — dim Blinn-Phong + edge contribution ──────────────── */
+/* ── §8 lightpass — softly light each surface cell, then add its glow ──── */
 
-static Vec3 g_light[GBUF_MAX_H][GBUF_MAX_W];
+/* The soft surface shading, but with a twist (Valve's "half-Lambert"): even the
+ * side turned away from the sun keeps a faint gradient instead of going dead
+ * flat. The brightest point doesn't change and the sun is very dim anyway, so
+ * this only brings back a little shape on the dark side at chunky terminal
+ * resolution — the near-black look and the glowing edges stay intact. */
+static Vec3 half_lambert_diffuse(Vec3 N, Vec3 L, Vec3 albedo, Vec3 sun_col) {
+  float wrap = 0.5f * v3_dot(N, L) + 0.5f;
+  float diff = wrap * wrap;
+  return v3(albedo.x * sun_col.x * diff, albedo.y * sun_col.y * diff,
+            albedo.z * sun_col.z * diff);
+}
 
-static void render_lightpass(Vec3 cam_pos, bool edges_on, int cols, int rows) {
+/* The shiny highlight — bright where the surface is angled just right to bounce
+ * the sun toward the eye. It's the sun's own colour, not the surface's. */
+static Vec3 blinn_phong_specular(Vec3 N, Vec3 L, Vec3 V, Vec3 sun_col) {
+  Vec3 H = v3_norm(v3_add(L, V));
+  float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN;
+  return v3(sun_col.x * spec, sun_col.y * spec, sun_col.z * spec);
+}
+
+/* The colour of one surface cell: a little fill light, plus the soft sun
+ * shading, plus the shiny highlight, plus the edge glow when edges are on. The
+ * glow can push it well past full brightness — bloom and the final squash deal
+ * with that. */
+static Vec3 shade_pixel(const GBuffer *gb, int r, int c, Vec3 L, Vec3 sun_col,
+                        Vec3 ambient, Vec3 cam_pos, bool edges_on) {
+  Vec3 P = gb->pos[r][c];
+  Vec3 N = gb->normal[r][c];
+  Vec3 albedo = gb->albedo[r][c];
+
+  Vec3 amb =
+      v3(ambient.x * albedo.x, ambient.y * albedo.y, ambient.z * albedo.z);
+  Vec3 dif = half_lambert_diffuse(N, L, albedo, sun_col);
+  Vec3 V = v3_norm(v3_sub(cam_pos, P));
+  Vec3 sp = blinn_phong_specular(N, L, V, sun_col);
+  Vec3 edge = edges_on ? gb->edge[r][c] : v3(0, 0, 0);
+
+  return v3(amb.x + dif.x + sp.x + edge.x, amb.y + dif.y + sp.y + edge.y,
+            amb.z + dif.z + sp.z + edge.z);
+}
+
+static void render_lightpass(GBuffer *gb, Vec3 cam_pos, bool edges_on, int cols,
+                             int rows) {
   Vec3 sun_dir = v3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
   Vec3 sun_col = v3(SUN_COL[0], SUN_COL[1], SUN_COL[2]);
   Vec3 ambient = v3(AMBIENT_COL[0], AMBIENT_COL[1], AMBIENT_COL[2]);
@@ -1317,46 +897,28 @@ static void render_lightpass(Vec3 cam_pos, bool edges_on, int cols, int rows) {
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c]) {
-        g_light[r][c] = v3(0, 0, 0);
+      if (!gb->valid[r][c]) {
+        gb->light[r][c] = v3(0, 0, 0);
         continue;
       }
-
-      Vec3 P = g_pos[r][c];
-      Vec3 N = g_normal[r][c];
-      Vec3 albedo = g_albedo[r][c];
-
-      Vec3 amb =
-          v3(ambient.x * albedo.x, ambient.y * albedo.y, ambient.z * albedo.z);
-
-      float diff = fmaxf(0.f, v3_dot(N, L));
-      Vec3 dif = v3(albedo.x * sun_col.x * diff, albedo.y * sun_col.y * diff,
-                    albedo.z * sun_col.z * diff);
-
-      Vec3 V = v3_norm(v3_sub(cam_pos, P));
-      Vec3 H = v3_norm(v3_add(L, V));
-      float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS) * SPEC_GAIN;
-      Vec3 sp = v3(sun_col.x * spec, sun_col.y * spec, sun_col.z * spec);
-
-      Vec3 edge = edges_on ? g_edge[r][c] : v3(0, 0, 0);
-
-      /* HDR — edges can push channels well past 1.0. */
-      g_light[r][c] =
-          v3(amb.x + dif.x + sp.x + edge.x, amb.y + dif.y + sp.y + edge.y,
-             amb.z + dif.z + sp.z + edge.z);
+      gb->light[r][c] =
+          shade_pixel(gb, r, c, L, sun_col, ambient, cam_pos, edges_on);
     }
   }
 }
 
-/* ── §9 bloom — extract → blur → composite (same as bloom_finale.c) ──── */
+/* ── §9 bloom — spread the bright edges into a soft halo ──────────────── */
 
+/* Two scratch tables: the bright pixels we pulled out, and a half-blurred copy.
+ * Reused every frame, so they live here as plain globals. */
 static Vec3 g_bloom[GBUF_MAX_H][GBUF_MAX_W];
 static Vec3 g_bloom_tmp[GBUF_MAX_H][GBUF_MAX_W];
 
-static void bloom_extract(float threshold, int cols, int rows) {
+static void bloom_extract(const GBuffer *gb, float threshold, int cols,
+                          int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      Vec3 lit = g_light[r][c];
+      Vec3 lit = gb->light[r][c];
       g_bloom[r][c] = (v3_luma(lit) > threshold) ? lit : v3(0, 0, 0);
     }
   }
@@ -1390,51 +952,78 @@ static void bloom_blur_v(int cols, int rows) {
   }
 }
 
-static void bloom_composite(float intensity, int cols, int rows) {
+static void bloom_composite(GBuffer *gb, float intensity, int cols, int rows) {
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      g_light[r][c] = v3_add(g_light[r][c], v3_scale(g_bloom[r][c], intensity));
+      gb->light[r][c] =
+          v3_add(gb->light[r][c], v3_scale(g_bloom[r][c], intensity));
     }
   }
 }
 
-/* ── §10 scene ───────────────────────────────────────────────────────── */
+/* The whole halo effect: keep only the bright pixels, blur them sideways then
+ * up-and-down, and add the soft result back onto the lit image. */
+static void bloom_pass(GBuffer *gb, int cols, int rows) {
+  bloom_extract(gb, BLOOM_THRESHOLD, cols, rows);
+  bloom_blur_h(cols, rows);
+  bloom_blur_v(cols, rows);
+  bloom_composite(gb, BLOOM_INTENSITY, cols, rows);
+}
 
+/* ── §10 scene — all the moving state, advanced once per frame ────────── */
+
+/* The orbiting camera. Two knobs you actually set — how far around it has swung
+ * and how far out it sits — and three things worked out from them each time
+ * those change (where the eye ends up, and the two matrices the renderer needs).
+ *   yaw  — how far around the scene it has swung (radians)
+ *   dist — how far out the eye sits (the zoom)
+ *   pos  — where the eye actually is, worked out from yaw + dist
+ *   view — looks from the eye toward the scene centre
+ *   proj — makes far things smaller, matched to the window shape */
 typedef struct {
-  Mesh meshes[N_OBJECTS];
-  Vec3 albedos[N_OBJECTS];
-  Mat4 models[N_OBJECTS];
+  float yaw;
+  float dist;
+  Vec3 pos;
+  Mat4 view;
+  Mat4 proj;
+} Camera;
 
-  Mat4 view, proj;
-  Vec3 cam_pos;
-  float cam_dist;
-  float cam_yaw;
+/* Scene — everything the demo is about, in one place:
+ *   WHAT  — the renderable objects (the floor + the three spinning shapes)
+ *   HOW   — the knobs the keys change (edge glow, bloom, pause)
+ *   WHERE — the camera
+ * plus how big the drawing area is. Written only by scene_init / scene_tick and
+ * the key handler; the render passes read it but never change it. */
+typedef struct {
+  /* what's drawn */
+  SceneObject objects[N_OBJECTS];
 
-  /* per-object spin (only the three platonic shapes rotate) */
-  float spin_angle[N_OBJECTS];
-  float spin_speed[N_OBJECTS];
+  /* what the keys change */
+  bool edges_on; /* 'e' — Sobel edge glow on/off       */
+  bool bloom_on; /* 'b' — soft bloom halo on/off       */
+  bool paused;   /* space — freeze spin + camera orbit */
 
-  bool edges_on;
-  bool bloom_on;
-  bool paused;
-  int scene_cols;
-  int scene_rows;
+  /* where we view from */
+  Camera cam;
+
+  /* drawing area in cells (full width; height minus the HUD band) */
+  int scene_cols, scene_rows;
 } Scene;
 
-static void scene_rebuild_proj(Scene *s, int cols, int rows) {
+static void camera_rebuild_proj(Camera *cam, int cols, int rows) {
   float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
-  s->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
+  cam->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 }
 
-static void scene_rebuild_view(Scene *s) {
-  float r = s->cam_dist;
-  s->cam_pos = v3(sinf(s->cam_yaw) * r, CAM_EYE_Y, cosf(s->cam_yaw) * r);
-  s->view = m4_lookat(s->cam_pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
+static void camera_rebuild_view(Camera *cam) {
+  float r = cam->dist;
+  cam->pos = v3(sinf(cam->yaw) * r, CAM_EYE_Y, cosf(cam->yaw) * r);
+  cam->view = m4_lookat(cam->pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
 }
 
-/* Rebuild a shape's model matrix as translate · rotate_y · rotate_x.
- * Each shape spins on its own axes — the rotation is what reveals
- * the silhouette + crease edges from changing angles. */
+/* Places a shape at (cx, cy, cz) and spins it by `angle` (a bit more around the
+ * up-axis than the side-axis, so it tumbles). The turning is what keeps swinging
+ * fresh outlines and creases into view. */
 static Mat4 spin_model(float cx, float cy, float cz, float angle) {
   Mat4 ry = m4_rotate_y(angle);
   Mat4 rx = m4_rotate_x(angle * 0.6f);
@@ -1444,76 +1033,92 @@ static Mat4 spin_model(float cx, float cy, float cz, float angle) {
 
 static void scene_init(Scene *s, int total_cols, int total_rows) {
   for (int i = 0; i < N_OBJECTS; i++)
-    mesh_free(&s->meshes[i]);
+    mesh_free(&s->objects[i].mesh);
 
   memset(s, 0, sizeof *s);
   s->scene_cols = total_cols;
   s->scene_rows = total_rows - HUD_ROWS;
   s->edges_on = true;
   s->bloom_on = true;
-  s->cam_dist = CAM_DIST;
-  s->cam_yaw = 0.f;
+  s->cam.dist = CAM_DIST;
+  s->cam.yaw = 0.f;
 
   /* OBJ_FLOOR — near-black slate; doesn't spin. */
-  s->meshes[OBJ_FLOOR] = tessellate_quad(
+  s->objects[OBJ_FLOOR].mesh = tessellate_quad(
       v3(-FLOOR_HALF_X, 0.f, FLOOR_HALF_Z), v3(2 * FLOOR_HALF_X, 0.f, 0.f),
       v3(0.f, 0.f, -2 * FLOOR_HALF_Z), v3(0.f, 1.f, 0.f));
-  s->albedos[OBJ_FLOOR] = v3(0.06f, 0.07f, 0.09f);
-  s->models[OBJ_FLOOR] = m4_identity();
-  s->spin_speed[OBJ_FLOOR] = 0.f;
+  s->objects[OBJ_FLOOR].albedo = v3(0.06f, 0.07f, 0.09f);
+  s->objects[OBJ_FLOOR].model = m4_identity();
+  s->objects[OBJ_FLOOR].spin_speed = 0.f;
 
   /* OBJ_CUBE — 6 faces, 12 creases. Slow spin. */
-  s->meshes[OBJ_CUBE] = tessellate_box(CUBE_HALF, CUBE_HALF, CUBE_HALF);
-  s->albedos[OBJ_CUBE] = v3(0.10f, 0.10f, 0.13f);
-  s->spin_speed[OBJ_CUBE] = 0.45f;
-  s->models[OBJ_CUBE] = spin_model(CUBE_CX, CUBE_CY, CUBE_CZ, 0.f);
+  s->objects[OBJ_CUBE].mesh = tessellate_box(CUBE_HALF, CUBE_HALF, CUBE_HALF);
+  s->objects[OBJ_CUBE].albedo = v3(0.10f, 0.10f, 0.13f);
+  s->objects[OBJ_CUBE].spin_speed = 0.45f;
+  s->objects[OBJ_CUBE].model = spin_model(CUBE_CX, CUBE_CY, CUBE_CZ, 0.f);
 
   /* OBJ_TETRA — 4 faces, 6 creases. Faster spin (smaller poly count). */
-  s->meshes[OBJ_TETRA] = tessellate_tetrahedron(TETRA_R);
-  s->albedos[OBJ_TETRA] = v3(0.10f, 0.10f, 0.13f);
-  s->spin_speed[OBJ_TETRA] = 0.65f;
-  s->models[OBJ_TETRA] = spin_model(TETRA_CX, TETRA_CY, TETRA_CZ, 0.f);
+  s->objects[OBJ_TETRA].mesh = tessellate_tetrahedron(TETRA_R);
+  s->objects[OBJ_TETRA].albedo = v3(0.10f, 0.10f, 0.13f);
+  s->objects[OBJ_TETRA].spin_speed = 0.65f;
+  s->objects[OBJ_TETRA].model = spin_model(TETRA_CX, TETRA_CY, TETRA_CZ, 0.f);
 
   /* OBJ_OCTA — 8 faces, 12 creases, sharp star silhouette. */
-  s->meshes[OBJ_OCTA] = tessellate_octahedron(OCTA_R);
-  s->albedos[OBJ_OCTA] = v3(0.10f, 0.10f, 0.13f);
-  s->spin_speed[OBJ_OCTA] = -0.55f; /* opposite direction */
-  s->models[OBJ_OCTA] = spin_model(OCTA_CX, OCTA_CY, OCTA_CZ, 0.f);
+  s->objects[OBJ_OCTA].mesh = tessellate_octahedron(OCTA_R);
+  s->objects[OBJ_OCTA].albedo = v3(0.10f, 0.10f, 0.13f);
+  s->objects[OBJ_OCTA].spin_speed = -0.55f; /* opposite direction */
+  s->objects[OBJ_OCTA].model = spin_model(OCTA_CX, OCTA_CY, OCTA_CZ, 0.f);
 
-  scene_rebuild_proj(s, total_cols, s->scene_rows);
-  scene_rebuild_view(s);
+  camera_rebuild_proj(&s->cam, total_cols, s->scene_rows);
+  camera_rebuild_view(&s->cam);
 }
 
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
 
-  s->cam_yaw += CAM_ORBIT_RAD_PER_SEC * dt;
-  scene_rebuild_view(s);
+  s->cam.yaw += CAM_ORBIT_RAD_PER_SEC * dt;
+  camera_rebuild_view(&s->cam);
 
-  s->spin_angle[OBJ_CUBE] += s->spin_speed[OBJ_CUBE] * dt;
-  s->spin_angle[OBJ_TETRA] += s->spin_speed[OBJ_TETRA] * dt;
-  s->spin_angle[OBJ_OCTA] += s->spin_speed[OBJ_OCTA] * dt;
+  s->objects[OBJ_CUBE].spin_angle += s->objects[OBJ_CUBE].spin_speed * dt;
+  s->objects[OBJ_TETRA].spin_angle += s->objects[OBJ_TETRA].spin_speed * dt;
+  s->objects[OBJ_OCTA].spin_angle += s->objects[OBJ_OCTA].spin_speed * dt;
 
-  s->models[OBJ_CUBE] =
-      spin_model(CUBE_CX, CUBE_CY, CUBE_CZ, s->spin_angle[OBJ_CUBE]);
-  s->models[OBJ_TETRA] =
-      spin_model(TETRA_CX, TETRA_CY, TETRA_CZ, s->spin_angle[OBJ_TETRA]);
-  s->models[OBJ_OCTA] =
-      spin_model(OCTA_CX, OCTA_CY, OCTA_CZ, s->spin_angle[OBJ_OCTA]);
+  s->objects[OBJ_CUBE].model =
+      spin_model(CUBE_CX, CUBE_CY, CUBE_CZ, s->objects[OBJ_CUBE].spin_angle);
+  s->objects[OBJ_TETRA].model =
+      spin_model(TETRA_CX, TETRA_CY, TETRA_CZ, s->objects[OBJ_TETRA].spin_angle);
+  s->objects[OBJ_OCTA].model =
+      spin_model(OCTA_CX, OCTA_CY, OCTA_CZ, s->objects[OBJ_OCTA].spin_angle);
 }
 
-/* ── §11 screen — render_scene + HUD ─────────────────────────────────── */
+/* ── §11 screen — build the frame in memory, then paint it ────────────── */
 
-static void render_scene(const Scene *s) {
+/* Builds one finished frame in the per-cell tables: draw the shapes, find their
+ * edges, light everything, and spread the halo. Edges and halo are skippable
+ * (the 'e' and 'b' toggles). */
+static void render_frame(const Scene *s, GBuffer *gb) {
+  render_gbuffer(gb, s->objects, N_OBJECTS, s->cam.view, s->cam.proj,
+                 s->scene_cols, s->scene_rows);
+
+  if (s->edges_on)
+    edge_pass(gb, s->scene_cols, s->scene_rows);
+
+  render_lightpass(gb, s->cam.pos, s->edges_on, s->scene_cols, s->scene_rows);
+
+  if (s->bloom_on)
+    bloom_pass(gb, s->scene_cols, s->scene_rows);
+}
+
+static void render_scene(const Scene *s, const GBuffer *gb) {
   int cols = s->scene_cols;
   int rows = s->scene_rows;
 
   for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
     for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-      if (!g_valid[r][c])
+      if (!gb->valid[r][c])
         continue;
-      paint_cell(c, r, g_light[r][c]);
+      paint_cell(c, r, gb->light[r][c]);
     }
   }
 }
@@ -1524,13 +1129,13 @@ static void hud_draw(const Scene *s, double fps) {
 
   int total_tris = 0;
   for (int i = 0; i < N_OBJECTS; i++)
-    total_tris += s->meshes[i].ntri;
+    total_tris += s->objects[i].mesh.ntri;
 
   char status[160];
   snprintf(status, sizeof status,
            " %5.1f fps  edges:%s  bloom:%s  zoom:%.1f  tris:%d  %s ", fps,
            s->edges_on ? "ON " : "OFF", s->bloom_on ? "ON " : "OFF",
-           (double)s->cam_dist, total_tris, s->paused ? "PAUSED" : "running");
+           (double)s->cam.dist, total_tris, s->paused ? "PAUSED" : "running");
   int slen = (int)strlen(status);
   if (slen > cols)
     slen = cols;
@@ -1563,8 +1168,12 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §12 app ─────────────────────────────────────────────────────────── */
+/* ── §12 app — startup, the main loop, signals, and keys ──────────────── */
 
+/* Everything the running program needs to hold onto: the scene, the current
+ * terminal size, and two flags the signal handlers flip — one to quit, one to
+ * note the window changed size. The flags are sig_atomic_t because a signal can
+ * write them at any moment. */
 typedef struct {
   Scene scene;
   int total_cols;
@@ -1592,10 +1201,12 @@ static void screen_init(void) {
   curs_set(0);
   nodelay(stdscr, TRUE);
   keypad(stdscr, TRUE);
-  typeahead(-1);
+  typeahead(-1); /* stop ncurses peeking at input mid-draw, which causes tearing */
   color_init();
 }
 
+/* Rebuild for the new terminal size after a resize. The endwin + refresh dance
+ * is how ncurses is told to pick up the new dimensions. */
 static void app_do_resize(App *app) {
   endwin();
   refresh();
@@ -1628,43 +1239,22 @@ static bool app_handle_key(App *app, int ch) {
     break;
   case '=':
   case '+':
-    s->cam_dist -= CAM_ZOOM_STEP;
-    if (s->cam_dist < CAM_DIST_MIN)
-      s->cam_dist = CAM_DIST_MIN;
-    scene_rebuild_view(s);
+    s->cam.dist -= CAM_ZOOM_STEP;
+    if (s->cam.dist < CAM_DIST_MIN)
+      s->cam.dist = CAM_DIST_MIN;
+    camera_rebuild_view(&s->cam);
     break;
   case '-':
   case '_':
-    s->cam_dist += CAM_ZOOM_STEP;
-    if (s->cam_dist > CAM_DIST_MAX)
-      s->cam_dist = CAM_DIST_MAX;
-    scene_rebuild_view(s);
+    s->cam.dist += CAM_ZOOM_STEP;
+    if (s->cam.dist > CAM_DIST_MAX)
+      s->cam.dist = CAM_DIST_MAX;
+    camera_rebuild_view(&s->cam);
     break;
   default:
     break;
   }
   return true;
-}
-
-/*
- * One-frame pipeline. Reads as plain pseudocode — each named pass
- * does what it says, conditionally, in dependency order.
- */
-static void render_frame(const Scene *s) {
-  render_gbuffer(s->meshes, s->albedos, s->models, N_OBJECTS, s->view, s->proj,
-                 s->scene_cols, s->scene_rows);
-
-  if (s->edges_on)
-    edge_pass(s->scene_cols, s->scene_rows);
-
-  render_lightpass(s->cam_pos, s->edges_on, s->scene_cols, s->scene_rows);
-
-  if (s->bloom_on) {
-    bloom_extract(BLOOM_THRESHOLD, s->scene_cols, s->scene_rows);
-    bloom_blur_h(s->scene_cols, s->scene_rows);
-    bloom_blur_v(s->scene_cols, s->scene_rows);
-    bloom_composite(BLOOM_INTENSITY, s->scene_cols, s->scene_rows);
-  }
 }
 
 int main(void) {
@@ -1685,13 +1275,17 @@ int main(void) {
   int fps_cnt = 0;
   double fps_display = 0.0;
 
+  /* The heartbeat: move the world a little, draw it, read a key. Repeat. */
   while (app->running) {
 
+    /* did the window change size? rebuild for it before anything else */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
     }
 
+    /* how long since the last frame? (capped, so one hiccup can't make the
+     * shapes leap across the screen) */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
@@ -1699,8 +1293,10 @@ int main(void) {
       dt = DT_CAP_NS;
     float dt_sec = (float)dt / (float)NS_PER_SEC;
 
+    /* move everything forward by that much — the one place the world changes */
     scene_tick(&app->scene, dt_sec);
 
+    /* refresh the fps readout every so often */
     fps_cnt++;
     fps_acc += dt;
     if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1709,23 +1305,26 @@ int main(void) {
       fps_acc = 0;
     }
 
+    /* nap until it's time for the next frame, before we touch the screen */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
 
+    /* draw: build the frame in memory, paint it, lay the HUD on top, show it */
     Scene *s = &app->scene;
     erase();
-    render_frame(s);
-    render_scene(s);
+    render_frame(s, &g_gbuf);
+    render_scene(s, &g_gbuf);
     hud_draw(s, fps_display);
     screen_present();
 
+    /* read one key — it may pause, reset, toggle a stage, zoom, or quit */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;
   }
 
   for (int i = 0; i < N_OBJECTS; i++)
-    mesh_free(&app->scene.meshes[i]);
+    mesh_free(&app->scene.objects[i].mesh);
 
   endwin();
   return 0;

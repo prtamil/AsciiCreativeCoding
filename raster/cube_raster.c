@@ -1,600 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * cube_raster.c — software rasteriser, cube demo
+ * cube_raster.c — the smallest software 3-D renderer in this folder: a glossy
+ * orange cube tumbling on black, drawn one triangle at a time on the CPU (no
+ * GPU). Press 's' to flip between four looks (phong, toon, normals, fresnel),
+ * 'c' to show/hide the inside faces, '+/-' to zoom, space to pause, q to quit.
  *
- * DEMO: A textured glossy cube (warm orange) tumbling on a black
- *       background. Cycle through phong → toon → normals → wire to
- *       see four shading models running on the same triangle mesh.
- *       Press 'c' to toggle back-face culling and watch the inside
- *       faces appear; press '+' / '-' to zoom.
- *
- *       This is the smallest possible software rasteriser:
- *           - 24 vertices (6 faces × 4 corners, flat-normal duplicated)
- *           - 12 triangles (each face is a quad split into 2 tris)
- *           - 4 shaders pluggable as function pointers
- *           - z-buffer, back-face cull, barycentric rasteriser
- *           - continuous RGB pipeline → 6×6×6 cube + 92-char Bourke ramp
- *
- * Study alongside:
- *   raster/sphere_raster.c           — same skeleton, smooth normals
- *   raster/torus_raster.c            — same skeleton, parametric tessellation
- *   raster/displace_raster.c         — same skeleton + vertex displacement
- *   raster/deferred_rendering_pipeline.c — same skeleton + G-buffer
- *
- * Section map:
- *   §1 config        — frame rate, FOV, cube geometry, ramp, ncurses pairs
- *   §2 clock         — monotonic timer + sleep
- *   §3 math          — V3, V4, Mat4 (transform matrices)
- *   §4 paint         — 216-pair RGB cube + Bourke ramp + paint_cell
- *   §5 shaders       — VS/FS function-pointer interface + 4 shader pairs
- *                      §5.1 types     §5.2 default vertex shader
- *                      §5.3 phong     §5.4 toon
- *                      §5.5 normals   §5.6 wire (barycentric edge detection)
- *   §6 mesh          — cube tessellation (24 vertices, 12 triangles)
- *   §7 framebuffer   — z-buffer + cell buffer + clear/blit
- *   §8 pipeline      — barycentric + per-triangle rasteriser
- *                      §8.1 barycentric (Möller signed-area form)
- *                      §8.2 pipeline_draw_mesh (vert → cull → raster → frag)
- *   §9 scene         — Uniforms, scene_tick, shader swap
- *   §10 screen       — ncurses init + HUD (yellow row 0 + cyan bottom)
- *   §11 app          — signals, resize, fixed-step main loop
- *
- * Keys:
- *   s         cycle shader (phong → toon → normals → wire)
- *   c         toggle back-face culling
- *   space     pause / resume rotation
- *   + / =     zoom in
- *   -         zoom out
- *   q / ESC   quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raster/cube_raster.c -o cube_rt -lncurses
- * -lm
+ * Read this one first — sphere_raster.c, torus_raster.c, and
+ * displace_raster.c reuse the same skeleton with a different shape, and
+ * deferred_rendering_pipeline.c adds a G-buffer on top.
+ * Ideas from: Reinhard tone-map (SIGGRAPH '02); the signed-area triangle test
+ *   (Möller, Game Programming Gems 2000); z-buffer (Catmull 1974).
+ * Build: gcc -std=c11 -O2 -Wall -Wextra raster/cube_raster.c -o cube_rt -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Software rasterisation in the classic 1990s pipeline:
- *                  vertex shader → perspective divide → screen mapping
- *                  → back-face cull → barycentric rasteriser → fragment
- *                  shader → z-test → write framebuffer cell.
- *
- *                  The cube is a TEACHING choice: 6 flat faces with
- *                  duplicated vertices (4 per face) make the shading
- *                  model visible as hard steps — phong shows uniform
- *                  diffuse per face, toon shows hard cel boundaries
- *                  between faces, normals shows 6 distinct face colours,
- *                  wire shows the 12-edge silhouette via barycentric
- *                  edge detection.
- *
- *                  The output pipeline is identical to the raytracing
- *                  folder's: continuous RGB → Reinhard tone-map → gamma
- *                  → 6×6×6 cube + 92-char Bourke ramp + A_BOLD/A_DIM.
- *                  This unifies the rendering across every demo in the
- *                  raster + raytracer folders.
- *
- * Data-structure : `Mesh` = static array of `Vertex` (pos, normal, uv) +
- *                  static array of `Triangle` (3 indices). Cube has 24
- *                  vertices, 12 triangles, allocated ONCE at startup.
- *                  `Framebuffer` = z-buffer (float per cell, init +∞) +
- *                  colour buffer (Cell per cell: char + pair + attr).
- *                  Reset between frames with `fb_clear`.
- *                  Shaders are FUNCTION POINTERS — plug-and-play; the
- *                  pipeline doesn't know what they do.
- *
- * Rendering      : Per fragment: V3 colour from frag shader → Reinhard
- *                  tone-map per channel → gamma 1/2.2 encode → quantise
- *                  to 216-cell xterm cube → density char from Bourke
- *                  92-char ramp by Rec.709 luma. Bayer 4×4 dither
- *                  perturbs luma slightly so neighbouring cells with
- *                  similar brightness pick different glyphs (smoother
- *                  gradients on coarse grid).
- *
- * Performance    : 12 triangles · ~rows×cols rasterisation cells per
- *                  frame. Bottleneck is per-fragment cost (4 luma
- *                  computes + dither + cube quantise + ramp lookup).
- *                  At 240×80 cells × 60 fps ≈ 4 ms shading per frame.
- *
- * References     : Real-Time Rendering 4e §23 (software rasterisation).
- *                  Möller, "Fast triangle rasterisation by interpolating
- *                    edge functions," Game Programming Gems (2000).
- *                    The signed-area barycentric form used in §8.1.
- *                  Foley, van Dam, Feiner & Hughes, "Computer Graphics:
- *                    Principles and Practice" 3e §10.4 (rasterisation
- *                    fundamentals).
- *                  Reinhard et al., "Photographic Tone Reproduction for
- *                    Digital Images," SIGGRAPH '02.
- *                  Tanner Helland (blackbody) — used elsewhere in the
- *                    raytracer folder; unrelated here but the same
- *                    paint pipeline is shared.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A unit cube is 24 vertices and 12 triangles. Each frame:
- *   1. Build a model matrix (rotate X, then Y); compose with view (look
- *      at origin) and projection (perspective) → MVP matrix.
- *   2. For each triangle:
- *        - Run the vertex shader on its 3 vertices (transform to clip).
- *        - Perspective-divide to NDC; map to screen.
- *        - Reject if back-facing (signed area ≤ 0).
- *        - Rasterise: walk the triangle's screen-space bounding box;
- *          for each pixel inside (all 3 barycentric coords > 0), z-test;
- *          run the fragment shader on the interpolated state to get RGB;
- *          write to framebuffer cell.
- *   3. After all 12 triangles: blit the framebuffer to ncurses.
- *
- * It's a tiny GPU written in C. Vertices are STAMPS; transform them to
- * where they should appear on screen. Triangles are PAINT MASKS defined
- * by 3 stamps. For every cell under a paint mask, ask "what's my
- * position WITHIN this mask?" — that's barycentric coordinates u, v, w.
- * Use those to interpolate any per-vertex attribute (normal, UV, world
- * position) to the current pixel. Hand the interpolated state to a
- * fragment shader → RGB → cube cell.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- *
- *      MODEL → VIEW → PROJ
- *        ↓        ↓       ↓     ← matrices composed into MVP
- *       (vertex shader runs here)
- *        ↓
- *      CLIP-SPACE TRIANGLE
- *        ↓
- *      perspective divide → SCREEN-SPACE TRIANGLE
- *        ↓
- *      back-face cull (signed area)
- *        ↓
- *      bounding-box raster:
- *        for each pixel:
- *          barycentric (u, v, w)
- *          if any < 0 → skip (outside)
- *          z = u·z0 + v·z1 + w·z2
- *          if z >= zbuf → skip (occluded)
- *          interpolate position, normal, uv
- *          (fragment shader runs here)
- *          → V3 RGB → tone-map → cube cell
- *
- * Same skeleton as the rest of the raster folder; only §6 (mesh
- * tessellation) differs between cube/sphere/torus/displaced.
- *
- * ALGORITHM IN STEPS  (per frame)
- * ──────────────────────────────
- *  1. Tessellate cube ONCE at startup: 6 faces × 4 vertices = 24
- *     vertices, each with face-local outward normal (so faces have
- *     uniform normals — flat shading, hard edges).
- *  2. scene_tick: angle_x += ROT_X·dt, angle_y += ROT_Y·dt;
- *     model = rot_y(angle_y) · rot_x(angle_x);
- *     mvp   = proj · view · model;
- *     norm_mat = cofactor(model)  (correct normal transform under
- *                                   non-uniform scale).
- *  3. fb_clear: zbuf[i] = +∞, cbuf[i] = empty.
- *  4. For each of 12 triangles:
- *       a. vert_shader on 3 vertices → clip_pos, world_pos, world_nrm.
- *       b. Near-clip reject (all w < ε).
- *       c. Perspective divide:
- *            sx = ( clip.x/w + 1)·0.5·cols
- *            sy = (-clip.y/w + 1)·0.5·rows  (Y-flip for screen-down)
- *            sz =   clip.z/w
- *       d. Signed area; if cull_backface AND area ≤ 0 → skip.
- *       e. Compute bbox; walk every pixel in it.
- *       f. For each pixel: barycentric → all > 0 + z-test → run fragment.
- *       g. fragment shader returns V3 RGB; paint_cell tones, gammas,
- *          quantises to cube + ramp char.
- *  5. fb_blit to stdscr; HUD; present.
- *
- * KEY FORMULAS
- * ────────────
- *  Perspective projection (OpenGL-style):
- *     m[0][0] = (1/tan(fov/2)) / aspect
- *     m[1][1] =  1/tan(fov/2)
- *     m[2][2] = (far+near)/(near-far)
- *     m[2][3] = (2·far·near)/(near-far)
- *     m[3][2] = -1
- *
- *  Aspect with terminal cell ratio:
- *     aspect = (cols·CELL_W) / (rows·CELL_H)   CELL_W=8, CELL_H=16
- *  Without this the cube renders as a vertical ellipsoid because
- *  terminal cells are taller than wide.
- *
- *  Perspective divide + screen mapping:
- *     sx = ( clip.x / w + 1) · 0.5 · cols      NDC x ∈ [-1,1]
- *     sy = (-clip.y / w + 1) · 0.5 · rows      Y-flip for screen-down
- *     sz =   clip.z / w
- *
- *  Barycentric (Möller signed-area form):
- *     d  = (y1−y2)(x0−x2) + (x2−x1)(y0−y2)
- *     b0 = ((y1−y2)(px−x2) + (x2−x1)(py−y2)) / d
- *     b1 = ((y2−y0)(px−x2) + (x0−x2)(py−y2)) / d
- *     b2 = 1 − b0 − b1
- *
- *  Back-face cull (after Y-flip, CCW = positive area):
- *     area = (sx1−sx0)(sy2−sy0) − (sx2−sx0)(sy1−sy0)
- *     cull when area ≤ 0
- *
- *  Blinn-Phong (frag_phong):
- *     N=world normal, L=light_dir, V=view_dir, H=normalize(L+V)
- *     diff = max(0, N·L)
- *     spec = max(0, N·H)^shininess
- *     col  = ambient + obj·light·diff + spec·0.5
- *     gamma = col^(1/2.2)
- *
- *  Toon (frag_toon, 4 bands):
- *     banded = floor(diff·bands) / bands
- *     spec   = (N·H > 0.94) ? 0.7 : 0       hard cel highlight
- *
- *  Normals (frag_normals):  RGB = N·0.5 + 0.5  ∈ [0,1] per channel
- *
- *  Wireframe (frag_wire):
- *     edge = min(b0, b1, b2)    distance to nearest edge
- *     if edge > WIRE_THRESH → discard
- *     else colour ramp from white at edge to grey at threshold
- *
- *  Bayer 4×4 ordered dither (k_bayer[py%4][px%4]):
- *      0  8  2 10                /16
- *     12  4 14  6
- *      3 11  1  9
- *     15  7 13  5
- *
- *  RGB → 6×6×6 cube pair (xterm 16..231):
- *     r5 = clamp(round(r·5), 0, 5);   g5, b5 likewise
- *     pair_id = PAIR_CUBE_BASE + r5·36 + g5·6 + b5
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Y-FLIP. NDC has +Y up but screen rows go down. The minus sign in
- *    `sy = (-clip.y/w + 1)·…` flips it. Without the flip the cube is
- *    upside-down AND back-face culling inverts (CCW becomes CW after
- *    flip).
- *  • BACK-FACE AREA SIGN. After the Y-flip, CCW triangles have POSITIVE
- *    area; cull when `area <= 0` (also catches zero-area degenerates).
- *  • WIREFRAME IDENTITY COORDS. The pipeline injects (1,0,0), (0,1,0),
- *    (0,0,1) into VSIn.u/v BEFORE the vertex shader; vert_wire writes
- *    to custom[0..2] AFTER. Skip either step and barycentric edge
- *    detection in frag_wire reads zeros and the whole triangle is
- *    discarded.
- *  • DUPLICATED CUBE VERTICES. Each face has its own 4 vertices with
- *    a uniform face-normal — 24 total. Sharing vertices between faces
- *    would average normals at corners and round the cube. Wrong for
- *    hard-surface shading.
- *  • NEAR-CLIP. Triangles entirely behind the camera (all w < ε) are
- *    skipped before perspective divide. Triangles partially behind
- *    are NOT properly clipped (would require Sutherland-Hodgman) and
- *    can produce stretched artefacts when CAM_DIST is set very small.
- *  • BOURKE RAMP BOUNDS. Indexing past `BOURKE_LEN−1` reads beyond the
- *    string literal. Always clamp `idx` after the cast.
- *  • DITHER SCALE. `0.15` is chosen so dither doesn't smear the toon's
- *    hard bands. Larger values dissolve cel-shading; smaller values
- *    posterise phong gradients.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • PHONG shader: light at (4, 5, 4); lit faces are upper-front-right;
- *    opposite faces are dim ambient grey. Specular highlight moves
- *    smoothly across the front face as the cube rotates.
- *  • TOON shader: 4 bands. Each face is entirely ONE band — no
- *    gradient across one face (flat normals).
- *  • NORMALS shader: 6 distinct face colours. +X → reddish, +Y →
- *    greenish, +Z → bluish (after the ·0.5+0.5 shift), opposites use
- *    complementary colours.
- *  • WIRE: 12 edges visible plus the 6 diagonals from quad-to-tri
- *    splits. As the cube rotates you can count edges.
- *  • CULL TOGGLE 'c': switch off — interior face glyphs appear inside
- *    the cube outline. Switch on — clean silhouette.
- *  • ZOOM +/-: cube grows/shrinks; HUD shows current cam distance
- *    (1.0..8.0 with 0.2 step). Aspect remains correct because proj
- *    is rebuilt with cell-aspect on resize.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. This is the SIMPLEST full triangle rasteriser in
- *      this folder; read it first if you want to understand the
- *      raster pipeline before tackling sphere / torus / shadow / SSAO.
- *   2. §1 config — every constant has a unit-bearing comment.
- *   3. §3 math — V3, V4, Mat4 + matrix builders. Read AFTER tutorial T2.
- *   4. §6 mesh — cube tessellation (24 verts, 12 tris). Skim.
- *   5. §8 pipeline — barycentric + per-triangle rasteriser. Read AFTER
- *      tutorials T3-T6.
- *   6. §5 shaders — four VS/FS pairs (phong/toon/normals/wire) plug
- *      into the pipeline via function pointers. Read AFTER tutorial T7.
- *   7. §4 paint + §7 framebuffer + §9-§11 — infrastructure; skim.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   V3 / V4 / Mat4   3-D vector / 4-D vector / 4×4 matrix
- *   model / view /   object → world / world → camera / camera → clip
- *     proj / mvp     transform matrices, composed into mvp
- *   norm_mat         transposed-inverse of model for transforming normals
- *   sx / sy / sz     screen-space coordinates (after perspective divide)
- *   b0 / b1 / b2     barycentric weights (sum to 1; all > 0 = inside)
- *   zbuf / cbuf      z-buffer (depth) and colour buffer (Cell)
- *   VSIn / VSOut     vertex shader input / output
- *   FSIn             fragment shader input (interpolated VSOut)
- *
- * Background you need
- * ───────────────────
- *   - 4×4 matrices for transforms (identity, perspective, lookAt).
- *   - Homogeneous coordinates: a 3-D point becomes (x, y, z, 1) so
- *     translation can be a matrix multiplication.
- *   - Cross product and signed area of a triangle.
- *   - Linear interpolation: a · b0 + b · b1 + c · b2 with b0+b1+b2=1.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - GPU shading languages — these are CPU function pointers.
- *   - Sutherland-Hodgman near-plane clipping (we just reject whole
- *     triangles where all vertices are behind near; partial clipping
- *     not implemented).
- *   - Texture sampling — cube faces are flat-coloured by face-normal.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
- *
- * Eight short tutorials that build the rasteriser from first
- * principles. Read in order; each builds on the previous.
- *
- *   T1  The 7-stage raster pipeline — what every triangle goes through
- *   T2  MVP matrix — composing model · view · proj
- *   T3  Perspective divide + screen mapping (NDC → cells)
- *   T4  Back-face culling via signed area
- *   T5  Barycentric coordinates (Möller signed-area form)
- *   T6  Z-buffer — hidden surface removal in O(1) per pixel
- *   T7  Four shader pairs — phong / toon / normals / wire
- *   T8  Continuous-RGB pipeline → 6×6×6 cube + Bayer dither + ramp
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  THE 7-STAGE RASTER PIPELINE
- * ────────────────────────────────
- * Every triangle in this file goes through the same seven stages:
- *
- *   STAGE 1  VERTEX SHADER       per-vertex transform: object-space
- *                                 vertex → clip-space position +
- *                                 carried-along data (world pos, normal,
- *                                 UV) for the fragment shader.
- *
- *   STAGE 2  PERSPECTIVE DIVIDE  divide x, y, z by w. Result is in
- *                                 normalised device coordinates (NDC),
- *                                 each axis in [-1, +1].
- *
- *   STAGE 3  SCREEN MAPPING      NDC → cell coordinates (sx, sy, sz).
- *                                 Y is flipped (NDC up = +1 → screen
- *                                 row 0 = top).
- *
- *   STAGE 4  BACK-FACE CULL      compute signed triangle area in screen
- *                                 space. CCW = positive (front);
- *                                 CW = negative (back, cull if enabled).
- *
- *   STAGE 5  BOUNDING-BOX RASTER walk every cell in the triangle's
- *                                 axis-aligned screen bbox. For each:
- *                                   compute barycentric (T5)
- *                                   if any < 0 → outside, skip
- *
- *   STAGE 6  Z-TEST (HSR)         interpolated z = b0·z0 + b1·z1 + b2·z2.
- *                                 If z >= zbuf[cell] → occluded, skip.
- *                                 Else: zbuf[cell] = z, proceed.
- *
- *   STAGE 7  FRAGMENT SHADER      use barycentrics to interpolate
- *                                 normal/UV/world position to this
- *                                 pixel; FS returns RGB; paint_cell
- *                                 quantises to cube + ramp.
- *
- * Read §8 pipeline_draw_mesh — it implements stages 1-6 directly.
- * Stage 7 is the FS function pointer the user picks via 's'.
- *
- * T2  MVP MATRIX — COMPOSING MODEL · VIEW · PROJ
- * ───────────────────────────────────────────────
- * Three transforms compose to put a vertex on the screen:
- *
- *     v_clip = PROJ · VIEW · MODEL · v_object
- *              ╲___╱   ╲___╱   ╲____╱   ╲_______╱
- *               5         4       3        2        ← reading order
- *
- *   1. v_object — vertex's local-space coords (e.g. cube corner at
- *                 (0.5, 0.5, 0.5)).
- *   2. MODEL    — places the object in the WORLD. Rotation,
- *                 translation, scale.
- *   3. VIEW     — places the camera. Mat4 from `lookAt(eye, target, up)`
- *                 — equivalent to "translate so camera is at origin
- *                 then rotate so it looks down -Z".
- *   4. PROJ     — perspective. Maps 4-D homogeneous coords such that
- *                 the camera frustum becomes a clip box. After
- *                 perspective divide (T3), points in front of the
- *                 camera land in NDC's [-1, +1]³.
- *   5. CLIP     — final 4-D output. Per vertex.
- *
- * In code (§9 scene_tick):
- *
- *     model = rot_y(angle_y) · rot_x(angle_x);
- *     view  = lookAt(camera, (0,0,0), up);
- *     mvp   = proj · view · model;       composed once per frame
- *
- * Per-vertex (§5.2 default vertex shader):
- *
- *     v_clip = mvp · v_object;
- *
- * Normals need a separate matrix because non-uniform scale would
- * shear them — `norm_mat = transpose(inverse(model))`. For pure
- * rotation/uniform scale (our case) this equals the model matrix's
- * 3×3 upper-left.
- *
- * T3  PERSPECTIVE DIVIDE + SCREEN MAPPING (NDC → CELLS)
- * ──────────────────────────────────────────────────────
- * After the vertex shader, we have v_clip = (cx, cy, cz, cw). The
- * cw component encodes "depth from camera" — a vertex 5 m away has
- * cw ≈ 5. Perspective divide converts to NDC:
- *
- *     ndc.x = cx / cw     ∈ [-1, +1] inside the visible frustum
- *     ndc.y = cy / cw
- *     ndc.z = cz / cw
- *
- * That divide IS the perspective effect — distant vertices (large
- * cw) get small ndc values and cluster near the centre.
- *
- * Then we map NDC to cell coordinates:
- *
- *     sx = ( ndc.x + 1) · 0.5 · cols       NDC -1 → 0; +1 → cols
- *     sy = (-ndc.y + 1) · 0.5 · rows       Y FLIP: NDC +1 (up) → row 0
- *     sz = ndc.z                            kept for z-buffer
- *
- * The Y-flip is critical. NDC has +Y up; screen rows go DOWN. Without
- * the minus sign, the cube renders upside-down — AND back-face
- * culling inverts (CCW becomes CW after flip). Cull-condition then
- * needs adjusting: post-flip, CCW = positive area = front face
- * (T4).
- *
- * Near-clip rejection: if all three vertices have cw < ε, the
- * triangle is entirely behind the near plane — skip BEFORE perspective
- * divide (dividing by zero or negative cw produces garbage).
- *
- * T4  BACK-FACE CULLING VIA SIGNED AREA
- * ──────────────────────────────────────
- * After screen mapping we have three 2-D points (sx0,sy0), (sx1,sy1),
- * (sx2,sy2). The signed area of the triangle they form is:
- *
- *     area = (sx1 - sx0)(sy2 - sy0) - (sx2 - sx0)(sy1 - sy0)
- *
- * Sign tells us orientation:
- *
- *     area > 0   counter-clockwise (CCW) — front face after Y-flip
- *     area = 0   degenerate (zero-area triangle, skip)
- *     area < 0   clockwise (CW)         — back face, cull if enabled
- *
- * The convention "CCW = front" is OpenGL's. After the Y-flip in
- * stage 3, our screen-space triangles inherit it.
- *
- * Pseudocode:
- *     if cull_enabled and area <= 0: skip triangle
- *
- * Saves ~half the per-pixel work on a closed mesh — every back-
- * facing triangle is invisible from this camera angle anyway. Press
- * 'c' to toggle and see interior faces appear.
- *
- * T5  BARYCENTRIC COORDINATES (MÖLLER SIGNED-AREA FORM)
- * ──────────────────────────────────────────────────────
- * For a point P inside triangle (V0, V1, V2), barycentric coordinates
- * (b0, b1, b2) are the WEIGHTS such that:
- *
- *     P = b0·V0 + b1·V1 + b2·V2,      b0 + b1 + b2 = 1
- *
- * Geometrically: b0 is the fractional area of the sub-triangle
- * opposite V0 (between P, V1, V2). Same for b1 (opposite V1) and
- * b2 (opposite V2). All three positive → P inside.
- *
- * Computed via the signed-area form (Möller 2000):
- *
- *     d  = (y1-y2)(x0-x2) + (x2-x1)(y0-y2)         total area · 2
- *     b0 = ((y1-y2)(px-x2) + (x2-x1)(py-y2)) / d
- *     b1 = ((y2-y0)(px-x2) + (x0-x2)(py-y2)) / d
- *     b2 = 1 - b0 - b1
- *
- * d is computed ONCE per triangle (constant). b0, b1 are computed
- * per-pixel. The whole inside-test is:
- *
- *     if b0 >= 0 and b1 >= 0 and b2 >= 0: inside
- *
- * Once inside, barycentrics interpolate any vertex attribute:
- *
- *     z       = b0·z0 + b1·z1 + b2·z2          (for z-buffer)
- *     normal  = b0·n0 + b1·n1 + b2·n2          (for fragment shader)
- *     world_p = b0·p0 + b1·p1 + b2·p2
- *
- * That's the entire triangle rasteriser. Walk the bbox, compute
- * three weights, test inside, interpolate, ship to fragment shader.
- *
- * T6  Z-BUFFER — HIDDEN SURFACE REMOVAL IN O(1) PER PIXEL
- * ────────────────────────────────────────────────────────
- * Multiple triangles can cover the same pixel — we want only the
- * NEAREST one to win. Z-buffer is the standard solution:
- *
- *     for each pixel:
- *       initialise zbuf[pixel] = +∞
- *
- *     when a triangle wants to write to (x, y) with depth z:
- *       if z >= zbuf[x][y]: skip       occluded by previous closer
- *       else:               write,
- *                           zbuf[x][y] = z   record new winner
- *
- * Cost: O(1) per pixel per triangle. The triangles can be processed
- * in ANY order — each pixel independently keeps the nearest winner
- * regardless of submission order.
- *
- * Limitations:
- *   - Memory: one float per cell. Trivial at terminal resolution.
- *   - Transparency: doesn't work (needs back-to-front sort).
- *   - Anti-aliasing: a pixel either passes or fails z-test; no
- *     partial coverage.
- *
- * For an opaque cube, z-buffer is perfect. Read §7 (zbuf, cbuf,
- * fb_clear) and §8 (z-test inside the per-pixel loop).
- *
- * T7  FOUR SHADER PAIRS — PHONG / TOON / NORMALS / WIRE
- * ──────────────────────────────────────────────────────
- * The pipeline is shape-agnostic and shader-agnostic. The user's
- * `s' key cycles between four (VS, FS) pairs, all plugging into the
- * same pipeline:
- *
- *   PHONG    smooth diffuse + Blinn-Phong specular. Realistic.
- *            Lit faces show smooth gradient; opposite faces dim.
- *
- *   TOON     diffuse quantised into 4 bands (cel-shading) + a
- *            hard binary specular cut-off at N·H > 0.94. Each
- *            cube face = ONE band (flat normals).
- *
- *   NORMALS  RGB = (N + 1) / 2 — surface normal as colour. Each
- *            face is a flat distinct colour (+X red-ish, +Y green-
- *            ish, etc). Diagnostic for "are normals correct?"
- *
- *   WIRE     barycentric edge detection: edge_distance =
- *            min(b0, b1, b2). Where edge_dist > WIRE_THRESH
- *            DISCARD the fragment; else fade colour from white at
- *            edge to dim near threshold. 12 cube edges + 6 quad-
- *            split diagonals visible.
- *
- * The vertex shader is mostly the SAME for all four — it just
- * computes clip_pos, world_pos, world_normal. WIRE adds a special
- * vertex shader that writes barycentric identity coords (1,0,0),
- * (0,1,0), (0,0,1) into the FSIn.custom slot — those interpolate
- * across the triangle, giving the FS the per-pixel barycentric
- * needed for edge detection.
- *
- * Read §5 — each shader is ~20 lines.
- *
- * T8  CONTINUOUS-RGB PIPELINE → 6×6×6 CUBE + DITHER + RAMP
- * ─────────────────────────────────────────────────────────
- * Every fragment shader returns a CONTINUOUS V3 RGB in [0, ∞)³.
- * paint_cell quantises that to a terminal cell:
- *
- *   1. Reinhard tone-map per channel:  L' = L / (1 + L)
- *      Compresses HDR (specular peaks > 1.0) into [0, 1).
- *   2. Gamma encode 1/2.2: brightens midtones perceptually.
- *   3. Bayer 4×4 dither: add (dither[r%4][c%4] - 0.5) · 0.15 to luma
- *      before glyph index lookup. This perturbs brightness slightly
- *      so neighbouring cells with similar luma pick DIFFERENT ramp
- *      glyphs — smoother gradients on a coarse 6×6×6 cube.
- *   4. Quantise: r5 = round(r · 5) ∈ [0, 5] per channel.
- *   5. Pair index = 16 + 36·r5 + 6·g5 + b5  (xterm cube convention).
- *   6. Density char = ramp[round(luma_dithered · 91)] in 92-char
- *      Bourke ramp.
- *   7. A_BOLD on luma > 0.85, A_DIM on luma < 0.15.
- *
- * Bayer dither is the single biggest visual quality improvement
- * over plain quantisation. Without it, a smooth phong gradient
- * shows visible bands at every cube-cell boundary. With it, the
- * boundaries dissolve into noise that the eye averages out.
- *
- * Read §4 paint_cell.
- *
- * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -625,33 +42,51 @@ enum {
 #define CAM_FOV (55.0f * 3.14159265f / 180.0f)
 #define CAM_NEAR 0.1f
 #define CAM_FAR 100.0f
-#define CAM_DIST 2.8f /* default camera Z distance              */
+/* A corner this close to the eye (or behind it) is dropped. The step that makes
+ * far things smaller divides by distance, and that blows up for a point sitting
+ * right on top of the camera. */
+#define CLIP_W_MIN 0.001f
+#define CAM_DIST 2.8f /* how far back the camera starts          */
 #define CAM_DIST_MIN 1.0f
 #define CAM_DIST_MAX 8.0f
 #define CAM_ZOOM_STEP 0.2f
 
-/* CELL_W, CELL_H — terminal cell aspect for projection.
- * Without aspect correction the cube renders as a vertical ellipsoid. */
+/* A terminal cell is taller than it is wide; these numbers let the projection
+ * correct for that, otherwise the cube would look like a squashed tall blob. */
 #define CELL_W 8
 #define CELL_H 16
 
 /* §1.3 cube geometry */
-#define CUBE_S 0.75f /* half-extent: vertices at ±CUBE_S       */
+#define CUBE_S 0.75f /* half the cube's width: corners sit at ±this */
 
-/* §1.4 rotation rates (rad/sec) — different X and Y for tumbling. */
+/* §1.3b how the light dims with distance (used by the phong shader). A nearby
+ * light plus this fade gives each flat face a bright-to-dim gradient across it;
+ * without it, a face all points the same way and shades to one flat tone. */
+#define LIGHT_ATTEN_LIN 0.09f
+#define LIGHT_ATTEN_QUAD 0.07f
+
+/* §1.4 how fast the cube spins (radians/sec) — different on each axis so it
+ * tumbles instead of just spinning flat. */
 #define ROT_Y 0.55f
 #define ROT_X 0.37f
 
-/* §1.5 wireframe edge threshold (barycentric distance). */
-#define WIRE_THRESH 0.06f
+/* §1.5 the fresnel look — a glowing outline. Surfaces turned edge-on to you get
+ * a bright cool rim; the inside stays dark. On the black terminal it reads like
+ * a glowing wireframe of the cube. */
+#define FRESNEL_POWER 1.8f /* smaller = a broader, brighter rim          */
+static const float FRESNEL_BASE[3] = {0.05f, 0.07f, 0.12f}; /* dark cool inside */
+static const float FRESNEL_RIM[3] = {0.55f, 0.95f, 1.35f};  /* bright icy rim   */
 
-/* §1.6 Bourke 92-char ASCII density ramp (sparse → dense). */
+/* §1.6 the brightness-to-character ladder: a space for near-black up to '@' for
+ * the brightest. Brighter pixels get busier characters. */
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
-/* §1.7 Bayer 4×4 ordered dither matrix (values in [0, 1)). */
+/* §1.7 a fixed 4×4 nudge pattern (values 0..1). Added to each cell's brightness
+ * so neighbouring cells of similar brightness pick different characters, which
+ * hides the steps in a smooth gradient. */
 static const float k_bayer[4][4] = {
     {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
     {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
@@ -661,12 +96,18 @@ static const float k_bayer[4][4] = {
 
 #define DITHER_AMP 0.12f
 
-/* §1.8 ncurses pair IDs. */
-#define PAIR_CUBE_BASE 1 /* + 0..215 = 6×6×6 RGB cube              */
-#define PAIR_HUD 217     /* yellow status row 0                    */
-#define PAIR_HINT 218    /* cyan hint bottom row                   */
+/* §1.8 ncurses colour-pair numbers. */
+#define PAIR_CUBE_BASE 1 /* +0..215 = the 216 cube colours         */
+#define PAIR_HUD 217     /* yellow, the top status row             */
+#define PAIR_HINT 218    /* cyan, the bottom hint row              */
 
-/* ── §2 clock ────────────────────────────────────────────────────────── */
+/* §1.9 turning a colour into a cell — see paint_compute_cell (§4). */
+#define CUBE_LEVELS 6              /* 6 steps per channel → 6×6×6 = 216 colours  */
+#define DISPLAY_GAMMA 2.2f         /* screen-brightness correction, applied last  */
+#define BOLD_LUMA_THRESHOLD 0.85f  /* brighter than this → draw the cell bold     */
+#define DIM_LUMA_THRESHOLD 0.15f   /* darker than this   → draw the cell dim      */
+
+/* ── §2 clock — reading the time and sleeping ──────────────────────────── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -682,14 +123,16 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ── §3 math (V3, V4, Mat4) ──────────────────────────────────────────── */
+/* ── §3 math — vectors and 4×4 matrices ────────────────────────────────── */
 
 typedef struct {
   float x, y, z;
 } Vec3;
+
 typedef struct {
   float x, y, z, w;
 } Vec4;
+
 typedef struct {
   float m[4][4];
 } Mat4;
@@ -805,14 +248,10 @@ static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
   return m;
 }
 
-/*
- * m4_normal_mat — cofactor of the upper-left 3×3.
- *
- * Correctly transforms normals under non-uniform scale.
- * For a uniform-scale model (like our cube) this equals the rotation
- * part of the model matrix — but computing it properly means non-
- * uniform scale "just works" later if you change the model.
- */
+/* Makes the matrix used to rotate the surface-facing directions (normals). You
+ * can't just reuse the cube's own matrix: if a shape were stretched unevenly,
+ * its normals would come out skewed. For our cube (only rotated) this works out
+ * the same, but doing it properly means a stretched shape would still look right. */
 static Mat4 m4_normal_mat(Mat4 m) {
   Mat4 n = m4_identity();
   n.m[0][0] = m.m[1][1] * m.m[2][2] - m.m[1][2] * m.m[2][1];
@@ -827,19 +266,13 @@ static Mat4 m4_normal_mat(Mat4 m) {
   return n;
 }
 
-/* ── §4 paint (216 RGB cube + Bourke ramp) ───────────────────────────── */
+/* ── §4 paint — turning a colour into one terminal cell ────────────────── */
 
 static int g_256;
 
-/*
- * color_init — allocate 216 ncurses pairs as a 6×6×6 RGB cube + reserve
- * yellow PAIR_HUD and cyan PAIR_HINT for the HUD spec.
- *
- * Pair index = PAIR_CUBE_BASE + r·36 + g·6 + b   (r,g,b ∈ {0..5})
- *
- * Same scheme as the entire raytracer folder; reading any raytrace
- * file's color_init covers this one too.
- */
+/* Sets up our colours: 216 of them arranged as a 6×6×6 cube of reds × greens ×
+ * blues, plus a yellow for the status bar and a cyan for the hint line. Falls
+ * back to plain white if the terminal can't do 256 colours. */
 static void color_init(void) {
   start_color();
   use_default_colors();
@@ -856,118 +289,139 @@ static void color_init(void) {
   }
 }
 
-/*
- * Reinhard tone-map and gamma encode (matching path_tracer / raytracers).
- *   Reinhard: L' = L / (1 + L)   compresses HDR into [0, 1)
- *   Gamma:    out = L'^(1/2.2)   approximate sRGB transfer
- *
- * Without these, quantising to the 6×6×6 cube collapses every bright
- * cell into one cube cell because the cube is uniform in [0,1]³.
- */
+/* Two small steps that bring a colour into the range the screen can show:
+ *   reinhard — gently rolls over-bright values toward white instead of clipping
+ *   gamma    — a brightness correction so mid-tones look right
+ * Without them, every bright colour would slam into the same brightest cube
+ * cell and the highlights would lose all their shape. */
 static inline float clamp01(float x) {
   return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
 }
 static inline float reinhard(float x) { return x / (1.f + x); }
-static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
+static inline float gamma_enc(float x) {
+  return powf(clamp01(x), 1.f / DISPLAY_GAMMA);
+}
 
-/* Cell stored in the framebuffer; blitted to ncurses at frame end. */
+/* Brings a too-bright colour into screen range, channel by channel (the roll-off
+ * then the brightness correction). The one and only place that happens. */
+static inline Vec3 tonemap_encode(Vec3 hdr) {
+  return v3(gamma_enc(reinhard(hdr.x)), gamma_enc(reinhard(hdr.y)),
+            gamma_enc(reinhard(hdr.z)));
+}
+
+/* How bright a colour looks to the eye (green counts most, blue least). The
+ * character is chosen from this, so a brighter-looking colour gets a busier one. */
+static inline float v3_luma(Vec3 c) {
+  return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
+
+/* to_cube_level — quantise one encoded channel [0,1] to a cube level
+ * 0..CUBE_LEVELS-1 (round-to-nearest, clamped). */
+static inline int to_cube_level(float c) {
+  int lvl = (int)(c * (CUBE_LEVELS - 1) + 0.5f);
+  if (lvl < 0)
+    lvl = 0;
+  if (lvl > CUBE_LEVELS - 1)
+    lvl = CUBE_LEVELS - 1;
+  return lvl;
+}
+
+/* Finds the closest of our 216 colours to this RGB and returns its pair number. */
+static inline int cube_pair(Vec3 rgb) {
+  return PAIR_CUBE_BASE + to_cube_level(rgb.x) * (CUBE_LEVELS * CUBE_LEVELS) +
+         to_cube_level(rgb.y) * CUBE_LEVELS + to_cube_level(rgb.z);
+}
+
+/* Picks the character for a given brightness (0..1) from the ladder. */
+static inline int ramp_index(float luma) {
+  int idx = (int)(luma * (BOURKE_LEN - 1) + 0.5f);
+  if (idx < 0)
+    idx = 0;
+  if (idx >= BOURKE_LEN)
+    idx = BOURKE_LEN - 1;
+  return idx;
+}
+
+/* The nudge for this cell from the 4×4 pattern, centred around zero and scaled
+ * down. Added to brightness before picking a character, to smooth gradients. */
+static inline float bayer_dither(int px, int py) {
+  return (k_bayer[py & 3][px & 3] - 0.5f) * DITHER_AMP;
+}
+
+/* Cell — one character on screen, the thing the renderer ultimately produces.
+ * Kept as plain data (not drawn straight to ncurses) so the drawing math just
+ * fills cells and a single pass at the end pushes them to the terminal.
+ *   ch   — the character to show; 0 means empty (left blank, so the black
+ *          background shows through)
+ *   pair — which colour (a number into our 216 colours, §4)
+ *   attr — extra style bits: bold on bright cells, dim on dark ones */
 typedef struct {
   char ch;
   int pair;
   int attr;
 } Cell;
 
-/*
- * paint_compute_cell — full RGB → cell pipeline.
- *
- *   1. Reinhard tone-map per channel.
- *   2. Gamma encode 1/2.2.
- *   3. Bayer 4×4 dither on the luma so neighbouring cells get
- *      slightly different ramp characters even when their luma is
- *      identical (smoother gradient on a coarse grid).
- *   4. Quantise to 6×6×6 cube → pair id.
- *   5. Compute Rec.709 luma → density glyph from 92-char Bourke ramp.
- *   6. A_BOLD on the brightest bin, A_DIM on the darkest.
- */
+/* Turns a colour into a finished cell: bring it into screen range, measure its
+ * brightness, pick the closest colour and the matching character (with a dither
+ * nudge so gradients stay smooth), and choose bold/dim. The nudge only affects
+ * the character, not the colour, so smooth shading doesn't band on the grid. */
 static Cell paint_compute_cell(Vec3 col, int px, int py) {
-  float r = gamma_enc(reinhard(col.x));
-  float g = gamma_enc(reinhard(col.y));
-  float b = gamma_enc(reinhard(col.z));
-
-  /* Rec.709 luma (Bourke ramp expects perceptual brightness). */
-  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-
-  /* Bayer dither perturbs the ramp index without changing the cube. */
-  float dith = (k_bayer[py & 3][px & 3] - 0.5f) * DITHER_AMP;
-  float lum_d = clamp01(luma + dith);
+  Vec3 rgb = tonemap_encode(col);
+  float luma = v3_luma(rgb); /* un-dithered, used for the bold/dim choice */
 
   Cell c;
-  if (g_256) {
-    int r5 = (int)(r * 5.f + 0.5f);
-    if (r5 > 5)
-      r5 = 5;
-    if (r5 < 0)
-      r5 = 0;
-    int g5 = (int)(g * 5.f + 0.5f);
-    if (g5 > 5)
-      g5 = 5;
-    if (g5 < 0)
-      g5 = 0;
-    int b5 = (int)(b * 5.f + 0.5f);
-    if (b5 > 5)
-      b5 = 5;
-    if (b5 < 0)
-      b5 = 0;
-    c.pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
-  } else {
-    c.pair = PAIR_CUBE_BASE;
-  }
-
-  int idx = (int)(lum_d * (BOURKE_LEN - 1) + 0.5f);
-  if (idx < 0)
-    idx = 0;
-  if (idx >= BOURKE_LEN)
-    idx = BOURKE_LEN - 1;
-  c.ch = k_bourke[idx];
-
-  c.attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
+  c.pair = g_256 ? cube_pair(rgb) : PAIR_CUBE_BASE;
+  c.ch = k_bourke[ramp_index(clamp01(luma + bayer_dither(px, py)))];
+  c.attr = (luma > BOLD_LUMA_THRESHOLD)  ? A_BOLD
+           : (luma < DIM_LUMA_THRESHOLD) ? A_DIM
+                                         : A_NORMAL;
   return c;
 }
 
-/* ── §5 shaders ──────────────────────────────────────────────────────── */
+/* ── §5 shaders — four ways to colour the cube ─────────────────────────── */
 
-/* §5.1 ── shader interface types ─────────────────────────────────────── */
+/* §5.1 ── the little records that flow through the drawing steps ───────── */
 
+/* Just like a GPU, drawing happens in two programmable steps — one per corner,
+ * then one per pixel — and these four records carry data between them:
+ *   VSIn  — a cube corner going IN to the per-corner step (its raw position etc.)
+ *   VSOut — what that step produces (where the corner lands + info to pass on)
+ *   FSIn  — VSOut blended across the triangle to a single pixel
+ *   FSOut — what the per-pixel step produces (a colour, + a "skip me" flag)
+ * A matched per-corner + per-pixel pair is a ShaderProgram (below). */
 typedef struct {
-  Vec3 pos;
-  Vec3 normal;
-  float u, v;
+  Vec3 pos;    /* the corner's position in the cube's own coordinates */
+  Vec3 normal; /* which way its face points (same for all 4 of a face) */
+  float u, v;  /* texture coords, carried along but unused here        */
 } VSIn;
 
 typedef struct {
-  Vec4 clip_pos;
-  Vec3 world_pos;
-  Vec3 world_nrm;
-  float u, v;
-  float custom[4]; /* generic per-vertex output (e.g. baryco) */
+  Vec4 clip_pos;  /* where the corner lands, before the divide-by-distance */
+  Vec3 world_pos; /* the corner's spot in the world, for the lighting      */
+  Vec3 world_nrm; /* which way it faces in the world                       */
+  float u, v;     /* texture coords, passed along                          */
 } VSOut;
 
 typedef struct {
-  Vec3 world_pos;
-  Vec3 world_nrm;
-  float u, v;
-  float custom[4];
-  int px, py;
+  Vec3 world_pos; /* this pixel's spot in the world (blended from corners)  */
+  Vec3 world_nrm; /* which way the surface faces here                       */
+  float u, v;     /* blended texture coords                                 */
+  int px, py;     /* which screen cell this is                              */
 } FSIn;
 
 typedef struct {
-  Vec3 color;
-  bool discard;
+  Vec3 color;   /* the colour this pixel came out (before screen-range fix) */
+  bool discard; /* true → don't draw this pixel at all                      */
 } FSOut;
 
 typedef void (*VertShaderFn)(const VSIn *in, VSOut *out, const void *uni);
 typedef void (*FragShaderFn)(const FSIn *in, FSOut *out, const void *uni);
 
+/* ShaderProgram — one swappable "look": a per-corner step, a per-pixel step, and
+ * a pointer to the shared values each reads. The drawing code calls the two
+ * steps through these pointers without knowing what they do, so switching looks
+ * is just swapping this struct (scene_build_shader). The value pointers are
+ * untyped so a look can point at its own extra data (e.g. ToonUniforms). */
 typedef struct {
   VertShaderFn vert;
   FragShaderFn frag;
@@ -975,28 +429,37 @@ typedef struct {
   const void *frag_uni;
 } ShaderProgram;
 
-/* Uniforms — global per-frame state shared by all shaders. */
+/* Uniforms — the values that stay the same for a whole frame and that every look
+ * reads. Grouped:
+ *   model/view/proj/mvp/norm_mat — the transforms: spin the cube, look from the
+ *                                  camera, apply perspective, all chained into
+ *                                  mvp, plus the one for the facing directions
+ *   light_pos/light_col/ambient  — the one light, plus a dim everywhere-fill
+ *   cam_pos                      — where the eye is (for highlights)
+ *   obj_color/shininess          — the cube's colour and how glossy it is
+ * There's only one cube and one light, so these live together here rather than
+ * in their own types. Ref: Blinn-Phong shading (Blinn, SIGGRAPH '77). */
 typedef struct {
   Mat4 model, view, proj, mvp, norm_mat;
   Vec3 light_pos, light_col, ambient, cam_pos, obj_color;
   float shininess;
 } Uniforms;
 
-/* Toon shader needs an extra "bands" parameter. */
+/* ToonUniforms — the extra data the toon look needs: all the usual Uniforms plus
+ * how many flat brightness steps to snap to. It wraps Uniforms because a look
+ * gets handed a single pointer, and toon needs `bands` carried alongside.
+ *   base  — the full Uniforms (transforms + light + material)
+ *   bands — how many flat steps (4 here); more = a smoother stepped look */
 typedef struct {
   Uniforms base;
   int bands;
 } ToonUniforms;
 
-/* §5.2 ── default vertex shader ──────────────────────────────────────── */
+/* §5.2 ── the per-corner step (shared by all four looks) ──────────────── */
 
-/*
- * Almost every fragment shader needs the same per-vertex computations:
- * world position, world-space normal, MVP-transformed clip position.
- * The default vertex shader does ALL of those; specialised shaders
- * (vert_normals, vert_wire) extend it by writing extra `custom`
- * outputs.
- */
+/* All four looks need the same per-corner work — where the corner lands on
+ * screen, where it sits in the world, and which way it faces — so one shared
+ * step does it; the looks differ only in the per-pixel colouring below. */
 static void vert_default(const VSIn *in, VSOut *out, const void *u_) {
   const Uniforms *u = (const Uniforms *)u_;
   out->clip_pos = m4_mul_v4(u->mvp, v4(in->pos.x, in->pos.y, in->pos.z, 1.f));
@@ -1004,61 +467,34 @@ static void vert_default(const VSIn *in, VSOut *out, const void *u_) {
   out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
   out->u = in->u;
   out->v = in->v;
-  out->custom[0] = out->custom[1] = out->custom[2] = out->custom[3] = 0.f;
 }
 
-/*
- * vert_normals — same as default + writes the world normal into custom[]
- * so the fragment shader can read it directly without recomputing.
- * (frag_normals doesn't actually use custom, but this is a useful
- * pattern shown for the wire shader below.)
- */
-static void vert_normals(const VSIn *in, VSOut *out, const void *u_) {
-  vert_default(in, out, u_);
-  out->custom[0] = out->world_nrm.x;
-  out->custom[1] = out->world_nrm.y;
-  out->custom[2] = out->world_nrm.z;
-}
+/* §5.3 ── phong: ordinary realistic lighting ─────────────────────────── */
 
-/*
- * vert_wire — barycentric-coord injection.
+/* The standard lit look: a dim base everywhere, plus light where the surface
+ * faces the lamp (brighter the more directly), plus a shiny hotspot. The lamp
+ * also fades with distance.
  *
- * The pipeline (§8.2) sets VSIn.u/v to the per-vertex BARYCENTRIC
- * IDENTITY VECTOR (1,0,0)/(0,1,0)/(0,0,1) BEFORE this shader runs.
- * We just call the default; the pipeline writes custom[0..2] AFTER.
- *
- * Inside the rasteriser, custom[0..2] are interpolated by barycentric
- * weights (b0, b1, b2). When all three are large simultaneously, we're
- * deep inside the triangle; when any one is near zero, we're at an
- * edge. min(custom[0..2]) is the distance to the nearest edge.
- */
-static void vert_wire(const VSIn *in, VSOut *out, const void *u_) {
-  vert_default(in, out, u_);
-  /* custom[0..2] zeroed by vert_default; pipeline overwrites them. */
-}
-
-/* §5.3 ── frag_phong: Blinn-Phong shading ───────────────────────────── */
-
-/*
- * Blinn-Phong = ambient + diffuse + specular.
- *   diffuse = max(0, N·L)                 Lambertian
- *   spec    = max(0, N·H)^shininess       half-vector form
- *   col     = ambient + obj·light·diff + spec·0.5
- *   gamma   = col^(1/2.2)
- *
- * On the cube this is easy to verify because each face has a uniform
- * normal: every fragment on a face sees the same N, L, H → uniform
- * diffuse + a single specular highlight per face.
- */
+ * Each cube face points one single way, so a far-off lamp would paint a whole
+ * face one flat tone. Putting the lamp CLOSE (set in scene_init) means its
+ * distance and direction change noticeably across one face, so you get a real
+ * gradient — bright near the lamp's corner, dim at the far one — plus a glossy
+ * spot that slides around as the cube turns. */
 static void frag_phong(const FSIn *in, FSOut *out, const void *u_) {
   const Uniforms *u = (const Uniforms *)u_;
   Vec3 N = v3_norm(in->world_nrm);
-  Vec3 L = v3_norm(v3_sub(u->light_pos, in->world_pos));
+  Vec3 to_light = v3_sub(u->light_pos, in->world_pos);
+  float dist = v3_len(to_light);
+  Vec3 L = v3_scale(to_light, 1.f / fmaxf(dist, 1e-4f));
   Vec3 V = v3_norm(v3_sub(u->cam_pos, in->world_pos));
   Vec3 H = v3_norm(v3_add(L, V));
 
-  float diff = fmaxf(0.f, v3_dot(N, L));
-  float spec = powf(fmaxf(0.f, v3_dot(N, H)), u->shininess);
+  /* the distance fade — this is what gives a flat face its gradient: distance
+   * and light direction change across the face even though its facing doesn't */
+  float atten =
+      1.f / (1.f + LIGHT_ATTEN_LIN * dist + LIGHT_ATTEN_QUAD * dist * dist);
+  float diff = fmaxf(0.f, v3_dot(N, L)) * atten;
+  float spec = powf(fmaxf(0.f, v3_dot(N, H)), u->shininess) * atten;
 
   Vec3 c = u->obj_color;
   out->color = v3(u->ambient.x + c.x * u->light_col.x * diff + spec * 0.5f,
@@ -1067,18 +503,13 @@ static void frag_phong(const FSIn *in, FSOut *out, const void *u_) {
   out->discard = false;
 }
 
-/* §5.4 ── frag_toon: 4-band quantised diffuse + hard specular ───────── */
+/* §5.4 ── toon: flat cartoon shading ─────────────────────────────────── */
 
-/*
- * Quantising the diffuse term to discrete bands gives the cel-shaded
- * look: instead of a smooth gradient, you see hard steps. For a cube,
- * each face is uniformly lit so each face is entirely one band — the
- * silhouette between a bright and a dim face is a perfectly sharp
- * boundary.
- *
- * The hard specular threshold (N·H > 0.94) gives the cel highlight:
- * either ON (bright spot) or OFF — no falloff.
- */
+/* Like the comic-book / cel-shaded look: snap the lighting to a few flat steps
+ * instead of a smooth gradient, so you get hard bands. Each cube face is lit
+ * evenly, so a whole face falls in one band and the line between a bright and a
+ * dim face is razor sharp. The highlight is all-or-nothing too — a bright spot
+ * appears only where the surface points nearly straight at the lamp-and-eye. */
 static void frag_toon(const FSIn *in, FSOut *out, const void *u_) {
   const ToonUniforms *tu = (const ToonUniforms *)u_;
   const Uniforms *u = &tu->base;
@@ -1097,17 +528,12 @@ static void frag_toon(const FSIn *in, FSOut *out, const void *u_) {
   out->discard = false;
 }
 
-/* §5.5 ── frag_normals: world-normal-as-RGB (diagnostic) ─────────────── */
+/* §5.5 ── normals: show which way each face points, as colour ────────── */
 
-/*
- * Each component remapped from [-1, +1] → [0, 1]. For a cube, each
- * face has a uniform normal so each face renders as ONE solid colour:
- *   +X → (1.0, 0.5, 0.5)   -X → (0.0, 0.5, 0.5)
- *   +Y → (0.5, 1.0, 0.5)   -Y → (0.5, 0.0, 0.5)
- *   +Z → (0.5, 0.5, 1.0)   -Z → (0.5, 0.5, 0.0)
- *
- * The colours rotate as the cube rotates (world-space normal).
- */
+/* A debugging view: paint each surface by the direction it faces, turned into a
+ * colour. Each cube face points one way, so each shows as one solid colour
+ * (right-facing reddish, up-facing greenish, toward-you bluish, and so on). The
+ * colours swing around as the cube turns. Handy to check the facings are right. */
 static void frag_normals(const FSIn *in, FSOut *out, const void *u_) {
   (void)u_;
   Vec3 N = v3_norm(in->world_nrm);
@@ -1115,44 +541,61 @@ static void frag_normals(const FSIn *in, FSOut *out, const void *u_) {
   out->discard = false;
 }
 
-/* §5.6 ── frag_wire: barycentric edge detection ─────────────────────── */
+/* §5.6 ── fresnel: a glowing outline ─────────────────────────────────── */
 
-/*
- * `min(custom[0..2])` is the distance to the nearest TRIANGLE edge
- * (the pipeline interpolates the barycentric identity vector across
- * fragments, and the smallest of (b0, b1, b2) is the distance to the
- * opposite edge of the triangle we're inside).
+/* Fakes the way real surfaces light up along their edges. A surface facing you
+ * straight on stays dark; one turned nearly edge-on glows. So the glow gathers
+ * exactly on the outline and the faces seen at a steep angle.
  *
- * Below WIRE_THRESH: draw the edge with a brightness proportional to
- * "how close to the edge we are" (sharper near the line itself).
- * Above WIRE_THRESH: discard — the triangle interior is transparent.
- */
-static void frag_wire(const FSIn *in, FSOut *out, const void *u_) {
-  (void)u_;
-  float b0 = in->custom[0], b1 = in->custom[1], b2 = in->custom[2];
-  float edge = fminf(b0, fminf(b1, b2));
-  if (edge > WIRE_THRESH) {
-    out->discard = true;
-    return;
-  }
-  float t = edge / WIRE_THRESH;
-  out->color = v3(0.9f - t * 0.3f, 0.9f - t * 0.3f, 0.9f - t * 0.3f);
+ * On the cube that's a bright cool rim around a dark interior — a glowing
+ * outline that needs nothing but each pixel's facing and view direction. Looks
+ * great on the black terminal background. */
+static void frag_fresnel(const FSIn *in, FSOut *out, const void *u_) {
+  const Uniforms *u = (const Uniforms *)u_;
+  Vec3 N = v3_norm(in->world_nrm);
+  Vec3 V = v3_norm(v3_sub(u->cam_pos, in->world_pos));
+  float facing = fmaxf(0.f, v3_dot(N, V));
+  float rim = powf(1.f - facing, FRESNEL_POWER);
+
+  Vec3 base = v3(FRESNEL_BASE[0], FRESNEL_BASE[1], FRESNEL_BASE[2]);
+  out->color = v3(base.x + FRESNEL_RIM[0] * rim, base.y + FRESNEL_RIM[1] * rim,
+                  base.z + FRESNEL_RIM[2] * rim);
   out->discard = false;
 }
 
-typedef enum { SH_PHONG = 0, SH_TOON, SH_NORMALS, SH_WIRE, SH_COUNT } ShaderIdx;
-static const char *k_shader_names[] = {"phong", "toon", "normals", "wire"};
+typedef enum { SH_PHONG = 0, SH_TOON, SH_NORMALS, SH_FRESNEL, SH_COUNT } ShaderIdx;
+static const char *k_shader_names[] = {"phong", "toon", "normals", "fresnel"};
 
-/* ── §6 mesh — cube tessellation ─────────────────────────────────────── */
+/* ── §6 mesh — building the cube out of triangles ──────────────────────── */
 
+/* Vertex — one corner, in the cube's own coordinates (the model matrix places it
+ * into the world later). Fields:
+ *   pos    — where the corner is (the cube's corners sit at ±CUBE_S)
+ *   normal — which way its face points. The cube keeps a SEPARATE copy of each
+ *            corner per face so every face can face its own way — that's what
+ *            makes the edges crisp. Sharing corners would blend the facings and
+ *            round the cube off.
+ *   u, v   — texture coords, filled in but unused here (no images). */
 typedef struct {
   Vec3 pos;
   Vec3 normal;
   float u, v;
 } Vertex;
+
+/* Triangle — one face, stored as three slot-numbers into its Mesh's corner list
+ * (so shared corners live once and faces just point at them). Its corners are
+ * listed counter-clockwise seen from outside; the "skip faces turned away" check
+ * in §8 relies on that ordering. */
 typedef struct {
   int v[3];
 } Triangle;
+
+/* Mesh — a whole shape: a list of corners plus the triangles connecting them.
+ * Built once at startup (tessellate_cube), freed by mesh_free. For the cube:
+ * 24 corners (6 faces × 4 of their own) and 12 triangles (each square face cut
+ * into two).
+ *   verts / nvert — the corner list and how many are filled in
+ *   tris  / ntri  — the triangle list and how many are filled in */
 typedef struct {
   Vertex *verts;
   int nvert;
@@ -1166,26 +609,12 @@ static void mesh_free(Mesh *m) {
   *m = (Mesh){0};
 }
 
-/*
- * tessellate_cube — 6 faces, each a quad split into 2 triangles.
- *
- * Each face has 4 unique vertices with the SAME outward normal — flat
- * shading, no shared vertices between faces. Sharing vertices would
- * average normals at corners and round the cube (correct for a sphere,
- * wrong for a hard-surface cube).
- *
- * Winding order: CCW when viewed from outside (from the direction the
- * normal points). The pipeline culls CW back faces (signed-area test
- * after Y-flip → CCW maps to positive area).
- *
- * UV layout per face: each face maps [0,1]² independently.
- *   v0 = bottom-left  (0,1)
- *   v1 = bottom-right (1,1)
- *   v2 = top-right    (1,0)
- *   v3 = top-left     (0,0)
- *
- * Total: 24 vertices, 12 triangles. Mesh allocated ONCE at startup.
- */
+/* Builds the cube: 6 faces, each a square cut into 2 triangles. Every face gets
+ * its own 4 corners all facing the same way, so the faces stay flat and the
+ * edges crisp (sharing corners would round it off — right for a ball, wrong for
+ * a box). Corners are listed counter-clockwise seen from outside, which is what
+ * lets the renderer tell front faces from back ones. 24 corners, 12 triangles,
+ * built once. */
 static Mesh tessellate_cube(void) {
   float s = CUBE_S;
 
@@ -1193,8 +622,8 @@ static Mesh tessellate_cube(void) {
       {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
   };
 
-  /* Corners per face in CCW winding viewed from outside. Each corner
-   * is in -1..+1 and gets scaled by s in the build loop. */
+  /* the 4 corners of each face, listed counter-clockwise from outside; each is
+   * at ±1 and gets scaled to the cube's size in the loop below */
   static const float face_vtx[6][4][3] = {
       /* +X */ {{1, -1, 1}, {1, 1, 1}, {1, 1, -1}, {1, -1, -1}},
       /* -X */ {{-1, -1, -1}, {-1, 1, -1}, {-1, 1, 1}, {-1, -1, 1}},
@@ -1222,9 +651,7 @@ static Mesh tessellate_cube(void) {
       m.verts[m.nvert++] = (Vertex){p, n, face_uv[i][0], face_uv[i][1]};
     }
 
-    /* Split quad into 2 CCW triangles:
-     *   tri 0: v0, v1, v2  (bottom-left → bottom-right → top-right)
-     *   tri 1: v0, v2, v3  (bottom-left → top-right → top-left) */
+    /* cut the square into two triangles sharing a diagonal */
     m.tris[m.ntri++] = (Triangle){{base + 0, base + 1, base + 2}};
     m.tris[m.ntri++] = (Triangle){{base + 0, base + 2, base + 3}};
   }
@@ -1232,8 +659,15 @@ static Mesh tessellate_cube(void) {
   return m;
 }
 
-/* ── §7 framebuffer ──────────────────────────────────────────────────── */
+/* ── §7 framebuffer — where we draw before showing it ──────────────────── */
 
+/* Framebuffer — our own off-screen page, the size of the terminal, that we draw
+ * into and then copy to the screen all at once. Two grids of cols×rows:
+ *   cbuf — the character + colour for each cell
+ *   zbuf — how near the closest thing drawn at each cell is, so a farther
+ *          surface can't paint over a nearer one (the classic z-buffer, Catmull
+ *          1974; starts at "infinitely far" and keeps the nearest)
+ * Wiped each frame (fb_clear), filled by the pipeline, copied out by fb_blit. */
 typedef struct {
   float *zbuf;
   Cell *cbuf;
@@ -1259,7 +693,7 @@ static void fb_clear(Framebuffer *fb) {
   memset(fb->cbuf, 0, (size_t)(fb->cols * fb->rows) * sizeof(Cell));
 }
 
-/* fb_blit — copy framebuffer cbuf to ncurses screen. */
+/* Copies our finished page to the actual terminal, skipping empty cells. */
 static void fb_blit(const Framebuffer *fb) {
   for (int y = 0; y < fb->rows; y++) {
     for (int x = 0; x < fb->cols; x++) {
@@ -1273,23 +707,14 @@ static void fb_blit(const Framebuffer *fb) {
   }
 }
 
-/* ── §8 pipeline ─────────────────────────────────────────────────────── */
+/* ── §8 pipeline — drawing the triangles ───────────────────────────────── */
 
-/* §8.1 ── barycentric (Möller signed-area form) ─────────────────────── */
+/* §8.1 ── filling a triangle ──────────────────────────────────────────── */
 
-/*
- * Compute barycentric coordinates of point (px, py) inside triangle
- * with vertices (sx[0..2], sy[0..2]) in screen space.
- *
- * Outputs b[0..2] such that:
- *   - b[0] + b[1] + b[2] = 1
- *   - All three positive iff (px, py) is strictly inside the triangle
- *   - Each b[i] is the SIGNED RATIO of "sub-triangle area opposite
- *     vertex i" to "full triangle area"
- *
- * If the triangle is degenerate (area ≈ 0), returns negative values
- * so the caller treats it as a miss.
- */
+/* For a pixel and a triangle, returns three weights (one per corner) saying how
+ * much each corner pulls on that pixel. They tell us if the pixel is inside (all
+ * three come out positive) and how to blend the corners' values there. A
+ * degenerate (zero-area) triangle returns negatives so the caller skips it. */
 static void barycentric(const float sx[3], const float sy[3], float px,
                         float py, float b[3]) {
   float d =
@@ -1303,92 +728,79 @@ static void barycentric(const float sx[3], const float sy[3], float px,
   b[2] = 1.f - b[0] - b[1];
 }
 
-/* §8.2 ── pipeline_draw_mesh — vertex → cull → raster → fragment ────── */
+/* Takes a corner the camera has already transformed and finishes it onto the
+ * screen: divide by distance (so farther is smaller), then scale into cells.
+ * Returns (screen x, screen y, depth); y is flipped because screen rows count
+ * downward but up should be up. */
+static inline Vec3 project_to_screen(Vec4 clip, int cols, int rows) {
+  float w = clip.w;
+  if (fabsf(w) < 1e-6f)
+    w = 1e-6f;
+  return v3((clip.x / w + 1.f) * 0.5f * (float)cols,
+            (-clip.y / w + 1.f) * 0.5f * (float)rows, clip.z / w);
+}
 
-/*
- * The big function. For each triangle in the mesh:
- *   1. Run the vertex shader on its 3 vertices.
- *   2. Reject if all 3 are behind the near plane (w < ε).
- *   3. Perspective-divide to NDC, map to screen.
- *   4. Back-face cull (signed-area test).
- *   5. Walk the screen-space bounding box.
- *   6. For each pixel: barycentric check + z-test + fragment shader
- *      + paint_compute_cell + framebuffer write.
- *
- * The `is_wire` flag inserts barycentric-identity values into VSIn.u/v
- * BEFORE the vertex shader, then writes them to VSOut.custom[0..2]
- * AFTER. Inside the rasteriser, custom[0..2] are interpolated by the
- * barycentric weights. The fragment shader (frag_wire) reads those
- * three to compute distance-to-nearest-edge.
- */
+/* True if this triangle is turned away from us (the back of the cube), so we can
+ * skip it. The trick: measure the triangle's signed area on screen; with our
+ * corner ordering and the y-flip, faces toward us come out negative, so anything
+ * zero-or-positive is facing away. */
+static inline bool is_back_facing(const float sx[3], const float sy[3]) {
+  float area =
+      (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+  return area >= 0.f;
+}
+
+/* §8.2 ── draw the whole mesh, triangle by triangle ───────────────────── */
+
+/* The main drawing loop. For each triangle: run the per-corner step on its 3
+ * corners, drop it if it's behind the camera or facing away, then for every
+ * pixel it covers and is the nearest thing seen so far, blend the corners to
+ * that pixel, run the per-pixel step to get a colour, and store the cell. */
 static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
-                               ShaderProgram *sh, bool is_wire,
-                               bool cull_backface) {
+                               const ShaderProgram *sh, bool cull_backface) {
   int cols = fb->cols, rows = fb->rows;
-  static const float wu[3] = {1.f, 0.f, 0.f};
-  static const float wv[3] = {0.f, 1.f, 0.f};
 
   for (int ti = 0; ti < mesh->ntri; ti++) {
     const Triangle *tri = &mesh->tris[ti];
     VSOut vo[3];
 
-    /* (1) Run vertex shader on each of the triangle's 3 vertices. */
+    /* run the per-corner step on the triangle's 3 corners */
     for (int vi = 0; vi < 3; vi++) {
       const Vertex *vtx = &mesh->verts[tri->v[vi]];
       VSIn in;
       in.pos = vtx->pos;
       in.normal = vtx->normal;
-      in.u = is_wire ? wu[vi] : vtx->u;
-      in.v = is_wire ? wv[vi] : vtx->v;
+      in.u = vtx->u;
+      in.v = vtx->v;
       memset(&vo[vi], 0, sizeof vo[vi]);
       sh->vert(&in, &vo[vi], sh->vert_uni);
-      if (is_wire) {
-        vo[vi].custom[0] = wu[vi];
-        vo[vi].custom[1] = wv[vi];
-        vo[vi].custom[2] = 1.f - wu[vi] - wv[vi];
-        /* Suppress the shared quad diagonal so the wireframe shows real cube
-         * edges only. mesh_add_quad splits each face into tris (0,1,2)+(0,2,3);
-         * the diagonal is edge v0-v2 = custom[1]≈0 in the first tri, custom[2]≈0
-         * in the second. Inflate that channel so frag_wire never draws it. */
-        if (ti & 1)
-          vo[vi].custom[2] += 10.f;
-        else
-          vo[vi].custom[1] += 10.f;
-      }
     }
 
-    /* (2) Near-clip reject — entirely behind camera. */
-    if (vo[0].clip_pos.w < 0.001f && vo[1].clip_pos.w < 0.001f &&
-        vo[2].clip_pos.w < 0.001f)
+    /* skip it if all three corners are behind the camera */
+    if (vo[0].clip_pos.w < CLIP_W_MIN && vo[1].clip_pos.w < CLIP_W_MIN &&
+        vo[2].clip_pos.w < CLIP_W_MIN)
       continue;
 
-    /* (3) Perspective divide → screen coordinates.
-     * Y-flip because NDC has +Y up but screen rows go down. */
+    /* finish each corner onto the screen */
     float sx[3], sy[3], sz[3];
     for (int vi = 0; vi < 3; vi++) {
-      float w = vo[vi].clip_pos.w;
-      if (fabsf(w) < 1e-6f)
-        w = 1e-6f;
-      sx[vi] = (vo[vi].clip_pos.x / w + 1.f) * 0.5f * (float)cols;
-      sy[vi] = (-vo[vi].clip_pos.y / w + 1.f) * 0.5f * (float)rows;
-      sz[vi] = vo[vi].clip_pos.z / w;
+      Vec3 s = project_to_screen(vo[vi].clip_pos, cols, rows);
+      sx[vi] = s.x;
+      sy[vi] = s.y;
+      sz[vi] = s.z;
     }
 
-    /* (4) Back-face cull. After the Y-flip a front face (CCW from outside)
-     * has NEGATIVE screen-space signed area, so we keep area < 0 and cull
-     * area >= 0 (back faces + zero-area degenerates). */
-    float area =
-        (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-    if (cull_backface && area >= 0.f)
+    /* skip faces turned away from us, if culling is on */
+    if (cull_backface && is_back_facing(sx, sy))
       continue;
 
-    /* (5) Screen-space bounding box (clamped to framebuffer). */
+    /* the little box of cells the triangle could touch, clipped to the screen */
     int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
     int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
     int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
     int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
 
-    /* (6) Walk every pixel in the bbox; rasterise. */
+    /* walk those cells and fill the ones inside the triangle */
     for (int py = y0; py <= y1; py++) {
       for (int px = x0; px <= x1; px++) {
         float b[3];
@@ -1396,14 +808,14 @@ static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
         if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
           continue;
 
-        /* Z-test (linear interpolation of NDC depth). */
+        /* how near this pixel is; skip it if something nearer is already here */
         float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
         int idx = py * cols + px;
         if (z >= fb->zbuf[idx])
           continue;
         fb->zbuf[idx] = z;
 
-        /* Build fragment-shader input by barycentric interpolation. */
+        /* blend the three corners to this exact pixel for the per-pixel step */
         FSIn fsin;
         fsin.world_pos = v3_bary(vo[0].world_pos, vo[1].world_pos,
                                  vo[2].world_pos, b[0], b[1], b[2]);
@@ -1413,9 +825,6 @@ static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
         fsin.v = b[0] * vo[0].v + b[1] * vo[1].v + b[2] * vo[2].v;
         fsin.px = px;
         fsin.py = py;
-        for (int c = 0; c < 4; c++)
-          fsin.custom[c] = b[0] * vo[0].custom[c] + b[1] * vo[1].custom[c] +
-                           b[2] * vo[2].custom[c];
 
         FSOut fsout = {v3(0, 0, 0), false};
         sh->frag(&fsin, &fsout, sh->frag_uni);
@@ -1428,20 +837,32 @@ static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
   }
 }
 
-/* ── §9 scene ────────────────────────────────────────────────────────── */
+/* ── §9 scene — the cube, the camera, and the chosen look ──────────────── */
 
+/* Scene — everything about WHAT is on screen and HOW the viewer is steering it.
+ * The cube and how it's turned are the only things that change on their own each
+ * frame; the knobs are what the keys change; the rest is rebuilt from those
+ * every frame (the active look and the values it reads), kept here so the look's
+ * pointers always have a steady address to point at. */
 typedef struct {
+  /* the object and how it's turned right now */
   Mesh mesh;
-  float angle_x, angle_y;
-  float cam_dist;
-  bool paused;
-  bool cull_backface;
-  ShaderIdx shade_idx;
-  ShaderProgram shader;
-  Uniforms uni;
-  ToonUniforms toon_uni;
+  float angle_x, angle_y; /* tumble angles, nudged along by scene_tick      */
+
+  /* what the keys change */
+  float cam_dist;      /* zoom distance, limited by the +/- keys         */
+  ShaderIdx shade_idx; /* which look is showing (cycled by 's')          */
+  bool cull_backface;  /* whether to hide the inside faces ('c')         */
+  bool paused;         /* when true, the tumble freezes (space)          */
+
+  /* rebuilt from the above every frame */
+  ShaderProgram shader;  /* the active look (its two steps + value pointers) */
+  Uniforms uni;          /* transforms (from the pose) + light + material    */
+  ToonUniforms toon_uni; /* uni + band count, for the toon look              */
 } Scene;
 
+/* Points the active look's slot at the right pair of steps + values for the
+ * shader the user picked. */
 static void scene_build_shader(Scene *s) {
   switch (s->shade_idx) {
   case SH_PHONG:
@@ -1453,10 +874,10 @@ static void scene_build_shader(Scene *s) {
     s->shader = (ShaderProgram){vert_default, frag_toon, &s->uni, &s->toon_uni};
     break;
   case SH_NORMALS:
-    s->shader = (ShaderProgram){vert_normals, frag_normals, &s->uni, &s->uni};
+    s->shader = (ShaderProgram){vert_default, frag_normals, &s->uni, &s->uni};
     break;
-  case SH_WIRE:
-    s->shader = (ShaderProgram){vert_wire, frag_wire, &s->uni, &s->uni};
+  case SH_FRESNEL:
+    s->shader = (ShaderProgram){vert_default, frag_fresnel, &s->uni, &s->uni};
     break;
   default:
     break;
@@ -1470,9 +891,9 @@ static void scene_init(Scene *s, int cols, int rows) {
   s->cam_dist = CAM_DIST;
   s->cull_backface = true;
 
-  s->uni.light_pos = v3(4.f, 5.f, 4.f);
-  s->uni.light_col = v3(1.f, 1.f, 1.f);
-  s->uni.ambient = v3(0.07f, 0.07f, 0.07f);
+  s->uni.light_pos = v3(1.4f, 1.7f, 1.9f);    /* close in, so faces get a gradient */
+  s->uni.light_col = v3(1.40f, 1.34f, 1.22f); /* bright warm, lifts lit faces     */
+  s->uni.ambient = v3(0.10f, 0.10f, 0.13f);   /* dim cool fill so dark faces read */
   s->uni.shininess = 64.f;
   s->uni.cam_pos = v3(0.f, 0.f, s->cam_dist);
   s->uni.obj_color = v3(0.9f, 0.55f, 0.15f); /* warm orange */
@@ -1484,16 +905,14 @@ static void scene_init(Scene *s, int cols, int rows) {
   scene_build_shader(s);
 }
 
-/*
- * scene_set_zoom — update camera position and view matrix.
- * Called on +/- keys; rebuilds cam_pos and view so the change takes
- * effect on the very next scene_tick → mvp rebuild.
- */
+/* Moves the camera in/out after a +/- key and refreshes its look-from transform,
+ * so the new zoom shows up on the very next frame. */
 static void scene_set_zoom(Scene *s) {
   s->uni.cam_pos = v3(0.f, 0.f, s->cam_dist);
   s->uni.view = m4_lookat(s->uni.cam_pos, v3(0, 0, 0), v3(0, 1, 0));
 }
 
+/* Rebuilds the perspective for a new window size so the cube isn't stretched. */
 static void scene_rebuild_proj(Scene *s, int cols, int rows) {
   float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
   s->uni.proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
@@ -1512,20 +931,15 @@ static void scene_tick(Scene *s, float dt) {
   s->toon_uni.base = s->uni;
 }
 
-static void scene_draw(Scene *s, Framebuffer *fb) {
-  fb_clear(fb);
-  pipeline_draw_mesh(fb, &s->mesh, &s->shader, (s->shade_idx == SH_WIRE),
-                     s->cull_backface);
-  fb_blit(fb);
-}
-
 static void scene_next_shader(Scene *s) {
   s->shade_idx = (ShaderIdx)((s->shade_idx + 1) % SH_COUNT);
   scene_build_shader(s);
 }
 
-/* ── §10 screen ──────────────────────────────────────────────────────── */
+/* ── §10 screen — drawing the frame, the HUD, and showing it ───────────── */
 
+/* Screen — the terminal window: how many cells wide and tall, and the home of
+ * the ncurses setup / resize / show-it calls. */
 typedef struct {
   int cols, rows;
 } Screen;
@@ -1548,11 +962,8 @@ static void screen_resize(Screen *s) {
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * hud_draw — yellow status row 0 + cyan hint bottom row.
- * Per CLAUDE.md HUD spec: PAIR_HUD is bright yellow (xterm 226) with
- * A_BOLD; PAIR_HINT is bright cyan (xterm 51) with A_BOLD.
- */
+/* Draws the two overlay lines: a yellow status across the top (fps, current
+ * look, zoom, cull) and a cyan key reminder along the bottom. */
 static void hud_draw(const Screen *s, const Scene *sc, double fps) {
   char buf[96];
   snprintf(buf, sizeof buf, " %5.1f fps  [%s]  z:%.1f  cull:%s%s ", fps,
@@ -1579,8 +990,21 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §11 app ─────────────────────────────────────────────────────────── */
+/* Draws one frame: wipe the page, draw the cube through the current look, copy
+ * it to the screen. Reads the scene, writes only the page — never the scene. */
+static void scene_draw(const Scene *s, Framebuffer *fb) {
+  fb_clear(fb);
+  pipeline_draw_mesh(fb, &s->mesh, &s->shader, s->cull_backface);
+  fb_blit(fb);
+}
 
+/* ── §11 app — setup, the main loop, and keypresses ────────────────────── */
+
+/* App — the whole running program: the scene, the screen, the drawing page, and
+ * the loop's stop/resize flags. Not part of the 3-D world — it just bundles
+ * everything so the signal handlers and main loop share one object (g_app). The
+ * two flags are marked volatile sig_atomic_t because a signal can set them at
+ * any moment, so the compiler must always read/write them for real. */
 typedef struct {
   Scene scene;
   Screen screen;
@@ -1668,13 +1092,13 @@ int main(void) {
 
   while (app->running) {
 
-    /* §11.1 resize. */
+    /* handle a window resize if one happened */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
     }
 
-    /* §11.2 timing. */
+    /* how long since the last frame (capped, so a hiccup doesn't lurch the cube) */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
@@ -1682,10 +1106,10 @@ int main(void) {
       dt = DT_CAP_NS;
     float dt_sec = (float)dt / (float)NS_PER_SEC;
 
-    /* §11.3 advance scene state. */
+    /* advance the cube's tumble */
     scene_tick(&app->scene, dt_sec);
 
-    /* §11.4 fps rolling average over half-second windows. */
+    /* update the fps readout (averaged over half-second windows) */
     fps_cnt++;
     fps_acc += dt;
     if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1694,18 +1118,18 @@ int main(void) {
       fps_acc = 0;
     }
 
-    /* §11.5 paint frame. */
+    /* draw the frame and show it */
     erase();
     scene_draw(&app->scene, &app->fb);
     hud_draw(&app->screen, &app->scene, fps_disp);
     screen_present();
 
-    /* §11.6 input. */
+    /* handle a keypress (pause / shader / cull / zoom / quit) */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;
 
-    /* §11.7 frame cap. */
+    /* wait out the rest of the frame to hold a steady rate */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
   }

@@ -1,5 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 
+/*
+ * path_tracer.c — a tiny path tracer that draws the classic Cornell box as
+ * coloured ASCII. Rays bounce randomly around a closed box; we average
+ * thousands of these random walks per pixel, so the picture starts as noise
+ * and slowly sharpens — with soft shadows and colour bleeding between walls.
+ *
+ * Simpler sister files (same scene): sphere_raytrace.c (one bounce, no
+ * randomness), cube_raytrace.c, capsule_raytrace.c. The scene is the standard
+ * Cornell box (Goral et al. 1984); the famous compact version is Beason's
+ * "smallpt".
+ */
+
 #define _POSIX_C_SOURCE 199309L
 #include <math.h>
 #include <ncurses.h>
@@ -14,73 +26,66 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── §1 CONFIG — constants, ramp, enums (data only)
- * ──────────────────────────────────────────────────────── */
+/* ── §1  Settings you can tweak ── */
 
-/* §1.1 frame rate. PT is compute-heavy so we target 30 Hz, not 60. */
+/* §1.1 Loop speed. Tracing is slow, so we aim for 30 frames/sec, not 60. */
+#define NS_PER_SEC 1000000000LL        /* nanoseconds in a second             */
 #define TARGET_FPS 30
-#define DT_CAP_NS 200000000LL /* 0.2 s — spiral-of-death cap */
+#define DT_CAP_NS 200000000LL          /* clamp a long stall to 0.2 s so the
+                                          sim can't try to "catch up" forever */
+#define FPS_WINDOW_NS (NS_PER_SEC / 2) /* refresh the fps readout twice a sec */
 
-/* §1.2 view geometry. */
-#define ASPECT 0.47f  /* terminal cell W/H ratio    */
-#define FOV_DEG 66.0f /* horizontal FOV             */
+/* §1.2 The camera lens. */
+#define ASPECT 0.47f  /* characters are taller than wide; this squares pixels */
+#define FOV_DEG 66.0f /* how wide an angle the camera takes in                */
 
-/* §1.3 path tracing. */
-#define MAX_DEPTH 7   /* hard depth cap per path     */
-#define RR_DEPTH 3    /* RR starts at this depth     */
-#define SPP_DEFAULT 2 /* samples per pixel per frame */
+/* §1.3 How rays bounce. */
+#define MAX_DEPTH 7    /* give up on a ray after this many bounces            */
+#define RR_DEPTH 3     /* after this many bounces, start randomly dropping
+                          dim rays to save work (see russian_roulette)        */
+#define SPP_DEFAULT 2  /* rays fired per pixel each frame                     */
 #define SPP_MIN 1
 #define SPP_MAX 8
-#define ACCUM_CAP 8192 /* auto-pause once converged   */
-#define RAY_EPS 1e-4f  /* origin offset along N       */
+#define ACCUM_CAP 8192 /* stop adding rays once the image is clean enough     */
+#define RAY_EPS 1e-4f  /* nudge a bounced ray off the surface it left, so it
+                          doesn't immediately "hit" itself                    */
 
-#define MAX_W 320 /* static accumulator width    */
-#define MAX_H 100 /* static accumulator height   */
+#define MAX_W 320 /* biggest screen we plan for — the image buffer is this big */
+#define MAX_H 100
 
 /*
- * §1.4 Cornell box coordinate system:
- *   x ∈ [-1, 1]   left (red) → right (green)
- *   y ∈ [-1, 1]   floor → ceiling
- *   z ∈ [ 0, 2]   open front → back wall
- *   Camera at (0, 0.05, -1.5) looking toward +Z. The front face
- *   (z = 0) is open so the camera sees in.
+ * §1.4 Where things sit in the box. x runs left(red)→right(green), y runs
+ * floor→ceiling, z runs from the open front toward the back wall. The camera
+ * sits just outside the open front looking in.
  */
 #define CAM_X 0.00f
 #define CAM_Y 0.05f
 #define CAM_Z -1.50f
 
-/* §1.5 character ramp — Paul Bourke 92-char density ladder. */
+/* §1.5 Characters ordered dark→bright; we pick one by how bright a pixel is.
+ * (Paul Bourke's 92-character ramp.) */
 static const char k_ramp[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define RAMP_LEN ((int)(sizeof k_ramp - 1))
 
-/* §1.6 ncurses pair IDs. */
-#define PAIR_CUBE_BASE 1   /* + 0..215 = 6×6×6 cube       */
-#define PAIR_HUD 217       /* yellow row 0 status         */
-#define PAIR_HINT 218      /* cyan bottom hint strip      */
-#define PAIR_BAR_FILL 219  /* progress-bar filled cells   */
-#define PAIR_BAR_EMPTY 220 /* progress-bar empty cells    */
+/* §1.6 Colour slots we hand to ncurses. */
+#define PAIR_CUBE_BASE 1   /* start of the 216-colour block (6×6×6 cube) */
+#define PAIR_HUD 217       /* yellow status text         */
+#define PAIR_HINT 218      /* cyan key-hint strip        */
+#define PAIR_BAR_FILL 219  /* filled part of the bar     */
+#define PAIR_BAR_EMPTY 220 /* empty part of the bar      */
 
-/* §1.7 shade-mode enum (cycled with 'd'). See T12 + §14.
- *
- *   MODE_PT      full progressive Monte Carlo path tracer (default).
- *                Uses passes 1-7.
- *   MODE_NORMAL  first-hit surface normal as RGB. Passes 1+2 only.
- *   MODE_ALBEDO  first-hit material colour. Passes 1+2+3 only.
- *   MODE_DEPTH   first-hit 1/(1+t) gray. Passes 1+2 only.
- *
- * NORMAL/ALBEDO/DEPTH are deterministic — they converge in 1 sample
- * because no randomness is involved. Switching modes resets the
- * accumulator (their output ranges differ; mixing them under one
- * average would produce incoherent results).
- */
+/* §1.7 What to draw, toggled with the 'd' key. PT is the real renderer; the
+ * other three are quick diagnostic views that stop at the first thing a ray
+ * hits, so they show up instantly with no bouncing or randomness. Switching
+ * views throws away the running image, since the views aren't comparable. */
 typedef enum {
-  MODE_PT = 0,     /* full path tracing — the real Monte-Carlo render  */
-  MODE_NORMAL = 1, /* AOV: first-hit normal as RGB (passes 1-2)        */
-  MODE_ALBEDO = 2, /* AOV: first-hit material colour (passes 1-3)      */
-  MODE_DEPTH = 3,  /* AOV: first-hit 1/(1+t) gray (passes 1-2)         */
-  MODE_N = 4,      /* count — enables % MODE_N wraparound              */
+  MODE_PT = 0,     /* the real path tracer — bounces light, builds up slowly */
+  MODE_NORMAL = 1, /* colour each surface by which way it faces              */
+  MODE_ALBEDO = 2, /* each surface's own colour, with no lighting            */
+  MODE_DEPTH = 3,  /* grey by distance: near is bright, far is dark          */
+  MODE_N = 4,      /* how many views there are, so 'd' can wrap around       */
 } ShadeMode;
 
 static const char *shade_mode_name(ShadeMode m) {
@@ -98,55 +103,44 @@ static const char *shade_mode_name(ShadeMode m) {
   }
 }
 
-/* ── §2 PERFORMANCE — monotonic clock + sleep
- * ───────────────────────────────────────────────────────── */
+/* §1.7.1 The light is enormously brighter than the walls, so in the ALBEDO
+ * view we shrink it by this much — otherwise it would just blow out to white. */
+#define ALBEDO_LIGHT_SCALE 0.06f
 
-/*
- * clock_ns — wall-clock time in nanoseconds, monotonic.
- *
- * Why CLOCK_MONOTONIC: we care about ELAPSED real time (for animation
- * dt), not wall date. CLOCK_MONOTONIC never goes backward across NTP
- * adjustments, DST shifts, or system clock changes.
- */
+/* §1.8 Turning brightness into something a screen can show. Light values have
+ * no upper limit, but the screen tops out, so we squash them into 0..1. We pin
+ * the squash so the ceiling light lands at pure white and the bright surfaces
+ * spread out near the top instead of bunching together. EXPOSURE is an overall
+ * brightness dial (1.0 = leave as-is); raise it only if the box looks dim. */
+#define TONE_WHITE 15.0f   /* brightness that should come out pure white   */
+#define TONE_EXPOSURE 1.0f /* overall brightness dial                      */
+#define DISPLAY_GAMMA 2.2f /* matches how screens map values to brightness */
+
+/* ── §2  Clock and sleep ── */
+
+/* CLOCK_MONOTONIC, not the wall clock: it only ever counts forward, so a clock
+ * change (NTP, daylight saving) can't make our elapsed-time math go negative. */
 static long long clock_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  return ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
-/*
- * clock_sleep_ns — best-effort sleep for the requested nanoseconds.
- *
- * The main loop uses this to cap render rate without burning the CPU
- * at 100%; we subtract elapsed work time from the target frame and
- * sleep the remainder.
- */
+/* Sleeps off the leftover time in a frame so we don't peg a CPU core at 100%. */
 static void clock_sleep_ns(long long ns) {
   if (ns <= 0)
     return;
-  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  struct timespec ts = {ns / NS_PER_SEC, ns % NS_PER_SEC};
   nanosleep(&ts, NULL);
 }
 
-/* ── §3 LOGIC: vec3 math (pure)
- * ────────────────────────────────────────────────────────── *
- *
- * V3 — three floats by value. All vector helpers are inline to avoid
- * call overhead in the per-bounce loop.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §3  3-D vector math ── */
 
-/*
- * V3 — a point or direction in 3-D world space, and (reused) a linear-HDR RGB
- * colour, since both are three floats under the same algebra. By value: 12
- * bytes in registers, keeping the helpers pure and cheap in the per-bounce
- * loop. No homogeneous w — path tracing intersects analytically, with no
- * projective divide. Ref: Shirley, "Ray Tracing in One Weekend"; Foley & van
- * Dam, vectors ch.
- */
+/* Three floats. We use it for a point in space, a direction, OR a colour
+ * (red/green/blue) — all three are just three numbers we add and scale the
+ * same way, so one type and one set of helpers covers all of them. */
 typedef struct {
-  float x, y,
-      z; /* Cartesian components — or linear R,G,B when used as colour */
+  float x, y, z;
 } V3;
 
 static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
@@ -173,43 +167,21 @@ static inline V3 v3cross(V3 a, V3 b) {
             a.x * b.y - a.y * b.x);
 }
 
-/* v3maxc — maximum channel of a V3. Used by Russian roulette to pick
- * the survival probability (T9: max, not mean, to keep paths whose
- * energy is concentrated in a single colour band). */
+/* Biggest of the three numbers. Russian roulette uses it to judge how much
+ * "life" a ray has left — the brightest channel, not the average, so a ray
+ * carrying mostly deep red doesn't get thrown away too early. */
 static inline float v3maxc(V3 a) {
   return a.x > a.y ? (a.x > a.z ? a.x : a.z) : (a.y > a.z ? a.y : a.z);
 }
 
-/* ── §4 LOGIC: RNG — xorshift32, decorrelated per pixel/frame (pure given seed)
- * ──────────── *
- *
- * Path tracing needs LOTS of random numbers (sub-pixel jitter + 2 per
- * cosine-hemisphere sample × MAX_DEPTH bounces × SPP × cols × rows).
- * Quality matters less than throughput: we use xorshift32, a single-
- * register PRNG with a period of 2³² − 1 — plenty for a single frame.
- *
- * Decorrelation: every (pixel, frame) gets an independent seed via a
- * small hash. Without that, neighbouring pixels would receive
- * correlated sequences and the noise would form visible streaks.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §4  Random numbers ── */
 
-/*
- * Rng — a 32-bit xorshift PRNG state (one word). Each pixel-frame gets an
- * independent seed (rng_seed) so neighbours don't share a sequence and the
- * noise stays unstructured; rng_f advances it and returns a float in [0,1).
- * Threaded by pointer through the path, so the LOGIC layer has no hidden global
- * RNG. Ref: Marsaglia (2003) "Xorshift RNGs", J. Statistical Software 8(14).
- */
+/* Path tracing burns through a huge number of random values, so we use a fast,
+ * cheap generator (xorshift). Its whole state is one 32-bit number, which we
+ * pass around by pointer rather than keeping a hidden global one. */
 typedef uint32_t Rng;
 
-/*
- * rng_f — uniform float in [0, 1) via xorshift32.
- *
- * The shift triple (13, 17, 5) is Marsaglia's, with the upper bit
- * masked off (>>1) so the result is non-negative when reinterpreted
- * via the integer-to-float divide.
- */
+/* Advances the generator and returns a random float in [0, 1). */
 static float rng_f(Rng *rng_state) {
   *rng_state ^= *rng_state << 13;
   *rng_state ^= *rng_state >> 17;
@@ -217,14 +189,9 @@ static float rng_f(Rng *rng_state) {
   return (float)(*rng_state >> 1) * (1.f / (float)0x7FFFFFFF);
 }
 
-/*
- * rng_seed — produce an independent seed for (px, py, frame).
- *
- * The three large primes + xorshift warm-up scramble the components
- * so adjacent pixels and adjacent frames don't share correlated
- * sequences. Without decorrelation, neighbouring pixels would receive
- * the same sample sequence and the noise would form visible streaks.
- */
+/* Gives each pixel, on each frame, its own starting seed. Without this,
+ * neighbouring pixels would share the same "random" sequence and the noise
+ * would line up into visible streaks instead of looking like static. */
 static Rng rng_seed(int pixel_x, int pixel_y, int frame) {
   uint32_t s = (uint32_t)(pixel_x * 1973 + pixel_y * 9277 + frame * 26699 + 1);
   s ^= s << 13;
@@ -233,36 +200,21 @@ static Rng rng_seed(int pixel_x, int pixel_y, int frame) {
   return s ? s : 1u;
 }
 
-/* ── §5 CONFIG/DATA + LOGIC: Cornell-box scene — Mat/Quad/Sphere types + scene
- * data + mat_is_light ─────────────────────────────────────────── *
+/* ── §5  What's in the box ──
  *
- * The Cornell Box has just three primitive types:
- *   §5.1 Material (Lambertian diffuse only)
- *   §5.2 Quad (axis-aligned rectangle)
- *   §5.3 Sphere
- *
- * Six quads form the walls (floor, ceiling, back, left, right, plus
- * the small ceiling light). Two spheres sit on the floor. That's the
- * entire geometry — six rectangles and two balls.
- *
- * See tutorial T11 for the scene's history and what it specifically
- * tests.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* §5.1 ── Material ──────────────────────────────────────────────────── */
-
-/*
- * Mat — a surface material: Lambertian diffuse reflectance plus optional
- * emission. The only material model in this Cornell box.
- * With Lambertian BRDF f_r = albedo/π and cosine-weighted hemisphere sampling
- * p(ω) = cosθ/π (T6), the Monte-Carlo estimator simplifies to weight = albedo —
- * which is why "throughput *= albedo" is the ENTIRE bounce update (§10 + §12).
- * Ref: Kajiya (1986) "The Rendering Equation"; Lambert's cosine law.
+ * The whole scene is six flat walls (floor, ceiling, back, left, right, and a
+ * small lamp on the ceiling) plus two balls on the floor. That's it.
  */
+
+/* §5.1  A surface's look. `albedo` is how much red/green/blue it bounces back
+ * (0..1 each — the red wall bounces lots of red, almost no green or blue), and
+ * `emit` is light it gives off (zero for everything but the lamp). Every
+ * surface here is matte — it scatters light evenly in all directions — which is
+ * exactly why a bounce later boils down to "multiply the ray's colour by
+ * albedo" and nothing more. */
 typedef struct {
-  V3 albedo; /* diffuse reflectance per channel, [0,1]³        */
-  V3 emit;   /* emitted radiance (light sources only; else 0)  */
+  V3 albedo; /* fraction of each colour it reflects, 0..1 */
+  V3 emit;   /* light it gives off; nonzero only for the lamp */
 } Mat;
 
 static const Mat k_mats[] = {
@@ -278,29 +230,19 @@ static inline bool mat_is_light(const Mat *m) {
   return m->emit.x > 0.f || m->emit.y > 0.f || m->emit.z > 0.f;
 }
 
-/* §5.2 ── Quad (axis-aligned rectangular plane) ───────────────────── */
-
-/*
- * Quad — an axis-aligned rectangle: a Cornell-box wall / floor / ceiling, or
- * the light. Encoding a wall as "fixed coordinate on one axis + bounds on the
- * other two" makes the ray test a single divide + two range checks (§7.1) — far
- * cheaper than a triangle, and exact.
- *   axis = 0 → X-plane (lo/hi bound Y,Z); 1 → Y-plane (X,Z); 2 → Z-plane (X,Y)
- * Ref: ray vs axis-aligned plane — Shirley, "Fundamentals of Computer
- * Graphics".
- */
+/* §5.2  A flat rectangle lined up with the axes — a wall, floor, ceiling, or
+ * the lamp. We store it as "pinned on one axis, with a min/max box on the other
+ * two," which makes the ray test cheap and exact (one divide, two range
+ * checks). `axis` says which direction it's pinned along. */
 typedef struct {
-  int axis;           /* 0=X plane, 1=Y plane, 2=Z plane              */
-  float pos;          /* coordinate of the plane on its fixed axis    */
-  float lo[2], hi[2]; /* bounds in the two free axes                  */
-  int mat;            /* material index into k_mats                   */
+  int axis;           /* which axis it lies flat against: 0=x, 1=y, 2=z */
+  float pos;          /* where it sits along that axis                  */
+  float lo[2], hi[2]; /* min/max along the other two axes               */
+  int mat;            /* which material (row in the table above)        */
 } Quad;
 
-/*
- * Cornell-box quads. The light at y = 0.98 sits just below the ceiling
- * (y = 1.0); rays going UP through the light's XZ footprint hit it
- * before the ceiling (smaller t) and pick up the emission.
- */
+/* The six walls and the lamp. The lamp hangs a hair below the ceiling so a ray
+ * heading straight up reaches the lamp first and picks up its light. */
 static const Quad k_quads[] = {
     /* floor    y=-1   x∈[-1,1] z∈[0,2] */ {
         1, -1.0f, {-1.f, 0.f}, {1.f, 2.f}, 0},
@@ -317,19 +259,13 @@ static const Quad k_quads[] = {
 };
 #define N_QUADS ((int)(sizeof k_quads / sizeof k_quads[0]))
 
-/* §5.3 ── Sphere ───────────────────────────────────────────────────── */
-
-/*
- * Sphere — a diffuse sphere primitive (the two balls on the floor), intersected
- * by the textbook ray-sphere quadratic (§7.2).
- * The two sit with bottoms at y ≈ -0.98 (floor at y = -1.0): a small gap that
- * avoids numerical self-intersection between sphere and floor.
- * Ref: ray-sphere intersection — Shirley, "Ray Tracing in One Weekend".
- */
+/* §5.3  One of the two balls on the floor: a centre and a radius. They rest a
+ * hair above the floor so the ball and the floor don't fight over which one a
+ * ray touches right at the contact point. */
 typedef struct {
-  V3 c;    /* centre (world space)        */
-  float r; /* radius                      */
-  int mat; /* material index into k_mats  */
+  V3 c;    /* centre */
+  float r; /* radius */
+  int mat; /* which material (row in the table above) */
 } Sphere;
 
 static const Sphere k_spheres[] = {
@@ -338,129 +274,80 @@ static const Sphere k_spheres[] = {
 };
 #define N_SPHERES ((int)(sizeof k_spheres / sizeof k_spheres[0]))
 
-/* ── §6 LOGIC: PASS 1 — camera ray generation (pure)
- * ──────────────────────────────── *
- *
- * Pass 1 turns a pixel index (col, row) into a world-space Ray.
- *
- * The camera is a pinhole at (CAM_X, CAM_Y, CAM_Z) looking down +Z.
- * Each pixel maps to a screen-space (u, v) which we offset with sub-
- * pixel jitter for free anti-aliasing.
- *
- *      pixel (col, row)              world-space ray
- *      ┌─────┐                       ┌─────────────────────────┐
- *      │     │                       │ origin: camera position │
- *      │  +  │   ──── camera_ray ──▶ │ dir   : norm(forward    │
- *      │     │                       │              + u·right  │
- *      └─────┘                       │              + v·up   ) │
- *                                    └─────────────────────────┘
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * Ray — a parametric half-line P(t) = origin + t·dir (t ≥ 0), the unit of work
- * every intersection test consumes. dir is kept unit-length so t reads as world
- * distance. Ref: parametric ray — Shirley, "Ray Tracing in One Weekend".
- */
+/* §5.4  Everything to render in one bundle, so each function below takes a
+ * single `const Scene *` instead of reaching for these globals by name: the
+ * material table, the walls, and the balls (with how many of each). */
 typedef struct {
-  V3 origin; /* ray origin (camera, or a bounce point)  */
-  V3 dir;    /* unit direction; P(t) = origin + t·dir   */
+  const Mat *mats;
+  const Quad *quads;
+  int n_quads;
+  const Sphere *spheres;
+  int n_spheres;
+} Scene;
+
+static const Scene k_scene = {k_mats, k_quads, N_QUADS, k_spheres, N_SPHERES};
+
+/* ── §6  Step 1: from a pixel to a ray ── */
+
+/* The camera is a single point you look out from (a pinhole). `fov_deg` is how
+ * wide it sees; `aspect` squashes things sideways so the box doesn't look
+ * stretched, since terminal characters are taller than they are wide. */
+typedef struct {
+  V3 origin;
+  float fov_deg;
+  float aspect;
+} Camera;
+
+static const Camera k_camera = {{CAM_X, CAM_Y, CAM_Z}, FOV_DEG, ASPECT};
+
+/* A ray: a start point and a direction, like a laser pointer. Every point on it
+ * is origin + t·dir, and because dir has length 1, t is simply how far along we
+ * are. This is the one thing every "what do I hit?" test works on. */
+typedef struct {
+  V3 origin;
+  V3 dir; /* length 1, so t reads straight off as a distance */
 } Ray;
 
-/*
- * camera_ray — produce a primary ray for pixel (col, row).
- *
- * Pseudocode:
- *   centre_x = cols / 2          centre_y = rows / 2
- *   tan_half = tan(FOV / 2)
- *   u =  ((col + jitter_x) - centre_x) / centre_x  *  tan_half
- *   v = -((row + jitter_y) - centre_y) / centre_x  *  tan_half / ASPECT
- *   ray.origin = camera position
- *   ray.dir    = norm(forward + u·right + v·up)
- *
- * Why divide v by centre_x (NOT centre_y): we want square pixels in
- * world space — equal angular extent per cell on both axes. Then we
- * correct for the terminal cell's aspect ratio (cells are taller
- * than wide) by a final /ASPECT.
- *
- * Why the negative sign on v: row indices increase downward (y-down)
- * but world-space "up" is +Y (y-up). Negate so the world's +Y maps
- * to the top of the screen (lower row numbers).
- *
- * jitter_x, jitter_y ∈ [-0.5, +0.5] gives free anti-aliasing — each
- * sample's primary ray pierces a slightly different sub-pixel point;
- * averaging filters out staircase aliasing along edges.
- */
-static Ray camera_ray(int col, int row, int cols, int rows, float jitter_x,
-                      float jitter_y) {
+/* Aims a ray from the camera out through one pixel. The tiny jitter (a random
+ * fraction of a pixel) makes each ray pierce a slightly different spot inside
+ * the pixel; averaging those samples smooths the jagged stair-steps off edges.
+ * The minus sign on the vertical flips it, because screen rows count downward
+ * while up in the world is +y. */
+static Ray camera_ray(const Camera *cam, int col, int row, int cols, int rows,
+                      float jitter_x, float jitter_y) {
   (void)rows; /* v normalised by cols */
   float centre_x = cols * 0.5f;
   float centre_y = rows * 0.5f;
-  float tan_half = tanf(FOV_DEG * (float)M_PI / 360.f);
+  float tan_half = tanf(cam->fov_deg * (float)M_PI / 360.f);
 
   float u = ((col + jitter_x) - centre_x) / centre_x * tan_half;
-  float v = -((row + jitter_y) - centre_y) / centre_x * tan_half / ASPECT;
+  float v = -((row + jitter_y) - centre_y) / centre_x * tan_half / cam->aspect;
 
   V3 forward = v3(0, 0, 1);
   V3 right = v3(1, 0, 0);
   V3 up = v3(0, 1, 0);
 
   Ray ray;
-  ray.origin = v3(CAM_X, CAM_Y, CAM_Z);
+  ray.origin = cam->origin;
   ray.dir = v3norm(v3add(forward, v3add(v3s(u, right), v3s(v, up))));
   return ray;
 }
 
-/* ── §7 LOGIC: PASS 2 — scene intersection (pure)
- * ─────────────────────────────────── *
- *
- * Pass 2 finds the closest surface a Ray hits.
- *
- * Three short tests:
- *   §7.1 ray_quad    — ray vs axis-aligned rectangle
- *   §7.2 ray_sphere  — ray vs sphere (textbook quadratic)
- *   §7.3 scene_hit   — try every primitive, keep the nearest
- *
- * No spatial structures — N is small (8 primitives). A real renderer
- * would put a BVH here; we keep it brute-force for clarity.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §7  Step 2: what does the ray hit first? ── */
 
-/*
- * Hit — the intersection record: where the ray met the nearest surface and what
- * it is. The normal N is oriented TOWARD the incoming ray, so §9's hemisphere
- * sampling always yields outgoing directions without a later flip.
- * Ref: ray-scene hit record — Shirley, "Ray Tracing in One Weekend".
- */
+/* What we learned at the nearest hit: how far (`t`), the exact point (`P`),
+ * which way the surface faces there (`N`), and which material it is. We always
+ * flip `N` to point back toward the ray, which keeps the bounce code in §9
+ * simple — it never has to wonder which side it's looking at. */
 typedef struct {
-  float t; /* ray parameter of the hit (world distance)  */
-  V3 P, N; /* hit position; normal (oriented toward ray) */
-  int mat; /* material index into k_mats                 */
+  float t; /* distance along the ray to the hit         */
+  V3 P, N; /* the hit point, and which way the surface faces (toward the ray) */
+  int mat; /* which material (row in the table)         */
 } Hit;
 
-/* §7.1 ── ray vs axis-aligned quad ─────────────────────────────────── */
-
-/*
- * ray_quad — analytic intersection of a ray with one axis-aligned
- *            rectangle.
- *
- * Pseudocode:
- *   On the FIXED axis, find t at which the ray crosses the plane:
- *     dir_a, origin_a = ray.dir[axis], ray.origin[axis]
- *     if |dir_a| < ε:   ray is parallel → MISS
- *     t = (q->pos - origin_a) / dir_a
- *     if t < t_min:     behind us → MISS
- *
- *   Compute the hit point's two FREE-axis coordinates and check
- *   against the rectangle's bounds:
- *     hit_point = ray.origin + t · ray.dir
- *     u, v      = hit_point's two free-axis components
- *     if u or v outside [lo, hi]:   MISS
- *
- *   The outward normal is the basis vector of the FIXED axis with
- *   sign chosen to FACE the incoming ray (so subsequent hemisphere
- *   sampling puts directions on the outgoing side automatically).
- */
+/* Does the ray cross this rectangle, and if so how far away? Because the
+ * rectangle is axis-aligned, this is just: find where the ray crosses its flat
+ * plane, then check the two sideways coordinates land inside the box. */
 static int ray_quad(Ray ray, const Quad *quad, float t_min, float *out_t,
                     V3 *out_normal) {
   float dir_a, origin_a;
@@ -508,7 +395,7 @@ static int ray_quad(Ray ray, const Quad *quad, float t_min, float *out_t,
       free_axis_v < quad->lo[1] || free_axis_v > quad->hi[1])
     return 0;
 
-  /* Outward normal: basis vector of fixed axis, sign opposing ray. */
+  /* Which way this face points — pick the sign so it faces back at the ray. */
   V3 normal = {0, 0, 0};
   switch (quad->axis) {
   case 0:
@@ -526,24 +413,9 @@ static int ray_quad(Ray ray, const Quad *quad, float t_min, float *out_t,
   return 1;
 }
 
-/* §7.2 ── ray vs sphere ─────────────────────────────────────────────── */
-
-/*
- * ray_sphere — analytic intersection via the textbook quadratic.
- *
- * Setup: |ray.origin + t·ray.dir − centre|² = radius². With unit-
- * length ray.dir, this expands to
- *
- *     t² + 2·b·t + (|origin_to_centre|² − radius²) = 0
- *
- * where b = ray.dir · origin_to_centre.
- *
- * Discriminant disc = b² − (|origin_to_centre|² − radius²).
- * Roots t = -b ± √disc. We pick the nearest root that's beyond
- * t_min (front face for an outside ray; far root only if the ray
- * starts INSIDE the sphere, which can't happen here — diffuse
- * surfaces don't let rays in).
- */
+/* Does the ray hit this ball, and how far away? Solving "where is the ray
+ * exactly one radius from the centre?" gives a quadratic; `disc < 0` means the
+ * ray sails past and misses. We take the nearer of the two crossings. */
 static int ray_sphere(Ray ray, const Sphere *sphere, float t_min,
                       float *out_t) {
   V3 origin_to_centre = v3sub(ray.origin, sphere->c);
@@ -563,384 +435,213 @@ static int ray_sphere(Ray ray, const Sphere *sphere, float t_min,
   return 1;
 }
 
-/* §7.3 ── scene_hit (find nearest surface) ─────────────────────────── */
-
-/*
- * scene_hit — loop over all primitives, keep the smallest valid t.
- *
- * For 6 quads + 2 spheres this brute-force test is fine; a real
- * renderer would put a BVH here, but BVH belongs in a separate
- * teaching file (raymarcher.c uses spatial structures).
- *
- * The sphere normal is computed AFTER selection: an outward normal
- * `(P − centre)/r`, then flipped if it points away from the ray
- * (ensuring the hemisphere sampler gets a normal on the outgoing
- * side, regardless of front/back hit).
- */
-static int scene_hit(Ray ray, float t_min, Hit *out_hit) {
-  float t_best = 1e30f;
+/* Tries the ray against every wall and ball and keeps the closest hit. Only 8
+ * shapes, so plain brute force is fine — no fancy spatial index needed. */
+static int scene_hit(const Scene *scene, Ray ray, float t_min, Hit *out_hit) {
+  float t_best = 1e30f; /* nearest hit so far; starts effectively infinite */
   int any = 0;
 
-  for (int i = 0; i < N_QUADS; i++) {
+  for (int i = 0; i < scene->n_quads; i++) {
     float t;
     V3 normal;
-    if (ray_quad(ray, &k_quads[i], t_min, &t, &normal) && t < t_best) {
+    if (ray_quad(ray, &scene->quads[i], t_min, &t, &normal) && t < t_best) {
       t_best = t;
       out_hit->t = t;
       out_hit->P = v3add(ray.origin, v3s(t, ray.dir));
       out_hit->N = normal;
-      out_hit->mat = k_quads[i].mat;
+      out_hit->mat = scene->quads[i].mat;
       any = 1;
     }
   }
-  for (int i = 0; i < N_SPHERES; i++) {
+  for (int i = 0; i < scene->n_spheres; i++) {
     float t;
-    if (ray_sphere(ray, &k_spheres[i], t_min, &t) && t < t_best) {
+    if (ray_sphere(ray, &scene->spheres[i], t_min, &t) && t < t_best) {
       t_best = t;
       out_hit->t = t;
       out_hit->P = v3add(ray.origin, v3s(t, ray.dir));
-      V3 outward_n = v3norm(v3sub(out_hit->P, k_spheres[i].c));
-      /* Flip outward normal to face the incoming ray. */
+      V3 outward_n = v3norm(v3sub(out_hit->P, scene->spheres[i].c));
+      /* point the surface direction back toward the ray */
       out_hit->N =
           (v3dot(outward_n, ray.dir) < 0.f) ? outward_n : v3s(-1.f, outward_n);
-      out_hit->mat = k_spheres[i].mat;
+      out_hit->mat = scene->spheres[i].mat;
       any = 1;
     }
   }
   return any;
 }
 
-/* ── §8 LOGIC: PASS 3 — shading decision (pure)
- * ───────────────────────────────────── *
- *
- * Pass 3 looks up the Material at a hit point. Trivial here (it's
- * just an array index) but factored into a named function so the
- * spine of the algorithm reads as "every pass = one operation".
- *
- * In a real renderer this is where you'd dispatch on material type:
- * diffuse vs specular vs glass vs subsurface. We have one type
- * (Lambertian) so it's a one-liner — but the conceptual stage is
- * real and the orchestrator (§12) calls it explicitly.
- *
- * The actual shading DECISION ("emissive? then accumulate and stop;
- * otherwise prepare to bounce") happens in path_trace using the
- * Material this function returns. That decision belongs with the
- * orchestrator, not with the lookup.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §8  Step 3: which material did we hit? ── */
 
-static const Mat *shade_at_hit(const Hit *hit) { return &k_mats[hit->mat]; }
+/* Looks up the material for a hit. It's a one-line lookup, but giving it a name
+ * keeps the main loop reading as one clean step per stage. */
+static const Mat *shade_at_hit(const Scene *scene, const Hit *hit) {
+  return &scene->mats[hit->mat];
+}
 
-/* ── §9 LOGIC: PASS 4 — bounce direction sampling (pure; advances threaded RNG)
- * ──────────────────────────── *
- *
- * Pass 4 picks a random new direction from the BRDF's importance-
- * sampled distribution. For Lambertian we use cosine-weighted
- * hemisphere sampling via Malley's method (T6, T7).
- *
- * Two helper functions:
- *   §9.1 onb              — orthonormal basis around a normal
- *   §9.2 sample_bounce    — Malley's method (was cos_sample_hemi)
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §9  Step 4: pick a random bounce direction ── */
 
-/* §9.1 ── onb: orthonormal basis around a normal ────────────────────── */
-
-/*
- * onb — construct two perpendicular unit vectors so {u, v, n} is a
- *       right-handed orthonormal basis.
- *
- * Used by the cosine-hemisphere sampler to translate "local +Z =
- * normal" samples into world coordinates.
- *
- * The "pick non-parallel up" trick: if n is mostly along X (|n.x| ≥
- * 0.9) use Y as the seed; otherwise use X. Either way `up × n` is
- * non-zero, so v3cross produces a valid perpendicular.
- */
+/* Builds two directions at right angles to `normal`, so together with the
+ * normal they form a little 3-axis frame standing on the surface. The bounce
+ * sampler works in that frame and then maps the result back into the world.
+ * The if-test just avoids picking a starter axis that's nearly parallel to the
+ * normal (which would collapse to zero). */
 static void onb(V3 normal, V3 *out_u, V3 *out_v) {
   V3 up = (fabsf(normal.x) < 0.9f) ? v3(1, 0, 0) : v3(0, 1, 0);
   *out_u = v3norm(v3cross(up, normal));
   *out_v = v3cross(normal, *out_u);
 }
 
-/* §9.2 ── sample_bounce: cosine-weighted hemisphere sample ──────────── */
-
-/*
- * sample_bounce — Malley's method (1988): the 2-D uniform-disk
- *                 sampling distribution, lifted to a hemisphere via
- *                 z = √(1 − r²), produces a 3-D distribution whose
- *                 density is exactly cosθ/π — exactly what we need.
- *
- *   r1 ∈ [0, 1)  →  φ = 2π · r1                  azimuth
- *   r2 ∈ [0, 1)  →  in-plane radius = √r2        (uniform on disc)
- *                   z              = √(1 − r2)   (lift onto hemisphere)
- *
- * Local sample is (cosφ·√r2, sinφ·√r2, √(1−r2)). Transform to world
- * using the (u, v, n) basis from §9.1.
- *
- * Why this beats rejection sampling:
- *   • Always two RNG calls — no loop with worst-case unbounded retries.
- *   • Numerically stable at grazing angles where rejection thrashes.
- *   • PDF analytically known and matches the Lambertian BRDF — the
- *     algebraic cancellation in T6 hinges on this.
- *
- * See tutorial T7 for the diagram.
- */
+/* Picks a random direction for the ray to bounce off a matte surface. Directions
+ * facing straight out are favoured over grazing ones (Malley's trick: scatter
+ * points evenly on a flat disc, then lift them onto the dome). Doing it this way
+ * — rather than guess-and-retry — is what later lets a bounce be just "multiply
+ * by albedo," with no extra angle terms to carry around. */
 static V3 sample_bounce(V3 normal, Rng *rng_state) {
   float r1 = rng_f(rng_state);
   float r2 = rng_f(rng_state);
   float phi = 2.f * (float)M_PI * r1;
-  float sr2 = sqrtf(r2); /* sinθ */
+  float sr2 = sqrtf(r2);
   float local_x = cosf(phi) * sr2;
   float local_y = sinf(phi) * sr2;
-  float local_z = sqrtf(1.f - r2); /* cosθ */
+  float local_z = sqrtf(1.f - r2);
   V3 basis_u, basis_v;
   onb(normal, &basis_u, &basis_v);
   return v3norm(v3add(v3s(local_x, basis_u),
                       v3add(v3s(local_y, basis_v), v3s(local_z, normal))));
 }
 
-/* ── §10 LOGIC: PASS 5 — throughput chain (pure)
- * ──────────────────────────────────── *
- *
- * Pass 5 is one line of arithmetic: throughput *= albedo.
- *
- * Why it deserves its own §-section: this single multiplication is
- * the entire BRDF evaluation in our path tracer. Cosine-weighted
- * hemisphere sampling cancelled the cosθ and the π (T6), leaving
- * just "multiply by albedo" as the bounce update. Every other path
- * tracer has a more elaborate update; ours is one of the most
- * stripped-down possible.
- *
- * After N bounces:
- *   throughput = albedo_1 · albedo_2 · … · albedo_N
- *
- * That product encodes "what fraction of any light we eventually
- * find will reach the camera through this exact path". When the
- * path finally hits an emissive surface, multiplying its emission
- * by this throughput gives the contribution of this random walk —
- * see T8's worked example.
- *
- * The function below is an inline one-liner; in a textbook this
- * might be a paragraph of comment with no code at all. Naming it
- * makes Pass 5 greppable.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §10  Step 5: track the ray's leftover colour ── */
 
+/* A bounce keeps only the share of light the surface reflects, so we multiply
+ * the ray's running colour by the surface's albedo. After a few bounces this
+ * product is "how much of whatever light we finally reach will make it back to
+ * the eye along this path" — and it's why the red wall tints nearby surfaces
+ * red as the picture builds up. */
 static inline V3 throughput_chain(V3 throughput, V3 albedo) {
   return v3mul(throughput, albedo);
 }
 
-/* ── §11 LOGIC: PASS 6 — Russian-roulette termination (pure; advances threaded
- * RNG) ───────────────────────────────────────── *
- *
- * Pass 6 decides when to stop bouncing. Two mechanisms:
- *
- *   (a) HARD DEPTH CAP — an outer for-loop bound (MAX_DEPTH). After
- *       MAX_DEPTH bounces, force-stop even if RR didn't kill us.
- *       Belt-and-braces: keeps bad RR luck from running forever.
- *
- *   (b) RUSSIAN ROULETTE — probabilistic kill, unbiased. Used after
- *       depth ≥ RR_DEPTH so early high-energy bounces aren't killed.
- *       See T9.
- *
- * russian_roulette() implements (b). The depth cap (a) is a loop
- * bound in path_trace, not a separate function.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §11  Step 6: deciding when to stop ── */
 
-/*
- * russian_roulette — unbiased path termination.
- *
- * Pseudocode:
- *   p = max(throughput.r, throughput.g, throughput.b)
- *   if p < ε:                       throughput is dead anyway → kill
- *   if random() > p:                kill with probability (1 − p)
- *   throughput *= 1 / p             (compensate survivors → unbiased)
- *   return survived?
- *
- * Returning false means the caller should break out of the bounce
- * loop. Returning true means the caller continues — and the
- * throughput has already been scaled in-place to compensate.
- *
- * Why MAX channel and not MEAN: a path with throughput (0.5, 0, 0)
- * is meaningful in the red channel; killing it because the average
- * is 0.17 would erase real red contributions.
- */
+/* Once a ray has bounced a few times, this randomly ends the dim ones instead
+ * of cutting every ray off at a fixed depth (which would darken the image).
+ * Survivors are scaled up by exactly the odds they survived, so the average
+ * comes out the same — we just stop spending effort on rays that barely add
+ * anything. Returns false when the caller should stop. "Dim" is judged by the
+ * brightest channel, so a strongly-red ray isn't dropped over its low green. */
 static bool russian_roulette(V3 *throughput, Rng *rng_state) {
   float p = v3maxc(*throughput);
   if (p < 1e-4f)
-    return false; /* throughput too low */
+    return false; /* already basically black */
   if (rng_f(rng_state) > p)
-    return false;                          /* rolled the kill   */
-  *throughput = v3s(1.f / p, *throughput); /* compensate       */
-  return true;                             /* survived         */
+    return false;                          /* unlucky roll — end it here */
+  *throughput = v3s(1.f / p, *throughput); /* brighten survivors to stay fair */
+  return true;
 }
 
-/* ── §12 LOGIC: path_trace — THE CORE (pure; combines passes 2-6)
- * ─────────────── *
- *
- * THE CORE. This function is small — one for-loop, ~25 lines of body —
- * but every line is one of the seven passes. Read it slowly.
- *
- * INPUT  : a primary Ray (produced by Pass 1 in the caller)
- *          plus a per-pixel-per-frame RNG state.
- * OUTPUT : V3 radiance contribution from this single random walk.
- *          Many such walks averaged form the converged image (Pass 7).
- *
- * Algorithm in steps (matches the 7-pass spine):
- *   throughput = (1, 1, 1)            what's left of the photon's energy
- *   color      = (0, 0, 0)            accumulated radiance
- *   for depth = 0 .. MAX_DEPTH:
- *     PASS 2: hit ← scene_hit(ray)
- *             if MISS: break (background = black)
- *     PASS 3: mat ← shade_at_hit(hit)
- *             if mat is emissive:
- *               color += throughput · emission       contribute
- *               break                                 (T4 step 11)
- *     PASS 6: if depth ≥ RR_DEPTH:
- *               if !russian_roulette(throughput): break
- *     PASS 5: throughput = throughput_chain(throughput, mat.albedo)
- *     PASS 4: ray.dir   ← sample_bounce(hit.N)
- *             ray.origin ← hit.P + ε · hit.N         self-int. push
- *   return color
- *
- * Iterative, not recursive. Iterative is clearer pedagogically because
- * the throughput chain (Pass 5) is a single line you can point at —
- * `throughput = throughput_chain(throughput, mat.albedo)`. With
- * recursion the same chain is hidden in the call/return structure.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §12  The heart of it: follow one ray as it bounces ── */
 
-static V3 path_trace(Ray ray, Rng *rng_state) {
+/* Follows a single ray bouncing around the box until it reaches the lamp or
+ * fizzles out, and returns the colour that one random walk saw. `throughput` is
+ * the share of light still able to reach the eye along this path; `color` is
+ * what we collect when we finally land on the lamp. Thousands of these walks,
+ * averaged, make one pixel. It's a plain loop rather than recursion so you can
+ * watch the colour get dimmer one bounce at a time. */
+static V3 path_trace(const Scene *scene, Ray ray, Rng *rng_state) {
   V3 color = v3(0, 0, 0);
   V3 throughput = v3(1, 1, 1);
 
   for (int depth = 0; depth < MAX_DEPTH; depth++) {
 
-    /* PASS 2 — SCENE INTERSECTION. */
+    /* what does the ray hit? nothing → it escaped into the dark */
     Hit hit;
-    if (!scene_hit(ray, RAY_EPS, &hit))
+    if (!scene_hit(scene, ray, RAY_EPS, &hit))
       break;
 
-    /* PASS 3 — SHADING DECISION. */
-    const Mat *mat = shade_at_hit(&hit);
+    /* reached the lamp? collect its light and we're done */
+    const Mat *mat = shade_at_hit(scene, &hit);
     if (mat_is_light(mat)) {
-      /* Emissive: contribute throughput · emission and stop. */
       color = v3add(color, v3mul(throughput, mat->emit));
       break;
     }
 
-    /* PASS 6 — TERMINATION (Russian roulette after depth warm-up). */
+    /* after a few bounces, maybe quit early on a dim ray */
     if (depth >= RR_DEPTH && !russian_roulette(&throughput, rng_state))
       break;
 
-    /* PASS 5 — THROUGHPUT CHAIN. */
+    /* dim the ray by the share of light this surface reflects */
     throughput = throughput_chain(throughput, mat->albedo);
 
-    /* PASS 4 — BOUNCE DIRECTION SAMPLING.  Push origin off surface. */
+    /* bounce off in a new random direction, nudged clear of the surface */
     ray.dir = sample_bounce(hit.N, rng_state);
     ray.origin = v3add(hit.P, v3s(RAY_EPS, hit.N));
   }
   return color;
 }
 
-/* ── §13 SIMULATION + RENDER + LOGIC: accumulator — accum_add_frame (SIM)
- * writes g_accum; accum_draw (RENDER) reads it; tone map (LOGIC)
- * ───────────────────────── *
+/* ── §13  Step 7: average the rays and put it on screen ──
  *
- * Pass 7 averages many samples per pixel into a clean image and
- * presents the result to the screen.
- *
- * Three sub-stages:
- *   §13.1 accumulator buffer + reset
- *   §13.2 accum_add_frame   — cast `spp` fresh samples per cell
- *   §13.3 tone-map + draw   — divide, tone-map, ASCII-quantise, paint
- *
- * The accumulator stays in LINEAR HDR space at all times. Tone
- * mapping happens only at draw time, AFTER dividing by sample count
- * (T10). Static arrays (no malloc) sized to the largest terminal
- * we'll encounter; on resize we reset rather than reallocate — the
- * previous accumulator is meaningless at the new resolution anyway.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* §13.1 ── accumulator + reset ──────────────────────────────────────── */
-
-/*
- * Accumulator — the progressive render target: a per-pixel running SUM of HDR
- * radiance plus the number of samples folded in. A pixel's displayed colour is
- * sum / samples, so the two always travel together — that pairing is the whole
- * reason this is one type and not two globals. Kept in LINEAR HDR space; tone
- * mapping happens only at draw time, AFTER the divide.
- *   sum      [row][col][rgb] running sum of sample radiance (linear HDR)
- *   samples  total samples folded into every pixel so far (the divisor)
- * Ref: progressive Monte-Carlo rendering — PBRT (Pharr/Jakob/Humphreys), Film.
+ * One ray is pure noise, so we keep adding more and show the running average,
+ * which sharpens frame by frame. The pieces below add a frame of rays, then
+ * turn the average into characters and colours.
  */
+
+/* §13.1  Where the picture builds up. For every pixel we keep a running total
+ * of the colours all its rays have seen, plus how many rays that is; the colour
+ * we show is total ÷ count. The two live together because you always need both
+ * to get the average. We keep the totals as raw, uncapped brightness and only
+ * squash them to screen range at draw time — averaging first, squashing second.
+ * It's one fixed-size block (no malloc), big enough for the largest screen we
+ * expect; on resize we just clear it and start over. */
 typedef struct {
-  float sum[MAX_H][MAX_W][3]; /* per-pixel running radiance sum (linear HDR) */
-  int samples;                /* samples folded into each pixel so far       */
+  float sum[MAX_H][MAX_W][3]; /* running colour total per pixel (uncapped) */
+  int samples;                /* how many rays are in that total           */
 } Accumulator;
 
 static Accumulator g_accum;
 
+/* defined later, in §14 */
+static V3 first_hit_viz(const Scene *scene, Ray ray, ShadeMode mode);
+
+/* Fires one ray for a pixel and returns the colour it found: seed its own
+ * randomness, jitter inside the pixel, aim the ray, and either trace it fully
+ * (the real renderer) or take a quick diagnostic shortcut. */
+static V3 sample_pixel(const Scene *scene, const Camera *cam, int col, int row,
+                       int cols, int rows, int sample_idx, ShadeMode mode) {
+  Rng rng_state = rng_seed(col, row, sample_idx);
+  float jitter_x = rng_f(&rng_state) - 0.5f; /* random spot inside the pixel */
+  float jitter_y = rng_f(&rng_state) - 0.5f;
+  Ray primary = camera_ray(cam, col, row, cols, rows, jitter_x, jitter_y);
+  return (mode == MODE_PT) ? path_trace(scene, primary, &rng_state)
+                           : first_hit_viz(scene, primary, mode);
+}
+
+/* §13.3  The only two functions that change the picture buffer. */
+
+/* Throws the picture away and starts over. We call it when something changes
+ * what a ray means (resize, or the user changes a setting), never mid-frame. */
 static void accum_reset(Accumulator *a) {
   memset(a->sum, 0, sizeof a->sum);
   a->samples = 0;
 }
 
-/* forward declaration — debug overlays defined in §14. */
-static V3 first_hit_viz(Ray ray, ShadeMode mode);
-
-/*
- * sample_pixel — one Monte-Carlo radiance sample for pixel (col,row): seed a
- * decorrelated RNG, jitter the ray within the pixel for free anti-aliasing,
- * generate the primary ray (PASS 1), and trace it — full path (PASSES 2-6) in
- * MODE_PT, or a deterministic debug AOV otherwise. Pure given sample_idx.
- */
-static V3 sample_pixel(int col, int row, int cols, int rows, int sample_idx,
-                       ShadeMode mode) {
-  Rng rng_state = rng_seed(col, row, sample_idx);
-  float jitter_x = rng_f(&rng_state) - 0.5f; /* sub-pixel AA */
-  float jitter_y = rng_f(&rng_state) - 0.5f;
-  Ray primary = camera_ray(col, row, cols, rows, jitter_x, jitter_y);
-  return (mode == MODE_PT) ? path_trace(primary, &rng_state)
-                           : first_hit_viz(primary, mode);
-}
-
-/* §13.2 ── accum_add_frame: cast `spp` samples per pixel ────────────── */
-
-/*
- * accum_add_frame — one frame of additional samples.
- *
- * Pseudocode:
- *   for each row:
- *     for each col:
- *       sample_sum = (0, 0, 0)
- *       for s = 0 .. spp − 1:
- *         sample_sum += sample_pixel(col, row, ..., frame_idx*spp + s, mode)
- *       a->sum[row][col] += sample_sum                   PASS 7 (sum)
- *   a->samples += spp                                    PASS 7 (count)
- *
- * sample_pixel does PASS 1 (jittered primary ray) + PASSES 2-6 (or a debug
- * AOV); kept separate so this loop reads as "sum spp samples per pixel".
- *
- * No tone-mapping here — that happens in accum_draw so we keep the
- * accumulator in linear HDR space. Tone-mapping the running sum each
- * frame would compound: the right place is "after divide".
- *
- * Frame-decorrelated seed (frame * spp + s) ensures back-to-back
- * frames don't redraw the same noise pattern.
- */
-static void accum_add_frame(Accumulator *a, int cols, int rows, int spp,
+/* Fires another round of rays — `spp` of them per pixel — and adds what they
+ * see into the running totals. We add raw colours here and leave the squash-to-
+ * screen step for draw time, because averaging has to happen before squashing,
+ * not after. */
+static void accum_add_frame(Accumulator *a, const Scene *scene,
+                            const Camera *cam, int cols, int rows, int spp,
                             int frame_idx, ShadeMode mode) {
   for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
     for (int col = 0; col < cols && col < MAX_W; col++) {
       float sum_r = 0.f, sum_g = 0.f, sum_b = 0.f;
 
       for (int s = 0; s < spp; s++) {
+        /* a number unique to this pixel-and-frame, so each ray gets fresh
+         * randomness and frames don't repeat the same noise */
+        int sample_idx = frame_idx * spp + s;
         V3 radiance =
-            sample_pixel(col, row, cols, rows, frame_idx * spp + s, mode);
+            sample_pixel(scene, cam, col, row, cols, rows, sample_idx, mode);
         sum_r += radiance.x;
         sum_g += radiance.y;
         sum_b += radiance.z;
@@ -954,18 +655,30 @@ static void accum_add_frame(Accumulator *a, int cols, int rows, int spp,
   a->samples += spp;
 }
 
-/* §13.3 ── tone-mapping + draw ──────────────────────────────────────── */
+/* §13.4  Turning a brightness into a character and a colour. */
 
-static inline float reinhard(float x) { return x / (1.f + x); }
-static inline float gamma_enc(float x) {
-  return powf(x < 0.f ? 0.f : (x > 1.f ? 1.f : x), 1.f / 2.2f);
+/* Squashes an unbounded brightness down into 0..1 so it fits on screen, with
+ * the pin from §1.8 so the lamp lands at pure white instead of just near it. */
+static inline float reinhard(float x) {
+  x *= TONE_EXPOSURE;
+  return x * (1.f + x / (TONE_WHITE * TONE_WHITE)) / (1.f + x);
 }
+/* Bends 0..1 to match how screens actually turn numbers into brightness. */
+static inline float gamma_enc(float x) {
+  return powf(x < 0.f ? 0.f : (x > 1.f ? 1.f : x), 1.f / DISPLAY_GAMMA);
+}
+/* How bright a colour looks to the eye — green counts most, blue least. */
 static inline float rec601_luma(float r, float g, float b) {
   return 0.2126f * r + 0.7152f * g + 0.0722f * b;
 }
 
-/* luma_to_ramp_char — map perceptual brightness [0,1] to a Bourke density
- * glyph (denser char = brighter), clamped to the ramp's bounds. */
+/* Full screen-ready colour from a raw one: squash, then gamma, each channel. */
+static inline V3 tonemap_to_srgb(V3 linear_hdr) {
+  return v3(gamma_enc(reinhard(linear_hdr.x)), gamma_enc(reinhard(linear_hdr.y)),
+            gamma_enc(reinhard(linear_hdr.z)));
+}
+
+/* Picks a character for a brightness: brighter pixel → denser-looking glyph. */
 static char luma_to_ramp_char(float luma) {
   int ramp_index = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
   if (ramp_index < 0)
@@ -975,8 +688,8 @@ static char luma_to_ramp_char(float luma) {
   return k_ramp[ramp_index];
 }
 
-/* rgb_to_cube_pair — quantise an sRGB triple to the nearest 6x6x6 xterm colour
- * cube and return its ncurses pair id (each channel rounded to 0..5). */
+/* Picks the closest terminal colour. Terminals offer a 6×6×6 grid of colours,
+ * so we round each of red/green/blue to one of 6 levels and look up that slot. */
 static int rgb_to_cube_pair(float r, float g, float b) {
   int red_5bit = (int)(r * 5.f + 0.5f);
   int green_5bit = (int)(g * 5.f + 0.5f);
@@ -996,20 +709,10 @@ static int rgb_to_cube_pair(float r, float g, float b) {
   return PAIR_CUBE_BASE + red_5bit * 36 + green_5bit * 6 + blue_5bit;
 }
 
-/*
- * accum_draw — paint the running average to screen.
- *
- * Per cell:
- *   1. linear average:    L = accum / samples            (T10)
- *   2. Reinhard tone-map: L' = L / (1 + L)               (HDR → [0, 1))
- *   3. gamma encode:      out = L'^(1/2.2)               (linear → sRGB)
- *   4. luminance → ASCII density char
- *   5. RGB → nearest 6×6×6 xterm cube colour pair
- *
- * Step 1 must happen BEFORE tone-mapping — tone-mapping a sum of N
- * samples is not the same as N times the tone-map of a single sample.
- * (Tone-map is non-linear.)
- */
+/* §13.5  Draws the picture buffer to the screen. For each pixel: average its
+ * rays, squash that to a screen colour, then pick a character and a colour.
+ * Averaging must come before squashing — squash first and the brightness comes
+ * out wrong. (Reads the buffer; never changes it.) */
 static void accum_draw(const Accumulator *a, int cols, int rows) {
   if (a->samples == 0)
     return;
@@ -1017,16 +720,14 @@ static void accum_draw(const Accumulator *a, int cols, int rows) {
 
   for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
     for (int col = 0; col < cols && col < MAX_W; col++) {
-      float r = a->sum[row][col][0] * inv_samples;
-      float g = a->sum[row][col][1] * inv_samples;
-      float b = a->sum[row][col][2] * inv_samples;
+      /* average of every ray that hit this pixel (still raw, uncapped) */
+      V3 linear_avg = v3(a->sum[row][col][0] * inv_samples,
+                         a->sum[row][col][1] * inv_samples,
+                         a->sum[row][col][2] * inv_samples);
+      V3 srgb = tonemap_to_srgb(linear_avg);
 
-      r = gamma_enc(reinhard(r));
-      g = gamma_enc(reinhard(g));
-      b = gamma_enc(reinhard(b));
-
-      char ch = luma_to_ramp_char(rec601_luma(r, g, b));
-      int pair_index = rgb_to_cube_pair(r, g, b);
+      char ch = luma_to_ramp_char(rec601_luma(srgb.x, srgb.y, srgb.z));
+      int pair_index = rgb_to_cube_pair(srgb.x, srgb.y, srgb.z);
       attron(COLOR_PAIR(pair_index) | A_BOLD);
       mvaddch(row, col, (chtype)(unsigned char)ch);
       attroff(COLOR_PAIR(pair_index) | A_BOLD);
@@ -1034,47 +735,41 @@ static void accum_draw(const Accumulator *a, int cols, int rows) {
   }
 }
 
-/* ── §14 LOGIC: debug overlays — first_hit_viz (pure) ───────────────── *
+/* ── §14  The quick diagnostic views ──
  *
- * The debug modes short-circuit the path tracer at the FIRST hit and
- * paint an intermediate quantity. Each mode lets you SEE the output
- * of one or two passes in isolation:
- *
- *   MODE_NORMAL  Pass 1 + Pass 2:   (N + 1) / 2 as RGB
- *   MODE_ALBEDO  Pass 1 + 2 + 3:    material albedo (no lighting)
- *   MODE_DEPTH   Pass 1 + Pass 2:   1 / (1 + t) as gray
- *
- * No bounces, no randomness — these modes converge in a single
- * sample. Cycle them with `d` to compare against the full PT result.
- *
- * ─────────────────────────────────────────────────────────────────── */
+ * The 'd' key swaps the real renderer for one of these. They stop at the first
+ * thing a ray hits and just colour it in — no bouncing, no randomness — so they
+ * show up instantly and let you sanity-check the earlier steps on their own.
+ */
 
-static V3 first_hit_viz(Ray ray, ShadeMode mode) {
+/* Colours a surface by which way it faces, so each wall gets its own flat tint
+ * (the usual trick: shift each direction value from -1..1 into 0..1). */
+static inline V3 normal_to_rgb(V3 n) {
+  return v3(n.x * 0.5f + 0.5f, n.y * 0.5f + 0.5f, n.z * 0.5f + 0.5f);
+}
+
+static V3 first_hit_viz(const Scene *scene, Ray ray, ShadeMode mode) {
   Hit hit;
-  if (!scene_hit(ray, RAY_EPS, &hit))
-    return v3(0, 0, 0); /* miss */
+  if (!scene_hit(scene, ray, RAY_EPS, &hit))
+    return v3(0, 0, 0); /* ray hit nothing */
 
-  const Mat *mat = shade_at_hit(&hit);
+  const Mat *mat = shade_at_hit(scene, &hit);
 
   switch (mode) {
   case MODE_NORMAL:
-    /* Encode normal as RGB ∈ [0, 1]³ — each component −1..1 → 0..1. */
-    return v3(hit.N.x * 0.5f + 0.5f, hit.N.y * 0.5f + 0.5f,
-              hit.N.z * 0.5f + 0.5f);
+    return normal_to_rgb(hit.N);
 
   case MODE_ALBEDO:
-    /* Material body colour. Lights show as a clamped slice of
-     * emission so they read bright but don't blow out the cube. */
+    /* each surface's own colour; the lamp is dimmed so it doesn't blow out */
     if (mat_is_light(mat)) {
-      return v3(fminf(mat->emit.x * 0.06f, 1.f),
-                fminf(mat->emit.y * 0.06f, 1.f),
-                fminf(mat->emit.z * 0.06f, 1.f));
+      return v3(fminf(mat->emit.x * ALBEDO_LIGHT_SCALE, 1.f),
+                fminf(mat->emit.y * ALBEDO_LIGHT_SCALE, 1.f),
+                fminf(mat->emit.z * ALBEDO_LIGHT_SCALE, 1.f));
     }
     return mat->albedo;
 
   case MODE_DEPTH: {
-    /* 1 / (1 + t): closer surfaces brighter, distant darker.
-     * Output as gray (R=G=B). */
+    /* grey by distance: near is bright, far is dark */
     float v = 1.f / (1.f + hit.t);
     return v3(v, v, v);
   }
@@ -1084,20 +779,20 @@ static V3 first_hit_viz(Ray ray, ShadeMode mode) {
   }
 }
 
-/* ── §15 RENDER: screen — colour init, progress bar, HUD, cell paint
- * ─────────────────────────────────────────────────────── */
+/* ── §15  The on-screen extras: colours, progress bar, status line ── */
 
 static int g_have_256 = 0;
 
-/* §15.1 ── color_init: 6×6×6 cube + reserved HUD/HINT/bar pairs ────── */
-
+/* Sets up the colour slots: the full 6×6×6 grid for the image if the terminal
+ * has 256 colours, plus the few we reserve for the status text and the bar.
+ * Falls back to plain colours on an old 8-colour terminal. */
 static void color_init(void) {
   start_color();
   use_default_colors();
   g_have_256 = (COLORS >= 256);
 
   if (g_have_256) {
-    /* 216-colour xterm cube: pairs PAIR_CUBE_BASE..+215. */
+    /* fill the 216 image colours */
     for (int i = 0; i < 216; i++)
       init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
     init_pair(PAIR_HUD, 226, -1);       /* bright yellow         */
@@ -1113,18 +808,9 @@ static void color_init(void) {
   }
 }
 
-/* §15.2 ── progress bar (samples / ACCUM_CAP) ───────────────────────── */
-
-/*
- * draw_progress_bar — visualise convergence as samples / ACCUM_CAP.
- *
- * The bar fills as samples accumulate; once full, the HUD shows
- * "CONVERGED" and the main loop stops adding new samples (so the CPU
- * doesn't burn refining a converged image past visual gain).
- *
- * Width scales to ≈ cols/3 with bounds [8, 60] so it stays useful on
- * both narrow and wide terminals.
- */
+/* Draws the bar showing how close the image is to "clean enough" — it fills as
+ * rays pile up and is full once we stop adding more. Width tracks the terminal
+ * but stays within sensible limits. */
 static void draw_progress_bar(int row, int cols, int samples) {
   int bar_width = cols / 3;
   if (bar_width < 8)
@@ -1151,19 +837,11 @@ static void draw_progress_bar(int row, int cols, int samples) {
   attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* §15.3 ── hud_draw (HUD spec compliant) ────────────────────────────── */
-
-/*
- * hud_draw — three HUD elements:
- *
- *   row 0 (top, yellow + BOLD)         status: fps / spp / samples /
- *                                      mode / state
- *   row 1 (top, yellow + progress bar) convergence visualisation
- *   row rows-1 (bottom, cyan + BOLD)   key hint strip
- */
+/* Draws the overlay: a status line up top (speed, settings, what it's doing),
+ * the progress bar, and a strip of key hints along the bottom. */
 static void hud_draw(int cols, int rows, float fps, int spp, int samples,
                      ShadeMode mode, bool paused) {
-  /* §15.3.1 status — top-right. */
+  /* status text, top-right */
   char buf[140];
   snprintf(buf, sizeof buf, " %5.1f fps  spp:%d  samples:%-5d  mode:%s  %s ",
            (double)fps, spp, samples, shade_mode_name(mode),
@@ -1178,26 +856,26 @@ static void hud_draw(int cols, int rows, float fps, int spp, int samples,
   mvprintw(0, cols - len, "%s", buf);
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-  /* §15.3.2 title — top-left, same row. */
+  /* title, top-left */
   attron(COLOR_PAIR(PAIR_HUD));
   mvprintw(0, 0, " PATH TRACER · CORNELL BOX ");
   attroff(COLOR_PAIR(PAIR_HUD));
 
-  /* §15.3.3 progress bar — row 1. Only meaningful in PT mode (debug
-   * modes converge in 1 sample so the bar would just show "tiny
-   * progress, full bar"). Hide it in debug modes. */
+  /* progress bar only makes sense for the real renderer; the quick views
+   * finish in one frame, so the bar would always look instantly full */
   if (rows > 4 && mode == MODE_PT)
     draw_progress_bar(1, cols, samples);
 
-  /* §15.3.4 hint — bottom row, cyan + BOLD. */
+  /* key hints, bottom row */
   attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
   mvprintw(rows - 1, 0, " q:quit  spc/p:pause  r:reset  d:mode  +/-:spp ");
   attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* ── §16 APP / TICK — signals, input, the per-tick combine (see ARCHITECTURE)
- * ────────────────────────────────────────────────────────── */
+/* ── §16  The program: setup, the main loop, and keys ── */
 
+/* Signals set these flags and the loop checks them — you can't safely do much
+ * else from inside a signal handler. */
 static volatile sig_atomic_t g_run = 1;
 static volatile sig_atomic_t g_resize = 0;
 static void on_sigint(int s) {
@@ -1210,20 +888,102 @@ static void on_sigwinch(int s) {
 }
 static void cleanup(void) { endwin(); }
 
-int main(void) {
-  signal(SIGINT, on_sigint);
-  signal(SIGTERM, on_sigint);
-  signal(SIGWINCH, on_sigwinch);
-  atexit(cleanup);
+/* Throws the picture away and starts fresh. Anything that changes what a ray
+ * would see (a resize, or a settings change) makes the old picture wrong. */
+static void restart_convergence(Accumulator *a, int *frame_idx) {
+  accum_reset(a);
+  *frame_idx = 0;
+}
 
+/* Should we add more rays this frame? No if paused; the quick views are done
+ * after one frame; the real renderer keeps going until it's clean enough. */
+static bool should_accumulate(ShadeMode mode, int samples, bool paused) {
+  if (paused)
+    return false;
+  return (mode != MODE_PT) ? (samples == 0) : (samples < ACCUM_CAP);
+}
+
+/* Puts the terminal into the mode we need: keys read instantly, no echo, no
+ * blinking cursor, getch() returns right away instead of waiting. */
+static void screen_init(void) {
   initscr();
   cbreak();
   noecho();
   curs_set(0);
   keypad(stdscr, TRUE);
   nodelay(stdscr, TRUE);
-  typeahead(-1); /* prevent input tearing */
+  typeahead(-1); /* stop ncurses checking for keys mid-draw, which causes tearing */
+}
 
+/* Handles the terminal being resized: get the new size and start the picture
+ * over, since the old one no longer fits. */
+static void apply_resize(int *cols, int *rows, Accumulator *a, int *frame_idx) {
+  g_resize = 0;
+  endwin();
+  refresh();
+  getmaxyx(stdscr, *rows, *cols);
+  restart_convergence(a, frame_idx);
+}
+
+/* Draws one whole frame: clear, paint the picture, add the overlay, flush it
+ * all to the terminal in one go. Only reads the picture buffer. */
+static void render_frame(const Accumulator *a, int cols, int rows, float fps,
+                         int spp, ShadeMode mode, bool paused) {
+  erase();
+  accum_draw(a, cols, rows);
+  hud_draw(cols, rows, fps, spp, a->samples, mode, paused);
+  wnoutrefresh(stdscr);
+  doupdate();
+}
+
+/* Handles whatever key was pressed this frame: quit, pause, or change a setting
+ * (which starts the picture over). */
+static void process_input(Accumulator *a, int *spp, ShadeMode *mode,
+                          bool *paused, int *frame_idx) {
+  switch (getch()) {
+  case 'q':
+  case 'Q':
+  case 27 /* Esc */:
+    g_run = 0;
+    break;
+  case ' ':
+  case 'p':
+  case 'P':
+    *paused = !*paused;
+    break;
+  case 'r':
+  case 'R':
+    restart_convergence(a, frame_idx);
+    break;
+  case '+':
+  case '=':
+    if (*spp < SPP_MAX)
+      (*spp)++;
+    restart_convergence(a, frame_idx);
+    break;
+  case '-':
+  case '_':
+    if (*spp > SPP_MIN)
+      (*spp)--;
+    restart_convergence(a, frame_idx);
+    break;
+  case 'd':
+  case 'D':
+    *mode = (ShadeMode)((*mode + 1) % MODE_N);
+    restart_convergence(a, frame_idx);
+    break;
+  default:
+    break;
+  }
+}
+
+int main(void) {
+  signal(SIGINT, on_sigint);
+  signal(SIGTERM, on_sigint);
+  signal(SIGWINCH, on_sigwinch);
+  atexit(cleanup);
+
+  screen_init();
   int cols, rows;
   getmaxyx(stdscr, rows, cols);
   color_init();
@@ -1235,1052 +995,46 @@ int main(void) {
   float fps = 0.f;
   long long fps_acc = 0;
   int fps_cnt = 0;
-  long long frame_ns = 1000000000LL / TARGET_FPS;
+  long long frame_ns = NS_PER_SEC / TARGET_FPS;
   long long last = clock_ns();
   int frame_idx = 0;
 
   while (g_run) {
 
-    /* §16.1 USER EVENT — apply pending SIGWINCH: reset accumulator + frame
-     *         index (control state, NOT part of the tick). */
-    if (g_resize) {
-      g_resize = 0;
-      endwin();
-      refresh();
-      getmaxyx(stdscr, rows, cols);
-      accum_reset(&g_accum);
-      frame_idx = 0;
-    }
+    /* deal with a resize if one happened */
+    if (g_resize)
+      apply_resize(&cols, &rows, &g_accum, &frame_idx);
 
-    /* §16.2 PERFORMANCE — wall-clock dt with spiral-of-death cap. */
+    /* how long since last frame (clamped, so one slow frame can't snowball) */
     long long now = clock_ns();
     long long dt = now - last;
     if (dt > DT_CAP_NS)
       dt = DT_CAP_NS;
     last = now;
 
-    /* §16.3 PERFORMANCE — fps rolling average over half-second windows. */
+    /* update the fps readout a couple of times a second */
     fps_acc += dt;
     fps_cnt++;
-    if (fps_acc >= 500000000LL) {
-      fps = (float)fps_cnt * 1e9f / (float)fps_acc;
+    if (fps_acc >= FPS_WINDOW_NS) {
+      fps = (float)fps_cnt * (float)NS_PER_SEC / (float)fps_acc;
       fps_acc = 0;
       fps_cnt = 0;
     }
 
-    /* §16.4 SIMULATION — add one frame of samples to the accumulator: the ONLY
-     *         per-tick state advance. Skipped while paused or once converged
-     *         (g_accum.samples >= ACCUM_CAP) — that gate is the DELAYS layer.
-     * Debug modes are deterministic, so they add one frame and then hold. */
-    bool can_sample =
-        !paused && (mode != MODE_PT ? (g_accum.samples == 0)
-                                    : (g_accum.samples < ACCUM_CAP));
-    if (can_sample)
-      accum_add_frame(&g_accum, cols, rows, spp, frame_idx++, mode);
+    /* add another round of rays into the picture (unless we're holding) */
+    if (should_accumulate(mode, g_accum.samples, paused))
+      accum_add_frame(&g_accum, &k_scene, &k_camera, cols, rows, spp,
+                      frame_idx++, mode);
 
-    /* §16.5 RENDER combine — the ONE place state -> screen: erase -> accum_draw
-     *         -> hud_draw -> doupdate. Reads g_accum, never writes it. */
+    /* draw it; time the frame from here so the cap below covers draw + input */
     long long frame_start = clock_ns();
-    erase();
-    accum_draw(&g_accum, cols, rows);
-    hud_draw(cols, rows, fps, spp, g_accum.samples, mode, paused);
-    wnoutrefresh(stdscr);
-    doupdate();
+    render_frame(&g_accum, cols, rows, fps, spp, mode, paused);
 
-    /* §16.6 USER EVENTS — mutate spp / mode / pause and reset the accumulator
-     *         (r resets; +/- change SPP; d changes mode — each resets because
-     * the running average can't mix different sampling rates / ranges). NOT
-     *         part of the tick, never advance simulation. */
-    int ch = getch();
-    switch (ch) {
-    case 'q':
-    case 'Q':
-    case 27 /* ESC */:
-      g_run = 0;
-      break;
-    case ' ':
-    case 'p':
-    case 'P':
-      paused = !paused;
-      break;
-    case 'r':
-    case 'R':
-      accum_reset(&g_accum);
-      frame_idx = 0;
-      break;
-    case '+':
-    case '=':
-      if (spp < SPP_MAX)
-        spp++;
-      accum_reset(&g_accum);
-      frame_idx = 0;
-      break;
-    case '-':
-    case '_':
-      if (spp > SPP_MIN)
-        spp--;
-      accum_reset(&g_accum);
-      frame_idx = 0;
-      break;
-    case 'd':
-    case 'D':
-      mode = (ShadeMode)((mode + 1) % MODE_N);
-      accum_reset(&g_accum);
-      frame_idx = 0;
-      break;
-    default:
-      break;
-    }
+    /* react to any keypress */
+    process_input(&g_accum, &spp, &mode, &paused, &frame_idx);
 
-    /* §16.7 PERFORMANCE — frame cap. */
+    /* sleep off the rest of the frame so we don't run hot */
     clock_sleep_ns(frame_ns - (clock_ns() - frame_start));
   }
   return 0;
 }
-
-/*
- * path_tracer.c — progressive Monte Carlo path tracer · Cornell Box
- *
- * DEMO: A Cornell Box (red left wall, green right wall, white floor/
- *       ceiling/back, warm light overhead, gold + indigo spheres)
- *       slowly resolves from random noise into a clean image as
- *       samples accumulate. Color bleeding makes the gold sphere
- *       blush red on its left flank and the indigo sphere green on
- *       its right — global illumination you can see materialise in
- *       real time. Cycle four debug overlays
- *       (PT → NORMAL → ALBEDO → DEPTH) to see what each early stage
- *       of the renderer contributes on its own.
- *
- *       This file is structured as the SEVEN CONCEPTUAL PASSES of
- *       path tracing (camera ray → intersection → shading decision →
- *       bounce sampling → throughput chain → termination → average +
- *       tone-map). Each pass lives in its own §-section and its own
- *       named function. Reading top-to-bottom you build the algorithm
- *       one pass at a time.
- *
- * Study alongside:
- *   raytracing/sphere_raytrace.c   — same scene primitives, NO bounces
- *                                     (direct phong only). Read this
- *                                     first to see what a single ray
- *                                     hit looks like before adding
- *                                     stochastic sampling.
- *   raytracing/cube_raytrace.c     — same skeleton, slab method.
- *   raytracing/capsule_raytrace.c  — same skeleton, decomposed analytic.
- *
- * Section map (the spine — 7 numbered passes):
- *   §1  config         — frame rate, depth/RR/SPP caps, shade-mode enum
- *   §2  clock          — monotonic timer + sleep
- *   §3  vec3           — V3 math
- *   §4  rng            — xorshift32 + per-pixel-per-frame seed
- *   §5  scene          — Cornell-box materials, quads, spheres
- *
- *   §6  PASS 1 — CAMERA RAY GENERATION
- *                       pixel (col, row) → world-space Ray
- *   §7  PASS 2 — SCENE INTERSECTION
- *                       Ray → nearest Hit (ray vs quad, ray vs sphere)
- *   §8  PASS 3 — SHADING DECISION
- *                       Hit → Material (emission + albedo lookup)
- *   §9  PASS 4 — BOUNCE DIRECTION SAMPLING
- *                       Hit normal → cosine-weighted random direction
- *   §10 PASS 5 — THROUGHPUT CHAIN
- *                       running product: throughput *= albedo
- *   §11 PASS 6 — TERMINATION
- *                       Russian roulette + depth cap
- *   §12 path_trace     — orchestrator: combines passes 2-6 in a loop
- *   §13 PASS 7 — ACCUMULATION + TONE MAPPING
- *                       N samples → average → ASCII display
- *   §14 debug overlays — first-hit visualisations (NORMAL/ALBEDO/DEPTH)
- *
- *   §15 screen         — color init, rgb→pair, HUD
- *   §16 app            — signals, resize, main loop
- *
- * Keys:
- *   r          reset accumulator (restart convergence from sample 0)
- *   p / SPC    pause / resume sampling
- *   d / D      cycle shade mode  (PT → NORMAL → ALBEDO → DEPTH → PT)
- *   + / =      more samples per frame  (faster convergence, lower fps)
- *   -          fewer samples per frame (higher fps, slower convergence)
- *   q / ESC    quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c \
- *       -o path_tracer -lncurses -lm
- */
-
-/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order as
- *      prose before touching code. Path tracing is a SHORT idea hiding
- *      behind dense math; the prose teaches the idea, the code
- *      implements it.
- *   2. §1 config — every constant has a unit-bearing comment, so a
- *      glance is the fastest tour of what's tunable.
- *   3. The 7 passes (§6 through §13). Each pass is small (~30-100
- *      lines). Read in order; each builds on the previous.
- *   4. §12 path_trace — the orchestrator that fuses passes 2-6 into
- *      one loop. Read AFTER you've seen each pass on its own.
- *   5. §14 debug overlays — read if you want to understand what each
- *      early pass produces in isolation.
- *   6. §2/§3/§4 + §15/§16 are infrastructure; skip on a first read.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   Long descriptive names everywhere. The file uses these
- *   consistently:
- *     ray.origin / ray.dir   the ray as (point, unit direction)
- *     hit.P / hit.N          hit point and surface normal (toward ray)
- *     throughput             surviving fraction of the photon's energy
- *     albedo / emission      from a Lambertian Material
- *     accum / samples        per-pixel running sum + total sample count
- *     rng_state              xorshift32 state, mutated by rng_f()
- *
- *   When a one-letter name appears it's a tight-loop index (`i`, `s`)
- *   or a math symbol whose meaning is on the line above.
- *
- * Background you need
- * ───────────────────
- *   - Mean-of-N-samples ≈ true mean (law of large numbers).
- *   - The integral ∫f dx as "average of f over the domain × domain
- *     size", and Monte Carlo as "sample a few points and average".
- *   - Vector dot product, normalisation, Cartesian basis.
- *   - The quadratic formula (for ray-sphere).
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - The full BRDF zoo (we use Lambertian only).
- *   - Probability density measure theory — pretend densities are just
- *     "how often this direction gets picked" and the math works out.
- *   - Importance sampling beyond cosine-weighted hemispheres.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ───────────────────────────────────────────────────────── *
- *
- * Algorithm      : Unidirectional Monte Carlo path tracing — the
- *                  unbiased numerical solver for Kajiya's rendering
- *                  equation. Per pixel, cast a ray. At each surface
- *                  hit:
- *                    (1) if the surface is emissive, accumulate its
- *                        radiance times the path's surviving
- *                        throughput and terminate;
- *                    (2) otherwise, multiply throughput by surface
- *                        albedo, sample a random new direction from
- *                        the cosine-weighted hemisphere around the
- *                        surface normal, and recurse with the new ray.
- *                  Russian-roulette termination at depth ≥ RR_DEPTH:
- *                  survive with probability p = max(throughput); on
- *                  survival multiply throughput by 1/p (preserves
- *                  unbiasedness) — finite expected depth, no truncation.
- *
- *                  The seven passes named in the section map ARE the
- *                  algorithm. Memorise them and you can read any path
- *                  tracer (smallpt, pbrt, mitsuba, cycles).
- *
- * Data-structure : the Accumulator (g_accum) — a static per-pixel buffer
- *                  holding, for every pixel:
- *                    sum[MAX_H][MAX_W][3]  — radiance summed over ALL
- *                                            samples ever cast there
- *                    samples               — total sample count
- *                    Display = sum / samples, tone-mapped.
- *                  Resetting accum_reset() zeroes both. The buffer IS
- *                  the convergence record — each frame just adds more
- *                  samples to the running sum.
- *
- * Rendering      : Reinhard tone-map L' = L/(1+L) compresses the
- *                  open-ended HDR radiance into [0, 1), then a 1/2.2
- *                  gamma encode produces sRGB-perceptual values.
- *                  Final RGB is quantised to xterm's 6×6×6 colour
- *                  cube (216 shades) and Bourke's 92-character
- *                  density ramp picks the glyph from luminance.
- *                  Four debug modes (cycled with `d`) short-circuit
- *                  the path tracer at the first hit and visualise the
- *                  output of an early pass on its own — pedagogically
- *                  this lets you SEE what each pass contributes.
- *
- * Performance    : Per pixel per frame: SPP paths × MAX_DEPTH bounces
- *                  × scene_hit(O(quads) + O(spheres)) intersections.
- *                  At 8 quads, 2 spheres, MAX_DEPTH=7, SPP=2 that's
- *                  ~140 intersections/pixel/frame on average (RR
- *                  ends most paths early). Modern CPU: ~5 ns each →
- *                  ~700 ns/pixel/frame. A 200×60 terminal is 12 000
- *                  cells, so ~8 ms shading per frame at SPP=2 —
- *                  comfortable at 30 Hz. SPP=8 stretches that to
- *                  ~32 ms — still ok.
- *
- * References     : Kajiya, "The Rendering Equation," SIGGRAPH '86.
- *                    The original paper that defines path tracing.
- *                  Beason, "smallpt: Global Illumination in 99 lines
- *                    of C++," http://www.kevinbeason.com/smallpt/.
- *                    The canonical compressed hello world. Reading
- *                    smallpt alongside this file is the fastest way
- *                    to see how dense vs explicit code can teach the
- *                    same algorithm.
- *                  Pharr, Jakob & Humphreys, "Physically Based
- *                    Rendering: From Theory to Implementation" 4e
- *                    (free online: pbr-book.org). Definitive
- *                    reference; chapters 13-14 cover Monte Carlo and
- *                    path tracing.
- *                  Malley, "A Shading Method for Computer Generated
- *                    Images," MS thesis, U. Utah, 1988. (Cosine-
- *                    weighted hemisphere sampling.)
- *                  Veach, "Robust Monte Carlo Methods for Light
- *                    Transport Simulation," PhD thesis, Stanford
- *                    1997. (Russian roulette, bidirectional methods.)
- *                  Goral et al., "Modeling the Interaction of Light
- *                    Between Diffuse Surfaces," SIGGRAPH '84. (The
- *                    original Cornell Box.)
- *                  Reinhard et al., "Photographic Tone Reproduction
- *                    for Digital Images," SIGGRAPH '02.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ───────────────────────────────────────────────────── *
- *
- * CORE IDEA — three concepts stacked in this order
- * ────────────────────────────────────────────────
- * Path tracing is THREE concepts on top of each other. If you
- * understand each in turn, the algorithm is obvious.
- *
- *   1. LIGHT TRANSPORT IS AN INTEGRAL.
- *      The brightness of a surface point is the SUM (integral) over
- *      every direction of the light arriving from that direction,
- *      weighted by how much of it the surface scatters toward the
- *      camera. Kajiya 1986 wrote this down as the rendering equation.
- *
- *   2. ANY INTEGRAL CAN BE ESTIMATED BY AVERAGING RANDOM SAMPLES.
- *      Pick N random directions, evaluate the integrand at each,
- *      average. The average converges to the true integral as N grows.
- *      That's Monte Carlo. The estimate's noise shrinks as 1/√N.
- *
- *   3. THE INTEGRAND IS RECURSIVE — SO AVERAGE RANDOM PATHS, NOT
- *      RANDOM DIRECTIONS.
- *      The light arriving from a direction is itself the answer to
- *      another rendering-equation problem at the surface that ray
- *      hits. So instead of sampling at one point, sample WHOLE
- *      RANDOM PATHS from camera to light. Each path = one Monte
- *      Carlo sample. Many random paths averaged = the converged
- *      image.
- *
- * That's the entire idea. The seven passes (§6–§13) are the
- * implementation; everything else (importance sampling, Russian
- * roulette, tone mapping) is an optimisation on top.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Pretend you're a photon flying BACKWARDS in time. Start at the
- * camera, fly out, hit a wall, bounce in a random direction, hit
- * another wall, bounce again, … until you eventually land on a light
- * (or give up). Multiply the colours of every wall you bounced off,
- * times the light's emission. That's ONE estimate of what colour
- * this pixel should be. Do thousands of these random walks per pixel
- * and average. The average converges to the true image.
- *
- * Or, in soap-opera terms — imagine a RUMOUR network. Each character
- * (surface) has a "story-attenuation" factor — the fraction of any
- * rumour they pass along. The light is the only character who STARTS
- * rumours. To find out what rumour reaches your eye, you walk
- * randomly back through the gossip chain until you reach the light,
- * multiplying the attenuation factor of every character you visit:
- *
- *      eye  ←──  red wall (×0.65 in red)  ←──  white floor (×0.73)
- *           ←──  ceiling (×0.73)   ←──  LIGHT (radiance 15)
- *
- * Final colour ≈ 15 · 0.73 · 0.73 · 0.65  in red (lots gets through),
- *                15 · 0.73 · 0.73 · 0.05  in green (most absorbed).
- *
- * That's COLOUR BLEEDING — the red of the wall stains the rumour as
- * it travels back to your eye. Run a few thousand random walks per
- * pixel and average; the noise smooths into a clean image.
- *
- *      ┌──────────── ceiling (white) ──────────┐
- *      │                  light                │
- *      │                  ▼ ▼ ▼                │
- *      │               ╲╲╲│╱╱╱                 │
- *      │ red          rays scatter        green│
- *      │ wall         ──────────          wall │
- *      │                                       │
- *      │             ●           ●             │
- *      │          gold        indigo           │
- *      └──────────── floor (white) ────────────┘
- *
- *               ↑     ↑
- *         camera at (0, 0.05, -1.5), looking +Z
- *
- * The camera sits at the open front face. Each terminal cell fires
- * SPP rays per frame. Those rays bounce around inside the box,
- * eventually reaching the light at the top — and the colours of
- * everything they touched on the way mix into the pixel.
- *
- * ALGORITHM IN STEPS  (per pixel per sample)
- * ──────────────────────────────────────────
- *  1. PASS 1: Build a primary ray from the camera through a JITTERED
- *     sub-pixel offset. Jitter gives free anti-aliasing.
- *  2. throughput = (1, 1, 1)        ← what's left of the photon
- *     col        = (0, 0, 0)        ← accumulated radiance
- *  3. Loop up to MAX_DEPTH bounces:
- *      a. PASS 2: find nearest surface hit. If miss → break (black).
- *      b. PASS 3: look up the material at the hit.
- *      c. If surface is EMISSIVE:
- *            col += throughput · emission ;  break.
- *      d. PASS 6: RUSSIAN ROULETTE (depth ≥ RR_DEPTH):
- *            p = max(throughput.r, .g, .b)
- *            if rng > p → break (path killed)
- *            else throughput /= p   (compensate killed paths)
- *      e. PASS 5: throughput = throughput · albedo
- *      f. PASS 4: pick a new direction from the cosine-weighted
- *         hemisphere around the surface normal.
- *      g. Push the ray origin by ε·N to avoid self-intersection.
- *  4. Return col.
- *  5. PASS 7: accum[pixel] += col;  samples += 1.
- *  6. Display = tone_map(accum / samples).
- *
- * KEY FORMULAS
- * ────────────
- *   Rendering equation (Kajiya 1986):
- *     L_o(p, ω_o) = L_e(p, ω_o) + ∫_Ω f_r(p, ω_i, ω_o) · L_i(p, ω_i)
- *                                          · (ω_i · n) dω_i
- *
- *   Lambertian BRDF:
- *     f_r = ρ / π       where ρ = albedo (in [0, 1]).
- *
- *   Cosine-weighted hemisphere PDF:
- *     p(ω) = (n · ω) / π
- *
- *   Monte Carlo estimate per bounce (one sample):
- *     L̂ = f_r · L_i · cosθ / p(ω)
- *        = (ρ/π) · L_i · cosθ / (cosθ/π)
- *        = ρ · L_i           ← cosθ and π cancel: weight is just ρ.
- *
- *   That cancellation is THE WHOLE REASON we use cosine-weighted
- *   hemisphere sampling. Naïve uniform sampling would leave a `cosθ`
- *   factor in the estimator that makes near-grazing samples noisy.
- *
- *   Malley's method for cosine-weighted samples (no rejection):
- *     r1, r2 ~ U[0, 1)
- *     φ = 2π · r1
- *     local ω = (cosφ · √r2,  sinφ · √r2,  √(1 − r2))
- *     world ω = onb(n) · local ω
- *
- *   Russian roulette (Veach):
- *     p = max(throughput.r, .g, .b)
- *     kill with prob (1 − p); on survival throughput *= 1/p
- *     ⇒ E[contribution] is unchanged → unbiased.
- *
- *   Reinhard tone map + gamma:
- *     L' = L / (1 + L)
- *     out = L'^(1/2.2)
- *
- * WORKED EXAMPLE  (verify by hand)
- * ────────────────────────────────
- *   Path:  eye → floor → red wall → light
- *   Materials:
- *     floor   albedo (0.73, 0.73, 0.73)
- *     red     albedo (0.65, 0.05, 0.05)
- *     light   emission (15, 14, 11)
- *
- *   throughput evolution:
- *     start:        (1.00, 1.00, 1.00)
- *     after floor:  (0.73, 0.73, 0.73)
- *     after wall:   (0.73·0.65, 0.73·0.05, 0.73·0.05)
- *                 = (0.4745, 0.0365, 0.0365)
- *     light hit, contribution = throughput · emission:
- *                 = (0.4745·15, 0.0365·14, 0.0365·11)
- *                 = (7.12, 0.51, 0.40)
- *
- *   That is BRIGHT RED — exactly the colour bleeding visible on the
- *   white floor near the red wall. Other paths to the same pixel may
- *   bounce different ways and contribute different colours; the
- *   AVERAGE over thousands of samples is the converged image.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • SELF-INTERSECTION. After a bounce we push the ray origin by
- *    1e-4 · N. Without the push, the next intersection finds the
- *    surface we just left at t ≈ 0 and the path stops one bounce
- *    short. The push must be along N (not into the surface).
- *  • DOUBLE-SIDED NORMAL. For a quad we pick the normal that faces
- *    the incoming ray. For a sphere we flip the outward normal if it
- *    points away from the ray. Forgetting either gives black sides
- *    or NaN bounces.
- *  • RR PROBABILITY. p = max channel, NOT mean — we want to keep
- *    paths that still carry SIGNIFICANT energy in any single channel.
- *    Mean would over-kill paths whose energy is concentrated in one
- *    band (deep red, etc).
- *  • FIRST RR DEPTH. Killing too early (depth = 0, 1) raises variance
- *    sharply because every path has roughly equal expected
- *    contribution. RR_DEPTH = 3 is the standard "hold off until
- *    bounces are getting dim" choice.
- *  • CONVERGENCE = √-LAW. Variance of an N-sample average scales as
- *    1/N, so noise ∝ 1/√N. To halve the visible noise you must
- *    QUADRUPLE the samples. ACCUM_CAP = 8192 is plenty for visual
- *    cleanliness; rendering past that just burns CPU.
- *  • DOMINANT LIGHT VIA BOUNCES ONLY. This implementation has NO
- *    direct-light sampling (no NEE). Light is found purely by random
- *    bounces lucking into the light's footprint. That's slow but
- *    pedagogically clean — every line of code is path tracing,
- *    nothing is "the next-event sampler". Adding NEE would cut
- *    convergence time ~5× but add another 80 lines.
- *  • DEBUG-MODE RESET. When you cycle the shade mode (`d`) we reset
- *    the accumulator. NORMAL/ALBEDO/DEPTH produce different output
- *    ranges than PT, so mixing them under the same average would
- *    give nonsense.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Press 'r' then watch:
- *      sample 1     → almost solid noise, hint of bright spot at light
- *      sample 32    → silhouettes visible, lots of grain
- *      sample 256   → clean walls, slight grain on the spheres
- *      sample 2048  → near-converged, only subtle noise remains
- *  • Press 'd' once → NORMAL: the scene appears INSTANTLY in solid
- *    flat colours, each face a different RGB-encoded normal. (Pass 1
- *    + Pass 2 only.)
- *  • Press 'd' again → ALBEDO: the scene appears as flat material
- *    colours (red wall, green wall, white floor, gold sphere, etc).
- *    No shadows, no bounces — just the body colour of each surface.
- *    (Pass 1 + 2 + 3.)
- *  • Press 'd' again → DEPTH: brightness ∝ 1/(1+t). Closer surfaces
- *    brighter, distant ones darker. Gray-scale only. Sanity check
- *    that the camera + intersection passes produce sane distances.
- *    (Pass 1 + Pass 2.)
- *  • Press 'd' once more → PT: the noisy progressive path-traced
- *    image returns. Compare ALBEDO vs PT to see how much detail
- *    comes from indirect light.
- *  • COLOUR BLEED in PT: the gold sphere has a slightly REDDISH
- *    tint on its LEFT flank (bouncing off red wall) and slightly
- *    GREENISH tint on its RIGHT (off green wall). Same for indigo.
- *  • SOFT SHADOWS in PT: the floor under each sphere is slightly
- *    darker than surrounding floor (less direct illumination from
- *    the area light reaches there).
- *  • CEILING NEAR LIGHT in PT: the parts of the ceiling adjacent to
- *    the light quad are slightly brighter than the corners (bounce
- *    light from the floor warming the ceiling indirectly).
- *  • Increasing SPP with '+' should make the image converge visibly
- *    faster but the per-frame fps drops proportionally.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
- *
- * Twelve short tutorials that build path tracing from first principles.
- * Read in order; each builds on the previous.
- *
- *   T1  The rendering equation — what we are solving
- *   T2  Monte Carlo: averaging random samples to estimate an integral
- *   T3  THE 7 PASSES — the universal vocabulary of path tracing
- *   T4  The backward photon — pretending we're a photon in reverse
- *   T5  Lambertian BRDF and the cosθ weight
- *   T6  Cosine-weighted hemisphere sampling — the magical cancellation
- *   T7  Malley's method — uniform-disk → hemisphere with no rejection
- *   T8  The throughput chain — how colour bleeding emerges
- *   T9  Russian roulette — terminating without bias
- *   T10 Progressive accumulation and the √N convergence law
- *   T11 The Cornell Box — what this scene specifically tests
- *   T12 Four debug overlays — PT vs NORMAL vs ALBEDO vs DEPTH
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  THE RENDERING EQUATION — WHAT WE ARE SOLVING
- * ─────────────────────────────────────────────────
- * Kajiya's 1986 rendering equation describes how light leaves a
- * surface point p in a given outgoing direction ω_o:
- *
- *   L_o(p, ω_o) = L_e(p, ω_o)                                emitted
- *               + ∫_Ω f_r(p, ω_i, ω_o) · L_i(p, ω_i)         scattered
- *                       · (ω_i · n) dω_i
- *
- *   L_o   outgoing radiance       (what the camera sees)
- *   L_e   emitted radiance        (zero except for lights)
- *   f_r   bidirectional reflectance distribution function (BRDF)
- *   L_i   incoming radiance       (what's coming in along ω_i)
- *   ω_i·n cosine of incidence     (Lambert's law geometry term)
- *   Ω     hemisphere above p
- *
- * Read the integral aloud: "the outgoing radiance at this point in
- * this direction equals what the surface emits, PLUS the sum over
- * every incoming direction of (BRDF × incoming radiance × cosine)".
- *
- * The catch: L_i is the SAME quantity recursively. To know what's
- * coming IN at p, you have to know what's going OUT at every point
- * around p. The equation is recursive in L. You can't solve it
- * directly — there's no closed form.
- *
- * What CAN you do? Estimate the integral numerically. T2.
- *
- * T2  MONTE CARLO: AVERAGING RANDOM SAMPLES TO ESTIMATE AN INTEGRAL
- * ──────────────────────────────────────────────────────────────────
- * Suppose you want to estimate ∫_Ω g(ω) dω.
- *
- * Pick a probability density p(ω) on Ω (any density, as long as it's
- * non-zero where g is non-zero). Draw N samples ω_1, …, ω_N from
- * p. Then:
- *
- *           ∫g(ω) dω ≈ (1/N) Σ g(ω_i) / p(ω_i)
- *
- * That ESTIMATOR is unbiased — its expected value equals the true
- * integral. The law of large numbers says the average converges to
- * the truth as N → ∞.
- *
- * For our integrand g(ω) = f_r · L_i · cosθ:
- *
- *           L̂ = (1/N) Σ  f_r(ω_i) · L_i(ω_i) · cosθ_i
- *                          / p(ω_i)
- *
- * Now the only question is: HOW DO YOU GET L_i(ω_i)?
- *
- * Recursively: by tracing a ray from p in direction ω_i and asking
- * what it sees. THAT IS PATH TRACING. Each "path" is one Monte
- * Carlo sample of the rendering-equation integral.
- *
- * T3  THE 7 PASSES — THE UNIVERSAL VOCABULARY
- * ────────────────────────────────────────────
- * Every path tracer ever written organises around the same seven
- * conceptual stages. Naming them is the single most useful thing you
- * can do for your understanding. After this tutorial you can READ
- * any path tracer (smallpt, pbrt, mitsuba, cycles, blender) and find
- * your way around — the names line up.
- *
- *   Pass 1  CAMERA RAY GENERATION         (§6)
- *           pixel → world-space Ray.
- *           Add sub-pixel jitter for free anti-aliasing.
- *
- *   Pass 2  SCENE INTERSECTION            (§7)
- *           Ray → nearest Hit (P, N, mat).
- *           Miss → background (black, here).
- *
- *   Pass 3  SHADING DECISION              (§8)
- *           Hit → Material lookup (emission + albedo).
- *           In a real renderer this dispatches on material type
- *           (diffuse vs specular vs glass); here we have one type
- *           so it's a one-liner — but the conceptual stage is real.
- *
- *   Pass 4  BOUNCE DIRECTION SAMPLING     (§9)
- *           Hit normal → random new outgoing direction.
- *           For Lambertian we use cosine-weighted hemisphere
- *           sampling via Malley's method (T6, T7).
- *
- *   Pass 5  THROUGHPUT CHAIN              (§10)
- *           throughput *= albedo. After N bounces:
- *             throughput = albedo_1 · albedo_2 · … · albedo_N.
- *           That product is "what fraction of any light the path
- *           eventually hits will reach the camera through this
- *           specific path".
- *
- *   Pass 6  TERMINATION                   (§11)
- *           Hard depth cap + Russian roulette. Stop bouncing
- *           when paths run out of interesting energy (T9).
- *
- *   Pass 7  ACCUMULATION + TONE MAP       (§13)
- *           Average many samples per pixel; tone-map HDR result;
- *           map to display colour and ASCII glyph (T10, T12).
- *
- * Mental drill: pick any 30 lines of any path tracer and ask "which
- * pass is this?" If you can't answer in 5 seconds, you don't yet
- * know that pass well enough — re-read its tutorial below.
- *
- * The orchestrator function (§12 path_trace) labels each block with
- * a "PASS N — ..." comment — six labels in twenty-five lines. That
- * IS the algorithm.
- *
- * T4  THE BACKWARD PHOTON
- * ────────────────────────
- * The naïve interpretation of "trace a ray to estimate L_i" is to
- * fire MANY rays from each point. That balloons exponentially with
- * depth (one ray hits a wall → fire 100 from there → each hits
- * another wall → fire 100 from each → 10⁴ rays for two bounces).
- *
- * The trick: don't branch. Pick ONE random direction at each bounce.
- * The single-sample estimator is still unbiased — the average of
- * many such single-sample paths converges to the truth.
- *
- * Pseudocode of one path:
- *
- *   trace(p, ω_o):
- *     hit ← scene_intersect(p, ω_o)
- *     if hit is light:
- *       return L_e(hit)
- *     else:
- *       ω_i ← random direction in hemisphere around N
- *       L_i ← trace(hit, -ω_i)             ← recurse
- *       return f_r · L_i · cosθ / p(ω_i)
- *
- * For a Lambertian surface this becomes (T5-T6):
- *
- *   trace(p, ω_o):
- *     hit ← intersect
- *     if light: return emission
- *     ω_i ← cosine_weighted_sample(N)
- *     return albedo · trace(hit, -ω_i)
- *
- * Iteratively (no recursion, no stack overflow on deep paths):
- *
- *   throughput ← (1, 1, 1)
- *   colour     ← (0, 0, 0)
- *   loop until break:
- *     hit ← intersect                          PASS 2
- *     if miss:        break
- *     mat ← shade_at_hit(hit)                  PASS 3
- *     if light:       colour += throughput · emission;  break
- *     RR check                                  PASS 6
- *     throughput     *= albedo                  PASS 5
- *     ω             ← cosine_weighted_sample(N) PASS 4
- *   return colour
- *
- * The throughput multiplies each surface's albedo as the path walks
- * backwards. Hit a light at the end → that throughput product times
- * the light's emission is your colour estimate.
- *
- * T5  LAMBERTIAN BRDF AND THE cosθ WEIGHT
- * ────────────────────────────────────────
- * A LAMBERTIAN surface scatters incoming light EQUALLY in every
- * outgoing direction in the hemisphere. Its BRDF is constant:
- *
- *   f_r(ω_i, ω_o) = ρ / π
- *
- *   ρ = albedo (∈ [0, 1] per channel)
- *   π = normalisation so the surface conserves energy
- *
- * The cosθ = (ω_i · n) factor in the rendering equation isn't part
- * of the BRDF — it's a GEOMETRIC factor expressing Lambert's law:
- * a flux d-Φ landing on a tilted surface spreads over an area
- * 1/cosθ larger than the same flux landing perpendicular, so the
- * irradiance contribution scales by cosθ.
- *
- * Substituting into the rendering equation:
- *
- *   L_o = L_e + (ρ/π) · ∫_Ω L_i(ω_i) · cosθ_i dω_i
- *
- * The (ρ/π) factor pulls outside; we're left with a cosine-weighted
- * integral of L_i. That cosθ_i is what motivates T6.
- *
- * T6  COSINE-WEIGHTED HEMISPHERE SAMPLING — THE MAGICAL CANCELLATION
- * ───────────────────────────────────────────────────────────────────
- * The Monte Carlo estimator weights each sample by f_r·L_i·cosθ/p(ω).
- *
- * If we pick samples UNIFORMLY on the hemisphere (p = 1/(2π)):
- *
- *   weight = (ρ/π) · L_i · cosθ / (1/2π)
- *          = 2ρ · L_i · cosθ
- *
- * The cosθ STAYS in the weight. Near-grazing samples (cosθ ≈ 0)
- * contribute ~0 even though they're equally likely — wasted samples.
- *
- * Better: pick samples PROPORTIONAL TO cosθ. Set p(ω) = cosθ/π.
- * Then:
- *
- *   weight = (ρ/π) · L_i · cosθ / (cosθ/π)
- *          =  ρ · L_i
- *
- * THE cosθ AND THE π CANCEL.
- *
- * Two things become true at once:
- *   - The estimator weight is just `albedo · L_i` (no cosθ, no π).
- *   - Near-grazing samples are rare (low p), so we don't waste many
- *     samples on directions that contribute little anyway.
- *
- * This is IMPORTANCE SAMPLING — match the sample density to the
- * thing you're integrating. For Lambertian + cosθ the optimal match
- * is cosine-weighted, and the algebra simplifies to "throughput ×=
- * albedo per bounce".
- *
- * Read §10 throughput_chain — the inner update is literally
- * `throughput = throughput * albedo`. That's T6 in code.
- *
- * T7  MALLEY'S METHOD — UNIFORM DISK → HEMISPHERE WITHOUT REJECTION
- * ──────────────────────────────────────────────────────────────────
- * How do you draw samples from p(ω) = cosθ/π?
- *
- * One option: rejection sampling. Sample uniformly on the hemisphere,
- * accept with probability cosθ. Slow — average rejection rate ~50%
- * with worst case unbounded.
- *
- * Better: Malley's method (1988). It exploits a beautiful identity:
- *
- *   "Uniform samples on the unit disk, projected up to the
- *    hemisphere via z = √(1 − r²), give a cosine-weighted
- *    hemisphere distribution."
- *
- * Geometric picture (cross-section through the hemisphere):
- *
- *      hemisphere      ⌒
- *                    ╱   ╲
- *                  ╱       ╲          ← uniform points on the
- *                ╱  • • •    ╲          DISK below project up
- *              ╱                ╲       onto the hemisphere via
- *            ╱   • • • • • •      ╲      z = √(1 − x² − y²)
- *      _____╱_____________________╲_____   = √(1 − r²)
- *           ↑                     ↑
- *           uniform disk          z gives cosθ
- *
- * So sample uniformly on a 2-D disk; lift to 3-D via z = √(1−r²);
- * the resulting hemisphere samples are cosine-weighted. Two RNG
- * calls, no loops, numerically stable at all angles.
- *
- * Pseudocode (matches §9.2 sample_bounce):
- *
- *   r1, r2 ~ U[0, 1)
- *   φ      = 2π · r1                      angle around the axis
- *   in-plane radius = √r2                 (uniform on disk)
- *   z              = √(1 − r2)            (lift onto hemisphere)
- *   local_dir = (cosφ · √r2, sinφ · √r2, z)
- *   world_dir = onb(N) · local_dir        (rotate so N is +Z)
- *
- * The `onb(N)` builds an orthonormal basis around the surface
- * normal so "local +Z" maps to "world N". See §9.1.
- *
- * T8  THE THROUGHPUT CHAIN — HOW COLOUR BLEEDING EMERGES
- * ───────────────────────────────────────────────────────
- * In §12, between bounces:
- *
- *     throughput = throughput · albedo
- *
- * That's a CHANNEL-WISE multiply (red × red, green × green, blue ×
- * blue). After N bounces the throughput is:
- *
- *     final_throughput = albedo_1 · albedo_2 · … · albedo_N
- *
- * If a path goes  EYE → red wall (0.65, 0.05, 0.05)
- *                     → white floor (0.73, 0.73, 0.73)
- *                     → light (15, 14, 11),
- *
- * the final contribution is:
- *
- *     (0.65, 0.05, 0.05) · (0.73, 0.73, 0.73) · (15, 14, 11)
- *     = (7.12, 0.51, 0.40)
- *
- * BRIGHT RED. That's COLOUR BLEEDING — the red wall stained the
- * floor's contribution as the photon walked back to the eye. The
- * green channel got crushed (0.05) because the red wall absorbs
- * green; barely any green light makes it through that path.
- *
- * Try it: in PT mode, watch the gold sphere's left flank as samples
- * accumulate. It picks up a red blush from paths that bounced off
- * the red wall before reaching it. The right flank picks up green
- * from the green wall. That's two-bounce color bleeding rendered
- * automatically — no special code, just throughput × albedo per
- * step.
- *
- * T9  RUSSIAN ROULETTE — TERMINATING WITHOUT BIAS
- * ────────────────────────────────────────────────
- * We can't trace paths to infinite depth. Some termination rule is
- * needed. Three options:
- *
- *   HARD CAP        stop at depth = 7. Simple but BIASED — we ignore
- *                   light that would arrive via deeper paths.
- *   FADE-OUT        scale down contributions at deep bounces. Smooth
- *                   but still biased.
- *   RUSSIAN ROULETTE  unbiased termination — the crown jewel.
- *
- * Russian roulette: at each bounce past some depth, KILL the path
- * with probability (1 − p), where p is some "survival probability".
- * On survival, multiply throughput by 1/p:
- *
- *     if rng() > p:                kill the path (return 0)
- *     else:                        throughput *= 1/p
- *
- * Why is this unbiased? Compute the expected contribution:
- *
- *     E[contribution] = p · (contribution × 1/p)
- *                     + (1 − p) · 0
- *                     = contribution
- *
- * The 1/p compensation EXACTLY counterbalances the (1 − p) kills
- * in expectation. So the answer is right ON AVERAGE, even though
- * any single path is either zero or amplified.
- *
- * Choosing p: we want to keep paths that CAN STILL contribute
- * meaningfully. The throughput's MAX channel is a good proxy for
- * remaining energy. If max(throughput) = 0.001, contributions
- * through this path are dwarfed by paths with throughput 0.5 — kill
- * with high probability. If max = 0.9, keep almost certainly.
- *
- *     p = max(throughput.r, .g, .b)
- *
- * MAX (not MEAN) so we keep paths whose energy is concentrated in
- * one band (deep red after a red-wall hit).
- *
- * RR_DEPTH = 3: don't enable RR before this depth. Early bounces
- * carry most of the energy regardless of throughput, so killing
- * them just raises variance. After ~3 bounces the throughputs have
- * dimmed enough that RR's pruning saves more than it costs.
- *
- * T10 PROGRESSIVE ACCUMULATION AND THE √N CONVERGENCE LAW
- * ────────────────────────────────────────────────────────
- * One Monte Carlo sample is NOISY. The estimator is correct on
- * AVERAGE, but any single sample is a long way from the true value.
- *
- * Variance of an N-sample average:
- *
- *     Var(L̄_N) = σ² / N
- *
- * Standard deviation (visible noise) ∝ 1/√N.
- *
- * To halve visible noise, you must QUADRUPLE the sample count.
- * This is the central pain of path tracing — fast convergence
- * doesn't exist; only fewer samples per noticeable improvement.
- *
- * Implementation: keep a per-pixel SUM of all samples ever cast,
- * and a global COUNT. Display = sum / count. Adding more samples
- * just refines that average:
- *
- *     accum.sum[r][c] += new_sample;
- *     accum.samples   += 1;
- *     display          = accum.sum[r][c] / accum.samples;
- *
- * That's PROGRESSIVE refinement. The user sees:
- *
- *     1 sample        almost solid noise, hint of bright spot
- *     32 samples      silhouettes, lots of grain
- *     256 samples     clean walls, slight grain on spheres
- *     2048 samples    near-converged, only subtle noise remains
- *     8192 samples    converged for visual purposes
- *
- * The SPP slider (`+`/`-`) controls samples-per-FRAME, not
- * samples-per-final-image. SPP=8 gives you 8× the convergence per
- * frame at 8× the per-frame cost — same asymptotic, just different
- * pacing.
- *
- * KEY: keep the accumulator in LINEAR HDR space. Tone-map only at
- * draw time, AFTER dividing by sample count. Tone-mapping the sum
- * is mathematically wrong: tonemap(a+b) ≠ tonemap(a) + tonemap(b).
- *
- * T11 THE CORNELL BOX — WHAT THIS SCENE SPECIFICALLY TESTS
- * ─────────────────────────────────────────────────────────
- * The Cornell Box (Goral et al. 1984) is the canonical test scene
- * for global-illumination renderers. It was originally a PHYSICAL
- * BOX in a Cornell University lab — built from coloured paper and
- * photographed under measured light, then matched against
- * radiosity-renderer output to validate the algorithm.
- *
- * Key features:
- *
- *   OPEN FRONT   The camera sits at z = -1.5, looking +Z into the
- *                box's open face. Light only escapes through this
- *                opening (and the camera's pixels).
- *   COLOURED     Left wall RED, right wall GREEN. White floor,
- *   WALLS        ceiling, back. The colour asymmetry produces
- *                obvious COLOUR BLEEDING that's easy to verify.
- *   AREA LIGHT   The light is a small flat quad on the ceiling, not
- *                a point. Real lights have area; point lights are a
- *                fiction. Area lights produce SOFT shadows whose
- *                penumbra width depends on light size.
- *   2 SPHERES    Diffuse spheres on the floor. They're the focus —
- *                their colour shifts subtly toward the nearer wall.
- *
- * What this scene tests, that simpler scenes don't:
- *
- *   COLOUR BLEEDING        red wall stains nearby surfaces red,
- *                          green wall stains nearby surfaces green.
- *                          Whole-scene effect, not just the wall.
- *   AREA-LIGHT SOFT        floor under each sphere is dimmer than
- *   SHADOWS                surrounding floor; shadow edges are
- *                          gradient, not crisp.
- *   INDIRECT BOUNCE        ceiling NEAR the light is brighter than
- *                          ceiling at the corners — bounce light
- *                          from the floor warms the ceiling.
- *   ENERGY BALANCE         radiosity in = radiosity out. Get this
- *                          wrong (energy leak or gain) and the
- *                          colours drift over thousands of samples.
- *
- * If a renderer produces all four of those features visibly and
- * stably, it's a CORRECT global-illumination renderer. That's why
- * the Cornell Box is the sanity-check benchmark.
- *
- * Side note: the ORIGINAL smallpt represents the Cornell box with
- * NINE huge spheres (giant spheres acting as walls — clever but
- * pedagogically confusing). We use real axis-aligned quads instead
- * because the ray-quad math is simpler and the scene reads as it's
- * drawn.
- *
- * T12 FOUR DEBUG OVERLAYS — PT VS NORMAL VS ALBEDO VS DEPTH
- * ──────────────────────────────────────────────────────────
- * Cycling `d` switches between four rendering modes. Each one
- * short-circuits the path tracer at the FIRST hit and visualises
- * the output of one or two early passes — pedagogically this lets
- * you SEE what each pass produces in isolation.
- *
- *   PT       Pass 1+2+3+4+5+6+7. Full progressive Monte Carlo path
- *            tracer (default). Slowly converges from noise to clean.
- *   NORMAL   Pass 1+2 only. Per pixel, find the FIRST hit and
- *            encode its surface normal as RGB ((N+1)/2). Each face
- *            of the Cornell Box becomes a flat colour:
- *              floor   normal +Y → (0.5, 1.0, 0.5)
- *              ceiling normal -Y → (0.5, 0.0, 0.5)
- *              left    normal +X → (1.0, 0.5, 0.5)
- *              right   normal -X → (0.0, 0.5, 0.5)
- *              back    normal -Z → (0.5, 0.5, 0.0)
- *            Diagnostic for "did intersection produce the right
- *            normal?" If a face shows the wrong colour, the
- *            geometry is broken.
- *   ALBEDO   Pass 1+2+3. Per pixel, find the FIRST hit and return
- *            the material's body colour. No bounces, no lighting.
- *            Compare ALBEDO vs PT: how much detail comes from
- *            indirect light? In a Cornell Box: a LOT.
- *   DEPTH    Pass 1+2 only. Brightness ∝ 1 / (1 + t). Closer
- *            surfaces brighter, distant darker. Gray-scale only.
- *            Sanity check that intersection produces sane distances.
- *
- * The three debug modes converge in ONE SAMPLE because no
- * randomness is involved. Switching INTO them is instant; switching
- * OUT to PT resets the accumulator (the modes have different output
- * ranges and mixing them under one average would be incoherent).
- *
- * Pedagogical contrast:
- *   NORMAL  → "this is what the geometry pipeline gives us"
- *   ALBEDO  → "this is what the materials assert their colour is"
- *   DEPTH   → "this is what the camera-ray distances look like"
- *   PT      → "this is what they look like with light bouncing
- *              everywhere — and that's what makes it photo-real"
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * ════════════════════════════════════════════════════════════════════
- *  ARCHITECTURE — concern layers (step-4 separation pass)
- * ════════════════════════════════════════════════════════════════════
- *
- *  Labelled, separated layers. LOGIC is pure: the passes only READ the scene
- *  and advance a THREADED rng (never a global), so reordering or deleting
- *  RENDER can never change a LOGIC result.
- *
- *  LAYER        SECTION(S)                       MUTATES
- *  ----------   ------------------------------   ------------------------------
- *  CONFIG       §1, §5 (scene data)              nothing — constants, ramp,
- * enums, Cornell-box geometry (compile-time) PERFORMANCE  §2; main §16.2/.3/.7
- * OS sleep + loop-local timers; no scene state LOGIC        §3, §4, §5
- * (intersection),       nothing global — pure functions: §6-§12, §13 (tone
- * map), §14      vec3, RNG, ray-quad/sphere, scene_hit, camera ray, bounce
- *                                                sampling, throughput,
- * roulette, path_trace (the core), tone map, debug viz. sample_bounce/roulette/
- *                                                rng_f advance the PASSED-IN
- * Rng. SIMULATION   accum_add_frame (§13)            the Accumulator g_accum —
- * the progressive image; each tick adds one frame of samples. accum_reset
- *                                                clears it, but only on user
- * events. RENDER       accum_draw (§13), §15            the SCREEN (ncurses
- * cells) + g_have_256; reads g_accum, never writes it DELAYS       `paused`
- * gate + converged hold   nothing — once g_accum.samples reaches (§16.4)
- * ACCUM_CAP (or paused), sampling stops; no other holds/timers EFFECTS      —
- * none —                         no stored cosmetic state; the accumulator is
- * SIMULATION state (the converging image), not a glow
- *
- *  Timestep note: PERFORMANCE uses a VARIABLE wall-clock dt with a spiral-of-
- *  death cap (§16.2) and a frame-cap sleep (§16.7) — NOT a fixed-timestep
- *  accumulator. The image converges by ADDING samples each frame until
- *  g_accum.samples hits ACCUM_CAP, then holds (progressive Monte-Carlo render).
- *
- *  PER-TICK COMBINE ORDER (main loop — the one place layers meet):
- *    §16.1 resize   USER EVENT   apply SIGWINCH -> accum_reset
- *    §16.2 dt       PERFORMANCE  wall-clock dt, capped
- *    §16.3 fps      PERFORMANCE  rolling average
- *    §16.4 sample   SIMULATION   accum_add_frame (skipped if paused/converged)
- *    §16.5 paint    RENDER       erase -> accum_draw -> hud_draw -> doupdate
- *    §16.6 input    USER EVENTS  spp/mode/pause + accum_reset (NOT the tick)
- *    §16.7 sleep    PERFORMANCE  frame cap
- *
- *  User events (§16.1 resize, §16.6 keys, the signal handlers) mutate
- *  spp/mode/paused, reset the accumulator, and set g_run/g_resize. They are
- *  NOT the tick; the only per-tick simulation write is accum_add_frame.
- * ════════════════════════════════════════════════════════════════════
- */

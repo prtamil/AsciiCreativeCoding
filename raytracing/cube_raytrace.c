@@ -1,5 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 
+/* A cube spinning in space, ray-traced one terminal character at a time. Each
+ * character shoots a ray; if it hits the cube we work out the colour and
+ * brightness there and pick a glyph for it. Lights are plain white, so each
+ * material — gold, glass, neon, … — shows its own real look. Keys spin, zoom,
+ * and switch material/view (the on-screen hint strip lists them).
+ * Same skeleton, other shapes: sphere_raytrace.c, capsule_raytrace.c,
+ * torus_raytrace.c. */
+
 #define _POSIX_C_SOURCE 199309L
 #include <math.h>
 #include <ncurses.h>
@@ -12,81 +20,84 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── §1 CONFIG — constants, enums, ramp & layout (data only)
- * ──────────────────────────────────────────────────────── */
+/* ── §1  settings & constants ── */
 
-/* §1.1 frame rate. */
+/* §1.1 frame pacing */
 #define TARGET_FPS 60
-#define DT_CAP_NS 100000000LL /* 0.1 s — spiral-of-death cap   */
+#define DT_CAP_NS 100000000LL /* if a frame stalls, pretend at most 0.1s passed
+                               * so the cube can't suddenly lurch forward */
 
-/* §1.2 view geometry — terminal cell aspect (W/H) and full vertical FOV. */
+/* §1.2 view. Terminal cells are taller than they are wide, so we squash the
+ * picture vertically to stop the cube looking stretched. FOV = how wide a
+ * view the camera takes in. */
 #define ASPECT 0.47f
 #define FOV_DEG 55.0f
 
-/* §1.3 cube (object space, axis-aligned, centred on origin). */
-#define CUBE_S 0.80f /* half-extent: spans [-S, +S]   */
+/* §1.3 cube half-size: it runs from -CUBE_S to +CUBE_S on each axis, centred at 0 */
+#define CUBE_S 0.80f
 
-/* §1.4 wireframe mode. */
-#define WIRE_THRESH 0.055f  /* edge band as fraction of S    */
-#define WIRE_LUMA_BASE 0.7f /* edge brightness at the band rim       */
-#define WIRE_LUMA_GAIN 0.3f /* extra brightness ramped to the edge   */
+/* §1.4 wireframe view: how near an edge still counts as "on the edge", and how
+ * bright those edge characters are */
+#define WIRE_THRESH 0.055f  /* edge band width, as a fraction of the cube size */
+#define WIRE_LUMA_BASE 0.7f /* brightness at the outer rim of the band */
+#define WIRE_LUMA_GAIN 0.3f /* extra brightness right on the edge */
 
-/* §1.5 rotation rates (rad/sec). */
-#define ROT_Y 0.52f /* primary spin around Y         */
-#define ROT_X 0.35f /* tilt around X                 */
+/* §1.5 spin speed (radians per second) */
+#define ROT_Y 0.52f /* main turn, left-right */
+#define ROT_X 0.35f /* gentler tilt, up-down */
 
-/* §1.6 camera distance (orbits along −Z; bigger = cube looks smaller). */
+/* §1.6 camera pull-back; bigger = cube looks smaller / further away */
 #define CAM_DIST_DEF 3.2f
 #define CAM_DIST_MIN 1.5f
 #define CAM_DIST_MAX 7.0f
 #define CAM_DIST_STEP 0.25f
 
-/* §1.7 shading constants. */
-#define AMBIENT 0.20f
-#define SHININESS 75.0f     /* phong exponent — high = metal */
-#define DEPTH_FAR_SCALE 2.f /* MODE_DEPTH far plane = cam_dist × this */
+/* §1.7 lighting knobs */
+#define AMBIENT 0.20f   /* faint base glow so shadowed faces aren't pure black */
+#define SHININESS 32.0f /* highlight tightness. Kept low on purpose: a cube face
+                         * is flat, so a tight highlight would flip the whole
+                         * face bright-or-dark at once. Low spreads it into a
+                         * gradient the character grid can actually show. */
+#define RIM_SHININESS 10.f  /* the back light's highlight, wider than the rest */
+#define FRESNEL_POWER 2.5f  /* how fast edges brighten as they face away from us */
+#define FRESNEL_GAIN 0.5f   /* how strong that edge brightening is */
+#define DEPTH_FAR_SCALE 2.f /* depth view: how far away counts as fully dark */
 
-/* §1.8 character ramp — Paul Bourke 92-char density ladder. */
+/* §1.8 brightness-to-character ladder, dark on the left to bright on the right:
+ * we pick a glyph by how bright a point is, so " " is darkest and "@" brightest.
+ * (Paul Bourke's 92-character set.) */
 static const char k_ramp[] =
     " `.-':_,^=;><+!rc*/"
     "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define RAMP_LEN ((int)(sizeof k_ramp - 1))
 
-/* §1.9 ncurses pair IDs (216 cube + reserved HUD/HINT). */
+/* §1.9 colour. Terminals give us a 6×6×6 grid of colours (xterm 16..231); we
+ * claim ncurses colour-slots 1..216 for those, plus two for the HUD text. */
+#define CUBE_SIDE 6
 #define PAIR_CUBE_BASE 1
 #define PAIR_HUD 217
 #define PAIR_HINT 218
 
-/* §1.10 numerical epsilons. */
-#define T_EPS 1e-4f        /* reject t < this (self-hit)    */
-#define PARALLEL_EPS 1e-9f /* |ray_dir_i| below this = parallel */
+/* §1.10 tiny tolerances for the hit math */
+#define T_EPS 1e-4f        /* ignore hits this close to the ray's start (self-hits) */
+#define PARALLEL_EPS 1e-9f /* a direction this small counts as "parallel to a wall" */
+#define T_EXIT_MATCH_EPS                                                        \
+  1e-6f /* slop for "is this the wall the ray leaves through?" */
 
-/* §1.11 dummy "infinity" used as initial t_enter / t_exit. */
+/* §1.11 stand-in for infinity while we narrow down the hit range */
 #define BIG_T 1e30f
 
-/* ── §2 PERFORMANCE — monotonic clock + sleep
- * ───────────────────────────────────────────────────────── */
+/* ── §2  timing helpers ── */
 
-/*
- * clock_ns — wall-clock time in nanoseconds, monotonic.
- *
- * Why CLOCK_MONOTONIC: we care about ELAPSED real time (for animation
- * dt), not wall date. CLOCK_MONOTONIC never goes backward across NTP
- * adjustments, DST shifts, or system clock changes.
- */
+/* A clock that only ever counts forward, so animation timing isn't thrown off
+ * if the system clock jumps (NTP, daylight saving, etc.). */
 static long long clock_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-/*
- * clock_sleep_ns — best-effort sleep for the requested nanoseconds.
- *
- * Used by the main loop to cap the frame rate without burning the
- * CPU at 100%; we subtract (clock_ns() - frame_start) from the target
- * frame time and sleep the remainder.
- */
+/* Sleep the unused part of a frame so we don't spin a CPU core at 100%. */
 static void clock_sleep_ns(long long nanoseconds) {
   if (nanoseconds <= 0)
     return;
@@ -95,30 +106,13 @@ static void clock_sleep_ns(long long nanoseconds) {
   nanosleep(&request, NULL);
 }
 
-/* ── §3 LOGIC: math (pure) — V3 + Mat3
- * ────────────────────────────────────────────── *
- *
- * V3 — three floats by value. All vector helpers are inline to avoid
- * call overhead in the per-pixel loop.
- *
- * Mat3 — a 3×3 rotation matrix stored as three V3 ROWS. Storing rows
- * (rather than columns) makes "M · v" a clean trio of v3dot() calls.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §3  3-D vectors and rotations ── */
 
-/*
- * V3 — a point or direction in 3-D space (also reused as a linear-RGB colour
- * triple, since both are three floats under the same algebra).
- * WHY by-value, not a pointer: a V3 is 12 bytes and rides in registers, which
- * is cheaper than chasing a pointer in the per-pixel hot loop and keeps every
- * vector helper pure (§3 LOGIC). No 4th/homogeneous component: this tracer
- * intersects rays analytically and never does a projective divide, so w would
- * be dead weight.
- * Ref: Shirley, "Ray Tracing in One Weekend"; Foley & van Dam, vectors ch.
- */
+/* A point or direction in 3-D — and we reuse it as an R,G,B colour too, since
+ * both are just three numbers. Passed around by value (it's tiny) to keep the
+ * per-character loop fast. */
 typedef struct {
-  float x, y,
-      z; /* Cartesian components — or linear R,G,B when used as colour */
+  float x, y, z;
 } V3;
 
 static inline V3 v3add(V3 a, V3 b) {
@@ -140,16 +134,8 @@ static inline V3 v3norm(V3 a) {
   return (length > 1e-9f) ? v3scale(1.f / length, a) : (V3){0.f, 1.f, 0.f};
 }
 
-/*
- * v3reflect — reflect outgoing vector v across surface normal n.
- *
- * Identity:  v_reflected = v − 2·(v·n)·n
- *
- * Geometric reading: subtract twice the COMPONENT of v along n. In
- * §6 phong shading we feed v3reflect the NEGATED light vector (−L)
- * so the function's "outgoing" semantics match: light-as-outgoing
- * reflects to viewing-as-outgoing.
- */
+/* Bounce a direction off a surface, like a ball off a wall. Used to turn
+ * "where the light comes from" into "where it reflects toward". */
 static inline V3 v3reflect(V3 v, V3 n) {
   return v3sub(v, v3scale(2.f * v3dot(v, n), n));
 }
@@ -166,35 +152,15 @@ static inline V3 v3clamp01(V3 v) {
                           : v.z};
 }
 
-/*
- * Mat3 — a 3x3 rotation matrix, stored as three V3 ROWS.
- * WHY rows: with row storage "M*v" is exactly three v3dot() calls (row[i]*v).
- * Only rotations live here, so the matrix is always orthonormal and its
- * transpose IS its inverse (Mt == M^-1). That identity is the whole trick in
- * §8: a world-space ray is pushed into object space with Mt*v — no inverse is
- * ever computed. No translation/scale rows, so 3x3 (not 4x4) suffices.
- * Ref: Foley & van Dam, "Computer Graphics: Principles and Practice",
- * transforms.
- */
+/* A 3×3 rotation, stored as three rows. Because it's a pure rotation, flipping
+ * it along the diagonal (the transpose) gives its inverse for free — the trick
+ * that lets us rotate the *ray* into the cube's frame instead of the cube. */
 typedef struct {
-  V3 row[3]; /* orthonormal basis rows; row[i]*v = component i of M*v */
+  V3 row[3];
 } Mat3;
 
-/*
- * mat3_rotation — composed rotation Rx(angle_x) · Ry(angle_y).
- *
- * Purpose: build the OBJECT→WORLD rotation matrix.
- * Inputs : angle_x, angle_y in radians.
- * Output : Mat3 with three V3 rows.
- *
- * Composition order: Y first, then X. For an axis-aligned cube both
- * rotations matter — Y rotates the silhouette around the vertical
- * axis (cube → diamond → square), X tilts to expose top/bottom faces.
- *
- * Why this matrix flavour: T7 explains we rotate the RAY by the
- * INVERSE of this matrix. Since rotations are orthogonal, the inverse
- * is the transpose — see mat3_mulT below.
- */
+/* Builds the cube's current orientation from two spin angles (radians): a turn
+ * left-right plus a tilt up-down. */
 static Mat3 mat3_rotation(float angle_x, float angle_y) {
   float cos_x = cosf(angle_x), sin_x = sinf(angle_x);
   float cos_y = cosf(angle_y), sin_y = sinf(angle_y);
@@ -205,96 +171,61 @@ static Mat3 mat3_rotation(float angle_x, float angle_y) {
   return m;
 }
 
-/*
- * mat3_mul — forward transform v_world = M · v_obj.
- *
- * Each output component is a dot of one matrix row with the input.
- * Used in §8 to bring the OBJECT-space surface normal back to WORLD
- * space for shading.
- */
+/* Rotate a vector by the matrix — used to turn which-way-a-face-points from the
+ * cube's own frame back into world space, so we can light it. */
 static V3 mat3_mul(Mat3 m, V3 v) {
   return (V3){v3dot(m.row[0], v), v3dot(m.row[1], v), v3dot(m.row[2], v)};
 }
 
-/*
- * mat3_mulT — inverse transform v_obj = Mᵀ · v_world.
- *
- * For an orthogonal matrix Mᵀ = M⁻¹. Same operation count as
- * mat3_mul; just a transposed memory pattern. No determinant, no
- * division.
- *
- * Used in §8 to push the WORLD-space ray into OBJECT space where
- * the cube is axis-aligned.
- */
+/* Rotate by the inverse (the same matrix, just flipped — see Mat3). Used to push
+ * a world-space ray into the cube's own frame, where the cube sits square to the
+ * axes and the hit test is simple. */
 static V3 mat3_mulT(Mat3 m, V3 v) {
   return (V3){m.row[0].x * v.x + m.row[1].x * v.y + m.row[2].x * v.z,
               m.row[0].y * v.x + m.row[1].y * v.y + m.row[2].y * v.z,
               m.row[0].z * v.x + m.row[1].z * v.y + m.row[2].z * v.z};
 }
 
-/* ── §4 CONFIG/DATA: materials — Theme type + theme table
- * ─────────────────────────────────────────────── *
- *
- * Two channels make every cell expressive on a monochrome glyph grid:
- *
- *   COLOUR    256-colour 6×6×6 cube → "what" the surface is.
- *   DENSITY   ASCII-ramp character → "how bright" the surface is.
- *
- * Themes vary the obj/spec/light tints; the geometry pipeline doesn't
- * care which theme is active.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── Theme — PBR-flavoured material descriptor ────────────────────── *
- *
- * First-principles redesign: the LIGHTS are pure WHITE, and each
- * material's distinctive look comes entirely from its own properties.
- * Under white light, gold looks like gold (warm yellow metal) and
- * blue plastic looks like blue plastic — the colour is intrinsic to
- * the material, not painted on by a tinted light source.
- *
- * Fields:
- *   albedo          body diffuse colour (what the material LOOKS LIKE
- *                   under uniform white illumination)
- *   specular        F0 — Fresnel reflectance at normal incidence:
- *                     METALS:      tinted to match albedo (gold spec
- *                                  is warm yellow because gold reflects
- *                                  yellow at the highlight)
- *                     DIELECTRICS: near-white (~4% achromatic
- *                                  reflectance for non-conductors)
- *   emissive        self-luminance, added AFTER lighting — visible
- *                   even in shadow. Mostly (0,0,0); used for neon.
- *   diffuse_weight  scales the diffuse contribution from albedo:
- *                     metals      ≈ 0.15 (real metals diffuse very
- *                                         little — almost everything
- *                                         reflects via specular)
- *                     gems        ≈ 0.70 (saturated body + bright spec)
- *                     plastic /
- *                       ceramic   ≈ 0.85 (full body colour)
- *                     glass       ≈ 0.10 (very dark body, bright spec
- *                                         fakes the transparent look)
- *                     neon        ≈ 0.20 (low diffuse + bright emissive)
- *
- * The 20 themes below are organised into 4 families. Switching themes
- * with `t / T` cycles through all 20 in order.
- *
- * Metal albedos are taken from PBR reference tables (Naty Hoffman,
- * "Physics and Math of Shading", SIGGRAPH 2013) and lightly tweaked
- * for terminal-renderer contrast.
- * ─────────────────────────────────────────────────────────────────── */
+/* A ray: a start point and a direction — the straight line a single character
+ * "looks" along. The two always travel together, so they share one struct.
+ *   origin  where the ray starts (the camera, in world space)
+ *   dir     which way it points (we keep it unit length so hit distances
+ *           come out as real distances) */
 typedef struct {
-  V3 albedo;            /* body diffuse colour                      */
-  V3 specular;          /* F0 — metal: matches albedo; die: white   */
-  V3 emissive;          /* self-glow (added after lighting)         */
-  float diffuse_weight; /* 0.10..0.90 — metal/dielectric scale      */
-  const char *name;
-} Theme;
+  V3 origin;
+  V3 dir;
+} Ray;
 
-static const Theme g_themes[] = {
-    /* === METALS (12) — spec hue MATCHES albedo, low diffuse_weight ===
-     * Real metals reflect nearly all incident light specularly. Their
-     * F0 (Fresnel at normal incidence) is what tints the highlight,
-     * giving each metal its signature colour. */
+/* ── §4  materials (what each surface is made of) ── */
+
+/* What a surface is made of. The lights are plain white on purpose, so a
+ * material's whole look comes from these numbers — gold reads as gold, glass as
+ * glass — rather than being painted on by a coloured light.
+ *   albedo          the body colour you'd see in flat, even light (0..1 RGB)
+ *   specular        colour of the shiny highlight. For metals it matches the
+ *                   body colour (a gold highlight is yellow); for everything
+ *                   else it's near-white. (Graphics calls this "F0".)
+ *   emissive        colour the surface gives off by itself, added after the
+ *                   lighting so it glows even in shadow. Usually black; neon.
+ *   diffuse_weight  how much plain body colour shows vs. shine, 0..1: metals
+ *                   ~0.15 (almost all shine), gems ~0.70, plastic/ceramic ~0.85,
+ *                   glass ~0.10 (dark body + bright shine fakes see-through),
+ *                   neon ~0.20.
+ *   name            shown in the status line.
+ * The 20 materials below come in 4 families; t / T cycle through them. Metal
+ * colours are real measured values (Naty Hoffman, "Physics and Math of
+ * Shading", SIGGRAPH 2013), nudged a little for terminal contrast. */
+typedef struct {
+  V3 albedo;
+  V3 specular;
+  V3 emissive;
+  float diffuse_weight;
+  const char *name;
+} Material;
+
+static const Material g_materials[] = {
+    /* Metals (12): almost all shine, very little body colour, and the shine is
+     * tinted like the metal itself (a gold highlight is yellow). */
 
     /* gold     — warm yellow precious metal                            */
     {{1.00f, 0.77f, 0.34f},
@@ -369,9 +300,7 @@ static const Theme g_themes[] = {
      0.15f,
      "aluminum"},
 
-    /* === GEMS (4) — saturated body + WHITE spec, mid diffuse_weight =
-     * Gems are dielectrics; their Fresnel reflectance is achromatic.
-     * Body colour comes from absorption inside the crystal. */
+    /* Gems (4): a deep, rich body colour with a white highlight. */
 
     /* ruby     — red corundum (Cr-doped)                               */
     {{0.85f, 0.10f, 0.18f},
@@ -398,9 +327,7 @@ static const Theme g_themes[] = {
      0.70f,
      "amethyst"},
 
-    /* === DIELECTRICS (3) — body colour + WHITE spec ===================
-     * Plastics, ceramics, and glass. F0 is achromatic (~4%); body
-     * colour comes from sub-surface absorption. */
+    /* Plastic, glass, ceramic (3): full body colour with a white highlight. */
 
     /* plastic  — saturated blue plastic, full body colour              */
     {{0.20f, 0.40f, 0.92f},
@@ -421,10 +348,8 @@ static const Theme g_themes[] = {
      0.85f,
      "ceramic"},
 
-    /* === EMISSIVE (1) — neon glow ====================================
-     * Neon plasma is a self-emissive material. The albedo is the dim
-     * "off" tube colour; the emissive value glows hot pink even in
-     * shadow because emissive is added AFTER lighting. */
+    /* Neon (1): a dark "off" body that glows hot pink on its own, even in
+     * shadow, because the emissive colour is added after lighting. */
 
     /* neon     — hot pink/magenta self-glow                            */
     {{0.05f, 0.02f, 0.10f},
@@ -433,134 +358,73 @@ static const Theme g_themes[] = {
      0.20f,
      "neon"},
 };
-#define THEME_N ((int)(sizeof g_themes / sizeof g_themes[0]))
+#define MATERIAL_N ((int)(sizeof g_materials / sizeof g_materials[0]))
 
-/* color_init() and draw_color() are RENDER, not config — they live in the
- * RENDER layer at §7.5 (below), keeping §4 pure data. See ARCHITECTURE. */
+/* ── §5  does a ray hit the cube? (the core) ── *
+ *
+ * Think of the cube as the overlap of three "slabs": the gap between the
+ * left/right walls, the bottom/top walls, and the front/back walls. A ray is
+ * inside the cube only while it's inside all three at once. So for each pair of
+ * walls we find the stretch of the ray that lies between them, then overlap the
+ * three stretches — if anything's left (and it's in front of us), that's a hit.
+ * No square roots, just a few comparisons per character.
+ * (The classic "slab method": Kay & Kajiya 1986; Ericson, Real-Time Collision
+ * Detection §5.3.) */
 
-/* ── §5 LOGIC: ray-AABB intersection (pure) — THE CORE
- * ────────────────────────────── *
- *
- * The most important section in this file. Three short functions
- * implementing the slab method:
- *
- *   §5.1 slab_test       — solve the 1D ray-vs-interval problem
- *   §5.2 ray_aabb        — combine three slab results into a hit
- *   §5.3 face_edge_dist  — fraction-to-edge of a hit point on its
- *                          face (used by wireframe mode)
- *
- * All three operate in OBJECT space. The cube is axis-aligned, centred
- * at the origin, with half-extent CUBE_S.
- *
- * On hit, ray_aabb populates a BoxHit struct so the renderer can:
- *   - shade the hit (needs `t_hit` and `normal_obj`),
- *   - run debug overlays (needs `axis_at_enter`, `t_enter`, `t_exit`),
- *   - run wireframe mode (needs the world-/object-space hit point).
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * BoxHit — the "hit record" for the slab method: everything §5's ray-AABB
- * intersection learns about one ray, packed so the renderer (§8) and the debug
- * overlays (§7) need no recomputation. The slab test intersects the ray with
- * three axis-aligned slabs and keeps the overlap interval [t_enter, t_exit];
- * the cube is hit iff that interval is non-empty and in front of the camera.
- * Filled in OBJECT space (cube axis-aligned at the origin); §8 rotates the
- * normal back to world space for lighting.
- *   hit           1 if the ray meets the box, else 0 (test this first).
- *   axis_at_enter which axis {0,1,2}=X,Y,Z tightened t_enter — i.e. which face
- *                 was entered; it selects the face normal. Also diagnostic
- *                 (DEBUG_AXIS colours by it).
- *   t_hit         ray parameter of the visible surface: t_enter normally, or
- *                 t_exit when the camera is INSIDE the box (we see the back).
- *   t_enter       largest per-axis slab ENTRY (inside all three slabs).
- *                 Exposed for the DEBUG_INTERVAL overlay.
- *   t_exit        smallest per-axis slab EXIT (leaving any slab). Exposed for
- *                 DEBUG_INTERVAL; t_exit−t_enter is the chord length.
- *   normal_obj    outward face normal at the hit (one of ±X/±Y/±Z), object
- *                 space; the input to every term in §6.
- *   inside        1 if the camera origin began inside the box (t_enter < 0),
- *                 so t_hit fell back to the exit face.
- * Ref: Kay & Kajiya (1986) slab method; Ericson, "Real-Time Collision
- *      Detection" §5.3.3; Quilez box intersector.
- */
+/* What we learn when a ray meets the cube — filled once, then read by the
+ * shading and the debug views so nothing gets worked out twice. Computed in the
+ * cube's own frame; the face direction is rotated back to world space later.
+ *   hit            did it hit? Check this first — the rest is meaningless if 0.
+ *   axis_at_enter  which pair of walls it came in through (0/1/2 = X/Y/Z). This
+ *                  is what tells us which way the face points; the AXIS debug
+ *                  view colours by it.
+ *   t_hit          how far along the ray the visible surface is. The entry point
+ *                  normally; the exit point if the camera is inside the cube.
+ *   t_enter        when the ray enters the cube (the latest of the three slabs).
+ *   t_exit         when it leaves (the earliest of the three). exit − enter is
+ *                  how far it travels through the cube; the INTERVAL view uses it.
+ *   normal_obj     which way the hit face points (one of ±X/±Y/±Z), in the
+ *                  cube's frame — the starting point for all the shading.
+ *   inside         1 if the camera started inside the cube. */
 typedef struct {
-  int hit;           /* 1 = ray meets the box, 0 = miss (test first)   */
-  int axis_at_enter; /* {0,1,2}=X,Y,Z — which slab tightened t_enter    */
-  float t_hit;       /* visible-surface t: t_enter, or t_exit if inside */
-  float t_enter;     /* max per-axis slab entry  — DEBUG_INTERVAL       */
-  float t_exit;      /* min per-axis slab exit   — DEBUG_INTERVAL       */
-  V3 normal_obj;     /* outward face normal ±X/±Y/±Z, OBJECT space      */
-  int inside;        /* 1 if camera origin was inside the box           */
+  int hit;
+  int axis_at_enter;
+  float t_hit;
+  float t_enter;
+  float t_exit;
+  V3 normal_obj;
+  int inside;
 } BoxHit;
 
-/*
- * Box — the domain object this file renders: an axis-aligned cube centred on
- * the origin, the same half_extent on every axis, plus the orientation it is
- * currently spinning to. Geometry (half_extent) is fixed at scene_init;
- * spin_x/spin_y are advanced every tick by scene_advance(). The §5 slab math
- * keeps the cube axis-aligned and rotates the RAY into object space instead,
- * so the intersection stays in a fixed, simple frame.
- *   half_extent  the cube spans [-half_extent, +half_extent] on each axis.
- *   spin_x       live pitch about X (radians) — advanced by the tick.
- *   spin_y       live yaw   about Y (radians) — advanced by the tick.
- * Ref: AABB / slab method — Kay & Kajiya (1986); Ericson, "Real-Time
- *      Collision Detection" §5.3.
- */
+/* The thing we're drawing: a cube at the origin, the same size on every axis,
+ * plus how far it has spun. We keep the cube square to the axes and spin the
+ * *ray* instead — far simpler math — so the spin only ever touches the rays.
+ *   half_extent  half the cube's width; it runs -half_extent .. +half_extent
+ *   spin_x       tilt so far, up-down (radians)
+ *   spin_y       turn so far, left-right (radians) */
 typedef struct {
-  float half_extent; /* cube spans [-half_extent, +half_extent] per axis */
-  float spin_x;      /* live pitch (rad) — advanced by the tick          */
-  float spin_y;      /* live yaw   (rad) — advanced by the tick          */
+  float half_extent;
+  float spin_x;
+  float spin_y;
 } Box;
 
-/*
- * §5.1 slab_test — solve the 1D ray-vs-slab problem on one axis.
- *
- * Purpose: turn one axis's slab boundaries into a time interval
- *          [t_enter_slab, t_exit_slab]. Handles parallel rays.
- *
- * Inputs:
- *   ray_origin_i   the i-th component of ray origin (1D)
- *   ray_dir_i      the i-th component of ray direction (1D)
- *   half_extent    slab spans [-half_extent, +half_extent] on this axis
- *
- * Outputs (only valid on success):
- *   *out_t_enter   ray parameter at slab entry
- *   *out_t_exit    ray parameter at slab exit
- *   *out_enter_sign sign of the OUTWARD normal on the entry face
- *                   for this axis (it's −sign(ray_dir_i)).
- *
- * Returns: 1 if the ray ever sits inside this slab (possibly forever
- *            when parallel and inside),
- *          0 if the ray is parallel AND outside (forever-miss case).
- *
- * Pseudocode:
- *   if |ray_dir_i| < ε:                       (parallel to slab)
- *     if ray_origin_i ∉ [-h, +h]: return MISS forever
- *     else:                       no t-bound; t_enter = -∞, t_exit = +∞
- *   else:
- *     inv = 1 / ray_dir_i
- *     t0  = (-h - ray_origin_i) * inv
- *     t1  = ( h - ray_origin_i) * inv
- *     t_enter = min(t0, t1)
- *     t_exit  = max(t0, t1)
- *     enter_sign = -sign(ray_dir_i)
- *
- * Why min/max instead of branching on sign(ray_dir_i): when ray_dir_i
- * is negative, t0 and t1 swap roles (dividing by a negative flips
- * which is smaller). The min/max recovers the correct ordering with
- * one comparison, no sign branch. T2 has the geometric picture.
- */
+/* One axis at a time: when is the ray between this pair of walls? Hands back the
+ * time it enters that gap, the time it leaves, and which way the entry wall
+ * faces. Returns 0 (an instant, total miss) only in the odd case where the ray
+ * runs parallel to the walls and starts outside them; if it's parallel but
+ * between them, it's always between them, so we report no time limit.
+ * (We use min/max instead of a sign test because a ray pointing the negative
+ * way crosses the far wall first.) */
 static int slab_test(float ray_origin_i, float ray_dir_i, float half_extent,
                      float *out_t_enter, float *out_t_exit,
                      float *out_enter_sign) {
   if (fabsf(ray_dir_i) < PARALLEL_EPS) {
-    /* Parallel to the two walls of this slab. */
+    /* ray runs parallel to these two walls */
     if (ray_origin_i < -half_extent || ray_origin_i > half_extent)
-      return 0;            /* outside → permanent miss */
-    *out_t_enter = -BIG_T; /* slab imposes no bound    */
+      return 0;            /* started outside them → never between them */
+    *out_t_enter = -BIG_T; /* always between them → no time limit */
     *out_t_exit = BIG_T;
-    *out_enter_sign = 0.f; /* no entry face contribution */
+    *out_enter_sign = 0.f; /* never crosses an entry wall here */
     return 1;
   }
   float inv_dir = 1.f / ray_dir_i;
@@ -573,52 +437,51 @@ static int slab_test(float ray_origin_i, float ray_dir_i, float half_extent,
     *out_t_enter = t1;
     *out_t_exit = t0;
   }
-  /* Entry-face outward normal: opposite sign to ray direction. */
+  /* the entry wall faces back against the ray */
   *out_enter_sign = (ray_dir_i > 0.f) ? -1.f : 1.f;
   return 1;
 }
 
-/*
- * §5.2 ray_aabb — slab-method ray vs axis-aligned box.
- *
- * Purpose: combine three slab tests (one per axis) into a single
- *          hit/miss decision and recover the entry face's normal.
- *
- * Inputs:  ray_origin, ray_dir   OBJECT-space ray
- *          half_extent           cube half-side (box = [-h, +h]^3)
- *
- * Output:  BoxHit struct populated for the hit, .hit=0 on miss.
- *
- * Pseudocode:
- *   t_enter = -∞;  t_exit = +∞;  axis_at_enter = -1
- *   for axis i in 0,1,2:
- *     slab_test → t_enter_slab, t_exit_slab, enter_sign
- *     if MISS: return MISS
- *     if t_enter_slab > t_enter:
- *       t_enter       = t_enter_slab
- *       axis_at_enter = i
- *       enter_sign_g  = enter_sign
- *     if t_exit_slab  < t_exit:  t_exit = t_exit_slab
- *     if t_enter > t_exit: return MISS
- *
- *   if t_exit < ε: return MISS              (whole interval behind)
- *   if t_enter < ε:                         (camera inside box)
- *     t_hit = t_exit
- *     find axis owning t_exit; enter_sign_g = +sign(ray_dir on that axis)
- *   else:
- *     t_hit = t_enter
- *
- *   normal_obj = (axis basis vector)[axis_at_enter] * enter_sign_g
- *   return HIT(t_hit, axis_at_enter, normal_obj)
- *
- * Tightening logic: t_enter only grows (max-of-slabs); t_exit only
- * shrinks (min-of-slabs). The moment they cross, no t can satisfy
- * all three slabs and we early-exit.
- */
-static BoxHit ray_aabb(V3 ray_origin, V3 ray_dir, float half_extent) {
-  /* Pack components into arrays for a clean axis loop. */
-  float ray_origin_arr[3] = {ray_origin.x, ray_origin.y, ray_origin.z};
-  float ray_dir_arr[3] = {ray_dir.x, ray_dir.y, ray_dir.z};
+/* Turn "which wall, which side" into the direction that face points — one of
+ * ±X / ±Y / ±Z. */
+static inline V3 axis_normal(int axis, float sign) {
+  V3 normal = {0.f, 0.f, 0.f};
+  if (axis == 0)
+    normal.x = sign;
+  else if (axis == 1)
+    normal.y = sign;
+  else
+    normal.z = sign;
+  return normal;
+}
+
+/* When the camera started inside the cube, the surface we can see is the one the
+ * ray leaves through. Find that wall (its exit time matches the cube's exit
+ * time); its face points the way the ray is heading. Returns the axis and its
+ * sign, or -1 if nothing matches. */
+static int exit_face(const float ray_origin_arr[3], const float ray_dir_arr[3],
+                     float half_extent, float t_exit, float *out_sign) {
+  for (int axis = 0; axis < 3; axis++) {
+    float t_enter_slab, t_exit_slab, slab_enter_sign;
+    if (!slab_test(ray_origin_arr[axis], ray_dir_arr[axis], half_extent,
+                   &t_enter_slab, &t_exit_slab, &slab_enter_sign))
+      return -1;
+    if (fabsf(t_exit_slab - t_exit) < T_EXIT_MATCH_EPS) {
+      *out_sign = (ray_dir_arr[axis] > 0.f) ? +1.f : -1.f;
+      return axis;
+    }
+  }
+  return -1;
+}
+
+/* The hit test. Check each pair of walls (X, Y, Z) and keep the overlap: enter
+ * at the latest of the three entry times, leave at the earliest of the exits. If
+ * those cross, the ray misses; if the whole overlap is behind us, it misses too.
+ * Normally we see the entry face; if the camera is inside the cube we hand back
+ * the exit face. The face we came in through is just the axis whose entry won. */
+static BoxHit ray_aabb(Ray ray, float half_extent) {
+  float ray_origin_arr[3] = {ray.origin.x, ray.origin.y, ray.origin.z};
+  float ray_dir_arr[3] = {ray.dir.x, ray.dir.y, ray.dir.z};
 
   BoxHit out = {.hit = 0};
 
@@ -630,36 +493,26 @@ static BoxHit ray_aabb(V3 ray_origin, V3 ray_dir, float half_extent) {
     float t_enter_slab, t_exit_slab, slab_enter_sign;
     if (!slab_test(ray_origin_arr[axis], ray_dir_arr[axis], half_extent,
                    &t_enter_slab, &t_exit_slab, &slab_enter_sign))
-      return out; /* parallel & outside → MISS */
+      return out; /* runs alongside these walls and outside them → miss */
 
-    /* Tighten entry: take the LATEST start. */
-    if (t_enter_slab > t_enter) {
+    if (t_enter_slab > t_enter) { /* latest entry wins, and names the face */
       t_enter = t_enter_slab;
       axis_at_enter = axis;
       enter_sign = slab_enter_sign;
     }
-    /* Tighten exit: take the EARLIEST end. */
     if (t_exit_slab < t_exit)
       t_exit = t_exit_slab;
 
-    /* Empty intersection? No t can satisfy all three slabs. */
-    if (t_enter > t_exit)
+    if (t_enter > t_exit) /* the ranges no longer overlap → miss */
       return out;
   }
 
   if (t_exit < T_EPS)
-    return out; /* whole interval behind us */
+    return out; /* the whole cube is behind the camera */
 
   out.t_enter = t_enter;
   out.t_exit = t_exit;
 
-  /* Two cases:
-   *   t_enter > T_EPS  → ordinary entry hit, t_hit = t_enter.
-   *   t_enter ≤ T_EPS  → ray ORIGIN is INSIDE the box → return the
-   *                       EXIT (t_hit = t_exit) and the exit-face
-   *                       normal. We rebuild that normal from
-   *                       sign(ray_dir) on the axis whose t_exit
-   *                       matched the global t_exit. */
   float t_hit;
   if (t_enter > T_EPS) {
     t_hit = t_enter;
@@ -667,32 +520,14 @@ static BoxHit ray_aabb(V3 ray_origin, V3 ray_dir, float half_extent) {
   } else {
     t_hit = t_exit;
     out.inside = 1;
-    /* Find which axis owns t_exit, and use sign(ray_dir) — the ray
-     * is LEAVING through that wall, so the normal points the same
-     * way as ray_dir on that axis. */
-    for (int axis = 0; axis < 3; axis++) {
-      float t_enter_slab, t_exit_slab, slab_enter_sign;
-      if (!slab_test(ray_origin_arr[axis], ray_dir_arr[axis], half_extent,
-                     &t_enter_slab, &t_exit_slab, &slab_enter_sign))
-        return out;
-      if (fabsf(t_exit_slab - t_exit) < 1e-6f) {
-        axis_at_enter = axis;
-        enter_sign = (ray_dir_arr[axis] > 0.f) ? +1.f : -1.f;
-        break;
-      }
-    }
+    /* Camera inside → the visible surface is the EXIT face. */
+    axis_at_enter = exit_face(ray_origin_arr, ray_dir_arr, half_extent, t_exit,
+                              &enter_sign);
     if (axis_at_enter < 0)
       return out;
   }
 
-  /* Face normal: the axis basis vector with the recorded sign. */
-  out.normal_obj = (V3){0.f, 0.f, 0.f};
-  if (axis_at_enter == 0)
-    out.normal_obj.x = enter_sign;
-  else if (axis_at_enter == 1)
-    out.normal_obj.y = enter_sign;
-  else
-    out.normal_obj.z = enter_sign;
+  out.normal_obj = axis_normal(axis_at_enter, enter_sign);
 
   out.t_hit = t_hit;
   out.axis_at_enter = axis_at_enter;
@@ -700,31 +535,9 @@ static BoxHit ray_aabb(V3 ray_origin, V3 ray_dir, float half_extent) {
   return out;
 }
 
-/*
- * §5.3 face_edge_dist — fraction-to-edge of a hit point on its face.
- *
- * Purpose: tell wireframe mode how close a hit is to the boundary of
- *          its face. Returns 0 exactly on an edge, 1 at the face
- *          centre.
- *
- * Inputs:
- *   point_obj      OBJECT-space hit point
- *   normal_obj     hit-face normal (one of ±X, ±Y, ±Z)
- *   half_extent    cube half-side
- *
- * Pseudocode:
- *   pick the two coordinates that LIE WITHIN the face (the two NOT
- *     aligned with the normal axis):
- *       if normal is ±X: u = point.y, v = point.z
- *       if normal is ±Y: u = point.x, v = point.z
- *       if normal is ±Z: u = point.x, v = point.y
- *   distance to the nearest u-edge = h - |u|
- *   distance to the nearest v-edge = h - |v|
- *   return min(du, dv) / h   ← normalised to [0, 1]
- *
- * Returned value is 0 exactly on an edge of the face and 1 at the
- * face centre. Wireframe mode draws cells with value < WIRE_THRESH.
- */
+/* How close a hit point is to the edge of its face, for the wireframe view:
+ * 0 right on an edge, 1 dead centre. We look at the two coordinates that run
+ * along the face and take whichever is nearest its border. */
 static float face_edge_dist(V3 point_obj, V3 normal_obj, float half_extent) {
   float u, v;
   if (fabsf(normal_obj.x) > 0.5f) {
@@ -743,13 +556,8 @@ static float face_edge_dist(V3 point_obj, V3 normal_obj, float half_extent) {
   return fminf(du, dv) / half_extent;
 }
 
-/*
- * face_uv — return the in-face UV coordinates of a hit point.
- *
- * Used by the FACE-UV debug overlay. Outputs are in [-1, +1] (after
- * normalising by half_extent), so a centre-of-face hit reports (0,0)
- * and a corner reports (±1, ±1).
- */
+/* Where a hit sits on its face, as two numbers in -1..+1 (centre is 0,0, a
+ * corner is ±1,±1). Used by the face-uv debug view. */
 static void face_uv(V3 point_obj, V3 normal_obj, float half_extent,
                     float *out_u, float *out_v) {
   float u, v;
@@ -767,224 +575,148 @@ static void face_uv(V3 point_obj, V3 normal_obj, float half_extent,
   *out_v = v / half_extent;
 }
 
-/* ── §6 LOGIC: shading (pure) — surface → colour
- * ─────────────────────────────────────────────────────── *
- *
- * Once §5 has identified a hit point and its surface normal, §6 turns
- * those into an RGB colour. Four orthogonal modes (T9) are provided.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §6  turning a hit into a colour ── */
 
-/*
- * ShadeMode — which surface→colour view §6 produces for a hit: four ORTHOGONAL
- * views of the same geometry (one lit look + three diagnostics) so the user can
- * SEE what the renderer computes. Cycled with `s`. Trailing MODE_N is the
- * member count, enabling `(mode + 1) % MODE_N` wraparound; order matches
- * k_mode_names[] and the switch in shade_surface() (§6). MODE_PHONG Blinn-Phong
- * lit material — the physically-motivated look. MODE_NORMAL  normal vector
- * mapped xyz→rgb — inspect the surface normals. MODE_WIRE    draw only cells
- * near a face edge (face_edge_dist < WIRE_THRESH) — the cube's wireframe
- * silhouette. MODE_DEPTH   distance-to-camera ramp — inspect depth ordering.
- * Ref: Phong (1975); Blinn (1977).
- */
+/* The four ways to colour a hit, switched with `s`: one real lit look plus
+ * three views that show the math behind it. MODE_N is just the count, so we can
+ * wrap around with (mode + 1) % MODE_N; the order matches k_mode_names[] and the
+ * switch in shade_surface.
+ *   MODE_PHONG   the proper lit look
+ *   MODE_NORMAL  paint each face by which way it points (a normals check)
+ *   MODE_WIRE    draw only the edges
+ *   MODE_DEPTH   brighter = closer */
 typedef enum {
-  MODE_PHONG = 0, /* Blinn-Phong lit material (the "real" look)    */
-  MODE_NORMAL,    /* normal xyz → rgb (debug normals)              */
-  MODE_WIRE,      /* edge-only wireframe (face_edge_dist band)     */
-  MODE_DEPTH,     /* distance ramp (debug depth)                   */
-  MODE_N          /* count — enables % MODE_N wraparound           */
+  MODE_PHONG = 0,
+  MODE_NORMAL,
+  MODE_WIRE,
+  MODE_DEPTH,
+  MODE_N
 } ShadeMode;
 static const char *const k_mode_names[] = {"phong", "normals", "wireframe",
                                            "depth"};
 
-/* Three fixed world-space lights — POSITIONS, not directions.
- * Cinematic three-point setup:
- *   KEY  = warm above-front-right (the bright "sun")
- *   FILL = cool low-front-left    (lifts the shadow side)
- *   RIM  = bright back-low        (separates silhouette from bg)
- */
-static const V3 LIGHT_KEY = {3.0f, 4.0f, -2.0f};
-static const V3 LIGHT_FILL = {-4.0f, 1.0f, -1.0f};
-static const V3 LIGHT_RIM = {0.5f, -1.0f, 5.0f};
+/* One light in the three-light setup: where it sits, plus a few dials for how it
+ * adds in. Keeping each light's dials next to its position lets the shader just
+ * loop over the lights instead of repeating itself three times.
+ *   pos        where the light is (a spot in space, not a direction)
+ *   diffuse    how much soft, all-over light it adds
+ *   specular   how much shine it adds (0 = a soft-only light, like the fill)
+ *   shininess  how tight that shine is (smaller = broader) */
+typedef struct {
+  V3 pos;
+  float diffuse;
+  float specular;
+  float shininess;
+} Light;
 
-/* Per-light gains for the three-point rig (visual weights, not physical).
- * KEY is the dominant light; FILL is diffuse-only; RIM is a wide backlight. */
-#define KEY_DIFFUSE 1.00f  /* KEY  diffuse weight                           */
-#define KEY_SPECULAR 1.30f /* KEY  specular weight (sharp highlight)        */
-#define FILL_DIFFUSE 0.55f /* FILL diffuse weight (lifts the shadow side)   */
-#define RIM_DIFFUSE 0.40f  /* RIM  diffuse weight                           */
-#define RIM_SPECULAR 1.20f /* RIM  specular weight (silhouette kiss)        */
-#define RIM_SHININESS 10.f /* RIM  specular exponent (wider than SHININESS) */
+/* Three white lights, the classic photo setup:
+ *   KEY  main light, up and to the right — bright, with a crisp shine
+ *   FILL down to the left — soft only, just lifts the shadow side
+ *   RIM  behind and low — a wide back-glow that picks out the edge */
+static const Light g_lights[] = {
+    {{3.0f, 4.0f, -2.0f}, 1.00f, 1.30f, SHININESS},     /* KEY  */
+    {{-4.0f, 1.0f, -1.0f}, 0.55f, 0.00f, SHININESS},    /* FILL */
+    {{0.5f, -1.0f, 5.0f}, 0.40f, 1.20f, RIM_SHININESS}, /* RIM  */
+};
+#define LIGHT_N ((int)(sizeof g_lights / sizeof g_lights[0]))
 
-/*
- * add_phong_light — accumulate ONE white point-light's Blinn-Phong
- * contribution (diffuse + specular) onto a running colour. Extracted from
- * shade_phong so the three-point rig reads as three named lights; the
- * per-light recipe is identical, only the gains differ.
- *   light_dir = normalize(light_pos − point)        (lights are POSITIONS)
- *   diffuse   = max(0, N·light_dir) · diffuse_weight · diffuse_gain → albedo
- *   specular  = max(0, reflect(−light_dir,N)·V)^shininess · specular_gain → F0
- * v3reflect() reflects an OUTGOING vector, so we pass −light_dir: light arrives
- * along −light_dir and the reflection is what we compare against the view dir.
- * A diffuse-only light (e.g. FILL) passes specular_gain = 0. Pure (const
- * Theme*).
- */
-static V3 add_phong_light(V3 colour, V3 light_pos, V3 point_world,
-                          V3 normal_world, V3 view_dir, const Theme *th,
-                          float diffuse_gain, float specular_gain,
-                          float shininess) {
-  V3 light_dir = v3norm(v3sub(light_pos, point_world));
+/* Add one white light's share to a running colour: a soft part that's strongest
+ * where the surface faces the light head-on, plus a shiny part that flares where
+ * the light bounces straight back toward the camera. (We hand the bounce the
+ * flipped light direction so "light coming in" lines up with "bounce going out".) */
+static V3 add_phong_light(V3 colour, const Light *light, V3 point_world,
+                          V3 normal_world, V3 view_dir,
+                          const Material *material) {
+  V3 light_dir = v3norm(v3sub(light->pos, point_world));
   float diffuse = fmaxf(0.f, v3dot(normal_world, light_dir));
-  colour = v3add(
-      colour, v3scale(diffuse * th->diffuse_weight * diffuse_gain, th->albedo));
+  colour = v3add(colour, v3scale(diffuse * material->diffuse_weight *
+                                     light->diffuse,
+                                 material->albedo));
   V3 reflect_dir = v3reflect(v3scale(-1.f, light_dir), normal_world);
-  float specular = powf(fmaxf(0.f, v3dot(reflect_dir, view_dir)), shininess);
-  colour = v3add(colour, v3scale(specular * specular_gain, th->specular));
+  float specular =
+      powf(fmaxf(0.f, v3dot(reflect_dir, view_dir)), light->shininess);
+  colour =
+      v3add(colour, v3scale(specular * light->specular, material->specular));
   return colour;
 }
 
-/*
- * shade_phong — three-point Phong with PURE WHITE lights.
- *
- * For each white light at position L_pos:
- *   light_dir   = normalize(L_pos − point_world)
- *   diffuse     = max(0, normal · light_dir)
- *   reflect_dir = reflect(−light_dir, normal)
- *   specular    = max(0, reflect_dir · view_dir)^SHININESS
- *
- * The lights are pure white — every material's distinctive look comes
- * from its OWN albedo and specular tint, not from a coloured key
- * filter. Under white light:
- *   gold ALBEDO + gold SPEC      → looks like gold
- *   blue ALBEDO + WHITE SPEC     → looks like blue plastic
- *   dark ALBEDO + WHITE SPEC     → looks like glass
- * Material-as-material, not material-tinted-by-light.
- *
- * Per-light weighting: KEY > FILL > RIM in diffuse; KEY and RIM
- * contribute specular; FILL is diffuse-only.
- *
- * Diffuse contribution is multiplied by th->diffuse_weight:
- *   metals       ≈ 0.15 — real metals reflect almost everything
- *                         specularly; near-zero diffuse.
- *   gems         ≈ 0.70 — saturated body + bright white spec.
- *   dielectrics  ≈ 0.85 — full body colour.
- *   glass        ≈ 0.10 — very dark body, bright spec fakes
- *                         transparency.
- *
- * Emissive is added AFTER the lighting sum and BEFORE the clamp, so
- * neon glows hot pink even in shadow.
- *
- * On a cube, each face is FLAT-LIT — the normal is constant across
- * the whole face, so diffuse and specular don't vary across pixels
- * of the same face. The visual result is six flat-shaded quads.
- */
+/* The real lit look. Faint base glow, then the three lights, then a rim that
+ * brightens edges turning away from us. That rim matters because a cube face is
+ * flat: the lights alone paint each face one even tone, and the rim is what
+ * gives it shape and makes the edges show up on a coarse character grid. Last,
+ * add any self-glow (neon). Because the lights are white, each material ends up
+ * showing its own colour. */
 static V3 shade_phong(V3 point_world, V3 normal_world, V3 view_dir,
-                      const Theme *th) {
-  /* ambient: a dim, flat fraction of the body albedo (fills the shadow). */
-  V3 colour = v3scale(AMBIENT, th->albedo);
+                      const Material *material) {
+  V3 colour = v3scale(AMBIENT, material->albedo); /* faint base glow */
 
-  /* three-point rig, all WHITE lights — the material tints itself: */
-  colour = add_phong_light(colour, LIGHT_KEY, point_world, normal_world,
-                           view_dir, th, KEY_DIFFUSE, KEY_SPECULAR, SHININESS);
-  colour = add_phong_light(colour, LIGHT_FILL, point_world, normal_world,
-                           view_dir, th, FILL_DIFFUSE, 0.f, SHININESS);
-  colour =
-      add_phong_light(colour, LIGHT_RIM, point_world, normal_world, view_dir,
-                      th, RIM_DIFFUSE, RIM_SPECULAR, RIM_SHININESS);
+  for (int i = 0; i < LIGHT_N; i++)
+    colour = add_phong_light(colour, &g_lights[i], point_world, normal_world,
+                             view_dir, material);
 
-  /* emissive: added AFTER lighting, BEFORE clamp → neon glows even in shadow.
-   */
-  colour = v3add(colour, th->emissive);
+  /* Rim: brighten the surface as it turns edge-on to us. It's tinted by the
+   * material's shine colour, so metals get a coloured edge and others white. */
+  float facing = v3dot(normal_world, view_dir);
+  /* Clamp facing to 0..1 on BOTH ends. A face seen dead-on can round just above
+   * 1, making (1 - facing) negative; raising a negative to a fractional power
+   * gives NaN, which then picks a garbage character and crashes. (We hit this.) */
+  facing = facing < 0.f ? 0.f : (facing > 1.f ? 1.f : facing);
+  float fresnel = powf(1.f - facing, FRESNEL_POWER);
+  colour = v3add(colour, v3scale(fresnel * FRESNEL_GAIN, material->specular));
+
+  colour = v3add(colour, material->emissive); /* self-glow, shows even in shadow */
   return v3clamp01(colour);
 }
 
-/*
- * shade_normal — RGB-encode the surface normal as a colour.
- *
- *   N ∈ [−1,1]³   →   (N+1)/2 ∈ [0,1]³
- *
- * For an axis-aligned cube each face has a constant normal so each
- * face becomes a single flat colour:
- *   +X (1.0, 0.5, 0.5)   −X (0.0, 0.5, 0.5)
- *   +Y (0.5, 1.0, 0.5)   −Y (0.5, 0.0, 0.5)
- *   +Z (0.5, 0.5, 1.0)   −Z (0.5, 0.5, 0.0)
- * Cleanest possible diagnostic for normal correctness.
- */
+/* Debug view: colour a face by which way it points, so you can eyeball the face
+ * directions. Each cube face points one fixed way, so it comes out one flat
+ * colour. (x,y,z of the direction shifted from -1..1 into 0..1.) */
 static V3 shade_normal(V3 normal_world) {
   return (V3){normal_world.x * 0.5f + 0.5f, normal_world.y * 0.5f + 0.5f,
               normal_world.z * 0.5f + 0.5f};
 }
 
-/*
- * shade_wire — wireframe edge tint.
- *
- * Called only for cells where face_edge_dist returned a value below
- * WIRE_THRESH. Saturation rises toward the edge centre (edge_dist=0)
- * and falls farther away. The face's normal-encoded colour serves as
- * the base hue so each edge inherits its face's colour.
- */
+/* Wireframe tint, only used for cells right by an edge: brighter the closer to
+ * the edge, coloured by the face it belongs to. */
 static V3 shade_wire(V3 normal_world, float edge_dist) {
   V3 colour = shade_normal(normal_world);
-  /* Saturation peaks at the edge centre (k=1) and fades to k=0 at
-   * the WIRE_THRESH boundary. */
-  float k = 1.f - edge_dist / WIRE_THRESH;
+  float k = 1.f - edge_dist / WIRE_THRESH; /* 1 on the edge, 0 at the band's rim */
   return v3clamp01(v3scale(0.6f + 0.4f * k, colour));
 }
 
-/*
- * shade_depth — encode hit distance as brightness (closer = brighter).
- *
- *   depth_norm = 1 − min(t / t_max, 1)
- *   bright     = depth_norm²              (steeper falloff)
- *
- * Sanity check: in DEPTH mode, the brightest pixel sits at the
- * nearest point on the visible silhouette.
- */
-static V3 shade_depth(float t_hit, float distance_max, const Theme *th) {
+/* Debug view: nearer surfaces are brighter, far ones fade to black. */
+static V3 shade_depth(float t_hit, float distance_max, const Material *material) {
   float depth_norm = 1.f - fminf(t_hit / distance_max, 1.f);
   depth_norm = depth_norm * depth_norm;
-  return v3clamp01(v3scale(depth_norm, th->albedo));
+  return v3clamp01(v3scale(depth_norm, material->albedo));
 }
 
-/*
- * rec601_luma — perceptual brightness from RGB (Rec. 601).
- *
- *   Y = 0.299·R + 0.587·G + 0.114·B
- *
- * Used to choose the ASCII ramp character for a coloured pixel.
- */
+/* Boil a colour down to one brightness number, weighted the way the eye sees it
+ * (green counts most), so we can pick a character for it. */
 static inline float rec601_luma(V3 c) {
   return 0.299f * c.x + 0.587f * c.y + 0.114f * c.z;
 }
 
-/*
- * normal_vis_luma — brightness for the MODE_NORMAL view. There the colour IS
- * the normal remapped (N+1)/2 → RGB, so plain Rec.601 luma reads oddly; this
- * weights the remapped channels green-heavy (0.30/0.60/0.10) to match the
- * eye's "green is brightest" intuition for normal-map visualisations.
- */
+/* Same idea for the "which way it faces" view. Its false colours look wrong
+ * under plain brightness, so we lean even harder on green to match how bright
+ * they feel. */
 static inline float normal_vis_luma(V3 normal_world) {
   return (normal_world.x * 0.5f + 0.5f) * 0.30f +
          (normal_world.y * 0.5f + 0.5f) * 0.60f +
          (normal_world.z * 0.5f + 0.5f) * 0.10f;
 }
 
-/*
- * shade_surface — produce the on-screen colour + brightness for one hit in the
- * selected ShadeMode (`s` cycles it). Returns 0 when the pixel should be left
- * blank — only MODE_WIRE does this, skipping face interiors so just the cube's
- * edges draw. The single place a hit becomes a drawable cell, so render()'s
- * loop reads as steps. MODE_DEPTH measures against a far plane at
- * cam_dist·DEPTH_FAR_SCALE. Pure: const Theme*, writes only its out-params.
- */
+/* Work out the colour and brightness for one hit in the current view. Returns 0
+ * to leave the cell blank — only the wireframe view does that, skipping the
+ * middle of each face so just the edges show. */
 static int shade_surface(ShadeMode mode, const BoxHit *hit, V3 hit_point_obj,
                          V3 hit_point_world, V3 normal_world, V3 view_dir,
-                         float cam_dist, float half_extent, const Theme *th,
+                         float cam_dist, float half_extent, const Material *material,
                          V3 *out_colour, float *out_luminance) {
   switch (mode) {
   default:
   case MODE_PHONG:
-    *out_colour = shade_phong(hit_point_world, normal_world, view_dir, th);
+    *out_colour = shade_phong(hit_point_world, normal_world, view_dir, material);
     *out_luminance = rec601_luma(*out_colour);
     break;
   case MODE_NORMAL:
@@ -1002,49 +734,35 @@ static int shade_surface(ShadeMode mode, const BoxHit *hit, V3 hit_point_obj,
     break;
   }
   case MODE_DEPTH:
-    *out_colour = shade_depth(hit->t_hit, cam_dist * DEPTH_FAR_SCALE, th);
+    *out_colour = shade_depth(hit->t_hit, cam_dist * DEPTH_FAR_SCALE, material);
     *out_luminance = rec601_luma(*out_colour);
     break;
   }
   return 1;
 }
 
-/* ── §7 LOGIC: debug-overlay decisions (pure)
- * ──────────────────────────────────────────────── *
+/* ── §7  debug views of the math ── *
  *
- * Three overlays that REPLACE the normal shaded colour with a
- * visualisation of the §5 intersection's intermediate state. Cycled
- * with `d`. Each teaches one specific aspect of the slab method —
- * see T10.
- *
- * The overlays read BoxHit fields populated by §5 plus a few values
- * the renderer (§8) computed locally (object-space hit point for the
- * FACE-UV overlay).
- *
- * ─────────────────────────────────────────────────────────────────── */
+ * Each replaces the normal colour with a picture of what the hit test found, so
+ * the math isn't a black box. Switched with `d`. */
 
-/*
- * DebugMode — an overlay that REPLACES the shaded colour with a picture of the
- * slab method's internal state, so §5 is not a black box. Each reads BoxHit
- * fields already computed (DEBUG_FACE_UV also uses the object-space hit point
- * the renderer has on hand). Cycled with `d`; trailing DEBUG_N is the count for
- * `% DEBUG_N` wraparound; order matches k_debug_names[] and apply_debug() (§7).
- *   DEBUG_OFF       no overlay — keep the §6 shaded colour.
- *   DEBUG_AXIS      tint by axis_at_enter (R/G/B = entered face X/Y/Z).
- *   DEBUG_INTERVAL  brightness from the slab overlap width (t_exit − t_enter).
- *   DEBUG_FACE_UV   colour by the hit's in-face (u,v) coordinates.
- */
+/* A debug overlay, switched with `d`. DEBUG_N is the count, for wrap-around;
+ * order matches k_debug_names[] and apply_debug.
+ *   DEBUG_OFF       leave the normal colour
+ *   DEBUG_AXIS      colour by which pair of walls the ray came in through
+ *   DEBUG_INTERVAL  brighter where the ray passes deeper through the cube
+ *   DEBUG_FACE_UV   colour by where the hit lands on its face */
 typedef enum {
-  DEBUG_OFF = 0,  /* no overlay — keep the shaded colour            */
-  DEBUG_AXIS,     /* tint by axis_at_enter (R/G/B = X/Y/Z face)     */
-  DEBUG_INTERVAL, /* brightness from slab width (t_exit − t_enter)  */
-  DEBUG_FACE_UV,  /* colour by in-face (u,v) coordinates            */
-  DEBUG_N         /* count — enables % DEBUG_N wraparound           */
+  DEBUG_OFF = 0,
+  DEBUG_AXIS,
+  DEBUG_INTERVAL,
+  DEBUG_FACE_UV,
+  DEBUG_N
 } DebugMode;
 static const char *const k_debug_names[] = {"off", "axis", "interval",
                                             "face-uv"};
 
-/* Helper: simple two-stop colour gradient driven by t ∈ [0,1]. */
+/* Blend from a cool blue to a warm yellow as t goes 0 → 1. */
 static V3 gradient_cold_hot(float t) {
   if (t < 0.f)
     t = 0.f;
@@ -1056,29 +774,10 @@ static V3 gradient_cold_hot(float t) {
               cold.z + (hot.z - cold.z) * t};
 }
 
-/*
- * apply_debug — given a hit and an overlay mode, return the overlay
- *               colour and luminance.
- *
- * AXIS       primary-colour-coded faces:
- *              red   = X-axis face won (axis_at_enter == 0)
- *              green = Y-axis face (axis_at_enter == 1)
- *              blue  = Z-axis face (axis_at_enter == 2)
- *            Teaches WHICH axis is "tightest" for each pixel — i.e.
- *            which slab tightened the t_enter race.
- *
- * INTERVAL   brightness from (t_exit − t_enter) — "thickness of the
- *            box-overlap interval" = "how much of the ray is inside".
- *            Bright at face centres, dim at silhouette edges.
- *            Teaches the geometric meaning of the interval overlap.
- *
- * FACE-UV    colour by the face's local (u,v) ∈ [-1,+1]² mapped to
- *            an RGB gradient. Reveals each face's parameterisation —
- *            the same coordinates wireframe uses to detect edges.
- *
- * Outputs are written to *out_colour and *out_luminance. The caller
- * passes them straight to draw_color().
- */
+/* Pick the overlay colour + brightness for a hit:
+ *   AXIS      red/green/blue = which pair of walls (X/Y/Z) the ray entered
+ *   INTERVAL  brighter where the ray cuts deeper through the cube
+ *   FACE-UV   colour by where the hit lands on its face */
 static void apply_debug(DebugMode mode, const BoxHit *hit, V3 hit_point_obj,
                         float half_extent, V3 *out_colour,
                         float *out_luminance) {
@@ -1103,10 +802,8 @@ static void apply_debug(DebugMode mode, const BoxHit *hit, V3 hit_point_obj,
     break;
   }
   case DEBUG_INTERVAL: {
-    /* Interval thickness in object-space units, normalised by
-     * the cube's diagonal (≈ 2·sqrt(3)·half_extent ≈ 3.46·h).
-     * For a head-on view through the centre the thickness is
-     * 2·half_extent, normalised to ≈ 0.58 — comfortably bright. */
+    /* how far the ray travels inside the cube, scaled to 0..1 against the
+     * longest path it could take (corner to corner) */
     float thickness = hit->t_exit - hit->t_enter;
     float norm = thickness / (2.f * sqrtf(3.f) * half_extent);
     if (norm < 0.f)
@@ -1120,8 +817,7 @@ static void apply_debug(DebugMode mode, const BoxHit *hit, V3 hit_point_obj,
   case DEBUG_FACE_UV: {
     float u, v;
     face_uv(hit_point_obj, hit->normal_obj, half_extent, &u, &v);
-    /* (u,v) ∈ [-1,+1] → (R,G) ∈ [0,1]. Blue stays at 0.5 so the
-     * overall brightness is constant — only hue changes. */
+    /* position on the face → red/green; blue fixed so only the colour shifts */
     *out_colour = (V3){u * 0.5f + 0.5f, v * 0.5f + 0.5f, 0.5f};
     *out_luminance = 0.85f;
     break;
@@ -1132,18 +828,12 @@ static void apply_debug(DebugMode mode, const BoxHit *hit, V3 hit_point_obj,
   }
 }
 
-/* ── §7.5 RENDER: colour output — ncurses pairs + cell painter ─────── */
+/* ── §7.5  drawing a coloured character ── */
 
-static int g_have_256; /* 1 if 256-colour cube is available, 0 = mono */
+static int g_have_256; /* true if the terminal has 256 colours; false = plain */
 
-/*
- * color_init — bind ncurses colour pairs.
- *
- * Pair scheme:
- *   1..216    6×6×6 RGB cube (xterm 16..231) — used by draw_color().
- *   217       PAIR_HUD  — bright yellow on default bg.
- *   218       PAIR_HINT — bright cyan on default bg.
- */
+/* Claim the colour slots once: 1..216 for the 6×6×6 colour grid, plus two for
+ * the HUD text. */
 static void color_init(void) {
   start_color();
   use_default_colors();
@@ -1156,69 +846,51 @@ static void color_init(void) {
   init_pair(PAIR_HINT, 51, -1);
 }
 
-/*
- * draw_color — paint one cell with a colour and a luminance.
- *
- * Inputs : row, col       terminal cell
- *          colour         0..1 RGB triplet
- *          luminance      0..1 brightness picking the ramp character
- */
-static void draw_color(int row, int col, V3 colour, float luminance) {
+/* Pick a character for a brightness 0..1: dark → " ", bright → "@". */
+static inline char ramp_char(float luminance) {
   if (luminance < 0.f)
     luminance = 0.f;
   if (luminance > 1.f)
     luminance = 1.f;
-  char ch = k_ramp[(int)(luminance * (RAMP_LEN - 1))];
+  return k_ramp[(int)(luminance * (RAMP_LEN - 1))];
+}
+
+/* Snap one colour channel (0..1) onto the terminal's 6 brightness levels. */
+static inline int cube_level(float channel) {
+  int level = (int)(channel * (CUBE_SIDE - 1) + 0.5f);
+  return level > CUBE_SIDE - 1 ? CUBE_SIDE - 1 : level;
+}
+
+/* Turn an R,G,B colour into the matching terminal colour-slot number. */
+static inline int cube_pair(V3 colour) {
+  return PAIR_CUBE_BASE + cube_level(colour.x) * CUBE_SIDE * CUBE_SIDE +
+         cube_level(colour.y) * CUBE_SIDE + cube_level(colour.z);
+}
+
+/* Draw one cell: a character chosen by brightness, in the colour for this RGB
+ * (plain terminals just get the character). */
+static void draw_color(int row, int col, V3 colour, float luminance) {
+  char ch = ramp_char(luminance);
 
   if (g_have_256) {
-    int red_5 = (int)(colour.x * 5.f + 0.5f);
-    if (red_5 > 5)
-      red_5 = 5;
-    int green_5 = (int)(colour.y * 5.f + 0.5f);
-    if (green_5 > 5)
-      green_5 = 5;
-    int blue_5 = (int)(colour.z * 5.f + 0.5f);
-    if (blue_5 > 5)
-      blue_5 = 5;
-    int pair_idx = PAIR_CUBE_BASE + red_5 * 36 + green_5 * 6 + blue_5;
-    attron(COLOR_PAIR(pair_idx));
+    int pair = cube_pair(colour);
+    attron(COLOR_PAIR(pair));
     mvaddch(row, col, (chtype)(unsigned char)ch);
-    attroff(COLOR_PAIR(pair_idx));
+    attroff(COLOR_PAIR(pair));
   } else {
     mvaddch(row, col, (chtype)(unsigned char)ch);
   }
 }
 
-/* ── §8 RENDER: per-pixel frame → screen
- * ────────────────────────────────────────────────── *
+/* ── §8  shoot one ray per character ── *
  *
- * One ray per terminal cell. The pipeline:
- *
- *   1. Compute camera basis (forward / right / up — fixed; the CUBE
- *      rotates, not the camera).
- *   2. Pre-build the WORLD↔OBJECT rotation matrix from the current
- *      angles. Used as Mᵀ on the ray (T7) and as M on the normal.
- *   3. For each cell:
- *        a. screen u, v in [-1,1] with FOV expansion + ASPECT correction
- *        b. world ray (origin, direction)
- *        c. object-space ray via mat3_mulT
- *        d. ray_aabb()
- *        e. on hit: world-space hit + normal, shade, optionally apply
- *           debug overlay, draw
- *
- * The bottom row is left blank so the cyan hint strip in §9 has
- * somewhere to live.
- *
- * ─────────────────────────────────────────────────────────────────── */
+ * For each cell we build a ray from the camera through it, rotate it into the
+ * cube's frame, test for a hit, and if it hits, shade it and draw it. The bottom
+ * row is left empty so the key-hint strip has somewhere to sit. */
 
-/*
- * primary_ray_dir — the camera ray through one terminal cell, in WORLD space.
- * cell → normalized screen coords in [-1,1] (centre origin) → scale by the
- * half-FOV tangent → divide the VERTICAL axis by ASPECT so the terminal's tall
- * cells don't squash the square cube into a rectangle → combine with the camera
- * basis and normalize. Both axes use the WIDTH centre, so x and y share one
- * pixel scale before the aspect correction. Pure: builds a direction.
- */
+/* The ray from the camera out through one character cell. We turn the cell's
+ * column and row into a direction, squashing the vertical a little so the tall
+ * cells don't stretch the cube, then aim it out from the camera. */
 static V3 primary_ray_dir(int col, int row, float screen_centre_x,
                           float screen_centre_y, float fov_half_tan,
                           V3 view_right, V3 view_up, V3 view_forward) {
@@ -1229,15 +901,14 @@ static V3 primary_ray_dir(int col, int row, float screen_centre_x,
                                           v3scale(screen_v, view_up))));
 }
 
-static void render(const Box *box, const Theme *th, ShadeMode shade_mode,
+static void render(const Box *box, const Material *material, ShadeMode shade_mode,
                    DebugMode debug_mode, float cam_dist, int cols, int rows) {
   float fov_half_tan = tanf(FOV_DEG * (float)M_PI / 360.f);
 
-  /* §8.1 — WORLD↔OBJECT rotation. (Mᵀ goes WORLD→OBJECT for the ray;
-   *         M goes OBJECT→WORLD for the normal.) */
+  /* the cube's current spin, as a rotation we can apply to rays and faces */
   Mat3 rotation = mat3_rotation(box->spin_x, box->spin_y);
 
-  /* §8.2 — camera basis (fixed). */
+  /* the camera sits back along -Z and looks toward +Z; the cube spins, not it */
   V3 camera_origin = {0.f, 0.f, -cam_dist};
   V3 view_forward = {0.f, 0.f, 1.f};
   V3 view_right = {1.f, 0.f, 0.f};
@@ -1246,36 +917,35 @@ static void render(const Box *box, const Theme *th, ShadeMode shade_mode,
   float screen_centre_x = cols * 0.5f;
   float screen_centre_y = rows * 0.5f;
 
-  /* §8.3 — Mᵀ applied to the camera origin once (it doesn't depend
-   *         on the pixel). */
+  /* the camera in the cube's frame — same for every cell, so compute it once */
   V3 ray_origin_obj = mat3_mulT(rotation, camera_origin);
 
-  /* §8.4 — primary loop: one camera ray per cell, read top-to-bottom. */
   for (int row = 0; row < rows - 1; row++) {
     for (int col = 0; col < cols; col++) {
       V3 ray_dir_world =
           primary_ray_dir(col, row, screen_centre_x, screen_centre_y,
                           fov_half_tan, view_right, view_up, view_forward);
-      V3 ray_dir_obj =
-          mat3_mulT(rotation, ray_dir_world); /* world → object (T7) */
+      /* the same ray, rotated into the cube's frame for the hit test */
+      Ray ray_obj = {ray_origin_obj, mat3_mulT(rotation, ray_dir_world)};
 
-      BoxHit hit = ray_aabb(ray_origin_obj, ray_dir_obj, box->half_extent);
+      BoxHit hit = ray_aabb(ray_obj, box->half_extent);
       if (!hit.hit)
         continue;
 
-      /* Reconstruct the hit in OBJECT and WORLD space (t is identical in both —
-       * a pure rotation preserves distance). */
-      V3 hit_point_obj = v3add(ray_origin_obj, v3scale(hit.t_hit, ray_dir_obj));
+      /* where the hit is (the distance is the same in either frame), plus which
+       * way the face points and the direction back to the camera */
+      V3 hit_point_obj =
+          v3add(ray_obj.origin, v3scale(hit.t_hit, ray_obj.dir));
       V3 hit_point_world =
           v3add(camera_origin, v3scale(hit.t_hit, ray_dir_world));
       V3 normal_world = mat3_mul(rotation, hit.normal_obj);
       V3 view_dir = v3norm(v3sub(camera_origin, hit_point_world));
 
-      /* Shade for the active mode (MODE_WIRE skips face interiors). */
+      /* colour it; the wireframe view returns 0 to skip a face's middle */
       V3 colour;
       float luminance;
       if (!shade_surface(shade_mode, &hit, hit_point_obj, hit_point_world,
-                         normal_world, view_dir, cam_dist, box->half_extent, th,
+                         normal_world, view_dir, cam_dist, box->half_extent, material,
                          &colour, &luminance))
         continue;
 
@@ -1288,24 +958,16 @@ static void render(const Box *box, const Theme *th, ShadeMode shade_mode,
   }
 }
 
-/* ── §9 RENDER: HUD → screen ──────────────────────────────────────────────────
- * *
- *
- * Two-row HUD per project spec:
- *   row 0    yellow status (right-aligned) + yellow mode label (left)
- *   rows-1   cyan key-hint strip (BOLD; never DIM, must read against
- *            any animation behind it)
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §9  status line + key hints ── */
 
-static void hud_draw(int cols, int rows, float fps, const Theme *th,
+static void hud_draw(int cols, int rows, float fps, const Material *material,
                      ShadeMode shade_mode, DebugMode debug_mode, float cam_dist,
                      int paused) {
-  /* §9.1 right-aligned status. fps lives here so it never gets
-   * clipped by a long mode label on narrow terminals. */
+  /* right side: fps, distance, material, paused/running. fps goes on the right
+   * so a long mode name on the left can't shove it off a narrow screen. */
   char status[96];
   snprintf(status, sizeof status, " %5.1f fps  dist:%.1f  %-9s  %s ",
-           (double)fps, (double)cam_dist, th->name,
+           (double)fps, (double)cam_dist, material->name,
            paused ? "PAUSED " : "running");
   int status_len = (int)strlen(status);
   if (status_len > cols)
@@ -1314,7 +976,7 @@ static void hud_draw(int cols, int rows, float fps, const Theme *th,
   mvprintw(0, cols - status_len, "%s", status);
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-  /* §9.2 left-aligned mode + debug labels (yellow without bold). */
+  /* left side: which view, and which debug overlay */
   char left_label[80];
   snprintf(left_label, sizeof left_label, " mode:%-9s  debug:%-8s ",
            k_mode_names[shade_mode], k_debug_names[debug_mode]);
@@ -1322,60 +984,45 @@ static void hud_draw(int cols, int rows, float fps, const Theme *th,
   mvprintw(0, 0, "%s", left_label);
   attroff(COLOR_PAIR(PAIR_HUD));
 
-  /* §9.3 bottom-left cyan key-hint strip (BOLD, ASCII only). */
+  /* bottom: the key hints, bold so they stay readable over the animation */
   attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
   mvprintw(
       rows - 1, 0,
-      " q:quit  spc/p:pause  s:mode  d:debug  t:theme  r:reset  +/-:zoom ");
+      " q:quit  spc/p:pause  s:mode  d:debug  t:material  r:reset  +/-:zoom ");
   attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* ── §9.5 SCENE — runtime state aggregate + lifecycle ───────────────── *
- *
- * One struct holding everything that changes at runtime, so the app loop
- * below reads like a table of contents. Functions elsewhere take the
- * NARROWEST type they need (const Box*, const Theme*, scalars); only the
- * lifecycle orchestrators here take Scene*, so "everything hangs off
- * Scene" never re-couples the layers.
- *
- * ─────────────────────────────────────────────────────────────────── */
+/* ── §9.5  all the live state in one place ── */
 
+/* Everything that changes while the program runs, gathered so the main loop
+ * reads like a summary. Other functions take only the piece they need (a const
+ * Box*, a const Material*, a number); just init/reset/advance take the whole
+ * Scene. */
 typedef struct {
-  /* WHAT is simulated — the one domain object (its orientation lives inside
-   * it, so there are no loose angle fields here). */
-  Box box; /* the spinning cube (geometry + orientation)     */
+  Box box; /* the spinning cube */
 
-  /* HOW the user views it — RENDER/view knobs, grouped by THAT concept (not
-   * by "things the keyboard changes"): none feed the simulation, they only
-   * change the picture. All toggled in §10.5. */
-  int theme_idx;        /* index into g_themes[] (read mod THEME_N)       */
-  ShadeMode shade_mode; /* which §6 surface→colour view to run            */
-  DebugMode debug_mode; /* which §7 overlay (DEBUG_OFF = none)            */
-  float cam_dist;       /* camera pull-back along -Z; +/- clamp it to     */
-                        /* [CAM_DIST_MIN, CAM_DIST_MAX]                   */
-  int paused;           /* DELAYS gate: when set, scene_advance skips spin */
+  /* view settings — these change only the picture, never the cube; all driven
+   * by keys in the main loop */
+  int material_idx;     /* which material (wraps around MATERIAL_N) */
+  ShadeMode shade_mode; /* which of the four views */
+  DebugMode debug_mode; /* which debug overlay, if any */
+  float cam_dist;       /* how far back the camera sits */
+  int paused;           /* when set, the cube stops spinning */
 
-  /* WHERE we draw — terminal size, re-read on SIGWINCH (§10.1) so render and
-   * the HUD always match the real window. */
-  int cols, rows; /* terminal columns × rows                        */
+  int cols, rows; /* terminal size, re-read when the window changes */
 
-  /* frame pacing — PERFORMANCE readout only; never affects the image. Once
-   * per ~0.5 s window: fps = fps_frames * 1e9 / fps_accum_ns, then both
-   * accumulators reset (a rolling average that smooths per-frame jitter). */
-  float fps;              /* last computed rolling frames/sec (for the HUD) */
-  long long fps_accum_ns; /* nanoseconds summed in the current window       */
-  int fps_frames;         /* frames summed in the current window            */
+  /* frame-rate readout for the HUD, averaged over ~0.5s so it doesn't flicker */
+  float fps;
+  long long fps_accum_ns;
+  int fps_frames;
 } Scene;
 
-/*
- * scene_init — opening state: cube geometry + zero spin, default view knobs,
- * current terminal size. Orchestrator: takes the whole Scene.
- */
+/* Starting state: cube at zero spin, default view, current window size. */
 static void scene_init(Scene *s) {
   s->box.half_extent = CUBE_S;
   s->box.spin_x = 0.f;
   s->box.spin_y = 0.f;
-  s->theme_idx = 0;
+  s->material_idx = 0;
   s->shade_mode = MODE_PHONG;
   s->debug_mode = DEBUG_OFF;
   s->cam_dist = CAM_DIST_DEF;
@@ -1386,21 +1033,14 @@ static void scene_init(Scene *s) {
   s->fps_frames = 0;
 }
 
-/*
- * scene_reset — the `r` key: return the spin to zero. That orientation is the
- * only evolving simulation state; view knobs (theme, cam, mode) are untouched.
- * Orchestrator: takes Scene*. A USER EVENT, not part of the tick.
- */
+/* The `r` key: stop the spin (back to facing straight on). View settings stay. */
 static void scene_reset(Scene *s) {
   s->box.spin_x = 0.f;
   s->box.spin_y = 0.f;
 }
 
-/*
- * scene_advance — one tick of state evolution: spin the cube (unless paused)
- * and fold dt into the rolling fps. The ONLY writer of simulation state inside
- * the tick; render/hud never mutate the Scene. Orchestrator: takes Scene*.
- */
+/* One step forward in time: spin the cube a little (unless paused) and update the
+ * frame-rate counter. The only place the spin changes during a frame. */
 static void scene_advance(Scene *s, long long dt_ns) {
   if (!s->paused) {
     float seconds = (float)dt_ns * 1e-9f;
@@ -1416,8 +1056,7 @@ static void scene_advance(Scene *s, long long dt_ns) {
   }
 }
 
-/* ── §10 APP / TICK — combines all layers (see ARCHITECTURE)
- * ────────────────────────────────────────────────────────── */
+/* ── §10  startup, input, main loop ── */
 
 static volatile sig_atomic_t g_run = 1;
 static volatile sig_atomic_t g_resize = 0;
@@ -1443,7 +1082,8 @@ int main(void) {
   curs_set(0);
   keypad(stdscr, TRUE);
   nodelay(stdscr, TRUE);
-  typeahead(-1); /* prevent input tearing */
+  typeahead(-1); /* stop ncurses pausing our drawing to peek at the keyboard,
+                  * which otherwise tears the picture */
   atexit(cleanup);
   color_init();
 
@@ -1454,8 +1094,7 @@ int main(void) {
   long long last = clock_ns();
 
   while (g_run) {
-    /* §10.1 USER EVENT — apply pending SIGWINCH (control state, not the tick).
-     */
+    /* window was resized: reset ncurses and re-read the new size */
     if (g_resize) {
       g_resize = 0;
       endwin();
@@ -1463,33 +1102,28 @@ int main(void) {
       getmaxyx(stdscr, scene.rows, scene.cols);
     }
 
-    /* §10.2 PERFORMANCE — wall-clock dt with spiral-of-death cap. */
+    /* time since the last frame, capped so one hiccup can't make the cube jump */
     long long now = clock_ns();
     long long dt = now - last;
     if (dt > DT_CAP_NS)
       dt = DT_CAP_NS;
     last = now;
 
-    /* §10.3 TICK — advance simulation + fps (the only per-tick Scene mutation;
-     *         spin is skipped while paused — the DELAYS layer; the `r` key also
-     *         zeroes the spin, but as a USER EVENT in §10.5). */
+    /* move the cube on by that much time (does nothing while paused) */
     scene_advance(&scene, dt);
 
-    /* §10.4 RENDER combine — the ONE place the layers meet, in order:
-     *         erase -> render -> hud_draw -> doupdate. Reads state, never
-     * writes it. */
-    const Theme *th = &g_themes[scene.theme_idx % THEME_N];
+    /* draw the frame: clear, cube, HUD, then flip it to the screen */
+    const Material *material = &g_materials[scene.material_idx % MATERIAL_N];
     long long frame_start = clock_ns();
     erase();
-    render(&scene.box, th, scene.shade_mode, scene.debug_mode, scene.cam_dist,
+    render(&scene.box, material, scene.shade_mode, scene.debug_mode, scene.cam_dist,
            scene.cols, scene.rows);
-    hud_draw(scene.cols, scene.rows, scene.fps, th, scene.shade_mode,
+    hud_draw(scene.cols, scene.rows, scene.fps, material, scene.shade_mode,
              scene.debug_mode, scene.cam_dist, scene.paused);
     wnoutrefresh(stdscr);
     doupdate();
 
-    /* §10.5 USER EVENTS — mutate view/control state (theme, mode, cam, pause,
-     *         reset, quit); NOT part of the tick, never advance simulation. */
+    /* handle one keypress — these change the view, never the cube's motion */
     int ch = getch();
     switch (ch) {
     case 'q':
@@ -1515,10 +1149,10 @@ int main(void) {
       scene.debug_mode = (DebugMode)((scene.debug_mode + 1) % DEBUG_N);
       break;
     case 't':
-      scene.theme_idx = (scene.theme_idx + 1) % THEME_N;
+      scene.material_idx = (scene.material_idx + 1) % MATERIAL_N;
       break;
     case 'T':
-      scene.theme_idx = (scene.theme_idx + THEME_N - 1) % THEME_N;
+      scene.material_idx = (scene.material_idx + MATERIAL_N - 1) % MATERIAL_N;
       break;
     case '+':
     case '=':
@@ -1536,788 +1170,8 @@ int main(void) {
       break;
     }
 
-    /* §10.6 PERFORMANCE — frame cap. */
+    /* sleep whatever's left of the frame so we hold roughly 60 fps */
     clock_sleep_ns(frame_ns - (clock_ns() - frame_start));
   }
   return 0;
 }
-
-/*
- * cube_raytrace.c — analytic ray-traced cube via the slab method.
- *
- * DEMO: A solid cube tumbling in space, lit by a three-point rig of white
- *       lights (each material tints itself).
- *       Cycle four shading modes (phong → normals → wireframe →
- *       depth) and three debug overlays (off → axis → interval →
- *       face-uv) to see how the slab method works on the inside.
- *       Watch the silhouette change from square (face-on) to hexagon
- *       (corner-on) as the cube rotates.
- *
- * Study alongside:
- *   raytracing/sphere_raytrace.c   — same skeleton, ONE quadratic
- *   raytracing/capsule_raytrace.c  — same skeleton, decomposed analytic
- *   raytracing/torus_raytrace.c    — same skeleton, QUARTIC (much harder)
- *
- * Section map (each section is tagged with its concern — CONFIG /
- * PERFORMANCE / LOGIC / RENDER / SCENE / APP; see the ARCHITECTURE block
- * at the bottom of the file for the full layer table):
- *   §1   CONFIG       — frame rate, FOV, cube geometry, gains, ramp, IDs
- *   §2   PERFORMANCE  — monotonic clock + sleep
- *   §3   LOGIC: math  — V3, Mat3 (object↔world transforms)
- *   §4   CONFIG/DATA  — Theme material table + 256-colour cube
- *   §5   LOGIC: core  — Box type + ray-AABB slab method
- *                       §5.1 slab_test  §5.2 ray_aabb  §5.3 face_edge_dist
- *   §6   LOGIC: shade — add_phong_light, phong/normals/wireframe/depth,
- *                       shade_surface dispatcher
- *   §7   LOGIC: debug — overlays that visualise the §5 intermediate state
- *   §7.5 RENDER       — colour output: ncurses pairs + cell painter
- *   §8   RENDER       — per-pixel frame (primary_ray_dir → shade → draw)
- *   §9   RENDER       — ncurses HUD (yellow status row, cyan hint strip)
- *   §9.5 SCENE        — runtime state aggregate + scene_init/reset/advance
- *   §10  APP / TICK   — signals, input, main loop
- *
- * Keys:
- *   s         cycle shade mode   (phong → normals → wireframe → depth)
- *   d         cycle debug overlay (off → axis → interval → face-uv)
- *   t / T     cycle theme — 20 materials in 4 families:
- *               metals (12)  gold, silver, copper, bronze, brass, platinum,
- *                            titanium, iron, steel, chrome, mercury, aluminum
- *               gems    (4)  ruby, emerald, sapphire, amethyst
- *               dielectrics  plastic, glass, ceramic
- *               emissive     neon
- *   p / SPC   pause / resume rotation
- *   r         reset rotation angles to zero
- *   + / =     zoom in
- *   -         zoom out
- *   q / ESC   quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raytracing/cube_raytrace.c \
- *       -o cube_rt -lncurses -lm
- */
-
-/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL (in this order, as prose).
- *   2. §1 config — the constants you can twiddle.
- *   3. §5 cube (the core math) — read AFTER tutorials T2-T5.
- *   4. §8 render — see how the math is fed by per-pixel rays.
- *   5. Other sections only if curious.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   Long descriptive names everywhere — `t_enter` not `tn`,
- *   `axis_at_enter` not `near_axis`. Every line becomes a
- *   self-explanatory sentence.
- *
- *   Suffixes name COORDINATE SPACE explicitly:
- *     `_world`  scene-fixed coordinates (camera & lights live here)
- *     `_obj`    cube-local coordinates (axis-aligned at the origin)
- *
- *   When a single name lacks a space suffix it's space-independent
- *   (e.g. `half_extent`, `t_hit`).
- *
- * Background you need
- * ───────────────────
- *   - 1-D number-line intuition (interval [a,b], when do two intervals
- *     overlap?).
- *   - Linear interpolation along a parametric ray P(t) = O + t·D.
- *   - That a 3×3 rotation matrix has inverse = transpose.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Any prior raymarching/raytracing knowledge — the file teaches it.
- *   - Quadratic formulas — the slab method has none.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ───────────────────────────────────────────────────────── *
- *
- * Algorithm      : Analytic ray-vs-axis-aligned-box (AABB) by the
- *                  SLAB METHOD. An AABB is the INTERSECTION of three
- *                  pairs of parallel planes — three "slabs", one per
- *                  axis. Per-axis the ray spends t ∈ [t_enter_i,
- *                  t_exit_i] inside the slab. The ray is inside the
- *                  BOX only when all three intervals overlap, i.e.
- *                    t_enter = max(t_enter_x, t_enter_y, t_enter_z)
- *                    t_exit  = min(t_exit_x,  t_exit_y,  t_exit_z)
- *                  Hit iff t_enter ≤ t_exit AND t_exit > 0. The face
- *                  the ray entered through is exactly the slab whose
- *                  t_enter became the global maximum — and its
- *                  outward normal is one of ±X, ±Y, ±Z determined by
- *                  the sign of the ray direction along that axis.
- *
- * Data-structure : AABB ≡ (V3 min, V3 max). Stored implicitly as a
- *                  single half-extent CUBE_S because the box is
- *                  axis-aligned and centred at the origin in OBJECT
- *                  space; world-space rotation is applied to the RAY
- *                  (inverse-rotation trick), not to the box geometry.
- *
- * Rendering      : One ray per terminal cell. Phong with three
- *                  coloured world-space lights. Normals mode encodes N
- *                  as RGB (excellent diagnostic — each face is a single
- *                  flat colour). Wireframe mode draws only cells within
- *                  WIRE_THRESH of the nearest face edge. Depth mode
- *                  encodes hit distance as a brightness gradient.
- *
- * Performance    : O(3) per pixel — three single-slab solves, three
- *                  max/min tightenings. No square roots, no trig, no
- *                  iterations. The cube is the CHEAPEST primitive in
- *                  the raytracing folder.
- *
- * References     : Andrew Woo, "Fast Ray-Box Intersection",
- *                    in Andrew S. Glassner (ed.) "Graphics Gems" (1990).
- *                  Inigo Quílez, "Box — intersection",
- *                    https://iquilezles.org/articles/intersectors/
- *                  Kay & Kajiya, "Ray Tracing Complex Scenes",
- *                    SIGGRAPH '86 (original slab method paper).
- *                  Real-Time Rendering 4e §22.7 (ray-box variants).
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ───────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * To check if a ray hits a 3D box, ask THREE 1D questions:
- *   "When does the ray cross the X faces?"
- *   "When does it cross the Y faces?"
- *   "When does it cross the Z faces?"
- * Each answer is a time interval [t_enter, t_exit]. The ray is inside
- * the box iff all THREE intervals share a common moment. Three
- * intervals share a moment iff the LATEST entry is still earlier than
- * the EARLIEST exit. The slab method reduces "is the ray inside this
- * box?" to "do three 1D intervals overlap?" — and interval overlap is
- * two arithmetic comparisons.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a cube as a sandwich of three pairs of parallel walls:
- *
- *           ┌─────────────────────┐
- *          ╱                     ╱│
- *         ╱       Y-slab        ╱ │
- *        ┌─────────────────────┐  │ ← X-slab (left/right walls)
- *        │                     │  │
- *        │    box interior     │  │
- *        │  =  X ∩ Y ∩ Z slabs │ ╱
- *        │                     │╱  ← Z-slab (front/back walls)
- *        └─────────────────────┘
- *
- * As a ray flies through space, it spends a time interval inside each
- * slab:
- *
- *   t →  ───[==== X-slab ====]──────────────────
- *   t →  ─────────[========= Y-slab ===========]
- *   t →  ───[============ Z-slab ===]──────────
- *               ↑                ↑
- *               t_enter        t_exit  ← ray IS inside the box
- *                                         in this overlap region
- *
- * The ray is inside the box ONLY in the overlap of all three intervals.
- * `t_enter` is the most-restrictive lower bound (the LATEST start);
- * `t_exit` is the most-restrictive upper bound (the EARLIEST end). If
- * the upper bound has not run out yet by the time the latest slab
- * starts, the ray made it inside.
- *
- * The face that produced `t_enter` is the face the ray entered
- * through, because that's the slab that was the "last" to start
- * admitting the ray.
- *
- * Coordinate-system pipeline (T8 unpacks each step):
- *
- *      SCREEN ─FOV─→ CAMERA ─cam basis─→ WORLD ─Mᵀ─→ OBJECT
- *                                                       ↓
- *                                                  intersection
- *                                                       ↓
- *      OBJECT ────M────→ WORLD ──────→ shading ──→ pixel
- *
- * Everything left of "intersection" is per-frame ceremony; the
- * intersection happens in OBJECT space where the cube is axis-aligned.
- *
- * ALGORITHM IN STEPS  (per pixel)
- * ───────────────────────────────
- *  1. Build a primary ray (origin + direction) in WORLD space from the
- *     screen coordinates and the camera's basis.
- *  2. Apply Mᵀ to the ray to put it in OBJECT space (the cube stays
- *     axis-aligned there).
- *  3. For each axis i ∈ {0,1,2}:
- *        if ray_dir_i ≈ 0:
- *           if ray_origin_i is outside [-s, s]:  ray runs forever
- *               outside this slab → MISS.
- *           else:                              this slab imposes no
- *               t-bound (ray sits inside it permanently).
- *        else:
- *           t0 = (-s - ray_origin_i) / ray_dir_i
- *           t1 = (+s - ray_origin_i) / ray_dir_i
- *           t_enter_slab = min(t0, t1)
- *           t_exit_slab  = max(t0, t1)
- *           if t_enter_slab > t_enter:
- *              t_enter       = t_enter_slab
- *              axis_at_enter = i
- *              enter_sign    = -sign(ray_dir_i)
- *           if t_exit_slab  < t_exit:  t_exit = t_exit_slab
- *           if t_enter > t_exit:  early exit → MISS
- *  4. After three axes:
- *        if t_exit < ε:                    MISS (interval all behind us)
- *        if t_enter < ε:  t_hit = t_exit   ray ORIGIN is inside box;
- *                                          use the EXIT face instead
- *        else:            t_hit = t_enter  ordinary entry hit
- *        N_obj = ±axis_i for axis_at_enter, sign = enter_sign.
- *  5. Transform N_obj back to world (M·N_obj) and shade.
- *
- * KEY FORMULAS
- * ────────────
- *   For axis i, plane at position p, with ray_dir_i ≠ 0:
- *     t = (p − ray_origin_i) / ray_dir_i      [P(t) = O + t·D]
- *
- *   Per-slab interval for box [-s, s] on axis i:
- *     t0 = (−s − ray_origin_i) / ray_dir_i
- *     t1 = (+s − ray_origin_i) / ray_dir_i
- *     t_enter_slab = min(t0, t1)            [enter time]
- *     t_exit_slab  = max(t0, t1)            [exit  time]
- *
- *   Combine across three axes:
- *     t_enter = max(t_enter_x, t_enter_y, t_enter_z)
- *     t_exit  = min(t_exit_x,  t_exit_y,  t_exit_z)
- *
- *   Hit test:
- *     hit ⇔ t_enter ≤ t_exit AND t_exit > 0
- *
- *   Outward normal at entry:
- *     N_obj = e_i · (−sign(ray_dir_i))
- *     where i is the axis that set t_enter.
- *     (At t = t_enter the ray is just stepping ONTO that face, so the
- *      outward normal points OPPOSITE to the ray direction component
- *      on that axis.)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • ray_dir_i ≈ 0 (ray parallel to slab): use a 1e-9 tolerance. If
- *    ray_origin_i ∈ [-s, s] the slab imposes no bound; otherwise the
- *    ray never enters that slab → return MISS immediately.
- *  • Inside the box (t_enter < 0 < t_exit): the "entry" is in the
- *    past; we return t_exit and the EXIT face's normal. This is
- *    correct for self-intersecting hits — a ray starting inside a box
- *    leaves through one face.
- *  • Corner / edge hits: two slabs may produce numerically equal
- *    t_enter values — the dispatcher picks one (whichever was checked
- *    first whose tn was strictly greater). On a terminal grid this
- *    discontinuity is invisible because the pixel at the geometric
- *    corner is already a single cell.
- *  • t < T_EPS reject prevents self-intersection at t ≈ 0 when the
- *    camera grazes a face.
- *  • The inverse-rotation trick: rotating a cube means rotating 8
- *    vertices and 6 face equations. Keeping the cube fixed at the
- *    origin and rotating the RAY by Mᵀ is equivalent and costs ONE
- *    matrix×ray multiply per pixel — and lets us keep the box AABB,
- *    so the slab method's per-axis test stays a scalar division (a
- *    rotated box would need general-plane equations: 3 dot products
- *    per slab instead of 1 division).
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Static cube (press `r` to reset, then SPC to pause), viewed
- *    head-on: silhouette is a SQUARE of solid colour (one visible
- *    face). MODE_NORMAL paints it a single flat colour — the (0,0,−1)
- *    face is RGB(0.5, 0.5, 0).
- *  • Cube viewed from a corner (let it rotate ~45°/45°): silhouette
- *    is a HEXAGON, and you see THREE faces meeting at the central
- *    vertex forming a tri-radial "Y". MODE_NORMAL paints each face a
- *    different flat colour.
- *  • `d` → AXIS overlay: the three visible faces of the corner-on
- *    view should each show a different flat colour (red = X-axis face,
- *    green = Y-axis face, blue = Z-axis face).
- *  • `d` → INTERVAL overlay: bright at the centre of the cube
- *    silhouette (the ray plunges deepest there), dimmest at the
- *    silhouette edges (grazing rays).
- *  • `d` → FACE-UV overlay: each visible face shows a 2D gradient
- *    (red ↔ green) revealing its local UV parameterisation.
- *  • Worked-example check: head-on ray to a 1.6-cube at distance 3.2
- *    should hit at t = 2.4. (Cube spans [-0.8, +0.8]; closest face is
- *    z = -0.8, ray starts at z = -3.2, so t = (-0.8 - (-3.2)) / 1 = 2.4.)
- *  • Doubling CUBE_S doubles the silhouette in every dimension and
- *    halves the apparent distance — bringing the cube closer.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
- *
- * Ten short tutorials that build the algorithm from first principles.
- * Read in order; each builds on the previous.
- *
- *   T1  What problem are we solving?
- *   T2  The simplest case: ray vs 1D INTERVAL
- *   T3  Two axes: ray vs 2D RECTANGLE
- *   T4  Three axes: ray vs 3D BOX
- *   T5  Recovering the entry FACE (not just the time)
- *   T6  Edge cases — parallel rays + camera-inside-box
- *   T7  The inverse-rotation trick (rotate the RAY)
- *   T8  Coordinate systems at a glance
- *   T9  Four shading modes — same geometry, four pictures
- *   T10 White light is the lab; the material is the specimen
- *   T11 Metals vs dielectrics — F0, Fresnel, and the spec-tint trick
- *   T12 Three debug overlays — making the slab method visible
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  WHAT PROBLEM ARE WE SOLVING?
- * ────────────────────────────────
- * Given:
- *   • a ray  (origin O, unit direction D)
- *   • an axis-aligned box  [-s, +s]^3  (centred at origin, half-side s)
- * Find:
- *   • the smallest t > 0 such that O + t·D lies on the box's surface,
- *   • the outward unit normal at that point — one of the six axis
- *     basis vectors ±X, ±Y, ±Z, since every face of an axis-aligned
- *     box has a normal perpendicular to one of the coordinate axes.
- *
- * Why a box and not a more general shape? Because boxes are the
- * cheapest primitives in graphics — bounding-volume hierarchies use
- * them by the millions. AND every face has a constant normal, which
- * makes shading trivially flat (no smooth shading wanted on a cube).
- *
- * The trick we'll exploit: the box is the INTERSECTION of three
- * 1D slabs. Each slab is "the region between two parallel walls."
- * Intersection of slabs ↔ intersection of time intervals, which is
- * just max-of-mins / min-of-maxes.
- *
- * T2  THE SIMPLEST CASE: RAY VS 1D INTERVAL
- * ──────────────────────────────────────────
- * Strip the world down to one dimension. The "box" is the interval
- * [-s, +s] on the number line. The ray is a 1D parametric line
- *   P(t) = ray_origin + t · ray_dir.
- *
- * When does the ray sit inside the interval? When P(t) is between
- * -s and +s:
- *
- *     -s ≤ ray_origin + t · ray_dir ≤ +s
- *
- * Solve each side for t:
- *
- *     t0 = (-s - ray_origin) / ray_dir         when ray_dir ≠ 0
- *     t1 = (+s - ray_origin) / ray_dir
- *
- *     t_enter = min(t0, t1)        (whichever wall we cross first)
- *     t_exit  = max(t0, t1)        (whichever wall we cross last)
- *
- * The ray is inside the interval for t ∈ [t_enter, t_exit]. Done —
- * one division per wall, two comparisons, no quadratics.
- *
- * Why might (t0, t1) need a swap? Because if ray_dir < 0 (ray going
- * leftward), dividing by a negative flips the inequality, so what
- * "should" be t_enter ends up larger than t_exit. The min/max
- * swap fixes that without a separate sign branch.
- *
- * T3  TWO AXES: RAY VS 2D RECTANGLE
- * ──────────────────────────────────
- * Now do T2 on each axis independently. The ray spends time
- * [t_enter_x, t_exit_x] inside the X-strip (region between the left
- * and right walls), and time [t_enter_y, t_exit_y] inside the Y-strip
- * (region between the bottom and top walls).
- *
- *      t_enter_x          t_exit_x
- *           │                │
- *      ────[==================]────────────────────  X-strip interval
- *
- *               t_enter_y                     t_exit_y
- *                    │                            │
- *      ──────────────[============================]  Y-strip interval
- *
- * The ray is inside the rectangle iff it's inside BOTH strips at the
- * same moment — the OVERLAP of the two intervals:
- *
- *     t_enter = max(t_enter_x, t_enter_y)
- *     t_exit  = min(t_exit_x,  t_exit_y)
- *
- * Hit iff t_enter ≤ t_exit. The picture above gives a hit; if the
- * X-strip ended before the Y-strip began we'd see no overlap and the
- * ray would miss.
- *
- * T4  THREE AXES: RAY VS 3D BOX
- * ──────────────────────────────
- * Same trick, third axis. Now we have THREE slab intervals:
- *
- *     X-slab: [t_enter_x, t_exit_x]
- *     Y-slab: [t_enter_y, t_exit_y]
- *     Z-slab: [t_enter_z, t_exit_z]
- *
- * The ray is inside the box iff all three intervals overlap. Three
- * intervals overlap iff the LATEST start is ≤ the EARLIEST end:
- *
- *     t_enter = max(t_enter_x, t_enter_y, t_enter_z)
- *     t_exit  = min(t_exit_x,  t_exit_y,  t_exit_z)
- *
- *     hit ⇔ t_enter ≤ t_exit  AND  t_exit > 0
- *
- * That's the slab method in one line. The implementation in §5.2
- * walks the three axes once, tightens t_enter and t_exit on each
- * iteration, and bails the moment they cross.
- *
- * T5  RECOVERING THE ENTRY FACE (NOT JUST THE TIME)
- * ──────────────────────────────────────────────────
- * Knowing t_enter is enough to compute the hit POINT (it's just
- * O + t·D). But for shading we also need the surface NORMAL — and
- * the slab method gives us that too, almost for free.
- *
- * Insight: the axis whose t_enter became the GLOBAL maximum is the
- * "last" wall the ray crossed before getting inside. That axis's
- * face IS the entry face.
- *
- *   axis_at_enter = arg max over i of t_enter_i
- *
- * The entry face is on the +axis side or the -axis side depending on
- * which way the ray is going:
- *
- *   ray moving in +X direction → entered through the −X face
- *   ray moving in −X direction → entered through the +X face
- *
- * Hence enter_sign = -sign(ray_dir_i) for the chosen axis i. The
- * outward normal is just enter_sign × the axis basis vector:
- *
- *   axis_at_enter = 0 → N = (enter_sign, 0, 0)
- *   axis_at_enter = 1 → N = (0, enter_sign, 0)
- *   axis_at_enter = 2 → N = (0, 0, enter_sign)
- *
- * The code in §5.1 records enter_sign inside slab_test; §5.2's loop
- * remembers axis_at_enter as it tightens t_enter. By the time the
- * loop ends, normal computation is one assignment.
- *
- * T6  EDGE CASES — PARALLEL RAYS + CAMERA-INSIDE-BOX
- * ────────────────────────────────────────────────────
- * Two cases the naïve formula stumbles on:
- *
- * (a) Ray parallel to a slab (ray_dir_i ≈ 0).
- *     Dividing by ray_dir_i would be a division by zero. Fortunately
- *     the geometry tells us the answer:
- *       - If ray_origin_i ∈ [-s, +s] the ray sits inside this slab
- *         FOREVER. We treat the slab as imposing no t-bound (write
- *         t_enter = -∞, t_exit = +∞ for this axis).
- *       - If ray_origin_i ∉ [-s, +s] the ray is OUTSIDE this slab
- *         forever — no t can ever satisfy all three slabs. Return
- *         MISS immediately, no need to test the others.
- *
- * (b) Ray origin inside the box (t_enter < 0 < t_exit).
- *     The "entry" already happened in the past; we want the EXIT
- *     point instead. The slab method handles this with one branch:
- *       t_hit = (t_enter > 0) ? t_enter : t_exit
- *     The exit-face normal is found the same way as the entry
- *     normal but on the axis that owns t_exit, with the sign FLIPPED
- *     (the ray is leaving, so the normal points the same direction
- *     as ray_dir_i, not opposite).
- *
- * The implementation in §5.2 handles both cases.
- *
- * T7  THE INVERSE-ROTATION TRICK (ROTATE THE RAY)
- * ────────────────────────────────────────────────
- * Naive way: every frame, rotate the cube's 8 vertices and 6 face
- * equations by the current orientation matrix M. Cost grows with
- * scene size.
- *
- * Smarter way: keep the box AXIS-ALIGNED at the origin, and rotate
- * the RAY into the cube's local space:
- *
- *     ray_obj.origin    = Mᵀ · ray_world.origin
- *     ray_obj.direction = Mᵀ · ray_world.direction
- *
- * Why Mᵀ? Because rotation matrices are ORTHOGONAL — their inverse
- * equals their transpose. Computing Mᵀ is free (just access pattern);
- * computing M⁻¹ generally requires a determinant and division.
- *
- * After intersecting in OBJECT space we get a normal N_obj. Bring it
- * back to world space:
- *
- *     N_world = M · N_obj
- *
- * Cost: ONE matrix-vector multiply per ray. As a bonus, keeping the
- * box AABB in object space is what lets the slab method use scalar
- * division per axis instead of full plane equations — a rotated box
- * would force 3 dot products per slab.
- *
- * T8  COORDINATE SYSTEMS AT A GLANCE
- * ───────────────────────────────────
- * Four spaces appear in this file:
- *
- *      SCREEN          (col, row)         pixel grid, integer
- *        │
- *        │  pu = (col − cx)/cx · tan(FOV/2)
- *        │  pv = −(row − cy)/cx · tan(FOV/2) / ASPECT
- *        ▼
- *      CAMERA          (pu, pv)           normalised, axis-aligned
- *        │
- *        │  ray_world = camera_origin
- *        │  view_dir  = normalize(forward + pu·right + pv·up)
- *        ▼
- *      WORLD           (x, y, z)          scene-fixed coords; lights here
- *        │
- *        │  ray_obj.origin = Mᵀ · ray_world.origin
- *        │  ray_obj.dir    = Mᵀ · ray_world.dir
- *        ▼
- *      OBJECT          (x, y, z)          cube axis-aligned at origin
- *        │
- *        │  intersection (§5)
- *        ▼
- *      hit_point_obj, normal_obj
- *        │
- *        │  hit_point_world = camera_origin + t · view_dir   (in world!)
- *        │  normal_world    = M · normal_obj
- *        ▼
- *      WORLD shading (§6) → pixel colour → SCREEN.
- *
- * The hit point is computed in world space directly from the world
- * ray + the t we obtained — t is the same in both spaces (rotation
- * preserves distances). World-space hit points let shading use
- * world-space lights with no extra transforms.
- *
- * For wireframe mode we also need the hit point in OBJECT space to
- * measure distance-to-edge in face-local coordinates (§5.3).
- *
- * T9  FOUR SHADING MODES — SAME GEOMETRY, FOUR PICTURES
- * ──────────────────────────────────────────────────────
- * After we know the hit point and its normal we still have to turn
- * those into a colour. Four orthogonal modes (cycle with `s`):
- *
- *   PHONG       Three pure-WHITE lights (key + fill + rim). Diffuse =
- *               max(N·L, 0); specular = (R·V)^shininess. The material's
- *               distinctive colour comes from its OWN albedo and spec
- *               tint — the lights are white so each material reads as
- *               itself, not as a coloured filter. Diffuse weight per
- *               material: metals ≈ 0.15 (spec-dominated), gems ≈ 0.70,
- *               dielectrics ≈ 0.85, glass ≈ 0.10. Emissive (added after
- *               lighting, before clamp) lets neon glow in shadow.
- *   NORMALS     N → (N+1)/2, channel-by-channel. Each face becomes
- *               a SINGLE flat colour because every cube face has a
- *               constant normal. The six possible colours:
- *                 +X (1.0, 0.5, 0.5)   −X (0.0, 0.5, 0.5)
- *                 +Y (0.5, 1.0, 0.5)   −Y (0.5, 0.0, 0.5)
- *                 +Z (0.5, 0.5, 1.0)   −Z (0.5, 0.5, 0.0)
- *               The cleanest possible diagnostic for normal correctness.
- *   WIREFRAME   Draw only cells within WIRE_THRESH of a face edge in
- *               OBJECT-space face-UV coordinates (§5.3 face_edge_dist).
- *               Body interior is black; you see exactly the edges of
- *               the front-facing parts of the cube. From a corner-on
- *               view: 9 edges visible (the 6-edge silhouette plus the
- *               3 internal edges meeting at the central vertex).
- *   DEPTH       Brightness from t: closer = brighter. Useful as a
- *               sanity check (the centre of the visible silhouette
- *               should be the brightest spot).
- *
- * T10 WHITE LIGHT IS THE LAB; THE MATERIAL IS THE SPECIMEN
- * ─────────────────────────────────────────────────────────
- * A common amateur-lighting trick is to TINT the lights to flatter
- * each material — warm key for gold, cool key for silver, blue rim
- * for plastic. It looks slick at first glance but it CONFLATES two
- * orthogonal things: "what the LIGHT is doing" and "what the
- * MATERIAL is".
- *
- * The first-principles fix: keep all lights pure WHITE. Then any
- * colour the eye sees comes from the MATERIAL itself. This is how
- * PBR (physically-based rendering) sees the world, and the same
- * logic an art gallery uses — neutral white-balanced spotlights so
- * each painting shows its TRUE colours. A warm gallery light would
- * make every Mondrian lean orange.
- *
- * In this file, every per-light colour is unit white:
- *
- *     LIGHT_KEY  = (1, 1, 1)         pure white sun
- *     LIGHT_FILL = (1, 1, 1)         pure white fill
- *     LIGHT_RIM  = (1, 1, 1)         pure white rim
- *
- * The KEY/FILL/RIM weights still differ in INTENSITY (KEY brightest,
- * RIM dimmest, geometric falloff per light position) but they're all
- * achromatic. So:
- *
- *     gold  albedo + gold  spec   →  looks like real gold
- *     blue  albedo + WHITE spec   →  looks like real blue plastic
- *     dark  albedo + WHITE spec   →  looks like real glass
- *     dim   albedo + EMISSIVE     →  looks like real neon
- *
- * Material-as-material, not material-tinted-by-light.
- *
- * Try it:
- *  - Pause (`p`), cycle `t` through all 20 materials. Each material
- *    should be recognisable as ITSELF — gold reads gold, plastic
- *    reads plastic, glass reads glass, neon glows pink.
- *  - If the lights were tinted, every material would lean toward
- *    the dominant light's hue and the recognition would break.
- *
- * T11 METALS VS DIELECTRICS — F0, FRESNEL, AND THE SPEC-TINT TRICK
- * ─────────────────────────────────────────────────────────────────
- * Three numbers describe how light interacts with a surface:
- *
- *   ALBEDO   the body colour from sub-surface absorption — what you
- *            see when the surface is EVENLY illuminated and viewed
- *            head-on (no highlight).
- *   F0       the fraction of light reflected at NORMAL INCIDENCE
- *            (cell facing camera, 0° angle to view).
- *   FRESNEL  the curve raising reflectance to ≈ 1 at GRAZING angles
- *            (cell at 90° to view, like the rim of the silhouette).
- *
- * Real materials split into two regimes along the F0 axis:
- *
- *   METALS       F0 has the SAME TINT as the visible body colour.
- *                  gold's   measured F0 = (1.000, 0.766, 0.336)  ← yellow!
- *                  silver's measured F0 = (0.972, 0.960, 0.915)  ← white-ish
- *                  copper's measured F0 = (0.955, 0.638, 0.538)  ← pink-orange
- *                That tinted F0 is what makes a metal look "metallic"
- *                — its highlights reflect the metal's own colour
- *                because metals are conductors and light can't enter
- *                the bulk to be re-coloured by absorption. Whatever
- *                gets reflected gets reflected AT THE METAL'S TINT.
- *
- *   DIELECTRICS  F0 is achromatic: ~0.04 (4%) across the spectrum.
- *                Plastic, glass, gem, ceramic, wood, water — all of
- *                them. The body colour comes ENTIRELY from absorption
- *                inside the material; the highlight is a small WHITE
- *                fraction reflected off the surface.
- *
- * Why it matters: the DIFFERENCE between a gold cube and a yellow
- * plastic cube is not the body colour (both yellow) but the
- * highlight — gold's highlight is YELLOW, plastic's is WHITE. That
- * single tint difference is what makes "metal" look like metal and
- * "plastic" look like plastic.
- *
- * Our Theme struct encodes this directly:
- *
- *   typedef struct {
- *       V3 albedo;          body colour
- *       V3 specular;        F0:  metal → albedo;  dielectric → white
- *       V3 emissive;        self-glow (mostly 0; neon glows hot pink)
- *       float diffuse_weight;
- *       const char *name;
- *   } Theme;
- *
- * The `diffuse_weight` field captures the OTHER physical truth:
- * metals reflect almost everything specularly, with very little
- * diffuse contribution. So:
- *
- *   metal:        diffuse_weight = 0.15  (low; mostly specular reflects)
- *   gem:          diffuse_weight = 0.70  (saturated body + bright spec)
- *   plastic:      diffuse_weight = 0.85  (full body colour)
- *   glass:        diffuse_weight = 0.10  (dark body, bright white spec)
- *   neon:         diffuse_weight = 0.20  (low diffuse + huge emissive)
- *
- * `add_phong_light` makes this concrete (the KEY light, gains
- * KEY_DIFFUSE / KEY_SPECULAR):
- *
- *     // Diffuse contribution: WHITE light × albedo × diffuse_weight
- *     colour += diffuse · diffuse_weight · KEY_DIFFUSE · albedo
- *
- *     // Specular contribution: WHITE light × F0
- *     //   metal       F0 = tinted albedo  → tinted highlight
- *     //   dielectric  F0 = (1, 1, 1)      → white highlight
- *     colour += specular · KEY_SPECULAR · spec_F0
- *
- * On a CUBE this contrast is especially dramatic because each face
- * has a CONSTANT normal, so a single face shows the metal's
- * highlight as a uniform tinted glow. A flat-shaded gold face looks
- * like burnished gold; a flat-shaded plastic face looks like an
- * injection-moulded part with a single pure-white highlight bloom.
- *
- * Try it:
- *  - Cycle to gold (`t` until name says "gold") — watch the bright
- *    face. The whole face is WARM YELLOW.
- *  - Cycle to plastic — same geometry, same lighting; the bright
- *    face is BLUE in the body but the highlight band fades to
- *    WHITE. That's the dielectric signature.
- *  - Cycle to ruby (red gem dielectric) — body deep red, highlight
- *    near-white. Same dielectric signature.
- *  - Cycle to neon — even on the SHADOW faces, the surface still
- *    glows hot pink because the emissive value is added AFTER the
- *    lighting sum and BEFORE the clamp.
- *
- * T12 THREE DEBUG OVERLAYS — MAKING THE SLAB METHOD VISIBLE
- * ──────────────────────────────────────────────────────────
- * Cycling `d` switches the active overlay. Each REPLACES the shaded
- * colour with a visualisation of one piece of intermediate state from
- * §5, teaching one specific aspect of the slab method:
- *
- *   OFF        normal shade-mode output (T9).
- *   AXIS       colour the surface by `axis_at_enter`:
- *                red   = X-axis face won the t_enter race
- *                green = Y-axis face won
- *                blue  = Z-axis face won
- *              You SEE the dispatcher's decision boundary — at a
- *              corner-on view, three differently-coloured triangles
- *              meet at the central vertex.
- *   INTERVAL   brightness from (t_exit − t_enter) — "thickness of
- *              the overlap interval" = "how much of the ray sits
- *              inside the box". Bright at face centres (long dive
- *              through the box), dim at silhouette edges (grazing
- *              rays barely scratch the corners).
- *   FACE-UV    colour by the hit point's two in-face coordinates,
- *              normalised to [-1,+1] and remapped to RGB. Reveals
- *              the local 2D parameterisation each face has — the
- *              same parameterisation used by wireframe to detect
- *              edge-cells.
- *
- * Each overlay reads BoxHit fields populated by §5; toggling them
- * costs only a final tint.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/*
- * ════════════════════════════════════════════════════════════════════
- *  ARCHITECTURE — concern layers + state model (steps 4-5)
- * ════════════════════════════════════════════════════════════════════
- *
- *  Separated, labelled layers. Each function lives in exactly one layer.
- *  LOGIC is pure (no mutation, no I/O), so reordering or deleting
- *  RENDER/EFFECTS can never change a LOGIC result.
- *
- *  All runtime state lives on ONE aggregate, Scene (§9.5), so the app
- *  loop reads as a table of contents. Functions take the NARROWEST type
- *  they need — const Box* / const Theme* / scalars for reads — and ONLY
- *  the scene_init / scene_reset / scene_advance lifecycle takes Scene*,
- *  so "everything hangs off Scene" never re-couples the layers.
- *
- *  LAYER        SECTION(S)                 MUTATES
- *  ----------   ------------------------   ---------------------------------
- *  CONFIG       §1, §4                     nothing — constants, enums and
- *                                          material tables (compile-time data)
- *  PERFORMANCE  §2; §10.2/.6; scene_advance  OS sleep, dt cap + rolling fps;
- *                                          no scene-geometry state
- *  LOGIC        §3, §5, §6, §7             nothing — pure functions returning
- *                                          values / out-params (math, ray-AABB
- *                                          slab intersection, shading,
- *                                          debug-overlay decisions)
- *  RENDER       §7.5, §8, §9               the SCREEN (ncurses cells) + the
- *                                          g_have_256 capability flag; reads
- *                                          Scene, never writes it
- *  SIMULATION   scene_advance() (§9.5)     Scene.box.spin_x/_y — the rotation,
- *                                          the ONLY evolving scene state;
- *                                          also zeroed by scene_reset (the `r`
- *                                          key, a user event)
- *  DELAYS       Scene.paused gate (§9.5)   nothing — pause merely skips the
- *                                          SIMULATION step; no holds/timers
- *  EFFECTS      — none —                   no stored cosmetic state: wireframe
- *                                          edges, depth fade and debug tints
- * are all derived at render time from the per-pixel hit, never stored
- *
- *  DOMAIN TYPES (nouns a ray-tracing text names): Box (AABB half-extent +
- *  live spin, §5), Theme (PBR-style material, §4), the hit record BoxHit
- *  (§5), V3 / Mat3 (§3). Scene (§9.5) is the only aggregate; there is no
- *  role-named State / Config / Context struct.
- *
- *  Timestep note: PERFORMANCE uses a VARIABLE wall-clock dt with a spiral-
- *  of-death cap (§10.2) plus a frame cap (§10.6) — NOT a fixed-timestep
- *  accumulator, because the scene is a pure function of elapsed rotation
- *  and needs no sub-stepping.
- *
- *  PER-TICK COMBINE ORDER (main loop — the one place the layers meet):
- *    §10.1 resize   USER EVENT  apply pending SIGWINCH (control state)
- *    §10.2 dt       PERFORMANCE wall-clock dt, capped
- *    §10.3 advance  scene_advance(&scene, dt): SIMULATION spin (if !paused)
- *                                              + PERFORMANCE rolling fps
- *    §10.4 paint    RENDER      erase -> render -> hud_draw -> doupdate
- *    §10.5 input    USER EVENTS mutate Scene view/control knobs (NOT the tick)
- *    §10.6 sleep    PERFORMANCE frame cap
- *
- *  User events (§10.1 resize, §10.5 keys incl. the `r` reset via
- *  scene_reset, the signal handlers) mutate control/view state and
- *  g_run/g_resize. They are NOT the tick; the only simulation write they
- *  make is scene_reset.
- * ════════════════════════════════════════════════════════════════════
- */

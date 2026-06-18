@@ -1,5 +1,14 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 
+/* tunnel.c — a first-person flight down an endless textured pipe, in the
+ * terminal. For each character cell we shoot a ray and find where it hits the
+ * pipe wall; the camera actually stays put while the texture scrolls past, which
+ * the eye reads as flying forward. Patterns (n), colour themes (t), speed,
+ * sway and sim rate are all live keys, shown along the bottom while it runs.
+ * Sister files: sphere_raytrace.c / cube_raytrace.c / torus_raytrace.c (same
+ * one-ray-per-cell idea on solid shapes); raymarcher/raymarcher.c for the
+ * opposite approach when a shape has no neat hit formula. */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -16,75 +25,78 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── §1 [DATA] config ─────────────────────────────────────────────────────────
- */
+/* §1 — every tunable number in one place, so none of them show up as a
+ * mystery value down in the code. */
 
 enum {
+  /* How fast the simulation steps (the `[` / `]` keys), and the render cap. */
   SIM_FPS_MIN = 10,
   SIM_FPS_DEFAULT = 60,
   SIM_FPS_MAX = 120,
   SIM_FPS_STEP = 10,
+  RENDER_FPS_CAP = 60, /* drawing never runs faster than this; sim rate is separate */
+  FPS_UPDATE_MS = 500, /* how often the on-screen fps number refreshes */
 
-  FPS_UPDATE_MS = 500,
-
-  /* Color pair indices. */
-  PAIR_HUD = 1,        /* yellow + bold — top status row     */
-  PAIR_HINT = 2,       /* cyan   + bold — bottom hint row    */
-  PAIR_DEPTH_BASE = 3, /* +0..+7 — depth ramp (far → near)   */
-  PAIR_VANISH = 11,    /* vanishing-point crosshair          */
+  /* ncurses colour-slot numbers. The depth ramp uses 8 in a row from the base. */
+  PAIR_HUD = 1,        /* top status row (yellow) */
+  PAIR_HINT = 2,       /* bottom hint row (cyan) */
+  PAIR_DEPTH_BASE = 3, /* +0..+7: far/dim → near/bright */
+  PAIR_VANISH = 11,    /* the centre crosshair */
 };
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
+#define DT_CAP_NS (100 * NS_PER_MS) /* ignore frame stalls longer than 0.1s */
 
-#define CELL_ASPECT 2.0f /* terminal cell h / w                */
+/* Terminal cells are about twice as tall as wide; we squash by this so the
+ * round pipe looks round instead of stretched. */
+#define CELL_ASPECT 2.0f
 
-/* Tunnel geometry. */
-#define TUNNEL_RADIUS 2.0f
-#define FOV_DEG 70.0f
+/* The pipe and the lens. */
+#define TUNNEL_RADIUS 2.0f /* the camera flies inside a pipe of this radius */
+#define FOV_DEG 70.0f      /* how wide a view the lens takes in */
 
-/* Camera flow + sway. */
+/* Forward speed (texture scroll), set by + / -. */
 #define SPEED_DEFAULT 8.0f
 #define SPEED_MIN 0.5f
 #define SPEED_MAX 40.0f
-#define SPEED_STEP_FACTOR 1.30f
+#define SPEED_STEP_FACTOR 1.30f /* each press multiplies/divides by this */
 
-#define SWAY_AMP_DEFAULT 1.30f /* max horizontal offset (cells)      */
+/* Side-to-side wobble as you fly, set by s / S. */
+#define SWAY_AMP_DEFAULT 1.30f /* how far the camera drifts off-centre (cells) */
 #define SWAY_AMP_MIN 0.0f
-#define SWAY_AMP_MAX 1.65f /* < TUNNEL_RADIUS · 0.85             */
+#define SWAY_AMP_MAX 1.65f /* kept under the pipe radius so we never clip the wall */
 #define SWAY_AMP_STEP 0.10f
-#define SWAY_FREQ_X 0.55f /* rad / sec                          */
-#define SWAY_FREQ_Y 0.31f
-#define ROLL_RATE 0.18f /* rad / sec — texture spin           */
+#define SWAY_FREQ_X 0.55f      /* how quickly it drifts left/right (rad per sec) */
+#define SWAY_FREQ_Y 0.31f      /* and up/down */
+#define SWAY_AMP_Y_RATIO 0.55f /* vertical drift is this fraction of horizontal */
+#define ROLL_RATE 0.18f        /* how fast the view slowly spins (rad per sec) */
 
-/* Numerical tolerances. */
-#define EPS_PARALLEL 1.5e-3f /* ray-axis-parallel threshold        */
-#define T_MAX 80.0f          /* far clip — vanishing point         */
+#define EPS_PARALLEL 1.5e-3f /* a ray flatter than this counts as "straight down
+                                the pipe" — it never hits a wall */
+#define T_MAX 80.0f /* stop looking past here; treat it as the far vanishing point */
 
-/* Distance fog (T8). */
-#define FOG_DENSITY 0.030f /* exp(−t · FOG_DENSITY)              */
-#define FOG_FLOOR 0.18f    /* never fade below this — keep walls */
+/* Haze: walls fade with distance so the tube has depth. */
+#define FOG_DENSITY 0.030f /* bigger = fades out sooner */
+#define FOG_FLOOR 0.18f    /* but never all the way to black, so structure stays */
 
-/* Depth-tier quantisation (T10): intensity → one of 8 ramp tiers. */
-#define N_DEPTH_TIERS 8         /* depth ramp pairs PAIR_DEPTH_BASE+0..7      */
-#define DEPTH_TIER_SCALE 7.999f /* intensity∈[0,1] → tier 0..7 (= 8 − ε) */
-#define TIER_BOLD_MIN 6 /* tiers ≥ this render A_BOLD (nearest walls) */
-#define TIER_DIM_MAX 1  /* tiers ≤ this render A_DIM  (farthest)      */
+/* We bucket brightness into 8 levels — one colour + one character per level. */
+#define N_DEPTH_TIERS 8
+#define DEPTH_TIER_SCALE 7.999f /* 0..1 brightness → level 0..7 (just under 8) */
+#define TIER_BOLD_MIN 6         /* nearest levels drawn bold */
+#define TIER_DIM_MAX 1          /* farthest levels drawn dim */
 
-/*
- * Pattern — which procedural texture is painted on the cylinder wall. All four
- * are evaluated in cylindrical UV space (u = angle around the axis, v =
- * distance along it) by pattern_sample (§10): the geometry is identical, only
- * the texture function differs. Cycled live with n/N (wraps via % N_PATTERNS).
- * Ref: procedural texturing — Ebert et al., "Texturing & Modeling".
- */
+/* Which texture is painted on the pipe wall, cycled with n / N. Every pattern
+ * is just a function of two coordinates on the wall — the angle around the pipe
+ * and the distance along it (like longitude and how far down a tube). The shape
+ * of the pipe never changes; only this function does. */
 typedef enum {
-  PATTERN_RINGS = 0,   /* sinusoidal axial bands (rings down the tube)    */
-  PATTERN_CHECKER = 1, /* alternating squares (floor(u)·floor(v) parity)  */
-  PATTERN_SPOKES = 2,  /* radial stripes (parity of the angle only)       */
-  PATTERN_GRID = 3,    /* cross-hatch lines (thin-u + thin-v threshold)   */
-  N_PATTERNS = 4,      /* count — enables `% N_PATTERNS` cycling          */
+  PATTERN_RINGS = 0,   /* bands wrapped around the tube */
+  PATTERN_CHECKER = 1, /* a checkerboard */
+  PATTERN_SPOKES = 2,  /* stripes running down the length */
+  PATTERN_GRID = 3,    /* thin cross-hatch lines */
+  N_PATTERNS = 4,      /* how many there are, so n/N can wrap around */
 } Pattern;
 
 static const char *pattern_name(Pattern p) {
@@ -102,24 +114,19 @@ static const char *pattern_name(Pattern p) {
   }
 }
 
-/*
- * PatternParams — the per-pattern texture tunables: one row of the patterns[]
- * lookup table (§1), chosen by Scene.current_pattern and passed (const) to
- * every pattern_* function. All quantities live in UV space, so the same
- * numbers read identically at any tunnel depth. Ref: procedural texturing
- * (Ebert et al.).
- *
- *   stripes_around : how many bright/dark cells per full revolution around the
- *                    cylinder axis (must be EVEN so the seam at u = 0/1 lines
- * up) stripes_long   : cells per world-space unit along the axis ring_freq :
- * rad / unit for the sinusoidal RINGS pattern line_thick     : fraction of a
- * cell occupied by a GRID line
- */
+/* The dials for one pattern — one row of the table below, picked by the active
+ * pattern and handed to the pattern functions. They're all measured on the wall
+ * surface, so a pattern looks the same size whether it's near or far.
+ *   stripes_around : how many cells make one trip around the pipe (even, so the
+ *                    seam where the angle wraps lines up)
+ *   stripes_long   : how many cells per unit of distance down the pipe
+ *   ring_freq      : how tightly the RINGS bands are spaced
+ *   line_thick     : how wide a GRID line is, as a fraction of a cell */
 typedef struct {
-  int stripes_around; /* cells per revolution (EVEN) — seam alignment    */
-  float stripes_long; /* cells per axial world unit                      */
-  float ring_freq;    /* rad / unit — RINGS sinusoid frequency           */
-  float line_thick;   /* fraction of a cell that is a GRID line          */
+  int stripes_around;
+  float stripes_long;
+  float ring_freq;
+  float line_thick;
 } PatternParams;
 
 static const PatternParams patterns[N_PATTERNS] = {
@@ -130,14 +137,13 @@ static const PatternParams patterns[N_PATTERNS] = {
     /* GRID    */ {16, 0.55f, 0.0f, 0.20f},
 };
 
-/*
- * Themes — 8-tier depth ramp (far/dim → near/bright) + a vanishing-point
- * accent colour.  All entries sit in the bright half of
- * the 256-colour cube per the CLAUDE.md theme-brightness rule.
- */
+/* A colour scheme, cycled with t / T. `depth` is 8 colours from farthest (dim)
+ * to nearest (bright) — that gradient is what makes the tube feel deep. `vanish`
+ * tints the centre crosshair. All are kept in the bright half of the palette so
+ * even the dim end stays visible. */
 typedef struct {
   const char *name;
-  short depth[8];
+  short depth[8]; /* far → near */
   short vanish;
 } Theme;
 
@@ -163,19 +169,17 @@ static const Theme themes[N_THEMES] = {
     {"GOLD    ", {130, 137, 173, 179, 215, 222, 229, 230}, 231},
 };
 
-/* Glyph ramp (dim → bright). */
+/* The characters we draw with, faintest to densest, so a brighter cell picks a
+ * denser one. */
 static const char LUMA_GLYPHS[8] = {' ', '.', ',', ':', '+', '*', '#', '@'};
 
-/*
- * Vanishing-point cursor — a small 5-cell crosshair (`+` centre, `o`
- * at N/E/S/W) drawn LAST over the rendered tunnel.  Non-intrusive
- * marker that anchors the eye on the tunnel axis (T9).
- */
+/* A little 5-cell crosshair drawn at screen centre, where the pipe's far end
+ * always sits — a steady thing for the eye to hold onto. */
 #define VANISH_CENTER_GLYPH '+'
 #define VANISH_ARM_GLYPH 'o'
 
-/* ── §2 [PERF] clock — monotonic timer + sleep ────────────────────────────────
- */
+/* §2 — a steady clock (only ever counts forward) and a plain sleep, used to
+ * pace the loop. */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -193,14 +197,11 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ── §3 [RENDER+DATA] color — themes + 2-pair HUD spec
- * ─────────────────────────────── *
- *
- * 8 depth-ramp pairs (PAIR_DEPTH_BASE..+7) hold the active theme's
- * colours.  Two HUD pairs (PAIR_HUD yellow, PAIR_HINT cyan) are
- * theme-independent per the CLAUDE.md HUD spec.  One extra pair
- * (PAIR_VANISH) is a theme-specific colour used by the crosshair.
- */
+/* §3 — load colours into ncurses' slots. Loads the active theme's 8 depth
+ * colours + the crosshair tint; falls back to basic colours on a 16-colour
+ * terminal. The two HUD colours stay fixed regardless of theme. */
+
+/* program the 8 depth colours + crosshair tint for one theme (on a 't' press) */
 static void theme_apply(int idx) {
   if (idx < 0 || idx >= N_THEMES)
     idx = 0;
@@ -233,18 +234,13 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ── §4 [LOGIC] vec3 — value-type 3-D math
- * ───────────────────────────────────── */
+/* §4 — bare-bones 3-D vector maths. */
 
-/*
- * V3 — a 3-component single-precision vector, the one math type the renderer is
- * built on. Here it is a POSITION (camera origin O, hit point) or a DIRECTION
- * (ray D, the camera basis fwd/right/up, surface normal) in world space;
- * directions are kept unit length by v3norm where the math assumes |v| = 1.
- * Ref: Shirley, "Ray Tracing in One Weekend" (vec3); Foley & van Dam (vectors).
- */
+/* Three floats used as either a point in space (the camera, a hit point) or a
+ * direction (a ray, an axis). Directions are kept length-1 by v3norm where the
+ * maths needs it. */
 typedef struct {
-  float x, y, z; /* position or direction in world space */
+  float x, y, z;
 } V3;
 
 static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
@@ -262,25 +258,14 @@ static inline V3 v3norm(V3 a) {
   return L > 1e-12f ? v3scale(1.0f / L, a) : v3(0, 0, 1);
 }
 
-/* ── §5 [LOGIC] ray-cylinder intersection — closed-form (T1, T2)
- * ─────────────── *
- *
- * Cylinder along z-axis, radius R, infinite extent.  Substitute
- * r(t) = O + t·D into x² + y² = R²:
- *
- *      (O.x + t·D.x)² + (O.y + t·D.y)² = R²
- *      a·t² + 2b·t + c = 0
- *      a = D.x² + D.y²        (radial direction speed²)
- *      b = O.x·D.x + O.y·D.y  (radial inner-product)
- *      c = O.x² + O.y² − R²   (radial offset² − R² — negative inside)
- *
- *      t = (−b + sqrt(b² − a·c)) / a    (camera inside → +sqrt root)
- *
- * Returns t (positive forward distance) or -1 if the ray is too
- * close to the cylinder axis (D.x² + D.y² < EPS_PARALLEL).  The
- * parallel flag tells the caller to render that pixel as the
- * vanishing-point fog tier.
- */
+/* §5 — how far along a ray it hits the pipe wall. The pipe is the set of points
+ * a fixed distance from the central axis, which boils the question down to a
+ * little quadratic equation in the distance t — so one square root gives the
+ * exact answer, no marching along the ray. Since the camera is inside the pipe,
+ * there's always a hit ahead; we take it. A ray pointing almost straight down
+ * the pipe never meets the wall — we flag it (`parallel`) and the caller paints
+ * it as the dark far end. Only the x/y part matters because the pipe runs along
+ * z. */
 static inline float cylinder_hit(V3 O, V3 D, float R, bool *parallel) {
   float a = D.x * D.x + D.y * D.y;
   if (a < EPS_PARALLEL) {
@@ -292,33 +277,21 @@ static inline float cylinder_hit(V3 O, V3 D, float R, bool *parallel) {
   float c = O.x * O.x + O.y * O.y - R * R;
   float disc = b * b - a * c;
   if (disc < 0.0f)
-    return -1.0f; /* impossible inside, defensive */
+    return -1.0f; /* can't happen from inside; guard anyway */
   float t = (-b + sqrtf(disc)) / a;
   return t;
 }
 
-/* ── §6 [LOGIC] pattern: RINGS — sinusoidal axial bands (T7)
- * ─────────────────── *
- *
- *      brightness = sin(v_tex · ring_freq) · 0.5 + 0.5
- *
- * No u dependence at all — camera roll is INVISIBLE against this
- * pattern, since rolling rotates u_tex but RINGS ignores u.
- * Visible motion = axial flow + sway.
- */
+/* §6 — RINGS: bright/dark bands wrapped around the tube, as a smooth wave along
+ * its length. It ignores the angle, so spinning the view doesn't change it — you
+ * only see the forward flow. Returns 0..1. */
 static inline float pattern_rings(float v_tex, const PatternParams *pp) {
   return sinf(v_tex * pp->ring_freq) * 0.5f + 0.5f;
 }
 
-/* ── §7 [LOGIC] pattern: CHECKER — alternating squares (T7)
- * ──────────────────── *
- *
- *      brightness = (floor(u·N) + floor(v·M)) & 1
- *
- * The XOR of two integer-floor parities produces alternating
- * bright/dark squares.  Both u and v matter, so roll, flow, and
- * sway are all visible.
- */
+/* §7 — CHECKER: a checkerboard. Chop the angle and the length into whole cells;
+ * a cell is bright when the two cell-counts have opposite odd/even-ness. Both
+ * directions matter, so flow, sway and spin all show. Returns 0 or 1. */
 static inline float pattern_checker(float u_tex, float v_tex,
                                     const PatternParams *pp) {
   int gu = (int)floorf(u_tex * (float)pp->stripes_around);
@@ -326,29 +299,17 @@ static inline float pattern_checker(float u_tex, float v_tex,
   return ((gu + gv) & 1) ? 1.0f : 0.0f;
 }
 
-/* ── §8 [LOGIC] pattern: SPOKES — radial stripe parity (T7)
- * ──────────────────── *
- *
- *      brightness = floor(u·N) & 1
- *
- * Pure azimuthal stripes; no v dependence → axial flow and sway
- * are INVISIBLE against this pattern.  Roll, however, IS visible.
- */
+/* §8 — SPOKES: stripes running the length of the tube — bright on every other
+ * wedge of angle. No dependence on length, so the forward flow is invisible but
+ * the slow spin shows. Returns 0 or 1. */
 static inline float pattern_spokes(float u_tex, const PatternParams *pp) {
   int gu = (int)floorf(u_tex * (float)pp->stripes_around);
   return (gu & 1) ? 1.0f : 0.0f;
 }
 
-/* ── §9 [LOGIC] pattern: GRID — line-thickness threshold cross-hatch (T7)
- * ────── *
- *
- *      u_dist = min(frac(u·N), 1 − frac(u·N))           proximity to u line
- *      v_dist = min(frac(v·M), 1 − frac(v·M))           proximity to v line
- *      brightness = (u_dist < thick OR v_dist < thick) ? 1 : 0
- *
- * Bright cross-hatch lines on a dark base.  thick = 0.20 means each
- * line is 20% of one cell wide.  Both u and v matter.
- */
+/* §9 — GRID: thin cross-hatch lines on a dark wall. A cell is bright when it's
+ * close to a grid line in either direction — "close" meaning within line_thick
+ * of a cell boundary. Returns 0 or 1. */
 static inline float pattern_grid(float u_tex, float v_tex,
                                  const PatternParams *pp) {
   float u_pos = u_tex * (float)pp->stripes_around;
@@ -363,15 +324,8 @@ static inline float pattern_grid(float u_tex, float v_tex,
   return 0.0f;
 }
 
-/* ── §10 [LOGIC] pattern dispatch + cylindrical UV mapping (T3)
- * ──────────────── *
- *
- * pattern_sample dispatches by pattern_idx.  Returns brightness in
- * [0, 1] (not 0/1 binary): the lerp into FOG_FLOOR..1 at the call
- * site gives smooth depth shading.  RINGS returns a sinusoid for an
- * extra-smooth visual; the others return 0 or 1 plus the fog
- * smoothing.
- */
+/* §10 — pick the active pattern and ask it how bright this spot on the wall is
+ * (0..1). */
 static float pattern_sample(float u_tex, float v_tex, int pattern_idx) {
   const PatternParams *pp = &patterns[pattern_idx];
   switch (pattern_idx) {
@@ -387,49 +341,43 @@ static float pattern_sample(float u_tex, float v_tex, int pattern_idx) {
   }
 }
 
-/* ── §11 [LOGIC] distance fog — exp(−t · density) with floor (T8)
- * ────────────── *
+/* §11 — distance haze and bucketing.
  *
- *      fog       = exp(−t · FOG_DENSITY)
- *      intensity = fog · (FOG_FLOOR + brightness · (1 − FOG_FLOOR))
- *
- * fog → 0 at far distances; FOG_FLOOR keeps the result from going
- * fully black so we still see the tunnel structure at the
- * vanishing point.
- */
-static inline float fog_intensity(float t, float brightness) {
-  float fog = expf(-t * FOG_DENSITY);
-  return fog * (FOG_FLOOR + brightness * (1.0f - FOG_FLOOR));
+ * fog_of: how much a wall hit at distance t is dimmed by haze — 1 right in
+ * front of the camera, fading toward 0 far down the tube. It drives the COLOUR
+ * (so colour reads as distance), while the pattern folded in with the fog drives
+ * the GLYPH. FOG_FLOOR keeps even dark cells from going fully black, so the tube
+ * stays visible all the way to the far end. */
+static inline float fog_of(float t) { return expf(-t * FOG_DENSITY); }
+
+/* squash a 0..1 brightness onto one of the 8 ramp levels (0..7) */
+static inline int tier_of(float x) {
+  int s = (int)(x * DEPTH_TIER_SCALE);
+  if (s < 0)
+    s = 0;
+  if (s > N_DEPTH_TIERS - 1)
+    s = N_DEPTH_TIERS - 1;
+  return s;
 }
 
-/* ── §12 [SIM] scene state — struct + init + tick + reset ────────────────────
- */
-
-/*
- * Scene — the tunnel flight's persistent state, the table of contents the loop
- * in §17 drives. The flight has ONE evolving value (time); every motion the
- * viewer sees — sway, roll, texture flow — is derived from it at render time
- * (§13 build_camera, §14 scene_render), so nothing cosmetic is stored here.
- *   WHAT  : time                         — the simulation clock
- *   HOW   : speed / sway_amp / paused     — flight knobs (SIMULATION)
- *           current_pattern / current_theme — look knobs (RENDER)
- *   WHERE : cols, rows                    — the viewport this frame renders
- * into
- */
+/* §12 — the flight's state, all in one place. The trick: the only thing that
+ * actually changes over time is the clock; everything you see moving (the
+ * scroll, the wobble, the slow spin) is computed fresh each frame from that one
+ * number, so there's no animation state to keep in sync. The rest are knobs the
+ * keys turn. */
 typedef struct {
-  /* WHAT — the flight: one evolving value; sway/roll/flow derive from it. */
-  float time; /* accumulated seconds since reset            */
+  float time; /* seconds since the last reset — the one evolving value */
 
-  /* HOW — flight knobs (SIMULATION). */
-  float speed;    /* texture flow speed (units / sec)           */
-  float sway_amp; /* horizontal sway amplitude (cells)          */
-  bool paused;    /* freeze the time advance (the DELAYS gate)  */
+  /* flight knobs */
+  float speed;    /* how fast the texture scrolls (forward-motion feel) */
+  float sway_amp; /* how far the camera wobbles off-centre */
+  bool paused;    /* freeze the clock */
 
-  /* HOW — look knobs (RENDER). */
-  int current_pattern; /* active procedural pattern (a Pattern)      */
-  int current_theme;   /* active colour theme (index into themes)    */
+  /* look knobs */
+  int current_pattern; /* which wall texture (a Pattern) */
+  int current_theme;   /* which colour scheme (index into themes) */
 
-  /* WHERE — viewport, refreshed on resize. */
+  /* current window size, refreshed on resize */
   int cols, rows;
 } Scene;
 
@@ -452,43 +400,30 @@ static void scene_resize(Scene *s, int cols, int rows) {
 
 static void scene_reset(Scene *s) { s->time = 0.0f; }
 
+/* the only thing that advances each tick: move the clock forward (unless paused) */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
   s->time += dt;
 }
 
-/* ── §13 [LOGIC] camera basis — sway position + roll basis (T5, T6)
- * ──────────── *
- *
- * Two separate motions composed into the camera state:
- *
- *   POSITION (sway) — Lissajous orbit within the cylinder:
- *       O.x = sway_amp · sin(t · SWAY_FREQ_X)
- *       O.y = sway_amp · cos(t · SWAY_FREQ_Y) · 0.55
- *       O.z = 0                       (T4 — speed faked via texture flow)
- *
- *   BASIS (roll) — rotate (right, up) around z:
- *       r = ROLL_RATE · t
- *       forward = (0, 0, 1)
- *       right   = ( cos r,  sin r, 0)
- *       up      = (−sin r,  cos r, 0)
- *
- * Built fresh each frame by build_camera (§13) from Scene.time — a pure
- * Scene→Camera mapping with no stored state. Ref: pinhole camera + look-at
- * basis (Shirley, "Fundamentals of Computer Graphics"); Lissajous curve (sway).
- */
+/* §13 — where the camera is and which way it's pointing this frame, all worked
+ * out from the clock. Two motions layered on: a gentle drift off-centre (the
+ * wobble) and a slow roll of the view. `fwd` always points down the pipe; the
+ * camera never actually moves forward — the scrolling texture fakes that. Built
+ * fresh every frame, nothing kept between frames. */
 typedef struct {
-  V3 O;              /* camera origin — sway offset within the tube   */
-  V3 fwd, right, up; /* orthonormal view basis (fwd = +Z, then rolled)*/
-  float fov_t;       /* tan(FOV/2) — half-FOV ray-spread factor       */
-  float phys_aspect; /* (rows·CELL_ASPECT)/cols — non-square-cell fix */
+  V3 O;              /* where the camera is (off-centre by the wobble) */
+  V3 fwd, right, up; /* which way it points (fwd = down the pipe, then rolled) */
+  float fov_t;       /* how wide the lens spreads rays (from the FOV) */
+  float phys_aspect; /* corrects for tall terminal cells so the pipe stays round */
 } Camera;
 
 static Camera build_camera(const Scene *s, int rows_eff) {
   Camera c;
   c.O = (V3){s->sway_amp * sinf(s->time * SWAY_FREQ_X),
-             s->sway_amp * cosf(s->time * SWAY_FREQ_Y) * 0.55f, 0.0f};
+             s->sway_amp * cosf(s->time * SWAY_FREQ_Y) * SWAY_AMP_Y_RATIO,
+             0.0f};
 
   float r = s->time * ROLL_RATE;
   float cr = cosf(r);
@@ -502,47 +437,29 @@ static Camera build_camera(const Scene *s, int rows_eff) {
   return c;
 }
 
-/* ── §14 [RENDER] scene_render — per-pixel orchestrator
- * ───────────────────────── *
- *
- * Tutorials T1-T10 are realised by this function and its helpers
- * (primary_ray_dir, shade_tunnel_cell, cylinder_uv, draw_vanishing_crosshair):
- *   T1, T2  cylinder_hit (closed form, +sqrt root)
- *   T3      cylindrical UV mapping
- *   T4      v_flow = speed · time (fake forward motion)
- *   T5, T6  build_camera (sway + roll)
- *   T7      pattern_sample
- *   T8      fog_intensity
- *   T10     glyph + theme depth quantisation
- *
- * Two HUD rows are reserved (row 0 yellow, row rows-1 cyan); the
- * tunnel renders into rows 1..rows-2 via y_offset = 1.
- *
- * The vanishing-point crosshair (T9, §15) is drawn LAST, on top of
- * the rendered tunnel.
- */
-/* primary_ray_dir — unit ray direction through screen-cell NDC (u, v) for the
- * camera basis: norm(fwd + u·fov·right + v·fov·aspect·up). One pinhole ray. */
+/* §14 — turning the scene into a screen of characters: one ray per cell, plus
+ * the centre crosshair on top. The top and bottom rows are left for the HUD, so
+ * the tunnel draws into the rows between (shifted down by y_offset). */
+
+/* the direction the ray for one screen cell points: start down the pipe, then
+ * lean right/up by how far this cell is from centre (scaled by the lens) */
 static inline V3 primary_ray_dir(const Camera *cam, float u, float v) {
   return v3norm(v3add(
       cam->fwd, v3add(v3scale(u * cam->fov_t, cam->right),
                       v3scale(v * cam->fov_t * cam->phys_aspect, cam->up))));
 }
 
-/* cylinder_uv — cylindrical texture coords at a wall hit point P (T3): u_tex is
- * the angle around the axis mapped to [0,1) (atan2 + π, /2π); v_tex is the
- * axial distance minus the flow offset so the pattern scrolls toward the camera
- * (T4). */
+/* where on the wall a hit lands, as two texture coords: the angle around the
+ * pipe (0..1) and the distance along it, minus the scroll offset so the texture
+ * streams toward you (the forward-motion illusion) */
 static inline void cylinder_uv(V3 P, float v_flow, float *u_tex, float *v_tex) {
   *u_tex = (atan2f(P.y, P.x) + (float)M_PI) * (1.0f / (2.0f * (float)M_PI));
   *v_tex = P.z - v_flow;
 }
 
-/* shade_tunnel_cell — appearance of one wall cell along ray O+t·D: cast at the
- * cylinder, and from the hit derive glyph + colour pair + attr via pattern ×
- * fog × depth-tier quantisation (T1-T8, T10). A miss / parallel / too-far ray
- * renders as the deepest fog tier — the dark tunnel exit at the vanishing
- * point. */
+/* work out one wall cell: hit the pipe, then turn the hit into a character +
+ * colour + bold/dim. A ray that goes straight down the pipe (or absurdly far)
+ * has no wall to show, so it becomes the dark far end. */
 static void shade_tunnel_cell(V3 O, V3 D, float v_flow, int pattern_idx,
                               char *glyph, int *pair, attr_t *attr) {
   bool parallel = false;
@@ -559,27 +476,30 @@ static void shade_tunnel_cell(V3 O, V3 D, float v_flow, int pattern_idx,
   float u_tex, v_tex;
   cylinder_uv(P, v_flow, &u_tex, &v_tex);
 
+  float fog = fog_of(t);
   float bright = pattern_sample(u_tex, v_tex, pattern_idx);
-  float intensity = fog_intensity(t, bright);
 
-  /* Quantise intensity to a depth tier (far tier 0 → near tier 7). */
-  int slot = (int)(intensity * DEPTH_TIER_SCALE);
-  if (slot < 0)
-    slot = 0;
-  if (slot > N_DEPTH_TIERS - 1)
-    slot = N_DEPTH_TIERS - 1;
+  /* Two independent channels — far clearer on a coarse character grid:
+   *   COLOUR depends on DISTANCE only (fog), so a wall at a given depth is one
+   *   colour and the tube reads as a clean near-bright → far-dim gradient.
+   *   GLYPH depends on distance AND the surface pattern, so the texture shows
+   *   up in the character density instead of masquerading as a depth change in
+   *   the colour (which made the checker/grid walls look buckled).
+   *   Brightness/dimness follows depth too, reinforcing the near/far cue. */
+  int depth_slot = tier_of(fog);
+  float intensity = fog * (FOG_FLOOR + bright * (1.0f - FOG_FLOOR));
+  int glyph_slot = tier_of(intensity);
 
-  *glyph = LUMA_GLYPHS[slot];
-  *pair = PAIR_DEPTH_BASE + slot;
-  *attr = (slot >= TIER_BOLD_MIN)  ? A_BOLD
-          : (slot <= TIER_DIM_MAX) ? A_DIM
-                                   : A_NORMAL;
+  *glyph = LUMA_GLYPHS[glyph_slot];
+  *pair = PAIR_DEPTH_BASE + depth_slot;
+  *attr = (depth_slot >= TIER_BOLD_MIN)  ? A_BOLD
+          : (depth_slot <= TIER_DIM_MAX) ? A_DIM
+                                         : A_NORMAL;
 }
 
-/* §15 [RENDER] draw_vanishing_crosshair — the eye-anchor at screen centre (T9),
- * drawn LAST by scene_render on top of the tunnel. forward = +Z projects the
- * axis vanishing point to the centre regardless of sway, so the bold '+' and
- * four 'o' arms sit there. */
+/* §15 — the little crosshair at screen centre, drawn last so it sits on top.
+ * The pipe's far end always lands dead centre (no matter how the camera wobbles),
+ * so this is a fixed spot for the eye to rest on. */
 static void draw_vanishing_crosshair(int cols, int rows_eff, int y_offset) {
   int cx = cols / 2;
   int cy = rows_eff / 2;
@@ -601,26 +521,46 @@ static void draw_vanishing_crosshair(int cols, int rows_eff, int y_offset) {
   }
 }
 
+/* cell_to_ndc — map a cell centre (col,row) to normalised device coords in
+ * [-1,1], with v flipped so screen-row-down becomes world-up. */
+static inline void cell_to_ndc(int col, int row, int cols, int rows, float *u,
+                               float *v) {
+  *u = ((float)col + 0.5f) / (float)cols * 2.0f - 1.0f;
+  *v = -(((float)row + 0.5f) / (float)rows * 2.0f - 1.0f);
+}
+
+/* set_active_attr — make (pair, attr) the active ncurses style, but only emit
+ * the attron/attroff when it differs from the previous cell, so a run of
+ * same-depth cells shares one switch (fewer escape codes). cur_pair and
+ * cur_attr carry the active style across the scan; start them at (-1, 0). */
+static inline void set_active_attr(int pair, attr_t attr, int *cur_pair,
+                                   attr_t *cur_attr) {
+  if (pair == *cur_pair && attr == *cur_attr)
+    return;
+  if (*cur_pair >= 0)
+    attroff(COLOR_PAIR(*cur_pair) | *cur_attr);
+  attron(COLOR_PAIR(pair) | attr);
+  *cur_pair = pair;
+  *cur_attr = attr;
+}
+
 static void scene_render(const Scene *s) {
-  /* Reserve top + bottom HUD rows.  Tunnel renders into 1..rows-2. */
+  /* leave the top and bottom rows for the HUD; draw the tunnel between them */
   int rows_eff = s->rows - 2;
   int y_offset = 1;
   if (rows_eff < 1)
     return;
 
   Camera cam = build_camera(s, rows_eff);
-  float v_flow =
-      s->speed * s->time; /* texture flow → fake forward motion (T4) */
+  float v_flow = s->speed * s->time; /* how far the texture has scrolled by now */
 
-  /* Paint the wall, batching attr changes across runs of equal cells. */
+  /* one cell at a time: cell -> ray -> shade -> draw */
   int last_pair = -1;
   attr_t last_attr = 0;
   for (int row = 0; row < rows_eff; row++) {
     for (int col = 0; col < s->cols; col++) {
-      /* NDC for this cell (y flipped: screen-down → world-up). */
-      float u = ((float)col + 0.5f) / (float)s->cols * 2.0f - 1.0f;
-      float v = -(((float)row + 0.5f) / (float)rows_eff * 2.0f - 1.0f);
-
+      float u, v;
+      cell_to_ndc(col, row, s->cols, rows_eff, &u, &v);
       V3 D = primary_ray_dir(&cam, u, v);
 
       char glyph;
@@ -629,15 +569,7 @@ static void scene_render(const Scene *s) {
       shade_tunnel_cell(cam.O, D, v_flow, s->current_pattern, &glyph, &pair,
                         &attr);
 
-      /* Batched attron/attroff: switch only when (pair, attr) changes, so
-       * adjacent same-depth cells share one attron call. */
-      if (pair != last_pair || attr != last_attr) {
-        if (last_pair >= 0)
-          attroff(COLOR_PAIR(last_pair) | last_attr);
-        attron(COLOR_PAIR(pair) | attr);
-        last_pair = pair;
-        last_attr = attr;
-      }
+      set_active_attr(pair, attr, &last_pair, &last_attr);
       mvaddch(row + y_offset, col, (chtype)(unsigned char)glyph);
     }
   }
@@ -647,16 +579,12 @@ static void scene_render(const Scene *s) {
   draw_vanishing_crosshair(s->cols, rows_eff, y_offset);
 }
 
-/* ── §16 [RENDER] screen — ncurses init / 2-row HUD / present
- * ─────────────────── */
+/* §16 — talking to the terminal: set it up, draw the HUD, push the frame out. */
 
-/*
- * Screen — the terminal output surface: its current size, re-read on SIGWINCH
- * so render and HUD always match the real window. Owns the ncurses lifecycle
- * (init / resize / free / present) in §16.
- */
+/* The terminal we draw to — just its size, re-read whenever the window resizes
+ * so the render always matches the real window. */
 typedef struct {
-  int cols, rows; /* terminal size in character cells (refreshed on resize) */
+  int cols, rows; /* window size in characters (refreshed on resize) */
 } Screen;
 
 static void screen_init(Screen *sc) {
@@ -680,19 +608,15 @@ static void screen_resize_curses(Screen *sc) {
   getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-/*
- * screen_draw — CLAUDE.md HUD spec.
- *   row 0          PAIR_HUD  (yellow + bold) — title + fps left, status right
- *   row rows-1     PAIR_HINT (cyan   + bold) — key hint
- *
- * FPS lives in the LEFT label so it stays visible even when the
- * settings status overflows the terminal width.
- */
-static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+/* Draw one full frame: the tunnel, then the two HUD rows on top. The fps sits
+ * in the left label so it stays on screen even if the long status line on the
+ * right gets cut off on a narrow window. */
+static void screen_draw(const Screen *sc, const Scene *s, double fps,
+                        int sim_fps) {
   erase();
   scene_render(s);
 
-  /* Top row — title + fps left, settings status right (truncated). */
+  /* top row: title + fps on the left, settings on the right (trimmed to fit) */
   char left[48];
   snprintf(left, sizeof left, " TUNNEL  %5.1f fps ", fps);
   int llen = (int)strlen(left);
@@ -716,7 +640,7 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
     mvprintw(0, sc->cols - slen, "%.*s", slen, status);
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-  /* Bottom row — cyan key hint. */
+  /* bottom row: the key hints */
   attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
   mvprintw(sc->rows - 1, 0,
            " q:quit  spc:pause  r:reset  n/N:pat  t/T:theme  "
@@ -730,21 +654,18 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §17 [APP] app — main loop, signals, key handling ────────────────────────
- */
+/* §17 — the whole program: the main loop, signal handling, and keys. */
 
-/*
- * App — the running program in one place: the simulation (Scene), the output
- * surface (Screen), the fixed-timestep rate, and the signal-driven run flags.
- * main / app_handle_key / app_do_resize take App*; everything below takes a
- * sub-type, so the layers never re-couple through this aggregate.
- */
+/* Everything the running program holds onto: the flight, the screen, the sim
+ * rate, and two flags the signal handlers flip (one to quit, one to note the
+ * window resized). Only main and the app_* helpers see the whole thing; every
+ * other function takes just the piece it needs. */
 typedef struct {
-  Scene scene;                       /* the flight simulation (WHAT + HOW)   */
-  Screen screen;                     /* the output surface                   */
-  int sim_fps;                       /* fixed-timestep rate ([ / ])          */
-  volatile sig_atomic_t running;     /* 0 = quit (set by signal or `q`)      */
-  volatile sig_atomic_t need_resize; /* 1 = SIGWINCH pending                 */
+  Scene scene;
+  Screen screen;
+  int sim_fps;                       /* simulation steps per second ([ / ]) */
+  volatile sig_atomic_t running;     /* set to 0 to quit (by a signal or 'q') */
+  volatile sig_atomic_t need_resize; /* set to 1 when the window resized */
 } App;
 
 static App g_app;
@@ -857,35 +778,34 @@ int main(void) {
   double fps_display = 0.0;
 
   while (app->running) {
-    /* One iteration = one frame. Layers combine in the order documented in
-     * ARCHITECTURE; only the §12 scene_tick accumulator advances simulation. */
+    /* one pass = one frame */
 
-    /* USER EVENT — apply pending SIGWINCH resize (NOT part of the tick). */
+    /* handle a window resize that happened since last frame */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
       sim_accum = 0;
     }
 
-    /* PERFORMANCE — wall-clock dt with spiral-of-death cap. */
+    /* how much real time passed, ignoring any huge stall */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
-    if (dt > 100 * NS_PER_MS)
-      dt = 100 * NS_PER_MS;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
 
     int64_t tick_ns = TICK_NS(app->sim_fps);
     float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
 
-    /* SIMULATION (the tick) — fixed-timestep accumulator: scene_tick advances
-     * scene.time; the paused gate inside scene_tick acts as DELAYS. */
+    /* step the clock in fixed-size ticks, so the motion runs at the same rate
+     * no matter the frame rate (paused freezes it) */
     sim_accum += dt;
     while (sim_accum >= tick_ns) {
       scene_tick(&app->scene, dt_sec);
       sim_accum -= tick_ns;
     }
 
-    /* PERFORMANCE — rolling fps measure (display only). */
+    /* update the fps number shown in the HUD */
     frame_count++;
     fps_accum += dt;
     if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -895,17 +815,15 @@ int main(void) {
       fps_accum = 0;
     }
 
-    /* PERFORMANCE — frame cap (sleep the remainder of the ~60 fps budget). */
+    /* don't run hotter than the render cap — sleep off the rest of the frame */
     int64_t elapsed = clock_ns() - frame_time + dt;
-    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+    clock_sleep_ns(NS_PER_SEC / RENDER_FPS_CAP - elapsed);
 
-    /* RENDER combine — the ONE place state → screen: scene_render + HUD,
-     * then present. Reads scene, never writes it. */
+    /* the one place state becomes pixels: draw the tunnel + HUD, then show it */
     screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
     screen_present();
 
-    /* USER EVENTS — drain one key (knobs / reset / quit); NOT part of the tick.
-     */
+    /* read one keypress (a knob or quit) — not part of the tick */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;
@@ -915,605 +833,3 @@ int main(void) {
   return 0;
 }
 
-/*
- * tunnel.c — first-person flight through a textured cylinder
- *
- * DEMO: A camera sits at the origin inside an infinite cylinder of
- *       radius TUNNEL_RADIUS, looking forward (+Z).  For every
- *       terminal cell we cast a ray, intersect it with the
- *       cylinder ANALYTICALLY (closed-form quadratic — no sphere
- *       tracing), recover cylindrical UV at the hit point, sample
- *       a procedural pattern (RINGS / CHECKER / SPOKES / GRID),
- *       and apply distance fog.  Texture v-coordinate offsets by
- *       speed · time so the pattern flows toward the camera —
- *       gives the illusion of forward motion while the camera
- *       itself stays at z = 0.  Optional sway (translates camera
- *       within the can) and roll (rotates camera basis) layer
- *       extra motion on top.
- *
- *       Six colour themes, four pattern types, live speed / sway
- *       controls, vanishing-point crosshair anchored at screen
- *       centre.
- *
- * Study alongside: raytracing/sphere_raytrace.c, raytracing/cube_
- *       raytrace.c, raytracing/torus_raytrace.c, raytracing/capsule_
- *       raytrace.c — same family of analytical primary-ray
- *       intersections, each with one primitive that has a closed-
- *       form quadratic (or quartic, for torus).  Then read
- *       raymarcher/raymarcher.c for the OPPOSITE pole: when a
- *       primitive's surface has no closed-form intersection, you
- *       sphere-trace it iteratively instead.  Tutorial T1 in this
- *       file derives why a cylinder belongs in the analytical
- *       camp — the geometry has one algebraic equation, so four
- *       multiplies and one sqrt give the exact hit distance.
- *
- * Section map (see ARCHITECTURE for the layer model):
- *   §1   config         [DATA]   every tunable named, no magic numbers later
- *   §2   clock          [PERF]   monotonic timer + sleep
- *   §3   color          [RENDER] themes + 2-pair HUD spec
- *   §4   vec3           [LOGIC]  value-type 3-D math (pure)
- *   §5   ray-cylinder   [LOGIC]  analytical intersection (the central trick)
- *   §6   pattern: RINGS [LOGIC]  sinusoidal axial bands
- *   §7   pattern: CHECKER [LOGIC] floor(u)·floor(v) XOR
- *   §8   pattern: SPOKES [LOGIC] floor(u) parity (radial only)
- *   §9   pattern: GRID  [LOGIC]  hatch lines via line-thickness threshold
- *   §10  pattern dispatch [LOGIC] + cylindrical UV mapping
- *   §11  distance fog   [LOGIC]  exp(−t · density) with floor
- *   §12  scene state    [SIM]    struct + init + tick + reset (advances time)
- *   §13  camera basis   [LOGIC]  sway position + roll basis (pure:
- * Scene→Camera) §14  scene_render   [RENDER] per-pixel orchestrator §15
- * vanishing crosshair [RENDER] eye-anchor at screen centre §16  screen [RENDER]
- * ncurses init + 2-row HUD + present §17  app            [APP]    main loop
- * (tick combine), signals, key handling
- *
- * Keys:
- *   q / ESC      quit
- *   space        pause / resume forward motion + sway
- *   r            reset camera time
- *   n / N        next / previous pattern
- *                  (RINGS / CHECKER / SPOKES / GRID)
- *   t / T        next / previous theme
- *                  (WARP / INFERNO / ELECTRIC / VOID / MATRIX / GOLD)
- *   + / =        speed up
- *   -            speed down
- *   s / S        sway amplitude up / down (curving feel)
- *   ] / [        sim Hz up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raytracing/tunnel.c \
- *       -o tunnel -lncurses -lm
- */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * The file is its own textbook.  Read top-to-bottom.
- *
- *   • CONCEPTS         names the algorithm + lists references.
- *   • MENTAL MODEL     intuition + ASCII diagram of the ray-cylinder
- *                      intersection in 2-D cross-section.
- *   • GUIDED TUTORIAL  ten short answers — why analytical (not
- *                      iterative), the +sqrt root choice, cylindrical
- *                      UV mapping, "speed lives in the texture",
- *                      camera basis with roll, sway, the four
- *                      patterns, distance fog, vanishing-point
- *                      crosshair, glyph quantisation.
- *   • §1..§17          the actual code, each section short and focused.
- *
- * Ten-minute version: read the GUIDED TUTORIAL.  By the end the
- * §-sections feel like reviewing notes.
- *
- * Math notation used in code:
- *      O          — ray origin (camera position; varies with sway)
- *      D          — ray direction (unit vector)
- *      R          — cylinder radius
- *      t          — ray parameter at hit (forward distance)
- *      P          — hit point = O + t · D
- *      u_tex      — angular UV in [0, 1) from atan2(P.y, P.x)
- *      v_tex      — axial UV (P.z minus the per-frame "flow" offset)
- *
- * Background you need:
- *   • basic vector arithmetic (add, scale, length, normalise)
- *   • the QUADRATIC FORMULA — the central trick (T1, T2)
- *   • read raymarcher.c first if surface raymarching is unfamiliar;
- *     this file is the closed-form-intersection counterpoint to it
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ────────────────────────────────────────────────────────── *
- *
- * Algorithm    : Per-pixel ANALYTICAL RAY-CYLINDER INTERSECTION.
- *                Cylinder is infinite, axis-aligned along +Z, radius
- *                R.  The intersection equation reduces to a quadratic
- *                in t with closed-form roots:
- *
- *                    a·t² + 2b·t + c = 0
- *                    a = D.x² + D.y²              (radial speed²)
- *                    b = O.x·D.x + O.y·D.y        (radial momentum)
- *                    c = O.x² + O.y² − R²         (radial offset²−R²)
- *                    t = (−b + sqrt(b² − a·c)) / a
- *
- *                The camera is INSIDE the cylinder, so the
- *                discriminant is always ≥ 0 and we always take the
- *                larger root (smaller would exit through the camera).
- *                See T1 for why this is the right tool here.
- *
- *                Per pixel:
- *                  1. build ray from camera + screen-space coords
- *                  2. cylinder_hit → exact t (closed form)
- *                  3. cylindrical UV from hit point
- *                  4. sample one of 4 procedural patterns
- *                  5. apply distance fog with floor
- *                  6. (intensity, theme) → glyph + colour pair
- *
- *                After the per-pixel loop, a 5-cell crosshair is
- *                drawn at screen centre as a vanishing-point anchor.
- *
- * Data         : Stateless math (Vec3 + cylinder_hit + 4 patterns +
- *                pattern dispatch).  ONE Scene struct holds time,
- *                speed, sway amplitude, current pattern + theme,
- *                paused flag.  No frame buffer — emit cells directly.
- *
- * Rendering    : One pixel per terminal cell.  Glyph from an 8-char
- *                ramp (' ', '.', ',', ':', '+', '*', '#', '@')
- *                indexed by intensity; colour from the active
- *                theme's 8-tier depth ramp (far → dim, near →
- *                bright).  attron/attroff batched on (pair, attr)
- *                changes — adjacent cells in the same depth tier
- *                share one attron call.
- *
- * Performance  : Per pixel: 4 mul + 1 sqrt for cylinder_hit, 1
- *                atan2 + a few multiplies for UV, 1 small switch
- *                for pattern, 1 expf for fog.  ~25 floating-point
- *                ops per cell.  At 80×24 = 1920 cells × 60 fps ≈
- *                3 M ops/sec — comfortable on any CPU made this
- *                century.  No iteration, no MAX_STEPS budget —
- *                this is what closed-form geometry gives you.
- *
- * References   :
- *   • Quílez, I. — "Intersectors"
- *     https://iquilezles.org/articles/intersectors/
- *     Closed-form ray-cylinder, ray-box, ray-sphere intersection
- *     formulas in usable form.
- *   • Hart, J. C. (1996) — "Sphere Tracing: A Geometric Method for
- *     the Antialiased Ray Tracing of Implicit Surfaces", *Visual
- *     Computer* 12(10):527-545.  The contrast: when shape is simple
- *     enough for closed-form, you skip Hart entirely.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The camera sits inside a long pipe and looks down its length.  For
- * every cell on the screen, fire a ray from the camera in that cell's
- * direction.  All rays eventually hit the pipe wall (or the far
- * vanishing point if they're nearly parallel to the axis).  A ray's
- * hit DISTANCE plus the WORLD POSITION of the hit determines what we
- * paint: deeper hits get dimmer (fog), and the angular + axial
- * position of the hit indexes a procedural texture wrapped around the
- * pipe's interior.  Forward motion is faked: the camera stays at z=0
- * forever, but the texture's axial coordinate is offset by speed ·
- * time so the pattern STREAMS toward us.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine standing inside a printed cardboard mailing tube.  The
- * pattern on the inside surface is fixed.  To make it look like
- * you're flying down the tube, don't move your head — instead,
- * SHIFT THE PATTERN backward.  The visual effect is identical: dots
- * on the wall stream past your eyes, and your brain reads it as
- * forward motion.  Add a slight side-to-side wobble (sway) and a
- * gentle rotation (roll) and the illusion completes.  The actual
- * geometry — an infinite cylinder centred on you — is so simple that
- * we never have to march along the ray.  One quadratic per pixel
- * gives the exact wall position.
- *
- * One ray, in cross-section through the X-Y plane (looking down the Z
- * axis from above):
- *
- *           ●─────────●  cylinder wall (radius R)
- *          ╱           ╲
- *         ╱             ╲
- *        ╱      ●─→ D    ╲    ray fired from camera O,
- *       ●       O        ●    direction D = (D.x, D.y, D.z)
- *        ╲     [inside]  ╱
- *         ╲             ╱      analytical hit:
- *          ╲           ╱         a = D.x² + D.y²
- *           ●─────────●          b = O.x·D.x + O.y·D.y
- *                                c = O.x² + O.y² − R²
- *                                t = (−b + sqrt(b²−ac)) / a
- *           ●                    P = O + t · D
- *           ↑                    u_tex = (atan2(P.y, P.x) + π) / 2π
- *           hit P                v_tex = P.z − speed · time
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- * Once per tick:
- *   1. animate     scene_t accumulates dt; pause freezes everything
- *
- * Per render frame:
- *   2. camera      O = sway position; basis = roll-rotated (right, up)
- *   3. for each cell:
- *      3a. ray         build D from screen-space (col, row) + camera basis
- *      3b. intersect   t = cylinder_hit(O, D, R)        closed form
- *      3c. axis-parallel branch: render as deepest fog tier
- *      3d. far-clip branch:      render as deepest fog tier
- *      3e. otherwise:  P = O + t·D
- *                      u_tex = atan2-azimuth, v_tex = P.z − speed·time
- *                      bright = pattern_sample(u_tex, v_tex)
- *                      intensity = fog(t) · (FLOOR + bright·(1−FLOOR))
- *                      slot = floor(intensity · 7.999)
- *                      emit glyph + theme-depth pair, attribute by slot
- *   4. crosshair   draw 5-cell vanishing-point cursor at (cx, cy)
- *
- * Per draw frame:
- *   5. HUD overlay yellow row 0 (title + fps + status), cyan key hint
- *                  at row rows-1
- *
- * KEY FORMULAS
- * ────────────
- * Ray-cylinder intersection (axis along +Z, radius R, camera inside):
- *      a = D.x² + D.y²
- *      b = O.x · D.x + O.y · D.y
- *      c = O.x² + O.y² − R²
- *      Δ = b² − a·c
- *      t = (−b + sqrt(Δ)) / a              (always the larger root)
- *
- * Cylindrical UV at hit P:
- *      u_tex = (atan2(P.y, P.x) + π) / (2π)   ∈ [0, 1)   azimuth
- *      v_tex = P.z − speed · time                          axial
- *
- * Camera basis with roll:
- *      r = ROLL_RATE · time
- *      forward = (0, 0, 1)
- *      right   = (cos r,  sin r, 0)
- *      up      = (−sin r, cos r, 0)
- *
- * Sway (camera position within the can):
- *      O.x = sway_amp · sin(time · SWAY_FREQ_X)
- *      O.y = sway_amp · cos(time · SWAY_FREQ_Y) · 0.55
- *      O.z = 0                                  (forward motion is FAKE — see
- * T4)
- *
- * Per-pixel ray direction (NDC in [−1, +1]):
- *      u =  (col + 0.5) / cols · 2 − 1
- *      v = −(row + 0.5) / rows · 2 + 1
- *      D = normalise(forward + u·F·right + v·F·aspect·up)
- *      F = tan(FOV/2)
- *
- * Distance fog with floor:
- *      fog       = exp(−t · FOG_DENSITY)
- *      intensity = fog · (FOG_FLOOR + brightness · (1 − FOG_FLOOR))
- *
- * Pattern brightness (per pattern):
- *      RINGS    = sin(v · ring_freq) · 0.5 + 0.5
- *      CHECKER  = (floor(u·N) + floor(v·M)) & 1
- *      SPOKES   = floor(u·N) & 1
- *      GRID     = (u_dist < thick || v_dist < thick) ? 1 : 0
- *
- * Glyph quantisation:
- *      slot   = floor(intensity · 7.999)              ∈ {0..7}
- *      glyph  = LUMA_GLYPHS[slot]
- *      pair   = PAIR_DEPTH_BASE + slot
- *      attr   = A_BOLD (slot ≥ 6) | A_DIM (slot ≤ 1) | A_NORMAL else
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Axis-parallel ray (D.x² + D.y² < EPS_PARALLEL): the quadratic
- *     coefficient `a` is essentially zero, dividing by it gives
- *     spurious huge t.  Guard with the parallel flag and render the
- *     cell as deepest-fog "vanishing point".  The crosshair cursor
- *     in §15 paints over this region.
- *
- *   • Camera close to the wall: sway_amp is clamped to <
- *     TUNNEL_RADIUS · 0.85.  Push past that and rays toward the wall
- *     hit at very small t → the wall fills nearly the whole screen.
- *     Defensive but not strictly required.
- *
- *   • Discriminant Δ should always be ≥ 0 since the camera is INSIDE
- *     the cylinder (every direction must hit the wall eventually).
- *     Returning −1 on Δ < 0 is purely defensive; in normal operation
- *     this branch is never taken.
- *
- *   • atan2(0, 0) is implementation-defined.  Guarded by the
- *     parallel-ray check upstream — if D.x² + D.y² is tiny we never
- *     reach the UV calculation.
- *
- *   • The Z roll basis swaps right and up but keeps forward = +z.
- *     Composed with forward ray-cylinder intersection, this just
- *     rotates the rendered TEXTURE in place — geometry is invariant
- *     under z-axis rotation by symmetry.  Reads as "camera is
- *     rolling".
- *
- *   • The crosshair at screen centre projects to the axis vanishing
- *     point.  When sway translates the camera within the can, the
- *     vanishing point's screen position is INVARIANT — it depends
- *     only on the forward direction, not on camera translation
- *     parallel to the screen plane.  See T9.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • At default settings, walls of the tunnel STREAM toward the
- *     camera at speed 8.  The HUD shows "speed:8.0".  Press '−'
- *     repeatedly until speed = 0.5 — pattern motion slows to a
- *     crawl.
- *
- *   • Pause (space): stops sway + roll + texture flow, all at once.
- *     Confirms that animation is purely time-driven; pause kills all.
- *
- *   • Press n through all 4 patterns.  RINGS shows axial sinusoidal
- *     bands.  CHECKER shows alternating squares.  SPOKES shows
- *     stripes radiating outward (no axial variation).  GRID shows
- *     bright crosshatch lines.
- *
- *   • Press t through all 6 themes.  Geometry stays identical, only
- *     the depth-ramp colour changes.
- *
- *   • Press s several times to add sway: camera slowly orbits within
- *     the cylinder, but the vanishing-point crosshair stays put at
- *     screen centre (T9).
- *
- *   • Press r to reset time → texture flow snaps back to a fresh
- *     phase; camera position resets.
- *
- *   • Resize the terminal → tunnel re-aspects, vanishing point stays
- *     at the new screen centre, HUD reflows.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL — ten short answers ─────────────────────────────── *
- *
- *
- * T1: Why ANALYTICAL intersection (not sphere tracing)?
- * ─────────────────────────────────────────────────────
- * Most files in raymarcher/ use SPHERE TRACING — iterative march
- * along the ray, asking the SDF "how far is the nearest surface?"
- * at each step until convergence.  That's the right tool when the
- * surface has 3-D structure that VARIES along the ray (a fractal,
- * a Boolean of primitives, a metaball field).
- *
- * For an INFINITE CYLINDER, the surface satisfies a single algebraic
- * equation:
- *
- *      x² + y² = R²
- *
- * Substitute the ray r(t) = O + t · D into that equation:
- *
- *      (O.x + t · D.x)² + (O.y + t · D.y)² = R²
- *
- * Expand → quadratic in t → quadratic formula → exact closed-form t.
- * No iteration, no MAX_STEPS, no convergence epsilon.  Four multiplies
- * and one sqrt give the answer to floating-point precision.
- *
- * Trade-off: closed-form intersection only works when the surface
- * has a simple algebraic equation.  For a torus you'd need a quartic
- * (still solvable in closed form, but messy); for a Bezier patch,
- * forget it.  Sphere tracing handles ALL of those uniformly at the
- * cost of iteration.  Pick the right tool for the shape.
- *
- *
- * T2: The +sqrt root — camera inside the can
- * ──────────────────────────────────────────
- * The quadratic a·t² + 2b·t + c = 0 has two roots:
- *
- *      t± = (−b ± sqrt(b² − a·c)) / a
- *
- * Geometrically, these are the TWO points where the ray crosses the
- * cylinder wall (entering and exiting if camera is outside; or the
- * one behind and one ahead if camera is inside).  Our camera is
- * inside, so:
- *
- *      t− is NEGATIVE — the ray would exit "backward" through the
- *           wall behind the camera (we don't render backward rays).
- *      t+ is POSITIVE — the ray exits "forward" through the wall
- *           ahead.  This is the hit we want.
- *
- * Always take t+.  Code does `(−b + sqrt(...)) / a` — the + is
- * non-negotiable.  Use t− and you'd render the cylinder INSIDE OUT.
- *
- *
- * T3: Cylindrical UV mapping
- * ──────────────────────────
- * Once we have hit point P = O + t · D, recover its position in
- * cylindrical (u, v) coordinates:
- *
- *      u_tex   = (atan2(P.y, P.x) + π) / (2π)         azimuth ∈ [0, 1)
- *      v_tex   = P.z                                    axial position
- *
- * The atan2(P.y, P.x) returns the angle from +X axis to the vector
- * (P.x, P.y), in (−π, π].  Adding π shifts to [0, 2π); dividing by
- * 2π normalises to [0, 1).  The wraparound at u = 0/1 is a SEAM —
- * patterns that depend on integer floor(u·N) cleanly tile across
- * it as long as N divides evenly.
- *
- * v_tex is just the axial position.  A pattern pinned at integer
- * v values stays pinned in world space; subtract a flow offset to
- * make it move (T4).
- *
- *
- * T4: "Speed lives in the texture, not the geometry"
- * ──────────────────────────────────────────────────
- * Naïve approach: advance the camera forward each frame.  Update
- * O.z += speed · dt.  Re-render.
- *
- * Smarter approach for an INFINITE cylinder: the camera doesn't
- * NEED to move.  An infinite cylinder is translation-invariant
- * along its axis — the geometry at z = 1000 is identical to the
- * geometry at z = 0.  So: leave the camera at z = 0 forever, and
- * SUBTRACT a flow offset from v_tex when sampling the texture:
- *
- *      v_tex = P.z − speed · time
- *
- * Visually identical to moving the camera forward at the given
- * speed.  Computationally cheaper (no per-frame state update; no
- * concern about z growing without bound); and the camera-basis
- * code stays trivial.  Speed control becomes "tune one parameter
- * inside the SDF", not "tune the camera animation".
- *
- *
- * T5: Camera basis with roll — rotate right and up around z
- * ─────────────────────────────────────────────────────────
- * For a basic camera, the basis vectors are:
- *
- *      forward = (0, 0, 1)
- *      right   = (1, 0, 0)
- *      up      = (0, 1, 0)
- *
- * To make the camera ROLL (rotate around its forward axis), apply
- * a 2-D rotation to right and up:
- *
- *      r = ROLL_RATE · time
- *      right = ( cos r,  sin r, 0)
- *      up    = (−sin r,  cos r, 0)
- *
- * forward stays (0, 0, 1).  This is a pure z-axis rotation of the
- * camera frame.  Geometrically: the cylinder is symmetric under
- * z-rotation, so rolling the camera is equivalent to rotating the
- * texture sample point's u_tex coordinate.  Visual effect: the
- * pattern appears to rotate in place as you fly.  Different
- * patterns (RINGS) ignore u entirely → they're invisible to roll.
- * CHECKER, SPOKES, GRID all show the rotation.
- *
- *
- * T6: Sway — Lissajous translation of the camera
- * ──────────────────────────────────────────────
- *      O.x = sway_amp · sin(time · SWAY_FREQ_X)
- *      O.y = sway_amp · cos(time · SWAY_FREQ_Y) · 0.55
- *
- * Two different frequencies (SWAY_FREQ_X = 0.55, SWAY_FREQ_Y =
- * 0.31) → quasi-periodic Lissajous orbit; the camera doesn't
- * repeat the same path exactly.  Reads as "the tunnel curves
- * gently" even though the geometry is straight.  Amplitude is
- * clamped to <0.85 · R so we don't slam into the wall.
- *
- * Sway is a TRANSLATION of camera origin, not a rotation of
- * direction.  Combined with the analytical intersection, sway just
- * shifts which part of the cylinder wall each ray hits — no extra
- * cost in the renderer.
- *
- *
- * T7: Four patterns — different ways of dividing (u, v)
- * ─────────────────────────────────────────────────────
- *      RINGS      sin(v · ring_freq) · 0.5 + 0.5
- *                 axial sinusoid; ignores u entirely
- *                 (so camera roll is invisible against this pattern)
- *
- *      CHECKER    floor(u · stripes_around) XOR floor(v · stripes_long)
- *                 alternating squares; both u and v matter, so roll
- *                 + flow + sway are all visible
- *
- *      SPOKES     floor(u · stripes_around) parity
- *                 ignores v entirely; pure radial stripes
- *                 (so flow and sway are invisible against this pattern)
- *
- *      GRID       hatch lines at integer u and v boundaries
- *                 max(u_distance, v_distance) < line_thick → bright
- *                 cross-hatch with thin bright lines on a dark base
- *
- * Each pattern exposes a different aspect of the camera motion.
- * Switch between them (n / N keys) to feel which animation is
- * driving the visual at any given instant.
- *
- *
- * T8: Distance fog — exp(−t · density) with floor
- * ───────────────────────────────────────────────
- * Walls farther down the tunnel should be DIMMER (fog hides
- * distance).  Apply an exponential decay:
- *
- *      fog = exp(−t · FOG_DENSITY)
- *
- * t is the ray-parameter at hit (= distance to the wall).  Far
- * hits (t large) → fog ≈ 0; near hits (t small) → fog ≈ 1.
- *
- * Combine with pattern brightness:
- *
- *      intensity = fog · (FOG_FLOOR + brightness · (1 − FOG_FLOOR))
- *
- * The FOG_FLOOR keeps even very-far walls from going PURE BLACK —
- * we want to SEE the tunnel structure even at the vanishing point,
- * not just see void.  At fog = 0, intensity = 0.  At fog = 1 and
- * full brightness, intensity = 1.  In between, the floor adds a
- * minimum visibility that fades out smoothly with fog.
- *
- *
- * T9: Vanishing-point crosshair — invariant to sway
- * ─────────────────────────────────────────────────
- * For our camera with forward = (0, 0, 1), the AXIS DIRECTION's
- * projection on the screen is at exactly (cols/2, rows_eff/2).
- * Why: the projection of a direction vector (not a point) ignores
- * camera translation entirely — only camera ROTATION affects it.
- * Our roll is around the SAME axis the cylinder lives on, so it
- * also doesn't move the projected vanishing point.
- *
- * Net result: as the camera sways within the can, the cylinder
- * walls visibly shift around on the screen, but the vanishing
- * point — the screen position toward which all "down-the-tunnel"
- * rays point — stays nailed at the centre.  The crosshair is a
- * 5-cell `+` and four `o` arms drawn LAST (over the rendered
- * tunnel) as a visual anchor for the eye.
- *
- *
- * T10: Quantisation — intensity → glyph + theme depth
- * ───────────────────────────────────────────────────
- *      slot   = floor(intensity · 7.999)              ∈ {0..7}
- *      glyph  = LUMA_GLYPHS[slot]                     ' ' through '@'
- *      pair   = PAIR_DEPTH_BASE + slot                theme's tier-N colour
- *      attr   = A_BOLD (slot ≥ 6) | A_DIM (slot ≤ 1) | A_NORMAL else
- *
- * Three signals into one cell: GLYPH from the intensity (perceptual
- * brightness via the ink-density ramp), COLOUR PAIR from the same
- * slot (theme-specific depth ramp), ATTRIBUTE for an extra bold/
- * dim push at the extremes of the range.  All three reinforce each
- * other — the brightest cells are bright glyph + bright colour +
- * bold attribute; the dimmest are space + dim colour + DIM
- * attribute.
- *
- * Six themes (WARP / INFERNO / ELECTRIC / VOID / MATRIX / GOLD)
- * give different depth-ramp hues; every theme keeps the same
- * 8-tier slot mapping so glyph + attr stay coherent across theme
- * changes.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE — concern layers & the per-tick combine ────────────── *
- *
- * This demo grew by accretion; the concerns below were interleaved and are
- * now isolated into labelled sections. The persistent state lives in two
- * structs (Scene §12, App §17) — listed under MUTATES.
- *
- *   LAYER        SECTION(S)        MUTATES
- *   ----------   ---------------   -----------------------------------------
- *   SIMULATION   §12 scene_tick    scene.time  (accumulated seconds — the ONE
- *                                  evolving value; sway/roll/flow derive from
- * it) LOGIC        §4 vec3, §5 ray-  nothing — pure functions; same inputs give
- *                cylinder, §6-§11  the same result, so render/effects ordering
- *                patterns/UV/fog,  cannot corrupt them. build_camera (§13) is a
- *                §13 build_camera  pure Scene→Camera mapping.
- *   EFFECTS      — none —          the sway, roll, fog and texture-flow "look"
- *                                  are all derived at render time from
- *                                  scene.time; nothing cosmetic is stored.
- *   RENDER       §3 color, §14     the terminal only (ncurses screen); reads
- *                scene_render,     scene + knob state, never writes it.
- * theme_apply §15, §16 screen   reprograms colour pairs on a 't' press. DELAYS
- * §12 scene_tick    none — `scene.paused` gates the time advance PERFORMANCE §2
- * clock, §17     frame_time, dt, sim_accum, fps_accum, main loop frame_count,
- * fps_display; sleep — timing only
- *
- * PER-TICK COMBINE — one loop iteration in main (§17); ONLY step 3 advances
- * simulation state, and it does so in a fixed-timestep accumulator:
- *   1. (event)  apply pending resize             — app_do_resize  — NOT the
- * tick
- *   2. perf     measure dt, cap to 100 ms
- *   3. SIM      while (accum >= tick): scene_tick(dt_sec)         ← the tick
- *   4. perf     roll fps average
- *   5. perf     sleep to frame-cap (~60 fps)
- *   6. RENDER   screen_draw (scene_render + HUD) → present  ← the one
- * state→screen
- *   7. (event)  drain one key via app_handle_key            — NOT the tick
- *
- * User EVENTS (resize, keys §17) are NOT the tick — they set inputs the next
- * tick and render read. Keys mutate Scene knobs
- * (pattern/theme/speed/sway/pause) and app.sim_fps; RESET (`r`) → scene_reset
- * zeroes scene.time.
- * ─────────────────────────────────────────────────────────────────── */

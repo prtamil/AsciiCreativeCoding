@@ -1,5 +1,14 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 
+/* solar_eclipse.c — a solar eclipse drawn into the terminal in colour.
+ * For every character cell we trace one ray and step it through the thin
+ * glowing gas around the sun (the corona), so the corona, the red rim, the
+ * prominences and the beads of light all fall out of one physics loop rather
+ * than being painted on. The moon drifts across the sun and back.
+ * Sister files: sphere_raytrace.c (the ray-vs-sphere math up close),
+ * path_tracer.c (the colour-to-terminal pipeline). Keys show along the
+ * bottom of the screen while it runs. */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -16,55 +25,25 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── §0 TYPES — forward type declarations (V3 / RGB)
- * ────────────────────────────────────────────────── *
- *
- * V3 (a 3-D float vector) and RGB (three colour channels) are declared
- * here — at the very top — because §1.16 (the stellar-classes table)
- * embeds RGB literals when set up with explicit colour fields, and
- * because keeping these definitions early lets the rest of the file
- * use them anywhere. The math operators that consume V3 / RGB live in
- * §3; only the type tags appear here.
- *
- * No methods, no constructors — these are POD bags of three floats.
- * Throughout the file V3 represents a position OR a direction (the
- * difference is which one the variable name describes), and RGB
- * represents an HDR colour (channels can exceed 1.0 — tone-mapping
- * happens in §5).
- * Ref: Shirley, "Ray Tracing in One Weekend"; Foley & van Dam (vectors);
- *      PBR radiometry (RGB as linear HDR radiance).
- */
+/* §0 — the two core number-bags, declared first so everything below can use
+ * them. Both are just three floats with no methods. */
 
+/* A point or a direction in 3-D space (which one is clear from the name). */
 typedef struct {
-  float x, y, z; /* position OR direction in world space   */
+  float x, y, z;
 } V3;
+/* A colour. Brightness can go above 1.0 (it's "HDR"); §5 squashes it down to
+ * something the terminal can show. */
 typedef struct {
-  float r, g, b; /* linear HDR colour (tone-mapped in §5)   */
+  float r, g, b;
 } RGB;
 
-/* ── §1 CONFIG — constants, ramp, enums (data only)
- * ────────────────────────────────────────────────── *
- *
- * Every tunable in the simulation is a named #define here, with a
- * comment explaining what it controls and what changes when you nudge
- * it. The §1 sub-sections below mirror the GUIDED TUTORIAL topics —
- * if you've read Tutorial 6 (transmittance LUT), §1.8's LUT_SIZE is
- * the parameter you'd touch.
- *
- * No magic numbers anywhere else in this file. If you find one in §11
- * or further down, it's a bug — please rename and move it here.
- */
+/* §1 — config: every tunable number in one place, so none of them turn up as
+ * a mystery value buried in the code below. */
 
-/* §1.1 frame-rate and orbit-speed knobs.
- *
- * The main loop runs a fixed-timestep simulation tick at SIM_FPS_DEFAULT
- * Hz, decoupled from the render rate. Pressing ] / [ adjusts the tick
- * rate at runtime; +/- multiplies / divides the orbital speed of the
- * moon (so you can dial in slow motion at a totality boundary).
- *
- * SPEED_DEF is the baseline — 1× orbit; SPEED_MAX is 8× faster than
- * that, SPEED_MIN is 1/8×. The scale is multiplicative.
- */
+/* How fast time moves. The world updates on a steady clock (ticks/sec); speed
+ * multiplies how fast the moon drifts (turn it down for slow-mo at the edge
+ * of totality). */
 enum {
   SIM_FPS_MIN = 10,
   SIM_FPS_DEFAULT = 30,
@@ -79,269 +58,145 @@ enum {
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
-#define DT_CAP_NS (100 * NS_PER_MS) /* spiral-of-death guard */
+#define DT_CAP_NS (100 * NS_PER_MS) /* after a stall, never advance more than this */
 
-/* §1.2 view geometry and zoom.
- *
- * FOV_H_BASE is tan(half horizontal field of view). The effective FOV
- * during rendering is `FOV_H_BASE / zoom` — larger zoom → smaller FOV
- * → bigger objects on screen. ASPECT_Y compensates for terminal cells
- * being roughly twice as tall as wide, so spheres render round.
- *
- * At zoom = 1, with the geometry below (sun_R = 3.5, sun_Z = 50), the
- * sun's apparent angular radius is ~7% of the screen half-width — a
- * compact, vivid disc. Zooming to 4× or 8× brings totality details
- * (chromosphere ring, prominences, beads) into focus.
- */
+/* The camera lens. zoom shrinks the field of view (bigger objects); ASPECT_Y
+ * squashes vertically so the sun stays round, not egg-shaped, in tall cells. */
 #define ASPECT_Y 2.0f
-#define FOV_H_BASE 0.40f
+#define FOV_H_BASE 0.40f /* base field-of-view width; effective = this / zoom */
 #define ZOOM_MIN 0.25f
 #define ZOOM_MAX 8.0f
 #define ZOOM_STEP 1.25f
 
-/* §1.3 scene geometry — sun far, moon close.
- *
- * Apparent angular radii at default geometry:
- *   sun_α   = atan(SUN_R  / SUN_Z ) = atan(3.5 / 50.0) ≈ 4.0°
- *   moon_α  = atan(0.62  / 5.0)    ≈ 7.1°
- *   ratio   = moon_α / sun_α       ≈ 1.76
- *
- * Setting moon clearly larger than sun (1.76×) makes totality read
- * unambiguously: the moon's silhouette dominates, with corona visible
- * in a halo around it. Were the ratio close to 1 the eye would read
- * the bright sun + corona as one disc and the moon as a small dark
- * intrusion — visually wrong.
- *
- * Three pattern-specific moon sizes are predefined; pattern_set
- * (§12.2) picks one when n / p is pressed. The user-controlled
- * `moon_scale` (in Scene, §12.1) multiplies on top of these.
- *
- * MOON_ORBIT_X_FRAC controls how far the moon swings horizontally —
- * the full orbit reaches MOON_ORBIT_X_FRAC × (sun_α + moon_α) on
- * either side of centre. Setting it < 1 gives a near-miss; 1.5 gives
- * a clean enter/exit cycle.
- */
-#define SUN_Z 50.0f
-#define SUN_R 3.5f
-#define MOON_Z 5.0f
-#define MOON_BASE_R_TOTAL 0.62f
-#define MOON_BASE_R_ANNULAR 0.32f
-#define MOON_BASE_R_TRANSIT 0.04f
+/* Where everything sits. The sun is far and big; the moon is near and small,
+ * but because it's so much closer it looks LARGER in the sky — which is what
+ * lets it cover the sun. Made deliberately larger (~1.7x) so totality reads
+ * clearly: a dark moon with the corona haloed around it. */
+#define SUN_Z 50.0f             /* sun distance */
+#define SUN_R 3.5f              /* sun radius */
+#define MOON_Z 5.0f             /* moon distance (much nearer) */
+#define MOON_BASE_R_TOTAL 0.62f /* moon radius: fully covers the sun */
+#define MOON_BASE_R_ANNULAR 0.32f /* smaller: leaves a ring of sun showing */
+#define MOON_BASE_R_TRANSIT 0.04f /* tiny: just a dot crossing the disc */
 
-#define MOON_SCALE_MIN 0.5f
+#define MOON_SCALE_MIN 0.5f  /* live moon-size multiplier (m / M keys) */
 #define MOON_SCALE_MAX 2.0f
 #define MOON_SCALE_STEP 1.10f
 
-#define ECLIPSE_PERIOD_S 30.0f
-#define MOON_ORBIT_X_FRAC 1.5f
-#define PARTIAL_Y_OFFSET 0.025f
+#define ECLIPSE_PERIOD_S 30.0f /* seconds for the moon to cross and return */
+#define MOON_ORBIT_X_FRAC 1.5f /* how far it swings sideways (1.5 = clean in/out) */
+#define PARTIAL_Y_OFFSET 0.025f /* lift for the PARTIAL pattern, so it never centres */
 
-/* §1.4 corona scattering coefficient.
- *
- * The corona's electron density falls roughly as r^(-2.5) (the K-corona
- * power law) — we use 3.0 here for a slightly steeper falloff that
- * keeps the visible glow tight to the limb. CORONA_SIGMA0 is σ at
- * exactly r = R_sun (the photospheric boundary). CORONA_REACH bounds
- * the medium: outside r > REACH·R_sun, σ ≡ 0 and the path tracer can
- * coarse-stride harmlessly.
- *
- * Real-world coronal optical depth across one solar radius is ~10^-9.
- * For an LDR ASCII display we scale all σ values up by a uniform
- * representational factor so τ along visible chords lands in the
- * [0.05, 0.6] range — this is a display scaling, not a physics hack;
- * the radial decay shape stays correct.
- */
-#define CORONA_REACH 8.0f
-#define CORONA_SIGMA0 0.18f
-#define CORONA_DECAY 3.0f
+/* The corona — the faint glowing gas around the sun. Its thickness falls off
+ * fast with distance from the sun's edge, keeping the glow tight. CORONA_REACH
+ * is where we treat it as empty so the ray can stride through quickly. (The
+ * real corona is fantastically faint; these numbers are scaled up so it shows
+ * on screen — the shape of the falloff is what's real, not the magnitude.) */
+#define CORONA_REACH 8.0f   /* corona fades to nothing past this x sun radius */
+#define CORONA_SIGMA0 0.18f /* how thick the corona is right at the sun's edge */
+#define CORONA_DECAY 3.0f   /* how fast it thins out with distance */
 
-/* §1.5 chromosphere shell.
- *
- * The chromosphere is a thin layer above the photosphere — real-world
- * thickness ~0.3% of R_sun, we use 2.5% so it's visible at low
- * resolution. CHROMOS_SIGMA0 is its peak σ (much higher than corona's
- * — chromosphere is optically thick at Hα core).
- *
- * Outer edge falls off as (1 − h)⁴ where h = (r − R_sun) / thickness ∈
- * [0,1] — sharper than a quadratic, reads as a thin band rather than
- * a soft glow.
- */
-#define CHROMOS_THICK 0.025f
-#define CHROMOS_SIGMA0 6.0f
+/* The chromosphere — the thin red rim hugging the sun's surface. Real one is
+ * paper-thin; we make it 2.5% of the radius so it's visible at this size. */
+#define CHROMOS_THICK 0.025f /* shell thickness, as a fraction of sun radius */
+#define CHROMOS_SIGMA0 6.0f  /* how dense (and bright-red) it is */
 
-/* §1.6 chromosphere spicule fBm.
- *
- * Spicules are radial jet-like structures in the chromosphere (~tens
- * of thousands of them on the real sun). We approximate the texture
- * by sampling 2-D fBm in spherical surface coordinates (theta, phi).
- * The patches extend radially through the thin shell, producing
- * visible streak-like texture rather than a smooth ring.
- *
- *   spicule_factor = SPICULE_BASE + SPICULE_AMP · fBm(phi · 12,
- *                                                     theta · 6)
- *
- * The factor multiplies chromos_emission. Hot peaks (high fBm) shift
- * the Hα colour toward yellow for thermal variation.
- */
-#define SPICULE_FREQ_PHI 12.0f
-#define SPICULE_FREQ_TH 6.0f
-#define SPICULE_BASE 0.5f
-#define SPICULE_AMP 1.2f
+/* Spicules — the fine hairy texture on the red rim (countless little jets on
+ * the real sun). We fake it with noise; hot patches lean toward yellow. */
+#define SPICULE_FREQ_PHI 12.0f /* noise detail around the rim */
+#define SPICULE_FREQ_TH 6.0f   /* noise detail up/down the rim */
+#define SPICULE_BASE 0.5f      /* baseline rim brightness */
+#define SPICULE_AMP 1.2f       /* how much the texture varies it */
 
-/* §1.7 prominences — dense Hα loops.
- *
- * Prominences are arcs of cool dense plasma rooted in the chromosphere.
- * We place PROM_COUNT of them at random angular positions per seed,
- * each with its own height (up to PROM_HEIGHT × R_sun above the
- * photosphere) and lateral angular width. Their density adds onto the
- * chromosphere shell — they are NOT spherically symmetric, so they
- * don't contribute to the radial transmittance LUT (only to the
- * additive emission term).
- */
-#define PROM_COUNT 5
-#define PROM_HEIGHT 0.18f
-#define PROM_LATERAL 0.18f
-#define PROM_SIGMA0 8.0f
+/* Prominences — the bright arcs of gas looping off the sun's edge. A handful,
+ * placed at random angles each reseed, each with its own height and width. */
+#define PROM_COUNT 5       /* how many loops */
+#define PROM_HEIGHT 0.18f  /* tallest reach, as a fraction of sun radius */
+#define PROM_LATERAL 0.18f /* angular width of each */
+#define PROM_SIGMA0 8.0f   /* how dense / bright they are */
 
-/* §1.8 path tracer parameters.
- *
- * MARCH_STEPS is the budget of fine-step samples between t=0 and
- * t_max (per pixel). Adaptive marching uses these inside the corona's
- * radial extent and 4× coarser strides outside; the 96 fine-step
- * count gives Δt ≈ 0.83 in world units when t_max ≈ 80, which is
- * fine enough to step into the chromosphere shell (thickness 0.125)
- * with at least one sample inside.
- *
- * IN_SCATTER_GAIN scales corona radiance to the LDR display range
- * (real corona is ~10⁶× dimmer than photosphere; we compress that to
- * a factor of ~14 so Reinhard maps it to visibly distinct cells).
- *
- * SUN_EMIT_HDR is the photosphere radiance multiplier: high enough
- * that even after eye-ray extinction (T ≈ 0.6) the photosphere
- * saturates the tone-map at the disc centre.
- *
- * HA_EMIT_GAIN does the same job for chromosphere and prominence Hα
- * line emission — relative to corona scatter.
- *
- * LUT_SIZE / LUT_R_MAX define the radial transmittance table. 256
- * samples from R_sun to (REACH+2)·R_sun is plenty given the smooth
- * power-law σ — bilinear interpolation has sub-cell accuracy.
- */
-#define MARCH_STEPS 96
-#define MARCH_T_MAX (SUN_Z + SUN_R * 6.0f)
-#define LUT_SIZE 256
-#define LUT_R_MAX (SUN_R * (CORONA_REACH + 2.0f))
-#define IN_SCATTER_GAIN 14.0f
-#define SUN_EMIT_HDR 8.0f
-#define HA_EMIT_GAIN 3.0f
-#define MARCH_COARSE_MULT                                                      \
-  4.0f /* coarse step = 4x fine outside corona reach    */
-#define CORONA_FINE_MARGIN                                                     \
-  0.5f /* extra R_sun margin: keep chromosphere fine    */
-#define TRANSMITTANCE_CUTOFF                                                   \
-  1e-3f                   /* stop the march when this little light remains */
-#define DENSITY_EPS 1e-6f /* skip scatter+emission below this density      */
-#define VIS_EPS 1e-4f     /* skip in-scatter below this sun-disc fraction  */
+/* The ray-marcher's dials. We walk each ray forward in small steps, sampling
+ * the glowing gas; these set how many steps, how bright each glowing thing is
+ * on screen, and where the marcher can speed up. The brightness gains are big
+ * because real space spans a huge range we have to squeeze into a terminal. */
+#define MARCH_STEPS 96               /* fine steps along a ray */
+#define MARCH_T_MAX (SUN_Z + SUN_R * 6.0f) /* how far a sky ray marches */
+#define LUT_SIZE 256                 /* entries in the see-through table (§10) */
+#define LUT_R_MAX (SUN_R * (CORONA_REACH + 2.0f)) /* outer radius that table covers */
+#define IN_SCATTER_GAIN 14.0f        /* corona brightness on screen */
+#define SUN_EMIT_HDR 8.0f            /* sun-surface brightness (saturates to white) */
+#define HA_EMIT_GAIN 3.0f            /* red-rim + prominence brightness */
+#define MARCH_COARSE_MULT 4.0f       /* step 4x bigger out where space is empty */
+#define CORONA_FINE_MARGIN 0.5f      /* keep fine stepping a touch past the corona */
+/* Step ultra-fine within this x sun-radius of the sun: the red rim and the
+ * prominences are thinner than a normal step, so without this the ray would
+ * stride right over them and they'd come out dotty. The band is wide enough
+ * that any step able to reach the rim already starts inside it. */
+#define MARCH_DETAIL_REACH 1.30f
+#define MARCH_DETAIL_DT (SUN_R * CHROMOS_THICK * 0.5f) /* ~2 samples across the rim */
+#define TRANSMITTANCE_CUTOFF 1e-3f /* stop a ray once almost no light is left */
+#define DENSITY_EPS 1e-6f          /* skip empty space */
+#define VIS_EPS 1e-4f              /* skip in-scatter where the sun is fully hidden */
 
-/* §1.9 eye-adaptation gate.
- *
- * Multiplier applied to corona and chromosphere emission. Computed
- * once per frame from the camera's view of the sun:
- *
- *   gate = CORONA_GATE_FLOOR + CORONA_GATE_RANGE · (1 − vis_cam_sun)
- *
- * FLOOR=0 means no halo on an unblocked sun (this file). FLOOR=0.15
- * preserves a faint baseline glow always — change one constant to
- * switch behaviour. See Tutorial 10.
- */
+/* Eye adaptation. Just like your eyes, the corona only shows once the bright
+ * sun is hidden. This gate (0..1) multiplies the corona's brightness: 0 while
+ * the sun is in view, rising to 1 at totality. Bump FLOOR up to keep a faint
+ * glow always. */
 #define CORONA_GATE_FLOOR 0.00f
 #define CORONA_GATE_RANGE 1.00f
 
-/* §1.10 surface BRDF parameters.
- *
- * LIMB_AMBIENT and LIMB_GAIN parameterise the photosphere's Eddington-
- * style limb darkening: I(μ) = AMBIENT + GAIN · μ where μ = N · V is
- * the cosine of the view angle. The disc edge (μ ≈ 0) reads at 40% of
- * the central brightness — close to real solar physics.
- *
- * Moon is Lambertian with a low albedo (lunar Bond albedo ≈ 0.12).
- * EARTH_ALBEDO_BLUE is the blue channel of the Earth's averaged
- * Rayleigh-tinted reflectance — the cool-blue tint the moon picks up
- * via earthshine. EARTHSHINE_GAIN scales the constant ambient term we
- * apply.
- */
-#define LIMB_AMBIENT 0.40f
-#define LIMB_GAIN 0.60f
-#define MOON_ALBEDO 0.12f
-#define EARTH_ALBEDO_BLUE 0.45f
-#define EARTHSHINE_GAIN 0.10f
+/* How the surfaces catch light. The sun's disc is brightest at its centre and
+ * dims toward the edge (we see through more of its hazy air there). The moon's
+ * near face is dark — turned away from the sun — so it only catches a faint
+ * cool-blue "earthshine" (light bounced off the Earth). EARTHSHINE_GAIN is kept
+ * small on purpose: the tone-mapping lifts dim values hard, so a small amount
+ * still shows; too much and the moon greys out and stops reading as a dark
+ * silhouette against the corona. */
+#define LIMB_AMBIENT 0.40f      /* sun-edge brightness (fraction of centre) */
+#define LIMB_GAIN 0.60f         /* extra brightness toward the centre */
+#define MOON_ALBEDO 0.12f       /* how reflective the moon is (it's dark) */
+#define EARTH_ALBEDO_BLUE 0.45f /* the blue tint of earthshine */
+#define EARTHSHINE_GAIN 0.04f   /* how bright the moon's earthshine glow is */
 
-/* §1.11 lunar terrain — Bailey's-bead silhouette perturbation.
- *
- * Two scales of valleys:
- *   • 14 macro valleys, ~2% deep, 0.06 rad wide, ASYMMETRIC.
- *     One per seed gets a 2.5× depth boost (the diamond ring).
- *   • 30 micro valleys, ~1% deep, 0.025 rad wide, SYMMETRIC.
- *
- * Both bake into a single 512-entry angular LUT once per seed. Bigger
- * LUT size resolves narrow micro valleys without bilinear blur.
- *
- * The asymmetry: each macro valley has a per-seed coin-flip choosing
- * which side is sharp (narrower Gaussian) and which is gradual. Beads
- * "pop in" sharply on the sharp side and fade out on the gradual side,
- * mimicking real mountain shadows.
- */
-#define LUNAR_VALLEY_COUNT 14
+/* The moon's bumpy edge. We dent its outline with valleys so that, at the
+ * moment of contact, sunlight leaks through the gaps as bright "beads". A few
+ * wide lopsided ones plus many narrow ones; one wide valley per reseed is
+ * extra-deep and makes the single bright "diamond ring" flash. The lopsided
+ * shape makes beads pop in sharply on one side and fade on the other, like
+ * real mountain shadows. All baked into one angle->dent table per reseed. */
+#define LUNAR_VALLEY_COUNT 14    /* wide valleys */
 #define LUNAR_VALLEY_DEPTH 0.020f
 #define LUNAR_VALLEY_WIDTH 0.06f
-#define LUNAR_VALLEY_ASYM 0.45f
-#define LUNAR_DIAMOND_BOOST 2.5f
+#define LUNAR_VALLEY_ASYM 0.45f   /* how lopsided each wide valley is */
+#define LUNAR_DIAMOND_BOOST 2.5f  /* the one extra-deep valley (diamond ring) */
 
-#define LUNAR_MICRO_COUNT 30
+#define LUNAR_MICRO_COUNT 30      /* narrow valleys (the smaller beads) */
 #define LUNAR_MICRO_DEPTH 0.010f
 #define LUNAR_MICRO_WIDTH 0.025f
 
-#define LUNAR_LUT_SIZE 512
+#define LUNAR_LUT_SIZE 512        /* table resolution (big enough for the narrow ones) */
 
-/* §1.12 background stars.
- *
- * Sparse pinpoint stars visible only during totality (drowned by
- * photosphere otherwise). Each star samples a blackbody at random
- * Kelvin in [STAR_K_MIN, STAR_K_MAX], log-uniform — so the field has
- * the warm-orange to cool-blue colour spread of real stars rather
- * than uniform white.
- *
- * STAR_DENSITY = 250 means roughly 1 star per 250 sky cells; tune
- * down for a denser field, up for sparser.
- */
-#define STAR_DENSITY 250
-#define STAR_OCC_VISIBLE 0.85f
-#define STAR_K_MIN 3000.0f
-#define STAR_K_MAX 30000.0f
-#define STAR_LUMA_MAX 0.04f  /* only sprinkle stars on cells dimmer than this  \
-                              */
-#define STAR_BRIGHT_MIN 0.6f /* dimmest star brightness */
-#define STAR_BRIGHT_RANGE                                                      \
-  0.4f /* brightness spread above the minimum           */
+/* Background stars — only visible during totality, when the sun isn't washing
+ * them out. Each gets a random temperature, so the field has the real warm-to-
+ * cool colour spread instead of being all white. */
+#define STAR_DENSITY 250       /* roughly one star per this many sky cells */
+#define STAR_OCC_VISIBLE 0.85f /* only show stars once the sun is this hidden */
+#define STAR_K_MIN 3000.0f     /* coolest (red) star temperature */
+#define STAR_K_MAX 30000.0f    /* hottest (blue) */
+#define STAR_LUMA_MAX 0.04f    /* only place stars on cells dimmer than this */
+#define STAR_BRIGHT_MIN 0.6f   /* dimmest star */
+#define STAR_BRIGHT_RANGE 0.4f /* brightness spread above the minimum */
 
-/* §1.13 framebuffer dimensions.
- *
- * Static — no malloc anywhere in the hot path. BUF_MAX_W/H bound the
- * per-frame g_buf array; if your terminal is bigger than that you'll
- * see clipping (rare; 400×200 is generous).
- */
+/* The off-screen image we render into before copying to the terminal. Fixed
+ * size so we never allocate while running; a terminal bigger than this just
+ * clips (rare — 400x200 is generous). */
 #define BUF_MAX_W 400
 #define BUF_MAX_H 200
 
-/* §1.14 ncurses pair IDs and ASCII glyph ramp.
- *
- * PAIR_HUD / PAIR_HINT match the project HUD convention. The cube
- * pairs occupy IDs 16..231 (216 cells of the xterm 6×6×6 cube).
- *
- * The density ramp ` .'`,-_:;~=+*oO0` uses only OPEN glyphs — no
- * filled blocks. Bright cells become points of light, not solid
- * pixels. `#` and `@` are deliberately absent.
- */
+/* Colour slots we hand to ncurses. We pack a 6x6x6 grid of 216 colours into
+ * consecutive slots from PAIR_CUBE_BASE; the low slots are the HUD. The draw
+ * characters are all "open" shapes (no solid blocks), so bright cells look
+ * like points of light rather than filled pixels. */
 enum {
   PAIR_HUD = 1,
   PAIR_HINT = 2,
@@ -353,17 +208,21 @@ enum {
 static const char k_ramp[] = " .'`,-_:;~=+*oO0";
 #define RAMP_LEN ((int)(sizeof k_ramp - 1))
 
-/* §1.15 patterns enum.
- *
- * Four moon-size / orbit-offset configurations. pattern_set (§12.2)
- * applies the corresponding moon radius and y-offset.
- */
+/* Turning a colour into a cell: snap it onto the 6-levels-per-channel grid,
+ * and draw the very brightest cells bold and the very darkest dim for a bit
+ * of extra contrast. */
+#define CUBE_SIDE 6
+#define LUMA_BOLD_THRESH 0.85f
+#define LUMA_DIM_THRESH 0.15f
+
+/* Which kind of eclipse we're showing, switched with the n / p keys. Each one
+ * just sets a different moon size or offset (see pattern_set). */
 typedef enum {
-  PATTERN_TOTAL = 0,   /* moon fully covers the sun → corona + beads      */
-  PATTERN_PARTIAL = 1, /* moon offset in y → a bite out of the disc       */
-  PATTERN_ANNULAR = 2, /* moon smaller than sun → ring of fire            */
-  PATTERN_TRANSIT = 3, /* tiny moon → a dot crossing the disc             */
-  N_PATTERNS = 4,      /* count — enables % N_PATTERNS wraparound         */
+  PATTERN_TOTAL = 0,   /* moon fully covers the sun → corona + beads */
+  PATTERN_PARTIAL = 1, /* moon rides high → just a bite out of the disc */
+  PATTERN_ANNULAR = 2, /* moon too small → a "ring of fire" left showing */
+  PATTERN_TRANSIT = 3, /* tiny moon → a dot crossing the disc */
+  N_PATTERNS = 4,      /* how many, so the keys can wrap around */
 } Pattern;
 
 static const char *pattern_name(Pattern p) {
@@ -381,20 +240,14 @@ static const char *pattern_name(Pattern p) {
   }
 }
 
-/* §1.16 stellar classes — main-sequence spectral types.
- *
- * Each entry is a single number (Kelvin temperature). Every visible
- * colour in the scene derives from this:
- *   photosphere = blackbody(K)
- *   corona      = scattered photosphere = same chromaticity
- *   chromos/Hα  = fixed wavelength (independent of K)
- *
- * No artistic palettes here. M-DWARF gives a deep red sun, B-STAR
- * a hot blue one — these are real spectral types.
- */
+/* A type of star, named by its real astronomy class, with one number: how hot
+ * it is (in Kelvin). That temperature alone decides the sun's colour — and
+ * since the corona is just scattered sunlight, its colour too. So a cool star
+ * gives a deep-red sun and a hot one a blue sun, all from real physics, no
+ * hand-picked palettes. Cycled with t / T. */
 typedef struct {
   const char *name;
-  float kelvin;
+  float kelvin; /* temperature; drives every colour in the scene */
 } Star;
 
 static const Star STARS[] = {
@@ -403,42 +256,18 @@ static const Star STARS[] = {
 };
 #define N_STARS ((int)(sizeof STARS / sizeof STARS[0]))
 
-/* ── §2 PERFORMANCE — monotonic clock + sleep
- * ──────────────────────────────────────────────── *
- *
- * Two primitives: read the monotonic clock as nanoseconds, sleep for
- * a duration in nanoseconds. Both use POSIX functions; nanosleep
- * blocks the calling thread until the time elapses. We use the
- * monotonic clock (not wall clock) so suspend/resume of the laptop
- * doesn't produce frame jumps.
- */
+/* §2 — keeping time: a steady nanosecond clock and a plain sleep, used to pace
+ * the loop. The clock only moves forward, so timing never glitches if the
+ * system clock gets adjusted. */
 
-/*
- * clock_ns — nanoseconds since an arbitrary monotonic epoch.
- *
- * Purpose:    return a steadily-increasing time value that doesn't
- *             jump when wall-clock changes happen (NTP, DST).
- * Returns:    int64_t, ns since epoch (the value's absolute meaning
- *             doesn't matter; only differences are meaningful).
- * Why:        the simulation's accumulator-based loop in §16 needs
- *             a robust dt source. CLOCK_MONOTONIC is that.
- */
 static int64_t clock_ns(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
   return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-/*
- * clock_sleep_ns — sleep for `ns` nanoseconds, no-op for non-positive.
- *
- * Purpose:    yield CPU until ns have elapsed. Returns early on signal
- *             interruption (we don't care; the main loop re-paces).
- * Inputs:     ns  duration to sleep (nanoseconds). Negative or zero
- *                 returns immediately.
- * Why:        used by the main loop to cap the maximum FPS — without
- *             it we'd burn 100% of a CPU core.
- */
+/* sleep this long (does nothing for zero/negative); the loop uses it to avoid
+ * pinning a CPU core at full speed */
 static void clock_sleep_ns(int64_t ns) {
   if (ns <= 0)
     return;
@@ -449,26 +278,9 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ── §3 LOGIC: math + colour helpers + tone map (pure)
- * ────────────────────────────────────────────────── *
- *
- * Vector arithmetic on V3, channel-wise arithmetic on RGB, plus tone-
- * mapping helpers and a blackbody-temperature → RGB approximation.
- * Everything is `static inline` because all of these are called in
- * tight loops — the path tracer dispatches thousands of v3_dot, v3_sub
- * calls per frame.
- *
- * We use sqrtf (single-precision) throughout. The path tracer doesn't
- * benefit from double-precision accuracy in this resolution regime.
- */
-
-/* §3.1 V3 ops — geometric primitives.
- *
- * Constructor, addition, subtraction, scalar multiplication, dot
- * product, length, normalisation. v3_norm clamps zero-length vectors
- * to (0,0,0) instead of dividing by zero — used in a few places where
- * a chord might collapse during the orbit.
- */
+/* §3 — small maths: 3-D vectors, colour arithmetic, and the helpers that turn
+ * a finished HDR colour into something a screen can show. All tiny and called
+ * a lot, so they're inline. */
 
 static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
 static inline V3 v3_add(V3 a, V3 b) {
@@ -484,17 +296,10 @@ static inline float v3_dot(V3 a, V3 b) {
 static inline float v3_len(V3 a) { return sqrtf(v3_dot(a, a)); }
 static inline V3 v3_norm(V3 a) {
   float l = v3_len(a);
-  if (l < 1e-12f)
+  if (l < 1e-12f) /* guard against a zero-length vector */
     return v3(0, 0, 0);
   return v3_scl(a, 1.0f / l);
 }
-
-/* §3.2 RGB ops — channel-wise arithmetic.
- *
- * RGB is HDR (channels can exceed 1.0). rgb_mul is component-wise
- * multiplication, used for things like "sun colour × Earth albedo →
- * earthshine tint".
- */
 
 static inline RGB rgb_make(float r, float g, float b) { return (RGB){r, g, b}; }
 static inline RGB rgb_add(RGB a, RGB b) {
@@ -507,23 +312,12 @@ static inline RGB rgb_scl(RGB a, float s) {
   return rgb_make(a.r * s, a.g * s, a.b * s);
 }
 
-/* §3.3 tone-map + gamma + luma.
- *
- * Reinhard tone-map: c' = c / (1+c). Maps [0, ∞) → [0, 1) — saturates
- * toward 1 as input grows. Gamma 1/2.2 is the standard sRGB encoding
- * approximation. luma_of uses Rec.601 weights to convert RGB to a
- * single brightness.
- *
- * These are the FINAL pipeline stage between HDR-radiance and the
- * 6×6×6 cube + glyph. paint_cell (§5.2) is the only call site.
- */
-
 static inline float clamp01(float x) {
   return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
 }
-/* wrap_pi - fold an angle into (-pi, pi]. The buried concept behind the
- * `while (dphi > pi) dphi -= 2pi` idiom repeated by the lunar LUT (§7) and
- * the prominence sum (§9): periodic angular distance on a circle. */
+/* fold an angle back into the -180°..180° range — i.e. the shortest way round
+ * a circle. Used wherever we measure angular distance (the moon's bumpy edge,
+ * the prominences). */
 static inline float wrap_pi(float a) {
   while (a > (float)M_PI)
     a -= 2.0f * (float)M_PI;
@@ -531,38 +325,20 @@ static inline float wrap_pi(float a) {
     a += 2.0f * (float)M_PI;
   return a;
 }
+/* gently squash very bright values into 0..1 so nothing blows out to white */
 static inline float reinhard(float x) { return x / (1.f + x); }
+/* nudge brightness to match how a screen actually shows it */
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
+/* how bright a colour looks to the eye (green counts most) */
 static inline float luma_of(RGB c) {
   return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
 }
 
-/* §3.4 blackbody → RGB (Tanner Helland approximation).
- *
- * Purpose:     convert a temperature in Kelvin to an sRGB chromaticity.
- *              Used for the photosphere (sun_em), background star
- *              colours, and indirectly the corona (it scatters
- *              photospheric light unchanged in chromaticity).
- * Inputs:      kelvin  temperature, K. Useful range 1000–40000.
- * Returns:     RGB ∈ [0, 1] — chromaticity, NOT photometric brightness.
- *
- * Why:         every colour in the scene comes from this function. The
- *              piecewise approximation is from Tanner Helland (2012),
- *              accurate enough for visual chromaticity given the 6×6×6
- *              cube's quantisation budget. Higher precision (Planck
- *              integrated against CIE matching functions) wouldn't
- *              survive cube quantisation.
- *
- * Pseudocode:
- *      K = kelvin / 100   (scaled, for the piecewise)
- *      r = 1                                    if K ≤ 66
- *          329.7 · (K-60)^(-0.1332)             otherwise   (cap at 1)
- *      g = piecewise log/power formulae
- *      b = 0   if K ≤ 19
- *          1   if K ≥ 66
- *          piecewise log formula otherwise
- *      return clamp01(r), clamp01(g), clamp01(b)
- */
+/* The colour something glows at a given temperature: cool is red, hot is blue
+ * (think of heated metal). This is where every colour in the scene starts —
+ * the sun, the stars, and the corona that scatters the sun's light. The magic
+ * numbers are a well-known curve fit (Tanner Helland, 2012); it gives the hue,
+ * not the brightness. */
 static RGB blackbody_rgb(float kelvin) {
   float K = kelvin / 100.0f;
   float r, g, b;
@@ -587,26 +363,12 @@ static RGB blackbody_rgb(float kelvin) {
   return rgb_make(clamp01(r), clamp01(g), clamp01(b));
 }
 
-/* ── §4 LOGIC: rng + noise — Perlin/fBm (pure); perm_shuffle seeds the table at
- * init/reseed ──────────────────────────────────────────────────── *
- *
- * Two RNG primitives: a 3-D integer hash for deterministic per-cell /
- * per-seed values (used for star positions, lunar valley parameters,
- * prominence layouts), and Perlin noise / fBm for the chromosphere
- * spicule texture (§9.4).
- *
- * The Perlin permutation table `perm[]` is shuffled per seed so the
- * spicule pattern changes when the user presses 'r'.
- */
+/* §4 — randomness: a hash that turns a few integers into a repeatable random
+ * number (for star spots, valley shapes, prominence placement), plus Perlin
+ * noise — smooth natural-looking randomness — for the hairy texture on the red
+ * rim. The noise table is reshuffled on reseed ('r') so each look is new. */
 
-/* §4.1 integer hash → uint32 / float.
- *
- * hash3 mixes three 32-bit integers into one. Used pervasively for
- * "give me a deterministic pseudo-random number for this combination
- * of indices and seed". Same inputs always produce the same output;
- * different inputs produce well-distributed outputs.
- */
-
+/* scramble three integers into one repeatable random number */
 static inline uint32_t hash3(int wx, int wy, int wz) {
   uint32_t h = (uint32_t)wx * 73856093u ^ (uint32_t)wy * 19349663u ^
                (uint32_t)wz * 83492791u;
@@ -618,21 +380,18 @@ static inline uint32_t hash3(int wx, int wy, int wz) {
   return h;
 }
 
+/* turn a scrambled number into a random float from 0 up to (not quite) 1 */
 static inline float hash01(uint32_t h) {
   return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
 }
 
-/* §4.2 Perlin noise.
- *
- * Standard 2-D Perlin noise. The permutation table `perm[]` is filled
- * by perm_shuffle from a seed; perlin2d does gradient-based smooth
- * interpolation via fade_q (the quintic 6t⁵-15t⁴+10t³ smoothstep).
- *
- * Output range: roughly (-1, 1); we re-scale to (0, 1) inside fbm2.
- */
+/* Perlin noise machinery. The maths is standard Perlin — look it up if
+ * curious; here it's a black box that returns a smooth random value. The
+ * shuffled table below is what makes each reseed look different. */
 
-static uint8_t perm[512];
+static uint8_t perm[512]; /* the noise's shuffled lookup table */
 
+/* reshuffle the noise table so reseeding ('r') gives a fresh texture */
 static void perm_shuffle(int seed) {
   uint8_t base[256];
   for (int i = 0; i < 256; i++)
@@ -664,6 +423,7 @@ static inline float grad2(int hash, float x, float y) {
   return ((h & 1) ? -u : u) + ((h & 2) ? -2.f * v : 2.f * v);
 }
 
+/* smooth pseudo-random value at point (x,y), wobbling around 0 */
 static float perlin2d(float x, float y) {
   int X = (int)floorf(x) & 255;
   int Y = (int)floorf(y) & 255;
@@ -679,14 +439,7 @@ static float perlin2d(float x, float y) {
   return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
 }
 
-/* §4.3 fractal Brownian motion (fBm).
- *
- * Three octaves of Perlin summed with halving amplitude and doubling
- * frequency — the standard cloud-noise recipe. Returns a value in
- * [0, 1]. Used by emission_at (§9.4) for chromosphere spicule
- * texture.
- */
-
+/* stack a few sizes of Perlin noise for richer, cloud-like detail; 0..1 */
 static float fbm2(float x, float y) {
   float total = 0.f, amp = 1.f, freq = 1.f, max_amp = 0.f;
   for (int o = 0; o < 3; o++) {
@@ -698,33 +451,14 @@ static float fbm2(float x, float y) {
   return (total / max_amp) * 0.5f + 0.5f;
 }
 
-/* ── §5 RENDER: terminal painting — colour init + cell paint
- * ────────────────────────────────────────────── *
- *
- * Final stage of the pipeline: take an HDR RGB radiance value and
- * write a glyph-with-colour to the terminal cell. Two functions:
- * color_init sets up the ncurses pair table at startup; paint_cell
- * does the per-cell tone-map → cube-quantise → glyph-pick at the end
- * of every frame.
- *
- * On 256-colour terminals we use a 6×6×6 RGB cube (216 pairs) plus
- * four named pairs for the HUD. On 8-colour terminals we fall back to
- * a single yellow-on-default pair for the whole scene — the eclipse
- * still works visually, just mono-yellow.
- */
+/* §5 — putting colour on screen. A terminal can't show arbitrary colours, so
+ * we set up a fixed 6×6×6 grid of 216 colours once, then snap each computed
+ * colour to the nearest one. Old 8-colour terminals fall back to plain yellow
+ * — the eclipse still reads, just monochrome. */
 
-static int g_256; /* 1 if terminal supports 256 colours */
+static int g_256; /* true if the terminal has the full 256-colour set */
 
-/*
- * color_init — set up ncurses pair table.
- *
- * Purpose:     define COLOR_PAIR ids 1..231 with sensible foreground
- *              colours. Called once at startup from screen_init.
- * Inputs:      none (uses the global ncurses state set by start_color).
- * Why:         paint_cell needs the cube pairs pre-defined; the HUD
- *              uses PAIR_HUD / PAIR_HINT / PAIR_EVENT_HOT. Doing this
- *              once keeps the per-cell paint cheap.
- */
+/* claim the colour slots once at startup, so painting each cell is cheap */
 static void color_init(void) {
   start_color();
   use_default_colors();
@@ -743,114 +477,61 @@ static void color_init(void) {
   }
 }
 
+/* paint_cell's pipeline, as named steps. */
+
+/* snap one display-encoded channel [0,1] to a cube axis 0..CUBE_SIDE-1 */
+static inline int cube_axis(float c) {
+  int q = (int)(c * (float)(CUBE_SIDE - 1) + 0.5f);
+  return q < 0 ? 0 : (q > CUBE_SIDE - 1 ? CUBE_SIDE - 1 : q);
+}
+
+/* display-encoded RGB → its slot in the 6×6×6 colour cube */
+static inline int rgb_to_cube_pair(float r, float g, float b) {
+  return PAIR_CUBE_BASE + cube_axis(r) * CUBE_SIDE * CUBE_SIDE +
+         cube_axis(g) * CUBE_SIDE + cube_axis(b);
+}
+
+/* brightness → density glyph (faint space..bright '0') */
+static inline char ramp_glyph(float luma) {
+  int ri = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
+  return k_ramp[ri < 0 ? 0 : (ri >= RAMP_LEN ? RAMP_LEN - 1 : ri)];
+}
+
+/* brightness → bold for the brightest cells, dim for the darkest */
+static inline int luma_to_attr(float luma) {
+  return (luma > LUMA_BOLD_THRESH)  ? A_BOLD
+         : (luma < LUMA_DIM_THRESH) ? A_DIM
+                                    : A_NORMAL;
+}
+
 /*
- * paint_cell — write one terminal cell from an HDR RGB value.
- *
- * Purpose:     end-of-pipeline conversion of HDR float radiance to a
- *              coloured glyph in the terminal at (sx, sy).
- * Inputs:      sx, sy   screen position (cell coordinates)
- *              col      HDR RGB radiance (channels can exceed 1.0)
- *
- * Pseudocode:
- *      r,g,b = gamma_enc(reinhard(col.{r,g,b}))
- *      luma  = 0.2126·r + 0.7152·g + 0.0722·b
- *      glyph = k_ramp[ round(luma · (RAMP_LEN − 1)) ]
- *      r5,g5,b5 = round(r/g/b · 5)        ∈ [0,5]
- *      pair  = PAIR_CUBE_BASE + r5·36 + g5·6 + b5
- *      attr  = A_BOLD if luma > 0.85 else A_DIM if luma < 0.15 else 0
- *      mvaddch(sy, sx, glyph) with COLOR_PAIR(pair) | attr
- *
- * Mental model: we're projecting an HDR point in colour space onto
- * one of 216 cube cells, then choosing a brightness glyph and a font
- * weight based on luma. The cube pair governs hue; the glyph governs
- * brightness; A_BOLD/A_DIM bumps brightness slightly at the extremes.
- *
- * Why: the only place HDR meets the terminal. If you want to add a
- * bloom pass or post-process, this is where it would land — but
- * currently we go straight from g_buf to mvaddch.
+ * paint_cell — the only place a computed colour meets the terminal. First tame
+ * its brightness into a showable range, then pick the nearest grid colour for
+ * the hue and a character for the brightness. (Any post-process would go here.)
  */
 static void paint_cell(int sx, int sy, RGB col) {
-  float r = gamma_enc(reinhard(col.r));
-  float g = gamma_enc(reinhard(col.g));
-  float b = gamma_enc(reinhard(col.b));
-  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-  int ri = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
-  if (ri < 0)
-    ri = 0;
-  if (ri >= RAMP_LEN)
-    ri = RAMP_LEN - 1;
+  RGB enc = rgb_make(gamma_enc(reinhard(col.r)), gamma_enc(reinhard(col.g)),
+                     gamma_enc(reinhard(col.b)));
+  float luma = luma_of(enc);
+  char glyph = ramp_glyph(luma);
 
   if (g_256) {
-    int r5 = (int)(r * 5.f + 0.5f);
-    if (r5 > 5)
-      r5 = 5;
-    if (r5 < 0)
-      r5 = 0;
-    int g5 = (int)(g * 5.f + 0.5f);
-    if (g5 > 5)
-      g5 = 5;
-    if (g5 < 0)
-      g5 = 0;
-    int b5 = (int)(b * 5.f + 0.5f);
-    if (b5 > 5)
-      b5 = 5;
-    if (b5 < 0)
-      b5 = 0;
-    int pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
-    int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
+    int pair = rgb_to_cube_pair(enc.r, enc.g, enc.b);
+    int attr = luma_to_attr(luma);
     attron(COLOR_PAIR(pair) | attr);
-    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    mvaddch(sy, sx, (chtype)(unsigned char)glyph);
     attroff(COLOR_PAIR(pair) | attr);
   } else {
     attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
-    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    mvaddch(sy, sx, (chtype)(unsigned char)glyph);
     attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
   }
 }
 
-/* ── §6 LOGIC: ray-sphere intersection (pure)
- * ──────────────────────────────────────── *
- *
- * Analytic intersection of a unit-length ray with a sphere. The math
- * is the quadratic in disguise (Tutorial 3); this is the workhorse of
- * the path tracer's primary-ray hit test against the photosphere
- * sphere. The moon uses a perturbed variant in §7 that calls into the
- * lunar terrain LUT.
- *
- * If the ray misses or both hit-times are behind the camera, returns
- * false and *out_t is unchanged. Otherwise *out_t is the nearest hit
- * t-value (t > 1e-3 to keep us off self-intersection at the surface).
- */
-
-/*
- * ray_sphere — analytic ray-vs-sphere with unit direction.
- *
- * Purpose:     test whether a ray from `ro` in direction `rd` (|rd|=1)
- *              hits the sphere of radius `r` centred at `c`, and if
- *              so, return the nearest valid hit-time.
- *
- * Pseudocode:
- *      oc = ro − c
- *      b  = oc · rd
- *      cc = oc·oc − r·r
- *      disc = b·b − cc
- *      if disc < 0: miss
- *      sq = √disc
- *      t  = −b − sq                ← near intersection
- *      if t < ε: t = −b + sq       ← try far intersection
- *      if t < ε: still behind     → miss
- *      *out_t = t; return true
- *
- * Inputs:      ro      ray origin (world units)
- *              rd      ray direction, must be unit length
- *              c       sphere centre (world)
- *              r       sphere radius (world units)
- *              out_t   filled with hit parameter on hit
- * Returns:     true on hit, false on miss or all-behind
- *
- * Why: the photosphere is the only purely-spherical primitive we hit
- * in the eye-ray pass. The moon needs a perturbed variant — see §7.
- */
+/* §6 — does a ray hit a sphere? This is the "where does a line cross a ball"
+ * test, used for the sun. It hands back the distance to the nearest hit in
+ * front of us (in *out_t), or false if the ray sails past. The moon gets a
+ * bumpy-edge variant in §7. */
 static bool ray_sphere(V3 ro, V3 rd, V3 c, float r, float *out_t) {
   V3 oc = v3_sub(ro, c);
   float b = v3_dot(oc, rd);
@@ -868,60 +549,21 @@ static bool ray_sphere(V3 ro, V3 rd, V3 c, float r, float *out_t) {
   return true;
 }
 
-/* ── §7 WORLDGEN + LOGIC: lunar terrain — build_lunar_lut seeds the bead
- * silhouette (init/reseed); lunar_R_at/ray_moon pure ─────────────────────── *
- *
- * The moon isn't a perfect sphere visually — it has mountains and
- * valleys around its limb. Real Bailey's beads come from light
- * leaking through valleys at the totality boundary. We model this
- * with a per-direction radius perturbation (Tutorial 8):
- *
- *      moon_R(direction) = moon_R_base · (1 − valley_depth(phi))
- *
- * `phi` is the angle from +x axis to the perpendicular projection of
- * `direction` onto the moon's silhouette plane (the xy plane in world
- * coordinates, since we look down +z). 14+30 valleys are baked into a
- * 512-entry LUT once per seed.
- *
- * §7 has three pieces:
- *   §7.1 build_lunar_lut — construct the LUT from per-seed valley params
- *   §7.2 lunar_R_at      — runtime O(1) lookup with bilinear interp
- *   §7.3 ray_moon        — perturbed ray-sphere using the LUT
- */
+/* §7 — the moon's bumpy edge. A real moon has mountains and valleys around
+ * its rim, and that's what makes the beads of light: at the moment the sun is
+ * almost covered, sunlight leaks through the low spots. We fake it by letting
+ * the moon's radius dip a little depending on direction. All the dips are
+ * worked out once per reseed and stored in a table indexed by angle around the
+ * rim; the runtime lookup is then instant. */
 
-static float lunar_lut[LUNAR_LUT_SIZE];
+static float lunar_lut[LUNAR_LUT_SIZE]; /* angle-around-the-rim → how much the radius dips */
 
-/* §7.1 build_lunar_lut.
- *
- * Purpose:     bake 14 macro + 30 micro valleys into a single 512-entry
- *              angular table. After this, lunar_R_at is a constant-time
- *              lookup with no exp() calls.
- *
- * Pseudocode:
- *      pick a per-seed diamond-ring index ∈ [0, 14)
- *      for each macro k ∈ [0, 14):
- *          phi_k       = random angle around limb
- *          base_width  = LUNAR_VALLEY_WIDTH · (0.5..1.5)
- *          asym_sign   = ±1 (per seed)
- *          w_left      = base_width · (1 + asym · 0.45)
- *          w_right     = base_width · (1 − asym · 0.45)
- *          depth       = LUNAR_VALLEY_DEPTH · (0.4..1.0)
- *          if k == diamond_idx:
- *              depth *= LUNAR_DIAMOND_BOOST
- *      for each micro k ∈ [0, 30):
- *          ... narrower symmetric Gaussians ...
- *      for each LUT cell i:
- *          phi   = ((i / LUT_SIZE) · 2π) − π
- *          total = sum over macros (asym Gaussian) + sum over micros
- *          lunar_lut[i] = total
- *
- * Inputs:      seed   integer; same seed produces same valley layout.
- * Why:         baking once at reseed makes the runtime cost zero, and
- *              the bilinear interp at lookup gives sub-cell precision
- *              when the 0.06-rad valleys are ~10 LUT cells wide.
- */
+/* Work out the moon's dented outline for this reseed and bake it into the
+ * table. Scatter the wide and narrow valleys at random angles, make one wide
+ * one extra-deep (the diamond ring), then fill each table slot with the total
+ * dip at that angle. Same seed → same outline. */
 static void build_lunar_lut(int seed) {
-  /* Macro valleys (wide, asymmetric, the main silhouette features). */
+  /* The wide, lopsided valleys — the main dents in the outline. */
   float phi_v[LUNAR_VALLEY_COUNT];
   float w2_left_v[LUNAR_VALLEY_COUNT];
   float w2_right_v[LUNAR_VALLEY_COUNT];
@@ -938,8 +580,8 @@ static void build_lunar_lut(int seed) {
     phi_v[k] = (hash01(h) - 0.5f) * 2.0f * (float)M_PI;
     float w_base = LUNAR_VALLEY_WIDTH * (0.5f + 1.0f * hash01(h ^ 0xE1u));
 
-    /* Asymmetry: one side narrower (sharp), one wider (gradual).
-     * `asym_sign` ∈ {-1, +1} chooses which side is sharp per seed. */
+    /* one side steep, one side gradual — beads pop in sharply on the steep
+     * side and fade out on the gradual side, like real mountain shadows */
     float asym_sign = (hash01(h ^ 0xAA00u) > 0.5f) ? 1.0f : -1.0f;
     float w_left = w_base * (1.0f + asym_sign * LUNAR_VALLEY_ASYM);
     float w_right = w_base * (1.0f - asym_sign * LUNAR_VALLEY_ASYM);
@@ -952,7 +594,7 @@ static void build_lunar_lut(int seed) {
     d_v[k] = d_k;
   }
 
-  /* Micro valleys (narrow, symmetric — sharper beads). */
+  /* The narrow valleys — the smaller, crisper beads. */
   float phi_s[LUNAR_MICRO_COUNT];
   float w2_s[LUNAR_MICRO_COUNT];
   float d_s[LUNAR_MICRO_COUNT];
@@ -969,13 +611,13 @@ static void build_lunar_lut(int seed) {
                 (float)M_PI; /* phi ∈ [-π, π) */
 
     float total = 0.0f;
-    /* Macro contribution — asymmetric Gaussian. */
+    /* add up the wide valleys (each steeper on one side) */
     for (int k = 0; k < LUNAR_VALLEY_COUNT; k++) {
       float dphi = wrap_pi(phi - phi_v[k]);
       float w2 = (dphi < 0.0f) ? w2_left_v[k] : w2_right_v[k];
       total += d_v[k] * expf(-(dphi * dphi) / w2);
     }
-    /* Micro contribution — symmetric. */
+    /* add up the narrow valleys */
     for (int k = 0; k < LUNAR_MICRO_COUNT; k++) {
       float dphi = wrap_pi(phi - phi_s[k]);
       total += d_s[k] * expf(-(dphi * dphi) / w2_s[k]);
@@ -984,27 +626,8 @@ static void build_lunar_lut(int seed) {
   }
 }
 
-/* §7.2 lunar_R_at.
- *
- * Purpose:     given a unit vector pointing from moon centre toward a
- *              chord's closest-approach point, return the moon's
- *              effective radius along that direction.
- *
- * Pseudocode:
- *      phi   = atan2(from_centre.y, from_centre.x)
- *      u     = (phi + π) / (2π) · LUT_SIZE         ← LUT index, real
- *      i0    = floor(u);  i1 = (i0 + 1) mod LUT_SIZE
- *      depth = lunar_lut[i0]·(1−frac) + lunar_lut[i1]·frac
- *      return moon_R_base · (1 − depth)
- *
- * Inputs:      from_centre  unit V3; the silhouette direction
- *              moon_R_base  unperturbed radius (world units)
- *              seed         unused at runtime (baked into the LUT)
- *
- * Why: the cost-aware wrapper around the LUT. Called from ray_moon
- * (§7.3) at the closest-approach point of a chord. Bilinear lookup
- * ensures smooth transitions between LUT cells.
- */
+/* Look up the moon's dented radius toward a given point on its rim, blending
+ * smoothly between the two nearest table entries. */
 static float lunar_R_at(V3 from_centre, float moon_R_base, int seed) {
   (void)seed; /* baked into the LUT at build time */
   float phi = atan2f(from_centre.y, from_centre.x); /* (-π, π] */
@@ -1020,45 +643,17 @@ static float lunar_R_at(V3 from_centre, float moon_R_base, int seed) {
   return moon_R_base * (1.0f - depth);
 }
 
-/* §7.3 ray_moon — perturbed ray-vs-moon intersection.
- *
- * Purpose:     test a ray against the moon, using the lunar terrain LUT
- *              to vary the moon's effective radius with direction.
- *
- * The fast path:
- *      Compute b, oc² as in ray_sphere.
- *      Test against the UNPERTURBED moon_R_base sphere first.
- *      If miss → return false (cheap reject — no LUT lookup).
- *      Since lunar valleys only REDUCE radius (depth ≥ 0), missing the
- *      base sphere implies missing any perturbed variant.
- *
- * If the cheap reject doesn't fire, do the perturbed test:
- *      Compute closest-approach point along the chord to moon centre.
- *      Use it as the silhouette direction → lunar_R_at returns r_eff.
- *      Test against r_eff sphere. If hit, return nearest valid t.
- *
- * Without the cheap reject, every NEE chord would do a 14+30 = 44-
- * Gaussian evaluation on the LUT lookup path. With it, ~80% of NEE
- * chords miss the unperturbed sphere and never touch the LUT.
- *
- * Inputs:      ro            ray origin
- *              rd            ray direction (unit)
- *              c             moon centre (world)
- *              moon_R_base   unperturbed moon radius
- *              seed          unused at runtime
- *              out_t         filled with hit parameter on hit
- * Returns:     true on hit (perturbed sphere), false on miss.
- *
- * Why: the EYE-RAY hit test for the moon. The NEE penumbra calculation
- * uses §8 instead — there the moon-disc-vs-sun-disc geometry is the
- * point, and the penumbra formula handles partial coverage analytically.
- */
+/* Does this ray hit the (dented) moon? First a quick test against a plain
+ * round moon — if that misses, the dented one misses too (the dents only ever
+ * cut inward), so we skip the costly lookup. Otherwise we re-test against the
+ * dented radius right where the ray grazes the edge. This is the eye-ray test;
+ * the soft shadow edge uses §8 instead. */
 static bool ray_moon(V3 ro, V3 rd, V3 c, float moon_R_base, int seed,
                      float *out_t) {
   V3 oc = v3_sub(ro, c);
   float b = v3_dot(oc, rd);
 
-  /* Cheap reject against base sphere. */
+  /* quick miss-test against a plain round moon first */
   float oc2 = v3_dot(oc, oc);
   float r2 = moon_R_base * moon_R_base;
   float disc = b * b - (oc2 - r2);
@@ -1069,7 +664,7 @@ static bool ray_moon(V3 ro, V3 rd, V3 c, float moon_R_base, int seed,
   if (t_far < 1e-3f)
     return false;
 
-  /* Now evaluate perturbation. */
+  /* it's near the moon — re-test against the dented edge right here */
   V3 nearest = v3_add(ro, v3_scl(rd, -b));
   V3 radial = v3_sub(nearest, c);
   float r_eff = lunar_R_at(v3_norm(radial), moon_R_base, seed);
@@ -1088,62 +683,15 @@ static bool ray_moon(V3 ro, V3 rd, V3 c, float moon_R_base, int seed,
   return true;
 }
 
-/* ── §8 LOGIC: penumbra — analytic visible sun-disc fraction (pure)
- * ─────────────── *
- *
- * The path tracer's NEE step (§11) needs to know, at every scatter
- * point, how much of the sun's apparent disc is unblocked by the
- * moon. A binary "is the moon between me and the sun?" test would
- * give a hard cliff at the moon's edge — wrong; real penumbra is a
- * smooth gradient. We compute the gradient analytically as the
- * fraction of the sun's apparent disc area not covered by the moon's.
- *
- * From a scatter point p, both sun and moon look like circular discs
- * on the unit sphere around p. For small angular extents (a few
- * degrees, true here) the spherical geometry approximates well as
- * planar circles in a tangent plane — circle-circle intersection has
- * a closed form.
- */
+/* §8 — how much of the sun a point can see. From a spot out in the corona,
+ * the sun and moon both look like little discs in the sky; this works out what
+ * fraction of the sun's disc the moon is covering. Doing it as a smooth
+ * fraction (rather than a yes/no "blocked?") is what gives the shadow a soft,
+ * gradual edge instead of a hard line. */
 
-/*
- * visible_fraction_sun — analytic [0..1] visibility of the sun.
- *
- * Purpose:     return the unobstructed fraction of the sun's apparent
- *              disc as seen from world point p, given the moon
- *              partially occludes it. Replaces a binary moon-block
- *              test in NEE — gives smooth penumbra.
- *
- * Math:
- *      α_sun  = asin(SUN_R  / |sun − p|)        sun's angular radius
- *      α_moon = asin(moon_R / |moon − p|)       moon's
- *      γ      = angle between (sun − p) and (moon − p)
- *
- *      γ ≥ α_sun + α_moon                     → visible = 1
- *      γ ≤ |α_sun − α_moon| AND α_moon ≥ α_sun → visible = 0    (total)
- *      γ ≤ |α_sun − α_moon| AND α_moon <  α_sun → visible = 1−(α_moon/α_sun)²
- *                                                               (annular)
- *      else: partial overlap → overlap = circle_overlap_area(γ, α_sun, α_moon)
- *                              visible = 1 − overlap / (π · α_sun²)
- *
- * Inputs:      p          world point we're sampling visibility from
- *              sun_pos    sun centre (world)
- *              moon_pos   moon centre (world)
- *              moon_R     moon radius (world; pass scene_moon_r value)
- * Returns:     visible fraction ∈ [0, 1]; clamped on output.
- *
- * Why: Bailey's beads come from EYE-RAY perturbations (§7.3); penumbra
- * comes from NEE scattering. Different physics, different code paths,
- * but they compose: the eye ray hits the perturbed moon (beads); the
- * NEE-from-corona chords use the unperturbed disc here (smooth
- * penumbra). Trying to combine both into one function gives tangled
- * formulas; separate is cleaner.
- */
-
-/* circle_overlap_area - area of the lens where two circles overlap: radii
- * r1/r2 with centre-distance d (angle units here). Closed-form circle-circle
- * intersection = two circular segments minus the shared triangle (the Heron
- * product under the root). Caller guarantees the partial regime
- * |r1-r2| < d < r1+r2. Ref: circle-circle intersection area. */
+/* Area of the lens-shaped sliver where two overlapping circles meet (radii
+ * r1, r2, centre-to-centre distance d). The caller only calls this when the
+ * circles genuinely partly overlap. */
 static float circle_overlap_area(float d, float r1, float r2) {
   float r1s = r1 * r1, r2s = r2 * r2;
   float a1_arg = (d * d + r1s - r2s) / (2.0f * d * r1);
@@ -1171,6 +719,8 @@ static float circle_overlap_area(float d, float r1, float r2) {
   return A1 + A2 - A3;
 }
 
+/* What fraction of the sun (0..1) is visible from point p: 1 if the moon is
+ * out of the way, 0 if it fully covers it, something in between at the edge. */
 static float visible_fraction_sun(V3 p, V3 sun_pos, V3 moon_pos, float moon_R) {
   V3 to_sun_v = v3_sub(sun_pos, p);
   V3 to_moon_v = v3_sub(moon_pos, p);
@@ -1202,8 +752,7 @@ static float visible_fraction_sun(V3 p, V3 sun_pos, V3 moon_pos, float moon_R) {
     return 1.0f - r * r;
   }
 
-  /* Partial overlap: visible = 1 - (lens area / sun-disc area), in angle space.
-   */
+  /* the edge case: how much of the sun's disc the moon's disc covers */
   float overlap = circle_overlap_area(gamma, a_sun, a_moon);
   float sun_a = (float)M_PI * a_sun * a_sun;
   if (sun_a < 1e-9f)
@@ -1211,66 +760,25 @@ static float visible_fraction_sun(V3 p, V3 sun_pos, V3 moon_pos, float moon_R) {
   return clamp01(1.0f - overlap / sun_a);
 }
 
-/* ── §9 LOGIC + DATA: coronal medium — Medium params + density/emission (pure)
- * ───────────────────────────────────────────────── *
- *
- * The medium has two parts: a spherically-symmetric component (corona +
- * chromosphere shell) and an anisotropic component (prominences). The
- * separation matters because:
- *   • The 1-D radial transmittance LUT (§10) only sees the symmetric
- *     part. Prominences are too small/sparse to affect it visibly.
- *   • Per-frame medium state (Medium struct) holds prominence parameters
- *     that change with seed; the symmetric part is hard-coded and
- *     identical every frame.
- *
- * §9 has four pieces:
- *   §9.1 Medium struct
- *   §9.2 sigma_sph         spherical scattering coefficient at radius r
- *   §9.3 sigma_prom        anisotropic prominence contribution
- *   §9.4 density_total + emission_at  — combined hot-path entry points
- */
+/* §9 — the glowing gas around the sun, and how thick and bright it is at any
+ * point. It's two parts: an even haze (the corona plus the thin red rim) that
+ * only depends on distance from the sun, and a few lopsided arcs (the
+ * prominences) on top. Keeping the even part separate is what lets §10
+ * precompute its see-through table cheaply. */
 
-/* §9.1 Medium struct.
- *
- * Per-frame state for the coronal medium. The kelvin field is stamped
- * by scene_draw with the current stellar class. Prominence parameters
- * are filled in by medium_reseed (§12.3) when 'r' is pressed.
- * Ref: solar K-corona Thomson scattering; chromosphere & prominences (solar
- *      physics); blackbody photosphere colour (§3).
- */
+/* The gas's state for this frame: the sun's temperature (which sets all the
+ * colours), plus where the prominence arcs sit and how big they are. The
+ * prominence values are rolled fresh on reseed. */
 typedef struct {
-  float kelvin;                  /* photosphere temperature        */
-  float prom_phi[PROM_COUNT];    /* angular position (rad)         */
-  float prom_height[PROM_COUNT]; /* angular reach × R_sun          */
-  float prom_amp[PROM_COUNT];    /* density multiplier             */
+  float kelvin;                  /* sun temperature; drives every colour */
+  float prom_phi[PROM_COUNT];    /* where each arc sits around the rim */
+  float prom_height[PROM_COUNT]; /* how far each reaches out */
+  float prom_amp[PROM_COUNT];    /* how dense / bright each is */
 } Medium;
 
-/* §9.2 sigma_sph — spherically-symmetric σ at radius r.
- *
- * Purpose:     return the local scattering coefficient at distance r
- *              from the sun centre, as the sum of corona power-law
- *              and chromosphere shell.
- *
- * Pseudocode:
- *      if r < R_sun  or  r > REACH·R_sun:  return 0
- *      corona = SIGMA0 · (R_sun / r)^DECAY
- *      h     = (r − R_sun) / (CHROMOS_THICK · R_sun)         ∈ [0, ?]
- *      if h ∈ [0, 1]:
- *          chromos = CHROMOS_SIGMA0 · (1−h)²        ← peaks at shell base
- *      else:
- *          chromos = 0
- *      return corona + chromos
- *
- * Inputs:      r   distance from sun centre (world units)
- * Returns:     σ at this radius, units 1/world-unit.
- *
- * Why: the only function the trans_lut (§10) integrates. Spherical
- * symmetry is what makes the LUT possible — a 1-D table τ(r). Adding
- * anisotropy here would force a 2-D or 3-D LUT with proportionally
- * larger memory; instead we keep prominences in §9.3, where they
- * contribute to the volume rendering integral as additive emission
- * but not to the radial transmittance.
- */
+/* How thick the even haze is at distance r from the sun's centre: the corona
+ * (thinning with distance) plus the thin red rim. Zero inside the sun and far
+ * out past the corona. */
 static float sigma_sph(float r) {
   if (r < SUN_R)
     return 0.0f;
@@ -1289,35 +797,9 @@ static float sigma_sph(float r) {
   return cor + chrom;
 }
 
-/* §9.3 sigma_prom — additive prominence density.
- *
- * Purpose:     return extra σ at point p_local from prominence loops.
- *              Each prominence is a 2-D Gaussian in (phi, h_above)
- *              centred at a fixed angular position with random height
- *              and amplitude.
- *
- * Pseudocode:
- *      r       = |p_local|
- *      if r < R_sun or r > (1+PROM_HEIGHT)·R_sun: return 0
- *      h_above = (r − R_sun) / R_sun         ∈ [0, PROM_HEIGHT]
- *      phi     = atan2(p_local.x, p_local.z)
- *      total   = 0
- *      for k ∈ [0, PROM_COUNT):
- *          dphi    = wrap(phi − prom_phi[k]) ∈ (−π, π]
- *          lateral = exp(−dphi² / PROM_LATERAL²)
- *          radial  = (1 − h_above/prom_height[k])² if in range else 0
- *          total += prom_amp[k] · lateral · radial
- *      return PROM_SIGMA0 · total
- *
- * Inputs:      m         medium with seed-dependent prominence params
- *              p_local   point in sun-centred coords
- * Returns:     additional σ from prominences, ≥ 0.
- *
- * Why: lets us paint a few thick "loops" of cool plasma rising from
- * the chromosphere without breaking spherical symmetry of σ_sph.
- * Prominences emit Hα strongly (see emission_at) — they're the
- * brightest features at totality apart from the photosphere itself.
- */
+/* Extra thickness from the prominence arcs at a point. Each is a soft blob at
+ * its own angle around the rim, fading out toward its own top. Added on top of
+ * the even haze, so the arcs can stick out asymmetrically. */
 static float sigma_prom(const Medium *m, V3 p_local) {
   float r = v3_len(p_local);
   if (r < SUN_R)
@@ -1344,57 +826,17 @@ static float sigma_prom(const Medium *m, V3 p_local) {
   return PROM_SIGMA0 * total;
 }
 
-/* §9.4 density_total + emission_at — the path tracer's entry points.
- *
- * density_total just sums sigma_sph(r) and sigma_prom(p) — the path
- * tracer asks for "total σ at this point" once per active step.
- *
- * emission_at returns the Hα emission radiance at p — chromosphere
- * plus prominence contributions. The chromosphere part has spicule
- * texture (fBm in spherical coords) and a hot-peak hue shift; the
- * prominence part stays at the cool baseline Hα colour.
- */
-
+/* Total gas thickness at a point — the even haze plus any prominence arcs.
+ * The marcher asks for this once per step. */
 static float density_total(const Medium *m, V3 p_local) {
   float r = v3_len(p_local);
   return sigma_sph(r) + sigma_prom(m, p_local);
 }
 
-/*
- * emission_at — local volumetric emission per unit length at p_local.
- *
- * Purpose:     return the radiance emitted per metre by the chromos-
- *              phere + prominences at world-point p_local. The corona
- *              itself doesn't emit — it only scatters photospheric
- *              light, which is handled in the path tracer's NEE step.
- *
- * Pseudocode:
- *      r = |p_local|
- *      if outside chromos+prom range: return (0,0,0)
- *      ha_cool = (1.00, 0.18, 0.12)        cool Hα baseline
- *      ha_hot  = (1.00, 0.45, 0.18)        hot peak (yellow-shifted)
- *      h = (r − R_sun) / (CHROMOS_THICK · R_sun)
- *      chr_em = 0,  spicule_n = 0
- *      if h ∈ [0, 1]:
- *          fade   = (1 − h)^4               sharp outer edge
- *          theta  = acos(p_local.y / r)
- *          phi    = atan2(p_local.x, p_local.z)
- *          spicule_n = fbm2(phi · 12, theta · 6)        ∈ [0, 1]
- *          spicule_factor = SPICULE_BASE + SPICULE_AMP · spicule_n
- *          chr_em = CHROMOS_SIGMA0 · fade · spicule_factor
- *      pr_em = sigma_prom(m, p_local)
- *      chr_col = lerp(ha_cool, ha_hot, spicule_n)        hot-peak shift
- *      return chr_col · chr_em + ha_cool · pr_em
- *
- * Inputs:      m         medium
- *              p_local   world point in sun-centred coords
- * Returns:     RGB radiance per unit length (HDR).
- *
- * Why: chromosphere isn't smooth — it's textured by spicules. fBm in
- * (theta, phi) gives radial-streak patches that map to vertical
- * streaks on the visible chromos ring. Hot peaks lean yellow because
- * real spicule heating shifts emission lines.
- */
+/* The light the gas gives off on its own at a point (the red rim and the
+ * prominences — the corona doesn't glow itself, it only scatters sunlight).
+ * The rim is textured with noise (the hairy spicules) and leans a touch yellow
+ * where it's hot; the prominences stay deep red. */
 static RGB emission_at(const Medium *m, V3 p_local) {
   float r = v3_len(p_local);
   if (r < SUN_R)
@@ -1437,44 +879,17 @@ static RGB emission_at(const Medium *m, V3 p_local) {
   return out;
 }
 
-/* ── §10 WORLDGEN + LOGIC: transmittance LUT — build_trans_lut precomputes
- * (init); lookup pure ───────────────────────────────────────────── *
- *
- * The realtime trick. The path tracer needs, at every active scatter
- * point, the transmittance from that point to the photosphere along
- * the radial inward chord. Computing it by ray-marching at runtime
- * would be O(steps²) per pixel — unaffordable. Spherical symmetry of
- * σ_sph saves us: the optical depth along the radial chord from r to
- * R_sun depends only on r. Tabulate τ(r) once at startup, lookup at
- * runtime.
- */
+/* §10 — a speed trick. As a ray crosses the corona we keep needing "how much
+ * of the sun's light makes it out to this point through the gas in the way?"
+ * Working that out fresh every time would be far too slow. But because the
+ * even haze only depends on distance from the sun, the answer only depends on
+ * how far out the point is — so we compute it once at startup for a range of
+ * distances and just look it up afterwards. */
 
-static float trans_lut[LUT_SIZE];
+static float trans_lut[LUT_SIZE]; /* how much the haze dims light, by distance from the sun */
 
-/* §10.1 build_trans_lut — precompute τ(r) at LUT_SIZE radii.
- *
- * Purpose:     fill `trans_lut[]` with the cumulative radial optical
- *              depth from R_sun out to LUT_R_MAX. Called once at
- *              startup; not seed-dependent (σ_sph doesn't change with
- *              seed).
- *
- * Pseudocode:
- *      trans_lut[0] = 0                 ← τ at r = R_sun
- *      r_prev = R_sun
- *      for i ∈ [1, LUT_SIZE):
- *          r_curr = R_sun + (LUT_R_MAX − R_sun) · (i / (LUT_SIZE − 1))
- *          ds     = (r_curr − r_prev) / N_INT       fine sub-step
- *          tau    = trans_lut[i−1]
- *          for j ∈ [0, N_INT):
- *              s    = r_prev + (j + 0.5) · ds
- *              tau += sigma_sph(s) · ds
- *          trans_lut[i] = tau
- *          r_prev = r_curr
- *
- * Inputs:      none (uses globals LUT_SIZE, LUT_R_MAX, σ_sph).
- * Why: cumulative storage means lookup_transmittance can do a
- * one-bilinear-interp constant-time fetch.
- */
+/* Fill that table once at startup by adding up the haze from each distance
+ * outward. (The haze never changes, so this never needs redoing.) */
 static void build_trans_lut(void) {
   const int N_INT = 32;
   trans_lut[0] = 0.0f;
@@ -1493,27 +908,8 @@ static void build_trans_lut(void) {
   }
 }
 
-/* §10.2 lookup_transmittance — fetch Tr at world point p_local.
- *
- * Purpose:     return exp(−τ(|p_local|)) by bilinear lookup. p_local
- *              is in sun-centred coordinates.
- *
- * Pseudocode:
- *      r = |p_local|
- *      if r < R_sun:                  return 0    (inside sun)
- *      if r > LUT_R_MAX:              return 1    (clear)
- *      fr = (r − R_sun)/(LUT_R_MAX − R_sun) · (LUT_SIZE − 1)
- *      ir = floor(fr); frac = fr − ir
- *      tau = trans_lut[ir] · (1−frac) + trans_lut[ir+1] · frac
- *      return exp(−tau)
- *
- * Inputs:      p_local   point in sun-centred coords.
- * Returns:     Tr ∈ [0, 1].
- *
- * Why: the inner-loop call from trace_ray's NEE. One memory access,
- * three multiplies, one expf — that's the entire NEE-transmittance
- * cost per active step.
- */
+/* Look up that fraction (0..1) for a point: 0 inside the sun, 1 once you're
+ * past all the gas, blended from the table in between. */
 static float lookup_transmittance(V3 p_local) {
   float r = v3_len(p_local);
   if (r < SUN_R)
@@ -1532,58 +928,21 @@ static float lookup_transmittance(V3 p_local) {
   return expf(-tau);
 }
 
-/* ── §11 LOGIC: path tracer — trace_ray (THE CORE, pure)
- * ─────────────────────────────────────────────────── *
- *
- * The kernel. One function — trace_ray — handles a complete primary
- * ray: cast it from the camera, find the nearest opaque surface,
- * march through the medium accumulating in-scattered + emitted
- * radiance, then add the surface contribution.
- *
- * The volume rendering equation (Tutorial 4) becomes:
- *
- *   radiance_accum = ∫₀^t_max T(t) · [emission(t) + scatter(t)] dt
- *                  + T(t_max) · L_surface
- *
- * where T(t) = exp(−∫₀^t σ(s) ds) is the transmittance from camera to
- * march parameter t. We approximate the integral with a Riemann sum
- * (adaptive step size; fine inside the corona's reach, 4× coarse
- * outside).
- *
- * §11 has six pieces — trace_ray plus the five helpers it composes:
- *   §11.1 thomson_phase      Thomson scattering phase function
- *   §11.2 sun_solid_angle    sun-disc solid angle (NEE geometric weight)
- *   §11.3 shade_sun_surface  photosphere limb-darkened radiance
- *   §11.4 shade_moon_surface moon Lambertian + earthshine radiance
- *   §11.5 march_medium       volumetric ray-march (in-scatter + emission)
- *   §11.6 trace_ray          the kernel — composes the above
- */
+/* §11 — the heart of the program: follow one ray and work out the colour it
+ * sees. Walk it forward in small steps; at each step add the sunlight the gas
+ * scatters toward us plus the light the gas glows with, dimming as the gas
+ * blocks more of it; then, if the ray finally lands on the sun or the moon,
+ * add that surface's colour. A few small helpers below feed into it. */
 
-/* §11.1 thomson_phase.
- *
- * Purpose:     Thomson scattering phase function at angle θ between
- *              incident and outgoing directions. Wavelength-flat
- *              (achromatic) — that's why the corona's hue follows the
- *              photosphere's exactly.
- *
- *      P_T(θ) = (3/16π) · (1 + cos²θ)
- *
- * Inputs:      cos_theta   cos of scatter angle ∈ [-1, 1]
- * Returns:     phase value, 1/sr.
- *
- * Why: NEE computes scatter-toward-eye via this phase function. Other
- * media (Mie scattering for clouds, Rayleigh for blue sky) would use
- * different phases here. Thomson is correct for free electrons in
- * the K-corona.
- */
+/* How strongly a gas particle scatters light toward us versus other angles.
+ * It doesn't favour any colour, which is exactly why the corona ends up the
+ * same colour as the sun. */
 static inline float thomson_phase(float cos_theta) {
   return (3.0f / (16.0f * (float)M_PI)) * (1.0f + cos_theta * cos_theta);
 }
 
-/* §11.2 sun_solid_angle - solid angle Omega subtended by the photosphere disc
- * at distance dist_sun. Omega = 2pi(1 - cos a), sin a = R_sun / dist: the cone
- * of directions from a corona sample that actually see the sun, i.e. the
- * geometric weight on single-scattered sunlight (NEE). */
+/* How big the sun looks in the sky from a point that far away — i.e. how much
+ * of the sky it fills. Bigger when you're closer to it. */
 static inline float sun_solid_angle(float dist_sun) {
   float sin_a = SUN_R / fmaxf(dist_sun, SUN_R + 1e-3f);
   if (sin_a > 1.0f)
@@ -1592,9 +951,8 @@ static inline float sun_solid_angle(float dist_sun) {
   return 2.0f * (float)M_PI * (1.0f - cos_a);
 }
 
-/* §11.3 shade_sun_surface - photosphere radiance for an eye ray that hits the
- * sun at t_sun. Emissive with Eddington limb darkening I(mu)=AMBIENT+GAIN*mu,
- * mu = -rd.N. Returns radiance BEFORE the remaining-transmittance factor. */
+/* The sun's surface colour where a ray hits it: bright, and a little dimmer
+ * toward the edge (we look through more of its hazy air there). */
 static RGB shade_sun_surface(V3 ro, V3 rd, V3 sun_pos, float t_sun,
                              RGB sun_em) {
   V3 p = v3_add(ro, v3_scl(rd, t_sun));
@@ -1606,10 +964,9 @@ static RGB shade_sun_surface(V3 ro, V3 rd, V3 sun_pos, float t_sun,
   return rgb_scl(sun_em, lim);
 }
 
-/* §11.4 shade_moon_surface - moon radiance for an eye ray that hits the moon at
- * t_moon. Direct Lambertian sunlight is ~0 in eclipse geometry (the near face
- * points away from the sun), so earthshine - a cool-blue ambient - fills the
- * night side. Returns radiance BEFORE the remaining-transmittance factor. */
+/* The moon's surface colour where a ray hits it. We're looking at its night
+ * side (it's between us and the sun), so the sun barely touches it; what fills
+ * the dark disc is the faint cool-blue glow bounced off the Earth. */
 static RGB shade_moon_surface(V3 ro, V3 rd, V3 sun_pos, V3 moon_pos,
                               float t_moon, RGB sun_em, RGB earth_tint) {
   V3 p = v3_add(ro, v3_scl(rd, t_moon));
@@ -1628,35 +985,43 @@ static RGB shade_moon_surface(V3 ro, V3 rd, V3 sun_pos, V3 moon_pos,
   return rgb_add(direct, earth);
 }
 
-/* §11.5 march_medium - ray-march the coronal volume from the eye to t_max,
- * accumulating single-scattered sunlight (NEE) + local Halpha emission,
- * attenuated by Beer-Lambert transmittance. *transmittance enters at the eye's
- * value and is left at the fraction surviving to t_max for the surface term.
- * Returns the accumulated in-scatter + emission radiance. */
+/* Walk a ray through the gas from the eye out to t_max, adding up the sunlight
+ * the gas scatters our way plus the light it glows with, and dimming as it
+ * goes. `transmittance` comes in as how much light still survives and is left
+ * at the fraction reaching t_max, so the caller can dim the surface behind it. */
 static RGB march_medium(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
                         float moon_R, float t_max, RGB sun_em,
                         float corona_gate, float *transmittance) {
-  /* Adaptive step: fine inside corona reach, coarse through empty space.
-   * Outside (CORONA_REACH + margin)*R_sun, sigma_sph == 0, so coarse strides
-   * through truly empty space contribute nothing regardless of length. */
+  /* Step big through empty space, smaller through the corona. Out past the
+   * corona the gas is nothing, so big strides there cost nothing. */
   float dt_fine = t_max / (float)MARCH_STEPS;
   float dt_coarse = dt_fine * MARCH_COARSE_MULT;
   float corona_outer = SUN_R * (CORONA_REACH + CORONA_FINE_MARGIN);
   float corona_outer_R2 = corona_outer * corona_outer;
+  /* The chromosphere shell and prominences are far thinner than one fine
+   * step, so close to the photosphere we step ultra-fine — otherwise the eye
+   * ray strides right over them and the red ring + prominences come out dotty
+   * and flickery. The band is wide enough that any step able to reach the
+   * shell already starts inside it (so it's ultra-fine and can't skip it). */
+  float detail_outer = SUN_R * MARCH_DETAIL_REACH;
+  float detail_outer_R2 = detail_outer * detail_outer;
 
   RGB radiance_accum = rgb_make(0.f, 0.f, 0.f);
   float t_along_ray = 0.0f;
 
   while (t_along_ray < t_max && *transmittance > TRANSMITTANCE_CUTOFF) {
-    /* Step size from distance to sun at the start of the step. */
+    /* Step size from distance to sun at the start of the step: ultra-fine in
+     * the near-surface detail band, fine through the corona, coarse outside. */
     V3 p_now = v3_add(ro, v3_scl(rd, t_along_ray));
     V3 p_now_loc = v3_sub(p_now, sun_pos);
     float r2_now = v3_dot(p_now_loc, p_now_loc);
-    float dt = (r2_now < corona_outer_R2) ? dt_fine : dt_coarse;
+    float dt = (r2_now < detail_outer_R2)   ? MARCH_DETAIL_DT
+               : (r2_now < corona_outer_R2) ? dt_fine
+                                            : dt_coarse;
     if (t_along_ray + dt > t_max)
       dt = t_max - t_along_ray;
 
-    /* Sample density at the step midpoint. */
+    /* how much gas is here, sampled at the middle of the step */
     float t_mid = t_along_ray + 0.5f * dt;
     V3 p = v3_add(ro, v3_scl(rd, t_mid));
     V3 p_local = v3_sub(p, sun_pos);
@@ -1667,7 +1032,8 @@ static RGB march_medium(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
       float dist_sun = v3_len(to_sun_v);
       V3 to_sun = v3_scl(to_sun_v, 1.0f / fmaxf(dist_sun, 1e-6f));
 
-      /* Single-scatter sunlight toward the eye (NEE), soft moon shadow. */
+      /* sunlight this bit of gas bounces toward us — but only as much sun as
+       * it can still see past the moon (that's what softens the shadow edge) */
       float vis = visible_fraction_sun(p, sun_pos, moon_pos, moon_R);
       if (vis > VIS_EPS) {
         float omega = sun_solid_angle(dist_sun);
@@ -1680,7 +1046,7 @@ static RGB march_medium(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
             radiance_accum, rgb_scl(rgb_scl(sun_em, in_sc), *transmittance));
       }
 
-      /* Local Halpha emission (chromosphere + prominences). */
+      /* light this bit of gas glows with on its own (red rim + prominences) */
       RGB em = emission_at(m, p_local);
       if (em.r + em.g + em.b > 0.f) {
         radiance_accum = rgb_add(
@@ -1688,7 +1054,7 @@ static RGB march_medium(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
             rgb_scl(em, *transmittance * dt * HA_EMIT_GAIN * corona_gate));
       }
 
-      /* Beer-Lambert extinction across this step. */
+      /* dim everything behind this step by how much gas it just passed through */
       *transmittance *= expf(-density * dt);
     }
     t_along_ray += dt;
@@ -1696,56 +1062,21 @@ static RGB march_medium(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
   return radiance_accum;
 }
 
-/* §11.6 trace_ray — the path tracer kernel.
- *
- * Purpose:     return the HDR radiance for a single eye ray from the
- *              camera through the medium, ending at sun / moon / sky.
- *
- * Inputs:
- *      ro              ray origin (= camera position, the world origin)
- *      rd              ray direction, unit length
- *      m               medium with this frame's prominence parameters
- *      sun_pos         world sun centre
- *      moon_pos        world moon centre
- *      moon_R          moon radius (after user-applied moon_scale)
- *      seed            shared with lunar terrain LUT (purely for
- *                      readability — actual data is baked into
- *                      lunar_lut at reseed time)
- *      sun_em          photospheric blackbody radiance (HDR; usually
- *                      ~SUN_EMIT_HDR × blackbody chromaticity)
- *      earth_tint      earthshine colour (blue-tinted sun_em)
- *      corona_gate     eye-adaptation multiplier ∈ [0, 1] for this frame
- *
- * Returns:     RGB pixel radiance (HDR).
- *
- * Pseudocode:
- *      hit_sun,  t_sun  = ray_sphere(ro, rd, sun_pos, SUN_R)
- *      hit_moon, t_moon = ray_moon (ro, rd, moon_pos, moon_R, seed)
- *      pick (t_max, surf_type) by nearest hit (sky -> MARCH_T_MAX)
- *
- *      transmittance = 1
- *      radiance = march_medium(...)   integrate the volume; leaves
- *                                     transmittance at the fraction of
- *                                     light still reaching t_max
- *      if hit sun:  radiance += transmittance * shade_sun_surface(...)
- *      if hit moon: radiance += transmittance * shade_moon_surface(...)
- *      return radiance                (sky: no surface term)
- *
- * Why: this is THE function. Everything else in the file is in service
- * of feeding it the right inputs and rendering its output. Read it
- * after Tutorials 4, 5, 6, 7, and 10.
- */
+/* The colour one ray sees — the whole job in one place. Find whether it hits
+ * the sun, the moon, or nothing; walk the gas up to that point adding glow and
+ * scattered light; then add the surface's colour, dimmed by whatever gas was
+ * in front of it. Everything else in the file just feeds this. */
 static RGB trace_ray(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
                      float moon_R, int seed, RGB sun_em, RGB earth_tint,
                      float corona_gate) {
-  /* Surface intersections — moon uses perturbed-radius variant for
-   * Bailey's-bead-correct silhouette (see Tutorial 8). */
+  /* what does the ray hit? (the moon uses its bumpy-edge test, for beads) */
   float t_sun = 0.f, t_moon = 0.f;
   bool hit_sun = ray_sphere(ro, rd, sun_pos, SUN_R, &t_sun);
   bool hit_moon = ray_moon(ro, rd, moon_pos, moon_R, seed, &t_moon);
 
+  /* keep the nearer hit; if it hits nothing, march out to the sky distance */
   float t_max;
-  int surf_type = 0; /* 0 sky · 1 sun · 2 moon */
+  int surf_type = 0; /* 0 = sky, 1 = sun, 2 = moon */
   if (hit_moon && (!hit_sun || t_moon < t_sun)) {
     t_max = t_moon;
     surf_type = 2;
@@ -1757,14 +1088,13 @@ static RGB trace_ray(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
     surf_type = 0;
   }
 
-  /* March the coronal volume; transmittance is left at the fraction of light
-   * still reaching the eye at t_max, used by the surface term below. */
+  /* walk the gas; transmittance comes back as how much light still gets
+   * through to the surface behind it */
   float transmittance = 1.0f;
   RGB radiance_accum = march_medium(ro, rd, m, sun_pos, moon_pos, moon_R, t_max,
                                     sun_em, corona_gate, &transmittance);
 
-  /* Surface term - radiance from the hit surface, dimmed by the light that
-   * survived the march to reach it. */
+  /* add the hit surface's colour, dimmed by the gas in front of it */
   if (surf_type == 1) {
     RGB surf = shade_sun_surface(ro, rd, sun_pos, t_sun, sun_em);
     radiance_accum = rgb_add(radiance_accum, rgb_scl(surf, transmittance));
@@ -1773,89 +1103,52 @@ static RGB trace_ray(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
                                   earth_tint);
     radiance_accum = rgb_add(radiance_accum, rgb_scl(surf, transmittance));
   }
-  /* Sky case: no surface term. */
+  /* sky: nothing to add */
 
   return radiance_accum;
 }
 
-/* ── §12 SIMULATION: scene state + orbit — scene_tick advances;
- * init/reseed/pattern are user events
- * ─────────────────────────────────────────────────── *
- *
- * Per-frame state container: which pattern is active, current
- * stellar class, zoom and moon-scale knob positions, simulation time,
- * RNG seed, and the medium struct (with prominence parameters for
- * this seed). `pattern_set` and `*_reseed` mutate the scene; `scene_*`
- * read it.
- *
- * §12 has four sub-sections:
- *   §12.1 PatternParams + Scene structs
- *   §12.2 pattern_set
- *   §12.3 medium_reseed, scene_reseed, scene_init, scene_tick
- *   §12.4 scene_moon_r, scene_moon_pos, scene_occlusion
- */
+/* §12 — the scene: everything we're showing and how the user is driving it,
+ * plus the clock that moves the moon. The pieces here play different roles,
+ * marked per group: the structs hold the state; pattern_set / reseed / init
+ * change it on a keypress; scene_tick is the one thing the clock advances; and
+ * the scene_* readers just work out facts from it without changing anything. */
 
-/* §12.1 PatternParams + Scene.
- *
- * PatternParams holds the geometric configuration of the current
- * pattern: moon's world radius, optional y-offset (PARTIAL only),
- * gating booleans for HUD events. Scene wraps PatternParams plus all
- * the user-controllable knobs and the Medium.
- *
- * No bitfields, no unions — flat structs, easy to read.
- */
-
+/* The geometry of the current kind of eclipse: how big the moon is and whether
+ * it rides off-centre, plus a flag or two for the HUD. */
 typedef struct {
-  float moon_world_r;     /* moon radius in world units (sets coverage)   */
-  float moon_y_world;     /* vertical offset (PARTIAL bites the disc)      */
-  bool totality_possible; /* can this pattern reach totality? (HUD gate)   */
-  bool show_corona;       /* unused at runtime, kept for HUD              */
+  float moon_world_r;     /* moon radius (sets how much of the sun it covers) */
+  float moon_y_world;     /* vertical offset (PARTIAL rides high) */
+  bool totality_possible; /* can this one go fully total? (for the HUD label) */
+  bool show_corona;       /* unused; kept for the HUD */
 } PatternParams;
 
-/*
- * Scene — the simulation's table of contents: WHAT is shown (which eclipse, the
- * moon geometry, the coronal medium, the procedural identity), the clock that
- * advances the eclipse, and HOW the user drives / views it. Held by App (§16);
- * the lifecycle orchestrators scene_init / scene_reseed / scene_tick /
- * pattern_set take Scene*, while pure readers take only the fields (or
- * sub-types like Medium) they need.
- */
+/* Everything the program needs to draw and run the eclipse, in one place: which
+ * eclipse and the random seeds that flavour it, the clock the moon rides on,
+ * and the settings the user changes with the keys. Only init / reseed / tick
+ * rewrite this whole thing — the drawing code just reads it. */
 typedef struct {
-  /* WHAT is shown — the eclipse */
-  Pattern current_pattern; /* which eclipse (TOTAL/PARTIAL/ANNULAR/…)     */
-  PatternParams pp;        /* moon geometry derived from the pattern       */
-  Medium medium;           /* coronal corona + prominence parameters       */
-  int seed;                /* RNG seed for the medium + lunar terrain       */
-  float seed_phase;        /* procedural phase (orbit start offset)         */
+  /* which eclipse, and its random identity */
+  Pattern current_pattern; /* TOTAL / PARTIAL / ANNULAR / TRANSIT */
+  PatternParams pp;        /* the moon geometry for it */
+  Medium medium;           /* the corona + prominence gas */
+  int seed;                /* random seed for the gas and the moon's edge */
+  float seed_phase;        /* where in its crossing the moon starts out */
 
-  /* WHAT evolves — the clock */
-  float time_secs; /* eclipse clock; scene_tick advances it         */
+  /* the clock */
+  float time_secs; /* how long it's been running; the moon rides on this */
 
-  /* HOW the user drives / views it */
-  bool paused;      /* DELAYS: freeze the eclipse                    */
-  int speed;        /* sim time multiplier (relative to SPEED_DEF)   */
-  int star_idx;     /* stellar class → sun blackbody colour          */
-  float zoom;       /* effective FOV = FOV_H_BASE / zoom             */
-  float moon_scale; /* live moon-radius multiplier                   */
+  /* what the user changes with the keys */
+  bool paused;      /* freeze the motion */
+  int speed;        /* how fast the moon moves */
+  int star_idx;     /* which star → the sun's colour */
+  float zoom;       /* how zoomed in */
+  float moon_scale; /* live moon-size tweak */
 } Scene;
 
-/* §12.2 pattern_set.
- *
- * Purpose:     apply the geometric defaults for a pattern enum. Called
- *              when n / p is pressed.
- *
- * Pseudocode:
- *      pp = (defaults: TOTAL moon radius, no offset)
- *      switch p:
- *          TOTAL    → totality_possible = true
- *          PARTIAL  → moon offset above midline by PARTIAL_Y_OFFSET·MOON_Z
- *          ANNULAR  → moon radius = MOON_BASE_R_ANNULAR (smaller)
- *          TRANSIT  → moon radius = MOON_BASE_R_TRANSIT (tiny)
- *
- * Why: rather than hard-coding pattern-specific bits in the path
- * tracer, we change the world geometry. Same kernel renders all four
- * patterns by reading current Scene state.
- */
+/* Set the moon geometry for a kind of eclipse (on the n / p keys). We don't
+ * special-case the patterns anywhere else — we just resize/move the moon here
+ * and the same renderer produces all four looks. */
 static void pattern_set(Scene *s, Pattern p) {
   s->current_pattern = p;
   PatternParams *pp = &s->pp;
@@ -1883,30 +1176,21 @@ static void pattern_set(Scene *s, Pattern p) {
   }
 }
 
-/* §12.3 reseeding + init + tick.
- *
- * medium_reseed regenerates the prominence positions and rebuilds the
- * lunar terrain LUT and Perlin permutation. scene_reseed picks a new
- * orbit phase and seed, then delegates. scene_init zeroes the Scene
- * and calls medium_reseed once. scene_tick advances simulation time
- * proportional to user-set speed.
- */
-
+/* Roll a fresh look for the gas: new prominence arcs, a new moon edge, and a
+ * new rim texture. Run on 'r' and at startup. */
 static void medium_reseed(Medium *m, int seed) {
-  /* Random prominence positions (angle, height, amplitude). */
+  /* scatter the prominence arcs (angle, reach, brightness) */
   for (int k = 0; k < PROM_COUNT; k++) {
     uint32_t h = hash3(k, seed, 0xF1A3E);
     m->prom_phi[k] = hash01(h) * 2.0f * (float)M_PI;
     m->prom_height[k] = PROM_HEIGHT * (0.40f + 0.60f * hash01(h ^ 0xA1u));
     m->prom_amp[k] = 0.50f + 0.50f * hash01(h ^ 0xB2u);
   }
-  /* Bake the moon's silhouette perturbation. */
-  build_lunar_lut(seed);
-
-  /* Shuffle Perlin permutation table for spicule fBm. */
-  perm_shuffle(seed);
+  build_lunar_lut(seed); /* re-dent the moon's edge */
+  perm_shuffle(seed);    /* re-shuffle the rim texture noise */
 }
 
+/* pick a new random seed and moon start-position, then reseed the gas */
 static void scene_reseed(Scene *s) {
   uint32_t h = hash3((int)(s->time_secs * 1000.0f),
                      (int)(s->seed_phase * 100.0f), 0xC0FFEE);
@@ -1915,6 +1199,7 @@ static void scene_reseed(Scene *s) {
   medium_reseed(&s->medium, s->seed);
 }
 
+/* start fresh at launch: a total eclipse of the Sun, sensible defaults */
 static void scene_init(Scene *s) {
   memset(s, 0, sizeof *s);
   s->paused = false;
@@ -1928,6 +1213,7 @@ static void scene_init(Scene *s) {
   pattern_set(s, PATTERN_TOTAL);
 }
 
+/* The one and only place the clock moves forward. Does nothing while paused. */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
@@ -1935,25 +1221,17 @@ static void scene_tick(Scene *s, float dt) {
   s->time_secs += dt * speed_mul;
 }
 
-/* §12.4 derived geometry queries.
- *
- * scene_moon_r returns the EFFECTIVE moon radius (base × user scale).
- * scene_moon_pos returns the current moon world position from orbit
- * parameters (sin curve over ECLIPSE_PERIOD_S seconds). scene_occlusion
- * returns the fraction of the sun's apparent disc covered by the moon
- * AS SEEN FROM THE CAMERA — used by the HUD progress bar and by the
- * background-stars gate (§14.2).
- *
- * Note: scene_occlusion is the "binary occlusion" formula appropriate
- * for the camera's view (it includes the annular-cap case). The path
- * tracer uses visible_fraction_sun (§8) for the inverse — fraction
- * NOT covered, returned as a continuous value.
- */
+/* §12 readers — work out the moon's current size, where it is, and how much
+ * of the sun it covers from the camera. Pure: they read the scene, change
+ * nothing. (The HUD uses these; the renderer uses §8 instead, which gives a
+ * smooth edge.) */
 
+/* the moon's actual size right now: its pattern size times the user's tweak */
 static inline float scene_moon_r(const Scene *s) {
   return s->pp.moon_world_r * s->moon_scale;
 }
 
+/* where the moon is right now — it slides side to side on a gentle sine curve */
 static V3 scene_moon_pos(const Scene *s) {
   float sun_a = atanf(SUN_R / SUN_Z);
   float moon_a = atanf(scene_moon_r(s) / MOON_Z);
@@ -1964,6 +1242,8 @@ static V3 scene_moon_pos(const Scene *s) {
   return v3(mx, s->pp.moon_y_world, MOON_Z);
 }
 
+/* how much of the sun the moon is covering right now (0..1), from the camera —
+ * drives the HUD progress bar and decides when the background stars come out */
 static float scene_occlusion(const Scene *s) {
   V3 sun_pos = v3(0, 0, SUN_Z);
   V3 moon_pos = scene_moon_pos(s);
@@ -1992,21 +1272,14 @@ static float scene_occlusion(const Scene *s) {
   return t * (moon_a / sun_a) * (moon_a / sun_a);
 }
 
-/* ── §13 LOGIC: camera — pinhole ray generation (pure)
- * ──────────────────────────────────────────────────────── *
- *
- * Camera is a tiny struct holding origin, fov values, and screen
- * dimensions. camera_make stamps in the per-frame fov (computed from
- * the user's zoom in scene_draw). camera_ray converts a (col, row)
- * cell coordinate to a world-space unit direction using the pinhole
- * formula in Tutorial 2.
- * Ref: pinhole camera model — Shirley, "Fundamentals of Computer Graphics".
- */
+/* §13 — the camera: turns a screen cell into the ray that shoots out through
+ * it. A simple pinhole — where the eye sits, how wide the view is, and the
+ * picture size. */
 
 typedef struct {
-  V3 pos;             /* eye position (world space)                    */
-  float fov_h, fov_v; /* horizontal / vertical field of view (tan)     */
-  int cols, rows;     /* image-plane resolution                        */
+  V3 pos;             /* eye position */
+  float fov_h, fov_v; /* how wide the view is, across and up/down */
+  int cols, rows;     /* picture size in cells */
 } Camera;
 
 static void camera_make(Camera *c, int cols, int rows, float fov_h) {
@@ -2017,6 +1290,8 @@ static void camera_make(Camera *c, int cols, int rows, float fov_h) {
   c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
 }
 
+/* the ray through screen cell (sx, sy). The up/down part is flipped because
+ * screen rows count downward while the world's "up" points up. */
 static V3 camera_ray(const Camera *c, int sx, int sy) {
   float u =
       ((2.0f * (float)sx + 1.0f) - (float)c->cols) / (float)c->cols * c->fov_h;
@@ -2025,38 +1300,18 @@ static V3 camera_ray(const Camera *c, int sx, int sy) {
   return v3_norm(v3(u, v, 1.0f));
 }
 
-/* ── §14 RENDER: screen + scene_draw → framebuffer → screen
- * ─────────────────────────────────────────── *
- *
- * Per-frame orchestration. screen_init / screen_resize manage the
- * ncurses window. scene_draw is the per-frame entry point: build the
- * camera, set up the medium and emission constants, then iterate
- * every cell calling trace_ray and storing the result in a
- * framebuffer; finally paint the framebuffer to the terminal.
- *
- * §14 has two pieces:
- *   §14.1 screen_init / screen_resize
- *   §14.2 scene_draw
- */
+/* §14 — drawing a frame. We trace a ray for every cell into an off-screen
+ * image, then copy that image to the terminal. Also sets up the terminal
+ * window and re-measures it on resize. */
 
-/*
- * Screen — the terminal output surface this frame draws to: just its current
- * size, re-read on SIGWINCH so render and HUD always match the real window. Two
- * fields, but its own concept (the output surface), passed to every RENDER fn.
- */
+/* The terminal we're drawing to — just its current size, re-read whenever the
+ * window changes so the picture and HUD always fit. */
 typedef struct {
-  int cols, rows; /* terminal size in character cells (refreshed on resize) */
+  int cols, rows; /* terminal size in cells */
 } Screen;
 
-/* §14.1 screen lifecycle.
- *
- * screen_init configures ncurses for a non-blocking, no-echo, key-
- * captured, cursor-hidden TUI. typeahead(-1) is a small but important
- * call: it makes ncurses accept all queued input on every refresh
- * rather than blocking. screen_resize is called from the SIGWINCH
- * handler in §16.
- */
-
+/* put the terminal into the mode we need: no echo, keys read immediately and
+ * without blocking, cursor hidden, colours ready */
 static void screen_init(Screen *s) {
   initscr();
   noecho();
@@ -2069,50 +1324,19 @@ static void screen_init(Screen *s) {
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
+/* on a window resize, tear down and re-measure so we match the new size */
 static void screen_resize(Screen *s) {
   endwin();
   refresh();
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* §14.2 scene_draw — per-frame orchestration.
- *
- * Purpose:     for each cell in the visible window, dispatch a
- *              path-traced ray; store the HDR result in g_buf; then
- *              paint the buffer to the terminal.
- *
- * Pseudocode:
- *      compute working rows/cols within bounds (BUF_MAX_*)
- *      build camera with fov_h = FOV_H_BASE / zoom
- *      stamp medium.kelvin from current Star
- *      sun_em      = SUN_EMIT_HDR · blackbody_rgb(kelvin)
- *      earth_alb   = (0.30, 0.45, EARTH_ALBEDO_BLUE)
- *      earth_tint  = sun_em · earth_alb               (componentwise)
- *      cam_vis_sun = visible_fraction_sun(camera, sun, moon, moon_R)
- *      corona_gate = FLOOR + RANGE · (1 − cam_vis_sun)
- *
- *      PASS 1 — for each (r, c):
- *          ray = camera_ray(c, r)
- *          col = trace_ray(camera_origin, ray, medium,
- *                          sun_pos, moon_pos, moon_R, seed,
- *                          sun_em, earth_tint, corona_gate)
- *          if col is dark and totality:
- *              maybe add a background star at (c, r) from per-cell hash
- *          g_buf[r][c] = col
- *
- *      PASS 2 — paint g_buf to terminal via paint_cell
- *
- * Why: keeps trace_ray pure (it doesn't know about the eye-adapt
- * gate, the framebuffer, or the stars). All per-frame setup happens
- * here, leaving the kernel free of bookkeeping.
- */
-
+/* the off-screen image we draw into, then copy to the terminal */
 static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
 
-/* §14.1 background_star - colour contribution of a star at sky cell (c,r), or
- * black if this cell rolls no star. A per-cell hash gives frame-stable
- * positions; 1-in-STAR_DENSITY cells host a star whose Kelvin is log-uniform
- * over [STAR_K_MIN, STAR_K_MAX] for a warm-to-cool chromaticity spread. */
+/* a star's colour at cell (c, r), or black if this cell happens not to get
+ * one. The same cells get stars each frame (it's hashed from position), and
+ * each star gets a random temperature for a warm-to-cool colour spread. */
 static RGB background_star(int c, int r, int seed) {
   uint32_t h = hash3(c, r, seed);
   if ((h % STAR_DENSITY) != 0u)
@@ -2123,7 +1347,11 @@ static RGB background_star(int c, int r, int seed) {
   return rgb_scl(blackbody_rgb(kK), br);
 }
 
+/* Draw one frame: set up the camera, the sun's colour, and the per-frame
+ * lighting, then trace a ray for every cell and copy the result to the screen.
+ * Keeping all this here lets trace_ray stay a pure "one ray → one colour". */
 static void scene_draw(const Screen *sc, const Scene *s) {
+  /* leave the top and bottom rows for the HUD (unless the window is tiny) */
   int rows_eff = sc->rows - 2;
   int row_off = 1;
   if (rows_eff < 4) {
@@ -2149,31 +1377,37 @@ static void scene_draw(const Screen *sc, const Scene *s) {
   RGB sun_chrom = blackbody_rgb(m_local.kelvin);
   RGB sun_em = rgb_scl(sun_chrom, SUN_EMIT_HDR);
 
-  /* Earthshine: rough Earth-as-mirror with Rayleigh-blue albedo. */
+  /* the cool-blue earthshine colour — the sun's light tinted as if bounced
+   * off the blue Earth */
   RGB earth_alb = rgb_make(0.30f, 0.45f, EARTH_ALBEDO_BLUE);
   RGB earth_tint = rgb_mul(sun_em, earth_alb);
 
-  /* Eye-adaptation gate — one number per frame. */
+  /* eye adaptation: how strong the corona shows this frame (0 with the sun in
+   * view, rising to full as it's covered) */
   float cam_vis_sun = visible_fraction_sun(cam.pos, sun_pos, moon_pos, moon_R);
   float corona_gate =
       CORONA_GATE_FLOOR + CORONA_GATE_RANGE * (1.0f - cam_vis_sun);
 
-  /* PASS 1 — path tracer for each cell. */
+  /* are we near totality? a per-frame fact, so work it out once rather than
+   * for every dim cell below */
+  bool stars_visible = scene_occlusion(s) > STAR_OCC_VISIBLE;
+
+  /* trace a ray for every cell into the off-screen image */
   for (int r = 0; r < rows_eff; r++) {
     for (int c = 0; c < cols_eff; c++) {
       V3 ray_d = camera_ray(&cam, c, r);
       RGB col = trace_ray(cam.pos, ray_d, &m_local, sun_pos, moon_pos, moon_R,
                           s->seed, sun_em, earth_tint, corona_gate);
 
-      /* Background stars - only on dim "sky" cells at near-totality. */
-      if (luma_of(col) < STAR_LUMA_MAX && scene_occlusion(s) > STAR_OCC_VISIBLE)
+      /* sprinkle stars on the dark sky cells once we're near totality */
+      if (stars_visible && luma_of(col) < STAR_LUMA_MAX)
         col = rgb_add(col, background_star(c, r, s->seed));
 
       g_buf[r][c] = col;
     }
   }
 
-  /* PASS 2 — paint to screen. */
+  /* copy the image to the terminal */
   for (int r = 0; r < rows_eff; r++) {
     for (int c = 0; c < cols_eff; c++) {
       paint_cell(c, r + row_off, g_buf[r][c]);
@@ -2181,33 +1415,9 @@ static void scene_draw(const Screen *sc, const Scene *s) {
   }
 }
 
-/* ── §15 RENDER: HUD → screen
- * ─────────────────────────────────────────────────────────── *
- *
- * One row at the top with status, plus a TOTALITY event flash, plus a
- * key-hint strip at the bottom. Per project convention everything is
- * bright yellow on default background (PAIR_HUD) for the status, with
- * the bottom strip in cyan A_BOLD (PAIR_HINT) and the event flash in
- * red A_BOLD (PAIR_EVENT_HOT).
- *
- * The status string packs in a lot:
- *   fps, simulation Hz, pattern, stellar class, sun and moon angular
- *   radii (degrees), occlusion progress bar, zoom, moon-scale, speed.
- */
+/* §15 — the text overlay: a status line and a "TOTALITY" flash along the top,
+ * and the key hints along the bottom. */
 
-/*
- * hud_draw — render the top status row + bottom hint strip.
- *
- * Purpose:     draw the per-frame status overlay. Read-only on Scene.
- *
- * Inputs:      sc        Screen with current cols, rows
- *              s         Scene to read state from
- *              fps       measured render fps
- *              sim_fps   current simulation tick rate
- *
- * Why: separated from scene_draw so the path tracer's framebuffer
- * doesn't need to know about the HUD's row reservation.
- */
 static void hud_draw(const Screen *sc, const Scene *s, double fps,
                      int sim_fps) {
   float occ = scene_occlusion(s);
@@ -2271,41 +1481,24 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ── §16 APP / TICK — signals, input, the per-tick combine (see ARCHITECTURE)
- * ────────────────────────── *
- *
- * Standard project pattern:
- *   • Signal handlers set volatile flags; the main loop polls them.
- *   • atexit registers cleanup (endwin) so the terminal is restored
- *     even if we crash.
- *   • Fixed-step accumulator advances simulation time at SIM_FPS;
- *     render runs at whatever rate the rest of the loop achieves.
- *   • Frame-pacing sleeps target ~60 fps render budget.
- *
- * §16 has three pieces:
- *   §16.1 signals + cleanup
- *   §16.2 app_handle_key
- *   §16.3 app_init / app_run / main
- */
+/* §16 — the program itself: keyboard, signals, and the main loop that ties it
+ * all together. */
 
-/*
- * App — the application harness: the whole running program's state in one place
- * (WHERE/when we are, vs Scene's WHAT/HOW). Holds the simulation, the output
- * surface, the performance knob and the signal-driven run flags. app_init /
- * app_run take App*; everything below takes a sub-type.
- */
+/* The whole running program in one place: the scene, the terminal we draw to,
+ * how fast the world updates, and two flags the signal handlers flip. */
 typedef struct {
-  Scene scene;                   /* the simulation (WHAT + HOW) — see Scene */
-  Screen screen;                 /* the output surface — see Screen         */
-  int sim_fps;                   /* fixed-timestep rate ([ / ])             */
-  volatile sig_atomic_t running; /* 0 = quit (set by signal or `q`)         */
-  volatile sig_atomic_t need_resize; /* 1 = SIGWINCH pending */
+  Scene scene;   /* the eclipse being shown */
+  Screen screen; /* the terminal we draw to */
+  int sim_fps;   /* how many times a second the world updates */
+  /* These two are touched by signal handlers, so they need the special
+   * "safe to poke from a signal" type. */
+  volatile sig_atomic_t running;     /* set to 0 to quit */
+  volatile sig_atomic_t need_resize; /* set when the window was resized */
 } App;
 
 static App g_app;
 
-/* §16.1 signal handlers. Set flags, return immediately — the main loop
- * checks them after the next getch() / scene_tick. */
+/* signal handlers just flip a flag and return; the loop notices next time round */
 
 static void on_exit_signal(int sig) {
   (void)sig;
@@ -2317,11 +1510,7 @@ static void on_resize_signal(int sig) {
 }
 static void cleanup(void) { endwin(); }
 
-/* §16.2 app_handle_key — process one key.
- *
- * Returns true to keep running, false to quit. The cases mirror the
- * "Keys" section of the file header — one switch case per key.
- */
+/* Act on one keypress. Returns false only for quit, which ends the program. */
 static bool app_handle_key(App *app, int ch) {
   Scene *s = &app->scene;
   switch (ch) {
@@ -2404,14 +1593,17 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
-/* §16.3 app_init / app_run / main.
- *
- * app_init zeros the App, sets up Scene + Screen, builds the
- * transmittance LUT (only place we call it — once, at startup).
- * app_run is the main loop: poll input, advance simulation in
- * fixed-step ticks, render once per loop iteration, sleep to pace.
- * main wires it all up.
- */
+/* wire up the OS signals: Ctrl-C / kill ask us to quit, a window resize sets a
+ * flag, and we always put the terminal back on the way out */
+static void install_signals(void) {
+  struct sigaction sa = {0};
+  sa.sa_handler = on_exit_signal;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sa.sa_handler = on_resize_signal;
+  sigaction(SIGWINCH, &sa, NULL);
+  atexit(cleanup);
+}
 
 static void app_init(App *app) {
   memset(app, 0, sizeof *app);
@@ -2429,17 +1621,10 @@ static void app_run(App *app) {
   int64_t fps_window_start = prev;
   double fps_meas = 0.0;
 
-  struct sigaction sa = {0};
-  sa.sa_handler = on_exit_signal;
-  sigaction(SIGINT, &sa, NULL);
-  sigaction(SIGTERM, &sa, NULL);
-  sa.sa_handler = on_resize_signal;
-  sigaction(SIGWINCH, &sa, NULL);
-  atexit(cleanup);
+  install_signals();
 
   while (app->running) {
-    /* USER EVENTS — drain all pending keys (mutate Scene knobs / quit);
-     * NOT part of the tick. */
+    /* handle any keys waiting (these change settings or quit — not the clock) */
     int ch;
     while ((ch = getch()) != ERR) {
       if (!app_handle_key(app, ch)) {
@@ -2449,22 +1634,21 @@ static void app_run(App *app) {
     }
     if (!app->running)
       break;
-    /* USER EVENT — apply pending SIGWINCH (control state, not the tick). */
+    /* apply a pending window resize */
     if (app->need_resize) {
       screen_resize(&app->screen);
       app->need_resize = 0;
     }
 
-    /* PERFORMANCE — wall-clock dt with spiral-of-death cap. */
+    /* how much real time passed, capped so a long stall doesn't lurch ahead */
     int64_t now = clock_ns();
     int64_t dt = now - prev;
     if (dt > DT_CAP_NS)
       dt = DT_CAP_NS;
     prev = now;
 
-    /* SIMULATION (fixed timestep) — drain the accumulator: scene_tick advances
-     * the eclipse clock (the per-tick sim writer); paused gate inside = DELAYS.
-     */
+    /* advance the clock in fixed-size steps, so the motion runs at the same
+     * speed whatever the frame rate */
     int64_t tick_ns = TICK_NS(app->sim_fps);
     sim_accum += dt;
     while (sim_accum >= tick_ns) {
@@ -2472,12 +1656,11 @@ static void app_run(App *app) {
       sim_accum -= tick_ns;
     }
 
-    /* RENDER combine — the ONE place state → screen: scene_draw + HUD, then
-     * present. Reads scene, never writes it. */
+    /* draw the frame and flip it to the screen */
     screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
     screen_present();
 
-    /* PERFORMANCE — rolling fps measure (display only). */
+    /* refresh the fps number once a second */
     frame_count++;
     if (now - fps_window_start >= NS_PER_SEC) {
       fps_meas = (double)frame_count * (double)NS_PER_SEC /
@@ -2486,7 +1669,7 @@ static void app_run(App *app) {
       fps_window_start = now;
     }
 
-    /* PERFORMANCE — frame cap (sleep the remainder of the render budget). */
+    /* sleep off the rest of the frame's time budget so we don't run flat out */
     int64_t target = clock_ns();
     int64_t left = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
     if (left > 0)
@@ -2501,732 +1684,3 @@ int main(void) {
   return 0;
 }
 
-/*
- * solar_eclipse.c — a path-traced solar eclipse, rendered into ASCII at
- * a low resolution but with real volumetric physics. The corona, the
- * chromosphere's red Hα ring, the prominences arcing out from the
- * lunar limb, Bailey's beads, the diamond ring at first/last contact,
- * the soft penumbra at the moon's edge — every one of those features
- * is the natural output of a single per-pixel volume-rendering kernel,
- * not a screen-space effect painted on top.
- *
- * What you'll see when you run it
- * ───────────────────────────────
- *   A small bright sun sits at the centre of a 2-D pinhole-camera view.
- *   The moon orbits horizontally across it on a sin curve, completing
- *   one full pass every ~30 seconds at default speed. As the moon
- *   crosses, the corona — invisible while the photosphere is bright —
- *   gradually fades up, peaks dramatically at totality, then fades
- *   back. At the totality boundary, photospheric light leaks through
- *   valleys in the moon's silhouette as Bailey's beads, with one
- *   dominant bead briefly forming the diamond ring. During totality
- *   itself, a thin red chromospheric ring hugs the moon, and prominence
- *   loops rise from it in fBm-shaped arcs. The moon's silhouette is
- *   filled with a dim cool-blue glow — earthshine.
- *
- * What's controlling each visual
- * ──────────────────────────────
- *   The corona's structure: σ(r) = σ₀(R/r)^3 for the spherical part,
- *     plus an additive prominence field anisotropic in latitude.
- *   The corona's COLOUR: scattered photospheric blackbody light, so
- *     hotter stars (B-class) yield bluer coronas — that's real Thomson
- *     scattering physics, not artistic licence.
- *   Bailey's beads: the moon is a sphere with a per-direction radius
- *     perturbation (44 procedural valleys around its limb). When a
- *     valley angularly aligns with the photospheric edge during
- *     first/last contact, light sneaks through.
- *   The diamond ring: one of the 14 macro valleys per random seed is
- *     2.5× deeper than the rest. When it aligns at contact, it produces
- *     a single bright flash above the smaller surrounding beads.
- *   The penumbra (soft moon-shadow edge): each scatter point in the
- *     corona uses a closed-form circle-circle disc-overlap formula to
- *     get a continuous [0..1] visibility-of-the-sun, not a binary block.
- *   Eye adaptation: the corona is multiplied by a per-frame gate that
- *     drops to zero when the photosphere is unblocked (matching what a
- *     human eye actually perceives during a real eclipse).
- *
- * Stellar classes (cycle with t / T):
- *     M-DWARF   3500 K   cool red star
- *     K-STAR    4500 K   orange
- *     G-STAR    5778 K   our Sun (default)
- *     A-STAR    9500 K   white-blue (Sirius-like)
- *     B-STAR   18000 K   hot blue
- *
- * Patterns (cycle with n / p):
- *     TOTAL     moon angular radius > sun's     → totality possible
- *     PARTIAL   moon offset above midline       → never centres
- *     ANNULAR   moon angular radius < sun's     → ring of fire
- *     TRANSIT   moon ≪ sun                     → pinpoint silhouette
- *
- * Other keys:
- *   q / ESC      quit
- *   space        pause / resume orbit
- *   r            reseed (orbit phase + lunar terrain + spicule fBm)
- *   z / Z        zoom in / out                  (0.25× .. 8×)
- *   m / M        shrink / grow moon             (0.5× .. 2×)
- *   + / =        speed up the orbit             ('-': slow down)
- *   ] / [        raise / lower simulation tick rate (Hz)
- *
- * Section map (top-level):
- *   §0  forward types    — V3 and RGB declared early so §1 can use them
- *   §1  configuration    — every tunable named & documented in one place
- *   §2  monotonic clock  — frame-pacing primitives
- *   §3  math + colour    — V3 / RGB ops, blackbody, Reinhard, gamma
- *   §4  rng + noise      — hash3, Perlin / fBm
- *   §5  terminal paint   — 6×6×6 cube + density-glyph ramp + paint_cell
- *   §6  ray-sphere       — analytic primary intersection
- *   §7  lunar terrain    — Bailey's-bead silhouette via per-seed valleys
- *   §8  penumbra         — analytic visible-fraction-of-sun-disc
- *   §9  coronal medium   — σ(r), prominences, emission, density_total
- *   §10 transmittance    — 1-D radial LUT τ(r) → exp(−τ)
- *   §11 path tracer      — march + NEE + surface BRDFs (the kernel)
- *   §12 scene state      — Scene struct, orbit, occlusion, reseed
- *   §13 camera           — ray generation from screen cell coordinates
- *   §14 screen + draw    — scene_draw orchestration, framebuffer
- *   §15 hud              — top-row status, event flash, hint strip
- *   §16 app              — signals, fixed-step main loop
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raytracing/solar_eclipse.c \
- *       -o solar_eclipse -lncurses -lm
- *
- * Study alongside:
- *   raytracing/path_tracer.c        — same Reinhard/cube pipeline
- *   raytracing/saturn_with_rings.c  — same RGB tone-mapping
- *   grids/rect_grids/01_uniform_rect.c
- *                                   — canonical MENTAL MODEL block
- */
-
-/* ── HOW TO READ THIS FILE ─────────────────────────────────────────────── *
- *
- * Read top-to-bottom on a first pass. The four prose blocks at the top
- * (this one, plus CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL) teach the
- * algorithm without code. Once you reach §0 you should already know
- * what each function will do before you read it.
- *
- * If you only have a few minutes:
- *   - skim CONCEPTS for the algorithm name + references
- *   - read MENTAL MODEL → CORE IDEA (one paragraph)
- *   - jump to §11 trace_ray to see the volume-rendering kernel
- *
- * If you want to TUNE the visuals, the GUIDED TUTORIAL is mapped to
- * sections of §1 — each tunable paragraph in §1 says which knob inside
- * it controls which visible feature.
- *
- * Background you'll need: basic C (pointers, structs, arithmetic on
- * arrays); a feel for ray-sphere intersection (the quadratic formula);
- * a vague familiarity with what an integral is. No prior path-tracing
- * knowledge is assumed; the volume rendering equation is derived in
- * Tutorial 4 from a glitter-dust analogy.
- *
- * Variable-naming conventions used in §11 and other dense functions:
- *   `transmittance`     attenuation factor along the eye ray, [0..1]
- *   `radiance_accum`    accumulated HDR colour for the pixel
- *   `density`           local σ at the current sample point
- *   `tr_to_sun`         transmittance from a scatter point to photosphere
- *   `t_along_ray`       parametric distance from camera along the ray
- *   `dt`                length of the current march step (world units)
- * Short names like `i`, `t`, `dphi` appear only inside very short loops.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Single-scattering volumetric path tracing with
- *                  next-event estimation (NEE). For each pixel we
- *                  march along a primary eye ray; at each step we
- *                  evaluate the local extinction coefficient σ(p) of
- *                  a coronal-plasma medium and ask "if a photon
- *                  scattered here, what fraction of the photosphere is
- *                  visible from this point and what radiance does it
- *                  contribute back along the eye ray?". We sum those
- *                  contributions, attenuating each by the running
- *                  transmittance. When the eye ray finally hits sun /
- *                  moon / sky we add a surface BRDF term. The output
- *                  is HDR; we tone-map and quantise it to 6×6×6 cube
- *                  cells with an ASCII density-glyph for brightness.
- *
- * Data-structure : Coronal medium is spherically symmetric: a 1-D
- *                  function σ(r) gives the scattering coefficient at
- *                  distance r from the sun, with three regions —
- *                  power-law corona, thin chromosphere shell, then
- *                  zero outside CORONA_REACH·R. Prominences are an
- *                  additive anisotropic field (per-seed angular
- *                  positions). Two precomputed lookup tables (LUT)
- *                  carry the realtime budget:
- *                    • trans_lut[256]   τ(r) integrated radially
- *                    • lunar_lut[512]   moon's perturbed silhouette
- *                                       depth as a function of phi
- *                  Per-frame state: 80×40-ish RGB framebuffer.
- *
- * Rendering      : HDR float RGB per cell → Reinhard tone-map per
- *                  channel → gamma 1/2.2 → quantise to xterm 6×6×6 cube
- *                  → density glyph from the 16-char open-form ramp
- *                  ` .'`,-_:;~=+*oO0`. A_BOLD on bright cells, A_DIM
- *                  on dark; A_NORMAL otherwise.
- *
- * Performance    : ~3000 cells × ~30 active march steps × O(1) per step
- *                  (one transmittance LUT fetch, one lunar LUT fetch,
- *                  one closed-form penumbra formula, ~10 FLOPs of
- *                  arithmetic). At 30 fps that's roughly 3 M FLOPs of
- *                  hot-path work per second — comfortably realtime on
- *                  a single CPU core. Three optimisations earn this
- *                  budget: closed-form transmittance via 1-D radial
- *                  LUT, cheap base-sphere reject for moon-block tests,
- *                  and adaptive march (4× coarse stride outside the
- *                  corona's effective extent).
- *
- * References     : Pharr / Jakob / Humphreys, "Physically Based
- *                    Rendering" 3rd ed §15 — volumetric path tracing,
- *                    next-event estimation, transmittance integrals.
- *                  Eddington, "The Internal Constitution of the Stars"
- *                    (1926), §8 — Eddington-approximation limb
- *                    darkening.
- *                  Wikipedia: Solar corona, K-corona, Thomson
- *                    scattering, Solar prominence, Hα line, Bailey's
- *                    beads, Eclipse penumbra.
- *                  Tanner Helland, "How to convert temperature to RGB":
- *                    https://tannerhelland.com/2012/09/18/convert-temperature-rgb-algorithm-code.html
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Picture the corona as glitter suspended in space around the sun. A
- * photon leaves the photosphere, hits a glitter speck, scatters, and
- * some of those scattered photons reach your eye. The brightness you
- * see at any point along your line of sight is the sum of "how much
- * glitter is here" × "how much sun-light reaches it" × "how much of
- * that scatters in your direction". Compute exactly that integral per
- * pixel and you get a real coronal image — no fake halos required.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Walk a stick along a line through the glitter cloud. Stop every
- * inch. At each stop, ask the question: "if a scatter event happened
- * here, how bright would it be?" Three sub-questions:
- *   1. Is there glitter at this point?  (Density σ at p.)
- *   2. Can sunlight reach this point?   (Transmittance scatter→sun,
- *                                        and is the moon in the way?)
- *   3. Will it scatter toward my eye?   (Phase function of the
- *                                        scatter angle.)
- * Sum these answers, weighted by how transparent the cloud is between
- * the camera and the current stop. That sum, plus whatever you hit at
- * the end of the stick, is the pixel.
- *
- *      camera ────►  ●─●─●─●─●─●─●─●─●─●─●─●─●  ←  surface or sky
- *                    │ │ │ │ │ │ │ │ │ │ │ │ │
- *                    │ │ │ each stop:
- *                    │ │ │   density σ(p)
- *                    │ │ │   NEE ↑ to photosphere (ask sun)
- *                    │ │ │   accumulate scattered light
- *                    │ │ │   attenuate transmittance for next step
- *                    ▼ ▼ ▼
- *                    photosphere (NEE target)
- *
- * DRAWING METHOD / ALGORITHM IN STEPS  (per pixel, per frame)
- * ──────────────────────────────────────────────────────────
- *  1. Build the camera ray for the cell. Find the nearest hit
- *     among {sun-sphere, moon-sphere}; if neither, t_max = "sky".
- *  2. Initialise transmittance = 1, radiance_accum = (0,0,0).
- *  3. March a parametric t from 0 toward t_max. Step size depends
- *     on whether we're inside the corona's radial extent (fine step)
- *     or outside it (4× coarse step — σ is zero out there).
- *  4. At each step's midpoint p:
- *        density = σ_corona(|p−sun|) + σ_chromos(|p−sun|)
- *                                    + σ_prom(p, medium)
- *        if density is significant:
- *           visible = analytic_circle_circle(sun-disc, moon-disc, p)
- *           if visible > 0:
- *              tr_to_sun = trans_lut(|p−sun|)
- *              phase     = thomson_phase(angle between eye-ray, p→sun)
- *              omega_sun = solid_angle(sun-sphere from p)
- *              radiance_accum += transmittance · density · phase
- *                                · tr_to_sun · omega_sun · visible
- *                                · sun_emission · dt · gain · gate
- *           radiance_accum += transmittance · emission_at(p) · dt · gate
- *           transmittance *= exp(−density · dt)
- *  5. Add the surface contribution at t_max:
- *        sun-hit:  emission · limb_darkening(N·V) · transmittance
- *        moon-hit: (sun_NEE_cos(N,sun) + earthshine) · transmittance
- *        sky:      0
- *  6. Reinhard: c' = c / (1+c). Gamma 1/2.2. Cube quantise. Glyph.
- *
- * KEY FORMULAS
- * ────────────
- *  Volume rendering equation (single-scatter):
- *      L(eye) = ∫₀^t_max T(t) σ(t) [J_emit(t) + J_scatter(t)] dt
- *             + T(t_max) · L_surface
- *  Single-scatter NEE term:
- *      J_scatter(p) = phase(θ) · Tr(p→sun) · L_sun · Ω(sun seen from p)
- *                                          · vis(p, sun, moon)
- *  Beer-Lambert transmittance:
- *      T(t) = exp(−∫₀^t σ(s) ds)
- *  Thomson phase function (electron scatter, achromatic):
- *      P_T(θ) = (3/16π) · (1 + cos²θ)
- *  Solid angle of a sphere at distance d, radius R (R ≤ d):
- *      Ω = 2π · (1 − √(1 − R²/d²))
- *  Eddington-style limb darkening at view-cosine μ:
- *      I(μ) = AMBIENT + GAIN · μ        (with our defaults 0.4, 0.6)
- *  Analytic circle-circle disc overlap (small-angle approximation):
- *      see visible_fraction_sun in §8 — closed form, no sampling.
- *  Planck blackbody → sRGB chromaticity:
- *      Tanner Helland piecewise approximation; see §3.4.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • The transmittance LUT is 1-D radial. The chord from a scatter
- *    point P toward the sun centre passes through the photosphere at
- *    exactly distance R_sun, ending there. Older 2-D versions of this
- *    LUT (parameterised by impact parameter b) have a trap: at b=0
- *    the chord seems to cross the sun's interior, so they store τ=∞.
- *    But our chord ends at the surface — so the right answer is the
- *    radial integral from R_sun outward to r. The 1-D LUT bypasses
- *    the b=0 confusion entirely.
- *  • Moon-block of NEE is computed analytically as visible-fraction,
- *    not as a binary intersection test. Without this you get a hard
- *    cliff at the moon's edge instead of a soft penumbra.
- *  • The eye-adaptation gate must use the camera's view of the sun,
- *    not the per-scatter-point view. Otherwise you'd get inconsistent
- *    fade-up across pixels. One number per frame.
- *  • Adaptive marching only safe because σ ≡ 0 outside CORONA_REACH·R.
- *    Coarse strides through truly empty space contribute nothing,
- *    regardless of step size. Inside the medium we keep fine steps.
- *  • Earthshine is geometrically simplified: real Earth is BEHIND the
- *    camera, and the moon's near face is lit by Earth-reflected
- *    sunlight. We approximate this as a constant ambient with a blue
- *    Earth-albedo tint on the moon's surface. cos(N, sun) ≤ 0 in this
- *    geometry so direct sun-lit moon would be black anyway.
- *  • B-star coronas come out blue. That's correct: Thomson scattering
- *    is wavelength-flat, so the corona's chromaticity follows the
- *    photosphere's spectrum. A 18000 K star has cool-blue blackbody
- *    light, and its corona scatters that same cool-blue.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Press space at totality. The corona should have visible streaks
- *    (denser at the equator if you happen to land there), a thin red
- *    Hα ring just outside the moon, and a few prominence loops at
- *    random angular positions.
- *  • Cycle stellar class with t/T. The same scene geometry repeats,
- *    but M-DWARF gives a deep red sun + reddish corona, G-STAR a
- *    warm-white sun, B-STAR a blue-white sun + bluer corona. If those
- *    chromaticities don't shift together, the colour pipeline is wrong.
- *  • Outside the eclipse window: the corona should be invisible (or
- *    very faint at FLOOR=0.15). If you can see corona around an
- *    uneclipsed sun, the eye-adaptation gate is mis-wired.
- *  • Press r repeatedly during totality. Bailey's-bead positions and
- *    chromosphere spicule pattern should change visibly each time.
- *  • Press n / p to cycle pattern. ANNULAR should show a bright ring
- *    of sun around the moon at maximum (no totality). TRANSIT should
- *    show a tiny moon dot crossing the disc.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ───────────────────────────────────────────────────── *
- *
- * Ten short lessons that build the algorithm from first principles.
- * Read them in order on the first pass — each lesson assumes the
- * previous one. Then jump to the §-section listed at the end of each.
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 1 — What is a solar eclipse, mechanically?
- * ────────────────────────────────────────────────────────────────────────
- *   Q: What's actually happening when an eclipse occurs?
- *
- *   The sun, moon, and an observer line up. The moon (~1740 km radius)
- *   is much smaller than the sun (~700,000 km radius), but it's also
- *   much closer to the observer. The two factors balance so that the
- *   moon's APPARENT angular size — atan(R/distance) — is comparable to
- *   the sun's. When they happen to coincide angularly, the moon
- *   blocks the photosphere from the observer's view. That brief
- *   blockage reveals a normally-invisible structure: the corona, a
- *   tenuous plasma extending a few solar radii outward.
- *
- *   We're modelling this from the observer's perspective. The camera
- *   is at the origin. Sun lives at +Z (far). Moon lives between camera
- *   and sun (closer in +Z). World units are arbitrary; we picked
- *   sun_R = 3.5, sun_Z = 50, moon_R = 0.62, moon_Z = 5 to give a
- *   pleasing screen presence with the moon's apparent radius about
- *   1.76× the sun's at default zoom.
- *
- *   ASCII diagram of the world layout:
- *
- *         camera                moon                       sun
- *           ●  ─────────────────  ●  ─────────────────────  ●
- *           │                    R=0.62                   R=3.5
- *           │                    Z=5                      Z=50
- *           ↑
- *         origin
- *           +Z increases this way →
- *
- *   Pseudocode of the per-frame setup:
- *       sun_pos       = (0, 0, 50)
- *       moon_pos      = (orbit_x * sin(omega·time), 0, 5)
- *       moon_R_world  = 0.62 (× user moon-scale)
- *
- *   See: §1.3, §12.3 (orbit), §12.4 (scene_moon_pos).
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 2 — A pinhole camera in three lines
- * ────────────────────────────────────────────────────────────────────────
- *   Q: How do we turn a pixel coordinate into a 3-D ray?
- *
- *   Pinhole model. The camera sits at the origin and looks down +Z.
- *   The image plane sits at +1 unit, and a pixel at column c, row r on
- *   a cols × rows screen maps to a point in the image plane. The ray
- *   from origin through that point, normalised, is the eye ray for
- *   the pixel.
- *
- *       u =  ((2c + 1) − cols) / cols · fov_h
- *       v = -((2r + 1) − rows) / rows · fov_v
- *       ray_dir = normalise( (u, v, 1) )
- *
- *   `fov_h` is the tan of the half-horizontal field of view. We
- *   multiply by `fov_v = fov_h · rows·ASPECT_Y / cols` so circles look
- *   round on a terminal where each cell is ~2× taller than wide. The
- *   −sign on v puts row 0 at the top of the screen.
- *
- *   Pseudocode:
- *       for each row r:
- *           for each col c:
- *               ray = camera_ray(c, r, cols, rows, fov_h)
- *               pixel = trace(ray)
- *
- *   See: §13.
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 3 — Hitting a sphere (the quadratic in disguise)
- * ────────────────────────────────────────────────────────────────────────
- *   Q: How do we tell whether a ray hits a sphere, and where?
- *
- *   A point on the ray at parameter t is ray_origin + t·ray_dir.
- *   "Hits the sphere of radius R centred at C" means |that point − C|
- *   = R. Square that and you get a quadratic in t:
- *
- *       (oc + t·rd) · (oc + t·rd) = R²        with oc = ray_origin − C
- *       (rd·rd) t² + 2(oc·rd) t + (oc·oc − R²) = 0
- *       │ assuming |rd| = 1, the t² coefficient is 1 │
- *       t² + 2 b t + c = 0,  b = oc·rd,  c = oc·oc − R²
- *       t = −b ± √(b² − c)
- *
- *   Three cases:
- *       discriminant b² − c < 0  → ray misses the sphere entirely
- *       both t < epsilon         → sphere is behind the camera
- *       else                     → nearest valid t is the hit
- *
- *   The `epsilon = 1e-3` keeps us off self-intersection at the surface.
- *
- *   See: §6.
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 4 — Why surfaces aren't enough: volume rendering
- * ────────────────────────────────────────────────────────────────────────
- *   Q: If we hit the sun, why don't we just draw the sun and stop?
- *
- *   Because the corona is air. There's no surface to hit. It's a thin
- *   plasma occupying a 3-D volume around the sun. Every cubic metre
- *   of corona absorbs and scatters a tiny amount of light. To render
- *   it we have to integrate along the ray.
- *
- *   The volume rendering equation says: the radiance reaching the eye
- *   is the sum of radiance contributed at every point along the ray,
- *   weighted by the transmittance from that point back to the eye.
- *   In integral form:
- *
- *       L_eye = ∫₀^t_max T(t) [σ(t) · J(t)] dt + T(t_max) · L_surface
- *
- *   where σ(t) is the local scattering coefficient at parameter t,
- *   J(t) is the local "source" — light entering the ray at that point —
- *   and T(t) = exp(−∫₀^t σ(s) ds) is the cumulative transmittance from
- *   eye to that point (Beer-Lambert law).
- *
- *   We approximate this integral with a Riemann sum: divide [0, t_max]
- *   into ~30 active steps, evaluate σ and J at the midpoint of each,
- *   accumulate. ASCII picture of one step:
- *
- *       eye ──── t_now ──╳────── t_next ──── ... ──── t_max
- *                        │
- *                  midpoint p:
- *                  σ = σ(p),  J = J(p)
- *                  L_pixel += T_now · σ · J · dt
- *                  T_next = T_now · exp(−σ · dt)
- *
- *   The "source" J has two parts: locally emitted light (chromosphere
- *   Hα emission) and in-scattered light (corona scattering photospheric
- *   light into our direction). Tutorial 5 covers the in-scatter.
- *
- *   See: §11.
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 5 — Next-event estimation: sampling the sun
- * ────────────────────────────────────────────────────────────────────────
- *   Q: At each scatter point, how do we compute the in-scattered light?
- *
- *   Naively: shoot many rays from the scatter point in random
- *   directions, see which ones hit a light, average. Slow, noisy.
- *
- *   Smart: the sun is by far the brightest thing. Always sample
- *   exactly toward the sun and weight by the sun's solid angle. This
- *   is "next-event estimation" (NEE). For a sphere of radius R at
- *   distance d, the solid angle from a point outside it is:
- *
- *       Ω = 2π · (1 − cos α),   with sin α = R / d
- *
- *   The NEE estimate of in-scattered light at scatter point p:
- *
- *       J_scatter(p) = phase(θ) · transmittance(p→sun) · L_sun
- *                                                     · Ω(sun seen from p)
- *
- *   The transmittance(p→sun) accounts for absorption along the chord
- *   from p to the photosphere — coronal scattering between the scatter
- *   point and the sun dims the contribution. We compute this via a
- *   1-D LUT (Tutorial 6).
- *
- *   The phase(θ) is the Thomson phase function: probability that a
- *   photon scatters by angle θ. For free electrons (Thomson scattering)
- *   it's:
- *
- *       phase(θ) = (3 / 16π) · (1 + cos²θ)
- *
- *   This is wavelength-flat — Thomson cross-section doesn't depend on
- *   colour — which is why the corona's hue follows the photosphere's
- *   exactly.
- *
- *   See: §11 (`thomson_phase`, NEE inside `trace_ray`).
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 6 — The transmittance LUT (the realtime trick)
- * ────────────────────────────────────────────────────────────────────────
- *   Q: How do we compute transmittance(p → sun) without ray-marching
- *      a SECOND time per scatter point?
- *
- *   The chord from a scatter point P at distance r from the sun
- *   centre, going inward toward the photosphere, ends at radius R_sun.
- *   Because the medium is spherically symmetric (σ depends only on
- *   distance r), the optical depth along that chord depends only on
- *   r — not on direction. Precompute it once at startup.
- *
- *       τ(r) = ∫_{R_sun}^{r} σ(s) ds        (radial integral)
- *       Tr(r) = exp(−τ(r))
- *
- *   Store τ at 256 sample radii from R_sun to LUT_R_MAX. Lookup is
- *   one bilinear interpolation. ASCII picture of the chord:
- *
- *                     ┌──────────────── r = LUT_R_MAX
- *                     │ outer corona, σ ≈ 0
- *                     │
- *                     │  P (scatter point)
- *                     ├──── │ ←── chord direction (toward sun centre)
- *                     │     │
- *                     │     │  thin chromosphere shell, σ large
- *                     │   R_sun ←── chord ENDS here, at the photosphere
- *                     │
- *                     │  (chord does NOT continue into the sun's interior)
- *
- *   Because the chord ends at R_sun, we never need to know the impact
- *   parameter b. A single 1-D table τ(r) is enough.
- *
- *   See: §10.
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 7 — Penumbra: continuous moon-shadow at the edge
- * ────────────────────────────────────────────────────────────────────────
- *   Q: How do we model the soft brightness gradient at the moon's edge?
- *
- *   From any scatter point in the corona, the sun and moon both look
- *   like circular discs on the sky. The fraction of the SUN's disc
- *   that is NOT covered by the MOON's disc is the visible fraction:
- *
- *       sun-disc:    centred at angle (sun − P), radius α_sun
- *       moon-disc:   centred at angle (moon − P), radius α_moon
- *       γ = angle between the two centres (on the unit sphere)
- *
- *   Three cases:
- *       γ ≥ α_sun + α_moon              → no overlap: visible = 1
- *       γ ≤ |α_sun − α_moon|            → full nesting:
- *           if α_moon ≥ α_sun           →   visible = 0  (total)
- *           if α_moon < α_sun           →   visible = 1 − (α_moon/α_sun)²
- *                                                            (annular)
- *       else                            → partial: closed-form area
- *                                          of two-circle intersection.
- *
- *   ASCII picture of the partial-overlap case:
- *
- *           ╭────────╮
- *          ╱  sun     ╲          ╲
- *         │           ╳overlap   │
- *          ╲          ╱           ╱
- *           ╰─────────╳───────────
- *                     │  moon  │
- *                      ╲──────╱
- *
- *           visible = (sun_area − overlap_area) / sun_area
- *
- *   No multi-sampling, no Monte Carlo, no extra rays — just one
- *   formula per scatter point. The shadow gradient at the moon's edge
- *   becomes a smooth function of position, giving the classic soft
- *   penumbra.
- *
- *   Bailey's beads are NOT done here — they come from a separate
- *   geometric perturbation of the moon's silhouette (Tutorial 8).
- *
- *   See: §8.
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 8 — Bailey's beads + diamond ring via lunar terrain
- * ────────────────────────────────────────────────────────────────────────
- *   Q: What about the bright bead-like flashes at the totality boundary?
- *
- *   Real beads come from light leaking through valleys in the moon's
- *   mountain range. We model that with a per-direction perturbation of
- *   the moon's effective radius:
- *
- *       moon_R(phi) = moon_R_base · (1 − valley_depth(phi))
- *
- *   `phi` is the angular position around the moon's silhouette. We
- *   place 14 wide "macro" Gaussian valleys around the limb, each up to
- *   2% deep, with a per-seed random asymmetry (one side sharper than
- *   the other). On top of those we add 30 narrow "micro" valleys, up
- *   to 1% deep, to sharpen individual beads. One macro valley per
- *   seed is given a 2.5× depth boost — the diamond ring.
- *
- *   ASCII picture of moon's silhouette with valleys (exaggerated):
- *
- *                ╭───────╮
- *               ╱  moon   ╲
- *              │         ▼ │  ← valley (deeper inward)
- *              │           │
- *              │ ▼         │  ← another valley
- *               ╲   ◀────  ╱  ← diamond ring valley (deepest)
- *                ╰───────╯
- *
- *   When the sun's photospheric edge during first/last contact
- *   angularly aligns with a valley, photospheric light leaks through
- *   that valley directly to the camera — bead. The diamond-ring
- *   valley produces a clearly brighter flash than the others.
- *
- *   We bake the 14+30 valleys into a 512-entry LUT once per seed.
- *   At runtime, `lunar_R_at(direction)` is one bilinear lookup —
- *   no exp() in the hot path, no per-pixel terrain math.
- *
- *   IMPORTANT: this perturbation lives in the EYE-RAY hit test, not
- *   in the NEE penumbra formula. Beads are a primary-ray phenomenon
- *   (they show up in the eye-ray hit), penumbra is a NEE-secondary-
- *   ray phenomenon. Different physics, different code paths.
- *
- *   See: §7, §11 (`ray_moon` is called in eye-ray hit).
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 9 — Spicules + Hα chromosphere texture
- * ────────────────────────────────────────────────────────────────────────
- *   Q: Why is the red ring at the moon's edge textured, not smooth?
- *
- *   The chromosphere is a thin plasma layer just above the
- *   photosphere. It emits strongly in the Hα line (656.3 nm, hydrogen
- *   alpha) — a deep red. But it isn't a smooth shell: it's a forest of
- *   "spicules", jet-like structures rising radially. We model that
- *   radial-streak texture with 2-D fractal Brownian motion sampled in
- *   spherical surface coordinates (theta, phi):
- *
- *       chromos_emission(p) = base_emission(r)
- *                           · spicule_factor(theta, phi)
- *
- *       spicule_factor = SPICULE_BASE + SPICULE_AMP · fbm(phi · 12,
- *                                                          theta · 6)
- *
- *   where (theta, phi) are the polar and azimuthal angles of p in the
- *   sun's frame. The fBm "patches" extend radially through the thin
- *   shell, producing visible streaks. Bright peaks shift the Hα colour
- *   slightly toward yellow for thermal variation:
- *
- *       Hα_cool = (1.00, 0.18, 0.12)   — deep crimson
- *       Hα_hot  = (1.00, 0.45, 0.18)   — yellow-shifted at fBm peaks
- *
- *   Outer edge of shell falls off as (1−h)⁴ for sharpness, where
- *   h = (r − R_sun) / shell_thickness ∈ [0, 1].
- *
- *   See: §9.4.
- *
- * ────────────────────────────────────────────────────────────────────────
- * TUTORIAL 10 — Eye adaptation: why pre/post eclipses are dark
- * ────────────────────────────────────────────────────────────────────────
- *   Q: If the corona is "always there" physically, why is it invisible
- *      except during totality?
- *
- *   Real-life corona radiance is about 10⁶× dimmer than the
- *   photosphere. Your eye's pupil + retina adapt to the brightest
- *   thing in view; with the photosphere visible, that's "the photo-
- *   sphere", and everything 10⁶ dimmer is below your perceptual
- *   threshold. During totality the photosphere is hidden; your eye
- *   dilates and corona radiance is now well within your dynamic range.
- *
- *   We model this with a single per-frame multiplier:
- *
- *       cam_vis_sun = visible_fraction(camera, sun, moon)  ∈ [0, 1]
- *       gate        = FLOOR + RANGE · (1 − cam_vis_sun)
- *
- *   With FLOOR=0 (this file): gate = 0 when sun fully visible (corona
- *   completely invisible), gate = 1 at totality (corona at full
- *   brightness). Linear ramp through partial phases. Bump FLOOR to
- *   ~0.15 if you prefer a faint always-on baseline halo.
- *
- *   The gate multiplies corona NEE in-scatter and chromosphere/
- *   prominence emission. It does NOT multiply photosphere or moon
- *   surface contributions — those are direct light sources, the eye
- *   sees them at any time.
- *
- *   See: §1.9 (FLOOR / RANGE constants), §11 (gate parameter passed
- *   into `trace_ray`), §14.2 (gate computed once per frame).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/*
- * ════════════════════════════════════════════════════════════════════
- *  ARCHITECTURE — concern layers (step-4 separation pass)
- * ════════════════════════════════════════════════════════════════════
- *
- *  Labelled, separated layers. LOGIC is pure (no mutation, no I/O), so
- *  reordering or deleting RENDER can never change a LOGIC result.
- *
- *  LAYER        SECTION(S)                       MUTATES
- *  ----------   ------------------------------   ------------------------------
- *  TYPES/CONFIG §0, §1                           nothing — forward types,
- *                                                constants, ramp, enums (data)
- *  PERFORMANCE  §2; app_run dt/accum/fps/cap     OS sleep + loop-local timers
- *  LOGIC        §3, §4 (noise), §6, §7 (read),   nothing — pure functions:
- * math, §8, §9, §10 (lookup), §11, §13,  colour, noise, ray-sphere, lunar
- *               scene_moon_* / occlusion (§12)   silhouette, penumbra, medium
- *                                                density/emission,
- * transmittance lookup, trace_ray (the core), camera rays, moon-orbit math
- *  RENDER       §5, §14, §15                     the SCREEN (ncurses cells) +
- *                                                g_buf framebuffer + g_256;
- * reads scene, never writes it SIMULATION   scene_tick (§12) Scene.time_secs —
- * the eclipse clock, the only PER-TICK state. Worldgen at init / `r` reseed:
- *                                                perm_shuffle (§4),
- * build_lunar_lut (§7), medium_reseed (§9), plus the one-time build_trans_lut
- * (§10). DELAYS       Scene.paused gate (§12)          nothing — pause
- * early-returns scene_tick; no holds/timers EFFECTS      — none — no stored
- * cosmetic state; the corona/beads/penumbra are traced fresh every frame (g_buf
- * is per-frame scratch, not temporal)
- *
- *  Timestep note: PERFORMANCE uses a FIXED-TIMESTEP accumulator (app_run:
- *  sim_accum += dt; while (sim_accum >= TICK_NS) scene_tick()), with a spiral-
- *  of-death dt cap and a frame-cap sleep. sim_fps is user-tunable ( [ / ] ),
- *  decoupling the sim rate from the render rate.
- *
- *  PER-TICK COMBINE ORDER (app_run — the one place layers meet):
- *    drain input   USER EVENTS  app_handle_key: mutate Scene knobs / quit
- *    resize        USER EVENT   apply pending SIGWINCH
- *    dt            PERFORMANCE  wall-clock dt, capped
- *    accumulate    SIMULATION   scene_tick() per fixed step (skipped if paused)
- *    draw          RENDER       scene_draw -> screen_present (reads only)
- *    fps + sleep   PERFORMANCE  rolling fps measure, then frame cap
- *
- *  User events (key input, SIGWINCH resize, the `r` reseed, signal handlers)
- *  mutate Scene knobs, reseed the LUTs / medium, and set running / need_resize.
- *  They are NOT the tick; the only per-tick simulation write is scene_tick.
- * ════════════════════════════════════════════════════════════════════
- */

@@ -1,524 +1,19 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * ragdoll_figure.c — Verlet humanoid ragdoll bouncing through slanted shelves
+ * ragdoll_figure.c — a stick-figure puppet (15 dots, 17 bones) falls under
+ * gravity and tumbles down slanted shelves. Each dot remembers its last
+ * position, so its speed is just where-it-is minus where-it-was; "bones" are
+ * fixed-distance rules nudged true many times a frame so the body holds shape
+ * and flops like a ragdoll. Sister file: ragdoll_ropes.c (same physics, cloth).
  *
- * DEMO: A 15-particle stick figure falls under gravity and tumbles down five
- *       slanted platforms before settling on the ground. Distance constraints
- *       hold its 17 bones rigid; periodic wind gusts keep the figure lively.
+ * Verlet integration; T. Jakobsen, "Advanced Character Physics" (GDC 2001).
  *
- * Study alongside: snake_inverse_kinematics.c (constraint-projection sibling)
- *
- * Section map:
- *   §1 config   — tunables: physics, gravity, wind, platform layout
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — body-part palette + HUD/hint pairs
- *   §4 coords   — pixel↔cell aspect-ratio bridge
- *   §5 entity   — Ragdoll: Verlet particles + distance constraints
- *       §5a verlet_update             — gravity + wind integration
- *       §5b apply_boundaries          — wall/floor/ceiling bounce
- *       §5b-2 apply_platform_collisions — slanted-shelf reflection
- *       §5c satisfy_constraint        — bone-length projection
- *       §5d ragdoll_tick              — orchestrator (one physics step)
- *       §5e bone_glyph / draw_bone    — ASCII line stamp
- *   §6 scene    — Scene = ragdoll + platforms; tick/draw + render decomposition
- *   §7 screen   — ncurses double-buffer display layer
- *   §8 app      — signals, resize, main game loop
- *
- * Keys:
- *   q / ESC       quit
- *   space         pause
- *   r             reset (figure back to top, new platforms)
- *   w/s, ↑/↓      gravity × 1.3 / ÷ 1.3
- *   a/d, ←/→      wind force ± 20
- *   [ / ]         sim Hz − / +
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *       ragdoll_figure.c -o ragdoll_figure -lncurses -lm
+ * Build (needs -lm for the trig in bone-direction glyphs and normals):
+ *   gcc -std=c11 -O2 -Wall -Wextra ragdoll_figure.c -o ragdoll_figure -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Position-Verlet integration. Each particle stores its
- *                  current and previous position; velocity is implicit in
- *                  the difference. Gravity and wind accelerate particles;
- *                  8 passes of distance-constraint projection (Jakobsen)
- *                  restore all bone lengths after integration. Boundary
- *                  and slanted-platform collisions are implemented as
- *                  position clamp + old_pos reflection, which naturally
- *                  yields a physical bounce without explicit velocity
- *                  manipulation.
- *
- * Data-structure : Ragdoll holds pos[], old_pos[] (the Verlet pair) and
- *                  prev_pos[] (snapshot for sub-tick alpha lerp).
- *                  Constraint arrays c_a[], c_b[], c_len[] are parallel
- *                  arrays indexed by constraint id. Platforms are kept in
- *                  Scene as Platform[] (cx, y, half_w, slope). All state
- *                  lives in pixel space — square, isotropic — so forces
- *                  and distances are correct regardless of the terminal's
- *                  cell aspect ratio.
- *
- * Rendering      : Each bone is walked in DRAW_STEP_PX increments; the
- *                  direction glyph (-, |, /, \) is stamped at every
- *                  terminal cell the bone crosses. Alpha-interpolated
- *                  prev_pos → pos positions keep motion smooth even when
- *                  render Hz ≠ sim Hz. Platforms render in two passes
- *                  (fill 'o' bead, then '0' nodes at quarter points).
- *
- * Performance    : Fixed-step accumulator decouples physics Hz from render
- *                  Hz. 8 constraint iterations × 17 constraints ≈ 136
- *                  scalar projections per tick — trivial. ncurses
- *                  wnoutrefresh + doupdate emits only changed cells.
- *
- * References
- * ──────────
- *   ── Verlet integration (the §5a solver) ──────────────────────────
- *   [1] Verlet, L. (1967), "Computer Experiments on Classical Fluids.
- *       I. Thermodynamical Properties of Lennard-Jones Molecules",
- *       Phys. Rev. 159(1), pp. 98-103 — the original integrator.
- *       The position-only formulation that implicit_velocity()
- *       relies on dates from this paper.
- *   [2] Swope, W. C. et al. (1982), "A computer simulation method
- *       for the calculation of equilibrium constants...", J. Chem.
- *       Phys. 76 — velocity-Verlet variant (we use Verlet's
- *       original position-only form, sometimes called Störmer-Verlet).
- *
- *   ── Ragdoll / character physics (the FULL PIPELINE) ─────────────
- *   [3] Jakobsen, T. (2001), "Advanced Character Physics", GDC —
- *       THE canonical Verlet-ragdoll paper; §2 integrator, §3
- *       distance-constraint relaxation, §4 collisions. This file
- *       implements the entire pipeline described therein.
- *       https://www.cs.cmu.edu/afs/cs/academic/class/15462-s13/www/lec_slides/Jakobsen.pdf
- *   [4] Hecker, C. (2005), "Behind the Screen — Verlet Physics",
- *       Game Developer Magazine — accessible walk-through of the
- *       Jakobsen pipeline with the gotchas a novice will hit.
- *
- *   ── Position Based Dynamics (the modern generalisation) ──────────
- *   [5] Müller, M., Heidelberger, B., Hennix, M. & Ratcliff, J.
- *       (2007), "Position Based Dynamics", J. Vis. Comm. Image Repr.
- *       18(2), pp. 109-118 — generalises Jakobsen's distance-only
- *       projection to arbitrary constraints (bending, volume, etc.).
- *   [6] Bender, J., Müller, M. & Macklin, M. (2017), "A Survey on
- *       Position-Based Simulation Methods in Computer Graphics",
- *       Computer Graphics Forum 36(6) — modern survey including
- *       XPBD and stable extensions.
- *
- *   ── Classical mechanics (the physics of collisions) ─────────────
- *   [7] Goldstein, H. (1980), "Classical Mechanics" (2nd ed.),
- *       Addison-Wesley — §3.6 on collisions: the coefficient of
- *       restitution e and the vector reflection formula
- *       v' = v − (1+e)(v·n)n that drives reflect_velocity_with_
- *       restitution() in §5b-2.
- *
- *   ── Computer graphics (geometric primitives) ─────────────────────
- *   [8] Hughes, J. F., van Dam, A. et al. (2013), "Computer Graphics:
- *       Principles and Practice" (3rd ed.) — §16.4 surface normals;
- *       basis for surface_upward_normal() in §5b-2.
- *
- *   ── Timestep / animation ─────────────────────────────────────────
- *   [9] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com —
- *       the fixed-step accumulator pattern this file uses; alpha
- *       interpolation between prev_pos and pos comes from the same
- *       source.
- *
- *   ── Rendering / ncurses ─────────────────────────────────────────
- *  [10] Bresenham, J. E. (1965), "Algorithm for computer control of
- *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
- *       the integer line algorithm; §5e draw_bone uses the simpler
- *       parametric oversample because float math is already paid
- *       for in the physics step.
- *  [11] Bourke, P. (1997), "Character representation of grayscale
- *       images", paulbourke.net/dataformats/asciiart — basis for
- *       the high-contrast head + joint glyph choices.
- *  [12] Raymond, E. S., "NCURSES Programming HOWTO" —
- *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
- *       use_default_colors, and the diff pipeline §7 relies on.
- *
- *   ── Online quick reference ───────────────────────────────────────
- *  [13] https://en.wikipedia.org/wiki/Verlet_integration
- *  [14] https://en.wikipedia.org/wiki/Position-based_dynamics
- *  [15] https://en.wikipedia.org/wiki/Coefficient_of_restitution
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A ragdoll is just a cloud of particles falling under gravity, with rigid
- * bones enforced as a *post-step correction*: integrate first, then project
- * the network back to its rest distances. Repeat the projection enough
- * times and the figure looks rigid; do it too few times and it stretches
- * like rubber. There is no joint solver, no angular velocity, no torque —
- * the rigidity emerges from iterating distance-only constraints.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine 15 marbles connected by 17 inelastic strings, all falling
- * through a stack of tilted glass shelves. Each tick:
- *   • each marble takes one step in the direction it was already moving,
- *     plus a downward kick from gravity (Verlet);
- *   • whenever a string is too long or too short, the two marbles at its
- *     ends move halfway toward each other (or apart) along the string.
- * Run that string-fix step eight times in a row and the figure looks
- * solid. Touch a shelf and the marble *and its previous position* both
- * snap above the surface — the bounce is automatic.
- *
- * DRAWING METHOD / ALGORITHM IN STEPS
- * ───────────────────────────────────
- *   1. Save prev_pos = pos             (anchor for sub-tick interpolation)
- *   2. If a wind period elapsed, kick old_pos sideways (impulse via Verlet
- *      identity: changing old_pos changes implicit velocity).
- *   3. For each particle, Verlet update:
- *        vel     = (pos − old_pos) · DAMPING
- *        old_pos = pos
- *        pos    += vel + accel · dt²
- *   4. Clamp particles to walls/floor/ceiling; reflect old_pos for bounce.
- *   5. Test each particle against each slanted platform; reflect velocity
- *      along the surface normal n = (slope, −1)/||·|| if crossing from above.
- *   6. Repeat N_CONSTRAINT_ITERS times: walk every bone, project both
- *      endpoints by half the length error along the bone direction.
- *      After each iteration re-apply platform collisions so a bone cannot
- *      yank a foot through a shelf.
- *   7. Render: lerp prev_pos → pos by alpha, stamp bone glyphs and joints.
- *
- * KEY FORMULAS
- * ────────────
- *   Verlet integration (position-implicit velocity):
- *     vel     = (pos − old_pos) · DAMPING
- *     old_pos = pos
- *     pos    += vel + accel · dt²
- *
- *   Distance constraint (Jakobsen projection):
- *     v     = p2 − p1
- *     dist  = |v|
- *     error = (dist − rest) / dist
- *     p1   += 0.5 · error · v        (equal mass → half each)
- *     p2   −= 0.5 · error · v
- *
- *   Slanted-surface reflection (screen +y down, upward normal):
- *     n        = (slope, −1) / sqrt(slope² + 1)
- *     v_n      = v · n
- *     v_refl   = v − (1 + BOUNCE) · v_n · n
- *     old_pos  = pos − v_refl
- *
- *   Pixel→cell aspect-ratio fix:
- *     cx = round(px / CELL_W)
- *     cy = round(py / CELL_H)        CELL_W=8, CELL_H=16
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Two coincident particles → distance ≈ 0 → constraint divides by zero.
- *     satisfy_constraint() bails early when dist < 1e-6.
- *   • Order matters: Verlet integration MUST save old_pos before computing
- *     new pos (verlet_update uses a temp). Reverse order destroys velocity.
- *   • Bones can drag a foot through a platform if collisions only run
- *     before constraints — that is why ragdoll_tick re-applies platform
- *     collisions inside the constraint loop.
- *   • Negative slope = right side higher (looks like /), positive = right
- *     side lower (looks like \) — easy to flip mentally.
- *   • Resize: rescaling platforms must preserve relative layout; clamp all
- *     particle positions to new pixel bounds so none get stranded.
- *   • Frame cap: do NOT add dt to elapsed — it cancels the cap. Use
- *     `clock_ns() − frame_start` only.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Drop the figure with wind=0 and gravity=800: it should land in a
- *     limp pile, no limbs longer than they started (constraint solver OK).
- *   • Pause (space): figure freezes mid-fall. Resume: motion continues
- *     without a velocity glitch (because prev_pos is saved every tick).
- *   • Crank gravity to 3200 and bounce off the floor: figure should rebound
- *     to ~30 % of drop height (BOUNCE_COEFF = 0.55, so √0.55² ≈ 0.30).
- *   • Drop on a 0.4-slope platform: ankle slides sideways — proves the
- *     normal-component reflection is working, not just a vertical bounce.
- *   • Reset (r) repeatedly: every reset must produce a clean T-pose at the
- *     top with all 17 bones at rest length (no pop on first frame).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. This file is your introduction to PHYSICS-BASED
- *      animation. Everything before in animation/ was kinematic
- *      (no forces, just geometry). This is forces + integration +
- *      constraint projection.
- *   2. §5 entity — THE HEART. In sub-section order:
- *        §5a verlet_update           ← T2 (the integrator)
- *        §5b apply_boundaries        ← walls / floor / ceiling
- *        §5b-2 platform_collisions   ← T5 (slanted surfaces)
- *        §5c satisfy_constraint      ← T3 (Jakobsen projection)
- *        §5d ragdoll_tick            ← T4 (orchestration order)
- *        §5e bone_glyph / draw_bone  ← rendering
- *      Read AFTER tutorials T1-T6.
- *   3. §6 scene — Ragdoll + platforms.
- *   4. §1-§4 + §7-§8 — infrastructure. Skim if you've seen the
- *      framework. Note this file uses fixed-step + alpha lerp.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   pos[i]                  particle i's CURRENT position (Vec2).
- *   old_pos[i]              particle i's PREVIOUS position. Velocity
- *                           is implicit: vel = pos − old_pos.
- *   prev_pos[i]             snapshot at start of sim tick (for
- *                           sub-tick alpha lerp).
- *   c_a[k], c_b[k]          endpoints of constraint k (particle
- *                           indices).
- *   c_len[k]                rest length of constraint k.
- *   N_PARTICLES             15 — head, neck, shoulders, elbows,
- *                           wrists, hips, knees, ankles, ...
- *   N_CONSTRAINTS           17 — the bones connecting them.
- *   N_CONSTRAINT_ITERS      8  — Jakobsen iterations per tick.
- *   DAMPING                 multiplier on implicit velocity each
- *                           tick; <1 = energy loss.
- *
- * Background you need
- * ───────────────────
- *   - Newton's laws — gravity is a constant downward acceleration.
- *   - Numerical integration — converting force into motion.
- *   - Distance: |a − b| = sqrt((a.x − b.x)² + (a.y − b.y)²).
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Lagrangian / Hamiltonian mechanics. Verlet is just a
- *     position update.
- *   - Rigid-body dynamics (forces + torques + inertia tensors).
- *     Verlet ragdolls SIMULATE rigid-body behaviour as an
- *     emergent property of constraint iteration.
- *   - Implicit / semi-implicit Euler. Verlet is its own scheme,
- *     simpler than Euler, with better long-term energy behaviour.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Six tutorials that build a Verlet ragdoll from first principles.
- *
- *   T1  The shift from kinematic to physics-based animation
- *   T2  Verlet integration — velocity-implicit position update
- *   T3  Distance constraints — Jakobsen's projection trick
- *   T4  Why iteration order MATTERS for ragdolls
- *   T5  Bouncing off slanted surfaces — reflect, then move old_pos
- *   T6  Why "rigidity" emerges from soft constraints
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  THE SHIFT FROM KINEMATIC TO PHYSICS-BASED ANIMATION
- * ───────────────────────────────────────────────────────
- * Every previous file in animation/ was KINEMATIC. The animator
- * (you, the user, or a sin/cos formula) commands joint
- * positions; the chain follows by FK or IK. No forces, no mass,
- * no collisions — geometry only.
- *
- * A ragdoll is PHYSICS-BASED. You DON'T command joint positions;
- * you specify FORCES (gravity, wind, contact reactions) and let
- * the simulator compute where the particles go. The pose
- * EMERGES from the integrator — the animator gives up direct
- * control of the figure.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │   kinematic            physics-based             │
- *      │                                                  │
- *      │   command pose      command forces               │
- *      │       ↓                  ↓                       │
- *      │     pose             integrator                  │
- *      │                          ↓                       │
- *      │                      pose emerges                │
- *      └──────────────────────────────────────────────────┘
- *
- * The trade:
- *   ‒ Less control: you can't pose a ragdoll by writing
- *     joint angles.
- *   + More realism: gravity, momentum, and contact "just
- *     work" without per-frame authoring.
- *
- * Ragdolls excel at INVOLUNTARY motion (a knocked-out
- * character collapsing) and fail at GOAL-DIRECTED motion
- * (the same character standing back up). Production engines
- * BLEND animation + ragdoll: keyframe animation when the
- * character is conscious, ragdoll when it's not.
- *
- * T2  VERLET INTEGRATION — VELOCITY-IMPLICIT POSITION UPDATE
- * ──────────────────────────────────────────────────────────
- * The simplest physics integrator is EULER:
- *
- *     vel  += accel · dt
- *     pos  += vel   · dt
- *
- * Two state variables per particle (pos, vel). Drift over time
- * is significant — Euler's energy errors accumulate.
- *
- * VERLET INTEGRATION (Loup Verlet, 1967) replaces velocity with
- * an IMPLICIT velocity stored in the previous position:
- *
- *     vel       = pos − old_pos    (implicit, computed when needed)
- *     old_pos   = pos              (save current as new "old")
- *     pos      += vel + accel · dt²
- *
- * One state variable per particle (pos), with old_pos updated
- * each tick. Equivalent to leapfrog or central-difference
- * integration; better long-term stability than Euler.
- *
- * Why Verlet for a ragdoll? TWO HUGE benefits:
- *
- *   1. CONSTRAINT PROJECTION IS TRIVIAL (T3). When you snap a
- *      particle to a new position to fix a constraint, vel
- *      automatically updates because vel is "pos − old_pos."
- *      With Euler you'd have to recompute vel by hand.
- *
- *   2. NO EXPLICIT VELOCITY MANAGEMENT. Bouncing off a wall is
- *      "set old_pos to where vel should reflect" — no separate
- *      velocity vector to maintain.
- *
- * Damping (energy loss): multiply (pos − old_pos) by DAMPING <
- * 1 each tick. Without damping, Verlet conserves energy and the
- * ragdoll bounces forever; with damping, it eventually settles.
- *
- * T3  DISTANCE CONSTRAINTS — JAKOBSEN'S PROJECTION TRICK
- * ──────────────────────────────────────────────────────
- * Each "bone" of the ragdoll is a fixed-length DISTANCE
- * CONSTRAINT between two particles. After the integration step
- * pushes particles around, bones may have stretched or
- * compressed. Jakobsen's (2001) trick: explicitly snap them
- * back to length.
- *
- *     for each constraint (i, j) with rest length L:
- *       v     = pos[j] − pos[i]
- *       dist  = |v|
- *       error = (dist − L) / dist
- *       pos[i] += 0.5 · error · v        ← move i toward j
- *       pos[j] −= 0.5 · error · v        ← move j toward i
- *
- * "Move both endpoints halfway toward (or away from) each
- * other along their connecting line until the distance is
- * exactly L." For equal masses, move each by half the error.
- *
- * One pass per bone fixes that bone, but typically BREAKS
- * adjacent bones (which shared one endpoint). Repeat the whole
- * pass enough times and the system converges.
- *
- * Convergence rate: for small graphs (15 particles, 17
- * constraints) ~8 iterations per tick gives visually rigid
- * limbs. More iterations = stiffer body (and slower); fewer =
- * stretchy / rubbery.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │  before                  after constraint pass   │
- *      │                                                  │
- *      │  A───────B               A─────B                 │
- *      │   ╲       ╲                                      │
- *      │    ╲       ●  C  →   pulls B toward A,           │
- *      │     ╲                pulls A toward B            │
- *      │      D               until |A−B| = L_AB          │
- *      │                                                  │
- *      │  but now B is too close to C!  Iterate again.    │
- *      └──────────────────────────────────────────────────┘
- *
- * T4  WHY ITERATION ORDER MATTERS FOR RAGDOLLS
- * ────────────────────────────────────────────
- * The ragdoll tick has FOUR stages, run in this order:
- *
- *   1. INTEGRATE       Verlet step on every particle.
- *   2. COLLIDE WORLD   clamp to walls; bounce off platforms.
- *   3. SATISFY (×8)    Jakobsen projection on every bone.
- *   4. COLLIDE WORLD   AGAIN — inside the satisfy loop.
- *
- * Why collide AGAIN inside the satisfy loop? Because step 3
- * (constraint projection) can YANK A FOOT BACK THROUGH A
- * PLATFORM. The bone says "ankle must be exactly L from
- * knee," and pulling the knee out of a slanted shelf would
- * shorten the leg.
- *
- * Solution: every constraint iteration, re-collide all
- * particles with the world. The satisfy step then has to
- * accept the world's hard surface BEFORE the next bone tries
- * to pull through it.
- *
- * If you skip the inner-loop collide, the ragdoll's feet will
- * occasionally pop through platforms — the bone yank wins
- * over a single boundary clamp.
- *
- * T5  BOUNCING OFF SLANTED SURFACES — REFLECT, THEN MOVE old_pos
- * ──────────────────────────────────────────────────────────────
- * A horizontal floor bounce is easy: clamp pos.y above the
- * floor, set old_pos.y = floor (reverses implicit velocity).
- * A slanted platform needs vector reflection.
- *
- * Given a platform with slope k:
- *
- *     surface = (1, k)
- *     normal n = (slope, −1) / sqrt(slope² + 1)
- *
- * (We negate the y-component because screen y points down;
- * the "up" normal is the one with negative y.)
- *
- * For each particle that just crossed the platform:
- *
- *     v       = pos − old_pos
- *     v_n     = v · n                 ← component along normal
- *     v_refl  = v − (1 + BOUNCE) · v_n · n
- *     old_pos = pos − v_refl          ← put old_pos to make
- *                                       implicit vel = v_refl
- *
- * Reflecting v through n removes the component into the
- * surface and reverses it. BOUNCE ∈ [0, 1] is the coefficient
- * of restitution: 1 = perfect bounce, 0 = absorbed completely
- * (no rebound — just slides along). 0.55 is "rubbery."
- *
- * Setting old_pos = pos − v_refl is the Verlet way to assign
- * a new velocity. No explicit vel variable to update.
- *
- * Same recipe works for any surface — circular, polygonal,
- * SDF — as long as you can compute the surface normal.
- *
- * T6  WHY "RIGIDITY" EMERGES FROM SOFT CONSTRAINTS
- * ────────────────────────────────────────────────
- * A real human bone is RIGID — its length CANNOT change. Our
- * constraints are SOFT — each iteration only NUDGES particles
- * toward the rest length. With ∞ iterations, the system
- * converges to exact rigidity; with FINITE iterations, the
- * bones can stretch or compress slightly.
- *
- * For 8 iterations and typical drop velocities (gravity 800,
- * dt 16 ms), bones stretch by < 1 % — visually invisible.
- * For dramatically high gravity or heavy impacts, you might
- * see bones briefly elongate at impact frames; cranking
- * N_CONSTRAINT_ITERS to 16 or 32 fixes that at a small CPU
- * cost.
- *
- * Why use SOFT constraints when hard ones would be more
- * accurate? Because hard constraints require solving a linear
- * system (matrix inversion) that gets ugly fast. The Jakobsen
- * iterative trick produces VISUALLY indistinguishable
- * rigidity at a fraction of the complexity, and it scales
- * trivially to thousands of particles + constraints.
- *
- * Production physics engines (Box2D, Bullet, Havok) use
- * SEQUENTIAL IMPULSES — a velocity-based variant of the same
- * idea: iteratively apply impulses to correct constraint
- * violations. The mathematical core is identical; the
- * representation differs.
- *
- * For this terminal demo (15 particles, 17 bones), Jakobsen's
- * position-based projection is simpler, cleaner, and looks
- * indistinguishable from the impulse approach.
- *
- * Same machinery is reused in ragdoll_ropes.c for cloth-like
- * sheets — same Verlet + same Jakobsen, just thousands of
- * particles instead of fifteen.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
 #define _POSIX_C_SOURCE 200809L
 
-/*
- * M_PI is a POSIX extension, not standard C99/C11.
- * _POSIX_C_SOURCE 200809L exposes it on most systems, but if a toolchain
- * omits it we define our own constant so the build never fails.
- */
+/* M_PI isn't standard C; define it ourselves if the toolchain didn't. */
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -533,38 +28,20 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — all tunable numbers, in one place ── */
 
-/*
- * All magic numbers live here.  Change behaviour by editing this block
- * only — never scatter literals through the code.
- */
 enum {
-    /*
-     * SIM_FPS_DEFAULT — target physics tick rate in Hz.
-     * The accumulator loop in §8 fires scene_tick() this many times
-     * per wall-clock second regardless of render frame rate.
-     */
+    /* Physics tick rate in Hz: how many times per second the puppet steps.
+     * Decoupled from on-screen fps by the accumulator loop in main(). */
     SIM_FPS_MIN      =  10,
     SIM_FPS_DEFAULT  =  60,
     SIM_FPS_MAX      = 120,
-    SIM_FPS_STEP     =  10,
+    SIM_FPS_STEP     =  10,   /* [/] keys nudge by this much */
 
-    /*
-     * HUD_COLS — byte budget for the status-bar string.
-     * 96 bytes covers the longest possible HUD at max values.
-     *
-     * FPS_UPDATE_MS — how often the displayed fps is recalculated.
-     */
-    HUD_COLS         =  96,
-    FPS_UPDATE_MS    = 500,
+    HUD_COLS         =  96,   /* byte budget for the status string; fits the widest HUD */
+    FPS_UPDATE_MS    = 500,   /* recompute the displayed fps this often */
 
-    /*
-     * Color-pair IDs.  Pairs 1-7 paint the body; PAIR_HUD/PAIR_HINT paint
-     * the two HUD lines per the project HUD spec.
-     */
+    /* Color-pair IDs. 1..7 paint the body; 8,9 are the HUD lines. */
     PAIR_HEAD        =   1,   /* white   — head marker             */
     PAIR_BODY        =   2,   /* white   — non-head joints         */
     PAIR_SPINE       =   3,   /* grey    — spine + collarbones     */
@@ -575,96 +52,53 @@ enum {
     PAIR_HUD         =   8,   /* bright yellow — top status        */
     PAIR_HINT        =   9,   /* bright cyan   — bottom key hints  */
 
-    /*
-     * Ragdoll topology constants.
-     *
-     * N_PARTICLES — 15 joints representing the humanoid skeleton:
-     *   0=head, 1=neck, 2=left_shoulder, 3=right_shoulder,
-     *   4=left_elbow, 5=right_elbow, 6=left_wrist, 7=right_wrist,
-     *   8=hip_center, 9=left_hip, 10=right_hip,
-     *   11=left_knee, 12=right_knee, 13=left_ankle, 14=right_ankle
-     *
-     * N_CONSTRAINTS — 17 distance constraints:
-     *   spine(2) + arms(4) + legs(4) + hip-cross(2) + collarbones(2) +
-     *   shoulder-width(1) + hip-width(1) + head-shoulder(2) = 17
-     *
-     * N_CONSTRAINT_ITERS — how many full passes over all constraints per
-     *   tick.  8 is sufficient for a 15-particle body at 60 Hz.
-     */
+    /* The puppet: 15 dots ("particles") joined by 17 bones ("constraints").
+     * Dot indices: 0 head, 1 neck, 2/3 shoulders, 4/5 elbows, 6/7 wrists,
+     *   8 hip_center, 9/10 hips, 11/12 knees, 13/14 ankles.
+     * More constraint passes = stiffer body but more CPU; 8 looks rigid
+     * for this many dots. (See satisfy_constraint for the tradeoff.) */
     N_PARTICLES        = 15,
     N_CONSTRAINTS      = 17,
     N_CONSTRAINT_ITERS =  8,
-    N_PLATFORMS        =  5,   /* staggered platforms the ragdoll falls through */
+    N_PLATFORMS        =  5,   /* staggered shelves the puppet falls through */
 
-    /*
-     * N_THEMES  — entries in §3 THEMES[]. Each theme rebinds pairs 1..7
-     *             (body parts) to a distinct multi-colour palette. HUD/HINT
-     *             pairs (8, 9) are theme-independent per CLAUDE.md HUD spec.
-     * N_PRESETS — entries in §6 PRESETS[]. Each preset bundles (gravity,
-     *             wind_force, sim_fps) into a named physics scenario.
-     * N_THEME_SLOTS — slot count per theme; matches the 7 body pairs.
-     */
-    N_THEMES           = 10,
-    N_PRESETS          =  5,
-    N_THEME_SLOTS      =  7,
+    N_THEMES           = 10,   /* color palettes in THEMES[]   */
+    N_PRESETS          =  5,   /* physics scenarios in PRESETS[] */
+    N_THEME_SLOTS      =  7,   /* colors per theme = the 7 body pairs */
 };
 
-/*
- * Physics constants.
- *
- * GRAVITY      — downward acceleration in px/s² (+y is down in screen space).
- * DAMPING      — per-tick velocity damping (multiply implicit vel each tick).
- *                0.995 ≈ 0.5% energy loss per tick = very slight air drag.
- * BOUNCE_COEFF — fraction of velocity preserved after a floor collision.
- *                0.55 gives a lively but controllable bounce.
- * WIND_PERIOD  — seconds between random lateral impulses.
- * WIND_FORCE   — magnitude of each wind impulse in px/s (Verlet velocity units).
- *
- * Boundary margins in pixel space:
- *   FLOOR_MARGIN — how far above the bottom pixel row the floor is placed.
- *   CEIL_MARGIN  — how far below the top pixel row the ceiling is.
- *   LEFT_MARGIN  — how far inside the left edge the left wall is.
- *   RIGHT_MARGIN — how far inside the right edge the right wall is.
- */
-#define GRAVITY       800.0f
-#define DAMPING         0.995f
-#define BOUNCE_COEFF    0.55f
-#define WIND_PERIOD     3.5f
-#define WIND_FORCE    120.0f
+/* Physics tunables. +y points DOWN the screen, so gravity is positive. */
+#define GRAVITY       800.0f   /* downward pull, px/s²                       */
+#define DAMPING         0.995f /* speed kept per tick; <1 = mild air drag    */
+#define BOUNCE_COEFF    0.55f  /* speed kept after a bounce; 0=dead, 1=elastic */
+#define WIND_PERIOD     3.5f   /* seconds between random sideways gusts       */
+#define WIND_FORCE    120.0f   /* strength of each gust                       */
 
+/* How far inside the screen edges the walls sit, in pixels. */
 #define FLOOR_MARGIN    8.0f
 #define CEIL_MARGIN    16.0f
 #define LEFT_MARGIN    16.0f
 #define RIGHT_MARGIN   16.0f
 
-/*
- * DRAW_STEP_PX — pixel step size for dense bone rendering.
- * Must be < CELL_W (8 px) so no terminal cell is skipped along a bone.
- */
+/* Step along a bone in this many pixels when drawing it. Must be < CELL_W
+ * (8) or the dashed line would skip whole terminal cells. */
 #define DRAW_STEP_PX    2.0f
 
-/*
- * Timing primitives — verbatim from framework.c.
- */
+/* Time in nanoseconds. */
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/*
- * Terminal cell dimensions — the aspect-ratio bridge between physics
- * and display (see §4 for full explanation).
- */
-#define CELL_W   8    /* physical pixels per terminal column */
-#define CELL_H  16    /* physical pixels per terminal row    */
+/* One terminal cell is this many physics pixels wide/tall. Cells aren't
+ * square, so physics works in pixels and only converts to cells at draw
+ * time (see §4). */
+#define CELL_W   8
+#define CELL_H  16
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock — monotonic timer + sleep ── */
 
-/*
- * clock_ns() — monotonic wall-clock in nanoseconds.
- * CLOCK_MONOTONIC never goes backward; safe for dt measurements.
- */
+/* Current time in nanoseconds. MONOTONIC never jumps backward, so frame-to-
+ * frame deltas are always sane. */
 static int64_t clock_ns(void)
 {
     struct timespec t;
@@ -672,10 +106,7 @@ static int64_t clock_ns(void)
     return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-/*
- * clock_sleep_ns() — sleep for exactly ns nanoseconds.
- * If ns ≤ 0 (frame over budget) returns immediately without sleeping.
- */
+/* Sleep ns nanoseconds; return at once if the frame already ran over. */
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
@@ -686,38 +117,25 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color — body-part palette + dedicated HUD pair                    */
-/* ===================================================================== */
+/* ── §3 color — body-part palette + HUD pairs ── */
 
 /*
- * Theme — one named multi-colour palette for the 7 body-rendering pairs.
+ * Theme — one named color set for the 7 body pairs (head..strut, in
+ * pair order). The two HUD pairs are NOT themed: they stay bright
+ * yellow/cyan so the status bar reads against any palette. Every value
+ * is from the bright half of the 256-color cube so even the dimmed
+ * strut stays visible.
  *
- * Slot semantics (col[0..6] → pairs PAIR_HEAD..PAIR_STRUT):
- *   [0] head marker            [4] leg bones + ankles
- *   [1] non-head joint dots    [5] slanted platform beads
- *   [2] spine + collarbones    [6] stabiliser struts + ground line (A_DIM)
- *   [3] arm bones + wrists
- *
- * HUD/HINT pairs (PAIR_HUD, PAIR_HINT) are NOT theme-bound — they keep
- * bright yellow / bright cyan across every theme so the status bar
- * remains readable against any palette (CLAUDE.md HUD spec).
- *
- * Brightness rule: every entry sits in the BRIGHT HALF of the 256-colour
- * cube — cube indices ≥ 24, grayscale ≥ 240 — so even the A_DIM strut
- * stays visible. See CLAUDE.md "Theme Palette Brightness".
+ *   name : shown in the HUD.
+ *   col  : 7 xterm-256 foreground indices, one per body pair.
  */
 typedef struct {
-    const char *name;                 /* HUD-displayable theme name        */
-    int         col[N_THEME_SLOTS];   /* xterm-256 fg indices per slot;    *
-                                       * slots [0..6] → PAIR_HEAD..STRUT   */
+    const char *name;
+    int         col[N_THEME_SLOTS];
 } Theme;
 
-/*
- * THEMES — ten multi-colour palettes. Each theme uses several distinct
- * hues across the seven body slots; head and leg colours are usually
- * the most contrasted so the eye finds the figure quickly.
- */
+/* Ten palettes; head and leg colors are usually the most contrasted so
+ * the eye finds the figure fast. */
 static const Theme THEMES[N_THEMES] = {
     /*  name         HEAD  BODY  SPN   ARM   LEG   PLAT  STRUT */
     { "CLASSIC",  { 231,  255,  248,  214,   75,   45,  244 } }, /* default */
@@ -732,16 +150,9 @@ static const Theme THEMES[N_THEMES] = {
     { "CARNIVAL", { 226,  196,  202,   51,   46,  201,  244 } }, /* every primary */
 };
 
-/*
- * theme_apply() — rebind pairs PAIR_HEAD..PAIR_STRUT to theme `idx`.
- *
- *   The seven init_pair calls are the only mutation; HUD/HINT pairs
- *   stay untouched. In 8-colour mode (COLORS < 256) the index palette
- *   is not available, so we leave the fallback pairs from color_init()
- *   in place — themes are a 256-colour feature.
- *
- *   Defensive bound: out-of-range idx folds to 0 (CLASSIC).
- */
+/* Repaint the 7 body pairs from theme `idx`. HUD pairs untouched. Themes
+ * need the 256-color palette, so on 8-color terminals this is a no-op and
+ * the fallback pairs from color_init stay. Out-of-range idx falls to 0. */
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -757,29 +168,9 @@ static void theme_apply(int idx)
     init_pair(PAIR_STRUT,    t->col[6], -1);
 }
 
-/*
- * color_init() — start ncurses colour, bind the initial theme,
- * and pin the two theme-independent HUD pairs.
- *
- * Background = -1 (terminal default) so the demo respects the user's
- * terminal background.  Foreground tints from the bright half of the
- * 256-colour cube — see CLAUDE.md "Theme Palette Brightness".
- *
- *   Pair  Role                                    Theme-bound?
- *   ──────────────────────────────────────────────────────────
- *     1   head marker                             yes
- *     2   generic joint dot                       yes
- *     3   spine + collarbones                     yes
- *     4   arm bones, wrists                       yes
- *     5   leg bones, ankles                       yes
- *     6   slanted platform beads                  yes
- *     7   stabiliser struts + ground line         yes
- *     8   HUD top status (PAIR_HUD)               NO  (always 226 yellow)
- *     9   HUD bottom key hint (PAIR_HINT)         NO  (always  51 cyan)
- *
- * For COLORS < 256 we fall back to the 8-colour ANSI palette and
- * ignore theme cycling (no 256-cube available).
- */
+/* Turn on color, paint the starting theme, and pin the HUD pairs.
+ * Background -1 = the terminal's own background. On terminals with fewer
+ * than 256 colors we use a coarse 8-color palette and drop theme cycling. */
 static void color_init(int initial_theme)
 {
     start_color();
@@ -788,7 +179,7 @@ static void color_init(int initial_theme)
     if (COLORS >= 256) {
         theme_apply(initial_theme);
     } else {
-        /* 8-colour fallback — theme-independent, coarser but readable */
+        /* 8-color fallback — coarser but readable, not themeable */
         init_pair(PAIR_HEAD,     COLOR_WHITE,   -1);
         init_pair(PAIR_BODY,     COLOR_WHITE,   -1);
         init_pair(PAIR_SPINE,    COLOR_WHITE,   -1);
@@ -798,24 +189,17 @@ static void color_init(int initial_theme)
         init_pair(PAIR_STRUT,    COLOR_WHITE,   -1);
     }
 
-    /* HUD pairs — theme-independent in both 256- and 8-colour modes. */
+    /* HUD pairs — same bright yellow/cyan in either color mode. */
     init_pair(PAIR_HUD,  COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ===================================================================== */
-/* §4  coords — pixel↔cell; the one aspect-ratio fix                     */
-/* ===================================================================== */
+/* ── §4 coords — turn physics pixels into terminal cells ── */
 
 /*
- * WHY TWO COORDINATE SPACES
- * ─────────────────────────
- * Terminal cells are not square (CELL_H=16 vs CELL_W=8).  All particle
- * positions are in pixel space (square, isotropic).  Only at draw time
- * are pixel coordinates converted to cell coordinates.
- *
- * px_to_cell_x / px_to_cell_y — round to nearest cell.
- * Formula: cell = floor(px / CELL_DIM + 0.5)  ("round half up")
+ * Physics runs in square pixels; the terminal's cells are tall (16 vs 8),
+ * so a cell is not a pixel. These two helpers do the only conversion, at
+ * draw time. Dividing by the cell size and rounding picks the nearest cell.
  */
 static inline int px_to_cell_x(float px)
 {
@@ -826,207 +210,92 @@ static inline int px_to_cell_y(float py)
     return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  entity — Ragdoll: Verlet particles + distance constraints          */
-/* ===================================================================== */
+/* ── §5 entity — the puppet: dots, bones, and how it moves ── */
 
 /*
- * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
+ * Vec2 — a 2-D point (or vector) in pixel space. Used for positions,
+ * speeds, gusts, and surface normals alike. Passed around by value;
+ * the compiler keeps it in registers.
  *
- * Intent
- *   Every §5 physics quantity — particle positions, velocities (as
- *   pos − old_pos), wind impulses, surface normals — lives in pixel
- *   space. Each character cell is CELL_W × CELL_H sub-pixels
- *   (8 × 16), giving sub-cell precision so the figure moves smoothly
- *   instead of jumping cell-to-cell. The conversion to cell space
- *   happens only inside §5e rendering helpers via px_to_cell_x/y —
- *   the project's "one conversion point" rule.
- *
- * Convention
- *   x : EASTWARD pixel coordinate (positive → right of screen).
- *   y : SOUTHWARD pixel coordinate (positive → DOWN the screen).
- *
- *   The y-down convention matters for the physics:
- *     - GRAVITY is POSITIVE (pulls toward larger y).
- *     - The UPWARD surface normal of a slanted platform has NEGATIVE y.
- *     - "Above" in screen coords is "smaller y".
- *
- * Why a value type
- *   8 bytes; passes in registers. implicit_velocity, apply_damping,
- *   integrate_acceleration, surface_upward_normal, reflect_velocity_
- *   with_restitution all take/return Vec2 by value — -O2 inlines
- *   them into straight-line code with no allocation.
- *
- * Why named (x, y) instead of two loose floats
- *   Type-checking catches (col, row) confusion at compile time
- *   rather than via visual debugging.
- *
- * References [3] Jakobsen §2 for the Verlet position representation;
- *   [8] Hughes & van Dam §16.4 on surface normals in screen space.
+ *   x : pixels rightward (positive → right edge).
+ *   y : pixels DOWNWARD  (positive → bottom). Screen y points down, so
+ *       gravity is positive and "up" means a smaller y — this sign
+ *       convention shows up all through the physics below.
  */
 typedef struct {
-    float x;   /* eastward  pixel coordinate (positive → right) */
-    float y;   /* southward pixel coordinate (positive → down)  */
+    float x;
+    float y;
 } Vec2;
 
 /*
- * Ragdoll — the full simulation state for the humanoid figure.
+ * Ragdoll — everything the puppet is and remembers.
  *
- * Intent
- *   A 15-particle skeleton enforced by 17 distance constraints,
- *   integrated with position-only Verlet. Four interlocked subsystems
- *   share one record:
+ * The trick (Verlet): each dot stores where it is now AND where it was
+ * last frame. Its speed is just the gap between the two, so there is no
+ * separate velocity array. To shove a dot, you move its old position;
+ * that changes the gap, which changes the speed. Every bounce and gust
+ * below works by editing old_pos, never by storing a velocity.
  *
- *     1. VERLET STATE — (pos, old_pos) — the integrator's two-position
- *        memory. Velocity is IMPLICIT: v = pos − old_pos. Modifying
- *        old_pos (without touching pos) injects velocity — this is
- *        how every collision response works in §5b / §5b-2. Ref [1].
+ * Bones ("constraints"): a bone just says "keep these two dots a fixed
+ * distance apart." Each frame, after gravity moves the dots, we walk
+ * every bone and nudge its two dots back to the right distance — many
+ * passes, because fixing one bone disturbs the next. Enough passes and
+ * the loose dots hold a rigid shape that flops like a real ragdoll.
  *
- *     2. RENDER SNAPSHOT — prev_pos — copied from pos at the START of
- *        each physics tick. render_ragdoll lerps prev_pos → pos by
- *        alpha ∈ [0, 1) (the leftover fraction in the fixed-step
- *        accumulator) so motion stays smooth at any combination of
- *        sim Hz and render Hz. Ref [9] Fiedler.
+ *   pos      : where each dot is now. Moves every step.
+ *   old_pos  : where each dot was last step. Speed = pos − old_pos.
+ *              Bounces and gusts write here to change speed.
+ *   prev_pos : snapshot of pos taken at the very start of a step, used
+ *              only to draw smooth in-between frames (see lerp_positions).
+ *              Kept separate from old_pos because old_pos keeps changing
+ *              during a step while prev_pos must stay frozen.
  *
- *     3. CONSTRAINT NETWORK — (c_a[], c_b[], c_len[]) — three parallel
- *        arrays describing N_CONSTRAINTS distance constraints. Each
- *        constraint i connects particle c_a[i] to c_b[i] and tries
- *        to keep them at distance c_len[i]. Rest lengths are computed
- *        from the initial T-pose in scene_init, so the natural
- *        spacing IS the rest pose — no separate constant table.
- *        Iteratively projected to convergence by satisfy_constraint
- *        (Jakobsen relaxation). Refs [3] Jakobsen §3, [5] Müller PBD.
+ *   c_a, c_b : the two dot indices each bone connects.
+ *   c_len    : the distance that bone wants to hold (its rest length),
+ *              measured from the starting pose in scene_init.
  *
- *     4. ENVIRONMENT FORCES — (gravity, wind_force, wind_timer,
- *        wind_x). gravity is a constant downward acceleration; wind
- *        fires periodic random horizontal impulses; wind_timer counts
- *        seconds since the last gust.
- *
- *   The subsystems interact in a fixed order each tick:
- *     env-forces → Verlet integrate → boundary collide → platform
- *     collide → relax constraints (with collision re-pinning).
- *   See ragdoll_tick in §5d for the orchestrator.
- *
- * Why pos AND old_pos AND prev_pos (three position arrays)
- *   - pos     : the CURRENT physics position; mutates every tick.
- *   - old_pos : the PREVIOUS physics position; defines implicit velocity.
- *   - prev_pos: the position at the START of the current tick;
- *               anchor for sub-tick render interpolation.
- *   Why not collapse old_pos and prev_pos? Because they are updated
- *   at DIFFERENT moments: old_pos is shifted inside verlet_update
- *   and tweaked by every collision response throughout the tick;
- *   prev_pos is frozen at tick start. Conflating them would corrupt
- *   either the integrator or the renderer.
- *
- * Why constraint arrays are PARALLEL (SoA), not array-of-structs
- *   The inner loop of relax_constraints_with_collision_repinning
- *   walks all three arrays in lockstep; SoA gives sequential cache
- *   reads. Also the rest of the file already uses parallel arrays
- *   for per-particle state (foot/hip/etc in other files), so the
- *   convention is consistent.
- *
- * Why wind is APPLIED VIA old_pos (not as a force in verlet_update)
- *   Wind is an IMPULSE (an instantaneous velocity change), not a
- *   sustained force. In Verlet form, an impulse is a shift of
- *   old_pos in the direction of the desired velocity change. This
- *   keeps the integrator's force term (just gravity) simple.
- *
- * References [1] Verlet 1967 + [3] Jakobsen 2001 for the integrator
- *   and constraint network; [5] Müller PBD for the projection
- *   generalisation; [9] Fiedler for the prev_pos lerp pattern.
+ *   gravity    : downward pull, px/s² (tunable with w/s and presets).
+ *   wind_force : strength of each gust (tunable with a/d and presets).
+ *   wind_timer : seconds since the last gust; fires at WIND_PERIOD.
+ *   wind_x     : sideways acceleration applied this step.
+ *   paused     : true freezes the physics; drawing keeps running.
  */
 typedef struct {
-    /* ── Verlet state (the integrator's two-position memory) ──── *
-     * pos    : current positions, mutated every tick.            *
-     * old_pos: previous positions; v = pos − old_pos (implicit). *
-     *          Collision response writes here to inject velocity. */
     Vec2 pos     [N_PARTICLES];
     Vec2 old_pos [N_PARTICLES];
-
-    /* ── Render snapshot (sub-tick interpolation anchor) ──────── *
-     * Frozen at the start of each physics tick; render_ragdoll   *
-     * lerps prev_pos → pos by alpha for smooth motion.           */
     Vec2 prev_pos[N_PARTICLES];
 
-    /* ── Constraint network (SoA, length N_CONSTRAINTS) ───────── *
-     * Constraint i: keep particles c_a[i] and c_b[i] at distance *
-     * c_len[i]. Rest lengths from the initial T-pose.            */
     int   c_a  [N_CONSTRAINTS];
     int   c_b  [N_CONSTRAINTS];
     float c_len[N_CONSTRAINTS];
 
-    /* ── Environment forces ───────────────────────────────────── *
-     * gravity     : continuous downward acceleration (px/s²).    *
-     * wind_force  : magnitude of each gust impulse (px/s).        *
-     * wind_timer  : seconds since last gust; gust fires when      *
-     *               ≥ WIND_PERIOD.                                *
-     * wind_x      : current gust contribution to integrator       *
-     *               acceleration this tick (px/s²). Decays via    *
-     *               the natural DAMPING factor.                   */
-    float gravity;            /* runtime-tunable via w/s + presets    */
-    float wind_force;         /* runtime-tunable via a/d + presets    */
+    float gravity;
+    float wind_force;
     float wind_timer;
     float wind_x;
 
-    /* ── Control flags ────────────────────────────────────────── */
-    bool  paused;             /* gates scene_tick; renderer still runs */
+    bool  paused;
 } Ragdoll;
 
-/* ── §5a  verlet_update ─────────────────────────────────────────────── */
+/* ── §5a verlet_update — move each dot under gravity + wind ── */
 
-/*
- * implicit_velocity — Verlet's defining trick.
- *
- *   In Verlet integration, velocity is NEVER stored explicitly. It's
- *   reconstructed from two consecutive positions:
- *
- *       v(t) ≈ pos(t) − pos(t − dt)
- *
- *   This means the state vector (pos, old_pos) carries BOTH position
- *   AND momentum — any modification to old_pos automatically alters
- *   the implicit velocity. Collision response uses this property
- *   heavily: shift old_pos behind pos to inject velocity.
- *
- *   Reference: Verlet (1967) "Computer Experiments on Classical
- *   Fluids", Phys. Rev. 159 — original integrator. Jakobsen (2001)
- *   "Advanced Character Physics" GDC — cloth/character application.
- */
+/* Speed of a dot = where it is now minus where it was last step.
+ * That's the whole Verlet idea: no stored velocity, just two positions. */
 static inline Vec2 implicit_velocity(Vec2 pos, Vec2 old_pos)
 {
     return (Vec2){ pos.x - old_pos.x, pos.y - old_pos.y };
 }
 
-/*
- * apply_damping — multiplicative velocity damping per tick.
- *
- *   v' = v · DAMPING
- *
- *   DAMPING = 0.995 corresponds to ~0.5% kinetic-energy loss per
- *   tick — a very mild air drag. Multiplicative damping in Verlet
- *   form is equivalent to a viscous friction term −β·v in the
- *   continuous equations of motion, with β chosen so that
- *   (1 − β·dt) ≈ DAMPING for the simulation's dt.
- */
+/* Shrink the speed a hair each step (DAMPING < 1) so the puppet loses
+ * energy and eventually settles instead of bouncing forever. */
 static inline Vec2 apply_damping(Vec2 v, float damping)
 {
     return (Vec2){ v.x * damping, v.y * damping };
 }
 
-/*
- * integrate_acceleration — Verlet position step.
- *
- *   pos(t + dt) = pos(t) + v(t)·dt + a·dt²
- *
- *   In our reduced form (with v already multiplied by dt in the
- *   implicit-velocity reconstruction), the equation collapses to:
- *
- *       pos' = pos + v + a · dt²
- *
- *   where v is the position DELTA over the last tick (i.e. already
- *   "·dt") and a · dt² is the standard ½·a·t² term — Verlet's
- *   second-order accuracy folds the ½ into the implicit-velocity
- *   formulation, so the explicit coefficient is 1 not ½.
- */
+/* The Verlet step: new position = old position + carried speed + the
+ * gravity/wind nudge (acceleration × dt²). v already covers one step of
+ * motion, so it isn't multiplied by dt again here. */
 static inline Vec2 integrate_acceleration(Vec2 pos, Vec2 v, Vec2 a, float dt2)
 {
     return (Vec2){
@@ -1036,21 +305,12 @@ static inline Vec2 integrate_acceleration(Vec2 pos, Vec2 v, Vec2 a, float dt2)
 }
 
 /*
- * verlet_update — one Störmer-Verlet integration step on particle i.
+ * verlet_update — advance one dot by one step.
  *
- *   1. v       = implicit_velocity(pos, old_pos)   (Verlet trick)
- *   2. v      ← apply_damping(v)                   (air drag)
- *   3. a       = (wind_x, gravity)                 (external accel)
- *   4. old_pos ← pos                               (slide state vector)
- *   5. pos    ← integrate_acceleration(pos, v, a, dt²)
- *
- *   Step 4 MUST run before step 5 — otherwise the new pos would
- *   overwrite the cur it depends on. The temporary variable
- *   captured at step 1 prevents the aliasing.
- *
- *   gravity is positive because +y is downward in pixel space.
- *
- *   Reference: Jakobsen (2001) §2 "Verlet Integration".
+ * Read its speed, trim it for drag, then slide old_pos up to the current
+ * pos and push pos forward by speed + gravity/wind. Saving the current
+ * position into `cur` first is what lets old_pos and pos update without
+ * clobbering each other.
  */
 static void verlet_update(Ragdoll *r, int i, float dt)
 {
@@ -1065,28 +325,13 @@ static void verlet_update(Ragdoll *r, int i, float dt)
     r->pos[i]     = integrate_acceleration(cur, v, a, dt2);
 }
 
-/* ── §5b  apply_boundaries ──────────────────────────────────────────── */
+/* ── §5b apply_boundaries — keep dots inside the screen ── */
 
 /*
- * bounce_against_wall_1d — one-axis elastic-with-restitution bounce.
- *
- *   For an axis-aligned wall in 1-D, the Verlet bounce is:
- *
- *       1. v_axis = pos − old_pos          (implicit velocity, 1-D)
- *       2. pos    ← wall                    (clamp onto surface)
- *       3. old_pos ← wall + v_axis · e     (encode reflected vel)
- *
- *   Step 3 places old_pos PAST the wall by an amount proportional
- *   to the impact velocity, so the next tick's implicit velocity
- *   (pos − old_pos) points AWAY from the wall — the bounce.
- *
- *   e ∈ (0, 1] is the COEFFICIENT OF RESTITUTION:
- *     e = 1    perfectly elastic (no energy loss)
- *     e → 0    perfectly inelastic (sticks to wall)
- *     e = 0.55 our default — rubbery thump
- *
- *   Reference: any classical mechanics text on 1-D collisions;
- *   e.g. Goldstein "Classical Mechanics" §3.6.
+ * Bounce a dot off a flat wall on one axis. Pin it onto the wall, then
+ * place old_pos on the far side so next step's speed points away from the
+ * wall — that reversed gap IS the bounce. BOUNCE_COEFF (0..1) sets how
+ * much speed survives: 1 = perfectly bouncy, 0 = dead stop.
  */
 static inline void bounce_against_wall_1d(float *pos, float *old_pos,
                                           float wall)
@@ -1096,15 +341,9 @@ static inline void bounce_against_wall_1d(float *pos, float *old_pos,
     *old_pos = wall + v_axis * BOUNCE_COEFF;
 }
 
-/*
- * snap_to_wall_1d — one-axis HARD STOP (no bounce).
- *
- *   Both pos and old_pos collapse to `wall`, which zeroes the
- *   implicit velocity on that axis. Used for the ceiling where
- *   bouncing would feel unphysical (gravity pulls particles
- *   down; ceiling impacts are vanishingly rare and the soft stop
- *   prevents tunnelling).
- */
+/* Dead stop on one axis: both positions snap to the wall, so the gap (and
+ * thus the speed) is zero. Used for the ceiling, where a bounce would look
+ * odd and a hard stop also avoids tunnelling. */
 static inline void snap_to_wall_1d(float *pos, float *old_pos, float wall)
 {
     *pos     = wall;
@@ -1112,18 +351,9 @@ static inline void snap_to_wall_1d(float *pos, float *old_pos, float wall)
 }
 
 /*
- * apply_boundaries — keep particle i inside the screen rectangle.
- *
- *   Four axis-aligned walls. Floor + side walls BOUNCE; ceiling
- *   HARD-STOPS. Each test is independent so corner impacts bounce
- *   correctly on both axes.
- *
- *     wall          test                action
- *     ────────────────────────────────────────────────────────
- *     floor         pos.y > floor_y     bounce_against_wall_1d
- *     ceiling       pos.y < ceil_y      snap_to_wall_1d
- *     left wall     pos.x < left_x      bounce_against_wall_1d
- *     right wall    pos.x > right_x     bounce_against_wall_1d
+ * Keep dot i inside the screen box. Floor and side walls bounce; the
+ * ceiling hard-stops. The four tests are independent, so a corner hit
+ * bounces correctly on both axes.
  */
 static void apply_boundaries(Ragdoll *r, int i, int cols, int rows)
 {
@@ -1142,93 +372,46 @@ static void apply_boundaries(Ragdoll *r, int i, int cols, int rows)
         bounce_against_wall_1d(&r->pos[i].x, &r->old_pos[i].x, right_x);
 }
 
-/* ── §5b-2  platform collision ─────────────────────────────────────── */
+/* ── §5b-2 platform collision — bounce off the slanted shelves ── */
 
 /*
- * Platform — one slanted shelf the ragdoll bounces off of.
+ * Platform — one tilted shelf, just a line segment in pixel space. A dot
+ * landing on it bounces; because the shelf is tilted, the bounce also
+ * shoves the dot sideways, which is what makes the puppet zig-zag down
+ * the stack. Set up once in init_platforms and never changed after.
  *
- * Intent
- *   A platform is a LINE SEGMENT in pixel space defined by a centre
- *   point (cx, y), a half-width (half_w), and a slope (dy/dx).
- *   The surface equation is:
- *
- *       y_surface(x) = y + (x − cx) · slope     for x ∈ [cx−hw, cx+hw]
- *
- *   §5b-2 `surface_y_at_x` and `particle_within_platform_extent`
- *   both read directly from this struct.
- *
- * Slope sign convention (screen +y down)
- *   POSITIVE slope ⇒ right side LOWER on screen:  \
- *   NEGATIVE slope ⇒ right side HIGHER on screen: /
- *   ZERO slope     ⇒ flat horizontal:             —
- *
- *   The slanted surface DEFLECTS the ragdoll sideways on impact (a
- *   slanted normal mixes y-momentum into x-momentum) — this is what
- *   makes the figure zig-zag through the platform stack instead of
- *   falling straight down. See `surface_upward_normal` and
- *   `reflect_velocity_with_restitution` in §5b-2.
- *
- * Why a value-only struct (no behaviour)
- *   Platforms are immutable scenery — they sit in `Scene::platforms[]`
- *   and never mutate after `init_platforms()`. All behaviour
- *   (intersection, reflection) lives in §5b-2 helpers that take a
- *   `const Platform *`.
- *
- * References [7] Goldstein §3.6 for the impact mechanics; [8] Hughes
- *   & van Dam §16.4 for the line-segment geometry.
+ *   cx     : center x of the shelf.
+ *   y      : surface height at cx (the line pivots here).
+ *   half_w : half the shelf's width; it exists for x in [cx-hw, cx+hw].
+ *   slope  : rise per pixel rightward. With +y down: positive tilts the
+ *            right end down (\), negative tilts it up (/), zero is flat.
  */
 typedef struct {
-    float cx;       /* centre x (pixel space)                          */
-    float y;        /* surface y at cx (pivot point of the surface line)*/
-    float half_w;   /* half-width along x; surface exists on [-hw,+hw]  */
-    float slope;    /* dy/dx in screen coords (+y down); see signs above*/
+    float cx;
+    float y;
+    float half_w;
+    float slope;
 } Platform;
 
-/*
- * surface_y_at_x — height of the platform surface at horizontal x.
- *
- *     y_surface(x) = y_centre + (x − cx) · slope
- *
- *   Linear equation of a line, with cx as the pivot point and slope
- *   as dy/dx (rise per pixel rightward in screen coordinates).
- *   POSITIVE slope ⇒ right side LOWER (screen +y down):  \
- *   NEGATIVE slope ⇒ right side HIGHER:                   /
- *
- *   Called twice per collision check (current x, previous x) so the
- *   swept-segment test handles a slanted surface correctly even
- *   when the particle moves horizontally between ticks.
- */
+/* Height of the shelf line directly under x. Sampled at both the dot's
+ * old and new x so the cross test below works even when the dot also
+ * slid sideways. */
 static inline float surface_y_at_x(const Platform *pl, float x)
 {
     return pl->y + (x - pl->cx) * pl->slope;
 }
 
-/*
- * particle_within_platform_extent — x-range gate.
- *
- *   A platform exists only on |x − cx| ≤ half_w. A particle outside
- *   the x-range is treated as missing the platform entirely (the
- *   surface line has no support there).
- */
+/* True only when x is within the shelf's width; outside it there's no
+ * shelf to land on. */
 static inline bool particle_within_platform_extent(const Platform *pl,
                                                    float x)
 {
     return fabsf(x - pl->cx) <= pl->half_w;
 }
 
-/*
- * particle_crossed_surface_from_above — swept-segment collision test.
- *
- *   The particle's trajectory from old_pos to pos is a line segment.
- *   We check whether that segment crossed the platform surface
- *   going DOWNWARD (from above to below):
- *
- *       old_pos.y ≤ surf_y(old_pos.x)  AND  pos.y ≥ surf_y(pos.x)
- *
- *   The double-surface-sample form (different x at each end) is
- *   what makes this work for slanted platforms. Using a single
- *   surf_y would alias under fast horizontal motion.
- */
+/* Did the dot pass through the shelf going downward this step? True when
+ * it was at/above the line last frame and at/below it now. Sampling the
+ * line at each end's own x is what handles the tilt. */
 static inline bool particle_crossed_surface_from_above(const Platform *pl,
                                                        Vec2 old_pos,
                                                        Vec2 pos)
@@ -1238,24 +421,9 @@ static inline bool particle_crossed_surface_from_above(const Platform *pl,
     return (old_pos.y <= surf_old) && (pos.y >= surf_now);
 }
 
-/*
- * surface_upward_normal — unit normal of the inclined line,
- * pointing UP in screen coordinates (toward smaller y).
- *
- *   The tangent of a line y = m·x is (1, m).
- *   Rotating by +90° (math-CCW) gives (−m, 1), which points DOWN
- *   on screen because y-axis is flipped.
- *   Rotating by −90° gives (m, −1) — pointing UP on screen. We
- *   want the upward normal; normalising gives:
- *
- *       n = (slope, −1) / √(slope² + 1)
- *
- *   For slope = 0 (flat platform): n = (0, −1) — straight up. ✓
- *   For positive slope (\): n leans rightward — perpendicular to \. ✓
- *
- *   Reference: Hughes, van Dam et al. "Computer Graphics: Principles
- *   and Practice" §16.4 — geometric reflection / surface normals.
- */
+/* The "up" direction perpendicular to a shelf of this slope, as a unit
+ * vector. Flat shelf gives straight up (0, -1); a tilt leans it sideways.
+ * The bounce reflects across this direction. */
 static inline Vec2 surface_upward_normal(float slope)
 {
     float length = sqrtf(slope * slope + 1.0f);
@@ -1263,27 +431,10 @@ static inline Vec2 surface_upward_normal(float slope)
 }
 
 /*
- * reflect_velocity_with_restitution — vector reflection of v about
- * surface normal n, scaled by coefficient of restitution e.
- *
- *   Decompose v into normal and tangential components:
- *       v_n = (v · n) · n             (normal component)
- *       v_t = v − v_n                 (tangential component)
- *
- *   Elastic reflection:    v' = v_t − v_n
- *   With restitution e:    v' = v_t − e · v_n
- *                              = v − (1 + e) · (v · n) · n
- *
- *   e = 0 → "stuck to surface" (zero normal velocity after impact).
- *   e = 1 → perfectly elastic (kinetic energy preserved on impact).
- *
- *   Why the slanted surface DEFLECTS the figure sideways: when n
- *   has a non-zero x component, the (v · n) · n term subtracts
- *   from BOTH x and y components of v. Energy from the y direction
- *   leaks into the x direction.
- *
- *   Reference: Goldstein "Classical Mechanics" §3.6 on collisions;
- *   Verlet 1967 + Jakobsen 2001 for the integration framework.
+ * Reflect speed v off a surface whose "up" is n, keeping fraction e of it.
+ * Strip out the part heading into the surface and reverse it; the part
+ * sliding along stays. Because a tilted n points partly sideways, some of
+ * the downward speed turns into sideways speed — that's the deflection.
  */
 static inline Vec2 reflect_velocity_with_restitution(Vec2 v, Vec2 n, float e)
 {
@@ -1292,19 +443,8 @@ static inline Vec2 reflect_velocity_with_restitution(Vec2 v, Vec2 n, float e)
     return (Vec2){ v.x - factor * n.x, v.y - factor * n.y };
 }
 
-/*
- * write_implicit_velocity — encode a velocity vector back into the
- * Verlet (pos, old_pos) state.
- *
- *   Verlet's implicit-velocity rule is  v = pos − old_pos.
- *   To make the next tick see velocity v, place old_pos at:
- *
- *       old_pos = pos − v
- *
- *   Used after any collision response that computes a new velocity:
- *   pos is already at the collision point; we write old_pos behind
- *   it so the implicit velocity matches the reflected one.
- */
+/* Give a dot a chosen speed the Verlet way: put old_pos exactly that far
+ * behind pos, so next step's gap (pos − old_pos) equals the speed. */
 static inline void write_implicit_velocity(Vec2 *old_pos, Vec2 pos, Vec2 v)
 {
     old_pos->x = pos.x - v.x;
@@ -1312,21 +452,10 @@ static inline void write_implicit_velocity(Vec2 *old_pos, Vec2 pos, Vec2 v)
 }
 
 /*
- * resolve_one_platform_collision — full reflection sequence for
- * particle i against platform pl (assumed already INTERSECTED).
- *
- *   1. Capture v = implicit_velocity(pos, old_pos) BEFORE snapping
- *      (so the saved v reflects the pre-collision motion).
- *   2. pos.y ← surface_y_at_x(pl, pos.x)        (snap onto surface)
- *   3. n     = surface_upward_normal(pl.slope)  (Frenet normal)
- *   4. if v · n ≥ 0  : already moving away — return (no-op).
- *   5. v_reflected = reflect_velocity_with_restitution(v, n, e)
- *   6. write_implicit_velocity(old_pos, pos, v_reflected)
- *
- *   Step 4 (the "already moving away" guard) handles the case where
- *   the particle rests on the surface and the constraint pass has
- *   pushed it slightly sideways — without this guard, the reflection
- *   would launch the particle off the platform spuriously.
+ * Bounce dot i off shelf pl (already known to have been crossed). Grab its
+ * speed first, pin it onto the shelf, then reflect. The "moving away" skip
+ * stops a dot already resting on the shelf from being flung off when a
+ * bone nudges it sideways.
  */
 static void resolve_one_platform_collision(Ragdoll *r, int i,
                                            const Platform *pl)
@@ -1343,18 +472,9 @@ static void resolve_one_platform_collision(Ragdoll *r, int i,
     write_implicit_velocity(&r->old_pos[i], r->pos[i], v_reflected);
 }
 
-/*
- * apply_platform_collisions — bounce particle i off any slanted shelf.
- *
- *   For each platform pl:
- *     1. particle_within_platform_extent (x-range gate)
- *     2. particle_crossed_surface_from_above (swept-segment test)
- *     3. resolve_one_platform_collision (slanted-surface bounce)
- *
- *   A slanted surface naturally transfers some y-momentum into x-
- *   momentum, deflecting the ragdoll sideways on impact — the same
- *   physics that makes a stone skip on water.
- */
+/* Check dot i against every shelf: if it's over the shelf's width AND
+ * just crossed the surface going down, bounce it. The tilt deflects it
+ * sideways, like a stone skipping on water. */
 static void apply_platform_collisions(Ragdoll *r, int i,
                                       const Platform *plats, int n)
 {
@@ -1370,19 +490,10 @@ static void apply_platform_collisions(Ragdoll *r, int i,
     }
 }
 
-/* ── §5c  satisfy_constraint ────────────────────────────────────────── */
+/* ── §5c satisfy_constraint — hold each bone at its length ── */
 
-/*
- * displacement_and_length — Δ = b − a and its Euclidean length, in one pass.
- *
- *   Returns:
- *     *out_delta  ← b − a            (displacement vector)
- *     return val  ← |b − a|         (Euclidean length)
- *
- *   Saving one sqrt + one struct field-write per call vs computing
- *   them separately. Called N_CONSTRAINT_ITERS × N_CONSTRAINTS times
- *   per tick — the inner loop of the position-based dynamics relax.
- */
+/* Return the vector from a to b (via out_delta) and its length, computing
+ * both in one pass; called a lot, so it shares the work. */
 static inline float displacement_and_length(Vec2 a, Vec2 b, Vec2 *out_delta)
 {
     out_delta->x = b.x - a.x;
@@ -1392,34 +503,12 @@ static inline float displacement_and_length(Vec2 a, Vec2 b, Vec2 *out_delta)
 }
 
 /*
- * satisfy_constraint — Jakobsen relaxation step for one distance
- * constraint (position-based dynamics).
- *
- *   Given particles p_a, p_b and rest length L, define:
- *
- *       Δ           = p_b − p_a              (current displacement)
- *       d           = |Δ|                    (current length)
- *       fractional  = (d − L) / d            (stretch / length, signed)
- *
- *   POSITIVE fractional → stretched (need to pull together).
- *   NEGATIVE fractional → compressed (need to push apart).
- *
- *   EQUAL-MASS CORRECTION (Jakobsen 2001 §3): split the error
- *   evenly between the two endpoints, each moving HALF the residual:
- *
- *       p_a' = p_a + ½ · fractional · Δ      (toward midpoint if
- *       p_b' = p_b − ½ · fractional · Δ       stretched)
- *
- *   For unequal masses m_a, m_b the splits become m_b/(m_a+m_b) and
- *   m_a/(m_a+m_b). We use uniform mass so the splits are both ½.
- *
- *   Iterating this projection over ALL constraints N_CONSTRAINT_ITERS
- *   times converges the system: each pass typically halves the
- *   residual stretch (geometric convergence — Gauss-Seidel style).
- *
- *   References: Jakobsen (2001) "Advanced Character Physics" GDC §3.
- *     Müller, Heidelberger, Hennix & Ratcliff (2007) "Position Based
- *     Dynamics", J. Vis. Comm. Image Repr. 18(2) — generalisation.
+ * Fix one bone: nudge its two dots back to the bone's rest length. Measure
+ * how far off the current distance is, then move each dot half the error
+ * along the line between them — together if stretched, apart if squashed.
+ * One nudge isn't enough because fixing this bone disturbs its neighbours;
+ * the relax loop calls this over all bones many times until they settle.
+ * Both dots share the error equally (they're treated as equal weight).
  */
 static void satisfy_constraint(Ragdoll *r, int ci)
 {
@@ -1428,7 +517,7 @@ static void satisfy_constraint(Ragdoll *r, int ci)
 
     Vec2  delta;
     float length = displacement_and_length(r->pos[a], r->pos[b], &delta);
-    if (length < 1e-6f) return;        /* degenerate: particles coincide */
+    if (length < 1e-6f) return;        /* dots on top of each other — avoid /0 */
 
     float fractional = (length - r->c_len[ci]) / length;
     float cx         = 0.5f * fractional * delta.x;
@@ -1438,34 +527,21 @@ static void satisfy_constraint(Ragdoll *r, int ci)
     r->pos[b].x -= cx;  r->pos[b].y -= cy;
 }
 
-/* ── §5d  ragdoll_tick ──────────────────────────────────────────────── */
+/* ── §5d ragdoll_tick — run one physics step in the right order ── */
 
-/*
- * snapshot_for_render_interpolation — copy pos into prev_pos.
- *
- *   The renderer lerps prev_pos → pos by `alpha` (the fractional
- *   leftover in the fixed-step accumulator) so motion stays smooth
- *   even when render Hz ≠ sim Hz. MUST run before physics modifies
- *   pos this tick — otherwise the lerp anchor collapses.
- */
+/* Save where every dot is right now. The renderer blends from here toward
+ * the new positions to draw smooth in-between frames, so this must run
+ * before the physics moves anything this step. */
 static inline void snapshot_for_render_interpolation(Ragdoll *r)
 {
     memcpy(r->prev_pos, r->pos, sizeof r->pos);
 }
 
 /*
- * apply_wind_gust — periodic random horizontal impulse to every particle.
- *
- *   Wind in Verlet form is a VELOCITY KICK, not a force. Moving
- *   old_pos by Δx shifts the implicit velocity by +Δx for the next
- *   tick — exactly what an instantaneous lateral push would do.
- *
- *   Gust timing  : every WIND_PERIOD seconds.
- *   Magnitude    : wind_force × random ∈ [0.5, 1.0]   (so gusts vary).
- *   Direction    : ±1 coin flip                       (left or right).
- *
- *   `dt` is the per-tick duration so impulse · dt scales the kick
- *   consistently across different sim_fps choices.
+ * Every WIND_PERIOD seconds, shove every dot sideways by a random gust.
+ * It's an instant push, not a steady force, so we apply it the Verlet way:
+ * move old_pos sideways, which changes the gap and so the speed.
+ * Strength varies 0.5..1.0 of wind_force; direction is a coin flip.
  */
 static void apply_wind_gust(Ragdoll *r, float dt)
 {
@@ -1481,27 +557,11 @@ static void apply_wind_gust(Ragdoll *r, float dt)
 }
 
 /*
- * relax_constraints_with_collision_repinning — N iterations of
- * Jakobsen distance-constraint relaxation, INTERLEAVED with
- * platform-collision repinning.
- *
- *   For iter = 0 .. N_CONSTRAINT_ITERS:
- *     1. Project every distance constraint to rest length
- *        (satisfy_constraint for ci = 0 .. N_CONSTRAINTS).
- *     2. Re-apply platform collisions to every particle.
- *
- *   WHY INTERLEAVE? Constraint projection moves particles. That
- *   motion can push a particle THROUGH a surface it had bounced off
- *   in the pre-relaxation pass. Re-applying collisions after each
- *   projection step "re-pins" any particle that crossed back through
- *   a platform, preventing bones from tunnelling through shelves.
- *
- *   This is the position-based-dynamics pattern: alternate between
- *   internal (constraint) and external (collision) projections until
- *   they roughly agree. Convergence rate is geometric — each iter
- *   halves the residual violation in practice.
- *
- *   References: Jakobsen (2001) §3-4; Müller et al. (2007) §3.
+ * Hold the skeleton together: many passes of fixing every bone, and after
+ * each pass re-bounce the dots off the shelves. The re-bounce matters
+ * because fixing a bone can drag a foot back through a shelf it had landed
+ * on; redoing the collision each pass pins it back on top. More passes =
+ * stiffer body for more CPU (N_CONSTRAINT_ITERS sets the tradeoff).
  */
 static void relax_constraints_with_collision_repinning(Ragdoll *r,
                                                        const Platform *plats)
@@ -1515,74 +575,37 @@ static void relax_constraints_with_collision_repinning(Ragdoll *r,
 }
 
 /*
- * ragdoll_tick — one complete physics step.
- *
- *   1. snapshot_for_render_interpolation
- *        prev_pos ← pos                 (anchor for sub-tick lerp)
- *
- *   2. pause gate
- *        if paused return                (prev_pos saved so freeze is clean)
- *
- *   3. apply_wind_gust                   (random horizontal velocity kick)
- *
- *   4. verlet_update per particle        (integrate gravity + wind)
- *
- *   5. apply_boundaries per particle     (walls / floor / ceiling)
- *
- *   6. apply_platform_collisions per particle  (initial platform pass)
- *
- *   7. relax_constraints_with_collision_repinning
- *        N_CONSTRAINT_ITERS × (Jakobsen + collision re-pin)
- *
- *   ORDER MATTERS:
- *     integration (4) → boundary collision (5) → platform collision (6)
- *     → constraint relaxation with re-pinning (7).
- *
- *   The collision-BEFORE-relaxation order is what lets a foot land
- *   on the floor first (5), then have the constraint pull the knee
- *   into position (7). Reversing the order would tunnel bones
- *   through the floor.
- *
- *   References: Jakobsen (2001) §3-4 for the full pipeline;
- *     Verlet (1967) for the integrator.
+ * One full physics step. The order is the whole trick: move the dots
+ * first, let them hit the world, THEN hold the bones. Doing collisions
+ * before the bone-fixing is what lets a foot land on a shelf and then the
+ * leg fold up to it, instead of the bone yanking the foot through the floor.
  */
 static void ragdoll_tick(Ragdoll *r, float dt, int cols, int rows,
                          const Platform *plats)
 {
-    /* (1) snapshot for render interpolation */
-    snapshot_for_render_interpolation(r);
+    snapshot_for_render_interpolation(r);     /* remember frame start for drawing */
 
-    /* (2) pause gate */
-    if (r->paused) return;
+    if (r->paused) return;                     /* frozen, but snapshot already saved */
 
-    /* (3) wind */
     apply_wind_gust(r, dt);
 
-    /* (4) Verlet integration */
     for (int i = 0; i < N_PARTICLES; i++)
-        verlet_update(r, i, dt);
+        verlet_update(r, i, dt);               /* gravity + wind move every dot */
 
-    /* (5) walls + floor + ceiling */
     for (int i = 0; i < N_PARTICLES; i++)
-        apply_boundaries(r, i, cols, rows);
+        apply_boundaries(r, i, cols, rows);    /* walls, floor, ceiling */
 
-    /* (6) initial platform pass (before relaxation) */
     for (int i = 0; i < N_PARTICLES; i++)
         apply_platform_collisions(r, i, plats, N_PLATFORMS);
 
-    /* (7) PBD constraint relaxation with collision re-pinning */
-    relax_constraints_with_collision_repinning(r, plats);
+    relax_constraints_with_collision_repinning(r, plats);   /* hold the bones */
 }
 
-/* ── §5e  ragdoll_draw ──────────────────────────────────────────────── */
+/* ── §5e ragdoll_draw — stamp the puppet into the terminal ── */
 
-/*
- * bone_glyph() — ASCII character that best represents a bone's direction.
- *
- * Same logic as seg_glyph() in snake_forward_kinematics.c.
- * Maps (dx, dy) angle to one of '-', '/', '|', '\'.
- * dy is negated before atan2f to convert terminal-down to math-up.
- */
+/* Pick the ASCII char that best matches a bone's slope: -, /, |, or \.
+ * dy is flipped first so the angle is measured the usual math way despite
+ * screen y pointing down. */
 static chtype bone_glyph(float dx, float dy)
 {
     float ang = atan2f(-dy, dx);
@@ -1596,15 +619,10 @@ static chtype bone_glyph(float dx, float dy)
     return                             (chtype)'/';
 }
 
-/*
- * draw_bone() — stamp glyphs along one bone from pixel point a to b.
- *
- * Walks the bone in DRAW_STEP_PX increments, converting each sample to a
- * terminal cell and stamping a direction glyph.  Deduplication via
- * *prev_cx / *prev_cy avoids double-drawing within one bone and at the
- * joint between adjacent bones (shared endpoint, same cell).
- * Out-of-bounds cells are silently skipped.
- */
+/* Draw one bone as a dashed line from a to b: walk it in small pixel steps,
+ * stamping the direction glyph in each cell touched. prev_cx/prev_cy skip
+ * re-stamping the same cell (within a bone and at shared joints).
+ * Off-screen cells are dropped. */
 static void draw_bone(WINDOW *w,
                       Vec2 a, Vec2 b,
                       int pair, attr_t attr,
@@ -1636,13 +654,8 @@ static void draw_bone(WINDOW *w,
     }
 }
 
-/*
- * mark_cell() — stamp one ASCII glyph at terminal cell (cx,cy).
- *
- * Centralises the (chtype)(unsigned char) cast plus bounds-check that would
- * otherwise be repeated at every mvwaddch site.  Glyph is silently dropped
- * if the cell is off-screen.
- */
+/* Put one char at cell (cx,cy) with color+attr. Off-screen cells are
+ * dropped. The cast keeps chars > 127 from sign-extending into garbage. */
 static void mark_cell(WINDOW *w, int cx, int cy, char ch,
                       int pair, attr_t attr, int cols, int rows)
 {
@@ -1652,15 +665,9 @@ static void mark_cell(WINDOW *w, int cx, int cy, char ch,
     wattroff(w, COLOR_PAIR(pair) | attr);
 }
 
-/*
- * lerp_positions() — fill rp[] with alpha-interpolated render positions.
- *
- * rp[i] = prev_pos[i] + (pos[i] − prev_pos[i]) · alpha
- *
- * alpha ∈ [0,1) is the leftover fraction in the fixed-step accumulator.
- * Without this lerp, motion stutters whenever render Hz ≠ sim Hz; with
- * it, the figure glides smoothly at any combination of the two rates.
- */
+/* Blend each dot from its frame-start position toward its current one by
+ * alpha (0..1). Physics steps at a fixed rate that rarely matches the
+ * draw rate; this in-between blend keeps motion smooth instead of jerky. */
 static void lerp_positions(const Ragdoll *r, float alpha, Vec2 rp[N_PARTICLES])
 {
     for (int i = 0; i < N_PARTICLES; i++) {
@@ -1669,13 +676,9 @@ static void lerp_positions(const Ragdoll *r, float alpha, Vec2 rp[N_PARTICLES])
     }
 }
 
-/*
- * draw_platforms() — render the slanted shelves in two passes per platform.
- *
- * Pass 1 fills every cell along the surface with 'o' (the bead).
- * Pass 2 over-stamps quarter-point '0' nodes (A_BOLD on ends + centre),
- * giving each shelf a clear visual anchor without losing the smooth line.
- */
+/* Draw each shelf in two passes: first a line of 'o' beads along the
+ * surface, then bolder '0' anchors at the ends and midpoint so the shelf
+ * has a clear shape. */
 static void draw_platforms(WINDOW *w, const Platform *plats,
                            int cols, int rows)
 {
@@ -1715,9 +718,7 @@ static void draw_platforms(WINDOW *w, const Platform *plats,
     }
 }
 
-/*
- * draw_ground() — single dashed row at the floor for visual reference.
- */
+/* A dashed line across the floor row, just for visual reference. */
 static void draw_ground(WINDOW *w, int cols, int rows)
 {
     int floor_row = px_to_cell_y((float)(rows * CELL_H) - FLOOR_MARGIN);
@@ -1728,18 +729,13 @@ static void draw_ground(WINDOW *w, int cols, int rows)
 }
 
 /*
- * draw_bones() — render every distance constraint as a glyph-stamped line.
- *
- * Bone palette is keyed by constraint index ranges:
- *   0–1   spine (head→neck, neck→hip)            PAIR_SPINE A_BOLD
- *   2–3   collarbones (neck→shoulders)           PAIR_SPINE A_NORMAL
- *   4–7   arms (shoulders→elbows→wrists)         PAIR_ARM   A_NORMAL
- *   8–9   hip cross (hip_center→hips)            PAIR_SPINE A_NORMAL
- *   10–13 legs (hips→knees→ankles)               PAIR_LEG   A_NORMAL
- *   14–16 stabilisers (shoulder-W, hip-W, strut) PAIR_STRUT A_DIM
- *
- * The pcx/pcy de-dup state is reset per bone so adjacent bones don't
- * suppress each other's first cell.
+ * Draw all 17 bones, each colored by which body part it is:
+ *   0-1 spine, 2-3 collarbones, 8-9 hip cross  → SPINE color
+ *   4-7 arms                                   → ARM color
+ *   10-13 legs                                 → LEG color
+ *   14-16 hidden stabiliser struts             → STRUT color, dimmed
+ * The de-dup state is reset per bone so neighbours don't blank each
+ * other's first cell.
  */
 static void draw_bones(WINDOW *w, const Ragdoll *r,
                        const Vec2 rp[N_PARTICLES], int cols, int rows)
@@ -1752,12 +748,8 @@ static void draw_bones(WINDOW *w, const Ragdoll *r,
         PAIR_LEG,   PAIR_LEG,   PAIR_LEG,   PAIR_LEG,             /* 10–13 */
         PAIR_STRUT, PAIR_STRUT, PAIR_STRUT,                       /* 14–16 */
     };
-    /*
-     * BOLD on every ANATOMICAL bone (0..13) so the figure reads as a
-     * "filled in" body rather than a skeletal wire-frame. Stabiliser
-     * struts (14..16) stay DIM — they are physics-only constraints,
-     * not body parts, and should fade into the background.
-     */
+    /* Body bones (0..13) are bold so the figure looks solid; the three
+     * stabiliser struts (14..16) are physics-only, so they stay dim. */
     static const attr_t bone_attr[N_CONSTRAINTS] = {
         A_BOLD, A_BOLD,                            /*  0-1  spine        */
         A_BOLD, A_BOLD,                            /*  2-3  collarbones  */
@@ -1778,28 +770,11 @@ static void draw_bones(WINDOW *w, const Ragdoll *r,
 }
 
 /*
- * draw_particles() — over-stamp joint markers on top of bones.
- *
- * Visual hierarchy (after brightness pass to make the figure read
- * as a human rather than a wire-frame skeleton):
- *
- *   Particle role        Glyph  Pair         Attr      Why
- *   ─────────────────────────────────────────────────────────────────
- *   HEAD (i=0)           — handled by draw_head() (two-cell head)
- *   neck (1)             '+'    SPINE        A_DIM     hidden by spine
- *   shoulders (2,3)      'o'    SPINE        A_BOLD    torso anchor
- *   elbows (4,5)         'o'    ARM          A_NORMAL  mid-limb hinge
- *   wrists (6,7)         'o'    ARM          A_BOLD    "fists" — limb tip
- *   hip_center (8)       '+'    SPINE        A_DIM     hidden by hip cross
- *   hips (9,10)          'o'    SPINE        A_BOLD    torso anchor
- *   knees (11,12)        'o'    LEG          A_NORMAL  mid-limb hinge
- *   ankles (13,14)       'v'    LEG          A_BOLD    "feet" — limb tip
- *
- * BOLD on the four torso anchors (shoulders + hips) + four limb tips
- * (fists + feet) gives the figure a "human" silhouette: a clear torso
- * with visible body-mass corners, plus four limb extremities. The
- * mid-limb joints (elbows, knees) stay NORMAL so they don't compete
- * with the limb tips for attention.
+ * Stamp a joint marker over each dot (head is drawn separately). The glyph
+ * and brightness pick out the silhouette: shoulders and hips are bold 'o'
+ * torso corners, wrists are bold 'o' fists, ankles are bold 'v' feet,
+ * elbows and knees are plain 'o' hinges, and neck/hip-center are dim '+'
+ * since the bones already cover them.
  */
 static void draw_particles(WINDOW *w, const Vec2 rp[N_PARTICLES],
                            int cols, int rows)
@@ -1834,29 +809,10 @@ static void draw_particles(WINDOW *w, const Vec2 rp[N_PARTICLES],
 }
 
 /*
- * draw_head() — two-cell head: face + tumble-aware "hair" halo cell.
- *
- *   Cell 1 (face):  'O' BOLD at the head particle position.
- *   Cell 2 (hair):  '\'' BOLD one cell-step along the (head − neck)
- *                   direction — i.e. away from the body, on the
- *                   "outside" of the head. Because the offset is
- *                   recomputed every frame from the live head→neck
- *                   vector, the hair stays on top of the head no
- *                   matter how the ragdoll tumbles (right-side-up,
- *                   upside-down, sideways — the halo always points
- *                   away from the torso).
- *
- *   Step distance — one cell of anisotropy: (CELL_W·u_x, CELL_H·u_y).
- *   This makes the halo land on a NEIGHBOURING cell in any direction
- *   regardless of the screen's 8:16 cell aspect ratio.
- *
- *   Degenerate guard — if the head and neck collide (rare, very
- *   strong compression), the unit vector is undefined; skip the
- *   halo and just draw the face.
- *
- *   Drawn LAST in render_ragdoll() so the head + halo win every
- *   shared cell against bones and other joint markers — the head
- *   stays the focal point of the figure.
+ * Draw the head as two cells: an 'O' face, plus a tick of "hair" one cell
+ * away in the head-minus-neck direction (always the side facing away from
+ * the body, so it stays on top however the puppet tumbles). Recomputed each
+ * frame; drawn last so the head wins any shared cell.
  */
 static void draw_head(WINDOW *w, const Vec2 rp[N_PARTICLES],
                       int cols, int rows)
@@ -1864,16 +820,16 @@ static void draw_head(WINDOW *w, const Vec2 rp[N_PARTICLES],
     Vec2 head = rp[0];
     Vec2 neck = rp[1];
 
-    /* Face cell — 'O' is universally a "head" in ASCII art. */
     int fx = px_to_cell_x(head.x);
     int fy = px_to_cell_y(head.y);
     mark_cell(w, fx, fy, 'O', PAIR_HEAD, A_BOLD, cols, rows);
 
-    /* Hair cell — one cell along (head − neck), normalised. */
+    /* Step one cell along head→neck (scaled per axis since cells aren't
+     * square) to place the hair on a neighbouring cell. */
     float dx = head.x - neck.x;
     float dy = head.y - neck.y;
     float len = sqrtf(dx * dx + dy * dy);
-    if (len < 0.1f) return;          /* degenerate: head ≈ neck */
+    if (len < 0.1f) return;          /* head sits on neck — no direction, skip hair */
 
     float ux = dx / len;
     float uy = dy / len;
@@ -1886,20 +842,9 @@ static void draw_head(WINDOW *w, const Vec2 rp[N_PARTICLES],
     mark_cell(w, hx, hy, '\'', PAIR_HEAD, A_BOLD, cols, rows);
 }
 
-/*
- * render_ragdoll() — orchestrate one frame in painter's order.
- *
- *   1. lerp_positions  — sub-tick interpolation
- *   2. draw_platforms  — slanted shelves first (bottom layer)
- *   3. draw_ground     — floor reference line
- *   4. draw_bones      — every distance constraint stamped as glyph line
- *   5. draw_particles  — joint markers on top of bones (skips head)
- *   6. draw_head       — two-cell head (face + tumble-aware hair) ON TOP
- *
- * Order matters: each later layer over-stamps earlier ones at shared
- * cells, so joints read above bones, the head reads above joints, etc.
- * draw_head runs LAST so the focal point of the figure always wins.
- */
+/* Draw one frame back-to-front: shelves and ground, then bones, then
+ * joints, then the head last. Later layers paint over earlier ones at
+ * shared cells, so the head always reads on top. */
 static void render_ragdoll(const Ragdoll *r, WINDOW *w,
                            int cols, int rows, float alpha,
                            const Platform *plats)
@@ -1914,77 +859,29 @@ static void render_ragdoll(const Ragdoll *r, WINDOW *w,
     draw_head      (w, rp,       cols, rows);
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6 scene — the world: puppet + shelves + presets ── */
 
 /*
- * Scene — composition root for §6.
- *
- * Intent
- *   The world is one ragdoll plus a fixed stack of N_PLATFORMS
- *   slanted shelves. Scene bundles both into a single record so the
- *   framework loop (scene_init / scene_tick / scene_draw) reads
- *   identically to every other file in the repo.
- *
- * Simulation vs Rendering locality
- *   The Ragdoll struct itself already separates Verlet state /
- *   render snapshot / constraint network / environment forces /
- *   control flags. Within Scene there are only two members:
- *
- *     ── Simulation state ──   things scene_tick READS+WRITES
- *        ragdoll               the 15-particle figure (§5)
- *
- *     ── World geometry (immutable) ──  scenery the figure interacts
- *                                       with; never mutated after
- *                                       init_platforms() in scene_init
- *        platforms[]           N_PLATFORMS slanted shelves (§5b-2)
- *
- *   Platforms count as SIMULATION input (the collision pass reads
- *   them) but never as simulation OUTPUT — they don't carry energy
- *   or position state between ticks. Re-initialised on SIGWINCH so
- *   the shelf layout always fits the current terminal.
- *
- * Things that DO NOT live here
- *   - sim_fps + theme_idx + preset_idx → §8 App (these are SESSION
- *     state, not part of the simulated world).
- *   - fps counter → main() local (display-only).
- *   - terminal extents (cols, rows) → §7 Screen.
- *   - signal flags (running, need_resize) → §8 App.
- *   - Preset / Theme tables → file-scope `static const`; never
- *     mutate, never duplicated per scene.
- *
- * One Scene per program; passed by pointer to every §6 entry point.
- *
- * References [3] Jakobsen for the physics composition; [9] Fiedler
- *   for the scene_tick / scene_draw separation that the framework
- *   loop in §8 uses.
+ * Scene — the whole world: the puppet plus the shelves it falls past.
+ * The shelves are read by the collision pass but never change during a
+ * step; they're rebuilt on resize so the layout fits the new terminal.
+ * Settings like theme and preset live in App, not here, so a reset can
+ * wipe the scene without losing them.
  */
 typedef struct {
-    /* ── Simulation state ─────────────────────────────────────── */
-    Ragdoll  ragdoll;                  /* 15-particle humanoid figure */
-
-    /* ── World geometry (immutable scenery) ───────────────────── */
-    Platform platforms[N_PLATFORMS];   /* slanted shelves              */
+    Ragdoll  ragdoll;
+    Platform platforms[N_PLATFORMS];
 } Scene;
 
 /*
- * Preset — one named physics scenario.
+ * Preset — a named bundle of the three settings the user can cycle (n/p):
+ * gravity, wind strength, and physics tick rate. Values are tuned for how
+ * they look in the terminal, not for real-world accuracy.
  *
- * Bundles the three runtime-tunable scalars (gravity, wind_force,
- * sim_fps) into a single "world preset" the user can cycle between
- * with n/p. Each entry is a coherent setting — e.g. MOON is low
- * gravity with light air, JUPITER is heavy gravity with light wind.
- *
- *   gravity    — px/s² along +y (downward). Earth-equivalent ≈ 800.
- *   wind_force — magnitude of each random lateral impulse (px/s).
- *   sim_fps    — fixed-step Hz for the physics accumulator; higher
- *                values give a stiffer feel at the cost of CPU.
- *
- * Reference: any introductory physics text — surface gravity ratios
- * (Moon ≈ 1/6 g, Jupiter ≈ 2.5 g). The values here are SCALED for
- * visual effect, not literal: the demo trades physical accuracy for
- * readable motion at terminal frame rates.
+ *   name       : shown in the HUD.
+ *   gravity    : downward pull, px/s².
+ *   wind_force : strength of each gust.
+ *   sim_fps    : physics steps per second; higher feels stiffer, costs CPU.
  */
 typedef struct {
     const char *name;
@@ -1993,16 +890,8 @@ typedef struct {
     int         sim_fps;
 } Preset;
 
-/*
- * PRESETS — five named scenarios. PRESETS[0] EARTH is the default
- * matching the original §1 constants GRAVITY + WIND_FORCE.
- *
- *   EARTH    — baseline; the original feel of the demo.
- *   MOON     — low gravity; figure drifts slowly downward.
- *   TORNADO  — Earth gravity + violent wind; rag-doll thrash.
- *   JUPITER  — heavy gravity; collapses fast and slams platforms.
- *   ZERO_G   — gravity off; wind pushes the figure around in a void.
- */
+/* Five scenarios. EARTH (index 0) is the default and matches §1's GRAVITY
+ * and WIND_FORCE; the rest are exaggerated for fun. */
 static const Preset PRESETS[N_PRESETS] = {
     /*  name         gravity   wind_force  sim_fps */
     { "EARTH",         800.0f,   120.0f,     60 },
@@ -2012,19 +901,9 @@ static const Preset PRESETS[N_PRESETS] = {
     { "ZERO_G",          0.0f,   200.0f,     60 },
 };
 
-/*
- * preset_apply() — write the preset's physics scalars into the ragdoll.
- *
- *   Only mutates the runtime-tunable scalars; the chain topology,
- *   particle positions, and constraint network are untouched. Callers
- *   that want a fresh figure (e.g. n/p preset cycling) call scene_init
- *   BEFORE preset_apply.
- *
- *   sim_fps lives in App, not in Ragdoll, so the caller is responsible
- *   for applying PRESETS[idx].sim_fps to app->sim_fps separately.
- *
- *   Defensive bound: out-of-range idx folds to 0 (EARTH).
- */
+/* Copy a preset's gravity and wind into the puppet. Leaves the figure's
+ * shape alone, so callers wanting a fresh figure call scene_init first.
+ * sim_fps lives in App, so the caller sets that separately. Bad idx → 0. */
 static void preset_apply(Ragdoll *r, int idx)
 {
     if (idx < 0 || idx >= N_PRESETS) idx = 0;
@@ -2034,21 +913,16 @@ static void preset_apply(Ragdoll *r, int idx)
 }
 
 /*
- * init_platforms() — place N_PLATFORMS shelves staggered across the screen.
- *
- * Y positions evenly spaced from ~18% to ~78% of screen height.
- * X positions alternate left-center-right so the ragdoll zig-zags down.
- * Each platform is about 36% of the screen width.
+ * Lay out the shelves: spread down the screen (18%..78% of height), left/
+ * center/right across it so the puppet zig-zags, each ~36% wide, with
+ * alternating tilt (positive = right end lower \, negative = right end up /).
  */
 static void init_platforms(Platform *plats, int cols, int rows)
 {
     float wpx = (float)(cols * CELL_W);
     float hpx = (float)(rows * CELL_H);
-    float hw   = wpx * 0.18f;   /* half-width: 36% of screen total */
+    float hw   = wpx * 0.18f;   /* half-width, so full width is 36% of screen */
 
-    /* Staggered y, alternating x, alternating slope direction.
-     * slope in pixel space: positive = right side lower (\), negative = right higher (/)
-     * Using ±0.35 gives visible tilt and meaningful sideways deflection on bounce. */
     static const float yfrac [N_PLATFORMS] = { 0.18f,  0.32f,  0.47f,  0.62f,  0.77f };
     static const float xfrac [N_PLATFORMS] = { 0.50f,  0.25f,  0.72f,  0.35f,  0.65f };
     static const float slopes[N_PLATFORMS] = { -0.35f,  0.38f, -0.40f,  0.32f, -0.36f };
@@ -2061,14 +935,9 @@ static void init_platforms(Platform *plats, int cols, int rows)
     }
 }
 
-/*
- * add_constraint() — helper to register one distance constraint.
- *
- * The rest length is computed from the current (initial) positions of
- * the two particles so bones are exactly the initial spacing long.
- * This means the rest pose IS the initial T-pose — no separate constant
- * table needed.
- */
+/* Register one bone between dots a and b. Its rest length is just their
+ * current spacing, so whatever pose the dots are placed in becomes the
+ * shape the bones try to hold — no separate length table needed. */
 static void add_constraint(Ragdoll *r, int *nc, int a, int b)
 {
     if (*nc >= N_CONSTRAINTS) return;
@@ -2081,33 +950,11 @@ static void add_constraint(Ragdoll *r, int *nc, int a, int b)
 }
 
 /*
- * scene_init() — place the ragdoll in a T-pose at the screen centre.
- *
- * PARTICLE LAYOUT (pixel offsets from screen centre):
- *
- *   Part            Index  dx    dy   Description
- *   ─────────────────────────────────────────────────
- *   head               0    0   -96   32px above neck
- *   neck               1    0   -64   32px above hip_center
- *   left_shoulder      2  -48   -64   same height as neck
- *   right_shoulder     3  +48   -64
- *   left_elbow         4  -96   -64   96px from neck horiz
- *   right_elbow        5  +96   -64
- *   left_wrist         6 -144   -64
- *   right_wrist        7 +144   -64
- *   hip_center         8    0   -32   midpoint of hips
- *   left_hip           9  -32   -32   32px left of hip_center
- *   right_hip         10  +32   -32
- *   left_knee         11  -32    16   below hip
- *   right_knee        12  +32    16
- *   left_ankle        13  -32    64   below knee
- *   right_ankle       14  +32    64
- *
- * All positions start at pixel-space centre of the screen plus these
- * offsets.  The figure hangs in a T-pose so constraints initialise with
- * their natural rest lengths.
- *
- * prev_pos is set equal to pos so the alpha lerp is a no-op on frame 1.
+ * Build a fresh puppet: spawn it in a spread-arm "T" pose near the top so
+ * it can fall through every shelf, then register the 17 bones (their rest
+ * lengths come straight from this pose). The off[] table below gives each
+ * dot's pixel offset from the spawn point. old_pos and prev_pos start equal
+ * to pos, so the figure begins at rest with no jump on frame 1.
  */
 static void scene_init(Scene *sc, int cols, int rows)
 {
@@ -2120,18 +967,14 @@ static void scene_init(Scene *sc, int cols, int rows)
     r->wind_timer = 0.0f;
     r->wind_x     = 0.0f;
 
-    /* Init platforms first so they exist before figure is placed */
     init_platforms(sc->platforms, cols, rows);
 
-    /* Spawn near top of screen so the figure falls through all platforms.
-     * Head is at cy-96; CEIL_MARGIN=16, so cy must be > 112 to clear ceiling. */
+    /* Spawn point: centered, near the top. cy must clear the head (96px up)
+     * plus CEIL_MARGIN, so 130 keeps the whole figure on screen. */
     float cx = (float)(cols * CELL_W) * 0.5f;
     float cy = CEIL_MARGIN + 130.0f;
 
-    /*
-     * Initial T-pose positions.
-     * (x-offset, y-offset) from (cx, cy) for each of the 15 particles.
-     */
+    /* Each dot's (x, y) offset from the spawn point, in pixels. */
     static const float off[N_PARTICLES][2] = {
         /*  0 head          */  {  0.0f, -96.0f },
         /*  1 neck          */  {  0.0f, -64.0f },
@@ -2153,11 +996,11 @@ static void scene_init(Scene *sc, int cols, int rows)
     for (int i = 0; i < N_PARTICLES; i++) {
         r->pos[i].x     = cx + off[i][0];
         r->pos[i].y     = cy + off[i][1];
-        r->old_pos[i]   = r->pos[i];   /* zero initial velocity */
+        r->old_pos[i]   = r->pos[i];   /* old == now → starts at rest */
         r->prev_pos[i]  = r->pos[i];
     }
 
-    /* Register all 17 distance constraints */
+    /* The 17 bones, in the order draw_bones colors them. */
     int nc = 0;
     add_constraint(r, &nc,  0,  1);   /*  0: head → neck (spine top)          */
     add_constraint(r, &nc,  1,  8);   /*  1: neck → hip_center (spine)        */
@@ -2181,20 +1024,14 @@ static void scene_init(Scene *sc, int cols, int rows)
      * plus the shoulder-width strut provides sufficient head stability. */
 }
 
-/*
- * scene_tick() — one fixed-step physics update.
- * dt is the fixed tick duration in seconds (1.0 / sim_fps).
- * Delegates to ragdoll_tick() which handles prev_pos save internally.
- */
+/* One physics step. dt is the fixed step length in seconds (1 / sim_fps). */
 static void scene_tick(Scene *sc, float dt, int cols, int rows)
 {
     ragdoll_tick(&sc->ragdoll, dt, cols, rows, sc->platforms);
 }
 
-/*
- * scene_draw() — render the scene; called once per render frame.
- * alpha ∈ [0,1) is the sub-tick interpolation factor (see §5e).
- */
+/* Draw one frame. alpha (0..1) is how far between physics steps we are,
+ * used to blend for smooth motion. */
 static void scene_draw(const Scene *sc, WINDOW *w,
                        int cols, int rows, float alpha, float dt_sec)
 {
@@ -2202,41 +1039,16 @@ static void scene_draw(const Scene *sc, WINDOW *w,
     render_ragdoll(&sc->ragdoll, w, cols, rows, alpha, sc->platforms);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen — the ncurses display layer ── */
 
-/*
- * Screen — terminal-extent snapshot in CHARACTER CELLS.
- *
- * Intent
- *   Caches the current terminal size so every §6 entry point reads
- *   (cols, rows) as plain ints rather than re-querying ncurses each
- *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
- *   propagated to scene_init via app_do_resize.
- *
- * Why a separate struct (not just two ints in App)
- *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
- *   except this struct. Carving it out makes screen_resize pure and
- *   isolates the ncurses dependency from the simulation layer.
- *
- * Why cells, not pixels
- *   ncurses' coordinate system is cells. Pixel space (CELL_W × CELL_H
- *   sub-pixels per cell) lives only inside §5 — converted at the
- *   draw boundary, per the project's "one conversion point" rule.
- *
- * References [12] Raymond, NCURSES Programming HOWTO.
- */
+/* Screen — the terminal's size in character cells. Cached so the rest of
+ * the code reads cols/rows as plain ints, and refreshed on resize. */
 typedef struct {
-    int cols;   /* terminal width  in CHARACTER CELLS */
-    int rows;   /* terminal height in CHARACTER CELLS */
+    int cols;   /* width  in cells */
+    int rows;   /* height in cells */
 } Screen;
 
-/*
- * screen_init() — configure the terminal for animation.
- * Settings match framework.c exactly (see snake_forward_kinematics.c §7
- * for full rationale).
- */
+/* Put the terminal into raw, no-echo, hidden-cursor mode for animation. */
 static void screen_init(Screen *s)
 {
     initscr();
@@ -2319,9 +1131,7 @@ static void screen_draw(Screen *s, const Scene *sc,
  */
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app — top-level container + main loop ── */
 
 /*
  * App — top-level container; everything outside the world.

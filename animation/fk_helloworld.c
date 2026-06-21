@@ -1,476 +1,19 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * fk_helloworld.c — two-link arm driven by joint angles (forward kinematics)
+ * fk_helloworld.c — a two-link arm you steer by joint angles (forward kinematics).
  *
- * DEMO: The textbook hello-world of FORWARD kinematics, the
- *       counterpart to ik_helloworld.c. A two-link arm hangs off
- *       a fixed shoulder. The user controls TWO joint angles
- *       directly with the arrow keys; the elbow and hand
- *       positions are COMPUTED from those angles by composing
- *       two rotations. The hand is no longer commanded — it is
- *       wherever the angles place it.
+ * You set the shoulder and elbow angles with the arrow keys; the elbow and
+ * hand positions just follow from those angles. Forward kinematics means
+ * angles in, positions out — the opposite of ik_helloworld.c, which takes a
+ * hand position and solves back for the angles.
  *
- *           S ──────────────── E ──────────────── H
- *           @       L1         O       L2         *
- *        shoulder            elbow              hand
- *         (fixed)         (computed)         (computed)
+ * Sisters: ik_helloworld.c (same arm, reversed), snake_forward_kinematics.c
+ * and snake_inverse_kinematics.c (the same idea on a long chain).
  *
- *       ←/→ rotate θ1 (the shoulder angle).
- *       ↑/↓ rotate θ2 (the elbow angle, relative to the upper arm).
- *       Hold a key and watch the hand sweep through space —
- *       that traced path is exactly what ik_helloworld.c has to
- *       INVERT to recover the angles from a hand position.
- *
- * FK vs IK in one paragraph
- *   FK (this file): user inputs JOINT ANGLES → compute positions.
- *                   Closed-form. One unique answer for every input.
- *                   No reachability check, no two-solution
- *                   ambiguity. Just two rotations composed.
- *   IK (partner)  : user inputs the HAND POSITION → back-solve
- *                   for the angles via law of cosines. TWO valid
- *                   solutions per reachable target (elbow up/down),
- *                   reachability check needed. The hard
- *                   mathematical inverse of FK.
- *   FK is the EASY direction. Every IK solver is essentially
- *   asking "what FK input produced THIS output?" — so studying
- *   FK first makes IK intelligible.
- *
- * Symbol meanings — note how '*' flips role between the two files:
- *
- *               IK (ik_helloworld.c)        FK (this file)
- *     '@'  S    fixed (same)                fixed (same)
- *     'O'  E    computed (IK output)        computed (FK output)
- *     '*'  ─    *target* — user INPUT        *hand* — FK OUTPUT
- *
- * Study alongside:
- *   animation/ik_helloworld.c             — the IK partner: same
- *                                           geometry, opposite
- *                                           input/output flow.
- *   animation/snake_forward_kinematics.c  — FK on a long chain.
- *   animation/snake_inverse_kinematics.c  — FABRIK on a long chain.
- *
- * Section map:
- *   §1  config       — every tunable in one place
- *   §2  clock        — monotonic timer + sleep
- *   §3  color        — HUD/HINT plus per-link / per-marker pairs
- *   §4  coords       — pixel↔cell aspect-ratio bridge
- *   §5  fk           — Vec2 + compute_fk(S, θ1, θ2) → (E, H)
- *   §6  scene        — Scene state, input, draw
- *   §7  screen       — ncurses init / present / HUD
- *   §8  app          — signals, resize, main loop
- *
- * Keys:
- *   q / ESC      quit
- *   space        pause / resume angle input
- *   r            reset angles to zero (arm horizontal)
- *   ← / →        rotate θ1  (shoulder)
- *   ↑ / ↓        rotate θ2  (elbow, relative to upper arm)
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra animation/fk_helloworld.c \
- *       -o fk_helloworld -lncurses -lm
+ * Keys: q/ESC quit  space pause  r reset  L/R shoulder angle  U/D elbow angle.
+ * Build: gcc -std=c11 -O2 -Wall -Wextra animation/fk_helloworld.c \
+ *            -o fk_helloworld -lncurses -lm   (trig, so -lm is required)
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Forward Kinematics — given joint angles θ1, θ2
- *                  and link lengths L1, L2, compute joint positions
- *                  by composing two rotations from the fixed
- *                  shoulder S:
- *                      E = S + L1·(cos θ1,        sin θ1)
- *                      H = E + L2·(cos(θ1 + θ2),  sin(θ1 + θ2))
- *                  No equations to solve, no triangle to construct,
- *                  no ambiguity. Hand position is a deterministic
- *                  function of the joint angles.
- *
- * Data-structure : One Vec2 for the fixed shoulder, two scalar
- *                  angles (theta1, theta2) for user input, and two
- *                  cached Vec2 outputs (elbow, hand) in the scene.
- *                  compute_fk(S, θ1, θ2) is a pure function returning
- *                  an ArmPose struct; the main loop assigns its
- *                  result into scene.{elbow, hand} so renderer and
- *                  HUD can read the positions without recomputing.
- *
- * Rendering      : Identical to ik_helloworld.c — two coloured
- *                  lines (S→E cyan, E→H orange) plus three markers
- *                  ('@' shoulder, 'O' elbow, '*' hand). The visual
- *                  is the same; only the data flow direction
- *                  differs. In IK '*' is INPUT (you place the
- *                  hand); in FK '*' is OUTPUT (the hand is wherever
- *                  the angles put it).
- *
- * Performance    : O(1) per frame. Two cosf and two sinf per
- *                  frame; nothing else of consequence.
- *
- * Why FK before IK?
- *   FK is the easy direction. Given angles, finding positions is
- *   one matrix multiplication (or, in 2-D, two trig calls). IK is
- *   the inverse problem: given the desired hand position, what
- *   angles produce it? That inverse is non-trivial — multiple
- *   solutions exist, the problem may be unsolvable, and the math
- *   branches into case analysis. Studying FK first makes IK
- *   intelligible: every IK solver is essentially asking "what FK
- *   input produced this output?".
- *
- * References
- * ──────────
- *   ── Forward kinematics: canonical textbooks ──────────────────────
- *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
- *       and Control" (3rd ed.), Pearson — the standard robotics
- *       textbook, FK and IK presented side-by-side; the 2-link
- *       planar derivation in §1.5 matches compute_fk in §5 of
- *       this file line for line.
- *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005),
- *       "Robot Modeling and Control", Wiley — alternative
- *       canonical text; chapter 3 on FK is the cleanest derivation
- *       of the link-by-link composition we use.
- *   [3] Murray, R. M., Li, Z. & Sastry, S. S. (1994), "A
- *       Mathematical Introduction to Robotic Manipulation", CRC —
- *       the rigorous Lie-group treatment; read once you want to
- *       see why FK is a SE(2)/SE(3) composition under the hood.
- *
- *   ── Inverse-kinematics contrast (what FK is NOT) ──────────────────
- *   [4] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
- *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
- *       UCSD course notes — the standard IK reference; read this
- *       to feel the contrast — IK is hard, FK is the easy direction
- *       of the same chain.
- *   [5] Aristidou, A. & Lasenby, J. (2011), "FABRIK: a fast,
- *       iterative solver for the inverse kinematics problem",
- *       Graphical Models 73(5), pp. 243-260 — concrete IK algorithm
- *       you can pose against compute_fk to feel the asymmetry.
- *
- *   ── Notation / multi-joint chains ─────────────────────────────────
- *   [6] Denavit, J. & Hartenberg, R. S. (1955), "A kinematic
- *       notation for lower-pair mechanisms based on matrices",
- *       J. Appl. Mech. 22, pp. 215-221 — the DH formalism every
- *       multi-link FK algorithm follows; overkill for 2 links but
- *       essential the moment you scale up.
- *
- *   ── Timestep / animation ──────────────────────────────────────────
- *   [7] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
- *       — articulates when fixed-step matters and when variable-step
- *       is the better tool; this file uses variable-step because
- *       compute_fk is unconditionally stable.
- *
- *   ── Rendering / ncurses ──────────────────────────────────────────
- *   [8] Bresenham, J. E. (1965), "Algorithm for computer control of
- *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
- *       the integer line-drawing algorithm; we use the simpler
- *       parametric oversample (draw_line_px §6) because float math
- *       is already paid for in compute_fk.
- *   [9] Bourke, P. (1997), "Character representation of grayscale
- *       images", paulbourke.net/dataformats/asciiart — design basis
- *       for the high-contrast glyph choice ('@', 'O', '*', '#').
- *  [10] Raymond, E. S., "NCURSES Programming HOWTO" —
- *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
- *       use_default_colors, and the newscr/curscr diff pipeline
- *       used in screen_present().
- *
- *   ── Online quick reference ───────────────────────────────────────
- *  [11] https://en.wikipedia.org/wiki/Forward_kinematics
- *  [12] https://en.wikipedia.org/wiki/Inverse_kinematics
- *  [13] https://en.wikipedia.org/wiki/Denavit%E2%80%93Hartenberg_parameters
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Position is what falls out when angles are given. Rotate the
- * shoulder by θ1 and the upper arm points in that direction;
- * walk L1 along it — there's the elbow. Apply a second rotation θ2
- * RELATIVE to the upper arm and walk L2 along the resulting
- * direction — there's the hand. That's it. Two rotations composed
- * in series. There is no solver, no inverse, no ambiguity: FK is
- * the FORWARD direction of the kinematic chain.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Sit at a desk and lay your right arm flat. Slowly rotate your
- * right SHOULDER — the upper arm swings, and your elbow draws an
- * arc of radius L1 around the shoulder. Now hold the shoulder
- * fixed and bend your ELBOW — the forearm pivots, and your hand
- * draws an arc of radius L2 around the elbow. Combine the two:
- * any reachable hand position is some θ1 (shoulder) plus some θ2
- * (elbow). That is all FK is.
- *
- *   shoulder    @          ← S, fixed, never moves
- *                ╲ θ1
- *                 ╲   L1   ← upper arm (constant length)
- *                  ╲
- *           elbow   O      ← E = S + L1·(cos θ1, sin θ1)
- *                   ╲ θ2   (relative to the upper arm direction)
- *                    ╲ L2
- *                     ╲
- *                hand  *   ← H = E + L2·(cos(θ1+θ2), sin(θ1+θ2))
- *
- * ALGORITHM
- * ─────────
- *   E = S + L1 · (cos θ1,        sin θ1)
- *   H = E + L2 · (cos(θ1 + θ2),  sin(θ1 + θ2))
- *
- * Two assignments, four trig calls. Read compute_fk in §5
- * line-by-line and it matches exactly.
- *
- * KEY FORMULAS
- * ────────────
- *   Forward step    : a link of length L hanging from base B at
- *                     angle θ from +X has its tip at
- *                         B + L · (cos θ, sin θ)
- *                     This is THE FK primitive. Stack two of them
- *                     in series — second one using the SUM of
- *                     angles — and you have a 2-link planar arm.
- *
- *   Angle convention: θ1 is absolute (measured from +X, math
- *                     convention so positive θ rotates CCW in
- *                     math space, CW in screen space because y
- *                     points down). θ2 is RELATIVE to the upper
- *                     arm, so the forearm's absolute angle is
- *                     (θ1 + θ2).
- *
- *   Hand reach      : |H − S| ranges over [|L1−L2|, L1+L2] depending
- *                     on θ2 alone. With L1 = L2 the minimum is 0
- *                     (forearm folds back exactly onto the upper
- *                     arm) and the maximum is L1+L2 (arm fully
- *                     extended).
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Angle wrap-around. We normalise θ1, θ2 into (−π, π] every
- *     frame so the HUD readout doesn't drift to ±10000°. Wrapping
- *     is purely cosmetic — the trig calls work fine on raw values.
- *
- *   • No reachability check. The hand can land anywhere within the
- *     reach disc; there's no "out of reach" because the user isn't
- *     TARGETING anything — they're rotating joints. This is one
- *     of the major ways FK is simpler than IK.
- *
- *   • No two-solution ambiguity. Each (θ1, θ2) pair maps to a
- *     unique (E, H). Compare with IK, where any reachable target
- *     has TWO valid configurations (elbow up / elbow down).
- *
- *   • Resize. SIGWINCH re-anchors S to the new screen centre.
- *     Angles are unaffected; the new positions just recompute
- *     from the same θ1, θ2.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Press 'r'. θ1 = θ2 = 0; arm horizontal pointing right,
- *     hand at distance L1+L2 from the shoulder.
- *
- *   • Hold →. θ1 increases; the WHOLE arm rotates around the
- *     shoulder. The elbow traces a circle of radius L1; the hand
- *     traces a circle of radius L1+L2 (because θ2 stayed at 0).
- *
- *   • Press 'r', then hold ↓. θ2 increases; only the FOREARM
- *     rotates around the elbow, while the upper arm stays put.
- *     The hand traces a circle of radius L2 around the elbow.
- *
- *   • With θ2 = π (180°) exactly, the forearm folds back along
- *     the upper arm. With L1 = L2 the hand sits ON the shoulder;
- *     the HUD shows |H − S| = 0.
- *
- *   • With θ2 = 0 exactly, the forearm extends straight from the
- *     upper arm; the arm is fully extended and |H − S| = L1+L2.
- *
- *   • Try to reproduce IK behaviour by hand: pick a hand position
- *     somewhere, then twiddle θ1, θ2 until '*' lands on it. THAT
- *     manual search is what IK automates.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. This is THE smallest possible FK demo; everything
- *      else in animation/ is some elaboration of compute_fk().
- *   2. §5 fk — the entire algorithm is one function: compute_fk.
- *      Read AFTER tutorials T1-T4. It mirrors the formula in
- *      MENTAL MODEL line for line.
- *   3. §6 scene — input and rendering. Two arrow-key handlers
- *      (one per joint angle), a draw routine that plots two
- *      lines + three markers. Mostly UI plumbing.
- *   4. §1-§4 + §7-§8 — infrastructure (config, clock, colour,
- *      screen, app loop). Skim if you've seen the framework.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   theta1, theta2     joint angles. theta1 is absolute (from +X);
- *                      theta2 is RELATIVE to the upper arm.
- *   L1, L2             link lengths (in pixels). Constant.
- *   S, E, H            shoulder / elbow / hand positions (Vec2).
- *                      S fixed; E and H computed every frame.
- *   ArmPose            return type bundling (E, H) so compute_fk
- *                      stays a pure function (no out-params).
- *
- * Background you need
- * ───────────────────
- *   - Trigonometric circle: (cos θ, sin θ) is a unit vector at
- *     angle θ from +X.
- *   - Vector addition: walk a length L along a direction d̂ →
- *     base + L · d̂.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Matrices. The standard FK formulation in robotics uses 4×4
- *     transforms; in 2-D with two joints, two trig calls beat
- *     any matrix.
- *   - Denavit-Hartenberg parameters. Worth knowing for serial
- *     robots; overkill for this two-link arm.
- *   - Quaternions. 2-D angles compose by addition; 3-D needs them.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Five tutorials that build forward kinematics from first principles.
- *
- *   T1  What is a kinematic chain?
- *   T2  One link — angle to position
- *   T3  Two links — relative angles compose by addition
- *   T4  Why FK is the EASY direction
- *   T5  How to translate this code into IK
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  WHAT IS A KINEMATIC CHAIN?
- * ──────────────────────────────
- * A KINEMATIC CHAIN is a sequence of rigid links connected by
- * joints. Each joint has a small set of "degrees of freedom" —
- * the parameters that pin down its current pose.
- *
- *   In 2-D each joint is a HINGE: one degree of freedom (the
- *   angle around the joint pivot).
- *   In 3-D a joint can be a hinge (1 DOF), a universal joint
- *   (2 DOF), a ball joint (3 DOF), or fancier.
- *
- * "FORWARD" kinematics walks the chain from the FIXED END (root)
- * toward the FREE END (tip), using the joint angles to decide
- * each link's orientation. The output is the WORLD POSITION (and
- * orientation, in 3-D) of every joint and link.
- *
- *      ┌─────────────────────────────────────────────────┐
- *      │  fixed root               free tip              │
- *      │   @  ──────  O  ──────  O  ──────  *            │
- *      │   S  link 1  E  link 2  J3 link 3  H            │
- *      │                                                 │
- *      │  given angles → walk forward → tip position     │
- *      └─────────────────────────────────────────────────┘
- *
- * Our arm is the simplest non-trivial chain: two links, two
- * hinge joints, one fixed root.
- *
- * T2  ONE LINK — ANGLE TO POSITION
- * ────────────────────────────────
- * Start with one link of length L attached to a base B at angle
- * θ measured from +X. The tip of that link is at:
- *
- *     tip = B + L · (cos θ, sin θ)
- *
- * Why? (cos θ, sin θ) is the UNIT VECTOR pointing in direction
- * θ. Multiplying by L scales it to length L; adding to B places
- * the tail at B and the head at the tip.
- *
- * That's the ENTIRE FK primitive. Every other FK in this folder
- * (snake, centipede, spider) is just this primitive run in a loop.
- *
- *      ┌────────────────────────────────────────────┐
- *      │      tip                                   │
- *      │       *                                    │
- *      │      ╱                                     │
- *      │     ╱  L                                   │
- *      │    ╱  ↗                                    │
- *      │   ╱ θ                                      │
- *      │  ●─────────────  +X                        │
- *      │  B                                         │
- *      └────────────────────────────────────────────┘
- *
- * T3  TWO LINKS — RELATIVE ANGLES COMPOSE BY ADDITION
- * ───────────────────────────────────────────────────
- * Now add a second link of length L₂ hinged at the tip of the
- * first. Question: at what ABSOLUTE angle does link 2 point?
- *
- * Answer: the ABSOLUTE angle of link 2 is the absolute angle of
- * link 1 plus the RELATIVE angle θ₂ (measured at the elbow,
- * between link 1 and link 2):
- *
- *     link 1 absolute angle = θ₁
- *     link 2 absolute angle = θ₁ + θ₂
- *
- * That's why "angles compose by addition" — in 2-D, rotation is
- * a scalar that adds.
- *
- * Apply the T2 primitive twice:
- *
- *     elbow E = S + L₁ · (cos θ₁,        sin θ₁)
- *     hand  H = E + L₂ · (cos(θ₁ + θ₂),  sin(θ₁ + θ₂))
- *
- * That's compute_fk in §5 in two lines. Notice θ₂ being RELATIVE
- * is what lets you pose the elbow naturally — "bend the elbow
- * 30°" rather than "make the forearm point at 47°."
- *
- * In 3-D you'd compose two ROTATION MATRICES (or quaternions)
- * instead of adding scalars, but the structure is identical.
- *
- * T4  WHY FK IS THE EASY DIRECTION
- * ────────────────────────────────
- * FK gives you positions FROM angles. IK gives you angles FROM
- * a target position. The two share geometry but differ wildly
- * in difficulty:
- *
- *               FK                   IK
- *   inputs    angles                 target position
- *   outputs   positions              angles
- *   solver    closed form            non-trivial: trig + cases
- *   solutions ONE                    ZERO, ONE, or TWO
- *   reach     not asked              reachability check needed
- *   cost      O(N) trig calls        O(N) per joint × iterations
- *
- * FK ALWAYS SUCCEEDS. Every (θ₁, θ₂) maps to one unique (E, H).
- *
- * IK can FAIL: the target may be outside the reach disc
- * [|L₁−L₂|, L₁+L₂]. Even when reachable, two valid arm poses
- * exist (elbow-up / elbow-down) so the solver must PICK one.
- *
- * Doing FK in your head: rotate, walk, rotate, walk. Trivial.
- * Doing IK in your head: imagine the target, find the elbow
- * position via the law of cosines, then solve for both angles.
- * That mental work is exactly what ik_helloworld.c does for you.
- *
- * T5  HOW TO TRANSLATE THIS CODE INTO IK
- * ──────────────────────────────────────
- * Open ik_helloworld.c side-by-side with this file. The DEMO
- * is identical: same shoulder, same two coloured links, same
- * three markers. The DATA-FLOW is reversed:
- *
- *   FK input pipeline:    arrow keys  →  θ₁, θ₂
- *                         compute_fk  →  E, H
- *                         draw          (E, H)
- *
- *   IK input pipeline:    arrow keys  →  H (target)
- *                         solve_ik    →  θ₁, θ₂  (and back to E)
- *                         draw          (E, H)
- *
- * Reading the IK file with FK already in your head:
- *   - The 2-link IK solver applies the LAW OF COSINES to the
- *     triangle (S, E, H) to find θ₂.
- *   - Then atan2 finds the angle from S to H, and another trig
- *     adjustment splits that into θ₁.
- *   - The "elbow up vs elbow down" choice is a single sign flip.
- *
- * The IK file is bigger because it has to handle reachability
- * (clamp the target to the reach disc), pick a branch (which
- * elbow), and undo the inverse mapping. The math is harder; the
- * geometry is the same triangle.
- *
- * Once you can read both files, every other animation/ file is
- * "FK or IK on a longer chain or a more interesting pose."
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -488,15 +31,14 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — every tunable in one place ── */
 
 enum {
     TARGET_FPS = 60,
 
-    /* ncurses pair IDs. PAIR_HUD/PAIR_HINT carry the project HUD
-     * convention (bright yellow / bright cyan, both A_BOLD). */
+    /* ncurses colour-pair slots. HUD and HINT use the shared
+     * project look (bright yellow / bright cyan); the rest colour
+     * the two arm links and the three joint markers. */
     PAIR_HUD          = 1,
     PAIR_HINT         = 2,
     PAIR_LINK_UPPER   = 3,
@@ -506,33 +48,27 @@ enum {
     PAIR_HAND         = 7,
 };
 
-/* Equal upper arm and forearm: the hand reaches all the way back
- * to the shoulder when the elbow is fully folded (θ2 = π).
- * 80 px = 10 cells per link → maximum reach 20 cells. */
+/* Both links the same length, so when the elbow folds all the way
+ * back (elbow angle = 180°) the hand lands right on the shoulder. */
 #define L1_PX  80.0f                  /* upper arm length, pixels */
 #define L2_PX  80.0f                  /* forearm  length, pixels */
 
-/* Angle conversions. */
 #define DEG_TO_RAD      ((float)M_PI / 180.0f)
 #define RAD_TO_DEG      (180.0f / (float)M_PI)
 
-/* 2° per arrow keypress. With typical key-repeat ~30 Hz this gives
- * a comfortable ~60°/sec sweep — fast enough to feel responsive,
- * slow enough to land on a target angle by eye. */
+/* How far each arrow keypress nudges a joint angle. 2° feels
+ * smooth when you hold the key and still lets you stop on a target. */
 #define ANGLE_STEP_RAD  (2.0f * DEG_TO_RAD)
 
-/* Terminal cell dimensions — the aspect-ratio bridge. CELL_W=8
- * sub-pixels per column, CELL_H=16 per row, giving the 2:1 ratio
- * that matches a typical terminal font. All math is in pixel space
- * (isotropic); cell conversion happens only at draw time. */
+/* A terminal cell is taller than it is wide, so we treat it as
+ * 8 sub-pixels across and 16 tall. The arm math runs in these square
+ * pixels and only converts to cells when drawing (see §4). */
 #define CELL_W   8
 #define CELL_H  16
 
 #define NS_PER_SEC 1000000000LL
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock — monotonic timer and sleep ── */
 
 static int64_t clock_ns(void)
 {
@@ -551,17 +87,12 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color — one colour per visual role ── */
 
 /*
- * One fixed semantic colour per visual role:
- *   upper arm   cyan
- *   forearm     orange
- *   elbow       white
- *   shoulder    lime    (anchor — never moves)
- *   hand        red     (FK output — wherever the angles place it)
+ * Each part of the arm gets its own colour: cyan upper arm, orange
+ * forearm, white elbow, lime shoulder (the fixed anchor), red hand.
+ * Falls back to the 8 basic colours on older terminals.
  */
 static void color_init(void)
 {
@@ -588,63 +119,30 @@ static void color_init(void)
     }
 }
 
-/* ===================================================================== */
-/* §4  coords — pixel↔cell aspect-ratio bridge                           */
-/* ===================================================================== */
+/* ── §4 coords — convert between pixels and cells ── */
 
 /*
- * Positions live in square pixel space. These helpers convert to
- * cell coordinates only at draw time, undoing the 8:16 cell aspect
- * ratio. Doing geometry in pixel space means perpendicular vectors
- * are genuinely perpendicular — a property that would break in
- * cell space.
+ * The arm math uses square pixels so angles and lengths behave
+ * normally. These helpers turn a pixel position into the row/column
+ * of a terminal cell, and vice versa. They are the only place the
+ * pixel-to-cell conversion happens.
  */
 static inline int   px_to_cell_x(float px) { return (int)floorf(px / (float)CELL_W + 0.5f); }
 static inline int   px_to_cell_y(float py) { return (int)floorf(py / (float)CELL_H + 0.5f); }
 static inline float cells_to_px_w(int cols){ return (float)cols * CELL_W; }
 static inline float cells_to_px_h(int rows){ return (float)rows * CELL_H; }
 
-/* ===================================================================== */
-/* §5  fk — Vec2 + compute_fk(S, θ1, θ2) → (E, H)                         */
-/* ===================================================================== */
+/* ── §5 fk — the forward-kinematics math ── */
 
 /*
- * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
- *
- * Intent
- *   The whole §5 FK algebra lives in pixel space: each pixel cell is
- *   CELL_W × CELL_H sub-pixels (8 × 16 by default), giving the math
- *   sub-cell resolution so a swinging arm reads as continuous motion
- *   instead of jumping cell-to-cell. The conversion to cell space
- *   happens exactly once per draw at the §6 render boundary
- *   (px_to_cell_x/y) — the project's "one conversion point" rule.
- *
- * Convention
- *   x : EASTWARD pixel coordinate (positive → right of screen).
- *   y : SOUTHWARD pixel coordinate (positive → down the screen).
- *
- *   Angles are MATH-CONVENTION (positive CCW around +X), so a CCW
- *   rotation in math becomes CW on screen because y points DOWN.
- *   This is the standard graphics convention; only the HUD readout
- *   ever needs to think about it.
- *
- * Why a value type (not a pointer)
- *   Sized 8 bytes; passed in registers on every modern ABI. compute_fk
- *   returning ArmPose-by-value gets inlined by -O2 into the same
- *   straight-line code as if the caller wrote two cos/sin pairs by
- *   hand. Encapsulation costs nothing here.
- *
- * Why not just (float, float) inline
- *   Named fields with a struct type catch a whole class of bugs at
- *   compile time: passing (col, row) where (x, y) is expected gets
- *   caught by the type system, not by visual debugging.
- *
- * References [1] Craig §2 "Spatial descriptions"; [3] Murray et al.
- *   for the formal R² convention this follows.
+ * Vec2 — a point in pixel space. The whole arm lives in these
+ * coordinates; positions get rounded to terminal cells only at
+ * draw time. x grows rightward, y grows downward (screen-style, so
+ * y is flipped from the usual math axis — only the HUD cares).
  */
 typedef struct {
-    float x;   /* eastward  pixel coordinate (positive → right) */
-    float y;   /* southward pixel coordinate (positive → down)  */
+    float x;   /* rightward pixel coordinate */
+    float y;   /* downward  pixel coordinate */
 } Vec2;
 
 static inline Vec2  vec2(float x, float y)    { return (Vec2){x, y}; }
@@ -653,56 +151,26 @@ static inline float vec2_len(Vec2 v)          { return sqrtf(v.x*v.x + v.y*v.y);
 static inline float vec2_dist(Vec2 a, Vec2 b) { return vec2_len(vec2_sub(a, b)); }
 
 /*
- * ArmPose — the two computed outputs of one compute_fk() call.
- *
- * Intent
- *   compute_fk is a PURE FUNCTION of (S, θ1, θ2); ArmPose is the
- *   record that bundles its two derived outputs (elbow, hand) so
- *   the caller can take them as ONE assignment instead of two
- *   out-parameters. Reads as "evaluate FK; here is the pose":
- *
- *       ArmPose pose = compute_fk(S, θ1, θ2);
- *       scene.elbow  = pose.elbow;
- *       scene.hand   = pose.hand;
- *
- * Why a struct (not two out-parameters)
- *   Return-by-struct (8 bytes per Vec2 → 16-byte ArmPose) fits in
- *   two registers on x86-64 / aarch64; -O2 lowers the function to
- *   the same code as direct field writes. Callers gain a clear
- *   "input → output" reading without verbose `Vec2 *out_E, Vec2
- *   *out_H` plumbing.
- *
- * Why NOT also store θ1, θ2 here
- *   ArmPose is the OUTPUT of FK; angles are the INPUT. Mixing them
- *   in one record would obscure the data flow direction that this
- *   file exists to teach (CONCEPTS §"Why FK before IK"). Angles
- *   live in Scene; ArmPose stays output-only.
- *
- * Field origin
- *   elbow : E = S + L1·(cos θ1,        sin θ1)         — see [1] Craig §3
- *   hand  : H = E + L2·(cos(θ1+θ2),    sin(θ1+θ2))    — see [1] Craig §3
- *
- *   These are the TWO compositions of the FK primitive
- *   (B + L·(cos θ, sin θ)) — the smallest non-trivial kinematic chain.
+ * ArmPose — the two positions that compute_fk works out from the
+ * angles. Bundling them lets the caller grab both with one
+ * assignment. Only the computed positions live here; the angles
+ * that produced them stay in Scene.
  */
 typedef struct {
-    Vec2 elbow;   /* E — derived from S, θ1, L1                            */
-    Vec2 hand;    /* H — derived from E (which is derived from S), θ2, L2  */
+    Vec2 elbow;   /* where the upper arm ends */
+    Vec2 hand;    /* where the forearm ends   */
 } ArmPose;
 
 /*
- * compute_fk — forward kinematics for a 2-link planar arm.
+ * compute_fk — the heart of forward kinematics. You give it the
+ * shoulder position and the two joint angles; it follows the chain
+ * down and reports where the elbow and hand end up. Set the angles,
+ * the positions follow.
  *
- * Pure function: given a fixed shoulder S and two joint angles,
- * return the resulting elbow and hand positions. No branches, no
- * iteration, four trig calls.
- *
- *     theta1   absolute, measured from +X axis.
- *     theta2   RELATIVE to the upper-arm direction, so the
- *              forearm's absolute angle is (theta1 + theta2).
- *
- * The body matches the ALGORITHM block in MENTAL MODEL exactly —
- * E walks L1 from S along θ1; H walks L2 from E along (θ1 + θ2).
+ * Walk out from the shoulder by L1 in the direction of theta1 to
+ * reach the elbow, then out from the elbow by L2 to reach the hand.
+ * theta2 is measured relative to the upper arm, so the forearm's
+ * actual heading is theta1 + theta2.
  */
 static ArmPose compute_fk(Vec2 S, float theta1, float theta2)
 {
@@ -713,75 +181,31 @@ static ArmPose compute_fk(Vec2 S, float theta1, float theta2)
     return (ArmPose){E, H};
 }
 
-/* ===================================================================== */
-/* §6  scene — Scene state, input, draw                                   */
-/* ===================================================================== */
+/* ── §6 scene — state, input, drawing ── */
 
 /*
- * Scene — all per-frame state of the FK demo.
- *
- * Intent
- *   The scene holds three KINDS of data, kept separate so a reader
- *   can see the data-flow direction this file exists to teach:
- *
- *     INPUTS   (user-controlled)  : theta1, theta2          ← arrow keys
- *     ANCHOR   (fixed per resize) : shoulder                ← SIGWINCH
- *     OUTPUTS  (derived each frame): elbow, hand            ← compute_fk
- *
- *   The main loop's order is exactly: read INPUTS → run compute_fk →
- *   write OUTPUTS → render. That arrow ALWAYS points the same way;
- *   no field ever flows backwards. Compare with ik_helloworld.c, where
- *   hand is the INPUT and theta1/theta2 are the OUTPUTS — same struct
- *   shape, opposite data-flow direction. THAT is the FK/IK contrast.
- *
- * Simulation vs Rendering locality
- *   ── Simulation state ── read+written by scene_input + compute_fk:
- *      shoulder        S, pinned per resize
- *      theta1, theta2  user-controlled angles (the ONLY true inputs)
- *      elbow, hand     E, H — derived; cached so renderer + HUD can
- *                      read positions without recomputing FK.
- *
- *   ── Rendering / control state ── read only by scene_draw + HUD:
- *      paused          frozen frame; sim path skipped, render unchanged
- *      rows, cols      terminal extent in CELLS (resize cache)
- *
- *   Note: rows/cols live HERE rather than in a separate Screen struct
- *   (cf. fk_centipede.c) because this demo is small enough that one
- *   Scene argument carries everything draw needs. No App struct
- *   either — main() holds the signal flags directly. Trade-off:
- *   simpler reading vs the canonical multi-struct framework.
- *
- * Things that DO NOT live here
- *   - Link lengths L1_PX, L2_PX → §1 config (compile-time constants).
- *   - Angle step ANGLE_STEP_RAD → §1 config.
- *   - fps counter → main() local (display-only, not part of the scene).
- *   - Signal flags g_running / g_need_resize → §8 file-scope (must
- *     be writable from a signal handler that takes no user pointer).
- *
- * References [1] Craig §3 (FK as forward map θ → x); [4] Buss for
- *   the IK direction this file is the foil for.
+ * Scene — everything the demo tracks. The two angles are the only
+ * real input (you change them with the arrow keys); the elbow and
+ * hand are recomputed from them every frame and cached here so the
+ * drawing code and HUD can read positions without redoing the math.
+ * (ik_helloworld.c flips this: there the hand is the input and the
+ * angles are computed.)
  */
 typedef struct {
-    /* ── Simulation state ─────────────────────────────────────── *
-     * Anchor + inputs + cached FK outputs. scene_input writes the *
-     * angles; compute_fk reads (S, θ1, θ2) and writes (E, H).     */
-    Vec2  shoulder;     /* S — pinned origin; resets on SIGWINCH      */
-    float theta1;       /* shoulder angle (rad), abs from +X axis     */
-    float theta2;       /* elbow    angle (rad), REL to upper arm     */
-    Vec2  elbow;        /* E — cached FK output, refreshed per frame  */
-    Vec2  hand;         /* H — cached FK output, refreshed per frame  */
+    Vec2  shoulder;     /* fixed anchor; re-centred on terminal resize */
+    float theta1;       /* shoulder angle, radians, measured from +X   */
+    float theta2;       /* elbow angle, radians, relative to upper arm */
+    Vec2  elbow;        /* computed each frame by compute_fk           */
+    Vec2  hand;         /* computed each frame by compute_fk           */
 
-    /* ── Rendering / control state ────────────────────────────── *
-     * Read only by scene_draw and the HUD. paused gates the sim   *
-     * but not the renderer; rows/cols clip draws to terminal.     */
-    bool  paused;       /* user-toggled freeze; sim skipped, draw same */
-    int   rows, cols;   /* terminal extent in CHARACTER CELLS         */
+    bool  paused;       /* freezes angle input; drawing still runs     */
+    int   rows, cols;   /* terminal size in cells; clips the drawing   */
 } Scene;
 
 /*
- * wrap_pi — fold an angle into (−π, π]. Cosmetic only: keeps the
- * HUD readout stable as the user holds an arrow key for a long
- * time. The underlying trig works fine on any real angle.
+ * wrap_pi — keep an angle in the range -180°..180°. Purely cosmetic:
+ * stops the HUD readout from climbing to huge numbers when you hold
+ * a key; the trig would work fine without it.
  */
 static inline float wrap_pi(float a)
 {
@@ -791,9 +215,9 @@ static inline float wrap_pi(float a)
 }
 
 /*
- * scene_init — anchor S at screen centre, set angles to zero
- * (arm horizontal pointing right), run compute_fk once so the
- * cached elbow and hand are valid on frame zero.
+ * scene_init — start fresh: shoulder at screen centre, both angles
+ * zero (arm horizontal, pointing right), and one compute_fk so the
+ * cached elbow and hand are valid before the first frame draws.
  */
 static void scene_init(Scene *s, int rows, int cols)
 {
@@ -811,6 +235,8 @@ static void scene_init(Scene *s, int rows, int cols)
     s->hand  = pose.hand;
 }
 
+/* Re-centre the shoulder for a new terminal size; angles are kept,
+ * so the arm just recomputes from the same pose. */
 static void scene_resize(Scene *s, int rows, int cols)
 {
     s->rows = rows;
@@ -824,13 +250,10 @@ static void scene_resize(Scene *s, int rows, int cols)
 }
 
 /*
- * scene_input — translate one keypress.
- *   ←/→     rotate shoulder θ1
- *   ↑/↓     rotate elbow    θ2
- *   space   toggle pause
- *   r       reset angles to zero
- * No key for moving the elbow or the hand directly — both are
- * FK output. Only angles are user input.
+ * scene_input — act on one keypress. Left/right turn the shoulder,
+ * up/down bend the elbow, space pauses, r resets. There is no key
+ * to move the elbow or hand directly: they always follow from the
+ * angles.
  */
 static void scene_input(Scene *s, int ch)
 {
@@ -855,7 +278,7 @@ static void scene_input(Scene *s, int ch)
     }
 }
 
-/* ---- rendering ------------------------------------------------------- */
+/* ── rendering ── */
 
 static inline bool in_screen(int row, int col, int rows, int cols)
 {
@@ -863,9 +286,9 @@ static inline bool in_screen(int row, int col, int rows, int cols)
 }
 
 /*
- * draw_line_px — parametric line from a to b in pixel space, sampled
- * at half-cell spacing along the dominant axis so no cell on the
- * path is skipped at any angle.
+ * draw_line_px — draw a straight line between two pixel points by
+ * stepping along it in small increments (about half a cell each) so
+ * no cell on the path gets skipped, whatever the angle.
  */
 static void draw_line_px(Vec2 a, Vec2 b, chtype glyph, int rows, int cols)
 {
@@ -903,10 +326,9 @@ static void draw_point(Vec2 p, char glyph, int color_pair, int rows, int cols)
 }
 
 /*
- * scene_draw — the five draw calls. Identical to ik_helloworld.c
- * except that '*' is now the COMPUTED hand instead of the
- * user-controlled target. Lines first, markers on top; '@' last so
- * the pinned shoulder always wins the cell contest at S.
+ * scene_draw — draw the two arm links, then the three joint markers
+ * on top. Order matters: the shoulder '@' is drawn last so it always
+ * shows through when markers land in the same cell.
  */
 static void scene_draw(const Scene *s)
 {
@@ -920,9 +342,7 @@ static void scene_draw(const Scene *s)
     draw_point(S, '@', PAIR_SHOULDER, s->rows, s->cols);
 }
 
-/* ===================================================================== */
-/* §7  screen — ncurses init / present / HUD                              */
-/* ===================================================================== */
+/* ── §7 screen — ncurses setup, present, HUD ── */
 
 static void screen_init(void)
 {
@@ -948,10 +368,9 @@ static void screen_present(void)
 }
 
 /*
- * screen_hud — required HUD: status row 0, hint row last. Row 1
- * shows the live values of θ1 and θ2 in degrees plus the resulting
- * hand reach |H − S|. Holding a single arrow key produces a
- * smooth sweep through both readouts — that's FK doing its job.
+ * screen_hud — the on-screen readouts: fps and pause state on the
+ * top row, the live angles and the hand's distance from the shoulder
+ * on the next, and the key hints along the bottom.
  */
 static void screen_hud(const Scene *s, float fps)
 {
@@ -982,9 +401,7 @@ static void screen_hud(const Scene *s, float fps)
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §8  app — signals, resize, main loop                                   */
-/* ===================================================================== */
+/* ── §8 app — signals, resize, main loop ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -1041,18 +458,18 @@ int main(void)
             scene_resize(&scene, rows, cols);
         }
 
-        /* (1) input — angles, NOT a target */
+        /* (1) read keys: the user steers angles, not a target */
         for (int ch; (ch = getch()) != ERR; ) {
             if (ch == 'q' || ch == 27 /*ESC*/) { g_running = 0; break; }
             scene_input(&scene, ch);
         }
 
-        /* (2) compute_fk(S, θ1, θ2) → (E, H), cached in scene */
+        /* (2) angles changed, so recompute the elbow and hand */
         ArmPose pose = compute_fk(scene.shoulder, scene.theta1, scene.theta2);
         scene.elbow  = pose.elbow;
         scene.hand   = pose.hand;
 
-        /* (3) clear / draw / present (same five draws as IK) */
+        /* (3) redraw the frame */
         erase();
         scene_draw(&scene);
         screen_hud(&scene, fps);

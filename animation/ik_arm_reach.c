@@ -1,543 +1,26 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * ik_arm_reach.c — FABRIK robotic arm tracking a Lissajous figure-8
+ * ik_arm_reach.c — a 4-link arm that reaches for a moving dot.
  *
- * DEMO: A 4-link robotic arm anchored at screen centre tracks a target
- *       that traces a Lissajous figure-8 (∞) path autonomously. The
- *       FABRIK solver iteratively bends the chain to follow; when the
- *       target wanders beyond the arm's reach, the chain stretches
- *       straight at it and a yellow horizon circle appears showing
- *       exactly how far the arm can extend.
+ * Inverse kinematics: you say where the hand should reach and the
+ * solver works out the joint angles. Here a self-driving target traces
+ * a figure-8 and the arm bends to keep its tip on it. The solver is
+ * FABRIK: drag the chain so the tip lands on the target, then drag it
+ * back so the shoulder stays put; repeat until it settles. When the
+ * target drifts out of reach, the arm just points at it and a yellow
+ * circle shows how far it can stretch.
  *
- * Study alongside: snake_forward_kinematics.c (FK contrast)
- *                  hexpod_tripod.c            (analytical 2-joint IK contrast)
+ * Sister files: ik_tentacle_seek.c, snake_inverse_kinematics.c (same
+ *               FABRIK solver on longer chains).
+ * FABRIK from: Aristidou & Lasenby (2011). License: MIT (see line 1).
  *
- * Section map:
- *   §1  config       — all tunables in one place
- *   §2  clock        — monotonic clock + sleep (verbatim from framework)
- *   §3  color        — 10 themes + spec HUD/hint pairs
- *   §4  coords       — pixel↔cell aspect-ratio helpers
- *   §5  entity       — Arm = FABRIK chain + Lissajous target
- *       §5a  vec2 helpers
- *       §5b  FABRIK solver (forward / backward / orchestrator)
- *       §5c  target motion (Lissajous + trail)
- *       §5d  rendering helpers
- *       §5e  render_arm orchestrator
- *   §6  scene        — thin Scene wrapper
- *   §7  screen       — ncurses double-buffer display layer
- *   §8  app          — signals, resize, main game loop
+ * Keys:  q / ESC  quit     space  pause     +/-  target speed
+ *        t  cycle theme     [ / ]  time scale (0.25x .. 4x)
  *
- * Keys:  q / ESC      quit              space   pause / resume
- *        + / -        target speed × / ÷ 1.25
- *        t            cycle theme       [ / ]   time scale (0.25× .. 4×)
- *
- * Build:
+ * Build (-lm for the trig — cosf/sinf/sqrtf):
  *   gcc -std=c11 -O2 -Wall -Wextra animation/ik_arm_reach.c \
  *       -o ik_arm_reach -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm     : FABRIK iterative inverse kinematics. Two geometric
- *                 passes per iteration:
- *                   FORWARD  — snap tip to target; walk root-ward
- *                              re-stretching each segment to its fixed
- *                              link length. After this pass the tip
- *                              exactly equals target but the root has
- *                              drifted away from its anchor.
- *                   BACKWARD — snap root back to anchor; walk tip-ward
- *                              re-stretching each segment. After this
- *                              pass the root is fixed and every link
- *                              is correct, but the tip has drifted —
- *                              by less than before, provably.
- *                 Each iteration strictly reduces the tip-to-target
- *                 error; convergence in 3–5 iterations for a typical
- *                 4-link chain. MAX_ITER = 15 caps degenerate-config
- *                 cost. No matrix inverse, no Jacobian, no singularities
- *                 — only positions and elementary trig.
- *
- *                 A reachability check fires once per tick: if the
- *                 target is beyond the chain's total length, no IK
- *                 solution exists. Skip iteration, stretch the arm
- *                 straight at the target, raise at_limit so the
- *                 reach-horizon circle is drawn.
- *
- *                 The autonomous target traces a Lissajous curve
- *                 x(t) = Ax · cos(t), y(t) = Ay · sin(2t + π/4). The
- *                 1:2 frequency ratio produces exactly one self-
- *                 intersection — the classic figure-8 ∞ shape. The
- *                 π/4 phase shift makes the crossing a clean X
- *                 rather than a tangent cusp.
- *
- * Data-structure: Arm holds joint positions pos[N_JOINTS=5] (4 links),
- *                 link_len[N_LINKS=4] tapered root→tip, current target
- *                 with a TRAIL_SIZE=60 ring-buffer history, Lissajous
- *                 parameters (root_px/py, lis_ax/ay, scene_time,
- *                 speed_scale), and the at_limit flag. No prev/cur
- *                 snapshots and no alpha-lerp scaffolding — variable
- *                 timestep makes them unnecessary.
- *
- * Rendering     : Painter's order — faint dotted Lissajous trail behind
- *                 → yellow reach-horizon circle (only at_limit) →
- *                 arm link bead-fill (root-dark to tip-bright gradient)
- *                 → joint node markers (size-coded '0' '0' 'o' 'o' '.')
- *                 → bright red target marker ('+' tracking, 'X' out
- *                 of reach). 48-sample sparse-dot circle approximates
- *                 the reach envelope without overlapping cells.
- *
- * Performance   : Variable timestep at render rate. Per frame:
- *                 max 15 FABRIK iterations × 4 link traversals × 2
- *                 passes ≈ 120 simple ops; typically converges in 3–5
- *                 iterations so ~30 ops. Microseconds total.
- *
- * References
- * ──────────
- *   ── FABRIK (the §5b solver) ──────────────────────────────────────
- *   [1] Aristidou, A. & Lasenby, J. (2011), "FABRIK: A fast,
- *       iterative solver for the inverse kinematics problem",
- *       Graphical Models 73(5), pp. 243-260 — the foundational
- *       paper, including the convergence proof; §5b implements
- *       the two geometric passes line-by-line.
- *       https://www.andreasaristidou.com/FABRIK.html
- *   [2] Aristidou, A., Chrysanthou, Y. & Lasenby, J. (2016),
- *       "Extending FABRIK with model constraints", Computer
- *       Animation and Virtual Worlds 27(1) — joint-limit
- *       extensions; relevant if you ever add elbow constraints
- *       (currently unconstrained, see EDGE CASES).
- *
- *   ── IK families FABRIK avoids ────────────────────────────────────
- *   [3] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
- *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
- *       UCSD course notes — the Jacobian-iterative family; FABRIK
- *       converges faster and skips matrix inverses entirely.
- *   [4] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
- *       and Control" (3rd ed.), Pearson — Ch. 4 derives the
- *       ANALYTICAL closed-form 2-link IK (law of cosines); read
- *       to feel the contrast between analytical and iterative
- *       solvers. Analytical solutions don't scale past 3 links.
- *   [5] Wang, L.-C. T. & Chen, C. C. (1991), "A combined
- *       optimization method for solving the inverse kinematics
- *       problem of mechanical manipulators", IEEE TRA 7(4) —
- *       CCD (Cyclic Coordinate Descent), the IK-iteration scheme
- *       FABRIK improved upon.
- *
- *   ── Lissajous / target path ──────────────────────────────────────
- *   [6] Lissajous, J. A. (1857), "Mémoire sur l'étude optique des
- *       mouvements vibratoires", Annales de Chimie et de Physique
- *       51 — original derivation of the figure family. The 1:2
- *       frequency ratio with π/4 phase shift gives the clean ∞ in
- *       this demo.
- *   [7] Cundy, H. M. & Rollett, A. P. (1961), "Mathematical Models",
- *       Oxford — Ch. 5 enumerates Lissajous curves by ratio and
- *       phase; reference for picking different target patterns.
- *
- *   ── Timestep / animation ─────────────────────────────────────────
- *   [8] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
- *       — when fixed-step matters; this file uses variable-step
- *       because FABRIK and the Lissajous oscillator are
- *       unconditionally stable.
- *
- *   ── Rendering / ncurses ─────────────────────────────────────────
- *   [9] Bresenham, J. E. (1965), "Algorithm for computer control of
- *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
- *       the integer line algorithm; the §5d line rasteriser uses
- *       the simpler parametric oversample because float math is
- *       already paid for in FABRIK.
- *  [10] Bourke, P. (1997), "Character representation of grayscale
- *       images", paulbourke.net/dataformats/asciiart — design basis
- *       for the root→tip brightness ramp.
- *  [11] Raymond, E. S., "NCURSES Programming HOWTO" —
- *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
- *       use_default_colors, and the diff pipeline §7 relies on.
- *
- *   ── Online quick reference ───────────────────────────────────────
- *  [12] https://en.wikipedia.org/wiki/Inverse_kinematics
- *  [13] https://en.wikipedia.org/wiki/Lissajous_curve
- *  [14] https://en.wikipedia.org/wiki/FABRIK
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two clean halves: a TARGET that drives itself along a closed-form
- * figure-8 path, and an ARM that does whatever it has to do to put its
- * tip on that target. The arm has no will of its own — every frame it
- * solves "given root anchor, given target, find joint positions that
- * make all segments stay link_len apart" with the FABRIK iterative
- * geometric trick. When the target escapes the arm's reach sphere, the
- * "trick" is simpler: stretch straight at it and accept defeat (the
- * tip can't get there).
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Target  : a planet on a fixed elliptical orbit. It does not negotiate.
- *
- * Arm     : a multi-jointed pointer chasing a laser dot. With more
- *           joints, the pointer can curl around obstacles and trace
- *           non-straight paths — the wider freedom of multi-link IK
- *           over a plain 2-bar linkage.
- *
- * FABRIK  : an iterative coin-flip between two constraints. Cycle 1:
- *           "tip must reach target" — done, by snapping it. Cycle 2:
- *           "root must stay anchored" — done, by snapping it. Each
- *           cycle violates the OTHER constraint by a smaller amount
- *           than before, so 3–5 cycles converges to satisfying both
- *           within sub-pixel tolerance.
- *
- * Reach   : the disc of radius Σ link_len centred on the root. Outside
- *           the disc, no joint configuration can place the tip there —
- *           geometric impossibility. The arm just points at the target
- *           and the dashed yellow circle visualises that boundary.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Measure dt = wall-clock since last frame; multiply by time_scale.
- *  2. Update target:
- *       a. scene_time += dt · speed_scale
- *       b. target.x = root.x + Ax · cos(LIS_FX · scene_time)
- *          target.y = root.y + Ay · sin(LIS_FY · scene_time + LIS_PHASE)
- *       c. push target into the trail ring buffer
- *  3. Reachability: if |target − root| > Σ link_len, stretch the arm
- *     straight at the target, set at_limit = true, return.
- *  4. Else FABRIK loop (up to MAX_ITER iterations):
- *       a. Forward pass: pos[N−1] = target. For i = N−2 down to 0,
- *          slide pos[i] toward pos[i+1] until they're link_len[i] apart.
- *       b. Backward pass: pos[0] = root. For i = 0 up to N−2, slide
- *          pos[i+1] away from pos[i] until they're link_len[i] apart.
- *       c. If |pos[N−1] − target| < CONV_TOL: converged, break.
- *  5. Render painter's order: trail → reach circle (if at_limit) →
- *     link beads → joint markers → target marker.
- *
- * KEY FORMULAS
- * ────────────
- *  Lissajous     : x = root.x + Ax · cos(LIS_FX · t)
- *                  y = root.y + Ay · sin(LIS_FY · t + LIS_PHASE)
- *                  fx:fy = 1:2 → one self-crossing → figure-8 shape.
- *
- *  Forward pass  : pos[N−1] = target
- *                  for i = N−2 .. 0:
- *                    f      = pos[i] − pos[i+1]
- *                    r      = link_len[i] / |f|
- *                    pos[i] = pos[i+1] + f · r
- *
- *  Backward pass : pos[0] = root
- *                  for i = 0 .. N−2:
- *                    b        = pos[i+1] − pos[i]
- *                    r        = link_len[i] / |b|
- *                    pos[i+1] = pos[i] + b · r
- *
- *  Convergence   : break when |pos[N−1] − target| < CONV_TOL (≈ 1.5 px)
- *                  — sub-cell accuracy, further iterations invisible.
- *
- *  Reach circle  : 48 dots at angle k · 2π/48, at distance Σ link_len
- *                  from root. Sparse enough to read as dashed; dense
- *                  enough that the eye reads it as circular.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  - Coincident joints. If two joints land at the exact same pixel,
- *    |f| or |b| → 0 and division blows up. Guarded with a 1e−6 floor;
- *    the solver self-corrects on the next iteration as one joint is
- *    flung far apart and pulled back into normal range.
- *
- *  - Target out of reach. Skip iteration entirely and stretch the arm
- *    straight. Without the early-out, FABRIK would oscillate without
- *    converging (the tip can never reach the target).
- *
- *  - Tip already at target. CONV_TOL early-out lets the solver finish
- *    in one iteration when the target hasn't moved; otherwise we'd
- *    waste 14 more iterations doing nothing visible.
- *
- *  - Resize. scene_init recomputes root anchor, link lengths, and
- *    Lissajous amplitudes for the new screen. Saved scene_time,
- *    speed_scale, and theme_idx are preserved so animation continues.
- *
- *  - Suspend / lid-close. dt clamped to 100 ms in main() so the arm
- *    doesn't catastrophically catch up after a long pause.
- *
- * HOW TO VERIFY
- * ─────────────
- *  - Default config: target traces ∞ in ~9 s; arm tracks smoothly. The
- *    reach-horizon circle blinks on at the horizontal extremes of the
- *    figure-8 (because Ax is clipped to 90% of total reach, the lobes
- *    just barely escape).
- *
- *  - Pause: scene_tick returns; arm freezes at current pose.
- *
- *  - Crank `+` repeatedly: target speeds up; the tip increasingly lags
- *    behind during fast motion — the FABRIK solver only does 15 iters
- *    per tick.
- *
- *  - Press `[` to slow time: motion stays smooth at any time scale.
- *
- *  - Cycle themes: arm gradient changes; HUD stays bright yellow on
- *    default bg regardless of theme.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read ik_helloworld.c first if 2-link IK isn't
- *      automatic. This file handles a 4-link arm where the
- *      closed-form approach STOPS WORKING (ik_helloworld T6) —
- *      so we switch to FABRIK iteration.
- *   2. §5 entity — THE HEART of this file. In sub-section order:
- *        §5b FABRIK solver           ← read AFTER tutorials T1-T5
- *           - fabrik_forward
- *           - fabrik_backward
- *           - fabrik_solve (orchestrator)
- *        §5c target Lissajous + trail
- *        §5d-§5e renderers
- *      The two passes are tiny (≤15 lines each); the algorithm's
- *      brilliance is in their COMPOSITION.
- *   3. §6 scene — thin wrapper.
- *   4. §1-§4 + §7-§8 — infrastructure. Skim if you've seen the
- *      framework.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   pos[i]              joint i position (Vec2). 0 = root, N_JOINTS-1
- *                       = tip.
- *   link_len[i]         constant length of link between pos[i] and
- *                       pos[i+1]. Tapered root-to-tip.
- *   target              where the user (here: the Lissajous) wants
- *                       the tip.
- *   anchor              root pos[0] origin — this NEVER MOVES.
- *   at_limit            bool — true iff target is outside the reach
- *                       sphere; renderer draws the dashed circle.
- *   CONV_TOL            ~1.5 px — once tip is this close to target,
- *                       declare convergence.
- *   MAX_ITER            iteration cap (15) — degenerate-config bound.
- *
- * Background you need
- * ───────────────────
- *   - 2-link analytical IK (ik_helloworld T3-T5). FABRIK is the
- *     successor for chains where closed-form fails.
- *   - Vector subtract / normalise / scale.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Jacobian / pseudoinverse IK. FABRIK avoids matrix algebra
- *     entirely; positions in, positions out.
- *   - Cyclic Coordinate Descent (CCD). FABRIK is its successor —
- *     similar idea but converges faster.
- *   - Joint limits, ball joints, twist constraints. We have a
- *     plain planar chain; angle limits are mentioned in T7 only.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Seven tutorials that build FABRIK from first principles.
- *
- *   T1  Why iteration past 2 links — closed-form's limit
- *   T2  FABRIK in one sentence — alternate two snaps
- *   T3  The forward pass — chase the tip down to the root
- *   T4  The backward pass — anchor the root, push back to the tip
- *   T5  Why this CONVERGES — error bounded by the convex hull
- *   T6  Reachability — the disc, the horizon circle, the early-out
- *   T7  Joint limits, multi-effector, smoothing — what FABRIK adds
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  WHY ITERATION PAST 2 LINKS — CLOSED-FORM'S LIMIT
- * ────────────────────────────────────────────────────
- * 2-link IK has a closed-form solution (law of cosines —
- * ik_helloworld T3-T5). 3-link IK is UNDERDETERMINED; the
- * 2+1 hybrid (fk_ik_helloworld T4) picks one specific
- * configuration by adding a constraint.
- *
- * What about 4 links? 5? 30 (a tentacle)? The CONFIG space is
- * a manifold of dimension N − 2 (target gives 2 equations to
- * pin down N angles). Tabulating all of those by hand is
- * intractable.
- *
- * Iterative IK side-steps the algebraic blowup: instead of
- * SOLVING for joint angles, ADJUST the chain repeatedly until
- * it satisfies the constraints. Two flavours dominate:
- *
- *   JACOBIAN  Linearise around the current pose, take a step
- *             toward the target. Used in robotics.
- *
- *   FABRIK    Geometric only. Two passes. No matrix math.
- *             Used in animation and games.
- *
- * FABRIK is what this file implements. It scales to ANY chain
- * length, converges in 3-5 iterations for typical configurations,
- * and uses only positions + Euclidean lengths.
- *
- * T2  FABRIK IN ONE SENTENCE — ALTERNATE TWO SNAPS
- * ────────────────────────────────────────────────
- * "Forward And Backward Reaching Inverse Kinematics."
- *
- * Each iteration is two passes:
- *
- *   FORWARD   pretend the TIP is at the target. Walk root-ward
- *             along the chain, re-stretching each segment to
- *             its link_len. The tip ends exactly at target;
- *             the root has DRIFTED.
- *
- *   BACKWARD  pretend the ROOT is at its anchor. Walk tip-ward
- *             along the chain, re-stretching each segment to
- *             its link_len. The root ends exactly at anchor;
- *             the tip has drifted.
- *
- * Iterate. The tip-drift after each backward pass is provably
- * smaller than after the previous backward pass. After ~5 cycles
- * the tip lands within sub-pixel tolerance.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │  before:    @──●──●──●──●  current pose          │
- *      │             (root)        (tip)                  │
- *      │                                          *  target│
- *      │                                                  │
- *      │  forward:        ●──●──●──●──*                   │
- *      │             ╲ ↑ root drifted               (tip)  │
- *      │                                                  │
- *      │  backward:  @──●──●──●──●                        │
- *      │             (root anchored)  ↑ tip drifted (less) │
- *      │                                                  │
- *      │  iterate ~5 times → both ends correct            │
- *      └──────────────────────────────────────────────────┘
- *
- * That is FABRIK. The rest is implementation.
- *
- * T3  THE FORWARD PASS — CHASE THE TIP DOWN TO THE ROOT
- * ─────────────────────────────────────────────────────
- * The forward pass walks the chain from tip to root.
- *
- *     pos[N-1] = target           ← snap the tip to target
- *     for i = N-2 down to 0:
- *       direction = pos[i] − pos[i+1]      ← vector from i+1 to i
- *       d = |direction|
- *       pos[i] = pos[i+1] + (direction / d) · link_len[i]
- *
- * "Slide pos[i] along the line from pos[i+1] until they're
- * link_len[i] apart." The new pos[i] sits in the SAME DIRECTION
- * from pos[i+1] as before, but at the correct distance.
- *
- * Why does this preserve link length? Because we explicitly
- * scaled the direction vector to length link_len[i] and
- * placed pos[i] at that distance from pos[i+1]. By
- * construction.
- *
- * After the loop, every segment has its correct length and
- * pos[N-1] is on the target. Only pos[0] is wrong — the root
- * has drifted from its anchor.
- *
- * T4  THE BACKWARD PASS — ANCHOR THE ROOT, PUSH BACK TO THE TIP
- * ─────────────────────────────────────────────────────────────
- * Same pattern, opposite direction:
- *
- *     pos[0] = anchor               ← snap the root to anchor
- *     for i = 0 up to N-2:
- *       direction = pos[i+1] − pos[i]      ← vector from i to i+1
- *       d = |direction|
- *       pos[i+1] = pos[i] + (direction / d) · link_len[i]
- *
- * "Slide pos[i+1] along the line from pos[i] until they're
- * link_len[i] apart." After the loop, every segment has its
- * correct length and pos[0] is at anchor — but pos[N-1] has
- * drifted from target.
- *
- * Forward fixed the tip and broke the root.
- * Backward fixed the root and broke the tip.
- *
- * Both passes preserve segment lengths exactly — only the
- * endpoint constraints get violated, alternately. The
- * MAGNITUDE of violation shrinks each iteration.
- *
- * T5  WHY THIS CONVERGES — ERROR BOUNDED BY THE CONVEX HULL
- * ─────────────────────────────────────────────────────────
- * Why doesn't FABRIK oscillate forever between two bad poses?
- *
- * Aristidou & Lasenby's proof: the BACKWARD pass moves pos[i]
- * toward where pos[i] should ideally sit. The chain's tip-end
- * error after backward pass is BOUNDED ABOVE by the chain's
- * tip-end error after forward pass scaled by a contraction
- * factor < 1. Each FULL iteration (forward + backward) shrinks
- * the error by a factor that depends on the geometry but is
- * always < 1 for non-degenerate configs.
- *
- * Convergence is GEOMETRIC: typical 4-link arm reaches sub-
- * pixel error in 3-5 iterations. Our MAX_ITER = 15 is just a
- * safety cap — for adversarial geometries (chain folded
- * tightly) it might need a few more.
- *
- * Failure modes:
- *   - Coincident joints (|direction| → 0). Guard with a 1e-6
- *     floor; the next iteration flings the joint apart again.
- *   - Target unreachable (T6). Forward pass never converges
- *     because the tip cannot get to the target. Detect early
- *     and stretch the arm straight.
- *
- * T6  REACHABILITY — THE DISC, THE HORIZON CIRCLE, THE EARLY-OUT
- * ──────────────────────────────────────────────────────────────
- * The arm can reach any point at distance ≤ Σ link_len from
- * the anchor — a DISC. Outside, no IK solution exists.
- *
- * If we pretend it does and start FABRIK iterating, the tip
- * keeps trying to reach the target and the root keeps trying
- * to stay anchored — the algorithm oscillates without
- * converging. MAX_ITER fires; the result is a fully extended
- * arm in some semi-random direction.
- *
- * Better: detect the unreachable case BEFORE iterating:
- *
- *     d = |target − anchor|
- *     R = Σ link_len
- *     if d > R:
- *       at_limit = true
- *       stretch chain straight at target
- *       return
- *
- * "Stretch the chain straight" means each pos[i] sits at
- * distance Σ_{j<i} link_len[j] from anchor along the
- * anchor → target direction. The arm visibly POINTS at the
- * target it can't reach.
- *
- * The reach circle (yellow dashed) is drawn ONLY when at_limit;
- * its appearance teaches the user that the arm has hit a real
- * geometric limit, not a buggy solver.
- *
- * T7  JOINT LIMITS, MULTI-EFFECTOR, SMOOTHING — WHAT FABRIK ADDS
- * ──────────────────────────────────────────────────────────────
- * The basic FABRIK loop in this file is the SIMPLEST form. The
- * algorithm scales gracefully:
- *
- *   JOINT LIMITS  After each pass, clamp every joint's angle
- *                 (relative to its parent) to a min/max range.
- *                 The next pass may violate other constraints
- *                 but on average the chain settles into a
- *                 limit-respecting pose.
- *
- *   MULTI-EFFECTOR  Multiple targets — solve each in turn,
- *                 average the resulting positions per joint.
- *                 Used for character rigs where two hands need
- *                 to grab two objects simultaneously.
- *
- *   BRANCHING     The chain forks into a tree (a torso with two
- *                 arms). At the branching joint, the forward
- *                 passes from each branch coexist via a centroid
- *                 average.
- *
- *   SMOOTHING     Damp the tip's motion toward target by
- *                 weight ∈ [0, 1]; the chain follows the target
- *                 elastically rather than instantly.
- *
- * For our 4-link Lissajous-tracking arm, none of these are
- * needed. The basic loop with reachability early-out is enough.
- * ik_tentacle_seek.c uses the same basic loop on a 16-link chain;
- * snake_inverse_kinematics.c on a much longer chain. All three
- * files share the §5b FABRIK code structurally.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -557,109 +40,93 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — every tunable number, named once ── */
 
-/* All magic numbers live here. Never scatter literals through the code. */
 enum {
-    /* Render frame-rate target. Variable-timestep simulation, so the
-     * only thing this controls is the sleep cap at end of frame. */
+    /* Frame-rate cap. Timestep is variable, so this only sets how long
+     * we sleep at the end of each frame. */
     TARGET_FPS    = 60,
 
-    /* HUD layout. */
-    HUD_COLS      = 96,
-    FPS_UPDATE_MS = 500,
+    HUD_COLS      = 96,    /* max status-bar width */
+    FPS_UPDATE_MS = 500,   /* how often the fps readout refreshes */
 
-    /* ncurses pair IDs.
-     *   1..N_ARM_COLORS  arm gradient (root dark → tip bright), themed
-     *   6                target marker — fixed bright red (semantic)
-     *   7                reach horizon — fixed yellow    (semantic)
-     *   8 PAIR_HUD       status bar — bright yellow on default bg
-     *   9 PAIR_HINT      key hint   — bright cyan  on default bg */
+    /* ncurses colour-pair IDs:
+     *   1..N_ARM_COLORS  arm gradient (root dark to tip bright), themed
+     *   6                target marker — always bright red
+     *   7                reach circle  — always yellow
+     *   8 PAIR_HUD       status bar    — bright yellow
+     *   9 PAIR_HINT      key hint       — bright cyan */
     N_ARM_COLORS = 5,
     PAIR_HUD     = 8,
     PAIR_HINT    = 9,
 
-    N_THEMES     = 10,    /* cycled with `t` */
+    N_THEMES     = 10,    /* arm palettes, cycled with `t` */
 
-    /* Joint chain sizing. N_JOINTS = N_LINKS + 1.
-     *   pos[0]      root anchor (never moved by solver)
-     *   pos[N-1]    end effector / tip (must reach target)
-     *   pos[1..N-2] interior joints, freely moved by FABRIK */
+    /* The chain: N_LINKS bones, N_JOINTS = N_LINKS + 1 joints between
+     * them. pos[0] is the root (fixed); pos[N_JOINTS-1] is the tip that
+     * chases the target; the joints between are free to bend. */
     N_JOINTS     = 5,
     N_LINKS      = 4,
 
-    /* MAX_ITER: FABRIK convergence cap. Typical 4-link chains converge
-     * in 3-5 iterations; 15 is a safety ceiling for degenerate configs.
-     * Cost: 15 · 5 · 2 = 150 simple ops — negligible per tick. */
+    /* Most a 4-link chain needs is 3-5 FABRIK passes; this caps the
+     * worst case (a tightly folded chain) so a frame can't run away. */
     MAX_ITER     = 15,
 
-    /* Trail buffer capacity. At ~60 ticks/s this is roughly 1 second of
-     * target history — about 1/9 of the figure-8 cycle, enough to read
-     * the curve shape without clutter. */
+    /* How many past target positions to keep for the dotted trail.
+     * At ~60 ticks/s this is about 1 second — enough to read the
+     * figure-8 shape without cluttering the screen. */
     TRAIL_SIZE   = 60,
 
-    /* Sparse reach-circle samples. 48 dots ≈ 7.5° spacing — visually
-     * dashed without overlapping cells at typical arm sizes. */
+    /* Dots drawn around the reach circle. 48 reads as a dashed ring
+     * without the dots overlapping at typical arm sizes. */
     REACH_CIRCLE_SAMPLES = 48,
 };
 
-/*
- * CONV_TOL — FABRIK convergence tolerance (pixel space). 1.5 px is
- * sub-cell on both axes (CELL_W=8, CELL_H=16), so further iterations
- * produce no visible improvement.
- */
+/* "Close enough" for the tip: once it lands within 1.5 px of the
+ * target the solver stops. That's under one cell, so more passes
+ * would change nothing you can see. (cells are 8x16 px.) */
 #define CONV_TOL    1.5f
 
 /*
- * Lissajous figure-8 parameters.
- *
- *   x(t) = root.x + lis_ax · cos(LIS_FX · scene_time)
- *   y(t) = root.y + lis_ay · sin(LIS_FY · scene_time + LIS_PHASE)
- *
- * fx : fy = 1 : 2 → exactly one self-intersection → figure-8 shape.
- * φ = π/4         → clean X-crossing at the centre (no tangent cusp).
- * Amplitudes lis_ax/ay are computed at scene_init from terminal size
- * and clipped to ≤ 90% of total arm reach so the at_limit state
- * triggers naturally at the figure-8 extremes.
+ * The target's figure-8 path (a Lissajous curve):
+ *   x = root.x + lis_ax * cos(LIS_FX * t)
+ *   y = root.y + lis_ay * sin(LIS_FY * t + LIS_PHASE)
+ * A 1:2 frequency ratio gives one self-crossing — the figure-8. The
+ * phase shift makes that crossing a clean X instead of a cusp. The
+ * amplitudes lis_ax/lis_ay are set at scene_init from the screen size.
  */
 #define LIS_FX               1.0f
 #define LIS_FY               2.0f
-#define LIS_PHASE            0.785f       /* ≈ π/4 */
+#define LIS_PHASE            0.785f       /* about pi/4 */
 
-/* Lissajous speed multiplier (user-tunable on +/-).
- *   default 0.7 → ~9 s per figure-8 cycle, leisurely.
- *   range [0.05, 5.0] → ~125 s to ~1.3 s per cycle. */
+/* Target speed (the +/- keys scale it).
+ *   0.7 -> a leisurely ~9 s per figure-8 lap.
+ *   clamped to [0.05, 5.0] -> ~125 s down to ~1.3 s per lap. */
 #define LIS_SPEED_DEFAULT    0.7f
 #define LIS_SPEED_MIN        0.05f
 #define LIS_SPEED_MAX        5.0f
 
-/*
- * DRAW_STEP_PX — bead fill stride along each link. Must be < CELL_W (8)
- * so the dense stamping never skips a column. 5 px gives a slightly
- * sparse "beaded chain" texture so the joint markers (drawn in pass 2)
- * read clearly through the fill.
- */
+/* Spacing of the 'o' beads stamped along each bone when drawing. Kept
+ * below CELL_W (8) so no cell is skipped; 5 px leaves small gaps so
+ * the joint markers stay visible through the fill. */
 #define DRAW_STEP_PX   5.0f
 
-/* Time scale — user-controlled simulation speed multiplier on `[/]`. */
+/* Time scale (the [ and ] keys): slows down or speeds up the whole
+ * simulation, separate from the target's own speed. */
 #define TIME_SCALE_DEFAULT  1.0f
 #define TIME_SCALE_MIN      0.25f
 #define TIME_SCALE_MAX      4.0f
 #define TIME_SCALE_STEP     1.5f
 
-/* Timing primitives — verbatim from framework.c. */
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 
-/* Terminal cell dimensions — the aspect-ratio bridge. */
+/* Sub-pixels per character cell. The terminal is taller than wide per
+ * cell, so positions are kept in square px and converted at draw time. */
 #define CELL_W   8
 #define CELL_H  16
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock — monotonic time + sleep ── */
 
 static int64_t clock_ns(void)
 {
@@ -678,46 +145,22 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color — 10 themes + spec-fixed HUD pairs                          */
-/* ===================================================================== */
+/* ── §3 color — arm palettes + fixed HUD colours ── */
 
 /*
- * Theme — one arm colour palette (xterm-256 fg indices).
+ * Theme — one arm colour ramp (five xterm-256 indices, root to tip).
  *
- * Intent
- *   Each theme rebinds only the FIVE arm pairs (1..5) via
- *   init_pair. The two SEMANTIC pairs — target red (6) and reach-
- *   horizon yellow (7) — are theme-INDEPENDENT because their colour
- *   carries meaning the user must learn once and then trust across
- *   every theme. HUD/HINT (8/9) are also theme-independent.
- *
- * Slot semantics (arm[0..4] map to pairs 1..5; root → tip gradient)
- *   [0] pair 1 — root link (dimmest); shoulder end of chain.
- *   [1] pair 2 — second link.
- *   [2] pair 3 — middle link.
- *   [3] pair 4 — fourth link.
- *   [4] pair 5 — tip link (brightest); end-effector end of chain.
- *
- *   The root→tip brightness gradient lets the eye trace the chain
- *   without joint-numbering overlay. Refs [10] Bourke for the
- *   depth-cued character/colour pairing pattern.
- *
- * Brightness rule (CLAUDE.md "Theme Palette Brightness")
- *   Every entry sits in the BRIGHT HALF of the 256-colour space:
- *     - cube colours: ≥ 24  (avoid 16-23; invisible under A_DIM)
- *     - grayscale  : ≥ 240 (avoid 232-239; same reason)
- *   Theme character comes from the RELATIVE gradient, not absolute
- *   darkness — push the dimmest slot up by a few indices to keep
- *   the look and gain legibility.
- *
- * References [10] Bourke for the gradient-as-depth pattern;
- *   [11] Raymond §init_pair for the rebind mechanism.
+ * Switching theme rebinds only the five arm pairs (1..5). The target
+ * (red) and reach circle (yellow) keep their colours across every theme
+ * because those colours mean something — you learn them once. The five
+ * indices go dim->bright so the eye can trace the chain from shoulder to
+ * tip without numbering the joints. Every index stays in the bright half
+ * of the palette so nothing vanishes when drawn with A_DIM.
  */
 typedef struct {
-    const char *name;              /* HUD-displayable theme name        */
-    int         arm[N_ARM_COLORS]; /* xterm-256 fg indices, root → tip; *
-                                    * pair (i+1) = arm[i] at apply time */
+    const char *name;              /* shown in the HUD                  */
+    int         arm[N_ARM_COLORS]; /* fg indices, root to tip;          *
+                                    * arm[i] becomes colour-pair (i+1)  */
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -733,10 +176,8 @@ static const Theme THEMES[N_THEMES] = {
     { "Neon",   { 57,  93, 129, 165, 201} },
 };
 
-/* theme_apply — re-bind arm pairs (1..N_ARM_COLORS) to the chosen
- * theme. Pairs 6 (target red) and 7 (reach yellow) are NEVER
- * touched here — they carry semantic meaning that must not change
- * with the theme. HUD/HINT (8/9) are also theme-independent. */
+/* Point the five arm colour-pairs at the chosen theme. The target,
+ * reach, and HUD pairs are left alone — their colours never change. */
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -753,10 +194,10 @@ static void color_init(int initial_theme)
 
     if (COLORS >= 256) {
         theme_apply(initial_theme);
-        init_pair(6, 196, -1);   /* bright red — target marker (semantic) */
-        init_pair(7, 226, -1);   /* yellow     — reach horizon (semantic) */
+        init_pair(6, 196, -1);   /* bright red — target marker */
+        init_pair(7, 226, -1);   /* yellow     — reach circle  */
     } else {
-        /* 8-color fallback */
+        /* terminals with only 8 colours */
         init_pair(1, COLOR_WHITE,  -1);
         init_pair(2, COLOR_WHITE,  -1);
         init_pair(3, COLOR_WHITE,  -1);
@@ -766,21 +207,19 @@ static void color_init(int initial_theme)
         init_pair(7, COLOR_YELLOW, -1);
     }
 
-    /* HUD pairs are theme-independent — bright yellow status, bright
-     * cyan hint, both on default bg so they overlay any theme. */
+    /* Bright yellow status bar, bright cyan hint — fixed so they stay
+     * readable over any theme. */
     init_pair(PAIR_HUD,  COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ===================================================================== */
-/* §4  coords — pixel↔cell aspect-ratio helpers                          */
-/* ===================================================================== */
+/* ── §4 coords — pixel to cell conversion ── */
 
 /*
- * All entity positions live in square pixel space (1 unit = 1 px).
- * Only at draw time do these helpers convert to cell coordinates,
- * undoing the 8:16 cell aspect ratio.
- *   cell = floor(px / CELL_DIM + 0.5)    — nearest-integer rounding
+ * Positions are stored in square pixels; the terminal's cells aren't
+ * square (8 wide, 16 tall), so these turn a pixel position into the
+ * cell that contains it, rounding to the nearest. This is the only
+ * place that conversion happens.
  */
 static inline int px_to_cell_x(float px)
 {
@@ -791,46 +230,21 @@ static inline int px_to_cell_y(float py)
     return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  entity — Arm                                                       */
-/* ===================================================================== */
+/* ── §5 entity — the Arm (chain + target) ── */
 
 /*
- * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
- *
- * Intent
- *   FABRIK arithmetic and Lissajous integration both live in pixel
- *   space. Each character cell is CELL_W × CELL_H sub-pixels
- *   (8 × 16), so a sweeping arm and a moving target read as
- *   continuous motion instead of jumping cell-to-cell. The
- *   conversion to cell space happens only inside §5d rendering
- *   helpers via px_to_cell_x/y — the project's "one conversion
- *   point" rule.
- *
- * Convention
- *   x : EASTWARD pixel coordinate (positive → right of screen).
- *   y : SOUTHWARD pixel coordinate (positive → down the screen).
- *
- *   FABRIK is direction-AGNOSTIC — every step works purely on
- *   distances and unit vectors. The screen-y-down convention costs
- *   nothing: the solver doesn't compute angles, just positions.
- *
- * Why a value type
- *   8 bytes; passes in registers on every modern ABI. Joints are
- *   stored Vec2 pos[N_JOINTS] (5 entries → 40 bytes); the inner
- *   FABRIK loop walks this array with no indirection.
- *
- * Why named (x, y) instead of two loose floats
- *   Type-checking catches (col, row) confusion at compile time.
- *
- * References [4] Craig §2 "Spatial descriptions".
+ * Vec2 — a point in pixel space.
+ *   x grows rightward, y grows downward (screen convention).
+ * The whole simulation runs in pixels and only converts to cells when
+ * drawing. FABRIK never looks at directions as angles, only as
+ * positions and distances, so y-pointing-down doesn't matter to it.
  */
 typedef struct {
-    float x;   /* eastward  pixel coordinate (positive → right) */
-    float y;   /* southward pixel coordinate (positive → down)  */
+    float x;   /* pixels, positive = right */
+    float y;   /* pixels, positive = down  */
 } Vec2;
 
-/* ── §5a  vec2 helpers ──────────────────────────────────────────────── */
+/* ── §5a  vec2 helpers ── */
 
 static inline float vec2_len(Vec2 v)
 {
@@ -838,10 +252,9 @@ static inline float vec2_len(Vec2 v)
 }
 
 /*
- * vec2_norm — unit vector. Degenerate guard: zero-length input returns
- * (1, 0) so callers can use the result without NaN propagation. The
- * specific direction (east) is arbitrary; any unit vector is OK because
- * the next FABRIK iteration immediately separates coincident joints.
+ * Unit vector (same direction, length 1). If the input is (near) zero
+ * there's no direction to return, so fall back to (1,0) — any direction
+ * works, because the next FABRIK pass pulls coincident joints apart.
  */
 static inline Vec2 vec2_norm(Vec2 v)
 {
@@ -851,105 +264,51 @@ static inline Vec2 vec2_norm(Vec2 v)
 }
 
 /*
- * Arm — the full IK arm state.
- *
- * Intent
- *   Two cleanly-separated sub-systems share one record:
- *
- *     1. CHAIN — N_JOINTS joints, N_LINKS fixed-length segments
- *        between them. pos[0] is the root (pinned to the screen-
- *        centre anchor); pos[N_LINKS] is the tip (end-effector).
- *        FABRIK rewrites pos[] in full each tick. Refs [1].
- *
- *     2. TARGET OSCILLATOR — a Lissajous(1, 2, π/4) figure-8 that
- *        the chain chases. Output = (lis_ax·cos(t), lis_ay·sin(2t+
- *        π/4)) shifted to (root_px, root_py). The arm has no will
- *        of its own; this oscillator is what gives the demo motion.
- *        Refs [6][7].
- *
- *   The sub-systems are UNCOUPLED in time: the target advances on
- *   wall-clock time; the chain reacts to wherever it ended up.
- *   No feedback loop, no shared state besides `target`.
- *
- * Why pos[] has N_JOINTS = N_LINKS + 1 entries
- *   A chain with N links has N+1 joints (one per link end + the
- *   root). pos[0] = root anchor; pos[N_LINKS] = tip. The "+1" is a
- *   constant trap to remember — index it wrong and FABRIK silently
- *   shortens the chain by one.
- *
- * Why total_len is CACHED (not recomputed)
- *   The reachability test "is |target - root| > Σ link_len?" runs
- *   every tick. Σ link_len doesn't change after scene_init, so cache
- *   it once. Lets the hot path skip an O(N) sum and one sqrtf
- *   per frame.
- *
- * Why TRAIL_SIZE is a CIRCULAR buffer (not a growing list)
- *   The renderer walks the most recent TRAIL_SIZE samples backward
- *   from trail_head. Circular indexing means no allocation, no
- *   shifting; trail_head walks mod TRAIL_SIZE forward, oldest entry
- *   is overwritten. trail_count caps at TRAIL_SIZE on warm-up so
- *   the renderer doesn't read uninitialised entries on frame 1.
- *
- * Why root anchor is stored (not just hard-coded)
- *   SIGWINCH triggers a recompute (in app_do_resize) — the anchor
- *   moves to the new screen centre, and the Lissajous re-centres
- *   around it. Caching it here means the resize path is one
- *   assignment, not a re-derivation in every helper.
- *
- * The `at_limit` flag
- *   Set true when reachability fails (target outside Σ link_len
- *   radius). Two readers care:
- *     - solver: skips FABRIK iteration, calls stretch_arm_straight.
- *     - renderer: draws the yellow reach-horizon circle.
- *   Recomputed every tick, never persists across frames.
- *
- * References [1][2] Aristidou & Lasenby for FABRIK; [6] Lissajous
- *   original derivation; [3][4] Buss + Craig for the IK families
- *   this file's solver is NOT.
+ * Arm — everything about the arm and the dot it chases, in one record.
+ * Two independent halves: the chain of joints (solved by FABRIK each
+ * frame) and the self-driving target (a figure-8). They share nothing
+ * but the target's position: the dot moves on its own, the chain just
+ * reacts to wherever it ended up.
  */
 typedef struct {
-    /* ── Chain state (FABRIK rewrites pos[] each tick) ─────────── */
-    Vec2  pos     [N_JOINTS];  /* joint positions; [0]=root, [N]=tip */
-    float link_len[N_LINKS];   /* fixed segment lengths; set once    */
-    float total_len;           /* cache of Σ link_len for reach test */
+    /* ── The chain (FABRIK overwrites pos[] every frame) ── */
+    Vec2  pos     [N_JOINTS];  /* joints: pos[0]=root (fixed), last=tip */
+    float link_len[N_LINKS];   /* bone lengths, in px; set once at init */
+    float total_len;           /* sum of link_len; the reach radius     */
 
-    /* ── Root anchor (Lissajous centre coincides) ──────────────── *
-     * Re-set on SIGWINCH so a resize re-centres both the chain    *
-     * root and the figure-8 path the target traces.               */
-    float root_px;             /* pixel-space x of arm root         */
-    float root_py;             /* pixel-space y of arm root         */
+    /* ── Root position (also the centre of the figure-8) ──
+     * Recomputed on resize so the arm re-centres on the new screen. */
+    float root_px;             /* root x, px */
+    float root_py;             /* root y, px */
 
-    /* ── Lissajous target oscillator (closed-form, stateless) ─── *
-     * target is a pure function of scene_time + lis_ax/lis_ay +   *
-     * root anchor. scene_time advances by dt·speed_scale per tick;*
-     * pausing freezes scene_time so motion can resume in phase.   */
-    Vec2  target;              /* current oscillator output         */
-    float scene_time;          /* phase accumulator (s)             */
-    float speed_scale;         /* +/- user-tunable multiplier       */
-    float lis_ax;              /* amplitude in x (pixels)           */
-    float lis_ay;              /* amplitude in y (pixels)           */
+    /* ── The moving target ──
+     * target is just a function of scene_time; pausing stops the clock
+     * so the dot resumes exactly where it left off. */
+    Vec2  target;              /* where the tip is trying to reach   */
+    float scene_time;          /* the figure-8 clock, in seconds     */
+    float speed_scale;         /* target speed, 0.05..5.0 (+/- keys)  */
+    float lis_ax;              /* figure-8 half-width, px            */
+    float lis_ay;              /* figure-8 half-height, px           */
 
-    /* ── Target trail (circular buffer of recent positions) ───── *
-     * Rendered as a faint dotted ∞ behind the live target so the  *
-     * eye can see the path being traced.                           */
+    /* ── Trail: recent target positions, drawn as a faint dotted path.
+     * A ring buffer: trail_head is the newest, older ones wrap around
+     * and get overwritten. trail_count is how many are filled in so far
+     * (so frame 1 doesn't draw garbage), maxing out at TRAIL_SIZE. */
     Vec2  trail[TRAIL_SIZE];
-    int   trail_head;          /* index of newest entry, mod size   */
-    int   trail_count;         /* valid entries, saturates at SIZE  */
+    int   trail_head;          /* index of newest entry */
+    int   trail_count;         /* filled entries, up to TRAIL_SIZE */
 
-    /* ── Reachability + UI flags ───────────────────────────────── *
-     * at_limit: recomputed each tick (NOT persistent state).      *
-     * paused / theme_idx: user control flags.                     */
-    bool  at_limit;            /* target outside Σ link_len radius  */
-    bool  paused;              /* freezes scene_time; chain freezes */
-    int   theme_idx;           /* index into §3 THEMES[]            */
+    /* ── Flags ── */
+    bool  at_limit;            /* target out of reach (recomputed each frame) */
+    bool  paused;              /* spacebar: freeze the whole sim */
+    int   theme_idx;           /* which THEMES[] palette is active */
 } Arm;
 
-/* ── §5b  FABRIK solver ─────────────────────────────────────────────── */
+/* ── §5b  FABRIK solver ── */
 
 /*
- * stretch_arm_straight — out-of-reach posture. Lay every joint along
- * the unit vector from root toward target. Cannot reach the target
- * but presents the arm at maximum extension in the right direction.
+ * Target's too far: lay all the joints in a straight line pointing at
+ * it. The tip can't reach, but the arm at least points the right way.
  */
 static void stretch_arm_straight(Arm *a, Vec2 root, Vec2 target)
 {
@@ -962,9 +321,10 @@ static void stretch_arm_straight(Arm *a, Vec2 root, Vec2 target)
 }
 
 /*
- * fabrik_forward_pass — pin tip to target, walk back to root preserving
- * link lengths. After this pass: tip equals target exactly; all link
- * lengths correct; root has drifted from anchor.
+ * Forward pass: snap the tip onto the target, then walk back toward the
+ * root, pulling each joint into line so every bone keeps its length.
+ * Afterward the tip is exactly on target, but the root has slid off its
+ * anchor — the backward pass fixes that.
  */
 static void fabrik_forward_pass(Arm *a, Vec2 target)
 {
@@ -973,7 +333,7 @@ static void fabrik_forward_pass(Arm *a, Vec2 target)
         float fx   = a->pos[i].x - a->pos[i + 1].x;
         float fy   = a->pos[i].y - a->pos[i + 1].y;
         float flen = sqrtf(fx * fx + fy * fy);
-        if (flen < 1e-6f) flen = 1e-6f;     /* coincident-joint guard */
+        if (flen < 1e-6f) flen = 1e-6f;     /* two joints on top of each other */
         float r    = a->link_len[i] / flen;
         a->pos[i].x = a->pos[i + 1].x + fx * r;
         a->pos[i].y = a->pos[i + 1].y + fy * r;
@@ -981,9 +341,10 @@ static void fabrik_forward_pass(Arm *a, Vec2 target)
 }
 
 /*
- * fabrik_backward_pass — pin root to anchor, walk forward to tip
- * preserving link lengths. After this pass: root anchored; all links
- * correct; tip has drifted from target (by less than before).
+ * Backward pass: snap the root back onto its anchor, then walk out to
+ * the tip the same way. Now the root is right and the bones are right,
+ * but the tip has drifted off the target — by less than last time.
+ * Alternating the two passes closes that gap each round.
  */
 static void fabrik_backward_pass(Arm *a, Vec2 root)
 {
@@ -999,7 +360,7 @@ static void fabrik_backward_pass(Arm *a, Vec2 root)
     }
 }
 
-/* tip_target_distance — |pos[N−1] − target|, used for convergence test. */
+/* How far the tip still is from the target — the solver's stop test. */
 static float tip_target_distance(const Arm *a, Vec2 target)
 {
     float tdx = a->pos[N_JOINTS - 1].x - target.x;
@@ -1008,9 +369,9 @@ static float tip_target_distance(const Arm *a, Vec2 target)
 }
 
 /*
- * fabrik_solve — orchestrator. Reachability check first; if reachable,
- * iterate forward + backward passes until tip-to-target error drops
- * below CONV_TOL or MAX_ITER is hit. See ALGORITHM IN STEPS §3-§4.
+ * Solve the whole arm for this frame. If the target sits farther than
+ * the arm can stretch, just point at it. Otherwise run forward/backward
+ * passes until the tip is within CONV_TOL or we hit the pass cap.
  */
 static void fabrik_solve(Arm *a)
 {
@@ -1034,9 +395,10 @@ static void fabrik_solve(Arm *a)
     }
 }
 
-/* ── §5c  target motion — Lissajous figure-8 ───────────────────────── */
+/* ── §5c  target motion — the figure-8 ── */
 
-/* trail_push — append current target to ring buffer (overwrites oldest). */
+/* Record the latest target position in the trail ring, dropping the
+ * oldest if the ring is full. */
 static void trail_push(Arm *a, Vec2 pos)
 {
     a->trail_head = (a->trail_head + 1) % TRAIL_SIZE;
@@ -1045,8 +407,8 @@ static void trail_push(Arm *a, Vec2 pos)
 }
 
 /*
- * update_target — advance the Lissajous clock and recompute target
- * position. See KEY FORMULAS for the parametric equations.
+ * Move the target along its figure-8 for this frame: advance the clock,
+ * plug it into the curve equations (see §1 LIS_*), and log the trail.
  */
 static void update_target(Arm *a, float dt)
 {
@@ -1060,18 +422,12 @@ static void update_target(Arm *a, float dt)
     trail_push(a, a->target);
 }
 
-/* ── §5d  rendering helpers ─────────────────────────────────────────── */
+/* ── §5d  rendering helpers ── */
 
 /*
- * draw_link_beads — stamp 'o' along segment a→b at DRAW_STEP_PX
- * intervals (pass 1 of the two-pass arm renderer).
- *
- * WHY DENSE STEPPING? A cell is CELL_W=8 px wide. Drawing only at
- * endpoints leaves visible gaps on segments longer than one cell.
- * Stepping every DRAW_STEP_PX=5 px (< CELL_W) guarantees at least
- * one sample per cell along the segment.
- *
- * The dedup cursor is local: each link's stamping is independent.
+ * Draw one bone as a line of 'o' beads from a to b. We step along it in
+ * pixel-sized hops smaller than a cell so no cell along the line is
+ * missed, skipping repeats when several hops land in the same cell.
  */
 static void draw_link_beads(WINDOW *w, Vec2 a, Vec2 b,
                             int pair, attr_t attr,
@@ -1100,7 +456,7 @@ static void draw_link_beads(WINDOW *w, Vec2 a, Vec2 b,
     }
 }
 
-/* mark_cell — stamp one glyph at a pixel position with bounds check. */
+/* Draw one glyph at a pixel position, ignoring it if off-screen. */
 static void mark_cell(WINDOW *w, Vec2 p, chtype glyph,
                       int pair, attr_t attr, int cols, int rows)
 {
@@ -1113,13 +469,9 @@ static void mark_cell(WINDOW *w, Vec2 p, chtype glyph,
 }
 
 /*
- * joint_marker — size-coded glyph by joint index.
- *   root anchor (i=0)         → '0' big
- *   tip / end effector        → '.' small (precision)
- *   near-root interior        → '0' big
- *   near-tip interior         → 'o' medium
- * The taper from big to small visually emphasises the root→tip
- * hierarchy and makes the tip read as a precision gripper.
+ * Pick a joint's glyph by where it sits in the chain. Big to small from
+ * root to tip, so the chain reads as a hierarchy and the tip looks like
+ * a fine gripper.
  */
 static chtype joint_marker(int i)
 {
@@ -1129,22 +481,18 @@ static chtype joint_marker(int i)
     return                          (chtype)(unsigned char)'o';   /* near tip  */
 }
 
-/*
- * joint_pair — colour pair by joint index. Maps to the link below
- * each joint, so each joint's marker matches its femur colour. Pair 4
- * is intentionally skipped (tip uses pair 5 directly) for visual
- * contrast between the bright tip and middle links.
- */
+/* Pick a joint's colour so its marker roughly matches the bone it sits
+ * on. The tip jumps to the brightest pair (5) for contrast. */
 static int joint_pair(int i)
 {
     if (i == 0)             return 1;   /* root */
     if (i == N_JOINTS - 1)  return 5;   /* tip  */
-    return i + 1;                       /* interior — 2, 3 */
+    return i + 1;                       /* interior joints */
 }
 
-/* ── §5e  render_arm orchestrator ───────────────────────────────────── */
+/* ── §5e  render_arm — draw the whole arm ── */
 
-/* draw_trail — pass A: faint dotted Lissajous path, oldest → newest. */
+/* The faint dotted figure-8 path behind the live target. */
 static void draw_trail(const Arm *a, WINDOW *w, int cols, int rows)
 {
     for (int k = 0; k < a->trail_count; k++) {
@@ -1155,10 +503,8 @@ static void draw_trail(const Arm *a, WINDOW *w, int cols, int rows)
     }
 }
 
-/*
- * draw_reach_circle — pass B (only when at_limit): sparse dot circle
- * showing the reach horizon. 48 angular samples — see MENTAL MODEL.
- */
+/* The dashed yellow ring showing how far the arm can reach — only drawn
+ * when the target has escaped past it. */
 static void draw_reach_circle(const Arm *a, WINDOW *w, int cols, int rows)
 {
     if (!a->at_limit) return;
@@ -1174,11 +520,8 @@ static void draw_reach_circle(const Arm *a, WINDOW *w, int cols, int rows)
     }
 }
 
-/*
- * draw_links — pass C: bead fill along each link with the gradient
- * pair. Pair 4 is intentionally skipped between mid-links and tip
- * (link_pairs[3] = 5) to widen the visual gap to the bright tip.
- */
+/* The four bones, each in its gradient colour. The last bone jumps
+ * straight to the brightest pair (5) to set the tip apart. */
 static void draw_links(const Arm *a, WINDOW *w, int cols, int rows)
 {
     static const int link_pairs[N_LINKS] = { 1, 2, 3, 5 };
@@ -1189,9 +532,7 @@ static void draw_links(const Arm *a, WINDOW *w, int cols, int rows)
     }
 }
 
-/* draw_joints — pass D: bold node glyph at each joint, sitting on top
- * of the link bead fill. Marker shape encodes hierarchy via
- * joint_marker(); pair via joint_pair(). */
+/* A bold node marker at every joint, drawn over the bones. */
 static void draw_joints(const Arm *a, WINDOW *w, int cols, int rows)
 {
     for (int i = 0; i < N_JOINTS; i++)
@@ -1199,8 +540,8 @@ static void draw_joints(const Arm *a, WINDOW *w, int cols, int rows)
                   joint_pair(i), A_BOLD, cols, rows);
 }
 
-/* draw_target — pass E: '+' when tracking, 'X' when out of reach.
- * Bright red bold so it always stands out against any theme. */
+/* The target marker on top of everything: '+' when the arm can reach
+ * it, 'X' when it can't. Always bright red so it never gets lost. */
 static void draw_target(const Arm *a, WINDOW *w, int cols, int rows)
 {
     chtype glyph = a->at_limit
@@ -1209,11 +550,8 @@ static void draw_target(const Arm *a, WINDOW *w, int cols, int rows)
     mark_cell(w, a->target, glyph, 6, A_BOLD, cols, rows);
 }
 
-/*
- * render_arm — orchestrator. Painter's order so each pass overlays
- * the previous: trail (deepest) → reach circle → links → joints →
- * target marker (topmost).
- */
+/* Draw the whole arm, back to front, so later layers cover earlier
+ * ones: trail, reach circle, bones, joints, then the target marker. */
 static void render_arm(const Arm *a, WINDOW *w, int cols, int rows)
 {
     draw_trail        (a, w, cols, rows);
@@ -1223,62 +561,26 @@ static void render_arm(const Arm *a, WINDOW *w, int cols, int rows)
     draw_target       (a, w, cols, rows);
 }
 
-/* ===================================================================== */
-/* §6  scene — thin wrapper around Arm                                   */
-/* ===================================================================== */
+/* ── §6 scene — the world (just the one arm) ── */
 
 /*
- * Scene — composition root for §6.
- *
- * Intent
- *   In this demo the simulation IS one arm + one Lissajous target.
- *   We keep a Scene wrapper anyway so the framework loop (scene_init
- *   / scene_tick / scene_draw) reads identically to every other file
- *   in the repo. If a future variant adds e.g. obstacles for the arm
- *   to avoid, secondary targets, or a goal-switcher, those slot in
- *   here as siblings of `arm` without changing the loop.
- *
- * Simulation vs Rendering locality
- *   The Arm struct itself already separates CHAIN STATE (FABRIK
- *   output) from TARGET OSCILLATOR (sim verbs) from TRAIL (render-
- *   only cache) from REACHABILITY/UI FLAGS. Within Scene there is
- *   no further split needed yet — one field, one concern. When
- *   adding a new member, place it as follows:
- *
- *     ── Simulation state ──   things scene_tick READS+WRITES
- *                              (obstacles[], secondary_target, …)
- *     ── Render-only state ──  things scene_draw READS, never the
- *                              physics path (camera, shake, …)
- *
- * Things that DO NOT live here
- *   - fps / sim_fps counters → §8 App (frame-timing concern, not
- *     part of the world being simulated).
- *   - terminal extents (cols, rows) → §7 Screen.
- *   - signal flags (running, need_resize) → §8 App.
- *
- * One Scene per program; passed by pointer to every §6 entry point.
+ * Scene — the whole simulated world. Here that's just one Arm, but the
+ * wrapper keeps init/tick/draw looking the same as every other demo in
+ * the repo, and gives obstacles or a second target somewhere to go later.
  */
 typedef struct {
-    /* ── Simulation state ─────────────────────────────────────── */
-    Arm arm;                   /* the world: chain + target + trail */
-
-    /* (no render-only state yet — theme_idx + trail live inside
-     *  Arm because trail is also used by the reach-check overlay) */
+    Arm arm;                   /* chain + target + trail */
 } Scene;
 
 /*
- * scene_init — place the arm at screen centre with all geometry sized
- * to the current terminal dimensions.
- *
- * Non-obvious bits:
- *  - link_len weights {0.32, 0.27, 0.23, 0.18} sum to 1.0 so total_len
- *    equals arm_reach exactly. Tapered root → tip mirrors animal-limb
- *    biomechanics (upper arm > forearm > hand) and gives visual hierarchy.
- *  - lis_ax / lis_ay clipped to 0.9 · total_len so the figure-8
- *    extremes are JUST out of reach — at_limit briefly fires at each
- *    horizontal lobe, making the reach-horizon circle blink visibly.
- *  - Initial pose: arm laid out straight to the right. FABRIK reshapes
- *    it on the first tick to track the initial Lissajous target.
+ * Build the arm centred on the screen, sized to the current terminal.
+ *  - The four bone lengths shrink from root to tip and add up to the
+ *    full reach; the taper mimics an upper-arm/forearm/hand and helps
+ *    the eye read the chain.
+ *  - The figure-8 is sized so its widest points sit just past the reach,
+ *    so the arm hits its limit (and flashes the reach circle) each lap.
+ *  - The arm starts laid out straight to the right; FABRIK reshapes it
+ *    on the first frame.
  */
 static void scene_init(Scene *sc, int cols, int rows)
 {
@@ -1288,19 +590,20 @@ static void scene_init(Scene *sc, int cols, int rows)
     float sw = (float)(cols * CELL_W);
     float sh = (float)(rows * CELL_H);
 
-    /* Link lengths: arm spans 60% of shorter screen dimension.
-     * Weights sum to 1.0 so total_len = arm_reach exactly. */
+    /* Full reach = 60% of the shorter screen side. The four weights
+     * add to 1.0, so the bones add up to exactly that reach. */
     float arm_reach = (sw < sh ? sw : sh) * 0.60f;
-    a->link_len[0]  = arm_reach * 0.32f;   /* longest — root link  */
+    a->link_len[0]  = arm_reach * 0.32f;   /* longest — root bone */
     a->link_len[1]  = arm_reach * 0.27f;
     a->link_len[2]  = arm_reach * 0.23f;
-    a->link_len[3]  = arm_reach * 0.18f;   /* shortest — tip link  */
+    a->link_len[3]  = arm_reach * 0.18f;   /* shortest — tip bone */
     a->total_len    = arm_reach;
 
     a->root_px = sw * 0.50f;
     a->root_py = sh * 0.50f;
 
-    /* Lissajous amplitudes: 40% of each axis, clipped to 90% of reach. */
+    /* Figure-8 size: 40% of each screen axis, but never more than 90%
+     * of the reach (so the extremes poke just past what the arm can do). */
     float max_amp = a->total_len * 0.90f;
     a->lis_ax     = sw * 0.40f;
     a->lis_ay     = sh * 0.40f;
@@ -1310,14 +613,14 @@ static void scene_init(Scene *sc, int cols, int rows)
     a->scene_time  = 0.0f;
     a->speed_scale = LIS_SPEED_DEFAULT;
 
-    /* Initial pose: straight line to the right from root. */
+    /* Starting pose: joints in a straight line to the right of the root. */
     a->pos[0] = (Vec2){ a->root_px, a->root_py };
     for (int i = 1; i < N_JOINTS; i++) {
         a->pos[i].x = a->pos[i - 1].x + a->link_len[i - 1];
         a->pos[i].y = a->pos[i - 1].y;
     }
 
-    /* Initial target at scene_time = 0. */
+    /* Where the target starts, at time 0 on the figure-8. */
     a->target.x = a->root_px + a->lis_ax;
     a->target.y = a->root_py + a->lis_ay * sinf(LIS_PHASE);
 
@@ -1328,17 +631,15 @@ static void scene_init(Scene *sc, int cols, int rows)
     a->theme_idx   = 0;
 }
 
-/*
- * scene_tick — one variable-timestep update. dt is the wall-clock
- * delta scaled by the caller's time_scale.
- */
+/* One frame of simulation: move the target, then solve the arm to it.
+ * dt is seconds since the last frame (already time-scaled). */
 static void scene_tick(Scene *sc, float dt)
 {
     Arm *a = &sc->arm;
     if (a->paused) return;
 
-    update_target(a, dt);    /* advance Lissajous, push trail */
-    fabrik_solve (a);        /* IK: bring tip to new target   */
+    update_target(a, dt);    /* move the dot along its figure-8 */
+    fabrik_solve (a);        /* bend the arm so the tip reaches it */
 }
 
 static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows)
@@ -1346,38 +647,20 @@ static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows)
     render_arm(&sc->arm, w, cols, rows);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen — ncurses display + HUD ── */
 
 /*
- * Screen — terminal-extent snapshot in CHARACTER CELLS.
- *
- * Intent
- *   Caches the current terminal size so every §6 entry point reads
- *   (cols, rows) as plain ints rather than re-querying ncurses each
- *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
- *   propagated to scene_init via app_do_resize.
- *
- * Why a separate struct (not just two ints in App)
- *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
- *   except this struct. Carving it out makes screen_resize pure and
- *   isolates the ncurses dependency from the simulation layer.
- *
- * Why cells, not pixels
- *   ncurses' coordinate system is cells. Pixel space (CELL_W ×
- *   CELL_H sub-pixels per cell) lives only inside §5 — converted at
- *   the draw boundary, per the project's "one conversion point" rule.
- *
- * References [11] Raymond, NCURSES Programming HOWTO.
+ * Screen — the current terminal size, in cells. Cached here so the rest
+ * of the code reads plain ints instead of querying ncurses every frame;
+ * refreshed on resize. (Pixels are a §5 thing; ncurses works in cells.)
  */
 typedef struct {
-    int cols;   /* terminal width  in CHARACTER CELLS */
-    int rows;   /* terminal height in CHARACTER CELLS */
+    int cols;   /* terminal width in cells  */
+    int rows;   /* terminal height in cells */
 } Screen;
 
-/* The non-obvious call here is typeahead(-1): without it, ncurses peeks
- * at stdin during output writes, which can tear frames mid-update. */
+/* typeahead(-1) is the one to know: without it ncurses checks stdin
+ * mid-write and can tear the frame. */
 static void screen_init(Screen *s)
 {
     initscr();
@@ -1393,7 +676,7 @@ static void screen_init(Screen *s)
 
 static void screen_free(Screen *s) { (void)s; endwin(); }
 
-/* SIGWINCH path: endwin()+refresh() forces ncurses to re-read LINES/COLS. */
+/* On resize: endwin()+refresh() makes ncurses re-read the new size. */
 static void screen_resize(Screen *s)
 {
     endwin();
@@ -1401,13 +684,8 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * screen_draw — compose one full frame:
- *   erase → arm → status (top right) → key hint (bottom).
- *
- * HUD pairs are spec-fixed (PAIR_HUD = bright yellow, PAIR_HINT = bright
- * cyan, both A_BOLD on default bg) so they read against any theme.
- */
+/* Paint one full frame: clear, draw the arm, then the status line
+ * (top-right) and the key hint (bottom). */
 static void screen_draw(Screen *s, const Scene *sc,
                         double fps, float time_scale)
 {
@@ -1439,55 +717,25 @@ static void screen_draw(Screen *s, const Scene *sc,
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app — signals, resize, main loop ── */
 
 /*
- * App — top-level container; everything outside the world.
+ * App — everything outside the simulated world: the Scene, the Screen,
+ * and the loop's control flags, in one record. It's a file-scope global
+ * (g_app) so the signal handlers can reach it — they get no argument.
  *
- * Intent
- *   Bundles the simulated world (Scene), the host terminal (Screen),
- *   and the loop-control flags into one record so main() reads as
- *   four-line phases: init / service signals / step+draw / shutdown.
- *   Declared file-scope (g_app) so signal handlers — which cannot
- *   take a user argument — can write `running` and `need_resize`
- *   without globals scattered through the file.
- *
- * Locality of concern
- *   ── Owned subsystems ── nouns the app composes
- *      scene       — the world being simulated (§6)
- *      screen      — the terminal extent it draws to (§7)
- *
- *   ── Loop control ─── verbs the loop reads each frame
- *      time_scale  — wall-clock dt multiplier ([ / ] adjust)
- *      running     — clear → loop exits; set by SIGINT/SIGTERM
- *      need_resize — set by SIGWINCH; cleared after Screen refresh
- *
- * Why volatile sig_atomic_t (not bool, not int)
- *   `volatile`    : the compiler must not cache the flag across a
- *                   signal-handler write — every loop iteration must
- *                   re-read it from memory.
- *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
- *                   signals; a plain `int` could be observed half-
- *                   written on architectures where stores are split.
- *   See [11] Raymond §"Signal handling".
- *
- * Things that DO NOT live here
- *   - Wall-clock timestamps / fps counters — main() locals; no
- *     other code path needs them.
- *   - Arm tuning values (speed_scale, theme_idx) — user-state in
- *     §5 Arm.
+ * running and need_resize are written from signal handlers, so they're
+ * volatile sig_atomic_t: volatile forces a re-read each loop instead of
+ * caching, and sig_atomic_t is the one int type guaranteed to be written
+ * in one piece even when a signal interrupts.
  */
 typedef struct {
-    /* ── Owned subsystems ─────────────────────────────────────── */
-    Scene  scene;              /* the world (§6)                       */
-    Screen screen;             /* terminal extent (§7)                 */
+    Scene  scene;              /* the world (§6)        */
+    Screen screen;             /* terminal size (§7)    */
 
-    /* ── Loop control ─────────────────────────────────────────── */
-    float                 time_scale;   /* dt multiplier; 1.0 = realtime */
-    volatile sig_atomic_t running;      /* main loop predicate            */
-    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
+    float                 time_scale;   /* sim speed; 1.0 = realtime ([ ] keys) */
+    volatile sig_atomic_t running;      /* loop runs while set; SIGINT/TERM clears */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH sets it; handled next frame */
 } App;
 
 static App g_app;
@@ -1499,11 +747,9 @@ static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void) { endwin(); }
 
 /*
- * app_do_resize — handle a pending SIGWINCH.
- *
- * Geometry (root, link lengths, Lissajous amplitudes) is recomputed for
- * the new screen, but scene_time, speed_scale, theme_idx are PRESERVED
- * so animation continues from the same point in its cycle.
+ * Rebuild the arm for the new terminal size after a resize. Geometry is
+ * recomputed from scratch, but the theme, speed, and figure-8 clock are
+ * saved and restored so the animation carries on where it was.
  */
 static void app_do_resize(App *app)
 {
@@ -1559,14 +805,9 @@ static bool app_handle_key(App *app, int ch)
 }
 
 /*
- * main — variable-timestep render loop. Per-frame phases:
- *   ① INPUT      drain getch() — a press takes effect on this frame
- *   ② RESIZE     handle pending SIGWINCH before touching ncurses
- *   ③ MEASURE dt wall-clock ns since last frame; capped at 100 ms
- *   ④ TICK       one simulation step at exactly dt · time_scale
- *   ⑤ FPS        smoothed over a 500 ms window
- *   ⑥ RENDER     erase → draw → wnoutrefresh → doupdate
- *   ⑦ FRAME CAP  sleep so total frame ≈ 1/TARGET_FPS
+ * The render loop. Each frame: read keys, handle a pending resize,
+ * measure how long the last frame took, advance the sim by that much,
+ * update the fps readout, draw, then sleep to hold ~TARGET_FPS.
  */
 int main(void)
 {
@@ -1611,7 +852,8 @@ int main(void)
             last_time = clock_ns();
         }
 
-        /* ③ measure dt */
+        /* ③ measure dt — capped at 100 ms so the arm doesn't lurch
+         *    after the program was paused or the laptop slept */
         int64_t dt_ns = frame_start - last_time;
         last_time     = frame_start;
         if (dt_ns > 100 * NS_PER_MS) dt_ns = 100 * NS_PER_MS;
@@ -1635,8 +877,7 @@ int main(void)
                     fps_display, app->time_scale);
         screen_present();
 
-        /* ⑦ frame cap — sleep so total frame ≈ target_ns. The math is
-         *    just (target − elapsed); no spurious +dt terms. */
+        /* ⑦ frame cap — sleep off whatever time is left in the budget */
         int64_t elapsed = clock_ns() - frame_start;
         clock_sleep_ns(target_ns - elapsed);
     }

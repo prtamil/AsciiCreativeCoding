@@ -1,514 +1,26 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * hexpod_tripod.c — 2-D hexapod walker with tripod gait + 2-joint IK
+ * hexpod_tripod.c — a six-legged robot walks across the terminal.
  *
- * DEMO: A 6-legged rigid-body robot walks across the terminal in an
- *       alternating tripod gait — three feet always planted in a
- *       stable support triangle while the other three swing forward.
- *       Each leg is a 2-joint chain solved each frame by law-of-cosines
- *       IK; arrow keys steer the heading.
+ * It moves with a tripod gait: three legs plant on the ground while the
+ * other three swing forward, then they swap — so there are always three
+ * feet down forming a stable tripod and the body never tips. Each leg
+ * uses inverse kinematics: you say where the foot should be and the code
+ * works out the knee angle. Arrow keys steer; the body slides along its
+ * heading.
  *
- * Study alongside: ik_spider.c        (2-joint IK + per-leg gait)
- *                  ragdoll_figure.c   (framework structure)
+ * Sister demos (same 2-joint IK leg, different walkers):
+ *   ik_spider.c, ik_scorpin.c
  *
- * Section map:
- *   §1  config        — all tunables in one place
- *   §2  clock         — monotonic clock + sleep
- *   §3  color         — 8 robot themes + spec HUD/hint pairs
- *   §4  coords        — pixel↔cell aspect-ratio helpers
- *   §5  entity        — Hexapod = rigid body + 6 legs
- *       §5a  vec helpers + per-leg static tables
- *       §5b  solve_ik         — analytical 2-joint IK
- *       §5c  hip_world_pos    — body-local → world transform
- *       §5d  rest_target      — ideal foot rest position
- *       §5e  gait_tick        — tripod state machine
- *       §5f  hexapod_tick     — body + gait + IK orchestrator
- *       §5g  rendering helpers (seg_glyph, draw_leg_line)
- *       §5h  hexapod_draw     — full-frame compositor
- *   §6  scene         — thin Scene wrapper
- *   §7  screen        — ncurses double-buffer display layer
- *   §8  app           — signals, resize, main game loop
+ * Author : Tamilselvan R     License: MIT (see line 1)
  *
- * Keys:  q / ESC      quit                  space  pause / resume
- *        ↑ ↓ ← →      steer heading         w / s  speed × / ÷ 1.25
- *        t            cycle theme           [ / ]  time scale (0.25× .. 4×)
- *
- * Build:
+ * Build (needs -lm for the trig in the IK and rotations):
  *   gcc -std=c11 -O2 -Wall -Wextra animation/hexpod_tripod.c \
  *       -o hexpod_tripod -lncurses -lm
+ *
+ * Keys:  q / ESC quit   space pause   arrows steer   w/s speed
+ *        t theme   [ / ] slow / speed up time
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Two interlocked sub-systems share one body.
- *
- *                 GAIT — a clock that keeps the robot upright. The six
- *                 legs are split into two interlocked tripods:
- *                     A = {left-front 0, right-mid 3, left-rear 4}
- *                     B = {right-front 1, left-mid 2, right-rear 5}
- *                 At all times, exactly one tripod's three feet are
- *                 PLANTED (forming a stable support triangle under the
- *                 body) while the other three SWING forward in
- *                 parabolic arcs to new rest targets. Phases swap when
- *                 the timer expires AND every swinging foot has
- *                 finished its arc — never mid-stride.
- *
- *                 IK — a law-of-cosines solver placing knee joints.
- *                 For each leg the femur (U) and tibia (L) form a
- *                 triangle with the hip→foot vector; the knee angle
- *                 satisfies cos(ah) = (d² + U² − L²)/(2·d·U). Left and
- *                 right legs use opposite signs of ah so left knees
- *                 break toward −y and right knees toward +y.
- *
- *                 STEERING — heading interpolates toward target_heading
- *                 at TURN_RATE rad/s (short-arc through ±π so a flip
- *                 takes the shorter path).
- *
- * Data-structure: Hexapod owns body kinematics (body_x, body_y, heading,
- *                 target_heading, body_speed), per-leg state (foot_pos,
- *                 foot_old, step_target, stepping flag, swing progress
- *                 step_t), per-leg derived (hip, knee) recomputed each
- *                 frame, and the gait state machine (gait_phase,
- *                 phase_timer). Static tables HIP_LOCAL_X/Y, REST_*,
- *                 TRIPOD_A/B encode the per-leg geometry.
- *
- * Rendering     : Painter's order — leg lines first (femur pair 2,
- *                 tibia pair 3), then foot markers ('*' planted bold,
- *                 'o' swinging dim), then knee markers, then the body
- *                 rectangle (4 edges + 2 cross-braces), then hip
- *                 attachment markers '+', and finally the body center
- *                 '@'. Direction-glyph line rasterisation uses the
- *                 same dense-stepping pattern as the FK demos.
- *
- * Performance   : Variable timestep at render rate — no fixed-step
- *                 accumulator, no alpha lerp, no prev/cur snapshots.
- *                 Per frame: 6 IK solves (each ≈ 2 sqrtf + 1 atan2f +
- *                 1 acosf), gait state machine, body integration,
- *                 ~30 cell stamps for legs + body. Microseconds total.
- *
- * References
- * ──────────
- *   ── 2-joint IK (the §5b solver) ──────────────────────────────────
- *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
- *       and Control" (3rd ed.), Pearson — Ch. 4 derives the law-of-
- *       cosines closed-form for 2-link arms; solve_ik() implements
- *       exactly this with a left/right knee-side sign flip.
- *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005),
- *       "Robot Modeling and Control", Wiley — alternative canonical
- *       text; Ch. 4 covers solvability and the two configurations
- *       (knee-up / knee-down) that map to elbow_up here.
- *   [3] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
- *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
- *       UCSD course notes — the iterative IK family this file
- *       AVOIDS by staying analytical at 2 joints per leg.
- *
- *   ── Biological gait + tripod pattern ─────────────────────────────
- *   [4] Wilson, D. M. (1966), "Insect Walking", Annual Review of
- *       Entomology 11, pp. 103-122 — the experimental basis for the
- *       alternating-tripod gait; insects switch between A/B tripods
- *       on a metronome much like §5e gait_tick.
- *   [5] Full, R. J. & Tu, M. S. (1991), "Mechanics of a rapid running
- *       insect: two-, four- and six-legged locomotion", J. Exp. Biol.
- *       156, pp. 215-231 — quantitative reference for stance/swing
- *       duty cycles in 6-legged locomotion.
- *   [6] Hirose, S. (1993), "Biologically Inspired Robots: Snake-Like
- *       Locomotors and Manipulators", Oxford — engineering text on
- *       multi-leg gaits; the TRIPOD_A / TRIPOD_B partition follows
- *       Hirose's "support pattern" framework.
- *   [7] Cruse, H. (1990), "What mechanisms coordinate leg movement
- *       in walking arthropods?", Trends in Neurosciences 13(1) —
- *       on the inter-leg coordination rules that justify the
- *       "swap only when every swinging foot has landed" guard in
- *       §5e launch_tripod().
- *
- *   ── Procedural motion / steering ─────────────────────────────────
- *   [8] Reynolds, C. (1999), "Steering Behaviors for Autonomous
- *       Characters", Game Developers Conference — the short-arc
- *       heading-toward-target interpolation in §5f hexapod_tick.
- *       https://www.red3d.com/cwr/steer/
- *
- *   ── Timestep / animation ─────────────────────────────────────────
- *   [9] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
- *       — when fixed-step matters; this file uses variable-step
- *       because both the IK solve and the gait state machine are
- *       unconditionally stable.
- *
- *   ── Rendering / ncurses ─────────────────────────────────────────
- *  [10] Bresenham, J. E. (1965), "Algorithm for computer control of
- *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
- *       the integer line-drawing algorithm; §5g draw_leg_line uses
- *       the simpler parametric oversample for the same effect.
- *  [11] Bourke, P. (1997), "Character representation of grayscale
- *       images", paulbourke.net/dataformats/asciiart — design basis
- *       for the depth-cued ASCII line glyphs.
- *  [12] Raymond, E. S., "NCURSES Programming HOWTO" —
- *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
- *       use_default_colors, and the diff pipeline §7 relies on.
- *
- *   ── Online quick reference ───────────────────────────────────────
- *  [13] https://en.wikipedia.org/wiki/Tripod_gait
- *  [14] https://en.wikipedia.org/wiki/Inverse_kinematics
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A rigid body slides along its heading; six legs hang off it. The
- * legs play a duet: three are always PLANTED (anchored to the world,
- * forming a stable triangle), three are SWINGING (lifting off, arcing
- * forward, landing at a new spot). Every tick: re-derive hips from the
- * body's pose, advance any swinging feet, then solve law-of-cosines IK
- * to place the knees. The body never tips because the planted tripod
- * is always there.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Body : a brick on rails. You tell it which way to face; it slides
- *        forward at body_speed. Gravity is irrelevant — the legs
- *        aren't bearing weight, they're a visual.
- *
- * Legs : six 2-bar linkages (femur + tibia). Given the hip's world
- *        position and the foot's target, the knee falls out of
- *        elementary trigonometry. No state stored on the leg itself
- *        beyond "is it stepping right now, and how far through the
- *        step?"
- *
- * Gait : a metronome with two phases. Phase A: legs A swing, legs B
- *        plant. Phase B: legs B swing, legs A plant. Phase swap
- *        happens after PHASE_DURATION elapses AND all swinging feet
- *        have landed — whichever is later. This guarantees the
- *        support tripod is always complete.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Measure dt = wall-clock since last frame; multiply by time_scale.
- *  2. Steer: heading interpolates toward target_heading at TURN_RATE
- *     rad/s, taking the short arc through ±π.
- *  3. Translate body along heading by body_speed · dt; wrap toroidally.
- *  4. Recompute every world-space hip from the body's rotated pose.
- *  5. Stretch-snap: if any foot is now beyond IK reach (e.g. body just
- *     wrapped around the edge), snap that foot to its rest target.
- *  6. Gait tick:
- *       a. For each leg in the currently swinging tripod, advance
- *          step_t; place the foot at lerp(foot_old, step_target,
- *          smoothstep(step_t)) plus a parabolic Y-arc.
- *       b. If phase_timer ≥ PHASE_DURATION AND every swinging foot
- *          has landed (step_t = 1), swap tripods: the just-landed
- *          tripod plants, the other launches with new step_targets.
- *  7. For every leg, solve law-of-cosines IK to find knee position.
- *  8. Render painter's order: leg lines → foot markers → knee markers
- *     → body box → hips → center.
- *
- * KEY FORMULAS
- * ────────────
- *  Heading lerp  : turn = clamp(target − heading, ±TURN_RATE · dt)
- *                  (with target − heading wrapped to [−π, π])
- *
- *  2-joint IK    : dist  = clamp(|T − H|, |U − L| + 1, U + L − 1)
- *                  base  = atan2(Ty − Hy, Tx − Hx)
- *                  cos_h = (dist² + U² − L²) / (2 · dist · U)
- *                  ah    = acos(clamp(cos_h, −1, 1))
- *                  knee_angle = base ± ah    ( − for left, + for right )
- *                  knee  = H + U · (cos knee_angle, sin knee_angle)
- *
- *  Foot swing    : ease  = smoothstep(step_t)
- *                  hz    = lerp(foot_old, step_target, ease)
- *                  arc_y = −STEP_HEIGHT · sin(π · step_t)
- *                  foot  = (hz.x, hz.y + arc_y)
- *                  ( smoothstep on the lerp, raw step_t on the arc, so
- *                    the foot decelerates into landing while the arc
- *                    peaks symmetrically at step_t = 0.5 )
- *
- *  Step target   : T = hip_world + rotate(REST_offset
- *                                         + (body_speed · LOOKAHEAD, 0),
- *                                         heading)
- *
- *  Tripod groups : A = {0, 3, 4},  B = {1, 2, 5}
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  - IK clamp. The hip↔target distance is bounded into
- *    [|U − L| + 1, U + L − 1] so acos(cos_h) never sees a value
- *    outside [−1, 1]. Without the clamp, an over-stretched leg
- *    would yield NaN and the chain would vanish.
- *
- *  - Toroidal wrap during walk. The body moves N pixels per tick,
- *    but planted feet don't wrap with it — they were anchored to
- *    the OLD coordinates. The stretch-snap pass detects feet beyond
- *    reach and forces them to rest. The visible glitch is one frame
- *    of teleporting feet, then the gait recovers naturally.
- *
- *  - Phase swap timing. The metronome fires when phase_timer expires
- *    AND all swinging feet have landed. If swing time > phase time,
- *    the metronome waits. Without this guard, the next tripod could
- *    launch while the current one is still mid-air → robot tips.
- *
- *  - Sharp 180° steer. heading interpolates at TURN_RATE rad/s, so a
- *    π-rad flip takes π/TURN_RATE ≈ 1.26 s. During the turn, planted
- *    feet stay where they were planted; you'll see the body spin
- *    while the gait keeps stepping in body-local coordinates.
- *
- *  - Suspend / lid-close. dt grows large; capped at 100 ms in main()
- *    so the body never teleports across the screen on resume.
- *
- * HOW TO VERIFY
- * ─────────────
- *  - Default config: robot walks rightward at 40 px/s. At any
- *    frozen frame, exactly 3 feet are '*' (planted) and 3 are 'o'
- *    (swinging). The 3 planted feet form a triangle: a left/right
- *    pair at front-or-rear plus the opposite-side mid leg.
- *
- *  - Press arrow keys → heading interpolates toward the new target;
- *    a 90° turn takes ~0.6 s. Body visibly spins; legs keep stepping.
- *
- *  - Press space → everything freezes: gait, body, knees. Un-pause
- *    → motion resumes from exactly where it was.
- *
- *  - Crank speed with `w` → step lookahead grows so feet land further
- *    ahead of the hips. The gait keeps up automatically because step
- *    targets are recomputed every phase swap.
- *
- *  - Press `[` to slow time → motion stays smooth (variable timestep
- *    guarantees this); press `]` for fast-forward.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read ik_helloworld.c first; the IK here is the
- *      same 2-link law-of-cosines, applied 6 times per frame.
- *      The NEW lesson is the GAIT state machine.
- *   2. §5 entity — THE HEART. In sub-section order:
- *        §5a static tables       ← per-leg geometry
- *        §5b solve_ik            ← 2-link IK (T1)
- *        §5c hip_world_pos       ← body→world transform (T2)
- *        §5d rest_target         ← per-leg ideal foot rest
- *        §5e gait_tick           ← TRIPOD GAIT state machine (T3-T5)
- *        §5f hexapod_tick        ← top-level orchestrator
- *        §5g-§5h rendering
- *      Read AFTER tutorials T1-T5.
- *   3. §6 scene — thin wrapper.
- *   4. §1-§4 + §7-§8 — infrastructure. Skim if seen.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   body_x, body_y         body center pixel position.
- *   heading                body facing angle. INTERPOLATES toward
- *                          target_heading at TURN_RATE.
- *   target_heading         what the user just set with arrow keys.
- *   HIP_LOCAL_X/Y[i]       hip i's offset from body in BODY LOCAL
- *                          coordinates (constant per leg).
- *   hip[i]                 hip i's WORLD position (recomputed each
- *                          frame from body pose).
- *   foot_pos[i]            foot i's world position.
- *   foot_old[i]            foot i's position at the start of its
- *                          current swing (the lerp anchor).
- *   step_target[i]         where the foot is heading during swing.
- *   stepping[i]            bool — true iff this leg is currently
- *                          swinging.
- *   step_t[i]              progress through swing ∈ [0, 1].
- *   gait_phase             0 (tripod A swings) or 1 (tripod B).
- *   phase_timer            seconds since last phase swap.
- *   TRIPOD_A, TRIPOD_B     the two leg-index sets.
- *
- * Background you need
- * ───────────────────
- *   - 2-link analytical IK (ik_helloworld T3-T5).
- *   - Body-local → world transform via 2-D rotation +
- *     translation. We'll cover this in T2.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Centre-of-mass / dynamic balance. The body NEVER tips —
- *     it's not gravity-loaded; we just animate it sliding on
- *     rails. Tripod gait is purely AESTHETIC stability.
- *   - 3-D leg geometry. We're planar; femur and tibia all lie
- *     in the screen plane.
- *   - Iterative IK. Closed-form 2-link is exact; no FABRIK.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Five tutorials that build a tripod-gait hexapod from first
- * principles.
- *
- *   T1  Six 2-link arms — IK applied per leg, every frame
- *   T2  Body-local hips — the rigid-body transform we apply 6 times
- *   T3  The tripod gait — three legs always planted, stable triangle
- *   T4  Step phase machine — time-bounded swings with landing wait
- *   T5  Step target lookahead — feet land where the body is going
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  SIX 2-LINK ARMS — IK APPLIED PER LEG, EVERY FRAME
- * ─────────────────────────────────────────────────────
- * Each leg is a 2-link arm hanging off a hip:
- *
- *     hip ─── femur ─── knee ─── tibia ─── foot
- *      │              (U)               (L)
- *      └─ pinned to the body
- *      └─ foot pinned to the world (planted) or in flight (swinging)
- *
- * For each leg every frame:
- *   1. Compute hip's WORLD position from body pose (T2).
- *   2. The foot is given (either planted at last-frame's pos or
- *      mid-swing as computed by the gait T4).
- *   3. solve_ik(hip, foot, U, L) → knee position.
- *
- * The IK is the SAME law-of-cosines from ik_helloworld T4 — but
- * applied to a triangle (hip, knee, foot) where hip and foot are
- * both KNOWN. This is "place the elbow given the shoulder and
- * the hand position."
- *
- * Sign convention: left legs use elbow-DOWN (knee below the
- * hip-foot line); right legs use elbow-UP. Without that, the
- * left and right legs would visually mirror the wrong way and
- * the body would look broken.
- *
- * The IK is COMPLETELY STATELESS — it doesn't care if the foot
- * is planted or swinging. It just places the knee given the
- * current pair of endpoints. State lives in the GAIT (T3-T5),
- * not the IK.
- *
- * T2  BODY-LOCAL HIPS — THE RIGID-BODY TRANSFORM WE APPLY 6 TIMES
- * ───────────────────────────────────────────────────────────────
- * Hips are pinned to the body. As the body moves and rotates,
- * the hips move and rotate WITH it. Per-leg static tables hold
- * the BODY-LOCAL offset of each hip:
- *
- *     HIP_LOCAL_X[6] = { -2.0, +2.0, -2.0, +2.0, -2.0, +2.0 }
- *     HIP_LOCAL_Y[6] = { -1.5, -1.5,  0.0,  0.0, +1.5, +1.5 }
- *
- * "x = ±2 from body center, y = front / mid / rear." These are
- * constants — the legs never move relative to the body.
- *
- * Every frame, transform LOCAL → WORLD:
- *
- *     for each leg i:
- *       local_x, local_y = HIP_LOCAL_X[i], HIP_LOCAL_Y[i]
- *       cos_h = cos(heading); sin_h = sin(heading)
- *       hip[i].x = body_x + local_x · cos_h − local_y · sin_h
- *       hip[i].y = body_y + local_x · sin_h + local_y · cos_h
- *
- * That's the standard 2-D rigid-body transform: rotate the
- * local offset by the heading, then translate by the body's
- * world position.
- *
- * Same trick is used by every multi-body system: each part's
- * world pose is parent_pose composed with local_offset.
- * Hierarchical animation, scene graphs, and physics engines
- * all operate this way.
- *
- * T3  THE TRIPOD GAIT — THREE LEGS ALWAYS PLANTED, STABLE TRIANGLE
- * ────────────────────────────────────────────────────────────────
- * Real insects use ALTERNATING TRIPOD: divide six legs into two
- * sets of three, where each set forms a TRIANGLE under the body.
- * At any moment, ONE set is planted (forming the support
- * triangle) and the other set is swinging.
- *
- *   TRIPOD A = {LF, RM, LR}   (left-front, right-mid, left-rear)
- *   TRIPOD B = {RF, LM, RR}   (right-front, left-mid, right-rear)
- *
- *      ┌────────────────────────────────────┐
- *      │      LF *           RF o           │
- *      │           ╲ A     B ╱              │
- *      │            ▭body▭                  │
- *      │           ╱ B     A ╲              │
- *      │      LM o           RM *           │
- *      │           ╲ A     B ╱              │
- *      │            ▭body▭                  │
- *      │           ╱ B     A ╲              │
- *      │      LR *           RR o           │
- *      │                                    │
- *      │  '*' planted (tripod A here),      │
- *      │  'o' swinging (tripod B here)      │
- *      └────────────────────────────────────┘
- *
- * Notice each tripod has a leg in EACH front/mid/rear row
- * AND mixes left + right. This guarantees that when those
- * three feet are planted, their support triangle ENCLOSES
- * the body's centre of mass — kinematically stable.
- *
- * Real insects use this gait at speed ~3-5 body lengths per
- * second; slower they switch to wave gait (one leg swinging
- * at a time, five planted).
- *
- * T4  STEP PHASE MACHINE — TIME-BOUNDED SWINGS WITH LANDING WAIT
- * ──────────────────────────────────────────────────────────────
- * The gait is a STATE MACHINE with two phases:
- *
- *     phase 0:   tripod A swings,   tripod B planted
- *     phase 1:   tripod A planted,  tripod B swings
- *
- * Transition rule: SWAP after PHASE_DURATION elapsed AND every
- * swinging foot has reached step_t == 1 (finished its arc).
- *
- *     phase_timer += dt
- *     if phase_timer >= PHASE_DURATION:
- *       all_landed = (every swinging leg has step_t == 1)
- *       if all_landed:
- *         swap phases
- *         phase_timer = 0
- *
- * Why both conditions? Time alone isn't enough — at very high
- * step heights or low swing speeds, a foot may still be
- * mid-arc when the timer expires. Swapping then would launch
- * a new tripod while the previous one is still in the air →
- * three feet up + three feet up = no support triangle = robot
- * tips. The "all landed" guard prevents that.
- *
- * Foot trajectory during swing:
- *
- *     ease     = smoothstep(step_t)                   ∈ [0, 1]
- *     ground   = lerp(foot_old, step_target, ease)
- *     arc_y    = −STEP_HEIGHT · sin(π · step_t)
- *     foot     = ground + (0, arc_y)
- *
- * The smoothstep on horizontal lerp gives soft acceleration /
- * deceleration. The sin-based vertical arc peaks at step_t =
- * 0.5 and lands cleanly at step_t = 1 (the foot kisses the
- * ground at landing — no slam).
- *
- * T5  STEP TARGET LOOKAHEAD — FEET LAND WHERE THE BODY IS GOING
- * ─────────────────────────────────────────────────────────────
- * Where SHOULD a stepping foot land? Not at its current rest
- * position relative to the hip — by the time it lands, the
- * body has moved forward, and the foot would be too far back.
- *
- * Solution: LOOKAHEAD by some amount in the body's heading
- * direction:
- *
- *     T = hip_world + rotate(REST_offset + (body_speed · LOOKAHEAD, 0),
- *                            heading)
- *
- * In words: from the hip's CURRENT world position, walk to
- * the leg's body-local rest offset PLUS a forward push
- * proportional to body_speed. At zero speed the lookahead is
- * zero — feet plant exactly under their rest. At higher
- * speed, feet plant further ahead of the rest, so by the time
- * they land they're at the rest under the moving body.
- *
- * LOOKAHEAD is in seconds: it's "how far ahead the body will
- * be when this foot lands." For a half-second swing,
- * LOOKAHEAD ≈ 0.5 · body_speed predicts almost exactly where
- * the body will be at landing.
- *
- * Without lookahead, the body would visually outpace its own
- * legs at speed — feet permanently dragging behind the body's
- * actual position. Lookahead keeps the legs centred under the
- * moving body.
- *
- * Same trick is used by real bipedal walking robots (foot
- * placement based on velocity prediction) and by 4-legged
- * animation rigs.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -528,11 +40,8 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — every tunable number, named in one place ── */
 
-/* All magic numbers live here. Never scatter literals through the code. */
 enum {
     /* Render frame-rate target. Variable-timestep simulation, so the
      * only thing this controls is the sleep cap at end of frame. */
@@ -565,7 +74,8 @@ enum {
 #define BODY_LEN         80.0f   /* total length along body axis           */
 #define BODY_HALF_W      20.0f   /* half-width — legs attach at ±this      */
 
-/* Leg geometry (px). Femur + tibia must be > max reach for IK to solve. */
+/* Leg bone lengths (px). Their sum is the leg's max reach; every foot
+ * target must stay inside it or the IK can't reach. */
 #define UPPER_LEN        40.0f   /* femur (hip → knee)                     */
 #define LOWER_LEN        36.0f   /* tibia (knee → foot)                    */
 
@@ -607,9 +117,7 @@ enum {
 #define CELL_W   8
 #define CELL_H  16
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock — monotonic time + sleep ── */
 
 static int64_t clock_ns(void)
 {
@@ -628,48 +136,28 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color — 8 robot themes + spec-fixed HUD pairs                     */
-/* ===================================================================== */
+/* ── §3 color — 8 robot palettes + fixed HUD colours ── */
 
 /*
- * Theme — one robot colour palette (xterm-256 fg indices).
+ * Theme — one robot colour palette (xterm-256 foreground indices).
  *
- * Intent
- *   Each theme rebinds the seven body-rendering pairs (pairs 1..7)
- *   in one shot via init_pair (see theme_apply). HUD/HINT pairs are
- *   NOT included here — they live at PAIR_HUD / PAIR_HINT and stay
- *   bright yellow / bright cyan across every theme so the status
- *   bar always reads against any animation behind it (CLAUDE.md
- *   HUD spec).
+ * Picking a theme rebinds the seven body-rendering pairs (1..7) in one
+ * shot; see theme_apply. The HUD/hint pairs are deliberately left out —
+ * they stay bright yellow / bright cyan in every theme so the status bar
+ * stays readable over any robot colour.
  *
- * Slot semantics (col[0..6] map to pairs 1..7)
- *   [0] body     — body rectangle + cross-braces
- *   [1] femur    — upper leg segment (hip → knee)
- *   [2] tibia    — lower leg segment (knee → foot)
- *   [3] plant    — planted-foot marker '*' (high-saturation green;
- *                  green 46 across every theme = "ground contact"
- *                  reads identically whatever the robot's colour)
- *   [4] step     — swinging-foot marker 'o'
- *   [5] knee     — knee joint marker
- *   [6] reserved — currently unused; held in reserve for future
- *                  accent (antenna, eye, etc.) without renumbering
+ * col[0..6] map to pairs 1..7, in this order:
+ *   [0] body box     [1] femur (hip→knee)   [2] tibia (knee→foot)
+ *   [3] planted foot '*'  [4] swinging foot 'o'  [5] knee joint
+ *   [6] reserved (unused; kept so adding an accent later won't renumber)
  *
- * Brightness rule (CLAUDE.md "Theme Palette Brightness")
- *   Every entry sits in the BRIGHT HALF of the 256-colour space:
- *     - cube colours: ≥ 24  (avoid 16-23; invisible under A_DIM)
- *     - grayscale  : ≥ 240 (avoid 232-239; same reason)
- *   Theme character comes from RELATIVE gradient, not absolute
- *   darkness — pushing the dimmest slot up by a few indices keeps
- *   the look and gains legibility.
- *
- * References [11] Bourke for the depth-cued glyph/colour pairing;
- *   [12] Raymond §init_pair for the rebind mechanism.
+ * Every index sits in the bright half of the palette so nothing vanishes
+ * under A_DIM. The planted-foot slot is green 46 in every theme so
+ * "ground contact" always reads the same colour.
  */
 typedef struct {
-    const char *name;          /* HUD-displayable theme name           */
-    int         col[N_PAIRS];  /* xterm-256 fg index per pair slot     *
-                                * (pair p = col[p-1] at apply time)    */
+    const char *name;          /* shown in the HUD                     */
+    int         col[N_PAIRS];  /* xterm-256 fg per pair: pair p = col[p-1] */
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -719,15 +207,13 @@ static void color_init(int initial_theme)
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ===================================================================== */
-/* §4  coords — pixel↔cell aspect-ratio helpers                          */
-/* ===================================================================== */
+/* ── §4 coords — turn pixel positions into terminal cells ── */
 
 /*
- * All entity positions live in square pixel space (1 unit = 1 px).
- * Only at draw time do these helpers convert to cell coordinates,
- * undoing the 8:16 cell aspect ratio.
- *   cell = floor(px / CELL_DIM + 0.5)    — nearest-integer rounding
+ * The robot lives in square "pixel" space (1 unit = 1 pixel). A terminal
+ * cell is taller than it is wide (8 wide, 16 tall), so at draw time these
+ * helpers divide by the cell size and round to the nearest cell. This is
+ * the only place pixels become cells.
  */
 static inline int px_to_cell_x(float px)
 {
@@ -738,50 +224,26 @@ static inline int px_to_cell_y(float py)
     return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  entity — Hexapod                                                   */
-/* ===================================================================== */
+/* ── §5 entity — the Hexapod: body, legs, gait ── */
 
-/* ── §5a  vec helpers + per-leg static tables ─────────────────────── */
+/* ── §5a vec math + the constant per-leg geometry tables ── */
 
 /*
- * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
+ * Vec2 — a 2-D point in pixel space.
  *
- * Intent
- *   Body kinematics, leg IK, and foot interpolation all live in
- *   pixel space. Each character cell is CELL_W × CELL_H sub-pixels
- *   (8 × 16), so a walking robot reads as continuous motion instead
- *   of jumping cell-to-cell. The conversion to cell space happens
- *   only inside §5g draw_leg_line / §5h hexapod_draw via
- *   px_to_cell_x/y — the project's "one conversion point" rule.
+ * Two coordinate frames use this type:
+ *   body-local : +x is forward (walk direction), +y is the body's right
+ *                side, -y is its left. Used by the constant tables below.
+ *   world      : +x is right of screen, +y is down. Used by foot/hip/knee
+ *                positions. rotate2d turns a local point into world:
+ *                world = body_center + R(heading) * local.
  *
- * Convention (body-LOCAL space, used by HIP_LOCAL_*, REST_*)
- *   +x : forward along the body axis (walk direction)
- *   +y : down on screen → "right" side of body
- *   −y : up   on screen → "left"  side of body
- *
- * Convention (WORLD space, used by foot_pos, hip[], knee[])
- *   +x : eastward  (positive → right of screen)
- *   +y : southward (positive → down  the screen)
- *   rotate2d composes the two: world = body_center + R(heading)·local
- *
- *   Angles are MATH-CONVENTION (positive CCW from +X); because y
- *   points DOWN on screen, a math-CCW rotation displays as CW. Only
- *   the left/right knee-side sign flip in §5b solve_ik cares.
- *
- * Why a value type
- *   8 bytes; passes in registers. solve_ik / rotate2d / vec2_lerp
- *   all take and return Vec2 by value — -O2 lowers them to
- *   straight-line code.
- *
- * Why named (x, y) instead of two loose floats
- *   Type-checking catches (col, row) confusion at compile time
- *   rather than via visual debugging.
- *
- * References [1] Craig §2 "Spatial descriptions".
+ * Angles follow the math convention (positive = counter-clockwise from
+ * +x). Because screen y points down, a math-CCW turn looks clockwise on
+ * screen; only the left/right knee sign flip in solve_ik depends on this.
  */
 typedef struct {
-    float x;   /* see Convention notes above (body-local vs world)  */
+    float x;
     float y;
 } Vec2;
 
@@ -801,7 +263,7 @@ static inline float smoothstep(float t)
     return t * t * (3.0f - 2.0f * t);
 }
 
-/* rotate2d — rotate v by `angle` radians (screen space: +y = down). */
+/* rotate2d — turn vector v by `angle` radians (screen space, +y = down). */
 static inline Vec2 rotate2d(Vec2 v, float angle)
 {
     float c = cosf(angle), s = sinf(angle);
@@ -809,17 +271,15 @@ static inline Vec2 rotate2d(Vec2 v, float angle)
 }
 
 /*
- * Coordinate convention in body-local space:
- *   body faces +x  (walk direction)
- *   +y = down on screen → "left" side of body is −y, "right" side +y
- *
- * Leg index map:
+ * The six legs, by index (left side is even, right side is odd):
  *   0 left-front   1 right-front
  *   2 left-mid     3 right-mid
  *   4 left-rear    5 right-rear
  */
 
-/* Hip attachment offsets from body center (body-local). */
+/* Where each hip attaches, measured from the body centre (body-local).
+ * X is front/back along the body, Y is left/right. Constant — legs are
+ * bolted to the body and never move relative to it. */
 static const float HIP_LOCAL_X[N_LEGS] = {
     BODY_LEN * 0.40f,    /* 0 left-front  */
     BODY_LEN * 0.40f,    /* 1 right-front */
@@ -838,11 +298,13 @@ static const float HIP_LOCAL_Y[N_LEGS] = {
 };
 
 /*
- * Rest foot offsets from hip (body-local).
- *   REST_FORWARD — along body axis; front legs reach forward, rear back.
- *   REST_SIDE    — lateral; left legs to −y, right legs to +y.
+ * Where each foot rests relative to its hip when standing still
+ * (body-local). FORWARD spreads front legs ahead and rear legs behind;
+ * SIDE pushes left legs out to -y and right legs out to +y.
  *
- * Reach check: max |offset| ≈ √(32² + 50²) ≈ 60 px < UPPER+LOWER = 76 px.
+ * The farthest rest offset is about sqrt(32^2 + 50^2) ~= 60 px, comfortably
+ * inside the leg's reach (femur + tibia = 76 px), so the IK can always
+ * solve it.
  */
 static const float REST_FORWARD[N_LEGS] = {
      32.0f, 32.0f,    /* front */
@@ -856,124 +318,78 @@ static const float REST_SIDE[N_LEGS] = {
 };
 
 /*
- * Tripod groups — two interlocked support triangles.
+ * The two tripods. Each is three legs that form a triangle under the
+ * body: one front, one mid, one rear, mixing left and right sides. While
+ * one tripod swings forward, the other is planted and holds the robot up.
  *   A = {left-front, right-mid, left-rear}
  *   B = {right-front, left-mid, right-rear}
- * When A swings, B forms a stable triangle (and vice versa).
  */
 static const int TRIPOD_A[3] = { 0, 3, 4 };
 static const int TRIPOD_B[3] = { 1, 2, 5 };
 
 /*
- * Hexapod — the full robot state.
+ * Hexapod — everything about the robot in one record.
  *
- * Intent
- *   The robot is THREE INTERLOCKED SUB-SYSTEMS sharing one record:
+ * It holds three things that work together each frame:
+ *   1. the body — slides along its heading at body_speed;
+ *   2. the gait — which of the two tripods is currently swinging, and a
+ *      timer that decides when to swap them;
+ *   3. the legs — per-leg foot positions, plus the hip and knee points
+ *      worked out from them each frame.
  *
- *     1. BODY KINEMATICS — a rigid 2-D body that slides along its
- *        heading at body_speed. Heading interpolates toward
- *        target_heading at TURN_RATE rad/s (short-arc through ±π).
- *        Refs [8] Reynolds steering.
+ * The per-leg data is kept as parallel arrays (one entry per leg, indexed
+ * 0..N_LEGS-1) rather than an array of structs — simple, and most loops
+ * touch one field across all legs at once.
  *
- *     2. GAIT STATE MACHINE — a metronome that alternates between
- *        two interlocked tripods. At any moment exactly one tripod
- *        is PLANTED (forming a stable support triangle) while the
- *        other is SWINGING (lifting off and arcing forward to new
- *        rest targets). The handoff happens only when phase_timer
- *        expires AND every swinging foot has finished its arc —
- *        never mid-stride. Refs [4][6][7].
- *
- *     3. PER-LEG IK — for each leg, recompute the world hip from
- *        the body pose, then solve law-of-cosines IK to place the
- *        knee. Left/right legs flip the knee-side sign so left
- *        knees break to −y and right knees to +y. Refs [1][2].
- *
- *   The three sub-systems are deliberately UNCOUPLED in time: body
- *   integrates from heading; gait reads body_x/y to choose step
- *   targets; IK reads (hip, foot_pos) to place knees. No feedback
- *   loop, no constraints — order of operations in hexapod_tick
- *   makes the dependency chain explicit and one-way.
- *
- * Per-leg parallel-array design
- *   The five per-leg arrays (foot_pos, foot_old, step_target,
- *   stepping, step_t) describe ONE leg per index i ∈ [0, N_LEGS).
- *   Parallel arrays instead of an array-of-struct because:
- *     - The whole row of a leg is read together — cache-friendly
- *       either way for N_LEGS = 6 (fits in one cache line).
- *     - Most loops walk one field at a time (e.g., the rendering
- *       pass walks foot_pos[i] for all i); SoA is the natural fit.
- *     - Static tables HIP_LOCAL_*, REST_*, TRIPOD_A/B are also
- *       parallel arrays, so the convention is consistent.
- *
- * Why `hip` and `knee` are CACHED (not recomputed at every reader)
- *   Both depend only on body pose + foot target. Caching them once
- *   per tick lets the renderer (which reads them many times across
- *   leg lines, joint markers, attachment points) skip the cosine /
- *   sine / IK math entirely. Marked "derived" so a reader knows
- *   they're outputs of hexapod_tick, not user inputs.
- *
- * Reach budget (CONFIRMED at init in §5e)
- *   sqrt(REST_FORWARD_max² + REST_SIDE_max²) ≈ √(32² + 50²) ≈ 60 px
- *   UPPER + LOWER = 76 px, so even the maximum rest offset stays
- *   inside the IK reachable annulus with margin for step lookahead.
- *
- * References [1] Craig §4 (2-link IK); [4][7] Wilson + Cruse for
- *   the tripod handoff rule; [8] Reynolds for the heading lerp.
+ * hip[] and knee[] are derived: recomputed every tick by hexapod_tick and
+ * then read many times by the renderer. Storing them once saves redoing
+ * the rotation and IK math for every line and marker drawn.
  */
 typedef struct {
-    /* ── Body kinematics (rigid body in world pixel space) ─────── *
-     * Three scalars + one derived: body_x/y is integrated each    *
-     * tick from body_speed along heading; heading lerps toward    *
-     * target_heading via short-arc rotation (Reynolds).           */
-    float body_x;             /* body centre x, world pixel space  */
-    float body_y;             /* body centre y, world pixel space  */
-    float body_speed;         /* magnitude (px/s) along heading    */
-    float heading;            /* current direction (rad), 0 = +x   */
-    float target_heading;     /* steered toward this each tick     */
+    /* ── Body: a rigid block sliding through world pixel space ── */
+    float body_x;             /* body centre x, world pixels             */
+    float body_y;             /* body centre y, world pixels             */
+    float body_speed;         /* walk speed along heading, px/s          */
+    float heading;            /* way it's facing now, radians (0 = +x)   */
+    float target_heading;     /* way you steered it to; heading eases to it */
 
-    /* ── Per-leg simulation state (SoA, length N_LEGS) ─────────── *
-     * Five parallel arrays describing each leg's gait phase. A    *
-     * leg is in one of two modes:                                 *
-     *   stepping[i] = false → foot_pos[i] is planted; ignore step_t *
-     *   stepping[i] = true  → foot_pos[i] = lerp(foot_old, step_target, *
-     *                                            smoothstep(step_t)) + arc */
-    Vec2  foot_pos   [N_LEGS]; /* current IK target each frame      */
-    Vec2  foot_old   [N_LEGS]; /* foot at step start; lerp anchor   */
-    Vec2  step_target[N_LEGS]; /* landing point this swing aims at  */
-    bool  stepping   [N_LEGS]; /* in-flight flag                    */
-    float step_t     [N_LEGS]; /* swing progress in [0, 1]          */
+    /* ── Per-leg gait state (one slot per leg) ──
+     * A leg is either planted (stepping=false, foot_pos held fixed on the
+     * ground) or swinging (stepping=true, foot_pos sweeps from foot_old to
+     * step_target along an arc as step_t goes 0 -> 1). */
+    Vec2  foot_pos   [N_LEGS]; /* where the foot is right now (the IK target) */
+    Vec2  foot_old   [N_LEGS]; /* where this swing started (lerp start point) */
+    Vec2  step_target[N_LEGS]; /* where this swing is aiming to land      */
+    bool  stepping   [N_LEGS]; /* true while the foot is in the air       */
+    float step_t     [N_LEGS]; /* swing progress, 0 = lifted .. 1 = landed */
 
-    /* ── Per-leg DERIVED (outputs of hexapod_tick) ─────────────── *
-     * Recomputed each frame from body pose + foot target.         *
-     * Cached so the renderer reads positions without re-doing     *
-     * the rotation / IK math.                                     */
-    Vec2  hip [N_LEGS];        /* world hip = body + R(heading)·local */
-    Vec2  knee[N_LEGS];        /* solve_ik(hip, foot_pos, side)     */
+    /* ── Per-leg derived (recomputed every tick, read by the drawer) ── */
+    Vec2  hip [N_LEGS];        /* hip in world coords = body + rotated offset */
+    Vec2  knee[N_LEGS];        /* knee from the IK solve                  */
 
-    /* ── Gait state machine (Wilson / Cruse handoff) ─────────── */
-    int   gait_phase;          /* 0 → group A swings, 1 → group B    */
-    float phase_timer;         /* elapsed time in current half-cycle */
+    /* ── Gait clock ── */
+    int   gait_phase;          /* which tripod swings: 0 = A, 1 = B       */
+    float phase_timer;         /* seconds since the last tripod swap      */
 
-    /* ── UI / control state ─────────────────────────────────── *
-     * paused gates the sim path (renderer still runs);          *
-     * theme_idx selects the palette in §3 THEMES[].             */
-    bool  paused;
-    int   theme_idx;
+    /* ── Controls ── */
+    bool  paused;              /* true freezes the simulation (still draws) */
+    int   theme_idx;           /* index into THEMES[]                     */
 } Hexapod;
 
-/* ── §5b  solve_ik ─────────────────────────────────────────────────── */
+/* ── §5b solve_ik — given hip and foot, find the knee ── */
 
 /*
- * solve_ik — 2-joint IK via law of cosines.
+ * Inverse kinematics for one 2-bone leg: you know where the hip is and
+ * where the foot should be, and this finds where the knee must bend to.
+ * It uses the law of cosines on the triangle hip-knee-foot.
  *
- * The hip→target distance is clamped just inside the reachable annulus
- * |U − L| < d < U + L so acos never receives a value outside [−1, 1]
- * (which would yield NaN and silently break the chain).
+ * Edge case: if the foot is too far or too close, the angle math would
+ * try acos() of a value outside [-1, 1] and produce NaN, making the leg
+ * vanish. So the hip-to-foot distance is clamped to just inside the
+ * reachable range first.
  *
- * Left vs right sign convention: even-indexed legs are LEFT (−y side),
- * so their knees break toward −y (knee_angle = base − ah). Right legs
- * mirror this with base + ah. This is opposite to ik_spider.c because
- * here the legs extend perpendicular to the walk axis.
+ * A leg can bend two ways; left legs (even index) bend their knee toward
+ * -y and right legs toward +y, so the two sides mirror each other.
  */
 static void solve_ik(Vec2 hip, Vec2 target, bool is_left, Vec2 *knee_out)
 {
@@ -996,9 +412,10 @@ static void solve_ik(Vec2 hip, Vec2 target, bool is_left, Vec2 *knee_out)
     knee_out->y = hip.y + UPPER_LEN * sinf(ka);
 }
 
-/* ── §5c  hip_world_pos ────────────────────────────────────────────── */
+/* ── §5c hip_world_pos — body-local hip offset to world position ── */
 
-/* hip_world_pos — leg i's hip in world coords, accounting for heading. */
+/* Take leg i's fixed body-local hip offset, rotate it by the body's
+ * heading, and add the body centre to get the hip's world position. */
 static Vec2 hip_world_pos(const Hexapod *h, int i)
 {
     Vec2 local   = { HIP_LOCAL_X[i], HIP_LOCAL_Y[i] };
@@ -1006,13 +423,14 @@ static Vec2 hip_world_pos(const Hexapod *h, int i)
     return (Vec2){ h->body_x + rotated.x, h->body_y + rotated.y };
 }
 
-/* ── §5d  rest_target ──────────────────────────────────────────────── */
+/* ── §5d rest_target — where leg i's foot should aim to land ── */
 
 /*
- * rest_target — ideal foot landing spot for leg i.
- * The (body_speed · STEP_LOOKAHEAD) forward bias plants the foot ahead
- * of the hip so the leg is already reaching forward when it lands —
- * faster walking → longer strides automatically.
+ * The foot's resting spot relative to the hip, pushed a little forward in
+ * the walk direction. The push (body_speed * STEP_LOOKAHEAD) aims the foot
+ * ahead of where the body is now, so by the time the swing finishes the
+ * body has caught up and the foot lands underneath it. Faster walking ->
+ * bigger push -> longer strides, automatically.
  */
 static Vec2 rest_target(const Hexapod *h, int i)
 {
@@ -1023,10 +441,10 @@ static Vec2 rest_target(const Hexapod *h, int i)
     return (Vec2){ hip.x + rotated.x, hip.y + rotated.y };
 }
 
-/* ── §5e  gait_tick ────────────────────────────────────────────────── */
+/* ── §5e gait_tick — the tripod state machine ── */
 
-/* swing_foot — advance one leg's swing by dt; place foot.
- * Pure helper called by gait_tick for each leg in the stepping group. */
+/* Move one swinging foot a step forward in time and place it. When the
+ * swing finishes (step_t hits 1) the foot lands and goes back to planted. */
 static void swing_foot(Hexapod *h, int i, float dt)
 {
     h->step_t[i] += dt / STEP_DURATION;
@@ -1037,14 +455,17 @@ static void swing_foot(Hexapod *h, int i, float dt)
         return;
     }
 
+    /* Horizontal: ease in and out so the foot starts and lands gently.
+     * Vertical: a sine bump (raw step_t, so it peaks halfway through and
+     * touches down softly at the end) lifts the foot off the ground. */
     float ease  = smoothstep(h->step_t[i]);
     Vec2  hz    = vec2_lerp(h->foot_old[i], h->step_target[i], ease);
-    /* Parabolic Y-arc — raw step_t (not eased) so the peak is centred. */
     float arc_y = -STEP_HEIGHT * sinf((float)M_PI * h->step_t[i]);
     h->foot_pos[i] = (Vec2){ hz.x, hz.y + arc_y };
 }
 
-/* launch_tripod — start a new step for every leg in the given group. */
+/* Start a fresh swing for all three legs in the given tripod: remember
+ * where each foot is now and aim it at a new rest target. */
 static void launch_tripod(Hexapod *h, const int group[3])
 {
     for (int k = 0; k < 3; k++) {
@@ -1057,16 +478,15 @@ static void launch_tripod(Hexapod *h, const int group[3])
 }
 
 /*
- * gait_tick — one tick of the tripod state machine. Advances any
- * swinging legs, then checks whether the phase can swap.
+ * One tick of the gait: move the swinging tripod's feet, then decide
+ * whether to hand off to the other tripod.
  *
- * The phase swaps only when BOTH conditions hold:
- *   - phase_timer ≥ PHASE_DURATION  (rhythmic minimum)
- *   - every swinging leg has landed (no leg in mid-air)
- *
- * Without the second guard, the next tripod could launch while the
- * current one is still mid-arc → the body would briefly have only a
- * 2-foot or 1-foot support pattern → it would visibly tip.
+ * The swap happens only when BOTH are true:
+ *   - enough time has passed (phase_timer >= PHASE_DURATION), and
+ *   - all three swinging feet have actually landed.
+ * The second check matters: if we swapped while feet were still in the
+ * air, both tripods would be up at once and the robot would have nothing
+ * to stand on.
  */
 static void gait_tick(Hexapod *h, float dt)
 {
@@ -1091,10 +511,11 @@ static void gait_tick(Hexapod *h, float dt)
     launch_tripod(h, (h->gait_phase == 0) ? TRIPOD_A : TRIPOD_B);
 }
 
-/* ── §5f  hexapod_tick ─────────────────────────────────────────────── */
+/* ── §5f hexapod_tick — update everything for one frame ── */
 
-/* steer_heading — interpolate heading toward target_heading at TURN_RATE.
- * The diff is wrapped to [−π, π] so a 180° flip takes the short arc. */
+/* Ease the current heading toward the steered target at TURN_RATE. The
+ * angle difference is wrapped to [-pi, pi] so a near-180-degree turn goes
+ * the short way around instead of spinning the long way. */
 static void steer_heading(Hexapod *h, float dt)
 {
     float diff = h->target_heading - h->heading;
@@ -1104,9 +525,8 @@ static void steer_heading(Hexapod *h, float dt)
     h->heading += turn;
 }
 
-/* translate_body — advance position along heading; wrap toroidally.
- * Wrapping in all 4 directions matches the snake/spider convention
- * and makes the world feel infinite at any screen size. */
+/* Slide the body forward along its heading, then wrap it around all four
+ * screen edges so walking off one side reappears on the other. */
 static void translate_body(Hexapod *h, float dt, int cols, int rows)
 {
     h->body_x += h->body_speed * cosf(h->heading) * dt;
@@ -1121,13 +541,11 @@ static void translate_body(Hexapod *h, float dt, int cols, int rows)
 }
 
 /*
- * stretch_snap — recover after toroidal wrap or sharp turn.
- *
- * After the body wraps, planted feet didn't wrap with it — they're
- * still anchored to the OLD coordinates, now possibly across the
- * screen. The IK solver clamps distance, but a foot that's a full
- * screen away looks wrong. Snap any over-reach foot to its rest
- * target so the gait recovers within one frame.
+ * Recover after a wrap or sharp turn. Planted feet stay where they were
+ * placed, so when the body jumps to the other edge of the screen a foot
+ * can end up impossibly far from its hip. The IK would clamp it, but the
+ * leg would still look stretched across the screen. So any foot now out of
+ * reach is snapped to its rest spot; the gait looks normal again next frame.
  */
 static void stretch_snap(Hexapod *h)
 {
@@ -1145,7 +563,8 @@ static void stretch_snap(Hexapod *h)
     }
 }
 
-/* hexapod_tick — orchestrator. See ALGORITHM IN STEPS for the order. */
+/* One full simulation step, in order: turn, move, refresh hips, fix any
+ * over-stretched legs, advance the gait, then solve every knee. */
 static void hexapod_tick(Hexapod *h, float dt, int cols, int rows)
 {
     if (h->paused) return;
@@ -1153,7 +572,7 @@ static void hexapod_tick(Hexapod *h, float dt, int cols, int rows)
     steer_heading  (h, dt);
     translate_body (h, dt, cols, rows);
 
-    /* Recompute hips from new body pose before any IK or stretch check. */
+    /* Hips move with the body, so recompute them before anything reads them. */
     for (int i = 0; i < N_LEGS; i++)
         h->hip[i] = hip_world_pos(h, i);
 
@@ -1164,20 +583,15 @@ static void hexapod_tick(Hexapod *h, float dt, int cols, int rows)
         solve_ik(h->hip[i], h->foot_pos[i], (i % 2 == 0), &h->knee[i]);
 }
 
-/* ── §5g  rendering helpers ─────────────────────────────────────────── */
+/* ── §5g rendering helpers ── */
 
 /*
- * seg_glyph — best ASCII direction glyph for vector (dx, dy).
- *
- * Glyphs partition the angular circle, folded to [0°, 180°) since each
- * glyph is symmetric under 180° rotation:
- *   '-'  near-horizontal     ( 0°,  22.5° ) ∪ (157.5°, 180°)
- *   '\'  down-right diagonal ( 22.5°,  67.5° )
- *   '|'  near-vertical       ( 67.5°, 112.5° )
- *   '/'  down-left diagonal  (112.5°, 157.5° )
- *
- * dy is negated before atan2f so the angle matches visual direction
- * (terminal y grows down; math y grows up).
+ * Pick the ASCII character that best shows the direction (dx, dy). A line
+ * and its reverse look the same, so we fold the angle into a half-circle
+ * and pick one of four glyphs by slice:
+ *   '-' roughly horizontal   '\' down-right   '|' roughly vertical   '/' down-left
+ * dy is negated first because terminal y grows downward but the angle math
+ * assumes y grows up.
  */
 static chtype seg_glyph(float dx, float dy)
 {
@@ -1193,10 +607,9 @@ static chtype seg_glyph(float dx, float dy)
 }
 
 /*
- * draw_leg_line — rasterise a→b with direction glyphs.
- * Steps every DRAW_LEG_STEP_PX, dedups same-cell samples. The dedup
- * cursor is local: each call sweeps independently because consecutive
- * segments do not share intermediate cells in this simulation.
+ * Draw a straight line from a to b using direction glyphs. It walks the
+ * line in small steps (DRAW_LEG_STEP_PX apart) and stamps a glyph in each
+ * cell it crosses, skipping repeats so one cell isn't drawn twice.
  */
 static void draw_leg_line(WINDOW *w,
                           Vec2 a, Vec2 b,
@@ -1227,7 +640,7 @@ static void draw_leg_line(WINDOW *w,
     }
 }
 
-/* mark_cell — stamp one glyph at a pixel position with bounds check. */
+/* Stamp one glyph at a pixel position, ignored if it falls off-screen. */
 static void mark_cell(WINDOW *w, Vec2 p, chtype glyph,
                       int pair, attr_t attr, int cols, int rows)
 {
@@ -1239,9 +652,9 @@ static void mark_cell(WINDOW *w, Vec2 p, chtype glyph,
     wattroff(w, COLOR_PAIR(pair) | attr);
 }
 
-/* ── §5h  hexapod_draw ─────────────────────────────────────────────── */
+/* ── §5h hexapod_draw — paint the whole robot ── */
 
-/* draw_legs — pass 1: femur and tibia line glyphs for all 6 legs. */
+/* Femur (hip->knee) and tibia (knee->foot) lines for all six legs. */
 static void draw_legs(const Hexapod *h, WINDOW *w, int cols, int rows)
 {
     for (int i = 0; i < N_LEGS; i++) {
@@ -1250,7 +663,7 @@ static void draw_legs(const Hexapod *h, WINDOW *w, int cols, int rows)
     }
 }
 
-/* draw_feet — pass 2: '*' bold for planted, 'o' dim for swinging. */
+/* Foot markers: bold '*' where planted, dim 'o' while swinging. */
 static void draw_feet(const Hexapod *h, WINDOW *w, int cols, int rows)
 {
     for (int i = 0; i < N_LEGS; i++) {
@@ -1263,7 +676,7 @@ static void draw_feet(const Hexapod *h, WINDOW *w, int cols, int rows)
     }
 }
 
-/* draw_knees — pass 3: bold 'o' marker at each knee joint. */
+/* A bold 'o' at each knee joint. */
 static void draw_knees(const Hexapod *h, WINDOW *w, int cols, int rows)
 {
     for (int i = 0; i < N_LEGS; i++)
@@ -1271,13 +684,13 @@ static void draw_knees(const Hexapod *h, WINDOW *w, int cols, int rows)
                   6, A_BOLD, cols, rows);
 }
 
-/* draw_body_box — pass 4: rectangle edges + cross-braces, rotated. */
+/* The body: a rotated rectangle with two diagonal cross-braces. */
 static void draw_body_box(const Hexapod *h, WINDOW *w, int cols, int rows)
 {
     float bhl = BODY_LEN  * 0.5f;
     float bhw = BODY_HALF_W;
 
-    /* Four corners in body-local then rotated to world. */
+    /* Four corners, placed in body-local space then rotated into the world. */
     Vec2 tl_l = { -bhl, -bhw }, tr_l = {  bhl, -bhw };
     Vec2 bl_l = { -bhl,  bhw }, br_l = {  bhl,  bhw };
     Vec2 tl   = rotate2d(tl_l, h->heading);
@@ -1289,7 +702,7 @@ static void draw_body_box(const Hexapod *h, WINDOW *w, int cols, int rows)
     bl.x += h->body_x;  bl.y += h->body_y;
     br.x += h->body_x;  br.y += h->body_y;
 
-    /* Edges bold, cross-braces dim — gives the body weight visually. */
+    /* Edges bold, the two diagonals dim, so the box reads as solid. */
     draw_leg_line(w, tl, tr, 1, A_BOLD, cols, rows);
     draw_leg_line(w, bl, br, 1, A_BOLD, cols, rows);
     draw_leg_line(w, tl, bl, 1, A_BOLD, cols, rows);
@@ -1298,7 +711,7 @@ static void draw_body_box(const Hexapod *h, WINDOW *w, int cols, int rows)
     draw_leg_line(w, tr, bl, 1, A_DIM,  cols, rows);
 }
 
-/* draw_hips_and_center — pass 5+6: hip '+' markers and body '@' centre. */
+/* A '+' where each leg joins the body, and an '@' at the body centre. */
 static void draw_hips_and_center(const Hexapod *h, WINDOW *w,
                                  int cols, int rows)
 {
@@ -1311,8 +724,8 @@ static void draw_hips_and_center(const Hexapod *h, WINDOW *w,
 }
 
 /*
- * hexapod_draw — orchestrator. Painter's order back-to-front so joint
- * markers and the body box always sit on top of leg lines.
+ * Draw the robot back-to-front so the body box and joint markers land on
+ * top of the leg lines instead of being painted over by them.
  */
 static void hexapod_draw(const Hexapod *h, WINDOW *w, int cols, int rows)
 {
@@ -1323,56 +736,23 @@ static void hexapod_draw(const Hexapod *h, WINDOW *w, int cols, int rows)
     draw_hips_and_center(h, w, cols, rows);
 }
 
-/* ===================================================================== */
-/* §6  scene — thin wrapper around Hexapod                               */
-/* ===================================================================== */
+/* ── §6 scene — thin wrapper holding the one robot ── */
 
 /*
- * Scene — composition root for §6.
- *
- * Intent
- *   In this demo the simulation IS one hexapod. We keep a Scene
- *   wrapper anyway so the framework loop (scene_init / scene_tick /
- *   scene_draw) reads identically to every other file in the repo.
- *   If a future variant adds e.g. obstacles, a swarm, or a goal
- *   point for the body to steer to, those slot in here as siblings
- *   of `hexapod` without changing the loop.
- *
- * Simulation vs Rendering locality
- *   The Hexapod struct itself already separates BODY KINEMATICS
- *   (verbs) from PER-LEG STATE (nouns) from DERIVED CACHE (outputs)
- *   from GAIT MACHINE from UI/CONTROL. Within Scene there is no
- *   further split needed yet — one field, one concern. When adding
- *   a new member, place it as follows:
- *
- *     ── Simulation state ──   things scene_tick READS+WRITES
- *                              (obstacles[], goal_point, pheromones)
- *     ── Render-only state ──  things scene_draw READS, never the
- *                              physics path (camera, shake, trail FX)
- *
- * Things that DO NOT live here
- *   - fps / sim_fps counters → §8 App (frame-timing concern, not
- *     part of the world being simulated).
- *   - terminal extents (cols, rows) → §7 Screen.
- *   - signal flags (running, need_resize) → §8 App.
- *   - Per-leg geometry tables HIP_LOCAL_*, REST_*, TRIPOD_A/B
- *     → §5a (file-scope `static const`; never mutates).
- *
- * One Scene per program; passed by pointer to every §6 entry point.
+ * Scene — the simulated world. Here it is just one hexapod, but it gets
+ * its own struct so the loop (scene_init / scene_tick / scene_draw) looks
+ * the same as in every other demo. Anything extra (obstacles, a goal to
+ * walk toward) would sit alongside `hexapod` here.
  */
 typedef struct {
-    /* ── Simulation state ─────────────────────────────────────── */
-    Hexapod hexapod;           /* the world: body + 6 legs + gait    */
-
-    /* (no render-only state yet — theme_idx lives inside Hexapod
-     *  because it's user-toggled via the same keymap as paused)  */
+    Hexapod hexapod;           /* the robot: body + 6 legs + gait     */
 } Scene;
 
 /*
- * scene_init — place the robot at screen centre with all feet at rest,
- * then immediately launch group A into a step so the gait begins on
- * frame 1. Without that initial launch, both tripods would be planted
- * and gait_tick would have to wait PHASE_DURATION before the first step.
+ * Put the robot at the centre of the screen with every foot at its rest
+ * spot, then start tripod A swinging right away so a step is visible on
+ * the very first frame (otherwise the gait would sit still until the
+ * phase timer first expires).
  */
 static void scene_init(Scene *sc, int cols, int rows)
 {
@@ -1392,7 +772,7 @@ static void scene_init(Scene *sc, int cols, int rows)
     for (int i = 0; i < N_LEGS; i++)
         h->hip[i] = hip_world_pos(h, i);
 
-    /* Plant all feet at rest (no lookahead — robot is stationary). */
+    /* Plant every foot at its rest spot (no lookahead — it's standing still). */
     for (int i = 0; i < N_LEGS; i++) {
         Vec2 hip = h->hip[i];
         h->foot_pos[i]    = (Vec2){ hip.x + REST_FORWARD[i],
@@ -1404,7 +784,6 @@ static void scene_init(Scene *sc, int cols, int rows)
         solve_ik(h->hip[i], h->foot_pos[i], (i % 2 == 0), &h->knee[i]);
     }
 
-    /* Launch group A so step animation begins on frame 1. */
     launch_tripod(h, TRIPOD_A);
 }
 
@@ -1418,38 +797,20 @@ static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows)
     hexapod_draw(&sc->hexapod, w, cols, rows);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen — ncurses setup and the display layer ── */
 
 /*
- * Screen — terminal-extent snapshot in CHARACTER CELLS.
- *
- * Intent
- *   Caches the current terminal size so every §6 entry point reads
- *   (cols, rows) as plain ints rather than re-querying ncurses each
- *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
- *   propagated to scene_init via app_do_resize.
- *
- * Why a separate struct (not just two ints in App)
- *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
- *   except this struct. Carving it out makes screen_resize pure and
- *   isolates the ncurses dependency from the simulation layer.
- *
- * Why cells, not pixels
- *   ncurses' coordinate system is cells. Pixel space (CELL_W ×
- *   CELL_H sub-pixels per cell) lives only inside §5 — converted at
- *   the draw boundary, per the project's "one conversion point" rule.
- *
- * References [12] Raymond, NCURSES Programming HOWTO.
+ * Screen — the current terminal size, in character cells. Cached here so
+ * the rest of the code reads (cols, rows) as plain ints; refreshed only
+ * when a resize (SIGWINCH) arrives.
  */
 typedef struct {
-    int cols;   /* terminal width  in CHARACTER CELLS */
-    int rows;   /* terminal height in CHARACTER CELLS */
+    int cols;   /* terminal width  in cells */
+    int rows;   /* terminal height in cells */
 } Screen;
 
-/* The non-obvious call here is typeahead(-1): without it, ncurses peeks
- * at stdin during output writes, which can tear frames mid-update. */
+/* typeahead(-1) is the one non-obvious call: without it ncurses peeks at
+ * stdin while writing output, which can tear a frame mid-update. */
 static void screen_init(Screen *s)
 {
     initscr();
@@ -1465,7 +826,7 @@ static void screen_init(Screen *s)
 
 static void screen_free(Screen *s) { (void)s; endwin(); }
 
-/* SIGWINCH path: endwin()+refresh() forces ncurses to re-read LINES/COLS. */
+/* On resize, endwin()+refresh() makes ncurses re-read the new size. */
 static void screen_resize(Screen *s)
 {
     endwin();
@@ -1473,7 +834,7 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* heading_arrow — '>' '<' '^' 'v' for the HUD readout. */
+/* An arrow ('>' '<' '^' 'v') showing which way the robot faces, for the HUD. */
 static const char *heading_arrow(float heading)
 {
     float deg = heading * (180.0f / (float)M_PI);
@@ -1486,12 +847,9 @@ static const char *heading_arrow(float heading)
 }
 
 /*
- * screen_draw — compose one full frame:
- *   erase → hexapod → status (top right) → key hint (bottom).
- *
- * HUD pairs are spec-fixed (PAIR_HUD = bright yellow, PAIR_HINT = bright
- * cyan, both A_BOLD on default bg) so they read against any animation
- * behind them.
+ * Draw one full frame: clear, draw the robot, then the status line
+ * (top-right) and the key hints (bottom). The HUD colours stay bright
+ * yellow / cyan so they read over the robot.
  */
 static void screen_draw(Screen *s, const Scene *sc,
                         double fps, float time_scale)
@@ -1524,55 +882,25 @@ static void screen_draw(Screen *s, const Scene *sc,
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app — signals, resize, input, and the main loop ── */
 
 /*
- * App — top-level container; everything outside the world.
+ * App — everything outside the simulated world, bundled so main() reads
+ * as a few clear phases. It's a file-scope global (g_app) because signal
+ * handlers can't take an argument and need to set the flags below.
  *
- * Intent
- *   Bundles the simulated world (Scene), the host terminal (Screen),
- *   and the loop-control flags into one record so main() reads as
- *   four-line phases: init / service signals / step+draw / shutdown.
- *   Declared file-scope (g_app) so signal handlers — which cannot
- *   take a user argument — can write `running` and `need_resize`
- *   without globals scattered through the file.
- *
- * Locality of concern
- *   ── Owned subsystems ── nouns the app composes
- *      scene       — the world being simulated (§6)
- *      screen      — the terminal extent it draws to (§7)
- *
- *   ── Loop control ─── verbs the loop reads each frame
- *      time_scale  — wall-clock dt multiplier ([ / ] adjust)
- *      running     — clear → loop exits; set by SIGINT/SIGTERM
- *      need_resize — set by SIGWINCH; cleared after Screen refresh
- *
- * Why volatile sig_atomic_t (not bool, not int)
- *   `volatile`    : the compiler must not cache the flag across a
- *                   signal-handler write — every loop iteration must
- *                   re-read it from memory.
- *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
- *                   signals; a plain `int` could be observed half-
- *                   written on architectures where stores are split.
- *   See [12] Raymond §"Signal handling".
- *
- * Things that DO NOT live here
- *   - Wall-clock timestamps / fps counters — main() locals; no
- *     other code path needs them.
- *   - Hexapod tuning values (body_speed, theme_idx) — user-state in
- *     §5 Hexapod.
+ * running and need_resize are volatile sig_atomic_t because a signal
+ * handler writes them: volatile forces the loop to re-read them from
+ * memory each pass, and sig_atomic_t guarantees the write can't be seen
+ * half-finished.
  */
 typedef struct {
-    /* ── Owned subsystems ─────────────────────────────────────── */
     Scene  scene;              /* the world (§6)                       */
-    Screen screen;             /* terminal extent (§7)                 */
+    Screen screen;             /* terminal size (§7)                   */
 
-    /* ── Loop control ─────────────────────────────────────────── */
-    float                 time_scale;   /* dt multiplier; 1.0 = realtime */
-    volatile sig_atomic_t running;      /* main loop predicate            */
-    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
+    float                 time_scale;   /* dt multiplier; 1.0 = realtime  */
+    volatile sig_atomic_t running;      /* loop runs while true           */
+    volatile sig_atomic_t need_resize;  /* set by SIGWINCH, cleared on handle */
 } App;
 
 static App g_app;
@@ -1584,9 +912,9 @@ static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void) { endwin(); }
 
 /*
- * app_do_resize — handle a pending SIGWINCH.
- * Body position is clamped into the new bounds; theme is re-applied
- * because some terminals re-derive COLORS on resize.
+ * Handle a pending resize: re-read the size, pull the body back on-screen
+ * if the new bounds left it outside, and re-apply the theme (some
+ * terminals reset their colours on resize).
  */
 static void app_do_resize(App *app)
 {
@@ -1601,9 +929,8 @@ static void app_do_resize(App *app)
 }
 
 /*
- * app_handle_key — dispatch one keypress; return false to quit.
- * Arrow keys set target_heading; the body interpolates toward it at
- * TURN_RATE rad/s in steer_heading().
+ * Act on one keypress; return false to quit. Arrow keys only set the
+ * target heading — the body turns toward it gradually in steer_heading.
  */
 static bool app_handle_key(App *app, int ch)
 {
@@ -1646,15 +973,15 @@ static bool app_handle_key(App *app, int ch)
 }
 
 /*
- * main — variable-timestep render loop. Per-frame phases:
- *   ① INPUT      drain getch() — a press takes effect on this frame
- *   ② RESIZE     handle pending SIGWINCH before touching ncurses
- *   ③ MEASURE dt wall-clock ns since last frame; capped at 100 ms
- *                (see EDGE CASES "Suspend / lid-close")
- *   ④ TICK       one simulation step at exactly dt · time_scale
- *   ⑤ FPS        smoothed over a 500 ms window
- *   ⑥ RENDER     erase → draw → wnoutrefresh → doupdate
- *   ⑦ FRAME CAP  sleep so total frame ≈ 1/TARGET_FPS
+ * The main loop. Each frame, in order:
+ *   1 read all pending keys
+ *   2 handle a pending resize before touching ncurses
+ *   3 measure real time since last frame (capped at 100 ms so the robot
+ *     can't teleport after the machine was asleep)
+ *   4 advance the simulation by that time, scaled by time_scale
+ *   5 update the fps counter
+ *   6 draw the frame
+ *   7 sleep so the frame lasts about 1/TARGET_FPS
  */
 int main(void)
 {

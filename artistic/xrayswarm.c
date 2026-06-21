@@ -1,113 +1,10 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * xrayswarm.c — ray swarm simulation
+ * xrayswarm.c — swarms of rays that shoot out from a queen and fly back in.
  *
- * Swarms of particles: each swarm has a wandering queen (@) and workers (*)
- * that shoot outward as rays, park at the screen edge, then fly back in.
- * Fading directional trails give a bright-ray-on-dark look.
- * Phase cycle: DIVERGE → PAUSE (retract) → CONVERGE → PAUSE → repeat.
- *
- * Keys:
- *   q / ESC   quit
- *   spc       pause / resume
- *   r         reset
- *   + / -     add / remove a swarm (1–5)
- *   [ / ]     lower / raise simulation Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *       artistic/xrayswarm.c \
- *       -o xrayswarm -lncurses -lm
- *
- * §1 config   §2 clock   §3 color   §4 coords   §5 entity
- * §6 scene    §7 screen  §8 app
+ * Each swarm has a wandering queen (@) and workers (*). Workers race outward,
+ * park at the screen edge, then retrace their path home, leaving fading trails.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Swarm simulation with 4-phase state machine per worker.
- *                  DIVERGE: workers shoot outward from queen along fixed
- *                  headings; PAUSE (retract): workers brake and hold; then
- *                  CONVERGE: workers fly back toward queen; second PAUSE;
- *                  repeat.  Queen wanders with smooth Brownian-like steering.
- *
- * Data-structure : Per-worker ring buffer of TRAIL_LEN=48 past positions.
- *                  Older trail positions drawn at decreasing brightness,
- *                  creating the long fading ray appearance.  Buffer is a
- *                  circular array with head pointer — O(1) append.
- *
- * Physics        : Queen steering: each tick a small random angle δθ is
- *                  added to the heading, bounded to avoid tight circles
- *                  (Ornstein-Uhlenbeck-like bounded random walk).
- *                  Worker heading locked to outward direction from queen
- *                  at the start of DIVERGE; held fixed during flight.
- *
- * Rendering      : Cell-aspect correction: CELL_W=8, CELL_H=16 — worker
- *                  pixel positions are divided by (CELL_H/CELL_W) in y to
- *                  produce equal angular spacing on screen.  Trail chars
- *                  selected from brightness ramp based on trail age.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A swarm is a TIMER-DRIVEN BREATH.  The state machine inhales (DIVERGE)
- * pushing N_WORKERS rays outward from a queen, holds (PAUSE) while
- * trails physically retract one slot per tick, exhales (CONVERGE)
- * pulling each worker straight back along its parked exit point, holds
- * again, and repeats.  Workers carry no autonomy — their behaviour is
- * dictated entirely by the swarm's current phase.  The "ray" is not a
- * line primitive; it's the visible TAIL of a moving particle, drawn
- * three brightness tiers deep in cross-swarm passes so dim tails never
- * paint over bright tips.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a sea anemone in a tide.  When the tide goes out (DIVERGE)
- * its tentacles all extend straight outward from the central body.
- * The tide hesitates (PAUSE), and the tentacles slowly contract.  The
- * tide flips (CONVERGE) and the tentacles snap back to the body, each
- * one retracing its outstretched path.  Pause again, and the cycle
- * begins anew.  The body stays put — DIVERGE locks the queen position
- * so CONVERGE has a fixed homing target.
- *
- * ALGORITHM IN STEPS  (per swarm tick)
- * ──────────────────
- *  1. ST_DIVERGE: phase_timer += dt. For each worker: integrate
- *     velocity + small jitter; push current position into trail ring;
- *     if the worker exits the screen bbox, clamp to edge and zero its
- *     velocity (parks).  When phase_timer >= DIVERGE_DUR, lock queen
- *     pos, snapshot every worker's park_px/py, set state=ST_PAUSE,
- *     next_state=ST_CONVERGE, pause_timer=PAUSE_DUR.
- *  2. ST_PAUSE: each tick decrement every trail's tlen by 1 (visual
- *     retraction).  When pause_timer<=0, branch on next_state:
- *       CONVERGE → relaunch each worker from its park position aimed
- *                  at the locked queen
- *       DIVERGE  → relaunch each worker from queen at staggered angle
- *  3. ST_CONVERGE: phase_timer += dt.  Each worker: vector toward
- *     locked queen, steered with strength CONVERGE_STEER per second.
- *     Park at queen when within ARRIVE_DIST.  Phase ends on timer.
- *  4. Render in 3 BRIGHTNESS PASSES across all swarms then a HEAD pass:
- *       DP_DIM    = oldest 20 % of trails, '.', A_DIM
- *       DP_MID    = middle 40 %, line glyph, A_NORMAL
- *       DP_BRIGHT = newest 40 %, line glyph, A_BOLD
- *       DP_HEAD   = workers '*', then queens '@' last so they top.
- *
- * KEY FORMULAS
- * ────────────
- *  Worker launch angle :  θ_i = i · 2π / N_WORKERS + U(0, 0.5)
- *  Diverge speed       :  v = WORK_SPEED · (0.55 + 0.45·U)
- *  Converge homing     :  v += (target_dir·WORK_SPEED − v) · STEER · dt
- *  Trail head index    :  thead = (thead + 1) mod TRAIL_LEN
- *  Brightness norm     :  norm = 1 − i/(tlen−1)  (i=0 is newest)
- *  Trail glyph by slope:  adx = |dx|·CELL_H, ady = |dy|·CELL_W
- *                         adx > 2.2·ady → '-'   ady > 2.2·adx → '|'
- *                         else  '\\' if sign(dx)==sign(dy) else '/'
- *  Render interpolate  :  draw_pos = pos + vel · alpha · dt
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -120,9 +17,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — tunable constants, all named here ── */
 
 #define CELL_W   8
 #define CELL_H  16
@@ -131,7 +26,7 @@ enum {
     N_SWARMS_DEFAULT = 3,
     N_SWARMS_MAX     = 5,
     N_WORKERS        = 20,    /* workers per swarm                        */
-    TRAIL_LEN        = 48,    /* history slots per bug — long = ray look  */
+    TRAIL_LEN        = 48,    /* trail history slots — longer = longer ray */
 
     SIM_FPS_DEFAULT  = 60,
     SIM_FPS_MIN      = 10,
@@ -146,25 +41,23 @@ enum {
 #define QUEEN_DAMP     0.96f
 #define QUEEN_SPEED    80.0f
 
-/* Workers — high inertia = straight-line rays */
+/* Workers — barely any drag, so they fly nearly straight like rays */
 #define WORK_JITTER    4.0f
 #define WORK_DAMP      0.994f
 #define WORK_SPEED    380.0f
 
-/* Phase durations — timer drives transitions, not worker state */
+/* How long each phase lasts. A countdown, not the workers, flips the phase. */
 #define DIVERGE_DUR    3.5f    /* seconds rays shoot outward              */
 #define CONVERGE_DUR   3.5f    /* seconds rays fly inward                 */
 #define PAUSE_DUR      0.7f    /* seconds between phases (trails retract) */
-#define ARRIVE_DIST   40.0f    /* px — worker "arrives" at queen          */
-#define CONVERGE_STEER 5.0f    /* homing correction strength (per second) */
+#define ARRIVE_DIST   40.0f    /* px — how close counts as "reached queen" */
+#define CONVERGE_STEER 5.0f    /* how hard workers curve toward the queen  */
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS   1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock — monotonic time and sleep ── */
 
 static int64_t clock_ns(void)
 {
@@ -183,14 +76,9 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color — one color per swarm, plus the HUD ── */
 
-/*
- * One color pair per swarm (up to 5) + one for the HUD.
- * 256-color: vivid saturated hues; 8-color: basic fallback.
- */
+/* Color-pair ids: one bright hue per swarm, plus grey for the status bar. */
 enum {
     CP_S0 = 1,   /* swarm 0 — cyan    */
     CP_S1,       /* swarm 1 — green   */
@@ -225,9 +113,7 @@ static const int swarm_colors[N_SWARMS_MAX] = {
     CP_S0, CP_S1, CP_S2, CP_S3, CP_S4
 };
 
-/* ===================================================================== */
-/* §4  coords                                                             */
-/* ===================================================================== */
+/* ── §4 coords — turn fine pixel positions into terminal cells ── */
 
 static inline int px_to_cell_x(float px)
 {
@@ -238,42 +124,45 @@ static inline int px_to_cell_y(float py)
     return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  entity                                                             */
-/* ===================================================================== */
+/* ── §5 entity — bugs, swarms, and the phase state machine ── */
 
 /*
- * SwarmState — three-phase cycle per swarm:
- *
- *   ST_DIVERGE  rays shoot outward; workers exit screen → instantly respawn
- *               at queen so new rays fire continuously.  Phase ends on timer.
- *   ST_PAUSE    trails shrink to nothing; queen still wanders
- *   ST_CONVERGE rays home in from edges; workers arrive → instantly respawn
- *               at a new random edge.  Phase ends on timer.
- *
- *   DIVERGE → (DIVERGE_DUR s) → PAUSE → CONVERGE → (CONVERGE_DUR s) → PAUSE → …
+ * Which part of the breathing cycle a swarm is in. It loops forever:
+ *   ST_DIVERGE  → rays shoot outward from the queen until the timer runs out
+ *   ST_PAUSE    → hold; trails shrink away one slot per tick
+ *   ST_CONVERGE → rays fly back home to the queen until the timer runs out
+ * Order: DIVERGE → PAUSE → CONVERGE → PAUSE → DIVERGE → …
  */
 typedef enum { ST_DIVERGE, ST_PAUSE, ST_CONVERGE } SwarmState;
 
+/*
+ * One moving dot — either a queen or a worker — plus the trail it leaves.
+ * The trail is a ring buffer: a fixed array we keep writing into in a circle,
+ * so the newest point overwrites the oldest. That gives a long tail cheaply.
+ */
 typedef struct {
-    float px, py;
-    float vx, vy;
-    float tpx[TRAIL_LEN];
-    float tpy[TRAIL_LEN];
-    int   thead;
-    int   tlen;
-    float park_px, park_py;   /* position where this worker parked at screen edge */
+    float px, py;             /* current position, pixel space            */
+    float vx, vy;             /* current velocity, pixels per second      */
+    float tpx[TRAIL_LEN];     /* trail positions x — ring buffer          */
+    float tpy[TRAIL_LEN];     /* trail positions y — ring buffer          */
+    int   thead;              /* next slot to write in the ring [0,TRAIL_LEN) */
+    int   tlen;               /* how many trail slots are filled [0,TRAIL_LEN] */
+    float park_px, park_py;   /* where this worker stopped at the edge    */
 } Bug;
 
+/*
+ * One swarm: a queen, her workers, and the phase clock that drives them.
+ * Workers have no will of their own — what they do depends only on `state`.
+ */
 typedef struct {
     Bug        queen;
     Bug        workers[N_WORKERS];
-    int        cp;
-    SwarmState state;
-    SwarmState next_state;
-    float      phase_timer;   /* seconds elapsed in current active phase   */
-    float      pause_timer;
-    float      locked_qx, locked_qy; /* queen pos locked at start of CONVERGE */
+    int        cp;            /* color-pair id for this swarm             */
+    SwarmState state;         /* phase running right now                  */
+    SwarmState next_state;    /* phase to enter after the upcoming PAUSE  */
+    float      phase_timer;   /* seconds spent in the current phase       */
+    float      pause_timer;   /* seconds left in a PAUSE, counts down     */
+    float      locked_qx, locked_qy; /* queen position frozen so rays have a fixed home to return to */
 } Swarm;
 
 /* ── helpers ── */
@@ -303,10 +192,8 @@ static void clamp_speed(Bug *b, float max_spd)
 
 /* ── diverge phase ── */
 
-/*
- * Launch a worker outward from the queen.
- * index used to evenly stagger launch angles across N_WORKERS.
- */
+/* Fire one worker outward from the queen. `index` fans the workers out
+ * evenly around the circle so the rays spread in all directions. */
 static void worker_launch_diverge(Bug *w, const Bug *q, int index)
 {
     w->px = q->px;
@@ -321,7 +208,7 @@ static void worker_launch_diverge(Bug *w, const Bug *q, int index)
 
 static void worker_diverge_tick(Bug *w, float dt, float max_px, float max_py)
 {
-    /* Already parked at screen edge — wait for PAUSE to retract the trail */
+    /* Stopped at the edge already — wait for PAUSE to pull the trail back in */
     if (w->vx == 0.0f && w->vy == 0.0f) return;
 
     w->vx += randc() * WORK_JITTER * dt;
@@ -332,7 +219,8 @@ static void worker_diverge_tick(Bug *w, float dt, float max_px, float max_py)
     trail_push(w, w->px, w->py);
     w->px += w->vx * dt;
     w->py += w->vy * dt;
-    /* Exited screen → park at edge; timer will trigger the PAUSE transition */
+    /* Flew off-screen → snap back to the edge and stop; the phase timer
+     * (not this worker) decides when to switch to PAUSE. */
     if (w->px < 0.0f || w->px > max_px ||
         w->py < 0.0f || w->py > max_py) {
         if (w->px < 0.0f)    w->px = 0.0f;
@@ -346,11 +234,9 @@ static void worker_diverge_tick(Bug *w, float dt, float max_px, float max_py)
 
 /* ── converge phase ── */
 
-/*
- * Launch a worker back from its stored park position toward the locked queen.
- * park_px/py were saved when the worker hit the screen edge during DIVERGE,
- * so this is the exact reverse of that ray's outward journey.
- */
+/* Send a worker home from where it parked, aimed at the frozen queen.
+ * It starts from park_px/py (saved when it hit the edge), so the return
+ * trip retraces the outward ray in reverse. */
 static void worker_launch_converge(Bug *w, float target_x, float target_y)
 {
     w->px = w->park_px;
@@ -367,14 +253,14 @@ static void worker_launch_converge(Bug *w, float target_x, float target_y)
 
 static void worker_converge_tick(Bug *w, float target_x, float target_y, float dt)
 {
-    /* Already arrived and parked — nothing to do */
+    /* Already home and stopped — nothing to do */
     if (w->vx == 0.0f && w->vy == 0.0f) return;
 
     float dx   = target_x - w->px;
     float dy   = target_y - w->py;
     float dist = sqrtf(dx*dx + dy*dy);
 
-    /* Arrived: park at queen, trail retraction happens during PAUSE */
+    /* Close enough: snap onto the queen and stop; PAUSE pulls the trail in */
     if (dist < ARRIVE_DIST) {
         w->px = target_x;
         w->py = target_y;
@@ -383,7 +269,7 @@ static void worker_converge_tick(Bug *w, float target_x, float target_y, float d
         return;
     }
 
-    /* Strong homing toward locked queen — less jitter so path retraces cleanly */
+    /* Steer hard toward the queen, with little wobble so the path stays clean */
     float tx = (dx / dist) * WORK_SPEED;
     float ty = (dy / dist) * WORK_SPEED;
     w->vx += (tx - w->vx) * CONVERGE_STEER * dt;
@@ -419,10 +305,9 @@ static void swarm_init(Swarm *s, int cp, float max_px, float max_py)
         worker_launch_diverge(&s->workers[i], &s->queen, i);
 }
 
+/* Advance one swarm by one tick: run the current phase, flip when its timer ends. */
 static void swarm_tick(Swarm *sw, float dt, float max_px, float max_py)
 {
-    /* Queen is stationary — rays always return to their origin */
-
     switch (sw->state) {
 
     case ST_DIVERGE:
@@ -430,7 +315,8 @@ static void swarm_tick(Swarm *sw, float dt, float max_px, float max_py)
         for (int j = 0; j < N_WORKERS; j++)
             worker_diverge_tick(&sw->workers[j], dt, max_px, max_py);
         if (sw->phase_timer >= DIVERGE_DUR) {
-            /* Lock queen position and record each worker's park position */
+            /* Freeze the queen and remember where each worker parked, so the
+             * return trip has a fixed home and a known starting point. */
             sw->locked_qx = sw->queen.px;
             sw->locked_qy = sw->queen.py;
             sw->queen.vx  = 0.0f;
@@ -446,7 +332,7 @@ static void swarm_tick(Swarm *sw, float dt, float max_px, float max_py)
         break;
 
     case ST_PAUSE:
-        /* Shrink every trail one slot per tick — visual retraction */
+        /* Trim one slot off every trail each tick, so the rays appear to suck back in */
         for (int j = 0; j < N_WORKERS; j++) {
             Bug *w = &sw->workers[j];
             if (w->tlen > 0) w->tlen--;
@@ -455,7 +341,7 @@ static void swarm_tick(Swarm *sw, float dt, float max_px, float max_py)
         if (sw->pause_timer <= 0.0f) {
             sw->phase_timer = 0.0f;
             if (sw->next_state == ST_CONVERGE) {
-                /* Launch each worker from its stored park position back to locked queen */
+                /* Send everyone home from where they parked */
                 for (int j = 0; j < N_WORKERS; j++)
                     worker_launch_converge(&sw->workers[j],
                                           sw->locked_qx, sw->locked_qy);
@@ -482,15 +368,14 @@ static void swarm_tick(Swarm *sw, float dt, float max_px, float max_py)
     }
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6 scene — hold all swarms and draw them ── */
 
+/* Everything on screen: the active swarms and the world's pixel bounds. */
 typedef struct {
     Swarm swarms[N_SWARMS_MAX];
-    int   n_swarms;
+    int   n_swarms;          /* how many swarms are live right now       */
     bool  paused;
-    float max_px, max_py;    /* pixel-space bounds, updated on resize     */
+    float max_px, max_py;    /* world size in pixels, refreshed on resize */
 } Scene;
 
 static void scene_init(Scene *s, int cols, int rows)
@@ -522,46 +407,28 @@ static const char *state_name(SwarmState st)
     return "";
 }
 
-/*
- * trail_char() — pick a line-drawing character based on the direction
- * of motion between two consecutive trail positions.
- *
- * Terminal cells are CELL_H/CELL_W ≈ 2× taller than wide, so we scale
- * dy by CELL_W and dx by CELL_H before comparing to get aspect-correct
- * slope thresholds.
- *
- *   mostly horizontal  →  '-'
- *   mostly vertical    →  '|'
- *   diagonal ↘ or ↖   →  '\'
- *   diagonal ↗ or ↙   →  '/'
- */
+/* Pick the ASCII glyph (- | \ /) that best matches the direction of motion.
+ * Terminal cells are about twice as tall as they are wide, so we weight the
+ * x and y movement to undo that stretch before deciding the slope. */
 static chtype trail_char(float dx, float dy)
 {
-    /* Normalize for cell aspect ratio */
-    float adx = fabsf(dx) * (float)CELL_H;   /* horizontal extent in px  */
-    float ady = fabsf(dy) * (float)CELL_W;   /* vertical   extent in px  */
+    float adx = fabsf(dx) * (float)CELL_H;
+    float ady = fabsf(dy) * (float)CELL_W;
 
-    if (adx > ady * 2.2f) return '-';
-    if (ady > adx * 2.2f) return '|';
-    /* diagonal: sign(dx)==sign(dy) → '\', else '/' */
-    return ((dx > 0.0f) == (dy > 0.0f)) ? '\\' : '/';
+    if (adx > ady * 2.2f) return '-';   /* mostly sideways */
+    if (ady > adx * 2.2f) return '|';   /* mostly up/down  */
+    return ((dx > 0.0f) == (dy > 0.0f)) ? '\\' : '/';   /* a diagonal */
 }
 
 /*
- * Pass-based rendering — solves the cross-swarm overwrite problem.
- *
- * When multiple swarms' trails occupy the same cell, the last draw wins.
- * If we draw swarm-by-swarm, dim tails of a later swarm overwrite bold
- * tips of an earlier one, making rays look like they terminate at the
- * wrong queen.
- *
- * Fix: render across ALL swarms in brightness order —
- *   Pass 0 (DP_DIM)    → dim dots     (oldest 20% of every trail)
- *   Pass 1 (DP_MID)    → normal body  (middle 40%)
- *   Pass 2 (DP_BRIGHT) → bold tips    (newest 40%)
- *   Pass 3 (DP_HEAD)   → worker heads (*), then queen heads (@)
- *
- * Bright tips always paint last and are never overwritten by dim tails.
+ * Which brightness layer we are currently drawing. We draw the whole screen
+ * dim-first, then brighter, then heads last. Reason: when two swarms overlap
+ * the same cell, the last write wins — so painting in this order keeps a dim
+ * tail from ever covering a bright tip and making a ray look broken.
+ *   DP_DIM    oldest fifth of each trail (faint dots)
+ *   DP_MID    middle of each trail (normal)
+ *   DP_BRIGHT newest part of each trail (bold)
+ *   DP_HEAD   the moving heads: workers (*), then queens (@) on top
  */
 typedef enum { DP_DIM, DP_MID, DP_BRIGHT, DP_HEAD } DrawPass;
 
@@ -602,7 +469,7 @@ static void draw_bug(WINDOW *w, const Bug *b, int cp, bool is_queen,
             seg = DP_DIM;    ch = '.';                       attr = A_DIM;
         }
 
-        if (seg != pass) continue;   /* only draw this brightness tier */
+        if (seg != pass) continue;   /* skip slots that belong to another pass */
 
         wattron(w, COLOR_PAIR(cp) | attr);
         mvwaddch(w, cy, cx, ch);
@@ -614,7 +481,7 @@ static void scene_draw(const Scene *s, WINDOW *w,
                        int cols, int rows,
                        float alpha, float dt_sec)
 {
-    /* Three brightness passes across all swarms — dim never wins over bright */
+    /* Trails dim-to-bright across every swarm, so a faint tail never hides a tip */
     for (DrawPass pass = DP_DIM; pass <= DP_BRIGHT; pass++) {
         for (int i = 0; i < s->n_swarms; i++) {
             const Swarm *sw = &s->swarms[i];
@@ -626,7 +493,7 @@ static void scene_draw(const Scene *s, WINDOW *w,
         }
     }
 
-    /* Head pass — workers first, queens on top of everything */
+    /* Heads last: workers, then queens so the queens sit on top of everything */
     for (int i = 0; i < s->n_swarms; i++) {
         const Swarm *sw = &s->swarms[i];
         for (int j = 0; j < N_WORKERS; j++)
@@ -640,9 +507,7 @@ static void scene_draw(const Scene *s, WINDOW *w,
     }
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen — ncurses setup, HUD, and present ── */
 
 typedef struct { int cols, rows; } Screen;
 
@@ -675,7 +540,7 @@ static void screen_draw(Screen *s, const Scene *sc,
     erase();
     scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
-    /* HUD — top bar: show state of swarm 0 as representative */
+    /* Top status bar. Swarm 0's phase stands in for all of them. */
     const char *phase = sc->paused ? "PAUSED"
                       : state_name(sc->swarms[0].state);
     char buf[80];
@@ -686,7 +551,7 @@ static void screen_draw(Screen *s, const Scene *sc,
     mvwprintw(stdscr, 0, 0, "%s", buf);
     wattroff(stdscr, COLOR_PAIR(CP_HUD) | A_DIM);
 
-    /* Key hint — bottom bar */
+    /* Bottom bar lists every key you can press */
     wattron(stdscr, COLOR_PAIR(CP_HUD) | A_DIM);
     mvwprintw(stdscr, s->rows - 1, 0,
               " q:quit  spc:pause  r:reset  +/-:swarms  [/]:Hz ");
@@ -699,9 +564,7 @@ static void screen_present(void)
     doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app — input, fixed-timestep loop, main ── */
 
 typedef struct {
     Scene                 scene;
@@ -720,7 +583,7 @@ static void cleanup(void)             { endwin(); }
 static void app_do_resize(App *app)
 {
     screen_resize(&app->screen);
-    /* Recompute pixel bounds so bugs stay inside new terminal dimensions */
+    /* Redo the world size so bugs stay inside the new terminal */
     app->scene.max_px  = (float)(app->screen.cols * CELL_W - 1);
     app->scene.max_py  = (float)(app->screen.rows * CELL_H - 1);
     app->need_resize = 0;
@@ -793,20 +656,21 @@ int main(void)
 
     while (app->running) {
 
-        /* ── resize ──────────────────────────────────────────────── */
+        /* Terminal got resized: rebuild the screen and reset the timer */
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns();
             sim_accum  = 0;
         }
 
-        /* ── dt ──────────────────────────────────────────────────── */
+        /* Real time elapsed since last frame, capped so a stall can't make
+         * the sim try to catch up with a huge burst of ticks. */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
         if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
 
-        /* ── sim accumulator ─────────────────────────────────────── */
+        /* Run the sim in fixed steps so it behaves the same at any frame rate */
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
@@ -817,10 +681,9 @@ int main(void)
             sim_accum -= tick_ns;
         }
 
-        /* ── alpha ───────────────────────────────────────────────── */
+        /* How far we are between sim steps, for smooth in-between drawing */
         float alpha = (float)sim_accum / (float)tick_ns;
 
-        /* ── FPS counter ─────────────────────────────────────────── */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -830,17 +693,15 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* ── frame cap — sleep before render ────────────────────── */
+        /* Sleep before drawing to hold a steady ~60 fps cap */
         int64_t elapsed = clock_ns() - frame_time + dt;
         clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
-        /* ── draw + present ──────────────────────────────────────── */
         screen_draw(&app->screen, &app->scene,
                     fps_display, app->sim_fps,
                     alpha, dt_sec);
         screen_present();
 
-        /* ── input ───────────────────────────────────────────────── */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

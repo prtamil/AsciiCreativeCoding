@@ -1,247 +1,10 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * sand_art.c — sands of time: curved hourglass with falling-sand
- *              simulation, decorative frame, time tracking + auto-flip.
- *
- * DEMO: A proper iconic hourglass with quarter-elliptical curved bulbs
- *       (not the linear-tapered triangles of the previous version)
- *       sits centred in a wooden frame.  Eight coloured sand layers
- *       fill the top bulb in geological strata.  A falling-sand
- *       cellular automaton with per-cell momentum accumulation runs
- *       the physics: grains move down (or up after flip), diagonals
- *       in random order if blocked, and free-falling grains in the
- *       neck stream gain momentum so they advance multiple cells
- *       per tick — giving the visible streaming acceleration through
- *       the narrow waist that a pure 1-cell-per-tick CA can't produce.
- *
- *       Press space to flip gravity → the sand avalanches the other
- *       way, layers visibly mix as they fall, and a new landscape
- *       forms in the formerly empty bulb.  HUD tracks `Time: NN%`
- *       (grains transferred / total) and `Flips: N`.
- *
- *       Patterns (cycle with n / N):
- *         NORMAL       8 horizontal layers, classic hourglass timer
- *         RAINBOW      16 thinner layers, vivid colour spectrum
- *         GEOLOGICAL   8 layers with random thickness asymmetry
- *         DUAL_FLOW    sand in BOTH bulbs, perpetual flip drama
- *
- *       Themes (cycle with t / T):
- *         BEACH        golden sand, brown frame
- *         VOLCANIC     black sand, dark frame, glowing red veins
- *         ROYAL        purple + gold sand, gold frame
- *         ICE          blue/white sand, silver frame
- *         ALIEN        multicolour neon, glowing
- *         NEGATIVE     white-paper bg + dark sand (inverted)
- *
- * Section map (layers):
- *   §1 config        — themes, patterns, hourglass + frame geometry
- *   §2 performance   — monotonic timer + sleep (frame cap in §9)
- *   §3 color         — RENDER setup: palette pairs (startup + theme cycle)
- *   §4 logic         — pure RNG step + hash
- *   §5 simulation    — hourglass cavity mask (built on reset)
- *   §6 simulation    — sand grid + CA momentum tick + flip + transfer count
- *   §7 simulation    — scene control: rebuild / refill / cycle / per-tick
- *   §8 render        — draw passes (frame / walls / sand / HUD) + screen
- *   §9 app           — combine loop, signals, key + resize handling
- *
- * Keys:
- *   q / ESC      quit
- *   space / f    flip gravity (DOWN ↔ UP)
- *   a            toggle auto-flip (default ON: flips when fully drained)
- *   r            refill sand layers (reset transfer count)
- *   n / N        next / previous pattern
- *   t / T        next / previous theme
- *   p            pause / resume simulation
- *   ] / [        sim Hz up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/sand_art.c \
- *       -o sand_art -lncurses -lm
+ * sand_art.c — an hourglass you can watch and flip: coloured sand falls
+ * through a curved-bulb glass, driven by a falling-sand cellular automaton.
+ * Sand-pile physics: Toffoli & Margolus (1987); Powder Toy (2008+) for the
+ * momentum trick; Beverloo et al. (1961) for why the narrow neck meters flow.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Falling-sand cellular automaton with per-cell
- *                  MOMENTUM accumulation, on a curved-bulb hourglass
- *                  mask.
- *
- *                  GRID:
- *                     `mask[row][col]` is 1 inside the hourglass cavity
- *                     (sand can occupy), 0 outside (impassable).
- *                     `sand[row][col]` is the colour layer index of any
- *                     grain at that cell, or 0 if empty.
- *                     `momentum[row][col]` is per-cell vertical velocity
- *                     (0 = at rest, >0 = falling fast).
- *
- *                  TICK (when gravity is DOWN):
- *                     Scan rows BOTTOM → TOP (so a grain doesn't move
- *                     twice in one tick).  For each filled cell:
- *                       - Try direct movement direction (down).  If
- *                         destination empty AND inside mask: move.
- *                         Increment momentum.
- *                       - Else try diagonals (down-left, down-right)
- *                         in random order.  Reset momentum on diagonal.
- *                       - Else: at rest.  Reset momentum.
- *                     Free-falling cells (advanced multiple cells via
- *                     momentum) speed up the visible neck stream.
- *
- *                  FLIP:
- *                     Toggle gravity direction.  Scan order reverses.
- *                     Sand piles re-form with new dynamics.
- *
- *                  HOURGLASS SHAPE:
- *                     Two bulbs joined at a narrow NECK row range.
- *                     Each bulb's half-width as a function of vertical
- *                     position uses a QUARTER-ELLIPSE curve:
- *                       half_w(p) = NECK_HALF
- *                                 + (FULL_HALF − NECK_HALF) · √(1 − (1−p)²)
- *                     where p ∈ [0, 1] is the bulb's vertical fraction
- *                     (0 = at the neck, 1 = at the bulb's far end).
- *                     This produces the iconic "rounded hourglass"
- *                     silhouette instead of straight triangular taper.
- *
- *                  TIME TRACKING:
- *                     Count grains that have crossed the neck row.
- *                     `transferred / total` is the elapsed-time fraction.
- *                     Reaches 1.0 when all sand has flowed through;
- *                     resets on flip or refill.
- *
- * Data-structure : Three parallel grids: mask (uint8), sand (uint8 colour
- *                  index 0..LAYER_MAX), momentum (uint8 0..MOMENTUM_MAX).
- *                  Static buffers sized for SCREEN_MAX_W × SCREEN_MAX_H.
- *                  Frame decoration: a few hard-coded glyph patterns
- *                  drawn at the cap rows.
- *
- * Rendering      : ASCII only.  Sand glyphs vary with momentum: at-rest
- *                  cells render dense ('@', '#'), falling cells render
- *                  lighter ('*', '+', '.') so the streaming neck looks
- *                  visibly faster than the static piles.  Hourglass
- *                  walls are '|', '/', '\\' depending on slope; frame
- *                  uses '=' caps and '|' rails.
- *
- * Performance    : Per tick: cols·rows mask check + sand moves.  At
- *                  80×24 ≈ 2 K cell visits.  CA is O(N) in occupied
- *                  cells, not O(N²); even with 1500 grains it's
- *                  trivial at 60 Hz.
- *
- * References     :
- *   Falling-sand cellular automaton (§6 sand tick)
- *     [1] Toffoli & Margolus, "Cellular Automata Machines" (1987) §7 — the
- *         sand-pile / falling-sand CA this is built on.
- *     [2] "The Powder Toy" (2008+) — the interactive falling-sand sandbox
- *         lineage the per-cell momentum accumulator comes from.
- *   Granular physics — piles, repose, flow (§6 diagonal fall, §5 neck)
- *     [3] Bak, Tang & Wiesenfeld, "Self-Organized Criticality," Phys. Rev. A 38
- *         (1988) — the angle-of-repose behaviour the diagonal-fall rule yields.
- *     [4] Jaeger, Nagel & Behringer, "Granular solids, liquids, and gases,"
- *         Rev. Mod. Phys. 68 (1996) — the standard review of pile/flow physics.
- *     [5] Beverloo, Leniger & van de Velde, "The flow of granular solids through
- *         orifices," Chem. Eng. Sci. 15 (1961) — discharge through a narrow
- *         opening: why the neck bottlenecks the flow (the hourglass timer).
- *   ASCII / terminal rendering (§3 colour, §7 render)
- *     [6] Bourke, "Character representation of grey scale images" (1997) — the
- *         momentum → glyph-density ramp ('.' '+' '*' '#' '@').
- *     [7] Padala, "NCURSES Programming HOWTO" (TLDP) — colour pairs and the
- *         erase → draw → refresh frame model.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * An hourglass is a closed shape with sand inside.  Each grain has one
- * job per tick: try to move with gravity.  If the cell directly with
- * gravity is empty AND inside the hourglass, go there.  Otherwise try
- * the two diagonal-with-gravity cells.  Otherwise rest.  Doing this for
- * every grain, every tick, gives proper sand-pile behaviour: cones
- * form, slopes settle at the angle of repose, narrow openings (the
- * neck) bottleneck flow.  Adding momentum lets free-falling grains
- * advance multiple cells per tick so the neck stream visibly accelerates.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine you're a sand grain.  Each tick the universe asks "can you
- * fall straight down?"  If yes, you fall.  If not, "can you slide down
- * to your left or right?"  If yes, you slide (random choice between
- * left/right).  If everything below is blocked, you stay put.  When
- * gravity flips, "down" becomes "up" — same questions, opposite
- * direction.  The hourglass shape constrains where you can go.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. STARTUP — build hourglass mask:
- *
- *        For each (row, col):
- *            decide which bulb (top/bottom) this row belongs to
- *            compute that bulb's half_w via quarter-ellipse:
- *                p = vertical_progress_in_bulb(row)
- *                half_w = NECK_HALF + (FULL_HALF − NECK_HALF) · √(1 − (1−p)²)
- *            mask[row][col] = (|col − cx| ≤ half_w) ? 1 : 0
- *
- *     Neck rows: half_w = NECK_HALF (constant width).
- *
- *  2. STARTUP — fill sand layers:
- *
- *        Determine TOP bulb cells.  Divide vertically into N_LAYERS
- *        bands.  Each band gets one colour index (1..N_LAYERS).
- *        sand[row][col] = layer for cells in that band; 0 elsewhere.
- *
- *  3. PER TICK (when gravity is DOWN):
- *
- *        Scan rows from BOTTOM to TOP, cols left-to-right.
- *        For each filled cell (row, col):
- *
- *            // Try straight-down
- *            if mask[row+1][col] AND sand[row+1][col] == 0:
- *                sand[row+1][col] = sand[row][col]
- *                sand[row][col] = 0
- *                momentum[row+1][col] = min(momentum[row][col]+1, MAX_MOM)
- *                momentum[row][col] = 0
- *                // High-momentum cells get an additional drop
- *                if momentum[row+1][col] >= 2 AND
- *                   mask[row+2][col] AND sand[row+2][col] == 0:
- *                    sand[row+2][col] = sand[row+1][col]
- *                    sand[row+1][col] = 0
- *                    momentum[row+2][col] = momentum[row+1][col]
- *                    momentum[row+1][col] = 0
- *                continue
- *
- *            // Try diagonals in random order
- *            (left_first = random) → try those two
- *            on success: move, reset momentum (diagonals reset speed)
- *
- *            // No move: at rest, momentum decays to 0
- *
- *  4. FLIP — toggle gravity_dir, reverse scan direction.  Reset all
- *     momentums (avalanche starts from rest).
- *
- *  5. TIME COUNTING — when a grain crosses the neck row(s) downward
- *     (or upward), increment `transferred`.  HUD shows
- *     `transferred / total · 100` as %.
- *
- * KEY FORMULAS
- * ────────────
- *  Bulb half-width via quarter-ellipse profile:
- *    half_w(p) = NECK_HALF + (FULL_HALF − NECK_HALF) · √(1 − (1−p)²)
- *  where p ∈ [0, 1] is fractional distance from neck toward bulb's far
- *  end.  At p=0 (neck) half_w = NECK_HALF; at p=1 (bulb tip)
- *  half_w = FULL_HALF.  Curve is concave-out — the bulb curves
- *  outward from the neck before flattening at the cap.
- *
- *  Diagonal random order (deterministic CA needs random tie-break):
- *    if hash3(row, col, frame) & 1:  try left_first
- *    else:                            try right_first
- *
- *  Cell-aspect handling:
- *    Hourglass is taller than wide in cell space because terminal
- *    cells are 2× taller than wide.  We don't aspect-correct the
- *    bulb shape — a hourglass IS naturally taller than wide.  But
- *    a "circular bulb top" would need correction: not used here.
- *
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -255,54 +18,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
- *
- *   LAYER        SECTION   MUTATES
- *   ────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2        nothing — clock primitives (fixed-timestep
- *                            accumulator, frame cap and fps live in §9 main)
- *   LOGIC        §4        nothing — pure RNG step (lcg_*) and hash3.  The
- *                            lcg_* helpers advance a CALLER-OWNED state word,
- *                            never global state; hash3 is a pure function.
- *   SIMULATION   §5,§6,§7  the Scene aggregate: the cavity mask (Scene.hg) +
- *                            the sand grids (Scene.sand: sand/mom/counters) +
- *                            the control fields.  §5 builds the mask, §6
- *                            advances/flips the sand, §7 orchestrates (rebuild /
- *                            refill / cycle / tick).
- *   RENDER       §3,§8     §3 sets up colour pairs; §8 draws (frame / walls /
- *                            sand / HUD) and owns the terminal.  Reads Scene.hg /
- *                            Scene.sand; never writes simulation state.
- *
- *   EFFECTS  : ABSENT — a grain's glyph (dense at rest, light while streaming)
- *              is derived at render from its momentum (Scene.sand.mom); no
- *              separate cosmetic state is stored.
- *   DELAYS   : the only pause is Scene.paused (scene_tick early-returns); the
- *              auto-flip "settle / stall" holds are idle_frames counters folded
- *              into the sand sim, not a separate timer module.
- *
- * Note: §3 colour is RENDER but sits early because it defines the colour pairs
- * that startup AND the theme-cycle event (scene_cycle_theme, §7) both invoke;
- * LOGIC (§4) does no mutation/I/O so no render/effect can corrupt it.
- *
- * Per-tick combine order — main() (§9) is the only place that advances state:
- *     1. PERFORMANCE  measure dt (capped); fixed-timestep accumulator   §9
- *     2. SIMULATION   scene_tick(dt) per fixed step  [skipped if paused] §7
- *                       → sand_tick, then the auto-flip check
- *     3. PERFORMANCE  fps tally + sleep to the 60 fps cap                §9
- *     4. RENDER       screen_draw() + present  (read-only)               §8
- *
- * RESET (NOT a tick): scene_rebuild / scene_refill rebuild the mask + sand —
- * triggered at startup, by r / n / N / resize, never inside the per-tick step.
- *
- * User events (keys: flip / auto / refill / pattern / theme / pause / Hz;
- * SIGWINCH resize) mutate the Scene/sand but are handled in app_handle_key and
- * the resize block (§9), outside the tick.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — tunables: themes, patterns, hourglass + frame geometry ── */
 
 enum {
     SIM_FPS_MIN      =  10,
@@ -319,16 +35,14 @@ enum {
     PAIR_LAYER_BASE   =  5,    /* +0..+15 — sand colour layers       */
     PAIR_PAPER        = 22,    /* NEGATIVE bg                        */
 
-    /* Static-buffer caps. */
+    /* Biggest terminal we size our fixed grids for. */
     SCREEN_MAX_W      = 200,
     SCREEN_MAX_H      = 80,
 
-    /* Sand layers: max LAYER_MAX colours.  RAINBOW pattern uses up
-     * to 16; NORMAL/GEOLOGICAL use 8.                              */
+    /* Most distinct sand colours one fill can use (RAINBOW uses all 16). */
     LAYER_MAX         = 16,
 
-    /* Per-cell momentum: 0 (rest) .. MOMENTUM_MAX (free-fall).
-     * Stored as uint8 to keep grids small. */
+    /* Top fall speed a grain can build up (0 = resting, 4 = free-fall). */
     MOMENTUM_MAX      = 4,
 };
 
@@ -336,41 +50,28 @@ enum {
 #define NS_PER_MS          1000000LL
 #define TICK_NS(f)      (NS_PER_SEC / (f))
 
-/*
- * Hourglass geometry — tunables.  Narrower than v1's wider container
- * to look like a real hourglass: bulb-to-neck ratio ~8:1 vs the
- * old 27:1 (which made the bulbs feel like wide funnels).
- */
-#define HG_FULL_FRAC     0.16f     /* full half-width as frac of cols    */
-#define HG_NECK_HALF     1.0f      /* neck half-width (cells); 1 → neck is 3 cells wide */
-#define HG_NECK_ROWS     2         /* number of rows where neck is at MIN width */
-#define HG_HEIGHT_FRAC   0.86f     /* height as frac of rows_eff         */
-#define HG_FRAME_PAD     1         /* extra rows at top + bottom for frame */
+/* Default hourglass shape. The bulbs are wide, the neck is tiny — that
+ * narrow waist is what makes sand trickle through slowly, like a real timer. */
+#define HG_FULL_FRAC     0.16f     /* bulb half-width, as a fraction of screen width */
+#define HG_NECK_HALF     1.0f      /* neck half-width in cells; 1 means a 3-cell-wide waist */
+#define HG_NECK_ROWS     2         /* how many rows stay at the narrow neck width */
+#define HG_HEIGHT_FRAC   0.86f     /* glass height, as a fraction of usable rows */
+#define HG_FRAME_PAD     1         /* spare rows above + below for the wooden frame */
 
-/* Sand layer fill — fraction of TOP bulb height to fill initially. */
+/* How full the upper bulb starts — 0.92 leaves a little headroom. */
 #define HG_FILL_FRAC     0.92f
 
-/*
- * Auto-flip — fires when the source bulb has FULLY drained (every
- * grain has crossed the neck) AND the simulation has settled.  Models
- * real hourglass behaviour: watch it complete, THEN flip it.
- *
- * AUTO_FLIP_SETTLE is the post-completion pause (frames of no movement
- * before flipping) so the user sees the drained state for half a sec.
- *
- * AUTO_FLIP_STALL is a fallback: if the sim has been settled for this
- * many consecutive frames but the bulb hasn't fully drained (grains
- * stuck in repose pockets above the neck), flip anyway.  The flip
- * itself unsticks them.  Without this, a stuck final 1-2 % could
- * lock the demo at "almost done" forever.
- */
-#define AUTO_FLIP_SETTLE     30     /* settle frames after completion    */
-#define AUTO_FLIP_STALL     180     /* hard stall fallback (~3 sec)      */
+/* When the demo flips itself, like turning a real hourglass over once it
+ * finishes. SETTLE is the little pause after the last grain falls, so you
+ * see the empty bulb before it turns. STALL is a safety net: if a few grains
+ * get stuck near the neck and never drain, flip anyway after a few seconds —
+ * the avalanche shakes them loose. Both counted in frames. */
+#define AUTO_FLIP_SETTLE     30     /* pause after the bulb empties */
+#define AUTO_FLIP_STALL     180     /* give up waiting and flip (~3 sec) */
 
-/* Pattern — identity of each sand-art preset; indexes the patterns[] table.
- * Each preset differs in BOTH fill (colours / layering) AND glass shape, so
- * cycling n/N is visibly distinct, not a recolour.  Scene.current_pattern
- * stores the active index. */
+/* The four sand-art presets you cycle with n/N. Each one changes both the
+ * colours/layering of the sand AND the glass shape, so they look clearly
+ * different, not just recoloured. Used as an index into patterns[] below. */
 typedef enum {
     PAT_NORMAL     = 0,
     PAT_RAINBOW    = 1,
@@ -379,25 +80,17 @@ typedef enum {
     N_PATTERNS     = 4,
 } Pattern;
 
-/* PatternParams — the recipe for one pattern, in two halves.
- *
- * FILL: layer_count = how many stratified colour bands fill the up-bulb (8 vs
- * 16 → coarse vs fine strata); irregular jitters band thickness for a
- * geological look; dual_fill seeds BOTH bulbs so sand flows perpetually.
- * GLASS: height_frac / full_frac / neck_half reshape the cavity per pattern
- * (tall-narrow vs short-wide vs fat-neck) — so each preset is its own
- * silhouette.  Consumed by sand_fill_layers (fill) and hourglass_build (glass);
- * one row per Pattern. */
+/* The full recipe for one preset: how the sand is laid out, plus how the
+ * glass is shaped. One row of patterns[] per Pattern value. */
 typedef struct {
     const char *name;
-    int         layer_count;       /* 1..LAYER_MAX                       */
-    bool        irregular;         /* layer thicknesses random?           */
-    bool        dual_fill;         /* both bulbs filled at start?         */
-    /* Per-pattern glass geometry — gives each pattern a distinct silhouette
-     * so cycling n/N is obviously different, not just a recolour. */
-    float       height_frac;       /* glass height as frac of rows_eff    */
-    float       full_frac;         /* bulb half-width as frac of cols      */
-    float       neck_half;         /* neck half-width in cells             */
+    int         layer_count;       /* number of colour bands, 1..LAYER_MAX (8 = coarse, 16 = fine) */
+    bool        irregular;         /* wobble the band thicknesses for a geological look? */
+    bool        dual_fill;         /* start sand in BOTH bulbs (so it flows forever)? */
+    /* The glass shape for this preset — what makes each silhouette distinct. */
+    float       height_frac;       /* glass height, as a fraction of usable rows */
+    float       full_frac;         /* bulb half-width, as a fraction of screen width */
+    float       neck_half;         /* neck half-width in cells */
 } PatternParams;
 
 static const PatternParams patterns[N_PATTERNS] = {
@@ -412,20 +105,17 @@ static const PatternParams patterns[N_PATTERNS] = {
     { "DUAL_FLOW ",    8,    false, true,  0.80f,          0.20f,        2.0f         },
 };
 
-/* Theme — a colour palette for the scene.
- *
- * WHY a colour PER layer: the stratified fill only reads as distinct geological
- * bands if adjacent layers contrast — so a theme is up to 16 hand-picked sand
- * colours (indexed by layer-1) plus the frame and glass-wall accents.  `inverted`
- * flips to a white-paper background (the NEGATIVE theme), drawn via a separate
- * PAIR_PAPER fill.  All entries sit in the bright half of the 256 cube so they
- * read on the default background. */
+/* One colour scheme for the whole scene. Each layer gets its own sand colour
+ * so neighbouring bands contrast and you can actually see the stripes; the
+ * frame and glass walls get their own accent colours too. `inverted` is the
+ * odd one out (the NEGATIVE theme): dark sand on a white-paper background.
+ * Colours are all from the bright half of the palette so they stay readable. */
 typedef struct {
     const char *name;
-    short       sand[16];         /* up to LAYER_MAX colours              */
-    short       frame;            /* wooden frame                         */
-    short       wall;             /* hourglass glass walls                */
-    bool        inverted;
+    short       sand[16];         /* colour per layer, indexed by (layer - 1) */
+    short       frame;            /* the wooden frame */
+    short       wall;             /* the glass walls of the hourglass */
+    bool        inverted;         /* dark sand on white paper instead of light-on-dark? */
 } Theme;
 
 #define N_THEMES 6
@@ -468,7 +158,8 @@ static const Theme themes[N_THEMES] = {
        16,  60, true  },
 };
 
-/* Glyph for sand depending on momentum: at rest = dense, falling = light. */
+/* The character drawn for a grain depends on how fast it's moving: settled
+ * sand looks solid, falling sand looks wispy. The pairs add a little variety. */
 static const char SAND_AT_REST[]   = "@#";
 static const char SAND_MOVING[]    = "*+";
 static const char SAND_FAST[]      = ".,";
@@ -481,9 +172,7 @@ static const char SAND_FAST[]      = ".,";
 #define FRAME_RAIL_GLYPH   '|'
 #define FRAME_CORNER       '+'
 
-/* ===================================================================== */
-/* §2  performance — monotonic clock + sleep (frame cap in §9 main)        */
-/* ===================================================================== */
+/* ── §2 performance — monotonic clock + sleep (frame timing lives in §9) ── */
 
 static int64_t clock_ns(void)
 {
@@ -502,10 +191,10 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color — RENDER setup: palette pairs (startup + theme-cycle invoke it)  */
-/* ===================================================================== */
+/* ── §3 color — load a theme's palette into ncurses colour pairs ── */
 
+/* Push one theme's colours into the ncurses pairs the renderer reads.
+ * Called at startup and again each time t/T cycles the theme. */
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -553,9 +242,7 @@ static void color_init(void)
     theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  logic — pure RNG step + hash (no mutation of global state, no I/O)    */
-/* ===================================================================== */
+/* ── §4 logic — small random-number helpers (no shared state, no I/O) ── */
 
 static uint32_t g_rng = 0x12345678u;
 
@@ -575,9 +262,9 @@ static inline int lcg_pick(uint32_t *st)
     return (int)(lcg_next(st) & 1u);
 }
 
-/* Hash three ints to uint32 — used for per-cell-per-frame random
- * tie-break in diagonal-direction selection (deterministic given
- * frame number, so it's reproducible for a given simulation). */
+/* Scramble three numbers into one. Used to pick left-or-right for a sliding
+ * grain: feeding it (row, col, frame) gives a per-grain coin flip that's the
+ * same every time, so a run replays identically. */
 static inline uint32_t hash3(int a, int b, int c)
 {
     uint32_t h = (uint32_t)a * 374761393u
@@ -587,65 +274,37 @@ static inline uint32_t hash3(int a, int b, int c)
     return h ^ (h >> 16);
 }
 
-/* ===================================================================== */
-/* §5  simulation — hourglass cavity mask (built on reset; read by §6/§8)   */
-/* ===================================================================== */
+/* ── §5 simulation — build the hourglass shape (the empty space sand fills) ── */
 
-/* Hourglass — the static glass geometry: a cavity mask plus the bulb / neck /
- * frame coordinates derived from it.
- *
- * WHY a mask separate from the sand: the glass never changes during a run, only
- * the grains move — so the cavity is built ONCE (hourglass_build, a reset op)
- * and the CA just tests it each tick.  Each bulb wall follows a QUARTER-ELLIPSE
- * profile, half_w(p) = NECK_HALF + (FULL_HALF−NECK_HALF)·√(1−(1−p)²), for the
- * iconic rounded silhouette; the narrow neck is what bottlenecks the flow and
- * makes the timer (granular discharge through an orifice, ref [5]).
- *
- * VALUE LOGIC: hg_top..hg_bot bound the glass rows; hg_neck_top..hg_neck_bot the
- * constant-width waist; hg_cx the centre column; hg_full_half / hg_neck_half the
- * bulb / neck half-widths; frame_* the wooden-frame decoration coords. */
+/* The fixed shape of the glass: a map of which cells are inside the cavity,
+ * plus the key coordinates (where the bulbs and neck sit). The glass never
+ * moves during a run — only the sand does — so this is built once and then
+ * just read. The rounded bulbs and pinched neck are the whole point: that
+ * narrow waist is what meters the flow and makes it act like a timer. */
 typedef struct {
-    /* cavity[r][c] = 1 if inside the hourglass cavity (sand-able);
-     *               0 if outside (impassable / wall / outside-frame).
-     *
-     * Built once per resize/reseed; never mutated during simulation. */
+    /* For each cell: 1 = sand can live here (inside the glass), 0 = wall or
+     * outside. Rebuilt on resize or reset, never touched while sand moves. */
     uint8_t cavity[SCREEN_MAX_H][SCREEN_MAX_W];
 
-    /* Hourglass bounding rows/cols within the screen. */
-    int hg_top;        /* top bulb cap row                              */
-    int hg_bot;        /* bottom bulb cap row (inclusive)               */
-    int hg_neck_top;   /* first row of neck (constant width)            */
-    int hg_neck_bot;   /* last row of neck (inclusive)                  */
-    int hg_cx;         /* horizontal centre column                      */
-    int hg_full_half;  /* full half-width at bulb caps                   */
-    int hg_neck_half;  /* neck half-width                                */
+    /* Where the glass sits on screen. */
+    int hg_top;        /* top edge of the upper bulb */
+    int hg_bot;        /* bottom edge of the lower bulb (inclusive) */
+    int hg_neck_top;   /* first row of the narrow neck */
+    int hg_neck_bot;   /* last row of the narrow neck (inclusive) */
+    int hg_cx;         /* centre column the glass is symmetric about */
+    int hg_full_half;  /* half-width at the widest part of a bulb, in cells */
+    int hg_neck_half;  /* half-width at the neck, in cells */
 
-    /* Frame decoration rows: top/bottom caps. */
+    /* Where the wooden frame's top/bottom bars and side rails go. */
     int frame_top_row;
     int frame_bot_row;
     int frame_left_col;
     int frame_right_col;
 } Hourglass;
 
-/*
- * hourglass_build — generate the cavity mask.
- *
- * Two bulbs joined at a HG_NECK_ROWS-row neck of constant width.
- * Each bulb's half-width along its vertical axis follows a quarter-
- * ellipse profile so the silhouette is properly rounded (not a
- * straight triangular taper).
- *
- *   half_w(p) = NECK_HALF + (FULL_HALF − NECK_HALF) · √(1 − (1 − p)²)
- *
- * where p ∈ [0, 1] is the fractional distance from neck toward the
- * bulb's far end (p=0 at neck, p=1 at bulb cap).  Setting q = 1 − p:
- *   half_w(q) = NECK_HALF + (FULL_HALF − NECK_HALF) · √(1 − q²)
- * which is just a quarter-ellipse with semi-axes
- * `(FULL_HALF − NECK_HALF, bulb_height)`.
- */
-/* bulb_half_width — the QUARTER-ELLIPSE wall profile: half-width of a bulb at
- * `d` rows from the neck (d=0) out to the cap (d = bulb_h-1).
- *   half_w(p) = neck + (full−neck)·√(1−(1−p)²),  p = d/(bulb_h−1). */
+/* How wide the bulb is `d` rows away from the neck. It starts pinched at the
+ * neck and swells out toward the cap along a curve (a quarter of an ellipse),
+ * which gives the rounded hourglass look instead of straight funnel walls. */
 static int bulb_half_width(int d, int bulb_h, int neck_half, int full_half)
 {
     float p = (bulb_h > 1) ? (float)d / (float)(bulb_h - 1) : 0.0f;
@@ -656,7 +315,7 @@ static int bulb_half_width(int d, int bulb_h, int neck_half, int full_half)
     return hw;
 }
 
-/* carve_row — open a horizontal span of cavity (centre cx, half-width hw). */
+/* Open up one row of the glass: mark cells within hw of the centre as inside. */
 static void carve_row(Hourglass *hg, int r, int cx, int hw, int cols)
 {
     for (int dx = -hw; dx <= hw; dx++) {
@@ -666,8 +325,8 @@ static void carve_row(Hourglass *hg, int r, int cx, int hw, int cols)
     }
 }
 
-/* compute_glass_dims — derive every bounding row/col of the glass + frame from
- * the window size and the pattern's geometry fracs (clamped to stay on-screen). */
+/* Work out where every part of the glass and frame goes, given the window size
+ * and the preset's shape fractions. Lots of clamping so it always fits onscreen. */
 static void compute_glass_dims(Hourglass *hg, int cols, int rows_eff,
                                const PatternParams *pp)
 {
@@ -700,7 +359,7 @@ static void compute_glass_dims(Hourglass *hg, int cols, int rows_eff,
     hg->hg_full_half = half_w;
     hg->hg_neck_half = neck_half;
 
-    /* Frame coords. */
+    /* The frame sits just outside the glass on all four sides. */
     hg->frame_top_row   = top - 1;
     hg->frame_bot_row   = bot + 1;
     hg->frame_left_col  = cx - half_w - 1;
@@ -714,7 +373,6 @@ static void compute_glass_dims(Hourglass *hg, int cols, int rows_eff,
 static void hourglass_build(Hourglass *hg, int cols, int rows_eff,
                             const PatternParams *pp)
 {
-    /* Clear mask. */
     for (int r = 0; r < rows_eff && r < SCREEN_MAX_H; r++)
         for (int c = 0; c < cols && c < SCREEN_MAX_W; c++)
             hg->cavity[r][c] = 0;
@@ -725,8 +383,8 @@ static void hourglass_build(Hourglass *hg, int cols, int rows_eff,
     int neck_top = hg->hg_neck_top, neck_bot = hg->hg_neck_bot;
     int cx = hg->hg_cx, half_w = hg->hg_full_half, neck_half = hg->hg_neck_half;
 
-    /* Carve top bulb (neck at the bottom end), the constant-width neck, then the
-     * mirrored bottom bulb — each row a quarter-ellipse half-width. */
+    /* Carve the upper bulb, then the straight neck, then the mirrored lower
+     * bulb — one row at a time, each row's width from bulb_half_width. */
     int top_h = neck_top - top;     if (top_h < 1) top_h = 1;
     int bot_h = bot - neck_bot;     if (bot_h < 1) bot_h = 1;
 
@@ -740,38 +398,26 @@ static void hourglass_build(Hourglass *hg, int cols, int rows_eff,
         carve_row(hg, r, cx, bulb_half_width(r - neck_bot - 1, bot_h, neck_half, half_w), cols);
 }
 
-/* ===================================================================== */
-/* §6  simulation — sand grid + CA tick + flip + transfer counter           */
-/* ===================================================================== */
+/* ── §6 simulation — move the sand each tick, flip gravity, count progress ── */
 
-/* Sand — the grains plus the simulation's running state (falling-sand cellular
- * automaton, ref [1]; the per-cell momentum accumulator is from the Powder-Toy
- * lineage, ref [2]).
- *
- * WHY two parallel grids: `sand` is WHAT colour sits in a cell, `mom` is HOW
- * FAST it is falling.  A pure 1-cell-per-tick CA can't show the neck stream
- * accelerating; accumulating momentum lets free-falling grains advance several
- * cells per tick, so the waist visibly speeds up (granular discharge, ref [5]).
- * The diagonal-fall rule yields the angle of repose for free (refs [3], [4]).
- *
- * VALUE LOGIC: sand[r][c] = 0 empty / 1..LAYER_MAX colour; mom[r][c] =
- * 0..MOMENTUM_MAX; gravity_dir = +1 down / −1 up; transferred / total_grains
- * drive the Time% HUD; flip_count counts user flips; frame is the hash tick;
- * moves_this_tick + idle_frames detect settling that triggers auto-flip. */
+/* All the sand and the bookkeeping that goes with it. Two grids run in
+ * lockstep: `sand` says what colour grain is in each cell, `mom` says how fast
+ * it's falling. The speed grid is the trick that makes the neck stream look
+ * like it's accelerating — a fast grain can drop several cells in one tick
+ * instead of just one. Letting grains slide sideways gives sand piles their
+ * natural slope for free. */
 typedef struct {
-    uint8_t sand[SCREEN_MAX_H][SCREEN_MAX_W];
-    uint8_t mom [SCREEN_MAX_H][SCREEN_MAX_W];
-    int     gravity_dir;       /* +1 = down, -1 = up                     */
-    int     transferred;       /* grains crossed the neck in current dir */
-    int     total_grains;      /* total filled cells (for % progress)    */
-    int     flip_count;        /* how many times the user has flipped    */
-    int     frame;             /* monotonic frame counter for hash       */
+    uint8_t sand[SCREEN_MAX_H][SCREEN_MAX_W];   /* 0 = empty, 1..LAYER_MAX = colour */
+    uint8_t mom [SCREEN_MAX_H][SCREEN_MAX_W];   /* fall speed, 0..MOMENTUM_MAX */
+    int     gravity_dir;       /* which way is "down": +1 = down, -1 = up */
+    int     transferred;       /* grains that have fallen through the neck so far */
+    int     total_grains;      /* how many grains there are (the 100% mark) */
+    int     flip_count;        /* how many times the glass has been turned over */
+    int     frame;             /* tick counter, fed to hash3 for the L/R coin flip */
 
-    /* Settling detection: count grains that moved this tick (for the
-     * idle_frames counter that drives auto-flip).  Reset at the start
-     * of each tick. */
-    int     moves_this_tick;
-    int     idle_frames;       /* consecutive frames with zero moves     */
+    /* Used to notice when everything has stopped, which triggers an auto-flip. */
+    int     moves_this_tick;   /* grains that moved this tick (reset each tick) */
+    int     idle_frames;       /* how many ticks in a row nothing has moved */
 } Sand;
 
 static void sand_clear(Sand *s)
@@ -785,8 +431,8 @@ static void sand_clear(Sand *s)
     s->frame        = 0;
 }
 
-/* fill_layer_band — fill the cavity cells of rows [row_a,row_b] with `color`,
- * skipping already-filled cells; returns how many grains were placed. */
+/* Paint a horizontal band of rows with one colour, only touching empty
+ * in-glass cells. Returns how many grains it placed. */
 static int fill_layer_band(Sand *s, const Hourglass *hg, int row_a, int row_b,
                            uint8_t color, int cols, int rows_eff)
 {
@@ -795,7 +441,7 @@ static int fill_layer_band(Sand *s, const Hourglass *hg, int row_a, int row_b,
         if (r < 0 || r >= rows_eff) continue;
         for (int c = 0; c < cols; c++) {
             if (!hg->cavity[r][c]) continue;
-            if (s->sand[r][c] != 0) continue;     /* don't overwrite */
+            if (s->sand[r][c] != 0) continue;     /* leave already-filled cells alone */
             s->sand[r][c] = color;
             s->mom [r][c] = 0;
             n++;
@@ -804,16 +450,10 @@ static int fill_layer_band(Sand *s, const Hourglass *hg, int row_a, int row_b,
     return n;
 }
 
-/*
- * sand_fill_layers — fill the BULB-currently-on-top with stratified
- * colour bands, dividing its vertical extent into `layers` bands.
- *
- * Pattern flag `dual_fill` makes us also fill the BULB-currently-on-
- * bottom (with reversed colour order) — the DUAL_FLOW pattern.
- *
- * `irregular` jitters each layer's vertical thickness with a hash
- * for organic geological strata.
- */
+/* Fill the upper bulb with coloured stripes, splitting its height into `layers`
+ * bands. The DUAL_FLOW preset also seeds the lower bulb (colours reversed) so
+ * sand is always flowing; the geological preset jitters each stripe's thickness
+ * so the bands look natural rather than ruler-straight. */
 static void sand_fill_layers(Sand *s, const Hourglass *hg,
                               int cols, int rows_eff,
                               const PatternParams *pp, uint32_t seed)
@@ -822,9 +462,8 @@ static void sand_fill_layers(Sand *s, const Hourglass *hg,
     if (layers > LAYER_MAX) layers = LAYER_MAX;
     if (layers < 1)         layers = 1;
 
-    /* Determine which bulb is "up" for refill (gravity-direction-aware:
-     * +1 gravity → top bulb is "up"; −1 → bottom bulb is "up"). */
-    int up_top, up_bot;     /* row range of the bulb to fill            */
+    /* Which bulb is currently the upper one depends on gravity direction. */
+    int up_top, up_bot;     /* the row range we'll fill */
     if (s->gravity_dir > 0) {
         up_top = hg->hg_top;
         up_bot = hg->hg_neck_top - 1;
@@ -835,20 +474,18 @@ static void sand_fill_layers(Sand *s, const Hourglass *hg,
     int up_h = up_bot - up_top + 1;
     if (up_h < 1) return;
 
-    /* Fill the bulb to HG_FILL_FRAC of its height, starting from the
-     * far end (away from neck). */
+    /* Only fill most of the bulb (HG_FILL_FRAC), starting at the far end. */
     int fill_h = (int)((float)up_h * HG_FILL_FRAC);
     if (fill_h < 1)  fill_h = 1;
     if (fill_h > up_h) fill_h = up_h;
 
-    /* For each layer band, compute its row range. */
     int filled_count = 0;
     for (int L = 0; L < layers; L++) {
-        /* Layer L's vertical extent within the fill region. */
+        /* This stripe occupies the slice [t0, t1] of the fill region. */
         float t0 = (float)L       / (float)layers;
         float t1 = (float)(L + 1) / (float)layers;
         if (pp->irregular) {
-            /* Jitter the boundaries with a hash; keep monotonic. */
+            /* Nudge the stripe edges a little, but keep them in order. */
             float j0 = ((hash3(L,    0, seed) & 0xFFu) / 255.0f - 0.5f) * 0.10f;
             float j1 = ((hash3(L+1,  0, seed) & 0xFFu) / 255.0f - 0.5f) * 0.10f;
             t0 += j0;
@@ -858,9 +495,8 @@ static void sand_fill_layers(Sand *s, const Hourglass *hg,
             if (t1 <= t0) t1 = t0 + 0.01f;
         }
 
-        /* Map [t0, t1] into rows.  When gravity is +1 (down), layer 0
-         * (oldest sand) is at the TOP (far from neck); when -1, layer
-         * 0 is at the BOTTOM. */
+        /* Turn that slice into actual rows. Stripe 0 (the oldest sand) sits
+         * at the far end of the bulb, away from the neck. */
         int row_a, row_b;
         if (s->gravity_dir > 0) {
             row_a = up_top + (int)(t0 * (float)fill_h);
@@ -871,13 +507,12 @@ static void sand_fill_layers(Sand *s, const Hourglass *hg,
         }
         if (row_a > row_b) { int t = row_a; row_a = row_b; row_b = t; }
 
-        /* layer L → colour L+1 (1-based) */
+        /* Colours are 1-based (0 means empty), so stripe L gets colour L+1. */
         filled_count += fill_layer_band(s, hg, row_a, row_b,
                                         (uint8_t)(L + 1), cols, rows_eff);
     }
 
-    /* DUAL_FLOW: also fill the OTHER bulb to half its height, with
-     * reversed layer order. */
+    /* DUAL_FLOW preset: seed the other bulb too, half-full, colours reversed. */
     if (pp->dual_fill) {
         int dn_top, dn_bot;
         if (s->gravity_dir > 0) {
@@ -903,7 +538,7 @@ static void sand_fill_layers(Sand *s, const Hourglass *hg,
                     row_b = dn_bot - (int)(t0 * (float)dn_fill);
                 }
                 if (row_a > row_b) { int t = row_a; row_a = row_b; row_b = t; }
-                /* Reverse layer order in the secondary bulb. */
+                /* Colours run the opposite way here. */
                 filled_count += fill_layer_band(s, hg, row_a, row_b,
                                                 (uint8_t)(layers - L), cols, rows_eff);
             }
@@ -915,8 +550,8 @@ static void sand_fill_layers(Sand *s, const Hourglass *hg,
     s->frame        = 0;
 }
 
-/* count_neck_crossing — a grain that moved from from_r to to_r crossed the neck
- * midline this step; bump the transfer counter that drives the Time% HUD. */
+/* If this move carried a grain across the middle of the neck, count it — that
+ * tally is what the Time% readout is based on. */
 static void count_neck_crossing(Sand *s, int from_r, int to_r, int dir,
                                 int neck_mid)
 {
@@ -925,10 +560,10 @@ static void count_neck_crossing(Sand *s, int from_r, int to_r, int dir,
     if (crossed) s->transferred++;
 }
 
-/* grain_bonus_drops — a fast grain (momentum ≥ 2) advances 1–2 EXTRA cells this
- * tick, so a free-falling stream accelerates instead of creeping one cell/tick
- * (the streaming neck, ref [5]).  Starts from `from_r`; stops at the first wall
- * or occupied cell. */
+/* Let a fast grain fall a couple of extra cells in the same tick. This is what
+ * makes the stream through the neck look like it's speeding up, instead of every
+ * grain crawling exactly one cell per tick. Stops as soon as it hits a wall or
+ * another grain. */
 static void grain_bonus_drops(Sand *s, const Hourglass *hg, int from_r, int c,
                               uint8_t mom, int dir, int neck_mid, int rows_eff)
 {
@@ -950,9 +585,9 @@ static void grain_bonus_drops(Sand *s, const Hourglass *hg, int from_r, int c,
     }
 }
 
-/* grain_fall_straight — try to fall one cell straight ahead; on success the
- * grain gains momentum and a fast grain also takes its bonus drops.  Returns
- * true iff the grain moved. */
+/* Try to drop the grain straight down by one cell. If it works it picks up a
+ * little speed, and a fast grain then takes its bonus drops. Returns whether
+ * it moved. */
 static bool grain_fall_straight(Sand *s, const Hourglass *hg, int r, int c,
                                 int dir, int neck_mid, int rows_eff)
 {
@@ -972,9 +607,9 @@ static bool grain_fall_straight(Sand *s, const Hourglass *hg, int r, int c,
     return true;
 }
 
-/* grain_slide_diagonal — try to slide one cell diagonally with gravity, in a
- * per-cell-random L/R order (hash3) so piles settle at the angle of repose
- * (refs [3],[4]).  Diagonals reset momentum.  Returns true iff the grain moved. */
+/* If it can't fall straight, try sliding down to one side. Which side it checks
+ * first is a coin flip per grain, so piles spread evenly and settle at a natural
+ * slope. Sliding kills its speed. Returns whether it moved. */
 static bool grain_slide_diagonal(Sand *s, const Hourglass *hg, int r, int c,
                                  int dir, int neck_mid, int cols)
 {
@@ -989,13 +624,13 @@ static bool grain_slide_diagonal(Sand *s, const Hourglass *hg, int r, int c,
         if (nc < 0 || nc >= cols)                continue;
         if (!hg->cavity[dest_r][nc])             continue;
         if (s->sand[dest_r][nc] != 0)            continue;
-        /* Require the same-row neighbour non-blocking (the grain can "see" the
-         * diagonal cell); else sand would tunnel through walls. */
+        /* The grain has to be able to "reach" the diagonal cell — the cell
+         * beside it must be open. Otherwise sand would leak through walls. */
         if (!hg->cavity[r][nc] && s->sand[r][nc] != 0) continue;
 
         s->sand[dest_r][nc] = s->sand[r][c];
         s->sand[r][c]       = 0;
-        s->mom[dest_r][nc]  = 0;     /* diagonals reset speed   */
+        s->mom[dest_r][nc]  = 0;     /* a sideways slide resets the grain's speed */
         s->mom[r][c]        = 0;
         s->moves_this_tick++;
         count_neck_crossing(s, r, dest_r, dir, neck_mid);
@@ -1004,18 +639,15 @@ static bool grain_slide_diagonal(Sand *s, const Hourglass *hg, int r, int c,
     return false;
 }
 
-/*
- * sand_move_grain — advance ONE grain at (r,c) one CA step with gravity `dir`,
- * trying each move in order until one succeeds:
- *     fall straight (+ momentum bonus) → slide diagonally → settle in place.
- */
+/* Move one grain for one tick: fall straight if you can, else slide to a side,
+ * else just sit there. */
 static void sand_move_grain(Sand *s, const Hourglass *hg, int r, int c,
                             int dir, int neck_mid, int cols, int rows_eff)
 {
-    if (s->sand[r][c] == 0) return;            /* empty cell */
+    if (s->sand[r][c] == 0) return;            /* nothing here to move */
 
     int dest_r = r + dir;
-    if (dest_r < 0 || dest_r >= rows_eff) {    /* would fall off the end */
+    if (dest_r < 0 || dest_r >= rows_eff) {    /* off the edge of the screen */
         s->mom[r][c] = 0;
         return;
     }
@@ -1023,17 +655,16 @@ static void sand_move_grain(Sand *s, const Hourglass *hg, int r, int c,
     if (grain_fall_straight(s, hg, r, c, dir, neck_mid, rows_eff)) return;
     if (grain_slide_diagonal(s, hg, r, c, dir, neck_mid, cols))    return;
 
-    s->mom[r][c] = 0;                           /* blocked → settle */
+    s->mom[r][c] = 0;                           /* stuck, so it comes to rest */
 }
 
-/*
- * sand_tick — one CA step.  Scan rows AGAINST gravity (bottom → top when
- * falling down) so a grain isn't moved twice in a tick, advance each grain,
- * then update the settling counter that drives auto-flip.
- */
+/* One step of the whole simulation: move every grain once. We walk the rows
+ * against gravity (bottom-up when falling down) so a grain that just dropped
+ * isn't picked up and moved again in the same tick. Afterwards we note whether
+ * anything moved, which is how the auto-flip knows the glass has emptied. */
 static void sand_tick(Sand *s, const Hourglass *hg, int cols, int rows_eff)
 {
-    int dir = s->gravity_dir;          /* +1 down, -1 up */
+    int dir = s->gravity_dir;
     int neck_mid_row = (hg->hg_neck_top + hg->hg_neck_bot) / 2;
 
     int r_start, r_end, r_step;
@@ -1049,43 +680,36 @@ static void sand_tick(Sand *s, const Hourglass *hg, int cols, int rows_eff)
             sand_move_grain(s, hg, r, c, dir, neck_mid_row, cols, rows_eff);
     }
 
-    /* End-of-tick: zero moves → settling toward auto-flip. */
+    /* No grain moved this tick → the sand has settled. */
     if (s->moves_this_tick == 0) s->idle_frames++;
     else                         s->idle_frames = 0;
 }
 
+/* Turn the glass over: swap which way is down and let the sand avalanche back. */
 static void sand_flip(Sand *s)
 {
     s->gravity_dir = -s->gravity_dir;
     s->transferred = 0;
     s->flip_count++;
     s->idle_frames = 0;
-    /* Reset momentum after flip — avalanche starts from rest. */
-    memset(s->mom, 0, sizeof s->mom);
+    memset(s->mom, 0, sizeof s->mom);   /* everything starts from rest again */
 }
 
-/* ===================================================================== */
-/* §7  simulation — scene control: rebuild / refill / cycle / per-tick      */
-/* ===================================================================== */
+/* ── §7 simulation — scene control: build, refill, cycle presets, step ── */
 
-/* Scene — the whole hourglass in one aggregate, a table of contents:
- *   WHAT  : hg (the cavity mask) + sand (the grains, momentum and counters).
- *   HOW   : current_pattern / current_theme / auto_flip — the user knobs.
- *   WHERE : cols/rows (terminal), seed (the run's RNG), paused (run-state).
- * Functions still take the narrowest sub-type (Sand* / const Hourglass*); only
- * the scene_* orchestrators take Scene*. */
+/* Everything that makes up one running hourglass, bundled together: the glass
+ * shape, the sand, the current preset/theme, the terminal size, and run state.
+ * The low-level helpers take just the piece they need; the scene_* functions
+ * here are the ones that coordinate the whole thing. */
 typedef struct {
-    /* WHAT — the simulated objects. */
-    Hourglass  hg;
-    Sand       sand;
-    /* HOW — simulation knobs (keys n/N, t/T, a). */
-    int        current_pattern;
-    int        current_theme;
-    bool       auto_flip;          /* auto-flip when fully drained?      */
-    /* WHERE / when. */
-    int        cols, rows;
-    uint32_t   seed;
-    bool       paused;
+    Hourglass  hg;                 /* the glass shape */
+    Sand       sand;               /* the grains and their state */
+    int        current_pattern;    /* which preset (cycled with n/N) */
+    int        current_theme;      /* which colour scheme (cycled with t/T) */
+    bool       auto_flip;          /* turn the glass over by itself when it empties? */
+    int        cols, rows;         /* terminal size in cells */
+    uint32_t   seed;               /* random seed for this run's fills */
+    bool       paused;             /* is the simulation frozen? */
 } Scene;
 
 static void scene_rebuild(Scene *s)
@@ -1122,7 +746,7 @@ static void scene_refill(Scene *s)
 {
     s->seed = (uint32_t)clock_ns() ^ 0xA5A5A5A5u;
     g_rng   = s->seed ^ 0xBEEFu;
-    /* Keep current gravity direction; just refill the up-bulb. */
+    /* Keep gravity pointing the same way; just top the upper bulb back up. */
     sand_clear(&s->sand);
     int rows_eff = s->rows - 1;
     sand_fill_layers(&s->sand, &s->hg, s->cols, rows_eff,
@@ -1151,19 +775,11 @@ static void scene_tick(Scene *s, float dt)
     int rows_eff = s->rows - 1;
     sand_tick(&s->sand, &s->hg, s->cols, rows_eff);
 
-    /*
-     * Auto-flip — two trigger conditions:
-     *
-     *   (a) FULLY DRAINED: transferred reaches total_grains AND the sim
-     *       has been settled for AUTO_FLIP_SETTLE frames.  This is the
-     *       canonical "the hourglass has finished, flip it" trigger.
-     *
-     *   (b) STALL FALLBACK: settled for AUTO_FLIP_STALL frames (~3 sec)
-     *       even though some grains haven't crossed.  Catches the rare
-     *       case where grains are stuck in repose pockets above the
-     *       neck and would never drain on their own.  Flip anyway —
-     *       the avalanche unsticks them.
-     */
+    /* Decide whether to turn the glass over on its own. Two ways that happens:
+     * either every grain has fallen through and the sand has sat still for a
+     * moment (the normal "it's done" case), or a few grains got stuck near the
+     * neck and it's been frozen for a few seconds — flip anyway, the tumble
+     * frees them. */
     if (s->auto_flip && s->sand.total_grains > 0) {
         bool fully_drained = (s->sand.transferred >= s->sand.total_grains);
         bool short_settled = fully_drained
@@ -1177,14 +793,10 @@ static void scene_tick(Scene *s, float dt)
     (void)dt;
 }
 
-/* ===================================================================== */
-/* §8  render — draw passes (frame / walls / sand / HUD); reads only        */
-/* ===================================================================== */
+/* ── §8 render — draw the frame, glass, sand, and HUD (reads, never writes) ── */
 
-/*
- * draw_frame — wooden frame around the hourglass.  Top + bottom caps
- * with `=` chars and corners; vertical rails along the side columns.
- */
+/* Draw the wooden frame: a bar across the top and bottom with corner pieces,
+ * and two vertical rails down the sides. */
 static void draw_frame(const Scene *s, bool inverted)
 {
     (void)inverted;
@@ -1196,14 +808,14 @@ static void draw_frame(const Scene *s, bool inverted)
     int lc      = hg->frame_left_col;
     int rc      = hg->frame_right_col;
 
-    /* Top + bottom cap rows. */
+    /* The top and bottom bars. */
     for (int c = lc; c <= rc; c++) {
         if (top_row >= 0)
             mvaddch(top_row, c, (chtype)(unsigned char)FRAME_CAP_GLYPH);
         if (bot_row < s->rows - 1)
             mvaddch(bot_row, c, (chtype)(unsigned char)FRAME_CAP_GLYPH);
     }
-    /* Corners. */
+    /* The four corner pieces. */
     if (top_row >= 0) {
         mvaddch(top_row, lc, (chtype)(unsigned char)FRAME_CORNER);
         mvaddch(top_row, rc, (chtype)(unsigned char)FRAME_CORNER);
@@ -1213,8 +825,7 @@ static void draw_frame(const Scene *s, bool inverted)
         mvaddch(bot_row, rc, (chtype)(unsigned char)FRAME_CORNER);
     }
 
-    /* Side rails — the columns directly outside the bulbs at top/bottom
-     * caps' Y range.  Just two vertical bars on the outside corners. */
+    /* The two vertical rails down the left and right sides. */
     for (int r = top_row + 1; r < bot_row; r++) {
         if (r >= 0 && r < s->rows - 1) {
             mvaddch(r, lc, (chtype)(unsigned char)FRAME_RAIL_GLYPH);
@@ -1225,11 +836,10 @@ static void draw_frame(const Scene *s, bool inverted)
     attroff(COLOR_PAIR(PAIR_FRAME) | A_BOLD);
 }
 
-/*
- * draw_walls — hourglass GLASS walls.  Walk the cavity boundary;
- * any cell that's NOT inside the cavity but IS adjacent to one
- * gets a wall glyph based on slope direction.
- */
+/* Draw the glass walls. For each row we find the leftmost and rightmost cells
+ * the sand can reach, then draw a wall just outside them. The character is
+ * picked to follow the curve: a slash where the wall slopes, a bar where it's
+ * straight. */
 static void draw_walls(const Scene *s, bool inverted)
 {
     (void)inverted;
@@ -1240,7 +850,7 @@ static void draw_walls(const Scene *s, bool inverted)
     attron(COLOR_PAIR(PAIR_WALL));
     for (int r = hg->hg_top; r <= hg->hg_bot; r++) {
         if (r < 0 || r >= rows_eff) continue;
-        /* Find leftmost and rightmost cavity cells in this row. */
+        /* Leftmost and rightmost open cells in this row. */
         int left = -1, right = -1;
         for (int c = 0; c < cols; c++) {
             if (hg->cavity[r][c]) {
@@ -1250,11 +860,11 @@ static void draw_walls(const Scene *s, bool inverted)
         }
         if (left < 0) continue;
 
-        /* Wall just outside the cavity boundary. */
+        /* The wall sits one cell outside the open span on each side. */
         int wl = left  - 1;
         int wr = right + 1;
         if (wl >= 0) {
-            /* Choose slope glyph by neighbouring rows' boundaries. */
+            /* Compare with the rows above/below to see if the wall is sloping. */
             char g = WALL_GLYPH_V;
             if (r > 0 && r < rows_eff - 1) {
                 int left_above = -1, left_below = -1;
@@ -1284,13 +894,9 @@ static void draw_walls(const Scene *s, bool inverted)
     attroff(COLOR_PAIR(PAIR_WALL));
 }
 
-/*
- * draw_sand — render every filled cell.  Glyph chosen by momentum:
- *   momentum 0 (resting): dense glyph from SAND_AT_REST
- *   momentum 1-2 (slow):  SAND_MOVING
- *   momentum 3+ (fast):   SAND_FAST
- * Colour pair chosen by layer index.
- */
+/* Draw every grain. The character shows how fast it's moving (solid at rest,
+ * wispier the faster it falls) and the colour comes from which stripe it's in.
+ * Colour/attribute changes are batched so we don't reset ncurses state per cell. */
 static void draw_sand(const Scene *s, bool inverted)
 {
     int rows_eff = s->rows - 1;
@@ -1353,12 +959,10 @@ static void scene_render(const Scene *s)
     draw_sand (s, inverted);
 }
 
-/* ===================================================================== */
-/* §8  render (cont'd) — screen surface + HUD                              */
-/* ===================================================================== */
+/* ── §8 render (cont'd) — the ncurses surface and the HUD ── */
 
-/* Screen — the ncurses display surface: cached terminal size in cells, re-read
- * at init and on every SIGWINCH so the layout tracks window resizes. */
+/* The terminal as a drawing surface: just its size in cells, re-read at startup
+ * and after every resize so the layout keeps up with the window. */
 typedef struct { int cols, rows; } Screen;
 
 static void screen_init(Screen *sc)
@@ -1392,7 +996,7 @@ static void screen_draw(const Screen *sc, const Scene *s,
     int pct = 100 * s->sand.transferred / total;
     if (pct > 100) pct = 100;
 
-    /* ── top row: data readout (yellow), clipped so it never wraps ── */
+    /* Top row: status readout, clipped to the window width so it never wraps. */
     char buf[200];
     snprintf(buf, sizeof buf,
              " SANDS OF TIME   %s   pat:%s   theme:%s   "
@@ -1409,7 +1013,7 @@ static void screen_draw(const Screen *sc, const Scene *s,
     mvprintw(0, 0, "%.*s", sc->cols, buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* ── bottom row: action keys (cyan), clipped ── */
+    /* Bottom row: the key hints. */
     int row = sc->rows - 1;
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
@@ -1420,23 +1024,19 @@ static void screen_draw(const Screen *sc, const Scene *s,
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §9  app — combine point (per-tick order) + user events + frame cap       */
-/* ===================================================================== */
+/* ── §9 app — the main loop, keys, signals, and frame timing ── */
 
-/* App — process-level glue: the scene, its display, the sim-rate knob, and the
- * two signal flags.
- *
- * WHY global (g_app): POSIX signal handlers take no user-data argument, so the
- * SIGINT/SIGTERM/SIGWINCH handler reaches running / need_resize through a
- * file-scope object; volatile sig_atomic_t is the one type the C standard
- * guarantees is safe to write in a handler and read in the loop. */
+/* The top-level bundle: the scene, its display, the sim-speed setting, and two
+ * flags the signal handlers flip. It's a single global because POSIX signal
+ * handlers can't be passed any data — they can only reach these fields through
+ * a file-scope object. The flags use sig_atomic_t because that's the one type
+ * the C standard promises is safe to set in a handler and read in the loop. */
 typedef struct {
     Scene                 scene;
     Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    int                   sim_fps;       /* simulation ticks per second */
+    volatile sig_atomic_t running;       /* cleared by Ctrl-C / kill to exit */
+    volatile sig_atomic_t need_resize;   /* set on window resize */
 } App;
 
 static App g_app;

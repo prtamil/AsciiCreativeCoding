@@ -1,336 +1,11 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * volcano.c — erupting volcano with lava bombs, ash plume, sparks,
- *             lava flows, and random AMBIENT BURSTS.  Heavy particle
- *             counts; ~600-800 active simultaneously for a visually
- *             dense eruption.
- *
- * DEMO: A stratovolcano fills the screen with a glowing crater at its
- *       summit.  Lava bombs trace ballistic arcs with smoke trails;
- *       embers drift up the rising plume; ash spreads slowly into the
- *       upper sky; sparks streak from the crater rim.  An fBm-modulated
- *       plume column rises and curls in the wind.  Lava flows trace
- *       glowing rivers down the mountain slopes.  Five rendering
- *       layers compose the final frame; one large particle pool
- *       (1024 slots) drives everything that moves.
- *
- *       Distinct from a single-particle-system demo: volcano is a
- *       LAYERED COMPOSITION — sky, mountain silhouette, lava flows,
- *       plume column, and particle effects are each their own pass.
- *       That layering plus the dense particle pool gives the dramatic
- *       eruption look that a one-pool one-type demo can't reach.
- *
- *       Eruption patterns (cycle with n / N):
- *         STROMBOLIAN  rhythmic moderate bursts, ~1-2 sec interval
- *         VULCANIAN    periodic violent explosions (large burst spawns)
- *         PLINIAN      continuous massive plume, heavy ash, tall column
- *         HAWAIIAN     strong lava fountain, lighter ash, slope flows
- *
- *       AMBIENT BURSTS — every 8-22 sec, a dramatic random surge fires
- *       regardless of pattern: ~28 bombs + ~18 sparks + ~40 embers all
- *       at once.  The interval is randomised per occurrence, so the
- *       pacing is unpredictable.  Adds drama to even the quietest
- *       patterns.
- *
- *       Themes (cycle with t / T):
- *         DAY       blue sky, mountain silhouette, orange lava
- *         DUSK      sunset orange/pink sky, dramatic dark silhouette
- *         NIGHT     dark sky, bright white-hot lava (most dramatic)
- *         MARS      red planet — pink sky, rust mountain, white-hot lava
- *         ASHFALL   grey muted everything, heavy ash dominance
- *         MONO      monochrome white / light-grey (silhouette study)
- *
- * Section map (re-cut into concern-separated layers — see ARCHITECTURE):
- *   §1 CONFIG       — constants, enums, theme + pattern tables, glyph ramps
- *   §2 LOGIC        — pure math, RNG, fBm noise (no mutation, no I/O)
- *   §3 PERFORMANCE  — monotonic clock + sleep (frame cap lives in §8 main)
- *   §4 RENDER-SETUP — colour-pair / theme palette configuration
- *   §5 SIMULATION   — mountain build + particle pool/physics + scene_tick
- *   §6 RENDER       — state→screen draws (sky/mtn/lava/plume/particles)
- *   §7 EVENTS       — init / resize / reset (mutate state OUTSIDE the tick)
- *   §8 SCREEN + APP — ncurses I/O, HUD, input, main loop + frame cap
- *
- * Keys:
- *   q / ESC      quit
- *   space        pause / resume eruption
- *   r            reseed mountain shape + clear particles
- *   n / N        next / previous eruption pattern
- *   t / T        next / previous theme
- *   + / =        eruption intensity up
- *   -            eruption intensity down
- *   ] / [        sim Hz up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/volcano.c \
- *       -o volcano -lncurses -lm
+ * volcano.c — an erupting volcano built from five layered passes (sky,
+ * mountain, lava flows, smoke plume, particles) over one shared pool of
+ * 1024 particles.  Cycle eruption styles with n/N and colour themes with
+ * t/T.  The eruption styles are named after the real volcanological
+ * taxonomy: Strombolian, Vulcanian, Plinian, Hawaiian (Pyle, 2015).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Five-layer composition with a shared particle pool.
- *                  Each frame, in back-to-front order:
- *
- *                    1. SKY: vertical gradient over the visible region,
- *                       theme-tinted (deep blue → cyan → pale near
- *                       horizon, or sunset / night / mars equivalents).
- *
- *                    2. MOUNTAIN: heightmap silhouette painted as a
- *                       solid-coloured shape from `silhouette_y(col)`
- *                       down to the bottom row.  The silhouette is
- *                       generated once at startup from a parametric
- *                       cone profile + 1-D fBm noise on the surface.
- *                       Crater is a small dip near the peak.
- *
- *                    3. LAVA FLOWS: a few streamlines traced down the
- *                       outer slopes from the crater rim.  Each cell
- *                       on a flow is painted hot (orange/yellow) with
- *                       gentle rate-of-temperature falloff with
- *                       distance from the crater.
- *
- *                    4. PLUME: a column of fBm noise above the crater.
- *                       Cells where the density is above threshold
- *                       paint as ash glyph in plume colour; the column
- *                       drifts in the +x direction (wind), so each
- *                       frame the texture shifts as a coherent flow.
- *
- *                    5. PARTICLES: one pool of 1024 slots, four types
- *                       sharing one struct:
- *                         BOMB   — launched from crater with random
- *                                  ballistic velocity, gravity pulls
- *                                  it down, stores a 4-tail trail.
- *                         EMBER  — spawned in the plume column with
- *                                  upward drift + lateral noise; cools
- *                                  with age.
- *                         ASH    — like ember but slower, larger lateral
- *                                  drift, fades to grey.
- *                         SPARK  — fast small particles near crater rim,
- *                                  short lifetime, very bright.
- *
- *                  Pattern selection (`n`/`N`) varies the SPAWN RATES
- *                  per type and the burst behaviour (e.g. VULCANIAN
- *                  occasionally dumps 60 bombs at once).
- *
- *                  Theme selection (`t`/`T`) re-applies the colour
- *                  palette (sky + mountain + lava ramp) without
- *                  rebuilding any geometry.
- *
- * Data-structure : One `Scene` aggregate owns everything: a `Mountain`
- *                  (silhouette_y[cols] heightfield + crater + lava-flow
- *                  paths) and `ejecta[1024]`, a pool of `Particle`s (type
- *                  tag, position, velocity, age, life, temperature).  Held
- *                  in BSS via the global App, no malloc.  The ejecta pool
- *                  dominates memory: 1024 × ~80 bytes ≈ 80 KB.
- *
- * Rendering      : ASCII only.  Heat ramp `' .,:;-+*#@'` for hot
- *                  particles; sky gradient via cell-row indexing; ash
- *                  uses sparse glyphs (`,` `.` `:`); mountain silhouette
- *                  uses block-like chars (`@` `#`).
- *
- * Performance    : Per frame: 1024 particle ticks (each ~12 ops) +
- *                  cols·rows sky fill + plume fBm sample at each
- *                  visible plume cell + a few hundred lava-flow cells.
- *                  At 80×24 ≈ 30 K ops per frame, trivially 60 fps.
- *
- * References     :
- *   Particle systems (§5 bombs / embers / ash / sparks)
- *     [1] Reeves, "Particle Systems: A Technique for Modelling a Class of Fuzzy
- *         Objects," ACM TOG 2(2) (1983) — the pool + active-flag pattern used
- *         here, and the emit / age / cool / recycle lifecycle.
- *     [2] Witkin & Heckbert, "Using Particles to Sample and Control Implicit
- *         Surfaces," SIGGRAPH (1994) — the layered-particle-system approach.
- *   Procedural noise — plume + mountain surface (§1/§4 fBm)
- *     [3] Mandelbrot, "The Fractal Geometry of Nature" (1982), §28 — the
- *         self-similar (fractal) basis of the multi-octave noise.
- *     [4] Perlin, "An Image Synthesizer," SIGGRAPH (1985) — gradient noise; the
- *         octave sums (fBm) that texture the plume and the silhouette.
- *     [5] Ebert, Musgrave, Peachey, Perlin & Worley, "Texturing & Modeling: A
- *         Procedural Approach" (2003) — fBm recipes for clouds/plumes and for
- *         terrain heightfields (the mountain profile).
- *   Volcanology (§1 eruption patterns)
- *     [6] Pyle, "Volcanoes: Encyclopedia of Earth's Living Systems" (2015) —
- *         eruption-style taxonomy (Strombolian / Vulcanian / Plinian /
- *         Hawaiian) and ejecta classification driving the spawn patterns.
- *   ASCII / terminal rendering (§3 colour, §6 render)
- *     [7] Bourke, "Character representation of grey scale images" (1997) — the
- *         heat / density → glyph ramp (' .,:;-+*#@').
- *     [8] Padala, "NCURSES Programming HOWTO" (TLDP) — colour pairs and the
- *         erase → draw → refresh frame model.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A volcano demo is FIVE separate things layered on top of each other:
- * sky behind, mountain shape, hot lava streams down slopes, smoke plume
- * rising up, particles flying everywhere.  Treat each as its own pass
- * with its own simple rules; let them composite.  No one master loop
- * tries to do "the eruption" — each layer just does its piece, and the
- * pile of layers IS the eruption.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine you're painting an erupting volcano.  You start with a sky
- * background, paint the mountain silhouette over it, drag bright lines
- * of orange down the slopes for lava flows, smudge a column of grey
- * smoke above the peak, then dot in dozens of bright orange specks
- * (bombs) following arcs across the sky and tiny embers drifting up
- * through the smoke.  Each step is simple; together they're an
- * eruption.  That's exactly the rendering pipeline.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. STARTUP — generate `silhouette_y[cols]`:
- *
- *       For each column x:
- *           cone_y = peak_y + |x − crater_x| · slope
- *           noise  = fbm_1d(x · scale, seed) · amp
- *           silhouette_y[x] = cone_y + noise
- *
- *     Crater is a small dip in `silhouette_y` around `crater_x`.
- *
- *  2. PER FRAME, IN ORDER:
- *
- *       a. Erase screen.
- *
- *       b. Sky fill:
- *          for each (row, col):
- *              if row < silhouette_y[col]:
- *                  sky_slot = (row * 4) / silhouette_y[col]
- *                  paint with theme.sky[sky_slot]
- *
- *       c. Mountain fill:
- *          for each col:
- *              y_top = silhouette_y[col]
- *              for row = y_top to rows-1:
- *                  paint with theme.mountain (with surface noise
- *                  modulating brightness)
- *
- *       d. Lava flows (HAWAIIAN + sometimes others):
- *          For each pre-traced flow path { (x, y) }:
- *              paint with theme.lava ramp by distance-from-crater
- *
- *       e. Plume column:
- *          For each (row, col) above silhouette_y[col]:
- *              x_w = (col − crater_x) − wind · time
- *              y_w = (silhouette_y[crater_x] − row)
- *              if (within plume cone)
- *                  density = fbm2d(x_w · s, y_w · s + time · drift)
- *                  density *= cone_falloff(x_w, y_w)
- *                  if density > threshold:
- *                      paint plume glyph + theme.plume colour
- *
- *       f. Particles:
- *          For each active particle:
- *              update_physics(p, dt)
- *              project to screen, paint glyph + colour
- *              draw bomb trails as fading dots
- *
- *       g. HUD on bottom row.
- *
- *  3. SPAWN RULES (per pattern):
- *
- *       BOMBS:    rate scales with intensity; angle uniform around
- *                 vertical-up; speed gives apex 0.5-0.8 of screen height.
- *       EMBERS:   spawned in a small disc around crater; upward bias.
- *       ASH:      higher up the plume column; slow horizontal drift.
- *       SPARKS:   crater rim; fast outward jets.
- *
- *       VULCANIAN: every 4-6 sec, dump 60-80 BOMBS in one frame for a
- *                  violent burst.
- *
- *  4. PARTICLE PHYSICS (per type):
- *
- *       BOMB:   v.y += GRAVITY · dt  ; v *= drag  ; pos += v · dt
- *               temp -= cooling · dt ; trail.shift_in(pos)
- *       EMBER:  v.y −= BUOYANCY · dt ; v.x += wind · dt + jitter
- *               temp -= cooling · dt
- *       ASH:    v.y −= small_buoy · dt ; v.x += wind · 0.6 · dt
- *               (cools to grey faster than ember)
- *       SPARK:  fast initial speed; fast cooling; lifetime <1s
- *
- *  5. CYCLE: n/N → swap pattern (different spawn rates).  t/T → swap
- *     theme (re-apply colour pairs).  r → reseed mountain + clear
- *     particles.  +/− → intensity up/down.  Pause freezes physics.
- *
- * KEY FORMULAS
- * ────────────
- *  Stratovolcano cone (parametric):
- *    silhouette_y(x) = peak_y + |x − crater_x| · slope + fbm_1d(x · s)·amp
- *
- *  Crater dip (small bowl at the summit):
- *    if |x − crater_x| < crater_radius:
- *        silhouette_y(x) += crater_depth · cos(π · (x − crater_x) / crater_radius)
- *
- *  Bomb ballistic arc:
- *    v_y(t) = v_y(0) + g · t                 // g positive (screen y down)
- *    y(t)   = y(0) + v_y(0) · t + ½ g t²
- *
- *  Plume cone-falloff (so the plume doesn't extend forever sideways):
- *    cone_falloff(dx, dy) = exp(−(dx²/(spread·dy + base)²))
- *
- *  Aspect correction (any 2-D shape that should look round in pixels):
- *    dy_pixels = dy_cells · CELL_ASPECT
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE (layer separation) ─────────────────────────────────── *
- *
- * This file was re-cut into concern-separated layers.  Each function's
- * read/mutate role is FIXED by the layer it lives in:
- *
- *   LAYER          SECTION    MUTATES                        I/O
- *   ──────────────────────────────────────────────────────────────────────
- *   LOGIC          §2         nothing global (lcg_* advance   none
- *                             the *uint32_t handed to them)
- *   PERFORMANCE    §3, §8     nothing (clock_sleep_ns sleeps; reads clock,
- *                             main owns dt-cap/fps/frame-cap)  sleeps
- *   RENDER-SETUP   §4         ncurses colour pairs            init_pair
- *   SIMULATION     §5         scene.ejecta, scene.mountain,    none
- *                             Scene time / accum / burst timers
- *   RENDER         §6         nothing — reads scene.mountain,  ncurses out
- *                             scene.ejecta via narrow pointers
- *   EVENTS         §7, §8     scene.ejecta, scene.mountain,    ncurses
- *                             Scene, Screen, App — OUTSIDE tick init/resize
- *
- * LOGIC (§2) is provably uncorruptable from RENDER/EFFECTS: it touches no
- * global state and does no I/O, so reordering or deleting any draw cannot
- * change a noise / clamp / count result.  RENDER (§6) is read-only w.r.t.
- * simulation state — it can be re-run or skipped without altering physics.
- *
- * PER-TICK COMBINE — scene_tick() (§5) is the ONE place that advances
- * simulation, in this fixed named order:
- *     1. GUARD      if paused → return (nothing advances)
- *     2. TIME       s->time += dt
- *     3. SPAWN      accumulators += rate·dt·intensity; drain → spawn
- *                   bomb / ember / ash / spark
- *     4. BURST/VULC VULCANIAN burst timer → 55-bomb dump (pattern-gated)
- *     5. BURST/AMB  AMBIENT burst timer  → bomb+spark+ember dump (all pats)
- *     6. PHYSICS    particles_tick(dt) → integrate + cool + die + trail
- * Nothing outside scene_tick advances simulation state.
- *
- * USER EVENTS are NOT ticks.  scene_init / scene_resize / scene_reset (§7)
- * and app_do_resize / app_handle_key (§8) may mutate scene.ejecta,
- * scene.mountain, Scene, Screen and App — rebuild the world, toggle pause,
- * switch pattern/theme,
- * change intensity/Hz — but they run from the input / resize path, never
- * from scene_tick.
- *
- * EFFECTS — no dedicated layer.  The only cosmetic-only STORED state is the
- * bomb trail (tx/ty/trail_n), and it is shifted inside the bomb branch of
- * particles_tick (§5) as part of that particle's own physics step.  Every
- * other flourish — crater-glow pulse, sky/plume dimming, ember/bomb
- * brightness — is DERIVED at render time from `time` / `temp`, not stored,
- * so there is nothing to separate out.
- *
- * DELAYS — no dedicated layer.  `paused` is a one-line gate at the top of
- * scene_tick (§5); the eruption-burst timers (next_burst_at /
- * next_ambient_at) are simulation timers living inside the tick.  The only
- * real wall-clock hold is clock_sleep_ns (§3), driven by the frame cap in
- * main (§8) — it belongs to PERFORMANCE.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -348,9 +23,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  CONFIG — constants, enums, theme + pattern tables, glyph ramps     */
-/* ===================================================================== */
+/* ── §1 CONFIG — constants, enums, theme + pattern tables, glyph ramps ── */
 
 enum {
     SIM_FPS_MIN      =  10,
@@ -468,20 +141,15 @@ enum {
 #define AMBIENT_BURST_BOOST  1.1f
 
 /*
- * Pattern — the four eruption styles the demo cycles through (n/N), used as
- * an index into patterns[].  The names are the standard volcanological
- * eruption-style taxonomy (ref [6]); each implies a characteristic ejecta
- * mix, which the matching EruptionPattern row encodes as spawn rates:
- *   PAT_STROMBOLIAN — frequent moderate bursts of incandescent bombs; the
- *                     "rhythmic" baseline, ember-heavy.
- *   PAT_VULCANIAN   — short violent explosions: a low steady rate punctuated
- *                     by periodic 55-bomb dumps (the vulcanian_bursts flag).
- *   PAT_PLINIAN     — sustained towering ash column: heavy ash + ember, the
- *                     tallest/densest plume (plume_intensity 1.8).
- *   PAT_HAWAIIAN    — fluid lava fountaining: high bomb/spark rate, bright
- *                     slope flows, little ash.
- * N_PATTERNS is the count sentinel — keep it last so the wrap
- * `(cur + 1) % N_PATTERNS` and the patterns[] table size stay in sync.
+ * Pattern — which of the four eruption styles is active (n/N cycles
+ * through them).  Each value indexes the patterns[] table below; the names
+ * are real volcano types (Pyle, 2015), each with its own feel:
+ *   PAT_STROMBOLIAN — steady rhythmic bursts; lots of glowing embers.
+ *   PAT_VULCANIAN   — quiet most of the time, then a sudden violent volley.
+ *   PAT_PLINIAN     — one huge towering ash column, very heavy plume.
+ *   PAT_HAWAIIAN    — a bright lava fountain with rivers down the slopes.
+ * N_PATTERNS is the count, kept last so the "wrap to next style" math and
+ * the patterns[] table size stay in sync.
  */
 typedef enum {
     PAT_STROMBOLIAN = 0,
@@ -492,23 +160,21 @@ typedef enum {
 } Pattern;
 
 /*
- * EruptionPattern — one immutable row of the eruption-style table
- * (patterns[]), one per Pattern.  This is the data-driven heart of the
- * demo: switching style (n/N) only swaps WHICH row scene_tick reads —
- * there is no per-style branching in the physics, so a new style is just a
- * new row.  Each style (ref [6]) is reduced to four Poisson spawn rates
- * plus two cosmetic weights and one burst flag; the numbers in patterns[]
- * are tuned so the four read as visually distinct (see Pattern).
+ * EruptionPattern — one row of the patterns[] table, one row per style.
+ * This is what makes a style a style: the physics never branches on which
+ * style is active, it just reads these numbers, so adding a new style means
+ * adding a new row, not new code.  Each row is basically "how often does
+ * each kind of particle appear, and how does the plume and lava look".
  */
 typedef struct {
-    const char *name;          /* HUD label, space-padded to a fixed width        */
-    float bomb_per_sec;        /* mean ballistic-bomb spawns/sec (Poisson rate)   */
-    float ember_per_sec;       /* mean ember spawns/sec (rising glow specks)      */
-    float ash_per_sec;         /* mean ash spawns/sec (slow grey drift)           */
-    float spark_per_sec;       /* mean spark spawns/sec (fast crater-rim jets)    */
-    float plume_intensity;     /* scales fBm plume density: 0.6 wispy → 1.8 towering */
-    bool  vulcanian_bursts;    /* true → also dump VULCAN_BURST_BOMBS every few sec  */
-    float lava_flow_amount;    /* 0..1 render brightness of the pre-traced slope flows */
+    const char *name;          /* label shown in the HUD, padded to fixed width  */
+    float bomb_per_sec;        /* average lava bombs launched per second         */
+    float ember_per_sec;       /* average rising glowing embers per second       */
+    float ash_per_sec;         /* average slow grey ash specks per second        */
+    float spark_per_sec;       /* average fast crater-rim sparks per second      */
+    float plume_intensity;     /* smoke-column density: ~0.6 wispy to ~1.8 towering */
+    bool  vulcanian_bursts;    /* if true, also fire a big bomb volley every few sec */
+    float lava_flow_amount;    /* 0..1 how bright the rivers down the slopes glow */
 } EruptionPattern;
 
 static const EruptionPattern patterns[N_PATTERNS] = {
@@ -528,14 +194,10 @@ static const EruptionPattern patterns[N_PATTERNS] = {
 #define VULCAN_BURST_BOMBS         55
 
 /*
- * AMBIENT BURST — a random-frequency dramatic eruption that fires for
- * EVERY pattern (not just VULCANIAN).  Wide interval distribution so
- * sometimes you get 8 sec of calm and sometimes 25 sec — keeps the
- * timing unpredictable, which is the point of "occasional drama".
- *
- * Particle count is moderate (smaller than VULCANIAN's 55-bomb dump)
- * so that VULCANIAN bursts still feel distinctly violent compared
- * with the universal ambient ones.
+ * Ambient burst — an occasional dramatic surge that fires no matter which
+ * style is active.  The gap between surges is random and wide (8 to 22 sec)
+ * so the timing stays unpredictable.  Its bomb count is deliberately kept
+ * below the Vulcanian volley so a true Vulcanian burst still feels bigger.
  */
 #define AMBIENT_BURST_INTERVAL_MIN  8.0f
 #define AMBIENT_BURST_INTERVAL_MAX 22.0f
@@ -558,22 +220,22 @@ static const EruptionPattern patterns[N_PATTERNS] = {
 #define DT_CAP_MS         100
 
 /*
- * Theme — a complete colour palette for the scene, swapped live with t/T by
- * re-running init_pair (ref [8]); no geometry rebuilds.  Each field is an
- * ORDERED gradient of xterm-256 colour indices that the renderer addresses
- * by a normalised quantity — sky by screen row, lava by particle temp,
- * plume by fBm density — so an array position MEANS "how high / how hot /
- * how dense", it is not an arbitrary slot.  Every index sits in the bright
- * half of the cube so even the darkest tier stays legible against the
- * default background under A_DIM (project palette-brightness rule).
+ * Theme — one complete colour scheme, swapped live with t/T (it only
+ * re-assigns the terminal colour pairs; no geometry is rebuilt).  Each
+ * array is an ordered colour ramp, dark end first.  The renderer picks a
+ * slot by a meaningful 0..1 amount — sky by how high the row is, lava by
+ * how hot the particle is, plume by how dense the smoke is — so position in
+ * the array means something, it's not arbitrary.  All colours sit in the
+ * bright half of the xterm-256 cube so even the darkest tier stays visible
+ * against the terminal background (project palette-brightness rule).
  */
 typedef struct {
-    const char *name;          /* HUD label, space-padded                       */
-    short       sky[4];        /* vertical gradient: [0]=zenith → [3]=horizon    */
-    short       mountain[3];   /* edifice shading: [0]=shadow [1]=mid [2]=lit    */
-    short       lava[6];       /* heat ramp: [0]=cooled/dim → [5]=white-hot      */
-    short       plume[4];      /* smoke ramp: [0]=dense core → [3]=wispy edge    */
-    bool        inverted;      /* true → "paper" study: dark ink on a white fill */
+    const char *name;          /* label shown in the HUD, padded to fixed width */
+    short       sky[4];        /* sky gradient, top of screen to horizon        */
+    short       mountain[3];   /* mountain shading: shadow, mid, lit            */
+    short       lava[6];       /* heat ramp: cooled/dim up to white-hot         */
+    short       plume[4];      /* smoke ramp: dense core out to wispy edge      */
+    bool        inverted;      /* true = dark ink on a white "paper" background */
 } Theme;
 
 #define N_THEMES 6
@@ -635,20 +297,7 @@ static const char SPARK_GLYPHS[3]  = { '.', '*', '#' };
 static const char MTN_GLYPH        = '#';
 static const char MTN_RIDGE_GLYPH  = '@';   /* topmost mountain pixel  */
 
-/* ===================================================================== */
-/* §2  LOGIC — pure math, RNG, fBm noise                                  */
-/*                                                                        */
-/* Pure: these functions mutate no global program state and do no I/O.    */
-/* The lcg_* helpers advance the uint32_t handed to them by pointer —     */
-/* that is the caller's RNG cursor, not hidden state — so their result    */
-/* is fully determined by their inputs.  Nothing in RENDER or EFFECTS     */
-/* can corrupt a noise / clamp / count value here.                        */
-/* ===================================================================== */
-
-/* V2 — a 2-D vector (x, y).  Vestigial: declared for pixel-space helpers
- * but currently UNUSED — particles store x/y/vx/vy as loose floats instead.
- * Kept only because removing it is out of scope for a docs pass. */
-typedef struct { float x, y; } V2;
+/* ── §2 LOGIC — pure math, RNG, fBm noise ── */
 
 /* Clamp v into [lo, hi]: below lo → lo, above hi → hi, else unchanged. */
 static inline float clampf(float v, float lo, float hi)
@@ -656,9 +305,9 @@ static inline float clampf(float v, float lo, float hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/* Quantise a normalised value t01∈[0,1] to a ramp index in [0, n_slots-1].
- * The -0.001 nudge keeps t01==1.0 from overflowing to n_slots; used to map
- * heat / density / brightness onto a glyph-or-colour ramp. */
+/* Turn a 0..1 amount into a ramp slot 0..n_slots-1.  The tiny -0.001 keeps
+ * an input of exactly 1.0 from landing one slot past the end.  Used to map
+ * heat / density / brightness onto a glyph or colour ramp. */
 static inline int unit_to_slot(float t01, int n_slots)
 {
     int s = (int)(t01 * ((float)n_slots - 0.001f));
@@ -668,11 +317,10 @@ static inline int unit_to_slot(float t01, int n_slots)
 }
 
 /*
- * lcg_next — one step of a linear congruential generator: st = a·st + c
- * (mod 2^32, the modulo happening for free as uint32 overflow).  The
- * constants are the classic Numerical Recipes pair — a = 1664525 (the
- * multiplier) and c = 1013904223 (the increment) — chosen together to give
- * a full period of 2^32 before the sequence repeats.
+ * lcg_next — one step of a simple random-number generator: multiply the
+ * current state by a constant, add another, and let it wrap around at 32
+ * bits.  These two constants are the well-known Numerical Recipes pair,
+ * picked so the sequence runs through all 2^32 values before repeating.
  */
 static inline uint32_t lcg_next(uint32_t *st)
 {
@@ -681,17 +329,16 @@ static inline uint32_t lcg_next(uint32_t *st)
 }
 
 /*
- * lcg_unit — next random float in [0, 1).  An LCG's LOW bits are poor
- * quality (the lowest bit just toggles), so we drop the bottom 8 (>> 8) and
- * keep the high 24 bits, then divide by 2^24 (1u << 24 = 16777216) to map
- * that 24-bit integer in [0, 2^24) onto [0, 1).
+ * lcg_unit — next random float in [0, 1).  This kind of generator has weak
+ * low bits (the bottom bit just flips back and forth), so we throw the
+ * bottom 8 away, keep the top 24, and scale that down into [0, 1).
  */
 static inline float lcg_unit(uint32_t *st)
 {
     return (float)(lcg_next(st) >> 8) / (float)(1u << 24);
 }
 
-/* lcg_range — uniform random float in [lo, hi): just rescale a [0,1) unit. */
+/* lcg_range — random float somewhere in [lo, hi). */
 static inline float lcg_range(uint32_t *st, float lo, float hi)
 {
     return lo + (hi - lo) * lcg_unit(st);
@@ -700,15 +347,12 @@ static inline float lcg_range(uint32_t *st, float lo, float hi)
 static uint32_t g_rng = 0xCAFEBABEu;
 
 /*
- * hash2d — deterministic 32-bit hash of an integer lattice point (x,z) plus
- * a seed.  Each input is multiplied by a distinct large odd prime so they
- * scatter to different parts of the word before being summed — 374761393
- * and 668265263 are well-known spatial-hash primes, and 2147483647 (the
- * Mersenne prime 2^31-1) decorrelates the seed.  The last two lines are an
- * xorshift-multiply "finalizer" (xor a high-bit-shifted copy, multiply by
- * the mixing prime 1274126177, xor again) that avalanches the bits so two
- * adjacent cells give completely unrelated outputs.  Shifts 13 and 16 are
- * the standard mixing amounts for a 32-bit word.
+ * hash2d — turn a grid point (x,z) and a seed into a scrambled 32-bit
+ * number that is the same every time for the same inputs.  Each input is
+ * multiplied by its own big odd constant so they land in different parts of
+ * the number, then the last two lines stir the bits hard so that two
+ * neighbouring cells come out looking totally unrelated.  This is what lets
+ * the noise below look random while still being repeatable.
  */
 static inline uint32_t hash2d(int x, int z, uint32_t seed)
 {
@@ -719,29 +363,26 @@ static inline uint32_t hash2d(int x, int z, uint32_t seed)
     return h ^ (h >> 16);
 }
 
-/* hash_unit — hash2d normalised to [0,1): drop the weak low 8 bits, keep
- * the high 24, divide by 2^24 (same recipe as lcg_unit). */
+/* hash_unit — hash2d squeezed into [0,1), same bit trick as lcg_unit. */
 static inline float hash_unit(int x, int z, uint32_t seed)
 {
     return (float)(hash2d(x, z, seed) >> 8) / (float)(1u << 24);
 }
 
 /*
- * smoothstep01 — the Hermite ease curve S(t) = 3t² - 2t³ = t²(3 - 2t),
- * mapping [0,1]→[0,1].  The constants 3 and 2 are not free: they are the
- * unique cubic with S(0)=0, S(1)=1 AND zero slope at both ends (S'(0)=
- * S'(1)=0), which is what removes the visible creases at lattice
- * boundaries when it eases the noise interpolation weights below.
+ * smoothstep01 — an ease curve that maps 0..1 to 0..1 but flattens out at
+ * both ends instead of running in a straight line.  Used to soften how the
+ * noise below blends between cells, which hides the grid-like creases a
+ * plain straight blend would leave behind.
  */
 static inline float smoothstep01(float t) { return t * t * (3.0f - 2.0f * t); }
 
 /*
- * vnoise2d — value noise in [0,1].  Split the point into its integer cell
- * (xi,zi) and fractional offset (fx,fz)∈[0,1).  Hash the four cell corners
- * (xi+0/1, zi+0/1) to random corner values, then bilinearly blend them —
- * but using smoothstep01-eased weights (sx,sz) instead of raw fx,fz, so the
- * field is smooth across cell boundaries.  a/b interpolate the bottom/top
- * edges in x; the final line interpolates those two in z.
+ * vnoise2d — smooth random-looking value in [0,1] for any point.  The idea:
+ * lay an invisible grid over the plane, give each grid corner a random
+ * value, then for a point inside a cell, blend its four corner values
+ * together.  The blend uses the eased smoothstep weights so the result
+ * flows smoothly from one cell to the next instead of showing seams.
  */
 static float vnoise2d(float x, float z, uint32_t seed)
 {
@@ -759,14 +400,12 @@ static float vnoise2d(float x, float z, uint32_t seed)
 }
 
 /*
- * fbm2d — fractional Brownian motion: sum several octaves of value noise to
- * get detail at multiple scales (refs [3][4]).  Per octave: freq *= 2.0
- * (lacunarity — each octave is twice as fine) and amp *= 0.5 (gain /
- * persistence — and contributes half as much).  3 octaves is plenty for a
- * terminal-resolution field.  `norm` sums the amplitudes (1 + 0.5 + 0.25)
- * so the final h/norm stays in [0,1] regardless of octave count.  The
- * `seed + i*17` gives each octave its OWN hash field (17 is just an
- * arbitrary odd offset) so the layers don't line up and reinforce.
+ * fbm2d — layered noise that adds detail at several sizes at once, the way
+ * real clouds and rock have both big shapes and fine texture.  It sums a
+ * few passes of the noise above: each pass is twice as fine and counts half
+ * as much as the one before.  Three passes is plenty here.  Each pass uses
+ * a different seed so the layers don't line up and reinforce, and the final
+ * divide keeps the result in 0..1.  (Mandelbrot 1982; Perlin 1985.)
  */
 static float fbm2d(float x, float z, uint32_t seed)
 {
@@ -780,19 +419,13 @@ static float fbm2d(float x, float z, uint32_t seed)
     return h / norm;
 }
 
-/* 1-D fBm for the mountain surface (just the y=0 slice). */
+/* fbm1d — 1-D version of the noise above, for the mountain's surface. */
 static float fbm1d(float x, uint32_t seed)
 {
     return fbm2d(x, 0.0f, seed);
 }
 
-/* ===================================================================== */
-/* §3  PERFORMANCE — monotonic clock + sleep                              */
-/*                                                                        */
-/* Timing primitives only.  clock_ns reads the OS clock; clock_sleep_ns   */
-/* is the program's single wall-clock hold (the per-frame cap).  The      */
-/* fixed-frame-cap arithmetic that USES these lives in main() (§8).       */
-/* ===================================================================== */
+/* ── §3 PERFORMANCE — monotonic clock + sleep ── */
 
 static int64_t clock_ns(void)
 {
@@ -811,14 +444,11 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §4  RENDER-SETUP — colour-pair / theme palette configuration           */
-/*                                                                        */
-/* The only state these mutate is the ncurses colour table (init_pair).   */
-/* Called from screen_init (startup) and the t/T key (EVENTS) — never     */
-/* from the tick.                                                         */
-/* ===================================================================== */
+/* ── §4 RENDER-SETUP — colour-pair / theme palette configuration ── */
 
+/* Load one theme's colours into the terminal's colour-pair table.  Called
+ * at startup and whenever t/T switches themes.  Falls back to basic 8
+ * colours when the terminal can't do 256. */
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -868,55 +498,40 @@ static void color_init(void)
     theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §5  SIMULATION — state + advance                                       */
-/*                                                                        */
-/* This layer owns every piece of mutable simulation state, all now        */
-/* members of Scene (no file-scope globals):                               */
-/*   • scene.mountain (Mountain)      — built by mountain_build (events)   */
-/*   • scene.ejecta   (Particle pool) — spawned / advanced / recycled here */
-/*   • Scene time / accumulators / burst timers — advanced by scene_tick   */
-/* scene_tick() is the ONE per-tick combiner (combine order documented     */
-/* in the ARCHITECTURE block).  mountain_build runs only from EVENTS       */
-/* (§7), not the tick.  The bomb-trail shift inside particles_tick is the  */
-/* sole cosmetic-only stored state — see the EFFECTS note in ARCHITECTURE. */
-/* ===================================================================== */
+/* ── §5 SIMULATION — state + advance ── */
 
 /* --- mountain: heightmap silhouette + crater + lava-flow streams ------ */
 
 /*
- * Mountain — the static volcanic edifice, generated once per seed by
- * mountain_build and then only READ each frame.  Because the view is a
- * side-on silhouette, the terrain needs just a 1-D HEIGHT FIELD, not a 2-D
- * grid: silhouette_y[col] is the screen row where rock starts in that
- * column, so the whole shape is one row-per-column array.  The profile is a
- * parametric cone (peak + |dx|·slope) textured with 1-D fBm so the surface
- * reads as eroded rock rather than a perfect triangle (Perlin gradient
- * noise summed over octaves, refs [4][5]); a cosine bowl carves the crater.
+ * Mountain — the volcano's fixed shape, built once per seed and only read
+ * after that.  Since we view it from the side, we only need to know, for
+ * each screen column, the top row where rock starts — that one number per
+ * column (silhouette_y) IS the whole outline.  The shape is a cone with
+ * fractal noise roughening its surface so it looks like eroded rock, and a
+ * small bowl carved at the top for the crater.
  *
- * Lava flows are STREAMLINES traced once down each slope from the crater
- * rim and cached as parallel (x,y) arrays.  They are stored, not recomputed,
- * because the terrain is immutable — the renderer just re-colours the cached
- * cells with a distance-from-crater falloff each frame.
+ * The two lava flows are traced once down the slopes and stored as their
+ * cells, not recomputed each frame, because the terrain never changes — the
+ * renderer just recolours those cells every frame.
  */
 typedef struct {
-    int   silhouette_y[MTN_MAX_W]; /* HEIGHT FIELD: top rock-row per column (smaller y = taller) */
-    int   crater_x;                /* column of the summit crater centre               */
-    int   crater_y;                /* row of the crater floor — the particle spawn point */
-    /* Pre-traced lava-flow streamlines: parallel arrays of (col,row) cells
-     * walked outward from the crater; flow_*_n is how many cells were laid. */
-    int   flow_l_x[MTN_MAX_W];     /* left-slope flow: column of cell i                */
-    int   flow_l_y[MTN_MAX_W];     /* left-slope flow: row of cell i                   */
-    int   flow_l_n;                /* number of cells in the left flow                 */
-    int   flow_r_x[MTN_MAX_W];     /* right-slope flow: column of cell i               */
-    int   flow_r_y[MTN_MAX_W];     /* right-slope flow: row of cell i                  */
-    int   flow_r_n;                /* number of cells in the right flow                */
+    int   silhouette_y[MTN_MAX_W]; /* top rock row in each column (smaller = taller) */
+    int   crater_x;                /* column of the crater centre                    */
+    int   crater_y;                /* row of the crater floor; particles spawn here  */
+    /* The two lava flows as lists of cells walked out from the crater.
+     * flow_*_n is how many cells each list actually holds. */
+    int   flow_l_x[MTN_MAX_W];     /* left flow: column of each cell                 */
+    int   flow_l_y[MTN_MAX_W];     /* left flow: row of each cell                    */
+    int   flow_l_n;                /* number of cells in the left flow              */
+    int   flow_r_x[MTN_MAX_W];     /* right flow: column of each cell                */
+    int   flow_r_y[MTN_MAX_W];     /* right flow: row of each cell                   */
+    int   flow_r_n;                /* number of cells in the right flow             */
 } Mountain;
 
 /*
- * pick_crater_column — choose the vent column: screen-centred, jittered up
- * to ±CRATER_X_JITTER of the width, then clamped to the middle half so the
- * full cone always fits on screen.  Advances *seed (the build RNG cursor).
+ * pick_crater_column — choose which column the crater sits in: near the
+ * middle, nudged left or right at random, but kept in the middle half so
+ * the whole cone still fits on screen.
  */
 static int pick_crater_column(int cols, uint32_t *seed)
 {
@@ -928,9 +543,9 @@ static int pick_crater_column(int cols, uint32_t *seed)
 }
 
 /*
- * build_cone_silhouette — lay the base height field: a parametric cone
- * (peak + |dx|·slope) plus 1-D fBm surface noise, clamped to the screen
- * (refs [4][5]).  Writes silhouette_y[0..cols).
+ * build_cone_silhouette — fill in the basic mountain outline: a triangle
+ * that rises toward the crater, with fractal noise added so the slopes look
+ * rough instead of perfectly straight.
  */
 static void build_cone_silhouette(Mountain *m, int cols, int rows,
                                   int crater_x, int peak_y, uint32_t seed)
@@ -947,8 +562,8 @@ static void build_cone_silhouette(Mountain *m, int cols, int rows,
 }
 
 /*
- * carve_crater — deepen a cosine bowl of radius CRATER_RADIUS at the summit,
- * so the vent reads as a dip rather than a sharp peak.
+ * carve_crater — scoop a small rounded bowl out of the summit so the top
+ * reads as a crater dip instead of a sharp point.
  */
 static void carve_crater(Mountain *m, int cols, int rows, int crater_x)
 {
@@ -964,9 +579,9 @@ static void carve_crater(Mountain *m, int cols, int rows, int crater_x)
 }
 
 /*
- * trace_lava_flow — walk a streamline outward from the crater rim in
- * direction `dir` (-1 left, +1 right), laying one cell per column just below
- * the surface, up to max_len cells.  Writes into xs/ys; returns the count.
+ * trace_lava_flow — walk one lava river out from the crater rim, going left
+ * (dir -1) or right (dir +1), dropping one cell per column just under the
+ * surface.  Fills xs/ys and returns how many cells it laid.
  */
 static int trace_lava_flow(const Mountain *m, int cols, int crater_x, int dir,
                            int max_len, int *xs, int *ys)
@@ -983,9 +598,9 @@ static int trace_lava_flow(const Mountain *m, int cols, int crater_x, int dir,
 }
 
 /*
- * mountain_build — generate the static edifice in four steps: choose the
- * vent, lay the cone+fBm silhouette, carve the crater bowl, then pre-trace a
- * lava-flow streamline down each slope.  Reads top-to-bottom as that recipe.
+ * mountain_build — build the whole mountain in four steps: pick the crater
+ * column, draw the rough cone outline, carve the crater bowl, then trace a
+ * lava river down each slope.
  */
 static void mountain_build(Mountain *m, int cols, int rows, uint32_t seed)
 {
@@ -1000,7 +615,7 @@ static void mountain_build(Mountain *m, int cols, int rows, uint32_t seed)
     m->crater_x = crater_x;
     m->crater_y = m->silhouette_y[crater_x];
 
-    /* Flows exhaust a quarter of the way to the edge, capped at MTN_FLOW_MAX_LEN. */
+    /* Flows run a quarter of the way to the edge, capped at MTN_FLOW_MAX_LEN. */
     int max_len = (cols / 4 < MTN_FLOW_MAX_LEN) ? cols / 4 : MTN_FLOW_MAX_LEN;
     m->flow_l_n = trace_lava_flow(m, cols, crater_x, -1, max_len,
                                   m->flow_l_x, m->flow_l_y);
@@ -1011,15 +626,14 @@ static void mountain_build(Mountain *m, int cols, int rows, uint32_t seed)
 /* --- particles: single pool, four types ------------------------------- */
 
 /*
- * ParticleType — which of the four ejecta kinds a Particle is.  All four
- * share ONE struct and ONE pool (the tagged / particle-system pattern, ref
- * [1]): particles_tick switches on this tag to pick the force model and
- * cooling rate, so new behaviour is a new switch case, not a new array.
- * Physically:
- *   PT_BOMB  — lava bomb: heavy ballistic arc under gravity, leaves a trail.
- *   PT_EMBER — buoyant glowing speck that rises through the plume and cools.
- *   PT_ASH   — fine near-neutral-buoyancy grey particle, long-lived drift.
- *   PT_SPARK — tiny, very hot, very short-lived crater-rim jet.
+ * ParticleType — which of the four kinds of flying debris a particle is.
+ * All four share one struct and one pool; the physics step looks at this
+ * tag to decide how each kind moves and cools, so adding a new kind is just
+ * a new case, not a new array.  What each one is:
+ *   PT_BOMB  — a lava bomb: heavy, arcs up and falls, leaves a smoke trail.
+ *   PT_EMBER — a glowing speck that floats up through the smoke and cools.
+ *   PT_ASH   — a fine grey fleck that drifts a long time before fading.
+ *   PT_SPARK — a tiny, very hot, very short-lived spark off the crater rim.
  */
 typedef enum {
     PT_BOMB  = 0,
@@ -1029,27 +643,26 @@ typedef enum {
 } ParticleType;
 
 /*
- * Particle — one slot in the fixed pool (ref [1], Reeves).  There is no
- * free list: `active` marks a live slot, particle_alloc linear-scans for a
- * dead one, and a particle frees itself (active=false) on death, so the
- * pool size (PARTICLES_MAX) is the hard cap on simultaneous ejecta.
- * Position/velocity are in CELL units (this sim is cell-space, not pixel).
- * Fields group into kinematics, lifecycle, look, and the bomb-only trail:
+ * Particle — one slot in the fixed pool of debris (Reeves, 1983).  There's
+ * no free list: `active` says whether a slot is in use, a new particle
+ * grabs the first inactive slot, and a particle marks itself inactive when
+ * it dies.  So PARTICLES_MAX is simply the most debris that can be on
+ * screen at once.  Positions are in character cells, not pixels.
  */
 typedef struct {
-    bool         active;      /* slot live? false = free for reuse              */
-    ParticleType type;        /* selects the physics branch in particles_tick   */
-    /* kinematics — cells and cells/sec */
-    float        x, y;        /* position; y grows DOWNWARD (screen convention) */
-    float        vx, vy;      /* velocity; vy < 0 is upward                     */
-    /* lifecycle — seconds */
-    float        age, life;   /* dies when age >= life (also on cooling/off-screen) */
-    /* look */
-    float        temp;        /* heat 0=cold → 1=white-hot; indexes the lava heat ramp */
-    /* bomb-only smoke trail — last BOMB_TRAIL_LEN positions, newest at [0] */
-    float        tx[BOMB_TRAIL_LEN]; /* trailing x history (cosmetic only)      */
-    float        ty[BOMB_TRAIL_LEN]; /* trailing y history                      */
-    int          trail_n;     /* count of valid trail samples (0 until it moves)*/
+    bool         active;      /* slot in use? false = free to reuse             */
+    ParticleType type;        /* which kind, picks the physics branch          */
+    /* where it is and how fast it's moving (cells, cells/sec) */
+    float        x, y;        /* position; y increases downward                 */
+    float        vx, vy;      /* velocity; negative vy means moving up          */
+    /* how long it lives (seconds) */
+    float        age, life;   /* dies once age reaches life                     */
+    /* appearance */
+    float        temp;        /* heat, 0 cold to 1 white-hot; picks the colour  */
+    /* bomb-only smoke trail: recent positions, newest first */
+    float        tx[BOMB_TRAIL_LEN]; /* past x positions (just for the trail)   */
+    float        ty[BOMB_TRAIL_LEN]; /* past y positions                        */
+    int          trail_n;     /* how many trail samples are valid yet           */
 } Particle;
 
 static int particle_alloc(Particle *pool)
@@ -1066,9 +679,8 @@ static void particles_clear(Particle *pool)
 }
 
 /*
- * particle_spawn_bomb — random ballistic launch from crater.  Velocity
- * is angled within ±BOMB_ANGLE around vertical-up; speed gives an
- * apex around 0.5-0.8 of screen height (set by speed range).
+ * particle_spawn_bomb — launch a lava bomb from the crater at a random
+ * upward angle and speed.
  */
 static void particle_spawn_bomb(Particle *pool, int crater_x, int crater_y,
                                 float intensity)
@@ -1087,7 +699,7 @@ static void particle_spawn_bomb(Particle *pool, int crater_x, int crater_y,
     p->age    = 0;
     p->life   = lcg_range(&g_rng, BOMB_LIFE_MIN, BOMB_LIFE_MAX);
     p->temp   = 1.0f;
-    /* Initialise trail to current position so we don't see uninit data. */
+    /* Seed the trail with the start position so it draws nothing stale. */
     for (int k = 0; k < BOMB_TRAIL_LEN; k++) {
         p->tx[k] = p->x;
         p->ty[k] = p->y;
@@ -1150,8 +762,8 @@ static void particle_spawn_spark(Particle *pool, int crater_x, int crater_y)
     p->trail_n = 0;
 }
 
-/* Shift the bomb's position history one slot (newest at [0]) — the smoke
- * trail.  A small ring-buffer write; cosmetic-only state (see Particle). */
+/* Record the bomb's current spot at the front of its trail history,
+ * pushing the older spots back one. */
 static void bomb_trail_push(Particle *p)
 {
     for (int k = BOMB_TRAIL_LEN - 1; k > 0; k--) {
@@ -1163,8 +775,8 @@ static void bomb_trail_push(Particle *p)
     p->trail_n = BOMB_TRAIL_LEN;
 }
 
-/* PT_BOMB — ballistic arc: gravity down, light air drag, slow cooling;
- * records a trail.  `drag` is the per-tick velocity-retention factor. */
+/* Move a bomb one step: pulled down by gravity, slowed a little by air,
+ * cooling slowly, and adding its spot to the smoke trail. */
 static void bomb_step(Particle *p, float dt, float drag)
 {
     bomb_trail_push(p);
@@ -1176,7 +788,8 @@ static void bomb_step(Particle *p, float dt, float drag)
     p->temp -= COOL_BOMB * dt;
 }
 
-/* PT_EMBER — buoyant rise + gentle wind + turbulence; cools fast. */
+/* Move an ember: floats upward, nudged sideways by wind and random
+ * turbulence, and cools fairly fast. */
 static void ember_step(Particle *p, float dt)
 {
     p->vy -= EMBER_BUOYANCY * dt;
@@ -1187,7 +800,8 @@ static void ember_step(Particle *p, float dt)
     p->temp -= COOL_EMBER * dt;
 }
 
-/* PT_ASH — weak buoyancy, stronger wind coupling, near-zero cooling. */
+/* Move ash: drifts up only weakly, blows sideways more in the wind, and
+ * barely cools, so it lingers a long time. */
 static void ash_step(Particle *p, float dt)
 {
     p->vy -= ASH_BUOYANCY * dt;
@@ -1198,7 +812,7 @@ static void ash_step(Particle *p, float dt)
     p->temp -= COOL_ASH * dt;
 }
 
-/* PT_SPARK — fast ballistic with reduced gravity; very fast cooling. */
+/* Move a spark: fast, only lightly pulled down, and cools almost at once. */
 static void spark_step(Particle *p, float dt)
 {
     p->vy += GRAVITY * SPARK_GRAVITY_FACTOR * dt;
@@ -1207,8 +821,8 @@ static void spark_step(Particle *p, float dt)
     p->temp -= COOL_SPARK * dt;
 }
 
-/* A particle dies when it outlives its lifespan, cools to black, or drifts
- * past the screen edge (with a small margin so it doesn't pop at the border). */
+/* A particle is done when it runs out of life, cools to black, or wanders
+ * off screen (with a little margin so it doesn't vanish right at the edge). */
 static bool particle_is_dead(const Particle *p, int rows, int cols)
 {
     if (p->age >= p->life)                            return true;
@@ -1221,8 +835,8 @@ static bool particle_is_dead(const Particle *p, int rows, int cols)
 }
 
 /*
- * particles_tick — advance every live particle one step: dispatch to the
- * per-type integrator, age it, then recycle the slot if it died.
+ * particles_tick — step every live particle once: move it by its own
+ * rules, age it, and free its slot if it just died.
  */
 static void particles_tick(Particle *pool, float dt, int rows, int cols)
 {
@@ -1248,46 +862,40 @@ static void particles_tick(Particle *pool, float dt, int rows, int cols)
 /* --- scene state + the per-tick combiner ------------------------------ */
 
 /*
- * Scene — the whole erupting volcano, the one aggregate the tick
- * orchestrates.  Reads as a table of contents:
- *   WHAT is simulated — the mountain edifice + the live ejecta pool.
- *   HOW it is driven   — the user knobs (style, intensity, pause).
- *   WHEN we are        — the sim clock + the emission cadence (spawn
- *                        accumulators + burst timers) that share its units.
- *   render + viewport  — palette choice and terminal dims (a RENDER concern
- *                        kept OUT of the simulation-knob group on purpose).
- * Sub-functions take the narrowest member they need (const Mountain* /
- * Particle*), never the whole Scene — only init / reset / tick do.
+ * Scene — everything about the running volcano in one place: the mountain,
+ * the live particles, the user's settings, the clock, and the timers that
+ * decide when to spawn things.  The per-frame step works on this; the draw
+ * code only reads it.
  */
 typedef struct {
-    /* WHAT is simulated — the domain objects */
-    Mountain mountain;                  /* static edifice: heightfield + crater + lava-flow paths */
-    Particle ejecta[PARTICLES_MAX];     /* live pool: bombs / embers / ash / sparks               */
+    /* the things being simulated */
+    Mountain mountain;                  /* the fixed mountain shape + lava paths    */
+    Particle ejecta[PARTICLES_MAX];     /* the pool of flying debris                */
 
-    /* HOW the eruption is driven — user knobs */
-    int    current_pattern;             /* index into patterns[] (eruption style)  */
-    float  intensity;                   /* multiplier on every spawn rate           */
-    bool   paused;                      /* freeze spawning + physics                */
+    /* user-controlled settings */
+    int    current_pattern;             /* which eruption style (index into patterns[]) */
+    float  intensity;                   /* overall how-much knob on all spawn rates */
+    bool   paused;                      /* true freezes spawning and physics        */
 
-    /* WHEN — sim clock + emission cadence (seconds, except the accumulators) */
-    float  time;                        /* accumulated sim seconds                  */
-    float  bomb_accum, ember_accum, ash_accum, spark_accum; /* fractional spawns pending */
-    float  next_burst_at;               /* sim time of next VULCANIAN bomb dump     */
-    float  next_ambient_at;             /* sim time of next universal ambient burst */
-    float  last_ambient_age;            /* seconds since last ambient (HUD feedback)*/
+    /* clock and spawn timing (seconds) */
+    float  time;                        /* seconds of simulation elapsed            */
+    float  bomb_accum, ember_accum, ash_accum, spark_accum; /* fractional spawns waiting to fire */
+    float  next_burst_at;               /* time the next Vulcanian volley fires     */
+    float  next_ambient_at;             /* time the next ambient surge fires        */
+    float  last_ambient_age;            /* seconds since the last ambient surge     */
 
     /* world generation */
-    uint32_t seed;                      /* reseeds mountain shape + spawn RNG       */
+    uint32_t seed;                      /* seed for the mountain shape and spawns   */
 
-    /* render + viewport */
-    int    cols, rows;                  /* sim's copy of terminal dims              */
-    int    current_theme;               /* index into themes[] (colour palette)     */
+    /* terminal size + colours */
+    int    cols, rows;                  /* current terminal size in cells           */
+    int    current_theme;               /* which colour theme (index into themes[]) */
 } Scene;
 
 /*
- * spawn_continuous — the steady eruption.  Advance each Poisson accumulator
- * by rate·dt·intensity, then spawn one particle per whole unit that crosses
- * 1.0 (ref [1]).  This is the only emission that runs every tick.
+ * spawn_continuous — the steady stream of debris.  Each type has a counter
+ * that fills up at its spawn rate; every time a counter passes 1, one
+ * particle of that type is born.  This runs every frame.
  */
 static void spawn_continuous(Scene *s, const EruptionPattern *pp, float dt)
 {
@@ -1320,8 +928,8 @@ static void spawn_continuous(Scene *s, const EruptionPattern *pp, float dt)
 }
 
 /*
- * maybe_vulcanian_burst — VULCANIAN styles only: when the burst timer
- * elapses, dump a violent VULCAN_BURST_BOMBS volley and schedule the next.
+ * maybe_vulcanian_burst — only for the Vulcanian style: when its timer is
+ * up, fire a big volley of bombs and set the timer for the next one.
  */
 static void maybe_vulcanian_burst(Scene *s, const EruptionPattern *pp)
 {
@@ -1337,9 +945,10 @@ static void maybe_vulcanian_burst(Scene *s, const EruptionPattern *pp)
 }
 
 /*
- * maybe_ambient_burst — fires for EVERY pattern at a random 8-22 s interval:
- * a mixed bomb+spark+ember surge so even quiet styles get occasional drama.
- * Between surges it just ages the HUD "time since last burst" counter.
+ * maybe_ambient_burst — fires for every style at a random 8-22 sec spacing:
+ * a mixed surge of bombs, sparks and embers so even calm styles get the
+ * occasional dramatic moment.  Otherwise it just bumps the "time since last
+ * surge" counter the HUD shows.
  */
 static void maybe_ambient_burst(Scene *s, float dt)
 {
@@ -1362,10 +971,9 @@ static void maybe_ambient_burst(Scene *s, float dt)
 }
 
 /*
- * scene_tick — THE per-tick combiner, and the ONLY function that advances
- * simulation state.  Reads as the combine order documented in ARCHITECTURE:
- *   guard pause → advance clock → continuous emission → burst timers →
- *   integrate particles.
+ * scene_tick — advance the whole simulation by dt seconds, and the only
+ * place that does: skip if paused, move the clock, spawn the steady stream,
+ * check the two burst timers, then move every particle.
  */
 static void scene_tick(Scene *s, float dt)
 {
@@ -1380,19 +988,12 @@ static void scene_tick(Scene *s, float dt)
     particles_tick(s->ejecta, dt, s->rows, s->cols);
 }
 
-/* ===================================================================== */
-/* §6  RENDER — state → screen (read-only)                                */
-/*                                                                        */
-/* Every function here READS the Mountain / ejecta pool (via narrow const  */
-/* pointers) and paints cells; none writes simulation state.  Reordering   */
-/* or skipping any draw cannot change the simulation.  All cosmetic shading*/
-/* (glow pulse, dimming, brightness slots) is DERIVED here from time/temp. */
-/* ===================================================================== */
+/* ── §6 RENDER — state to screen (read-only) ── */
 
 /*
- * draw_bomb_trail — paint one bomb's fading smoke trail.  Skips index 0
- * (that's the live head, drawn in pass 2); each older sample k uses a cooler
- * ramp slot (temp-slot minus k) and a dimmer glyph so the tail recedes.
+ * draw_bomb_trail — paint one bomb's fading smoke tail.  Skips the newest
+ * spot (the bomb itself is drawn later); each older spot is dimmer and uses
+ * a cooler colour so the tail trails off.
  */
 static void draw_bomb_trail(const Particle *p, int rows_eff, int cols, bool inverted)
 {
@@ -1401,7 +1002,7 @@ static void draw_bomb_trail(const Particle *p, int rows_eff, int cols, bool inve
         int ty = (int)(p->ty[k] + 0.5f);
         if (tx < 0 || tx >= cols)     continue;
         if (ty < 0 || ty >= rows_eff) continue;
-        int slot = unit_to_slot(p->temp, 6) - k;   /* cooler further back */
+        int slot = unit_to_slot(p->temp, 6) - k;   /* cooler the further back it is */
         if (slot < 0) slot = 0;
         if (slot > 5) slot = 5;
         char glyph = (k == 1) ? '*' : (k == 2 ? '+' : '.');
@@ -1413,9 +1014,9 @@ static void draw_bomb_trail(const Particle *p, int rows_eff, int cols, bool inve
 }
 
 /*
- * draw_particle_head — choose glyph + colour pair + attribute for one
- * particle from its type and temperature, then stamp it at (ix,iy).  Hotter
- * temp → higher ramp slot → brighter glyph; each type uses its own ramp.
+ * draw_particle_head — draw one particle at (ix,iy), picking its character
+ * and colour from its kind and how hot it is.  Each kind has its own ramp;
+ * hotter looks brighter.
  */
 static void draw_particle_head(const Particle *p, int ix, int iy, bool inverted)
 {
@@ -1466,21 +1067,21 @@ static void draw_particle_head(const Particle *p, int ix, int iy, bool inverted)
 }
 
 /*
- * particles_draw — two passes over the pool: trails first so live heads
- * stamp over them, then each particle's head projected to a screen cell.
+ * particles_draw — draw the bomb trails first, then every particle on top,
+ * so the bombs sit over their own tails.
  */
 static void particles_draw(const Particle *pool, int rows, int cols, bool inverted)
 {
-    int rows_eff = rows - 1;       /* leave bottom row for HUD */
+    int rows_eff = rows - 1;       /* keep the bottom row free for the HUD */
 
-    /* Pass 1 — bomb trails (drawn under the heads). */
+    /* trails first, under everything else */
     for (int i = 0; i < PARTICLES_MAX; i++) {
         const Particle *p = &pool[i];
         if (p->active && p->type == PT_BOMB)
             draw_bomb_trail(p, rows_eff, cols, inverted);
     }
 
-    /* Pass 2 — every live particle's head, projected and culled to screen. */
+    /* then every live particle, skipping any off screen */
     for (int i = 0; i < PARTICLES_MAX; i++) {
         const Particle *p = &pool[i];
         if (!p->active) continue;
@@ -1492,25 +1093,26 @@ static void particles_draw(const Particle *pool, int rows, int cols, bool invert
     }
 }
 
-/* Plume cone half-width (cells) at height h above the crater. */
+/* How wide the smoke column is at height h above the crater (it widens as
+ * it rises). */
 static inline float plume_half_width(float h)
 {
     return PLUME_BASE_W + h * PLUME_SPREAD;
 }
 
-/* Parabolic edge fade across the cone: 1 on the axis, 0 at the wall
- * (|dx| == half_w), negative beyond (caller treats <= 0 as outside). */
+/* Fade across the column: full strength in the middle, fading to zero at
+ * the edge, and below zero past it (callers treat <= 0 as outside). */
 static inline float plume_cone_falloff(float dx, float half_w)
 {
     return 1.0f - (dx * dx) / (half_w * half_w);
 }
 
 /*
- * plume_density — fBm smoke density at one cell.  The noise field is
- * ADVECTED: the sample x drifts with time·PLUME_WIND (wind) and the sample
- * y with time·PLUME_RISE (the column boils upward), giving a coherent
- * flowing column.  Weighted by style intensity and the cone edge fade.
- * Refs [4][5].
+ * plume_density — how thick the smoke is at one cell.  It samples the noise
+ * field, but shifts where it samples over time: sideways with the wind and
+ * upward as the column rises, so the smoke looks like it's flowing rather
+ * than sitting still.  Scaled by the style's plume strength and the edge
+ * fade.
  */
 static float plume_density(float dx, float h, float time,
                            float intensity, float falloff)
@@ -1521,10 +1123,8 @@ static float plume_density(float dx, float h, float time,
 }
 
 /*
- * plume_draw — for each cell inside the widening cone above the crater,
- * sample the advected fBm density and, if it clears the threshold, paint it
- * in the plume ramp.  Reads top-to-bottom: cone width → inside-cone test →
- * skip rock → edge fade → density → threshold → slot → paint.
+ * plume_draw — for each cell inside the smoke column above the crater,
+ * check how thick the smoke is there and, if it's thick enough, paint it.
  */
 static void plume_draw(const Mountain *mtn, int rows, int cols,
                           float time, float intensity, bool inverted)
@@ -1534,16 +1134,16 @@ static void plume_draw(const Mountain *mtn, int rows, int cols,
     int crater_y = mtn->crater_y;
 
     for (int row = 0; row < rows_eff; row++) {
-        if (row > crater_y) break;     /* below crater = inside mountain */
+        if (row > crater_y) break;     /* below the crater is inside the mountain */
 
-        float h = (float)(crater_y - row);     /* height above the vent */
+        float h = (float)(crater_y - row);     /* how high above the crater */
         if (h < 0.5f) continue;
         float half_w = plume_half_width(h);
 
         for (int col = 0; col < cols; col++) {
             float dx = (float)(col - crater_x);
-            if (fabsf(dx) > half_w) continue;             /* outside cone   */
-            if (row > mtn->silhouette_y[col]) continue;   /* inside mountain*/
+            if (fabsf(dx) > half_w) continue;             /* outside the column */
+            if (row > mtn->silhouette_y[col]) continue;   /* hidden by the mountain */
 
             float falloff = plume_cone_falloff(dx, half_w);
             if (falloff <= 0) continue;
@@ -1551,7 +1151,7 @@ static void plume_draw(const Mountain *mtn, int rows, int cols,
             float density = plume_density(dx, h, time, intensity, falloff);
             if (density < PLUME_THRESHOLD) continue;
 
-            /* Above-threshold density, normalised, → plume ramp slot. */
+            /* turn the thickness into a colour/character slot */
             float t_n = (density - PLUME_THRESHOLD) / (1.0f - PLUME_THRESHOLD);
             if (t_n > 1.0f) t_n = 1.0f;
             int slot = unit_to_slot(t_n, 4);
@@ -1567,7 +1167,7 @@ static void plume_draw(const Mountain *mtn, int rows, int cols,
     }
 }
 
-/* Lowest rock row across all columns — the sky-gradient horizon (never 0). */
+/* The lowest rock row anywhere — used as the horizon for the sky gradient. */
 static int silhouette_max(const Mountain *mtn, int cols)
 {
     int m = 0;
@@ -1577,14 +1177,13 @@ static int silhouette_max(const Mountain *mtn, int cols)
 }
 
 /*
- * scene_draw_sky — vertical gradient over rows above the silhouette.
- * Each cell's slot is determined by row position: top → slot 0 (deepest
- * sky), horizon → slot 3 (palest).
+ * scene_draw_sky — fill the sky above the mountain with a top-to-bottom
+ * colour gradient: deepest at the top, palest near the horizon.
  */
 static void scene_draw_sky(const Mountain *mtn, int cols, int rows, bool inverted)
 {
     int rows_eff = rows - 1;
-    int horizon_y = silhouette_max(mtn, cols);   /* gradient normalised over this */
+    int horizon_y = silhouette_max(mtn, cols);   /* the gradient spans down to here */
 
     for (int row = 0; row < rows_eff; row++) {
         if (row >= horizon_y) break;
@@ -1592,13 +1191,13 @@ static void scene_draw_sky(const Mountain *mtn, int cols, int rows, bool inverte
         if (slot < 0) slot = 0;
         if (slot > 3) slot = 3;
 
-        char glyph = inverted ? ' ' : ' ';   /* sky cells get bg colour only */
+        char glyph = ' ';   /* sky is just the background colour */
         attr_t attr = (inverted) ? A_NORMAL
                     : (slot == 0) ? A_DIM : A_NORMAL;
         int pair = PAIR_SKY_BASE + slot;
         attron(COLOR_PAIR(pair) | attr);
         for (int col = 0; col < cols; col++) {
-            if (row > mtn->silhouette_y[col]) continue;     /* mountain   */
+            if (row > mtn->silhouette_y[col]) continue;     /* that cell is rock */
             mvaddch(row, col, (chtype)(unsigned char)glyph);
         }
         attroff(COLOR_PAIR(pair) | attr);
@@ -1606,9 +1205,8 @@ static void scene_draw_sky(const Mountain *mtn, int cols, int rows, bool inverte
 }
 
 /*
- * scene_draw_mountain — paint solid silhouette from `silhouette_y`
- * downward.  Top edge gets a slightly different glyph (`@`) for ridge
- * emphasis.
+ * scene_draw_mountain — fill each column with rock from its top edge down,
+ * using a different character on the very top row to mark the ridge.
  */
 static void scene_draw_mountain(const Mountain *mtn, int cols, int rows, bool inverted)
 {
@@ -1628,9 +1226,8 @@ static void scene_draw_mountain(const Mountain *mtn, int cols, int rows, bool in
 }
 
 /*
- * scene_draw_lava_flows — bright cells along the pre-traced flow paths.
- * Brightness decays with distance from the crater (slot drops from
- * hottest at idx=0 down to dim at far end).
+ * scene_draw_lava_flows — light up the two lava rivers, hottest near the
+ * crater and dimming as they reach down the slope.
  */
 static void scene_draw_lava_flows(const Mountain *mtn, int cols, int rows,
                                   float lava_flow_amount, bool inverted)
@@ -1665,8 +1262,8 @@ static void scene_draw_lava_flows(const Mountain *mtn, int cols, int rows,
 }
 
 /*
- * scene_draw_crater_glow — a few cells inside the crater bowl that
- * pulse with hot-lava colours, anchoring the eruption point visually.
+ * scene_draw_crater_glow — a few cells in the crater that pulse with hot
+ * colours, so the eye has a glowing centre to anchor on.
  */
 static void scene_draw_crater_glow(const Mountain *mtn, int cols, int rows,
                                    float time, bool inverted)
@@ -1679,11 +1276,11 @@ static void scene_draw_crater_glow(const Mountain *mtn, int cols, int rows,
              dx <= (int)CRATER_RADIUS - 1; dx++) {
         int x = cx + dx;
         if (x < 0 || x >= cols) continue;
-        int y = cy - 1;            /* one row above the bowl bottom */
+        int y = cy - 1;            /* one row above the crater floor */
         if (y < 0 || y >= rows_eff) continue;
 
         float pulse = 0.5f + 0.5f * sinf(time * GLOW_PULSE_RATE + (float)dx * 0.5f);
-        int slot = 4 + (int)(pulse * 1.5f);     /* pulse between the 2 hottest slots */
+        int slot = 4 + (int)(pulse * 1.5f);     /* flicker between the two hottest colours */
         if (slot < 4) slot = 4;
         if (slot > 5) slot = 5;
         char glyph = LAVA_GLYPHS[slot];
@@ -1694,7 +1291,7 @@ static void scene_draw_crater_glow(const Mountain *mtn, int cols, int rows,
     }
 }
 
-/* Pure read — counts active particles for the HUD; mutates nothing. */
+/* Count how many particles are live, for the HUD readout. */
 static int particles_active_count(const Particle *pool)
 {
     int n = 0;
@@ -1709,7 +1306,7 @@ static void scene_render(const Scene *s)
     const EruptionPattern *style    = &patterns[s->current_pattern];
     int                    rows_eff = s->rows - 1;
 
-    /* Inverted theme: pre-fill white "paper" before drawing. */
+    /* Paper themes: fill the screen white first, then draw dark ink on top. */
     if (inverted) {
         attron(COLOR_PAIR(PAIR_PAPER));
         for (int row = 0; row < rows_eff; row++)
@@ -1729,16 +1326,7 @@ static void scene_render(const Scene *s)
     particles_draw(s->ejecta, s->rows, s->cols, inverted);
 }
 
-/* ===================================================================== */
-/* §7  EVENTS — init / resize / reset (mutate state OUTSIDE the tick)     */
-/*                                                                        */
-/* These rebuild the world (mountain + particle pool) and reset Scene     */
-/* timers.  They mutate scene.mountain, scene.ejecta, g_rng and Scene —   */
-/* but they run                                                           */
-/* from startup / the r key / SIGWINCH, NEVER from scene_tick.  Keeping   */
-/* them out of the tick is what lets §5's combine order stay the single   */
-/* source of simulation advancement.                                     */
-/* ===================================================================== */
+/* ── §7 EVENTS — init / resize / reset (rebuild the world) ── */
 
 static void scene_init(Scene *s, int cols, int rows)
 {
@@ -1784,19 +1372,12 @@ static void scene_reset(Scene *s)
     particles_clear(s->ejecta);
 }
 
-/* ===================================================================== */
-/* §8  SCREEN + APP — ncurses I/O, HUD, input, main loop + frame cap      */
-/*                                                                        */
-/* Terminal setup/teardown + HUD (RENDER infrastructure), the input       */
-/* handler (EVENTS), and the main loop which owns the PERFORMANCE         */
-/* frame cap (dt clamp, fps measure, target-Hz sleep).                    */
-/* ===================================================================== */
+/* ── §8 SCREEN + APP — ncurses I/O, HUD, input, main loop + frame cap ── */
 
 /*
- * Screen — the terminal viewport in character cells: the authoritative size
- * read from ncurses getmaxyx (ref [8]) at startup and after every SIGWINCH.
- * Scene keeps its own cols/rows copy for the simulation; THIS is ground
- * truth and drives the resize that rebuilds the mountain to the new extent.
+ * Screen — the terminal's current size in cells.  This is the real, current
+ * size (re-read at startup and after every resize); the Scene keeps its own
+ * copy, but this one is what triggers rebuilding the mountain on a resize.
  */
 typedef struct { int cols, rows; } Screen;
 
@@ -1826,7 +1407,7 @@ static void screen_draw(Screen *sc, const Scene *s,
     erase();
     scene_render(s);
 
-    /* ── top row: data readout (yellow), clipped so it never wraps ── */
+    /* top row: status line in yellow, clipped so it never wraps */
     char buf[200];
     snprintf(buf, sizeof buf,
              " VOLCANO   %s   pattern:%s   theme:%s   particles:%4d   "
@@ -1842,7 +1423,7 @@ static void screen_draw(Screen *sc, const Scene *s,
     mvprintw(0, 0, "%.*s", sc->cols, buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* ── bottom row: action keys (cyan), clipped ── */
+    /* bottom row: the key hints in cyan */
     int row = sc->rows - 1;
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
@@ -1854,20 +1435,18 @@ static void screen_draw(Screen *sc, const Scene *s,
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /*
- * App — the top-level program aggregate.  A single static instance (g_app)
- * exists so the async signal handlers can reach the run flags.  It bundles
- * the simulation (scene), the terminal it draws to (screen), the run-rate
- * knob, and the two flags the handlers poke.  running/need_resize are
- * `volatile sig_atomic_t`: volatile stops the main loop from caching them
- * in a register (the handler can change them between iterations), and
- * sig_atomic_t guarantees the read/write is indivisible across a signal.
+ * App — the whole program in one struct.  There's a single global one so
+ * the signal handlers can reach the two flags below.  Those two flags are
+ * volatile sig_atomic_t because a signal handler can change them at any
+ * moment: volatile stops the main loop from caching a stale value, and
+ * sig_atomic_t guarantees reading or writing them happens in one piece.
  */
 typedef struct {
-    Scene                 scene;       /* the whole simulation + its render state */
-    Screen                screen;      /* terminal viewport (ground-truth dims)   */
-    int                   sim_fps;     /* target ticks/sec — the frame cap ([ / ])*/
-    volatile sig_atomic_t running;     /* SIGINT/SIGTERM clear it → main loop exits */
-    volatile sig_atomic_t need_resize; /* SIGWINCH sets it → rebuild on next frame  */
+    Scene                 scene;       /* the whole simulation                    */
+    Screen                screen;      /* the terminal it draws to                */
+    int                   sim_fps;     /* target frames per second ([ and ] keys) */
+    volatile sig_atomic_t running;     /* cleared by a quit signal to end the loop */
+    volatile sig_atomic_t need_resize; /* set by a resize signal, handled next frame */
 } App;
 
 static App g_app;
@@ -1964,7 +1543,7 @@ int main(void)
             frame_time = clock_ns();
         }
 
-        /* 2. timestep since last frame, capped against spiral-of-death. */
+        /* 2. time since the last frame, capped so a long stall can't cause one huge catch-up step. */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;

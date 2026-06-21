@@ -1,117 +1,10 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
-/* dune_sandworm.c — Arrakis sandworm: swim underground, breach, open mouth, dive
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/dune_sandworm.c -o dune_sandworm -lncurses -lm
- *
- * Keys: q quit | p pause | r reset | +/- speed | Space breach | w/W worms | t theme
- */
+/* dune_sandworm.c — Arrakis sandworms that swim under the dunes, breach with
+ * an open mouth, then dive again. The body is a chain of points that follow
+ * the head. Refs: Jakobsen "Advanced Character Physics" (GDC 2001) for the
+ * follower chain; Perlin/fBm noise for the dune profile. */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Segmented worm body using a chain-of-circles (Conga)
- *                  follower model.  Each segment follows the previous:
- *                    if dist(seg[i], seg[i-1]) > SEG_LEN, move seg[i]
- *                    toward seg[i-1] until separation == SEG_LEN.
- *                  The head drives; the body follows with O(N_SEGS) updates.
- *
- * Math           : Underground path: sinusoidal oscillation
- *                    y = surface_row + SWIM_DEPTH + SWIM_AMP·sin(SWIM_FREQ·x)
- *                  Breach arc: parabolic trajectory above the surface —
- *                    apex at BREACH_HEIGHT rows, spanning BREACH_SPAN cols.
- *                  Terrain surface: procedural height map built from a sum
- *                  of low-frequency cosine waves to mimic sand dunes.
- *
- * Rendering      : Body segments drawn with direction-dependent ASCII glyphs
- *                  (| ! vertical, O o 0 horizontal, \ / diagonal; see seg_char).
- *                  Head has a multi-row open-mouth sprite during breach.  Sand
- *                  ripples expand radially at RIPPLE_SPEED cols/s after a breach.
- *
- * References     :
- *   Body chain / follower (the segment distance constraint in relax_chain):
- *   [1] Jakobsen, "Advanced Character Physics" (GDC 2001) — Verlet + stick
- *       constraints; relaxing each segment to SEG_LEN is exactly his distance
- *       stick with the leading endpoint pinned (the chain loop here).
- *   [2] Müller, Heidelberger, Hennix & Ratcliff, "Position Based Dynamics"
- *       (J. Vis. Commun. & Image Repr. 2007) — formal framework for the
- *       per-segment distance projection that keeps spacing == SEG_LEN.
- *   [3] Aristidou & Lasenby, "FABRIK: A fast, iterative solver for the
- *       Inverse Kinematics problem" (Graphical Models 2011) — the
- *       follow-the-leader chain-of-points this Conga body is built on.
- *
- *   Procedural terrain & ballistic motion:
- *   [4] Perlin, "An Image Synthesizer" (SIGGRAPH 1985) — gradient noise; the
- *       dune surface is its cheap cousin, a sum of low-frequency sines.
- *   [5] Ebert, Musgrave, Peachey, Perlin & Worley, "Texturing & Modeling:
- *       A Procedural Approach" (3rd ed. 2003) — fBm / sum-of-octaves terrain.
- *   [6] Witkin & Baraff, "Physically Based Modeling" (SIGGRAPH course notes)
- *       — explicit Euler for the sand-spray particles; the breach arc is the
- *       same projectile integration written in closed form (parabola in t).
- *
- *   Particles & ASCII rendering:
- *   [7] Reeves, "Particle Systems — A Technique for Modeling a Class of Fuzzy
- *       Objects" (ACM TOG 1983) — origin of the spray / ripple particle model.
- *   [8] Bourke, "Character representation of grey scale images" (1997) —
- *       luminance->ASCII ramp behind the intensity / glyph choices.
- *   [9] Padala, "NCURSES Programming HOWTO" — color pairs and erase/doupdate
- *       double-buffering used in the §8 draw layer.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
- *
- * The file is cut into LAYERS by concern. All simulation DATA hangs off one
- * Scene aggregate (§3); functions take the NARROWEST slice they need —
- * const DomainType* for a pure read, DomainType* for a mutator — so the layers
- * never re-couple. Only the whole-tick orchestrators (scene_reset / scene_tick)
- * take Scene*.
- *
- *   Layer        Section            Mutates
- *   ─────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2 timing          nothing (reads OS clock, sleeps)
- *   DATA         §3 data            — types + the Scene aggregate —
- *   LOGIC        §4 logic           nothing (pure reads: returns values)
- *   EFFECTS      §5 effects         scene.ripples, scene.spray (cosmetic)
- *   SIMULATION   §6 simulation      scene.worms (and spawns into EFFECTS)
- *   INIT/RESET   §7 init            ALL of Scene
- *   RENDER       §8 render          the screen only — never Scene
- *   EVENTS       §9 events          scene.{paused,speed,n_worms,theme,worms},
- *                                    g_running, g_need_resize
- *   —            §10 main           the per-frame driver (combines layers)
- *
- * EFFECTS is real here: ripples and spray are cosmetic-only particle pools
- * that advance over time but are never read back by the worm simulation, so
- * deleting them cannot change worm motion. SIMULATION spawns into them
- * (ripple_spawn / spray_burst) but never reads them.
- *
- * LOGIC (terrain_at, seg_char, count_active) does no mutation and no I/O, so
- * reordering or deleting RENDER/EFFECTS cannot change its results.
- *
- * No DELAYS layer: pause is a single flag (scene.paused) tested once in main
- * before the tick; the per-worm timers (swim_timer, ripple_timer,
- * respawn_timer) are owned by and advanced inside the SIMULATION state. There
- * are no global holds.
- *
- * PER-TICK COMBINE — scene_tick (§6) is the ONLY place sim state advances,
- * in order:
- *   1. per worm: if inactive, worm_try_respawn (ages respawn_timer, may
- *      worm_reset); else worm_update — which delegates to worm_swim /
- *      worm_breach (these may ripple_spawn / spray_burst) then relax_chain
- *   2. ripple_update   (EFFECTS)
- *   3. spray_update    (EFFECTS)
- *
- * User events (quit, pause, reset r, breach space, speed +/-, worms w/W,
- * theme t, resize) DO mutate state but are NOT part of the tick — they run in
- * main's input/resize handling, outside and before the gated
- * `if (!scene.paused) scene_tick(&scene, ...)`. Reset r and resize re-invoke
- * INIT (§7). The signal flags g_running/g_need_resize stay global so the
- * handlers can reach them.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-
-/* ── §1 config ───────────────────────────────────────────────────────────── */
+/* ── §1 config — all the tuning knobs ────────────────────────────────────── */
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <math.h>
@@ -185,11 +78,7 @@
 
 #define MAX_COLS 512
 
-/* ── §2 PERFORMANCE — timing primitives ──────────────────────────────────── *
- * Monotonic clock + sleep. Mutates nothing. The frame cap and dt clamp that use
- * these live in main's loop (variable-dt + frame cap, not a fixed-timestep
- * accumulator).
- * ────────────────────────────────────────────────────────────────────────── */
+/* ── §2 timing — read the clock, sleep to cap the frame rate ─────────────── */
 static long long clock_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -201,18 +90,12 @@ static void clock_sleep_ns(long long ns) {
     nanosleep(&ts, NULL);
 }
 
-/* ── §3 DATA — types & the Scene aggregate ────────────────────────────────── *
- * Declarations only; no behaviour. State is mutated by EFFECTS (§5) /
- * SIMULATION (§6) / INIT (§7) / EVENTS (§9) and read by LOGIC (§4) / RENDER
- * (§8). The signal flags live with their handlers in §9.
- * ────────────────────────────────────────────────────────────────────────── */
+/* ── §3 data — the types and the one Scene that holds everything ──────────── */
 
-/* color-pair identifiers (RENDER). ncurses pairs are 1-BASED — pair 0 is the
- * reserved default (white-on-black) and cannot be redefined, so the first real
- * id starts at 1. Each id names ONE visually-distinct element; theme_apply (§8)
- * rebinds CP_STAR..CP_SPRAY from the active Theme on every theme switch, while
- * CP_HUD/CP_HINT are fixed (yellow/cyan) per the project HUD standard. Ordered
- * back-to-front by draw order: sky, then terrain, then worm, then effects. */
+/* Names for the color pairs. ncurses pair numbers start at 1 (pair 0 is the
+ * fixed default and can't be redefined), so the first id is 1. theme_apply (§8)
+ * recolors CP_STAR..CP_SPRAY when you switch themes; CP_HUD/CP_HINT stay fixed.
+ * Listed in draw order: sky, then ground, then worm, then effects. */
 enum {
     CP_STAR = 1,                                       /* night-sky speckle      */
     CP_GROUND, CP_SAND,                                /* dune crest, sub-surface */
@@ -221,20 +104,18 @@ enum {
     CP_HUD, CP_HINT                                    /* top data bar, bottom action bar */
 };
 
-/* Theme — one named RENDER palette, fully DATA-DRIVEN so the whole look swaps at
- * runtime ('t' cycles k_themes) with zero code change. WHY a flat table of ints:
- * each field is an xterm-256 FOREGROUND index (16..231 = the 6x6x6 colour cube,
- * 232..255 = the gray ramp); the background is always -1 (the terminal default)
- * so a theme never fights the user's wallpaper. Indices are picked from the
- * BRIGHT half of the cube so even the darkest tier stays legible on black
- * (project palette-brightness rule). k_themes is the fixed table; the live
- * choice is Scene.theme, and one row maps 1:1 onto the CP_* pairs above.
+/* Theme — one named color palette. The whole look is just a row of numbers, so
+ * pressing 't' swaps every color at once with no code change. Each field is an
+ * xterm-256 foreground color number; the background is always the terminal
+ * default (-1) so a theme never clashes with the user's wallpaper. Colors are
+ * picked from the bright half of the palette so even the darkest one stays
+ * readable on black. One row lines up 1:1 with the CP_* pairs above.
  *   name                 : label shown in the HUD.
- *   star                 : night-sky speckle               (CP_STAR).
- *   ground, sand         : dune crest glyph, sub-surface fill (CP_GROUND/SAND).
- *   worm_top, worm_sub   : dorsal body, submerged-head tint (CP_WORM_TOP/SUB).
- *   worm_head, mouth     : breaching head, open-maw cavity  (CP_WORM_HEAD/MOUTH).
- *   ripple, spray        : the two sand particle effects    (CP_RIPPLE/SPRAY). */
+ *   star                 : night-sky speckle.
+ *   ground, sand         : dune-crest glyph, the sand fill below it.
+ *   worm_top, worm_sub   : body color above ground, submerged-head tint.
+ *   worm_head, mouth     : breaching head, the open mouth's inside.
+ *   ripple, spray        : the two sand particle effects. */
 typedef struct {
     const char *name;
     int star, ground, sand, worm_top, worm_sub, worm_head, mouth, ripple, spray;
@@ -255,153 +136,120 @@ static const Theme k_themes[N_THEMES] = {
 /* 9 */ { "Ghost",     252, 240, 235,  255, 244,  231, 238, 248, 253 },
 };
 
-/* HeightField — the Arrakis dune surface as a 1-D HEIGHT FIELD: exactly one
- * ground row per screen column (NOT a 2-D grid — the "…Field" suffix marks that
- * lesson). WHY 1-D: the desert is drawn one glyph per column and the worm only
- * ever asks "how deep is the sand at x?", so a row-per-column array answers in
- * O(1) and costs MAX_COLS ints instead of a whole screen grid. INTENT of the
- * profile (sampled by dune_height, laid into row[] by terrain_init): a sum of
- * three sine octaves with FALLING amplitude (1.5 / 0.8 / 0.4) and RISING
- * frequency (2.1 / 5.3 / 11.7) — a cheap fractal-Brownian (fBm) stand-in for
- * true Perlin gradient noise [4][5], seamless because every term is periodic
- * across the width. The sum is clamped to +/-DUNE_CLAMP rows of the centre so
- * dunes never swallow the sky or the bottom HUD.
- *   row[c]      : sand-surface screen ROW at column c. Larger = LOWER on screen
- *                 (row 0 is the top). Valid c in [0,cols); each value clamped to
- *                 [surface_row-3, surface_row+3].
- *   surface_row : baseline centre row (= rows/2) the dune profile varies around,
- *                 and the depth datum worms swim SWIM_DEPTH rows below. */
+/* HeightField — the dune surface stored as one ground row per screen column,
+ * not a full 2-D grid. The desert is drawn a column at a time and the worm only
+ * ever asks "where's the sand surface at this x?", so a single row-per-column
+ * array answers instantly and costs far less memory. The shape comes from
+ * adding three sine waves of shrinking height and rising frequency (built in
+ * terrain_init) — a cheap stand-in for Perlin noise that gives rolling dunes.
+ * The result is kept within DUNE_CLAMP rows of center so dunes never swallow
+ * the sky or the bottom HUD.
+ *   row[c]      : screen row of the sand surface at column c. Bigger means lower
+ *                 on screen (row 0 is the top). c ranges over [0,cols).
+ *   surface_row : the center row (= rows/2) the dunes wave around, and the line
+ *                 worms swim SWIM_DEPTH rows beneath. */
 typedef struct {
     int row[MAX_COLS];
     int surface_row;
 } HeightField;
 
-/* Ripple — one concentric sand ring racing outward from the spot where a worm
- * nears or breaks the surface; a coarse particle effect in the spirit of Reeves
- * [7]. WHY just an origin + radius (not a list of points): the ring is perfectly
- * symmetric, so draw_ripples reconstructs it each frame as two mirrored points
- * at ox +/- radius riding the terrain crest — O(1) state per ring. Cosmetic-only
- * (EFFECTS): the worm simulation NEVER reads it back, so a ripple may be added,
- * dropped, or reordered with no effect on motion.
- *   ox     : origin column in cells — fixed at spawn, the ring's centre.
- *   radius : current half-width (cells); grows by RIPPLE_SPEED each tick.
- *   life   : seconds remaining, counts down from RIPPLE_LIFE; the life/RIPPLE_LIFE
- *            fraction selects the glyph ('~' -> '.' -> ' ') as it fades.
- *   active : 1 while this fixed-pool slot is in use (no per-frame allocation). */
+/* Ripple — one sand ring that races outward from where a worm nears or breaks
+ * the surface. We store only a center and a radius (not a list of points)
+ * because the ring is symmetric: draw_ripples just redraws two mirrored points
+ * at center +/- radius each frame. Purely cosmetic — the worm motion never
+ * reads it, so adding or dropping a ripple changes nothing about the worms.
+ *   ox     : center column where the ring started.
+ *   radius : how far the ring has spread (cells); grows each tick.
+ *   life   : seconds left, counting down from RIPPLE_LIFE; its fraction picks
+ *            the fading glyph ('~' then '.' then blank).
+ *   active : 1 while this slot in the fixed pool is in use. */
 typedef struct {
     float ox, radius, life;
     int   active;
 } Ripple;
 
-/* Spray — one ballistic sand grain thrown up as the worm's head punches through
- * the surface. A textbook particle [7] integrated with explicit Euler under
- * CONSTANT gravity [6]: each tick vy += g·dt, then pos += vel·dt (spray_update),
- * no inter-particle forces. INTENT: spray_one emits into the UPPER hemisphere
- * only (angle 0..π, vy negative = up) so grains arc up and outward, never down
- * into the dune. Cosmetic-only (EFFECTS): never read back by the simulation.
+/* Spray — one sand grain flung up when the worm's head punches the surface.
+ * Each tick gravity pulls its upward speed back down, then it moves by its
+ * speed, tracing a thrown-rock arc (spray_update). Grains are launched only
+ * upward and outward, never down into the dune. Purely cosmetic — the worm
+ * motion never reads it.
  *   x, y     : position in cells.
- *   vx, vy   : velocity in cells/sec; vy starts negative (upward) and is bent
- *              back down by gravity each tick, tracing the parabolic toss.
- *   life     : seconds of life remaining, counts down to 0 = dead.
- *   max_life : lifetime captured at spawn; the life/max_life ratio (1 -> 0) is
- *              the ONLY age signal kept and drives the glyph fade ('*' '+' '.').
- *   active   : 1 while this fixed-pool slot is in use. */
+ *   vx, vy   : speed in cells/sec; vy starts negative (upward) and gravity bends
+ *              it back down over time.
+ *   life     : seconds left before it dies at 0.
+ *   max_life : the life it started with; life/max_life (1 down to 0) is how we
+ *              fade the glyph ('*' then '+' then '.').
+ *   active   : 1 while this slot in the fixed pool is in use. */
 typedef struct {
     float x, y, vx, vy, life, max_life;
     int   active;
 } Spray;
 
-/* WState — the worm's two-phase lifecycle, a tiny state machine that selects
- * which trajectory the head follows (worm_update branches on it):
- *   WS_SWIM   : cruising UNDER the dunes on a sine path (depth SWIM_DEPTH, swing
- *               SWIM_AMP); a countdown (swim_timer) eventually triggers a breach.
- *   WS_BREACH : arcing ABOVE the surface along a parabola (apex BREACH_HEIGHT,
- *               span BREACH_SPAN); on finishing the arc it returns to WS_SWIM.
- * Only these two phases exist — entering/leaving the field off-screen is handled
- * by the worm's `active` flag, not by a third state. */
+/* WState — which of the worm's two phases it is in; picks the path the head
+ * follows (worm_update checks it):
+ *   WS_SWIM   : cruising under the dunes on a wavy path until a timer fires.
+ *   WS_BREACH : arcing up over the surface, then dropping back to WS_SWIM. */
 typedef enum { WS_SWIM, WS_BREACH } WState;
 
-/* Seg — one body node: a single point on the worm's follower chain (the
- * "circle" in the chain-of-circles / Conga model [1][3]). WHY only (x,y): a
- * segment carries no velocity or mass of its own — it is repositioned purely by
- * the distance constraint against the node ahead of it (relax_chain), so a bare
- * position is all the state it needs. N_SEGS of these, spaced SEG_LEN apart,
- * make one worm body.
- *   x, y : position in cells (fractional; rounded only at draw time). */
+/* Seg — one bead on the worm's body chain. It has no speed or weight of its
+ * own; relax_chain just drags it to stay SEG_LEN behind the bead ahead, so a
+ * plain position is all it needs. N_SEGS of these make one worm.
+ *   x, y : position in cells (can be fractional; rounded at draw time). */
 typedef struct { float x, y; } Seg;
 
-/* Worm — one sandworm built as a HEAD that drives a SEG_LEN-spaced FOLLOWER
- * CHAIN (the chain-of-circles / Conga model). INTENT / how it moves: only the
- * head is integrated — it rides a swim sinusoid (WS_SWIM) or a breach parabola
- * (WS_BREACH); the body is then relaxed in ONE pass, tail-from-head, by a
- * one-sided DISTANCE CONSTRAINT (relax_chain) — if a segment sits farther than
- * SEG_LEN from the node ahead, slide it straight in until the gap == SEG_LEN.
- * That single relaxation IS Jakobsen's Verlet "stick" with the lead end pinned
- * [1], the
- * simplest case of Position-Based Dynamics [2] and the FABRIK follow-the-leader
- * pass [3]; it is O(N_SEGS) and needs no per-segment velocity. Worms live in a
- * fixed object pool — `active` marks a live slot, so there is no allocation on
- * the hot path.
+/* Worm — one sandworm: a head that leads and a chain of beads that follow it.
+ * Only the head actually moves on its own (along a swim wave or a breach arc);
+ * the body then catches up in one pass from head to tail, each bead pulled in
+ * to sit SEG_LEN behind the one ahead (relax_chain). This follower trick is
+ * Jakobsen's pinned-stick chain. Worms live in a fixed array — `active` marks a
+ * live slot — so nothing is allocated while the program runs.
  *
- *   segs[]        : the body chain; segs[0] is pinned to the head each tick and
- *                   the rest follow by the SEG_LEN constraint.
- *   hx, hy        : head position in CELLS (fractional; rounded at draw time).
- *   dir           : travel sense — +1 = rightward, -1 = leftward.
- *   speed         : head speed (cells/sec); per-worm = base speed * U[0.85,1.15)
- *                   sampled at reset, so worms never march in lock-step.
- *   state         : WState — WS_SWIM (below ground) or WS_BREACH (arcing over).
- *   swim_timer    : seconds of swimming left before the next breach fires; set
- *                   to a random SWIM_TIME_MIN..SWIM_TIME_MAX at each reset/arc.
- *   swim_phase    : accumulating sine phase (radians) for the underground path.
- *   breach_x0     : head x captured at breach start; the arc is parametric in
- *                   t = (hx-breach_x0)/(dir*BREACH_SPAN), with t in [0,1].
- *   mouth_open    : 0 = shut .. 1 = fully open; peaks at the breach apex (t≈0.5)
- *                   and drives how wide the head sprite's maw is drawn.
- *   ripple_timer  : countdown gating how often near-surface swimming sheds a
- *                   ripple (an EFFECTS cadence, not a sim input).
- *   respawn_timer : counts UP while inactive; at 2 s the slot respawns. Preserved
- *                   across worm_reset so the delay survives the reset.
- *   sprayed       : one-shot latch so the breach sand-burst fires exactly once.
- *   active        : 1 while this pool slot holds a live worm. */
+ *   segs[]        : the body beads; segs[0] is snapped to the head each tick.
+ *   hx, hy        : head position in cells.
+ *   dir           : travel direction — +1 right, -1 left.
+ *   speed         : head speed (cells/sec); each worm gets a slightly different
+ *                   one at reset so they don't move in lock-step.
+ *   state         : swimming (WS_SWIM) or breaching (WS_BREACH).
+ *   swim_timer    : seconds of swimming left before the next breach.
+ *   swim_phase    : how far along the swim wave the head is.
+ *   breach_x0     : head x where the current breach began; the arc measures its
+ *                   progress from here.
+ *   mouth_open    : 0 shut .. 1 fully open; widest at the top of the arc and
+ *                   sets how wide the mouth is drawn.
+ *   ripple_timer  : countdown for how often a near-surface swim sheds a ripple.
+ *   respawn_timer : counts up while dead; at RESPAWN_DELAY_S the slot respawns.
+ *                   Kept across worm_reset so the wait survives the reset.
+ *   sprayed       : flag so the breach sand-burst fires exactly once per breach.
+ *   active        : 1 while this slot holds a live worm. */
 typedef struct {
     Seg    segs[N_SEGS];
-    float  hx, hy;          /* head position (float cells) */
+    float  hx, hy;          /* head position in cells */
     float  dir;             /* +1 right / -1 left */
     float  speed;
     WState state;
     float  swim_timer;      /* seconds until next breach */
-    float  swim_phase;      /* sinusoidal phase accumulator */
-    float  breach_x0;       /* hx at start of breach */
+    float  swim_phase;      /* how far along the swim wave */
+    float  breach_x0;       /* head x where this breach began */
     float  mouth_open;      /* 0=closed 1=fully open */
     float  ripple_timer;
-    float  respawn_timer;   /* counts up when inactive */
-    int    sprayed;         /* sand spray fired this breach? */
+    float  respawn_timer;   /* counts up while dead */
+    int    sprayed;         /* did this breach already throw sand? */
     int    active;
 } Worm;
 
-/* Scene — the ENTIRE simulation in one aggregate, laid out like a table of
- * contents so a reader sees WHAT exists, HOW it is tuned, and WHERE in its run
- * it is. WHY one aggregate: state lives in exactly one place, yet functions
- * still take the NARROWEST slice they need (const X* to read, X* to mutate) —
- * only scene_reset / scene_tick take Scene* — so "everything hangs off Scene"
- * never re-couples the layers. worms / ripples / spray are FIXED-SIZE OBJECT
- * POOLS: an `active` flag per slot, a linear scan for a free one, nothing
- * allocated after start-up (no malloc on the hot path).
- *
- *   WHAT  — the domain objects:
- *     terrain   : the dune height field (HeightField).
- *     worms[]   : pool of up to MAX_WORMS sandworms; n_worms of them are managed.
- *   EFFECTS — cosmetic pools the sim writes but never reads back:
- *     ripples[] : up to MAX_RIPPLES expanding sand rings.
- *     spray[]   : up to MAX_SPRAY ballistic sand grains.
- *   HOW   — the user-tunable simulation knobs:
- *     speed     : base head speed (cells/sec); +/- adjust it within [4,40], and
- *                 each worm samples speed*U[0.85,1.15) at reset.
- *     n_worms   : how many worm slots are managed; w/W adjust it in [1,MAX_WORMS].
- *   WHERE — run position / render selector:
- *     paused    : 1 freezes scene_tick (RENDER keeps running).
- *     theme     : index into k_themes of the active palette — a RENDER choice
- *                 (cycled by 't'), kept on Scene so reset/resize preserve it. */
+/* Scene — the whole simulation in one place. Keeping all state here means it
+ * lives in exactly one spot, while individual functions still take only the
+ * piece they need. The worms, ripples, and spray are fixed-size arrays with an
+ * `active` flag per slot, so nothing is allocated once the program is running.
+ *   terrain   : the dune surface.
+ *   worms[]   : up to MAX_WORMS sandworms; n_worms of them are in play.
+ *   ripples[] : up to MAX_RIPPLES expanding sand rings (cosmetic).
+ *   spray[]   : up to MAX_SPRAY flung sand grains (cosmetic).
+ *   speed     : base head speed; +/- changes it, each worm varies slightly.
+ *   n_worms   : how many worm slots are in play; w/W change it.
+ *   paused    : 1 freezes the simulation (drawing keeps going).
+ *   theme     : which palette is active; 't' cycles it, kept here so reset and
+ *               resize don't lose your choice. */
 typedef struct {
     HeightField terrain;
     Worm        worms[MAX_WORMS];
@@ -415,33 +263,26 @@ typedef struct {
 
 static Scene g_scene = { .speed = WORM_SPEED0, .n_worms = DEFAULT_WORMS };
 
-/* ── §4 LOGIC — pure reads (no mutation, no I/O) ──────────────────────────── *
- * Each reads its inputs and returns a value. Deleting or reordering
- * RENDER/EFFECTS cannot change their results.
- * ────────────────────────────────────────────────────────────────────────── */
+/* ── §4 logic — small helpers that only read and return a value ───────────── */
 
-/* PRNG utilities — the one impurity in §4: they advance the shared rand()
- * stream, but hold no sim state and touch no screen. They reproduce the file's
- * original 0.01-step jitter exactly, so swapping them in leaves visuals
- * unchanged. */
-
-/* uniform random float in [lo, hi) in 0.01 steps */
+/* random float somewhere in [lo, hi) */
 static float frand_range(float lo, float hi) {
     int steps = (int)((hi - lo) * 100.f + 0.5f);
     return lo + (float)(rand() % steps) * 0.01f;
 }
 
-/* symmetric random offset about 0: (rand()%n - n/2) * scale */
+/* random offset spread evenly above and below 0 */
 static float rand_centered(int n, float scale) {
     int off = rand() % n - n / 2;
     return (float)off * scale;
 }
 
-/* random +1 or -1 — a coin flip for which side a worm enters from */
+/* coin flip: +1 or -1, used to pick which side a worm comes from */
 static float rand_sign(void) {
     return (rand() % 2 == 0) ? 1.f : -1.f;
 }
 
+/* sand-surface row at column x (clamped to the screen) */
 static int terrain_at(const HeightField *hf, float x, int cols) {
     int c = (int)(x + 0.5f);
     if (c < 0)    c = 0;
@@ -449,7 +290,8 @@ static int terrain_at(const HeightField *hf, float x, int cols) {
     return hf->row[c];
 }
 
-/* segment character: direction toward head gives slope → ring char */
+/* pick the body glyph for a segment from which way it leans toward the head:
+   nearly vertical -> '|'/'!', nearly flat -> 'O'/'o'/'0', else a diagonal */
 static char seg_char(float dx, float dy, int idx) {
     float ax = fabsf(dx), ay = fabsf(dy);
     if (ay > ax * SLOPE_AXIS_RATIO)
@@ -465,36 +307,33 @@ static int count_active(const Worm *worms, int n_worms) {
     return n;
 }
 
-/* true once the whole body has cleared the screen edge plus a margin */
+/* true once the whole worm has slid past a screen edge, body and all */
 static int worm_off_field(const Worm *w, int cols) {
     float margin = (float)N_SEGS * SEG_LEN + RETIRE_MARGIN;
     return (w->dir > 0.f && w->hx > (float)cols + margin) ||
            (w->dir < 0.f && w->hx < -margin);
 }
 
-/* normalized progress along the breach arc: t in [0,1) as the head advances
-   BREACH_SPAN cols from breach_x0 (clamped non-negative). */
+/* how far the worm is through its breach arc: 0 at the start, 1 at the end */
 static float breach_t(const Worm *w) {
     float t = (w->hx - w->breach_x0) / (w->dir * BREACH_SPAN);
     return t < 0.f ? 0.f : t;
 }
 
-/* height above the surface at arc progress t — a parabola peaking at t=0.5
-   (4t(1-t) hits 1 at the apex), scaled to BREACH_HEIGHT rows. */
+/* how high above the surface the head sits partway through the arc; a smooth
+   hump that peaks halfway and reaches BREACH_HEIGHT rows there */
 static float breach_height(float t) {
     return BREACH_HEIGHT * 4.f * t * (1.f - t);
 }
 
-/* mouth openness 0..1: fully open at the apex (t=0.5), ramping shut within
-   MOUTH_APEX_WIN of it, closed beyond. */
+/* mouth openness 0..1: fully open at the top of the arc, closing on either side */
 static float mouth_openness(float t) {
     float d_apex = fabsf(t - 0.5f);
     return (d_apex < MOUTH_APEX_WIN) ? 1.f - d_apex / MOUTH_APEX_WIN : 0.f;
 }
 
-/* one sample of the dune profile at normalized x in [0,1]: a 3-octave fBm with
-   falling amplitude and rising frequency — a cheap periodic stand-in for Perlin
-   gradient noise [4][5]. */
+/* one sample of the dune height: three sine waves of shrinking size added up,
+   a cheap stand-in for Perlin noise that gives rolling dunes */
 static float dune_height(float x) {
     static const float freq [3] = { 2.1f, 5.3f, 11.7f };
     static const float amp  [3] = { 1.5f, 0.8f,  0.4f };
@@ -505,19 +344,15 @@ static float dune_height(float x) {
     return h;
 }
 
-/* 2-D integer hash → a well-mixed pseudo-random word (MurmurHash-style
-   finalizer); scatters a stable star field across the sky. */
+/* turn a (column, row) pair into a scrambled number; lets us scatter stars that
+   stay put frame to frame instead of flickering randomly */
 static unsigned int star_hash(int c, int r) {
     unsigned int h = (unsigned int)(c * 1234597u ^ r * 987659u);
     h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
     return h;
 }
 
-/* ── §5 EFFECTS — cosmetic-only particle pools ────────────────────────────── *
- * Ripples and spray advance over time but are NEVER read back by the worm
- * simulation, so they cannot influence worm motion. SIMULATION spawns into
- * them (ripple_spawn / spray_burst); scene_tick advances them each tick.
- * ────────────────────────────────────────────────────────────────────────── */
+/* ── §5 effects — sand ripples and spray (cosmetic only) ──────────────────── */
 
 static void ripple_spawn(Ripple *ripples, float ox) {
     for (int i = 0; i < MAX_RIPPLES; i++) {
@@ -539,11 +374,11 @@ static void ripple_update(Ripple *ripples, float dt) {
 static void spray_one(Spray *spray, float x, float y) {
     for (int i = 0; i < MAX_SPRAY; i++) {
         if (spray[i].active) continue;
-        /* upward hemisphere: angle 0..π → left/up/right burst */
+        /* aim somewhere in the upper half-circle so grains fly up and out */
         float ang = (float)(rand() % 180) * (float)M_PI / 180.f;
         float spd = frand_range(3.f, 10.f);     /* grain speed (cells/sec) */
         spray[i].active   = 1;
-        spray[i].x        = x + rand_centered(7, 0.5f);   /* small spawn scatter */
+        spray[i].x        = x + rand_centered(7, 0.5f);   /* scatter the start a bit */
         spray[i].y        = y;
         spray[i].vx       =  cosf(ang) * spd;
         spray[i].vy       = -sinf(ang) * spd;   /* negative = upward */
@@ -568,28 +403,24 @@ static void spray_update(Spray *spray, float dt) {
     }
 }
 
-/* ── §6 SIMULATION — worm physics & the per-tick combine ───────────────────── *
- * worm_update advances one worm by delegating to the phase helpers worm_swim /
- * worm_breach (which read terrain via LOGIC §4 and spawn into EFFECTS §5), then
- * relax_chain pulls the body after the head. scene_tick is the SINGLE per-tick
- * combine — nothing else in the program advances simulation state. worm_reset
- * re-seeds one worm and is reused by INIT (§7) and worm_try_respawn here.
- * ────────────────────────────────────────────────────────────────────────── */
+/* ── §6 simulation — move the worms, then their bodies, once per tick ─────── */
 
+/* put one worm back at the start: pick a side, a slightly random speed, and
+   line its body up off-screen ready to swim in */
 static void worm_reset(Worm *w, const HeightField *hf, float speed,
                        int cols, int rows, float dir) {
-    float respawn = w->respawn_timer;  /* preserve across reset */
+    float respawn = w->respawn_timer;  /* keep the respawn countdown across the wipe */
     memset(w, 0, sizeof *w);
     w->respawn_timer = respawn;
     w->active      = 1;
     w->dir         = dir;
-    w->speed       = speed * frand_range(0.85f, 1.15f);   /* +/-15% so worms desync */
+    w->speed       = speed * frand_range(0.85f, 1.15f);   /* vary it so worms drift apart */
     w->state       = WS_SWIM;
     w->swim_timer  = frand_range(SWIM_TIME_MIN, SWIM_TIME_MAX);
-    w->swim_phase  = frand_range(0.f, 6.28f);             /* random start phase [0,2pi) */
+    w->swim_phase  = frand_range(0.f, 6.28f);             /* random spot on the swim wave */
     w->ripple_timer = 0.6f;
 
-    /* start off-screen on the side matching dir */
+    /* start off-screen on the side it's heading from */
     float start_x = (dir > 0.f)
                   ? -(float)(N_SEGS) * SEG_LEN
                   : (float)cols + (float)(N_SEGS) * SEG_LEN;
@@ -604,8 +435,8 @@ static void worm_reset(Worm *w, const HeightField *hf, float speed,
     (void)rows;
 }
 
-/* WS_SWIM: ride the underground sine path, shedding ripples while skimming the
-   surface, until the breach countdown fires. */
+/* swimming phase: ride the underground wave, leave a ripple when skimming near
+   the surface, and count down to the next breach */
 static void worm_swim(Worm *w, const HeightField *hf, Ripple *ripples,
                       float dt, int cols) {
     float surf = (float)terrain_at(hf, w->hx, cols);
@@ -613,7 +444,7 @@ static void worm_swim(Worm *w, const HeightField *hf, Ripple *ripples,
     w->swim_phase += SWIM_FREQ * w->speed * dt;
     w->mouth_open  = 0.f;
 
-    /* shed ripples while skimming near the surface */
+    /* close to the surface? shed a ripple now and then */
     float depth = w->hy - surf;
     if (depth < SWIM_DEPTH * RIPPLE_SHED_FRAC) {
         w->ripple_timer -= dt;
@@ -623,26 +454,24 @@ static void worm_swim(Worm *w, const HeightField *hf, Ripple *ripples,
         }
     }
 
-    /* countdown to the next breach */
+    /* time to breach? switch phases and burst a cluster of ripples */
     w->swim_timer -= dt;
     if (w->swim_timer <= 0.f) {
         w->state     = WS_BREACH;
         w->breach_x0 = w->hx;
         w->sprayed   = 0;
-        /* big ripple cluster at the breach point */
         ripple_spawn(ripples, w->hx);
         ripple_spawn(ripples, w->hx);
         ripple_spawn(ripples, w->hx + w->dir * 3.f);
     }
 }
 
-/* WS_BREACH: arc over the surface on a parabola, opening the mouth near the
-   apex and flinging a one-shot sand burst as the head breaks through; returns
-   to WS_SWIM when the arc completes. */
+/* breaching phase: arc up over the surface, open the mouth near the top, throw
+   sand once as the head breaks through, and drop back to swimming at the end */
 static void worm_breach(Worm *w, const HeightField *hf, Spray *spray, int cols) {
     float t = breach_t(w);
     if (t >= 1.f) {
-        /* completed arc — resume swimming */
+        /* arc done — go back under */
         w->state      = WS_SWIM;
         w->swim_timer = frand_range(SWIM_TIME_MIN, SWIM_TIME_MAX);
         w->mouth_open = 0.f;
@@ -651,7 +480,7 @@ static void worm_breach(Worm *w, const HeightField *hf, Spray *spray, int cols) 
         w->hy         = surf - breach_height(t);
         w->mouth_open = mouth_openness(t);
 
-        /* one-shot sand spray as the head breaks the surface */
+        /* throw sand once, right as the head breaks the surface */
         if (!w->sprayed && t > SPRAY_T_LO && t < SPRAY_T_HI) {
             spray_burst(spray, w->hx, surf, SPRAY_BURST_N);
             w->sprayed = 1;
@@ -659,9 +488,8 @@ static void worm_breach(Worm *w, const HeightField *hf, Spray *spray, int cols) 
     }
 }
 
-/* pin segs[0] to the head, then pull each following node straight in until it
-   sits exactly SEG_LEN from the node ahead — one tail-from-head pass of
-   Jakobsen's pinned distance constraint [1] (the chain-of-circles follower). */
+/* drag the body to follow the head: snap the first bead to the head, then walk
+   the rest, pulling each one in until it sits SEG_LEN behind the bead ahead */
 static void relax_chain(Worm *w) {
     w->segs[0].x = w->hx;
     w->segs[0].y = w->hy;
@@ -682,7 +510,7 @@ static void worm_update(Worm *w, const HeightField *hf,
                         float dt, int cols, int rows) {
     if (!w->active) return;
 
-    w->hx += w->dir * w->speed * dt;                 /* advance head along its lane */
+    w->hx += w->dir * w->speed * dt;                 /* move the head forward */
     if (w->state == WS_SWIM) worm_swim(w, hf, ripples, dt, cols);
     else                     worm_breach(w, hf, spray, cols);
 
@@ -692,7 +520,7 @@ static void worm_update(Worm *w, const HeightField *hf,
     (void)rows;
 }
 
-/* a dead slot ages its respawn timer and re-enters from a random side */
+/* a dead worm waits a moment, then comes back in from a random side */
 static void worm_try_respawn(Worm *w, const HeightField *hf, float speed,
                              int cols, int rows, float dt) {
     w->respawn_timer += dt;
@@ -700,7 +528,7 @@ static void worm_try_respawn(Worm *w, const HeightField *hf, float speed,
         worm_reset(w, hf, speed, cols, rows, rand_sign());
 }
 
-/* the per-tick combine: the ONLY place sim state advances (see ARCHITECTURE) */
+/* one simulation step: move every worm, then advance the ripples and spray */
 static void scene_tick(Scene *s, float dt, int cols, int rows) {
     for (int i = 0; i < s->n_worms; i++) {
         Worm *w = &s->worms[i];
@@ -713,13 +541,10 @@ static void scene_tick(Scene *s, float dt, int cols, int rows) {
     spray_update(s->spray, dt);
 }
 
-/* ── §7 INIT/RESET — builds Scene state (setup, NOT part of the tick) ───────── *
- * Mutates terrain + worm + effect state wholesale. Called at startup, on reset
- * (r), and on resize — all outside scene_tick.
- * ────────────────────────────────────────────────────────────────────────── */
+/* ── §7 init — build the scene fresh (startup, reset, and resize) ─────────── */
 
 static void terrain_init(HeightField *hf, int cols, int rows) {
-    hf->surface_row = rows / 2;                          /* surface sits at mid-screen */
+    hf->surface_row = rows / 2;                          /* surface sits mid-screen */
     for (int c = 0; c < cols; c++) {
         float x  = (float)c / (float)(cols > 1 ? cols - 1 : 1);
         int   gr = hf->surface_row + (int)(dune_height(x) + 0.5f);
@@ -734,19 +559,15 @@ static void scene_reset(Scene *s, int cols, int rows) {
     memset(s->ripples, 0, sizeof s->ripples);
     memset(s->spray,   0, sizeof s->spray);
     terrain_init(&s->terrain, cols, rows);
-    /* spawn worms alternating sides, stagger their breach timers */
+    /* worms enter from alternating sides, each a bit later than the last */
     for (int i = 0; i < s->n_worms; i++) {
         float dir = (i % 2 == 0) ? 1.f : -1.f;
         worm_reset(&s->worms[i], &s->terrain, s->speed, cols, rows, dir);
-        s->worms[i].swim_timer += (float)i * WORM_STAGGER_S;   /* stagger entries */
+        s->worms[i].swim_timer += (float)i * WORM_STAGGER_S;   /* stagger their breaches */
     }
 }
 
-/* ── §8 RENDER — Scene → screen (reads only, never mutates sim state) ──────── *
- * color_init / theme_apply set up pairs; the draw_* functions translate the
- * current state into characters and take the narrowest const sub-type. Particle
- * FADE is derived here from life fraction, never stored.
- * ────────────────────────────────────────────────────────────────────────── */
+/* ── §8 render — turn the scene into characters on screen ─────────────────── */
 
 static void theme_apply(int t) {
     const Theme *th = &k_themes[t];
@@ -820,15 +641,15 @@ static void draw_terrain(const HeightField *hf, int cols, int rows) {
     }
 }
 
-/* the follower chain, drawn tail-to-head so the head writes last (on top); each
-   segment is a slope glyph above ground, a faint dot showing through the sand. */
+/* draw the body, tail first so the head ends up on top; segments above ground
+   get a slope glyph, those still buried show as a faint dot */
 static void draw_worm_body(const Worm *w, const HeightField *hf, int cols, int rows) {
     for (int i = N_SEGS - 1; i >= 1; i--) {
         int sr = (int)(w->segs[i].y + 0.5f);
         int sc = (int)(w->segs[i].x + 0.5f);
         if (sr < 0 || sr >= rows || sc < 0 || sc >= cols) continue;
 
-        /* direction of this segment toward head */
+        /* which way this segment leans toward the head, for picking the glyph */
         float dx = w->segs[i-1].x - w->segs[i].x;
         float dy = w->segs[i-1].y - w->segs[i].y;
         char  ch = seg_char(dx, dy, i);
@@ -841,13 +662,13 @@ static void draw_worm_body(const Worm *w, const HeightField *hf, int cols, int r
             attr_t at = is_tail ? A_DIM : A_BOLD;
             attron(COLOR_PAIR(CP_WORM_TOP) | at);
             mvaddch(sr, sc, (chtype)(unsigned char)ch);
-            /* thicken: draw a second row when the segment is mostly horizontal */
+            /* mostly-flat segment? add a row below so the body looks thick */
             if (!is_tail && fabsf(dx) > fabsf(dy) * THICKEN_RATIO && sr + 1 < surf && sr + 1 < rows)
                 mvaddch(sr + 1, sc, (chtype)(unsigned char)ch);
             attroff(COLOR_PAIR(CP_WORM_TOP) | at);
         } else {
-            /* underground: bright dorsal theme colour so the body still shows
-               clearly through the sand (no A_DIM — that washes out against it) */
+            /* still buried: use the bright body color (not dim) so it shows
+               through the sand instead of washing out */
             attr_t at = is_tail ? A_NORMAL : A_BOLD;
             attron(COLOR_PAIR(CP_WORM_TOP) | at);
             mvaddch(sr, sc, (chtype)(unsigned char)(i % 3 == 0 ? 'o' : '.'));
@@ -856,9 +677,8 @@ static void draw_worm_body(const Worm *w, const HeightField *hf, int cols, int r
     }
 }
 
-/* the head: a multi-row open-mouth sprite when breaching above ground (top lip /
-   maw cavity / bottom lip, width from mouth_open), or a single bold dot when
-   still under the sand. */
+/* draw the head: above ground while breaching it's a little open-mouth sprite
+   (top lip, mouth, bottom lip, width from mouth_open); buried it's just a dot */
 static void draw_worm_head(const Worm *w, const HeightField *hf, int cols, int rows) {
     int hr = (int)(w->hy + 0.5f);
     int hc = (int)(w->hx + 0.5f);
@@ -868,7 +688,7 @@ static void draw_worm_head(const Worm *w, const HeightField *hf, int cols, int r
     int  above_ground = (hr < surf);
 
     if (above_ground) {
-        /* open_w: how many chars the mouth extends each side */
+        /* how many chars the mouth spreads to each side */
         int open_w = (int)(w->mouth_open * MOUTH_HALF_MAX);
 
         attron(COLOR_PAIR(CP_WORM_HEAD) | A_BOLD);
@@ -973,37 +793,31 @@ static void draw_spray(const Spray *spray, int cols, int rows) {
     }
 }
 
-/*
- * draw_hud — two fixed bars (HUD Standard). Takes the few scene values it shows
- * (not Scene*), so RENDER stays decoupled from the aggregate:
- *   top    row 0      DATA    — title (left) + speed / worm count / theme / run
- *                              state (right-aligned, yellow).
- *   bottom row rows-1 ACTIONS — the key legend (cyan).
- * Both bars are filled first, then text is clipped with "%.*s" so a narrow
- * terminal can neither overflow nor wrap.
- */
+/* draw the two status bars: stats along the top, the key legend along the
+   bottom. Each bar is filled blank first, then text is clipped to fit so a
+   narrow terminal can't overflow or wrap. */
 static void draw_hud(float speed, int n_active, int n_total,
                      const char *theme, int paused, int rows, int cols) {
     if (cols < 1 || rows < 1) return;
 
-    /* ── Top row 0: DATA. ── */
+    /* top row: title on the left, stats on the right */
     char left[24], right[72];
     snprintf(left,  sizeof left,  " DUNE SANDWORM ");
     snprintf(right, sizeof right, " spd:%.0f  worms:%d/%d  theme:%s  %s ",
              speed, n_active, n_total, theme,
              paused ? "PAUSED" : "running");
-    int rx = cols - (int)strlen(right);          /* right-aligned stats column */
+    int rx = cols - (int)strlen(right);          /* column where the stats start */
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
     for (int c = 0; c < cols; c++) mvaddch(0, c, ' ');
     if (rx >= 0) {
-        mvprintw(0, 0,  "%.*s", rx, left);       /* title clipped clear of stats */
+        mvprintw(0, 0,  "%.*s", rx, left);       /* title, clipped before the stats */
         mvprintw(0, rx, "%s", right);
     } else {
-        mvprintw(0, 0,  "%.*s", cols, right);    /* too narrow: data only */
+        mvprintw(0, 0,  "%.*s", cols, right);    /* too narrow: show stats only */
     }
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    /* ── Bottom row: ACTIONS — every interactive key. ── */
+    /* bottom row: every key you can press */
     int brow = rows - 1;
     if (brow > 0) {
         attron(COLOR_PAIR(CP_HINT) | A_BOLD);
@@ -1014,11 +828,7 @@ static void draw_hud(float speed, int n_active, int n_total,
     }
 }
 
-/* ── §9 EVENTS — signals & user actions (mutate state, NOT part of the tick) ─ *
- * Signal handlers set volatile flags read by main; they stay global so the
- * handlers can reach them without a Scene pointer. The key handling itself
- * lives inline in main's input loop. These run outside scene_tick.
- * ────────────────────────────────────────────────────────────────────────── */
+/* ── §9 events — signal handlers (key handling lives in main) ─────────────── */
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
 static void on_sigint(int s)   { (void)s; g_running = 0; }

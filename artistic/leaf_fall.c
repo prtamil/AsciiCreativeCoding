@@ -1,115 +1,10 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
-/* leaf_fall.c — ASCII tree with matrix-rain leaf fall
+/* leaf_fall.c — an ASCII tree that grows itself, then drops its leaves as
+ * Matrix-style digital rain, then regrows a slightly different tree, forever.
  *
- * States: DISPLAY (2.5 s static tree) → FALLING (matrix-rain leaf drop)
- *         → RESET (brief blank) → new algorithmically varied tree
- *
- * Keys: q/ESC quit   r new tree   spc skip state
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/leaf_fall.c -o leaf_fall -lncurses -lm
- *
- * §1 config   §2 performance   §3 simulation state   §4 logic
- * §5 simulation   §6 render   §7 app
- */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two-phase animation: (1) stochastic recursive tree growth
- *                  using a branching stack (iterative DFS), then (2) matrix-
- *                  rain-style leaf fall where each leaf column streams downward
- *                  with a white head and green trail.
- *
- * Data-structure : Leaf pool (MAX_LEAVES=4096) of (col, row, delay) structs.
- *                  Each leaf is assigned to a column of the rendered tree;
- *                  start delay staggers the fall so leaves drop in waves.
- *                  Trail drawn by remembering last TRAIL_LEN=7 row positions.
- *
- * Rendering      : Tree drawn into a virtual grid (GRID_ROWS×GRID_COLS) using
- *                  recursive branching with angle jitter (BRANCH_SPREAD=0.50
- *                  radians range); leaf chars scattered at branch tips.
- *                  FALL_NS=55 ms per step → ~18 fps fall rate, slower than
- *                  the 30 fps render tick for smooth trailing effect.
- *
- * State machine  : DISPLAY → FALLING → RESET → (new tree) in a cycle.
- *                  Each state has a fixed time budget (DISPLAY_NS=2.5 s,
- *                  RESET_NS=0.7 s) measured with CLOCK_MONOTONIC timestamps.
- *
- * References     :
- *   Procedural tree growth (§5 grow_tree — stochastic recursive branching)
- *     [1] Prusinkiewicz & Lindenmayer, "The Algorithmic Beauty of Plants"
- *         (Springer, 1990) — the canonical procedural-plant / L-system text.
- *     [2] Lindenmayer, "Mathematical models for cellular interactions in
- *         development," J. Theoretical Biology 18 (1968) — original L-systems.
- *   Rasterisation
- *     [3] Bresenham, "Algorithm for computer control of a digital plotter,"
- *         IBM Systems Journal 4(1) (1965) — the integer line drawer used by
- *         draw_branch_line to paint branches into the TreeGrid.
- *   Effect
- *     [4] "Matrix" digital rain — per-column streamer with a bright head and a
- *         fading trail; recycled here with the column AND the start row taken
- *         from the tree's foliage (cf. the project's matrix_rain.c).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The tree is grown ONCE into a cell grid (chars + colour-pair codes),
- * then frozen.  The leaves remember their birthplace (orig_row, orig_col)
- * and a single moving HEAD row.  When fall begins, each leaf's head
- * starts at orig_row and walks downward at its own period; the trail is
- * not stored — it's the last TRAIL_LEN rows above the head, drawn live
- * each frame with the head white-bold and the trail solid green.  This
- * is the matrix-rain composition recycled: per-column streamers, but the
- * column AND the start row come from the tree's foliage layout.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Two layers stacked.  Bottom layer: a still painting (trunk + branches
- * + leaves).  Top layer: vertical waterfalls, one per leaf, each with a
- * white droplet at the bottom and a fading green tail trailing upward.
- * In DISPLAY the waterfall is invisible — you see the painting.  In
- * FALLING the waterfall switches on per-leaf as its start_delay expires;
- * the painting's leaf cells turn into droplets and the static green
- * leaves disappear from their birthplace as the head leaves it behind.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. scene_new_tree()  — reseed LCG, clear grid, run grow_tree() which
- *     pushes branch tasks to a fixed-size Branch stack and processes them
- *     iteratively (DFS).  Branch ends call place_foliage(), which
- *     scatters leaves in an aspect-corrected ellipse (1×2 axes ratio
- *     compensates for non-square cells).  Each leaf gets a random
- *     start_delay in [0, MAX_START_DELAY) and fall_period in {1,2,3}.
- *  2. PHASE_DISPLAY for DISPLAY_NS; HUD shows static painting.
- *  3. PHASE_FALLING:  every FALL_NS the fall_tick() advances each started
- *     leaf's head_row when its sub-counter hits its period.  Leaves
- *     finish (done=true) when head exceeds rows + TRAIL_LEN.
- *  4. scene_draw() during fall: trunk/branch cells are drawn from the
- *     grid as-is.  Leaves not yet started → static green at orig.
- *     Started leaves → for j in [TRAIL_LEN..0], draw cell at
- *     (head_row − j, orig_col).  j=0 is the white head; j>0 is the
- *     green tail.  Trail is clipped at orig_row so rain starts AT the
- *     leaf, not above it.
- *  5. When all_done(), enter PHASE_RESET for RESET_NS, then loop with a
- *     new seed (g_cycle increments to vary tree shape).
- *
- * KEY FORMULAS
- * ────────────
- *  Branch endpoint (screen y-up, sin uses negation):
- *      er = r − ⌊sin(θ) · len⌋,   ec = c + ⌊cos(θ) · len⌋
- *  Foliage ellipse test (aspect-correct):
- *      d  = dr² + 0.25·dc²            (so semi-axes are rad × 2·rad)
- *      keep cell if d ≤ rad²
- *  Foliage density:  thresh = 0.62 + 0.33·d/(rad²+1); rng > thresh
- *  Leaf fall trigger:  ++fall_sub >= fall_period → head_row++
- *  LCG step       :  s = s · 1664525 + 1013904223
- *  Trunk height   :  h = (TRUNK_H_MIN..MAX) · g_rows  (≈45–65 % of screen)
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Tree growth follows the procedural-plant idea (Prusinkiewicz & Lindenmayer,
+ * "The Algorithmic Beauty of Plants", 1990); branches are drawn with Bresenham's
+ * line algorithm; the falling leaves reuse the Matrix digital-rain look. */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -126,48 +21,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
- *
- * Four real layers; two are intentionally absent.
- *
- *   LAYER        SECTION  MUTATES
- *   ────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2       nothing — clock primitives (the RENDER_NS frame cap
- *                           and FALL_NS fall accumulator live in §7 main)
- *   SIMULATION   §3,§5    §3 holds the state; §5 builds & advances it:
- *                           g_tree.ch/g_tree.cp (the frozen tree painting),
- *                           g_leaves[]/g_leaf_count (pool + per-tick head_row),
- *                           g_seed (PRNG), g_phase/g_phase_t/g_cycle/g_fall_tick
- *   LOGIC        §4       nothing — pure predicates (in_grid, all_done)
- *   RENDER       §6       the terminal only (ncurses); READS grid/leaves/state,
- *                           never writes them
- *
- *   EFFECTS  : ABSENT — the matrix-rain trail is NOT stored; it is redrawn each
- *              frame as the last TRAIL_LEN rows above head_row (scene_draw).
- *   DELAYS   : the two timed holds (DISPLAY_NS, RESET_NS) are not a module —
- *              they are elapsed-time comparisons in the state machine at the
- *              combine point (§7).  There is no pause feature.
- *
- * GENERATION vs TICK: grow_tree() and its helpers BUILD a tree once per cycle
- * (the reset / new-tree path); fall_tick() is the only PER-TICK advance.
- *
- * LOGIC (§4) is provably uncorruptable from RENDER: it does no mutation and no
- * I/O, so reordering or deleting any draw cannot change in_grid / all_done.
- *
- * Per-tick combine order — main() (§7) is the ONLY place that advances state:
- *     1. PERFORMANCE  measure dt (capped at 100 ms)              §7
- *     2. SIMULATION   state-machine transitions (timed / all_done) §7 + §4/§5
- *     3. PERFORMANCE  fall accumulator → fall_tick() per FALL_NS  §7 → §5
- *     4. RENDER       scene_draw() + HUD (read-only)             §6 + §7
- *     5. PERFORMANCE  sleep to the RENDER_NS frame cap           §7
- *
- * User events (q/r/spc keys, SIGWINCH resize) may rebuild the tree or change
- * state but are NOT part of the tick — they are handled at the top of the loop
- * before the tick (§7): the g_resize block and the getch() branch.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── §1 config ────────────────────────────────────────────────────────────── */
+/* ── §1 config — timings, sizes, and tunable knobs ── */
 #define RENDER_FPS      30
 #define RENDER_NS       (1000000000LL / RENDER_FPS)
 #define FALL_NS         55000000LL    /* 55 ms per fall step (~18 fps) */
@@ -200,7 +54,7 @@ static const float BRANCH_SPREAD = 0.50f;
 #define CP_HUD    6   /* top: data readout */
 #define CP_HINT   7   /* bottom: action keys */
 
-/* ── §2 performance — timing primitives (frame cap / accumulators in §7) ───── */
+/* ── §2 performance — read and sleep on the monotonic clock ── */
 static long long clock_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -212,53 +66,42 @@ static void clock_sleep_ns(long long ns) {
     nanosleep(&ts, NULL);
 }
 
-/* ── §3 simulation state — the data SIMULATION owns (mutated only by §5) ────── */
+/* ── §3 simulation state — the data the simulation owns ── */
 
-/* TreeGrid — the tree rasterised ONCE into a fixed cell grid: a glyph plus a
- * colour-pair code per cell.
+/* TreeGrid — the whole tree painted once into a fixed grid of cells, then held
+ * still on screen.  We draw the branching tree ONE time into this grid and then
+ * just copy cells to the screen each frame, so the costly growth happens once
+ * rather than every frame.  Two parallel arrays (one char, one small int per
+ * cell) keep memory tight with no padding.
  *
- * WHY a grid (a framebuffer): the tree is produced by stochastic recursive
- * branching, but we want a STATIC image to hold on screen for 2.5 s and to
- * anchor the leaf fall.  So grow_tree() rasterises the whole branching process
- * ONCE into this grid (branch lines via Bresenham, ref [3]) and freezes it;
- * every frame then just blits cells — generation cost is paid once, not per
- * frame.  Struct-of-arrays (parallel ch/cp) keeps each cell to a char + an
- * int8_t with no struct padding, versus an array-of-structs.
- *
- * VALUE LOGIC: ch[r][c]==0 marks an empty cell (skipped by the renderer); cp
- * is the colour-pair tag (CP_TRUNK / CP_BRANCH / CP_LEAF) that doubles as a
- * cell TYPE — add_leaf refuses to overwrite trunk/branch cells, and scene_draw
- * animates CP_LEAF cells while drawing the rest verbatim. */
+ *   ch[r][c]  the glyph drawn at that cell; 0 means the cell is empty.
+ *   cp[r][c]  which colour pair to use AND what kind of cell it is
+ *             (trunk, branch, or leaf).  The colour code doubles as a type tag:
+ *             leaves are animated when they fall, trunk/branch cells never move,
+ *             and a leaf is never allowed to overwrite a trunk or branch cell. */
 typedef struct {
-    char   ch[GRID_ROWS][GRID_COLS];   /* glyph per cell (0 = empty)     */
-    int8_t cp[GRID_ROWS][GRID_COLS];   /* colour-pair code + cell type   */
+    char   ch[GRID_ROWS][GRID_COLS];
+    int8_t cp[GRID_ROWS][GRID_COLS];
 } TreeGrid;
 static TreeGrid g_tree;
 
-/* Leaf — one foliage cell that becomes a "digital-rain" streamer when it falls
- * (the Matrix-rain effect, ref [4]: a bright white head trailing a fading green
- * tail).
+/* Leaf — one leaf that turns into a falling Matrix-rain streak: a bright white
+ * head leaving a fading green tail behind it as it drops.
  *
- * WHY store so little: the trail is NOT kept anywhere — only the single moving
- * head_row is stored, and scene_draw re-derives the last TRAIL_LEN rows above
- * it each frame.  That shrinks a streamer of arbitrary length to ~16 bytes, so
- * the whole canopy (up to MAX_LEAVES) fits in a flat pool with no allocation.
- *
- * CONTEXT: leaves are created by place_foliage() at branch tips; the per-leaf
- * randomised start_delay + fall_period make the canopy drop in staggered waves
- * rather than as one sheet.
- *
- * VALUE LOGIC: the head walks from orig_row downward; clipping the trail at
- * orig_row makes the rain ORIGINATE at the leaf, not above it. */
+ * We store almost nothing about the trail.  Only the head's current row is kept;
+ * the tail is just redrawn each frame as the few rows directly above the head.
+ * That keeps each leaf tiny, so the whole canopy fits in one fixed array with no
+ * memory allocation.  Each leaf gets a random start delay and speed so the
+ * canopy drops in scattered waves instead of all at once. */
 typedef struct {
-    int16_t orig_row, orig_col; /* birthplace in the grid (and trail origin)   */
-    char    ch;                 /* the leaf glyph (chosen from k_lch)          */
-    int16_t head_row;           /* current head row; walks down during FALLING */
-    bool    started;            /* has start_delay elapsed? (fall has begun)   */
-    bool    done;               /* head passed bottom + trail → fully gone     */
-    int16_t start_delay;        /* ticks to wait before falling (staggers waves) */
-    int16_t fall_period;        /* ticks per row step: 1=fast 2=med 3=slow     */
-    int16_t fall_sub;           /* sub-tick counter toward fall_period         */
+    int16_t orig_row, orig_col; /* where the leaf was born; also where its rain starts */
+    char    ch;                 /* the glyph this leaf is drawn with                   */
+    int16_t head_row;           /* the row the falling head is on right now            */
+    bool    started;            /* true once start_delay is up and the leaf has begun falling */
+    bool    done;               /* true once the head and its tail are fully off-screen */
+    int16_t start_delay;        /* ticks to wait before this leaf starts falling       */
+    int16_t fall_period;        /* ticks between downward steps: 1 fast, 2 medium, 3 slow */
+    int16_t fall_sub;           /* counts up toward fall_period, then steps down a row  */
 } Leaf;
 
 /* Leaf pool + active screen extent + PRNG state. */
@@ -270,23 +113,19 @@ static unsigned g_seed;
 /* Fall sub-tick counter (advanced by fall_tick). */
 static int g_fall_tick;
 
-/* Phase — the scene's timed animation cycle, as a finite state machine: show
- * the finished tree, drop its leaves, blank briefly, then regrow.
- *
- * WHY a cycle: the demo runs forever, varying the tree each round (g_cycle
- * perturbs the seed).  Each phase owns a different exit condition, so the loop
- * stays a clean 3-state machine rather than a tangle of timers.
- *
- * VALUE LOGIC (transitions evaluated in main):
- *   DISPLAY → FALLING  once DISPLAY_NS has elapsed
- *   FALLING → RESET    when all_done() (every leaf off-screen)
- *   RESET   → DISPLAY  after RESET_NS, via scene_new_tree() (fresh seed). */
+/* Phase — which part of the endless cycle we're in: show the finished tree,
+ * drop its leaves, go blank briefly, then grow a fresh tree and repeat.  Each
+ * phase ends on its own condition (a timer, or "all leaves gone"), which keeps
+ * the main loop simple.  Transitions are decided in main():
+ *   DISPLAY → FALLING  once the display timer runs out
+ *   FALLING → RESET    once every leaf has fallen off-screen
+ *   RESET   → DISPLAY  after the blank timer, growing a new tree. */
 typedef enum { PHASE_DISPLAY, PHASE_FALLING, PHASE_RESET } Phase;
-static Phase     g_phase;     /* current animation phase                    */
-static long long g_phase_t;   /* clock_ns timestamp when this phase began   */
-static unsigned  g_cycle;     /* trees shown so far (also varies the seed)  */
+static Phase     g_phase;     /* which phase we're in right now             */
+static long long g_phase_t;   /* clock timestamp when this phase started    */
+static unsigned  g_cycle;     /* how many trees shown so far (also seeds variety) */
 
-/* ── §4 logic — pure predicates over the state: no mutation, no I/O ─────────── */
+/* ── §4 logic — yes/no questions about the state, with no side effects ── */
 
 static bool in_grid(int r, int c) {
     return r >= 0 && r < g_rows && r < GRID_ROWS &&
@@ -300,9 +139,9 @@ static bool all_done(void) {
     return true;
 }
 
-/* ── §5 simulation — builds the tree (generation) and advances the fall ─────── */
+/* ── §5 simulation — grow the tree, then advance the falling leaves ── */
 
-/* LCG — deterministic from seed */
+/* Cheap repeatable random numbers: same seed always gives the same tree. */
 static unsigned lcg(void)  { g_seed = g_seed * 1664525u + 1013904223u; return g_seed; }
 static float    lcgf(void) { return (float)(lcg() & 0x7fffffffu) / (float)0x7fffffffu; }
 
@@ -330,23 +169,24 @@ static void add_leaf(int r, int c, char ch) {
         .started     = false,
         .done        = false,
         .start_delay = (int16_t)(lcg() % MAX_START_DELAY),
-        .fall_period = (int16_t)(1 + (int)(lcg() % 3)),  /* 1=fast 2=med 3=slow */
+        .fall_period = (int16_t)(1 + (int)(lcg() % 3)),  /* random speed: 1 fast, 2 medium, 3 slow */
         .fall_sub    = 0,
     };
 }
 
 static const char k_lch[] = "*@&#%o~";
 
-/* elliptical foliage patch — aspect-correct so it looks round on screen */
+/* Scatter a clump of leaves around (r,c).  Terminal cells are taller than they
+ * are wide, so the clump is stretched twice as wide as tall to look round. */
 static void place_foliage(int r, int c, int rad) {
     if (rad < 1) rad = 1;
     int nlch = (int)(sizeof(k_lch) - 1);
     for (int dr = -rad; dr <= rad; dr++) {
         for (int dc = -(rad * 2); dc <= (rad * 2); dc++) {
-            /* ellipse: semi-axes rad (rows) × 2*rad (cols) ≈ circle on terminal */
+            /* skip cells outside the round patch */
             float d = (float)(dr * dr) + FOLIAGE_ASPECT * (float)(dc * dc);
             if (d > (float)(rad * rad)) continue;
-            /* density falls off toward edge — keep sparse */
+            /* thinner toward the edge, so the clump fades out instead of ending hard */
             float thresh = FOLIAGE_DENSITY_BASE
                          + FOLIAGE_DENSITY_FALLOFF * d / (float)(rad * rad + 1);
             if (lcgf() > thresh) {
@@ -357,14 +197,14 @@ static void place_foliage(int r, int c, int rad) {
     }
 }
 
-/* Glyph for a branch line from its run direction: vertical, horizontal, diagonal. */
+/* Pick the glyph for a branch line based on which way it runs. */
 static char branch_glyph(int dr, int dc, int sr, int sc) {
     return (dc == 0) ? '|' :
            (dr == 0) ? '-' :
            (sr * sc > 0) ? '\\' : '/';
 }
 
-/* Bresenham line (ref [3]) — rasterise a branch into the TreeGrid. */
+/* Draw a straight branch from one cell to another using Bresenham's line. */
 static void draw_branch_line(int r0, int c0, int r1, int c1, int8_t cp) {
     int dr = abs(r1 - r0), dc = abs(c1 - c0);
     int sr = (r1 > r0) ? 1 : -1, sc = (c1 > c0) ? 1 : -1;
@@ -372,7 +212,7 @@ static void draw_branch_line(int r0, int c0, int r1, int c1, int8_t cp) {
     int r = r0, c = c0;
     char ch = branch_glyph(dr, dc, sr, sc);
     for (;;) {
-        /* don't overwrite thick trunk chars with thinner branch chars */
+        /* leave the thick trunk alone; thin branches shouldn't paint over it */
         if (in_grid(r, c) && g_tree.cp[r][c] != CP_TRUNK) {
             g_tree.ch[r][c] = ch;
             g_tree.cp[r][c]  = cp;
@@ -384,49 +224,46 @@ static void draw_branch_line(int r0, int c0, int r1, int c1, int8_t cp) {
     }
 }
 
-/* Branch — one pending branch segment on the growth stack: a turtle-graphics
- * state (position + heading + length + recursion depth).
+/* Branch — one branch segment still waiting to be drawn.  Instead of calling
+ * itself recursively (which could overflow on a deep tree), the grower keeps a
+ * to-do list of branches in a fixed array and works through it in a loop.  When
+ * the list is full it simply stops, so it can never run out of memory.
  *
- * WHY an explicit stack instead of recursion: grow_tree() is an iterative DFS
- * — it pushes child Branches onto g_bstack and pops them in a loop.  This caps
- * memory at BSTACK_MAX (no unbounded call stack / overflow on deep trees) and
- * lets the generator bail cleanly when the stack is full.  The stochastic
- * branching itself is the procedural-plant / L-system idea (refs [1][2]).
- *
- * VALUE LOGIC: (r,c) is the segment's start cell; angle is its heading in
- * radians (M_PI/2 = straight up, since screen y is inverted); len is its length
- * in cells; depth is the recursion level — it selects thickness (CP_TRUNK when
- * ≤2, else CP_BRANCH) and triggers the switch to foliage at MAX_DEPTH. */
+ *   r, c    the cell where this branch segment starts.
+ *   angle   the direction it points, in radians (straight up is M_PI/2, because
+ *           screen rows count downward).
+ *   len     how long the segment is, in cells.
+ *   depth   how deep into the tree we are: low depth means thick trunk, deeper
+ *           means thin branch, and the deepest branches turn into leaf clumps. */
 typedef struct { int r, c; float angle; int len; int depth; } Branch;
 static Branch g_bstack[BSTACK_MAX];
 
-/* Draw the trunk: a 2-cell column, a wider flare at the base, and root buttresses. */
+/* Draw the trunk: a two-cell column, a wider flare near the base, and little roots. */
 static void draw_trunk(int base_row, int base_col, int trunk_h, int trunk_top) {
-    /* 2-cell wide trunk */
     for (int row = base_row; row >= trunk_top; row--) {
         set_cell(row, base_col,     '|', CP_TRUNK);
         set_cell(row, base_col + 1, '|', CP_TRUNK);
     }
-    /* wider flare at base (~25% of trunk height) */
+    /* widen the bottom quarter of the trunk so the base looks heavier */
     int flare = trunk_h / 4;
     for (int row = base_row; row >= base_row - flare; row--) {
         set_cell(row, base_col - 1, '|', CP_TRUNK);
         set_cell(row, base_col + 2, '|', CP_TRUNK);
     }
-    /* root buttresses at very bottom */
+    /* roots splaying out at the very bottom */
     set_cell(base_row, base_col - 2, '/', CP_TRUNK);
     set_cell(base_row, base_col + 3, '\\', CP_TRUNK);
 }
 
-/* Seed the growth stack with 3–5 pairs of primary branches up the trunk
- * (longest at mid-canopy).  Returns the new stack top. */
+/* Add the first big branches: 3-5 left/right pairs going up the trunk, longest
+ * around the middle.  Returns the updated stack position. */
 static int push_trunk_branches(int base_row, int base_col, int trunk_h, int bsp) {
-    int n_pts = 3 + (int)(lcgf() * 3.0f);   /* 3–5 */
+    int n_pts = 3 + (int)(lcgf() * 3.0f);   /* between 3 and 5 */
     for (int i = 0; i < n_pts && bsp < BSTACK_MAX - 2; i++) {
         float hf     = (float)(i + 1) / (float)(n_pts + 1);
         int   br     = base_row - (int)(hf * (float)trunk_h * 0.95f);
         float spread = BRANCH_SPREAD + lcgf() * 0.35f;
-        /* branches are longer at mid-canopy */
+        /* longest in the middle of the trunk, shorter near top and bottom */
         float len_f  = 0.25f + 0.35f * (1.0f - fabsf(hf - 0.5f) * 2.0f) + lcgf() * 0.10f;
         int   blen   = (int)(len_f * (float)trunk_h);
         if (blen < 3) blen = 3;
@@ -436,7 +273,7 @@ static int push_trunk_branches(int base_row, int base_col, int trunk_h, int bsp)
     return bsp;
 }
 
-/* Seed the top crown: two spreading branches plus one straight-up shoot. */
+/* Add the crown at the top: two branches spreading out plus one shooting straight up. */
 static int push_crown_branches(int base_col, int trunk_top, int trunk_h, int bsp) {
     if (bsp < BSTACK_MAX - 3) {
         int   top_len = trunk_h / 3;
@@ -449,14 +286,14 @@ static int push_crown_branches(int base_col, int trunk_top, int trunk_h, int bsp
     return bsp;
 }
 
-/* Branch endpoint from heading θ and length (screen y inverted → sin negated). */
+/* Where a branch ends, given its start, direction, and length. */
 static void branch_endpoint(const Branch *t, int *er, int *ec) {
     *er = t->r - (int)(sinf(t->angle) * (float)t->len);
     *ec = t->c + (int)(cosf(t->angle) * (float)t->len);
 }
 
-/* Expand one popped branch: cap it with foliage (terminal / max depth), or draw
- * its line and push child branches at depth+1.  Mutates the stack via *bsp. */
+/* Handle one branch: if it's a tip, top it with leaves; otherwise draw it and
+ * add a couple of smaller child branches to the to-do list. */
 static void grow_branch(Branch t, int *bsp) {
     if (t.len <= 1 || t.depth > MAX_DEPTH) {
         int frad = 2 + (MAX_DEPTH - t.depth) / 2;
@@ -472,7 +309,7 @@ static void grow_branch(Branch t, int *bsp) {
     int8_t cp = (t.depth <= 2) ? CP_TRUNK : CP_BRANCH;
     draw_branch_line(t.r, t.c, er, ec, cp);
 
-    /* sparse foliage along mid/deep branches */
+    /* sprinkle a few leaves along the deeper branches, not just at the tips */
     if (t.depth >= 4 && lcgf() < 0.40f)
         place_foliage(er, ec, 1);
 
@@ -488,7 +325,7 @@ static void grow_branch(Branch t, int *bsp) {
     if (*bsp < BSTACK_MAX - 3) {
         g_bstack[(*bsp)++] = (Branch){ er, ec, t.angle + spread, slen, t.depth + 1 };
         g_bstack[(*bsp)++] = (Branch){ er, ec, t.angle - spread, slen, t.depth + 1 };
-        /* occasional straight-ahead sub-branch */
+        /* now and then add a third branch carrying roughly straight on */
         if (lcgf() < 0.35f && *bsp < BSTACK_MAX - 1) {
             float jitter = (lcgf() - 0.5f) * 0.20f;
             g_bstack[(*bsp)++] = (Branch){ er, ec, t.angle + jitter,
@@ -497,9 +334,10 @@ static void grow_branch(Branch t, int *bsp) {
     }
 }
 
-/* Grow one whole tree into the grid: trunk, then an iterative-DFS branch expand. */
+/* Grow one whole tree into the grid: draw the trunk, then work through every
+ * branch on the to-do list until none are left. */
 static void grow_tree(int base_row, int base_col) {
-    /* trunk height (clamped to fit the screen) */
+    /* random trunk height, kept inside the screen */
     int trunk_h = (int)((TRUNK_H_MIN + lcgf() * (TRUNK_H_MAX - TRUNK_H_MIN)) * (float)g_rows);
     if (trunk_h < 8) trunk_h = 8;
     int trunk_top = base_row - trunk_h;
@@ -507,7 +345,6 @@ static void grow_tree(int base_row, int base_col) {
 
     draw_trunk(base_row, base_col, trunk_h, trunk_top);
 
-    /* seed the growth stack, then expand it depth-first */
     int bsp = 0;
     bsp = push_trunk_branches(base_row, base_col, trunk_h, bsp);
     bsp = push_crown_branches(base_col, trunk_top, trunk_h, bsp);
@@ -518,9 +355,8 @@ static void grow_tree(int base_row, int base_col) {
     }
 }
 
-/* per-tick advance: walk each started leaf's head downward at its own period */
-/* Advance one leaf: wait out start_delay, then step the head down one row every
- * fall_period ticks; mark done once it clears the bottom + trail. */
+/* Advance one leaf by a tick: wait out its delay, then drop one row every few
+ * ticks, and mark it done once it (and its tail) have left the screen. */
 static void leaf_step(Leaf *lf) {
     if (lf->done) return;
     if (!lf->started) {
@@ -541,7 +377,7 @@ static void fall_tick(void) {
 }
 
 static void scene_new_tree(void) {
-    /* vary seed per cycle for algorithmic diversity */
+    /* fresh seed each cycle so every tree comes out a little different */
     g_seed = (unsigned)clock_ns() ^ (g_cycle * 0x9e3779b9u);
     g_cycle++;
     grid_clear();
@@ -557,7 +393,7 @@ static void scene_resize(int rows, int cols) {
     scene_new_tree();
 }
 
-/* ── §6 render — state → screen; reads only, never mutates sim state ────────── */
+/* ── §6 render — draw the current state to the terminal ── */
 static void color_init(void) {
     start_color();
     use_default_colors();
@@ -580,13 +416,13 @@ static void color_init(void) {
     }
 }
 
-/* Blit the frozen trunk + branch cells (leaf cells are drawn separately). */
+/* Copy the still trunk and branch cells to the screen; leaves are drawn later. */
 static void draw_tree_cells(void) {
     for (int r = 0; r < g_rows && r < GRID_ROWS; r++) {
         for (int c = 0; c < g_cols && c < GRID_COLS; c++) {
             char   ch = g_tree.ch[r][c];
             int8_t cp = g_tree.cp[r][c];
-            if (!ch || cp == CP_LEAF) continue;   /* empty cell or a leaf cell */
+            if (!ch || cp == CP_LEAF) continue;   /* skip empty cells and leaves */
             attron(COLOR_PAIR(cp) | A_BOLD);
             mvaddch(r, c, (chtype)(unsigned char)ch);
             attroff(COLOR_PAIR(cp) | A_BOLD);
@@ -594,20 +430,20 @@ static void draw_tree_cells(void) {
     }
 }
 
-/* Draw one leaf: a static green glyph at rest, or a falling matrix-rain
- * streamer (white head + green trail clipped to its birthplace). */
+/* Draw one leaf: a still green glyph when at rest, or a falling streak with a
+ * white head and a green tail when it's dropping. */
 static void draw_leaf(const Leaf *lf, bool falling) {
     if (!falling || !lf->started) {
-        /* static green leaf at original position */
+        /* still green leaf, drawn where it grew */
         attron(COLOR_PAIR(CP_LEAF) | A_BOLD);
         mvaddch(lf->orig_row, lf->orig_col, (chtype)(unsigned char)lf->ch);
         attroff(COLOR_PAIR(CP_LEAF) | A_BOLD);
         return;
     }
-    if (lf->done) return;   /* fallen off screen — erase() cleared it */
+    if (lf->done) return;   /* already off-screen; erase() handled the cleanup */
 
-    /* matrix-rain trail: green body + white head.  Clipped to orig_row so the
-     * rain originates AT the leaf position, not above it. */
+    /* draw the falling streak from tail to head; stop the tail at the leaf's
+     * birthplace so the rain seems to start there, not in midair above it */
     for (int j = TRAIL_LEN; j >= 0; j--) {
         int r = lf->head_row - j;
         if (r < lf->orig_row || r < 0 || r >= g_rows) continue;
@@ -641,7 +477,7 @@ static void screen_init(void) {
 }
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* HUD — data readout top-right, action keys bottom-left (bright + A_BOLD). */
+/* On-screen status: phase and counters top-right, key hints bottom-left. */
 static void draw_hud(int rows, int cols) {
     const char *phase_name = (g_phase == PHASE_DISPLAY) ? "display" :
                              (g_phase == PHASE_FALLING) ? "falling" : "reset";
@@ -659,7 +495,7 @@ static void draw_hud(int rows, int cols) {
     attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ── §7 app — combine point (per-tick order) + user events + frame cap ──────── */
+/* ── §7 app — setup, input, the main loop, and shutdown ── */
 static volatile sig_atomic_t g_quit   = 0;
 static volatile sig_atomic_t g_resize = 0;
 
@@ -685,7 +521,7 @@ int main(void) {
     long long last_ns  = clock_ns();
 
     while (!g_quit) {
-        /* USER EVENT (out of tick): apply resize → rebuild the tree */
+        /* terminal was resized: grow a fresh tree to fit the new size */
         if (g_resize) {
             g_resize = 0;
             getmaxyx(stdscr, rows, cols);
@@ -695,7 +531,7 @@ int main(void) {
             continue;
         }
 
-        /* USER EVENT (out of tick): keys — quit / new tree / skip state */
+        /* keys: quit, grow a new tree, or skip ahead to the next phase */
         int ch = getch();
         if (ch == 'q' || ch == 27) break;
         if (ch == 'r') {
@@ -709,7 +545,7 @@ int main(void) {
             }
         }
 
-        /* 1. PERFORMANCE — measure dt, capped to avoid spiral-of-death */
+        /* time since last frame; capped so a long stall can't make the sim lurch */
         long long now_ns = clock_ns();
         long long dt     = now_ns - last_ns;
         last_ns = now_ns;
@@ -717,7 +553,7 @@ int main(void) {
 
         long long elapsed = now_ns - g_phase_t;
 
-        /* 2. SIMULATION — state-machine transitions (timed holds / all_done) */
+        /* move between phases when their timer runs out or all leaves have fallen */
         if (g_phase == PHASE_DISPLAY && elapsed >= DISPLAY_NS) {
             g_phase = PHASE_FALLING; g_phase_t = now_ns;
         }
@@ -729,19 +565,19 @@ int main(void) {
             continue;
         }
 
-        /* 3. PERFORMANCE — fall accumulator drives fall_tick at FALL_NS */
+        /* step the falling leaves at their own steady rate, separate from the frame rate */
         if (g_phase == PHASE_FALLING) {
             fall_acc += dt;
             while (fall_acc >= FALL_NS) { fall_tick(); fall_acc -= FALL_NS; }
         }
 
-        /* 4. RENDER — read-only: scene then HUD on top */
+        /* draw the scene, then the status text on top */
         erase();
         if (g_phase != PHASE_RESET) scene_draw();
         draw_hud(rows, cols);
         screen_present();
 
-        /* 5. PERFORMANCE — sleep to the render frame cap */
+        /* sleep off the rest of the frame to hold a steady frame rate */
         clock_sleep_ns(RENDER_NS - (clock_ns() - now_ns));
     }
 

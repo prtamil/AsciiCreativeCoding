@@ -1,99 +1,10 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * nebula.c — drifting nebula with star births and shock illumination
- *
- * DEMO: A multi-octave fBm scalar field defines the density and tint
- *       of a glowing gas cloud that fills the screen. The field
- *       slowly scrolls across two parallax layers — a near layer
- *       (high frequency, dim) and a far layer (low frequency, brighter)
- *       — giving an illusion of cosmic depth. A static catalogue of
- *       background stars sparkles. Periodically (every ~5–8 seconds)
- *       a NEW STAR is born somewhere inside the densest gas: a sharp
- *       flash, then a slow expanding spherical shock-wave illuminates
- *       the surrounding gas for several seconds before fading.
- *
- *       The result is a still, vast, slowly evolving cosmic scene with
- *       occasional dramatic moments — a star nursery seen from a
- *       distant telescope.
- *
- * Study alongside: artistic/galaxy.c (rotating disc — opposite scale),
- *                  fluid/wave_2d.c (the radial wave-front under the
- *                  shock illumination uses similar 1/r decay),
- *                  fractal_random/perlin_landscape.c (multi-octave fBm).
- *
- * Section map (layers):
- *   §1 config            — fBm/parallax/star/shock constants, colour-pair IDs
- *   §2 performance       — monotonic clock + sleep (frame cap in §7)
- *   §3 simulation state  — Star / Shock / Nebula types
- *   §4 logic             — value-noise + fBm, gas bucketing, shock illumination
- *   §5 simulation        — PRNG, seed/reseed, shock spawn, per-tick advance
- *   §6 render            — palette, stars, fBm raster, shocks, HUD, ncurses
- *   §7 app               — signals, the per-tick combine loop, key handling
- *
- * Keys:  [/]   star count (50..400)
- *        -/+   nebula brightness threshold
- *        ,/.   parallax scroll speed
- *        b     trigger a star birth on demand
- *        t     cycle theme   r reseed   p pause   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/nebula.c \
- *       -o nebula -lncurses -lm
+ * nebula.c — a drifting glowing gas cloud with twinkling stars and
+ * occasional star births that flash and light up the surrounding gas.
+ * Gas field uses fBm value-noise (Mandelbrot 1982; Ebert et al., "Texturing
+ * & Modeling"); newborn diffraction spikes after Spencer et al. (SIGGRAPH 1995).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm     : The gas is a 2-D fBm field — sum of OCTAVES value-noise
- *                 layers at doubling frequency and halving amplitude.
- *                 Two layers are sampled and added: a "near" layer at
- *                 fine spatial scale, and a "far" layer at coarse scale,
- *                 each scrolled at a different speed (`near.speed` >
- *                 `far.speed`). The combined field controls colour
- *                 (deep gas → cool, sparse → dark) and glyph density
- *                 (Bourke ramp, indexed by field magnitude).
- *
- *                 Stars are a fixed catalogue: random (x, y, brightness,
- *                 phase) generated at startup; rendered each frame with
- *                 a slow sinusoidal twinkle.
- *
- *                 Star births are events with a small expanding shock-
- *                 wave: each Shock has (x, y, age). A radius `r =
- *                 SHOCK_SPEED · age` advances; cells whose distance to
- *                 (x, y) is near `r` get extra brightness. Older shocks
- *                 fade. New shocks spawn periodically + on user demand.
- *
- * Data-structure: Nebula holds Star[N_STARS_MAX] and Shock[N_SHOCKS_MAX]
- *                 inline. fBm is evaluated on demand per cell each frame
- *                 — O(rows · cols · OCTAVES) per frame. At 80×24×4 ≈ 7k
- *                 evaluations, each ~10 multiplies — easily 30 fps.
- *
- * Rendering     : Per frame: fBm raster (every cell), then star catalogue,
- *                 then shocks (additive brightness over the gas). HUD
- *                 last.
- *
- * References    :
- *   Noise & fBm gas field (§4 fbm / value_noise, §6 raster)
- *     [1] Perlin, "An Image Synthesizer," SIGGRAPH (1985) — procedural noise;
- *         this file uses cheap value-noise in the same role.
- *     [2] Mandelbrot, "The Fractal Geometry of Nature" (1982) — fractional
- *         Brownian motion (fBm), the summed-octaves field that is the gas.
- *     [3] Musgrave, Kolb & Mace, "The Synthesis and Rendering of Eroded
- *         Fractal Terrains," SIGGRAPH (1989) — fBm gain/lacunarity choices.
- *     [4] Ebert, Musgrave, Peachey, Perlin & Worley, "Texturing & Modeling:
- *         A Procedural Approach" (Morgan Kaufmann) — value noise, octave
- *         layering, and using fBm for clouds/gas.
- *   Star birth — diffraction spikes & glow (§4 shock_brightness_at, §6 scene_draw)
- *     [5] Spencer, Shirley, Zimmerman & Greenberg, "Physically-Based Glare
- *         Effects for Digital Images," SIGGRAPH (1995) — why a bright point
- *         source shows a 4-pointed diffraction starburst + halo (the newborn).
- *   ASCII rendering substrate (§4 gas_bucket, §6 GAS_GLYPH)
- *     [6] Bourke, "Character representation of grey scale images" (1997) — the
- *         brightness → glyph ramp ('.' : ~ o #).
- *     [7] Padala, "NCURSES Programming HOWTO" (TLDP) — colour pairs and the
- *         erase → draw → refresh frame model.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -109,56 +20,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── ARCHITECTURE (layer separation) ───────────────────────────────────── *
- *
- * Four real layers; two are intentionally absent.
- *
- *   LAYER        SECTION  MUTATES
- *   ────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2       nothing — clock primitives (frame cap / fps in §7)
- *   SIMULATION   §3,§5    §3 holds the state; §5 advances it: the near/far
- *                           ParallaxLayer offsets and world_time (drift),
- *                           shocks[] (spawn /
- *                           age / plant star), stars[]/n_stars, next_shock_in;
- *                           advances the global PRNG (frand / rand).
- *                           (threshold, scroll speeds, theme, paused, n_stars
- *                           are changed by USER EVENTS in §7, not by the tick.)
- *   LOGIC        §4       nothing — pure: value_noise/fbm/hash01/smoothstep
- *                           (gas field), gas_bucket (quantise), and
- *                           shock_brightness_at (illumination from shock ages).
- *                           Reads state, returns values; no mutation, no I/O.
- *   RENDER       §6       the terminal + colour pairs only; READS the Nebula,
- *                           never writes it.
- *
- *   EFFECTS  : ABSENT — star twinkle and shock glow are derived at render time
- *              from world_time / shock age (star_draw, shock_brightness_at),
- *              never stored as separate cosmetic state.
- *   DELAYS   : the only pause is Nebula.paused (checked at the combine point);
- *              the shock-cadence timer next_shock_in is simulation state inside
- *              nebula_tick, not a separate module.
- *
- * LOGIC (§4) is provably uncorruptable from RENDER: it does no mutation and no
- * I/O, so deleting or reordering any draw cannot change fbm / shock_brightness.
- *
- * Per-tick combine order — main() (§7) is the only place that advances state:
- *     1. PERFORMANCE  measure dt (capped at DT_CAP_S)       §7
- *     2. SIMULATION   nebula_tick(dt)  [skipped if paused]  §5
- *     3. PERFORMANCE  smoothed fps                          §7
- *     4. RENDER       scene_draw()  (read-only)             §6
- *     5. PERFORMANCE  sleep to the frame cap                §7
- *
- * User events (keys: stars/thresh/scroll/birth/theme/reset/pause; SIGWINCH)
- * may mutate the Nebula / screen but are NOT part of the tick — handled before
- * it in §7 (the getch drain and resize block; 'b'/'r' call shock_spawn /
- * nebula_reseed from §5).
- *
- * ─────────────────────────────────────────────────────────────────────── */
+/* ── §1 config — fBm, parallax, star, shock constants and colour-pair IDs ── */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-#define TARGET_FPS         30        /* slow scene; 30 fps is plenty       */
+#define TARGET_FPS         30        /* slow scene, so 30 fps is plenty    */
 
 /* fBm */
 #define FBM_OCTAVES         4
@@ -185,12 +49,12 @@
 #define SHOCK_INTERVAL_MIN   4.0f
 #define SHOCK_INTERVAL_MAX   9.0f
 #define SHOCK_LIFE           5.0f
-#define SHOCK_SPEED          5.0f      /* cells/sec radius growth          */
+#define SHOCK_SPEED          5.0f      /* how fast the ring grows, cells/sec */
 #define SHOCK_THICKNESS      1.6f
-#define SHOCK_FLASH_DUR      0.3f      /* age < this: 3×3 white-hot flash   */
-#define SHOCK_SPIKE_DUR      1.5f      /* age < this: 4-point spikes; also
-                                        * the age the permanent star is planted */
-#define SHOCK_SAMPLES        12        /* candidate cells sampled per birth */
+#define SHOCK_FLASH_DUR      0.3f      /* younger than this: 3x3 bright flash */
+#define SHOCK_SPIKE_DUR      1.5f      /* younger than this: 4-point spikes;
+                                        * also when the lasting star appears  */
+#define SHOCK_SAMPLES        12        /* random cells tried to find dense gas */
 
 /* Nebula brightness threshold — below this the gas is invisible. */
 #define THRESH_DEFAULT       0.45f
@@ -198,31 +62,29 @@
 #define THRESH_MAX           0.85f
 #define THRESH_STEP          0.05f
 
-#define ASPECT_X             2.0f
-#define SCROLL_VDRIFT        0.25f     /* vertical drift = this × layer speed */
+#define ASPECT_X             2.0f      /* cells are ~2x taller than wide       */
+#define SCROLL_VDRIFT        0.25f     /* vertical drift = this x layer speed  */
 
-/* Gas-field blend (the two parallax layers) + shock illumination weight. */
-#define GAS_NEAR_W           0.55f     /* weight of the near parallax layer   */
-#define GAS_FAR_W            0.45f     /* weight of the far parallax layer    */
-#define SHOCK_BOOST          0.5f      /* shock light folded into the gas     */
+/* How the two scrolling gas layers are mixed, plus how much a shock adds. */
+#define GAS_NEAR_W           0.55f     /* weight of the near (fine) layer      */
+#define GAS_FAR_W            0.45f     /* weight of the far (coarse) layer     */
+#define SHOCK_BOOST          0.5f      /* how much shock light brightens gas   */
 
 #define DT_CAP_S             0.10f
 #define N_THEMES             4
 
 /* Colour pairs */
-#define PAIR_GAS_0    1   /* coolest gas (e.g. deep blue)                 */
+#define PAIR_GAS_0    1   /* dimmest gas                                  */
 #define PAIR_GAS_1    2
 #define PAIR_GAS_2    3
 #define PAIR_GAS_3    4
-#define PAIR_GAS_4    5   /* hottest gas (white-pink)                     */
+#define PAIR_GAS_4    5   /* brightest gas (near white)                   */
 #define PAIR_STAR     6
 #define PAIR_SHOCK    7
 #define PAIR_HUD      8
 #define PAIR_HINT     9
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  performance — timing primitives (frame cap applied in §7)           */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 performance — monotonic clock and sleep (frame cap lives in §7) ── */
 
 static int64_t clock_ns(void)
 {
@@ -239,104 +101,73 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  simulation state — the data SIMULATION owns (mutated only by §5)     */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 simulation state — Star, Shock, ParallaxLayer, and the Nebula scene ── */
 
-/* Star — one entry in the background catalogue: a fixed cell that twinkles.
- *
- * WHY a static catalogue: the starfield is a cheap, unchanging backdrop — each
- * star is just a position plus a sinusoidal twinkle, so hundreds cost almost
- * nothing and never need simulating.  Newborn stars (planted by a settling
- * Shock) are appended to the SAME pool, so a birth leaves a permanent mark.
- *
- * VALUE LOGIC: rendered brightness = brightness × (0.7 + 0.3·sin(t·1.5 + phase));
- * the per-star `phase` decorrelates the twinkle so the sky shimmers rather than
- * pulsing in unison. */
+/* One background star: a fixed cell that gently brightens and dims (twinkles).
+ * The starfield never moves or needs simulating, so we keep a big fixed pool
+ * and just draw it. Stars born from a settling shock are added to this same
+ * pool, so a birth leaves a permanent dot in the sky. */
 typedef struct {
-    int   x, y;            /* fixed integer cell                            */
-    float brightness;      /* base magnitude 0.3..1.0 (newborns ≈ 1.0)      */
-    float phase;           /* 0..2π — per-star twinkle offset (decorrelates) */
-    int   alive;           /* 0 = empty pool slot                           */
+    int   x, y;            /* fixed cell on the grid                          */
+    float brightness;      /* base brightness 0.3..1.0 (newborns near 1.0)    */
+    float phase;           /* 0..2pi twinkle offset, random per star, so the
+                            * sky shimmers instead of all pulsing together    */
+    int   alive;           /* 0 means this pool slot is unused                */
 } Star;
 
-/* Shock — a star-birth event: an expanding wavefront that lights the gas and,
- * once it settles, leaves a permanent Star behind.  Lives SHOCK_LIFE seconds.
+/* A star-birth event: an expanding ring of light that brightens the gas and,
+ * once it settles, leaves a permanent star behind. Lives SHOCK_LIFE seconds.
  *
- * WHY one `age` drives everything: a star birth is inherently a timeline, so
- * rather than store per-effect state we keep only seconds-since-birth and DERIVE
- * the rest — the ring radius (SHOCK_SPEED·age), the three illumination layers
- * (ring / diffraction spikes / halo, §4 shock_brightness_at) and the three
- * render phases (flash → 4-point spikes → settle, §6).  The spikes + halo of a
- * bright point source follow the glare model of Spencer et al. (ref [5]).
- *
- * CONTEXT: x,y are WORLD space and do NOT scroll — the explosion is anchored to
- * its birthplace while the gas drifts past.  star_added is a one-shot latch: at
- * age ≥ 1.5 s it plants the permanent Star, then is never acted on again. */
+ * Everything about the effect is figured out from one number, the age (seconds
+ * since birth): the ring's size, the three light contributions (§4
+ * shock_brightness_at), and which of three drawing phases it's in (§6). The
+ * 4-point spikes and halo mimic how a bright point of light looks through a
+ * lens (Spencer et al., SIGGRAPH 1995). The position stays put while the gas
+ * drifts past it. */
 typedef struct {
-    float x, y;            /* birthplace cell (world space — does NOT scroll)  */
-    float age;             /* seconds since birth — drives radius + every phase */
-    int   alive;           /* 0 = empty pool slot                              */
-    int   star_added;      /* one-shot latch: 1 once the star has been planted */
+    float x, y;            /* birthplace cell; stays fixed, does not scroll    */
+    float age;             /* seconds since birth; drives the whole effect     */
+    int   alive;           /* 0 means this pool slot is unused                 */
+    int   star_added;      /* flips to 1 once the lasting star has been placed */
 } Shock;
 
-/* ParallaxLayer — one scrolling sample of the fBm gas (Mandelbrot, ref [2]).
- *
- * WHY two layers: motion parallax — nearer things sweep past faster.  Sampling
- * the same noise at two scales and scrolling them at different speeds (near =
- * fine & fast, far = coarse & slow), then summing, fakes cosmic depth on a flat
- * grid.
- *
- * HOW it scrolls: the offset (ox, oy) is ADDED to the cell coordinates before
- * sampling fbm — the field slides under a fixed screen; nothing is moved in
- * memory.  Each tick advances ox by speed·ASPECT_X (cells are ~2× tall, so x is
- * boosted to keep the drift visually isotropic) and oy by a gentler speed·0.25. */
+/* One scrolling layer of gas. We draw two of them: a near layer (fine and
+ * fast) and a far layer (coarse and slow). Drawing the same noise at two
+ * scales and sliding them at different speeds, then adding them, fakes a sense
+ * of depth on a flat screen, the way roadside trees rush past while distant
+ * hills barely move. The offset just gets added to each cell's coordinates
+ * before sampling, so the cloud slides under a fixed screen, nothing actually
+ * moves in memory. */
 typedef struct {
-    float ox, oy;          /* accumulated scroll offset, cells (advanced/tick) */
-    float speed;           /* drift speed, cells/s (user-tunable knob)         */
+    float ox, oy;          /* how far this layer has scrolled, in cells        */
+    float speed;           /* drift speed, cells/sec (user can adjust)         */
 } ParallaxLayer;
 
-/* Nebula — the whole cosmic scene, one aggregate read as a table of contents.
- *
- * WHY fixed pools + on-demand field: stars[]/shocks[] are sized to their maxima
- * once and never grown or freed (the `alive` flags mark live slots), and the
- * gas is re-evaluated per cell every frame (fbm, ref [4]) with NO stored grid —
- * so the whole scene is this one struct plus the terminal, malloc-free in the
- * hot path.  Fields are grouped by the CONCEPT they belong to, not by the key
- * that changes them: the colour `theme` is a RENDER choice, kept apart from the
- * simulation knobs.
- *
- *   WHAT        : stars[] / n_stars (catalogue), shocks[] (active births)
- *   field state : world_time + the two ParallaxLayer scroll offsets
- *   SIM knobs   : near/far layer speeds, threshold (gas visibility cutoff)
- *   RENDER knob : theme (palette)
- *   run-state   : paused, next_shock_in (auto-birth cadence timer)           */
+/* The whole scene in one struct. The star and shock pools are sized to their
+ * limits up front and never grown or freed (the `alive` flags say which slots
+ * are in use), and the gas is recomputed for every cell each frame with no
+ * stored grid. So the scene is just this struct plus the terminal, with no
+ * memory allocation in the per-frame loop. */
 typedef struct {
-    /* WHAT is simulated */
-    Star  stars[N_STARS_MAX];      /* catalogue pool; first n_stars are live   */
+    Star  stars[N_STARS_MAX];      /* star pool; first n_stars are in use      */
     Shock shocks[N_SHOCKS_MAX];    /* active star-birth events                 */
     int   n_stars;
 
-    /* Parallax field state — advanced every tick */
-    float         world_time;      /* seconds elapsed (drives star twinkle)    */
-    ParallaxLayer near, far;       /* the two scrolling noise layers           */
+    float         world_time;      /* seconds elapsed; drives star twinkle     */
+    ParallaxLayer near, far;       /* the two scrolling gas layers             */
 
-    /* HOW the user drives the simulation — tunable knobs */
-    float threshold;               /* gas visibility cutoff (higher = sparser) */
+    float threshold;               /* gas below this brightness is hidden;
+                                    * higher means a thinner, sparser cloud    */
+    int   theme;                   /* which colour palette is shown            */
 
-    /* RENDER knob — palette selection (a render choice, not a sim knob) */
-    int   theme;
-
-    /* run-state + auto-birth cadence */
     int   paused;
-    float next_shock_in;           /* seconds until the next auto star birth   */
+    float next_shock_in;           /* seconds until the next automatic birth   */
 } Nebula;
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  logic — pure scalar fields: no mutation, no I/O                      */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 logic — noise, fBm gas field, and shock illumination (no I/O) ── */
 
-/* Fast integer hash → [0, 1] for value-noise lattice samples. */
+/* Scramble two integers into a repeatable random-looking number in 0..1.
+ * Same inputs always give the same output, so the cloud's shape is stable. */
 static float hash01(int x, int y)
 {
     uint32_t h = (uint32_t)(x * 374761393) ^ (uint32_t)(y * 668265263);
@@ -350,7 +181,8 @@ static float smoothstep(float t)
     return t * t * (3.0f - 2.0f * t);
 }
 
-/* Value noise at fractional (x, y). Bilinear interp + smoothstep. */
+/* A smooth random field: pick random values at whole-number grid points and
+ * blend between them, giving soft lumps instead of a jagged checkerboard. */
 static float value_noise(float x, float y)
 {
     int   xi = (int)floorf(x), yi = (int)floorf(y);
@@ -366,7 +198,9 @@ static float value_noise(float x, float y)
     return a + (b - a) * uy;
 }
 
-/* fBm: sum of OCTAVES value-noise samples at increasing freq. */
+/* Stack several copies of the noise at finer and finer scales, each fainter
+ * than the last, and add them up. Big soft blobs gain wispy detail, the way
+ * real clouds have both broad shapes and fine tendrils (fBm). */
 static float fbm(float x, float y, float base_freq)
 {
     float sum  = 0.0f;
@@ -382,7 +216,7 @@ static float fbm(float x, float y, float base_freq)
     return sum / norm;
 }
 
-/* Quantise a [0,1] gas brightness to a glyph/colour bucket index 0..4. */
+/* Turn a 0..1 brightness into one of five steps, picking a glyph and colour. */
 static int gas_bucket(float v)
 {
     int b = (int)(v * 4.99f);
@@ -391,18 +225,9 @@ static int gas_bucket(float v)
     return b;
 }
 
-/*
- * shock_brightness_at — extra brightness contribution from active shocks
- * at cell (sx, sy). Three layered contributions:
- *
- *   1. Expanding shockwave ring — Gaussian peak at d = r_now (was the
- *      only effect in stage 1).
- *   2. Anisotropic diffraction spikes — bright on the horizontal and
- *      vertical axes through the star centre, fading by age 1.2s.
- *      This is what gives a newborn star its iconic 4-pointed look.
- *   3. Diffuse halo — soft Gaussian glow centred on the star, slowly
- *      illuminating the surrounding gas; fades by age 2.5s.
- */
+/* Extra light that all the active shocks add to one cell. Three things stack:
+ * a bright expanding ring, the four spikes radiating from a new star, and a
+ * soft round glow around it. Each fades as the shock ages. */
 static float shock_brightness_at(const Nebula *n, float sx, float sy)
 {
     float total = 0.0f;
@@ -417,14 +242,15 @@ static float shock_brightness_at(const Nebula *n, float sx, float sy)
         float fade  = 1.0f - (s->age / SHOCK_LIFE);
         if (fade < 0) fade = 0;
 
-        /* Layer 1 — expanding shockwave ring. */
+        /* The bright ring: brightest exactly at the ring's current radius,
+         * dropping off on either side. */
         float ring  = d - r_now;
         float gauss = expf(-ring * ring / (SHOCK_THICKNESS * SHOCK_THICKNESS));
         total += gauss * fade;
 
-        /* Layer 2 — diffraction spikes. Bright thin lines along ±x
-         * and ±y axes through the star, falling off radially so the
-         * spikes don't dominate at large distance. Strong early. */
+        /* The four spikes: thin bright lines straight up/down and left/right
+         * through the star, also dimming with distance so they don't reach
+         * too far. Strongest right after birth. */
         float spike_t = 1.0f - (s->age / 1.2f);
         if (spike_t > 0.0f) {
             float h_spike = expf(-dy * dy / 0.6f) * expf(-d * d / 80.0f);
@@ -432,8 +258,7 @@ static float shock_brightness_at(const Nebula *n, float sx, float sy)
             total += (h_spike + v_spike) * spike_t * 1.5f;
         }
 
-        /* Layer 3 — diffuse halo. Soft Gaussian glow around the centre
-         * that fades over a couple of seconds, illuminating gas. */
+        /* The soft glow around the star, fading over a couple of seconds. */
         float halo_t = 1.0f - (s->age / 2.5f);
         if (halo_t < 0.0f) halo_t = 0.0f;
         float halo = expf(-d * d / 12.0f);
@@ -442,9 +267,7 @@ static float shock_brightness_at(const Nebula *n, float sx, float sy)
     return total;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  simulation — advances state (sole mutator of the Nebula)            */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 simulation — seed, spawn shocks, and advance the scene each tick ── */
 
 static float frand(void) { return (float)rand() / (float)RAND_MAX; }
 
@@ -454,9 +277,8 @@ static float random_shock_interval(void)
          + frand() * (SHOCK_INTERVAL_MAX - SHOCK_INTERVAL_MIN);
 }
 
-/* star_set — place a star at (x,y) with the given brightness; assigns a random
- * twinkle phase and marks it alive.  Shared by the catalogue seed, the +stars
- * key, and shock-planted newborns. */
+/* Place a live star, giving it a random twinkle offset. Used when seeding the
+ * field, when the user adds stars, and when a shock plants a newborn. */
 static void star_set(Star *st, int x, int y, float brightness)
 {
     st->x          = x;
@@ -487,10 +309,6 @@ static void nebula_reseed(Nebula *n, int rows, int cols)
     n->next_shock_in = random_shock_interval();
 }
 
-/*
- * shock_spawn — find a dead slot, set position to a high-density spot
- * (sample fBm at random points, keep the brightest of K tries).
- */
 /* Index of the first free shock slot, or -1 if all are in use. */
 static int find_dead_shock(const Nebula *n)
 {
@@ -499,8 +317,8 @@ static int find_dead_shock(const Nebula *n)
     return -1;
 }
 
-/* Pick the densest gas cell out of SHOCK_SAMPLES random candidates, so star
- * births favour bright gas.  Writes the winner to (*bx, *by). */
+/* Try a handful of random cells and return the one with the thickest gas, so
+ * stars tend to be born in the bright parts of the cloud. */
 static void densest_cell(const Nebula *n, int rows, int cols, int *bx, int *by)
 {
     *bx = cols / 2; *by = (rows - 1) / 2;
@@ -517,7 +335,7 @@ static void densest_cell(const Nebula *n, int rows, int cols, int *bx, int *by)
     }
 }
 
-/* shock_spawn — start a new star birth at the densest gas cell we can find. */
+/* Start a new star birth at the densest gas cell we can find. */
 static void shock_spawn(Nebula *n, int rows, int cols)
 {
     int slot = find_dead_shock(n);
@@ -532,8 +350,9 @@ static void shock_spawn(Nebula *n, int rows, int cols)
     n->shocks[slot].star_added = 0;
 }
 
-/* Advance the world clock and scroll both parallax layers (x boosted by the
- * cell aspect, y a gentler vertical drift). */
+/* Tick the clock forward and slide both gas layers. Horizontal drift is scaled
+ * up because cells are taller than wide, so motion looks even; vertical drift
+ * is kept gentle. */
 static void advance_parallax(Nebula *n, float dt)
 {
     n->world_time += dt;
@@ -543,8 +362,8 @@ static void advance_parallax(Nebula *n, float dt)
     n->far.oy  += n->far.speed  * SCROLL_VDRIFT * dt;
 }
 
-/* Age every active shock: when the spike phase ends, plant the permanent star
- * (the event's visible legacy); retire the shock once it outlives SHOCK_LIFE. */
+/* Age each active shock. When its spike phase ends, leave a permanent star
+ * behind; once it has lived past SHOCK_LIFE, free the slot. */
 static void age_shocks(Nebula *n, float dt)
 {
     for (int i = 0; i < N_SHOCKS_MAX; i++) {
@@ -554,7 +373,7 @@ static void age_shocks(Nebula *n, float dt)
 
         if (!s->star_added && s->age >= SHOCK_SPIKE_DUR) {
             if (n->n_stars < N_STARS_MAX) {
-                float b = 0.85f + 0.15f * frand();          /* bright newborn */
+                float b = 0.85f + 0.15f * frand();          /* newborns are bright */
                 star_set(&n->stars[n->n_stars++], (int)s->x, (int)s->y, b);
             }
             s->star_added = 1;
@@ -569,7 +388,7 @@ static void nebula_tick(Nebula *n, float dt, int rows, int cols)
     advance_parallax(n, dt);
     age_shocks(n, dt);
 
-    /* Schedule the next automatic star birth. */
+    /* Count down to the next automatic star birth. */
     n->next_shock_in -= dt;
     if (n->next_shock_in <= 0.0f) {
         shock_spawn(n, rows, cols);
@@ -577,22 +396,19 @@ static void nebula_tick(Nebula *n, float dt, int rows, int cols)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  render — state → screen; reads only, never mutates sim state         */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 render — draw gas, stars, shocks and the HUD; never changes state ── */
 
-/* 5-stop nebula palette per theme + a star colour and shock colour.
- * Each theme has a distinct dominant hue so cycling 't' is visibly
- * different across the sky; the dim end is brightened from near-black
- * (17/22/52) to visible mid-tones. */
+/* Five gas colours per theme, plus a star and shock colour. Each theme has a
+ * different main hue so pressing 't' visibly changes the sky. The darkest end
+ * is kept off pure black so it stays visible. */
 static const short GAS_256[N_THEMES][5] = {
-    /* 0 emission red   — pink/red → orange → white                   */
+    /* 0 emission red:    pink/red to orange to white                 */
     {  88, 131, 196, 215, 231 },
-    /* 1 reflection blue — deep blue → cyan → white                   */
+    /* 1 reflection blue: deep blue to cyan to white                  */
     {  25,  33,  39,  51, 231 },
-    /* 2 emerald nebula — dark green → lime → yellow-green → white     */
+    /* 2 emerald nebula:  dark green to lime to yellow-green to white */
     {  22,  28,  82, 154, 231 },
-    /* 3 horsehead pink — purple → magenta → light pink → white       */
+    /* 3 horsehead pink:  purple to magenta to light pink to white    */
     {  53,  91, 165, 213, 231 },
 };
 static const short STAR_256[N_THEMES] = { 231, 231, 231, 231 };
@@ -621,10 +437,8 @@ static void color_init(int theme)
 
 static const char STAR_GLYPH[3] = { '.', '+', '*' };
 
-/*
- * star_draw — bright dot with sinusoidal twinkle. brightness × twinkle
- * picks one of three glyphs and bold/dim attribute.
- */
+/* Draw one star as a dot that gently brightens and dims over time. Its current
+ * brightness picks one of three glyphs and whether it's bold or dim. */
 static void star_draw(const Star *s, float world_time, int rows, int cols)
 {
     if (!s->alive) return;
@@ -640,11 +454,11 @@ static void star_draw(const Star *s, float world_time, int rows, int cols)
     attroff(attr);
 }
 
-/* Glyph ramp by gas brightness bucket. */
+/* Glyphs from faint to thick gas. */
 static const char GAS_GLYPH[5] = { '.', ':', '~', 'o', '#' };
 
-/* fBm gas raster — sample the two parallax layers at every cell, fold in shock
- * illumination, and emit a glyph where the brightness clears the threshold. */
+/* Draw the gas: for every cell, add up the two scrolling layers plus any shock
+ * light, and print a glyph wherever the result is bright enough to show. */
 static void draw_gas(const Nebula *n, int rows, int cols)
 {
     for (int sr = 0; sr < rows - 1; sr++) {
@@ -677,7 +491,7 @@ static void draw_stars(const Nebula *n, int rows, int cols)
         star_draw(&n->stars[i], n->world_time, rows, cols);
 }
 
-/* Shock phase 1 — flash: a 3×3 white-hot core. */
+/* Newest shock: a bright 3x3 flash at the centre. */
 static void draw_shock_flash(int sr, int sc, int rows, int cols)
 {
     attron(COLOR_PAIR(PAIR_SHOCK) | A_BOLD);
@@ -693,7 +507,7 @@ static void draw_shock_flash(int sr, int sc, int rows, int cols)
     attroff(COLOR_PAIR(PAIR_SHOCK) | A_BOLD);
 }
 
-/* Shock phase 2 — young star: 4-pointed cross, spikes two cells each way. */
+/* A young star: a 4-pointed cross with spikes reaching two cells each way. */
 static void draw_shock_spikes(int sr, int sc, int rows, int cols)
 {
     attron(COLOR_PAIR(PAIR_SHOCK) | A_BOLD);
@@ -707,7 +521,7 @@ static void draw_shock_spikes(int sr, int sc, int rows, int cols)
     attroff(COLOR_PAIR(PAIR_SHOCK) | A_BOLD);
 }
 
-/* Shock phase 3 — settling: a single glyph fading toward death. */
+/* A settling shock: a single dot fading out as the event ends. */
 static void draw_shock_settle(int sr, int sc, float age)
 {
     float fade = 1.0f - (age / SHOCK_LIFE);
@@ -718,8 +532,8 @@ static void draw_shock_settle(int sr, int sc, float age)
     attroff(attr);
 }
 
-/* Each active shock's centre, drawn by its age-driven phase:
- *   flash (3×3 core) → 4-point spikes → settling fade. */
+/* Draw each shock's centre in the right stage for its age:
+ * flash, then 4-point spikes, then a fading dot. */
 static void draw_shocks(const Nebula *n, int rows, int cols)
 {
     for (int i = 0; i < N_SHOCKS_MAX; i++) {
@@ -785,9 +599,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  app — combine point (per-tick order) + user events + frame cap       */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 app — signals, the main loop, key handling, and the frame cap ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -822,7 +634,7 @@ int main(void)
     int64_t t_tick_prev = t_fps_prev;
 
     while (g_running) {
-        /* USER EVENT (out of tick): apply resize → reseed for new bounds */
+        /* Window was resized: rebuild for the new size and reseed the scene. */
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();
@@ -830,7 +642,7 @@ int main(void)
             nebula_reseed(&g_neb, rows, cols);
         }
 
-        /* USER EVENT (out of tick): drain input, mutate knobs / run-state */
+        /* Read all pending keys and adjust the knobs or run-state. */
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
@@ -881,23 +693,23 @@ int main(void)
             }
         }
 
-        /* 1. PERFORMANCE — measure dt, capped to avoid spiral-of-death */
+        /* Seconds since last frame, capped so a long stall can't make the sim
+         * lurch forward in one giant step. */
         int64_t now = clock_ns();
         float   dt  = (float)(now - t_tick_prev) / 1e9f;
         if (dt > DT_CAP_S) dt = DT_CAP_S;
         t_tick_prev = now;
 
-        /* 2. SIMULATION — the sole state advance (skipped while paused) */
+        /* Advance the scene, unless paused. */
         if (!g_neb.paused) nebula_tick(&g_neb, dt, rows, cols);
 
-        /* 3. PERFORMANCE — smoothed fps estimate */
+        /* Smoothed fps for the HUD. */
         fps = fps * 0.95 + (1e9 / (double)(now - t_fps_prev + 1)) * 0.05;
         t_fps_prev = now;
 
-        /* 4. RENDER — read-only */
         scene_draw(rows, cols, &g_neb, fps);
 
-        /* 5. PERFORMANCE — sleep to the frame cap */
+        /* Sleep off the rest of the frame so we hold the target rate. */
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

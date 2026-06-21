@@ -1,222 +1,11 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * phoenix.c — perched phoenix that self-immolates and is reborn from ash
- *
- * DEMO: A still owl-like phoenix sits on a perch, breathing softly.
- *       After a long calm, it ignites — sparks crawl across the body,
- *       feathers turn to flame, then the whole bird becomes a roaring
- *       conflagration.  The silhouette dissolves; embers fall and
- *       smoulder on the perch as ash and smoke drift upward.  After
- *       a long quiet, a single bright spark appears at the head of
- *       the perch and the bird grows back outward from that seed
- *       until the owl is whole again, eyes glowing, and the cycle
- *       repeats.
- *
- *       Lifecycle (one full cycle ≈ 26 seconds):
- *         PERCH    (12s)  still owl, gentle breathing
- *         IGNITE    (2s)  bird heats; sparks crawl; flame buds form
- *         BLAZE     (3s)  full conflagration; bright core
- *         COLLAPSE  (2s)  silhouette dissolves; embers fall as ash
- *         ASH       (4s)  smouldering remains drift; perch glows red
- *         REBIRTH   (3s)  spark at head expands outward; bird reforms
- *
- * Study alongside: artistic/fire_tornado.c (heat ramp + buoyancy),
- *                  artistic/volcano.c (free-flight cooling embers),
- *                  artistic/ant_colony.c (anchor-template particle
- *                  silhouette pattern from a different domain).
- *
- * Section map (layers):
- *   §1  config       — sizes, phase timings, fire physics, palette IDs
- *   §2  performance  — monotonic clock + sleep (frame cap in §7)
- *   §3  types        — Anchor / BodyParticle / Spark / Phoenix / Scene
- *   §4  logic        — pure: heat ramp + phase tables (no mutation, no I/O)
- *   §5  simulation   — PRNG, anchors, fire physics, lifecycle FSM, ticks
- *   §6  render        — heat colours, body/spark/perch draw, HUD, ncurses
- *   §7  app          — signals, the per-tick combine loop, key handling
- *
- * Keys:
- *   q / ESC      quit
- *   space / p    pause / resume
- *   r            reset (immediate PERCH)
- *   s            skip to next phase
- *   i            ignite NOW (skip to IGNITE)
- *   t / T        next / previous theme
- *   ,/.          decrease / increase body density
- *   ;/'          decrease / increase spark density
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/phoenix.c \
- *       -o phoenix -lncurses -lm
+ * phoenix.c — an owl-shaped phoenix that bursts into flame and is reborn
+ * from the ash, in an endless loop. The bird is a swarm of glowing
+ * particles that either trace an owl outline or fly free as fire.
+ * Fire look borrows from Reeves particle systems (SIGGRAPH 1983) and the
+ * temperature-to-glyph ramp from Bourke's grey-scale character mapping.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Two cooperating particle systems, one anchor template,
- *                 one finite-state lifecycle.
- *
- *                 The BODY is a fixed array of anchor points in body-local
- *                 coordinates that together describe an owl silhouette
- *                 — head ellipse, body ellipse, eye discs, beak, ear
- *                 tufts.  Each frame, body particles either re-bind to a
- *                 weighted-random anchor (BOUND) or integrate free-flight
- *                 fire physics (FREE).  Whether a particle is BOUND or
- *                 FREE is dictated by the lifecycle phase: PERCH/IGNITE/
- *                 BLAZE force BOUND; ASH forces FREE; COLLAPSE flips
- *                 particles BOUND→FREE over time; REBIRTH flips them
- *                 FREE→BOUND.
- *
- *                 During REBIRTH, only anchors whose `alive_at` value is
- *                 below the growth fraction can be re-bound to.  alive_at
- *                 is the normalised distance from a SEED point (the head
- *                 centre).  As growth_frac rises 0→1, the alive set
- *                 expands outward from the seed, so the bird grows back
- *                 visually from the eyes outward.
- *
- *                 Spark particles are a separate, smaller, pure-free-
- *                 flight pool.  They're emitted from random body anchors
- *                 during IGNITE/BLAZE/COLLAPSE — the wisps that rise
- *                 above the burning silhouette and trail away as smoke.
- *
- *                 Both populations integrate the same fire physics:
- *                   – buoyancy   : vy -= BUOYANCY · (0.2 + 0.8·temp)·dt
- *                   – turbulence : v  += SHEAR · sin/cos field · dt
- *                   – drag       : v  *= 1 − DRAG · dt
- *                   – cooling    : T  *= exp(-COOL · dt)
- *
- *                 Heat ramp: temp ∈ [0,1] mapped to 6 colour buckets
- *                 from smoke (bucket 0, dim grey) through dark theme
- *                 tint, mid theme, bright theme, hot accent, white-hot
- *                 core (bucket 5).  At rest the owl's anchors carry low
- *                 base_temp values (~0.2) so the silhouette renders in
- *                 buckets 1-2 (dark feather colours).  Ignition raises
- *                 temps; blaze pegs them at ~1.0; rebirth eases them
- *                 back down.
- *
- * Data-structure: Phoenix holds inline pools — BodyParticle[N_BODY] and
- *                 Spark[N_SPARK] — plus an Anchor[] array recomputed at
- *                 init (the owl is static, so anchors don't change per
- *                 frame; only the per-particle position/state does).
- *
- * Rendering     : ASCII only.  Heat-ramp glyph set ` . + * # @ %` from
- *                 coolest to hottest.  Bucket 0 uses A_DIM, bucket ≥4
- *                 uses A_BOLD.  Perch is drawn as a static `-` strip
- *                 with a dim brown colour pair below the bird.
- *
- * Performance   : O(N_body + N_spark) per frame.  At defaults
- *                 (350 body + 200 spark) ≈ 550 mvaddch — trivial well
- *                 past 60 fps.
- *
- * References    :
- *   Particle systems & fire physics (§5 fire_step, sparks)
- *     [1] Reeves, "Particle Systems — A Technique for Modeling a Class of
- *         Fuzzy Objects," SIGGRAPH (1983) — the emit / integrate / cool /
- *         recycle loop used by sparks and free body particles.
- *     [2] Nguyen, Fedkiw & Jensen, "Physically Based Modeling and Animation
- *         of Fire," SIGGRAPH (2002) — the buoyant, cooling, blackbody-coloured
- *         flame this fakes cheaply with a per-particle temperature.
- *     [3] Stam, "Real-Time Fluid Dynamics for Games," GDC (2003) — the sin/cos
- *         shear field is a cheap stand-in for real velocity advection.
- *     [4] Boussinesq buoyancy approximation (any combustion text): the hot/cold
- *         density gradient drives the rise (vy -= BUOYANCY · temp · dt).
- *   Heat → colour & ASCII rendering (§4 heat_attrs, §6 draw)
- *     [5] Bourke, "Character representation of grey scale images" (1997) — the
- *         temperature → glyph ramp ('.' '+' '*' '#' '@' '%').
- *     [6] Padala, "NCURSES Programming HOWTO" (TLDP) — colour pairs and the
- *         erase → draw → refresh frame model.
- *   Myth
- *     [7] Phoenix mythology — the bird that ignites itself, burns to ash and
- *         regrows from the embers: Bulfinch's Mythology (1855), the Egyptian
- *         "Bennu" (Book of the Dead), the Persian "Simurgh".
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The owl is a SHAPE, not a thing.  The shape is a list of anchor
- * points; the thing is a swarm of particles that snaps to the shape
- * each frame.  Lifecycle phases change the rules of snapping: snap
- * always (PERCH), snap with heat (IGNITE), snap at white-hot (BLAZE),
- * stop snapping piece by piece (COLLAPSE), don't snap at all and float
- * away (ASH), then snap back from the inside out (REBIRTH).  At the
- * core, every visible character is just a particle deciding "where am
- * I and how hot am I" — the lifecycle decides which question to ask.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a flock of fireflies trained to fly to a pose.  At rest they
- * land in formation tracing an owl.  Heat them up: they glow brighter.
- * Heat them more: the formation breaks; some leave the pose and rise
- * as embers.  Wait long enough, and the heat fades out.  Now drop one
- * bright firefly back where the owl's eye should be, and call the
- * others home — they return one by one, nearest pose-points first,
- * and the silhouette grows back from a single point.  That's the
- * phoenix.
- *
- * DRAWING METHOD  (per frame, FSM-driven)
- * ──────────────
- *  1. erase(); draw the perch (static).
- *  2. Advance world_t and phase_t.  If phase_t exceeds the phase's
- *     duration, advance to the next phase (wraps PERCH → … → REBIRTH
- *     → PERCH).
- *  3. For every BODY PARTICLE, decide BOUND vs FREE for this frame:
- *       PERCH/IGNITE/BLAZE   → force BOUND
- *       COLLAPSE             → with prob frac·release_rate·dt, become
- *                              FREE for the rest of the cycle (until
- *                              REBIRTH or reset)
- *       ASH                  → force FREE
- *       REBIRTH              → with prob capture_rate·dt, try to
- *                              rebind to an anchor whose alive_at <=
- *                              growth_frac; if successful, BOUND.
- *  4. For each BOUND particle: re-pick a weighted-random anchor (from
- *     the alive set during REBIRTH; from the full set otherwise).
- *     Snap position to anchor world coord + small radial jitter.  Set
- *     temp to a phase-modified version of anchor.base_temp.
- *  5. For each FREE particle: integrate buoyancy + turbulence + drag
- *     + cooling.  If temp drops below FLOOR or particle drifts off the
- *     screen, mark inactive.
- *  6. SPARK pool: during IGNITE/BLAZE/COLLAPSE emit at phase-dependent
- *     rate from random anchors.  Each spark integrates the same fire
- *     physics, gets recycled when life or temp expires.
- *  7. Render: BODY (BOUND first, then FREE) → SPARKS → HUD.
- *
- * KEY FORMULAS
- * ────────────
- *  Heat-ramp bucket:
- *      b = clamp(floor(temp · 6), 0, 5)
- *      bucket  glyph  attr      colour role
- *      0       '.'    A_DIM     smoke
- *      1       '+'    -         dark theme tint   (owl feathers)
- *      2       '*'    -         mid theme tint    (warm feathers)
- *      3       '#'    -         bright theme tint (ember)
- *      4       '@'    A_BOLD    hot accent       (flame)
- *      5       '%'    A_BOLD    white-hot core
- *
- *  Anchor alive_at (radial wake order during REBIRTH):
- *      d_i      = sqrt((dx_i − seed_x)^2 + (dy_i − seed_y)^2)
- *      d_max    = max_i d_i
- *      alive_at = d_i / d_max                       ∈ [0,1]
- *      anchor i is alive when growth_frac >= alive_at
- *
- *  Phase temp modifier for BOUND particles:
- *      PERCH    : T = base_temp                         + jitter
- *      IGNITE   : T = lerp(base_temp, 1.0, frac)        + jitter
- *      BLAZE    : T = 0.85 + 0.15·frand_pos             (white-hot)
- *      COLLAPSE : T = lerp(1.0, 0.4, frac)
- *      REBIRTH  : T = lerp(hot, base_temp, frac)        (owl cools into shape)
- *
- *  Free-flight fire physics (same for body-FREE and sparks):
- *      vy   -= BUOYANCY · (0.20 + 0.80·T) · dt
- *      v    += SHEAR · (sin(t·hz + .3x + .45y),
- *                       cos(t·hz + .45x − .3y)) · dt
- *      v    *= 1 − DRAG · dt
- *      x,y  += v · dt
- *      T    *= exp(-COOL · dt)
- *      life -= dt    (sparks only; body-FREE has no life cap)
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -233,47 +22,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── ARCHITECTURE (layer separation) ───────────────────────────────────── *
- *
- * Four real layers; two are intentionally absent.
- *
- *   LAYER        SECTION  MUTATES
- *   ────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2       nothing — clock primitives (frame cap / fps in §7)
- *   LOGIC        §4       nothing — pure: heat_attrs (temp → colour/glyph/attr)
- *                           and the phase tables (phase_name / phase_duration /
- *                           spark_hz_for_phase).  Read-only, no I/O.
- *   SIMULATION   §3,§5    §3 holds the state; §5 advances it: every BodyParticle
- *                           and Spark (pos/vel/temp/state), the Phoenix FSM
- *                           (phase, phase_t, world_t, spark_emit_acc) and Scene;
- *                           builds the Anchor template; advances the global PRNG.
- *   RENDER       §6       the terminal + colour pairs only; READS the Scene,
- *                           never writes it.
- *
- *   EFFECTS  : ABSENT — a particle's glow / colour is derived at render time
- *              from its `temp` (heat_attrs), never stored as separate state.
- *   DELAYS   : the only pause is Scene.paused; the phase holds (PERCH 12 s, …)
- *              are the FSM's phase_t-vs-phase_duration test, not a module.
- *
- * LOGIC (§4) is provably uncorruptable from RENDER: it does no mutation and no
- * I/O, so deleting or reordering any draw cannot change heat_attrs / phase_*.
- *
- * Per-tick combine order — main() (§7) is the only place that advances state,
- * and phoenix_tick() (via scene_tick) is the only simulation mutator:
- *     1. PERFORMANCE  measure dt (capped at DT_CAP_S)        §7
- *     2. SIMULATION   scene_tick(dt)  [skipped if paused]    §5
- *     3. RENDER       scene_draw()  (read-only)              §6
- *     4. PERFORMANCE  fps tally + sleep to the frame cap     §7
- *
- * User events (keys: pause/reset/skip/ignite/theme/density; SIGWINCH resize)
- * mutate Scene but are NOT part of the tick — handled before it in §7
- * (getch branch → app_handle_key, and the resize block).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config — sizes, phase timings, fire physics, palette IDs ── */
 
 #define TARGET_FPS         60
 
@@ -290,12 +39,11 @@
 
 #define N_ANCHOR_MAX       80
 
-/* Display aspect — terminal cells are tall+narrow; multiply x by this
- * factor when drawing so the owl reads round, not stretched vertical. */
+/* Terminal cells are taller than wide, so a circle drawn 1:1 looks
+ * squashed. Multiply x by this when drawing so the owl reads round. */
 #define ASPECT_X           2.0f
 
-/* Owl silhouette geometry (cells; head at origin, +y down).
- * The seed (REBIRTH growth centre) is the head centre. */
+/* Owl shape, measured in cells from the head centre (+y points down). */
 #define HEAD_CY           (-3.0f)
 #define HEAD_RX            4.0f
 #define HEAD_RY            3.0f
@@ -309,9 +57,9 @@
 #define EARTUFT_DY        (-6.2f)
 
 #define SEED_DX            0.0f
-#define SEED_DY           (-3.0f)     /* head centre — REBIRTH source   */
+#define SEED_DY           (-3.0f)     /* where the reborn bird grows from */
 
-/* Lifecycle timings (seconds). */
+/* How long each stage of the burn-and-rebirth cycle lasts (seconds). */
 #define T_PERCH           12.0f
 #define T_IGNITE           2.0f
 #define T_BLAZE            3.0f
@@ -320,61 +68,58 @@
 #define T_REBIRTH          3.0f
 
 /* Body particle behaviour. */
-#define BODY_JITTER_R      0.55f
-#define BREATH_HZ          0.25f      /* slow chest rise, cycles/sec    */
-#define BREATH_AMP         0.20f      /* tiny head/body bob, cells       */
+#define BODY_JITTER_R      0.55f      /* random wobble around each anchor */
+#define BREATH_HZ          0.25f      /* breathing speed, cycles/sec     */
+#define BREATH_AMP         0.20f      /* tiny up-down bob while perched   */
 
-/* IGNITE / BLAZE / COLLAPSE / REBIRTH temperature shaping.  See the
- * MENTAL MODEL "phase temp modifier" formulas. */
+/* Hot/cool temperatures the various burn stages aim particles toward. */
 #define BLAZE_TEMP_MIN     0.85f
 #define BLAZE_TEMP_MAX     1.00f
 #define COLLAPSE_TEMP_HOT  1.00f
 #define COLLAPSE_TEMP_COOL 0.30f
 
-/* COLLAPSE: rate at which BOUND body particles flip BOUND→FREE.
- * With release rate 4/s and frac ramping 0→1, near end of COLLAPSE we
- * release ~4 particles/s/particle — i.e. virtually all in the last
- * fraction of the phase. */
+/* During COLLAPSE, how eagerly bound particles let go and become flying
+ * embers. Higher = they scatter sooner; tuned so nearly all are loose by
+ * the time the stage ends. */
 #define COLLAPSE_RELEASE_RATE  6.0f
 
-/* REBIRTH: rate at which FREE body particles try to recapture to an
- * alive anchor.  Each frame, prob = rate · dt — 5 means most particles
- * will have at least one capture attempt per second. */
+/* During REBIRTH, how eagerly flying embers get pulled back onto the owl
+ * shape each second. Higher = the bird reforms faster. */
 #define REBIRTH_CAPTURE_RATE   5.0f
 
-/* Spark emission rate, particles/sec, by phase. */
+/* How many sparks per second fly off, per burn stage. */
 #define SPARK_HZ_PERCH       0.0f
 #define SPARK_HZ_IGNITE     20.0f
 #define SPARK_HZ_BLAZE     120.0f
 #define SPARK_HZ_COLLAPSE   60.0f
 #define SPARK_HZ_ASH         8.0f
 #define SPARK_HZ_REBIRTH    45.0f      /* flames lick around the reforming owl */
-#define SPARK_BURST_MAX     16
-#define REBIRTH_FLARE_FRAC   4         /* onset flare = n_spark / this         */
+#define SPARK_BURST_MAX     16          /* cap sparks emitted in one frame    */
+#define REBIRTH_FLARE_FRAC   4         /* rebirth flare = n_spark / this      */
 
 /* Spark physics. */
-#define SPARK_LIFE_BASE     1.6f
+#define SPARK_LIFE_BASE     1.6f       /* how long a spark lives, seconds  */
 #define SPARK_LIFE_VAR      0.5f
-#define SPARK_TEMP_INIT     0.95f
+#define SPARK_TEMP_INIT     0.95f      /* sparks start near white-hot      */
 #define SPARK_TEMP_VAR      0.10f
-#define SPARK_VEL_BASE      4.0f      /* initial speed, cells/sec       */
+#define SPARK_VEL_BASE      4.0f      /* launch speed, cells/sec        */
 #define SPARK_VEL_VAR       0.6f
-#define SPARK_VEL_UP        2.5f      /* extra upward bias              */
+#define SPARK_VEL_UP        2.5f      /* extra upward kick              */
 
-/* Free-flight fire physics — applied to body-FREE particles AND sparks. */
-#define FIRE_BUOYANCY      11.0f
-#define FIRE_DRAG           1.4f
-#define FIRE_COOL           0.85f
-#define FIRE_SHEAR_AMP      6.0f
-#define FIRE_SHEAR_HZ       1.5f
-#define FIRE_TEMP_FLOOR     0.04f
+/* Fire motion shared by loose body embers and sparks alike. */
+#define FIRE_BUOYANCY      11.0f       /* how hard hot stuff floats up     */
+#define FIRE_DRAG           1.4f       /* air resistance                   */
+#define FIRE_COOL           0.85f      /* how fast things cool down        */
+#define FIRE_SHEAR_AMP      6.0f       /* strength of the swirling wind    */
+#define FIRE_SHEAR_HZ       1.5f       /* how fast that wind changes       */
+#define FIRE_TEMP_FLOOR     0.04f      /* below this, a particle dies      */
 
-/* COLLAPSE release initial velocity range. */
-#define COLLAPSE_VEL_LATERAL  3.0f    /* ±cells/sec sideways            */
-#define COLLAPSE_VEL_DOWN     2.0f    /* base downward fall, cells/sec  */
-#define COLLAPSE_VEL_UPVAR    3.5f    /* random component (some go up)  */
+/* Launch velocity when a body particle breaks loose during COLLAPSE. */
+#define COLLAPSE_VEL_LATERAL  3.0f    /* sideways spread, ±cells/sec    */
+#define COLLAPSE_VEL_DOWN     2.0f    /* baseline fall, cells/sec       */
+#define COLLAPSE_VEL_UPVAR    3.5f    /* random kick (some fly upward)  */
 
-#define DT_CAP_S           0.10f
+#define DT_CAP_S           0.10f       /* cap one frame's time step, seconds */
 #define N_THEMES           4
 
 /* Colour pair IDs */
@@ -388,9 +133,7 @@
 #define PAIR_HUD      8
 #define PAIR_HINT     9
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  performance — timing primitives (frame cap applied in §7)           */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 performance — monotonic clock and sleep helpers ── */
 
 static int64_t clock_ns(void)
 {
@@ -408,66 +151,67 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&t, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  types — the data SIMULATION owns (built/mutated in §5, read in §6)   */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 types — anchor template, particle pools, lifecycle, scene ── */
 
-/* Anchor — one fixed point of the owl pose, in body-local cells.  The owl is a
- * SHAPE (a list of ~38 of these), not a drawn image.
+/* Anchor — one fixed point of the owl's outline. The owl is described as a
+ * list of ~38 of these points rather than a drawn picture; a swarm of
+ * particles snaps to them to make the shape appear. Listing the pose this way
+ * is what makes igniting, dissolving, and regrowing the bird easy — the same
+ * particles just stop or resume snapping (the anchor-template idea, also used
+ * in ant_colony.c).
  *
- * WHY anchors + a swarm: rather than draw an owl, we list its pose points and
- * let a particle swarm snap to them each frame (the anchor-template pattern,
- * cf. ant_colony.c).  That makes ignite / dissolve / regrow trivial — the SAME
- * particles just stop or resume snapping — so one swarm renders owl AND fire.
- *
- * VALUE LOGIC:
- *   dx,dy     — position relative to the owl centre (cells; x is ×ASPECT_X at
- *               draw time so the bird reads round on tall terminal cells).
- *   weight    — relative draw probability (eyes 5.0 ≫ body-fill 0.7), so dense
- *               regions get proportionally more particles.
- *   base_temp — PERCH heat ∈ ~[0.14..0.55]: eyes hot (glow), body coolest.
- *   alive_at  — normalised distance from the SEED (head centre), 0..1.  REBIRTH
- *               admits anchor i only once growth_frac ≥ alive_at, so the bird
- *               grows outward from the eyes (KEY FORMULAS in the header). */
+ *   dx,dy     — position relative to the owl's centre, in cells. (x is scaled
+ *               by ASPECT_X at draw time so the bird looks round.)
+ *   weight    — how likely a particle is to pick this point; bigger means a
+ *               denser cluster. Eyes ~5.0, plain body fill ~0.7.
+ *   base_temp — resting heat, roughly 0.14 (coolest body) to 0.55 (glowing
+ *               eyes); drives the resting feather colour.
+ *   alive_at  — distance from the seed point, scaled 0 (at the seed) to 1
+ *               (farthest). During rebirth a point only reappears once the
+ *               growth reaches its alive_at, so the bird grows outward from
+ *               the eyes. */
 typedef struct {
-    float dx, dy;      /* body-local position (cells)                  */
-    float weight;      /* draw probability                              */
-    float base_temp;   /* PERCH temperature                             */
-    float alive_at;    /* REBIRTH wake threshold (0 = at seed, 1 = far) */
+    float dx, dy;      /* position relative to owl centre (cells)      */
+    float weight;      /* how likely particles cluster here            */
+    float base_temp;   /* resting heat, 0..1                           */
+    float alive_at;    /* rebirth wake order, 0 = at seed, 1 = farthest */
 } Anchor;
 
-/* BodyParticle — one owl-forming particle (a Reeves particle system, ref [1]).
+/* BodyParticle — one of the particles that make up the owl/fire.
  *
- * WHY two modes: the whole effect is ONE swarm that either traces the owl or
- * burns.  BOUND (released=false) snaps to an anchor every frame → the
- * silhouette.  FREE (released=true) integrates fire physics (vx/vy via
- * fire_step) → an ember that peeled off in COLLAPSE/ASH and drifts home in
- * REBIRTH.  The lifecycle FSM (§5) flips the mode per phase; nothing else
- * about the particle changes — that's what lets the owl become fire and back.
+ * Every particle is in one of two modes. BOUND (released=false) snaps to an
+ * anchor each frame, so the swarm traces the owl outline. FREE (released=true)
+ * flies under the fire physics — a loose ember that broke off while burning
+ * and drifts back during rebirth. The same particle just switches modes; that
+ * single switch is what turns the owl into fire and back.
  *
- * VALUE LOGIC: x,y in world cells; vx,vy meaningful only while FREE; temp ∈
- * [0,1] drives the heat-ramp colour in BOTH modes (a perched owl is just
- * low-temp feathers); anchor_idx is the anchor it last snapped to. */
+ *   x,y        — position in world cells.
+ *   vx,vy      — velocity; only meaningful while FREE.
+ *   temp       — heat 0..1; picks the colour and glyph in BOTH modes (a
+ *                perched owl is simply low-temp feather colours).
+ *   anchor_idx — the anchor it last snapped to, while BOUND.
+ *   released   — false = BOUND (tracing the owl), true = FREE (flying). */
 typedef struct {
-    float x, y;          /* world cell coords                            */
-    float vx, vy;        /* used while FREE (released)                   */
-    float temp;          /* drives heat-ramp bucket                      */
-    int   anchor_idx;    /* current anchor, when BOUND                   */
-    bool  released;      /* false = BOUND, true = FREE                   */
+    float x, y;
+    float vx, vy;
+    float temp;
+    int   anchor_idx;
+    bool  released;
 } BodyParticle;
 
-/* Spark — a pure free-flight ember (a Reeves particle system, ref [1]); a
- * separate, smaller pool from the body.
+/* Spark — a short-lived flying ember, kept in its own smaller pool.
  *
- * WHY a second pool: body particles must return to the owl, so they can't fly
- * off forever.  Sparks CAN — they're the disposable wisps emitted from the
- * burning silhouette that rise, cool and die, plus the flare the owl bursts
- * from at REBIRTH.  Same fire_step physics as a FREE body particle, but with a
- * hard life cap so a slot frees up for re-emission.
+ * Body particles must always be able to return to the owl, so they never truly
+ * die. Sparks can: they're the throwaway wisps thrown off the burning bird
+ * that rise, cool, and wink out, plus the burst the owl emerges from at
+ * rebirth. They use the same fire physics as a free body particle but with a
+ * countdown so the slot frees up to be reused.
  *
- * VALUE LOGIC: x,y / vx,vy in world cells & cells/s; temp ∈ [0,1] cools every
- * tick (drives the heat-ramp colour); life counts down seconds; active=false
- * marks a free slot, reused by the next emission. */
+ *   x,y    — position in world cells.
+ *   vx,vy  — velocity in cells/sec.
+ *   temp   — heat 0..1; cools every frame and picks the colour.
+ *   life   — seconds remaining before it dies.
+ *   active — false means this slot is empty and reusable. */
 typedef struct {
     float x, y;
     float vx, vy;
@@ -476,15 +220,11 @@ typedef struct {
     bool  active;
 } Spark;
 
-/* PhoenixPhase — the self-immolation lifecycle as a finite state machine,
- * advanced in a fixed loop (phoenix myth, ref [7]):
- *   PERCH → IGNITE → BLAZE → COLLAPSE → ASH → REBIRTH → (PERCH)
- *
- * WHY an FSM: every visible difference between "owl" and "fire" is just which
- * BOUND/FREE rule and which temperature shaping is active.  Encoding that as one
- * enum keeps the per-particle update a clean switch and the whole cycle a single
- * counter (phase_t vs phase_duration).  Per-phase durations are the T_* config
- * literals; per-phase spark rates the SPARK_HZ_* ones. */
+/* PhoenixPhase — the stages of the burn-and-rebirth cycle, run in a fixed
+ * loop: PERCH → IGNITE → BLAZE → COLLAPSE → ASH → REBIRTH → back to PERCH.
+ * Each stage just decides whether particles snap to the owl or fly free and
+ * how hot they get, so the whole animation is one simple counter (time in the
+ * current stage versus that stage's length). */
 typedef enum {
     PHX_PERCH = 0,
     PHX_IGNITE,
@@ -495,60 +235,62 @@ typedef enum {
     N_PHX_PHASES,
 } PhoenixPhase;
 
-/* Phoenix — the bird as a whole: two cooperating particle systems over one
- * static anchor template, driven by one lifecycle FSM.
+/* Phoenix — the whole bird: a fixed owl outline plus the moving swarm and the
+ * clock that drives the cycle. The outline (anchors) is built once and never
+ * changes; only which particles snap to it, and how hot they are, varies over
+ * time. Pools are fixed-size and never grown, so nothing allocates while
+ * running.
  *
- * WHY this shape: the owl POSE is fixed (anchors, built once at init); only
- * which particles snap to it — and how hot they are — changes over the cycle.
- * So the struct cleanly separates the unchanging template (anchors) from the
- * moving swarm (body, sparks) and the clock that drives them (world_t / phase /
- * phase_t).  Pools are fixed-capacity and never grown — no malloc in the hot
- * path; n_body / n_spark are the live counts the user tunes. */
+ *   ox,oy           — owl's centre in world cells.
+ *   perch_y         — row the perch branch sits on.
+ *   world_t         — total seconds since reset; drives the swirling wind.
+ *   phase_t         — seconds spent in the current stage.
+ *   phase           — current stage of the cycle.
+ *   anchors,n_anchor— the owl outline and how many points it has.
+ *   body,n_body     — body particle pool; only the first n_body are live
+ *                     (',' '.' keys tune this).
+ *   sparks,n_spark  — spark pool; only the first n_spark are live (';' '\''
+ *                     keys tune this).
+ *   spark_emit_acc  — leftover fractional spark count carried between frames
+ *                     so a steady rate emits smoothly. */
 typedef struct {
-    /* Pose — owl centre + the perch it sits on (world cells). */
-    float ox, oy;                /* world centre of owl                  */
-    float perch_y;               /* perch row                             */
+    float ox, oy;
+    float perch_y;
 
-    /* Lifecycle clock — total time, time in phase, current phase. */
-    float world_t;               /* seconds since reset (drives turbulence) */
-    float phase_t;               /* seconds in the current phase            */
-    PhoenixPhase phase;          /* current lifecycle phase                 */
+    float world_t;
+    float phase_t;
+    PhoenixPhase phase;
 
-    /* Anchor template — the owl shape, built once at init (never per-frame). */
     Anchor anchors[N_ANCHOR_MAX];
-    int    n_anchor;             /* anchors actually written                */
+    int    n_anchor;
 
-    /* Particle pools — fixed capacity; only the first n_* are live. */
     BodyParticle body[N_BODY_MAX];
-    int          n_body;         /* live body particles (,/. keys)          */
+    int          n_body;
     Spark        sparks[N_SPARK_MAX];
-    int          n_spark;        /* live spark slots (;/' keys)             */
+    int          n_spark;
 
-    /* Spark emission — fractional carry so a fixed Hz emits smoothly. */
     float spark_emit_acc;
 } Phoenix;
 
-/* Scene — the whole program in one aggregate (the WHAT + WHERE + the knobs).
- * WHAT: phx, the phoenix.  WHERE/when: rows/cols (terminal) and fps (measured).
- * RENDER knob: theme (palette).  run-state: paused.  The body/spark density
- * knobs live on Phoenix beside the pools they size — those are simulation
- * knobs, not screen state. */
+/* Scene — everything the program tracks in one bundle.
+ *   rows,cols — terminal size.
+ *   phx       — the phoenix itself.
+ *   theme     — which colour palette is active.
+ *   paused    — true while the animation is frozen.
+ *   fps       — measured frame rate, shown in the HUD. */
 typedef struct {
-    int     rows, cols;   /* terminal dimensions (WHERE)                      */
-    Phoenix phx;          /* the phoenix: owl shape + fire + lifecycle (WHAT) */
-    int     theme;        /* active colour palette — a RENDER choice          */
-    bool    paused;       /* run-state                                        */
-    float   fps;          /* measured frame rate, shown in the HUD            */
+    int     rows, cols;
+    Phoenix phx;
+    int     theme;
+    bool    paused;
+    float   fps;
 } Scene;
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  logic — pure decisions: no mutation, no I/O                         */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 logic — pure heat-to-colour mapping and per-phase lookups ── */
 
-/* heat_attrs — map a per-particle temperature to (color pair, glyph,
- * extra attributes).  Bucket 0 dim, buckets 1-3 normal, buckets 4-5
- * bold so the white-hot core dominates.  Glyph density (sparser →
- * denser) parallels heat (cool dot, bright fill char). */
+/* Turn a particle's heat into a colour, glyph, and emphasis. Cooler =
+ * sparser dot and dimmer; hotter = denser character and bold, so the
+ * white-hot core stands out. */
 static void heat_attrs(float temp, short *pair, char *glyph, attr_t *attrs)
 {
     static const char glyphs[6] = { '.', '+', '*', '#', '@', '%' };
@@ -599,15 +341,12 @@ static float spark_hz_for_phase(PhoenixPhase p)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  simulation — advances state (sole mutator of the Phoenix / Scene)    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 simulation — build the owl, run the fire physics and lifecycle ── */
 
 static float frand(void)         { return (float)rand() / (float)RAND_MAX; }
 static float frand_signed(void)  { return frand() * 2.f - 1.f; }
 
-/* emit_ellipse — write n anchors evenly around an ellipse centred at (cx,cy)
- * with radii (rx,ry), all sharing kind/weight/base_temp.  Returns next index. */
+/* Place n anchors evenly around an ellipse. Returns the next free index. */
 static int emit_ellipse(Anchor *out, int idx, int n, float cx, float cy,
                         float rx, float ry, float weight, float base_temp)
 {
@@ -622,7 +361,7 @@ static int emit_ellipse(Anchor *out, int idx, int n, float cx, float cy,
     return idx;
 }
 
-/* emit_point — write one feature anchor at (dx,dy).  Returns next index. */
+/* Place a single feature anchor (eye, beak, tuft). Returns the next index. */
 static int emit_point(Anchor *out, int idx, float dx, float dy,
                       float weight, float base_temp)
 {
@@ -633,9 +372,8 @@ static int emit_point(Anchor *out, int idx, float dx, float dy,
     return idx + 1;
 }
 
-/* normalize_alive_at — set each anchor's alive_at to its distance from the SEED,
- * normalised to [0,1], so REBIRTH grows the bird outward from the head centre
- * (eyes near the seed reappear first, ear tufts last). */
+/* Set each anchor's alive_at to its distance from the seed, scaled 0..1, so
+ * rebirth fills the bird outward from the head (eyes first, ear tufts last). */
 static void normalize_alive_at(Anchor *out, int n)
 {
     float max_d = 0.f;
@@ -654,19 +392,14 @@ static void normalize_alive_at(Anchor *out, int n)
     }
 }
 
-/*
- * anchor_table_build — populate `out[]` with the owl silhouette.
- * Returns the number of anchors written.
- *
- * Outline rings (head + body) give the silhouette; a small interior ring adds
- * mass; high-weight feature points (eyes, beak, ear tufts) read as features.
- * Finally alive_at is normalised so REBIRTH can grow the bird outward.
- */
+/* Build the owl outline into out[] and return how many anchors it holds. Two
+ * rings sketch the head and body, a small inner ring fills it in, and a few
+ * heavy feature points become the eyes, beak, and ear tufts. */
 static int anchor_table_build(Anchor *out)
 {
     int idx = 0;
 
-    /* Outline + mass: head ring, body ring (taller than wide), inner body fill. */
+    /* Head ring, body ring (taller than wide), and an inner fill ring. */
     idx = emit_ellipse(out, idx, 12, 0.f, HEAD_CY, HEAD_RX, HEAD_RY,
                        1.4f, 0.18f);
     idx = emit_ellipse(out, idx, 14, 0.f, BODY_CY, BODY_RX, BODY_RY,
@@ -674,7 +407,7 @@ static int anchor_table_build(Anchor *out)
     idx = emit_ellipse(out, idx,  5, 0.f, BODY_CY, BODY_RX * 0.45f, BODY_RY * 0.45f,
                        0.7f, 0.14f);
 
-    /* Features: two glowing eyes, a beak, two ear tufts (high weight/temp). */
+    /* Glowing eyes, a beak, and two ear tufts (heavier and hotter). */
     idx = emit_point(out, idx, -EYE_DX,     EYE_DY,     5.0f, 0.55f);
     idx = emit_point(out, idx,  EYE_DX,     EYE_DY,     5.0f, 0.55f);
     idx = emit_point(out, idx,  0.f,        BEAK_DY,    2.0f, 0.40f);
@@ -685,7 +418,7 @@ static int anchor_table_build(Anchor *out)
     return idx;
 }
 
-/* anchor_pick — weighted-random anchor index over ALL anchors. */
+/* Pick a random anchor, with denser-weighted points chosen more often. */
 static int anchor_pick(const Anchor *anch, int n)
 {
     float total = 0.f;
@@ -699,8 +432,8 @@ static int anchor_pick(const Anchor *anch, int n)
     return n - 1;
 }
 
-/* anchor_pick_alive — weighted-random over anchors with alive_at <=
- * growth_frac (used during REBIRTH).  Returns -1 if none alive. */
+/* Like anchor_pick, but only among points the rebirth has reached so far
+ * (alive_at <= growth_frac). Returns -1 if none have woken yet. */
 static int anchor_pick_alive(const Anchor *anch, int n, float growth_frac)
 {
     float total = 0.f;
@@ -720,12 +453,9 @@ static int anchor_pick_alive(const Anchor *anch, int n, float growth_frac)
     return last_alive;
 }
 
-/*
- * body_rebind_to — set particle position to anchor world pos + jitter,
- * record anchor index, mark BOUND.  Caller chooses the anchor so this
- * works for both unrestricted (PERCH/IGNITE/BLAZE) and alive-only
- * (REBIRTH) bind paths.
- */
+/* Snap a particle onto the given anchor (plus a little wobble) and mark it
+ * bound. The caller picks the anchor, so this serves both the normal bind and
+ * the rebirth alive-only bind. */
 static void body_rebind_to(BodyParticle *p, const Anchor *anch, int idx,
                            float ox, float oy, float bob)
 {
@@ -737,71 +467,54 @@ static void body_rebind_to(BodyParticle *p, const Anchor *anch, int idx,
     p->released = false;
 }
 
-/*
- * body_release — convert a BOUND particle to FREE.  Initial velocity
- * is mostly downward (the bird is collapsing onto the perch) with
- * lateral spread and an upward random component (some embers fly up
- * even as the silhouette falls).
- *
- * Position is left at its current value (just snapped from rebind),
- * temperature is preserved so the released particle starts hot and
- * cools naturally — a sudden temp drop on release would look like
- * teleportation rather than disintegration.
- */
+/* Let a bound particle break loose into a flying ember. It keeps its current
+ * spot and heat (so it looks like it crumbles, not teleports) and gets a
+ * mostly-downward launch as the bird collapses onto the perch. */
 static void body_release(BodyParticle *p)
 {
     p->released = true;
     p->vx = frand_signed() * COLLAPSE_VEL_LATERAL;
-    /* y velocity: mostly down, with random component that occasionally
-     * sends a piece upward — visually "embers escaping the collapse". */
+    /* Mostly falling, but the random part lets a few embers shoot upward. */
     p->vy = COLLAPSE_VEL_DOWN + frand_signed() * COLLAPSE_VEL_UPVAR;
 }
 
-/*
- * fire_step — one integration step of the free-flight fire physics.
- * Used by FREE body particles AND by sparks.  Same buoyancy + sin-shear
- * + drag + cooling formulas as fire_tornado.c / volcano.c.
- */
+/* Move one flying ember forward by dt seconds: swirling wind, upward float
+ * (stronger when hotter), air drag, then it cools. Shared by loose body
+ * particles and sparks, same as fire_tornado.c / volcano.c. */
 static void fire_step(float *x, float *y, float *vx, float *vy, float *temp,
                       float dt, float t)
 {
-    /* Turbulence — sine-shear field, position-dependent so neighbours
-     * get different forces (otherwise the column sways as a block). */
+    /* Swirling wind. The push depends on position so nearby embers get
+     * different shoves, instead of the whole column swaying as one block. */
     float shx = sinf(FIRE_SHEAR_HZ * t + 0.30f * (*x) + 0.45f * (*y));
     float shy = cosf(FIRE_SHEAR_HZ * t + 0.45f * (*x) - 0.30f * (*y));
     *vx += FIRE_SHEAR_AMP * shx * dt;
     *vy += FIRE_SHEAR_AMP * shy * dt * 0.6f;
 
-    /* Buoyancy (negative y = up).  Smoke (low temp) keeps a small floor
-     * lift so wisps drift up. */
+    /* Hot air rises (negative y is up). Even cool smoke gets a little lift. */
     float lift = FIRE_BUOYANCY * (0.20f + 0.80f * (*temp));
     *vy -= lift * dt;
 
-    /* Drag — multiplicative velocity damping. */
+    /* Air drag slows it down. */
     float k = 1.f - FIRE_DRAG * dt;
     if (k < 0.f) k = 0.f;
     *vx *= k;
     *vy *= k;
 
-    /* Integrate. */
     *x += *vx * dt;
     *y += *vy * dt;
 
-    /* Cooling — exponential. */
     *temp *= expf(-FIRE_COOL * dt);
     if (*temp < 0.f) *temp = 0.f;
 }
 
-/*
- * spark_emit — one new spark at (sx,sy), with mostly-upward velocity
- * (sparks rise from a fire) plus lateral spread.  Life and temp
- * randomised so the resulting trail isn't striped.
- */
+/* Launch a fresh spark from (sx,sy), aimed mostly upward with some spread.
+ * Life and heat are randomised so the rising trail doesn't look striped. */
 static void spark_emit(Spark *s, float sx, float sy)
 {
     float speed   = SPARK_VEL_BASE * (1.f + SPARK_VEL_VAR * frand_signed());
-    float ang     = (float)(-M_PI / 2.0)               /* up */
-                  + frand_signed() * 0.7f;             /* ±~40° */
+    float ang     = (float)(-M_PI / 2.0)               /* straight up */
+                  + frand_signed() * 0.7f;             /* wobble ~40 degrees */
     s->x          = sx + frand_signed() * 0.6f;
     s->y          = sy + frand_signed() * 0.4f;
     s->vx         = cosf(ang) * speed;
@@ -821,11 +534,10 @@ static void spark_tick(Spark *s, float dt, float t)
     if (s->life <= 0.f || s->temp <= FIRE_TEMP_FLOOR) s->active = false;
 }
 
-/* Compute the per-frame BOUND temperature for a body particle, given
- * the anchor's base_temp and the current phase + phase fraction.
- * This is where each phase's "temperament" lives — see the MENTAL
- * MODEL "phase temp modifier" section.  (Not in §4 LOGIC: it draws on
- * the PRNG via frand_signed.) */
+/* Decide how hot a snapped-on particle should be right now. This is where each
+ * stage gets its mood: resting feathers in PERCH, heating up through IGNITE,
+ * white-hot in BLAZE, cooling through COLLAPSE, and easing from flame back to
+ * feather in REBIRTH. frac is 0..1 progress through the current stage. */
 static float bound_temp(PhoenixPhase phase, float frac, float base_temp,
                         float alive_at)
 {
@@ -833,8 +545,8 @@ static float bound_temp(PhoenixPhase phase, float frac, float base_temp,
     case PHX_PERCH:
         return base_temp + frand_signed() * 0.05f;
     case PHX_IGNITE: {
-        /* Linearly blend from base_temp toward 1.0.  At frac=1 the bird
-         * is fully ignited (white-hot); at frac=0 it's still itself. */
+        /* Ramp from the resting feather heat up toward white-hot as the
+         * stage progresses. */
         float t = base_temp + (1.0f - base_temp) * frac;
         return t + frand_signed() * 0.05f;
     }
@@ -846,12 +558,11 @@ static float bound_temp(PhoenixPhase phase, float frac, float base_temp,
         return t + frand_signed() * 0.05f;
     }
     case PHX_REBIRTH: {
-        /* Each particle is born hot (flame at the seed, cooler at the edges),
-         * then cools toward its settled feather colour (base_temp) as the bird
-         * completes (frac → 1).  So the owl EMERGES from the flames and resolves
-         * into the cool silhouette, rather than staying on fire the whole time. */
-        float hot = 0.95f - 0.30f * alive_at;       /* flamy core, cooler out */
-        float t   = hot + (base_temp - hot) * frac; /* flame → feather over phase */
+        /* Start each particle as flame (hottest near the seed) and let it cool
+         * down to its resting feather colour as the bird finishes reforming,
+         * so the owl emerges out of the fire instead of staying ablaze. */
+        float hot = 0.95f - 0.30f * alive_at;
+        float t   = hot + (base_temp - hot) * frac;
         return t + frand_signed() * 0.05f;
     }
     default:
@@ -859,11 +570,9 @@ static float bound_temp(PhoenixPhase phase, float frac, float base_temp,
     }
 }
 
-/*
- * phoenix_init — build anchors, place owl at the screen centre slightly
- * above the perch, distribute body particles to anchors with valid
- * initial state.  Sparks all inactive.
- */
+/* Set up a fresh bird: build the owl outline, place it on screen, and snap
+ * every body particle onto an anchor so frame 0 already looks like an owl
+ * rather than a cloud. Sparks all start empty. */
 static void phoenix_init(Phoenix *p, int rows, int cols, int n_body, int n_spark)
 {
     memset(p, 0, sizeof *p);
@@ -875,7 +584,6 @@ static void phoenix_init(Phoenix *p, int rows, int cols, int n_body, int n_spark
     p->n_spark  = n_spark;
     p->n_anchor = anchor_table_build(p->anchors);
 
-    /* Initial bind so frame 0 is already an owl, not a smear. */
     for (int i = 0; i < p->n_body; i++) {
         int idx = anchor_pick(p->anchors, p->n_anchor);
         body_rebind_to(&p->body[i], p->anchors, idx, p->ox, p->oy, 0.f);
@@ -899,8 +607,8 @@ static void phoenix_resize(Phoenix *p, int rows, int cols)
     p->perch_y = (float)rows * 0.45f + (BODY_CY + BODY_RY + 1.0f);
 }
 
-/* On entering PERCH, snap any still-FREE particle back to an anchor so the
- * resting owl is whole, not half-rebuilt. */
+/* When the cycle settles back to PERCH, pull any leftover flying particles
+ * home so the resting owl is whole rather than half-rebuilt. */
 static void rebind_strays_to_owl(Phoenix *p)
 {
     for (int i = 0; i < p->n_body; i++) {
@@ -913,22 +621,20 @@ static void rebind_strays_to_owl(Phoenix *p)
     }
 }
 
-/* On entering REBIRTH, force every particle FREE so the rebuild starts from a
- * clean slate (no leftover bound "ghost owl" from the COLLAPSE end). */
+/* When REBIRTH starts, set every particle flying so the rebuild begins from a
+ * clean slate with no leftover "ghost owl" from the collapse. */
 static void release_all_body(Phoenix *p)
 {
     for (int i = 0; i < p->n_body; i++) {
         if (!p->body[i].released) {
             p->body[i].released = true;
-            /* Inherit current position; assign small drift. */
             p->body[i].vx = frand_signed() * 1.5f;
             p->body[i].vy = -1.0f + frand_signed() * 0.8f;
         }
     }
 }
 
-/* Flame flare at the seed — the burst of upward fire the owl bursts out of and
- * then reforms from (REBIRTH onset). */
+/* The upward burst of fire at the seed that the reborn owl emerges from. */
 static void emit_seed_flare(Phoenix *p)
 {
     float sx = p->ox + SEED_DX * ASPECT_X;
@@ -941,8 +647,8 @@ static void emit_seed_flare(Phoenix *p)
     }
 }
 
-/* phoenix_advance_phase — phase_t exceeded duration; step to the next phase
- * and run its entry action (clean owl on PERCH; release + flare on REBIRTH). */
+/* Move to the next stage of the cycle and run its one-time entry action
+ * (tidy the owl on PERCH; scatter everything and flare on REBIRTH). */
 static void phoenix_advance_phase(Phoenix *p)
 {
     p->phase_t = 0.f;
@@ -952,9 +658,8 @@ static void phoenix_advance_phase(Phoenix *p)
     if (p->phase == PHX_REBIRTH) { release_all_body(p); emit_seed_flare(p); }
 }
 
-/* Snap a body particle to a weighted-random anchor (full pool) and set its
- * temperature for the current phase.  Used by PERCH/IGNITE/BLAZE and by the
- * still-bound branch of COLLAPSE. */
+/* Snap a particle to a random anchor and give it the right heat for the
+ * current stage. Used while the owl is intact (PERCH/IGNITE/BLAZE). */
 static void body_bind_random(Phoenix *p, BodyParticle *b, float frac, float bob)
 {
     int idx = anchor_pick(p->anchors, p->n_anchor);
@@ -963,8 +668,8 @@ static void body_bind_random(Phoenix *p, BodyParticle *b, float frac, float bob)
                          p->anchors[idx].base_temp, p->anchors[idx].alive_at);
 }
 
-/* Try to snap a body particle onto an AWAKE anchor (alive_at ≤ growth) during
- * REBIRTH; returns true if it bound, false if none are awake yet. */
+/* During REBIRTH, try to snap a particle onto an already-awoken anchor;
+ * returns false if the growth hasn't reached any anchors yet. */
 static bool body_bind_alive(Phoenix *p, BodyParticle *b, float frac, float bob)
 {
     int idx = anchor_pick_alive(p->anchors, p->n_anchor, frac);
@@ -975,8 +680,8 @@ static bool body_bind_alive(Phoenix *p, BodyParticle *b, float frac, float bob)
     return true;
 }
 
-/* COLLAPSE: a still-bound particle has a frac-rising chance to release; once
- * FREE it integrates fire physics.  By the end virtually all are FREE. */
+/* COLLAPSE step for one particle: a bound one has a growing chance to break
+ * loose; once loose it flies as fire. By the end almost all have let go. */
 static void body_tick_collapse(Phoenix *p, BodyParticle *b, float frac, float dt,
                                float bob)
 {
@@ -988,7 +693,7 @@ static void body_tick_collapse(Phoenix *p, BodyParticle *b, float frac, float dt
         fire_step(&b->x, &b->y, &b->vx, &b->vy, &b->temp, dt, p->world_t);
 }
 
-/* ASH: force FREE (smouldering wisps drift up) and integrate fire physics. */
+/* ASH step: make sure the particle is loose, then let it drift up as smoke. */
 static void body_tick_ash(Phoenix *p, BodyParticle *b, float dt)
 {
     if (!b->released) {
@@ -999,8 +704,8 @@ static void body_tick_ash(Phoenix *p, BodyParticle *b, float dt)
     fire_step(&b->x, &b->y, &b->vx, &b->vy, &b->temp, dt, p->world_t);
 }
 
-/* REBIRTH: a FREE particle tries to capture onto an awake anchor each frame
- * (else keeps flying); a bound straggler re-binds to an awake anchor. */
+/* REBIRTH step: a flying particle tries each frame to land on an awoken anchor,
+ * otherwise keeps drifting; an already-landed one re-snaps to an awoken one. */
 static void body_tick_rebirth(Phoenix *p, BodyParticle *b, float frac, float dt,
                               float bob)
 {
@@ -1014,12 +719,7 @@ static void body_tick_rebirth(Phoenix *p, BodyParticle *b, float frac, float dt,
         fire_step(&b->x, &b->y, &b->vx, &b->vy, &b->temp, dt, p->world_t);
 }
 
-/*
- * phoenix_tick_body — update every body particle by dispatching to the current
- * phase's rule: BOUND (snap to the owl) for PERCH/IGNITE/BLAZE, the BOUND→FREE
- * release for COLLAPSE, free drift for ASH, and the FREE→BOUND recapture for
- * REBIRTH.  See each body_tick_* / body_bind_* helper.
- */
+/* Update every body particle using the rule for the current stage. */
 static void phoenix_tick_body(Phoenix *p, float dt, float bob)
 {
     float frac = p->phase_t / phase_duration(p->phase);
@@ -1039,10 +739,7 @@ static void phoenix_tick_body(Phoenix *p, float dt, float bob)
     }
 }
 
-/*
- * phoenix_tick_sparks — emit sparks from random anchors at the rate
- * dictated by the current phase, then integrate every active spark.
- */
+/* Emit new sparks at this stage's rate, then move every live spark forward. */
 static void phoenix_tick_sparks(Phoenix *p, float dt)
 {
     float hz = spark_hz_for_phase(p->phase);
@@ -1065,11 +762,8 @@ static void phoenix_tick_sparks(Phoenix *p, float dt)
         spark_tick(&p->sparks[i], dt, p->world_t);
 }
 
-/*
- * phoenix_tick — top-level update.  Advance time, advance phase, then
- * step body and sparks.  Body bob is a slow vertical breath so even
- * the perched owl looks alive.
- */
+/* One full simulation step: advance the clock, move to the next stage if it's
+ * over, then update the body and the sparks. */
 static void phoenix_tick(Phoenix *p, float dt)
 {
     p->world_t += dt;
@@ -1078,8 +772,8 @@ static void phoenix_tick(Phoenix *p, float dt)
     if (p->phase_t >= phase_duration(p->phase))
         phoenix_advance_phase(p);
 
-    /* Breath bob — only obvious during PERCH but harmless during
-     * fire phases (the rebind absorbs the small offset). */
+    /* A gentle up-down bob so the resting owl looks like it's breathing;
+     * only applied during PERCH, where the small offset is visible. */
     float bob = (p->phase == PHX_PERCH)
               ? sinf(p->world_t * (float)(2.0 * M_PI) * BREATH_HZ) * BREATH_AMP
               : 0.f;
@@ -1109,24 +803,21 @@ static void scene_tick(Scene *s, float dt)
     phoenix_tick(&s->phx, dt);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  render — state → screen; reads only, never mutates sim state         */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 render — colours, particle/perch drawing, HUD, ncurses setup ── */
 
-/* Theme — a 6-step heat ramp (cool → hot) that doubles as BOTH the owl's
- * feather palette and the fire palette, plus the perch colour.
+/* A colour theme. Because a particle's colour comes straight from its heat,
+ * one six-step cool-to-hot ramp paints the whole bird: the cool end is the
+ * resting feathers, the hot end is the blaze. So pressing 't' swaps both the
+ * owl's plumage and its fire at once. All colours sit in the bright half of
+ * the 256-colour space so nothing vanishes (see CLAUDE.md).
  *
- * WHY one ramp for feathers AND fire: a particle's colour is purely a function
- * of its temperature (heat_attrs maps temp → bucket, ref [2] blackbody-style
- * fire colour).  A perched owl is just the cool end of the ramp (buckets 1-2);
- * a blaze is the hot end (4-5).  So one 6-colour ramp per theme defines the
- * whole look — feathers, embers, white-hot core — and 't' swaps the bird's
- * "species" and its fire at once.  Bucket 0 is smoke/ash (grey); all entries
- * sit in the bright half of the 256 cube (CLAUDE.md palette-brightness rule). */
+ *   name  — label shown in the HUD.
+ *   heat  — six colours from coolest (smoke) to hottest (white core).
+ *   perch — colour of the branch the owl sits on. */
 typedef struct {
     const char *name;
-    short       heat[6];     /* cool → hot, indexed by heat bucket 0..5  */
-    short       perch;        /* perch (branch) colour                   */
+    short       heat[6];
+    short       perch;
 } Theme;
 
 static const Theme g_themes[N_THEMES] = {
@@ -1201,11 +892,8 @@ static void spark_draw(const Spark *s, int rows, int cols)
     attroff(COLOR_PAIR(pair) | at);
 }
 
-/*
- * draw_perch — static branch under the bird, dim themed brown.
- * Length ≈ body width + padding, plus two short "leg" anchors below
- * to suggest depth.  Drawn before particles so the bird can sit on it.
- */
+/* Draw the branch the owl perches on, a little wider than the bird, with
+ * upturned ends and a drop strut so it reads as a branch rather than a beam. */
 static void draw_perch(const Scene *s)
 {
     int row = (int)lroundf(s->phx.perch_y);
@@ -1220,18 +908,18 @@ static void draw_perch(const Scene *s)
     attron(COLOR_PAIR(PAIR_PERCH) | A_BOLD);
     for (int x = x0; x <= x1; x++)
         mvaddch(row, x, (chtype)(unsigned char)'-');
-    /* End caps: slight upturn so it looks like a branch, not a beam. */
+    /* Slight upturn at each end. */
     if (x0 - 1 >= 0)        mvaddch(row, x0 - 1,
                                     (chtype)(unsigned char)'/');
     if (x1 + 1 <  s->cols)  mvaddch(row, x1 + 1,
                                     (chtype)(unsigned char)'\\');
-    /* Drop strut so it grounds visually. */
+    /* A short strut below so the branch feels grounded. */
     if (row + 1 < s->rows)
         mvaddch(row + 1, cx, (chtype)(unsigned char)'|');
     attroff(COLOR_PAIR(PAIR_PERCH) | A_BOLD);
 }
 
-/* HUD — phase + theme + counts + fps top-right; key hints bottom-left. */
+/* Status line top-right (stage, theme, counts, fps) and key hints bottom-left. */
 static void draw_hud(const Scene *s)
 {
     char buf[120];
@@ -1253,28 +941,24 @@ static void draw_hud(const Scene *s)
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/*
- * scene_draw — render order: perch → body (BOUND first, then FREE) →
- * sparks → HUD.  Drawing BOUND before FREE ensures fire that's flying
- * over the silhouette doesn't get overwritten by a re-snap below it.
- */
+/* Draw one frame. Order matters: the bound owl outline goes down first, then
+ * the flying embers on top of it, then the sparks, then the status line. */
 static void scene_draw(const Scene *s)
 {
     erase();
     draw_perch(s);
 
-    /* BOUND body first (the silhouette). */
+    /* The owl outline (particles snapped to anchors). */
     for (int i = 0; i < s->phx.n_body; i++)
         if (!s->phx.body[i].released)
             body_draw(&s->phx.body[i], s->rows, s->cols);
 
-    /* FREE body next — released embers, drawn on top of the silhouette
-     * they're disintegrating from. */
+    /* Flying embers, drawn over the outline they peeled off of. */
     for (int i = 0; i < s->phx.n_body; i++)
         if (s->phx.body[i].released)
             body_draw(&s->phx.body[i], s->rows, s->cols);
 
-    /* Sparks (pure free-flight pool) on top. */
+    /* Sparks on top. */
     for (int i = 0; i < s->phx.n_spark; i++)
         spark_draw(&s->phx.sparks[i], s->rows, s->cols);
 
@@ -1301,9 +985,7 @@ static void screen_cleanup(void)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  app — combine point (per-tick order) + user events + frame cap       */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 app — signals, key handling, the main loop and frame cap ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -1326,9 +1008,8 @@ static void install_signals(void)
 
 static void atexit_cleanup(void) { screen_cleanup(); }
 
-/* phoenix_skip_phase — finish the current phase immediately so
- * advance fires at the next tick.  Used by 's' and 'i' (jump to
- * IGNITE). */
+/* Jump straight to the end of the current stage so the next tick advances it
+ * (the 's' key). */
 static void phoenix_skip_phase(Phoenix *p)
 {
     p->phase_t = phase_duration(p->phase);
@@ -1340,7 +1021,7 @@ static void phoenix_jump_to_ignite(Phoenix *p)
     p->phase_t = 0.f;
 }
 
-/* User event — mutates Scene, but NOT part of the per-tick combine order. */
+/* Handle one keypress. Returns false only on quit. */
 static bool app_handle_key(Scene *s, int ch)
 {
     switch (ch) {
@@ -1415,28 +1096,25 @@ int main(void)
     int64_t fps_t0 = prev;
 
     while (g_running) {
-        /* USER EVENT (out of tick): resize */
         if (g_need_resize) app_do_resize(&scene);
 
-        /* USER EVENT (out of tick): key handling */
         int ch = getch();
         if (ch != ERR && !app_handle_key(&scene, ch)) g_running = 0;
 
-        /* 1. PERFORMANCE — measure dt, capped to avoid spiral-of-death */
+        /* Time since last frame, capped so a hiccup can't make the
+         * simulation lurch forward in one giant step. */
         int64_t now = clock_ns();
         float dt = (float)(now - prev) * 1e-9f;
         if (dt > DT_CAP_S) dt = DT_CAP_S;
         prev = now;
 
-        /* 2. SIMULATION — the sole state advance (skipped while paused) */
         scene_tick(&scene, dt);
 
-        /* 3. RENDER — read-only */
         scene_draw(&scene);
         wnoutrefresh(stdscr);
         doupdate();
 
-        /* 4. PERFORMANCE — fps tally + sleep to the frame cap */
+        /* Tally fps about twice a second. */
         frames++;
         if (now - fps_t0 >= 500000000LL) {
             scene.fps = (float)frames * 1e9f / (float)(now - fps_t0);
@@ -1444,6 +1122,7 @@ int main(void)
             fps_t0    = now;
         }
 
+        /* Sleep off the rest of the frame to hold the target rate. */
         int64_t sleep_ns = frame_ns - (clock_ns() - now);
         clock_sleep_ns(sleep_ns);
     }

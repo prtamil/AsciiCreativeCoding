@@ -1,247 +1,12 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * islamic_mandalas.c — 30 parametric Islamic geometric patterns
- *                       (20 simple + 10 complex)
- *
- *
- * Section map (cut by layer — see ARCHITECTURE):
- *   §1 config       — preset table + Ring/Preset types + constants + themes
- *   §2 performance  — monotonic clock + sleep
- *   §3 logic        — pure maps & queries (polar↔cell, line glyph, build math)
- *   §4 data         — Scene runtime state
- *   §5 simulation   — scene_tick: advance the build animation + rotation
- *   §6 render       — colour, primitives, draw_mandala, scene_draw + HUD
- *   §7 init/reset   — scene reset / restart / init
- *   §8 events       — keys, signals, screen setup
- *   §9 app          — the frame loop (the per-tick combine)
- *
- * Keys:
- *   q / Q / ESC     quit
- *   n / →           next preset (restarts build animation)
- *   p / ←           previous preset (restarts build animation)
- *   b / B           replay build animation for current preset
- *   t / T           cycle colour theme
- *   + / =           scale up
- *   -               scale down
- *   r / R           toggle slow rotation
- *   space           pause / resume (freezes build + rotation)
- *   0               reset to defaults
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/islamic_mandalas.c \
- *       -o islamic_mandalas -lncurses -lm
+ * islamic_mandalas.c — 30 parametric Islamic geometric patterns drawn in the
+ * terminal. Each pattern is a stack of concentric "rings", and each ring is one
+ * of six simple shapes (circle, polygon, star, outlined star, interlocking
+ * polygons, rays). Refs: Critchlow, "Islamic Patterns" (1976); Bourgoin,
+ * "Arabic Geometrical Pattern and Design" (1973); Lu & Steinhardt, Science 315
+ * (2007) for the near-quasicrystal star patterns.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Parametric Islamic-geometric synthesis.  Each
- *                 preset is a list of RINGS, where each ring is one
- *                 of six radial primitives:
- *                   CIRCLE      continuous dotted circle ('.')
- *                   POLYGON     N-vertex regular polygon (line-drawn)
- *                   STAR_POLY   N vertices connected by skip-density
- *                                lines (e.g. octagram = 8/3, dodecagram
- *                                = 12/5).  Same primitive as Hindu.
- *                   STAR_SHAPE  TRUE star outline: alternates OUTER
- *                                vertices (radius r) and INNER
- *                                vertices (radius r·inner_ratio),
- *                                drawing a sharp-pointed star
- *                                outline with 2n edges.  Distinctly
- *                                Islamic-style.
- *                   INTERLOCK   TWO regular n-gons at offset π/n
- *                                rotation (e.g. 4 + 4 rotated 45° =
- *                                Khatim 8-pointed star; 3 + 3 rotated
- *                                60° = hexagram Solomon's seal).
- *                   RAYS        N lines from inner gap to outer
- *                                radius (sun / compass patterns).
- *                 Optional centre marker '+' for medallion presets.
- *                 Thirty PRESETS pick different combinations to
- *                 produce thirty named geometric patterns.
- *
- * Data-structure: PRESETS[30] of MandalaPreset = (name, up to MAX_RINGS
- *                 Rings, centre flag).  Each Ring = (type, count,
- *                 density_or_inner_pct, relative_radius).  No heap
- *                 allocation.  Compact R(...) macro lets each
- *                 preset fit on one line.
- *
- * Rendering     : Polar→cell mapping with aspect correction
- *                 (ASPECT = 0.5 keeps circles round on screen).
- *                 Lines walked cell-by-cell with glyph picked from
- *                 (dx, dy) direction.  Per-ring-type colour pair,
- *                 themed by 4-theme palette (Iznik / Persian /
- *                 Andalusian / Mamluk).  Rings build progressively
- *                 over RING_BUILD_DUR seconds each; features fill in
- *                 sequentially within a ring.
- *
- * Performance   : O(rings · features · cells_per_feature) per frame.
- *                 At 4 rings × 32 features × ~12 cells = ~1500
- *                 paints per frame, microseconds.
- *
- * Strapwork simplification: real Islamic geometric art is built
- * from interlace strapwork — ribbons that pass over and under
- * each other at every crossing, creating a continuous 3-D woven
- * effect.  We render lines as plain crossings (no over-under).
- * The parametric structure is faithful to the underlying
- * geometry; the strapwork illusion is a lossy ASCII compromise.
- *
- * References    :
- *   Islamic geometric construction (the preset forms + their symmetry):
- *     Critchlow, "Islamic Patterns: An Analytical and Cosmological Approach"
- *       (1976) — the canonical introduction to the compass-and-straightedge
- *       construction behind these patterns.
- *     Bourgoin, "Arabic Geometrical Pattern and Design" (Dover reprint, 1973)
- *       — 200+ classical patterns analysed; a catalogue of the named forms.
- *     Broug, "Islamic Geometric Patterns" (Thames & Hudson, 2008) — a modern
- *       step-by-step guide to building each pattern from a circle subdivision.
- *     Lu & Steinhardt, "Decagonal and Quasi-Crystalline Tilings in Medieval
- *       Islamic Architecture" (Science 315, 2007) — the girih-tile / near-
- *       quasicrystal analysis behind the most intricate star patterns.
- *     Wikipedia, "Islamic geometric patterns", "Star polygon", "Girih tiles".
- *       https://en.wikipedia.org/wiki/Islamic_geometric_patterns
- *
- *   Geometry & rendering (star polygons, tilings, line raster, polar layout):
- *     Coxeter, "Regular Polytopes" (1973) — star polygon {n/d} notation and
- *       the gcd-based enumeration behind the STAR_POLY rings.
- *     Grünbaum & Shephard, "Tilings and Patterns" (1987) — the definitive
- *       treatment of star polygons, symmetry groups, and tilings.
- *     Bresenham, "Algorithm for computer control of a digital plotter"
- *       (IBM Syst. J. 1965) — the integer line walk behind the cell-by-cell
- *       segment drawing (POLYGON / STAR / INTERLOCK / RAYS rings).
- *     Foley, van Dam, Feiner & Hughes, "Computer Graphics: Principles and
- *       Practice" — polar / parametric primitives and 2-D raster line drawing
- *       behind §3's polar→cell mapping and the §6 ring draws.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * An Islamic geometric pattern is a SYMMETRIC DESIGN built from a
- * small alphabet of primitives — interlocking polygons (two
- * triangles = hexagram, two squares = 8-pointed star), star
- * polygons (octagram, dodecagram), outlined sharp stars, and
- * radial rays.  Thirty named patterns turn out to be thirty
- * parameter combinations of THE SAME draw function.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a tile-maker's stencil kit.  Stencils for an octagram
- * (8/3 star), a hexagram (two triangles), a sharp 12-point star
- * outline, a regular octagon frame, a circular border, a 16-spoke
- * sunburst.  An Andalusian tile is "octagram + outer circle"; a
- * Persian medallion is "two squares + outlined 8-star + octagonal
- * frame + circle".  Same kit, different recipe.
- *
- * VISUAL GRAMMAR
- * ──────────────
- *   STAR_POLY (line star)         STAR_SHAPE (outlined star)
- *
- *        \  |  /                       /\
- *         \ | /                       /  \
- *      ----X----                  ---/    \---
- *         / | \                       \  /
- *        /  |  \                       \/
- *
- *   "vertices connected by lines        "alternating outer-inner
- *    skipping d positions"                vertices, sharp points"
- *
- *   INTERLOCK (two polygons offset)
- *
- *           ▲         + 60°    ▽
- *          / \                 \-/
- *         /   \                /-\
- *         -----                ▲
- *
- *   "two regular n-gons rotated by π/n; together they form a
- *    2n-pointed star (4+4=Khatim, 3+3=hexagram)"
- *
- * ALGORITHM IN STEPS  (per frame)
- * ───────────────────────────────
- *   1. Find screen centre (cx, cy) and base radius from
- *      min(cols/2, rows/(2·ASPECT)) · scale.
- *   2. For each ring in the preset, gated by build_time:
- *      a. compute progress ∈ [0, 1] within the ring's time window
- *      b. dispatch by type to the matching draw primitive,
- *         passing the progress so partial features render
- *   3. Draw centre marker '+' if the preset has centre_dot set.
- *   4. HUD row + key hint strip.
- *
- * KEY FORMULAS
- * ────────────
- *   Polar→cell:
- *     col = cx + r·cos θ
- *     row = cy + r·sin θ · ASPECT      (ASPECT ≈ 0.5)
- *
- *   Star polygon (line star, n vertices, density d):
- *     edge i connects vertex[i] to vertex[(i+d) mod n]
- *     gcd(n, d) = 1 → single connected star
- *     gcd(n, d) > 1 → multi-graph (e.g. INTERLOCK 4 emulates
- *                                    star polygon 8/2)
- *
- *   Outlined star (n points, inner ratio ρ ∈ (0, 1)):
- *     2n vertices: outer at radius r, inner at radius r·ρ
- *     vertex k at angle θ_k = rot + π·k/n
- *     2n edges connecting consecutive vertices
- *
- *   Interlocking polygons:
- *     polygon A: rotation rot, n edges
- *     polygon B: rotation rot + π/n, n edges
- *     total: 2n edges; build draws A first, then B
- *
- *   Inner ratio encoding:
- *     density field in Ring stores integer 0..100 = percent
- *     inner_ratio = density / 100  (e.g. 50 = 0.50)
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
- *
- * The file is cut into LAYERS by concern. All runtime state lives on one Scene
- * (§4); each layer reads and/or mutates a named slice of it. Functions take the
- * NARROWEST type they need — const Scene* to read, Scene* to mutate — so the
- * layers never re-couple. The split is by SECTION; this table lists what each
- * mutates.
- *
- *   Layer        Section            Mutates
- *   ─────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2 performance     nothing (reads OS clock, sleeps)
- *   LOGIC        §3 logic           nothing (pure maps & queries)
- *   DATA         §4 data            — Scene declaration + the instance —
- *   SIMULATION   §5 simulation      scene.build_time, .build_complete, .rot
- *   RENDER       §6 render          the screen + the colour pairs; never Scene
- *   INIT/RESET   §7 init            ALL of Scene (defaults / build restart)
- *   EVENTS       §8 events          scene.{preset_idx, theme_idx, scale, ...}
- *   —            §9 app             the per-frame driver (combines layers)
- *
- * SIMULATION is THIN here: the pattern is a STATIC parametric drawing, so the
- * only state that advances per tick is the build-reveal timer (build_time) and
- * the rotation angle (rot) — cosmetic ANIMATION, not physics.
- *
- * No separate EFFECTS layer: that cosmetic animation state IS the per-tick state
- * (build_time / rot), advanced by SIMULATION and read by RENDER; there is no
- * extra stored effect (glow / trail / flash) on top of it.
- *
- * No separate DELAYS layer: pause is a single flag (scene.paused) tested once at
- * the top of scene_tick; the build reveal is a timer (build_time) owned by
- * SIMULATION; the fps window is a PERFORMANCE counter in main.
- *
- * LOGIC (polar_to_cell, line_glyph, progress_to_count, preset_ring_count,
- * preset_build_duration) does no mutation and no I/O — it maps inputs to a
- * value — so reordering or deleting RENDER cannot change a LOGIC result.
- *
- * PER-TICK COMBINE — main's loop (§9) advances state in ONE place, in order:
- *   1. scene_tick(dt)   — advance build animation + rotation        (SIMULATION)
- *   2. scene_draw()     — project the preset's rings to screen + HUD (RENDER)
- *
- * User events (quit, next/prev preset, theme, size, rotate, pause, replay,
- * reset, resize) DO mutate state but are NOT part of the tick — they run in
- * main's input/resize handling (scene_input, §8), before scene_tick. Reset (0)
- * and preset change re-invoke the INIT-style restarts in §7.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -258,11 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <locale.h>
 
-/* ===================================================================== */
-/* §1  config                                                              */
-/* ===================================================================== */
+/* ── §1 config — presets, ring/preset types, constants, themes ── */
 
 enum {
     TARGET_FPS    = 60,
@@ -292,8 +54,8 @@ enum {
 #define SCALE_STEP    0.05f
 #define NS_PER_SEC    1000000000LL
 
-#define BINDU_AT       0.10f
-#define RING_BUILD_DUR 0.55f
+#define BINDU_AT       0.10f      /* seconds before the centre dot appears */
+#define RING_BUILD_DUR 0.55f      /* seconds each ring takes to reveal      */
 
 /* Primitive geometry */
 #define CIRCLE_OVERSAMPLE  1.4f   /* '.' samples per cell of circle circumference */
@@ -307,76 +69,69 @@ enum {
 #define SCREEN_MARGIN      4      /* cells kept clear around the pattern (HUD rows) */
 #define MANDALA_MIN_R      2.0f   /* never shrink the pattern below this radius     */
 
-/* §1.1 Ring + Preset types ------------------------------------------- */
+/* ── §1.1 Ring + Preset types ── */
 
-/* RingType — the six RADIAL PRIMITIVES every Islamic pattern in this file is
- * built from. A pattern is a concentric stack of rings, each one of these laid
- * out around a shared centre; combining a handful at different radii reproduces
- * the canonical girih / tile motifs (Critchlow; Bourgoin). RING_NONE is the
- * array SENTINEL — the first one ends a preset's ring list.
- *   RING_NONE       : end-of-list marker (value 0 so {0}-init ends a preset)
- *   RING_CIRCLE     : a continuous dotted ring ('.')
- *   RING_POLYGON    : a regular n-gon (n vertices joined edge-to-edge)
- *   RING_STAR_POLY  : a line star polygon {n/d} — vertices joined with skip d
- *                     (octagram {8/3}, dodecagram {12/5}); see Coxeter
- *   RING_STAR_SHAPE : a TRUE outlined star — 2n vertices alternating outer
- *                     radius r and inner radius r·ρ, drawing sharp points
- *   RING_INTERLOCK  : two n-gons offset by π/n (4+4 = Khatim 8-star, 3+3 =
- *                     hexagram / Solomon's seal)
- *   RING_RAYS       : N spokes from an inner gap to the rim (sun / compass) */
+/* The six shapes a ring can be. A pattern is just a stack of these laid out
+ * around one centre; mixing a few at different radii reproduces the classic
+ * tile motifs. RING_NONE is the "stop here" marker that ends a ring list (its
+ * value is 0, so a {0}-padded array naturally ends a short preset).
+ *   RING_CIRCLE     : a dotted ring drawn with '.'
+ *   RING_POLYGON    : a regular n-sided shape (corners joined edge to edge)
+ *   RING_STAR_POLY  : a "line star" — vertices joined by skipping d of them
+ *                     each step (octagram, dodecagram); see Coxeter
+ *   RING_STAR_SHAPE : a real outlined star with sharp points — alternates
+ *                     outer vertices and shorter inner vertices
+ *   RING_INTERLOCK  : two polygons, the second rotated half a step, giving a
+ *                     2n-pointed star (4+4 = Khatim 8-star, 3+3 = hexagram)
+ *   RING_RAYS       : N spokes from an inner gap out to the rim (sunburst) */
 typedef enum {
     RING_NONE = 0, RING_CIRCLE, RING_POLYGON, RING_STAR_POLY,
     RING_STAR_SHAPE, RING_INTERLOCK, RING_RAYS,
 } RingType;
 
-/* Ring — one concentric layer of a pattern: a single RingType primitive drawn N
- * times around the centre at a relative radius. WHY four fields and no more: a
- * ring is fully specified by WHICH primitive, HOW MANY of it, one extra integer
- * the primitive interprets, and WHERE (radius). The `density` field is
- * OVERLOADED by type — a deliberate space saving so every preset fits one line:
- *   STAR_POLY  : the star-polygon stride d of {n/d} (Coxeter) — vertex i joins
- *                vertex (i+d) mod n; d=1 is a polygon, d≥2 a star.
- *   STAR_SHAPE : the inner radius as a PERCENT of the outer (0..100), so 50 →
- *                inner vertices at r·0.50 (points sharpen as the percent drops).
- *   others     : unused (0).
- *   type    : a RingType (stored as int; an array of these ends at RING_NONE).
- *   n       : feature count — vertices / points / rays (0 for CIRCLE, whose
- *             sample count is derived from its radius at draw time).
- *   density : the per-type extra integer described above.
- *   radius  : radius as a FRACTION of the pattern's base radius, in (0, 1]. */
+/* One ring of a pattern: which shape, how many of it, one extra knob, and how
+ * far out. Just four fields, because that fully describes a ring. The `density`
+ * field means different things per shape — a deliberate trick so every preset
+ * fits on one line:
+ *   STAR_POLY  : the skip stride d — join each vertex to the one d ahead
+ *                (d=1 is a plain polygon, d>=2 makes a star).
+ *   STAR_SHAPE : inner radius as a percent of the outer (0..100), so 50 puts
+ *                the inner points halfway in (smaller percent = sharper points).
+ *   others     : unused, left 0.
+ *   type    : one of the RingType values above.
+ *   n       : how many vertices / points / rays (0 for a circle, which picks
+ *             its own dot count from its radius at draw time).
+ *   density : the per-shape knob described above.
+ *   radius  : a fraction of the pattern's base radius, in (0, 1]. */
 typedef struct {
-    int   type;     /* RingType */
-    int   n;        /* feature count (or 0 for RING_CIRCLE) */
-    int   density;  /* STAR_POLY: skip stride; STAR_SHAPE: inner_pct (0..100) */
-    float radius;   /* relative to base_r ∈ (0, 1] */
+    int   type;
+    int   n;
+    int   density;
+    float radius;
 } Ring;
 
-/* MandalaPreset — one named Islamic pattern as a RECIPE: a centre flag plus an
- * ordered list of Rings. This is the file's central lesson — "thirty different
- * patterns" is really ONE parametric draw function fed thirty parameter sets.
- * The named forms (Khatim, Octagram, Alhambra Star, Quasi-Crystal 10, ...) are
- * canonical tilings / girih designs (Critchlow; Bourgoin; Lu & Steinhardt for
- * the near-quasicrystal stars); each is reproduced by choosing rings at chosen
- * radii. The rings[] order is innermost-to-outermost and also drives the
- * build-in ANIMATION — ring i reveals during its time window.
+/* One named pattern, written as a recipe: a centre flag plus a list of rings.
+ * This is the whole idea of the file — "thirty different patterns" is really one
+ * draw routine fed thirty different ring lists. Ring order runs inner to outer,
+ * and that same order drives the build-in animation (ring 0 appears first).
  *   name       : label shown in the HUD.
- *   rings      : up to MAX_RINGS layers; the list ends at the first RING_NONE
- *                entry, so short presets {0}-pad the remainder.
- *   centre_dot : draw a central '+' medallion marker (painted last so it always
- *                wins the centre cell); off for star-only patterns. */
+ *   rings      : up to MAX_RINGS of them; the list ends at the first RING_NONE,
+ *                so short presets just leave the rest zeroed.
+ *   centre_dot : draw a '+' in the middle (painted last so it always shows);
+ *                off for star-only patterns. */
 typedef struct {
     const char *name;
     Ring rings[MAX_RINGS];
     bool centre_dot;
 } MandalaPreset;
 
-/* Compact preset constructor.  Macro params CC/DD/RR avoid colliding with
- * struct field names (`.n`, `.density`, `.radius` — the preprocessor
- * would substitute plain `n`/`d`/`r` inside those designators). */
+/* Shorthand so each preset fits on one line. The params are CC/DD/RR rather
+ * than n/d/r because the preprocessor would otherwise rewrite the field names
+ * inside the .n/.density/.radius designators below. */
 #define R(t,CC,DD,RR) {.type = RING_##t, .n = (CC), .density = (DD), .radius = (RR)}
 
 static const MandalaPreset PRESETS[N_PRESETS] = {
-/*  ─────────── 20 named Islamic geometric patterns ──────────────────────── */
+/* 20 simple named patterns */
     {"Khatim",          {R(INTERLOCK,    4, 0,  0.65f), R(CIRCLE,        0,  0, 0.92f)},                                                                                  true},
     {"Hexagram",        {R(INTERLOCK,    3, 0,  0.65f), R(CIRCLE,        0,  0, 0.92f)},                                                                                  true},
     {"Octagram",        {R(STAR_POLY,    8, 3,  0.65f), R(CIRCLE,        0,  0, 0.92f)},                                                                                  true},
@@ -398,7 +153,7 @@ static const MandalaPreset PRESETS[N_PRESETS] = {
     {"Alhambra Star",   {R(STAR_SHAPE,  16, 55, 0.70f), R(POLYGON,      16,  0, 0.85f), R(CIRCLE,        0,  0, 0.92f)},                                                  false},
     {"Mosque Window",   {R(POLYGON,      6, 0,  0.85f), R(STAR_POLY,     6,  2, 0.55f), R(CIRCLE,        0,  0, 0.92f)},                                                  false},
 
-/*  ─────────── 10 complex Islamic patterns — 5-7 rings each ─────────── */
+/* 10 complex patterns, 5-7 rings each */
     {"Topkapi Scroll",        {R(INTERLOCK,   5,  0, 0.30f), R(STAR_SHAPE,  10, 50, 0.50f), R(STAR_POLY,   10,  3, 0.65f), R(POLYGON,     10,  0, 0.85f), R(CIRCLE,        0,  0, 0.92f)},                                                                          true},
     {"Konya Rosette",         {R(STAR_POLY,  12,  5, 0.30f), R(STAR_SHAPE,  12, 55, 0.50f), R(INTERLOCK,    6,  0, 0.65f), R(POLYGON,     12,  0, 0.82f), R(RAYS,        24,  0, 0.92f), R(CIRCLE,        0,  0, 0.95f)},                                            false},
     {"Damascus Dome",         {R(STAR_POLY,  16,  7, 0.30f), R(STAR_SHAPE,  16, 60, 0.50f), R(INTERLOCK,    8,  0, 0.65f), R(POLYGON,     16,  0, 0.82f), R(CIRCLE,        0,  0, 0.88f), R(CIRCLE,        0,  0, 0.94f)},                                          false},
@@ -411,7 +166,7 @@ static const MandalaPreset PRESETS[N_PRESETS] = {
     {"Quasi-Crystal 10",      {R(STAR_POLY,  10,  3, 0.25f), R(STAR_POLY,   10,  4, 0.40f), R(STAR_SHAPE,  10, 45, 0.55f), R(STAR_SHAPE, 20, 65, 0.72f), R(INTERLOCK,    5,  0, 0.85f), R(RAYS,        20,  0, 0.92f), R(CIRCLE,        0,  0, 0.95f)},               false},
 };
 
-/* §1.2 Themes — six ring-type colours per theme, plus centre marker. */
+/* ── §1.2 Themes — one colour per ring shape, plus the centre marker ── */
 static const int THEME_PALETTE[N_THEMES][6] = {
     /*           CIRCLE POLY  S_POLY S_SHAPE INTER  RAYS                  */
     /* IZNIK    */ {  39,   45,   51,   75,  117,   45 }, /* turquoise + cobalt */
@@ -422,11 +177,7 @@ static const int THEME_PALETTE[N_THEMES][6] = {
 static const int   THEME_CENTRE[N_THEMES] = { 195, 230, 230, 230 };
 static const char *THEME_NAME  [N_THEMES] = { "Iznik", "Persian", "Andalusian", "Mamluk" };
 
-/* ===================================================================== */
-/* §2  PERFORMANCE — clock                                                 */
-/* ===================================================================== *
- * Monotonic clock + sleep. Mutates nothing. The frame cap, dt clamp and fps
- * window that use these live in main's loop (§9).                            */
+/* ── §2 performance — monotonic clock and sleep ── */
 
 static int64_t clock_ns(void) {
     struct timespec ts;
@@ -440,33 +191,32 @@ static void clock_sleep_ns(int64_t ns) {
     nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  LOGIC — pure maps & queries (no mutation, no I/O)                   */
-/* ===================================================================== *
- * Each maps its inputs to a value (or out-params); no globals, no screen. So
- * reordering or deleting RENDER cannot change a result here.                 */
+/* ── §3 logic — pure helpers: polar-to-cell, glyphs, build timing ── */
 
-/* polar→cell with terminal aspect correction (sin scaled by ASPECT). */
+/* Turn an angle and radius into a screen cell. Cells are about twice as tall as
+ * wide, so the vertical part is squashed by ASPECT to keep circles looking
+ * round instead of stretched. */
 static inline void polar_to_cell(int cx, int cy, float r, float theta,
                                  int *col, int *row) {
     *col = cx + (int)roundf(r * cosf(theta));
     *row = cy + (int)roundf(r * sinf(theta) * ASPECT);
 }
 
-/* angle of the i-th of n features evenly spaced around the circle, plus rot. */
+/* Angle of feature i when n of them are spread evenly around the circle, offset
+ * by the current rotation. */
 static inline float feature_angle(int i, int n, float rot) {
     return rot + (float)i / (float)n * 2.0f * (float)M_PI;
 }
 
-/* valid star-polygon stride d: 1 (a plain polygon) unless 2 <= d < n (a star). */
+/* The skip stride for a line star: 1 (plain polygon) unless 2 <= d < n. */
 static int star_stride(int density, int n) {
     int d = (density < 2) ? 1 : density;
     if (d >= n) d = 1;
     return d;
 }
 
-/* outlined-star inner radius as a fraction of the outer, clamped to a drawable
- * range so its points neither collapse to the centre nor flatten into the rim. */
+/* Inner radius of an outlined star as a fraction of the outer, kept in a sane
+ * range so the points don't collapse to the centre or flatten into the rim. */
 static float star_inner_ratio(int inner_pct) {
     float ratio = (float)inner_pct / 100.0f;
     if (ratio < STAR_INNER_MIN) ratio = STAR_INNER_MIN;
@@ -474,7 +224,8 @@ static float star_inner_ratio(int inner_pct) {
     return ratio;
 }
 
-/* Pick an ASCII line glyph that matches a (dx, dy) direction in cells. */
+/* Pick the ASCII character that best matches a line's direction: | for steep,
+ * - for shallow, / or \ for diagonal. */
 static char line_glyph(int dx, int dy) {
     float adx = (float)abs(dx);
     float ady = (float)abs(dy) / ASPECT;
@@ -486,8 +237,9 @@ static char line_glyph(int dx, int dy) {
     return ((dx > 0) == (dy > 0)) ? '\\' : '/';
 }
 
-/* progress_to_count — see hindu_mandalas.c for the float-roundoff
- * tolerance rationale.  Same fix here. */
+/* How many of n features to draw given build progress 0..1. The near-1 and
+ * near-0 checks dodge float rounding so a finished build shows every feature.
+ * (See hindu_mandalas.c for the same fix.) */
 static int progress_to_count(int n, float progress) {
     if (progress >= 0.999f) return n;
     if (progress <= 0.0f)   return 0;
@@ -497,7 +249,7 @@ static int progress_to_count(int n, float progress) {
     return k;
 }
 
-/* ring count + total build duration for a preset */
+/* How many rings a preset actually uses (stops at the first RING_NONE). */
 static int preset_ring_count(const MandalaPreset *p) {
     int n = 0;
     for (int i = 0; i < MAX_RINGS; i++) {
@@ -511,8 +263,8 @@ static float preset_build_duration(const MandalaPreset *p) {
     return BINDU_AT + (float)preset_ring_count(p) * RING_BUILD_DUR;
 }
 
-/* build-animation progress of ring i in [0,1]; <= 0 before its reveal window
- * opens. Ring i's window is [BINDU_AT + i·RING_BUILD_DUR, +RING_BUILD_DUR]. */
+/* How far along ring i's reveal is, from 0 to 1. Each ring gets its own slice
+ * of the build timeline; this returns <= 0 before ring i's slice starts. */
 static float ring_build_progress(int i, float build_time) {
     float ring_start = BINDU_AT + (float)i * RING_BUILD_DUR;
     float prog = (build_time - ring_start) / RING_BUILD_DUR;
@@ -520,8 +272,8 @@ static float ring_build_progress(int i, float build_time) {
     return prog;
 }
 
-/* base pattern radius that fits the screen (minus the HUD margin), scaled by the
- * user size; the ×0.5 and /ASPECT make it round in 2:1 terminal cells. */
+/* Largest radius that still fits on screen (after leaving room for the HUD),
+ * times the user's size knob. The /ASPECT keeps the pattern round, not oval. */
 static float mandala_base_radius(int rows, int cols, float scale) {
     float max_r_x = (float)(cols - SCREEN_MARGIN) * 0.5f;
     float max_r_y = (float)(rows - SCREEN_MARGIN) * 0.5f / ASPECT;
@@ -530,50 +282,33 @@ static float mandala_base_radius(int rows, int cols, float scale) {
     return base_r;
 }
 
-/* ===================================================================== */
-/* §4  DATA — Scene runtime state                                          */
-/* ===================================================================== *
- * Declaration + the single instance; no behaviour. Mutated by SIMULATION (§5)
- * / INIT (§7) / EVENTS (§8) and read by RENDER (§6).                         */
+/* ── §4 data — the whole runtime state in one struct ── */
 
-/* Scene — the whole runtime view in one aggregate, read like a table of
- * contents. Functions take the NARROWEST slice they need (const Scene* to read,
- * Scene* to mutate); only the orchestrators (scene_init / scene_reset /
- * scene_tick) and the event handler take Scene*, so the layers never re-couple.
- *   WHAT   — preset_idx: which of the PRESETS[] patterns is on screen.
- *   HOW    — the user-tunable knobs: scale (size), rotation_on (spin toggle).
- *   WHEN   — the cosmetic animation advanced per tick: build_time +
- *            build_complete (the ring-by-ring reveal) and rot (rotation angle);
- *            paused freezes both.
- *   RENDER — theme_idx: the selected colour-palette index.
- *   FPS    — a sliding-window frame-rate meter, shown in the HUD only. */
+/* Everything the program needs to know at runtime, grouped by what it is for:
+ * which pattern, the user's knobs, the running animation, the colour theme, and
+ * a frame-rate counter for the HUD. */
 typedef struct {
-    /* WHAT — the pattern on screen */
-    int     preset_idx;       /* index into PRESETS[]  [0..N_PRESETS)          */
-    /* HOW — user-tunable knobs */
-    float   scale;            /* size multiplier  [SCALE_MIN..SCALE_MAX]       */
-    bool    rotation_on;      /* slow rotation enabled?                        */
-    /* WHEN — cosmetic animation + run state */
-    float   build_time;       /* seconds into the ring-by-ring build reveal    */
-    bool    build_complete;   /* true once build_time >= the preset's duration */
-    float   rot;              /* current rotation angle (radians)              */
-    bool    paused;           /* 1 freezes the build + rotation                */
-    /* RENDER — palette selection */
-    int     theme_idx;        /* index into THEME_*  [0..N_THEMES)             */
-    /* FPS — sliding-window frame-rate meter (HUD only) */
-    float   fps;              /* last computed frames/sec                      */
-    int64_t fps_window_start; /* clock_ns at the window's start                */
-    int     frames_in_window; /* frames counted since the window start         */
+    /* which pattern is showing */
+    int     preset_idx;       /* index into PRESETS[], 0..N_PRESETS-1          */
+    /* user knobs */
+    float   scale;            /* size, SCALE_MIN..SCALE_MAX                    */
+    bool    rotation_on;      /* slow spin on?                                */
+    /* the build-in animation and run state */
+    float   build_time;       /* seconds into the ring-by-ring reveal          */
+    bool    build_complete;   /* true once the whole pattern has revealed      */
+    float   rot;              /* current spin angle, radians                   */
+    bool    paused;           /* freezes both the build and the spin           */
+    /* colour */
+    int     theme_idx;        /* index into THEME_*, 0..N_THEMES-1             */
+    /* frame-rate meter, shown in the HUD only */
+    float   fps;              /* last measured frames per second               */
+    int64_t fps_window_start; /* clock reading when this measuring window began */
+    int     frames_in_window; /* frames drawn since that point                 */
 } Scene;
 
 static Scene g_scene;
 
-/* ===================================================================== */
-/* §5  SIMULATION — scene_tick (advance the build animation + rotation)    */
-/* ===================================================================== *
- * The ONLY per-tick state advance. The pattern is a static drawing, so the only
- * state that moves is cosmetic ANIMATION: the build-reveal timer (build_time /
- * build_complete) and the rotation angle (rot). Paused short-circuits both.    */
+/* ── §5 simulation — advance the build-in animation and the spin ── */
 
 static void scene_tick(Scene *s, float dt) {
     if (s->paused) return;
@@ -596,12 +331,7 @@ static void scene_tick(Scene *s, float dt) {
     }
 }
 
-/* ===================================================================== */
-/* §6  RENDER — colour setup, primitives, draw_mandala, scene_draw         */
-/* ===================================================================== *
- * State → screen (reads only, never mutates Scene). colour_init/theme_apply
- * load pairs; the draw_* primitives stamp cells via paint_cell; draw_mandala
- * dispatches a preset's rings; scene_draw composes the frame + HUD.           */
+/* ── §6 render — colours, shape primitives, draw_mandala, scene_draw ── */
 
 static void color_init(void) {
     use_default_colors();
@@ -619,7 +349,8 @@ static void theme_apply(int idx) {
     init_pair(PAIR_RAYS,       THEME_PALETTE[idx][5],  -1);
 }
 
-/* paint_cell: bounds-checked stamp.  Reserves rows 0 and rows-1 for HUD. */
+/* Draw one character, skipping anything off-screen. The top and bottom rows are
+ * left alone because the HUD lives there. */
 static void paint_cell(int col, int row, char ch, int pair, int attr) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -644,7 +375,7 @@ static void draw_line(int x1, int y1, int x2, int y2, int pair, int attr) {
     }
 }
 
-/* circle — many '.' samples around a continuous ring */
+/* A dotted ring: scatter many '.' evenly around the circle. */
 static void draw_circle(int cx, int cy, float r, float progress) {
     if (progress <= 0.0f || r < 0.5f) return;
     int n = (int)(2.0f * (float)M_PI * r * CIRCLE_OVERSAMPLE);
@@ -659,7 +390,7 @@ static void draw_circle(int cx, int cy, float r, float progress) {
     }
 }
 
-/* polygon — N corners connected by lines (regular n-gon) */
+/* A regular n-sided shape: join each corner to the next. */
 static void draw_polygon(int cx, int cy, float r, int n, float rot, float progress) {
     if (n < 3 || progress <= 0.0f) return;
     int n_done = progress_to_count(n, progress);
@@ -673,7 +404,8 @@ static void draw_polygon(int cx, int cy, float r, int n, float rot, float progre
     }
 }
 
-/* star_poly — N vertices, density-d skip lines (octagram, etc.) */
+/* A "line star": join each vertex to the one d steps ahead, not the next-door
+ * one. That skipping is what makes the star shape (octagram, dodecagram). */
 static void draw_star_poly(int cx, int cy, float r, int n, int density,
                            float rot, float progress) {
     if (n < 3 || progress <= 0.0f) return;
@@ -689,9 +421,9 @@ static void draw_star_poly(int cx, int cy, float r, int n, int density,
     }
 }
 
-/* star_shape — TRUE outlined star: n outer + n inner vertices,
- *      2n edges total, alternating outer-inner.  inner_pct is the
- *      inner radius as a percentage of outer radius (0..100). */
+/* A real outlined star with sharp points: walk around alternating between far-
+ * out points and pulled-in dips. inner_pct says how far in the dips sit (0..100
+ * percent of the outer radius). */
 static void draw_star_shape(int cx, int cy, float r, int n, int inner_pct,
                             float rot, float progress) {
     if (n < 3 || progress <= 0.0f) return;
@@ -715,10 +447,9 @@ static void draw_star_shape(int cx, int cy, float r, int n, int inner_pct,
     }
 }
 
-/* interlock — TWO regular n-gons rotated by π/n.  Total 2n
- *      edges; build draws polygon A first (n edges), then B.
- *      Khatim 8-pointed star = INTERLOCK 4 (two squares).
- *      Hexagram (Solomon's seal) = INTERLOCK 3 (two triangles). */
+/* Two copies of the same polygon, the second turned half a step, so together
+ * they make a 2n-pointed star. Two squares give the Khatim 8-star, two triangles
+ * give the hexagram. The first polygon reveals before the second. */
 static void draw_interlock(int cx, int cy, float r, int n,
                            float rot, float progress) {
     if (n < 3 || progress <= 0.0f) return;
@@ -738,7 +469,7 @@ static void draw_interlock(int cx, int cy, float r, int n,
     }
 }
 
-/* rays — N lines from inner gap to outer radius */
+/* A sunburst: N spokes from a small inner gap out to the rim. */
 static void draw_rays(int cx, int cy, float r, int n, float rot, float progress) {
     if (n < 1 || progress <= 0.0f) return;
     int n_done = progress_to_count(n, progress);
@@ -751,17 +482,18 @@ static void draw_rays(int cx, int cy, float r, int n, float rot, float progress)
     }
 }
 
-/* dispatcher — render rings up to current build_time, centre last */
+/* Draw a whole pattern: walk its rings, drawing each one as far as the build
+ * timer has revealed, then stamp the centre marker last. */
 static void draw_mandala(const MandalaPreset *p,
                          int cx, int cy, float base_r, float rot,
                          float build_time) {
     for (int i = 0; i < MAX_RINGS; i++) {
         const Ring *ring = &p->rings[i];
-        if (ring->type == RING_NONE) break;          /* end of the ring list  */
+        if (ring->type == RING_NONE) break;          /* end of the ring list */
         float prog = ring_build_progress(i, build_time);
-        if (prog <= 0.0f) continue;                  /* reveal window not open */
+        if (prog <= 0.0f) continue;                  /* this ring hasn't started revealing yet */
         float r = ring->radius * base_r;
-        if (r < 0.5f) continue;                      /* sub-cell — nothing to draw */
+        if (r < 0.5f) continue;                      /* too small to see */
         switch (ring->type) {
             case RING_CIRCLE:     draw_circle    (cx, cy, r,                       prog); break;
             case RING_POLYGON:    draw_polygon   (cx, cy, r, ring->n,         rot, prog); break;
@@ -777,12 +509,11 @@ static void draw_mandala(const MandalaPreset *p,
     }
 }
 
-/* draw_hud — top yellow data line (fps / preset / theme / size / build-status /
- * rotation) right-aligned, and the bottom cyan key legend. */
+/* The on-screen readout: a data line at the top and the key legend at the bottom. */
 static void draw_hud(const Scene *s, int rows, int cols) {
     const MandalaPreset *p = &PRESETS[s->preset_idx];
 
-    /* build-progress string: "build 47%" assembling, "complete", or "PAUSED". */
+    /* what to show for build state: a percent while assembling, else done/paused */
     char build_str[24];
     if (s->build_complete) {
         snprintf(build_str, sizeof build_str, "complete");
@@ -834,9 +565,7 @@ static void scene_draw(const Scene *s) {
     doupdate();
 }
 
-/* ===================================================================== */
-/* §7  INIT/RESET — scene defaults & build restart (NOT part of the tick)  */
-/* ===================================================================== */
+/* ── §7 init/reset — scene defaults and restarting the build animation ── */
 
 static void scene_restart_build(Scene *s) {
     s->build_time     = 0.0f;
@@ -861,9 +590,7 @@ static void scene_init(Scene *s) {
     scene_reset(s);
 }
 
-/* ===================================================================== */
-/* §8  EVENTS — keys, signals, screen setup (mutate state, NOT the tick)   */
-/* ===================================================================== */
+/* ── §8 events — key handling, signals, screen setup ── */
 
 static void scene_input(Scene *s, int ch) {
     switch (ch) {
@@ -904,7 +631,6 @@ static void on_signal(int sig) {
 }
 
 static void screen_init(void) {
-    setlocale(LC_ALL, "");
     initscr();
     noecho();
     cbreak();
@@ -922,9 +648,7 @@ static void screen_cleanup(void) {
     endwin();
 }
 
-/* ===================================================================== */
-/* §9  app — the frame loop (the per-tick combine)                         */
-/* ===================================================================== */
+/* ── §9 app — the main frame loop ── */
 
 int main(void) {
     signal(SIGINT,   on_signal);
@@ -942,7 +666,7 @@ int main(void) {
     while (g_running) {
         int64_t frame_start = clock_ns();
         float dt = (float)(frame_start - prev_ns) / 1e9f;
-        if (dt > 0.1f) dt = 0.1f;
+        if (dt > 0.1f) dt = 0.1f;   /* cap so a stalled frame can't make the animation jump */
         prev_ns = frame_start;
 
         if (g_resize) {

@@ -1,179 +1,12 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * bonsai.c — bonsai tree gallery: 5 classical styles, 6 themes,
- *            static skeleton + subtle wind rustle on foliage.
+ * bonsai.c — a gallery of ASCII bonsai trees: 5 classical styles, 6 colour
+ * themes, a tree that's grown once and then gently rustles in the wind.
  *
- * Section map  (re-cut into single-concern layers — see ARCHITECTURE below):
- *   §1  config       — constants, style + theme tables, glyph palettes
- *   §2  clock        — PERFORMANCE: monotonic timer + sleep
- *   §3  color        — RENDER setup: theme → colour-pair binding
- *   §4  random       — LOGIC: pure RNG + hashes (no global mutation, no I/O)
- *   §5  generation   — BUILD: recursive tree skeleton
- *   §6  raster       — BUILD/bake: skeleton → char grid (Bresenham + ellipse)
- *   §7  pot          — BUILD/bake: pot frame
- *   §8  build        — BUILD orchestration: scene_rebuild + Scene state
- *   §9  events       — USER EVENTS: init/resize/reseed/cycle (NOT the tick)
- *   §10 simulation   — SIMULATION: scene_tick (the only per-tick state advance)
- *   §11 render       — RENDER: scene_render (grid → screen, reads only)
- *   §12 screen       — RENDER: terminal I/O + HUD
- *   §13 app + main   — USER-EVENT glue + PERFORMANCE per-frame combine
- *
- * Keys:
- *   q / ESC      quit
- *   space        pause / resume rustle
- *   n / N        next / previous style
- *   t / T        next / previous theme
- *   r            reseed (new tree variant of same style)
- *   ] / [        sim Hz up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/bonsai.c \
- *       -o bonsai -lncurses -lm
+ * The trunk shapes follow the classic bonsai style names (Naka, Bonsai
+ * Techniques I & II); the branching is a stochastic cousin of an L-system
+ * (Prusinkiewicz & Lindenmayer, The Algorithmic Beauty of Plants, 1990).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two-pass procedural composition.
- *
- *                  PASS 1 — SKELETON GENERATION:
- *                     Generate trunk path according to style:
- *                       CHOKKAN  : vertical with tiny noise wobble
- *                       MOYOGI   : sin-S-curve, 1-2 wavelengths over height
- *                       SHAKAN   : straight line at chosen lean angle
- *                       KENGAI   : up-then-arc-over-rim 2-phase path
- *                       BUNJIN   : nearly vertical, very tall, very thin
- *                     Recursively subdivide: at each trunk node, with
- *                     style-dependent probability, branch outward.
- *                     Each branch is itself recursively subdivided.
- *                     Stop when length < MIN_LEN or depth > the style's max_depth;
- *                     terminal points become FOLIAGE CLOUDS (centre,
- *                     radius, density).
- *
- *                  PASS 2 — RASTERISE TO CHAR GRID:
- *                     For each trunk/branch segment, walk a Bresenham
- *                     line and stamp a glyph at each cell, choosing
- *                     trunk-thick (`M`, `H`) vs medium (`|`, `[`) vs
- *                     thin (`/`, `\`, `|`) based on segment thickness.
- *                     For each foliage cloud, fill an aspect-corrected
- *                     ELLIPSE (round in physical pixels) with random
- *                     leaf glyphs sampled from the theme's leaf set.
- *                     Pot drawn last over the bottom rows.
- *
- *                  PER FRAME:
- *                     Re-emit the char grid; for ~5% of FOLIAGE cells
- *                     (gated by per-cell rustle hash + global time),
- *                     re-pick a random leaf glyph.  This is the only
- *                     per-frame work — the skeleton never regenerates
- *                     unless the user reseeds (`r`) or switches style
- *                     (`n`).
- *
- * Data-structure : Both live on the Scene aggregate.  `Tree` holds segs[]
- *                  (trunk + branches as line segments with depth) and fols[]
- *                  (foliage clouds with centre/radius), sized for the gnarliest
- *                  recursion (SEG_MAX=384, FOL_MAX=96).  `CharGrid` is the baked
- *                  image: parallel glyph / role / pair planes (struct-of-arrays)
- *                  the renderer replays each frame.
- *
- * Rendering      : ASCII only.  Trunk uses heavy bracket-style chars
- *                  (`M`, `H`, `(`, `)`, `[`, `]`); branches use slashes
- *                  (`/`, `\`); foliage uses density chars (`&`, `%`,
- *                  `#`, `*`, `@`, `^`, `o`).  Pot uses `_`, `|`, `:`,
- *                  `.`, `'` for box-drawing-like effect.
- *
- * Performance    : Skeleton generation: 256 segments × ~5 ops + 64
- *                  clouds × ~50 cells each = ~5 K ops, one-time.
- *                  Per-frame: cols·rows mvaddch + rustle hash check.
- *                  Trivial at any terminal size; the limit is ncurses
- *                  output throughput, not the algorithm.
- *
- * References     :
- *   Bonsai form & botanical structure (the CONCEPTS) —
- *   • Naka, J. Y. — *Bonsai Techniques I & II* (1973, 1982).  The
- *     classical-style taxonomy (chokkan / moyogi / shakan / kengai /
- *     bunjin) the StyleParams table encodes.
- *   • Iwata, Y. — *Bonsai: A Patient Art* (2009).  Photographic
- *     reference for how trunks curve, branches space, foliage clumps.
- *   • Prusinkiewicz, P. & Lindenmayer, A. — *The Algorithmic Beauty of
- *     Plants* (Springer, 1990; free PDF at algorithmicbotany.org).  THE
- *     reference for procedural trees; our recursive grow_branch() is a
- *     stochastic, non-rewriting cousin of its bracketed L-systems.
- *   • Lindenmayer, A. — "Mathematical models for cellular interactions
- *     in development", *J. Theor. Biol.* 18 (1968).  The L-system origin
- *     paper; the branch-then-subdivide pattern descends from it.
- *
- *   Rasterisation & rendering (the RENDERING part) —
- *   • Bresenham, J. E. — "Algorithm for computer control of a digital
- *     plotter", *IBM Systems Journal* 4(1), 1965.  The integer line walk
- *     in draw_segment() that stamps trunk/branch glyphs cell by cell.
- *   • Foley, van Dam, Feiner & Hughes — *Computer Graphics: Principles
- *     and Practice* (2nd ed., 1990), ch. 3.  Scan-conversion of lines
- *     and the midpoint ELLIPSE — the model behind the aspect-corrected
- *     foliage fill in draw_foliage_cloud().
- *   • Bourke, P. — "Character representation of grey-scale images"
- *     (paulbourke.net, 1997).  The ASCII-ramp idea: map structure and
- *     density to a glyph set (thick→thin trunk ramps, foliage density
- *     chars) — the basis of all text-mode rendering here.
- *   • Press, Teukolsky, Vetterling & Flannery — *Numerical Recipes*
- *     (3rd ed., 2007), ch. 7.  The LCG in lcg_next() uses this book's
- *     multiplier / increment (1664525 / 1013904223) for the
- *     deterministic, reproducible per-seed tree.
- *   • Jarzynski, M. & Olano, M. — "Hash Functions for GPU Rendering",
- *     *JCGT* 9(3), 2020.  Integer bit-mixing hashes of the kind hash3()
- *     uses to gate the stateless, per-cell wind rustle.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE (separated layers) ──────────────────────────────────── *
- *
- * This program has TWO time axes, not one:
- *
- *   A. BUILD pipeline — runs ONLY on a user event (init / reseed / style /
- *      theme / resize), never per frame.  GENERATION lays out the skeleton,
- *      RASTER bakes it into the static char grid.  The result is a frozen
- *      still-life the render layer then replays every frame.
- *   B. Per-frame TICK — advance the rustle clock (SIMULATION), then RENDER the
- *      baked grid with a derived wind flutter.
- *
- * The six canonical concerns, as they actually appear here:
- *
- *   LAYER        SECTION                 MUTATES
- *   ─────        ───────                 ───────
- *   LOGIC        §4  random              nothing global — pure RNG (transforms
- *                                        the caller's *st) + hash3 (pure).  No I/O.
- *   (BUILD)      §5  generation          Scene.tree   (segments + foliage clouds)
- *   (BUILD)      §6  raster, §7 pot      Scene.canvas (CharGrid: glyph/role/pair)
- *   (BUILD)      §8  build               Scene.tree + Scene.canvas + Scene.pot_top
- *   SIMULATION   §10 simulation          Scene.time   (the ONLY per-tick advance)
- *   RENDER       §3  color (setup),      the ncurses screen + colour pairs ONLY;
- *                §11 render, §12 screen  reads Scene.canvas + Scene.time, writes none
- *   PERFORMANCE  §2  clock, §13 main     frame timing / fps / sleep — no sim state
- *
- *   EFFECTS — NONE STORED.  The wind rustle is re-derived every frame inside
- *             scene_render from hash3(col,row,⌊time·RUSTLE_FREQ⌋); the chosen
- *             leaf glyph is a LOCAL, never written back to the grid.  There is
- *             no cosmetic state to advance or corrupt, so no EFFECTS layer.
- *   DELAYS  — TRIVIAL.  The only "timer" is Scene.paused, a boolean gate at the
- *             top of scene_tick; no holds, cooldowns, or staged delays exist.
- *
- * PER-TICK COMBINE — main() (§13) is the ONE place the per-frame layers meet,
- * in this fixed order; nothing else advances Scene.time:
- *     (resize?) → measure dt (capped) → scene_tick (SIM) → fps sample
- *               → sleep to frame cap (PERF) → screen_draw + present (RENDER)
- *               → drain one input event (USER EVENT)
- *
- * USER EVENTS (NOT part of the tick) mutate state and may trigger a full BUILD,
- * but fire only on input / resize — see §9 and app_handle_key (§13):
- *     space        Scene.paused
- *     r            reseed  → BUILD
- *     n/N, t/T     style / theme → BUILD (theme also re-binds colours)
- *     [ / ]        App.sim_fps  (the frame-cap target)
- *     SIGWINCH     resize → BUILD
- *
- * (The const-pointer read/mutate signature convention is deferred to step 5,
- *  where the types exist to express it; here the roles are documented only.)
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -191,13 +24,11 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — constants, style + theme tables, glyph palettes ── */
 
 enum {
     SIM_FPS_MIN      =  10,
-    SIM_FPS_DEFAULT  =  30,    /* rustle is gentle; 30 fps is plenty   */
+    SIM_FPS_DEFAULT  =  30,    /* rustle is gentle, so 30 fps is plenty */
     SIM_FPS_MAX      = 120,
     SIM_FPS_STEP     =  10,
 
@@ -205,62 +36,61 @@ enum {
 
     PAIR_HUD          =  1,
     PAIR_HINT         =  2,
-    PAIR_TRUNK_BASE   =  3,    /* +0..+2 — trunk dark/mid/light bark   */
-    PAIR_FOLIAGE_BASE =  6,    /* +0..+5 — leaf colour variants        */
+    PAIR_TRUNK_BASE   =  3,    /* trunk bark: +0 dark, +1 mid, +2 light  */
+    PAIR_FOLIAGE_BASE =  6,    /* leaf colours: +0..+5, six hues         */
     PAIR_POT          = 12,
 
-    /* Skeleton pool sizes. */
+    /* How many segments / foliage clouds a tree can have at most. */
     SEG_MAX           = 384,
     FOL_MAX           = 96,
 
-    /* Char grid maximum (for static buffers). */
+    /* Backing size of the baked character grid. */
     GRID_MAX_W        = 280,
     GRID_MAX_H        = 90,
 
-    /* Pot placement (pot_top_row). */
-    POT_TALL_MIN_ROWS = 18,    /* rows_eff ≥ this → a 4-row pot, else 3       */
+    /* Pot placement: a tall screen gets a 4-row pot, a short one gets 3. */
+    POT_TALL_MIN_ROWS = 18,
     POT_ROWS_TALL     =  4,
     POT_ROWS_SHORT    =  3,
 
-    /* Trunk poly-line resolution clamp (tree_generate). */
+    /* Limits on how many nodes the trunk poly-line is split into. */
     TRUNK_SEGS_MIN    =  6,
     TRUNK_SEGS_MAX    = 30,
 
-    FOLIAGE_BOLD_FROM =  4,     /* foliage pair index ≥ this → drawn A_BOLD   */
-    MAX_FRAME_MS      = 100,    /* clamp a long dt so a stall can't spiral    */
+    FOLIAGE_BOLD_FROM =  4,     /* leaf colour index at or above this draws bold */
+    MAX_FRAME_MS      = 100,    /* cap a long frame so a stall can't snowball     */
 };
 
 #define NS_PER_SEC      1000000000LL
 #define NS_PER_MS          1000000LL
 #define TICK_NS(f)      (NS_PER_SEC / (f))
 
-#define CELL_ASPECT      2.0f      /* terminal cell h/w                  */
+/* A terminal cell is about twice as tall as it is wide; we use this to
+ * keep circles looking round instead of squashed. */
+#define CELL_ASPECT      2.0f
 
-/* Tree generation — global tunables.  (Recursion depth is per-style:
- * StyleParams.max_depth, not a global cap.) */
-#define MIN_LEN          1.5f      /* segments shorter than this stop    */
-#define BRANCH_LEN_F     0.66f     /* child length = parent · this       */
+/* How branches grow.  (Each style sets its own recursion depth cap.) */
+#define MIN_LEN          1.5f      /* a branch shorter than this stops growing */
+#define BRANCH_LEN_F     0.66f     /* each child branch is this fraction of its parent */
 
-/* Trunk shape (tree_generate / trunk_x_at). */
-#define MIN_TRUNK_HEIGHT     4.0f  /* never shorter than this (cells)        */
-#define TRUNK_SEGS_PER_CELL  1.8f  /* poly-line nodes per cell of height     */
-#define BRANCH_BAND_LO       0.30f /* sprout branches only within this band  */
-#define BRANCH_BAND_HI       0.92f /*   of trunk height (clean base + apex)  */
-#define KENGAI_APEX_FRAC     0.30f /* cascade: trunk rises to here, then arcs */
+/* Trunk shape. */
+#define MIN_TRUNK_HEIGHT     4.0f  /* trunk is never shorter than this (cells)  */
+#define TRUNK_SEGS_PER_CELL  1.8f  /* poly-line nodes per cell of trunk height  */
+#define BRANCH_BAND_LO       0.30f /* only sprout branches between these heights */
+#define BRANCH_BAND_HI       0.92f /*   so the bare base and tip stay clean      */
+#define KENGAI_APEX_FRAC     0.30f /* cascade style: trunk rises to here, then bends down */
 
 /* Wind rustle. */
-#define RUSTLE_FREQ      6.0f      /* rustle hash key advances at this Hz */
-#define RUSTLE_RATE      0.06f     /* fraction of foliage cells per tick  */
-
-/* ── Style enum + per-style params ── */
+#define RUSTLE_FREQ      6.0f      /* how fast the rustle pattern changes, in Hz */
+#define RUSTLE_RATE      0.06f     /* fraction of leaves flickering at any moment */
 
 /*
- * TreeStyle — the five classical bonsai styles, the taxonomy a grower would
- * name (Naka, *Bonsai Techniques I & II*).  Each value indexes the styles[]
- * table of StyleParams; the visible difference between styles is entirely the
- * trunk-path branch of tree_generate() (§5) plus that row of knobs.
- * N_STYLES doubles as the array length and the modulus for n/N cycling — it
- * MUST stay last so it equals the real style count.
+ * TreeStyle — the five classic bonsai shapes a grower would name (Naka,
+ * Bonsai Techniques).  Each value indexes the styles[] table below; the
+ * only thing that really changes between styles is the trunk shape (in
+ * trunk_x_at, §5) and that row of knobs.
+ * N_STYLES is both the array length and the wrap-around count for n/N
+ * cycling, so it MUST stay last.
  */
 typedef enum {
     STYLE_CHOKKAN = 0,    /* formal upright — straight vertical trunk         */
@@ -272,12 +102,9 @@ typedef enum {
 } TreeStyle;
 
 /*
- * StyleParams — the per-style generation recipe: the numbers that bend ONE
- * recursive-descent generator (grow_branch / tree_generate, §5) into each
- * TreeStyle.  styles[] holds one row per style, indexed by TreeStyle.  This is
- * "parametric" in the sense of Prusinkiewicz & Lindenmayer, *The Algorithmic
- * Beauty of Plants* — identical production rules, different parameters yield
- * different silhouettes.  Several fields are read only by one style (noted).
+ * StyleParams — one row of dials per style.  The same tree-growing code
+ * (§5) reads these numbers and produces a different silhouette for each
+ * style.  Some dials are only used by one style (noted in the comments).
  */
 typedef struct {
     const char *name;               /* HUD label, space-padded to fixed width    */
@@ -300,25 +127,22 @@ static const StyleParams styles[N_STYLES] = {
     /* BUNJIN  */   { "BUNJIN  ", 0.78f,  1.0f,   0.5f, 0.05f,  0.18f,  4.5f,  5,    2.0f },
 };
 
-/* ── Theme ── */
-
 /*
- * Theme — a season/mood: the colours and the leaf alphabet a tree is painted
- * in.  Indexed by Scene.current_theme into themes[]; a theme change re-binds
- * the colour pairs (theme_apply, §3) AND forces a rebuild, because `bare`
- * changes the skeleton, not just the palette.  Colour fields are xterm-256
- * indices, all kept in the bright half of the cube so the tree stays legible on
- * the dark background (project palette rule).  Every theme is foreground-on-dark
- * — MONO is the achromatic one (white/grey bark + foliage).
+ * Theme — a season or mood: the colours and the set of leaf characters a
+ * tree is painted with.  Switching theme re-binds the colour pairs (§3)
+ * and rebuilds the tree, because the WINTER theme strips all the leaves,
+ * which changes the shape and not just the colour.  The colour numbers
+ * are xterm-256 indices, kept bright so they stay readable on a dark
+ * background.  MONO is the grey-only theme.
  */
 typedef struct {
-    const char *name;            /* HUD label, space-padded                     */
-    short       trunk[3];        /* bark ramp by depth: dark / mid / light      */
-    short       foliage[6];      /* 6 leaf hues — variety so a cloud isn't flat */
+    const char *name;            /* HUD label, padded to a fixed width          */
+    short       trunk[3];        /* bark colours: dark / mid / light            */
+    short       foliage[6];      /* six leaf colours, so a clump isn't flat     */
     short       pot;             /* pot colour                                  */
-    bool        bare;            /* WINTER: no foliage clouds (branches only)   */
-    const char *leaf_set;        /* glyph alphabet each foliage cell draws from */
-    const char *snow_tip;        /* WINTER: snow glyph atop clouds, else NULL   */
+    bool        bare;            /* true only for WINTER: branches, no leaves   */
+    const char *leaf_set;        /* the characters a leaf cell can be drawn as  */
+    const char *snow_tip;        /* WINTER: snow character on top of a clump; NULL otherwise */
 } Theme;
 
 #define N_THEMES 6
@@ -333,10 +157,10 @@ static const Theme themes[N_THEMES] = {
     { "MONO   ",  { 245, 250, 255 },   { 246, 248, 250, 252, 253, 255 },      250, false, "&%#*o^",          NULL  },
 };
 
-/* Glyph palettes. */
-static const char TRUNK_THICK[]    = "MHHM[]()";   /* depth 0-1, thick bark   */
-static const char TRUNK_MEDIUM[]   = "|[]/\\";       /* depth 2-3, medium       */
-static const char TRUNK_THIN[]     = "|/\\";         /* depth 4+, thin twigs    */
+/* Characters used to draw bark, picked by how thick the branch is. */
+static const char TRUNK_THICK[]    = "MHHM[]()";   /* the trunk and big limbs */
+static const char TRUNK_MEDIUM[]   = "|[]/\\";       /* medium branches         */
+static const char TRUNK_THIN[]     = "|/\\";         /* thin twigs              */
 
 #define POT_TOP_CH      '_'
 #define POT_SIDE_CH     '|'
@@ -345,27 +169,24 @@ static const char TRUNK_THIN[]     = "|/\\";         /* depth 4+, thin twigs    
 #define POT_BOTTOM_CH   ':'
 
 /*
- * CellRole — what a baked CharGrid cell represents.  Written at build time
- * (§6/§7), read at render (§11) to pick the colour pair + attribute.  Two
- * ordering invariants the code relies on:
- *   - ROLE_EMPTY = 0, so a zeroed grid reads as "nothing here".
- *   - ROLE_TRUNK_DARK..ROLE_TRUNK_LIGHT are contiguous, so grid_put() can test
- *     "is this a trunk cell?" with one range check (trunk wins over foliage).
+ * CellRole — what a cell in the baked grid is: empty, bark, leaf, snow,
+ * or pot.  Set when the tree is built (§6/§7), read at draw time (§11) to
+ * pick the right colour.  Two ordering rules the code leans on:
+ *   - ROLE_EMPTY = 0, so a freshly zeroed grid means "nothing here".
+ *   - the three trunk roles are listed back-to-back, so the code can ask
+ *     "is this a trunk cell?" with a single range check.
  */
 typedef enum {
     ROLE_EMPTY = 0,       /* background — nothing drawn                     */
-    ROLE_TRUNK_DARK,      /* depth 0-1 bark (thick)  — trunk ramp index 0   */
-    ROLE_TRUNK_MID,       /* depth 2-3 bark (medium) — index 1              */
-    ROLE_TRUNK_LIGHT,     /* depth 4+ twigs (thin)   — index 2              */
-    ROLE_FOLIAGE,         /* leaf cell — one of 6 theme hues, may rustle    */
-    ROLE_SNOW_TIP,        /* WINTER only: snow glyph atop a foliage cloud   */
-    ROLE_POT,             /* pot frame                                      */
+    ROLE_TRUNK_DARK,      /* thick bark (trunk and big limbs)              */
+    ROLE_TRUNK_MID,       /* medium branches                               */
+    ROLE_TRUNK_LIGHT,     /* thin twigs                                    */
+    ROLE_FOLIAGE,         /* a leaf — one of six colours, may flicker      */
+    ROLE_SNOW_TIP,        /* WINTER only: snow on top of a leaf clump      */
+    ROLE_POT,             /* pot frame                                     */
 } CellRole;
 
-/* ===================================================================== */
-/* §2  clock                       PERFORMANCE — monotonic time + sleep   */
-/* ===================================================================== */
-/* Timing primitives only.  Mutate nothing; read by the §13 main loop.    */
+/* ── §2 clock — monotonic time + sleep ── */
 
 static int64_t clock_ns(void)
 {
@@ -384,17 +205,14 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                       RENDER setup — theme → colour pairs    */
-/* ===================================================================== */
-/* Mutates ncurses colour pairs only (theme change / boot).  No sim state. */
+/* ── §3 color — bind a theme's colours into ncurses pairs ── */
 
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
     const Theme *t = &themes[idx];
 
-    /* Every theme is foreground-on-default-background (dark). */
+    /* 256-colour terminals get the real theme; 8-colour ones fall back. */
     if (COLORS >= 256) {
         for (int i = 0; i < 3; i++)
             init_pair((short)(PAIR_TRUNK_BASE + i), t->trunk[i], -1);
@@ -424,16 +242,16 @@ static void color_init(void)
     theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  random                      LOGIC — pure RNG + cheap hashes        */
-/* ===================================================================== */
+/* ── §4 random — a tiny random-number generator and a hash ── */
 /*
- * Pure: no global state, no I/O.  lcg_* transform the caller-owned RNG word
- * passed by pointer; hash3 is a stateless function of its inputs.  Because
- * they touch nothing else, reordering or deleting any RENDER/BUILD code cannot
- * change their results.  Used by BUILD (§5/§6) and by the render-time rustle.
+ * These keep no hidden state.  The caller hands in a counter (st) that the
+ * generator scrambles; the same seed always produces the same tree, which
+ * is what lets reseeding be repeatable.  hash3 just mixes three numbers
+ * into one and is used to decide which leaves flicker.
  */
 
+/* Standard "linear congruential" generator: multiply-and-add to get the
+ * next pseudo-random number (constants from Numerical Recipes). */
 static inline uint32_t lcg_next(uint32_t *st)
 {
     *st = *st * 1664525u + 1013904223u;
@@ -450,7 +268,7 @@ static inline float lcg_range(uint32_t *st, float lo, float hi)
     return lo + (hi - lo) * lcg_unit(st);
 }
 
-/* Stateless 3-input hash → uint32 for per-cell rustle gating. */
+/* Mix three numbers into one scrambled number; same inputs, same output. */
 static inline uint32_t hash3(int x, int y, int t)
 {
     uint32_t h = (uint32_t)x * 374761393u
@@ -460,54 +278,43 @@ static inline uint32_t hash3(int x, int y, int t)
     return h ^ (h >> 16);
 }
 
-/* ===================================================================== */
-/* §5  generation                  BUILD — recursive tree skeleton        */
-/* ===================================================================== */
-/*
- * Mutates the Scene's Tree (segments + foliage clouds), via a Tree* — no
- * globals.  BUILD-time only: runs from scene_rebuild (§8) on a user event,
- * NEVER per frame.  Produces the abstract skeleton that §6 bakes into a CharGrid.
- */
+/* ── §5 generation — grow the tree skeleton (runs once, not per frame) ── */
 
 /*
- * Segment — one straight trunk-or-branch piece in cell coordinates, the unit
- * draw_segment() walks with a Bresenham line (§6; Bresenham 1965).  Endpoints
- * are floats — the generator works at sub-cell precision and rounds at raster
- * time.  `depth` is both the recursion level AND the bark-thickness tier:
- * 0-1 thick, 2-3 medium, 4+ thin (see TRUNK_THICK/MEDIUM/THIN and CellRole).
+ * Segment — one straight piece of trunk or branch.  Endpoints are stored
+ * as floats so the generator can work at finer-than-a-cell precision and
+ * round only when it draws.  `depth` says how far from the trunk this
+ * piece is (0 = trunk, 1 = main branch, ...) and also picks its thickness:
+ * low depth = thick bark, high depth = thin twig.
  */
 typedef struct {
-    float    x0, y0, x1, y1;   /* start → end, cell coords (sub-cell precision)   */
-    int      depth;            /* 0 = trunk, 1 = primary branch, … ; sets thickness */
+    float    x0, y0, x1, y1;   /* start and end point, in cell coordinates  */
+    int      depth;            /* 0 = trunk, higher = thinner branch        */
 } Segment;
 
 /*
- * FoliageCloud — a clump of leaves dropped at a branch tip (Iwata, on how real
- * foliage clumps).  draw_foliage_cloud() (§6) fills it as an aspect-corrected
- * ellipse so it reads as round on screen despite the ~2:1 cell aspect (ellipse
- * scan-conversion, Foley/van Dam).  Stored as centre + base (x) radius; the
- * y-radius is derived as radius / CELL_ASPECT at raster time.
+ * FoliageCloud — a round clump of leaves dropped at the tip of a branch.
+ * Stored as a centre and a horizontal radius; the drawing code (§6) makes
+ * the clump look round on screen by squashing it vertically to undo the
+ * tall-cell distortion.
  */
 typedef struct {
-    float    cx, cy;       /* centre, cell coords                                 */
-    float    radius;       /* x radius, cells; y radius = radius / CELL_ASPECT    */
-    int      depth_at_tip; /* recursion depth here — gates the WINTER snow-tip    */
+    float    cx, cy;       /* centre, in cell coordinates                        */
+    float    radius;       /* horizontal radius in cells (vertical is smaller)   */
+    int      depth_at_tip; /* how deep the tree was here; used for the snow tip   */
 } FoliageCloud;
 
 /*
- * Tree — the abstract skeleton: every trunk/branch Segment plus every
- * FoliageCloud.  Produced by the recursive descent in §5 (a stochastic,
- * non-rewriting cousin of an L-system — Lindenmayer 1968; Prusinkiewicz &
- * Lindenmayer 1990) and consumed once by the rasteriser (§6).  Fixed-capacity,
- * append-only pools — NO malloc (project memory rule); seg_add/fol_add silently
- * no-op when full, so runaway recursion degrades gracefully instead of
- * overflowing.  Lives on Scene; rebuilt on every seed/style change.
+ * Tree — the whole skeleton: every trunk/branch segment plus every leaf
+ * clump.  Built once by §5, then drawn by §6.  The arrays are fixed-size
+ * (no malloc); if the tree somehow grows past the limit, seg_add/fol_add
+ * just stop adding instead of overflowing, so it fails gracefully.
  */
 typedef struct {
-    Segment      segs[SEG_MAX];   /* trunk + branches, in emission order   */
-    int          n_segs;          /* count in use, 0..SEG_MAX              */
-    FoliageCloud fols[FOL_MAX];   /* leaf clumps at terminal tips          */
-    int          n_fols;          /* count in use, 0..FOL_MAX              */
+    Segment      segs[SEG_MAX];   /* all trunk and branch pieces           */
+    int          n_segs;          /* how many of segs[] are in use         */
+    FoliageCloud fols[FOL_MAX];   /* all the leaf clumps                    */
+    int          n_fols;          /* how many of fols[] are in use         */
 } Tree;
 
 static void tree_clear(Tree *t)
@@ -532,8 +339,8 @@ static void fol_add(Tree *t, float cx, float cy, float radius, int depth)
     f->depth_at_tip = depth;
 }
 
-/* rotate_dir — rotate a 2-D direction vector by `bend` radians (the standard
- * 2×2 rotation matrix).  Used to splay child branches off the parent heading. */
+/* Turn a direction by `bend` radians, used to angle a child branch away
+ * from the one it grew from. */
 static void rotate_dir(float dx, float dy, float bend, float *out_x, float *out_y)
 {
     float c = cosf(bend), s = sinf(bend);
@@ -542,13 +349,11 @@ static void rotate_dir(float dx, float dy, float bend, float *out_x, float *out_
 }
 
 /*
- * grow_branch — recursive descent.  Walks (start → end) along `dir` for
- * `length` cells, emits a Segment, then either spawns sub-branches or
- * places a foliage cloud at the tip.
- *
- * `dir` is a 2-D unit-ish vector in screen-cell space; we scale y by
- * 1/CELL_ASPECT so that "1 unit of length" produces equal physical
- * pixels regardless of direction.
+ * grow_branch — grow one branch and then its children.  It draws a single
+ * straight piece in the given direction, then either splits into smaller
+ * branches or, when it's run out of length or depth, drops a leaf clump at
+ * the end.  It calls itself for each child, so the whole tree comes from
+ * this one function.
  */
 static void grow_branch(Tree *t, uint32_t *rng,
                         float x, float y, float dir_x, float dir_y,
@@ -563,72 +368,73 @@ static void grow_branch(Tree *t, uint32_t *rng,
         return;
     }
 
-    /* Apply cell-aspect to y component so the branch is the same
-     * physical length regardless of angle. */
+    /* Squash the vertical step so the branch covers the same on-screen
+     * distance no matter which way it points. */
     float ex = x + dir_x * length;
     float ey = y + dir_y * length / CELL_ASPECT;
     seg_add(t, x, y, ex, ey, depth);
 
-    /* Decide how to continue: extend (with bend) and/or branch. */
+    /* Either keep going as one branch or fork into two. */
     int n_subs = 1;
     if (lcg_unit(rng) < sp->branch_density && depth < sp->max_depth - 1) {
-        n_subs = 2;                    /* fork into 2 */
+        n_subs = 2;
     }
     if (depth == 0 && lcg_unit(rng) < 0.6f) n_subs = 2;
 
     for (int i = 0; i < n_subs; i++) {
         float bend = lcg_range(rng, -0.40f, 0.40f);
         if (n_subs > 1) {
-            /* Two children fork outward at moderate angles. */
+            /* When forking, send the two children off to opposite sides. */
             bend = (i == 0 ? -1 : +1) * lcg_range(rng, 0.5f, 0.95f);
         }
         float ndx, ndy;
         rotate_dir(dir_x, dir_y, bend, &ndx, &ndy);
-        /* Slight upward bias (anti-gravity for branches that aren't
-         * cascading) so non-trunk branches reach upward. */
+        /* Nudge non-trunk branches upward so they reach for the light. */
         if (depth > 0 && ndy > -0.1f) ndy -= 0.2f;
         float nlen = length * BRANCH_LEN_F;
         grow_branch(t, rng, ex, ey, ndx, ndy, nlen, depth + 1, sp, no_foliage);
     }
 }
 
-/* pot_top_row — y of the pot's top edge: reserve POT_ROWS_* rows at the bottom,
- * but on a tiny screen push the pot to the last row so the tree still gets room. */
+/* Which row the top of the pot sits on.  Normally we leave a few rows at
+ * the bottom for the pot, but on a very short screen we shove it to the
+ * last row so the tree still has somewhere to grow. */
 static int pot_top_row(int rows_eff)
 {
     int pot_rows = (rows_eff >= POT_TALL_MIN_ROWS) ? POT_ROWS_TALL : POT_ROWS_SHORT;
     int pot_top  = rows_eff - pot_rows - 1;
-    if (pot_top < 5) pot_top = rows_eff - 1;     /* no room above: pot at floor */
+    if (pot_top < 5) pot_top = rows_eff - 1;     /* no room above: pot at the floor */
     return pot_top;
 }
 
 /*
- * trunk_x_at — the trunk centre-line: x of the trunk at height-fraction `frac`.
- * This parametric path is what GIVES each style its silhouette (see KEY FORMULAS).
- * Most styles set only x; KENGAI (cascade) also overrides *y to arc downward past
- * the pot rim.  CHOKKAN draws on *rng for its wobble, so this must be called once
- * per node in ascending order to keep the tree deterministic for a seed.
+ * trunk_x_at — where the trunk sits side-to-side at a given height (frac
+ * runs 0 at the base to 1 at the top).  This is the one place each style's
+ * trunk shape lives: upright, S-curved, leaning, or cascading.  KENGAI also
+ * pushes the trunk down past the pot rim, so it can change *y too.  CHOKKAN
+ * uses the random generator for its tiny wobble, so call this once per node
+ * in order to keep a given seed repeatable.
  */
 static float trunk_x_at(uint32_t *rng, TreeStyle style, const StyleParams *sp,
                         float mid, float frac, float trunk_height,
                         int pot_top, float *y)
 {
     switch (style) {
-    case STYLE_CHOKKAN:                          /* upright: tiny x wobble */
+    case STYLE_CHOKKAN:                          /* straight up, tiny wobble */
         return mid + lcg_range(rng, -0.3f, 0.3f);
-    case STYLE_MOYOGI:                           /* S-curve */
+    case STYLE_MOYOGI:                           /* gentle S-curve */
         return mid + sp->trunk_curve_amp
                    * sinf(2.0f * (float)M_PI * sp->trunk_curve_waves * frac);
-    case STYLE_SHAKAN:                           /* straight lean */
+    case STYLE_SHAKAN:                           /* leans at a fixed angle */
         return mid + sp->trunk_lean * frac * trunk_height;
-    case STYLE_KENGAI: {                          /* rise to apex, then cascade */
+    case STYLE_KENGAI: {                          /* rises, then cascades down */
         float apex = KENGAI_APEX_FRAC;
-        if (frac < apex) return mid;             /* short straight rise */
+        if (frac < apex) return mid;             /* short straight rise first */
         float t2 = (frac - apex) / (1.0f - apex);
-        *y = (float)pot_top - apex * trunk_height + t2 * 6.0f;   /* down past rim */
-        return mid + 6.0f * sinf(t2 * (float)M_PI * 0.6f) * 1.5f;/* arc out right */
+        *y = (float)pot_top - apex * trunk_height + t2 * 6.0f;   /* arc down past the rim */
+        return mid + 6.0f * sinf(t2 * (float)M_PI * 0.6f) * 1.5f;/* and out to the side */
     }
-    case STYLE_BUNJIN:                            /* sparse, phase-shifted S */
+    case STYLE_BUNJIN:                            /* sparse, slightly shifted S */
     default:
         return mid + sp->trunk_curve_amp
                    * sinf(2.0f * (float)M_PI * sp->trunk_curve_waves * frac + 0.5f);
@@ -636,10 +442,10 @@ static float trunk_x_at(uint32_t *rng, TreeStyle style, const StyleParams *sp,
 }
 
 /*
- * maybe_sprout_branch — at a trunk node (height-fraction `frac`) possibly grow a
- * side branch: only within the clean band BRANCH_BAND_LO..HI (so the base and
- * apex stay bare), then with probability branch_density.  Picks a side + angle
- * (always reaching upward) and recurses via grow_branch.
+ * maybe_sprout_branch — at one point up the trunk, sometimes start a side
+ * branch.  It only happens in the middle stretch of the trunk (so the base
+ * and the very top stay bare) and then only by chance, so denser styles get
+ * more branches.  The branch always angles upward.
  */
 static void maybe_sprout_branch(Tree *t, uint32_t *rng, float x, float y,
                                 float frac, const StyleParams *sp, bool no_foliage)
@@ -649,15 +455,14 @@ static void maybe_sprout_branch(Tree *t, uint32_t *rng, float x, float y,
 
     float angle = (lcg_unit(rng) < 0.5f ? -1.0f : 1.0f) * lcg_range(rng, 0.7f, 1.2f);
     float dx = sinf(angle);
-    float dy = -fabsf(cosf(angle));              /* always upward */
-    float blen = sp->branch_length * (1.0f - frac * 0.5f);   /* shorter up high */
+    float dy = -fabsf(cosf(angle));              /* the minus keeps it pointing up */
+    float blen = sp->branch_length * (1.0f - frac * 0.5f);   /* shorter near the top */
     grow_branch(t, rng, x, y, dx, dy, blen, 1, sp, no_foliage);
 }
 
-/*
- * add_crown — the foliage cloud at the very top of the trunk: one big crown just
- * above an upright tip, a smaller one at the KENGAI cascading tip, none if bare.
- */
+/* Put a leaf clump at the very top of the trunk: a big one for upright
+ * trees, a smaller one for the cascading KENGAI tip, none if the theme is
+ * bare (WINTER). */
 static void add_crown(Tree *t, TreeStyle style, const StyleParams *sp,
                       float tip_x, float tip_y, bool no_foliage)
 {
@@ -669,11 +474,10 @@ static void add_crown(Tree *t, TreeStyle style, const StyleParams *sp,
 }
 
 /*
- * tree_generate — entry point.  Picks pot dimensions, lays out the
- * trunk according to style, and recurses for branches.
- *
- * Returns the y-coordinate of the pot's TOP edge so the renderer can
- * draw the pot frame.
+ * tree_generate — build a whole tree from a seed: work out the pot and
+ * trunk size, walk up the trunk dropping side branches, and cap it with a
+ * crown.  Returns the row the pot's top edge sits on so the pot can be
+ * drawn afterward.
  */
 static int tree_generate(Tree *t, uint32_t seed, int cols, int rows_eff,
                          TreeStyle style, bool no_foliage)
@@ -682,20 +486,20 @@ static int tree_generate(Tree *t, uint32_t seed, int cols, int rows_eff,
     tree_clear(t);
     const StyleParams *sp = &styles[style];
 
-    /* Pot + trunk geometry. */
+    /* Work out how tall the trunk is, keeping it within sane bounds. */
     int   pot_top      = pot_top_row(rows_eff);
     float trunk_height = (float)pot_top * sp->trunk_height_frac;
     if (trunk_height > (float)pot_top - 1.0f) trunk_height = (float)pot_top - 1.0f;
     if (trunk_height < MIN_TRUNK_HEIGHT)      trunk_height = MIN_TRUNK_HEIGHT;
     float mid = (float)cols * 0.5f;
 
-    /* Trunk drawn as a poly-line: more nodes for taller trunks, clamped. */
+    /* Taller trunks are drawn from more nodes (smoother), within limits. */
     int trunk_segs = (int)(trunk_height * TRUNK_SEGS_PER_CELL);
     if (trunk_segs < TRUNK_SEGS_MIN) trunk_segs = TRUNK_SEGS_MIN;
     if (trunk_segs > TRUNK_SEGS_MAX) trunk_segs = TRUNK_SEGS_MAX;
 
-    /* Walk up the trunk: place each node on the style's centre-line, emit the
-     * segment to it, and maybe sprout a branch there. */
+    /* Step up the trunk node by node: place the node where the style wants
+     * it, draw the segment to it, and maybe start a branch there. */
     float prev_x = mid, prev_y = (float)pot_top;
     for (int i = 1; i <= trunk_segs; i++) {
         float frac = (float)i / (float)trunk_segs;
@@ -714,26 +518,18 @@ static int tree_generate(Tree *t, uint32_t seed, int cols, int rows_eff,
     return pot_top;
 }
 
-/* ===================================================================== */
-/* §6  raster                      BUILD/bake — skeleton → char grid      */
-/* ===================================================================== */
-/*
- * Mutates a CharGrid (the baked still-life the renderer replays), via a
- * CharGrid* — no globals.  BUILD-time only, from scene_rebuild (§8).  Bresenham
- * line walk for segments + aspect-corrected ellipse fill for foliage clouds.
- */
+/* ── §6 raster — turn the skeleton into a grid of characters ── */
 
 /*
- * CharGrid — the baked still-life: a 2-D grid of character cells the renderer
- * replays every frame.  §6/§7 write it once per user event; §11 reads it.  The
- * glyph chosen per cell encodes structure/thickness as ASCII (heavy bark vs
- * thin twig vs leaf density) — the text-mode analogue of an intensity ramp
- * (Bourke, ASCII grey-scale).  Fixed [GRID_MAX_H][GRID_MAX_W] backing; only the
- * live rows_eff×cols sub-rectangle is cleared and read, the rest is ignored.
- * Structure-of-arrays (one plane per attribute, so each streams contiguously):
- *   glyph — the ASCII character to stamp in the cell
- *   role  — CellRole: what the cell represents (selects colour + bold at render)
- *   pair  — variant within the role's colour ramp (0..5 for the six leaf hues)
+ * CharGrid — the finished picture, baked once into a grid of characters
+ * that the renderer just replays every frame.  §6/§7 write it; §11 reads
+ * it.  It's stored as three separate planes (one big array each) rather
+ * than one array of structs, so each attribute sits contiguously in memory:
+ *   glyph — the character to print in the cell
+ *   role  — what the cell is (bark / leaf / pot / ...); picks the colour
+ *   pair  — which of a role's colours to use (0..5 for the six leaf hues)
+ * The arrays are sized for the biggest terminal we support; only the part
+ * matching the real window is ever touched.
  */
 typedef struct {
     char    glyph[GRID_MAX_H][GRID_MAX_W];
@@ -756,7 +552,7 @@ static inline void grid_put(CharGrid *grid, int r, int c, char ch, uint8_t role,
 {
     if (r < 0 || r >= rows_eff || r >= GRID_MAX_H) return;
     if (c < 0 || c >= cols     || c >= GRID_MAX_W) return;
-    /* Don't overwrite trunk/branch cells with foliage edges; trunk wins. */
+    /* If bark is already here, don't let a leaf paint over it. */
     uint8_t existing = grid->role[r][c];
     if (existing >= ROLE_TRUNK_DARK && existing <= ROLE_TRUNK_LIGHT
         && role == ROLE_FOLIAGE) return;
@@ -766,10 +562,10 @@ static inline void grid_put(CharGrid *grid, int r, int c, char ch, uint8_t role,
 }
 
 /*
- * bark_tier — map recursion depth to a bark thickness tier: the role + colour-
- * ramp index, and a base glyph sampled from that tier's palette (deterministic
- * in the cell so the same segment looks stable).  Tiers: 0-1 thick, 2-3 medium,
- * 4+ thin twig (see TRUNK_THICK/MEDIUM/THIN and CellRole).
+ * bark_tier — given how deep a branch is, pick its bark thickness: which
+ * colour to use and a character from the matching set (thick / medium /
+ * thin).  The `sample` number just picks one character so a given cell
+ * always looks the same.
  */
 static void bark_tier(int depth, int sample, char *glyph,
                       uint8_t *role, uint8_t *pair_idx)
@@ -790,8 +586,9 @@ static void bark_tier(int depth, int sample, char *glyph,
 }
 
 /*
- * draw_segment — Bresenham line in cell coords.  Picks trunk-thick /
- * medium / thin glyph by depth and writes to the grid.
+ * draw_segment — stamp one trunk/branch piece onto the grid, cell by cell,
+ * using Bresenham's line algorithm (a classic integer way to draw a
+ * straight line between two grid points).
  */
 static void draw_segment(const Segment *s, CharGrid *grid, int rows_eff, int cols)
 {
@@ -802,17 +599,17 @@ static void draw_segment(const Segment *s, CharGrid *grid, int rows_eff, int col
 
     char    glyph;
     uint8_t role;
-    uint8_t pair_idx;     /* 0..2 within trunk palette */
+    uint8_t pair_idx;
     bark_tier(s->depth, abs(x0 + y0), &glyph, &role, &pair_idx);
 
-    /* Bresenham. */
     int dx = abs(x1 - x0), dy = abs(y1 - y0);
     int sx = x0 < x1 ? 1 : -1;
     int sy = y0 < y1 ? 1 : -1;
     int err = dx - dy;
 
     while (1) {
-        /* Choose a glyph that hints at direction for diagonal cells. */
+        /* Pick a character that leans the way the line is going, so a
+         * diagonal branch reads as a slash rather than a stack of bars. */
         char g = glyph;
         if (dx > dy * 2)        g = (s->depth <= 1) ? '=' : '-';
         else if (dy > dx * 2)   g = (s->depth <= 1) ? 'H' : '|';
@@ -828,8 +625,9 @@ static void draw_segment(const Segment *s, CharGrid *grid, int rows_eff, int col
 }
 
 /*
- * draw_foliage_cloud — fill an aspect-corrected ellipse with random
- * leaf glyphs from the active theme's leaf set.
+ * draw_foliage_cloud — fill in one leaf clump.  It walks the cells inside
+ * a circle (squashed vertically so it looks round on screen) and drops a
+ * random leaf character from the theme in each one.
  */
 static void draw_foliage_cloud(const FoliageCloud *f, const Theme *th,
                                 uint32_t *rng, CharGrid *grid,
@@ -838,7 +636,7 @@ static void draw_foliage_cloud(const FoliageCloud *f, const Theme *th,
     int cxi = (int)(f->cx + 0.5f);
     int cyi = (int)(f->cy + 0.5f);
     float rx = f->radius;
-    float ry = f->radius / CELL_ASPECT;     /* corrected → round on screen */
+    float ry = f->radius / CELL_ASPECT;     /* smaller vertically so it looks round */
 
     int yr_lo = cyi - (int)(ry + 1);
     int yr_hi = cyi + (int)(ry + 1);
@@ -852,9 +650,9 @@ static void draw_foliage_cloud(const FoliageCloud *f, const Theme *th,
             float dx = (float)(x - cxi);
             float dy = (float)(y - cyi) * CELL_ASPECT;
             float r2 = (dx*dx) / (rx*rx) + (dy*dy) / (rx*rx);
-            if (r2 > 1.0f) continue;
+            if (r2 > 1.0f) continue;           /* outside the circle */
 
-            /* Density falloff at the edge — softer cloud. */
+            /* Thin the leaves out toward the edge so the clump looks soft. */
             if (r2 > 0.6f && lcg_unit(rng) > 0.7f) continue;
 
             char g = th->leaf_set[lcg_next(rng) % (uint32_t)leaf_set_len];
@@ -863,8 +661,7 @@ static void draw_foliage_cloud(const FoliageCloud *f, const Theme *th,
         }
     }
 
-    /* WINTER snow tip on the topmost cell of each cloud (depth at tip
-     * means this is a terminal foliage point). */
+    /* In WINTER, dab a bit of snow on top of each clump. */
     if (th->snow_tip != NULL) {
         int top = yr_lo + 1;
         if (top >= 0 && top < rows_eff && cxi >= 0 && cxi < cols) {
@@ -874,16 +671,12 @@ static void draw_foliage_cloud(const FoliageCloud *f, const Theme *th,
     }
 }
 
-/* ===================================================================== */
-/* §7  pot                         BUILD/bake — pot frame → char grid     */
-/* ===================================================================== */
-/* Mutates the same grids as §6; drawn last so it sits over any trunk that  */
-/* dipped into its cells.  BUILD-time only, from scene_rebuild (§8).        */
+/* ── §7 pot — draw the pot under the tree ── */
 
 /*
- * draw_pot — a small trapezoidal pot centred under the trunk.  Width is a third
- * of the screen, clamped to [12, cols-4].  Drawn last so it sits on top of any
- * trunk segments that dipped into its cells (e.g. KENGAI cascades).
+ * draw_pot — a small pot centred under the trunk, about a third of the
+ * screen wide.  Drawn last so it covers any trunk that dipped down into its
+ * cells (the cascading KENGAI style does this).
  */
 static void draw_pot(CharGrid *grid, int pot_top, int rows_eff, int cols)
 {
@@ -893,7 +686,7 @@ static void draw_pot(CharGrid *grid, int pot_top, int rows_eff, int cols)
     int x0 = cols / 2 - w / 2;
     int x1 = x0 + w - 1;
 
-    /* Top rim row (just above the pot proper).  Slight overhang. */
+    /* The rim, which sticks out a little past the walls on each side. */
     int rim_y = pot_top + 1;
     if (rim_y >= 0 && rim_y < rows_eff) {
         for (int x = x0 - 1; x <= x1 + 1; x++) {
@@ -915,7 +708,7 @@ static void draw_pot(CharGrid *grid, int pot_top, int rows_eff, int cols)
         if (y >= rows_eff) break;
 
         if (i == pot_rows - 1) {
-            /* Bottom row — solid. */
+            /* The solid bottom row. */
             for (int x = x0; x <= x1; x++) {
                 if (x < 0 || x >= cols) continue;
                 char c = POT_BOTTOM_CH;
@@ -924,55 +717,47 @@ static void draw_pot(CharGrid *grid, int pot_top, int rows_eff, int cols)
                 grid_put(grid, y, x, c, ROLE_POT, 0, rows_eff, cols);
             }
         } else {
-            /* Side walls. */
+            /* The two side walls. */
             if (x0 >= 0 && x0 < cols)
                 grid_put(grid, y, x0, POT_SIDE_CH, ROLE_POT, 0, rows_eff, cols);
             if (x1 >= 0 && x1 < cols)
                 grid_put(grid, y, x1, POT_SIDE_CH, ROLE_POT, 0, rows_eff, cols);
-            /* Faint interior fill (just a few dots). */
+            /* Scatter a few dots inside for a hint of soil texture. */
             for (int x = x0 + 1; x <= x1 - 1; x++) {
                 if (x < 0 || x >= cols) continue;
-                if (((unsigned)(x + y)) & 3u) continue;   /* 25 % density */
+                if (((unsigned)(x + y)) & 3u) continue;   /* keep about one in four */
                 grid_put(grid, y, x, '.', ROLE_POT, 0, rows_eff, cols);
             }
         }
     }
 }
 
-/* ===================================================================== */
-/* §8  build                       BUILD orchestration + Scene state      */
-/* ===================================================================== */
-/*
- * Scene holds all per-instance state.  scene_rebuild is the BUILD combine
- * point: GENERATION (§5) → RASTER (§6/§7).  It mutates Scene.tree, Scene.canvas
- * and Scene.pot_top.  Runs on user events (§9), NEVER per frame.
- */
+/* ── §8 build — assemble one tree and hold all its state ── */
 
 /*
- * Scene — the whole bonsai instance, read top-to-bottom as a table of contents.
- *   WHAT is built — the tree skeleton, its baked image, and the pot geometry.
- *   HOW it is chosen — the generation knobs the user cycles (which tree, which
- *     palette); a (seed, style, theme) triple fully determines the specimen.
- *   WHERE / WHEN — viewport size, the rustle clock, and the run-state.
- * scene_rebuild owns the WHAT (regenerates it from the HOW); the per-frame tick
- * only advances `time`.  Holds its own cols/rows so the build never reaches
- * into the I/O layer (Screen) for bounds.
+ * Scene — everything about the one bonsai on screen.  The first group is
+ * the finished tree (rebuilt whenever something changes); the second group
+ * is the choices that decide which tree to grow (a seed plus a style plus a
+ * theme fully determines it); the last group is the window size and the
+ * rustle clock.  scene_rebuild regrows the tree from the choices; the
+ * per-frame tick only nudges `time` forward.  Scene keeps its own cols/rows
+ * so the tree-building code never has to ask the terminal directly.
  */
 typedef struct {
-    /* WHAT — the built specimen (regenerated by scene_rebuild on any change) */
-    Tree       tree;          /* skeleton: segments + foliage clouds (§5)     */
-    CharGrid   canvas;        /* baked still-life the renderer replays (§6/§7) */
-    int        pot_top;       /* y of the pot's top edge — a build output     */
+    /* The finished tree (rebuilt by scene_rebuild on any change). */
+    Tree       tree;          /* the skeleton (§5)                            */
+    CharGrid   canvas;        /* the baked picture the renderer replays       */
+    int        pot_top;       /* row the pot's top edge sits on               */
 
-    /* HOW — which tree to build (the generation knobs the user drives) */
-    uint32_t   seed;          /* RNG seed → one specific tree of the style    */
-    int        current_style; /* TreeStyle: trunk shape + branching recipe    */
-    int        current_theme; /* palette + leaf set + bare flag               */
+    /* The choices that decide which tree to grow. */
+    uint32_t   seed;          /* picks one specific tree of the chosen style  */
+    int        current_style; /* which trunk shape (a TreeStyle)              */
+    int        current_theme; /* which colours + leaves (a Theme index)       */
 
-    /* WHERE / WHEN */
-    int        cols, rows;    /* viewport in cells (own copy; cf. Screen)     */
-    float      time;          /* rustle clock, seconds — the sim state        */
-    bool       paused;        /* run-state: freeze the rustle clock           */
+    /* Window size and timing. */
+    int        cols, rows;    /* window size in cells (own copy)              */
+    float      time;          /* seconds elapsed, drives the rustle           */
+    bool       paused;        /* when true, the rustle freezes                */
 } Scene;
 
 static void scene_rebuild(Scene *s)
@@ -1000,13 +785,11 @@ static void scene_rebuild(Scene *s)
     draw_pot(&s->canvas, s->pot_top, rows_eff, s->cols);
 }
 
-/* ===================================================================== */
-/* §9  events                      USER EVENTS — mutate + trigger BUILD   */
-/* ===================================================================== */
+/* ── §9 events — keypress and resize handlers that rebuild the tree ── */
 /*
- * Each runs ONLY on input or resize, NOT as part of the per-frame tick.
- * They mutate Scene and call scene_rebuild (§8) to re-bake; scene_cycle_theme
- * additionally re-binds colours (§3).  None of these advance Scene.time.
+ * These run only when the user presses a key or resizes the window, never
+ * as part of the normal frame loop.  Each changes the Scene and rebuilds
+ * the tree; switching theme also re-binds the colours (§3).
  */
 
 static void scene_init(Scene *s, int cols, int rows)
@@ -1048,16 +831,13 @@ static void scene_cycle_theme(Scene *s, int dir)
     while (idx < 0) idx += N_THEMES;
     s->current_theme = idx % N_THEMES;
     theme_apply(s->current_theme);
-    scene_rebuild(s);     /* WINTER toggles foliage on/off → rebuild */
+    scene_rebuild(s);     /* rebuild because WINTER adds/removes the leaves */
 }
 
-/* ===================================================================== */
-/* §10  simulation                 SIMULATION — the only per-tick advance */
-/* ===================================================================== */
+/* ── §10 simulation — advance the rustle clock ── */
 /*
- * Advances Scene.time (the rustle clock) and nothing else.  Gated by the
- * Scene.paused boolean — the program's only DELAY.  Called once per frame
- * from main (§13); this is the entire per-tick state advance.
+ * The tree itself never moves; the only thing that changes over time is the
+ * clock that drives the leaf flicker.  When paused, even that stops.
  */
 static void scene_tick(Scene *s, float dt)
 {
@@ -1065,18 +845,16 @@ static void scene_tick(Scene *s, float dt)
     s->time += dt;
 }
 
-/* ===================================================================== */
-/* §11  render                     RENDER — char grid → screen (read-only)*/
-/* ===================================================================== */
+/* ── §11 render — draw the baked grid to the screen ── */
 /*
- * Reads the baked Scene.canvas + Scene.time; writes the ncurses screen ONLY,
- * never Scene or the canvas.  The wind flutter is the lone EFFECT, and it is
- * DERIVED here (not stored): hash3 gates an on-the-fly leaf re-pick into a local.
+ * This only reads the baked picture and writes to the screen; it never
+ * changes the tree.  The wind flicker is worked out here on the fly (not
+ * stored anywhere) by re-picking a leaf character for some cells.
  */
 
-/* cell_style — the colour pair + attribute a cell is drawn with, from its role.
- * Bark steps dark→bold / mid→normal / light→dim; bright foliage hues
- * (≥ FOLIAGE_BOLD_FROM) go bold so the canopy has highlights. */
+/* cell_style — pick the colour and emphasis for a cell from what it is.
+ * Bark gets brighter the closer to the trunk; the lighter leaf colours are
+ * drawn bold so the canopy has some sparkle. */
 static void cell_style(uint8_t role, uint8_t pair_idx, int *pair, attr_t *attr)
 {
     switch (role) {
@@ -1098,9 +876,9 @@ static void cell_style(uint8_t role, uint8_t pair_idx, int *pair, attr_t *attr)
     }
 }
 
-/* rustle_glyph — the wind flutter (the lone EFFECT, derived not stored): a
- * stable per-cell hash (cell + time window) fires for ~RUSTLE_RATE of cells; a
- * firing cell swaps in a different random leaf, else the baked glyph holds. */
+/* rustle_glyph — the wind flicker.  A hash of the cell and the current time
+ * window decides whether this leaf "flutters" right now: a small fraction do,
+ * and those swap to a different random leaf; the rest keep their baked one. */
 static char rustle_glyph(char baked, const Theme *th, int c, int r,
                          int time_key, int leaf_len)
 {
@@ -1110,10 +888,8 @@ static char rustle_glyph(char baked, const Theme *th, int c, int r,
     return baked;
 }
 
-/*
- * scene_render — emit the baked grid to ncurses: each non-empty cell coloured
- * by its role, foliage flickering with the wind.
- */
+/* scene_render — print every non-empty cell of the baked grid in its
+ * colour, letting the leaves flicker as it goes. */
 static void scene_render(const Scene *s)
 {
     int rows_eff = s->rows - 1;
@@ -1126,8 +902,8 @@ static void scene_render(const Scene *s)
     int          time_key = (int)(s->time * RUSTLE_FREQ);
     int          leaf_len = (int)strlen(th->leaf_set);
 
-    /* Emit each non-empty cell, batching attron/attroff so a run of one colour
-     * costs a single ncurses attr change rather than one per cell. */
+    /* Only switch ncurses colour when it actually changes, so a long run of
+     * the same colour costs one switch instead of one per cell. */
     int    last_pair = -1;
     attr_t last_attr = 0;
     for (int r = 0; r < rows_eff; r++) {
@@ -1161,22 +937,18 @@ static void scene_render(const Scene *s)
     if (last_pair >= 0) attroff(COLOR_PAIR(last_pair) | last_attr);
 }
 
-/* ===================================================================== */
-/* §12  screen                     RENDER — terminal I/O + HUD            */
-/* ===================================================================== */
+/* ── §12 screen — terminal setup/teardown and the HUD ── */
 /*
- * Terminal lifecycle (init / resize / teardown) plus the two-line HUD overlay.
- * Writes the ncurses screen only.  screen_resize_curses re-reads the terminal
- * size on SIGWINCH — a USER EVENT, driven from app_do_resize (§13).
+ * Owns the ncurses lifecycle (start, resize, stop) and draws the two HUD
+ * bars on top of the tree.
  */
 
 /*
- * Screen — cached terminal size in character cells, owned by the I/O layer.
- * Refreshed by getmaxyx at init and on every SIGWINCH (§12).  Scene keeps its
- * OWN cols/rows copy so the build/sim never reaches into the I/O layer for
- * bounds; the two are synced at resize (app_do_resize, §13).
+ * Screen — the current terminal size in cells, re-read at startup and on
+ * every resize.  Scene keeps its own copy of the size; the two are synced
+ * when the window resizes.
  */
-typedef struct { int cols, rows; } Screen;   /* cells, ≥1; refreshed on resize */
+typedef struct { int cols, rows; } Screen;
 
 static void screen_init(Screen *sc)
 {
@@ -1199,14 +971,11 @@ static void screen_resize_curses(Screen *sc)
 }
 
 /*
- * screen_draw — render the tree, then overlay the two-line HUD:
- *   top    row 0      DATA    — title, rustle/paused, style, theme (left)
- *                              + fps / Hz (right-aligned).
- *   bottom row rows-1 ACTIONS — the key legend.
- * Both bars are filled first so the tree never shows through.  Every field is
- * clipped to the terminal width with "%.*s", and the left data block is kept
- * clear of the right-aligned stats, so a narrow terminal can neither overflow
- * nor wrap the HUD.
+ * screen_draw — draw the tree, then put the HUD on top: a status line along
+ * the top (title, state, style, theme, and fps/Hz on the right) and the key
+ * legend along the bottom.  Both bars are filled with spaces first so the
+ * tree doesn't peek through, and every piece of text is clipped to the
+ * window width so a narrow terminal can't overflow or wrap it.
  */
 static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
 {
@@ -1217,26 +986,26 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
     int rows = sc->rows;
     if (cols < 1 || rows < 1) return;
 
-    /* ── Top row 0: DATA — left block + right-aligned fps/Hz. ── */
+    /* Top line: status on the left, fps/Hz pinned to the right. */
     char data[128], stats[40];
     snprintf(data, sizeof data, " BONSAI   %s   style:%s  theme:%s ",
              s->paused ? "PAUSED" : "RUSTLE",
              styles[s->current_style].name,
              themes[s->current_theme].name);
     snprintf(stats, sizeof stats, " %5.1f fps  %3d Hz ", fps, sim_fps);
-    int sx = cols - (int)strlen(stats);          /* right-aligned stats column */
+    int sx = cols - (int)strlen(stats);          /* column where the stats begin */
 
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     for (int x = 0; x < cols; x++) mvaddch(0, x, ' ');
     if (sx >= 0) {
-        mvprintw(0, 0, "%.*s", sx, data);        /* data clipped clear of stats */
+        mvprintw(0, 0, "%.*s", sx, data);        /* stop the status short of the stats */
         mvprintw(0, sx, "%s", stats);
     } else {
-        mvprintw(0, 0, "%.*s", cols, data);      /* too narrow for stats: data only */
+        mvprintw(0, 0, "%.*s", cols, data);      /* window too narrow for stats */
     }
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* ── Bottom row: ACTIONS — every interactive key. ── */
+    /* Bottom line: the list of keys you can press. */
     if (rows >= 2) {
         int brow = rows - 1;
         attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -1249,31 +1018,22 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §13  app + main                 USER-EVENT glue + PERFORMANCE combine  */
-/* ===================================================================== */
-/*
- * App owns the sub-systems + run flags.  The signal handlers and app_handle_key
- * / app_do_resize are USER EVENTS (mutate state, may trigger a BUILD), NOT part
- * of the tick.  main() is the ONE per-frame combine point (see ARCHITECTURE):
- *   resize? → dt(cap) → scene_tick (SIM) → fps → sleep (PERF) → render → input.
- */
+/* ── §13 app + main — wire it together and run the frame loop ── */
 
 /*
- * App — the running program: the two sub-systems plus the loop's run-state.
- * A single instance (g_app), driven by main (§13).  sim_fps is the render
- * frame-cap target in Hz (the [ / ] keys), NOT a simulation-accuracy knob — the
- * rustle clock advances by real dt regardless of it.  running / need_resize are
- * written from signal handlers, hence volatile sig_atomic_t: the only type the
- * C standard guarantees safe to set in a handler and re-read in the loop without
- * tearing or being optimised away.
+ * App — the running program: the tree, the terminal, and the loop flags.
+ * sim_fps is just a frame-rate cap (the [ and ] keys); it doesn't change how
+ * the rustle advances, since that uses real elapsed time.  running and
+ * need_resize are set inside signal handlers, so they're volatile
+ * sig_atomic_t — the one type C promises is safe to poke from a handler and
+ * read back in the loop without surprises.
  */
 typedef struct {
-    Scene                 scene;       /* the bonsai instance (§8)             */
-    Screen                screen;      /* terminal geometry cache (§12)        */
-    int                   sim_fps;     /* frame-cap target, SIM_FPS_MIN..MAX   */
-    volatile sig_atomic_t running;     /* 0 ⇒ exit the main loop (SIGINT / q)  */
-    volatile sig_atomic_t need_resize; /* 1 ⇒ rebuild at top of next frame     */
+    Scene                 scene;       /* the bonsai (§8)                      */
+    Screen                screen;      /* terminal size (§12)                  */
+    int                   sim_fps;     /* frame-rate cap, SIM_FPS_MIN..MAX     */
+    volatile sig_atomic_t running;     /* set to 0 to quit (Ctrl-C or 'q')     */
+    volatile sig_atomic_t need_resize; /* set to 1 by a window resize          */
 } App;
 
 static App g_app;
@@ -1338,23 +1098,24 @@ int main(void)
     double  fps_display = 0.0;
 
     while (app->running) {
-        /* 1. apply a pending resize before this frame is measured */
+        /* Handle a pending resize before timing this frame. */
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns();
         }
 
-        /* 2. measure elapsed time, clamped so a stall can't spiral the rustle */
+        /* How long since the last frame, capped so a hiccup can't make the
+         * rustle jump. */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
         if (dt > MAX_FRAME_MS * NS_PER_MS) dt = MAX_FRAME_MS * NS_PER_MS;
 
-        /* 3. advance the only sim state: the rustle clock */
+        /* Move the rustle clock forward. */
         float dt_sec = (float)dt / (float)NS_PER_SEC;
         scene_tick(&app->scene, dt_sec);
 
-        /* 4. refresh the fps readout a couple of times a second */
+        /* Update the fps reading a couple of times a second. */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1364,14 +1125,14 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* 5. cap the frame rate, then draw the tree + HUD */
+        /* Sleep to hold the frame rate, then draw. */
         int64_t target_ns = TICK_NS(app->sim_fps);
         int64_t elapsed   = clock_ns() - frame_time + dt;
         clock_sleep_ns(target_ns - elapsed);
         screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
         screen_present();
 
-        /* 6. drain one input event (may flip running or trigger a rebuild) */
+        /* Read one keypress, if any. */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

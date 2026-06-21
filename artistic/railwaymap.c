@@ -1,142 +1,10 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * railwaymap.c — complex transit-map network  (10–15 interconnected lines)
- *
- * An 8×6 logical grid hosts up to 15 lines built from five path templates:
- *   H_FULL   — full-width horizontal at one grid row
- *   V_FULL   — full-height vertical at one grid column
- *   Z_SHAPE  — H → V bend → H  (classic S/Z shape)
- *   REV_Z    — V → H bridge → V  (upright Z)
- *   DOUBLE_Z — H → V → H → V → H  (two-bend zigzag)
- *
- * Stations emerge at every grid node on a line's path.
- * Nodes shared by ≥2 lines become interchange stations (shown as 'O').
- * A canvas is filled before drawing: each terminal cell is tagged with the
- * color-pair of its H-track and/or V-track → ACS_HLINE / ACS_VLINE / ACS_PLUS.
- * Station names are placed perpendicular to their line's local direction.
- *
- * Keys:  r new map   t/T theme   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/railwaymap.c \
- *       -o railwaymap -lncurses -lm
- *
- * §1 config  §2 performance  §3 types  §4 simulation
- * §5 render   §6 app
+ * railwaymap.c — a procedurally generated subway-style transit map.
+ * Stations, lines and moving trains drawn with ncurses box-line characters.
+ * Look modelled on Beck's London Underground; see Ovenden, "Transit Maps
+ * of the World" (2007).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Procedural transit map generation using path templates.
- *                  Lines are built from 5 path templates (H_FULL, V_FULL,
- *                  Z_SHAPE, REV_Z, DOUBLE_Z) routed through an 8×6 logical
- *                  grid.  Interchange stations detected by counting how many
- *                  lines share a grid node (O(lines × path_length) scan).
- *
- * Data-structure : Canvas — flat 2D array of cell descriptors storing which
- *                  H-line and V-line (if any) pass through each terminal cell.
- *                  At render time: 0 lines → space, 1 H-line → ACS_HLINE,
- *                  1 V-line → ACS_VLINE, both → ACS_PLUS (cross symbol).
- *                  Animated trains stored as a pool of (line, progress)
- *                  structs; progress advances along the line's path.
- *
- * Math           : Grid node → terminal cell mapping: linear interpolation
- *                  between left/right margins and top/bottom margins so the
- *                  map fills the terminal regardless of size.  Station name
- *                  placement rotated 90° for vertical lines.
- *
- * References     :
- *   Transit-map design — the look (§4 line building, §5 draw)
- *     [1] Ovenden, "Transit Maps of the World" (2007) — the schematic /
- *         octolinear visual language (Beck's London Underground) this imitates.
- *     [2] Nöllenburg & Wolff, "Drawing and Labeling High-Quality Metro Maps by
- *         Mixed-Integer Programming," IEEE TVCG (2011) — the metro-map layout
- *         problem proper; this file's path templates are a cheap stand-in.
- *   Orthogonal graph layout (§4 H/V/Z path templates)
- *     [3] Di Battista, Eades, Tamassia & Tollis, "Graph Drawing: Algorithms for
- *         the Visualization of Graphs" (1999) — orthogonal (right-angle) edge
- *         routing, what the H_FULL/V_FULL/Z templates produce.
- *   Map label placement (§5 station names)
- *     [4] Imhof, "Positioning Names on Maps," The American Cartographer (1975) —
- *         placing labels clear of features; the perpendicular name rule here.
- *   Procedural generation (§4 build + shuffle)
- *     [5] Shaker, Togelius & Nelson, "Procedural Content Generation in Games"
- *         (2016) — template-based generation + shuffling for per-run variety.
- *   ASCII / terminal rendering (§5 canvas)
- *     [6] Padala, "NCURSES Programming HOWTO" (TLDP) — ACS_HLINE / ACS_VLINE /
- *         ACS_PLUS line-drawing, colour pairs, and the frame model.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A transit map is just a graph drawn with right angles.  The trick to
- * generating one procedurally is to NEVER work in pixel space — work
- * on an 8×6 LOGICAL grid first.  Pick a few path templates that only
- * use horizontal and vertical strokes between grid nodes (H_FULL,
- * V_FULL, Z, REV_Z, DOUBLE_Z), stamp 12–15 of them onto the grid, and
- * map every grid node to a terminal cell at render time.  Where two
- * lines share a grid node, you get an interchange.  Where two lines
- * cross at a non-shared cell, the canvas detects an H-track + V-track
- * coincidence and draws ACS_PLUS.  All of the visual richness comes
- * from those two facts.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine sketching a subway map on graph paper.  You don't draw
- * curves — you draw L-shapes and Z-shapes that snap to grid lines.
- * Each line you draw passes through a sequence of grid nodes; if two
- * lines cross at a node, the node becomes a station with a transfer.
- * The canvas is the "ink layer": each pixel cell remembers which
- * H-line passes through it (h_cp) and which V-line (v_cp).  A cell
- * with both is a junction; one with neither is empty.  Trains are
- * just floating-point cursors that ride one node-to-node segment of
- * a line, bouncing at endpoints — no graph navigation, just t∈[0,N-1].
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Compute terminal coordinates for each grid node:
- *       term_col[i] = mg_c + i · (cols - 2·mg_c)/(GNODES_C-1)
- *       term_row[i] = mg_r + i · (rows - mg_r - 4)/(GNODES_R-1)
- *  2. Shuffle h_rows[GNODES_R] and v_cols[GNODES_C] index arrays so
- *     each new map looks different.
- *  3. Build n_lines = 12 + rand()%4 paths from templates:
- *       3 H_FULL (gc0 → gc1 at one row)
- *       3 V_FULL (gr0 → gr1 at one col)
- *       3 Z_SHAPE (H → V → H, 3 nodes total)
- *       2 REV_Z   (V → H → V)
- *       1 DOUBLE_Z (H → V → H → V → H, two bends)
- *       remaining slots alternate Z and REV_Z.
- *     append_h / append_v skip duplicate nodes at the join points.
- *  4. For each line, register every path node as a station; if the
- *     node already exists, just bump its n_lines counter.  Decide
- *     name_side: H stations use even/odd row parity; V stations use
- *     left/right halfscreen.
- *  5. Fill canvas: for each consecutive (n, n+1) pair of path nodes,
- *     paint h_cp along the row OR v_cp along the column.  Cells that
- *     get both colours are junctions.
- *  6. Pick station names from STATION_POOL (shuffled); cap n_lines≥2
- *     stations as interchanges.
- *  7. Spawn one train per line (max 10): t∈[0, n_path-1] (random
- *     start), spd∈[1.2, 4.0] nodes/sec, dir = ±1.
- *  8. Each frame: trains_tick advances t by dir·spd·dt and bounces
- *     at endpoints.  Render canvas → station dots → trains → names →
- *     legend (3 rows × 5 entries) → HUD.
- *
- * KEY FORMULAS
- * ────────────
- *  Node spacing      step_c = (cols − 2·mg_c) / (GNODES_C − 1)
- *  Train interp      pos = p[n] + frac · (p[n+1] − p[n]),  n=⌊t⌋, frac=t-n
- *  Train bounce      if t≥end: t=end, dir=-1;  if t≤0: t=0, dir=+1
- *  Junction detect   h_cp != 0 && v_cp != 0  ⇒  ACS_PLUS
- *  Interchange test  station.n_lines ≥ 2     ⇒  glyph 'O' (else 'o')
- *  Path templates    Z = H+V+H,  REV_Z = V+H+V,  DOUBLE_Z = H+V+H+V+H
- *  Legend grid       3 rows × 5 cols, entry_w = (cols<100 ? 14 : 16)
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <curses.h>
@@ -147,52 +15,11 @@
 #include <string.h>
 #include <time.h>
 
-/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
- *
- *   LAYER        SECTION  MUTATES
- *   ────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2       nothing — clock primitives (frame cap / dt cap live
- *                           in §6 main)
- *   SIMULATION   §4       the RailMap (stations / lines / trains / terminal
- *                           grid) and g_canvas.  railmap_gen BUILDS the whole
- *                           map (a reset); trains_tick ADVANCES train positions
- *                           each tick.
- *   RENDER       §5       the terminal + colour pairs only; READS the RailMap
- *                           and g_canvas, never writes them.
- *
- *   LOGIC   : minimal — no section.  The only pure decisions are clamp_gc and
- *             two inline tests (junction: h_cp && v_cp; interchange: n_lines≥2),
- *             kept beside the code that uses them.
- *   EFFECTS : ABSENT — a train's look (an A_REVERSE coloured block with head/
- *             body glyphs) is derived at render in draw_trains; no cosmetic
- *             state is stored.
- *   DELAYS  : ABSENT — no pause or timers; the only hold is the frame cap.
- *
- * The canvas is SIM-produced (railmap_gen writes g_canvas) and RENDER-consumed
- * (draw_railmap reads it).  RENDER does no mutation, so reordering or removing
- * any draw cannot change the map.
- *
- * Per-tick combine order — main() (§6) is the only place that advances state:
- *     1. PERFORMANCE  measure dt (capped at 0.15 s)
- *     2. SIMULATION   trains_tick(dt)   — the ONLY per-tick state advance
- *     3. RENDER       screen_render()   — read-only
- *     4. PERFORMANCE  sleep to the frame cap
- *
- * RESET (NOT a tick): railmap_gen rebuilds the entire map + canvas — triggered
- * at startup, by the 'r' key, and on resize, never inside the per-tick advance.
- *
- * User events (keys r / t / T; SIGWINCH resize) mutate the map / theme but are
- * handled in app_key and the resize block (§6), outside the tick.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — grid size, limits, color-pair IDs ── */
 
 #define GNODES_C     8      /* logical grid columns                        */
 #define GNODES_R     6      /* logical grid rows                           */
-#define MAX_STATIONS 48     /* GNODES_C × GNODES_R                        */
+#define MAX_STATIONS 48     /* GNODES_C x GNODES_R                        */
 #define MAX_LINES    15
 #define MAX_PATH     70     /* max grid nodes per line path                */
 #define NAME_LEN     14
@@ -202,23 +29,19 @@
 #define LINES_MIN    12     /* fewest lines per generated map              */
 #define LINES_VAR     4     /* line count = LINES_MIN + rand()%LINES_VAR   */
 
-/*
- * Cell — one terminal character cell of the track "ink layer" (g_canvas).
- *
- * WHY store the H-track and V-track colours SEPARATELY (not one glyph): a cell
- * where a horizontal and a vertical line cross must render as a junction
- * (ACS_PLUS), and we only know it's a crossing if BOTH axes are tagged.  So
- * railmap_gen paints h_cp along horizontal segments and v_cp along verticals,
- * and draw_railmap reads the pair to choose ACS_HLINE / ACS_VLINE / ACS_PLUS
- * (ref [6]).  Painting into a canvas first also lets later lines overlap earlier
- * ones cleanly rather than erasing them.
- *
- * VALUE LOGIC: each is a colour-pair index (CP_LINE0+slot) or 0 = no track on
- * that axis.  unsigned char keeps the 320×90 canvas small (≈57 KB).
- */
 #define CANVAS_COLS 320
 #define CANVAS_ROWS  90
 
+/*
+ * Cell — one character of the off-screen "ink layer" where tracks get painted
+ * before they hit the screen.  We keep the horizontal and vertical track
+ * separate so we can tell when two lines cross: a cell with both a horizontal
+ * AND a vertical track is a junction and gets drawn as a '+'.  Painting into
+ * this layer first also lets later lines sit on top of earlier ones cleanly.
+ *   h_cp, v_cp — color-pair index of the line on that axis (CP_LINE0+slot),
+ *                or 0 meaning "no track here". unsigned char keeps the big
+ *                320x90 canvas small.
+ */
 typedef struct {
     unsigned char h_cp;
     unsigned char v_cp;
@@ -229,17 +52,10 @@ static Cell g_canvas[CANVAS_ROWS][CANVAS_COLS];
 #define NSPS 1000000000LL
 enum { TARGET_FPS = 20 };
 
-/*
- * Color pair layout (pair IDs; used by SIM to tag tracks AND by RENDER):
- *   1–15  : line colours (CP_LINE0 … CP_LINE0+14)
- *   16    : regular station dot
- *   17    : interchange station dot
- *   18    : station name text
- *   19    : HUD data bar (top, yellow)
- *   20    : key hint (bottom, cyan)
- */
+/* Color-pair IDs. The 15 line colors are a contiguous block so a line's
+ * slot maps straight to CP_LINE0+slot. */
 enum {
-    CP_LINE0 = 1,   /* …through CP_LINE0+14 = 15 */
+    CP_LINE0 = 1,   /* line colours occupy 1..15 (CP_LINE0+0 .. +14) */
     CP_STN   = 16,
     CP_XCHG  = 17,
     CP_NAME  = 18,
@@ -247,9 +63,7 @@ enum {
     CP_HINT  = 20,
 };
 
-/* ===================================================================== */
-/* §2  performance — timing primitives (frame cap / dt cap in §6 main)     */
-/* ===================================================================== */
+/* ── §2 performance — monotonic clock and sleep helpers ── */
 
 static int64_t clock_ns(void)
 {
@@ -268,94 +82,88 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  types                                                              */
-/* ===================================================================== */
+/* ── §3 types — grid nodes, stations, lines, trains, the whole map ── */
 
-/* GNode — one node of the 8×6 LOGICAL grid (column gc, row gr).
- *
- * WHY a logical grid at all (orthogonal graph drawing, ref [3]; schematic maps,
- * ref [1]): real transit maps aren't geographic — they're schematic graphs on a
- * coarse grid with only right-angle strokes.  Generating in grid space (not
- * pixels) makes the path templates trivial (a segment is just two grid indices)
- * and keeps lines aligned; term_col/term_row map a node to a terminal cell only
- * at render time, so the same map fits any window size. */
+/*
+ * GNode — one node of the coarse 8x6 logical grid (gc = column, gr = row).
+ * Real subway maps aren't drawn to geographic scale; they're tidy diagrams
+ * snapped to a grid with only right-angle turns. We do all the layout work
+ * in this grid (where a track segment is just two grid indices) and only
+ * convert to actual screen cells at draw time, so one map fits any window.
+ */
 typedef struct { int gc, gr; } GNode;
 
 /*
- * Train — an animated cursor riding one line's GNode path.
- *
- * WHY a float position over a discrete path: the path is a list of grid nodes,
- * but a train must glide smoothly between them, so t ∈ [0, n_path-1] is
- * continuous and the head is linearly interpolated between path[⌊t⌋] and the
- * next node (trains_tick advances t, draw_trains interpolates).  No graph
- * navigation is needed — a train never leaves its one line.
- *
- * VALUE LOGIC: line_idx → which Line; t = fractional path position; spd in
- * path-nodes/second; dir = +1 / −1, flipped at either endpoint so the train
- * bounces back and forth rather than wrapping.
+ * Train — a little marker that glides along one line's path of grid nodes.
+ * The path is a list of nodes, but we want smooth motion between them, so the
+ * position is a fractional number: a t of 2.5 means "halfway between node 2
+ * and node 3". A train never leaves its own line; it just slides back and
+ * forth, flipping direction at each end.
+ *   line_idx — which Line this train rides
+ *   t        — position along that line's path; 0 .. (n_path-1)
+ *   spd      — how fast it moves, in path-nodes per second
+ *   dir      — +1 going forward, -1 going back; flips at the ends
  */
 typedef struct {
     int   line_idx;
-    float t;          /* current position along path                        */
-    float spd;        /* path-units / second                                */
-    int   dir;        /* +1 forward, -1 reverse                             */
+    float t;
+    float spd;
+    int   dir;
 } Train;
 
-/* Station — a stop at one grid node (the interchange concept, ref [1]).
- *
- * WHY n_lines is the key field: a node visited by ≥2 lines IS an interchange —
- * the most important feature of a transit map — so it's counted on first visit
- * and drawn larger ('O' vs 'o').  WHY dir_h + name_side: a label must not sit on
- * the track, so the name is written perpendicular to the local line direction
- * (the map-labelling problem, ref [4]) — above/below a horizontal station,
- * left/right a vertical one.
- *
- * VALUE LOGIC: gc,gr = grid node; col,row = its terminal cell (cached from the
- * grid→cell map); n_lines ≥ 2 ⇒ interchange; dir_h = sits on a horizontal
- * segment; name_side = +1/−1 offset direction, chosen from row parity (H
- * station) or screen half (V station). */
+/*
+ * Station — a stop sitting on one grid node.
+ * The key field is n_lines: a stop where two or more lines meet is an
+ * interchange (a transfer point), the most important feature on a transit
+ * map, so we draw it bigger ('O' instead of 'o'). The name has to be placed
+ * off the track so it stays readable, so we record which way the track runs
+ * through here (dir_h) and which side to push the label (name_side).
+ *   gc, gr     — grid node this stop lives on
+ *   col, row   — its actual screen cell, cached from the grid->screen map
+ *   name       — display name (from a shuffled pool)
+ *   n_lines    — how many lines pass through; 2 or more means interchange
+ *   dir_h      — true if the track runs horizontally through this stop
+ *   name_side  — +1 or -1: which side of the track to write the label on
+ */
 typedef struct {
     int  gc, gr;
-    int  col, row;          /* terminal cell position                      */
+    int  col, row;
     char name[NAME_LEN];
-    int  n_lines;           /* lines passing through; ≥2 = interchange     */
-    bool dir_h;             /* primary direction at this station           */
-    int  name_side;         /* +1 or −1 depending on dir_h                 */
+    int  n_lines;
+    bool dir_h;
+    int  name_side;
 } Station;
 
-/* Line — one transit line: an ordered path of grid nodes plus its identity.
- *
- * WHY an explicit node path (orthogonal layout, ref [3]; template PCG, ref [5]):
- * each line is stamped from a template (H_FULL / V_FULL / Z / REV_Z / DOUBLE_Z)
- * as a sequence of right-angle segments; storing the resolved node list lets
- * station registration, canvas fill and train motion all just walk path[].
- *
- * VALUE LOGIC: path[0..n_path-1] = grid nodes in order; label 'A'–'O' + lname
- * are the legend identity; cp = the line's colour pair (CP_LINE0+slot), shared
- * by its track cells AND its train so the whole line reads as one colour
- * (ref [1]). */
+/*
+ * Line — one transit line: the ordered list of grid nodes it runs through,
+ * plus its identity. Each line is stamped out from one of five shape templates
+ * (straight across, straight down, or various zig-zags) as a run of right-angle
+ * segments. Storing the final node list lets the rest of the code (stations,
+ * track painting, train motion) just walk path[] without re-deriving the shape.
+ *   path, n_path — the grid nodes in order
+ *   label        — legend letter 'A'..'O'
+ *   lname        — legend name, e.g. "CENTRAL"
+ *   cp           — color pair shared by this line's tracks AND its train, so
+ *                  the whole line reads as one color
+ */
 typedef struct {
     GNode path[MAX_PATH];
     int   n_path;
-    char  label;            /* 'A'–'O'                                     */
+    char  label;
     char  lname[LNAME_LEN];
-    int   cp;               /* color pair                                  */
+    int   cp;
 } Line;
 
-/* RailMap — the whole procedurally generated network (template PCG, ref [5]; the
- * metro-map layout problem, ref [2], here approximated by templates instead of
- * full optimisation).
- *
- * WHY one aggregate holds it all: the map is generated as a unit (railmap_gen)
- * and its parts cross-reference by index (Train.line_idx → lines[]; stations
- * share grid nodes), so stations, lines and trains belong together.  term_col/
- * term_row are the grid→terminal mapping computed once per (re)generation so the
- * map fills the current window (the linear-interpolation step in ALGORITHM).
- *
- * VALUE LOGIC: stations/lines/trains + their counts; n_xchg = interchange count
- * (cached for the HUD); theme = active palette index; term_col[gc]/term_row[gr]
- * = terminal cell of each grid index. */
+/*
+ * RailMap — the whole generated network in one place. The pieces refer to each
+ * other by index (a Train points at lines[], stations share grid nodes), and
+ * the whole thing is built or rebuilt as a unit, so they live together.
+ *   stations/lines/trains + counts — the network contents
+ *   n_xchg     — number of interchange stops, cached for the HUD readout
+ *   theme      — active color palette index
+ *   term_col[gc], term_row[gr] — screen column/row for each grid index;
+ *                recomputed on every (re)generation so the map fills the window
+ */
 typedef struct {
     Station stations[MAX_STATIONS];
     int     n_stations;
@@ -364,29 +172,28 @@ typedef struct {
     Train   trains[MAX_TRAINS];
     int     n_trains;
     int     theme;
-    int     n_xchg;         /* interchange count (for HUD)                 */
+    int     n_xchg;
     int     term_col[GNODES_C];
     int     term_row[GNODES_R];
 } RailMap;
 
-/* Scene — the framework aggregate: WHAT is shown (the RailMap) plus WHERE we are
- * (the terminal size the map was laid out for).  cols/rows are cached so a
- * resize can re-lay the map (railmap_gen) to fill the new window. */
+/* Scene — what's shown (the map) plus the window size it was laid out for.
+ * cols/rows are kept so a resize can re-lay the map to fill the new window. */
 typedef struct {
     RailMap map;
     int     cols, rows;
 } Scene;
 
-/* Screen — the ncurses display surface: cached terminal size in cells, re-read
- * at init and on resize. */
+/* Screen — the terminal size in cells, re-read at startup and on resize. */
 typedef struct { int cols, rows; } Screen;
 
-/* App — process-level glue: the scene, its display, and the two signal flags.
- *
- * WHY global (g_app): POSIX signal handlers take no user-data argument, so the
- * SIGINT/SIGTERM/SIGWINCH handler reaches running/need_resize through a
- * file-scope object; volatile sig_atomic_t is the one type the C standard
- * guarantees is safe to write in a handler and read in the loop. */
+/*
+ * App — everything the program holds at once: the scene, the screen, and two
+ * flags set by signal handlers. It's a single global because POSIX signal
+ * handlers get no user pointer, so the handler reaches these flags through a
+ * file-scope object. volatile sig_atomic_t is the only type C promises is safe
+ * to set in a handler and read in the main loop.
+ */
 typedef struct {
     Scene                 scene;
     Screen                screen;
@@ -394,9 +201,7 @@ typedef struct {
     volatile sig_atomic_t need_resize;
 } App;
 
-/* ===================================================================== */
-/* §4  simulation — builds the map (reset) and advances trains (tick)      */
-/* ===================================================================== */
+/* ── §4 simulation — generate the map and move the trains ── */
 
 /* ── name / label pools ── */
 
@@ -420,7 +225,7 @@ static const char *STATION_POOL[] = {
 };
 #define N_POOL  (int)(sizeof STATION_POOL / sizeof STATION_POOL[0])
 
-/* 15 line names — one per slot */
+/* One name per line slot. */
 static const char *LINE_NAMES[15] = {
     "EXPRESS",  "CENTRAL",  "CIRCLE",  "DISTRICT", "JUBILEE",
     "ORBITAL",  "RAPID",    "METRO",   "PIONEER",  "ECLIPSE",
@@ -438,8 +243,10 @@ static void shuffle_ints(int *a, int n)
 }
 
 /*
- * append_h / append_v — grow a GNode path with a horizontal / vertical
- * segment, skipping the first node when it duplicates the current tail.
+ * append_h / append_v — add a straight horizontal / vertical run of grid nodes
+ * to a path. If the first new node is the same as the path's current end (which
+ * happens where two segments meet at a corner), it's skipped so the join isn't
+ * duplicated.
  */
 static int append_h(GNode *p, int n, int gc0, int gc1, int gr)
 {
@@ -488,9 +295,9 @@ static void line_set_identity(Line *l, int li)
     strncpy(l->lname, LINE_NAMES[li], LNAME_LEN-1);
 }
 
-/* compute_term_grid — map each logical grid index to a terminal cell, spreading
- * the 8×6 grid across the window with margins (bottom 4 rows reserved for the
- * legend + hint).  This is the only place grid space meets pixel space. */
+/* Work out the screen column/row for each grid index, spreading the grid evenly
+ * across the window with a margin around it (the bottom 4 rows are saved for the
+ * legend and key hint). This is the one place the logical grid becomes pixels. */
 static void compute_term_grid(RailMap *m, int cols, int rows)
 {
     int mg_c = cols / 10;
@@ -513,9 +320,9 @@ static void compute_term_grid(RailMap *m, int cols, int rows)
     }
 }
 
-/* build_lines — stamp 12–15 lines from the five path templates onto the grid:
- * 3 H_FULL, 3 V_FULL, 3 Z, 2 REV_Z, 1 DOUBLE_Z, then alternate Z / REV_Z to
- * fill.  Shuffled row/col pools spread the full lines so each map differs. */
+/* Lay down 12-15 lines on the grid using the five shape templates (a few of
+ * each, then alternating zig-zags to fill out the count). The row/column pools
+ * are shuffled first so the straight lines land in different places each run. */
 static void build_lines(RailMap *m)
 {
     /* ── shuffled pools for rows, cols ── */
@@ -526,7 +333,7 @@ static void build_lines(RailMap *m)
     shuffle_ints(v_cols, GNODES_C);
 
     /* ── line count and order ── */
-    int n_lines = LINES_MIN + rand() % LINES_VAR;   /* 12–15 */
+    int n_lines = LINES_MIN + rand() % LINES_VAR;   /* 12-15 */
     if (n_lines > MAX_LINES) n_lines = MAX_LINES;
 
     int li = 0;
@@ -629,9 +436,9 @@ static void build_lines(RailMap *m)
     m->n_lines = n_lines;
 }
 
-/* register_line_stations — turn every node on a line's path into a Station
- * (creating it, or bumping n_lines if shared), and on first creation decide the
- * name side (perpendicular to the local track). */
+/* Turn every node on a line's path into a station (creating it, or bumping its
+ * line count if another line already stops there). The first time a station is
+ * created we decide which side its label goes, off the track. */
 static void register_line_stations(RailMap *m, const Line *l, int cols)
 {
     for (int pi = 0; pi < l->n_path; pi++) {
@@ -644,26 +451,26 @@ static void register_line_stations(RailMap *m, const Line *l, int cols)
         s->row = m->term_row[gr];
 
         if (first) {
-            /* determine if this node sits on an H or V segment */
+            /* does the track run horizontally through this stop? */
             bool h_nbr =
                 (pi > 0           && l->path[pi-1].gr == gr) ||
                 (pi < l->n_path-1 && l->path[pi+1].gr == gr);
             s->dir_h = h_nbr;
 
             if (h_nbr) {
-                /* H station: alternate names above/below by grid row */
+                /* horizontal stop: put the name above or below, alternating by row */
                 s->name_side = (gr % 2 == 0) ? 1 : -1;
             } else {
-                /* V station: right if in left half, left if right half */
+                /* vertical stop: name on the right if near the left edge, else left */
                 s->name_side = (m->term_col[gc] < cols / 2) ? 1 : -1;
             }
         }
     }
 }
 
-/* paint_line_to_canvas — tag g_canvas cells along each segment of a line's path
- * with the line's colour: h_cp on horizontal runs, v_cp on vertical runs.  A
- * cell that gets both becomes a junction at render time. */
+/* Paint a line's color onto the canvas cell by cell: along horizontal runs the
+ * color goes in h_cp, along vertical runs in v_cp. A cell that ends up with both
+ * is where two lines cross, and it'll be drawn as a junction. */
 static void paint_line_to_canvas(const RailMap *m, const Line *l)
 {
     for (int pi = 0; pi < l->n_path - 1; pi++) {
@@ -710,8 +517,9 @@ static void count_interchanges(RailMap *m)
         if (m->stations[i].n_lines >= 2) m->n_xchg++;
 }
 
-/* spawn_trains — one train per line (capped at MAX_TRAINS), with staggered start
- * positions, randomised speed (1.2–4.0 nodes/s) and direction. */
+/* Put one train on each line (up to the train cap), starting at a random spot
+ * along the line so they don't all bunch together, at a random speed and
+ * direction. */
 static void spawn_trains(RailMap *m)
 {
     m->n_trains = m->n_lines < MAX_TRAINS ? m->n_lines : MAX_TRAINS;
@@ -721,15 +529,15 @@ static void spawn_trains(RailMap *m)
         tr->line_idx = i;
         /* stagger start positions so trains don't bunch at t=0 */
         tr->t   = (float)(rand() % (l->n_path > 1 ? l->n_path - 1 : 1));
-        tr->spd = 1.2f + (float)(rand() % 28) * 0.1f;   /* 1.2–4.0 nodes/s */
+        tr->spd = 1.2f + (float)(rand() % 28) * 0.1f;   /* 1.2-4.0 nodes/s */
         tr->dir = (rand() % 2) ? +1 : -1;
     }
 }
 
 /*
- * railmap_gen — build a fresh map (the RESET operation), top-to-bottom:
- *   grid coords → lines from templates → stations + canvas → names →
- *   interchange count → trains.  Preserves the theme across the wipe.
+ * Build a whole fresh map from scratch: lay out the grid, draw the lines, turn
+ * their nodes into stations and paint the tracks, name the stations, count the
+ * interchanges, then spawn the trains. The color theme is kept across the wipe.
  */
 static void railmap_gen(RailMap *m, int cols, int rows)
 {
@@ -751,10 +559,8 @@ static void railmap_gen(RailMap *m, int cols, int rows)
     spawn_trains(m);
 }
 
-/*
- * trains_tick — advance all train positions by dt seconds.
- * Trains bounce at the ends of their line paths.  The ONLY per-tick mutator.
- */
+/* Move every train forward by dt seconds, reversing direction when one hits
+ * either end of its line so it bounces back. */
 static void trains_tick(RailMap *m, float dt)
 {
     for (int i = 0; i < m->n_trains; i++) {
@@ -778,26 +584,26 @@ static void scene_init(Scene *sc, int cols, int rows)
     railmap_gen(&sc->map, cols, rows);
 }
 
-/* ===================================================================== */
-/* §5  render — state → screen; reads only, never mutates sim state        */
-/* ===================================================================== */
+/* ── §5 render — draw the map to the screen; never changes the map ── */
 
-/* Theme — a transit-map palette (ref [1]).
- *
- * WHY one hue per line: distinguishing lines by colour is the defining
- * convention of the schematic transit map (Beck's Underground), so a theme is
- * really "15 maximally-distinct hues + 3 accents".  Cycled with t/T and loaded
- * into colour pairs by color_apply_theme.
- *
- * VALUE LOGIC: line_fg[slot] colours line `slot` (and its train, via cp);
- * stn_fg/xchg_fg/name_fg colour the dots and labels.  All entries are 256-colour
- * cube indices, kept in the bright half so they read on the default background. */
+/*
+ * Theme — one color palette for the map. Telling lines apart by color is the
+ * whole point of a subway map, so a theme is really 15 distinct line colors plus
+ * a few accent colors. Cycle through them with t/T.
+ *   name    — palette name shown in the HUD
+ *   line_fg — one color per line slot (also used for that line's train)
+ *   stn_fg  — regular station dot
+ *   xchg_fg — interchange station dot
+ *   name_fg — station name text
+ * All colors are 256-color indices, kept in the bright half so they stay
+ * readable on the default background.
+ */
 typedef struct {
     const char *name;
-    int line_fg[15];    /* one colour per line slot                        */
-    int stn_fg;         /* regular station dot                             */
-    int xchg_fg;        /* interchange station dot                         */
-    int name_fg;        /* station name text                               */
+    int line_fg[15];
+    int stn_fg;
+    int xchg_fg;
+    int name_fg;
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -897,15 +703,11 @@ static void color_init(int theme)
 }
 
 /*
- * draw_trains — render each train on top of the canvas.
- *
- * Horizontal train (moving right): ## 0   (body ## + head 0 at the front)
- * Horizontal train (moving left):   0 ##
- * Vertical train   (moving down):   head 0 at bottom, ## above it
- * Vertical train   (moving up):     head 0 at top, ## below it
- *
- * A_REVERSE swaps fg/bg so the train appears as a solid coloured block —
- * clearly distinct from the thin ACS line characters of the track.
+ * Draw each train on top of the tracks. A train is a short bar: a '0' head with
+ * a '##' body trailing behind it, oriented along its current segment and always
+ * with the head facing the way it's going. A_REVERSE swaps foreground and
+ * background so the train shows up as a solid colored block, easy to tell apart
+ * from the thin track lines.
  */
 static void draw_trains(WINDOW *win, const RailMap *m, int cols, int rows)
 {
@@ -915,7 +717,7 @@ static void draw_trains(WINDOW *win, const RailMap *m, int cols, int rows)
         const Train *tr = &m->trains[i];
         const Line  *l  = &m->lines[tr->line_idx];
 
-        /* ── find current segment ── */
+        /* which segment is the train on, and how far along it (f, 0..1)? */
         int n = (int)tr->t;
         if (n >= l->n_path - 1) n = l->n_path - 2;
         if (n < 0) n = 0;
@@ -926,7 +728,7 @@ static void draw_trains(WINDOW *win, const RailMap *m, int cols, int rows)
         int c0  = m->term_col[gc0], r0  = m->term_row[gr0];
         int c1  = m->term_col[gc1], r1  = m->term_row[gr1];
 
-        /* interpolated terminal position of the head */
+        /* screen cell of the head, blended between the two segment ends */
         int c = (int)(c0 + f * (float)(c1 - c0) + 0.5f);
         int r = (int)(r0 + f * (float)(r1 - r0) + 0.5f);
 
@@ -939,15 +741,14 @@ static void draw_trains(WINDOW *win, const RailMap *m, int cols, int rows)
         wattron(win, attr);
 
         if (horiz) {
-            /* heading right when segment goes right AND dir=+1, or left AND dir=-1 */
             bool go_right = ((c1 >= c0) == (tr->dir > 0));
             if (go_right) {
-                /* body ## trails left of head 0 */
+                /* body trails to the left of the head */
                 if (c - 2 >= 0)     mvwaddch(win, r, c - 2, '#');
                 if (c - 1 >= 0)     mvwaddch(win, r, c - 1, '#');
                 mvwaddch(win, r, c, '0');
             } else {
-                /* head 0 leads, body ## trails right */
+                /* body trails to the right of the head */
                 mvwaddch(win, r, c, '0');
                 if (c + 1 < cols)   mvwaddch(win, r, c + 1, '#');
                 if (c + 2 < cols)   mvwaddch(win, r, c + 2, '#');
@@ -972,8 +773,8 @@ static void draw_trains(WINDOW *win, const RailMap *m, int cols, int rows)
     }
 }
 
-/* draw_canvas — paint the track ink layer: ACS_HLINE / ACS_VLINE, or ACS_PLUS
- * where an H-track and V-track coincide (a junction). */
+/* Draw the painted track layer onto the screen: a horizontal line, a vertical
+ * line, or a '+' junction where a cell has both a horizontal and vertical track. */
 static void draw_canvas(WINDOW *win, int cols, int rows)
 {
     int r_lo = 1;
@@ -986,7 +787,7 @@ static void draw_canvas(WINDOW *win, int cols, int rows)
 
             chtype ch; int cp;
             if (cl->h_cp && cl->v_cp) {
-                ch = ACS_PLUS;  cp = cl->h_cp;   /* H-line colour wins at junction */
+                ch = ACS_PLUS;  cp = cl->h_cp;   /* at a crossing the horizontal line's colour wins */
             } else if (cl->h_cp) {
                 ch = ACS_HLINE; cp = cl->h_cp;
             } else {
@@ -999,8 +800,7 @@ static void draw_canvas(WINDOW *win, int cols, int rows)
     }
 }
 
-/* draw_stations — a dot at each station over the tracks: 'O' interchange, 'o'
- * regular. */
+/* Put a dot at each station: 'O' for an interchange, 'o' for a regular stop. */
 static void draw_stations(WINDOW *win, const RailMap *m, int cols, int rows)
 {
     for (int i = 0; i < m->n_stations; i++) {
@@ -1016,8 +816,8 @@ static void draw_stations(WINDOW *win, const RailMap *m, int cols, int rows)
     }
 }
 
-/* draw_station_names — write each name perpendicular to its local track,
- * clamped inside the visible map area. */
+/* Write each station's name beside it, off to the side of its track, nudged back
+ * inside the visible area if it would run off an edge. */
 static void draw_station_names(WINDOW *win, const RailMap *m, int cols, int rows)
 {
     for (int i = 0; i < m->n_stations; i++) {
@@ -1026,11 +826,11 @@ static void draw_station_names(WINDOW *win, const RailMap *m, int cols, int rows
         int nc, nr;
 
         if (s->dir_h) {
-            /* H station: name above or below */
+            /* horizontal stop: name centered above or below the dot */
             nc = s->col - nlen / 2;
             nr = s->row + s->name_side;
         } else {
-            /* V station: name right or left */
+            /* vertical stop: name to the right or left of the dot */
             nr = s->row;
             nc = (s->name_side > 0) ? s->col + 2 : s->col - nlen - 1;
         }
@@ -1046,11 +846,11 @@ static void draw_station_names(WINDOW *win, const RailMap *m, int cols, int rows
     }
 }
 
-/* draw_legend — the line key: 3 rows of up to 5 "[label]name" slots in each
- * line's colour, across the reserved bottom margin. */
+/* Draw the line key along the bottom: up to 5 "[letter]name" entries per row,
+ * 3 rows, each in its line's color. */
 static void draw_legend(WINDOW *win, const RailMap *m, int cols, int rows)
 {
-    int entry_w = (cols < 100) ? 14 : 16;   /* chars per legend slot  */
+    int entry_w = (cols < 100) ? 14 : 16;   /* width of one legend entry */
     int per_row = 5;
     int li      = 0;
     for (int row_off = 0; row_off < 3; row_off++) {
@@ -1067,8 +867,7 @@ static void draw_legend(WINDOW *win, const RailMap *m, int cols, int rows)
     }
 }
 
-/* draw_hud — data readout top-right (yellow) + key hint bottom-left (cyan),
- * each clipped to the window width so it never wraps. */
+/* Draw the status line along the top and the key hint along the bottom. */
 static void draw_hud(WINDOW *win, const RailMap *m, int cols, int rows)
 {
     char buf[160];
@@ -1078,7 +877,7 @@ static void draw_hud(WINDOW *win, const RailMap *m, int cols, int rows)
              m->theme, THEMES[m->theme].name,
              m->n_lines, m->n_stations, m->n_xchg);
     wattron(win, COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvwprintw(win, 0, 0, "%.*s", cols, buf);   /* clip to width — never wrap */
+    mvwprintw(win, 0, 0, "%.*s", cols, buf);   /* clip to window width so it can't wrap */
     wattroff(win, COLOR_PAIR(CP_HUD) | A_BOLD);
 
     wattron(win, COLOR_PAIR(CP_HINT) | A_BOLD);
@@ -1086,10 +885,8 @@ static void draw_hud(WINDOW *win, const RailMap *m, int cols, int rows)
     wattroff(win, COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/*
- * draw_railmap — composite the frame back-to-front so each layer overwrites the
- * one beneath: tracks → station dots → trains → names → legend → HUD.
- */
+/* Draw the whole frame bottom layer first so each layer covers the one below:
+ * tracks, then station dots, then trains, then names, then legend, then HUD. */
 static void draw_railmap(WINDOW *win, const RailMap *m, int cols, int rows)
 {
     draw_canvas(win, cols, rows);
@@ -1120,9 +917,7 @@ static void screen_render(const Screen *sc, const Scene *s)
     doupdate();
 }
 
-/* ===================================================================== */
-/* §6  app — combine point (per-tick order) + user events + frame cap      */
-/* ===================================================================== */
+/* ── §6 app — main loop, keys, signals, frame timing ── */
 
 static App g_app;
 
@@ -1133,7 +928,7 @@ static void on_signal(int sig)
 }
 static void cleanup(void) { endwin(); }
 
-/* User event — mutates the map / theme, but NOT part of the tick. */
+/* Handle a key: q/ESC quits, r builds a new map, t/T cycle the color theme. */
 static bool app_key(App *app, int ch)
 {
     RailMap *m = &app->scene.map;
@@ -1174,13 +969,13 @@ int main(void)
     int64_t prev     = clock_ns();
 
     while (app->running) {
-        /* 1. PERFORMANCE — measure dt, capped after pauses / resize */
+        /* seconds since last frame; cap it so a long stall doesn't jump the world */
         int64_t now = clock_ns();
         float   dt  = (float)(now - prev) * 1e-9f;
         if (dt > 0.15f) dt = 0.15f;
         prev = now;
 
-        /* USER EVENT (out of tick): resize → full RESET (railmap_gen) */
+        /* window resized: rebuild the whole map to fit the new size */
         if (app->need_resize) {
             int saved = app->scene.map.theme;
             screen_resize(&app->screen);
@@ -1188,22 +983,18 @@ int main(void)
             scene_init(&app->scene, app->screen.cols, app->screen.rows);
             color_apply_theme(saved);
             app->need_resize = 0;
-            prev = clock_ns();   /* reset timer so resize spike doesn't teleport trains */
+            prev = clock_ns();   /* restart the clock so the resize gap doesn't teleport trains */
             continue;
         }
 
-        /* 2. SIMULATION — the only per-tick state advance */
         trains_tick(&app->scene.map, dt);
-
-        /* 3. RENDER — read-only */
         screen_render(&app->screen, &app->scene);
 
-        /* USER EVENT (out of tick): key handling */
         int key = getch();
         if (key != ERR && !app_key(app, key))
             app->running = 0;
 
-        /* 4. PERFORMANCE — sleep to the frame cap */
+        /* sleep off the rest of the frame to hold a steady frame rate */
         clock_sleep_ns(frame_ns - (clock_ns() - now));
     }
 

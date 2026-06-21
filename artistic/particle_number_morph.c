@@ -1,131 +1,11 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * particle_number_morph.c — Solid Particle Number Morphing (LERP)
+ * particle_number_morph.c — particles morph through the digits 0..9.
  *
- * Up to 500 particles densely fill every pixel of a large bitmap font,
- * cycling digits 0 → 1 → 2 → … → 9 → 0.
- *
- * On each digit change a greedy nearest-neighbour match assigns every
- * particle the closest target in the new digit.  Positions are then
- * linearly interpolated (smoothstep easing) from their snapshot at the
- * moment of change to the new target — no spring forces, no velocity.
- * The result is a clean, deterministic glide between shapes.
- *
- * Idle particles (excess over the new digit's count) glide back to the
- * digit centre and become invisible, then rejoin the swarm on future
- * digits that need more particles.
- *
- * Font: 9-row × 7-col bitmap, each '#' expanded to a sub-grid of
- * particles scaled to the terminal (up to 3 rows × 4 cols per pixel).
- *
- * Keys:
- *   q / ESC   quit
- *   p / spc   pause / resume
- *   n         next digit immediately
- *   ] / [     hold time longer / shorter
- *   f / F     morph faster / slower
- *   t / T     next / prev theme  (Neon/Fire/Ice/Plasma/Mono)
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra particle_number_morph.c \
- *       -o particle_number_morph -lncurses -lm
- *
- * §1  config & font     §2  performance    §3  logic
- * §4  simulation        §5  render          §6  app
+ * Up to 500 dots fill in a big bitmap font and glide from one digit's
+ * shape to the next. Greedy matching pairs each dot to its nearest pixel
+ * in the new digit; smoothstep easing slides them there. No physics.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Greedy nearest-neighbour bipartite matching + LERP morph.
- *                  On digit change: build target set for new digit; for each
- *                  particle, find closest unassigned target (O(P·T) greedy
- *                  scan); then linearly interpolate position from snapshot
- *                  to target over MORPH_FRAMES frames using smoothstep easing.
- *
- * Math           : Smoothstep easing: f(t) = 3t² − 2t³, t ∈ [0,1].
- *                  Produces S-curve acceleration at start and deceleration at
- *                  end — more visually pleasing than linear interpolation.
- *                  Bitmap font: 9-row × 7-col bitmap; each '#' pixel expanded
- *                  to a sub-grid of particles scaled to terminal dimensions.
- *
- * Performance    : Greedy matching is O(P·T) per digit change but only runs
- *                  once per transition (not per frame).  Per-frame cost is
- *                  O(P) position update + draw — cheap at P≤500.
- *
- * Rendering      : Particle colour based on proximity to target: settled
- *                  particles show theme colour; particles in flight fade
- *                  through a gradient based on interpolation progress t.
- *
- * References     :
- *   Particle→target matching & morph (§4 digit_assign, parts_update)
- *     [1] Kuhn, "The Hungarian Method for the Assignment Problem," Naval
- *         Research Logistics Quarterly 2 (1955) — the optimal particle↔target
- *         assignment; this file uses the cheap O(P·T) greedy approximation.
- *     [2] Reeves, "Particle Systems — A Technique for Modeling a Class of
- *         Fuzzy Objects," ACM TOG 2(2) (1983) — the pool-of-points model whose
- *         collective motion forms the digit.
- *   Easing (§3 smoothstep)
- *     [3] Penner, "Robert Penner's Easing Functions" (2002) — the S-curve
- *         ease-in/ease-out used to glide particles between shapes.
- *     [4] Perlin, "Improving Noise," ACM SIGGRAPH (2002) — the cubic Hermite
- *         smoothstep 3t²−2t³ (and its smootherstep cousin) behind the easing.
- *   ASCII rendering substrate (§5 parts_draw)
- *     [5] Bourke, "Character representation of grey scale images" (1997) — the
- *         progress → glyph ramp ('.' → '+' → '#' → '@').
- *     [6] Padala, "NCURSES Programming HOWTO" (TLDP) — colour pairs and the
- *         erase → draw → refresh frame model.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * No physics, no springs. Each digit transition is a one-shot global
- * problem: "given 500 particles in their current poses, snap a snapshot,
- * pair every particle with the nearest unclaimed pixel of the new digit,
- * then slide everyone there in lockstep over MORPH_FRAMES frames using a
- * smoothstep curve." Once the snapshot is taken, particles are just
- * interpolating along straight lines — predictable, jitter-free, fast.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Think of it as a camera-track shot rather than a flock. At t=0 the
- * camera (the global lerp parameter) is at 0% and every particle stands at
- * its old pose. By t=1 every particle is parked exactly on a target pixel
- * of the new digit. Smoothstep gives the shot a soft start and soft end so
- * eyes follow comfortably. Idle particles (excess from a sparser digit
- * like "1") are sent to the digit centre and fade out together.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Precompute targets: for each digit 0..9, walk the 9×7 bitmap, expand
- *     every '#' pixel into a sub-grid of g_suby × g_subx points, store in
- *     g_targets[d].x/.y[0..g_targets[d].n-1].
- *  2. On digit change (digit_assign):
- *       a. Snapshot every particle's current (x,y) into (ox,oy).
- *       b. For each of n=g_targets[digit].n targets, scan all unclaimed
- *          particles, pick the one with smallest squared distance, mark
- *          claimed and write target.
- *       c. Unclaimed particles are sent to (cx,cy) and marked inactive.
- *       d. Reset g_morph_t = 0.
- *  3. Per frame (parts_update): t += 1/morph_frames, st = 3t²−2t³,
- *     x = ox + st·(tx − ox).
- *  4. Render: glyph escalates with st (.→+→#→@); inactive particles fade
- *     out once g_morph_t hits 1.
- *  5. Hold timer increments only after the morph completes; on overflow
- *     trigger digit_assign(next).
- *
- * KEY FORMULAS
- * ────────────
- *  smoothstep(t) = 3t² − 2t³        S-curve ease, derivatives 0 at 0 and 1
- *  x(t) = ox + smoothstep(t)·(tx−ox)  per-axis lerp from snapshot to target
- *  greedy match cost: argmin_p ‖p − target_t‖²    O(P·T) per transition
- *  digit width  = FONT_C × g_sx     pixels in cells
- *  particle target count: g_targets[d].n = (#-pixels) × g_suby × g_subx
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -137,57 +17,14 @@
 #include <string.h>
 #include <time.h>
 
-/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
- *
- * Four real layers; two are intentionally absent.
- *
- *   LAYER        SECTION  MUTATES
- *   ────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2       nothing — clock primitives (frame cap + fps in §6)
- *   LOGIC        §3       nothing — pure smoothstep (eased t)
- *   SIMULATION   §4       scene geometry (g_rows/g_cols, the scale & sub-grid
- *                           sizes), the digit target tables (g_targets[]),
- *                           the particle pool
- *                           g_parts[] and the morph clock g_morph_t; advances
- *                           the PRNG g_lcg.
- *   RENDER       §5       the terminal + colour pairs only; READS the particles,
- *                           never writes them.
- *
- *   EFFECTS  : ABSENT — a particle's glyph ('.'→'+'→'#'→'@') and the idle fade
- *              are derived at render time from the morph progress
- *              (smoothstep(g_morph_t)), never stored as cosmetic state.
- *   DELAYS   : the morph clock g_morph_t and the post-morph hold timer
- *              (hold_tick → hold_max) plus the pause flag are inline counters in
- *              §4 / §6, not a module.
- *
- * LOGIC (§3) is provably uncorruptable from RENDER: it does no mutation and no
- * I/O, so deleting or reordering any draw cannot change smoothstep.
- *
- * Per-tick combine order — main() (§6) is the only place that advances state:
- *     1. PERFORMANCE  frame_start timestamp                       §6
- *     2. SIMULATION   parts_update()  (lerp)  [skipped if paused]  §4
- *     3. DELAYS       after the morph completes, hold_tick++ →
- *                       digit_assign(next) when it overflows        §6 + §4
- *     4. RENDER       parts_draw + hud_draw                        §5
- *     5. PERFORMANCE  fps tally + sleep to RENDER_NS               §6
- *
- * User events (keys: quit/pause/next/hold/speed/theme; SIGWINCH resize) mutate
- * state but are NOT part of the tick — handled before it (§6 input drain and the
- * g_need_resize block, which re-run scale_compute / targets_precompute and
- * digit_assign).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ===================================================================== */
-/* §1  config & font                                                      */
-/* ===================================================================== */
+/* ── §1 config & font — tunable constants and the 9×7 bitmap digits ── */
 
 #define RENDER_FPS  30
 #define RENDER_NS  (1000000000LL / RENDER_FPS)
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS   1000000LL
 
-/* Bitmap font — '#' = filled, ' ' = empty.  9 rows × 7 cols. */
+/* Each digit is drawn as a tiny picture: '#' means filled, ' ' means empty. */
 #define FONT_R  9
 #define FONT_C  7
 
@@ -214,41 +51,39 @@ static const char k_font[10][FONT_R][FONT_C + 1] = {
                " ######", "     ##", "     ##", "##   ##", " ##### " },
 };
 
-/* Particle pool — digit 8 has 39 '#' pixels, max sub = 3×4 = 12 → 468 < 500 */
+/* Pool size: the densest digit needs ~468 dots, so 500 leaves headroom. */
 #define N_PARTS     500
 #define SUB_Y_MAX   3
 #define SUB_X_MAX   4
 
-/* Lerp timing */
+/* How many frames a morph takes — fewer = faster glide. */
 #define MORPH_FRAMES_MIN   10   /* ~0.33 s */
 #define MORPH_FRAMES_DEF   40   /* ~1.33 s */
 #define MORPH_FRAMES_MAX  120   /* ~4 s    */
+
+/* How long a finished digit sits still before morphing to the next. */
 #define HOLD_MIN    20
-#define HOLD_DEF    60    /* frames to hold after morph completes */
+#define HOLD_DEF    60
 #define HOLD_MAX   200
 
-/* Layout / scatter */
 #define FONT_HEIGHT_FRAC 0.65f  /* digit fills this fraction of screen height */
-#define SCATTER_SPAN     1.5f   /* initial scatter box = this × digit box     */
+#define SCATTER_SPAN     1.5f   /* startup scatter box = this × the digit box */
 
-/* Render glyph ramp by morph progress st (parts_draw) */
-#define GLYPH_SETTLED    0.92f  /* st > this: '@' settled                     */
-#define GLYPH_NEAR       0.55f  /* st > this: '#' nearly there                */
-#define GLYPH_MID        0.20f  /* st > this: '+' mid-flight; else '.'        */
+/* Glyph thresholds: as a dot settles it grows '.' -> '+' -> '#' -> '@'. */
+#define GLYPH_SETTLED    0.92f
+#define GLYPH_NEAR       0.55f
+#define GLYPH_MID        0.20f
 
 #define N_THEMES  5
 
-/* Color pairs */
 enum {
-    CP_HUD  = 1,    /* top HUD: data readout (yellow)   */
-    CP_D0   = 2,    /* CP_D0 + digit → per-digit color  */
-    CP_IDLE = 12,   /* in-transit idle particles        */
-    CP_HINT = 14,   /* bottom HUD: action keys (cyan)    */
+    CP_HUD  = 1,    /* top status line (yellow)              */
+    CP_D0   = 2,    /* CP_D0 + digit picks that digit's color */
+    CP_IDLE = 12,   /* dots gliding to centre and fading out */
+    CP_HINT = 14,   /* bottom key hints (cyan)               */
 };
 
-/* ===================================================================== */
-/* §2  performance — timing primitives (frame cap applied in §6)          */
-/* ===================================================================== */
+/* ── §2 performance — read the clock and sleep to cap the frame rate ── */
 
 static int64_t clock_ns(void)
 {
@@ -267,11 +102,10 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  logic — pure decisions: no mutation, no I/O                        */
-/* ===================================================================== */
+/* ── §3 logic — the easing curve, no side effects ── */
 
-/* Smoothstep easing: starts and ends gently, fast through the middle */
+/* Smooth ramp from 0 to 1 that eases in and out: slow at the ends, quick
+ * in the middle. Makes the glide look natural instead of robotic. */
 static float smoothstep(float t)
 {
     if (t <= 0.0f) return 0.0f;
@@ -279,11 +113,9 @@ static float smoothstep(float t)
     return t * t * (3.0f - 2.0f * t);
 }
 
-/* ===================================================================== */
-/* §4  simulation — advances state (geometry, targets, particles, morph)  */
-/* ===================================================================== */
+/* ── §4 simulation — geometry, digit targets, and the morphing dots ── */
 
-/* PRNG — mutates g_lcg, so NOT pure (not §3 logic). */
+/* Cheap random number in [0,1). Used only to scatter dots at startup. */
 static uint32_t g_lcg = 12345u;
 static float lcg_f(void)
 {
@@ -291,7 +123,7 @@ static float lcg_f(void)
     return (float)(g_lcg >> 8) / (float)(1u << 24);
 }
 
-/* Scene geometry, derived from the terminal at init/resize. */
+/* Screen size and how big to draw the font; recomputed on every resize. */
 static int g_rows, g_cols;
 static int g_sy, g_sx;
 static int g_suby, g_subx;
@@ -307,14 +139,14 @@ static void scale_compute(void)
     g_subx = (g_sx < SUB_X_MAX) ? g_sx : SUB_X_MAX;
 }
 
-/* DigitTargets — the set of target pixel positions for one digit: n points at
- * (x[i], y[i]).  Precomputed once per scale by expanding the bitmap font;
- * digit_assign matches particles onto these points.  Struct-of-arrays, one per
- * digit 0..9. */
+/* Where the dots should land for one digit. We blow the small font picture
+ * up to screen size and record a target spot for every filled sub-pixel, so
+ * a digit becomes a cloud of points the dots aim for. One of these per digit
+ * 0..9, filled in once whenever the scale changes. */
 typedef struct {
-    float x[N_PARTS];       /* target x per point                          */
-    float y[N_PARTS];       /* target y per point                          */
-    int   n;                /* valid point count (#pixels × sub-grid size) */
+    float x[N_PARTS];       /* target column of point i                        */
+    float y[N_PARTS];       /* target row of point i                           */
+    int   n;                /* how many points are valid (rest of arrays junk) */
 } DigitTargets;
 
 static DigitTargets g_targets[10];
@@ -348,22 +180,17 @@ static void targets_precompute(float cx, float cy)
     }
 }
 
-/*
- * Each particle stores:
- *   ox, oy — position snapshot taken the moment a new digit is triggered
- *   tx, ty — target for this digit (or centre for idle particles)
- *   x,  y  — current position = lerp(o, t, smoothstep(morph_t))
- *   active — true = assigned to a digit target; false = gliding to centre
- */
+/* One dot. Each morph slides it in a straight line from where it was when
+ * the digit changed (the origin snapshot) to where it should end up. */
 typedef struct {
-    float x,  y;    /* current position  */
-    float ox, oy;   /* origin at morph start */
-    float tx, ty;   /* target */
-    bool  active;
+    float x,  y;    /* current position on screen                            */
+    float ox, oy;   /* where it sat when this morph began                    */
+    float tx, ty;   /* where it's heading (a digit pixel, or the centre)     */
+    bool  active;   /* true = part of the digit; false = surplus, fading out */
 } Particle;
 
 static Particle g_parts[N_PARTS];
-static float    g_morph_t     = 1.0f;   /* 0 = just triggered, 1 = done */
+static float    g_morph_t     = 1.0f;   /* morph progress: 0 = start, 1 = done */
 static int      g_morph_frames = MORPH_FRAMES_DEF;
 
 static void parts_init(float cx, float cy)
@@ -379,8 +206,8 @@ static void parts_init(float cx, float cy)
     }
 }
 
-/* Greedy nearest-neighbour: index of the closest particle not yet claimed by a
- * target (by squared distance), or -1 if none remain. */
+/* Find the closest still-free dot to a target spot, or -1 if all are taken.
+ * (Compares squared distance to skip the square root — same winner.) */
 static int nearest_unclaimed(float tx, float ty, const bool *used)
 {
     float best_d2 = 1e18f;
@@ -395,21 +222,18 @@ static int nearest_unclaimed(float tx, float ty, const bool *used)
     return best_p;
 }
 
-/*
- * digit_assign — snapshot current positions, match particles to new
- * digit targets (greedy nearest-neighbour), send idle ones to centre,
- * then reset morph_t to 0 so the lerp restarts.
- */
+/* Start a morph to a new digit: hand each target pixel its nearest free dot,
+ * park the surplus dots at the centre, snapshot where everyone is now, and
+ * rewind the progress clock so the glide plays from the beginning. */
 static void digit_assign(int digit, float cx, float cy)
 {
     const DigitTargets *tg = &g_targets[digit];
     bool  used[N_PARTS];
     memset(used, 0, sizeof used);
 
-    /* Mark all inactive first */
     for (int i = 0; i < N_PARTS; i++) g_parts[i].active = false;
 
-    /* Greedy match: each target claims its nearest free particle */
+    /* Each target spot grabs its nearest unclaimed dot. */
     for (int t = 0; t < tg->n; t++) {
         int p = nearest_unclaimed(tg->x[t], tg->y[t], used);
         if (p < 0) continue;
@@ -419,7 +243,7 @@ static void digit_assign(int digit, float cx, float cy)
         g_parts[p].ty = tg->y[t];
     }
 
-    /* Unclaimed particles glide to centre; snapshot every origin for the lerp */
+    /* Leftover dots head for the centre; record everyone's starting point. */
     for (int i = 0; i < N_PARTS; i++) {
         if (!used[i]) {
             g_parts[i].active = false;
@@ -430,14 +254,11 @@ static void digit_assign(int digit, float cx, float cy)
         g_parts[i].oy = g_parts[i].y;
     }
 
-    g_morph_t = 0.0f;   /* kick off lerp */
+    g_morph_t = 0.0f;
 }
 
-/*
- * parts_update — advance lerp by one frame.
- * All particles (active and idle) move together from their origin
- * snapshot toward their target using the same eased t value.
- */
+/* One frame of the glide: nudge progress forward and slide every dot the
+ * matching fraction of the way from its start to its target. */
 static void parts_update(void)
 {
     if (g_morph_t >= 1.0f) return;
@@ -445,7 +266,7 @@ static void parts_update(void)
     g_morph_t += 1.0f / (float)g_morph_frames;
     if (g_morph_t > 1.0f) g_morph_t = 1.0f;
 
-    float st = smoothstep(g_morph_t);   /* eased t */
+    float st = smoothstep(g_morph_t);
 
     for (int i = 0; i < N_PARTS; i++) {
         g_parts[i].x = g_parts[i].ox + st * (g_parts[i].tx - g_parts[i].ox);
@@ -453,16 +274,14 @@ static void parts_update(void)
     }
 }
 
-/* ===================================================================== */
-/* §5  render — state → screen; reads only, never mutates sim state        */
-/* ===================================================================== */
+/* ── §5 render — draw the dots and the status lines ── */
 
-/* Theme — one named colour preset: a per-digit palette (dig[0..9]) plus the
- * colour for in-transit idle particles.  t/T cycle the presets. */
+/* One colour preset, cycled with t/T. Gives each digit its own colour plus
+ * a dim colour for the surplus dots drifting to the centre. */
 typedef struct {
-    const char *name;       /* label shown in the HUD                     */
-    short       dig[10];    /* foreground colour per digit 0..9           */
-    short       idle;       /* idle (gliding-to-centre) particle colour   */
+    const char *name;       /* shown in the status line                 */
+    short       dig[10];    /* colour to use for each digit 0..9         */
+    short       idle;       /* colour for the fading surplus dots        */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -490,7 +309,7 @@ static void colors_init(int theme)
     theme_apply(theme);
 }
 
-/* Glyph for a settling particle by morph progress: dot → plus → hash → solid. */
+/* Pick the character for a dot by how far along the glide it is. */
 static char morph_glyph(float st)
 {
     if (st > GLYPH_SETTLED) return '@';
@@ -504,14 +323,14 @@ static void parts_draw(int digit)
     attr_t a_bright = (attr_t)COLOR_PAIR(CP_D0 + digit) | A_BOLD;
     attr_t a_idle   = (attr_t)COLOR_PAIR(CP_IDLE);
 
-    /* Character tracks lerp progress (same for all); colour is the digit colour */
+    /* Every dot is the same character this frame, just in the digit's colour. */
     char glyph = morph_glyph(smoothstep(g_morph_t));
 
     for (int i = 0; i < N_PARTS; i++) {
         Particle *p = &g_parts[i];
         int col = (int)(p->x + 0.5f);
         int row = (int)(p->y + 0.5f);
-        if (row < 0 || row >= g_rows - 1) continue;
+        if (row < 0 || row >= g_rows - 1) continue;   /* keep off the bottom hint line */
         if (col < 0 || col >= g_cols)     continue;
 
         if (p->active) {
@@ -519,7 +338,7 @@ static void parts_draw(int digit)
             mvaddch(row, col, (chtype)(unsigned char)glyph);
             attroff(a_bright);
         } else {
-            /* Idle: visible only during the lerp, invisible once at centre */
+            /* Surplus dots show only while drifting; once parked they vanish. */
             if (g_morph_t >= 1.0f) continue;
             attron(a_idle);
             mvaddch(row, col, '.');
@@ -530,7 +349,7 @@ static void parts_draw(int digit)
 
 static void hud_draw(int digit, int hold_max, int theme, bool paused, double fps)
 {
-    /* Top-right: data readout */
+    /* Top-right status: which digit, theme, timings, fps. */
     char buf[160];
     snprintf(buf, sizeof buf,
              " digit:%d  theme:%s  morph:%d  hold:%d  %.0f fps  %s ",
@@ -542,16 +361,14 @@ static void hud_draw(int digit, int hold_max, int theme, bool paused, double fps
     mvprintw(0, x, "%s", buf);
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    /* Bottom-left: action keys */
+    /* Bottom-left: the key hints. */
     attron(COLOR_PAIR(CP_HINT) | A_BOLD);
     mvprintw(g_rows - 1, 0,
              " q:quit  p:pause  n:next  ]/[:hold  f/F:speed  t/T:theme ");
     attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §6  app / main — combine point + user events + frame cap               */
-/* ===================================================================== */
+/* ── §6 app — setup, the main loop, input, and the frame cap ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -614,23 +431,21 @@ int main(void)
 
     while (g_running) {
 
-        /* USER EVENT (out of tick): resize → re-derive geometry + targets */
+        /* On resize, rebuild the geometry and re-match the dots to the digit. */
         if (g_need_resize) {
             do_resize(&cx, &cy);
             digit_assign(cur_digit, cx, cy);
         }
 
-        /* 1. PERFORMANCE — frame start timestamp */
         int64_t frame_start = clock_ns();
 
-        /* USER EVENT (out of tick): input — quit/pause/next/hold/speed/theme */
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
             case 'q': case 'Q': case 27: g_running = 0; break;
             case 'p': case 'P': case ' ': paused = !paused; break;
             case 'n': case 'N':
-                /* skip to next digit immediately */
+                /* Jump straight to the next digit: finish the morph and the hold. */
                 hold_tick = hold_max;
                 g_morph_t = 1.0f;
                 break;
@@ -643,12 +458,12 @@ int main(void)
                 if (hold_max < HOLD_MIN) hold_max = HOLD_MIN;
                 break;
             case 'f':
-                /* faster morph: fewer frames */
+                /* Faster glide = fewer frames. */
                 g_morph_frames -= 5;
                 if (g_morph_frames < MORPH_FRAMES_MIN) g_morph_frames = MORPH_FRAMES_MIN;
                 break;
             case 'F':
-                /* slower morph: more frames */
+                /* Slower glide = more frames. */
                 g_morph_frames += 5;
                 if (g_morph_frames > MORPH_FRAMES_MAX) g_morph_frames = MORPH_FRAMES_MAX;
                 break;
@@ -665,10 +480,9 @@ int main(void)
         }
 
         if (!paused) {
-            /* 2. SIMULATION — advance the lerp every frame */
             parts_update();
 
-            /* 3. DELAYS — hold timer runs only after the morph completes */
+            /* Once the digit has formed, count down the hold then start the next. */
             if (g_morph_t >= 1.0f) {
                 hold_tick++;
                 if (hold_tick >= hold_max) {
@@ -679,14 +493,13 @@ int main(void)
             }
         }
 
-        /* 4. RENDER — read-only */
         erase();
         parts_draw(cur_digit);
         hud_draw(cur_digit, hold_max, theme, paused, fps);
         wnoutrefresh(stdscr);
         doupdate();
 
-        /* 5. PERFORMANCE — fps tally + sleep to the frame cap */
+        /* Update the fps reading about twice a second, then sleep to cap fps. */
         frame_cnt++;
         int64_t now = clock_ns();
         if (now - fps_clock >= 500LL * NS_PER_MS) {

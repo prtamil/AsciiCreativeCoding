@@ -1,144 +1,12 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * hurricane.c — top-down hurricane / cyclone with calm eye
+ * hurricane.c — top-down view of a swirling cyclone with a calm eye.
  *
- * DEMO: Bird's-eye view of a tropical cyclone. A pool of cloud particles
- *       orbits a central eye following the Rankine vortex velocity
- *       profile — solid-body rotation inside the eyewall, decaying
- *       1/r outside. Each particle slowly spirals inward (radial
- *       inflow) and is recycled when it reaches the eye boundary,
- *       respawning at a random outer radius. Three concentric "bands"
- *       of different colour intensity give a satellite-view texture:
- *       outer rim dim grey, middle band brighter cloud, eyewall white.
- *       The eye itself is a calm dark spot at the centre. The screen
- *       reads as a still-frame of a hurricane satellite image, but
- *       animated.  n/p cycle 15 preset storms — different colour, spin,
- *       eye size, density, handedness, and spiral-vs-ring flow.
- *
- * Study alongside: artistic/fire_tornado.c (rotation, but side-view),
- *                  fluid/navier_stokes.c (real fluid dynamics),
- *                  geometry/voronoi.c (radial-distance ideas).
- *
- * Section map (cut by layer — see ARCHITECTURE):
- *   §1 config      — constants, colour-pair ids
- *   §2 performance — monotonic clock + sleep
- *   §3 data        — presets + palette tables + Cloud/Hurricane types
- *   §4 logic       — pure maps (frand, Rankine ω, radial zone, wind glyph)
- *   §5 simulation  — cloud respawn / tick + hurricane_tick (the per-tick advance)
- *   §6 render      — colour, cloud/eye draw, scene_draw + HUD
- *   §7 init/reset  — geometry, reseed, apply_preset
- *   §8 events      — signals, screen setup
- *   §9 app         — the frame loop (the per-tick combine)
- *
- * Keys:  n/p   next / previous preset (15 storms)
- *        [/]   particle count        -/+  spin speed
- *        ,/.   eye radius            i    toggle inflow
- *        t     cycle theme   r reseed   space pause   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/hurricane.c \
- *       -o hurricane -lncurses -lm
+ * Cloud particles orbit a central eye following the Rankine vortex wind
+ * profile and spiral slowly inward. n/p cycle 15 preset storms.
+ * Refs: Rankine, "A Manual of Applied Mechanics" (1858) §625 — the two-zone
+ * vortex; Emanuel, "Divine Wind" (2005) — eye/eyewall/bands structure.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Each cloud particle is stored in polar coordinates
- *                 around the screen centre: (radius, theta, age). Each
- *                 frame: theta advances by ω(r)·dt where the angular
- *                 velocity ω comes from the Rankine vortex profile —
- *                 solid-body rotation `ω = ω_max · r/R_eye` inside the
- *                 eyewall, and `ω = ω_max · R_eye/r` outside (so v(r)
- *                 = ω_max·R_eye is constant in the eyewall, then
- *                 decays as 1/r). Radial inflow pulls particles
- *                 inward at a small constant rate; particles that
- *                 cross the eye are recycled to the outer radius.
- *
- *                 Every cloud renders as a wind-aligned SLOPE glyph
- *                 (- \ | /, from atan2 of its velocity) so the swirl
- *                 direction reads even on a still frame. COLOUR comes
- *                 from the radial zone instead:
- *                   inside eye   → left empty (a clean calm centre)
- *                   eyewall      → bright white, bold (high winds)
- *                   middle band  → mid-tone cloud
- *                   outer rim    → dimmer grey
- *
- * Data-structure: Hurricane holds Cloud[N_CLOUDS_MAX] inline. Each Cloud
- *                 carries (radius, theta, alive). No allocation after init.
- *
- * Rendering     : Per frame: erase, paint each cloud at its (radius,
- *                 theta) projection — with cell-aspect correction so the
- *                 hurricane reads as round, not vertically squashed.
- *
- * Performance   : O(N_CLOUDS) per frame. 600 particles is fine.
- *
- * References    :
- *   Vortex & hurricane physics (the Rankine profile + storm structure):
- *     Rankine, "A Manual of Applied Mechanics" (1858) §625 — the original
- *       two-zone vortex (solid-body core + 1/r free vortex) this sim uses.
- *     Lamb, "Hydrodynamics" (6th ed. 1932) — the classic vortex-motion
- *       reference; the Rankine combined vortex is its textbook case.
- *     Holland, "An Analytic Model of the Wind and Pressure Profiles in
- *       Hurricanes" (Monthly Weather Review 108, 1980) — the modern wind
- *       profile that Rankine simplifies (rankine_omega).
- *     Emanuel, "Divine Wind: The History and Science of Hurricanes" (2005)
- *       — accessible account of the eye / eyewall / spiral bands / radial
- *       inflow that the radial zones and glyphs here reproduce.
- *
- *   Particle rendering (cloud pool, polar projection, glyph ramp):
- *     Reeves, "Particle Systems — A Technique for Modeling a Class of Fuzzy
- *       Objects" (ACM TOG 1983) — the spawn / advect / recycle cloud pool (§5).
- *     Bourke, "Character representation of greyscale images" — the radius →
- *       intensity → glyph mapping that textures the bands.
- *     Foley, van Dam, Feiner & Hughes, "Computer Graphics: Principles and
- *       Practice" — polar→screen projection with cell-aspect correction.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
- *
- * The file is cut into LAYERS by concern. All state lives on one Hurricane
- * aggregate (§3); each layer reads and/or mutates a named slice of it. Functions
- * take the NARROWEST type they need — a Cloud* plus a const RankineVortex* for
- * one particle, Hurricane* only for the whole-storm orchestrators — so the
- * layers never re-couple. The split is by SECTION; this table lists what each
- * mutates.
- *
- *   Layer        Section            Mutates
- *   ─────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2 performance     nothing (reads OS clock, sleeps)
- *   DATA         §3 data            — types, tables + the Hurricane instance —
- *   LOGIC        §4 logic           nothing (pure maps; frand advances rand())
- *   SIMULATION   §5 simulation      h.clouds[] (r, theta, alive)
- *   RENDER       §6 render          the screen + the colour pairs; never Hurricane
- *   INIT/RESET   §7 init            ALL of Hurricane (geometry / reseed / preset)
- *   EVENTS       §8 events          g_running, g_need_resize (+ keys mutate h in main)
- *   —            §9 app             the per-frame driver (combines layers)
- *
- * No EFFECTS layer: the storm IS the cloud particle pool (SIMULATION). Each
- * cloud's GLYPH and colour ZONE are derived at render time from its radius and
- * velocity (radial_zone / wind_glyph) — not stored — so there is no cosmetic-
- * only state to advance separately.
- *
- * No DELAYS layer: pause is a single flag (h.paused) tested once in main before
- * hurricane_tick; the fps window is a PERFORMANCE counter in main. No holds.
- *
- * LOGIC (frand, rankine_omega, radial_zone, wind_glyph) does no I/O and (apart
- * from frand's PRNG) no mutation — it maps inputs to a value — so reordering or
- * deleting RENDER cannot change a LOGIC result.
- *
- * PER-TICK COMBINE — main's loop (§9) advances state in ONE place:
- *   hurricane_tick(dt) — advance every cloud (theta via Rankine ω, r via inflow,
- *                        recycle across the eye/rim)            (SIMULATION)
- *   then every frame:  scene_draw(...) — clouds + eye + HUD     (RENDER)
- *
- * User events (quit, pause, next/prev preset, reseed, theme, inflow, clouds,
- * spin, eye, resize) DO mutate state but are NOT part of the tick — they run in
- * main's input/resize handling, before the gated hurricane_tick. Preset change
- * (n/p) and reseed (r) re-invoke INIT (§7); resize re-runs the geometry (§7).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -155,9 +23,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config — tunable constants and colour-pair ids ── */
 
 #define TARGET_FPS         60
 
@@ -165,8 +31,7 @@
 #define N_CLOUDS_MIN       100
 #define N_CLOUDS_STEP      100
 
-/* Vortex profile. Radii are in cells. Startup values come from PRESETS[0];
- * these MIN/MAX/STEP bound the live tweak keys ([/], -/+, ,/.). */
+/* Limits for the keys that nudge the storm live. Radii are in screen cells. */
 #define EYE_RADIUS_MIN        2.0f
 #define EYE_RADIUS_MAX        8.0f
 #define EYE_RADIUS_STEP       1.0f
@@ -176,29 +41,29 @@
 #define OMEGA_MAX_MAX         4.0f
 #define OMEGA_MAX_STEP        0.25f
 
-/* Cell aspect — terminal cells ~2× tall as wide. Stretch r·cos(θ) so
- * the hurricane is visually round on screen. */
+/* Terminal cells are about twice as tall as wide, so we widen the storm
+ * horizontally by this factor to make it look round instead of squashed. */
 #define ASPECT_X              2.0f
 
 #define DT_CAP_S              0.10f
 #define N_THEMES              4
 
-/* fps display smoothing — exponential moving-average weight on each new frame */
+/* How heavily each new frame pulls the smoothed fps reading; small = steady. */
 #define FPS_EMA_ALPHA       0.05
 
-/* small-radius guard in rankine_omega (avoid 1/r blow-up at the exact centre) */
+/* Tiny floor on radius so the wind formula doesn't divide by zero at the centre. */
 #define VORTEX_CENTRE_EPS   1e-3f
 
-/* Radial band boundaries (× r_eye or × r_outer) — see radial_zone */
-#define ZONE_EYE_FRAC       0.70f  /* r < r_eye·this   → inside the calm eye     */
-#define ZONE_EYEWALL_FRAC   1.15f  /* r < r_eye·this   → the eyewall (peak wind) */
-#define ZONE_MIDBAND_FRAC   0.60f  /* r < r_outer·this → mid cloud band          */
+/* Where one coloured band ends and the next begins (see radial_zone). */
+#define ZONE_EYE_FRAC       0.70f  /* inside this fraction of the eye → calm centre */
+#define ZONE_EYEWALL_FRAC   1.15f  /* up to here → the eyewall (strongest wind)     */
+#define ZONE_MIDBAND_FRAC   0.60f  /* up to this fraction of the rim → mid band     */
 
-/* Cloud spawn + recycle bounds (× r_outer or × r_eye) */
-#define SPAWN_R2_MIN        0.40f  /* spawn radius² in [MIN, MIN+SPAN]; sqrt →   */
-#define SPAWN_R2_SPAN       0.60f  /*   area-uniform, biased toward the rim      */
-#define RECYCLE_INNER_FRAC  0.50f  /* r < r_eye·this   → sucked into eye, recycle */
-#define RECYCLE_OUTER_FRAC  1.05f  /* r > r_outer·this → past the rim,   recycle */
+/* When a cloud spawns or gets recycled, relative to outer rim / eye. */
+#define SPAWN_R2_MIN        0.40f  /* spawn point is picked area-uniformly so       */
+#define SPAWN_R2_SPAN       0.60f  /*   clouds bunch toward the wider outer rim     */
+#define RECYCLE_INNER_FRAC  0.50f  /* pulled this far inside the eye → recycle      */
+#define RECYCLE_OUTER_FRAC  1.05f  /* drifted past the rim → recycle                */
 
 /* Colour pairs */
 #define PAIR_OUTER    1
@@ -208,11 +73,7 @@
 #define PAIR_HUD      5
 #define PAIR_HINT     6
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  PERFORMANCE — clock                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ *
- * Monotonic clock + sleep. Mutates nothing. The frame cap, dt clamp and fps
- * window that use these live in main's loop (§9).                            */
+/* ── §2 performance — monotonic clock and sleep ── */
 
 static int64_t clock_ns(void)
 {
@@ -229,23 +90,11 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  DATA — presets, palette tables, Cloud / RankineVortex / Hurricane     */
-/* ═══════════════════════════════════════════════════════════════════════ *
- * Declarations only; no behaviour. Mutated by SIMULATION (§5) / INIT (§7) /
- * EVENTS (§8) and read by LOGIC (§4) / RENDER (§6).                          */
+/* ── §3 data — presets, palettes, and the Cloud / vortex / scene types ── */
 
-/* ─── Presets ─────────────────────────────────────────────────────────── *
- * HurricanePreset — one named storm as a parameter RECIPE. n/p cycle through
- * them and hurricane_apply_preset (§7) copies a preset onto the live state: its
- * physics fields seed the RankineVortex, plus the cloud count and palette. A
- * preset is deliberately FLAT and screen-independent — it carries no r_outer
- * (that is derived from the terminal size at runtime), so the same recipe reads
- * correctly at any window size. Variety comes from the colour theme, eyewall
- * spin, eye size, cloud density, whether the flow SPIRALS in (inflow=1) or
- * orbits in concentric rings (inflow=0), the spin HANDEDNESS (spin_dir +1 =
- * counter-clockwise like a northern-hemisphere cyclone, -1 = clockwise like a
- * southern one), and how tightly it winds in (inflow_rate). */
+/* One named storm written down as a recipe. Cycling presets (n/p) copies these
+ * settings onto the live storm. It carries no outer radius on purpose — that is
+ * worked out from the window size — so the same recipe looks right at any size. */
 typedef struct {
     const char *name;   /* label shown in the HUD                           */
     int   theme;        /* palette index 0..N_THEMES-1                      */
@@ -277,23 +126,17 @@ static const HurricanePreset PRESETS[N_PRESETS] = {
     { "Supercell",         0,  4.0f,  2.0f, 800,  1,   +1.f,  1.4f },
 };
 
-/* 4-zone palette per theme: outer / band / eyewall / eye.
- *
- * Brightness gradient is encoded in the colour values themselves
- * (outer = mid-bright, eyewall = white) plus A_BOLD on the eyewall —
- * we no longer apply A_DIM to the outer band, since on most terminals
- * dim × medium-saturation = invisible.
- *
- * Eye colour is a fixed visible gray (240) regardless of theme — the
- * eye is a static "calm centre" feature, not part of the storm hue. */
+/* Four colours per theme, one for each band: outer / mid / eyewall / eye.
+ * Brightness rises toward the centre so the eyewall stands out as white; the
+ * eye is always the same gray (240) since the calm centre isn't part of the hue. */
 static const short PAL_256[N_THEMES][4] = {
-    /* 0 satellite white — light gray → bright white                   */
+    /* 0 satellite white — light gray to bright white */
     { 250, 254, 231, 240 },
-    /* 1 blue storm      — sky blue → cyan → white                     */
+    /* 1 blue storm — sky blue to cyan to white */
     {  39,  45,  51, 240 },
-    /* 2 gold storm      — orange → gold → white                       */
+    /* 2 gold storm — orange to gold to white */
     { 178, 214, 231, 240 },
-    /* 3 magenta storm   — pink → light pink → white                   */
+    /* 3 magenta storm — pink to light pink to white */
     { 175, 213, 231, 240 },
 };
 static const short PAL_8[N_THEMES][4] = {
@@ -303,76 +146,50 @@ static const short PAL_8[N_THEMES][4] = {
     { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_WHITE,   COLOR_WHITE },
 };
 
-/* Cloud — one advected particle in the storm's cloud pool. Stored in POLAR
- * coordinates about the eye centre because the vortex velocity field is itself
- * polar: a tick advances theta by ω(r)·dt and pulls r inward by the inflow —
- * two cheap adds — and the (r, theta) → screen projection is deferred to render
- * time (cloud_draw). The pool is fixed-size and recycled, never reallocated
- * (Reeves, "Particle Systems", ACM TOG 1983): a particle that crosses the eye
- * or the outer rim has `alive` cleared and is re-seeded into the slot next tick. */
+/* One cloud particle in the storm. Its position is stored as distance-from-centre
+ * and angle (polar coordinates) rather than x/y, because the swirling motion is
+ * naturally a circle: each tick just turns the angle and shrinks the radius. The
+ * pool is fixed-size and reused — a cloud that reaches the eye or the rim is
+ * marked dead and reborn in place (Reeves, "Particle Systems", ACM TOG 1983). */
 typedef struct {
-    float r;          /* radius from eye centre (cells)                     */
-    float theta;      /* angle about the eye (radians); ω(r)·dt per tick    */
-    int   alive;      /* 0 = spent slot — cloud_respawn re-seeds it          */
+    float r;          /* distance from the eye centre, in screen cells       */
+    float theta;      /* angle around the eye, in radians                    */
+    int   alive;      /* 0 means the slot is free and will be respawned      */
 } Cloud;
 
-/* RankineVortex — the parameterised velocity field the clouds move in. The
- * tangential wind follows the Rankine profile (solid-body core spinning up to
- * the eyewall at r_eye, then 1/r decay outside); a weak radial INFLOW spirals
- * clouds in. r_eye / omega_max / spin_dir / inflow / inflow_rate come from the
- * active preset; r_outer is the screen-fit outer extent where clouds recycle.
- *
- * The two-zone tangential profile is Rankine's combined vortex (Rankine,
- * "A Manual of Applied Mechanics", 1858, §625; Lamb, "Hydrodynamics", 1932):
- *     ω(r) = ω_max · r / r_eye    for r ≤ r_eye   (solid-body core)
- *     ω(r) = ω_max · r_eye / r    for r >  r_eye   (1/r free vortex)
- * so the tangential wind v = ω·r peaks exactly at r_eye — the eyewall, where a
- * real cyclone's strongest winds sit. See rankine_omega (§4) for the code. */
+/* The wind field the clouds ride in. Wind speed grows from the centre out to the
+ * eyewall, then fades with distance beyond it — so the fastest wind sits right at
+ * the eyewall, just like a real cyclone. A gentle inward pull makes clouds spiral
+ * in. (This two-zone wind shape is the Rankine combined vortex: Rankine, "A Manual
+ * of Applied Mechanics", 1858, §625; the math lives in rankine_omega.) */
 typedef struct {
-    float r_eye;        /* eye / eyewall radius (cells) — peak-wind cusp      */
-    float r_outer;      /* outer extent (cells) — recycle + outer-rim bound   */
-    float omega_max;    /* angular velocity at the eyewall (rad/sec)          */
-    float spin_dir;     /* +1 = counter-clockwise, -1 = clockwise            */
-    int   inflow;       /* 1 = spiral inward, 0 = orbit at fixed radius       */
-    float inflow_rate;  /* radial inflow speed (cells/sec) — spiral tightness */
+    float r_eye;        /* eyewall radius in cells; where the wind peaks      */
+    float r_outer;      /* outer edge in cells; clouds past it get recycled   */
+    float omega_max;    /* spin rate at the eyewall, in radians/second        */
+    float spin_dir;     /* +1 spins counter-clockwise, -1 clockwise          */
+    int   inflow;       /* 1 = spiral inward, 0 = orbit at a fixed radius     */
+    float inflow_rate;  /* how fast clouds drift inward, in cells/second      */
 } RankineVortex;
 
-/* Hurricane — the whole runtime scene, read like a table of contents. Functions
- * take the NARROWEST slice they need (Cloud* / const Cloud* for one particle,
- * const RankineVortex* to read the field); only the whole-storm orchestrators
- * (hurricane_geometry / reseed / apply_preset / tick) take Hurricane*.
- *   WHAT  — the cloud particle pool: clouds[0..n).
- *   HOW   — vortex: the Rankine velocity field that pool moves in.
- *   WHERE — preset_idx / theme (current selection) + paused (run state). */
+/* The whole storm in one place: the pool of clouds, the wind field they ride,
+ * and which preset/theme is showing plus whether it's paused. */
 typedef struct {
-    /* WHAT — the cloud particle pool */
     Cloud clouds[N_CLOUDS_MAX];
-    int   n;                 /* active clouds [0..n)                        */
-    /* HOW — the velocity field they move in */
-    RankineVortex vortex;
-    /* WHERE — selection + run state */
-    int   preset_idx;        /* current PRESETS[] index (n/p cycle it)      */
-    int   theme;             /* current palette index                       */
-    int   paused;            /* 1 freezes the per-tick advance              */
+    int   n;                 /* how many clouds are actually in use, [0..n) */
+    RankineVortex vortex;    /* the wind field the clouds move in           */
+    int   preset_idx;        /* which preset is showing (n/p cycle it)      */
+    int   theme;             /* which colour palette is showing             */
+    int   paused;            /* 1 freezes the animation                     */
 } Hurricane;
 
 static Hurricane g_h;
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  LOGIC — pure maps (no mutation, no I/O)                             */
-/* ═══════════════════════════════════════════════════════════════════════ *
- * Each maps its inputs to a value; only frand touches global state (it advances
- * the libc PRNG). Reordering or deleting RENDER cannot change a result here.   */
+/* ── §4 logic — pure helpers that compute, never change state ── */
 
 static float frand(void) { return (float)rand() / (float)RAND_MAX; }
 
-/*
- * rankine_omega — Rankine vortex angular velocity at radius r.
- *   Inside  eye/eyewall (r ≤ R_eye):  ω = ω_max · r / R_eye   (solid body)
- *   Outside              (r >  R_eye): ω = ω_max · R_eye / r  (free vortex)
- * The cusp at r = R_eye is where the maximum tangential wind v = ω_max·R_eye
- * occurs — physically the eyewall.
- */
+/* How fast a cloud spins at distance r from the centre. The spin ramps up to the
+ * eyewall, then eases off further out — so wind is fastest right at the eyewall. */
 static float rankine_omega(float r, float r_eye, float omega_max)
 {
     if (r < VORTEX_CENTRE_EPS) return omega_max * VORTEX_CENTRE_EPS / r_eye;
@@ -380,7 +197,7 @@ static float rankine_omega(float r, float r_eye, float omega_max)
     return omega_max * r_eye / r;
 }
 
-/* keep an angle within (-2π, 2π) so a cloud's theta never grows without bound. */
+/* Keep an angle from growing forever by folding it back near one full turn. */
 static float wrapped_angle(float a)
 {
     if (a >  2.0f * (float)M_PI) a -= 2.0f * (float)M_PI;
@@ -388,35 +205,30 @@ static float wrapped_angle(float a)
     return a;
 }
 
-/*
- * radial_zone — pick a band index (0..3) by radius.
- *   0 = outer rim, 1 = mid band, 2 = eyewall, 3 = inside eye.
- */
+/* Which coloured band a cloud falls in, from its distance to the centre:
+ * 0 outer rim, 1 mid band, 2 eyewall, 3 inside the calm eye. */
 static int radial_zone(float r, float r_eye, float r_outer)
 {
-    if (r < r_eye * ZONE_EYE_FRAC)        return 3;   /* inside eye         */
-    if (r < r_eye * ZONE_EYEWALL_FRAC)    return 2;   /* eyewall            */
-    if (r < r_outer * ZONE_MIDBAND_FRAC)  return 1;   /* mid band           */
-    return 0;                                         /* outer rim          */
+    if (r < r_eye * ZONE_EYE_FRAC)        return 3;
+    if (r < r_eye * ZONE_EYEWALL_FRAC)    return 2;
+    if (r < r_outer * ZONE_MIDBAND_FRAC)  return 1;
+    return 0;
 }
 
-/* a cloud has left the active annulus if the inflow pulled it inside the eye or
- * it drifted past the outer rim — the caller recycles it. */
+/* True once a cloud has been sucked into the eye or has drifted past the rim,
+ * so the caller knows to recycle it. */
 static bool cloud_escaped(const Cloud *c, const RankineVortex *v)
 {
     return c->r < v->r_eye   * RECYCLE_INNER_FRAC
         || c->r > v->r_outer * RECYCLE_OUTER_FRAC;
 }
 
-/*
- * wind_glyph — directional character for a particle moving at angle
- * `theta_vel` (atan2 of (vx, vy)). 8 sectors map to 8 glyphs that
- * trace the swirl direction even on a still frame.
- */
+/* Picks a slash-like character (- \ | /) that points along the wind direction,
+ * so the swirl is readable even in a frozen frame. */
 static char wind_glyph(float vx, float vy)
 {
     static const char G[8] = { '-', '\\', '|', '/', '-', '\\', '|', '/' };
-    float ang = atan2f(vy, vx);                  /* -π..π */
+    float ang = atan2f(vy, vx);
     if (ang < 0) ang += 2.0f * (float)M_PI;
     int sect = (int)(ang / (2.0f * (float)M_PI / 8.0f));
     if (sect < 0) sect = 0;
@@ -424,8 +236,7 @@ static char wind_glyph(float vx, float vy)
     return G[sect];
 }
 
-/* glyph tracing a cloud's LOCAL wind direction. Tangential velocity v = ω × r
- * (perpendicular to the radius), aspect-stretched on x to match the screen. */
+/* The wind glyph for one cloud, pointing along its swirl (sideways to the radius). */
 static char cloud_wind_glyph(const Cloud *c, const RankineVortex *v)
 {
     float omega = rankine_omega(c->r, v->r_eye, v->omega_max);
@@ -434,39 +245,33 @@ static char cloud_wind_glyph(const Cloud *c, const RankineVortex *v)
     return wind_glyph(vx, vy);
 }
 
-/* project a cloud's polar position to a screen cell about the eye centre
- * (cx, cy); the ASPECT_X stretch on x makes the round storm read round. */
+/* Turns a cloud's distance-and-angle into a screen row/column around the eye
+ * centre, widening it sideways so the storm looks round. */
 static void cloud_to_cell(const Cloud *c, int cx, int cy, int *sr, int *sc)
 {
     *sc = (int)((float)cx + ASPECT_X * c->r * cosf(c->theta));
     *sr = (int)((float)cy + c->r * sinf(c->theta));
 }
 
-/* true if a cell is off the canvas — past an edge, or in the bottom row that
- * the HUD action bar reserves. */
+/* True if a cell is off-screen, counting the bottom row reserved for the HUD. */
 static bool off_screen(int sr, int sc, int rows, int cols)
 {
     return sr < 0 || sr >= rows - 1 || sc < 0 || sc >= cols;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  SIMULATION — cloud advance + the per-tick combine                   */
-/* ═══════════════════════════════════════════════════════════════════════ *
- * Advances h.clouds[] (radius, theta, alive). cloud_respawn re-seeds one slot
- * (reused by INIT §7); hurricane_tick is the SINGLE per-tick advance.         */
+/* ── §5 simulation — move the clouds forward one tick ── */
 
 static void cloud_respawn(Cloud *c, float r_outer)
 {
-    /* Bias toward larger radii (uniform in r²): sqrt of an area-uniform sample. */
+    /* The sqrt spreads new clouds evenly over area, so they bunch near the
+     * roomier outer rim instead of crowding the centre. */
     c->r     = r_outer * sqrtf(SPAWN_R2_MIN + SPAWN_R2_SPAN * frand());
     c->theta = frand() * 2.0f * (float)M_PI;
     c->alive = 1;
 }
 
-/*
- * cloud_tick — advance theta via Rankine omega; pull r inward by the
- * inflow rate. Recycle when the cloud crosses the eye into nothingness.
- */
+/* Move one cloud: spin its angle, pull it inward, and recycle it if it falls
+ * into the eye or drifts off the rim. */
 static void cloud_tick(Cloud *c, const RankineVortex *v, float dt)
 {
     if (!c->alive) {
@@ -485,12 +290,7 @@ static void hurricane_tick(Hurricane *h, float dt)
         cloud_tick(&h->clouds[i], &h->vortex, dt);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  RENDER — state → screen (reads only, never mutates Hurricane)       */
-/* ═══════════════════════════════════════════════════════════════════════ *
- * color_init loads the palette pairs; cloud_draw / draw_eye stamp cells;
- * scene_draw composes the frame + HUD. Glyph and colour zone are derived here
- * from each cloud's radius/velocity, not stored.                              */
+/* ── §6 render — paint the storm and HUD to the screen ── */
 
 static void color_init(int theme)
 {
@@ -504,15 +304,15 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,    x256 ?  51 : COLOR_CYAN,   -1);  /* bright cyan   — bottom action bar */
 }
 
-/* colour pair + emphasis for a radial band: the eyewall is bold, the bands step
- * down in brightness. (zone 3, the eye interior, is culled by the caller.) */
+/* Colour and emphasis for a band: the eyewall is bold and brightest. (The eye
+ * interior, zone 3, never reaches here — the caller skips it.) */
 static chtype zone_attr(int zone)
 {
     short pair  = (zone == 2) ? PAIR_EYEWALL
                 : (zone == 1) ? PAIR_BAND
                 :                PAIR_OUTER;
     chtype attr = COLOR_PAIR(pair);
-    if (zone == 2) attr |= A_BOLD;          /* eyewall pops */
+    if (zone == 2) attr |= A_BOLD;
     return attr;
 }
 
@@ -527,7 +327,7 @@ static void cloud_draw(const Cloud *c, int cx, int cy,
     if (off_screen(sr, sc, rows, cols)) return;
 
     int zone = radial_zone(c->r, v->r_eye, v->r_outer);
-    if (zone == 3) return;          /* eye interior stays empty — see draw_eye */
+    if (zone == 3) return;          /* leave the calm eye empty; draw_eye marks it */
 
     chtype attr = zone_attr(zone);
     char   ch   = cloud_wind_glyph(c, v);
@@ -536,7 +336,7 @@ static void cloud_draw(const Cloud *c, int cx, int cy,
     attroff(attr);
 }
 
-/* Faint eye marker — three '.' at the very centre, dim. */
+/* Marks the calm centre with three dots. */
 static void draw_eye(int cx, int cy, int rows, int cols)
 {
     if (cy < 0 || cy >= rows - 1) return;
@@ -547,9 +347,8 @@ static void draw_eye(int cx, int cy, int rows, int cols)
     attroff(COLOR_PAIR(PAIR_EYE) | A_BOLD);
 }
 
-/* draw_hud — the two standard bars: a top yellow DATA line (preset / spin / eye
- * / fps / run-state) and a bottom cyan ACTION legend. Each row is filled, then
- * clipped with "%.*s" so a narrow terminal can neither overflow nor wrap. */
+/* Draws the top stats bar and bottom key legend. Text is clipped to the window
+ * width so a narrow terminal can't make the bars overflow or wrap. */
 static void draw_hud(const Hurricane *h, double fps, int rows, int cols)
 {
     char left[24], right[96];
@@ -559,14 +358,14 @@ static void draw_hud(const Hurricane *h, double fps, int rows, int cols)
              h->preset_idx + 1, N_PRESETS, PRESETS[h->preset_idx].name,
              h->vortex.omega_max, h->vortex.r_eye, fps,
              h->paused ? "PAUSED" : "running");
-    int rx = cols - (int)strlen(right);          /* right-aligned stats column */
+    int rx = cols - (int)strlen(right);          /* column where the stats start */
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     for (int c = 0; c < cols; c++) mvaddch(0, c, ' ');
     if (rx >= 0) {
-        mvprintw(0, 0,  "%.*s", rx, left);       /* title clipped clear of stats */
+        mvprintw(0, 0,  "%.*s", rx, left);       /* title, trimmed to clear the stats */
         mvprintw(0, rx, "%s", right);
     } else {
-        mvprintw(0, 0,  "%.*s", cols, right);    /* too narrow: data only */
+        mvprintw(0, 0,  "%.*s", cols, right);    /* too narrow for both: stats only */
     }
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
@@ -592,16 +391,12 @@ static void scene_draw(int rows, int cols, const Hurricane *h, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  INIT/RESET — geometry, reseed, preset load (NOT part of the tick)   */
-/* ═══════════════════════════════════════════════════════════════════════ *
- * Mutate Hurricane state wholesale. Called at startup, on resize (geometry),
- * and on reseed / preset-change keys — all outside hurricane_tick.            */
+/* ── §7 init/reset — fit to the window, reseed, and load presets ── */
 
 static void hurricane_geometry(Hurricane *h, int rows, int cols)
 {
-    /* Outer radius is the largest circle that fits inside the screen,
-     * accounting for cell-aspect: horizontal extent scales by ASPECT_X. */
+    /* Set the outer radius to the biggest circle that fits the window, allowing
+     * for the sideways stretch that keeps the storm round. */
     float max_h = (float)(rows - 2) * 0.5f;
     float max_w = (float)cols * 0.5f / ASPECT_X;
     float bound = (max_h < max_w) ? max_h : max_w;
@@ -613,9 +408,8 @@ static void hurricane_reseed(Hurricane *h)
     for (int i = 0; i < h->n; i++) cloud_respawn(&h->clouds[i], h->vortex.r_outer);
 }
 
-/* Load preset `idx`: set the storm parameters, apply its palette, and reseed
- * the cloud pool so the new look starts fresh. Geometry (r_outer) must already
- * be set, since reseed scatters clouds out to the outer radius. */
+/* Switch to preset idx: copy its settings, load its palette, and scatter the
+ * clouds fresh. Caller must set the geometry first, since reseed needs r_outer. */
 static void hurricane_apply_preset(Hurricane *h, int idx)
 {
     const HurricanePreset *p = &PRESETS[idx];
@@ -631,9 +425,7 @@ static void hurricane_apply_preset(Hurricane *h, int idx)
     hurricane_reseed(h);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  EVENTS — signals & screen setup (mutate state, NOT part of the tick) */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 events — signals, keys, and screen setup ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -644,8 +436,7 @@ static void on_signal(int s)
     if (s == SIGWINCH)               g_need_resize = 1;
 }
 
-/* apply one keypress to the storm — cycle presets, tweak vortex knobs, pause,
- * reseed, or quit. An EVENT, run before the tick and never part of it. */
+/* Handles one keypress: cycle presets, tweak the storm, pause, reseed, or quit. */
 static void hurricane_handle_key(Hurricane *h, int ch)
 {
     switch (ch) {
@@ -707,9 +498,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  app — the frame loop (the per-tick combine)                         */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 app — the main frame loop ── */
 
 int main(void)
 {
@@ -719,8 +508,8 @@ int main(void)
 
     screen_init(PRESETS[0].theme);
     int rows = LINES, cols = COLS;
-    hurricane_geometry(&g_h, rows, cols);     /* sets r_outer, needed by reseed */
-    hurricane_apply_preset(&g_h, 0);          /* params + palette + reseed      */
+    hurricane_geometry(&g_h, rows, cols);     /* must run before the preset reseed */
+    hurricane_apply_preset(&g_h, 0);
 
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double  fps         = TARGET_FPS;
@@ -744,7 +533,7 @@ int main(void)
         t_tick_prev = now;
         if (!g_h.paused) hurricane_tick(&g_h, dt);
 
-        /* fps = exponential moving average of the instantaneous rate */
+        /* Smooth the fps so the readout doesn't jitter frame to frame. */
         double inst_fps = 1e9 / (double)(now - t_fps_prev + 1);
         fps = fps * (1.0 - FPS_EMA_ALPHA) + inst_fps * FPS_EMA_ALPHA;
         t_fps_prev = now;

@@ -1,242 +1,12 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * bat.c  —  formations of ASCII bats erupting from the screen centre into the dark
+ * bat.c — three V-formations of ASCII bats burst from the screen centre and fly
+ * off in scripted directions, flapping a 4-frame wing cycle as they go.
  *
- * Three formations of bats burst outward from the screen centre, each heading
- * in a different direction.  Every formation is a V-wedge — one leader at the
- * tip with follower rows fanning out behind.  Each bat flaps through a 4-frame
- * wing cycle.
- *
- * Formation shape — filled triangle (Pascal rows), n_rows = 3 shown:
- *
- *            /o\                 ← row 0: 1 bat  (leader, bold)
- *         /o\   /o\              ← row 1: 2 bats
- *      /o\   /o\   /o\           ← row 2: 3 bats
- *   /o\   /o\   /o\   /o\        ← row 3: 4 bats
- *
- * Row r has r+1 bats evenly spaced.  Total bats = (n+1)(n+2)/2.
- *   n_rows 1 → 3 bats    n_rows 4 → 15 bats
- *   n_rows 2 → 6 bats    n_rows 5 → 21 bats
- *   n_rows 3 → 10 bats   n_rows 6 → 28 bats
- *
- * Pressing + / - grows or shrinks the triangle live.  Flying formations gain
- * or lose bats immediately, placed at the correct position in the formation.
- *
- * Wing frames (triangle wave):
- *   0  /o\   wings up
- *   1  -o-   wings level
- *   2  \o/   wings down
- *   3  -o-   wings level
- *
- * When the leader of a formation exits the screen the formation holds briefly
- * then re-launches from the centre in a new direction, cycling through 6
- * presets.
- *
- * Formation colours:
- *   Formation 0 — light purple  (xterm 141) / magenta fallback
- *   Formation 1 — electric cyan (xterm  87) / cyan fallback
- *   Formation 2 — pink-magenta  (xterm 213) / white fallback
- *
- * Keys:
- *   q / ESC   quit
- *   + / -     add / remove one row (1–6 rows, 3–28 bats per formation)
- *   r         reset all formations to centre
- *   p / spc   pause / resume
- *   ] [       faster / slower simulation
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra Artistic/bat.c -o bat -lncurses -lm
- *
- * Sections  (re-cut into single-concern layers — see ARCHITECTURE below)
- * --------
- *   §1  config       — constants, numeric palette data, timing macros
- *   §2  clock        — PERFORMANCE: monotonic clock + sleep
- *   §3  color        — RENDER setup: theme palettes, colour-pair binding
- *   §4  coords        — LOGIC: pure pixel ↔ cell conversions
- *   §5  data         — type definitions (Bat, Formation, Scene, Screen)
- *   §6  logic        — pure decisions (formation geometry, leader-exit test)
- *   §7  simulation   — advances state; scene_tick is the per-tick combine
- *   §8  render       — state → screen (reads only)
- *   §9  screen       — terminal lifecycle (init / resize / teardown)
- *   §10 app          — input events + fixed-timestep main loop
+ * Refs: Reynolds, "Steering Behaviors for Autonomous Characters" (GDC 1999) for
+ * leader/follower formation motion; Williams, *The Animator's Survival Kit* for
+ * the looping wing-flap cycle.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : V-formation particle system with triangular row layout.
- *                  Row r contains r+1 bats; total bats = (n+1)(n+2)/2
- *                  (triangular number).  Each bat's position is computed
- *                  analytically from formation heading angle, row index, and
- *                  column index — no physics integration, pure kinematics.
- *
- * Data-structure : Fixed-size formation array; each formation stores heading
- *                  (angle), velocity, flight state (FLYING / HOLDING), and
- *                  n_rows.  Bats within a formation are reconstructed each
- *                  frame from the formation's leader, avoiding per-bat storage
- *                  for the wedge shape.
- *
- * Math           : Row r, column c bat offset from leader:
- *                    dx = c·SPACING_X − r·SPACING_X/2  (fan-out)
- *                    dy = r·SPACING_Y                   (depth behind leader)
- *                  Rotation matrix applied to (dx,dy) using formation heading θ.
- *
- * Rendering      : 4-frame wing cycle (0→up, 1→level, 2→down, 3→level)
- *                  implemented as a triangle wave index: frame%4 maps to
- *                  one of 3 ASCII bat shapes.  Leader drawn bold.
- *
- * References     : Formation flight & group motion —
- *  • Reynolds, C.W. "Flocks, Herds, and Schools: A Distributed Behavioral
- *    Model," SIGGRAPH 1987 — the boids model; canonical reference for animated
- *    groups of creatures. (Here the formation is SCRIPTED geometry, not emergent
- *    flocking, but the leader/follower idea descends from this line.)
- *  • Reynolds, C.W. "Steering Behaviors For Autonomous Characters," GDC 1999 —
- *    leader following, offset pursuit and formation motion: directly the leader
- *    + follower-row layout each formation flies in.
- *  • Lissaman, P.B.S. & Shollenberger, C.A. "Formation Flight of Birds,"
- *    Science 168 (1970) — the aerodynamics behind echelon / V formations; the
- *    real-world inspiration for the triangular flight wedge.
- *                  Animation, kinematics & rendering —
- *  • Williams, R. *The Animator's Survival Kit* (Faber, 2001) — keyframe cycles;
- *    the 4-frame wing flap (WING_CYCLE) is a looping flap cycle.
- *  • Lengyel, E. *Mathematics for 3D Game Programming and Computer Graphics*
- *    (3rd ed., 2011) — 2D rotation matrices + parametric constant-velocity
- *    motion: the heading-rotation of each bat's (dx,dy) offset and formation flight.
- *  • Fiedler, G. "Fix Your Timestep!" (gafferongames.com, 2004) — the fixed-
- *    timestep accumulator that decouples bat kinematics from frame rate.
- *  • Graham, Knuth & Patashnik, *Concrete Mathematics* (§1.2, figurate numbers)
- *    — the triangular number (n+1)(n+2)/2 that sizes each formation.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A V-formation isn't simulated bat-by-bat — it's a RIGID JIG that rides
- * on top of the leader.  Every follower's position is the leader's
- * position plus a fixed (along, perp) offset rotated into the formation's
- * heading.  Simulation is a single point per formation; everything else is
- * cosmetic geometry recomputed each frame.  The wing flap is a four-frame
- * cycle indexed by a per-bat phase counter, and the formation is a
- * triangular Pascal layout where row r holds r+1 bats.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Think of a paper-cutout V glued to the tip of an arrow.  The arrow
- * flies; the V flies with it, never deforming.  When the arrow flips to
- * a new heading, the V instantly re-orients — there is no inertia, no
- * per-bat physics, no flocking.  The "swarm" feel comes purely from
- * three independent arrows leaving the same origin at staggered times
- * along six preset compass directions.
- *
- * ALGORITHM IN STEPS  (per formation, per tick)
- * ──────────────────
- *  1. If FLIGHT_HOLDING, decrement timer; on zero, advance angle_idx, pick
- *     the next preset angle from k_angles[6], call formation_launch().
- *  2. formation_launch sets vx,vy = SPEED·(cos θ, sin θ) and re-places every
- *     bat at (cx,cy) using the formation jig.
- *  3. If FLIGHT_FLYING, advance every bat by (vx·dt, vy·dt) — same delta
- *     for all bats, so the formation is rigid by construction.
- *  4. Increment each bat's phase by 1; wrap at WING_CYCLE (=36 ticks).
- *  5. If the LEADER (bat 0) leaves the screen rect, switch to FLIGHT_HOLDING
- *     for HOLD_TICKS.
- *  6. Render: for each bat compute frame = phase·4/WING_CYCLE ∈ {0..3}
- *     and stamp the 3-cell glyph (lw, body, rw); leader uses A_BOLD.
- *
- * KEY FORMULAS
- * ────────────
- *  Pascal row of bat k :  largest r with r·(r+1)/2 <= k
- *  Position in row     :  pos = k − r·(r+1)/2          ∈ {0..r}
- *  Bat count           :  n_bats = (n_rows+1)·(n_rows+2)/2  (triangular)
- *  Flight-frame offset :  along = −r · LAG_PX
- *                         perp  = (pos − r/2) · SPREAD_PX
- *  World rotation      :  wx = lx + along·cos θ − perp·sin θ
- *                         wy = ly + along·sin θ + perp·cos θ
- *  Velocity            :  (vx, vy) = SPEED·(cos θ, sin θ)
- *  Wing frame index    :  frame = ⌊phase · 4 / WING_CYCLE⌋   (∈ 0..3)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Leader-exit detection uses bat[0] only — followers can briefly
- *    linger off-screen after the leader trips the bound; the cell-clip
- *    in formation_draw skips out-of-bounds glyphs so this is safe.
- *  • WING_CYCLE must be divisible by 4, else `frame` skips frames at
- *    the wrap point.  36 / 4 = 9, fine.
- *  • Growing rows mid-flight: new bats inherit current leader pos and
- *    velocity, so the formation snaps in rigidly without trailing.
- *  • Shrinking rows: tail bats are simply not iterated — old pixel
- *    positions remain in the slots but are never drawn.
- *  • Initial stagger uses (k_init_angle_idx − 1) so the post-hold
- *    increment lands on the intended first-launch heading.
- *  • Resize triggers full scene_init; current formation state is discarded
- *    intentionally rather than trying to re-anchor mid-flight.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Press `+` six times: row count must climb 3→4→5→6 then clamp.
- *    Bat counts per formation: 6, 10, 15, 21, 28.
- *  • Pause with space; the leaders sit at the centre and three V's
- *    fan out behind in their respective heading.  Count rows: should
- *    equal n_rows + 1 (leader is row 0).
- *  • Watch one bat through one flap: '/o\' → '-o-' → '\o/' → '-o-' →
- *    '/o\' over WING_CYCLE ticks (~0.6 s at 60 fps).
- *  • All three formations should never collide at t=0 — the STAGGER_TICKS
- *    delay puts them on the screen one at a time.
- *  • After leader exits, the formation reappears at centre after
- *    HOLD_TICKS ticks (≈0.9 s at 60 fps) heading 60° later in the
- *    six-preset cycle.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE (layer separation + abstraction) ────────────────────── *
- *
- * Single-concern layers; the table says what each layer MUTATES.  The
- * narrowest-type signature convention is now applied: a pure read takes
- * `const DomainType *`, a mutator takes `DomainType *`, and only the few
- * orchestrators that drive a whole tick/reset take `Scene *` — so although the
- * simulation DATA aggregates on Scene, the layers never re-couple through it.
- *
- *   LAYER        SECTION         MUTATES
- *   ─────        ───────         ───────
- *   PERFORMANCE  §2  clock       timing only — sim_accum / fps_accum / frame
- *                §10 app loop    timer / fps_display / sim_fps.  Never sim state.
- *   LOGIC        §4  coords      nothing — pure px↔cell conversions
- *                §6  logic       nothing — pure (bat_form_offset, leader_exited)
- *   SIMULATION   §7  simulation  Formation{ bats[].px/py/phase, vx, vy, angle,
- *                                 state, timer, angle_idx, n_rows, n_bats },
- *                                 Scene{ formations, n_rows, cols, rows, paused }
- *   RENDER       §3  color       ncurses colour pairs (setup only)
- *                §8  render      the ncurses frame buffer ONLY; reads sim state
- *                                 through const pointers, never writes it
- *
- * EFFECTS  — no standalone layer.  The only cosmetic state is each bat's wing
- *            `phase`; it is advanced inline in formation_tick (SIMULATION) and
- *            the 4-frame flap index + leader A_BOLD are DERIVED read-only at
- *            render time (formation_draw).  Nothing cosmetic is stored or
- *            updated apart from the sim tick, so there is no effects state to
- *            layer.
- * DELAYS   — no standalone layer.  The inter-flight hold and the launch
- *            stagger are the single `Formation.timer` field: set by
- *            formation_hold / scene_init, counted down inside formation_tick.
- *            Folded into SIMULATION because the function that advances flight
- *            is the same one that counts the hold.
- *
- * PER-TICK COMBINE — scene_tick (§7) is the ONE place that advances state.
- * It calls formation_tick for each formation; per formation, in explicit order:
- *     HOLDING state: DELAY countdown → on expiry SIM formation_launch (new heading)
- *     FLYING  state: SIM advance positions → advance wing phase
- *                  → LOGIC leader_exited? → DELAY formation_hold
- * Nothing else advances simulation state.
- *
- * USER EVENTS (NOT part of the tick) — these mutate state from §10 in response
- * to input, OUTSIDE scene_tick:
- *     scene_init        boot / 'r' reset / SIGWINCH resize
- *     scene_set_rows    '+' / '-'  (grow / shrink formation)
- *     paused toggle     'p' / space
- *     apply_theme       't' / 'T'   (App.theme — a RENDER setting, not sim state)
- *     sim_fps           '[' / ']'
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -249,9 +19,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — constants, palette data, timing macros ── */
 
 enum {
     SIM_FPS_DEFAULT =  60,
@@ -260,92 +28,72 @@ enum {
     SIM_FPS_STEP    =  10,
 
     /*
-     * CELL_W × CELL_H — physical pixels per terminal cell.
-     * Physics lives in pixel space so that diagonal motion is isotropic
-     * regardless of the non-square terminal cell aspect.
+     * CELL_W x CELL_H — sub-cell "pixels" per terminal character cell.  Motion
+     * is tracked in these pixels (not in whole cells) so that diagonal flight
+     * looks evenly paced even though terminal cells are taller than they are
+     * wide.
      */
     CELL_W = 8,
     CELL_H = 16,
 
     N_FORMATIONS = 3,
 
-    /*
-     * n_rows — number of follower rows behind the leader (1 = leader only pair,
-     * 6 = six rows deep).  n_bats = (n_rows+1)*(n_rows+2)/2.
-     * MAX_BATS covers the largest possible formation.
-     */
+    /* How many follower rows fan out behind the leader.  A deeper wedge holds
+     * more bats; the count grows as a triangular number (see bat_count). */
     ROWS_DEFAULT =  3,
     ROWS_MIN     =  1,
-    ROWS_MAX     =  6,   /* row 6 → 7 bats wide; comfortable on any terminal */
+    ROWS_MAX     =  6,   /* a 6-row wedge is 7 bats wide; fits any terminal */
 
-    /*
-     * STAGGER_TICKS — how many ticks each successive formation waits before
-     * launching.  Prevents all three formations overlapping at t=0.
-     */
-    STAGGER_TICKS = 30,
-    HOLD_TICKS    = 55,  /* ticks to hold at centre before re-launch */
+    STAGGER_TICKS = 30,  /* gap before each later formation launches, so the
+                          * three don't all leave the centre at once */
+    HOLD_TICKS    = 55,  /* how long a formation waits at centre before re-launch */
 
-    /*
-     * WING_CYCLE  — ticks for one complete flap.  36 @ 60 fps ≈ 0.6 s ≈ 1.7 Hz.
-     * WING_FRAMES — keyframes in that flap (up→level→down→level).  WING_CYCLE
-     *               must be divisible by WING_FRAMES so frame selection is even
-     *               (36 / 4 = 9 ticks per frame).
-     */
+    /* One full wing flap takes WING_CYCLE ticks, split into WING_FRAMES poses.
+     * WING_CYCLE must divide evenly by WING_FRAMES so each pose lasts the same
+     * number of ticks (36 / 4 = 9). */
     WING_CYCLE    = 36,
     WING_FRAMES   =  4,
 
     FPS_UPDATE_MS = 500,
 
-    /*
-     * Render-loop timing (consumed in main()).  Distinct from the SIM_FPS_* set:
-     * those set how often the sim TICKS; these bound the FRAME the user sees.
-     */
-    FRAME_CAP_FPS = 60,   /* present at most this many frames/sec       */
-    MAX_FRAME_MS  = 100,  /* clamp a long dt to this, so a stall can't  */
-                          /* spiral the sim into a catch-up death loop  */
+    /* Frame-pacing for the render loop.  Separate from SIM_FPS_*: those control
+     * how often the world updates; these control how often it's drawn. */
+    FRAME_CAP_FPS = 60,   /* draw at most this many frames per second */
+    MAX_FRAME_MS  = 100,  /* cap a long pause so the sim doesn't try to catch up
+                           * with a flood of ticks and lock up */
 
-    HUD_TITLE_COLS = 18,  /* min column for the stats block, so it never */
-                          /* collides with the left-justified title bar  */
+    HUD_TITLE_COLS = 18,  /* leftmost column the right-side stats may start at,
+                           * so they never overwrite the title */
 };
 
-/*
- * MAX_BATS — worst-case bat count per formation (n_rows = ROWS_MAX).
- * Triangular number: (ROWS_MAX+1)*(ROWS_MAX+2)/2.
- * ROWS_MAX=6 → 7*8/2 = 28.
- */
+/* Biggest a formation can ever get: a full ROWS_MAX wedge holds 28 bats. */
 #define MAX_BATS ((ROWS_MAX + 1) * (ROWS_MAX + 2) / 2)   /* = 28 */
 
 /*
- * FORMATION_SPEED — physical pixels per second.
- * LAG_PX          — along-flight gap between successive rows (pixels).
- * SPREAD_PX       — lateral gap per rank unit (pixels).
- *                   Row k sits at ±k × SPREAD_PX from the centreline.
+ * FORMATION_SPEED — flight speed in pixels per second.
+ * LAG_PX          — how far behind the leader each successive row sits (pixels).
+ * SPREAD_PX       — how far apart bats sit sideways within a row (pixels).
  */
 #define FORMATION_SPEED  260.0f
 #define LAG_PX            56.0f
 #define SPREAD_PX         32.0f
 
 /*
- * SECONDS_PER_TICK — sim time advanced per tick.  Deliberately tied to
- * SIM_FPS_DEFAULT, NOT the live sim_fps: changing Hz changes how OFTEN the sim
- * ticks (accumulator in main), while each tick always advances a fixed 1/60 s
- * of motion — so faster Hz reads as faster flight, by design.
- * PARK_PX — off-screen parking position for a held (invisible) formation's bats.
+ * SECONDS_PER_TICK — how much flight time one tick stands for.  Fixed at 1/60 s
+ * on purpose: the Hz key changes how often ticks happen, not how far each tick
+ * moves, so raising the Hz simply reads as faster flight.
+ * PARK_PX — a far-off-screen spot to hide a waiting formation's bats.
  */
 #define SECONDS_PER_TICK (1.0f / (float)SIM_FPS_DEFAULT)
 #define PARK_PX          (-99999.0f)
 
 /*
- * 6 preset flight angles (radians, y-down screen coordinates).
- * Screen y-down: sin > 0 = downward, sin < 0 = upward.
- *
- *   330° → upper-right    210° → upper-left    90° → straight down
- *    45° → lower-right    135° → lower-left   270° → straight up
- *
- * WHY presets, not random: scripted headings keep the three formations visually
- * separated and reproducible.  Each formation holds an `angle_idx` into this
- * table and advances it +1 mod N_ANGLES on every relaunch, so its successive
- * flights walk these six headings in order (see Formation.angle_idx).
+ * The six headings a formation cycles through, in radians.  Y points down on a
+ * terminal, so a positive sine means downward and a negative sine upward:
+ *   330 deg -> upper-right   210 deg -> upper-left    90 deg -> straight down
+ *    45 deg -> lower-right   135 deg -> lower-left   270 deg -> straight up
+ * Scripted (not random) so the three formations stay visually apart and the
+ * scene looks the same every run.
  */
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -362,10 +110,7 @@ static const float k_angles[6] = {
 #define NS_PER_MS   1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                       PERFORMANCE — monotonic time + sleep   */
-/* ===================================================================== */
-/* Mutates nothing.  Read by the §10 fixed-timestep loop only. */
+/* ── §2 clock — monotonic time and sleep ── */
 
 static int64_t clock_ns(void)
 {
@@ -384,25 +129,18 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                       RENDER setup — palettes + pair binding */
-/* ===================================================================== */
-/* Mutates ncurses colour pairs only (setup / 't'-'T' key).  No sim state. */
+/* ── §3 color — theme palettes and colour-pair binding ── */
 
 /*
- * ColorID — names for the ncurses colour-pair slots this program allocates.
- *
- * WHY: ncurses addresses colours by small integer "pair" handles (defined with
- * init_pair, selected with COLOR_PAIR); naming them keeps every call site
- * readable instead of scattering magic 1..5.  The values ARE the literal pair
- * slots — they start at 1 because ncurses reserves pair 0 for the terminal's
- * default foreground/background, which cannot be redefined.
- *
- * Two groups, split by concern:
- *   COL_G0..COL_G2  — one slot per formation (3 = N_FORMATIONS).  RENDER-themed:
- *                     apply_theme() rebinds these to the active palette (t/T).
- *   COL_HUD/COL_HINT— fixed HUD slots, never themed, so the overlay stays
- *                     legible against any palette (project HUD standard).
+ * ColorID — friendly names for the numbered colour slots ("pairs") this program
+ * uses.  ncurses identifies each foreground/background combination by a small
+ * integer, so we name them instead of sprinkling bare 1..5 through the code.
+ * The numbers start at 1 because slot 0 is reserved for the terminal's own
+ * default colours and can't be changed.
+ *   COL_G0..COL_G2  — one slot per formation; apply_theme() rebinds these when
+ *                     the user cycles themes with t/T.
+ *   COL_HUD/COL_HINT— the on-screen text overlay; fixed colours, never themed,
+ *                     so the HUD stays readable over any palette.
  */
 typedef enum {
     COL_G0   = 1,   /* formation 0 — themed (rebound by apply_theme)        */
@@ -413,16 +151,12 @@ typedef enum {
 } ColorID;
 
 /*
- * Colour themes — the palette table, indexed by App.theme (0..N_THEMES-1, the
- * value t/T cycles).  Each ROW gives the N_FORMATIONS formation colours (one
- * per wedge); the columns line up with COL_G0/G1/G2.
- *
- * Value logic: entries are xterm-256 cube indices, all chosen from the BRIGHT
- * half of the cube — bottom-of-palette colours go invisible against black under
- * A_DIM, so even a theme's darkest hue stays legible (project palette rule).
- * Each row's three hues are kept distinct so the three formations read apart.
- * theme_names[] is the parallel HUD label for each row.  On an 8-colour
- * terminal apply_theme() ignores this table and falls back to magenta/cyan/white.
+ * The colour themes, one per row, picked by App.theme (cycled with t/T).  Each
+ * row lists the three formation colours, lined up with COL_G0/G1/G2; the values
+ * are xterm-256 colour codes, all from the bright half of the range so even the
+ * darkest hue stays visible against black.  theme_names[] is the matching HUD
+ * label.  On an 8-colour terminal apply_theme() ignores this and uses
+ * magenta/cyan/white instead.
  */
 #define N_THEMES 5
 static const char *const theme_names[N_THEMES] = {
@@ -436,9 +170,9 @@ static const short bat_themes[N_THEMES][N_FORMATIONS] = {
     { 213, 226,  51 },   /* CANDY  — pink / yellow / cyan   */
 };
 
-/* apply_theme — (re)bind the formation colour pairs to theme t. Safe at
- * runtime (t/T key); the next refresh shows the new palette. 8-colour fallback
- * uses fixed magenta/cyan/white regardless of theme. */
+/* Point the three formation colour slots at theme t.  Safe to call live (t/T);
+ * the change shows on the next redraw.  Falls back to magenta/cyan/white on
+ * terminals that lack 256 colours. */
 static void apply_theme(int t)
 {
     if (t < 0 || t >= N_THEMES) t = 0;
@@ -466,157 +200,96 @@ static void color_init(void)
     apply_theme(0);   /* default theme */
 }
 
-/* ===================================================================== */
-/* §4  coords                      LOGIC — pure pixel ↔ cell conversions  */
-/* ===================================================================== */
-/* Pure: no mutation, no I/O.  Used by both LOGIC (§6) and RENDER (§8). */
+/* ── §4 coords — convert between pixels and character cells ── */
 
 static inline int   px_to_col(float px) { return (int)(px / CELL_W); }
 static inline int   px_to_row(float py) { return (int)(py / CELL_H); }
 static inline float col_to_px(int col)  { return (float)col * CELL_W + CELL_W * 0.5f; }
 static inline float row_to_px(int row)  { return (float)row * CELL_H + CELL_H * 0.5f; }
 
-/* ===================================================================== */
-/* §5  data                        type definitions (no behaviour)        */
-/* ===================================================================== */
-/*
- * All structs/enums live here so LOGIC (§6), SIMULATION (§7) and RENDER (§8)
- * can each reference them without one layer's types living inside another.
- * Defining the data has no read/mutate role of its own.
- */
+/* ── §5 data — the types (Bat, Formation, Scene, Screen) ── */
 
 /*
- * Bat — one animated bat: its body-cell position and where it is in the flap.
- *
- * WHY pixel space: position is held in sub-cell "pixels" (CELL_W×CELL_H per
- * character cell, §1) rather than integer row/col, so diagonal flight is
- * isotropic on a non-square terminal cell.  The single px→cell conversion
- * happens in the coords layer (§4), at draw time only.  `phase` is the program's
- * ONLY cosmetic state; everything else about a bat is derived from its formation.
- *
- * Refs: Lengyel, *Math for 3D Game Programming* — constant-velocity parametric
- * motion (each bat advances by the shared formation velocity); Williams,
- * *Animator's Survival Kit* — `phase` drives the looping keyframe flap.
+ * Bat — one drawn bat: where its body is, and how far through its wing flap.
+ * Position is kept in pixels (see §1) rather than whole cells so diagonal
+ * flight looks evenly paced; the conversion to a cell happens only at draw time.
  */
 typedef struct {
-    float px, py;   /* body-cell centre, pixel space (CELL_W×CELL_H per cell)    */
-    float phase;    /* flap position in ticks, [0, WING_CYCLE); the draw frame   */
-                    /* is derived by wing_frame() — the only cosmetic state      */
+    float px, py;   /* body centre in pixels (origin top-left, x right, y down) */
+    float phase;    /* where in the flap, 0 .. WING_CYCLE; wing_frame() turns it
+                     * into one of the four wing poses */
 } Bat;
 
 /*
- * Flight — the two states of a formation's launch cycle (a 2-state machine).
- *
- * WHY: a formation does not live forever on screen.  When its leader crosses
- * the edge it vanishes, waits, then relaunches in a new direction.  That wait
- * is FLIGHT_HOLDING, and it is also where the DELAYS concern lives (the
- * countdown is Formation.timer).  States are compared by name, so their numeric
- * order carries no meaning.
- *
- * Ref: Reynolds, "Steering Behaviors for Autonomous Characters" (GDC 1999) —
- * launch / re-spawn of a leader-led group.
+ * Flight — which of two states a formation is in.  A formation flies until its
+ * leader leaves the screen, then waits hidden at the centre, then launches
+ * again in a new direction.  The names are what matter; the numbers don't.
  */
 typedef enum {
-    FLIGHT_HOLDING,   /* at centre between flights: invisible, timer counting down */
-    FLIGHT_FLYING,    /* airborne: bats advance each tick until the leader exits    */
+    FLIGHT_HOLDING,   /* hidden at centre between flights, counting down to launch */
+    FLIGHT_FLYING,    /* on screen, advancing every tick until the leader exits    */
 } Flight;
 
 /*
- * Formation — one V-wedge of bats sharing a single heading and velocity.
- *
- * WHY one struct, not N independent bats: the wedge is a RIGID JIG.  Only the
- * leader (bat 0, the tip) has a real trajectory; every follower's world
- * position is the leader's plus a fixed (along, perp) offset rotated into the
- * heading (bat_form_offset + formation_place_bat, §6/§7).  So the struct stores
- * ONE motion state (vx, vy, angle) shared by all bats and recomputes the shape
- * from it each frame — no per-follower physics, no inertia, no flocking.
- *
- * Shape: a filled Pascal triangle, row r holding r+1 bats; the live count is
- * therefore the triangular number (n_rows+1)(n_rows+2)/2.
- *
- * Refs: Reynolds (SIGGRAPH 1987 / GDC 1999) — leader/follower & formation
- * motion; Lissaman & Shollenberger (Science 1970) — the V / echelon wedge;
- * Lengyel (2011) — the 2D rotation of each offset into the heading;
- * Graham/Knuth/Patashnik, *Concrete Mathematics* §1.2 — the triangular number.
+ * Formation — one V-shaped wedge of bats that all share a single heading and
+ * speed.  Only the leader (bat 0, at the tip) really moves; each follower's
+ * spot is the leader's spot plus a fixed offset turned to face the heading, so
+ * the whole wedge holds its shape like a rigid cut-out.  That's why one struct
+ * holds the motion once instead of giving every bat its own — there's no
+ * per-bat physics.  The bats form a filled triangle, row r holding r+1 of them.
  */
 typedef struct {
-    Bat     bats[MAX_BATS];   /* fixed pool (28 = worst case); only [0,n_bats) used; */
-                              /* bat 0 = leader at the tip.  No malloc (mem rule).   */
-    int     n_rows;           /* Pascal-triangle depth: follower rows, 1..ROWS_MAX(6) */
-    int     n_bats;           /* live count; invariant (n_rows+1)(n_rows+2)/2 ⇒ 3..28 */
-    float   vx, vy;           /* px/sec; = FORMATION_SPEED·(cosθ,sinθ); SAME for all  */
-                              /* bats — that shared delta is what keeps the wedge rigid */
-    float   angle;            /* heading θ, radians, y-down; always one of k_angles    */
-    ColorID color;            /* this wedge's colour-pair slot; set once from k_colors */
-    Flight  state;            /* FLIGHT_HOLDING (waiting) or FLIGHT_FLYING (airborne)  */
-    int     timer;            /* DELAYS: ticks left while HOLDING; reaches ≤0 ⇒ relaunch */
-    int     angle_idx;        /* cursor into k_angles[N_ANGLES]; +1 mod 6 per relaunch  */
-                              /* so successive flights cycle the six compass presets    */
+    Bat     bats[MAX_BATS];   /* slots for the bats; only [0, n_bats) are in use,
+                               * bat 0 is the leader.  Fixed pool, never malloc'd */
+    int     n_rows;           /* follower rows behind the leader, 1 .. ROWS_MAX */
+    int     n_bats;           /* live bat count = (n_rows+1)(n_rows+2)/2, 3 .. 28 */
+    float   vx, vy;           /* velocity in pixels/sec; the same for every bat,
+                               * which is what keeps the wedge rigid */
+    float   angle;            /* heading in radians; always one of k_angles */
+    ColorID color;            /* this wedge's colour slot; set once, never changed */
+    Flight  state;            /* flying, or holding at centre */
+    int     timer;            /* ticks left while holding; at 0 or below it relaunches */
+    int     angle_idx;        /* which of k_angles is current; steps +1 each relaunch
+                               * so successive flights walk the six headings in turn */
 } Formation;
 
 /*
- * Scene — the whole simulated world; reads top-to-bottom as a table of contents.
- *
- * WHY one aggregate: it is the single value the orchestrators (scene_init /
- * scene_tick / scene_set_rows, §7) own and advance, while every other function
- * takes the narrowest sub-type it needs (a Formation*, or a const view) — so
- * "all sim data hangs off Scene" WITHOUT the layers re-coupling through it.
- * Holds ONLY simulation state: the colour theme is a RENDER setting and lives on
- * App, deliberately not here, so a reset/resize that rebuilds Scene cannot
- * disturb the palette.
+ * Scene — the whole simulated world in one value.  It holds only simulation
+ * state; the colour theme lives on App instead, so resetting or resizing (which
+ * rebuilds the Scene) never disturbs the chosen palette.
  */
 typedef struct {
-    Formation formations[N_FORMATIONS];  /* WHAT:  the 3 flying wedges             */
-    int       n_rows;                    /* HOW:   shared wedge depth, 1..6 (+/-)  */
-    int       cols, rows;                /* WHERE: viewport in cells — Scene's OWN */
-                                         /*        copy of the terminal size (decoupled */
-                                         /*        from Screen; see below)         */
-    bool      paused;                    /* WHEN:  true ⇒ scene_tick is a no-op    */
+    Formation formations[N_FORMATIONS];  /* the three wedges */
+    int       n_rows;                    /* shared wedge depth, set by +/- keys */
+    int       cols, rows;                /* viewport size in cells; the sim's own
+                                          * copy, so it never reads from Screen */
+    bool      paused;                    /* when true, scene_tick does nothing */
 } Scene;
 
 /*
- * Screen — cached terminal size in character cells, for the render / I-O layer.
- *
- * WHY separate from Scene's cols/rows: this is the terminal geometry as ncurses
- * reports it (getmaxyx at init and on every SIGWINCH).  Scene keeps its OWN
- * copy so the simulation never reaches into the I/O layer for its bounds; the
- * two are synced at scene_init time, then read independently.
+ * Screen — the terminal size in cells, as ncurses reports it (at start-up and
+ * on every resize).  Kept apart from Scene's own cols/rows so the simulation
+ * never reaches into the I/O side for its bounds; the two are synced when the
+ * scene is built, then read independently.
  */
-typedef struct { int cols, rows; } Screen;   /* cells, ≥1; refreshed on resize */
+typedef struct { int cols, rows; } Screen;
 
-/* ===================================================================== */
-/* §6  logic                       LOGIC — pure decisions, no mutation    */
-/* ===================================================================== */
-/*
- * Provably uncorruptible from EFFECTS or RENDER: these functions do no
- * mutation and no I/O, so reordering or deleting any render/effects code
- * cannot change their result.  bat_form_offset writes only its caller-owned
- * out-params; leader_exited reads through a const pointer and returns a bool.
- */
+/* ── §6 logic — pure geometry and tests, no state changes ── */
 
 /*
- * bat_form_offset — formation position of bat k in flight-frame coordinates.
- *
- * Bats are laid out in a filled triangle (Pascal rows):
- *   Row r contains r+1 bats: indices r*(r+1)/2 … (r+1)*(r+2)/2 − 1.
- *
- * To find row r from k, we walk up until the next row would overshoot k.
- * Position within row:  pos = k − r*(r+1)/2,  ranging 0 … r.
- *
- * along = −r × LAG_PX          (behind the leader)
- * perp  = (pos − r/2) × SPREAD_PX  (centred on the leader's lateral axis)
- *
- *   r=0, pos=0:  perp = 0                           (leader)
- *   r=1, pos=0:  perp = −½S   pos=1: +½S            (2 bats)
- *   r=2, pos=0:  perp = −S    pos=1:  0   pos=2: +S (3 bats)
- *   r=3, pos=0:  perp = −3/2S … pos=3: +3/2S        (4 bats)
+ * Where bat k sits within the wedge, measured from the leader: how far back
+ * (`along`, negative = behind) and how far to the side (`perp`).  The bats fill
+ * a triangle — the first row has 1 bat, the next 2, the next 3, and so on — so
+ * we first find which row r bat k is in by counting rows until adding one more
+ * would pass k, then find its place within that row.  Each row sits one LAG_PX
+ * further back, and the bats in a row spread out by SPREAD_PX, centred on the
+ * leader's line.
  */
 static void bat_form_offset(int k, float *along, float *perp)
 {
-    /* Determine row r: largest r with r*(r+1)/2 <= k */
     int r = 0;
-    while ((r + 1) * (r + 2) / 2 <= k) r++;
-    int pos = k - r * (r + 1) / 2;
+    while ((r + 1) * (r + 2) / 2 <= k) r++;   /* row of bat k */
+    int pos = k - r * (r + 1) / 2;            /* its place within that row, 0..r */
 
     *along = -(float)r * LAG_PX;
     *perp  = ((float)pos - (float)r * 0.5f) * SPREAD_PX;
@@ -629,50 +302,31 @@ static bool leader_exited(const Formation *f, int cols, int rows)
     return (c < -2 || c > cols + 1 || r < -2 || r > rows + 1);
 }
 
-/* bat_count — how many bats a wedge of n_rows follower rows holds: the
- * triangular number (n_rows+1)(n_rows+2)/2 (Concrete Mathematics §1.2).  One
- * name for a formula the sim and the HUD both need. */
+/* How many bats a wedge of n_rows follower rows holds.  Adding up 1 + 2 + ... +
+ * (n_rows+1) gives (n_rows+1)(n_rows+2)/2.  Both the sim and the HUD need it. */
 static int bat_count(int n_rows)
 {
     return (n_rows + 1) * (n_rows + 2) / 2;
 }
 
-/* ===================================================================== */
-/* §7  simulation                  SIMULATION — the only state-advancing  */
-/* ===================================================================== */
-/*
- * Mutates Formation{ bats[].px/py/phase, vx, vy, angle, state, timer,
- * angle_idx, n_rows, n_bats } and Scene{ formations, n_rows, cols, rows,
- * paused }.
- *
- * scene_tick is the ONE per-tick combine point (see ARCHITECTURE).  The other
- * mutating functions here are either its callees or USER-EVENT entry points
- * (scene_init, scene_set_rows) invoked from §10, NOT from the tick.
- *
- * The wing `phase` advance (the only cosmetic / EFFECTS state) and the hold
- * `timer` countdown (the only DELAYS state) are both folded in here rather
- * than split out — see ARCHITECTURE for why neither earns its own layer.
- */
+/* ── §7 simulation — the only code that advances the world ── */
 
 /*
- * Per-formation init tables, indexed by formation number (0..N_FORMATIONS-1):
- *   k_init_angle_idx — each formation's STARTING heading, as an index into
- *                      k_angles.  {0,1,2} = three different presets, so the
- *                      formations diverge from t=0 instead of overlapping
- *                      (paired with the STAGGER_TICKS launch delay in scene_init).
- *   k_colors         — each formation's colour-pair slot, assigned once in
- *                      scene_init and never reassigned (a theme change remaps
- *                      what the slot LOOKS like, not which slot a formation owns).
+ * Per-formation setup tables, one entry per formation:
+ *   k_init_angle_idx — the heading each formation starts on (an index into
+ *                      k_angles).  Three different values so the formations
+ *                      head different ways from the start.
+ *   k_colors         — each formation's colour slot, fixed once and never
+ *                      changed (a theme change recolours the slot, not which
+ *                      slot a formation owns).
  */
 static const int     k_init_angle_idx[N_FORMATIONS] = { 0, 1, 2 };
 static const ColorID k_colors[N_FORMATIONS]         = { COL_G0, COL_G1, COL_G2 };
 
 /*
- * staggered_wing_phase — the initial flap phase for bat k of n_bats.
- * Spreads the bats evenly around the cycle (k·WING_CYCLE/n_bats) plus a small
- * random jitter (< one frame), so the wings do NOT all flap in unison — the
- * formation reads as a living swarm rather than a rigid stamp.  Wrapped into
- * [0, WING_CYCLE).
+ * A starting flap position for bat k, spread evenly around the cycle plus a
+ * little random jitter, so the bats don't all flap in lockstep and the wedge
+ * looks alive rather than stamped.  Kept within [0, WING_CYCLE).
  */
 static float staggered_wing_phase(int k, int n_bats)
 {
@@ -683,20 +337,16 @@ static float staggered_wing_phase(int k, int n_bats)
 }
 
 /*
- * formation_place_bat — write bat k's world position and starting flap phase,
- * given the leader at (lx, ly) and the formation's heading.
+ * Place bat k on screen: take its offset within the wedge and turn it to point
+ * along the formation's heading, then add it to the leader's spot (lx, ly).
+ * Also give it a starting flap position.
  */
 static void formation_place_bat(Formation *f, int k, float lx, float ly)
 {
     float along, perp;
     bat_form_offset(k, &along, &perp);
 
-    /*
-     * Rotate flight-frame offset into world pixel space.
-     * Flight frame axes:
-     *   along → (cos_a,  sin_a)   forward
-     *   perp  → (−sin_a, cos_a)   left-normal
-     */
+    /* rotate the (along, perp) offset to face the heading */
     float cos_a = cosf(f->angle);
     float sin_a = sinf(f->angle);
     f->bats[k].px = lx + along * cos_a - perp * sin_a;
@@ -726,16 +376,10 @@ static void formation_hold(Formation *f, int ticks)
 }
 
 /*
- * formation_set_rows — resize the wedge to new_rows while preserving motion.
- *
- * Growing (new_rows > f->n_rows):
- *   New bats are placed at the correct formation positions relative to the
- *   leader's current pixel location and given random wing phases.  They
- *   immediately inherit the formation velocity so the wedge stays rigid.
- *
- * Shrinking (new_rows < f->n_rows):
- *   Simply decrement n_bats/n_rows — the tail bats are no longer iterated
- *   or drawn.  No memory needs clearing; the slots are just ignored.
+ * Resize a wedge to new_rows without interrupting its flight.  Growing it slots
+ * the extra bats into place behind the current leader so they fall straight
+ * into formation; shrinking it just lowers the count, leaving the now-unused
+ * tail slots to be ignored.
  */
 static void formation_set_rows(Formation *f, int new_rows)
 {
@@ -755,49 +399,47 @@ static void formation_set_rows(Formation *f, int new_rows)
     }
 }
 
-/* advance_to_next_heading — step angle_idx to the next compass preset and
- * adopt that heading (the +1-mod-N_ANGLES cycle through k_angles). */
+/* Move to the next heading in the six-direction cycle. */
 static void advance_to_next_heading(Formation *f)
 {
     f->angle_idx = (f->angle_idx + 1) % N_ANGLES;
     f->angle     = k_angles[f->angle_idx];
 }
 
-/* formation_advance — move every bat one tick along the shared velocity and
- * step its wing flap (wrapping the phase).  The whole wedge translates rigidly
- * because the delta is identical for all bats. */
+/* Move every bat one tick forward and step its wing flap.  All bats share the
+ * same velocity, so the wedge slides along without changing shape. */
 static void formation_advance(Formation *f)
 {
     for (int k = 0; k < f->n_bats; k++) {
         Bat *b = &f->bats[k];
         b->px    += f->vx * SECONDS_PER_TICK;
         b->py    += f->vy * SECONDS_PER_TICK;
-        b->phase += 1.0f;                                   /* one tick of flap */
+        b->phase += 1.0f;
         if (b->phase >= (float)WING_CYCLE) b->phase -= (float)WING_CYCLE;
     }
 }
 
 static void formation_tick(Formation *f, float cx, float cy, int cols, int rows)
 {
-    if (f->state == FLIGHT_HOLDING) {                       /* waiting to relaunch */
-        if (--f->timer <= 0) {
+    if (f->state == FLIGHT_HOLDING) {
+        if (--f->timer <= 0) {                /* wait's over: launch a new flight */
             advance_to_next_heading(f);
             formation_launch(f, cx, cy);
         }
         return;
     }
 
-    formation_advance(f);                                  /* fly + flap          */
-    if (leader_exited(f, cols, rows))                      /* gone? park & wait    */
+    formation_advance(f);
+    if (leader_exited(f, cols, rows))         /* off screen: park and wait */
         formation_hold(f, HOLD_TICKS);
 }
 
 /*
- * formation_init — place formation `slot` in its starting state at centre
- * (cx, cy): give it the shared depth, its preset colour and heading, then
- * either launch it (slot 0, flies immediately) or hold it for a staggered
- * entrance.  Held formations rewind angle_idx by one so the increment applied
- * on their first relaunch lands back on k_init_angle_idx[slot].
+ * Set formation `slot` to its starting state at the centre (cx, cy): its depth,
+ * colour and heading.  Formation 0 launches at once; the others start holding
+ * so they enter a little later, one after another.  A held formation rewinds
+ * its heading index by one, because the relaunch will step it forward again and
+ * we want it to land back on the intended starting heading.
  */
 static void formation_init(Formation *f, int slot, int n_rows, float cx, float cy)
 {
@@ -815,14 +457,14 @@ static void formation_init(Formation *f, int slot, int n_rows, float cx, float c
     }
 }
 
-/* scene_init — USER-EVENT entry point (boot / 'r' reset / SIGWINCH resize).
- * NOT part of the per-tick combine. */
+/* Build (or rebuild) the whole scene at the given size.  Called at start-up, on
+ * 'r' reset, and on resize. */
 static void scene_init(Scene *s, int cols, int rows)
 {
     s->cols   = cols;
     s->rows   = rows;
     s->paused = false;
-    /* Preserve n_rows across resets; first call sets default. */
+    /* keep the current depth across a reset; only the very first call defaults it */
     if (s->n_rows < ROWS_MIN || s->n_rows > ROWS_MAX)
         s->n_rows = ROWS_DEFAULT;
 
@@ -833,13 +475,8 @@ static void scene_init(Scene *s, int cols, int rows)
         formation_init(&s->formations[i], i, s->n_rows, cx, cy);
 }
 
-/*
- * scene_set_rows — resize all formations by delta (+1 or −1).
- * Clamps to [ROWS_MIN, ROWS_MAX].  Applied immediately: flying formations gain
- * or lose bats without waiting for the next reset.
- *
- * USER-EVENT entry point ('+' / '-'); NOT part of the per-tick combine.
- */
+/* Grow or shrink every formation by one row (the +/- keys), clamped to the
+ * allowed range.  Takes effect right away, even mid-flight. */
 static void scene_set_rows(Scene *s, int delta)
 {
     int new_rows = s->n_rows + delta;
@@ -849,10 +486,7 @@ static void scene_set_rows(Scene *s, int delta)
         formation_set_rows(&s->formations[i], new_rows);
 }
 
-/* scene_tick — THE per-tick combine.  The single place that advances
- * simulation state; nothing else does.  Per formation it runs the order
- * documented in the ARCHITECTURE block (HOLDING countdown→launch, or FLYING
- * advance→phase→leader-exit→hold). */
+/* Advance the world by one tick: the one place the simulation moves forward. */
 static void scene_tick(Scene *s)
 {
     if (s->paused) return;
@@ -862,35 +496,22 @@ static void scene_tick(Scene *s)
         formation_tick(&s->formations[i], cx, cy, s->cols, s->rows);
 }
 
-/* ===================================================================== */
-/* §8  render                      RENDER — state → screen, reads only    */
-/* ===================================================================== */
-/*
- * Mutates the ncurses frame buffer ONLY.  Every function reads simulation
- * state through const pointers (formation_draw / scene_draw) or recomputes
- * derived values (the flap `frame`, leader A_BOLD) at draw time — it never
- * writes Formation/Scene fields.  Driven once per FRAME from §10, separate
- * from the per-tick combine.
- */
+/* ── §8 render — draw the world to the screen, never changing it ── */
 
 /*
- * Wing glyphs — the four keyframes of one flap, as a triangle wave:
- *   frame   0    1    2    3     (then repeats)
- *   shape  /o\  -o-  \o/  -o-    up → level → down → level
- * k_bat_lw / k_bat_rw are the left / right wing chars for each frame; drawn on
- * either side of BAT_BODY they read as a flapping bat.  wing_frame() (below)
- * maps a phase to its frame index.
- * Body 'o' is direction-neutral so it looks right on any heading.  All glyphs
- * are plain ASCII (project ASCII-only rule).
- * Ref: Williams, *Animator's Survival Kit* — a looping keyframe cycle.
+ * The four wing poses of one flap.  Read side by side with the body, they give
+ * the up/level/down/level look of a flapping bat:
+ *   pose    0    1    2    3
+ *   shape  /o\  -o-  \o/  -o-
+ * Body 'o' looks the same in any direction.  All plain ASCII so they render the
+ * same everywhere.
  */
-static const char k_bat_lw[WING_FRAMES] = { '/', '-', '\\', '-' };  /* left wing, per frame  */
-static const char k_bat_rw[WING_FRAMES] = { '\\', '-', '/', '-' };  /* right wing, per frame */
-#define BAT_BODY 'o'                                                /* direction-neutral body */
+static const char k_bat_lw[WING_FRAMES] = { '/', '-', '\\', '-' };  /* left wing per pose  */
+static const char k_bat_rw[WING_FRAMES] = { '\\', '-', '/', '-' };  /* right wing per pose */
+#define BAT_BODY 'o'
 
-/* wing_frame — which of the WING_FRAMES keyframes a flap phase falls in
- * (0..WING_FRAMES-1): ⌊phase·WING_FRAMES/WING_CYCLE⌋.  Clamped defensively so a
- * stray phase can never index past the glyph tables. */
+/* Which wing pose a flap position falls in.  Clamped so a stray value can never
+ * read past the wing tables. */
 static int wing_frame(float phase)
 {
     int frame = (int)phase * WING_FRAMES / WING_CYCLE;
@@ -898,15 +519,14 @@ static int wing_frame(float phase)
     return frame;
 }
 
-/* bat_glyph_on_screen — true when the 3-cell glyph (col-1 .. col+1 on row) sits
- * wholly inside the viewport, so drawing it clips nothing at an edge. */
+/* True when all three cells of a bat fit on screen, so none get clipped. */
 static bool bat_glyph_on_screen(int col, int row, int cols, int rows)
 {
     return row >= 0 && row < rows && col - 1 >= 0 && col + 1 < cols;
 }
 
-/* stamp_bat — paint one bat as left-wing / body / right-wing across three cells
- * in the formation's colour.  The leader (tip of the V) is bold to stand out. */
+/* Draw one bat as left-wing / body / right-wing in its formation's colour; the
+ * leader is bold so the tip of the V stands out. */
 static void stamp_bat(WINDOW *w, int row, int col, int frame, ColorID color, bool leader)
 {
     attr_t attr = COLOR_PAIR((int)color);
@@ -920,7 +540,7 @@ static void stamp_bat(WINDOW *w, int row, int col, int frame, ColorID color, boo
 
 static void formation_draw(const Formation *f, WINDOW *w, int cols, int rows)
 {
-    if (f->state == FLIGHT_HOLDING) return;   /* parked off-screen: nothing to draw */
+    if (f->state == FLIGHT_HOLDING) return;   /* hidden at centre: nothing to draw */
 
     for (int k = 0; k < f->n_bats; k++) {
         const Bat *b = &f->bats[k];
@@ -937,16 +557,15 @@ static void scene_draw(const Scene *s, WINDOW *w)
         formation_draw(&s->formations[i], w, s->cols, s->rows);
 }
 
-/* hud_bar — fill a HUD row with spaces so it reads as a clean bar over the
- * animation (the bats are drawn first; the bar then covers that row). */
+/* Blank a HUD row with spaces so the text sits on a clean bar instead of over
+ * the bats (which are drawn first). */
 static void hud_bar(int row, int cols)
 {
     for (int x = 0; x < cols; x++) mvaddch(row, x, ' ');
 }
 
-/* hud_title_stats — row 0: title (left) + live fps / Hz / run-state (right).
- * The stats block is right-justified but clamped to HUD_TITLE_COLS so it never
- * overruns the title on a narrow terminal. */
+/* Top row: title on the left, live fps / Hz / run-state on the right.  The
+ * right-side block is held back from overrunning the title on a narrow screen. */
 static void hud_title_stats(int cols, double fps, int sim_fps, bool paused)
 {
     hud_bar(0, cols);
@@ -961,8 +580,8 @@ static void hud_title_stats(int cols, double fps, int sim_fps, bool paused)
     attroff(COLOR_PAIR(COL_HUD) | A_BOLD);
 }
 
-/* hud_params — row 1: the tunable parameters (active theme, formation depth and
- * the bat count it implies).  No bold, so row 0 stays the dominant line. */
+/* Second row: the adjustable settings (theme, wedge depth, total bat count).
+ * Not bold, so the top row stays the dominant line. */
 static void hud_params(int cols, int theme, int n_rows)
 {
     hud_bar(1, cols);
@@ -975,7 +594,7 @@ static void hud_params(int cols, int theme, int n_rows)
     attroff(COLOR_PAIR(COL_HUD));
 }
 
-/* hud_keys — bottom row: the action legend, listing every interactive key. */
+/* Bottom row: the list of keys the user can press. */
 static void hud_keys(int cols, int rows)
 {
     int brow = rows - 1;
@@ -986,12 +605,7 @@ static void hud_keys(int cols, int rows)
     attroff(COLOR_PAIR(COL_HINT) | A_BOLD);
 }
 
-/*
- * screen_draw — render one frame: the bats, then the HUD overlaid in three
- * bands.  Bars are filled first so the animation never shows through the text.
- * Scene is read const, never mutated; `theme` is passed in (it lives on App, a
- * render setting).
- */
+/* Draw one full frame: the bats first, then the three HUD rows on top. */
 static void screen_draw(const Screen *s, const Scene *sc, double fps,
                         int sim_fps, int theme)
 {
@@ -1004,11 +618,7 @@ static void screen_draw(const Screen *s, const Scene *sc, double fps,
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §9  screen                      terminal lifecycle (init/resize/free)  */
-/* ===================================================================== */
-/* Mutates terminal mode + the Screen{cols,rows} cache.  USER-EVENT / setup
- * (boot, SIGWINCH); not part of the per-tick combine. */
+/* ── §9 screen — terminal setup, resize, and teardown ── */
 
 static void screen_init(Screen *s)
 {
@@ -1032,44 +642,23 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* ===================================================================== */
-/* §10  app                        input events + fixed-timestep loop     */
-/* ===================================================================== */
-/*
- * PERFORMANCE: the main loop owns the fixed-timestep accumulator, the 60 fps
- * frame cap and the fps display — it advances timing state, never sim state
- * directly.  It drives the layers in this per-FRAME order:
- *   resize (USER EVENT) → SIM combine (scene_tick, N× per frame) → fps calc
- *   → sleep → RENDER (screen_draw/present) → input (USER EVENT, app_handle_key)
- * USER EVENTS (resize, keys) mutate state OUTSIDE scene_tick — see ARCHITECTURE.
- */
+/* ── §10 app — key handling and the main loop ── */
 
 /*
- * App — the running program: its sub-systems plus everything that lives for the
- * whole session rather than for a single scene.
- *
- * WHY these fields sit together (three concerns, one owner):
- *   scene, screen        — the two sub-systems the loop drives each frame.
- *   sim_fps, theme       — session SETTINGS that must survive a scene reset ('r')
- *                          and a resize; held here, off Scene, so the rebuild
- *                          literally cannot touch them.  theme is a RENDER choice;
- *                          both start at their zero/default via static init of
- *                          g_app (theme 0 = NEON; sim_fps is set in main()).
- *   running, need_resize — signal flags.  volatile sig_atomic_t because they are
- *                          WRITTEN from signal handlers (about the only thing a
- *                          handler may safely do) and READ in the main loop;
- *                          the qualifiers stop the compiler caching/ tearing them.
- *
- * Ref: Fiedler, "Fix Your Timestep!" — the fixed-timestep loop in main() that
- * consumes sim_fps.
+ * App — the whole running program: the two sub-systems plus the settings that
+ * outlive any single scene.  sim_fps and theme are kept here, off the Scene, on
+ * purpose: a reset or resize rebuilds the Scene, and these must survive that.
+ * running and need_resize are set from signal handlers and read in the loop, so
+ * they're volatile sig_atomic_t — the type a handler may safely touch, with the
+ * qualifier that stops the compiler from caching a stale value.
  */
 typedef struct {
-    Scene                 scene;       /* the simulated world (§5/§7)              */
-    Screen                screen;      /* terminal geometry cache (§9)             */
-    int                   sim_fps;     /* tick rate (Hz), SIM_FPS_MIN..MAX, [ / ]  */
-    int                   theme;       /* palette index 0..N_THEMES-1, t / T       */
-    volatile sig_atomic_t running;     /* 0 ⇒ leave the loop (SIGINT/SIGTERM, q)   */
-    volatile sig_atomic_t need_resize; /* 1 ⇒ rebuild on next frame (SIGWINCH)     */
+    Scene                 scene;       /* the simulated world */
+    Screen                screen;      /* cached terminal size */
+    int                   sim_fps;     /* tick rate in Hz, changed by [ and ] */
+    int                   theme;       /* current palette, cycled by t and T */
+    volatile sig_atomic_t running;     /* set to 0 to leave the loop */
+    volatile sig_atomic_t need_resize; /* set to 1 when the terminal was resized */
 } App;
 
 static App g_app;
@@ -1098,7 +687,7 @@ static bool app_handle_key(App *app, int ch)
         app->scene.paused = !app->scene.paused;
         break;
 
-    /* Formation size — + / = to grow, - to shrink */
+    /* grow / shrink the wedges */
     case '+': case '=':
         scene_set_rows(&app->scene, +1);
         break;
@@ -1127,9 +716,9 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* app_init — one-time start-up: seed the RNG, install signal handlers, bring up
- * the terminal, then build the scene at the current size.  scene is zeroed
- * before scene_init so its n_rows starts at 0 and picks up ROWS_DEFAULT. */
+/* One-time start-up: seed the random numbers, install signal handlers, bring up
+ * the terminal, then build the scene.  The scene is zeroed first so its depth
+ * starts at 0 and picks up the default. */
 static void app_init(App *app)
 {
     srand((unsigned int)clock_ns());

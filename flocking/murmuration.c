@@ -1,326 +1,11 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * murmuration.c — 800-bird starling flock rendered as a density field
- *
- * DEMO: A high-count Reynolds flock (separation + alignment + cohesion)
- *       drifts across a toroidal terminal world.  Instead of drawing
- *       one glyph per bird, the renderer bins agents into a per-cell
- *       density grid and stamps a glyph from the ramp ".,:;oO*#@" —
- *       sparse cells fade to dots, dense cells glow as `@`, the
- *       flock reads as a moving black blob with internal density
- *       waves.  A single hawk orbits the world centre; press SPACE
- *       to send it diving through the flock at 250 px/s for ~1.5 s
- *       — the flock fragments around the hawk and reforms behind
- *       it.  Press 'h' to enable auto-dive every 6 seconds.
- *
- * Study alongside: flocking/flocking.c (the boid forces this builds on)
- *                  flocking/shepherd.c (Strömbom hawk/sheep model)
- *
- * Section map:
- *   §1 config   — counts, speeds, radii, weights, glyph ramp, hash dims
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 10 Theme palettes + PAIR_HAWK + PAIR_HUD/PAIR_HINT
- *   §4 coords   — pixel↔cell aspect bridge + Vec2 + toroidal_delta +
- *                 World struct + world_from_terminal
- *   §5 boid     — Boid struct, spawn, integrate, boid_clamp_speed,
- *                 boid_wrap
- *   §6 forces   — align_force, cohere_force, hawk_flee_force primitives
- *                 (with named-intermediate math)
- *   §6.5 hash   — SpatialHash struct + spatial_hash_build +
- *                 accumulate_pair_force + boid_forces (O(N·k) scan)
- *   §7 hawk     — Hawk struct + PATROL/HOVER/PURSUE/DIVE controller;
- *                 per-mode steppers (snap/integrate helpers) +
- *                 hawk_cycle_base_mode (n/p); world_centre +
- *                 hawk_patrol_radius_for shared shape helpers
- *   §8 scene    — SimControls + Scene (= pool + n_birds + hawk + sim +
- *                 world + flock_centroid + hash); scene_init (uses
- *                 spawn_boid_pool + place_hawk_at_orbit_east); scene_tick
- *                 (tick_auto_dive_timer + hawk_step + spatial_hash_build
- *                 + compute_new_velocities + commit_step_and_wrap +
- *                 scene_centroid); scene_draw (zero_density_region +
- *                 bin_boids_into_density + render_density_field +
- *                 stamp_hawk_glyph; tint_pair_for_cell + density_glyph)
- *   §9 app      — Screen, FpsCounter, App (= scene + screen + fps +
- *                 sim_fps + sig flags); signals; app_do_resize;
- *                 screen_draw (format_hud_status + hud_paint_text +
- *                 draw_hud_status / draw_hud_hint); app_handle_key
- *                 (toggle_auto_dive + cycle_theme + adjust_bird_count);
- *                 main game loop
- *
- * Keys:
- *   q / ESC    quit                       space    hawk DIVE (overlay)
- *   n / p      cycle hawk base mode       h        toggle auto-dive
- *              (PATROL → HOVER → PURSUE)           (every AUTO_DIVE_PERIOD s)
- *   . (period) pause / resume             r / R    reset (theme preserved)
- *   t / T      next / prev theme          + / -    add / remove 100 boids
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra flocking/murmuration.c \
- *       -o murmuration -lncurses -lm
+ * murmuration.c — a Reynolds boid flock drawn as a density cloud, with a
+ * diving hawk.  Instead of one glyph per bird, birds are binned into a
+ * grid and each cell shows a glyph from sparse '.' to dense '@', so the
+ * flock reads like a real starling murmuration.
+ * Boids: Reynolds 1987.  Spatial hash: Teschner et al. 2003.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Reynolds boids (separation, alignment, cohesion) on a
- *                  toroidal grid, plus a flee force from a single hawk
- *                  predator.  All three boid forces and the flee force
- *                  are computed in ONE single-pass O(N²) loop per tick
- *                  — toroidal_delta gives the shortest signed
- *                  displacement on each axis so neighbours across the
- *                  screen edge are correctly seen as close.
- *
- *                  The renderer is what makes this visually distinct
- *                  from `flocking/flocking.c`.  Instead of one glyph
- *                  per bird (which at 800 birds in 80x24 = 1920 cells
- *                  would be a uniform soup), each frame:
- *                    1. zero a density[rows][cols] grid;
- *                    2. for each bird, increment density[cy][cx];
- *                    3. for each non-empty cell, pick a glyph from the
- *                       ASCII ramp ".,:;oO*#@" indexed by density and
- *                       a brightness from A_DIM/NORMAL/BOLD by tier.
- *                  The flock now reads as a 2D density field — exactly
- *                  the visual signature of real starling murmurations.
- *
- *                  HAWK has two states.  PATROL: orbit the world centre
- *                  at radius 0.40·min(w,h) with angular speed 0.4 rad/s.
- *                  DIVE (triggered by SPACE or auto-dive timer): set a
- *                  straight-line velocity toward the flock centroid,
- *                  step at 250 px/s for HAWK_DIVE_DURATION (~1.5 s),
- *                  then resume PATROL from the new position.
- *
- * Data-structure : Scene owns a fixed Boid pool[N_BOIDS_MAX], the
- *                  active count `n_birds`, the Hawk, the world
- *                  dimensions, and a pair of file-scope statics for
- *                  the per-frame density buffer (avoiding a per-frame
- *                  malloc and keeping the stack small).  Boids carry
- *                  pos / prev_pos / vel and a spawn-time colour pair
- *                  index used for HUD identity (the renderer ignores
- *                  per-bird colour because it draws the density field).
- *
- * Rendering      : Painter's order — density-mapped flock first, hawk
- *                  '!' last (always on top, A_BOLD red).  The density
- *                  ramp index is `min(density − 1, RAMP_LEN − 1)`; the
- *                  brightness tier is `A_DIM` for density 1-2,
- *                  `A_NORMAL` for 3-5, `A_BOLD` for 6+.  Sub-tick
- *                  alpha lerp is omitted on purpose — the visual is
- *                  the density gradient, which is itself stable across
- *                  alpha values, and skipping the per-bird interp
- *                  saves the 800 × 2 lerp ops per frame.
- *
- * Performance    : Uniform SPATIAL HASH (§6.5) drops the inner loop
- *                  from O(N²) to O(N·k), where k is the typical number
- *                  of birds in a 3×3 cell neighbourhood (cell size =
- *                  COHESION_RADIUS).  At default density on an 80×24
- *                  terminal that's k ≈ 30; the loop does ~N·k pair
- *                  tests per tick instead of N·(N-1).
- *
- *                    N      O(N²) pairs   O(N·k) pairs   speedup
- *                    ──     ───────────   ────────────   ───────
- *                    800       639 K          ~24 K       ~27×
- *                    1500     2 250 K         ~45 K       ~50×
- *
- *                  Hash build is O(N) (one prepend per bird).  Density
- *                  binning is O(N + cells) ≈ 800 + 1920 ≈ 2700 ops per
- *                  render — unchanged.  Net result: 1500-bird sims that
- *                  used to run at 2-8 fps now sit comfortably at 60.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES ───────────────────────────────────────────────────────── *
- *
- *   ── Original behavioural-steering papers ───────────────────────
- *   [1] Reynolds, C. W. (1987), "Flocks, Herds, and Schools: A
- *       Distributed Behavioral Model", SIGGRAPH '87 Computer Graphics
- *       21(4), pp. 25-34 — the ORIGINAL boids paper.  Introduces
- *       separation + alignment + cohesion; coins "boid" (bird-oid).
- *       This file's §6 force primitives are a direct implementation.
- *   [2] Reynolds, C. W. (1999), "Steering Behaviors for Autonomous
- *       Characters", Game Developers Conference 1999.  Online at
- *       https://www.red3d.com/cwr/steer/ — canonical steering primer
- *       (seek, flee, arrive, pursue, evade, wander, separate, align,
- *       cohere).  The hawk's flee force in §6 and the future-extension
- *       PURSUE base mode are taken straight from this primer.
- *
- *   ── Statistical-physics flocking models ────────────────────────
- *   [3] Vicsek, T., Czirók, A., Ben-Jacob, E., Cohen, I. & Shochet, O.
- *       (1995), "Novel type of phase transition in a system of self-
- *       driven particles", Phys. Rev. Lett. 75(6), pp. 1226-1229 —
- *       the canonical Vicsek model.  Establishes flocking as a
- *       CONTINUOUS PHASE TRANSITION between order (low noise) and
- *       disorder (high noise) — same physics that lets a real
- *       starling murmuration switch between coherent and chaotic
- *       motion in seconds.
- *   [4] Toner, J. & Tu, Y. (1995, 1998), "Long-Range Order in a
- *       Two-Dimensional Dynamical XY Model" (PRL 75, pp. 4326-4329)
- *       + "Flocks, herds, and schools" (Phys. Rev. E 58, pp. 4828-
- *       4858) — hydrodynamic continuum theory of flocking; the
- *       macroscopic field theory behind the Vicsek model.  Read
- *       after [3] when you want to understand WHY the density
- *       waves visible in §8's renderer are smooth and propagating
- *       rather than chaotic.
- *
- *   ── Collective-behaviour biology ───────────────────────────────
- *   [5] Couzin, I. D., Krause, J., James, R., Ruxton, G. D. & Franks,
- *       N. R. (2002), "Collective memory and spatial sorting in
- *       animal groups", J. Theor. Biol. 218(1), pp. 1-11 — extends
- *       boids with explicit ZONES OF REPULSION / ORIENTATION /
- *       ATTRACTION.  Justifies SEPARATION_RADIUS < ALIGN_RADIUS <
- *       COHESION_RADIUS as the canonical ordering (this file uses
- *       14 / 50 / 80 px).
- *
- *   ── Empirical starling-murmuration studies ─────────────────────
- *   [6] Hildenbrandt, H., Carere, C. & Hemelrijk, C. K. (2010),
- *       "Self-organized aerial displays of thousands of starlings:
- *       a model", Behav. Ecol. 21(6), pp. 1349-1359 — the canonical
- *       QUANTITATIVE simulation model of starling murmurations.
- *       Adds aerodynamic banked turns + roost attraction; this file
- *       omits both but the flocking core matches.
- *   [7] Cavagna, A., Cimarelli, A., Giardina, I., Parisi, G.,
- *       Santagati, R., Stefanini, F. & Viale, M. (2010), "Scale-free
- *       correlations in starling flocks", PNAS 107(26), pp. 11865-
- *       11870 — the STARFLAG project's empirical analysis of real
- *       3-D starling flocks.  Shows real flocks are CRITICAL —
- *       behaviour correlations span the entire flock at all sizes,
- *       not just within a fixed neighbourhood radius.  Context for
- *       why the density-wave visuals in this demo emerge naturally.
- *
- *   ── Implementation-oriented references ─────────────────────────
- *   [8] Shiffman, D., "The Nature of Code", Ch. 6 — reading-level
- *       walkthrough of Reynolds steering with Processing examples.
- *       The single most accessible introduction; pair with [2].
- *       https://natureofcode.com/book/chapter-6-autonomous-agents/
- *
- *   ── Game-loop / fixed-step physics ─────────────────────────────
- *   [9] Fiedler, G. (2004, updated 2014), "Fix Your Timestep!",
- *       https://gafferongames.com/post/fix_your_timestep/ — the
- *       fixed-step accumulator + cap-dt pattern implemented in §9
- *       main().  This file does NOT lerp between physics snapshots
- *       in the renderer (density-field is stable across alpha) but
- *       the dt-cap + accumulator logic is straight from this article.
- *
- *   ── Large-N optimisation: spatial hashing ──────────────────────
- *  [10] Teschner, M., Heidelberger, B., Müller, M., Pomerantes, D. &
- *       Gross, M. (2003), "Optimized spatial hashing for collision
- *       detection of deformable objects", Vision, Modeling, and
- *       Visualization 2003, pp. 47-54 — the standard reference for
- *       uniform spatial hashing in particle / agent systems.
- *       §6.5 implements this for boid neighbour search: cell size =
- *       max neighbour radius, scan the 3×3 surround.  Drops the
- *       inner loop from O(N²) to O(N·k); critical for the 1500-bird
- *       configuration.
- *
- *   ── Online quick reference ─────────────────────────────────────
- *  [11] Wikipedia: "Boids", "Murmuration", "Vicsek model" —
- *       https://en.wikipedia.org/wiki/Boids
- *       https://en.wikipedia.org/wiki/Murmuration
- *       https://en.wikipedia.org/wiki/Vicsek_model
- *       concise summaries of the rules, the biological phenomenon
- *       this demo reproduces, and the phase-transition model.
- *
- *   ── Companion files in this project ────────────────────────────
- *   See also:
- *     flocking/flocking.c — same Reynolds rules with FIVE switchable
- *       modes (boids / chase / Vicsek / orbit / predator-prey).  Read
- *       FIRST if you want the per-rule story before the high-N
- *       density-field rendering here.
- *     flocking/crowd.c    — single-flock crowd with six behaviour
- *       modes (WANDER / FLOCK / PANIC / GATHER / FOLLOW / QUEUE).
- *       Shows how the same primitives compose into different
- *       emergent behaviours at MEDIUM N (~150 agents).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Stop drawing birds.  Draw the LOCAL DENSITY of birds.  When 800
- * agents are clustered into ~1900 terminal cells, each cell almost
- * always has 0, 1, or 2 birds — except the heart of the flock,
- * which has 5-15.  Map count → ASCII glyph from a ramp going
- * sparse-to-dense, and the flock automatically reads as a moving
- * black cloud with a bright core, internal density waves, and
- * a clear silhouette — which is exactly how real starling
- * murmurations look at human visual scale.  The flocking forces
- * just keep the cloud cohesive; the ramp is what makes it pretty.
- *
- *
- * ALGORITHM IN STEPS  (per tick)
- * ──────────────────────────────
- *   1. Hawk: tick controller.  Pick stepper based on .mode —
- *      PATROL  → advance phase along the orbit ring.
- *      HOVER   → drift toward flock centroid; settle inside hold radius.
- *      PURSUE  → track flock centroid continuously at PURSUE_SPEED.
- *      DIVE    → integrate forward at DIVE_SPEED until dive_timer
- *                expires, then snap back to .base_mode (n/p selects).
- *   2. Hash build: O(N) — clear bucket heads, then prepend every
- *      bird to its cell's singly-linked list.  Cell size =
- *      COHESION_RADIUS so a 3×3 cell neighbourhood is sufficient.
- *   3. Boids: read OLD positions, hash-narrowed neighbour scan.
- *      For each bird, walk its own + 8 adjacent buckets; for each
- *      pair (self, neighbour) compute toroidal Δ; classify into
- *      separation / alignment / cohesion accumulators.  After the
- *      inner loop, add a flee force from the hawk (once per bird).
- *   4. Boids: write phase.  Apply force·dt to vel, clamp |vel|
- *      to [MIN_SPEED, MAX_SPEED], integrate pos, wrap toroidally.
- *   5. Render: zero density[rows][cols]; bin every bird into the
- *      grid via px_to_cell; for each cell with density > 0 stamp
- *      the corresponding glyph + brightness; over-stamp the hawk.
- *
- * KEY FORMULAS
- * ────────────
- *   Toroidal delta (shortest signed displacement on a wrapped axis):
- *     d = b − a
- *     if d >  extent/2 : d −= extent
- *     if d < −extent/2 : d += extent
- *
- *   Boid forces (per neighbour with squared toroidal distance d²):
- *     if d² < SEP_R²  : sep_force  += unit(self−nb) · (SEP_R − d)/SEP_R · BOID_SPEED
- *     if d² < ALIGN_R²: ali_vsum   += nb.vel; ali_n++
- *     if d² < COH_R²  : coh_dsum   += toroidal_delta(self, nb)  (offset, NOT pos)
- *                       coh_n++
- *
- *   After loop:
- *     ali_force  = (ali_n>0) ? (ali_vsum/ali_n − vel)             : 0
- *     coh_force  = (coh_n>0) ? unit(coh_dsum/coh_n) · BOID_SPEED  : 0
- *     hawk_flee  = if dist(self, hawk) < HAWK_FLEE_RADIUS:
- *                    unit(self − hawk) · (HAWK_FLEE_R − d)/HAWK_FLEE_R · FLEE_SPEED
- *                  else 0
- *
- *   Steering sum:
- *     force = W_SEP·sep + W_ALIGN·ali + W_COHERE·coh + W_FLEE·hawk_flee
- *
- *   Density-to-glyph mapping (renderer):
- *     idx   = min(density − 1, RAMP_LEN − 1)
- *     glyph = RAMP[idx]                     ".,:;oO*#@"
- *     attr  = density ≥ 5 ? A_BOLD : A_NORMAL
- *
- *     (No A_DIM tier — sparse cells make up most of the flock area
- *     and A_DIM would mute them to near-invisible, defeating the
- *     "tinted cloud" look.  The fade-to-edge effect comes from the
- *     glyph ramp '.'→'@', not from brightness modulation.)
- *
- *
- * Background you need
- * ───────────────────
- *   - flocking.c T1-T7 (boid + three rules + toroidal + 2-stage).
- *   - Histogram / binning — counting items into discrete buckets.
- *   - Uniform spatial hash — bucket agents by floor(pos / cell_size),
- *     query the 3×3 neighbourhood.  Standard large-N optimisation;
- *     this file uses it in §6.5 to scale to 1500 birds at 60 fps.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - kd-trees / BVH / R-trees.  Uniform hash is enough when agents
- *     are roughly uniformly distributed; flocking density doesn't
- *     fluctuate enough to need adaptive structures.
- *   - Voxel splatting / volume rendering. The density grid is 2-D,
- *     ASCII output.
- *   - Per-bird identity. The renderer doesn't track WHICH boid is
- *     in which cell — only HOW MANY.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -337,9 +22,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — counts, speeds, radii, weights, glyph ramp, hash dims ── */
 
 enum {
     SIM_FPS_DEFAULT = 60,
@@ -347,32 +30,16 @@ enum {
     HUD_COLS        = 96,
     FPS_UPDATE_MS   = 500,
 
-    /*
-     * Boid pool sizing.
-     *
-     * N_BOIDS_DEFAULT = 800: enough density that the binned grid
-     *   shows clear `@`-core + falloff to `.` periphery on an 80x24
-     *   terminal (1920 cells), without breaking sub-millisecond tick
-     *   budget under O(N²) steering.
-     *
-     * N_BOIDS_MAX     = 1500: hard ceiling.  At 1500 the inner loop
-     *   does 2.25 M pair tests/tick = 135 M/s — still well under the
-     *   16 ms frame budget at 60 Hz on any modern CPU.
-     *
-     * BOID_STEP       = 100: chunk added/removed per `+`/`-` keypress.
-     */
+    /* How many birds. Default 800 reads as a clear dense core fading to a
+     * sparse edge on a normal terminal. Max 1500 is the hard ceiling the
+     * spatial hash keeps fast. +/- keys add or remove BOID_STEP at a time. */
     N_BOIDS_DEFAULT = 800,
     N_BOIDS_MAX     = 1500,
     N_BOIDS_MIN     = 100,
     BOID_STEP       = 100,
 
-    /*
-     * Colour pair IDs (see §3 for actual colour values).
-     *   Pairs 1-7 cycle the flock tint through the active theme.
-     *   PAIR_HAWK is fixed (red, A_BOLD) regardless of theme so the
-     *   predator always reads as the predator.
-     *   PAIR_HUD/PAIR_HINT follow the project HUD spec.
-     */
+    /* Colour pair IDs. Pairs 1..N_COLORS tint the flock through the active
+     * theme; PAIR_HAWK is a fixed red so the predator always stands out. */
     N_COLORS        =   7,
     PAIR_HAWK       =   8,
     PAIR_HUD        =   9,
@@ -380,32 +47,18 @@ enum {
 
     N_THEMES        =  10,
 
-    /*
-     * Density-grid hard cap — sized for very large terminals so
-     * resize never overflows the buffer.  At MAX_ROWS=80, MAX_COLS=256
-     * this is 80 × 256 × sizeof(int) = 80 KB of static BSS.
-     */
+    /* Density grid cap — big enough that even a huge terminal can't
+     * overflow the buffer. Only the visible region is ever touched. */
     MAX_ROWS        =  80,
     MAX_COLS        = 256,
 
-    /*
-     * Spatial-hash grid cap.
-     *
-     * Cell size equals the LARGEST neighbour radius (COHESION_RADIUS = 80 px),
-     * so a 3×3 cell neighbourhood is sufficient to find every neighbour
-     * within COHESION_RADIUS of self regardless of where self sits in its
-     * cell.  Grid dims grow with world size; values below cap any
-     * reasonable terminal:
-     *
-     *   max world px = MAX_COLS·CELL_W × MAX_ROWS·CELL_H = 2048 × 1280
-     *   max hash dims = ceil(2048/80) × ceil(1280/80) = 26 × 16 → fits 32×24.
-     *
-     * Storage: 32·24·sizeof(int) + N_BOIDS_MAX·sizeof(int) ≈ 3 KB + 6 KB
-     *          = 9 KB static.  Cheap.
-     */
+    /* Spatial-hash grid cap. Each hash cell is HASH_CELL_PX wide, set equal
+     * to the largest neighbour radius so a bird's neighbours always sit in
+     * the 3x3 block of cells around it. The grid grows with the world; these
+     * caps cover any terminal we'd realistically see. */
     HASH_CELL_PX     = 80,         /* matches COHESION_RADIUS              */
-    HASH_GRID_W_MAX  = 32,         /* covers worlds up to 2560 px wide     */
-    HASH_GRID_H_MAX  = 24,         /* covers worlds up to 1920 px tall     */
+    HASH_GRID_W_MAX  = 32,
+    HASH_GRID_H_MAX  = 24,
 };
 
 /* Cell dimensions — physics in pixel space, draw in cells. */
@@ -425,13 +78,10 @@ enum {
 #define HAWK_FLEE_RADIUS 110.0f  /* boids flee within this disc of hawk    */
 
 /* ── boid force weights ─────────────────────────────────────────────── *
- *  Order of magnitude reflects priority:
- *    FLEE   (4.5) overrides everything when hawk is close.
- *    SEP    (1.8) firm enough to stop overlap during panic.
- *    ALIGN  (1.0) nominal — produces the coherent direction of travel.
- *    COHERE (0.7) softer — flock stays loose, doesn't collapse to a point.
- *    MAX_STEER caps the per-tick acceleration so smooth curves emerge
- *    rather than instant pivots even when forces stack up.            */
+ *  Bigger weight = stronger pull. Fleeing the hawk wins over everything;
+ *  separation is firm so birds don't overlap in a panic; cohesion is soft
+ *  so the flock stays loose rather than collapsing to a dot. MAX_STEER caps
+ *  how hard a bird can turn per tick, giving smooth curves not instant pivots. */
 #define W_SEP      1.8f
 #define W_ALIGN    1.0f
 #define W_COHERE   0.7f
@@ -439,61 +89,38 @@ enum {
 #define MAX_STEER 130.0f
 
 /* ── hawk parameters ────────────────────────────────────────────────── *
- *
- *  Hawk has THREE base modes (selected with n / p cycling) and ONE
- *  overlay (DIVE, fired by SPACE on top of any base mode):
- *
- *    PATROL — orbit world centre at HAWK_PATROL_FRAC · min(w,h) at
- *             HAWK_PATROL_OMEGA rad/s.  Hawk circles, ignored by the
- *             flock except when it passes through.
- *    HOVER  — slow drift toward the flock centroid; settle once close.
- *             Creates a persistent "no-fly zone" the flock has to
- *             route around — flock self-organises into a moving torus.
- *    PURSUE — continuous tracking at HAWK_PURSUE_SPEED (just above
- *             BOID_SPEED so the hawk slowly closes).  Flock keeps
- *             running; pressure is constant rather than burst-like.
- *    DIVE   — overlay: straight-line sprint at HAWK_DIVE_SPEED toward
- *             the flock centroid for HAWK_DIVE_DURATION seconds, then
- *             return to whichever base mode is currently selected.
- *
- *  Speed ordering (px/s):
- *    BOID_SPEED 90  <  HAWK_HOVER_DRIFT 60  ≪ ...
- *    BOID_MAX_SPEED 150  >  HAWK_PURSUE_SPEED 110
- *    HAWK_DIVE_SPEED 250  ≫ everything (burst attack)
- *
- *  AUTO_DIVE_PERIOD — when auto-dive is on (`h` key), the next dive
- *  fires this many seconds after the previous one ended.            */
+ *  The hawk has three base modes (cycled with n/p) plus a DIVE overlay
+ *  (fired by SPACE). PATROL circles the centre; HOVER drifts onto the flock
+ *  and parks there; PURSUE chases at a touch above bird speed; DIVE is a
+ *  fast straight sprint at the flock for a fixed time, then back to base.
+ *  AUTO_DIVE_PERIOD is the gap between auto-dives when the 'h' toggle is on. */
 #define HAWK_PATROL_FRAC      0.40f
 #define HAWK_PATROL_OMEGA     0.4f
 #define HAWK_DIVE_SPEED     250.0f
 #define HAWK_DIVE_DURATION    1.5f
 #define AUTO_DIVE_PERIOD      6.0f
 
-/* HOVER: drift toward centroid at this slow speed; settle once within
- * HAWK_HOVER_HOLD_RADIUS of centroid (vel scales linearly to 0 inside). */
+/* HOVER drift speed, and the radius inside which it eases to a stop so the
+ * hawk settles smoothly onto the flock instead of jerking to a halt. */
 #define HAWK_HOVER_DRIFT        60.0f
 #define HAWK_HOVER_HOLD_RADIUS  30.0f
 
-/* PURSUE: continuous chase speed.  Slightly faster than BOID_SPEED so
- * the hawk slowly catches up; flock keeps running and reshapes. */
+/* PURSUE chase speed — a little faster than a bird, so the hawk slowly gains. */
 #define HAWK_PURSUE_SPEED  110.0f
 
-/* Glyph ramp for density-to-character mapping.  Index 0 = density 1
- * (sparsest), index RAMP_LEN-1 = density ≥ RAMP_LEN (densest core).
- * Pure ASCII per CLAUDE.md "ASCII-Only Rendering" — no Unicode blocks. */
+/* The glyph ramp: sparse cells get '.', the densest core gets '@'.
+ * ASCII only (no Unicode blocks) so it renders the same everywhere. */
 static const char DENSITY_RAMP[] = ".,:;oO*#@";
 #define RAMP_LEN ((int)(sizeof DENSITY_RAMP - 1))
 
-/* Timing primitives (verbatim from framework.c). */
+/* Timing helpers. */
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock — monotonic timer + sleep ── */
 
-/* clock_ns — monotonic wall-clock in ns; never goes backward. */
+/* Wall-clock in nanoseconds; never runs backward. */
 static int64_t clock_ns(void)
 {
     struct timespec t;
@@ -501,7 +128,7 @@ static int64_t clock_ns(void)
     return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-/* clock_sleep_ns — sleep ns nanoseconds; ns ≤ 0 returns immediately. */
+/* Sleep for the given nanoseconds; a non-positive value returns at once. */
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
@@ -512,50 +139,22 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color — 10 themes for the flock + theme-independent hawk + HUD    */
-/* ===================================================================== */
+/* ── §3 color — flock themes plus fixed hawk and HUD colours ── */
 
 /*
  * Theme — one named flock palette.
  *
- * Intent
- *   Holds the seven xterm-256 colour indices that compose ONE flock
- *   tint.  The renderer cycles through pairs 1..N_COLORS keyed by
- *   spatial hash (`(cy*7 + cx) % N_COLORS`), so adjacent cells get
- *   different pair indices and the flock reads as a cloud with a
- *   subtle interior mottle.
- *
- * Why a TIGHT CLUSTER of bright shades (not a dim-to-bright gradient)
- *   The renderer cycles through all 7 pairs spatially.  If the
- *   palette spans dim → bright, roughly half the flock cells render
- *   dim and the cloud reads as muddy.  Keeping all 7 entries in the
- *   same brightness band gives a clean tinted cloud with a subtle
- *   mottle from the spatial hash — no dim spots, no banding.
- *
- * Brightness floor
- *   All entries sit at ≥ 81 in the xterm-256 cube (or ≥ 119 in
- *   mint/peach band, or use full-saturation primaries 46/196/220/226).
- *   No values below 80 — at A_DIM they'd vanish.  We removed the
- *   A_DIM tier in density_glyph but the floor is a safety margin in
- *   case it's ever re-enabled (per CLAUDE.md palette-brightness rule).
+ * The renderer spreads these colours across the cloud (it picks a pair per
+ * cell from its position), so the flock gets a soft mottled tint rather than
+ * one flat colour. That's why all seven entries are kept in the same
+ * brightness band: a dim-to-bright spread would leave half the cloud looking
+ * muddy. Everything stays bright (>= 80 on the xterm-256 scale) so nothing
+ * vanishes if a dim tier is ever switched back on.
  *
  * Members
- *   name     HUD label shown to the user (e.g. "Dusk", "Sky", "Matrix").
- *            Pointer to a static C string literal.  Read by screen_draw.
- *   body[7]  Seven xterm-256 colour indices.  Bird i renders with
- *            pair (i % N_COLORS) + 1, so each theme entry is "the
- *            colour for the i-th rotation slot".  All seven SHOULD be
- *            shades of the same tint; see "tight cluster" above.
- *
- * Invariants
- *   name != NULL.
- *   Every body[k] ∈ [0, 255] (xterm-256 colour index range).
- *   For visual quality: body[k] ≥ 80 (brightness floor).
- *
- * References
- *   None directly — the colour palette is project-specific design.
- *   xterm-256 cube layout: see CLAUDE.md §"Theme Palette Brightness".
+ *   name     label shown in the HUD (e.g. "Dusk"); points at a string literal.
+ *   body[7]  seven xterm-256 colour indices (each 0..255), all shades of the
+ *            same tint. Colour pair i+1 uses body[i].
  */
 typedef struct {
     const char *name;
@@ -567,7 +166,7 @@ static const Theme THEMES[N_THEMES] = {
     {"Dusk",    { 180, 187, 188, 222, 223, 224, 230 }},  /* warm cream    */
     {"Sky",     {  81,  87, 111, 117, 123, 153, 159 }},  /* sky-blue      */
     {"Solar",   { 214, 220, 221, 222, 226, 227, 228 }},  /* warm yellow   */
-    {"Aurora",  { 121, 122, 158, 159, 195, 207, 213 }},  /* mint → pink   */
+    {"Aurora",  { 121, 122, 158, 159, 195, 207, 213 }},  /* mint to pink  */
     {"Ember",   { 196, 202, 208, 209, 214, 215, 220 }},  /* fire ramp     */
     {"Forest",  { 119, 120, 121, 154, 155, 156, 157 }},  /* leafy green   */
     {"Neon",    { 165, 171, 201, 207, 213, 219, 225 }},  /* hot magenta   */
@@ -576,11 +175,8 @@ static const Theme THEMES[N_THEMES] = {
     {"Matrix",  {  46,  82, 118, 119, 120, 121, 156 }},  /* matrix green  */
 };
 
-/*
- * theme_apply — register the body palette with ncurses.  Background
- * = -1 (terminal default) per CLAUDE.md HUD spec.  Hawk and HUD pairs
- * are theme-independent and configured once in color_init().
- */
+/* Register the chosen flock palette with ncurses (background = terminal
+ * default). Hawk and HUD colours don't change with the theme. */
 static void theme_apply(int idx)
 {
     const Theme *th = &THEMES[idx];
@@ -597,15 +193,8 @@ static void theme_apply(int idx)
     }
 }
 
-/*
- * color_init — one-time colour setup.
- *   start_color()        — initialise ncurses colour support.
- *   use_default_colors() — allow background = -1 (terminal default).
- *   theme_apply()        — register the initial flock palette.
- *   PAIR_HAWK            — bright red 196, A_BOLD on draw.
- *   PAIR_HUD             — bright yellow 226, A_BOLD on draw.
- *   PAIR_HINT            — bright cyan   51, A_BOLD on draw.
- */
+/* One-time colour setup: turn on colour, allow a default background, load the
+ * starting flock palette, and fix the hawk (red) and HUD (yellow/cyan) pairs. */
 static void color_init(int initial_theme)
 {
     start_color();
@@ -623,101 +212,53 @@ static void color_init(int initial_theme)
     }
 }
 
-/* ===================================================================== */
-/* §4  coords — pixel↔cell + Vec2 + toroidal_delta                       */
-/* ===================================================================== */
+/* ── §4 coords — pixel/cell bridge, Vec2, toroidal distance ── */
 
-/* Pixel-space world dimensions from terminal cell counts. */
+/* World size in pixels, from the terminal's cell counts. */
 static inline float pw(int cols) { return (float)(cols * CELL_W); }
 static inline float ph(int rows) { return (float)(rows * CELL_H); }
 
 /*
- * World — pixel-space extent of the simulation box.
+ * World — the size of the simulation box, in pixels.
  *
- * Intent
- *   Every physics routine needs "the size of the world" for two things:
- *
- *     1. Toroidal wrap (boid_wrap, hawk_wrap):
- *          if px <  0      → px += width
- *          if px >= width  → px -= width
- *        A bird leaving one edge re-enters at the opposite edge.
- *
- *     2. Shortest-path distance (toroidal_delta):
- *          d = b − a
- *          if |d| > extent/2 : take the wrap path instead
- *        Used by every steering force so neighbours across the wrap
- *        are correctly seen as close.
- *
- *   Before this struct, every signature carried a separate (ww, wh)
- *   pair — 10+ functions, all threading the same two floats.  Bundling
- *   them into one named type makes signatures read in the physics
- *   vocabulary: `boid_wrap(b, world)` instead of `boid_wrap(b, ww, wh)`.
+ * The physics treats the world as a torus: a bird leaving one edge comes back
+ * on the opposite edge, and "distance" between two birds is always the
+ * shortest path, even if that path goes off one edge and back on the other.
+ * Both rules need the world's width and height, so they're bundled here and
+ * passed around as one value.
  *
  * Members
- *   width   x-extent in pixels = cols × CELL_W (CELL_W = 8).
- *   height  y-extent in pixels = rows × CELL_H (CELL_H = 16, double
- *           CELL_W to compensate for the terminal cell aspect ratio).
- *
- * Invariants
- *   width > 0 AND height > 0 (set by world_from_terminal).
- *   width  == cols × CELL_W,  height == rows × CELL_H, kept in sync
- *   with Screen.cols / Screen.rows by scene_init / app_do_resize.
+ *   width   x size in pixels = cols * CELL_W.
+ *   height  y size in pixels = rows * CELL_H. (CELL_H is double CELL_W to
+ *           offset the fact that terminal cells are taller than they are wide.)
  */
 typedef struct {
     float width;
     float height;
 } World;
 
-/*
- * world_from_terminal — derive the pixel-space World from a terminal
- * (cols, rows) reading.  Called at scene_init and again after every
- * SIGWINCH so the physics box matches the visible terminal extent.
- */
+/* Build the pixel-space World from a terminal (cols, rows). Called at startup
+ * and after each resize so the physics box matches what's on screen. */
 static inline World world_from_terminal(int cols, int rows)
 {
     return (World){ .width = pw(cols), .height = ph(rows) };
 }
 
-/*
- * px_to_cell_x/y — round to nearest cell.  "Round half up" via
- * floor(p/dim + 0.5) avoids the half-pixel oscillation roundf()
- * would produce at exact boundaries.
- */
+/* Pixel position to the nearest cell. The +0.5-then-floor rounding avoids a
+ * jitter that plain rounding causes right on cell boundaries. */
 static inline int px_to_cell_x(float px) { return (int)floorf(px / (float)CELL_W + 0.5f); }
 static inline int px_to_cell_y(float py) { return (int)floorf(py / (float)CELL_H + 0.5f); }
 
 /*
- * Vec2 — 2-D float vector used everywhere physics or geometry shows up.
+ * Vec2 — a 2-D point or arrow (x, y) in pixels.
  *
- * Intent
- *   Position, velocity, acceleration, force, offset, centroid — every
- *   quantity with an x and a y is a Vec2.  Functions return Vec2 BY
- *   VALUE (no out-params); the v2* helpers below compose into terse
- *   chains that read like the math notation they implement:
- *
- *      Vec2 force = v2add(v2scale(sep, W_SEP), v2scale(ali, W_ALIGN));
- *
- *   reads as `force = W_SEP · sep + W_ALIGN · ali` to a maths-fluent
- *   reader.
- *
- * Why a struct (not float[2] or two scalars)
- *   • Named type makes signatures read in the algorithm's vocabulary:
- *     `boid_forces(pool, hash, self, hawk_pos, world)` rather than
- *     `boid_forces(pool, hash, self, hawk_x, hawk_y, ww, wh)`.
- *   • Return by value works without spilling to memory on x86-64 +
- *     ARM ABIs (8 bytes = one register pair); no perf penalty.
- *   • Eliminates two-out-parameter idioms in every steering helper.
+ * Everything with an x and a y is a Vec2: positions, velocities, forces,
+ * offsets. The v2* helpers below let you add and scale them so the steering
+ * code reads close to the math it implements. Only scene_draw ever converts
+ * these pixels into terminal cells; the physics never deals in cells.
  *
  * Members
- *   x, y    Cartesian components in PIXEL space (units = px).  Cell-
- *           space conversion happens only inside scene_draw via
- *           px_to_cell_x/y.  Physics never sees cells.
- *
- * References
- *   [2] Reynolds 1999 — every steering primitive returns a Vec2
- *       force; this file's §6 mirrors that API shape.
- *   [8] Shiffman, *Nature of Code* Ch. 1 — PVector pedagogy that
- *       this type is the C analogue of.
+ *   x, y   the two components, in pixels.
  */
 typedef struct { float x, y; } Vec2;
 
@@ -728,14 +269,14 @@ static inline Vec2  v2scale(Vec2 v, float s)     { return v2(v.x*s, v.y*s); }
 static inline float v2len(Vec2 v)                { return sqrtf(v.x*v.x + v.y*v.y); }
 static inline float v2len2(Vec2 v)               { return v.x*v.x + v.y*v.y; }
 
-/* v2norm — unit vector; returns zero if input is near-zero. */
+/* Direction of v as a length-1 arrow; zero if v is basically zero. */
 static inline Vec2 v2norm(Vec2 v)
 {
     float l = v2len(v);
     return (l > 0.001f) ? v2scale(v, 1.0f/l) : v2(0, 0);
 }
 
-/* v2clamp_len — cap |v| at max_len, preserve direction. */
+/* Shorten v to at most max_len, keeping its direction. */
 static inline Vec2 v2clamp_len(Vec2 v, float max_len)
 {
     float l = v2len(v);
@@ -743,14 +284,11 @@ static inline Vec2 v2clamp_len(Vec2 v, float max_len)
 }
 
 /*
- * toroidal_delta — shortest signed displacement from a to b on a
- * single axis of length `extent`.  On a wrap-around axis there are
- * two paths between any two points; we always return the shorter
- * one with sign indicating direction.
- *
- * Example (extent=100): a=5, b=95 → direct=+90, wrap=-10 → returns -10.
- * Used by every steering force so neighbours across the wrap are
- * correctly seen as close — without this, the flock would tear at edges.
+ * Shortest step from a to b along one wrapped axis of length `extent`.
+ * On a torus there are two ways round; this picks the shorter one and keeps
+ * the sign so you know which way. Example (extent 100): a=5, b=95 gives -10,
+ * not +90 — going off the left edge is closer. Every steering force uses this
+ * so birds near opposite edges still count as close neighbours.
  */
 static inline float toroidal_delta(float a, float b, float extent)
 {
@@ -762,99 +300,38 @@ static inline float toroidal_delta(float a, float b, float extent)
 
 static inline float randf(void) { return (float)rand() / (float)RAND_MAX; }
 
-/* ===================================================================== */
-/* §5  boid                                                               */
-/* ===================================================================== */
+/* ── §5 boid — one bird: state, spawn, speed clamp, wrap ── */
 
 /*
- * Boid — one bird's complete kinematic state (Reynolds [1]: "bird-oid").
+ * Boid — one bird ("bird-oid", from Reynolds 1987).
  *
- * Intent
- *   The atomic unit of the murmuration.  A Boid is a point particle
- *   on a torus with position + velocity; steering forces accumulate
- *   into vel each tick, vel integrates into pos.  At N=1500 the file
- *   holds 1500 of these in Scene.pool[].
- *
- * Why these fields and no more
- *   • No mass — every bird is implicitly mass 1, so force·dt feeds
- *     directly into vel.  Reynolds [2] uses the same simplification:
- *     weights become tunable scalars rather than per-mass forces.
- *   • No personal cruise_speed — unlike flocking.c / crowd.c, this
- *     file uses one global BOID_SPEED for every agent because the
- *     density-field renderer hides per-agent variation anyway.  The
- *     visual variety comes from the density gradient, not from
- *     individual depth.
- *   • No heading angle — heading is implicit in atan2(vel.y, vel.x);
- *     never stored separately.  Eliminates desync risk between an
- *     angle and velocity components.
- *
- * Why prev_pos despite no alpha-lerp
- *   prev_pos is snapshotted each tick out of habit / future-proofing:
- *   the renderer (§8 scene_draw) does NOT currently lerp between
- *   prev_pos and pos (density rendering is stable across alpha, and
- *   skipping the 1500×2 lerp ops/frame saves real time).  prev_pos
- *   is kept so a future per-bird rendering mode could use it without
- *   a schema change.
- *
- * Why PIXEL space
- *   Storing px/py in cell coordinates would lose sub-cell motion
- *   (CELL_W=8 means a 90 px/s bird advances 0.19 cell/tick at 60 Hz;
- *   in cell space that becomes "stay in cell A for 5 ticks, jump to
- *   B" — visible stair-stepping).  Float pixel space → smooth motion.
+ * A bird is just a moving dot: it has a position and a velocity. Each tick the
+ * steering rules nudge its velocity, then the velocity moves its position.
+ * There's no mass (every bird weighs 1, so a force feeds straight into speed)
+ * and no stored heading (the direction is implied by the velocity). The whole
+ * flock is an array of these. Positions are kept in pixels, not cells, so
+ * motion stays smooth instead of jumping cell to cell.
  *
  * Members
- *   pos          current position in PIXEL space (units = px).
- *                INVARIANT: 0 ≤ x < World.width AND 0 ≤ y < World.height
- *                after every boid_wrap() call (torus wraps strays back).
- *                Density binning recovers (col, row) via px_to_cell_x/y.
- *
- *   prev_pos     position at start of this tick.  Snapshotted in
- *                commit_step_and_wrap (scene_tick stage 2) BEFORE pos
- *                is integrated.  Kept for future renderer extensions;
- *                current density renderer ignores it.
- *
- *   vel          velocity in PIXELS PER SECOND.  Integration rule:
- *                  vel += steer·dt   (steering accumulator,  §6 forces)
- *                  pos += vel ·dt   (Euler integration,     §8 commit_step_and_wrap)
- *                Magnitude clamped to [BOID_MIN_SPEED, BOID_MAX_SPEED]
- *                each tick by boid_clamp_speed (floor prevents stall
- *                when forces cancel; ceiling prevents flee-runaway).
- *
- *   color_pair   ncurses colour pair index, set once at spawn from
- *                `(id % N_COLORS) + 1`.  COSMETIC ONLY — the density
- *                renderer derives per-cell colour from spatial hash,
- *                not from per-bird color_pair.  Kept on the struct so
- *                a future per-bird draw mode (e.g. trail rendering)
- *                could use it.
- *
- * Invariants
- *   0 ≤ pos.x < World.width  AND  0 ≤ pos.y < World.height after wrap.
- *   |vel| ∈ [BOID_MIN_SPEED, BOID_MAX_SPEED] after boid_clamp_speed.
- *   color_pair ∈ [1, N_COLORS]; set once at spawn, never mutated.
- *
- * References
- *   [1] Reynolds 1987 — the original boid: point particle that
- *       accumulates steering forces.
- *   [2] Reynolds 1999 §"Vehicle Model" — same kinematic model:
- *       force → velocity → position with magnitude caps.
- *   [8] Shiffman *Nature of Code* Ch. 6 — same Vehicle layout in
- *       Processing pseudocode; great companion read.
+ *   pos          current position, in pixels. Always inside the world after
+ *                wrapping. Binning turns this into a (col, row) for drawing.
+ *   prev_pos     position at the start of the tick. Snapshotted but unused by
+ *                the current renderer; kept for a possible per-bird draw mode.
+ *   vel          velocity, in pixels per second. Kept between MIN and MAX
+ *                speed each tick (a floor so birds never freeze, a ceiling so
+ *                a hawk-flee can't fling them away).
+ *   color_pair   a spawn-time colour, 1..N_COLORS. Cosmetic only — the density
+ *                renderer colours by cell position, not per bird.
  */
 typedef struct {
-    /* kinematic state — written by physics every tick */
     Vec2 pos;
-    Vec2 prev_pos;     /* kept for future renderer extensions; unused now */
+    Vec2 prev_pos;     /* snapshotted but unused by the current renderer */
     Vec2 vel;
-
-    /* identity — written once at spawn, read by NO active code path
-     * (density renderer uses spatial hash instead).  Cosmetic. */
-    int  color_pair;
+    int  color_pair;   /* cosmetic; density renderer ignores it */
 } Boid;
 
-/*
- * boid_spawn — random pos in world, random direction at BOID_SPEED·0.5
- * so the flock isn't frozen on frame one.
- */
+/* Place a bird at a random spot, moving in a random direction at half cruise
+ * speed so the flock is already in motion on frame one. */
 static void boid_spawn(Boid *b, int id, World world)
 {
     b->pos      = v2(randf() * world.width, randf() * world.height);
@@ -867,20 +344,16 @@ static void boid_spawn(Boid *b, int id, World world)
     b->color_pair = (id % N_COLORS) + 1;
 }
 
-/*
- * boid_clamp_speed — enforce MIN_SPEED ≤ |vel| ≤ MAX_SPEED.
- *
- * Without a floor, boids stall when sep + ali + coh roughly cancel.
- * Without a ceiling, the flee force during a hawk dive can blow up
- * |vel| past anything visually useful.  Both clamps are needed.
- */
+/* Keep a bird's speed within sane limits. A floor stops it freezing when the
+ * steering forces happen to cancel out; a ceiling stops a hawk-flee from
+ * launching it off the screen. */
 static void boid_clamp_speed(Boid *b)
 {
     const float STALL_EPSILON = 0.001f;     /* below this = no direction left */
     float current_speed = v2len(b->vel);
 
-    /* (a) full stall: forces cancelled to ~0; kick forward in a random
-     *     direction so the bird never freezes in place */
+    /* Dead stop: forces cancelled out. Kick off in a random direction so the
+     * bird never just sits there frozen. */
     if (current_speed < STALL_EPSILON) {
         float random_heading_rad = randf() * 2.0f * (float)M_PI;
         b->vel = v2(cosf(random_heading_rad) * BOID_MIN_SPEED,
@@ -888,23 +361,19 @@ static void boid_clamp_speed(Boid *b)
         return;
     }
 
-    /* (b) below floor: rescale to MIN_SPEED preserving direction */
+    /* Too slow / too fast: rescale to the limit, keeping direction. */
     if (current_speed < BOID_MIN_SPEED) {
         b->vel = v2scale(v2norm(b->vel), BOID_MIN_SPEED);
         return;
     }
 
-    /* (c) above ceiling: rescale to MAX_SPEED preserving direction */
     if (current_speed > BOID_MAX_SPEED) {
         b->vel = v2scale(v2norm(b->vel), BOID_MAX_SPEED);
     }
 }
 
-/*
- * boid_wrap — toroidal boundary.  A bird leaving one edge re-enters
- * at the opposite edge.  Uniform flocking everywhere — no "edge of
- * the world" where birds bunch up.
- */
+/* Wrap a bird that walked off an edge back onto the opposite edge, so the
+ * flocking looks the same everywhere with no edge where birds pile up. */
 static void boid_wrap(Boid *b, World world)
 {
     if (b->pos.x <  0.0f)        b->pos.x += world.width;
@@ -913,67 +382,45 @@ static void boid_wrap(Boid *b, World world)
     if (b->pos.y >= world.height)b->pos.y -= world.height;
 }
 
-/* ===================================================================== */
-/* §6  forces — separation + alignment + cohesion + hawk flee primitives */
-/* ===================================================================== */
-/* These are SHAPE helpers: take accumulators (built by §6.5 over a 3×3
- * cell neighbourhood) and return a Reynolds-style steering force.  The
- * actual neighbour scan and accumulator construction lives in §6.5
- * (spatial hash + accumulate_pair_force + boid_forces).               */
+/* ── §6 forces — separation, alignment, cohesion, hawk flee ── */
+/* These turn the per-rule sums gathered in §6.5 into steering forces.
+ * The neighbour scan that builds those sums lives in §6.5. */
 
-/*
- * align_force — convert alignment accumulator (sum of neighbour
- * velocities + count) into a Reynolds-style "steer toward mean
- * heading" force.  Returns zero if no neighbours were in range.
- */
+/* Alignment: steer toward the average heading of nearby birds. Given the sum
+ * of their velocities and how many there were, aim for that average. Zero if
+ * nobody was in range. (Reynolds rule 2.) */
 static Vec2 align_force(Vec2 ali_vsum, int ali_n, Vec2 my_vel)
 {
     if (ali_n == 0) return v2(0, 0);
 
-    /* mean_neighbour_velocity = Σ neighbour.vel / count
-     * force = (desired − own_velocity), where desired = mean heading
-     * Reynolds rule 2: steer toward the average heading of the group */
     Vec2 mean_neighbour_velocity = v2scale(ali_vsum, 1.0f / (float)ali_n);
     return v2sub(mean_neighbour_velocity, my_vel);
 }
 
-/*
- * cohere_force — convert cohesion accumulator (sum of toroidal
- * offsets toward neighbours + count) into a "seek mean position"
- * force.  We accumulate OFFSETS, not absolute positions, because
- * naïve averaging across the toroidal wrap would put the centroid
- * in the middle of the screen even when birds are clustered at
- * opposite edges.
- */
+/* Cohesion: steer toward the centre of the nearby group. We feed in the sum of
+ * *offsets* to neighbours, not their raw positions, because averaging raw
+ * positions on a wrapped world would point at the screen centre even when the
+ * flock sits at one edge. Zero if nobody was in range. (Reynolds rule 3.) */
 static Vec2 cohere_force(Vec2 coh_dsum, int coh_n, Vec2 my_vel)
 {
     if (coh_n == 0) return v2(0, 0);
 
-    /* mean_offset_to_centre_of_mass = Σ (neighbour_pos − self_pos) / n
-     *   (OFFSETS, not absolute positions — see cohere_force docblock)
-     * toward_centre_dir = unit vector pointing at the group centroid
-     * desired_velocity  = toward_centre direction at cruise speed
-     * force             = desired − own_velocity (Reynolds rule 3) */
     Vec2 mean_offset_to_centre_of_mass = v2scale(coh_dsum, 1.0f / (float)coh_n);
     Vec2 toward_centre_dir             = v2norm(mean_offset_to_centre_of_mass);
     Vec2 desired_velocity              = v2scale(toward_centre_dir, BOID_SPEED);
     return v2sub(desired_velocity, my_vel);
 }
 
-/*
- * hawk_flee_force — repulsion from the hawk with linear falloff
- * inside HAWK_FLEE_RADIUS, zero outside.  Magnitude scales toward
- * FLEE_SPEED at the wall (d → 0).  Uses toroidal_delta so a hawk
- * across the wrap still scares its neighbours.
- */
+/* Flee: push the bird away from the hawk, harder the closer it is, and nothing
+ * once the hawk is outside the panic radius. Uses the wrapped distance so a
+ * hawk near the far edge still scares birds near the near edge. */
 static Vec2 hawk_flee_force(Vec2 me_pos, Vec2 hawk_pos, World world)
 {
     const float DIST_EPSILON_SQ = 1e-6f;
     const float HAWK_FLEE_RADIUS_SQ = HAWK_FLEE_RADIUS * HAWK_FLEE_RADIUS;
 
-    /* offset_to_hawk = self → hawk (toroidal shortest-path)
-     * squared_distance compared first to skip the sqrt when hawk is
-     * out of range (very common — most birds aren't near the hawk) */
+    /* Compare squared distance first so we can bail without a square root when
+     * the hawk is out of range — which is true for most birds most of the time. */
     float offset_x          = toroidal_delta(me_pos.x, hawk_pos.x, world.width);
     float offset_y          = toroidal_delta(me_pos.y, hawk_pos.y, world.height);
     float squared_distance  = offset_x*offset_x + offset_y*offset_y;
@@ -982,11 +429,8 @@ static Vec2 hawk_flee_force(Vec2 me_pos, Vec2 hawk_pos, World world)
     bool well_separated    = squared_distance > DIST_EPSILON_SQ;
     if (!inside_panic_zone || !well_separated) return v2(0, 0);
 
-    /* distance_to_hawk          : pull out sqrt now that we need it
-     * panic_intensity ∈ (0, 1]  : closer to hawk ⇒ stronger flee
-     * away_from_hawk_dir        : unit vector pointing AWAY from hawk
-     *                             (negate offset which is self→hawk)
-     * force = away_dir · panic_intensity · FLEE_SPEED */
+    /* In range: panic_intensity is near 1 right next to the hawk and fades to 0
+     * at the edge of the radius; push directly away from the hawk by that much. */
     float distance_to_hawk = sqrtf(squared_distance);
     float panic_intensity  = (HAWK_FLEE_RADIUS - distance_to_hawk) / HAWK_FLEE_RADIUS;
     Vec2  away_from_hawk_dir = v2(-offset_x / distance_to_hawk,
@@ -994,85 +438,43 @@ static Vec2 hawk_flee_force(Vec2 me_pos, Vec2 hawk_pos, World world)
     return v2scale(away_from_hawk_dir, panic_intensity * FLEE_SPEED);
 }
 
-/* ── §6.5 spatial hash — O(N·k) neighbour search ────────────────────── *
+/* ── §6.5 hash — spatial hash for fast neighbour search ── */
+/*
+ * The slow way to find each bird's neighbours is to test it against every
+ * other bird, which gets painfully slow at 1500 birds. Instead we drop every
+ * bird into a coarse grid of cells, then a bird only has to look at the birds
+ * in its own cell and the eight around it.
  *
- * At large N (e.g. 1500 birds) the O(N²) inner loop dominates: 2.25 M
- * pair tests per tick × 60 Hz ≈ 135 M/s, which can drop visible fps to
- * single digits.  A uniform spatial hash brings the work down to
- * O(N · k) where k is the typical number of birds in a 3×3 cell
- * neighbourhood.  At default density that's k ≈ 20-40, giving roughly
- * an order of magnitude speedup at N=1500.
+ * The grid is stored as one linked list per cell, packed into two arrays:
  *
- * Data structure (singly-linked-list buckets, held by Scene.hash):
+ *      head[gy][gx]   index of the first bird in that cell, or -1 if empty
+ *      next[bird]     index of the next bird in the same cell, or -1 at the end
  *
- *      hash->head[gy][gx]   : index of FIRST bird in cell, or −1
- *      hash->next[bird]     : index of NEXT bird in same cell, or −1
+ * Build: clear all the heads, then push each bird onto the front of its cell's
+ * list. Query: for each bird, walk the 3x3 block of cells around it.
  *
- *      cell 5 occupants: head[…] = 12 ─► next[12] = 7 ─► next[7] = 3
- *                                                      ─► next[3] = −1
- *
- * Build: clear heads, then prepend each bird to its cell's list.  O(N).
- *
- * Query: for each bird, walk the 3×3 cells centred on its own cell
- * (toroidal-wrapped) and visit only the birds in those buckets.
- *
- * Cell size MUST be ≥ COHESION_RADIUS (the largest neighbour radius).
- * Smaller cells = more cells visited; larger cells = more birds per
- * cell ≈ same total work.  Matching exactly is the sweet spot.
- *
- * Small-world fix: if the world only fits 1 or 2 hash cells along an
- * axis, the toroidal-wrap of {-1, 0, +1} visits some cells twice and
- * double-counts.  In that case we sweep ALL cells along that axis
- * once each (no wrap), which is equivalent in correctness and is
- * still O(N) overall since the dimension itself is small.
- *
- * ────────────────────────────────────────────────────────────────── */
+ * The cell size matches the largest neighbour radius, so the 3x3 block is
+ * guaranteed to contain every neighbour that could matter. One wrinkle: if the
+ * world is so small it's only one or two cells wide, wrapping {-1,0,+1} would
+ * visit the same cell twice and double-count, so along a tiny axis we just
+ * sweep all of its cells once with no wrap.
+ */
 
 /*
- * SpatialHash — bucketed linked-list neighbour index, rebuilt every tick.
+ * SpatialHash — the grid of per-cell bird lists, rebuilt every tick.
  *
- * Intent
- *   The data half of the O(N·k) neighbour search.  At N=1500 the
- *   O(N²) pair loop runs at ~5 fps; with this hash, ~60 fps.  Lives
- *   ON Scene so it travels with the simulation state rather than as
- *   loose file-scope globals.
- *
- * Why on Scene (not file-scope statics)
- *   Two reasons.  (1) Owning structure: every steering call already
- *   takes Scene; reading the hash through `s->hash` keeps the data
- *   close to its only user.  (2) Multiple Scenes: a future split-
- *   screen demo or recorded-replay viewer would need independent
- *   hashes — file-scope statics make that impossible.
+ * This is what makes neighbour search fast (see the note above). It lives on
+ * the Scene so it travels with the simulation it indexes.
  *
  * Members
- *   head[gy][gx]   index of the FIRST bird in this hash cell, or −1
- *                  if empty.  Singly-linked-list head pointer.
- *   next[i]        index of the NEXT bird in the same cell as i, or
- *                  −1 if i is the tail.  next[] is keyed by BIRD index
- *                  (parallel to Scene.pool), NOT by cell index.
- *   grid_w, grid_h Active grid dimensions for THIS tick (depend on
- *                  world extent).  ≤ HASH_GRID_W_MAX × HASH_GRID_H_MAX.
+ *   head[gy][gx]   first bird in that cell, or -1 if the cell is empty.
+ *   next[i]        next bird in the same cell as bird i, or -1 if i is last.
+ *                  Indexed by bird, in step with the pool array.
+ *   grid_w, grid_h this tick's grid size (depends on the world size), each
+ *                  at most the matching HASH_GRID_*_MAX.
  *
- * Lifecycle
- *   spatial_hash_build()       — called once per tick, before boid_forces.
- *   boid_forces()              — reads head/next walks for the 3×3
- *                                neighbourhood of each bird.
- *   No teardown — the buffer is rebuilt from scratch every tick.
- *
- * Invariants
- *   1 ≤ grid_w ≤ HASH_GRID_W_MAX,  1 ≤ grid_h ≤ HASH_GRID_H_MAX.
- *   head[gy][gx] is either −1 (empty bucket) or a valid bird index
- *   in [0, n_birds).
- *   next[i] for i ∈ [0, n_birds) is either −1 (i is the tail of its
- *   bucket) or another valid bird index pointing further down the
- *   same bucket's list.
- *
- * References
- *  [10] Teschner et al. 2003 — "Optimized spatial hashing for
- *       collision detection of deformable objects".  Canonical
- *       reference for uniform-grid bucket hashing in particle /
- *       agent systems; this struct implements the simplest form
- *       (no hash function — direct cell index as bucket).
+ * It's cleared and refilled from scratch each tick, so there's nothing to
+ * tear down. Reference: Teschner et al. 2003 (uniform spatial hashing).
  */
 typedef struct {
     int head[HASH_GRID_H_MAX][HASH_GRID_W_MAX];
@@ -1081,7 +483,7 @@ typedef struct {
     int grid_h;
 } SpatialHash;
 
-/* Map a possibly-out-of-range cell index back into [0, extent) toroidally. */
+/* Fold a cell index that may be out of range back into [0, extent), wrapping. */
 static inline int hash_wrap_cell(int idx, int extent)
 {
     int r = idx % extent;
@@ -1089,27 +491,20 @@ static inline int hash_wrap_cell(int idx, int extent)
     return r;
 }
 
-/* hash_cell_for_pos — pixel → cell coordinates (no wrap).  Caller wraps. */
+/* Pixel position to grid cell (without wrapping; the caller wraps). */
 static inline void hash_cell_for_pos(Vec2 pos, int *out_cx, int *out_cy)
 {
     *out_cx = (int)floorf(pos.x / (float)HASH_CELL_PX);
     *out_cy = (int)floorf(pos.y / (float)HASH_CELL_PX);
 }
 
-/*
- * spatial_hash_build — populate the SpatialHash's head + next arrays
- * from the current bird positions.  Called once per tick BEFORE the
- * steering loop (so all reads inside the steering loop see a consistent
- * hash structure).
- *
- *   1. derive active grid dims from world extent, clamped to caps
- *   2. clear every head to −1 (empty)
- *   3. for each bird: prepend to its cell's linked list
- */
+/* Refill the hash from the current bird positions: size the grid to the world,
+ * empty every cell, then drop each bird into its cell. Called once per tick
+ * before steering so every bird sees the same neighbour grid. */
 static void spatial_hash_build(SpatialHash *h, const Boid *pool, int n,
                                World world)
 {
-    /* (1) active grid dims = ceil(world / cell), clamped to compile-time cap */
+    /* (1) grid size = world rounded up to whole cells, capped */
     int gw = (int)ceilf(world.width  / (float)HASH_CELL_PX);
     int gh = (int)ceilf(world.height / (float)HASH_CELL_PX);
     if (gw < 1)               gw = 1;
@@ -1119,12 +514,12 @@ static void spatial_hash_build(SpatialHash *h, const Boid *pool, int n,
     h->grid_w = gw;
     h->grid_h = gh;
 
-    /* (2) clear heads (only the active region) */
+    /* (2) empty every cell */
     for (int gy = 0; gy < gh; gy++)
         for (int gx = 0; gx < gw; gx++)
             h->head[gy][gx] = -1;
 
-    /* (3) prepend each bird to its cell's singly-linked list */
+    /* (3) push each bird onto the front of its cell's list */
     for (int i = 0; i < n; i++) {
         int cx, cy;
         hash_cell_for_pos(pool[i].pos, &cx, &cy);
@@ -1136,12 +531,10 @@ static void spatial_hash_build(SpatialHash *h, const Boid *pool, int n,
 }
 
 /*
- * accumulate_pair_force — given a pair (self, neighbour=pool[j]), update
- * the per-rule accumulators for separation / alignment / cohesion if the
- * pair falls inside the relevant radius.  Skips self-pair (j == self)
- * and zero-distance overlaps.
- *
- * Caller has already done the cell-narrowing; this is the per-pair work.
+ * For one pair (this bird and a neighbour), add the neighbour's contribution
+ * to the running totals for the three rules — but only for the rules whose
+ * radius the neighbour is inside. Skips the bird itself and exact overlaps.
+ * The caller has already narrowed things to nearby cells; this is per-pair.
  */
 static inline void accumulate_pair_force(const Boid *me, const Boid *nb,
                                          int j, int self, World world,
@@ -1155,8 +548,8 @@ static inline void accumulate_pair_force(const Boid *me, const Boid *nb,
     const float COH_R2          = COHESION_RADIUS * COHESION_RADIUS;
     if (j == self) return;
 
-    /* (a) toroidal offset self → neighbour, squared distance for cheap
-     *     comparisons before paying for sqrt */
+    /* Wrapped offset to the neighbour, and squared distance for cheap
+     * comparisons before paying for a square root. */
     float offset_x         = toroidal_delta(me->pos.x, nb->pos.x, world.width);
     float offset_y         = toroidal_delta(me->pos.y, nb->pos.y, world.height);
     float squared_distance = offset_x*offset_x + offset_y*offset_y;
@@ -1165,25 +558,21 @@ static inline void accumulate_pair_force(const Boid *me, const Boid *nb,
     bool well_separated    = squared_distance >  DIST_EPSILON_SQ;
     if (!inside_perception || !well_separated) return;
 
-    /* (b) COHESION sum — offsets, not absolute positions
-     *     (averaging absolutes is wrong on a torus; see cohere_force) */
+    /* Cohesion: add the offset (not the raw position — see cohere_force). */
     coh_dsum->x += offset_x;
     coh_dsum->y += offset_y;
     (*coh_n)++;
 
-    /* (c) ALIGNMENT sum — neighbour velocities inside the smaller align ring */
+    /* Alignment: add the neighbour's velocity, if it's in the closer align ring. */
     if (squared_distance < ALIGN_R2) {
         ali_vsum->x += nb->vel.x;
         ali_vsum->y += nb->vel.y;
         (*ali_n)++;
     }
 
-    /* (d) SEPARATION push — only neighbours inside personal-space radius
-     *     distance              : NOW we pay sqrt (rare branch)
-     *     personal_space_intrusion ∈ (0,1] — linear falloff: 1 at d=0, 0 at d=SEP
-     *     push_away_dir         : unit vector pointing FROM neighbour
-     *                             TOWARD self  (subtract offset_x = flip)
-     *     contribution scaled by BOID_SPEED so the push has speed units */
+    /* Separation: only for neighbours inside personal space. Push away from the
+     * neighbour, harder the closer it is; the square root is paid only here, in
+     * this rare branch. */
     if (squared_distance < SEP_R2) {
         float distance                 = sqrtf(squared_distance);
         float personal_space_intrusion = (SEP_RADIUS - distance) / SEP_RADIUS;
@@ -1195,38 +584,30 @@ static inline void accumulate_pair_force(const Boid *me, const Boid *nb,
 }
 
 /*
- * boid_forces — compute the total steering force for one bird via the
- * spatial hash.
- *
- *   1. find self's hash cell
- *   2. walk the 3×3 cells centred on it (toroidal wrap; or full sweep
- *      along any axis whose grid dim < 3, to avoid double-counting)
- *   3. for every bird in those buckets, call accumulate_pair_force
- *   4. convert per-rule accumulators to forces, add hawk-flee, sum,
- *      clamp to MAX_STEER
- *
- * Reads only — no writes to pool[].  scene_tick captures all new_vel[]
- * before writing back, so the update is "simultaneous" across the flock.
- */
+ * Total steering force for one bird, using the hash to find neighbours fast.
+ * Finds the bird's cell, walks the 3x3 block of cells around it tallying the
+ * three rules, then turns those tallies into forces, adds the hawk-flee, and
+ * caps the result. Reads only — it never moves any bird, so scene_tick can
+ * gather all the new velocities first and apply them together. */
 static Vec2 boid_forces(const Boid *pool, const SpatialHash *hash, int self,
                         Vec2 hawk_pos, World world)
 {
     const Boid *me = &pool[self];
 
-    /* Per-rule accumulators */
+    /* Running totals, one set per rule. coh_dsum holds offsets, not positions. */
     Vec2 sep_force = v2(0, 0);
     Vec2 ali_vsum  = v2(0, 0); int ali_n = 0;
-    Vec2 coh_dsum  = v2(0, 0); int coh_n = 0;   /* OFFSETS, not absolute */
+    Vec2 coh_dsum  = v2(0, 0); int coh_n = 0;
 
-    /* (1) self's hash cell */
+    /* (1) this bird's cell */
     int self_cx, self_cy;
     hash_cell_for_pos(me->pos, &self_cx, &self_cy);
     self_cx = hash_wrap_cell(self_cx, hash->grid_w);
     self_cy = hash_wrap_cell(self_cy, hash->grid_h);
 
-    /* (2) build dy/dx sweep ranges — special-case small worlds:
-     *     grid_h ≥ 3: dy ∈ {-1, 0, +1} with toroidal wrap (standard 3×3)
-     *     grid_h < 3: walk every row 0..grid_h-1 once (no wrap, no dup) */
+    /* (2) pick the sweep range for each axis: the normal {-1,0,+1} with wrap,
+     *     or, if the grid is under 3 cells on that axis, every cell once with
+     *     no wrap (so a tiny world doesn't double-count). */
     int dy_lo, dy_hi, dy_use_wrap;
     if (hash->grid_h >= 3) { dy_lo = -1;            dy_hi =  1;                 dy_use_wrap = 1; }
     else                   { dy_lo =  0;            dy_hi = hash->grid_h - 1;   dy_use_wrap = 0; }
@@ -1235,7 +616,7 @@ static Vec2 boid_forces(const Boid *pool, const SpatialHash *hash, int self,
     if (hash->grid_w >= 3) { dx_lo = -1;            dx_hi =  1;                 dx_use_wrap = 1; }
     else                   { dx_lo =  0;            dx_hi = hash->grid_w - 1;   dx_use_wrap = 0; }
 
-    /* (3) walk 3×3 neighbourhood (or full sweep on small axis), accumulate */
+    /* (3) walk those cells, tallying every bird in them */
     for (int dy = dy_lo; dy <= dy_hi; dy++) {
         int cy = dy_use_wrap ? hash_wrap_cell(self_cy + dy, hash->grid_h) : dy;
         for (int dx = dx_lo; dx <= dx_hi; dx++) {
@@ -1249,12 +630,12 @@ static Vec2 boid_forces(const Boid *pool, const SpatialHash *hash, int self,
         }
     }
 
-    /* (4) Accumulators → final per-rule forces */
+    /* (4) turn the tallies into forces */
     Vec2 ali  = align_force    (ali_vsum, ali_n, me->vel);
     Vec2 coh  = cohere_force   (coh_dsum, coh_n, me->vel);
     Vec2 flee = hawk_flee_force(me->pos, hawk_pos, world);
 
-    /* (5) Sum weighted forces, clamp to MAX_STEER for smooth curves */
+    /* (5) blend by weight and cap the turn so the path stays smooth */
     Vec2 total = v2add(
         v2add(v2scale(sep_force, W_SEP),
               v2scale(ali,       W_ALIGN)),
@@ -1264,85 +645,32 @@ static Vec2 boid_forces(const Boid *pool, const SpatialHash *hash, int self,
     return v2clamp_len(total, MAX_STEER);
 }
 
-/* ===================================================================== */
-/* §7  hawk — PATROL / DIVE controller                                    */
-/* ===================================================================== */
+/* ── §7 hawk — the predator and its PATROL/HOVER/PURSUE/DIVE modes ── */
 
 /*
- * HawkMode — finite-state machine for the predator's behaviour.
+ * HawkMode — what the hawk is doing right now.
  *
- * Intent
- *   Four discrete states + one cycle helper give the user three
- *   "base" modes (PATROL, HOVER, PURSUE) to choose from with n / p,
- *   plus one OVERLAY mode (DIVE) triggered by SPACE or the auto-dive
- *   timer.  When DIVE expires, the FSM returns to whichever base
- *   mode was last selected — never teleports.
+ * There are three "base" modes the user cycles with n/p, plus DIVE, an overlay
+ * fired by SPACE (or the auto-dive timer) on top of whatever base is active.
+ * When a dive finishes, the hawk returns to its base mode rather than jumping
+ * anywhere.
  *
- * State diagram
- *
- *       n press  ─►    n press  ─►    n press  ─►
- *      ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
- *      │ PATROL │ │ HOVER  │ │ PURSUE │ │ PATROL │  (cycles via n/p)
- *      └───┬────┘ └───┬────┘ └───┬────┘ └────────┘
- *          ◄─ p press ◄─ p press ◄─
- *
- *          SPACE (or auto-dive timer) from ANY base mode:
- *            → enter DIVE; dive_timer = HAWK_DIVE_DURATION
- *            → vel = unit(centroid − pos) · HAWK_DIVE_SPEED
- *
- *          DIVE → base_mode  when dive_timer ≤ 0
- *            → if base_mode == PATROL:
- *                patrol_phase = atan2(pos − world_centre)
- *                (orbit resumes from current pos; no teleport)
- *
- * Per-mode behaviour
- *
- *   PATROL  Closed-form orbit around the world centre at radius
- *           HAWK_PATROL_FRAC · min(w,h), angular speed
- *           HAWK_PATROL_OMEGA = 0.4 rad/s (one orbit ≈ 15.7 s).
- *           pos is a pure function of (centre, r, phase) — no
- *           velocity integration.  Hawk reads as "watching" rather
- *           than chasing.  Reference: [2] Reynolds 1999 §"Wander" —
- *           same closed-form-circular-motion pattern.
- *
- *   HOVER   Slow drift toward flock centroid at HAWK_HOVER_DRIFT
- *           (60 px/s).  Inside HAWK_HOVER_HOLD_RADIUS (30 px) the
- *           drift speed scales linearly to 0, producing a smooth
- *           settle.  Flock forms a moving torus around the hawk —
- *           classic murmuration motif when an aerial predator is
- *           present.  Reference: [5] Couzin et al. 2002 — analogous
- *           "loaf" / "doughnut" configurations.
- *
- *   PURSUE  Continuous tracking at HAWK_PURSUE_SPEED (110 px/s,
- *           slightly above BOID_SPEED = 90).  Hawk closes in slowly;
- *           flock keeps running and reshapes.  Reference: [2]
- *           Reynolds 1999 §"Pursue" — directly relevant.
- *
- *   DIVE    Straight-line sprint at HAWK_DIVE_SPEED (250 px/s) for
- *           HAWK_DIVE_DURATION (1.5 s) toward the flock centroid.
- *           Models the "stoop" of a real raptor attack.  References:
- *           [6] Hildenbrandt et al. 2010 (hawk dive simulation),
- *           [7] Cavagna et al. 2010 (empirical evidence that real
- *           starling flocks fragment + reform around such attacks).
+ *   PATROL  circle the centre of the world at a steady angular speed; the hawk
+ *           looks like it's watching, not chasing.
+ *   HOVER   drift onto the flock's centre and park there, easing to a stop, so
+ *           the flock has to bend around it (a moving doughnut shape).
+ *   PURSUE  chase the flock's centre nonstop at just above bird speed, slowly
+ *           gaining, so the flock keeps running.
+ *   DIVE    a fast straight sprint at the flock for a fixed time — a raptor's
+ *           stoop. The flock splits and reforms around it.
  *
  * Members
- *   HAWK_PATROL    = 0  Default base; orbiting watch.
- *   HAWK_HOVER     = 1  Stationary threat over the flock.
- *   HAWK_PURSUE    = 2  Continuous low-speed chase.
- *   HAWK_DIVE      = 3  Overlay; never in the n/p cycle.
- *   HAWK_MODE_COUNT_BASE  Sentinel == HAWK_DIVE (= 3 cyclable bases).
+ *   HAWK_PATROL/HOVER/PURSUE  the three base modes (0..2).
+ *   HAWK_DIVE                 the overlay; kept last, never in the n/p cycle.
+ *   HAWK_MODE_COUNT_BASE      equals HAWK_DIVE, i.e. the count of base modes (3).
  *
- * Invariants
- *   0 ≤ mode < HAWK_DIVE+1 == 4.
- *   0 ≤ base_mode < HAWK_MODE_COUNT_BASE == 3 (DIVE never in base).
- *
- * References (collected)
- *   [1] Reynolds 1987 — boid model the prey-flock obeys.
- *   [2] Reynolds 1999 — steering primitives (PATROL=wander,
- *       HOVER=arrival, PURSUE=pursue) reused as hawk steerings.
- *   [5] Couzin et al. 2002 — torus / loaf configurations.
- *   [6] Hildenbrandt et al. 2010 — hawk-dive simulation.
- *   [7] Cavagna et al. 2010 — empirical fragment-and-reform.
+ * References: Reynolds 1999 (steering), Couzin et al. 2002 (doughnut shapes),
+ * Hildenbrandt et al. 2010 and Cavagna et al. 2010 (hawk dives on real flocks).
  */
 typedef enum {
     HAWK_PATROL = 0,
@@ -1360,103 +688,49 @@ static const char *HAWK_MODE_NAMES[] = {
 };
 
 /*
- * Hawk — the singleton predator + its controller state.
+ * Hawk — the single predator and the state its modes need.
  *
- * Intent
- *   One Hawk instance lives on Scene.  Each tick its mode-specific
- *   stepper (hawk_step_patrol / _hover / _pursue / _dive) advances
- *   pos + vel; every Boid feels a flee force via hawk_flee_force.
+ * One Hawk lives on the Scene. Each tick the stepper for its current mode moves
+ * it, and every bird feels a flee force from it. All four modes share one flat
+ * struct; a given mode only touches the fields it needs (PATROL uses
+ * patrol_phase, DIVE uses dive_timer, and so on).
  *
- * Why ONE struct instead of separate state-per-mode
- *   The four modes share the same KINEMATIC variables (pos, vel) but
- *   only some use each controller variable (patrol_phase only in
- *   PATROL, dive_timer only in DIVE).  A flat layout keeps the
- *   structure size small (~36 bytes) and avoids the inheritance
- *   gymnastics of per-mode subtypes.  The few unused fields-per-
- *   mode are tolerable noise.
+ * It keeps two mode fields. `mode` is what's running now (which stepper to
+ * call); `base_mode` is what to return to when a dive ends. Without the second
+ * one, a dive launched from HOVER would wrongly snap back to PATROL.
  *
- * Why TWO mode fields (mode + base_mode)
- *   The state machine has 3 cyclable bases plus 1 overlay (see
- *   HawkMode docblock).  `mode` tracks WHAT'S RUNNING right now
- *   (which stepper to call); `base_mode` tracks WHERE TO RETURN
- *   when DIVE ends.  Without `base_mode`, a DIVE fired while in
- *   HOVER would return to PATROL by default, losing the user's
- *   selection.  With it, DIVE is a true non-destructive overlay.
+ * Members
+ *   pos          position in pixels; the centre every bird flees from.
+ *   vel          velocity in pixels/sec. Used by HOVER, PURSUE, DIVE. PATROL
+ *                ignores it — it sets pos straight from its orbit equation.
+ *   mode         the live mode. Also drives the HUD label and the hawk glyph.
+ *   base_mode    the mode to return to after a dive (one of the three bases).
+ *   patrol_phase the orbit angle, in radians, ticked forward while patrolling.
+ *                When a dive ends back into PATROL, it's recomputed from the
+ *                current position so the orbit picks up where the dive left off.
+ *   dive_timer   seconds left in the current dive; ignored outside DIVE.
+ *   auto_dive    when on ('h' key), dives fire on a timer with no keypresses.
+ *   auto_dive_timer  seconds since the last dive; only ticks while auto_dive is
+ *                    on and a dive isn't already running.
  *
- * Members — kinematic state
- *   pos          world-pixel position; clamped/wrapped by hawk_wrap.
- *                Source of the flee-vector emanation for every Boid.
- *   vel          world-pixel velocity (units = px/s).  USED by HOVER,
- *                PURSUE, DIVE.  IGNORED by PATROL (which writes pos
- *                directly from closed-form orbit equation, then
- *                leaves vel stale — no harm because PATROL is the
- *                only mode that doesn't read vel).
- *
- * Members — controller state
- *   mode         live FSM state (PATROL/HOVER/PURSUE/DIVE).  Read by
- *                hawk_step's dispatcher to pick the right stepper.
- *                Also read by screen_draw for the HUD label and
- *                glyph choice ('!' during DIVE, 'X' otherwise).
- *   base_mode    persistent "what to return to after DIVE" — set by
- *                hawk_cycle_base_mode (n/p keys).  Range: PATROL,
- *                HOVER, PURSUE.  Never HAWK_DIVE.
- *   patrol_phase Orbit angle in RADIANS.  Advanced by
- *                HAWK_PATROL_OMEGA·dt each PATROL tick.  When DIVE
- *                ends with base_mode==PATROL, this is recomputed as
- *                atan2(pos − centre) so the orbit resumes smoothly
- *                from where the dive ended (NO TELEPORT — see [2]
- *                Reynolds 1999 §"Wander" for the same trick).
- *   dive_timer   Seconds remaining in the current DIVE.  Decremented
- *                each DIVE tick by dt; on ≤ 0 the FSM transitions to
- *                base_mode.  Unused outside DIVE.
- *
- * Members — user-facing flags
- *   auto_dive       Toggled by `h` key.  When true, auto_dive_timer
- *                   accumulates dt; on reaching AUTO_DIVE_PERIOD,
- *                   scene_tick fires a dive automatically.  Lets the
- *                   user watch the cycle "cohere → split → reform"
- *                   without continuous keypresses.
- *   auto_dive_timer Seconds since the last (auto-)fired dive.  Reset
- *                   to 0 on each fire and on `h` toggle.  Only ticks
- *                   while auto_dive is true AND mode != HAWK_DIVE.
- *
- * Invariants
- *   mode ∈ {PATROL, HOVER, PURSUE, DIVE}.
- *   base_mode ∈ {PATROL, HOVER, PURSUE}  (never DIVE).
- *   dive_timer > 0  IFF  mode == HAWK_DIVE  (otherwise unread).
- *   0 ≤ pos.x < World.width  AND  0 ≤ pos.y < World.height after wrap.
- *
- * References
- *   [2] Reynolds 1999 — Pursue / Arrival / Wander steerings reused.
- *   [6] Hildenbrandt et al. 2010 — adds aerial predators to the
- *       canonical starling-murmuration simulation.
- *   [7] Cavagna et al. 2010 — empirical evidence that real flocks
- *       fragment and reform around hawk attacks.
+ * References: Reynolds 1999, Hildenbrandt et al. 2010, Cavagna et al. 2010.
  */
 typedef struct {
-    /* kinematic state */
     Vec2 pos;
     Vec2 vel;        /* used by HOVER / PURSUE / DIVE; PATROL recomputes pos */
 
-    /* controller state */
-    HawkMode mode;            /* current state — includes DIVE overlay  */
+    HawkMode mode;            /* current mode — includes DIVE overlay   */
     HawkMode base_mode;       /* PATROL/HOVER/PURSUE — DIVE returns here */
     float    patrol_phase;    /* radians around world centre            */
     float    dive_timer;      /* seconds remaining in current dive      */
 
-    /* user-facing flag (HUD + auto-dive) */
     bool     auto_dive;
     float    auto_dive_timer; /* seconds since last (auto-)fired dive */
 } Hawk;
 
-/*
- * hawk_cycle_base_mode — cycle the persistent base mode forward (dir=+1,
- * `n` key) or backward (dir=−1, `p` key) through the three cyclable
- * states {PATROL, HOVER, PURSUE}.  If the hawk is currently in DIVE,
- * the cycle changes what it will return to when the dive ends; the
- * dive itself runs to completion.  If the hawk is in any base mode,
- * the cycle also flips the live mode.
- */
+/* Step the base mode forward (n) or backward (p) through PATROL/HOVER/PURSUE.
+ * Mid-dive this only changes what the hawk returns to afterward; otherwise it
+ * switches the live mode too. */
 static void hawk_cycle_base_mode(Hawk *h, int dir)
 {
     int next = ((int)h->base_mode + dir + HAWK_MODE_COUNT_BASE)
@@ -1465,26 +739,15 @@ static void hawk_cycle_base_mode(Hawk *h, int dir)
     if (h->mode != HAWK_DIVE) h->mode = h->base_mode;
 }
 
-/*
- * hawk_dive — kick off a dive toward `target` (typically the flock
- * centroid).  No-op if the hawk is already mid-dive.
- *
- *   pick the direction TARGET − POS;
- *   set vel = direction · HAWK_DIVE_SPEED;
- *   start dive_timer = HAWK_DIVE_DURATION;
- *   mode = DIVE.
- *
- * The dive moves in a straight line and IGNORES toroidal wrap on the
- * direction calculation — if the centroid wraps across an edge, the
- * hawk will fly the long way around.  This is fine because PATROL
- * resumes immediately after dive_timer expires, and the hawk's orbit
- * will re-centre.
- */
+/* Start a dive at `target` (usually the flock's centre). Does nothing if a dive
+ * is already running. The dive flies in a straight line and ignores wrap, so if
+ * the target is across an edge the hawk takes the long way — harmless, since it
+ * resumes its base mode the moment the dive ends. */
 static void hawk_dive(Hawk *h, Vec2 target)
 {
     if (h->mode == HAWK_DIVE) return;
     Vec2 dir = v2norm(v2sub(target, h->pos));
-    if (v2len(dir) < 0.001f) return;       /* degenerate: hawk on target */
+    if (v2len(dir) < 0.001f) return;       /* hawk already on the target */
 
     h->vel        = v2scale(dir, HAWK_DIVE_SPEED);
     h->dive_timer = HAWK_DIVE_DURATION;
@@ -1493,14 +756,8 @@ static void hawk_dive(Hawk *h, Vec2 target)
 
 /* ── per-mode hawk steppers ─────────────────────────────────────────── */
 
-/*
- * hawk_step_patrol — closed-form orbit position.
- *
- *   patrol_phase += OMEGA · dt
- *   pos = centre + r · (cos φ, sin φ)
- *
- * No velocity integration; pos is a pure function of (centre, r, phase).
- */
+/* PATROL: advance the orbit angle and place the hawk on the circle. No velocity
+ * is used — the position comes straight from the angle. */
 static void hawk_step_patrol(Hawk *h, Vec2 world_centre, float patrol_r, float dt)
 {
     h->patrol_phase += HAWK_PATROL_OMEGA * dt;
@@ -1509,19 +766,10 @@ static void hawk_step_patrol(Hawk *h, Vec2 world_centre, float patrol_r, float d
     h->pos = v2add(world_centre, orbit_offset);
 }
 
-/*
- * hawk_step_hover — slow drift toward flock centroid; settle once close.
- *
- *   offset_to_centroid  = centroid − pos  (no toroidal wrap; hover is
- *                         a local LOS approach, not a wrap-aware seek)
- *   distance            = |offset_to_centroid|
- *   if distance < HOLD_RADIUS:
- *       speed scales linearly from HAWK_HOVER_DRIFT at the edge to 0
- *       at the centroid — produces a smooth settle, not a stop-jerk
- *   else:
- *       speed = HAWK_HOVER_DRIFT (full drift toward target)
- *   vel = unit(offset) · speed; pos += vel · dt
- */
+/* HOVER: drift toward the flock's centre and ease to a stop near it. Outside
+ * the hold radius it moves at full drift speed; inside, the speed shrinks with
+ * the distance so it settles smoothly instead of stopping with a jerk. (Plain
+ * line-of-sight, no wrap — hover is a close-range approach.) */
 static void hawk_step_hover(Hawk *h, Vec2 centroid, float dt)
 {
     Vec2  offset_to_centroid = v2sub(centroid, h->pos);
@@ -1538,11 +786,8 @@ static void hawk_step_hover(Hawk *h, Vec2 centroid, float dt)
     h->pos = v2add(h->pos, v2scale(h->vel, dt));
 }
 
-/*
- * hawk_step_pursue — continuous chase at HAWK_PURSUE_SPEED toward flock
- * centroid.  Always at full speed (no settling) — the hawk is actively
- * trying to close in.  Boid flee force still applies normally.
- */
+/* PURSUE: chase the flock's centre at full chase speed, no settling — the hawk
+ * is actively trying to close the gap. */
 static void hawk_step_pursue(Hawk *h, Vec2 centroid, float dt)
 {
     Vec2  offset_to_centroid = v2sub(centroid, h->pos);
@@ -1554,19 +799,9 @@ static void hawk_step_pursue(Hawk *h, Vec2 centroid, float dt)
     h->pos = v2add(h->pos, v2scale(h->vel, dt));
 }
 
-/*
- * hawk_step_dive — straight-line sprint at HAWK_DIVE_SPEED until the
- * dive_timer expires; on expiry, snap back to base_mode with state
- * re-derived from current position so there's no teleport.
- *
- *   pos += vel · dt
- *   dive_timer -= dt
- *   if dive_timer ≤ 0:
- *       if base_mode == PATROL:
- *           re-derive patrol_phase = atan2(pos − centre) so orbit
- *           resumes from CURRENT position (no jump back to ring)
- *       mode = base_mode
- */
+/* DIVE: fly straight at full dive speed, counting down the timer. When it runs
+ * out, return to the base mode. If that's PATROL, recompute the orbit angle from
+ * the current spot so the circle resumes here instead of snapping back. */
 static void hawk_step_dive(Hawk *h, Vec2 world_centre, float dt)
 {
     h->pos = v2add(h->pos, v2scale(h->vel, dt));
@@ -1580,8 +815,7 @@ static void hawk_step_dive(Hawk *h, Vec2 world_centre, float dt)
     h->mode = h->base_mode;
 }
 
-/* hawk_wrap — toroidal wrap for the hawk; keeps it on-screen during
- * long dives that would otherwise punch off the edge. */
+/* Wrap the hawk back on-screen, so a long dive doesn't fly it off the edge. */
 static void hawk_wrap(Hawk *h, World world)
 {
     if (h->pos.x <  0.0f)         h->pos.x += world.width;
@@ -1590,12 +824,9 @@ static void hawk_wrap(Hawk *h, World world)
     if (h->pos.y >= world.height) h->pos.y -= world.height;
 }
 
-/*
- * hawk_step — dispatcher: pick the right per-mode stepper, then wrap.
- *
- * Centroid is supplied by the caller (Scene refreshes it each tick).
- * For PATROL, centroid is unused; for HOVER/PURSUE/DIVE it's the target.
- */
+/* Run the stepper for the hawk's current mode, then wrap it on-screen. The
+ * caller passes the flock centre (the target for HOVER/PURSUE/DIVE; PATROL
+ * ignores it). */
 static void hawk_step(Hawk *h, Vec2 world_centre, float patrol_r,
                       Vec2 flock_centroid, World world, float dt)
 {
@@ -1609,26 +840,14 @@ static void hawk_step(Hawk *h, Vec2 world_centre, float patrol_r,
     hawk_wrap(h, world);
 }
 
-/* ===================================================================== */
-/* §8  scene                                                              */
-/* ===================================================================== */
+/* ── §8 scene — flock + hawk state, the tick, and the density renderer ── */
 
 /*
- * SimControls — user-facing playback knobs.
- *
- * Intent
- *   Bundle the two scalars that the input handler writes and the HUD +
- *   tick read — `paused` (toggled by `.`) and `theme_idx` (cycled by
- *   t / T).  Keeps app_handle_key compact and gives the Scene's top
- *   level a cleaner shape (everything user-controlled in one place).
+ * SimControls — the playback knobs the user can change.
  *
  * Members
- *   paused      true → scene_tick early-returns; HUD shows "PAUSED".
- *   theme_idx   active flock colour palette in [0, N_THEMES); cycled
- *               by t / T.  theme_apply() re-registers ncurses pairs.
- *
- * Invariants
- *   0 ≤ theme_idx < N_THEMES (clamped in app_handle_key).
+ *   paused      true means the simulation is frozen; the HUD shows PAUSED.
+ *   theme_idx   which flock palette is active, 0..N_THEMES-1 (t/T cycles it).
  */
 typedef struct {
     bool paused;
@@ -1636,62 +855,37 @@ typedef struct {
 } SimControls;
 
 /*
- * Scene — owns ALL simulation state for one run.
+ * Scene — all of one run's simulation state in one place.
  *
- * Layered ownership
+ * Every persistent simulation value hangs off a single Scene: the flock, the
+ * hawk, the user knobs, the world size, the flock centre, and the per-tick
+ * neighbour grid. (Terminal size and ncurses live on Screen; signal flags on
+ * App, since signal handlers can't be handed a pointer.) Keeping it in one
+ * struct rather than loose globals means a helper that takes `Scene *` is the
+ * one place to look for what state exists, and a future split-screen view could
+ * just allocate a second Scene.
  *
- *     Scene
- *       ├── pool[N_BOIDS_MAX] : Boid[]       ← flock pool (first n active)
- *       ├── n_birds           : int          ← active prefix length
- *       ├── hawk              : Hawk         ← singleton predator
- *       ├── sim               : SimControls  ← paused + theme_idx
- *       ├── world             : World        ← pixel-space simulation extent
- *       ├── flock_centroid    : Vec2         ← derived (refreshed each tick)
- *       └── hash              : SpatialHash  ← per-tick neighbour structure
- *
- *   Every persistent simulation value is reachable from one Scene*.
- *   Terminal state (cols, rows, ncurses lifecycle) lives on Screen in §9;
- *   POSIX signal flags live on App in §9 because signal handlers can't
- *   receive a context pointer.
- *
- * Why this hierarchy
- *   • Replaceability: a future split-screen demo allocates multiple
- *     Scenes; file-scope globals would prevent that.
- *   • Reading aid: every helper takes `Scene *`, giving the reader ONE
- *     place to look for "what state exists".
- *   • The spatial hash sits on Scene rather than as file-scope statics
- *     so it travels with the simulation it indexes — see SpatialHash
- *     docblock above (§6.5) for the rationale.
+ * Members
+ *   pool[]          the bird pool; only the first n_birds are active.
+ *   n_birds         how many birds are live right now.
+ *   hawk            the single predator.
+ *   sim             paused + theme.
+ *   world           world size in pixels; refreshed on resize.
+ *   flock_centroid  the flock's centre, recomputed each tick (a dive target).
+ *   hash            the neighbour grid, rebuilt each tick.
  */
 typedef struct {
-    /* ── flock pool ─ first n_birds slots active ───────────────── */
     Boid  pool[N_BOIDS_MAX];
     int   n_birds;
-
-    /* ── singleton predator ────────────────────────────────────── */
     Hawk  hawk;
-
-    /* ── user-facing knobs (paused + theme_idx) ────────────────── */
     SimControls sim;
-
-    /* ── pixel-space simulation extent (refreshed on resize) ───── */
     World world;
-
-    /* ── derived: flock centre of mass (refreshed each tick) ───── */
     Vec2  flock_centroid;
-
-    /* ── per-tick neighbour index (rebuilt each tick) ──────────── */
     SpatialHash hash;
 } Scene;
 
-/*
- * scene_init — fresh scene with random birds and a hawk parked at the
- * east edge of its patrol orbit.  Theme index is preserved across
- * reset (saved before memset, restored after).
- */
-/*
- * world_centre — geometric centre of the simulation box in pixel space.
- * Used as patrol orbit centre + initial centroid + dive return point. */
+/* The geometric centre of the world. Used as the patrol orbit centre, the
+ * starting centroid, and a dive's return point. */
 static inline Vec2 world_centre(World world)
 {
     const float WORLD_CENTRE_FRAC = 0.5f;
@@ -1699,31 +893,24 @@ static inline Vec2 world_centre(World world)
               world.height * WORLD_CENTRE_FRAC);
 }
 
-/* hawk_patrol_radius_for — orbit radius = HAWK_PATROL_FRAC × min(w, h).
- * The min-dimension constraint keeps the orbit visible on tall-and-thin
- * or short-and-wide terminals where one axis would otherwise dominate. */
+/* The hawk's orbit radius, scaled to the smaller of width/height so the circle
+ * stays fully on screen even on a long-and-thin terminal. */
 static inline float hawk_patrol_radius_for(World world)
 {
     float min_dim = (world.width < world.height) ? world.width : world.height;
     return min_dim * HAWK_PATROL_FRAC;
 }
 
-/*
- * spawn_boid_pool — pre-spawn every bird in the pool to a random
- * position in the world.  Called once at scene_init; the '+'/'-'
- * keys just slide n_birds without re-randomising.
- */
+/* Spawn the whole pool at once. The +/- keys just change how many are active,
+ * so they reveal already-placed birds rather than re-randomising. */
 static void spawn_boid_pool(Boid *pool, World world)
 {
     for (int i = 0; i < N_BOIDS_MAX; i++)
         boid_spawn(&pool[i], i, world);
 }
 
-/*
- * place_hawk_at_orbit_east — park the hawk on the east edge of its
- * patrol orbit (phase = 0, position = centre + (r, 0)) so the first
- * frame shows the hawk away from the spawn cluster.
- */
+/* Put the hawk at the right-hand point of its orbit and reset its controller
+ * state, so frame one shows it away from where the birds spawned. */
 static void place_hawk_at_orbit_east(Hawk *h, World world)
 {
     Vec2  centre = world_centre(world);
@@ -1738,42 +925,33 @@ static void place_hawk_at_orbit_east(Hawk *h, World world)
     h->auto_dive_timer = 0.0f;
 }
 
+/* Start (or reset) a scene: random birds, hawk on its orbit. The chosen theme
+ * survives a reset (saved before the wipe, restored after). */
 static void scene_init(Scene *s, int cols, int rows)
 {
-    /* (a) Preserve theme across reset; zero everything else */
     int saved_theme = s->sim.theme_idx;
     memset(s, 0, sizeof *s);
     s->sim.theme_idx = saved_theme;
     s->sim.paused    = false;
 
-    /* (b) World extent in pixel space, derived from terminal extent */
     s->world   = world_from_terminal(cols, rows);
     s->n_birds = N_BOIDS_DEFAULT;
 
-    /* (c) Pre-spawn the full pool; place the predator on the orbit */
     spawn_boid_pool(s->pool, s->world);
     place_hawk_at_orbit_east(&s->hawk, s->world);
 
-    /* (d) Initial centroid = world centre (no birds have moved yet) */
+    /* No bird has moved yet, so start the centroid at the world centre. */
     s->flock_centroid = world_centre(s->world);
 }
 
-/*
- * scene_centroid — toroidal-aware flock centre of mass.  Used by the
- * hawk dive to choose a target.  For a small flock on a large world
- * this is just the average position; on small terminals (where the
- * flock can wrap around) we need to pick a reference and accumulate
- * toroidal offsets relative to it.
- */
+/* The flock's centre of mass, picked as the hawk's dive target. Computed in a
+ * wrap-aware way: pick one bird as a reference and average the *offsets* to
+ * every other bird, so a flock straddling an edge still gets the right centre
+ * (same trick as cohere_force). */
 static Vec2 scene_centroid(const Boid *pool, int n, World world)
 {
-    /* (1) degenerate case: no birds → world centre */
     if (n <= 0) return v2(world.width * 0.5f, world.height * 0.5f);
 
-    /* (2) pick a reference bird and sum TOROIDAL OFFSETS to every other
-     *     bird.  Averaging absolute positions would give the wrong
-     *     centroid when the flock straddles a wrap edge — see the
-     *     cohere_force docblock for the same trick. */
     Vec2 reference_pos = pool[0].pos;
     Vec2 offset_sum    = v2(0, 0);
     for (int i = 0; i < n; i++) {
@@ -1781,13 +959,10 @@ static Vec2 scene_centroid(const Boid *pool, int n, World world)
         offset_sum.y += toroidal_delta(reference_pos.y, pool[i].pos.y, world.height);
     }
 
-    /* (3) mean offset from reference = average displacement of the flock
-     *     centroid_pos = reference_pos + mean_offset */
     Vec2 mean_offset_from_reference = v2scale(offset_sum, 1.0f / (float)n);
     Vec2 centroid_pos = v2add(reference_pos, mean_offset_from_reference);
 
-    /* (4) wrap centroid back into [0, width) × [0, height) so callers
-     *     get a valid world-space coordinate */
+    /* Wrap the result back into the world so callers get a valid position. */
     if (centroid_pos.x <  0.0f)         centroid_pos.x += world.width;
     if (centroid_pos.x >= world.width)  centroid_pos.x -= world.width;
     if (centroid_pos.y <  0.0f)         centroid_pos.y += world.height;
@@ -1795,12 +970,8 @@ static Vec2 scene_centroid(const Boid *pool, int n, World world)
     return centroid_pos;
 }
 
-/*
- * tick_auto_dive_timer — advance the auto-dive timer if enabled, fire a
- * dive once AUTO_DIVE_PERIOD has elapsed.  Only ticks while the hawk
- * is in a base mode (not already mid-dive) so successive dives don't
- * stack.  No-op when auto_dive is off.
- */
+/* When auto-dive is on, count up and fire a dive every AUTO_DIVE_PERIOD. Only
+ * counts while the hawk isn't already diving, so dives don't stack up. */
 static void tick_auto_dive_timer(Hawk *h, Vec2 flock_centroid, float dt)
 {
     bool eligible = h->auto_dive && h->mode != HAWK_DIVE;
@@ -1813,16 +984,9 @@ static void tick_auto_dive_timer(Hawk *h, Vec2 flock_centroid, float dt)
     }
 }
 
-/*
- * compute_new_velocities — stage 1 of the two-stage simultaneous update.
- *
- *   for each active bird i:
- *     force_i  = boid_forces(...)        (hashed neighbour scan)
- *     vel'_i   = clamp(vel_i + force_i·dt, MAX_SPEED)
- *
- * Reads pool[] only (OLD positions); writes new_vel[].  No bird sees
- * any already-moved neighbour.
- */
+/* Step 1 of the two-step update: compute every bird's new velocity from the
+ * current positions and write it into new_vel, without moving anything yet. So
+ * no bird reacts to a neighbour that has already moved this tick. */
 static void compute_new_velocities(const Boid *pool, const SpatialHash *hash,
                                    int n, Vec2 hawk_pos, World world,
                                    float dt, Vec2 *new_vel)
@@ -1834,16 +998,8 @@ static void compute_new_velocities(const Boid *pool, const SpatialHash *hash,
     }
 }
 
-/*
- * commit_step_and_wrap — stage 2 of the two-stage simultaneous update.
- *
- *   for each active bird i:
- *     vel_i       = new_vel[i]                         (write back)
- *     prev_pos_i  = pos_i                              (snapshot)
- *     pos_i      += vel_i · dt                         (Euler integrate)
- *     toroidal-wrap pos_i
- *     clamp |vel_i| ∈ [MIN_SPEED, MAX_SPEED]
- */
+/* Step 2 of the two-step update: now that every new velocity is known, apply
+ * them — store the velocity, save the old position, move, wrap, clamp speed. */
 static void commit_step_and_wrap(Boid *pool, int n, const Vec2 *new_vel,
                                  World world, float dt)
 {
@@ -1858,60 +1014,41 @@ static void commit_step_and_wrap(Boid *pool, int n, const Vec2 *new_vel,
 }
 
 /*
- * scene_tick — one fixed-step physics update.
- *
- *   (1) auto-dive timer  : tick_auto_dive_timer fires DIVE on schedule
- *   (2) hawk             : hawk_step dispatches by mode
- *   (3) spatial hash     : rebuild once for THIS tick's positions
- *   (4) STAGE 1 (read)   : compute_new_velocities reads OLD pool[]
- *   (5) STAGE 2 (write)  : commit_step_and_wrap writes vel + pos
- *   (6) centroid         : refresh for next-frame HUD + future dive
- *
- * The two-stage simultaneous update is the canonical fix for the
- * "boid earlier in array sees the next boid already moved" drift —
- * see flocking.c MENTAL MODEL for the same pattern with detail.
+ * One physics tick: fire the auto-dive if it's due, move the hawk, rebuild the
+ * neighbour hash, then run the two-step bird update (compute all new velocities,
+ * then apply them), and finally refresh the flock centre. The two-step update
+ * is what stops birds drifting because an earlier one in the array already
+ * moved — see flocking.c for the same pattern explained in detail.
  */
 static void scene_tick(Scene *s, float dt)
 {
     if (s->sim.paused) return;
     World world = s->world;
 
-    /* (1) auto-dive trigger (only when hawk is in a base mode) */
     tick_auto_dive_timer(&s->hawk, s->flock_centroid, dt);
 
-    /* (2) hawk step — pick stepper by mode; PATROL needs centre + radius,
-     *     HOVER/PURSUE/DIVE use the flock centroid */
     hawk_step(&s->hawk,
               world_centre(world),
               hawk_patrol_radius_for(world),
               s->flock_centroid, world, dt);
 
-    /* (3) build spatial hash ONCE for this tick so every boid_forces call
-     *     below sees a consistent neighbour structure.  O(N). */
+    /* Build the neighbour hash once so every bird this tick sees the same one. */
     spatial_hash_build(&s->hash, s->pool, s->n_birds, world);
 
-    /* (4) STAGE 1 — compute every new velocity from OLD positions */
-    static Vec2 new_vel[N_BOIDS_MAX];   /* file-scope: keep stack small */
+    static Vec2 new_vel[N_BOIDS_MAX];   /* static so it stays off the stack */
     compute_new_velocities(s->pool, &s->hash, s->n_birds,
                            s->hawk.pos, world, dt, new_vel);
 
-    /* (5) STAGE 2 — write velocities, integrate, wrap, clamp speed */
     commit_step_and_wrap(s->pool, s->n_birds, new_vel, world, dt);
 
-    /* (6) refresh centroid for next-frame HUD and any future dive */
     s->flock_centroid = scene_centroid(s->pool, s->n_birds, world);
 }
 
 /* ── render ──────────────────────────────────────────────────────────── */
 
-/*
- * mark_cell — stamp one ASCII glyph at terminal cell (cx, cy).
- *
- * Centralises the (chtype)(unsigned char) cast plus bounds-check that
- * would otherwise be repeated at every mvwaddch site.  The double
- * cast prevents sign-extension on values > 127 (per CLAUDE.md
- * "Common ncurses Bugs").  Off-screen cells are silently dropped.
- */
+/* Draw one ASCII glyph at terminal cell (cx, cy), or drop it if off-screen.
+ * The double cast stops a char above 127 turning negative and corrupting the
+ * output (a known ncurses gotcha). */
 static void mark_cell(WINDOW *w, int cx, int cy, char ch,
                       int pair, attr_t attr, int cols, int rows)
 {
@@ -1921,29 +1058,15 @@ static void mark_cell(WINDOW *w, int cx, int cy, char ch,
     wattroff(w, COLOR_PAIR(pair) | attr);
 }
 
-/*
- * Per-frame density buffer.  Static so we don't re-allocate every
- * frame and don't put 80 KB on the stack.  Sized to MAX_ROWS × MAX_COLS
- * to handle very large terminals; scene_draw zeroes only the active
- * region (rows × cols), not the whole buffer.
- */
+/* The per-frame grid of how many birds are in each cell. Kept static (not on
+ * the stack, not re-allocated) and only the visible part is ever touched. */
 static int g_density[MAX_ROWS][MAX_COLS];
 
-/*
- * density_glyph — pick the glyph + brightness tier for a given count.
- *
- *   density 0      : not drawn (caller skips)
- *   density 1-4    : A_NORMAL, glyphs '.' ',' ':' ';'
- *   density 5+     : A_BOLD,   glyphs 'o' 'O' '*' '#' '@' (saturating)
- *
- * No A_DIM tier — at A_DIM most terminals render colours at ~half
- * intensity, and since most cells in the flock have density 1 or 2
- * the periphery would fade to near-black.  The visual fade-to-edge
- * comes from the GLYPH ramp ('.' for sparse → '@' for dense), not
- * from brightness modulation; using only A_NORMAL and A_BOLD keeps
- * every drawn cell legible while still giving the bright core its
- * characteristic A_BOLD glow.
- */
+/* Map a cell's bird count to a glyph and brightness: sparse cells get faint
+ * dots from the ramp, dense cells get bold bright '@'. There's no dim tier on
+ * purpose — most cells hold only one or two birds, and dimming them would make
+ * the flock edges nearly invisible. The fade comes from the glyph ramp, not
+ * from dimming. */
 static void density_glyph(int density, char *out_ch, attr_t *out_attr)
 {
     int idx = density - 1;
@@ -1954,25 +1077,7 @@ static void density_glyph(int density, char *out_ch, attr_t *out_attr)
     *out_attr = (density >= 5) ? A_BOLD : A_NORMAL;
 }
 
-/*
- * scene_draw — paint the frame in painter's order:
- *
- *   1. Bin every bird into the density grid (skipping out-of-bounds).
- *   2. For each non-empty cell, stamp the corresponding glyph from the
- *      ASCII ramp with its brightness tier; the colour pair cycles
- *      through pairs 1..N_COLORS keyed by cell position so the flock
- *      reads as a coherent tinted cloud rather than monochrome.
- *   3. Hawk on top — always A_BOLD red `!`.
- *
- * The flock tint per cell uses (cy * 7 + cx) % N_COLORS — a cheap
- * spatial hash that gives the cloud a soft mottled colour without
- * recomputing per-bird identity.
- */
-/*
- * zero_density_region — clear the active rectangle of the density grid.
- * Only zeros the visible region (cap_rows × cap_cols) — touching the
- * full buffer would be wasteful on small terminals.
- */
+/* Clear the visible part of the density grid (no need to touch the rest). */
 static void zero_density_region(int cap_cols, int cap_rows)
 {
     for (int r = 0; r < cap_rows; r++)
@@ -1980,14 +1085,8 @@ static void zero_density_region(int cap_cols, int cap_rows)
             g_density[r][c] = 0;
 }
 
-/*
- * bin_boids_into_density — histogram step: for each bird, increment
- * the count in its cell.  O(N) over birds + bounds-check per bird.
- *
- *   for each bird:
- *     (cx, cy) = px_to_cell(bird.pos)
- *     if inside the visible region:  density[cy][cx]++
- */
+/* Tally the birds into the grid: for each bird, bump the count in its cell
+ * (skipping any that fall off-screen). */
 static void bin_boids_into_density(const Boid *pool, int n_birds,
                                    int cap_cols, int cap_rows)
 {
@@ -1999,26 +1098,18 @@ static void bin_boids_into_density(const Boid *pool, int n_birds,
     }
 }
 
-/*
- * tint_pair_for_cell — choose a flock colour pair index for the cell
- * at (cx, cy).  Uses a CHEAP SPATIAL HASH `(cy·7 + cx) mod N_COLORS`
- * so adjacent cells get DIFFERENT pairs — produces the subtle mottle
- * inside an otherwise monochrome flock cloud.  7 is coprime with
- * N_COLORS=7's typical neighbours; any odd small int gives a similar
- * effect.
- */
+/* Pick a flock colour for a cell from its position, so neighbouring cells get
+ * different colours and the cloud looks softly mottled instead of one flat
+ * tint. The exact arithmetic doesn't matter much — any small odd multiplier
+ * spreads the colours about evenly. */
 static inline int tint_pair_for_cell(int cx, int cy)
 {
     const int SPATIAL_HASH_PRIME = 7;
     return ((cy * SPATIAL_HASH_PRIME + cx) % N_COLORS) + 1;
 }
 
-/*
- * render_density_field — for each non-empty density cell, look up the
- * glyph + brightness tier from the ramp and paint with a spatial-
- * hashed flock tint.  This is the step that makes 1500 boids read as
- * ONE cloud — see CONCEPTS §"Density binning" + tutorial T1/T2.
- */
+/* Paint the cloud: for each non-empty cell, draw its density glyph in its tint.
+ * This is the step that makes a thousand-plus birds read as one cloud. */
 static void render_density_field(WINDOW *w, int cap_cols, int cap_rows,
                                  int cols, int rows)
 {
@@ -2037,12 +1128,8 @@ static void render_density_field(WINDOW *w, int cap_cols, int cap_rows,
     }
 }
 
-/*
- * stamp_hawk_glyph — over-stamp the hawk on top of the rendered flock.
- * Glyph is '!' during DIVE (urgency), 'X' otherwise.  Always A_BOLD
- * in PAIR_HAWK (theme-independent bright red) so the predator is
- * visible regardless of which flock theme is active.
- */
+/* Draw the hawk on top of the flock: '!' while diving, 'X' otherwise, always in
+ * bold red so it stands out against any theme. */
 static void stamp_hawk_glyph(WINDOW *w, const Hawk *hawk, int cols, int rows)
 {
     int  cx       = px_to_cell_x(hawk->pos.x);
@@ -2051,73 +1138,35 @@ static void stamp_hawk_glyph(WINDOW *w, const Hawk *hawk, int cols, int rows)
     mark_cell(w, cx, cy, hawk_glyph, PAIR_HAWK, A_BOLD, cols, rows);
 }
 
+/* Draw the whole scene: tally birds into the density grid, paint the cloud from
+ * it, then stamp the hawk on top. */
 static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows)
 {
-    /* (1) Visible region (clip to density-buffer dims) */
+    /* Don't draw past the density buffer on a very large terminal. */
     int cap_rows = (rows < MAX_ROWS) ? rows : MAX_ROWS;
     int cap_cols = (cols < MAX_COLS) ? cols : MAX_COLS;
 
-    /* (2) Density histogram: zero, then bin every bird */
     zero_density_region(cap_cols, cap_rows);
     bin_boids_into_density(s->pool, s->n_birds, cap_cols, cap_rows);
-
-    /* (3) Convert density → glyphs + spatial-hash tint → paint cloud */
     render_density_field(w, cap_cols, cap_rows, cols, rows);
-
-    /* (4) Hawk on top (always painted last) */
     stamp_hawk_glyph(w, &s->hawk, cols, rows);
 }
 
-/* ===================================================================== */
-/* §9  app — screen + signals + main loop                                 */
-/* ===================================================================== */
+/* ── §9 app — screen, signals, input, and the main loop ── */
 
 /*
- * Screen — cell-space (terminal) extent + ncurses lifecycle wrapper.
+ * Screen — the terminal size in cells, and the ncurses wrapper.
  *
- * Intent
- *   Owns the TERMINAL side of the world.  Where Scene.world tracks
- *   the pixel-space simulation box, this struct tracks the cell-space
- *   terminal grid that ncurses paints onto.  The two are linked but
- *   live in DIFFERENT spaces:
- *
- *      World.width  = Screen.cols × CELL_W      (CELL_W = 8  px)
- *      World.height = Screen.rows × CELL_H      (CELL_H = 16 px)
- *
- *   Keeping them in SEPARATE structs prevents the entire class of
- *   "rendered too early in cell space" aspect-ratio bugs — physics
- *   never sees cells, the renderer never sees pixels except through
- *   the one px_to_cell_x/y bridge in §4.
- *
- * Why a tiny 2-field struct (not flat ints on App)
- *   • Lifecycle isolation: only screen_init / screen_resize /
- *     screen_free / screen_draw / screen_present touch ncurses'
- *     initscr / endwin / mvprintw.  They all take `Screen *` to
- *     make this layer explicit at the type level.
- *   • Symmetry with World: simulation and rendering each get one
- *     struct named for the space they live in.
- *   • Future-proof: a status panel / split-screen / viewport offset
- *     adds fields here without touching Scene.
+ * This is the terminal side of the world, kept separate from Scene.world (the
+ * pixel side). The two stay in step (World.width = cols * CELL_W, and so on),
+ * but keeping them apart means the physics only ever deals in pixels and the
+ * renderer only ever deals in cells, which avoids a whole class of
+ * aspect-ratio bugs.
  *
  * Members
- *   cols   terminal width in CELLS (read from getmaxyx).  Used by
- *          the renderer for cell-bounds checks after px → cell
- *          conversion, and by screen_draw for right-aligning the
- *          top HUD row.
- *   rows   terminal height in CELLS.  Same role on the vertical
- *          axis; bottom-row index is `rows - 1` (where the key hint
- *          paints).
- *
- * Invariants
- *   cols > 0 AND rows > 0 (set by screen_init via getmaxyx).
- *   Scene.world.width  == cols × CELL_W,
- *   Scene.world.height == rows × CELL_H,
- *   maintained in lockstep by scene_init / app_do_resize.
- *
- * References
- *   None directly — terminal extent is a rendering substrate concern.
- *   Aspect-ratio compensation (CELL_W vs CELL_H = 1:2) is project-
- *   specific; see CLAUDE.md §"Coordinate / Physics".
+ *   cols   terminal width in cells. Used for bounds checks and right-aligning
+ *          the top HUD line.
+ *   rows   terminal height in cells. The key-hint line sits at row rows-1.
  */
 typedef struct { int cols, rows; } Screen;
 
@@ -2143,23 +1192,9 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * screen_draw — compose one frame: density-rendered flock + hawk
- * + HUD bars.  HUD top-right (PAIR_HUD bright yellow A_BOLD) shows
- * fps + sim Hz + bird count + theme + hawk mode.  Bottom-left
- * (PAIR_HINT bright cyan A_BOLD) shows the key-binding strip.
- */
-/*
- * format_hud_status — write the top-row HUD text into `buf`.
- *
- *   live_mode is what's actually running right now (PATROL/HOVER/PURSUE
- *   in normal use, DIVE during the overlay).  When DIVE is firing on
- *   top of a non-PATROL base, render `hawk:DIVE→HOVER` so the user
- *   sees what mode it'll return to when the dive ends.  Otherwise
- *   show just the live mode.
- *
- *   Suffix shows PAUSED / AUTO / nothing.
- */
+/* Build the top HUD line. When a dive is running over a non-PATROL base, it
+ * shows "hawk:DIVE->HOVER" so you can see where it'll return; otherwise just
+ * the current mode. The suffix shows PAUSED, AUTO, or nothing. */
 static void format_hud_status(const Scene *sc, double fps, int sim_fps,
                               char *buf, size_t buflen)
 {
@@ -2172,7 +1207,7 @@ static void format_hud_status(const Scene *sc, double fps, int sim_fps,
 
     if (dive_over_non_patrol) {
         snprintf(buf, buflen,
-                 " %5.1f fps  sim:%3d Hz  n:%d/%d  [%s]  hawk:%s→%s%s ",
+                 " %5.1f fps  sim:%3d Hz  n:%d/%d  [%s]  hawk:%s->%s%s ",
                  fps, sim_fps, sc->n_birds, N_BOIDS_MAX,
                  THEMES[sc->sim.theme_idx].name,
                  live_mode, HAWK_MODE_NAMES[sc->hawk.base_mode], suffix);
@@ -2184,8 +1219,7 @@ static void format_hud_status(const Scene *sc, double fps, int sim_fps,
     }
 }
 
-/* hud_paint_text — attron / mvprintw / attroff sandwich; both HUD rows
- * use this so the colour-pair setup isn't duplicated at every call. */
+/* Print one bold coloured string at (row, col). Shared by both HUD lines. */
 static void hud_paint_text(int row, int col, int pair, const char *text)
 {
     attron (COLOR_PAIR(pair) | A_BOLD);
@@ -2193,7 +1227,7 @@ static void hud_paint_text(int row, int col, int pair, const char *text)
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* draw_hud_status — right-aligned top-row data line (fps + mode + count). */
+/* The top-row status line (fps, mode, counts), right-aligned. */
 static void draw_hud_status(const Screen *s, const Scene *sc,
                             double fps, int sim_fps)
 {
@@ -2206,7 +1240,7 @@ static void draw_hud_status(const Screen *s, const Scene *sc,
     hud_paint_text(HUD_TOP_ROW, right_col, PAIR_HUD, buf);
 }
 
-/* draw_hud_hint — bottom-row key bindings strip. */
+/* The bottom-row strip of key bindings. */
 static void draw_hud_hint(const Screen *s)
 {
     static const char *KEY_HINT =
@@ -2214,14 +1248,12 @@ static void draw_hud_hint(const Screen *s)
     hud_paint_text(s->rows - 1, 0, PAIR_HINT, KEY_HINT);
 }
 
+/* Compose one frame: clear, draw the scene, then the two HUD lines on top. */
 static void screen_draw(Screen *s, const Scene *sc,
                         double fps, int sim_fps)
 {
-    /* (1) Clear offscreen buffer */
     erase();
-    /* (2) Paint the simulation (density field + hawk) */
     scene_draw(sc, stdscr, s->cols, s->rows);
-    /* (3) HUD on top — data on row 0, key hints on last row */
     draw_hud_status(s, sc, fps, sim_fps);
     draw_hud_hint  (s);
 }
@@ -2231,28 +1263,16 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ── App + signal handlers ──────────────────────────────────────────── */
 
 /*
- * FpsCounter — rolling-window frame-rate estimator.
+ * FpsCounter — a smoothed frame-rate readout.
  *
- * Intent
- *   Per-frame fps would jitter wildly (a single 1 ms variance swings
- *   the instantaneous reading by ~6 fps).  This struct accumulates
- *   frame_count + elapsed nanoseconds over a fixed window
- *   (FPS_UPDATE_MS = 500 ms) and emits a smoothed `display` figure
- *   each time the window fills, so the HUD reads a stable number.
- *
- * Lifecycle
- *   fps_counter_init  — zero everything at startup.
- *   fps_counter_tick  — call once per frame with frame dt (ns); emits
- *                       a fresh `display` only when the window fills.
+ * A raw per-frame fps number jumps around too much to read, so this tallies
+ * frames and elapsed time over a half-second window and only updates the
+ * displayed figure when the window fills.
  *
  * Members
- *   frame_count  frames seen in the current window
- *   window_ns    nanoseconds accumulated in the current window
- *   display      most recent smoothed fps figure (HUD reads this)
- *
- * Why on App (not on Scene)
- *   Render-side bookkeeping, not simulation state — keeps Scene the
- *   pure-physics container.
+ *   frame_count  frames counted so far in the current window.
+ *   window_ns    nanoseconds counted so far in the current window.
+ *   display      the latest smoothed fps the HUD shows.
  */
 typedef struct {
     int     frame_count;
@@ -2267,7 +1287,7 @@ static void fps_counter_init(FpsCounter *f)
     f->display     = 0.0;
 }
 
-/* fps_counter_tick — tally one frame; emit smoothed reading when window fills. */
+/* Count one frame; refresh the displayed fps when the window fills. */
 static void fps_counter_tick(FpsCounter *f, int64_t dt)
 {
     const int64_t FPS_WINDOW_NS = (int64_t)FPS_UPDATE_MS * NS_PER_MS;
@@ -2281,32 +1301,20 @@ static void fps_counter_tick(FpsCounter *f, int64_t dt)
 }
 
 /*
- * App — top-level container for every persistent value in the program.
+ * App — everything the program keeps around, in one place.
  *
- * Layered ownership
+ * There's a single static `g_app`. Most code reaches state through an `App *`
+ * argument; the signal handlers reach it through `&g_app` because a handler
+ * can't be passed a pointer.
  *
- *     App
- *       ├── scene       : Scene       ← simulation state
- *       │      ├── pool[]       : Boid[]
- *       │      ├── n_birds      : int
- *       │      ├── hawk         : Hawk
- *       │      ├── sim          : SimControls   ← paused + theme_idx
- *       │      ├── world        : World         ← pixel-space extent
- *       │      ├── flock_centroid: Vec2
- *       │      └── hash         : SpatialHash   ← per-tick neighbour idx
- *       │
- *       ├── screen      : Screen      ← terminal cell extent
- *       ├── fps         : FpsCounter  ← rolling-window frame-rate
- *       ├── sim_fps     : int         ← target physics rate (config)
- *       ├── running     : sig_atomic_t  ← cleared by on_exit_signal
- *       └── need_resize : sig_atomic_t  ← set by on_resize_signal
- *
- * Intent
- *   One static `g_app` is the sole file-scope variable in the program;
- *   every helper reaches state through `&g_app` (signal handlers) or
- *   through an `App *app` argument (everything else).  See flocking.c
- *   App docblock for the broader rationale on volatile sig_atomic_t
- *   and the "one root, everything reachable" design.
+ * Members
+ *   scene        the simulation.
+ *   screen       the terminal size.
+ *   fps          the frame-rate readout.
+ *   sim_fps      the target physics rate.
+ *   running      cleared by a quit signal to end the loop.
+ *   need_resize  set by a resize signal; handled at the top of the loop.
+ *                (Both flags are sig_atomic_t because signal handlers set them.)
  */
 typedef struct {
     Scene                 scene;
@@ -2328,11 +1336,11 @@ static void app_do_resize(App *app)
     screen_resize(&app->screen);
     Scene *sc = &app->scene;
 
-    /* Refresh pixel-space world extent from new terminal extent. */
+    /* Recompute the world size from the new terminal size. */
     sc->world = world_from_terminal(app->screen.cols, app->screen.rows);
     World world = sc->world;
 
-    /* Clamp every bird and the hawk into the new world bounds. */
+    /* Pull any bird or the hawk that's now outside the smaller world back in. */
     for (int i = 0; i < sc->n_birds; i++) {
         Boid *b = &sc->pool[i];
         if (b->pos.x >= world.width)  b->pos.x = world.width  - 1.0f;
@@ -2345,47 +1353,24 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/*
- * app_handle_key — dispatch one keypress; return false to quit.
- *
- *   q / Q / ESC    quit
- *   space          fire one hawk DIVE at the flock centroid (overlay)
- *   n              cycle hawk BASE mode forward  (PATROL → HOVER → PURSUE)
- *   p              cycle hawk BASE mode backward (PATROL ← HOVER ← PURSUE)
- *   h / H          toggle auto-dive (every AUTO_DIVE_PERIOD seconds)
- *   . (period)     pause / resume
- *   r / R          reset (theme preserved)
- *   t              cycle to next theme; T cycles backward
- *   + / =          add BOID_STEP birds (cap N_BOIDS_MAX)
- *   -              remove BOID_STEP birds (floor N_BOIDS_MIN)
- */
-/*
- * toggle_auto_dive — flip the auto-dive flag and reset the timer.
- * Resetting on toggle prevents "phantom dives" where the timer was
- * mid-period when the user disabled auto-dive previously.
- */
+/* Flip auto-dive on or off, resetting its timer. Resetting avoids a stray dive
+ * firing right after you re-enable it from a half-elapsed timer. */
 static void toggle_auto_dive(Hawk *h)
 {
     h->auto_dive       = !h->auto_dive;
     h->auto_dive_timer = 0.0f;
 }
 
-/*
- * cycle_theme — advance theme_idx by `dir` (+1 = next, −1 = prev) wrapped
- * over [0, N_THEMES); re-register ncurses pairs so the new palette
- * takes effect immediately.
- */
+/* Switch to the next (dir +1) or previous (-1) theme, wrapping around, and
+ * load it so the change shows immediately. */
 static void cycle_theme(SimControls *sim, int dir)
 {
     sim->theme_idx = (sim->theme_idx + dir + N_THEMES) % N_THEMES;
     theme_apply(sim->theme_idx);
 }
 
-/*
- * adjust_bird_count — slide the active prefix by `delta`, clamped to
- * [N_BOIDS_MIN, N_BOIDS_MAX].  Pool is pre-spawned at scene_init so
- * positive delta reveals existing birds instantly (no re-randomise).
- */
+/* Add or remove birds, clamped to the min/max. The pool is already spawned, so
+ * adding just reveals more of the existing birds. */
 static void adjust_bird_count(Scene *sc, int delta)
 {
     int next = sc->n_birds + delta;
@@ -2394,23 +1379,20 @@ static void adjust_bird_count(Scene *sc, int delta)
     sc->n_birds = next;
 }
 
+/* Handle one keypress; return false only on quit. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *sc = &app->scene;
     switch (ch) {
     case 'q': case 'Q': case 27 /* ESC */: return false;
 
-    /* hawk DIVE overlay */
     case ' ':  hawk_dive(&sc->hawk, sc->flock_centroid);          break;
 
-    /* hawk BASE mode cycle */
     case 'n':  hawk_cycle_base_mode(&sc->hawk, +1);               break;
     case 'p':  hawk_cycle_base_mode(&sc->hawk, -1);               break;
 
-    /* auto-dive toggle */
     case 'h': case 'H':  toggle_auto_dive(&sc->hawk);             break;
 
-    /* pause / reset / theme / bird count */
     case '.':            sc->sim.paused = !sc->sim.paused;        break;
     case 'r': case 'R':  scene_init(sc, app->screen.cols, app->screen.rows); break;
     case 't':            cycle_theme(&sc->sim, +1);               break;
@@ -2423,15 +1405,9 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/*
- * main — game loop.  Identical structure to the project framework:
- *   ① resize check → ② measure dt → ③ fixed-step accumulator →
- *   ④ fps counter  → ⑤ frame cap (sleep BEFORE render) →
- *   ⑥ draw + present → ⑦ drain input.
- *
- * The frame cap uses `clock_ns() − frame_start` (no `+ dt`) — adding
- * dt back into elapsed cancels the cap and pegs CPU at 100 %.
- */
+/* Game loop: handle resizes, measure elapsed time, run fixed-size physics steps
+ * until caught up, update the fps readout, sleep to hold the frame rate, draw,
+ * then read input. */
 int main(void)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
@@ -2448,7 +1424,9 @@ int main(void)
     screen_init(&app->screen, 0 /* initial theme = Dusk */);
     scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    const int64_t DT_CAP_NS       = 100 * NS_PER_MS;       /* avalanche guard */
+    /* DT_CAP_NS bounds one frame's time so a hiccup can't trigger a flood of
+     * catch-up physics steps. */
+    const int64_t DT_CAP_NS       = 100 * NS_PER_MS;
     const int64_t FRAME_BUDGET_NS = NS_PER_SEC / TARGET_FPS;
 
     int64_t frame_time = clock_ns();
@@ -2457,20 +1435,20 @@ int main(void)
     while (app->running) {
         int64_t frame_start = clock_ns();
 
-        /* (1) handle pending resize: reload extent, reset timers */
+        /* (1) handle a pending resize: reload sizes, reset timers */
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns();
             sim_accum  = 0;
         }
 
-        /* (2) measure dt since last frame, capped to avoid physics avalanche */
+        /* (2) time since last frame, capped */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
         if (dt > DT_CAP_NS) dt = DT_CAP_NS;
 
-        /* (3) drain accumulator: fixed-step physics until caught up */
+        /* (3) run as many fixed-size physics steps as the elapsed time owes */
         const int64_t tick_ns = TICK_NS(app->sim_fps);
         const float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
         sim_accum += dt;
@@ -2479,18 +1457,18 @@ int main(void)
             sim_accum -= tick_ns;
         }
 
-        /* (4) rolling-window fps counter */
+        /* (4) update the fps readout */
         fps_counter_tick(&app->fps, dt);
 
-        /* (5) sleep BEFORE render so terminal I/O stays inside the budget */
+        /* (5) sleep before drawing so terminal output stays inside the budget */
         int64_t budget_left = FRAME_BUDGET_NS - (clock_ns() - frame_start);
         clock_sleep_ns(budget_left);
 
-        /* (6) draw + present */
+        /* (6) draw */
         screen_draw(&app->screen, &app->scene, app->fps.display, app->sim_fps);
         screen_present();
 
-        /* (7) drain input */
+        /* (7) read input */
         int key = getch();
         if (key != ERR && !app_handle_key(app, key))
             app->running = 0;

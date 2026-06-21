@@ -1,292 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * war.c — two-faction battle: melee + archers + 6 switchable strategies
+ * war.c — two armies of steering "warriors" clash in the terminal.
  *
- * DEMO: Two armies — GONDOR (right side, cyan letters + green '@'
- *       archers) and MORDOR (left side, red letters + orange '%'
- *       archers) — clash in the middle of the terminal.  Each warrior
- *       runs a four-state machine (ADVANCE / COMBAT / FLEE / DEAD).
- *       Archers fire real '-' projectile arrows that travel across
- *       the screen and deal damage on contact.  Press 1-6 to live-
- *       switch between six battle strategies (Standard, Berserker,
- *       Shield Wall, Guerrilla, Archer Focus, Chaos), each tuning
- *       all engagement / rout / shoot parameters.
- *
- * Study alongside: flocking/flocking.c (the steering forces both
- *                                       unit types use)
- *                  flocking/shepherd.c (Strömbom-style state machine)
- *
- * Section map:
- *   §1 config   — StrategyParams + g_presets[N_STRATEGIES] table +
- *                  global combat constants
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — faction palette + PAIR_HUD/PAIR_HINT
- *   §4 coords   — pixel↔cell aspect bridge + Vec2 helpers
- *   §5 entity   — Warrior + Arrow structs, warrior_spawn, integrator
- *   §6 combat   — steering forces; melee FSM (advance/combat/flee
- *                  helpers); archer FSM as 5-step pipeline
- *                  (archer_handle_no_enemies / _maybe_panic_on_low_hp
- *                  / _pick_force / _tick_rally); all take
- *                  const StrategyParams *sp — no file-scope state
- *   §7 scene    — World + SimControls + Strategy + FactionStats[2]
- *                  sub-structs; Scene root; spawn_warriors +
- *                  count_alive_faction; scene_set_strategy,
- *                  scene_init, scene_add_warriors, arrows_tick (with
- *                  arrow_out_of_bounds + arrow_apply_hit +
- *                  compact_arrows), scene_tick, scene_draw
- *   §8 app      — FpsCounter + App; signals, resize, key dispatch,
- *                  HUD helpers (hud_paint_text + draw_faction_roster_*
- *                  + draw_hud_title / _fps / _hint), main game loop
- *                  (8 numbered phases)
- *
- * Keys:
- *   q / ESC    quit                       space    pause / resume
- *   r / R      reset                      g / m    add Gondor / Mordor
- *   1-6        switch strategy (live, no reset needed)
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra flocking/war.c -o war -lncurses -lm
+ * Each warrior is a moving dot with a tiny brain that picks one of four
+ * actions: advance, fight, flee, or lie dead.  Archers shoot real '-'
+ * arrows that fly across the screen and damage on contact.  Press 1-6 to
+ * swap battle strategies live.  Steering forces follow Reynolds 1999
+ * (red3d.com/cwr/steer); the four-state brain follows Buckland's
+ * "Programming Game AI by Example".  Gondor/Mordor names are Tolkien
+ * flavour, not lore.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two cooperating systems share the screen.
- *
- *                  STEERING — every warrior is a Reynolds-style
- *                  particle.  Each tick it sums a weighted force
- *                  vector (seek toward target / centroid, separate
- *                  from same-faction allies, flee from threat),
- *                  integrates it into velocity, clamps the
- *                  magnitude, and integrates position.
- *
- *                  STATE MACHINE — each warrior is in one of four
- *                  states: ADVANCE (march toward enemy mass),
- *                  COMBAT (engaged: brawl or shoot), FLEE (route),
- *                  or DEAD (corpse, briefly visible).  Transitions
- *                  fire on engage range, HP threshold, target
- *                  death, or rally timer expiry.  Both melee and
- *                  archer use the same four states; the per-state
- *                  forces differ.
- *
- *                  ARROW PROJECTILES — archers don't deal instant
- *                  damage.  Each shot spawns an Arrow in a flat
- *                  pool: pos, vel, target_idx, faction.  The
- *                  arrows_tick step advances every active arrow,
- *                  detects hit (within ARROW_HIT_DIST of target),
- *                  marks miss (off-screen), and compacts the pool.
- *
- *                  STRATEGIES — six StrategyParams presets each
- *                  configure ~16 parameters (ranges, speeds, force
- *                  weights, attack intervals).  All combat helpers
- *                  take `const StrategyParams *sp` from
- *                  scene.strategy.params, so a key-press switches
- *                  the active preset and the next tick fights
- *                  under the new rules — no reset needed.
- *
- * Data-structure : Scene owns one flat pool[] of Warriors (both
- *                  factions interleaved by spawn order; dead
- *                  warriors keep their slot for simple corpse
- *                  rendering) and one arrow[] pool that compacts
- *                  inactive entries each tick.  Warrior carries
- *                  pos / vel / faction / unit_type / hp / state /
- *                  the per-unit timers; Arrow carries just the
- *                  projectile pose + its target.
- *
- * Rendering      : Painter's order — arrows '-' (under) → corpses
- *                  '.' dim → living warriors with HP-driven
- *                  attributes (A_BOLD full HP, A_DIM last HP,
- *                  A_BLINK while routing) → '*' arrow-hit flash
- *                  briefly overrides the warrior glyph → optional
- *                  victory banner.  Sub-tick alpha lerp on
- *                  prev_pos → pos for smooth motion.  Every glyph
- *                  stamp goes through a mark_cell() helper that
- *                  performs the (chtype)(unsigned char) cast and
- *                  bounds-check.
- *
- * Performance    : Steering and target-search are O(N²); at
- *                  N = 120 warriors per faction (POOL_MAX = 160
- *                  total cap including corpses), 120·119 = 14 280
- *                  distance checks per warrior per tick is ~0.25 M
- *                  per tick, ~15 M/s at 60 Hz — sub-millisecond.
- *                  Arrow loop is O(N_arrows), capped at
- *                  ARROW_POOL_MAX = 80.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES ───────────────────────────────────────────────────────── *
- *
- *   ── Canonical steering / flocking ──────────────────────────────
- *   [1] Reynolds, C. W. (1999), "Steering Behaviors for Autonomous
- *       Characters", Game Developers Conference 1999.  Online at
- *       https://www.red3d.com/cwr/steer/ — THE source of every
- *       steering force used here.  §6 steer_seek / _flee /
- *       _separate are 1:1 implementations of Reynolds's reference
- *       algorithms; the "Pursuit" / "Evasion" primitives are what
- *       warriors do in COMBAT / FLEE states.
- *   [2] Reynolds, C. W. (1987), "Flocks, Herds, and Schools: A
- *       Distributed Behavioral Model", SIGGRAPH '87 Computer Graphics
- *       21(4), pp. 25-34 — the original three-rule boid paper.
- *       Melee warriors use a subset (separation + arrive); archers
- *       add a flee-from-enemy term unique to ranged units.
- *
- *   ── Game-AI textbooks (steering + FSM combined) ────────────────
- *   [3] Buckland, M. (2005), "Programming Game AI by Example",
- *       Wordware — the most relevant single reference for this
- *       file.  Chapter 3 covers Reynolds steering with C++
- *       implementations; chapter 2 covers FSM-driven AI agents
- *       (Buckland calls them "West World" cowboys).  Combine the
- *       two → exactly this file's architecture.
- *   [4] Millington, I. & Funge, J. (2009), "Artificial Intelligence
- *       for Games" (2nd ed.), Morgan Kaufmann — the comprehensive
- *       game-AI textbook.  Part II ch. 3 ("Movement") is the
- *       steering-behaviour reference; Part IV ch. 11 ("Tactical
- *       and Strategic AI") covers squad/army-level behaviour
- *       beyond per-agent steering.
- *
- *   ── Finite state machines ──────────────────────────────────────
- *   [5] Rabin, S. (ed.) (2002), "AI Game Programming Wisdom",
- *       Charles River Media — the canonical FSM-in-games reference;
- *       Section 2 ("Movement and Pathfinding") and Section 3 ("AI
- *       Architectures") cover the ADVANCE / COMBAT / FLEE / DEAD
- *       pattern used by every behaviour branch in §6.
- *
- *   ── Combat attrition math ──────────────────────────────────────
- *   [6] Lanchester, F. W. (1916), "Aircraft in Warfare: The Dawn of
- *       the Fourth Arm" — Lanchester's Square Law: under modern
- *       (aimed-fire) combat, the rate of attrition is proportional
- *       to the square of force size:
- *
- *           dN_A/dt = -k · N_B,  dN_B/dt = -k · N_A
- *
- *       The n_alive[] curves this simulation produces match the
- *       Lanchester model when force imbalance is large — equal
- *       numbers produce a roughly proportional drain; doubled
- *       numbers produce a 4× advantage in attrition rate.
- *
- *   ── Game-loop / fixed-step physics ─────────────────────────────
- *   [7] Fiedler, G. (2004, updated 2014), "Fix Your Timestep!",
- *       https://gafferongames.com/post/fix_your_timestep/ — the
- *       fixed-step accumulator + sub-tick alpha-lerp pattern
- *       implemented in §8 main.  Caps dt at 100 ms to prevent
- *       the avalanche spiral on slow terminals.
- *
- *   ── Online quick reference ─────────────────────────────────────
- *   [8] Wikipedia: "Boids", "Lanchester's laws", "Finite-state
- *       machine", "Steering behaviors".  Useful one-paragraph
- *       summaries that link out to the primary literature.
- *
- *   ── Flavour ────────────────────────────────────────────────────
- *   [9] Tolkien, J. R. R., *The Lord of the Rings* — flavour for
- *       the Gondor / Mordor faction names.  Gameplay is fictional
- *       Reynolds-AI [1] + Lanchester attrition [6], not lore-
- *       accurate.
- *
- *   ── Companion files in this project ────────────────────────────
- *   See also:
- *     flocking/flocking.c    — Reynolds-style boids; the same
- *       steering primitives at a smaller scale, no FSM.
- *     flocking/crowd.c       — single-agent steering primer
- *       (seek/flee/wander) on a Person model.
- *     flocking/swarm_gen_numbers.c — 10 strategy presets dispatched
- *       by index; same StrategyParams + dispatch table pattern.
- *     flocking/shepherd.c    — Strömbom shepherd-and-sheep model;
- *       herd dynamics are the inverse of war's combat dynamics.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Every warrior is a particle with a brain that picks one of four
- * verbs each tick: ADVANCE (head toward enemy mass), COMBAT (fight
- * the locked target or shoot at the nearest), FLEE (sprint away),
- * DEAD (be a corpse).  The "brain" is just a switch on the warrior's
- * current state plus a few distance/HP checks; the "body" sums
- * steering forces, clamps to max_speed, and integrates.  Arrows are
- * separate particles that fly between archer and victim — damage
- * lands on hit, not on shoot.  Strategies just rebind the constants.
- *
- *
- * ALGORITHM IN STEPS  (per tick, per warrior)
- * ───────────────────────────────────────────
- *   1. DEAD?            decrement corpse timer, return.
- *   2. hp ≤ 0?          enter DEAD; credit kill to enemy faction.
- *   3. Stale target?    drop target_idx if locked enemy is now dead.
- *   4. Dispatch by unit_type:
- *        UNIT_MELEE  → melee_logic
- *        UNIT_ARCHER → archer_logic
- *
- *   melee_logic — switch on state → per-state Steer helper:
- *     ADVANCE → melee_advance (seek enemy centroid; if any enemy
- *               enters engage_range, lock on → COMBAT).
- *     COMBAT  → melee_combat (seek locked target slowly; deal
- *               ATK_DAMAGE every atk_interval s.  Target dies →
- *               ADVANCE.  hp ≤ flee_hp → FLEE).
- *     FLEE    → melee_flee (flee from nearest enemy; if d ≥
- *               safe_range, count rally_timer; rally_time → ADVANCE).
- *
- *   archer_logic — 5-step pipeline:
- *     (1) archer_handle_no_enemies — if none, glide to halt + return.
- *     (2) archer_maybe_panic_on_low_hp — transition to FLEE on
- *         hp ≤ archer_flee_hp.
- *     (3) archer_pick_force — distance ladder:
- *           d < archer_flee_range  → archer_flee_force (panic-close
- *                                     transition into FLEE)
- *           state == FLEE          → archer_flee_force (carry-over)
- *           d ≤ arrow_range        → archer_combat (shoot arrow
- *                                     every shoot_interval s + drift
- *                                     to standoff)
- *           otherwise              → archer_advance (head toward
- *                                     standoff behind enemy centroid)
- *     (4) integrate + bounce.
- *     (5) archer_tick_rally — accumulate timer at safe_range; rally
- *         to ADVANCE after rally_time.
- *
- *   After every warrior, run arrows_tick: integrate each arrow by
- *   vel·dt, hit-test against its target (within ARROW_HIT_DIST →
- *   arrow_apply_hit deals ATK_DAMAGE + HIT_FLASH_TIME), miss if
- *   off-screen, then compact_arrows shifts the active slots to the
- *   front of the pool (O(N) stable, no free-list).
- *
- * KEY FORMULAS
- * ────────────
- *   Seek:        desired = normalize(target − pos) · speed
- *                force   = desired − vel
- *
- *   Flee:        force   = − seek(threat)
- *
- *   Separate (per same-faction ally with 0 < d < sep_radius):
- *                strength = (sep_radius − d) / sep_radius
- *                force   += normalize(self − ally) · strength · speed_advance
- *
- *   Arrow flight:
- *                arrow.pos += arrow.vel · dt
- *                hit if |target.pos − arrow.pos| < ARROW_HIT_DIST
- *                miss if arrow exits world bounds
- *                arrow.vel = normalize(target.pos@spawn − archer.pos)
- *                          · ARROW_TRAVEL_SPD       (set once at shoot)
- *
- *   Pixel→cell aspect bridge:
- *                cx = round(px / CELL_W)        (CELL_W = 8)
- *                cy = round(py / CELL_H)        (CELL_H = 16)
- *
- * Background you need
- * ───────────────────
- *   - flocking.c T1-T7 (boid + steering forces).
- *   - shepherd.c T1-T3 (heterogeneous agents + state machines).
- *   - Object pool with ACTIVE flag — the arrow pool compacts
- *     in place rather than allocating.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Real RTS combat math (range/armour/morale models).
- *     Simplified to HP + flat damage.
- *   - Pathfinding / navmesh. Warriors steer reactively; no
- *     A*; no obstacles.
- *   - Networked multiplayer. Single-process simulation.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <float.h>
@@ -299,46 +22,39 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                            */
-/* ===================================================================== */
+/* ── §1 config — strategy presets + fixed combat constants ── */
 
 /*
- * StrategyParams — all tuneable combat constants for one steering
- * preset (one strategy = one row of the g_presets[] table).
+ * StrategyParams — one full set of combat tuning knobs.  Each of the six
+ * strategies is one row of g_presets[] below, and the active row drives
+ * every warrior.  Combat code reads these through a `const StrategyParams
+ * *sp` pointer, so swapping the active row takes effect on the next tick.
  *
- * Intent
- *   Every combat helper in §6 takes `const StrategyParams *sp` and
- *   reads sp->* for its coefficients.  The Scene's `strategy`
- *   sub-struct (in §7) caches the pointer to the active preset so a
- *   key-press takes effect on the very next tick without re-indexing
- *   the table.  No file-scope strategy state.
+ * Melee knobs:
+ *   engage_range   how close an enemy must be before a melee fighter
+ *                  commits to fighting it (pixels)
+ *   flee_hp        run away once health drops to this; 0 = never run
+ *   atk_interval   seconds between melee hits
+ *   speed_advance  marching speed toward the enemy (px/s)
+ *   speed_flee     running-away speed; should beat speed_advance
+ *   sep_radius     personal-space bubble between allies (px); smaller
+ *                  packs them tighter
+ *   safe_range     how far a fleer must get before it can regroup (px)
+ *   rally_time     seconds spent safe before rejoining the advance
+ *   melee_speed    slow shuffle while brawling, to stay on the target
  *
- * Melee fields
- * ────────────
- *   engage_range   distance at which a melee warrior locks on → COMBAT
- *   flee_hp        HP threshold that triggers melee rout (0 = never)
- *   atk_interval   seconds between melee damage ticks
- *   speed_advance  march speed toward enemy mass (px/s)
- *   speed_flee     routing sprint speed; must exceed speed_advance
- *   sep_radius     ally personal-space radius (px); lower = denser
- *   safe_range     distance a routing warrior must reach before rallying
- *   rally_time     seconds spent safe before returning to ADVANCE
- *   melee_speed    slow footwork while brawling; keeps fighters near target
+ * Archer knobs:
+ *   archer_flee_hp    health at which archers panic; 0 = never from HP
+ *   arrow_range       firing range; archers close in until within it (px)
+ *   archer_flee_range run if any enemy gets this close (px)
+ *   stand_off_dist    preferred gap to keep from the enemy while firing
+ *   shoot_interval    seconds between shots
+ *   archer_speed      archer move speed (slower than melee)
  *
- * Archer fields
- * ─────────────
- *   archer_flee_hp    HP at which archers panic (0 = never flee from HP)
- *   arrow_range       max shooting range; archers advance until inside
- *   archer_flee_range panic-flee if any enemy closes this far
- *   stand_off_dist    preferred gap from nearest enemy while shooting
- *   shoot_interval    seconds between arrow shots
- *   archer_speed      archer movement speed (slower than melee)
- *
- * Steering weights  (higher = stronger influence)
- *   w_seek   drive toward chosen target
- *   w_sep    push away from allies (low = dense pack, high = spread)
- *   w_flee   urgency of routing sprint
+ * Steering weights (bigger = stronger pull):
+ *   w_seek  toward the chosen target
+ *   w_sep   away from crowding allies (low = dense, high = spread out)
+ *   w_flee  urgency of the run-away
  */
 typedef struct {
   const char *name;
@@ -363,27 +79,15 @@ typedef struct {
 } StrategyParams;
 
 /*
- * Six presets — dramatically different combat rhythms:
- *
- *  STANDARD      Deliberate advance, engage near contact, flee at 1 HP.
- *                Archers hold mid-range.  Good baseline.
- *
- *  BERSERKER     Wide engage, fast attacks, nobody routs.  Dense packing
- *                (low sep) → chaotic melee pile in the centre.
- *
- *  SHIELD WALL   Slow tight march (high sep keeps ranks orderly).
- *                Archers shoot from very long range.  Hard to break.
- *
- *  GUERRILLA     Skirmish: hit fast, flee at 2 HP, rally in 1.2 s,
- *                re-engage.  Archers very jumpy and highly mobile.
- *
- *  ARCHER FOCUS  Ranged dominance: 220 px range, ~1 s fire rate,
- *                archers stay deep in their half (160 px standoff).
- *
- *  CHAOS         Everyone sprints, personal space collapses, no rout.
- *                Produces one big scrum at the centre.
+ * The six presets, each with its own feel:
+ *   STANDARD      balanced baseline; cautious advance, archers mid-range
+ *   BERSERKER     wide engage, fast hits, nobody flees, packs tight
+ *   SHIELD WALL   slow orderly ranks, very long-range archers, hard to break
+ *   GUERRILLA     skirmishers: hit, run, regroup, re-engage; jumpy archers
+ *   ARCHER FOCUS  ranged dominance; archers hang far back in their half
+ *   CHAOS         everyone sprints, no personal space, no fleeing — one scrum
  */
-#define N_STRATEGIES 6   /* number of presets in g_presets[] below */
+#define N_STRATEGIES 6
 static const StrategyParams g_presets[N_STRATEGIES] = {
     /*            engage flee atk   adv    flee  sep   safe  rally melee */
     /*            afleehp  arange  aflee standoff shoot aspd  seek  sep   flee
@@ -408,12 +112,7 @@ static const StrategyParams g_presets[N_STRATEGIES] = {
      120.0f, 15.0f, 60.0f, 2.5f, 80.0f, 2.0f, 0.3f, 0.3f},
 };
 
-/* g_presets[] is the const table of all strategy presets, indexed by
- * Strategy.index in §9 Scene.  Strategy.params on Scene caches the
- * pointer to the active preset (= &g_presets[index]) so the combat
- * helpers in §6 avoid the array index on every read. */
-
-/* ── army sizes + colour pair IDs — fixed across all strategies ── */
+/* Army sizes and colour-pair IDs — the same no matter which strategy is on. */
 enum {
   MELEE_DEFAULT = 35,
   ARCHER_DEFAULT = 12,
@@ -425,25 +124,16 @@ enum {
   TARGET_FPS = 60,
   FPS_UPDATE_MS = 500,
 
-  /*
-   * Colour-pair IDs.  Pairs 1-7 paint the world (one per faction
-   * unit type, plus shared corpse/banner yellow).  PAIR_HUD and
-   * PAIR_HINT are theme-independent per the project HUD spec —
-   * the HUD stays readable against any animation behind it.
-   *
-   * The HUD uses three pairs total:
-   *   - faction sides (left/right counts) keep their faction colour
-   *     (5 cyan for Gondor, 1 red for Mordor) so the eye reads
-   *     "this number belongs to that side" instantly;
-   *   - the centre strategy title uses PAIR_HUD bright yellow;
-   *   - the bottom key-hint bar uses PAIR_HINT bright cyan.
-   */
+  /* Colour-pair IDs.  Pairs 1-7 paint the battle (faction units + shared
+   * corpse/banner yellow).  PAIR_HUD/PAIR_HINT stay bright so the overlay
+   * reads against any battle behind it. */
   N_COLORS = 7,
   PAIR_HUD = 8,  /* bright yellow — top-centre status */
   PAIR_HINT = 9, /* bright cyan   — bottom key hint   */
 };
 
-/* Cell dimensions — physics in px, draw in cells; convert only at render */
+/* Physics runs in pixels; the screen is cells.  One cell is this many
+ * pixels wide/tall — terminal cells are taller than wide, so x and y differ. */
 #define CELL_W 8
 #define CELL_H 16
 
@@ -466,9 +156,7 @@ enum {
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                            */
-/* ===================================================================== */
+/* ── §2 clock — monotonic timer + sleep ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -486,31 +174,17 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                            */
-/* ===================================================================== */
+/* ── §3 color — faction palette + HUD pairs ── */
 
 /*
- * War palette — semantic, not theme-driven.  Each colour is tied to
- * a specific game role: faction sides + arrow visibility + corpse
- * fade + HUD bars.  Background = -1 (terminal default) so the demo
- * respects the user's theme.
- *
- *   Pair  256-col  Role
- *   ───────────────────────────────────────────────────────────
- *     1     196    Mordor melee — pure red
- *     2     208    Mordor archers + arrows — orange
- *     3     226    corpses + victory banner — yellow
- *     4      46    Gondor archers + arrows — matrix green
- *     5      51    Gondor melee — bright cyan
- *     6      33    spare (dodger blue, currently unused)
- *     7     201    spare (magenta, currently unused)
- *     8 PAIR_HUD   bright yellow 226 — top-centre status, A_BOLD
- *     9 PAIR_HINT  bright cyan   51  — bottom key hint, A_BOLD
- *
- * Every foreground sits in the bright half of the 256-colour cube
- * (≥ 33) per the project palette-brightness rule, so even routing
- * (A_BLINK) and last-HP (A_DIM) warriors stay legible.
+ * Each colour pair stands for one game role, not a theme tier:
+ *   1 Mordor melee (red)   2 Mordor archers/arrows (orange)
+ *   3 corpses + banner (yellow)   4 Gondor archers/arrows (green)
+ *   5 Gondor melee (cyan)   6,7 spare
+ *   8 PAIR_HUD   9 PAIR_HINT
+ * Background is -1 (the terminal default) so we sit on the user's theme.
+ * Every colour is in the bright half of the palette so even dim (last-HP)
+ * and blinking (fleeing) warriors stay visible.
  */
 static void color_init(void) {
   start_color();
@@ -538,14 +212,13 @@ static void color_init(void) {
   }
 }
 
-/* ===================================================================== */
-/* §4  coords & vec2                                                    */
-/* ===================================================================== */
+/* ── §4 coords & vec2 — pixel↔cell bridge + 2-D vector helpers ── */
 
 static inline float pw(int cols) { return (float)(cols * CELL_W); }
 static inline float ph(int rows) { return (float)(rows * CELL_H); }
 
-/* Round-half-up avoids oscillation at exact half-pixel boundaries. */
+/* Rounding half-up here keeps a dot from flickering between two cells when
+ * it sits exactly on the boundary. */
 static inline int px_to_cell_x(float px) {
   return (int)floorf(px / (float)CELL_W + 0.5f);
 }
@@ -554,37 +227,12 @@ static inline int px_to_cell_y(float py) {
 }
 
 /*
- * Vec2 — 2-D float vector used everywhere physics or geometry shows
- * up: position, velocity, force, offset, centroid.
+ * Vec2 — a 2-D point or direction.  Used for everything spatial: position,
+ * velocity, force, offsets.  The helpers below return new Vec2s (no output
+ * pointers) so steering math reads like the formula it implements.
  *
- * Intent
- *   Functions return Vec2 BY VALUE (no out-params); the v2* helpers
- *   below compose into terse chains that mirror the math notation
- *   they implement:
- *
- *       Vec2 force = v2add(v2scale(seek_f, sp->w_seek),
- *                          v2scale(sep_f,  sp->w_sep));
- *
- *   reads as `force = w_seek·seek + w_sep·sep` to a math-fluent reader.
- *
- * Why a struct (not float[2] or two scalars)
- *   • Named type makes every signature read in the algorithm's
- *     vocabulary: `steer_seek(pos, vel, target, speed)` rather than
- *     `steer_seek(px, py, vx, vy, tx, ty, speed)`.
- *   • Return by value works without spilling to memory on x86-64 +
- *     ARM ABIs (8 bytes = one register pair); no perf penalty.
- *   • Eliminates two-out-parameter idioms in every steering helper.
- *
- * Members
- *   x, y    Cartesian components in PIXEL space (units = px).  Cell-
- *           space conversion happens only inside scene_draw via
- *           px_to_cell_x/y.  Physics never sees cells.
- *
- * References
- *   [1] Reynolds 1999 — every steering primitive returns a Vec2
- *       force; this file's §6 mirrors that API shape.
- *   [3] Buckland *Programming Game AI by Example* Ch. 1 — the
- *       Vector2D class this struct is the C analogue of.
+ *   x, y   the two components, always in PIXEL space.  Only scene_draw
+ *          converts to screen cells; the physics never sees cells.
  */
 typedef struct {
   float x, y;
@@ -607,7 +255,8 @@ static inline Vec2 v2clamp_len(Vec2 v, float max_len) {
   return (l > max_len) ? v2scale(v2norm(v), max_len) : v;
 }
 
-/* Elastic wall bounce: velocity component flips on contact. */
+/* Keep a warrior inside the world: on hitting an edge, pin it and flip the
+ * velocity so it bounces back in. */
 static void bounce_pos(Vec2 *pos, Vec2 *vel, float ww, float wh) {
   if (pos->x < 0) {
     pos->x = 0;
@@ -627,241 +276,111 @@ static void bounce_pos(Vec2 *pos, Vec2 *vel, float ww, float wh) {
   }
 }
 
-/* ===================================================================== */
-/* §5  entity                                                           */
-/* ===================================================================== */
+/* ── §5 entity — Warrior + Arrow data and movement ── */
 
 /*
- * UnitType — pick which behaviour state machine drives this warrior.
- *
- * Intent
- *   Every Warrior runs ONE of two distinct combat loops:
- *
- *     UNIT_MELEE  : ADVANCE toward nearest enemy → COMBAT (brawl)
- *                   → FLEE on low HP → DEAD.  No ranged action.
- *
- *     UNIT_ARCHER : ADVANCE toward standoff range → COMBAT (shoot
- *                   arrows at intervals) → FLEE if enemy too close
- *                   or HP low → DEAD.  Never engages in melee.
- *
- *   warrior_tick dispatches to melee_logic or archer_logic based on
- *   this enum.  The two units share Steer + WarriorState but have
- *   different attack distance, attack interval, and flee triggers.
- *
- * Why a flat enum (not a behaviour vtable or class hierarchy)
- *   Only two unit types and they're branching cleanly on a single
- *   bit — a vtable is overkill.  Adding a third unit type (cavalry,
- *   mage, …) would warrant rethinking; at two, the if-else is
- *   clearer than an indirection.
+ * UnitType — which kind of fighter, which decides its behaviour:
+ *   UNIT_MELEE   charges in and brawls; no ranged attack
+ *   UNIT_ARCHER  hangs back and shoots arrows; runs if enemies close in
+ * warrior_tick branches to melee_logic or archer_logic on this.
  */
 typedef enum { UNIT_MELEE = 0, UNIT_ARCHER } UnitType;
 
 /*
- * WarriorState — Buckland [3] / Rabin [5] style finite-state machine
- * driving each Warrior's behaviour.
+ * WarriorState — the one thing a warrior is doing right now.  The four
+ * states form a little brain: a warrior advances, picks a fight, may break
+ * and flee, and eventually dies.  An enemy in engage_range moves ADVANCE to
+ * COMBAT; low health moves COMBAT to FLEE; reaching safety long enough
+ * rallies FLEE back to ADVANCE; zero health goes to DEAD.
  *
- * State diagram
+ *   STATE_ADVANCE  marching toward the enemy mass
+ *   STATE_COMBAT   fighting: brawling (melee) or shooting (archer)
+ *   STATE_FLEE     running away; the renderer makes it blink
+ *   STATE_DEAD     a corpse, shown briefly then ignored.  The slot is
+ *                  never reused — simpler than tracking free slots, and
+ *                  the pool is sized for the worst case.
  *
- *                  enemy in engage_range
- *      ┌─────────┐ ─────────────────────► ┌────────┐
- *      │ ADVANCE │                        │ COMBAT │
- *      └─────────┘ ◄───── rally ───────── └────────┘
- *           │                                   │
- *           │       hp ≤ flee_hp                │
- *           └────────────────┐  ┌───────────────┘
- *                            ▼  ▼
- *                          ┌──────┐    hp ≤ 0    ┌──────┐
- *                          │ FLEE │ ───────────► │ DEAD │
- *                          └──────┘              └──────┘
- *                                                (corpse: CORPSE_LIFETIME)
- *
- * Members
- *   STATE_ADVANCE  Marching or repositioning.  Force = seek(centroid
- *                  of nearest 3 enemies) + separation.  HUD glyph
- *                  rendered at full HP-driven intensity.
- *
- *   STATE_COMBAT   Locked on `target_idx`.  Melee: brawl in place,
- *                  apply ATK_DAMAGE every atk_interval.  Archer: stay
- *                  in arrow_range, shoot every shoot_interval.
- *
- *   STATE_FLEE     Routing.  Force = flee(centroid of nearest enemies)
- *                  at speed_flee (must exceed speed_advance to be
- *                  useful).  Renderer adds A_BLINK; HP-low warriors
- *                  flash red.  Rallies back to ADVANCE after
- *                  rally_time at distance ≥ safe_range.
- *
- *   STATE_DEAD     HP == 0.  Body stays on screen for CORPSE_LIFETIME
- *                  seconds as a '%' glyph, then is excluded from the
- *                  per-tick pool scan.  Slot is NEVER freed — n_total
- *                  is monotonic, simpler than holey-pool bookkeeping
- *                  and the pool is sized for worst-case spawns.
- *
- * Invariants
- *   STATE_ADVANCE = 0 deliberately, so memset-zeroed warriors start
- *   in ADVANCE without an explicit initialiser (used by scene_init).
- *
- * References
- *   [3] Buckland *Programming Game AI by Example* Ch. 2 — the
- *       canonical "West World" cowboy FSM that this design follows.
- *   [5] Rabin (ed.) *AI Game Programming Wisdom* §3 — survey of
- *       agent FSM architectures and state-transition idioms.
+ * ADVANCE is 0 on purpose: a freshly zeroed warrior starts out advancing.
  */
 typedef enum {
-  STATE_ADVANCE = 0, /* marching / repositioning */
-  STATE_COMBAT,      /* engaged: brawling (melee) or shooting (archer) */
-  STATE_FLEE,        /* routing */
-  STATE_DEAD,        /* HP == 0; showing corpse */
+  STATE_ADVANCE = 0,
+  STATE_COMBAT,
+  STATE_FLEE,
+  STATE_DEAD,
 } WarriorState;
 
 /*
- * Warrior — one soldier in the battle.  The atomic unit of war.c.
+ * Warrior — one soldier.  All warriors live in one shared pool[] array.
+ * Fields are grouped by who writes them: identity is set once at spawn;
+ * the position/velocity block is rewritten every tick; the health/state
+ * block is driven by combat code; the timers count down.
  *
- * Intent
- *   N_AGENTS warriors share the pool[] array, interleaved by spawn
- *   order (Gondor melee, Gondor archers, Mordor melee, Mordor archers,
- *   reinforcements …).  Each tick warrior_tick runs the appropriate
- *   logic (melee or archer) which drives the FSM in `state`, sums a
- *   weighted Reynolds force (steer_seek + steer_flee + steer_separate
- *   from §6), and integrates via warrior_step.  The renderer reads
- *   prev_pos + pos and alpha-lerps for smooth motion.
+ * prev_pos is last tick's position.  Physics steps at a fixed rate but the
+ * screen may redraw faster, so the renderer blends prev_pos toward pos to
+ * keep motion smooth instead of jumpy (Fiedler, "Fix Your Timestep!").
  *
- * Why prev_pos (a snapshot, not just current pos)
- *   Physics ticks at sim_fps (60 Hz default); the renderer can draw at
- *   any rate.  scene_draw lerps prev_pos → pos by sub-tick alpha
- *   (Fiedler [7]).  Without prev_pos, fast warriors would jitter
- *   visibly between tick boundaries.
+ * Members:
+ *   pos         current position, pixels; bounced off world edges
+ *   prev_pos    position at the start of this tick, for smooth drawing
+ *   vel         velocity, pixels per second; capped per state
+ *   faction     GONDOR (0) or MORDOR (1); never changes
+ *   unit_type   melee or archer; picks which brain runs
+ *   glyph       the ASCII character drawn for this warrior
+ *   color_pair  ncurses colour for this warrior's side
+ *   hp          health, 0..HP_MAX; reaching 0 means dead
+ *   state       what it's doing now (see WarriorState)
+ *   target_idx  pool index of the enemy it's locked onto, or -1 for none
+ *   atk_timer   seconds until the next hit or shot
+ *   rally_timer seconds spent safe; crossing rally_time ends a flee
+ *   dead_timer  seconds the corpse stays on screen
+ *   hit_timer   seconds left of the '*' flash after being struck
  *
- * Why fields are GROUPED by lifecycle (not by type)
- *   • IDENTITY (faction, unit_type, glyph, color_pair) is set ONCE at
- *     warrior_spawn and is read-only thereafter.
- *   • KINEMATIC STATE (pos/prev_pos/vel) is rewritten EVERY tick by
- *     warrior_step.
- *   • FSM STATE (hp, state, target_idx) is written by combat code in
- *     §6, read by the HUD and renderer.
- *   • TIMERS are countdown clocks, ticked down by warrior_tick.
- *   Grouping by lifecycle makes "who writes this field" answerable at
- *   a glance — the most common debugging question.
- *
- * Why slot never frees on death
- *   STATE_DEAD warriors stay in the pool for CORPSE_LIFETIME (visible
- *   '%' glyph for narrative effect) and stay forever in `n_total`
- *   (never decremented).  Holey-pool bookkeeping would add a free-list
- *   and a compaction pass for no real win; POOL_MAX is sized for
- *   worst-case spawn counts so we just live with the dead slots.
- *
- * Members
- *   ── kinematic state (rewritten every tick) ──────────────────────
- *   pos          Current position in PIXEL space (units = px).
- *                Toroidally bounced at world edges via bounce_pos.
- *   prev_pos     Position at start of this tick — snapshotted before
- *                pos is integrated, for the renderer's alpha lerp.
- *   vel          Velocity in PIXELS PER SECOND.  Capped by the
- *                Steer.max_spd from the active state helper.
- *
- *   ── identity (set once at warrior_spawn) ────────────────────────
- *   faction      GONDOR (0) or MORDOR (1) — never changes.
- *   unit_type    UNIT_MELEE or UNIT_ARCHER — picks the state machine.
- *   glyph        ASCII character for rendering this warrior.
- *                Gondor melee: A..Z; Gondor archers: lowercase letters
- *                cycled.  Mordor: matching but tinted with PAIR_MORDOR.
- *   color_pair   ncurses pair (1..) for this warrior's faction tint.
- *
- *   ── FSM state (written by combat helpers in §6) ─────────────────
- *   hp           Current health in [0, HP_MAX].  hp ≤ 0 → STATE_DEAD.
- *   state        Current WarriorState (see enum doc above).
- *   target_idx   Pool index of the locked enemy in COMBAT, or −1
- *                when no target (ADVANCE/FLEE, or archer between shots).
- *
- *   ── timers (countdown seconds, ticked by warrior_tick) ──────────
- *   atk_timer    Seconds until next melee hit / arrow shot.
- *   rally_timer  Seconds at safe distance ≥ safe_range; once it
- *                crosses rally_time the warrior rallies back to
- *                ADVANCE.
- *   dead_timer   Seconds of corpse remaining (counts down from
- *                CORPSE_LIFETIME on death).
- *   hit_timer    Seconds of '*' flash overlay remaining after an
- *                arrow strike (visual feedback only).
- *
- * Invariants
- *   0 ≤ hp ≤ HP_MAX.
- *   state == STATE_DEAD  iff  hp == 0.
- *   target_idx ∈ [0, n_total)  OR  target_idx == −1.
- *   0 ≤ faction ≤ 1.
- *
- * References
- *   [1] Reynolds 1999 — every steering force a warrior applies is a
- *       Reynolds primitive (seek, flee, separate).
- *   [3] Buckland *Programming Game AI by Example* — the entity's
- *       (kinematic state + identity + FSM state + timers) layout
- *       follows Buckland's autonomous-agent design pattern (Ch. 1-3).
- *   [7] Fiedler 2014 — the prev_pos / alpha-lerp pattern.
+ * Always true: 0 <= hp <= HP_MAX; state is DEAD exactly when hp is 0;
+ * target_idx is a valid pool index or -1.
  */
 typedef struct {
-  /* kinematic state — alpha-lerped on draw */
+  /* rewritten every tick */
   Vec2 pos;
   Vec2 prev_pos;
   Vec2 vel;
 
-  /* identity — set once at spawn */
-  int faction;        /* GONDOR or MORDOR             */
-  UnitType unit_type; /* UNIT_MELEE or UNIT_ARCHER    */
-  char glyph;         /* ASCII glyph drawn for unit   */
-  int color_pair;     /* ncurses pair for this unit   */
+  /* set once at spawn */
+  int faction;
+  UnitType unit_type;
+  char glyph;
+  int color_pair;
 
-  /* HP + state machine */
-  int hp;             /* 0..HP_MAX                    */
-  WarriorState state; /* ADVANCE/COMBAT/FLEE/DEAD     */
-  int target_idx;     /* pool index of locked enemy
-                       * (-1 = none; archers ignore)  */
+  /* health + behaviour */
+  int hp;
+  WarriorState state;
+  int target_idx;     /* -1 when locked onto no one */
 
-  /* timers (seconds) */
-  float atk_timer;   /* until next melee hit / shot  */
-  float rally_timer; /* time at safe distance         */
-  float dead_timer;  /* corpse remaining lifetime     */
-  float hit_timer;   /* arrow-strike '*' flash        */
+  /* countdown clocks, in seconds */
+  float atk_timer;
+  float rally_timer;
+  float dead_timer;
+  float hit_timer;
 } Warrior;
 
 /*
- * Arrow — one '-' projectile fired by an archer.
+ * Arrow — one '-' projectile in flight.  An archer fires it once; it then
+ * flies in a straight line at a fixed speed and damages its target if it
+ * gets close enough.  Arrows live in their own pool, separate from
+ * warriors, because an arrow can outlive the archer who shot it, and most
+ * warriors have no arrow in flight at any moment.
  *
- * Intent
- *   Archers in STATE_COMBAT shoot one Arrow per shoot_interval at
- *   their locked target.  The Arrow flies straight (constant velocity,
- *   no gravity — this is ASCII, not realistic ballistics) and tests
- *   proximity to its target_idx each tick.  On hit, the target takes
- *   ATK_DAMAGE and a '*' flash overlays the strike point.
+ * The target is fixed at fire time and never re-aimed: if the target moves
+ * or dies, the arrow keeps going to where it was headed and misses.  No
+ * homing.
  *
- * Why a separate pool (not embedded in Warrior)
- *   • Arrows OUTLIVE the warrior that fired them — an archer can die
- *     mid-shot and the arrow still arrives.  Decoupling arrow life
- *     from warrior life keeps both lifecycles simple.
- *   • Arrows are SPARSE — most warriors don't have one in flight at
- *     any given moment.  A dense arrows[] array compacted each tick
- *     (active flag → memmove on the C side) avoids paying for empty
- *     arrow slots in every warrior struct.
- *
- * Why pin the target_idx (rather than re-acquire each tick)
- *   The shot is committed to its original target at fire time.  If
- *   the target dies mid-flight, the arrow continues to its dead
- *   warrior's last position and harmlessly expires off-screen.
- *   This matches the physical metaphor and avoids the "homing arrow"
- *   behaviour that re-targeting would produce.
- *
- * Members
- *   pos          Current position in PIXEL space.
- *   vel          Velocity in PIXELS PER SECOND; magnitude is exactly
- *                ARROW_TRAVEL_SPD at the moment of firing, direction
- *                = unit(target_pos − fire_pos).  Constant thereafter.
- *   target_idx   Pool index of the warrior this arrow is aimed at.
- *                Proximity-checked each tick for hit detection.
- *   faction      Faction of the FIRING archer (so an arrow doesn't
- *                damage its own side on a stray miss).
- *   active       true while in flight; cleared on hit / out-of-bounds.
- *                arrows_tick compacts the inactive slots away.
- *
- * Invariants
- *   active → target_idx ∈ [0, n_total).
- *   |vel| ≈ ARROW_TRAVEL_SPD while active.
+ * Members:
+ *   pos         current position, pixels
+ *   vel         velocity, pixels per second; speed and direction set at
+ *               firing and constant after
+ *   target_idx  pool index of the warrior aimed at
+ *   faction     the firing archer's side (so it won't hit its own team)
+ *   active      true while flying; cleared on a hit or when off-screen,
+ *               then the slot is swept away by arrows_tick
  */
 typedef struct {
   Vec2 pos;
@@ -877,10 +396,9 @@ static const char MORDOR_MELEE_GLYPHS[] = "abcdefghijklmnopqrstuvwxyz";
 static float randf(void) { return (float)rand() / (float)RAND_MAX; }
 
 /*
- * warrior_spawn — initialise one pool slot.
- *
- * Spawn zones: melee outer 30%, archers deeper 15% of their half.
- * atk_timer is randomised to stagger first attacks — organic rhythm.
+ * warrior_spawn — fill in one fresh warrior.  Each side starts on its own
+ * half: melee toward the front, archers further back.  The first attack
+ * timer is randomised so they don't all swing on the same frame.
  */
 static void warrior_spawn(Warrior *w, int id, int faction, UnitType unit_type,
                           const StrategyParams *sp, float ww, float wh) {
@@ -921,11 +439,10 @@ static void warrior_spawn(Warrior *w, int id, int faction, UnitType unit_type,
 }
 
 /*
- * warrior_step — shared Euler integration for every live state.
- *
- *   vel     += accel × dt  then clamped to max_speed
- *   prev_pos = pos          (renderer lerps between prev and pos)
- *   pos     += vel × dt
+ * warrior_step — move one warrior for this tick.  Apply the steering force
+ * to its velocity (capped at max_speed), remember where it was, then slide
+ * it to the new position.  Remembering prev_pos lets the renderer draw
+ * smooth motion between ticks.
  */
 static void warrior_step(Warrior *w, Vec2 accel, float max_speed, float dt) {
   w->vel = v2clamp_len(v2add(w->vel, v2scale(accel, dt)), max_speed);
@@ -933,35 +450,29 @@ static void warrior_step(Warrior *w, Vec2 accel, float max_speed, float dt) {
   w->pos = v2add(w->pos, v2scale(w->vel, dt));
 }
 
-/* ===================================================================== */
-/* §6  combat — steering forces, melee logic, archer logic              */
-/* ===================================================================== */
+/* ── §6 combat — steering forces, melee logic, archer logic ── */
 
 /*
- * steer_seek — force steering toward (target) at (speed).
- *
- *   desired = normalise(target − pos) × speed
- *   force   = desired − vel
- *
- * Subtracting current velocity gives smooth deceleration: when moving at
- * full speed toward the target, force → 0 naturally.
+ * steer_seek — a steering force that pulls a warrior toward a point at a
+ * given speed.  It aims for the velocity it *wants* and returns the
+ * difference from its current velocity, so the harder it is already moving
+ * the right way, the gentler the nudge.  Reynolds 1999.
  */
 static Vec2 steer_seek(Vec2 pos, Vec2 vel, Vec2 target, float speed) {
   Vec2 desired = v2scale(v2norm(v2sub(target, pos)), speed);
   return v2sub(desired, vel);
 }
 
-/* steer_flee — steer AWAY from threat; negated seek. */
+/* steer_flee — the opposite of seek: a force that pushes away from a threat. */
 static Vec2 steer_flee(Vec2 pos, Vec2 vel, Vec2 threat, float speed) {
   return v2scale(steer_seek(pos, vel, threat, speed), -1.0f);
 }
 
 /*
- * steer_separate — repulsion from same-faction allies within sep_radius.
- *
- * Repulsion strength = (sep_radius − dist) / sep_radius ∈ (0,1].
- * Scaled by speed_advance so force is in velocity-compatible units.
- * Only same-faction warriors push each other (fight through enemies).
+ * steer_separate — a push away from nearby allies so they don't pile onto
+ * the same cell.  The closer an ally is (within sep_radius), the stronger
+ * the push.  Only same-side warriors repel each other; enemies don't, so
+ * fighters can press into the enemy line.
  */
 static Vec2 steer_separate(const Warrior *pool, int n_total, int self,
                             const StrategyParams *sp) {
@@ -986,9 +497,10 @@ static Vec2 steer_separate(const Warrior *pool, int n_total, int self,
 }
 
 /*
- * enemy_centroid — average position of all living enemies.
- * Warriors march toward the mass (not one target) to form a battle line.
- * Falls back to world centre when no enemies remain.
+ * enemy_centroid — the average position of all living enemies, i.e. the
+ * "centre of mass" of the other army.  Warriors march toward this rather
+ * than one foe, which makes them form a battle line.  No enemies left
+ * means the world centre.
  */
 static Vec2 enemy_centroid(const Warrior *pool, int n_total, int faction,
                            float ww, float wh) {
@@ -1006,7 +518,8 @@ static Vec2 enemy_centroid(const Warrior *pool, int n_total, int faction,
   return n ? v2scale(sum, 1.0f / n) : v2(ww * 0.5f, wh * 0.5f);
 }
 
-/* nearest_enemy_idx — pool index of the closest living enemy; -1 if none. */
+/* nearest_enemy_idx — find the closest living enemy; returns its pool index,
+ * or -1 if none are left. */
 static int nearest_enemy_idx(const Warrior *pool, int n_total, int self) {
   int efac = 1 - pool[self].faction;
   int best = -1;
@@ -1026,60 +539,29 @@ static int nearest_enemy_idx(const Warrior *pool, int n_total, int self) {
 }
 
 /*
- * Steer — the (force, max_speed) result returned by every per-state
- * behaviour helper in §6.
+ * Steer — what one behaviour decides this tick: a force to apply and a top
+ * speed.  Each per-state helper returns one of these, and the dispatcher
+ * feeds it to warrior_step.  The speed cap travels with the force because
+ * it depends on the state — a fleeing warrior sprints, a brawling one
+ * barely moves.
  *
- * Intent
- *   Each helper (melee_advance, melee_combat, melee_flee,
- *   archer_advance, archer_combat, archer_flee_force) is a pure
- *   function of `(Warrior *, pool, sp, world, dt)` returning a
- *   Steer.  The dispatcher (melee_logic / archer_logic) then calls
- *   warrior_step with steer.force at steer.max_spd and bounces off
- *   walls.
- *
- *   Returning a struct (vs two output pointers) keeps call sites
- *   one-line and makes the contract explicit at the type level:
- *   every helper MUST set both fields.  STATE_ADVANCE returns
- *   speed_advance; STATE_FLEE returns speed_flee (higher); STATE_
- *   COMBAT returns 0 (warrior stands still while attacking).
- *
- * Why TWO fields (not just force)
- *   Speed cap varies by state: a fleeing warrior sprints (speed_flee
- *   may be 1.5× the advance speed), an engaged warrior stands still.
- *   Embedding the cap in the Steer result lets each per-state helper
- *   pick its own without the dispatcher knowing the state.
- *
- * Members
- *   force      Weighted force vector to integrate this tick (px/s²).
- *              Computed as a Reynolds [1] weighted sum of the
- *              steering primitives needed by this state.
- *   max_spd    Hard cap on |vel| after integration (px/s).
- *
- * References
- *   [1] Reynolds 1999 — the "vehicle.steer_*()" methods return a
- *       force vector; this struct adds the max_speed component
- *       because state-dependent speed caps weren't part of Reynolds's
- *       single-vehicle assumption.
- *   [3] Buckland *Programming Game AI by Example* — Buckland's
- *       SteeringBehavior class returns Vector2D; the addition of
- *       max_spd here is the project-specific extension.
+ *   force    the steering force to apply this tick
+ *   max_spd  the hard ceiling on speed afterward (px/s)
  */
 typedef struct {
   Vec2 force;
   float max_spd;
 } Steer;
 
-/* ── melee state machine ─────────────────────────────────────────── *
- *
- * Shared contract: each per-state helper takes the warrior and the
- * pool, reads/writes w->state and w->target_idx + timers as needed,
- * and returns the Steer for this tick.  The dispatcher applies the
- * result via warrior_step + bounce_pos exactly once.
+/*
+ * The melee state machine.  Each helper below handles one state: it reads
+ * the warrior and the pool, may change the warrior's state/target/timers,
+ * and returns the Steer for this tick.  melee_logic picks the right one.
  */
 
 /*
- * melee_advance — march toward enemy mass; transition to COMBAT
- * when any enemy enters engage_range.  Sets target_idx on lock.
+ * melee_advance — march toward the enemy army.  The moment any enemy comes
+ * within engage_range, lock onto it and switch to fighting.
  */
 static Steer melee_advance(Warrior *w, const Warrior *pool, int n_total,
                            int self, const StrategyParams *sp,
@@ -1088,8 +570,8 @@ static Steer melee_advance(Warrior *w, const Warrior *pool, int n_total,
   int ne = nearest_enemy_idx(pool, n_total, self);
 
   if (ne >= 0 && v2len(v2sub(pool[ne].pos, w->pos)) < sp->engage_range) {
-    /* lock on → COMBAT next tick.  No movement this tick;
-     * atk_timer reset prevents an instant-hit on transition. */
+    /* Lock on and stand still this tick; resetting atk_timer stops a free
+     * hit the instant combat begins. */
     w->state = STATE_COMBAT;
     w->target_idx = ne;
     w->atk_timer = sp->atk_interval;
@@ -1104,10 +586,9 @@ static Steer melee_advance(Warrior *w, const Warrior *pool, int n_total,
 }
 
 /*
- * melee_combat — slow footwork toward the locked target; deal
- * ATK_DAMAGE every atk_interval seconds.  Transitions:
- *   target died    → ADVANCE
- *   hp ≤ flee_hp   → FLEE (drop target)
+ * melee_combat — brawl: shuffle slowly toward the locked target and land a
+ * hit every atk_interval.  If the target dies, go back to advancing; if our
+ * own health drops too low, break and flee.
  */
 static Steer melee_combat(Warrior *w, Warrior *pool, int n_total, int self,
                           const StrategyParams *sp, float dt) {
@@ -1121,7 +602,7 @@ static Steer melee_combat(Warrior *w, Warrior *pool, int n_total, int self,
     return (Steer){v2(0, 0), sp->speed_flee};
   }
 
-  /* Damage tick: consume the timer; on rollover, hit + reset. */
+  /* Count down to the next swing; when it fires, deal damage and reset. */
   w->atk_timer -= dt;
   if (w->atk_timer <= 0.0f) {
     w->atk_timer = sp->atk_interval;
@@ -1132,14 +613,15 @@ static Steer melee_combat(Warrior *w, Warrior *pool, int n_total, int self,
   Vec2 force = v2add(
       v2scale(steer_seek(w->pos, w->vel, tgt, sp->melee_speed), sp->w_seek),
       v2scale(steer_separate(pool, n_total, self, sp),
-              sp->w_sep * 0.4f) /* reduced: stay near target */
+              sp->w_sep * 0.4f) /* weaker push so it stays on the target */
   );
   return (Steer){force, sp->melee_speed * 1.5f};
 }
 
 /*
- * melee_flee — sprint away from the nearest enemy.  Once at
- * safe_range, count rally_timer; on rally_time → ADVANCE.
+ * melee_flee — sprint away from the nearest enemy.  Once far enough away
+ * (safe_range), start a countdown; survive that countdown and the warrior
+ * regains its nerve and advances again.
  */
 static Steer melee_flee(Warrior *w, const Warrior *pool, int n_total, int self,
                         const StrategyParams *sp, float dt) {
@@ -1171,10 +653,8 @@ static Steer melee_flee(Warrior *w, const Warrior *pool, int n_total, int self,
 }
 
 /*
- * melee_logic — dispatcher.  Picks the per-state helper, applies its
- * Steer through warrior_step + bounce_pos.  All combat coefficients
- * come through `const StrategyParams *sp`, so a strategy change takes
- * effect on the very next tick.
+ * melee_logic — run one melee warrior for a tick: pick the helper for its
+ * current state, then apply the resulting move and bounce off the edges.
  */
 static void melee_logic(Warrior *pool, int n_total, int self,
                         const StrategyParams *sp, float ww, float wh, float dt) {
@@ -1199,24 +679,17 @@ static void melee_logic(Warrior *pool, int n_total, int self,
   bounce_pos(&w->pos, &w->vel, ww, wh);
 }
 
-/* ── archer state machine ────────────────────────────────────────── *
- *
- * Archers are distance-driven; no target lock.  The dispatcher picks
- * one of three behaviours per tick based on dist-to-nearest-enemy
- * vs. the strategy's range thresholds, plus an HP panic check.
+/*
+ * The archer state machine.  Archers don't lock a single target; each tick
+ * they react to how far the nearest enemy is plus a panic check on low
+ * health, and pick one of: flee, shoot, or close the distance.
  */
 
 /*
- * archer_shoot — spawn one '-' arrow from this archer toward target
- * pool[ne].  Silently dropped if the arrow pool is at capacity.
- *
- *   pos     = archer's current position
- *   vel     = ARROW_TRAVEL_SPD · normalize(target − archer)
- *   target  = pool index of the locked enemy at shoot time
- *
- * The arrow flies in a straight line at constant speed; it does not
- * track the target if the target moves after the shot.  Hits are
- * detected by arrows_tick on a proximity check.
+ * archer_shoot — fire one arrow at enemy pool[ne].  The arrow starts at the
+ * archer and heads straight for where the target is right now, at a fixed
+ * speed; it won't follow the target afterward.  Dropped silently if the
+ * arrow pool is full.
  */
 static void archer_shoot(const Warrior *w, const Warrior *pool, int ne,
                          Arrow *arrows, int *n_arrows) {
@@ -1234,9 +707,9 @@ static void archer_shoot(const Warrior *w, const Warrior *pool, int ne,
 }
 
 /*
- * archer_flee_force — flee force from nearest enemy + ally separation.
- * Used by both the close-range panic path and the HP-flee carry-over
- * path; the caller picks which.
+ * archer_flee_force — the run-away force: push from the nearest enemy plus
+ * the usual spacing from allies.  Shared by the two reasons an archer flees
+ * (an enemy got too close, or it's already fleeing).
  */
 static Steer archer_flee_force(const Warrior *w, const Warrior *pool,
                                int n_total, int self,
@@ -1249,8 +722,8 @@ static Steer archer_flee_force(const Warrior *w, const Warrior *pool,
 }
 
 /*
- * archer_combat — within arrow_range: hold standoff (stand_off_dist
- * from the nearest enemy) and shoot every shoot_interval seconds.
+ * archer_combat — in firing range: keep a comfortable gap from the enemy
+ * (stand_off_dist) and loose an arrow every shoot_interval.
  */
 static Steer archer_combat(Warrior *w, const Warrior *pool, int n_total,
                            int self, const StrategyParams *sp,
@@ -1273,9 +746,9 @@ static Steer archer_combat(Warrior *w, const Warrior *pool, int n_total,
 }
 
 /*
- * archer_advance — beyond arrow_range: head toward a standoff point
- * BEHIND the enemy centroid (i.e. on this archer's own side of the
- * field).  This keeps archers in their half rather than charging in.
+ * archer_advance — too far to shoot: move closer, but aim for a spot on the
+ * archer's own side of the enemy rather than into them, so archers hang
+ * back in their half instead of charging.
  */
 static Steer archer_advance(Warrior *w, const Warrior *pool, int n_total,
                             int self, const StrategyParams *sp,
@@ -1291,12 +764,11 @@ static Steer archer_advance(Warrior *w, const Warrior *pool, int n_total,
   return (Steer){force, sp->archer_speed};
 }
 
-#define ARCHER_IDLE_DAMPING  0.92f   /* per-tick velocity decay when no enemies */
+#define ARCHER_IDLE_DAMPING  0.92f   /* how fast it coasts to a stop, per tick */
 
 /*
- * archer_handle_no_enemies — STATE_ADVANCE + glide-to-stop.  Used
- * when nearest_enemy_idx returns −1 (the last enemy of the other
- * faction is dead).
+ * archer_handle_no_enemies — nothing left to shoot at, so coast to a halt
+ * and stand down.
  */
 static void archer_handle_no_enemies(Warrior *w, const StrategyParams *sp,
                                       float ww, float wh, float dt) {
@@ -1307,10 +779,10 @@ static void archer_handle_no_enemies(Warrior *w, const StrategyParams *sp,
 }
 
 /*
- * archer_maybe_panic_on_low_hp — HP-driven FLEE transition.  Doesn't
- * return a force; the caller picks the flee force below based on the
- * (now-set) state.  Resets rally_timer so the warrior must EARN the
- * way back to ADVANCE by spending rally_time at safe_range.
+ * archer_maybe_panic_on_low_hp — if health is low, switch into fleeing.
+ * It only flips the state (the caller chooses the actual force) and resets
+ * the rally clock, so the archer has to spend the full safe time before it
+ * can advance again.
  */
 static void archer_maybe_panic_on_low_hp(Warrior *w, const StrategyParams *sp) {
   bool flee_enabled       = sp->archer_flee_hp > 0;
@@ -1324,11 +796,10 @@ static void archer_maybe_panic_on_low_hp(Warrior *w, const StrategyParams *sp) {
 }
 
 /*
- * archer_tick_rally — once per tick, if the warrior is FLEEING and far
- * enough from its last threat (≥ safe_range), accumulate rally_timer.
- * After rally_time consecutive seconds at safe distance, return to
- * STATE_ADVANCE.  Any tick inside safe_range RESETS the timer — so a
- * partial rally is wasted if the warrior dips back into danger.
+ * archer_tick_rally — while fleeing, count how long it's been safely away
+ * from the threat (at least safe_range).  Stay safe long enough and it
+ * advances again.  Dipping back into danger restarts the count, so a
+ * half-finished rally is wasted.
  */
 static void archer_tick_rally(Warrior *w, const Warrior *enemy,
                                 const StrategyParams *sp, float dt) {
@@ -1350,16 +821,12 @@ static void archer_tick_rally(Warrior *w, const Warrior *enemy,
 }
 
 /*
- * archer_pick_force — choose which combat-tier helper produces this
- * tick's steering force, based on (state, distance to nearest enemy).
- *
- *   panic-close  : within archer_flee_range  → archer_flee_force
- *   carry-over   : still in STATE_FLEE       → archer_flee_force
- *   shoot range  : within arrow_range        → archer_combat
- *   otherwise                                → archer_advance
- *
- * Also sets state to STATE_FLEE on the panic-close transition (the
- * other branches don't change state).
+ * archer_pick_force — decide what an archer does this tick from how close
+ * the nearest enemy is and whether it's already fleeing:
+ *   enemy too close      -> flee (and switch into the flee state)
+ *   already fleeing      -> keep fleeing
+ *   within firing range  -> hold position and shoot
+ *   otherwise            -> move closer
  */
 static Steer archer_pick_force(Warrior *w, Warrior *pool, int n_total,
                                 int self, const StrategyParams *sp,
@@ -1390,15 +857,9 @@ static Steer archer_pick_force(Warrior *w, Warrior *pool, int n_total,
 }
 
 /*
- * archer_logic — dispatcher.  Order of decisions (matters):
- *
- *   (1) No enemies left → coast to a halt and bail.
- *   (2) Low-HP panic → transition into STATE_FLEE (state mutation only,
- *       force is picked below).
- *   (3) Pick the appropriate steering force based on (state, distance).
- *   (4) Integrate + bounce off walls.
- *   (5) If still FLEEING, advance the rally clock; rally back to
- *       ADVANCE if we've spent rally_time at safe_range.
+ * archer_logic — run one archer for a tick.  Order matters: stand down if
+ * no enemies remain; panic-flee if hurt; pick and apply a move; bounce off
+ * walls; then advance the rally clock if it's still fleeing.
  */
 static void archer_logic(Warrior *pool, int n_total, int self,
                          const StrategyParams *sp, float ww,
@@ -1426,19 +887,12 @@ static void archer_logic(Warrior *pool, int n_total, int self,
   archer_tick_rally(w, &pool[ne], sp, dt);
 }
 
-/* ── top-level warrior tick ──────────────────────────────────────── */
-
 /*
- * warrior_tick — run one warrior through the full update pipeline.
- *
- * Shared preamble (both unit types):
- *   1. Tick hit_timer down (arrow-strike flash duration).
- *   2. DEAD: count down corpse timer; return.
- *   3. hp ≤ 0: die, credit kill to enemy faction.
- *   4. Invalidate stale target (enemy died last tick).
- *
- * Then dispatch to melee_logic or archer_logic.
- * Kill-credit bookkeeping lives here so neither logic function needs it.
+ * warrior_tick — one full update for one warrior, before handing off to the
+ * melee or archer brain.  First it handles the shared bookkeeping: tick down
+ * the hit flash, age corpses, turn the warrior into a corpse (and credit the
+ * kill to the other side) if its health is gone, and forget a target that
+ * just died.
  */
 static void warrior_tick(Warrior *pool, int n_total, int self,
                          const StrategyParams *sp,
@@ -1458,7 +912,7 @@ static void warrior_tick(Warrior *pool, int n_total, int self,
   if (w->hp <= 0) {
     w->state = STATE_DEAD;
     w->dead_timer = CORPSE_LIFETIME;
-    kills_per_faction[1 - w->faction]++;  /* enemy of dying warrior gains a kill */
+    kills_per_faction[1 - w->faction]++;  /* the other side scores the kill */
     return;
   }
 
@@ -1471,40 +925,12 @@ static void warrior_tick(Warrior *pool, int n_total, int self,
     melee_logic(pool, n_total, self, sp, ww, wh, dt);
 }
 
-/* ===================================================================== */
-/* §7  scene                                                            */
-/* ===================================================================== */
+/* ── §7 scene — world state, spawning, ticking, drawing ── */
 
 /*
- * Scene — complete simulation state.
- *
- * Field groups, by who reads/writes them:
- *   - warrior pool — new warriors always append at pool[n_total++];
- *     dead warriors keep their slot (no compaction) so corpse
- *     rendering is trivial and indices stay stable.
- *   - arrow pool — inactive arrows compacted each tick by
- *     arrows_tick(); spare slots reused on next shoot.
- *   - per-faction tallies — recomputed each tick from the pool;
- *     drive HUD display and victory detection.
- *   - world dimensions — refreshed each tick from cols/rows.
- *   - user mode flags — toggled by app_handle_key.
- */
-/*
- * World — pixel-space simulation extent.
- *
- * Intent
- *   Bundles the (width, height) pair that every combat helper needs
- *   for boundary clamping and centroid computations.  Before this
- *   struct, helpers carried `float ww, float wh` as two parameters —
- *   ~30 call sites in this file.  Bundling makes the data flow
- *   reachable through one Scene field.
- *
- * Members
- *   width   World width in pixels (= cols × CELL_W).
- *   height  World height in pixels (= rows × CELL_H).
- *
- * Invariants
- *   width > 0, height > 0.  Refreshed in scene_tick + scene_init.
+ * World — how big the battlefield is, in pixels (width = cols x CELL_W,
+ * height = rows x CELL_H).  Bundled so combat helpers can take one value
+ * instead of two.  Refreshed each tick from the terminal size.
  */
 typedef struct {
   float width;
@@ -1512,44 +938,23 @@ typedef struct {
 } World;
 
 /*
- * SimControls — user-facing playback knobs.
- *
- * Intent
- *   Currently just one flag, but bundled into a named sub-struct for
- *   symmetry with the other files in this project (slime_mold.c,
- *   shepherd.c, etc.) and to give the future home for any additional
- *   user toggles (slow-motion, gore enable, etc.) a clear place.
- *
- * Members
- *   paused   true → scene_tick early-returns; HUD shows "PAUSED".
- *            Toggled by SPACE.
+ * SimControls — the playback knobs the user can flip.
+ *   paused   when true the battle freezes and the HUD shows "PAUSED"
+ *            (toggled with SPACE)
  */
 typedef struct {
   bool paused;
 } SimControls;
 
 /*
- * Strategy — which of the N_STRATEGIES presets is currently active.
+ * Strategy — which preset is active.  Held as two things kept in lockstep:
+ * an index (for the 1-6 keys and the HUD label) and a pointer straight to
+ * that preset's knobs (what the combat code actually reads).  Keeping the
+ * pointer means combat helpers skip the array lookup every tick.  Always
+ * change both together via scene_set_strategy.
  *
- * Intent
- *   The strategy choice is TWO pieces of state that MUST stay in
- *   lockstep: an index (for cycling with 1..6 keys and for HUD
- *   display) and a pointer to the active StrategyParams (read by
- *   every combat helper in §6).  Bundling them prevents the historical
- *   bug of the index pointing one place while the params pointer
- *   points somewhere else after a key dispatch.
- *
- * Members
- *   index    Currently active preset in [0, N_STRATEGIES).  1..6 keys
- *            set it directly.
- *   params   Pointer to &g_presets[index] — the const table of all
- *            combat coefficients (speed_advance, atk_interval, …).
- *            Always re-set together with `index` via
- *            scene_set_strategy.
- *
- * Invariants
- *   0 ≤ index < N_STRATEGIES.
- *   params == &g_presets[index].
+ *   index    which preset, 0..N_STRATEGIES-1
+ *   params   pointer to &g_presets[index]
  */
 typedef struct {
   int                   index;
@@ -1557,29 +962,12 @@ typedef struct {
 } Strategy;
 
 /*
- * FactionStats — per-faction tallies recomputed each tick.
- *
- * Intent
- *   Scene holds `faction[2]`, indexed by the GONDOR / MORDOR enum
- *   constants.  Replaces three parallel `int x[2]` arrays
- *   (n_alive[2], n_archers[2], kills[2]) with one struct array —
- *   `scene.faction[GONDOR].kills` reads like the domain language
- *   instead of `scene.kills[0]`.
- *
- * Members
- *   n_alive    living warriors of this faction this tick
- *              (excludes STATE_DEAD corpses)
- *   n_archers  living archers of this faction this tick
- *              (subset of n_alive; melee = n_alive − n_archers)
- *   kills     CUMULATIVE kills credited to this faction across the
- *              whole battle (NOT reset each tick).  Incremented in
- *              warrior_tick when a warrior of the OTHER faction dies.
- *
- * Invariants
- *   n_archers ≤ n_alive.  kills ≥ 0; monotonically increasing.
- *
- * References
- *   None directly — standard ABM "per-team aggregate" pattern.
+ * FactionStats — a side's running totals.  Scene keeps one per faction.
+ *   n_alive    living warriors right now (corpses excluded)
+ *   n_archers  how many of those are archers (so melee = n_alive - n_archers)
+ *   kills      total enemies this side has killed, across the whole battle;
+ *              only ever grows
+ * n_alive and n_archers are recounted every tick; kills is not reset.
  */
 typedef struct {
   int n_alive;
@@ -1588,52 +976,38 @@ typedef struct {
 } FactionStats;
 
 /*
- * Scene — owns ALL simulation state for one battle.
+ * Scene — all the state for one battle, reachable from a single Scene*.
+ * Both armies share one warrior pool and there is one arrow pool; the rest
+ * is bookkeeping (tallies, who won, world size, active strategy, controls).
  *
- * Layered ownership
- *
- *     Scene
- *       ├── pool[POOL_MAX]   : Warrior[]    ← warrior pool (both factions)
- *       ├── n_total          : int          ← used slots (monotonic)
- *       ├── arrows[ARROW_…]  : Arrow[]      ← arrow pool (compacted/tick)
- *       ├── n_arrows         : int          ← active arrow count
- *       ├── faction[2]       : FactionStats ← per-side tallies + kills
- *       ├── winner           : int          ← −1 ongoing, else GONDOR/MORDOR
- *       ├── world            : World        ← pixel-space extent
- *       ├── strategy         : Strategy     ← index + active params pointer
- *       └── sim              : SimControls  ← paused
- *
- *   Every persistent simulation value is reachable from one Scene*.
- *   No file-scope globals carry simulation state; g_presets[] is a
- *   const lookup, not state.
+ *   pool/n_total    every warrior; new ones append, dead ones keep their
+ *                   slot, so indices stay stable and n_total only grows
+ *   arrows/n_arrows arrows in flight; swept clean each tick
+ *   faction[2]      per-side totals, indexed by GONDOR/MORDOR
+ *   winner          -1 while ongoing, else the winning faction
+ *   world           battlefield size in pixels
+ *   strategy        the active preset
+ *   sim             user controls (paused)
  */
 typedef struct {
-  /* warrior pool — both factions interleaved by spawn order */
   Warrior pool[POOL_MAX];
-  int n_total; /* used slots; never decreases */
+  int n_total;
 
-  /* arrow pool — compacted each tick */
   Arrow arrows[ARROW_POOL_MAX];
-  int n_arrows; /* active arrow count          */
+  int n_arrows;
 
-  /* per-faction tallies — recomputed in scene_tick (kills is cumulative) */
   FactionStats faction[2];
-  int          winner; /* -1 ongoing, 0 GONDOR, 1 MORDOR */
+  int          winner;
 
-  /* pixel-space extent — refreshed each tick */
   World world;
-
-  /* active steering preset — index + cached params pointer */
   Strategy strategy;
-
-  /* user-facing controls */
   SimControls sim;
 } Scene;
 
 /*
- * scene_set_strategy — switch the active steering preset.  Keeps
- * Strategy.index and Strategy.params in lockstep so a key-press takes
- * effect on the very next tick.  Wraps modularly over N_STRATEGIES.
+ * scene_set_strategy — switch to another preset, keeping the index and the
+ * params pointer in sync.  The math wraps the index around so out-of-range
+ * values land back in 0..N_STRATEGIES-1.
  */
 static void scene_set_strategy(Scene *s, int new_index) {
   new_index = ((new_index % N_STRATEGIES) + N_STRATEGIES) % N_STRATEGIES;
@@ -1642,13 +1016,9 @@ static void scene_set_strategy(Scene *s, int new_index) {
 }
 
 /*
- * spawn_warriors — append `count` warriors of one (faction, unit_type)
- * onto the pool, bumping n_total each time.
- *
- * The cap argument (POOL_MAX for init, or POOL_MAX min WARRIORS_MAX
- * for reinforcements) prevents pool overflow.  Used by scene_init's
- * four spawn waves AND by scene_add_warriors's two reinforcement
- * waves — six identical loop bodies collapsed into one helper.
+ * spawn_warriors — add `count` new warriors of one side and type to the
+ * pool, stopping early if the pool would pass pool_cap.  Used both for the
+ * opening armies and for reinforcements.
  */
 static void spawn_warriors(Scene *s, int faction, UnitType unit_type,
                             int count, int pool_cap) {
@@ -1659,9 +1029,8 @@ static void spawn_warriors(Scene *s, int faction, UnitType unit_type,
   }
 }
 
-/* count_alive_faction — how many warriors of `faction` are not corpses.
- * Used by scene_add_warriors to enforce the WARRIORS_MAX cap on
- * reinforcements (so a side can't grow unboundedly via repeated 'g'/'m'). */
+/* count_alive_faction — how many of a side's warriors are still alive.
+ * Used to cap reinforcements so a side can't grow forever by mashing g/m. */
 static int count_alive_faction(const Scene *s, int faction) {
   int n = 0;
   for (int i = 0; i < s->n_total; i++)
@@ -1671,27 +1040,18 @@ static int count_alive_faction(const Scene *s, int faction) {
 }
 
 /*
- * scene_init — bring a Scene to a fresh start.
- *
- *   (1) zero everything, set the World extent from cols/rows
- *   (2) point Strategy at preset 0 (BALANCED) — index+params in lockstep.
- *       MUST come BEFORE warrior_spawn so it can read sp->atk_interval
- *       / shoot_interval for the initial atk_timer randomisation.
- *   (3) spawn the four starting waves in fixed order
- *       (Gondor melee → Gondor archers → Mordor melee → Mordor archers)
+ * scene_init — start a fresh battle: clear everything, size the world, pick
+ * the first strategy, then spawn both armies.  The strategy must be set
+ * before spawning because warrior_spawn reads its attack timing.
  */
 static void scene_init(Scene *s, int cols, int rows) {
-  /* (1) world extent */
   memset(s, 0, sizeof *s);
   s->world.width  = pw(cols);
   s->world.height = ph(rows);
   s->winner = -1;
 
-  /* (2) default strategy (must precede spawning) */
   scene_set_strategy(s, 0);
 
-  /* (3) four starting waves; spawn order matters only for pool index
-   * layout, the simulation is symmetric in faction. */
   spawn_warriors(s, GONDOR, UNIT_MELEE,  MELEE_DEFAULT,  POOL_MAX);
   spawn_warriors(s, GONDOR, UNIT_ARCHER, ARCHER_DEFAULT, POOL_MAX);
   spawn_warriors(s, MORDOR, UNIT_MELEE,  MELEE_DEFAULT,  POOL_MAX);
@@ -1699,16 +1059,9 @@ static void scene_init(Scene *s, int cols, int rows) {
 }
 
 /*
- * scene_add_warriors — append reinforcements to the pool ('g' / 'm' keys).
- *
- * Always appends at pool[n_total++]: no faction-offset arithmetic, no
- * aliasing bugs regardless of the order in which factions are reinforced.
- *
- * Bails early if:
- *   - battle already decided (winner ≥ 0), so reinforcements can't
- *     resurrect the loser
- *   - this faction already has WARRIORS_MAX living, so the side can't
- *     grow unboundedly via repeated key presses
+ * scene_add_warriors — drop in reinforcements for one side (the g/m keys).
+ * Does nothing if the battle is already won (no reviving the loser) or if
+ * the side is already at its living-warrior cap.
  */
 static void scene_add_warriors(Scene *s, int faction) {
   if (s->winner >= 0) return;
@@ -1718,19 +1071,16 @@ static void scene_add_warriors(Scene *s, int faction) {
   spawn_warriors(s, faction, UNIT_ARCHER, REINFORCE_ARCHER, POOL_MAX);
 }
 
-/* arrow_out_of_bounds — true if the arrow has flown off the world. */
+/* arrow_out_of_bounds — true once the arrow has flown off the battlefield. */
 static inline bool arrow_out_of_bounds(const Arrow *a, float ww, float wh) {
   return a->pos.x < 0.0f || a->pos.x >= ww
       || a->pos.y < 0.0f || a->pos.y >= wh;
 }
 
 /*
- * arrow_apply_hit — deal damage + flash on a successful proximity hit.
- *
- *   target_hp     -= ATK_DAMAGE         (may drop ≤ 0; resolved next
- *                                         warrior_tick)
- *   target_flash   = HIT_FLASH_TIME      (visual '*' overlay seconds)
- *   arrow.active   = false               (slot recycled by compact pass)
+ * arrow_apply_hit — an arrow landed: damage the target, start its hit
+ * flash, and retire the arrow.  The target may drop to 0 health; that's
+ * turned into a death on its next tick.
  */
 static void arrow_apply_hit(Arrow *a, Warrior *target) {
   target->hp        -= ATK_DAMAGE;
@@ -1738,12 +1088,8 @@ static void arrow_apply_hit(Arrow *a, Warrior *target) {
   a->active          = false;
 }
 
-/* compact_arrows — Stable single-pass compaction.  Walks the arrows
- * pool, copying active entries down to fill any gaps left by
- * deactivated arrows.  *n_arrows is rewritten with the live count.
- *
- * Pattern: standard "two-finger" array compaction in O(N), used in
- * many ECS-style systems for sparse pools without a free-list. */
+/* compact_arrows — squeeze the dead arrows out of the pool by copying the
+ * live ones down to fill the gaps, in one pass, and update the count. */
 static void compact_arrows(Arrow *arrows, int *n_arrows) {
   int write_idx = 0;
   for (int read_idx = 0; read_idx < *n_arrows; read_idx++)
@@ -1753,13 +1099,9 @@ static void compact_arrows(Arrow *arrows, int *n_arrows) {
 }
 
 /*
- * arrows_tick — move every active arrow, resolve hits, compact pool.
- *
- *   (1) for each active arrow:
- *         integrate position (pos += vel · dt)
- *         deactivate if off-screen / target dead / no-target
- *         if within ARROW_HIT_DIST of target → arrow_apply_hit
- *   (2) compact: shift active arrows to the front of the array
+ * arrows_tick — advance every arrow one tick: move it, drop it if it flew
+ * off-screen or its target is gone, and damage the target if it's close
+ * enough.  Then sweep the dead arrows out of the pool.
  */
 static void arrows_tick(Arrow *arrows, int *n_arrows, Warrior *pool, float ww,
                         float wh, float dt) {
@@ -1767,23 +1109,21 @@ static void arrows_tick(Arrow *arrows, int *n_arrows, Warrior *pool, float ww,
     Arrow *a = &arrows[i];
     if (!a->active) continue;
 
-    /* (1a) integrate */
     a->pos = v2add(a->pos, v2scale(a->vel, dt));
 
-    /* (1b) early outs */
+    /* gone for good: off the field, no target, or target already dead */
     if (arrow_out_of_bounds(a, ww, wh)) { a->active = false; continue; }
     if (a->target_idx < 0)              { a->active = false; continue; }
 
     Warrior *target = &pool[a->target_idx];
     if (target->state == STATE_DEAD)    { a->active = false; continue; }
 
-    /* (1c) proximity hit test */
+    /* close enough to count as a strike? */
     float distance_to_target = v2len(v2sub(target->pos, a->pos));
     if (distance_to_target < ARROW_HIT_DIST)
       arrow_apply_hit(a, target);
   }
 
-  /* (2) compact out inactive slots */
   compact_arrows(arrows, n_arrows);
 }
 
@@ -1793,8 +1133,8 @@ static void scene_tick(Scene *s, float dt, int cols, int rows) {
   if (s->sim.paused || s->winner >= 0)
     return;
 
-  /* warrior_tick increments a tiny `int[2]` kills array; copy current
-   * cumulative totals in, let warrior_tick add to them, then write back. */
+  /* warrior_tick bumps a plain two-element kill count; seed it with the
+   * running totals, let the loop add to it, then store it back. */
   int kills_per_faction[2] = { s->faction[GONDOR].kills, s->faction[MORDOR].kills };
   for (int i = 0; i < s->n_total; i++)
     warrior_tick(s->pool, s->n_total, i, s->strategy.params,
@@ -1805,7 +1145,7 @@ static void scene_tick(Scene *s, float dt, int cols, int rows) {
 
   arrows_tick(s->arrows, &s->n_arrows, s->pool, s->world.width, s->world.height, dt);
 
-  /* Recount per-faction tallies from the pool (kills is cumulative, not reset). */
+  /* Recount how many of each side are alive (kills stays, it's a running total). */
   s->faction[GONDOR].n_alive   = s->faction[MORDOR].n_alive   = 0;
   s->faction[GONDOR].n_archers = s->faction[MORDOR].n_archers = 0;
   for (int i = 0; i < s->n_total; i++) {
@@ -1826,13 +1166,9 @@ static void scene_tick(Scene *s, float dt, int cols, int rows) {
 }
 
 /*
- * mark_cell — stamp one ASCII glyph at terminal cell (cx, cy).
- *
- * Centralises the (chtype)(unsigned char) cast plus bounds-check that
- * would otherwise be repeated at every mvwaddch site.  The double
- * cast prevents sign-extension on character values > 127 (per
- * CLAUDE.md "Common ncurses Bugs").  Off-screen cells are silently
- * dropped.
+ * mark_cell — draw one character at a terminal cell, skipping it if it
+ * falls off screen.  The double cast on ch keeps ncurses from mangling
+ * characters above 127 (it would otherwise sign-extend them).
  */
 static void mark_cell(WINDOW *w, int cx, int cy, char ch, int pair, attr_t attr,
                       int cols, int rows) {
@@ -1844,12 +1180,8 @@ static void mark_cell(WINDOW *w, int cx, int cy, char ch, int pair, attr_t attr,
 }
 
 /*
- * warrior_attr — compute the ncurses attribute bundle for a living
- * warrior, encoding HP and state into A_BOLD / A_DIM / A_BLINK.
- *
- *   hp == HP_MAX  → A_BOLD       (full strength)
- *   hp == 1       → A_DIM        (last hit)
- *   state==FLEE   → |= A_BLINK   (panic)
+ * warrior_attr — how a living warrior should look: bold at full health,
+ * faint on its last hit, and blinking while it's fleeing.
  */
 static attr_t warrior_attr(const Warrior *wr) {
   attr_t attr = A_NORMAL;
@@ -1863,10 +1195,8 @@ static attr_t warrior_attr(const Warrior *wr) {
 }
 
 /*
- * draw_arrows — pass 0: every active arrow as a coloured '-'
- * (green for Gondor, orange for Mordor).  No alpha lerp — arrows
- * are short-lived and move fast, so the 16 ms sub-tick smoothing
- * doesn't help.
+ * draw_arrows — draw each arrow in flight as a coloured '-'.  No smoothing:
+ * arrows are quick and short-lived, so it wouldn't help.
  */
 static void draw_arrows(const Scene *s, WINDOW *w, int cols, int rows) {
   for (int i = 0; i < s->n_arrows; i++) {
@@ -1880,9 +1210,8 @@ static void draw_arrows(const Scene *s, WINDOW *w, int cols, int rows) {
 }
 
 /*
- * draw_corpses — pass 1: dim '.' at every dead warrior whose corpse
- * timer has not yet expired.  Drawn underneath living warriors so a
- * fresh kill on the same cell doesn't show two glyphs.
+ * draw_corpses — draw a faint '.' for each recent corpse.  Drawn before the
+ * living so a warrior standing on a corpse hides it.
  */
 static void draw_corpses(const Scene *s, WINDOW *w, int cols, int rows) {
   for (int i = 0; i < s->n_total; i++) {
@@ -1895,10 +1224,9 @@ static void draw_corpses(const Scene *s, WINDOW *w, int cols, int rows) {
 }
 
 /*
- * draw_living — pass 2: every living warrior with HP-driven attrs.
- * Arrow-strike flash ('*' in standout+bold) briefly overrides the
- * warrior's own glyph during HIT_FLASH_TIME after being hit.  Draws
- * at the alpha-interpolated position prev_pos → pos.
+ * draw_living — draw every living warrior at its smoothed position.  A
+ * warrior that was just hit flashes as a '*' for a moment instead of its
+ * normal glyph.
  */
 static void draw_living(const Scene *s, WINDOW *w, int cols, int rows,
                         float alpha) {
@@ -1922,15 +1250,15 @@ static void draw_living(const Scene *s, WINDOW *w, int cols, int rows,
 }
 
 /*
- * draw_victory_banner — pass 3: blinking centred ribbon when one
- * faction has been wiped out.  Drawn last so it overlays everything.
+ * draw_victory_banner — once a side has won, blink a centred banner over
+ * everything else.
  */
 static void draw_victory_banner(const Scene *s, WINDOW *w, int cols, int rows) {
   if (s->winner < 0)
     return;
   static const char *win_msg[2] = {
-      "  === GONDOR WINS — FOR FRODO ===  ",
-      "  === MORDOR WINS — THE EYE SEES ALL ===  ",
+      "  === GONDOR WINS - FOR FRODO ===  ",
+      "  === MORDOR WINS - THE EYE SEES ALL ===  ",
   };
   const char *msg = win_msg[s->winner];
   int mx = (cols - (int)strlen(msg)) / 2;
@@ -1942,16 +1270,8 @@ static void draw_victory_banner(const Scene *s, WINDOW *w, int cols, int rows) {
 }
 
 /*
- * scene_draw — paint one frame in painter's order:
- *
- *   1. arrows '-' under everything (so fired arrows look "behind"
- *      the warriors they were shot at).
- *   2. corpses '.' dim under living warriors.
- *   3. living warriors at alpha-interpolated positions.
- *   4. victory banner overlaid last when battle is decided.
- *
- * Each pass is its own helper so a reader can find any pass
- * without scanning a 100-line orchestrator.
+ * scene_draw — paint one frame, back to front: arrows, then corpses, then
+ * living warriors, then the victory banner on top.
  */
 static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
                        float alpha) {
@@ -1961,49 +1281,13 @@ static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
   draw_victory_banner(s, w, cols, rows);
 }
 
-/* ===================================================================== */
-/* §8  app — screen, input, main loop                                  */
-/* ===================================================================== */
+/* ── §8 app — screen, input, main loop ── */
 
 /*
- * Screen — terminal cell extent + ncurses lifecycle wrapper.
- *
- * Intent
- *   Owns the TERMINAL side of the world.  Where Scene.world tracks
- *   the pixel-space simulation box, this struct tracks the cell-space
- *   terminal grid that ncurses paints onto.  The two are linked but
- *   live in DIFFERENT spaces:
- *
- *      World.width  = Screen.cols × CELL_W      (CELL_W = 8 px)
- *      World.height = Screen.rows × CELL_H      (CELL_H = 16 px)
- *
- *   Keeping them in SEPARATE structs prevents the class of "drew in
- *   cell-space when I meant pixel-space" aspect-ratio bugs — physics
- *   never sees cells, the renderer never sees pixels except through
- *   the one px_to_cell_x/y bridge in §4.
- *
- * Why a tiny 2-field struct (not flat ints on App)
- *   • Lifecycle isolation: only screen_init / screen_resize /
- *     screen_free / screen_draw touch ncurses' initscr / endwin /
- *     mvprintw.  They all take `Screen *` to make this layer
- *     explicit at the type level.
- *   • Symmetry with World: simulation and rendering each get one
- *     struct named for the space they live in.
- *
- * Members
- *   cols   Terminal width in CELLS (from getmaxyx).
- *   rows   Terminal height in CELLS.  Bottom-row index is rows − 1.
- *
- * Invariants
- *   cols > 0, rows > 0.
- *   Scene.world.width  == cols × CELL_W,
- *   Scene.world.height == rows × CELL_H,
- *   maintained in lockstep by scene_init / scene_tick (refreshed
- *   each tick from the live Screen).
- *
- * References
- *   None directly — terminal extent is a rendering substrate concern.
- *   See CLAUDE.md §"Coordinate / Physics" for aspect-ratio compensation.
+ * Screen — the terminal's size, in cells (cols x rows), plus the ncurses
+ * setup/teardown.  This is the cell-space counterpart to Scene.world's
+ * pixel space; keeping them apart keeps physics out of cells and the
+ * renderer out of pixels except at the one conversion point.
  */
 typedef struct {
   int cols, rows;
@@ -2032,26 +1316,16 @@ static void screen_resize(Screen *s) {
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * screen_draw — assemble a complete frame: scene, then HUD on top.
- *
- * HUD layout:
- *   Row 0 left:    GONDOR alive (melee + archers) and kills
- *   Row 0 centre:  [ WAR: <strategy> ] or [ WAR: PAUSED ]
- *   Row 0 right:   MORDOR alive and kills
- *   Row 1 right:   fps / sim Hz
- *   Last row:      key hints
- */
-/* hud_paint_text — attron / mvprintw / attroff sandwich for one HUD
- * row.  Centralises the colour-pair setup that every HUD region uses. */
+/* hud_paint_text — write one bold coloured string at a spot on screen.
+ * Wraps the attribute on/off so every HUD piece doesn't repeat it. */
 static void hud_paint_text(int row, int col, int pair, const char *text) {
   attron (COLOR_PAIR(pair) | A_BOLD);
   mvprintw(row, col, "%s", text);
   attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* draw_faction_roster_left — top-left: GONDOR roster (melee + archer
- * counts + cumulative kills).  Painted in PAIR_GONDOR (5). */
+/* draw_faction_roster_left — top-left: Gondor's melee/archer counts and
+ * total kills, in Gondor's colour. */
 static void draw_faction_roster_left(const Scene *sc) {
   int melee_count   = sc->faction[GONDOR].n_alive - sc->faction[GONDOR].n_archers;
   int archer_count  = sc->faction[GONDOR].n_archers;
@@ -2061,8 +1335,7 @@ static void draw_faction_roster_left(const Scene *sc) {
   hud_paint_text(0, 0, 5 /* PAIR_GONDOR */, buf);
 }
 
-/* draw_faction_roster_right — top-right: MORDOR roster, mirror of the
- * left panel.  Painted in PAIR_MORDOR (1). */
+/* draw_faction_roster_right — top-right: the same for Mordor, mirrored. */
 static void draw_faction_roster_right(const Screen *s, const Scene *sc) {
   int melee_count  = sc->faction[MORDOR].n_alive - sc->faction[MORDOR].n_archers;
   int archer_count = sc->faction[MORDOR].n_archers;
@@ -2074,8 +1347,7 @@ static void draw_faction_roster_right(const Screen *s, const Scene *sc) {
   hud_paint_text(0, right_col, 1 /* PAIR_MORDOR */, buf);
 }
 
-/* draw_hud_title — centred: active strategy name (or "PAUSED").
- * Bright yellow PAIR_HUD so it dominates any battle activity behind. */
+/* draw_hud_title — centred: the active strategy's name, or "PAUSED". */
 static void draw_hud_title(const Screen *s, const Scene *sc) {
   char buf[48];
   snprintf(buf, sizeof buf, "[ WAR: %-12s ]",
@@ -2104,11 +1376,9 @@ static void draw_hud_hint(const Screen *s) {
 
 static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
                         float alpha) {
-  /* (1) clear offscreen buffer */
   erase();
-  /* (2) paint the battle (warriors + arrows + corpses) */
   scene_draw(sc, stdscr, s->cols, s->rows, alpha);
-  /* (3) HUD on top: 3-segment top row + fps indicator + bottom keys */
+  /* HUD goes on top of the battle */
   draw_faction_roster_left (sc);
   draw_faction_roster_right(s, sc);
   draw_hud_title           (s, sc);
@@ -2124,12 +1394,12 @@ static void screen_present(void) {
 /* ── App ── */
 
 /*
- * FpsCounter — rolling-window frame-rate estimator.
- *
- * Per-frame fps would jitter; accumulate frame_count + elapsed
- * nanoseconds over FPS_WINDOW_NS (500 ms) and emit a smoothed
- * `display` value each time the window fills.  Same shape as the
- * FpsCounter on every other file in this project.
+ * FpsCounter — a smoothed frame-rate readout.  Measuring fps frame by frame
+ * jumps around, so it counts frames over a half-second window and reports
+ * the average.
+ *   frame_count  frames seen so far this window
+ *   window_ns    time elapsed this window, in nanoseconds
+ *   display      the last smoothed fps value, shown in the HUD
  */
 typedef struct {
   int     frame_count;
@@ -2155,15 +1425,14 @@ static void fps_counter_tick(FpsCounter *f, int64_t dt) {
 }
 
 /*
- * App — top-level container for every persistent value.
- *
- *   scene        simulation state (sub-structs reachable from here)
- *   screen       terminal cell extent + ncurses lifecycle
- *   fps          rolling-window fps estimator for the HUD
- *   sim_fps      target physics tick rate (config; not user-tweakable)
- *   running      sig_atomic_t flag cleared by SIGINT/TERM + 'q' key
- *   need_resize  sig_atomic_t flag set by SIGWINCH; main reacts on
- *                the next iteration
+ * App — everything that lives for the whole program.
+ *   scene        the battle state
+ *   screen       terminal size + ncurses
+ *   fps          the HUD's frame-rate readout
+ *   sim_fps      physics ticks per second (fixed)
+ *   running      cleared to stop the loop; set by 'q' and by exit signals
+ *   need_resize  set by a terminal-resize signal; handled next loop
+ * The two flags are sig_atomic_t because signal handlers write them.
  */
 typedef struct {
   Scene                 scene;
@@ -2191,13 +1460,9 @@ static void app_do_resize(App *app) {
 }
 
 /*
- * app_handle_key — process one keystroke.
- *
- * Keys 1–6 invoke scene_set_strategy with the corresponding index.
- * The change is live: every combat helper takes `const StrategyParams
- * *sp` from `scene.strategy.params` on the next tick — no reset
- * required.  In-flight arrows continue unaffected (ARROW_TRAVEL_SPD
- * is constant).
+ * app_handle_key — act on one keypress; returns false only for quit.
+ * Keys 1-6 switch strategy live, taking effect on the next tick with no
+ * reset; arrows already flying are unaffected.
  */
 static bool app_handle_key(App *app, int ch) {
   Scene *sc = &app->scene;
@@ -2236,16 +1501,11 @@ static bool app_handle_key(App *app, int ch) {
 }
 
 /*
- * main — game loop (fixed-step accumulator; Fiedler "Fix Your Timestep!").
- *
- *   (1) handle pending SIGWINCH + reset timers
- *   (2) measure dt since last frame, capped at DT_CAP_NS
- *   (3) drain sim_accum: scene_tick at fixed dt_sec until caught up
- *   (4) sub-tick alpha for the renderer (= leftover ns / TICK_LEN_NS)
- *   (5) rolling-window fps via fps_counter_tick
- *   (6) sleep BEFORE render so terminal I/O stays inside FRAME_BUDGET_NS
- *   (7) draw + present
- *   (8) drain non-blocking input via app_handle_key
+ * main — the game loop.  Physics runs at a fixed rate while the screen
+ * draws as often as it can: each pass measures real time elapsed, steps the
+ * simulation in fixed chunks until it's caught up, then draws (blending
+ * between steps for smooth motion) and reads input.  Pattern from Fiedler,
+ * "Fix Your Timestep!".
  */
 int main(void) {
   srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
@@ -2273,20 +1533,21 @@ int main(void) {
   while (app->running) {
     int64_t frame_start = clock_ns();
 
-    /* (1) handle SIGWINCH */
+    /* react to a terminal resize and restart the timing */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
       sim_accum  = 0;
     }
 
-    /* (2) measure dt, cap to avoid avalanche */
+    /* time since last frame; capped so a long stall can't trigger a flood
+     * of catch-up steps */
     int64_t now = clock_ns();
     int64_t dt  = now - frame_time;
     frame_time  = now;
     if (dt > DT_CAP_NS) dt = DT_CAP_NS;
 
-    /* (3) drain accumulator: fixed-step physics until caught up */
+    /* run as many fixed physics steps as the elapsed time bought us */
     sim_accum += dt;
     while (sim_accum >= TICK_LEN_NS) {
       scene_tick(&app->scene, TICK_LEN_SEC,
@@ -2294,22 +1555,19 @@ int main(void) {
       sim_accum -= TICK_LEN_NS;
     }
 
-    /* (4) sub-tick alpha for renderer */
+    /* how far between two physics steps we are, for smooth drawing (0..1) */
     float alpha = (float)sim_accum / (float)TICK_LEN_NS;
 
-    /* (5) rolling-window fps counter */
     fps_counter_tick(&app->fps, dt);
 
-    /* (6) sleep BEFORE render so I/O stays inside the budget */
+    /* sleep before drawing so terminal writes stay inside the frame budget */
     int64_t budget_left = FRAME_BUDGET_NS - (clock_ns() - frame_start);
     clock_sleep_ns(budget_left);
 
-    /* (7) draw + present */
     screen_draw(&app->screen, &app->scene,
                 app->fps.display, app->sim_fps, alpha);
     screen_present();
 
-    /* (8) drain input */
     int key = getch();
     if (key != ERR && !app_handle_key(app, key))
       app->running = 0;

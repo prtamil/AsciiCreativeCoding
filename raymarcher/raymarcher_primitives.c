@@ -1,555 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * raymarcher_primitives.c — a gallery of 17 SDF primitives
+ * raymarcher_primitives.c — a gallery of 17 shapes drawn with text in the
+ * terminal, each by shooting a ray per character cell and shading what it hits.
+ * One renderer, 17 shapes: a function-pointer table picks the distance function,
+ * and Tab cycles it.  The shapes tumble so you see every side, and dithering
+ * smooths the shading.  Read raymarcher.c (a single sphere) and
+ * raymarcher_cube.c first.
  *
- * DEMO: Cycle through 17 distinct geometric primitives — sphere, box,
- *       torus, hex prism, capsule, cone, octahedron, pyramid, and
- *       more — each rendered with the same sphere-tracing skeleton.
- *       What changes per primitive is ONE line: the SDF function
- *       pointer in the active table entry.  Two-axis "tumble"
- *       rotation shows every face/edge/vertex over time.  92-char
- *       Bourke ramp + Floyd-Steinberg dithering for smooth shading.
- *       Six themes, four debug overlays.
- *
- * Study alongside: raymarcher/raymarcher.c (sphere — same march loop
- *       with one primitive) and raymarcher/raymarcher_cube.c (box
- *       SDF deeply explained).  This file is what happens when you
- *       want a CATALOGUE of primitives sharing one renderer.
- *
- * Section map:
- *   §1   config          — every tunable named, no magic numbers later
- *   §2   clock           — monotonic timer + sleep
- *   §3   color           — themes + HUD/hint pairs
- *   §4   vec2 / vec3     — 2-D and 3-D math, value types
- *   §5   rotation        — rot_y, rot_x, tumble (two-axis spin)
- *   §6   SDFs A          — sphere + box family (|p|−h primitives)
- *   §7   SDFs B          — torus family (radial reduction)
- *   §8   SDFs C          — cone + capsule + cylinder (segment-based)
- *   §9   SDFs D          — polyhedra + 2-D extruded slabs
- *   §10  wrappers + prim table (function-pointer dispatch)
- *   §11  raymarch        — trace + tetrahedral normal + Phong + cast_ray → Hit
- *   §12  canvas state    — Hit + intensity + pixels arrays
- *   §13  Bourke ramp + LUT
- *   §14  shade_to_terminal — gamma + Floyd-Steinberg dithering
- *   §15  canvas render   + production canvas_draw
- *   §16  debug overlays  — see the rendering signals raw
- *   §17  scene + screen + app
- *
- * Keys:
- *   q / ESC      quit
- *   space        pause / resume the tumble
- *   Tab / t / T  next primitive (T = previous)
- *   = / -        primitive size larger / smaller
- *   r / R        tumble faster / slower
- *   z / Z        zoom in / out (camera closer / farther)
- *   c / C        next / previous colour theme
- *                  (CLASSIC / AMBER / MATRIX / NEON / ICE / COPPER)
- *   d / D        cycle debug overlay
- *                  (NORMAL / NORMALS / DEPTH / STEPS)
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c \
- *       -o primitives -lncurses -lm
+ * Ideas borrowed: Hart's "Sphere Tracing" (1996) for the marching, Iñigo
+ * Quílez's distance-function catalogue for the 17 shapes
+ * (https://iquilezles.org/articles/distfunctions/), Floyd & Steinberg (1976)
+ * for the dithering, and Paul Bourke's 92-char ASCII ramp
+ * (https://paulbourke.net/dataformats/asciiart/).
  */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * The file is its own textbook.  Read top-to-bottom.
- *
- *   • CONCEPTS         names the algorithm and lists references.
- *   • MENTAL MODEL     intuition + an ASCII diagram of the dispatch.
- *   • GUIDED TUTORIAL  nine short answers walking from "why a function-
- *                      pointer table?" through each shape family,
- *                      tetrahedron normals, gamma correction, and
- *                      Floyd-Steinberg dithering.
- *   • §1..§17          the actual code, each section short and focused.
- *
- * Ten-minute version: read the GUIDED TUTORIAL.  By the end the
- * §-sections feel like reviewing notes.
- *
- * Math notation used in code:
- *      p          — a 3-D point (the SDF input)
- *      s          — primitive size scalar (1.0 = default)
- *      ry, rx     — current Y-spin and X-tilt angles (radians)
- *      ro, rd     — ray origin, ray direction (unit)
- *      t          — distance the ray has marched
- *      N          — surface normal at hit
- *      L, V, R    — light, view, reflection unit vectors
- *
- * Background you need:
- *   • basic vector arithmetic (add, dot, length, normalise)
- *   • read raymarcher.c first if sphere tracing is unfamiliar
- *   • optional: Inigo Quílez's "Distance Functions" page is the
- *     reference for the 17 primitive formulas in §6..§9
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ────────────────────────────────────────────────────────── *
- *
- * Algorithm    : SPHERE TRACING (Hart 1996) of a SWAPPABLE SDF chosen
- *                from a 17-entry function-pointer table.  Each entry
- *                is a tiny wrapper that maps a single user-controlled
- *                size scalar to that primitive's intrinsic parameters
- *                (half-extents, radii, heights).  The renderer never
- *                knows WHICH primitive is active — it just calls
- *                k_prims[active].sdf(p, size).  Tab cycles the active
- *                index; nothing else has to change.
- *
- *                Beneath the dispatch: each primitive is one of Inigo
- *                Quílez's catalogued distance functions, expressed in
- *                7-25 lines of pure math.
- *
- *                Per pixel:
- *                  1. ray from camera through cell, aspect-corrected
- *                  2. tumble query point by (ry, rx)        (rotation)
- *                  3. sphere-trace using k_prims[i].sdf
- *                  4. on hit: 4-tap tetrahedral normal, Phong shade
- *                  5. (intensity) → glyph + colour pair via Bourke
- *                                  ramp + gamma + Floyd-Steinberg
- *
- * Data         : Stateless math (V2 + V3 + 17 SDFs + 17 wrappers + 1
- *                Prim table).  Per-pixel result is Hit (hit / p /
- *                normal / intensity / t / steps); Canvas stores Hit[]
- *                + intensity[] + pixels[].  Production view applies
- *                gamma + Floyd-Steinberg from intensity[] into
- *                pixels[]; debug overlays read Hit[] directly.
- *
- * Rendering    : One ray per terminal cell.  GLYPH from Paul Bourke's
- *                92-character ASCII ramp (from " " to "@", measured
- *                by ink density).  COLOUR from the active theme's
- *                8-band luma palette (the 92 ramp slots are grouped
- *                into 8 colour bands).  Floyd-Steinberg dithering
- *                hides the ~1% quantisation step between adjacent
- *                ramp slots — smooth gradients stay smooth.
- *
- * Performance  : ~5 SDF evals per hit pixel (1 trace step at hit + 4
- *                tetrahedral normal samples).  Per-march-step: ~20-100
- *                evals depending on grazing.  At 80×24 terminal, ~50K
- *                SDF evals per frame.  Holds 24 fps.  Floyd-Steinberg
- *                pass is one extra full-canvas scan.
- *
- * References   :
- *   • Hart, J. C. (1996) — "Sphere Tracing: A Geometric Method for
- *     the Antialiased Ray Tracing of Implicit Surfaces", *Visual
- *     Computer* 12(10):527-545.  The march loop.
- *   • Quílez, I. — "Distance Functions" (the catalogue):
- *     https://iquilezles.org/articles/distfunctions/
- *     Source for all 17 primitives in §6..§9.
- *   • Floyd & Steinberg (1976) — "An Adaptive Algorithm for Spatial
- *     Greyscale", *Proceedings of the SID* 17(2):75-77.  The
- *     dithering pattern (§14).
- *   • Bourke, P. — "ASCII art" character ramp:
- *     https://paulbourke.net/dataformats/asciiart/
- *     The 92-char ink-density-ordered ramp used in §13.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * One renderer, seventeen geometries.  The renderer doesn't know the
- * difference between a sphere and a hex prism — it asks a question
- * ("how far am I from the surface, given size s?") through a function
- * pointer in a table.  The table entry knows.  Cycling primitives
- * with Tab swaps which row of the table is active; the renderer's
- * machine code is identical from one frame to the next.  The 17
- * entries cover the standard library of analytical SDFs: spheres,
- * boxes, tori, capsules, cones, polyhedra, extruded 2-D shapes.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a museum gallery: one rotating turntable, seventeen
- * sculptures.  An attendant stands in the centre and answers the
- * single question "how far is your sculpture from this point in
- * space?" — they swap which sculpture they describe each time the
- * curator (Tab key) walks by.  The visitor (the ray) doesn't care
- * about the swap; they just keep asking and walking the safe distance
- * the answer gives them.  When the answer is essentially zero, the
- * visitor has touched the surface and the lighting / colour pipeline
- * decides which character + theme colour to paint.
- *
- * Function-pointer dispatch in cross-section:
- *
- *      Tab / t / T
- *           │
- *           ▼
- *      active prim index ─────►  k_prims[i].sdf  ──────►  pure math
- *           │                          │                    (one of
- *           │                          │                     17 SDFs)
- *           │                          │
- *           ▼                          ▼
- *      sphere_trace loop:       returns distance estimate
- *        p = ro + t·rd                    │
- *        d = k_prims[i].sdf(p, s) ◄───────┘
- *        if d < ε:  HIT              (whole inner loop unchanged
- *        if t > MAX: MISS             whether i = SPHERE or HEX_PRISM)
- *        t += d
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- * Once per frame:
- *   1. tick           advance Y-spin angle ry by rot_spd · dt
- *                     X-tilt is implicit: rx = ry · ROT_X_RATIO (0.37)
- *                     The irrational ratio gives a quasi-periodic
- *                     orbit that visits every face/edge/vertex.
- *
- * Once per pixel:
- *   2. ray            primary ray from camera through cell, aspect-corr
- *   3. tumble         rotate the SAMPLE POINT (not the cube) — see
- *                     raymarcher_cube.c Tutorial T5 for the trick
- *   4. trace          sphere-march using k_prims[active].sdf
- *   5. on hit:        4-tap tetrahedral normal (see raymarcher_cube T6)
- *                     Phong intensity (KA + KD·N·L + KS·(R·V)^SHIN)
- *
- * Once per cell (production view):
- *   6. gamma          v ← v^(1/2.2)        (linear → perceptual)
- *   7. quantise       v → 1 of 92 ramp indices via LUT
- *   8. dither         distribute quantisation error to 4 neighbours
- *                     (Floyd-Steinberg)
- *   9. emit           glyph = bourke_ramp[idx]
- *                     colour = lumi_attr(idx · LUMI_N / 92)
- *
- * KEY FORMULAS
- * ────────────
- * Sphere SDF (canonical):
- *      f(p) = |p| − r
- *
- * Box SDF (Quílez exact):
- *      q = |p| − b              (component-wise abs and subtract)
- *      d = |max(q, 0)| + min(max(q.x, q.y, q.z), 0)
- *
- * Torus SDF (radial reduction):
- *      r_xz = |(p.x, p.z)| − R    (distance to centre circle)
- *      d    = |(r_xz, p.y)| − r   (distance to tube around it)
- *
- * Capsule SDF (line-segment distance):
- *      h = clamp((p−a)·(b−a) / |b−a|², 0, 1)
- *      d = |(p − a) − (b − a)·h| − r
- *
- * Tetrahedron normal (4-tap finite difference):
- *      k = {(+,−,−), (−,+,−), (−,−,+), (+,+,+)}
- *      N = normalise( Σ kᵢ · sdf(p + ε · kᵢ) )
- *
- * Phong intensity:
- *      I = KA + KD · max(0, N·L) + KS · max(0, R·V)^SHIN
- *      R = 2 · (N·L) · N − L
- *
- * Pixel → ray (cell at column px, row py, canvas cw × ch):
- *      u =  (px + 0.5) / cw · 2 − 1
- *      v = −(py + 0.5) / ch · 2 + 1
- *      rd = normalise(u · F, v · F · aspect, −1)
- *      F  = FOV_HALF_TAN, aspect = (ch · CELL_ASPECT) / cw
- *
- * Tumble (rotation of the query point):
- *      p ← rot_x( rot_y(p, ry), rx )       rx = ry · ROT_X_RATIO
- *
- * Gamma correction:
- *      v_perceptual = v_linear ^ (1 / 2.2)
- *
- * Floyd-Steinberg dithering (4-neighbour error diffusion):
- *      err = v − quantised_value(v)
- *      buf[x+1, y    ] += err · 7/16
- *      buf[x−1, y + 1] += err · 3/16
- *      buf[x  , y + 1] += err · 5/16
- *      buf[x+1, y + 1] += err · 1/16
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Some primitives (cone, pyramid) are NOT Lipschitz-1 globally —
- *     their SDF is a true distance only inside a bounding region,
- *     and far-away rays can step past the surface.  RM_MAX_DIST = 20
- *     catches escaped rays.
- *
- *   • The triangle SDF requires CCW vertex winding: at interior
- *     points the cross products (edge × q-vertex) are POSITIVE.  We
- *     test `> 0` for the inside flag (the original `< 0` test was a
- *     winding bug — fixed earlier — that made the triangle render
- *     hollow).  See sdf_triangle in §9.
- *
- *   • RM_HIT_EPS = 0.002 is in world units.  Tighter ε gives sharper
- *     edges but more steps; RM_MAX_STEPS = 100 caps the budget.  At
- *     grazing angles the marcher can stall — visible "haloing" along
- *     silhouettes.
- *
- *   • Bourke ramp has 92 chars (~1% intensity per slot).  Without
- *     dithering you'd see distinct bands; with FS dithering the bands
- *     dissolve into noise the eye reads as a continuous gradient.
- *
- *   • Plane / Triangle / Quad pre-tilt their query point by ~0.52
- *     rad (~30°) so the tumble shows the FACE rather than just the
- *     edge.  At rot=0 a flat shape would be edge-on and invisible.
- *
- *   • shade_to_terminal allocates a malloc PER FRAME.  On alloc
- *     failure it falls back to direct linear mapping (no dither, no
- *     gamma).  Visually noticeable but the program keeps running.
- *
- *   • The ROT_X_RATIO = 0.37 is irrational on purpose — a rational
- *     ratio (e.g. 0.5) makes the tumble close back on itself
- *     periodically and you'd never see some faces.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Press Tab through all 17 primitives without resizing.  Every
- *     shape should re-centre and re-orient automatically; if a shape
- *     drifts off-centre, its wrapper's translation is wrong.
- *
- *   • Pause (space) and watch the Phong highlight: a single bright
- *     spot should sit on the side facing LIGHT = (−3, 3.5, 2.5).
- *     Its position is independent of rotation — only the OBJECT
- *     turns under it.
- *
- *   • +/- doubles/halves apparent size by PRIM_SIZE_STEP = 1.15.
- *     Verify the silhouette grows/shrinks but the centre stays put.
- *
- *   • Set rot_spd to 0 (R repeatedly): image freezes.  No jitter
- *     means rm_normal is stable.  Jitter ⇒ RM_NORM_EPS too small.
- *
- *   • Sphere is the canonical test: at default size the silhouette
- *     should be a perfect ellipse (terminal aspect 2:1) with smooth
- *     Phong fall-off.  Visible banding ⇒ Floyd-Steinberg broken;
- *     flat shading ⇒ rm_normal returning a constant.
- *
- *   • Press d to cycle debug overlays.  NORMALS shows raw geometry
- *     hue (no lighting); DEPTH shows hit-distance brightness; STEPS
- *     shows where the marcher took many iterations (silhouette).
- *
- *   • Press t to cycle themes.  Geometry stays put; only colour
- *     ramp and HUD bg change.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL — nine short answers ────────────────────────────── *
- *
- *
- * T1: Why a function-pointer table?
- * ─────────────────────────────────
- * Naïve approach: one big switch in the renderer:
- *
- *      float scene_sdf(V3 p, int prim, float s) {
- *          switch (prim) {
- *          case 0: return sdf_sphere(p, s);
- *          case 1: return sdf_box(p, ...);
- *          ...
- *          }
- *      }
- *
- * Two problems: every renderer touchpoint has the switch, and adding
- * a new primitive means editing the renderer.  The function-pointer
- * approach moves dispatch into a table:
- *
- *      typedef struct { const char *name;
- *                       float (*sdf)(V3 p, float s); } Prim;
- *      static const Prim k_prims[N_PRIMS] = {
- *          { "Sphere", w_sphere },
- *          { "Box",    w_box    },
- *          ...
- *      };
- *
- * Now the renderer just calls `k_prims[active].sdf(p, s)`.  Adding
- * a new primitive: write the SDF, write a wrapper, add ONE row to
- * k_prims.  No renderer change.
- *
- * Cost: one indirect call per SDF evaluation.  At -O2 the compiler
- * can sometimes inline through a constant-table lookup, but here
- * `active` is runtime-variable, so we pay the indirect-call cost.
- * Negligible — the call cost is dwarfed by the SDF body.
- *
- *
- * T2: The two-axis tumble — irrational ratio for full coverage
- * ────────────────────────────────────────────────────────────
- * One axis of rotation reveals only a single ring of orientations.
- * Two perpendicular axes reveal a 2-D family of orientations — but
- * if the speeds are RATIONALLY related (e.g. 1:2), the orbit on the
- * 2-torus closes back on itself periodically and you never visit
- * many points.
- *
- * Solution: make the speed ratio IRRATIONAL.  We use:
- *
- *      ry = scene_time · rot_spd
- *      rx = ry · 0.37       ← irrational ratio (= ROT_X_RATIO)
- *
- * Now the (ry mod 2π, rx mod 2π) trajectory on the 2-torus is a
- * QUASI-PERIODIC ORBIT — never exactly closing — and over time it
- * fills the surface densely.  Wait long enough and every face,
- * edge, and vertex of the primitive faces the camera.
- *
- * The constant 0.37 is arbitrary; any irrational ratio works.  We
- * just want NOT a small-integer ratio.
- *
- *
- * T3: The simplest SDF — sphere
- * ─────────────────────────────
- * For a sphere of radius r centred at origin:
- *
- *      f(p, r) = |p| − r          (one line of math)
- *
- *      |p| > r:  outside, distance to surface = |p| − r
- *      |p| = r:  on the surface
- *      |p| < r:  inside, negative distance
- *
- * That's it.  Lipschitz-1 (true Euclidean distance), so sphere
- * tracing converges in two steps for a head-on ray.  The sphere
- * is the "hello world" of distance functions — every other SDF
- * in this file is more involved.
- *
- *
- * T4: Box SDF — outside + inside terms
- * ────────────────────────────────────
- * Quílez's exact box SDF for a box of half-extents b:
- *
- *      q = |p| − b              (component-wise)
- *      d = |max(q, 0)|      +   min(max(q.x, q.y, q.z), 0)
- *          └ outside ─┘         └ inside (negative inside) ──┘
- *
- * Two regimes:
- *   q has at least one positive component → p is OUTSIDE the box
- *      max(q,0) keeps only the positive parts; |max(q,0)| is the
- *      Euclidean distance to the nearest face/edge/corner.
- *      The inside term is min(positive, 0) = 0 → no contribution.
- *
- *   all q < 0 → p is INSIDE the box
- *      max(q,0) is the zero vector → outside term = 0.
- *      max(q.x, q.y, q.z) is the LEAST-NEGATIVE q (the closest face
- *      from inside); min(negative, 0) = negative → returns a negative
- *      distance.
- *
- * Same code handles both regimes — that's the elegance.  Round box
- * is sdf_box(p, b−r) − r (offset surface).  Box frame is three
- * thin slabs Booleaned together.  Hex prism is a 6-fold symmetric
- * variant.  All in §6.
- *
- *
- * T5: Torus SDF — two-step radial reduction
- * ─────────────────────────────────────────
- * A torus is the surface of revolution of a circle of radius r
- * around a circle of radius R (the centre line of the tube).
- *
- *      r_xz   = |(p.x, p.z)| − R       (distance from p to centre circle)
- *      d      = |(r_xz, p.y)| − r       (distance from p to tube)
- *
- * Step 1: project p onto the XZ plane and measure how far it is
- *         from the centre circle of radius R.  This is the "ring
- *         distance" — positive outside, negative inside the donut
- *         hole region.
- *
- * Step 2: combine that ring distance with the height p.y to get the
- *         distance to the tube of radius r centred on the ring.
- *
- * Capped torus and link extend the same idea with extra clamping
- * (to make the torus an open arc) or extrusion (to make a chain
- * link).  All in §7.
- *
- *
- * T6: Cone, capsule, cylinder — segment-based distances
- * ─────────────────────────────────────────────────────
- * For shapes built around a LINE SEGMENT (capsule), a CIRCULAR FACE
- * (cylinder), or a TILTED LINE (cone), the SDF reduces to "distance
- * from p to the closest point on the segment/cap/edge, minus a
- * radius".
- *
- * Capsule (segment from a to b, radius r):
- *      h = clamp((p − a) · (b − a) / |b − a|², 0, 1)
- *      closest_on_segment = a + (b − a) · h
- *      d = |p − closest_on_segment| − r
- *
- * The clamp ensures the closest point sits within [a, b]; outside
- * that range the closest point is one of the endpoints.  The result
- * is a stadium-like swept-sphere shape.
- *
- * Cylinder = capsule with flat caps (extra max with cap distance).
- * Cone = tilted line capsule with a varying radius along its length.
- * Round cone = cone whose two endpoints have different radii (drips,
- * bullets, etc.).  All in §8.
- *
- *
- * T7: Polyhedra and 2-D extruded slabs
- * ────────────────────────────────────
- * Octahedron, pyramid: SDFs derived from the geometry of the
- * specific polyhedron — a few dot products to project p onto the
- * appropriate face, then a clamped distance.  These are the
- * trickiest closed-form SDFs in the file (octahedron exploits the
- * |x|+|y|+|z| = const symmetry; pyramid uses several halfspace
- * tests with explicit case analysis).
- *
- * Plane (rendered as a finite disc), triangle, quad: take the 2-D
- * shape's SDF in the XZ plane, then extrude it along Y by a
- * thickness:
- *
- *      d_xz = sdf_2d(p.x, p.z)            (distance in the plane)
- *      d_y  = |p.y| − thickness/2
- *      d    = min(max(d_xz, d_y), 0) + |max((d_xz, d_y), 0)|
- *
- * That last formula is the standard extrusion combining 2-D and
- * height SDFs.  All in §9.
- *
- * The triangle SDF has one subtlety: a winding-direction test for
- * "is this point inside the triangle".  Our vertices are wound CCW
- * (top, bottom-left, bottom-right), so the cross-product sign at
- * interior points is POSITIVE — the inside test uses `> 0`, not
- * `< 0`.  Earlier code had the wrong sign and the triangle rendered
- * HOLLOW (only the perimeter edges hit).  Fixed.
- *
- *
- * T8: Tetrahedron normal — 4-tap finite difference
- * ────────────────────────────────────────────────
- * For ANY SDF, the gradient ∇f points OUTWARD from the surface, so
- * N = ∇f / |∇f|.  We approximate ∇f via finite differences.  The
- * cube file (raymarcher_cube.c, Tutorial T6) explained why 4-tap
- * tetrahedral beats 6-tap central differences for sharp edges:
- *
- *      k₀ = ( ε, −ε, −ε)
- *      k₁ = (−ε,  ε, −ε)        (no two share an axis)
- *      k₂ = (−ε, −ε,  ε)
- *      k₃ = ( ε,  ε,  ε)
- *      N  = normalise( Σ kᵢ · sdf(p + kᵢ) )
- *
- * 4 SDF evals per hit pixel.  Normal is sharp at edges (no blur
- * from straddling adjacent faces).
- *
- *
- * T9: Bourke ramp + gamma + Floyd-Steinberg dithering
- * ───────────────────────────────────────────────────
- * Three tricks combine to produce smooth ASCII gradients.
- *
- *   PAUL BOURKE'S 92-CHAR RAMP.  Most SDF demos use 8-13 characters
- *   for shading.  Bourke measured the ACTUAL ink density of every
- *   printable ASCII character and ranked them from sparsest (' ') to
- *   densest ('@'), giving a 92-element ramp.  See the literal ramp
- *   in the k_ramp[] declaration at §13.
- *
- *   With 92 levels we have ~1% intensity quantisation per slot,
- *   instead of ~12.5% with 8 slots.  Much finer gradient.
- *
- *   GAMMA CORRECTION.  Terminal displays are NON-LINEAR.  An RGB
- *   value of 0.5 doesn't render at half brightness — it renders at
- *   roughly 0.5^2.2 ≈ 0.22 brightness (gamma 2.2).  Without
- *   correction, Phong's linear-light intensity values look too DARK
- *   on screen.  Apply v ← v^(1/2.2) before quantising.
- *
- *   FLOYD-STEINBERG DITHERING.  Even at 92 slots, smooth gradients
- *   show subtle banding.  Floyd & Steinberg (1976): when you
- *   QUANTISE a pixel, distribute the ROUNDING ERROR to four
- *   neighbours that haven't been quantised yet:
- *
- *       quantised pixel       raw error e = v_true − v_quant
- *            ●─────────────────►  +e · 7/16
- *           ╱│╲
- *          ╱ │ ╲
- *      e·3/16 e·5/16 e·1/16
- *         ↙   ↓   ↘
- *
- *   The error is "pushed forward" so the LOCAL AVERAGE of any
- *   region's brightness stays correct, even though individual
- *   pixels are quantised.  The eye sees a smooth gradient because
- *   the high-frequency quantisation noise averages out across a
- *   small visual neighbourhood.
- *
- *   All three live in shade_to_terminal (§14).
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* End of textbook.  The rest of the file is the worked exercises. */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -582,18 +45,20 @@ enum {
 /* §1.2 cell aspect (terminal cells are ~2× as tall as wide). */
 #define CELL_ASPECT 2.0f
 
-/* §1.3 sphere-trace tunables. */
-#define RM_MAX_STEPS 100
-#define RM_HIT_EPS 0.002f
-#define RM_MAX_DIST 20.0f
-#define RM_NORM_EPS 0.001f
+/* §1.3 ray-march tuning. */
+#define RM_MAX_STEPS 100       /* give up after this many steps along one ray  */
+#define RM_HIT_EPS 0.002f      /* this close counts as "touched the surface"   */
+#define RM_MAX_DIST 20.0f      /* if a ray gets this far out, it hit nothing   */
+#define RM_NORM_EPS 0.001f     /* how far apart the points we sample to find the facing (§11) */
+#define RM_T_START 0.05f       /* start a bit down the ray so it can't "hit" at the eye */
+#define RM_TETRA_SCALE 0.5773f /* ≈1/√3: scales the ±1 tetra corners (cancels in normalise) */
 
 /* §1.4 camera (zoom). */
 #define CAM_Z_DEFAULT 4.5f
-#define CAM_Z_MIN 3.0f /* keep camera outside SIZE_MAX prim */
+#define CAM_Z_MIN 3.0f /* nearest zoom — keeps the eye outside the biggest shape */
 #define CAM_Z_MAX 12.0f
 #define CAM_ZOOM_STEP 0.30f
-#define FOV_HALF_TAN 0.65f
+#define FOV_HALF_TAN 0.65f /* how wide the lens sees; bigger = wider */
 
 /* §1.5 primitive size. */
 #define PRIM_SIZE_DEFAULT 1.0f
@@ -601,50 +66,51 @@ enum {
 #define PRIM_SIZE_MIN 0.2f
 #define PRIM_SIZE_MAX 3.0f
 
-/* §1.6 two-axis tumble (T2).
- *      ROT_Y_SPD_DEFAULT  fast Y spin rate (rad/sec)
- *      ROT_X_RATIO        irrational ratio for X tilt (rx = ry · ratio)
- */
+/* §1.6 the tumble: how fast it spins around the up axis, plus a sideways tilt
+ * that follows at rx = ry · ratio.  The ratio is deliberately not a tidy
+ * fraction, so the spin never loops and every side eventually faces you. */
 #define ROT_Y_SPD_DEFAULT 0.60f
 #define ROT_X_RATIO 0.37f
 #define ROT_SPD_STEP 1.3f
 #define ROT_SPD_MIN 0.0f
 #define ROT_SPD_MAX 5.0f
 
-/* §1.7 fixed light position — three-point side key.  Object rotates;
- * the light never moves. */
+/* §1.7 where the light sits — off to one side and above.  The shape turns;
+ * the light stays put. */
 #define LIGHT_X -3.0f
 #define LIGHT_Y 3.5f
 #define LIGHT_Z 2.5f
 
-/* §1.8 Phong shading coefficients. */
-#define KA 0.10f
-#define KD 0.78f
-#define KS 0.55f
-#define SHIN 40.0f
+/* §1.8 how much each kind of light counts when shading a spot (see §11). */
+#define KA 0.10f   /* a little glow everywhere, so nothing is pure black  */
+#define KD 0.78f   /* brightness from facing the light                    */
+#define KS 0.55f   /* shiny-highlight strength                            */
+#define SHIN 40.0f /* highlight tightness — bigger = smaller, sharper spot */
+
+/* §1.8b display gamma — terminals don't show brightness evenly, so we bend the
+ * shaded values to compensate before turning them into characters (§14). */
+#define DISPLAY_GAMMA 2.2f
 
 /* §1.9 time helpers. */
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* §1.10 luma slot count + colour pair IDs.
- *
- * The 92-slot Bourke ramp's output index is grouped down to LUMI_N
- * = 8 colour bands (idx · LUMI_N / 92).  HUD/HINT pairs are theme-
- * independent yellow + cyan per the CLAUDE.md HUD spec.
- */
+/* §1.10 brightness bands + colour-pair slots.  The 92-step character ramp is
+ * grouped down to 8 colour bands; the HUD gets its own yellow + cyan. */
 enum {
   LUMI_N = 8,
   PAIR_HUD = LUMI_N + 1,
   PAIR_HINT = LUMI_N + 2,
 };
 
-/* §1.11 themes — six 8-band 256-colour ramps.  Per CLAUDE.md every
- * entry sits in the bright half of the 256-cube. */
+/* §1.11 colour themes — a name plus 8 colour codes running dark→bright.  c/C
+ * picks which one is active; the shapes and shading never change.  Every colour
+ * sits in the bright half of the 256-colour set so even the dimmest stays
+ * visible on black. */
 typedef struct {
-  const char *display_name;
-  short ramp_256[LUMI_N];
+  const char *display_name; /* shown in the HUD, padded to a fixed width */
+  short ramp_256[LUMI_N];   /* 8 xterm-256 codes, dark to bright         */
 } Theme;
 
 #define THEME_COUNT 6
@@ -658,12 +124,13 @@ static const Theme THEMES[THEME_COUNT] = {
     {"COPPER  ", {94, 130, 136, 166, 172, 208, 214, 220}},
 };
 
-/* §1.12 debug overlays — d / D cycles between them. */
+/* §1.12 the views you flip through with d / D — the normal lit shape, plus
+ * three that paint a raw fact instead of shading it. */
 typedef enum {
-  DEBUG_NORMAL = 0,  /* full lit primitive (production view)   */
-  DEBUG_NORMALS = 1, /* surface normal direction → colour band */
-  DEBUG_DEPTH = 2,   /* hit distance t → brightness            */
-  DEBUG_STEPS = 3,   /* march iteration count → brightness     */
+  DEBUG_NORMAL = 0,  /* the normal, fully-lit shape                */
+  DEBUG_NORMALS = 1, /* colour by which way the surface faces      */
+  DEBUG_DEPTH = 2,   /* brighter = closer to the camera            */
+  DEBUG_STEPS = 3,   /* brighter = the ray took more steps to land */
   DEBUG_MODE_COUNT = 4,
 } DebugMode;
 
@@ -674,7 +141,8 @@ static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
     "STEPS  ",
 };
 
-/* ── §2 clock — monotonic timer + sleep ──────────────────────────────── */
+/* ── §2 clock — read the time and sleep ──────────────────────────────── *
+ * We use the monotonic clock because it only ever counts forward. */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -688,7 +156,10 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ── §3 color — themes + HUD/hint pairs ──────────────────────────────── */
+/* ── §3 color — themes + HUD colours ─────────────────────────────────── *
+ * Hands ncurses the theme's 8 shades plus the two HUD colours, at startup and
+ * on theme change.  Terminals with fewer than 256 colours fall back to white,
+ * faking bright/dim with bold/dim. */
 
 static void theme_apply(int theme_index) {
   if (theme_index < 0 || theme_index >= THEME_COUNT)
@@ -731,7 +202,9 @@ static attr_t lumi_attr(int l) {
   return a;
 }
 
-/* ── §4 vec2 / vec3 — value-type math ────────────────────────────────── */
+/* ── §4 vec2 / vec3 — 2-D and 3-D vector helpers ─────────────────────── *
+ * Everything from here through §11 is pure math: it reads its inputs and
+ * returns an answer, touching no shared state and no screen. */
 
 typedef struct {
   float x, y;
@@ -772,16 +245,19 @@ static inline V3 v3norm(V3 a) {
   return l > 1e-7f ? v3mul(a, 1.f / l) : v3(0, 0, 1);
 }
 
+/* bounce direction v off a surface that faces way n (n must be unit length) —
+ * used to find where light reflects toward the eye (§11). */
+static inline V3 v3reflect(V3 v, V3 n) {
+  return v3sub(v3mul(n, 2.f * v3dot(n, v)), v);
+}
+
 static inline float clmpf(float v, float lo, float hi) {
   return fmaxf(lo, fminf(hi, v));
 }
 
-/* ── §5 rotation — rot_y, rot_x, tumble (T2) ─────────────────────────── *
- *
- * rot_y / rot_x rotate a 3-D point around Y or X.  tumble applies
- * Y first, then X — the order matters: applying X-then-Y produces
- * different behaviour at large angles.
- */
+/* ── §5 rotation — spin a point around the up or sideways axis ────────── *
+ * tumble spins around Y (up), then X (sideways).  The order matters — doing X
+ * first looks different at large angles. */
 
 static inline V3 rot_y(V3 p, float a) {
   float c = cosf(a), s = sinf(a);
@@ -792,40 +268,41 @@ static inline V3 rot_x(V3 p, float a) {
   return v3(p.x, c * p.y - s * p.z, s * p.y + c * p.z);
 }
 
-/* tumble — apply Y rotation then X rotation to the SAMPLE POINT.
- * Equivalent to spinning the primitive in the OPPOSITE direction
- * (see raymarcher_cube.c Tutorial T5 for the "rotate the question,
- * not the answer" framing). */
+/* tumble — spin the SAMPLE POINT around Y then X.  Spinning the point one way
+ * is the same as spinning the shape the other way: the renderer rotates the
+ * question, not the shape (see raymarcher_cube.c for the trick). */
 static inline V3 tumble(V3 p, float ry, float rx) {
   return rot_x(rot_y(p, ry), rx);
 }
 
-/* ── §6 SDFs A — sphere + box family (T3, T4) ────────────────────────── *
+/* ── §6 shapes A — sphere + box family ───────────────────────────────── *
+ * §6–§9 are the 17 shape functions.  Each takes a point and returns how far it
+ * is from that shape's surface (negative inside, zero on
+ * it, positive outside) — the one number the ray march needs.  All from Iñigo
+ * Quílez's catalogue.
  *
- * Five primitives built around |p| − something:
- *   sphere       canonical |p| − r
- *   box          Quílez exact box (outside + inside terms)
- *   round box    box with offset surface (subtract r at the end)
- *   box frame    three thin slabs Booleaned together
- *   hex prism    six-fold symmetric cylinder
- */
+ *   sphere     distance is just |point| − radius
+ *   box        nearest face/edge/corner outside, nearest face inside
+ *   round box  a box with its surface pushed out, so the edges round off
+ *   box frame  only the twelve edges of a box (three thin slabs)
+ *   hex prism  a six-sided bar */
 
-/* 1. Sphere of radius r at the origin. */
+/* 1. Sphere of radius r. */
 static float sdf_sphere(V3 p, float r) { return v3len(p) - r; }
 
-/* 2. Box of half-extents b.  T4 derived this. */
+/* 2. Box reaching b on each axis. */
 static float sdf_box(V3 p, V3 b) {
   V3 q = v3sub(v3abs(p), b);
   return v3len(v3max0(q)) + fminf(fmaxf(q.x, fmaxf(q.y, q.z)), 0.f);
 }
 
-/* 3. Round Box — box(p, b) − r offsets the surface outward. */
+/* 3. Round box — a box (size b) with its surface pushed out by r, rounding the edges. */
 static float sdf_round_box(V3 p, V3 b, float r) {
   V3 q = v3sub(v3abs(p), b);
   return v3len(v3max0(q)) + fminf(fmaxf(q.x, fmaxf(q.y, q.z)), 0.f) - r;
 }
 
-/* 4. Box Frame — three thin slabs (one per principal axis pair). */
+/* 4. Box frame — just the box's edges: three thin slabs, keep whichever is nearest. */
 static float sdf_box_frame(V3 p, V3 b, float e) {
   V3 pa = v3sub(v3abs(p), b);
   V3 q = v3sub(v3abs(v3add(pa, v3(e, e, e))), v3(e, e, e));
@@ -838,7 +315,7 @@ static float sdf_box_frame(V3 p, V3 b, float e) {
   return fminf(fminf(d0, d1), d2);
 }
 
-/* 10. Hex Prism — hexagonal cross-section, height ry. */
+/* 10. Hex prism — a six-sided bar; rx sizes the hexagon, ry its length. */
 static float sdf_hex_prism(V3 p, float rx, float ry) {
   const float kx = -0.8660254f, ky = 0.5f, kz = 0.57735f;
   V3 q = v3abs(p);
@@ -853,25 +330,20 @@ static float sdf_hex_prism(V3 p, float rx, float ry) {
   return fminf(fmaxf(dv.x, dv.y), 0.f) + v2len(v2max0(dv));
 }
 
-/* ── §7 SDFs B — torus family (T5, radial reduction) ─────────────────── *
- *
- * Three primitives built by reducing 3-D distance to 2-D distance
- * via the radial-projection trick:
- *   torus            full revolution of a circle
- *   capped torus     partial arc (controlled by sx, cx of half-angle)
- *   link             torus extruded into a chain link
- */
+/* ── §7 shapes B — the torus family ──────────────────────────────────── *
+ * Rings and loops.  The trick: collapse the 3-D distance to a 2-D one by first
+ * measuring how far the point is from the ring's centre circle.
+ *   torus         a full donut
+ *   capped torus  a donut with a slice missing (an arc)
+ *   link          a stretched donut, like one link of a chain */
 
-/* 5. Torus in XZ plane, ring radius R, tube radius r.  T5 derived this. */
+/* 5. Torus (donut): ring radius R, tube radius r. */
 static float sdf_torus(V3 p, float R, float r) {
   return v2len(v2(v2len(v2(p.x, p.z)) - R, p.y)) - r;
 }
 
-/*
- * 6. Capped Torus — partial arc.  The (sx, cx) pair encodes
- * (sin, cos) of the arc's half-angle.  Folds p.x into +X so the
- * arc is symmetric, then uses a piecewise distance.
- */
+/* 6. Capped torus — a donut with a slice cut out.  sx, cx are the sine and
+ * cosine of how wide the remaining arc is. */
 static float sdf_capped_torus(V3 p, float ra, float rb, float sx, float cx) {
   p.x = fabsf(p.x);
   float k = (cx * p.x > sx * p.y) ? v2dot(v2(p.x, p.y), v2(cx, sx))
@@ -879,30 +351,24 @@ static float sdf_capped_torus(V3 p, float ra, float rb, float sx, float cx) {
   return sqrtf(v3dot(p, p) + ra * ra - 2.f * ra * k) - rb;
 }
 
-/*
- * 7. Link — chain link.  le = half-length of straight section;
- * r1 = link radius (the loop part); r2 = tube radius.
- */
+/* 7. Link — one chain link.  le = how stretched it is, r1 = loop radius,
+ * r2 = tube thickness. */
 static float sdf_link(V3 p, float le, float r1, float r2) {
   V3 q = v3(p.x, fmaxf(fabsf(p.y) - le, 0.f), p.z);
   return v2len(v2(v2len(v2(q.x, q.y)) - r1, q.z)) - r2;
 }
 
-/* ── §8 SDFs C — cone + capsule + cylinder (T6, segment-based) ───────── *
- *
- * Four primitives whose distance reduces to "closest point on a line
- * segment" plus a radius:
- *   cone           tilted line with varying radius along length
- *   plane (disc)   thin extruded disc
- *   capsule        swept sphere along a segment
- *   cylinder       capsule with flat caps
- *   round cone     cone with two different endpoint radii
- */
+/* ── §8 shapes C — cones, capsules, cylinders ────────────────────────── *
+ * Shapes built around a line: find the closest point on the line, then step a
+ * fixed radius out from it.
+ *   cone        a tilted line whose radius shrinks to a point
+ *   plane       a thin disc (so a flat plane has something to show)
+ *   capsule     a pill: a sphere swept along a line
+ *   cylinder    a capsule with flat ends
+ *   round cone  a cone with rounded ends of different sizes (a drip) */
 
-/*
- * 8. Cone — apex at y=0, base at y=−h.  (si, co) = (sin, cos) of
- * the half-angle.  IQ exact formula (verbatim from the GLSL source).
- */
+/* 8. Cone — point at the top, circular base h below it.  si, co are the sine
+ * and cosine of how wide it flares.  (Quílez's exact formula, kept verbatim.) */
 static float sdf_cone(V3 p, float si, float co, float h) {
   V2 q = v2(h * si / co, -h);
   V2 w = v2(v2len(v2(p.x, p.z)), p.y);
@@ -914,17 +380,14 @@ static float sdf_cone(V3 p, float si, float co, float h) {
   return sqrtf(d) * (s >= 0.f ? 1.f : -1.f);
 }
 
-/*
- * 9. Plane (rendered as a thin disc so it has visible silhouette).
- * Disc of radius R, thickness t, in the XZ plane.
- */
+/* 9. Plane — drawn as a thin disc (radius R, thickness t) so it actually shows. */
 static float sdf_plane_disc(V3 p, float R, float t) {
   float r2d = v2len(v2(p.x, p.z)) - R;
   float ry = fabsf(p.y) - t;
   return fminf(fmaxf(r2d, ry), 0.f) + v2len(v2max0(v2(r2d, ry)));
 }
 
-/* 11. Capsule — swept sphere from a to b, radius r.  T6 derived. */
+/* 11. Capsule (pill): a sphere of radius r swept from point a to point b. */
 static float sdf_capsule(V3 p, V3 a, V3 b, float r) {
   V3 pa = v3sub(p, a), ba = v3sub(b, a);
   float h = clmpf(v3dot(pa, ba) / v3dot(ba, ba), 0.f, 1.f);
@@ -937,10 +400,8 @@ static float sdf_cylinder(V3 p, float h, float r) {
   return fminf(fmaxf(d.x, d.y), 0.f) + v2len(v2max0(d));
 }
 
-/*
- * 13. Round Cone — bottom radius r1, top radius r2, height h.
- * Three regions: spherical bottom cap, conical sides, spherical top.
- */
+/* 13. Round cone — a cone with rounded ends: radius r1 at the bottom, r2 at the
+ * top, height h.  Three parts: round bottom, straight sides, round top. */
 static float sdf_round_cone(V3 p, float r1, float r2, float h) {
   V2 q = v2(v2len(v2(p.x, p.z)), p.y);
   float b = (r1 - r2) / h, a = sqrtf(1.f - b * b), k = v2dot(q, v2(-b, a));
@@ -951,20 +412,16 @@ static float sdf_round_cone(V3 p, float r1, float r2, float h) {
   return v2dot(q, v2(a, b)) - r1;
 }
 
-/* ── §9 SDFs D — polyhedra + 2-D extruded slabs (T7) ─────────────────── *
- *
- * Five primitives built from explicit polyhedron geometry or from
- * 2-D shapes extruded along Y:
- *   octahedron     |x|+|y|+|z| symmetry
- *   pyramid        explicit halfspace tests + face projection
- *   triangle       2-D equilateral triangle extruded (slab)
- *   quad           2-D rectangle extruded (slab)
- */
+/* ── §9 shapes D — solids with flat faces, and flat slabs ────────────── *
+ * The trickier ones: solids with flat faces, and flat 2-D shapes given a little
+ * thickness so they aren't invisibly thin.
+ *   octahedron  two square pyramids base-to-base
+ *   pyramid     square base, apex on top
+ *   triangle    a flat triangle with thickness
+ *   quad        a flat rectangle with thickness */
 
-/*
- * 14. Octahedron — exploits the L¹ norm |x|+|y|+|z| = const.
- * Three cases by which face is closest, plus a degenerate centre case.
- */
+/* 14. Octahedron (two pyramids base-to-base), size s.  It checks which of the
+ * eight slanted faces is nearest, with a fallback near the centre. */
 static float sdf_octahedron(V3 p, float s) {
   V3 q = v3abs(p);
   float m = q.x + q.y + q.z - s;
@@ -981,7 +438,7 @@ static float sdf_octahedron(V3 p, float s) {
   return v3len(v3(r.x, r.y - s + k, r.z - k));
 }
 
-/* 15. Pyramid — apex at top, square base.  Several halfspace tests. */
+/* 15. Pyramid — square base, apex on top, height h. */
 static float sdf_pyramid(V3 p, float h) {
   float m2 = h * h + 0.25f;
   p.x = fabsf(p.x);
@@ -1003,16 +460,10 @@ static float sdf_pyramid(V3 p, float h) {
   return sqrtf((d2 + q.z * q.z) / m2) * (fmaxf(q.z, -p.y) >= 0.f ? 1.f : -1.f);
 }
 
-/*
- * 16. Triangle slab — equilateral 2-D triangle extruded along Y.
- *
- * Vertices are wound CCW in (x, z): top, bottom-left, bottom-right.
- * For CCW winding the cross product (edge × q-vertex) is POSITIVE
- * at interior points — the inside test below uses `> 0`.  An older
- * version used `< 0`, which made the triangle render hollow (only
- * the perimeter edges hit because the interior was reported as
- * positive distance).  T7 explained.
- */
+/* 16. Triangle with thickness.  The corners are listed anticlockwise (top,
+ * bottom-left, bottom-right).  The inside test below uses `> 0` to match that
+ * winding — an earlier `< 0` made the triangle render hollow (only its edges
+ * showed), so don't flip it. */
 static float sdf_triangle(V3 p, float sz, float thick) {
   V2 a = v2(0.f, sz);
   V2 b = v2(-sz * 0.866f, -sz * 0.5f);
@@ -1035,7 +486,7 @@ static float sdf_triangle(V3 p, float sz, float thick) {
   return fminf(fmaxf(d_xz, d_y), 0.f) + v2len(v2max0(v2(d_xz, d_y)));
 }
 
-/* 17. Quad slab — axis-aligned rectangle extruded along Y. */
+/* 17. Quad — a flat rectangle (wx by wz) with thickness. */
 static float sdf_quad(V3 p, float wx, float wz, float thick) {
   V2 q2 = v2sub(v2abs(v2(p.x, p.z)), v2(wx, wz));
   float d_xz = v2len(v2max0(q2)) + fminf(fmaxf(q2.x, q2.y), 0.f);
@@ -1043,21 +494,19 @@ static float sdf_quad(V3 p, float wx, float wz, float thick) {
   return fminf(fmaxf(d_xz, d_y), 0.f) + v2len(v2max0(v2(d_xz, d_y)));
 }
 
-/* ── §10 wrappers + prim table (T1 — function-pointer dispatch) ──────── *
+/* ── §10 wrappers + the shape table ──────────────────────────────────── *
+ * Each shape function wants its own parameters (radii, heights…); a wrapper
+ * turns the one user-facing size knob into those.  A few also pre-tilt flat
+ * shapes so they aren't edge-on (and invisible) when the spin is at zero.
  *
- * Each wrapper maps the user-controlled `s` (size) to that
- * primitive's intrinsic parameters.  Some wrappers also pre-tilt
- * the query point so flat shapes (plane, triangle, quad) face the
- * camera at rotation 0 — otherwise they'd be edge-on and invisible.
- *
- * The Prim struct + k_prims[] table is the "switch statement" of
- * the renderer, but as data instead of code.  Tab cycles the
- * active index.
- */
+ * The k_prims[] table is the renderer's "switch statement" turned into data:
+ * one row per shape, and Tab just moves which row is active. */
 
+/* Prim — one entry in the shape gallery: a display name and the function that
+ * says how far a point is from that shape's surface. */
 typedef struct {
   const char *name;
-  float (*sdf)(V3 p, float s);
+  float (*sdf)(V3 p, float s); /* distance to this shape, sized by s */
 } Prim;
 
 static float w_sphere(V3 p, float s) { return sdf_sphere(p, s); }
@@ -1087,8 +536,8 @@ static float w_link(V3 p, float s) {
   return sdf_link(p, s * .32f, s * .26f, s * .11f);
 }
 
-/* Cone: apex at top, base at bottom, centred at origin.
- * sdf_cone returns apex-at-y=0; we shift up by h/2 so midpoint = origin. */
+/* Cone: tip up, base down.  sdf_cone puts the tip at the origin, so we nudge it
+ * up to sit centred. */
 static float w_cone(V3 p, float s) {
   float h = s * 0.7f;
   V3 pp = v3(p.x, p.y + h * 0.5f, p.z);
@@ -1162,34 +611,52 @@ static const Prim k_prims[N_PRIMS] = {
     {"Quad", w_quad},              /* 17 */
 };
 
-/* ── §11 raymarch — trace + tetrahedral normal + Phong + cast_ray ────── *
+/* ── §11 raymarch — shoot one ray, return what it found ──────────────── *
+ * Given a ray and the tumbling shape, returns a Hit and changes nothing else.
  *
- * Same march loop as raymarcher.c but with k_prims[prim].sdf instead
- * of a hardcoded SDF.  The Hit struct collects per-pixel result so
- * production view + 3 debug overlays can share one render pass.
- */
+ * Same creep-along-the-ray loop as raymarcher.c, except it asks the shape table
+ * which shape to measure.  Each cell is traced once; the normal view and the
+ * three debug views all read back from the same Hit. */
 
+/* Tumbler — the primitive currently on the turntable: which of the 17 shapes,
+ * how big, how far it has turned, and how fast it spins.  cast_ray reads it
+ * (never writes); scene_tick advances `angle` by `spin` each tick.  Angle in
+ * radians, spin in radians/second, size a scalar (1.0 = default). */
 typedef struct {
-  bool hit;
-  V3 p;            /* hit position (world coords)    */
-  V3 normal;       /* unit surface normal at hit     */
-  float intensity; /* Phong result in [0, 1]         */
-  float t;         /* ray parameter at hit           */
-  int steps;       /* march iterations (AO proxy)    */
+  int prim;    /* index into k_prims[] — which shape is shown */
+  float size;  /* size knob the wrapper scales by */
+  float angle; /* how far it has turned so far (radians); the sideways tilt follows from it */
+  float spin;  /* turn speed (radians per second) */
+} Tumbler;
+
+/* Hit — what one ray found at one cell.  Filled once and stored so every view
+ * can read whatever it needs without tracing again.  When hit is false, the
+ * other fields are meaningless. */
+typedef struct {
+  bool hit;        /* did the ray reach the shape at all? */
+  V3 p;            /* where on the surface it landed */
+  V3 normal;       /* which way the surface faces there */
+  float intensity; /* brightness 0..1, for the normal view */
+  float t;         /* how far the ray travelled to get there (DEPTH view) */
+  int steps;       /* how many creep-steps it took (STEPS view) */
 } Hit;
 
-/*
- * rm_march — Hart 1996 march.  The query point gets tumbled by the
- * current rotation before each SDF evaluation (T2).  Returns t at
- * hit, -1 on miss; *out_steps gets the iteration count.
- */
+/* the point a distance t along the ray from origin ro */
+static inline V3 ray_at(V3 ro, V3 rd, float t) {
+  return v3add(ro, v3mul(rd, t));
+}
+
+/* Creep along the ray until it touches the shape.  Each step jumps forward by
+ * the distance to the surface (always safe — nothing is closer).  Before each
+ * measurement we tumble the point into the shape's own frame.  Returns the
+ * distance to the hit (or -1 for a miss), and how many steps it took. */
 static float rm_march(V3 ro, V3 rd, int prim, float s, float ry,
                       int *out_steps) {
   float rx = ry * ROT_X_RATIO;
-  float t = 0.05f;
+  float t = RM_T_START;
   int step;
   for (step = 0; step < RM_MAX_STEPS; step++) {
-    V3 p = tumble(v3add(ro, v3mul(rd, t)), ry, rx);
+    V3 p = tumble(ray_at(ro, rd, t), ry, rx);
     float d = k_prims[prim].sdf(p, s);
     if (d < RM_HIT_EPS) {
       if (out_steps)
@@ -1205,104 +672,104 @@ static float rm_march(V3 ro, V3 rd, int prim, float s, float ry,
   return -1.f;
 }
 
-/*
- * rm_normal — 4-tap tetrahedral normal estimation (T8).  Each of
- * the 4 sample directions has no axis shared with another, so the
- * normal stays sharp at edges.  Note: pos is in WORLD space; we
- * tumble each sample point before evaluating the SDF.
- */
+/* the i-th of four sample directions arranged as a tetrahedron's corners (no
+ * two share an axis, which keeps the normal sharp at the shape's edges). */
+static inline V3 tetra_offset(int i) {
+  float bx = (float)(((i + 3) >> 1) & 1), by = (float)((i >> 1) & 1),
+        bz = (float)(i & 1);
+  return v3mul(v3(2.f * bx - 1.f, 2.f * by - 1.f, 2.f * bz - 1.f), RM_TETRA_SCALE);
+}
+
+/* Which way the surface faces at the hit.  There's no neat formula for these
+ * shapes, so we feel it out: check the distance at four nearby points and see
+ * which way it grows fastest — that points straight out.  pos is in world
+ * space, so each sample is tumbled into the shape's frame first. */
 static V3 rm_normal(V3 pos, int prim, float s, float ry) {
   float rx = ry * ROT_X_RATIO;
-  const float e = RM_NORM_EPS;
   V3 n = v3(0, 0, 0);
   for (int i = 0; i < 4; i++) {
-    float bx = (float)(((i + 3) >> 1) & 1), by = (float)((i >> 1) & 1),
-          bz = (float)(i & 1);
-    V3 ev = v3mul(v3(2.f * bx - 1.f, 2.f * by - 1.f, 2.f * bz - 1.f), 0.5773f);
-    V3 sp = tumble(v3add(pos, v3mul(ev, e)), ry, rx);
+    V3 ev = tetra_offset(i);
+    V3 sp = tumble(v3add(pos, v3mul(ev, RM_NORM_EPS)), ry, rx);
     n = v3add(n, v3mul(ev, k_prims[prim].sdf(sp, s)));
   }
   return v3norm(n);
 }
 
-/*
- * rm_shade — Phong: ambient + diffuse + specular.  Same formula as
- * the other raymarcher files.
- */
+/* the specular highlight: a bright spot where the light reflects toward the eye.
+ * Only where the surface actually faces the light (true N·L > 0) — clamping N·L
+ * before building the reflection would let a back face catch a phantom highlight. */
+static float specular_term(V3 N, V3 L, V3 V, float ndl) {
+  if (ndl <= 0.f)
+    return 0.f;
+  V3 R = v3reflect(L, N);
+  return powf(fmaxf(0.f, v3dot(R, V)), SHIN);
+}
+
+/* Turn a surface spot into a brightness 0..1: a faint everywhere-glow, plus how
+ * squarely it faces the light, plus a shiny highlight (Phong, 1975). */
 static float rm_shade(V3 N, V3 hit, V3 cam, V3 light) {
   V3 L = v3norm(v3sub(light, hit));
   V3 V = v3norm(v3sub(cam, hit));
-  float ndl = fmaxf(0.f, v3dot(N, L));
-  V3 R = v3sub(v3mul(N, 2.f * ndl), L);
-  float sp = powf(fmaxf(0.f, v3dot(R, V)), SHIN);
-  float I = KA + KD * ndl + KS * sp;
+  float ndl = v3dot(N, L);
+
+  float ambient = KA;
+  float diffuse = KD * fmaxf(0.f, ndl);
+  float specular = KS * specular_term(N, L, V, ndl);
+
+  float I = ambient + diffuse + specular;
   return I > 1.f ? 1.f : I;
 }
 
-/*
- * cast_ray — full per-pixel pipeline returning Hit.
- *
- *   u = (px + 0.5) / cw · 2 − 1         in [−1, +1]
- *   v = −(py + 0.5) / ch · 2 + 1        Y-flip
- *   rd = normalise(u·F, v·F·aspect, −1) F = FOV_HALF_TAN
- *   t  = rm_march(ro, rd, prim, s, ry, &steps)
- *   if t < 0:  return Hit{ hit=false, steps }
- *   hit_p = ro + t · rd
- *   N     = rm_normal(hit_p, prim, s, ry)
- *   I     = rm_shade(N, hit_p, ro, light)
- *   return Hit{ true, hit_p, N, I, t, steps }
- *
- * The aspect-correction factor on v compensates for terminal cells
- * being ~2× as tall as they are wide; without it primitives would
- * render as vertical ellipses.
- */
-static Hit cast_ray(int px, int py, int cw, int ch, int prim, float s, float ry,
-                    V3 light, float cam_z) {
-  Hit h = {false, {0, 0, 0}, {0, 0, 1}, 0.f, 0.f, 0};
-
+/* the primary ray direction through one cell's centre: map the cell to screen
+ * coords in [-1,1] (row flipped so row 0 is the top), aim through that point,
+ * and let the aspect squash undo the tall-cell stretch. */
+static V3 ray_through_pixel(int px, int py, int cw, int ch) {
   float u = ((float)px + 0.5f) / (float)cw * 2.f - 1.f;
   float v = -((float)py + 0.5f) / (float)ch * 2.f + 1.f;
   float pa = ((float)ch * CELL_ASPECT) / (float)cw;
+  return v3norm(v3(u * FOV_HALF_TAN, v * FOV_HALF_TAN * pa, -1.f));
+}
+
+static Hit cast_ray(int px, int py, int cw, int ch, const Tumbler *tum,
+                    V3 light, float cam_z) {
+  Hit h = {false, {0, 0, 0}, {0, 0, 1}, 0.f, 0.f, 0};
 
   V3 ro = v3(0.f, 0.f, cam_z);
-  V3 rd = v3norm(v3(u * FOV_HALF_TAN, v * FOV_HALF_TAN * pa, -1.f));
+  V3 rd = ray_through_pixel(px, py, cw, ch);
 
   int steps = 0;
-  float t = rm_march(ro, rd, prim, s, ry, &steps);
+  float t = rm_march(ro, rd, tum->prim, tum->size, tum->angle, &steps);
   h.steps = steps;
   if (t < 0.f)
     return h;
 
   h.hit = true;
   h.t = t;
-  h.p = v3add(ro, v3mul(rd, t));
-  h.normal = rm_normal(h.p, prim, s, ry);
+  h.p = ray_at(ro, rd, t);
+  h.normal = rm_normal(h.p, tum->prim, tum->size, tum->angle);
   h.intensity = rm_shade(h.normal, h.p, ro, light);
   return h;
 }
 
-/* ── §12 canvas state — Hit + intensity + pixels arrays ──────────────── *
- *
- * Three parallel arrays:
- *
- *   hits[]       Hit per pixel.  Production view reads .intensity to
- *                fill intensity[]; debug overlays read everything else.
- *
- *   intensity[]  Phong float per pixel (or INTENSITY_MISS).  Input
- *                to shade_to_terminal (gamma + LUT + Floyd-Steinberg).
- *
- *   pixels[]     Bourke ramp index per pixel (or CANVAS_MISS).  Output
- *                of shade_to_terminal; canvas_draw paints from this.
- */
+/* ── §12 canvas — the per-frame picture, in three buffers ────────────── *
+ * Owns the render buffers (made at startup, remade on resize); the render fills
+ * them and the views read them. */
 
 #define CANVAS_MISS -1
 #define INTENSITY_MISS -1.0f
 
+/* Canvas — three arrays, one entry per cell, that the render fills in stages:
+ *   hits[]      what each ray found (the full Hit).  The debug views read this.
+ *   intensity[] just the brightness 0..1 (or a miss marker).  Fed to the
+ *               shading + dithering step.
+ *   pixels[]    the final character to print (or a miss marker) from that step;
+ *               the normal view prints from here.
+ * Owned here — calloc'd by canvas_alloc, freed by canvas_free. */
 typedef struct {
-  int w, h;
-  Hit *hits;        /* [h*w] per-pixel cast_ray result        */
-  float *intensity; /* [h*w] raw Phong or INTENSITY_MISS      */
-  int *pixels;      /* [h*w] ramp index or CANVAS_MISS        */
+  int w, h;         /* size in cells */
+  Hit *hits;        /* w*h: what each ray found */
+  float *intensity; /* w*h: brightness 0..1, or INTENSITY_MISS */
+  int *pixels;      /* w*h: character-ramp index, or CANVAS_MISS */
 } Canvas;
 
 static void canvas_alloc(Canvas *c, int cols, int rows) {
@@ -1323,19 +790,12 @@ static void canvas_free(Canvas *c) {
   c->w = c->h = 0;
 }
 
-/* ── §13 Bourke ramp + LUT ───────────────────────────────────────────── *
- *
- * Paul Bourke's 92-character ASCII ramp, ordered from least to most
- * ink density.  The LUT (`k_lut_breaks[]`) is a 92-entry table of
- * thresholds in gamma-corrected space; lut_index() finds which slot
- * a value falls into; lut_value() returns the slot's midpoint (used
- * by Floyd-Steinberg for error calculation).
- *
- * Because the Bourke ramp was already MEASURED to have approximately
- * uniform density steps, our LUT is just evenly-spaced thresholds.
- * The architecture preserves the option to use a non-uniform LUT
- * later (e.g. perceptually-tuned) without touching the dithering.
- */
+/* ── §13 the character ramp + its lookup table ───────────────────────── *
+ * Paul Bourke ranked all the printable characters from lightest (' ') to
+ * darkest ('@') by how much ink they put on the page — 92 of them.  More steps
+ * than the usual 8–13 means smoother shading.  The lookup table (k_lut_breaks)
+ * just splits 0..1 into 92 even slices; it's a table so a fancier, perceptual
+ * split could be dropped in later without touching anything else. */
 
 static const char k_ramp[] =
     " `.-':_,^=;><+!rc*/"
@@ -1349,7 +809,7 @@ static void lut_init(void) {
     k_lut_breaks[i] = (float)i / (float)(RAMP_N - 1);
 }
 
-/* lut_index — gamma-corrected float [0, 1] → ramp slot 0..RAMP_N−1. */
+/* which ramp slot (0..91) a 0..1 brightness falls into */
 static inline int lut_index(float v) {
   int idx = RAMP_N - 1;
   for (int i = 0; i < RAMP_N - 1; i++) {
@@ -1361,7 +821,7 @@ static inline int lut_index(float v) {
   return idx;
 }
 
-/* lut_value — ramp slot → midpoint float (for Floyd-Steinberg error). */
+/* the brightness a ramp slot stands for (its midpoint), for the dither's error */
 static inline float lut_value(int idx) {
   if (idx <= 0)
     return 0.f;
@@ -1370,32 +830,42 @@ static inline float lut_value(int idx) {
   return (k_lut_breaks[idx] + k_lut_breaks[idx + 1]) * 0.5f;
 }
 
-/* ── §14 shade_to_terminal — gamma + Floyd-Steinberg dithering (T9) ──── *
+/* ── §14 shade_to_terminal — make the shading look smooth ────────────── *
+ * Three steps turn a brightness into a character:
+ *   1. gamma   — terminals are non-linear, so adjust values to match (§1.8b).
+ *   2. pick    — choose the closest of the 92 ramp characters.
+ *   3. dither  — spread each rounding error onto neighbouring cells, so the
+ *                steps between characters blur into what the eye reads as a
+ *                smooth gradient (Floyd-Steinberg, 1976).
  *
- * Three corrections in sequence, fixing one class of artefact each:
- *
- *   STEP 1 — GAMMA.  Phong returns LINEAR light; the terminal
- *            applies gamma ~2.2.  Apply v ← v^(1/2.2) so the
- *            displayed brightness matches the mathematical intent.
- *
- *   STEP 2 — LUT.  Map gamma-corrected float to one of 92 ramp
- *            slots via the threshold table from §13.
- *
- *   STEP 3 — FLOYD-STEINBERG.  At each pixel, compute the
- *            quantisation error (true value minus quantised
- *            midpoint) and distribute it to 4 neighbours that
- *            haven't been quantised yet.  T9 explained the pattern:
- *
- *               quantised pixel ●
- *                              ╱│╲
- *                             7/16 (right)
- *                          3/16  5/16  1/16
- *                          ↙     ↓     ↘
- *
- * On malloc failure the function falls back to direct linear
- * mapping (no gamma, no dither).  Visible regression but the
- * program keeps running.
- */
+ * If the scratch buffer can't be allocated it falls back to a plain mapping
+ * (no gamma, no dither) so the program keeps running. */
+
+/* true if a working-buffer value is a real shaded pixel, not the miss sentinel */
+static inline bool is_lit(float v) { return v > INTENSITY_MISS + 0.5f; }
+
+/* linear light → display brightness (terminals are non-linear, ~gamma 2.2) */
+static inline float linear_to_display(float v) {
+  return powf(clmpf(v, 0.f, 1.f), 1.f / DISPLAY_GAMMA);
+}
+
+/* Floyd-Steinberg: push a pixel's quantisation error onto the four not-yet-drawn
+ * neighbours (right, and the three below) so the local average brightness stays
+ * correct.  Skips neighbours that were ray misses. */
+static void diffuse_error(float *buf, int w, int h, int x, int y, float err) {
+  int i = y * w + x;
+  if (x + 1 < w && is_lit(buf[i + 1]))
+    buf[i + 1] += err * (7.f / 16.f);
+  if (y + 1 < h) {
+    if (x - 1 >= 0 && is_lit(buf[i + w - 1]))
+      buf[i + w - 1] += err * (3.f / 16.f);
+    if (is_lit(buf[i + w]))
+      buf[i + w] += err * (5.f / 16.f);
+    if (x + 1 < w && is_lit(buf[i + w + 1]))
+      buf[i + w + 1] += err * (1.f / 16.f);
+  }
+}
+
 static void shade_to_terminal(Canvas *c) {
   int w = c->w, h = c->h;
   int n = w * h;
@@ -1417,13 +887,7 @@ static void shade_to_terminal(Canvas *c) {
   /* Step 1+2: gamma correction + carry into working buffer. */
   for (int i = 0; i < n; i++) {
     float v = c->intensity[i];
-    if (v < 0.f) {
-      buf[i] = INTENSITY_MISS;
-      continue;
-    }
-    v = fmaxf(0.f, fminf(1.f, v));
-    v = powf(v, 1.f / 2.2f);
-    buf[i] = v;
+    buf[i] = v < 0.f ? INTENSITY_MISS : linear_to_display(v);
   }
 
   /* Step 3: Floyd-Steinberg error diffusion. */
@@ -1440,51 +904,33 @@ static void shade_to_terminal(Canvas *c) {
       int idx = lut_index(v);
       c->pixels[i] = idx;
 
-      float qv = lut_value(idx);
-      float err = v - qv;
-
-      if (x + 1 < w && buf[i + 1] > INTENSITY_MISS + 0.5f)
-        buf[i + 1] += err * (7.f / 16.f);
-      if (y + 1 < h) {
-        if (x - 1 >= 0 && buf[i + w - 1] > INTENSITY_MISS + 0.5f)
-          buf[i + w - 1] += err * (3.f / 16.f);
-        if (buf[i + w] > INTENSITY_MISS + 0.5f)
-          buf[i + w] += err * (5.f / 16.f);
-        if (x + 1 < w && buf[i + w + 1] > INTENSITY_MISS + 0.5f)
-          buf[i + w + 1] += err * (1.f / 16.f);
-      }
+      float err = v - lut_value(idx);
+      diffuse_error(buf, w, h, x, y, err);
     }
   }
 
   free(buf);
 }
 
-/* ── §15 canvas render + production canvas_draw ──────────────────────── *
- *
- * Render: walk every pixel, call cast_ray, fill hits[] AND
- * intensity[] (production view's input).  Then run shade_to_terminal
- * to populate pixels[] for canvas_draw.
- *
- * Production canvas_draw paints from pixels[] using the Bourke ramp.
- * Debug overlays (§16) read hits[] directly without going through
- * shade_to_terminal.
- */
-static void canvas_render(Canvas *c, int prim, float s, float ry, V3 light,
-                          float cam_z) {
+/* ── §15 render the canvas, then draw it ─────────────────────────────── *
+ * canvas_render traces a ray for every cell and fills the buffers; canvas_draw
+ * prints the normal view from pixels[].  The debug views (§16) read the hits
+ * directly instead. */
+static void canvas_render(Canvas *c, const Tumbler *tum, V3 light, float cam_z) {
   /* Phase 1: cast each ray, store full Hit + intensity. */
   for (int py = 0; py < c->h; py++) {
     for (int px = 0; px < c->w; px++) {
       int idx = py * c->w + px;
-      Hit h = cast_ray(px, py, c->w, c->h, prim, s, ry, light, cam_z);
+      Hit h = cast_ray(px, py, c->w, c->h, tum, light, cam_z);
       c->hits[idx] = h;
       c->intensity[idx] = h.hit ? h.intensity : -1.f;
     }
   }
-  /* Phase 2: gamma + LUT + Floyd-Steinberg → pixels[]. */
+  /* Phase 2: turn those brightnesses into characters, smoothed by dithering. */
   shade_to_terminal(c);
 }
 
-/* canvas_draw — production view (Bourke glyph + theme colour). */
+/* the normal view: print each cell's chosen character in its band colour */
 static void canvas_draw(const Canvas *c, int tcols, int trows) {
   int ox = (tcols - c->w) / 2, oy = (trows - c->h) / 2;
   for (int y = 0; y < c->h; y++) {
@@ -1496,7 +942,8 @@ static void canvas_draw(const Canvas *c, int tcols, int trows) {
       if (tx < 0 || tx >= tcols || ty < 0 || ty >= trows)
         continue;
       char ch = k_ramp[idx];
-      attr_t attr = lumi_attr((idx * LUMI_N) / RAMP_N);
+      int band = (idx * LUMI_N) / RAMP_N; /* group the 92 ramp slots into 8 colour bands */
+      attr_t attr = lumi_attr(band);
       attron(attr);
       mvaddch(ty, tx, (chtype)(unsigned char)ch);
       attroff(attr);
@@ -1504,13 +951,9 @@ static void canvas_draw(const Canvas *c, int tcols, int trows) {
   }
 }
 
-/* ── §16 debug overlays — see the rendering signals raw ──────────────── *
- *
- * Three educational visualisations, each isolating ONE field of the
- * Hit struct.  Debug overlays use a simple 13-char glyph ramp
- * (skipping Floyd-Steinberg) so the visualisation isn't blurred by
- * dithering.
- */
+/* ── §16 debug views (d/D) — paint one raw fact instead of shading ───── *
+ * Each picks one fact from each ray's Hit and paints it straight from the Hit
+ * buffer (no dithering), using a simple 13-step ramp. */
 
 static const char DEBUG_GLYPHS[] = " .,:;+*oxOX#@";
 #define DEBUG_GLYPHS_N ((int)(sizeof DEBUG_GLYPHS - 1))
@@ -1530,11 +973,8 @@ static int debug_slot(float v) {
   return slot;
 }
 
-/*
- * canvas_draw_normals — surface-normal direction → colour band.
- *      hue   = atan2(N.x, N.z) / 2π + 0.5   (azimuth around y-axis)
- *      glyph = N.y · 0.5 + 0.5              (up-facing → bright)
- */
+/* NORMALS view — colour by which compass direction the surface faces (its turn
+ * around the up axis), and brighten the parts that face upward. */
 static void canvas_draw_normals(const Canvas *c, int tcols, int trows) {
   int ox = (tcols - c->w) / 2, oy = (trows - c->h) / 2;
   for (int y = 0; y < c->h; y++) {
@@ -1554,7 +994,7 @@ static void canvas_draw_normals(const Canvas *c, int tcols, int trows) {
       if (y_lit > 1.f)
         y_lit = 1.f;
 
-      attr_t attr = lumi_attr(debug_slot(azimuth)); /* hue from azimuth */
+      attr_t attr = lumi_attr(debug_slot(azimuth));
       attron(attr);
       mvaddch(ty, tx, (chtype)(unsigned char)debug_glyph(y_lit));
       attroff(attr);
@@ -1562,11 +1002,8 @@ static void canvas_draw_normals(const Canvas *c, int tcols, int trows) {
   }
 }
 
-/*
- * canvas_draw_depth — hit distance t → glyph + colour.  Closer hits
- * get higher depth_n.  Range bracketed by camera position and the
- * primitive's bounding sphere.
- */
+/* DEPTH view — nearer the camera = brighter, scaled across how near and far the
+ * shape can possibly be. */
 static void canvas_draw_depth(const Canvas *c, int tcols, int trows,
                               float cam_z) {
   int ox = (tcols - c->w) / 2, oy = (trows - c->h) / 2;
@@ -1598,11 +1035,8 @@ static void canvas_draw_depth(const Canvas *c, int tcols, int trows,
   }
 }
 
-/*
- * canvas_draw_steps — march iteration count → glyph + colour.
- * Grazing silhouette rays take many steps to converge; this overlay
- * makes the silhouette glow.
- */
+/* STEPS view — the rim glows: rays grazing the edge take the most steps before
+ * they decide whether they hit. */
 static void canvas_draw_steps(const Canvas *c, int tcols, int trows) {
   int ox = (tcols - c->w) / 2, oy = (trows - c->h) / 2;
   for (int y = 0; y < c->h; y++) {
@@ -1626,30 +1060,40 @@ static void canvas_draw_steps(const Canvas *c, int tcols, int trows) {
   }
 }
 
-/* ── §17 scene + screen + app ────────────────────────────────────────── */
+/* ── §17 scene + screen + app ────────────────────────────────────────── *
+ * Scene is the one bundle of program state; scene_tick is the only thing that
+ * moves it forward.  Then the screen (ncurses) and the main loop. */
 
+/* Scene — the whole program state, as a table of contents:
+ *   WHAT is shown        tumbler      the primitive on the turntable
+ *   HOW the user drives   cam_z        camera distance / zoom (z/Z)
+ *                         theme_index  colour palette (c/C)
+ *                         debug_mode   which view (d/D)
+ *   WHERE/when            time         animation clock (seconds)
+ *                         paused       freezes the tumble (space)
+ *   render buffers        canvas       per-cell hit/intensity/pixel (scratch, §12)
+ * (camera and the view knobs are one or two loose fields each — too thin to be
+ *  their own types, so they live directly on Scene.) */
 typedef struct {
-  Canvas canvas;
-  int prim;
-  float size;
-  float ry;      /* Y-spin angle (fast axis)               */
-  float rot_spd; /* Y speed; X = rot_spd · ROT_X_RATIO     */
-  float time;
+  Tumbler tumbler;
+
   float cam_z;
   int theme_index;
   DebugMode debug_mode;
-  bool paused;
-} Scene;
 
-static V3 scene_light(void) { return v3(LIGHT_X, LIGHT_Y, LIGHT_Z); }
+  float time;
+  bool paused;
+
+  Canvas canvas;
+} Scene;
 
 static void scene_init(Scene *s, int cols, int rows) {
   memset(s, 0, sizeof *s);
   canvas_alloc(&s->canvas, cols, rows);
-  s->prim = 0;
-  s->size = PRIM_SIZE_DEFAULT;
-  s->ry = 0.f;
-  s->rot_spd = ROT_Y_SPD_DEFAULT;
+  s->tumbler.prim = 0;
+  s->tumbler.size = PRIM_SIZE_DEFAULT;
+  s->tumbler.angle = 0.f;
+  s->tumbler.spin = ROT_Y_SPD_DEFAULT;
   s->cam_z = CAM_Z_DEFAULT;
   s->theme_index = 0;
   s->debug_mode = DEBUG_NORMAL;
@@ -1662,15 +1106,20 @@ static void scene_resize(Scene *s, int cols, int rows) {
   canvas_alloc(&s->canvas, cols, rows);
 }
 
+/* the light never moves; the shape turns under it */
+static V3 scene_light(void) { return v3(LIGHT_X, LIGHT_Y, LIGHT_Z); }
+
+/* the only thing that moves the scene forward: advance the clock and the tumble
+ * angle (both frozen while paused) */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
   s->time += dt;
-  s->ry += s->rot_spd * dt;
+  s->tumbler.angle += s->tumbler.spin * dt;
 }
 
 static void scene_render(Scene *s) {
-  canvas_render(&s->canvas, s->prim, s->size, s->ry, scene_light(), s->cam_z);
+  canvas_render(&s->canvas, &s->tumbler, scene_light(), s->cam_z);
 }
 
 static void scene_draw(const Scene *s, int cols, int rows) {
@@ -1704,9 +1153,9 @@ static void screen_init(Screen *s) {
   noecho();
   cbreak();
   curs_set(0);
-  nodelay(stdscr, TRUE);
+  nodelay(stdscr, TRUE); /* getch() returns right away if no key is waiting */
   keypad(stdscr, TRUE);
-  typeahead(-1);
+  typeahead(-1); /* don't let waiting keypresses interrupt our drawing */
   color_init();
   getmaxyx(stdscr, s->rows, s->cols);
 }
@@ -1715,6 +1164,8 @@ static void screen_free(Screen *s) {
   (void)s;
   endwin();
 }
+
+/* the endwin + refresh dance makes ncurses pick up the new terminal size */
 static void screen_resize(Screen *s) {
   endwin();
   refresh();
@@ -1733,7 +1184,7 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sfps) {
   snprintf(status, sizeof status,
            " %4.1f fps  [%2d/%2d] %-14s  size:%.2f  zoom:%.2f  "
            "theme:%s  debug:%s  sim:%d  %s ",
-           fps, sc->prim + 1, N_PRIMS, k_prims[sc->prim].name, sc->size,
+           fps, sc->tumbler.prim + 1, N_PRIMS, k_prims[sc->tumbler.prim].name, sc->tumbler.size,
            sc->cam_z, THEMES[sc->theme_index].display_name,
            DEBUG_MODE_NAMES[sc->debug_mode], sfps,
            sc->paused ? "PAUSED" : "running");
@@ -1758,12 +1209,16 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* §17.2 app — main loop, signals, key handling. */
+/* §17.2 app — the main loop and the keys.
+ * The main loop ties everything together each frame.  Key presses and resizes
+ * change the scene between frames, not during the simulation step. */
 
+/* App — everything the running program owns.  running/need_resize are flipped
+ * from inside signal handlers, so they're volatile and acted on between frames. */
 typedef struct {
   Scene scene;
   Screen screen;
-  int sim_fps;
+  int sim_fps;                                /* how many times a second the tumble steps */
   volatile sig_atomic_t running, need_resize;
 } App;
 
@@ -1794,12 +1249,12 @@ static bool app_handle_key(App *a, int ch) {
 
   case '\t':
   case 't':
-    s->prim = (s->prim + 1) % N_PRIMS;
-    s->ry = 0.f;
+    s->tumbler.prim = (s->tumbler.prim + 1) % N_PRIMS;
+    s->tumbler.angle = 0.f;
     break;
   case 'T':
-    s->prim = (s->prim + N_PRIMS - 1) % N_PRIMS;
-    s->ry = 0.f;
+    s->tumbler.prim = (s->tumbler.prim + N_PRIMS - 1) % N_PRIMS;
+    s->tumbler.angle = 0.f;
     break;
 
   case ' ':
@@ -1808,25 +1263,25 @@ static bool app_handle_key(App *a, int ch) {
 
   case '=':
   case '+':
-    s->size *= PRIM_SIZE_STEP;
-    if (s->size > PRIM_SIZE_MAX)
-      s->size = PRIM_SIZE_MAX;
+    s->tumbler.size *= PRIM_SIZE_STEP;
+    if (s->tumbler.size > PRIM_SIZE_MAX)
+      s->tumbler.size = PRIM_SIZE_MAX;
     break;
   case '-':
-    s->size /= PRIM_SIZE_STEP;
-    if (s->size < PRIM_SIZE_MIN)
-      s->size = PRIM_SIZE_MIN;
+    s->tumbler.size /= PRIM_SIZE_STEP;
+    if (s->tumbler.size < PRIM_SIZE_MIN)
+      s->tumbler.size = PRIM_SIZE_MIN;
     break;
 
   case 'r':
-    s->rot_spd += 0.15f;
-    if (s->rot_spd > ROT_SPD_MAX)
-      s->rot_spd = ROT_SPD_MAX;
+    s->tumbler.spin += 0.15f;
+    if (s->tumbler.spin > ROT_SPD_MAX)
+      s->tumbler.spin = ROT_SPD_MAX;
     break;
   case 'R':
-    s->rot_spd -= 0.15f;
-    if (s->rot_spd < ROT_SPD_MIN)
-      s->rot_spd = ROT_SPD_MIN;
+    s->tumbler.spin -= 0.15f;
+    if (s->tumbler.spin < ROT_SPD_MIN)
+      s->tumbler.spin = ROT_SPD_MIN;
     break;
 
   case 'z':
@@ -1881,12 +1336,13 @@ int main(void) {
   double fpsd = 0.;
 
   while (app->running) {
-    if (app->need_resize) {
+    if (app->need_resize) { /* 1. apply a pending resize, before timing the frame */
       app_do_resize(app);
       ft = clock_ns();
       sa = 0;
     }
 
+    /* 2. measure how long the last frame took, capping a long stall */
     int64_t now = clock_ns(), dt = now - ft;
     ft = now;
     if (dt > 100 * NS_PER_MS)
@@ -1894,14 +1350,17 @@ int main(void) {
 
     int64_t tick = TICK_NS(app->sim_fps);
     float dts = (float)tick / (float)NS_PER_SEC;
+
+    /* 3. advance the simulation in fixed steps — the only place state moves */
     sa += dt;
     while (sa >= tick) {
       scene_tick(&app->scene, dts);
       sa -= tick;
     }
 
-    scene_render(&app->scene);
+    scene_render(&app->scene); /* 4. trace the rays and shade into the canvas */
 
+    /* 5. refresh the fps number, then sleep to hold a steady frame rate */
     fc++;
     fa += dt;
     if (fa >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1913,10 +1372,10 @@ int main(void) {
     int64_t el = clock_ns() - ft + dt;
     clock_sleep_ns(NS_PER_SEC / 60 - el);
 
-    screen_draw(&app->screen, &app->scene, fpsd, app->sim_fps);
+    screen_draw(&app->screen, &app->scene, fpsd, app->sim_fps); /* 6. draw it */
     screen_present();
 
-    int ch = getch();
+    int ch = getch(); /* 7. read one key (changes state for the next frame) */
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;
   }

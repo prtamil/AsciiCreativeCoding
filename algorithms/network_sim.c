@@ -1,238 +1,21 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * network_sim.c — SIR epidemic on a Watts-Strogatz small-world network
+ * network_sim.c — a disease spreading through a small-world social network.
  *
- * SPLIT DISPLAY
- *   Left  ~60% : network ring — nodes coloured by SIR state
- *   Right ~40% : scrolling stacked epidemic curve (S/I/R over time)
+ * Left panel: the network as a ring of people (nodes), coloured by health
+ * state (grey susceptible, red infected, green recovered). Right panel: a
+ * scrolling chart of how many people are in each state over time.
  *
- * N=40 nodes (half the original; ring is readable).
- * Watts-Strogatz: K=4 ring neighbours, 15% rewiring probability.
+ * The disease model is SIR (Susceptible -> Infected -> Recovered); the
+ * network is a Watts-Strogatz "small world" (a ring where a few links are
+ * randomly rewired into long-range shortcuts). See Watts & Strogatz 1998,
+ * Nature 393; Kermack & McKendrick 1927 (the original SIR model).
+ * Sister files: algorithms/graph_search.c (same graph layout idea).
  *
- * Node symbols
- *   S  grey  ·  susceptible — small, unobtrusive
- *   I  red   *  newly infected (flashes FLASH_TICKS ticks after transition)
- *   I  red   @  infected, settled
- *   R  green +  recovered / immune
- *
- * Edge colours
- *   dim grey      S–S and R–* edges   (background structure)
- *   bright red    any edge touching I  (shows where disease is active)
- *   bright yellow rewired shortcut edge touching I
- *
- * Epidemic curve (right panel)
- *   stacked bar per tick: R (bottom green) → I (middle red) → S (top grey)
- *   scrolls left as time advances; Y axis = node count 0..N
- *
- * R0 = β · <k> / γ — when R0 > 1 epidemic spreads; < 1 it dies
- *
- * Keys:  q quit   ↑↓ β   ←→ γ   r reset   i inject   spc pause
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra algorithms/network_sim.c \
- *       -o network_sim -lncurses -lm
- *
- * §1 config  §2 clock  §3 color  §4 types  §5 graph
- * §6 SIR     §7 draw   §8 app
+ * Build: gcc -std=c11 -O2 -Wall -Wextra algorithms/network_sim.c \
+ *            -o network_sim -lncurses -lm
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : SIR (Susceptible-Infected-Recovered) epidemic model on
- *                  a Watts-Strogatz small-world network.
- *                  Per tick: each I node infects each S neighbour with
- *                  probability β; each I node recovers with probability γ.
- *                  R0 = β·⟨k⟩/γ: epidemic spreads when R0 > 1.
- *
- * Data-structure : Watts-Strogatz construction: start with a K=4 ring graph
- *                  (each node connected to K/2 nearest neighbours on each
- *                  side); rewire each edge with probability p=0.15, replacing
- *                  target with a random node.  Rewired "shortcut" edges create
- *                  the small-world property: short average path length + high
- *                  clustering coefficient.
- *
- * Math           : SIR basic reproduction number: R0 = β·⟨k⟩/γ where
- *                  ⟨k⟩ is the mean degree.  Epidemic threshold R0=1 marks
- *                  the phase transition between extinction and outbreak.
- *                  Node positions on ring: θ_i = 2πi/N, placed in a circle.
- *
- * Rendering      : Split display: left panel shows network ring with node
- *                  colours (S=grey, I=red, R=green) and edges; right panel
- *                  shows scrolling stacked epidemic curve bar chart.
- *
- * References
- * ──────────
- *   ── Small-world networks (§5 graph construction) ────────────────
- *   [1] Watts, D. J. & Strogatz, S. H. (1998), "Collective dynamics
- *       of small-world networks", Nature 393, pp. 440-442 — THE
- *       small-world paper.  Defines the K-ring + rewire construction
- *       implemented in §5.  ~3 pages; the best place to start.
- *   [2] Newman, M. E. J. (2010), "Networks: An Introduction", Oxford
- *       University Press — the network-science textbook.  Ch. 15
- *       covers small-world; Ch. 17 covers degree distributions
- *       relevant to the ⟨k⟩ in our R0 formula.
- *   [3] Barabási, A.-L. & Albert, R. (1999), "Emergence of scaling
- *       in random networks", Science 286, pp. 509-512 — the SCALE-
- *       FREE network model.  Read alongside [1] to see how a
- *       different rewiring rule produces a different "interesting"
- *       network topology, and how each affects epidemic spread.
- *
- *   ── SIR epidemic models (§6 SIR transitions) ────────────────────
- *   [4] Kermack, W. O. & McKendrick, A. G. (1927), "A contribution to
- *       the mathematical theory of epidemics", Proc. Royal Society A
- *       115, pp. 700-721 — the ORIGINAL SIR model.  Defines the
- *       three-compartment system and the threshold theorem (R0 > 1).
- *   [5] Anderson, R. M. & May, R. M. (1991), "Infectious Diseases of
- *       Humans: Dynamics and Control", Oxford University Press — the
- *       bible of mathematical epidemiology.  Ch. 2 derives the
- *       R0 = β·⟨k⟩/γ used in the HUD.
- *   [6] Keeling, M. J. & Rohani, P. (2008), "Modeling Infectious
- *       Diseases in Humans and Animals", Princeton University Press
- *       — modern practical textbook.  Ch. 3 covers stochastic SIR
- *       in discrete time, exactly what §6 simulates.
- *   [7] Diekmann, O. & Heesterbeek, J. A. P. (2000), "Mathematical
- *       Epidemiology of Infectious Diseases: Model Building, Analysis
- *       and Interpretation", Wiley — for the deterministic ODE limit
- *       (dS/dt = -βSI/N) that this stochastic simulation approximates
- *       at large N.
- *
- *   ── Epidemics on networks (combines §5 + §6) ────────────────────
- *   [8] Pastor-Satorras, R., Castellano, C., Van Mieghem, P. &
- *       Vespignani, A. (2015), "Epidemic processes in complex
- *       networks", Reviews of Modern Physics 87(3), pp. 925-979 — the
- *       definitive review of SIR/SIS dynamics on networks of
- *       different topologies.  Pairs [1] and [4] into one paper.
- *
- *   ── Stochastic simulation algorithm ─────────────────────────────
- *   [9] Gillespie, D. T. (1977), "Exact stochastic simulation of
- *       coupled chemical reactions", J. Physical Chemistry 81(25),
- *       pp. 2340-2361 — the EXACT continuous-time algorithm.  Our
- *       fixed-tick synchronous update is a discrete-time
- *       approximation; Gillespie is what you'd use if rates were
- *       very heterogeneous or you cared about exact timing.
- *
- *   ── Rendering ───────────────────────────────────────────────────
- *  [10] Bresenham, J. E. (1965), "Algorithm for computer control of
- *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
- *       the line-rasterization algorithm used by the edge draw in §7
- *       (with the directional-glyph trick '\' '/' '-' '|').
- *
- *   ── Online quick references ─────────────────────────────────────
- *  [11] https://en.wikipedia.org/wiki/Small-world_network — covers
- *       W-S, Newman-Watts variants, and the clustering coefficient.
- *  [12] https://en.wikipedia.org/wiki/Compartmental_models_in_epidemiology
- *       — SIR, SIS, SEIR, SIRS variants with the standard ODE
- *       formulations and threshold derivations.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Every individual is in exactly one of three boxes: S (susceptible), I
- * (infected), R (recovered).  Each tick, each I rolls the dice once
- * for recovery (probability γ) and once per infected→susceptible edge
- * for transmission (probability β).  The single most important
- * derived number is R0 = β·⟨k⟩/γ — when R0 > 1 the epidemic explodes,
- * < 1 it dies.  The network shape (small-world: K=4 ring with 15%
- * rewired shortcuts) controls how fast the wavefront circles the ring
- * versus skipping across via shortcuts.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Watts-Strogatz construction:
- *       a. Ring lattice: connect each node i to its K/2=2 nearest
- *          neighbours on each side (K=4 total).
- *       b. For each ring edge (i, i+k), with probability p=0.15,
- *          replace target i+k with a random other node, marking
- *          topology.rewired[i][new_j] = true.
- *  2. Layout: place node i on circle at angle 2π·i/N − π/2 (12
- *     o'clock start), radius RING_FRAC · half-min-extent.
- *  3. SIR tick (synchronous; staged update via nxt[]):
- *       For each I node:
- *         - With probability γ: mark nxt[i] = R.
- *         - For each neighbour j with state S: with probability β,
- *           mark nxt[j] = I, set flash[j] = FLASH_TICKS=6.
- *       commit_state(nxt → epi.state).
- *  4. Append (S_count, I_count, R_count) to history (circular
- *     buffer, capacity HIST_LEN=500); track all-time peak I.
- *  5. Render network: edges first (dim grey for S–S/R–*, hot red for
- *     any I-touching, bright yellow for hot rewired shortcuts).
- *     Nodes on top: '.' grey for S, '@' red bold for I (or '*'
- *     yellow during flash), '+' green for R.
- *  6. Render chart: each tick = one column, stacked R(bottom green
- *     '-') / I(red '#') / S(top grey '='); scrolls left as new ticks
- *     append at right edge.  Y-axis labels at 0/N/4/N/2/3N/4/N.
- *  7. HUD row: live β, γ, R0 (coloured by threshold), <k>, S/I/R
- *     counts, phase label (READY/SEEDED/GROWING/WANING/PLATEAU/EXTINCT).
- *
- * KEY FORMULAS
- * ────────────
- *  Mean degree    ⟨k⟩ = (1/N) · Σ_i deg(i)        (= K = 4 if no rewire)
- *  Reproduction   R0 = β · ⟨k⟩ / γ
- *  Threshold      R0 > 1 → epidemic;  R0 < 1 → extinction
- *  Tick recover   I → R with prob γ (uniform random)
- *  Tick transmit  for each (I,S) edge: S → I with prob β
- *  Ring node pos  (cx + r·cos θ_i,  cy + r·sin θ_i),  θ_i = 2πi/N - π/2
- *  Rewire prob    p = WS_P = 0.15 per directed edge
- *  Phase detect   prev_i = hist[(head-2+HIST_LEN) % HIST_LEN]
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS + MENTAL MODEL above — read first.  Read
- *      algorithms/graph_search.c first if adjacency lists are new —
- *      that file has the same Watts-Strogatz layout idea (random
- *      graph + force layout) for a different purpose.  Read
- *      flocking/flocking.c if you want a totally different
- *      "interacting agents on a graph" example.
- *   2. §6 SIR — the per-tick transition rule + staged update.
- *      THE HEART of this file.  Each driver carries a pseudocode
- *      docblock; read those before the bodies.
- *   3. §5 graph — Watts-Strogatz construction (see References [1]).
- *   4. §7 draw — split layout (network ring + epidemic curve).
- *   5. §1-§3, §4, §8 — config / clock / colour / data types / app loop.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   sc                          the Scene struct passed by pointer to
- *                               every sim / draw / input function.
- *   sc->epi.state[i]            current SIR state of node i.
- *   nxt[]                       sir_tick's local scratch — staged
- *                               next-tick state for SYNCHRONOUS update.
- *   sc->topology.adj[i][j]      true iff edge i↔j exists.  Symmetric
- *                               (undirected graph).
- *   sc->topology.rewired[i][j]  true iff this is a "shortcut" rewired
- *                               edge (used for yellow highlighting
- *                               of small-world long-range links).
- *   sc->beta, sc->gamma         transmission + recovery rates ∈ [0, 1].
- *   N_NODES                     40.
- *   WS_K = 4                    ring lattice degree (each node has
- *                               K/2 neighbours on each side).
- *   WS_P = 0.15                 rewiring probability per edge.
- *   sc->history.s/i/r[]         rolling (S, I, R) history for the
- *                               right-panel curve.  Capacity HIST_LEN=500.
- *
- * Background you need
- * ───────────────────
- *   - Adjacency-matrix graph storage.
- *   - Probability: a coin with P(heads) = β, flipped per (I, S)
- *     edge per tick.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Differential equations.  The continuous SIR ODE
- *     (dS/dt = -βSI/N etc.) is the limit of large-N stochastic
- *     simulation; we use the stochastic version directly.
- *   - Stochastic differential equations / master equations.
- *   - Real epidemiology (R_eff vs R_0, contact tracing,
- *     interventions).  We use the simplest textbook model.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -247,81 +30,55 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — tunable constants: network size, disease rates, layout ── */
 
-#define N_NODES     40        /* ring nodes — readable without hairball    */
-#define WS_K         4        /* ring degree (2 neighbours each side)      */
-#define WS_P         0.15f    /* Watts-Strogatz rewiring probability       */
+#define N_NODES     40        /* people in the network — small enough to see */
+#define WS_K         4        /* each person starts linked to 4 ring neighbours (2 per side) */
+#define WS_P         0.15f    /* chance each link gets rewired into a shortcut */
 
-#define BETA_INIT    0.040f   /* infection prob per S-I edge per tick      */
-#define GAMMA_INIT   0.025f   /* recovery prob per I node per tick         */
-#define BETA_STEP    0.005f
-#define GAMMA_STEP   0.005f
+#define BETA_INIT    0.040f   /* chance an infected person infects a susceptible neighbour, per tick */
+#define GAMMA_INIT   0.025f   /* chance an infected person recovers, per tick */
+#define BETA_STEP    0.005f   /* how much arrow keys nudge beta  */
+#define GAMMA_STEP   0.005f   /* how much arrow keys nudge gamma */
 
-#define FLASH_TICKS  6        /* ticks a newly-infected node shows as '*'  */
-#define HIST_LEN   500        /* rolling history for epidemic curve        */
+#define FLASH_TICKS  6        /* how long a freshly-infected node flashes bright */
+#define HIST_LEN   500        /* how many past ticks the chart remembers */
 
-#define CELL_W       8        /* pixels per terminal column                */
-#define CELL_H      16        /* pixels per terminal row                   */
-#define NET_FRAC     0.58f    /* fraction of screen width for network      */
-#define RING_FRAC    0.44f    /* ring radius / min(half-width, half-height)*/
-#define FPS         15
+#define CELL_W       8        /* sub-cell width: terminal cells are taller than wide, */
+#define CELL_H      16        /*   so we work in fake pixels and divide down when drawing */
+#define NET_FRAC     0.58f    /* left fraction of the screen given to the network */
+#define RING_FRAC    0.44f    /* ring radius as a fraction of the panel half-size */
+#define FPS         15        /* simulation/redraw rate, frames per second */
 
-/* HUD layout — rows reserved at top/bottom of the screen for status bars.
- * Top bar carries DATA (β, γ, R0, S/I/R counts, SIR proportion bar);
- * bottom bar carries ACTIONS (key hints).  layout_ring + draw_network +
- * draw_chart all clip into the band between the two bars. */
-#define HUD_TOP_ROWS 2        /* row 0: params  ;  row 1: SIR proportion bar */
-#define HUD_BOT_ROWS 1        /* last row: key-hint action bar               */
+/* Rows fenced off at top and bottom for status bars: the top bar shows the
+ * live numbers (rates, R0, counts), the bottom bar shows the key hints. The
+ * network and chart only draw in the band between them. */
+#define HUD_TOP_ROWS 2        /* row 0: numbers; row 1: S/I/R proportion bar */
+#define HUD_BOT_ROWS 1        /* last row: key hints                          */
 
-/*
- * SIR — the three compartments of the Kermack-McKendrick model.
- *
- * Intent
- *   Each node sits in EXACTLY ONE of these states at any moment.
- *   The whole simulation is the per-tick rule for transitioning
- *   between them:
- *
- *       ┌───┐  prob_roll(β) per I-S edge   ┌───┐  prob_roll(γ)   ┌───┐
- *       │ S │ ──────────────────────────► │ I │ ──────────────► │ R │
- *       └───┘                             └───┘                 └───┘
- *
- *   S → I  is the ONLY transition driven by neighbours (graph-mediated).
- *   I → R  is independent per node — one die roll per I per tick.
- *   R → *  is ABSENT — recovered nodes are permanently immune in
- *          the basic SIR model.  Variants (SIRS, SEIR) reintroduce
- *          edges or add intermediate states; not implemented here.
- *
- * Why an enum (not int 0/1/2)
- *   Self-documenting at every comparison site: `state[i] == I_STATE`
- *   reads as English; the compiler catches typos that bare ints
- *   would silently accept.  Zero cost — the enum's underlying type
- *   is int.
- *
- * Reference: Kermack & McKendrick (1927) [4] for the three-
- *   compartment model; Anderson & May (1991) [5] §2 for the
- *   derivation of R0 = β·⟨k⟩/γ from these transition rules.
- */
+/* The three health states every person is in, exactly one at a time:
+ * Susceptible (healthy, can catch it), Infected (has it, can pass it on),
+ * Recovered (had it, now immune forever in this basic model). The whole
+ * simulation is just the rules for moving S->I->R. An enum (not bare 0/1/2)
+ * so comparisons like `state[i] == I_STATE` read in English and typos are
+ * caught at compile time. Classic SIR model: Kermack & McKendrick 1927. */
 typedef enum {
-    S_STATE,    /* Susceptible — can be infected by an I neighbour       */
-    I_STATE,    /* Infected    — transmits; rolls γ each tick to recover */
-    R_STATE,    /* Recovered   — immune; absorbing state in basic SIR    */
+    S_STATE,    /* Susceptible — healthy, can be infected by a sick neighbour */
+    I_STATE,    /* Infected    — sick; spreads it, may recover each tick       */
+    R_STATE,    /* Recovered   — immune; never changes again                   */
 } SIR;
 
+/* Names for the ncurses colour-pair slots (slot 0 is reserved, so start at 1). */
 enum {
-    CP_S=1, CP_I, CP_I_FLASH, CP_R,
-    CP_EDGE_DIM, CP_EDGE_HOT, CP_EDGE_REWIRE,
-    CP_HUD,                /* top data bar  — bright yellow + A_BOLD */
-    CP_HINT,               /* bottom action bar — bright cyan + A_BOLD */
-    CP_BAR_S, CP_BAR_I, CP_BAR_R,
-    CP_DIVIDER,
+    CP_S=1, CP_I, CP_I_FLASH, CP_R,   /* node colours by state            */
+    CP_EDGE_DIM, CP_EDGE_HOT, CP_EDGE_REWIRE,  /* link colours            */
+    CP_HUD,                /* top numbers bar — bright yellow            */
+    CP_HINT,               /* bottom key-hint bar — bright cyan          */
+    CP_BAR_S, CP_BAR_I, CP_BAR_R,     /* the three chart bands           */
+    CP_DIVIDER,            /* the line splitting the two panels          */
 };
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock — monotonic time + sleep, for the frame timer ── */
 
 static long long clock_ns(void)
 {
@@ -336,14 +93,13 @@ static void clock_sleep_ns(long long ns)
     nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color — ncurses colour pairs for nodes, edges, chart, HUD ── */
 
 static void color_init(void)
 {
     start_color();
     use_default_colors();
+    /* Prefer the 256-colour palette; fall back to the 8 basic colours. */
     if (COLORS >= 256) {
         init_pair(CP_S,          246,  -1);  /* grey — susceptible            */
         init_pair(CP_I,          196,  -1);  /* red  — infected               */
@@ -375,357 +131,124 @@ static void color_init(void)
     }
 }
 
-/* ===================================================================== */
-/* §4  data types — Vec2, Topology, EpiState, EpiHistory, Scene           */
-/* ===================================================================== */
+/* ── §4 data types — graph, disease state, history, and the Scene that holds it all ── */
 
-/*
- * Vec2 — 2-D pixel-space position.
- *
- * Intent
- *   One node's screen position in PIXEL coordinates (CELL_W × CELL_H
- *   sub-pixels per terminal cell).  Stored as float because the ring
- *   layout uses trigonometry — integer coords would accumulate
- *   rounding error at every layout recompute and cause nodes to
- *   "jitter" on resize.
- *
- *   Used only for node positions (Scene.pos[]) and the (centre,
- *   radius) of the ring layout in §5.  Force-directed layouts in
- *   other files use Vec2 for velocities too; we don't here.
- *
- * Convention
- *   x : EASTWARD pixel coordinate  (positive → right)
- *   y : SOUTHWARD pixel coordinate (positive → DOWN — terminal idiom)
- *
- *   The y-down convention is why place_node_on_ring's angle starts
- *   at −π/2: that places node 0 at the TOP of the ring in screen
- *   space, matching the reader's natural "12 o'clock" expectation.
- *
- * Why pass-by-value
- *   8 bytes; fits in registers on every modern ABI.  No aliasing
- *   concerns when both centre and per-node positions live in the
- *   same caller frame.  place_node_on_ring takes centre by value
- *   and returns a fresh Vec2 the same way.
- */
+/* A point on the screen, in fake "pixels" (CELL_W x CELL_H pixels per cell).
+ * Float, not int, so the ring trig doesn't accumulate rounding and make nodes
+ * jitter when the layout is recomputed on resize. y grows downward, the usual
+ * terminal convention. */
 typedef struct {
-    float x;        /* eastward  pixel coordinate (right is positive)  */
-    float y;        /* southward pixel coordinate (down  is positive)  */
+    float x;        /* rightward; bigger x is further right */
+    float y;        /* downward;  bigger y is further down  */
 } Vec2;
 
-/*
- * Topology — the IMMUTABLE Watts-Strogatz graph structure.
+/* Who is connected to whom. Built once at startup and never changed after
+ * that — resetting ('r') or injecting ('i') only touches the disease, never
+ * the wiring. That lets you re-run the same outbreak on the same network and
+ * see how much of the difference is pure luck versus the layout.
  *
- * Intent
- *   Captures the network built ONCE at startup and frozen for the
- *   life of the program: which nodes are connected (adj), and which
- *   of those connections are RANDOM SHORTCUTS introduced by the
- *   rewire step (rewired).  Stays constant across epi_reset ('r')
- *   and epi_inject ('i'); only the SIR dynamics get wiped on reset,
- *   never the graph.
- *
- *   This separation matters pedagogically: the user can rerun the
- *   epidemic many times on the SAME graph and watch how outbreak
- *   trajectories differ purely due to stochastic rolls — isolating
- *   the variance contributed by RANDOMNESS from the variance
- *   contributed by TOPOLOGY.
- *
- * Why two parallel matrices
- *   adj[i][j]      — true iff edge (i, j) exists; symmetric (undirected).
- *   rewired[i][j]  — true iff that edge replaced a ring edge during
- *                    rewire_edges; strict SUBSET of adj.
- *
- *   Keeping `rewired` as a separate matrix lets the renderer paint
- *   shortcut edges in BRIGHT YELLOW (when hot) — the single most
- *   informative visual feature for understanding small-world
- *   acceleration.  Recomputing "is this a shortcut?" per frame
- *   would require remembering the original ring construction.
- *
- * Why ADJACENCY MATRIX (not adjacency list)
- *   At N=40 the matrix is 1600 bytes; two parallel matrices = 3200
- *   bytes total.  Adjacency-list storage would save space at large
- *   N but the matrix gives O(1) edge query (used heavily in
- *   sir_tick's "for each neighbour" loop and in draw_network_edges).
- *   For N ≫ 1000 you would switch to a list; at N=40 the matrix
- *   wins cleanly.
- *
- * Construction sequence (§5)
- *   topology_clear            — zero both matrices
- *   connect_ring_neighbours   — K-ring lattice (Step 1 of W-S)
- *   rewire_edges              — replace ring edges with prob WS_P (Step 2)
- *
- * Members
- *   adj    [i][j]   symmetric undirected adjacency
- *   rewired[i][j]   subset of adj; true iff edge is a small-world shortcut
- *
- * Invariants
- *   adj[i][j]     == adj[j][i]                   — symmetry
- *   rewired[i][j] == rewired[j][i]               — symmetry
- *   rewired[i][j] → adj[i][j]                    — subset
- *   adj[i][i]     == false                       — no self-loops
- *
- * References
- *   [1] Watts & Strogatz (1998) — the original construction.  Our
- *       implementation is literal; see also [2] §15 for the
- *       clustering-coefficient + path-length analysis.
- */
+ * Two square tables, both symmetric (if i links j, then j links i):
+ *   adj[i][j]      is there a link between person i and person j?
+ *   rewired[i][j]  is that link one of the random long-range shortcuts?
+ *                  (always a subset of adj.) Kept separate only so the
+ *                  drawing code can paint shortcuts bright yellow — the
+ *                  most telling feature of a small-world network.
+ * A full table (not an adjacency list) because N is tiny (40) and "are i
+ * and j linked?" is asked constantly; the table answers it instantly.
+ * Watts & Strogatz 1998 for the construction. */
 typedef struct {
-    bool adj    [N_NODES][N_NODES];     /* symmetric, no self-loops      */
-    bool rewired[N_NODES][N_NODES];     /* subset of adj — shortcut flag */
+    bool adj    [N_NODES][N_NODES];     /* link present? symmetric, no self-links */
+    bool rewired[N_NODES][N_NODES];     /* link is a shortcut? (subset of adj)    */
 } Topology;
 
-/*
- * EpiState — per-node epidemiological state.
+/* The disease side of each person: their current state, plus a short
+ * countdown so freshly-infected nodes flash bright for a few ticks before
+ * settling into the steady infected look. state[] picks the colour, flash[]
+ * picks the glyph ('*' while flashing, '@' once settled). Reset on 'r',
+ * nudged by 'i' (infect a random healthy person).
  *
- * Intent
- *   The CURRENT compartment of each node, plus a short "just got
- *   infected" countdown that drives the bright-yellow flash glyph
- *   in the renderer.  Together these capture everything the renderer
- *   needs to draw the network panel: state[] picks the COLOUR family,
- *   flash[] picks WHICH variant (fresh '*' vs settled '@').
- *
- *   Reset on 'r' (epi_reset clears all to S except one seed I);
- *   extended on 'i' (epi_inject flips a random S → I).
- *
- * Why a SEPARATE flash counter (not derived from state)
- *   "Just infected" is a TEMPORAL property — the same I_STATE
- *   transitioning two ticks apart, just one rendered with extra
- *   emphasis.  Encoding it as a second state (e.g. I_FRESH_STATE)
- *   would mean the SIR update logic has to know to demote
- *   I_FRESH → I after the countdown, complicating sir_tick.  A
- *   separate decrement loop (decrement_flash_counters) keeps the
- *   compartment logic and the rendering hint cleanly separate.
- *
- * Why INT (not bool) for flash
- *   The flash lasts FLASH_TICKS frames, not one.  An int countdown
- *   that the renderer compares with > 0 captures both "is it
- *   flashing?" (the bool we need) and "for how many more ticks?"
- *   (the state machine that drives it).
- *
- * Members
- *   state[i]   one of S_STATE, I_STATE, R_STATE.  Mutated synchronously
- *              via the nxt[] scratch in sir_tick (never in place).
- *   flash[i]   FLASH_TICKS countdown.  Renderer maps:
- *                flash > 0  AND state == I  →  '*' bright yellow
- *                flash == 0 AND state == I  →  '@' red
- *                otherwise                  →  ignored (no flash glyph)
- *
- *   Synchronous-update scratch (`nxt[N_NODES]`) is a local in
- *   sir_tick — no cross-frame meaning, not in this struct.
- *
- * Invariants
- *   state[i] ∈ {S_STATE, I_STATE, R_STATE}
- *   flash[i] ≥ 0
- *   flash[i] > 0  →  state[i] == I_STATE        (only I nodes flash)
- */
+ * flash is a separate countdown rather than an extra state so the spreading
+ * rules in sir_tick stay simple — they never have to remember to "un-flash" a
+ * node. It's an int, not a bool, because the flash lasts several ticks. */
 typedef struct {
-    SIR state[N_NODES];     /* current compartment per node                 */
-    int flash[N_NODES];     /* FLASH_TICKS countdown — render hint for new I */
+    SIR state[N_NODES];     /* S / I / R for each person                       */
+    int flash[N_NODES];     /* ticks left flashing after infection (0 = done)  */
 } EpiState;
 
-/*
- * EpiHistory — circular buffer of per-tick (S, I, R) counts.
+/* The data behind the scrolling chart: how many people were in each state at
+ * each past tick. It's a ring buffer — after HIST_LEN ticks it wraps and
+ * overwrites the oldest sample, so memory stays bounded while the chart keeps
+ * showing the most recent window. Three parallel arrays (not one array of
+ * triples) so `h->i[k]` literally reads "infected count at tick k".
  *
- * Intent
- *   Drives the right-panel scrolling stacked bar chart.  Each tick
- *   appends one (S, I, R) triple via history_record; the chart shows
- *   the most recent `data_w` columns scrolling left as time advances.
- *   After HIST_LEN ticks the buffer wraps and overwrites the oldest
- *   sample — the chart still shows the most recent window, just with
- *   bounded memory.
- *
- *   peak_i is a MONOTONIC max of the I count over the entire run;
- *   the chart marks it with "pk" so the all-time outbreak peak is
- *   visible even after I has dropped back down.
- *
- * Why a CIRCULAR buffer (not a fixed array)
- *   Outbreak runs can last thousands of ticks (slow γ).  A linear
- *   array would either grow unboundedly or truncate on overflow.
- *   The circular form gives bounded memory + automatic forgetting
- *   of ancient ticks the chart can't show anyway.
- *
- * Why SEPARATE s/i/r arrays (not array of struct)
- *   Slightly better cache behaviour for the column-major chart
- *   render (reads all S values, then all I, then all R).  More
- *   importantly: `h->i[bi]` reads as "I count at bin bi", matching
- *   the visual idiom of the stacked bar chart.  At N=40 with three
- *   arrays of 500 ints = 6 KB total, the whole buffer fits in L1
- *   either way.
- *
- * Members
- *   s[k]    S count for tick k                 (k indexed mod HIST_LEN)
- *   i[k]    I count for tick k
- *   r[k]    R count for tick k
- *   head    NEXT write position; 0 ≤ head < HIST_LEN
- *   n       current fill count; 0 ≤ n ≤ HIST_LEN
- *   peak_i  MONOTONIC max of I across the entire run
- *
- * Invariants
- *   0 ≤ head < HIST_LEN
- *   0 ≤ n    ≤ HIST_LEN
- *   The OLDEST valid sample sits at (head − n + HIST_LEN) % HIST_LEN.
- *   The NEWEST valid sample sits at (head − 1 + HIST_LEN) % HIST_LEN.
- *   peak_i never decreases (history_record only assigns if i > peak_i).
- *   s[k] + i[k] + r[k] == N_NODES   for every valid k (each node
- *   sits in exactly one compartment per tick — partition invariant).
- */
+ * head is the next slot to write; n is how many slots are filled so far.
+ * peak_i remembers the worst-ever infected count so the chart can mark it
+ * even after the outbreak has died down. Always s+i+r == N_NODES, since every
+ * person is in exactly one state. */
 typedef struct {
-    int s[HIST_LEN];        /* S count per recorded tick                 */
-    int i[HIST_LEN];        /* I count per recorded tick                 */
-    int r[HIST_LEN];        /* R count per recorded tick                 */
-    int head;               /* next write slot; 0 ≤ head < HIST_LEN      */
-    int n;                  /* fill count;      0 ≤ n    ≤ HIST_LEN      */
-    int peak_i;             /* monotonic max of I across the entire run  */
+    int s[HIST_LEN];        /* susceptible count per recorded tick      */
+    int i[HIST_LEN];        /* infected count per recorded tick         */
+    int r[HIST_LEN];        /* recovered count per recorded tick        */
+    int head;               /* next slot to write (0..HIST_LEN-1)       */
+    int n;                  /* how many slots filled (0..HIST_LEN)      */
+    int peak_i;             /* highest infected count seen all run      */
 } EpiHistory;
 
-/*
- * Scene — owns ALL persistent simulation + render state for one run.
+/* Everything one running simulation needs, in one bag passed by pointer to
+ * every function. Splitting it out of globals means each function's signature
+ * shows what it reads and writes. (The only true globals are the signal-handler
+ * flags in §8, which signals can't reach any other way.)
  *
- * Intent
- *   One instance lives in main() and is passed by pointer to every
- *   simulation, draw, and input function.  No file-scope mutables
- *   for the simulation; signal-handler flags (g_quit, g_resize) in
- *   §8 stay as file-scope globals because POSIX signal handlers
- *   can't be passed a pointer.
+ * Its parts have three different lifetimes: the graph and node positions are
+ * built once (positions recomputed on resize); the disease fields get wiped on
+ * 'r' so you can re-run on the same graph; rows/cols are refreshed every frame.
  *
- *   The struct is partitioned into THREE LIFETIMES that map directly
- *   to the user's key bindings:
- *     (1) Topology + layout — built ONCE at startup; refreshed only
- *         on terminal resize (layout_ring); never touched by 'r'.
- *     (2) Epidemic dynamics — wiped on every 'r' (epi_reset); the
- *         user can rerun the SAME graph many times this way.
- *     (3) Terminal extent  — read each frame from LINES/COLS so
- *         resize is picked up.
- *
- * Why a struct (not a global blob)
- *   - Every function's signature now documents what it READS / WRITES
- *     (look at the const-ness of the Scene* parameter).
- *   - Two simulations could coexist (e.g. an A/B comparison panel)
- *     without aliasing.  Not used today; the door is open.
- *   - Removes ~15 file-scope globals from the previous version,
- *     keeping the module surface clean.
- *
- * Sub-structures (defined just above)
- *   Topology    immutable graph (adj + rewired)
- *   EpiState    per-node compartment + flash counter
- *   EpiHistory  circular buffer of (S, I, R) counts
- *
- * Members
- *   ── Graph (built once, survives reset) ──────────────────────────
- *   topology       Watts-Strogatz adjacency + shortcut flags
- *   pos[N_NODES]   ring layout positions in pixel space; recomputed
- *                  by layout_ring on startup and on every resize.
- *
- *   ── Epidemic dynamics (cleared on 'r' reset) ───────────────────
- *   epi            per-node SIR state + flash countdown
- *   history        rolling (S, I, R) counts for the chart
- *   beta           transmission probability per S-I edge per tick;
- *                  read in try_transmission via prob_roll(beta).
- *                  Valid range [0, 1]; clamp01 enforces in handle_input.
- *   gamma          recovery probability per I node per tick;
- *                  read in try_recovery via prob_roll(gamma).
- *                  Valid range [0, 1]; clamp01 enforces in handle_input.
- *   tick           frame counter since last reset (0 at startup and
- *                  after epi_reset); shown in HUD.
- *   paused         pause flag; sir_tick is a no-op while true.
- *                  Toggle: SPACE.
- *
- *   ── Terminal extent (refreshed each frame) ─────────────────────
- *   rows, cols     LINES, COLS snapshot for the current frame
- *
- * Derived quantities (computed on demand, NOT stored)
- *   ⟨k⟩    topology_mean_degree(&topology)
- *   R0     β · ⟨k⟩ / γ           (HUD computes each frame)
- *   S/I/R  count_state(&epi, …)  (HUD + sir_tick each compute)
- *
- *   Keeping these derived rather than cached avoids stale-cache
- *   bugs: any update to β/γ or epi.state is immediately visible
- *   in the next frame's HUD with no invalidation logic.
- *
- * Invariants
- *   0 ≤ beta  ≤ 1
- *   0 ≤ gamma ≤ 1
- *   tick    ≥ 0
- *   rows    ≥ HUD_TOP_ROWS + HUD_BOT_ROWS + 1   (else simulation panel
- *                                                is empty; layout_ring
- *                                                degenerates to radius 0)
- */
+ * Note: <k> (mean links per node), R0, and the live S/I/R counts are NOT
+ * stored — they're recomputed each frame so they can never go stale. */
 typedef struct {
-    Topology    topology;       /* immutable graph                          */
-    Vec2        pos[N_NODES];   /* ring layout positions, pixel space       */
+    Topology    topology;       /* the network (fixed once built)           */
+    Vec2        pos[N_NODES];   /* where each node sits on the ring         */
 
-    EpiState    epi;            /* per-node compartment + flash             */
-    EpiHistory  history;        /* rolling (S, I, R) counts                 */
-    float       beta;           /* transmission rate, [0, 1]                */
-    float       gamma;          /* recovery rate,     [0, 1]                */
-    int         tick;           /* ticks since last reset, ≥ 0              */
-    bool        paused;         /* sir_tick is a no-op while true           */
+    EpiState    epi;            /* per-person disease state + flash         */
+    EpiHistory  history;        /* past counts, for the chart               */
+    float       beta;           /* infection chance per sick-healthy contact, 0..1 */
+    float       gamma;          /* recovery chance per sick person, 0..1    */
+    int         tick;           /* ticks since the last reset               */
+    bool        paused;         /* true = disease frozen (SPACE toggles)    */
 
-    int         rows;           /* LINES this frame                         */
-    int         cols;           /* COLS  this frame                         */
+    int         rows;           /* terminal height this frame               */
+    int         cols;           /* terminal width  this frame               */
 } Scene;
 
-/* ── shared helpers ────────────────────────────────────────────── */
+/* ── shared helpers ── */
 
-/*
- * prob_roll — coin flip with probability p of returning true.
- *
- *   Pseudocode:  return rand() / RAND_MAX < p
- *
- *   The single primitive that drives every probabilistic event in
- *   the file:
- *     - rewire decision (§5 graph)
- *     - recovery roll   (§6 SIR)
- *     - transmission roll (§6 SIR)
- *
- *   Naming it makes the algorithm bodies read as
- *   "if (prob_roll(γ)) recover; ..." rather than an opaque
- *   `rand()/RAND_MAX` expression.  Caller is responsible for
- *   keeping p in [0, 1] — values outside are clamped at the
- *   THRESH_MIN/MAX bounds in handle_input.
- */
+/* The one coin flip behind every random event here: returns true with
+ * probability p (rewiring a link, recovering, infecting). Caller keeps p in
+ * 0..1; the input handler clamps it. */
 static inline bool prob_roll(float p)
 {
     return (float)rand() / (float)RAND_MAX < p;
 }
 
-/*
- * px_col / px_row — pixel-space → cell-space rounding.
- *   The renderer needs (col, row) cell indices; node positions live
- *   in pixel coordinates (CELL_W × CELL_H pixels per cell).  +0.5f
- *   rounds to the nearest cell.
- */
+/* Turn a pixel position into a terminal column/row, rounding to nearest. */
 static inline int px_col(float px) { return (int)(px / (float)CELL_W + 0.5f); }
 static inline int px_row(float py) { return (int)(py / (float)CELL_H + 0.5f); }
 
-/* ===================================================================== */
-/* §5  graph — Watts-Strogatz construction + ring layout                  */
-/* ===================================================================== */
+/* ── §5 graph — build the small-world network and place nodes on a circle ── */
 
-/* ── Topology construction ───────────────────────────────────────── */
+/* ── building the network ── */
 
-/*
- * topology_clear — zero adjacency and rewire flags.  Step 0 of any
- * (re)build; idempotent.
- */
+/* Wipe both link tables back to empty — first step of any (re)build. */
 static void topology_clear(Topology *t)
 {
     memset(t->adj,     0, sizeof t->adj);
     memset(t->rewired, 0, sizeof t->rewired);
 }
 
-/*
- * connect_ring_neighbours — Step 1: build the K-ring lattice.
- *
- *   Pseudocode:
- *     for each node i in 0..N-1:
- *       for each k in 1..K/2:
- *         adj[i][(i+k) mod N] := adj[(i+k) mod N][i] := true
- *
- *   Each node ends up with exactly K neighbours (K/2 on each side of
- *   the ring).  This is the regular-lattice starting point: high
- *   clustering, long path lengths.  rewire_edges introduces the
- *   shortcuts that turn it into a small-world graph.
- */
+/* Step 1: seat everyone in a circle and link each person to their K nearest
+ * neighbours (K/2 on each side). A tidy, regular ring — neighbours all know
+ * each other, but getting across the circle takes many hops. rewire_edges
+ * then adds the shortcuts that make it a "small world". */
 static void connect_ring_neighbours(Topology *t)
 {
     for (int i = 0; i < N_NODES; i++)
@@ -735,21 +258,10 @@ static void connect_ring_neighbours(Topology *t)
         }
 }
 
-/*
- * rewire_one_edge — Step 2.b: try to replace edge (i → old_j) with
- * (i → new_j) for some random new_j.
- *
- *   Pseudocode:
- *     for up to N tries:
- *       new_j := uniform random in [0, N)
- *       if new_j != i AND no existing edge (i, new_j):
- *         delete (i, old_j);  add (i, new_j);  mark new_j as rewired
- *         return
- *     give up — graph too dense to find a free slot
- *
- *   The retry budget caps work in pathological cases (almost-complete
- *   graphs); at WS_P=0.15 and K=4 the loop almost never fails.
- */
+/* Unplug one of person i's links (to old_j) and re-plug it to a random other
+ * person — a long-range shortcut. Picks a random partner that isn't i and
+ * isn't already linked; gives up after a bounded number of tries if the graph
+ * is too dense to find one (rare at our settings). */
 static void rewire_one_edge(Topology *t, int i, int old_j)
 {
     for (int tries = 0; tries < N_NODES; tries++) {
@@ -760,21 +272,11 @@ static void rewire_one_edge(Topology *t, int i, int old_j)
         t->rewired[i][new_j] = t->rewired[new_j][i] = true;
         return;
     }
-    /* dense graph: leave the original ring edge intact */
+    /* couldn't find a free partner — keep the original ring link */
 }
 
-/*
- * rewire_edges — Step 2: roll WS_P for each ring edge, redirecting
- * target to a random non-self non-neighbour.
- *
- *   Pseudocode:
- *     for each i, k in (0..N-1) × (1..K/2):
- *       if prob_roll(WS_P):
- *         rewire_one_edge(t, i, (i+k) mod N)
- *
- *   Iterates over the SAME (i, i+k) pairs that connect_ring_neighbours
- *   created, ensuring each ring edge gets exactly one rewire chance.
- */
+/* Step 2: walk every ring link and, with probability WS_P, turn it into a
+ * shortcut. Visiting the same pairs Step 1 made, so each link gets one shot. */
 static void rewire_edges(Topology *t)
 {
     for (int i = 0; i < N_NODES; i++)
@@ -783,16 +285,8 @@ static void rewire_edges(Topology *t)
                 rewire_one_edge(t, i, (i + k) % N_NODES);
 }
 
-/*
- * topology_build_ws — Watts-Strogatz orchestrator.
- *
- *   Pseudocode:
- *     1. topology_clear           — zero adjacency
- *     2. connect_ring_neighbours  — K-ring lattice
- *     3. rewire_edges             — replace ring edges with prob WS_P
- *
- *   Reference: Watts & Strogatz (1998) [1].
- */
+/* Build the whole small-world network: empty it, make the ring, add shortcuts.
+ * (Watts & Strogatz 1998.) */
 static void topology_build_ws(Topology *t)
 {
     topology_clear(t);
@@ -800,16 +294,8 @@ static void topology_build_ws(Topology *t)
     rewire_edges(t);
 }
 
-/*
- * topology_mean_degree — ⟨k⟩ over all nodes.
- *
- *   ⟨k⟩ = (1/N) · Σ_i deg(i)
- *
- *   With pure ring (no rewires) this equals K.  Rewires preserve
- *   total edges (each delete is paired with an add), so ⟨k⟩ stays
- *   at K even after rewiring.  Used in the HUD as the denominator
- *   of R0 = β·⟨k⟩/γ.
- */
+/* Average number of links per person. Stays at K even after rewiring (each
+ * unplug is paired with a re-plug). Feeds the R0 number in the HUD. */
 static float topology_mean_degree(const Topology *t)
 {
     int total = 0;
@@ -819,16 +305,11 @@ static float topology_mean_degree(const Topology *t)
     return (float)total / (float)N_NODES;
 }
 
-/* ── Ring layout (geometry) ──────────────────────────────────────── */
+/* ── placing nodes on the ring ── */
 
-/*
- * compute_ring_geometry — derive (centre, radius) for the network panel.
- *
- *   The network panel occupies the left NET_FRAC of the screen, and
- *   vertically the band between HUD_TOP_ROWS and rows - HUD_BOT_ROWS.
- *   The ring centre is the centre of that rectangle; the radius is
- *   RING_FRAC × half-min-extent so the ring fits inside with margin.
- */
+/* Work out where the ring sits: its centre and radius. The network gets the
+ * left NET_FRAC of the screen and the rows between the two HUD bars; the ring
+ * is centred in that box and sized to fit with a margin. */
 static void compute_ring_geometry(int rows, int cols,
                                   Vec2 *centre, float *radius)
 {
@@ -840,15 +321,8 @@ static void compute_ring_geometry(int rows, int cols,
     *radius     = RING_FRAC * (pw < ph ? pw : ph) * 0.5f;
 }
 
-/*
- * place_node_on_ring — pure geometry: node i's pixel position.
- *
- *   θ_i  = 2π·i/N − π/2          (start at 12 o'clock, sweep clockwise)
- *   pos  = centre + radius · (cos θ_i, sin θ_i)
- *
- *   The −π/2 phase shift puts node 0 at the TOP of the ring rather
- *   than at the right — matches the natural reader expectation.
- */
+/* Where node i goes on the circle: spread the N nodes evenly around it. The
+ * -pi/2 twist starts node 0 at the top (12 o'clock) instead of the right. */
 static Vec2 place_node_on_ring(int i, int n, Vec2 centre, float radius)
 {
     float angle = 2.f * (float)M_PI * (float)i / (float)n
@@ -858,13 +332,8 @@ static Vec2 place_node_on_ring(int i, int n, Vec2 centre, float radius)
     return p;
 }
 
-/*
- * layout_ring — orchestrator: compute geometry, then place each node.
- *
- *   Called at startup AND on every resize so node positions track
- *   the current terminal extent.  The TOPOLOGY (edges) is unchanged
- *   by resize — only the layout.
- */
+/* Place every node on the ring. Run at startup and on every resize so the
+ * picture refits the terminal; the links themselves never change. */
 static void layout_ring(Scene *sc)
 {
     Vec2  centre;
@@ -874,17 +343,9 @@ static void layout_ring(Scene *sc)
         sc->pos[i] = place_node_on_ring(i, N_NODES, centre, radius);
 }
 
-/* ===================================================================== */
-/* §6  SIR dynamics                                                       */
-/* ===================================================================== */
+/* ── §6 SIR dynamics — one tick of the disease spreading and people recovering ── */
 
-/*
- * count_state — count nodes currently in `target` compartment.
- *
- *   Single pass over EpiState.state.  The compartment is a parameter
- *   so one function covers all three counts — no per-compartment
- *   count_s / count_i / count_r split.
- */
+/* How many people are currently in a given state (S, I, or R). */
 static int count_state(const EpiState *epi, SIR target)
 {
     int n = 0;
@@ -893,19 +354,9 @@ static int count_state(const EpiState *epi, SIR target)
     return n;
 }
 
-/*
- * epi_reset — seed a fresh outbreak: all S except one random I.
- *
- *   Pseudocode:
- *     for each i:  state[i] := S;  flash[i] := 0
- *     seed := uniform random in [0, N)
- *     state[seed] := I;  flash[seed] := FLASH_TICKS
- *     clear history;  reset tick counter
- *
- *   Does NOT touch the topology — topology_build_ws runs once at
- *   startup.  Each 'r' keypress draws a fresh seed; topology stays
- *   constant.
- */
+/* Start a fresh outbreak: everyone healthy except one random patient zero,
+ * history cleared, clock to zero. The network is left alone, so each 'r'
+ * re-runs the disease on the same wiring. */
 static void epi_reset(Scene *sc)
 {
     for (int i = 0; i < N_NODES; i++) {
@@ -919,14 +370,8 @@ static void epi_reset(Scene *sc)
     sc->history = (EpiHistory){ 0 };
 }
 
-/*
- * epi_inject — find any S node and flip it to I (the 'i' key).
- *
- *   Manually seeds additional infections — useful when an outbreak
- *   has died out and you want to study spread again without losing
- *   the existing history.  Bounded retry budget covers the edge
- *   case where no S exists (all already I or R).
- */
+/* Infect one random healthy person (the 'i' key) — restarts spread after an
+ * outbreak fizzles, without wiping the chart. Gives up if nobody's healthy. */
 static void epi_inject(EpiState *epi)
 {
     for (int tries = 0; tries < N_NODES * 2; tries++) {
@@ -939,40 +384,25 @@ static void epi_inject(EpiState *epi)
     }
 }
 
-/*
- * decrement_flash_counters — age the just-infected flash markers.
- *
- *   Every node with flash > 0 decrements by 1 each tick.  When it
- *   reaches 0 the renderer switches the glyph from '*' (yellow flash)
- *   to '@' (red settled).  Runs BEFORE the SIR update so this tick's
- *   new infections start at the full FLASH_TICKS value.
- */
+/* Tick down each node's flash timer. When it hits 0 the glyph settles from
+ * '*' to '@'. Runs before the spread step so this tick's new infections start
+ * with a full flash. */
 static void decrement_flash_counters(EpiState *epi)
 {
     for (int i = 0; i < N_NODES; i++)
         if (epi->flash[i] > 0) epi->flash[i]--;
 }
 
-/*
- * try_recovery — one I rolls γ; on success, stages I → R in nxt[].
- *
- *   Probability γ per I node per tick.  Independent of neighbours.
- */
+/* Give one sick person a chance (gamma) to recover this tick. Staged into
+ * nxt[] rather than applied immediately (see snapshot/commit below). */
 static inline void try_recovery(int i, SIR *nxt, float gamma_rate)
 {
     if (prob_roll(gamma_rate))
         nxt[i] = R_STATE;
 }
 
-/*
- * try_transmission — one (I, S) edge rolls β; on success, stages
- * S → I in nxt[] and sets the flash counter for the new infectee.
- *
- *   Probability β per (I, S) edge per tick.  Note: the source's state
- *   is read from the CURRENT state[] (the pre-tick snapshot), not
- *   nxt[] — so an I that recovers this tick still transmits this
- *   tick (synchronous semantics).
- */
+/* Give a sick->healthy contact a chance (beta) to pass the disease along; on
+ * success the healthy neighbour j becomes infected and starts flashing. */
 static inline void try_transmission(int j, EpiState *epi, SIR *nxt,
                                     float beta_rate)
 {
@@ -982,21 +412,9 @@ static inline void try_transmission(int j, EpiState *epi, SIR *nxt,
     }
 }
 
-/*
- * tick_one_infected — apply recovery + transmission for ONE I node.
- *
- *   Pseudocode:
- *     try_recovery(i, nxt, γ)
- *     for each neighbour j with state[j] == S:
- *       try_transmission(j, epi, nxt, β)
- *
- *   Reads adjacency from the topology; reads neighbour susceptibility
- *   from epi->state (NOT from nxt — synchronous semantics).  If two
- *   I neighbours both try to infect the same S in one tick, both
- *   writes target the same nxt[j] slot and at most one transition
- *   survives — but the new I is "deserved" regardless of which
- *   neighbour's roll happened to succeed.
- */
+/* Everything one sick person does in a tick: maybe recover, and roll to
+ * infect each healthy neighbour. Whether a neighbour is healthy is read from
+ * this tick's snapshot, so the result doesn't depend on loop order. */
 static void tick_one_infected(int i, const Scene *sc, EpiState *epi,
                               SIR *nxt)
 {
@@ -1008,14 +426,8 @@ static void tick_one_infected(int i, const Scene *sc, EpiState *epi,
     }
 }
 
-/*
- * history_record — append the current (S, I, R) counts; bump peak.
- *
- *   Circular write: head advances mod HIST_LEN; once n reaches
- *   HIST_LEN, head wraps and overwrites the oldest sample (the
- *   chart still shows the most recent data_w samples).
- *   peak_i is monotonic over the run — only ever increases.
- */
+/* Record this tick's (S, I, R) counts into the ring buffer and update the
+ * worst-ever infected count. Wraps around to overwrite the oldest sample. */
 static void history_record(EpiHistory *h, int s, int i, int r)
 {
     h->s[h->head] = s;
@@ -1026,62 +438,33 @@ static void history_record(EpiHistory *h, int s, int i, int r)
     if (i > h->peak_i)   h->peak_i = i;
 }
 
-/*
- * history_prev_infected — return the I count from the PREVIOUS tick.
- *
- *   Used for phase detection in the HUD (GROWING vs WANING vs
- *   PLATEAU): compare current I count to history_prev_infected.
- *   Returns 0 if there's fewer than 2 samples (no prior tick).
- */
+/* The infected count one tick ago. The HUD compares it to "now" to decide
+ * whether the outbreak is growing, fading, or flat. Returns 0 before there's
+ * a previous tick to look at. */
 static int history_prev_infected(const EpiHistory *h)
 {
     if (h->n < 2) return 0;
     return h->i[(h->head - 2 + HIST_LEN) % HIST_LEN];
 }
 
-/*
- * snapshot_state — read epi.state into a scratch SIR[] buffer.
- *
- *   The "read-half" of the synchronous-update pattern: every
- *   per-node transition computed this tick will look at this
- *   immutable snapshot, NEVER at epi.state directly.  This is what
- *   makes the SIR step iteration-order-independent.
- *
- *   See cellular-automata literature on synchronous vs asynchronous
- *   update; Wolfram, "A New Kind of Science" §3 covers it.
- */
+/* Copy the current states into a scratch buffer. Everyone decides their next
+ * move by looking at this frozen photo, so two people changing in the same
+ * tick can't trip over each other and the result is order-independent. */
 static inline void snapshot_state(const EpiState *epi, SIR *out)
 {
     memcpy(out, epi->state, sizeof epi->state);
 }
 
-/*
- * commit_state — write the staged nxt[] buffer back as the new state.
- *
- *   The "write-half" of the synchronous-update pattern: after every
- *   per-node transition has been computed into nxt[], one atomic
- *   write applies all of them.  Pairs with snapshot_state above.
- */
+/* Once every decision is staged in nxt[], apply them all at once. Pairs with
+ * snapshot_state above. */
 static inline void commit_state(EpiState *epi, const SIR *in)
 {
     memcpy(epi->state, in, sizeof epi->state);
 }
 
-/*
- * compute_next_state — fill nxt[] with this tick's transitions.
- *
- *   Pseudocode:
- *     for each node i:
- *       if state[i] == I_STATE:
- *         tick_one_infected(i, sc, epi, nxt)
- *
- *   Only I nodes drive transitions (recovery + transmission); S and
- *   R nodes are passive (only changed by some I neighbour writing
- *   to their nxt[] slot).  tick_one_infected reads state[] (the
- *   pre-tick snapshot from snapshot_state) and writes nxt[], so
- *   neighbour ordering is irrelevant — this is the property the
- *   snapshot/commit dance buys us.
- */
+/* Work out everyone's next state into nxt[]. Only sick people act (recover,
+ * infect neighbours); the healthy and recovered just sit there until a sick
+ * neighbour reaches them. */
 static void compute_next_state(Scene *sc, SIR *nxt)
 {
     for (int i = 0; i < N_NODES; i++) {
@@ -1090,15 +473,8 @@ static void compute_next_state(Scene *sc, SIR *nxt)
     }
 }
 
-/*
- * record_current_counts — sample (S, I, R) compartment sizes into history.
- *
- *   One pass per compartment via count_state; the three results
- *   plus the all-time peak update are pushed onto the rolling
- *   history buffer by history_record.  Called after commit_state
- *   so the counts reflect THIS tick's transitions, not the
- *   pre-tick snapshot.
- */
+/* Tally S/I/R right now and push them onto the chart history. Called after the
+ * states are committed, so the numbers reflect this tick. */
 static void record_current_counts(Scene *sc)
 {
     int s = count_state(&sc->epi, S_STATE);
@@ -1107,24 +483,10 @@ static void record_current_counts(Scene *sc)
     history_record(&sc->history, s, i, r);
 }
 
-/*
- * sir_tick — advance the whole simulation by ONE frame.
- *
- *   Pseudocode (synchronous SIR update — cellular-automata pattern):
- *     if paused: return
- *     decrement_flash_counters       ← age render flash hints
- *     nxt := snapshot_state          ← READ HALF of sync update
- *     compute_next_state(nxt)        ← per-I transitions written to nxt
- *     commit_state(nxt)              ← WRITE HALF (atomic apply)
- *     tick++
- *     record_current_counts          ← push (S, I, R) to chart history
- *
- *   SYNCHRONOUS means every node's transition for this tick is
- *   COMPUTED from the pre-tick state, then APPLIED all at once.
- *   Without the snapshot/commit pair an I that recovered early in
- *   the loop wouldn't transmit to its neighbours, under-counting
- *   infections — a classic order-of-iteration bug in CA simulations.
- */
+/* Advance the disease one tick: age the flashes, photograph the current
+ * states, decide everyone's next move from that photo, apply them all at once,
+ * then record the new counts. The photo-then-apply order is what keeps the
+ * result fair regardless of who is processed first. Does nothing while paused. */
 static void sir_tick(Scene *sc)
 {
     if (sc->paused) return;
@@ -1140,18 +502,11 @@ static void sir_tick(Scene *sc)
     record_current_counts(sc);
 }
 
-/* ===================================================================== */
-/* §7  draw                                                               */
-/* ===================================================================== */
+/* ── §7 draw — paint the network, the epidemic chart, and the HUD ── */
 
-/*
- * draw_line — Bresenham rasteriser with slope-matched ASCII glyph.
- *
- *   At each step the glyph is chosen so the line visibly slopes in
- *   the right direction:  '-' horizontal, '|' vertical, '\' '/' diagonal.
- *
- *   Reference: Bresenham (1965) [10].
- */
+/* Draw a straight line of characters between two cells, picking a glyph that
+ * matches its slope ('-' flat, '|' upright, '/' or '\' diagonal). Integer-only
+ * line stepping (Bresenham 1965). */
 static void draw_line(int x0,int y0,int x1,int y1,attr_t attr,int cols,int rows)
 {
     int dx=abs(x1-x0),dy=abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1,err=dx-dy;
@@ -1168,63 +523,20 @@ static void draw_line(int x0,int y0,int x1,int y1,attr_t attr,int cols,int rows)
     }
 }
 
-/* ── left panel: network ─────────────────────────────────────────────── */
+/* ── left panel: the network ── */
 
-/*
- * NodeGlyph — the rendered representation of one node's SIR state.
- *
- * Intent
- *   The output of pick_node_glyph — a 3-tuple that
- *   draw_network_nodes passes straight to ncurses.  Naming the
- *   tuple as a struct lets the classifier function return a single
- *   value and decouples "what colour / glyph corresponds to state X"
- *   from the drawing loop.
- *
- *   Same idiom as the `case_glyph[16]` table in marching_squares.c
- *   and the `NodeGlyph` in kd_tree.c — render output as data, not
- *   logic.  Adding a new visual state (e.g. an "exposed" pre-
- *   infectious node) is a one-line case in pick_node_glyph; no
- *   draw-loop changes needed.
- *
- * Why a STRUCT (not three out-params or a packed int)
- *   - Three values, three roles; the names document the call sites.
- *   - Pass-by-value: 8-12 bytes, fits in registers on any 64-bit ABI.
- *   - Adding a fourth field (e.g. background colour for an overlay)
- *     is a one-line struct edit; no signature churn elsewhere.
- *
- * Visual legend (matches pick_node_glyph cases)
- *   S            → grey   '.'        (small dot, unobtrusive)
- *   I, flash > 0 → yellow '*'  bold  (just-infected highlight)
- *   I, flash = 0 → red    '@'  bold  (settled infection)
- *   R            → green  '+'        (recovered + immune)
- *
- *   These four mappings are the LEGEND the HUD's row-1 "key:" line
- *   exposes to the user.
- *
- * Members
- *   cp       ncurses colour-pair index (CP_S, CP_I, CP_I_FLASH,
- *            CP_R) — see §1 enum.
- *   ch       glyph character ('.', '@', '*', '+').
- *   extra    additional ncurses attributes — A_BOLD for I, 0 for S/R.
- *            ORed with COLOR_PAIR(cp) at the attron / attroff call.
- */
+/* How one node should look: which colour, which character, and any extra
+ * attribute (bold). Bundling the three keeps the "what does state X look like"
+ * decision in one place (pick_node_glyph) and out of the drawing loop. */
 typedef struct {
-    int    cp;      /* ncurses colour-pair index (see §1 CP_* enum) */
-    chtype ch;      /* glyph character drawn at the node's cell     */
-    attr_t extra;   /* extra attributes ORed in (A_BOLD or 0)       */
+    int    cp;      /* colour-pair index (CP_S, CP_I, ...) */
+    chtype ch;      /* the character to draw               */
+    attr_t extra;   /* A_BOLD, or 0 for none               */
 } NodeGlyph;
 
-/*
- * pick_node_glyph — translate (state, flash) to (cp, glyph, attrs).
- *
- *     state == S:                       grey '.'
- *     state == I  AND flash > 0:        bright yellow '*' (just infected)
- *     state == I  AND flash == 0:       red '@'           (settled)
- *     state == R:                       green '+'         (immune)
- *
- *   Extending the alphabet (e.g. an "exposed" pre-infectious state)
- *   only requires a new case here — the draw loop stays unchanged.
- */
+/* Pick the look for node i: grey '.' if healthy, bright '*' if just infected,
+ * red '@' if settled-infected, green '+' if recovered. This is the on-screen
+ * legend the HUD spells out. */
 static NodeGlyph pick_node_glyph(const EpiState *epi, int i)
 {
     switch (epi->state[i]) {
@@ -1237,18 +549,10 @@ static NodeGlyph pick_node_glyph(const EpiState *epi, int i)
     }
 }
 
-/*
- * pick_edge_attr — colour an edge by infection / shortcut status.
- *
- *     hot AND rewired:       bright yellow + bold  (shortcut active)
- *     hot AND ring:          bright red    + bold  (ring edge active)
- *     not hot:               dim grey              (background lattice)
- *
- *   "hot" means at least one endpoint is in state I.  The shortcut
- *   highlight is THE visualisation of small-world acceleration —
- *   bright yellow paths jumping across the ring tell you the
- *   epidemic is using a long-range link to spread.
- */
+/* Colour a link by how "live" it is. If either end is infected the link is
+ * active: bright yellow if it's a shortcut, red if it's an ordinary ring link.
+ * Otherwise dim grey background. Yellow shortcuts jumping across the ring are
+ * the visible sign of the disease taking a long-range hop. */
 static attr_t pick_edge_attr(const Scene *sc, int i, int j)
 {
     bool hot = (sc->epi.state[i] == I_STATE || sc->epi.state[j] == I_STATE);
@@ -1257,10 +561,8 @@ static attr_t pick_edge_attr(const Scene *sc, int i, int j)
     return                                    COLOR_PAIR(CP_EDGE_HOT)    | A_BOLD;
 }
 
-/*
- * draw_network_edges — every adjacency, drawn first so nodes paint
- * on top.  Pass i < j only to avoid drawing each edge twice.
- */
+/* Draw all the links, before the nodes so the nodes sit on top. Only j > i so
+ * each link is drawn once. */
 static void draw_network_edges(const Scene *sc)
 {
     int net_w = (int)(sc->cols * NET_FRAC);
@@ -1274,10 +576,8 @@ static void draw_network_edges(const Scene *sc)
         }
 }
 
-/*
- * draw_network_nodes — paint each node's glyph on top of its edges.
- *   Bounds-clipped to the network panel and the HUD-free band.
- */
+/* Draw each node on top of the links, skipping any that fall outside the
+ * left panel or behind the HUD bars. */
 static void draw_network_nodes(const Scene *sc)
 {
     int net_w = (int)(sc->cols * NET_FRAC);
@@ -1293,121 +593,35 @@ static void draw_network_nodes(const Scene *sc)
     }
 }
 
-/* draw_network — orchestrator: edges then nodes (painter's order). */
+/* The whole left panel: links first, then nodes over them. */
 static void draw_network(const Scene *sc)
 {
     draw_network_edges(sc);
     draw_network_nodes(sc);
 }
 
-/* ── right panel: epidemic curve ─────────────────────────────────────── */
+/* ── right panel: the epidemic chart ── */
 
-/*
- * ChartLayout — derived geometry for ONE frame's chart panel.
- *
- * Intent
- *   compute_chart_layout fills this struct from (rows, cols); the
- *   downstream draw_chart_* helpers consume it instead of recomputing
- *   each dimension at every call.
- *
- *   Same idiom as a "shader uniform block" in 3-D graphics: pre-
- *   compute the per-frame derived constants once, then pass them by
- *   const ptr to every fragment that needs them.  Saves both
- *   arithmetic AND the temptation for the draw_chart_* siblings to
- *   drift apart on geometry assumptions.
- *
- * Why a `valid` flag (not just panic on too-small terminals)
- *   When the user shrinks the terminal below the chart's minimum
- *   workable size, we want the network panel to keep rendering
- *   without an awkward partial chart appearing in slivers.
- *   compute_chart_layout sets valid = false and draw_chart bails;
- *   the rest of the frame still renders.  This pattern composes
- *   better than a global "panic" early-return at the top of
- *   scene_draw.
- *
- * Coordinate naming convention (left → right across the screen)
- *
- *       0 ─── net_w  net_w+1 ─── chart_x ─── data_x ─── cols
- *                  │           │           │           │
- *       network    │  divider  │  Y-axis   │  bar data │
- *       panel      │  (1 col)  │  labels   │  area     │
- *                  │           │  (3 col)  │           │
- *
- *   - net_w     : column index of the divider; equal to floor(cols*NET_FRAC)
- *   - chart_x   : net_w + 1 — first column past the divider
- *   - data_x    : chart_x + 3 — first column past the Y-axis label width
- *
- *   And vertically:
- *
- *       row 0 ─── HUD_TOP_ROWS = chart_top ─── data_top ─── rows-HUD_BOT_ROWS
- *
- *   - chart_top : HUD_TOP_ROWS (right after the top HUD)
- *   - data_top  : chart_top + 1 — leaves one row for the title
- *
- * Members
- *   net_w       column of the vertical divider (also last column of
- *               the network panel).
- *   chart_x     first column AFTER the divider — left edge of chart area.
- *   chart_top   first row of the chart area  (= HUD_TOP_ROWS).
- *   chart_h     height of the chart area
- *               (= rows − chart_top − HUD_BOT_ROWS).
- *   data_x      first column AFTER the Y-axis labels — left edge of
- *               the bar-chart data area.
- *   data_w      width of the data area in columns; the visible bars
- *               occupy the rightmost min(history.n, data_w) columns.
- *   data_top    chart_top + 1 (skips the title row).
- *   data_h      chart_h − 1.
- *   valid       false if any dimension check failed; draw_chart bails.
- *
- * Invariants (when valid == true)
- *   net_w + 1   == chart_x
- *   chart_top   == HUD_TOP_ROWS
- *   chart_h     ≥ 4         (else valid would be false)
- *   data_w      ≥ 4
- *   data_h      ≥ 2
- *   data_x      == chart_x + 3
- *   data_top    == chart_top + 1
- *   data_h      == chart_h − 1
- *
- *   These minima are what the early-return checks in
- *   compute_chart_layout enforce; downstream helpers can trust them.
- */
+/* Pre-computed screen rectangles for this frame's chart, worked out once and
+ * handed to all the chart-drawing helpers so they don't each redo the math (or
+ * disagree about it). The screen reads left to right: network panel | divider |
+ * Y-axis labels | the bars. The `valid` flag is the polite handling of a too-
+ * small terminal: if the chart can't fit, draw_chart just skips it and the
+ * network panel still draws. */
 typedef struct {
-    int  net_w;        /* column index of the vertical divider        */
-    int  chart_x;      /* leftmost column of chart area (= net_w + 1) */
-    int  chart_top;    /* first row of chart area (= HUD_TOP_ROWS)    */
-    int  chart_h;      /* total height of chart area                  */
-    int  data_x;       /* leftmost column of data area (past Y labels)*/
-    int  data_w;       /* width of data area in columns               */
-    int  data_top;     /* first row of data area (chart_top + 1)      */
-    int  data_h;       /* height of data area (chart_h − 1)           */
-    bool valid;        /* false if any dimension check failed         */
+    int  net_w;        /* column of the divider (right edge of the network) */
+    int  chart_x;      /* first column past the divider                     */
+    int  chart_top;    /* first row of the chart (just below the top HUD)   */
+    int  chart_h;      /* chart height in rows                              */
+    int  data_x;       /* first column of the bars (past the axis labels)   */
+    int  data_w;       /* width of the bar area in columns                  */
+    int  data_top;     /* first row of the bars (below the title row)       */
+    int  data_h;       /* height of the bar area in rows                    */
+    bool valid;        /* false = terminal too small; skip the chart        */
 } ChartLayout;
 
-/*
- * compute_chart_layout — derive all chart-panel dimensions from
- * the current terminal extent.
- *
- *   Pseudocode:
- *     net_w     := cols × NET_FRAC      ← edge of network panel
- *     chart_x   := net_w + 1            ← past divider column
- *     chart_top := HUD_TOP_ROWS
- *     chart_h   := rows - chart_top - HUD_BOT_ROWS
- *     y_lbl_w   := 3                    ← width reserved for "40 " "20 " " 0 "
- *     data_x    := chart_x + y_lbl_w
- *     data_w    := chart_w - y_lbl_w
- *     data_top  := chart_top + 1        ← one row for the title
- *     data_h    := chart_h - 1
- *     valid     := all dimensions fit
- */
-/*
- * split_panels_horizontally — divide the screen between the network
- * panel (left NET_FRAC) and the chart panel (right remainder).
- *
- *   Sets L->net_w (divider column) and L->chart_x (chart's left edge);
- *   returns false if the chart would be narrower than 8 columns
- *   (too small to render any meaningful curve).
- */
+/* Split the screen left/right: network on the left, chart on the right. Bails
+ * (returns false) if the chart would be under 8 columns wide. */
 static bool split_panels_horizontally(ChartLayout *L, int cols)
 {
     L->net_w   = (int)(cols * NET_FRAC);
@@ -1416,13 +630,8 @@ static bool split_panels_horizontally(ChartLayout *L, int cols)
     return chart_w >= 8;
 }
 
-/*
- * set_chart_vertical_extent — clip the chart vertically to the
- * HUD-free band [HUD_TOP_ROWS, rows − HUD_BOT_ROWS).
- *
- *   Sets L->chart_top and L->chart_h.  Returns false if the band is
- *   shorter than 4 rows (no room for title + axis + bars).
- */
+/* Fit the chart into the rows between the two HUD bars. Bails if fewer than 4
+ * rows are left (no room for title + bars). */
 static bool set_chart_vertical_extent(ChartLayout *L, int rows)
 {
     L->chart_top = HUD_TOP_ROWS;
@@ -1430,14 +639,8 @@ static bool set_chart_vertical_extent(ChartLayout *L, int rows)
     return L->chart_h >= 4;
 }
 
-/*
- * reserve_y_axis_columns — set aside Y_LBL_W=3 columns at the left of
- * the chart for "40 ", "20 ", " 0" axis labels.
- *
- *   Sets L->data_x (left edge of the bar data area) and L->data_w
- *   (width of the bar data area).  Returns false if data_w < 4
- *   (no room for any visible bars).
- */
+/* Reserve 3 columns at the left of the chart for the Y-axis numbers; what's
+ * left is the bar area. Bails if under 4 columns remain for bars. */
 static bool reserve_y_axis_columns(ChartLayout *L, int cols)
 {
     const int y_lbl_w = 3;          /* "40 ", "20 ", " 0" */
@@ -1446,13 +649,8 @@ static bool reserve_y_axis_columns(ChartLayout *L, int cols)
     return L->data_w >= 4;
 }
 
-/*
- * reserve_title_row — set aside ONE row at the top of the chart for
- * the " EPIDEMIC CURVE" title; everything below is the bar data area.
- *
- *   Sets L->data_top and L->data_h.  Returns false if the data area
- *   would be shorter than 2 rows (no usable bar height).
- */
+/* Reserve one row at the top for the title; the rest is bar height. Bails if
+ * under 2 rows remain for bars. */
 static bool reserve_title_row(ChartLayout *L)
 {
     L->data_top = L->chart_top + 1;
@@ -1460,20 +658,8 @@ static bool reserve_title_row(ChartLayout *L)
     return L->data_h >= 2;
 }
 
-/*
- * compute_chart_layout — orchestrate the four layout steps.
- *
- *   Pseudocode:
- *     split_panels_horizontally    ← divide screen N|C
- *     set_chart_vertical_extent    ← clip into HUD-free band
- *     reserve_y_axis_columns       ← left edge: axis labels
- *     reserve_title_row            ← top edge: chart title
- *     mark valid; return
- *
- *   Any step that returns false sets L.valid = false implicitly
- *   (it was initialised that way) and short-circuits the orchestrator.
- *   draw_chart's early-return on !L.valid then skips the whole panel.
- */
+/* Run the four sizing steps in order. If any step says "doesn't fit", we leave
+ * valid = false (its initial value) and stop, and draw_chart skips the panel. */
 static ChartLayout compute_chart_layout(int rows, int cols)
 {
     ChartLayout L = { .valid = false };
@@ -1485,7 +671,7 @@ static ChartLayout compute_chart_layout(int rows, int cols)
     return L;
 }
 
-/* draw_chart_divider — vertical bar separating network from chart. */
+/* The vertical line splitting the network panel from the chart panel. */
 static void draw_chart_divider(const Scene *sc, const ChartLayout *L)
 {
     attron(COLOR_PAIR(CP_DIVIDER));
@@ -1494,7 +680,7 @@ static void draw_chart_divider(const Scene *sc, const ChartLayout *L)
     attroff(COLOR_PAIR(CP_DIVIDER));
 }
 
-/* draw_chart_title — single yellow heading line above the data area. */
+/* The "EPIDEMIC CURVE" heading above the bars. */
 static void draw_chart_title(const ChartLayout *L)
 {
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
@@ -1502,7 +688,7 @@ static void draw_chart_title(const ChartLayout *L)
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/* draw_chart_axis_labels — 0, N/4, N/2, 3N/4, N along the Y axis. */
+/* The Y-axis tick numbers (0 up to N), marking node counts. */
 static void draw_chart_axis_labels(const ChartLayout *L)
 {
     attron(COLOR_PAIR(CP_HUD));
@@ -1514,18 +700,9 @@ static void draw_chart_axis_labels(const ChartLayout *L)
     attroff(COLOR_PAIR(CP_HUD));
 }
 
-/*
- * draw_chart_stacked_bars — one column per visible history sample,
- * stacked R (bottom green) → I (middle red) → S (top grey).
- *
- *   Pseudocode:
- *     n_show := min(history.n, data_w)              ← columns to draw
- *     for cx in 0..n_show-1:
- *       bi := circular-buffer index of sample (oldest at left)
- *       rh, ih, sh := scaled heights for R, I, S
- *       for each row from bottom up:
- *         paint R / I / S glyph depending on which segment owns this row
- */
+/* The bars themselves: one column per past tick, newest on the right. Each
+ * column is stacked recovered (green, bottom), infected (red, middle),
+ * susceptible (grey, top), with each band's height scaled to the node count. */
 static void draw_chart_stacked_bars(const Scene *sc, const ChartLayout *L)
 {
     int n_show = sc->history.n < L->data_w ? sc->history.n : L->data_w;
@@ -1563,13 +740,8 @@ static void draw_chart_stacked_bars(const Scene *sc, const ChartLayout *L)
     }
 }
 
-/*
- * draw_chart_peak_marker — "pk" label at the all-time outbreak peak.
- *
- *   peak_i is monotonic over the run (see history_record), so this
- *   label only moves UP (or stays put).  Drawn in dim red so it
- *   reads as an annotation, not part of the bars.
- */
+/* A small "pk" tag at the height of the worst-ever infected count, so you can
+ * see how bad the peak got even after it passes. Dim so it reads as a note. */
 static void draw_chart_peak_marker(const Scene *sc, const ChartLayout *L)
 {
     if (sc->history.peak_i <= 0) return;
@@ -1581,18 +753,8 @@ static void draw_chart_peak_marker(const Scene *sc, const ChartLayout *L)
     attroff(COLOR_PAIR(CP_I) | A_DIM);
 }
 
-/*
- * draw_chart — orchestrator.
- *
- *   Pseudocode:
- *     L := compute_chart_layout(rows, cols)
- *     if !L.valid: return                      ← too small to render
- *     draw_chart_divider      (sc, &L)
- *     draw_chart_title        (&L)
- *     draw_chart_axis_labels  (&L)
- *     draw_chart_stacked_bars (sc, &L)
- *     draw_chart_peak_marker  (sc, &L)
- */
+/* The whole right panel: lay it out, then (if it fits) draw divider, title,
+ * axis, bars, and peak marker. */
 static void draw_chart(const Scene *sc)
 {
     ChartLayout L = compute_chart_layout(sc->rows, sc->cols);
@@ -1604,22 +766,11 @@ static void draw_chart(const Scene *sc)
     draw_chart_peak_marker (sc, &L);
 }
 
-/* ── HUD (top rows: data, bottom row: actions) ───────────────────────── */
+/* ── HUD (top rows: live numbers, bottom row: key hints) ── */
 
-/*
- * detect_epidemic_phase — classify the current frame into one of
- * five readable labels: READY, SEEDED, GROWING, WANING, PLATEAU,
- * EXTINCT.
- *
- *   Pseudocode:
- *     if I == 0 AND R == 0:  READY  ← never seeded
- *     if I == 0:             EXTINCT (was infected; now all R)
- *     if no prior tick:      SEEDED
- *     compare current I to history_prev_infected:
- *       larger  →  GROWING
- *       smaller →  WANING
- *       equal   →  PLATEAU
- */
+/* A one-word label for where the outbreak is right now: READY (not started),
+ * SEEDED (just started), GROWING / WANING / PLATEAU (by comparing the infected
+ * count to last tick's), or EXTINCT (everyone's recovered). */
 static const char *detect_epidemic_phase(const Scene *sc, int ni, int nr)
 {
     if (ni == 0 && nr == 0) return "READY  ";
@@ -1631,13 +782,8 @@ static const char *detect_epidemic_phase(const Scene *sc, int ni, int nr)
     return                  "PLATEAU";
 }
 
-/*
- * draw_hud_rates — column 0 of row 0: "β=0.040  γ=0.025".
- *
- *   The two probabilistic rates the user adjusts with the arrow keys.
- *   These are the INPUTS to the SIR dynamics; everything else on row
- *   0 (R0, <k>, S/I/R, phase) is derived.
- */
+/* The two rates the user dials with the arrow keys: infection (beta) and
+ * recovery (gamma). Everything else on the top row is computed from these. */
 static void draw_hud_rates(const Scene *sc)
 {
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
@@ -1645,19 +791,10 @@ static void draw_hud_rates(const Scene *sc)
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/*
- * draw_hud_r0 — column 18 of row 0: "R0=6.40" with threshold colouring.
- *
- *   R0 = β·⟨k⟩/γ — the BASIC REPRODUCTION NUMBER.  Threshold is 1:
- *     R0 > 1   →  epidemic spreads      (rendered red)
- *     R0 ≤ 1   →  epidemic dies         (rendered green)
- *
- *   The colour swap at R0 = 1 IS the phase-transition signal — the
- *   user can drag β/γ and watch R0 cross the threshold and the
- *   colour flip mid-frame.
- *
- *   References [4], [5] §2 for the derivation.
- */
+/* R0: roughly how many people one sick person infects before recovering. Above
+ * 1 the disease takes off (shown red), at-or-below 1 it dies out (green). Drag
+ * the rates and watch the colour flip as R0 crosses 1 — that's the tipping
+ * point. (Anderson & May 1991 for the formula behind it.) */
 static void draw_hud_r0(float r0)
 {
     attr_t a = (r0 > 1.f) ? (COLOR_PAIR(CP_I) | A_BOLD)
@@ -1667,14 +804,8 @@ static void draw_hud_r0(float r0)
     attroff(a);
 }
 
-/*
- * draw_hud_summary — column 27 of row 0: derived state at a glance.
- *
- *   <k>=mean_degree  tick=N  S=n I=n R=n  PHASE  [PAUSED]
- *
- *   Everything here is DERIVED from sc (counts, topology_mean_degree)
- *   or from sc plus history (phase) — no new state.
- */
+/* The rest of the top row: average links per person, tick count, the S/I/R
+ * tallies, the phase label, and a PAUSED marker. */
 static void draw_hud_summary(const Scene *sc, float mk, int ns, int ni, int nr,
                              const char *phase)
 {
@@ -1686,18 +817,9 @@ static void draw_hud_summary(const Scene *sc, float mk, int ns, int ni, int nr,
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/*
- * draw_bar_segment — paint ONE coloured segment of the stacked bar.
- *
- *   Pseudocode:
- *     fill := count × bar_w / total       ← proportional length
- *     paint `glyph` in colour `cp` from column bx for `fill` cells
- *     return bx + fill                    ← new write head for caller
- *
- *   Returning the advanced cursor position lets the caller chain
- *   segments without tracking the offset itself — the classic
- *   "fold" idiom (a → b → c → … applied left-to-right).
- */
+/* Draw one coloured chunk of the horizontal proportion bar, its length set by
+ * count's share of the total. Returns where the next chunk should start, so
+ * the caller can lay them end to end. */
 static int draw_bar_segment(int row, int bx, int count, int total, int bar_w,
                             int max_col, int cp, attr_t extra, chtype glyph)
 {
@@ -1709,10 +831,7 @@ static int draw_bar_segment(int row, int bx, int count, int total, int bar_w,
     return bx + fill;
 }
 
-/*
- * draw_segment_legend — three coloured "S I R" letters keyed to the
- * bar segment colours.  Tells the reader what the bar's colours mean.
- */
+/* The coloured "S I R" key that says which colour is which in the bar. */
 static void draw_segment_legend(int row, int bx)
 {
     attron(COLOR_PAIR(CP_BAR_S));        mvprintw(row, bx+2, "S"); attroff(COLOR_PAIR(CP_BAR_S));
@@ -1720,11 +839,8 @@ static void draw_segment_legend(int row, int bx)
     attron(COLOR_PAIR(CP_BAR_R));        mvprintw(row, bx+6, "R"); attroff(COLOR_PAIR(CP_BAR_R));
 }
 
-/*
- * draw_glyph_key — the " key: .=S @=I +=R" hint that maps the
- * NETWORK-PANEL glyphs to their meaning.  Distinct from the segment
- * legend (which keys the BAR colours).
- */
+/* The ".=S @=I +=R" key explaining the node glyphs in the network panel
+ * (separate from the bar-colour key above). */
 static void draw_glyph_key(int row, int bx)
 {
     attron(COLOR_PAIR(CP_HUD));
@@ -1735,19 +851,9 @@ static void draw_glyph_key(int row, int bx)
     attron(COLOR_PAIR(CP_R));        mvprintw(row, bx+23, "+=R");  attroff(COLOR_PAIR(CP_R));
 }
 
-/*
- * draw_hud_proportion_bar — row 1: stacked-fill bar showing the
- * current S / I / R proportions of the population.
- *
- *   Pseudocode:
- *     bar_w := cols - 22                ← width budget
- *     bx    := 1                        ← writer head, after lead pad
- *     bx    := draw_bar_segment(..., S, '=')
- *     bx    := draw_bar_segment(..., I, '#')
- *     bx    := draw_bar_segment(..., R, '-')
- *     draw_segment_legend(bx)           ← " S I R " key for the bar
- *     draw_glyph_key(bx)                ← " key: .=S @=I +=R " for the network
- */
+/* Row 1: a single horizontal bar split into S / I / R chunks showing what
+ * fraction of the population is in each state right now, with both keys after
+ * it. */
 static void draw_hud_proportion_bar(const Scene *sc, int ns, int ni, int nr)
 {
     int bar_w = sc->cols - 22;
@@ -1763,21 +869,8 @@ static void draw_hud_proportion_bar(const Scene *sc, int ns, int ni, int nr)
     draw_glyph_key     (1, bx);
 }
 
-/*
- * draw_hud_top — top HUD_TOP_ROWS rows: live DATA readout.
- *
- *   Pseudocode:
- *     compute ns, ni, nr, mk, r0, phase   ← derived quantities
- *     draw_hud_rates                       ← row 0 cols 0-17
- *     draw_hud_r0                          ← row 0 col 18, threshold-coloured
- *     draw_hud_summary                     ← row 0 col 27 onwards
- *     draw_hud_proportion_bar              ← row 1: stacked S/I/R bar + keys
- *
- *   Top bar follows the project HUD Standard: bright yellow + A_BOLD
- *   (CP_HUD) so the bar stays legible against any animation that
- *   intrudes from the network panel below.  R0 uses CP_I/CP_R to
- *   colour-code the epidemic-threshold crossing (see draw_hud_r0).
- */
+/* The whole top status area: compute the live numbers, then draw the rates,
+ * R0, the summary line, and the proportion bar. */
 static void draw_hud_top(const Scene *sc)
 {
     int ns = count_state(&sc->epi, S_STATE);
@@ -1793,13 +886,7 @@ static void draw_hud_top(const Scene *sc)
     draw_hud_proportion_bar (sc, ns, ni, nr);
 }
 
-/*
- * draw_hud_bottom — last row: ACTION key hints.
- *
- *   Bright cyan + A_BOLD per the project HUD Standard.  Lists every
- *   interactive key bound in handle_input; each key here changes a
- *   value visible in the top data bar.
- */
+/* The bottom row: the list of keys you can press. */
 static void draw_hud_bottom(const Scene *sc)
 {
     attron(COLOR_PAIR(CP_HINT)|A_BOLD);
@@ -1808,19 +895,8 @@ static void draw_hud_bottom(const Scene *sc)
     attroff(COLOR_PAIR(CP_HINT)|A_BOLD);
 }
 
-/*
- * scene_draw — render one frame.
- *
- *   Pseudocode (the entire frame pipeline):
- *     1. draw_hud_top      ─ row 0+1: live data (yellow)
- *     2. draw_network      ─ left panel: ring + edges + nodes
- *     3. draw_chart        ─ right panel: scrolling epidemic curve
- *     4. draw_hud_bottom   ─ last row: key hints (cyan)
- *
- *   Step 1 is drawn first so steps 2-3 can overlap it visually only
- *   if positions are mis-clipped (defensive; should never happen with
- *   correct HUD_*_ROWS reservations).
- */
+/* Paint one whole frame: top HUD, then the network, the chart, and the key
+ * hints. */
 static void scene_draw(const Scene *sc)
 {
     draw_hud_top   (sc);
@@ -1829,10 +905,10 @@ static void scene_draw(const Scene *sc)
     draw_hud_bottom(sc);
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app — startup, the main loop, input handling, cleanup ── */
 
+/* Set by signal handlers, read by the main loop. volatile sig_atomic_t is the
+ * only type a handler may safely touch. */
 static volatile sig_atomic_t g_quit   = 0;
 static volatile sig_atomic_t g_resize = 0;
 
@@ -1843,10 +919,7 @@ static void sig_h(int s)
 }
 static void cleanup(void) { endwin(); }
 
-/*
- * clamp01 — pin a value into [0, 1].  Used to bound β and γ when the
- * user adjusts them via arrow keys.
- */
+/* Keep a value between 0 and 1 — beta and gamma are probabilities. */
 static inline float clamp01(float v)
 {
     if (v < 0.f) return 0.f;
@@ -1854,14 +927,8 @@ static inline float clamp01(float v)
     return v;
 }
 
-/*
- * handle_input — dispatch one keypress against the scene.
- *
- *   Pure delegation: every key maps to a small mutation of sc.
- *   Quit signals go through g_quit so SIGINT/SIGTERM take the same
- *   exit path as the 'q' key.  β and γ are clamped to [0, 1] so
- *   the probability roll in prob_roll always sees a valid value.
- */
+/* Act on one keypress: quit, pause, reset, inject, or nudge a rate. Quit goes
+ * through g_quit so 'q' and Ctrl-C take the same exit path. */
 static void handle_input(Scene *sc, int ch)
 {
     switch (ch) {
@@ -1877,18 +944,17 @@ static void handle_input(Scene *sc, int ch)
     }
 }
 
-/* ── main loop helpers ───────────────────────────────────────────────── */
+/* ── startup and main loop ── */
 
-/* init_random_seed — seed the libc RNG from the monotonic clock. */
+/* Seed the random number generator from the clock so each run differs. */
 static void init_random_seed(void)
 {
     srand((unsigned)(clock_ns() & 0xFFFFFFFF));
 }
 
-/*
- * register_signal_handlers — wire SIGINT/SIGTERM to g_quit and
- * SIGWINCH to g_resize, plus atexit(cleanup) so endwin always runs.
- */
+/* Hook up the signals: Ctrl-C / kill ask the loop to quit, a window resize
+ * asks it to relayout, and atexit makes sure the terminal is restored even on
+ * a crash. */
 static void register_signal_handlers(void)
 {
     atexit(cleanup);
@@ -1897,12 +963,10 @@ static void register_signal_handlers(void)
     signal(SIGWINCH, sig_h);
 }
 
-/*
- * init_ncurses_session — bring up ncurses in the mode this demo
- * needs: cbreak (raw keys), noecho, keypad (for arrow keys),
- * nodelay (non-blocking getch), hidden cursor, no typeahead,
- * colours initialised.
- */
+/* Start ncurses the way this demo wants it: raw unbuffered keys, no echo,
+ * arrow keys recognised, non-blocking input, hidden cursor, and colour on.
+ * typeahead(-1) stops ncurses pausing the redraw to peek at input (avoids
+ * tearing). */
 static void init_ncurses_session(void)
 {
     initscr();
@@ -1911,20 +975,9 @@ static void init_ncurses_session(void)
     color_init();
 }
 
-/*
- * init_scene — set default rates and build the one-shot graph + layout.
- *
- *   Pseudocode:
- *     sc.beta, sc.gamma := INIT defaults    (clamped to [0, 1])
- *     sc.paused := false;  sc.tick := 0
- *     read terminal extent into sc.rows, sc.cols
- *     topology_build_ws(&sc.topology)       ← built ONCE per run
- *     layout_ring(sc)                       ← positions for current size
- *     epi_reset(sc)                         ← seed first infection
- *
- *   The TOPOLOGY survives the entire program lifetime; only the
- *   layout is rebuilt on resize and only the epi state is wiped on 'r'.
- */
+/* Set the starting rates, build the network once, place it, and seed the first
+ * infection. The network lasts the whole run; only the layout is redone on
+ * resize and only the disease is wiped on reset. */
 static void init_scene(Scene *sc)
 {
     sc->beta   = BETA_INIT;
@@ -1937,13 +990,8 @@ static void init_scene(Scene *sc)
     epi_reset(sc);
 }
 
-/*
- * handle_resize — refresh ncurses' terminal size cache and rebuild
- * the ring layout so node positions track the new extent.
- *
- *   The TOPOLOGY (edges) is unchanged on resize — only pixel
- *   positions; this keeps the simulation continuous across resizes.
- */
+/* On a window resize, tell ncurses the new size and replace the node positions
+ * to match. The disease keeps running; only the picture is refitted. */
 static void handle_resize(Scene *sc)
 {
     g_resize = 0;
@@ -1953,17 +1001,9 @@ static void handle_resize(Scene *sc)
 }
 
 /*
- * render_one_frame — paint + flush one ncurses frame.
- *
- *   Pseudocode:
- *     erase                ← clear stdscr's virtual buffer
- *     scene_draw(sc)       ← paint everything into stdscr
- *     wnoutrefresh         ← stage the diff (no terminal I/O yet)
- *     doupdate             ← flush ONE diff to the terminal
- *
- *   The wnoutrefresh + doupdate split is the standard ncurses idiom
- *   for "only emit one diff per frame" — see Pradeep Padala's ncurses
- *   HOWTO, "Update vs. wnoutrefresh + doupdate".
+ * Draw and show one frame. erase clears the back buffer, scene_draw paints it,
+ * and wnoutrefresh+doupdate push a single minimal update to the terminal (one
+ * write per frame, the standard ncurses way to avoid flicker).
  */
 static void render_one_frame(const Scene *sc)
 {
@@ -1973,35 +1013,15 @@ static void render_one_frame(const Scene *sc)
     doupdate();
 }
 
-/*
- * sleep_to_frame_deadline — burn the remainder of the frame budget.
- *
- *   Holds the loop to FPS by sleeping (frame_ns − elapsed) since t0.
- *   If we overran the budget (negative delta) clock_sleep_ns no-ops,
- *   so a slow frame just doesn't get any sleep — no spiral.
- */
+/* Wait out whatever's left of this frame's time budget to hold the target FPS.
+ * If the frame already ran long, the sleep is zero — no catch-up spiral. */
 static void sleep_to_frame_deadline(long long t0, long long frame_ns)
 {
     clock_sleep_ns(frame_ns - (clock_ns() - t0));
 }
 
-/*
- * main — own the Scene, build the graph once, drive the fixed-rate loop.
- *
- *   Pseudocode:
- *     init_random_seed
- *     register_signal_handlers
- *     init_ncurses_session
- *     init_scene(&scene)           ← topology + layout + first seed
- *
- *     while !g_quit:
- *       if g_resize: handle_resize
- *       handle_input(scene, getch)
- *       t0 := now
- *       sir_tick(scene)            ← advance one tick (or no-op if paused)
- *       render_one_frame(scene)
- *       sleep_to_frame_deadline(t0)
- */
+/* Set everything up, then loop until quit: handle resize, read a key, advance
+ * the disease one tick, draw, and sleep to keep a steady frame rate. */
 int main(void)
 {
     init_random_seed();

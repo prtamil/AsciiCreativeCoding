@@ -1,217 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * geometry/visibility_polygon.c -- Visibility Polygon Simulator
+ * visibility_polygon.c -- what a light at a moving point can see inside a
+ * room of walls.  Shoot rays at every wall corner, find where each ray first
+ * hits a wall, connect the hit points into a polygon, then fill it.  The
+ * observer drifts along a looping Lissajous path so the lit region animates.
  *
- * An observer glides along a Lissajous figure path inside a room full of
- * wall obstacles.  At each frame the exact set of cells visible from the
- * observer is computed via the angular-sweep algorithm and drawn with
- * distance-coded fill characters.
+ * Algorithm: exact angular-sweep visibility polygon (Asano 1986).  Clearest
+ * walkthrough: Red Blob Games, "2D Visibility"
+ * (https://www.redblobgames.com/articles/visibility/).
  *
- * -------------------------------------------------------------------------
- *  Section map
- * -------------------------------------------------------------------------
- *  S1  config       -- sizes, timing, aspect ratio, algorithm constants
- *  S2  clock        -- monotonic ns clock + sleep
- *  S3  color        -- fill / walls / observer / HUD color pairs
- *  S4  geometry     -- Wall, WallSpec, SweepHit, VisibilityPolygon types;
- *                      ray_hits_wall(), aspect-ratio helpers
- *  S5  visibility   -- compute_visibility(), cast_ray_in_direction(),
- *                      find_angle_sector(), cell_is_visible()
- *  S6  scene        -- WallSet/Observer/SimControls/Scene structs +
- *                      scene_init / scene_tick / random-wall generator
- *  S7  render       -- scene_addch helper, render_scene(), draw_hud()
- *  S8  screen       -- ncurses init / teardown
- *  S9  app          -- signals, input, main loop
- * -------------------------------------------------------------------------
- *
- * Keys:  SPACE pause/resume   r reset   +/- speed   q quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *       algorithms/visibility_polygon.c -o vp -lncurses -lm
+ * Keys: SPACE pause  r reset  +/- speed  q quit
+ * Build: gcc -std=c11 -O2 -Wall -Wextra algorithms/visibility_polygon.c \
+ *            -o vp -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Exact angular-sweep visibility polygon.  From observer
- *                 O, only WALL ENDPOINT directions matter — between
- *                 two consecutive endpoint angles the nearest wall
- *                 cannot change, so the visibility boundary is a
- *                 straight segment between two ray-wall hits.  We
- *                 cast 3 rays per endpoint (θ - ε, θ, θ + ε) so
- *                 corners on either side are handled correctly, then
- *                 sort all hits by angle and join them as a polygon.
- *
- * Math          : Ray-segment intersection via 2-D cross product:
- *                   denom = D × (B - A)
- *                   t     = (A - O) × (B - A) / denom
- *                   s     = (A - O) × D       / denom
- *                 Hit is valid iff t > 0 AND 0 ≤ s ≤ 1.
- *                 Pick the wall with smallest t.
- *
- * Aspect fix    : Terminal cells are 2:1 tall.  Geometry done in
- *                 "geo space" where y is multiplied by ASPECT_Y to
- *                 make distances metrically isotropic.
- *
- * Performance   : O(E log E) for sorting endpoint angles, plus
- *                 O(E · W) for ray-vs-all-walls intersection.  With
- *                 MAX_WALLS = 13 walls × 2 endpoints × 3 ε-bracket rays
- *                 = 78 rays per frame; well under 1 ms per frame.
- *
- * References
- * ──────────
- *   ── Original algorithm papers ───────────────────────────────────
- *   [1] Asano, T., Asano, T., Guibas, L., Hershberger, J. & Imai, H.
- *       (1986), "Visibility of disjoint polygons", Algorithmica
- *       1(1), pp. 49-63 — the foundational angular-sweep paper;
- *       casting rays only at wall endpoints originates here.
- *   [2] ElGindy, H. & Avis, D. (1981), "A linear algorithm for
- *       computing the visibility polygon from a point", J. Algorithms
- *       2(2), pp. 186-197 — the O(n) visibility-from-a-point algorithm
- *       for an observer inside a simple polygon.
- *   [3] Lee, D. T. (1983), "Visibility of a simple polygon", Computer
- *       Vision, Graphics, and Image Processing 22(2), pp. 207-221 —
- *       predecessor to El Gindy & Avis; the classic stack-based sweep.
- *   [4] Suri, S. & O'Rourke, J. (1986), "Worst-case optimal algorithms
- *       for constructing visibility polygons with holes", SoCG '86 —
- *       generalises angular sweep to polygons-with-holes (the case
- *       this file uses, with isolated wall obstacles).
- *
- *   ── Canonical textbooks ────────────────────────────────────────
- *   [5] de Berg, M., Cheong, O., van Kreveld, M. & Overmars, M.
- *       (2008), "Computational Geometry: Algorithms and Applications"
- *       (3rd ed.), Springer — Ch. 15 (art gallery + visibility),
- *       Ch. 2 (line-segment intersection via plane sweep).  The
- *       standard graduate text.
- *   [6] O'Rourke, J. (1998), "Computational Geometry in C" (2nd ed.),
- *       Cambridge — Ch. 8 covers visibility polygons with full C code.
- *       The most accessible implementation-oriented reference.
- *   [7] Goodman, J. E., O'Rourke, J. & Tóth, C. D. (eds., 2017),
- *       "Handbook of Discrete and Computational Geometry" (3rd ed.),
- *       CRC — Ch. 33 (visibility) collects every modern result in
- *       one place.  Reference, not introduction.
- *
- *   ── Ray-segment intersection primitive (§4 math) ───────────────
- *   [8] Ericson, C. (2005), "Real-Time Collision Detection", Morgan
- *       Kaufmann — §5.1 ray vs segment, §5.3 ray vs polygon.  The
- *       practical-implementation reference; explains numerical
- *       robustness concerns the textbooks skip.
- *   [9] Bourke, P. (1989), "Intersection point of two lines in 2D" —
- *       http://paulbourke.net/geometry/pointlineplane/ — the same
- *       cross-product derivation used in ray_hits_wall(), in 3
- *       short pages with worked examples.
- *
- *   ── Algorithm visualisation ────────────────────────────────────
- *  [10] Patel, A., "2D Visibility", Red Blob Games —
- *       https://www.redblobgames.com/articles/visibility/ —
- *       interactive WebGL walkthrough of this exact angular-sweep
- *       algorithm.  The most pedagogically clear treatment of the
- *       ε-offset corner trick that §5 uses.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Stand somewhere in a room full of walls.  The set of cells you
- * can see (no wall in the way) is the VISIBILITY POLYGON.  Compute
- * it: sweep a ray 360° around the observer; at each angle, record
- * where the ray first hits a wall; connect those hit points and
- * fill the interior.  Cleverness: only WALL CORNERS matter — at
- * angles between corners, the polygon edge is a straight line from
- * hit-at-corner-A to hit-at-corner-B.  So we cast O(E) rays
- * instead of "infinitely many."
- *
- * ALGORITHM IN STEPS  (per frame)
- * ───────────────────────────────
- *  1. Move observer along Lissajous path.
- *  2. Collect all wall-endpoint angles relative to observer.
- *  3. For each endpoint at angle θ, cast THREE rays:
- *     θ - ε, θ, θ + ε.  The ε-offset rays disambiguate corners.
- *  4. For each ray:
- *     For each wall, compute ray-segment intersection (t, s).
- *     Valid iff t > 0 AND 0 ≤ s ≤ 1.  Keep min-t hit.
- *  5. Sort hits by angle.  The polygon is the closed list of hits
- *     in angular order.
- *  6. Render: cell is visible iff angularly-bracketing hits give
- *     a wall-distance ≥ cell-distance to observer.
- *
- * KEY FORMULAS
- * ────────────
- *   Ray-segment intersection (2-D cross product):
- *     denom = D.x · (B.y - A.y) - D.y · (B.x - A.x)
- *     if denom == 0: parallel, no hit
- *     t = ((A.x - O.x)·(B.y - A.y) - (A.y - O.y)·(B.x - A.x)) / denom
- *     s = ((A.x - O.x)·D.y       - (A.y - O.y)·D.x      ) / denom
- *     hit valid iff t > 0 AND 0 ≤ s ≤ 1
- *
- *   Polygon area (shoelace):
- *     area = ½ · |Σ (x_i · y_{i+1} - x_{i+1} · y_i)|
- *
- *   Aspect: y_geo = y_cell · ASPECT_Y
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS + MENTAL MODEL above — read first as prose.
- *   2. §4 data types — Wall, WallSpec, SweepHit, VisibilityPolygon.
- *      Sub-structs are referenced by every later step; understanding
- *      their fields makes the rest read like pseudocode.
- *   3. §5 visibility — compute_visibility orchestrator (collect
- *      endpoint angles → cast every ray → sort by angle → shoelace
- *      area).  THE HEART of this file.  Each step is one named helper.
- *   4. §4 geometry — ray-vs-segment intersection primitive.
- *      The single most important math; everything else is bookkeeping.
- *   5. §6 scene — WallSet / Observer / SimControls / Scene structs
- *      + the tick / init / random-wall generator built on top of them.
- *   6. §7 render — five-pass painter (paint_visible_cells →
- *      draw_sweep_ray → paint_interior_walls → paint_bounding_box →
- *      paint_observer_glyph) + draw_hud (top status / bottom hint).
- *   7. §9 app — main loop with handle_resize / advance_fixed_timestep /
- *      app_handle_input / frame_render / wait_until_next_frame.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   Almost everything lives in `Scene scene` on main()'s stack and
- *   threads through every function as `Scene *s` (mutators) or
- *   `const Scene *s` (observers).  Only the POSIX signal flags
- *   (g_quit, g_resize_pending) remain global; signal handlers cannot
- *   receive a context pointer.
- *
- *   s->walls.list[]            line-segment obstacles in cell coords.
- *   s->walls.count             number of valid entries in list[].
- *   s->walls.rand_specs[]      randomised-layout fractions (use_rand=true).
- *   s->observer.x_cells/y_cells  current eye position (Lissajous-driven).
- *   s->observer.lissajous_t      drift-path phase (radians).
- *   s->observer.sweep_angle_rad  independent '*' overlay ray angle.
- *   s->vis.hits[]              ray-hit list (sorted by angle).
- *   s->vis.n_hits              valid hit count.
- *   s->vis.visible_area_cells  shoelace area, cached for HUD.
- *   s->sim.paused / s->sim.fps user-controlled run parameters.
- *   s->scene_cols / s->scene_rows  drawable extent (term minus HUD_ROWS).
- *
- *   theta, eps                 sweep angle + ε disambiguator (local to §5).
- *   ASPECT_Y                   y-stretch factor for geo space (§4 helper).
- *
- * Background you need
- * ───────────────────
- *   - 2-D cross product as winding determinant
- *     (algorithms/convex_hull.c T2 if new).
- *   - Linear ray equation P(t) = O + t·D, segment Q(s) = A + s·(B−A).
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Computational geometry beyond this single primitive.
- *   - 3-D visibility (BSP trees, portal rendering).  This is
- *     2-D only.  See algorithms/bsp_tree.c for the 3-D
- *     analogue's data structure.
- *   - Real-time shadow casting in graphics engines.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -227,9 +28,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* S1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config — sizes, timing, aspect ratio, sweep tuning ── */
 
 /* Simulation speed: physics steps per second (user-adjustable). */
 #define SIM_FPS_DEFAULT   30
@@ -394,9 +193,7 @@
 #define INNER_SCENE_MIN_FRAC       0.02f   /* clamp wall endpoints inside outer wall    */
 #define INNER_SCENE_MAX_FRAC       0.98f
 
-/* ===================================================================== */
-/* S2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock — monotonic nanosecond clock and sleep ── */
 
 static int64_t clock_ns(void)
 {
@@ -415,9 +212,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* S3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color — color pairs for fill, walls, observer, HUD ── */
 
 enum {
     CP_DEFAULT = 0,
@@ -468,184 +263,102 @@ static void color_init(void)
     }
 }
 
-/* ===================================================================== */
-/* S4  geometry                                                           */
-/* ===================================================================== */
+/* ── §4 geometry — wall/hit/polygon types and the ray-vs-wall test ── */
 
 /*
- * Wall — one line-segment obstacle in CELL space.
+ * Wall -- one wall, stored as a line segment from corner to corner.  Every
+ * frame each ray is tested against every wall to see where it stops.  The
+ * four coordinates are kept flat (not two points) so the intersection math
+ * can read them straight as A.x, A.y, B.x, B.y.
  *
- * Intent
- *   The atomic unit consumed by ray_hits_wall().  Each frame the sweep
- *   intersects every ray against every Wall in WallSet.list[].
+ *   x0_cells, y0_cells   one endpoint, in cells (column, row).
+ *   x1_cells, y1_cells   the other endpoint, in cells.
  *
- * Why a 4-float record (rather than two Points)
- *   Ray-segment intersection (Bourke 1989 / Ericson 2005 §5.1) reads
- *   the endpoints as scalars (A.x, A.y, B.x, B.y); keeping them flat
- *   matches that math literally and avoids one layer of indirection
- *   in the hottest inner loop of the program.
- *
- * Members
- *   x0_cells, y0_cells   segment start in cell space (column, row).
- *   x1_cells, y1_cells   segment end   in cell space (column, row).
- *
- * Invariants
- *   The segment is UNDIRECTED — swapping (x0,y0) ↔ (x1,y1) yields the
- *   same occlusion behaviour.  cast_ray_in_direction() does not rely
- *   on a winding order.
- *   The _cells suffix is load-bearing: distance math must convert via
- *   geo_y() to compensate for the 2:1 terminal cell aspect ratio.
- *
- * References
- *   [8] Ericson 2005 §5.1 — ray vs segment, robust formulation.
- *   [9] Bourke 1989 — short derivation of the 2-D cross-product test
- *       used by ray_hits_wall().
+ * The segment has no direction -- swapping the two endpoints blocks sight
+ * exactly the same.  "_cells" matters: y must be passed through geo_y()
+ * before any distance/angle math because terminal cells are twice as tall
+ * as they are wide.
  */
 typedef struct {
-    float x0_cells, y0_cells;   /* segment start: (col, row) */
-    float x1_cells, y1_cells;   /* segment end:   (col, row) */
+    float x0_cells, y0_cells;   /* one endpoint (col, row)   */
+    float x1_cells, y1_cells;   /* other endpoint (col, row) */
 } Wall;
 
 /*
- * WallSpec — a wall expressed as fractions of scene dimensions.
+ * WallSpec -- the same wall, but stored as fractions of the screen rather
+ * than fixed cells, so the layout survives a terminal resize.  When the
+ * window changes size we re-multiply the fractions by the new (cols, rows)
+ * and the scene keeps the same proportions, just bigger or smaller.
  *
- * Intent
- *   Resolution-independent obstacle definition.  scene_build_walls()
- *   instantiates each WallSpec into a cell-space Wall by multiplying
- *   the fractions by (scene_cols, scene_rows).
+ *   x0_frac, y0_frac   one endpoint as a fraction of (cols, rows).
+ *   x1_frac, y1_frac   other endpoint as a fraction of (cols, rows).
  *
- * Why fractions (not cell coords baked in)
- *   The terminal can resize at any moment.  Storing the LAYOUT as
- *   fractions and re-baking to Wall on every resize means the
- *   obstacle arrangement preserves its visual proportions across
- *   terminal sizes — a small 80×24 window and a wide 200×60 window
- *   show the SAME scene, just bigger / smaller.  Equivalent to
- *   normalized device coordinates in 3-D graphics.
- *
- * Members
- *   x0_frac, y0_frac   segment start as a fraction of (cols, rows).
- *   x1_frac, y1_frac   segment end   as a fraction of (cols, rows).
- *
- * Invariants
- *   All four fields lie in [0.0, 1.0] for default layouts.  The random
- *   generator may place endpoints anywhere in that closed unit square.
- *   0.0 = top/left edge; 1.0 = bottom/right edge.
+ * 0.0 is the top/left edge, 1.0 the bottom/right edge.  Hand-placed layouts
+ * stay inside [0, 1]; the random generator may use the full unit square.
  */
 typedef struct {
-    float x0_frac, y0_frac;  /* start: fraction of (scene_cols, scene_rows) */
-    float x1_frac, y1_frac;  /* end:   fraction of (scene_cols, scene_rows) */
+    float x0_frac, y0_frac;  /* one endpoint, fraction of (cols, rows)   */
+    float x1_frac, y1_frac;  /* other endpoint, fraction of (cols, rows) */
 } WallSpec;
 
 /*
- * SweepHit — one (angle, contact) sample from the radial visibility sweep.
+ * SweepHit -- one ray's result: the direction it was fired, and the point
+ * where it first hit a wall.  Sort a batch of these by angle and join them
+ * up and you have traced the outline of everything the observer can see.
+ * Angle and hit point ride together in one struct so a single sort by angle
+ * keeps each direction matched to its hit point.
  *
- * Intent
- *   The atomic OUTPUT unit of compute_visibility().  For each ray cast
- *   at an endpoint angle, the algorithm records WHICH direction the
- *   ray went (angle_rad) and WHERE it first hit a wall (hit_x/y_cells).
- *   Sorting hits by angle and joining them produces the boundary of
- *   the visibility polygon.
+ *   angle_rad     direction from the observer (radians, geo space).
+ *                 This is the sort key; the final polygon is in angle order.
+ *   hit_x_cells   x of the first wall hit, in cells.
+ *   hit_y_cells   y of the first wall hit, in cells.
  *
- * Why bundle angle + hit point (not separate arrays)
- *   qsort must keep angle and hit_point paired during reordering.
- *   Bundling them into one struct lets us sort with a SINGLE cmp_by_angle
- *   function that just dereferences `angle_rad`; storing them in two
- *   parallel arrays would require a permutation index and a second
- *   sweep to reorder the second array.
- *
- * Members
- *   angle_rad      ray direction from the observer, in geo space.
- *                  SORT KEY — strictly ascending in the final polygon.
- *   hit_x_cells    x of the ray's first wall contact, in cell space.
- *   hit_y_cells    y of the ray's first wall contact, in cell space.
- *
- * Invariants
- *   angle_rad ∈ (−π, π].  We wrap into this canonical interval before
- *   sorting so the polygon vertices walk around the observer exactly
- *   once.
- *   The hit point lies on some Wall in WallSet.list[].
- *
- * References
- *   [1] Asano et al. 1986 — angular-sweep formulation; sort hits by
- *       angle, join consecutive hits with straight segments.
- *  [10] Patel (Red Blob Games) — interactive presentation of the
- *       hits-sorted-by-angle data layout.
+ * angle_rad is wrapped into (-pi, pi] before sorting so the outline walks
+ * around the observer exactly once.  The hit point always sits on some wall.
  */
 typedef struct {
-    float angle_rad;      /* direction of this ray from observer, in geo space */
-    float hit_x_cells;    /* x of the ray's first wall contact, in cell coords */
-    float hit_y_cells;    /* y of the ray's first wall contact, in cell coords */
+    float angle_rad;      /* ray direction from observer (radians, geo space) */
+    float hit_x_cells;    /* x of first wall hit, cells                       */
+    float hit_y_cells;    /* y of first wall hit, cells                       */
 } SweepHit;
 
 /*
- * VisibilityPolygon — complete output of one compute_visibility() call.
+ * VisibilityPolygon -- the whole result of one visibility computation: the
+ * outline of what the observer can see, plus its area.  Rebuilt from scratch
+ * every frame.  Outline, count, and area travel together so a reader can
+ * never use a fresh outline with a stale count.
  *
- * Intent
- *   Captures the star-shaped polygon rooted at the observer in one
- *   compact bundle that downstream consumers (render_scene,
- *   cell_is_visible, draw_hud) can read freely.  Recomputed in full
- *   every frame; never updated incrementally.
- *
- * Why a STRUCT (not just a raw hits[] array)
- *   Three pieces of metadata travel together:
- *     • the boundary vertices,
- *     • how many of them are valid,
- *     • the polygon AREA in cell² (cached so the HUD doesn't
- *       re-shoelace every frame).
- *   Bundling them prevents the "two-out-of-three" bug where a caller
- *   reads stale n_hits against fresh hits[].
- *
- * Members
- *   hits[MAX_SWEEP_RAYS]   boundary vertices SORTED BY angle_rad.
- *                          Form the star-shaped visibility polygon
- *                          when joined cyclically.
- *   n_hits                 number of valid entries in hits[];
- *                          rays that missed all walls are dropped.
- *   visible_area_cells     polygon area in cell² (shoelace formula);
- *                          cached so draw_hud's percentage computation
- *                          is O(1) per frame instead of O(n_hits).
- *
- * Invariants
- *   0 ≤ n_hits ≤ MAX_SWEEP_RAYS.
- *   hits[i].angle_rad < hits[i+1].angle_rad  for i in [0, n_hits − 2].
- *   visible_area_cells ≥ 0 (sign-flipped via fabsf in the shoelace).
- *
- * References
- *   [6] O'Rourke 1998 §8 — visibility polygon shape (star-shaped, with
- *       the observer as the kernel point).
- *   [5] de Berg et al. 2008 Ch. 15 — visibility-polygon construction.
- *   Meister, A. L. F. (1769) / Gauss — shoelace area formula
- *       derivation; reproduced in any computational-geometry text.
+ *   hits[MAX_SWEEP_RAYS]  outline corners, sorted by angle; join them in
+ *                         order to trace the lit region.
+ *   n_hits                how many entries in hits[] are real (rays that
+ *                         missed every wall are dropped).  0..MAX_SWEEP_RAYS.
+ *   visible_area_cells    area of that outline in cells^2 (shoelace formula);
+ *                         cached here so the HUD's "% visible" is free to
+ *                         read.  Always >= 0.
  */
 typedef struct {
-    SweepHit hits[MAX_SWEEP_RAYS]; /* sorted boundary vertices              */
-    int       n_hits;              /* number of valid sweep samples         */
-    float     visible_area_cells;  /* polygon area in cell^2 (shoelace)     */
+    SweepHit hits[MAX_SWEEP_RAYS]; /* outline corners, sorted by angle      */
+    int       n_hits;              /* valid entries in hits[]               */
+    float     visible_area_cells;  /* outline area, cells^2 (shoelace)      */
 } VisibilityPolygon;
 
-/*
- * geo_y / cell_y: convert between cell-space and geo-space y coordinates.
- * All angle/distance math must be done in geo space.
- * Only convert back to cell space for the final mvaddch() call.
- */
+/* Stretch y so a cell is square for the math (geo space), and unstretch it
+ * back for drawing.  Do every angle/distance calculation in geo space; only
+ * go back to cell space for the final mvaddch(). */
 static inline float geo_y(float y_cells)  { return y_cells * ASPECT_Y; }
 static inline float cell_y(float y_geo)   { return y_geo   / ASPECT_Y; }
 
 /*
- * ray_hits_wall -- parametric ray vs. segment intersection (geo space).
+ * ray_hits_wall -- where the sight line first crosses a wall, if at all.
  *
- * Ray:     P(t) = O + t*D              (want t >= RAY_T_MIN)
- * Segment: Q(s) = A + s*(B-A)          (want 0 <= s <= 1)
+ * Walk the ray forward as O + t*D and the wall as A + s*(B-A), then solve
+ * for the (t, s) where they meet.  A real hit needs t in front of the eye
+ * (t >= RAY_T_MIN) and s between the wall's two ends (0 <= s <= 1).  The
+ * shared "denom" is the 2-D cross product of the two directions: zero means
+ * ray and wall are parallel and never meet.
  *
- * Setting P(t) = Q(s):
- *   denom   = D x (B-A)                (2D cross product, scalar)
- *   t_ray   = (A-O) x (B-A) / denom   (ray parameter at intersection)
- *   s_seg   = (A-O) x D     / denom   (segment parameter at intersection)
- *
- * 2D cross product: (u x v) = u.x*v.y - u.y*v.x
- *
- * Returns t_ray on a valid hit; returns -1.0f otherwise.
- * All arguments must be in geo space (y already multiplied by ASPECT_Y).
+ * Returns t (distance along the ray) on a hit, or -1 on a miss.  All inputs
+ * must already be in geo space.
  */
 static float ray_hits_wall(
     float ox_geo,  float oy_geo,   /* ray origin      */
@@ -678,25 +391,10 @@ static int cmp_sweep_hit_by_angle(const void *lhs, const void *rhs)
     return (a > b) - (a < b);
 }
 
-/* ===================================================================== */
-/* S5  visibility                                                         */
-/* ===================================================================== */
+/* ── §5 visibility — cast rays at every corner, sort, build the polygon ── */
 
-/*
- * cast_ray_in_direction -- find the nearest wall hit along one ray.
- *
- * obs_x/y_cells: observer position in cell space.
- * ray_angle_rad: direction to cast in geo space (y already corrected).
- * all_walls, n_walls: the complete wall list to test against.
- * out_hit: filled with angle_rad and hit_x/y_cells on success.
- *
- * Returns false if no wall was intersected (should not happen in a closed scene).
- */
-/*
- * intersect_ray_with_wall_geo — thin wrapper around ray_hits_wall that
- * stretches a Wall's cell-space endpoints into geo space first.  Keeps
- * the call site in cast_ray_in_direction clean.
- */
+/* Test one ray against one wall, stretching the wall's endpoints into geo
+ * space first so the caller can stay in cell space. */
 static float intersect_ray_with_wall_geo(
     float ox_geo, float oy_geo,
     float dx_geo, float dy_geo,
@@ -710,20 +408,9 @@ static float intersect_ray_with_wall_geo(
     );
 }
 
-/*
- * find_nearest_wall_t — min-t reduction over every wall.
- *
- *   Pseudocode:
- *     nearest := +∞
- *     for each wall w:
- *       t := intersect_ray_with_wall_geo(ray, w)
- *       if t > 0 and t < nearest:
- *         nearest := t
- *     return nearest
- *
- *   Returns RAY_NO_HIT_T_SENTINEL when no wall is hit.  cast_ray_in_direction
- *   compares the result against RAY_VALID_HIT_T_LIMIT to detect that case.
- */
+/* Walk every wall and keep the closest one this ray hits -- that's the wall
+ * the sight line actually stops at.  Returns a huge sentinel value if the ray
+ * somehow hits nothing; the caller checks for that. */
 static float find_nearest_wall_t(
     float ox_geo, float oy_geo,
     float dx_geo, float dy_geo,
@@ -750,17 +437,8 @@ static void record_sweep_hit(
     out->hit_y_cells = cell_y(oy_geo + t * dy_geo);        /* y unstretched         */
 }
 
-/*
- * cast_ray_in_direction — fire ONE ray from the observer, return the
- * nearest wall hit (if any).
- *
- *   Pseudocode:
- *     (ox, oy)  := observer in geo space
- *     (dx, dy)  := unit ray direction
- *     t         := find_nearest_wall_t over all walls
- *     if t indicates no hit: return false
- *     record (angle, hit point) into out_hit; return true
- */
+/* Fire one ray from the observer at the given angle and return its nearest
+ * wall hit in out_hit; false if it somehow hits nothing. */
 static bool cast_ray_in_direction(
     float obs_x_cells, float obs_y_cells,
     float ray_angle_rad,
@@ -780,24 +458,8 @@ static bool cast_ray_in_direction(
     return true;
 }
 
-/*
- * compute_visibility -- angular sweep producing the full visibility polygon.
- *
- * The algorithm (three steps):
- *   1. Collect endpoint angles: for every wall endpoint, compute the angle
- *      from the observer.  Emit angle-eps, angle, angle+eps to bracket
- *      each corner.
- *   2. Cast one ray per candidate angle; record the nearest wall hit.
- *   3. Sort all hits by angle_rad.  The ordered sequence of hit points is
- *      the star-shaped boundary polygon of visible space.
- *
- * The shoelace formula is applied to the sorted hits to get visible area.
- */
-/*
- * angle_from_observer_to_endpoint — atan2 in geo space, with the
- * eye stretched + the endpoint stretched so the angle is metrically
- * correct on the 2:1 terminal grid.
- */
+/* Angle from the observer to a wall corner.  Both points are stretched into
+ * geo space first so the angle is correct on the 2:1 terminal grid. */
 static float angle_from_observer_to_endpoint(
     float ox_geo, float oy_geo, float ex_cells, float ey_cells
 ) {
@@ -806,14 +468,10 @@ static float angle_from_observer_to_endpoint(
     return atan2f(dy, dx);
 }
 
-/*
- * push_endpoint_angle_triplet — emit (θ−ε, θ, θ+ε) into the candidate
- * angle buffer.  The ε-offset trick (see [10] Patel / Red Blob Games)
- * disambiguates which side of a wall corner the ray hits.
- *
- *   Skip if the buffer would overflow — `out_count` is treated as a
- *   bounded resource.
- */
+/* Push three angles for one corner: dead-on, plus a hair to each side.  A ray
+ * aimed exactly at a corner is ambiguous about which side it passes; the two
+ * nudged rays slip just past the corner so the sight line continues to the
+ * wall behind it.  Skips silently if the buffer is full. */
 static void push_endpoint_angle_triplet(
     float angles[], int *count, int capacity, float theta
 ) {
@@ -823,18 +481,10 @@ static void push_endpoint_angle_triplet(
     angles[(*count)++] = theta + ENDPOINT_ANGLE_EPS_RAD;
 }
 
-/*
- * collect_endpoint_candidate_angles — Step 1 of the sweep.
- *
- *   Pseudocode:
- *     for each wall w:
- *       for each endpoint e in (w.start, w.end):
- *         θ := angle_from_observer_to_endpoint(observer, e)
- *         push (θ − ε, θ, θ + ε) into the candidate buffer
- *
- *   The output is an unsorted list of angles; cast_all_candidate_rays
- *   fires one ray per angle, and the final qsort imposes order.
- */
+/* Step 1 of the sweep: gather the directions worth firing at.  Only wall
+ * corners can change what's visible, so collect the angle to each corner
+ * (with its two nudged neighbours).  Output is unsorted; it gets ordered
+ * later. */
 static int collect_endpoint_candidate_angles(
     float ox_geo, float oy_geo,
     const Wall *walls, int n_walls,
@@ -853,18 +503,9 @@ static int collect_endpoint_candidate_angles(
     return n_candidates;
 }
 
-/*
- * cast_all_candidate_rays — Step 2 of the sweep.
- *
- *   Pseudocode:
- *     out.n_hits := 0
- *     for each candidate angle θ:
- *       if cast_ray_in_direction(θ) hits a wall:
- *         out.hits[out.n_hits++] := hit
- *
- *   Rays that miss every wall (degenerate: open scene) are silently
- *   dropped.  In a bounded room the outer walls always catch a ray.
- */
+/* Step 2 of the sweep: fire one ray per collected angle, keeping each
+ * nearest hit.  Rays that hit nothing are dropped, but the room's outer
+ * walls always stop every ray, so that case doesn't happen here. */
 static void cast_all_candidate_rays(
     float obs_x_cells, float obs_y_cells,
     const float angles[], int n_angles,
@@ -883,27 +524,17 @@ static void cast_all_candidate_rays(
     }
 }
 
-/* Step 3 wrapper — qsort hits by angle_rad so consecutive entries
- * form sectors of the visibility polygon. */
+/* Step 3 of the sweep: sort the hits by angle so neighbours in the list are
+ * neighbours around the observer -- that's what makes them a polygon. */
 static void sort_hits_by_angle(VisibilityPolygon *vp)
 {
     qsort(vp->hits, vp->n_hits, sizeof(SweepHit), cmp_sweep_hit_by_angle);
 }
 
-/*
- * polygon_shoelace_area_cells — Gauss/Meister 1769 shoelace formula
- * applied to the sorted hits, returning area in cell² units.
- *
- *   Pseudocode:
- *     sum := 0
- *     for i in 0..n−1:
- *       j := (i + 1) mod n
- *       sum += xi · yj − xj · yi              (in geo space)
- *     return ½ · |sum| / ASPECT_Y             (undo y-stretch)
- *
- *   The y-stretch undo step recovers cell² because cell-y was multiplied
- *   by ASPECT_Y throughout the angle math.
- */
+/* Area of the lit region in cells, via the shoelace formula: walk the
+ * sorted corners and sum each edge's cross product, then halve the absolute
+ * total.  The final /ASPECT_Y undoes the y-stretch so the answer is in real
+ * cells, not stretched ones. */
 static float polygon_shoelace_area_cells(const VisibilityPolygon *vp)
 {
     float sum = 0.0f;
@@ -919,18 +550,9 @@ static float polygon_shoelace_area_cells(const VisibilityPolygon *vp)
     return 0.5f * fabsf(sum) / ASPECT_Y;
 }
 
-/*
- * compute_visibility — the angular-sweep orchestrator.
- *
- *   Pseudocode:
- *     Step 1: collect endpoint candidate angles (3 per endpoint, ±ε bracket).
- *     Step 2: cast one ray per angle, keep the nearest wall hit.
- *     Step 3: sort hits by angle → polygon boundary in CCW order.
- *     Step 4: shoelace area, cache into out.visible_area_cells.
- *
- *   Asano et al. 1986 / O'Rourke 1998 §8 — exact angular-sweep
- *   visibility polygon.
- */
+/* The heart of the file: build the whole "what can the observer see" polygon.
+ * Aim rays at every wall corner, keep where each first hits a wall, sort the
+ * hits into a loop around the observer, then measure the enclosed area. */
 static void compute_visibility(
     float obs_x_cells, float obs_y_cells,
     const Wall *all_walls, int n_walls,
@@ -952,12 +574,10 @@ static void compute_visibility(
     out_vp->visible_area_cells = polygon_shoelace_area_cells(out_vp);
 }
 
-/*
- * find_angle_sector -- binary search for the largest i where hits[i].angle_rad
- * <= query_angle_rad.  Returns i; caller wraps to (i+1) % n_hits for the sector.
- *
- * Precondition: hits[] sorted ascending, n_hits >= 1.
- */
+/* Binary-search the sorted hits for the last one at or before query_angle_rad
+ * -- i.e. which slice of the polygon a given direction falls into.  The caller
+ * pairs it with the next hit to get the slice's far edge.  Needs hits[] sorted
+ * and non-empty. */
 static int find_angle_sector(const VisibilityPolygon *vp, float query_angle_rad)
 {
     int lo = 0;
@@ -972,23 +592,9 @@ static int find_angle_sector(const VisibilityPolygon *vp, float query_angle_rad)
     return lo;
 }
 
-/*
- * cell_is_visible -- test whether a terminal cell lies inside the visibility polygon.
- *
- * Algorithm (O(log N) per cell):
- *   1. Compute angle from observer to cell center in geo space.
- *   2. Identify which angular sector the cell falls in (binary search).
- *      The wrap-around sector [hits[n-1], hits[0]] needs a special check.
- *   3. The polygon boundary in that sector is segment hits[i] -> hits[next].
- *   4. Cast a ray from observer at cell_angle; intersect with that boundary.
- *   5. Cell is visible iff cell_dist <= boundary_t (with a small tolerance).
- */
-/*
- * cell_displacement_from_observer_geo — write the (dx, dy) vector and
- * the squared length of the observer→cell displacement, in geo space.
- *   The squared distance is sufficient for the "own cell" early exit
- *   so we avoid a sqrtf in the hot path.
- */
+/* Vector and squared distance from observer to a cell, in geo space.  We
+ * return the squared distance (no sqrt) because the "cell sits on the
+ * observer" early-out only needs to compare against a small radius. */
 static void cell_displacement_from_observer_geo(
     float cell_x_cells, float cell_y_cells,
     float obs_x_cells,  float obs_y_cells,
@@ -1001,12 +607,10 @@ static void cell_displacement_from_observer_geo(
     *out_dist_sq = dx * dx + dy * dy;
 }
 
-/*
- * locate_polygon_sector_for_angle — given a cell angle, return the
- * indices (sector, next) of the polygon boundary segment that brackets
- * that angle.  The wrap-around sector (between the LAST and FIRST hit)
- * is detected explicitly because find_angle_sector assumes interior.
- */
+/* For a given direction, return the two polygon corners whose edge that
+ * direction crosses.  The slice that wraps past the last corner back to the
+ * first is handled on its own, since the binary search only covers the
+ * middle. */
 static void locate_polygon_sector_for_angle(
     const VisibilityPolygon *vp, float cell_angle_rad,
     int *out_sector, int *out_next
@@ -1023,12 +627,10 @@ static void locate_polygon_sector_for_angle(
     }
 }
 
-/*
- * intersect_cell_ray_with_sector_boundary — fire a unit ray at
- * cell_angle_rad from the observer and intersect with the polygon
- * boundary segment hits[sector]→hits[next].  Returns the parameter t
- * along the ray, or a negative value if the boundary is degenerate.
- */
+/* Fire a ray toward a cell and find how far it reaches before crossing the
+ * polygon edge for that slice -- i.e. how far the observer can see in that
+ * direction.  Returns distance along the ray, or negative if that edge is
+ * degenerate (its two corners coincide). */
 static float intersect_cell_ray_with_sector_boundary(
     const VisibilityPolygon *vp, int sector_idx, int next_idx,
     float obs_x_cells, float obs_y_cells, float cell_angle_rad
@@ -1044,8 +646,8 @@ static float intersect_cell_ray_with_sector_boundary(
                          bnd0_x, bnd0_y, bnd1_x, bnd1_y);
 }
 
-/* Fallback for the degenerate-sector case: visible iff cell sits within
- * one cell of the polygon-boundary first endpoint distance. */
+/* Used when the slice's edge collapsed to a point: just compare the cell's
+ * distance against that point's distance (with one cell of slack). */
 static bool visible_via_degenerate_sector_fallback(
     const VisibilityPolygon *vp, int sector_idx,
     float obs_x_cells, float obs_y_cells, float cell_dist
@@ -1056,22 +658,11 @@ static bool visible_via_degenerate_sector_fallback(
     return cell_dist <= bnd0_dist + DEGENERATE_SECTOR_SLACK_CELLS;
 }
 
-/*
- * cell_is_visible — does this cell sit inside the visibility polygon?
- *
- *   Pseudocode (O(log N) per cell):
- *     if polygon is degenerate (< 3 hits): false
- *     compute (dx, dy, dist²) from observer to cell
- *     if cell is on top of the observer:   true                    (early exit)
- *     θ := atan2(dy, dx)
- *     locate the angular sector hits[sector]→hits[next] containing θ
- *     t := intersect a unit ray at θ with that boundary segment
- *     if degenerate sector:  fall back to bnd0-distance check
- *     else:                  visible iff cell_dist ≤ t + tolerance
- *
- *   The tolerance (BOUNDARY_VISIBILITY_TOLERANCE_CELLS) lets cells
- *   that ride the polygon edge still light up — cosmetic.
- */
+/* Can the observer see this cell?  Find the direction to the cell, look up
+ * how far the lit region reaches that way, and check the cell isn't farther
+ * than that.  Tiny edge cases: a too-small polygon is never visible, a cell
+ * right on the observer always is, and a small tolerance lets cells sitting
+ * exactly on the boundary still light up. */
 static bool cell_is_visible(
     float cell_x_cells, float cell_y_cells,
     float obs_x_cells,  float obs_y_cells,
@@ -1100,9 +691,7 @@ static bool cell_is_visible(
     return cell_dist <= boundary_t + BOUNDARY_VISIBILITY_TOLERANCE_CELLS;
 }
 
-/* ===================================================================== */
-/* S6  scene                                                              */
-/* ===================================================================== */
+/* ── §6 scene — walls, observer, controls, and per-tick update ── */
 
 /*
  * Bounding walls: the four outer edges of the room.
@@ -1116,10 +705,10 @@ static const WallSpec BOUNDING_WALL_SPECS[BOUNDING_WALL_COUNT] = {
 };
 
 /*
- * Interior obstacle walls: placed in the outer thirds of the scene so
- * the observer's Lissajous path (occupying the central ~25%) stays clear.
+ * Interior obstacle walls: kept out toward the edges so the observer's drift
+ * path through the middle never runs into one.
  *
- * Layout sketch (. = open space, # = wall, @ = observer path region):
+ * Layout sketch (. = open space, # = wall, @ = where the observer roams):
  *
  *   |   |   |   | # |   |   |   |   |   |   |   |   |   |   |   |   | # |
  *   |   |   |   | # |                    @@@@@                         | # |
@@ -1163,241 +752,89 @@ static const WallSpec INTERIOR_WALL_SPECS[INTERIOR_WALL_COUNT] = {
 };
 
 /*
- * WallSet — every line-segment obstacle in the scene.
+ * WallSet -- every wall in the room, plus the state for the "new random
+ * layout" feature ('n' key).  Fixed-size array, no allocation: the project
+ * never mallocs after startup, and MAX_WALLS is the exact capacity used.
  *
- * Intent
- *   Owns the OBSTACLES seen by the visibility sweep.  Includes both
- *   the active wall list AND the random-pattern feature state, so
- *   pressing 'n' regenerates a fresh layout without touching the rest
- *   of the Scene.
- *
- * Why a BUNDLE (not three top-level Scene fields)
- *   The wall list, its count, and the random-pattern variant always
- *   move together — every place that reads `list[]` needs to know
- *   `count` to bound the loop, and choosing between the default and
- *   random layouts touches `use_rand` + `rand_specs[]`.  Grouping
- *   them keeps scene_build_walls() and the 'n' key handler reading
- *   one bundle instead of four scattered Scene fields.
- *
- * Why a fixed array (not malloc'd slice)
- *   Project rule: no dynamic allocation after init.  MAX_WALLS (13 =
- *   4 bounding + 9 interior) is the exact capacity used by every
- *   layout; the random generator overwrites only the interior slots.
- *
- * Members
- *   list[MAX_WALLS]    line-segment obstacles in cell coords.  First
- *                      BOUNDING_WALL_COUNT entries are the outer
- *                      bounding box (always present); the rest are
- *                      interior obstacles.
- *   count              number of valid entries in list[].
- *   rand_specs[]       fractions of a randomised interior layout;
- *                      re-instantiated to cell-space on each resize
- *                      via scene_build_walls().
- *   use_rand           false = use INTERIOR_WALL_SPECS default layout;
- *                      true after the first 'n' press = use rand_specs.
- *
- * Invariants
- *   BOUNDING_WALL_COUNT ≤ count ≤ MAX_WALLS.
- *   list[0..BOUNDING_WALL_COUNT−1] is always the outer bounding box.
- *   At any moment EITHER the default INTERIOR_WALL_SPECS or rand_specs
- *   has been baked into list[]; use_rand selects which.
- *
- * References
- *   [4] Suri & O'Rourke 1986 — visibility among disjoint line
- *       segments (the polygons-with-holes regime this WallSet models).
+ *   list[MAX_WALLS]   the actual walls in cells.  The first
+ *                     BOUNDING_WALL_COUNT are the outer box (always there);
+ *                     the rest are interior obstacles.
+ *   count             how many entries of list[] are in use
+ *                     (BOUNDING_WALL_COUNT..MAX_WALLS).
+ *   rand_specs[]      a randomly generated interior layout, kept as
+ *                     fractions so it can be re-baked on a resize.
+ *   use_rand          false = use the hand-placed default interior layout;
+ *                     true once 'n' is pressed = use rand_specs instead.
  */
 typedef struct {
-    Wall      list[MAX_WALLS];
-    int       count;
-    WallSpec  rand_specs[INTERIOR_WALL_COUNT];
-    bool      use_rand;
+    Wall      list[MAX_WALLS];               /* walls in use, cell coords  */
+    int       count;                         /* valid entries in list[]    */
+    WallSpec  rand_specs[INTERIOR_WALL_COUNT]; /* random layout, fractions */
+    bool      use_rand;                      /* default vs random layout   */
 } WallSet;
 
 /*
- * Observer — the eye + the visualisation sweep ray.
+ * Observer -- the eye: where it is, where it's headed, and the lone spinning
+ * ray drawn as a teaching aid.  The drift path and the spinning ray move at
+ * their own rates, so pausing one doesn't pause the other.
  *
- * Intent
- *   Owns everything the visibility math + scene animation need to know
- *   about WHERE the viewer is and HOW the spinning teaching-aid ray is
- *   oriented.  The visibility sweep math reads x_cells / y_cells; the
- *   spinning sweep ray glyph is a SEPARATE teaching aid driven by
- *   sweep_angle_rad; lissajous_t parameterises the auto-drift path.
+ *   x_cells, y_cells   eye position in cells (column, row).  The visibility
+ *                      polygon is computed from here.
+ *   lissajous_t        position along the looping drift path, in radians.
+ *                      Feeding it through sin gives the eye's x and y, so a
+ *                      3:2 frequency ratio traces a smooth figure-eight.
+ *   sweep_angle_rad    direction of the animated '*' ray (radians).  Purely
+ *                      decorative -- it just shows "one ray being cast" and
+ *                      rotates on its own.
  *
- * Why bundle three state machines (eye pos, drift phase, sweep angle)
- *   They all share the SAME conceptual frame of reference — "the eye"
- *   — even though they evolve at different rates:
- *     • lissajous_t  → ticks forward each frame; deterministic curve.
- *     • x_cells/y_cells → derived from lissajous_t each tick.
- *     • sweep_angle_rad → rotates independently for the '*' overlay.
- *   Splitting them across three Scene fields would scatter "anything
- *   that the eye knows" across the file; bundling makes scene_tick()
- *   a single sub-struct mutation.
- *
- * Why TWO separate angles (lissajous_t and sweep_angle_rad)
- *   lissajous_t parameterises the *path* (Lissajous curve), driving
- *   where the eye is.  sweep_angle_rad drives the *spinning ray
- *   overlay*, an entirely separate teaching aid that exists only to
- *   visualise "what a single cast looks like".  They are independent
- *   so the user can pause the eye while the ray keeps sweeping, or
- *   vice versa, depending on UI design.
- *
- * Members
- *   x_cells, y_cells    eye position in CELL space (column, row).
- *                       Drives the angular-sweep computation; the
- *                       visibility polygon is rooted here.
- *   lissajous_t         Lissajous-path phase parameter (radians);
- *                       grows monotonically each tick.  The eye
- *                       position is then
- *                         x = cx + rx · sin(fx · t)
- *                         y = cy + ry · sin(fy · t + phase)
- *                       — a Lissajous figure with rational
- *                       frequency ratio (Bowditch 1815 / Lissajous 1857).
- *   sweep_angle_rad     direction of the animated '*' sweep ray drawn
- *                       in the scene; rotates independently of the
- *                       visibility polygon computation.
- *
- * Invariants
- *   0 < x_cells < scene_cols   AND   0 < y_cells < scene_rows
- *     (scene_update_observer keeps the eye inside the bounding box;
- *      OBS_RADIUS_*_FRAC are tuned to leave a margin).
- *   sweep_angle_rad ∈ (−π, π]  (cast_ray_in_direction is angle-agnostic
- *                               but we wrap to keep numbers small).
- *   lissajous_t is unbounded as written — sin/cos handle wraparound,
- *   so we accept the slow precision drift over ~10^8 frames.
- *
- * References
- *   Bowditch, N. (1815) / Lissajous, J. A. (1857) — the curve
- *       x = A·sin(at), y = B·sin(bt + δ) that traces compound
- *       harmonic motion when a/b is rational.  Used here purely
- *       as a deterministic non-trivial 2-D path for the demo.
- *   [10] Patel (Red Blob Games) — uses a similar drifting observer
- *       in the interactive 2-D visibility tutorial.
+ * The eye stays inside the room (the path radii leave a margin).  Both angles
+ * are kept in (-pi, pi].  lissajous_t is wrapped each tick so it never drifts
+ * off into large, imprecise floats.
  */
 typedef struct {
-    float x_cells, y_cells;
-    float lissajous_t;
-    float sweep_angle_rad;
+    float x_cells, y_cells;   /* eye position, cells (col, row)        */
+    float lissajous_t;        /* phase along the drift path, radians   */
+    float sweep_angle_rad;    /* direction of the '*' teaching ray     */
 } Observer;
 
 /*
- * SimControls — playback controls toggled / adjusted at runtime.
+ * SimControls -- the two playback knobs the user can change while it runs.
  *
- * Intent
- *   Two knobs the user adjusts via the input handler; kept together
- *   so handle_input writes ONE bundle rather than two scattered
- *   Scene fields.  Decouples the FIXED-TIMESTEP accumulator in
- *   main() from the underlying simulation rate.
- *
- * Why a sub-struct (two scalars is not much)
- *   The boundary "user-controlled run parameters" is conceptually
- *   distinct from "simulation state" — paused and fps are read by
- *   main()'s tick loop and the HUD; everything else in Scene is
- *   simulation output.  Naming them as a bundle signals that
- *   distinction to the reader.  Easy to extend later (target_fps,
- *   speed_multiplier) without churning Scene's top level.
- *
- * Members
- *   paused      true → scene_tick is a no-op (animation freezes).
- *               The HUD then displays "PAUSED" instead of "running".
- *   fps         simulation tick rate (Hz).  '+' / '-' adjust by 5,
- *               clamped to [SIM_FPS_MIN, SIM_FPS_MAX].  Drives the
- *               fixed-timestep accumulator's TICK_NS(fps) period.
- *
- * Invariants
- *   SIM_FPS_MIN ≤ fps ≤ SIM_FPS_MAX  (handle_input clamps).
- *
- * References
- *   Fiedler, G., "Fix Your Timestep!" — gafferongames.com/post/
- *       fix_your_timestep — the canonical "accumulator-driven discrete
- *       ticks" pattern that main()'s loop implements using SimControls.
+ *   paused   true freezes the animation; the HUD then reads "PAUSED".
+ *   fps      how many simulation steps per second; the +/- keys nudge it,
+ *            kept within [SIM_FPS_MIN, SIM_FPS_MAX].
  */
 typedef struct {
-    bool paused;
-    int  fps;
+    bool paused;   /* animation frozen?      */
+    int  fps;      /* simulation steps/sec   */
 } SimControls;
 
 /*
- * Scene — owns ALL simulation + render state for one run.
+ * Scene -- all the state for one run, in one place.  A single Scene lives on
+ * main()'s stack and is threaded through every function: functions that only
+ * read it take `const Scene *`, functions that change it take `Scene *`, so
+ * the signature tells you whether a call mutates anything.  The only state
+ * not in here is the two signal flags in §9, which have to be globals because
+ * signal handlers can't be handed a pointer.
  *
- * Layered ownership
- *
- *     Scene
- *       ├── walls    : WallSet            ← obstacles + random-layout state
- *       │     ├── list[MAX_WALLS]   : Wall[]        (cell-space segments)
- *       │     ├── count                                (≥ BOUNDING_WALL_COUNT)
- *       │     ├── rand_specs[]      : WallSpec[]   (resolution-independent)
- *       │     └── use_rand          : bool         (default vs 'n'-pressed)
- *       │
- *       ├── observer : Observer           ← eye + sweep-ray + path phase
- *       │     ├── x_cells, y_cells        (Lissajous-driven eye position)
- *       │     ├── lissajous_t             (path-curve parameter)
- *       │     └── sweep_angle_rad         (independent '*' overlay angle)
- *       │
- *       ├── vis      : VisibilityPolygon  ← per-frame angular-sweep output
- *       │     ├── hits[]           : SweepHit[]    (sorted boundary verts)
- *       │     ├── n_hits                            (valid entries)
- *       │     └── visible_area_cells                (cached shoelace area)
- *       │
- *       ├── scene_cols, scene_rows        ← drawable extent inside HUD frame
- *       │
- *       └── sim      : SimControls        ← paused + fps
- *
- *   Every persistent value the program needs is reachable from a
- *   single Scene*.  No file-scope simulation state exists; only the
- *   two POSIX signal flags (g_quit, g_resize_pending) remain global
- *   in §9 because signal handlers cannot receive a context pointer.
- *
- * Intent
- *   One instance lives on main()'s stack and is passed by pointer to
- *   every tick, renderer, and input handler.  Pure observers take
- *   `const Scene *`; mutators take `Scene *`.  The signature alone
- *   communicates which kind of access each callee performs.
- *
- * Why a SCENE struct (not file-scope globals)
- *   • Replaceability: future variants (split-screen, recorded replay)
- *     allocate multiple Scenes — impossible with globals.
- *   • Testability: scene_tick becomes a pure transformation s → s';
- *     no hidden inputs.
- *   • Reading aid: every helper begins with `Scene *s` (or const),
- *     giving the reader ONE place to look for "what state exists".
- *
- * Members
- *   walls           WallSet — obstacles + random-pattern state.
- *   observer        Observer — eye position + sweep ray + Lissajous phase.
- *   vis             VisibilityPolygon — sorted sweep hits + area.
- *   scene_cols      drawable columns (= terminal cols).
- *   scene_rows      drawable rows (= terminal rows − HUD_ROWS).
- *   sim             SimControls — paused + fps.
- *
- * Invariants
- *   scene_cols > 0  AND  scene_rows > 0  (set by scene_init).
- *   walls.count ≥ BOUNDING_WALL_COUNT   AND   observer inside scene area.
- *   g_quit / g_resize_pending are NOT here — POSIX signal handlers
- *   need sig_atomic_t globals, so they live in §9.
- *
- * References
- *   [10] Patel (Red Blob Games) — uses an equivalent single-Scene
- *       "world" object pattern in the interactive 2-D visibility demo.
- *   "Game Programming Patterns" (Nystrom, 2014) — Game Loop chapter
- *       motivates the one-Scene + fixed-timestep accumulator design
- *       that main() implements.
+ *   walls        the room's walls plus random-layout state.
+ *   observer     the eye, its drift path, and the spinning ray.
+ *   vis          the visibility polygon, recomputed every frame.
+ *   scene_cols   drawable width  (= terminal columns).
+ *   scene_rows   drawable height (= terminal rows minus the HUD rows).
+ *   sim          paused flag and simulation speed.
  */
 typedef struct {
-    WallSet           walls;
-    Observer          observer;
-    VisibilityPolygon vis;
-    int               scene_cols;
-    int               scene_rows;
-    SimControls       sim;
+    WallSet           walls;       /* the room's walls               */
+    Observer          observer;    /* the eye                        */
+    VisibilityPolygon vis;         /* what the eye can see this frame */
+    int               scene_cols;  /* drawable width, cells          */
+    int               scene_rows;  /* drawable height, cells         */
+    SimControls       sim;         /* pause + speed                  */
 } Scene;
 
-/*
- * bake_wall_spec_to_cells — convert a single WallSpec (fractions) into
- * a cell-space Wall by scaling fractions against the scene extent.
- *
- *   Equivalent to "normalized device coordinates → device coordinates"
- *   in graphics pipelines.
- */
+/* Turn one fraction-based WallSpec into a concrete cell-space Wall by
+ * multiplying its fractions by the scene's width and height. */
 static void bake_wall_spec_to_cells(
     const WallSpec *spec, float scene_w, float scene_h, Wall *out
 ) {
@@ -1423,16 +860,8 @@ static const WallSpec *interior_layout_to_use(const Scene *s)
     return s->walls.use_rand ? s->walls.rand_specs : INTERIOR_WALL_SPECS;
 }
 
-/*
- * scene_build_walls — bake the WallSpec layout into cell-space Walls.
- *
- *   Pseudocode:
- *     count := 0
- *     append BOUNDING_WALL_SPECS (the outer box)
- *     append the currently-selected interior layout (default or random)
- *
- *   Must be called after scene_cols / scene_rows are set (init / resize).
- */
+/* Rebuild the live wall list: the outer box first, then whichever interior
+ * layout is selected.  Call after the scene size is known (init or resize). */
 static void scene_build_walls(Scene *s)
 {
     float scene_w = (float)s->scene_cols;
@@ -1466,16 +895,9 @@ static void random_anchor_in_inner_scene(float *out_ax, float *out_ay)
     *out_ay = ANCHOR_MARGIN_FRAC + rand_frac() * ANCHOR_RANGE_FRAC;
 }
 
-/*
- * pick_anchor_outside_safe_zone — rejection-sample an anchor that
- * misses the observer safe zone.
- *
- *   Pseudocode:
- *     repeat up to MAX_PLACEMENT_TRIES:
- *       draw a uniform anchor
- *       if it is OUTSIDE the safe zone: return
- *     fall through with the last sample (best effort)
- */
+/* Pick a random anchor that avoids the observer's no-walls zone: keep
+ * re-rolling until one lands outside it, giving up after a fixed number of
+ * tries and using whatever it last drew. */
 static void pick_anchor_outside_safe_zone(float *out_ax, float *out_ay)
 {
     *out_ax = OBS_CENTER_X_FRAC;
@@ -1507,11 +929,9 @@ static float clamp_to_inner_scene(float frac)
     return fmaxf(INNER_SCENE_MIN_FRAC, fminf(INNER_SCENE_MAX_FRAC, frac));
 }
 
-/*
- * write_wall_spec_from_anchor — build a WallSpec from
- * (anchor, angle, half-length).  Endpoints are (anchor ± half-length ·
- * (cos θ, sin θ)), then clamped to the strict interior.
- */
+/* Build a wall centered on an anchor: step half its length each way along
+ * the given angle to get the two endpoints, then pull them back inside the
+ * room if they spilled past the edge. */
 static void write_wall_spec_from_anchor(
     WallSpec *out, float ax, float ay, float angle, float half_len
 ) {
@@ -1523,20 +943,9 @@ static void write_wall_spec_from_anchor(
     out->y1_frac = clamp_to_inner_scene(ay + dy);
 }
 
-/*
- * scene_generate_random_walls — rebuild s->walls.rand_specs[] with a
- * fresh random layout, then bake + recompute visibility.
- *
- *   Pseudocode:
- *     for i in 0..INTERIOR_WALL_COUNT−1:
- *       (ax, ay)  := pick_anchor_outside_safe_zone()
- *       θ         := random_undirected_angle_rad()
- *       half_len  := random_wall_half_length()
- *       rand_specs[i] := write_wall_spec_from_anchor(ax, ay, θ, half_len)
- *     mark use_rand := true
- *     scene_build_walls(s)              ← bake new fractions to cells
- *     compute_visibility(observer, walls, &vis)   ← refresh polygon
- */
+/* The 'n' key: roll a fresh random interior layout (each wall a random
+ * anchor, angle, and length), switch to it, rebuild the walls, and recompute
+ * what the observer can now see. */
 static void scene_generate_random_walls(Scene *s)
 {
     for (int i = 0; i < INTERIOR_WALL_COUNT; i++) {
@@ -1554,17 +963,10 @@ static void scene_generate_random_walls(Scene *s)
                        s->walls.list, s->walls.count, &s->vis);
 }
 
-/*
- * lissajous_eval_at_phase — Lissajous curve evaluator in cell space.
- *
- *   Formula (Bowditch 1815 / Lissajous 1857):
- *     x(t) = cx + rx · sin(fx · t)
- *     y(t) = cy + ry · sin(fy · t + phase)
- *
- *   With fx:fy = 3:2 this traces the canonical 6-lobed figure-eight.
- *   Centre + radii are derived from scene extent so the curve scales
- *   automatically with terminal resize.
- */
+/* Where on the drift path the eye sits at phase t.  Each axis is a sine wave
+ * around the scene centre; the 3:2 frequency ratio makes the looping
+ * figure-eight.  Centre and amplitude scale with the scene so it fits any
+ * terminal size. */
 static void lissajous_eval_at_phase(
     float t, float scene_w, float scene_h,
     float *out_x_cells, float *out_y_cells
@@ -1586,15 +988,7 @@ static float lissajous_advance_phase(float t)
     return t;
 }
 
-/*
- * scene_update_observer — move the eye one tick along the Lissajous
- * curve.
- *
- *   Pseudocode:
- *     (x, y) := lissajous_eval_at_phase(lissajous_t, scene_w, scene_h)
- *     observer.{x_cells, y_cells} := (x, y)
- *     lissajous_t := lissajous_advance_phase(lissajous_t)
- */
+/* Move the eye one step along its drift path and advance the path phase. */
 static void scene_update_observer(Scene *s)
 {
     lissajous_eval_at_phase(
@@ -1630,17 +1024,9 @@ static void observer_seed_at_center(Observer *o, float scene_w, float scene_h)
     o->y_cells         = scene_h * OBS_CENTER_Y_FRAC;
 }
 
-/*
- * scene_init — zero, seed defaults, build walls, compute first polygon.
- *
- *   Pseudocode:
- *     memset scene to zero
- *     compute drawable extent (term − HUD)
- *     seed sim controls (paused=false, fps=default)
- *     seed observer at scene centre with Lissajous phase = 0
- *     scene_build_walls(s)
- *     compute_visibility(observer, walls, &vis)   ← first frame ready
- */
+/* Set up a fresh scene for the given terminal size: clear it, seed the
+ * controls and observer, build the walls, and compute the first frame's
+ * visibility so something is ready to draw immediately. */
 static void scene_init(Scene *s, int term_cols, int term_rows)
 {
     memset(s, 0, sizeof(*s));
@@ -1661,14 +1047,8 @@ static float sweep_ray_advance_angle(float angle_rad)
     return angle_rad;
 }
 
-/*
- * scene_tick — advance one simulation step.
- *
- *   Pseudocode:
- *     scene_update_observer(s)             ← Lissajous one step forward
- *     observer.sweep_angle_rad := sweep_ray_advance_angle(…)
- *     compute_visibility(observer, walls, &vis)   ← refresh polygon
- */
+/* One simulation step: nudge the eye and the spinning ray forward, then
+ * recompute what the eye can see from its new spot. */
 static void scene_tick(Scene *s)
 {
     scene_update_observer(s);
@@ -1678,17 +1058,11 @@ static void scene_tick(Scene *s)
                        s->walls.list, s->walls.count, &s->vis);
 }
 
-/* ===================================================================== */
-/* S7  render                                                             */
-/* ===================================================================== */
+/* ── §7 render — paint the lit region, walls, ray, observer, and HUD ── */
 
-/*
- * fill_char_for_distance -- encode depth as character density.
- * A bright dense ring near the observer fades to sparse dots at the edges,
- * giving a "light cone emanating from the observer" feel.
- *
- * dist_fraction: cell_dist_geo / scene_diagonal_geo, clamped to [0,1].
- */
+/* Pick a fill glyph by distance: dense near the eye, fading to dots and then
+ * blank far away, so the lit region looks like a glow around the observer.
+ * dist_fraction is 0 at the eye, 1 at the far corner. */
 static char fill_char_for_distance(float dist_fraction)
 {
     if (dist_fraction < FILL_DIST_FRAC_DENSE_LIMIT) return '@';  /* dense ring */
@@ -1698,7 +1072,7 @@ static char fill_char_for_distance(float dist_fraction)
     return ' ';                                                  /* fade out  */
 }
 
-/* color_pair_for_distance -- complement fill_char_for_distance with color. */
+/* The matching colour for a distance: brighter near the eye, cooler far. */
 static int color_pair_for_distance(float dist_fraction)
 {
     if (dist_fraction < COLOR_DIST_FRAC_NEAR_LIMIT) return CP_FILL_NEAR;
@@ -1706,13 +1080,9 @@ static int color_pair_for_distance(float dist_fraction)
     return CP_FILL_FAR;
 }
 
-/*
- * scene_addch -- bounds-checked mvaddch that translates scene-y into
- * terminal-y.  Scene coords are 0..scene_rows-1; HUD_TOP_ROWS reserves
- * row 0 for the top status bar, so the actual terminal row is
- * (scene_y + HUD_TOP_ROWS).  All four scene-coord draw sites route
- * through this helper.
- */
+/* Draw one character at a scene cell, clipping off-screen writes.  Scene row
+ * 0 sits below the top HUD row, so we shift down by HUD_TOP_ROWS.  Every
+ * scene-space draw goes through here. */
 static void scene_addch(const Scene *s, int scene_y, int scene_x, char ch)
 {
     if (scene_x < 0 || scene_x >= s->scene_cols) return;
@@ -1720,11 +1090,9 @@ static void scene_addch(const Scene *s, int scene_y, int scene_x, char ch)
     mvaddch(scene_y + HUD_TOP_ROWS, scene_x, (chtype)ch);
 }
 
-/*
- * draw_line_bresenham -- draw character c from (x0,y0) to (x1,y1) using
- * Bresenham's algorithm in SCENE coordinates; scene_addch handles the
- * HUD_TOP_ROWS y-translation and clipping.
- */
+/* Draw a straight line of character c from one cell to another using
+ * Bresenham's algorithm (integer stepping, no floats).  scene_addch handles
+ * the HUD offset and clipping. */
 static void draw_line_bresenham(
     const Scene *s,
     int x0, int y0, int x1, int y1,
@@ -1745,11 +1113,8 @@ static void draw_line_bresenham(
     attroff(COLOR_PAIR(color_pair) | attrs);
 }
 
-/*
- * wall_display_char -- choose a line character based on wall slope.
- * Nearly-horizontal walls get '-', nearly-vertical get '|',
- * diagonal walls get '/' or '\'.
- */
+/* Pick a glyph that matches the wall's slant: '-' for flat, '|' for upright,
+ * '/' or '\' for diagonal. */
 static char wall_display_char(const Wall *w)
 {
     float dx  = w->x1_cells - w->x0_cells;
@@ -1760,11 +1125,9 @@ static char wall_display_char(const Wall *w)
     return (dx * dy > 0.0f) ? '\\' : '/';                    /* diagonal   */
 }
 
-/*
- * draw_sweep_ray -- draw the animated rotating ray from observer to nearest wall.
- * This is a visual teaching aid showing "the scan is sweeping around 360 degrees".
- * It is computed independently of the visibility polygon.
- */
+/* Draw the spinning '*' ray from the eye to the first wall it hits -- just a
+ * teaching aid to show the sweep going around, separate from the real
+ * visibility math. */
 static void draw_sweep_ray(const Scene *s)
 {
     SweepHit ray_hit;
@@ -1798,22 +1161,9 @@ static void draw_sweep_ray(const Scene *s)
     attroff(COLOR_PAIR(CP_SWEEP_RAY));
 }
 
-/*
- * render_scene -- main per-frame draw.
- *
- * Pass 1: iterate every cell in the scene.  If visible, draw a fill
- *         character whose density and color encode the observer distance.
- * Pass 2: draw the animated sweep ray ('*').
- * Pass 3: draw interior walls on top of the fill.
- * Pass 4: draw bounding box (dim, behind everything visually).
- * Pass 5: draw observer '@' topmost.
- *
- * Per-cell cost: O(log N) binary search + O(1) intersection.
- * Total frame cost: O(scene_cells * log N).
- */
-/* Scene diagonal in geo space — the normaliser for "fraction of the
- * farthest possible distance".  Used by paint_visible_cells to map
- * raw distance into [0, 1] for the fill_char + colour_pair pickers. */
+/* The farthest a cell can be from the eye -- the corner-to-corner distance in
+ * geo space.  Used to scale raw distances into the 0..1 fraction the glyph
+ * and colour pickers want. */
 static float scene_diagonal_geo(const Scene *s)
 {
     float w = (float)s->scene_cols;
@@ -1821,8 +1171,8 @@ static float scene_diagonal_geo(const Scene *s)
     return sqrtf(w * w + h * h);
 }
 
-/* Centre of cell (row, col) in cell space — the place the ray actually
- * tests, not the top-left corner. */
+/* The middle of a cell -- we test visibility at the centre of the glyph, not
+ * its corner, so the lit/unlit decision matches what the eye sees painted. */
 static void cell_center_in_cell_space(int row, int col,
                                       float *out_cx, float *out_cy)
 {
@@ -1830,8 +1180,8 @@ static void cell_center_in_cell_space(int row, int col,
     *out_cy = (float)row + CELL_CENTER_OFFSET;
 }
 
-/* Distance from observer to cell centre in geo space, normalised by
- * the scene diagonal (so 0.0 = observer cell, 1.0 = farthest cell). */
+/* How far a cell is from the eye, as a fraction of the longest possible
+ * distance (0 at the eye, 1 at the far corner). */
 static float cell_distance_fraction(
     float cell_cx, float cell_cy,
     float obs_x_cells, float obs_y_cells, float scene_diag_geo
@@ -1842,8 +1192,8 @@ static float cell_distance_fraction(
     return (scene_diag_geo > 0.0f) ? dist / scene_diag_geo : 0.0f;
 }
 
-/* Paint one cell in the appropriate fill glyph + colour pair derived
- * from its distance fraction.  Skips writes when the glyph is ' '. */
+/* Paint one cell with the glyph and colour for its distance; does nothing if
+ * that distance maps to blank space. */
 static void paint_cell_with_distance_falloff(
     const Scene *s, int row, int col, float dist_fraction
 ) {
@@ -1855,15 +1205,8 @@ static void paint_cell_with_distance_falloff(
     attroff(COLOR_PAIR(cpair));
 }
 
-/*
- * paint_visible_cells_with_distance_falloff — Pass 1 of render_scene.
- *
- *   Pseudocode (per cell of the scene grid):
- *     (cx, cy) := cell centre in cell space
- *     if not cell_is_visible(cx, cy):  skip
- *     frac     := cell_distance_fraction(...)
- *     paint cell with the falloff glyph + colour
- */
+/* Pass 1: walk every cell, and for each one the eye can see, paint it with
+ * the glyph and colour for its distance. */
 static void paint_visible_cells_with_distance_falloff(const Scene *s)
 {
     float scene_diag = scene_diagonal_geo(s);
@@ -1883,7 +1226,7 @@ static void paint_visible_cells_with_distance_falloff(const Scene *s)
     }
 }
 
-/* Paint one Wall as a Bresenham line in (color_pair, attr). */
+/* Draw one wall as a line in the given colour and style. */
 static void paint_wall_line(
     const Scene *s, const Wall *w, int color_pair, int attr
 ) {
@@ -1894,22 +1237,22 @@ static void paint_wall_line(
         color_pair, attr, wc);
 }
 
-/* Pass 3 — interior walls (bold). */
+/* Pass 3: the interior obstacle walls, in bold. */
 static void paint_interior_walls(const Scene *s)
 {
     for (int i = BOUNDING_WALL_COUNT; i < s->walls.count; i++)
         paint_wall_line(s, &s->walls.list[i], CP_WALL, A_BOLD);
 }
 
-/* Pass 4 — outer bounding box (dim, drawn AFTER interior so it doesn't
- * occlude interior junctions). */
+/* Pass 4: the outer box, dim.  Drawn after the interior walls so it never
+ * paints over where they meet. */
 static void paint_bounding_box(const Scene *s)
 {
     for (int i = 0; i < BOUNDING_WALL_COUNT; i++)
         paint_wall_line(s, &s->walls.list[i], CP_BOUND, A_DIM);
 }
 
-/* Pass 5 — observer '@' glyph on top of everything else. */
+/* Pass 5: the observer '@', on top of everything. */
 static void paint_observer_glyph(const Scene *s)
 {
     int obs_col = (int)roundf(s->observer.x_cells);
@@ -1919,18 +1262,8 @@ static void paint_observer_glyph(const Scene *s)
     attroff(COLOR_PAIR(CP_OBSERVER) | A_BOLD);
 }
 
-/*
- * render_scene — main per-frame draw, five passes painter-order.
- *
- *   Pseudocode:
- *     Pass 1  paint_visible_cells_with_distance_falloff   (depth fill)
- *     Pass 2  draw_sweep_ray                              ('*' overlay)
- *     Pass 3  paint_interior_walls                        (bold)
- *     Pass 4  paint_bounding_box                          (dim outer box)
- *     Pass 5  paint_observer_glyph                        ('@' on top)
- *
- *   Cost per frame: O(scene_cells · log n_hits) + O(walls · cell_len).
- */
+/* Draw the whole frame back-to-front: lit fill, then the sweep ray, then
+ * walls, the outer box, and finally the observer on top. */
 static void render_scene(const Scene *s)
 {
     paint_visible_cells_with_distance_falloff(s);
@@ -1940,18 +1273,8 @@ static void render_scene(const Scene *s)
     paint_observer_glyph(s);
 }
 
-/*
- * draw_hud -- canonical project HUD.
- *
- *   Top row 0       (CP_HUD,  A_BOLD)   right-aligned data line:
- *       visibility %, rays cast, wall count, fps, paused/running.
- *   Bottom row R-1  (CP_HINT, A_BOLD)   left-aligned key bindings.
- *
- *   Layout follows the project HUD Standard (CLAUDE.md): data on top,
- *   actions on bottom, both bright and bold so they remain legible
- *   over any animation cell underneath.
- */
-/* visible_polygon_area / scene_area as a percentage; 0 if scene degenerate. */
+/* What fraction of the room the eye can see, as a percentage; 0 if the scene
+ * has no area. */
 static float visible_area_percent(const Scene *s)
 {
     float scene_area = (float)s->scene_cols * (float)s->scene_rows;
@@ -1960,7 +1283,7 @@ static float visible_area_percent(const Scene *s)
         : 0.0f;
 }
 
-/* One-word run-state indicator used in the top status string. */
+/* "PAUSED" or "running", for the status line. */
 static const char *run_state_label(const Scene *s)
 {
     return s->sim.paused ? "PAUSED " : "running";
@@ -1994,15 +1317,8 @@ static void draw_bottom_hint(int term_rows)
     attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/*
- * draw_hud — canonical project HUD (top status + bottom hints).
- *
- *   Pseudocode:
- *     read terminal extent
- *     format right-aligned status line
- *     draw top status        (row 0,        CP_HUD,  A_BOLD)
- *     draw bottom action hint(row R−1,      CP_HINT, A_BOLD)
- */
+/* The HUD: a status line across the top and a key-hint strip along the
+ * bottom, both bright and bold so they stay readable over the animation. */
 static void draw_hud(const Scene *s)
 {
     int term_rows, term_cols;
@@ -2014,9 +1330,7 @@ static void draw_hud(const Scene *s)
     draw_bottom_hint(term_rows);
 }
 
-/* ===================================================================== */
-/* S8  screen                                                             */
-/* ===================================================================== */
+/* ── §8 screen — ncurses bring-up and teardown ── */
 
 static void screen_init(void)
 {
@@ -2031,12 +1345,12 @@ static void screen_init(void)
 
 static void screen_teardown(void) { endwin(); }
 
-/* ===================================================================== */
-/* S9  app                                                                */
-/* ===================================================================== */
+/* ── §9 app — signals, input, and the main loop ── */
 
-static volatile sig_atomic_t g_resize_pending = 0;
-static volatile sig_atomic_t g_quit           = 0;
+/* The only globals: signal handlers can't be handed a Scene pointer, so the
+ * two flags they set have to live at file scope. */
+static volatile sig_atomic_t g_resize_pending = 0;   /* terminal was resized */
+static volatile sig_atomic_t g_quit           = 0;   /* time to exit         */
 
 static void handle_sigwinch(int sig) { (void)sig; g_resize_pending = 1; }
 static void handle_sigint  (int sig) { (void)sig; g_quit           = 1; }
@@ -2062,16 +1376,8 @@ static void sim_fps_decrease(Scene *s)
     if (s->sim.fps > SIM_FPS_MIN) s->sim.fps -= SIM_FPS_STEP;
 }
 
-/*
- * route_key_to_action — translate one keystroke into a Scene mutation.
- *
- *   q / Q / ESC  → request quit (set g_quit)
- *   SPACE        → toggle pause
- *   r / R        → reset scene at current extent
- *   n / N        → regenerate random wall layout
- *   + / =        → faster simulation tempo
- *   - / _        → slower simulation tempo
- */
+/* Act on one keystroke: q/ESC quit, space pauses, r resets, n re-rolls the
+ * walls, +/- change speed. */
 static void route_key_to_action(Scene *s, int ch)
 {
     switch (ch) {
@@ -2085,16 +1391,15 @@ static void route_key_to_action(Scene *s, int ch)
     }
 }
 
-/* Drain every pending key from ncurses and route each through
- * route_key_to_action.  ncurses is in non-blocking mode so getch()
- * returns ERR when the buffer is empty. */
+/* Handle every key waiting in the buffer.  getch() returns ERR when empty
+ * because the terminal is in non-blocking mode. */
 static void app_handle_input(Scene *s)
 {
     int ch;
     while ((ch = getch()) != ERR) route_key_to_action(s, ch);
 }
 
-/* ── one-shot init helpers for main() ────────────────────────────────── */
+/* ── one-shot helpers for main() ── */
 
 /* Install the POSIX signal handlers used by the loop. */
 static void signals_install(void)
@@ -2103,9 +1408,8 @@ static void signals_install(void)
     signal(SIGINT,   handle_sigint);
 }
 
-/* If the SIGWINCH handler set g_resize_pending, tear ncurses down +
- * back up so stdscr matches the new terminal extent, then rebuild the
- * scene against the new size. */
+/* If the terminal was resized, restart ncurses so it learns the new size,
+ * then rebuild the scene to fit and reset the frame timers. */
 static void handle_resize_if_pending(Scene *s,
                                      int64_t *sim_accum_ns,
                                      int64_t *frame_prev_ns)
@@ -2121,18 +1425,9 @@ static void handle_resize_if_pending(Scene *s,
     *sim_accum_ns  = 0;
 }
 
-/*
- * advance_fixed_timestep_sim — Fiedler's accumulator pattern.
- *
- *   Pseudocode:
- *     if paused: return
- *     accum += dt
- *     while accum ≥ tick_period:
- *       scene_tick(s)
- *       accum -= tick_period
- *
- *   Keeps physics deterministic regardless of render frame rate.
- */
+/* Run as many fixed-size simulation steps as the elapsed time has earned.
+ * Banking leftover time in an accumulator keeps the animation running at the
+ * same speed whatever the actual frame rate. */
 static void advance_fixed_timestep_sim(Scene *s,
                                        int64_t *sim_accum_ns, int64_t dt_ns)
 {
@@ -2145,7 +1440,7 @@ static void advance_fixed_timestep_sim(Scene *s,
     }
 }
 
-/* Render one frame: erase, scene, HUD, mark dirty, single-write flush. */
+/* Draw one frame: clear, paint the scene and HUD, then flush in one write. */
 static void frame_render(const Scene *s)
 {
     erase();
@@ -2162,22 +1457,9 @@ static void wait_until_next_frame(int64_t frame_start_ns)
     clock_sleep_ns(TICK_NS(TARGET_FPS) - elapsed);
 }
 
-/*
- * main — wire signals + ncurses + Scene, then run the canonical loop:
- *
- *   Pseudocode:
- *     install signal handlers
- *     bring up terminal (ncurses + colour)
- *     allocate Scene on stack, seed at current terminal extent
- *
- *     while not quit:
- *       handle resize if pending
- *       compute dt since last frame
- *       advance the fixed-timestep simulation
- *       drain input
- *       render one frame
- *       wait until next frame boundary
- */
+/* Set up signals, the terminal, and the scene, then loop: handle any resize,
+ * advance the simulation by the time elapsed, read input, draw, and wait for
+ * the next frame -- until the user quits. */
 int main(void)
 {
     signals_install();

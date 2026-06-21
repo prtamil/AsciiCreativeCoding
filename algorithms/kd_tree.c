@@ -1,232 +1,16 @@
 /*
- * algorithms/kd_tree.c — K-D Tree: data structure, operations, visual demo
+ * algorithms/kd_tree.c — a 2-D k-d tree with a step-by-step ASCII demo.
  *
- * This file is in two parts:
+ * A k-d tree sorts points by x, then y, then x again, level by level, so a
+ * range search can skip whole regions instead of checking every point. Part 1
+ * is the reusable tree (insert + range query); part 2 walks main() through
+ * inserting 12 points and one query, pausing on Enter. Sister structures:
+ * algorithms/quadtree.c, algorithms/bsp_tree.c.
  *
- *   PART 1 — the kd-tree library
- *     Data types (Point, KDNode, BBox, GridCanvas, QueryResult),
- *     geometry helpers, memory management, core operations
- *     (kd_insert, kd_query), inspection helpers, and the ASCII
- *     grid visualizer.  No I/O — a reusable module.
+ * Algorithm: Bentley, "Multidimensional binary search trees" (CACM 1975).
  *
- *   PART 2 — step-by-step demo in main()
- *     Inserts 12 labelled points, shows every split live, then
- *     runs a range query and prints the prune trace.  Press Enter
- *     between steps.
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra algorithms/kd_tree.c -o kd_tree
- *
- * Run:
- *   ./kd_tree
+ * Build: gcc -std=c11 -O2 -Wall -Wextra algorithms/kd_tree.c -o kd_tree
  */
-
-/* ── CONCEPTS ───────────────────────────────────────────────────────────── *
- *
- * K-D tree vs Quadtree vs BSP tree (all three are under algorithms/):
- *
- *   Quadtree  — every leaf holds up to LEAF_CAPACITY points; when it
- *               overflows it splits into FOUR equal children (NW/NE/SW/SE).
- *               Both axes are cut simultaneously.  Good for spatial hashing
- *               of points and 2-D range queries.
- *
- *   BSP tree  — every leaf splits into TWO children; axis alternates with
- *               depth (even → vertical, odd → horizontal).  Each node stores
- *               the split line, not a data point.  Classic use: Doom/Quake
- *               back-to-front rendering (pre-computed at level build time).
- *
- *   K-D tree  — each node holds EXACTLY ONE data point AND acts as the
- *               split plane.  Axis alternates with depth.  Every internal
- *               node is simultaneously a stored datum and a spatial divider.
- *               This makes insertion and exact-match search simple: just
- *               compare the relevant coordinate and go left or right.
- *               Trade-off: deletion is more complex (requires re-insertion
- *               of the subtree, or a "tombstone" flag).
- *
- * Time complexity:
- *   Insert (kd_insert):   O(log N) average, O(N) worst case (unbalanced)
- *   Range query (kd_query): O(√N + k) average for 2-D, k = points found
- *   Nearest-neighbour:    O(log N) average (not implemented here)
- *   The √N factor in range queries comes from the fact that in 2-D, a
- *   worst-case strip query touches O(√N) subtrees — this is tighter
- *   than the O(N) brute force but looser than 1-D binary search O(log N).
- *
- * Alternating axis split (kd_insert, kd_query):
- *   At depth 0, 2, 4 … the split is on X (vertical dividing line).
- *   At depth 1, 3, 5 … the split is on Y (horizontal dividing line).
- *   This guarantees that every 2-D region is eventually subdivided along
- *   both axes, preventing degeneracy from axis-aligned point clusters.
- *
- * Bounding-box pruning (kd_query):
- *   Each recursive call narrows the bounding box by halving it along the
- *   current node's split axis.  If the narrowed box does NOT overlap the
- *   query rectangle, the ENTIRE subtree is skipped in O(1).  This is the
- *   source of the √N efficiency — whole branches are pruned without visiting
- *   individual points.
- *
- * References
- * ──────────
- *   ── KD-trees: original + canonical ──────────────────────────────
- *   [1] Bentley, J. L. (1975), "Multidimensional binary search trees
- *       used for associative searching", Communications of the ACM
- *       18(9), pp. 509-517 — the ORIGINAL kd-tree paper.  Defines
- *       the alternating-axis insertion and range query implemented
- *       in this file.  ~9 pages; the best place to start.
- *   [2] Friedman, J. H., Bentley, J. L. & Finkel, R. A. (1977), "An
- *       algorithm for finding best matches in logarithmic expected
- *       time", ACM Trans. Math. Software 3(3), pp. 209-226 — nearest-
- *       neighbour search.  Made kd-trees practical for machine
- *       learning and graphics; the algorithm we did NOT implement.
- *   [3] Bentley, J. L. (1990), "K-d trees for semidynamic point sets",
- *       6th Symposium on Computational Geometry (SCG '90), pp. 187-197
- *       — perfectly balanced kd-tree via median splits.  Addresses
- *       the insertion-order sensitivity that makes our incremental
- *       build potentially degenerate on sorted input.
- *   [4] Samet, H. (2006), "Foundations of Multidimensional and Metric
- *       Data Structures", Morgan Kaufmann — the encyclopaedic
- *       reference for everything spatial.  §1.5, §4.2 cover kd-tree
- *       variants in exhaustive depth (k > 2, bulk loading, paging).
- *
- *   ── Computational geometry textbooks ────────────────────────────
- *   [5] de Berg, M., Cheong, O., van Kreveld, M. & Overmars, M.
- *       (2008), "Computational Geometry: Algorithms and Applications"
- *       (3rd ed.), Springer — Ch. 5 covers kd-trees + range trees
- *       with full proofs of the O(√N + k) query bound used by
- *       kd_query.
- *   [6] O'Rourke, J. (1998), "Computational Geometry in C" (2nd ed.),
- *       Cambridge — practical C-implementation companion to [5].
- *       Working code for many computational-geometry primitives.
- *   [7] Knuth, D. E. (1998), "The Art of Computer Programming, Vol. 3:
- *       Sorting and Searching" (2nd ed.), Addison-Wesley — §6.5
- *       "Retrieval on Secondary Keys" gives the historical context
- *       for multidimensional searching (pre-Bentley).
- *
- *   ── Range searching refinements ─────────────────────────────────
- *   [8] Lueker, G. S. (1978), "A data structure for orthogonal range
- *       queries", 19th FOCS, pp. 28-34 — fractional cascading for
- *       range trees; how to push the query bound below O(√N).
- *   [9] Bentley, J. L. & Maurer, H. A. (1980), "Efficient worst-case
- *       data structures for range searching", Information Sciences
- *       28, pp. 91-112 — survey of worst-case bounds for range
- *       queries on multiple dimensions.
- *
- *   ── Online quick reference ──────────────────────────────────────
- *  [10] https://en.wikipedia.org/wiki/K-d_tree — comprehensive
- *       overview with construction, insertion, range and NN query
- *       pseudocode in several languages.  Good first stop after [1].
- *
- *   Note on RENDERING: the ASCII visualizer uses only direct axis-
- *   aligned glyph placement (no Bresenham, no anti-aliasing).  The
- *   only non-trivial trick is the '+' intersection merge in
- *   grid_put_line; grid_print uses plain ANSI escape codes (ECMA-48).
- *   No external rendering references needed.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A K-D TREE is a binary search tree where each node holds ONE
- * data point AND that point's coordinate IS the split.  The
- * split axis ALTERNATES with depth: depth 0 cuts on x (the
- * stored point's x is the split value), depth 1 cuts on y,
- * depth 2 on x again, etc.  Insertion is "go left if smaller,
- * right if greater along the current axis."  Range queries
- * prune subtrees whose region can't possibly contain query
- * points.
- *
- * KD-TREE vs OTHER SPATIAL TREES
- * ──────────────────────────────
- *
- *   QUADTREE: every internal split = 4 children; both axes at
- *             once; data only in leaves.  Wider but shallower.
- *
- *   BSP TREE: 2 children, splits at MIDPOINT of region; data
- *             only in leaves.  Insertion-order independent.
- *
- *   KD TREE:  2 children, splits at the DATA POINT'S coord;
- *             data IN every node.  No "internal-only" nodes →
- *             tighter memory.  Best for nearest-neighbour
- *             search.  Sensitive to insertion order.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  INSERT(point P):
- *    1. If root is null: root = new node with P, depth 0.
- *    2. Else: descend from root:
- *       at each node N at depth d:
- *         axis = (d % 2 == 0) ? X : Y
- *         if P[axis] < N.point[axis]:
- *           if N.left is null: N.left = new node with P; done
- *           else: descend N.left, increment depth
- *         else: same with N.right
- *
- *  RANGE QUERY(rectangle R):
- *    Recursively descend with a "current bounding box" that
- *    narrows along the split axis at each level:
- *
- *      query(node, R, current_box):
- *        if current_box doesn't overlap R: return  ← prune
- *        if node.point in R: report it
- *        axis = depth-dependent
- *        split current_box along axis at node.point[axis]:
- *          left_box  = current_box ∩ {axis < split}
- *          right_box = current_box ∩ {axis ≥ split}
- *        query(node.left,  R, left_box)
- *        query(node.right, R, right_box)
- *
- * KEY FORMULAS
- * ────────────
- *   Split axis at depth d:  d % 2 == 0 → X
- *                           d % 2 == 1 → Y
- *
- *   Insertion comparison:   point[axis] < node.point[axis] → left
- *
- *   Bounding box halving:   left_box.max[axis]  = node.point[axis]
- *                           right_box.min[axis] = node.point[axis]
- *
- *   Bounding box overlap:   along each axis, max1 ≥ min2 AND min1 ≤ max2
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS + MENTAL MODEL above — read first.  Read
- *      algorithms/bsp_tree.c first if "midpoint splits" are familiar;
- *      this file's "data-point splits" is the natural contrast.
- *      algorithms/quadtree.c covers the quadtree variant.
- *   2. PART 1: KDNode + BBox + helpers + kd_insert + kd_query —
- *      THE LIBRARY.  Each driver carries a pseudocode docblock; read
- *      those before the bodies.
- *   3. PART 2: main() with step-by-step insertion + query.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   KDNode                     one node = one data point + 2 children.
- *   .point                     the (x, y) data this node holds.
- *   .left, .right              children pointers.
- *   depth                      tracked during traversal (not stored)
- *                              — determines split axis.
- *
- * Background you need
- * ───────────────────
- *   - Recursion + binary-tree pointer manipulation.
- *   - Comparison-based search (binary search idea).
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Self-balancing trees (red-black, AVL).  K-D balance is
- *     handled by INSERTION ORDER, not by tree rotations.
- *   - K-D nearest-neighbour search.  We only do range queries
- *     here.
- *   - Higher-dimensional K-D trees (k > 2).  The principle
- *     generalises by cycling through axes 0, 1, ..., k-1 at
- *     each depth level.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #include <assert.h>
 #include <stdbool.h>
@@ -234,7 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ─── ANSI color codes ──────────────────────────────────────────────── */
+/* ── ANSI color codes — what each color flags on screen ── */
 #define CLR_RESET   "\033[0m"
 #define CLR_BOLD    "\033[1m"
 #define CLR_DIM     "\033[2m"
@@ -246,381 +30,169 @@
 #define CLR_BLUE    "\033[1;34m"   /* y-split lines (horizontal -)    */
 #define CLR_GOLD    "\033[33m"     /* headers and labels              */
 
-/* ================================================================
- * PART 1 — DATA STRUCTURES
- * ================================================================ */
+/* ── §1 PART 1: the k-d tree library — sizes the grid lives on ── */
 
-/* ── constants ──────────────────────────────────────────────────── */
-
-/*
- * The demo space is a 56 × 22 integer grid.
- * Points have (x, y) in [0, SPACE_W) × [0, SPACE_H).
- * These dimensions fit in an 80-column terminal once the border is drawn.
- */
+/* The drawing area: a 56-wide by 22-tall grid of cells. Every point's (x,y)
+ * is a cell address in [0,SPACE_W) x [0,SPACE_H). Sized to fit an 80-column
+ * terminal once the surrounding border is drawn. */
 #define SPACE_W   56
 #define SPACE_H   22
 
-/* Maximum points a single range query can return. */
+/* Most points one range query can hand back. Matches over this are dropped. */
 #define QUERY_CAP 64
 
-/* ── data types ─────────────────────────────────────────────────── */
+/* ── data types ── */
 
 /*
  * Point — an atomic data point stored inside the kd-tree.
  *
- * Intent
- *   This is the smallest unit the kd-tree organises.  Every KDNode
- *   wraps exactly one Point; the tree's topology IS just a spatial
- *   sort of a Point set.  The tree NEVER inspects the label — it
- *   routes purely on (x, y) — so Point is conceptually a 2-D sort
- *   key + an opaque payload.
- *
- * Why integer coordinates (and not float)
- *   The demo space is a fixed SPACE_W × SPACE_H character grid (§1).
- *   Integers let us address grid cells directly without rounding;
- *   the renderer plots a point at cells[y][x] with no conversion,
- *   and kd_query's < / >= comparisons stay exact (no FP rounding
- *   flipping a near-equal compare).  A production kd-tree on
- *   continuous data would use float/double; the algorithm is
- *   identical, only the comparator type changes.
- *
- * Why a `label` field
- *   Pedagogical only — the step-by-step demo narrates "insert
- *   A(28,11), then B(14,5)" so the letter has to travel with the
- *   point through the tree.  In a real application this slot
- *   carries whatever payload the use case needs (record id,
- *   pointer to a row, metric value).  The kd-tree code never
- *   reads it — only the render and dump layers do.
+ * The one thing the tree sorts. The tree only ever looks at (x,y) to decide
+ * left or right; the label just rides along so the demo can say "insert A".
+ * Coordinates are whole numbers because each one is a cell on the screen grid
+ * (a real app would use floats — only the comparison type changes).
  *
  * Members
- *   x      grid column,  0 ≤ x < SPACE_W   — split axis when node.axis == 0
- *   y      grid row,     0 ≤ y < SPACE_H   — split axis when node.axis == 1
- *                                            (y grows DOWNWARD — screen convention)
- *   label  opaque payload; the tree treats it as a black box and only
- *          the renderer / dumper inspect it ('A'..'Z' by demo convention)
- *
- * References
- *   The "sort key + opaque payload" pattern is the standard binary-
- *   search-tree node generalised to k dimensions — see Knuth TAOCP
- *   Vol. 3 §6.2 (BST) and Bentley 1975 [1] for the k-D extension.
+ *   x      column, 0..SPACE_W-1.  The value the tree splits on at even depths.
+ *   y      row,    0..SPACE_H-1.  The value the tree splits on at odd depths.
+ *                  (y grows downward, as on a screen)
+ *   label  a letter A..Z, drawn on screen; the tree never reads it.
  */
 typedef struct {
-    int  x;       /* grid column [0, SPACE_W)  — primary key when axis==0 */
-    int  y;       /* grid row    [0, SPACE_H)  — primary key when axis==1 */
-    char label;   /* display glyph 'A'..'Z' — opaque to the tree routing  */
+    int  x;       /* column 0..SPACE_W-1 — split value at even depths */
+    int  y;       /* row    0..SPACE_H-1 — split value at odd depths   */
+    char label;   /* display letter A..Z; ignored by the tree itself   */
 } Point;
 
 /*
- * KDNode — one node in the kd-tree.  Both a stored datum AND a splitter.
+ * KDNode — one node in the tree. It does two jobs at once: it stores a point,
+ * and it splits the screen with a line drawn through that point. The split is
+ * vertical or horizontal depending on the node's depth, and that one line
+ * decides which child every later point goes to. Storing the point and the
+ * split in the same node (rather than separate leaf/internal types) is what
+ * keeps a k-d tree compact.
  *
- * Intent
- *   Each KDNode does THREE jobs that other spatial structures split
- *   across different node types:
- *     (1) Holds one data point   — like a leaf in a quadtree.
- *     (2) Acts as a splitting plane — like an internal node in a BSP.
- *     (3) Routes child traversal via an axis-aligned comparison.
- *   Collapsing all three into one node type is why kd-trees are so
- *   memory-tight (no separate internal/leaf classes) and why
- *   insert + exact-match search are both O(log N) average.
- *
- * Alternating-axis policy
- *   `axis` is fixed at allocation time by kd_new based on the node's
- *   DEPTH in the tree:
- *
- *     depth 0, 2, 4, … → axis = 0  → split on X (vertical line)
- *     depth 1, 3, 5, … → axis = 1  → split on Y (horizontal line)
- *
- *   See axis_at_depth() in §1.  Alternating guarantees both
- *   dimensions get used as filtering criteria; without it the tree
- *   would degenerate to a 1-D BST on one axis only (see Bentley
- *   1975 §3 for the original justification).
- *
- * Why CACHE `axis` per node (instead of recomputing depth % 2)
- *   Two reasons:
- *     (i) Query / render / free recursion don't need a `depth`
- *         parameter — every node carries its own split rule.  Keeps
- *         the public signatures clean (kd_query takes 4 args, not 5).
- *    (ii) Makes the node SELF-DESCRIBING — given any subtree root
- *         you can route a new point without knowing where the
- *         subtree sits in its parent.  Useful for subtree-rebuild,
- *         tree-merge, and other operations not implemented here.
- *   Costs one extra int per node.  Negligible at any reasonable N.
- *
- * Routing rule (mirrored exactly by kd_insert)
- *   coord_on_axis(p, axis) <  coord_on_axis(point, axis)  → go LEFT
- *   coord_on_axis(p, axis) >= coord_on_axis(point, axis)  → go RIGHT
- *   Ties + duplicates fall RIGHT — consistent with bsearch and the
- *   STL multiset convention.
- *
- * Why NO parent pointer
- *   All current operations are top-down recursive (insert, query,
- *   render, free).  A parent pointer would double per-node memory
- *   for zero current benefit.  If you ever implement DELETION you'll
- *   need either a parent pointer or to walk down with a parent
- *   stack — see Bentley 1990 [3] for the standard approach.
+ * Each node remembers its own axis (set once, by depth, in kd_new) so the
+ * recursive walks don't have to carry a depth counter — a node knows how to
+ * route on its own. There's no parent pointer because every operation here
+ * walks top-down; deletion would need one (see Bentley 1990).
  *
  * Members
- *   point   the stored datum AND the split position
- *           (split value = point.x if axis==0 else point.y)
- *   axis    0 → split on X (vertical line through point.x)
- *           1 → split on Y (horizontal line through point.y)
- *           Fixed at kd_new time; never mutated after.
- *   left    subtree: every descendant p has coord[axis] <  point.coord[axis]
- *           (NULL when the slot is empty — a "leaf edge")
- *   right   subtree: every descendant p has coord[axis] >= point.coord[axis]
- *           (NULL when empty; ties + duplicates land here)
- *
- * Invariants
- *   axis ∈ {0, 1}
- *   Every node in left  has coord[axis] strictly less than this node's
- *   Every node in right has coord[axis] greater-or-equal
- *   (these are the per-node BST invariants on the split axis — the
- *   OTHER axis is unconstrained at this level and gets sorted deeper)
- *
- * References
- *   [1] Bentley 1975 §3 defines this exact layout (one point + two
- *       children + alternating axis).  Our KDNode is the direct C
- *       transliteration of his Algol-ish pseudocode.
- *   [3] Bentley 1990 covers semidynamic point sets — deletion,
- *       rebalancing, bulk insert.
+ *   point   the stored point; its x (or y) is also the split line's position.
+ *   axis    0 = split on x (a vertical line); 1 = split on y (horizontal).
+ *           Fixed when the node is born; never changes.
+ *   left    child holding points on the smaller side of the split (NULL = empty).
+ *   right   child holding points on the equal-or-larger side (ties go here).
  */
 typedef struct KDNode KDNode;
 struct KDNode {
-    Point   point;   /* stored datum AND the split position                          */
-    int     axis;    /* 0 = x-split (vertical), 1 = y-split (horizontal); set once   */
-    KDNode *left;    /* subtree: descendants have coord[axis] <  point.coord[axis]   */
-    KDNode *right;   /* subtree: descendants have coord[axis] >= point.coord[axis]   */
+    Point   point;   /* the stored point; its coord on `axis` is the split line */
+    int     axis;    /* 0 = vertical (x) split, 1 = horizontal (y); set once    */
+    KDNode *left;    /* points whose coord on this axis is smaller              */
+    KDNode *right;   /* points whose coord is equal or larger (ties land here)  */
 };
 
 /*
- * BBox — inclusive axis-aligned bounding box.  [xmin, xmax] × [ymin, ymax].
+ * BBox — a rectangle of grid cells, edges included on both sides. Used for
+ * three things here, all the same shape: the patch of grid a subtree owns
+ * (shrinks as you walk down), the search rectangle the user asks about, and
+ * the area the renderer is allowed to draw a split line into.
  *
- * Intent
- *   A BBox names a RECTANGULAR REGION of grid space.  Three distinct
- *   roles in this file, all served by the same type:
- *     (a) Current subtree's territory — passed down kd_query and
- *         grid_render_tree.  At the root it's the full grid; every
- *         recursion narrows it along the current node's axis.
- *     (b) User's QUERY RECTANGLE — the "give me all stored points
- *         inside R" parameter to kd_query / show_query.
- *     (c) Rendering territory — the pixel region grid_render_tree
- *         is allowed to paint a split line within.
- *   All three are axis-aligned rectangles on the integer grid, so
- *   one struct + one set of geometry helpers (bbox_overlap,
- *   point_in_bbox, bbox_split_left/right) serves every caller.
- *
- * INCLUSIVE convention (both ends)
- *   A point (px, py) is INSIDE iff
- *     xmin ≤ px ≤ xmax  AND  ymin ≤ py ≤ ymax.
- *   Chosen for two reasons:
- *     (i) Match kd_query's "is point in query rect" predicate — you
- *         want to FIND a point that sits at a corner of R.
- *    (ii) Let bbox_split_left/right produce two halves that PARTITION
- *         the parent EXACTLY — no gap, no overlap — by giving the
- *         left half max = value-1 and the right half min = value.
- *         The cell at coord==value belongs to right; the cell at
- *         coord==value-1 belongs to left.
- *
- * Why pass by VALUE (not pointer)
- *   16 bytes (4 × int).  Fits in registers on a 64-bit ABI.  Pass-by-
- *   value avoids aliasing concerns in the recursion where the same
- *   `query_rect` is passed unchanged but the per-call `box` narrows.
- *   The two are clearly separate values in the caller's frame.
+ * "Edges included" means a point exactly on a side still counts as inside.
+ * That choice also lets a split cut the rectangle into two halves that fit
+ * together perfectly with no gap and no overlap (left gets up to value-1,
+ * right starts at value). Passed around by value — it's only four ints.
  *
  * Members
- *   xmin   left   edge, inclusive — 0 ≤ xmin ≤ xmax in a valid box
- *   ymin   top    edge, inclusive — 0 ≤ ymin ≤ ymax (y grows DOWNWARD)
- *   xmax   right  edge, inclusive
- *   ymax   bottom edge, inclusive
- *
- * Degenerate / empty case
- *   xmin > xmax  OR  ymin > ymax  →  bbox_overlap returns false
- *   against anything; the recursion in kd_query prunes naturally.
- *   bbox_split_left can produce such a box when value == xmin or
- *   value == ymin (the left half is empty) — handled by the prune.
- *
- * References
- *   The bbox-pruning idiom is folklore in computational geometry.
- *   The tightest analysis for kd-trees is in de Berg et al. [5] §5.2
- *   (proves O(√N + k) 2-D range-query cost from this one primitive).
- *   Lueker [8] improves it further with fractional cascading.
+ *   xmin   left edge   (inclusive)
+ *   ymin   top edge    (inclusive; y grows downward)
+ *   xmax   right edge  (inclusive)
+ *   ymax   bottom edge (inclusive)
+ * A valid box has xmin<=xmax and ymin<=ymax; an "inside-out" box (min>max)
+ * is treated as empty and is pruned away by bbox_overlap.
  */
 typedef struct {
-    int xmin;   /* left   edge, inclusive — 0 ≤ xmin ≤ xmax            */
-    int ymin;   /* top    edge, inclusive — 0 ≤ ymin ≤ ymax (y is DOWN) */
-    int xmax;   /* right  edge, inclusive                              */
-    int ymax;   /* bottom edge, inclusive                              */
+    int xmin;   /* left edge,  inclusive */
+    int ymin;   /* top edge,   inclusive (y grows downward) */
+    int xmax;   /* right edge, inclusive */
+    int ymax;   /* bottom edge, inclusive */
 } BBox;
 
 /*
- * GridCanvas — the ASCII character buffer the visualizer paints into.
+ * GridCanvas — a paper-doll grid of characters the demo draws on. The grid_*
+ * helpers paint into it (split lines, point letters, query frame) in any
+ * order, then grid_print walks it once and colors each character. Separating
+ * "draw" from "print" means the drawing code never worries about color codes.
  *
- * Intent
- *   Decouples PAINTING (the grid_* helpers below) from PRINTING
- *   (grid_print walks the buffer and emits ANSI-coloured stdout).
- *   This two-phase pattern lets us:
- *     - Paint splits + labels + query frame in any order without
- *       worrying about render-time interleaving.
- *     - Re-paint the same canvas for many frames without re-allocating
- *       (currently we allocate per call — caching is a one-line change).
- *     - Swap the printer in future (e.g. HTML, SVG) without touching
- *       the painters — the canvas IS the abstraction boundary.
+ * Each row carries one extra column holding a string terminator, so a row can
+ * be printed as a plain C string if you ever need to.
  *
- * Why a struct (not a plain 2-D array typedef)
- *   Lets every visualizer helper take `GridCanvas *gc` and read as
- *   "method on a canvas".  No file-scope render state: show_tree and
- *   show_query each own a fresh canvas on their stack frame, so two
- *   threads or two nested renders can never alias each other.
- *
- * Storage layout
- *   `cells[row][col]` — ROW-MAJOR, matching terminal scanout order.
- *   row ∈ [0, SPACE_H);  col ∈ [0, SPACE_W).  The +1 column per row
- *   is a NUL terminator so any row can be treated as a printable C
- *   string (useful for ad-hoc debugging); grid_print itself walks
- *   per-character to apply per-glyph colour.
- *
- * Glyph alphabet (single byte per cell — see glyph_color_for)
- *     ' '       empty space (default fill from grid_clear)
- *     '|'       x-split — vertical line through an x-axis node
- *     '-'       y-split — horizontal line through a y-axis node
- *     '+'       split intersection (set by grid_put_line when | meets -)
- *     'A'..'Z'  data-point label
- *     '*'       data-point highlighted as a query result
- *     '[' ']'   query-rectangle vertical/corner frame
- *     '~'       query-rectangle horizontal frame
- *   New visual states are added by extending this alphabet + adding a
- *   case to glyph_color_for; no other code changes.
- *
- * Why ≈ 1.2 KB on the stack is fine
- *   SPACE_H × (SPACE_W + 1) = 22 × 57 = 1254 bytes.  Well within any
- *   reasonable stack limit (typically 1-8 MiB).  Lifetime is one
- *   show_tree / show_query call — no deep recursion below.
+ * What a cell can hold (see glyph_color_for for the matching colors):
+ *     ' '       empty
+ *     '|'       a vertical split line
+ *     '-'       a horizontal split line
+ *     '+'       where a vertical and horizontal line cross
+ *     'A'..'Z'  a stored point
+ *     '*'       a stored point that a query found
+ *     '[' ']'   left/right side (and corners) of the query rectangle
+ *     '~'       top/bottom of the query rectangle
  *
  * Members
- *   cells   [SPACE_H][SPACE_W + 1]  — row-major glyph buffer.
- *                                     cells[r][SPACE_W] is the per-row
- *                                     NUL terminator; never paint there.
- *
- * Invariants (when handed to grid_print)
- *   Every cells[r][c] for c < SPACE_W holds one of the alphabet glyphs.
- *   Every cells[r][SPACE_W] == '\0'.
- *
- * References
- *   The paint-then-blit / paint-then-print split is the same pattern
- *   ncurses uses (write to stdscr, then doupdate flushes one diff).
- *   Here we do the manual equivalent without the ncurses dependency.
+ *   cells   [row][col] grid of characters. cells[row][SPACE_W] is the per-row
+ *           string terminator — leave it alone, never draw there.
  */
 typedef struct {
-    char cells[SPACE_H][SPACE_W + 1];   /* row-major; cells[r][SPACE_W] is NUL */
+    char cells[SPACE_H][SPACE_W + 1];   /* [row][col]; last col per row is the '\0' */
 } GridCanvas;
 
 /*
- * QueryResult — fixed-capacity output buffer for kd_query.
+ * QueryResult — where kd_query drops the points it found. The caller makes one
+ * (on the stack, no malloc), zeroes count, and passes it in; the search fills
+ * it. Storage is a fixed array, so if a query somehow finds more than
+ * QUERY_CAP points the extras are silently dropped — size QUERY_CAP for your
+ * worst case (any value >= 12 is plenty for this 12-point demo).
  *
- * Intent
- *   One struct that replaces the old `(Point *results, int *count,
- *   int capacity)` parameter trio.  Three concrete wins:
- *     (i) kd_query's signature drops from 12 params to 4.
- *    (ii) The "how many matches and where they live" invariant is
- *         encoded in one type, easy to forward to show_query later.
- *   (iii) Fixed-size storage means callers don't malloc — one
- *         QueryResult on the stack covers the whole query lifecycle.
- *
- * Why a FIXED capacity (QUERY_CAP) instead of a growable buffer
- *   The demo answers a single query of bounded size; growing on
- *   demand would just hide a malloc/realloc behind a slower API.
- *   If kd_query fills past QUERY_CAP it silently drops further
- *   matches (count is clamped at QUERY_CAP); callers must size
- *   QUERY_CAP for their expected worst case.  For N=12 demo points
- *   any QUERY_CAP ≥ 12 is safe.
- *
- * Caller protocol
- *     QueryResult result = { .count = 0 };
- *     kd_query(root, bbox_full_grid(), query_rect, &result);
- *     // result.points[0 .. result.count - 1] now hold the matches.
- *     // Order is depth-first left-before-right (insertion-order
- *     // adjacent for sibling nodes); not sorted by distance — if you
- *     // need that, sort the slice after the call.
+ * Found points come out in tree-walk order (left child before right), not
+ * sorted by distance; sort the slice yourself if you need that.
  *
  * Members
- *   points   [QUERY_CAP]  — match buffer; ONLY entries [0, count)
- *                           are initialised after kd_query returns.
- *   count                 — number of valid entries; 0 on init, grows
- *                           MONOTONICALLY during one kd_query call,
- *                           CAPPED at QUERY_CAP.
- *
- * Invariants (any time)
- *   0 ≤ count ≤ QUERY_CAP
- *   points[i] ∈ query_rect    for 0 ≤ i < count   (post-call)
- *   points[count .. QUERY_CAP-1] are UNINITIALISED — do not read.
- *
- * References
- *   The "output struct with fixed buffer" pattern is from K&R-era C
- *   APIs (e.g. POSIX getcwd, snprintf): the caller owns the storage,
- *   the callee fills it, no ownership ambiguity around returned
- *   pointers.  See Knuth TAOCP Vol. 1 §1.4.1 for the underlying
- *   "preallocated workspace" discipline.
+ *   points   the matches; only points[0 .. count-1] are filled in.
+ *   count    how many matches; starts at 0, never exceeds QUERY_CAP.
  */
 typedef struct {
-    Point points[QUERY_CAP];   /* match buffer — entries [0, count) are valid    */
-    int   count;               /* match count;  0 ≤ count ≤ QUERY_CAP            */
+    Point points[QUERY_CAP];   /* the matches; valid up to index count-1 */
+    int   count;               /* how many were found, 0..QUERY_CAP      */
 } QueryResult;
 
-/* ── BBox + axis helpers ────────────────────────────────────────── */
+/* ── box + axis helpers — the small geometry the tree leans on ── */
 
-/*
- * axis_at_depth / coord_on_axis — the two primitives that turn
- * "alternating-axis kd-tree" into a single-line policy.
- *
- *   axis_at_depth(d)       even d → 0 (x-split, vertical line)
- *                          odd  d → 1 (y-split, horizontal line)
- *
- *   coord_on_axis(p, axis) returns p.x when axis==0, p.y when axis==1.
- *                          Generalises trivially to k ≥ 2 by indexing
- *                          a coords[k] array instead.
- *
- *   Together they let the same comparison `coord_on_axis(p, axis) <
- *   coord_on_axis(node->point, axis)` work at any depth.
- */
+/* The two rules that make the tree alternate x, y, x, y... down the levels:
+ * even depth splits on x (axis 0), odd depth splits on y (axis 1); and
+ * coord_on_axis reads the x or y of a point depending on the axis. */
 static inline int axis_at_depth(int depth)       { return depth % 2; }
 static inline int coord_on_axis(Point p, int ax) { return ax == 0 ? p.x : p.y; }
 
-/* The full grid extent — the bounding box at the root of every recursion. */
+/* The whole grid — the box every search starts from at the root. */
 static inline BBox bbox_full_grid(void) {
     return (BBox){0, 0, SPACE_W - 1, SPACE_H - 1};
 }
 
-/*
- * bbox_overlap — two AABBs overlap iff their projections overlap on
- * BOTH axes.  Equivalently, NON-overlap on either axis is enough to
- * rule out intersection — that's the form the body tests.
- *
- *   This is the PRUNING PREDICATE in kd_query: when the current
- *   subtree's box doesn't overlap the query rect, the whole subtree
- *   is skipped in O(1).  That's where the √N comes from.
- */
+/* Do two rectangles touch or overlap? This is the pruning test: if a
+ * subtree's box misses the search rectangle, the whole subtree is skipped. */
 static inline bool bbox_overlap(BBox a, BBox b) {
     return !(a.xmin > b.xmax || a.xmax < b.xmin ||
              a.ymin > b.ymax || a.ymax < b.ymin);
 }
 
-/* Point (with grid coords) inside an inclusive box. */
+/* Is a point inside the (edge-inclusive) box? */
 static inline bool point_in_bbox(Point p, BBox b) {
     return p.x >= b.xmin && p.x <= b.xmax &&
            p.y >= b.ymin && p.y <= b.ymax;
 }
 
-/*
- * bbox_split_left / bbox_split_right — partition a box along an axis
- * at `value`.  Mirrors the kd_insert routing rule:
- *
- *   left  half:  coord[axis] <  value    →  axis_max := value − 1
- *   right half:  coord[axis] >= value    →  axis_min := value
- *
- * The two halves partition the parent exactly: no overlap, no gap.
- * The grid renderer uses the SAME split when drawing the dividing
- * line, so the visual splits and the algorithmic splits stay in sync.
- */
+/* Cut a box in two at `value` along one axis, the same way the tree routes
+ * points: the left half stops just before value, the right half starts at
+ * value. The renderer cuts with these same calls, so the lines on screen
+ * land exactly where the tree's splits are. */
 static inline BBox bbox_split_left(BBox b, int axis, int value) {
     if (axis == 0) b.xmax = value - 1;
     else           b.ymax = value - 1;
@@ -632,20 +204,20 @@ static inline BBox bbox_split_right(BBox b, int axis, int value) {
     return b;
 }
 
-/* ── memory management ──────────────────────────────────────────── */
+/* ── memory: make and free nodes ── */
 
-/* Allocate and initialise a new leaf node for point p at depth. */
+/* Make a new childless node holding p. Its axis is fixed here, by depth. */
 static KDNode *kd_new(Point p, int depth)
 {
     KDNode *n = malloc(sizeof *n);
     assert(n != NULL);
     n->point = p;
-    n->axis  = depth % 2;   /* even depth → x-split, odd → y-split */
+    n->axis  = depth % 2;   /* even depth splits on x, odd on y */
     n->left  = n->right = NULL;
     return n;
 }
 
-/* Free a node and all descendants (post-order traversal). */
+/* Free a node and everything below it. Caller must not touch it after. */
 void kd_free(KDNode *node)
 {
     if (!node) return;
@@ -654,30 +226,20 @@ void kd_free(KDNode *node)
     free(node);
 }
 
-/* ── core operations ────────────────────────────────────────────── */
+/* ── the two core operations: insert and range query ── */
 
 /*
- * kd_insert — add point p into the subtree rooted at 'node'.
+ * Drop point p into the tree. At each node, compare p against that node's
+ * split value on its axis: smaller goes left, equal-or-larger goes right.
+ * Keep going until you fall off the tree, and put p there. Returns the
+ * subtree root so the caller can write: root = kd_insert(root, p, 0).
  *
- * Returns the (possibly new) root of the subtree so the caller can
- * write:  root = kd_insert(root, p, 0);
- *
- * Pseudocode:
- *   if node is null:  return a fresh leaf with p at this depth
- *   axis  := node->axis                       (set when node was created)
- *   if coord_on_axis(p, axis) <  coord_on_axis(node->point, axis):
- *     node->left  := kd_insert(node->left,  p, depth + 1)
- *   else:
- *     node->right := kd_insert(node->right, p, depth + 1)
- *
- * Because the axis is cached in node->axis at allocation time, query
- * and traversal functions don't need a `depth` parameter — they read
- * axis directly from each node.  Insert keeps `depth` only so a new
- * leaf can pick its own axis via axis_at_depth.
+ * `depth` is only here so a brand-new node can pick its own axis; once a node
+ * exists it remembers its axis, so the search functions don't need depth.
  */
 KDNode *kd_insert(KDNode *node, Point p, int depth)
 {
-    if (!node) return kd_new(p, depth);   /* found the insertion slot */
+    if (!node) return kd_new(p, depth);   /* empty slot — p lands here */
 
     int axis  = node->axis;
     int coord = coord_on_axis(p,           axis);
@@ -690,36 +252,22 @@ KDNode *kd_insert(KDNode *node, Point p, int depth)
 }
 
 /*
- * kd_query — collect all stored points lying inside query_rect into out.
+ * Find every stored point inside query_rect. The trick that makes a k-d tree
+ * fast: as we walk down, we track the patch of grid (`box`) the current
+ * subtree can possibly cover. If that patch doesn't even touch the search
+ * rectangle, none of its points can match, so we skip the whole subtree in one
+ * step instead of checking each point. That skipping is the whole point of the
+ * structure — it's why a range search beats scanning all the points.
  *
- * Pseudocode (depth-first, prune by bbox_overlap):
- *   if out is full or node is null:  return
- *   if NOT bbox_overlap(box, query_rect):  return        ← prune subtree
- *   if point_in_bbox(node->point, query_rect):  add to out
- *   axis  := node->axis
- *   split := coord_on_axis(node->point, axis)
- *   kd_query(node->left,  bbox_split_left (box, axis, split), query_rect, out)
- *   kd_query(node->right, bbox_split_right(box, axis, split), query_rect, out)
- *
- * `box` is the bounding box of the CURRENT subtree (caller passes
- * bbox_full_grid() at the root).  It narrows along the current axis
- * at every level, exactly mirroring how kd_insert routes new points.
- *
- * PRUNING (the source of the O(√N) average cost in 2-D):
- *   When `box` doesn't overlap query_rect, every point in this
- *   subtree is geometrically outside the query, so the whole subtree
- *   is skipped in O(1).  Without this check the cost would be O(N).
- *
- * Parameters:
- *   node        — current subtree root
- *   box         — current subtree's bounding box (narrows on recursion)
- *   query_rect  — caller's query rectangle (constant through recursion)
- *   out         — fixed-capacity result buffer (caller zeroes out->count)
+ *   node        the subtree we're looking at
+ *   box         the grid patch this subtree covers (shrinks as we descend)
+ *   query_rect  the rectangle we're searching (same the whole way down)
+ *   out         where matches are collected (caller sets out->count to 0)
  */
 void kd_query(KDNode *node, BBox box, BBox query_rect, QueryResult *out)
 {
     if (!node || out->count >= QUERY_CAP)     return;
-    if (!bbox_overlap(box, query_rect))       return;   /* prune subtree */
+    if (!bbox_overlap(box, query_rect))       return;   /* nothing here can match */
 
     if (point_in_bbox(node->point, query_rect))
         out->points[out->count++] = node->point;
@@ -730,20 +278,17 @@ void kd_query(KDNode *node, BBox box, BBox query_rect, QueryResult *out)
     kd_query(node->right, bbox_split_right(box, axis, split), query_rect, out);
 }
 
-/* ── inspection helpers ─────────────────────────────────────────── */
+/* ── inspecting the tree: count, depth, text dump ── */
 
-/* Total number of nodes in the tree. */
+/* How many points are stored. */
 int kd_node_count(KDNode *node)
 {
     if (!node) return 0;
     return 1 + kd_node_count(node->left) + kd_node_count(node->right);
 }
 
-/*
- * kd_depth — return the depth of the deepest node (root = depth 0).
- * 'current' is the depth of 'node' in the full tree.
- * A NULL child returns current-1 (the parent's depth).
- */
+/* How tall the tree is (root counts as 0). Call with current = 0 at the root;
+ * a missing child reports its parent's depth so empty slots don't add height. */
 int kd_depth(KDNode *node, int current)
 {
     if (!node) return current - 1;
@@ -753,9 +298,8 @@ int kd_depth(KDNode *node, int current)
 }
 
 /*
- * kd_dump — print an indented text representation.
- *
- * Example output after all 12 points are inserted:
+ * Print the tree as indented text — one line per node, deeper nodes indented
+ * more, so you can read the parent/child shape. Example after all 12 points:
  *   root   axis=X  A(28,11)
  *     LEFT   axis=Y  B(14,5)
  *       LEFT   axis=X  D(7,2)
@@ -791,29 +335,13 @@ void kd_dump(KDNode *node, int depth, const char *label)
     kd_dump(node->right, depth + 1, "RIGHT");
 }
 
-/* ── ASCII grid visualizer ──────────────────────────────────────── */
+/* ── drawing the tree as ASCII art ── */
 
-/*
- * The visualizer paints every node's splitting line into a GridCanvas
- * (SPACE_W × SPACE_H character buffer), then walks the canvas with
- * grid_print to colour each glyph.  No global state — the canvas is
- * a local in show_tree / show_query, passed to every helper.
- *
- * Glyph alphabet (matches the legend printed in main):
- *   ' '       empty space
- *   |         x-split  (vertical line through an x-axis node)   magenta
- *   -         y-split  (horizontal line through a y-axis node)  blue
- *   +         intersection where a | and a - line cross         cyan
- *   A..Z      data point label                                  yellow
- *   *         data point found by a range query                 green
- *   [ ] ~     query rectangle frame                             red
- *
- * Painter's-order: grid_render_tree first draws the split line, then
- * recurses into the two halved sub-boxes, THEN paints the data point
- * over whatever line passed through that cell — so a node label is
- * never hidden by its own split.
- */
+/* These helpers paint split lines and points onto a GridCanvas, then grid_print
+ * walks it once and colors each character. Points are drawn last (after their
+ * split lines) so a node's letter never gets hidden under its own line. */
 
+/* Blank the whole canvas to spaces. */
 static void grid_clear(GridCanvas *gc)
 {
     for (int r = 0; r < SPACE_H; r++) {
@@ -822,36 +350,28 @@ static void grid_clear(GridCanvas *gc)
     }
 }
 
-/*
- * grid_put_line — paint a line character ('|' or '-') with intersection
- * merging.  When a vertical meets a horizontal in the same cell, emit '+'
- * so crossings are visible; otherwise paint the requested glyph (and
- * never overwrite an already-correct '+').
- */
+/* Draw one cell of a split line. If a vertical and horizontal line meet in the
+ * same cell, draw a '+' so the crossing shows; an existing '+' is left alone. */
 static void grid_put_line(GridCanvas *gc, int x, int y, char ch)
 {
     if (x < 0 || x >= SPACE_W || y < 0 || y >= SPACE_H) return;
     char cur = gc->cells[y][x];
     if ((ch == '|' && cur == '-') || (ch == '-' && cur == '|'))
         gc->cells[y][x] = '+';
-    else if (cur != '+')   /* don't overwrite an already-correct '+' */
+    else if (cur != '+')   /* keep a crossing we already drew */
         gc->cells[y][x] = ch;
 }
 
-/* Place a glyph at (x, y), always overriding whatever line was there. */
+/* Stamp a character at (x, y), painting over any line already there. */
 static void grid_put_point(GridCanvas *gc, int x, int y, char ch)
 {
     if (x >= 0 && x < SPACE_W && y >= 0 && y < SPACE_H)
         gc->cells[y][x] = ch;
 }
 
-/*
- * grid_draw_query_rect — frame the query rectangle with [ ] ~ glyphs.
- *
- *   Top / bottom edges use '~', left / right use '[' / ']'.  Corners
- *   are forced to '[' or ']' so the frame reads as a box, not a wave.
- *   Distinct from the split-line alphabet so frames never look like splits.
- */
+/* Draw the search rectangle as a frame: '~' along top/bottom, '[' and ']' down
+ * the sides and at the corners. Uses characters the split lines never use, so
+ * the search box is easy to tell apart from the tree's own lines. */
 static void grid_draw_query_rect(GridCanvas *gc, BBox r)
 {
     for (int x = r.xmin; x <= r.xmax; x++) {
@@ -868,10 +388,8 @@ static void grid_draw_query_rect(GridCanvas *gc, BBox r)
     grid_put_point(gc, r.xmax, r.ymax, ']');
 }
 
-/*
- * point_is_highlighted — is this node's point in the highlight set?
- *   Used by grid_render_tree to swap label → '*' for query matches.
- */
+/* Was this point one the query found? grid_render_tree uses it to draw a
+ * found point as '*' instead of its letter. */
 static bool point_is_highlighted(Point p, const QueryResult *highlight)
 {
     if (!highlight) return false;
@@ -881,25 +399,10 @@ static bool point_is_highlighted(Point p, const QueryResult *highlight)
     return false;
 }
 
-/*
- * grid_render_tree — recursive painter for splits + labels.
- *
- *   Pseudocode:
- *     if node is null:  return
- *     axis  := node->axis
- *     split := coord_on_axis(node->point, axis)
- *     paint the split line spanning the current box on `axis`
- *     recurse into node->left  with bbox_split_left (box, axis, split)
- *     recurse into node->right with bbox_split_right(box, axis, split)
- *     paint the label glyph (or '*' if highlighted) at node->point
- *
- *   The recursion order matches kd_query exactly: same bbox split,
- *   same axis policy.  That's why the visible drawing matches the
- *   tree's algorithmic partitioning cell-for-cell.
- *
- *   `highlight` is the QueryResult to mark with '*'; pass NULL to
- *   render plain labels (no query in progress).
- */
+/* Walk the tree and paint each node's split line across the patch of grid it
+ * owns, then draw the point on top. It splits the box and recurses exactly the
+ * way kd_query does, so the picture matches the tree cell-for-cell. Pass a
+ * query result as `highlight` to mark found points with '*'; NULL for none. */
 static void grid_render_tree(GridCanvas *gc, KDNode *node, BBox box,
                              const QueryResult *highlight)
 {
@@ -921,18 +424,13 @@ static void grid_render_tree(GridCanvas *gc, KDNode *node, BBox box,
     grid_render_tree(gc, node->right,
                      bbox_split_right(box, axis, split), highlight);
 
-    /* Paint the data point AFTER recursion so it sits on top of any
-     * line that passes through its cell.                             */
+    /* Draw the point last so its own split line can't hide it. */
     char glyph = point_is_highlighted(node->point, highlight)
                ? '*' : node->point.label;
     grid_put_point(gc, node->point.x, node->point.y, glyph);
 }
 
-/*
- * glyph_color_for — pick the ANSI colour code for a single canvas glyph.
- *   Decouples the colour table from grid_print's loop.  Extending the
- *   alphabet (e.g. a new highlight class) only requires a new case here.
- */
+/* The color for one character on the canvas (NULL = print it uncolored). */
 static const char *glyph_color_for(char ch)
 {
     if (ch >= 'A' && ch <= 'Z')               return CLR_YELLOW;
@@ -941,7 +439,7 @@ static const char *glyph_color_for(char ch)
     if (ch == '|')                            return CLR_MAGENTA;
     if (ch == '-')                            return CLR_BLUE;
     if (ch == '+')                            return CLR_CYAN;
-    return NULL;   /* plain putchar */
+    return NULL;
 }
 
 /* Print the canvas with a surrounding box and per-character ANSI colour. */
@@ -967,12 +465,9 @@ static void grid_print(const GridCanvas *gc)
     printf("+" CLR_RESET "\n");
 }
 
-/* ================================================================
- * PART 2 — STEP-BY-STEP DEMO
- * ================================================================ */
+/* ── §2 PART 2: the step-by-step demo — small printing helpers ── */
 
-/* ── demo helpers ───────────────────────────────────────────────── */
-
+/* Wait until the user presses Enter (lets them read each step). */
 static void press_enter(void)
 {
     printf(CLR_DIM "  [press Enter]" CLR_RESET);
@@ -989,11 +484,7 @@ static void print_separator(void)
            CLR_RESET);
 }
 
-/*
- * show_tree — render the current kd-tree state and print a summary line.
- *   Allocates a fresh GridCanvas on the stack (≈ 1.2 KB), paints the
- *   tree into it from the full-grid bbox, prints, then drops it.
- */
+/* Draw the tree as it stands now, with a title and a node/depth summary. */
 static void show_tree(const char *title, KDNode *root)
 {
     printf("\n" CLR_GOLD CLR_BOLD "%s" CLR_RESET "\n", title);
@@ -1010,12 +501,8 @@ static void show_tree(const char *title, KDNode *root)
                kd_node_count(root), kd_depth(root, 0));
 }
 
-/*
- * show_query — render tree + query rectangle + highlighted found points.
- *   Same canvas pattern as show_tree, plus a query-frame overlay and a
- *   summary line listing each found point.  Pass `result` to mark its
- *   points with '*' instead of their label glyph.
- */
+/* Like show_tree, but also draws the search rectangle, marks the points it
+ * found with '*', and lists them below. */
 static void show_query(const char *title, KDNode *root,
                        BBox query_rect, const QueryResult *result)
 {
@@ -1038,11 +525,11 @@ static void show_query(const char *title, KDNode *root,
     putchar('\n');
 }
 
-/* ── main: the walkthrough ──────────────────────────────────────── */
+/* ── main: build the tree one group at a time, then query it ── */
 
 int main(void)
 {
-    /* ── introduction ─────────────────────────────────────────── */
+    /* ── intro: explain the rules and the legend ── */
 
     printf("\n");
     print_separator();

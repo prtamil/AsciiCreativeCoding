@@ -1,266 +1,14 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * fireworks_rain.c — fireworks with matrix-rain arc trails
+ * fireworks_rain.c — fireworks whose every spark drags a shimmering
+ * Matrix-rain trail of rerolling ASCII along the arc it falls through.
  *
- * DEMO: Rockets rise from the bottom of the screen, decelerate to apex,
- *       and explode into 72 sparks per burst. Every spark grows a
- *       16-character matrix-rain trail that follows the exact arc
- *       it traces under gravity — head bright, body dimming, glyphs
- *       rerolling every frame for the classic Matrix shimmer.
- *
- *           ASCII sketch of one spark in flight:
- *
- *               head (white, bold)
- *                ↓
- *                A   ← cache[0]   (newest, BOLD, TRAIL_HOT band)
- *                 q  ← cache[1]   BOLD
- *                  W ← cache[2]   BOLD
- *                   z              normal (TRAIL_WARM band)
- *                    7             normal
- *                     R            DIM   (TRAIL_COOL band)
- *                      e           DIM
- *                       %          DIM   (oldest)
- *
- *       The trail is the LAST 16 head positions kept in a per-spark
- *       ring buffer. Each frame: slide the buffer down, push the new
- *       head into slot [0], integrate physics, reroll most cache
- *       glyphs. The same trajectory therefore re-renders with
- *       constantly-changing characters — the Matrix-rain shimmer.
- *
- * Study alongside:
- *   matrix_rain/matrix_rain.c       — same shimmer-cache trick on
- *                                     plain vertical rain (read first
- *                                     if the cache reroll is unfamiliar).
- *   particle_systems/fireworks.c    — the rocket-and-burst skeleton
- *                                     without trails.
- *   matrix_rain/pulsar_rain.c       — the same shimmer-cache trick
- *                                     on rotating beams.
- *   matrix_rain/matrix_snowflake.c  — rain accumulating into snow.
- *
- * Section map:
- *   §1  config       — every tunable in one place, grouped by concept
- *   §2  clock        — monotonic timer + sleep
- *   §3  color        — HUD/HINT plus 5 themed spark palettes
- *   §4  spark        — Vec2, Spark, burst, tick, draw
- *   §5  rocket       — IDLE → RISING → EXPLODED state machine
- *   §6  scene        — RocketPool + SimControls sub-structs; Scene root;
- *                       scene_init / _tick / _draw / _free /
- *                       _change_rockets / _scale_speed / _cycle_theme
- *                       + park_idle_slot / launch_idle_slot helpers
- *   §7  screen       — ncurses init / present / HUD
- *   §8  app          — FpsCounter + App; signals, resize, key dispatch,
- *                       variable-dt main loop (7 numbered phases)
- *
- * Keys:
- *   q / Q / ESC      quit
- *   space / p        pause / resume
- *   r                reset the show
- *   ]   [            speed up / slow down
- *   = / +            more rockets
- *   -                fewer rockets
- *   t                cycle theme (vivid / matrix / fire / ice / plasma)
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra matrix_rain/fireworks_rain.c \
- *       -o fireworks_rain -lncurses -lm
+ * Sister files: matrix_rain/matrix_rain.c (the plain vertical version of
+ * the same rerolling-glyph trail — read it first if that trick is new) and
+ * particle_systems/fireworks.c (the rocket-and-burst skeleton, no trails).
+ * The particle model is the classic one from Reeves, "Particle Systems",
+ * SIGGRAPH '83.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Three independent ideas stacked on top of each other.
- *
- *                 (A) ROCKET   — a 3-state machine. IDLE counts down a
- *                                fuse (in seconds). RISING climbs under
- *                                gravity until vy ≥ 0 (apex) or y < 2
- *                                (top edge). EXPLODED ticks all sparks
- *                                until none are alive, then returns to
- *                                IDLE with a fresh random fuse.
- *
- *                 (B) SPARK    — one explosion particle with a head
- *                                position + velocity, a 16-slot trail
- *                                history of past head positions, and
- *                                a parallel cache of random ASCII
- *                                glyphs. Each frame: slide history,
- *                                integrate physics, shimmer cache,
- *                                decay life.
- *
- *                 (C) SHIMMER  — for each cache slot, with probability
- *                                1 − 1/SHIMMER_KEEP_ONE_IN, reroll the
- *                                glyph. KEEP_ONE_IN = 4 → 75 % rerolled
- *                                each frame, the classic Matrix-rain
- *                                shimmer rate.
- *
- * Data-structure: Scene ⊃ RocketPool.rockets[16] ⊃ Spark[72] (per
- *                 rocket).  All inline; no heap allocation post-init.
- *                 Scene also carries SimControls (paused, speed_scale)
- *                 and a theme_idx alongside the pool.  Each Spark owns:
- *                 a Vec2 head, a Vec2 velocity, a Vec2[TRAIL_LEN]
- *                 history, a char[TRAIL_LEN] glyph cache, plus life /
- *                 decay / color / active.  The trail history is laid
- *                 out newest-at-[0] oldest-at-[N−1] so painter's-order
- *                 drawing reads as a normal for-loop.
- *
- * Rendering     : Painter's order is load-bearing. For each spark,
- *                 paint oldest trail slot first, newer over older,
- *                 then a single white head on top. Drawing dim
- *                 entries first lets the brighter head overwrite them
- *                 at cells where multiple positions map to the same
- *                 column/row (common near burst centres where sparks
- *                 are tightly packed). trail_attr() maps slot index
- *                 → BOLD / NORMAL / DIM bands; if life < FADING_THRESH
- *                 every slot goes DIM (death fade).
- *
- * Performance   : O(R · P · T) per tick where R = active rockets ≤ 16,
- *                 P = sparks per burst = 72, T = trail slots = 16 —
- *                 about 18k vec2 ops worst case. At 60 fps that's
- *                 ~1.1 M ops/sec, microseconds. Trail history uses a
- *                 literal shift-down (O(T) per push) instead of a ring
- *                 buffer with head index because T = 16 makes the
- *                 constant factor invisible and the shift is easier
- *                 to read.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES ───────────────────────────────────────────────────────── *
- *
- *   ── Canonical particle-system paper ────────────────────────────
- *   [1] Reeves, W. T. (1983), "Particle Systems — A Technique for
- *       Modeling a Class of Fuzzy Objects", ACM SIGGRAPH '83 / ACM
- *       TOG 2(2), pp. 91-108 — the FOUNDATIONAL particle-systems
- *       paper.  Introduces the per-particle (pos, vel, accel, age,
- *       colour, alpha) state vector and the spawn / step / expire
- *       lifecycle that every spark in §4 follows.  Originally used
- *       to render the genesis effect in *Star Trek II* (the same
- *       year).  §4 Spark + §5 Rocket are direct descendants.
- *
- *   ── Particle dynamics course notes ─────────────────────────────
- *   [2] Witkin, A. & Baraff, D. (1997), "Particle System Dynamics",
- *       SIGGRAPH '97 course notes — clean pedagogical exposition of
- *       the Euler integrator and particle pool management.  §4
- *       spark_integrate uses the gravity-only update
- *         head += vel · dt;  vel.y += g · dt
- *       directly from Witkin/Baraff's particle-with-acceleration
- *       template (no drag — see "Why no drag" note below).
- *   [3] Akenine-Möller, T., Haines, E. & Hoffman, N. (2018),
- *       "Real-Time Rendering" (4th ed.), Ch. 13 — particle-system
- *       implementation patterns for games, including the fixed-pool
- *       + active-prefix design used by RocketPool in §6.
- *
- *   ── Numerical integration ──────────────────────────────────────
- *   [4] Hairer, E., Lubich, C. & Wanner, G. (2006), "Geometric
- *       Numerical Integration" (2nd ed.), Springer — explicit-Euler
- *       reference.  §4 spark_integrate is plain forward Euler:
- *         head += vel · dt   (pos update)
- *         vel  += g · dt     (velocity update — same tick)
- *       Per-spark gravity is JITTERED (×(1 ± SPARK_GRAVITY_JITTER))
- *       so a burst of sparks spreads naturally rather than all
- *       tracing identical parabolas.
- *
- *   ── Projectile mechanics ───────────────────────────────────────
- *   [5] Symon, K. R. (1971), "Mechanics" (3rd ed.), Addison-Wesley,
- *       Ch. 3 — classical projectile motion under gravity (no air
- *       drag).  Each spark traces an EXACT PARABOLA in the absence
- *       of drag (see Why-no-drag note below).
- *
- *   Why no drag
- *     This file uses pure gravity, no aerodynamic forces.  At
- *     terminal-cell resolution the drag effect on a 1-second
- *     trajectory is sub-cell — invisible.  Skipping drag keeps the
- *     integrator at two lines and the arcs as analytically-tractable
- *     parabolas (modulo the per-spark gravity jitter).
- *
- *   ── Game loop / fixed-cap render ───────────────────────────────
- *   [6] Fiedler, G. (2004, updated 2014), "Fix Your Timestep!",
- *       https://gafferongames.com/post/fix_your_timestep/ — the
- *       variable-dt loop pattern in §8 main.  Unlike physics-heavy
- *       demos this file uses a VARIABLE dt (not fixed-step
- *       accumulator) because rockets are decorative — exact
- *       reproducibility isn't required.  The 100 ms dt cap
- *       (DT_CAP_SEC) is still from Fiedler.
- *
- *   ── Implementation-oriented references ─────────────────────────
- *   [7] Shiffman, D., "The Nature of Code", Ch. 4 (Particle Systems)
- *       — reading-level walkthrough of the particle-system pattern
- *       in Processing.  Pair with [2] for the math.  Online at
- *       https://natureofcode.com/book/chapter-4-particle-systems/
- *
- *   ── Online quick reference ─────────────────────────────────────
- *   [8] Wikipedia: "Particle system", "Euler method",
- *       "Trajectory of a projectile" — quick-reference summaries.
- *       https://en.wikipedia.org/wiki/Particle_system
- *
- *   ── Flavour ────────────────────────────────────────────────────
- *   [9] *The Matrix* (1999, dir. Wachowski) — visual inspiration
- *       for the rerolling-glyph trail, here decorating each spark's
- *       trajectory rather than falling vertically.
- *
- *   ── Companion files in this project ────────────────────────────
- *   See also:
- *     matrix_rain/matrix_rain.c — the same shimmer-cache pattern
- *       applied to plain vertical rain.  Read first if the
- *       per-cell glyph-reroll trick is unfamiliar.
- *     flocking/murmuration.c    — large-N particle pool (1500) with
- *       similar fixed-pool BSS layout but different physics
- *       (Reynolds boid forces vs ballistic + drag).
- *     fluid/fluid_sph.c         — SPH Lagrangian particle pool with
- *       neighbour-list dynamics; same "pool[] + count" storage
- *       pattern as RocketPool.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A normal firework spark traces a parabolic arc, but its visible body
- * is just one bright point. Here we keep the last 16 positions per
- * spark in a buffer, redraw all of them, and randomly reshuffle the
- * GLYPHS at those positions every frame. The result: the spark is no
- * longer a dot but a 16-character snake of jumping ASCII that traces
- * its own trajectory, brightest at the head, dim at the tail.
- *
- * ALGORITHM IN STEPS  (per frame, per spark — read with spark_tick)
- * ──────────────────
- *  1. ADVANCE TRAIL
- *       slide trail[i] = trail[i-1] for i = N-1 down to 1
- *       trail[0] = head            (newest snapshot)
- *  2. INTEGRATE PHYSICS
- *       g          = SPARK_GRAVITY · uniform(1−J, 1+J)
- *       head      += vel · dt
- *       vel.y     += g · dt
- *  3. SHIMMER CACHE
- *       for each k in 0..N-1:
- *         if rand() % SHIMMER_KEEP_ONE_IN ≠ 0:
- *           cache[k] = rand_glyph()
- *  4. LIFE DECAY
- *       life -= decay_rate · dt
- *       if life ≤ 0: active = false
- *
- * KEY FORMULAS
- * ────────────
- *   angle_i  = 2π·i/N + jitter             even fan-out around centre
- *   (vx,vy)  = (cos a · s, sin a · s)      polar→cartesian initial vel
- *   head    += vel · dt                    cells/sec × seconds = cells
- *   vy      += g · dt                      cells/sec² × seconds = cells/sec
- *   trail[0] = head                        most recent position; index = age
- *   shimmer  = 1 − 1/KEEP_ONE_IN           fraction of cache rerolled/frame
- *   life(t)  = life(0) − decay_rate · t    linear decay
- *
- *
- * Background you need
- * ───────────────────
- *   - matrix_rain T3-T4 (shimmer cache + 6-band brightness ramp).
- *   - Newton's laws: pos += vel · dt; vel += g · dt.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Air drag / wind. We use plain gravity, no aerodynamic
- *     forces. The arcs are exact parabolas.
- *   - Particle-particle collision. Sparks pass through each other.
- *   - Sound or smoke effects.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -278,16 +26,14 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* §1  config — every tunable in one place */
 
-/* ── §1.1 frame rate ──────────────────────────────────────────────── */
+/* §1.1 frame rate */
 enum {
     TARGET_FPS = 60,
 };
 
-/* ── §1.2 rocket pool ──────────────────────────────────────────────── */
+/* §1.2 rocket pool */
 enum {
     ROCKETS_MIN     =  1,
     ROCKETS_DEFAULT =  5,
@@ -295,104 +41,84 @@ enum {
     MAX_ROCKETS     = ROCKETS_MAX,
 };
 
-/* Initial fuse stagger — rocket i starts at i × STAGGER seconds after
- * launch. Without this they all fire at t = 0 and bunch up at apex. */
+/* Stagger the start so the rockets don't all fire at once and bunch up
+ * at the top: rocket i waits i of these before its first launch. */
 #define INITIAL_FUSE_STAGGER_SEC  0.13f
 
-/* ── §1.3 rocket physics (cells/sec, cells/sec²) ──────────────────── */
-/*
- * Launch velocity range. Negative = upward in screen-row coordinates
- * (which increase downward). Slow rocket explodes ~1 sec after launch
- * about 5 rows up; fast rocket ~1.5 sec, ~30 rows up.
- */
-#define ROCKET_LAUNCH_VY_MIN_CPS  -18.0f   /* slow rocket             */
-#define ROCKET_LAUNCH_VY_MAX_CPS  -48.0f   /* fast rocket             */
+/* §1.3 rocket physics, in cells per second (y points DOWN, so up is negative) */
 
-/*
- * ROCKET_GRAVITY_CPS2 — downward acceleration on rockets. Higher
- * values → rockets explode lower on screen. 30 cells/sec² puts
- * explosions throughout the upper half.
- */
+/* How hard a rocket is thrown upward. The slow end pops about 5 rows up
+ * a second after launch; the fast end climbs ~30 rows over ~1.5 s. */
+#define ROCKET_LAUNCH_VY_MIN_CPS  -18.0f   /* slow rocket */
+#define ROCKET_LAUNCH_VY_MAX_CPS  -48.0f   /* fast rocket */
+
+/* Pull of gravity on a rising rocket. Bigger means it runs out of climb
+ * sooner and bursts lower; this value keeps bursts in the upper half. */
 #define ROCKET_GRAVITY_CPS2       30.0f
 
-/*
- * ROCKET_TOP_EXPLODE_ROW — safety net: explode early if a rocket
- * hits the top edge (rare for too-fast launches).
- */
+/* Burst early if a rocket reaches the top edge — only matters for the
+ * occasional too-fast launch. */
 #define ROCKET_TOP_EXPLODE_ROW    2.0f
 
-/* Random fuse range after a rocket finishes (seconds). 0.5 .. 2.5 s
- * before the same rocket relaunches. */
+/* How long a spent rocket waits before launching again: 0.5 to 2.5 s. */
 #define FUSE_MIN_SEC      0.5f
 #define FUSE_VAR_SEC      2.0f
 
-/* ── §1.4 spark physics (cells/sec, cells/sec²) ───────────────────── */
+/* §1.4 spark physics, cells per second */
 enum { PARTICLES_PER_BURST = 72 };
 
-/*
- * Spark initial-velocity magnitude range. Each spark fires off the
- * burst origin at a polar angle with this speed.
- */
+/* How fast each spark flies away from the burst point. */
 #define SPARK_SPEED_MIN_CPS    12.0f
 #define SPARK_SPEED_MAX_CPS    40.0f
 
-/*
- * SPARK_GRAVITY_CPS2 — downward acceleration on every spark.
- * SPARK_GRAVITY_JITTER — per-spark variance (±20 % at default 0.20)
- *   so sparks don't all trace the SAME parabola. Without jitter
- *   the whole burst falls in lock-step.
- */
+/* Gravity on each spark, plus a per-spark wobble of +/-20 % so they don't
+ * all fall along the exact same arc — without it a burst drops in lockstep. */
 #define SPARK_GRAVITY_CPS2     32.0f
 #define SPARK_GRAVITY_JITTER    0.20f
 
-/*
- * Spark life — initial value uniform([MIN, MIN+VAR]) on [0, 1] scale.
- * Decay rate uniform([MIN_RPS, MIN+VAR_RPS]) per second. Lifespan
- * = life / decay → 0.33 s at fastest decay, 1.33 s at slowest.
- */
+/* How long a spark lives and how fast it dims. life starts somewhere in
+ * [MIN, MIN+VAR] on a 0..1 scale and drains by decay-per-second; together
+ * they give a spark roughly 0.33 to 1.33 s before it dies. */
 #define SPARK_LIFE_MIN          0.6f
 #define SPARK_LIFE_VAR          0.4f
 #define SPARK_DECAY_MIN_RPS     0.75f
 #define SPARK_DECAY_VAR_RPS     1.05f
 
-/*
- * BURST_ANGLE_JITTER — radians of random offset added to evenly-
- * spaced burst angles. Without this 72 sparks form a perfect ring;
- * with it the cloud reads as a sphere, not a circle.
- */
+/* A little random nudge (radians) on each spark's launch angle so the 72
+ * of them read as a 3-D ball of sparks, not a flat ring. */
 #define BURST_ANGLE_JITTER      0.30f
 
-/* ── §1.5 trail + shimmer ─────────────────────────────────────────── */
+/* §1.5 trail + shimmer */
 enum {
-    /* TRAIL_LEN — historic positions kept per spark.
-     * At 60 fps a trail of 16 spans ~267 ms of arc history. */
+    /* How many past positions each spark remembers — at 60 fps, 16 of
+     * them cover about the last quarter-second of its flight. */
     TRAIL_LEN       = 16,
 
-    /* Brightness band boundaries (used by trail_attr). */
-    TRAIL_HOT_END   = 2,                /* [0..2]      → BOLD            */
-    TRAIL_WARM_END  = TRAIL_LEN / 2,    /* [3..N/2-1]  → NORMAL          */
-                                        /* [N/2..N-1]  → DIM             */
+    /* Where the brightness bands sit along the trail (see trail_attr):
+     * the first few slots are bold, the middle plain, the tail dim. */
+    TRAIL_HOT_END   = 2,
+    TRAIL_WARM_END  = TRAIL_LEN / 2,
 
-    /* Per-frame, each cache slot has a 1-in-KEEP_ONE_IN chance of
-     * surviving; the rest reroll. KEEP_ONE_IN = 4 → reroll fraction
-     * = 0.75, the classic 75 % Matrix-rain shimmer. */
+    /* Each frame, every cached glyph has a 1-in-this chance of staying
+     * put; the rest get rerolled. 4 means ~75 % change — the Matrix look. */
     SHIMMER_KEEP_ONE_IN = 4,
 };
 
-/* ── §1.6 fade threshold ──────────────────────────────────────────── */
-/* When life drops below this, every trail slot is forced DIM —
- * the spark visibly fades out before disappearing. */
+/* §1.6 fade threshold */
+/* Once a spark's life drops below this, the whole trail goes dim so it
+ * visibly fades out instead of just vanishing. */
 #define FADING_LIFE_THRESHOLD  0.25f
 
-/* ── §1.7 speed scale (rain global multiplier, [/] keys) ─────────── */
+/* §1.7 speed scale — the global slow/fast multiplier the [ and ] keys drive */
 #define SPEED_SCALE_DEFAULT    1.0f
 #define SPEED_SCALE_MIN        0.25f
 #define SPEED_SCALE_MAX        4.0f
 #define SPEED_SCALE_STEP       1.25f
 
-/* ── §1.8 ncurses pair IDs ────────────────────────────────────────── */
+/* §1.8 ncurses pair IDs */
 enum {
-    /* 1..7 — spark colours, theme-controlled */
+    /* 1..7 — the seven spark colours; the theme decides the actual hues,
+     * so these names only match the default "vivid" look. */
     CP_RED          = 1,
     CP_ORANGE,
     CP_YELLOW,
@@ -401,25 +127,23 @@ enum {
     CP_BLUE,
     CP_MAGENTA,
 
-    /* 8 — trail head, always white */
+    /* 8 — the bright trail head, always white whatever the theme */
     CP_TRAIL_HEAD,
 
-    /* 9..10 — HUD spec, theme-independent */
+    /* 9..10 — the HUD colours, which never change with the theme */
     PAIR_HUD,
     PAIR_HINT,
 };
 
 #define N_SPARK_COLORS  7
 
-/* ── §1.9 dt cap + timing primitives ─────────────────────────────── */
+/* §1.9 dt cap + timing units */
 #define DT_CAP_SEC    0.10f
 #define NS_PER_SEC    1000000000LL
 #define NS_PER_MS     1000000LL
 #define HUD_BUF_LEN   96
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* §2  clock — monotonic timer + sleep */
 
 static int64_t clock_ns(void)
 {
@@ -438,68 +162,33 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* §3  color */
 
 /*
- * Color pairs.
+ * Theme — one named palette of seven spark colours.
  *
- *   1..7  CP_RED..CP_MAGENTA  spark colour SLOTS, remapped per theme.
- *                             The names refer to the default vivid
- *                             theme; under e.g. the matrix theme
- *                             CP_RED is a dark green. Spark code
- *                             never relies on the literal hue.
- *   8     CP_TRAIL_HEAD       always white (theme-independent).
- *   9     PAIR_HUD            yellow on default bg (CLAUDE.md HUD).
- *   10    PAIR_HINT           cyan on default bg (CLAUDE.md HINT).
- */
-
-/*
- * Theme — one named 7-colour palette for the spark slots.
+ * Picking a theme just decides what hue each spark can wear. A spark is
+ * handed one of these colours when it's born and keeps it for its whole
+ * life, so a burst looks like a fan of coloured rays. The `t` key flips
+ * to the next theme; theme_apply() then repaints colour pairs 1..7, so
+ * the pair numbers stay the same and only the colours behind them change.
  *
- * Intent
- *   Each spark in a burst is assigned ONE colour from the active
- *   theme's `colors[]` (or `fallback[]` on 8-colour terminals).  The
- *   assignment is fixed at spawn time — a spark keeps its hue across
- *   its entire trail, so the burst looks like N coloured rays
- *   radiating from the explosion point.
+ * Two palettes per theme because terminals differ: colors[] is the rich
+ * 256-colour version (smooth shading down each trail); fallback[] is the
+ * best we can do on an old 8-colour terminal, where nearby shades blur
+ * into one.
  *
- *   The `t` key cycles through THEME_COUNT presets at runtime;
- *   `theme_apply()` re-registers the colour pairs in one O(N_COLORS)
- *   call.  Each agent's `color_pair` field is the same pair number
- *   throughout — only the pair's foreground changes when the theme
- *   switches.
- *
- * Why two parallel palettes (colors[] vs fallback[])
- *   256-colour terminals get fine-grained hue ramps for visible
- *   shading along each trail; 8-colour terminals can't — fallback[]
- *   picks the closest ANSI primary, accepting that adjacent shades
- *   collapse into the same equivalence class.
- *
- * Themes (preset table)
- *   vivid  — multi-hue (red/orange/yellow/green/cyan/blue/magenta)
- *   matrix — green ramp; trails look like Matrix rain arcs
- *   fire   — reds/oranges/yellows; every burst is a flame arc
- *   ice    — blues/cyans; cold, crystalline trails
- *   plasma — purples/magentas; electric neon arcs
+ * The presets: vivid (rainbow), matrix (greens, the Matrix-rain look),
+ * fire (reds/oranges/yellows), ice (blues/cyans), plasma (purple/magenta).
  *
  * Members
- *   name        HUD label ("vivid", "matrix", …) shown in the status row.
- *   colors[]    N_SPARK_COLORS xterm-256 indices.
- *   fallback[]  N_SPARK_COLORS ANSI-8 indices for non-256 terminals.
+ *   name        the label shown in the HUD ("vivid", "matrix", ...); never NULL.
+ *   colors[]    the seven 256-colour indices.
+ *   fallback[]  the seven 8-colour indices for old terminals.
  *
- * Invariants
- *   Every colors[i] ∈ [24, 255] per CLAUDE.md "Theme Palette Brightness"
- *   — cube indices 16–23 and gray 232–239 are deliberately excluded
- *   (they render as black on default background, making sparks invisible).
- *   24–29 only used as the LOWEST tier (trail tail).
- *   name != NULL.
- *
- * References
- *   CLAUDE.md §"Theme Palette Brightness" for the cube-floor rule.
- *   See also DyeRenderer + ColorTheme in fluid_sph.c / fluid_navier
- *   for the same theme-cycling design pattern at file-scope scale.
+ * Every colors[] entry stays at index 24 or higher: the very dark cube and
+ * gray colours (16-23, 232-239) come out black on the default background and
+ * would make sparks invisible (CLAUDE.md "Theme Palette Brightness").
  */
 typedef struct {
     const char *name;
@@ -534,11 +223,8 @@ static const Theme k_themes[] = {
 
 static bool g_has_256 = false;
 
-/*
- * theme_apply — re-bind spark pairs 1..7 plus trail-head pair 8 for
- * the chosen theme. PAIR_HUD and PAIR_HINT are NEVER touched here —
- * they carry semantic meaning that must not change with theme.
- */
+/* Repaints the spark colours (and the white trail head) for one theme.
+ * Leaves the HUD colours alone on purpose — they must stay readable. */
 static void theme_apply(int idx)
 {
     const Theme *t = &k_themes[idx];
@@ -549,11 +235,8 @@ static void theme_apply(int idx)
     init_pair(CP_TRAIL_HEAD, g_has_256 ? 255 : COLOR_WHITE, COLOR_BLACK);
 }
 
-/*
- * hud_pairs_init — bind PAIR_HUD and PAIR_HINT once at startup. Both
- * use the default terminal background (-1) so the HUD row sits on
- * whatever background the user actually has, never a forced black box.
- */
+/* Sets up the HUD colours once at startup. They sit on the terminal's own
+ * background (-1) so the status text never appears inside a black box. */
 static void hud_pairs_init(void)
 {
     init_pair(PAIR_HUD,  g_has_256 ? 226 : COLOR_YELLOW, -1);
@@ -562,13 +245,11 @@ static void hud_pairs_init(void)
 
 static int color_rand(void) { return 1 + rand() % N_SPARK_COLORS; }
 
-/* ===================================================================== */
-/* §4  spark — the heart of the matrix-rain effect                        */
-/* ===================================================================== */
+/* §4  spark — the matrix-rain trail effect */
 
-/* ── §4.1 ASCII glyph pool + tiny utilities ─────────────────────────── */
+/* §4.1 the glyph pool + tiny helpers */
 
-/* The shimmer pool — same letters/digits/punctuation as matrix_rain.c. */
+/* The characters a shimmering trail can show — same set as matrix_rain.c. */
 static const char k_glyphs[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "abcdefghijklmnopqrstuvwxyz"
@@ -580,227 +261,140 @@ static const char k_glyphs[] =
 static char  rand_glyph(void) { return k_glyphs[rand() % GLYPHS_LEN]; }
 static float urand01   (void) { return (float)rand() / (float)RAND_MAX; }
 
-/* ── §4.2 Vec2 + Spark types ────────────────────────────────────────── */
+/* §4.2 Vec2 + Spark types */
 
 /*
- * Vec2 — 2-D float vector used everywhere physics or geometry shows up.
+ * Vec2 — a 2-D point or velocity.
  *
- * Intent
- *   Position, velocity, trail-history snapshots — every quantity with
- *   an (x, y) pair is a Vec2.  Returning Vec2 BY VALUE (no out-params)
- *   from helpers lets call sites read linearly:
- *
- *      spark->vel.y += GRAVITY_CELLS_PER_SEC_SQ * dt;
- *      spark->head   = v2_add(spark->head,
- *                              v2_scale(spark->vel, dt));
- *
- * Why a struct (not float[2] or two scalars)
- *   • Named type makes signatures read in the algorithm's vocabulary:
- *     `Vec2 spawn_at` rather than `float spawn_x, spawn_y`.
- *   • Return-by-value works without spilling to memory on x86-64 +
- *     ARM ABIs (8 bytes = one register pair); no perf penalty.
- *   • Eliminates the two-out-parameter idiom from every helper that
- *     wants to "return a 2-D coordinate".
- *
- * Members
- *   x, y    Cartesian components in CELL space (units = terminal cells,
- *           with FRACTIONAL precision — sparks live between cells and
- *           round to integers only at draw time).  Origin at top-left;
- *           y increases downward (matches terminal cell convention).
- *
- * References
- *   [1] Reeves 1983 — every particle in his original paper carries a
- *       position + velocity Vec2 of exactly this shape.
+ * x and y are measured in terminal cells but kept as floats, so a spark
+ * can sit between cells and only round to a whole cell when it's drawn —
+ * that fractional precision is what makes the arcs look smooth.
+ * Top-left is the origin and y grows downward, the usual terminal convention.
  */
 typedef struct { float x, y; } Vec2;
 
 /*
- * Spark — one explosion particle with a matrix-rain arc trail.
+ * Spark — one piece of an explosion, dragging a Matrix-rain trail.
  *
- * Intent
- *   A Reeves [1] particle augmented with a HISTORY BUFFER.  Standard
- *   particle systems draw ONE point per particle; this file draws a
- *   COMETARY TRAIL by remembering the last TRAIL_LEN head positions.
- *   The trail is then DECORATED with random ASCII glyphs that reroll
- *   each frame — the Matrix-rain shimmer applied per-particle.
+ * A plain firework particle is just one bright dot following an arc. This
+ * one also remembers where it's been: the last TRAIL_LEN positions it
+ * passed through, drawn as a comet tail of ASCII characters that keep
+ * randomly changing — the Matrix-rain shimmer, one per spark.
  *
- *   Each tick:
- *     1. spark_advance_trail   — shift trail[] / cache[] down by 1
- *                                 (newest enters at index 0)
- *     2. integrate physics     — vel += accel·dt; head += vel·dt
- *                                (Symon [5] linear drag in vel)
- *     3. reroll glyphs         — ~75 % of cache[] entries get a fresh
- *                                 random ASCII char (the shimmer)
- *     4. age + decay           — life -= decay_rps·dt; active = life > 0
+ * Each frame it does four things (see spark_tick): slide a new position
+ * into the trail, move under gravity, reroll most of its glyphs, and dim
+ * a little. The trail is drawn newest-first so the bright head lands on
+ * top wherever it overlaps an older part of the tail.
  *
- *   Drawn newest-first so the head glyph sits on top of any older
- *   trail slots that share the same cell.
- *
- * Why a per-spark trail (and not a global trail-cell grid)
- *   Sparks fly along arcs — their trails are CURVED lines through cell
- *   space.  A global grid would lose the ordering ("which spark left
- *   THIS glyph at THIS cell?") and would clobber sparks that cross.
- *   Per-spark trail keeps each arc's history isolated.
- *
- * Why a parallel glyph cache (not random-on-draw)
- *   Without the cache, the same trail cell would show a different
- *   glyph EVERY frame — too much shimmer, the trail loses shape.
- *   Caching + selective reroll means each glyph persists for several
- *   frames and the shimmer reads as TEXTURE, not noise.  Same trick
- *   as matrix_rain/matrix_rain.c — see [9] for the visual heritage.
+ * Each spark keeps its OWN trail rather than scribbling glyphs into a
+ * shared grid: the arcs are curved and they cross, so a shared grid would
+ * lose track of which spark owns which glyph. And the glyphs are cached,
+ * not picked fresh every frame — only some reroll each frame — so the
+ * trail holds a shape and the shimmer reads as texture instead of noise.
  *
  * Members
- *   ── kinematic state (rewritten every frame by physics integrator)
- *   head          Current position in cell-space (float; sub-cell
- *                 precision is what makes smooth arcs visible).
- *   vel           Velocity in cells / second.  Forward-Euler updated
- *                 (pos uses OLD vel, then vel takes its g·dt kick —
- *                 see [4]).  At dt ≈ 1/60 s and gravity ≈ 15 cells/s²,
- *                 energy drift per second is sub-cell — invisible.
+ *   head          Where the spark is right now, in cell-space (fractional).
+ *   vel           How fast it's moving, in cells per second. Updated by
+ *                 plain forward-Euler each frame: head moves using the old
+ *                 velocity, then gravity nudges the velocity. Good enough —
+ *                 a spark only lives about a second, so any drift is unseen.
  *
- *   ── trail history buffer (ring-shift each frame) ────────────────
- *   trail[]       Last TRAIL_LEN head positions, NEWEST AT [0],
- *                 OLDEST AT [TRAIL_LEN-1].  Shifted down by 1 each
- *                 frame in spark_advance_trail (literal memmove —
- *                 T = 16 makes the O(T) cost invisible).
- *   trail_fill    How many slots are actually populated.  Ramps
- *                 0 → TRAIL_LEN over the spark's first TRAIL_LEN
- *                 frames so the trail GROWS from the burst point
- *                 instead of appearing instantly.
+ *   trail[]       The recent head positions, newest at [0], oldest at the
+ *                 end. Every frame they all slide down one to make room.
+ *   trail_fill    How many of those slots have real data yet. Climbs from 0
+ *                 to full over the spark's first frames, so the tail grows
+ *                 out of the burst point instead of popping in fully formed.
  *
- *   ── shimmer cache (parallel to trail[]) ─────────────────────────
- *   cache[]       Random ASCII glyph at each trail position.  Each
- *                 frame ~GLYPH_REROLL_PROB of slots are rerolled —
- *                 the "Matrix" shimmer applied per-particle.
+ *   cache[]       One random glyph per trail position. Most get rerolled
+ *                 every frame — this is the shimmer.
  *
- *   ── lifetime + visual state ─────────────────────────────────────
- *   life          Decays 1.0 (fresh) → 0.0 (dead).  Dimensionless.
- *                 Renderer reads this to pick the trail's tail-fade
- *                 colour pair (life close to 0 → dimmest tier).
- *   decay_rps     Per-second `life` drop.  Randomised per spark at
- *                 burst time so a single explosion fades GRADUALLY
- *                 (sparks die over a spread of times) rather than
- *                 collapsing in unison.
- *   color         Hue assigned at burst time (theme-dependent pair).
- *                 Constant for the spark's lifetime.
- *   active        false once life ≤ 0; rocket_tick stops integrating
- *                 inactive sparks.  Particle slot stays in the pool
- *                 until the rocket reloads.
+ *   life          A 1.0-down-to-0.0 health bar; the renderer dims the trail
+ *                 as it nears 0.
+ *   decay_rps     How fast life drains per second. Randomised per spark so a
+ *                 burst fades out raggedly instead of all dying at once.
+ *   color         The hue picked when the spark was born; fixed for life.
+ *   active        Goes false when life hits 0; the ticker then skips it and
+ *                 the slot waits to be reused on the next burst.
  *
  * Invariants
- *   0 ≤ trail_fill ≤ TRAIL_LEN.
- *   trail[0] == head (after every spark_advance_trail).
+ *   0 <= trail_fill <= TRAIL_LEN.
+ *   trail[0] == head right after each trail slide.
  *   active == (life > 0).
- *
- * References
- *   [1] Reeves 1983 — the per-particle state vector (pos, vel, life,
- *       colour, active) this struct extends.
- *   [4] Hairer et al. — Euler-integration reference.  spark_integrate
- *       uses plain forward Euler (cheap; drift is invisible at the
- *       sub-second lifetimes sparks have).
- *   [5] Symon Mechanics — linear-drag term in the velocity update.
- *   [9] *The Matrix* — visual heritage for the cache reroll.
  */
 typedef struct {
-    /* kinematic state */
+    /* where it is and how it's moving */
     Vec2  head;
     Vec2  vel;
 
-    /* trail history (ring-shifted each frame) */
+    /* the comet tail of past positions */
     Vec2  trail[TRAIL_LEN];
     int   trail_fill;
 
-    /* parallel glyph cache (matrix-rain shimmer) */
+    /* one shimmering glyph per tail position */
     char  cache[TRAIL_LEN];
 
-    /* lifetime + visual */
+    /* how alive it is, and how it looks */
     float life;
     float decay_rps;
     int   color;
     bool  active;
 } Spark;
 
-/* ── §4.3 spark_burst_spawn — factory for a full explosion ──────────── */
+/* §4.3 spark_burst_spawn — light off one whole explosion */
 
-/* burst_angle_for — evenly-spaced ring angle for spark i, plus a
- * uniform jitter so the ring isn't perfectly regular (a perfect ring
- * reads as a circular outline rather than an explosion). */
+/* The launch direction for spark i: an even share of the full circle, plus
+ * a small random skew so the sparks don't land on a perfect ring outline. */
 static inline float burst_angle_for(int i, int count) {
     float ring_angle   = ((float)i / (float)count) * 2.0f * (float)M_PI;
     float random_skew  = urand01() * BURST_ANGLE_JITTER;
     return ring_angle + random_skew;
 }
 
-/* random_uniform_in — sample uniformly from [lo, hi). */
 static inline float random_uniform_in(float lo, float hi) {
     return lo + urand01() * (hi - lo);
 }
 
-/* fill_glyph_cache_random — populate one spark's entire trail-glyph
- * cache with random ASCII characters at burst time.  Subsequent
- * frames only reroll ~75 % via spark_shimmer; the initial fill is
- * what gives the brand-new trail something to display before
- * shimmer takes over. */
+/* Fills a fresh spark's whole trail with random glyphs so it has something
+ * to show on frame one, before the per-frame shimmer takes over. */
 static inline void fill_glyph_cache_random(Spark *p) {
     for (int k = 0; k < TRAIL_LEN; k++)
         p->cache[k] = rand_glyph();
 }
 
-/*
- * spark_burst_spawn — initialise `count` sparks at `origin`.
- *
- *   For each spark:
- *     (1) pick angle           — evenly spaced + jitter
- *     (2) pick radial speed    — uniform [MIN, MAX]
- *     (3) seed kinematic state — head = origin, vel = speed·(cos,sin)
- *     (4) seed lifetime        — jittered so the burst fades gradually
- *     (5) pick colour          — random from theme palette
- *     (6) fill glyph cache     — initial random ASCII per trail slot
- *     (7) flag active          — ticker starts processing this slot
- */
+/* Sets up `count` brand-new sparks all flying out from `origin`. */
 static void spark_burst_spawn(Spark *pool, int count, Vec2 origin)
 {
     for (int i = 0; i < count; i++) {
         Spark *p = &pool[i];
 
-        /* (1) angular direction in the radial fan */
         float angle = burst_angle_for(i, count);
 
-        /* (2) outward speed (cells per second) */
         float speed = random_uniform_in(SPARK_SPEED_MIN_CPS,
                                          SPARK_SPEED_MAX_CPS);
 
-        /* (3) kinematic state */
         p->head        = origin;
         p->vel.x       = cosf(angle) * speed;
         p->vel.y       = sinf(angle) * speed;
         p->trail_fill  = 0;
 
-        /* (4) lifetime + decay — jittered so the burst fades GRADUALLY */
+        /* spread the lifespans so the burst fades out raggedly */
         p->life        = SPARK_LIFE_MIN  + urand01() * SPARK_LIFE_VAR;
         p->decay_rps   = SPARK_DECAY_MIN_RPS
                        + urand01() * SPARK_DECAY_VAR_RPS;
 
-        /* (5) visual */
         p->color       = color_rand();
 
-        /* (6) glyph cache — random ASCII per trail slot */
         fill_glyph_cache_random(p);
 
-        /* (7) flag active — spark_tick will start integrating */
         p->active      = true;
     }
 }
 
-/* ── §4.4 per-frame helpers — one named function per ALGORITHM step ── */
+/* §4.4 the per-frame steps, one function each */
 
-/*
- * Step 1 — push current head into trail[0], slide older entries down.
- *
- * The shift loop must run in REVERSE (i = N-1 down to 1). Running it
- * forward would copy the same value across the whole buffer because
- * trail[i] would be overwritten before being read into trail[i+1].
- */
+/* Remembers the current position: drops it in at the front of the trail and
+ * pushes everything else back one. The loop runs back-to-front on purpose —
+ * front-to-back would smear the newest value across the whole buffer. */
 static void spark_advance_trail(Spark *p)
 {
     for (int i = TRAIL_LEN - 1; i > 0; i--)
@@ -809,14 +403,8 @@ static void spark_advance_trail(Spark *p)
     if (p->trail_fill < TRAIL_LEN) p->trail_fill++;
 }
 
-/*
- * Step 2 — explicit Euler integration with per-spark gravity variance.
- *
- * Each spark's effective gravity is SPARK_GRAVITY_CPS2 scaled by
- * uniform(1−J, 1+J), so sparks fan out instead of all tracing the
- * same parabola. Velocities are in cells/sec; multiplying by dt
- * gives the cell-space displacement directly — no magic scale factor.
- */
+/* Moves the spark one frame forward under gravity. Each spark gets its
+ * gravity wobbled a bit so the burst spreads out instead of falling as one. */
 static void spark_integrate(Spark *p, float dt)
 {
     float jitter = 1.0f - SPARK_GRAVITY_JITTER + urand01() * 2.0f * SPARK_GRAVITY_JITTER;
@@ -826,11 +414,8 @@ static void spark_integrate(Spark *p, float dt)
     p->vel.y  += g * dt;
 }
 
-/*
- * Step 3 — for each cache slot, with probability 1 − 1/KEEP_ONE_IN
- * reroll the glyph. KEEP_ONE_IN = 4 → 75 % rerolled per frame —
- * the classic Matrix-rain shimmer.
- */
+/* The shimmer: rerolls about three-quarters of the trail's glyphs, leaving
+ * the rest so the trail keeps its shape from frame to frame. */
 static void spark_shimmer(Spark *p)
 {
     for (int k = 0; k < TRAIL_LEN; k++)
@@ -838,37 +423,25 @@ static void spark_shimmer(Spark *p)
             p->cache[k] = rand_glyph();
 }
 
-/* ── §4.5 spark_tick — orchestrator: one of each helper, in order ───── */
+/* §4.5 spark_tick — do all the steps in order */
 
-/*
- * One simulation step. Reads as the recipe in MENTAL MODEL → ALGORITHM
- * IN STEPS, line for line: advance trail, integrate, shimmer, decay.
- * Drop the spark from the live pool when life reaches zero.
- */
 static void spark_tick(Spark *p, float dt)
 {
     if (!p->active) return;
 
-    spark_advance_trail(p);                        /* 1. slide history */
-    spark_integrate    (p, dt);                    /* 2. physics       */
-    spark_shimmer      (p);                        /* 3. reroll cache  */
+    spark_advance_trail(p);
+    spark_integrate    (p, dt);
+    spark_shimmer      (p);
 
-    p->life -= p->decay_rps * dt;                  /* 4. life decay    */
+    p->life -= p->decay_rps * dt;
     if (p->life <= 0.0f) p->active = false;
 }
 
-/* ── §4.6 trail_attr — band the brightness gradient ─────────────────── */
+/* §4.6 trail_attr — how bright each part of the trail is */
 
-/*
- * Map a trail slot index to its ncurses attribute.
- *
- *   i in [0..TRAIL_HOT_END]    → BOLD   (hot, near-head)
- *   i in [..TRAIL_WARM_END-1]  → NORMAL (mid-fade)
- *   else (deep tail)           → DIM
- *
- *   life < FADING_LIFE_THRESHOLD overrides everything to DIM,
- *   producing a clean death fade as the spark dies.
- */
+/* Picks the brightness for one trail slot: the near-head slots are bold,
+ * the middle plain, the far tail dim. A dying spark (fading) goes all-dim
+ * so it fades out cleanly. */
 static attr_t trail_attr(int i, int cp, bool fading)
 {
     if (fading)              return COLOR_PAIR(cp) | A_DIM;
@@ -877,33 +450,23 @@ static attr_t trail_attr(int i, int cp, bool fading)
     return COLOR_PAIR(cp) | A_DIM;
 }
 
-/* ── §4.7 spark_draw — paint trail (oldest first) then head on top ──── */
+/* §4.7 spark_draw — paint the tail oldest-first, then the head on top */
 
-/*
- * Painter's-algorithm render. Drawing dim entries first lets the
- * brighter head and near-head slots overwrite them at cells where
- * multiple positions map to the same column/row — common near burst
- * centres where many sparks are tightly packed.
- */
-/*
- * cell_in_screen — bounds check used by the renderer; off-screen
- * positions are silently dropped without crashing ncurses. */
+/* True if (x, y) lands on the visible screen. Off-screen draws are skipped
+ * so ncurses never gets an out-of-bounds cell. */
 static inline bool cell_in_screen(int x, int y, int cols, int rows) {
     return x >= 0 && x < cols && y >= 0 && y < rows;
 }
 
-/* paint_glyph_at — attron/mvaddch/attroff sandwich for one ASCII
- * character.  Centralises the (chtype)(unsigned char) cast that
- * prevents sign-extension on chars > 127 (CLAUDE.md ncurses bug). */
+/* Draws one character with the given attributes. The cast keeps a
+ * high-value byte (> 127) from being read as a negative char by ncurses. */
 static inline void paint_glyph_at(int y, int x, char glyph, attr_t attrs) {
     attron(attrs);
     mvaddch(y, x, (chtype)(unsigned char)glyph);
     attroff(attrs);
 }
 
-/* paint_trail_slot — paint ONE slot of the trail history buffer.
- * Skips off-screen positions; picks the slot's attr via trail_attr
- * (tier-based brightness with optional A_DIM for fading sparks). */
+/* Draws one slot of the trail at its rounded cell, skipping it if off-screen. */
 static inline void paint_trail_slot(const Spark *p, int slot_idx,
                                      int cols, int rows, bool fading) {
     int x = (int)roundf(p->trail[slot_idx].x);
@@ -913,10 +476,8 @@ static inline void paint_trail_slot(const Spark *p, int slot_idx,
                    trail_attr(slot_idx, p->color, fading));
 }
 
-/* paint_live_head — paint the spark's current position.  Drawn LAST
- * so it always wins overlap with overlapping trail slots from this
- * or neighbouring sparks.  Uses CP_TRAIL_HEAD + A_BOLD while alive,
- * or the spark's own colour + A_DIM once fading. */
+/* Draws the bright head. Painted last so it wins wherever it lands on top of
+ * a tail slot — bold white while alive, dim in the spark's colour while dying. */
 static inline void paint_live_head(const Spark *p, int cols, int rows,
                                     bool fading) {
     int hx = (int)roundf(p->head.x);
@@ -929,155 +490,73 @@ static inline void paint_live_head(const Spark *p, int cols, int rows,
     paint_glyph_at(hy, hx, p->cache[0], head_attrs);
 }
 
-/*
- * spark_draw — paint one spark's trail + live head.
- *
- *   (1) skip if inactive
- *   (2) compute the fading-flag once (life threshold check)
- *   (3) trail: oldest → newest (newest paints OVER older slots that
- *       map to the same cell, the painter's-order trick)
- *   (4) head: drawn last, always wins overlap
- */
+/* Draws one spark: its tail oldest-first, then its head on top. Skipped
+ * entirely if the spark is dead. The oldest-first order is what lets the
+ * brighter, newer parts cover the older ones where they overlap. */
 static void spark_draw(const Spark *p, int cols, int rows)
 {
     if (!p->active) return;
 
     bool fading = (p->life < FADING_LIFE_THRESHOLD);
 
-    /* (3) trail — oldest first so newer slots paint on top */
     for (int slot = p->trail_fill - 1; slot >= 0; slot--)
         paint_trail_slot(p, slot, cols, rows, fading);
 
-    /* (4) live head — drawn last, always wins overlap */
     paint_live_head(p, cols, rows, fading);
 }
 
-/* ===================================================================== */
-/* §5  rocket — IDLE → RISING → EXPLODED state machine                    */
-/* ===================================================================== */
+/* §5  rocket — its IDLE -> RISING -> EXPLODED life */
 
-/* ── §5.1 RocketState enum + Rocket type ─────────────────────────── */
+/* §5.1 RocketState enum + Rocket type */
 
 /*
- * RocketState — the three-phase state machine of one firework.
+ * RocketState — which of three stages a firework is in.
  *
- * Intent
- *   A real firework has four stages (loaded → lit → rising → bursting
- *   → fading) compressed here into three because "loaded" and "lit"
- *   become the SAME state from the simulation's view: counting down
- *   a fuse with no visible motion.
+ *   RS_IDLE      Waiting underground, counting its fuse down; nothing drawn.
+ *                When the fuse hits zero it launches.
+ *   RS_RISING    Climbing. Gravity slows it; the moment it starts to fall
+ *                (or reaches the top edge) it bursts into sparks and moves on.
+ *   RS_EXPLODED  Its sparks are flying. Once they've all died out, the rocket
+ *                goes back to IDLE with a fresh random fuse and does it again.
  *
- * State diagram
- *
- *      ┌─────────────┐  fuse hits 0    ┌──────────────┐
- *      │   IDLE      │ ───────────────►│   RISING     │
- *      │ (fuse > 0,  │                 │ (climbs at   │
- *      │  no glyph)  │                 │   apex_vy,   │
- *      └─────────────┘                 │  gravity     │
- *           ▲                          │  decelerates)│
- *           │                          └──────┬───────┘
- *           │ all sparks                     │ apex reached
- *           │ inactive                       │ (vy ≥ 0)
- *           │                                ▼
- *      ┌─────────────┐  spark_burst    ┌──────────────┐
- *      │  reload     │ ◄───────────────│   EXPLODED   │
- *      │  (idle      │                 │ (burst alive,│
- *      │   loops to  │                 │  sparks      │
- *      │   IDLE)     │                 │  ticking)    │
- *      └─────────────┘                 └──────────────┘
- *
- * Members
- *   RS_IDLE     = 0  Counting down `fuse_sec`; no rocket body drawn.
- *                    Once the fuse hits 0, transition to RS_RISING.
- *   RS_RISING   = 1  Climbing under gravity until apex (vy ≥ 0).
- *                    A single '|' glyph is drawn at (x, y).  Once
- *                    velocity flips sign, transition to RS_EXPLODED
- *                    after spawning the burst of sparks.
- *   RS_EXPLODED = 2  Burst alive — all PARTICLES_PER_BURST sparks
- *                    ticking independently.  When every spark has
- *                    `active = false`, the rocket recycles back to
- *                    RS_IDLE with a fresh random fuse.
- *
- * Why RS_IDLE = 0 deliberately
- *   memset(0)-initialised rockets start in IDLE without an explicit
- *   initialiser; scene_init uses this for parking inactive slots.
- *
- * References
- *   [1] Reeves 1983 — particle systems lifecycle (spawn / step /
- *       expire); RocketState is the per-rocket version of that
- *       lifecycle, with EXPLODED → IDLE being the recycle phase.
+ * IDLE is 0 on purpose: a zeroed-out rocket is automatically idle, which
+ * scene_init relies on when it parks the slots it isn't using.
  */
 typedef enum {
-    RS_IDLE     = 0,    /* counting down a fuse, then launches */
-    RS_RISING   = 1,    /* climbing under gravity until apex   */
-    RS_EXPLODED = 2,    /* burst alive; sparks ticking         */
+    RS_IDLE     = 0,
+    RS_RISING   = 1,
+    RS_EXPLODED = 2,
 } RocketState;
 
 /*
- * Rocket — one ascending streak plus its inline pool of explosion sparks.
+ * Rocket — one rising streak that owns the sparks it bursts into.
  *
- * Intent
- *   Each Rocket owns the FULL LIFECYCLE: the rising body, the burst at
- *   apex, the sparks that fly outward, and the recycle back to IDLE.
- *   Embedding the sparks inline (`Spark particles[PARTICLES_PER_BURST]`)
- *   means no malloc / free per burst — slots are simply marked
- *   `active = false` and overwritten on the next spawn.
+ * A rocket handles its own whole show: the climb, the burst at the top,
+ * the sparks flying out, and the wait before it goes again. Its burst of
+ * sparks lives right inside it (particles[]), so a burst never has to
+ * allocate anything — old sparks are just marked dead and overwritten next
+ * time. That also matches the project's "no malloc after startup" rule.
  *
- *   At any given moment a rocket is in ONE of three states (see
- *   RocketState).  Vertical motion is 1-D physics (no horizontal
- *   drift); the burst's outward radial velocity comes from the
- *   sparks, not the rocket itself.
- *
- * Why an inline particle pool (not a separate sparks_pool[])
- *   • Each rocket has a hard-coded burst count.  A heap allocation
- *     per burst would be allocator-heavy at high rocket counts
- *     (ROCKETS_MAX × bursts_per_minute).
- *   • Inline storage matches CLAUDE.md "no dynamic allocation after
- *     init" rule — the entire rocket pool is one BSS array, no malloc
- *     anywhere in the hot path.
- *   • Memory locality: when rocket_tick iterates particles, they all
- *     sit in the same cache line as the rocket.
- *
- * Why vy only (no vx)
- *   Rockets fly STRAIGHT UP — they don't drift sideways while rising.
- *   The visible variety comes from (1) the random launch column, and
- *   (2) the radial spark fan AT THE APEX.  Adding vx would diffuse
- *   the visual impact of the upward streak without making the bursts
- *   any more interesting.
+ * A rocket only tracks vertical speed; it flies straight up. The spread
+ * comes from the random launch column and the fan of sparks at the top, so
+ * a sideways drift would only blur the streak without adding anything.
  *
  * Members
- *   x, y         Current cell-space position (y fractional; positive
- *                downward by terminal convention, so a CLIMBING rocket
- *                has DECREASING y).
- *   vy           Vertical velocity (cells / sec; NEGATIVE while
- *                climbing because y points down).  Forward-Euler
- *                updated under gravity until vy ≥ 0 marks the apex.
- *   color        Rocket-BODY hue used while RISING (theme-driven).
- *                Not read once the rocket explodes — each spark
- *                picks its own colour from the theme palette.
- *   state        Current RocketState (IDLE / RISING / EXPLODED).
- *   fuse_sec     Seconds remaining on the IDLE-state fuse.  Set to
- *                a fresh random value on every recycle; counted down
- *                each tick by rocket_tick_idle.
- *   particles[]  Inline pool of PARTICLES_PER_BURST Sparks.  Never
- *                allocated/freed — just deactivated and overwritten
- *                on the next burst.  Iterated by rocket_tick_exploded
- *                and rocket_draw.
+ *   x, y         Where it is. y grows downward, so a climbing rocket's y
+ *                is going down.
+ *   vy           Vertical speed (negative while climbing). Gravity bends it
+ *                upward toward zero; hitting zero means it's at the top.
+ *   color        The streak's colour while rising. Ignored after it bursts —
+ *                each spark then picks its own.
+ *   state        Which stage it's in (see RocketState).
+ *   fuse_sec     Seconds left before an idle rocket launches; reset to a new
+ *                random value each time it recycles.
+ *   particles[]  Its built-in batch of sparks. Reused burst after burst.
  *
  * Invariants
- *   state == RS_IDLE     ⇒ fuse_sec > 0  AND  every particle.active == false
- *   state == RS_RISING   ⇒ vy < 0  (until the next tick crosses apex)
- *   state == RS_EXPLODED ⇒ at least one particle.active == true
- *                          (transitions to IDLE when none remain)
- *
- * References
- *   [1] Reeves 1983 — the inline particle-pool design predates the
- *       free-list / arena patterns and is still preferred for small
- *       fixed-size effects.
- *   [3] Akenine-Möller §13 — fixed-pool particle storage in modern
- *       real-time renderers (same design at scale).
- *   [4] Hairer et al. — Euler-integration reference for
- *       rocket_tick_rising (same forward-Euler form as spark_integrate).
+ *   IDLE     => fuse_sec > 0 and every particle is dead.
+ *   RISING   => vy < 0 (until the tick that tips it past the top).
+ *   EXPLODED => at least one spark still alive (else it flips to IDLE).
  */
 typedef struct {
     float        x, y;
@@ -1088,7 +567,7 @@ typedef struct {
     Spark        particles[PARTICLES_PER_BURST];
 } Rocket;
 
-/* ── §5.2 rocket_launch — fresh rising rocket from the bottom ─────── */
+/* §5.2 rocket_launch — send a fresh rocket up from the bottom */
 
 static void rocket_launch(Rocket *r, int cols, int rows)
 {
@@ -1103,14 +582,9 @@ static void rocket_launch(Rocket *r, int cols, int rows)
         r->particles[i].active = false;
 }
 
-/* ── §5.3 per-state tick functions — one per RocketState ─────────── */
+/* §5.3 one tick function per stage */
 
-/*
- * RS_IDLE — count down the fuse; launch when it hits zero.
- *
- * cols/rows are forwarded to rocket_launch which uses them to pick
- * a random column for the new rocket.
- */
+/* Idle: burn the fuse down, and launch the moment it runs out. */
 static void rocket_tick_idle(Rocket *r, float dt, int cols, int rows)
 {
     r->fuse_sec -= dt;
@@ -1118,12 +592,8 @@ static void rocket_tick_idle(Rocket *r, float dt, int cols, int rows)
         rocket_launch(r, cols, rows);
 }
 
-/*
- * RS_RISING — integrate position and gravity; explode at apex
- * (vy ≥ 0) or if the rocket clears the top edge (rare too-fast
- * launch). When exploding, spawn PARTICLES_PER_BURST sparks at
- * the rocket's current position.
- */
+/* Rising: climb under gravity, and burst the instant it tops out (or hits
+ * the top edge on a too-fast launch), scattering its sparks from there. */
 static void rocket_tick_rising(Rocket *r, float dt)
 {
     r->y  += r->vy * dt;
@@ -1136,10 +606,8 @@ static void rocket_tick_rising(Rocket *r, float dt)
     }
 }
 
-/*
- * RS_EXPLODED — tick every spark; when none remain alive, return
- * to RS_IDLE with a fresh random fuse.
- */
+/* Exploded: tick the sparks, and once they've all died go back to idle
+ * with a new random fuse. */
 static void rocket_tick_exploded(Rocket *r, float dt)
 {
     bool any_alive = false;
@@ -1153,7 +621,7 @@ static void rocket_tick_exploded(Rocket *r, float dt)
     }
 }
 
-/* ── §5.4 rocket_tick — dispatch on state ───────────────────────── */
+/* §5.4 rocket_tick — run whichever stage we're in */
 
 static void rocket_tick(Rocket *r, float dt, int cols, int rows)
 {
@@ -1164,28 +632,16 @@ static void rocket_tick(Rocket *r, float dt, int cols, int rows)
     }
 }
 
-/* ── §5.5 rocket_draw — body while rising, sparks when exploded ──── */
+/* §5.5 rocket_draw — the streak while rising, the sparks once burst */
 
-/*
- * Body while rising; particle trails while exploded. IDLE rockets
- * draw nothing — they're "below ground" waiting on the fuse.
- */
-/* Glyphs that compose the rising-rocket body. */
+/* The two characters that make up the rising rocket. */
 enum {
-    ROCKET_BODY_GLYPH = '|',   /* bright head (this cell, A_BOLD) */
-    ROCKET_TAIL_GLYPH = '\'',  /* faint tail (one cell below)     */
+    ROCKET_BODY_GLYPH = '|',   /* bright head */
+    ROCKET_TAIL_GLYPH = '\'',  /* faint tail one cell below */
 };
 
-/*
- * draw_rising_rocket_body — paint the two-cell rocket streak.
- *
- *   y     : bright '|' in the rocket's colour (A_BOLD)
- *   y + 1 : faint '\'' tail in the same colour (no bold) — gives the
- *           illusion of a one-cell smoke trail without persisting
- *           historical positions.
- *
- * Off-screen positions are silently dropped.
- */
+/* Draws the rocket as a bright '|' with a faint tail just below it — a cheap
+ * two-cell streak that fakes a smoke trail without storing past positions. */
 static void draw_rising_rocket_body(const Rocket *r, int cols, int rows) {
     int x = (int)r->x;
     int y = (int)r->y;
@@ -1198,20 +654,14 @@ static void draw_rising_rocket_body(const Rocket *r, int cols, int rows) {
         paint_glyph_at(y + 1, x, ROCKET_TAIL_GLYPH, COLOR_PAIR(r->color));
 }
 
-/*
- * draw_exploded_burst — paint every active spark in the burst.  No
- * back-to-front sort is needed: spark_draw uses painter's order
- * within each spark (oldest trail slot first, live head last).
- */
+/* Draws every spark in the burst. No sorting needed — each spark already
+ * paints its own tail back-to-front. */
 static void draw_exploded_burst(const Rocket *r, int cols, int rows) {
     for (int i = 0; i < PARTICLES_PER_BURST; i++)
         spark_draw(&r->particles[i], cols, rows);
 }
 
-/*
- * rocket_draw — dispatch by RocketState.  IDLE rockets draw nothing
- * (they're "below ground" waiting on the fuse).
- */
+/* Idle rockets draw nothing — they're "below ground" waiting on the fuse. */
 static void rocket_draw(const Rocket *r, int cols, int rows)
 {
     switch (r->state) {
@@ -1221,36 +671,25 @@ static void rocket_draw(const Rocket *r, int cols, int rows)
     }
 }
 
-/* ===================================================================== */
-/* §6  scene — Scene root + RocketPool + SimControls sub-structs          */
-/* ===================================================================== */
+/* §6  scene — the Scene and its sub-structs */
 
 /*
- * RocketPool — the fixed-size rocket array plus its active prefix.
+ * RocketPool — the rocket array and how many of it are switched on.
  *
- * Intent
- *   `rockets[]` is sized at MAX_ROCKETS (the hard ceiling); the first
- *   `active_count` slots are the LIVE rockets, the rest sit idle as
- *   STATE = RS_IDLE with a giant fuse so rocket_tick effectively
- *   ignores them.  Bumping active_count up via the '+' key wakes the
- *   next idle slot.
- *
- * Why a prefix-active design (not a free-list)
- *   Simpler bookkeeping: no need to track which slots are free.  The
- *   pool fits in BSS with no malloc, and inactive slots cost only a
- *   tick of "is your fuse ready? no" — cheap compared to the active
- *   particle physics they would otherwise run.
+ * The array is always full-sized, but only the first active_count slots are
+ * live; the rest sit idle with an enormous fuse so they never fire. The '+'
+ * key just bumps active_count and wakes the next slot. Keeping the live ones
+ * up front (instead of tracking free slots) means there's nothing to
+ * allocate and an off slot costs only a "fuse ready? no" each frame.
  *
  * Members
- *   rockets[]      Fixed-capacity pool; slots [0, active_count) live.
- *   active_count   Number of rockets currently in active rotation
- *                  (∈ [ROCKETS_MIN, ROCKETS_MAX], user-tunable
- *                  via + / − keys).
+ *   rockets[]      The whole pool; slots 0..active_count-1 are the live ones.
+ *   active_count   How many rockets are on, between ROCKETS_MIN and MAX
+ *                  (the + / - keys move it).
  *
  * Invariants
- *   0 ≤ active_count ≤ MAX_ROCKETS.
- *   rockets[i].state == RS_IDLE for i ≥ active_count
- *   (and their fuse_sec is set to a huge value to prevent firing).
+ *   0 <= active_count <= MAX_ROCKETS.
+ *   Every slot at or past active_count is idle with a huge fuse.
  */
 typedef struct {
     Rocket rockets[MAX_ROCKETS];
@@ -1258,23 +697,13 @@ typedef struct {
 } RocketPool;
 
 /*
- * SimControls — user-facing playback knobs.
+ * SimControls — the playback knobs the user controls.
  *
- * Intent
- *   Bundles the two boolean / float knobs that the input handler
- *   writes and scene_tick reads.  Same shape as the SimControls
- *   sub-struct on every other Scene in this project.
- *
- * Members
- *   paused        true → scene_tick early-returns; HUD shows "PAUSED".
- *                 Toggled by SPACE / p key.
- *   speed_scale   Multiplier applied to dt before rocket_tick reads
- *                 it.  Default 1.0; live-tunable with [ and ] keys
- *                 (geometric scaling by SPEED_SCALE_STEP per press).
- *                 Clamped to [SPEED_SCALE_MIN, SPEED_SCALE_MAX].
- *
- * Invariants
- *   SPEED_SCALE_MIN ≤ speed_scale ≤ SPEED_SCALE_MAX.
+ *   paused        When true the scene freezes and the HUD says PAUSED
+ *                 (space / p toggles it).
+ *   speed_scale   Stretches or shrinks time for the whole show. 1.0 is
+ *                 normal; the [ and ] keys scale it, kept within
+ *                 [SPEED_SCALE_MIN, SPEED_SCALE_MAX].
  */
 typedef struct {
     bool  paused;
@@ -1282,19 +711,14 @@ typedef struct {
 } SimControls;
 
 /*
- * Scene — owns ALL simulation state for one run.
+ * Scene — all the state for one running show, reachable from one pointer.
  *
- * Layered ownership
+ *   pool       the rockets and how many are on
+ *   sim        the pause / speed knobs
+ *   theme_idx  which colour theme is active (the t key cycles it)
  *
- *     Scene
- *       ├── pool       : RocketPool   ← fixed-size rocket array + active count
- *       ├── sim        : SimControls  ← paused + speed_scale
- *       └── theme_idx  : int          ← active colour palette (t/T cycles)
- *
- *   Every persistent simulation value is reachable from one `Scene *s`.
- *   theme_idx lives here (not on App) because it's a SCENE-level
- *   rendering concern — different scenes could in principle pick
- *   different default themes.
+ * The theme lives here, not on App, because it's a per-scene look — another
+ * scene could start on a different theme.
  */
 typedef struct {
     RocketPool  pool;
@@ -1302,14 +726,9 @@ typedef struct {
     int         theme_idx;
 } Scene;
 
-/*
- * launch_idle_slot — wake one rocket slot with a quick fuse so it
- * fires shortly.  Used by scene_init (to stagger initial firings)
- * and by scene_change_rockets (to wake newly-activated slots).
- *
- * The launch params (`cols`, `rows`) come from the Screen extent —
- * rocket_launch needs them to pick the launch column + apex height.
- */
+/* Wakes one rocket slot with a short fuse so it fires soon. Used to stagger
+ * the opening volley and to switch on a slot when the user adds a rocket.
+ * cols/rows are passed through so the launch can pick a column and height. */
 static void launch_idle_slot(Scene *s, int slot_index, int cols, int rows,
                              float fuse_sec) {
     Rocket *r = &s->pool.rockets[slot_index];
@@ -1318,13 +737,8 @@ static void launch_idle_slot(Scene *s, int slot_index, int cols, int rows,
     r->state    = RS_IDLE;
 }
 
-/*
- * park_idle_slot — put a slot into "effectively never fires" state.
- * Sets fuse_sec to a huge value so rocket_tick_idle never trips it,
- * and zeros every particle.active flag.
- *
- * Used by scene_init to park slots ABOVE active_count.
- */
+/* Switches a slot off: a giant fuse it'll never burn through, and all its
+ * sparks marked dead. Used for the slots above active_count. */
 static void park_idle_slot(Scene *s, int slot_index) {
     Rocket *r = &s->pool.rockets[slot_index];
     r->state    = RS_IDLE;
@@ -1340,7 +754,7 @@ static void scene_init(Scene *s, int cols, int rows, int rocket_count) {
 
     for (int i = 0; i < MAX_ROCKETS; i++) {
         if (i < rocket_count) {
-            /* Stagger initial firings so they don't all explode at once. */
+            /* stagger the opening volley so they don't all pop at once */
             float staggered_fuse = (float)i * INITIAL_FUSE_STAGGER_SEC;
             launch_idle_slot(s, i, cols, rows, staggered_fuse);
         } else {
@@ -1363,12 +777,11 @@ static void scene_draw(const Scene *s, int cols, int rows) {
         rocket_draw(&s->pool.rockets[i], cols, rows);
 }
 
-/* Scene input helpers — used by app_handle_key. */
+/* Scene input helpers — driven by app_handle_key. */
 
-/* scene_change_rockets — bump the active_count by `delta`, clamp to
- * [ROCKETS_MIN, ROCKETS_MAX].  When growing, wake the next idle slot
- * with a short fuse so the new rocket fires soon (not after a long
- * wait that would feel unresponsive). */
+/* Adds or removes rockets (clamped to the allowed range). When adding, it
+ * wakes the new slot with a short fuse so it fires soon — a long wait would
+ * make the key feel dead. */
 static void scene_change_rockets(Scene *s, int delta, int cols, int rows) {
     int next_count = s->pool.active_count + delta;
     if (next_count < ROCKETS_MIN) next_count = ROCKETS_MIN;
@@ -1381,59 +794,35 @@ static void scene_change_rockets(Scene *s, int delta, int cols, int rows) {
     s->pool.active_count = next_count;
 }
 
-/* scene_scale_speed — multiply speed_scale by `factor`, clamped.
- *   factor > 1 (']' key) → faster
- *   factor < 1 ('[' key) → slower
- * Geometric scaling means a press has the same proportional effect
- * regardless of current speed. */
+/* Speeds the show up or slows it down (clamped). Multiplying rather than
+ * adding means each key press feels the same whatever the current speed. */
 static void scene_scale_speed(Scene *s, float factor) {
     s->sim.speed_scale *= factor;
     if (s->sim.speed_scale < SPEED_SCALE_MIN) s->sim.speed_scale = SPEED_SCALE_MIN;
     if (s->sim.speed_scale > SPEED_SCALE_MAX) s->sim.speed_scale = SPEED_SCALE_MAX;
 }
 
-/* scene_cycle_theme — t/T → next palette index, wrap at THEME_COUNT,
- * re-register the colour pairs.  Pure render mutation. */
+/* Moves to the next colour theme and repaints the spark colours. */
 static void scene_cycle_theme(Scene *s) {
     s->theme_idx = (s->theme_idx + 1) % THEME_COUNT;
     theme_apply(s->theme_idx);
 }
 
-/* ===================================================================== */
-/* §7  screen — ncurses init / present / HUD                              */
-/* ===================================================================== */
+/* §7  screen — ncurses setup, present, and HUD */
 
 /*
- * Screen — terminal cell extent + ncurses lifecycle wrapper.
+ * Screen — how big the terminal is, in character cells.
  *
- * Intent
- *   Tracks the TERMINAL side of the demo: cell dimensions for HUD
- *   placement and field clipping.  ncurses owns the back buffer;
- *   this struct is the source-of-truth for cell-space dimensions,
- *   refreshed via getmaxyx in screen_init / screen_resize.
- *
- *   Sparks live in CELL space (with sub-cell precision for smooth
- *   arcs) and the Spark.head Vec2 components are in the same units
- *   as Screen.cols / Screen.rows.  No pixel-vs-cell aspect bridge —
- *   this is a pure cell-space demo.
- *
- * Why a tiny 2-field struct (not flat ints on App)
- *   • Lifecycle isolation: only screen_init / screen_resize /
- *     screen_free / screen_draw_hud touch ncurses' initscr / endwin
- *     / mvprintw.  They all take `Screen *` to make this layer
- *     explicit at the type level.
- *   • Symmetry with the rest of the project — every demo's Screen
- *     uses the same {cols, rows} shape.
+ * Sparks and rockets live in these same cell units, so this is the one
+ * source of truth for clipping draws and placing the HUD. cols/rows are
+ * read from ncurses at startup and re-read on every resize.
  *
  * Members
- *   cols   Terminal width in CELLS (getmaxyx).
- *   rows   Terminal height in CELLS.  Bottom row index is rows − 1
- *          (where the key hint paints).  Row 0 is the status row.
+ *   cols   width in cells.
+ *   rows   height in cells; the bottom row (rows-1) holds the key hint,
+ *          the top row (0) holds the status line.
  *
- * Invariants
- *   cols > 0, rows > 0 after screen_init.
- *   Both refreshed on every SIGWINCH via screen_resize +
- *   app_do_resize (which also re-inits the scene at the new size).
+ * Both are > 0 after setup.
  */
 typedef struct { int cols, rows; } Screen;
 
@@ -1460,15 +849,8 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * screen_draw_hud — required HUD per CLAUDE.md spec.
- *
- *   Row 0       PAIR_HUD  + A_BOLD  (yellow) — fps + state + params
- *   Bottom row  PAIR_HINT + A_BOLD  (cyan)   — full key list
- *
- * Both pairs sit on default background (-1) so they stay legible
- * regardless of theme. theme_apply() never touches them.
- */
+/* Draws the two status lines: fps and settings along the top, the key list
+ * along the bottom. Both use fixed colours so they stay readable on any theme. */
 static void screen_draw_hud(const Screen *sc, double fps,
                             const Scene *scene)
 {
@@ -1497,17 +879,13 @@ static void screen_present(void)
     doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app — signals, resize, variable-dt main loop                       */
-/* ===================================================================== */
+/* §8  app — signals, resize, and the main loop */
 
 /*
- * FpsCounter — rolling-window frame-rate estimator.
+ * FpsCounter — a steady frame-rate number for the HUD.
  *
- * Per-frame fps would jitter; this accumulates frame_count + elapsed
- * nanoseconds over a 500 ms window and emits a smoothed `display`
- * value each time the window fills.  Same shape as the FpsCounter on
- * every other file in this project.
+ * A per-frame rate jumps around too much to read, so this tallies frames
+ * over a half-second window and only then updates the displayed value.
  */
 typedef struct {
     int     frame_count;
@@ -1533,18 +911,16 @@ static void fps_counter_tick(FpsCounter *f, int64_t dt_ns) {
 }
 
 /*
- * App — top-level container for every persistent value.
+ * App — everything the program keeps alive while it runs.
  *
- *   scene         simulation state (rocket pool + sim + theme)
- *   screen        terminal cell extent + ncurses lifecycle
- *   fps           rolling-window fps estimator for HUD
- *   running       sig_atomic_t flag cleared by SIGINT / SIGTERM + 'q'
- *   need_resize   sig_atomic_t flag set by SIGWINCH; main reacts at
- *                 the top of the next iteration
+ *   scene         the show itself (rockets, pause/speed, theme)
+ *   screen        the terminal size and ncurses handle
+ *   fps           the smoothed frame rate for the HUD
+ *   running       cleared on Ctrl-C / kill / 'q' to end the loop
+ *   need_resize   set when the terminal is resized; the loop reacts next frame
  *
- * `g_app` is the program's only file-scope mutable state.  Signal
- * handlers reach the flags through it; everything else flows via
- * `App *app` parameter.
+ * g_app is the only global. The signal handlers need it to flip those two
+ * flags; everything else is passed an App pointer instead.
  */
 typedef struct {
     Scene                 scene;
@@ -1560,10 +936,8 @@ static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-/*
- * app_do_resize — full re-init of the scene on the new screen size,
- * preserving user-tuned theme and rocket count.
- */
+/* Rebuilds the show at the new terminal size after a resize, keeping the
+ * user's chosen theme, speed, and rocket count. */
 static void app_do_resize(App *app)
 {
     int   saved_n     = app->scene.pool.active_count;
@@ -1578,18 +952,9 @@ static void app_do_resize(App *app)
     app->need_resize           = 0;
 }
 
-/*
- * app_handle_key — process one keystroke.  Returns false on quit.
- *
- *   q / Q / ESC      quit
- *   p / P / SPACE    toggle paused
- *   r / R            reset (re-init scene at current rocket count)
- *   ]                speed up (×SPEED_SCALE_STEP)
- *   [                slow down (÷SPEED_SCALE_STEP)
- *   + / =            add a rocket
- *   -                remove a rocket
- *   t / T            cycle theme
- */
+/* Handles one keypress; returns false only when the user wants to quit.
+ * Keys: q/Q/ESC quit, space/p pause, r reset, [ ] slower/faster,
+ * +/= add a rocket, - remove one, t cycle theme. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
@@ -1641,20 +1006,21 @@ int main(void)
 
     while (app->running) {
 
-        /* (1) handle resize first so subsequent steps see the new size */
+        /* handle a pending resize first so the rest of the frame sees the new size */
         if (app->need_resize) {
             app_do_resize(app);
             last_ns = clock_ns();
         }
 
-        /* (2) measure dt, capped to prevent spiral-of-death */
+        /* how long since the last frame, capped so one slow frame can't
+         * make the catch-up step huge and snowball */
         int64_t now_ns = clock_ns();
         int64_t dt_ns  = now_ns - last_ns;
         last_ns        = now_ns;
         float   dt     = (float)dt_ns / (float)NS_PER_SEC;
         if (dt > DT_CAP_SEC) dt = DT_CAP_SEC;
 
-        /* (3) drain input */
+        /* read any keys waiting */
         for (int ch; (ch = getch()) != ERR; ) {
             if (!app_handle_key(app, ch)) {
                 app->running = 0;
@@ -1662,19 +1028,17 @@ int main(void)
             }
         }
 
-        /* (4) advance the scene */
         scene_tick(scene, dt, app->screen.cols, app->screen.rows);
 
-        /* (5) rolling fps counter */
         fps_counter_tick(&app->fps, dt_ns);
 
-        /* (6) draw + present */
+        /* draw the frame and flush it */
         erase();
         scene_draw(scene, app->screen.cols, app->screen.rows);
         screen_draw_hud(&app->screen, app->fps.display, scene);
         screen_present();
 
-        /* (7) frame cap — sleep before the NEXT frame's I/O */
+        /* wait out the rest of the frame's time budget */
         int64_t elapsed = clock_ns() - now_ns;
         clock_sleep_ns(FRAME_BUDGET_NS - elapsed);
     }

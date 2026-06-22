@@ -1,666 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * fourier_shapes.c — animated DFT epicycle reconstruction over a
- *                    catalog of 21 preset parametric shapes, with a
- *                    PARSEVAL'S-THEOREM ENERGY BAR showing how much
- *                    of the signal's total power the active arms have
- *                    captured.  10 colour themes, 3 convergence tiers.
+ * fourier_shapes.c — picks one of 21 preset 2-D shapes, breaks it into
+ * spinning arms (a DFT), and animates the arm chain redrawing the shape.
+ * The headline is the bar up top: how much of the shape's "energy" the
+ * arms you've turned on have captured so far. Add arms and watch it fill.
  *
- * DEMO
- *   Pick one of 21 preset shapes (Square, Lissajous variants,
- *   spirograph rosettes, hypocycloids, gears, knots, ...).  The
- *   program samples N = 256 points along the shape, runs an O(N²)
- *   DFT, sorts the output bins by amplitude, and animates the chain
- *   of rotating arms whose tip retraces the shape.  Add or remove
- *   arms with '+' / '-' or let auto-add ramp them up; the trail
- *   converges visibly toward the ghost overlay of the source.
- *
- *   The HEADLINE FEATURE is the energy bar at the top of the screen:
- *   it shows the cumulative fraction of total signal power captured
- *   by the M active arms (Parseval's theorem applied to a sorted,
- *   finite spectrum).  Because we sort by amplitude, this is the
- *   energy-OPTIMAL partial reconstruction at every M.  The bar's
- *   colour signals the convergence tier:
- *       red    < 50%    "we have only the broad strokes"
- *       yellow 50..80%  "shape is recognisable, details missing"
- *       green  >= 80%   "reconstruction is essentially correct"
- *
- *   Each shape carries a TIER label (Fast / Med / Slow) shown in the
- *   HUD alongside its in-tier position (e.g. "[Fast 5/9]").  Cycling
- *   through with 'n' / 'p' is a guided tour through three different
- *   convergence stories: smooth shapes hit 100% in 4 arms; cusped
- *   shapes need 10-15; sharp polygons trickle to 95% only past 50.
- *
- * Study alongside
- *   signal/fourier_draw.c    The interactive sibling — same epicycle
- *                             chain machinery, but the user TRACES a
- *                             path with arrow keys instead of choosing
- *                             a preset shape.
- *   signal/epicycles.c       The deepest pedagogical treatment of the
- *                             DFT + epicycle chain, with 20 different
- *                             parametric shapes and signed frequencies
- *                             explained in detail.
- *   signal/fft_vis.c         The 1-D version: same Fourier maths
- *                             applied to a scalar audio-style signal,
- *                             with windowing and a spectrogram waterfall.
- *   signal/dft_helloworld.c  The minimum-viable DFT intro.  Read it
- *                             first if "what is a DFT?" is the open
- *                             question.
- *
- * Section map
- *   §1   config             constants (N, FPS, scale, theme/shape counts)
- *   §2   clock              monotonic-ns timer + sleep
- *   §3   themes             palette table (10 themes) + apply_theme + init
- *   §4   shape_helpers      gcd_int, sample_poly, hypotrochoid, epitrochoid
- *   §5   shape_samplers     21 parametric shape generators (4 sub-groups)
- *   §6   shape_dispatch     sample_path — the big switch
- *   §7   tier_classify      tier table + shape_tier_position helper
- *   §8   dft                O(N^2) DFT with twiddle recurrence
- *   §9   epicycle_table     Epicycle struct + sort + cumulative energy
- *   §10  trail              tip-path ring buffer
- *   §11  scene_state        per-frame globals + reset/init
- *   §12  scene_chain        compute joint positions from epicycle table
- *   §13  scene_tick         per-frame orchestrator (auto-add + advance phi)
- *   §14  draw_helpers       Bresenham line + cell-aspect orbit ellipse
- *   §15  draw_layers        ghost / orbits / trail / chain / markers
- *   §16  hud_energy         status top-right + energy bar + bottom hint
- *   §17  screen             ncurses init / cleanup / present
- *   §18  app                signal handlers + main loop + key dispatch
- *
- * Keys
- *   q | Q | ESC      quit
- *   space            pause / resume
- *   n / p            next / previous shape  (21 to choose from)
- *   t / T            next / previous theme  (10 palettes)
- *   + / -            grow / shrink chain by one arm
- *   a                toggle auto-add (one new arm every ~0.27 s)
- *   c                toggle orbit-circle overlay
- *   g                toggle ghost overlay (faint trace of source samples)
- *   r                reset to current shape (M = 1, fresh trail)
- *
- * Build
- *   gcc -std=c11 -O2 -Wall -Wextra signal/fourier_shapes.c \
- *       -o fourier_shapes -lncurses -lm
+ * Sister files: signal/fourier_draw.c (you trace the shape by hand),
+ * signal/epicycles.c (the same idea taught in depth), signal/fft_vis.c
+ * (the 1-D audio version), signal/dft_helloworld.c (start here if you've
+ * never met a DFT). The bar is Parseval's theorem made visible
+ * (Parseval 1799); intro video: 3Blue1Brown "But what is a Fourier
+ * series?". Math background: Smith, "The Scientist and Engineer's Guide
+ * to DSP", ch. 8.
  */
-
-/* ── HOW TO READ THIS FILE ────────────────────────────────────────────── *
- *
- * Reading order
- *   First-time reader, no Fourier background:
- *     1. CONCEPTS — the elevator pitch.
- *     2. MENTAL MODEL — analogies, diagrams, invariants.  The energy-
- *        bar diagram is the headline picture for THIS file.
- *     3. GUIDED TUTORIAL T1..T12 — twelve mini-lessons centred on
- *        Parseval's theorem and the convergence-tier story.  Each
- *        ends in pseudocode that maps to a function in §4..§13.
- *     4. §1 config — the knobs.
- *     5. §8 dft → §9 epicycle_table → §11 scene_state → §13 scene_tick
- *        — the algorithm pipeline, in execution order.
- *     6. §5 shape_samplers — the 21 parametric formulas.  Browse,
- *        don't read linearly; group preambles tell you what each
- *        family teaches.
- *     7. §15 draw_layers + §16 hud_energy — rendering plumbing.
- *     8. §17..§18 — ncurses + main loop.
- *
- *   Reader who already knows DFT and epicycle chains:
- *     §1, §5 (skim), §9 (cumulative energy table is the unique bit),
- *     §13 scene_tick, §16 hud_energy.  The rest is scaffolding
- *     shared with epicycles.c.
- *
- * Naming convention
- *   File-scope globals carry the `g_` prefix.  Variable names spell
- *   out the math whenever a short name would hide what's happening:
- *
- *     g_epicycle_table[i]            sorted (amp, phase, freq) records
- *     g_total_epicycle_count         always = N_SAMPLES after build
- *     g_active_epicycle_count        arms currently animated (1..N)
- *     g_cumulative_energy_fraction[k] Parseval power captured by first k arms
- *     g_total_signal_energy          sum of |Z[n]|^2 (Parseval invariant)
- *     g_animation_phase_radians      phi — global animation angle
- *     g_pivot_pixel_x / _y           chain origin in pixel space
- *     g_pixel_scale                  normalised → pixel multiplier
- *     g_joint_pixel_x[i]             i-th chain joint in pixel space
- *     g_resampled_source[N]          N complex samples used by DFT (= ghost)
- *
- *   Inside tight loops (`i`, `j`, `k`, `n` for counters; `dx`, `dy`
- *   for pixel deltas) single letters stay short.
- *
- * Background you NEED
- *   - The DFT formula at the level of "X[k] is a weighted sum of
- *     inputs".  See dft_helloworld.c CONCEPTS or any DSP textbook.
- *   - Basic complex arithmetic.  We use a 2-float Cplx struct and
- *     spell out re/im operations directly (no <complex.h>).
- *   - The "epicycle chain" idea: each output bin Z[n] decodes into
- *     one rotating arm.  Detailed in epicycles.c T7-T8.
- *
- * Background you do NOT need
- *   - The Fast Fourier Transform.  We use the textbook O(N^2) DFT
- *     with the twiddle recurrence; N = 256 keeps the per-shape cost
- *     under a millisecond and we only run it ONCE per shape change.
- *   - Continuous calculus.  Everything is finite sums.
- *   - Detailed signed-frequency derivation.  See epicycles.c T8.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * What this file demonstrates, in one sentence
- *   PARSEVAL'S THEOREM, made visceral: take any closed 2-D shape,
- *   decompose it into rotating arms via DFT, sort by amplitude, and
- *   watch the cumulative energy fraction climb to 100% as you add
- *   arms one at a time.  Different shapes climb at different rates;
- *   the rate IS the shape's complexity.
- *
- * Algorithm
- *   ONCE per shape change (n / p / r):
- *     1. Sample the chosen parametric formula at N evenly-spaced
- *        parameter values to get N complex points.
- *     2. Compute the O(N^2) DFT with the twiddle recurrence (one
- *        cos+sin per output bin, then complex multiplies).
- *     3. Decode each Z[n] into (amplitude, phase, signed_frequency).
- *     4. qsort by amplitude DESCENDING — this is what makes the
- *        partial sums ENERGY-OPTIMAL.
- *     5. Pre-compute the cumulative-energy table:
- *          cumulative[k] = (sum_{i <= k} |amp_i|^2) / total_energy
- *        The HUD's energy bar reads cumulative[active_count - 1].
- *
- *   EVERY frame (60 times a second):
- *     6. Maybe auto-add one arm (every AUTO_ADD_FRAMES frames).
- *     7. Advance global animation phase phi by 2*pi / CYCLE_FRAMES.
- *     8. Walk the active arms, accumulating tip position from pivot.
- *     9. Push the final tip into the trail ring buffer.
- *    10. Render layered scene: ghost → orbits → trail → chain →
- *        markers → energy bar → HUD.
- *
- * Math
- *   PARSEVAL'S THEOREM (the unique pedagogy here):
- *     sum_{n=0..N-1} |x[n]|^2  =  (1/N) * sum_{n=0..N-1} |Z[n]|^2
- *   In words: total signal power equals total spectrum power.  After
- *   normalising amp_n = |Z[n]| / N this becomes:
- *     average sample power = sum_n amp_n^2
- *   So sorting epicycles by amp DESCENDING and summing amp^2 gives
- *   the largest possible captured energy at every cutoff M — which is
- *   exactly what the energy bar plots.
- *
- * Performance / boundaries
- *   - DFT cost: O(N^2) ONCE per shape change.  At N = 256 → ~65k
- *     complex multiplies, well under a millisecond.
- *   - Per-frame cost: O(M) chain walk + O(L) trail render.  Holds
- *     30 fps trivially.
- *   - No malloc on the hot path.  All buffers sized at compile time.
- *   - 21 shapes × 10 themes = 210 visual variants, all from one demo.
- *
- * Rendering
- *   Pixel-space simulation, cell-space draw.  The chain math runs in
- *   sub-cell pixel coordinates so arm endpoints don't snap to grid;
- *   conversion happens at one point per draw call (px_cx / px_cy).
- *   Six layered passes per frame: ghost → orbit guides → trail →
- *   arm chain → pivot/tip markers → HUD with energy bar.
- *
- * References
- *   Parseval, M.-A. (1799), "Mémoire sur les séries et sur
- *     l'intégration complète d'une équation aux différences partielles
- *     linéaire du second ordre, à coefficients constants."  The
- *     original paper introducing what we now call Parseval's theorem.
- *   3Blue1Brown, "But what is a Fourier series? From heat flow to
- *     drawing with circles", YouTube — the popular intro that put
- *     epicycles into the mainstream.  Watch first if new to this.
- *   Cooley & Tukey (1965), "An Algorithm for the Machine Calculation
- *     of Complex Fourier Series", Math. Comp. 19, 297-301.
- *   Smith, S. W., "The Scientist and Engineer's Guide to DSP",
- *     Chapter 8 (DFT) and Chapter 12 (FFT).  Free online.
- *   https://en.wikipedia.org/wiki/Parseval%27s_theorem
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- *   Every closed 2-D shape is a sum of N integer-rate rotations
- *   (the DFT).  Parseval's theorem says the TOTAL ENERGY of the
- *   shape equals the SUM of |amplitude|^2 over those rotations.
- *   Sort the rotations by amplitude descending and you have the
- *   energy-optimal partial reconstruction at every cutoff M.
- *
- *   This file animates that partial reconstruction, with a literal
- *   energy bar that ratchets from 0% to 100% as M grows.  The bar's
- *   speed-of-fill IS the shape's complexity.  Smooth shapes
- *   (Lissajous, hypotrochoid) fill the bar to 100% by M = 4.  Sharp
- *   shapes (Square, Lightning) trickle for 60+ arms before the bar
- *   reaches 95%.  Cycle through the 21 shapes and you are taking
- *   a guided tour through "what kinds of curves are easy or hard
- *   for Fourier reconstruction".
- *
- * HOW TO THINK ABOUT IT
- *   Imagine a sculptor blocking out a marble statue.  The biggest
- *   chisel does the rough cut — gets you to "vaguely human-shaped"
- *   in one stroke.  Each smaller chisel adds finer detail.  The
- *   energy bar is "how much marble has been carved".
- *
- *     A SMOOTH PEBBLE: one big chisel does 100% of the work.  Bar
- *     pops to green at M = 1 or 2.
- *
- *     A FOREARM AND HAND: the rough shape is most of the silhouette;
- *     fingers are fine details.  Bar reaches yellow (~70%) by M = 5
- *     and creeps green (~95%) by M = 30.
- *
- *     A LACE DOILY: every chisel matters.  Bar is still red (< 50%)
- *     at M = 30 and only reaches green at M = 100+.
- *
- *   The Fourier basis (rotations sorted by amplitude) is the
- *   GREEDY-OPTIMAL choice of chisels — at every cutoff M, no other
- *   M-rotation chain captures more energy.  Parseval guarantees this.
- *
- *      ┌────────────────────────────────────────────────────────────┐
- *      │                                                            │
- *      │   ENERGY BAR  (the headline visual):                       │
- *      │                                                            │
- *      │     [================================------]   97.4%       │
- *      │      ▲ green = >= 80%                                       │
- *      │                                                            │
- *      │     [============================------------]   65.2%     │
- *      │      ▲ yellow = 50..80%                                     │
- *      │                                                            │
- *      │     [====================----------------------]   38.1%   │
- *      │      ▲ red = < 50%                                          │
- *      │                                                            │
- *      │     Filled portion = sum(amp^2)/total for first M arms.    │
- *      │                                                            │
- *      └────────────────────────────────────────────────────────────┘
- *
- * ALGORITHM IN STEPS  (bird's-eye view)
- *
- *   At shape change ('n' / 'p' / 'r'):
- *     1. Sample the shape's parametric formula at N=256 points.
- *     2. Run O(N^2) DFT.
- *     3. Decode each Z[n] into Epicycle{amp, phase, freq_signed}.
- *     4. qsort the table by amp DESCENDING.
- *     5. Pre-compute g_cumulative_energy_fraction[k] for every k.
- *
- *   At every frame:
- *     6. Maybe auto-add one arm.
- *     7. Advance phi.
- *     8. Walk active arms, write joint positions in pixel space.
- *     9. Push tip into trail ring.
- *    10. Render layers + HUD + energy bar.
- *
- * KEY FORMULAS
- *
- *   Sampling the chosen shape:
- *     z[k] = (x(t_k), y(t_k))  for k = 0..N-1, t_k = 2*pi*k/N
- *     (some shapes use a longer period; see hypotrochoid §4)
- *
- *   Forward DFT (computed by §8):
- *     Z[n] = sum_{k=0..N-1}  z[k] * exp(-i * 2*pi * n * k / N)
- *
- *   Per-arm decoding:
- *     amp_n   = |Z[n]| / N
- *     phase_n = arg(Z[n])
- *     freq_n  = (n <= N/2) ? n : n - N    (signed frequency)
- *
- *   Tip position at animation phase phi:
- *     z(phi) = sum_{i=0..M-1}  amp_i * exp(i * (freq_i * phi + phase_i))
- *
- *   Parseval's theorem (the unique formula here):
- *     sum_{n=0..N-1} |x[n]|^2  =  (1/N) * sum_{n=0..N-1} |Z[n]|^2
- *     equivalently:
- *     mean_sample_power  =  sum_n amp_n^2
- *
- *   Cumulative energy fraction (the HUD energy bar):
- *     g_total_signal_energy        = sum_n amp_n^2
- *     g_cumulative_energy_fraction[k] = (sum_{i <= k} amp_i^2)
- *                                     / g_total_signal_energy
- *     The bar reads g_cumulative_energy_fraction[active_count - 1].
- *
- *   Animation step (one degree per frame at default 360-frame cycle):
- *     phi <- phi + 2*pi / CYCLE_FRAMES
- *
- *   Cell-aspect orbit ellipse (rendering):
- *     a_cells = radius_pixels / CELL_W
- *     b_cells = radius_pixels / CELL_H
- *     CELL_H = 2 * CELL_W (terminal cells are twice as tall as wide)
- *
- * EDGE CASES TO WATCH
- *   - The DC bin Z[0] is the sum of samples.  After dividing by N
- *     it's the centroid of the curve.  If the centroid is far from
- *     the origin (e.g. cardioid) Z[0] is large and dominates the
- *     sorted order — its amp^2 alone can be >50% of total energy.
- *   - For real-valued samples (always the case here?  No — z[k] is
- *     COMPLEX because each shape is a 2-D point packed as x + i*y),
- *     the DFT output is NOT conjugate-symmetric.  Both positive and
- *     negative signed frequencies carry independent information.
- *     This is why we draw arms at signed frequencies (T8 in
- *     epicycles.c).
- *   - Auto-add timing: AUTO_ADD_FRAMES = 8 frames at 30 fps = ~0.27 s
- *     per arm.  256 arms total → ~68 seconds for the full ramp.
- *   - Resize triggers a full scene_init which calls scene_reset(0).
- *     You LOSE your current shape selection on resize.
- *   - Energy bar at M = 0 reads 0% (we explicitly clamp to avoid
- *     accessing g_cumulative_energy_fraction[-1]).
- *
- * HOW TO VERIFY
- *   - Default shape is Square (slow tier).  Energy bar at M = 1
- *     should be small (~50%); at M = 10 it grows to maybe ~85%; at
- *     M = 50 it reaches green (~95%).  At M = 256 it's exactly 100%.
- *   - Press 'n' eight times to reach Lissajous 7:3.  Energy bar
- *     should slam to green at M = 4 — the "4 dominant bins" claim
- *     in T8 made physical.
- *   - Press 'g' to flip ghost overlay off.  The ":" lattice
- *     disappears.  The trail and chain remain.
- *   - Press 'c' to flip orbit circles off.  Faint dotted ellipses
- *     disappear.
- *   - Press 't' to cycle themes.  Arm/trail/orbit colours change;
- *     HUD stays bright yellow (theme-invariant).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ──────────────────────────────────────────────────── *
- *
- *   T1   What is the headline?  (Parseval = greedy-optimal energy)
- *   T2   Parseval's theorem — total energy is preserved
- *   T3   Sorting by amplitude is the energy-optimal greedy choice
- *   T4   The energy bar — what it shows, what it means
- *   T5   Convergence tiers — the catalog as PEDAGOGY
- *   T6   Polygonal shapes (Square, Arrow, Star, Lightning) and Gibbs
- *   T7   Smooth shapes (Cardioid, Lissajous, Hypotrochoid)
- *   T8   Cusped shapes (Deltoid, Hypocycloid, Rose) and medium decay
- *   T9   Compound curves and DFT linearity
- *   T10  Closed spiral — periodicity violation made visible
- *   T11  Per-frame pipeline (when shape changes vs every frame)
- *   T12  Layered rendering — ghost / orbits / trail / chain / energy bar
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  WHAT IS THE HEADLINE?
- * ─────────────────────────
- * Three sibling files in this directory animate the SAME idea:
- * "decompose a 2-D shape into rotating arms via DFT".  What makes
- * this file unique is the ENERGY BAR — a literal progress meter that
- * reads "how complete is the reconstruction, from a power-spectral
- * point of view".
- *
- * The bar is grounded in Parseval's theorem (T2): the sum of
- * |amplitude|^2 over all arms equals the total signal energy.  Sort
- * the arms by amplitude descending (T3) and the partial sum at
- * every cutoff M is the LARGEST POSSIBLE — no other M-arm chain
- * captures more energy.  So the bar's reading is mathematically
- * meaningful: it's "you've accomplished X percent of what's
- * physically possible with M arms".
- *
- * Cycle the 21 shapes ('n' / 'p') and the bar tells different
- * stories.  Some shapes ('Lissajous 7:3') slam the bar to 100% at
- * M = 4.  Others ('Lightning', 'Square') keep the bar in the red
- * zone past M = 30.  The catalog is engineered to span all three
- * tiers — Fast (green by M = 6), Med (~85% by M = 10), Slow (still
- * crawling at M = 30).
- *
- * T2  PARSEVAL'S THEOREM — TOTAL ENERGY IS PRESERVED
- * ──────────────────────────────────────────────────
- * The discrete Fourier transform is unitary up to a scale factor.
- * Concretely:
- *
- *   sum_{n=0..N-1} |x[n]|^2  =  (1/N) * sum_{n=0..N-1} |Z[n]|^2
- *
- * Read it: total power computed in the time domain (left side)
- * equals total power computed in the frequency domain (right side,
- * with a 1/N normaliser).  The DFT is just a CHANGE OF BASIS — it
- * rearranges the energy, doesn't destroy or create any.
- *
- * In our notation we use amp_n = |Z[n]| / N, so:
- *
- *   total_energy = sum_n amp_n^2 = mean_sample_power
- *
- * Pre-computing this once per shape gives us the denominator for
- * the energy bar.  Pre-computing the running sum gives us the
- * numerator at every M.  The ratio is what the bar plots.
- *
- * Why does the energy bar matter?  Because magnitude alone does
- * not tell you "how good is my reconstruction".  Two shapes can
- * both have a "first arm" of amp = 0.5 — but for one that arm
- * captures 90% of total energy (smooth), for the other it captures
- * 30% (sharp).  The bar gives you the absolute scale.
- *
- * T3  SORTING BY AMPLITUDE IS THE ENERGY-OPTIMAL GREEDY CHOICE
- * ────────────────────────────────────────────────────────────
- * Suppose we have N candidate arms, each with energy amp_i^2, and
- * we can pick exactly M of them.  Question: which M arms maximise
- * captured energy?
- *
- * Answer: the M with the largest amp values.  This is trivial to
- * prove — the sum of top-M is by construction the largest M-element
- * subset sum of any selection.  The greedy "pick the biggest first"
- * is provably optimal here.
- *
- * For Fourier reconstruction this becomes: sort arms by amp
- * DESCENDING, then animate the first M.  The chain at every M is
- * the energy-optimal M-arm reconstruction of the shape.  Adding
- * the (M+1)-th arm is guaranteed to capture the next-largest
- * contribution.
- *
- * Note: "energy-optimal" is not the same as "VISUALLY closest".
- * For some shapes a small high-frequency arm matters more for the
- * eye than a larger low-frequency one.  But for the headline metric
- * (total power captured), greedy by amp wins, and that's what
- * Parseval lets us track exactly.
- *
- * T4  THE ENERGY BAR — WHAT IT SHOWS, WHAT IT MEANS
- * ─────────────────────────────────────────────────
- * The bar at the top of the screen is a fixed-width horizontal
- * meter.  Its filled portion shows the captured energy fraction:
- *
- *     g_cumulative_energy_fraction[active_count - 1]
- *
- * which equals
- *
- *     (sum_{i = 0..active_count - 1} amp_i^2) / total_signal_energy
- *
- * Range: [0.0, 1.0].  The bar's COLOUR encodes the value:
- *
- *     >= 80%   green   "essentially complete"
- *     50..80%  yellow  "shape is recognisable"
- *      < 50%   red     "broad strokes only"
- *
- * The bar updates LIVE as you press '+' / '-' or as auto-add
- * inches active_count up.
- *
- * Practical reading:
- *   - If the bar JUMPS to green at M = 1 or 2, the shape is
- *     dominated by one or two pure tones.  Lissajous 3:2 does this.
- *   - If the bar takes 30+ arms to reach green, the shape has
- *     significant high-frequency content (sharp corners, cusps,
- *     discontinuities).  Square, Lightning, Gear are like this.
- *
- * The bar is the cleanest answer to "have I added enough arms?".
- *
- * T5  CONVERGENCE TIERS — THE CATALOG AS PEDAGOGY
- * ───────────────────────────────────────────────
- * The 21 shapes are deliberately partitioned into three tiers:
- *
- *   FAST  (9 shapes, energy bar fills to ~100% in <= 6 arms):
- *     Cardioid, Lissajous 3:2, 5:4, 7:3, 11:7, Hypotrochoid 5:3,
- *     Hypotrochoid 7:4, Epitrochoid 3:1, Compound spiro.
- *
- *   MED   (7 shapes, ~85% by M = 10, slow tail of cusps):
- *     Star-7, Deltoid, Hypocycloid 5, Crescent, Rose r=cos(2t),
- *     Beaded circle, Torus knot 2:5.
- *
- *   SLOW  (5 shapes, energy keeps trickling for many arms):
- *     Square, Arrow, Gear 8-tooth, Lightning, Closed spiral.
- *
- * The HUD tier chip — e.g. "[Fast 5/9]" — tells you which tier the
- * current shape belongs to and where you are within that tier.
- * Cycling 'n' walks through the catalog in numbered order; cycling
- * with the tier chip in mind lets you sample one shape from each
- * tier and compare bar speeds directly.
- *
- * Why the tiers?  Because Fourier convergence rate is a real
- * mathematical property of a curve — smooth-everywhere curves have
- * EXPONENTIALLY decaying coefficients, curves with cusps decay only
- * POLYNOMIALLY, curves with discontinuities (Gibbs phenomenon)
- * decay even slower with persistent ringing.  The tiers materialise
- * this hierarchy as something you can SEE.
- *
- * T6  POLYGONAL SHAPES AND GIBBS
- * ──────────────────────────────
- * Square, Arrow, Star-7, Lightning are all defined as polygons —
- * sequences of vertices connected by straight chords.  These have
- * SHARP CORNERS where the curve's direction changes discontinuously.
- *
- * Sharp corners are the worst case for Fourier reconstruction.  A
- * partial Fourier sum near a corner OVERSHOOTS by ~9% of the jump
- * height (the universal Gibbs constant), regardless of how many
- * terms you add — the overshoot does not vanish in the limit.
- * Visible as little bumps just outside each corner of the trail.
- *
- * In energy terms: corner energy is spread across many high-
- * frequency bins.  Each bin's amp is small but there are many of
- * them.  The energy bar climbs slowly as you add arms.  At M = 30
- * you might be at 85%; the remaining 15% lives in the long tail
- * of small bins.
- *
- * Try:
- *   - Press 'n' to Square.  At M = 5 the trail looks like a
- *     rounded blob; the energy bar reads ~85%.  At M = 30 the
- *     corners are visible but with Gibbs ringing; bar reads ~92%.
- *     At M = 100+ the corners are crisp; bar reads ~98%.
- *   - 'n' to Lightning.  Even slower convergence — the 7-vertex
- *     zigzag has many sharp corners.  Bar at M = 30 might still
- *     be in the yellow zone.
- *
- * T7  SMOOTH SHAPES AND RAPID CONVERGENCE
- * ───────────────────────────────────────
- * Cardioid, Lissajous variants, hypotrochoid, epitrochoid are all
- * SMOOTH everywhere — infinitely differentiable, no corners.  Their
- * Fourier coefficients decay exponentially.  The energy bar slams
- * to green almost immediately.
- *
- * Special cases worth knowing:
- *
- *   LISSAJOUS curves are parametric pure tones:
- *     x(t) = sin(a*t + phase)
- *     y(t) = sin(b*t)
- *   With INTEGER a and b the curve closes after one parameter
- *   period.  The DFT spectrum has just FOUR non-zero bins — at
- *   signed frequencies ±a and ±b.  Energy bar goes from 0 to 100%
- *   at M = 4, full stop.  Try Lissajous 11:7 — visually intricate,
- *   spectrally trivial.
- *
- *   HYPOTROCHOIDS / EPITROCHOIDS are spirograph rosettes:
- *     x(t) = (R±r) cos(t) ∓ d cos((R±r)/r * t)
- *     y(t) = (R±r) sin(t) -  d sin((R±r)/r * t)
- *   These are SUMS of two circular motions.  Spectrum has just TWO
- *   non-zero rotation rates (the two integer ratios).  Energy bar
- *   reaches 100% at M = 4 (positive and negative pairs of each).
- *   The intricate visual rosette is a sum of two simple rotations.
- *
- * T8  CUSPED SHAPES AND MEDIUM DECAY
- * ──────────────────────────────────
- * Deltoid, Hypocycloid 5, Rose r=cos(2t), Crescent are SMOOTH
- * almost everywhere but have CUSPS — points where the curve
- * touches itself or comes to a sharp point with zero "smoothness"
- * in the local geometry.
- *
- * Cusps are intermediate between corners (worst case) and smooth
- * curves (best case).  Fourier coefficients decay polynomially,
- * typically as 1/n^2.  Energy reaches ~85% in 10 arms but the last
- * 10-15% comes slowly.
- *
- * Special: SHAPES WITH N-FOLD ROTATIONAL SYMMETRY have spectra that
- * are non-zero only at multiples of N.  Deltoid (3-fold symmetry)
- * has dominant energy at signed bins ±2 and ±4.  Hypocycloid 5
- * (5-fold) has dominant bins at ±4 and ±6.  This is why the energy
- * bar climbs in BIG STEPS instead of smoothly — every time you
- * add a "useful" bin, the bar jumps up; in between are bins with
- * essentially zero amp and the bar barely moves.
- *
- * T9  COMPOUND CURVES AND DFT LINEARITY
- * ─────────────────────────────────────
- * Compound spiro is the SUM of two hypotrochoids that share the
- * same closing period.  Each individually is a 2-bin spectrum;
- * their sum is a 4-bin spectrum.
- *
- *   DFT(x_A + x_B) = DFT(x_A) + DFT(x_B)
- *
- * This is "DFT is a linear operator" — adding two curves in the
- * time domain is the same as adding their spectra.  The energy bar
- * for compound spiro reaches 100% at M = 4 (the union of the two
- * hypotrochoids' bin sets).
- *
- * Beaded circle is similar: a circle (2 bins) plus a small high-
- * frequency wobble (2 more bins).  Total: 4 bins.  Energy bar
- * jumps to 100% at M = 4.
- *
- * Torus knot 2:5 is a non-trivial CLOSED knot in 3-D, projected to
- * 2-D.  Its parametric form r(t)*(cos(qt), sin(qt)) where r(t) =
- * p + cos(qt) blends a p-revolution carrier with q-fold modulation.
- * Spectrum: just three signed bins (±p, ±(q-p), ±(q+p)).
- *
- * T10 CLOSED SPIRAL — PERIODICITY VIOLATION
- * ─────────────────────────────────────────
- * The Archimedean spiral r(t) = a*t is NOT a closed curve.  We
- * close it artificially by appending a straight chord from the
- * outer end back to the origin.  The result is "smooth + a sharp
- * corner where the closing chord meets the spiral end".
- *
- * This violates the DFT's implicit periodicity assumption (the N
- * samples should look like one period of an infinitely-repeating
- * signal, but the closing chord is a discontinuity).  Energy bar
- * climbs slowly — it's a smooth-looking shape that fools the eye
- * into expecting fast convergence, but the closing chord behaves
- * like a sharp corner spectrally.
- *
- * This is the "always close your curves smoothly" lesson made
- * concrete.  Compare to Cardioid (genuinely smooth, periodic; bar
- * jumps to 100% at M = 5) — same visual quietness, opposite
- * convergence story.
- *
- * T11 PER-FRAME PIPELINE (WHEN SHAPE CHANGES VS EVERY FRAME)
- * ──────────────────────────────────────────────────────────
- * The DFT and energy table are computed ONCE per shape change, not
- * per frame.  This separation is critical for performance — at
- * N = 256 the DFT alone is ~65,000 complex multiplies, which would
- * eat the frame budget if done every render cycle.
- *
- * SHAPE-CHANGE PATH (n / p / r):
- *   1. sample_path(shape_idx, ghost) — fill 256 complex samples
- *   2. compute_dft(ghost, dft) — O(N^2)
- *   3. Decode Z[n] -> Epicycle{amp, phase, freq} for n = 0..N-1
- *   4. qsort by amp descending
- *   5. Compute g_cumulative_energy_fraction[k] for k = 0..N-1
- *   6. Reset trail, set active_count = 1, phi = 0
- *
- * PER-FRAME PATH (every render cycle):
- *   1. Maybe auto-add (every AUTO_ADD_FRAMES frames)
- *   2. phi += 2*pi / CYCLE_FRAMES
- *   3. Walk active arms, compute joint positions
- *   4. Push tip into trail ring
- *   5. Render ghost / orbits / trail / chain / markers / energy bar
- *
- * The shape change feels instant because the DFT runs in well
- * under a millisecond at N = 256.  At larger N (say N = 4096) it
- * would feel laggy — and that's where the FFT (signal/fft_vis.c)
- * becomes essential.
- *
- * T12 LAYERED RENDERING
- * ─────────────────────
- * Each frame paints six layers in back-to-front order.  Each layer
- * overwrites the previous in any cells they share — last writer
- * wins per cell, no blending:
- *
- *   1. GHOST overlay      faint ':' at projected source samples
- *   2. ORBIT circles      faint '.' at orbit guide ellipses
- *   3. TRAIL              fading '*' from oldest to newest tip path
- *   4. ARM CHAIN          Bresenham '-', '|', '/', '\' along arms
- *   5. MARKERS            '@' at tip, '+' at pivot
- *   6. HUD + ENERGY BAR   always last; bright yellow + bold
- *
- * Layer 1 (ghost) sits at the BACK because it's the static "target"
- * — every other layer is allowed to obscure it.  The energy bar is
- * the LAST element rendered, on the fixed top-right HUD line, never
- * obscured by anything.  This ordering means the most informative
- * content is always on top.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -677,90 +29,72 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config — every constant + enum lives here                         */
-/* ===================================================================== */
+/* ── §1  config — the knobs ── */
 
-#define N_SAMPLES 256 /* DFT input size; also max epicycles    */
-#define TRAIL_LEN 512 /* tip-trail ring buffer                  */
+#define N_SAMPLES 256 /* points sampled per shape; also the max arm count   */
+#define TRAIL_LEN 512 /* how many past tip positions the trail remembers    */
 #define RENDER_FPS 30
 #define RENDER_NS (1000000000LL / RENDER_FPS)
-#define CYCLE_FRAMES 360  /* frames per full reconstruction cycle   */
-#define AUTO_ADD_FRAMES 8 /* frames between auto-adding one arm     */
-#define N_CIRCLES 5       /* max orbit-guide rings drawn            */
-#define SHAPE_SCALE 0.38f /* fraction of min(pw, ph)/2 used as size */
-#define CELL_W 8          /* sub-pixels per terminal column         */
-#define CELL_H 16         /* sub-pixels per terminal row            */
+#define CYCLE_FRAMES 360  /* frames it takes the chain to trace once around */
+#define AUTO_ADD_FRAMES 8 /* frames between auto-added arms                  */
+#define N_CIRCLES 5       /* most orbit guide rings drawn at once            */
+#define SHAPE_SCALE 0.38f /* how big the shape is, as a slice of the screen  */
+#define CELL_W 8          /* a terminal cell is this many pixels wide        */
+#define CELL_H 16         /* and this many tall (so cells are 2x taller)     */
 
-/* Colour pair IDs.  HUD/HINT/ENERGY tiers are theme-INVARIANT per
- * CLAUDE.md HUD Standard, so the status bar and Parseval bar are
- * always legible regardless of the active animation theme. */
+/* Colour-pair slots. The first ten change with the theme; the last five
+ * (HUD/hint/energy bar) stay fixed so they're always readable. */
 enum {
-  /* themable animation pairs (10) */
-  CP_ARM_HI = 1,  /* large-amplitude arm                          */
-  CP_ARM_MID = 2, /* medium arm                                    */
-  CP_ARM_LO = 3,  /* tiny arm                                      */
-  CP_CIRCLE = 4,  /* orbit ring dots                               */
-  CP_TRAIL_1 = 5, /* trail newest                                  */
-  CP_TRAIL_2 = 6, /* trail mid                                     */
-  CP_TRAIL_3 = 7, /* trail oldest                                  */
-  CP_BOB = 8,     /* tip dot                                       */
-  CP_PIVOT = 9,   /* pivot marker                                  */
-  CP_GHOST = 10,  /* ghost source-sample dots                      */
-  /* theme-invariant pairs (5) */
-  CP_HUD = 11,        /* HUD top status — bright yellow + bold         */
-  CP_HINT = 12,       /* bottom hint    — bright cyan   + bold         */
-  CP_ENERGY = 13,     /* energy bar tier — green (>= 80%)               */
-  CP_ENERGY_MID = 14, /* energy bar tier — yellow (50..80%)             */
-  CP_ENERGY_LO = 15,  /* energy bar tier — red    (< 50%)               */
+  CP_ARM_HI = 1,  /* big arm     */
+  CP_ARM_MID = 2, /* medium arm  */
+  CP_ARM_LO = 3,  /* tiny arm    */
+  CP_CIRCLE = 4,  /* orbit rings */
+  CP_TRAIL_1 = 5, /* trail, newest */
+  CP_TRAIL_2 = 6, /* trail, middle */
+  CP_TRAIL_3 = 7, /* trail, oldest */
+  CP_BOB = 8,     /* tip marker   */
+  CP_PIVOT = 9,   /* centre marker */
+  CP_GHOST = 10,  /* faint target-shape dots */
+  CP_HUD = 11,        /* top status line */
+  CP_HINT = 12,       /* bottom key hints */
+  CP_ENERGY = 13,     /* bar when nearly done   (>= 80%) */
+  CP_ENERGY_MID = 14, /* bar when recognisable  (50..80%) */
+  CP_ENERGY_LO = 15,  /* bar when rough         (< 50%) */
 };
 
-/* ===================================================================== */
-/* §2  clock — monotonic ns timer + sleep                                */
-/* ===================================================================== */
+/* ── §2  clock — a steady nanosecond timer and a sleep ── */
 
 static long long clock_ns(void) {
-  /* Purpose : monotonic clock in ns.  Used by the main loop to
-   *           figure out how long to sleep before the next frame. */
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
 static void clock_sleep_ns(long long ns) {
-  /* Block for `ns` nanoseconds.  Without this, the main loop would
-   * spin a CPU at 100% just to redraw 30 times a second. */
+  /* The pause that keeps us at 30 fps instead of pinning a CPU core. */
   if (ns <= 0)
     return;
   struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
   nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  themes — palette table (10 themes) + apply_theme + init           */
-/* ===================================================================== */
-/*
- * Ten palettes, ten themable animation pairs each.  HUD/HINT/ENERGY
- * pairs are theme-invariant and bound separately in color_init.
- *
- * All entries chosen from the BRIGHT half of the 256-colour cube
- * (>= 24 in the cube, >= 240 in the greyscale ramp).  Codes 16-23
- * in the cube and 232-239 in greyscale are visually indistinguishable
- * from black with A_DIM and would disappear.
- *
- * Each theme also carries 8-colour fallbacks for terminals without
- * extended palette support.
- */
+/* ── §3  themes — the colour palettes you cycle with t / T ── */
 
+/*
+ * One colour scheme for the animation. Every colour comes in two flavours:
+ * a rich 256-colour version and a plain 8-colour fallback for old
+ * terminals. We deliberately avoid the darkest codes (16-23 and 232-239)
+ * because they look like black and vanish on screen.
+ */
 typedef struct {
   const char *name;
-  /* 256-colour foregrounds */
-  short arm_hi, arm_mid, arm_lo;
-  short circle;
-  short trail_1, trail_2, trail_3;
-  short bob, pivot;
-  short ghost;
-  /* 8-colour fallbacks */
+  /* 256-colour version: one foreground colour per thing we draw */
+  short arm_hi, arm_mid, arm_lo; /* the three arm-size buckets   */
+  short circle;                  /* orbit guide rings            */
+  short trail_1, trail_2, trail_3; /* trail, newest to oldest    */
+  short bob, pivot;                /* tip marker, centre marker  */
+  short ghost;                     /* faint target-shape dots    */
+  /* 8-colour fallback: same things, basic colours */
   short arm_hi8, arm_mid8, arm_lo8;
   short circle8;
   short trail_1_8, trail_2_8, trail_3_8;
@@ -840,11 +174,8 @@ static const Theme k_themes[N_THEMES] = {
 
 static int g_active_theme_index = 0;
 
-/*
- * apply_theme — rebind the 10 themable animation pairs to a theme's
- * palette.  HUD / HINT / ENERGY pairs are NOT touched here so the
- * status bar and Parseval bar stay legible across all themes.
- */
+/* Repaint the animation colours from theme `idx`; leaves the HUD/energy
+ * colours alone so they stay readable no matter the theme. */
 static void apply_theme(int idx) {
   if (idx < 0 || idx >= N_THEMES)
     idx = 0;
@@ -874,11 +205,7 @@ static void apply_theme(int idx) {
   }
 }
 
-/*
- * color_init — bind theme-invariant pairs once at startup, then
- * apply default theme.  Subsequent theme changes go through
- * apply_theme and leave HUD/HINT/ENERGY tiers alone.
- */
+/* Set up the fixed HUD/energy colours once, then load the first theme. */
 static void color_init(void) {
   start_color();
   use_default_colors();
@@ -898,18 +225,16 @@ static void color_init(void) {
   apply_theme(0);
 }
 
-/* ===================================================================== */
-/* §4  shape_helpers — gcd, polygon, hypotrochoid, epitrochoid           */
-/* ===================================================================== */
+/* ── §4  shape helpers — building blocks the shape catalog reuses ── */
 
+/* A 2-D point, stored as a complex number: re is x, im is y. Packing
+ * the point this way lets the DFT treat the whole shape as one signal. */
 typedef struct {
   float re, im;
 } Cplx;
 
-/*
- * gcd_int — Euclid's algorithm.  Used by hypotrochoid / epitrochoid
- * to compute their closing period: 2*pi * r / gcd(R, r).
- */
+/* Greatest common divisor. Spirograph shapes use it to find how many
+ * times the small gear must go round before the pen returns home. */
 static int gcd_int(int a, int b) {
   while (b) {
     int t = b;
@@ -919,22 +244,8 @@ static int gcd_int(int a, int b) {
   return a;
 }
 
-/*
- * sample_poly — linearly interpolate around a polygon with `nv`
- * vertices, producing N evenly-spaced complex points along the
- * boundary.
- *
- * Pseudocode:
- *   for i in 0..N-1:
- *     t        = i / N * nv
- *     seg      = floor(t) mod nv
- *     fraction = t - floor(t)
- *     out[i]   = lerp(v[seg], v[seg+1 mod nv], fraction)
- *
- * Sharp vertices in the polygon will produce Gibbs ringing in the
- * Fourier reconstruction — see T6.  Used by Square, Arrow, Star-7,
- * Lightning.
- */
+/* Walk evenly around a polygon's outline and drop N points along it.
+ * Its sharp corners are what make polygon shapes slow to reconstruct. */
 static void sample_poly(const float *vx, const float *vy, int nv, Cplx *out,
                         int N) {
   for (int i = 0; i < N; i++) {
@@ -947,22 +258,10 @@ static void sample_poly(const float *vx, const float *vy, int nv, Cplx *out,
   }
 }
 
-/*
- * sample_hypotrochoid(R, r, d) — tracer point on a small circle of
- * radius `r` rolling INSIDE a fixed circle of radius `R`, with the
- * pen at distance `d` from the rolling-circle centre.  The classic
- * spirograph parametric formula.
- *
- *   x(t) = (R - r) cos(t) + d cos((R - r)/r * t)
- *   y(t) = (R - r) sin(t) - d sin((R - r)/r * t)
- *
- * Closing period: 2*pi * r / gcd(R, r).  We sample N points over
- * the full closed loop; output normalised to fit the unit disc.
- *
- * Spectrum: dominated by just two signed bins (the two integer
- * rotation rates), regardless of how intricate the on-screen
- * rosette looks.  Energy bar fills to ~100% by M = 4.
- */
+/* A spirograph rosette: a pen on a small gear (radius r) rolling INSIDE
+ * a big ring (radius R), pen offset d from the small gear's centre.
+ * However tangled it looks, it's really just two circular motions
+ * added, so a handful of arms reproduce it almost perfectly. */
 static void sample_hypotrochoid(int R, int r, float d, Cplx *out, int N) {
   int reps = r / gcd_int(R, r);
   float period = 2.f * (float)M_PI * (float)reps;
@@ -977,16 +276,9 @@ static void sample_hypotrochoid(int R, int r, float d, Cplx *out, int N) {
   }
 }
 
-/*
- * sample_epitrochoid(R, r, d) — same family but rolling on the
- * OUTSIDE of the fixed circle.
- *
- *   x(t) = (R + r) cos(t) - d cos((R + r)/r * t)
- *   y(t) = (R + r) sin(t) - d sin((R + r)/r * t)
- *
- * Same 2-bin spectral fingerprint as hypotrochoid — yet visually
- * distinct (limaçon-like loops instead of inner rosettes).
- */
+/* Same idea as the hypotrochoid, but the small gear rolls on the
+ * OUTSIDE of the ring. Still two simple rotations added, just with
+ * looping outer petals instead of an inner rosette. */
 static void sample_epitrochoid(int R, int r, float d, Cplx *out, int N) {
   int reps = r / gcd_int(R, r);
   float period = 2.f * (float)M_PI * (float)reps;
@@ -1001,46 +293,16 @@ static void sample_epitrochoid(int R, int r, float d, Cplx *out, int N) {
   }
 }
 
-/* ===================================================================== */
-/* §5  shape_samplers — 21 parametric shape generators                   */
-/* ===================================================================== */
-/*
- *  The 21 shapes live inside a single big switch in §6 sample_path.
- *  This section is just the dispatcher's body, organised by family
- *  so a learner can read them in convergence-tier order.
- *
- *  GROUPS (and the lesson each teaches):
- *    POLYGONAL   — Square, Arrow, Star-7, Lightning.  Sharp corners
- *                  → Gibbs ringing → slow energy convergence.
- *    SMOOTH      — Cardioid, Lissajous variants, Hypotrochoid,
- *                  Epitrochoid.  Smooth-everywhere → exponential
- *                  decay → energy bar slams to green at M = 4-6.
- *    CUSPED      — Deltoid, Hypocycloid 5, Rose, Crescent.  Smooth
- *                  almost everywhere with isolated cusps →
- *                  polynomial decay.  N-fold symmetry → spectral
- *                  combs.
- *    COMPOUND    — Compound spiro, Beaded circle, Torus knot 2:5.
- *                  Sums of simpler curves → DFT linearity → 4-bin
- *                  spectra.
- *    SPECIAL     — Closed spiral.  Periodicity violation made
- *                  visible.
- *    GEAR        — Gear 8-tooth.  Radial AM → many sidebands →
- *                  slow convergence.
- */
+/* ── §5 / §6  the shape catalog — sample_path fills in one shape ── */
 
-/* ===================================================================== */
-/* §6  shape_dispatch — sample_path                                      */
-/* ===================================================================== */
 /*
- *  Purpose         : fill out[0..N-1] with the chosen shape's complex
- *                    samples.  Called ONCE per shape change by §9
- *                    build_epicycles.
- *  Mental model    : a directory of 21 parametric formulas.  Each case
- *                    body is the mathematical definition of one shape,
- *                    transcribed to C.
- *  Why it exists   : isolating the shape catalog from the DFT keeps
- *                    the algorithm reusable — adding a 22nd shape is
- *                    one new case, zero changes elsewhere.
+ * Each case below writes N points of one shape into out[]. They're
+ * grouped by how hard they are to rebuild from arms:
+ *   polygons (sharp corners) are the slowest;
+ *   smooth curves (circles, Lissajous, spirographs) are the fastest;
+ *   cusped and compound curves sit in between.
+ * Keeping the shapes here, apart from the maths, means adding a new one
+ * is just adding a case.
  */
 
 static const char *k_shape_names[] = {
@@ -1060,7 +322,6 @@ static const char *k_shape_names[] = {
     "Gear 8-tooth    ",
     "Crescent        ",
     "Lightning       ",
-    /* +5 patterns each carrying a distinct NEW lesson */
     "Lissajous 11:7  ",
     "Beaded circle   ",
     "Compound spiro  ",
@@ -1073,8 +334,7 @@ static void sample_path(int si, Cplx *out, int N) {
   switch (si) {
 
   case 0: {
-    /* SQUARE — 4 sharp corners.  Polygon family.
-     * Spectrum: Gibbs ringing.  Energy bar climbs slowly. */
+    /* Square. Four sharp corners make it slow to rebuild. */
     static const float sx[] = {-1.f, 1.f, 1.f, -1.f};
     static const float sy[] = {-1.f, -1.f, 1.f, 1.f};
     sample_poly(sx, sy, 4, out, N);
@@ -1082,8 +342,7 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 1: {
-    /* ARROW — 7-vertex polygon (notched tail adds re-entrant
-     * corners).  More corners than Square → slower convergence. */
+    /* Arrow. A 7-corner outline; even slower to rebuild than the square. */
     static const float ax[] = {0.f, .65f, .30f, .30f, -.30f, -.30f, -.65f};
     static const float ay[] = {1.f, .10f, .10f, -.85f, -.85f, .10f, .10f};
     sample_poly(ax, ay, 7, out, N);
@@ -1091,8 +350,7 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 2: {
-    /* 7-POINTED STAR — alternating outer (r=1) and inner (r=0.40)
-     * radii at 14 vertices.  Spiky → many corners → slow convergence. */
+    /* 7-pointed star: 14 corners alternating far out and close in. */
     float vx[14], vy[14];
     for (int i = 0; i < 14; i++) {
       float r = (i % 2 == 0) ? 1.f : 0.40f;
@@ -1105,9 +363,8 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 3: {
-    /* CARDIOID — r = 1 - cos(t) recentered.  Smooth.
-     * Centroid is offset; we subtract it numerically.
-     * Energy bar to 100% at M ≈ 5. */
+    /* Cardioid (heart curve). Smooth, so it rebuilds in a few arms. Its
+     * centre of mass sits off-origin, so we shift it back to centre. */
     float cx = 0.f;
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
@@ -1123,8 +380,8 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 4: {
-    /* LISSAJOUS 3:2 with pi/4 phase offset.  Pure 4-bin spectrum
-     * at signed frequencies ±3 and ±2.  Energy → 100% at M = 4. */
+    /* Lissajous 3:2 — a sine in x against a sine in y. Just two pure
+     * tones, so four arms rebuild it exactly. */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       out[k].re = sinf(3.f * t + (float)M_PI / 4.f);
@@ -1134,8 +391,8 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 5: {
-    /* 4-PETAL ROSE — r = cos(2t).  r goes negative (back-projection);
-     * curve traces all 4 petals over [0, 2*pi].  Cusps at origin. */
+    /* 4-petal rose. The radius dips negative, which folds the curve
+     * back through the centre and traces all four petals. */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       float r = cosf(2.f * t);
@@ -1146,8 +403,7 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 6: {
-    /* LISSAJOUS 5:4 — denser weaving than 3:2.  Spectrum: 4
-     * dominant bins (±5, ±4) → energy 100% at M = 4. */
+    /* Lissajous 5:4 — a denser weave than 3:2, still four arms. */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       out[k].re = sinf(5.f * t + (float)M_PI / 3.f);
@@ -1157,8 +413,7 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 7: {
-    /* LISSAJOUS 7:3 — wider ratio, "flower-like" intersections.
-     * Spectrum: 4 dominant bins (±7, ±3) → energy 100% at M = 4. */
+    /* Lissajous 7:3 — wider ratio, flower-like crossings, still four arms. */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       out[k].re = sinf(7.f * t);
@@ -1168,31 +423,28 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 8: {
-    /* HYPOTROCHOID (R=5, r=3, d=5) — spirograph rosette.
-     * 2-bin spectrum (the two integer rotation rates). */
+    /* Spirograph rosette (gears 5 and 3). */
     sample_hypotrochoid(5, 3, 5.f, out, N);
     break;
   }
 
   case 9: {
-    /* HYPOTROCHOID (R=7, r=4, d=6) — different gear ratio,
-     * more intricate but still 2-bin spectrum. */
+    /* Another spirograph rosette (gears 7 and 4), more intricate. */
     sample_hypotrochoid(7, 4, 6.f, out, N);
     break;
   }
 
   case 10: {
-    /* EPITROCHOID (R=3, r=1, d=2) — limaçon-like outer-rolling
-     * curve.  2-bin spectrum. */
+    /* Outer-rolling spirograph with looping petals. */
     sample_epitrochoid(3, 1, 2.f, out, N);
     break;
   }
 
   case 11: {
-    /* DELTOID — 3-cusp hypocycloid.  R=3, r=1, d=1.
-     * Cusp at every 120° → 3-fold symmetric spectral comb.
+    /* Deltoid: a triangle-ish curve with a sharp point (cusp) at each
+     * of its three corners. Mostly smooth, so it rebuilds at medium speed.
      *   x(t) = (2 cos t + cos 2t) / 3
-     *   y(t) = (2 sin t - sin 2t) / 3                      */
+     *   y(t) = (2 sin t - sin 2t) / 3 */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       out[k].re = (2.f * cosf(t) + cosf(2.f * t)) / 3.f;
@@ -1202,9 +454,9 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 12: {
-    /* 5-CUSP HYPOCYCLOID — R=5, r=1, d=1.  5-fold spectral comb.
+    /* Five-cusp hypocycloid: a star-ish curve with five sharp points.
      *   x(t) = (4 cos t + cos 4t) / 5
-     *   y(t) = (4 sin t - sin 4t) / 5                      */
+     *   y(t) = (4 sin t - sin 4t) / 5 */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       out[k].re = (4.f * cosf(t) + cosf(4.f * t)) / 5.f;
@@ -1214,11 +466,8 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 13: {
-    /* GEAR 8-TOOTH — radial square wave.  Radius alternates
-     * sharply between R_outer and R_inner with period 2*pi/8.
-     * Discontinuous derivative at every tooth → many high-freq
-     * harmonics → slow energy convergence.  Bar still climbing
-     * past M = 30. */
+    /* 8-tooth gear: the radius jumps in and out eight times around,
+     * making square teeth. The sudden jumps make it slow to rebuild. */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       float r = 0.6f + 0.3f * (sinf(8.f * t) > 0.f ? 1.f : -1.f);
@@ -1229,19 +478,17 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 14: {
-    /* CRESCENT — outer right semicircle + inner left semicircle
-     * (offset).  Smooth except at the two join points → energy
-     * converges fast initially then has a slow tail from the
-     * corner singularities. */
+    /* Crescent moon: a big right-hand arc joined to a smaller inner arc.
+     * Smooth apart from the two join points, so it rebuilds at medium speed. */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       if (t < (float)M_PI) {
-        /* outer semicircle, top → bottom on right side */
+        /* outer arc, top to bottom on the right */
         float theta = (float)M_PI / 2.f - t;
         out[k].re = cosf(theta);
         out[k].im = sinf(theta);
       } else {
-        /* inner semicircle, bottom → top, offset right */
+        /* inner arc, bottom to top, shifted right */
         float theta = -(float)M_PI / 2.f + (t - (float)M_PI);
         out[k].re = 0.30f + 0.70f * cosf(theta);
         out[k].im = 0.70f * sinf(theta);
@@ -1251,10 +498,8 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 15: {
-    /* LIGHTNING BOLT — piecewise-linear zigzag through 7 vertices.
-     * Sharp angle at every vertex → many harmonics.  Slowest
-     * convergence in the catalog: ~50% at M = 5, ~85% at M = 30,
-     * 95% at M = 60+. */
+    /* Lightning bolt: a 7-point zigzag. The sharpest, slowest-to-rebuild
+     * shape here — the bar is still climbing past 60 arms. */
     static const float lx[] = {0.00f,  0.55f, -0.20f, 0.30f,
                                -0.40f, 0.20f, 0.00f};
     static const float ly[] = {1.00f,  0.40f,  0.10f, -0.30f,
@@ -1264,13 +509,9 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 16: {
-    /* LISSAJOUS 11:7 — close-to-irrational ratio that visually
-     * packs the screen with intersecting curves.
-     *
-     * NEW LESSON: visual complexity does NOT imply spectral
-     * complexity.  Spectrum is still ONLY 4 dominant bins
-     * (±11, ±7) — energy bar reaches 100% at M = 4 just like
-     * the simpler Lissajous 3:2. */
+    /* Lissajous 11:7 — looks like a screen full of tangled curves, yet
+     * it's still just two tones: four arms rebuild it, same as the 3:2.
+     * A busy picture doesn't mean a complicated shape. */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       out[k].re = sinf(11.f * t + (float)M_PI / 4.f);
@@ -1280,16 +521,9 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 17: {
-    /* BEADED CIRCLE — circle of radius 1 with a small high-freq
-     * VECTOR offset added per sample.  Looks like a string of
-     * 8 beads on a necklace.
-     *
-     * NEW LESSON: vector AM places spectral energy at the TWO
-     * carrier frequencies (±1 and ±8), NOT at sum/diff.
-     * Compare with Gear 8-tooth: gear's RADIAL modulation
-     * creates many sidebands; beaded's VECTOR modulation
-     * creates just 4 bins.  Same "8" parameter, totally
-     * different spectra. */
+    /* Beaded circle: a plain circle with a small fast wobble added,
+     * like 8 beads on a necklace. Unlike the gear, the wobble adds in
+     * x and y directly, so it stays simple — four arms rebuild it. */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       out[k].re = cosf(t) + 0.25f * cosf(8.f * t);
@@ -1299,12 +533,8 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 18: {
-    /* COMPOUND SPIROGRAPH — sum of TWO hypotrochoids that share
-     * the same period.  Each by itself has a 2-bin spectrum;
-     * the sum has 4.
-     *
-     * NEW LESSON: the DFT is LINEAR.  Coefficients of (curve_A +
-     * curve_B) are exactly (coefs_A + coefs_B). */
+    /* Two spirographs added together. Each needs two arms, so the sum
+     * needs four — adding shapes just adds their arms. */
     Cplx tmp[N_SAMPLES];
     sample_hypotrochoid(4, 2, 2.f, out, N);
     sample_hypotrochoid(6, 3, 2.f, tmp, N);
@@ -1316,15 +546,10 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 19: {
-    /* CLOSED ARCHIMEDEAN SPIRAL — r(t) = a*t for t in [0, 4*pi],
-     * then a straight closing chord from spiral end to origin.
-     *
-     * NEW LESSON: PERIODICITY MATTERS.  The closing chord is a
-     * sharp DISCONTINUITY in derivative; the spiral itself is
-     * not periodic in 2*pi (it grows).  Energy spreads across
-     * many bins.  Bar climbs slowly even though the visible
-     * shape looks smooth. */
-    int spiral_end = N * 9 / 10; /* 90% of samples on spiral */
+    /* A spiral that winds out, then jumps straight back to the centre
+     * to close the loop. That snap-back acts like a sharp corner, so
+     * even though the spiral itself looks smooth, it rebuilds slowly. */
+    int spiral_end = N * 9 / 10; /* first 90% of the points draw the spiral */
     for (int k = 0; k < spiral_end; k++) {
       float t = 4.f * (float)M_PI * (float)k / (float)spiral_end;
       float r = 0.95f * t / (4.f * (float)M_PI);
@@ -1342,16 +567,10 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 
   case 20: {
-    /* TORUS KNOT (2, 5) — a closed curve that, in 3-D, is a
-     * non-trivial knot wrapping a torus 5 times the short way
-     * and 2 times the long way.  Projected to 2-D:
+    /* Torus knot (2, 5): a knotted loop flattened to 2-D — a 5-petal
+     * ripple riding on a 2-turn carrier. A few arms rebuild it.
      *   x(t) = (2 + cos(5t)) * cos(2t) / 3
-     *   y(t) = (2 + cos(5t)) * sin(2t) / 3
-     *
-     * NEW LESSON: knotted/torus closed curves have multi-frequency
-     * spectra structured around their (p, q) winding parameters.
-     * 5-fold modulation atop 2-rev carrier puts dominant energy
-     * at signed bins ±2, ±3 (= 2-5), ±7 (= 2+5). */
+     *   y(t) = (2 + cos(5t)) * sin(2t) / 3 */
     for (int k = 0; k < N; k++) {
       float t = 2.f * (float)M_PI * (float)k / (float)N;
       float r = 2.f + cosf(5.f * t);
@@ -1363,18 +582,15 @@ static void sample_path(int si, Cplx *out, int N) {
   }
 }
 
-/* ===================================================================== */
-/* §7  tier_classify — convergence tier table + helper                   */
-/* ===================================================================== */
+/* ── §7  shape tiers — how fast each shape rebuilds ── */
+
 /*
- * Every shape belongs to one of three convergence tiers based on
- * its Fourier-coefficient decay rate.  The HUD prints
- * "[Fast 5/9]" etc so the user can navigate the catalog with intent.
- *
- *   FAST  : energy bar reaches ~100% by M = 6 (typically 2 or 4
- *           dominant bins; everything else is noise)
- *   MED   : ~85% by M = 10, slow tail (cusps or composites)
- *   SLOW  : need 50+ arms for 95% (sharp corners, discontinuities)
+ * Every shape is tagged Fast, Med, or Slow by how quickly the energy bar
+ * fills as you add arms, and the HUD shows it (e.g. "[Fast 5/9]") so you
+ * can pick a shape knowing what to expect:
+ *   Fast — basically done by ~6 arms (smooth curves)
+ *   Med  — most of the way by ~10 arms, slow finish (cusped/compound)
+ *   Slow — needs 50+ arms to look right (sharp corners)
  */
 typedef enum { TIER_FAST = 0, TIER_MED, TIER_SLOW, TIER_COUNT } Tier;
 
@@ -1404,11 +620,8 @@ static const Tier k_shape_tier[N_SHAPES] = {
 
 static const char *k_tier_name[TIER_COUNT] = {"Fast", "Med ", "Slow"};
 
-/*
- * shape_tier_position — for the active shape, compute its tier name,
- * its position within that tier (1-indexed), and the total count
- * of shapes in that tier.  HUD prints "[Fast 5/9]" using this.
- */
+/* Works out what the HUD's "[Fast 5/9]" chip should say: this shape's
+ * tier, its place within that tier, and how many shapes share it. */
 static void shape_tier_position(int shape_idx, const char **out_tier_name,
                                 int *out_pos, int *out_total) {
   Tier t = k_shape_tier[shape_idx];
@@ -1424,26 +637,17 @@ static void shape_tier_position(int shape_idx, const char **out_tier_name,
   }
 }
 
-/* ===================================================================== */
-/* §8  dft — O(N^2) DFT with twiddle recurrence                          */
-/* ===================================================================== */
+/* ── §8  the DFT — find the spinning arms hidden in the shape ── */
+
 /*
- *  Purpose         : compute the discrete Fourier transform of N
- *                    complex samples.  Exactly the same algorithm
- *                    as dft_helloworld.c §5 (no trickery).
- *  Optimisation    : the TWIDDLE RECURRENCE — for each output bin we
- *                    pre-compute W = exp(-2*pi*i*n/N) ONCE, then
- *                    multiply a running `w` by W per inner iteration
- *                    instead of calling cos/sin every time.  Cuts
- *                    trig calls from 2*N^2 to 2*N.
- *  Mental model    : N parallel "lock-in detectors", each tuned to
- *                    one integer harmonic.  See dft_helloworld.c for
- *                    the full intuition.
- *  Inputs/outputs  : in[N] complex / out[N] complex (caller-allocated)
- *  Why it exists   : runs ONCE per shape change inside §9
- *                    build_epicycles.  Not in the per-frame hot path.
- *  Cost            : O(N^2) — at N = 256, ~65k complex multiplies.
- *                    Sub-millisecond.
+ * The discrete Fourier transform: turns the N shape points into N
+ * frequency bins, each one telling us how strong a particular spin rate
+ * is. We run it just once per shape change, not every frame.
+ *
+ * The one trick: instead of calling cos/sin inside the inner loop, we
+ * compute the per-step rotation once and keep multiplying by it. Same
+ * answer, far fewer trig calls. (See dft_helloworld.c for the plain
+ * version.)
  */
 static void compute_dft(const Cplx *in, Cplx *out, int N) {
   for (int n = 0; n < N; n++) {
@@ -1453,11 +657,11 @@ static void compute_dft(const Cplx *in, Cplx *out, int N) {
     float acc_re = 0.f, acc_im = 0.f;
 
     for (int k = 0; k < N; k++) {
-      /* acc += in[k] * twiddle  (complex mul spelled out) */
+      /* add this sample, rotated by the running angle */
       acc_re += in[k].re * twiddle_re - in[k].im * twiddle_im;
       acc_im += in[k].re * twiddle_im + in[k].im * twiddle_re;
 
-      /* twiddle = twiddle * twiddle_step  (advance W^k -> W^(k+1)) */
+      /* nudge the running angle on by one step */
       float next_re =
           twiddle_re * twiddle_step_re - twiddle_im * twiddle_step_im;
       twiddle_im = twiddle_re * twiddle_step_im + twiddle_im * twiddle_step_re;
@@ -1468,69 +672,46 @@ static void compute_dft(const Cplx *in, Cplx *out, int N) {
   }
 }
 
-/* ===================================================================== */
-/* §9  epicycle_table — struct + sort + cumulative energy table          */
-/* ===================================================================== */
-
-typedef struct {
-  float amp;   /* normalised arm length = |Z[n]| / N           */
-  float phase; /* arg(Z[n])                                    */
-  int freq;    /* signed rotation rate (cycles per shape trace)*/
-} Epicycle;
+/* ── §9  the arm list — one spinning arm per frequency ── */
 
 /*
- * epic_cmp — qsort comparator: amplitude DESCENDING.  Used by
- * build_epicycles to sort the arm table.  Sorting descending is
- * what makes the partial sums energy-OPTIMAL (T3).
+ * One rotating arm of the chain, read straight out of one DFT bin.
+ *   amp   — arm length (how big a circle this arm sweeps)
+ *   phase — where on its circle the arm starts
+ *   freq  — how many turns it makes per full shape trace; the sign says
+ *           which way it spins.
  */
+typedef struct {
+  float amp;
+  float phase;
+  int freq;
+} Epicycle;
+
+/* Sort helper: longest arm first. Putting the big arms up front is what
+ * lets "the first M arms" always be the M that capture the most shape. */
 static int epic_cmp(const void *a, const void *b) {
   float da = ((const Epicycle *)a)->amp;
   float db = ((const Epicycle *)b)->amp;
   return (da < db) - (da > db);
 }
 
-static Epicycle g_epicycle_table[N_SAMPLES];
-static int g_total_epicycle_count = 0;
-static int g_active_epicycle_count = 0;
+static Epicycle g_epicycle_table[N_SAMPLES]; /* all arms, longest first */
+static int g_total_epicycle_count = 0;       /* how many arms exist     */
+static int g_active_epicycle_count = 0;      /* how many are switched on */
 
-/*
- * g_cumulative_energy_fraction[k] — fraction of total signal power
- *   captured by the first k+1 epicycles (sorted by amplitude).
- *   The HUD's energy bar reads
- *   g_cumulative_energy_fraction[active_count - 1].
- *
- * Parseval connection: total_signal_energy = sum(amp^2) =
- *   (1/N^2) * sum |Z[n]|^2 = (1/N) * sum |x[k]|^2.
- */
+/* g_cumulative_energy_fraction[k]: with the first k+1 arms turned on,
+ * what fraction of the whole shape have we captured (0 to 1)? This is
+ * exactly what the energy bar shows. We fill it in once per shape so the
+ * bar is a cheap lookup every frame. */
 static float g_cumulative_energy_fraction[N_SAMPLES];
-static float g_total_signal_energy;
+static float g_total_signal_energy; /* the "100%" we measure against */
 
-/* Source samples preserved for the ghost overlay. */
+/* The shape's original points, kept around to draw the faint target. */
 static Cplx g_resampled_source[N_SAMPLES];
 
-/*
- * build_epicycles — turn a chosen shape into a sorted Epicycle[]
- * with a pre-computed cumulative-energy table.
- *
- * Pseudocode:
- *   sample_path(shape_idx, ghost)
- *   compute_dft(ghost, dft_bins)
- *   for n in 0..N-1:
- *     amp   = |dft_bins[n]| / N
- *     phase = arg(dft_bins[n])
- *     freq  = (n <= N/2) ? n : n - N           // signed
- *     table[n] = {amp, phase, freq}
- *   qsort(table, descending by amp)
- *   total_energy = sum(amp^2)
- *   running = 0
- *   for k in 0..N-1:
- *     running += amp_k^2
- *     cumulative_energy_fraction[k] = running / total_energy
- *
- * Why it exists : called at startup, on shape change ('n'/'p'),
- *                 and on reset ('r').  Keeps the DFT cost out of
- *                 the per-frame hot path.
- */
+/* Turn the chosen shape into the sorted arm list plus the energy lookup.
+ * Called whenever the shape changes (startup, n/p, reset) — this is
+ * where the one-time DFT cost lives, kept out of the per-frame path. */
 static void build_epicycles(int shape_idx) {
   Cplx dft[N_SAMPLES];
   sample_path(shape_idx, g_resampled_source, N_SAMPLES);
@@ -1539,18 +720,19 @@ static void build_epicycles(int shape_idx) {
   float inv_N = 1.f / (float)N_SAMPLES;
   for (int n = 0; n < N_SAMPLES; n++) {
     float re = dft[n].re, im = dft[n].im;
-    int f = (n <= N_SAMPLES / 2) ? n : n - N_SAMPLES; /* signed freq */
+    int f = (n <= N_SAMPLES / 2) ? n : n - N_SAMPLES; /* fold the top half to negative spins */
     g_epicycle_table[n] =
         (Epicycle){sqrtf(re * re + im * im) * inv_N, atan2f(im, re), f};
   }
   qsort(g_epicycle_table, N_SAMPLES, sizeof(Epicycle), epic_cmp);
   g_total_epicycle_count = N_SAMPLES;
 
-  /* Build cumulative energy table (Parseval). */
+  /* total "size" of the shape: add up every arm's squared length */
   g_total_signal_energy = 0.f;
   for (int n = 0; n < N_SAMPLES; n++)
     g_total_signal_energy += g_epicycle_table[n].amp * g_epicycle_table[n].amp;
 
+  /* running total as a fraction of that, arm by arm — the bar's data */
   float acc = 0.f;
   for (int n = 0; n < N_SAMPLES; n++) {
     acc += g_epicycle_table[n].amp * g_epicycle_table[n].amp;
@@ -1559,10 +741,13 @@ static void build_epicycles(int shape_idx) {
   }
 }
 
-/* ===================================================================== */
-/* §10  trail — tip-path ring buffer                                     */
-/* ===================================================================== */
+/* ── §10  trail — the fading path the arm tip leaves behind ── */
 
+/*
+ * A fixed-size loop of the last TRAIL_LEN tip positions. write_head is
+ * where the next point goes; once full it wraps and overwrites the
+ * oldest. filled_count tracks how many of the slots are real yet.
+ */
 typedef struct {
   float pixel_x[TRAIL_LEN];
   float pixel_y[TRAIL_LEN];
@@ -1571,7 +756,6 @@ typedef struct {
 } Trail;
 
 static void trail_push(Trail *t, float pixel_x, float pixel_y) {
-  /* Append (x, y); advance head; saturate count at TRAIL_LEN. */
   t->pixel_x[t->write_head] = pixel_x;
   t->pixel_y[t->write_head] = pixel_y;
   t->write_head = (t->write_head + 1) % TRAIL_LEN;
@@ -1580,20 +764,18 @@ static void trail_push(Trail *t, float pixel_x, float pixel_y) {
 }
 
 static void trail_clear(Trail *t) {
-  /* Logically empty without zeroing the data array. */
+  /* just forget the old points; no need to wipe the arrays */
   t->write_head = 0;
   t->filled_count = 0;
 }
 
-/* ===================================================================== */
-/* §11  scene_state — globals + reset/init                               */
-/* ===================================================================== */
+/* ── §11  scene state — everything the animation tracks ── */
 
 static int g_screen_rows, g_screen_cols;
-static float g_pivot_pixel_x, g_pivot_pixel_y; /* chain origin in pixel space */
-static float g_pixel_scale;                    /* normalised → pixel        */
-static float g_animation_phase_radians; /* phi ∈ [0, 2*pi)            */
-static int g_auto_add_counter;
+static float g_pivot_pixel_x, g_pivot_pixel_y; /* where the chain starts   */
+static float g_pixel_scale;             /* turns shape units into pixels   */
+static float g_animation_phase_radians; /* the angle that drives the spin  */
+static int g_auto_add_counter;          /* frames since last auto-added arm */
 static bool g_simulation_paused;
 static bool g_auto_add_enabled;
 static bool g_show_orbit_circles;
@@ -1601,11 +783,13 @@ static bool g_show_ghost_overlay;
 static int g_active_shape_index;
 static Trail g_tip_trail;
 
-/* Joint positions in pixel space; joint[0] = pivot, joint[i+1] is
- * the tip of arm i (and pivot of arm i+1). */
+/* The arm-chain joints in pixel space: joint[0] is the centre, and each
+ * joint[i+1] is where arm i ends (and arm i+1 begins). The last one is
+ * the pen tip that draws the shape. */
 static float g_joint_pixel_x[N_SAMPLES + 1];
 static float g_joint_pixel_y[N_SAMPLES + 1];
 
+/* The one place we turn pixel coordinates into terminal cells. */
 static int px_cx(float pixel_x) {
   return (int)(pixel_x / (float)CELL_W + 0.5f);
 }
@@ -1613,31 +797,12 @@ static int px_cy(float pixel_y) {
   return (int)(pixel_y / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §12  scene_chain — compute joint positions from epicycle table        */
-/* ===================================================================== */
-/*
- *  Purpose         : evaluate the chain at the current phi; record
- *                    joint positions in g_joint_pixel_x/y[].
- *  Pseudocode      :
- *      (x, y) = (pivot_x, pivot_y)
- *      joint[0] = (x, y)
- *      for i in 0..M-1:
- *        angle  = freq_i * phi + phase_i
- *        radius = amp_i * pixel_scale
- *        x += radius * cos(angle)
- *        y += radius * sin(angle)
- *        joint[i+1] = (x, y)
- *  Mental model    : add the i-th arm's tip displacement to the
- *                    running joint position.  Each arm is a polar-
- *                    to-Cartesian conversion.
- *  Inputs/outputs  : reads g_epicycle_table, g_animation_phase_radians,
- *                    g_pivot_pixel_x/y, g_pixel_scale, g_active_epicycle_count
- *                    / writes g_joint_pixel_x/y[0..M].
- *  Why it exists   : rendering layers consume joint positions, not
- *                    arm parameters.  Computing joints once per frame
- *                    avoids redundant work.
- */
+/* ── §12  the arm chain — where each joint sits right now ── */
+
+/* Start at the centre and follow the arms one by one: each arm points off
+ * at its current angle and lengthens the chain. We save every joint so the
+ * drawing code can just connect the dots, and so we compute it only once
+ * per frame. */
 static void scene_compute_chain(void) {
   float x = g_pivot_pixel_x, y = g_pivot_pixel_y;
   g_joint_pixel_x[0] = x;
@@ -1653,18 +818,10 @@ static void scene_compute_chain(void) {
   }
 }
 
-/* ===================================================================== */
-/* §13  scene_tick — per-frame orchestrator                              */
-/* ===================================================================== */
-/*
- *  Purpose : advance state by one frame.  Three numbered steps that
- *            match the per-frame portion of ALGORITHM IN STEPS.
- *
- *  Steps:
- *    1. (auto-add) maybe bump g_active_epicycle_count by 1.
- *    2. Advance phi; on wrap, clear the trail.
- *    3. Recompute chain joints; push tip into trail.
- */
+/* ── §13  setting up and stepping the scene ── */
+
+/* Start fresh on a new shape: one arm on, animation at the top, empty
+ * trail, then rebuild the arm list for that shape. */
 static void scene_reset(int shape_idx) {
   g_active_shape_index = shape_idx;
   g_animation_phase_radians = 0.f;
@@ -1675,6 +832,7 @@ static void scene_reset(int shape_idx) {
   scene_compute_chain();
 }
 
+/* Size the scene to the terminal and switch the default toggles on. */
 static void scene_init(int rows, int cols) {
   g_screen_rows = rows;
   g_screen_cols = cols;
@@ -1689,11 +847,12 @@ static void scene_init(int rows, int cols) {
   scene_reset(0);
 }
 
+/* One frame of motion: maybe add an arm, spin a little, redraw the chain. */
 static void scene_tick(void) {
   if (g_simulation_paused)
     return;
 
-  /* ── Step 1 — auto-add one arm at intervals ───────────────── */
+  /* every so often, switch on one more arm */
   if (g_auto_add_enabled && g_active_epicycle_count < g_total_epicycle_count) {
     g_auto_add_counter++;
     if (g_auto_add_counter >= AUTO_ADD_FRAMES) {
@@ -1702,29 +861,23 @@ static void scene_tick(void) {
     }
   }
 
-  /* ── Step 2 — advance phi; clear trail at cycle wrap ────── */
+  /* spin forward; when we come full circle, start the trail over */
   g_animation_phase_radians += 2.f * (float)M_PI / (float)CYCLE_FRAMES;
   if (g_animation_phase_radians >= 2.f * (float)M_PI) {
     g_animation_phase_radians -= 2.f * (float)M_PI;
     trail_clear(&g_tip_trail);
   }
 
-  /* ── Step 3 — recompute chain; record tip ─────────────────── */
+  /* move the arms and drop the new tip position into the trail */
   scene_compute_chain();
   trail_push(&g_tip_trail, g_joint_pixel_x[g_active_epicycle_count],
              g_joint_pixel_y[g_active_epicycle_count]);
 }
 
-/* ===================================================================== */
-/* §14  draw_helpers — Bresenham line + cell-aspect orbit ellipse        */
-/* ===================================================================== */
+/* ── §14  drawing helpers — straight lines and orbit rings ── */
 
-/*
- * draw_line_seg — Bresenham line with direction-aware glyph choice.
- *   Mostly-horizontal segments → '-'
- *   Mostly-vertical   segments → '|'
- *   Diagonal (\ or /)         → '\\' / '/'
- */
+/* Draw a straight line between two cells, picking a glyph that matches its
+ * slope: dash for flat, bar for steep, slash for diagonal. */
 static void draw_line_seg(int x0, int y0, int x1, int y1, attr_t attr) {
   int dx = abs(x1 - x0), dy = abs(y1 - y0);
   int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
@@ -1752,14 +905,11 @@ static void draw_line_seg(int x0, int y0, int x1, int y1, attr_t attr) {
   }
 }
 
-/*
- * draw_orbit — dotted ellipse around (piv_px, piv_py) with pixel-
- * space radius r_px.  In CELL space the orbit is an ellipse because
- * cells are CELL_H/CELL_W = 2x as tall as wide.
- */
+/* Draw the dotted circle one arm sweeps. It comes out as an ellipse on
+ * screen because terminal cells are twice as tall as they are wide. */
 static void draw_orbit(float piv_px, float piv_py, float r_px) {
   if (r_px < (float)CELL_W * 0.5f)
-    return; /* skip sub-cell orbits */
+    return; /* too small to see; skip it */
   float rx = r_px / (float)CELL_W;
   float ry = r_px / (float)CELL_H;
   int pcx = px_cx(piv_px), pcy = px_cy(piv_py);
@@ -1776,17 +926,13 @@ static void draw_orbit(float piv_px, float piv_py, float r_px) {
   }
 }
 
-/* ===================================================================== */
-/* §15  draw_layers — ghost / orbits / trail / chain / markers           */
-/* ===================================================================== */
+/* ── §15  drawing the scene — painted back to front ── */
 
+/* Painted in order so the most useful stuff ends up on top: the faint
+ * target first, then orbit guides, the trail, the arms, and the markers. */
 static void scene_draw(void) {
-  /* ── Layer 1.  GHOST overlay — source samples as ':' dots ──── */
-  /*
-   * Every other sample is drawn (i += 2) to keep density readable.
-   * Shows where the "true" shape lies so the viewer can compare
-   * the reconstruction's accuracy directly against the target.
-   */
+  /* faint ':' dots showing the real shape, so you can judge the fit
+   * (every other point, to keep it from looking solid) */
   if (g_show_ghost_overlay) {
     attron(COLOR_PAIR(CP_GHOST));
     for (int k = 0; k < N_SAMPLES; k += 2) {
@@ -1799,7 +945,7 @@ static void scene_draw(void) {
     attroff(COLOR_PAIR(CP_GHOST));
   }
 
-  /* ── Layer 2.  ORBIT circles for the largest arms ───────────── */
+  /* faint guide rings for the few biggest arms */
   if (g_show_orbit_circles) {
     int nc = g_active_epicycle_count < N_CIRCLES ? g_active_epicycle_count
                                                  : N_CIRCLES;
@@ -1808,7 +954,7 @@ static void scene_draw(void) {
                  g_epicycle_table[i].amp * g_pixel_scale);
   }
 
-  /* ── Layer 3.  TRAIL — fading dots from oldest to newest ───── */
+  /* the tip's path, brightest where it's newest */
   {
     int draw = g_tip_trail.filled_count;
     int start = (g_tip_trail.write_head - draw + TRAIL_LEN) % TRAIL_LEN;
@@ -1826,7 +972,7 @@ static void scene_draw(void) {
     }
   }
 
-  /* ── Layer 4.  ARM CHAIN — Bresenham segments per arm ──────── */
+  /* the arms themselves, coloured by length */
   for (int i = 0; i < g_active_epicycle_count; i++) {
     float r_px = g_epicycle_table[i].amp * g_pixel_scale;
     int cp = r_px > g_pixel_scale * 0.10f   ? CP_ARM_HI
@@ -1837,7 +983,7 @@ static void scene_draw(void) {
                   COLOR_PAIR(cp) | A_BOLD);
   }
 
-  /* ── Layer 5a.  TIP BOB — '@' at chain end ──────────────────── */
+  /* '@' on the pen tip that's drawing the shape */
   {
     int bx = px_cx(g_joint_pixel_x[g_active_epicycle_count]);
     int by = px_cy(g_joint_pixel_y[g_active_epicycle_count]);
@@ -1848,7 +994,7 @@ static void scene_draw(void) {
     }
   }
 
-  /* ── Layer 5b.  PIVOT MARKER — '+' at chain origin ─────────── */
+  /* '+' on the fixed centre the chain hangs from */
   {
     int pcx = px_cx(g_pivot_pixel_x), pcy = px_cy(g_pivot_pixel_y);
     if (pcx >= 0 && pcx < g_screen_cols && pcy >= 0 && pcy < g_screen_rows) {
@@ -1859,27 +1005,16 @@ static void scene_draw(void) {
   }
 }
 
-/* ===================================================================== */
-/* §16  hud_energy — status top-right + ENERGY BAR + bottom hint         */
-/* ===================================================================== */
-/*
- *  HUD layout (CLAUDE.md HUD Standard):
- *    row 0 top-left  : " PAUSED " chip when paused, otherwise blank
- *    row 0 top-right : status line (bright yellow + bold) including
- *                      shape name, tier chip, arm count, energy %,
- *                      theme, toggles
- *    row 1           : ENERGY BAR with colour tier (red < 50%,
- *                      yellow 50..80%, green >= 80%) — THE headline
- *                      visual of this file
- *    row LINES-1     : bottom-left hint (bright cyan + bold)
- */
+/* ── §16  the overlay — status line, energy bar, key hints ── */
 
+/* The text and bar laid over the animation: a status line top-right, the
+ * energy bar on the second row, and the key reminders along the bottom. */
 static void scene_draw_hud(void) {
   float efrac = (g_active_epicycle_count > 0 && g_total_signal_energy > 0.f)
                     ? g_cumulative_energy_fraction[g_active_epicycle_count - 1]
                     : 0.f;
 
-  /* ── status (top-right) ── */
+  /* status line: shape, tier, arm count, captured %, theme, toggles */
   {
     const char *tier_name;
     int tier_pos = 0, tier_total = 0;
@@ -1904,14 +1039,14 @@ static void scene_draw_hud(void) {
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
   }
 
-  /* ── PAUSED chip (top-left) ── */
+  /* PAUSED badge, top-left, only while paused */
   if (g_simulation_paused) {
     attron(COLOR_PAIR(CP_HUD) | A_BOLD | A_REVERSE);
     mvprintw(0, 0, " PAUSED ");
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD | A_REVERSE);
   }
 
-  /* ── ENERGY BAR with colour tier (row 1) ── */
+  /* the headline: how much of the shape the active arms capture */
   {
     int bar_col = 1, bar_row = 1, bar_w = 50;
     if (bar_col + bar_w + 16 >= g_screen_cols)
@@ -1919,12 +1054,12 @@ static void scene_draw_hud(void) {
     if (bar_w < 12)
       bar_w = 12;
 
-    /* Pick colour tier by energy fraction. */
+    /* red while rough, yellow once recognisable, green when nearly done */
     int bar_pair = (efrac >= 0.80f)   ? CP_ENERGY
                    : (efrac >= 0.50f) ? CP_ENERGY_MID
                                       : CP_ENERGY_LO;
 
-    /* "[" border + filled "=" + empty "-" + "]" border + label */
+    /* brackets at the ends, '=' for the filled part, '-' for the rest */
     attron(COLOR_PAIR(CP_HUD));
     mvaddch(bar_row, bar_col, '[');
     mvaddch(bar_row, bar_col + bar_w - 1, ']');
@@ -1943,7 +1078,7 @@ static void scene_draw_hud(void) {
     attroff(COLOR_PAIR(CP_HUD));
   }
 
-  /* ── bottom-left hint ── */
+  /* key reminders along the bottom */
   attron(COLOR_PAIR(CP_HINT) | A_BOLD);
   mvprintw(g_screen_rows - 1, 0,
            " q:quit  spc:pause  n/p:shape  +/-:arms  r:reset  a:auto  "
@@ -1951,9 +1086,7 @@ static void scene_draw_hud(void) {
   attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §17  screen — ncurses init / cleanup / present                        */
-/* ===================================================================== */
+/* ── §17  terminal setup and screen flush ── */
 
 static void screen_init(void) {
   initscr();
@@ -1962,7 +1095,7 @@ static void screen_init(void) {
   keypad(stdscr, TRUE);
   nodelay(stdscr, TRUE);
   curs_set(0);
-  typeahead(-1);
+  typeahead(-1); /* stop ncurses peeking at input mid-draw, which tears */
   color_init();
 }
 
@@ -1971,9 +1104,7 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §18  app — signal handlers + main loop + key dispatch                 */
-/* ===================================================================== */
+/* ── §18  the program — signals, the main loop, and the keys ── */
 
 static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
@@ -2003,7 +1134,7 @@ int main(void) {
 
   while (!g_should_quit) {
 
-    /* ── resize ────────────────────────────────────────────── */
+    /* terminal was resized: rebuild everything for the new size */
     if (g_resize_pending) {
       g_resize_pending = 0;
       endwin();
@@ -2014,7 +1145,7 @@ int main(void) {
       continue;
     }
 
-    /* ── input ─────────────────────────────────────────────── */
+    /* handle a keypress, if any */
     int ch = getch();
     switch (ch) {
     case 'q':
@@ -2072,23 +1203,23 @@ int main(void) {
       break;
     }
 
-    /* ── tick ──────────────────────────────────────────────── */
+    /* advance one frame */
     long long now_ns = clock_ns();
     long long dt = now_ns - last_ns;
     last_ns = now_ns;
     if (dt > 100000000LL)
-      dt = 100000000LL; /* pause-guard */
+      dt = 100000000LL; /* don't let a long stall jump the animation */
     (void)dt;
 
     scene_tick();
 
-    /* ── draw + present ────────────────────────────────────── */
+    /* repaint */
     erase();
     scene_draw();
     scene_draw_hud();
     screen_present();
 
-    /* ── frame cap ─────────────────────────────────────────── */
+    /* wait out the rest of the frame so we hold 30 fps */
     clock_sleep_ns(RENDER_NS - (clock_ns() - now_ns));
   }
 

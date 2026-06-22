@@ -1,150 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * bifurcation.c — Logistic Map Bifurcation Diagram (density-rendered)
+ * bifurcation.c — the logistic map's bifurcation diagram, drawn as a heat map.
+ * We sweep the parameter r across the screen and, for each column, count how
+ * often the orbit visits each row; busy cells glow, rare ones stay faint.
  *
- *   x_{n+1} = r · x_n · (1 − x_n)
- *
- * For each screen column a distinct r value is chosen.  WARMUP transient
- * iterations are discarded; the next PLOT iterations are accumulated into
- * a per-cell DENSITY BUFFER.  Each cell's count is mapped through a log
- * curve to one of N_TIERS brightness levels; each tier maps to a colour
- * from the active cosine-gradient theme.
- *
- * Why density rendering vs single-dot plotting:
- *   - period-N attractors land on N rows per column, each hit ~PLOT/N
- *     times -- they become BRIGHT thick lines in the heat map
- *   - chaos spreads iterations thinly across many cells, so each cell
- *     is a faint dot -- the result is a smooth fuzz cloud
- *   - period-3, period-5 etc windows inside chaos pop out as bright
- *     vertical bands
- *   - the iconic textbook appearance falls out for free
- *
- * Sub-pixel r-sampling: each visible column is split into SUBPIXEL
- * fractional r-values, all stamping into the same column.  This
- * anti-aliases the attractor curves and gives smoother continuous
- * regions at modest column counts.
- *
- * The view auto-zooms toward the Feigenbaum accumulation point
- * (r∞ ≈ 3.5699) so the self-similar fractal structure gradually fills
- * the screen.
- *
- * Keys:
- *   q / Q / ESC     quit
- *   space           pause / resume auto-zoom
- *   r / R           reset view to r ∈ [2.50, 4.00]
- *   t / T           next / prev colour theme (10 themes)
- *   ← / →           pan
- *   + / =           zoom in
- *   - / _           zoom out
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra procedural/chaos/bifurcation.c \
- *       -o bifurcation -lncurses -lm
- *
- * Sections:
- *   §1 config   -- sizes, sampling, named constants, colour-pair allocation
- *   §2 clock    -- monotonic ns clock + sleep
- *   §3 color    -- RGB, cosine_palette, ANSI quantizers, Theme + theme_apply
- *   §4 diagram  -- Density buffer, log-tier mapping, build + render
- *   §5 scene    -- ViewWindow + Scene + simulation tick + render pipeline
- *   §6 hud      -- top data bar + bottom action bar helpers
- *   §7 screen   -- Screen + cached terminal geometry
- *   §8 app      -- App + signals + action keys + main loop
+ * The map and its theory: May, Nature 261 (1976); Strogatz, "Nonlinear
+ * Dynamics and Chaos" ch. 10.  Palette trick from Quilez, "Palettes" (2015):
+ * https://iquilezles.org/articles/palettes/
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Logistic map iteration with parameter scanning and
- *                 density accumulation.  Per visible column (and SUBPIXEL
- *                 r-values per column), iterate the logistic map for
- *                 WARMUP transient steps, then accumulate PLOT iterations
- *                 into a per-cell density buffer.  Final image: density
- *                 mapped through log curve to N_TIERS brightness levels
- *                 coloured by the active cosine-gradient theme.
- *
- * Math          : The logistic map models population dynamics.
- *                  r < 3      : converges to fixed point  (period 1)
- *                  r ≈ 3.0    : period-2 bifurcation
- *                  r ≈ 3.449  : period-4 bifurcation
- *                  r ≈ 3.544  : period-8
- *                  r ≈ 3.5699 : accumulation point (onset of chaos)
- *                  r > 4      : trajectories diverge
- *                 Successive bifurcations r_n satisfy
- *                  (r_{n+1} − r_n) / (r_{n+2} − r_{n+1}) → δ ≈ 4.6692
- *                 where δ is Feigenbaum's constant -- universal across
- *                 all unimodal maps, not just the logistic.
- *
- * Rendering     : Density rendering is the discrete-cell analogue of a
- *                 graphics accumulation buffer.  Log-scale tier mapping
- *                  tier = round( log(1+d) / log(1+peak) · (N_TIERS-1) )
- *                 keeps faint chaos cells visible without saturating
- *                 the bright periodic-attractor lines.
- *
- * Palette       : Each theme is a cosine gradient (Iñigo Quilez):
- *                  color(t) = a + b · cos(2π · (c·t + d))
- *                 Sampled at t = i/(N_TIERS-1) for the N_TIERS tier stops,
- *                 quantised to nearest ANSI 256-cube colour.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* -- REFERENCES ---------------------------------------------------------  *
- *
- * Logistic map (the original chaos paper):
- *   [1] May, R. M. (1976). "Simple mathematical models with very
- *       complicated dynamics."  Nature 261, 459-467.
- *       -- the seminal paper that brought the logistic map to wide
- *          attention.  Showed that simple deterministic maps can
- *          exhibit periodic, periodic-doubling, and chaotic behaviour
- *          depending on a single parameter -- a foundational result
- *          for nonlinear dynamics in biology and physics.
- *
- * Feigenbaum's universality:
- *   [2] Feigenbaum, M. J. (1978). "Quantitative universality for a
- *       class of nonlinear transformations."  J. Statistical Physics
- *       19(1), 25-52.
- *       -- discovered the universal scaling constant δ ≈ 4.6692
- *          governing period-doubling cascades.  The constant appears
- *          across ALL unimodal maps (logistic, sine-circle, ...) and
- *          even in real physical systems (Rayleigh-Bénard convection,
- *          driven pendulums) -- the accumulation point in our diagram
- *          (r∞ ≈ 3.5699) is governed by exactly this constant.
- *
- *   [3] Cvitanović, P. (ed.) (1989). "Universality in Chaos" (2nd ed.).
- *       Adam Hilger.
- *       -- anthology collecting Feigenbaum's papers plus the related
- *          renormalisation-group derivations.  Useful background if
- *          [2] feels terse.
- *
- * Textbook treatments:
- *   [4] Strogatz, S. H. (2015). "Nonlinear Dynamics and Chaos" (2nd ed.).
- *       Westview Press.
- *       -- chapter 10 is the canonical pedagogical introduction to the
- *          logistic map: orbit diagrams, the period-3 window, Liapunov
- *          exponents, and the renormalisation argument behind δ.  Best
- *          single starting point.
- *
- *   [5] Devaney, R. L. (2003). "An Introduction to Chaotic Dynamical
- *       Systems" (2nd ed.).  Westview Press.
- *       -- more rigorous treatment; develops the symbolic dynamics that
- *          explain the structure of the periodic windows (where
- *          period-3, period-5 etc bands appear inside the chaos).
- *
- * Rendering:
- *   [6] Akenine-Möller, T., Haines, E., Hoffman, N., et al. (2018).
- *       "Real-Time Rendering" (4th ed.). CRC Press.
- *       -- §23 on accumulation buffer techniques.  Our per-cell
- *          density histogram is the discrete-cell analogue: each
- *          column accumulates PLOT trajectory samples; bright cells =
- *          frequently-visited (attractor lines), dim cells = rarely-
- *          visited (chaos floor).
- *
- *   [7] Quilez, I. (2015). "Palettes."
- *       https://iquilezles.org/articles/palettes/
- *       -- the cosine-gradient palette technique used in §3 theme
- *          generation.  color(t) = a + b·cos(2π·(c·t + d)) per channel
- *          gives smooth procedural palettes from just four RGB triples,
- *          which is why each theme is so compact and yet so flexible.
- *
- * ----------------------------------------------------------------------- */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -162,85 +25,72 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
-/* Iteration counts (per sub-pixel r-sample).  Higher PLOT = brighter
- * envelope lines + smoother chaos; cost is linear in PLOT. */
-#define WARMUP             500   /* transient iterations discarded         */
-#define PLOT              1500   /* iterations stamped into density buffer */
-#define SUBPIXEL             4   /* r-values sampled per visible column    */
+/* How many times we iterate per r-sample.  We throw away the first WARMUP
+ * steps so the orbit can settle, then count the next PLOT steps.  More PLOT
+ * means brighter lines and smoother chaos, at linear extra cost. */
+#define WARMUP             500   /* settling steps, thrown away             */
+#define PLOT              1500   /* steps we actually count                 */
+#define SUBPIXEL             4   /* r-values sampled per screen column      */
 
 /* Frame pacing. */
 #define RENDER_NS  (1000000000LL / 30)
 
-/* r-window control. */
-#define R_DOMAIN_LO        0.0f   /* logistic-map valid domain lo (exclusive) */
-#define R_DOMAIN_HI        4.0f   /* logistic-map valid domain hi (inclusive) */
-#define R_DEFAULT_LO       2.50f  /* startup / reset window low end           */
-#define R_DEFAULT_HI       4.00f  /* startup / reset window high end          */
+/* How far we can see along the r-axis, and how pan/zoom move that view. */
+#define R_DOMAIN_LO        0.0f   /* lowest r the map makes sense for         */
+#define R_DOMAIN_HI        4.0f   /* highest r the map makes sense for        */
+#define R_DEFAULT_LO       2.50f  /* left edge on startup / reset             */
+#define R_DEFAULT_HI       4.00f  /* right edge on startup / reset            */
 #define ZOOM_FACTOR        1.25f
-#define PAN_FRAC           0.12f  /* pan moves this fraction of width        */
-#define AUTO_ZOOM_SHRINK   0.997f /* window scale per frame (≈ 0.3%)         */
-#define ZOOM_MIN_WIDTH     0.002f /* auto-zoom stops below this              */
+#define PAN_FRAC           0.12f  /* one pan step = this slice of the view    */
+#define AUTO_ZOOM_SHRINK   0.997f /* view shrinks ~0.3% each frame            */
+#define ZOOM_MIN_WIDTH     0.002f /* auto-zoom stops once this narrow         */
 
-/* Feigenbaum accumulation point: r∞ where period-doubling cascades to chaos. */
+/* The famous spot where period-doubling piles up into chaos. */
 #define FEIGENBAUM_R   3.5699456718695f
 
-/* Static density-buffer capacity.  Real terminal size is clamped to these. */
+/* Biggest grid we ever store; a larger terminal just gets a margin. */
 #define MAX_ROWS   128
 #define MAX_COLS   320
 
-/* HUD layout -- top band carries data, bottom band carries action keys.
- * Plot area is rows [HUD_TOP_ROWS, rows - HUD_BOTTOM_ROWS). */
+/* The HUD eats some rows top and bottom; the diagram fills what's left. */
 #define HUD_TOP_ROWS                2
 #define HUD_BOTTOM_ROWS             1
-#define HUD_DATA_COL               16   /* col where the middle data segment starts */
+#define HUD_DATA_COL               16   /* column where the data readout begins */
 
-/* r-axis tick labels on HUD row 1. */
-#define N_TICKS                     5   /* labels at 5 evenly spaced columns      */
-#define TICK_LABEL_RIGHT_MARGIN     6   /* chars reserved on right (label width)  */
+/* The r-axis labels strung along HUD row 1. */
+#define N_TICKS                     5   /* how many labels                        */
+#define TICK_LABEL_RIGHT_MARGIN     6   /* space kept clear on the right          */
 
-/* Brightness tiers.  N_TIERS density levels paired with N_TIERS theme
- * palette stops (cold tier 0 → hot tier N_TIERS-1). */
+/* Brightness levels: tier 0 = coldest/faintest, top tier = hottest. */
 #define N_TIERS            8
 #define BRIGHT_TIER        (N_TIERS - 1)
 
-/*
- * Colour-pair allocation:
- *   1 .. N_TIERS         density tiers (theme-controlled by theme_apply)
- *   N_TIERS + 1          HUD data    (yellow, theme-independent)
- *   N_TIERS + 2          HUD title / hint  (cyan, theme-independent)
- */
+/* Which ncurses colour pairs we use.  The first N_TIERS change with the
+ * theme; the two HUD pairs stay fixed so the chrome never shifts colour. */
 #define CP_TIER_0          1
 #define CP_HUD             (N_TIERS + 1)
 #define CP_HINT            (N_TIERS + 2)
 
-/* HUD colour codes (256-mode). */
 #define HUD_DATA_YELLOW_256   226
 #define HUD_TITLE_CYAN_256     51
 
 #define KEY_ESC               27
 
-/* Math literals named for their geometric meaning. */
 #define TAU               (2.0f * (float)M_PI)
 
-/* ANSI 256-colour cube layout (RGB sub-cube 16..231):
- *   pair_code = ANSI_CUBE_BASE + R·ANSI_CUBE_R_STRIDE
- *                              + G·ANSI_CUBE_G_STRIDE
- *                              + B,    R,G,B ∈ [0, ANSI_CUBE_MAX_STEP] */
+/* How an (R,G,B) step maps to an xterm-256 colour code, using the 6x6x6
+ * colour cube that lives at codes 16..231. */
 #define ANSI_CUBE_BASE       16
 #define ANSI_CUBE_R_STRIDE   36
 #define ANSI_CUBE_G_STRIDE    6
 #define ANSI_CUBE_MAX_STEP    5
 
-/* Per-channel threshold for the 8-colour fallback. */
+/* On 8-colour terminals, a channel counts as "on" once it crosses this. */
 #define RGB_BIT_THRESHOLD   0.5f
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ── */
 
 static long long clock_ns(void)
 {
@@ -256,38 +106,25 @@ static void clock_sleep_ns(long long ns)
     nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
-
-/* ---- RGB + cosine palette helpers ------------------------------------ */
+/* ── §3  color ── */
 
 /*
- * RGB -- normalised colour triple in linear [0, 1]^3.
+ * RGB -- one colour, each channel a float in [0, 1].
  *
- * WHY normalised floats (not 0..255 ints):
- *   The cosine-palette formula (Quilez [7]) is naturally float-valued;
- *   coefficients (a, b, c, d) live in [0, 1] for visual coherence.
- *   Keeping the working representation in floats avoids round-trips
- *   through integer space until the very last quantization step
- *   (rgb_to_ansi256 / rgb_to_ansi8).
- *
- * Colour space:
- *   Values are TREATED as linear RGB for blending arithmetic.  Real
- *   ANSI terminals interpret colour codes through sRGB gamma; at the
- *   6-step cube's resolution (~16% per step) the gamma error sits well
- *   below the quantization noise, so we skip the conversion.
- *
- * Read-only after cosine_palette returns -- no RGB mutator anywhere
- * in the program.
+ * We keep colour as floats the whole time and only round to an integer
+ * terminal code at the very last moment.  The palette math (see Theme)
+ * naturally works in [0, 1], so this avoids needless round-trips.  We
+ * pretend the values are plain/linear; the terminal's own gamma curve
+ * would shift them slightly, but at the cube's coarse 6 steps per channel
+ * that shift is smaller than the rounding error anyway.
  */
 typedef struct {
-    float r;    /* red   channel, [0, 1] */
-    float g;    /* green channel, [0, 1] */
-    float b;    /* blue  channel, [0, 1] */
+    float r;    /* red,   0..1 */
+    float g;    /* green, 0..1 */
+    float b;    /* blue,  0..1 */
 } RGB;
 
-/* Saturate one channel into [0, 1]. */
+/* Pin one channel back into [0, 1]. */
 static inline float clamp01(float v)
 {
     if (v < 0.0f) return 0.0f;
@@ -295,24 +132,16 @@ static inline float clamp01(float v)
     return v;
 }
 
-/* Round-half-up to integer for non-negative v.  Used by the three
- * quantisation paths: ANSI-cube channel, density tier, x→row. */
+/* Round to the nearest whole number (for values that are never negative). */
 static inline int round_half_up(float v)
 {
     return (int)(v + 0.5f);
 }
 
 /*
- * cosine_palette -- procedural gradient sampler (Iñigo Quilez 2015).
- *
- *   color(t) = a + b · cos(TAU · (c · t + d))     evaluated per channel
- *
- *   a   DC offset       (channel midpoint)
- *   b   amplitude       (max excursion above/below a)
- *   c   frequency       (cycles per t ∈ [0, 1]; 0.5 = monotonic sweep)
- *   d   phase           (cosine offset; rotates the gradient)
- *
- * Reference: https://iquilezles.org/articles/palettes/
+ * Pick the colour at position t along a theme's gradient (Quilez 2015).
+ * Each channel is a cosine wave; the four control colours a,b,c,d shape
+ * it.  See Theme below for what each one does.
  */
 static RGB cosine_palette(const RGB *a, const RGB *b,
                           const RGB *c, const RGB *d, float t)
@@ -324,7 +153,7 @@ static RGB cosine_palette(const RGB *a, const RGB *b,
     return out;
 }
 
-/* Quantise one channel to the 6-step ANSI cube. */
+/* Snap one channel to its nearest of the 6 cube steps. */
 static int rgb_channel_to_cube_step(float v)
 {
     int idx = round_half_up(v * (float)ANSI_CUBE_MAX_STEP);
@@ -333,7 +162,7 @@ static int rgb_channel_to_cube_step(float v)
     return idx;
 }
 
-/* (R, G, B) ∈ [0,1]^3  →  nearest xterm-256 cube colour code. */
+/* Find the closest xterm-256 colour code for a float colour. */
 static int rgb_to_ansi256(RGB c)
 {
     int ri = rgb_channel_to_cube_step(c.r);
@@ -345,7 +174,7 @@ static int rgb_to_ansi256(RGB c)
          + bi;
 }
 
-/* 8-colour fallback: threshold each channel at RGB_BIT_THRESHOLD. */
+/* Same idea for old 8-colour terminals: round each channel to on/off. */
 static int rgb_to_ansi8(RGB c)
 {
     int r = (c.r > RGB_BIT_THRESHOLD);
@@ -361,71 +190,27 @@ static int rgb_to_ansi8(RGB c)
     return COLOR_WHITE;
 }
 
-/* ---- Theme palette table -------------------------------------------- */
-
 /*
- * Theme -- a named cosine-gradient palette (Quilez 2015 [7]).
- *
- * Each theme is FOUR RGB triples (a, b, c, d) that fully specify a
- * procedural gradient:
- *
- *     color(t) = a + b · cos(TAU · (c · t + d))
- *
- * evaluated independently per channel.  Sampling at t ∈ [0, 1] gives
- * the N_TIERS palette stops; theme_apply writes them into ncurses
- * pairs CP_TIER_0..CP_TIER_0+N_TIERS-1.
- *
- * WHY cosine-gradient parameters (and not a fixed N_TIERS-stop table):
- *
- *   1. Compact -- 12 floats per theme instead of 2 × N_TIERS·sizeof(int)
- *      (one int per stop for 256-mode plus one per stop for 8-mode).
- *      The floats DESCRIBE the gradient instead of just listing samples.
- *
- *   2. Resolution-independent -- if we bump N_TIERS from 8 to 16 the
- *      same theme generates a smoother 16-stop palette without a
- *      table edit.
- *
- *   3. Self-documenting -- reading the parameters tells you the gradient
- *      shape: c = 0.5 means "monotonic sweep", c = 1.0 means "full hue
- *      cycle wraps back", d shifts mark phase offsets.
- *
- *   4. Composable -- tweak d.g += 0.1 to rotate the green channel's
- *      hue by a known amount.  Designing a new theme is easier than
- *      picking 8 ANSI codes by trial-and-error.
- *
- * Worked sample -- "Matrix" theme at tier 0 (t = 0):
- *      r = 0.00 + 0.00·cos(TAU·0)         = 0.00
- *      g = 0.55 + 0.45·cos(TAU·0.5)       = 0.55 − 0.45 = 0.10
- *      b = 0.08 + 0.08·cos(TAU·0.5)       = 0.00
- *   → faint dark green.
- * At tier 7 (t = 1):
- *      g = 0.55 + 0.45·cos(TAU·1)         = 1.00
- *      b = 0.08 + 0.08·cos(TAU·1)         = 0.16
- *   → bright green with a slight cyan tint.
- *
- * Theme switching ('t' / 'T') just recomputes the N_TIERS stops and
- * rewrites pairs CP_TIER_0..CP_TIER_0+N_TIERS-1 via init_pair.  Pairs
- * above N_TIERS (HUD title + data) are left untouched so the chrome
- * stays consistent across themes.
- *
- * Reference:  Quilez 2015 [7] for the palette formula.
+ * Theme -- a whole colour gradient packed into four control colours
+ * (Quilez 2015).  Instead of hand-picking 8 colours, we describe the
+ * gradient as a cosine wave per channel and let cosine_palette sample it
+ * wherever we need.  That keeps each theme tiny, lets it restretch if we
+ * ever change the number of tiers, and makes tweaking a hue a one-number
+ * edit.  Switching themes just recomputes the tier colours; the HUD's own
+ * colours are left alone.
  */
 typedef struct {
-    const char *name;  /* HUD-displayable name ("Matrix", "Fire", ...) */
-    RGB         a;     /* DC offset    (mid value the channel oscillates around) */
-    RGB         b;     /* amplitude    (max excursion above/below a).
-                        * Keep a + b ≤ 1 and a − b ≥ 0 to avoid clipping;
-                        * cosine_palette clamps after the fact regardless. */
-    RGB         c;     /* frequency    (cycles per t ∈ [0, 1]).
-                        * c = 0.5 → monotonic sweep; c = 1.0 → full cycle. */
-    RGB         d;     /* phase        (cosine offset; rotates the gradient).
-                        * d = 0.5 makes the cosine start at trough (cos(π)). */
+    const char *name;  /* shown on the HUD ("Matrix", "Fire", ...) */
+    RGB         a;     /* the middle colour each channel swings around */
+    RGB         b;     /* how far it swings (keep a+b<=1, a-b>=0; clamped anyway) */
+    RGB         c;     /* how many wiggles across the gradient (0.5 = one sweep) */
+    RGB         d;     /* where the wave starts -- shifts the colours along */
 } Theme;
 
 #define N_THEMES 10
 
 static const Theme k_themes[N_THEMES] = {
-    /*  name           a (offset)             b (amplitude)            c (frequency)            d (phase)              */
+    /*  name              a (middle)             b (swing)                c (wiggles)              d (start)              */
     { "Matrix",     {0.00f, 0.55f, 0.08f}, {0.00f, 0.45f, 0.08f}, {0.00f, 0.50f, 0.50f}, {0.00f, 0.50f, 0.50f} },
     { "Sunset",     {0.70f, 0.50f, 0.30f}, {0.20f, 0.50f, 0.30f}, {0.50f, 0.50f, 0.50f}, {0.00f, 0.10f, 0.20f} },
     { "Ocean",      {0.20f, 0.45f, 0.65f}, {0.20f, 0.40f, 0.35f}, {0.50f, 0.50f, 0.50f}, {0.00f, 0.30f, 0.50f} },
@@ -441,16 +226,13 @@ static const Theme k_themes[N_THEMES] = {
 static inline int theme_next(int cur) { return (cur + 1) % N_THEMES; }
 static inline int theme_prev(int cur) { return (cur + N_THEMES - 1) % N_THEMES; }
 
-/* Position of tier i along the gradient axis t ∈ [0, 1]. */
+/* Where tier i sits along the gradient, as a fraction from 0 to 1. */
 static inline float tier_to_gradient_t(int i)
 {
     return (float)i / (float)(N_TIERS - 1);
 }
 
-/*
- * theme_apply -- compute N_TIERS palette stops for theme_idx and load
- * them into ncurses pairs CP_TIER_0..CP_TIER_0+N_TIERS-1.
- */
+/* Compute this theme's colours and load them into the tier colour pairs. */
 static void theme_apply(int theme_idx)
 {
     const Theme *th = &k_themes[theme_idx];
@@ -463,7 +245,7 @@ static void theme_apply(int theme_idx)
     }
 }
 
-/* One-time palette setup: theme-independent HUD chrome first, then theme 0. */
+/* Set up colours once: the fixed HUD colours, then the starting theme. */
 static void color_init(void)
 {
     start_color();
@@ -478,66 +260,25 @@ static void color_init(void)
     theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  diagram                                                            */
-/* ===================================================================== */
-
-/* ---- Density buffer ---------------------------------------------------- */
+/* ── §4  diagram ── */
 
 /*
- * Density -- 2-D histogram of (column, row) attractor visits.
+ * Density -- a grid of counters, one per character cell, tallying how
+ * often the orbit visited that cell.  This counting is the whole trick:
+ * if we just drew a dot per visit we'd lose the "how often" information
+ * that makes the diagram look the way it does.  Cells the orbit settles
+ * on (the steady periodic lines) get hit a lot and glow bright; the
+ * scatter of chaos spreads thin and stays faint; narrow windows of order
+ * inside the chaos show up as bright vertical streaks.  (This is the
+ * cell-grid version of a graphics accumulation buffer; same trick is used
+ * by geometry/maurer_rose for drawing curves.)
  *
- * WHY this exists (the rendering technique it enables):
- *   Naive per-point plotting would draw a single '.' for every iterate
- *   and overdraw collisions, discarding the cell-visit-frequency
- *   information that GIVES the bifurcation diagram its iconic
- *   appearance.  Density rendering replaces that with accumulation:
- *
- *     stamp pass:   for each (r, column), iterate the logistic map
- *                   WARMUP+PLOT times; for every iterate, increment
- *                   density[row][col]
- *     render pass:  map each cell's count through a log curve to one of
- *                   N_TIERS brightness levels; brighter cells = more
- *                   frequently visited
- *
- *   Periodic attractors (period-N) land on N rows × cols cells per
- *   column, hit ~PLOT/N times each → high count → bright thick lines.
- *   Chaos spreads PLOT iterates across ~100 rows in a column → ~5-15
- *   per cell → faint fuzz.  Periodicity windows (period-3 etc) emerge
- *   inside the chaos band as bright vertical streaks.
- *
- * Invariants:
- *   I1.  cells[r][c] = number of distinct logistic-map iterates whose
- *        x-value landed in row r of column c during the most recent
- *        diagram_build_density pass.  Cleared to 0 at the start of
- *        every build.
- *   I2.  peak == max(cells[r][c]) over all (r, c) in the stamped
- *        region.  Maintained INCREMENTALLY by density_stamp so the
- *        renderer does not need a second pass to find the max.
- *   I3.  All writes are clipped to the drawing band:
- *           HUD_TOP_ROWS ≤ r < rows - HUD_BOTTOM_ROWS
- *           0 ≤ c < cols
- *
- * Memory:
- *   MAX_ROWS · MAX_COLS · sizeof(int) ≈ 160 KB.  Static -- lives
- *   inside Scene (and Scene inside g_app), so no heap allocation, no
- *   per-frame zeroing of allocated memory.
- *
- * Reference:  Akenine-Möller [6] §23 on accumulation buffers; this is
- *   the discrete-cell analogue.  Same idea used by geometry/maurer_rose
- *   for parametric-curve density; here it integrates chaotic-map
- *   trajectories rather than a polyline.
- *
- * Fields:
- *   cells   per-cell visit counter, bounded above by SUBPIXEL·PLOT
- *           (worst case where all sub-pixel samples for the same column
- *           land on the same row -- happens only for fixed-point r).
- *   peak    running max of cells; the normalisation denominator used
- *           by density_to_tier.
+ * The grid is sized to the largest terminal we support (~160 KB) and
+ * lives inside the App, so we never call malloc.
  */
 typedef struct {
-    int cells[MAX_ROWS][MAX_COLS];  /* per-cell visit counter, 0 = unvisited */
-    int peak;                       /* max(cells); maintained by density_stamp */
+    int cells[MAX_ROWS][MAX_COLS];  /* visit count per cell, 0 = never visited */
+    int peak;                       /* the largest count -- the brightest cell */
 } Density;
 
 static void density_clear(Density *d)
@@ -546,7 +287,7 @@ static void density_clear(Density *d)
     d->peak = 0;
 }
 
-/* Increment one cell and update running peak. */
+/* Count one visit, keeping peak up to date so we don't need a second scan. */
 static inline void density_stamp(Density *d, int row, int col)
 {
     int v = ++d->cells[row][col];
@@ -554,13 +295,10 @@ static inline void density_stamp(Density *d, int row, int col)
 }
 
 /*
- * density_to_tier -- map raw count to brightness tier via log curve.
- *
- *   tier = round( log(1 + d) / log(1 + peak) · (N_TIERS - 1) )
- *
- * Returns -1 for empty cells (caller should skip).  The log curve
- * keeps both bright periodic lines AND faint chaos fuzz visible in
- * the same frame -- linear scaling either saturates or loses the floor.
+ * Turn a raw visit count into a brightness level 0..N_TIERS-1, or -1 for
+ * empty cells (the caller skips those).  We scale by logarithm, not flat
+ * proportion, so the rare faint cells still show up next to the very busy
+ * ones instead of washing out to nothing.
  */
 static inline int density_to_tier(int d, int peak)
 {
@@ -572,7 +310,7 @@ static inline int density_to_tier(int d, int peak)
     return tier;
 }
 
-/* Intensity ramp for the N_TIERS brightness levels. */
+/* The character used for each brightness level, faintest to densest. */
 static inline char tier_glyph(int tier)
 {
     static const char ramp[N_TIERS] = {
@@ -581,57 +319,28 @@ static inline char tier_glyph(int tier)
     return ramp[tier];
 }
 
-/* A_BOLD on the hottest tier so envelope lines glow. */
+/* Make the very brightest level bold so the main lines really pop. */
 static inline chtype tier_attr(int tier)
 {
     return (tier == BRIGHT_TIER) ? A_BOLD : 0;
 }
 
-/* ===================================================================== */
-/* §5  scene                                                              */
-/* ===================================================================== */
-
-/* ---- ViewWindow -- the r-axis viewport ------------------------------ */
+/* ── §5  scene ── */
 
 /*
- * ViewWindow -- the visible slice of r-axis as [r_min, r_max].
- *
- * Coordinate transform from screen column to logistic-map parameter:
- *
- *     r(c) = r_min + (r_max − r_min) · c / (cols − 1)
- *
- * (with sub-pixel refinement via column_to_r in §5).  Shrinking the
- * window zooms in -- the user sees the period-doubling cascade in
- * ever-finer detail as auto-zoom drives the window toward FEIGENBAUM_R.
- * Translating the window pans.
- *
- * WHY a separate substruct (vs flat r_min/r_max on Scene):
- *   The view operations (pan, zoom, recenter, clamp, width-query) form
- *   a coherent abstract data type: "the visible slice of r-axis".
- *   Grouping them lets each operation take `ViewWindow *` and not
- *   accidentally touch unrelated Scene fields.  Also lets
- *   diagram_build_density take `const ViewWindow *` so its inability
- *   to mutate the viewport is enforced by the compiler.
- *
- * Invariants (maintained by view_window_clamp at every mutation site):
- *   I1.  R_DOMAIN_LO ≤ r_min < r_max ≤ R_DOMAIN_HI
- *   I2.  width = r_max - r_min ≥ 0;  may become ≤ ZOOM_MIN_WIDTH
- *        (the auto-zoom drift stops there to avoid float collapse)
- *
- * Reference:  Strogatz [4] ch. 10 for the bifurcation diagram structure
- *   that this viewport is sampling.
- *
- * Fields:
- *   r_min   left edge of the viewport, in r-axis units.
- *           Range: [R_DOMAIN_LO, R_DOMAIN_HI).
- *           Mutators: view_window_init / pan / zoom / recenter_to.
- *   r_max   right edge of the viewport, in r-axis units.
- *           Range: (R_DOMAIN_LO, R_DOMAIN_HI].
- *           Same mutators as r_min.
+ * ViewWindow -- the stretch of the r-axis we're currently looking at,
+ * given by its left and right edges.  The screen's leftmost column maps
+ * to r_min, the rightmost to r_max; everything in between is spread
+ * evenly.  Make the window narrower and you zoom in (the auto-zoom keeps
+ * shrinking it toward FEIGENBAUM_R); slide it and you pan.  It's its own
+ * little struct so the pan/zoom helpers can take just this and not reach
+ * into the rest of the Scene.  Both edges always stay inside the map's
+ * legal r-range, and we stop shrinking once the window gets tiny so the
+ * floats don't collapse.
  */
 typedef struct {
-    float r_min;
-    float r_max;
+    float r_min;   /* left edge,  in r units */
+    float r_max;   /* right edge, in r units */
 } ViewWindow;
 
 static void view_window_init(ViewWindow *v)
@@ -640,7 +349,7 @@ static void view_window_init(ViewWindow *v)
     v->r_max = R_DEFAULT_HI;
 }
 
-/* Clamp the window into the logistic-map valid r-domain. */
+/* Keep both edges inside the map's legal r-range. */
 static void view_window_clamp(ViewWindow *v)
 {
     if (v->r_min < R_DOMAIN_LO) v->r_min = R_DOMAIN_LO;
@@ -657,8 +366,8 @@ static inline bool view_window_too_narrow(const ViewWindow *v)
     return view_window_width(v) <= ZOOM_MIN_WIDTH;
 }
 
-/* If the window has slid past R_DOMAIN_LO, push the right edge by
- * the same overshoot so width is preserved.  No-op if in range. */
+/* If a pan ran off the left edge, slide the whole window back in so it
+ * keeps its width instead of getting squashed.  Does nothing if it fits. */
 static void view_window_reflect_off_left(ViewWindow *v)
 {
     if (v->r_min < R_DOMAIN_LO) {
@@ -667,8 +376,7 @@ static void view_window_reflect_off_left(ViewWindow *v)
     }
 }
 
-/* Symmetric case: if window has slid past R_DOMAIN_HI, pull the left
- * edge back by the same overshoot.  No-op if in range. */
+/* Same fix for the right edge. */
 static void view_window_reflect_off_right(ViewWindow *v)
 {
     if (v->r_max > R_DOMAIN_HI) {
@@ -677,17 +385,8 @@ static void view_window_reflect_off_right(ViewWindow *v)
     }
 }
 
-/*
- * view_window_pan -- translate the window by `fraction` of its width.
- *
- * Reads as pseudocode:
- *   shift both bounds by  width · fraction
- *   reflect off the left edge   (preserve width)
- *   reflect off the right edge  (preserve width)
- *
- * The reflection keeps the window's width invariant under pan, so the
- * user can't accidentally shrink it by sliding past the domain edge.
- */
+/* Slide the view sideways by a fraction of its width, bouncing back off
+ * the edges so panning never accidentally shrinks the view. */
 static void view_window_pan(ViewWindow *v, float fraction)
 {
     float w = view_window_width(v);
@@ -697,9 +396,7 @@ static void view_window_pan(ViewWindow *v, float fraction)
     view_window_reflect_off_right(v);
 }
 
-/* Scale the window's width by 1/factor while keeping its centre fixed.
- *   factor > 1  zooms IN  (window shrinks)
- *   factor < 1  zooms OUT (window grows) */
+/* Zoom about the centre: factor > 1 zooms in, factor < 1 zooms out. */
 static void view_window_zoom(ViewWindow *v, float factor)
 {
     float c  = (v->r_min + v->r_max) * 0.5f;
@@ -709,8 +406,7 @@ static void view_window_zoom(ViewWindow *v, float factor)
     view_window_clamp(v);
 }
 
-/* Shrink the window towards a target r value -- the per-frame auto-zoom
- * step.  New width = old width × shrink, recentred on `target`. */
+/* The auto-zoom step: shrink a little and re-centre on a target r. */
 static void view_window_recenter_to(ViewWindow *v, float target, float shrink)
 {
     float hw = view_window_width(v) * 0.5f * shrink;
@@ -719,55 +415,17 @@ static void view_window_recenter_to(ViewWindow *v, float target, float shrink)
     view_window_clamp(v);
 }
 
-/* ---- Scene -- the whole simulation state ---------------------------- */
-
 /*
- * Scene -- the entire simulation state.
- *
- * The state vector of the visualiser: the minimum set of values needed
- * to render the next frame.  Everything else (HUD strings, ncurses
- * cells) is derived.
- *
- * Composition decisions:
- *   - `view` is its own struct (ViewWindow) because the pan/zoom/
- *     recenter operations form a coherent ADT -- see ViewWindow doc.
- *   - `density` is derived data living on Scene rather than in a
- *     helper struct because its lifetime matches Scene (rebuilt every
- *     frame by diagram_build_density; cleared at start).
- *   - `theme_idx` is a flat int (index into k_themes[]).  Cycling
- *     with t/T is a single arithmetic bump; no pointer swizzling.
- *   - `paused` is a flat bool; only scene_tick reads it.  Doesn't
- *     earn its own substruct.
- *
- * Memory:
- *   density is the heavy field (~160 KB).  Scene therefore lives inside
- *   the static g_app (§8); never on the stack, never allocated.
- *
- * Reference:  May [1] for the logistic map this state visualises;
- *   Strogatz [4] §10 for the bifurcation theory it animates.
- *
- * Fields (range / unit / mutator):
- *   view        ViewWindow   --        the live r-axis viewport.
- *                                       Mutator: scene_tick (auto-zoom),
- *                                       action_reset / pan_* / zoom_*.
- *   density     Density      --        per-frame histogram, rebuilt by
- *                                       diagram_build_density.  Read-only
- *                                       during render passes.
- *   theme_idx   [0, N_THEMES)
- *                            --        active theme; t/T cycle.
- *                                       Mutator: action_theme_next/prev
- *                                       (also calls theme_apply).
- *   paused      bool         --        SPACE freezes scene_tick's auto-
- *                                       zoom drift.  Rendering still
- *                                       runs so the user can pan/zoom
- *                                       manually while paused.
- *                                       Mutator: action_pause.
+ * Scene -- everything we need to draw the next frame, and nothing more.
+ * The HUD text and the on-screen characters are all worked out from this.
+ * The visit-count grid is the big piece (~160 KB), so the Scene lives
+ * inside the one static App rather than on the stack.
  */
 typedef struct {
-    ViewWindow view;       /* live r-axis viewport                       */
-    Density    density;    /* per-frame attractor histogram (~160 KB)   */
-    int        theme_idx;  /* [0, N_THEMES)  active palette index        */
-    bool       paused;     /* SPACE freezes auto-zoom drift              */
+    ViewWindow view;       /* the stretch of r-axis we're looking at      */
+    Density    density;    /* visit counts, rebuilt every frame (~160 KB) */
+    int        theme_idx;  /* which colour theme is active; t/T cycles it */
+    bool       paused;     /* SPACE: freeze the auto-zoom (pan/zoom still work) */
 } Scene;
 
 static void scene_init(Scene *s)
@@ -778,11 +436,8 @@ static void scene_init(Scene *s)
     s->paused    = false;
 }
 
-/*
- * scene_tick -- one simulation step.  Just the auto-zoom drift; the
- * logistic-map iteration is part of the render pass (it depends on the
- * live (rows, cols) so it can't run independently of the frame layout).
- */
+/* One step of "time": just the slow auto-zoom.  The actual map iteration
+ * happens at draw time, since it needs the current screen size. */
 static void scene_tick(Scene *s)
 {
     if (s->paused) return;
@@ -790,23 +445,21 @@ static void scene_tick(Scene *s)
     view_window_recenter_to(&s->view, FEIGENBAUM_R, AUTO_ZOOM_SHRINK);
 }
 
-/* ---- diagram build pass --------------------------------------------- */
-
-/* Logistic-map iteration: x → r·x·(1−x).  One step, hot inner loop. */
+/* The logistic map itself: one step of x -> r*x*(1-x). */
 static inline float logistic_step(float r, float x)
 {
     return r * x * (1.0f - x);
 }
 
-/* Map attractor value x ∈ [0, 1] to a screen row inside the plot band. */
+/* Turn an orbit value (0..1) into a screen row.  Flipped so bigger x sits
+ * higher up, the way the textbook diagram is drawn. */
 static inline int x_to_row(float x, int plot_top, int plot_height)
 {
-    /* Invert top↔bottom so larger x sits higher on the screen. */
     return plot_top + plot_height - 1
          - round_half_up(x * (float)(plot_height - 1));
 }
 
-/* Run WARMUP discards followed by PLOT stamps for one (r, column). */
+/* For one r in one column: let the orbit settle, then count where it goes. */
 static void column_accumulate(Density *dens, float r, int col,
                               int plot_top, int plot_bottom_excl)
 {
@@ -822,13 +475,8 @@ static void column_accumulate(Density *dens, float r, int col,
     }
 }
 
-/*
- * Sub-pixel r position for sample sx ∈ [0, SUBPIXEL) within column col.
- *
- * Each visible column [col, col+1) is split into SUBPIXEL equal slices;
- * each slice picks its r at the slice midpoint.  This anti-aliases the
- * attractor curves so they look smooth even at modest column counts.
- */
+/* Pick the r for one of the SUBPIXEL slices inside a column.  Sampling a
+ * few r-values per column instead of one smooths out the lines. */
 static inline float column_to_r(int col, int sx, int n_cols,
                                 float r_min, float r_max)
 {
@@ -837,18 +485,8 @@ static inline float column_to_r(int col, int sx, int n_cols,
     return r_min + (r_max - r_min) * t;
 }
 
-/*
- * diagram_build_density -- scan every visible column, sub-pixel r-sample
- * it, iterate the logistic map, and accumulate counts into the density
- * buffer.  Reads as pseudocode:
- *
- *   clear density
- *   for each visible column:
- *     for each sub-pixel slice:
- *       r = column_to_r(col, sx)
- *       skip if r outside valid map domain
- *       column_accumulate(dens, r, col, ...)
- */
+/* Build the whole frame's visit counts: for every column, sample a few
+ * r-values and tally where each orbit lands. */
 static void diagram_build_density(Density *dens, const ViewWindow *v,
                                   int rows, int cols)
 {
@@ -869,9 +507,7 @@ static void diagram_build_density(Density *dens, const ViewWindow *v,
     }
 }
 
-/* ---- render pass ----------------------------------------------------- */
-
-/* Paint one density cell through the active tier ramp + palette. */
+/* Draw one cell: pick its brightness level, then its character and colour. */
 static void paint_density_cell(int row, int col, int count, int peak)
 {
     int tier = density_to_tier(count, peak);
@@ -882,7 +518,7 @@ static void paint_density_cell(int row, int col, int count, int peak)
     attroff(attr);
 }
 
-/* Walk the plot band; paint every non-empty cell. */
+/* Draw every visited cell in the diagram area. */
 static void render_density(const Density *dens, int rows, int cols)
 {
     int row_end = rows - HUD_BOTTOM_ROWS;
@@ -894,25 +530,14 @@ static void render_density(const Density *dens, int rows, int cols)
             paint_density_cell(y, x, dens->cells[y][x], dens->peak);
 }
 
-/* Compose the diagram: rebuild the density buffer from the current view,
- * then paint it through the tier ramp. */
+/* Draw the diagram: recount from the current view, then paint it. */
 static void scene_draw(Scene *s, int rows, int cols)
 {
     diagram_build_density(&s->density, &s->view, rows, cols);
     render_density(&s->density, rows, cols);
 }
 
-/* ===================================================================== */
-/* §6  hud                                                                */
-/* ===================================================================== */
-
-/*
- * Top HUD (rows 0 .. HUD_TOP_ROWS - 1) -- live data only.
- *   Row 0:  title (cyan) + r-window + theme + peak + status (yellow)
- *   Row 1:  N_TICKS r-axis labels + right-aligned r_inf annotation
- *
- * Bottom HUD (row rows - 1) -- action keys, bright cyan + A_BOLD.
- */
+/* ── §6  hud ── */
 
 static void hud_draw_title(void)
 {
@@ -933,7 +558,7 @@ static void hud_draw_state(const Scene *s)
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/* Draw the N_TICKS evenly-spaced r-axis labels along HUD row 1. */
+/* Print the r-axis number labels evenly across the top. */
 static void hud_draw_r_axis_ticks(int cols, const ViewWindow *v)
 {
     float w = view_window_width(v);
@@ -946,7 +571,7 @@ static void hud_draw_r_axis_ticks(int cols, const ViewWindow *v)
     }
 }
 
-/* Right-side annotation on HUD row 1: target Feigenbaum point r∞. */
+/* Note the auto-zoom target, the Feigenbaum point, on the right. */
 static void hud_draw_feigenbaum_annotation(int cols)
 {
     char tag[40];
@@ -956,13 +581,7 @@ static void hud_draw_feigenbaum_annotation(int cols)
         mvprintw(1, cols - len, "%s", tag);
 }
 
-/*
- * hud_draw_tick_labels -- compose HUD row 1.
- *   Reads as pseudocode:
- *     ticks first (left + middle)
- *     then the r_inf annotation (right edge)
- *     all in CP_HUD colour
- */
+/* The second HUD row: the axis labels plus the right-side note. */
 static void hud_draw_tick_labels(int cols, const ViewWindow *v)
 {
     attron(COLOR_PAIR(CP_HUD));
@@ -980,40 +599,19 @@ static void hud_draw_action_bar(int rows)
     attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7  screen ── */
 
 /*
- * Screen -- cached terminal geometry.
- *
- * WHY cache cols/rows on a struct instead of calling getmaxyx() everywhere:
- *   getmaxyx is cheap but not free, and -- more importantly -- the
- *   render layer takes plain ints for sizes.  Passing a Screen* down
- *   the call chain would conflate "I need the size" with "I need to
- *   talk to ncurses".  Holding size as a value lets the math layer
- *   stay terminal-agnostic; only screen_init / screen_resize ever
- *   write into Screen.
- *
- * Capacity clamps (screen_clamp_sizes):
- *   Values are clamped to MAX_ROWS / MAX_COLS at every update so the
- *   Density buffer never sees a row/col out of its static allocation.
- *   Very large terminals see a centred plot with empty margin rather
- *   than a corrupted buffer or a segfault.
- *
- * Update points:
- *   screen_init    -- once at startup
- *   screen_resize  -- after each SIGWINCH (triggered in §8 apply_resize)
- *
- * Fields follow the ncurses convention: cols = X-extent, rows = Y-extent,
- * both 1-based counts so valid coordinates are
- *      [0, cols-1] × [0, rows-1].
- * HUD bands reserve HUD_TOP_ROWS at the top and HUD_BOTTOM_ROWS at the
- * bottom; the diagram renderer stays inside the middle band.
+ * Screen -- the terminal's current size, remembered so the drawing code
+ * can take plain numbers and never has to talk to ncurses just to learn
+ * how big the window is.  The sizes are capped at MAX_ROWS / MAX_COLS so
+ * the visit-count grid can never be asked for a cell outside its fixed
+ * storage; an oversized terminal just shows a margin instead of crashing.
+ * Only startup and resize ever change these.
  */
 typedef struct {
-    int cols;   /* terminal width  in character cells  */
-    int rows;   /* terminal height in character cells  */
+    int cols;   /* width  in characters */
+    int rows;   /* height in characters */
 } Screen;
 
 static void screen_clamp_sizes(Screen *s)
@@ -1038,52 +636,29 @@ static void screen_init(Screen *s)
 
 static void screen_resize(Screen *s)
 {
-    endwin(); refresh();
+    endwin(); refresh();   /* ncurses needs this to pick up the new size */
     getmaxyx(stdscr, s->rows, s->cols);
     screen_clamp_sizes(s);
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8  app ── */
 
 /*
- * App -- the top-level container.
+ * App -- the whole program in one box.  There's a single static copy
+ * (g_app) so the signal handlers can flip its flags without a pile of
+ * loose globals.  The two flags live here, not in the Scene, because
+ * "should I quit?" and "did the window resize?" are about the run loop,
+ * not the math -- keeping them apart lets the Scene stay pure state.
  *
- * Lives as a single static instance (g_app, declared below) so the
- * signal handlers can poke flags on it without scattering globals
- * across the file.
- *
- * WHY signal-handler flags are on App, not Scene:
- *   Signals interrupt the main loop, not the simulation.  "Should I
- *   quit?" and "did the terminal resize?" are run-loop concerns, not
- *   bifurcation-math concerns.  Keeping them off Scene means the
- *   simulation stays PURE STATE -- snapshottable, replayable from a
- *   single (r_min, r_max, theme_idx) triple, testable in isolation.
- *
- * WHY volatile sig_atomic_t (and not bool):
- *   Per POSIX, sig_atomic_t is the only integer type guaranteed atomic
- *   with respect to async signal delivery.  `volatile` forces the
- *   main loop to re-read from memory each iteration rather than
- *   caching the flag in a register; without it the compiler may
- *   legally hoist the load out of the loop and the program would
- *   never see the signal-set value.
- *
- * Composition:
- *   scene        -- the simulation state (Scene, §5).  Heavy due to
- *                   the Density buffer; stays in BSS via g_app.
- *   screen       -- cached terminal geometry (Screen, §7).
- *   running      -- 0 ⇒ main loop should exit (SIGINT/SIGTERM signal
- *                   handler clears it; main checks each iteration).
- *   need_resize  -- 1 ⇒ main loop should re-init screen
- *                   (SIGWINCH signal handler sets it; main consumes
- *                   it in apply_resize).
+ * The flags are volatile sig_atomic_t because that's the one type a
+ * signal handler is allowed to touch safely, and "volatile" stops the
+ * compiler from caching the value so the loop actually notices the change.
  */
 typedef struct {
-    Scene                 scene;        /* simulation state             */
-    Screen                screen;       /* terminal size cache          */
-    volatile sig_atomic_t running;      /* 0 = exit main loop  (SIGINT) */
-    volatile sig_atomic_t need_resize;  /* 1 = re-init screen  (SIGWINCH) */
+    Scene                 scene;        /* the simulation state          */
+    Screen                screen;       /* remembered terminal size      */
+    volatile sig_atomic_t running;      /* set to 0 to quit (SIGINT/TERM) */
+    volatile sig_atomic_t need_resize;  /* set to 1 on window resize      */
 } App;
 
 static App g_app;
@@ -1112,14 +687,14 @@ static void app_init(App *app)
     scene_init(&app->scene);
 }
 
-/* SIGWINCH path: re-query terminal size; density and view stay valid. */
+/* Handle a window resize: just re-read the size; the view and counts hold. */
 static void apply_resize(App *app)
 {
     screen_resize(&app->screen);
     app->need_resize = 0;
 }
 
-/* ---- key actions (each one a named helper for clarity) -------------- */
+/* One small helper per key, so the key table below reads cleanly. */
 
 static void action_pause       (Scene *s) { s->paused = !s->paused; }
 static void action_reset       (Scene *s)
@@ -1142,7 +717,7 @@ static void action_pan_right   (Scene *s) { view_window_pan(&s->view,  PAN_FRAC)
 static void action_zoom_in     (Scene *s) { view_window_zoom(&s->view, ZOOM_FACTOR); }
 static void action_zoom_out    (Scene *s) { view_window_zoom(&s->view, 1.0f / ZOOM_FACTOR); }
 
-/* Returns false if the user asked to quit. */
+/* Act on one keypress; returns false if it means "quit". */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
@@ -1170,7 +745,7 @@ static bool drain_input(App *app)
     return true;
 }
 
-/* Compose one frame: build density, paint diagram, paint HUD. */
+/* Draw one full frame: the diagram, then the HUD on top. */
 static void frame_render(App *app)
 {
     erase();
@@ -1183,9 +758,7 @@ static void frame_render(App *app)
     doupdate();
 }
 
-/*
- * main() -- the orchestrator.  Each line is one named phase of a frame.
- */
+/* The loop: handle resize and keys, advance, draw, then sleep to ~30 fps. */
 int main(void)
 {
     install_signal_handlers();

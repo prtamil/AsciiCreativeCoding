@@ -1,224 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * strange_attractor.c — Strange-Attractor Zoo (rotating 3-D trail visual)
+ * strange_attractor.c — ten chaotic attractors, each drawn as a glowing
+ * trail of recent points spun around in 3-D.  Nine are flat 2-D maps
+ * lifted onto a sheet; the tenth is the Lorenz butterfly.  Same look as
+ * physics/lorenz.c (sister file -- shares the colour and camera ideas).
  *
- * Ten chaotic attractors rendered in the same visual language as the
- * physics/lorenz.c demo: a live RING-BUFFER trail per trajectory,
- * projected through a rotating 3-D camera (azimuth φ + elevation θ),
- * with age-based head/mid/tail colour ramp [4], a comet-head '+' bloom
- * halo, depth-cued brightness [5], a slow-parallax starfield, and N
- * ε-offset GHOST trajectories that diverge on the Lyapunov timescale
- * (visible only for the ODE preset, but cosmetically present for all).
- *
- * Ten named presets, ordered SIMPLE → VISUALLY COMPLEX:
- *
- *   1  "Henon"        a= 1.40  b=0.30                  -- 2-param polynomial
- *   2  "Hopalong"     a= 7.70  b=0.13   c=8.15         -- 3-param Barry Martin
- *   3  "Clifford"     a=-1.40  b=1.60   c=1.00  d=0.70
- *   4  "de Jong"      a=-1.70  b=1.30   c=-0.10 d=-1.20
- *   5  "Rampe"        a= 1.00  b=-1.20  c=-0.50 d=0.50
- *   6  "Tinkerbell"   a= 0.90  b=-0.6013 c=2.00 d=0.50 -- butterfly polynomial
- *   7  "Svensson"     a= 1.50  b=-1.80  c= 1.60 d=0.90
- *   8  "Bedhead"      a=-0.81  b=-0.92                  -- 2-param custom
- *   9  "Marek"        a=-2.00  b=-2.00  c=-1.20 d=2.00 -- extreme Clifford
- *  10  "Lorenz"       σ=10  ρ=28  β=8/3  h=0.005       -- 3-D ODE (RK4)
- *
- * The first 9 are DISCRETE 2-D maps: each iterate jumps far across the
- * attractor, so the trail looks like a HOPPING CONSTELLATION of recent
- * visits that traces the attractor over time.  They are LIFTED to
- * z = 0 and pushed through the same 3-D projection as the Lorenz ODE
- * -- the figure appears as a flat sheet that rotates and tilts in
- * space, revealing the attractor from different angles.
- *
- * The 10th preset (Lorenz) is a CONTINUOUS-TIME ODE integrated with
- * classical four-stage Runge-Kutta [3]; consecutive samples are
- * infinitesimally close, so the trail forms a SMOOTH SPIRAL CURVE --
- * the famous butterfly attractor [1].
- *
- * ═════════════════════════════════════════════════════════════════════
- *  WHAT YOU SEE ON SCREEN
- * ═════════════════════════════════════════════════════════════════════
- *
- *  Each frame paints BACK-TO-FRONT four layers:
- *
- *    1. STARFIELD   -- 60 ambient '.' stars in a 3-D box around the
- *                      attractor, rotating with the same φ/θ for cheap
- *                      parallax.  Far stars A_DIM, near stars A_NORMAL.
- *    2. GHOSTS      -- 5 ε-offset shadow trajectories painted in the
- *                      theme's ghost colour + A_DIM with ',' glyph.
- *                      For Lorenz they fan out exponentially -- Lyapunov
- *                      divergence [6] made visceral.  For 2-D maps they
- *                      look like extra hopping dots (still pretty).
- *    3. MAIN TRAIL  -- ring-buffer of TRAIL_LEN samples drawn
- *                      newest → oldest:
- *                        oldest 20%   '.'   tier-tail   A_DIM
- *                        next   60%   '.'   tier-mid    A_NORMAL
- *                        newest 25%   '.'   tier-head   A_BOLD
- *                      plus DEPTH CUEING -- points closer to the camera
- *                      paint BOLD, ones behind fade to A_DIM, so the
- *                      trail visibly pulses in and out of the page as
- *                      the view rotates [5].  Newest sample is 'O' BOLD.
- *    4. BLOOM HALO  -- 4-cross '+' painted in tier-head AROUND the
- *                      newest two main-trail samples; gives the head a
- *                      wide glowing comet footprint.
- *
- *  THEMES (10, 4-anchor each):  NEON / MATRIX / SUNSET / OCEAN /
- *    PLASMA / INFERNO / MINT / AURORA / SYNTHWAVE / RAINBOW.  Each
- *    theme picks four ANSI-256 codes for head / mid / tail / ghost;
- *    cycle with t / T.
- *
- *  PROJECTION  (the 5-step pipeline in §4)
- *  -----------------------------------------------------------------
- *  Orthographic with azimuth φ and elevation θ [5].  Per preset, the
- *  attractor is centred on its calibrated bounding box's midpoint;
- *  the rotated z-component sz is kept as camera-axis depth and used
- *  by the renderer for depth-cued shading.
- *
- *      (px, py, pz) = (lx − cx, ly − cy, lz − cz)        ; centre
- *      (rx, ry)     = (px·cosφ + py·sinφ,                ; rotate z
- *                      −px·sinφ + py·cosφ)
- *      sx           = rx                                  ; tilt x
- *      sy           = ry·cosθ + pz·sinθ
- *      sz           = −ry·sinθ + pz·cosθ                  ; depth
- *      col          = cx_screen + sx·scale
- *      row          = cy_screen − sy·scale·ASPECT
- *
- *  For 2-D maps lz = cz = pz = 0, so the figure stays in its plane;
- *  θ tilts it like a sheet of paper, φ spins it around its normal.
- *
- * Keys:
- *   q / Q / ESC     quit
- *   space           pause / resume
- *   r / R           reset (re-seed orbit + clear trails + recalibrate)
- *   n / N           next preset
- *   p / P           previous preset
- *   1 .. 9          jump directly to preset 1..9
- *   0               jump to preset 10 (Lorenz)
- *   t / T           next / previous theme
- *   g / G           toggle ghost trajectories
- *   a / A           toggle auto-rotate
- *   ← / →           azimuth φ (manual, disables auto-rotate)
- *   ↑ / ↓           elevation θ
- *   + / =           iteration speed × 2  (capped at SPEED_MAX)
- *   - / _           iteration speed ÷ 2  (capped at SPEED_MIN)
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra procedural/chaos/strange_attractor.c \
- *       -o strange_attractor -lncurses -lm
- *
- * ═════════════════════════════════════════════════════════════════════
- *  REFERENCES
- * ═════════════════════════════════════════════════════════════════════
- *
- *   [1] Lorenz, E. N. (1963) -- "Deterministic Nonperiodic Flow",
- *       *J. Atmos. Sci.* 20 (2), 130-141.  The original Lorenz ODE
- *       paper; basis for preset 10 and the entire chaos pedigree.
- *
- *   [2] Strogatz, S. H. (2014) -- *Nonlinear Dynamics and Chaos*,
- *       2nd ed., Westview.  Ch.9 on strange attractors and Lyapunov
- *       exponents; the textbook lens through which all 10 presets
- *       become "the same kind of object viewed differently".
- *
- *   [3] Press, W. H.; Teukolsky, S. A.; Vetterling, W. T.; Flannery,
- *       B. P. (2007) -- *Numerical Recipes*, 3rd ed., Cambridge.
- *       Ch.17 covers classical RK4 -- the integrator used for Lorenz.
- *       Backs h = 0.005 (RK4 global error ≈ h⁴ ≈ 6×10⁻¹⁰ per step).
- *
- *   [4] Quilez, I. (2015) -- "Palettes", iquilezles.org/articles/
- *       palettes.  Reference for 4-anchor palette design and the
- *       head→mid→tail brightness logic this file's themes follow
- *       (the codes themselves are hand-picked from the ANSI-256 cube,
- *       not procedurally generated).
- *
- *   [5] Foley, J. D.; van Dam, A.; Feiner, S. K.; Hughes, J. F. (1995)
- *       -- *Computer Graphics: Principles and Practice*, 2nd ed.,
- *       Addison-Wesley.  Ch.6 / 12 cover orthographic projection
- *       (the azimuth/elevation pipeline in §4) and depth-cueing
- *       brightness as a low-cost monocular depth cue.
- *
- *   [6] Wolf, A.; Swift, J. B.; Swinney, H. L.; Vastano, J. A. (1985)
- *       -- "Determining Lyapunov exponents from a time series",
- *       *Physica D* 16 (3), 285-317.  Foundational paper on numerical
- *       Lyapunov computation; sets the timescale on which the ghost
- *       trajectories fan out from the main orbit.
- *
- *   [7] Sprott, J. C. (1993) -- *Strange Attractors: Creating Patterns
- *       in Chaos*, M&T Books.  Catalog of 2-D and 3-D attractor maps
- *       (de Jong, Clifford, Hopalong, Tinkerbell, ...); sources the
- *       parameter sets for presets 2-9.
- *
- *   [8] Henon, M. (1976) -- "A two-dimensional mapping with a strange
- *       attractor", *Commun. Math. Phys.* 50 (1), 69-77.  The original
- *       Henon-map paper; basis for preset 1 and a worked example of a
- *       discrete map with fractal Hausdorff dimension ≈ 1.26.
- *
- *   [9] Bourke, P. -- "Strange Attractors" at paulbourke.net/fractals
- *       (clifford/, peterdejong/, hopalong/, tinkerbell/, ...).  The
- *       practical online catalog this file's 2-D preset parameters
- *       were tuned against; each page renders the attractor + lists
- *       canonical (a, b, c, d) tuples.
- *
- *  [10] Ward, M.; Grinstein, G.; Keim, D. (2015) -- *Interactive Data
- *       Visualization: Foundations, Techniques, and Applications*, 2nd
- *       ed., A K Peters.  Ch.6 covers age-based colour encoding (the
- *       head→mid→tail ramp here) and motion-cued depth perception
- *       (the parallax starfield + auto-rotate combination).
- *
- * Sections:
- *   §1 config        sizes, sampling, sub-stepping, colour pairs
- *   §2 clock         monotonic ns clock + sleep
- *   §3 color         themes (10 × {head, mid, tail, ghost})
- *   §4 coords        3-D → 2-D orthographic projection pipeline
- *   §5 attractor     step formulas + AttrDef + ATTRS + bbox calibration
- *   §6 orbits        Point3 + Trail (ring buffer) + Orbit (pos + Trail)
- *   §7 scene         Scene struct + per-frame tick + draw layers
- *   §8 hud           top data bar + bottom action bar
- *   §9 screen        Screen + initscr + resize
- *   §10 app          App + signals + key actions + main loop
+ * Attractor formulas and parameter sets: Sprott, *Strange Attractors*
+ * (1993) and Paul Bourke's catalog at paulbourke.net/fractals.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Ring-buffer TRAIL of recent orbit samples, drawn
- *                 newest → oldest each frame with an age-based colour
- *                 ramp.  Discrete-map presets push 1 sample per
- *                 attractor_step; the Lorenz ODE pushes 1 sample per
- *                 RK4 step.  Both share the same Trail, projection,
- *                 and rendering pipeline -- the only difference is
- *                 whether consecutive samples are infinitesimally
- *                 close (ODE → smooth curve) or far apart (map →
- *                 hopping constellation).
- *
- * Physics/Math  : 2-D maps -- Clifford / de Jong / Marek / Rampe share
- *                   x' = sin(a·y) + c·cos(a·x);
- *                   y' = sin(b·x) + d·cos(b·y).
- *                 Henon, Tinkerbell, Hopalong, Bedhead, Svensson each
- *                 have their own polynomial / radical formula.  All
- *                 nine are 2-D autonomous maps that exhibit chaos:
- *                 sensitive dependence on initial conditions [2],
- *                 fractal Hausdorff dimension, zero Lebesgue measure.
- *                 The 10th preset is the 3-D Lorenz ODE [1] integrated
- *                 with classical four-stage Runge-Kutta [3]; Lyapunov
- *                 exponent λ ≈ 0.9 sets the ghost-divergence timescale
- *                 [6].
- *
- * Rendering     : Orthographic projection [5] with azimuth φ + elevation
- *                 θ; depth-cued shading from the camera-axis depth sz;
- *                 4-cross '+' bloom halo around the newest 2 main-trail
- *                 samples; back-to-front layer stack (starfield →
- *                 ghosts → main trail).
- *
- * Palette       : 10 hand-picked 4-anchor themes in the xterm-256 cube.
- *                 Each theme provides {head, mid, tail, ghost} codes;
- *                 the age-tier mapping (newest 25% → head, next 60% →
- *                 mid, oldest 20% → tail) is theme-independent [10].
- *
- * Data-structure: Per-trajectory ring buffer of TRAIL_LEN points (1
- *                 main + N_GHOSTS = 5 ghosts = 6 trails total).  At 60
- *                 fps × 10 iter/tick = 600 samples/sec, a 2500-point
- *                 ring covers ~4 s of orbit history -- long enough for
- *                 the attractor outline to be visible at any moment.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -236,18 +25,16 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
 enum {
-  TRAIL_LEN          = 2500, /* per-trajectory ring length             */
-  SUB_STEPS_ODE      = 8,    /* RK4 sub-steps per tick (ODE presets)   */
-  ITERS_PER_TICK_MAP = 10,   /* discrete iterations per tick (maps)    */
-  N_GHOSTS           = 5,    /* ε-offset shadow trajectories per preset */
-  WARMUP_ITERS       = 5000, /* discard initial transient (calibration) */
-  BBOX_SAMPLES       = 50000,/* bbox probe size                         */
-  N_STARS            = 60,   /* ambient starfield density               */
+  TRAIL_LEN          = 2500, /* how many recent points each trail remembers */
+  SUB_STEPS_ODE      = 8,    /* Lorenz integration steps per tick           */
+  ITERS_PER_TICK_MAP = 10,   /* map iterations per tick                     */
+  N_GHOSTS           = 5,    /* faint shadow orbits started a hair apart    */
+  WARMUP_ITERS       = 5000, /* throwaway steps to settle onto the shape    */
+  BBOX_SAMPLES       = 50000,/* steps sampled to measure the shape's extent */
+  N_STARS            = 60,   /* backdrop dots                               */
   SPEED_MIN          = 1,
   SPEED_MAX          = 8,
   FPS_UPDATE_MS      = 500,
@@ -255,75 +42,68 @@ enum {
 
 #define NS_PER_SEC   1000000000LL
 #define NS_PER_MS    1000000LL
-#define TICK_NS      (NS_PER_SEC / 60)        /* 60 fps target          */
+#define TICK_NS      (NS_PER_SEC / 60)        /* aim for 60 frames a second */
 
-/* Main-loop timing -- both expressed against the 60 Hz fixed-step rate. */
-#define MAX_FRAME_DT_NS      (100 * NS_PER_MS) /* dt cap -- spiral-of-death guard */
-#define FIXED_TICK_DT_SEC    (1.0f / 60.0f)    /* sim-step wall time; matches TICK_NS */
+#define MAX_FRAME_DT_NS      (100 * NS_PER_MS) /* cap a frame's elapsed time so a long stall can't trigger a catch-up avalanche */
+#define FIXED_TICK_DT_SEC    (1.0f / 60.0f)    /* wall seconds one sim tick stands for */
 
-/* Bbox calibration -- guards for degenerate (single-point) attractors. */
-#define BBOX_MARGIN_FRAC      0.05f       /* bbox padding fraction       */
-#define BBOX_RADIUS_EPS       1e-6f       /* radius below this = collapse */
-#define BBOX_RADIUS_FALLBACK  1.0f        /* unit radius when bbox collapses */
+#define BBOX_MARGIN_FRAC      0.05f       /* breathing room around the measured shape */
+#define BBOX_RADIUS_EPS       1e-6f       /* below this the shape is basically a point */
+#define BBOX_RADIUS_FALLBACK  1.0f        /* stand-in size when that happens, avoids divide-by-zero */
 
-#define ORBIT_SEED            0.1f        /* common (x, y, z) seed value */
+#define ORBIT_SEED            0.1f        /* starting x=y=z for every orbit */
 
-/* Renderer sentinel -- "no previous cell painted yet" for the trail
- * dedupe check (a real cell can never be at (-999, -999)). */
+/* Marks "nothing drawn here yet" for the duplicate-cell check.  A real
+ * screen cell can never be at (-999, -999). */
 #define CELL_NONE            (-999)
 
-/* Lorenz parameters (classic chaotic regime).  Live in the AttrDef
- * (a, b, c) for SIGMA, RHO, BETA; d carries the RK4 step h. */
+/* The classic chaotic Lorenz settings.  They ride in an attractor row as
+ * a, b, c (sigma, rho, beta); d carries the integration step size. */
 #define LORENZ_SIGMA  10.0f
 #define LORENZ_RHO    28.0f
 #define LORENZ_BETA   (8.0f / 3.0f)
 #define LORENZ_H      0.005f
 
-/* HUD layout. */
 #define HUD_TOP_ROWS     2
 #define HUD_BOTTOM_ROWS  1
 
-/* View / projection. */
+/* Terminal cells are taller than they are wide; this keeps circles round. */
 #define CELL_W 8
 #define CELL_H 16
 #define ASPECT ((float)CELL_W / (float)CELL_H)   /* ≈ 0.5 */
 
-#define VIEW_PHI_DEFAULT    0.5f      /* initial azimuth (rad)            */
-#define VIEW_THETA_DEFAULT  0.55f     /* initial elevation (rad)          */
-#define VIEW_PHI_SPEED      0.08f     /* auto-rotation speed (rad/s)      */
-#define VIEW_PHI_STEP       0.10f     /* per-keypress azimuth nudge (rad) */
-#define VIEW_THETA_STEP     0.05f     /* per-keypress elevation nudge     */
-#define VIEW_THETA_MIN      0.10f     /* avoid top-down singularity       */
-#define VIEW_THETA_MAX      1.40f     /* avoid side-on singularity        */
+#define VIEW_PHI_DEFAULT    0.5f      /* starting spin angle (rad)        */
+#define VIEW_THETA_DEFAULT  0.55f     /* starting tilt angle (rad)        */
+#define VIEW_PHI_SPEED      0.08f     /* hands-free spin rate (rad/s)     */
+#define VIEW_PHI_STEP       0.10f     /* spin nudge per key press         */
+#define VIEW_THETA_STEP     0.05f     /* tilt nudge per key press         */
+#define VIEW_THETA_MIN      0.10f     /* don't tilt fully flat (it vanishes) */
+#define VIEW_THETA_MAX      1.40f     /* don't tilt fully edge-on            */
 
-#define VIEW_FILL_FRAC      0.80f     /* scale so bbox-diameter fills screen */
+#define VIEW_FILL_FRAC      0.80f     /* leave a small margin around the shape */
 
-/* Depth thresholds for the BOLD / NORMAL / DIM ramp.  Expressed as a
- * fraction of attractor radius so the cue auto-rescales for the wide
- * range of attractor sizes (Lorenz ≈ 43 vs Henon ≈ 1.7). */
+/* When does a point count as "near the camera" vs "far behind"?  Given as
+ * a fraction of the shape's size so it works for tiny and huge attractors
+ * alike (Lorenz is ~25x bigger than Henon). */
 #define DEPTH_CLOSE_FRAC   -0.25f
 #define DEPTH_FAR_FRAC      0.25f
 
-/* Trail age tier breakpoints (0 = newest, 1 = oldest). */
+/* Where the trail switches brightness, by age (0 = newest, 1 = oldest). */
 #define AGE_HEAD_LIMIT      0.25f
 #define AGE_MID_LIMIT       0.60f
 #define AGE_TAIL_LIMIT      0.80f
 
-/* Comet-head bloom -- glow halo painted around the newest 2 samples. */
+/* How many points at the very front get the glowing '+' halo. */
 #define BLOOM_HEAD_COUNT    2
 
 #define KEY_ESC  27
 
 /*
- * Colour-pair allocation (mirrors physics/lorenz.c so the visual
- * vocabulary is identical):
- *
- *   CP_TRAIL_HEAD  newest trail tier   -- A_BOLD,   theme `head`
- *   CP_TRAIL_MID   mid-age trail tier  -- A_NORMAL, theme `mid`
- *   CP_TRAIL_TAIL  oldest trail tier   -- A_DIM,    theme `tail`
- *   CP_GHOST       ghost trajectories  -- A_DIM,    theme `ghost`
- *   CP_HUD         status bar          -- canonical bright yellow 226
- *   CP_HINT        action keys         -- canonical bright cyan  51
+ * The colour slots we paint with.  The first four change with the theme;
+ * the last two are the fixed HUD colours.
+ *   head/mid/tail  the three brightness tiers of the trail, newest to oldest
+ *   ghost          the faint shadow orbits
+ *   hud / hint     status bar (yellow) and key list (cyan)
  */
 enum {
   CP_TRAIL_HEAD = 1,
@@ -337,9 +117,7 @@ enum {
 #define HUD_DATA_YELLOW_256   226
 #define HUD_TITLE_CYAN_256     51
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -358,59 +136,33 @@ static void clock_sleep_ns(int64_t ns)
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color / theme                                                      */
-/* ===================================================================== */
+/* ── §3  color / theme ── */
 
-/* ── Theme ───────────────────────────────────────────────────────────── *
+/*
+ * Theme -- one colour scheme.  Four colour codes, one for each thing the
+ * trail draws: the newest, middle, and oldest parts of the trail, plus
+ * the faint shadow orbits.  theme_apply() loads these into the live
+ * colour slots when you cycle themes.
  *
- * One palette = one Theme row.  Encodes a complete visual identity as
- * FOUR ANSI-256 colour codes -- one per ncurses pair the trail renderer
- * touches.  At runtime the four codes are bound into CP_TRAIL_HEAD /
- * CP_TRAIL_MID / CP_TRAIL_TAIL / CP_GHOST by theme_apply(idx).
+ * We pick four fixed colours rather than a smooth gradient because each
+ * character on screen can only hold one colour -- we fake the in-between
+ * shades by dimming and brightening these four (done in draw_trail).
+ * The HUD colours are separate and never change with the theme.
  *
- * WHY 4 anchors (and not a continuous gradient): ncurses has no
- *   per-cell colour interpolation -- every mvaddch lands on ONE colour
- *   pair.  We map four age tiers (head / mid / tail / ghost) onto
- *   four pairs and pick a code per tier; everything else is dithering
- *   via A_BOLD / A_DIM in draw_trail.
- *
- * WHY hand-picked (and not procedural cosine palettes): cosine
- *   gradients sweep through the muddy "in-between" zone of the cube at
- *   their sample points, producing chalky pastels for mid/tail.  Direct
- *   ANSI codes let each theme stake a vivid identity.  The brightness
- *   floor (every code has ≥1 RGB channel at max 5/5) keeps every tier
- *   legible even when painted A_DIM -- the recipe Inferno crystallised.
- *
- * WHY `short` for the codes: init_pair() takes a `short` for the colour
- *   code; matching the API type avoids a cast at every call.
- *
- * Fixed HUD pairs (CP_HUD = yellow 226, CP_HINT = cyan 51) are
- * theme-independent and bound once in color_init.
- *
- * References:
- *   [4]  Quilez 2015 -- 4-anchor head/mid/tail/ghost brightness logic
- *   [10] Ward et al  -- age-based colour encoding for trail data
+ * The codes are `short` to match what ncurses' init_pair() wants.
  */
 typedef struct {
-  const char *name;     /* HUD label, e.g. "Inferno"                   */
-  short       head;     /* newest 25% of trail -- comet leading edge   */
-  short       mid;      /* next   60%          -- comet body           */
-  short       tail;     /* oldest 20%          -- fading wake (A_DIM)  */
-  short       ghost;    /* ε-offset shadows    -- contrast accent (DIM)*/
+  const char *name;     /* shown in the HUD, e.g. "Inferno"              */
+  short       head;     /* newest part of the trail -- the bright tip    */
+  short       mid;      /* middle of the trail                           */
+  short       tail;     /* oldest part -- the fading end                 */
+  short       ghost;    /* the faint shadow orbits                       */
 } Theme;
 
 /*
- * 10 vivid 4-anchor themes.  INFERNO sets the brightness standard:
- * every code has AT LEAST ONE RGB channel at max (5/5 on the cube),
- * which keeps it saturated even when ncurses applies A_DIM to the tail
- * or ghost tier.  Codes like 99 / 105 / 171 (no channel at max) go
- * chalky under A_DIM and are avoided across the board.
- *
- * Each theme walks head → mid → tail through a coherent hue family
- * (the age ramp reads as a luminance/saturation fade), with the ghost
- * picked from a complementary saturated hue so the shadow trajectories
- * sit visually behind the main trail rather than blending in.
+ * Ten colour schemes.  Each picks colours from the bright half of the
+ * 256-colour set so even the faded tail and dim shadows stay readable --
+ * picking dull mid-cube colours would wash out once we dim them.
  */
 static const Theme THEMES[] = {
   /*  name           head  mid  tail  ghost   palette character                  */
@@ -427,14 +179,8 @@ static const Theme THEMES[] = {
 };
 #define N_THEMES ((int)(sizeof THEMES / sizeof THEMES[0]))
 
-/*
- * theme_apply -- rebind the THEME-DEPENDENT colour pairs for theme
- * `idx`.  Fixed HUD pairs (CP_HUD, CP_HINT) are NOT touched -- they
- * live in color_init and stay constant across themes.
- *
- * Stateless: takes the desired index, applies it, returns.  The
- * "current theme" is tracked by Scene.theme_idx (§7); no globals.
- */
+/* Load one theme's four colours into the live trail slots.  The HUD
+ * colours are left alone -- they never change with the theme. */
 static void theme_apply(int idx)
 {
   if (idx < 0 || idx >= N_THEMES) return;
@@ -446,7 +192,7 @@ static void theme_apply(int idx)
     init_pair(CP_TRAIL_TAIL, th->tail,  -1);
     init_pair(CP_GHOST,      th->ghost, -1);
   } else {
-    /* 8-colour ANSI fallback -- themes collapse to one palette. */
+    /* On an 8-colour terminal all themes look the same. */
     init_pair(CP_TRAIL_HEAD, COLOR_RED,     -1);
     init_pair(CP_TRAIL_MID,  COLOR_YELLOW,  -1);
     init_pair(CP_TRAIL_TAIL, COLOR_GREEN,   -1);
@@ -454,11 +200,7 @@ static void theme_apply(int idx)
   }
 }
 
-/*
- * color_init -- one-shot at startup.  Binds the two FIXED HUD pairs
- * (yellow status, cyan hints) and applies theme 0 as a sensible
- * default; scene_init then keeps Scene.theme_idx in sync.
- */
+/* Set up the fixed HUD colours once and load the first theme. */
 static void color_init(void)
 {
   start_color();
@@ -474,21 +216,13 @@ static void color_init(void)
   theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  coords -- orthographic 3-D → 2-D projection                       */
-/* ===================================================================== */
+/* ── §4  coords: turning a 3-D point into a screen cell ── */
 
-/* ── project() math primitives ──────────────────────────────────────── *
- *
- * The full 3-D → 2-D pipeline is four named transformations applied in
- * order -- translate the world so the attractor is centred at the
- * origin, rotate around z by azimuth φ, tilt around x by elevation θ,
- * then map (sx, sy) to a terminal cell.  Each step gets a tiny helper
- * so the orchestrator project() reads as the textbook recipe [5].
- */
+/* Three small steps that project() chains together: shift so the shape
+ * sits at the origin, spin it, then tilt it. */
 
-/* (1) TRANSLATE -- recentre (lx, ly, lz) so the attractor sits on the
- *     origin.  Pure shift; the bbox centre comes from §5 calibration. */
+/* Shift the point so the shape's centre lands at the origin.  The centre
+ * comes from the size measurement in §5. */
 static inline void world_center_to_origin(float lx, float ly, float lz,
                                           float cx, float cy, float cz,
                                           float *px, float *py, float *pz)
@@ -498,9 +232,8 @@ static inline void world_center_to_origin(float lx, float ly, float lz,
   *pz = lz - cz;
 }
 
-/* (2) ROTATE AROUND Z by azimuth φ.  Standard 2-D rotation in the
- *     (x, y) plane; convention puts the camera implicitly along +y
- *     after rotation, so ry becomes the "into-screen" axis. [5] */
+/* Spin the point around the vertical axis by angle phi -- this is what
+ * turns the shape left/right as you watch. */
 static inline void rotate_around_z_axis(float px, float py, float phi,
                                         float *rx, float *ry)
 {
@@ -509,10 +242,9 @@ static inline void rotate_around_z_axis(float px, float py, float phi,
   *ry = -px * s + py * c;
 }
 
-/* (3) TILT AROUND X by elevation θ.  Rotates the (ry, pz) plane.
- *     After tilt, sy is the vertical screen coord and sz is the
- *     camera-axis depth (positive = behind centre / farther from
- *     camera; negative = in front / closer). [5] */
+/* Tilt the point up/down by angle theta.  sy ends up as the on-screen
+ * height; sz is how far the point sits from the camera (negative = in
+ * front / closer, positive = behind / farther) -- used for shading. */
 static inline void tilt_around_x_axis(float ry, float pz, float theta,
                                       float *sy, float *sz)
 {
@@ -522,19 +254,10 @@ static inline void tilt_around_x_axis(float ry, float pz, float theta,
 }
 
 /*
- * project() -- map an attractor-space point to terminal (col, row,
- * depth).  Pseudocode pipeline:
- *
- *   (1) translate world so attractor centre → origin
- *   (2) rotate around z by azimuth φ              → (rx, ry, pz)
- *   (3) tilt   around x by elevation θ            → (sx, sy) + depth sz
- *   (4) scale + offset to cell coords             → (col, row)
- *   (5) clip to the renderable band               → return false if off
- *
- * out_depth: pass NULL when the caller doesn't need depth shading
- * (e.g. starfield -- still uses depth, but a separate path).
- *
- * Returns false if (col, row) falls outside the renderable band.
+ * Turn a point in attractor space into a screen cell (column, row) plus
+ * its distance from the camera.  Shift to centre, spin, tilt, then scale
+ * into cell coordinates.  Pass NULL for out_depth if you don't need the
+ * distance.  Returns false when the point falls off the visible area.
  */
 static bool project(float lx, float ly, float lz,
                     float cx, float cy, float cz,
@@ -544,46 +267,41 @@ static bool project(float lx, float ly, float lz,
 {
   float px, py, pz;
   world_center_to_origin(lx, ly, lz, cx, cy, cz,
-                         &px, &py, &pz);                          /* (1) */
+                         &px, &py, &pz);
 
   float rx, ry;
-  rotate_around_z_axis(px, py, phi, &rx, &ry);                    /* (2) */
+  rotate_around_z_axis(px, py, phi, &rx, &ry);
 
   float sx = rx;
   float sy, sz;
-  tilt_around_x_axis(ry, pz, theta, &sy, &sz);                    /* (3) */
+  tilt_around_x_axis(ry, pz, theta, &sy, &sz);
 
-  int col = screen_cx + (int)(sx * scale);                        /* (4) */
+  /* place it on the grid (ASPECT keeps it from looking squashed) */
+  int col = screen_cx + (int)(sx * scale);
   int row = screen_cy - (int)(sy * scale * ASPECT);
 
   if (out_col)   *out_col   = col;
   if (out_row)   *out_row   = row;
   if (out_depth) *out_depth = sz;
 
+  /* off-screen, or in the rows reserved for the HUD? caller skips it */
   return (col >= 0 && col < cols
-       && row >= HUD_TOP_ROWS && row < rows - HUD_BOTTOM_ROWS);   /* (5) */
+       && row >= HUD_TOP_ROWS && row < rows - HUD_BOTTOM_ROWS);
 }
 
-/* ===================================================================== */
-/* §5  attractor definitions                                              */
-/* ===================================================================== */
+/* ── §5  attractor definitions ── */
 
 /*
- * AttrDef -- one preset.
+ * AttrDef -- one of the ten presets.
  *
- * The `step` function pointer encodes WHICH formula this preset uses;
- * the (a, b, c, d) floats provide its parameters.  Function-pointer
- * dispatch (vs an int type-tag + switch) keeps `attractor_step` a
- * one-liner regardless of how many distinct formulas we add.
+ * `step` is a function pointer: it picks which formula advances the orbit
+ * one step, so adding a new attractor is just adding a row plus a step
+ * function -- no big switch to edit.  a, b, c, d are that formula's knobs.
  *
- * The step signature carries THREE state pointers (x, y, z) because
- * the Lorenz ODE has 3-D state.  2-D maps ignore z (they take
- * `(void)*z` to silence the unused-parameter warning).
- *
- * is_continuous = true for ODE presets that integrate a vector field
- * (Lorenz).  scene_tick uses this to switch from per-tick discrete
- * iteration (ITERS_PER_TICK_MAP iters/tick) to RK4 sub-stepping
- * (SUB_STEPS_ODE × h Lorenz-time per tick).
+ * Every step takes x, y, z because Lorenz needs all three; the flat 2-D
+ * maps just ignore z.  is_continuous flags Lorenz, the one preset that's
+ * a smooth flowing curve rather than a sequence of jumps -- scene_tick
+ * uses it to choose how to advance the orbit.
  */
 struct AttrDef;
 typedef void (*attr_step_fn)(const struct AttrDef *at,
@@ -591,14 +309,16 @@ typedef void (*attr_step_fn)(const struct AttrDef *at,
 
 typedef struct AttrDef {
   const char  *name;
-  float        a, b, c, d;
-  attr_step_fn step;
-  bool         is_continuous;
+  float        a, b, c, d;     /* the formula's tuning knobs            */
+  attr_step_fn step;           /* the formula that moves the orbit one step */
+  bool         is_continuous;  /* true only for Lorenz (a smooth curve) */
 } AttrDef;
 
-/* ---- discrete-map step formulas (one per family) -------------------- */
+/* Each function below is one attractor's formula -- given the current
+ * point, it works out the next one.  The math is the attractor; the
+ * comment names it and cites where the formula comes from. */
 
-/* Henon (1976) [8]: x' = 1 − a·x² + y,   y' = b·x  (canonical chaotic map). */
+/* Henon (1976): x' = 1 - a*x^2 + y,   y' = b*x */
 static void henon_step(const AttrDef *at, float *x, float *y, float *z)
 {
   (void)z;
@@ -608,7 +328,7 @@ static void henon_step(const AttrDef *at, float *x, float *y, float *z)
 }
 
 /* Hopalong (Barry Martin):
- *   x' = y − sign(x) · √|b·x − c|,   y' = a − x. */
+ *   x' = y - sign(x) * sqrt|b*x - c|,   y' = a - x */
 static void hopalong_step(const AttrDef *at, float *x, float *y, float *z)
 {
   (void)z;
@@ -661,17 +381,14 @@ static void bedhead_step(const AttrDef *at, float *x, float *y, float *z)
   *x = nx; *y = ny;
 }
 
-/* ---- Lorenz ODE + RK4 ----------------------------------------------- */
+/* ---- Lorenz: the one continuous-flow preset ---- */
 
 /*
- * lorenz_deriv -- evaluate the Lorenz vector field at (x, y, z).
- *
- *   dx/dt = σ·(y − x)
- *   dy/dt = x·(ρ − z) − y
- *   dz/dt = x·y − β·z
- *
- * Autonomous (no explicit t), so each call only depends on the
- * current state.  Inlined for the RK4 stages below.
+ * Which way the Lorenz orbit is heading right now -- its velocity at the
+ * current point (Lorenz 1963).
+ *   dx/dt = sigma*(y - x)
+ *   dy/dt = x*(rho - z) - y
+ *   dz/dt = x*y - beta*z
  */
 static inline void lorenz_deriv(float x, float y, float z,
                                 float *dx, float *dy, float *dz)
@@ -682,17 +399,11 @@ static inline void lorenz_deriv(float x, float y, float z,
 }
 
 /*
- * lorenz_step -- one classical four-stage Runge-Kutta step [3].
- *
- *   k1 = f(y_n)
- *   k2 = f(y_n + h/2 · k1)
- *   k3 = f(y_n + h/2 · k2)
- *   k4 = f(y_n + h   · k3)
- *   y_{n+1} = y_n + h/6 · (k1 + 2 k2 + 2 k3 + k4)
- *
- * Global error O(h⁴).  At h = 0.005 the per-step error ≈ 6×10⁻¹⁰,
- * well below float precision over the first ten seconds of simulated
- * time -- the orbit stays on the true attractor visually forever.
+ * Move the Lorenz orbit forward one small step using RK4 -- a recipe that
+ * samples the velocity four times across the step and blends them, far
+ * more accurate than a single straight-line guess.  The step h = 0.005 is
+ * small enough that the orbit looks dead-on for as long as you'll watch.
+ * (Press et al., *Numerical Recipes*, Ch.17.)
  */
 static void lorenz_step(const AttrDef *at, float *x, float *y, float *z)
 {
@@ -715,13 +426,8 @@ static void lorenz_step(const AttrDef *at, float *x, float *y, float *z)
   *z += (h / 6.0f) * (k1z + 2.0f * k2z + 2.0f * k3z + k4z);
 }
 
-/* ---- the preset table (simple → complex) ---------------------------- *
- *
- * The (a, b, c, d) tuples below come from Sprott [7] and Bourke [9]
- * (paulbourke.net/fractals).  Each row is one preset in the order the
- * `n`/`p`/`1..0` keys jump through them.
- */
-
+/* The ten presets, in the order the n/p and number keys step through.
+ * The a,b,c,d values are the well-known tunings from Sprott and Bourke. */
 static const AttrDef ATTRS[] = {
   /*  name           a              b              c             d           step             continuous */
   { "Henon",       1.40f,         0.30f,         0.00f,         0.00f,    henon_step,      false },
@@ -737,100 +443,57 @@ static const AttrDef ATTRS[] = {
 };
 #define N_ATTRS  ((int)(sizeof ATTRS / sizeof ATTRS[0]))
 
-/* Polymorphic dispatcher: one step of whichever map / ODE this is. */
+/* Move the orbit one step using whichever formula this preset carries. */
 static inline void attractor_step(const AttrDef *at,
                                   float *x, float *y, float *z)
 {
   at->step(at, x, y, z);
 }
 
-/* ===================================================================== */
-/* §6  orbits  --  Point3, Trail (ring buffer), Orbit (pos + Trail)      */
-/* ===================================================================== */
+/* ── §6  orbits: one moving point and the trail it leaves ── */
 
 /*
- * §6 builds the abstractions for tracking ONE moving particle through
- * attractor-space.  Three types in a clean composition stack:
- *
- *   Point3   atomic   -- one (x, y, z) sample in attractor-space
- *   Trail    bounded  -- ring buffer of recent Point3 samples
- *   Orbit    composite-- current Point3 + a Trail (the two pieces
- *                        that always travel together for one particle)
- *
- * Scene (§7) holds 1 main Orbit + N_GHOSTS ghost Orbits.
+ * Three nested pieces for tracking one moving point:
+ *   Point3  one spot in space
+ *   Trail   the last few thousand spots it visited
+ *   Orbit   where it is now, plus its Trail
+ * The Scene (§7) holds one main Orbit plus a handful of shadow Orbits.
  */
 
-/* ── Point3 ──────────────────────────────────────────────────────────── *
- *
- * Bare 3-coord point in attractor-space.  Used as the atomic element
- * inside Trail (a ring of Point3) and as the "current position" field
- * of an Orbit.
- *
- * WHY a struct (and not three loose floats): lets a single point pass
- *   by value through one parameter slot.  Before this type existed,
- *   every helper that handled "a position" had to take three floats
- *   AND every Trail field had to be parallel arrays just to avoid
- *   defining this type.  Adding the 12-byte struct simplifies the
- *   whole stack.
- *
- * WHY not Vec3 / vec3: in dynamical-systems literature a trajectory is
- *   a sequence of POINTS (not vectors).  "Point3" reads correctly
- *   whether the value is a current position or a recorded sample.
- */
+/* One point in the attractor's 3-D space.  A struct (not three loose
+ * floats) so a point can be passed and returned as one value. */
 typedef struct {
-  float x, y, z;     /* attractor-space coordinates                   */
+  float x, y, z;
 } Point3;
 
-/* ── Trail ───────────────────────────────────────────────────────────── *
+/*
+ * Trail -- the recent history of one orbit, drawn as the glowing tail.
  *
- * Bounded history of recent orbit samples for one trajectory --
- * implemented as a circular (ring) buffer of Point3.
+ * It's a ring buffer: a fixed array that wraps around, so once it's full
+ * each new point overwrites the oldest one.  The orbit runs forever, so a
+ * plain growing array would either leak memory or fill up -- the ring
+ * keeps the last TRAIL_LEN points and nothing more.
  *
- * WHY a ring buffer (and not a linear append-only array):
- *   the orbit runs forever; a linear buffer would either grow
- *   unbounded (memory leak) or stop recording at a cap (info loss).
- *   A ring of TRAIL_LEN slots overwrites the oldest sample on each
- *   push -- bounded memory, O(1) push, and the last TRAIL_LEN samples
- *   are always available.  TRAIL_LEN = 2500 covers ≈ 4 s of orbit
- *   history at the 60 fps × 10 iter/tick cadence (and ≈ 5 s for Lorenz
- *   at 60 fps × 8 RK4 sub-steps).
- *
- * WHY {head, count} (and not {head, tail}):
- *   the buffer fills monotonically (no element is ever removed except
- *   by overwrite), so a tail pointer would just be head − count + 1
- *   mod TRAIL_LEN -- redundant.  `count` also gives the renderer a
- *   free progress signal: count < TRAIL_LEN means the ring isn't full
- *   yet, so the oldest end shows what's actually there rather than
- *   uninitialised noise.
- *
- * WHY array-of-Point3 (AoS) and not three parallel float arrays (SoA):
- *   earlier revisions used parallel arrays to avoid needing a 3-coord
- *   type.  Now that Point3 exists, AoS reads cleaner -- the ring is
- *   visibly "a ring of points", not "three coincidental arrays".
- *   Cache behaviour is identical: the renderer reads all three coords
- *   per sample inside one loop iteration anyway.
- *
- * Memory: TRAIL_LEN × sizeof(Point3) = 2500 × 12 = 30 KB per trail.
- * With 1 main + N_GHOSTS = 5 ghosts = 6 trails per scene → ≈ 180 KB.
- *
- * Reference: classic circular-buffer pattern; see Sedgewick &
- * Wayne, *Algorithms* 4th ed., §1.3 (queue with bounded capacity).
+ * `head` is where the newest point sits; `count` is how many points are
+ * real so far (it climbs to TRAIL_LEN as the ring fills, then stays
+ * there).  We track count rather than a second index because the ring
+ * only ever fills, never drains -- a tail index would be redundant, and
+ * count also tells the renderer not to draw empty slots.
  */
 typedef struct {
-  Point3 data[TRAIL_LEN]; /* ring storage -- index 0..TRAIL_LEN-1     */
-  int    head;            /* index of NEWEST sample; written-into     */
-  int    count;           /* valid samples in ring, ≤ TRAIL_LEN       */
+  Point3 data[TRAIL_LEN]; /* the ring storage                          */
+  int    head;            /* slot holding the newest point             */
+  int    count;           /* how many real points so far (<= TRAIL_LEN)*/
 } Trail;
 
-/* trail_clear -- reset to empty ring (no samples). */
+/* Empty the trail. */
 static void trail_clear(Trail *t)
 {
   t->head  = 0;
   t->count = 0;
 }
 
-/* trail_push -- record one sample.  Advances head, overwrites oldest
- * slot when the ring is full (count == TRAIL_LEN). */
+/* Add one point, overwriting the oldest once the ring is full. */
 static void trail_push(Trail *t, Point3 p)
 {
   t->head = (t->head + 1) % TRAIL_LEN;
@@ -838,348 +501,182 @@ static void trail_push(Trail *t, Point3 p)
   if (t->count < TRAIL_LEN) t->count++;
 }
 
-/* trail_at -- read the k-th NEWEST sample (k = 0 is the most recent,
- * k = t->count - 1 is the oldest).  Hides the ring's modular index
- * arithmetic from callers so consumer loops read as "for each sample
- * from newest to oldest" instead of computing indices by hand.
- *
- * Undefined for k < 0 or k >= t->count -- caller must respect count. */
+/* Fetch the k-th newest point (k=0 is newest).  Hides the wrap-around
+ * arithmetic so loops can just walk newest-to-oldest.  Caller must keep
+ * k within count. */
 static inline Point3 trail_at(const Trail *t, int k)
 {
   int idx = (t->head - k + TRAIL_LEN) % TRAIL_LEN;
   return t->data[idx];
 }
 
-/* ── Orbit ───────────────────────────────────────────────────────────── *
- *
- * One trajectory through attractor-space: the CURRENT position + a
- * TRAIL of recent samples.  Bundles the two pieces of state that
- * always travel together -- you never want to advance the position
- * without recording it, or read the trail without knowing the live
- * head's position.
- *
- * WHY a struct (and not loose pos floats + a separate Trail):
- *   the previous revision had main = (mx, my, mz, mt) and PARALLEL
- *   ghost arrays = (gx[], gy[], gz[], gt[]) -- seven Scene fields for
- *   one conceptual object, repeated for N_GHOSTS more.  Wrapping
- *   them into Orbit makes the abstraction visible: "Scene has one
- *   main Orbit and N_GHOSTS ghost Orbits".  Ghosts become an array
- *   of Orbits, not four coincidental parallel arrays.
- *
- * WHY pos AND trail live in the same struct (vs trail-only with
- *   pos = trail_at(t, 0)):
- *   the position is an INPUT to the next attractor_step (needs to be
- *   mutated in place); reading it back from the trail every step
- *   would mean head-index math on the hot path.  Keeping `pos` as a
- *   live mutable field + pushing a copy into the trail keeps both
- *   roles explicit and avoids hidden coupling.
+/*
+ * Orbit -- one moving point: where it is now, plus its Trail.  The two
+ * always travel together (every step moves the point and records it), so
+ * they live in one struct.  We keep the live position separately rather
+ * than re-reading the trail's head each step, since it's the input the
+ * next step works from.
  */
 typedef struct {
-  Point3 pos;          /* current attractor-space position             */
-  Trail  trail;        /* ring of past positions (newest at head)      */
+  Point3 pos;          /* where the point is right now                 */
+  Trail  trail;        /* the points it has visited recently           */
 } Orbit;
 
-/* orbit_seed -- set initial conditions: place the particle at p and
- * clear its trail.  Used by scene_seed_trajectories at reset. */
+/* Drop the orbit at a starting point and wipe its trail. */
 static void orbit_seed(Orbit *o, Point3 p)
 {
   o->pos = p;
   trail_clear(&o->trail);
 }
 
-/* orbit_step -- one iterate: advance pos via the attractor's step
- * function, then record the new pos in the trail.  All trajectories
- * (main + ghosts) advance through this single function so they stay
- * in LOCKSTEP -- same iteration index across the scene, which is what
- * lets ε-divergence between ghosts be visually meaningful. */
+/* Advance one step and record the new spot.  Every orbit (main and
+ * shadows) goes through here so they all take the same number of steps --
+ * that's what makes the shadows drifting apart actually mean something. */
 static void orbit_step(Orbit *o, const AttrDef *at)
 {
   attractor_step(at, &o->pos.x, &o->pos.y, &o->pos.z);
   trail_push(&o->trail, o->pos);
 }
 
-/* ===================================================================== */
-/* §7  scene                                                              */
-/* ===================================================================== */
+/* ── §7  scene ── */
 
 /*
- * §7 organises the SCENE -- everything that lives in attractor space
- * and gets projected onto the terminal each frame.  Four nested types
- * carve up that scope so each has a clean single job:
- *
- *   Camera    -- viewer pose: azimuth φ, elevation θ, auto-rotate flag.
- *                Written by handle_key (or drifted by scene_tick when
- *                auto-rotate is on); read by every renderer.
- *
- *   Bounds    -- attractor spatial extent: axis-aligned bbox PLUS the
- *                derived centre (translation origin) and diagonal
- *                radius (drives view scale + depth normalisation).
- *                Written by scene_calibrate_bounds at reset; read by
- *                project() / compute_view_scale / depth shading.
- *
- *   Starfield -- N_STARS ambient backdrop points in attractor-space.
- *                Self-initialising; projected with the same Camera as
- *                the trail so the parallax matches.
- *
- *   RenderCtx -- per-frame derived view state: cols/rows, screen
- *                centre, projection scale, depth normaliser.  Built
- *                once at the top of scene_draw and threaded through
- *                every draw helper -- replaces a 9-parameter signature
- *                with a single pointer.
- *
- *   Scene     -- the umbrella struct.  Owns trajectories + Trails,
- *                Camera, Bounds, Starfield, UI flags, speed.  ONE
- *                Scene per program, inside g_app (§10).
+ * The scene is everything that lives in attractor space and gets painted
+ * each frame.  It splits into a few small pieces:
+ *   Camera     where you're looking from (two angles)
+ *   Bounds     how big the current attractor is, so it fits the screen
+ *   Starfield  the backdrop dots
+ *   RenderCtx  a few numbers worked out fresh each frame for drawing
+ *   Scene      the whole thing, wrapping the orbits plus all of the above
  */
 
-/* ── Camera ──────────────────────────────────────────────────────────── *
+/*
+ * Camera -- where we're viewing from, as two angles.  No eye position is
+ * needed because the projection has no perspective; only the direction we
+ * look from matters.
  *
- * The viewer pose for an ORTHOGRAPHIC projection.  Just two angles --
- * azimuth φ + elevation θ -- because orthographic has no eye position
- * (rays are parallel) and no perspective foreshortening; what matters
- * is the rotation that maps world-space to camera-space.
- *
- *   phi      ROTATION around the world z-axis (spin the world around
- *            its vertical axis -- like rotating a globe).  φ = 0
- *            looks down the +y axis; +φ rotates the world clockwise
- *            as seen from above.  Wraps freely (any real value).
- *
- *   theta    TILT around the camera-local x-axis after the spin
- *            (lean the camera up or down).  θ near 0 looks edge-on
- *            (degenerate flat view); θ near π/2 looks straight down.
- *            Clamped to [VIEW_THETA_MIN, VIEW_THETA_MAX] = [0.10, 1.40]
- *            so the view stays oblique and the attractor doesn't
- *            collapse into a line.
- *
- *   auto_rotate
- *            Camera MODE flag.  When true, scene_tick drifts phi by
- *            VIEW_PHI_SPEED · dt each tick (hands-free demo).  When
- *            false, phi only changes via ← / → keys.  Lives inside
- *            Camera (not Scene's UI block) because it's about how the
- *            camera moves itself, not a renderer toggle.
- *
- * The full 3-D → 2-D pipeline that consumes (φ, θ) is the 4-step
- * orthographic recipe in §4 -- translate → rotate-z → tilt-x → scale.
- *
- * Reference: [5] Foley et al. Ch.6 -- orthographic camera with
- * azimuth/elevation parameterisation (avoids gimbal lock for any
- * (φ, θ) the input clamps allow).
+ *   phi    spin angle -- turns the shape left and right, like spinning a
+ *          globe.  Any value; it just wraps around.
+ *   theta  tilt angle -- leans the view up or down.  Kept between
+ *          VIEW_THETA_MIN and MAX so it never goes fully flat (the shape
+ *          would vanish to a line) or straight down.
+ *   auto_rotate  when on, the view drifts by itself; the arrow keys turn
+ *          it off and let you aim by hand.
  */
 typedef struct {
-  float phi;           /* azimuth (rad) -- spin around world z-axis    */
-  float theta;         /* elevation (rad) -- tilt around camera x-axis */
-  bool  auto_rotate;   /* if true, scene_tick advances phi each tick   */
+  float phi;           /* spin angle (rad)                             */
+  float theta;         /* tilt angle (rad)                             */
+  bool  auto_rotate;   /* drift the view on its own when true          */
 } Camera;
 
-/* ── Bounds ──────────────────────────────────────────────────────────── *
+/*
+ * Bounds -- how big the current attractor is and where its middle sits.
+ * Measured once per preset (scene_calibrate_bounds) and cached here so the
+ * renderer isn't recomputing it for every point.
  *
- * The attractor's spatial extent, in three forms that the renderer
- * consumes at different stages:
+ *   xmin..zmax  the box that just contains the shape, with a little
+ *               padding so its edges don't get clipped.
+ *   cx, cy, cz  the box's centre.  project() subtracts this so the shape
+ *               sits in the middle of the screen, not off in a corner.
+ *   radius      roughly the shape's size (half its diagonal).  Used both
+ *               to scale it to fit the screen and as the yardstick for the
+ *               near/far shading -- so it all works whether the attractor
+ *               is tiny (Henon) or large (Lorenz).
  *
- *   xmin..zmax  RAW axis-aligned bounding box (AABB).  Computed once
- *               per preset by scene_calibrate_bounds: walk WARMUP_ITERS
- *               iterates to land on the attractor, then walk
- *               BBOX_SAMPLES more and track per-axis min/max.  Padded
- *               by BBOX_MARGIN_FRAC so the extremes don't sit on the
- *               projection clip plane.
- *
- *   cx, cy, cz  TRANSLATION ORIGIN -- the bbox midpoint.  Subtracted
- *               from every world point in project()'s step (1) so the
- *               attractor's centre lands at the screen centre instead
- *               of in some corner.  Cached here (not recomputed per
- *               sample) because the renderer reads it ~1500 times per
- *               frame and a bbox doesn't change between resets.
- *
- *   radius      ATTRACTOR-SCALE NUMBER -- half the bbox diagonal.
- *               Drives two unrelated things downstream:
- *                 (a) compute_view_scale picks scale = screen_dim /
- *                     (2·radius·fill_frac) so the orbit fills the
- *                     terminal regardless of preset size (Lorenz ≈ 43
- *                     vs Hénon ≈ 1.7).
- *                 (b) depth-cue thresholds in DEPTH_CLOSE_FRAC /
- *                     DEPTH_FAR_FRAC are expressed as fractions of
- *                     radius so they auto-rescale per preset.
- *
- * WHY store raw bbox AND derived centre/radius (instead of just one):
- *   cx/cy/cz/radius are pure functions of xmin..zmax, but they're hot-
- *   path reads.  Computing them per sample would burn cycles inside
- *   project(); computing them once per scene_reset and caching them
- *   here is the classic "precompute derived values" trade.
- *
- * For 2-D map presets, zmin = zmax = 0 (the orbit lives in z = 0) and
- * the projection degenerates to a rotation of a flat figure -- still
- * a valid AABB, just one whose z extent is exactly zero.
- *
- * Reference: [5] Foley et al. Ch.12 -- axis-aligned bounding volumes;
- * the "diagonal half-length" is the bounding sphere radius.
+ * For the flat 2-D presets the z range is zero -- still a valid box, just
+ * a flat one.
  */
 typedef struct {
-  float xmin, xmax;    /* per-axis extremes from BBOX_SAMPLES probe    */
+  float xmin, xmax;    /* the bounding box, per axis                   */
   float ymin, ymax;
   float zmin, zmax;
-  float cx, cy, cz;    /* bbox midpoint -- projection translation      */
-  float radius;        /* 0.5 · sqrt(bw² + bh² + bd²) -- scale driver  */
+  float cx, cy, cz;    /* box centre -- the point we centre on screen  */
+  float radius;        /* rough size of the shape (half the diagonal)  */
 } Bounds;
 
-/* ── Starfield ───────────────────────────────────────────────────────── *
+/*
+ * Starfield -- the backdrop dots.  N_STARS fixed points scattered in a
+ * box around the attractor.  They spin with the same camera as the orbit,
+ * so as the view turns, far stars slide past near ones -- that motion is
+ * what makes the scene read as 3-D, no real depth buffer needed.
  *
- * N_STARS = 60 fixed 3-D points scattered in a box around the attractor,
- * acting as an ambient backdrop.  Projected with the SAME Camera as the
- * orbit each frame, so the stars rotate WITH the view -- creating
- * motion parallax: distant stars sweep behind the attractor as the
- * camera spins, a strong monocular depth cue without needing a real
- * z-buffer.
+ * The box (±40 wide) is sized to comfortably wrap even the biggest preset
+ * (Lorenz, ~±25); for the tiny ones it just looks like a wide starry sky.
  *
- * BOX GEOMETRY (in attractor-space units):
- *   x, y  ∈ [-40, +40]      isotropic horizontal extent
- *   z     ∈ [-20, +40]      asymmetric vertical box -- more depth
- *                           BEHIND the camera-elevation plane than in
- *                           front, so most stars are far away
- *
- * The ±40 sizing was picked to comfortably enclose the LARGEST preset
- * (Lorenz ≈ ±25) and extend well past the SMALLEST (Hénon ≈ ±1.5).
- * For small attractors the star field looks like a wide sky around a
- * tiny painting; for large ones the stars sit just outside the orbit
- * envelope, like satellites.
- *
- * WHY a struct (and not 3 globals): puts the lifetime + ownership
- *   inside Scene where it belongs.  Earlier revisions had g_star_x[]
- *   / g_star_y[] / g_star_z[] / g_stars_initialised as file-scope
- *   globals -- that worked but obscured the fact that the starfield
- *   IS scene state.
- *
- * WHY parallel x[]/y[]/z[] arrays (SoA, not AoS): exact same trade-off
- *   as Trail -- the renderer reads all three coords per star anyway, so
- *   layout doesn't matter for cache.  SoA matches the LCG-driven
- *   per-coord seeding loop in starfield_init.
- *
- * WHY `initialised` flag (lazy-init pattern): starfield_init is
- *   idempotent -- callable multiple times safely.  scene_init triggers
- *   the FIRST init; future scene_resets skip it (the stars don't need
- *   to change when the attractor preset changes -- the backdrop is
- *   preset-independent).
- *
- * Reference: [5] Foley et al. Ch.14 -- motion parallax as a depth cue
- * (objects at different depths displace by amounts proportional to
- * their depth, when the camera moves).
+ * `initialised` lets us seed the stars exactly once -- the backdrop is the
+ * same for every attractor, so switching presets leaves it untouched.
  */
-#define STAR_BOX_HALF_EXTENT  40.0f   /* x,y box half-width (attr units) */
-#define STAR_BOX_Z_MIN       -20.0f   /* z box near plane                */
-#define STAR_BOX_Z_RANGE      60.0f   /* z box depth (so zmax = +40)     */
+#define STAR_BOX_HALF_EXTENT  40.0f   /* half-width of the x,y box        */
+#define STAR_BOX_Z_MIN       -20.0f   /* near edge of the depth box       */
+#define STAR_BOX_Z_RANGE      60.0f   /* depth of the box (far edge = +40)*/
 
 typedef struct {
-  float x[N_STARS];    /* per-star world coords, attractor-space units  */
+  float x[N_STARS];    /* where each star sits                          */
   float y[N_STARS];
   float z[N_STARS];
-  bool  initialised;   /* lazy-init guard -- set true on first init     */
+  bool  initialised;   /* seed them only the first time                 */
 } Starfield;
 
-/* ── RenderCtx ───────────────────────────────────────────────────────── *
- *
- * A FRAME-LOCAL CACHE: derived view state that is constant for one
- * frame but computed FROM (Screen, Scene) state that can change
- * between frames.  Built once at the top of scene_draw by
- * render_ctx_make() and threaded through every draw helper, so each
- * one can take (scene, ctx) instead of 9 loose floats.
- *
- * WHY a struct (and not pass these as parameters): draw_trail wants
- *   six values to project a point and clip to the renderable band.
- *   Passing them individually meant an 11-parameter signature that
- *   was hostile to read.  Bundling them into one pointer turns every
- *   draw helper into a 2-parameter function -- the textbook
- *   "parameter object" refactor.
- *
- * WHY rebuild every frame (vs cache on Scene): the inputs (cols, rows
- *   from Screen; bounds.radius from Scene) can change at any time --
- *   SIGWINCH resizes, scene_reset recalibrates bounds.  Recomputing 6
- *   floats once per frame is free; mutating Scene to invalidate a
- *   cache would couple draw to event handling.
- *
- * FIELD PROVENANCE (where each value comes from):
- *
- *   cols, rows           ← Screen (terminal geometry from getmaxyx)
- *   screen_cx            ← cols / 2
- *   screen_cy            ← centred between HUD top + bottom bars
- *   scale                ← compute_view_scale(bounds, cols, rows)
- *                          picks min(scale_x, scale_y) so the
- *                          attractor diagonal fills VIEW_FILL_FRAC of
- *                          the smaller dimension after aspect ratio
- *   depth_unit           ← bounds.radius (attractor's diagonal half-
- *                          length, used as the unit for normalising
- *                          camera-axis depth into [-1, +1] before
- *                          comparing against DEPTH_CLOSE/FAR_FRAC)
- *
- * Nothing inside RenderCtx is persistent; pointers to it never escape
- * scene_draw's stack frame.
+/*
+ * RenderCtx -- a few view numbers worked out once at the start of each
+ * frame and handed to every draw helper, so they take (scene, ctx)
+ * instead of a long list of loose values.  Rebuilt every frame because
+ * the terminal can be resized or the preset switched at any time;
+ * recomputing five numbers per frame costs nothing.
+ *   cols, rows           the terminal size
+ *   screen_cx/cy         where on screen the shape's centre goes
+ *   scale                attractor units to screen cells
+ *   depth_unit           the size yardstick the near/far shading uses
  */
 typedef struct {
-  int   cols, rows;       /* terminal extent (from Screen.cols/rows)  */
-  int   screen_cx;        /* projection origin col (= cols / 2)       */
-  int   screen_cy;        /* projection origin row (between HUD bars) */
-  float scale;            /* attractor-units → cell units             */
-  float depth_unit;       /* normaliser for depth-cue thresholds      */
+  int   cols, rows;       /* terminal size                            */
+  int   screen_cx;        /* where the shape's centre lands, column   */
+  int   screen_cy;        /* where the shape's centre lands, row      */
+  float scale;            /* attractor units -> screen cells          */
+  float depth_unit;       /* size yardstick for near/far shading      */
 } RenderCtx;
 
 /*
- * GHOST_EPS_TABLE -- per-ghost initial x-offset (attractor units).
- * Spans four orders of magnitude (0.001 → 0.1) so the divergence
- * timescale is visible across one viewing session.  For Lorenz
- * (λ ≈ 0.9 [6]) the smallest ε reaches attractor scale in ~10 s;
- * for discrete maps each ghost is just another iterate cloud
- * exploring the attractor -- still visually pleasing.
+ * How far each shadow orbit starts from the main one.  The tiny gaps span
+ * a wide range (0.001 up to 0.1) so you can watch them peel away at
+ * different rates within one sitting.  On Lorenz the smallest gap grows to
+ * fill the whole shape in about ten seconds -- chaos made visible; on the
+ * flat maps the shadows just make extra pretty dots.
  */
 static const float GHOST_EPS_TABLE[N_GHOSTS] = { 0.001f, 0.005f, 0.01f,
                                                  0.05f,  0.1f };
 
 /*
- * Scene -- the entire visible world in one struct.
+ * Scene -- the whole visible world in one bundle, so one `Scene *` can be
+ * passed around instead of a dozen separate things.  Fields are grouped by
+ * what they're for: the moving orbits, which attractor and how big it is,
+ * the camera and backdrop, the on/off toggles the keys flip, and the
+ * numbers shown in the HUD.
  *
- * WHY one struct (and not loose globals): every field shares the
- *   same lifetime -- born at scene_init, dies at scene_free (none
- *   today, but the API supports it).  Bundling lets `Scene *s`
- *   carry the world through scene_tick / scene_draw / app_handle_key
- *   without 15-argument function signatures.
- *
- * LOCALITY INTENT (fields grouped top-to-bottom by ROLE):
- *
- *   ORBITS         physics state -- 1 main Orbit + N_GHOSTS ghost
- *                  Orbits, all advanced by scene_tick.  Each Orbit
- *                  bundles a Point3 pos + a Trail of past positions
- *                  (§6).  Replacing the earlier 7 loose fields
- *                  (mx,my,mz,mt + gx[],gy[],gz[],gt[]) with two Orbit
- *                  arrays cut the field count from 7 to 2 and made
- *                  "there are N_GHOSTS+1 trajectories" explicit.
- *   ATTRACTOR      which preset + its spatial Bounds
- *   CAMERA         viewer pose
- *   STARFIELD      ambient backdrop
- *   UI LATCHES     key-handler toggles
- *   COUNTERS       HUD readouts
- *
- * Memory: trails dominate -- (1 + N_GHOSTS) × Trail × 30 KB = 6 ×
- * 30 KB ≈ 180 KB.  Scene lives inside the static g_app (§10); never
- * on the stack, never allocated.
+ * The trails make this large (~180 KB); it lives inside g_app (§10), never
+ * on the stack.
  */
 typedef struct {
-  /* ── ORBITS: 1 main + N_GHOSTS ε-offset shadow trajectories ─────── */
-  Orbit main;            /* the headline trajectory                    */
-  Orbit ghosts[N_GHOSTS];/* ε-offset shadows; diverge at Lyapunov rate */
+  /* the moving orbits: one main, plus the shadows that drift away from it */
+  Orbit main;
+  Orbit ghosts[N_GHOSTS];
 
-  /* ── ATTRACTOR: which preset + its spatial extent ───────────────── */
+  /* which preset is showing, and how big it is */
   int    attr_idx;
   Bounds bounds;
 
-  /* ── CAMERA + BACKDROP ──────────────────────────────────────────── */
+  /* the view and the backdrop */
   Camera    camera;
   Starfield stars;
 
-  /* ── UI LATCHES (written by key handler) ────────────────────────── */
-  bool show_ghost;       /* g -- toggle ε-offset shadow trajectories  */
-  bool paused;           /* space -- scene_tick early-returns         */
+  /* toggles flipped by the keys */
+  bool show_ghost;       /* g -- show the shadow orbits               */
+  bool paused;           /* space -- freeze the motion                */
 
-  /* ── COUNTERS (HUD readouts) ────────────────────────────────────── */
-  int       speed;       /* iter-rate multiplier (+/- via keys)       */
-  int       theme_idx;   /* active theme (index into THEMES)          */
-  long long total_pts;   /* accumulated iterates this run             */
+  /* numbers shown in the HUD */
+  int       speed;       /* how fast the orbit runs (+/- keys)        */
+  int       theme_idx;   /* which colour scheme is active             */
+  long long total_pts;   /* points computed this run                  */
 } Scene;
 
 static inline const AttrDef *scene_current_attr(const Scene *s)
@@ -1187,14 +684,9 @@ static inline const AttrDef *scene_current_attr(const Scene *s)
   return &ATTRS[s->attr_idx];
 }
 
-/* ── Starfield helpers ──────────────────────────────────────────────── *
- *
- * Self-contained backdrop: a tiny LCG seeds N_STARS positions in a
- * fixed box; starfield_draw projects them with the Scene's Camera.
- *
- * The LCG (vs srand/rand) keeps star placement reproducible without
- * touching libc's global RNG state.
- */
+/* A tiny self-contained random generator, used only to scatter the stars.
+ * Keeping our own avoids disturbing the shared rand() and gives the same
+ * star layout every run. */
 static unsigned int stars_lcg_next(unsigned int *s)
 {
   *s = (*s) * 1103515245u + 12345u;
@@ -1218,58 +710,40 @@ static void starfield_init(Starfield *sf)
   sf->initialised = true;
 }
 
-/* Depth attribute for a starfield point: closer stars get A_NORMAL,
- * stars behind the depth-cue plane fade to A_DIM.  Uses the SAME
- * DEPTH_CLOSE_FRAC threshold as the trail renderer so the cue is
- * consistent between layers. */
+/* Near stars are drawn normally, far ones dimmed -- same near/far cutoff
+ * the trail uses, so both layers fade together. */
 static inline attr_t star_attr_by_depth(float depth, float depth_unit)
 {
   return (depth < depth_unit * DEPTH_CLOSE_FRAC) ? A_NORMAL : A_DIM;
 }
 
-/*
- * starfield_draw -- back-most layer.  For each star:
- *   (1) project with the SAME Camera as the orbit (so the field rotates
- *       in lockstep -- the parallax depth cue);
- *   (2) pick A_NORMAL/A_DIM by camera-axis depth;
- *   (3) paint a '.' in the tail (faintest) colour pair.
- */
+/* Draw the backdrop: each star, spun by the same camera as the orbit so
+ * they all move together, dimmed by distance, painted as a faint dot. */
 static void starfield_draw(const Starfield *sf, const Camera *cam,
                            const RenderCtx *ctx)
 {
   for (int i = 0; i < N_STARS; i++) {
-    /* Step 1: project star with the Scene's Camera (parallax matches orbit). */
     int   col, row;
     float depth;
     if (!project(sf->x[i], sf->y[i], sf->z[i],
-                 0.0f, 0.0f, 0.0f,    /* stars live in absolute space */
+                 0.0f, 0.0f, 0.0f,    /* stars use absolute coords, not the shape's centre */
                  cam->phi, cam->theta, ctx->scale,
                  ctx->screen_cx, ctx->screen_cy, ctx->cols, ctx->rows,
                  &col, &row, &depth))
       continue;
 
-    /* Step 2: pick attribute by camera-axis depth (close=NORMAL, far=DIM). */
     attr_t at = star_attr_by_depth(depth, ctx->depth_unit);
 
-    /* Step 3: paint star glyph in the tail colour (faintest tier). */
     attron(COLOR_PAIR(CP_TRAIL_TAIL) | at);
     mvaddch(row, col, '.');
     attroff(COLOR_PAIR(CP_TRAIL_TAIL) | at);
   }
 }
 
-/* ── scene lifecycle: seed → calibrate → reset → init ───────────────── */
-
-/*
- * scene_seed_trajectories -- place the main orbit + N_GHOSTS at their
- * initial conditions and clear every trail.
- *
- * Main at (ORBIT_SEED, ORBIT_SEED, ORBIT_SEED).  Ghosts at
- * (ORBIT_SEED + ε_g, ORBIT_SEED, ORBIT_SEED) where ε_g spans four
- * decades from GHOST_EPS_TABLE.  By construction the ghosts differ
- * ONLY in initial conditions, so any divergence is pure deterministic
- * chaos (sensitive dependence on initial conditions, [2]).
- */
+/* Put the main orbit and every shadow at their starting points and clear
+ * their trails.  The shadows start a hair off the main orbit in x and
+ * nowhere else, so anything that happens afterwards is pure chaos pulling
+ * them apart, not different starting setups. */
 static void scene_seed_trajectories(Scene *s)
 {
   const Point3 main_seed = { ORBIT_SEED, ORBIT_SEED, ORBIT_SEED };
@@ -1283,28 +757,12 @@ static void scene_seed_trajectories(Scene *s)
   }
 }
 
-/* ── scene_calibrate_bounds step-helpers ────────────────────────────── *
- *
- * Bounding-box calibration is a four-step recipe:
- *
- *   (1) BURN-IN     -- walk WARMUP_ITERS to escape the initial transient
- *                      so subsequent samples actually live on the
- *                      attractor (not on the trajectory ramping in).
- *   (2) PROBE       -- walk BBOX_SAMPLES more and track per-axis min/max.
- *                      Classic single-pass extremes scan.
- *   (3) INFLATE     -- expand by BBOX_MARGIN_FRAC so the outermost orbit
- *                      points don't land on the projection clip plane.
- *   (4) DERIVE      -- compute the bbox MIDPOINT (translation origin in
- *                      project()) and the DIAGONAL HALF-LENGTH
- *                      (= bounding-sphere radius; drives view scale +
- *                      depth-cue normaliser).
- *
- * Each step is one helper so scene_calibrate_bounds reads as the recipe.
- */
+/* Measuring an attractor's size is four steps: settle onto it, sweep it
+ * and track the extremes, pad the result, then work out its centre and
+ * size.  One helper each so the driver reads as that recipe. */
 
-/* (1) Walk the orbit forward WARMUP_ITERS times and DISCARD those
- *     iterates -- they're transient (the trajectory hasn't settled on
- *     the attractor yet).  After this call (px, py, pz) sit on it. */
+/* Run a bunch of steps and throw them away -- the orbit starts off the
+ * attractor and needs a moment to settle onto it before we measure. */
 static void bbox_burn_in_transient(const AttrDef *at,
                                     float *px, float *py, float *pz)
 {
@@ -1312,9 +770,8 @@ static void bbox_burn_in_transient(const AttrDef *at,
     attractor_step(at, px, py, pz);
 }
 
-/* (2) Walk BBOX_SAMPLES more iterates while tracking per-axis extremes.
- *     Initialises mins/maxes from the starting sample so an attractor
- *     of any size works (no sentinel ±INF needed). */
+/* Sweep many more points, remembering the smallest and largest on each
+ * axis.  Seeded from the first point so it works at any scale. */
 static void bbox_probe_axis_extremes(const AttrDef *at,
                                       float *px, float *py, float *pz,
                                       float *xmin, float *xmax,
@@ -1335,9 +792,8 @@ static void bbox_probe_axis_extremes(const AttrDef *at,
   }
 }
 
-/* (3) Inflate raw min/max by BBOX_MARGIN_FRAC on each side and write
- *     the padded box into Bounds.  Padding is per-axis (proportional to
- *     that axis's extent) so a thin axis pads less in absolute units. */
+/* Pad the box a little on every side so the outermost points don't sit
+ * right on the screen edge and get clipped. */
 static void bbox_inflate_by_margin(Bounds *b,
                                     float xmin, float xmax,
                                     float ymin, float ymax,
@@ -1351,15 +807,9 @@ static void bbox_inflate_by_margin(Bounds *b,
   b->zmin = zmin - z_pad;  b->zmax = zmax + z_pad;
 }
 
-/* (4) Derive bbox MIDPOINT (cx,cy,cz) and DIAGONAL HALF-LENGTH (radius)
- *     from the padded box.  Midpoint = projection translation origin.
- *     Radius = bounding-sphere radius -- used as the unit for both the
- *     view-fill scale and the depth-cue thresholds, so the renderer
- *     auto-rescales across the 25× preset size range (Lorenz vs Hénon).
- *
- *     Degenerate guard: a single-point bbox would yield radius = 0
- *     (division-by-zero downstream); BBOX_RADIUS_FALLBACK substitutes
- *     a sane unit when that happens. */
+/* Work out the box's centre and rough size from its corners.  If the
+ * shape collapsed to a point, fall back to a unit size so nothing later
+ * divides by zero. */
 static void bbox_derive_centre_and_radius(Bounds *b)
 {
   b->cx = 0.5f * (b->xmin + b->xmax);
@@ -1373,37 +823,25 @@ static void bbox_derive_centre_and_radius(Bounds *b)
   if (b->radius < BBOX_RADIUS_EPS) b->radius = BBOX_RADIUS_FALLBACK;
 }
 
-/*
- * scene_calibrate_bounds -- driver for the four-step recipe declared
- * above.  Walks a TEMP orbit (the scene's actual orbits are untouched)
- * to produce s->bounds (raw bbox + centre + radius).  Called by
- * scene_reset on preset change / 'r' / SIGWINCH.
- */
+/* Measure the current attractor's size and centre into s->bounds.  Uses
+ * a throwaway orbit, so the live orbits aren't disturbed. */
 static void scene_calibrate_bounds(Scene *s)
 {
   const AttrDef *at = scene_current_attr(s);
   float px = ORBIT_SEED, py = ORBIT_SEED, pz = ORBIT_SEED;
 
-  /* Step 1: burn off transient so subsequent samples live on the attractor. */
   bbox_burn_in_transient(at, &px, &py, &pz);
 
-  /* Step 2: probe BBOX_SAMPLES iterates for per-axis min/max. */
   float xmin, xmax, ymin, ymax, zmin, zmax;
   bbox_probe_axis_extremes(at, &px, &py, &pz,
                            &xmin, &xmax, &ymin, &ymax, &zmin, &zmax);
 
-  /* Step 3: pad extremes so the outermost orbit point isn't on the clip plane. */
   bbox_inflate_by_margin(&s->bounds, xmin, xmax, ymin, ymax, zmin, zmax);
-
-  /* Step 4: derive bbox midpoint (= projection origin) and diagonal
-   *         half-length (= bounding-sphere radius, drives view scale). */
   bbox_derive_centre_and_radius(&s->bounds);
 }
 
-/*
- * scene_reset -- re-seed trajectories, recalibrate bounds.  Called
- * after preset change / 'r' key / SIGWINCH.
- */
+/* Start the current preset fresh: re-seed the orbits and re-measure its
+ * size.  Run on preset change, the 'r' key, and resize. */
 static void scene_reset(Scene *s)
 {
   scene_seed_trajectories(s);
@@ -1426,25 +864,15 @@ static void scene_init(Scene *s)
   scene_reset(s);
 }
 
-/* ── scene_tick step-helpers ─────────────────────────────────────────── *
- *
- * One simulation tick is three operations: drift the camera (if auto-
- * rotate is on), pick how many iterates to run this tick, then advance
- * every trajectory in lockstep that many times.
- */
-
-/* Hands-free azimuth drift: when auto_rotate is on, advance φ by a
- * constant angular rate (VIEW_PHI_SPEED · dt).  No-op otherwise -- the
- * user is driving φ via ← / → keys. */
+/* If auto-rotate is on, nudge the spin angle a touch; otherwise leave it
+ * alone (the user is steering with the arrow keys). */
 static inline void camera_drift_auto_rotate(Camera *cam, float dt)
 {
   if (cam->auto_rotate) cam->phi += VIEW_PHI_SPEED * dt;
 }
 
-/* Per-tick iteration count, branching on attractor family:
- *   continuous (Lorenz ODE):  SUB_STEPS_ODE × speed  RK4 sub-steps/tick
- *   discrete   (2-D maps):    ITERS_PER_TICK_MAP × speed  map iterates/tick
- * The `speed` multiplier is the user's +/- key control. */
+/* How many orbit steps to run this tick.  Lorenz needs many tiny ones to
+ * stay smooth; the maps take fewer bigger jumps.  Times the speed knob. */
 static inline int iters_per_tick_for_family(const AttrDef *at, int speed)
 {
   return at->is_continuous
@@ -1452,10 +880,9 @@ static inline int iters_per_tick_for_family(const AttrDef *at, int speed)
        : ITERS_PER_TICK_MAP  * speed;
 }
 
-/* Advance ALL trajectories (main + N_GHOSTS ghosts) by ONE iterate.
- * Stepping in lockstep is what gives ε-divergence its meaning -- after
- * k ticks every trajectory has been stepped k times, so the gap between
- * main and any ghost is exactly k iterates of Lyapunov stretching [6]. */
+/* Step every orbit once.  Keeping them in lockstep is what makes the
+ * shadows drifting apart meaningful -- they've all taken the same number
+ * of steps, so any gap is the attractor pulling them apart, nothing else. */
 static inline void step_all_trajectories_once(Scene *s, const AttrDef *at)
 {
   orbit_step(&s->main, at);
@@ -1463,40 +890,26 @@ static inline void step_all_trajectories_once(Scene *s, const AttrDef *at)
     orbit_step(&s->ghosts[g], at);
 }
 
-/*
- * scene_tick -- driver for the three-step recipe declared above.
- * `dt` is wall-clock seconds; used ONLY by camera_drift_auto_rotate.
- * The orbit integrators work in attractor-step units, not wall-clock.
- */
+/* Advance the world one tick: drift the view, then step every orbit the
+ * right number of times.  dt (wall seconds) is only used for the drift. */
 static void scene_tick(Scene *s, float dt)
 {
   if (s->paused) return;
 
-  /* Step 1: optional hands-free azimuth drift (auto-rotate mode). */
   camera_drift_auto_rotate(&s->camera, dt);
 
-  /* Step 2: pick per-tick iterate count by attractor family + speed. */
   const AttrDef *at = scene_current_attr(s);
   int iters = iters_per_tick_for_family(at, s->speed);
 
-  /* Step 3: advance main + ghosts in lockstep so ε-divergence stays meaningful. */
   for (int i = 0; i < iters; i++) {
     step_all_trajectories_once(s, at);
     s->total_pts++;
   }
 }
 
-/* ── RenderCtx build + view scale ───────────────────────────────────── *
- *
- * compute_view_scale picks the projection scale so the attractor's
- * diagonal diameter fills VIEW_FILL_FRAC of the smaller screen
- * dimension after accounting for the non-square cell aspect.
- * Conservative on the worst-case diagonal so rotation never overflows.
- *
- * render_ctx_make bundles the per-frame derived view state once so
- * every draw helper can be (scene, ctx) instead of carrying 9 loose
- * floats.  Rebuilt every frame; never persisted.
- */
+/* Pick the zoom so the shape fills most of the screen but never spills
+ * off as it spins.  Tries both width and height and takes the tighter
+ * fit, allowing for the tall-cell aspect. */
 static inline float compute_view_scale(const Bounds *b, int cols, int rows)
 {
   int usable_rows = rows - HUD_TOP_ROWS - HUD_BOTTOM_ROWS;
@@ -1521,24 +934,12 @@ static RenderCtx render_ctx_make(const Scene *s, int cols, int rows)
   return ctx;
 }
 
-/* ── trail-sample encoding primitives ───────────────────────────────── *
- *
- * Four pure functions that EACH map a sample's role/age/depth → ONE
- * presentation choice.  Composed by compose_main_trail_attr (below)
- * into the chtype draw_trail paints; paint_bloom_halo is invoked
- * separately for the comet-head samples.
- *
- *   trail_sample_color_pair    age          → CP_TRAIL_HEAD/MID/TAIL
- *   trail_sample_depth_attr    depth, k, age→ A_BOLD/A_NORMAL/A_DIM
- *   trail_sample_glyph         role, k      → 'O'/'.'/'x'/','
- *   paint_bloom_halo           row, col     → 4-cross '+' stamp
- *
- * Concrete thresholds (AGE_HEAD_LIMIT etc., DEPTH_CLOSE_FRAC etc.) and
- * the override logic (comet-head BOLD, oldest 20 % DIM) live inside the
- * helpers themselves.
- */
+/* These small helpers each turn one fact about a trail point -- its age,
+ * how close it is, whether it's a head or a shadow -- into one drawing
+ * choice (which colour, how bright, which character).  draw_trail combines
+ * them. */
 
-/* COLOUR tier from age. */
+/* Newer points get the brighter colour tier. */
 static inline short trail_sample_color_pair(float age)
 {
   if (age < AGE_HEAD_LIMIT) return CP_TRAIL_HEAD;
@@ -1546,7 +947,8 @@ static inline short trail_sample_color_pair(float age)
   return CP_TRAIL_TAIL;
 }
 
-/* ATTRIBUTE from normalised depth, with two age-extreme overrides. */
+/* Brightness from how close the point is: near = bold, far = dim.  The
+ * very front always glows bold, the oldest tail always fades. */
 static inline attr_t trail_sample_depth_attr(float depth_norm, int k,
                                              float age)
 {
@@ -1555,19 +957,20 @@ static inline attr_t trail_sample_depth_attr(float depth_norm, int k,
   else if (depth_norm > DEPTH_FAR_FRAC)   at = A_DIM;
   else                                    at = A_NORMAL;
 
-  if      (k < BLOOM_HEAD_COUNT)          at = A_BOLD;  /* comet head */
-  else if (age > AGE_TAIL_LIMIT)          at = A_DIM;   /* fading tail */
+  if      (k < BLOOM_HEAD_COUNT)          at = A_BOLD;  /* the glowing front */
+  else if (age > AGE_TAIL_LIMIT)          at = A_DIM;   /* the fading end    */
   return at;
 }
 
-/* GLYPH -- head marker (k=0) or trail dot.  Ghosts use ',' / 'x'. */
+/* The newest point gets a marker; older ones are dots.  Shadows get their
+ * own characters so they read as separate. */
 static inline char trail_sample_glyph(bool is_ghost, int k)
 {
   if (k == 0) return is_ghost ? 'x' : 'O';
   return is_ghost ? ',' : '.';
 }
 
-/* 4-cross BLOOM HALO around the comet head -- '+' marks in tier-head. */
+/* Stamp a little plus-shaped glow around the front of the trail. */
 static inline void paint_bloom_halo(int row, int col, const RenderCtx *ctx)
 {
   static const int hdr[4] = { -1,  1,  0,  0 };
@@ -1583,49 +986,31 @@ static inline void paint_bloom_halo(int row, int col, const RenderCtx *ctx)
   attroff(COLOR_PAIR(CP_TRAIL_HEAD));
 }
 
-/* ── draw_trail step-helpers ─────────────────────────────────────────── *
- *
- * Painting one trail point is a six-step recipe per sample:
- *
- *   (1) read sample, compute its AGE FRACTION (0 = newest, 1 = oldest)
- *   (2) PROJECT to (col, row, depth); skip if outside the renderable band
- *   (3) skip if it lands on the SAME CELL as the previous painted sample
- *       (dense ODE curves hit the same cell many times)
- *   (4) choose GLYPH (head marker vs trail dot, main vs ghost role)
- *   (5) compose the chtype ATTRIBUTE (colour pair + bold/normal/dim)
- *       -- two flavours: main (age tier + depth + comet head override)
- *                      / ghost (constant: CP_GHOST + A_DIM)
- *   (6) PAINT the cell; for main-trail comet-head samples, also stamp a
- *       4-cross BLOOM HALO around it
- */
+/* A few more one-fact helpers used by draw_trail below. */
 
-/* (1) AGE FRACTION: 0.0 = newest sample (k=0), 1.0 = oldest (k=count-1).
- *     Guards count == 0/1 so the divisor is never zero. */
+/* How old this point is, 0.0 newest to 1.0 oldest.  Guards a count of 0
+ * or 1 so we never divide by zero. */
 static inline float trail_sample_age_fraction(int k, int count)
 {
   return (float)k / (float)(count > 1 ? count - 1 : 1);
 }
 
-/* (3) Duplicate-cell test: is this sample landing on the same terminal
- *     cell as the previous one we painted?  Cheap dedupe -- avoids
- *     stacking up redundant mvaddch calls along dense curve segments. */
+/* Did this point land on the same cell as the last one we drew?  Dense
+ * curves hit the same cell repeatedly; skipping the repeats saves work. */
 static inline bool sample_overlaps_previous_cell(int col, int row,
                                                   int last_col, int last_row)
 {
   return col == last_col && row == last_row;
 }
 
-/* (6) Comet-head test: is this sample one of the newest BLOOM_HEAD_COUNT
- *     (i.e. should it carry the 4-cross '+' halo)? */
+/* Is this one of the front points that gets the glow halo? */
 static inline bool is_comet_head_sample(int k)
 {
   return k < BLOOM_HEAD_COUNT;
 }
 
-/* (5a) Compose the chtype for one MAIN-trail sample.
- *      Normalise depth against the bounding-sphere radius (so the same
- *      DEPTH_CLOSE/FAR_FRAC thresholds work across all preset sizes),
- *      then combine age-tier colour pair with depth/age attribute. */
+/* Pick colour + brightness for a main-trail point.  Distance is measured
+ * against the shape's size so the near/far cutoffs work at any scale. */
 static inline chtype compose_main_trail_attr(float depth, float depth_unit,
                                               int k, float age)
 {
@@ -1635,17 +1020,16 @@ static inline chtype compose_main_trail_attr(float depth, float depth_unit,
   return COLOR_PAIR(cp) | at;
 }
 
-/* (5b) Ghost samples are constant: ghost colour pair + A_DIM (so the
- *      shadow trajectories sit visually behind the main trail). */
+/* Shadow points are always the same: dim, in the ghost colour, so they
+ * sit visually behind the main trail. */
 static inline chtype compose_ghost_trail_attr(void)
 {
   return COLOR_PAIR(CP_GHOST) | A_DIM;
 }
 
-/* (6) Bracketed cell paint: attron → mvaddch → attroff in one helper so
- *     no caller can leak an attribute by forgetting the off side.  The
- *     `(chtype)(unsigned char)` cast prevents sign-extension on chars
- *     with the high bit set (see CLAUDE.md "Common ncurses Bugs"). */
+/* Paint one cell, turning the colour on and back off so it can't leak.
+ * The cast stops characters above 127 from being mistaken for negatives
+ * (a classic ncurses gotcha). */
 static inline void paint_trail_cell(int row, int col, chtype attr, char ch)
 {
   attron(attr);
@@ -1654,10 +1038,9 @@ static inline void paint_trail_cell(int row, int col, chtype attr, char ch)
 }
 
 /*
- * draw_trail -- walk one trail newest → oldest and paint each sample.
- * `is_ghost` selects the ghost flavour (CP_GHOST + A_DIM + ',' glyph,
- * no bloom halo); main trail gets full age/depth encoding + bloom halo
- * around the comet head.  Body reads as the six-step recipe above.
+ * Draw one trail, newest point to oldest.  is_ghost picks the faint
+ * shadow look (one dim colour, no glow); the main trail gets the full
+ * colour/brightness fade plus the glow around its front.
  */
 static void draw_trail(const Scene *s, const Trail *t, bool is_ghost,
                        const RenderCtx *ctx)
@@ -1667,11 +1050,9 @@ static void draw_trail(const Scene *s, const Trail *t, bool is_ghost,
   int last_col = CELL_NONE, last_row = CELL_NONE;
 
   for (int k = 0; k < t->count; k++) {
-    /* Step 1: read k-th newest sample + compute its age fraction. */
     Point3 p   = trail_at(t, k);
     float  age = trail_sample_age_fraction(k, t->count);
 
-    /* Step 2: project into cell coords; skip if outside the renderable band. */
     int   col, row;
     float depth;
     if (!project(p.x, p.y, p.z,
@@ -1679,72 +1060,46 @@ static void draw_trail(const Scene *s, const Trail *t, bool is_ghost,
                  cam->phi, cam->theta, ctx->scale,
                  ctx->screen_cx, ctx->screen_cy, ctx->cols, ctx->rows,
                  &col, &row, &depth))
-      continue;
+      continue;                       /* off-screen */
 
-    /* Step 3: dedupe consecutive samples that land on the same cell. */
     if (sample_overlaps_previous_cell(col, row, last_col, last_row))
-      continue;
+      continue;                       /* same cell as last point */
     last_col = col;
     last_row = row;
 
-    /* Step 4: pick glyph by role (main vs ghost) and position (head vs tail). */
     char ch = trail_sample_glyph(is_ghost, k);
 
-    /* Step 5: compose chtype (age tier + depth attr for main; constant for ghost). */
     chtype attr = is_ghost
                 ? compose_ghost_trail_attr()
                 : compose_main_trail_attr(depth, ctx->depth_unit, k, age);
 
-    /* Step 6: paint cell; comet-head samples also get the 4-cross bloom halo. */
     paint_trail_cell(row, col, attr, ch);
     if (!is_ghost && is_comet_head_sample(k))
       paint_bloom_halo(row, col, ctx);
   }
 }
 
-/*
- * scene_draw -- back-to-front layer stack, body reads as the recipe:
- *
- *   1  starfield               ambient background with parallax
- *   2  ghost trails            widest-ε first so closer ghosts overlay
- *   3  main trail              full depth / age / bloom encoding
- *
- * The per-frame RenderCtx is built once at the top and passed to
- * every draw helper -- nothing else recomputes scale or screen
- * centre.
- */
+/* Paint the whole frame back to front: stars, then shadows, then the main
+ * trail on top.  The widest shadow is drawn first so closer ones land over
+ * it.  The view numbers are worked out once here and shared. */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
   RenderCtx ctx = render_ctx_make(s, cols, rows);
 
-  /* Layer 1: ambient starfield backdrop. */
   starfield_draw(&s->stars, &s->camera, &ctx);
 
-  /* Layer 2: ghost trails (widest-ε first → closer overlay them). */
   if (s->show_ghost) {
     for (int g = N_GHOSTS - 1; g >= 0; g--)
       draw_trail(s, &s->ghosts[g].trail, true, &ctx);
   }
 
-  /* Layer 3: main trail (with depth + age + bloom). */
   draw_trail(s, &s->main.trail, false, &ctx);
 }
 
-/* ===================================================================== */
-/* §8  hud                                                                */
-/* ===================================================================== */
-
-/*
- * Top HUD (rows 0..HUD_TOP_ROWS-1) -- live data only.
- *   Row 0:  title (cyan) + preset + theme + ghost + rot + status (yellow)
- *   Row 1:  attractor parameters + speed + fps + total points (yellow)
- *
- * Bottom HUD (row rows-1) -- action keys, bright cyan + A_BOLD.
- */
+/* ── §8  hud ── */
 
 #define HUD_DATA_COL  24
 
-/* Row 0 left -- title in cyan + bold. */
 static void hud_draw_title(void)
 {
   attron(COLOR_PAIR(CP_HINT) | A_BOLD);
@@ -1752,7 +1107,6 @@ static void hud_draw_title(void)
   attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* Row 0 middle -- preset, theme, ghost, rotate, status. */
 static void hud_draw_state(const Scene *s)
 {
   const AttrDef *at = scene_current_attr(s);
@@ -1767,7 +1121,6 @@ static void hud_draw_state(const Scene *s)
   attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/* Row 1 -- attractor parameters + iter speed + fps + accumulated count. */
 static void hud_draw_params(const Scene *s, double fps)
 {
   const AttrDef *at = scene_current_attr(s);
@@ -1779,7 +1132,6 @@ static void hud_draw_params(const Scene *s, double fps)
   attroff(COLOR_PAIR(CP_HUD));
 }
 
-/* Row rows-1 -- action keys, bright cyan + A_BOLD. */
 static void hud_draw_action_bar(int rows)
 {
   attron(COLOR_PAIR(CP_HINT) | A_BOLD);
@@ -1789,7 +1141,6 @@ static void hud_draw_action_bar(int rows)
   attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* Compose all HUD regions for a frame. */
 static void hud_draw(const Scene *s, int rows, double fps)
 {
   hud_draw_title();
@@ -1798,42 +1149,17 @@ static void hud_draw(const Scene *s, int rows, double fps)
   hud_draw_action_bar(rows);
 }
 
-/* ===================================================================== */
-/* §9  screen                                                             */
-/* ===================================================================== */
+/* ── §9  screen ── */
 
 /*
- * Screen -- terminal-geometry container.
- *
- * DELIBERATELY DISTINCT from §7 Scene so the two domains stay
- * decoupled:
- *
- *   Scene  domain = SIMULATION (attractor units, world coords, orbit
- *                   state -- written by physics).
- *   Screen domain = TERMINAL   (cell coords, cols × rows -- written
- *                   by ncurses + SIGWINCH).
- *
- * The two meet ONLY in RenderCtx -- which reads from both to compute
- * the per-frame projection scale.  Keeping them apart means a terminal
- * resize doesn't accidentally invalidate physics state, and a preset
- * change doesn't trigger an ncurses repaint cycle.
- *
- * LIFECYCLE:
- *   screen_init    one-shot at startup; calls initscr() + color_init()
- *                  + getmaxyx().  Sets ncurses modes (noecho, cbreak,
- *                  curs_set(0), nodelay, keypad, typeahead(-1)).
- *   screen_resize  on SIGWINCH; calls endwin() + refresh() + getmaxyx()
- *                  to re-query the new terminal size.
- *   screen_free    on shutdown; calls endwin() to restore the terminal.
- *
- * NO ALLOCATION: Screen is just an (int, int) pair.  All ncurses
- * buffering lives inside ncurses itself (stdscr is global); we never
- * own a heap-allocated WINDOW.  This keeps cleanup trivial (endwin
- * suffices) and avoids the "who frees what on SIGINT" question.
+ * Screen -- just the terminal's size in characters.  Kept apart from the
+ * Scene on purpose: the simulation works in the attractor's own units and
+ * the screen works in cells, and they only meet when we draw.  So resizing
+ * the window can't disturb the running orbit.
  */
 typedef struct {
-  int cols;    /* terminal column count (getmaxyx) -- 0-indexed extent */
-  int rows;    /* terminal row count    (getmaxyx) -- 0-indexed extent */
+  int cols;    /* terminal width in characters                          */
+  int rows;    /* terminal height in characters                         */
 } Screen;
 
 static void screen_init(Screen *sc)
@@ -1858,7 +1184,6 @@ static void screen_resize(Screen *sc)
   getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-/* Compose one frame: paint scene + HUD, present. */
 static void screen_draw(Screen *sc, const Scene *s, double fps)
 {
   erase();
@@ -1872,38 +1197,20 @@ static void screen_present(void)
   doupdate();
 }
 
-/* ===================================================================== */
-/* §10  app                                                               */
-/* ===================================================================== */
+/* ── §10  app ── */
 
 /*
- * App -- top-level lifecycle container.
+ * App -- everything the program owns, in one bundle so a single pointer
+ * can carry it through the loop.
  *
- * WHY a struct (and not loose globals): the App lifecycle is well-
- * defined -- born at main() init, dies at main() return.  Bundling
- * lets a single App* propagate through the loop helpers (app_do_resize,
- * app_handle_key) without a forest of unrelated globals.
- *
- * WHY signal flags live inside App (with the volatile sig_atomic_t
- * dance):
- *   The C signal-handler signature is `void handler(int)` -- no place
- *   to pass an App* into it.  So we keep a SINGLE static App g_app
- *   instance at file scope; on_exit_signal / on_resize_signal write
- *   to its flags.
- *
- *   The flags themselves MUST be `volatile sig_atomic_t` because:
- *     - volatile      -- the main-loop read can't be optimised away
- *     - sig_atomic_t  -- guaranteed atomic w.r.t. signal interruption
- *
- *   Signal handlers ONLY SET FLAGS; the main loop reads them and
- *   does the real work.  Doing the work IN the handler is unsafe --
- *   endwin / ncurses calls / malloc / free are not signal-safe.
- *
- *     running       clear to 0 to break the main loop and exit
- *                   cleanly through atexit(cleanup).
- *     need_resize   set on SIGWINCH; main loop services it by
- *                   re-fitting Screen + recalibrating bbox on the
- *                   next iteration.
+ * The two flags are set by signal handlers (Ctrl-C / window resize).  A
+ * handler can't be passed anything, so there's one file-scope g_app it
+ * writes to.  The flags are volatile sig_atomic_t so the handler can set
+ * them safely and the loop is guaranteed to see the change.  Handlers
+ * only flip a flag; the real work happens back in the loop, because
+ * things like ncurses cleanup aren't safe to do inside a handler.
+ *   running       cleared to make the loop exit cleanly
+ *   need_resize   set on a window resize; the loop re-fits next frame
  */
 typedef struct {
   Scene                 scene;
@@ -1924,7 +1231,7 @@ static void app_do_resize(App *app)
   app->need_resize = 0;
 }
 
-/* ---- key actions (each one a named helper for clarity) -------------- */
+/* One small function per key, so app_handle_key reads like the key list. */
 
 static void action_pause            (Scene *s) { s->paused = !s->paused; }
 static void action_reset            (Scene *s) { scene_reset(s); }
@@ -2025,7 +1332,7 @@ static bool app_handle_key(App *app, int ch)
   case '-': case '_': action_speed_slower(s);    break;
 
   default:
-    /* '1'..'9' jump to presets 1..9; '0' jumps to the 10th preset. */
+    /* number keys jump straight to a preset; '0' is the tenth */
     if (ch >= '1' && ch <= '9' && (ch - '1') < N_ATTRS)
       action_preset_jump(s, ch - '1');
     else if (ch == '0' && N_ATTRS >= 10)
@@ -2035,16 +1342,11 @@ static bool app_handle_key(App *app, int ch)
   return true;
 }
 
-/* ── main-loop step-helpers ──────────────────────────────────────────── *
- *
- * The frame loop is a seven-step recipe.  Pulling each step into a
- * named helper lets main() read as the recipe and pushes the noisy
- * timing arithmetic out of the orchestrator.
- */
+/* The frame loop is a handful of steps; each is its own little function
+ * below so main() reads as the sequence and the timing math stays out of
+ * the way. */
 
-/* Bind atexit + the three signal handlers we care about.  Done once
- * before the loop -- handlers only flip volatile sig_atomic_t flags;
- * the main loop services them between frames (signal-safe). */
+/* Restore the terminal on exit, and catch Ctrl-C / kill / resize. */
 static void install_signal_handlers(void)
 {
   atexit(cleanup);
@@ -2053,7 +1355,6 @@ static void install_signal_handlers(void)
   signal(SIGWINCH, on_resize_signal);
 }
 
-/* Initial app state: clear flags, build screen, seed scene. */
 static void app_init(App *app)
 {
   app->running     = 1;
@@ -2062,9 +1363,8 @@ static void app_init(App *app)
   scene_init(&app->scene);
 }
 
-/* Step 1: react to a pending SIGWINCH (set by on_resize_signal).
- * Re-queries terminal size, then resets the frame clock + sim accumulator
- * so the dt arithmetic doesn't see the resize gap as accumulated time. */
+/* If the window was resized, re-read its size.  The clock is reset too so
+ * the time spent resizing doesn't get counted as simulation owed. */
 static inline void app_service_pending_resize(App *app, int64_t *frame_time,
                                                int64_t *sim_accum)
 {
@@ -2074,20 +1374,18 @@ static inline void app_service_pending_resize(App *app, int64_t *frame_time,
   *sim_accum  = 0;
 }
 
-/* Step 2: measure wall-clock dt since previous frame start.  Caps the
- * result at MAX_FRAME_DT_NS so a long pause (debugger break, terminal
- * suspend) can't push sim_accum so high that the next frame tries to
- * run thousands of catch-up ticks (the classic "spiral of death"). */
+/* Time since the last frame, capped.  The cap matters: if the program was
+ * paused for a while (debugger, suspended terminal), without it the next
+ * frame would try to catch up thousands of steps at once and lock up. */
 static inline int64_t frame_dt_capped(int64_t now, int64_t prev)
 {
   int64_t dt = now - prev;
   return (dt > MAX_FRAME_DT_NS) ? MAX_FRAME_DT_NS : dt;
 }
 
-/* Step 3: drain wall-clock time through the fixed-step simulator.
- * Each TICK_NS chunk → one scene_tick at FIXED_TICK_DT_SEC.  This is
- * what gives the demo timing-independent physics: regardless of frame
- * jitter, scene_tick fires at exactly 60 Hz worth of sim time. */
+/* Run the simulation in fixed-size ticks: bank the elapsed time, then
+ * spend it one tick at a time.  This keeps the motion running at the same
+ * pace no matter how fast or jerky the drawing is. */
 static inline void pump_fixed_simulation(Scene *scene, int64_t *sim_accum,
                                           int64_t dt)
 {
@@ -2098,9 +1396,8 @@ static inline void pump_fixed_simulation(Scene *scene, int64_t *sim_accum,
   }
 }
 
-/* Step 4: refresh the smoothed HUD fps readout once every
- * FPS_UPDATE_MS of wall-clock time.  Smoothing prevents the per-frame
- * jitter from spamming the HUD with noise. */
+/* Update the fps number shown in the HUD, but only twice a second, so it
+ * holds still long enough to read instead of flickering every frame. */
 static inline void fps_counter_update(int64_t dt, int64_t *fps_accum,
                                        int *frame_count, double *fps_display)
 {
@@ -2114,31 +1411,25 @@ static inline void fps_counter_update(int64_t dt, int64_t *fps_accum,
   }
 }
 
-/* Step 5: sleep so the frame matches TICK_NS (60 fps wall-clock budget).
- *
- * `elapsed` counts BOTH the work done in this frame so far (clock_ns -
- * frame_start) AND the dt that the previous frame ran over budget
- * (`+ dt`); subtracting from TICK_NS gives the remaining sleep budget.
- * If we ran over, clock_sleep_ns sees a non-positive value and returns
- * immediately (it guards `ns <= 0`). */
+/* Wait out the rest of this frame's time budget so we hold ~60 fps.  If
+ * the frame already ran long, the sleep amount goes negative and the sleep
+ * just returns at once. */
 static inline void throttle_to_target_fps(int64_t frame_start, int64_t dt)
 {
   int64_t elapsed = clock_ns() - frame_start + dt;
   clock_sleep_ns(TICK_NS - elapsed);
 }
 
-/* Step 6: paint scene + HUD onto stdscr and flush the diff to the
- * terminal.  Single I/O boundary -- nothing else in the loop calls
- * ncurses output. */
+/* Draw the frame and push it to the screen.  The only place we write to
+ * the terminal. */
 static inline void present_frame(App *app, double fps_display)
 {
   screen_draw(&app->screen, &app->scene, fps_display);
   screen_present();
 }
 
-/* Step 7: non-blocking read of one keystroke; clears running on quit.
- * One key per frame is enough at 60 fps -- the key handler dispatches
- * the action and the next frame's read picks up the following key. */
+/* Check for a keypress without blocking and act on it; one key per frame
+ * is plenty at 60 fps.  Quits the loop if the user asked to. */
 static inline void pump_one_keystroke(App *app)
 {
   int ch = getch();
@@ -2160,27 +1451,16 @@ int main(void)
   double  fps_display = 0.0;
 
   while (app->running) {
-    /* Step 1: service any pending terminal-resize signal. */
     app_service_pending_resize(app, &frame_time, &sim_accum);
 
-    /* Step 2: measure (and cap) wall-clock dt since previous frame. */
     int64_t now = clock_ns();
     int64_t dt  = frame_dt_capped(now, frame_time);
     frame_time  = now;
 
-    /* Step 3: drain dt through the 60 Hz fixed-step simulator. */
     pump_fixed_simulation(&app->scene, &sim_accum, dt);
-
-    /* Step 4: update the smoothed fps readout (HUD only). */
     fps_counter_update(dt, &fps_accum, &frame_count, &fps_display);
-
-    /* Step 5: sleep to honour the 60 fps wall-clock frame budget. */
     throttle_to_target_fps(frame_time, dt);
-
-    /* Step 6: paint the frame and present it to the terminal. */
     present_frame(app, fps_display);
-
-    /* Step 7: poll one keystroke (non-blocking); quit if requested. */
     pump_one_keystroke(app);
   }
 

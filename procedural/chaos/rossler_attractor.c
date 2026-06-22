@@ -1,157 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * rossler_attractor.c
- *   — The Rössler attractor: the simpler-cousin of Lorenz.  Same
- *     3-D ODE recipe but with ONLY ONE nonlinear term, yet it still
- *     exhibits a band-shaped strange attractor with a clean single
- *     scroll.  Famously analytically tractable enough to teach the
- *     "stretch + fold" mechanism by which 3-D continuous chaos
- *     arises.
+ * rossler_attractor.c — the Rössler attractor, Lorenz's simpler cousin: a
+ * 3-D system of equations with just one curved term that still traces out a
+ * thin, folded "strange attractor" you can watch evolve. We solve the
+ * equations step by step and draw the moving point with a fading trail, with
+ * 16 presets that walk from a still dot up to full chaos and a few odd shapes.
  *
- * DEMO: Integrate Rössler's ODE with RK4; project the 3-D state
- *       to screen via a slowly-rotating camera.  Trail ring buffer
- *       fades oldest → newest in 4 bands.  16 presets cycle the
- *       parameter space — n/p step the active row — grouped from
- *       trivial → exotic so the user walks the full bifurcation
- *       cascade and the alternative topologies:
- *
- *         GROUP A  fixed point / decay   STILL, SPIRAL
- *         GROUP B  period-doubling       CYCLE_1, _2, _4, _8
- *         GROUP C  onset & chaos         ONSET, CHAOS_S, CHAOS,
- *                                        CHAOS_L, CHAOS_XL, BANDS
- *         GROUP D  periodic-3 window     CYCLE_3
- *         GROUP E  alternative topology  FUNNEL, SCREW, SCREW_L
- *
- *       The camera auto-fits each preset (per-preset bounding-sphere
- *       extent), so tiny limit cycles AND large screw attractors
- *       both fill the terminal.
- *
- * Study alongside:
- *   ./strange_attractor.c   — Lorenz + 9 other attractors.
- *   ./poincare_section.c    — same Lorenz, viewed as a 2-D return map.
- *
- * Section map:
- *   §1  config    — constants, 16-preset table, themes
- *   §2  clock     — monotonic timer + sleep
- *   §3  color     — HUD pairs + 10 themes
- *   §4  camera    — Camera (yaw/pitch/scale), camera_fit_to_screen,
- *                   project()
- *   §5  physics   — Rössler (system + state) + named-stage RK4
- *   §6  trail     — Trail ring buffer
- *   §7  state     — PresetState + PaletteState typed wrappers
- *   §8  scene     — Scene composite (Rossler + Trail + Camera +
- *                   PresetState + PaletteState + viewport)
- *   §9  screen    — paint_trail, scene_paint, HUD writers
- *   §10 app       — signals, resize, key dispatch table, FrameClock,
- *                   main pseudocode driver + named loop helpers
- *
- * Keys: q/ESC quit | space pause | r reset | n/p preset | t/T theme | ]/[ Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra procedural/chaos/rossler_attractor.c \
- *       -o rossler_attractor -lncurses -lm
+ * Original equations: Rössler 1976, "An equation for continuous chaos".
+ * Sister demos: ./strange_attractor.c (Lorenz + 9 others),
+ *               ./poincare_section.c (Lorenz seen as a 2-D return map).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm     : RK4 with dt = 0.01 s and INT_STEPS_PER_TICK = 15
- *                 substeps per tick.  Camera is a slowly-rotating
- *                 azimuth (yaw) about z plus a fixed elevation
- *                 (pitch).  Each trail sample projects to a cell
- *                 via three named stages: rotate_about_z_yaw →
- *                 rotate_about_x_pitch → orthographic_to_cell.
- *
- * Data-struct   : Rossler composite (RosslerSystem + RosslerState)
- *                 + Trail ring buffer of TRAIL_MAX (3000) world
- *                 samples, walked oldest→newest and age-banded for
- *                 colour.  Camera = (yaw, pitch, scale); yaw
- *                 advances at CAM_YAW_RATE rad/s, scale auto-fits
- *                 the active preset's bounding-sphere extent.
- *
- * Rendering     : ASCII '.' for trail (4 age bands per Theme),
- *                 '@' for the live point on top.  Trail length
- *                 tuned so the full attractor fades over ~3 s —
- *                 enough to see the shape, not so long it
- *                 overwhelms the eye.
- *
- * References    : Numbered so inline code can cite [n].
- *
- *   PHYSICS / DYNAMICAL SYSTEMS
- *   [1] Rössler, O. E. (1976).  "An equation for continuous chaos",
- *       Physics Letters A 57(5), pp. 397-398.  THE original paper:
- *       defines the (x', y', z') equations and the canonical
- *       (a, b, c) = (0.2, 0.2, 5.7) regime.  Designed deliberately
- *       as the SIMPLEST 3-D ODE with one nonlinear term that still
- *       exhibits a strange attractor.
- *   [2] Strogatz, S. H. (2015).  *Nonlinear Dynamics and Chaos*
- *       (2nd ed.), §10.6 (Rössler system & period-doubling
- *       cascade) and §12.1-12.3 (chaotic attractors, stretch +
- *       fold).  Pedagogical reference for the bifurcation
- *       cascade visible in our PRESET_CYCLE_1..PRESET_CYCLE_8
- *       sequence, the period-3 window, and the chaos onset.
- *   [3] Letellier, C., Dutertre, P., Maheu, B. (1995).  "Unstable
- *       periodic orbits and templates of the Rössler system",
- *       Chaos 5(1), pp. 271-282.  Topological classification of
- *       the funnel, screw and other Rössler-family attractors —
- *       the basis for our PRESET_FUNNEL, _SCREW, _SCREW_L rows.
- *
- *   NUMERICS
- *   [4] Press, W. H. et al. (2007).  *Numerical Recipes* (3rd
- *       ed.), §17.1.  Classical 4-stage Runge-Kutta with the
- *       Butcher (1/6, 1/3, 1/3, 1/6) tableau used by
- *       rossler_rk4_step.
- *
- *   RENDERING
- *   [5] Foley, J. D., van Dam, A. et al. (1996).  *Computer
- *       Graphics: Principles and Practice* (2nd ed.), ch. 5-6.
- *       3-D rotation matrices + orthographic projection — the
- *       basis for the yaw/pitch projection in §4 (project()).
- *
- *   FRAMEWORK
- *   [6] Fiedler, G. (2004).  "Fix Your Timestep!",
- *       gafferongames.com.  Accumulator pattern used by
- *       app_drain_fixed_timestep so the integrator and the
- *       renderer decouple.
- *   [7] Sussman, G. J., Wisdom, J. (2014).  *Structure and
- *       Interpretation of Classical Mechanics* (2nd ed.), §1.6
- *       "Coordinate systems and states".  The System / State /
- *       Composite split used in §5 (RosslerSystem + RosslerState
- *       + Rossler composite).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Imagine a 2-D spiral that slowly grows outward in the (x, y)
- * plane.  Once x exceeds c, the z-component shoots up and PULLS
- * the trajectory toward small (x, y), then drops back down.
- * That's stretch + fold — the geometric mechanism for 3-D
- * continuous chaos.
- *
- * KEY FORMULAS  (Rössler 1976 [1])
- * ────────────
- *   dx/dt = −y − z
- *   dy/dt =  x + a·y
- *   dz/dt =  b + z·(x − c)
- *
- *   Classic chaotic regime: (a, b, c) = (0.20, 0.20, 5.70).
- *   Period-1 limit cycle  : c = 3.50.  Between these you can find
- *   the entire period-doubling cascade by varying c (Strogatz [2]
- *   §10.6); cycle these in PRESET_CYCLE_1..PRESET_CYCLE_8.
- *
- * HOW TO VERIFY  (texture / topology naming follows Letellier [3])
- * ─────────────
- *  • CHAOS:    trail traces a thin band-shaped attractor with
- *              occasional z-spikes pulling it toward the centre.
- *  • CYCLE_n:  trail collapses onto a closed loop with n leaves
- *              after transient (period-doubling cascade).
- *  • FUNNEL:   asymmetric "trumpet" spiral.
- *  • SCREW:    cylindrical attractor with long z-axis excursions
- *              — visible at PRESET_SCREW / _SCREW_L.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -168,15 +26,13 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* §1  config — constants, the 16-preset table, and the colour themes */
 
 enum {
     SIM_FPS_MIN      =  10, SIM_FPS_DEFAULT = 60, SIM_FPS_MAX = 240, SIM_FPS_STEP = 10,
     HUD_COLS         =  80, FPS_UPDATE_MS = 500,
     PAIR_HUD         =   1, PAIR_HINT = 2,
-    PAIR_TRAIL_BASE  =   3,    /* 4 trail bands */
+    PAIR_TRAIL_BASE  =   3,    /* first of the 4 trail-fade colours */
     PAIR_LIVE        =   7,
 };
 
@@ -197,84 +53,55 @@ enum {
 #define TRAIL_BAND_COUNT            4
 
 /* Camera */
-#define CAM_PITCH                 0.45f      /* fixed elevation (rad) */
-#define CAM_YAW_RATE              0.12f      /* yaw advance (rad / s) */
+#define CAM_PITCH                 0.45f      /* fixed tilt above the scene (rad) */
+#define CAM_YAW_RATE              0.12f      /* how fast the camera orbits (rad/s) */
 
-/* Camera fit — derive cam.scale from terminal size and the active
- * preset's bounding-sphere extent so the attractor fills the drawable
- * band regardless of resolution. */
-#define ROSS_FIT_MARGIN            0.85f    /* leave a small border    */
-#define ROSS_SCALE_MIN             0.45f    /* graceful for tiny terms */
-#define CAM_FIT_DRAWABLE_HEIGHT_MIN  4      /* floor under degenerate sizes */
-#define CAM_FIT_EXTENT_MIN         1.0f    /* avoid div-by-zero       */
-#define CAM_HALF_FRACTION          0.5f    /* viewport centre split   */
+/* How big to draw the attractor: derived from the terminal size and the
+ * current preset's rough radius so it fills the screen at any window size. */
+#define ROSS_FIT_MARGIN            0.85f    /* leave a little border */
+#define ROSS_SCALE_MIN             0.45f    /* don't shrink below this on tiny windows */
+#define CAM_FIT_DRAWABLE_HEIGHT_MIN  4      /* floor so the fit math survives tiny windows */
+#define CAM_FIT_EXTENT_MIN         1.0f    /* keep the radius non-zero so we never divide by 0 */
+#define CAM_HALF_FRACTION          0.5f    /* half of the viewport, i.e. the centre */
 
-/* Projection — z-axis compression before projecting onto the screen.
- * The Rössler z-component reaches ~80 in the screw regime; without
- * this squash the attractor would tower far off-screen vertically.
- * Matches the convention in ./strange_attractor.c. */
+/* Squash the up-down (z) axis before drawing. In the screw presets z can
+ * reach ~80, which would shoot the shape way off the top of the screen;
+ * halving it keeps it on screen. Same trick as ./strange_attractor.c. */
 #define Z_SQUASH_FACTOR            0.5f
 
-/* HUD display — radians → degrees for the yaw readout. */
+/* For showing the camera angle in degrees on the HUD. */
 #define RAD_TO_DEG                (180.0f / (float)M_PI)
 
 /*
- * Preset — the 16-entry index space for the presets[] table.
+ * Preset — names for the 16 rows of the presets[] table below.
  *
- * INTENT
- *   Named indices into the presets[] table, grouped by attractor
- *   topology (A trivial → E exotic).  Ordering is simple → complex
- *   so 'n' walks visual variety monotonically and the user
- *   experiences the period-doubling cascade BEFORE landing in
- *   chaos.  The period-3 window (CYCLE_3) is the one deliberate
- *   out-of-cascade insertion — it shows a PERIODIC island inside
- *   the chaotic band (Strogatz [2] §10.6, "type-I intermittency").
- *
- * CONTEXT
- *   Used only as table indices; entries themselves are defined in
- *   the presets[] static array below.  Group dividers in the enum
- *   line up with dividers in the array initialiser.  PresetState
- *   (§7) wraps a single instance of this enum and cycles modulo
- *   N_PRESETS.
- *
- * MEMBER LOGIC
- *   Each name follows the SHAPE/NUMBER convention.  Groups:
- *     A (2)  : fixed point / decay   STILL, SPIRAL
- *     B (4)  : period-doubling       CYCLE_1, _2, _4, _8
- *     C (6)  : onset & chaos         ONSET, CHAOS_S, CHAOS,
- *                                    CHAOS_L, CHAOS_XL, BANDS
- *     D (1)  : period-3 window       CYCLE_3
- *     E (3)  : alternative topology  FUNNEL, SCREW, SCREW_L
- *   PRESET_CHAOS is the canonical Rössler row [1] and is the
- *   boot-state default chosen by scene_init.
- *   N_PRESETS is the count sentinel; PresetState cycles modulo it.
- *
- * REFERENCES
- *   [1] Rössler 1976 — canonical CHAOS regime.
- *   [2] Strogatz §10.6 — the period-doubling cascade these
- *       presets are designed to demonstrate.
- *   [3] Letellier et al. (1995) — funnel & screw topology.
+ * They're just labelled slot numbers, ordered from boring to wild so pressing
+ * 'n' walks you through the whole story: a still point, then loops that double
+ * in length again and again, then chaos, then a couple of odd shapes. CYCLE_3
+ * is slipped in mid-chaos on purpose — a brief calm island in the middle of
+ * the storm. PRESET_CHAOS is the classic Rössler setting and the one we boot
+ * into. N_PRESETS is the count, used to wrap around when cycling.
  */
 typedef enum {
-    /* Group A — fixed point / decay (2) */
+    /* still point / decaying spiral */
     PRESET_STILL = 0,
     PRESET_SPIRAL,
-    /* Group B — period-doubling cascade (4) */
+    /* loops that keep doubling in length */
     PRESET_CYCLE_1,
     PRESET_CYCLE_2,
     PRESET_CYCLE_4,
     PRESET_CYCLE_8,
-    /* Group C — onset & chaos (6) */
+    /* the edge of chaos, then chaos */
     PRESET_ONSET,
     PRESET_CHAOS_S,
-    PRESET_CHAOS,            /* canonical Rössler — default boot state */
+    PRESET_CHAOS,            /* classic Rössler — the one we boot into */
     PRESET_CHAOS_L,
-    /* Group D — periodic-3 window (1) */
+    /* a calm 3-loop island in the middle of chaos */
     PRESET_CYCLE_3,
-    /* Group C cont. — wider chaos (2) */
+    /* wider chaos */
     PRESET_CHAOS_XL,
     PRESET_BANDS,
-    /* Group E — alternative topologies (3) */
+    /* odd shapes: trumpet and screw */
     PRESET_FUNNEL,
     PRESET_SCREW,
     PRESET_SCREW_L,
@@ -282,95 +109,57 @@ typedef enum {
 } Preset;
 
 /*
- * RossPreset — one named (a, b, c) row of the parameter zoo plus its
- * camera-fit extent.
+ * RossPreset — one row of the preset menu: a name, the three dials that shape
+ * the attractor, and a rough size used to fit the camera.
  *
- * INTENT
- *   Each row of the presets[] table fully describes one entry in
- *   the 16-preset zoo: 8-char HUD label, three Rössler [1] knobs,
- *   and the world-space bounding sphere used by the camera fit.
- *   Cycling through this table is the only way the user changes
- *   what the demo shows.
+ * Cycling through these rows is the only thing that changes what you see. Each
+ * row is read in three places: §5 turns (a, b, c) into the live equations, §8
+ * uses `extent` to size the camera, and §9 prints the name and dials on the HUD.
  *
- * CONTEXT
- *   Read by §5 rossler_system_from_preset (extracts a, b, c into
- *   the RosslerSystem), by §8 scene_compute_geometry (reads extent
- *   to re-fit the camera), and by §9 HUD writers (display name +
- *   parameters).  The PresetState wrapper in §7 holds an index
- *   INTO this table; cycling that index re-reads this row.
+ *   name   : short label for the HUD, padded so columns line up.
+ *   a, b, c: the three dials of the Rössler equations. Turning c alone walks
+ *            you from a single loop up through chaos; FUNNEL and SCREW also
+ *            nudge a and b to get their different shapes.
+ *   extent : roughly how far the shape reaches from its centre (in the same
+ *            squashed z units the renderer uses). Hand-tuned per row so every
+ *            preset ends up about the same size on screen — small loops fill a
+ *            few cells, the big screw fills dozens.
  *
- * MEMBER LOGIC
- *   name    : 8-char HUD label, padded so the parameter column aligns.
- *   a, b, c : the three Rössler [1] parameters.  All entries here use
- *             a ∈ {0.10, 0.20, 0.32}, b ∈ {0.10, 0.20, 0.30},
- *             c ∈ [1.5, 18.0].  Varying c alone walks the cascade;
- *             the FUNNEL and SCREW rows perturb a + b for topology.
- *   extent  : bounding-sphere radius in projected world units
- *             (x, y, z·½  — matching scene_paint's z-squash).
- *             Tuned per row so the camera fit gives every preset
- *             roughly the same on-screen size: limit cycles use
- *             ~3-8 cells, classic CHAOS ~14, SCREW_L ~38.
- *
- * REFERENCES
- *   [1] Rössler 1976 — parameter naming and canonical values.
- *   [2] Strogatz §10.6 — period-doubling cascade tuning of c.
- *   [3] Letellier et al. (1995) — funnel & screw parameter regimes.
+ * Equations and classic values: Rössler 1976. Funnel/screw regimes follow
+ * Letellier, Dutertre & Maheu 1995.
  */
 typedef struct { const char *name; float a, b, c; float extent; } RossPreset;
 static const RossPreset presets[N_PRESETS] = {
-    /* Group A — fixed point / decay ─────────────────────────────── */
     { "STILL   ", 0.20f, 0.20f,  1.50f,  3.0f },
     { "SPIRAL  ", 0.20f, 0.20f,  2.50f,  4.0f },
-    /* Group B — period-doubling cascade ─────────────────────────── */
     { "CYCLE_1 ", 0.20f, 0.20f,  3.00f,  5.0f },
     { "CYCLE_2 ", 0.20f, 0.20f,  4.00f,  6.0f },
     { "CYCLE_4 ", 0.20f, 0.20f,  4.55f,  7.0f },
     { "CYCLE_8 ", 0.20f, 0.20f,  4.66f,  8.0f },
-    /* Group C — onset & chaos ───────────────────────────────────── */
     { "ONSET   ", 0.20f, 0.20f,  4.72f,  9.0f },
     { "CHAOS_S ", 0.20f, 0.20f,  5.00f, 11.0f },
     { "CHAOS   ", 0.20f, 0.20f,  5.70f, 14.0f },
     { "CHAOS_L ", 0.20f, 0.20f,  6.00f, 16.0f },
-    /* Group D — periodic window inside chaos ────────────────────── */
     { "CYCLE_3 ", 0.20f, 0.20f,  6.30f, 16.0f },
-    /* Group C cont. ─────────────────────────────────────────────── */
     { "CHAOS_XL", 0.20f, 0.20f,  7.00f, 20.0f },
     { "BANDS   ", 0.20f, 0.20f,  8.00f, 24.0f },
-    /* Group E — alternative topologies (Letellier et al. [3]) ──── */
-    { "FUNNEL  ", 0.32f, 0.30f,  4.50f, 12.0f },   /* asymmetric one-fold  */
-    { "SCREW   ", 0.10f, 0.10f, 14.00f, 30.0f },   /* cylindrical screw    */
-    { "SCREW_L ", 0.10f, 0.10f, 18.00f, 38.0f },   /* larger-radius screw  */
+    { "FUNNEL  ", 0.32f, 0.30f,  4.50f, 12.0f },   /* lopsided trumpet  */
+    { "SCREW   ", 0.10f, 0.10f, 14.00f, 30.0f },   /* tall screw shape  */
+    { "SCREW_L ", 0.10f, 0.10f, 18.00f, 38.0f },   /* wider screw       */
 };
 
 /*
- * Theme — one named palette for the attractor renderer.
+ * Theme — one colour scheme for the drawing. The t/T keys cycle through them.
  *
- * INTENT
- *   Group the colour codes that define an attractor's visual
- *   identity into ONE named row, so a "next theme" key cycles a
- *   single flat table.  Every theme provides FOUR trail-band
- *   shades (oldest → newest) plus a live-point colour.
+ *   name  : short label for the HUD.
+ *   band[]: the four trail colours, darkest first. The oldest part of the
+ *           trail uses the darkest; the freshest uses the brightest, so the
+ *           streak looks like it's fading away behind the point.
+ *   live  : colour of the '@' that marks where the point is right now —
+ *           usually a hot colour so it stands out against its own trail.
  *
- * CONTEXT
- *   Indexed by PaletteState (§7); applied by theme_apply (§3)
- *   which pushes each band into PAIR_TRAIL_BASE + i and the
- *   live colour into PAIR_LIVE.  Cycled by t/T via
- *   app_cycle_theme_next/prev.  All palette values follow the
- *   project Brightness Rule (CLAUDE.md): every code lives in
- *   the bright half of the 256-colour cube so the dots stay
- *   legible on default black.
- *
- * MEMBER LOGIC
- *   name   : 7-char HUD label.
- *   band[] : TRAIL_BAND_COUNT (4) 256-colour codes, sorted
- *            dimmest → brightest.  paint_trail picks band[0]
- *            for the oldest sample and band[3] for the newest.
- *   live   : colour of the '@' live-point glyph (PAIR_LIVE).
- *            Usually a high-saturation hot colour so the
- *            "current state" pops against the trail.
- *
- * REFERENCES
- *   CLAUDE.md "Theme Palette Brightness".
+ * All colours sit in the bright half of the palette so the dots stay visible
+ * on a black terminal (CLAUDE.md "Theme Palette Brightness").
  */
 typedef struct { const char *name; short band[TRAIL_BAND_COUNT]; short live; } Theme;
 #define N_THEMES 10
@@ -387,17 +176,13 @@ static const Theme themes[N_THEMES] = {
     { "ARCTIC",  { 117, 159, 195, 231 }, 196 },
 };
 
-/* ===================================================================== */
-/* §2 clock + §3 color                                                    */
-/* ===================================================================== */
+/* §2 clock + §3 color */
 
 static int64_t clock_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec; }
 static void clock_sleep_ns(int64_t ns) { if (ns <= 0) return;
     struct timespec req = {ns/NS_PER_SEC, ns%NS_PER_SEC}; nanosleep(&req, NULL); }
 
-/* theme_install_256 — push a theme's bright-cube codes into the
- * two ncurses pair classes (trail bands, live point). */
 static inline void theme_install_256(const Theme *t)
 {
     for (int i = 0; i < TRAIL_BAND_COUNT; i++)
@@ -405,9 +190,7 @@ static inline void theme_install_256(const Theme *t)
     init_pair(PAIR_LIVE, t->live, -1);
 }
 
-/* theme_install_8color_fallback — graceful degradation when the
- * terminal advertises only 8 colours.  All trail bands collapse to
- * cyan; live point becomes red. */
+/* fallback for old 8-colour terminals: trail goes cyan, point goes red. */
 static inline void theme_install_8color_fallback(void)
 {
     for (int i = 0; i < TRAIL_BAND_COUNT; i++)
@@ -415,15 +198,6 @@ static inline void theme_install_8color_fallback(void)
     init_pair(PAIR_LIVE, COLOR_RED, -1);
 }
 
-/* theme_apply — push the chosen palette to the ncurses pair table.
- *
- * DRIVER PSEUDOCODE
- *   if idx out of range:  idx = 0                    // graceful fallback
- *   if terminal has 256 colours:
- *       theme_install_256(themes[idx])
- *   else:
- *       theme_install_8color_fallback()
- */
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -436,49 +210,30 @@ static void color_init(void)
   else { init_pair(PAIR_HUD, COLOR_YELLOW, -1); init_pair(PAIR_HINT, COLOR_CYAN, -1); }
   theme_apply(0); }
 
-/* ===================================================================== */
-/* §4  camera — yaw + pitch projection                                    */
-/* ===================================================================== */
+/* §4  camera — turn the 3-D point into a screen position */
 
 /*
- * Camera — orbiting orthographic camera onto the 3-D attractor.
+ * Camera — where we're looking at the 3-D shape from. We only need three
+ * numbers, not a full 3-D camera, because the view is deliberately simple.
  *
- * INTENT
- *   The 3-D attractor needs to project to 2-D character cells.  A
- *   FULL projection matrix would obscure the geometry; instead we
- *   carry just the three scalars that drive the look: yaw (which
- *   slowly rotates so the user sees the attractor from all sides),
- *   pitch (fixed elevation so the z-axis stays vertical-ish), and
- *   scale (auto-fit to terminal × preset extent).
+ *   yaw   : how far the camera has spun around the shape (radians). It keeps
+ *           creeping up so you slowly see the shape from every side.
+ *   pitch : how high above the shape we're looking down from. Held fixed —
+ *           letting it change too made the spin feel dizzying at this
+ *           chunky character resolution.
+ *   scale : how many screen cells one world unit becomes. Recomputed whenever
+ *           the window resizes or the preset changes so the shape stays
+ *           nicely sized.
  *
- * CONTEXT
- *   Owned by Scene.  yaw is advanced each tick by CAM_YAW_RATE
- *   (radians per sim second).  scale is set by camera_fit_to_screen
- *   from (cols, rows, active preset's extent); pitch is fixed at
- *   CAM_PITCH = 0.45 rad (≈ 26°).  Consumed by project(), which
- *   composes the yaw + pitch rotation and the orthographic squash.
- *
- * MEMBER LOGIC
- *   yaw   : azimuth angle (radians) around the z-axis.  Advances
- *           monotonically; not normalised since sinf/cosf wrap
- *           naturally.
- *   pitch : elevation angle (radians) above the xy-plane.  Fixed
- *           — varying pitch made the rotation feel disorienting
- *           in ncurses-resolution renders.
- *   scale : world-units → cells multiplier.  Re-derived on init,
- *           resize, and preset cycle by camera_fit_to_screen.
- *
- * REFERENCES
- *   [5] Foley & van Dam (1996) ch. 5 — rotation + orthographic
- *       projection math.
+ * The rotation + flatten-to-screen math is the standard textbook approach
+ * (Foley & van Dam 1996, ch. 5-6).
  */
 typedef struct { float yaw, pitch, scale; } Camera;
 
-#define CELL_ASPECT 0.5f   /* characters are roughly 2× tall as wide */
+#define CELL_ASPECT 0.5f   /* a character cell is about twice as tall as wide */
 
-/* screen_drawable_height — viewport rows MINUS the HUD reservation,
- * floored at CAM_FIT_DRAWABLE_HEIGHT_MIN so the fit math stays
- * well-defined on tiny terminals. */
+/* usable rows once the HUD (top + bottom) is taken out, never less than a
+ * tiny floor so the sizing math below doesn't break on a squashed window. */
 static inline int screen_drawable_height(int rows)
 {
     int draw_h = rows - HUD_BAND_RESERVED_ROWS;
@@ -486,20 +241,14 @@ static inline int screen_drawable_height(int rows)
     return draw_h;
 }
 
-/* horizontal_fit_scale — largest world→cell scale that keeps an
- * attractor of radius `extent` inside cols × MARGIN cells horizontally.
- *
- *   half_x_cells × MARGIN ≥ extent × scale   ⇒   scale ≤ …
- */
+/* biggest scale that still fits a shape of this radius across the width. */
 static inline float horizontal_fit_scale(int cols, float extent, float margin)
 {
     float half_x_cells = (float)cols * CAM_HALF_FRACTION;
     return (half_x_cells * margin) / extent;
 }
 
-/* vertical_fit_scale — same logic, vertical axis.  Account for
- * CELL_ASPECT: vertical world units occupy fewer cells than
- * horizontal because characters are 2× tall as wide. */
+/* same idea for the height; the aspect term accounts for tall, skinny cells. */
 static inline float vertical_fit_scale(int rows, float extent, float margin, float aspect)
 {
     int   draw_h       = screen_drawable_height(rows);
@@ -507,17 +256,8 @@ static inline float vertical_fit_scale(int rows, float extent, float margin, flo
     return (half_y_cells * margin) / (extent * aspect);
 }
 
-/* camera_fit_to_screen — pick cam.scale so the attractor fills the
- * drawable band on any terminal size.
- *
- * DRIVER PSEUDOCODE
- *   extent_safe = max(extent, EXTENT_MIN)             // avoid /0
- *   sx = horizontal_fit_scale(cols, extent_safe, MARGIN)
- *   sy = vertical_fit_scale  (rows, extent_safe, MARGIN, CELL_ASPECT)
- *   scale = min(sx, sy)                                // tightest axis wins
- *   scale = max(scale, SCALE_MIN)                      // graceful floor
- *   cam.scale ← scale
- */
+/* pick the scale that makes the shape fill the window: try both width and
+ * height, keep the smaller (so it fits both ways), but never go below a floor. */
 static void camera_fit_to_screen(Camera *cam, int cols, int rows, float extent)
 {
     if (extent < CAM_FIT_EXTENT_MIN) extent = CAM_FIT_EXTENT_MIN;
@@ -530,13 +270,8 @@ static void camera_fit_to_screen(Camera *cam, int cols, int rows, float extent)
     cam->scale = scale;
 }
 
-/* rotate_about_z_yaw — Foley/van Dam [5] ch.5 right-handed rotation
- * by yaw radians about the z-axis.  Applied to a 3-D point's (x, y);
- * z passes through unchanged.
- *
- *   ┌xr┐ = ┌ cos(θ)  −sin(θ) ┐ ┌x┐
- *   └yr┘   └ sin(θ)   cos(θ) ┘ └y┘
- */
+/* spin the point around the up-down axis by the camera's yaw — this is what
+ * lets us see the shape from different sides. Height (z) is untouched. */
 static inline void rotate_about_z_yaw(float x, float y,
                                       float cos_yaw, float sin_yaw,
                                       float *xr, float *yr)
@@ -545,24 +280,17 @@ static inline void rotate_about_z_yaw(float x, float y,
     *yr = x * sin_yaw + y * cos_yaw;
 }
 
-/* rotate_about_x_pitch — Foley/van Dam [5] ch.5 right-handed rotation
- * by pitch radians about the x-axis, applied to (yr, z).  Returns
- * the new vertical-world component yr2; the xr component is unchanged
- * by an x-axis rotation, so we only return what changes. */
+/* tilt the point so we look down on it from above. Only the vertical part
+ * changes, so that's all we return. */
 static inline float rotate_about_x_pitch(float yr, float z,
                                          float cos_pitch, float sin_pitch)
 {
     return yr * cos_pitch - z * sin_pitch;
 }
 
-/* orthographic_to_cell — final stage of project().  Drop the depth
- * axis, multiply by cam.scale, flip y (screen-y points DOWN, world-y
- * points UP), scale by CELL_ASPECT so characters look proportional.
- *
- *   sx_cells = cx + xr_world  · scale
- *   sy_cells = cy − yr2_world · scale · aspect
- *
- * Foley/van Dam [5] §6.2: parallel projection + viewport transform. */
+/* last step: forget depth and land on an actual screen cell. We scale to the
+ * right size, flip the y-axis (screen rows count downward, the world counts
+ * up), and squeeze vertically so tall cells don't stretch the picture. */
 static inline void orthographic_to_cell(float xr_world, float yr2_world,
                                         float scale, float aspect,
                                         int cx, int cy, int *sx, int *sy)
@@ -571,14 +299,7 @@ static inline void orthographic_to_cell(float xr_world, float yr2_world,
     *sy = cy + (int)(-yr2_world * scale * aspect);
 }
 
-/* project — world (x, y, z) → cell (sx, sy).  Three named stages
- * (Foley/van Dam [5] ch.5-6):
- *
- * DRIVER PSEUDOCODE
- *   STAGE 1 — rotate_about_z_yaw   (yaw   about z) → (xr,  yr)
- *   STAGE 2 — rotate_about_x_pitch (pitch about x) →       yr2
- *   STAGE 3 — orthographic_to_cell                  → (sx,  sy)
- */
+/* turn a 3-D world point into a screen cell: spin it, tilt it, flatten it. */
 static void project(const Camera *cam,
                     float x, float y, float z,
                     int cx_centre, int cy_centre, float aspect,
@@ -593,134 +314,61 @@ static void project(const Camera *cam,
     orthographic_to_cell(xr, yr2, cam->scale, aspect, cx_centre, cy_centre, sx, sy);
 }
 
-/* ===================================================================== */
-/* §5  Rössler ODE — system + state composite, RK4 integrator             */
-/* ===================================================================== */
+/* §5  the Rössler equations and the solver that steps them forward */
 
 /*
- * Vec3 — generic 3-component vector.
- *
- * INTENT
- *   The single 3-tuple this file traffics in.  Used three ways:
- *     • a Rössler phase point  (RosslerState alias)
- *     • a Rössler derivative   (output of rossler_deriv)
- *     • a trail sample         (geometry data fed to the renderer)
- *   Flat by-value struct so RK4 stages combine cheaply via state_add
- *   without extra heap allocation.
- *
- * CONTEXT
- *   Returned by rossler_deriv, stored as RosslerState inside Rossler,
- *   pushed into Trail by trail_push, projected to (sx, sy) by project().
- *
- * MEMBER LOGIC
- *   x, y, z : scalar components.  In Rössler context they are the
- *             three observables of the ODE; in trail/render context
- *             they are just a 3-tuple to project onto cells.
+ * Vec3 — three numbers (x, y, z) bundled together. Used as the point's
+ * position, as the direction it's moving (its slope), and as a stored trail
+ * sample. Passed around by value so the solver can add them up cheaply.
  */
 typedef struct { float x, y, z; } Vec3;
 
-/*
- * RosslerState — semantic alias for Vec3 at the "ODE phase point" site.
- *
- * INTENT
- *   Same memory layout as Vec3; the typedef just labels intent so a
- *   call like state_add(RosslerState, dt, slope) reads as ODE arith-
- *   metic, not generic vector arithmetic.  No new fields.  Mirrors
- *   the pattern in ./strange_attractor.c (LorenzState = Vec3).
- *
- * CONTEXT
- *   Lives inside Rossler::state.  Mutated by rossler_rk4_step.  Read
- *   by scene_paint to project the live point.
- *
- * REFERENCES
- *   [1] Rössler 1976 — the (x, y, z) coordinates these scalars name.
- */
+/* Just a Vec3, but the name says "this one is the point's current position"
+ * so the solver code reads as physics rather than generic vector math. */
 typedef Vec3 RosslerState;
 
 /*
- * RosslerSystem — invariant parameters of the Rössler ODE.
+ * RosslerSystem — the three dials that shape the motion. Kept apart from the
+ * moving point so the equations only depend on (point, dials); switching
+ * presets just swaps these dials and restarts the point.
  *
- * INTENT
- *   Split parameters away from state so rossler_deriv becomes a PURE
- *   function of (state, system).  Cycling a preset only re-assigns
- *   the system — the state is reset separately to its canonical
- *   seed (1, 1, 1).  Mirrors the System+State split used in every
- *   other chaos demo (Sussman & Wisdom [7] §1.6).
+ *   a : how fast the point spirals outward. Usually 0.2.
+ *   b : a steady push on the height so it never just dies down to zero.
+ *   c : the trip-wire — once the point's x passes c, the height suddenly
+ *       shoots up and yanks it back inward. Slowly raising c is what walks
+ *       the shape from a single loop, to a doubled loop, and on into chaos.
+ *       The big values (14, 18) give the screw shapes.
  *
- * CONTEXT
- *   Loaded from the active preset row via
- *   rossler_system_from_preset().  Read-only inside rossler_deriv
- *   and rossler_rk4_step.  Mutated only on preset cycle.
- *
- * MEMBER LOGIC
- *   a : weight on the y-component of the second equation.  Controls
- *       the rate of spiral expansion in the (x, y) plane.  Canonical
- *       value 0.2; FUNNEL uses 0.32, SCREW uses 0.10.
- *   b : constant pump in the z-equation.  Prevents z from settling
- *       to zero.  Canonical 0.2; SCREW uses 0.10.
- *   c : threshold at which z spikes (when x ≥ c the z-equation
- *       grows exponentially).  Controls the period-doubling cascade:
- *       c = 3 → period-1, 4 → period-2, 4.55 → period-4, 4.66 → -8,
- *       4.72 → chaos onset, 5.7 → classic.  Larger c yields screw
- *       attractors (14, 18).
- *
- * REFERENCES
- *   [1] Rössler 1976 — equations 1-3 and parameter naming.
- *   [2] Strogatz §10.6 — bifurcation diagram in c.
+ * Equations and dial names: Rössler 1976. How c drives the doubling:
+ * Strogatz, Nonlinear Dynamics and Chaos, §10.6.
  */
 typedef struct { float a, b, c; } RosslerSystem;
 
 /*
- * Rossler — composite: invariant system + current state.
- *
- * INTENT
- *   One value carrying everything needed to advance the ODE; matches
- *   the abstraction layout used by every chaos demo in this project
- *   (Lorenz, double pendulum, Hénon-Heiles, Duffing).  Lets
- *   rossler_rk4_step take a single argument instead of a state
- *   pointer plus four loose float parameters.
- *
- * CONTEXT
- *   Owned by Scene; rossler_rk4_step mutates its state field while
- *   reading its system field as const.  scene_apply_preset rebuilds
- *   it on every preset change.
- *
- * MEMBER LOGIC
- *   system : the (a, b, c) triple — never mutated by rossler_rk4_step.
- *   state  : the (x, y, z) phase point — mutated each RK4 step.
- *
- * REFERENCES
- *   [4] Numerical Recipes §17.1 — RK4 integrator that operates on
- *       this composite.
- *   [7] Sussman & Wisdom §1.6 — System/State separation rationale.
+ * Rossler — the dials plus the point's position, bundled so the solver takes
+ * one argument. The solver moves `state` and only reads `system`.
  */
 typedef struct {
     RosslerSystem system;
     RosslerState  state;
 } Rossler;
 
-/* rossler_deriv — evaluate dy/dt = f(state, system).  Rössler 1976
- * [1]; each line of the body maps 1-to-1 to one published formula:
- *
- *   dx/dt = −y − z
- *   dy/dt =  x + a·y
- *   dz/dt =  b + z·(x − c)
- *
- * The ONE nonlinear term (z·x) is what makes Rössler the simplest
- * 3-D ODE that exhibits a strange attractor (see Strogatz [2] §12.1
- * on stretch + fold mechanism). */
+/* Given where the point is, work out which way (and how fast) it's heading —
+ * the three Rössler equations, one per line. The single curved term, z·x in
+ * the last line, is the whole trick: it's what makes the shape fold over on
+ * itself and turn chaotic. */
 static inline RosslerState rossler_deriv(const RosslerState *s,
                                          const RosslerSystem *sys)
 {
     RosslerState dy;
-    dy.x = -s->y - s->z;                            /* −y − z          */
-    dy.y =  s->x + sys->a * s->y;                   /*  x + a·y        */
-    dy.z =  sys->b + s->z * (s->x - sys->c);        /*  b + z·(x − c)  */
+    dy.x = -s->y - s->z;
+    dy.y =  s->x + sys->a * s->y;
+    dy.z =  sys->b + s->z * (s->x - sys->c);
     return dy;
 }
 
-/* state_add — y + h·k, returned as a new RosslerState.  Pure helper
- * for combining an RK4 stage's slope into a midpoint estimate. */
+/* take a step of size h in a given direction from a point — "where would I
+ * be if I moved this way for this long?" */
 static inline RosslerState state_add(const RosslerState *a,
                                      float h, const RosslerState *k)
 {
@@ -731,11 +379,11 @@ static inline RosslerState state_add(const RosslerState *a,
     return r;
 }
 
-/* RK4 Butcher tableau constants — Numerical Recipes [4] §17.1. */
 #define RK4_BUTCHER_WEIGHT_SUM   6.0f
 #define RK4_MIDPOINT_FRACTION    0.5f
 
-/* rk4_butcher_weighted_average — (k₁ + 2k₂ + 2k₃ + k₄) / 6. */
+/* blend the four trial directions into one, trusting the two middle ones most
+ * — the recipe that makes this solver far more accurate than a naive step. */
 static inline RosslerState rk4_butcher_weighted_average(
     const RosslerState *k1, const RosslerState *k2,
     const RosslerState *k3, const RosslerState *k4)
@@ -747,26 +395,11 @@ static inline RosslerState rk4_butcher_weighted_average(
     return avg;
 }
 
-/* rossler_rk4_step — one fixed-step RK4 update of the composite.
- * Classical 4-stage Runge-Kutta with the Butcher (1/6, 1/3, 1/3, 1/6)
- * tableau (Numerical Recipes [4] §17.1).
- *
- * DRIVER PSEUDOCODE
- *   half_dt        = dt / 2
- *   slope_start    = f(state)
- *   midpoint_1     = state + half_dt · slope_start
- *   slope_mid_1    = f(midpoint_1)
- *   midpoint_2     = state + half_dt · slope_mid_1
- *   slope_mid_2    = f(midpoint_2)
- *   endpoint       = state + dt · slope_mid_2
- *   slope_end      = f(endpoint)
- *   effective_slope = (slope_start + 2·slope_mid_1
- *                                  + 2·slope_mid_2
- *                                  +   slope_end ) / 6
- *   state ← state + dt · effective_slope
- *
- * f here is rossler_deriv (system-parameterised), so the call sites
- * read 1-to-1 with the published Butcher tableau. */
+/* move the point forward one small time step. Instead of trusting a single
+ * direction, it samples the direction four times (start, twice in the middle,
+ * and end), then blends them — the classic Runge-Kutta method that keeps the
+ * curve accurate (Numerical Recipes §17.1). The named locals below read like
+ * the textbook recipe top to bottom. */
 static void rossler_rk4_step(Rossler *r, float dt)
 {
     const RosslerSystem *sys = &r->system;
@@ -785,49 +418,32 @@ static void rossler_rk4_step(Rossler *r, float dt)
     r->state = state_add(&r->state, dt, &effective_slope);
 }
 
-/* rossler_system_from_preset — construct a RosslerSystem from one
- * row of the §1 presets[] table.  Named so the call site reads
- * "rossler = system_from_preset" rather than "rossler.a = p->a; …". */
+/* pull the three dials out of a preset row. */
 static inline RosslerSystem rossler_system_from_preset(const RossPreset *p)
 {
     return (RosslerSystem){ p->a, p->b, p->c };
 }
 
-/* ===================================================================== */
-/* §6  trail — fixed-capacity ring buffer of recent samples              */
-/* ===================================================================== */
+/* §6  trail — the fading streak of recent positions */
 
 /*
- * Trail — ring buffer of the last TRAIL_MAX Rössler samples.
+ * Trail — the last few thousand positions, kept so we can draw the streak.
  *
- * INTENT
- *   Decouple "how long the visible streak is" from "how fast we
- *   advance the integrator" — the renderer reads up to TRAIL_MAX
- *   samples, the integrator pushes one every RK4 step.  No malloc;
- *   the whole buffer is a static field of Scene.  Storing the
- *   three axes as PARALLEL float arrays (struct-of-arrays) keeps
- *   each axis cache-coherent during paint_trail's age-banded walk.
+ * It's a fixed-size loop of slots (a ring buffer): once full, the newest
+ * position overwrites the oldest, so the streak stays a constant length no
+ * matter how long the program runs. No memory is allocated at runtime — it's
+ * one big static block. We store the three axes as separate arrays because
+ * the drawing code walks all the x's, then all the y's, which is friendlier
+ * to the cache that way.
  *
- * CONTEXT
- *   Written by scene_tick (one trail_push per RK4 step inside the
- *   INT_STEPS_PER_TICK substep loop).  Read by paint_trail in §9
- *   which walks oldest → newest, age-banding into TRAIL_BAND_COUNT
- *   colour tiers (oldest → dimmest).  Reset on r-key, preset
- *   change, and SIGWINCH so a fresh attractor isn't ghosted.
+ *   x[], y[], z[] : the stored positions, one array per axis.
+ *   head          : slot holding the newest position; steps forward (and
+ *                   wraps around) each time we add one.
+ *   count         : how many slots are filled, stopping at full. It fills up
+ *                   after roughly 3 seconds.
  *
- * MEMBER LOGIC
- *   x[], y[], z[] : per-axis sample arrays of length TRAIL_MAX
- *                   (3000).  Index 'head' is the newest sample;
- *                   (head - count + 1) mod TRAIL_MAX is the oldest.
- *   head          : index of the most recent sample.  Incremented
- *                   modulo TRAIL_MAX on every trail_push.
- *   count         : number of valid samples, capped at TRAIL_MAX.
- *                   Saturates once the buffer fills (after ~3
- *                   seconds at the default sim rate).
- *
- * REFERENCES
- *   Standard ring buffer; nothing exotic.  Same shape as the trail
- *   used by ./strange_attractor.c and ./poincare_section.c.
+ * Wiped whenever we reset, change preset, or resize so an old shape doesn't
+ * linger as a ghost behind the new one.
  */
 typedef struct {
     float x[TRAIL_MAX], y[TRAIL_MAX], z[TRAIL_MAX];
@@ -844,26 +460,23 @@ static void trail_push(Trail *t, Vec3 p)
     if (t->count < TRAIL_MAX) t->count++;
 }
 
-/* trail_oldest_index — ring-buffer offset of the oldest valid sample.
- * (head − count + 1) mod TRAIL_MAX, with TRAIL_MAX added to keep the
- * intermediate non-negative under C's truncating mod. */
+/* slot holding the oldest position still kept. The extra TRAIL_MAX keeps the
+ * number positive before the wrap, since C's % can go negative. */
 static inline int trail_oldest_index(const Trail *t)
 {
     return (t->head - t->count + 1 + TRAIL_MAX) % TRAIL_MAX;
 }
 
-/* trail_sample_at — i-th sample from oldest (i=0) to newest
- * (i=count-1).  Centralises the ring-buffer wrap so paint_trail
- * doesn't need to know the storage layout. */
+/* the i-th position counting from the oldest, so callers can just walk
+ * 0..count-1 and not worry about where the ring wraps. */
 static inline Vec3 trail_sample_at(const Trail *t, int i_from_oldest)
 {
     int idx = (trail_oldest_index(t) + i_from_oldest) % TRAIL_MAX;
     return (Vec3){ t->x[idx], t->y[idx], t->z[idx] };
 }
 
-/* trail_age_band — map a sample's age (0=newest, n-1=oldest) onto
- * one of TRAIL_BAND_COUNT colour tiers.  Newer samples get higher
- * band indices = brighter colours.  Clamped to [0, BAND_COUNT-1]. */
+/* pick which of the four fade colours a position gets from its age: fresh
+ * ones get the bright end, old ones the dim end. */
 static inline int trail_age_band(int age_from_newest, int n)
 {
     int band = (TRAIL_BAND_COUNT - 1) - (age_from_newest * TRAIL_BAND_COUNT) / n;
@@ -872,47 +485,20 @@ static inline int trail_age_band(int age_from_newest, int n)
     return band;
 }
 
-/* world_to_view_space — apply Z_SQUASH_FACTOR.  Names the convention
- * that the renderer "sees" a shorter z than the integrator computed,
- * keeping screw-attractor z-spikes from overflowing the viewport.
- * Same identity used by paint_trail and scene_paint's live-point. */
+/* squash the height before drawing so tall screw shapes don't run off screen.
+ * Both the trail and the live point go through here so they squash the same. */
 static inline Vec3 world_to_view_space(Vec3 world)
 {
     return (Vec3){ world.x, world.y, world.z * Z_SQUASH_FACTOR };
 }
 
-/* ===================================================================== */
-/* §7  state — typed wrappers around the two cycled selections           */
-/* ===================================================================== */
+/* §7  state — small wrappers around the two things you can cycle */
 
 /*
- * PresetState — typed wrapper around "which signal preset is loaded".
- *
- * INTENT
- *   The bare Preset enum is just an int; wrapping it in a struct
- *   plus cycle helpers makes the key-binding table read as a list
- *   of intentions ("cycle to next preset") rather than modular
- *   arithmetic on N_PRESETS.  Replace-Primitive-with-Object
- *   pattern (Fowler).  Critically, it makes a "next theme" key
- *   physically unable to cycle the presets[] table — the wrong
- *   index can no longer end up in the wrong slot.
- *
- * CONTEXT
- *   Owned by Scene; mutated only via preset_state_init,
- *   preset_state_cycle_next, preset_state_cycle_prev.  Read via
- *   preset_state_active (returns const RossPreset *).  The 'n'/'N'
- *   and 'p'/'P' keys are the only runtime mutation paths.  Changing
- *   the active index ALSO requires re-fitting the camera (the new
- *   preset has its own bounding-sphere extent) — handled by
- *   app_cycle_preset_next/prev which call scene_compute_geometry.
- *
- * MEMBER LOGIC
- *   current : index into the presets[] table (§1).  Must be in
- *             [0, N_PRESETS) = [0, 16).  Cycle helpers maintain
- *             this invariant via modular arithmetic on N_PRESETS.
- *
- * REFERENCES
- *   Fowler, M. — *Refactoring*, "Replace Primitive with Object".
+ * PresetState — remembers which preset is showing. It's just an index, but
+ * wrapping it in its own type means the "next theme" key literally can't
+ * reach in and change the preset by mistake; each cycler only touches its own.
+ * `current` always stays a valid row by wrapping around at the ends.
  */
 typedef struct { int current; } PresetState;
 
@@ -921,31 +507,8 @@ static void preset_state_cycle_next(PresetState *p)              { p->current = 
 static void preset_state_cycle_prev(PresetState *p)              { p->current = (p->current + N_PRESETS - 1) % N_PRESETS; }
 static const RossPreset *preset_state_active(const PresetState *p) { return &presets[p->current]; }
 
-/*
- * PaletteState — typed wrapper around "which colour theme is active".
- *
- * INTENT
- *   Same shape as PresetState, distinct type.  Bundles the active
- *   index plus the helper that re-pushes the theme to ncurses pairs.
- *   Distinct typing prevents a "next theme" callsite from
- *   accidentally cycling presets[] — the wrong index can no longer
- *   reach the wrong slot.
- *
- * CONTEXT
- *   Owned by Scene; mutated via palette_state_cycle_next/prev
- *   (t/T keys) followed immediately by scene_apply_theme, which
- *   pushes the resulting band[]/live/axis codes back into the
- *   ncurses pair table so the next frame paints with the new
- *   palette.
- *
- * MEMBER LOGIC
- *   current : index into the themes[] table (§1).  Must be in
- *             [0, N_THEMES) = [0, 10); cycle helpers maintain
- *             this invariant via modular arithmetic on N_THEMES.
- *
- * REFERENCES
- *   Fowler, M. — *Refactoring*, "Replace Primitive with Object".
- */
+/* Same idea as PresetState but for the colour theme — a distinct type so the
+ * theme and preset keys can never get crossed. */
 typedef struct { int current; } PaletteState;
 
 static void palette_state_init      (PaletteState *p, int initial) { p->current = initial; }
@@ -954,44 +517,20 @@ static void palette_state_cycle_prev(PaletteState *p)              { p->current 
 static const Theme *palette_state_active(const PaletteState *p)    { return &themes[p->current]; }
 static void palette_state_apply     (const PaletteState *p)        { theme_apply(p->current); }
 
-/* ===================================================================== */
-/* §8  scene — composite owner of all mutable simulation state           */
-/* ===================================================================== */
+/* §8  scene — everything that changes as the demo runs, in one place */
 
 /*
- * Scene — composite owner of all mutable simulation state.
+ * Scene — all the moving parts gathered into one struct, so the rest of the
+ * program drives the whole demo through a handful of scene_* calls.
  *
- * INTENT
- *   Bundle every piece of mutable state into one struct so the App
- *   layer owns ONE Scene and the main loop drives it through a tiny
- *   named-method API (scene_init, scene_resize, scene_reset,
- *   scene_tick).  Each sub-field is its own typed named concept so
- *   the compiler enforces the boundary between physics (rossler),
- *   geometry (trail, cam), selection (preset, palette), viewport
- *   (cols/rows) and runtime (paused).
- *
- * CONTEXT
- *   Owned by App as a value.  Accessed by the main-loop helpers in
- *   §10 and the painters in §9.  All mutation goes through named
- *   scene_* / app_* helpers so call sites stay declarative.
- *
- * MEMBER LOGIC
- *   rossler   : §5 Rössler composite — invariant (a, b, c) + state
- *               (x, y, z).  Advanced by rossler_rk4_step per tick.
- *   trail     : §6 Trail ring buffer — the visible streak.
- *   cam       : §4 Camera — yaw advances with time; scale auto-fits
- *               viewport + active preset extent.
- *   preset    : §7 PresetState — which row of presets[].
- *   palette   : §7 PaletteState — which colour theme.
- *   paused    : when true, scene_tick early-returns; trail freezes.
- *   cols/rows : current viewport in cells.  Cached here so the n/p
- *               preset cycle can re-fit the camera without round-
- *               tripping through Screen.
- *
- * REFERENCES
- *   [7] Sussman & Wisdom (2014), *Structure and Interpretation of
- *       Classical Mechanics*, §1.6 — the System / State / Composite
- *       split this layer mirrors at the simulation-root level.
+ *   rossler  : the equations and the moving point (§5).
+ *   trail    : the fading streak (§6).
+ *   cam      : the slowly orbiting view (§4).
+ *   preset   : which preset is showing (§7).
+ *   palette  : which colour theme is showing (§7).
+ *   paused   : when true, the point freezes and the streak holds still.
+ *   cols/rows: the window size, kept here so changing preset can re-fit the
+ *              camera without having to ask the screen again.
  */
 typedef struct {
     Rossler      rossler;
@@ -1003,8 +542,7 @@ typedef struct {
     int          cols, rows;
 } Scene;
 
-/* scene_active_preset / scene_active_system / scene_apply_theme —
- * convenience accessors so call sites don't repeat "presets[idx]". */
+/* short-hands so callers don't keep digging out the current preset/theme. */
 static inline const RossPreset *scene_active_preset(const Scene *s)
 {
     return preset_state_active(&s->preset);
@@ -1018,9 +556,8 @@ static void scene_apply_theme(const Scene *s)
     palette_state_apply(&s->palette);
 }
 
-/* scene_apply_preset — load the active preset onto the Rossler
- * composite (system + reset state to canonical seed) and clear the
- * trail so the new attractor isn't ghosted by the previous one. */
+/* switch to the current preset: load its dials, drop the point back to the
+ * (1,1,1) start, and wipe the streak so the old shape doesn't linger. */
 static void scene_apply_preset(Scene *s)
 {
     s->rossler.system = scene_active_system(s);
@@ -1030,10 +567,8 @@ static void scene_apply_preset(Scene *s)
 
 static void scene_reset(Scene *s) { scene_apply_preset(s); }
 
-/* scene_compute_geometry — re-derive cam.scale for the current
- * viewport AND the active preset's bounding-sphere extent.  Called
- * from scene_init, scene_resize, and the n/p preset key handler so
- * every preset fills the drawable band regardless of terminal size. */
+/* re-fit the camera to the current window and the current preset's size, so
+ * whatever's showing fills the screen. Run on start, resize, and preset change. */
 static void scene_compute_geometry(Scene *s)
 {
     camera_fit_to_screen(&s->cam, s->cols, s->rows,
@@ -1045,11 +580,11 @@ static void scene_init(Scene *s, int cols, int rows)
     memset(s, 0, sizeof *s);
     s->cols      = cols;
     s->rows      = rows;
-    preset_state_init (&s->preset,  PRESET_CHAOS);   /* canonical default */
-    palette_state_init(&s->palette, 0);              /* DEFAULT theme     */
+    preset_state_init (&s->preset,  PRESET_CHAOS);   /* boot into classic chaos */
+    palette_state_init(&s->palette, 0);              /* first theme */
     s->cam.yaw   = 0.0f;
     s->cam.pitch = CAM_PITCH;
-    scene_compute_geometry(s);   /* sets cam.scale to fit terminal */
+    scene_compute_geometry(s);   /* size the camera to the window */
     scene_reset(s);
 }
 
@@ -1057,14 +592,12 @@ static void scene_resize(Scene *s, int cols, int rows)
 {
     s->cols = cols;
     s->rows = rows;
-    scene_compute_geometry(s);   /* re-fit on SIGWINCH */
-    scene_reset(s);              /* clear trail so it redraws clean */
+    scene_compute_geometry(s);   /* re-fit to the new window size */
+    scene_reset(s);              /* wipe the streak so it redraws cleanly */
 }
 
-/* rossler_advance_substeps — INT_STEPS_PER_TICK fixed-step RK4
- * sub-iterations; each pushes one trail sample.  Substeps decouple
- * "physics granularity" (ROSS_DT = 10 ms) from "tick granularity"
- * (sim_fps) so the trajectory stays smooth even at low sim_fps. */
+/* take several tiny solver steps per frame, saving each into the trail. Doing
+ * many small steps keeps the curve smooth even when frames are far apart. */
 static inline void rossler_advance_substeps(Rossler *r, Trail *trail)
 {
     for (int i = 0; i < INT_STEPS_PER_TICK; i++) {
@@ -1073,21 +606,13 @@ static inline void rossler_advance_substeps(Rossler *r, Trail *trail)
     }
 }
 
-/* camera_orbit — advance yaw by CAM_YAW_RATE · dt.  Names the
- * "slowly orbiting camera" idiom so the trajectory's shape is
- * revealed from every angle over time. */
+/* nudge the camera a little further around the shape this frame. */
 static inline void camera_orbit(Camera *cam, float dt)
 {
     cam->yaw += CAM_YAW_RATE * dt;
 }
 
-/* scene_tick — advance one rendered frame of physics + camera.
- *
- * DRIVER PSEUDOCODE
- *   if paused: return
- *   rossler_advance_substeps(rossler, trail)    // INT_STEPS_PER_TICK × RK4
- *   camera_orbit(cam, dt)                       // yaw += rate · dt
- */
+/* one step of the world: move the point along its path and turn the camera. */
 static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
@@ -1095,32 +620,12 @@ static void scene_tick(Scene *s, float dt)
     camera_orbit(&s->cam, dt);
 }
 
-/* ===================================================================== */
-/* §9  screen                                                             */
-/* ===================================================================== */
+/* §9  screen — draw the attractor and the HUD */
 
 /*
- * Screen — terminal viewport dimensions cache.
- *
- * INTENT
- *   ncurses' COLS / LINES are global macros; caching them in a
- *   struct gives the layout code one explicit handle to read and
- *   means a resize touches a single named state.  Every painter
- *   takes Screen* (or cols/rows) explicitly so the layout math is
- *   decoupled from ncurses globals — easier to reason about and
- *   easier to test in isolation.
- *
- * CONTEXT
- *   Owned by App.  Initialised by screen_init; resized by
- *   screen_resize when SIGWINCH fires; consulted everywhere a draw
- *   needs the viewport.  Also fed into scene_init / scene_resize so
- *   the Scene's cached cols/rows stays in sync — this is what lets
- *   the n/p preset cycle re-fit the camera without round-tripping
- *   through the App layer.
- *
- * MEMBER LOGIC
- *   cols : current terminal width  in cells.
- *   rows : current terminal height in cells.
+ * Screen — the current window size, kept in one spot. ncurses exposes the
+ * size as global macros; copying them here gives the drawing code one tidy
+ * handle and one thing to update on a resize.
  */
 typedef struct { int cols, rows; } Screen;
 static void screen_init(Screen *s) { initscr(); noecho(); cbreak(); curs_set(0);
@@ -1131,9 +636,8 @@ static void screen_resize(Screen *s) { endwin(); refresh();
     getmaxyx(stdscr, s->rows, s->cols); }
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* viewport_center_in_drawable_band — (cx, cy) of the drawable band
- * (the rows BETWEEN HUD_TOP and HUD_BOTTOM).  Painting is centred
- * here, not at the raw terminal centre, so the HUD never overlaps. */
+/* the middle of the area we're allowed to draw in — the centre of the rows
+ * between the top and bottom HUD lines, so the picture never sits under them. */
 static inline void viewport_center_in_drawable_band(int cols, int rows,
                                                     int *cx, int *cy)
 {
@@ -1141,18 +645,16 @@ static inline void viewport_center_in_drawable_band(int cols, int rows,
     *cy = (rows - HUD_BAND_RESERVED_ROWS) / 2 + HUD_TOP_ROWS;
 }
 
-/* cell_in_drawable_band — clipping predicate.  True iff (sx, sy)
- * is strictly inside the drawable band (HUD top + HUD bottom both
- * excluded).  Used by both painters as their per-cell guard. */
+/* true if this cell is on screen and clear of the HUD rows; both painters use
+ * it to skip anything they shouldn't draw. */
 static inline bool cell_in_drawable_band(int sx, int sy, int cols, int rows)
 {
     return sx >= 0 && sx < cols
         && sy >= HUD_TOP_ROWS && sy < rows - HUD_BOTTOM_ROWS;
 }
 
-/* paint_cell — bracket attron / mvaddch / attroff so painters can
- * place a glyph in one line instead of three.  Glyph cast handles
- * the chtype sign-extension trap (CLAUDE.md "Common ncurses Bugs"). */
+/* draw one coloured character. The cast avoids an ncurses gotcha where a
+ * byte above 127 gets misread as a control code (CLAUDE.md ncurses bugs). */
 static inline void paint_cell(int sy, int sx, char glyph, short pair_id)
 {
     attron(COLOR_PAIR(pair_id) | A_BOLD);
@@ -1160,29 +662,16 @@ static inline void paint_cell(int sy, int sx, char glyph, short pair_id)
     attroff(COLOR_PAIR(pair_id) | A_BOLD);
 }
 
-/* project_view_to_cell — convenience wrapper: takes a Vec3 already in
- * view space (post Z_SQUASH_FACTOR), runs it through project(), and
- * returns the cell coords.  Encapsulates the CELL_ASPECT pass-through
- * so the two painters share one call shape. */
+/* project an already-squashed point to a cell, so both painters call it the
+ * same short way. */
 static inline void project_view_to_cell(const Camera *cam, Vec3 v,
                                         int cx, int cy, int *sx, int *sy)
 {
     project(cam, v.x, v.y, v.z, cx, cy, CELL_ASPECT, sx, sy);
 }
 
-/* paint_trail — walk the ring buffer oldest → newest, projecting each
- * sample and painting a '.' glyph in its age band's colour.
- *
- * DRIVER PSEUDOCODE
- *   if trail empty: return
- *   n = trail.count
- *   for i = 0 .. n-1:                          // oldest → newest
- *       sample_view = world_to_view_space(trail_sample_at(trail, i))
- *       (sx, sy)    = project_view_to_cell(cam, sample_view, cx, cy)
- *       if !cell_in_drawable_band(sx, sy): continue
- *       band  = trail_age_band(age = n−1−i, n)
- *       paint_cell(sy, sx, '.', PAIR_TRAIL_BASE + band)
- */
+/* draw the streak: every stored position becomes a '.', coloured by how old
+ * it is so the trail looks like it's fading out behind the point. */
 static void paint_trail(const Trail *tr, const Camera *cam,
                         int cx, int cy, int cols, int rows)
 {
@@ -1201,18 +690,8 @@ static void paint_trail(const Trail *tr, const Camera *cam,
     }
 }
 
-/* scene_paint — paint the visible attractor: trail first (oldest →
- * newest, so newest dots overdraw older ones), then the '@' live
- * point on top so the user always sees "where the integrator is now".
- *
- * DRIVER PSEUDOCODE
- *   (cx, cy)   = viewport_center_in_drawable_band(cols, rows)
- *   paint_trail(trail, cam, cx, cy, cols, rows)
- *   live_view  = world_to_view_space(rossler.state)
- *   (sx, sy)   = project_view_to_cell(cam, live_view, cx, cy)
- *   if cell_in_drawable_band(sx, sy):
- *       paint_cell(sy, sx, '@', PAIR_LIVE)
- */
+/* draw the whole picture: the fading streak first, then the '@' on top so you
+ * can always see exactly where the point is right now. */
 static void scene_paint(const Scene *s, int cols, int rows)
 {
     int cx, cy;
@@ -1227,13 +706,10 @@ static void scene_paint(const Scene *s, int cols, int rows)
         paint_cell(sy, sx, '@', PAIR_LIVE);
 }
 
-/* hud_label_segment_widths — column widths used by hud_param so the
- * three labels align consistently as the user cycles through presets
- * and themes (8-char names + bracket padding). */
+/* column widths for the row-1 labels so they stay lined up as names change. */
 #define HUD_PARAM_PRESET_WIDTH  19
 #define HUD_PARAM_THEME_WIDTH   17
 
-/* hud_write_title — left-aligned bold "RÖSSLER ATTRACTOR" banner. */
 static inline void hud_write_title(void)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1241,8 +717,7 @@ static inline void hud_write_title(void)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* hud_write_status_right — right-aligned status text on row 0
- * (fps, sim_fps, preset name + [n/N], c). */
+/* right side of the top line: frame rate, step rate, preset name, and c. */
 static inline void hud_write_status_right(int cols, double fps, int sim_fps,
                                           const Scene *s)
 {
@@ -1261,21 +736,14 @@ static inline void hud_write_status_right(int cols, double fps, int sim_fps,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* hud_top — row 0 of the HUD.
- *
- * DRIVER PSEUDOCODE
- *   hud_write_title()                   // left-aligned banner
- *   hud_write_status_right(...)         // right-aligned fps + preset
- */
 static void hud_top(int cols, double fps, int sim_fps, const Scene *s)
 {
     hud_write_title();
     hud_write_status_right(cols, fps, sim_fps, s);
 }
 
-/* hud_write_preset_label / _theme_label / _abc_yaw — three column
- * segments of row 1, each a one-line "label : value" pair.  Split so
- * hud_param() reads as a column layout, not as printf calls. */
+/* the three labelled columns of row 1, split out so hud_param reads like a
+ * layout rather than a stack of printf calls. */
 static inline void hud_write_preset_label(int x, const RossPreset *active)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1298,14 +766,6 @@ static inline void hud_write_abc_yaw(int x, const RossPreset *active,
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* hud_param — row 1 of the HUD: three labelled column segments.
- *
- * DRIVER PSEUDOCODE
- *   x = HUD_LEFT_MARGIN
- *   hud_write_preset_label(x);  x += PRESET_WIDTH
- *   hud_write_theme_label (x);  x += THEME_WIDTH
- *   hud_write_abc_yaw     (x)                       // a, b, yaw°
- */
 static void hud_param(const Scene *s)
 {
     const RossPreset *active = scene_active_preset(s);
@@ -1326,41 +786,22 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
 { erase(); scene_paint(s, sc->cols, sc->rows);
   hud_top(sc->cols, fps, sim_fps, s); hud_param(s); hud_hint(sc->rows); }
 
-/* ===================================================================== */
-/* §10 app — signals, resize, key dispatch, FrameClock, main loop        */
-/* ===================================================================== */
+/* §10 app — signals, resize, keys, timing, and the main loop */
 
 /*
- * App — top-level composition root.
+ * App — the whole program in one struct: the simulation, the window, the
+ * speed knob, and two flags the signal handlers set. It's a single global so
+ * those handlers can reach it directly.
  *
- * INTENT
- *   The "everything else" container.  Owns the simulation (Scene),
- *   the viewport (Screen), the simulation-rate knob (sim_fps), and
- *   the two volatile signal-handler flags.  Lives as a file-scope
- *   g_app so signal handlers can touch it without indirection.
- *
- * CONTEXT
- *   Created by app_bootstrap; mutated by app_handle_key and its
- *   named mutators; torn down by screen_free + atexit cleanup.
- *
- * MEMBER LOGIC
- *   scene       : the entire simulation state (§8 Scene) — Rossler
- *                 composite + Trail + Camera + selections.
- *   screen      : cached terminal dimensions (§9 Screen).
- *   sim_fps     : fixed-timestep rate scene_tick is driven at;
- *                 clamped to [SIM_FPS_MIN, SIM_FPS_MAX] = [10, 240].
- *                 Drives TICK_NS(sim_fps) which feeds the Fiedler
- *                 accumulator in app_drain_fixed_timestep.
- *   running     : main-loop guard.  Cleared by SIGINT/TERM via
- *                 on_exit_signal, or by 'q'/ESC via app_handle_key.
- *   need_resize : SIGWINCH flag; consumed by app_handle_pending_resize
- *                 at the top of each main-loop iteration.  Both
- *                 flags MUST be volatile sig_atomic_t (signal-handler
- *                 write + main-loop read, no other synchronisation).
- *
- * REFERENCES
- *   POSIX.1-2008 §2.4.3 — signal-safe writes via sig_atomic_t.
- *   [6] Fiedler — "Fix Your Timestep!" (drives sim_fps usage).
+ *   scene      : everything that animates (§8).
+ *   screen     : the window size (§9).
+ *   sim_fps    : how many simulation steps per second to run, separate from
+ *                how fast we redraw; kept between 10 and 240.
+ *   running    : the main loop keeps going while this is set; cleared by 'q',
+ *                ESC, or a kill signal.
+ *   need_resize: set when the window changes size, handled at the top of the
+ *                next loop. Both flags are sig_atomic_t because a signal
+ *                handler writes them while the loop reads them.
  */
 typedef struct {
     Scene                 scene;
@@ -1376,7 +817,7 @@ static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-/* main_install_signal_handlers — wire SIGINT/TERM → quit, SIGWINCH → resize. */
+/* ctrl-C / kill ask us to quit; a window resize asks us to re-fit. */
 static void main_install_signal_handlers(void)
 {
     atexit(cleanup);
@@ -1385,7 +826,6 @@ static void main_install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* app_bootstrap — first-time initialisation. */
 static void app_bootstrap(App *app)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
@@ -1395,7 +835,7 @@ static void app_bootstrap(App *app)
     scene_init(&app->scene, app->screen.cols, app->screen.rows);
 }
 
-/* app_handle_pending_resize — rebuild screen + scene on SIGWINCH. */
+/* if the window changed size, re-read it and re-fit the scene to match. */
 static void app_handle_pending_resize(App *app)
 {
     if (!app->need_resize) return;
@@ -1404,8 +844,8 @@ static void app_handle_pending_resize(App *app)
     app->need_resize = 0;
 }
 
-/* app_compute_frame_dt — wall-clock since last frame, capped to
- * SIM_MAX_FRAME_DT_MS. */
+/* how much real time passed since the last frame, capped so a long pause
+ * (debugger, laptop sleep) can't make the sim try to catch up forever. */
 static int64_t app_compute_frame_dt(int64_t *frame_time)
 {
     int64_t now = clock_ns();
@@ -1416,8 +856,8 @@ static int64_t app_compute_frame_dt(int64_t *frame_time)
     return dt;
 }
 
-/* app_drain_fixed_timestep — Fiedler [6] accumulator pattern.  Runs
- * scene_tick at the chosen sim_fps regardless of the render rate. */
+/* run as many fixed-size sim steps as the elapsed time has earned, so the
+ * physics ticks at a steady rate no matter how fast we're drawing. */
 static void app_drain_fixed_timestep(App *app, int64_t *sim_accum)
 {
     int64_t tick_ns = TICK_NS(app->sim_fps);
@@ -1428,7 +868,7 @@ static void app_drain_fixed_timestep(App *app, int64_t *sim_accum)
     }
 }
 
-/* app_update_fps_meter — refresh fps every FPS_UPDATE_MS ms. */
+/* recompute the displayed frame rate twice a second so the number isn't jumpy. */
 static void app_update_fps_meter(int64_t *fps_accum, int *frame_count,
                                  double *fps_display)
 {
@@ -1439,21 +879,22 @@ static void app_update_fps_meter(int64_t *fps_accum, int *frame_count,
     *fps_accum   = 0;
 }
 
-/* app_throttle_to_render_target — sleep so render runs at 60 fps. */
+/* sleep off whatever's left of the frame's time budget so we sit at ~60 fps
+ * instead of spinning the CPU flat out. */
 static void app_throttle_to_render_target(int64_t frame_time, int64_t dt)
 {
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(RENDER_FRAME_BUDGET_NS - elapsed);
 }
 
-/* app_present_frame — paint + flip back buffer. */
+/* draw this frame and flip it onto the screen in one go. */
 static void app_present_frame(App *app, double fps_display)
 {
     screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
     screen_present();
 }
 
-/* Clamped sim-rate mutators. */
+/* speed up / slow down the sim, staying within the allowed range. */
 static void app_sim_rate_faster(App *app)
 {
     app->sim_fps += SIM_FPS_STEP;
@@ -1465,7 +906,7 @@ static void app_sim_rate_slower(App *app)
     if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
 }
 
-/* One-line mutators — named so the binding table reads as intentions. */
+/* tiny one-liners, named so the key table below reads like plain intentions. */
 static void app_toggle_pause     (App *app) { app->scene.paused = !app->scene.paused; }
 static void app_reset_attractor  (App *app) { scene_reset(&app->scene); }
 static void app_cycle_theme_next (App *app) { palette_state_cycle_next(&app->scene.palette); scene_apply_theme(&app->scene); }
@@ -1473,7 +914,7 @@ static void app_cycle_theme_prev (App *app) { palette_state_cycle_prev(&app->sce
 static void app_cycle_preset_next(App *app)
 {
     preset_state_cycle_next(&app->scene.preset);
-    scene_compute_geometry(&app->scene);   /* re-fit camera to new extent */
+    scene_compute_geometry(&app->scene);   /* new preset, new size — re-fit */
     scene_reset(&app->scene);
 }
 static void app_cycle_preset_prev(App *app)
@@ -1485,7 +926,7 @@ static void app_cycle_preset_prev(App *app)
 
 static bool app_handle_key(App *app, int ch);
 
-/* app_poll_keyboard — non-blocking getch + dispatch.  false = quit. */
+/* check for a keypress without blocking; returns false only if the user quit. */
 static bool app_poll_keyboard(App *app)
 {
     int ch = getch();
@@ -1493,7 +934,7 @@ static bool app_poll_keyboard(App *app)
     return app_handle_key(app, ch);
 }
 
-/* app_handle_key — key-binding table; each case calls ONE named mutator. */
+/* the keymap: each key just calls one named action above. */
 static bool app_handle_key(App *app, int ch)
 {
     switch (ch) {
@@ -1512,41 +953,17 @@ static bool app_handle_key(App *app, int ch)
 }
 
 /*
- * FrameClock — wall-clock + accumulator state for the main loop.
+ * FrameClock — the loop's timekeeping, gathered so main() reads as a short
+ * recipe. It's a local in main(), not part of App, because it's pure loop
+ * bookkeeping.
  *
- * INTENT
- *   Bundle the 5 timing locals (frame_time, sim_accum, fps_accum,
- *   frame_count, fps_display) into ONE named concept so main() reads
- *   as a pseudocode driver: "init clock, advance clock, drain
- *   simulation, throttle to render rate, present frame".  Threading
- *   them through helpers as a single FrameClock* removes 5 separate
- *   parameter lists from app_compute_frame_dt /
- *   app_drain_fixed_timestep / app_update_fps_meter.
- *
- * CONTEXT
- *   Lives as a local in main(); not owned by App because it is pure
- *   loop scaffolding (a different driver would replace it whole).
- *   Mutated by frame_clock_init, frame_clock_advance,
- *   frame_clock_reset_after_resize, app_drain_fixed_timestep, and
- *   app_update_fps_meter.
- *
- * MEMBER LOGIC
- *   frame_time  : wall-clock ns at the START of the previous frame.
- *                 app_compute_frame_dt subtracts this from clock_ns()
- *                 and stamps it forward.
- *   sim_accum   : ns of unspent simulation time.  Drained in multiples
- *                 of TICK_NS(sim_fps) by the inner while-loop of
- *                 app_drain_fixed_timestep — this is the Fiedler [6]
- *                 accumulator that lets simulation rate and render
- *                 rate move independently.
- *   fps_accum   : ns elapsed since the last fps recalculation.
- *   frame_count : frames rendered since the last fps recalculation.
- *   fps_display : the displayed fps value, refreshed every
- *                 FPS_UPDATE_MS = 500 ms so the HUD doesn't flicker.
- *
- * REFERENCES
- *   [6] Fiedler — "Fix Your Timestep!" — the accumulator pattern
- *       this struct implements.
+ *   frame_time : when the last frame started, used to measure elapsed time.
+ *   sim_accum  : leftover time not yet spent on sim steps. The drain loop eats
+ *                it in fixed chunks, which is what keeps the sim rate steady
+ *                while the draw rate floats.
+ *   fps_accum  : time since we last recomputed the displayed frame rate.
+ *   frame_count: frames drawn since that last recompute.
+ *   fps_display: the frame rate shown on the HUD, refreshed twice a second.
  */
 typedef struct {
     int64_t frame_time;
@@ -1576,25 +993,8 @@ static void frame_clock_advance(FrameClock *c, int64_t dt)
     c->frame_count++;
 }
 
-/* main — the whole simulation as a pseudocode driver.
- *
- * DRIVER PSEUDOCODE
- *   main_install_signal_handlers()                  // SIGINT/TERM/WINCH
- *   app_bootstrap(app)                              // ncurses + Scene
- *   clk = frame_clock_init()
- *   while running:
- *       if need_resize:
- *           app_handle_pending_resize(app)
- *           frame_clock_reset_after_resize(clk)
- *       dt = app_compute_frame_dt(&clk.frame_time)
- *       frame_clock_advance(clk, dt)
- *       app_drain_fixed_timestep(app, &clk.sim_accum)
- *       app_update_fps_meter(...)
- *       app_throttle_to_render_target(clk.frame_time, dt)
- *       app_present_frame(app, clk.fps_display)
- *       if !app_poll_keyboard(app): running = 0
- *   screen_free(app)                                // endwin via atexit
- */
+/* the whole program: set up, then each loop measure time, run the sim,
+ * draw, wait a bit, and check the keyboard, until the user quits. */
 int main(void)
 {
     main_install_signal_handlers();

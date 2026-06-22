@@ -1,196 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * standard_map.c
- *   — Chirikov-Taylor "Standard Map".  The canonical visualisation of
- *     HAMILTONIAN (conservative) chaos: a 2-D area-preserving map on
- *     a torus that, depending on a single parameter K, shows either
- *     concentric KAM tori (regular orbits) or a chaotic sea with
- *     islands of regular motion inside it.
+ * standard_map.c — the Chirikov-Taylor "standard map": a tiny rule you
+ * apply over and over to a swarm of points, watching order dissolve
+ * into chaos as one knob K turns up.  Where the points pile up gets
+ * drawn brighter, so regular orbits show as thin curves and chaotic
+ * ones as fuzzy clouds.
  *
- * DEMO: For each of NUM_TRAJECTORIES = 900 initial conditions
- *       (uniformly spaced on the torus), repeatedly apply
- *         p_{n+1} = p_n + K · sin(x_n)              (mod 2π)
- *         x_{n+1} = x_n + p_{n+1}                   (mod 2π)
- *       and accumulate the visited cells into a density grid.  Each
- *       cell's brightness = log(count), mapped onto a 10-band ×
- *       10-glyph gradient.  Regular trajectories trace thin curves
- *       (high density along a 1-D path); chaotic trajectories spread
- *       thin across a 2-D region.
- *
- *       5 presets, chosen for maximum visual contrast — each
- *       produces a distinctly different settled picture.  Cycle
- *       with n / p:
- *
- *         1  INTEGRBL  K=0.00     horizontal stripes (pure rotation)
- *         2  RIPPLES   K=0.20     all KAM tori, gentle wiggles
- *         3  WAVES     K=0.40     clear island chains forming
- *         4  CHAOS_L   K=2.50     classic chaotic sea + islands
- *         5  STORM     K=5.00     chaos dominant, scattered islands
- *
- * Study alongside:
- *   ./bifurcation.c          — DISSIPATIVE 1-D map chaos (logistic).
- *   ./double_pendulum.c      — CONTINUOUS Hamiltonian chaos.
- *   ./poincare_section.c     — same idea (sample-and-plot) but
- *                              applied to a continuous-time ODE.
- *
- * Section map:
- *   §1  config    — constants, 5-preset table, themes, density gradient
- *   §2  clock     — monotonic timer + sleep
- *   §3  color     — HUD pairs + 10 themes (PAIR_DENS_BASE+0..9)
- *   §5  physics   — ChirikovSystem + ChirikovState + iterate
- *   §6  density   — DensityGrid (uint16 hit-counter per cell)
- *   §7  state     — TrajectoryEnsemble + PresetState + PaletteState
- *   §8  scene     — Scene composite (Ensemble + DensityGrid + selections)
- *   §9  screen    — density paint + HUD writers
- *   §10 app       — signals, resize, key dispatch, FrameClock, main
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reset (clear density, re-init trajectories)
- *   n / N      next preset    (p / P previous)
- *   t / T      next / previous theme
- *   ] / [      raise / lower simulation tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra procedural/chaos/standard_map.c \
- *       -o standard_map -lncurses -lm
+ * Key papers, for the values and ideas the code can't explain itself:
+ *   Chirikov 1979, Phys. Reports 52(5) — the original map.
+ *   Greene 1979, J. Math. Phys. 20 — KC_GREENE = 0.9716354, the K at
+ *     which the last regular curve breaks and chaos spans the torus.
+ * Sister demos: ./bifurcation.c (1-D map chaos), ./double_pendulum.c
+ *   and ./poincare_section.c (continuous-time chaos).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Chirikov-Taylor (standard) map.  An exactly
- *                 area-preserving (symplectic) map on the 2-torus
- *                 T² = [0, 2π)² with one bifurcation parameter K.
- *                 NUM_TRAJECTORIES independent initial conditions are
- *                 iterated in lock-step; each visited cell of a fixed
- *                 grid increments a uint16 density counter.
- *
- * Data-struct   : DensityGrid (uint16_t × CELLS_MAX) — small enough
- *                 for BSS, large enough to count millions of hits
- *                 before saturating.  TrajectoryEnsemble = one
- *                 shared ChirikovSystem (K) + NUM_TRAJECTORIES
- *                 ChirikovStates (x, p).  No other history is kept
- *                 (the DensityGrid IS the history).
- *
- * Rendering     : Density → log-mapped band ∈ [0, DENS_BAND_COUNT)
- *                 → palette colour pair × glyph tier.  10 bands × 10
- *                 glyphs ('. , : ; + o * X # @') = 100 visually
- *                 distinct intensity levels.  Phase space (x, p) ∈
- *                 [0, 2π)² fills the drawable area; (0, 0) is the
- *                 bottom-left corner (y inverted in phase_to_cell so
- *                 increasing p draws upward, textbook orientation).
- *                 Auto-stops at MAX_ITERATIONS_PER_TRAJ so each
- *                 preset settles to a stable picture.
- *
- * Performance   : Per tick: NUM_TRAJECTORIES × ITERATES_PER_TRAJ_PER_TICK
- *                 sin() + 2 mods + 1 density increment per iterate.
- *                 At 256 trajectories × 30 iterates × 60 Hz ≈ 460K
- *                 sin/sec — trivial.  Total work bounded by
- *                 MAX_ITERATIONS_PER_TRAJ so the loop quiesces.
- *
- * References    : Numbered so inline code can cite [n].
- *
- *   PHYSICS / DYNAMICAL SYSTEMS
- *   [1] Chirikov, B. V. (1979).  "A universal instability of many-
- *       dimensional oscillator systems", Physics Reports 52(5),
- *       pp. 263-379.  THE original paper: defines the standard
- *       map p' = p + K·sin(x), x' = x + p' and identifies a
- *       global-stochasticity threshold near K ≈ 1.
- *   [2] Greene, J. M. (1979).  "A method for determining a
- *       stochastic transition", J. Math. Phys. 20, pp. 1183-1201.
- *       Calculates the precise threshold K_c = 0.9716354 at which
- *       the last golden-ratio KAM torus breaks — the value
- *       hard-coded in KC_GREENE and shown in the HUD.
- *   [3] Lichtenberg, A. J., Lieberman, M. A. (1992).  *Regular and
- *       Chaotic Dynamics* (2nd ed.), §4.1.  Standard textbook
- *       treatment of the kicked rotor → standard map derivation,
- *       and §3.2 for the KAM theorem in this setting.
- *   [4] Arnold, V. I. (1989).  *Mathematical Methods of Classical
- *       Mechanics* (2nd ed.), §53.  Kolmogorov-Arnold-Moser
- *       theorem: most quasi-periodic tori survive a small
- *       Hamiltonian perturbation.  The standard map IS the
- *       canonical test case.
- *   [5] Strogatz, S. H. (2015).  *Nonlinear Dynamics and Chaos*
- *       (2nd ed.), §12.  Pedagogical companion text — though
- *       Strogatz focuses on dissipative chaos, his treatment of
- *       phase-space methods backs the visualisation approach.
- *
- *   FRAMEWORK
- *   [6] Fiedler, G. (2004).  "Fix Your Timestep!",
- *       gafferongames.com.  Accumulator pattern used by
- *       app_drain_fixed_timestep so the integrator runs at a
- *       fixed sim_fps regardless of render rate.
- *   [7] Sussman, G. J., Wisdom, J. (2014).  *Structure and
- *       Interpretation of Classical Mechanics* (2nd ed.), §1.6
- *       "Coordinate systems and states".  The System / State /
- *       Composite split used in §5 (ChirikovSystem +
- *       ChirikovState + the ensemble layout).
- *
- *   COMPARE IN PROJECT
- *   • ./bifurcation.c     — dissipative 1-D map chaos.
- *   • ./double_pendulum.c — continuous-time Hamiltonian.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * "Kicked rotor": a free rotor receiving an impulsive sin-shaped
- * kick once per period.  Between kicks the momentum p is constant
- * and the angle x advances by p.  At each kick p jumps by K·sin(x).
- * No friction → exactly area-preserving → trajectories cover
- * 2-D regions but never spirals.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * K = 0: completely integrable.  Every trajectory lies on a
- *        horizontal line (p constant).
- * K small: KAM tori survive (Arnold [4] §53) — each trajectory
- *        still traces a 1-D invariant curve, just deformed.
- * K ≈ 0.9716 (Greene [2]): the GOLDEN-RATIO KAM torus breaks;
- *        chaotic trajectories can now wander vertically across
- *        the entire torus.
- * K large: only ISLAND tori around stable periodic orbits survive;
- *        the rest is a connected chaotic sea.
- *
- * ALGORITHM IN STEPS  (per tick)
- * ──────────────────
- *  repeat ITERATES_PER_TRAJ_PER_TICK times:
- *    for each ChirikovState s in ensemble.state[]:
- *      s = chirikov_step(s, ensemble.system)       // (mod 2π wrap inside)
- *      density_record(grid, s)                      // ++ hit count
- *  stop when iterations_done ≥ MAX_ITERATIONS_PER_TRAJ.
- *
- * KEY FORMULAS  (Chirikov 1979 [1], Lichtenberg & Lieberman [3] §4.1)
- * ────────────
- *  p_{n+1} = p_n + K · sin(x_n)         (mod 2π)
- *  x_{n+1} = x_n + p_{n+1}              (mod 2π)
- *
- *  Jacobian determinant = 1 ↔ area-preserving (the defining
- *  property of a symplectic / Hamiltonian map).
- *
- *  K_c = 0.9716354 (Greene [2]) — threshold above which the
- *  golden-ratio invariant torus breaks and chaotic trajectories
- *  can wander unboundedly in p.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • INTEGRBL (K = 0.00):  16 perfectly horizontal stripes (one per
- *    starting p-value on the 16×16 grid) — no kick, no chaos.
- *  • RIPPLES  (K = 0.20):  every stripe deformed into a gentle sine
- *    — all KAM tori intact, well below Greene's threshold.
- *  • WAVES    (K = 0.40):  clear island chains appear around the
- *    elliptic fixed point at (x, p) = (π, 0); separatrix-like
- *    figure-eight structures emerge; no large fuzzy region yet.
- *  • CHAOS_L  (K = 2.50):  a fuzzy chaotic sea fills most of the torus
- *    with several visible "island chains" of regular tori around
- *    period-N points — the iconic standard-map silhouette.
- *  • STORM    (K = 5.00):  chaos dominant, only small period-N islands
- *    around stable orbits survive.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -209,9 +31,7 @@
 #endif
 #define TAU (2.0f * (float)M_PI)
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* §1  config */
 
 enum {
     MAP_W_MAX         = 200,
@@ -228,7 +48,7 @@ enum {
 
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_DENS_BASE    =   3,   /* DENS_BAND_COUNT slots: +0..+9 */
+    PAIR_DENS_BASE    =   3,   /* first of the 10 brightness-band colour pairs */
 };
 
 #define HUD_TOP_ROWS             2
@@ -243,96 +63,63 @@ enum {
 #define RENDER_FRAME_BUDGET_NS   (NS_PER_SEC / RENDER_FPS_TARGET)
 #define SIM_MAX_FRAME_DT_MS      100
 
-/* Trajectory ensemble — uniformly spaced grid of starting conditions.
- *
- * 16 × 16 = 256 trajectories.  Counter-intuitively, FEWER orbits
- * iterated MORE times gives the cleanest textbook picture: each
- * trajectory has time to trace its full KAM curve (~500-1000 points)
- * before the others overdraw it.  With 900+ trajectories the curves
- * blend into a uniform fog and every preset looks the same. */
+/* How many points we set loose, on a 16x16 = 256 grid of starts.
+ * Fewer points run for longer draw the cleanest picture: each one has
+ * time to trace its whole curve before the others paint over it.  Pack
+ * in 900+ and the curves blur into one grey fog and every preset looks
+ * the same. */
 #define TRAJ_GRID_W              16
 #define TRAJ_GRID_H              16
 #define NUM_TRAJECTORIES         (TRAJ_GRID_W * TRAJ_GRID_H)
 
-/* Iterations per trajectory per tick.  At 30 × 60 Hz = 1800
- * iterations/sec per trajectory, a full KAM curve traces in ~½
- * second.  900K total iterations/sec is still trivial. */
+/* How many times we advance each point per tick.  Enough to draw a
+ * full curve in about half a second, and nowhere near enough work to
+ * matter for speed. */
 #define ITERATES_PER_TRAJ_PER_TICK   30
 
-/* Auto-stop budget — total iterations PER TRAJECTORY at which the
- * picture is "done" and further iteration would just saturate cells.
- * 6000 iterations × 60 Hz / 30-per-tick ≈ 3.3 simulated seconds.
- * After this, scene_tick stops iterating so the user sees a clean
- * settled image instead of a slowly-saturating blur.  Press 'r' to
- * redo from the same initial conditions. */
+/* When to stop.  After this many steps per point the picture has
+ * settled; running longer would just over-darken cells, so we freeze
+ * it for a clean image (press 'r' to start the same picture over). */
 #define MAX_ITERATIONS_PER_TRAJ  6000
 
-/* Density gradient — 10 bands × 10 glyph tiers = 100 visually
- * distinct brightness levels.  Saturation log chosen so a typical
- * dense KAM curve reaches the top band (~5000 hits at MAX iter
- * budget) and the chaotic sea sits in the mid-bands instead of
- * uniformly saturating. */
+/* The brightness ladder: 10 colour bands times 10 glyph shapes give
+ * 100 distinct levels.  DENS_SATURATE_LOG sets how many visits count
+ * as "fully bright" — tuned so a dense curve reaches the top and the
+ * chaotic sea sits comfortably in the middle. */
 #define DENS_BAND_COUNT          10
-#define DENS_SATURATE_LOG         8.5f   /* log(~5000) at top band */
+#define DENS_SATURATE_LOG         8.5f   /* roughly 5000 visits = top band */
 
-/* Greene's golden-mean KAM threshold — last invariant torus breaks
- * at K = K_c.  Below this all orbits are bounded vertically; above,
- * a connected chaotic sea spans the torus.  This value is the
- * principal numerical result of Greene 1979 [2] and is hard-coded
- * here so the HUD can show "BELOW Kc" / "ABOVE Kc" annotations. */
+/* The famous tipping point (Greene 1979): turn K past this and the
+ * last regular curve breaks, letting chaos roam the whole torus.
+ * Kept here so the HUD can label the current K as below / at / above. */
 #define KC_GREENE                 0.9716354f
 
-/* KC_DEAD_BAND — half-width of the "AT Kc" zone in the HUD regime
- * annotation.  Any K within ±KC_DEAD_BAND of KC_GREENE renders as
- * "AT Kc"; this keeps slight float drift from flickering the label. */
+/* A small no-man's-land around KC_GREENE that reads as "AT Kc", so
+ * tiny rounding wobble doesn't make the HUD label flicker. */
 #define KC_DEAD_BAND              0.01f
 
-/* HUD row-1 column widths — fixed so the three labelled segments
- * align across all 5 presets and 10 themes. */
+/* Fixed widths for the three labels on the second HUD row so they line
+ * up no matter which preset or theme is showing. */
 #define HUD_PARAM_PRESET_WIDTH   19
 #define HUD_PARAM_THEME_WIDTH    17
 
-/* Density grid minimum dimensions — degenerate sizes (too narrow or
- * too short) get clamped UP to these floors so the grid stays usable
- * on tiny terminals.  CELLS_MAX caps the other direction. */
+/* Smallest grid we'll allow on a tiny terminal — sizes below this get
+ * bumped up to stay usable; CELLS_MAX caps the big end. */
 #define MAP_W_FLOOR              16
 #define MAP_H_FLOOR               8
 
 /*
- * Preset — the 5-entry index space for the presets[] table.
- *
- * INTENT
- *   Named indices into the presets[] table.  K values chosen for
- *   maximum visual contrast — each one produces a distinctly
- *   different settled picture so cycling 'n' walks the user from
- *   pure rotation (K=0) past the KAM tori regime, across Greene's
- *   threshold [2], into the chaotic sea, and finally into the
- *   chaos-dominant strong-K regime.
- *
- * CONTEXT
- *   Used only as table indices; entries themselves live in the
- *   presets[] static array below.  PresetState (§7) wraps a single
- *   instance and cycles modulo N_PRESETS.  PRESET_WAVES is the boot-
- *   state default chosen by scene_init — middle of the cascade, a
- *   good anchor that immediately shows non-trivial KAM structure.
- *
- * MEMBER LOGIC
- *   PRESET_INTEGRABLE : K = 0.00.  No kick; orbit p stays constant
- *                       forever; renders as 16 horizontal stripes
- *                       (one per starting p value on the 16×16 grid).
- *   PRESET_RIPPLES    : K = 0.20.  All KAM tori intact (well below
- *                       Greene threshold [2]); curves are gently
- *                       deformed sinusoidals.
- *   PRESET_WAVES      : K = 0.40.  First clear island chains appear
- *                       around the elliptic fixed points.
- *   PRESET_CHAOS_L    : K = 2.50.  Classic chaotic sea + regular
- *                       islands — the iconic standard-map picture.
- *   PRESET_STORM      : K = 5.00.  Chaos dominant; only small period-N
- *                       islands around stable orbits survive.
- *
- * REFERENCES
- *   [1] Chirikov 1979 — the canonical K parameterisation.
- *   [2] Greene 1979 — KC_GREENE = 0.9716 sits between WAVES and CHAOS_L.
+ * Preset — names for the five pre-chosen settings, used as indexes into
+ * the presets[] table just below.  The five K values are picked to look
+ * as different as possible, so tapping 'n' walks you from perfect order
+ * up through the tipping point and into full chaos.  Boot starts on
+ * PRESET_WAVES (the middle), which shows interesting structure right
+ * away.  What each one looks like:
+ *   PRESET_INTEGRABLE : K=0.00 — no nudge at all; flat horizontal stripes.
+ *   PRESET_RIPPLES    : K=0.20 — those stripes gently waved, still tidy.
+ *   PRESET_WAVES      : K=0.40 — first loops ("islands") appear.
+ *   PRESET_CHAOS_L    : K=2.50 — the classic fuzzy sea dotted with islands.
+ *   PRESET_STORM      : K=5.00 — chaos everywhere, only tiny islands left.
  */
 typedef enum {
     PRESET_INTEGRABLE = 0,
@@ -344,29 +131,12 @@ typedef enum {
 } Preset;
 
 /*
- * MapPreset — one row of the K-parameter zoo.
- *
- * INTENT
- *   Each row fully describes one entry in the catalogue: HUD label
- *   and the single Chirikov coupling K that defines the demo.  K is
- *   the ONLY parameter of the standard map — there are no sweep
- *   variables, no per-row tuning knobs, just K.
- *
- * CONTEXT
- *   Read by scene_load_active_preset_into_system (loads K into the
- *   ensemble's shared ChirikovSystem), by the HUD writers (display
- *   name + K + threshold annotation), and by the §5 docs.  The
- *   PresetState wrapper in §7 holds an INDEX into this table.
- *
- * MEMBER LOGIC
- *   name : 8-char HUD label, padded so the parameter column aligns.
- *   K    : Chirikov coupling [1].  Compare to KC_GREENE [2] to know
- *          whether the chaotic region is bounded (K < Kc) or globally
- *          connected across the torus (K > Kc).
- *
- * REFERENCES
- *   [1] Chirikov 1979 — parameter naming.
- *   [2] Greene 1979 — significance of the threshold.
+ * MapPreset — one row of the preset table.  K is the standard map's
+ * one and only knob, so a preset is really just a name plus a number.
+ *   name : label shown in the HUD; padded to 8 chars so the column lines up.
+ *   K    : how hard each step nudges the points.  Compare it to KC_GREENE
+ *          to know whether chaos stays penned in (K below) or runs free
+ *          across the whole torus (K above).
  */
 typedef struct {
     const char *name;
@@ -382,45 +152,24 @@ static const MapPreset presets[N_PRESETS] = {
 };
 
 /*
- * Theme — one named palette for the density renderer.
- *
- * INTENT
- *   Group the colour codes that define a density picture's visual
- *   identity into ONE flat row, so a "next theme" key cycles a
- *   single table.  Standard map is special among the chaos demos
- *   because its renderer needs ONE monotone-brightness ramp from
- *   sparsest visited cells (band 0) to most-visited cells (band 9);
- *   the ramp's hue family defines the theme.
- *
- * CONTEXT
- *   Indexed by PaletteState (§7); installed by theme_apply (§3)
- *   which pushes each band[i] into PAIR_DENS_BASE + i.  Cycled by
- *   t/T via app_cycle_theme_next/prev.  All palette values follow
- *   the project Brightness Rule (CLAUDE.md): every code lives in
- *   the bright half of the 256-colour cube so even band 0 is
- *   legible on default black.
- *
- * MEMBER LOGIC
- *   name    : 7-char HUD label.
- *   band[]  : DENS_BAND_COUNT (10) 256-colour codes, sorted
- *             dimmest → brightest.  density_paint reads index b
- *             returned by density_band() and looks up band[b].
- *
- * REFERENCES
- *   CLAUDE.md "Theme Palette Brightness".
+ * Theme — one named colour scheme for the picture.  Each theme is just
+ * a ten-step ramp running from dim (cells barely visited) to bright
+ * (cells visited a lot); the family of colours is what gives the theme
+ * its name.  t/T cycle through them.
+ *   name   : label shown in the HUD.
+ *   band[] : ten 256-colour codes, dimmest first.  density_paint asks
+ *            density_band() for a level 0..9 and looks it up here.
+ * All codes sit in the bright half of the palette (CLAUDE.md's
+ * brightness rule) so even the dimmest band shows up on black.
  */
 typedef struct {
     const char *name;
-    short       band[DENS_BAND_COUNT];   /* density ramp: low → high */
+    short       band[DENS_BAND_COUNT];   /* dim to bright */
 } Theme;
 
 #define N_THEMES 10
 
-/* Density ramps — monotone-brightness 10-step palettes, all in the
- * bright half of the 256-colour cube (≥ 30 / ≥ 244) per CLAUDE.md so
- * even band 0 is visible.  Each ramp climbs dimmest → brightest left
- * → right so band index directly tracks visual brightness.  Hue stays
- * within each theme's family so the name is honest. */
+/* The ten ramps, each climbing dim to bright left to right. */
 static const Theme themes[N_THEMES] = {
     /* name        band0  b1   b2   b3   b4   b5   b6   b7   b8   b9 */
     { "DEFAULT", {  31,  39,  45,  81, 117, 153, 189, 220, 226, 231 } },
@@ -435,9 +184,7 @@ static const Theme themes[N_THEMES] = {
     { "ARCTIC",  {  24,  31,  45,  51,  81, 117, 159, 195, 225, 231 } },
 };
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* §2  clock */
 
 static int64_t clock_ns(void)
 {
@@ -453,21 +200,17 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* §3  color */
 
-/* theme_install_256 — push a Theme's DENS_BAND_COUNT bright-cube
- * codes into the ncurses pair table (PAIR_DENS_BASE + 0 .. + 9). */
+/* Load a theme's ten colours into ncurses' colour-pair slots. */
 static inline void theme_install_256(const Theme *t)
 {
     for (int i = 0; i < DENS_BAND_COUNT; i++)
         init_pair(PAIR_DENS_BASE + i, t->band[i], -1);
 }
 
-/* theme_install_8color_fallback — graceful degradation for the few
- * terminals that advertise only 8 colours.  Cycles the basic ANSI
- * palette dim → bright across the 10 density bands. */
+/* Fallback for old terminals that only have 8 colours: spread the
+ * basic ANSI colours dim to bright across the ten bands. */
 static inline void theme_install_8color_fallback(void)
 {
     static const short fb[DENS_BAND_COUNT] = {
@@ -479,15 +222,8 @@ static inline void theme_install_8color_fallback(void)
         init_pair(PAIR_DENS_BASE + i, fb[i], -1);
 }
 
-/* theme_apply — push the chosen palette to the ncurses pair table.
- *
- * DRIVER PSEUDOCODE
- *   if idx out of range:  idx = 0                  // graceful fallback
- *   if terminal has 256 colours:
- *       theme_install_256(themes[idx])
- *   else:
- *       theme_install_8color_fallback()
- */
+/* Switch to theme idx, picking the rich or the fallback palette
+ * depending on what the terminal can do. */
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -507,54 +243,28 @@ static void color_init(void)
     theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §5  physics — Chirikov standard map: system + state + iterate          */
-/* ===================================================================== */
+/* §5  physics — the standard map: one rule, applied over and over */
 
 /*
- * ChirikovSystem — invariant parameter(s) of the map [1].
- *
- * INTENT
- *   Split the kick strength K away from the state so chirikov_step is
- *   a pure function of (state, system) — same shape as the Lorenz /
- *   Rössler composites in this project even though there's only one
- *   parameter.  Consistency makes the §5 layout instantly familiar
- *   to readers who've studied another chaos demo (Sussman & Wisdom
- *   [7] §1.6).
- *
- * MEMBER LOGIC
- *   K : Chirikov coupling.  Bifurcation parameter — below KC_GREENE
- *       all chaotic motion is bounded vertically in p (KAM theorem,
- *       Arnold [4] §53); above it the last invariant golden-ratio
- *       torus breaks (Greene [2]) and chaos spans the whole torus
- *       T² = [0, 2π)².
- *
- * REFERENCES
- *   [1] Chirikov 1979 — original definition.
- *   [3] Lichtenberg & Lieberman §4.1 — kicked-rotor derivation.
+ * ChirikovSystem — the part that's the same for every point: just K,
+ * the strength of the nudge.  Kept apart from a point's position so the
+ * step function below is a clean "old position + this K -> new position".
+ *   K : how hard each step kicks.  Below KC_GREENE the wandering stays
+ *       boxed in; above it, points can roam the whole torus.
  */
 typedef struct { float K; } ChirikovSystem;
 
 /*
- * ChirikovState — one orbit's phase-point (x, p) ∈ T² = [0, 2π)².
- *
- * INTENT
- *   Pair the angle x and the momentum p as a single named value so
- *   chirikov_step takes ONE arg instead of two float pointers, and
- *   so the trajectory ensemble can store an array of states as
- *   array-of-struct rather than two parallel float arrays.
- *
- * MEMBER LOGIC
- *   x : angle, [0, 2π).  Wraps via wrap_tau after each step.
- *   p : momentum, [0, 2π).  Wraps via wrap_tau after each step.
- *
- * REFERENCES
- *   [3] Lichtenberg & Lieberman §4 — coordinates of the kicked rotor.
+ * ChirikovState — where one point is right now, on a doughnut-shaped
+ * (torus) space where both coordinates wrap around at 2*pi.
+ *   x : the angle.
+ *   p : the spin / momentum.
+ * Both are kept wrapped into [0, 2*pi) by wrap_tau after every step.
  */
 typedef struct { float x, p; } ChirikovState;
 
-/* wrap_tau — wrap a real number into [0, 2π).  fmodf can return
- * negatives for negative inputs, so add TAU once if needed. */
+/* Fold a number back into [0, 2*pi).  fmodf can hand back a negative
+ * for negative input, so we add one full turn when that happens. */
 static inline float wrap_tau(float v)
 {
     v = fmodf(v, TAU);
@@ -562,16 +272,10 @@ static inline float wrap_tau(float v)
     return v;
 }
 
-/* chirikov_step — one iterate of the standard map.  Chirikov 1979 [1]
- * §I, Lichtenberg & Lieberman [3] §4.1; each line of the body maps
- * 1-to-1 to one published formula:
- *
- *   p_{n+1} = p_n + K · sin(x_n)   (mod 2π)    momentum kick
- *   x_{n+1} = x_n + p_{n+1}        (mod 2π)    free rotation
- *
- * Pure function: returns the next state without mutating its inputs.
- * The Jacobian determinant of this map is 1 — area-preserving, the
- * defining property of a symplectic (Hamiltonian) map [4] §53. */
+/* Move one point forward by a single step — the whole standard map in
+ * two lines (Chirikov 1979): first the spin gets a sine-shaped nudge,
+ * then the angle advances by the new spin.  Hands back the next
+ * position without touching the one passed in. */
 static inline ChirikovState chirikov_step(ChirikovState s, ChirikovSystem sys)
 {
     s.p = wrap_tau(s.p + sys.K * sinf(s.x));
@@ -579,36 +283,19 @@ static inline ChirikovState chirikov_step(ChirikovState s, ChirikovSystem sys)
     return s;
 }
 
-/* ===================================================================== */
-/* §6  density — accumulating hit-counter grid                            */
-/* ===================================================================== */
+/* §6  density — a tally of how often each cell gets visited */
 
 /*
- * DensityGrid — uint16 hit-counter per phase-space cell.
- *
- * INTENT
- *   The "memory" of the simulation: which (x, p) cells of the torus
- *   the trajectories have visited, and how many times.  Log-mapping
- *   the count onto a colour band turns this counter array into a
- *   density-of-visits picture — KAM curves show as bright 1-D
- *   filaments, chaotic regions as 2-D textured clouds.
- *
- * CONTEXT
- *   Written by density_record (one increment per chirikov_step).
- *   Read by density_paint (§9) which log-maps hits → band → glyph.
- *   Sized to the terminal at startup and on SIGWINCH; cell count is
- *   bounded by CELLS_MAX so the array lives in BSS without malloc.
- *
- * MEMBER LOGIC
- *   w, h  : current viewport dimensions in cells (set by density_reset).
- *   count : w × h, cached so loops don't multiply each frame.
- *   hits  : flat row-major buffer of hit counts.  Saturates at
- *           UINT16_MAX = 65535 (which log-maps well below the top
- *           band, so saturation is invisible in practice).
- *
- * REFERENCES
- *   [3] Lichtenberg & Lieberman §4 — phase-space density
- *       visualisation of area-preserving maps.
+ * DensityGrid — the picture's memory: a tally board, one counter per
+ * screen cell, counting how many times the points have landed there.
+ * Turning each tally into a brightness is what makes thin curves and
+ * fuzzy clouds appear.  density_record bumps the counters; density_paint
+ * reads them.  Sized to the terminal at startup and on resize; capped at
+ * CELLS_MAX so the buffer can be a plain fixed array, no malloc.
+ *   w, h  : grid size in cells.
+ *   count : w*h, kept around so loops don't recompute it.
+ *   hits  : the tallies, one long row-major run.  Stops climbing at
+ *           65535, but that's far past "fully bright" so you never see it.
  */
 typedef struct {
     int      w, h;
@@ -622,9 +309,8 @@ static void density_reset(DensityGrid *d, int w, int h)
     memset(d->hits, 0, sizeof(uint16_t) * (size_t)d->count);
 }
 
-/* phase_to_cell — map a (x, p) phase point onto the (sx, sy) cell of
- * the density grid.  Y is INVERTED so larger p draws further up on
- * screen, matching textbook orientation. */
+/* Turn a point's (x, p) into a grid cell.  The y axis is flipped so
+ * bigger p draws higher up, the way the textbooks show it. */
 static inline void phase_to_cell(const DensityGrid *d,
                                  float x, float p,
                                  int *cx, int *cy)
@@ -636,10 +322,10 @@ static inline void phase_to_cell(const DensityGrid *d,
     if (y_cell < 0)        y_cell = 0;
     if (y_cell >= d->h)    y_cell = d->h - 1;
     *cx = x_cell;
-    *cy = d->h - 1 - y_cell;            /* invert y for textbook orientation */
+    *cy = d->h - 1 - y_cell;            /* flip y so up means more p */
 }
 
-/* density_record — increment the count at one phase point. */
+/* Add one to the tally for wherever this point currently sits. */
 static inline void density_record(DensityGrid *d, ChirikovState s)
 {
     int cx, cy;
@@ -648,8 +334,9 @@ static inline void density_record(DensityGrid *d, ChirikovState s)
     if (d->hits[idx] < UINT16_MAX) d->hits[idx]++;
 }
 
-/* density_band — log-scale count → band ∈ [0, DENS_BAND_COUNT-1].
- * Returns −1 for unvisited cells so density_paint can skip them. */
+/* Turn a tally into a brightness level 0..9.  Uses a log scale so the
+ * first few visits brighten fast and busy cells don't all max out.
+ * Returns -1 for never-visited cells so the painter can skip them. */
 static inline int density_band(uint16_t hits)
 {
     if (hits == 0) return -1;
@@ -661,48 +348,24 @@ static inline int density_band(uint16_t hits)
     return b;
 }
 
-/* ===================================================================== */
-/* §7  state — TrajectoryEnsemble + PresetState + PaletteState           */
-/* ===================================================================== */
+/* §7  state — the swarm of points, plus which preset and theme are on */
 
 /*
- * TrajectoryEnsemble — NUM_TRAJECTORIES parallel orbits sharing ONE
- * Chirikov system.
- *
- * INTENT
- *   All orbits in this demo use the SAME K (changes only when the
- *   user cycles a preset), so the system is stored once at the
- *   ensemble level and the per-orbit state is an array of
- *   ChirikovState.  This makes the "shared physics, varied initial
- *   conditions" structure explicit at the type level — exactly what
- *   the standard-map demo is about.
- *
- * CONTEXT
- *   Owned by Scene.  Reset on r/n/p: ensemble_init_uniform_grid
- *   places trajectories on a regular TRAJ_GRID_W × TRAJ_GRID_H
- *   lattice of starting (x, p) ∈ [0, 2π)².  Iterated by scene_tick
- *   in lock-step (every orbit advances by ITERATES_PER_TRAJ_PER_TICK
- *   steps per tick).
- *
- * MEMBER LOGIC
- *   system   : the shared (K) parameter, loaded from the active
- *              preset by scene_apply_preset_to_system.
- *   state[]  : per-orbit (x, p) phase-points.  Stored as an
- *              array-of-struct (AoS) so chirikov_step takes one
- *              named value — cleaner than parallel float arrays.
- *
- * REFERENCES
- *   [1] Chirikov 1979; [3] Lichtenberg & Lieberman §4.
+ * TrajectoryEnsemble — the whole swarm: every point feels the same K,
+ * so K lives here once and only the positions vary.  That's the heart
+ * of the demo — same rule, many starting places.  Reset on r/n/p
+ * (which re-spreads the points), advanced together by scene_tick.
+ *   system  : the shared K, copied in from the current preset.
+ *   state[] : each point's (x, p), one struct per point.
  */
 typedef struct {
     ChirikovSystem system;
     ChirikovState  state[NUM_TRAJECTORIES];
 } TrajectoryEnsemble;
 
-/* ensemble_init_uniform_grid — place NUM_TRAJECTORIES orbits on an
- * evenly-spaced lattice of starting (x, p) inside (0, 2π)² with a
- * one-cell margin so the corners aren't artificially dense.  Run on
- * every reset / preset cycle.  K is loaded separately. */
+/* Spread the points out evenly across the torus, with a one-cell gap
+ * from the edges so the corners aren't unfairly crowded.  Run on every
+ * reset / preset change.  K is set separately. */
 static void ensemble_init_uniform_grid(TrajectoryEnsemble *e)
 {
     int idx = 0;
@@ -718,17 +381,10 @@ static void ensemble_init_uniform_grid(TrajectoryEnsemble *e)
 }
 
 /*
- * PresetState — typed wrapper around "which K-preset is loaded".
- *
- * INTENT
- *   Wrap the bare Preset enum so the key-binding table reads as
- *   intentions ("cycle to next preset") rather than modular
- *   arithmetic on N_PRESETS.  Typing prevents a t/T keystroke from
- *   accidentally cycling the presets[] table.  Replace-Primitive-
- *   with-Object pattern (Fowler, *Refactoring*).
- *
- * MEMBER LOGIC
- *   current : index into presets[].  Must be in [0, N_PRESETS).
+ * PresetState — just remembers which preset is showing.  It's a struct
+ * of one int on purpose: giving it its own type means the theme keys
+ * can't reach in and bump the preset by mistake.
+ *   current : index into presets[], always in [0, N_PRESETS).
  */
 typedef struct { int current; } PresetState;
 
@@ -738,27 +394,11 @@ static void preset_state_cycle_prev(PresetState *p)              { p->current = 
 static const MapPreset *preset_state_active(const PresetState *p) { return &presets[p->current]; }
 
 /*
- * PaletteState — typed wrapper around "which colour theme is active".
- *
- * INTENT
- *   Same shape as PresetState; distinct type so a t/T keystroke
- *   physically cannot reach the presets[] table.  Bundles the
- *   active index plus the helper that re-pushes the theme to the
- *   ncurses pair table.  Replace-Primitive-with-Object pattern.
- *
- * CONTEXT
- *   Owned by Scene; mutated via palette_state_cycle_next/prev (t/T
- *   keys) followed immediately by scene_apply_theme, which pushes
- *   the resulting band[] codes back into the ncurses pair table so
- *   the next frame paints with the new palette.
- *
- * MEMBER LOGIC
- *   current : index into themes[].  Must be in [0, N_THEMES) =
- *             [0, 10); cycle helpers maintain this invariant via
- *             modular arithmetic on N_THEMES.
- *
- * REFERENCES
- *   Fowler, M. — *Refactoring*, "Replace Primitive with Object".
+ * PaletteState — the twin of PresetState, but for the colour theme.
+ * Separate type for the same reason: the preset keys can't accidentally
+ * change the theme.  After a t/T cycle, scene_apply_theme reloads the
+ * colours so the next frame uses them.
+ *   current : index into themes[], always in [0, N_THEMES).
  */
 typedef struct { int current; } PaletteState;
 
@@ -768,40 +408,20 @@ static void palette_state_cycle_prev(PaletteState *p)              { p->current 
 static const Theme *palette_state_active(const PaletteState *p)    { return &themes[p->current]; }
 static void palette_state_apply     (const PaletteState *p)        { theme_apply(p->current); }
 
-/* ===================================================================== */
-/* §8  scene — composite owner of all mutable simulation state           */
-/* ===================================================================== */
+/* §8  scene — everything that changes, gathered in one place */
 
 /*
- * Scene — composition root.
- *
- * INTENT
- *   Bundle every piece of mutable state into ONE struct so App owns
- *   one Scene and the main loop drives it through a tiny named-
- *   method API.  Each sub-field is its own typed concept so the
- *   compiler enforces the boundary between physics (the trajectory
- *   ensemble), memory (the density grid), and selection (preset,
- *   palette).
- *
- * CONTEXT
- *   Owned by App as a value.  Accessed by §9 painters and §10 app
- *   helpers.  Auto-stops after MAX_ITERATIONS_PER_TRAJ iterations
- *   per trajectory so the picture settles to a stable image.
- *
- * MEMBER LOGIC
- *   density          : §6 DensityGrid — the visible hit-count picture.
- *   ensemble         : §7 TrajectoryEnsemble — shared K + per-orbit
- *                      ChirikovState[NUM_TRAJECTORIES].
- *   preset           : §7 PresetState — index into presets[].
- *   palette          : §7 PaletteState — index into themes[].
- *   paused           : when true, scene_tick early-returns.
- *   iterations_done  : per-trajectory iteration counter.  When this
- *                      reaches MAX_ITERATIONS_PER_TRAJ the picture is
- *                      "done" and scene_tick stops iterating.
- *
- * REFERENCES
- *   [7] Sussman & Wisdom *SICM* §1.6 — System / State / Composite
- *       split this layer mirrors at the simulation-root level.
+ * Scene — the whole running simulation in one struct, so the main loop
+ * can drive it through a handful of named calls.  Each piece keeps its
+ * own type, so the physics, the picture, and the menu choices stay
+ * cleanly separate.  Freezes once every point has run its full budget.
+ *   density          : the tally board / picture (§6).
+ *   ensemble         : the swarm of points and their shared K (§7).
+ *   preset           : which K-preset is selected.
+ *   palette          : which colour theme is selected.
+ *   paused           : true means scene_tick does nothing.
+ *   iterations_done  : steps taken per point; at MAX_ITERATIONS_PER_TRAJ
+ *                      the picture is done and ticking stops.
  */
 typedef struct {
     DensityGrid        density;
@@ -812,7 +432,7 @@ typedef struct {
     int                iterations_done;
 } Scene;
 
-/* Accessors so call sites don't repeat presets[s->preset.current]. */
+/* Short-hands so callers don't dig through preset.current every time. */
 static inline const MapPreset *scene_active_preset(const Scene *s)
 {
     return preset_state_active(&s->preset);
@@ -822,9 +442,8 @@ static void scene_apply_theme(const Scene *s)
     palette_state_apply(&s->palette);
 }
 
-/* scene_load_active_preset_into_system — copy the active preset's K
- * onto the ensemble's shared system.  Called on reset and on preset
- * cycle so chirikov_step sees the right K every tick. */
+/* Copy the chosen preset's K onto the swarm, so the next steps use it.
+ * Done on reset and whenever the preset changes. */
 static void scene_load_active_preset_into_system(Scene *s)
 {
     s->ensemble.system.K = scene_active_preset(s)->K;
@@ -840,21 +459,19 @@ static void scene_reset(Scene *s, int w, int h)
 static void scene_init(Scene *s, int w, int h)
 {
     memset(s, 0, sizeof *s);
-    preset_state_init (&s->preset,  PRESET_WAVES);   /* middle of cascade */
-    palette_state_init(&s->palette, 0);              /* DEFAULT theme    */
+    preset_state_init (&s->preset,  PRESET_WAVES);   /* start mid-cascade */
+    palette_state_init(&s->palette, 0);              /* DEFAULT theme */
     scene_reset(s, w, h);
 }
 
-/* scene_is_settled — true once every trajectory has spent its full
- * iteration budget.  Past this point further integration would just
- * saturate cells, so scene_tick returns early. */
+/* True once every point has used up its step budget — the picture is
+ * done, so there's no reason to keep going. */
 static inline bool scene_is_settled(const Scene *s)
 {
     return s->iterations_done >= MAX_ITERATIONS_PER_TRAJ;
 }
 
-/* ensemble_advance_one_step — one chirikov_step for every orbit,
- * plus the matching density increment.  Inner kernel of scene_tick. */
+/* Advance every point by one step and tally where each lands. */
 static inline void ensemble_advance_one_step(TrajectoryEnsemble *e,
                                              DensityGrid *d)
 {
@@ -864,14 +481,8 @@ static inline void ensemble_advance_one_step(TrajectoryEnsemble *e,
     }
 }
 
-/* scene_tick — advance the simulation by one fixed-timestep tick.
- *
- * DRIVER PSEUDOCODE
- *   if paused or settled: return
- *   repeat ITERATES_PER_TRAJ_PER_TICK times:
- *       ensemble_advance_one_step(ensemble, density)
- *   iterations_done += ITERATES_PER_TRAJ_PER_TICK
- */
+/* One tick of the simulation: take a batch of steps unless we're paused
+ * or already done. */
 static void scene_tick(Scene *s, float dt)
 {
     (void)dt;
@@ -884,30 +495,14 @@ static void scene_tick(Scene *s, float dt)
     s->iterations_done += ITERATES_PER_TRAJ_PER_TICK;
 }
 
-/* ===================================================================== */
-/* §9  screen                                                             */
-/* ===================================================================== */
+/* §9  screen */
 
 /*
- * Screen — terminal viewport dimensions cache.
- *
- * INTENT
- *   ncurses' COLS / LINES are global macros; caching them in a
- *   struct gives the layout code one explicit handle to read and
- *   means a resize touches a single named state.  Every painter
- *   takes Screen* (or cols/rows) explicitly so the layout math is
- *   decoupled from ncurses globals.
- *
- * CONTEXT
- *   Owned by App.  Initialised by screen_init; resized by
- *   screen_resize when SIGWINCH fires; consulted everywhere a draw
- *   needs the viewport.  Drives app_pick_map_size which clamps the
- *   density grid to fit (with CELLS_MAX ceilings to keep the static
- *   hits[] buffer bounded).
- *
- * MEMBER LOGIC
- *   cols : current terminal width  in cells.
- *   rows : current terminal height in cells.
+ * Screen — just the current terminal size, kept in one spot.  ncurses
+ * has these as globals; copying them here means the drawing code has a
+ * single handle to read and a resize only has to update one place.
+ *   cols : width  in characters.
+ *   rows : height in characters.
  */
 typedef struct { int cols, rows; } Screen;
 
@@ -923,12 +518,9 @@ static void screen_resize(Screen *s) { endwin(); refresh();
                                        getmaxyx(stdscr, s->rows, s->cols); }
 static void screen_present(void)     { wnoutrefresh(stdscr); doupdate(); }
 
-/* glyph_for_band — 10-step ASCII gradient.  Glyph density tracks band
- * brightness, so a low-coverage band paints sparse dots while a
- * saturated cell paints a solid '@'.  Combined with the 10 colour
- * pairs and A_BOLD, this gives ~100 visually distinct intensity
- * levels — enough to render KAM tori as crisp curves and the chaotic
- * sea as a textured cloud at the same time. */
+/* Pick the character for a brightness level: faint dots for dim cells
+ * climbing to a solid '@' for the brightest.  The shape carries part of
+ * the brightness and the colour carries the rest. */
 static char glyph_for_band(int b)
 {
     static const char tiers[DENS_BAND_COUNT] = {
@@ -939,17 +531,16 @@ static char glyph_for_band(int b)
     return tiers[b];
 }
 
-/* density_band_to_pair — colour pair for a given density band.
- * Single source of truth so paint code and themes stay in sync. */
+/* Which colour-pair slot holds the colour for a brightness level.
+ * One place does this, so the painter and the themes can't drift apart. */
 static inline short density_band_to_pair(int band)
 {
     return (short)(PAIR_DENS_BASE + band);
 }
 
-/* density_grid_origin — top-left cell of the density grid inside the
- * drawable band, centred horizontally AND vertically.  Both origins
- * are clamped so the grid never overlaps the HUD even when the
- * terminal is taller than the grid. */
+/* Where the top-left of the grid goes: centred in the space left
+ * between the top and bottom HUD rows, and nudged so it never overlaps
+ * them. */
 static inline void density_grid_origin(const DensityGrid *d,
                                        int cols, int rows,
                                        int *gx0, int *gy0)
@@ -962,9 +553,8 @@ static inline void density_grid_origin(const DensityGrid *d,
     *gy0 = y;
 }
 
-/* density_cell_in_drawable_band — clipping predicate.  True iff the
- * candidate (sx, sy) lies strictly inside the drawable band (HUD top
- * and HUD bottom both excluded). */
+/* True if this screen cell is inside the drawing area, i.e. clear of
+ * both the top and bottom HUD rows. */
 static inline bool density_cell_in_drawable_band(int sx, int sy,
                                                  int cols, int rows)
 {
@@ -972,9 +562,8 @@ static inline bool density_cell_in_drawable_band(int sx, int sy,
         && sy >= HUD_TOP_ROWS && sy < rows - HUD_BOTTOM_ROWS;
 }
 
-/* paint_density_cell — render ONE non-empty cell of the density grid.
- * Skips unvisited cells (band < 0 from density_band) so the
- * background stays untouched. */
+/* Draw one cell.  Untouched cells (level below 0) are left blank so the
+ * background shows through. */
 static inline void paint_density_cell(int sy, int sx, int band)
 {
     if (band < 0) return;
@@ -985,18 +574,8 @@ static inline void paint_density_cell(int sy, int sx, int band)
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* density_paint — render the entire DensityGrid as a coloured field.
- *
- * DRIVER PSEUDOCODE
- *   (gx0, gy0) = density_grid_origin(d, cols, rows)
- *   for y in 0 .. d.h-1:
- *       sy = gy0 + y
- *       for x in 0 .. d.w-1:
- *           sx = gx0 + x
- *           if !density_cell_in_drawable_band(sx, sy): continue
- *           band = density_band(d.hits[y * d.w + x])
- *           paint_density_cell(sy, sx, band)        // skips band < 0
- */
+/* Draw the whole grid: walk every cell, turn its tally into a
+ * brightness, and paint it. */
 static void density_paint(const DensityGrid *d, int cols, int rows)
 {
     int gx0, gy0;
@@ -1013,9 +592,8 @@ static void density_paint(const DensityGrid *d, int cols, int rows)
     }
 }
 
-/* hud_status_word — string shown next to the preset bracket in row 0.
- * Reflects what the simulation is doing right now: settled (done),
- * paused, or actively iterating (preset name). */
+/* The word shown next to the preset counter: what the sim is doing
+ * right now — paused, done, or running (then it shows the preset name). */
 static inline const char *hud_status_word(const Scene *s)
 {
     if (s->paused)            return "PAUSED  ";
@@ -1023,9 +601,8 @@ static inline const char *hud_status_word(const Scene *s)
     return scene_active_preset(s)->name;
 }
 
-/* hud_iteration_percent — progress 0..100 toward the iteration cap.
- * Past 100 returns 100 (the cap might be slightly overshot inside one
- * tick's worth of iteration). */
+/* How far along the picture is, 0..100%.  Clamped at 100 because a
+ * single batch of steps can nudge the count just past the cap. */
 static inline int hud_iteration_percent(const Scene *s)
 {
     int pct = (s->iterations_done * 100) / MAX_ITERATIONS_PER_TRAJ;
@@ -1033,8 +610,7 @@ static inline int hud_iteration_percent(const Scene *s)
     return pct;
 }
 
-/* regime_label_for_K — KAM-regime annotation given the active K.
- * KC_DEAD_BAND prevents jitter on the boundary. */
+/* Says whether the current K is below, at, or above the tipping point. */
 static inline const char *regime_label_for_K(float K)
 {
     if (K < KC_GREENE - KC_DEAD_BAND) return "BELOW Kc";
@@ -1042,7 +618,6 @@ static inline const char *regime_label_for_K(float K)
     return "AT Kc   ";
 }
 
-/* hud_write_title — left-aligned bold "STANDARD MAP (Chirikov)". */
 static inline void hud_write_title(void)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1050,8 +625,6 @@ static inline void hud_write_title(void)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* hud_write_status_right — right-aligned row-0 status text:
- * fps, sim_fps, status word, preset [n/N], K, iteration percent. */
 static inline void hud_write_status_right(int cols, double fps, int sim_fps,
                                           const Scene *s)
 {
@@ -1069,12 +642,6 @@ static inline void hud_write_status_right(int cols, double fps, int sim_fps,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* hud_top — row 0 of the HUD.
- *
- * DRIVER PSEUDOCODE
- *   hud_write_title()                       // left banner
- *   hud_write_status_right(...)             // right status
- */
 static void hud_top_left_title(void) { hud_write_title(); }
 
 static void hud_top_right_status(int cols, double fps, int sim_fps,
@@ -1083,8 +650,8 @@ static void hud_top_right_status(int cols, double fps, int sim_fps,
     hud_write_status_right(cols, fps, sim_fps, s);
 }
 
-/* hud_write_preset_label / _theme_label / _threshold_segment — three
- * column segments of row 1, each a one-line "label : value" pair. */
+/* The three labels on the second HUD row: preset, theme, and a
+ * below/at/above-Kc readout. */
 static inline void hud_write_preset_label(int x, const MapPreset *active)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1105,14 +672,7 @@ static inline void hud_write_threshold_segment(int x, float K)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* hud_param_row — row 1 of the HUD: three labelled column segments.
- *
- * DRIVER PSEUDOCODE
- *   x = HUD_LEFT_MARGIN
- *   hud_write_preset_label    (x, active);   x += HUD_PARAM_PRESET_WIDTH
- *   hud_write_theme_label     (x, scene);    x += HUD_PARAM_THEME_WIDTH
- *   hud_write_threshold_segment(x, active.K)
- */
+/* Lay out the three second-row labels side by side. */
 static void hud_param_row(const Scene *s)
 {
     const MapPreset *active = scene_active_preset(s);
@@ -1131,16 +691,7 @@ static void hud_bottom_hint(int rows)
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* screen_draw — paint one full frame.
- *
- * DRIVER PSEUDOCODE
- *   erase()                                          // clear back buffer
- *   density_paint(scene.density, cols, rows)         // phase-space image
- *   hud_top_left_title()                             // banner
- *   hud_top_right_status(cols, fps, sim_fps, scene)  // right status
- *   hud_param_row(scene)                             // preset+theme+regime
- *   hud_bottom_hint(rows)                            // key hints
- */
+/* Draw one whole frame: clear, paint the picture, then the HUD. */
 static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
 {
     erase();
@@ -1151,49 +702,24 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
     hud_bottom_hint(sc->rows);
 }
 
-/* ===================================================================== */
-/* §10 app                                                                */
-/* ===================================================================== */
+/* §10 app */
 
 /*
- * App — top-level composition root.
- *
- * INTENT
- *   The "everything else" container.  Owns the simulation (Scene),
- *   the viewport (Screen), the simulation-rate knob (sim_fps), the
- *   density-grid dimensions (map_w/h, decoupled from screen dims so
- *   they can be clamped to CELLS_MAX without warping the layout),
- *   and the two volatile signal-handler flags.  Lives as a file-
- *   scope g_app so signal handlers can touch it without indirection.
- *
- * CONTEXT
- *   Created by app_bootstrap; mutated by app_handle_key and its
- *   named mutators; torn down by screen_free + atexit cleanup.
- *   main() never reaches into the sub-fields directly — every
- *   access goes through a named helper.
- *
- * MEMBER LOGIC
- *   scene       : the entire simulation state (§8 Scene) — ensemble
- *                 + density grid + selections.
- *   screen      : cached terminal dimensions (§9 Screen).
- *   sim_fps     : fixed-timestep rate scene_tick is driven at;
- *                 clamped to [SIM_FPS_MIN, SIM_FPS_MAX] = [10, 240].
- *                 Drives TICK_NS(sim_fps) which feeds the Fiedler [6]
- *                 accumulator in app_drain_fixed_timestep.
- *   map_w/h     : density-grid dimensions in cells.  Picked by
- *                 app_pick_map_size from screen × HUD reservation
- *                 with both safety floors and CELLS_MAX ceilings.
- *   running     : main-loop guard.  Cleared by SIGINT/TERM via
- *                 on_exit_signal, or by 'q'/ESC via app_handle_key.
- *   need_resize : SIGWINCH flag; consumed by
- *                 app_handle_pending_resize at the top of each
- *                 main-loop iteration.  Both flags MUST be volatile
- *                 sig_atomic_t (signal-handler write + main-loop
- *                 read, no other synchronisation).
- *
- * REFERENCES
- *   POSIX.1-2008 §2.4.3 — signal-safe writes via sig_atomic_t.
- *   [6] Fiedler — "Fix Your Timestep!" (drives sim_fps usage).
+ * App — the top-level box holding everything: the simulation, the
+ * terminal size, the speed knob, and the two flags the signal handlers
+ * set.  It lives in one file-scope variable so those handlers can reach
+ * it directly.  main() never pokes the fields itself — it always goes
+ * through a named helper.
+ *   scene       : the whole simulation (§8).
+ *   screen      : the terminal size (§9).
+ *   sim_fps     : how many ticks a second to run, kept in [10, 240].
+ *   map_w/h     : grid size, kept separate from the screen size so it can
+ *                 be capped at CELLS_MAX without distorting the layout.
+ *   running     : the main loop runs while this is set; cleared by 'q',
+ *                 ESC, or Ctrl-C.
+ *   need_resize : set when the terminal is resized, handled at the top of
+ *                 the next loop pass.  Both flags are volatile sig_atomic_t
+ *                 because a signal handler writes them while the loop reads.
  */
 typedef struct {
     Scene                 scene;
@@ -1209,7 +735,7 @@ static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-/* main_install_signal_handlers — wire SIGINT/TERM → quit, SIGWINCH → resize. */
+/* Hook up the signals: Ctrl-C / kill stop the loop, a resize sets the flag. */
 static void main_install_signal_handlers(void)
 {
     atexit(cleanup);
@@ -1218,17 +744,9 @@ static void main_install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* app_pick_map_size — clamp the density grid to the terminal viewport.
- *
- * DRIVER PSEUDOCODE
- *   mw = screen.cols
- *   mh = screen.rows - HUD_BAND_RESERVED_ROWS
- *   clamp mw into [MAP_W_FLOOR, MAP_W_MAX]
- *   clamp mh into [MAP_H_FLOOR, MAP_H_MAX]
- *   app.map_w, app.map_h = mw, mh
- *
- * Floors avoid degenerate sizes on tiny terminals; ceilings keep the
- * static CELLS_MAX buffer from overflowing on huge ones. */
+/* Size the grid to fill the terminal minus the HUD rows.  The floors
+ * keep it usable on tiny windows; the ceilings stop a huge window from
+ * overrunning the fixed buffer. */
 static void app_pick_map_size(App *app)
 {
     int mw = app->screen.cols;
@@ -1241,7 +759,7 @@ static void app_pick_map_size(App *app)
     app->map_h = mh;
 }
 
-/* app_bootstrap — first-time initialisation. */
+/* Start everything up: ncurses, the grid size, and the scene. */
 static void app_bootstrap(App *app)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
@@ -1252,7 +770,8 @@ static void app_bootstrap(App *app)
     scene_init(&app->scene, app->map_w, app->map_h);
 }
 
-/* app_handle_pending_resize — rebuild screen + scene on SIGWINCH. */
+/* If the terminal was resized, rebuild the screen and start the picture
+ * over at the new size. */
 static void app_handle_pending_resize(App *app)
 {
     if (!app->need_resize) return;
@@ -1262,8 +781,8 @@ static void app_handle_pending_resize(App *app)
     app->need_resize = 0;
 }
 
-/* app_compute_frame_dt — wall-clock since last frame, capped to
- * SIM_MAX_FRAME_DT_MS so a long stall doesn't spiral the integrator. */
+/* How long since the last frame, capped so that one long pause (say the
+ * window was dragged) doesn't make the sim try to catch up all at once. */
 static int64_t app_compute_frame_dt(int64_t *frame_time)
 {
     int64_t now = clock_ns();
@@ -1274,8 +793,8 @@ static int64_t app_compute_frame_dt(int64_t *frame_time)
     return dt;
 }
 
-/* app_drain_fixed_timestep — Fiedler [6] accumulator pattern.  Runs
- * scene_tick at the chosen sim_fps regardless of the render rate. */
+/* Run the sim at a steady rate no matter how fast we draw: spend the
+ * banked-up time one fixed tick at a time. */
 static void app_drain_fixed_timestep(App *app, int64_t *sim_accum)
 {
     int64_t tick_ns = TICK_NS(app->sim_fps);
@@ -1286,7 +805,7 @@ static void app_drain_fixed_timestep(App *app, int64_t *sim_accum)
     }
 }
 
-/* app_update_fps_meter — refresh fps every FPS_UPDATE_MS ms. */
+/* Recompute the shown fps every half second so the number doesn't jitter. */
 static void app_update_fps_meter(int64_t *fps_accum, int *frame_count,
                                  double *fps_display)
 {
@@ -1297,21 +816,21 @@ static void app_update_fps_meter(int64_t *fps_accum, int *frame_count,
     *fps_accum   = 0;
 }
 
-/* app_throttle_to_render_target — sleep so render runs at 60 fps. */
+/* Sleep off whatever's left of this frame's time budget so we hold 60 fps. */
 static void app_throttle_to_render_target(int64_t frame_time, int64_t dt)
 {
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(RENDER_FRAME_BUDGET_NS - elapsed);
 }
 
-/* app_present_frame — paint + flip back buffer. */
+/* Draw the frame and show it. */
 static void app_present_frame(App *app, double fps_display)
 {
     screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
     screen_present();
 }
 
-/* Clamped sim-rate mutators. */
+/* Speed up / slow down the sim, staying within the allowed range. */
 static void app_sim_rate_faster(App *app)
 {
     app->sim_fps += SIM_FPS_STEP;
@@ -1323,7 +842,7 @@ static void app_sim_rate_slower(App *app)
     if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
 }
 
-/* One-line mutators — named so the binding table reads as intentions. */
+/* The little actions each key triggers, named so the key table reads clearly. */
 static void app_toggle_pause     (App *app) { app->scene.paused = !app->scene.paused; }
 static void app_reset_picture    (App *app) { scene_reset(&app->scene, app->map_w, app->map_h); }
 static void app_cycle_theme_next (App *app) { palette_state_cycle_next(&app->scene.palette); scene_apply_theme(&app->scene); }
@@ -1341,7 +860,7 @@ static void app_cycle_preset_prev(App *app)
 
 static bool app_handle_key(App *app, int ch);
 
-/* app_poll_keyboard — non-blocking getch + dispatch.  false = quit. */
+/* Check for a keypress (without blocking) and act on it; false = quit. */
 static bool app_poll_keyboard(App *app)
 {
     int ch = getch();
@@ -1349,7 +868,7 @@ static bool app_poll_keyboard(App *app)
     return app_handle_key(app, ch);
 }
 
-/* app_handle_key — key-binding table; each case calls ONE named mutator. */
+/* The key table: each key runs one of the little actions above. */
 static bool app_handle_key(App *app, int ch)
 {
     switch (ch) {
@@ -1368,41 +887,15 @@ static bool app_handle_key(App *app, int ch)
 }
 
 /*
- * FrameClock — wall-clock + accumulator state for the main loop.
- *
- * INTENT
- *   Bundle the 5 timing locals (frame_time, sim_accum, fps_accum,
- *   frame_count, fps_display) into ONE named concept so main() reads
- *   as a pseudocode driver: "init clock, advance clock, drain
- *   simulation, throttle to render rate, present frame".  Threading
- *   them through helpers as a single FrameClock* removes 5 separate
- *   parameter lists from app_compute_frame_dt /
- *   app_drain_fixed_timestep / app_update_fps_meter.
- *
- * CONTEXT
- *   Lives as a local in main(); not owned by App because it is pure
- *   loop scaffolding (a different driver would replace it whole).
- *   Mutated by frame_clock_init, frame_clock_advance,
- *   frame_clock_reset_after_resize, app_drain_fixed_timestep, and
- *   app_update_fps_meter.
- *
- * MEMBER LOGIC
- *   frame_time  : wall-clock ns at the START of the previous frame.
- *                 app_compute_frame_dt subtracts this from clock_ns()
- *                 and stamps it forward.
- *   sim_accum   : ns of unspent simulation time.  Drained in multiples
- *                 of TICK_NS(sim_fps) by the inner while-loop of
- *                 app_drain_fixed_timestep — this is the Fiedler [6]
- *                 accumulator that lets the integrator and renderer
- *                 advance at independent rates.
- *   fps_accum   : ns elapsed since the last fps recalculation.
- *   frame_count : frames rendered since the last fps recalculation.
- *   fps_display : the displayed fps value, refreshed every
- *                 FPS_UPDATE_MS = 500 ms so the HUD doesn't flicker.
- *
- * REFERENCES
- *   [6] Fiedler — "Fix Your Timestep!" — the accumulator pattern
- *       this struct implements.
+ * FrameClock — the loop's stopwatch and bookkeeping, in one place so
+ * main() reads as a short list of steps.  It's a loop-only helper, not
+ * part of App.
+ *   frame_time  : when the previous frame started; used to measure dt.
+ *   sim_accum   : sim-time we owe but haven't run yet, paid off one tick
+ *                 at a time — this is what keeps the sim rate steady.
+ *   fps_accum   : time piled up since we last figured the fps.
+ *   frame_count : frames drawn since we last figured the fps.
+ *   fps_display : the fps number on screen, refreshed twice a second.
  */
 typedef struct {
     int64_t frame_time;
@@ -1432,27 +925,8 @@ static void frame_clock_advance(FrameClock *c, int64_t dt)
     c->frame_count++;
 }
 
-/* main — the whole simulation as a pseudocode driver.
- *
- * DRIVER PSEUDOCODE
- *   main_install_signal_handlers()                       // SIGINT/TERM/WINCH
- *   app_bootstrap(app)                                   // ncurses + Scene
- *   clk = frame_clock_init()
- *   while running:
- *       if need_resize:
- *           app_handle_pending_resize(app)
- *           frame_clock_reset_after_resize(clk)
- *       dt = app_compute_frame_dt(&clk.frame_time)
- *       frame_clock_advance(clk, dt)
- *       app_drain_fixed_timestep(app, &clk.sim_accum)    // scene_tick × N
- *       app_update_fps_meter(...)
- *       app_throttle_to_render_target(clk.frame_time, dt) // sleep to 60 fps
- *       app_present_frame(app, clk.fps_display)
- *       if !app_poll_keyboard(app):  running = 0         // q/ESC → quit
- *   screen_free(app)                                     // endwin via atexit
- *
- * Body reads top-to-bottom as the OVERALL flow of the program; every
- * named call is one line in this block. */
+/* The whole program, top to bottom: set up, then loop — handle a resize,
+ * measure the frame, run the sim, draw, wait, read a key — until quit. */
 int main(void)
 {
     main_install_signal_handlers();

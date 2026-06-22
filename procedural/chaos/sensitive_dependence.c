@@ -1,163 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * sensitive_dependence.c
- *   — The "butterfly effect" made literal.  Two Lorenz trajectories
- *     are launched from initial conditions that differ by ε ≈ 10⁻⁶.
- *     For the first ~Lyapunov-time seconds the two paths are
- *     indistinguishable.  Then they diverge EXPONENTIALLY until they
- *     occupy completely different lobes of the strange attractor.
+ * sensitive_dependence.c — the "butterfly effect" you can watch.
+ * Two (or three) Lorenz trajectories start almost identical, a hair
+ * apart in their starting point. They track each other for a while,
+ * then drift apart faster and faster until they're on opposite wings
+ * of the attractor. Ten presets show this from different viewpoints
+ * and at different starting gaps.
  *
- * DEMO: Up to 3 Lorenz trajectories evolved with identical RK4,
- *       seeded ε apart in initial conditions.  10 presets walk
- *       three axes of variability — projection (which 2-D slice
- *       of the 3-D state to plot), perturbation size (ε ladder),
- *       and layout (overlay / split / log|δ| stacked / log|δ|
- *       full screen).
- *
- *       Presets (cycle with n/p):
- *         1  CLASSIC   — XZ butterfly, 2 trajectories, ε=1e-6 (default)
- *         2  TOP_DOWN  — XY view, 2 trajectories
- *         3  SIDE      — YZ view, 2 trajectories
- *         4  EPS_BIG   — XZ, ε=1e-3 (diverges in seconds)
- *         5  EPS_TINY  — XZ, ε=1e-12 (stays close for minutes)
- *         6  TRIO      — 3 trajectories (base, base±ε) fanning out
- *         7  SPLIT     — A on left half, B on right half, compare
- *         8  DELTA     — overlay (top 60%) + log|δ| plot (bottom 40%)
- *         9  LOG_ONLY  — only the log|δ| plot, full screen
- *        10  TRIO_LOG  — TRIO overlay + log|δ| plot
- *
- * Study alongside:
- *   ./strange_attractor.c   — same Lorenz, ten variations.
- *   ../fractals/lyapunov.c  — Lyapunov exponent as a 2-D parameter
- *                             portrait (related quantitative idea).
- *
- * Section map:
- *   §1  config   — constants, 10-preset table, themes, projection/layout enums
- *   §2  clock    — monotonic timer + sleep
- *   §3  color    — HUD pairs + 10 themes
- *   §5  physics  — Lorenz (system + state) composite + named-stage RK4
- *   §6  trail    — Trail ring buffer + LogPlot ring buffer
- *   §7  state    — PresetState + PaletteState typed wrappers
- *   §8  scene    — Scene composite (Lorenz × TRAJ_MAX + Trails + LogPlot
- *                  + PresetState + PaletteState + viewport)
- *   §9  screen   — projection / layout dispatch, paint_trail, paint_log_plot
- *   §10 app      — signals, resize, key dispatch table, FrameClock,
- *                  main pseudocode driver + named loop helpers
- *
- * Keys: q/ESC quit | space pause | r reset | n/p preset | t/T theme | ]/[ Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra procedural/chaos/sensitive_dependence.c \
- *       -o sensitive_dependence -lncurses -lm
+ * Original idea: Lorenz, "Deterministic Nonperiodic Flow" (1963).
+ * Sister files: ./strange_attractor.c (same Lorenz, more variations),
+ *               ../fractals/lyapunov.c (the divergence rate as a map).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm     : 2-3 Lorenz integrations side-by-side, identical
- *                 RK4 at dt = LORENZ_DT.  Base initial condition is
- *                 (1.0, 1.0, 1.0); per-preset ε seeds trajectory B
- *                 at base + ε·x̂ and (TRIO) trajectory C at base − ε·x̂.
- *                 At each substep compute δ(t) = ‖A − B‖₃ and push
- *                 log δ(t) into the LogPlot ring for the DELTA /
- *                 LOG_ONLY / TRIO_LOG presets.
- *
- * Data-struct   : Lorenz composite × TRAJ_MAX (system + state per
- *                 trajectory) + one Trail of projected (u, v) samples
- *                 per trajectory (4 age bands).  A LogPlot ring of
- *                 pre-logf'd |δ| values for the plot presets.
- *
- * Rendering     : Trails in two distinct colour ramps so A and B
- *                 stay separable (TRIO adds a solid colour for C).
- *                 Layout is per-preset: FULL / SPLIT / PLOT_BOTTOM
- *                 (attractor top, log plot bottom 40%) / PLOT_ONLY.
- *                 Projection is per-preset (XZ butterfly / XY top-down
- *                 / YZ side).
- *
- * References    : Numbered so inline code can cite [n].
- *
- *   PHYSICS / DYNAMICAL SYSTEMS
- *   [1] Lorenz, E. N. (1963).  "Deterministic Nonperiodic Flow",
- *       J. Atmos. Sci. 20, pp. 130-141.  THE original paper: defines
- *       the three equations and the (σ, ρ, β) = (10, 28, 8/3)
- *       regime; first observation of sensitive dependence.
- *   [2] Lorenz, E. N. (1972).  "Predictability: Does the flap of
- *       a butterfly's wings in Brazil set off a tornado in Texas?"
- *       AAAS talk that named the phenomenon.  The 1979 Bull. AMS
- *       reprint is the citable form.
- *   [3] Strogatz, S. H. (2015).  *Nonlinear Dynamics and Chaos*
- *       (2nd ed.), §9 (Lorenz equations & Hopf bifurcation) and
- *       §10.2 (Lyapunov exponent of 1-D maps as a template for
- *       the higher-dimensional case).  Pedagogical companion text.
- *   [4] Sparrow, C. (1982).  *The Lorenz Equations: Bifurcations,
- *       Chaos, and Strange Attractors*.  Applied Math Sciences 41.
- *       Definitive monograph; the source of the canonical Lyapunov
- *       value λ ≈ 0.906 referenced in the HUD.
- *   [5] Eckmann, J.-P., Ruelle, D. (1985).  "Ergodic theory of
- *       chaos and strange attractors", Rev. Mod. Phys. 57(3),
- *       pp. 617-656.  Formal definition of sensitive dependence
- *       on initial conditions and Lyapunov spectrum.
- *
- *   ALGORITHMS
- *   [6] Wolf, A., Swift, J. B., Swinney, H. L., Vastano, J. A.
- *       (1985).  "Determining Lyapunov exponents from a time
- *       series", Physica D 16(3), pp. 285-317.  The standard
- *       algorithm for MEASURING λ from observed |δ(t)|; the
- *       slope of our log|δ| plot is exactly the Wolf et al.
- *       largest-exponent estimate in the unsaturated regime.
- *
- *   NUMERICS
- *   [7] Press, W. H. et al. (2007).  *Numerical Recipes* (3rd ed.),
- *       §17.1.  Classical 4-stage Runge-Kutta with the Butcher
- *       (1/6, 1/3, 1/3, 1/6) tableau used by lorenz_rk4_step.
- *
- *   FRAMEWORK
- *   [8] Fiedler, G. (2004).  "Fix Your Timestep!",
- *       gafferongames.com.  Accumulator pattern used by
- *       app_drain_fixed_timestep so all trajectories integrate
- *       at the same wall-clock-independent fixed step.
- *   [9] Sussman, G. J., Wisdom, J. (2014).  *Structure and
- *       Interpretation of Classical Mechanics* (2nd ed.), §1.6
- *       "Coordinate systems and states".  The System / State /
- *       Composite split used in §5 (LorenzSystem + LorenzState
- *       + Lorenz composite).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two systems start nearly identical.  Their states stay nearly
- * identical for a while.  Then their separation grows exponentially
- * — δ(t) ≈ δ₀ · e^(λ·t) — until the separation is comparable to the
- * size of the attractor itself.  After that they wander
- * independently on the SAME attractor but are uncorrelated.
- *
- * KEY FORMULAS  (Lorenz 1963 [1], Eckmann-Ruelle 1985 [5])
- * ────────────
- *   dx/dt = σ(y − x), dy/dt = x(ρ − z) − y, dz/dt = x·y − β·z
- *   (σ, ρ, β) = (10, 28, 8/3) — chaotic regime
- *
- *   δ(t) = ‖A(t) − B(t)‖
- *   log δ(t) ≈ log δ₀ + λ·t  (Lyapunov regime)
- *
- *   λ_Lorenz ≈ 0.906  (Sparrow 1982 [4]) ⇒ T_λ = 1/λ ≈ 1.1 s.
- *   Every T_λ seconds the separation grows by factor e ≈ 2.7.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • CLASSIC  : the two trails are visibly identical for ~7 seconds
- *               (~7 Lyapunov times of growth from 1e-6 → ~1e-3),
- *               then visibly separate; by ~10s they're on different
- *               lobes of the butterfly.
- *  • EPS_TINY : same shape but the indistinguishable phase lasts
- *               ~25-35 seconds — the headline butterfly-effect
- *               experience.  Time-to-diverge scales as -log(ε)/λ.
- *  • LOG_ONLY : the log|δ| curve is a near-straight line with slope
- *               ≈ LORENZ_LAMBDA (0.906) in the unsaturated regime,
- *               then plateaus when |δ| saturates near attractor size.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -170,21 +23,19 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* §1  config */
 
 enum {
     SIM_FPS_MIN      =  10, SIM_FPS_DEFAULT = 60, SIM_FPS_MAX = 240, SIM_FPS_STEP = 10,
     HUD_COLS         =  80, FPS_UPDATE_MS = 500,
     PAIR_HUD         =   1, PAIR_HINT = 2,
-    PAIR_A_BASE      =   3,    /* 4 age bands for trail A */
-    PAIR_B_BASE      =   7,    /* 4 age bands for trail B */
+    PAIR_A_BASE      =   3,    /* trail A: 4 shades, faded to bright */
+    PAIR_B_BASE      =   7,    /* trail B: 4 shades, faded to bright */
     PAIR_LIVE_A      =  11,
     PAIR_LIVE_B      =  12,
-    PAIR_PLOT        =  13,    /* log|δ| curve */
+    PAIR_PLOT        =  13,    /* the divergence curve */
     PAIR_AXIS        =  14,
-    PAIR_LIVE_C      =  15,    /* 3rd trajectory (TRIO presets) */
+    PAIR_LIVE_C      =  15,    /* third trajectory (TRIO presets) */
 };
 
 #define HUD_TOP_ROWS             2
@@ -205,20 +56,19 @@ enum {
 #define PLOT_MAX                2000
 #define TRAJ_MAX                   3    /* up to 3 trajectories (TRIO presets) */
 
-/* Lorenz parameters (chaotic regime) */
+/* The Lorenz settings that make it chaotic — the famous ones. */
 #define LZ_SIGMA                 10.0f
 #define LZ_RHO                   28.0f
 #define LZ_BETA                  (8.0f / 3.0f)
 
-/* Initial conditions — base.  Per-preset epsilon and seed direction below. */
+/* Where every run starts. The tiny per-preset gap is added on top of this. */
 #define IC_X                      1.0f
 #define IC_Y                      1.0f
 #define IC_Z                      1.0f
 
-/* Per-projection viewport bounds.  Each (proj, axis) pair has its
- * own (min, max) so the attractor fills the drawable band whichever
- * 2-D slice we pick.  Bounds chosen wide enough to contain the
- * canonical Lorenz attractor with a small margin. */
+/* How far the camera can see along each axis. We pick a separate
+ * window per view so the attractor fills the screen no matter which
+ * two axes we're showing. Wide enough to hold the whole shape. */
 #define X_AXIS_MIN              -25.0f
 #define X_AXIS_MAX               25.0f
 #define Y_AXIS_MIN              -30.0f
@@ -226,88 +76,62 @@ enum {
 #define Z_AXIS_MIN                0.0f
 #define Z_AXIS_MAX               50.0f
 
-/* Log-plot range — vertical axis of log|δ| plot.  LOG_MAX is the log
- * of the attractor's diameter (≈ 60).  The plot's lower bound is
- * derived per-preset by log_floor_for_eps() so the curve enters from
- * the bottom edge regardless of the active ε. */
-#define LOG_PLOT_FLOOR_PAD        2.0f   /* log units below log(ε) */
-#define LOG_MAX                   4.5f   /* log of attractor diameter */
+/* The divergence plot's up/down range, in log units. LOG_MAX is the
+ * log of how big the attractor is, so the curve flattens once the two
+ * paths are as far apart as they can get. The plot's bottom edge is
+ * worked out per preset (see log_floor_for_eps) so the curve always
+ * starts near the bottom whatever the starting gap is. */
+#define LOG_PLOT_FLOOR_PAD        2.0f   /* a little headroom below log(gap) */
+#define LOG_MAX                   4.5f   /* log of how wide the attractor is */
 
-/* Lyapunov exponent of canonical Lorenz — Sparrow 1982 [4].  Shown in
- * the HUD as a reference value the user can verify by reading the
- * slope of the LOG_ONLY preset's curve. */
+/* The known divergence rate for this Lorenz setup (Sparrow 1982).
+ * Shown in the HUD so you can eyeball it against the slope of the
+ * LOG_ONLY curve. */
 #define LORENZ_LAMBDA              0.906f
 
-/* Layout dividers and plot guards — named so paint_layout_* and
- * paint_log_plot read as intentions, not magic ints. */
-#define PAINT_GUTTER_WIDTH           1     /* SPLIT: vertical divider cells     */
-#define PAINT_DIVIDER_ROWS           1     /* PLOT_BOTTOM: horizontal divider   */
-#define LOG_PLOT_BAND_NUMERATOR      2     /* PLOT_BOTTOM: bottom band ~ 2/5    */
+/* Sizes for the on-screen dividers and the smallest plot worth drawing. */
+#define PAINT_GUTTER_WIDTH           1     /* SPLIT: gap between the two halves */
+#define PAINT_DIVIDER_ROWS           1     /* PLOT_BOTTOM: line between panels  */
+#define LOG_PLOT_BAND_NUMERATOR      2     /* plot gets about 2/5 of the height */
 #define LOG_PLOT_BAND_DENOMINATOR    5
-#define PLOT_MIN_WIDTH_CELLS         4     /* below this, plot is unreadable    */
+#define PLOT_MIN_WIDTH_CELLS         4     /* smaller than this and it's a blur */
 #define PLOT_MIN_HEIGHT_CELLS        3
 
-/* HUD row-1 column widths — fixed so the three labelled segments
- * align across all 10 presets and 10 themes. */
+/* Fixed column widths for the HUD's second row, so the three labels
+ * line up the same across every preset and theme. */
 #define HUD_PARAM_PRESET_WIDTH      19
 #define HUD_PARAM_THEME_WIDTH       17
 
 /*
- * Projection — which two axes of the 3-D Lorenz state we render.
+ * Projection — which two of the three axes we draw.
  *
- * INTENT
- *   The Lorenz attractor is a 3-D object; the terminal is 2-D.  Each
- *   2-D projection drops one axis and reveals a different visual
- *   signature of the same dynamics.  Cycling the projection presets
- *   teaches the user that the BUTTERFLY shape is just ONE viewpoint
- *   on a more general 3-D structure.
+ * The attractor lives in 3-D but the screen is flat, so we pick two
+ * axes and drop the third. Each choice shows a different face of the
+ * same motion — handy reminder that the famous butterfly shape is
+ * just one camera angle.
  *
- * CONTEXT
- *   Read by trajectory_to_projection() (§8) which extracts the (u, v)
- *   pair from a 3-D LorenzState, and by projection_axis_bounds() (§9)
- *   which returns the per-projection (u_min, u_max, v_min, v_max).
- *   Stored as SDPreset::proj.
- *
- * MEMBER LOGIC
- *   PROJ_XZ : classic "butterfly" view — the iconic Lorenz silhouette.
- *             The two lobes appear because z spirals UP then x flips
- *             sign, tracing the wings.
- *   PROJ_XY : view from above — shows the convection-roll dynamic
- *             before z-dynamics are introduced.
- *   PROJ_YZ : sideways view — wing-flap dynamic; less iconic but
- *             reveals the asymmetry between the two lobes.
- *
- * REFERENCES
- *   [1] Lorenz 1963 §III plots all three projections in Fig. 1-3.
+ *   PROJ_XZ : the classic butterfly outline. The two wings come from
+ *             the path looping up on one side, flipping, looping up
+ *             on the other.
+ *   PROJ_XY : looking down from above.
+ *   PROJ_YZ : looking from the side; shows how the two wings differ.
  */
 typedef enum { PROJ_XZ = 0, PROJ_XY, PROJ_YZ } Projection;
 
 /*
- * Layout — how the drawable band is partitioned for a given preset.
+ * Layout — how a preset carves up the screen.
  *
- * INTENT
- *   Different presets need different real-estate splits: a full
- *   overlay maximises attractor detail; a side-by-side SPLIT lets
- *   the user compare trails without overlap; the PLOT_BOTTOM layout
- *   stacks the attractor and the log|δ| plot vertically so neither
- *   competes for the same cells (the original DIVERGENCE preset
- *   bug); PLOT_ONLY hands the screen to the divergence plot for
- *   pedagogy.
+ * Some presets want the whole screen for the attractor; some want the
+ * two paths side by side so they don't overlap; some stack the
+ * attractor on top and the divergence plot underneath so they don't
+ * fight for the same cells; one hands the whole screen to the plot.
  *
- * CONTEXT
- *   Read by scene_paint() (§9) which dispatches into one of four
- *   named painters (paint_layout_full / _split / _plot_bottom /
- *   _plot_only).  Stored as SDPreset::layout.
- *
- * MEMBER LOGIC
- *   LAYOUT_FULL        : trajectories fill the whole drawable band.
- *   LAYOUT_SPLIT       : drawable split in half horizontally, one
- *                        trajectory per side (1-cell gutter divider).
- *   LAYOUT_PLOT_BOTTOM : attractor top (~60%), log|δ| plot bottom
- *                        (~40%), horizontal divider between.
- *   LAYOUT_PLOT_ONLY   : log|δ| plot fills the whole drawable band
- *                        — the educational view of [6] Lyapunov
- *                        exponent estimation.
+ *   LAYOUT_FULL        : paths fill the whole drawing area.
+ *   LAYOUT_SPLIT       : screen cut in half, one path per side, with a
+ *                        thin divider down the middle.
+ *   LAYOUT_PLOT_BOTTOM : attractor on top (~60%), divergence plot on
+ *                        the bottom (~40%), a line between them.
+ *   LAYOUT_PLOT_ONLY   : the divergence plot takes the whole screen.
  */
 typedef enum {
     LAYOUT_FULL = 0,
@@ -317,79 +141,43 @@ typedef enum {
 } Layout;
 
 /*
- * Preset — the 10-entry index space for the presets[] table.
+ * Preset — names for the rows of the presets[] table below.
  *
- * INTENT
- *   Named indices into the presets[] table, ordered by pedagogical
- *   progression: classic view first (anchor), then alternate
- *   projections (XY, YZ), then the ε ladder (BIG → TINY) which
- *   teaches that time-to-diverge scales as -log(ε)/λ, then more
- *   trajectories (TRIO), then the layout variants (SPLIT, DELTA,
- *   LOG_ONLY, TRIO_LOG) which surface the log|δ| evidence.
- *
- * CONTEXT
- *   Used only as table indices; the entries themselves live in the
- *   presets[] array below.  PresetState (§7) wraps a single instance
- *   and cycles modulo N_PRESETS.  PRESET_CLASSIC is the boot-state
- *   default chosen by scene_init.
- *
- * MEMBER LOGIC
- *   See per-line comments — each entry pairs a (projection, layout,
- *   n_traj, ε) tuple into a memorable demo of sensitive dependence.
- *
- * REFERENCES
- *   [1] Lorenz 1963 — canonical CLASSIC preset.
- *   [2] Lorenz 1972 — "butterfly effect" name, the EPS_TINY preset's
- *       headline experience (one part in 10¹² perturbation visibly
- *       diverging in ~25-35 simulated seconds).
- *   [6] Wolf et al. (1985) — the LOG_ONLY preset visualises this
- *       algorithm's input directly.
+ * Ordered as a little tour: the classic view first, then the other
+ * camera angles, then the starting-gap ladder (big gap diverges fast,
+ * tiny gap stays together for ages), then three paths at once, then
+ * the layouts that show the divergence plot itself. PRESET_CLASSIC is
+ * what you see on startup.
  */
 typedef enum {
-    PRESET_CLASSIC = 0,   /* XZ butterfly, 2 trajectories, ε=1e-6   */
-    PRESET_TOP_DOWN,      /* XY view, 2 trajectories                */
-    PRESET_SIDE,          /* YZ view, 2 trajectories                */
-    PRESET_EPS_BIG,       /* XZ, ε=1e-3 — diverges in seconds       */
-    PRESET_EPS_TINY,      /* XZ, ε=1e-12 — stays close for minutes  */
-    PRESET_TRIO,          /* XZ, 3 trajectories (base, base±ε)      */
-    PRESET_SPLIT,         /* XZ, side-by-side                       */
-    PRESET_DELTA,         /* XZ overlay + log|δ| plot (no overlap)  */
-    PRESET_LOG_ONLY,      /* log|δ| plot fills the screen           */
-    PRESET_TRIO_LOG,      /* TRIO + log plot                        */
+    PRESET_CLASSIC = 0,   /* butterfly view, 2 paths, gap 1e-6      */
+    PRESET_TOP_DOWN,      /* from above, 2 paths                    */
+    PRESET_SIDE,          /* from the side, 2 paths                 */
+    PRESET_EPS_BIG,       /* big gap (1e-3) — splits in seconds     */
+    PRESET_EPS_TINY,      /* tiny gap (1e-12) — stays together long */
+    PRESET_TRIO,          /* 3 paths fanning out from the middle    */
+    PRESET_SPLIT,         /* the two paths side by side             */
+    PRESET_DELTA,         /* attractor on top, divergence plot below*/
+    PRESET_LOG_ONLY,      /* divergence plot fills the screen       */
+    PRESET_TRIO_LOG,      /* three paths + divergence plot          */
     N_PRESETS,
 } Preset;
 
 /*
- * SDPreset — one row of the 10-preset demo zoo.
+ * SDPreset — one row of the demo menu.
  *
- * INTENT
- *   Each row fully describes one entry in the catalogue: HUD label,
- *   which projection to render, which layout to partition the
- *   viewport with, how many trajectories to integrate, and how big
- *   the initial perturbation between trajectory 0 and 1 is.  Cycling
- *   through the table is the only way the user changes the demo.
+ * Each row says everything about one entry: its name, which two axes
+ * to draw, how to lay out the screen, how many paths to run, and how
+ * far apart the first two start. Stepping through this table (n/p) is
+ * the only way to change what's on screen.
  *
- * CONTEXT
- *   Read by scene_seed_perturbations (eps), scene_tick (n_traj,
- *   proj), trajectory_to_projection (proj), all painters (layout,
- *   proj), and the HUD writers (name + eps + n_traj).  The
- *   PresetState wrapper in §7 holds an index INTO this table.
- *
- * MEMBER LOGIC
- *   name    : 8-char HUD label, padded so the parameter column aligns.
- *   proj    : which 2-D projection of the Lorenz state to render
- *             (Projection enum).
- *   layout  : how the drawable band is partitioned (Layout enum).
- *   n_traj  : number of trajectories integrated.  Currently 2 or 3;
- *             TRAJ_MAX = 3 is the hard cap.
- *   eps     : initial ‖A − B‖ perturbation magnitude (applied along
- *             the +x axis for trajectory 1, ±x for trajectory 2 in
- *             TRIO).  Range covers six orders of magnitude (1e-3 to
- *             1e-12) so the time-to-diverge ladder is visible.
- *
- * REFERENCES
- *   [1] Lorenz 1963 — the demonstration this struct parameterises.
- *   [2] Lorenz 1972 — the ε-ladder dramatises the butterfly metaphor.
+ *   name    : the label shown in the HUD (padded so columns line up).
+ *   proj    : which two axes to draw (Projection).
+ *   layout  : how to split the screen (Layout).
+ *   n_traj  : how many paths to run — 2 or 3 (3 is the hard cap).
+ *   eps     : how far apart the first two paths start, measured along
+ *             the x axis. Ranges from 1e-3 down to 1e-12 so you can
+ *             feel how a smaller gap buys more time before they split.
  */
 typedef struct {
     const char *name;
@@ -400,7 +188,7 @@ typedef struct {
 } SDPreset;
 
 static const SDPreset presets[N_PRESETS] = {
-    /*  name        proj      layout              n  ε       */
+    /*  name        proj      layout              n  gap     */
     { "CLASSIC ", PROJ_XZ, LAYOUT_FULL,        2, 1e-6f  },
     { "TOP_DOWN", PROJ_XY, LAYOUT_FULL,        2, 1e-6f  },
     { "SIDE    ", PROJ_YZ, LAYOUT_FULL,        2, 1e-6f  },
@@ -414,43 +202,25 @@ static const SDPreset presets[N_PRESETS] = {
 };
 
 /*
- * Theme — one named palette for the demo.
+ * Theme — one named colour set for the whole demo.
  *
- * INTENT
- *   Group every colour code the renderer needs into ONE flat row so a
- *   "next theme" key cycles a single table.  Sensitive-dependence is
- *   special among the chaos demos because it overlays TWO ramps that
- *   must stay distinguishable: each theme's A and B ramp share a hue
- *   family (so the name is honest — OCEAN is all blues, FIRE all
- *   warms) but differ in shade/brightness so the user can still tell
- *   trajectory A from trajectory B.
+ * All the colours the drawing code needs, packed into one row, so the
+ * theme key (t/T) just steps through a table. This demo is fussier
+ * than most because it draws two paths at once: each theme gives path
+ * A and path B colours from the same family (so OCEAN really is all
+ * blues) but different enough that you can still tell them apart.
+ * Every colour sits in the bright half of the palette so the dots
+ * stay readable on a black background (see CLAUDE.md brightness rule).
  *
- * CONTEXT
- *   Indexed by PaletteState (§7); installed by theme_apply (§3) which
- *   pushes each band into PAIR_A_BASE + i / PAIR_B_BASE + i, the
- *   markers into PAIR_LIVE_A / _B / _C, and the helper colours into
- *   PAIR_PLOT and PAIR_AXIS.  Cycled by t/T via
- *   app_cycle_theme_next/prev.  All palette values follow the project
- *   Brightness Rule (CLAUDE.md): every code lives in the bright half
- *   of the 256-colour cube so the dots stay legible on default black.
- *
- * MEMBER LOGIC
- *   name    : 7-char HUD label.
- *   a[]     : TRAIL_BAND_COUNT (4) 256-colour codes for trajectory A,
- *             sorted dimmest oldest → brightest newest.
- *   b[]     : same shape for trajectory B.  Shares hue family with
- *             a[] but is distinguishable.
- *   live_a  : '@' marker colour for trajectory A (PAIR_LIVE_A).
- *   live_b  : '@' marker colour for trajectory B (PAIR_LIVE_B).
- *   live_c  : single solid colour for trajectory C in TRIO presets.
- *             No age banding — keeps the theme table small AND the
- *             3-way overlay readable (a third banded ramp would
- *             saturate the visible cells).
- *   plot    : log|δ| curve colour for DELTA / LOG_ONLY / TRIO_LOG.
- *   axis    : subtle axis-frame colour (dividers, plot border).
- *
- * REFERENCES
- *   CLAUDE.md "Theme Palette Brightness".
+ *   name    : the label shown in the HUD.
+ *   a[]     : four colours for path A, oldest/faintest to newest/brightest.
+ *   b[]     : same idea for path B; same family as a[] but distinct.
+ *   live_a  : colour of path A's current-position '@' marker.
+ *   live_b  : colour of path B's '@' marker.
+ *   live_c  : one flat colour for the third path (TRIO presets). No
+ *             fade — keeps the three-way overlay from turning to mush.
+ *   plot    : colour of the divergence curve.
+ *   axis    : faint colour for dividers and the plot's frame.
  */
 typedef struct {
     const char *name;
@@ -459,24 +229,20 @@ typedef struct {
     short       live_a, live_b, live_c, plot, axis;
 } Theme;
 
-/*
- * Each theme provides TWO ramps in the theme's hue family — A and B
- * must be distinguishable (different shade/brightness) so the user
- * can tell the two trajectories apart, but both must fit the theme
- * name.  Hue choices:
+/* Each theme picks two readable shades from one colour family so the
+ * two paths stay tellable apart while still matching the theme name:
  *
- *   DEFAULT : blue (A) vs warm red→yellow (B) — max-contrast for new users
- *   MATRIX  : deep green (A) vs bright lime (B)
- *   NOVA    : magenta (A) vs bright yellow (B)               — "explosion" pair
- *   MONO    : light gray (A) vs medium gray (B)
- *   OCEAN   : deep cyan (A) vs sky/ice blue (B)
- *   FIRE    : red→orange (A) vs yellow→white (B)             — both warm
- *   EARTH   : brown (A) vs olive/sienna (B)
- *   FOREST  : dark green (A) vs leaf green (B)
- *   DESERT  : sand (A) vs rust/burnt (B)
- *   ARCTIC  : ice blue (A) vs near-white cyan (B)
- *
- * All entries stay 30+ / 244+ per the brightness rule (CLAUDE.md). */
+ *   DEFAULT : blue vs warm red→yellow — easiest to tell apart
+ *   MATRIX  : deep green vs bright lime
+ *   NOVA    : magenta vs bright yellow
+ *   MONO    : light gray vs medium gray
+ *   OCEAN   : deep cyan vs sky blue
+ *   FIRE    : red→orange vs yellow→white
+ *   EARTH   : brown vs olive
+ *   FOREST  : dark green vs leaf green
+ *   DESERT  : sand vs rust
+ *   ARCTIC  : ice blue vs near-white cyan
+ */
 #define N_THEMES 10
 static const Theme themes[N_THEMES] = {
     /* name        A: oldest→newest    B: oldest→newest    lv_a lv_b lv_c plot axis */
@@ -492,18 +258,13 @@ static const Theme themes[N_THEMES] = {
     { "ARCTIC",    { 117, 153, 195, 231 }, {  51,  87, 123, 159 }, 231,  51, 220, 226, 244 },
 };
 
-/* ===================================================================== */
-/* §2 clock + §3 color                                                    */
-/* ===================================================================== */
+/* §2 clock + §3 color */
 
 static int64_t clock_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec; }
 static void clock_sleep_ns(int64_t ns) { if (ns <= 0) return;
     struct timespec req = {ns/NS_PER_SEC, ns%NS_PER_SEC}; nanosleep(&req, NULL); }
 
-/* theme_install_256 — push a Theme's bright-cube codes into all the
- * ncurses pair classes the renderer needs (4 A-bands + 4 B-bands +
- * 3 live markers + plot + axis). */
 static inline void theme_install_256(const Theme *t)
 {
     for (int i = 0; i < TRAIL_BAND_COUNT; i++) {
@@ -517,10 +278,8 @@ static inline void theme_install_256(const Theme *t)
     init_pair(PAIR_AXIS,   t->axis,   -1);
 }
 
-/* theme_install_8color_fallback — graceful degradation for the few
- * terminals that advertise only 8 colours.  All A-band cells collapse
- * to cyan and all B-band cells to red; the third trajectory is
- * magenta; plot/axis are yellow/white. */
+/* Fallback for old terminals that only have 8 colours: path A goes
+ * cyan, path B red, the third path magenta, plot yellow, axis white. */
 static inline void theme_install_8color_fallback(void)
 {
     for (int i = 0; i < TRAIL_BAND_COUNT; i++) {
@@ -534,15 +293,6 @@ static inline void theme_install_8color_fallback(void)
     init_pair(PAIR_AXIS,   COLOR_WHITE,   -1);
 }
 
-/* theme_apply — push the chosen palette to the ncurses pair table.
- *
- * DRIVER PSEUDOCODE
- *   if idx out of range:  idx = 0                  // graceful fallback
- *   if terminal has 256 colours:
- *       theme_install_256(themes[idx])
- *   else:
- *       theme_install_8color_fallback()
- */
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -554,158 +304,80 @@ static void color_init(void) { start_color(); use_default_colors();
     else { init_pair(PAIR_HUD, COLOR_YELLOW, -1); init_pair(PAIR_HINT, COLOR_CYAN, -1); }
     theme_apply(0); }
 
-/* ===================================================================== */
-/* §5  Lorenz ODE — system + state composite, RK4 integrator             */
-/* ===================================================================== */
+/* §5  Lorenz equations — the system, its state, and the RK4 stepper */
 
 /*
- * Vec3 — generic 3-component vector.
+ * Vec3 — a plain triple of floats.
  *
- * INTENT
- *   The single 3-tuple this file traffics in.  Used three ways:
- *     • a Lorenz phase point (LorenzState alias)
- *     • a Lorenz derivative dy/dt (output of lorenz_deriv)
- *     • a 2-D projection sample after trajectory_to_projection
- *   Flat by-value struct so RK4 stages combine cheaply via state_add
- *   without any heap allocation.
+ * The one little 3-number type the whole file passes around. It plays
+ * three roles: a point on a path, the rate-of-change at that point,
+ * and a flattened 2-D screen sample. Kept as a flat by-value struct so
+ * the RK4 math can add and scale copies cheaply without any malloc.
  *
- * CONTEXT
- *   Returned by lorenz_deriv; stored as LorenzState inside Lorenz;
- *   read by trajectory_to_projection.  Same shape used in every
- *   other 3-D chaos demo in this project (rossler, strange_attractor).
- *
- * MEMBER LOGIC
- *   x, y, z : scalar components.  In Lorenz context they are the
- *             three observables of the ODE — x is the convection
- *             intensity, y the horizontal temperature variation,
- *             z the vertical temperature variation.
- *
- * REFERENCES
- *   [1] Lorenz 1963 — physical interpretation of (x, y, z).
+ *   x, y, z : in Lorenz terms, roughly: how fast the fluid is rolling,
+ *             and two measures of the temperature pattern.
  */
 typedef struct { float x, y, z; } Vec3;
 
-/*
- * LorenzState — semantic alias for Vec3 at the "ODE phase point" site.
- *
- * INTENT
- *   Same memory layout as Vec3; the typedef just labels intent so a
- *   call like state_add(LorenzState, dt, slope) reads as ODE
- *   arithmetic, not generic vector arithmetic.  No new fields.
- *   Mirrors the pattern in ./rossler_attractor.c (RosslerState = Vec3).
- *
- * CONTEXT
- *   Lives inside Lorenz::state.  Mutated by lorenz_rk4_step on every
- *   substep.  Read by trajectory_to_projection (for trail/marker
- *   rendering) and by delta_norm (for the log|δ| plot).
- *
- * MEMBER LOGIC
- *   Inherited from Vec3 — x, y, z scalar components, interpreted as
- *   the Lorenz phase-point coordinates at the current sim time.
- *
- * REFERENCES
- *   [1] Lorenz 1963 — the (x, y, z) coordinate triple these scalars name.
- */
+/* A Lorenz state is just a Vec3 — the new name only says "this is a
+ * point on the path right now," so the math below reads as physics. */
 typedef Vec3 LorenzState;
 
 /*
- * LorenzSystem — invariant parameters of the Lorenz ODE [1].
+ * LorenzSystem — the three knobs that define the equations.
  *
- * INTENT
- *   Split parameters away from state so lorenz_deriv becomes a PURE
- *   function of (state, system).  In this demo all trajectories share
- *   the canonical (10, 28, 8/3) so the system field is the SAME for
- *   every Lorenz composite — sensitive dependence requires identical
- *   physics; only initial conditions differ.  The split is kept
- *   (rather than collapsing to bare constants) because every other
- *   chaos demo in this project uses the System+State+Composite layout
- *   (Sussman & Wisdom [9] §1.6) and consistency matters.
+ * Kept separate from the moving state so the math function below can
+ * be a clean "given where you are, here's which way you're heading."
+ * Every path in this demo uses the exact same knobs — that's the whole
+ * point: same physics, only the starting point differs. We keep this
+ * as its own struct (instead of bare constants) to match the other
+ * chaos demos in the project.
  *
- * CONTEXT
- *   Read-only inside lorenz_deriv and lorenz_rk4_step.  Mutated only
- *   in scene_seed_perturbations (which calls lorenz_system_canonical
- *   to populate it).
- *
- * MEMBER LOGIC
- *   sigma : Prandtl number σ — rate of convective heat transfer.
- *           Canonical 10.0.
- *   rho   : Rayleigh number ρ — temperature-gradient driving force.
- *           Canonical 28.0 — past the supercritical Hopf bifurcation
- *           at ρ ≈ 24.74, deep into chaos.
- *   beta  : geometric factor β = 8/3 in the original derivation
- *           (Lorenz [1] §III).  Aspect ratio of the convection cells.
- *
- * REFERENCES
- *   [1] Lorenz 1963 §II — derivation from the Saltzman convection
- *       equations; the original σ, ρ, β values.
- *   [4] Sparrow 1982 §1.2 — definitive analysis of the
- *       parameter-space structure around (10, 28, 8/3).
- *   [9] Sussman & Wisdom §1.6 — system/state separation rationale.
+ *   sigma : how fast heat moves through the fluid (the famous 10).
+ *   rho   : how hard the system is driven (28 — well into chaos).
+ *   beta  : a shape factor for the convection cells (8/3).
  */
 typedef struct { float sigma, rho, beta; } LorenzSystem;
 
 /*
- * Lorenz — composite: invariant system + current state.
+ * Lorenz — one path: its knobs plus where it is right now.
  *
- * INTENT
- *   One value carrying everything needed to advance ONE Lorenz
- *   trajectory through RK4.  Mirrors the abstraction layout used by
- *   every chaos demo in this project (Rössler, double pendulum,
- *   Hénon-Heiles).  The 3 trajectories in Scene live in this struct
- *   so a per-trajectory step is a single named call
- *   (lorenz_rk4_step(&traj[i], dt)) rather than three loose float
- *   parameters that callers must keep synchronised.
+ * Everything needed to push a single path forward one step, bundled so
+ * a step is one tidy call instead of juggling loose floats. Scene keeps
+ * an array of these, one per path.
  *
- * CONTEXT
- *   Owned by Scene as an array (traj[TRAJ_MAX]).  lorenz_rk4_step
- *   mutates state while reading system as const.
- *   scene_seed_perturbations rebuilds the whole composite on every
- *   r-key / preset-change.
- *
- * MEMBER LOGIC
- *   system : the (σ, ρ, β) triple — never mutated by lorenz_rk4_step.
- *            Identical across every trajectory in this demo.
- *   state  : the (x, y, z) phase point — mutated each substep.
- *            DIFFERS between trajectories by exactly ε in x.
- *
- * REFERENCES
- *   [1] Lorenz 1963 — the ODE this composite advances.
- *   [7] Numerical Recipes §17.1 — the RK4 integrator that operates
- *       on this composite.
- *   [9] Sussman & Wisdom §1.6 — System/State separation rationale.
+ *   system : the three knobs — never change while stepping; the same
+ *            for every path here.
+ *   state  : the current point — moves every step. This is the only
+ *            thing that starts off different between paths (by the gap).
  */
 typedef struct {
     LorenzSystem system;
     LorenzState  state;
 } Lorenz;
 
-/* lorenz_system_canonical — the (σ=10, ρ=28, β=8/3) regime from
- * Lorenz 1963 [1] §III.  All trajectories in this demo use these
- * values; varying parameters is left to ./strange_attractor.c. */
+/* The standard chaotic knob values (10, 28, 8/3). Trying other values
+ * is what ./strange_attractor.c is for. */
 static inline LorenzSystem lorenz_system_canonical(void)
 {
     return (LorenzSystem){ LZ_SIGMA, LZ_RHO, LZ_BETA };
 }
 
-/* lorenz_deriv — evaluate dy/dt = f(state, system).  Lorenz 1963 [1]
- * §III equations 25-27; each line maps 1-to-1 to one published formula:
- *
- *   dx/dt = σ(y − x)
- *   dy/dt = x(ρ − z) − y
- *   dz/dt = xy − βz
- */
+/* Given a point, which way is the path heading from here? These are
+ * the three Lorenz equations straight from the 1963 paper; each line
+ * is one of them. */
 static inline LorenzState lorenz_deriv(const LorenzState *s,
                                        const LorenzSystem *sys)
 {
     LorenzState dy;
-    dy.x = sys->sigma * (s->y - s->x);              /* σ(y − x)        */
-    dy.y = s->x * (sys->rho - s->z) - s->y;         /* x(ρ − z) − y    */
-    dy.z = s->x * s->y - sys->beta * s->z;          /* xy − βz         */
+    dy.x = sys->sigma * (s->y - s->x);              /* sigma * (y - x)     */
+    dy.y = s->x * (sys->rho - s->z) - s->y;         /* x * (rho - z) - y   */
+    dy.z = s->x * s->y - sys->beta * s->z;          /* x*y - beta*z        */
     return dy;
 }
 
-/* state_add — y + h·k, returned as a new LorenzState.  Pure helper
- * for combining an RK4 stage's slope into a midpoint estimate. */
+/* Take a step h in direction k from point a, hand back the new point.
+ * The little building block the step below uses to peek ahead. */
 static inline LorenzState state_add(const LorenzState *a,
                                     float h, const LorenzState *k)
 {
@@ -716,11 +388,12 @@ static inline LorenzState state_add(const LorenzState *a,
     return r;
 }
 
-/* RK4 Butcher tableau constants — Numerical Recipes [7] §17.1. */
+/* Mixing weights for the four direction samples below. */
 #define RK4_BUTCHER_WEIGHT_SUM   6.0f
 #define RK4_MIDPOINT_FRACTION    0.5f
 
-/* rk4_butcher_weighted_average — (k₁ + 2k₂ + 2k₃ + k₄) / 6. */
+/* Blend the four sampled directions into one, weighting the two
+ * middle ones twice as heavily: (k1 + 2k2 + 2k3 + k4) / 6. */
 static inline LorenzState rk4_butcher_weighted_average(
     const LorenzState *k1, const LorenzState *k2,
     const LorenzState *k3, const LorenzState *k4)
@@ -732,16 +405,11 @@ static inline LorenzState rk4_butcher_weighted_average(
     return avg;
 }
 
-/* lorenz_rk4_step — one fixed-step RK4 update of the composite.
- * Classical 4-stage Runge-Kutta with the Butcher (1/6, 1/3, 1/3, 1/6)
- * tableau (Numerical Recipes [7] §17.1):
- *
- *   STAGE 1 — slope_start = f(y)
- *   STAGE 2 — slope_mid_1 = f(y + ½dt · slope_start)
- *   STAGE 3 — slope_mid_2 = f(y + ½dt · slope_mid_1)
- *   STAGE 4 — slope_end   = f(y +  dt · slope_mid_2)
- *   UPDATE  — y ← y + dt · (k₁ + 2k₂ + 2k₃ + k₄) / 6
- */
+/* Move the path forward by one time step, accurately. The trick
+ * (RK4): instead of trusting the direction at the start, sample it
+ * four times — at the start, twice around the midpoint, once at the
+ * far end — then take a weighted average of those four directions and
+ * step that way. Far steadier than a single naive step. */
 static void lorenz_rk4_step(Lorenz *L, float dt)
 {
     const LorenzSystem *sys = &L->system;
@@ -760,26 +428,22 @@ static void lorenz_rk4_step(Lorenz *L, float dt)
     L->state = state_add(&L->state, dt, &effective_slope);
 }
 
-/* ===================================================================== */
-/* §6  trail + log_plot — ring buffers for visible streak & δ history   */
-/* ===================================================================== */
+/* §6  trail + plot — the fading streak behind each path, and the
+ *     running record of how far apart two paths have drifted */
 
 /*
- * Trail — fixed-capacity ring buffer of (u, v) 2-D projection samples.
+ * Trail — the last few thousand screen positions of one path.
  *
- * INTENT
- *   Decouple "how long the visible streak is" from "how fast we
- *   advance the integrator" — the renderer reads up to TRAIL_MAX
- *   samples, the integrator pushes one every RK4 substep.  No malloc.
- *   Each trajectory in Scene gets its own Trail so two or three can
- *   be overlaid without sample interleaving.
+ * A round buffer (oldest gets overwritten) so we can draw a fading
+ * streak without caring how fast the simulation is running. The
+ * stepper drops one position in each step; the drawing code reads them
+ * back. No malloc — fixed size. Each path gets its own so two or three
+ * streaks don't get tangled together.
  *
- * MEMBER LOGIC
- *   x[], y[] : projected (u, v) coords (NOT raw 3-D state).  This
- *              lets paint_trail draw directly without re-running
- *              trajectory_to_projection on every sample.
- *   head     : ring-buffer index of the most recent sample.
- *   count    : valid-sample count, saturates at TRAIL_MAX.
+ *   x[], y[] : already-flattened screen coords, not the raw 3-D point,
+ *              so drawing doesn't have to redo the flattening.
+ *   head     : where the newest position sits.
+ *   count    : how many are valid; tops out at TRAIL_MAX.
  */
 typedef struct {
     float x[TRAIL_MAX], y[TRAIL_MAX];
@@ -796,21 +460,20 @@ static void trail_push(Trail *t, float px, float py)
 }
 
 /*
- * LogPlot — fixed-capacity ring buffer of log|δ(t)| samples used by
- * the DELTA / LOG_ONLY / TRIO_LOG presets.
+ * LogPlot — the history of how far apart two paths have drifted,
+ * stored on a log scale, for the presets that draw the divergence
+ * plot.
  *
- * INTENT
- *   Pre-computing logf at push time (once per sample) is much cheaper
- *   than logf at paint time (once per visible cell).  Storing log|δ|
- *   instead of |δ| also lets the plot's y-axis be linear in log-space,
- *   so the largest Lyapunov exponent λ shows up as a literal slope
- *   (Wolf et al. [6]) until |δ| saturates near the attractor size.
+ * We store the log of the gap rather than the gap itself, computed
+ * once when each sample arrives. Two reasons: it's cheaper to do the
+ * log here than for every screen cell at draw time, and on a log scale
+ * the steady doubling-apart phase shows up as a nice straight slanted
+ * line — and that slope is exactly the divergence rate.
  *
- * MEMBER LOGIC
- *   v[]   : pre-logf'd sample values.  Clamped to log_floor by the
- *           paint code (so the curve enters from the bottom edge).
- *   head  : ring index of the most recent sample.
- *   count : valid-sample count, saturates at PLOT_MAX.
+ *   v[]   : log of the gap at each moment. The drawing code keeps these
+ *           from dropping off the bottom of the chart.
+ *   head  : where the newest value sits.
+ *   count : how many are valid; tops out at PLOT_MAX.
  */
 typedef struct {
     float v[PLOT_MAX];
@@ -825,23 +488,16 @@ static void plot_push(LogPlot *p, float v)
     if (p->count < PLOT_MAX) p->count++;
 }
 
-/* ===================================================================== */
-/* §7  state — typed wrappers around the two cycled selections           */
-/* ===================================================================== */
+/* §7  state — small wrappers tracking which preset and theme are on */
 
 /*
- * PresetState — typed wrapper around "which preset is loaded".
+ * PresetState — remembers which preset is showing.
  *
- * INTENT
- *   Wrap the bare Preset enum in a struct so the key-binding table
- *   reads as intentions ("cycle to next preset") rather than modular
- *   arithmetic on N_PRESETS.  Replace-Primitive-with-Object pattern;
- *   typing also prevents a "next theme" keystroke from accidentally
- *   cycling presets[] or vice versa.
+ * Just an index, but wrapped in its own type so the next/prev helpers
+ * read as intentions and so a theme keystroke can't accidentally poke
+ * the preset (the types won't let it).
  *
- * MEMBER LOGIC
- *   current : index into the presets[] table (§1).  Must be in
- *             [0, N_PRESETS) = [0, 10).
+ *   current : which row of presets[] — always 0..N_PRESETS-1.
  */
 typedef struct { int current; } PresetState;
 
@@ -851,27 +507,13 @@ static void preset_state_cycle_prev(PresetState *p)              { p->current = 
 static const SDPreset *preset_state_active(const PresetState *p) { return &presets[p->current]; }
 
 /*
- * PaletteState — typed wrapper around "which colour theme is active".
+ * PaletteState — remembers which colour theme is active.
  *
- * INTENT
- *   Same shape as PresetState; distinct type so a t/T keystroke
- *   physically cannot reach the presets[] table.  Bundles the active
- *   index plus the helper that re-pushes the theme to ncurses pairs.
- *   Replace-Primitive-with-Object pattern (Fowler).
+ * Same idea as PresetState, kept a separate type so the theme keys
+ * can't reach into the preset table by mistake. After changing it you
+ * call scene_apply_theme to push the new colours into ncurses.
  *
- * CONTEXT
- *   Owned by Scene; mutated via palette_state_cycle_next/prev (t/T
- *   keys) followed immediately by scene_apply_theme, which pushes the
- *   resulting band[]/live/plot/axis codes back into the ncurses pair
- *   table so the next frame paints with the new palette.
- *
- * MEMBER LOGIC
- *   current : index into the themes[] table (§1).  Must be in
- *             [0, N_THEMES) = [0, 10); cycle helpers maintain this
- *             invariant via modular arithmetic on N_THEMES.
- *
- * REFERENCES
- *   Fowler, M. — *Refactoring*, "Replace Primitive with Object".
+ *   current : which row of themes[] — always 0..N_THEMES-1.
  */
 typedef struct { int current; } PaletteState;
 
@@ -881,47 +523,28 @@ static void palette_state_cycle_prev(PaletteState *p)              { p->current 
 static const Theme *palette_state_active(const PaletteState *p)    { return &themes[p->current]; }
 static void palette_state_apply     (const PaletteState *p)        { theme_apply(p->current); }
 
-/* ===================================================================== */
-/* §8  scene                                                              */
-/* ===================================================================== */
+/* §8  scene — everything that changes as the simulation runs */
 
 /*
- * Scene — composite owner of all mutable simulation state.
+ * Scene — all the moving parts in one place.
  *
- * INTENT
- *   Bundle every piece of mutable state into ONE struct so the App
- *   layer owns one Scene and the main loop drives it through a tiny
- *   named-method API (scene_init, scene_reset, scene_tick,
- *   scene_apply_theme).  Each sub-field is its own typed concept so
- *   the compiler enforces the boundary between physics (the Lorenz
- *   composites), geometry (trails + log plot), selection (preset,
- *   palette), and runtime (paused, t_sim).
+ * Everything that changes while running, bundled so the main loop can
+ * drive it through a handful of named calls (init, reset, tick, apply
+ * theme). Each field is its own little type so the physics, the
+ * drawing data, and the menu choices stay clearly separate.
  *
- * CONTEXT
- *   Owned by App as a value.  Accessed by §9 painters and §10 app
- *   helpers.  All mutation goes through scene_* / app_* helpers so
- *   call sites stay declarative.
- *
- * MEMBER LOGIC
- *   traj[]    : up to TRAJ_MAX Lorenz composites (system + state).
- *               All share the canonical (σ, ρ, β) but start from
- *               ε-different initial conditions:
- *                 traj[0]: base = (IC_X, IC_Y, IC_Z)
- *                 traj[1]: base + ε·x̂
- *                 traj[2]: base − ε·x̂   (TRIO presets only)
- *   trail[]   : ring buffer per trajectory holding the active
- *               2-D projection (u, v).  Re-cleared on r/n/p.
- *   log_delta : ring buffer of log‖traj[0].state − traj[1].state‖
- *               values; used by DELTA / LOG_ONLY / TRIO_LOG presets.
- *   t_sim     : seconds of simulated time since reset; HUD readout.
- *   preset    : §7 PresetState — which row of presets[].
- *   palette   : §7 PaletteState — which colour theme.
- *   paused    : when true, scene_tick early-returns.
- *
- * REFERENCES
- *   [9] Sussman & Wisdom (2014), *Structure and Interpretation of
- *       Classical Mechanics*, §1.6 — the System / State / Composite
- *       split this layer mirrors at the simulation-root level.
+ *   traj[]    : the (up to 3) paths. Same physics, but they start a
+ *               hair apart:
+ *                 traj[0]: the base starting point
+ *                 traj[1]: base nudged a tiny gap along x
+ *                 traj[2]: base nudged the same gap the other way (TRIO)
+ *   trail[]   : the fading streak behind each path. Cleared on r/n/p.
+ *   log_delta : the running record of the gap between paths 0 and 1,
+ *               for the presets that draw the divergence plot.
+ *   t_sim     : seconds simulated since the last reset (shown in HUD).
+ *   preset    : which preset is showing.
+ *   palette   : which colour theme is on.
+ *   paused    : when true, tick does nothing.
  */
 typedef struct {
     Lorenz       traj [TRAJ_MAX];
@@ -933,29 +556,20 @@ typedef struct {
     bool         paused;
 } Scene;
 
-/* scene_active_preset — accessor so call sites don't repeat
- * presets[s->preset.current] everywhere. */
 static inline const SDPreset *scene_active_preset(const Scene *s)
 {
     return preset_state_active(&s->preset);
 }
 
-/* scene_apply_theme — push the active palette to ncurses pairs. */
 static void scene_apply_theme(const Scene *s)
 {
     palette_state_apply(&s->palette);
 }
 
-/* scene_seed_perturbations — apply the active preset's ε to each
- * trajectory.  Slot 0 is the base; slot 1 is base + ε·x̂; slot 2
- * (TRIO only) is base − ε·x̂ so the trio fans symmetrically.  Every
- * slot gets the canonical Lorenz system; only the state differs.
- *
- * This is the experiment Lorenz [1] [2] originally ran — two
- * trajectories from initial conditions that differ by a tiny
- * fraction of the attractor diameter, integrated with identical
- * physics.  Eckmann-Ruelle [5] §1 formalises why those trajectories
- * MUST diverge exponentially in any system with positive λ. */
+/* Place the paths' starting points the tiny gap apart: path 0 at the
+ * base, path 1 nudged one way, path 2 (TRIO only) nudged the other.
+ * Everything else is identical — that near-identical start, drifting
+ * apart, is the whole experiment Lorenz ran. */
 static void scene_seed_perturbations(Scene *s)
 {
     float eps = scene_active_preset(s)->eps;
@@ -981,9 +595,8 @@ static void scene_init(Scene *s)
     scene_reset(s);
 }
 
-/* trajectory_to_projection — extract the (u, v) pair for the active
- * projection.  Centralises the axis selection so paint and trail
- * code reads world coordinates through one named accessor. */
+/* Flatten a 3-D point to the two axes the current view shows. One
+ * place does this so the drawing code never picks axes by hand. */
 static inline void trajectory_to_projection(const LorenzState *p, Projection proj,
                                             float *u, float *v)
 {
@@ -995,29 +608,23 @@ static inline void trajectory_to_projection(const LorenzState *p, Projection pro
     }
 }
 
-/* delta_norm — ‖a − b‖₃ between two trajectory states.  The HUD
- * shows |δ| directly; LogPlot stores its log.  In the unsaturated
- * regime log|δ(t)| ≈ log|δ₀| + λ·t (Eckmann-Ruelle [5] §1, Wolf
- * et al. [6] §2) — the visible slope of the LOG_ONLY preset's
- * curve IS the largest Lyapunov exponent. */
+/* Straight-line distance between two paths' current points — how far
+ * apart they've drifted. Shown in the HUD, and its log feeds the plot. */
 static inline float delta_norm(const LorenzState *a, const LorenzState *b)
 {
     float dx = a->x - b->x, dy = a->y - b->y, dz = a->z - b->z;
     return sqrtf(dx*dx + dy*dy + dz*dz);
 }
 
-/* log_floor_for_eps — bottom of the log|δ| plot's vertical axis,
- * derived from the active ε so the curve starts a few log units
- * BELOW log(ε), not at a fixed -14. */
+/* The bottom edge of the divergence plot, set from the starting gap so
+ * the curve always begins just above the floor whatever gap is in use
+ * (a fixed floor would leave tiny-gap runs starting way off-screen). */
 static inline float log_floor_for_eps(float eps)
 {
     return logf(eps) - LOG_PLOT_FLOOR_PAD;
 }
 
-/* trajectory_advance_and_record_sample — one RK4 substep for one
- * trajectory, plus the projected (u, v) trail sample.  Named so
- * scene_advance_one_substep reads as "for each trajectory: advance
- * + record" rather than 4 inline statements. */
+/* Move one path forward a step and remember where it landed on screen. */
 static inline void trajectory_advance_and_record_sample(
     Lorenz *traj, Trail *trail, Projection proj)
 {
@@ -1027,21 +634,19 @@ static inline void trajectory_advance_and_record_sample(
     trail_push(trail, u, v);
 }
 
-/* scene_record_divergence — push log‖traj[0] − traj[1]‖ onto the
- * LogPlot.  Clamps the log to log_floor so a zero δ (impossible
- * after the first substep, but cheap to guard) doesn't −inf the
- * curve.  This is the [6] Wolf et al. raw input signal. */
+/* Record this moment's gap between paths 0 and 1 onto the plot. Guards
+ * against a zero gap (can't happen after the first step, but log of 0
+ * would blow up) by pinning it to the plot floor. */
 static inline void scene_record_divergence(Scene *s, float log_floor)
 {
     float d = delta_norm(&s->traj[0].state, &s->traj[1].state);
     plot_push(&s->log_delta, (d > 0.0f) ? logf(d) : log_floor);
 }
 
-/* scene_advance_one_substep — one RK4 substep for every live
- * trajectory, then record divergence into the log plot.  This is the
- * smallest indivisible step of the simulation: every trajectory MUST
- * advance with identical dt or the sensitive-dependence demo would
- * measure numerical drift instead of chaos. */
+/* One smallest step of the whole simulation: every path moves the same
+ * tiny amount, then we note how far apart they are. They MUST step by
+ * the exact same amount, or we'd be watching rounding noise drift them
+ * apart instead of real chaos. */
 static inline void scene_advance_one_substep(Scene *s,
                                              const SDPreset *active,
                                              float log_floor)
@@ -1053,15 +658,8 @@ static inline void scene_advance_one_substep(Scene *s,
     scene_record_divergence(s, log_floor);
 }
 
-/* scene_tick — advance the simulation by one fixed-timestep tick.
- *
- * DRIVER PSEUDOCODE
- *   if paused: return                               // freeze sim
- *   active     = scene_active_preset(s)
- *   log_floor  = log_floor_for_eps(active.eps)      // per-preset axis
- *   repeat INT_STEPS_PER_TICK times:
- *       scene_advance_one_substep(s, active, log_floor)
- */
+/* Advance the simulation a bit. We take several small steps per tick
+ * so the motion stays smooth and accurate. */
 static void scene_tick(Scene *s, float dt)
 {
     (void)dt;
@@ -1074,29 +672,18 @@ static void scene_tick(Scene *s, float dt)
         scene_advance_one_substep(s, active, log_floor);
 }
 
-/* ===================================================================== */
-/* §9  screen                                                             */
-/* ===================================================================== */
+/* §9  screen — turning paths into characters on the terminal */
 
 /*
- * Screen — terminal viewport dimensions cache.
+ * Screen — the current terminal size.
  *
- * INTENT
- *   ncurses' COLS / LINES are global macros; caching them in a
- *   struct gives the layout code one explicit handle to read and
- *   means a resize touches a single named state.  Every painter
- *   takes Screen* (or cols/rows) explicitly so layout math is
- *   decoupled from ncurses globals.
+ * ncurses tracks the size in globals; we copy it here so the layout
+ * code reads one tidy handle and a resize updates one place. Drawing
+ * functions take this (or cols/rows) directly rather than peeking at
+ * the globals.
  *
- * CONTEXT
- *   Owned by App.  Initialised by screen_init; resized by
- *   screen_resize when SIGWINCH fires; consulted everywhere a draw
- *   needs the viewport.  Re-read after resize before scene_reset is
- *   called.
- *
- * MEMBER LOGIC
- *   cols : current terminal width  in cells.
- *   rows : current terminal height in cells.
+ *   cols : width  in characters.
+ *   rows : height in characters.
  */
 typedef struct { int cols, rows; } Screen;
 static void screen_init(Screen *s) { initscr(); noecho(); cbreak(); curs_set(0);
@@ -1107,9 +694,8 @@ static void screen_resize(Screen *s) { endwin(); refresh();
     getmaxyx(stdscr, s->rows, s->cols); }
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* projection_axis_bounds — (u_min, u_max, v_min, v_max) for each of
- * the three 2-D projections.  Wide enough to contain the canonical
- * Lorenz attractor with a small margin so the camera doesn't crop. */
+/* The world-space window (left/right, bottom/top) for each view, wide
+ * enough to hold the whole attractor without clipping its edges. */
 static inline void projection_axis_bounds(Projection proj,
                                           float *u_min, float *u_max,
                                           float *v_min, float *v_max)
@@ -1125,9 +711,9 @@ static inline void projection_axis_bounds(Projection proj,
     }
 }
 
-/* world_u_to_cell_x / world_v_to_cell_y — map a world-space coord
- * within [min, max] onto an integer cell coord within [gx0, gx0+w).
- * Vertical axis is flipped (v_max at the TOP of the screen). */
+/* Turn a world coordinate into a screen column/row inside a panel.
+ * The vertical one is flipped so bigger values sit higher up, the way
+ * we read a graph. */
 static inline int world_u_to_cell_x(float u, int gx0, int w,
                                     float u_min, float u_max)
 {
@@ -1145,21 +731,15 @@ static inline int world_v_to_cell_y(float v, int gy0, int h,
     return c;
 }
 
-/* paint_trail_in_rect — render one ring buffer of (u, v) samples
- * into a viewport rectangle, using the given pair_base for age-band
- * colours.  When `pair_base < 0` the trail paints as a single solid
- * colour pair `live_pair` (used for trajectory C in TRIO presets). */
-/* trail_oldest_index — ring-buffer offset of the oldest valid sample.
- * (head − count + 1) mod TRAIL_MAX, with TRAIL_MAX added to keep the
- * intermediate non-negative under C's truncating mod. */
+/* Where the oldest still-valid position sits in the round buffer. The
+ * extra TRAIL_MAX keeps the wrap-around math from going negative. */
 static inline int trail_oldest_index(const Trail *t)
 {
     return (t->head - t->count + 1 + TRAIL_MAX) % TRAIL_MAX;
 }
 
-/* trail_age_band — map a sample's age (0 = newest, n-1 = oldest)
- * onto one of TRAIL_BAND_COUNT colour tiers.  Newer samples get
- * higher band indices = brighter colours.  Clamped to a valid band. */
+/* Pick which of the four shades a streak dot gets from its age, so the
+ * streak fades from bright at the head to dim at the tail. */
 static inline int trail_age_band(int age_from_newest, int n)
 {
     int band = (TRAIL_BAND_COUNT - 1) - (age_from_newest * TRAIL_BAND_COUNT) / n;
@@ -1168,10 +748,8 @@ static inline int trail_age_band(int age_from_newest, int n)
     return band;
 }
 
-/* trail_pair_for_age — which ncurses pair to use for ONE trail
- * sample.  Banded ramp when pair_base ≥ 0 (trajectories A, B);
- * solid live_pair when pair_base < 0 (trajectory C, which uses a
- * single colour rather than its own 4-band ramp). */
+/* The colour for one streak dot. Paths A and B fade through four
+ * shades; the third path (pair_base < 0) just uses one flat colour. */
 static inline short trail_pair_for_age(int pair_base, int live_pair,
                                        int age_from_newest, int n)
 {
@@ -1179,9 +757,8 @@ static inline short trail_pair_for_age(int pair_base, int live_pair,
     return (short)(pair_base + trail_age_band(age_from_newest, n));
 }
 
-/* paint_cell — bracket attron / mvaddch / attroff so painters can
- * place a glyph in one line instead of three.  Glyph cast handles
- * the chtype sign-extension trap (CLAUDE.md "Common ncurses Bugs"). */
+/* Drop one coloured character on screen in a single call. The cast
+ * dodges an ncurses gotcha where bytes over 127 get garbled. */
 static inline void paint_cell(int sy, int sx, char glyph, short pair_id)
 {
     attron(COLOR_PAIR(pair_id) | A_BOLD);
@@ -1189,17 +766,8 @@ static inline void paint_cell(int sy, int sx, char glyph, short pair_id)
     attroff(COLOR_PAIR(pair_id) | A_BOLD);
 }
 
-/* paint_trail_in_rect — render one trail buffer into a viewport.
- *
- * DRIVER PSEUDOCODE
- *   if trail empty: return
- *   n = trail.count
- *   for i = 0 .. n-1:                              // oldest → newest
- *       sample = trail_sample_at_offset(i)
- *       (sx, sy) = world_coord_to_cell(sample, rect, bounds)
- *       pair  = trail_pair_for_age(pair_base, live_pair, age, n)
- *       paint_cell(sy, sx, '.', pair)
- */
+/* Draw one path's fading streak inside a panel: walk oldest to newest,
+ * placing a '.' for each remembered position, dimmer the older it is. */
 static void paint_trail_in_rect(const Trail *tr, int pair_base, int live_pair,
                                 int gx0, int gy0, int w, int h,
                                 float u_min, float u_max,
@@ -1220,9 +788,9 @@ static void paint_trail_in_rect(const Trail *tr, int pair_base, int live_pair,
     }
 }
 
-/* paint_log_plot_axis_frame — subtle L-shape axis (left edge +
- * bottom edge) in PAIR_AXIS.  Top and right edges left open so the
- * curve can extend to the latest sample without bumping the border. */
+/* Draw the plot's faint L-shaped frame — just the left and bottom
+ * edges. The top and right are left open so the curve can run right up
+ * to the latest point without bumping a border. */
 static void paint_log_plot_axis_frame(int gx0, int gy0, int w, int h)
 {
     attron(COLOR_PAIR(PAIR_AXIS));
@@ -1231,21 +799,19 @@ static void paint_log_plot_axis_frame(int gx0, int gy0, int w, int h)
     attroff(COLOR_PAIR(PAIR_AXIS));
 }
 
-/* log_plot_newest_first_index — ring offset of the i-th newest
- * sample (i=0 is the latest, i=count-1 is the oldest).  Centralises
- * the ring-buffer wrap so paint_log_plot reads as a clean newest →
- * oldest walk. */
+/* Find the i-th most recent value in the round buffer (i=0 is the
+ * newest). Lets the plot walk newest-to-oldest without wrap-around
+ * fuss at the call site. */
 static inline int log_plot_newest_first_index(const LogPlot *p, int i_from_newest)
 {
     int oldest = (p->head - p->count + 1 + PLOT_MAX) % PLOT_MAX;
     return (oldest + p->count - 1 - i_from_newest) % PLOT_MAX;
 }
 
-/* log_value_to_cell_y — clamp a log|δ| value into the plot's vertical
- * range, then map it onto an integer cell row.  Top of the rect is
- * LOG_MAX; bottom is log_floor.  The linear-y mapping is exactly
- * what makes the largest Lyapunov exponent λ ([6] Wolf et al.) show
- * up as a literal slope in the chart. */
+/* Turn one log-gap value into a screen row in the plot, clamped to the
+ * chart's range. Because the rows are evenly spaced in log units, the
+ * steady drift-apart phase comes out as a straight slanted line whose
+ * slope is the divergence rate. */
 static inline int log_value_to_cell_y(float lg, float log_floor,
                                       int gy0, int h)
 {
@@ -1255,9 +821,8 @@ static inline int log_value_to_cell_y(float lg, float log_floor,
     return gy0 + (h - 1) - (int)(fraction * (float)(h - 1));
 }
 
-/* paint_log_plot_curve — paint the visible samples newest → oldest,
- * placing one '*' per cell column.  Stops at w-1 samples since the
- * axis frame occupies column gx0. */
+/* Draw the divergence curve: one '*' per column, newest at the right.
+ * Stops short by one column so it doesn't sit on the axis line. */
 static void paint_log_plot_curve(const LogPlot *p, int gx0, int gy0,
                                  int w, int h, float log_floor)
 {
@@ -1276,13 +841,8 @@ static void paint_log_plot_curve(const LogPlot *p, int gx0, int gy0,
     attroff(COLOR_PAIR(PAIR_PLOT) | A_BOLD);
 }
 
-/* paint_log_plot — log|δ(t)| curve with a faint axis frame.
- *
- * DRIVER PSEUDOCODE
- *   if no samples OR too small: return                     // unreadable
- *   paint_log_plot_axis_frame(rect)                        // L-shape
- *   paint_log_plot_curve(plot, rect, log_floor)            // '*' curve
- */
+/* Draw the whole divergence plot: frame plus curve. Skips drawing if
+ * there's nothing yet or the panel is too small to read. */
 static void paint_log_plot(const LogPlot *p, int gx0, int gy0,
                            int w, int h, float log_floor)
 {
@@ -1295,30 +855,20 @@ static void paint_log_plot(const LogPlot *p, int gx0, int gy0,
 }
 
 /*
- * Rect — a sub-rectangle of the drawable band.
+ * Rect — one panel of the screen.
  *
- * INTENT
- *   The layout dispatcher partitions the drawable band into one or
- *   two rectangles (full / split / plot_bottom).  Passing each one
- *   as a Rect (rather than 4 loose ints) makes paint_attractor_panel
- *   and paint_log_plot take a single named argument and prevents the
- *   "swapped gx0/gy0" bug class.
+ * The layout code carves the screen into one or two of these and hands
+ * them to the painters. Passing a named box instead of four loose ints
+ * keeps anyone from swapping the corner and the size by accident.
  *
- * MEMBER LOGIC
- *   gx0 : leftmost column of the rect (inclusive).
- *   gy0 : top row of the rect (inclusive).
- *   w   : width in cells.  Rect spans columns [gx0, gx0 + w).
- *   h   : height in cells.  Rect spans rows    [gy0, gy0 + h).
+ *   gx0 : leftmost column.
+ *   gy0 : top row.
+ *   w   : width in characters.
+ *   h   : height in characters.
  */
 typedef struct { int gx0, gy0, w, h; } Rect;
 
-/* paint_live_marker — '@' glyph at the trajectory's current state.
- *
- * DRIVER PSEUDOCODE
- *   (u, v)   = trajectory_to_projection(state, proj)
- *   (sx, sy) = world_coord_to_cell(u, v, rect, bounds)
- *   paint_cell(sy, sx, '@', pair)
- */
+/* Draw the '@' that marks where a path is right now. */
 static void paint_live_marker(const Vec3 *p, Projection proj, short pair,
                               const Rect *r,
                               float u_min, float u_max,
@@ -1331,28 +881,14 @@ static void paint_live_marker(const Vec3 *p, Projection proj, short pair,
     paint_cell(sy, sx, '@', pair);
 }
 
-/* trail_pair_table / live_pair_table — index 0=A, 1=B, 2=C.  A pair
- * base of −1 means "no banded ramp; use live_pair as a single solid
- * colour" (used by trajectory C in TRIO presets). */
+/* Colours per path: index 0 = A, 1 = B, 2 = C. The -1 means "no fade,
+ * use one flat colour" — that's the third path in TRIO presets. */
 static const int trail_pair_table[TRAJ_MAX] = { PAIR_A_BASE, PAIR_B_BASE, -1 };
 static const int live_pair_table [TRAJ_MAX] = { PAIR_LIVE_A, PAIR_LIVE_B, PAIR_LIVE_C };
 
-/* paint_attractor_panel — render n trails + live markers into ONE
- * rectangle.  Used standalone (full / plot_bottom layouts) and twice
- * per frame in SPLIT layout (once per half).
- *
- * DRIVER PSEUDOCODE
- *   active = scene_active_preset(s)
- *   bounds = projection_axis_bounds(active.proj)
- *   for t = trail_start .. trail_start + trail_count - 1, t < n_traj:
- *       paint_trail_in_rect(trail[t], pair_table[t], live_table[t],
- *                           rect, bounds)
- *   for t = trail_start .. trail_start + trail_count - 1, t < n_traj:
- *       paint_live_marker(traj[t].state, proj, live_table[t],
- *                         rect, bounds)
- *
- * Two passes (all trails first, then all markers) so the '@' markers
- * always sit on top of the '.' trails regardless of paint order. */
+/* Draw some paths (streaks + current-position markers) into one panel.
+ * Markers go in a second pass so every '@' sits on top of the streaks
+ * rather than getting buried under a later path's dots. */
 static void paint_attractor_panel(const Scene *s, const Rect *r,
                                   int trail_start, int trail_count)
 {
@@ -1375,15 +911,14 @@ static void paint_attractor_panel(const Scene *s, const Rect *r,
     }
 }
 
-/* drawable_band_full — the entire drawable area as a single Rect. */
+/* The whole drawing area (everything but the HUD rows) as one panel. */
 static inline Rect drawable_band_full(int cols, int rows)
 {
     return (Rect){ 0, HUD_TOP_ROWS, cols, rows - HUD_BAND_RESERVED_ROWS };
 }
 
-/* paint_vertical_divider / _horizontal_divider — single-cell-wide
- * dividers in PAIR_AXIS, used to mark the SPLIT gutter and the
- * PLOT_BOTTOM panel boundary. */
+/* The thin dividing lines: down the middle for SPLIT, across for the
+ * stacked plot layout. */
 static void paint_vertical_divider(int col, int gy0, int h)
 {
     attron(COLOR_PAIR(PAIR_AXIS));
@@ -1397,26 +932,14 @@ static void paint_horizontal_divider(int row, int cols)
     attroff(COLOR_PAIR(PAIR_AXIS));
 }
 
-/* paint_layout_full — every trajectory overlaid in the full band. */
+/* FULL: all paths overlaid on the whole screen. */
 static void paint_layout_full(const Scene *s, int cols, int rows)
 {
     Rect band = drawable_band_full(cols, rows);
     paint_attractor_panel(s, &band, 0, TRAJ_MAX);
 }
 
-/* paint_layout_split — drawable cut horizontally in half; trajectory
- * A on the left, B on the right, with a single-cell vertical gutter
- * between them.
- *
- * DRIVER PSEUDOCODE
- *   drawable_h  = rows - HUD_BAND_RESERVED_ROWS
- *   half_w      = (cols - PAINT_GUTTER_WIDTH) / 2
- *   left_rect   = (0,                        HUD_TOP_ROWS, half_w, drawable_h)
- *   right_rect  = (half_w + PAINT_GUTTER_WIDTH, HUD_TOP_ROWS, half_w, drawable_h)
- *   paint_attractor_panel(left,  trajectory A only)
- *   paint_attractor_panel(right, trajectory B only)
- *   paint_vertical_divider(at column half_w)
- */
+/* SPLIT: path A fills the left half, path B the right, divider between. */
 static void paint_layout_split(const Scene *s, int cols, int rows)
 {
     int drawable_h = rows - HUD_BAND_RESERVED_ROWS;
@@ -1425,32 +948,19 @@ static void paint_layout_split(const Scene *s, int cols, int rows)
     Rect left  = { 0,                          HUD_TOP_ROWS, half_w, drawable_h };
     Rect right = { half_w + PAINT_GUTTER_WIDTH, HUD_TOP_ROWS, half_w, drawable_h };
 
-    paint_attractor_panel(s, &left,  0, 1);    /* trajectory A only */
-    paint_attractor_panel(s, &right, 1, 1);    /* trajectory B only */
+    paint_attractor_panel(s, &left,  0, 1);    /* path A only */
+    paint_attractor_panel(s, &right, 1, 1);    /* path B only */
     paint_vertical_divider(half_w, HUD_TOP_ROWS, drawable_h);
 }
 
-/* log_plot_band_height — height (in cells) of the bottom log|δ| band
- * in PLOT_BOTTOM / TRIO_LOG layouts.  ~40% of drawable, named so the
- * fraction lives in §1 constants. */
+/* How tall the bottom plot panel is — about 2/5 of the drawing area. */
 static inline int log_plot_band_height(int drawable_h)
 {
     return drawable_h * LOG_PLOT_BAND_NUMERATOR / LOG_PLOT_BAND_DENOMINATOR;
 }
 
-/* paint_layout_plot_bottom — attractor overlay on top (~60%), log|δ|
- * plot on bottom (~40%), horizontal divider between.
- *
- * DRIVER PSEUDOCODE
- *   drawable_h  = rows - HUD_BAND_RESERVED_ROWS
- *   plot_h      = log_plot_band_height(drawable_h)
- *   attr_h      = drawable_h - plot_h - PAINT_DIVIDER_ROWS
- *   attr_rect   = top    band of `attr_h` rows
- *   plot_rect   = bottom band of `plot_h` rows
- *   paint_attractor_panel(attr_rect, all trajectories)
- *   paint_log_plot       (plot_rect, log_floor for active.eps)
- *   paint_horizontal_divider(between the two)
- */
+/* PLOT_BOTTOM: attractor on top (~60%), divergence plot below (~40%),
+ * a line between them. */
 static void paint_layout_plot_bottom(const Scene *s, int cols, int rows)
 {
     const SDPreset *active = scene_active_preset(s);
@@ -1470,12 +980,7 @@ static void paint_layout_plot_bottom(const Scene *s, int cols, int rows)
     paint_horizontal_divider(HUD_TOP_ROWS + attr_h, cols);
 }
 
-/* paint_layout_plot_only — log|δ| plot fills the drawable band.
- *
- * DRIVER PSEUDOCODE
- *   rect = drawable_band_full(cols, rows)
- *   paint_log_plot(rect, log_floor for active.eps)
- */
+/* PLOT_ONLY: the divergence plot takes the whole screen. */
 static void paint_layout_plot_only(const Scene *s, int cols, int rows)
 {
     const SDPreset *active = scene_active_preset(s);
@@ -1484,15 +989,7 @@ static void paint_layout_plot_only(const Scene *s, int cols, int rows)
                    log_floor_for_eps(active->eps));
 }
 
-/* scene_paint — dispatch on the active layout.
- *
- * DRIVER PSEUDOCODE
- *   switch active.layout:
- *       FULL        → paint_layout_full
- *       SPLIT       → paint_layout_split
- *       PLOT_BOTTOM → paint_layout_plot_bottom
- *       PLOT_ONLY   → paint_layout_plot_only
- */
+/* Draw the scene using whichever layout the current preset asks for. */
 static void scene_paint(const Scene *s, int cols, int rows)
 {
     switch (scene_active_preset(s)->layout) {
@@ -1503,7 +1000,6 @@ static void scene_paint(const Scene *s, int cols, int rows)
     }
 }
 
-/* hud_write_title — left-aligned bold "SENSITIVE DEPENDENCE (Lorenz)". */
 static inline void hud_write_title(void)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1511,8 +1007,8 @@ static inline void hud_write_title(void)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* hud_write_status_right — right-aligned status text on row 0
- * (fps, sim_fps, preset name + [n/N], sim time, current |δ|). */
+/* The right-hand status on the top row: frame rate, sim rate, current
+ * preset, elapsed time, and how far apart the two paths are now. */
 static inline void hud_write_status_right(int cols, double fps, int sim_fps,
                                           const Scene *s)
 {
@@ -1532,20 +1028,13 @@ static inline void hud_write_status_right(int cols, double fps, int sim_fps,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* hud_top — row 0 of the HUD.
- *
- * DRIVER PSEUDOCODE
- *   hud_write_title()                       // left-aligned banner
- *   hud_write_status_right(...)             // right-aligned status
- */
 static void hud_top(int cols, double fps, int sim_fps, const Scene *s)
 {
     hud_write_title();
     hud_write_status_right(cols, fps, sim_fps, s);
 }
 
-/* hud_write_preset_label / _theme_label / _eps_traj_lambda — three
- * column segments of row 1, each a one-line "label : value" pair. */
+/* The three labelled chunks of the HUD's second row. */
 static inline void hud_write_preset_label(int x, const SDPreset *active)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1566,14 +1055,6 @@ static inline void hud_write_eps_traj_lambda(int x, const SDPreset *active)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* hud_param — row 1 of the HUD: three labelled column segments.
- *
- * DRIVER PSEUDOCODE
- *   x = HUD_LEFT_MARGIN
- *   hud_write_preset_label    (x, active);  x += HUD_PARAM_PRESET_WIDTH
- *   hud_write_theme_label     (x, scene);   x += HUD_PARAM_THEME_WIDTH
- *   hud_write_eps_traj_lambda (x, active)
- */
 static void hud_param(const Scene *s)
 {
     const SDPreset *active = scene_active_preset(s);
@@ -1592,15 +1073,7 @@ static void hud_hint(int rows)
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* screen_draw — paint one full frame.
- *
- * DRIVER PSEUDOCODE
- *   erase()                                 // clear back buffer
- *   scene_paint(scene, cols, rows)          // layout dispatch
- *   hud_top   (cols, fps, sim_fps, scene)   // banner + status
- *   hud_param (scene)                       // preset + theme + params
- *   hud_hint  (rows)                        // key hints
- */
+/* Paint one whole frame: clear, draw the scene, then the HUD on top. */
 static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
 {
     erase();
@@ -1610,27 +1083,24 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
     hud_hint  (sc->rows);
 }
 
-/* ===================================================================== */
-/* §10 app — signals, resize, key dispatch, FrameClock, main loop        */
-/* ===================================================================== */
+/* §10 app — signals, resize, keys, timing, and the main loop */
 
 /*
- * App — top-level composition root.
+ * App — the whole program in one box.
  *
- * INTENT
- *   The "everything else" container.  Owns the simulation (Scene),
- *   the viewport (Screen), the simulation-rate knob (sim_fps), and
- *   the two volatile signal-handler flags.  Lives as a file-scope
- *   g_app so signal handlers can touch it without indirection.
+ * Holds the simulation, the screen size, the speed knob, and two flags
+ * the signal handlers flip. It lives as a single global so the signal
+ * handlers can reach it without being handed a pointer.
  *
- * MEMBER LOGIC
- *   scene       : the simulation (§8 Scene).
- *   screen      : cached terminal dimensions (§9 Screen).
- *   sim_fps     : fixed-timestep rate scene_tick is driven at;
- *                 clamped to [SIM_FPS_MIN, SIM_FPS_MAX] = [10, 240].
- *   running     : main-loop guard; cleared by SIGINT/TERM or 'q'.
- *   need_resize : SIGWINCH flag; consumed by handle_pending_resize.
- *                 Both flags MUST be volatile sig_atomic_t.
+ *   scene       : the simulation.
+ *   screen      : the cached terminal size.
+ *   sim_fps     : how many times a second the sim steps; clamped to
+ *                 10..240.
+ *   running     : the main loop runs while this is set; cleared by 'q'
+ *                 or a kill signal.
+ *   need_resize : set when the terminal is resized; cleared once handled.
+ *                 (Both flags are sig_atomic_t because signal handlers
+ *                 touch them.)
  */
 typedef struct {
     Scene                 scene;
@@ -1646,7 +1116,8 @@ static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-/* main_install_signal_handlers — wire SIGINT/TERM → quit, SIGWINCH → resize. */
+/* Hook up the signals: Ctrl-C / kill ask us to quit, a resize asks us
+ * to relayout. */
 static void main_install_signal_handlers(void)
 {
     atexit(cleanup);
@@ -1655,7 +1126,7 @@ static void main_install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* app_bootstrap — first-time initialisation. */
+/* First-time setup before the loop starts. */
 static void app_bootstrap(App *app)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
@@ -1665,7 +1136,7 @@ static void app_bootstrap(App *app)
     scene_init(&app->scene);
 }
 
-/* app_handle_pending_resize — rebuild screen + scene on SIGWINCH. */
+/* If the terminal was resized, re-read its size and restart the run. */
 static void app_handle_pending_resize(App *app)
 {
     if (!app->need_resize) return;
@@ -1674,8 +1145,9 @@ static void app_handle_pending_resize(App *app)
     app->need_resize = 0;
 }
 
-/* app_compute_frame_dt — wall-clock since last frame, capped to
- * SIM_MAX_FRAME_DT_MS so a long stall doesn't spiral the integrator. */
+/* How long since the last frame, capped so that if the program stalls
+ * (window dragged, laptop slept) it doesn't try to catch up all at
+ * once and lock up. */
 static int64_t app_compute_frame_dt(int64_t *frame_time)
 {
     int64_t now = clock_ns();
@@ -1686,11 +1158,10 @@ static int64_t app_compute_frame_dt(int64_t *frame_time)
     return dt;
 }
 
-/* app_drain_fixed_timestep — Fiedler [8] accumulator pattern.  Runs
- * scene_tick at the chosen sim_fps regardless of the render rate, so
- * BOTH trajectories integrate at the same wall-clock-independent
- * fixed step (essential — sensitive dependence requires identical
- * dt or the divergence would be from numerics, not chaos). */
+/* Step the simulation in fixed-size chunks, however many fit in the
+ * time that's passed. Keeping the step size fixed (not tied to frame
+ * rate) matters here: every path must step identically, or the split
+ * we're showing would be rounding error rather than real chaos. */
 static void app_drain_fixed_timestep(App *app, int64_t *sim_accum)
 {
     int64_t tick_ns = TICK_NS(app->sim_fps);
@@ -1701,7 +1172,8 @@ static void app_drain_fixed_timestep(App *app, int64_t *sim_accum)
     }
 }
 
-/* app_update_fps_meter — refresh fps every FPS_UPDATE_MS ms. */
+/* Recompute the displayed frame rate twice a second (smoother than
+ * updating it every single frame). */
 static void app_update_fps_meter(int64_t *fps_accum, int *frame_count,
                                  double *fps_display)
 {
@@ -1712,21 +1184,22 @@ static void app_update_fps_meter(int64_t *fps_accum, int *frame_count,
     *fps_accum   = 0;
 }
 
-/* app_throttle_to_render_target — sleep so render runs at 60 fps. */
+/* Sleep off whatever time is left in this frame so we draw at ~60 fps
+ * instead of spinning the CPU flat out. */
 static void app_throttle_to_render_target(int64_t frame_time, int64_t dt)
 {
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(RENDER_FRAME_BUDGET_NS - elapsed);
 }
 
-/* app_present_frame — paint + flip back buffer. */
+/* Draw the frame and push it to the terminal. */
 static void app_present_frame(App *app, double fps_display)
 {
     screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
     screen_present();
 }
 
-/* Clamped sim-rate mutators. */
+/* Speed the sim up / slow it down, staying within the allowed range. */
 static void app_sim_rate_faster(App *app)
 {
     app->sim_fps += SIM_FPS_STEP;
@@ -1738,7 +1211,8 @@ static void app_sim_rate_slower(App *app)
     if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
 }
 
-/* One-line mutators — named so the binding table reads as intentions. */
+/* One-line actions, named so the key table below reads like a list of
+ * intentions. */
 static void app_toggle_pause     (App *app) { app->scene.paused = !app->scene.paused; }
 static void app_reset_attractor  (App *app) { scene_reset(&app->scene); }
 static void app_cycle_theme_next (App *app) { palette_state_cycle_next(&app->scene.palette); scene_apply_theme(&app->scene); }
@@ -1746,7 +1220,7 @@ static void app_cycle_theme_prev (App *app) { palette_state_cycle_prev(&app->sce
 static void app_cycle_preset_next(App *app)
 {
     preset_state_cycle_next(&app->scene.preset);
-    scene_reset(&app->scene);   /* per-preset ε requires re-seeding */
+    scene_reset(&app->scene);   /* new preset, new starting gap — start over */
 }
 static void app_cycle_preset_prev(App *app)
 {
@@ -1756,7 +1230,8 @@ static void app_cycle_preset_prev(App *app)
 
 static bool app_handle_key(App *app, int ch);
 
-/* app_poll_keyboard — non-blocking getch + dispatch.  false = quit. */
+/* Check for a keypress without blocking and act on it. Returns false
+ * when the key means "quit". */
 static bool app_poll_keyboard(App *app)
 {
     int ch = getch();
@@ -1764,7 +1239,7 @@ static bool app_poll_keyboard(App *app)
     return app_handle_key(app, ch);
 }
 
-/* app_handle_key — key-binding table; each case calls ONE named mutator. */
+/* Which key does what. */
 static bool app_handle_key(App *app, int ch)
 {
     switch (ch) {
@@ -1783,21 +1258,16 @@ static bool app_handle_key(App *app, int ch)
 }
 
 /*
- * FrameClock — wall-clock + accumulator state for the main loop.
+ * FrameClock — the timekeeping the main loop carries around.
  *
- * INTENT
- *   Bundle the 5 timing locals (frame_time, sim_accum, fps_accum,
- *   frame_count, fps_display) into ONE named concept so main() reads
- *   as a pseudocode driver.  Threading them through helpers as a
- *   single FrameClock* removes 5 separate parameter lists.
+ * Bundles the five running timers so main() can read like a short
+ * recipe instead of juggling five loose locals everywhere.
  *
- * MEMBER LOGIC
- *   frame_time  : wall-clock ns at the START of the previous frame.
- *   sim_accum   : ns of unspent simulation time, drained in multiples
- *                 of TICK_NS(sim_fps) by app_drain_fixed_timestep.
- *   fps_accum   : ns elapsed since the last fps recalculation.
- *   frame_count : frames rendered since the last fps recalc.
- *   fps_display : displayed fps, refreshed every FPS_UPDATE_MS.
+ *   frame_time  : when the previous frame started.
+ *   sim_accum   : time owed to the simulation, paid off in fixed steps.
+ *   fps_accum   : time piled up since we last recomputed the fps number.
+ *   frame_count : frames drawn since then.
+ *   fps_display : the frame rate currently shown in the HUD.
  */
 typedef struct {
     int64_t frame_time;
@@ -1827,7 +1297,8 @@ static void frame_clock_advance(FrameClock *c, int64_t dt)
     c->frame_count++;
 }
 
-/* main — the whole simulation as a pseudocode driver. */
+/* The whole program in one loop: handle resize, advance time, step the
+ * sim, draw, check for a key, repeat until quit. */
 int main(void)
 {
     main_install_signal_handlers();

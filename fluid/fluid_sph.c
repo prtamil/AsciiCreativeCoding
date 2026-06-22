@@ -1,698 +1,20 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * fluid_sph.c — interactive Smoothed Particle Hydrodynamics (SPH) playground
+ * fluid_sph.c — a pool of particles that behaves like water.
  *
- * DEMO: A pool of 800-3000 particles behaves like compressible fluid.
- *       Drop a blob, slam two fronts together, fire a fountain, watch
- *       a rain curtain pile up.  Five preset SCENES (1..5), TEN colour
- *       themes (t to cycle), GRAVITY and VISCOSITY toggleable on the
- *       fly (g, v).  Every particle continuously estimates its local
- *       DENSITY from neighbours; pressure and cohesion forces emerge
- *       from density excess / shortfall.  No grid solver, no Navier-
- *       Stokes — just N particles + a smoothing kernel + a spatial
- *       hash for speed.  Yet you get fluid-like behaviour: surface
- *       tension, sloshing, splashing, settling.
+ * Each particle is one drop.  Every tick we measure how crowded each
+ * drop is, push crowded drops apart and pull lonely ones together, let
+ * neighbours match speeds, add gravity, and bounce off the walls.  Out
+ * of those few local rules you get splashing, sloshing, and a visible
+ * surface.  No fluid equations on a grid — just particles + a smoothing
+ * kernel + a spatial hash for speed.  This is the particle (Lagrangian)
+ * approach; fluid/navier_stokes.c is the grid (Eulerian) sibling.
  *
- * Study alongside:
- *   fluid/navier_stokes.c     — the GRID-based alternative; same
- *                                physics goal but Eulerian instead of
- *                                Lagrangian.  Read T1 below to compare.
- *   fluid/cfl_stability_explorer.c
- *                              — CFL number, time-step stability;
- *                                applies to SPH too (T8).
- *   particle_systems/         — particle pools without inter-particle
- *                                forces (sparks, fireworks, embers).
- *   physics/cloth.c           — particles + spring forces; SPH's
- *                                pressure force is the analogue of
- *                                cloth's spring force.
- *
- * Section map:
- *   §1  config          — every tunable constant, grouped by subsystem
- *   §2  clock           — monotonic ns timer + sleep
- *   §3  rng             — small random helper
- *   §4  themes          — 10 palette triples + names
- *   §5  colors          — colors_apply_theme split into
- *                          apply_density_palette_xterm256 / _ansi8 +
- *                          apply_chrome_palette helpers
- *   §6  particle        — Particle struct + ParticlePool (file-scope
- *                          g_particle_pool) + spawn helpers
- *   §7  kernel          — SPH smoothing kernel (compact-support tent²)
- *   §8  grid            — spatial-hash linked-list grid (file-scope
- *                          g_spatial_grid)
- *   §8.5 scene types    — World + SimControls + Scene typedefs hoisted
- *                          here so §9–§12 SPH passes can take
- *                          `const Scene *s` (Scene contains Grid *)
- *   §9  density_pass    — neighbour density estimation
- *   §10 forces_pass     — pressure + viscosity acceleration
- *                          (reads s->sim.gravity_enabled / .viscosity_enabled)
- *   §11 integrate_pass  — symplectic Euler + wall bounce
- *                          (reads s->world.width / .height)
- *   §12 sph_step        — full physics tick (4 passes), takes Scene *
- *   §13 scenes          — 5 scene loaders, each takes Scene *
- *   §14 scene           — scene_init / scene_tick (scene type lives in §8.5)
- *   §15 render_particles— density → glyph + colour (DensityRender)
- *   §16 render_border   — frame around the simulation area; split into
- *                          draw_horizontal_edges / _vertical_edges /
- *                          _corners helpers
- *   §17 hud             — top status + bottom hint strip
- *   §18 screen          — ncurses init / cleanup
- *   §19 app             — FpsCounter + App; key dispatch decomposed
- *                          into named action helpers (cycle_theme,
- *                          adjust_sim_hz, spawn_random_top_blob,
- *                          select_scene_preset); main loop + signals
- *   §20 main            — entry point (8 numbered phases)
- *
- * Keys:
- *   q / Q / ESC   quit
- *   space         pause / resume
- *   1 .. 5        load scene (blob / column / fountain / collision / rain)
- *   g             toggle gravity
- *   v             toggle viscosity
- *   r             reset (reload current scene)
- *   b             spawn a small extra blob at top
- *   t             cycle colour theme
- *   ] / [         simulation Hz +/-
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra fluid/fluid_sph.c -o fluid_sph \
- *       -lncurses -lm
+ * Method: Smoothed Particle Hydrodynamics.  Originals: Lucy 1977;
+ *   Gingold & Monaghan 1977.  Real-time form used here: Müller,
+ *   Charypar & Gross 2003.  Spatial-hash neighbour search: Teschner
+ *   et al. 2003.  Density-to-character ramp idea: Bourke 1997.
  */
-
-/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
- *      T1-T2 establish the SPH WORLDVIEW (Lagrangian particles + a
- *      smoothing kernel).  T3-T5 derive the physics passes.  T6
- *      explains symplectic Euler.  T7 explains the spatial hash for
- *      speed.  T8 closes the loop with stability conditions.
- *   2. §6 particle + §1 config — the data structure + the knobs.
- *      Together they describe the entire simulation state.
- *   3. §12 sph_step — four lines: grid_rebuild, density_pass,
- *      forces_pass, integrate_pass.  The whole physics is THERE; §9-§11
- *      are the bodies (each now a pseudocode orchestrator over named
- *      pair-loop / Euler helpers).
- *   4. §9 density_pass — read AFTER tutorial T3.
- *   5. §10 forces_pass — read AFTER tutorials T4 and T5.
- *   6. §11 integrate_pass — read AFTER tutorial T6.
- *   7. §13-§14 scenes / scene — orchestration.
- *   8. §15-§17 rendering / HUD — visual layer.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   g_particle_pool.pool[]            global array of every Particle
- *   g_particle_pool.count             how many slots are in use
- *   p->pos_col, p->pos_row     position (in cell units)
- *   p->vel_col, p->vel_row     velocity (cells/step)
- *   p->accel_col, p->accel_row force accumulator for one step
- *   p->density_estimate        ρᵢ = Σ kernel²
- *
- *   distance_cells             |pᵢ - pⱼ| in cell units
- *   kernel_signed              w = d/H - 1 (negative inside support)
- *   kernel_squared             w² (always non-negative; used for ρ)
- *
- *   g_spatial_grid.head[gy][gx]          first particle index in cell (gy, gx)
- *   g_spatial_grid.next[i]               next particle in same cell as i, or -1
- *
- *   scene.active_id            current scene preset (1..SCENE_COUNT)
- *   scene.theme_index          current theme (0..THEME_COUNT-1)
- *   scene.sim.paused           run/pause toggle
- *   scene.sim.gravity_enabled  gravity force toggle ('g' key)
- *   scene.sim.viscosity_enabled viscosity force toggle ('v' key)
- *   scene.world.width / .height physics-area extent (cells)
- *
- *   app.sim_hz                 physics tick rate (Hz; '[' / ']' keys)
- *   app.fps.display            smoothed fps shown in HUD
- *
- * Background you need
- * ───────────────────
- *   - Newton's second law (F = m·a; we treat m = 1).
- *   - Vectors as (col, row) or (x, y) interchangeably; physics is 2-D
- *     in cell space (no separate pixel coordinates).
- *   - Gradients / forces from a potential ("denser than rest" → a
- *     repulsive force, a la a spring).
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Navier-Stokes equations.  SPH is a PARTICLE method; it never
- *     writes ∂v/∂t = -∇p/ρ + ν∇²v explicitly.  See
- *     fluid/navier_stokes.c if you want the grid solver.
- *   - True incompressibility / projection step.  This file uses the
- *     simpler TAIT equation of state (T4), which makes the fluid
- *     SLIGHTLY compressible but cheap.
- *   - Variable density / multiphase fluid.  Single fluid, unit mass.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ───────────────────────────────────────────────────────── *
- *
- * Algorithm     : Smoothed Particle Hydrodynamics (SPH).  A LAGRANGIAN
- *                 fluid simulator: instead of tracking values on a
- *                 fixed grid (Eulerian), we track many small parcels
- *                 of fluid that MOVE WITH the flow.  Each particle
- *                 carries position, velocity, and a locally-estimated
- *                 density.  Forces between nearby particles cause
- *                 collective behaviour that LOOKS LIKE a fluid.
- *
- * Per tick:     1. BUILD SPATIAL HASH — map each particle to a grid
- *                  cell so neighbour lookup becomes O(1) amortised.
- *               2. DENSITY PASS — for each particle, sum kernel²
- *                  contributions from all neighbours.
- *               3. FORCES PASS — for each pair within kernel range:
- *                    a) PRESSURE FORCE proportional to (ρ_rest -
- *                       ρᵢ - ρⱼ).  Repulsive when overcrowded,
- *                       attractive when sparse — the implicit
- *                       Tait equation of state.
- *                    b) VISCOSITY FORCE proportional to (vⱼ - vᵢ).
- *                       Smooths velocity field; prevents tunnelling.
- *               4. INTEGRATE — symplectic Euler:
- *                       v += a·dt
- *                       x += v·dt    (uses NEW v, not old)
- *                  Then bounce off walls with energy loss.
- *
- * Math basis    : Compact-support tent kernel:
- *                       w(d) = (d/H) - 1     for d < H
- *                            = 0             for d ≥ H  (out of range)
- *                 Density:   ρᵢ = Σⱼ w(d_ij)²
- *                 Pressure:  F_pressure ∝ w · (ρ_rest - ρᵢ - ρⱼ)
- *                 Viscosity: F_visc     ∝ |w| · (vⱼ - vᵢ)
- *
- * Performance   : NAÏVE pair search is O(N²): every particle checks
- *                 every other.  With N=2000 that's 4M comparisons per
- *                 pass.  Replaced by a spatial-hash grid with cell
- *                 size ≥ kernel radius H.  Each particle now walks the
- *                 3×3 block of cells around it: ~50× speedup typical.
- *                 Hot-path numbers at N=1500: ~50k particle-pair
- *                 visits per pass; sub-millisecond.
- *
- * Boundary      : Hard walls.  When a particle exits the simulation
- *                 rectangle, push it back to the boundary and flip the
- *                 normal-component velocity, scaled by WALL_DAMPING <
- *                 1.0 to dissipate energy (otherwise the system gains
- *                 KE indefinitely from numerical errors).
- *
- * References
- * ──────────
- *   ── SPH foundations (1977 — two simultaneous discoveries) ─────────
- *   [1] Lucy, L. B. (1977), "A numerical approach to the testing of
- *       the fission hypothesis", Astron. J. 82, pp. 1013-1024 —
- *       ONE of the two original SPH papers, motivated by stellar
- *       fission simulation.
- *   [2] Gingold, R. A. & Monaghan, J. J. (1977), "Smoothed Particle
- *       Hydrodynamics: theory and application to non-spherical
- *       stars", Mon. Not. R. Astron. Soc. 181, pp. 375-389 — the
- *       OTHER original SPH paper, also 1977.  Modern SPH owes both.
- *   [3] Monaghan, J. J. (1992), "Smoothed Particle Hydrodynamics",
- *       Annu. Rev. Astron. Astrophys. 30, pp. 543-574 — rigorous
- *       SPH foundations and kernel theory.  Read for the proof that
- *       ∇·v at a particle = − (1/ρ)·dρ/dt, the key continuity link.
- *   [4] Monaghan, J. J. (2005), "Smoothed Particle Hydrodynamics",
- *       Rep. Prog. Phys. 68, pp. 1703-1759 — modernised review;
- *       covers tensile instability and the viscosity formulation
- *       used in §particle_step().
- *
- *   ── Real-time / graphics SPH ──────────────────────────────────────
- *   [5] Müller, M., Charypar, D. & Gross, M. (2003), "Particle-Based
- *       Fluid Simulation for Interactive Applications", ACM SIGGRAPH/
- *       Eurographics SCA — THE real-time SPH paper this implementation
- *       traces back to.  Source of the three poly6 / spiky / visc
- *       kernel choices used in §kernel.
- *   [6] Bridson, R. (2008), "Fluid Simulation for Computer Graphics",
- *       CRC Press — ch. 8 covers SPH side-by-side with grid solvers;
- *       useful comparison reading with [8].
- *
- *   ── Neighbour search ──────────────────────────────────────────────
- *   [7] Teschner, M. et al. (2003), "Optimized Spatial Hashing for
- *       Collision Detection of Deformable Objects", VMV — basis of
- *       the spatial-hash grid used in §grid_rebuild for O(N) neighbour
- *       queries instead of naive O(N²).
- *
- *   ── Comparison with the Eulerian approach ─────────────────────────
- *   [8] Stam, J. (1999), "Stable Fluids", SIGGRAPH — the Eulerian
- *       (grid-based) counterpart; project file fluid/navier_stokes.c
- *       uses this approach.  Same physics, different discretisation.
- *
- *   ── Rendering / ncurses ───────────────────────────────────────────
- *   [9] Bourke, P. (1997), "Character representation of grayscale
- *       images", paulbourke.net/dataformats/asciiart — design basis
- *       for the density-glyph ramp used by DensityRender.
- *  [10] Raymond, E. S., "NCURSES Programming HOWTO" —
- *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
- *       use_default_colors, and the newscr/curscr diff pipeline.
- *
- *   ── Online quick reference ────────────────────────────────────────
- *  [11] https://en.wikipedia.org/wiki/Smoothed-particle_hydrodynamics
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ───────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Imagine the fluid as a CROWD OF TINY DOTS, each with PERSONAL SPACE.
- * When dots get TOO CLOSE, they push each other apart (high local
- * density → repulsion).  When dots are FAR APART (low local density),
- * a weak attraction pulls them back together (surface tension).  The
- * dots also have a habit of MATCHING THEIR NEIGHBOURS' VELOCITIES
- * (viscosity).  Add gravity + walls.  That's it.  The fluid behaviour
- * (waves, splashing, settling) is EMERGENT from these three local
- * rules.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- *   Imagine a swimming pool full of bouncy beach balls (the
- *   particles).  Each ball:
- *     - Has roughly fixed volume — it doesn't like being squashed.
- *     - Drifts with its neighbours rather than fighting them.
- *     - Falls under gravity, bounces off the pool's sides.
- *   Watch a million such balls and the SURFACE LOOKS LIKE WATER even
- *   though no individual ball "knows" anything about fluids.  SPH is
- *   the math version of that.
- *
- * COMPARING SPH vs NAVIER-STOKES (Lagrangian vs Eulerian)
- * ───────────────────────────────────────────────────────
- *
- *      ┌────────────────────┬────────────────────────────────────┐
- *      │ SPH (this file)    │ Navier-Stokes grid (navier_stokes.c)│
- *      ├────────────────────┼────────────────────────────────────┤
- *      │ Particles MOVE.    │ Grid cells stay PUT.                │
- *      │ Density is         │ Velocity stored per cell.           │
- *      │  estimated from    │ Advection moves cell values.        │
- *      │  neighbour count.  │                                     │
- *      │ Implicit boundary  │ Explicit boundary masks.            │
- *      │  (particles just   │                                     │
- *      │  bounce).          │                                     │
- *      │ Adaptive: uses     │ Fixed resolution.                   │
- *      │  resolution where  │                                     │
- *      │  fluid is.         │                                     │
- *      │ Open surfaces are  │ Surfaces need an extra phase field  │
- *      │  "free."           │  or VOF tracker.                    │
- *      │ Compressibility    │ Incompressibility easy.             │
- *      │  via Tait EOS      │                                     │
- *      │  (slight artefact).│                                     │
- *      └────────────────────┴────────────────────────────────────┘
- *
- * Why SPH for ASCII fluid?
- *   - Particles map naturally to characters on a screen.
- *   - Free surfaces = thin layer where neighbour count drops →
- *     density-to-glyph mapping makes the surface VISIBLE for free.
- *   - No grid → simulation domain doesn't need a fixed shape;
- *     resize the terminal and walls follow.
- *
- * KEY FORMULAS
- * ────────────
- *
- *   KERNEL (compact-support tent²):
- *     w(d) = d/H - 1            for d < H
- *          = 0                   for d ≥ H
- *     w² = (d/H - 1)²           always ≥ 0
- *     "How much does a particle at distance d contribute to my
- *      neighbourhood?"  Answer: full at d=0, zero at d=H, smooth in
- *      between.  H is the SMOOTHING RADIUS in cell units.
- *
- *   DENSITY:
- *     ρᵢ = Σⱼ  w(d_ij)²            (sum over particles within H)
- *     "Crowded-ness" — high near a clump, low at the surface.
- *
- *   PRESSURE FORCE on i from j (Tait EOS, simplified):
- *     F_pressure(i ← j) = w(d_ij) · (ρ_rest - ρᵢ - ρⱼ) · K_pressure
- *                          / ρᵢ
- *     direction: along (pᵢ - pⱼ)
- *     - When ρᵢ + ρⱼ > ρ_rest (CROWDED), the (ρ_rest - ρᵢ - ρⱼ) term
- *       is NEGATIVE.  Multiplied by w (negative inside support), the
- *       force is POSITIVE along (pᵢ - pⱼ) — i.e. AWAY from j.
- *       REPULSION.
- *     - When ρᵢ + ρⱼ < ρ_rest (SPARSE), the term is POSITIVE,
- *       times w (negative) → NEGATIVE force = TOWARD j.  ATTRACTION
- *       (surface-tension analogue).
- *     - When equal, force = 0 (rest equilibrium).
- *
- *   VISCOSITY FORCE on i from j:
- *     F_viscosity(i ← j) = |w(d_ij)| · (vⱼ - vᵢ) · K_viscosity
- *     direction: along (vⱼ - vᵢ) — i.e. PULL i's velocity toward j's.
- *     Smooths the velocity field; prevents adjacent particles from
- *     ploughing through each other.
- *
- *   SYMPLECTIC EULER (one tick):
- *     vₙ₊₁ = vₙ + aₙ · dt           (update velocity FIRST)
- *     xₙ₊₁ = xₙ + vₙ₊₁ · dt          (use NEW velocity)
- *
- *   WALL BOUNCE (per axis):
- *     if x < x_min:  x = x_min;  vₓ = -vₓ · WALL_DAMPING
- *     if x > x_max:  x = x_max;  vₓ = -vₓ · WALL_DAMPING
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   - DIVISION BY DENSITY: if ρᵢ = 0 (an isolated particle with no
- *     neighbours), force / ρᵢ would NaN.  We add 0.001 in the
- *     denominator as a guard.
- *   - PARTICLES ESCAPING WALLS: if a single-step velocity exceeds the
- *     wall thickness, a particle could "tunnel" through.  Mitigated
- *     by capping SPH_DT below H / max_velocity (Courant condition).
- *   - GRID OVERFLOW: if the terminal grows huge, GMAX_W/GMAX_H limit
- *     the spatial-hash size; particles outside are clamped to the
- *     last cell (still works, just uneven distribution).
- *   - REST_SUM CALIBRATION: ρ_rest is hand-tuned for the kernel's
- *     "neutral packing density" at H = SMOOTH_RADIUS_CELLS.  Change
- *     H and ρ_rest must be re-tuned or the fluid will collapse or
- *     explode.
- *   - SPATIAL HASH CELL = 3 ≥ H = 2.2:  if you SHRINK GCELL below H,
- *     neighbours within H can fall outside the 3×3 cell block.
- *
- * HOW TO VERIFY
- * ─────────────
- *   - Scene 1 (blob): a sphere falls, splashes flat, settles to a
- *     pancake.  Surface stays visibly distinct from interior.
- *   - Scene 2 (column): a tall block collapses sideways like a
- *     liquid column losing its container.
- *   - Scene 3 (fountain): a dense stack at the floor erupts upward.
- *   - Scene 4 (collision): two blobs slam into each other and SLOSH.
- *   - Scene 5 (rain): top-down particles pile up.
- *   - Toggle 'g' (gravity OFF): particles drift to a Tait-EOS
- *     equilibrium — uniformly spaced grid-like packing.
- *   - Toggle 'v' (viscosity OFF): fluid becomes "rubbery" — pressure
- *     waves bounce visibly without damping.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
- *
- *   T1  What's a Lagrangian fluid simulator?
- *   T2  Smoothing kernel — compact support and tent²
- *   T3  Density estimation — counting weighted neighbours
- *   T4  Tait equation of state — pressure from density excess
- *   T5  Viscosity — velocity matching between neighbours
- *   T6  Symplectic Euler — why velocity update goes first
- *   T7  Spatial hash grid — O(N²) → O(N · k)
- *   T8  Stability — Courant, REST_SUM tuning, wall damping
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  WHAT'S A LAGRANGIAN FLUID SIMULATOR?
- * ────────────────────────────────────────
- * Two ways to simulate a fluid:
- *
- *   EULERIAN (grid-based)         LAGRANGIAN (particle-based)
- *   ─────────────────────         ─────────────────────────
- *                                                              .
- *   Fixed grid cells.             Particles MOVE freely.
- *   Each cell stores ρ, v, p.     Each particle stores its own
- *   Values FLOW through cells.     ρ, v.
- *   Need advection step.          Particles MOVE → no advection.
- *   Easy: incompressibility       Easy: free surfaces, splashes,
- *    via Poisson solve.            droplets.
- *   Hard: tracking surfaces       Hard: enforcing exact
- *    (need VOF/level-set).         incompressibility.
- *   Used in: Stable Fluids,       Used in: SPH (this file),
- *    weather models, smoke.        astrophysics, mud, snow.
- *
- * SPH = "Smoothed Particle Hydrodynamics."  Originally invented
- * for astrophysics (Lucy 1977, Gingold & Monaghan 1977) — modelling
- * star clusters and galaxies as point masses.  Adapted in the
- * 2000s for real-time graphics (Müller et al. 2003).  Your favourite
- * water fountain in a video game is almost certainly SPH or a
- * close cousin.
- *
- * The KEY INSIGHT of SPH:  if you can't carry a continuous density
- * field on a grid, ESTIMATE one at each particle from neighbours:
- *
- *     ρ(p) ≈ Σⱼ  m_j · w(|p - p_j|)
- *
- * where w(r) is a SMOOTHING KERNEL (smooth, peaked at r=0, zero
- * outside some radius H).  This converts particle positions into a
- * continuous density field on the fly.  Once you have ρ everywhere,
- * standard fluid physics applies.
- *
- * In this file we use UNIT MASS (m_j = 1) and the simpler estimator
- * ρᵢ = Σⱼ w(d_ij)² — the squared kernel makes the math simpler
- * downstream and gives the same qualitative behaviour.
- *
- * T2  SMOOTHING KERNEL — COMPACT SUPPORT AND TENT²
- * ────────────────────────────────────────────────
- * A smoothing kernel w(r) needs to:
- *
- *   1. Be SMOOTH (continuously differentiable).
- *   2. Be NON-NEGATIVE.
- *   3. Have COMPACT SUPPORT — be exactly zero for r ≥ H.
- *      (Otherwise every particle interacts with every other;
- *       neighbour search is impossible.)
- *   4. INTEGRATE TO 1 over its support (so density estimates make
- *      sense).
- *
- * The simplest kernel meeting these is the LINEAR TENT:
- *
- *     w_tent(r) = max(0, 1 - r/H)
- *
- * It's smooth(ish) and compact, but not C¹ at r = H (sharp
- * shoulder).  Squaring it gives the TENT² we use:
- *
- *     w_tent²(r) = (1 - r/H)²       for r < H
- *               = 0                  for r ≥ H
- *
- * Properties:
- *   - = 1 at r = 0 (peak)
- *   - = 0 at r = H (smooth shoulder, C¹ now)
- *   - quadratic between
- *
- * In code we store w SIGNED (= d/H - 1, NEGATIVE inside support)
- * and only square it where needed.  This is a tiny optimisation and
- * convenient: the SIGN of w gives the SIGN of pressure force directly
- * (T4 derivation).
- *
- *      ┌───────────────────────────────────────────────────────┐
- *      │                                                       │
- *      │    1 ┤●                                              │
- *      │      │  ●                                             │
- *      │      │    ●●                                          │
- *      │      │       ●●●                                      │
- *      │      │           ●●●●●                                │
- *      │      │                  ●●●●●●●●                      │
- *      │    0 ┤────────────────────────●───────────            │
- *      │      0                        H            r          │
- *      │                                                       │
- *      │      "compact support" = identically zero for r ≥ H    │
- *      │                                                       │
- *      └───────────────────────────────────────────────────────┘
- *
- * H = SMOOTH_RADIUS_CELLS = 2.2 cells in this file.  At unit
- * particle spacing, that means ~15 particles inside any one
- * particle's kernel.
- *
- * T3  DENSITY ESTIMATION — COUNTING WEIGHTED NEIGHBOURS
- * ─────────────────────────────────────────────────────
- * The DENSITY at particle i:
- *
- *     ρᵢ = Σⱼ  w(d_ij)²
- *
- * where the sum is over EVERY particle j (in practice only those
- * with d_ij < H, since w² = 0 outside).  Including SELF (d_ii = 0)
- * gives a baseline of w(0)² = 1, so ρᵢ ≥ 1 always.
- *
- * Worked example.  Take a particle in the middle of a uniformly-
- * packed clump at unit spacing.  Inside H = 2.2 there are roughly:
- *   - 1 self (d = 0, w² = 1)
- *   - 4 nearest neighbours at d=1 (w = 1/2.2 - 1 = -0.545,
- *                                  w² ≈ 0.297, total 1.19)
- *   - 4 diagonals at d ≈ 1.41 (w ≈ -0.36, w² ≈ 0.13, total 0.52)
- *   - 4 next-cell neighbours at d=2 (w ≈ -0.09, w² ≈ 0.008, total 0.03)
- *
- *   ρᵢ ≈ 1 + 1.19 + 0.52 + 0.03  ≈  2.74  ≈  3
- *
- * This "natural packing density ≈ 3" is the calibration anchor
- * for REST_SUM = 6 (= ρᵢ + ρⱼ at equilibrium pair).
- *
- * IMPLEMENTATION (§9): for each particle i, walk the 3×3 grid cells
- * around it (T7), compute distance to each particle j in those cells,
- * accumulate w² into ρᵢ.  ~15 evaluations per particle.
- *
- * T4  TAIT EQUATION OF STATE — PRESSURE FROM DENSITY EXCESS
- * ─────────────────────────────────────────────────────────
- * In a real fluid, PRESSURE is some FUNCTION of density:
- *
- *     p = f(ρ)              equation of state (EOS)
- *
- * For incompressible flow, p adjusts to keep ρ exactly constant —
- * but that requires solving a Poisson equation each step (expensive).
- *
- * The TAIT EOS is the cheap compromise:
- *
- *     p = K · (ρ - ρ_rest)
- *
- * Pressure is LINEARLY proportional to density excess.  Crowded
- * region → positive pressure → outward force.  Sparse region →
- * negative pressure → inward force ("cohesion").  K is the
- * STIFFNESS — bigger K → stiffer fluid (more incompressible).
- *
- * In SPH, the pressure FORCE on particle i from neighbour j is:
- *
- *     F_pressure(i←j) = ∇w(d_ij) · (pᵢ + pⱼ) / 2 · 1/ρⱼ
- *
- * Various simplifications get us to the form used in this file:
- *
- *     F_pressure(i←j) ∝ w(d_ij) · (ρ_rest - ρᵢ - ρⱼ) · K_pressure
- *                       direction: (xᵢ - xⱼ)
- *
- * Now check the SIGN:
- *
- *   Crowded (ρᵢ + ρⱼ > ρ_rest):
- *     (ρ_rest - ρᵢ - ρⱼ) < 0
- *     w < 0 (always inside support)
- *     product > 0
- *     direction is along (xᵢ - xⱼ) — i.e. AWAY from j  ✓ REPULSION
- *
- *   Sparse (ρᵢ + ρⱼ < ρ_rest):
- *     (ρ_rest - ρᵢ - ρⱼ) > 0
- *     w < 0
- *     product < 0
- *     direction is along (xⱼ - xᵢ) — i.e. TOWARD j     ✓ COHESION
- *
- *   Balanced: force = 0.  ✓ EQUILIBRIUM.
- *
- * So one expression handles both repulsion and cohesion, and the
- * sign of w (not its magnitude) does the switching.  Tidy.
- *
- * The cohesion gives surface tension for free: a particle near the
- * SURFACE of a blob has fewer neighbours → its ρᵢ is LOW → the
- * (ρ_rest - ρᵢ - ρⱼ) term is positive → it gets pulled INWARD.
- * The surface "wants" to minimise area — exactly surface tension.
- *
- * T5  VISCOSITY — VELOCITY MATCHING BETWEEN NEIGHBOURS
- * ────────────────────────────────────────────────────
- * Real-fluid viscosity diffuses momentum between neighbouring
- * parcels.  In SPH:
- *
- *     F_viscosity(i←j) = (vⱼ - vᵢ) · |w(d_ij)| · K_viscosity
- *
- * Particle i is PUSHED TOWARD neighbour j's velocity.  Big difference
- * → big force.  Same velocity → no force.
- *
- * This matters mainly for STABILITY: without viscosity, particles
- * with high velocity differences plough through each other,
- * crystalline patterns persist forever, and the simulation looks
- * "rubbery" rather than "fluid."  Toggle 'v' to see this in action.
- *
- * Note: real viscosity is FRAME-INVARIANT (only relative velocity
- * matters).  Our formulation respects that — (vⱼ - vᵢ) is the
- * relative velocity.  So adding a constant velocity to the whole
- * fluid produces no spurious viscous force.
- *
- * T6  SYMPLECTIC EULER — WHY VELOCITY UPDATE GOES FIRST
- * ─────────────────────────────────────────────────────
- * Standard FORWARD EULER:
- *
- *     xₙ₊₁ = xₙ + vₙ · dt
- *     vₙ₊₁ = vₙ + aₙ · dt
- *
- * Compute new x using OLD v, then update v.  Simple, intuitive,
- * UNSTABLE for oscillatory systems: energy slowly grows over time,
- * orbits spiral outward, springs explode.
- *
- * SYMPLECTIC EULER (also called "Euler-Cromer"):
- *
- *     vₙ₊₁ = vₙ + aₙ · dt    ◄── update velocity FIRST
- *     xₙ₊₁ = xₙ + vₙ₊₁ · dt   ◄── use NEW velocity
- *
- * Mathematically: this scheme PRESERVES the SYMPLECTIC FORM of
- * Hamiltonian dynamics (the "phase space volume" stays constant).
- * Practically: energy doesn't grow without bound, oscillators stay
- * bounded, particle systems with stiff springs (like SPH pressure
- * forces) don't explode.
- *
- * The only trick: write velocity update BEFORE position update.
- * One line of code; massive stability difference.
- *
- *      ┌───────────────────────────────────────────────────────┐
- *      │                                                       │
- *      │  Forward Euler on a spring:        Symplectic Euler:  │
- *      │                                                       │
- *      │      ●     spirals outward            ●               │
- *      │     ╱╲                              ╱   ╲             │
- *      │    ╱  ╲                            ●     ●            │
- *      │   ●    ●                            ╲   ╱             │
- *      │    ╲  ╱     each loop is               ●              │
- *      │     ╲╱       BIGGER (gains energy)    bounded loop    │
- *      │                                                       │
- *      └───────────────────────────────────────────────────────┘
- *
- * For SPH, where pressure forces are very stiff (high K_pressure),
- * standard Euler would explode within ~10 ticks.  Symplectic keeps
- * the same dt.
- *
- * T7  SPATIAL HASH GRID — O(N²) → O(N · k)
- * ────────────────────────────────────────
- * Naïve neighbour search: for every particle i, loop over every
- * particle j.  Cost: O(N²).  At N=1500 that's 2.25M comparisons
- * per pass, 4.5M per step (density + forces), 270M/sec at 60 Hz.
- * Slow.
- *
- * INSIGHT: the kernel has compact support — particles farther
- * than H contribute nothing.  Build a grid of CELLS of side ≥ H.
- * Each particle hashes into a cell.  All neighbours within H are
- * GUARANTEED to be in the 3×3 cell block around the particle's
- * cell.  Cost: O(N · k) where k = avg particles in 3×3 ≈ 9 ·
- * (N / cells).  For 1500 particles in a 30×8 grid that's
- * ~9 · 6 = 54 comparisons per particle.  ~30× speedup.
- *
- * Implementation (§8): linked-list-per-cell.  Two arrays:
- *
- *     g_spatial_grid.head[gy][gx]  = index of FIRST particle in cell (gy, gx)
- *     g_spatial_grid.next[i]       = index of NEXT particle in same cell as i
- *     terminator         = -1
- *
- * Build: O(N).  Iterate: walk g_spatial_grid.head[gy][gx], g_spatial_grid.next[i], ...
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   g_spatial_grid.head[gy][gx] ──► p_3 ─► p_8 ─► p_42 ─► -1│
- *      │                                                  │
- *      │   g_spatial_grid.next[3]  =  8                             │
- *      │   g_spatial_grid.next[8]  = 42                             │
- *      │   g_spatial_grid.next[42] = -1                             │
- *      │                                                  │
- *      │   walk pattern:                                  │
- *      │     for j = g_spatial_grid.head[gy][gx]; j != -1;          │
- *      │            j = g_spatial_grid.next[j]) { ... }             │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * T8  STABILITY — COURANT, REST_SUM TUNING, WALL DAMPING
- * ──────────────────────────────────────────────────────
- * Three knobs that determine whether SPH stays stable:
- *
- * (1) COURANT CONDITION on dt.  A particle should NOT move more
- *     than one kernel radius in one step.  Otherwise it could
- *     skip past neighbours entirely:
- *
- *        dt < H / max_velocity
- *
- *     With H = 2.2 and observed max v ≈ 18 cells/sec, dt < 0.12
- *     is safe.  We hard-code SPH_DT = 0.12; the CFL margin
- *     remains positive in all five scenes.
- *
- * (2) REST_SUM CALIBRATION.  REST_SUM = 6 is the (ρᵢ + ρⱼ) value
- *     at which pressure force = 0.  T3 worked example showed
- *     ρᵢ ≈ 3 for natural packing; pair sum = 3 + 3 = 6.  ✓
- *
- *     If REST_SUM is too SMALL, the fluid is COMPRESSED at
- *     equilibrium (denser than nature wants) — leads to under-
- *     puffed appearance.
- *     If too LARGE, the fluid wants to PUFF UP — particles drift
- *     apart unnaturally.
- *
- * (3) WALL DAMPING.  Without it, a particle bouncing off the
- *     floor returns with the same |v|.  Stack up many particles
- *     and energy ACCUMULATES from numerical errors → explosion.
- *     WALL_DAMPING = 0.6 keeps 60% of the kinetic energy on
- *     bounce; the other 40% leaves the simulation as "heat."
- *     Without this dissipation channel, the fluid gradually heats
- *     up.
- *
- * Together: SPH_DT respects Courant, REST_SUM matches the kernel,
- * WALL_DAMPING bleeds energy.  All three are interrelated; tweak
- * one and you may need to tweak the others.
- *
- * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -709,72 +31,71 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config — every constant in one place                              */
-/* ===================================================================== */
+/* ── §1  config — every tunable in one place ── */
 /*
- * No magic numbers below this section: every literal in the code is
- * a NAME defined here.  Knobs grouped by subsystem so you can find
- * the one that controls the behaviour you want to change.
+ * Everything the code can vary lives here as a named constant, so there
+ * are no bare numbers buried in the logic below.  Grouped by topic.
  */
 
-/* ── PARTICLE POOL ── */
+/* particle pool */
 #define PARTICLE_POOL_CAPACITY 5000
 
-/* ── SPH PHYSICS CONSTANTS ── */
+/* SPH physics */
 
-/* Kernel support radius (cells).  Particles within this distance
- * contribute to each other's density and forces. */
+/* How far a particle's influence reaches, in cells.  Two particles
+ * affect each other only when closer than this. */
 #define SMOOTH_RADIUS_CELLS 2.2
 
-/* Pressure stiffness K (Tait EOS coefficient).  Higher = stiffer
- * fluid (more incompressible) but unstable at large dt.  Tuned
- * jointly with SPH_DT for stability. */
+/* How stiff the fluid is.  Bigger = resists being squashed harder, but
+ * the simulation blows up if you push it too far for the chosen step. */
 #define PRESSURE_K 0.04
 
-/* Viscosity coefficient.  Velocity smoothing rate. */
+/* How strongly neighbours drag each other's speed into agreement. */
 #define VISCOSITY_K 0.03
 
-/* Gravity (cells / step²).  Low value avoids tunnelling through
- * floor at SPH_DT. */
+/* Downward pull per step.  Kept small so a fast drop can't jump clean
+ * through the floor in one step. */
 #define GRAVITY_G 0.08
 
-/* Wall energy retention on bounce.  0.6 = 60% kinetic energy kept;
- * 40% drained as "heat" (T8 reasoning). */
+/* How bouncy the walls are.  0.6 = keep 60% of the speed on a bounce,
+ * lose the rest as "heat" — that loss is what stops the pool slowly
+ * pumping itself up to an explosion from rounding errors. */
 #define WALL_DAMPING 0.6
 
-/* Fixed physics timestep (seconds-equivalent; units of cells per
- * step).  Honours Courant: dt < H / v_max. */
+/* Fixed amount of simulated time per physics step.  Small enough that a
+ * particle never moves more than about one influence-radius per step. */
 #define SPH_DT 0.12
 
-/* Density target at rest equilibrium.  pressure = 0 when
- * ρᵢ + ρⱼ = REST_SUM.  Calibrated for SMOOTH_RADIUS_CELLS = 2.2. */
+/* The crowd level a settled fluid wants.  When two neighbours' crowding
+ * adds up to this, they neither push nor pull.  Tuned to the radius. */
 #define REST_SUM 6.0
 
-/* Numerical guard so we never divide by zero density. */
+/* Tiny number added to a divisor so a lonely particle never divides by
+ * zero crowding. */
 #define DENSITY_DIVIDE_GUARD 0.001
 
-/* ── SPATIAL HASH GRID ── */
+/* spatial-hash grid */
 
-/* Cell side (cells).  Must be ≥ SMOOTH_RADIUS_CELLS so a 3×3
- * neighbourhood covers the kernel support. */
+/* Side of one grid cell, in cells.  Must be at least the influence
+ * radius so a particle's neighbours are always in the 3x3 block of
+ * cells around it. */
 #define GRID_CELL_SIZE 3
 
-/* Hard maximum grid dimensions (compile-time array bound). */
+/* Largest grid we'll ever allocate (caps the fixed arrays). */
 #define GRID_COLS_MAX 90
 #define GRID_ROWS_MAX 22
 
-/* ── DENSITY → GLYPH ZONES ── */
+/* density -> character */
 
-/* Density thresholds for character / colour selection in §15. */
+/* Crowding cutoffs that pick the glyph + colour in §15. */
 #define DENSITY_THRESHOLD_CORE 3.5 /* dense interior  '#' bold */
 #define DENSITY_THRESHOLD_BODY 1.2 /* fluid body       'o'      */
 #define DENSITY_THRESHOLD_EDGE 0.1 /* sparse edge      '.'      */
 
-/* ── HUD ── */
+/* HUD: bottom rows reserved for the status + key strip */
 #define HUD_RESERVED_ROWS 2
 
-/* ── COLOUR PAIRS ── */
+/* colour pairs */
 enum {
   PAIR_DENSITY_CORE = 1,
   PAIR_DENSITY_BODY,
@@ -784,13 +105,10 @@ enum {
   PAIR_HINT,
 };
 
-/* ── SCENE COUNT ── */
 #define SCENE_COUNT 5
-
-/* ── THEMES ── */
 #define THEME_COUNT 10
 
-/* ── FRAMEWORK TIMING ── */
+/* frame + sim timing */
 #define SIM_HZ_MIN 10
 #define SIM_HZ_DEFAULT 60
 #define SIM_HZ_MAX 120
@@ -802,9 +120,7 @@ enum {
 #define NS_PER_MS 1000000LL
 #define TICK_NS(hz) (NS_PER_SEC / (hz))
 
-/* ===================================================================== */
-/* §2  clock — monotonic ns timer + sleep                                */
-/* ===================================================================== */
+/* ── §2  clock — a steady timer + sleep ── */
 
 static int64_t clock_now_ns(void) {
   struct timespec ts;
@@ -819,9 +135,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  rng — small random helper                                         */
-/* ===================================================================== */
+/* ── §3  rng — small random helper ── */
 
 static int rand_in_range(int lo, int hi_exclusive) {
   if (hi_exclusive <= lo)
@@ -829,60 +143,26 @@ static int rand_in_range(int lo, int hi_exclusive) {
   return lo + rand() % (hi_exclusive - lo);
 }
 
-/* ===================================================================== */
-/* §4  themes — 10 palette triples + names                               */
-/* ===================================================================== */
-/*
- * Each theme is { core_xterm256, body_xterm256, edge_xterm256 }.
- * Core is the densest interior, edge is the sparsest surface;
- * the gradient should read as "less dense" left-to-right.
- *
- * All three colour values lie in the BRIGHT half of the 256-cube
- * (≥ 24), so they remain visible against the default-black
- * background even at A_NORMAL weight.
- */
+/* ── §4  themes — 10 colour sets + names ── */
 
 /*
- * ColorTheme — three-tier palette for one density-glyph theme.
+ * ColorTheme — three colours for one look of the fluid.
  *
- * Intent
- *   The density renderer paints each grid cell with a glyph chosen by
- *   the cell's smoothed-density tier (high / mid / low ≈ liquid core
- *   / body / edge spray).  Each tier needs a colour pair, so a theme
- *   is exactly three 256-cube indices + a name.
+ * The fluid is drawn in three crowding levels — dense core, body, and
+ * thin edge/spray — so a theme just needs one colour for each, plus a
+ * name to show in the HUD.  Three levels (not a fine gradient) is
+ * plenty here: it's the SHAPE of the fluid that carries the picture,
+ * not subtle shading within it.
  *
- * Why three tiers (not 8 like the wave demos)
- *   Density has a much narrower visible range than amplitude — it's
- *   always positive and bounded by particle count.  Three tiers map
- *   cleanly onto the three glyphs in the density ramp ('@' '*' '.')
- *   and don't require fine ramp colours.  Trade: lower visual
- *   resolution, but the spatial structure (the FLUID SHAPE) is what
- *   carries the demo, not subtle gradients within the fluid.
+ * All three colours are kept reasonably bright (index >= 24) so even
+ * the dim edge colour shows up against a black terminal; the very dark
+ * end of the palette would just vanish.  init_pair turns these into
+ * live colour pairs (Raymond's NCURSES HOWTO).
  *
- * Brightness rule (CLAUDE.md "Theme Palette Brightness")
- *   All values are kept ≥ 24 so even `edge` (the dimmest tier) stays
- *   visible against the default background.  Cube indices 16–23 and
- *   gray 232–239 are FORBIDDEN — they render as black.
- *
- * Reference [10] Raymond's NCURSES HOWTO §6 — init_pair semantics
- *   that turn these triples into live colour pairs.
- */
-/*
- * Members
- *   core   xterm-256 foreground index for the densest tier
- *          (T_CORE threshold).  Glyph '#'.
- *   body   medium-density tier (T_BODY threshold).  Glyph 'o'.
- *   edge   low-density tier (T_EDGE threshold).  Glyph '.'.
- *          Surface particles render in this colour — makes the
- *          fluid's FREE SURFACE visually distinct from the bulk.
- *   name   short ASCII label shown in the HUD ("ocean", "lava",
- *          "fire", …).  Cycled by the 't' key.
- *
- * Invariants
- *   All three foreground indices ∈ [24, 255] per the project
- *   palette-brightness rule (CLAUDE.md §"Theme Palette Brightness").
- *   Cube 16–23 and gray 232–239 render as black on default-black
- *   terminals and are forbidden — A_DIM there is invisible.
+ *   core   colour of the densest cells (drawn as '#')
+ *   body   colour of the mid cells     (drawn as 'o')
+ *   edge   colour of the thin surface / droplets (drawn as '.')
+ *   name   short label shown in the HUD; the 't' key cycles themes
  */
 typedef struct {
     short       core;     /* densest cells (liquid core)              */
@@ -892,50 +172,41 @@ typedef struct {
 } ColorTheme;
 
 static const ColorTheme color_theme_table[THEME_COUNT] = {
-    {51, 39, 27, "ocean"},     /* cyan → blue                      */
-    {196, 208, 220, "lava"},   /* red → orange → yellow            */
-    {226, 214, 196, "fire"},   /* white-yellow → orange → red      */
-    {46, 34, 28, "matrix"},    /* bright green → mid → dark        */
-    {231, 141, 93, "nova"},    /* white → violet → purple          */
-    {231, 159, 117, "ice"},    /* white → sky → steel              */
-    {220, 208, 197, "sunset"}, /* yellow → orange → rose           */
-    {196, 160, 124, "blood"},  /* bright red → crimson → dark      */
-    {201, 198, 165, "neon"},   /* magenta → pink → soft purple     */
-    {154, 118, 46, "acid"},    /* yellow-green → green             */
+    {51, 39, 27, "ocean"},     /* cyan to blue                     */
+    {196, 208, 220, "lava"},   /* red to orange to yellow          */
+    {226, 214, 196, "fire"},   /* white-yellow to orange to red    */
+    {46, 34, 28, "matrix"},    /* bright green to mid to dark      */
+    {231, 141, 93, "nova"},    /* white to violet to purple        */
+    {231, 159, 117, "ice"},    /* white to sky to steel            */
+    {220, 208, 197, "sunset"}, /* yellow to orange to rose         */
+    {196, 160, 124, "blood"},  /* bright red to crimson to dark    */
+    {201, 198, 165, "neon"},   /* magenta to pink to soft purple   */
+    {154, 118, 46, "acid"},    /* yellow-green to green            */
 };
 
-/* ===================================================================== */
-/* §5  colors — pair init + theme apply                                  */
-/* ===================================================================== */
+/* ── §5  colours — set up the colour pairs ── */
 
-/* Canonical bright xterm-256 indices for the project-standard HUD pairs
- * (CLAUDE.md §"HUD Standard"). */
+/* Fixed bright colours for the HUD and border (the project standard). */
 enum {
     HUD_YELLOW_256 = 226,
     HUD_CYAN_256   = 51,
     BORDER_GRAY_256 = 244,
 };
 
-/* apply_density_palette_xterm256 — register the three theme-driven
- * density pairs (core/body/edge) on terminals with the 256-colour
- * cube available. */
 static inline void apply_density_palette_xterm256(const ColorTheme *theme) {
     init_pair(PAIR_DENSITY_CORE, theme->core, -1);
     init_pair(PAIR_DENSITY_BODY, theme->body, -1);
     init_pair(PAIR_DENSITY_EDGE, theme->edge, -1);
 }
 
-/* apply_density_palette_ansi8 — closest-equivalent ANSI-8 fallback
- * (used when COLORS < 256). */
+/* Fallback for old terminals with only 8 colours. */
 static inline void apply_density_palette_ansi8(void) {
     init_pair(PAIR_DENSITY_CORE, COLOR_CYAN, -1);
     init_pair(PAIR_DENSITY_BODY, COLOR_CYAN, -1);
     init_pair(PAIR_DENSITY_EDGE, COLOR_BLUE, -1);
 }
 
-/* apply_chrome_palette — theme-INDEPENDENT pairs (border + HUD + hint).
- * Set on every theme switch so a future per-theme tweak can override,
- * but currently all themes share the same chrome. */
+/* Border + HUD colours, which don't change with the theme. */
 static inline void apply_chrome_palette(bool have_256_colors) {
     if (have_256_colors) {
         init_pair(PAIR_BORDER, BORDER_GRAY_256, -1);
@@ -965,132 +236,54 @@ static void colors_init(int theme_index) {
   colors_apply_theme(theme_index);
 }
 
-/* ===================================================================== */
-/* §6  particle — Particle struct + global pool + spawn helpers          */
-/* ===================================================================== */
-/*
- * The simulation state is the particle pool — a fixed-size array
- * with a count.  Fields use long descriptive names; positions and
- * velocities are in CELL UNITS (the screen IS the physics grid).
- */
+/* ── §6  particle — the drop, the pool, and how to spawn them ── */
 
 /*
- * Particle — one fluid sample point.
+ * Particle — one drop of fluid.
  *
- * Intent
- *   In SPH the fluid is represented by N samples that each carry
- *   position, velocity, and a few local field values.  The continuous
- *   field A(x) at any point is reconstructed by summing
- *   contributions from nearby particles:
+ * The whole fluid is just a big bag of these.  Each drop carries where
+ * it is, how fast it's going, a running total of the forces pushed onto
+ * it this step, and a number for how crowded its neighbourhood is.
  *
- *       A(x) = Σⱼ mⱼ · (Aⱼ / ρⱼ) · W(|x − xⱼ|, h)
+ * The crowding number is worked out once per step and then read several
+ * times (the force step needs it for this drop AND its neighbours, and
+ * the renderer uses it to pick a character).  Caching it on the drop
+ * means we don't re-measure the neighbourhood every time we need it.
  *
- *   where W is the smoothing kernel (§4) and h is the smoothing
- *   radius.  Each particle therefore needs (pos, vel) for its motion
- *   plus a CACHED LOCAL DENSITY so the next pass can evaluate
- *   pressure forces without re-summing kernel values.
+ * Positions and speeds are in CELL units — the terminal grid IS the
+ * playing field, there's no separate pixel space.  Stored as double
+ * because the force math subtracts small nearly-equal numbers and
+ * floats would lose them in noise.
  *
- * Why density_estimate is cached on the particle
- *   The pressure-force pass needs ρᵢ for both itself and its
- *   neighbours.  Computing ρ once per step (in density-pass) and
- *   reading it back during force-pass turns a doubly-nested loop into
- *   two single passes — see §particle_step and Müller §3.3 [5].
- *
- * Why explicit accel accumulators
- *   Forces from gravity, pressure, and viscosity arrive in three
- *   separate sub-passes.  Splitting them as accumulators (rather
- *   than computing a∑ in one mega-loop) makes each force law
- *   independently testable and matches the structure in [5].
- *
- * Why double, not float
- *   Many SPH viscosity / pressure terms involve products of small
- *   differences.  Single-precision can underflow into noise; the
- *   ~50 % extra cost of doubles is invisible at our N (~few hundred
- *   particles).
- *
- * Coordinate convention
- *   pos_col / pos_row are in CELL UNITS — the terminal grid IS the
- *   physics grid.  No separate pixel space (unlike spring_pendulum.c
- *   et al.).  vel and accel inherit the same units (cells / step,
- *   cells / step²).
- *
- * References [1][2] for the kernel-sum formalism; [5] Müller for the
- *   real-time field structure adopted here.
- */
-/*
- * Members
- *   ── kinematic state (rewritten every SPH step) ──────────────────
- *   pos_col, pos_row   Position in CELL UNITS — the terminal grid IS
- *                      the physics grid.  No separate pixel space.
- *   vel_col, vel_row   Velocity in cells / step.
- *   accel_col,         Force accumulator in cells / step².  RESET at
- *   accel_row          the top of every forces_pass — sub-passes
- *                      (gravity → pressure → viscosity) add into
- *                      this slot.
- *
- *   ── cached field quantity (computed once, read many times) ─────
- *   density_estimate   ρᵢ = Σⱼ mⱼ · W(|xᵢ − xⱼ|, h).  Written by
- *                      density_pass; read by forces_pass (pressure
- *                      term needs the SUM of i's + j's density) and
- *                      by render_particles (density → glyph tier).
- *                      Müller eq. (3) [5].
- *
- * Invariants
- *   density_estimate ≥ 0 after density_pass.
- *   accel_col, accel_row written every step BEFORE being read.
- *   pos_*, vel_* clamped by integrate_pass's bounce loop into
- *   [1, world.width−2] × [1, world.height−2] (walls 1 cell in).
- *
- * References
- *   [1][2] Monaghan / Lucy for the kernel-sum formalism that the
- *          density_estimate field caches.
- *   [5]    Müller et al. 2003 — the real-time field structure
- *          (pos / vel / accel / ρ-cache) adopted here.
+ *   pos_col, pos_row    where the drop is
+ *   vel_col, vel_row    how fast it's moving (cells per step)
+ *   accel_col, accel_row this step's forces, added up; cleared and
+ *                        refilled every force step
+ *   density_estimate    how crowded it is; set by the density step,
+ *                        read by the force step and the renderer.
+ *                        Always >= 0 (it counts itself, so >= 1).
  */
 typedef struct {
-    double pos_col;          /* x position (cells)                    */
-    double pos_row;          /* y position (cells)                    */
-    double vel_col;          /* x velocity (cells / step)             */
-    double vel_row;          /* y velocity (cells / step)             */
-    double accel_col;        /* x force accumulator (reset each step) */
-    double accel_row;        /* y force accumulator (reset each step) */
-    double density_estimate; /* ρᵢ = Σⱼ mⱼ·W(|xᵢ−xⱼ|, h); cached     *
-                              * by density-pass, read by force-pass.  */
+    double pos_col;          /* position (cells)                      */
+    double pos_row;
+    double vel_col;          /* velocity (cells / step)               */
+    double vel_row;
+    double accel_col;        /* this step's forces, added up          */
+    double accel_row;
+    double density_estimate; /* how crowded (set by the density step) */
 } Particle;
 
 /*
- * ParticlePool — the Lagrangian particle pool used by the SPH passes.
+ * ParticlePool — all the drops, just storage.
  *
- * Intent
- *   The PURE STORAGE half of the simulation: a contiguous fixed-size
- *   array of Particle plus the active count.  Earlier versions also
- *   carried phys-area bounds and the gravity/viscosity flags on this
- *   struct, but those are SCENE-level concerns (user-tuneable; live
- *   on Scene.sim / Scene.world now).  Keeping the pool struct to
- *   "just storage" makes its life cycle obvious — only spawn_at,
- *   spawn_blob, and the SPH passes touch it; user controls don't.
+ * A fixed array plus a count of how many are actually in use; the rest
+ * of the array is junk and must not be read.  It's one global because
+ * every step and every painter touches it, so passing a pointer around
+ * everywhere would just be noise.
  *
- *   The struct is touched by every physics pass (density, force,
- *   integrate, wall) and by every painter, so we keep a single
- *   file-scope `g_particle_pool` instance and helpers reach fields
- *   via `g_particle_pool.pool[i]`.  Avoids pointer threading through
- *   the inner-loop SPH math.
- *
- * Members
- *   pool[]   contiguous array of Particle records; first `count`
- *            slots are live, the rest are uninitialised garbage and
- *            must not be read.
- *   count    number of live particles ∈ [0, PARTICLE_POOL_CAPACITY].
- *            Monotonic during a scene preset; reset to 0 on r/R or
- *            scene change.
- *
- * Memory footprint
- *   PARTICLE_POOL_CAPACITY × sizeof(Particle) ≈ 280 KB in BSS;
- *   no malloc.  Matches CLAUDE.md "no dynamic allocation after init".
- *
- * References
- *   [5] Müller et al. 2003 — the standard Lagrangian particle pool
- *       storage layout for real-time SPH.
+ *   pool[]   the drops; only the first `count` are real
+ *   count    how many are live (0..capacity); back to 0 on reset or a
+ *            scene change
  */
 typedef struct {
     Particle pool [PARTICLE_POOL_CAPACITY];
@@ -1099,7 +292,7 @@ typedef struct {
 
 static ParticlePool g_particle_pool;
 
-/* particle_spawn_at — append one particle at (col, row) if room. */
+/* Add one drop, if there's room. */
 static void particle_spawn_at(double pos_col, double pos_row) {
   if (g_particle_pool.count >= PARTICLE_POOL_CAPACITY)
     return;
@@ -1114,7 +307,7 @@ static void particle_spawn_at(double pos_col, double pos_row) {
   g_particle_pool.count++;
 }
 
-/* Spawn a circular blob of radius r centred at (cx, cy). */
+/* Fill a circle of drops. */
 static void particle_spawn_blob(int centre_col, int centre_row,
                                 int radius_cells) {
   for (int dy = -radius_cells; dy <= radius_cells; dy++) {
@@ -1125,7 +318,7 @@ static void particle_spawn_blob(int centre_col, int centre_row,
   }
 }
 
-/* Spawn a solid rectangle. */
+/* Fill a solid rectangle of drops. */
 static void particle_spawn_rectangle(int corner_col, int corner_row,
                                      int width_cells, int height_cells) {
   for (int dy = 0; dy < height_cells; dy++)
@@ -1133,27 +326,23 @@ static void particle_spawn_rectangle(int corner_col, int corner_row,
       particle_spawn_at((double)(corner_col + dx), (double)(corner_row + dy));
 }
 
-/* ===================================================================== */
-/* §7  kernel — SPH smoothing kernel (compact-support tent²)             */
-/* ===================================================================== */
+/* ── §7  kernel — how much a nearby drop counts ── */
 /*
- * sph_kernel_signed — returns (d/H - 1) for d < H, else returns 0.
- *   - SIGNED: the value is NEGATIVE inside the kernel support.
- *     That negativity is what drives the SIGN of pressure forces
- *     in §10 (T4 derivation).
- *   - For density we want the SQUARED value (always non-negative);
- *     §9 squares it in place.
- *   - For "is this neighbour in range?" callers just check
- *     w_signed < 0  (equivalent to d < H).
+ * How much one drop influences another at a given distance.  Returns 0
+ * once they're out of range (farther than the influence radius), and a
+ * NEGATIVE number when in range, growing toward 0 at the edge.  The
+ * density step squares it (so it counts as a positive amount of
+ * crowding); the force step uses the negative sign to decide which way
+ * to push.  Negative-means-in-range is also the cheap range test.
  */
 static double sph_kernel_signed(double distance_cells) {
   double w = distance_cells / SMOOTH_RADIUS_CELLS - 1.0;
   return (w < 0.0) ? w : 0.0;
 }
 
-/* sph_pair_distance — compute |pᵢ - pⱼ| and the components.  Returns
- * the scalar distance; writes (Δcol, Δrow) to *delta_col / *delta_row
- * (i minus j; the convention used by the pressure force in §10). */
+/* Distance between two drops.  Also hands back the gap as separate
+ * column/row pieces (this drop minus the other) — the force step needs
+ * the direction, not just the distance. */
 static double sph_pair_distance(const Particle *pi, const Particle *pj,
                                 double *delta_col, double *delta_row) {
   double dc = pi->pos_col - pj->pos_col;
@@ -1163,112 +352,51 @@ static double sph_pair_distance(const Particle *pi, const Particle *pj,
   return sqrt(dc * dc + dr * dr);
 }
 
-/* ===================================================================== */
-/* §8  grid — spatial-hash linked-list grid                              */
-/* ===================================================================== */
-/*
- * The grid converts the O(N²) all-pairs test into O(N · k) with
- * k = average particles in a 3×3 cell block ≈ 9 · (N / total_cells).
- *
- * Linked-list-per-cell representation (T7):
- *   g_spatial_grid.head[gy][gx]  = first particle index in cell, or -1
- *   g_spatial_grid.next[i]       = next particle index in same cell as i, or -1
- *
- * Iteration:
- *   for (int j = g_spatial_grid.head[gy][gx]; j != -1; j = g_spatial_grid.next[j]) ...
- */
+/* ── §8  grid — find neighbours fast ── */
 
 /*
- * Grid — the spatial-hash grid used for O(N·k) neighbour search.
+ * Grid — sorts drops into cells so each drop only looks at nearby drops.
  *
- * Intent
- *   Naive SPH neighbour search is O(N²) — every particle queries every
- *   other for "are you within smoothing radius?".  The spatial-hash
- *   grid bins particles by cell, then each query inspects only the
- *   3×3 cells around the query — O(N·k) where k ≈ 9·(N / total_cells)
- *   is the average occupancy.  See [7] Teschner et al. 2003.
+ * Without it, finding a drop's neighbours means checking every other
+ * drop — far too slow with thousands of them.  Instead we chop the area
+ * into cells (each at least one influence-radius wide) and drop each
+ * particle into its cell.  Then a drop only needs to look in its own
+ * cell and the eight around it; anything farther is out of range
+ * anyway.  (Teschner et al. 2003.)
  *
- * Why linked-list-per-cell (T7)
- *   For each grid cell we store the index of the FIRST particle in
- *   that cell (`head[gy][gx]`).  Each particle then stores the index
- *   of the NEXT particle in the SAME cell (`next[i]`).  Iteration:
- *     for (int j = head[gy][gx]; j != -1; j = next[j]) { ... }
- *   This avoids per-cell dynamic arrays — important for our "no
- *   dynamic allocation after init" budget.  Cost: O(1) insert and
- *   O(k) traversal where k is cell occupancy.
+ * The cells are stored as one linked list per cell, using only plain
+ * integers (no per-cell allocation, which we avoid after startup):
+ *   - head[row][col] is the first drop's index in that cell, or -1.
+ *   - next[i] is the next drop sharing drop i's cell, or -1 at the end.
+ * So you walk a cell with:
+ *   for (j = head[row][col]; j != -1; j = next[j]) ...
  *
- * Memory footprint
- *   head: GRID_ROWS_MAX × GRID_COLS_MAX × sizeof(int)
- *   next: PARTICLE_POOL_CAPACITY × sizeof(int)
- *   Both in BSS, no malloc.
- *
- * Reference [7] Teschner et al. 2003 for the spatial-hashing scheme.
- */
-/*
- * Members
- *   head[gy][gx]   First particle index in cell (gy, gx), or −1 if
- *                  the cell is empty.  Cleared to −1 each tick by
- *                  clear_all_cell_heads.
- *   next[i]        Next particle index in the SAME cell as particle
- *                  i, or −1 if i is the last in its cell.  Re-built
- *                  each tick by insert_particle_into_cell — no need
- *                  to clear; the head[] reset is enough.
- *   active_cols    Active grid width  (= world.width  / GRID_CELL_SIZE + 2),
- *                  clamped to GRID_COLS_MAX.  The +2 padding gives
- *                  ghost cells around the visible area so the 3×3
- *                  neighbour stencil never reaches off-grid.
- *   active_rows    Active grid height (= world.height / GRID_CELL_SIZE + 2),
- *                  clamped to GRID_ROWS_MAX.
- *
- * Invariants
- *   2 ≤ active_cols ≤ GRID_COLS_MAX, 2 ≤ active_rows ≤ GRID_ROWS_MAX
- *   after compute_active_grid_bounds.
- *   head[gy][gx] == −1  OR  head[gy][gx] ∈ [0, particle_count).
- *   next[i] == −1  OR  next[i] ∈ [0, particle_count) for i < particle_count.
- *   No cycles in the per-cell linked lists (enforced by head-push insert).
- *
- * Memory footprint
- *   head: GRID_ROWS_MAX × GRID_COLS_MAX × sizeof(int)
- *   next: PARTICLE_POOL_CAPACITY × sizeof(int)
- *   Both in BSS, no malloc.  Together ≈ 28 KB.
+ *   head[][]     first drop in each cell, or -1; wiped to -1 each step
+ *   next[]       next drop in the same cell, or -1; rebuilt each step
+ *   active_cols  how many cells wide the grid currently is. It's the
+ *   active_rows  area divided by cell size, plus a 2-cell border so the
+ *                3x3 look-around never falls off the edge; capped at the
+ *                array size.
  */
 typedef struct {
-    /* Head index per cell: first particle in that cell, or -1.        */
     int head[GRID_ROWS_MAX][GRID_COLS_MAX];
-
-    /* Linked-list next-pointer per particle: next particle in the
-     * SAME cell as particle i, or -1.                                 */
     int next[PARTICLE_POOL_CAPACITY];
-
-    /* Active subregion bounds (≤ GRID_*_MAX, clamped on resize).      */
     int active_cols;
     int active_rows;
 } Grid;
 
 static Grid g_spatial_grid;
 
-/* ===================================================================== */
-/* §8.5  scene sub-structs — World, SimControls, Scene (hoisted before   */
-/* the §10–§12 SPH passes so they can take `const Scene *s`)             */
-/* ===================================================================== */
+/* ── §8.5  scene state — World, SimControls, Scene ── */
+/* (Defined up here so the physics steps below can take a Scene *.)      */
 
 /*
- * World — pixel-space simulation extent (refreshed each tick / resize).
+ * World — the size of the play area, in cells.
  *
- * Intent
- *   The phys-area dimensions used to bound every loop (boundary
- *   clamping in integrate_pass, grid bounds in grid_rebuild, scene
- *   layout in preset loaders).  Refreshed at the top of scene_tick
- *   from the live Screen extent minus HUD_RESERVED_ROWS.
- *
- * Members
- *   width   physics-area width in CELLS (= terminal cols).
- *   height  physics-area height in CELLS (= terminal rows − HUD_RESERVED_ROWS).
- *
- * Invariants
- *   width > 0, height > 0.  Bottom HUD_RESERVED_ROWS terminal rows
- *   are reserved for the status + key-hint strip; the simulation
- *   never paints into them.
+ * Just the width and height the fluid lives in.  Re-read every tick from
+ * the terminal size (minus the rows reserved for the HUD), so resizing
+ * the window resizes the pool.  The fluid never paints into the HUD
+ * rows.
  */
 typedef struct {
     int width;
@@ -1276,24 +404,12 @@ typedef struct {
 } World;
 
 /*
- * SimControls — user-facing toggles that gate the physics passes.
+ * SimControls — the three on/off switches the user flips.
  *
- * Intent
- *   Bundles the three boolean knobs that the input handler writes
- *   and scene_tick / forces_pass read.  Earlier versions kept these
- *   as flat fields on ParticleWorld + Scene; consolidating them in
- *   one struct gives an explicit "user controls" surface that the
- *   HUD can label and the key handler can target.
- *
- * Members
- *   paused             true → scene_tick early-returns; HUD shows "PAUSED".
- *                      Toggled by SPACE.
- *   gravity_enabled    true → forces_pass adds (0, GRAVITY_G) to accel.
- *                      Toggled by 'g'.
- *   viscosity_enabled  true → forces_pass adds the Müller [5] viscosity
- *                      term.  Toggled by 'v'.  Watching the simulation
- *                      with this OFF shows the system as an inviscid
- *                      pressure-only fluid (collapses faster, more splashy).
+ *   paused             space bar: freeze the simulation; HUD shows PAUSED
+ *   gravity_enabled    'g': add the downward pull
+ *   viscosity_enabled  'v': let neighbours match speeds.  Turn it off and
+ *                      the fluid gets twitchier and splashier.
  */
 typedef struct {
     bool paused;
@@ -1302,49 +418,25 @@ typedef struct {
 } SimControls;
 
 /*
- * Scene — owns ALL simulation state for one run.
+ * Scene — everything about one running simulation, in one place.
  *
- * Layered ownership
+ * Bundling it all behind a single Scene * means helpers take that one
+ * pointer and there's one spot to look for "what state exists."  The
+ * pool and grid are huge (a few hundred KB), so Scene holds POINTERS to
+ * the two big globals rather than copies of them — set once at startup.
  *
- *     Scene
- *       ├── active_id      : int             ← 1..SCENE_COUNT preset selector
- *       ├── theme_index    : int             ← colour palette selector
- *       ├── sim            : SimControls     ← paused / gravity / viscosity
- *       ├── world          : World           ← phys-area extent (cells)
- *       ├── particles      : ParticlePool *  ← points at g_particle_pool
- *       └── grid           : Grid *          ← points at g_spatial_grid
- *
- * Why pointers to particle pool + grid (not embedded)
- *   sizeof(ParticlePool) ≈ 280 KB and sizeof(Grid) ≈ 28 KB.  Embedding
- *   them on Scene would make every Scene * copy / stack-local Scene
- *   impractical.  The pointers are set ONCE in scene_init to point
- *   at the file-scope BSS instances.
- *
- * Why Scene-rooted (not file-scope globals)
- *   • Every persistent simulation value is reachable from one
- *     `Scene *s`.
- *   • Helpers that touch scene state take `Scene *s`, so there is
- *     ONE place to look for "what state exists".
- *   • A future "two simulations side-by-side" demo would allocate
- *     two Scene instances pointing at separate pool / grid backing.
- *
- * Reference [10] Raymond on the scene-paint pipeline that reads
- *   theme_index + sim.paused + world to size and decorate its loops.
+ *   active_id     which preset is loaded (1..5); also the HUD label
+ *   theme_index   which colour set is active
+ *   sim           the user switches (paused / gravity / viscosity)
+ *   world         the play-area size
+ *   particles     -> the one global drop pool
+ *   grid          -> the one global neighbour grid
  */
 typedef struct {
-    /* simulation selector (preset + HUD label) */
-    int           active_id;    /* 1..SCENE_COUNT */
-
-    /* pure render state (theme selector for colors_apply_theme) */
+    int           active_id;
     int           theme_index;
-
-    /* user-facing controls (paused + gravity + viscosity) */
     SimControls   sim;
-
-    /* pixel-space simulation extent (refreshed each tick) */
     World         world;
-
-    /* large BSS arrays — pointers set to file-scope statics */
     ParticlePool *particles;
     Grid         *grid;
 } Scene;
@@ -1367,10 +459,8 @@ static inline int grid_cell_row_of(double pos_row) {
   return gy;
 }
 
-/* Compute the active spatial-grid extent from the current physics
- * area.  +2 padding includes the ghost cells around the visible
- * domain so the 3×3 neighbour stencil never reaches off-grid.
- * Clamped to GRID_*_MAX. */
+/* Size the grid to the current play area, plus a 2-cell border so the
+ * 3x3 look-around never falls off the edge, capped at the array size. */
 static inline void compute_active_grid_bounds(const Scene *s) {
     g_spatial_grid.active_cols = s->world.width  / GRID_CELL_SIZE + 2;
     g_spatial_grid.active_rows = s->world.height / GRID_CELL_SIZE + 2;
@@ -1378,18 +468,16 @@ static inline void compute_active_grid_bounds(const Scene *s) {
     if (g_spatial_grid.active_rows > GRID_ROWS_MAX) g_spatial_grid.active_rows = GRID_ROWS_MAX;
 }
 
-/* Empty every cell's linked-list head so old particle indices from the
- * previous step don't linger.  Done in O(cells); the next-pointer
- * array is overwritten as particles are re-inserted (no clear needed). */
+/* Empty every cell before refilling.  (The next[] links get overwritten
+ * as drops are re-added, so only the heads need clearing.) */
 static inline void clear_all_cell_heads(void) {
     for (int gy = 0; gy < g_spatial_grid.active_rows; gy++)
         for (int gx = 0; gx < g_spatial_grid.active_cols; gx++)
             g_spatial_grid.head[gy][gx] = -1;
 }
 
-/* Insert particle i at the HEAD of its cell's linked list.
- * O(1) operation: new_node.next = old_head; cell.head = i.
- * Standard linked-list head-push. */
+/* Drop particle i into its cell (push onto the front of that cell's
+ * list). */
 static inline void insert_particle_into_cell(int i) {
     int gx = grid_cell_col_of(g_particle_pool.pool[i].pos_col);
     int gy = grid_cell_row_of(g_particle_pool.pool[i].pos_row);
@@ -1397,19 +485,8 @@ static inline void insert_particle_into_cell(int i) {
     g_spatial_grid.head[gy][gx] = i;
 }
 
-/*
- * grid_rebuild — rebuild the spatial-hash from scratch.
- *
- * Pseudocode:
- *   compute_active_grid_bounds   (recompute from current phys-area)
- *   clear_all_cell_heads          (every list starts empty)
- *   for each particle i:
- *     insert_particle_into_cell(i)
- *
- * Called once at the START of every physics step.  Order: rebuild →
- * density → forces → integrate.  Refs [7] Teschner 2003 for the
- * head/next spatial-hash scheme.
- */
+/* Re-sort every drop into its cell.  Done first thing each step, since
+ * the drops moved last step. */
 static void grid_rebuild(const Scene *s) {
     compute_active_grid_bounds(s);
     clear_all_cell_heads();
@@ -1417,22 +494,16 @@ static void grid_rebuild(const Scene *s) {
         insert_particle_into_cell(i);
 }
 
-/* ===================================================================== */
-/* §9  density_pass — neighbour density estimation                       */
-/* ===================================================================== */
+/* ── §9  density pass — how crowded is each drop? ── */
 /*
- * For each particle i, walk the 3×3 grid block around it.  Every
- * particle j in those cells contributes w(d_ij)² to ρᵢ.
- *
- * Self-contribution included: at d = 0, w² = 1, so ρᵢ ≥ 1 always.
- *
- * Total cost ≈ N · 9 · k, where k = avg particles per cell.  At
- * N=1500 in 30×8 cells, ~6 particles/cell, ~50 evals per particle.
+ * For each drop, look at the 3x3 block of cells around it and add up how
+ * much each nearby drop counts.  A drop counts itself too, so the answer
+ * is always at least 1 — handy, it means we never divide by zero later.
  */
-/* The 3×3 block of grid cells around particle pi, clipped to the
- * active grid.  Returns inclusive index ranges via out-pointers; the
- * caller iterates [gx_lo..gx_hi] × [gy_lo..gy_hi] and walks the
- * linked list at each cell.  Shared by density_pass and forces_pass. */
+
+/* The 3x3 block of cells around a drop, trimmed to stay on the grid.
+ * Hands back the column/row ranges to loop over.  Used by both the
+ * density and force steps. */
 static inline void cell_block_around(const Particle *pi,
                                      int *out_gx_lo, int *out_gx_hi,
                                      int *out_gy_lo, int *out_gy_hi) {
@@ -1444,10 +515,8 @@ static inline void cell_block_around(const Particle *pi,
     *out_gy_hi = (cy + 1 >= g_spatial_grid.active_rows) ? g_spatial_grid.active_rows - 1 : cy + 1;
 }
 
-/* Contribution to pi's density estimate from neighbour pj.
- * Müller §3.3 [5] uses the SQUARED kernel for density (always ≥ 0).
- * Self-pair (i == j) gives w(0)² = 1, so ρᵢ ≥ 1 always — a useful
- * lower bound that simplifies the pressure-force divide guard.       */
+/* How much one neighbour adds to a drop's crowding.  Squared so it's
+ * always a positive amount (Müller 2003). */
 static inline double squared_kernel_contribution(const Particle *pi,
                                                   const Particle *pj) {
     double dc, dr;
@@ -1456,20 +525,7 @@ static inline double squared_kernel_contribution(const Particle *pi,
     return w * w;
 }
 
-/*
- * density_pass — Müller et al. (2003) §3.3 [5] density estimation.
- *
- * Pseudocode:
- *   for each particle pi:
- *     pi.density_estimate ← 0
- *     (gx_lo..gx_hi, gy_lo..gy_hi) = cell_block_around(pi)
- *     for each cell in that 3×3 block:
- *       for each particle pj in that cell:
- *         pi.density_estimate += squared_kernel_contribution(pi, pj)
- *
- * Cost ≈ N · 9 · k where k = avg particles per cell.  At N=1500 in
- * 30×8 cells (~6 particles/cell), ~50 kernel evaluations per particle.
- */
+/* Give every drop its crowding number for this step. */
 static void density_pass(void) {
     for (int i = 0; i < g_particle_pool.count; i++) {
         Particle *pi = &g_particle_pool.pool[i];
@@ -1489,44 +545,29 @@ static void density_pass(void) {
     }
 }
 
-/* ===================================================================== */
-/* §10  forces_pass — pressure + viscosity acceleration                  */
-/* ===================================================================== */
+/* ── §10  force pass — push the drops around ── */
 /*
- * For each pair (i, j) with j in the 3×3 block around i and j != i:
- *   distance = |pᵢ - pⱼ|
- *   w_signed = d/H - 1   (skip if ≥ 0, out of range)
- *
- *   pressure_term = (REST_SUM - ρᵢ - ρⱼ) · K_pressure
- *   pressure_force_along_dx = w_signed · pressure_term
- *                              / (ρᵢ + DENSITY_DIVIDE_GUARD)
- *   pi.accel += pressure_force_along_dx · (Δcol, Δrow)
- *
- *   if s->sim.viscosity_enabled:
- *     visc_weight = -w_signed   (positive inside support)
- *     pi.accel += (vⱼ - vᵢ) · K_viscosity · visc_weight
- *
- * Gravity is set as the BASELINE acceleration so we don't add it
- * inside the pair loop.
+ * Two pushes between every close pair of drops:
+ *   - PRESSURE keeps spacing: if the pair is more crowded than the fluid
+ *     wants, shove them apart; if less, pull them together (which gives
+ *     the surface its skin-like tension).
+ *   - VISCOSITY (optional) nudges each drop toward its neighbours' speed,
+ *     so they flow together instead of cutting through each other.
+ * Gravity is added once up front as the starting push, so it isn't
+ * multiplied by the neighbour count inside the pair loop.
  */
-/* Set the baseline acceleration for one particle.  Gravity is the
- * ONLY external body force in this demo; setting it as a baseline
- * (not adding it inside the pair loop) is cleaner and avoids
- * accidentally scaling g by neighbour count.                        */
+
+/* Reset a drop's forces to just gravity (the starting point each step). */
 static inline void apply_gravity_baseline(Particle *pi, const Scene *s) {
     pi->accel_col = 0.0;
     pi->accel_row = s->sim.gravity_enabled ? GRAVITY_G : 0.0;
 }
 
-/* Add the SPH pressure force from pj to pi's acceleration accumulator.
- * Müller §3.4 [5]:
- *
- *     F_pressure_ij = −∇W(d) · (Pᵢ + Pⱼ) / (2 ρⱼ)
- *
- * Our simplified form merges the (P − P_rest) terms into one symmetric
- * REST_SUM − ρᵢ − ρⱼ expression (Tait equation of state, T4 tutorial).
- * The DENSITY_DIVIDE_GUARD prevents division by zero for isolated
- * particles whose density estimate could drop to ε. */
+/* The spacing push between two drops.  When the pair is over-crowded the
+ * push is outward (apart); when under-crowded it's inward (together);
+ * when just right it's zero.  Müller 2003, simplified.  We divide by
+ * this drop's crowding (plus a tiny guard so a lonely drop can't divide
+ * by zero). */
 static inline void apply_pressure_pair_force(Particle *pi,
                                               const Particle *pj,
                                               double dc, double dr,
@@ -1540,22 +581,18 @@ static inline void apply_pressure_pair_force(Particle *pi,
     pi->accel_row += dr * force_per_dx;
 }
 
-/* Add the SPH artificial-viscosity force from pj to pi's accel.
- * Müller §3.5 [5] / Monaghan [3] ch. 5.  Drives pi's velocity toward
- * the LOCAL AVERAGE of its neighbours — a smoothing operator on the
- * velocity field.  visc_weight = −w_signed is positive inside the
- * kernel support so the sign is correct. */
+/* The speed-matching push: nudge this drop's velocity toward the
+ * neighbour's, more strongly for closer neighbours. */
 static inline void apply_viscosity_pair_force(Particle *pi,
                                                const Particle *pj,
                                                double w_signed) {
-    double visc_weight = -w_signed;  /* positive inside support */
+    double visc_weight = -w_signed;  /* flip to a positive weight */
     pi->accel_col += (pj->vel_col - pi->vel_col) * VISCOSITY_K * visc_weight;
     pi->accel_row += (pj->vel_row - pi->vel_row) * VISCOSITY_K * visc_weight;
 }
 
-/* Apply both pair-wise SPH forces (pressure + optional viscosity)
- * from pj onto pi.  Skips self (i == j) and out-of-kernel pairs
- * (w_signed == 0). */
+/* Apply both pushes from one neighbour.  Skip the drop itself and any
+ * neighbour too far away to matter. */
 static inline void apply_sph_pair_forces(Particle *pi, int i,
                                           const Particle *pj, int j,
                                           const Scene *s) {
@@ -1572,21 +609,7 @@ static inline void apply_sph_pair_forces(Particle *pi, int i,
         apply_viscosity_pair_force(pi, pj, w_signed);
 }
 
-/*
- * forces_pass — Müller §3 [5]: pressure + viscosity acceleration.
- *
- * Pseudocode:
- *   for each particle pi:
- *     apply_gravity_baseline(pi)                       (g·ŷ if enabled)
- *     (gx_lo..gx_hi, gy_lo..gy_hi) = cell_block_around(pi)
- *     for each cell in that 3×3 block:
- *       for each particle pj in that cell:
- *         apply_sph_pair_forces(pi, pj)                (pressure + visc)
- *
- * Force shape: pressure REPELS dense regions, viscosity SMOOTHS
- * velocity disparities.  Together they reproduce incompressible
- * fluid flow.  Refs [3] Monaghan 1992; [5] Müller 2003.
- */
+/* Work out the total push on every drop this step. */
 static void forces_pass(const Scene *s) {
     for (int i = 0; i < g_particle_pool.count; i++) {
         Particle *pi = &g_particle_pool.pool[i];
@@ -1606,67 +629,40 @@ static void forces_pass(const Scene *s) {
     }
 }
 
-/* ===================================================================== */
-/* §11  integrate_pass — symplectic Euler + wall bounce                  */
-/* ===================================================================== */
+/* ── §11  move pass — turn forces into motion, then bounce ── */
 /*
- * Symplectic Euler (T6):
- *   v_new = v + a · dt
- *   x_new = x + v_new · dt
- *
- * Then enforce hard walls.  Push back to the boundary, flip velocity
- * sign, multiply by WALL_DAMPING < 1 to bleed energy.
+ * Update each drop's speed from its forces, then move it at the new
+ * speed.  Doing speed FIRST and position SECOND (with the just-updated
+ * speed) is the small trick that keeps the simulation from slowly
+ * gaining energy and blowing up.  Then keep drops inside the walls.
  */
-/* Symplectic-Euler step 1: velocity from acceleration.
- *   v_new = v + a · dt
- * Doing velocity FIRST and position SECOND (using the NEW velocity)
- * is what makes the integrator symplectic — conserves a modified
- * Hamiltonian and gives bounded energy error.  See [4] Monaghan 2005
- * §6 and the spring_pendulum.c demo for a deeper treatment. */
+
+/* Speed first: add this step's forces to the drop's velocity. */
 static inline void symplectic_euler_velocity_step(Particle *p, double dt) {
     p->vel_col += p->accel_col * dt;
     p->vel_row += p->accel_row * dt;
 }
 
-/* Symplectic-Euler step 2: position from NEW velocity.
- *   x_new = x + v_new · dt
- * Reading the just-updated velocity is the defining feature of
- * semi-implicit / symplectic Euler.  */
+/* Position next, using that just-updated velocity. */
 static inline void symplectic_euler_position_step(Particle *p, double dt) {
     p->pos_col += p->vel_col * dt;
     p->pos_row += p->vel_row * dt;
 }
 
-/* Hard-wall bounce on ONE axis.  If pos < lo or > hi, push back to
- * the boundary and FLIP the velocity component, scaled by
- * WALL_DAMPING < 1 to bleed energy out.  Energy loss is essential —
- * a perfectly-elastic bounce would let numerical noise pump KE into
- * the system indefinitely.                                          */
+/* Bounce off one wall: if the drop went past the edge, put it back at
+ * the edge and reverse that direction, losing a bit of speed.  The speed
+ * loss matters — a perfect bounce would slowly heat the pool up until it
+ * explodes. */
 static inline void enforce_wall_bounce_axis(double *pos, double *vel,
                                              double lo, double hi) {
     if (*pos < lo) { *pos = lo; *vel = -*vel * WALL_DAMPING; }
     if (*pos > hi) { *pos = hi; *vel = -*vel * WALL_DAMPING; }
 }
 
-/*
- * integrate_pass — symplectic Euler step + wall bounce.
- *
- * Pseudocode:
- *   (col_lo, col_hi) = (1, s->world.width - 2)   ← walls 1 cell in
- *   (row_lo, row_hi) = (1, s->world.height - 2)
- *   for each particle p:
- *     symplectic_euler_velocity_step(p, dt)       (v += a·dt)
- *     symplectic_euler_position_step(p, dt)       (x += v_new·dt)
- *     enforce_wall_bounce_axis(&p.col, &p.vel_col, col_lo, col_hi)
- *     enforce_wall_bounce_axis(&p.row, &p.vel_row, row_lo, row_hi)
- *
- * Order matters: forces_pass writes accel → integrate_pass reads it.
- * The walls are placed ONE cell inside the physics area so the
- * particles are visible against the border drawn at the edge.
- */
+/* Move every drop and bounce it off the walls. */
 static void integrate_pass(const Scene *s) {
-    /* Walls one cell inside the phys-area so particles render INSIDE
-     * the drawn border (drawn at the very edge). */
+    /* Walls one cell inside the area, so drops sit just inside the
+     * drawn border instead of on top of it. */
     const double col_lo = 1.0, col_hi = (double)(s->world.width  - 2);
     const double row_lo = 1.0, row_hi = (double)(s->world.height - 2);
 
@@ -1679,16 +675,10 @@ static void integrate_pass(const Scene *s) {
     }
 }
 
-/* ===================================================================== */
-/* §12  sph_step — full physics tick (4 passes)                          */
-/* ===================================================================== */
+/* ── §12  one physics tick — the whole simulation in four steps ── */
 /*
- * The complete physics in four lines.  ORDER MATTERS:
- *
- *   1. grid_rebuild     — positions snap to cells (input to next 2)
- *   2. density_pass     — needs grid; produces density_estimate
- *   3. forces_pass      — needs grid + density; produces accel
- *   4. integrate_pass   — needs accel; produces new pos / vel
+ * The order matters: each step feeds the next.  Re-sort drops into
+ * cells, measure crowding, turn crowding into pushes, then move.
  */
 static void sph_step(const Scene *s) {
   grid_rebuild  (s);
@@ -1697,19 +687,16 @@ static void sph_step(const Scene *s) {
   integrate_pass(s);
 }
 
-/* ===================================================================== */
-/* §13  scenes — 5 scene loaders                                         */
-/* ===================================================================== */
+/* ── §13  scenes — five starting layouts ── */
 /*
- * Each scene reseeds the particle pool with a different initial
- * configuration.  Velocities are zero unless the scene needs them
- * (only #4 collision sets non-zero initial velocities).
+ * Each one wipes the pool and drops in a fresh arrangement.  Drops start
+ * still, except the collision scene which throws two blobs at each other.
  *
- *   1 BLOB DROP          big sphere falling under gravity
- *   2 COLUMN COLLAPSE    wide rectangle that splashes outward
- *   3 FOUNTAIN           dense stack at floor → erupts
- *   4 COLLISION          two blobs slamming together
- *   5 RAIN               curtain of particles falling from top
+ *   1 blob      a big ball falls and splats
+ *   2 column    a tall block collapses sideways
+ *   3 fountain  a pile at the floor erupts upward
+ *   4 collision two blobs slam together
+ *   5 rain      a curtain of drops falls and piles up
  */
 
 static void scene_load_blob_drop(const Scene *s) {
@@ -1751,7 +738,7 @@ static void scene_load_rain(const Scene *s) {
   }
 }
 
-/* Dispatch helper — clear pool, then fill via the active preset. */
+/* Wipe the pool and load the chosen scene. */
 static void scene_load_by_id(Scene *s, int id) {
   g_particle_pool.count = 0;
   switch (id) {
@@ -1782,29 +769,24 @@ static const char *scene_name_of(int id) {
   }
 }
 
-/* ===================================================================== */
-/* §14  scene — scene state + tick orchestrator                          */
-/* ===================================================================== */
-/* (Scene + World + SimControls typedefs hoisted to §7.5 — see above,
- *  before the SPH passes that take `const Scene *s`.)                   */
+/* ── §14  scene setup + per-tick update ── */
+/* (The Scene/World/SimControls types are up in §8.5.)                   */
 
 static void scene_init(Scene *s, int cols, int rows) {
-  /* (1) reset selectors + control flags */
   s->active_id              = 1;
   s->theme_index            = 0;
   s->sim.paused             = false;
   s->sim.gravity_enabled    = true;
   s->sim.viscosity_enabled  = true;
 
-  /* (2) physics-area extent from current terminal (reserve HUD strip) */
+  /* play area = terminal, minus the HUD rows at the bottom */
   s->world.width  = cols;
   s->world.height = rows - HUD_RESERVED_ROWS;
 
-  /* (3) wire pointers to the file-scope BSS pool + grid */
+  /* point at the two big globals */
   s->particles    = &g_particle_pool;
   s->grid         = &g_spatial_grid;
 
-  /* (4) apply colour theme + load initial preset */
   colors_apply_theme(s->theme_index);
   scene_load_by_id(s, s->active_id);
 }
@@ -1812,136 +794,75 @@ static void scene_init(Scene *s, int cols, int rows) {
 static void scene_tick(Scene *s, int cols, int rows) {
   if (s->sim.paused) return;
 
-  /* refresh world extent each tick so SIGWINCH propagates cleanly */
+  /* re-read the size each tick so a window resize takes effect */
   s->world.width  = cols;
   s->world.height = rows - HUD_RESERVED_ROWS;
 
   sph_step(s);
 }
 
-/* ===================================================================== */
-/* §15  render_particles — density → glyph + colour                      */
-/* ===================================================================== */
+/* ── §15  draw the drops — crowding picks the character ── */
 /*
- * One character per particle.  Glyph + colour come from the
- * particle's local DENSITY (computed in §9):
- *
- *   density ≥ T_CORE   → '#'  bold,  PAIR_DENSITY_CORE
- *   density ≥ T_BODY   → 'o'        PAIR_DENSITY_BODY
- *   density ≥ T_EDGE   → '.'        PAIR_DENSITY_EDGE
- *   density  < T_EDGE  → not drawn (isolated particle)
- *
- * This makes the FREE SURFACE visible: surface particles have low
- * density (fewer neighbours than interior).
+ * Each drop becomes one character, chosen by how crowded it is: dense
+ * interior drops are '#' (bold), mid drops 'o', thin surface drops '.',
+ * and very lonely ones aren't drawn at all.  Because surface drops have
+ * fewer neighbours, this makes the water's surface stand out for free.
  */
 
 /*
- * DensityRender — one cell's drawing instruction, derived from local density.
+ * DensityRender — how to draw one cell: which character, colour, and
+ * whether to make it bold.  All three follow from the same crowding
+ * number, so we bundle them and return all three at once.  Three levels
+ * (not a fine gradient) is what shows the surface clearly.
  *
- * Intent
- *   The renderer needs to know THREE things per cell: which glyph to
- *   draw, which colour pair to use, and whether to apply A_BOLD.  All
- *   three depend on the same input — the local smoothed density — so
- *   bundling them in one struct lets density_to_render() return all
- *   three in one shot without an output-parameter dance.
- *
- * Why a struct and not three parallel arrays
- *   Per-cell density is computed once but read three ways (glyph,
- *   colour, attribute).  Co-locating the three derived values keeps
- *   the lookup table compact in cache and the calling code simple:
- *   `dr = density_to_render(rho); mvaddch(... dr.glyph ...)`.
- *
- * Why the tier choice depends on density (not particle count)
- *   We want SURFACE visibility — surface cells have lower density
- *   (fewer neighbours within smoothing radius) than interior cells.
- *   Tiering by density rather than count means droplets and spray
- *   render as the dim edge tier even when they're locally dense.
- */
-/*
- * Members
- *   glyph        ASCII character drawn at the cell.  '#' for CORE
- *                tier, 'o' for BODY, '.' for EDGE.  Tier choice in
- *                density_to_render().
- *   pair_id      ncurses colour pair number — PAIR_DENSITY_CORE /
- *                _BODY / _EDGE.  Pair foreground is set by the
- *                active ColorTheme.
- *   extra_attr   A_BOLD for the CORE tier (bumps brightness so the
- *                densest cells stand out); A_NORMAL otherwise.
- *
- * Invariants
- *   glyph is a printable ASCII character (0x20–0x7E).
- *   pair_id ∈ {PAIR_DENSITY_CORE, PAIR_DENSITY_BODY, PAIR_DENSITY_EDGE}.
- *
- * References
- *   [5] Müller et al. 2003 §5 — density-based surface visualisation,
- *       inspiration for the tiering-by-ρ rendering choice.
- *  [10] Raymond NCURSES-HOWTO §6 — colour pair / attribute combination.
+ *   glyph        the character: '#', 'o', or '.'
+ *   pair_id      which colour pair (core / body / edge) — its colour
+ *                comes from the current theme
+ *   extra_attr   bold for the dense core, normal otherwise
  */
 typedef struct {
-    char   glyph;        /* '@' '*' '.' depending on density tier */
-    int    pair_id;      /* PAIR_DENSITY_CORE / _BODY / _EDGE     */
-    attr_t extra_attr;   /* A_BOLD for the densest tier            */
+    char   glyph;
+    int    pair_id;
+    attr_t extra_attr;
 } DensityRender;
 
-/* Build the CORE density-tier instruction: dense liquid core glyph
- * + colour + bold attribute.  See DensityRender doc for the three-
- * tier rationale. */
 static inline DensityRender make_core_tier(void) {
     return (DensityRender){ '#', PAIR_DENSITY_CORE, A_BOLD };
 }
 
-/* Build the BODY density-tier instruction: medium liquid body glyph
- * + colour, no bold. */
 static inline DensityRender make_body_tier(void) {
     return (DensityRender){ 'o', PAIR_DENSITY_BODY, A_NORMAL };
 }
 
-/* Build the EDGE density-tier instruction: faint droplet / spray
- * glyph + colour, no bold.  Used for surface particles. */
 static inline DensityRender make_edge_tier(void) {
     return (DensityRender){ '.', PAIR_DENSITY_EDGE, A_NORMAL };
 }
 
-/*
- * density_render_for — tier dispatch by density threshold.
- *
- * Pseudocode:
- *   if ρ ≥ CORE_THRESHOLD → core tier ('#' bold)
- *   if ρ ≥ BODY_THRESHOLD → body tier ('o')
- *   else                  → edge tier ('.')
- *
- * Higher density → denser interior → bolder glyph.  Lower density
- * (surface / spray) → dim '.' so the FLUID SHAPE is what carries the
- * visual, not subtle ramp gradients.
- */
+/* Pick the character + colour for a drop from its crowding. */
 static DensityRender density_render_for(double density_estimate) {
     if (density_estimate >= DENSITY_THRESHOLD_CORE) return make_core_tier();
     if (density_estimate >= DENSITY_THRESHOLD_BODY) return make_body_tier();
     return make_edge_tier();
 }
 
-/* Round a particle's real-valued position to its display cell. */
+/* Round a drop's real position to the nearest screen cell. */
 static inline void particle_to_screen_cell(const Particle *p,
                                             int *out_col, int *out_row) {
     *out_col = (int)(p->pos_col + 0.5);
     *out_row = (int)(p->pos_row + 0.5);
 }
 
-/* Is the cell (col, row) inside the visible field rect? */
 static inline bool screen_cell_in_field(int col, int row,
                                          int cols, int phys_area_rows) {
     return col >= 0 && col < cols
         && row >= 0 && row < phys_area_rows;
 }
 
-/* Should this particle be drawn at all?  Below DENSITY_THRESHOLD_EDGE
- * the particle is an isolated splatter — drawing it would be visual
- * noise.  Skipping these cells also reduces newscr/curscr diff size. */
+/* Skip nearly-alone drops — they'd just be specks of noise. */
 static inline bool particle_should_render(const Particle *p) {
     return p->density_estimate >= DENSITY_THRESHOLD_EDGE;
 }
 
-/* Paint ONE particle cell with its density-tier glyph + colour. */
 static inline void paint_particle_cell(WINDOW *w, int row, int col,
                                         DensityRender dr) {
     attr_t attrs = COLOR_PAIR(dr.pair_id) | dr.extra_attr;
@@ -1950,17 +871,7 @@ static inline void paint_particle_cell(WINDOW *w, int row, int col,
     wattroff(w, attrs);
 }
 
-/*
- * render_particles — paint every visible particle to its density tier.
- *
- * Pseudocode:
- *   for each particle p:
- *     (col, row) = particle_to_screen_cell(p)
- *     if not screen_cell_in_field(col, row, ...): skip
- *     if not particle_should_render(p):           skip
- *     dr = density_render_for(p->density_estimate)
- *     paint_particle_cell(win, row, col, dr)
- */
+/* Draw every drop that's on-screen and worth showing. */
 static void render_particles(WINDOW *w, int cols, int phys_area_rows) {
     for (int i = 0; i < g_particle_pool.count; i++) {
         const Particle *p = &g_particle_pool.pool[i];
@@ -1978,19 +889,15 @@ static void render_particles(WINDOW *w, int cols, int phys_area_rows) {
     }
 }
 
-/* ===================================================================== */
-/* §16  render_border — frame around the simulation area                 */
-/* ===================================================================== */
+/* ── §16  border — frame around the play area ── */
 
-/* ASCII box-drawing glyphs (CLAUDE.md ASCII-Only Rendering rule: no
- * Unicode box characters). */
+/* Plain ASCII so it looks the same on every terminal. */
 enum {
     BORDER_GLYPH_HORIZONTAL = '-',
     BORDER_GLYPH_VERTICAL   = '|',
     BORDER_GLYPH_CORNER     = '+',
 };
 
-/* Draw the top + bottom edges (horizontal rules) of the simulation box. */
 static inline void draw_horizontal_edges(WINDOW *w, int cols,
                                           int top_row, int bottom_row) {
     for (int c = 0; c < cols; c++) {
@@ -1999,8 +906,7 @@ static inline void draw_horizontal_edges(WINDOW *w, int cols,
     }
 }
 
-/* Draw the left + right edges (vertical rules), skipping the corner
- * rows so draw_corners can stamp '+' there without contention. */
+/* Sides only — leaves the corner rows for draw_corners. */
 static inline void draw_vertical_edges(WINDOW *w, int cols,
                                         int top_row, int bottom_row) {
     int right_col = cols - 1;
@@ -2010,8 +916,7 @@ static inline void draw_vertical_edges(WINDOW *w, int cols,
     }
 }
 
-/* Stamp the four corner '+' glyphs.  Done last so they over-write any
- * horizontal/vertical glyph that landed at the corner cells. */
+/* The four '+' corners, drawn last so they sit over the edges. */
 static inline void draw_corners(WINDOW *w, int cols,
                                  int top_row, int bottom_row) {
     int right_col = cols - 1;
@@ -2021,16 +926,7 @@ static inline void draw_corners(WINDOW *w, int cols,
     mvwaddch(w, bottom_row, right_col, BORDER_GLYPH_CORNER);
 }
 
-/*
- * render_border — paint the ASCII frame around the simulation area.
- *
- * Drawn LAST so it always appears on top of any overflow particles.
- * Uses A_NORMAL (not A_DIM) per CLAUDE.md theme-brightness rule.
- *
- *   (1) horizontal edges (top + bottom)
- *   (2) vertical edges (left + right, skipping corners)
- *   (3) four corner '+' glyphs (over-stamp the corner cells)
- */
+/* Draw the frame, after the drops, so it always shows on top. */
 static void render_border(WINDOW *w, int cols, int phys_area_rows) {
     enum { TOP_ROW = 0 };
     int bottom_row = phys_area_rows - 1;
@@ -2042,16 +938,7 @@ static void render_border(WINDOW *w, int cols, int phys_area_rows) {
     wattroff(w, COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ===================================================================== */
-/* §17  hud — top status + bottom hint strip                             */
-/* ===================================================================== */
-/*
- * Two HUD elements per CLAUDE.md spec:
- *   - STATUS at top-right: PAIR_HUD bright yellow + A_BOLD
- *   - HINT   at bottom:    PAIR_HINT bright cyan   + A_BOLD
- *
- * PAUSED indicator centred top.
- */
+/* ── §17  HUD — status line on top, key hints on the bottom ── */
 
 static void hud_paint_status(WINDOW *w, int cols, double fps_display,
                              int sim_hz, const Scene *s) {
@@ -2080,59 +967,21 @@ static void hud_paint_hint(WINDOW *w, int rows) {
   wattroff(w, COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §18  screen — ncurses init / cleanup                                  */
-/* ===================================================================== */
+/* ── §18  screen — start, stop, and draw the terminal ── */
 
 /*
- * Screen — terminal cell extent + ncurses lifecycle wrapper.
+ * Screen — just the terminal's current width and height.
  *
- * Intent
- *   Owns the TERMINAL side of the world.  Where Scene.world tracks
- *   the physics-area extent in cells, this struct tracks the FULL
- *   terminal grid that ncurses paints onto.  The two are linked:
+ * World is the fluid's play area; Screen is the whole terminal it's
+ * drawn on.  The play area is the screen minus the HUD rows at the
+ * bottom, so the HUD never gets painted over.  Kept apart from World so
+ * a resize updates this first and the play area follows.
  *
- *      Scene.world.width  = Screen.cols
- *      Scene.world.height = Screen.rows − HUD_RESERVED_ROWS
- *
- *   Reserving the bottom HUD_RESERVED_ROWS rows for the HUD strip
- *   means the simulation never paints into them; the HUD always
- *   has clean canvas regardless of fluid activity.
- *
- *   Keeping Screen and World in SEPARATE structs lets a future
- *   resize update Screen.cols/rows first (from getmaxyx) and then
- *   propagate the truncated extent into Scene.world in scene_tick
- *   — a single point of contact between rendering and simulation.
- *
- * Why a tiny 2-field struct (not flat ints on App)
- *   • Lifecycle isolation: only screen_init / screen_resize /
- *     screen_cleanup / screen_present_frame touch ncurses' initscr
- *     / endwin / mvprintw.  They all take `Screen *` to make this
- *     layer explicit at the type level.
- *   • Symmetry with World: simulation and rendering each get one
- *     struct named for the space they live in.
- *
- * Render pipeline (one frame)
- *   erase → render_particles → render_border → hud_paint_status →
- *   hud_paint_hint → wnoutrefresh(stdscr) → doupdate().  Diff-only
- *   writes to the terminal — no flicker.
- *
- * Members
- *   cols   Terminal width in CELLS (from getmaxyx).
- *   rows   Terminal height in CELLS.  Bottom row index is rows − 1
- *          (where the key hint paints).
- *
- * Invariants
- *   cols > 0, rows > HUD_RESERVED_ROWS (otherwise no room for
- *   simulation; assumed throughout the codebase, not enforced).
- *
- * References
- *   [10] Raymond *Art of UNIX Programming* §11 / NCURSES-HOWTO §6 —
- *        diff-only render pipeline with wnoutrefresh + doupdate.
+ *   cols, rows   terminal size in cells (from getmaxyx)
  */
 typedef struct {
-    int cols;   /* terminal width  in cells (getmaxyx)             */
-    int rows;   /* terminal height in cells (getmaxyx)             */
+    int cols;
+    int rows;
 } Screen;
 
 static void screen_init(Screen *s, int theme_index) {
@@ -2167,44 +1016,18 @@ static void screen_present_frame(Screen *s, const Scene *sc, double fps_display,
   doupdate();
 }
 
-/* ===================================================================== */
-/* §19  app — main loop + signals + input                                */
-/* ===================================================================== */
+/* ── §19  app — the main loop, signals, and keys ── */
 
 /*
- * FpsCounter — rolling-window frame-rate estimator.
+ * FpsCounter — a steady frame-rate reading for the HUD.
  *
- * Intent
- *   Per-frame fps would jitter wildly (a single 1 ms scheduler hiccup
- *   swings the instantaneous reading by ~6 fps at 60 Hz).  This struct
- *   accumulates frame_count + elapsed nanoseconds over a fixed window
- *   (500 ms) and emits a smoothed `display` figure each time the
- *   window fills, so the HUD reads a stable number.
+ * A raw per-frame fps jumps around too much to read, so we count frames
+ * over a half-second window and show the average, refreshing it each
+ * time the window fills.
  *
- *   Same shape as the FpsCounter on every other file in this project
- *   (flocking.c, slime_mold.c, war.c, etc.) — adopting the shared
- *   pattern means a reader who knows one knows them all.
- *
- * Lifecycle
- *   fps_counter_init  — zero everything at startup.
- *   fps_counter_tick  — call once per frame with the frame's dt (ns).
- *                       Emits a fresh `display` only when the window
- *                       fills.
- *
- * Members
- *   frame_count   Frames seen in the current window.
- *   window_ns     Nanoseconds accumulated in the current window.
- *   display       Smoothed FPS shown in the HUD top row.
- *
- * Invariants
- *   frame_count ≥ 0, window_ns ≥ 0 between resets.
- *   display ≥ 0 (zero until the first 500 ms window completes).
- *
- * References
- *   [11] Fiedler 2014 — recommends a fixed smoothing window for any
- *        in-game fps display, on the same reasoning: per-frame
- *        readings are unstable, fixed-window averaging is the
- *        simplest robust answer.
+ *   frame_count   frames seen so far this window
+ *   window_ns     time piled up this window, in nanoseconds
+ *   display       the smoothed fps the HUD shows
  */
 typedef struct {
   int     frame_count;
@@ -2230,32 +1053,28 @@ static void fps_counter_tick(FpsCounter *f, int64_t dt) {
 }
 
 /*
- * App — top-level container; lives in BSS as the single g_app instance.
+ * App — everything the program holds onto, as one global.
  *
- * Intent
- *   Signal handlers (on_signal_*) need to reach state that the main
- *   loop polls.  A global App + handlers that flip its sig_atomic_t
- *   flags is the standard POSIX "wake the main loop" pattern.
+ * It's a global because the signal handlers below need to reach it, and
+ * a signal handler can only safely poke the two sig_atomic_t flags (the
+ * volatile keeps the main loop re-reading them after a signal lands).
+ * sim_hz lives here, not in Scene, because it's about loop timing, which
+ * the simulation itself doesn't care about.
  *
- * Why the volatile sig_atomic_t flags
- *   POSIX permits signal handlers to write ONLY sig_atomic_t values
- *   with simple assignments — anything wider is UB.  volatile forces
- *   the main loop to re-read from memory across signal arrival
- *   (no compiler caching into a register).
- *
- * Why sim_hz lives here (not in Scene)
- *   sim_hz is a frame-loop concern — it picks the inner-loop tick
- *   period TICK_NS(sim_hz) — and has no meaning inside scene_tick
- *   which receives the resulting dt as a parameter.  Putting it in
- *   App keeps Scene free of timing detail.
+ *   scene        the simulation
+ *   screen       the terminal size
+ *   fps          the frame-rate reading
+ *   sim_hz       physics steps per second ([ and ] adjust it)
+ *   running      cleared on Ctrl-C / kill to stop the loop
+ *   need_resize  set on a window resize so the loop re-reads the size
  */
 typedef struct {
-    Scene      scene;                      /* world + control state    */
-    Screen     screen;                     /* terminal extent          */
-    FpsCounter fps;                        /* rolling-window fps       */
-    int        sim_hz;                     /* sim tick rate, Hz        */
-    volatile sig_atomic_t running;         /* SIGINT/TERM clears this  */
-    volatile sig_atomic_t need_resize;     /* SIGWINCH sets this       */
+    Scene      scene;
+    Screen     screen;
+    FpsCounter fps;
+    int        sim_hz;
+    volatile sig_atomic_t running;
+    volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
@@ -2269,29 +1088,24 @@ static void on_signal_resize(int sig) {
   g_app.need_resize = 1;
 }
 
-/* Named action helpers — each maps to one key in the dispatcher
- * below.  Centralising them keeps app_handle_key as a flat switch
- * that reads as "key → named action" rather than inline mutations. */
+/* One small function per key, so the key switch below reads as a plain
+ * list of "key -> action". */
 
-/* spawn_random_top_blob — drop a small random blob near the top
- * row.  The 3-cell inset prevents spawn at the wall. */
+/* Drop a little extra blob near the top, kept off the side walls. */
 static void spawn_random_top_blob(const Scene *s) {
   enum { TOP_BLOB_RADIUS = 3, EDGE_INSET = 3, TOP_ROW = 3 };
   particle_spawn_blob(rand_in_range(EDGE_INSET, s->world.width - EDGE_INSET),
                       TOP_ROW, TOP_BLOB_RADIUS);
 }
 
-/* cycle_theme — t/T → next palette index, wrap at THEME_COUNT,
- * re-register the density colour pairs.  Pure render mutation —
- * does not disturb the particle pool. */
+/* Switch to the next colour theme. */
 static void cycle_theme(Scene *s) {
   s->theme_index = (s->theme_index + 1) % THEME_COUNT;
   colors_apply_theme(s->theme_index);
 }
 
-/* adjust_sim_hz — ] / [ keys bump physics tick rate by ±SIM_HZ_STEP,
- * clamped to [SIM_HZ_MIN, SIM_HZ_MAX].  Live change — the main loop
- * picks up the new TICK_NS(sim_hz) on the very next iteration. */
+/* Speed up / slow down the physics, kept within sane bounds.  The main
+ * loop notices the new rate on its next pass. */
 static void adjust_sim_hz(App *app, int delta) {
   int next = app->sim_hz + delta;
   if (next < SIM_HZ_MIN) next = SIM_HZ_MIN;
@@ -2299,26 +1113,13 @@ static void adjust_sim_hz(App *app, int delta) {
   app->sim_hz = next;
 }
 
-/* select_scene_preset — 1..5 keys load that scene preset; updates
- * Scene.active_id (HUD reads it) and reseeds the particle pool. */
+/* Load one of the five scenes. */
 static void select_scene_preset(Scene *s, int new_id) {
   s->active_id = new_id;
   scene_load_by_id(s, new_id);
 }
 
-/*
- * app_handle_key — process one keystroke.  Returns false to quit.
- *
- *   q / Q / ESC   quit
- *   space         toggle paused
- *   1..5          select_scene_preset
- *   g / G         toggle gravity (forces_pass reads s->sim.gravity_enabled)
- *   v / V         toggle viscosity (forces_pass reads s->sim.viscosity_enabled)
- *   r / R         reload current scene (re-runs scene_load_by_id)
- *   b / B         spawn_random_top_blob
- *   t / T         cycle_theme
- *   [ / ]         adjust_sim_hz by ∓SIM_HZ_STEP
- */
+/* Handle one keypress; return false only when it's time to quit. */
 static bool app_handle_key(App *app, int ch) {
   Scene *s = &app->scene;
   switch (ch) {
@@ -2343,20 +1144,15 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
-/* ===================================================================== */
-/* §20  main — entry point                                               */
-/* ===================================================================== */
+/* ── §20  main — set up, then run the loop ── */
 
 /*
- * main — fixed-step accumulator game loop (Fiedler "Fix Your Timestep!").
- *
- *   (1) handle pending SIGWINCH; refresh Scene.world from new extent
- *   (2) measure dt since last frame, capped at DT_CAP_NS
- *   (3) drain sim_accum: scene_tick at fixed TICK_LEN_NS until caught up
- *   (4) render + present
- *   (5) rolling-window fps counter
- *   (6) drain non-blocking input via app_handle_key
- *   (7) sleep until FRAME_BUDGET_NS exhausted (frame cap)
+ * Each pass of the loop: handle a resize, measure how long the last
+ * frame took, run as many fixed-size physics steps as that time bought,
+ * draw, update the fps reading, read keys, then sleep to hold the frame
+ * rate steady.  Stepping the physics at a fixed size (instead of by the
+ * real frame time) keeps the simulation behaving the same on any
+ * machine.
  */
 int main(void) {
   srand((unsigned int)(clock_now_ns() & 0xFFFFFFFF));
@@ -2373,7 +1169,7 @@ int main(void) {
   screen_init(&app->screen, 0);
   scene_init (&app->scene, app->screen.cols, app->screen.rows);
 
-  const int64_t DT_CAP_NS       = 100 * NS_PER_MS;          /* avalanche guard */
+  const int64_t DT_CAP_NS       = 100 * NS_PER_MS;          /* cap a long stall */
   const int64_t FRAME_BUDGET_NS = NS_PER_SEC / RENDER_FPS_CAP;
 
   int64_t prev_ns      = clock_now_ns();
@@ -2382,7 +1178,7 @@ int main(void) {
   while (app->running) {
     int64_t frame_start = clock_now_ns();
 
-    /* (1) handle pending SIGWINCH; refresh world from new extent */
+    /* (1) window resized? re-read the size */
     if (app->need_resize) {
       screen_resize(&app->screen);
       app->scene.world.width  = app->screen.cols;
@@ -2391,12 +1187,12 @@ int main(void) {
       app->need_resize = 0;
     }
 
-    /* (2) measure dt, cap to prevent avalanche */
+    /* (2) how long since last frame? (capped, so one stall can't snowball) */
     int64_t dt_ns = frame_start - prev_ns;
     prev_ns       = frame_start;
     if (dt_ns > DT_CAP_NS) dt_ns = DT_CAP_NS;
 
-    /* (3) drain accumulator: fixed-step physics until caught up */
+    /* (3) run fixed-size physics steps until we've used up that time */
     const int64_t TICK_LEN_NS = TICK_NS(app->sim_hz);
     sim_accum_ns += dt_ns;
     while (sim_accum_ns >= TICK_LEN_NS) {
@@ -2404,14 +1200,14 @@ int main(void) {
       sim_accum_ns -= TICK_LEN_NS;
     }
 
-    /* (4) render + present */
+    /* (4) draw the frame */
     screen_present_frame(&app->screen, &app->scene,
                          app->fps.display, app->sim_hz);
 
-    /* (5) rolling-window fps counter */
+    /* (5) update the fps reading */
     fps_counter_tick(&app->fps, dt_ns);
 
-    /* (6) drain input */
+    /* (6) handle any keys waiting */
     int ch;
     while ((ch = getch()) != ERR) {
       if (!app_handle_key(app, ch)) {
@@ -2420,7 +1216,7 @@ int main(void) {
       }
     }
 
-    /* (7) frame cap: sleep so we don't burn the next slot's budget */
+    /* (7) sleep out the rest of the frame to hold a steady rate */
     int64_t spent = clock_now_ns() - frame_start;
     if (spent < FRAME_BUDGET_NS)
       clock_sleep_ns(FRAME_BUDGET_NS - spent);

@@ -1,755 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * nuke.c — a mushroom cloud rising from a Stam stable-fluid simulation
+ * nuke.c — a rising mushroom cloud, in the terminal.
  *
- * DEMO: Detonate a Gaussian "blast" at the origin.  A 2-D AXISYMMETRIC
- *       fluid simulation runs underneath: hot gas rises by buoyancy,
- *       advects through the velocity field, cools toward ambient.
- *       A VOLUMETRIC RAYMARCHER renders the 2-D slice back into 3-D
- *       for the screen by exploiting the cloud's rotational symmetry
- *       around the y-axis.  Five blast presets, six themes (one of
- *       them photographic-negative), four debug overlays that show
- *       the raw fluid fields.
+ * Two pieces work together.  A small 2-D fluid simulation (Jos Stam's
+ * "Stable Fluids") tracks how hot gas climbs, drifts, and cools.  A
+ * volume raymarcher then spins that flat slice around its vertical
+ * axis to draw a 3-D-looking cloud — real mushroom clouds are nearly
+ * round, so one slice is enough.  Pick a blast size, a colour theme,
+ * or a debug overlay to peek at the raw fluid fields.
  *
- *       Two simulators stitched together by ONE NARROW INTERFACE:
- *
- *           sample_density_at_world(radius, altitude)
- *           sample_temperature_at_world(radius, altitude)
- *
- *       The fluid solver writes 2-D fields.  The renderer reads them
- *       at fractional cell coordinates derived from 3-D world (x, y,
- *       z) via the axisymmetric reduction (T7).  Neither side knows
- *       about the other's data structures.
- *
- *       The simulation runs Stam's "Stable Fluids" cycle:
- *
- *           BUOYANCY  →  PROJECT  →  ADVECT v  →  PROJECT  →
- *           ADVECT (T, ρ)  →  COOL & DECAY
- *
- *       Six steps per tick.  Each is unconditionally stable; the
- *       composition is too.  Crank dt — the cloud blurs, never blows.
- *
- * Study alongside:
- *   fluid/navier_stokes.c    — sibling Stam stable-fluid solver, but
- *                               on a Cartesian grid driven by user
- *                               forces / dye instead of buoyancy.
- *                               Same 4-phase advect/project pattern.
- *   raymarcher/raymarcher.c  — surface raymarching of an SDF.  This
- *                               file does VOLUME raymarching instead
- *                               (Beer-Lambert), a different beast (T8).
- *   fluid/fluid_sph.c        — Lagrangian particle alternative to
- *                               grid solvers.  Useful comparison.
- *
- * Section map:
- *   §1   config            — every tunable, every enum, no later magic
- *   §2   clock             — monotonic timer + sleep
- *   §3   vec3              — 3-D vector math (used only by raymarcher)
- *   §4   grid_helpers      — clampf, mirror_index, to_slot, bilinear
- *   §5   themes            — 6 colour palettes
- *   §6   colors            — pair init + theme apply
- *   §7   fluid_state       — the 8-field struct + global instance
- *   §8   boundaries        — wall conditions on the velocity field
- *   §9   buoyancy          — hot air rises
- *   §10  advect            — semi-Lagrangian back-trace
- *   §11  project           — divergence + Jacobi + gradient (one §)
- *   §12  cool_decay        — Newton cooling + density attenuation
- *   §13  fluid_step        — full physics tick (six phases)
- *   §14  detonate          — initial Gaussian bubble (only scripted bit)
- *   §15  sampling          — world (x, y, z) → bilinear 2-D field
- *   §16  raymarch          — Beer-Lambert volumetric integration
- *   §17  camera            — orthonormal basis + per-pixel ray
- *   §18  cell_decorate     — (lum, hot) → glyph + colour + attr
- *   §19  render_volume     — full screen of raymarched cells
- *   §20  debug_overlays    — three direct-field views
- *   §21  render_dispatch   — pick volume vs debug per active mode
- *   §22  hud               — top status + bottom hint (CLAUDE.md spec)
- *   §23  screen            — ncurses init / cleanup / present
- *   §24  scene             — per-frame state + tick + scene helpers
- *   §25  app               — main loop + signals + key handling
- *
- * Keys:
- *   q / Q / ESC      quit
- *   space            pause / resume
- *   r / R            re-detonate (restart from t = 0)
- *   n / N            next / prev blast preset
- *                      (TACTICAL / STANDARD / MEGATON / AIR_BURST / GROUND)
- *   t / T            next / prev theme
- *                      (REALISTIC / MATRIX / OCEAN / NOVA / TOXIC / NEGATIVE)
- *   d / D            cycle debug overlay
- *                      (NORMAL / DENSITY / TEMP / VELOCITY)
- *   + / -            simulation rate up / down
- *   z / Z            camera closer / farther
- *   ] / [            render fps cap up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra fluid/nuke.c -o nuke -lncurses -lm
+ * Sister files: fluid/navier_stokes.c (same solver, user-driven dye),
+ * raymarcher/raymarcher.c (surface — not volume — raymarching),
+ * fluid/fluid_sph.c (particle-based fluid for comparison).
  */
-
-/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
- *      Tutorials are a LADDER: T1 sets the worldview, T2-T6 build the
- *      fluid solver, T7 explains the 2-D-to-3-D bridge, T8-T10 build
- *      the volumetric renderer.
- *   2. §1 config — see all the tunables labelled.  Hint at scope.
- *   3. §7 fluid_state — the data structure.  Eight 2-D arrays in one
- *      struct; everything else manipulates these.
- *   4. §13 fluid_step — six lines of pseudocode.  The whole solver.
- *   5. §9 buoyancy → §10 advect → §11 project → §12 cool_decay —
- *      one § per phase, in the order fluid_step calls them.  Each
- *      pairs with one tutorial (T2, T4, T5, T6).
- *   6. §15 sampling + §16 raymarch + §17 camera — the renderer.
- *      Pairs with T7-T10.
- *   7. §22-§25 — orchestration.  Standard framework code.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   velocity_radial, velocity_vertical    vᵣ, vᵧ on the axisymmetric grid
- *   temperature, density                  T, ρ — passive scalars
- *   pressure, divergence                  scratch for projection (T5)
- *   scratch_a, scratch_b                  generic Jacobi/advection scratch
- *
- *   GRID_RADIAL_CELLS, GRID_VERTICAL_CELLS    grid resolution
- *   GRID_CELL_SIZE                            world-space cell side
- *   GRID_INV_CELL_SIZE                        1 / GRID_CELL_SIZE
- *
- *   simulation_time_seconds                   sim time elapsed (read in HUD)
- *   simulation_step_accumulator               fixed-dt accumulator
- *   simulation_rate                           real → sim time multiplier
- *
- *   total_luminance, hot_luminance            raymarcher per-pixel outputs
- *
- * Background you need
- * ───────────────────
- *   - Vectors in 3-D: dot, cross, normalise.  §3 vec3 has these.
- *   - Familiarity with ∇· (divergence) and ∇p (gradient) helpful but
- *     not required — T2 and T5 introduce them informally.
- *   - Read raymarcher/raymarcher.c first if SDF surface tracing is
- *     unfamiliar; volume raymarching (T8) is a different mode but
- *     reuses the per-pixel ray geometry.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Real combustion physics, Mach disks, fireball thermodynamics.
- *     We model heat as a passive scalar that lifts under buoyancy.
- *   - 3-D fluid math.  The simulator is 2-D axisymmetric (T7).
- *   - Compressible flow / shock waves.  Initial radial outflow is
- *     scripted in detonate(), not simulated.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ───────────────────────────────────────────────────────── *
- *
- * Algorithm    : Stam's Stable Fluids (1999) on a 2-D AXISYMMETRIC
- *                grid (radius × altitude), driven by BUOYANCY from a
- *                Gaussian temperature bubble.  Volumetric raymarching
- *                renders the 2-D slice back into 3-D by exploiting
- *                rotational symmetry around the y-axis.
- *
- *                Per fluid tick:
- *                   1. apply buoyancy           (hot → upward push)
- *                   2. project                  (zero ∇·v)
- *                   3. advect velocity by itself
- *                   4. project again            (advect re-introduces ∇·v)
- *                   5. advect temperature + density
- *                   6. cool + decay             (return to ambient)
- *
- *                Per render frame:
- *                   7. ray gen   (orthonormal camera basis, per-pixel ray)
- *                   8. raymarch  (Beer-Lambert volumetric integration)
- *                   9. decorate  ((lum, hot) → glyph + theme colour)
- *                  10. emit      (mvaddch with batched attr changes)
- *
- * Math basis   : Hodge decomposition theorem says any vector field
- *                can be split as v = v_div_free + ∇φ.  PROJECTION
- *                extracts v_div_free by solving the Poisson equation
- *                ∇²φ = ∇·v (Jacobi iteration, 40 sweeps), then
- *                subtracting ∇φ from v.  Buoyancy uses the Boussinesq
- *                approximation: vertical accel ∝ (T - T_ambient).
- *                Volumetric rendering uses the Beer-Lambert law for
- *                light attenuation through a participating medium
- *                with self-emission proportional to temperature.
- *
- * Performance  : Eight 2-D float arrays, total ~168 KB, all in BSS;
- *                no malloc anywhere.  Per render frame: ~80 cols ×
- *                ~22 rows × ~130 march steps ≈ 230K samples.  Per
- *                fluid tick: ~5K cells × 40 Jacobi sweeps × 2
- *                projections ≈ 430K cell updates.  Comfortable
- *                60 fps on any modern CPU.
- *
- * References
- * ──────────
- *   ── 2-D fluid solver (Stable Fluids) ──────────────────────────────
- *   [1] Stam, J. (1999), "Stable Fluids", SIGGRAPH '99 — THE
- *       foundational paper.  Introduces semi-Lagrangian advection +
- *       Hodge-projection scheme used in §fluid_*.  Five pages, mostly
- *       diagrams.
- *   [2] Stam, J. (2003), "Real-Time Fluid Dynamics for Games", GDC —
- *       the classroom version with 100-line reference C code that
- *       mirrors our §advect / §diffuse / §project.
- *   [3] Bridson, R. (2008), "Fluid Simulation for Computer Graphics",
- *       CRC Press — chs. 1-4 cover the discretisations used here in
- *       depth (semi-Lagrangian, Gauss-Seidel, projection).
- *
- *   ── Combustion / buoyancy models ─────────────────────────────────
- *   [4] Fedkiw, R., Stam, J. & Jensen, H. W. (2001), "Visual
- *       Simulation of Smoke", SIGGRAPH 2001 — the temperature-driven
- *       buoyancy term (T·ĝ) and vorticity-confinement extension used
- *       in §fluid_buoyancy.
- *   [5] Nguyen, D. Q., Fedkiw, R. & Jensen, H. W. (2002), "Physically
- *       Based Modeling and Animation of Fire", SIGGRAPH — the fire-
- *       core / temperature-emission model behind §raymarch's hot-zone
- *       glow.
- *
- *   ── Volume rendering (3-D raymarch) ──────────────────────────────
- *   [6] Quilez, I., "Volumetric raymarching" —
- *       iquilezles.org/articles/raymarchingvolumes; the Beer-Lambert
- *       integration loop in §raymarch.
- *   [7] Max, N. (1995), "Optical Models for Direct Volume Rendering",
- *       IEEE TVCG 1(2) — the canonical taxonomy of volume-rendering
- *       integrals; §16 implements the "emission-absorption" model.
- *   [8] Beer-Lambert law derivation — any optics textbook;
- *       absorption τ = ∫ κ·ds along the ray.
- *
- *   ── Rendering / ncurses ──────────────────────────────────────────
- *   [9] Bourke, P. (1997), "Character representation of grayscale
- *       images", paulbourke.net/dataformats/asciiart — the
- *       luminance→glyph ramp used to convert raymarched colour to
- *       cell glyphs.
- *  [10] Raymond, E. S., "NCURSES Programming HOWTO" —
- *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
- *       use_default_colors, and the newscr/curscr diff pipeline.
- *
- *   ── Online quick reference ───────────────────────────────────────
- *  [11] https://en.wikipedia.org/wiki/Beer%E2%80%93Lambert_law
- *  [12] https://en.wikipedia.org/wiki/Volume_rendering
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ───────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * TWO SIMULATORS run side-by-side: a 2-D fluid solver tracking how
- * hot gas moves through space, and a 3-D volumetric raymarcher that
- * INFLATES the 2-D slice back into a 3-D image.  The fluid never
- * knows about pixels.  The renderer never knows about pressure.
- * Both meet at one narrow interface: sample_density_at_world() and
- * sample_temperature_at_world(), which convert a world-space (x, y,
- * z) point to a (radius, altitude) pair and bilinearly sample the
- * 2-D grid.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a slowly-evolving photograph of a smoke column.  The
- * photograph is 2-D — a thin slice through the column.  Because real
- * mushroom clouds have rotational symmetry around their vertical
- * axis, a 3-D reconstruction is just "rotate the slice around the
- * y-axis."  Every camera ray, after tracing through this rotational
- * extrusion of the slice, accumulates light by Beer-Lambert: hot
- * cells emit, dense cells absorb.  The 2-D slice itself evolves
- * under Stam's stable-fluid rules: hot cells push up, the velocity
- * field is cleaned to be divergence-free, then everything advects
- * with the flow and cools toward ambient.
- *
- * One fluid tick (Stable Fluids cycle):
- *
- *      ┌─────────────────────────────────────────────────────────┐
- *      │                                                         │
- *      │   T (temperature) ──────► buoyancy ─┐                   │
- *      │                                     ▼                   │
- *      │   v (velocity) ◄──── project ◄── (v + Δv from buoyancy) │
- *      │                       │                                 │
- *      │                       ▼  (∇·v ≈ 0)                      │
- *      │                  advect v by itself                     │
- *      │                       │                                 │
- *      │                       ▼                                 │
- *      │                    project ◄──── advection re-introduces│
- *      │                       │           a tiny ∇·v            │
- *      │                       ▼                                 │
- *      │           advect (T, ρ) by clean v                      │
- *      │                       │                                 │
- *      │                       ▼                                 │
- *      │           cool toward ambient · density decay           │
- *      │                                                         │
- *      └─────────────────────────────────────────────────────────┘
- *
- * One render frame (volumetric raymarch):
- *
- *      ┌─────────────────────────────────────────────────────────┐
- *      │                                                         │
- *      │   for each pixel:                                       │
- *      │     ray ← (camera_origin, ray_direction)                │
- *      │     transmittance = 1; total = hot = 0                  │
- *      │     for step = 0..MAX_STEPS:                            │
- *      │       point = origin + t · direction                    │
- *      │       (radius, altitude) ← (√(x²+z²), y)                │
- *      │       (ρ, T) ← bilinear from 2-D grid                   │
- *      │       dτ = ρ · STEP · DENSITY_GAIN                      │
- *      │       emit = clamp((T-T_amb)/(T_peak-T_amb), 0, 1)       │
- *      │       total += transmittance · dτ · (emit·EM + AMB)     │
- *      │       hot   += transmittance · dτ · emit · EM           │
- *      │       transmittance *= exp(-dτ)                         │
- *      │       if transmittance < ε: break                       │
- *      │     cell ← decorate(total, hot)                         │
- *      │                                                         │
- *      └─────────────────────────────────────────────────────────┘
- *
- * KEY FORMULAS
- * ────────────
- *
- *   BUOYANCY (Boussinesq approximation):
- *     vᵧ_new = vᵧ_old + β · (T − T_ambient) · dt
- *
- *   SEMI-LAGRANGIAN ADVECTION (Stam):
- *     for each cell (i, j):
- *       (i_back, j_back) = (i, j) − v[i, j] · dt / h
- *       new_field[i, j]  = bilinear(old_field, i_back, j_back)
- *
- *   DIVERGENCE (centred difference):
- *     ∇·v[i, j] = (vᵣ[i+1, j] − vᵣ[i−1, j]) / (2h)
- *               + (vᵧ[i, j+1] − vᵧ[i, j−1]) / (2h)
- *
- *   POISSON FOR PRESSURE (Jacobi update):
- *     p_new[i, j] = ( p[i+1, j] + p[i−1, j] + p[i, j+1] + p[i, j−1]
- *                     − h² · ∇·v[i, j] ) / 4
- *
- *   GRADIENT SUBTRACTION (closes the projection):
- *     vᵣ_clean[i, j] = vᵣ[i, j] − (p[i+1, j] − p[i−1, j]) / (2h)
- *     vᵧ_clean[i, j] = vᵧ[i, j] − (p[i, j+1] − p[i, j−1]) / (2h)
- *
- *   NEWTON COOLING:
- *     T_new = T_ambient + (T_old − T_ambient) · exp(−k_cool · dt)
- *
- *   AXISYMMETRIC LIFT (3-D world → 2-D grid):
- *     radius   = √(x² + z²)
- *     altitude = y
- *     (ρ, T)   = bilinear(2-D field, radius/h, altitude/h)
- *
- *   BEER-LAMBERT VOLUME INTEGRATION (per ray, per step):
- *     dτ              = ρ · STEP · DENSITY_GAIN
- *     emit            = clamp((T − T_amb) / (T_peak − T_amb), 0, 1)
- *     source          = emit · EMISSION_GAIN + AMBIENT_FLOOR
- *     total_lum      += transmittance · dτ · source
- *     hot_lum        += transmittance · dτ · emit · EMISSION_GAIN
- *     transmittance  *= exp(−dτ)
- *
- *   PIXEL DECORATION:
- *     glyph_slot = floor(total_lum / LUM_CLAMP · 8)         ∈ [0, 7]
- *     hot_slot   = floor(hot_lum / total_lum · 8)            ∈ [0, 7]
- *     glyph      = ".,:;+*#@"[glyph_slot]
- *     pair       = PAIR_RAMP_BASE + hot_slot
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   - WHY TWO PROJECTIONS per fluid step?  Buoyancy adds vertical
- *     impulse → divergence.  Project to clean.  Then advection on a
- *     divergence-free field RE-INTRODUCES tiny ∇·v (bilinear sampling
- *     is not exactly volume-preserving).  Project again before
- *     scalar advection.  Without the second project, the cloud
- *     subtly drifts over time.
- *
- *   - JACOBI ITERATION COUNT (40) is tuned for visual quality at
- *     this grid size.  Below ~25 iters you see "puff" artefacts
- *     where residual divergence pushes scalars around.  Above 40
- *     gives diminishing returns at significant CPU cost.
- *
- *   - VELOCITY ADVECTION needs DOUBLE BUFFERING.  vᵣ and vᵧ are
- *     advected by the SAME field (themselves), so we can't overwrite
- *     vᵣ before reading it for vᵧ's advection.  scratch_a and
- *     scratch_b are the destination buffers; memcpy back at the end.
- *
- *   - AXISYMMETRIC reduces simulation cost by ~50× vs full 3-D, but
- *     loses any non-axisymmetric structure.  No tilted column, no
- *     wind shear, no off-centre cap.  Trade-off for terminal demo.
- *
- *   - CAM_DISTANCE_MIN (8.0) is just outside the typical MEGATON
- *     cap.  Pushing closer puts the camera INSIDE the cloud — the
- *     screen fills with smoke colour.
- *
- *   - NEGATIVE THEME uses a white background.  A_BOLD/A_DIM are
- *     disabled for it (see decorate_volume_pixel) because they
- *     INVERT their visual meaning against a light bg — bold becomes
- *     "more saturated", dim becomes "harder to see colour", neither
- *     of which is the brightness signal we want.
- *
- *   - SIM_DT_MAX_REAL (80 ms) caps per-frame sim advance.  Without
- *     it, a hiccup that delays the loop 1 s would advance 1 s of sim
- *     time in one frame — the cloud teleports to a much later state.
- *
- * HOW TO VERIFY
- * ─────────────
- *   - At t = 0 the screen shows a hint of glow at altitude ≈
- *     blast.detonation_altitude.  Within ~2 sim seconds a clear
- *     STEM forms; CAP appears around 4-6 seconds; cloud levels off
- *     around 10-15 seconds.
- *   - Press 'n' to cycle blast presets:
- *       TACTICAL  — small, low-altitude, brief.
- *       STANDARD  — canonical mid-yield mushroom.
- *       MEGATON   — huge, very tall column, long-lasting cap.
- *       AIR_BURST — high-altitude, no ground stem.
- *       GROUND    — surface burst, wide base, heavy dust.
- *   - Press 'd' to cycle debug overlays.  DENSITY shows the 2-D
- *     density slice directly (no rendering).  TEMP shows heat —
- *     watch buoyancy push hot cells upward.  VELOCITY shows the
- *     flow field as ASCII arrows.
- *   - Press 't' through all 6 themes.  Geometry stays identical;
- *     only the smoke→fire colour ramp changes.
- *   - Press 'r' to re-detonate.  Same physics replays — deterministic.
- *   - Press 'z' to zoom in.  At minimum distance you can resolve
- *     individual "puff" cells.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
- *
- *   T1   What is a fluid simulation?
- *   T2   Buoyancy — Boussinesq approximation
- *   T3   Operator splitting — divide and conquer
- *   T4   Semi-Lagrangian advection — backward trace
- *   T5   Pressure projection — Hodge decomposition + Jacobi
- *   T6   Cooling and density decay
- *   T7   Axisymmetric reduction — 2-D sim, 3-D render
- *   T8   Volumetric raymarching — Beer-Lambert
- *   T9   Camera + ray generation
- *   T10  Pixel decoration — decoupled glyph and colour signals
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  WHAT IS A FLUID SIMULATION?
- * ───────────────────────────────
- * A grid of cells, each storing some QUANTITIES that vary over space:
- *
- *      VELOCITY    how fast and which way the fluid is moving
- *      DENSITY     how much "stuff" (smoke) is in this cell
- *      TEMPERATURE how hot is the fluid here
- *      PRESSURE    internal force (used to enforce mass conservation)
- *
- * Each tick of simulation:
- *   - stuff MOVES according to the velocity (advection, T4)
- *   - velocity CHANGES according to forces (buoyancy, pressure, T2/T5)
- *   - temperature changes via its own laws (cooling, T6)
- *
- * Run this loop for thousands of ticks → an evolving fluid.  Render
- * the density + temperature each frame → a movie.
- *
- * Compare with PARTICLE methods (fluid_sph.c, lattice_gas.c): they
- * track DISCRETE PARTICLES that move with the flow.  Eulerian (this
- * file) tracks the FIELD on a fixed grid; Lagrangian (SPH) tracks
- * particles.  Trade-offs are well known: Eulerian wins on pressure
- * / incompressibility (one Poisson solve, T5); Lagrangian wins on
- * free surfaces and splashes.  We're modelling a smoke column —
- * Eulerian fits.
- *
- * T2  BUOYANCY — BOUSSINESQ APPROXIMATION
- * ───────────────────────────────────────
- * Hot gas is less dense than cold gas at the same pressure, so cold
- * surrounding air pushes the hot stuff up.  Real buoyancy is mass-
- * dependent and intricate; the BOUSSINESQ APPROXIMATION says we can
- * treat density variations as small (so mass is constant) and put
- * the temperature dependence ONLY into the buoyancy force:
- *
- *      acceleration_y = β · (T − T_ambient) · g
- *
- * where β is the thermal expansion coefficient and g is gravity.  We
- * bake (β · g) into one constant BUOYANCY_COEFFICIENT.  Per cell, per
- * tick:
- *
- *      vᵧ[i, j] += BUOYANCY_COEFFICIENT · (T[i, j] − T_ambient) · dt
- *
- * That's the entire buoyancy step — five characters of code and one
- * Newton's-law integration.  Try it: removing this function gives a
- * cold, drifting cloud (advection still moves stuff, but nothing
- * lifts it).  Doubling BUOYANCY_COEFFICIENT gives a fast riser;
- * halving gives a slow ponderous cloud.
- *
- * Real bombs: buoyancy lifts the fireball after the initial radial
- * expansion (~1-2 sec).  We seed the radial outflow in detonate()
- * (T8); buoyancy takes over from there.
- *
- * T3  OPERATOR SPLITTING — DIVIDE AND CONQUER
- * ───────────────────────────────────────────
- * Full Navier-Stokes is a coupled non-linear PDE.  Solving it
- * directly each tick is hard.  Stam's TRICK: split into pieces, each
- * with a clean solver, run them in sequence:
- *
- *     (1)  ∂v/∂t = f                FORCES — trivial: v += f·dt
- *     (2)  ∂v/∂t = −(v·∇)v          ADVECTION (T4)
- *     (3)  ∇·v = 0  via  ∇²p = ∇·v  PROJECTION (T5)
- *
- * Plus passive scalars (T, ρ) get advected by the cleaned-up
- * velocity, and temperature additionally cools (T6).
- *
- * Stam's order is: BUOYANCY → PROJECT → ADVECT v → PROJECT → ADVECT
- * scalars → COOL.  Six steps.  TWO projections because advection
- * re-introduces tiny divergence; we clean it up before the scalars
- * are advected.
- *
- * Each step's input is the previous step's output.  Each step is
- * UNCONDITIONALLY STABLE in isolation — the composition is too.
- *
- * Same architectural pattern as Unix pipes: each box knows nothing
- * about the others, plug new physics steps in by inserting a new
- * box (e.g. surface tension, vorticity confinement).
- *
- * T4  SEMI-LAGRANGIAN ADVECTION — BACKWARD TRACE
- * ──────────────────────────────────────────────
- * Naïve advection: PUSH each cell's value forward by velocity·dt:
- *
- *      new_field[i + vᵣ·dt][j + vᵧ·dt] = field[i][j]
- *
- * Two problems: (a) destination is fractional; (b) at big timesteps
- * the value lands outside the grid or overlaps other pushed values.
- * Either way it BLOWS UP — values amplify each tick.
- *
- * Stam's STABLE FLUIDS trick: trace BACKWARD.  For each destination
- * cell, ask "where was the fluid currently here, one step ago?".
- * Sample the OLD field at that source location:
- *
- *      for each cell (i, j):
- *          source_pos        = (i, j) − v[i, j]·dt / h
- *          new_field[i, j]   = bilinear(old_field, source_pos)
- *
- * Bilinear interpolation gives a clean weighted average of the four
- * neighbouring cells around the source position.  Two key
- * properties:
- *
- *   STABILITY  - bilinear sample is bounded by the four neighbours;
- *                the field can never blow up no matter how big dt.
- *   DIFFUSION  - bilinear interpolation always loses a little high-
- *                frequency detail.  Each tick the field gets very
- *                slightly blurrier.  Acceptable price.
- *
- * One advect_field() works for any scalar field: vᵣ, vᵧ, T, ρ.
- *
- *      ┌──────────────────────────────────────────────────────┐
- *      │                                                      │
- *      │   t            t + dt                                │
- *      │                                                      │
- *      │   ●────────►   ■                                     │
- *      │  source        cell at t+dt                          │
- *      │                                                      │
- *      │   "where did the fluid in ■ come from at time t?"    │
- *      │   Answer: trace backward by -v·dt → (i_back, j_back) │
- *      │   Then bilinear-interp the OLD field at that point.  │
- *      │                                                      │
- *      └──────────────────────────────────────────────────────┘
- *
- * T5  PRESSURE PROJECTION — HODGE DECOMPOSITION + JACOBI
- * ──────────────────────────────────────────────────────
- * After buoyancy adds vertical velocity, the field has nonzero
- * divergence — some cells "create" upward fluid.  To restore mass
- * conservation (∇·v = 0):
- *
- * HODGE DECOMPOSITION (the math fact we exploit).  Any vector
- * field can be uniquely split:
- *
- *      v = v_div_free + ∇φ
- *
- * where ∇φ is the gradient of some scalar field φ.  We don't know
- * v_div_free directly, but we can find ∇φ by solving:
- *
- *      ∇²φ = ∇·v          (Poisson equation for φ)
- *
- * Then v_div_free = v − ∇φ.  In our notation φ is "pressure" p:
- *
- *      1. compute ∇·v
- *      2. solve ∇²p = ∇·v for p (Jacobi iteration)
- *      3. subtract ∇p from v
- *
- * The result is a velocity field whose divergence is approximately
- * zero — fluid is conserved.
- *
- * JACOBI UPDATE.  Discrete Laplacian on a 5-point stencil:
- *
- *      ∇²p[i, j] ≈ (p[i+1, j] + p[i−1, j] + p[i, j+1] + p[i, j−1]
- *                   − 4·p[i, j]) / h²
- *
- * Setting equal to ∇·v[i, j] and solving for p[i, j]:
- *
- *      p[i, j] = (p[i+1, j] + p[i−1, j] + p[i, j+1] + p[i, j−1]
- *                 − h² · ∇·v[i, j]) / 4
- *
- * Replace each cell with the average of its four neighbours minus a
- * divergence correction.  Iterate until convergence.  We use 40
- * sweeps — enough for visual quality, fast enough for 60 fps.
- *
- * Boundary conditions: zero-gradient (mirror neighbours).  No-flow
- * walls everywhere — consistent with how we treat the axis (no
- * radial flow through r=0) and ground (no vertical flow through
- * y=0).  See §4 mirror_index.
- *
- * T6  COOLING AND DENSITY DECAY
- * ─────────────────────────────
- * Two passive losses keep the simulation from running indefinitely:
- *
- * NEWTON COOLING — temperature returns toward ambient exponentially:
- *
- *      T_new = T_ambient + (T_old − T_ambient) · exp(−k_cool · dt)
- *
- * The constant k_cool sets the time scale.  k_cool = 0.06/sec means
- * temperature excess halves every ~12 sec.  Without cooling, the
- * cloud rises forever; nothing pulls heat back down.
- *
- * DENSITY DECAY — linear loss models entrainment of ambient air:
- *
- *      ρ_new = ρ_old · (1 − k_decay · dt)
- *
- * We don't simulate entrainment as a process; we approximate its net
- * effect with a slow linear fade.  Without decay, dense smoke
- * persists indefinitely and the cloud never dissipates.
- *
- * Both are simple per-cell operations applied at the END of each
- * fluid_step().  They commute with each other (act on independent
- * fields) and with advection (advection is bilinear; both decays
- * are uniform scalar multiplications).
- *
- * T7  AXISYMMETRIC REDUCTION — 2-D SIM, 3-D RENDER
- * ────────────────────────────────────────────────
- * The fluid simulation is 2-D (radius × altitude = 56 × 96 cells).
- * The volume renderer thinks in 3-D world coordinates (x, y, z).
- * The bridge is one line of math:
- *
- *      radius   = √(x² + z²)
- *      altitude = y
- *
- * The "axisymmetric" assumption: the cloud is rotationally symmetric
- * around the y-axis.  Any 3-D world point's density is determined
- * solely by its radial distance from the y-axis and its altitude.
- * Sample the 2-D fluid grid at (radius/h, altitude/h) bilinearly →
- * the 3-D density at (x, y, z).
- *
- *      ┌──────────────────────────────────────────────────────┐
- *      │                                                      │
- *      │   2-D simulation slice         3-D rendered scene    │
- *      │   (radius × altitude)          (x, y, z space)       │
- *      │                                                      │
- *      │      ┌───────────┐                                   │
- *      │      │  ● ● ●    │           rotate around y         │
- *      │      │ ●     ●   │           ──────────────►         │
- *      │      │●       ●  │              ╭──────╮             │
- *      │      │  ● ● ●    │              │ ●●●● │             │
- *      │      │           │             │ ●●●●●● │            │
- *      │      └───────────┘              │●●●●●●●│            │
- *      │      r → outward                 ╰──────╯             │
- *      │      y ↑ upward                  axisymmetric         │
- *      │                                  3-D extrusion        │
- *      │                                                      │
- *      └──────────────────────────────────────────────────────┘
- *
- * Ramifications:
- *   - CHEAPER SIM.  ~5K grid cells, not ~3M (50× cost reduction).
- *   - LIMITED PHENOMENA.  No tilted columns, no wind shear, no
- *     non-circular caps.  Everything mirror-symmetric around y.
- *
- * For a MUSHROOM CLOUD this is approximately fine — real mushroom
- * clouds are very nearly axisymmetric.  For wind-blown smoke,
- * leaning campfires, or vortex shedding behind obstacles, you'd
- * need full 3-D simulation.
- *
- * T8  VOLUMETRIC RAYMARCHING — BEER-LAMBERT
- * ─────────────────────────────────────────
- * Surface raymarching (raymarcher.c) finds WHERE a ray hits a
- * surface.  Volume rendering integrates LIGHT along a ray as it
- * passes through a SEMI-TRANSPARENT MEDIUM.  For each ray:
- *
- *      transmittance = 1
- *      total_lum     = 0
- *      hot_lum       = 0
- *      for each step at distance s from origin:
- *          dτ      = ρ · STEP · DENSITY_GAIN          (optical depth)
- *          emit    = (T − T_amb) / (T_peak − T_amb)   in [0, 1]
- *          source  = emit · EMISSION_GAIN + AMBIENT_FLOOR
- *          total_lum += transmittance · dτ · source           (accumulate)
- *          hot_lum   += transmittance · dτ · emit · EMISSION_GAIN
- *          transmittance *= exp(−dτ)                  (Beer-Lambert decay)
- *          if transmittance < ε: break
- *
- * Physical interpretation:
- *   - DENSITY blocks light: each step subtracts dτ from optical
- *     transmittance, and exp(−dτ) is what fraction of incoming light
- *     survives the segment (Beer-Lambert law).
- *   - TEMPERATURE emits light: hot cells contribute proportional to
- *     their temperature excess.  A cool foggy cell adds nothing
- *     beyond AMBIENT_FLOOR (a faint Rayleigh-scatter analogue).
- *   - Each contribution is multiplied by transmittance — light from
- *     cells far behind opaque smoke doesn't reach the camera.
- *
- * Two outputs per ray:
- *   total_luminance   how bright this pixel is overall
- *   hot_luminance     how much of that came from emission
- *
- * The HOT FRACTION (hot_lum / total_lum) drives the smoke vs. fire
- * colour decision in §18 cell_decorate.
- *
- * Speed optimisation: empty regions (ρ < threshold) skip ahead with
- * a longer step.  Pure-empty rays (which dominate when the cloud is
- * small) cost ~70% less than a uniform march.
- *
- * T9  CAMERA + RAY GENERATION
- * ───────────────────────────
- * Standard pinhole camera.  Three orthonormal vectors define the
- * view:
- *
- *      forward = look_at − cam_origin, normalised
- *      right   = forward × world_up, normalised
- *      up      = right × forward
- *
- * Per pixel ray:
- *
- *      u =  (col + 0.5) / cols      ·2 −1     ∈ [−1, +1]
- *      v = −((row + 0.5) / rows·2 − 1)        ∈ [−1, +1]  (y-flip)
- *      ray = forward + u·tan(FOV/2)·right
- *                    + v·tan(FOV/2)·aspect·up
- *
- * The aspect factor accounts for terminal cells being ~2× tall.
- *
- * Camera placed at (0, CAM_HEIGHT, −distance) looking at (0,
- * CAM_LOOK_AT_HEIGHT, 0) so the cloud is centred in the frame and
- * we can see the stem from a slightly-above ground angle.
- *
- * T10 PIXEL DECORATION — DECOUPLED GLYPH AND COLOUR SIGNALS
- * ─────────────────────────────────────────────────────────
- * Two scalars per pixel from the raymarcher: total_lum and hot_lum.
- * Naively you might map both to a single colour-glyph composite.
- * We use TWO INDEPENDENT CHANNELS instead:
- *
- *      GLYPH from total_luminance via 8-tier ramp ".,:;+*#@".
- *            Read as: how DENSE is this pixel?
- *
- *      COLOUR from hot_fraction = hot_lum / total_lum.
- *             Cool pixel → ramp slot 0 (smoke colour).
- *             Hot pixel  → ramp slot 7 (fire colour).
- *             Read as: how HOT is this pixel?
- *
- * Result: a thin wisp of cool smoke and the bright core of a
- * fireball look visually distinct EVEN AT THE SAME BRIGHTNESS.
- * If glyph and colour both encoded brightness, you'd get redundant
- * info — a faint dot in red could mean either "dim fire" or "bright
- * smoke," indistinguishable.
- *
- *      ┌──────────────────────────────────────────────────────┐
- *      │                                                      │
- *      │   total_lum                hot_lum / total_lum       │
- *      │      │                              │                │
- *      │      ▼                              ▼                │
- *      │   GLYPH                          COLOUR              │
- *      │   ".,:;+*#@"                     "smoke→fire"        │
- *      │      │                              │                │
- *      │      └──────────┬───────────────────┘                │
- *      │                 ▼                                    │
- *      │              mvaddch(row, col, glyph) with          │
- *      │              COLOR_PAIR(pair) | attr                 │
- *      │                                                      │
- *      └──────────────────────────────────────────────────────┘
- *
- * Decoupled signals = more information per pixel.  Same trick
- * appears in good data visualisations: encode independent variables
- * with independent visual channels (size, colour, position, shape).
- *
- * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -767,9 +30,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  config — every constant + enums                                   */
-/* ===================================================================== */
+/* ── §1 config — every tunable lives here, no magic numbers later ── */
 
 /* §1.1 frame rate + UI layout. */
 enum {
@@ -783,9 +44,9 @@ enum {
 
 /* §1.2 colour-pair IDs. */
 enum {
-  PAIR_HUD_STATUS = 1, /* yellow + bold (top status row)           */
-  PAIR_HUD_HINT = 2,   /* cyan + bold   (bottom hint row)          */
-  PAIR_RAMP_BASE = 3,  /* +0..+7 — smoke→fire ramp                  */
+  PAIR_HUD_STATUS = 1, /* top status row (yellow + bold)            */
+  PAIR_HUD_HINT = 2,   /* bottom hint row (cyan + bold)             */
+  PAIR_RAMP_BASE = 3,  /* +0..+7 = the smoke-to-fire colour ramp    */
 };
 
 /* §1.3 time helpers. */
@@ -796,7 +57,7 @@ enum {
 /* §1.4 terminal cell aspect. */
 #define TERMINAL_CELL_ASPECT 2.0f /* physical h / w */
 
-/* §1.5 fluid grid (T7). */
+/* §1.5 fluid grid — the flat radius-by-altitude slice we simulate. */
 #define GRID_RADIAL_CELLS 56
 #define GRID_VERTICAL_CELLS 96
 #define GRID_CELL_SIZE 0.125f
@@ -804,15 +65,15 @@ enum {
 #define GRID_VERTICAL_EXTENT ((float)GRID_VERTICAL_CELLS * GRID_CELL_SIZE)
 #define GRID_INV_CELL_SIZE (1.0f / GRID_CELL_SIZE)
 
-#define POISSON_JACOBI_ITERATIONS 40 /* sweeps per project (T5)     */
+#define POISSON_JACOBI_ITERATIONS 40 /* relaxation passes per projection */
 
 /* §1.6 physics constants. */
 #define TEMPERATURE_AMBIENT 1.0f
 #define TEMPERATURE_PEAK 8.0f
 #define DENSITY_PEAK 4.0f
-#define BUOYANCY_COEFFICIENT 2.4f /* β·g, see T2                  */
-#define COOL_RATE 0.06f           /* Newton cooling (T6)          */
-#define DENSITY_DECAY 0.009f      /* density linear loss / sec    */
+#define BUOYANCY_COEFFICIENT 2.4f /* how hard hot air pushes upward   */
+#define COOL_RATE 0.06f           /* how fast heat fades to ambient   */
+#define DENSITY_DECAY 0.009f      /* how fast smoke thins out per sec */
 
 /* §1.7 simulation timing. */
 #define SIM_DT 0.025f          /* fixed sim step (sim seconds) */
@@ -831,7 +92,7 @@ enum {
 #define CAM_LOOK_AT_HEIGHT 6.0f
 #define CAM_FIELD_OF_VIEW_DEG 52.0f
 
-/* §1.9 volumetric raymarcher (T8). */
+/* §1.9 volume raymarcher — how the cloud gets drawn. */
 #define RM_RAY_NEAR 0.5f
 #define RM_RAY_FAR 32.0f
 #define RM_STEP 0.18f
@@ -841,15 +102,15 @@ enum {
 #define RM_EMISSION_GAIN 4.5f
 #define RM_AMBIENT_FLOOR 0.06f
 #define RM_EMPTY_DENSITY_EPS 0.001f
-#define RM_EMPTY_SKIP_FACTOR 2.0f /* fast-skip multiplier */
+#define RM_EMPTY_SKIP_FACTOR 2.0f /* take bigger steps through empty air */
 
-/* §1.10 pixel classification (T10). */
+/* §1.10 turning a pixel's brightness into a glyph + colour. */
 #define PIXEL_LUMINANCE_CLAMP 1.10f
 #define PIXEL_VISIBLE_LUM_EPS 0.002f
 #define GLYPH_SLOT_COUNT 8
-#define GLYPH_SLOT_FLOAT 7.999f /* (GLYPH_SLOT_COUNT - 0.001)  */
+#define GLYPH_SLOT_FLOAT 7.999f /* just under 8, so the top slot is 7 */
 
-/* §1.11 blast presets (T8 of MENTAL MODEL — initial conditions). */
+/* §1.11 blast presets — the five things '1'..'5' / n drop in. */
 typedef enum {
   BLAST_TACTICAL = 0,
   BLAST_STANDARD = 1,
@@ -860,31 +121,22 @@ typedef enum {
 } BlastType;
 
 /*
- * BlastParameters — one of 5 named blast presets (selected by '1'..'5').
+ * BlastParameters — the recipe for one blast (one of five presets).
  *
- * Intent
- *   Each preset is a YIELD CLASS plus geometric placement: peak
- *   temperature + density (how hot, how dense), Gaussian width
- *   (how big), detonation altitude (where in the world), and
- *   initial outflow speed (the kick that launches the rising
- *   mushroom).  Pressing a number drops the same Gaussian blob with
- *   different magnitudes into the fluid solver.
- *
- * Why these specific fields
- *   Together they parametrise the Gaussian initial condition that
- *   §scene_detonate seeds.  Tuned by hand against real-world yield
- *   classes (tactical / standard / megaton / air-burst / ground).
- *
- * Reference [4] Fedkiw-Stam-Jensen 2001 for the temperature-driven
- *   buoyancy that turns each blast's hot core into a rising column.
+ * Each preset is just a few numbers describing the initial fireball:
+ * how hot, how dense, how big, how high off the ground, and how hard
+ * it pushes outward at the instant of detonation.  Pressing a number
+ * stamps this blob into the fluid grid; physics takes it from there.
+ * The values were hand-tuned to feel like real yield classes
+ * (tactical / standard / megaton / air-burst / ground).
  */
 typedef struct {
     const char *display_name;       /* short HUD label                  */
-    float       sigma;              /* Gaussian σ (world units)         */
-    float       peak_temperature;   /* T peak above ambient             */
-    float       peak_density;       /* ρ peak                           */
-    float       detonation_altitude;/* y of blast centre (world)        */
-    float       initial_outflow;    /* radial outflow speed at t=0      */
+    float       sigma;              /* size of the fireball (world units) */
+    float       peak_temperature;   /* hottest temperature at the core  */
+    float       peak_density;       /* thickest smoke at the core       */
+    float       detonation_altitude;/* height of the blast centre       */
+    float       initial_outflow;    /* outward shove speed at t=0       */
 } BlastParameters;
 
 static const BlastParameters BLAST_PRESETS[BLAST_TYPE_COUNT] = {
@@ -900,36 +152,23 @@ static const BlastParameters BLAST_PRESETS[BLAST_TYPE_COUNT] = {
     {"GROUND    ", 0.45f, 7.0f, 7.0f, 0.6f, 3.5f},
 };
 
-/* §1.12 themes — 8-band ramp from coolest (slot 0) to hottest (slot 7). */
+/* §1.12 themes — six colour looks for the same cloud. */
 /*
- * Theme — one of 6 named look palettes.
+ * Theme — one colour palette, picked with t/T.
  *
- * Intent
- *   The raymarched volume's luminance is bucketed into
- *   GLYPH_SLOT_COUNT (=8) tiers, with slot 0 = coolest (faint smoke)
- *   through slot 7 = hottest (fire core).  Each theme maps the same
- *   8 tiers to different colour journeys (realistic / matrix /
- *   sunset / ...) so the visual interpretation of "hot" varies
- *   without changing physics.
- *
- * Why an 8-slot ramp (matching GLYPH_SLOT_COUNT)
- *   The glyph ramp `' . : * ▓ ▒ █ █` (or its ASCII equivalent) has
- *   8 tiers; one colour per glyph keeps the colour↔glyph mapping
- *   diagonal.  Slot 0 (faintest) needs to stay legible against the
- *   default-black bg so all themes pick values ≥ 24 there.
- *
- * Why inverted_background
- *   A few themes ("paper", inverted ramps) want a bright background
- *   instead of black.  The renderer reads this flag to clear the
- *   screen to the right paper colour before painting glyphs.
- *
- * References [9] Bourke for the glyph-ramp design; [10] Raymond for
- *   init_pair semantics.
+ * The cloud's brightness is sorted into eight tiers, from faint smoke
+ * (slot 0) up to the white-hot fire core (slot 7).  A theme just says
+ * which eight colours those tiers use, so the same physics can look
+ * realistic, matrix-green, ocean-blue, and so on.  Slot 0 stays a bit
+ * bright (index >= 24) so the faintest smoke is still visible against
+ * a black terminal.  A couple of themes flip to a bright background
+ * instead of black — inverted_background tells the renderer to clear
+ * the screen to that colour first.
  */
 typedef struct {
     const char *display_name;            /* short HUD label              */
-    short       ramp_256[GLYPH_SLOT_COUNT];  /* 8 fg indices, cool→hot   */
-    bool        inverted_background;     /* bright-background themes     */
+    short       ramp_256[GLYPH_SLOT_COUNT];  /* 8 colours, smoke -> fire */
+    bool        inverted_background;     /* true = use a bright backdrop */
 } Theme;
 
 #define THEME_COUNT 6
@@ -955,9 +194,9 @@ static const Theme THEMES[THEME_COUNT] = {
     {"NEGATIVE ", {253, 250, 245, 240, 237, 234, 232, 16}, true},
 };
 
-/* §1.13 luminance glyph ramp (T10).  Slot 0 is `.`, not space, so a
- * thin smoke wisp is faintly visible; below PIXEL_VISIBLE_LUM_EPS the
- * cell is left as background. */
+/* §1.13 the eight glyphs, faintest to densest.  Slot 0 is '.', not a
+ * space, so even a thin wisp of smoke shows up; cells dimmer than
+ * PIXEL_VISIBLE_LUM_EPS are left blank. */
 static const char LUMINANCE_GLYPHS[GLYPH_SLOT_COUNT] = {'.', ',', ':', ';',
                                                         '+', '*', '#', '@'};
 
@@ -977,9 +216,7 @@ static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
     "VELOCITY  ",
 };
 
-/* ===================================================================== */
-/* §2  clock — monotonic timer + sleep                                    */
-/* ===================================================================== */
+/* ── §2 clock — a steady timer and a sleep ── */
 
 static int64_t clock_now_ns(void) {
   struct timespec ts;
@@ -994,9 +231,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  vec3 — 3-D vector math (raymarcher only)                           */
-/* ===================================================================== */
+/* ── §3 vec3 — 3-D vector math, used only by the renderer ── */
 
 typedef struct {
   float x, y, z;
@@ -1025,14 +260,7 @@ static inline Vec3 v3normalise(Vec3 a) {
   return (length > 1e-12f) ? v3scale(1.0f / length, a) : v3(0, 0, 1);
 }
 
-/* ===================================================================== */
-/* §4  grid_helpers — clampf, mirror_index, to_slot, bilinear sample      */
-/* ===================================================================== */
-/*
- * Generic utilities used across both the fluid solver and the
- * renderer.  Consolidated here so the §-numbers below have ONE
- * concern each.
- */
+/* ── §4 grid helpers — small utilities shared by sim and renderer ── */
 
 static inline float clampf(float value, float lower, float upper) {
   if (value < lower)
@@ -1042,10 +270,9 @@ static inline float clampf(float value, float lower, float upper) {
   return value;
 }
 
-/* mirror_index — reflect an out-of-grid index back into [0, size).
- * Implements the no-flow walls used by the projection (§11) and
- * scalar advection.  Going out by 1 returns 1 (mirrors row 0);
- * going out by N returns N-2 (mirrors row N-1). */
+/* Fold an index that fell off the edge back inside the grid.  This is
+ * how we make solid walls: a neighbour just past the boundary reads
+ * back as a cell just inside, so nothing flows through. */
 static inline int mirror_index(int index, int grid_size) {
   if (index < 0)
     return 1;
@@ -1054,8 +281,7 @@ static inline int mirror_index(int index, int grid_size) {
   return index;
 }
 
-/* to_slot — map a normalised value ∈ [0, 1] to an integer slot
- * index ∈ [0, GLYPH_SLOT_COUNT-1]. */
+/* Turn a 0..1 value into one of the eight slot numbers. */
 static inline int to_slot(float value_01) {
   int slot = (int)(value_01 * GLYPH_SLOT_FLOAT);
   if (slot < 0)
@@ -1065,29 +291,16 @@ static inline int to_slot(float value_01) {
   return slot;
 }
 
-/*
- * sample_field_bilinear — sample a 2-D scalar at fractional cell
- * coordinates (fi, fj).  Out-of-grid coords clamp to the boundary
- * cell.  Bilinear weights:
- *
- *      (i, j+1)·──────·(i+1, j+1)        weight at (col, row):
- *           │        │                       (i,    j  ) = (1−fri)(1−fyj)
- *           │   ✦    │                       (i+1,  j  ) =   fri ·(1−fyj)
- *           │        │                       (i,    j+1) = (1−fri)·fyj
- *      (i,    j)·──────·(i+1,   j)           (i+1,  j+1) =   fri ·fyj
- */
-/* Clamp the sample point so that both (i, j) and (i+1, j+1) remain
- * inside the allocated grid.  Without this the i+1/j+1 corner reads
- * would seg-fault for samples just past the boundary. */
+/* Pin the sample point inside the grid so reading the cell AND its
+ * up-and-right neighbour can't run off the end of the array. */
 static inline void clamp_sample_to_grid_bounds(float *fi, float *fj) {
     *fi = clampf(*fi, 0.0f, (float)(GRID_RADIAL_CELLS - 1));
     *fj = clampf(*fj, 0.0f, (float)(GRID_VERTICAL_CELLS - 1));
 }
 
-/* Split a real-valued sample (fi, fj) into the integer base cell
- * (i, j) and the fractional offsets (frac_i, frac_j) ∈ [0, 1) used
- * as bilinear blend weights.  The base cell is the BOTTOM-LEFT corner
- * of the 2×2 stencil. */
+/* Split a fractional position into a whole cell (i, j) — the
+ * bottom-left of a 2x2 patch — and how far into that patch we are
+ * (frac_i, frac_j), used as the blend weights below. */
 static inline void integer_cell_and_subcell(float fi, float fj,
                                              int *out_i, int *out_j,
                                              float *out_frac_i, float *out_frac_j) {
@@ -1101,9 +314,9 @@ static inline void integer_cell_and_subcell(float fi, float fj,
     *out_frac_j = fj - (float)j;
 }
 
-/* Two-stage lerp over the 4 corners of a unit cell.  Returns a value
- * BETWEEN the min and max of the four corners — unconditionally stable
- * because every output is a convex combination of inputs. */
+/* Smoothly blend the four corner values by their weights.  The result
+ * always lands between the smallest and largest corner, so this can
+ * never blow up — that's what keeps the whole simulation stable. */
 static inline float bilinear_blend_corners(float bottom_left, float bottom_right,
                                             float top_left,    float top_right,
                                             float frac_i,      float frac_j) {
@@ -1112,16 +325,8 @@ static inline float bilinear_blend_corners(float bottom_left, float bottom_right
     return bottom * (1.0f - frac_j) + top * frac_j;
 }
 
-/*
- * sample_field_bilinear — bilinear sample of a 2-D scalar at (fi, fj).
- *
- * Pseudocode:
- *   clamp_sample_to_grid_bounds(&fi, &fj)             ← prevent over-read
- *   integer_cell_and_subcell(fi, fj, …)               ← (i, j, frac_i, frac_j)
- *   return bilinear_blend_corners(field[i][j], field[i+1][j],
- *                                  field[i][j+1], field[i+1][j+1],
- *                                  frac_i, frac_j)
- */
+/* Read a smooth value from the grid at a fractional spot (fi, fj) by
+ * blending the four cells around it. */
 static float
 sample_field_bilinear(const float field[GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS],
                       float fi, float fj) {
@@ -1136,14 +341,9 @@ sample_field_bilinear(const float field[GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS],
                                    frac_i, frac_j);
 }
 
-/* ===================================================================== */
-/* §5  themes — handled in §1; this section reserved for future      */
-/* ===================================================================== */
-/* (Theme palette table lives in §1.12 alongside the rest of config.) */
+/* §5 themes live in §1.12, alongside the rest of the config. */
 
-/* ===================================================================== */
-/* §6  colors — pair init + theme apply                                   */
-/* ===================================================================== */
+/* ── §6 colours — set up the colour pairs, swap palettes ── */
 
 static void apply_theme(int theme_index) {
   if (theme_index < 0 || theme_index >= THEME_COUNT)
@@ -1184,142 +384,83 @@ static void colors_init(void) {
   apply_theme(0);
 }
 
-/* ===================================================================== */
-/* §7  fluid_state — eight 2-D fields in one struct                       */
-/* ===================================================================== */
+/* ── §7 fluid state — everything the simulation tracks ── */
 /*
- * The simulation state.  Eight 2-D fields stored side-by-side in one
- * struct.  Total size 8 × 56 × 96 × 4 ≈ 168 KB, in BSS, no malloc.
+ * Fluid — the whole simulation, as eight grids stored together.
  *
- * Indexing convention:
- *   i ∈ [0, GRID_RADIAL_CELLS)     radial slot (0 = on the axis)
- *   j ∈ [0, GRID_VERTICAL_CELLS)   vertical slot (0 = on the ground)
+ * Because a mushroom cloud is round, we only simulate one flat slice
+ * of it — a strip running from the centre axis outward (i) and from
+ * the ground upward (j).  The renderer spins this slice back into a
+ * full 3-D cloud.  So index i = 0 means "on the centre axis" and
+ * j = 0 means "on the ground".  All eight grids together are ~168 KB
+ * and live in static memory — we never call malloc.
  *
- * The grid is the AXISYMMETRIC slice (T7): a 2-D vertical strip from
- * the y-axis outward.  Rotated around y for rendering.
- */
-/*
- * Fluid — the 2-D axisymmetric simulation state.
- *
- * Intent
- *   The (full) 3-D nuclear blast has rotational symmetry around the
- *   vertical axis, so a 2-D RADIAL-VERTICAL slice carries all the
- *   physics.  The 3-D renderer (§raymarch) reconstructs the 3-D field
- *   on demand by computing (r, y) from a world point and bilinearly
- *   sampling THIS slice.  Trade: we get 3-D-looking results at 2-D
- *   computational cost — perfect for a real-time terminal demo.
- *
- *   Grid indexing:
- *     i ∈ [0, GRID_RADIAL_CELLS)     radial slot, 0 = axis
- *     j ∈ [0, GRID_VERTICAL_CELLS)   vertical slot, 0 = ground
- *
- * Why eight 2-D arrays in one struct
- *   The Stable Fluids passes (advect / diffuse / project / buoyancy)
- *   touch FOUR distinct field types — velocity (2 components),
- *   temperature, density — plus FOUR scratch buffers for the iterative
- *   solvers.  Keeping them together as one struct gives a single
- *   pointer to thread through every pass and matches the textbook
- *   formulation in [1] Stam §3.
- *
- * Why velocity is split into radial + vertical (not Vec2[][])
- *   The advection and projection sweeps read each component
- *   independently with different boundary conditions (radial = even
- *   reflection at the axis, vertical = no-flow at ground/sky).
- *   Splitting into two arrays lets the inner loop be tight and
- *   per-component.
- *
- * Why scratch_a / scratch_b (and pressure / divergence)
- *   The Gauss-Seidel / Jacobi solver in §project needs a double
- *   buffer so the previous iteration's values remain readable while
- *   the next one is being written.  scratch_a + scratch_b is the
- *   generic role-swap pair; pressure + divergence are the specific
- *   pair used by the Hodge-projection step.  Both pairs live in BSS
- *   — no allocation in the hot path.
- *
- * References [1] Stam 1999 for the field layout; [4] Fedkiw-Stam-Jensen
- *   for the buoyancy term that turns temperature into vertical lift.
+ * The grids:
+ *   velocity is kept as two separate grids (sideways and up/down)
+ *   because each one hits a different wall — no sideways flow through
+ *   the centre axis, no up/down flow through the ground — and reading
+ *   them apart keeps the inner loops simple.  Temperature and density
+ *   are the stuff being carried along.  The pressure/divergence pair
+ *   and the scratch_a/scratch_b pair are workspace: the solvers need
+ *   somewhere to write next-step values while still reading the
+ *   current ones.
  */
 typedef struct {
-    /* ── Velocity components (axisymmetric polar) ───────────────── */
+    /* velocity, split into sideways and up/down */
     float velocity_radial   [GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS];
     float velocity_vertical [GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS];
 
-    /* ── Advected scalars (the "content" of the blast) ──────────── */
+    /* what the flow carries: heat and smoke */
     float temperature       [GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS];
     float density           [GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS];
 
-    /* ── Hodge-projection scratch (§project / T5) ───────────────── */
+    /* workspace for the projection step */
     float pressure          [GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS];
     float divergence        [GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS];
 
-    /* ── Generic scratch (Jacobi double-buffer + advect swap) ──── */
+    /* spare scratch grids the solvers write into */
     float scratch_a         [GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS];
     float scratch_b         [GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS];
 } Fluid;
 
 static Fluid g_fluid;
 
-/* ===================================================================== */
-/* §8  boundaries — wall conditions on the velocity field                 */
-/* ===================================================================== */
+/* ── §8 walls — keep flow from passing through the axis and ground ── */
 /*
- * Two physical walls in the axisymmetric simulation:
- *   1. AXIS at radius = 0    — mirror; no radial flow through (vᵣ=0).
- *   2. GROUND at altitude = 0 — solid; no vertical flow (vᵧ=0).
- *
- * Other domain edges (top, far radial) are "open" — advection
- * naturally diffuses fluid that tries to leave the grid.
- *
- * Called after every velocity-modifying step (buoyancy, advection,
- * projection).  Forgetting this is the #1 bug source for adapting
- * Stam-style solvers — symptom is fluid leaking energy at walls.
+ * The slice has two solid walls: the centre axis (nothing flows
+ * sideways through it) and the ground (nothing flows up or down
+ * through it).  Call this after anything that changes velocity —
+ * skipping it is the classic way these solvers leak energy at the
+ * edges and slowly fall apart.
  */
 static void enforce_velocity_boundaries(Fluid *fluid) {
-  /* Axis (radius = 0): no radial flow. */
   for (int j = 0; j < GRID_VERTICAL_CELLS; j++)
     fluid->velocity_radial[0][j] = 0.0f;
 
-  /* Ground (y = 0): no vertical flow. */
   for (int i = 0; i < GRID_RADIAL_CELLS; i++)
     fluid->velocity_vertical[i][0] = 0.0f;
 }
 
-/* ===================================================================== */
-/* §9  buoyancy — hot air rises (T2)                                      */
-/* ===================================================================== */
+/* ── §9 buoyancy — hot air rises ── */
 /*
- * Boussinesq approximation: vertical accel ∝ temperature excess.
- * Per cell, per tick:
- *     vᵧ[i, j] += BUOYANCY · (T[i, j] − T_ambient) · dt
+ * The one force that lifts the cloud: cells hotter than the
+ * surrounding air get a nudge upward each tick.  Cooler cells get a
+ * (gentle) nudge down.  Turn this off and the cloud just drifts
+ * limply — nothing climbs.  Ref: Fedkiw, Stam & Jensen 2001.
  */
-/* Temperature excess above ambient at one cell.  Positive when the
- * cell is HOTTER than ambient (drives upward buoyant force) and
- * negative when cooler.  Boussinesq approximation [4] Fedkiw §3:
- * density change is a linear function of (T − T_amb). */
+/* How much hotter than ambient this cell is — positive means it wants
+ * to rise. */
 static inline float temperature_excess_at(const Fluid *fluid, int i, int j) {
     return fluid->temperature[i][j] - TEMPERATURE_AMBIENT;
 }
 
-/* Add the Boussinesq vertical impulse for one cell, one tick:
- *     vᵧ[i, j] += α · (T − T_amb) · Δt
- * where α = BUOYANCY_COEFFICIENT controls how hard hot cells rise. */
+/* Give this cell its upward push for one tick, scaled by how hot it is. */
 static inline void add_boussinesq_vertical_impulse(Fluid *fluid, int i, int j,
                                                     float step_seconds) {
     fluid->velocity_vertical[i][j] +=
         BUOYANCY_COEFFICIENT * temperature_excess_at(fluid, i, j) * step_seconds;
 }
 
-/*
- * apply_buoyancy — hot air rises (Boussinesq approximation, T2).
- *
- * Pseudocode:
- *   for each cell (i, j):
- *     add_boussinesq_vertical_impulse(fluid, i, j, dt)
- *   enforce_velocity_boundaries(fluid)
- *
- * Reference [4] Fedkiw, Stam & Jensen 2001 §3 — temperature-driven
- * vertical lift is the entire engine behind the mushroom rise.
- */
 static void apply_buoyancy(Fluid *fluid, float step_seconds) {
     for (int i = 0; i < GRID_RADIAL_CELLS; i++)
         for (int j = 0; j < GRID_VERTICAL_CELLS; j++)
@@ -1327,28 +468,19 @@ static void apply_buoyancy(Fluid *fluid, float step_seconds) {
     enforce_velocity_boundaries(fluid);
 }
 
-/* ===================================================================== */
-/* §10  advect — semi-Lagrangian back-trace (T4)                          */
-/* ===================================================================== */
+/* ── §10 advect — let the flow carry a field along ── */
 /*
- * Generic over the field being advected — used for vᵣ, vᵧ, T, ρ.
- *
- *   for each cell (i, j):
- *       source_pos     = (i, j) − v·dt / h
- *       new_field[i,j] = bilinear(old_field, source_pos)
- *
- * Velocities are world-units/sec; we want grid-cells, hence
- * GRID_INV_CELL_SIZE = 1/h.
+ * Moving stuff with the flow.  The trick (Stam's "stable fluids"):
+ * instead of pushing each cell's value forward — which can overshoot
+ * and blow up — we look backward.  For every cell we ask "where was
+ * this bit of fluid one step ago?", then copy the old value from
+ * there.  Because we read by blending neighbours, the answer is
+ * always tame, so the timestep can be as big as we like.  The same
+ * routine carries velocity, heat, and smoke.
  */
-/* Trace the velocity field BACKWARD from cell (i, j) by one tick of
- * advection.  Returns the DEPARTURE POINT — where the fluid currently
- * at (i, j) came from one Δt ago.  This is the semi-Lagrangian step
- * from [1] Stam §3 / [4] Fedkiw §4: sampling the old field at the
- * departure point and copying it forward is what makes the integrator
- * unconditionally stable (no CFL constraint).
- *
- * Velocities are in world-units/sec; dt_in_grid_units = Δt · (1/h)
- * converts the offset into grid cells. */
+/* Step backward from cell (i, j) along the flow to find where this
+ * fluid came from one tick ago.  Velocities are in world units per
+ * second; multiplying by 1/cell-size turns the offset into grid cells. */
 static inline void trace_velocity_backward_to_departure(
         int i, int j,
         const float vr[GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS],
@@ -1359,18 +491,8 @@ static inline void trace_velocity_backward_to_departure(
     *out_source_j = (float)j - vy[i][j] * dt_in_grid_units;
 }
 
-/*
- * advect_field — semi-Lagrangian advection of one scalar by the
- * velocity field.  Generic — used for vᵣ, vᵧ, T, ρ.
- *
- * Pseudocode:
- *   dt_grid = step_seconds / h
- *   for each cell (i, j):
- *     (src_i, src_j) = trace_velocity_backward_to_departure(i, j, v, dt_grid)
- *     destination[i, j] = sample_field_bilinear(source, src_i, src_j)
- *
- * Refs [1] Stam 1999 §3, [4] Fedkiw 2001 §4.
- */
+/* Carry one whole grid along the flow: for each cell, trace back to
+ * where its fluid came from and copy the old value to here. */
 static void advect_field(
         float destination_field[GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS],
         const float source_field[GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS],
@@ -1391,26 +513,20 @@ static void advect_field(
     }
 }
 
-/* ===================================================================== */
-/* §11  project — divergence + Jacobi + gradient subtraction (T5)         */
-/* ===================================================================== */
+/* ── §11 projection — keep the flow from squashing or stretching ── */
 /*
- * The Hodge-decomposition step.  Three sub-phases:
- *
- *   PHASE A — compute_divergence: ∇·v field via centred differences.
- *   PHASE B — solve_pressure_poisson: Jacobi sweeps for ∇²p = ∇·v.
- *   PHASE C — subtract_pressure_gradient: v -= ∇p.
- *
- * Boundary conditions are mirror (no-flow walls) — implemented via
- * mirror_index from §4.
- *
- * After project_to_incompressible() returns, ∇·v ≈ 0 everywhere.
+ * After buoyancy gives some cells a shove, the flow stops being
+ * "balanced": fluid would pile up in some spots and vanish from
+ * others.  This step fixes that so the fluid neither compresses nor
+ * tears.  It works in three passes: measure how out-of-balance each
+ * cell is, solve for a pressure field that would cancel it, then
+ * subtract that pressure's push from the velocity.  Afterward the
+ * flow is balanced everywhere.
  */
 
-/* Pre-compute the 4-neighbour mirror indices for one cell.  Mirror BCs
- * mean an out-of-grid neighbour reads as the cell itself reflected
- * across the boundary, giving zero-flux walls.  Doing this once per
- * cell avoids repeating 4 mirror_index calls in every pass. */
+/* Grab the four neighbour indices for a cell, with off-grid ones
+ * folded back in (the solid-wall trick from §4).  Done once per cell
+ * so the passes below don't each repeat the fold. */
 static inline void neighbour_indices_mirrored(int i, int j,
                                               int *out_i_left, int *out_i_right,
                                               int *out_j_below, int *out_j_above) {
@@ -1420,12 +536,9 @@ static inline void neighbour_indices_mirrored(int i, int j,
     *out_j_above = mirror_index(j + 1, GRID_VERTICAL_CELLS);
 }
 
-/* Discrete divergence ∇·v at cell (i, j) via centred differences:
- *
- *   ∇·v ≈ ½h · ( (vᵣ[i+1] − vᵣ[i−1]) + (vᵧ[j+1] − vᵧ[j−1]) )
- *
- * Positive divergence means fluid is leaving this cell; negative means
- * it's piling up.  The Hodge projection step zeros this out. */
+/* How out-of-balance one cell is: are more fluid arrows pointing out
+ * of it than into it?  Positive means fluid is leaving (would thin
+ * out), negative means piling up.  Projection drives this to zero. */
 static inline float centred_divergence_at(const Fluid *fluid, int i, int j) {
     int i_left, i_right, j_below, j_above;
     neighbour_indices_mirrored(i, j, &i_left, &i_right, &j_below, &j_above);
@@ -1436,15 +549,8 @@ static inline float centred_divergence_at(const Fluid *fluid, int i, int j) {
     return (dvr_dr + dvy_dy) * 0.5f * GRID_INV_CELL_SIZE;
 }
 
-/*
- * compute_divergence — fill the divergence field (RHS of the Poisson
- * problem) and zero the pressure initial guess.
- *
- * Pseudocode:
- *   for each cell (i, j):
- *     fluid->divergence[i, j] = centred_divergence_at(fluid, i, j)
- *     fluid->pressure[i, j]   = 0      (warm-start Gauss-Seidel from zero)
- */
+/* Measure the imbalance everywhere, and start the pressure guess at
+ * zero ready for the solver below. */
 static void compute_divergence(Fluid *fluid) {
     for (int i = 0; i < GRID_RADIAL_CELLS; i++) {
         for (int j = 0; j < GRID_VERTICAL_CELLS; j++) {
@@ -1454,11 +560,10 @@ static void compute_divergence(Fluid *fluid) {
     }
 }
 
-/* One cell's Jacobi update for the Poisson equation ∇²p = ∇·v.
- *   p_new[i, j] = ( Σ p_neighbours − h² · div[i, j] ) / 4
- * Uses the OLD pressure values (read pre-sweep) so the iteration is a
- * true Jacobi (not Gauss-Seidel) — output goes to scratch, then is
- * swapped back at the end of the sweep. */
+/* New pressure for one cell: roughly the average of its neighbours,
+ * tugged by how out-of-balance the cell is.  Reads only old pressure
+ * values (this sweep writes to scratch), so the whole grid updates
+ * from a consistent snapshot. */
 static inline float jacobi_pressure_update_at(const Fluid *fluid, int i, int j,
                                               float h_squared) {
     int i_left, i_right, j_below, j_above;
@@ -1469,10 +574,9 @@ static inline float jacobi_pressure_update_at(const Fluid *fluid, int i, int j,
     return (neighbour_sum - h_squared * fluid->divergence[i][j]) * 0.25f;
 }
 
-/* One full Jacobi SWEEP: read pressure, write next iterate into
- * scratch_a, then copy scratch_a back to pressure.  Repeated
- * POISSON_JACOBI_ITERATIONS times.  Refs [5] Saad ch. 4 for the
- * iterative-Poisson convergence theory. */
+/* One pass over the whole grid: compute every cell's new pressure
+ * into scratch, then copy it back.  Repeating this many times lets
+ * the pressure settle into a consistent answer. */
 static inline void jacobi_pressure_sweep(Fluid *fluid, float h_squared) {
     for (int i = 0; i < GRID_RADIAL_CELLS; i++) {
         for (int j = 0; j < GRID_VERTICAL_CELLS; j++) {
@@ -1483,22 +587,16 @@ static inline void jacobi_pressure_sweep(Fluid *fluid, float h_squared) {
     memcpy(fluid->pressure, fluid->scratch_a, sizeof fluid->pressure);
 }
 
-/*
- * solve_pressure_poisson — iterative solve of ∇²p = ∇·v via Jacobi.
- *
- * Pseudocode:
- *   for iter = 0 .. POISSON_JACOBI_ITERATIONS-1:
- *     jacobi_pressure_sweep(fluid, h²)
- */
+/* Run enough sweeps for the pressure field to settle down. */
 static void solve_pressure_poisson(Fluid *fluid) {
     float h_squared = GRID_CELL_SIZE * GRID_CELL_SIZE;
     for (int iter = 0; iter < POISSON_JACOBI_ITERATIONS; iter++)
         jacobi_pressure_sweep(fluid, h_squared);
 }
 
-/* Compute (∂p/∂r, ∂p/∂y) at cell (i, j) via centred differences,
- * scaled by 0.5·(1/h).  These are the components of ∇p in the
- * axisymmetric (r, y) frame. */
+/* Which way pressure is rising at this cell, and how steeply — the
+ * sideways and up/down parts of that slope.  That slope is the push
+ * we subtract from the flow next. */
 static inline void centred_pressure_gradient_at(const Fluid *fluid, int i, int j,
                                                 float *out_dp_dr,
                                                 float *out_dp_dy) {
@@ -1510,8 +608,9 @@ static inline void centred_pressure_gradient_at(const Fluid *fluid, int i, int j
                   fluid->pressure[i      ][j_below]) * 0.5f * GRID_INV_CELL_SIZE;
 }
 
-/* Subtract ∇p from one cell's velocity.  This is the Helmholtz-Hodge
- * projection step — after the loop completes, ∇·v ≈ 0 everywhere. */
+/* Push this cell's flow the opposite way from rising pressure — high
+ * pressure shoves fluid toward low.  Once every cell is done, the
+ * flow is balanced. */
 static inline void subtract_pressure_gradient_at(Fluid *fluid, int i, int j) {
     float dp_dr, dp_dy;
     centred_pressure_gradient_at(fluid, i, j, &dp_dr, &dp_dy);
@@ -1519,12 +618,7 @@ static inline void subtract_pressure_gradient_at(Fluid *fluid, int i, int j) {
     fluid->velocity_vertical[i][j] -= dp_dy;
 }
 
-/*
- * subtract_pressure_gradient — v_new = v − ∇p, cell by cell.
- *
- * Refs [1] Stam 1999 §3.5 (Hodge decomposition); [6] Quilez volume
- * raymarching for the renderer side.
- */
+/* Apply that pressure-driven correction to every cell. */
 static void subtract_pressure_gradient(Fluid *fluid) {
     for (int i = 0; i < GRID_RADIAL_CELLS; i++)
         for (int j = 0; j < GRID_VERTICAL_CELLS; j++)
@@ -1538,13 +632,11 @@ static void project_to_incompressible(Fluid *fluid) {
   enforce_velocity_boundaries(fluid);
 }
 
-/* ===================================================================== */
-/* §12  cool_decay — Newton cooling + density attenuation (T6)            */
-/* ===================================================================== */
+/* ── §12 cool & fade — let the cloud wind down ── */
 /*
- * Two passive losses applied at the END of every fluid_step:
- *   COOL.  T → T_ambient via Newton cooling (exp decay).
- *   DECAY. ρ fades linearly (models entrainment we don't simulate).
+ * Two slow losses applied at the end of every tick: heat eases back
+ * toward the surrounding temperature, and smoke gradually thins out.
+ * Without these the cloud would rise and persist forever.
  */
 static void apply_cool_and_decay(Fluid *fluid, float step_seconds) {
   float cool_factor = expf(-COOL_RATE * step_seconds);
@@ -1561,17 +653,11 @@ static void apply_cool_and_decay(Fluid *fluid, float step_seconds) {
   }
 }
 
-/* ===================================================================== */
-/* §13  fluid_step — one full physics tick (six phases)                   */
-/* ===================================================================== */
-/*
- * The whole fluid solver in eight calls.  Reads top-to-bottom as the
- * algorithm pseudocode (T3).
- */
-/* Advect the velocity field BY ITSELF.  Read both components into
- * scratch buffers first, then swap them back — otherwise the second
- * advect_field call would read partially-updated velocities and the
- * scheme would no longer be true semi-Lagrangian.                  */
+/* ── §13 one tick — the whole solver, top to bottom ── */
+
+/* The flow carries itself along.  Both velocity grids are written to
+ * scratch first and swapped back at the end, so the second one isn't
+ * reading a half-updated copy of the first. */
 static inline void advect_velocity_self(Fluid *fluid, float step_seconds) {
     advect_field(fluid->scratch_a, fluid->velocity_radial,
                  fluid->velocity_radial, fluid->velocity_vertical, step_seconds);
@@ -1584,9 +670,8 @@ static inline void advect_velocity_self(Fluid *fluid, float step_seconds) {
     enforce_velocity_boundaries(fluid);
 }
 
-/* Advect a passive scalar field BY THE CURRENT VELOCITY.  Each scalar
- * (temperature, density, ...) needs the same pattern: read into
- * scratch, swap back.  Helper takes the field pointer to deduplicate. */
+/* Carry one carried-along grid (heat or smoke) with the current flow,
+ * using the same write-to-scratch-then-swap pattern. */
 static inline void advect_scalar_by_velocity(
         Fluid *fluid,
         float field[GRID_RADIAL_CELLS][GRID_VERTICAL_CELLS],
@@ -1598,27 +683,18 @@ static inline void advect_scalar_by_velocity(
 }
 
 /*
- * fluid_step — one full physics tick.  Reads top-to-bottom as the
- * Stable Fluids algorithm pseudocode (T3).
- *
- * Pseudocode:
- *   apply_buoyancy                     ← hot cells gain upward impulse
- *   project_to_incompressible          ← cancel ∇·v that buoyancy added
- *   advect_velocity_self               ← v ← v∘(x − v·dt)
- *   project_to_incompressible          ← restore ∇·v ≈ 0
- *   advect_scalar_by_velocity(T)       ← carry temperature along v
- *   advect_scalar_by_velocity(ρ)       ← carry density along v
- *   apply_cool_and_decay               ← Newton cooling + ρ fade
- *
- * Refs [1] Stam 1999 — the canonical "advect-project-advect" cycle;
- * [4] Fedkiw 2001 for the buoyancy + temperature coupling.
+ * One full step of physics, in the order it runs: hot cells get their
+ * upward push, rebalance the flow, let the flow carry itself, rebalance
+ * again, carry the heat and smoke along, then cool and fade.  We
+ * rebalance twice because carrying the flow nudges it slightly out of
+ * balance again — Jos Stam's classic advect-project-advect cycle.
  */
 static void fluid_step(Fluid *fluid, float step_seconds) {
     apply_buoyancy             (fluid, step_seconds);
     project_to_incompressible  (fluid);
 
     advect_velocity_self       (fluid, step_seconds);
-    project_to_incompressible  (fluid);  /* advection re-injects tiny ∇·v */
+    project_to_incompressible  (fluid);  /* carrying the flow unbalanced it a touch */
 
     advect_scalar_by_velocity  (fluid, fluid->temperature, step_seconds);
     advect_scalar_by_velocity  (fluid, fluid->density,     step_seconds);
@@ -1626,28 +702,18 @@ static void fluid_step(Fluid *fluid, float step_seconds) {
     apply_cool_and_decay       (fluid, step_seconds);
 }
 
-/* ===================================================================== */
-/* §14  detonate — initial Gaussian bubble (T8 of MENTAL MODEL)           */
-/* ===================================================================== */
+/* ── §14 detonate — the one scripted moment ── */
 /*
- * The ONLY scripted moment.  Paint a 3-D-symmetric Gaussian centred
- * at (radius=0, altitude=detonation_altitude), plus a small radial
- * outflow seed.  Everything after this is pure physics.
- *
- *      gauss(d) = exp(−d² / (2·σ²))         d² = r² + (y − y₀)²
- *      T(r, y) = T_ambient + (T_peak − T_ambient) · gauss
- *      ρ(r, y) = ρ_peak · gauss
- *
- * The radial outflow models the mechanical shock wave that happens
- * before buoyancy takes over (~1-2 sec).  Without it, the bubble
- * just rises with a clean leading-edge vortex.  With it, the bubble
- * first expands radially then transitions to buoyant rise — much
- * closer to a real explosion's two-phase profile.
+ * The only thing we stage by hand.  Stamp a soft round blob of heat
+ * and smoke at the blast centre — brightest in the middle, fading
+ * with distance — and give it an outward shove.  That shove stands in
+ * for the shock wave of the first second or two; without it the cloud
+ * just rises like a candle flame instead of expanding first.  After
+ * this, physics runs everything.
  */
-/* Zero all fields and refill temperature with TEMPERATURE_AMBIENT.
- * The memset zeros velocity/density/scratch — exactly what we want —
- * but temperature needs the AMBIENT baseline (not 0K) so the
- * Newton-cooling target in apply_cool_and_decay stays well-defined. */
+/* Wipe the grid to a clean start.  Zeroing handles velocity, smoke,
+ * and scratch, but temperature is reset to the ambient baseline (not
+ * absolute zero) so the cooling step has a sensible target. */
 static inline void reset_field_to_ambient(Fluid *fluid) {
     memset(fluid, 0, sizeof *fluid);
     for (int i = 0; i < GRID_RADIAL_CELLS; i++)
@@ -1655,17 +721,17 @@ static inline void reset_field_to_ambient(Fluid *fluid) {
             fluid->temperature[i][j] = TEMPERATURE_AMBIENT;
 }
 
-/* Cell centre's world coords from grid indices.  +0.5 picks the centre
- * (not corner) of the cell — keeps the Gaussian symmetric around the
- * intended detonation point. */
+/* Where a cell sits in the world.  The +0.5 aims at the cell's middle,
+ * not its corner, so the blob stays centred on the detonation point. */
 static inline void cell_centre_world_coords(int i, int j,
                                              float *out_radius, float *out_altitude) {
     *out_radius   = ((float)i + 0.5f) * GRID_CELL_SIZE;
     *out_altitude = ((float)j + 0.5f) * GRID_CELL_SIZE;
 }
 
-/* Evaluate gauss(d) = exp(−d² / 2σ²) where d² = r² + (y − y₀)²
- * is the squared distance from cell (i, j) to the detonation point. */
+/* How strong the blob is at this cell: full strength at the centre,
+ * smoothly fading to nothing with distance (a bell curve).  Also hands
+ * back the offset from the centre, reused for the outward shove. */
 static inline float gaussian_at_cell_distance(int i, int j,
                                                float detonation_altitude,
                                                float two_sigma_squared,
@@ -1679,10 +745,8 @@ static inline float gaussian_at_cell_distance(int i, int j,
     return expf(- *out_distance_squared / two_sigma_squared);
 }
 
-/* Seed temperature and density at cell (i, j) from the Gaussian
- * intensity:
- *     T(r, y) = T_amb + (T_peak − T_amb) · gauss
- *     ρ(r, y) = ρ_peak · gauss                                       */
+/* Set this cell's heat and smoke from the blob's strength here:
+ * fully hot and thick at the centre, ambient and clear far out. */
 static inline void seed_gaussian_scalars_at(Fluid *fluid, int i, int j,
                                              float gaussian,
                                              const BlastParameters *blast) {
@@ -1692,13 +756,10 @@ static inline void seed_gaussian_scalars_at(Fluid *fluid, int i, int j,
     fluid->density[i][j] = blast->peak_density * gaussian;
 }
 
-/* Seed initial outward radial velocity at one cell, but ONLY where the
- * Gaussian intensity is appreciable (>0.05).  Models the mechanical
- * shock wave that precedes buoyancy.  Without this seed, the bubble
- * rises with a clean leading vortex but no early expansion — looks
- * like a candle flame rather than a blast.
- *
- * The 1e-3 guard avoids div-by-zero exactly at the detonation point. */
+/* Shove this cell outward from the centre — the stand-in shock wave.
+ * Only cells well inside the blob (strength > 0.05) get a kick.  The
+ * tiny-distance guard skips the exact centre, where "outward" has no
+ * direction and we'd divide by zero. */
 static inline void seed_radial_outflow_at(Fluid *fluid, int i, int j,
                                            float gaussian,
                                            float dr, float dy,
@@ -1712,25 +773,11 @@ static inline void seed_radial_outflow_at(Fluid *fluid, int i, int j,
     fluid->velocity_vertical[i][j] = (dy / distance) * blast_speed;
 }
 
-/*
- * detonate_at_origin — the ONLY scripted moment of the simulation.
- * Paint a 3-D-symmetric Gaussian centred at the detonation altitude
- * plus a small radial outflow seed; physics handles the rest.
- *
- * Pseudocode:
- *   reset_field_to_ambient(fluid)
- *   two_sigma_squared = 2·σ²
- *   for each cell (i, j):
- *     gauss = gaussian_at_cell_distance(i, j, …)
- *     seed_gaussian_scalars_at(fluid, i, j, gauss, blast)
- *     seed_radial_outflow_at  (fluid, i, j, gauss, dr, dy, d², …)
- *   enforce_velocity_boundaries(fluid)
- *
- * The Gaussian shape isn't physically derived — it's the simplest
- * radially-symmetric blob that produces a believable mushroom when
- * the buoyancy step takes over after the first second or so.  Refs
- * [4] Fedkiw 2001 (buoyancy); [5] Nguyen et al. 2002 (fire core).
- */
+/* Stamp the whole blast into the grid: clear it, then for every cell
+ * set its heat/smoke and its outward shove from the blob.  The round
+ * blob shape isn't derived from real physics — it's just the simplest
+ * starting blob that grows into a believable mushroom once buoyancy
+ * takes over. */
 static void detonate_at_origin(Fluid *fluid, const BlastParameters *blast) {
     reset_field_to_ambient(fluid);
 
@@ -1751,13 +798,13 @@ static void detonate_at_origin(Fluid *fluid, const BlastParameters *blast) {
     enforce_velocity_boundaries(fluid);
 }
 
-/* ===================================================================== */
-/* §15  sampling — world (x, y, z) → bilinear 2-D field                   */
-/* ===================================================================== */
+/* ── §15 sampling — the bridge from renderer back to the slice ── */
 /*
- * The bridge from the renderer to the simulator.  T7 axisymmetric
- * reduction: any 3-D point's density / temperature is determined by
- * (radius, altitude).  Out-of-domain samples return safe defaults.
+ * The renderer asks "what's the smoke/heat at this 3-D point?" and
+ * these answer by looking up the flat slice.  Since the cloud is
+ * round, all that matters is how far the point is from the centre
+ * axis and how high it is.  Points outside the simulated region get a
+ * harmless default (clear air / ambient temperature).
  */
 static inline float sample_density_at_world(float radius, float altitude) {
   if (radius < 0.0f || radius >= GRID_RADIAL_EXTENT)
@@ -1777,32 +824,26 @@ static inline float sample_temperature_at_world(float radius, float altitude) {
                                altitude * GRID_INV_CELL_SIZE);
 }
 
-/* ===================================================================== */
-/* §16  raymarch — Beer-Lambert volumetric integration (T8)               */
-/* ===================================================================== */
+/* ── §16 raymarch — walk a sightline through the cloud ── */
 /*
- * Outputs:
- *   *out_total_luminance — total accumulated brightness (smoke + fire)
- *   *out_hot_luminance   — contribution from temperature emission only
- *
- * The hot fraction (hot/total) drives the smoke→fire palette pick in
- * §18 cell_decorate.
- *
- * Optimisation: empty regions skip ahead.  Pure-empty rays (which
- * dominate when the cloud is small) cost ~70% less than uniform
- * march.
+ * To colour a pixel we shoot a line from the camera and step along
+ * it, adding up the light.  Glowing-hot bits add brightness; thick
+ * smoke blocks whatever is behind it (so the far side of a dense
+ * cloud stays hidden).  Each ray reports two numbers: total
+ * brightness, and how much of it came from glowing heat — the second
+ * decides whether the pixel reads as smoke or fire.  Empty stretches
+ * are stepped over quickly, which is most of the work when the cloud
+ * is small.
  */
-/* Cylindrical-radius (axisymmetric) coordinate from a 3-D world point.
- *   r = √(x² + z²)
- * The fluid grid is 2-D (r, y); this is the projection from 3-D space. */
+/* Distance of a 3-D point from the centre axis — the first half of
+ * turning a world point back into a spot on the flat slice. */
 static inline float world_radius_at(Vec3 sample_point) {
     return sqrtf(sample_point.x * sample_point.x +
                  sample_point.z * sample_point.z);
 }
 
-/* Is the 3-D sample point INSIDE the axisymmetric simulation domain?
- * Rays that haven't entered yet (or have already left) can skip ahead
- * by RM_EMPTY_SKIP_FACTOR steps without missing any density. */
+/* Is this point inside the region we actually simulate?  If not, the
+ * ray can take a bigger stride — there's no cloud out there to miss. */
 static inline bool sample_inside_simulation_domain(Vec3 sample_point,
                                                     float *out_radius) {
     if (sample_point.y < 0.0f || sample_point.y > GRID_VERTICAL_EXTENT)
@@ -1811,27 +852,20 @@ static inline bool sample_inside_simulation_domain(Vec3 sample_point,
     return *out_radius <= GRID_RADIAL_EXTENT;
 }
 
-/* Linear normalisation of temperature into the emission range [0, 1].
- * 0 = ambient (no glow), 1 = peak (full fire colour).  Clamped — over-
- * heated cells (which can happen during a brief overshoot after
- * detonation) still contribute full brightness, not more. */
+/* Turn a temperature into a glow amount from 0 (no glow) to 1 (full
+ * fire).  Capped at 1, so a brief over-heat right after detonation
+ * just glows fully rather than blowing past the top. */
 static inline float temperature_to_emission_normalised(float temperature,
                                                         float inverse_temp_range) {
     float emission = (temperature - TEMPERATURE_AMBIENT) * inverse_temp_range;
     return clampf(emission, 0.0f, 1.0f);
 }
 
-/* Accumulate one ray-step's contribution to the running luminance
- * integrals.  Implements the discrete emission-absorption volume
- * rendering integral [7] Max 1995:
- *
- *   L(t) += T(t) · κ(t) · S(t) · Δt
- *
- * where T is the running transmittance (how much light hasn't yet
- * been absorbed), κ·Δt is the optical-depth step, S is the local
- * emission source.  hot_luminance is a separate integral over the
- * EMISSION component only — used downstream to pick the smoke→fire
- * colour ramp in decorate_volume_pixel. */
+/* Add what this one step contributes to the pixel.  Each bit of light
+ * is dimmed by how much smoke is already in front of it (transmittance
+ * — the fraction of light still getting through).  We tally total
+ * brightness and, separately, just the glowing-heat part, which later
+ * picks smoke vs fire colour. */
 static inline void accumulate_emission_absorption_step(
         float transmittance, float optical_depth_step,
         float emission, float source,
@@ -1841,42 +875,18 @@ static inline void accumulate_emission_absorption_step(
                                  emission * RM_EMISSION_GAIN;
 }
 
-/* Beer-Lambert attenuation: transmittance decays exponentially with
- * the accumulated optical depth.  T ← T · exp(−κ·Δt).  [8] any optics
- * text; [11] Wikipedia Beer-Lambert. */
+/* Dim the remaining light after passing through this much smoke.  The
+ * thicker the smoke in the step, the less gets through — the same law
+ * that makes deep fog go dark. */
 static inline float beer_lambert_attenuate(float transmittance,
                                             float optical_depth_step) {
     return transmittance * expf(-optical_depth_step);
 }
 
-/*
- * raymarch_volume — Beer-Lambert volumetric integration along one ray.
- *
- * Pseudocode:
- *   t = near; transmittance = 1; total = hot = 0
- *   for step = 0..MAX_STEPS:
- *     sample_point = origin + t·direction
- *     if not sample_inside_simulation_domain(sample_point):
- *       skip-ahead and continue
- *     density = sample_density_at_world(...)
- *     if density < ε: tiny step and continue
- *     temperature = sample_temperature_at_world(...)
- *     emission    = temperature_to_emission_normalised(...)
- *     source      = emission · GAIN + ambient_floor
- *     optical_depth_step = density · STEP · GAIN
- *     accumulate_emission_absorption_step(transmittance, ...)
- *     transmittance = beer_lambert_attenuate(transmittance, ...)
- *     if transmittance < ε:  early-out (opaque)
- *     t += STEP
- *   write out totals
- *
- * Outputs:
- *   *out_total_luminance — total smoke + fire luminance
- *   *out_hot_luminance   — fire-only luminance (drives palette choice)
- *
- * Refs [6] Quilez volumetric raymarching; [7] Max 1995 §3
- *   (emission-absorption); [11] Beer-Lambert law.
- */
+/* March one sightline from the camera through the cloud, adding up
+ * light as it goes.  Empty air is skipped quickly; once the smoke in
+ * front is thick enough to hide everything behind, we stop early.
+ * Reports total brightness and the glowing-heat part of it. */
 static void raymarch_volume(Vec3 origin, Vec3 direction,
                             float *out_total_luminance,
                             float *out_hot_luminance) {
@@ -1927,43 +937,25 @@ static void raymarch_volume(Vec3 origin, Vec3 direction,
     *out_hot_luminance   = hot_luminance;
 }
 
-/* ===================================================================== */
-/* §17  camera — orthonormal basis + per-pixel ray (T9)                   */
-/* ===================================================================== */
+/* ── §17 camera — where we look from, and the ray for each pixel ── */
 
 /*
- * Camera — orthonormal basis + projection params for the volume renderer.
+ * Camera — the viewpoint, plus three axes that orient the picture.
  *
- * Intent
- *   For each terminal cell the renderer needs to construct a world-
- *   space ray.  Camera carries the standard pinhole-camera triplet —
- *   origin + (forward, right, up) basis — plus enough projection
- *   information that pixel_to_ray() can produce one normalised ray
- *   direction per cell with no extra parameters.
- *
- * Why right and up are stored (not derived)
- *   The camera always looks at the mushroom column from a fixed
- *   "slightly above and behind" pose; the right/up axes are
- *   constructed ONCE in build_camera_basis() and reused for every
- *   pixel.  Precomputing them keeps the per-pixel loop free of cross
- *   products and length normalisations.
- *
- * Why aspect_factor (not just fov_tangent)
- *   Terminal cells are roughly 2:1 (height:width) so equal pixel
- *   counts horizontally and vertically mean different angular
- *   extents.  aspect_factor folds this 2:1 correction in so the
- *   rendered scene looks proportioned, not vertically stretched.
- *
- * Reference [6] Quilez volumetric raymarching for the per-pixel ray
- *   construction pattern Camera implements.
+ * To draw a pixel we need a ray pointing into the scene.  The camera
+ * holds where it sits (origin) and which way is forward, right, and
+ * up; those three axes are worked out once and reused for every pixel
+ * so the per-pixel loop stays cheap.  aspect_factor corrects for
+ * terminal cells being about twice as tall as they are wide, so the
+ * cloud looks proportioned instead of stretched.
  */
 typedef struct {
-    Vec3  origin;          /* world-space camera position             */
-    Vec3  forward;         /* unit, points from origin toward target  */
-    Vec3  right;           /* unit, world-x in screen space           */
-    Vec3  up;              /* unit, world-y in screen space           */
-    float fov_tangent;     /* tan(fov/2) for the horizontal axis      */
-    float aspect_factor;   /* terminal-cell aspect correction         */
+    Vec3  origin;          /* where the camera sits                   */
+    Vec3  forward;         /* the way it's looking                    */
+    Vec3  right;           /* screen-right direction                  */
+    Vec3  up;              /* screen-up direction                     */
+    float fov_tangent;     /* how wide the view is                    */
+    float aspect_factor;   /* fix for tall terminal cells             */
 } Camera;
 
 static Camera build_camera_basis(float distance_behind, int visible_rows,
@@ -1995,51 +987,36 @@ static Vec3 ray_for_pixel(int col, int row, int cols, int visible_rows,
   return v3normalise(ray);
 }
 
-/* ===================================================================== */
-/* §18  cell_decorate — (lum, hot) → glyph + colour + attr (T10)          */
-/* ===================================================================== */
+/* ── §18 decorate — turn a pixel's light into a glyph + colour ── */
 
 /*
- * Cell — one cell's drawing instruction, derived from raymarch luminance.
+ * Cell — what to draw at one screen position.
  *
- * Intent
- *   The raymarch loop returns two scalars per cell: total luminance
- *   (smoke opacity) and hot luminance (fire emission).  Cell bundles
- *   the three values the renderer needs (glyph, colour pair, attr)
- *   plus a SKIP flag for cells fully transparent against the
- *   background — those are left at default-bg so the terminal can
- *   skip writing them entirely.
- *
- * Why a struct (not three return values)
- *   C functions return one value; bundling glyph + pair + attr + skip
- *   into one POD struct lets decorate_volume_pixel return them all in
- *   one shot.  Callers read `if (c.skip) continue;` then a single
- *   `mvaddch_with_attr(... c.glyph, c.pair | c.attr ...)`.
- *
- * Reference [9] Bourke for the luminance → glyph design.
+ * The raymarcher gives two numbers per pixel (total brightness, and
+ * how much was glowing heat).  This bundles the final drawing
+ * decision: which character, which colour, and any extra emphasis —
+ * plus a skip flag for fully see-through pixels, which we just leave
+ * blank so the terminal doesn't bother drawing them.  Returning one
+ * struct lets the decorator hand all of that back at once.
  */
 typedef struct {
-    char   glyph;     /* one of LUMINANCE_GLYPHS[]                  */
-    int    pair;      /* colour-pair index (theme ramp)             */
-    attr_t attr;      /* extra attributes (A_BOLD for hottest slot) */
-    bool   skip;      /* if true, leave the cell blank (transparent) */
+    char   glyph;     /* the character to draw                      */
+    int    pair;      /* which themed colour                        */
+    attr_t attr;      /* extra emphasis (bold for the hottest)      */
+    bool   skip;      /* true = leave blank (see-through)           */
 } Cell;
 
-/* Map total luminance ∈ [0, ∞) to a GLYPH SLOT 0..GLYPH_SLOT_COUNT-1.
- * Total luminance can in principle exceed the clamp (very thick + very
- * hot cloud), but visually we cap the ramp at PIXEL_LUMINANCE_CLAMP
- * so saturated regions still pick the BRIGHTEST glyph rather than
- * spilling past the table. */
+/* Pick which of the eight glyphs to use from how bright the pixel is.
+ * Very bright pixels just cap at the densest glyph. */
 static inline int luminance_to_glyph_slot(float total_luminance) {
     float lum_normalised = total_luminance / PIXEL_LUMINANCE_CLAMP;
     if (lum_normalised > 1.0f) lum_normalised = 1.0f;
     return to_slot(lum_normalised);
 }
 
-/* Map "hot fraction" — hot_luminance / total_luminance — to a PALETTE
- * SLOT.  0 = pure smoke (cool end of ramp), 1 = pure fire (hot end).
- * The +0.001 guard prevents division by zero for cells whose total
- * luminance was just barely above PIXEL_VISIBLE_LUM_EPS.            */
+/* Pick the colour from how much of the brightness was glowing heat:
+ * none of it = smoke colour, all of it = fire colour.  The small +
+ * keeps us from dividing by zero on a barely-visible pixel. */
 static inline int hot_fraction_to_palette_slot(float hot_luminance,
                                                 float total_luminance) {
     float hot_fraction = hot_luminance / (total_luminance + 0.001f);
@@ -2048,12 +1025,9 @@ static inline int hot_fraction_to_palette_slot(float hot_luminance,
     return to_slot(hot_fraction);
 }
 
-/* Pick the right cell attribute based on the theme polarity:
- *   Normal themes — A_BOLD on hot/bright tiers (extra fire punch),
- *                    A_DIM on cool tiers (fading wisps), else A_NORMAL.
- *   Inverted themes — A_NORMAL only.  A_DIM / A_BOLD on a light fg
- *                      over a white bg INVERT the brightness intent,
- *                      so we skip them entirely.                   */
+/* Add emphasis: bold on the brightest/hottest pixels for punch, dim
+ * on the faintest wisps.  Skip both on bright-background themes, where
+ * bold and dim would read backwards against the light backdrop. */
 static inline attr_t pick_themed_cell_attribute(int slot_lum, int slot_hot,
                                                  bool inverted_theme) {
     if (inverted_theme) return A_NORMAL;
@@ -2062,23 +1036,10 @@ static inline attr_t pick_themed_cell_attribute(int slot_lum, int slot_hot,
     return A_NORMAL;
 }
 
-/*
- * decorate_volume_pixel — (lum, hot) → glyph + colour + attribute.
- *
- * Pseudocode:
- *   if total_luminance < ε:  skip cell (transparent)
- *   slot_lum = luminance_to_glyph_slot(total_luminance)
- *   slot_hot = hot_fraction_to_palette_slot(hot_lum, total_lum)
- *   attr     = pick_themed_cell_attribute(slot_lum, slot_hot, inverted)
- *   return Cell { glyph = LUMINANCE_GLYPHS[slot_lum],
- *                 pair  = PAIR_RAMP_BASE + slot_hot,
- *                 attr  = attr }
- *
- * The "luminance picks glyph, hot picks colour" split lets one
- * dimension (thickness) drive READABILITY and the other (heat) drive
- * VISUAL FEEL.  Smoke and fire share the same glyph ramp but read as
- * very different things because of the colour swap.
- */
+/* Turn one pixel's two numbers into a full drawing decision.  The
+ * brightness picks the character (so thicker cloud reads denser) and
+ * the heat picks the colour (so smoke and fire look different even
+ * when they're equally bright).  Fully see-through pixels are skipped. */
 static Cell decorate_volume_pixel(float total_luminance, float hot_luminance,
                                   bool inverted_theme) {
     if (total_luminance < PIXEL_VISIBLE_LUM_EPS)
@@ -2096,8 +1057,8 @@ static Cell decorate_volume_pixel(float total_luminance, float hot_luminance,
     };
 }
 
-/* emit_cell — paint one cell with attron/attroff batched on
- * (pair, attr) change.  Halves attribute thrash on uniform regions. */
+/* Draw one cell, only switching colour/emphasis when it actually
+ * changes from the last cell — cheaper across runs of the same look. */
 static void emit_cell(int row, int col, Cell cell, int *last_pair,
                       attr_t *last_attr) {
   if (cell.skip)
@@ -2112,85 +1073,40 @@ static void emit_cell(int row, int col, Cell cell, int *last_pair,
   mvaddch(row, col, (chtype)(unsigned char)cell.glyph);
 }
 
-/* ===================================================================== */
-/* §19  render_volume — full screen of raymarched cells                   */
-/* ===================================================================== */
+/* ── §19 render — raymarch every screen cell and paint it ── */
 
 /*
- * Scene — the single owner of this demo's live state.
+ * Scene — all the live state for one running demo.
  *
- * Intent
- *   Scene composes the user's choices (preset blast, theme, debug
- *   mode), the simulation clock (so multiple ticks per frame can
- *   work), and the camera distance.  The actual fluid field is in
- *   g_fluid (file-scope) since every pass loops over the whole grid
- *   and a struct pointer would just add indirection.
- *
- * Locality (sim vs render)
- *   Fields are GROUPED EXPLICITLY so a reader can tell which
- *   subsystem touches each one:
- *     - scene_tick / fluid_advect / project reads it     → simulation
- *     - render_volume_view / decorate_volume_pixel reads → rendering
- *     - both sides bound their loops (cols, rows)        → geometry
- *     - paused gates the tick AND drives the HUD tag     → control
- *
- *   Mis-classifying theme_index as sim (and re-running advect on a
- *   theme change) would break the architectural invariant that "the
- *   look is decoupled from the physics" — same blast with the same
- *   sim_rate must evolve identically regardless of theme.
- *
- * Why these specific fields and no others
- *   - paused                  gate for scene_tick + HUD "PAUSED" tag.
- *   - theme_index             pure render — palette ramp selector.
- *   - blast_type              user's preset choice; the LAST detonation
- *                              uses this row of BLAST_PRESETS[].
- *   - debug_mode              pure render — picks between full
- *                              raymarch and 2-D diagnostic overlays.
- *   - cols, rows              terminal extent; both sim (camera basis
- *                              aspect) and render (loop bounds) read.
- *   - simulation_time_seconds monotonic clock used by §emitter for the
- *                              time-varying turbulence input.
- *   - simulation_rate         user-adjustable sim Hz (faster mushroom).
- *   - simulation_step_accumulator  fixed-step accumulator for the
- *                              dt-decoupled tick loop.
- *   - camera_distance         user-adjustable zoom (zoom in/out keys).
- *
- * Things that DO NOT live here
- *   - Fluid field state                  → file-scope g_fluid
- *   - 5 blast presets / 6 themes / glyph ramp  → file-scope tables
- *   - Render-frame timing / FPS counter  → locals in main()
- *   - Signal flags                       → file-scope volatile
- *
- * Reference [1] Stam Stable Fluids for the field-state ownership
- *   pattern; [10] Raymond for the scene-paint pipeline.
+ * This holds the user's choices (which blast, theme, and debug view),
+ * the simulation clock, and how far back the camera sits.  The fluid
+ * grids themselves live in g_fluid at file scope, not here.  The
+ * fields are grouped so it's clear which belong to the physics and
+ * which only affect how things look — changing the theme, for
+ * instance, must never touch the simulation, so the same blast always
+ * plays out identically whatever colours you pick.
  */
 typedef struct {
-    /* ── Control state (gates tick + drives HUD) ────────────────── */
-    bool      paused;
+    bool      paused;                /* freezes the sim, shows in HUD */
 
-    /* ── Pure render state (read by render_volume_view) ─────────── *
-     * Changing these MUST NOT touch the fluid state.               */
+    /* look only — changing these never touches the physics */
     int       theme_index;
     DebugMode debug_mode;
 
-    /* ── Simulation selector (which preset to (re)detonate with) ─ */
-    BlastType blast_type;
+    BlastType blast_type;            /* which preset the next blast uses */
 
-    /* ── Shared geometry (sim AND render) ──────────────────────── */
-    int       cols, rows;            /* terminal extent in cells   */
+    int       cols, rows;            /* terminal size in cells   */
 
-    /* ── Simulation timing ────────────────────────────────────── */
-    float     simulation_time_seconds;  /* monotonic clock         */
-    float     simulation_rate;          /* sim Hz                  */
-    float     simulation_step_accumulator;  /* fixed-step accum    */
+    /* simulation clock */
+    float     simulation_time_seconds;
+    float     simulation_rate;          /* how fast sim time runs */
+    float     simulation_step_accumulator;
 
-    /* ── Pure render: camera placement ─────────────────────────── */
-    float     camera_distance;
+    float     camera_distance;       /* zoom in / out            */
 } Scene;
 
-/* For "inverted" themes (where the background is white-ish), pre-fill
- * the visible field with the background colour so cells we skip (the
- * transparent ones) sit against the right backdrop. */
+/* On bright-background themes, paint the whole area with the backdrop
+ * first, so the see-through cells we later skip show the right colour. */
 static inline void prefill_inverted_background(int visible_rows, int cols,
                                                 int y_offset) {
     attron(COLOR_PAIR(PAIR_RAMP_BASE));
@@ -2200,8 +1116,7 @@ static inline void prefill_inverted_background(int visible_rows, int cols,
     attroff(COLOR_PAIR(PAIR_RAMP_BASE));
 }
 
-/* Raymarch ONE pixel and convert its (total, hot) luminance into a
- * Cell drawing instruction.  Pure function — no side effects. */
+/* Shoot the ray for one pixel and decide what to draw there. */
 static inline Cell raymarch_and_decorate_pixel(int col, int row,
                                                 int cols, int visible_rows,
                                                 const Camera *cam,
@@ -2212,9 +1127,7 @@ static inline Cell raymarch_and_decorate_pixel(int col, int row,
     return decorate_volume_pixel(total_lum, hot_lum, inverted_theme);
 }
 
-/* Scan the visible field rect, raymarch every cell, paint via the
- * attribute-batching emit_cell to halve attron/attroff overhead on
- * uniform regions. */
+/* Walk every visible cell, raymarch it, and draw it. */
 static inline void paint_raymarched_field(const Camera *cam,
                                            int visible_rows, int cols,
                                            int y_offset, bool inverted,
@@ -2228,16 +1141,8 @@ static inline void paint_raymarched_field(const Camera *cam,
     }
 }
 
-/*
- * render_volume_view — full screen of raymarched volume cells.
- *
- * Pseudocode:
- *   visible_rows = rows - HUD_RESERVED_ROWS
- *   cam = build_camera_basis(camera_distance, visible_rows, cols)
- *   if theme is inverted: prefill_inverted_background(...)
- *   paint_raymarched_field(cam, visible_rows, cols, ...)
- *   close out any open attron pair
- */
+/* Draw the full cloud: set up the camera, prep the backdrop if needed,
+ * then raymarch and paint every cell. */
 static void render_volume_view(const Scene *scene) {
     int visible_rows = scene->rows - HUD_RESERVED_ROWS;
     if (visible_rows < 1) return;
@@ -2259,22 +1164,15 @@ static void render_volume_view(const Scene *scene) {
         attroff(COLOR_PAIR(last_pair) | last_attr);
 }
 
-/* ===================================================================== */
-/* §20  debug_overlays — direct views of the raw 2-D fluid fields         */
-/* ===================================================================== */
+/* ── §20 debug views — show the raw fluid grids straight up ── */
 /*
- * Each overlay swaps the raymarcher for a DIRECT view of one
- * underlying field.  Walks the 2-D fluid grid mapped to terminal
- * cells (with a y-flip so ground stays at the bottom of the screen).
- *
- *   DEBUG_DENSITY      raw 2-D density map
- *   DEBUG_TEMPERATURE  raw 2-D temperature map
- *   DEBUG_VELOCITY     raw 2-D velocity field as ASCII arrows
+ * Instead of the 3-D cloud, these draw one fluid grid flat on screen:
+ * the smoke, the heat, or the flow shown as little arrows.  Handy for
+ * watching what the simulation is actually doing.
  */
 
-/* Convert screen cell (row, col) to fluid-grid cell (grid_i, grid_j).
- * The y-axis is FLIPPED so ground (grid_j = 0) appears at the BOTTOM
- * of the screen rather than the top.  Linear stretch on both axes. */
+/* Map a screen cell to a grid cell, flipping top-to-bottom so the
+ * ground ends up at the bottom of the screen, not the top. */
 static inline void screen_cell_to_fluid_grid(int row, int col,
                                               int visible_rows, int cols,
                                               int *out_grid_i, int *out_grid_j) {
@@ -2282,9 +1180,8 @@ static inline void screen_cell_to_fluid_grid(int row, int col,
     *out_grid_i =  col                     * GRID_RADIAL_CELLS  / cols;
 }
 
-/* Render-pipeline init: bail-out check + y-offset for HUD reservation.
- * Returns the visible row count, or 0 if there isn't enough screen
- * space to draw anything. */
+/* Shared setup for the overlays: how many rows are drawable (0 if the
+ * window is too short), and the offset that keeps row 0 for the HUD. */
 static inline int begin_debug_overlay(const Scene *scene, int *out_y_offset) {
     int visible_rows = scene->rows - HUD_RESERVED_ROWS;
     if (visible_rows < 1) return 0;
@@ -2292,23 +1189,12 @@ static inline int begin_debug_overlay(const Scene *scene, int *out_y_offset) {
     return visible_rows;
 }
 
-/* Close out any open attron from emit_cell's batching. */
+/* Turn off whatever colour/emphasis the last drawn cell left on. */
 static inline void end_debug_overlay(int last_pair, attr_t last_attr) {
     if (last_pair >= 0) attroff(COLOR_PAIR(last_pair) | last_attr);
 }
 
-/*
- * render_debug_density — direct 2-D view of fluid->density[i][j].
- *
- * Pseudocode:
- *   visible_rows = begin_debug_overlay(scene, &y_offset)
- *   for each screen cell (row, col):
- *     (grid_i, grid_j) = screen_cell_to_fluid_grid(row, col, ...)
- *     density   = g_fluid.density[grid_i][grid_j]
- *     normalise = clamp(density / DENSITY_PEAK, 0, 1)
- *     paint glyph + ramp slot
- *   end_debug_overlay
- */
+/* Show the smoke grid flat: each cell's thickness as a glyph + colour. */
 static void render_debug_density(const Scene *scene) {
     int y_offset;
     int visible_rows = begin_debug_overlay(scene, &y_offset);
@@ -2337,13 +1223,7 @@ static void render_debug_density(const Scene *scene) {
     end_debug_overlay(last_pair, last_attr);
 }
 
-/*
- * render_debug_temperature — direct 2-D view of fluid->temperature[i][j].
- *
- * Pseudocode:
- *   like render_debug_density but normalises temperature instead:
- *     normalise = (T − T_amb) / (T_peak − T_amb)   ← maps to [0, 1]
- */
+/* Show the heat grid flat: each cell's temperature as a glyph + colour. */
 static void render_debug_temperature(const Scene *scene) {
     int y_offset;
     int visible_rows = begin_debug_overlay(scene, &y_offset);
@@ -2374,9 +1254,8 @@ static void render_debug_temperature(const Scene *scene) {
     end_debug_overlay(last_pair, last_attr);
 }
 
-/* arrow_for_velocity — pick an ASCII arrow that points in the same
- * direction as a 2-D velocity vector.  8 cardinal/intercardinal
- * directions; magnitude near zero → space (invisible). */
+/* Pick an arrow character pointing the way the flow goes (one of eight
+ * directions).  Nearly-still cells get a blank instead of an arrow. */
 static char arrow_for_velocity(float vx, float vy) {
     float magnitude = sqrtf(vx * vx + vy * vy);
     if (magnitude < 0.05f) return ' ';
@@ -2386,28 +1265,15 @@ static char arrow_for_velocity(float vx, float vy) {
     return ARROWS[octant];
 }
 
-/* |v| → ramp slot 0..GLYPH_SLOT_COUNT-1.  Magnitude is normalised by a
- * fixed 4.0 reference speed (faster than which clips to the brightest
- * slot).  The clip is intentional — overflowing velocities (rare) get
- * full visual weight rather than spilling past the table. */
+/* Colour an arrow by how fast the flow is, capping at a reference
+ * speed of 4 so the rare fast cell just shows brightest. */
 static inline int velocity_magnitude_to_slot(float vx, float vy) {
     float magnitude = sqrtf(vx * vx + vy * vy);
     float normalise = clampf(magnitude / 4.0f, 0.0f, 1.0f);
     return to_slot(normalise);
 }
 
-/*
- * render_debug_velocity — direct 2-D view of (vᵣ, vᵧ) as ASCII arrows.
- *
- * Pseudocode:
- *   for each screen cell (row, col):
- *     (grid_i, grid_j) = screen_cell_to_fluid_grid(row, col, ...)
- *     (vr, vy) from fluid
- *     glyph = arrow_for_velocity(vr, vy)
- *     if glyph == ' ': skip
- *     slot  = velocity_magnitude_to_slot(vr, vy)
- *     paint arrow with ramp colour, bold for top tiers
- */
+/* Show the flow grid as a field of arrows, coloured by speed. */
 static void render_debug_velocity(const Scene *scene) {
     int y_offset;
     int visible_rows = begin_debug_overlay(scene, &y_offset);
@@ -2437,9 +1303,7 @@ static void render_debug_velocity(const Scene *scene) {
     end_debug_overlay(last_pair, last_attr);
 }
 
-/* ===================================================================== */
-/* §21  render_dispatch — pick volume vs debug per active mode            */
-/* ===================================================================== */
+/* ── §21 dispatch — draw the cloud, or one of the debug views ── */
 
 static void render_active_view(const Scene *scene) {
   switch (scene->debug_mode) {
@@ -2461,13 +1325,7 @@ static void render_active_view(const Scene *scene) {
   }
 }
 
-/* ===================================================================== */
-/* §22  hud — top status + bottom hint (CLAUDE.md spec)                   */
-/* ===================================================================== */
-/*
- *   row 0          PAIR_HUD_STATUS (yellow + bold) — title + status
- *   row rows-1     PAIR_HUD_HINT   (cyan   + bold) — key hint
- */
+/* ── §22 HUD — status line on top, key hints along the bottom ── */
 
 static void hud_draw(int term_rows, int term_cols, const Scene *scene,
                      double real_fps, int target_render_fps) {
@@ -2498,21 +1356,16 @@ static void hud_draw(int term_rows, int term_cols, const Scene *scene,
   attroff(COLOR_PAIR(PAIR_HUD_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §23  screen — ncurses init / cleanup / present                         */
-/* ===================================================================== */
+/* ── §23 screen — ncurses setup, teardown, and frame flush ── */
 
 /*
- * Screen — terminal extent record.  ncurses owns the buffers; we
- * keep only cell dimensions for HUD placement and camera aspect.
- *
- * Render pipeline (one frame): erase → render_volume_view → hud_*
- *   → wnoutrefresh(stdscr) → doupdate().  Diff-only writes to the
- *   terminal.  See [10] Raymond §11.
+ * Screen — just the terminal's current size in cells.  ncurses owns
+ * the actual buffers; we only need the dimensions to place the HUD and
+ * shape the camera.
  */
 typedef struct {
-    int rows;   /* terminal height in cells (getmaxyx)             */
-    int cols;   /* terminal width  in cells (getmaxyx)             */
+    int rows;   /* terminal height in cells                        */
+    int cols;   /* terminal width  in cells                        */
 } Screen;
 
 static void screen_init(Screen *screen) {
@@ -2544,9 +1397,7 @@ static void screen_present_frame(Screen *screen, const Scene *scene,
   doupdate();
 }
 
-/* ===================================================================== */
-/* §24  scene — per-frame state + tick + scene helpers                    */
-/* ===================================================================== */
+/* ── §24 scene — set up, reset, and advance the world each frame ── */
 
 static void scene_init(Scene *scene, int cols, int rows) {
   memset(scene, 0, sizeof *scene);
@@ -2583,11 +1434,9 @@ static void scene_cycle_blast(Scene *scene, int direction) {
   scene_redetonate(scene);
 }
 
-/*
- * scene_tick — accumulate real time into sim time and run as many
- * fixed-dt fluid steps as fit.  Fixed-dt accumulator pattern keeps
- * cloud morphology FRAME-RATE-INDEPENDENT.
- */
+/* Advance the simulation.  We bank up elapsed time and run the sim in
+ * fixed little steps, so the cloud evolves the same way no matter what
+ * frame rate the terminal manages. */
 static void scene_tick(Scene *scene, float dt_real_seconds) {
   if (scene->paused)
     return;
@@ -2605,37 +1454,24 @@ static void scene_tick(Scene *scene, float dt_real_seconds) {
   }
 }
 
-/* ===================================================================== */
-/* §25  app — main loop + signals + key handling                          */
-/* ===================================================================== */
+/* ── §25 app — the main loop, signals, and key handling ── */
 
 /*
- * App — top-level container; lives in BSS as the single g_app instance.
+ * App — everything the program holds at the top level, in one global.
  *
- * Intent
- *   Signal handlers (on_exit_signal, on_resize_signal) need to reach
- *   state that the main loop polls.  A global App + handlers that
- *   flip its volatile sig_atomic_t flags is the standard POSIX
- *   "wake the main loop" pattern.
- *
- * Why the volatile sig_atomic_t flags
- *   POSIX permits signal handlers to write ONLY sig_atomic_t values
- *   with simple assignments — anything wider is UB.  volatile forces
- *   every read in the main loop to go back to memory (no compiler
- *   caching into a register across signal arrival).
- *
- * Why target_render_fps lives here (not in Scene)
- *   target_render_fps is a frame-loop concern — it picks the inner-
- *   loop sleep budget — and has no meaning inside scene_tick which
- *   receives the resulting dt as a parameter.  Putting it in App
- *   keeps Scene free of timing detail.
+ * A global lets the signal handlers reach the state the main loop
+ * watches.  The two flags are volatile sig_atomic_t because that's the
+ * only kind of variable a signal handler is allowed to set safely, and
+ * volatile makes sure the loop re-reads them instead of caching a stale
+ * copy.  target_render_fps lives here rather than in Scene because it's
+ * a frame-pacing detail, not part of the simulation.
  */
 typedef struct {
     Scene  scene;                          /* world + control state   */
-    Screen screen;                         /* terminal extent         */
-    int    target_render_fps;              /* render frame cap        */
-    volatile sig_atomic_t running;         /* SIGINT/TERM clears this */
-    volatile sig_atomic_t need_resize;     /* SIGWINCH sets this      */
+    Screen screen;                         /* terminal size           */
+    int    target_render_fps;              /* frame-rate cap          */
+    volatile sig_atomic_t running;         /* cleared on quit signal  */
+    volatile sig_atomic_t need_resize;     /* set on terminal resize  */
 } App;
 
 static App g_app;

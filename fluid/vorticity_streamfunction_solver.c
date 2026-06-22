@@ -1,834 +1,25 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * vorticity_streamfunction_solver.c
- *   2-D incompressible Navier-Stokes via the VORTICITY-STREAMFUNCTION
- *   formulation, with FOUR CLASSIC SCENARIOS and LAGRANGIAN TRACER
- *   PARTICLES so you can SEE the flow.
+ *   2-D water flow you can watch.  Instead of tracking speed and
+ *   pressure directly, we track two simpler things: how hard the
+ *   fluid is spinning at each point (ω), and a field whose contour
+ *   lines happen to be the paths the fluid follows (ψ).  Each tick
+ *   spins ω forward, rebuilds ψ from it, reads the velocity back out,
+ *   and floats a few hundred dots along for the ride so the motion
+ *   is actually visible.  Four classic scenarios cycle with p/P:
+ *   the Karman vortex street behind a cylinder, a lid-driven box, a
+ *   free jet, and flow over a backward step.
  *
- * DEMO: Solves the 2-D NS equations on a rectangular grid using ω
- *       (vorticity = local fluid spin) and ψ (streamfunction = a
- *       scalar whose contours ARE the streamlines).  Pressure is
- *       eliminated entirely.  Each tick advances ω in time, then
- *       solves a Poisson equation for ψ, then derives velocities.
+ * Sister demos in this folder, same physics, different approach:
+ *   fluid/navier_stokes.c        — Stam's stable fluids (speed+pressure)
+ *   fluid/lattice_gas.c          — flow from colliding particles (FHP)
+ *   fluid/shallow_water_solver.c — depth-averaged 2-D flow
  *
- *       Four scenarios cycle with 'p' / 'P':
- *
- *         KARMAN STREET   — uniform inflow past a circular cylinder.
- *                            At Reynolds ~100-1000, the wake develops
- *                            the famous KARMAN VORTEX STREET: vortices
- *                            shed alternately from the top and bottom
- *                            of the cylinder, drifting downstream in a
- *                            staggered pattern.  Iconic.  THE flow.
- *
- *         LID CAVITY      — square box, top wall slides right at unit
- *                            speed.  Steady recirculating vortex inside.
- *                            CFD validation classic.
- *
- *         FREE JET        — narrow inlet at the centre of the left
- *                            wall, fluid blasts in.  Outflow on the
- *                            right.  Jet entrains surrounding fluid;
- *                            mushroom-tip vortices form at the head.
- *
- *         BACKWARD STEP   — channel flow over a downward step at
- *                            inlet.  Behind the step, the flow
- *                            SEPARATES and reattaches further
- *                            downstream — a recirculation bubble
- *                            forms.  Classic separation flow.
- *
- *       Three core visualisations + tracer overlay:
- *
- *         VORTICITY       — diverging blue/red heatmap of ω.  Red =
- *                            counter-clockwise spin, blue = clockwise.
- *         STREAMLINES     — banded ψ contours (lines of constant ψ
- *                            are streamlines).
- *         VELOCITY        — speed magnitude heatmap.
- *         TRACERS         — 400 LAGRANGIAN PARTICLES advected through
- *                            the velocity field.  Toggle with 'x'.
- *                            This is the killer feature: when you SEE
- *                            dots tracing out the vortex street, the
- *                            abstract numbers become obvious.
- *
- * Study alongside:
- *   fluid/navier_stokes.c      — Eulerian primitive-variables NS
- *                                 (Stam stable fluids).  Different
- *                                 formulation, same underlying physics.
- *   fluid/lattice_gas.c        — particle-level NS (FHP).
- *   fluid/shallow_water_solver.c — depth-averaged 2-D flow.
- *
- * Section map:
- *   §1   config            — every tunable named, scenario presets
- *   §2   clock             — monotonic ns timer + sleep
- *   §3   rng               — small wrapper for tracer respawn
- *   §4   themes            — diverging vorticity + sequential velocity
- *   §5   colors            — pair init + diverging-band picker
- *   §6   ramp              — ASCII glyph + threshold lookup
- *   §7   grid_state        — psi, omega, omega_next, u, v, walls
- *   §8   obstacle_layouts  — cylinder, step builders
- *   §9   apply_boundary    — per-side BC + Thom's formula
- *   §10  vorticity_step    — explicit Euler with upwind + diffusion
- *   §11  poisson_solve     — SOR iteration of ∇²ψ = -ω
- *   §12  velocity_recompute— u = ∂ψ/∂y, v = -∂ψ/∂x; adaptive dt
- *   §13  ns_step           — full physics tick (orchestrator)
- *   §14  tracers           — Lagrangian particle pool + advection
- *   §15  presets           — 4 scenario specs + loaders
- *   §16  render_vorticity  — ω field heatmap
- *   §17  render_streamlines— ψ contour bands
- *   §18  render_velocity   — speed magnitude heatmap
- *   §19  render_tracers    — overlay particles + trails
- *   §20  render_obstacles  — overlay solid cells
- *   §21  hud               — top status + bottom hint (CLAUDE.md spec)
- *   §22  scene             — per-frame state + tick wrapper
- *   §23  screen            — ncurses init / cleanup / present
- *   §24  app               — main loop + signals + input
- *
- * Keys:
- *   q / Q / ESC      quit
- *   space            pause / resume
- *   v                vorticity view
- *   s                streamline view
- *   w                velocity view
- *   x                toggle tracer overlay
- *   p / P            next / prev scenario
- *   + / -            Reynolds number up / down
- *   r                reset current scenario
- *   t                cycle theme (vorticity palette)
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra fluid/vorticity_streamfunction_solver.c \
- *       -o vorticity_solver -lncurses -lm
+ * The wall-spin trick is Thom 1933; the lid-cavity test case is the
+ * standard Ghia-Ghia-Shin 1982 benchmark; the cylinder wake is von
+ * Karman 1911.
  */
-
-/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
- *      T1-T2 establish the worldview (vorticity + streamfunction
- *      replace velocity + pressure).  T3-T5 cover the numerical
- *      algorithm (transport equation, Poisson solve, velocity
- *      recovery).  T6-T7 cover boundary conditions for the four
- *      scenarios.  T8 explains the Karman street physics.  T9 covers
- *      tracer particles.  T10 ties everything together.
- *   2. §1 config — every tunable in one place.
- *   3. §7 grid_state — the data structure.
- *   4. §13 ns_step — the algorithm in five calls.
- *   5. §10-§12 — read AFTER tutorials T3, T4, T5.
- *   6. §15 presets — four scenario specs.
- *   7. §16-§20 — visualisation layer.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   g_scene.streamfunction_psi[]         ψ — flat row-major array
- *   g_scene.vorticity_omega[]            ω — flat row-major array
- *   g_scene.vorticity_omega_next[]       scratch for forward-Euler step
- *   g_scene.velocity_x[], g_scene.velocity_y[]   u, v — derived from ψ each tick
- *   g_scene.wall_mask[]                  true = solid obstacle / wall cell
- *
- *   g_scene.grid_cols, g_scene.grid_rows         active grid dimensions
- *   g_scene.cell_size_x, g_scene.cell_size_y     dx, dy
- *   g_scene.kinematic_viscosity          ν = 1/Re
- *   g_scene.reynolds_number              Re = U·L/ν
- *
- *   active_scenario_index        which row of scenario_table is live
- *   active_view_mode             VIEW_VORTICITY / VIEW_STREAMLINES /
- *                                  VIEW_VELOCITY
- *   tracer_overlay_enabled       toggle for the particle layer
- *   simulation_paused            run/pause toggle
- *
- *   inflow_velocity              U at the inflow boundary (= 1.0 for
- *                                  scenarios with a moving boundary)
- *
- * Background you need
- * ───────────────────
- *   - Vector calculus on a grid: ∇·u (divergence), ∇×u (curl, scalar
- *     in 2-D), ∇²ψ (Laplacian).  T1 reviews them informally.
- *   - Forward Euler integration; understand stability bounds.
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - Pressure-Poisson solvers, projection methods.  Vorticity-
- *     streamfunction sidesteps pressure entirely (T2).
- *   - Compressible flow, turbulence models, free surfaces.  Pure
- *     2-D incompressible viscous flow.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ───────────────────────────────────────────────────────── *
- *
- * Algorithm    : VORTICITY-STREAMFUNCTION formulation of the 2-D
- *                incompressible Navier-Stokes equations.  Two scalar
- *                fields replace the velocity vector + pressure:
- *
- *                  ω = vorticity         = ∂v/∂x − ∂u/∂y
- *                  ψ = streamfunction    where  u = ∂ψ/∂y, v = −∂ψ/∂x
- *
- *                Per tick:
- *                  1. ADVANCE ω by one timestep using the VORTICITY
- *                     TRANSPORT equation:
- *                       ∂ω/∂t + u·∂ω/∂x + v·∂ω/∂y = ν·∇²ω
- *                  2. RECOVER ψ from the new ω by solving the POISSON
- *                     EQUATION ∇²ψ = −ω.  Iterative SOR solver.
- *                  3. RECOMPUTE u, v from the new ψ via finite
- *                     differences:  u = ∂ψ/∂y,  v = −∂ψ/∂x.
- *                  4. APPLY BOUNDARY CONDITIONS — walls, inflow,
- *                     outflow, moving lid, obstacles.
- *
- *                Plus ADVECT a pool of Lagrangian tracer particles
- *                through the velocity field for visualisation.
- *
- * Math basis   : Take the curl of the Navier-Stokes momentum equation:
- *                  ∂u/∂t + (u·∇)u = -∇p/ρ + ν·∇²u
- *                The pressure term ∇p disappears (curl of a gradient
- *                is zero).  In 2-D the curl is a SCALAR ω, and the
- *                resulting equation is the vorticity transport
- *                equation above.  Combined with INCOMPRESSIBILITY
- *                (∇·u = 0), which is automatically satisfied by the
- *                streamfunction definition, the system is closed.
- *
- *                Why this is powerful:
- *                  - One scalar field (ω) carries all the dynamics.
- *                  - One scalar field (ψ) carries all the kinematics.
- *                  - PRESSURE is gone — no Poisson solve for p, no
- *                    projection step.
- *                  - Continuity (∇·u = 0) is automatic, exact, never
- *                    drifts numerically.
- *                Cost:
- *                  - Restricted to 2-D (curl is a scalar only in 2-D).
- *                  - Boundary conditions for ω at walls are tricky
- *                    (Thom's formula, T6).
- *
- * Performance  : SOR Poisson solver runs ~14 sweeps per tick.  Each
- *                sweep is O(N²) cell updates.  At 80 × 22 = 1760
- *                cells × 14 sweeps × 8 sub-steps × 30 fps ≈ 6M cell
- *                updates per second.  Trivial.
- *
- * References
- * ──────────
- *   ── The ψ-ω formulation ──────────────────────────────────────────
- *   [1] Roache, P. J. (1972), "Computational Fluid Dynamics", Hermosa
- *       — foundational textbook; the ψ-ω chapter is the canonical
- *       reference for the formulation used here.
- *   [2] Anderson, J. D. (1995), "Computational Fluid Dynamics: The
- *       Basics with Applications", McGraw-Hill — modern undergraduate
- *       treatment of ψ-ω with worked examples.
- *
- *   ── Historical benchmarks ─────────────────────────────────────────
- *   [3] Thom, A. (1933), "The Flow Past Circular Cylinders at Low
- *       Speeds", Proc. R. Soc. A 141, pp. 651-669 — the wall-
- *       vorticity formula in §9 is "Thom's formula" from this paper.
- *   [4] Ghia, U., Ghia, K. N. & Shin, C. T. (1982), "High-Re
- *       Solutions for Incompressible Flow Using the Navier-Stokes
- *       Equations and a Multigrid Method", J. Comput. Phys. 48(3),
- *       pp. 387-411 — the lid-driven cavity benchmark we use as a
- *       preset; one of the most-cited CFD validation problems.
- *   [5] von Kármán, T. (1911), "Über den Mechanismus des Widerstandes,
- *       den ein bewegter Körper in einer Flüssigkeit erfährt",
- *       Nachr. Ges. Wiss. Göttingen — original vortex-street analysis;
- *       the cylinder-wake preset reproduces this.
- *
- *   ── Poisson solvers ──────────────────────────────────────────────
- *   [6] Saad, Y. (2003), "Iterative Methods for Sparse Linear
- *       Systems", 2nd ed., SIAM — SOR convergence theory for the
- *       streamfunction Poisson solve.  Our SOR_OMEGA default of 1.7
- *       follows the textbook rule-of-thumb.
- *
- *   ── Numerical methods generally ───────────────────────────────────
- *   [7] LeVeque, R. J. (2007), "Finite Difference Methods for ODEs
- *       and PDEs", SIAM — explicit time-step stability for the ω
- *       advection-diffusion equation.
- *
- *   ── Rendering / ncurses ──────────────────────────────────────────
- *   [8] Bourke, P. (1997), "Character representation of grayscale
- *       images", paulbourke.net/dataformats/asciiart — design basis
- *       for the vorticity-magnitude → glyph ramp.
- *   [9] Raymond, E. S., "NCURSES Programming HOWTO" —
- *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; init_pair,
- *       use_default_colors, newscr/curscr diff pipeline.
- *
- *   ── Online quick reference ───────────────────────────────────────
- *  [10] https://en.wikipedia.org/wiki/Vorticity
- *  [11] https://en.wikipedia.org/wiki/Stream_function
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ───────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Don't track the velocity directly.  Track the FLUID'S TENDENCY TO
- * SPIN (vorticity ω) and a SCALAR FIELD WHOSE CONTOURS ARE THE
- * STREAMLINES (streamfunction ψ).  The two are linked by a Poisson
- * equation.  You get the flow without ever computing pressure —
- * which means no projection step, no incompressibility constraint
- * to enforce explicitly, just two coupled fields evolving in
- * lockstep.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a swirling river of water on a flat plain.  At each point,
- * two questions:
- *
- *   1. HOW MUCH IS THE WATER ROTATING HERE?  (vorticity ω)
- *      Positive ω = counter-clockwise spin.  Negative = clockwise.
- *      Zero = the water is gliding straight without rotation.
- *
- *   2. WHICH STREAMLINE IS THE WATER ON?  (streamfunction ψ)
- *      Imagine numbering every streamline 0, 1, 2, ...  ψ tells
- *      you which streamline the water at this point is sitting on.
- *      Cells with ψ = 5.0 all share the same streamline.  Cells
- *      with ψ = 5.1 are on a slightly displaced streamline.
- *
- * Now: given ω at every point, can you reconstruct the velocity
- * everywhere?  YES — solve ∇²ψ = -ω.  Once you have ψ, the
- * velocity is just the gradient of ψ rotated 90°: u = ∂ψ/∂y,
- * v = -∂ψ/∂x.
- *
- * And how does ω evolve?  By being CARRIED BY the flow (advection),
- * SPREAD by viscosity (diffusion), and CREATED at walls where
- * no-slip imposes a velocity gradient.  That's the vorticity
- * transport equation.
- *
- * So: ω drives the flow.  Walls inject ω.  ψ encodes ω back into
- * a velocity field.  Loop forever.
- *
- *      ┌──────────────────────────────────────────────────────┐
- *      │                                                      │
- *      │   ONE PHYSICS TICK:                                  │
- *      │                                                      │
- *      │     ω_new ← TRANSPORT(ω_old, u, v, ν)                │
- *      │              (advect by u, v; diffuse by ν)          │
- *      │                                                      │
- *      │     ψ ← POISSON_SOLVE(ω_new, BC's)                   │
- *      │              (∇²ψ = -ω, SOR iteration)               │
- *      │                                                      │
- *      │     u, v ← VELOCITY_FROM_PSI(ψ)                      │
- *      │              (u = ∂ψ/∂y, v = -∂ψ/∂x)                 │
- *      │                                                      │
- *      │     APPLY_BC(ψ, ω, u, v)                             │
- *      │              (walls, inflow, outflow, lid)           │
- *      │                                                      │
- *      └──────────────────────────────────────────────────────┘
- *
- * KEY FORMULAS
- * ────────────
- *
- *   STREAMFUNCTION DEFINITION (incompressible 2-D):
- *     u =  ∂ψ/∂y
- *     v = -∂ψ/∂x
- *     ⇒  ∇·u = ∂u/∂x + ∂v/∂y
- *           = ∂²ψ/∂x∂y - ∂²ψ/∂y∂x = 0    ✓ (continuity automatic)
- *
- *   VORTICITY DEFINITION (z-component of curl in 2-D):
- *     ω = ∂v/∂x - ∂u/∂y
- *
- *   POISSON EQUATION linking ψ to ω:
- *     ω = ∂v/∂x - ∂u/∂y
- *       = -∂²ψ/∂x² - ∂²ψ/∂y²
- *       = -∇²ψ
- *     ⇒  ∇²ψ = -ω
- *
- *   VORTICITY TRANSPORT (curl of Navier-Stokes):
- *     ∂ω/∂t + u·∂ω/∂x + v·∂ω/∂y = ν · ∇²ω
- *
- *   FORWARD EULER UPDATE (with upwind convection):
- *     ω_new[i, j] = ω + dt · (-u·∂ω/∂x - v·∂ω/∂y + ν·∇²ω)
- *
- *   SOR POISSON UPDATE (per cell, one sweep):
- *     ψ_GS = (dy²·(ψ_E + ψ_W) + dx²·(ψ_N + ψ_S) + dx²·dy²·ω)
- *             / (2·(dx² + dy²))
- *     ψ_new = ψ + α · (ψ_GS - ψ)        α ∈ (1, 2), α ≈ 1.7
- *
- *   THOM'S WALL-VORTICITY FORMULA (no-slip wall, ψ_wall = 0):
- *     ω_wall = -2 · ψ_interior / h²
- *     For a moving wall (lid at speed U_lid):
- *     ω_wall = -2 · ψ_interior / h² - 2 · U_lid / h
- *
- *   ADAPTIVE DT (CFL):
- *     dt_conv = CFL · dx / max|u|       (advection limit)
- *     dt_diff = CFL · dx² / (4 · ν)      (diffusion limit)
- *     dt = min(dt_conv, dt_diff)
- *
- *   TRACER ADVECTION (per particle, forward Euler):
- *     pos += velocity_at(pos) · dt
- *     bilinear-interpolate the velocity field at fractional pos
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   - WALL VORTICITY is not freely chosen — it's COMPUTED from the
- *     interior ψ via Thom's formula (T6).  Picking arbitrary ω at
- *     walls breaks the coupling.
- *   - STREAMFUNCTION at walls must be a CONSTANT for each connected
- *     wall segment (no-flow-through condition).  In a single-domain
- *     box, ψ = 0 on the entire boundary.  In Karman / step / jet,
- *     each wall segment has its own constant.
- *   - INFLOW BOUNDARIES need ψ to vary linearly with the
- *     perpendicular coordinate, ω = 0 (uniform incoming flow has
- *     no vorticity).
- *   - OUTFLOW (Neumann zero-gradient) loses energy slowly;
- *     reflections from boundaries are minimal but not zero.
- *   - SOR_OMEGA = 1.7 is a robust default but the optimum α
- *     depends on grid size.  At very small grids, α = 1.5 is safer.
- *   - TRACER PARTICLES that drift outside the domain must be
- *     RESPAWNED at the inflow (or random domain interior for
- *     closed scenarios) to maintain density.
- *   - OBSTACLE CELLS (cylinder, step) get u=v=0 + Thom's wall
- *     vorticity, just like walls.  The implementation iterates
- *     over the obstacle mask and applies wall-style BC at every
- *     internal interface.
- *
- * HOW TO VERIFY
- * ─────────────
- *   - KARMAN STREET (default): within ~5 seconds at Re=200 the
- *     wake develops alternating vortex shedding.  Press 'x' to
- *     toggle tracers — the staggered von Karman pattern becomes
- *     OBVIOUS.
- *   - LID CAVITY: a single recirculating vortex centred near the
- *     middle of the box.  At Re=400+, secondary corner vortices
- *     appear in the bottom-left and bottom-right.
- *   - FREE JET: fluid blasts in from the centre-left, mushroom-tip
- *     vortices form at the leading edge, jet entrains surrounding
- *     fluid.  Tracers visible curving inward.
- *   - BACKWARD STEP: flow over the step separates; a recirculation
- *     bubble forms behind the step.  Tracers in the bubble go
- *     ROUND AND ROUND while the main flow continues downstream.
- *   - Press '+' to bump Re higher: vortices sharper, more chaotic.
- *     Press '-' for lower Re: smooth creeping flow.
- *
- * ─────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
- *
- *   T1   Vorticity and streamfunction — what are they?
- *   T2   Why ψ-ω formulation — pressure elimination
- *   T3   Vorticity transport equation (curl of NS)
- *   T4   Poisson equation ∇²ψ = -ω and the SOR solver
- *   T5   Velocity recovery + adaptive dt
- *   T6   Boundary conditions and Thom's formula
- *   T7   The four scenarios (BCs in detail)
- *   T8   Karman vortex street — physics + history
- *   T9   Lagrangian tracer particles for visualisation
- *   T10  Reading the screen — what each view shows
- *
- * ─────────────────────────────────────────────────────────────────── *
- *
- * T1  VORTICITY AND STREAMFUNCTION — WHAT ARE THEY?
- * ─────────────────────────────────────────────────
- * Two scalar fields that replace the usual velocity vector + pressure
- * representation of fluid flow.
- *
- * VORTICITY ω(x, y).  At each point, ω measures the LOCAL ROTATION
- * RATE of the fluid.  Imagine a tiny paddle wheel placed at the
- * point and free to rotate:
- *
- *   - In rigid-body rotation at angular velocity Ω, the paddle
- *     rotates at exactly Ω.  ω = 2Ω.
- *   - In a uniform-velocity flow (wind blowing east), no paddle
- *     rotates.  ω = 0 everywhere.
- *   - In a SHEAR FLOW (top moving right, bottom stationary), the
- *     paddle spins because its top is dragged faster than its
- *     bottom.  ω ≠ 0.
- *
- * Mathematically, ω is the z-component of the curl of velocity
- * (the only non-zero component in 2-D):
- *
- *     ω = ∂v/∂x - ∂u/∂y
- *
- * Sign convention: ω > 0 means COUNTER-CLOCKWISE rotation.
- *
- * STREAMFUNCTION ψ(x, y).  A scalar whose CONTOURS ARE STREAMLINES.
- * If you sketch lines of constant ψ on the flow, you trace out the
- * paths fluid particles follow.
- *
- *   - A HORIZONTAL line of constant ψ → fluid flows horizontally
- *     along it.
- *   - CLOSELY SPACED contours → fluid moves FAST (small spacing
- *     means large gradient → large velocity).
- *   - WIDELY SPACED contours → fluid moves slow.
- *
- * Definition:
- *
- *     u =  ∂ψ/∂y          (horizontal velocity)
- *     v = -∂ψ/∂x          (vertical velocity)
- *
- * The minus sign on v is convention.  With this choice:
- *   ∇·u = ∂u/∂x + ∂v/∂y = ∂²ψ/∂x∂y - ∂²ψ/∂y∂x = 0
- * for any smooth ψ.  Continuity (incompressibility) is satisfied
- * AUTOMATICALLY.
- *
- *      ┌──────────────────────────────────────────────────────┐
- *      │                                                      │
- *      │  Streamlines (lines of constant ψ):                  │
- *      │                                                      │
- *      │   ──────────────────  ψ = 3.0    (slow)              │
- *      │   ─ ─ ─ ─ ─ ─ ─ ─ ─   ψ = 2.0                        │
- *      │   ───────────────────  ψ = 1.0   (fast — close)      │
- *      │   ────────────────────  ψ = 0.5                      │
- *      │   ────────────────────  ψ = 0.0                      │
- *      │                                                      │
- *      │   Speed = |∇ψ|.  Closely-spaced contours = fast flow.│
- *      │                                                      │
- *      └──────────────────────────────────────────────────────┘
- *
- * T2  WHY ψ-ω FORMULATION — PRESSURE ELIMINATION
- * ──────────────────────────────────────────────
- * The usual incompressible Navier-Stokes solver tracks (u, v, p):
- *
- *     ∂u/∂t + (u·∇)u = -∇p/ρ + ν·∇²u    (momentum)
- *     ∇·u = 0                            (continuity)
- *
- * Pressure has no time derivative — it's a Lagrange multiplier
- * enforcing continuity.  Each tick you must SOLVE A POISSON EQUATION
- * for p (the "projection step" in Stam stable fluids).  Expensive,
- * fiddly boundary conditions, easy to get wrong.
- *
- * VORTICITY-STREAMFUNCTION SIDESTEPS THIS.
- *
- * Take the curl of the momentum equation.  The curl of a gradient is
- * always zero (∇×∇p = 0), so PRESSURE DROPS OUT entirely:
- *
- *     ∂ω/∂t + (u·∇)ω = ν·∇²ω
- *
- * That's the VORTICITY TRANSPORT EQUATION.  No pressure.
- *
- * For the velocity, instead of solving for u and v separately under
- * the constraint ∇·u = 0, define ψ such that u = ∂ψ/∂y, v = -∂ψ/∂x.
- * Continuity is now AUTOMATIC.  And ψ is linked to ω by:
- *
- *     ∇²ψ = -ω           (Poisson equation)
- *
- * One scalar Poisson equation for ψ, no continuity constraint,
- * pressure ELIMINATED.
- *
- * Trade-offs:
- *   PRO  No pressure variable.
- *   PRO  Continuity exactly satisfied at every step (no drift).
- *   PRO  ψ contours give streamlines for free.
- *   CON  Restricted to 2-D (curl is a scalar in 2-D, vector in 3-D).
- *   CON  Wall boundary conditions for ω are subtle (Thom, T6).
- *
- * For 2-D viscous flow, ψ-ω is often the FORMULATION OF CHOICE in
- * textbooks and small-grid simulations.  Stam's stable fluids
- * (navier_stokes.c) uses primitive variables instead because it
- * generalises to 3-D and handles complex geometry better.
- *
- * T3  VORTICITY TRANSPORT EQUATION (CURL OF NS)
- * ─────────────────────────────────────────────
- * Start with the incompressible 2-D Navier-Stokes momentum equation:
- *
- *     ∂u/∂t + u·∂u/∂x + v·∂u/∂y = -∂p/∂x/ρ + ν·∇²u
- *     ∂v/∂t + u·∂v/∂x + v·∂v/∂y = -∂p/∂y/ρ + ν·∇²v
- *
- * Take ∂(second)/∂x - ∂(first)/∂y:
- *
- *     ∂(∂v/∂x - ∂u/∂y)/∂t  +  (cross-derivative terms)
- *       =  ∂(-∂p/∂y/ρ)/∂x - ∂(-∂p/∂x/ρ)/∂y
- *       +  ν·(∇²(∂v/∂x - ∂u/∂y))
- *
- * The pressure terms cancel (∂²p/∂x∂y = ∂²p/∂y∂x).  The first term
- * is ∂ω/∂t.  After algebra (using ∇·u = 0 to simplify the cross
- * terms), the cross-derivative collapses to (u·∇)ω, and we get:
- *
- *     ∂ω/∂t + u·∂ω/∂x + v·∂ω/∂y = ν·∇²ω
- *      ─────  ─────────────────   ──────
- *      time     advection         diffusion
- *
- * Read this as: "vorticity is CARRIED BY the flow (advection),
- * SPREAD by viscosity (diffusion).  No source term in the
- * interior — ω is created only at boundaries (walls)."
- *
- * NUMERICAL IMPLEMENTATION (§10):
- *   - Discrete time:  forward Euler.
- *   - Advection u·∂ω/∂x:  UPWIND first-order differencing.  Why
- *     upwind?  Central differences for advection have NEGATIVE
- *     numerical diffusion — they amplify oscillations.  Upwind
- *     introduces small positive numerical diffusion (which is fine
- *     for stability).
- *   - Diffusion ν·∇²ω:  central second-difference.  Always
- *     stable for diffusion since the term is dissipative.
- *
- * T4  POISSON EQUATION ∇²ψ = -ω AND THE SOR SOLVER
- * ────────────────────────────────────────────────
- * After advancing ω in time, we need to recover the velocity field.
- * That requires ψ.  ψ satisfies the POISSON EQUATION:
- *
- *     ∇²ψ = -ω
- *
- * Discretise on a 5-point stencil.  At interior cell (x, y):
- *
- *     (ψ_E + ψ_W - 2ψ)/dx² + (ψ_N + ψ_S - 2ψ)/dy² = -ω
- *
- * Solve for ψ at the centre cell:
- *
- *     ψ_GS = [dy²·(ψ_E + ψ_W) + dx²·(ψ_N + ψ_S) + dx²·dy²·ω]
- *             / (2·(dx² + dy²))
- *
- * (When dx = dy this collapses to the simpler ψ_GS = (sum of 4
- * neighbours + h²·ω) / 4.)  This is one GAUSS-SEIDEL iteration:
- * each cell uses the LATEST values of its neighbours.
- *
- * SUCCESSIVE OVER-RELAXATION (SOR) speeds this up.  Instead of
- * setting ψ_new = ψ_GS, we OVER-CORRECT:
- *
- *     ψ_new = ψ + α · (ψ_GS - ψ)         α ∈ (1, 2)
- *
- * α = 1 → pure Gauss-Seidel.  α > 1 → over-correction, faster
- * convergence.  α → 2 → diverges.  Optimum for square grid of
- * size N:
- *
- *     α_opt ≈ 2 / (1 + sin(π/(N+1)))
- *
- * For N ≈ 80 cells, α_opt ≈ 1.92.  We use α = 1.7, a safe value
- * across grid sizes.
- *
- * Convergence rate: each sweep reduces the error by factor
- * (α - 1)/(1 - sin(π/(N+1))).  At α = 1.7 and N = 80, that's
- * roughly 0.7 per sweep.  14 sweeps reduce the error by 0.7¹⁴ ≈
- * 0.007 — three orders of magnitude.  Visually exact.
- *
- * SCHEDULE PER TICK:
- *   - update ω (forward Euler, T3)
- *   - Poisson solve for ψ (14 SOR sweeps, this section)
- *   - recompute (u, v) from ψ (centred differences, T5)
- *   - apply boundary conditions (T6)
- *
- * T5  VELOCITY RECOVERY + ADAPTIVE DT
- * ───────────────────────────────────
- * After the Poisson solve, ψ is up to date.  Recover velocity via:
- *
- *     u[i, j] =  (ψ[i, j+1] - ψ[i, j-1]) / (2 · dy)
- *     v[i, j] = -(ψ[i+1, j] - ψ[i-1, j]) / (2 · dx)
- *
- * Central differences — second-order accurate.  At walls, override:
- *
- *     stationary wall:  u = v = 0
- *     moving lid:       u = U_lid, v = 0
- *
- * ADAPTIVE TIMESTEP.  Forward Euler stability requires:
- *
- *     dt < dx / max|u|             (advection / CFL bound)
- *     dt < dx² / (4 · ν)           (diffusion bound, 2-D)
- *
- * Take the MIN of the two and apply a safety factor (CFL = 0.25):
- *
- *     dt = CFL · min(dx / max|u|,  dx² / (4·ν))
- *
- * This is recomputed every tick because max|u| changes as the flow
- * evolves.  At Re = 100, dt ≈ 0.005.  At Re = 1000, dt ≈ 0.001.
- *
- * The CFL factor of 0.25 is conservative.  Pushing toward 1.0
- * works for diffusion but is risky for the advection bound at
- * high Re where local velocity spikes can occur.
- *
- * T6  BOUNDARY CONDITIONS AND THOM'S FORMULA
- * ──────────────────────────────────────────
- * Boundary conditions for ψ-ω are SUBTLE.  Three boundary types
- * appear in our scenarios:
- *
- *   NO-SLIP WALL (stationary or moving):
- *     ψ_wall = constant       (no flow THROUGH the wall)
- *     u, v at wall = explicit  (= 0 for stationary, = U_lid for lid)
- *     ω_wall = COMPUTED FROM INTERIOR ψ via THOM'S FORMULA:
- *
- *        ω_wall = -2 · ψ_interior / h²       (stationary)
- *        ω_lid  = -2 · ψ_interior / h² - 2·U_lid / h
- *
- *     Why?  The vorticity at a no-slip wall reflects the velocity
- *     gradient there.  Taylor-expand ψ near the wall:
- *
- *        ψ_interior ≈ ψ_wall + h · ∂ψ/∂n + h²/2 · ∂²ψ/∂n²
- *
- *     With ψ_wall = 0 and ∂ψ/∂n = -tangential velocity (ψ derivative
- *     normal to wall = velocity along wall), solving for the second
- *     derivative gives ω = -∇²ψ at the wall, hence the formula.
- *
- *     For a moving lid, the tangential velocity at the wall is U_lid,
- *     hence the extra -2·U_lid/h term.
- *
- *     This is THOM (1933) — the canonical reference.
- *
- *   INFLOW (uniform velocity entering the domain):
- *     u = U_in everywhere on this side.
- *     v = 0.
- *     ψ varies LINEARLY with the perpendicular coordinate:
- *        ψ(x=0, y) = U_in · y
- *     ω = 0 (uniform flow has no rotation).
- *
- *   OUTFLOW (zero gradient — fluid slides out):
- *     ∂ψ/∂n = ∂ω/∂n = 0     (Neumann BC)
- *     Practically: ghost cell value = nearest interior value.
- *     Some reflection occurs; not perfect ABC.
- *
- * Each scenario specifies the BC type for each of the four walls.
- * The boundary application function (§9) handles all combinations.
- *
- * T7  THE FOUR SCENARIOS (BCs IN DETAIL)
- * ──────────────────────────────────────
- * KARMAN STREET:
- *   left   = INFLOW (U_in = 1)
- *   right  = OUTFLOW
- *   top    = WALL or FREE-SLIP (we use wall for simplicity)
- *   bottom = WALL
- *   obstacle = circular cylinder at 25% from left, centred vertically
- *   PHYSICS: at Re ~50-200 the wake oscillates, vortices shed from
- *            top/bottom alternately → KARMAN VORTEX STREET.
- *
- * LID CAVITY:
- *   all walls stationary except TOP, which moves right at U_lid.
- *   no obstacles.
- *   PHYSICS: steady recirculating vortex inside the cavity.
- *
- * FREE JET:
- *   left wall — center band (20% of height) is INFLOW; rest is wall.
- *   right wall — OUTFLOW.
- *   top, bottom — walls.
- *   no obstacle.
- *   PHYSICS: jet enters, entrains surrounding fluid, mushroom tips.
- *
- * BACKWARD STEP:
- *   left wall — top half (above step) is INFLOW; bottom half is wall
- *               (the step).
- *   right    — OUTFLOW.
- *   top, bottom — walls.
- *   step is a solid block in the bottom-left corner.
- *   PHYSICS: flow separates behind the step, recirculation bubble
- *            forms.
- *
- * T8  KARMAN VORTEX STREET — PHYSICS + HISTORY
- * ────────────────────────────────────────────
- * In 1911, Theodore von Karman (a 30-year-old aerodynamicist in
- * Germany) was watching laboratory flow visualisations of fluid
- * past a circular cylinder.  At low Reynolds number (Re < 50) the
- * flow was steady — two symmetric eddies behind the cylinder.  At
- * higher Re, those eddies became UNSTABLE and shed alternately
- * into the wake.
- *
- * The result: a VON KARMAN VORTEX STREET — two parallel rows of
- * counter-rotating vortices drifting downstream.  Equally spaced
- * within each row; offset between rows.
- *
- *      ┌──────────────────────────────────────────────────────┐
- *      │                                                      │
- *      │  upstream                                downstream  │
- *      │   →    ●   →                            (CCW)        │
- *      │   →    ●   →    →   ↺   →   ●  →  ↺   →  ●           │
- *      │   →    ●   →                                         │
- *      │   →    ●   →    →   ●   →  ↻   →  ●  →  ↻            │
- *      │   →    ●   →                            (CW)         │
- *      │                                                      │
- *      │   uniform flow      cylinder         alternating     │
- *      │                                      vortex pairs    │
- *      │                                                      │
- *      └──────────────────────────────────────────────────────┘
- *
- * Critical Reynolds numbers:
- *   Re < ~5         creeping flow, no separation
- *   Re ~5-40        steady recirculation (twin eddies behind cylinder)
- *   Re ~40-90       wake oscillates, vortex shedding begins
- *   Re ~100-200     fully developed Karman street, periodic
- *   Re > 300        wake becomes 3-D unstable (we still see 2-D pattern)
- *   Re > 10000      turbulent wake, but Karman street still visible at
- *                    larger scales
- *
- * The STROUHAL NUMBER quantifies the shedding frequency:
- *   St = f · D / U  ≈  0.21 (universal, weak Re dependence)
- * where f = shedding frequency, D = cylinder diameter, U = flow
- * speed.  Telegraph wires sing in the wind at the Strouhal
- * frequency.  Tall buildings sway at it.  Submarine periscopes
- * vibrate at it.  Smokestacks have spiral vanes welded around them
- * to BREAK the regular shedding (otherwise they fatigue and fail).
- *
- * Real-world relevance:
- *   - Aeolian harps + organ pipes: vortex shedding excites resonance.
- *   - The Tacoma Narrows bridge collapse (1940) — vortex-induced
- *     oscillation, not just wind drag.
- *   - Underwater cables ringing in ocean currents.
- *   - Insect flight: vortex shedding from wings drives lift.
- *
- * In our simulator at Re=100, you should see crisp alternating
- * shedding within ~5 sec.  Toggle tracers ('x') for the iconic
- * staggered pattern.
- *
- * T9  LAGRANGIAN TRACER PARTICLES FOR VISUALISATION
- * ─────────────────────────────────────────────────
- * The vorticity / streamfunction / velocity fields are abstract.
- * Heatmaps help, but they don't convey MOVEMENT — and movement is
- * what fluid is.  TRACER PARTICLES fix this.
- *
- * Idea: scatter ~400 dots through the domain.  Each tick, advect
- * each dot by the local velocity field:
- *
- *     pos += velocity_at(pos) · dt
- *
- * `velocity_at(pos)` is bilinearly interpolated from the (u, v)
- * arrays.  After many ticks, the dots TRACE OUT the flow.
- * Vortices become visible as dots circling each other; jets show
- * as streams of dots streaking through; recirculation bubbles
- * become dots going round and round.
- *
- * Particle lifecycle:
- *   - SPAWN at a sensible location (inflow boundary for inflow
- *     scenarios; uniformly distributed in the domain for closed
- *     scenarios like the lid cavity).
- *   - ADVECT each tick.
- *   - RESPAWN when the particle exits the domain or its TRAIL
- *     gets too long (otherwise old data clutters the visualisation).
- *
- * Drawing: just put a single character at the particle's rounded
- * (col, row).  We use '.' for resting, brighter glyphs at higher
- * speeds.  Optionally: keep a short trail of past positions for a
- * "comet" effect.
- *
- * Lagrangian particles are the OLDEST flow-visualisation
- * technique — predates computers.  Real wind tunnels use SMOKE,
- * dye, or oil droplets.  Same principle, real particles.
- *
- *      ┌──────────────────────────────────────────────────────┐
- *      │                                                      │
- *      │  Without tracers: heatmap                            │
- *      │     red blob ↔ blue blob                             │
- *      │     "vortices?"                                       │
- *      │                                                      │
- *      │  With tracers:                                       │
- *      │     ↻ ↺ ↻ ↺                                          │
- *      │     ●●●●  ●●●●  ●●●●  ●●●●                            │
- *      │     "OH that's a Karman street!"                     │
- *      │                                                      │
- *      └──────────────────────────────────────────────────────┘
- *
- * T10 READING THE SCREEN — WHAT EACH VIEW SHOWS
- * ─────────────────────────────────────────────
- * Three base modes plus the tracer overlay:
- *
- *   VORTICITY ('v'):  diverging blue → grey → red.
- *     RED CELLS    counter-clockwise spinning fluid (positive ω).
- *     BLUE CELLS   clockwise spinning fluid (negative ω).
- *     GREY         irrotational (ω ≈ 0).
- *     INTERPRETATION: each shed vortex shows as a coloured BLOB.
- *     Karman street: alternating red-blue-red-blue blobs in the wake.
- *
- *   STREAMLINES ('s'):  banded ψ contours.
- *     DARK-LIGHT alternating bands trace out the streamlines of
- *     the flow.  Closely-spaced bands = fast flow.  Closed loops =
- *     vortices.
- *
- *   VELOCITY ('w'):  speed-magnitude heatmap.
- *     Bright cells = fast.  Dark cells = slow.
- *     Karman street: a "shadow" stretches downstream of the cylinder
- *     where speeds are reduced.
- *
- *   TRACERS ('x' to toggle):  Lagrangian particles overlaid on top
- *     of any base mode.  ~400 dots tracing the flow.  THE killer
- *     feature for understanding what's happening.
- *
- * Best combination for understanding Karman street:
- *   1. Start in VORTICITY mode (default).  See the alternating
- *      red/blue blobs.
- *   2. Toggle tracers ('x').  Watch dots curve around each blob.
- *   3. Switch to STREAMLINES ('s').  See the wavy wake structure.
- *   4. Switch to VELOCITY ('w').  See the speed shadow.
- *   5. Bump Re ('+'), watch the shedding sharpen.
- *
- * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -846,9 +37,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  config — every constant + enums                                   */
-/* ===================================================================== */
+/* §1  config — every constant + enums */
 
 /* §1.1 — frame timing. */
 
@@ -963,9 +152,7 @@ enum {
 
 #define STREAMLINE_BAND_COUNT 12
 
-/* ===================================================================== */
-/* §2  clock — monotonic ns timer + sleep                                */
-/* ===================================================================== */
+/* §2  clock — monotonic ns timer + sleep */
 
 static int64_t clock_now_ns(void) {
   struct timespec ts;
@@ -980,9 +167,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  rng — small wrapper for tracer respawn                            */
-/* ===================================================================== */
+/* §3  rng — small wrapper for tracer respawn */
 
 static float rand_uniform_unit(void) { return (float)rand() / (float)RAND_MAX; }
 
@@ -992,17 +177,11 @@ static int rand_in_range(int lo, int hi_exclusive) {
   return lo + rand() % (hi_exclusive - lo);
 }
 
-/* ===================================================================== */
-/* §4  themes — diverging vorticity + sequential velocity                */
-/* ===================================================================== */
-/*
- * Pair init values are chosen so that the bottom of each ramp lies
- * in the BRIGHT half of the 256-cube (≥ 30) so even faint bands
- * stay legible against the default-black terminal.
- *
- * Velocity ramp uses xterm-256 gradients dark-blue → cyan → yellow
- * → red.  Vorticity uses the canonical diverging blue/grey/red.
- */
+/* §4  themes — diverging vorticity + sequential velocity */
+/* Colours all sit in the bright half of the 256-colour space so even
+ * the faintest bands stay readable on a black terminal.  Velocity
+ * runs dark-blue to cyan to yellow to red; vorticity is the usual
+ * blue / grey / red split for clockwise / still / counter-clockwise. */
 
 /* Velocity glyph ramp — sparse to dense. */
 static const char velocity_glyph_table[VEL_RAMP_SIZE] = {' ', '.', ':', '+',
@@ -1011,9 +190,7 @@ static const char velocity_glyph_table[VEL_RAMP_SIZE] = {' ', '.', ':', '+',
 /* Tracer particle glyph ramp by speed band. */
 static const char tracer_glyph_table[4] = {'.', 'o', 'O', '@'};
 
-/* ===================================================================== */
-/* §5  colors — pair init + diverging-band picker                        */
-/* ===================================================================== */
+/* §5  colors — pair init + diverging-band picker */
 
 static bool terminal_has_256_colours = false;
 
@@ -1069,27 +246,21 @@ static void colors_init(void) {
 }
 
 /*
- * VortBand — one cell's drawing instruction, derived from local ω.
+ * VortBand — how to draw one cell, decided from how hard it's spinning.
  *
- * Intent
- *   The vorticity field ω = ∇×v is SIGNED — positive (counter-
- *   clockwise rotation) and negative (clockwise) need OPPOSITE
- *   colours.  vorticity_band_for() maps the normalised ω value to a
- *   diverging-palette tier (strong-CCW / weak-CCW / near-zero /
- *   weak-CW / strong-CW), picking glyph + colour pair + attribute in
- *   one shot.
+ * Spin is signed: counter-clockwise is positive, clockwise negative,
+ * and the two need opposite colours.  vorticity_band_for() takes the
+ * spin (scaled to roughly -1..1) and sorts it into one of seven tiers
+ * from strong-clockwise through still to strong-counter-clockwise,
+ * handing back the colour, character, and brightness all at once.
  *
- * Why a struct (not three return values)
- *   C functions return one value; bundling pair + glyph + attr in a
- *   POD struct keeps the per-cell loop linear:
- *     `b = vorticity_band_for(w); attron(b.pair|b.attr); ...`
- *
- * Reference [8] Bourke for the diverging glyph design.
+ * It's a struct only so the per-cell draw loop reads as one line —
+ * a C function can return just one value.  Glyph ramp follows Bourke.
  */
 typedef struct {
-    int    pair;      /* colour-pair index (CW/CCW tier)            */
-    char   glyph;     /* '.' / '*' / '#' / '@' depending on band    */
-    attr_t attr;      /* A_BOLD for strongest tier                  */
+    int    pair;      /* which colour to use (spin tier)           */
+    char   glyph;     /* the character to draw                     */
+    attr_t attr;      /* bold for the strongest tiers             */
 } VortBand;
 
 static VortBand vorticity_band_for(float omega_normalised) {
@@ -1108,9 +279,7 @@ static VortBand vorticity_band_for(float omega_normalised) {
   return (VortBand){PAIR_VORT_POS_STRONG, '#', A_BOLD};
 }
 
-/* ===================================================================== */
-/* §6  ramp — value to glyph-slot helpers                                */
-/* ===================================================================== */
+/* §6  ramp — value to glyph-slot helpers */
 
 static int speed_to_velocity_slot(float speed, float speed_max) {
   if (speed_max < 1e-6f)
@@ -1123,111 +292,57 @@ static int speed_to_velocity_slot(float speed, float speed_max) {
   return slot;
 }
 
-/* ===================================================================== */
-/* §7  grid_state — psi, omega, omega_next, u, v, walls                  */
-/* ===================================================================== */
+/* §7  grid_state — psi, omega, omega_next, u, v, walls */
 /*
- * All fields are flat row-major arrays of g_scene.grid_rows * g_scene.grid_cols.
- * Index helper: cell_index(x, y) = y * g_scene.grid_cols + x.
- *
- * GRID coordinates: (x, y) with x ∈ [0, g_scene.grid_cols-1], y ∈ [0,
- * g_scene.grid_rows-1].  y = 0 is the BOTTOM of the physics domain.  When
- * rendering, we INVERT y so the visual top of the screen matches
- * the highest y (matches the lid orientation).
+ * Every field is one flat array, one float per cell, laid out row by
+ * row; cell_index(x, y) finds a cell.  y = 0 is the BOTTOM of the
+ * fluid, but the screen draws top-down, so the render code flips y —
+ * that way the top of the window is the top of the tank.
  */
 
 #define GRID_TOTAL_CELLS (GRID_COLS_MAX * GRID_ROWS_MAX)
 
 /*
- * Scene — the single owner of this demo's live state.
+ * Scene — all of the demo's live state in one place.
  *
- * Intent
- *   Earlier versions kept scene state as flat file-scope globals.
- *   This Scene struct groups the same fields together so the sim /
- *   tuning / control / render split is enforced by the STRUCT
- *   LAYOUT, not just by convention.  Helpers continue to reach the
- *   state through `g_scene.<field>` so the inner-loop ψ-ω stencil
- *   math stays free of pointer threading.
+ * It's one big struct (reached through the g_scene global) rather than
+ * a pile of loose globals so the field arrays sit together and nobody
+ * has to thread pointers through the tight inner loops.  Everything is
+ * allocated once here, in BSS — no malloc ever runs while the sim is
+ * going.  The fields below are grouped by job: the simulation arrays
+ * the solver reads and writes, the grid geometry both the solver and
+ * the drawing share, the Reynolds-number knobs, and two render-only
+ * smoothing values that must never feed back into the physics (if a
+ * view changed the viscosity, the same scenario would evolve
+ * differently depending on what you were looking at).
  *
- *   Tracer pool, active-scenario index, view-mode, and paused flag
- *   are declared in §14/§15/§22 next to the code that owns them; for
- *   the consolidated picture see those sections.  Everything BELOW
- *   is what the per-step solver loop reads/writes.
- *
- * Locality (sim vs render)
- *   Fields are GROUPED EXPLICITLY by subsystem:
- *     - SOR Poisson + ω-advect + ω-diffuse + boundary + velocity-from-ψ
- *                                          → simulation
- *     - render_vorticity_view / render_streamlines_view / tracers
- *                                          → rendering
- *     - both sides bound their loops (g_scene.grid_cols, g_scene.grid_rows,
- *       g_scene.cell_size_x, _y)                   → shared geometry
- *     - simulation_paused gates the tick   → control state (§22)
- *
- *   Mis-classifying a field — e.g. letting render_vorticity_view bump
- *   g_scene.kinematic_viscosity — would couple visuals to physics and break
- *   reproducibility (the same scenario at the same Re must evolve
- *   identically regardless of which view is displayed).
- *
- * Why one big struct (not split across Scene + App + Field)
- *   Every solver pass needs the whole field set.  Splitting would
- *   force pointer chains in the inner SOR loop — already 14 sweeps
- *   per tick × W·H cells — and the extra indirection would slow it
- *   noticeably.  Keeping one Scene + one g_scene instance matches
- *   CLAUDE.md's "no dynamic allocation after init": ~6 × GRID_TOTAL
- *   floats in BSS, no malloc anywhere.
- *
- * Why these specific fields and no others
- *   - g_scene.streamfunction_psi   ψ field — primary unknown.  Solved each
- *                          step by SOR Poisson against vorticity.
- *   - g_scene.vorticity_omega      ω field — second primary unknown.  Advected
- *                          + diffused each step.
- *   - g_scene.vorticity_omega_next ω scratch for advection/diffusion step.
- *   - g_scene.velocity_x / _y      v = ∇×ψ — DERIVED but cached so tracers and
- *                          render passes don't recompute the curl.
- *   - g_scene.wall_mask            true at solid cells.  Scenario-configured.
- *   - g_scene.grid_cols, g_scene.grid_rows active subregion bounds.
- *   - g_scene.cell_size_x, _y      physical Δx, Δy used by the solver.
- *   - g_scene.kinematic_viscosity  ν, derived from Reynolds number.
- *   - g_scene.reynolds_number      Re = U·L/ν.
- *   - g_scene.reynolds_preset_index  index into the REYNOLDS_TABLE tier.
- *   - g_scene.current_dt           adaptive timestep, recomputed from CFL.
- *   - g_scene.velocity_max_smoothed  EMA of |v| max — normalises arrows.
- *   - g_scene.vorticity_max_smoothed EMA of |ω| max — normalises VortBand.
- *
- * Things that DO NOT live here
- *   - Tracer pool / view mode / paused flag    → declared in §14, §22
- *   - 5 scenario presets / 6 reynolds tiers    → file-scope constants
- *   - Render-frame timing / FPS counter        → locals in main()
- *   - Signal flags (SIGINT, SIGWINCH)          → file-scope volatile
- *
- * References [1] Roache for the ψ-ω state layout; [6] Saad for the
- *   SOR convergence properties that motivate this buffer design.
+ * The tracer dots, current view, scenario choice, and pause flag live
+ * with their own code in §14/§15/§22, not here.
  */
 typedef struct {
-    /* ── Simulation state (read by all physics passes) ──────────── */
-    float streamfunction_psi  [GRID_TOTAL_CELLS];  /* ψ — primary    */
-    float vorticity_omega     [GRID_TOTAL_CELLS];  /* ω — primary    */
-    float vorticity_omega_next[GRID_TOTAL_CELLS];  /* ω scratch      */
-    float velocity_x          [GRID_TOTAL_CELLS];  /* u = ∂ψ/∂y      */
-    float velocity_y          [GRID_TOTAL_CELLS];  /* v = -∂ψ/∂x     */
-    bool  wall_mask           [GRID_TOTAL_CELLS];  /* solid cells    */
+    /* ── The simulation itself ─────────────────────────────────── */
+    float streamfunction_psi  [GRID_TOTAL_CELLS];  /* ψ — the flow field */
+    float vorticity_omega     [GRID_TOTAL_CELLS];  /* ω — the spin field */
+    float vorticity_omega_next[GRID_TOTAL_CELLS];  /* scratch for the spin update */
+    float velocity_x          [GRID_TOTAL_CELLS];  /* speed across, read out of ψ */
+    float velocity_y          [GRID_TOTAL_CELLS];  /* speed up/down, read out of ψ */
+    bool  wall_mask           [GRID_TOTAL_CELLS];  /* true where a wall/obstacle is */
 
-    /* ── Shared geometry (sim AND render) ──────────────────────── */
+    /* ── Grid size + cell spacing (used by sim and drawing) ────── */
     int   grid_cols;
     int   grid_rows;
-    float cell_size_x;          /* physical Δx                       */
-    float cell_size_y;          /* physical Δy                       */
+    float cell_size_x;          /* width of one cell                 */
+    float cell_size_y;          /* height of one cell                */
 
-    /* ── Simulation tuning (Re-driven) ─────────────────────────── */
-    float kinematic_viscosity;  /* ν                                 */
-    float reynolds_number;      /* Re = U·L/ν                        */
-    int   reynolds_preset_index;
-    float current_dt;           /* adaptive timestep                 */
+    /* ── How thick/sticky the fluid is ─────────────────────────── */
+    float kinematic_viscosity;  /* stickiness; = 1 / Reynolds        */
+    float reynolds_number;      /* fast-and-swirly vs slow-and-smooth */
+    int   reynolds_preset_index;/* which +/- preset we're on         */
+    float current_dt;           /* time step, re-picked each tick     */
 
-    /* ── Pure render diagnostics (must not touch sim fields) ───── */
-    float velocity_max_smoothed;  /* EMA of |v| max — arrow scale    */
-    float vorticity_max_smoothed; /* EMA of |ω| max — VortBand scale */
+    /* ── Render-only smoothing (never touch the sim) ───────────── */
+    float velocity_max_smoothed;  /* running peak speed, for colour scale */
+    float vorticity_max_smoothed; /* running peak spin, for colour scale  */
 } Scene;
 
 static Scene g_scene = {
@@ -1257,9 +372,7 @@ static void grid_clear_walls(void) {
   memset(g_scene.wall_mask, 0, sizeof(bool) * n);
 }
 
-/* ===================================================================== */
-/* §8  obstacle_layouts — cylinder, step builders                        */
-/* ===================================================================== */
+/* §8  obstacle_layouts — cylinder, step builders */
 
 static void obstacle_build_cylinder(float cx_frac, float cy_frac,
                                     float radius_frac) {
@@ -1292,55 +405,41 @@ static void obstacle_build_step(float step_height_frac) {
   }
 }
 
-/* ===================================================================== */
-/* §9  apply_boundary — per-side BC + Thom's formula (T6)                */
-/* ===================================================================== */
+/* §9  apply_boundary — per-side rules + Thom's wall-spin formula */
 
 /*
- * BoundarySpec — the four-walled boundary configuration of a scenario.
+ * BoundarySpec — what each of the four walls does in a scenario.
  *
- * Intent
- *   The ψ-ω formulation needs DIFFERENT boundary treatment on each
- *   wall: a lid-driven cavity has a moving top + no-slip sides, a
- *   pipe flow has inflow on the left + outflow on the right + walls
- *   top and bottom, etc.  BoundarySpec carries one BC kind per wall
- *   (top/right/bottom/left) plus the magnitude of any inflow.
+ * Every wall can behave differently: in the lid-driven box the top
+ * slides while the other three sit still; in pipe flow the fluid
+ * comes in the left and leaves the right with solid walls top and
+ * bottom.  So we keep one rule per wall (a solid wall, a moving wall,
+ * one of three inflow shapes, or an open outflow) instead of a single
+ * setting for the whole box.  inflow_velocity is the one speed shared
+ * by whichever sides let fluid in — every scenario here uses the same
+ * inflow speed, so one number covers it.
  *
- * Why four separate ints (not one global BC_KIND)
- *   Most useful scenarios have ASYMMETRIC boundaries — a single global
- *   kind couldn't express "moving top + no-slip sides".  Splitting per
- *   wall lets each preset wire its own combination from the same set
- *   of BC kinds (NOSLIP / FREE_SLIP / INFLOW / OUTFLOW / PERIODIC).
- *
- * Why inflow_velocity is here (not on each side)
- *   In our presets, when an inflow boundary exists it's always with
- *   the SAME magnitude (a uniform flow speed).  Keeping one scalar
- *   here matches that pattern; a per-side inflow magnitude would be
- *   needed only for scenarios we don't currently demonstrate.
- *
- * Reference [3] Thom 1933 for the wall-vorticity formula that
- *   converts ψ values on no-slip walls into ω boundary values.
+ * The wall-spin formula those rules feed into is Thom (1933).
  */
 typedef struct {
-    int   side_top;          /* BC kind for top wall                */
-    int   side_right;         /* BC kind for right wall              */
-    int   side_bottom;        /* BC kind for bottom wall             */
-    int   side_left;          /* BC kind for left wall               */
-    float inflow_velocity;    /* speed at any INFLOW side            */
+    int   side_top;          /* rule for the top wall               */
+    int   side_right;         /* rule for the right wall            */
+    int   side_bottom;        /* rule for the bottom wall           */
+    int   side_left;          /* rule for the left wall             */
+    float inflow_velocity;    /* speed where fluid flows in         */
 } BoundarySpec;
 
-/* For UNIFORM inflow, ψ varies linearly with y so that ∂ψ/∂y = U_in
- * is constant over the whole left wall — every horizontal streamline
- * enters at the same speed. */
+/* Even inflow across the whole left wall: ψ climbs steadily up the
+ * wall so the fluid enters at one steady speed everywhere. */
 static inline float psi_uniform_inflow_profile(int y, int rows,
                                                 float inflow_velocity) {
     (void)rows;
     return inflow_velocity * (float)y * g_scene.cell_size_y;
 }
 
-/* For TOP-HALF inflow (backward-facing step) ψ is zero on the lower
- * step face and linear above it — the step acts as a no-slip "shelf"
- * the upper-half inflow has to flow over. */
+/* Inflow only above the step (backward-step scenario): nothing comes
+ * in over the lower quarter, which acts as a solid shelf, and the
+ * fluid above it pours over the edge. */
 static inline float psi_top_half_inflow_profile(int y, int rows,
                                                  float inflow_velocity) {
     int step_h = rows / 4;
@@ -1348,9 +447,10 @@ static inline float psi_top_half_inflow_profile(int y, int rows,
     return inflow_velocity * (float)(y - step_h) * g_scene.cell_size_y;
 }
 
-/* For CENTRE-BAND inflow (free jet) ψ ramps linearly inside the band
- * [40 %, 60 %], stays flat above (entrained but not driven), and is
- * zero below.  Models a planar jet from a slot. */
+/* Inflow through a narrow centre slot (free jet): fluid is driven in
+ * only over the middle 40-60% band, modelling a jet squirting out of
+ * a slot.  Above the band the fluid is just dragged along, below it
+ * stays put. */
 static inline float psi_centre_band_inflow_profile(int y, int rows,
                                                     float inflow_velocity) {
     int band_lo = rows * 4 / 10;
@@ -1361,9 +461,8 @@ static inline float psi_centre_band_inflow_profile(int y, int rows,
     return inflow_velocity * (float)(y - band_lo) * g_scene.cell_size_y;
 }
 
-/* Pick the right ψ profile function for the given inflow KIND and
- * evaluate it at y.  Non-inflow kinds get ψ = 0 (no slip on the left
- * wall). */
+/* Pick the matching inflow shape for this wall's rule and read its ψ
+ * at height y.  A plain wall just gets ψ = 0. */
 static inline float psi_inflow_value_at(int side_kind, int y, int rows,
                                          float inflow_velocity) {
     switch (side_kind) {
@@ -1378,8 +477,7 @@ static inline float psi_inflow_value_at(int side_kind, int y, int rows,
     }
 }
 
-/* LEFT side: pick the appropriate inflow profile (or zero for walls)
- * and write it to ψ along column 0. */
+/* Left wall: write the chosen inflow shape (or zero) down column 0. */
 static inline void apply_psi_on_left_side(int side_kind, float inflow_velocity,
                                            int rows) {
     for (int y = 0; y < rows; y++)
@@ -1387,9 +485,8 @@ static inline void apply_psi_on_left_side(int side_kind, float inflow_velocity,
             psi_inflow_value_at(side_kind, y, rows, inflow_velocity);
 }
 
-/* RIGHT side: for OUTFLOW we copy the second-to-last column (zero
- * normal-gradient).  Other kinds (walls) leave the value alone — set
- * elsewhere in scenario load. */
+/* Right wall: if fluid flows out here, just copy the column next to
+ * the edge so the flow leaves smoothly.  Solid walls are left alone. */
 static inline void apply_psi_on_right_side(int side_kind, int rows, int cols) {
     if (side_kind != BC_SIDE_OUTFLOW) return;
     for (int y = 0; y < rows; y++)
@@ -1397,16 +494,16 @@ static inline void apply_psi_on_right_side(int side_kind, int rows, int cols) {
             g_scene.streamfunction_psi[cell_index(cols - 2, y)];
 }
 
-/* BOTTOM side: ψ = 0 along the bottom wall — the "ground streamline"
- * by convention so vertical velocities measure absolute height of ψ. */
+/* Bottom wall: pin ψ = 0 along the floor.  This is our reference
+ * line; every other ψ value is measured up from here. */
 static inline void apply_psi_on_bottom_side(int cols) {
     for (int x = 0; x < cols; x++)
         g_scene.streamfunction_psi[cell_index(x, 0)] = 0.0f;
 }
 
-/* TOP side: for stationary walls coupled to a uniform inflow, ψ at
- * the top must equal the wall streamline value ψ = U_in · H so the
- * top streamline continues smoothly into the inflow profile. */
+/* Top wall: a still wall above a uniform inflow has to carry the ψ
+ * value the inflow reaches at the top, so the top streamline lines up
+ * with the incoming flow instead of kinking at the corner. */
 static inline void apply_psi_on_top_side(int side_kind, float inflow_velocity,
                                           int rows, int cols) {
     float psi_top = 0.0f;
@@ -1416,18 +513,7 @@ static inline void apply_psi_on_top_side(int side_kind, float inflow_velocity,
         g_scene.streamfunction_psi[cell_index(x, rows - 1)] = psi_top;
 }
 
-/*
- * boundary_set_psi_side — apply the ψ BC for ONE side of the domain.
- *
- * Pseudocode (dispatch by which side):
- *   L : apply_psi_on_left_side   (build inflow profile or zero)
- *   R : apply_psi_on_right_side  (copy column for outflow)
- *   B : apply_psi_on_bottom_side (zero along the floor)
- *   T : apply_psi_on_top_side    (match inflow's wall streamline)
- *
- * For inflow boundaries, ψ varies LINEARLY with the perpendicular
- * coordinate so that ∂ψ/∂(perp) gives a constant velocity component.
- */
+/* Set the ψ values along whichever wall you name (L/R/B/T). */
 static void boundary_set_psi_side(int side_kind, char which_side,
                                    float inflow_velocity) {
     int rows = g_scene.grid_rows;
@@ -1441,17 +527,14 @@ static void boundary_set_psi_side(int side_kind, char which_side,
     }
 }
 
-/* Thom's formula: wall vorticity from the streamfunction value at the
- * inner cell, one step in from the wall.  ω_wall = −2·ψ_inner / h²
- * comes from a second-order Taylor expansion of ψ at the no-slip wall
- * (ψ_wall = 0, ∂ψ/∂n_wall = 0 → ∂²ψ/∂n² gives the wall ω).
- * Refs [3] Thom 1933 (the eponymous paper). */
+/* Thom's trick: a wall where the fluid can't slip generates spin, and
+ * the amount is fixed by the ψ value one cell in from the wall.  This
+ * is how we work that spin out (Thom 1933). */
 static inline float thom_omega_from_inner_psi(float psi_inner, float h_squared) {
     return -2.0f * psi_inner / h_squared;
 }
 
-/* Bottom wall — stationary no-slip case only.  Uses Thom's formula
- * with the row-1 ψ value. */
+/* Set the spin along the bottom wall (only when it's a still wall). */
 static inline void apply_thom_on_bottom_wall(const BoundarySpec *spec,
                                               int cols, float dy_squared) {
     if (spec->side_bottom != BC_SIDE_WALL_STATIONARY) return;
@@ -1462,9 +545,8 @@ static inline void apply_thom_on_bottom_wall(const BoundarySpec *spec,
     }
 }
 
-/* Top wall — Thom's formula with an EXTRA TERM for the moving-lid
- * case.  The −2·U_lid/h₀ correction adds the wall's own velocity
- * shear to the vorticity it generates. */
+/* Set the spin along the top wall.  If the top is a sliding lid, add
+ * an extra term for the spin its own movement drags into the fluid. */
 static inline void apply_thom_on_top_wall(const BoundarySpec *spec,
                                            int rows, int cols, float dy_squared) {
     for (int x = 0; x < cols; x++) {
@@ -1477,8 +559,8 @@ static inline void apply_thom_on_top_wall(const BoundarySpec *spec,
     }
 }
 
-/* Left side — Thom if it's a wall, ω = 0 if it's an inflow (uniform
- * incoming flow carries no vorticity). */
+/* Set the spin along the left side: the wall formula if it's a wall,
+ * or zero where fluid flows in (incoming flow isn't spinning yet). */
 static inline void apply_thom_on_left_side(const BoundarySpec *spec,
                                             int rows, float dx_squared) {
     if (spec->side_left == BC_SIDE_WALL_STATIONARY) {
@@ -1493,8 +575,8 @@ static inline void apply_thom_on_left_side(const BoundarySpec *spec,
     }
 }
 
-/* Right side — Thom if it's a wall, zero-gradient copy if it's an
- * outflow. */
+/* Set the spin along the right side: the wall formula if it's a wall,
+ * or just copy the neighbour's spin where fluid flows out. */
 static inline void apply_thom_on_right_side(const BoundarySpec *spec,
                                              int rows, int cols, float dx_squared) {
     if (spec->side_right == BC_SIDE_WALL_STATIONARY) {
@@ -1510,11 +592,11 @@ static inline void apply_thom_on_right_side(const BoundarySpec *spec,
     }
 }
 
-/* Average ψ over the non-wall 4-neighbours of cell (x, y).  Used at
- * INTERIOR OBSTACLE CELLS as a Thom-formula proxy — at the obstacle
- * boundary the average gives the correct Thom magnitude; for cells
- * fully inside the obstacle (no fluid neighbours) it returns 0, which
- * the caller turns into ω = 0. */
+/* Average ψ of the (up to four) fluid cells touching cell (x, y).
+ * Used at obstacle cells to stand in for the wall formula: cells on
+ * the obstacle's edge see fluid and give a sensible spin; cells buried
+ * deep inside see none and report 0, which the caller treats as no
+ * spin. */
 static inline float average_psi_of_fluid_neighbours(int x, int y,
                                                      int *out_neighbour_count) {
     int  count    = 0;
@@ -1533,10 +615,9 @@ static inline float average_psi_of_fluid_neighbours(int x, int y,
     return (count > 0) ? psi_sum / (float)count : 0.0f;
 }
 
-/* For every INTERIOR obstacle cell, write the Thom-formula ω from
- * the average ψ of non-wall neighbours, and force ψ = 0 inside the
- * obstacle.  Boundary cells of the obstacle generate the correct
- * Thom ω; cells fully interior get ω = 0. */
+/* Walk every obstacle cell: give edge cells their wall spin from the
+ * surrounding fluid, give buried cells no spin, and zero ψ inside the
+ * obstacle so no flow leaks through it. */
 static inline void apply_thom_inside_obstacle_cells(int rows, int cols,
                                                      float dy_squared) {
     for (int y = 1; y < rows - 1; y++) {
@@ -1551,17 +632,7 @@ static inline void apply_thom_inside_obstacle_cells(int rows, int cols,
     }
 }
 
-/*
- * boundary_set_thom_wall_vorticity — populate ω at every wall via
- * Thom's formula [3] Thom 1933.
- *
- * Pseudocode:
- *   apply_thom_on_bottom_wall  (stationary case only)
- *   apply_thom_on_top_wall     (handles moving-lid extra term)
- *   apply_thom_on_left_side    (Thom or ω=0 for inflow)
- *   apply_thom_on_right_side   (Thom or zero-grad for outflow)
- *   apply_thom_inside_obstacle_cells   (avg-neighbour proxy)
- */
+/* Fill in the spin at every wall and obstacle for this tick. */
 static void boundary_set_thom_wall_vorticity(const BoundarySpec *spec) {
     int   rows = g_scene.grid_rows;
     int   cols = g_scene.grid_cols;
@@ -1583,13 +654,11 @@ static void apply_boundary(const BoundarySpec *spec) {
   boundary_set_thom_wall_vorticity(spec);
 }
 
-/* ===================================================================== */
-/* §10  vorticity_step — explicit Euler with upwind + diffusion (T3)     */
-/* ===================================================================== */
+/* §10  vorticity_step — step the spin field forward in time */
 
-/* The five values of ω in the 5-point stencil at cell (x, y) plus
- * its (u, v) velocity.  Bundled so the inner-loop body reads as
- * pure math rather than 7 array indexes. */
+/* A cell's own spin plus its four neighbours' spin and its own
+ * velocity, grabbed together so the update below reads like the
+ * physics instead of a wall of array lookups. */
 typedef struct {
     float omega_centre, omega_east, omega_west, omega_north, omega_south;
     float u_local, v_local;
@@ -1607,10 +676,10 @@ static inline OmegaStencil sample_omega_stencil_at(int x, int y) {
     return s;
 }
 
-/* UPWIND finite difference for the convective term u·∇ω.  The
- * stencil leg picked is the one POINTING INTO the wind — guarantees
- * conditional stability for hyperbolic advection.  Refs [7] LeVeque
- * §6 for the upwind scheme. */
+/* How fast spin changes as the flow carries it sideways.  We always
+ * look UPSTREAM (toward where the fluid is coming from) rather than
+ * downstream; using the downstream side here makes the sim wobble and
+ * blow up.  (LeVeque, upwind scheme.) */
 static inline float upwind_omega_gradient_x(const OmegaStencil *s, float idx) {
     return (s->u_local > 0.0f)
          ? (s->omega_centre - s->omega_west)  * idx
@@ -1623,18 +692,17 @@ static inline float upwind_omega_gradient_y(const OmegaStencil *s, float idy) {
          : (s->omega_north  - s->omega_centre) * idy;
 }
 
-/* Central-difference 5-point Laplacian for the viscous term ν·∇²ω.
- * Central works here (unlike for convection) because diffusion is
- * isotropic — there's no preferred direction. */
+/* How much a cell's spin differs from its neighbours' average — this
+ * is what stickiness smooths out.  Here we can look both ways evenly,
+ * since smoothing has no preferred direction. */
 static inline float laplacian_omega_at(const OmegaStencil *s, float idx2, float idy2) {
     return (s->omega_east  - 2.0f * s->omega_centre + s->omega_west ) * idx2
          + (s->omega_north - 2.0f * s->omega_centre + s->omega_south) * idy2;
 }
 
-/* The vorticity transport equation discretised as a time derivative
- *   ∂ω/∂t = −u·∇ω + ν·∇²ω
- * The minus signs in front of u·∇ω come from moving the advection
- * onto the RHS.  Refs [1] Roache §3.7. */
+/* How fast a cell's spin is changing right now: the flow drags it
+ * along (the two minus terms) while stickiness smooths it out (the
+ * last term).  Spin is only made at walls, never here in the open. */
 static inline float vorticity_time_derivative(const OmegaStencil *s,
                                                float idx, float idy,
                                                float idx2, float idy2, float nu) {
@@ -1646,8 +714,9 @@ static inline float vorticity_time_derivative(const OmegaStencil *s,
            + nu        * lap_omega;
 }
 
-/* Sweep INTERIOR cells; write the Euler update into omega_next.  Wall
- * cells are skipped — their ω is set by apply_boundary, not transport. */
+/* Take one time step of spin for every open cell, writing the result
+ * into the scratch array.  Wall cells are left out — their spin comes
+ * from apply_boundary, not from this update. */
 static inline void compute_vorticity_next_field(float dt_seconds) {
     int   cols = g_scene.grid_cols;
     int   rows = g_scene.grid_rows;
@@ -1669,8 +738,8 @@ static inline void compute_vorticity_next_field(float dt_seconds) {
     }
 }
 
-/* Copy interior cells from omega_next back to omega.  Cheaper than
- * pointer-swapping the whole arrays since walls were skipped. */
+/* Copy the freshly-stepped spin back into the live array.  We copy
+ * only the open cells we touched rather than swap whole arrays. */
 static inline void copy_omega_next_to_omega_interior(void) {
     int cols = g_scene.grid_cols;
     int rows = g_scene.grid_rows;
@@ -1683,30 +752,18 @@ static inline void copy_omega_next_to_omega_interior(void) {
     }
 }
 
-/*
- * vorticity_step — explicit Euler with upwind convection + central
- * diffusion of the vorticity transport equation.
- *
- * Pseudocode:
- *   compute_vorticity_next_field(dt)           ← into omega_next
- *   copy_omega_next_to_omega_interior()        ← into omega
- *
- * Refs [1] Roache 1972 §3.7; [7] LeVeque §6 (upwind hyperbolic).
- */
+/* Advance the whole spin field by one time step. */
 static void vorticity_step(float dt_seconds) {
     compute_vorticity_next_field(dt_seconds);
     copy_omega_next_to_omega_interior();
 }
 
-/* ===================================================================== */
-/* §11  poisson_solve — SOR iteration of ∇²ψ = -ω (T4)                   */
-/* ===================================================================== */
+/* §11  poisson_solve — rebuild the flow field ψ from the spin field */
 
-/* Per-cell Gauss-Seidel update for the 5-point Poisson stencil.
- *   ψ_GS = (dy²·(ψ_E + ψ_W) + dx²·(ψ_N + ψ_S) + dx²·dy²·ω) / (2·(dx² + dy²))
- * Solves the discretised ∇²ψ = −ω at cell (x, y) assuming all four
- * neighbours are correct (the GS approximation — they may not be,
- * but the iteration converges).  Refs [6] Saad §4.1. */
+/* The best guess for one cell's ψ given its four neighbours and the
+ * spin sitting there.  We pretend the neighbours are already right;
+ * they aren't yet, but repeating this over the grid converges to the
+ * answer.  (Gauss-Seidel; Saad.) */
 static inline float gauss_seidel_psi_update_at(int x, int y,
                                                 float dx2, float dy2,
                                                 float denominator) {
@@ -1719,19 +776,18 @@ static inline float gauss_seidel_psi_update_at(int x, int y,
             + dx2 * dy2 * omega) / denominator;
 }
 
-/* Apply Successive Over-Relaxation: ψ_new = ψ + α·(ψ_GS − ψ).  α > 1
- * (typically 1.5..1.8) ACCELERATES the convergence of Gauss-Seidel by
- * over-shooting the new estimate in the direction of the correction.
- * α = 1 reduces to plain Gauss-Seidel; α > 2 diverges.  [6] Saad §4. */
+/* Don't just move ψ to the new guess — overshoot a bit past it.  That
+ * deliberate overshoot (alpha around 1.5-1.8) reaches the answer in
+ * far fewer passes.  alpha = 1 means no overshoot; past 2 it blows
+ * up.  (Successive over-relaxation; Saad.) */
 static inline float sor_relax(float psi_centre, float psi_gauss_seidel,
                                float alpha) {
     return psi_centre + alpha * (psi_gauss_seidel - psi_centre);
 }
 
-/* One full SWEEP over the interior cells: apply the GS update then
- * the SOR relaxation in place.  GS sweeps converge in O(N²) iters,
- * SOR converges in O(N) — a real speedup for the streamfunction
- * solve which dominates this file's runtime.  Refs [6] Saad §4.2. */
+/* One pass over every open cell, nudging each ψ toward its new guess.
+ * This solve is the slowest part of the program, so the overshoot
+ * speedup matters. */
 static inline void sor_sweep_once(float dx2, float dy2,
                                    float denominator, float alpha) {
     int cols = g_scene.grid_cols;
@@ -1748,19 +804,8 @@ static inline void sor_sweep_once(float dx2, float dy2,
     }
 }
 
-/*
- * poisson_solve_sor — solve ∇²ψ = −ω via Successive Over-Relaxation.
- *
- * Pseudocode:
- *   dx² = cell_size_x²
- *   dy² = cell_size_y²
- *   denom = 2·(dx² + dy²)             ← 5-point Laplacian denominator
- *   α = SOR_OMEGA                     ← over-relaxation factor
- *   for sweep = 0 .. POISSON_SOR_SWEEPS-1:
- *     sor_sweep_once(dx², dy², denom, α)
- *
- * Refs [1] Roache §3.5; [6] Saad §4 (SOR convergence theory).
- */
+/* Rebuild ψ from the current spin by sweeping the grid a fixed number
+ * of times — enough passes to get visually exact. */
 static void poisson_solve_sor(void) {
     float dx2          = g_scene.cell_size_x * g_scene.cell_size_x;
     float dy2          = g_scene.cell_size_y * g_scene.cell_size_y;
@@ -1771,14 +816,12 @@ static void poisson_solve_sor(void) {
         sor_sweep_once(dx2, dy2, denominator, alpha);
 }
 
-/* ===================================================================== */
-/* §12  velocity_recompute — derive u, v from ψ + adaptive dt (T5)       */
-/* ===================================================================== */
+/* §12  velocity_recompute — read speeds out of ψ, pick the next dt */
 
-/* Velocity components from streamfunction at one INTERIOR cell:
- *   u = +∂ψ/∂y     v = −∂ψ/∂x
- * (sign convention: ψ rises to the left of the flow direction).
- * Central differences scaled by 1/(2h).  Refs [1] Roache §1.4. */
+/* Read one cell's velocity out of ψ.  ψ changing across the grid IS
+ * the flow: how fast it changes up/down gives the sideways speed, and
+ * how fast it changes left/right gives the up/down speed (with a sign
+ * flip).  We measure each slope from the two neighbouring cells. */
 static inline void velocity_from_psi_at_cell(int x, int y,
                                               float inv_2dx, float inv_2dy,
                                               float *out_u, float *out_v) {
@@ -1788,10 +831,9 @@ static inline void velocity_from_psi_at_cell(int x, int y,
              - g_scene.streamfunction_psi[cell_index(x - 1, y    )]) * inv_2dx;
 }
 
-/* Recompute u, v at every INTERIOR cell from ψ.  Wall cells are
- * forced to zero (they MUST be no-flow even if Thom-style ω made the
- * surrounding ψ non-zero).  Returns the maximum |v| seen — the
- * caller uses it for adaptive dt and colour normalisation.        */
+/* Read velocities out of ψ for every open cell; pin wall cells to
+ * zero so nothing flows through them.  Hands back the top speed seen,
+ * which the caller uses to size the time step and the colours. */
 static inline float recompute_interior_velocity_from_psi(void) {
     int   cols    = g_scene.grid_cols;
     int   rows    = g_scene.grid_rows;
@@ -1817,9 +859,9 @@ static inline float recompute_interior_velocity_from_psi(void) {
     return speed_max;
 }
 
-/* Inflow u(y) on the left wall per BoundarySpec — same profile that
- * boundary_set_psi_side embeds in ψ, but we set u directly here so the
- * advection step reads correct velocities even before Thom updates ω. */
+/* The inflow speed at height y on the left wall.  We set the velocity
+ * directly here so the next step has correct speeds to work with
+ * before ψ and the spin are refreshed. */
 static inline float left_inflow_u_at(int y, int rows,
                                       const BoundarySpec *spec) {
     switch (spec->side_left) {
@@ -1839,9 +881,9 @@ static inline float left_inflow_u_at(int y, int rows,
     }
 }
 
-/* Top & bottom row velocities — the bottom wall is always no-slip;
- * the top wall is the moving lid (u = inflow_velocity) if scenario
- * is LID_CAVITY, no-slip otherwise. */
+/* Force the velocities along the top and bottom walls.  The bottom is
+ * always still; the top moves at the lid speed in the lid-cavity
+ * scenario and is still otherwise. */
 static inline void apply_wall_velocity_top_and_bottom(const BoundarySpec *spec,
                                                        int rows, int cols) {
     for (int x = 0; x < cols; x++) {
@@ -1853,9 +895,9 @@ static inline void apply_wall_velocity_top_and_bottom(const BoundarySpec *spec,
     }
 }
 
-/* Left & right column velocities — left side picks an inflow profile
- * (or no-slip for walls); right side either no-slip or zero-gradient
- * outflow (copy column N-1 into column N). */
+/* Force the velocities along the left and right walls.  Left takes an
+ * inflow speed (or zero for a wall); right is either still or, for an
+ * outflow, just copies the column beside it so the flow slides out. */
 static inline void apply_wall_velocity_left_and_right(const BoundarySpec *spec,
                                                        int rows, int cols) {
     for (int y = 0; y < rows; y++) {
@@ -1873,11 +915,11 @@ static inline void apply_wall_velocity_left_and_right(const BoundarySpec *spec,
     }
 }
 
-/* Update the EMA of max |v| used to normalise the velocity colour
- * ramp.  α = 0.08 gives ~12-frame time constant — slow enough that
- * brief spikes don't flicker the colour scale, fast enough that
- * the visualisation tracks growing flows.  Clamped to a small ε to
- * avoid divide-by-zero downstream. */
+/* Ease the "fastest speed" value used to scale the velocity colours
+ * toward the latest peak.  Blending slowly (about a 12-frame lag)
+ * keeps a one-frame spike from making the whole picture flash, while
+ * still following a flow that's genuinely speeding up.  Kept above a
+ * tiny floor so later divisions never hit zero. */
 static inline void update_smoothed_velocity_max(float speed_max) {
     if (speed_max < 1e-6f) speed_max = 1e-6f;
     g_scene.velocity_max_smoothed = 0.92f * g_scene.velocity_max_smoothed
@@ -1886,11 +928,10 @@ static inline void update_smoothed_velocity_max(float speed_max) {
         g_scene.velocity_max_smoothed = 1e-6f;
 }
 
-/* CFL-derived adaptive timestep:
- *   dt_advection = α · h / |v|_max         (Courant condition)
- *   dt_diffusion = α · h² / (4·ν)          (von Neumann condition)
- *   dt           = min(dt_adv, dt_diff)    (whichever is tighter)
- * Both bounds [4] LeVeque §3-4.  The α is a safety factor < 1. */
+/* Pick the next time step.  Two things can break the sim if a step is
+ * too big: fast flow jumping more than a cell, and stickiness
+ * smoothing too aggressively.  We work out the safe step for each and
+ * take the smaller, with a safety margin under 1. */
 static inline void update_adaptive_dt(float speed_max) {
     float h          = g_scene.cell_size_x;
     float dt_adv     = CFL_SAFETY_FACTOR * h / speed_max;
@@ -1902,20 +943,8 @@ static inline void update_adaptive_dt(float speed_max) {
     g_scene.current_dt = dt;
 }
 
-/*
- * velocity_recompute_and_adapt_dt — derive (u, v) from ψ, set wall
- * velocities, then pick the next stable timestep.
- *
- * Pseudocode:
- *   speed_max = recompute_interior_velocity_from_psi()
- *   apply_wall_velocity_top_and_bottom (spec)
- *   apply_wall_velocity_left_and_right (spec)
- *   update_smoothed_velocity_max(speed_max)   ← EMA for colour scale
- *   update_adaptive_dt          (speed_max)   ← CFL min(adv, diff)
- *
- * Refs [1] Roache §1.4 (velocity-streamfunction relations); [4] LeVeque
- * for the CFL bounds.
- */
+/* Read all the velocities out of ψ, force the wall values, then size
+ * the next time step from the fastest flow seen. */
 static void velocity_recompute_and_adapt_dt(const BoundarySpec *spec) {
     int rows = g_scene.grid_rows;
     int cols = g_scene.grid_cols;
@@ -1928,14 +957,11 @@ static void velocity_recompute_and_adapt_dt(const BoundarySpec *spec) {
     update_adaptive_dt          (speed_max);
 }
 
-/* ===================================================================== */
-/* §13  ns_step — one full physics tick (orchestrator)                   */
-/* ===================================================================== */
+/* §13  ns_step — one full physics tick */
 
-/* Scan the full ω field for max |ω|, then update the EMA used by the
- * vorticity colour ramp.  α = 0.05 gives ~20-frame time constant —
- * slower than velocity_max_smoothed because ω spikes are sharper and
- * we want the band scale to ignore them. */
+/* Find the strongest spin anywhere and ease the colour-scaling value
+ * toward it.  Even slower blending than for speed, because spin spikes
+ * are sharper and we'd rather the colours ignore them. */
 static inline void update_smoothed_vorticity_max(void) {
     int   n    = g_scene.grid_cols * g_scene.grid_rows;
     float wmax = 1e-6f;
@@ -1949,21 +975,10 @@ static inline void update_smoothed_vorticity_max(void) {
         g_scene.vorticity_max_smoothed = 1e-6f;
 }
 
-/*
- * ns_step — one full Navier-Stokes tick in (ψ, ω) form.
- *
- * Pseudocode:
- *   vorticity_step                    ← ∂ω/∂t = −u·∇ω + ν·∇²ω
- *   apply_boundary                    ← Thom + ψ profiles
- *   poisson_solve_sor                 ← ∇²ψ = −ω
- *   velocity_recompute_and_adapt_dt   ← u = ∇×ψ + CFL dt
- *   apply_boundary                    ← refresh for next tick's reads
- *   update_smoothed_vorticity_max     ← EMA for colour band scale
- *
- * Refs [1] Roache §3.7 for the (ψ, ω) split that lets the pressure
- *   equation be replaced by a Poisson solve for ψ — no pressure
- *   solver needed in incompressible 2-D flow.
- */
+/* One full step: spin the fluid forward, fix the walls, rebuild the
+ * flow field, read the new speeds, fix the walls again so the next
+ * step starts clean, and refresh the colour scale.  No pressure
+ * anywhere — that's the whole point of working in spin + flow. */
 static void ns_step(const BoundarySpec *spec) {
     vorticity_step                 (g_scene.current_dt);
     apply_boundary                 (spec);
@@ -1973,49 +988,37 @@ static void ns_step(const BoundarySpec *spec) {
     update_smoothed_vorticity_max  ();
 }
 
-/* ===================================================================== */
-/* §14  tracers — Lagrangian particle pool + advection (T9)              */
-/* ===================================================================== */
+/* §14  tracers — floating dots that ride the flow */
 
 /*
- * Tracer — one passive Lagrangian particle that follows v = ∇×ψ.
+ * Tracer — one dot that drifts along with the fluid.
  *
- * Intent
- *   Vorticity by itself is invisible — the field shows positive /
- *   negative spin but no flow direction.  Tracers MAKE THE FLOW
- *   VISIBLE: each tick they sample (u, v) from the streamfunction
- *   and step in that direction, leaving a visible trace.  The
- *   overlay is OPTIONAL (toggle key 'a') because some users prefer
- *   the unobstructed vorticity field.
+ * The spin and flow fields are just colours; they don't show which
+ * way the water is actually going.  These dots do: each step we look
+ * up the flow speed under a dot and nudge it that way, so over time
+ * the dots trace out the streams and swirls.  Toggle the whole layer
+ * off if you'd rather see the field underneath uncluttered.
  *
- * Why a fixed pool (not a list of live particles)
- *   The pool is sized for TRACER_COUNT_MAX; active count varies via
- *   +/- keys.  No allocation in the hot path; respawned tracers
- *   reuse existing slots.
- *
- * Why fractional pos_x / pos_y (not int)
- *   Tracers move continuously through the grid, so their positions
- *   are real numbers and bilinear-sampled.  Integer positions would
- *   produce visible "stair-stepping" at sub-cell speeds.
- *
- * Why explicit ticks_remaining
- *   Tracers have FINITE LIFETIMES so the pool stays evenly mixed —
- *   without lifetimes, all tracers eventually pile up in the slow
- *   recirculation regions and the fast flow becomes unseen.  At end
- *   of life the tracer respawns at a random grid position.
+ * They live in one fixed-size array reused forever (no allocation
+ * mid-run; the +/- keys just change how many are active).  Positions
+ * are real numbers, not whole cells, so a dot can sit between cells
+ * and move smoothly instead of jumping cell to cell.  Each dot also
+ * carries a countdown: when it runs out the dot respawns somewhere
+ * fresh, which keeps them from all piling up in the slow corners and
+ * leaving the fast flow bare.
  */
 typedef struct {
-    float pos_x;            /* fractional grid x (bilinear-sampled) */
-    float pos_y;            /* fractional grid y                    */
-    int   ticks_remaining;  /* respawn when this hits 0             */
+    float pos_x;            /* position across, can be between cells */
+    float pos_y;            /* position up/down, can be between cells */
+    int   ticks_remaining;  /* respawn when this reaches 0          */
 } Tracer;
 
 static Tracer tracer_pool[TRACER_COUNT_MAX];
 static int active_tracer_count = TRACER_COUNT_DEFAULT;
 static bool tracer_overlay_enabled = true;
 
-/* Clamp a real-valued sample point into the [0, N-1] grid range so
- * the bilinear stencil never reaches outside. */
+/* Pull a sample point back inside the grid so the look-up below never
+ * reaches off the edge. */
 static inline void clamp_tracer_sample_in_grid(float *px, float *py) {
     if (*px < 0.0f)                            *px = 0.0f;
     if (*py < 0.0f)                            *py = 0.0f;
@@ -2023,10 +1026,9 @@ static inline void clamp_tracer_sample_in_grid(float *px, float *py) {
     if (*py > (float)(g_scene.grid_rows - 1))  *py = (float)(g_scene.grid_rows - 1);
 }
 
-/* Split (px, py) into the bottom-left integer cell + fractional
- * offsets ∈ [0, 1).  Right/top neighbours are clamped to the grid
- * edge so a sample exactly on the boundary still gives a valid
- * (degenerate) stencil. */
+/* Break a between-cells point into the cell it sits in plus how far
+ * into that cell it is.  The right/top neighbours are clamped to the
+ * edge so a point right on the boundary still gives valid cells. */
 static inline void integer_cell_and_subcell_2d(float px, float py,
                                                 int *out_x0, int *out_y0,
                                                 int *out_x1, int *out_y1,
@@ -2041,9 +1043,9 @@ static inline void integer_cell_and_subcell_2d(float px, float py,
     *out_fy = py - (float)y0;
 }
 
-/* Two-stage bilinear blend over the 4 corners.  Same formula as
- * elsewhere in this folder — duplicated rather than shared so each
- * file stays self-contained per CLAUDE.md. */
+/* Smoothly blend four corner values by how close the point is to
+ * each.  Copied into this file on purpose, not shared, so the file
+ * stands alone (CLAUDE.md). */
 static inline float bilinear_blend(float c00, float c10, float c01, float c11,
                                     float fx, float fy) {
     return (1.0f - fx) * (1.0f - fy) * c00
@@ -2052,15 +1054,8 @@ static inline float bilinear_blend(float c00, float c10, float c01, float c11,
          +         fx  *         fy  * c11;
 }
 
-/*
- * velocity_at_fractional — bilinear (u, v) sample at sub-cell (px, py).
- *
- * Pseudocode:
- *   clamp_tracer_sample_in_grid(&px, &py)
- *   (x0, y0, x1, y1, fx, fy) = integer_cell_and_subcell_2d(px, py)
- *   *out_u = bilinear_blend(u[x0][y0], u[x1][y0], u[x0][y1], u[x1][y1], fx, fy)
- *   *out_v = bilinear_blend(v[x0][y0], v[x1][y0], v[x0][y1], v[x1][y1], fx, fy)
- */
+/* The flow speed at a between-cells point, blended from the four cells
+ * around it. */
 static void velocity_at_fractional(float px, float py, float *out_u,
                                     float *out_v) {
     clamp_tracer_sample_in_grid(&px, &py);
@@ -2083,15 +1078,15 @@ static void velocity_at_fractional(float px, float py, float *out_u,
         fx, fy);
 }
 
-/* Lid-cavity respawn — closed domain, no inflow.  Uniform random
- * interior so tracers re-enter circulation cells evenly. */
+/* Lid cavity has no inflow, so respawn dots anywhere inside the box
+ * to keep them spread through the swirl. */
 static inline void place_tracer_lid_cavity_interior(Tracer *t) {
     t->pos_x = (float)rand_in_range(1, g_scene.grid_cols - 1);
     t->pos_y = (float)rand_in_range(1, g_scene.grid_rows - 1);
 }
 
-/* Backward-step respawn — release near the left inflow on the upper
- * half (above the step face).  Tracers then advect over the step. */
+/* Backward step: drop dots into the inflow above the step so they
+ * ride over the edge and reveal the swirl behind it. */
 static inline void place_tracer_in_step_inflow(Tracer *t) {
     int step_h = g_scene.grid_rows / 4;
     t->pos_x = 1.0f + 2.0f * rand_uniform_unit();
@@ -2099,8 +1094,8 @@ static inline void place_tracer_in_step_inflow(Tracer *t) {
              + rand_uniform_unit() * (float)(g_scene.grid_rows - 1 - step_h);
 }
 
-/* Free-jet respawn — release in the narrow inflow BAND on the left.
- * Tracers entrain into the jet and reveal its spreading angle. */
+/* Free jet: drop dots into the narrow inflow slot so they get swept
+ * into the jet and show how it fans out. */
 static inline void place_tracer_in_jet_inflow(Tracer *t) {
     int band_lo = g_scene.grid_rows * 4 / 10;
     int band_hi = g_scene.grid_rows * 6 / 10;
@@ -2109,33 +1104,22 @@ static inline void place_tracer_in_jet_inflow(Tracer *t) {
              + rand_uniform_unit() * (float)(band_hi - band_lo);
 }
 
-/* Kármán-street respawn — release at full left-wall inflow.  Tracers
- * advect past the cylinder and visualise the alternating vortex
- * shedding downstream. */
+/* Karman street: drop dots into the inflow across the whole left wall
+ * so they stream past the cylinder and trace the shed vortices. */
 static inline void place_tracer_in_karman_inflow(Tracer *t) {
     t->pos_x = 1.0f + 2.0f * rand_uniform_unit();
     t->pos_y = 1.0f + rand_uniform_unit() * (float)(g_scene.grid_rows - 3);
 }
 
-/* Assign a random lifetime ∈ [MIN, MAX] ticks.  Spread lifetimes
- * desynchronise respawns so the pool stays evenly mixed instead of
- * all dying on the same frame.  See Tracer struct doc. */
+/* Give the dot a random countdown so the dots don't all expire on the
+ * same frame and clump up. */
 static inline void assign_random_tracer_lifetime(Tracer *t) {
     t->ticks_remaining = TRACER_LIFETIME_MIN
                        + rand_in_range(0, TRACER_LIFETIME_MAX - TRACER_LIFETIME_MIN);
 }
 
-/*
- * tracer_spawn — initialise (or respawn) one tracer based on the
- * active scenario.
- *
- * Pseudocode (dispatch on scenario):
- *   SCENARIO_LID_CAVITY    → place_tracer_lid_cavity_interior
- *   SCENARIO_BACKWARD_STEP → place_tracer_in_step_inflow
- *   SCENARIO_FREE_JET      → place_tracer_in_jet_inflow
- *   default (Kármán)       → place_tracer_in_karman_inflow
- *   assign_random_tracer_lifetime
- */
+/* Place one dot using whatever spot suits the current scenario, then
+ * give it a fresh countdown. */
 static void tracer_spawn(Tracer *t, int active_scenario_index) {
     switch (active_scenario_index) {
         case SCENARIO_LID_CAVITY:    place_tracer_lid_cavity_interior(t); break;
@@ -2161,11 +1145,9 @@ static bool tracer_position_in_wall(float px, float py) {
   return g_scene.wall_mask[cell_index(x, y)];
 }
 
-/* Lagrangian advection step: sample velocity at the tracer's
- * fractional position and advance position by v·dt.  The
- * VISIBLE_MOTION_GAIN multiplier compensates for the fact that sim
- * time runs much slower than wall clock — without it, tracers would
- * crawl invisibly even when the simulated flow is fast. */
+/* Move one dot: look up the flow under it and nudge it that way.  The
+ * extra multiplier exists because sim-time runs much slower than the
+ * clock, so without it the dots would barely creep even in fast flow. */
 static inline void advect_one_tracer(Tracer *t, float dt_seconds) {
     const float visible_motion_gain = 6.0f;
     float u_here, v_here;
@@ -2174,11 +1156,8 @@ static inline void advect_one_tracer(Tracer *t, float dt_seconds) {
     t->pos_y += v_here * dt_seconds * visible_motion_gain;
 }
 
-/* Does the tracer need respawning?  Three reasons:
- *   - out of bounds: drifted into the BC ghost halo
- *   - inside wall:  advected into a solid obstacle
- *   - expired:      lifetime ticks_remaining hit zero
- * Any one is enough to trigger a respawn. */
+/* Is this dot done?  Yes if it drifted off the edge, wandered into a
+ * wall, or its countdown ran out — any one means respawn it. */
 static inline bool tracer_should_respawn(const Tracer *t) {
     bool out_of_bounds =
         t->pos_x < 0.5f
@@ -2190,9 +1169,8 @@ static inline bool tracer_should_respawn(const Tracer *t) {
     return out_of_bounds || inside_wall || expired;
 }
 
-/* Full single-tracer update: advect by dt, decrement lifetime, respawn
- * if needed.  Self-contained so the outer loop in tracers_advance
- * stays focused on "which tracers to update". */
+/* One dot's full update: move it, tick its countdown down, respawn if
+ * it's done. */
 static inline void update_one_tracer(Tracer *t, float dt_seconds,
                                       int active_scenario_index) {
     advect_one_tracer(t, dt_seconds);
@@ -2201,66 +1179,47 @@ static inline void update_one_tracer(Tracer *t, float dt_seconds,
         tracer_spawn(t, active_scenario_index);
 }
 
-/*
- * tracers_advance — advance all active tracers one tick (skipped
- * entirely when the overlay is disabled).
- *
- * Pseudocode:
- *   if not tracer_overlay_enabled: return
- *   for i = 0 .. active_tracer_count - 1:
- *     update_one_tracer(&tracer_pool[i], dt, scenario)
- */
+/* Move every active dot one step (nothing to do if the overlay is
+ * switched off). */
 static void tracers_advance(int active_scenario_index, float dt_seconds) {
     if (!tracer_overlay_enabled) return;
     for (int i = 0; i < active_tracer_count; i++)
         update_one_tracer(&tracer_pool[i], dt_seconds, active_scenario_index);
 }
 
-/* ===================================================================== */
-/* §15  presets — 4 scenario specs + loaders                             */
-/* ===================================================================== */
+/* §15  presets — the four scenarios + their loaders */
 
 /*
- * ScenarioPreset — one named CFD scenario (Karman street / lid cavity etc).
+ * ScenarioPreset — one ready-made flow to watch.
  *
- * Intent
- *   Each preset is a SCENARIO that demonstrates a different fluid-
- *   mechanics phenomenon.  A scenario bundles:
- *     - boundary configuration (which BC kind on each of the 4 walls)
- *     - default Reynolds number (controls expected behaviour)
- *     - obstacle geometry (cylinder for Kármán; step for separation)
+ * Each preset is a complete recipe for one classic flow: what each
+ * wall does, a starting Reynolds number (how fast and swirly it runs),
+ * and any obstacle in the way — a cylinder for the Karman street, a
+ * step for the separation scenario, nothing for the others.  Loading a
+ * preset copies its wall rules into the live setup and stamps its
+ * obstacle into the wall map.
  *
- *   Pressing 1..N loads a preset, which writes the BoundarySpec into
- *   the live BC and applies any geometry into the obstacle mask.
+ * Obstacle positions are fractions ("0.25" = a quarter of the way
+ * across) rather than fixed cells, so a scenario looks the same shape
+ * on any terminal size; the loader turns them into real cells.
  *
- * Why obstacle geometry is bundled here
- *   Different scenarios have different obstacles: the Kármán street
- *   needs a cylinder; backward-facing step needs a step.  Encoding
- *   both as optional flags (has_obstacle_*) lets the preset table
- *   describe the full geometry in one row.
- *
- * Why fractional coordinates (not absolute cells)
- *   `cylinder_x_frac = 0.25` means "1/4 of the way across the grid";
- *   this lets the same preset look proportional on any terminal
- *   size.  Conversion to integer cells happens in the loader.
- *
- * References [4] Ghia 1982 for the lid-cavity benchmark preset;
- *   [5] von Kármán 1911 for the cylinder-wake preset.
+ * The lid-cavity case is the standard Ghia 1982 test; the cylinder
+ * wake is von Karman 1911.
  */
 typedef struct {
-    const char  *display_name;            /* short HUD label            */
-    BoundarySpec boundary_spec;           /* per-wall BC configuration  */
-    int          default_reynolds_index;  /* index into REYNOLDS_TABLE  */
+    const char  *display_name;            /* short label for the HUD    */
+    BoundarySpec boundary_spec;           /* what each wall does         */
+    int          default_reynolds_index;  /* starting Reynolds preset    */
 
-    /* ── Optional cylinder obstacle ──────────────────────────── */
+    /* ── Optional cylinder (the Karman obstacle) ─────────────── */
     bool         has_obstacle_cylinder;
-    float        cylinder_x_frac;         /* centre x as fraction       */
-    float        cylinder_y_frac;         /* centre y as fraction       */
-    float        cylinder_radius_frac;    /* radius as fraction of W    */
+    float        cylinder_x_frac;         /* centre, fraction across     */
+    float        cylinder_y_frac;         /* centre, fraction up         */
+    float        cylinder_radius_frac;    /* radius, fraction of width   */
 
-    /* ── Optional step obstacle (backward-facing step etc.) ──── */
+    /* ── Optional step (the backward-step obstacle) ──────────── */
     bool         has_obstacle_step;
-    float        step_height_frac;        /* step height as fraction     */
+    float        step_height_frac;        /* step height, fraction       */
 } ScenarioPreset;
 
 static const ScenarioPreset scenario_table[SCENARIO_COUNT] = {
@@ -2324,9 +1283,8 @@ static const ScenarioPreset scenario_table[SCENARIO_COUNT] = {
 
 static int active_scenario_index = SCENARIO_KARMAN;
 
-/* Clamp the scenario index to a valid row and pick the corresponding
- * preset.  Updates the active_scenario_index global so render and
- * HUD code reads the same row. */
+/* Pick the preset for a scenario number (clamped to a real one) and
+ * remember the choice so drawing and the HUD use the same one. */
 static inline const ScenarioPreset *select_scenario_preset(int scenario_index) {
     if (scenario_index < 0 || scenario_index >= SCENARIO_COUNT)
         scenario_index = 0;
@@ -2334,9 +1292,9 @@ static inline const ScenarioPreset *select_scenario_preset(int scenario_index) {
     return &scenario_table[scenario_index];
 }
 
-/* Pick Reynolds number from the preset's default tier and derive
- * kinematic viscosity ν = 1/Re.  This sets the DIFFUSIVE damping
- * strength on ω in the vorticity transport equation. */
+/* Take the preset's Reynolds number and turn it into the fluid's
+ * stickiness (stickiness = 1 / Reynolds) — that's what controls how
+ * fast spin gets smoothed away. */
 static inline void apply_scenario_reynolds(const ScenarioPreset *preset) {
     g_scene.reynolds_preset_index = preset->default_reynolds_index;
     g_scene.reynolds_number       =
@@ -2344,10 +1302,9 @@ static inline void apply_scenario_reynolds(const ScenarioPreset *preset) {
     g_scene.kinematic_viscosity   = 1.0f / g_scene.reynolds_number;
 }
 
-/* Mask out the obstacle cells for the active scenario.  Cylinder for
- * Kármán-street, backward-facing step for the recirculation scenario,
- * neither for lid-cavity / free-jet.  The masks are read by every
- * subsequent solver pass to skip wall cells. */
+/* Stamp the scenario's obstacle into the wall map: a cylinder for the
+ * Karman street, a step for the separation flow, nothing for the rest.
+ * Every later solver pass skips these cells. */
 static inline void apply_scenario_obstacles(const ScenarioPreset *preset) {
     if (preset->has_obstacle_cylinder)
         obstacle_build_cylinder(preset->cylinder_x_frac,
@@ -2357,36 +1314,24 @@ static inline void apply_scenario_obstacles(const ScenarioPreset *preset) {
         obstacle_build_step    (preset->step_height_frac);
 }
 
-/* Seed initial ω = 0, ψ from BC.  apply_boundary sets the inflow ψ
- * profile; velocity_recompute_and_adapt_dt derives the matching (u, v)
- * and picks the first stable dt.  After this call the simulator is
- * ready for ns_step. */
+/* Lay down the starting state: set the walls, then read the matching
+ * speeds and pick the first time step.  After this the sim is ready
+ * to run. */
 static inline void apply_scenario_initial_state(const ScenarioPreset *preset) {
     apply_boundary                 (&preset->boundary_spec);
     velocity_recompute_and_adapt_dt(&preset->boundary_spec);
 }
 
-/* Reset the EMAs used by the colour ramps.  Starting from 1.0 (not 0)
- * avoids divide-by-zero in the first few frames before the actual max
- * values rise. */
+/* Reset the colour-scaling values.  Start at 1, not 0, so the first
+ * few frames don't divide by zero before real peaks appear. */
 static inline void reset_smoothed_maxes(void) {
     g_scene.velocity_max_smoothed  = 1.0f;
     g_scene.vorticity_max_smoothed = 1.0f;
 }
 
-/*
- * scenario_load — switch to scenario `scenario_index`, reseeding the
- * full simulation state.
- *
- * Pseudocode:
- *   preset = select_scenario_preset(scenario_index)
- *   grid_clear_walls + grid_zero_all_fields
- *   apply_scenario_reynolds      (preset)     ← Re, ν
- *   apply_scenario_obstacles     (preset)     ← cylinder / step
- *   apply_scenario_initial_state (preset)     ← BC + initial (u, v)
- *   tracers_init_all             (scenario)   ← respawn all tracers
- *   reset_smoothed_maxes()                    ← EMA bootstraps
- */
+/* Switch to a scenario from scratch: wipe the grid, set its
+ * stickiness and obstacle, lay down the starting flow, and scatter
+ * fresh dots. */
 static void scenario_load(int scenario_index) {
     const ScenarioPreset *preset = select_scenario_preset(scenario_index);
 
@@ -2401,13 +1346,10 @@ static void scenario_load(int scenario_index) {
     reset_smoothed_maxes();
 }
 
-/* ===================================================================== */
-/* §16  render_vorticity — ω heatmap                                     */
-/* ===================================================================== */
+/* §16  render_vorticity — draw the spin field */
 
-/* Standard draw-rect helper used by every render view.  Returns the
- * visible row count (clipped to grid and HUD-reserved rows).  HUD
- * reserves 2 rows: row 0 (status) and row rows-1 (hint). */
+/* How many grid rows actually fit on screen, leaving the top row for
+ * the status line and the bottom row for the key hints. */
 static inline int compute_render_max_y(int term_rows) {
     int draw_rows = term_rows - 2;
     if (draw_rows < 1) draw_rows = 1;
@@ -2415,15 +1357,14 @@ static inline int compute_render_max_y(int term_rows) {
     return (rows < draw_rows) ? rows : draw_rows;
 }
 
-/* Map a screen row to the grid row, with Y-INVERSION so the top of
- * the screen shows the top of the grid (otherwise gravity-aware
- * scenarios would look upside-down). */
+/* Turn a screen row into a grid row, flipped top-to-bottom so the top
+ * of the window shows the top of the tank instead of upside-down. */
 static inline int screen_row_to_grid_y(int sy) {
     return g_scene.grid_rows - 1 - sy;
 }
 
-/* Normalised vorticity at cell (x, y) in [-1, 1] for diverging-band
- * lookup.  Divides by the EMA-smoothed max, then clamps. */
+/* A cell's spin scaled to roughly -1..1 (against the running peak) so
+ * the colour picker can sort it into a tier. */
 static inline float normalised_omega_at(int x, int y) {
     float wn = g_scene.vorticity_omega[cell_index(x, y)]
              / g_scene.vorticity_max_smoothed;
@@ -2432,8 +1373,6 @@ static inline float normalised_omega_at(int x, int y) {
     return wn;
 }
 
-/* Paint one vorticity cell from its normalised value using the
- * diverging band picker. */
 static inline void paint_vorticity_cell(int screen_row, int screen_col,
                                          float omega_normalised) {
     VortBand band = vorticity_band_for(omega_normalised);
@@ -2442,16 +1381,8 @@ static inline void paint_vorticity_cell(int screen_row, int screen_col,
     attroff(COLOR_PAIR(band.pair) | band.attr);
 }
 
-/*
- * render_vorticity_view — ω diverging heatmap (red = CCW, blue = CW).
- *
- * Pseudocode:
- *   max_y = compute_render_max_y(term_rows)
- *   for sy = 0 .. max_y-1:
- *     y = screen_row_to_grid_y(sy)
- *     for each x in [0, min(cols, term_cols)):
- *       paint_vorticity_cell(sy + 1, x, normalised_omega_at(x, y))
- */
+/* Draw the spin field: red where it spins counter-clockwise, blue
+ * clockwise, grey where it's barely turning. */
 static void render_vorticity_view(int term_rows, int term_cols) {
     int cols  = g_scene.grid_cols;
     int max_y = compute_render_max_y(term_rows);
@@ -2463,13 +1394,11 @@ static void render_vorticity_view(int term_rows, int term_cols) {
     }
 }
 
-/* ===================================================================== */
-/* §17  render_streamlines — banded ψ contours                           */
-/* ===================================================================== */
+/* §17  render_streamlines — draw the flow as contour bands */
 
-/* Single-pass scan over the whole ψ field for its (min, max) range.
- * The range is what we BIN against to colour streamline cells —
- * banding by absolute ψ values would saturate at high Re. */
+/* Find the lowest and highest ψ on the grid in one pass.  We band
+ * against this range rather than fixed values, so the contours stay
+ * visible no matter how fast the flow gets. */
 static inline void scan_streamfunction_range(float *out_min, float *out_max) {
     int   n   = g_scene.grid_cols * g_scene.grid_rows;
     float lo  =  1e9f;
@@ -2483,10 +1412,9 @@ static inline void scan_streamfunction_range(float *out_min, float *out_max) {
     *out_max = hi;
 }
 
-/* Map a ψ value to a STREAMLINE BAND index ∈ [0, STREAMLINE_BAND_COUNT).
- * Adjacent ψ-levels group into the same band, so the resulting pattern
- * looks like CONTOUR LINES — the visual hallmark of streamfunction
- * plots.  Refs [1] Roache §6 on streamline visualisation. */
+/* Sort a ψ value into one of a fixed set of bands.  Nearby ψ values
+ * land in the same band, so the screen shows stripes — the contour
+ * lines you'd draw on a flow map. */
 static inline int psi_to_streamline_band(float psi, float psi_min,
                                           float psi_range) {
     float frac = (psi - psi_min) / psi_range;
@@ -2496,23 +1424,19 @@ static inline int psi_to_streamline_band(float psi, float psi_min,
     return band;
 }
 
-/* Alternate between two contrasting colour pairs based on band PARITY.
- * Gives the alternating-shade contour look that makes streamlines
- * readable even where the field is dense. */
+/* Flip between two colours on odd vs even bands.  The alternating
+ * shading keeps the contour lines readable even when they're crowded. */
 static inline int streamline_pair_for_band(int band) {
     return (band & 1) ? PAIR_VEL_FIRST + 2 : PAIR_VEL_FIRST + 4;
 }
 
-/* |v| at one cell.  Local to this file (other helpers in §17/§18 use
- * the same formula but are separate compilation units). */
+/* How fast the flow is moving at one cell. */
 static inline float speed_magnitude_at(int x, int y) {
     float u = g_scene.velocity_x[cell_index(x, y)];
     float v = g_scene.velocity_y[cell_index(x, y)];
     return sqrtf(u * u + v * v);
 }
 
-/* Paint one streamline cell: pick the contour band's colour and the
- * speed-based glyph in one shot. */
 static inline void paint_streamline_cell(int screen_row, int screen_col,
                                           int band, int speed_slot) {
     int pair = streamline_pair_for_band(band);
@@ -2522,23 +1446,9 @@ static inline void paint_streamline_cell(int screen_row, int screen_col,
     attroff(COLOR_PAIR(pair));
 }
 
-/*
- * render_streamlines_view — banded ψ contours with speed-shaped glyphs.
- *
- * Pseudocode:
- *   scan_streamfunction_range(&psi_min, &psi_max)
- *   psi_range = max(psi_max − psi_min, 1e-8)
- *   max_y = compute_render_max_y(term_rows)
- *   for each visible cell (sy, x):
- *     skip walls
- *     band       = psi_to_streamline_band(psi, psi_min, psi_range)
- *     speed_slot = speed_to_velocity_slot(speed, max_smoothed)
- *     paint_streamline_cell(sy + 1, x, band, speed_slot)
- *
- * The contour density follows the SPEED visually (slow regions get
- * dotted glyphs, fast regions get dense glyphs) while the colour
- * tracks the band parity — two channels of information per cell.
- */
+/* Draw the flow as contour stripes.  Each cell shows two things at
+ * once: the colour says which contour band it's in, and the character
+ * (faint dots to solid blocks) says how fast the flow is there. */
 static void render_streamlines_view(int term_rows, int term_cols) {
     int cols  = g_scene.grid_cols;
     int max_y = compute_render_max_y(term_rows);
@@ -2563,9 +1473,7 @@ static void render_streamlines_view(int term_rows, int term_cols) {
     }
 }
 
-/* ===================================================================== */
-/* §18  render_velocity — speed magnitude heatmap                        */
-/* ===================================================================== */
+/* §18  render_velocity — draw flow speed, dark = slow, bright = fast */
 
 static void render_velocity_view(int term_rows, int term_cols) {
   int cols = g_scene.grid_cols;
@@ -2596,13 +1504,11 @@ static void render_velocity_view(int term_rows, int term_cols) {
   }
 }
 
-/* ===================================================================== */
-/* §19  render_tracers — overlay particles (T9)                          */
-/* ===================================================================== */
+/* §19  render_tracers — draw the floating dots on top */
 
-/* Round a tracer's fractional position to grid cell + map to screen
- * row (with the y-flip).  Returns true if the result is inside both
- * the grid AND the visible field rect AND not a wall cell. */
+/* Work out which screen cell a dot lands on (rounded to a cell, with
+ * the top-to-bottom flip).  Returns false if it's off the grid, off
+ * the visible area, or inside a wall — those dots aren't drawn. */
 static inline bool tracer_to_visible_cell(const Tracer *t,
                                            int term_rows, int term_cols,
                                            int *out_gx, int *out_gy,
@@ -2624,9 +1530,8 @@ static inline bool tracer_to_visible_cell(const Tracer *t,
     return true;
 }
 
-/* Pick the glyph SLOT for a tracer from its local speed.  Discrete
- * 4-tier so the tracer visually "speeds up" as it advects faster —
- * an extra channel of information on top of the colour pair. */
+/* Pick a dot's character from how fast it's moving, in four steps, so
+ * faster dots look chunkier. */
 static inline int tracer_glyph_slot_for_speed(float speed_normalised) {
     int slot = (int)(speed_normalised * 4.0f);
     if (slot < 0) slot = 0;
@@ -2634,15 +1539,14 @@ static inline int tracer_glyph_slot_for_speed(float speed_normalised) {
     return slot;
 }
 
-/* Pick a HOT pair (red) for fast tracers, NORMAL pair (white) for
- * slow ones — emphasises where the active flow is. */
+/* Colour fast dots hot (red), slow ones plain (white), so the busy
+ * parts of the flow stand out. */
 static inline int tracer_pair_for_speed(float speed_normalised) {
     return (speed_normalised > 0.6f) ? PAIR_TRACER_FAST : PAIR_TRACER;
 }
 
-/* Paint one tracer.  Speed at the tracer's grid cell determines both
- * glyph and colour pair; A_BOLD makes the overlay pop over whatever
- * field view is underneath. */
+/* Draw one dot, its character and colour both set by the local speed,
+ * bold so it stands out over whatever field is underneath. */
 static inline void paint_one_tracer_at(int screen_row, int gx, int gy) {
     float speed_norm = speed_magnitude_at(gx, gy) / g_scene.velocity_max_smoothed;
     int   slot       = tracer_glyph_slot_for_speed(speed_norm);
@@ -2653,16 +1557,8 @@ static inline void paint_one_tracer_at(int screen_row, int gx, int gy) {
     attroff(attr);
 }
 
-/*
- * render_tracer_overlay — paint each tracer as a glyph on top of the
- * current field view.
- *
- * Pseudocode:
- *   if not tracer_overlay_enabled: return
- *   for each tracer:
- *     if not tracer_to_visible_cell(...) : skip
- *     paint_one_tracer_at(screen_row, gx, gy)
- */
+/* Draw all the dots on top of the current field view (nothing if the
+ * overlay is off). */
 static void render_tracer_overlay(int term_rows, int term_cols) {
     if (!tracer_overlay_enabled) return;
     for (int i = 0; i < active_tracer_count; i++) {
@@ -2675,21 +1571,17 @@ static void render_tracer_overlay(int term_rows, int term_cols) {
     }
 }
 
-/* ===================================================================== */
-/* §20  render_obstacles — overlay solid cells                           */
-/* ===================================================================== */
+/* §20  render_obstacles — draw the solid walls on top */
 
-/* Paint one obstacle cell as '#' bold in the obstacle colour pair.
- * Walls are the ONLY layer that's always drawn at full brightness —
- * makes scene topology unambiguous regardless of which field view
- * is active underneath. */
+/* Draw one wall cell as a bold '#'.  Walls are the one thing always
+ * drawn at full brightness, so the shape of the scene is clear no
+ * matter which field is showing underneath. */
 static inline void paint_obstacle_cell(int screen_row, int screen_col) {
     attron(COLOR_PAIR(PAIR_OBSTACLE) | A_BOLD);
     mvaddch(screen_row, screen_col, '#');
     attroff(COLOR_PAIR(PAIR_OBSTACLE) | A_BOLD);
 }
 
-/* Paint all obstacle cells in the visible field. */
 static inline void paint_all_obstacle_cells(int term_rows, int term_cols) {
     int cols  = g_scene.grid_cols;
     int max_y = compute_render_max_y(term_rows);
@@ -2703,10 +1595,9 @@ static inline void paint_all_obstacle_cells(int term_rows, int term_cols) {
     }
 }
 
-/* Draw a horizontal bar of '=' across the top of the field if the
- * active scenario has a MOVING LID (lid-driven cavity).  Visualises
- * the wall-shear-driving boundary condition that's otherwise
- * invisible — the field underneath just shows the resulting flow. */
+/* If the top wall is a sliding lid, draw a '=' bar across the top to
+ * mark it.  Otherwise the lid is invisible — you'd only see the swirl
+ * it stirs up, not the lid itself. */
 static inline void paint_moving_lid_indicator_if_active(int term_cols) {
     const ScenarioPreset *preset = &scenario_table[active_scenario_index];
     if (preset->boundary_spec.side_top != BC_SIDE_WALL_MOVING) return;
@@ -2717,21 +1608,13 @@ static inline void paint_moving_lid_indicator_if_active(int term_cols) {
     attroff(COLOR_PAIR(PAIR_LID) | A_BOLD);
 }
 
-/*
- * render_obstacle_overlay — paint walls + moving-lid indicator.
- *
- * Pseudocode:
- *   paint_all_obstacle_cells              ← '#' bold per wall cell
- *   paint_moving_lid_indicator_if_active  ← '=' bar if lid scenario
- */
+/* Draw the walls and, if there is one, the sliding-lid bar. */
 static void render_obstacle_overlay(int term_rows, int term_cols) {
     paint_all_obstacle_cells              (term_rows, term_cols);
     paint_moving_lid_indicator_if_active  (term_cols);
 }
 
-/* ===================================================================== */
-/* §21  hud — top status + bottom hint (CLAUDE.md spec)                  */
-/* ===================================================================== */
+/* §21  hud — status line up top, key hints along the bottom */
 
 static void hud_paint_status(int term_cols, double measured_fps,
                              int active_view_mode, bool simulation_paused) {
@@ -2760,9 +1643,7 @@ static void hud_paint_hint(int term_rows) {
   attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §22  scene — per-frame state + tick wrapper                           */
-/* ===================================================================== */
+/* §22  scene — per-frame state + tick wrapper */
 
 static int active_view_mode = VIEW_VORTICITY;
 static bool simulation_paused = false;
@@ -2802,21 +1683,18 @@ static void scene_tick(void) {
   tracers_advance(active_scenario_index, g_scene.current_dt * SUBSTEPS_PER_FRAME);
 }
 
-/* ===================================================================== */
-/* §23  screen — ncurses init / cleanup / present                        */
-/* ===================================================================== */
+/* §23  screen — ncurses setup, teardown, and frame output */
 
 /*
- * Screen — terminal extent record.  ncurses owns the buffers; we
- * keep only cell dimensions for HUD placement and field clipping.
- *
- * Render pipeline (one frame): erase → paint_field → paint_tracers
- *   → hud_paint_* → wnoutrefresh(stdscr) → doupdate().  Diff-only
- *   writes — no flicker.  See [9] Raymond §11.
+ * Screen — just the terminal's size.  ncurses holds the actual screen
+ * buffers; all we need to remember is how many rows and columns we
+ * have, for placing the HUD and clipping the field.  Each frame we
+ * wipe, draw the field, drop the dots on top, add the HUD, and flush
+ * once — ncurses writes only what changed, so there's no flicker.
  */
 typedef struct {
-    int rows;   /* terminal height in cells (getmaxyx)             */
-    int cols;   /* terminal width  in cells (getmaxyx)             */
+    int rows;   /* terminal height in cells                        */
+    int cols;   /* terminal width  in cells                        */
 } Screen;
 
 static void screen_init(Screen *screen) {
@@ -2864,9 +1742,7 @@ static void screen_present_frame(Screen *screen, double measured_fps) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §24  app — main loop + signals + input                                */
-/* ===================================================================== */
+/* §24  app — main loop, signals, keyboard */
 
 static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;

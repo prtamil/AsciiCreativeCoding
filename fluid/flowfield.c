@@ -1,724 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * flowfield.c — animated 2-D flow visualisation in ASCII
+ * flowfield.c — animated 2-D flow in ASCII.
  *
- * DEMO: Hundreds of TRACER particles drift across the screen as if
- *       riding wind, smoke, or ocean currents.  The wind itself is
- *       INVISIBLE (toggle with 'a' to see the field arrows behind
- *       the particles); the tracer trails are what reveal it.  The
- *       wind evolves slowly over time so the pattern keeps
- *       changing.  The result reads as smoke wisps, sand drifting,
- *       or aurora — depending on theme.
- *
- *       Everything you see emerges from THREE ideas:
- *
- *         1. PERLIN NOISE — a smooth pseudo-random function on a 2-D
- *            grid that LOOKS organic (not white noise).
- *         2. NOISE → ANGLE — two independent noise samples give the
- *            (vx, vy) of a vector at every grid cell; atan2 turns
- *            them into a single angle.
- *         3. PARTICLE ADVECTION — at every tick each tracer reads
- *            the local angle and walks one step in that direction.
- *
- *       Tutorials T2-T6 build these from scratch.  Press 'a' to
- *       see the wind arrows underneath; the connection between the
- *       arrows and the tracer trails is the visual proof of
- *       advection.
- *
- * Study alongside:
- *   procedural/fields/flow_field_particles.c — same idea, different
- *                                                visual aesthetic
- *   procedural/fields/perin_noise_flow_showcase.c — Perlin noise
- *                                                visualisation alone
- *   procedural/fields/curl_noise_vector_field.c — divergence-free
- *                                                noise (better for
- *                                                "real" fluid look)
- *   fluid/navier_stokes.c — the OPPOSITE approach: a real fluid
- *                                                solver, not a
- *                                                noise lookup
- *
- * Section map:
- *   §1  config       — every tunable constant
- *   §2  clock        — monotonic ns time + sleep
- *   §3  rng          — seeded shuffle for the perlin permutation table
- *   §4  perlin       — single-octave 2-D Perlin gradient noise
- *   §5  fbm          — multi-octave fractional Brownian motion
- *   §6  field        — 2-D angle grid: build, sample, evolve
- *   §7  arrows       — direction → ASCII arrow + hue table
- *   §8  themes       — rainbow + three mono palettes (data only)
- *   §9  colors       — ncurses pair setup
- *   §10 tracer       — one particle: pose, trail ring buffer
- *   §11 tracer_step  — Lagrangian advection (one tick of one tracer)
- *   §12 tracer_paint — fading-trail rendering
- *   §13 scene        — pool + field + tick orchestrator
- *   §14 hud          — top status + bottom key-hint strip
- *   §15 screen       — ncurses init / cleanup
- *   §16 app          — main loop + signals + input
- *
- * Keys:
- *   q / Q / ESC      quit
- *   space            pause / resume
- *   r                respawn all tracers at random positions
- *   a                toggle field-arrow background ON/OFF
- *   t                cycle theme  (rainbow → cyan → green → white)
- *   + / =            more tracers
- *   -                fewer tracers
- *   ] / [            sim FPS up / down
- *   f / F            field evolves faster / slower (time-axis speed)
- *   s / S            longer / shorter trail
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra fluid/flowfield.c \
- *       -o flowfield -lncurses -lm
+ * Hundreds of tiny tracer particles drift across the screen as if
+ * riding an invisible wind.  The "wind" is made-up smooth random
+ * noise; each tracer reads the local direction and walks one step
+ * that way every tick, leaving a fading trail.  Press 'a' to see the
+ * wind arrows underneath.  This is NOT a real fluid solver — the wind
+ * is a noise lookup, not physics.  For the real thing see
+ * fluid/navier_stokes.c; for a more fluid-like noise variant see
+ * procedural/fields/curl_noise_vector_field.c.
  */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose.  T1 motivates vector fields; T2-T4 build Perlin
- *      noise; T5 turns noise into a flow direction; T6 advects a
- *      tracer along it.  After T6 you can write a minimal
- *      flowfield from scratch.
- *   2. §4 perlin + §5 fbm — the math underpinning everything.
- *      Read AFTER tutorials T2-T4.
- *   3. §6 field — assembles a per-cell angle from FBM noise.
- *   4. §11 tracer_step — the heart of the simulation: ONE tracer's
- *      one-tick update.  Six lines.  Read AFTER tutorial T6.
- *   5. §13 scene + §16 app — orchestration.  Standard framework.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   tracer_pos_col, tracer_pos_row    a particle's continuous (x, y) position
- *   tracer_step_cells                  per-particle speed (cells/tick)
- *   tracer_angle                       last sampled flow angle (radians)
- *   trail_col[i], trail_row[i]         past-position ring buffer
- *   trail_write_index                  next slot to write
- *   trail_filled_count                 how many slots are populated (0..len)
- *   trail_length                       active trail length (slots used)
- *   ticks_until_respawn                lifetime countdown
- *   trail_pair_base                    the brightest colour pair for this trail
- *   tracer_alive                       slot is in use
- *
- *   flow_angle_at(field, c, r)         radians at integer cell (c, r)
- *   flow_angle_bilinear(field, x, y)   bilinearly interpolated, sub-cell
- *   field_evolution_speed              how fast the noise time-axis advances
- *
- *   perlin_value(x, y)                 single-octave Perlin in [-1, +1]
- *   fbm_value(x, y, octaves)           fractional Brownian motion sum
- *
- * Background you need
- * ───────────────────
- *   - 2-D arrays, ring buffers.
- *   - atan2(y, x).
- *   - Bilinear interpolation (lerp + lerp).
- *
- * Background you DON'T need
- * ─────────────────────────
- *   - The Navier-Stokes equations.  This file does NOT solve fluid
- *     dynamics — the field is a noise lookup, not a physical
- *     simulation.  See fluid/navier_stokes.c for the real thing.
- *   - Curl-free / divergence-free noise.  Curl noise is the
- *     improvement that makes this look more like real fluid; out
- *     of scope here.  See procedural/fields/curl_noise_vector_field.c.
- *   - Streamline integration with adaptive step size.  We do plain
- *     forward Euler — accurate enough for visualisation.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm     : LAGRANGIAN PARTICLE ADVECTION on a procedurally-
- *                 generated vector field.  Each tracer particle reads
- *                 the local flow angle and steps one cell in that
- *                 direction every tick.  The field is computed from
- *                 fractional Brownian motion (FBM) — a sum of three
- *                 octaves of 2-D Perlin noise.  Two independent FBM
- *                 samples (offset spatially) form the (vx, vy) of a
- *                 vector at each grid cell; atan2(vy, vx) gives the
- *                 angle.  The field's "time" axis advances slowly so
- *                 the pattern evolves smoothly.
- *
- * Math          : Perlin noise (Ken Perlin, 1985) — interpolates a
- *                 random GRADIENT vector at each integer corner of a
- *                 grid.  At a query point inside a cell:
- *
- *                     dot_product_at_corner_k = grad_k · offset_to_corner_k
- *                     value = bilinear_lerp(those four dot products)
- *                     value = smoothstep_interpolated  (3t² - 2t³)
- *
- *                 Result: a smooth function in [-1, +1] that looks
- *                 random but has continuous derivatives.
- *
- *                 FBM:  Σ (perlin(x · 2^i, y · 2^i) · 0.5^i)
- *                      i=0..octaves-1
- *
- *                 → broad swirls (low octave) plus fine detail
- *                 (high octaves), mimicking turbulent flow.
- *
- *                 Forward Euler advection:
- *                     pos_new = pos + (cos(angle), sin(angle)) · step
- *
- * Data layout   : - perlin permutation table (256 bytes, doubled to
- *                   512 to avoid modulo)
- *                 - 2-D angle field, one float per cell
- *                 - tracer pool: each tracer has (pos, speed, life,
- *                   trail ring buffer of up to MAX_TRAIL positions)
- *                 - rendering: erase → optional field arrows →
- *                   tracer trails → HUD
- *
- * Performance   : O(W·H · OCTAVES) for field rebuild every tick.
- *                 O(N_TRACERS · trail_length) for drawing.  At W=160,
- *                 H=40, OCTAVES=3, N_TRACERS=300, trail=14 — that's
- *                 ~19k noise evaluations + ~4200 cell paints per
- *                 tick.  Sub-millisecond on any modern CPU.
- *
- * References
- * ──────────
- *   ── Procedural noise (§4 perlin, §5 fbm) ──────────────────────────
- *   [1] Perlin, K. (1985), "An Image Synthesizer", SIGGRAPH 1985,
- *       pp. 287-296 — THE original gradient-noise paper.  §4 implements
- *       his lattice-hash + smooth-interpolation scheme.
- *   [2] Perlin, K. (2002), "Improving noise", SIGGRAPH 2002 — the
- *       quintic-fade refresh (6t⁵−15t⁴+10t³) used as our smoothstep.
- *   [3] Lagae, A. et al. (2010), "A Survey of Procedural Noise
- *       Functions", Comput. Graph. Forum 29(8), pp. 2579-2600 —
- *       comprehensive survey if you want alternatives (simplex,
- *       wavelet, sparse-convolution noise).
- *
- *   ── FBM / fractal stacking (§5 fbm) ───────────────────────────────
- *   [4] Mandelbrot, B. B. (1982), "The Fractal Geometry of Nature",
- *       W. H. Freeman — formalises the FBM idea our §5 uses (geometric
- *       octave summation gives a 1/f power spectrum).
- *   [5] Voss, R. F. (1985), "Random Fractal Forgeries", in
- *       "Fundamental Algorithms for Computer Graphics" (Springer) —
- *       canonical FBM-for-procedural-content recipe.
- *
- *   ── Particle tracers (§10 tracer, §11 tracer_step) ────────────────
- *   [6] Reynolds, C. (1999), "Steering Behaviors for Autonomous
- *       Characters", Game Developers Conference — same particle-
- *       following pattern; this file replaces the steering target
- *       with a noise-field angle.
- *   [7] Witkin, A. (1991), "Particle System Dynamics", SIGGRAPH course
- *       notes — foundations of Lagrangian particle advection in
- *       prescribed flow fields.
- *
- *   ── Visual technique ──────────────────────────────────────────────
- *   [8] Quilez, I., "Painting a 2D animation with noise" —
- *       iquilezles.org/articles/warp; the noise-warp aesthetic that
- *       inspired this demo's "wind in grass" visual.
- *
- *   ── Rendering / ncurses ───────────────────────────────────────────
- *   [9] Bourke, P. (1997), "Character representation of grayscale
- *       images", paulbourke.net/dataformats/asciiart — design basis
- *       for the 8-octant ASCII arrow ramp.
- *  [10] Raymond, E. S., "NCURSES Programming HOWTO" —
- *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
- *       use_default_colors, and the newscr/curscr diff pipeline used
- *       in scene_paint() → wnoutrefresh() → doupdate().
- *
- *   ── Online quick reference ────────────────────────────────────────
- *  [11] https://en.wikipedia.org/wiki/Perlin_noise
- *  [12] https://en.wikipedia.org/wiki/Fractional_Brownian_motion
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The screen is FILLED with an INVISIBLE WIND.  At every cell of the
- * terminal grid there's a wind direction (and implicitly a unit
- * speed).  We can't draw the wind directly — that'd be too busy.
- * Instead, we drop hundreds of tiny TRACER particles into the wind
- * and let each one drift at the local speed in the local direction.
- * The trails the tracers leave are what reveal the wind's shape.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a calm field of grass on a hilly day.  The wind blows in
- * complicated swirls — eddies behind hills, smooth flows down
- * valleys.  You can't SEE the wind, but if you sprinkle thousands
- * of tiny seed-fluffs onto the field, they DRIFT — and the patterns
- * they trace as they drift make the wind visible.  Slow swirls
- * become slow circling fluffs.  Sharp gusts become straight streaks.
- * Eventually each fluff lands somewhere or blows off the edge; new
- * fluffs spawn to keep the field populated.
- *
- * This file is exactly that:
- *
- *   - The "wind" is a 2-D angle field generated from PERLIN NOISE
- *     (a smooth random function, T2).
- *   - The "fluffs" are TRACERS — particles that drift one cell per
- *     tick in the direction the local wind tells them.
- *   - The "trails" are the last N positions of each tracer, drawn
- *     fading from bright (recent) to dim (old).
- *
- * THE THREE-LAYER STRUCTURE
- * ─────────────────────────
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   Layer 3: TRACERS (visible)                     │
- *      │      hundreds of moving particles                │
- *      │      with fading trails ' . , + ~ * '            │
- *      │                                                  │
- *      │   Layer 2: VECTOR FIELD (invisible by default,   │
- *      │            press 'a' to see)                     │
- *      │      one angle per cell, drives tracers          │
- *      │      (also represented by ASCII arrow chars)     │
- *      │                                                  │
- *      │   Layer 1: PERLIN NOISE (mathematical, never     │
- *      │            drawn directly)                       │
- *      │      smooth pseudo-random scalar field           │
- *      │      sampled by FBM to give the flow angles      │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * Each layer is a CLEAN ABSTRACTION over the layer below.  Tracers
- * don't know about Perlin noise; they read the field.  The field
- * doesn't know about advection; it just supplies an angle when
- * asked.  Perlin noise doesn't know about anything else; it just
- * returns a smooth scalar at any (x, y).
- *
- * GEOMETRY OF ONE TRACER STEP
- * ───────────────────────────
- *
- *      tick t                    tick t + 1
- *
- *      ●               →         '─→  ●
- *      tracer at                  trail glyph    tracer
- *      (x, y)                     where it       at
- *                                 was             (x + cos θ · v,
- *                                                  y + sin θ · v)
- *
- *      The angle θ comes from sampling the field at (x, y).
- *      The speed v is per-tracer (with jitter), in cells/tick.
- *
- * KEY FORMULAS
- * ────────────
- *   Perlin gradient hash + smoothstep:
- *     value(x, y) = bilinear_smoothstep(
- *                    grad(corner) · (x - corner.x, y - corner.y) )
- *
- *   FBM (3 octaves):
- *     fbm(x, y) = perlin(x, y)              · 1.0
- *               + perlin(x · 2, y · 2)      · 0.5
- *               + perlin(x · 4, y · 4)      · 0.25
- *
- *   Flow angle from two noise samples:
- *     vx = fbm(x · sx, y · sy + t)
- *     vy = fbm(x · sx + 100, y · sy + 200 + t)    ← offset → independent
- *     angle = atan2(vy, vx)
- *
- *   Tracer advection (forward Euler):
- *     pos = pos + (cos angle, sin angle) · speed_cells
- *
- *   Wrap-around boundary (toroidal):
- *     pos.x = (pos.x + cols) mod cols
- *     pos.y = (pos.y + rows) mod rows
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   - Trail wrap on toroidal field.  When a tracer crosses the
- *     screen edge, its NEW position is on the OPPOSITE side, but
- *     the trail's PREVIOUS position is on the FAR side.  Drawing a
- *     line between them would draw across the screen.  We just
- *     stamp each trail position individually (no line connect),
- *     so the wrap looks natural.
- *   - "Stuck" tracers.  If two adjacent cells have nearly opposite
- *     angles, a tracer can oscillate between them.  We give each
- *     tracer a finite LIFETIME so it gets respawned to a fresh
- *     position eventually.
- *   - Field rebuilt every tick.  Cheaper alternative: rebuild only
- *     when time has advanced by some Δ.  We rebuild every tick for
- *     visual smoothness; the cost is negligible.
- *
- * HOW TO VERIFY
- * ─────────────
- *   - Default theme (rainbow): tracers should clearly form streamlines
- *     — long curving paths, not random dots.  If trails look
- *     scattered, FIELD_EVOLVE_SPEED is too high (field changes
- *     faster than tracers can follow).
- *   - Press 'a': field arrows visible behind the tracers.  Each
- *     trail should run ALONG an arrow direction (visual proof of
- *     advection — T6).
- *   - Press 'F' to slow the field evolution: the wind looks
- *     "frozen," tracers form long stable streamlines.
- *   - Press 'r' to respawn: tracers vanish and reappear randomly;
- *     trails grow over the next ~14 ticks.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Eight tutorials that build the flowfield from first principles.
- *
- *   T1  What's a vector field, and why "flow"?
- *   T2  Why Perlin noise — smooth random functions
- *   T3  Perlin noise step by step (gradient + smoothstep + lerp)
- *   T4  FBM — layering octaves for organic detail
- *   T5  From noise to flow direction (atan2 trick)
- *   T6  Lagrangian advection — tracers riding the flow
- *   T7  Trail ring buffer — fixed memory, dynamic content
- *   T8  Why this isn't real fluid (and what it would take)
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  WHAT'S A VECTOR FIELD, AND WHY "FLOW"?
- * ──────────────────────────────────────────
- * A SCALAR FIELD assigns a NUMBER to every point of space:
- *   - temperature in a room: T(x, y) → degrees
- *   - elevation on a map: H(x, y) → metres
- *
- * A VECTOR FIELD assigns a VECTOR (an arrow with direction +
- * magnitude) to every point:
- *   - wind in a weather map: V(x, y) → (vx, vy) in m/s
- *   - water current under a ship: U(x, y) → flow velocity
- *   - electric field around a charge: E(x, y) → V/m
- *
- * "FLOW" is the technical term for following a vector field by
- * stepping along its direction.  If at every moment you walk in
- * the local flow direction at your speed, you trace a STREAMLINE
- * — a curve tangent to the field everywhere.  This is what tracer
- * particles in this file do.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   Vector field (sparse arrows):                  │
- *      │                                                  │
- *      │     ↗   ↗   →   →   ↘                            │
- *      │   ↗   →   →   →   ↘   ↘                          │
- *      │     →   →   →   →   →                            │
- *      │   ↘   →   →   →   ↗   ↗                          │
- *      │     ↘   →   →   ↗                                │
- *      │                                                  │
- *      │   Streamline (one tracer's path):                │
- *      │                                                  │
- *      │              .─→─.                               │
- *      │             /     \                              │
- *      │        ●─→─●       \                             │
- *      │                     ●─→─                          │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * In this file, the "wind" is procedurally generated from Perlin
- * noise (T2-T5), and "tracers" are the fluffs we follow (T6).
- *
- * T2  WHY PERLIN NOISE — SMOOTH RANDOM FUNCTIONS
- * ──────────────────────────────────────────────
- * Two ways to generate "random-looking" 2-D scalar fields:
- *
- *   WHITE NOISE — rand() at every cell.
- *   Pure salt-and-pepper.  Adjacent cells are UNCORRELATED.  Looks
- *   like TV static.  Bad for flow:  a tracer that lands on a cell
- *   pointing east, then walks 1 cell east, finds an unrelated
- *   random direction.  No streamlines emerge.
- *
- *   PERLIN NOISE — gradient hash + interpolation (Perlin 1985).
- *   Adjacent cells are HIGHLY CORRELATED.  Looks like a smooth
- *   landscape.  Adjacent angles vary continuously, so streamlines
- *   are smooth curves.  Looks like wind, smoke, or marble.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   White noise:           Perlin noise:           │
- *      │                                                  │
- *      │   ░▓░▓▒▒░▓▒░             ░░▒▒▓▒▒░░░              │
- *      │   ▓▒░▓▓░▓▒░▓             ░▒▓▓▓▒▒░░░              │
- *      │   ▒░▓░▒▓░▓▓░             ▒▓▓▓▓▒▒░░░              │
- *      │   ▓░▒░▓░▒░▒▓             ▒▓▓▒▒░░░░░              │
- *      │   ░▓▒░▓▒░▒░▓             ▒▒▒░░░░░░░              │
- *      │                                                  │
- *      │   uncorrelated           organic blobs           │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * Perlin noise is the workhorse of procedural generation:
- *   - Minecraft terrain
- *   - Cloud textures in 3-D games
- *   - Fire / smoke shaders
- *   - Procedural marble, wood, lava
- *   - Demoscene effects
- *
- * The simplest usable variant is what we implement next.
- *
- * T3  PERLIN NOISE STEP BY STEP (GRADIENT + SMOOTHSTEP + LERP)
- * ────────────────────────────────────────────────────────────
- * Goal: a function `perlin(x, y)` returning a value in [-1, +1]
- * that varies SMOOTHLY (continuous derivatives) but UNPREDICTABLY.
- *
- *   Step 1: AT EVERY INTEGER GRID POINT, assign a random GRADIENT
- *           vector.  We use a permutation table (256 bytes,
- *           shuffled) hashed by integer (xi, yi):
- *
- *               hash[xi, yi] = perm[ perm[xi] + yi ]      ∈ [0, 255]
- *
- *           From the hash, derive a 2-D unit gradient (we use 4
- *           directions: ±x, ±y combos — Perlin's "improved"
- *           variation uses 4 such vectors per grid cell).
- *
- *   Step 2: At a query point (x, y), find which grid cell contains
- *           it.  The cell has 4 corners c00, c10, c01, c11.
- *
- *               (xi, yi)   (xi+1, yi)
- *                  ┌─────────┐
- *                  │         │
- *                  │   ●     │   ← query point (x, y)
- *                  │         │
- *                  └─────────┘
- *               (xi, yi+1)  (xi+1, yi+1)
- *
- *   Step 3: At each corner, compute the DOT PRODUCT of the gradient
- *           vector with the OFFSET FROM CORNER TO QUERY POINT:
- *
- *               d00 = grad(c00) · (x - xi    , y - yi    )
- *               d10 = grad(c10) · (x - xi - 1, y - yi    )
- *               d01 = grad(c01) · (x - xi    , y - yi - 1)
- *               d11 = grad(c11) · (x - xi - 1, y - yi - 1)
- *
- *           Each d is a SCALAR.  At a corner exactly, the dot
- *           product is 0 (the offset is zero).  Slightly off the
- *           corner, it's a small linear deviation.
- *
- *   Step 4: BILINEAR INTERPOLATE the four dot products by the
- *           query's fractional offsets within the cell:
- *
- *               u = smoothstep(x - xi)
- *               v = smoothstep(y - yi)
- *               value = lerp( lerp(d00, d10, u),
- *                             lerp(d01, d11, u), v )
- *
- *           SMOOTHSTEP (3t² - 2t³) is the magic.  Plain linear
- *           interpolation makes the noise look CRYSTALLINE — you
- *           can see the grid.  Smoothstep makes it look SMOOTH
- *           because its first derivative is continuous at corners.
- *
- *   Step 5: Result is in [-1, +1].  Done.
- *
- * Pseudocode:
- *
- *     perlin_value(x, y):
- *       xi = floor(x);  yi = floor(y)
- *       fx = x - xi;    fy = y - yi
- *       u  = smoothstep(fx);  v = smoothstep(fy)
- *       g00 = grad(hash[xi   , yi   ])
- *       g10 = grad(hash[xi+1 , yi   ])
- *       g01 = grad(hash[xi   , yi+1 ])
- *       g11 = grad(hash[xi+1 , yi+1 ])
- *       d00 = g00 · (fx,   fy  )
- *       d10 = g10 · (fx-1, fy  )
- *       d01 = g01 · (fx,   fy-1)
- *       d11 = g11 · (fx-1, fy-1)
- *       return lerp( lerp(d00, d10, u), lerp(d01, d11, u), v )
- *
- * Implemented in §4 perlin.
- *
- * T4  FBM — LAYERING OCTAVES FOR ORGANIC DETAIL
- * ─────────────────────────────────────────────
- * Single-octave Perlin noise has ONE characteristic length scale —
- * roughly the spatial scale you queried at.  Real-world flow has
- * MANY scales: huge weather systems, regional eddies, local gusts,
- * tiny micro-turbulence.  To synthesise a flow with such richness,
- * SUM SEVERAL OCTAVES of Perlin noise at increasing frequencies and
- * decreasing amplitudes:
- *
- *     fbm(x, y) = Σ  perlin(x · 2^i, y · 2^i) · (0.5)^i
- *               i=0..N-1
- *
- * - Octave 0 contributes BIG SWIRLS (low frequency, high amplitude).
- * - Octave 1 adds smaller details at half amplitude.
- * - Octave 2 adds even smaller wobbles at quarter amplitude.
- * - ...
- *
- * The result has visible structure at every scale — a FRACTAL
- * pattern.  Mandelbrot-like in spirit, but generated cheaply.
- *
- * Three octaves is plenty for visual flow (more octaves cost more
- * noise evaluations per cell and give diminishing returns).
- *
- * Implemented in §5 fbm.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   1 octave         2 octaves        3 octaves    │
- *      │                                                  │
- *      │   smooth           smooth +         organic      │
- *      │   blobs            wobbles          detail       │
- *      │                                                  │
- *      │   ▒▒░░             ▒▓▒░░░          ░▒▓▒░░░       │
- *      │   ▓▓▒▒             ▒▓▓▒░▒          ▒▓▓▓▒░▒       │
- *      │   ▓▓▒              ▓▓▓▒▒░          ▓▓▒▒░░▒       │
- *      │   ▒░░              ▓▒░░░░          ▒▒░░░░▒       │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- *
- * T5  FROM NOISE TO FLOW DIRECTION (THE ATAN2 TRICK)
- * ──────────────────────────────────────────────────
- * FBM gives us a SCALAR field.  We need a VECTOR field — two
- * numbers per cell, the (vx, vy) of the local flow.
- *
- * Trick: sample TWO INDEPENDENT FBM functions, one for vx and one
- * for vy.  We make them independent by SAMPLING AT OFFSET POINTS:
- *
- *     vx = fbm(x · scale_x,        y · scale_y       + time)
- *     vy = fbm(x · scale_x + 100,  y · scale_y + 200 + time · 1.1)
- *
- * The "+ 100" and "+ 200" shifts move the second sample to a
- * faraway region of noise space — far enough that the two values
- * are uncorrelated.  The "+ time" terms drift the noise space over
- * time so the field evolves smoothly (T2 of the file: the scene
- * keeps changing).
- *
- * Now (vx, vy) is a 2-D vector.  Convert to an ANGLE for storage
- * and easy interpolation:
- *
- *     angle = atan2(vy, vx)            ∈ (-π, +π]
- *
- * (Storing only the angle discards the magnitude, but for a
- * visualisation we want all tracers to move at similar speeds, so
- * a unit-length advection is what we want anyway.)
- *
- * The field becomes one float per cell — angle in radians.  At
- * any sub-cell point we BILINEAR-INTERPOLATE the four corners (T6
- * uses this).  Bilinear-interpolating angles across the
- * −π↔+π wrap is technically wrong (you can get tracer wobble at
- * the seam) but for visual purposes it's invisible.
- *
- * T6  LAGRANGIAN ADVECTION — TRACERS RIDING THE FLOW
- * ──────────────────────────────────────────────────
- * EULERIAN view of fluid: stand still and watch the field at fixed
- * grid points.  The state is V(x, y, t).
- *
- * LAGRANGIAN view: ride along with a tracer.  Track ONE PARTICLE
- * over time as it moves through the flow.
- *
- * We use Lagrangian here because TRACERS ARE WHAT WE DRAW.  At
- * each tick, for each tracer:
- *
- *     1. Sample the flow angle at the tracer's CURRENT position
- *        (using bilinear interpolation between the four
- *        surrounding grid cells).
- *     2. Step the tracer by `step_cells` in the direction angle:
- *
- *          tracer.x += cos(angle) · step
- *          tracer.y += sin(angle) · step
- *
- *     3. Wrap the tracer toroidally (off the right edge → on the
- *        left edge, etc.).
- *
- * That's it.  Each tracer is a 6-line update.  Hundreds of tracers
- * later, you've got a beautiful flowfield visualisation.
- *
- * Pseudocode:
- *
- *     for each tracer t:
- *       angle = field_sample_bilinear(t.col, t.row)
- *       t.col += cos(angle) · t.step
- *       t.row += sin(angle) · t.step
- *       wrap_toroidal(&t.col, &t.row)
- *       record_in_trail_buffer(t)
- *
- * Implemented in §11 tracer_step.
- *
- * NOTE: this is FORWARD EULER integration of the ODE
- * dx/dt = V(x, t).  Higher-order integrators (RK2, RK4) give
- * smoother streamlines but cost more.  For visualisation, Euler
- * is fine because the visible "error" is just slight curve
- * deviation — invisible.  Real fluid simulators (e.g. Stam's
- * stable fluids) often use SEMI-LAGRANGIAN with RK2; not needed
- * here.
- *
- * T7  TRAIL RING BUFFER — FIXED MEMORY, DYNAMIC CONTENT
- * ─────────────────────────────────────────────────────
- * Each tracer needs to remember its LAST N positions to draw a
- * fading trail.  We don't want to allocate per-tracer; instead
- * each tracer owns a FIXED-SIZE ARRAY used as a CIRCULAR
- * (RING) BUFFER:
- *
- *     trail_col[MAX_TRAIL]
- *     trail_row[MAX_TRAIL]
- *     trail_write_index    — slot to write next
- *     trail_filled_count   — how many slots are populated (≤ MAX)
- *
- * Per tick:
- *
- *     trail_col[trail_write_index] = current_col_int
- *     trail_row[trail_write_index] = current_row_int
- *     trail_write_index = (trail_write_index + 1) % trail_length
- *     if trail_filled_count < trail_length:
- *         trail_filled_count++
- *
- * To draw, walk the trail in time order — OLDEST first, NEWEST
- * last — applying a BRIGHTNESS RAMP along the way:
- *
- *     for i in 0..trail_filled_count-1:
- *       slot = (trail_write_index − trail_filled_count + i + 2*L) % L
- *       brightness = i / (trail_filled_count − 1)
- *       paint(trail_col[slot], trail_row[slot], glyph_for(brightness))
- *
- * The "+ 2*L" before mod handles negative indices (C's mod can
- * return negative for negative dividends — classic gotcha).
- *
- * Why a ring buffer?  Because we add ONE position per tick and
- * remove ONE.  A naïve linked list would alloc/free every tick;
- * a shifting array would be O(N).  The ring buffer is O(1) per
- * push, O(N) only when DRAWING (one walk).
- *
- * Same trick is used in audio buffers, network packet queues,
- * keyboard typing-history buffers, and the trail buffers in
- * fk_centipede.c, snake_forward_kinematics.c, etc.
- *
- * T8  WHY THIS ISN'T REAL FLUID (AND WHAT IT WOULD TAKE)
- * ──────────────────────────────────────────────────────
- * The result LOOKS like fluid flow but isn't.  Differences:
- *
- *   This file:
- *     - field is a Perlin/FBM lookup; doesn't satisfy any
- *       conservation law.
- *     - field has no DIVERGENCE-FREE property.  Real
- *       incompressible fluid has ∇ · V = 0 (mass conserved); our
- *       field does not.  Visual symptom: tracers can pile up in
- *       "sinks" (cells where the surrounding angles converge
- *       inward) or rapidly empty out of "sources."
- *     - tracers are PASSIVE — they don't push back on the field.
- *       Real fluid flows respond to obstacles, walls, viscosity.
- *
- *   Real fluid simulator (e.g. fluid/navier_stokes.c):
- *     - solves the Navier-Stokes equations on the grid.
- *     - enforces ∇ · V = 0 every step via a pressure projection.
- *     - tracers (or smoke density, or temperature) are advected
- *       by the live solved velocity field, not a fixed lookup.
- *     - obstacles cleanly induce vortex shedding, boundary layers,
- *       turbulent wakes — all from the equations, no hand-tuning.
- *
- * To turn this file into a real fluid:
- *   1. Replace the Perlin field with a velocity grid initialised
- *      to zero.
- *   2. Each tick: solve the NS equations on the grid (advect →
- *      diffuse → project).
- *   3. Use the resulting (vx, vy) for the tracer advection.
- *
- * Step 2 is the substantial work; see fluid/navier_stokes.c for
- * Stam's stable-fluid algorithm in ~700 lines.
- *
- * BETTER MIDDLE GROUND: CURL NOISE.
- *
- *   Take a Perlin SCALAR field ψ(x, y).  Define the velocity as
- *   the CURL:
- *
- *     vx = ∂ψ/∂y       vy = -∂ψ/∂x
- *
- *   This is automatically divergence-free!  No tracer pile-ups.
- *   Looks dramatically more like real fluid than plain noise.
- *   See procedural/fields/curl_noise_vector_field.c.
- *
- * For "look like wind" without the cost of NS, curl noise is the
- * standard choice.  This file uses plain noise for pedagogical
- * clarity (you only need ONE noise function + atan2).
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -736,16 +28,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config — every constant in one place                              */
-/* ===================================================================== */
-/*
- * What's in this section
- * ----------------------
- * Tunable knobs grouped by purpose.  Anything literal in the rest of
- * the file should be a NAME from §1 (project rule: no magic numbers
- * scattered through the code).
- */
+/* ── §1  config — every tunable knob in one place ── */
 
 enum {
   /* Render frame cap. */
@@ -771,10 +54,10 @@ enum {
   TRAIL_LEN_DEFAULT = 14,
   TRAIL_LEN_MAX = 20,
 
-  /* FBM octaves — 3 is the sweet spot for organic-looking flow. */
+  /* How many noise layers to stack — 3 looks organic without costing much. */
   FBM_OCTAVES = 3,
 
-  /* Number of distinct hue pairs around the angle wheel (T5). */
+  /* How many distinct colours we cycle around the direction wheel. */
   HUE_WHEEL_PAIRS = 8,
 
   /* Number of themes (rainbow + 3 monos). */
@@ -784,27 +67,26 @@ enum {
   TRAIL_LEN_HARD_MAX = 20,
 };
 
-/* PHYSICAL / VISUAL CONSTANTS — units in the comment. */
-
-/* Per-tracer step distance (cells per tick).  Tracers get a per-particle
- * jitter so they don't all move in lockstep. */
+/* How far a tracer moves each tick, in cells.  A little random jitter
+ * is added per tracer so they don't all march in lockstep. */
 #define TRACER_STEP_BASE_CPT 0.9f
-#define TRACER_STEP_JITTER_CPT 0.4f /* uniform [-J/2, +J/2] */
+#define TRACER_STEP_JITTER_CPT 0.4f /* spread, centred on the base */
 
-/* How fast the noise time-axis advances per tick.  Smaller = slower
- * field evolution = longer-lived streamlines. */
+/* How fast the wind changes shape over time.  Smaller = slower drift,
+ * so tracers form longer, more stable streaks. */
 #define FIELD_EVOLUTION_DEFAULT 0.008f
 #define FIELD_EVOLUTION_MIN 0.001f
 #define FIELD_EVOLUTION_MAX 0.080f
-#define FIELD_EVOLUTION_FACTOR 1.4f /* multiplier per F/f keypress */
+#define FIELD_EVOLUTION_FACTOR 1.4f /* how much one F/f press multiplies it */
 
-/* Spatial scale of the noise (smaller = larger swirls).  Different
- * x/y scales make the flow gently anisotropic — looks like wind that
- * prefers horizontal direction. */
+/* How "zoomed in" the noise is — smaller numbers make bigger swirls.
+ * Using different x/y values makes the wind lean horizontal, like a
+ * breeze that prefers to blow sideways. */
 #define NOISE_SCALE_X 0.04f
 #define NOISE_SCALE_Y 0.07f
 
-/* Tracer lifetime in ticks before forced respawn (with jitter). */
+/* How many ticks a tracer lives before it respawns somewhere fresh
+ * (plus a random amount so they don't all die at once). */
 #define TRACER_LIFE_BASE_TICKS 100
 #define TRACER_LIFE_JITTER_TICKS 60
 
@@ -812,21 +94,18 @@ enum {
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 
-/* Color pair IDs.  Reserved blocks: */
+/* ncurses colour-pair IDs.  Trail colours take the first block; the
+ * HUD and key-hint colours sit just past them. */
 enum {
-  PAIR_TRAIL_BASE = 1, /* 1..HUE_WHEEL_PAIRS */
+  PAIR_TRAIL_BASE = 1, /* trail colours occupy 1..HUE_WHEEL_PAIRS */
   PAIR_HUD = PAIR_TRAIL_BASE + HUE_WHEEL_PAIRS,
   PAIR_HINT,
 };
 
-/* ===================================================================== */
-/* §2  clock — monotonic ns timer                                        */
-/* ===================================================================== */
-/*
- * CLOCK_MONOTONIC + clock_gettime + nanosleep is the POSIX standard
- * for soft real-time animation.  Wall-clock changes (NTP, manual
- * adjust) don't perturb monotonic time.
- */
+/* ── §2  clock — a steady timer for animation ──
+ * We use the monotonic clock (one that only ever counts up) so the
+ * animation isn't disturbed if the system clock jumps for NTP or a
+ * manual time change. */
 
 static int64_t clock_now_ns(void) {
   struct timespec ts;
@@ -841,30 +120,24 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  rng — Fisher-Yates shuffle for the perlin permutation table       */
-/* ===================================================================== */
-/*
- * The perlin permutation table is the SINGLE source of pseudo-randomness
- * for the noise function.  We seed rand() once at startup and shuffle
- * a 256-byte identity array.  The shuffled array is then doubled to
- * 512 bytes so we can index without a modulo (perm[i & 255]).
- */
+/* ── §3  rng — shuffled lookup table the noise draws from ──
+ * The noise function gets all its randomness from one shuffled list of
+ * 256 bytes.  We shuffle it once at startup, then mirror it into a
+ * 512-byte copy so the noise code can add two indices together and
+ * still land in range without a wraparound check. */
 
 static uint8_t perlin_perm_table[512];
 
-/* Fill an array with the identity permutation [0, 1, ..., n-1].
- * Pre-condition for the Fisher-Yates shuffle below: shuffling an
- * identity produces a uniform random permutation. */
+/* Start with [0, 1, ..., n-1] so the shuffle below has something to
+ * scramble into a random order. */
 static inline void fill_identity_permutation_u8(uint8_t *p, int n) {
     for (int i = 0; i < n; i++)
         p[i] = (uint8_t)i;
 }
 
-/* Knuth-Fisher-Yates shuffle: walk from the END to the START, swap
- * each element with one chosen uniformly from positions [0 .. i].
- * Produces a uniform permutation in O(n) using O(1) extra memory.
- * (Knuth Vol. 2 §3.4.2; Fisher-Yates 1938.) */
+/* Shuffle the list into a random order, every ordering equally likely.
+ * Walk from the end, swapping each slot with a random earlier one.
+ * (Fisher-Yates; Knuth Vol. 2 §3.4.2.) */
 static inline void fisher_yates_shuffle_u8(uint8_t *p, int n) {
     for (int i = n - 1; i > 0; i--) {
         int     j   = rand() % (i + 1);
@@ -874,23 +147,15 @@ static inline void fisher_yates_shuffle_u8(uint8_t *p, int n) {
     }
 }
 
-/* Mirror the 256-byte source array into the 512-byte destination so
- * perm[a + b] is always defined for a, b ∈ [0, 255].  Removes the need
- * for a modulo in the inner Perlin loop ([2] Perlin 2002 §3). */
+/* Copy the shuffled 256 bytes twice into a 512-byte array, so adding
+ * any two values in [0, 255] still lands inside it — no wraparound
+ * check needed in the noise inner loop (Perlin 2002 §3). */
 static inline void mirror_perm_table_to_512(const uint8_t *src256,
                                             uint8_t *dst512) {
     for (int i = 0; i < 512; i++)
         dst512[i] = src256[i & 255];
 }
 
-/*
- * perlin_perm_init — build the 512-byte permutation table.
- *
- * Pseudocode:
- *   identity ← [0, 1, ..., 255]
- *   fisher_yates_shuffle_u8(identity, 256)        ← uniform random perm
- *   mirror_perm_table_to_512(identity, perm)      ← doubled for wraparound
- */
 static void perlin_perm_init(void) {
     uint8_t identity[256];
     fill_identity_permutation_u8(identity, 256);
@@ -898,28 +163,17 @@ static void perlin_perm_init(void) {
     mirror_perm_table_to_512    (identity, perlin_perm_table);
 }
 
-/* ===================================================================== */
-/* §4  perlin — single-octave 2-D Perlin gradient noise                  */
-/* ===================================================================== */
-/*
- * Computes a smooth pseudo-random scalar in [-1, +1] at any (x, y).
- * Adjacent calls give CORRELATED values (the whole point — T2).
- *
- * Implementation (Perlin 1985 / improved 2002, simplified):
- *
- *   1. Find the integer cell containing (x, y).
- *   2. At each of the 4 cell corners, compute a "gradient dot" — the
- *      dot product of a gradient vector (selected from the perm
- *      table by hashing the corner coords) with the offset from
- *      that corner to (x, y).
- *   3. Smoothstep-interpolate the 4 corner dots back to (x, y)
- *      (bilinear with a 3t² - 2t³ ease so first derivatives are
- *      continuous at corners).
- */
+/* ── §4  perlin — smooth random noise ──
+ * Perlin noise (Perlin 1985, improved 2002) gives a smooth random
+ * value in [-1, +1] at any point (x, y).  Unlike rand(), nearby points
+ * give nearby values, so the result looks like rolling hills, not TV
+ * static — exactly what we want for a believable wind.  The grid is
+ * divided into unit cells; each corner has a fixed random direction,
+ * and we blend the four corners smoothly to get the value at a point. */
 
-/* Smoothstep: 3t² - 2t³.  C¹ continuous; C² has a discontinuity at
- * t=0 and t=1, which is why some implementations use the "improved"
- * 6t⁵ - 15t⁴ + 10t³.  For visualisation 3t² - 2t³ is plenty. */
+/* Smoothstep curve: eases in and out instead of going straight.  Using
+ * it to blend the corners hides the grid — straight blending would
+ * leave visible creases at the cell edges. */
 static inline float smoothstep_cubic(float t) {
   return t * t * (3.0f - 2.0f * t);
 }
@@ -928,9 +182,10 @@ static inline float lerp_scalar(float a, float b, float t) {
   return a + t * (b - a);
 }
 
-/* Gradient hash — turn an 8-bit hash into a unit-vector dot product
- * with the offset (x, y) to the corner.  Perlin's "improved" version
- * uses 4 vectors {(±1, 0), (0, ±1)} or 8 around the wheel; we use 4. */
+/* Each corner has a random direction; this measures how far in that
+ * direction the query point lies (the dot product of the corner's
+ * direction with the offset to the point).  The low bits of the hash
+ * pick one of four directions. */
 static inline float perlin_gradient_dot(int hash, float x, float y) {
   int bits = hash & 3;
   float term1 = (bits < 2) ? x : y;
@@ -938,17 +193,17 @@ static inline float perlin_gradient_dot(int hash, float x, float y) {
   return ((hash & 1) ? -term1 : term1) + ((hash & 2) ? -term2 : term2);
 }
 
-/* Hash an integer lattice corner (xi, yi) to an 8-bit gradient index
- * via the doubled permutation table.  Composing TWO permutation lookups
- * ([1] Perlin 1985) is what makes the same (xi, yi) always hash to the
- * same gradient regardless of which corner of which cell asks. */
+/* Turn a grid corner (xi, yi) into a stable random number by looking it
+ * up in the shuffled table twice.  Doing two lookups means the same
+ * corner always gets the same direction, no matter which cell asks for
+ * it — so neighbouring cells agree on the corner they share. */
 static inline int hash_lattice_corner(int xi, int yi) {
     return perlin_perm_table[perlin_perm_table[xi] + yi];
 }
 
-/* Fill the four corner dot products (gradient · offset) for the unit
- * cell at floor(x, y).  Order: NW, NE, SW, SE in fx/fy space
- * (top-left to bottom-right with y increasing downward). */
+/* Compute the four corner values for the cell the point falls in.
+ * d00/d10/d01/d11 are the top-left, top-right, bottom-left and
+ * bottom-right corners (y grows downward, screen-style). */
 static inline void lattice_corner_dot_products(int xi, int yi,
                                                float fx, float fy,
                                                float *out_d00, float *out_d10,
@@ -963,9 +218,9 @@ static inline void lattice_corner_dot_products(int xi, int yi,
                                     fx - 1.f,  fy - 1.f );
 }
 
-/* Bilinear interp with SMOOTHSTEP-eased weights (ux, uy).  The eased
- * weights (3t² − 2t³) make the field C¹-continuous across cell
- * boundaries; raw linear weights would produce visible "creases". */
+/* Blend the four corner values into one, mixing left-to-right then
+ * top-to-bottom.  Caller passes blend weights already eased through
+ * smoothstep so cell edges don't show. */
 static inline float bilinear_smooth_interp(float d00, float d10,
                                             float d01, float d11,
                                             float ux, float uy) {
@@ -974,19 +229,6 @@ static inline float bilinear_smooth_interp(float d00, float d10,
     return lerp_scalar(top, bottom, uy);
 }
 
-/*
- * perlin_value — smooth pseudo-random scalar in [−1, +1] at (x, y).
- *
- * Pseudocode:
- *   (xi, yi) = (floor(x), floor(y)) mod 256           ← integer cell
- *   (fx, fy) = (x − xi, y − yi)                       ← cell-local offset
- *   (ux, uy) = smoothstep(fx), smoothstep(fy)         ← eased weights
- *   (d00, d10, d01, d11) = lattice_corner_dot_products(...)
- *   return bilinear_smooth_interp(corners, ux, uy)
- *
- * Refs [1] Perlin 1985 (original); [2] Perlin 2002 (the quintic-fade
- *   refresh — we use the cubic smoothstep instead for simplicity).
- */
 static float perlin_value(float x, float y) {
     int xi = (int)floorf(x) & 255;
     int yi = (int)floorf(y) & 255;
@@ -1003,55 +245,20 @@ static float perlin_value(float x, float y) {
     return bilinear_smooth_interp(d00, d10, d01, d11, ux, uy);
 }
 
-/* ===================================================================== */
-/* §5  fbm — fractional Brownian motion                                  */
-/* ===================================================================== */
-/*
- * Sum multiple Perlin octaves at increasing frequency / decreasing
- * amplitude.  See T4 for the motivation.  The result has visible
- * structure at every scale — exactly what real-world flow looks
- * like.
- *
- * Pseudocode:
- *
- *     fbm_value(x, y, octaves):
- *         result = 0;  amp = 1;  freq = 1
- *         for i in 0 .. octaves-1:
- *             result += perlin_value(x · freq, y · freq) · amp
- *             amp *= 0.5;  freq *= 2
- *         return result
- *
- * Result range: roughly [-2, +2] for 3 octaves with the 1, 0.5, 0.25
- * amplitude weights.  We don't normalise — the magnitude doesn't
- * matter because we use atan2 to extract the angle (T5).
- */
+/* ── §5  fbm — stacking noise layers for richer detail ──
+ * One layer of Perlin noise has detail at a single size.  Real flow has
+ * detail at every size: huge swirls, medium eddies, tiny ripples.  So
+ * we add several layers, each one twice as fine and half as strong as
+ * the last.  The sum looks far more natural.  (Mandelbrot; Voss,
+ * "Random Fractal Forgeries".) */
 
-/* Add ONE Perlin octave's contribution to a running FBM sum.
- * Perlin is evaluated at the FREQUENCY-SCALED coordinates and the
- * result is weighted by amp.  Doubling frequency / halving amplitude
- * each octave gives a 1/f power spectrum — the "fractal" property
- * Mandelbrot named.  See [4] Mandelbrot §22; [5] Voss recipe.        */
+/* Add one more, finer, fainter layer of noise to the running total. */
 static inline void accumulate_perlin_octave(float *running_sum,
                                             float x, float y,
                                             float frequency, float amplitude) {
     *running_sum += perlin_value(x * frequency, y * frequency) * amplitude;
 }
 
-/*
- * fbm_value — Fractional Brownian Motion at (x, y).
- *
- * Pseudocode:
- *   sum = 0;  freq = 1;  amp = 1
- *   for octave in 0 .. octaves-1:
- *     accumulate_perlin_octave(&sum, x, y, freq, amp)
- *     amp  *= 0.5     ← geometric weight decay
- *     freq *= 2.0     ← geometric frequency doubling
- *   return sum
- *
- * Result is roughly in [−2, +2] for 3 octaves with these weights.
- * No normalisation — atan2 in §6 only needs the DIRECTION, not
- * magnitude.  Refs [4] Mandelbrot; [5] Voss "Random Fractal Forgeries".
- */
 static float fbm_value(float x, float y, int octaves) {
     float result    = 0.0f;
     float amplitude = 1.0f;
@@ -1064,73 +271,46 @@ static float fbm_value(float x, float y, int octaves) {
     return result;
 }
 
-/* ===================================================================== */
-/* §6  field — 2-D angle grid: build, sample, evolve                     */
-/* ===================================================================== */
-/*
- * The field stores ONE FLOAT per cell — the flow angle at that cell.
- * (Two floats per cell would let us also store a magnitude, but for
- * this visualisation all tracers move at unit speed, so we only need
- * the direction.)
- *
- * Two TIME-OFFSET fbm samples produce the (vx, vy) of the local
- * flow vector; atan2 turns it into an angle.  The "time" axis
- * advances slowly each tick so the pattern keeps changing.
- *
- * Static storage (no malloc): a 200×60 max grid uses 48 KB of
- * floats — tiny.
- */
+/* ── §6  field — the invisible wind: build, sample, evolve ──
+ * The wind is just a grid with one angle stored per cell — the
+ * direction the wind blows there.  We get the angle by sampling the
+ * noise twice (for an x-part and a y-part) and asking atan2 which way
+ * that pair points.  A slowly advancing "time" value keeps the whole
+ * pattern drifting so it never sits still. */
 
 #define FIELD_COLS_MAX 256
 #define FIELD_ROWS_MAX 80
 
 /*
- * flow_field — the invisible vector field that drives every tracer.
+ * flow_field — the invisible wind that every tracer rides.
  *
- * Intent
- *   For each grid cell we precompute an angle θ(x, y, t) by sampling
- *   octave-summed Perlin noise.  Tracers bilinearly sample this array
- *   and step in the resulting direction.  Storing the FIELD up front
- *   (rather than re-evaluating noise per tracer) trades memory for
- *   CPU — see "Why precompute on a grid" below.
+ * We work out a direction for every cell up front and store it, rather
+ * than recomputing noise for each tracer.  Computing it once per cell
+ * is cheaper than once per tracer (there are far more tracers), and it
+ * lets a tracer sitting between cells blend its four neighbours for a
+ * smooth direction.
  *
- * Why precompute on a grid (not evaluate per-tracer)
- *   With N tracers and a W·H grid, the grid evaluation costs
- *   O(W·H·OCTAVES) per tick, while per-tracer evaluation would cost
- *   O(N·OCTAVES) per tick × bilinear interp wins nothing.  For our
- *   defaults (W·H ≈ 6.4k cells, N ≈ 300, OCTAVES=3) the grid eval is
- *   ~3× cheaper AND bilinear sampling gives sub-cell smoothness for
- *   free.  See [3] Lagae §3 for the noise-evaluation cost model.
- *
- * Why static buffers (no malloc)
- *   200×60 active cells × float = 48 KB worst case in BSS.  Per
- *   CLAUDE.md "no dynamic allocation after init" the hot path makes
- *   zero allocations; resize on SIGWINCH just updates the active
- *   subregion.
- *
- * Why time_axis and evolution_speed are separate
- *   evolution_speed is user-adjustable via f/F keys; time_axis is the
- *   running clock that field_rebuild() advances by evolution_speed
- *   each tick.  Splitting them lets the user speed up / slow down
- *   the "wind" without restarting the noise phase.
- *
- * References [1][2] Perlin noise; [4] Mandelbrot FBM.
+ * The grid is a plain fixed array (no malloc) so the running animation
+ * never allocates memory — 256x80 floats is only ~80 KB.  On a window
+ * resize we just shrink the active part; the array stays put.
  */
 typedef struct {
-    /* ── Active subregion (≤ FIELD_*_MAX, clamped on resize) ────── */
+    /* The part of the grid actually in use.  Capped at the *_MAX sizes
+     * and re-clamped whenever the terminal is resized. */
     int   active_cols;
     int   active_rows;
 
-    /* ── Noise time axis ────────────────────────────────────────── *
-     * time_axis is the z-coordinate fed to 3-D noise; it advances  *
-     * by evolution_speed each tick so the field morphs smoothly    *
-     * over frames.                                                  */
+    /* The wind's clock.  time_axis creeps forward by evolution_speed
+     * every tick, which slides the noise pattern along and makes the
+     * wind morph.  They're kept separate so the user can speed up or
+     * slow down the morphing (f/F keys change evolution_speed) without
+     * jolting the pattern. */
     float time_axis;
     float evolution_speed;
 
-    /* ── Per-cell flow angle (radians), filled each tick ─────────── *
-     * Tracers read this via bilinear sampling — they never call    *
-     * the noise generators directly.                                */
+    /* The wind direction at each cell, in radians, refreshed every
+     * tick.  Tracers read this (blending neighbours) and never touch
+     * the noise generators themselves. */
     float angle[FIELD_ROWS_MAX][FIELD_COLS_MAX];
 } flow_field;
 
@@ -1146,20 +326,17 @@ static void field_init(flow_field *f, int cols, int rows) {
   memset(f->angle, 0, sizeof f->angle);
 }
 
-/* Step the noise clock forward by evolution_speed.  Doing the
- * increment here (not in scene_tick) keeps the "time" coupled to the
- * field that uses it — no risk of ticking it twice or forgetting. */
+/* Nudge the wind's clock forward one step.  Kept next to the field it
+ * belongs to so we can't accidentally advance it twice or forget. */
 static inline void advance_noise_clock(flow_field *f) {
     f->time_axis += f->evolution_speed;
 }
 
-/* Sample TWO FBM fields at the same (x, y) but with different time
- * offsets to produce the velocity components (vx, vy).  Using TWO
- * decorrelated FBM evaluations — rather than one for magnitude and a
- * separate angle — guarantees the resulting flow has BOTH spatial
- * variety AND temporal smoothness.  The 100.3 / 200.7 / phase
- * multipliers are arbitrary irrational-ish offsets to keep the two
- * fields uncorrelated.                                              */
+/* Get the wind vector (vx, vy) at a cell by sampling the noise twice.
+ * The second sample is shifted far away in noise-space (the +100.3 /
+ * +200.7 offsets) so the two readings are unrelated — otherwise vx and
+ * vy would move together and the wind would only ever point along one
+ * diagonal. */
 static inline void sample_velocity_components_at(float c, float r, float t,
                                                   float *out_vx,
                                                   float *out_vy) {
@@ -1171,24 +348,15 @@ static inline void sample_velocity_components_at(float c, float r, float t,
                         FBM_OCTAVES);
 }
 
-/* Velocity components → flow angle in [−π, +π].  Standard atan2 —
- * preferred over atan(vy/vx) because it covers all four quadrants. */
+/* Turn a wind vector into the single angle we store.  atan2 handles
+ * all directions (plain atan can't tell left from right). */
 static inline float velocity_to_angle(float vx, float vy) {
     return atan2f(vy, vx);
 }
 
-/*
- * field_evolve_and_rebuild — advance the noise clock, recompute every cell.
- *
- * Pseudocode:
- *   advance_noise_clock(f)
- *   for each grid cell (c, r):
- *     (vx, vy) ← sample_velocity_components_at(c, r, time)
- *     angle[r][c] ← velocity_to_angle(vx, vy)
- *
- * Cost: rows · cols · OCTAVES Perlin evaluations per tick.  At 200×60×3
- * = 36 k perlin_value calls/tick → sub-millisecond on any modern CPU.
- */
+/* Move the wind forward one step and recompute every cell's direction.
+ * We rebuild the whole grid each tick for smooth motion — it's only a
+ * fraction of a millisecond. */
 static void field_evolve_and_rebuild(flow_field *f) {
     advance_noise_clock(f);
     float t = f->time_axis;
@@ -1201,8 +369,8 @@ static void field_evolve_and_rebuild(flow_field *f) {
     }
 }
 
-/* flow_angle_at_cell — exact angle at integer cell.  Used by the
- * field-arrow background renderer. */
+/* The exact wind direction at one whole-number cell.  Used to draw the
+ * arrow overlay; out-of-range cells clamp to the edge. */
 static inline float flow_angle_at_cell(const flow_field *f, int c, int r) {
   if (c < 0)
     c = 0;
@@ -1215,16 +383,16 @@ static inline float flow_angle_at_cell(const flow_field *f, int c, int r) {
   return f->angle[r][c];
 }
 
-/* Clamp an integer cell index to the active field bounds.  Used by
- * the bilinear stencil so the floor+1 corner never reaches outside. */
+/* Keep a cell index inside the grid so the +1 neighbour below never
+ * reads past the edge. */
 static inline int clamp_cell_to_active(int idx, int max_count) {
     if (idx < 0)              return 0;
     if (idx >= max_count)     return max_count - 1;
     return idx;
 }
 
-/* (fx, fy) ∈ [0, 1): fractional offsets within the cell at
- * (floor(col), floor(row)).  These are the bilinear blend weights. */
+/* How far the point sits into its cell, 0 at the left/top edge up to
+ * just under 1 at the right/bottom — the weights for blending. */
 static inline void compute_subcell_offsets_xy(float col, float row,
                                               float *out_fx, float *out_fy) {
     *out_fx = col - floorf(col);
@@ -1232,19 +400,12 @@ static inline void compute_subcell_offsets_xy(float col, float row,
 }
 
 /*
- * flow_angle_bilinear — sub-cell interpolated angle at (col, row).
+ * Wind direction at a fractional position, blended from the four
+ * surrounding cells so a tracer between cells gets a smooth answer.
  *
- * Pseudocode:
- *   (c0, r0) = floor(col, row), clamped to [0, active-1]
- *   (c1, r1) = (c0+1, r0+1),    clamped likewise
- *   (fx, fy) = compute_subcell_offsets_xy(col, row)
- *   return bilinear_smooth_interp(corners, fx, fy)   ← from §4
- *
- * NOTE: bilinearly interpolating angles across the −π↔+π wrap is
- * technically wrong (you'd want to interpolate (cos θ, sin θ) and re-
- * atan2).  For visualisation the seam is invisible because Perlin
- * values change slowly across cells; the wrap rarely happens between
- * neighbours.
+ * Strictly speaking, blending angles is wrong where they wrap from +π
+ * to -π — but the wind turns so gently between neighbours that a tracer
+ * almost never straddles that seam, so it's invisible here.
  */
 static float flow_angle_bilinear(const flow_field *f, float col, float row) {
     int c0 = clamp_cell_to_active((int)floorf(col),     f->active_cols);
@@ -1255,43 +416,16 @@ static float flow_angle_bilinear(const flow_field *f, float col, float row) {
     float fx, fy;
     compute_subcell_offsets_xy(col, row, &fx, &fy);
 
-    /* Reuse the eased-bilinear helper from §4 with RAW (not
-     * smoothstepped) weights — the field is already smooth. */
+    /* Reuse the blend helper from §4, but with plain weights — the
+     * wind is already smooth, so no easing is needed here. */
     return bilinear_smooth_interp(f->angle[r0][c0], f->angle[r0][c1],
                                    f->angle[r1][c0], f->angle[r1][c1],
                                    fx, fy);
 }
 
-/* ===================================================================== */
-/* §7  arrows — direction → ASCII glyph + hue index                      */
-/* ===================================================================== */
-/*
- * Map a flow angle (in radians) to:
- *   - one of 8 ASCII arrow glyphs (for the field-arrow overlay)
- *   - one of 8 hue pair indices (for the rainbow theme)
- *
- * The mapping divides the full circle into 8 octants, each π/4 wide.
- * Octant 0 starts at the EAST (angle = 0) and increments clockwise
- * in screen space (which is counter-clockwise in math coords because
- * y points down on screens — matches the physical convention "wind
- * from east" = arrow pointing east).
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │           octant 2 (N, '^')                      │
- *      │                                                  │
- *      │   octant 3   ↖    │    ↗   octant 1              │
- *      │   (NW, '\')  '\'  │  '/'   (NE, '/')             │
- *      │                                                  │
- *      │   octant 4 ─ '<' ─ ●  ─ '>' ─ octant 0 (E, '>')  │
- *      │                                                  │
- *      │   octant 5   ↙    │    ↘   octant 7              │
- *      │   (SW, '/')  '/'  │  '\'   (SE, '\')             │
- *      │                                                  │
- *      │           octant 6 (S, 'v')                      │
- *      │                                                  │
- *      └──────────────────────────────────────────────────┘
- */
+/* ── §7  arrows — turn a direction into an arrow glyph and a colour ──
+ * We round each angle to one of 8 compass directions, then look up the
+ * matching arrow character and the matching rainbow colour. */
 
 #define ARROW_TABLE_LEN 8
 static const char arrow_glyph_table[ARROW_TABLE_LEN] = {
@@ -1322,34 +456,24 @@ static inline int hue_pair_for_angle(float angle_radians) {
   return PAIR_TRAIL_BASE + angle_to_octant(angle_radians);
 }
 
-/* ===================================================================== */
-/* §8  themes — rainbow + 3 mono palettes (data only)                    */
-/* ===================================================================== */
-/*
- * All theme data lives in TABLES so adding a new theme is just one
- * row of numbers.  Palettes target 256-colour terminals; the
- * 8-colour fallback is a separate table.
- *
- * RAINBOW: the 8 hue indices map to an evenly-spaced rainbow.
- * MONO:    all 8 indices map to one hue with brightness ramps,
- *          giving a "trail fade" effect within each particle's
- *          lifetime.
- *
- * Pair index 1 is BRIGHTEST (fresh trail / particle head).
- * Pair index 8 is DIMMEST   (oldest trail cell).
- */
+/* ── §8  themes — colour palettes (just data) ──
+ * Each theme is a row of 8 colours.  The rainbow theme spreads its 8
+ * across the colour wheel (so direction picks the colour); the mono
+ * themes are one hue from bright to dim (so newer trail = brighter).
+ * One table for full-colour terminals, a fallback table for 8-colour
+ * ones.  Slot 1 is brightest, slot 8 dimmest. */
 
 static const char *theme_name_table[THEME_COUNT] = {"rainbow", "cyan", "green",
                                                     "white"};
 
 static const int theme_palette_256[THEME_COUNT][HUE_WHEEL_PAIRS] = {
-    /* RAINBOW — 8 hues around the wheel (matches octants in §7). */
+    /* RAINBOW — 8 hues spread around the wheel. */
     {196, 208, 226, 46, 51, 33, 129, 201},
-    /* CYAN ramp — bright → dim. */
+    /* CYAN — bright to dim. */
     {51, 45, 39, 33, 27, 26, 25, 25},
-    /* GREEN ramp — bright → dim. */
+    /* GREEN — bright to dim. */
     {82, 46, 40, 34, 28, 28, 28, 28},
-    /* WHITE / GREY ramp — bright → dim. */
+    /* WHITE / GREY — bright to dim. */
     {255, 250, 247, 245, 243, 241, 240, 240},
 };
 
@@ -1364,16 +488,10 @@ static const int theme_palette_8[THEME_COUNT][HUE_WHEEL_PAIRS] = {
      COLOR_WHITE, COLOR_WHITE, COLOR_WHITE},
 };
 
-/* ===================================================================== */
-/* §9  colors — ncurses pair init                                        */
-/* ===================================================================== */
-/*
- * Per CLAUDE.md HUD spec:
- *   PAIR_HUD  = bright yellow on default bg, used with A_BOLD.
- *   PAIR_HINT = bright cyan   on default bg, used with A_BOLD.
- * Other pairs use default bg too (-1) so the user's terminal
- * background shows through.
- */
+/* ── §9  colors — hand the palette to ncurses ──
+ * Build the trail colour pairs from the chosen theme, plus the fixed
+ * HUD (yellow) and hint (cyan) colours.  Everything uses -1 for the
+ * background so the terminal's own background shows through. */
 
 static void colors_init(int theme_index) {
   start_color();
@@ -1395,75 +513,43 @@ static void colors_init(int theme_index) {
   }
 }
 
-/* ===================================================================== */
-/* §10  tracer — one particle: pose + trail ring buffer                  */
-/* ===================================================================== */
-/*
- * State of one tracer:
+/* ── §10  tracer — one particle and its trail ──
  *
- *   tracer_alive            slot in use?
- *   pos_col, pos_row        continuous (x, y) in grid units
- *   step_cells              per-tracer speed (cells/tick) with jitter
- *   last_angle              flow angle from the most recent tick
- *   ticks_until_respawn     lifetime countdown
- *   trail_pair_base         brightest colour pair (rainbow updates per tick)
- *   trail_col[i], trail_row[i]    ring buffer of past integer positions
- *   trail_write_index       next slot to write
- *   trail_filled_count      how many slots are populated (≤ active_length)
- *   trail_active_length     current length of the trail (for s/S keys)
- */
-
-/*
- * tracer — one particle: pose + ring-buffer trail.
+ * A tracer is one drifting particle.  Each tick it reads the wind where
+ * it stands, steps that way, and remembers where it just was so we can
+ * draw a fading trail behind it.
  *
- * Intent
- *   A tracer is a PASSIVE LAGRANGIAN PARTICLE [7] Witkin 1991: each
- *   tick it samples the field at its current position, advances in
- *   that direction by step_cells, and pushes its old position onto
- *   a fixed-length ring-buffer trail.  scene_paint reads the ring
- *   back into a fading-glow rendering (newest = brightest).
+ * The trail is a ring buffer: a fixed-size array used in a loop.  We
+ * keep the last few positions, overwriting the oldest as we go — so the
+ * trail stays a fixed length and we never allocate memory while running.
  *
- * Why a fixed-length ring buffer (not a linked list / dynamic array)
- *   Trails have a maximum visible length, so static
- *   trail_col[]/trail_row[] arrays avoid ALL allocation in the hot
- *   path.  trail_write_index walks circularly mod trail_active_length;
- *   trail_filled_count saturates once the buffer is full.  Static
- *   sizing matches CLAUDE.md "no dynamic allocation after init".
- *
- * Why ticks_until_respawn exists
- *   Tracers that walk off-grid don't teleport — they FADE, then wait
- *   a small random number of ticks (per-tracer), then respawn at a
- *   fresh random position.  Random offsets prevent all respawns from
- *   landing on the same frame (which would cause visible "popping").
- *
- * Why trail_pair_base is set at respawn (not per-tick)
- *   Each tracer keeps a stable palette base for its entire life.
- *   Re-sampling the palette every tick would make adjacent particles
- *   strobe.  Per-tick the rendering layer modulates the BASE pair to
- *   produce the fading gradient along the trail.
- *
- * Reference [6] Reynolds 1999 — same per-particle data shape used for
- *   "steering" agents; we just replace the steering target with a
- *   noise-field angle.
+ * Tracers don't bounce off walls; they live for a random number of
+ * ticks and then respawn at a fresh random spot.  The randomness keeps
+ * them from all dying on the same frame, which would look like popping.
  */
 typedef struct {
-    /* ── Life cycle ────────────────────────────────────────────── */
+    /* Is this slot in use, and how many ticks until it respawns. */
     bool  tracer_alive;
-    int   ticks_until_respawn;     /* counts down once tracer dies     */
+    int   ticks_until_respawn;
 
-    /* ── Current pose (continuous; bilinear-sampled in field) ──── */
+    /* Where it is (fractional cell position), how far it moves per tick,
+     * and the wind direction it last followed (used to draw its head). */
     float pos_col;
     float pos_row;
-    float step_cells;              /* per-tick advance (cells/tick)    */
-    float last_angle;              /* last sampled θ (drives glyph)    */
+    float step_cells;
+    float last_angle;
 
-    /* ── Trail ring buffer (fixed-size; no alloc in hot path) ──── */
-    int   trail_pair_base;         /* palette base SET at respawn      */
+    /* The trail ring buffer: recent positions plus the bookkeeping for
+     * the loop.  trail_pair_base is this tracer's colour, fixed for its
+     * whole life so it doesn't flicker.  trail_write_index is where the
+     * next position goes; trail_filled_count is how many slots are real
+     * yet; trail_active_length is the current trail length (s/S keys). */
+    int   trail_pair_base;
     int   trail_col[TRAIL_LEN_HARD_MAX];
     int   trail_row[TRAIL_LEN_HARD_MAX];
-    int   trail_write_index;       /* head index, mod active length    */
-    int   trail_filled_count;      /* up to trail_active_length        */
-    int   trail_active_length;     /* current window into the ring     */
+    int   trail_write_index;
+    int   trail_filled_count;
+    int   trail_active_length;
 } tracer;
 
 /* Uniform random spawn point inside the active field rect. */
@@ -1473,32 +559,28 @@ static inline void pick_random_spawn_position(int active_cols, int active_rows,
     *out_row = (float)(rand() % active_rows);
 }
 
-/* Per-tracer step speed in cells/tick: BASE ± JITTER/2.  Random jitter
- * desynchronises adjacent tracers so the visual stays textured rather
- * than gridded. */
+/* Pick a slightly random speed for this tracer so neighbours don't all
+ * move in step, which would look like a marching grid. */
 static inline float pick_jittered_step_speed_cpt(void) {
     return TRACER_STEP_BASE_CPT
          - TRACER_STEP_JITTER_CPT * 0.5f
          + TRACER_STEP_JITTER_CPT * ((float)rand() / (float)RAND_MAX);
 }
 
-/* Lifetime in ticks: BASE + uniform[0, JITTER).  Random offsets keep
- * the pool's death events spread out — without jitter all respawns
- * would land on one frame and produce visible "popping". */
+/* Pick a random lifetime so the tracers don't all respawn together. */
 static inline int pick_random_lifetime_ticks(void) {
     return TRACER_LIFE_BASE_TICKS + rand() % TRACER_LIFE_JITTER_TICKS;
 }
 
-/* Pick a fresh colour-pair BASE for the tracer's entire life — locked
- * at respawn so the rainbow theme can shift it per-tick later, while
- * mono themes keep the spawn-time base for the whole trail. */
+/* Pick this tracer's colour, fixed for its whole life.  (For the
+ * rainbow theme the per-tick step overrides it with the direction's
+ * colour; mono themes keep this one.) */
 static inline int pick_random_palette_pair_base(void) {
     return 1 + rand() % HUE_WHEEL_PAIRS;
 }
 
-/* Pre-fill the entire trail ring buffer with the spawn position so
- * the first paint frame doesn't draw a GAP between the tracer head
- * and its (still-empty) trail.  Resets the head/fill counters too. */
+/* Seed the whole trail with the spawn spot so the very first frame
+ * doesn't show a gap between the tracer and its empty trail. */
 static inline void reset_trail_ring_at(tracer *t,
                                         int initial_col, int initial_row,
                                         int trail_active_length) {
@@ -1511,19 +593,8 @@ static inline void reset_trail_ring_at(tracer *t,
     }
 }
 
-/*
- * tracer_respawn — give a tracer fresh position + speed + lifetime.
- * Called at init, when a tracer dies, and when the user presses 'r'.
- *
- * Pseudocode:
- *   alive ← true
- *   (pos_col, pos_row)    ← pick_random_spawn_position
- *   step_cells            ← pick_jittered_step_speed_cpt
- *   last_angle            ← 0
- *   ticks_until_respawn   ← pick_random_lifetime_ticks
- *   trail_pair_base       ← pick_random_palette_pair_base
- *   reset trail ring buffer with spawn position
- */
+/* Give a tracer a fresh start: new spot, speed, colour and lifetime.
+ * Runs at startup, when a tracer's time runs out, and on the 'r' key. */
 static void tracer_respawn(tracer *t, int active_cols, int active_rows,
                            int trail_active_length) {
     t->tracer_alive        = true;
@@ -1537,26 +608,12 @@ static void tracer_respawn(tracer *t, int active_cols, int active_rows,
                         trail_active_length);
 }
 
-/* ===================================================================== */
-/* §11  tracer_step — one tick of one tracer                             */
-/* ===================================================================== */
-/*
- * THE HEART OF THE SIMULATION.  Six lines of physics:
- *
- *   1. Push current position into the trail ring buffer.
- *   2. Sample the field angle at the tracer's position.
- *   3. Step in that direction at the tracer's per-particle speed.
- *   4. Wrap toroidally if the tracer left the grid.
- *   5. Update colour (rainbow theme tracks the angle).
- *   6. Decrement lifetime; mark dead when expired.
- *
- * Implements forward-Euler advection (T6).
- */
+/* ── §11  tracer_step — move one tracer one tick ──
+ * The heart of the demo: remember where we are, read the wind, step
+ * that way, wrap around the edges, recolour, and age by one tick. */
 
-/* Push the tracer's CURRENT integer position into the ring buffer.
- * trail_write_index advances mod trail_active_length; trail_filled_
- * count saturates.  Same shape as in §10 reset_trail_ring_at but for
- * the running head. */
+/* Drop the tracer's current spot into the trail, advancing the write
+ * position around the ring. */
 static inline void push_position_into_trail(tracer *t) {
     t->trail_col[t->trail_write_index] = (int)t->pos_col;
     t->trail_row[t->trail_write_index] = (int)t->pos_row;
@@ -1565,27 +622,24 @@ static inline void push_position_into_trail(tracer *t) {
         t->trail_filled_count++;
 }
 
-/* Sample the bilinear field angle at the tracer's current position,
- * cache it on the tracer (so the paint pass reads the SAME angle the
- * particle just travelled along), and return it. */
+/* Read the wind where the tracer stands and remember it, so the drawing
+ * code later shows the same direction the tracer actually moved. */
 static inline float sample_field_at_tracer(tracer *t, const flow_field *f) {
     float angle = flow_angle_bilinear(f, t->pos_col, t->pos_row);
     t->last_angle = angle;
     return angle;
 }
 
-/* Forward-Euler advection step.  Solves dx/dt = step_cells·(cos θ,
- * sin θ).  Implicit assumption: step_cells is small enough that the
- * field doesn't curve significantly within one step (CFL-like
- * concern).  Refs [7] Witkin 1991 §3. */
+/* Take one step in the wind's direction, scaled by the tracer's speed.
+ * Steps are small, so the slight curve we miss between steps doesn't
+ * show. */
 static inline void step_tracer_along_angle(tracer *t, float angle) {
     t->pos_col += cosf(angle) * t->step_cells;
     t->pos_row += sinf(angle) * t->step_cells;
 }
 
-/* Toroidal wrap-around at the field boundary.  Equivalent to a 2-D
- * torus topology — fluid leaving the right edge enters from the left.
- * Avoids the "tracer evaporated" failure mode of hard boundaries. */
+/* Wrap a tracer that leaves an edge back in on the opposite side, so
+ * nothing ever disappears off-screen. */
 static inline void wrap_position_toroidally(tracer *t,
                                             int active_cols, int active_rows) {
     if (t->pos_col <  0.0f)              t->pos_col += (float)active_cols;
@@ -1594,39 +648,23 @@ static inline void wrap_position_toroidally(tracer *t,
     if (t->pos_row >= (float)active_rows) t->pos_row -= (float)active_rows;
 }
 
-/* Rainbow theme: hue tracks the current direction so opposite-flowing
- * particles get complementary colours.  Mono themes keep the spawn-
- * time base unchanged (the per-frame brightness ramp in tracer_paint
- * creates the fade for those). */
+/* In the rainbow theme, colour the tracer by which way it's heading, so
+ * different directions read as different colours.  Other themes leave
+ * the tracer's fixed colour alone. */
 static inline void maybe_recolour_for_rainbow_theme(tracer *t, float angle,
                                                     int theme_index) {
     if (theme_index == 0)
         t->trail_pair_base = hue_pair_for_angle(angle);
 }
 
-/* Age the tracer by one tick; mark dead when the lifetime expires.
- * scene_tick respawns dead tracers via tracer_respawn. */
+/* Count down the tracer's life; mark it dead when it runs out so the
+ * next tick respawns it. */
 static inline void age_tracer_and_check_death(tracer *t) {
     t->ticks_until_respawn--;
     if (t->ticks_until_respawn <= 0)
         t->tracer_alive = false;
 }
 
-/*
- * tracer_advance_one_tick — one Lagrangian-advection step.
- *
- * Pseudocode:
- *   if not alive: skip
- *   push_position_into_trail(t)                        (ring-buffer)
- *   angle = sample_field_at_tracer(t, field)           (bilinear)
- *   step_tracer_along_angle(t, angle)                  (forward Euler)
- *   wrap_position_toroidally(t, cols, rows)            (torus topology)
- *   maybe_recolour_for_rainbow_theme(t, angle, theme)  (theme-aware)
- *   age_tracer_and_check_death(t)                      (lifetime)
- *
- * References [6] Reynolds 1999 and [7] Witkin 1991 for the
- * Lagrangian particle pattern.
- */
 static void tracer_advance_one_tick(tracer *t, const flow_field *f,
                                     int active_cols, int active_rows,
                                     int theme_index) {
@@ -1641,45 +679,39 @@ static void tracer_advance_one_tick(tracer *t, const flow_field *f,
     age_tracer_and_check_death(t);
 }
 
-/* ===================================================================== */
-/* §12  tracer_paint — fading-trail render                               */
-/* ===================================================================== */
-/*
- * Walk the trail ring buffer from OLDEST to NEWEST (so the head
- * draws LAST and wins overlaps).  Pick a glyph based on age and a
- * colour pair that fades from `trail_pair_base` at the head down to
- * pair 1 at the tail tip.  The head gets the directional arrow
- * glyph (T7-T6 connection — visual proof of the angle).
- */
+/* ── §12  tracer_paint — draw one tracer's fading trail ──
+ * Walk the trail from oldest to newest so the head draws last and sits
+ * on top.  Older cells get fainter glyphs and dimmer colours; the head
+ * gets an arrow showing its direction. */
 
 #define TRAIL_RAMP_LEN 5
 static const char trail_ramp_glyph[TRAIL_RAMP_LEN] = {'.', ',', '+', '~', '*'};
 
-/* Direction glyph for the head — picks the same 8-octant arrow as §7. */
+/* The arrow character drawn at the head, picked from the same 8
+ * directions as §7. */
 static char trail_head_glyph_for_angle(float angle_radians) {
   static const char head_dir_glyph[ARROW_TABLE_LEN] = {'-', '/', '|', '\\',
                                                        '-', '/', '|', '\\'};
   return head_dir_glyph[angle_to_octant(angle_radians)];
 }
 
-/* Resolve ring-buffer slot index `i ∈ [0, filled)` to the actual
- * buffer position.  i=0 is the OLDEST slot, i=filled-1 is the NEWEST
- * (current head).  The `+ 2*len` before mod handles negative dividends
- * — C's % returns negative for negative left operands. */
+/* Turn walk-step i (0 = oldest, filled-1 = newest) into the real array
+ * slot.  The `+ 2*len` keeps the index positive before the wrap, since
+ * C's % can return a negative result. */
 static inline int trail_slot_index(const tracer *t, int i,
                                    int filled, int len) {
     return (t->trail_write_index - filled + i + 2 * len) % len;
 }
 
-/* Is this trail slot a position inside the visible field rect? */
+/* Is this trail position still on the visible screen? */
 static inline bool position_in_field(int col, int row,
                                      int active_cols, int active_rows) {
     return col >= 0 && col < active_cols && row >= 0 && row < active_rows;
 }
 
-/* Glyph for trail slot i out of filled.  Head gets the direction arrow
- * (visual proof of last_angle); body uses the age ramp '.,+~' with the
- * brightest glyph reserved for the head. */
+/* Glyph for one trail cell: the head gets its direction arrow, the rest
+ * fade through '.' ',' '+' '~' as they get newer (the brightest '*' is
+ * saved for the head). */
 static inline char pick_trail_glyph(const tracer *t, int i, int filled,
                                     bool is_head) {
     if (is_head)
@@ -1691,9 +723,9 @@ static inline char pick_trail_glyph(const tracer *t, int i, int filled,
     return trail_ramp_glyph[ramp_index];
 }
 
-/* Linear pair-index fade from `trail_pair_base` at the head down to
- * pair 1 at the tail tip.  Used by mono themes; the rainbow theme
- * already shifts the base each frame.  Clamped to [1, HUE_WHEEL_PAIRS]. */
+/* Colour for one trail cell: bright at the head, fading toward the tail.
+ * Mainly for the mono themes — the rainbow theme already recolours the
+ * whole tracer each frame. */
 static inline int pick_trail_pair_fading(const tracer *t, int i, int filled,
                                           bool is_head) {
     int pair;
@@ -1710,7 +742,7 @@ static inline int pick_trail_pair_fading(const tracer *t, int i, int filled,
     return pair;
 }
 
-/* Paint ONE trail cell with the chosen pair + bold-if-head attribute. */
+/* Draw one trail cell, bolding it if it's the head. */
 static inline void paint_trail_cell(WINDOW *win, int row, int col,
                                     char glyph, int pair_id, bool is_head) {
     attr_t a = COLOR_PAIR(pair_id);
@@ -1721,20 +753,6 @@ static inline void paint_trail_cell(WINDOW *win, int row, int col,
     wattroff(win, a);
 }
 
-/*
- * tracer_paint — fading-trail render for one tracer.
- *
- * Pseudocode:
- *   if dead or no trail yet: skip
- *   for i = 0 .. filled-1  (oldest → newest, head LAST so it wins overlap):
- *     slot   = trail_slot_index(t, i, filled, len)
- *     (col, row) = trail buffer[slot]
- *     if not position_in_field(col, row, ...): skip
- *     is_head = (i == filled - 1)
- *     glyph   = pick_trail_glyph(t, i, filled, is_head)
- *     pair    = pick_trail_pair_fading(t, i, filled, is_head)
- *     paint_trail_cell(win, row, col, glyph, pair, is_head)
- */
 static void tracer_paint(const tracer *t, WINDOW *win, int active_cols,
                          int active_rows) {
     if (!t->tracer_alive)             return;
@@ -1759,82 +777,38 @@ static void tracer_paint(const tracer *t, WINDOW *win, int active_cols,
     }
 }
 
-/* ===================================================================== */
-/* §13  scene — pool + field + tick orchestrator                         */
-/* ===================================================================== */
+/* ── §13  scene — holds everything and runs each tick ── */
 
 /*
- * scene_state — the single owner of this demo's live state.
+ * scene_state — all of the demo's live state in one place.
  *
- * Intent
- *   scene_state composes the field (the WHAT — simulation) with the
- *   tracer pool (the WITNESSES — also simulation, since they advect
- *   in the field) and the user's visual choices (theme_index,
- *   show_field_arrows — pure rendering).  The hot path reads from
- *   here every tick; everything else (palette tables, glyph tables,
- *   key bindings) lives at file scope as immutable constants.
+ * It holds the wind, the pool of tracers riding it, and the user's
+ * display choices (theme, whether arrows show, paused).  The fields are
+ * grouped by who uses them so it's clear at a glance whether changing
+ * one affects the simulation or only the picture.  Keeping the display
+ * choices out of the simulation matters: if the tick ever read the
+ * theme, the same noise seed would stop producing the same wind.
  *
- * Locality (sim vs render)
- *   Fields are GROUPED EXPLICITLY so a reader can tell at a glance
- *   which subsystem touches each one:
- *     - scene_tick / tracer_step / field_rebuild reads it
- *                                          → simulation
- *     - scene_paint / hud_draw reads it    → rendering
- *     - both sides bound their loops by it (active_tracer_count,
- *       trail_active_length)               → shared bounds
- *     - paused gates the tick AND drives the HUD "PAUSED" tag
- *                                          → control state
- *
- *   Mis-classifying a field is a real source of bugs: a render-only
- *   value (theme_index, show_field_arrows) accidentally read by the
- *   tick would couple the simulation to a visual choice, breaking
- *   the "same noise seed ⇒ same field" reproducibility we depend on.
- *
- * Why these specific fields and no others
- *   - flow                  the noise-angle grid; largest member.
- *   - pool[]                tracer particles.  Active up to
- *                            active_tracer_count; the rest are unused
- *                            slots kept allocated for SIGWINCH.
- *   - active_tracer_count   user-adjustable via +/-; both tick and
- *                            paint iterate up to this bound.
- *   - trail_active_length   user-adjustable via s/S; affects both
- *                            the ring buffer's effective window (sim)
- *                            AND the fading-trail paint (render).
- *   - theme_index           pure render — palette selector.
- *   - show_field_arrows     pure render — toggles the background
- *                            arrow layer (debug-style visualisation).
- *   - paused                gate for scene_tick + HUD "PAUSED" tag.
- *
- * Things that DO NOT live here
- *   - The Perlin permutation table (§3)       → file-scope, immutable
- *   - The 8-octant arrow glyph table          → file-scope, immutable
- *   - Render-frame timing                     → locals in main()
- *   - Signal flags (SIGINT, SIGWINCH)         → file-scope volatile
- *
- * Reference [10] Raymond, NCURSES HOWTO §11 — the scene-paint
- *   newscr/curscr diff pipeline this struct feeds into.
+ * The tracer pool is sized for the maximum up front and partly used, so
+ * a window resize never has to allocate.
  */
 typedef struct {
-    /* ── Simulation state (read by scene_tick + tracer_step) ────── *
-     * The field plus the tracer particles that move through it.    */
+    /* The simulation itself: the wind, and the tracers moving in it. */
     flow_field flow;
     tracer     pool[TRACERS_MAX];
 
-    /* ── Shared sim+render bounds (read by both subsystems) ─────── *
-     * Both the tick loop (iterating live tracers) and the paint    *
-     * loop (drawing trails) bound their for-loops by these.        *
-     * Adjusted by +/- (tracer count) and s/S (trail length).       */
+    /* How many tracers are live, and how long their trails are.  Both
+     * the tick and the drawing loop over these, and the user changes
+     * them with +/- (count) and s/S (trail length). */
     int active_tracer_count;
     int trail_active_length;
 
-    /* ── Pure render state (read by scene_paint only) ───────────── *
-     * Changing these MUST NOT touch simulation — they only re-pick *
-     * which palette / background layer is drawn.                   */
-    int  theme_index;            /* indexes the palette table        */
-    bool show_field_arrows;      /* draw the underlying arrows?       */
+    /* Display-only choices — changing these must not touch the
+     * simulation, only what gets drawn. */
+    int  theme_index;            /* which palette */
+    bool show_field_arrows;      /* show the wind arrows underneath? */
 
-    /* ── Control state ──────────────────────────────────────────── *
-     * Gates the tick AND drives the HUD "PAUSED" indicator.        */
+    /* Paused freezes the tick and shows "PAUSED" in the HUD. */
     bool paused;
 } scene_state;
 
@@ -1891,10 +865,9 @@ static void scene_tick(scene_state *s, int cols, int rows) {
   }
 }
 
-/* Paint the field-arrow background (only when 'a' is toggled on).
- * Each cell gets its arrow glyph in the rainbow-mapped colour, NOT
- * dimmed (per CLAUDE.md anti-A_DIM rule).  Using a normal-weight
- * arrow keeps it visible without competing with bold tracer heads. */
+/* Draw an arrow in every cell showing the wind there (only when the 'a'
+ * overlay is on).  Arrows are normal weight so they stay visible but
+ * don't fight with the bold tracer heads on top. */
 static void scene_paint_field_arrows(const scene_state *s, WINDOW *win,
                                      int cols, int rows) {
   for (int r = 0; r < rows; r++) {
@@ -1917,9 +890,7 @@ static void scene_paint(const scene_state *s, WINDOW *win, int cols, int rows) {
     tracer_paint(&s->pool[i], win, cols, rows);
 }
 
-/* ===================================================================== */
-/* §14  hud — top status + bottom hint strip (CLAUDE.md spec)            */
-/* ===================================================================== */
+/* ── §14  hud — status line on top, key hints on the bottom ── */
 
 static void hud_paint_status(WINDOW *win, int cols, double fps, int sim_hz,
                              const scene_state *s) {
@@ -1948,9 +919,7 @@ static void hud_paint_hints(WINDOW *win, int rows) {
   wattroff(win, COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §15  screen — ncurses init / cleanup                                  */
-/* ===================================================================== */
+/* ── §15  screen — ncurses setup and teardown ── */
 
 static void screen_init(int theme_index) {
   initscr();
@@ -1965,9 +934,7 @@ static void screen_init(int theme_index) {
 
 static void screen_cleanup(void) { endwin(); }
 
-/* ===================================================================== */
-/* §16  app — main loop + signals + input                                */
-/* ===================================================================== */
+/* ── §16  app — main loop, signals, keyboard ── */
 
 static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
@@ -2061,7 +1028,7 @@ static bool app_handle_key(int key, scene_state *s, int *sim_hz, int cols,
 }
 
 int main(void) {
-  /* Seed PRNG from monotonic time, then build the perlin permutation. */
+  /* Seed randomness from the clock, then build the noise lookup table. */
   srand((unsigned int)clock_now_ns());
   perlin_perm_init();
 
@@ -2079,11 +1046,12 @@ int main(void) {
   getmaxyx(stdscr, rows, cols);
   scene_init(&scene, cols, rows);
 
-  /* Fixed-step accumulator (Glenn Fiedler "Fix Your Timestep!"). */
+  /* Keeps the simulation running at a steady rate no matter how fast we
+   * draw (Glenn Fiedler, "Fix Your Timestep!"). */
   int64_t prev_ns = clock_now_ns();
   int64_t sim_accum_ns = 0;
 
-  /* Sliding-window FPS counter. */
+  /* Counts frames over a short window to show a smooth fps number. */
   int frames_in_window = 0;
   int64_t window_accum_ns = 0;
   double fps_display = 0.0;
@@ -2093,7 +1061,7 @@ int main(void) {
   while (!g_should_quit) {
     int64_t frame_start = clock_now_ns();
 
-    /* Resize handling (signal-driven, processed at frame top). */
+    /* Handle a window resize, flagged by a signal, here at the top. */
     if (g_resize_pending) {
       g_resize_pending = 0;
       endwin();
@@ -2103,13 +1071,14 @@ int main(void) {
       sim_accum_ns = 0;
     }
 
-    /* dt + spiral-of-death guard (cap at 100 ms). */
+    /* Time since last frame, capped so a long stall (e.g. laptop sleep)
+     * can't make the sim try to catch up with a huge burst of ticks. */
     int64_t dt_ns = frame_start - prev_ns;
     prev_ns = frame_start;
     if (dt_ns > 100 * NS_PER_MS)
       dt_ns = 100 * NS_PER_MS;
 
-    /* Drive simulation at fixed sim_hz, regardless of render rate. */
+    /* Run as many fixed-rate sim steps as the elapsed time has earned. */
     int64_t tick_ns = NS_PER_SEC / sim_hz;
     sim_accum_ns += dt_ns;
     while (sim_accum_ns >= tick_ns) {

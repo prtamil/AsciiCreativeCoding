@@ -1,129 +1,14 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * spirograph.c — Spirograph (Hypotrochoid)
+ * spirograph.c — three Spirograph-style curves drawn in colour, each
+ * leaving a glowing trail that slowly fades.  The shapes morph on their
+ * own as a hidden parameter drifts back and forth.
  *
- * Three simultaneous hypotrochoid curves in different colours.  Each curve
- * traces a decaying trail on a per-cell float canvas; the canvas fades each
- * tick so older parts of the curve dim and eventually vanish, letting the
- * current trace shine.  Parameters drift slowly so the pattern evolves.
- *
- * PARAMETRIC FORMULA (hypotrochoid)
- * ───────────────────────────────────
- *   x(t) = (R − r)·cos(t)  +  d·cos((R−r)/r · t)
- *   y(t) = (R − r)·sin(t)  −  d·sin((R−r)/r · t)
- *
- * R = outer radius, r = rolling (inner) radius, d = pen distance from centre.
- * The ratio R/r determines the number of petals; d sets petal size.
- *
- * SLOW DRIFT
- * ──────────
- * r drifts sinusoidally between r_min and r_max at DRIFT_RATE rad/s,
- * gradually shifting between two distinct patterns without any keypress.
- *
- * CANVAS / TRAIL
- * ──────────────
- * float canvas[MAX_ROWS][MAX_COLS]  stores brightness [0,1] per cell.
- * int   cpair[MAX_ROWS][MAX_COLS]   stores the colour pair last written.
- *
- * Each tick:
- *   1. canvas *= FADE  (global brightness decay)
- *   2. For each curve: trace TRACE_STEPS points along the parameter
- *      interval [t, t+DELTA_T) and stamp canvas cells at brightness 1.0.
- *   3. t += DELTA_T.
- *
- * Scale so the largest curve fits within 85% of the shorter screen dimension.
- *
- * Keys:
- *   q/ESC quit   space pause   r reset canvas   ] / [  sim Hz up / down
- *   t / T next / prev theme (10 themes: Sunset, Ocean, Forest, Cyberpunk,
- *                            Pastel, Mono, Fire, Aurora, Royal, Mint)
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra spirograph.c -o spirograph -lncurses -lm
+ * These are hypotrochoids — the curve a pen draws when a small circle
+ * rolls inside a bigger one, exactly like the toothed-gear Spirograph toy.
+ * For the math, see Lawrence, "A Catalog of Special Plane Curves" (1972)
+ * or Maor, "Trigonometric Delights" (1998).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Parametric curve tracing with a float canvas + fade.
- *                  Rather than drawing discrete points, each curve advances
- *                  T_STEPS_PER_FRAME timesteps per tick, writing brightness
- *                  values to a float canvas.  The canvas decays by FADE_RATE
- *                  per tick, creating the fading trail effect.
- *
- * Math           : Hypotrochoid parametric equations:
- *                    x(t) = (R−r)·cos(t) + d·cos((R−r)/r · t)
- *                    y(t) = (R−r)·sin(t) − d·sin((R−r)/r · t)
- *                  The curve closes when (R−r)/r = p/q (rational ratio).
- *                  With p=3, q=1: deltoid (3-cusp astroid).
- *                  Irrational ratios → the curve never closes (dense in annulus).
- *                  Pen distance d controls petal amplitude: d<(R−r) → inside,
- *                  d>(R−r) → outside → loops at each reversal point.
- *
- * Rendering      : Three simultaneous curves with different r values.
- *                  r drifts sinusoidally (DRIFT_RATE), creating continuous
- *                  morphing between distinct petal patterns without keystrokes.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* -- REFERENCES ---------------------------------------------------------  *
- *
- * Roulette curves are an ancient subject -- Albrecht Dürer drew them
- * in 1525, and the modern Spirograph(R) toy (Denys Fisher, 1965) is a
- * gear-driven mechanism for tracing one out by hand.  The math below
- * covers the same family the toy traces: hypotrochoids (point inside
- * a rolling inner circle) and their generalisations.
- *
- * Curve theory & catalogues:
- *   [1] Lawrence, J. D. (1972). "A Catalog of Special Plane Curves."
- *       Dover Publications.
- *       -- the canonical catalogue.  Hypotrochoids, epitrochoids, and
- *          their special cases (deltoid, astroid, cardioid, ...) all
- *          live in a single chapter with parametric forms, closure
- *          criteria, and lobe-count formulae.
- *
- *   [2] Lockwood, E. H. (1961). "A Book of Curves."
- *       Cambridge University Press.
- *       -- didactic introduction; the chapter on roulettes derives the
- *          hypotrochoid equations geometrically (rolling-circle
- *          construction) rather than analytically.  Best entry point
- *          if the formulae feel arbitrary.
- *
- *   [3] Cundy, H. M., & Rollett, A. P. (1961). "Mathematical Models."
- *       Oxford University Press.
- *       -- chapter on epi-/hypotrochoid construction, including
- *          physical-model recipes (the Spirograph toy is essentially
- *          one of these).
- *
- *   [4] Maor, E. (1998). "Trigonometric Delights." Princeton Univ. Press.
- *       -- accessible treatment of the parametric form
- *          x(t) = (R−r)cos t + d cos((R−r)/r · t)
- *          and why the rational R/r criterion closes the curve.
- *
- * Dynamics (slow parameter drift):
- *   [5] Strogatz, S. H. (2015). "Nonlinear Dynamics and Chaos" (2nd ed.).
- *       Westview Press.
- *       -- the slow sinusoidal drift in r is a textbook example of
- *          quasi-periodic motion: a fast oscillator (the curve tracing)
- *          modulated by a slow oscillator (the drift in r).  Strogatz
- *          ch. 8 covers two-frequency systems and the rational/irrational
- *          dichotomy that decides whether the trajectory closes.
- *
- * Rendering:
- *   [6] Foley, van Dam, Feiner, Hughes (1995). "Computer Graphics:
- *       Principles and Practice" (2nd ed. in C), chapter 11.
- *       Addison-Wesley.
- *       -- parametric-curve discretisation.  Our TRACE_STEPS uniform
- *          t-sampling per tick is the simplest version of the textbook
- *          uniform-vs-adaptive trade-off.
- *
- *   [7] Akenine-Möller, T., Haines, E., Hoffman, N., et al. (2018).
- *       "Real-Time Rendering" (4th ed.). CRC Press.
- *       -- §12 covers motion blur and accumulation buffers.  Our
- *          per-tick canvas fade (Trail.brightness *= FADE) is the
- *          ASCII analogue of an exponential-decay accumulation buffer:
- *          each pixel is the geometric series of all past stamps,
- *          weighted by FADE^age.
- *
- * ----------------------------------------------------------------------- */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -140,9 +25,7 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
     SIM_FPS_MIN     = 10,
@@ -155,19 +38,12 @@ enum {
     MAX_ROWS        = 80,
     MAX_COLS        = 240,
 
-    /*
-     * Color-pair allocation:
-     *   1 .. N_CURVES         -- curve colors; the active Theme rewrites
-     *                             these via init_pair() at each theme switch
-     *   N_CURVES+1            -- HUD title / hint  (theme-independent)
-     *   N_CURVES+2            -- HUD data           (theme-independent)
-     */
+    /* Colour pairs 1..N_CURVES are the curve colours (the theme rewrites
+     * them); the two above that are the fixed HUD colours. */
     N_PAIRS         = N_CURVES + 2,
 
-    /* HUD layout — one row reserved at top for data, one at bottom
-     * for action keys.  The drawing area is rows
-     * [HUD_TOP_ROWS, rows - HUD_BOTTOM_ROWS).  Keep both as 1 to
-     * preserve the existing draw budget. */
+    /* One row at the very top and one at the very bottom belong to the
+     * HUD; the curves are drawn in the band between them. */
     HUD_TOP_ROWS    = 1,
     HUD_BOTTOM_ROWS = 1,
 };
@@ -176,76 +52,61 @@ enum {
 #define NS_PER_MS   1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* Pixel cell dimensions */
+/* How many sub-pixels make up one character cell, so the trace can move
+ * smoothly before it snaps to a coarse grid of characters. */
 #define CELL_W   8
 #define CELL_H   16
 
-/*
- * FADE — canvas brightness multiplier per tick.
- * At 60 Hz: 0.985^60 ≈ 0.40 → trail visible for ~1.5 seconds.
- */
+/* Each tick the whole trail dims to 98.5% of its brightness, so a path
+ * stays visible for about a second and a half before fading out. */
 #define FADE        0.985f
 
-/*
- * DELTA_T — parameter advance per tick (radians).
- * TRACE_STEPS sub-samples per tick fill the curve without gaps.
- */
+/* How far along the curve we advance per tick, and how many points we
+ * drop in between so the trace draws as a solid line, not dots. */
 #define DELTA_T     0.08f
 #define TRACE_STEPS 60
 
-/* Slow parameter drift */
-#define DRIFT_RATE  0.04f   /* rad/s — one full drift cycle every ~157 s  */
+/* How fast the hidden parameter drifts; one full sweep takes ~157 s. */
+#define DRIFT_RATE  0.04f
 
-/*
- * Render-frame fitting.
- *
- * The widest preset has R+d ≈ 12.5 (unit scale).  We scale the figure so
- * that bounding radius fits FIT_FRACTION of the SHORTER screen dimension,
- * leaving the rest as margin around the figure.
- */
-#define MAX_CURVE_EXTENT   12.5f   /* R + d of the widest preset (unit space) */
-#define FIT_FRACTION        0.85f  /* fraction of shorter screen dim used    */
+/* The biggest curve reaches about 12.5 units across.  We shrink the
+ * whole figure so it fills 85% of the shorter screen side, leaving a
+ * margin around the edge. */
+#define MAX_CURVE_EXTENT   12.5f
+#define FIT_FRACTION        0.85f
 
-/*
- * Trail brightness mapping.
- *
- *   STAMP_BRIGHTNESS  -- value written when a pen samples a cell
- *   TRAIL_VISIBLE_MIN -- below this, the renderer skips the cell
- *   BRIGHT_THRESHOLD  -- above this, the cell is painted A_BOLD
- *   DIM_THRESHOLD     -- below this (but above visible), painted A_DIM
- *   N_GLYPHS          -- intensity-glyph table size (" .,:+*#@")
- */
+/* Brightness used when a pen touches a cell, the cutoff below which a
+ * cell is too faint to draw, the two thresholds that pick bold vs dim,
+ * and the size of the " .,:+*#@" character ramp. */
 #define STAMP_BRIGHTNESS    1.0f
 #define TRAIL_VISIBLE_MIN   0.04f
 #define BRIGHT_THRESHOLD    0.7f
 #define DIM_THRESHOLD       0.25f
 #define N_GLYPHS            8
 
-/* Effective rolling-radius clamp: keep (R-r)/r finite when r_amp drives
- * r_actual close to zero.  Anything below R_ACTUAL_MIN gets clipped to it. */
+/* Never let the rolling radius shrink past this — keeps the (R-r)/r
+ * ratio from blowing up when drift pushes r toward zero. */
 #define R_ACTUAL_MIN        0.5f
 
-/* Frame pacing (§8 main loop). */
-#define DT_CAP_NS           (100 * NS_PER_MS)    /* spiral-of-death guard */
-#define FRAME_PERIOD_NS     (NS_PER_SEC / 60)    /* 60 Hz render cadence  */
+/* If one frame takes an unusually long time (debugger, laptop sleep),
+ * pretend it was at most 100 ms so we don't fire a burst of catch-up
+ * ticks.  Screen redraws aim for 60 a second. */
+#define DT_CAP_NS           (100 * NS_PER_MS)
+#define FRAME_PERIOD_NS     (NS_PER_SEC / 60)
 
-/* Input. */
 #define KEY_ESC             27
 
-/* HUD layout & colour-pair semantics.
- *
- * Pairs 1..N_CURVES carry curve colours and are rewritten by theme_apply;
- * pairs N_CURVES+1 and N_CURVES+2 are theme-independent HUD slots. */
-#define HUD_DATA_COL        16              /* column where data segment starts */
-#define HUD_PAIR_TITLE      (N_CURVES + 1)  /* bright cyan + A_BOLD             */
-#define HUD_PAIR_DATA       (N_CURVES + 2)  /* bright yellow + A_BOLD           */
-#define HUD_PAIR_HINT       HUD_PAIR_TITLE  /* action bar reuses title pair     */
-#define FALLBACK_PAIR       1               /* recover to curve-0 pair if a
-                                               trail cell holds a bad index    */
+/* Where the HUD's middle text starts, and the fixed cyan/yellow HUD
+ * colour pairs (these sit above the curve pairs so the theme never
+ * touches them). */
+#define HUD_DATA_COL        16
+#define HUD_PAIR_TITLE      (N_CURVES + 1)
+#define HUD_PAIR_DATA       (N_CURVES + 2)
+#define HUD_PAIR_HINT       HUD_PAIR_TITLE
+#define FALLBACK_PAIR       1               /* used if a trail cell ever
+                                               holds a bad colour index */
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -264,27 +125,19 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color ── */
 
 /*
- * Theme -- a named palette of N_CURVES colours.
+ * Theme — a named set of three curve colours.  Pressing 't' loads the
+ * theme's colours into ncurses pairs 1..N_CURVES.  Each curve keeps the
+ * same pair number, so only the colours behind those numbers change —
+ * which means trail cells already on screen instantly switch colour with
+ * no need to redraw or clear anything.
  *
- * On theme switch (the 't' key) the active theme's colours[] are loaded
- * into ncurses pairs 1..N_CURVES via init_pair().  Curve.pair indices
- * stay constant; only the underlying ANSI colour codes change.  This
- * means EXISTING trail cells automatically pick up the new colours --
- * no trail clear needed.  Theme switching becomes a one-pass palette
- * swap, not a redraw.
- *
- * Storage:
- *   colors_256[]  -- 256-colour ANSI codes (preferred when COLORS >= 256)
- *   colors_8[]    -- 8-colour fallback (COLOR_RED, COLOR_CYAN, ...)
- * Both are N_CURVES long; one entry per curve.
- *
- * Reference: Foley/van Dam [6] §13 on indexed-colour LUTs -- theme_apply
- * is the LUT swap, the Trail is the indexed-colour framebuffer.
+ *   name        the label shown in the HUD
+ *   colors_256  the colours to use on a 256-colour terminal (preferred)
+ *   colors_8    plain-colour fallback for old 8-colour terminals
+ * Both colour arrays hold one entry per curve.
  */
 typedef struct {
     const char *name;
@@ -293,7 +146,6 @@ typedef struct {
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
-    /*  name            256-colour codes              8-colour fallback                              */
     { "Sunset",       { 196, 208, 226 }, { COLOR_RED,     COLOR_YELLOW,  COLOR_YELLOW  } },
     { "Ocean",        {  21,  51,  87 }, { COLOR_BLUE,    COLOR_CYAN,    COLOR_CYAN    } },
     { "Forest",       {  22,  46, 154 }, { COLOR_GREEN,   COLOR_GREEN,   COLOR_GREEN   } },
@@ -306,15 +158,12 @@ static const Theme k_themes[N_THEMES] = {
     { "Mint",         {  23, 121, 195 }, { COLOR_CYAN,    COLOR_CYAN,    COLOR_CYAN    } },
 };
 
-/* Wrap a theme index back into [0, N_THEMES). */
+/* Step to the next / previous theme, wrapping around the ends. */
 static inline int theme_next(int cur) { return (cur + 1) % N_THEMES; }
 static inline int theme_prev(int cur) { return (cur + N_THEMES - 1) % N_THEMES; }
 
-/*
- * theme_apply -- rewrite ncurses pairs 1..N_CURVES with the chosen
- * theme's palette.  The HUD pairs are untouched (they live above
- * N_CURVES) so the HUD's cyan/yellow stay constant across themes.
- */
+/* Recolour the three curve pairs from the chosen theme.  Leaves the HUD
+ * pairs alone so the HUD's colours stay the same no matter the theme. */
 static void theme_apply(int theme_idx)
 {
     const Theme *t = &k_themes[theme_idx];
@@ -327,12 +176,8 @@ static void theme_apply(int theme_idx)
     }
 }
 
-/*
- * color_init -- one-time palette setup.
- *
- *   1. HUD pairs (theme-independent) get their fixed yellow/cyan colours.
- *   2. theme_apply(0) installs the default theme's curve palette.
- */
+/* Set up colour once at startup: the fixed HUD colours, then the first
+ * theme's curve colours. */
 static void color_init(void)
 {
     start_color();
@@ -349,47 +194,30 @@ static void color_init(void)
     theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  coords — pixel ↔ cell                                              */
-/* ===================================================================== */
+/* ── §4 coords: pixel ↔ cell ── */
 
 static inline int px_to_col(float px) { return (int)floorf(px / CELL_W + 0.5f); }
 static inline int px_to_row(float py) { return (int)floorf(py / CELL_H + 0.5f); }
 
 /*
- * RenderFrame -- per-frame derived render geometry.
+ * RenderFrame — where to put the figure on screen this frame.
  *
- * Holds the figure center in PIXEL space (sub-cell precision: one
- * pixel = 1/CELL_W of a column or 1/CELL_H of a row) and the unit→pixel
- * scale factor that fits MAX_CURVE_EXTENT within FIT_FRACTION of the
- * shorter screen dimension.
+ * The curve is computed in continuous "unit" space, but the screen is a
+ * coarse grid of characters.  We work in fine sub-pixels first (CELL_W ×
+ * CELL_H of them per character) and only snap to a character at the very
+ * end, so the line stays smooth instead of jumping in stair-steps.
  *
- * WHY pixel space (and not directly cell space):
- *   The curve trace lives in CONTINUOUS unit space; cells are integer
- *   grid positions.  Working in pixel space gives CELL_W × CELL_H
- *   sub-cell positional precision before the snap to integer cells
- *   (px_to_col / px_to_row in §4).  Without that intermediate
- *   precision, two close samples could collide at the same cell, the
- *   trail would lose fine motion, and small pen movements would
- *   appear as staircase steps.  See Foley/van Dam [6] §11 on
- *   parametric-curve discretisation precision.
+ * We rebuild this every frame from the current width and height rather
+ * than storing it, so a terminal resize can never leave it pointing at
+ * the old size.  The few sums it takes are nothing.
  *
- * WHY computed fresh each frame and NOT cached on Scene:
- *   Every field is a pure function of (cols, rows).  Caching on Scene
- *   would create a stale-value risk: a SIGWINCH between cache-write
- *   and frame-read would leave RenderFrame pointing at the old
- *   viewport.  Pure recomputation costs ~5 FLOPs/frame -- imperceptible.
- *
- * Fields:
- *   cx_px   = (cols·CELL_W)/2  -- figure center column in pixels
- *   cy_px   = (rows·CELL_H)/2  -- figure center row    in pixels
- *   scale   = shorter_px · FIT_FRACTION/2 / MAX_CURVE_EXTENT
- *             one unit in physics space becomes `scale` pixels on screen
+ *   cx_px, cy_px  the middle of the screen, in sub-pixels
+ *   scale         how many sub-pixels one curve unit becomes on screen
  */
 typedef struct {
-    float cx_px;    /* figure center X in pixel coords */
-    float cy_px;    /* figure center Y in pixel coords */
-    float scale;    /* unit→pixel scale factor          */
+    float cx_px;
+    float cy_px;
+    float scale;
 } RenderFrame;
 
 static RenderFrame render_frame_make(int cols, int rows)
@@ -405,127 +233,72 @@ static RenderFrame render_frame_make(int cols, int rows)
     };
 }
 
-/* ===================================================================== */
-/* §5  entity — Curve, Spirograph                                         */
-/* ===================================================================== */
+/* ── §5 entity: Curve, Spirograph ── */
 
 /*
- * Curve -- the live state of one rolling hypotrochoid "pen".
+ * Curve — one rolling "pen" and where it is right now.
  *
- * Physical picture:
- *   A small circle of radius r rolls without slipping INSIDE a large
- *   host circle of radius R.  A pen is rigidly attached to the small
- *   circle at distance d from its centre.  The pen traces a hypotrochoid.
- *     d < R-r   the pen stays inside the host circle (rosette curves)
- *     d > R-r   the pen swings outside the rolling center, looping at
- *               each reversal point (looped curves)
- *   See Lockwood [2] for the geometric rolling-circle derivation.
+ * Picture a small circle of radius r rolling around the inside of a big
+ * circle of radius R, with a pen stuck to the small circle a distance d
+ * from its centre.  As the small circle rolls, the pen draws the curve.
+ * If d is small the pen stays inside and draws a flower-like rosette; if
+ * d is large the pen swings wide and the curve makes little loops.  How
+ * many petals you get comes from the R-to-r ratio; see Lawrence (1972).
  *
- * Parametric form (also in CONCEPTS at top of file; Maor [4]):
- *     x(t) = (R-r) cos t + d cos((R-r)/r · t)
- *     y(t) = (R-r) sin t - d sin((R-r)/r · t)
- *   The curve CLOSES iff (R-r)/r is rational.  Lobe count for the
- *   reduced ratio p/q is p (Lawrence [1] §hypotrochoid).
+ * The trick that makes the shape morph on its own: r isn't fixed.  It
+ * gently oscillates around r_base by up to r_amp as `drift` advances,
+ * so the petal count slides smoothly between whole numbers with no
+ * keypress involved.
  *
- * Drift modulation of r:
- *     r_actual = r_base + r_amp · sin(drift)
- *   so as `drift` slowly advances (DRIFT_RATE rad/s) the effective r
- *   sweeps a band [r_base - r_amp, r_base + r_amp], and the curve
- *   morphs smoothly between adjacent integer lobe counts.  No keypress,
- *   no discontinuity -- this is the slow modulator in a two-frequency
- *   quasi-periodic system (Strogatz [5] §8).
- *
- * WHY one struct (not three: params + state + style):
- *   Every field describes the same physical pen.  They all travel
- *   together through the simulation -- one Curve per slot in
- *   Spirograph.curves[].  Splitting would require parallel arrays and
- *   index management for no clarity gain.
- *
- * Fields (range / unit / mutator):
- *   R         (0, ∞)  unit       outer host-circle radius   -- const after init
- *   r_base    (0, R)  unit       mean rolling-circle radius -- const after init
- *   r_amp     [0, R)  unit       drift amplitude of r       -- const after init
- *   d         (0, ∞)  unit       pen offset from small-circle centre
- *                                                            -- const after init
- *   t         free    rad        current parameter value    -- advances DELTA_T/tick
- *   drift     free    rad        slow modulator of r_actual -- advances DRIFT_RATE·dt
- *   pair      [1, N_COLORS]      ncurses colour pair index  -- const after init
+ * All values are in curve "units" (the scale-to-screen happens later).
+ *   R       radius of the big outer circle              (set once)
+ *   r_base  the average radius of the small circle      (set once)
+ *   r_amp   how far r swings above and below r_base      (set once)
+ *   d       how far the pen sits from the small centre   (set once)
+ *   t       how far along the curve we've drawn          (grows each tick)
+ *   drift   the slow phase that wobbles r                (grows each tick)
+ *   pair    which colour this curve draws in             (set once)
  */
 typedef struct {
-    float R;        /* outer radius (unit scale)                          */
-    float r_base;   /* inner radius base (unit scale)                     */
-    float r_amp;    /* drift amplitude for r                              */
-    float d;        /* pen offset (unit scale)                            */
-    float t;        /* current parameter value (radians)                  */
-    float drift;    /* drift phase (radians), advances by DRIFT_RATE·dt   */
-    int   pair;     /* ncurses colour pair                                */
+    float R;
+    float r_base;
+    float r_amp;
+    float d;
+    float t;
+    float drift;
+    int   pair;
 } Curve;
 
 /*
- * CurvePreset -- a hardcoded, named hypotrochoid recipe.
+ * CurvePreset — the starting recipe for one curve, fixed and never
+ * changed.  The three presets seed the demo at startup and again when
+ * the user presses 'r'.  Kept as its own const type, separate from the
+ * live Curve, so the compiler stops anything from accidentally writing
+ * to a preset (a Curve, by contrast, changes every tick).
  *
- * Three of these populate the demo at startup and on user 'r' reset
- * (see spirograph_reset_curves).  The R/r_base ratio determines the
- * DOMINANT lobe count when r_actual ≈ r_base (Lawrence [1] lobe
- * formula); the drift modulation means r is rarely exactly r_base,
- * so the visible figure interpolates between adjacent integer cases.
- *
- * WHY a separate "preset" type, distinct from Curve:
- *   1. Const correctness.  k_presets[] is const-static; CurvePreset
- *      can be passed as `const CurvePreset *` and the compiler enforces
- *      that nothing mutates a preset.  Curve, by contrast, IS mutable
- *      (t and drift advance every tick).  Two types make this static-
- *      vs-dynamic split explicit.
- *
- *   2. Index stability.  Presets stay in fixed positions in k_presets[];
- *      adding a new preset doesn't shuffle indices in surprising ways
- *      because each entry is independently named.
- *
- *   3. Documentation surface.  The `name` field carries the human label
- *      ("Pentagon", "Heptagon", "Triangle") for HUD use; embedding it
- *      in the preset keeps name in sync with parameters automatically.
- *
- * Fields:
- *   R           (0, ∞)   outer-circle radius (unit space)
- *   r_base      (0, R)   mean inner-circle radius
- *   r_amp       [0, R)   drift amplitude (∆r above/below r_base)
- *   d           (0, ∞)   pen offset from small-circle centre
- *   t0          free     initial parameter value
- *                        Staggered by 2π/3 across the three presets so
- *                        the curves don't start at the same point.
- *   drift0      free     initial drift phase
- *                        Staggered by 1 rad so the three curves fall
- *                        in/out of "interesting" r_actual values at
- *                        different times -- the user never sees all
- *                        three pause-and-morph simultaneously.
- *   color_pair  [1,N_COLORS]  ncurses pair (matches §3 color_init)
- *   name        non-null      shape family ("Pentagon", "Heptagon", ...)
+ *   R, r_base, r_amp, d  the curve's geometry (see Curve above)
+ *   t0      where this curve starts drawing — staggered across the three
+ *           so they don't all begin at the same point
+ *   drift0  starting drift phase — staggered so they morph at different
+ *           times and you never see all three stall at once
+ *   color_pair  which colour pair this curve uses
+ *   name        a label for the HUD ("Pentagon", "Heptagon", ...)
  */
 typedef struct {
-    float       R;          /* outer radius (unit scale) */
-    float       r_base;     /* inner radius base */
-    float       r_amp;      /* drift amplitude for r */
-    float       d;          /* pen offset (unit scale) */
-    float       t0;         /* initial parameter value */
-    float       drift0;     /* initial drift phase */
-    int         color_pair; /* ncurses colour pair */
-    const char *name;       /* human-readable family ("Pentagon", ...) */
+    float       R;
+    float       r_base;
+    float       r_amp;
+    float       d;
+    float       t0;
+    float       drift0;
+    int         color_pair;
+    const char *name;
 } CurvePreset;
 
-/*
- * The three presets.  t0 is staggered by 2π/3 so curves don't overlap
- * exactly at frame 1; drift0 is staggered by 1 rad so they fall in and
- * out of "interesting" r_actual values at different times.
- *
- *   R   r_base  r_amp     d    t0                      drift0  pair  shape
- */
-/*
- * Curve-to-pair assignment: curve i uses ncurses pair (i+1).  Pair
- * indices stay constant; theme_apply rewrites the underlying colours.
- * (Old layout used pairs 5/7/3 from a fixed 7-colour palette; the
- * themed layout collapses curve pairs into 1..N_CURVES so theme_apply
- * has a contiguous range to rewrite.)
- */
+/* The three starting curves.  Columns, in order:
+ *   R   r_base  r_amp   d   t0   drift0  colour-pair  name
+ * Curve i gets colour pair i+1; t0 and drift0 are staggered so the
+ * three never line up. */
 static const CurvePreset k_presets[N_CURVES] = {
     {  5.0f,  3.0f,  0.8f,  5.5f,  0.0f,                     0.0f,    1,  "Pentagon" },
     {  7.0f,  2.0f,  0.6f,  7.0f,  2.0f*(float)M_PI/3.0f,    1.0f,    2,  "Heptagon" },
@@ -543,82 +316,44 @@ static Curve curve_from_preset(const CurvePreset *p)
 }
 
 /*
- * Trail -- the fading float canvas where past curve samples accumulate.
+ * Trail — the screen's memory of where the pens have been, so each curve
+ * looks like a glowing path that fades behind the pen instead of three
+ * bare moving dots.  Every tick we dim the whole thing a little, then
+ * stamp the cells the pens just touched back to full brightness.  A cell
+ * too faint to matter is skipped when drawing, which is what gives the
+ * trail its limited length.
  *
- * WHY this exists (the visual effect):
- *   Without a trail, only the instantaneous pen positions would be
- *   visible -- three moving dots.  The Trail integrates samples over
- *   time, so each curve becomes a glowing path that fades behind the
- *   pen.  Each tick:
- *     1.  brightness[r][c] *= FADE                       (fade everything)
- *     2.  for each new sample at (r,c):
- *           brightness[r][c]  = 1.0                      (stamp full)
- *           color_pair[r][c]  = current pen
- *   The visible cell value is the geometric series over all past stamps
- *   weighted by FADE^age -- the ASCII analogue of an exponential-decay
- *   accumulation buffer in real-time graphics (Akenine-Möller [7] §12
- *   on motion blur).  Cells below TRAIL_VISIBLE_MIN are skipped by
- *   the renderer, so the trail has a finite effective length.
+ * Brightness and colour are kept in two separate grids rather than one
+ * grid of pairs: the dimming pass only walks the brightness grid, and a
+ * tight sweep over one plain array is faster than skipping through a
+ * mixed struct.  Both grids are a fixed max size so we never allocate
+ * memory while running; the drawing only ever uses the part that fits
+ * the real terminal.
  *
- * WHY parallel arrays (brightness + color_pair) instead of one
- * per-cell struct:
- *   The fade pass touches only brightness[][] for the whole grid;
- *   keeping it in a separate flat array means the fade loop scans
- *   memory sequentially and is friendly to the prefetcher.  A struct
- *   of {float, int} per cell would interleave the two channels, hurt
- *   that locality, and waste alignment padding.
- *
- * Fixed-size storage:
- *   MAX_ROWS × MAX_COLS so allocation is static -- no malloc in the
- *   hot path (CLAUDE.md rule).  The renderer clips to the live
- *   (rows, cols); cells beyond those bounds are simply unused.
- *
- * Fields:
- *   brightness   [0, 1]            visible glow per cell (float for the
- *                                  smooth-decay multiplication)
- *   color_pair   [1, N_COLORS]     which curve's pen last stamped this
- *                                  cell; "last write wins" gives the
- *                                  overlapping-curves blending effect
+ *   brightness  how bright each cell glows, 0 to 1
+ *   color_pair  the colour of the last pen to touch each cell — last one
+ *               to write wins, which is how overlapping curves blend
  */
 typedef struct {
-    float brightness[MAX_ROWS][MAX_COLS];  /* per-cell brightness, 0..1   */
-    int   color_pair[MAX_ROWS][MAX_COLS];  /* per-cell ncurses pair       */
+    float brightness[MAX_ROWS][MAX_COLS];
+    int   color_pair[MAX_ROWS][MAX_COLS];
 } Trail;
 
 /*
- * Spirograph -- the full simulation state: N_CURVES rolling pens
- * painting onto a shared Trail.
+ * Spirograph — the whole simulation: the three rolling pens and the one
+ * trail they all paint onto.  Everything else in the file is either the
+ * HUD or the run-loop plumbing around this.
  *
- * Mental model:
- *   N_CURVES "pens" (Curve entries) are rolling around the screen at
- *   different speeds and radii; the canvas (Trail) remembers where
- *   they've been, fading each tick.  This is the entire simulation;
- *   everything else in the file is either chrome (HUD, Screen) or
- *   plumbing (App, signal handlers).
+ * They share a single trail on purpose — the curves drawing over each
+ * other is the whole point, and one shared trail makes the overlap blend
+ * for free (last pen to touch a cell wins its colour).
  *
- * WHY one shared Trail (not one Trail per Curve):
- *   The visual effect IS the overlap.  Curves stamping over each
- *   other create the layered multi-colour petals.  With one Trail
- *   per Curve the renderer would have to composite N_CURVES grids
- *   per frame and pick a blending rule; with a single shared Trail
- *   the rule "most recent stamp wins" is free -- it falls out of the
- *   last-write-into-color_pair[r][c] semantic.
- *
- * WHY 'paused' lives here (not on Scene):
- *   paused is a property of THIS simulation, not of "Scene" in the
- *   abstract.  scene_tick delegates to spirograph_tick, which checks
- *   sg->paused at its entry.  If a future Scene variant adds a
- *   different simulation, that simulation gets its own paused flag.
- *
- * Fields:
- *   trail      fading canvas of past pen positions (visual memory)
- *   curves     the N_CURVES rolling-pen state vectors
- *   theme_idx  active row of k_themes[]; cycled by the 't' key.  Only
- *              affects the underlying colours of ncurses pairs
- *              1..N_CURVES via theme_apply -- no simulation impact.
- *   paused     freezes scene_tick; rendering still runs so the figure
- *              stays on screen and the user can still change params
- *              while frozen (SPACE key toggles)
+ *   trail      the fading memory of past pen positions
+ *   curves     the three rolling pens
+ *   theme_idx  which colour theme is active; 't' cycles it.  Only changes
+ *              colours, never the motion
+ *   paused     freezes the motion but keeps drawing, so the figure stays
+ *              up and you can still recolour while it's frozen (SPACE)
  */
 typedef struct {
     Trail trail;
@@ -645,26 +380,18 @@ static void spirograph_clear_trail(Spirograph *sg)
     memset(&sg->trail, 0, sizeof sg->trail);
 }
 
-/* ---- curve math + state helpers ------------------------------------- */
+/* ── curve math + state helpers ── */
 
-/*
- * Effective rolling radius after drift modulation, clamped at
- * R_ACTUAL_MIN so (R-r)/r stays finite.
- *
- *     r_actual = max(r_base + r_amp · sin(drift), R_ACTUAL_MIN)
- */
+/* The small circle's radius right now, after the drift wobble — kept at
+ * or above a floor so the curve math can't divide by something tiny. */
 static float curve_r_actual(const Curve *cv)
 {
     float r = cv->r_base + cv->r_amp * sinf(cv->drift);
     return (r < R_ACTUAL_MIN) ? R_ACTUAL_MIN : r;
 }
 
-/*
- * Hypotrochoid parametric position (unit space):
- *     x = (R-r) cos t + d cos((R-r)/r · t)
- *     y = (R-r) sin t - d sin((R-r)/r · t)
- * Inputs are pre-computed: Rmr = R - r, ratio = (R-r)/r.
- */
+/* The hypotrochoid formula: where the pen is at parameter t.  Rmr (= R-r)
+ * and ratio (= (R-r)/r) are passed in already worked out. */
 static void hypotrochoid_xy(float Rmr, float ratio, float d, float t,
                             float *x, float *y)
 {
@@ -672,16 +399,17 @@ static void hypotrochoid_xy(float Rmr, float ratio, float d, float t,
     *y = Rmr * sinf(t) - d * sinf(ratio * t);
 }
 
-/* Advance a curve's parametric time and drift by one tick. */
+/* Move one curve forward by a tick — a bit further along the curve, and
+ * a nudge of drift. */
 static inline void curve_advance(Curve *cv, float dt)
 {
     cv->t     += DELTA_T;
     cv->drift += DRIFT_RATE * dt;
 }
 
-/* ---- trail helpers --------------------------------------------------- */
+/* ── trail helpers ── */
 
-/* Multiply every cell's brightness by FADE.  Clipped to live bounds. */
+/* Dim every cell a notch so older parts of the trail fade away. */
 static void trail_fade(Trail *trail, int rows, int cols)
 {
     int row_end = (rows < MAX_ROWS) ? rows : MAX_ROWS;
@@ -691,15 +419,15 @@ static void trail_fade(Trail *trail, int rows, int cols)
             trail->brightness[r][c] *= FADE;
 }
 
-/* Stamp one cell at full brightness with the given colour pair. */
+/* Light one cell up fully in a curve's colour. */
 static inline void trail_stamp(Trail *trail, int row, int col, int pair)
 {
     trail->brightness[row][col] = STAMP_BRIGHTNESS;
     trail->color_pair[row][col] = pair;
 }
 
-/* True iff (row, col) is inside the drawing band: clear of both HUD
- * bands and within the static MAX_ROWS/MAX_COLS storage bounds. */
+/* Is this cell in the drawable area — past the HUD rows and inside the
+ * grid we have storage for? */
 static inline bool trail_in_band(int row, int col, int rows, int cols)
 {
     if (col < 0 || col >= cols || col >= MAX_COLS) return false;
@@ -708,23 +436,15 @@ static inline bool trail_in_band(int row, int col, int rows, int cols)
     return true;
 }
 
-/*
- * Trace one curve for DELTA_T worth of parametric time, stamping
- * TRACE_STEPS intermediate samples onto the trail.
- *
- * Reads as pseudocode:
- *   compute r_actual, Rmr, ratio for this tick
- *   for each sub-step:
- *       evaluate hypotrochoid (x, y)
- *       project to pixel space via RenderFrame
- *       snap to cell; clip to drawing band; stamp trail
- */
+/* Draw a short stretch of one curve this tick: step along it many small
+ * steps, work out the pen position at each, place it on screen, and stamp
+ * the cell.  The many sub-steps keep the line solid instead of dotted. */
 static void curve_trace(Curve *cv, Trail *trail,
                         const RenderFrame *rf, int rows, int cols)
 {
     float r_actual = curve_r_actual(cv);
-    float Rmr      = cv->R - r_actual;          /* R - r       */
-    float ratio    = Rmr / r_actual;            /* (R-r)/r     */
+    float Rmr      = cv->R - r_actual;
+    float ratio    = Rmr / r_actual;
 
     float sub_dt = DELTA_T / (float)TRACE_STEPS;
     for (int step = 0; step < TRACE_STEPS; step++) {
@@ -743,15 +463,8 @@ static void curve_trace(Curve *cv, Trail *trail,
     }
 }
 
-/*
- * spirograph_tick -- advance one simulation step.
- *
- * Reads as pseudocode:
- *   if paused: do nothing
- *   else:
- *       1. fade the trail uniformly
- *       2. for each curve: trace it onto the trail, then advance its state
- */
+/* One step of the simulation: fade the trail, then draw and move each
+ * curve.  Does nothing while paused. */
 static void spirograph_tick(Spirograph *sg, float dt, int cols, int rows)
 {
     if (sg->paused) return;
@@ -767,9 +480,10 @@ static void spirograph_tick(Spirograph *sg, float dt, int cols, int rows)
     }
 }
 
-/* ---- trail-cell rendering ------------------------------------------- */
+/* ── drawing the trail ── */
 
-/* Map brightness [0, 1] to glyph index in the " .,:+*#@" ramp. */
+/* Pick the character for a brightness: brighter cells get a denser glyph
+ * from the " .,:+*#@" ramp. */
 static inline int brightness_to_glyph_idx(float b)
 {
     int idx = (int)(b * (float)(N_GLYPHS - 1));
@@ -778,11 +492,8 @@ static inline int brightness_to_glyph_idx(float b)
     return idx;
 }
 
-/* Choose ncurses attribute by brightness tier.
- *   above BRIGHT_THRESHOLD  -> A_BOLD  (fresh stamp)
- *   below DIM_THRESHOLD     -> A_DIM   (old, fading)
- *   in between              -> plain
- */
+/* Make the brightest cells bold and the faintest dim, for extra contrast
+ * between fresh and fading trail. */
 static inline chtype brightness_to_attr(float b)
 {
     if (b > BRIGHT_THRESHOLD) return A_BOLD;
@@ -790,16 +501,14 @@ static inline chtype brightness_to_attr(float b)
     return 0;
 }
 
-/* Recover from an unset / out-of-range colour pair on a Trail cell.
- * Valid pair indices for trail cells are 1..N_CURVES (curves only --
- * HUD pairs never appear in Trail.color_pair).  (Defensive: should
- * never trigger for normal operation, but cheap.) */
+/* Guard against a stray colour index — only curve colours (1..N_CURVES)
+ * belong in the trail.  Shouldn't happen, but it's cheap insurance. */
 static inline int sanitize_pair(int p)
 {
     return (p < 1 || p > N_CURVES) ? FALLBACK_PAIR : p;
 }
 
-/* Paint one Trail cell if it crosses the visibility threshold. */
+/* Draw one trail cell, unless it's too faint to bother with. */
 static void render_trail_cell(WINDOW *w, const Trail *trail, int row, int col)
 {
     static const char GLYPHS[N_GLYPHS] = " .,:+*#@";
@@ -815,13 +524,8 @@ static void render_trail_cell(WINDOW *w, const Trail *trail, int row, int col)
     wattroff(w, COLOR_PAIR(pair) | attr);
 }
 
-/*
- * spirograph_draw -- paint the visible portion of the trail.
- *
- * Iterates the drawable band ([HUD_TOP_ROWS, rows - HUD_BOTTOM_ROWS) ×
- * [0, cols)) clipped to MAX_ROWS / MAX_COLS storage.  Each cell decides
- * its own glyph + attribute via render_trail_cell.
- */
+/* Draw the whole trail, cell by cell, across the band between the two
+ * HUD rows. */
 static void spirograph_draw(const Spirograph *sg, WINDOW *w, int cols, int rows)
 {
     int row_end = rows - HUD_BOTTOM_ROWS;
@@ -833,28 +537,11 @@ static void spirograph_draw(const Spirograph *sg, WINDOW *w, int cols, int rows)
             render_trail_cell(w, &sg->trail, row, col);
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6 scene ── */
 
-/*
- * Scene -- the abstract "what's on screen this frame" container.
- *
- * Currently a thin wrapper around a single Spirograph simulation.
- *
- * WHY the wrapper at all (when it's one field deep):
- *   The App layer composes Scene + Screen + signal flags into the
- *   top-level App struct.  Holding a Scene type (rather than putting
- *   Spirograph directly on App) means an alternative simulation --
- *   say, a Lissajous demo or a Maurer-rose variant -- can slot into
- *   the same App composition without changes propagating outward.
- *   The cost is one extra `.sg.` in field accesses; the win is a
- *   clean App/Scene/Spirograph layering that mirrors the §6/§5
- *   section split.
- *
- * Fields:
- *   sg   the Spirograph simulation (this file's only "scene")
- */
+/* Scene — a thin wrapper holding whatever is on screen.  It's just the
+ * one Spirograph here; the wrapper exists so a different demo could drop
+ * into the same app without touching the run loop. */
 typedef struct {
     Spirograph sg;
 } Scene;
@@ -878,36 +565,18 @@ static void scene_draw(const Scene *s, WINDOW *w,
     spirograph_draw(&s->sg, w, cols, rows);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen ── */
 
-/*
- * Screen -- cached terminal geometry.
+/* Screen — the terminal's current size, remembered so the drawing code
+ * can take plain row/col numbers and stay clear of ncurses.  Only filled
+ * in at startup and again after a resize.
  *
- * WHY cache cols/rows on a struct instead of calling getmaxyx() everywhere:
- *   getmaxyx is cheap but not free, and -- more importantly -- many
- *   functions in the render layer take rows/cols as plain ints.
- *   Passing a Screen* would conflate "I need the size" with "I need
- *   to talk to ncurses".  Holding size as a value lets the math layer
- *   stay terminal-agnostic; only screen_init / the SIGWINCH resize
- *   path in main() ever write into Screen.
- *
- * Update points:
- *   screen_init   -- once at startup
- *   resize path   -- after a SIGWINCH (terminal resized)
- *
- * Fields follow the ncurses convention:
- *   cols   X-extent in character cells
- *   rows   Y-extent in character cells
- * Both are 1-based counts, so valid coordinates are
- *    [0, cols-1] × [0, rows-1].
- * The HUD bands reserve HUD_TOP_ROWS at the top and HUD_BOTTOM_ROWS at
- * the bottom; the trail renderer must stay inside the middle band.
+ *   cols  width in characters
+ *   rows  height in characters
  */
 typedef struct {
-    int cols;   /* terminal width  in character cells */
-    int rows;   /* terminal height in character cells */
+    int cols;
+    int rows;
 } Screen;
 
 static void screen_init(Screen *s)
@@ -920,9 +589,9 @@ static void screen_init(Screen *s)
 
 static void screen_free(Screen *s) { (void)s; endwin(); }
 
-/* ---- HUD row helpers ------------------------------------------------- */
+/* ── HUD pieces ── */
 
-/* Row 0 left -- the title block. */
+/* Top-left title. */
 static void hud_draw_title(void)
 {
     attron(COLOR_PAIR(HUD_PAIR_TITLE) | A_BOLD);
@@ -930,7 +599,7 @@ static void hud_draw_title(void)
     attroff(COLOR_PAIR(HUD_PAIR_TITLE) | A_BOLD);
 }
 
-/* Row 0 middle -- live rolling-radius values + active theme name. */
+/* Top-middle: the active theme name and the three curves' live radii. */
 static void hud_draw_curve_radii(const Spirograph *sg)
 {
     attron(COLOR_PAIR(HUD_PAIR_DATA) | A_BOLD);
@@ -943,7 +612,7 @@ static void hud_draw_curve_radii(const Spirograph *sg)
     attroff(COLOR_PAIR(HUD_PAIR_DATA) | A_BOLD);
 }
 
-/* Row 0 right -- live engine stats: render fps, sim Hz, paused/running. */
+/* Top-right: frame rate, sim rate, and paused/running. */
 static void hud_draw_engine_stats(Screen *s, double fps, int sim_fps, bool paused)
 {
     char buf[80];
@@ -957,7 +626,7 @@ static void hud_draw_engine_stats(Screen *s, double fps, int sim_fps, bool pause
     attroff(COLOR_PAIR(HUD_PAIR_DATA) | A_BOLD);
 }
 
-/* Row rows-1 -- action keys, bright cyan + A_BOLD (HUD standard). */
+/* Bottom row: the list of keys you can press. */
 static void hud_draw_action_bar(Screen *s)
 {
     attron(COLOR_PAIR(HUD_PAIR_HINT) | A_BOLD);
@@ -966,11 +635,7 @@ static void hud_draw_action_bar(Screen *s)
     attroff(COLOR_PAIR(HUD_PAIR_HINT) | A_BOLD);
 }
 
-/*
- * Top HUD (row 0): title (left) + live curve r-values (middle) +
- *                  fps / sim Hz / paused (right).
- * Bottom HUD (row rows-1): action keys.
- */
+/* Draw the full HUD: title, stats, and key list. */
 static void screen_draw_hud(Screen *s, const Scene *sc, double fps, int sim_fps)
 {
     const Spirograph *sg = &sc->sg;
@@ -990,47 +655,32 @@ static void screen_draw(Screen *s, const Scene *sc,
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app ── */
 
 /*
- * App -- the top-level container.
+ * App — everything the program needs in one place.  There's a single
+ * shared copy (g_app below) so the signal handlers can reach it.
  *
- * Single static instance (g_app, declared below) so the signal handlers
- * can flip flags on it without scattering globals across the file.
+ * The two signal flags live here, not in the simulation: deciding to
+ * quit or noticing a resize are run-loop business, and keeping them out
+ * of the Scene leaves the simulation as pure, self-contained state.  They
+ * are volatile sig_atomic_t because that's the one type safe to touch
+ * from a signal handler, and volatile stops the loop from caching a stale
+ * value in a register and missing the change.
  *
- * WHY signal handler flags are on App, not Scene:
- *   Signals interrupt the main loop, not the simulation.  "Should I
- *   quit?" and "did the terminal resize?" are run-loop concerns, not
- *   spirograph-math concerns.  Keeping them off Scene means the
- *   simulation stays PURE state -- snapshottable, replayable from a
- *   seed, testable in isolation.
- *
- * WHY volatile sig_atomic_t (and not bool):
- *   Per POSIX, sig_atomic_t is the only integer type guaranteed atomic
- *   with respect to async signal delivery.  `volatile` forces the
- *   main loop to re-read from memory each iteration rather than
- *   caching the flag in a register; without it the compiler may
- *   legally hoist the read out of the loop and the program would
- *   never see the signal-set value.
- *
- * Fields:
- *   scene        the simulation state           (§6 Scene)
- *   screen       cached terminal dimensions     (§7 Screen)
- *   sim_fps      tick rate of scene_tick; [ and ] keys adjust it
- *                within [SIM_FPS_MIN, SIM_FPS_MAX].  Independent of
- *                render fps -- the main loop renders at a fixed
- *                ~60 Hz wallclock cadence regardless of sim_fps.
- *   running      0 ⇒ main loop should exit      (SIGINT / SIGTERM)
- *   need_resize  1 ⇒ main loop should re-init   (SIGWINCH)
+ *   scene        the simulation
+ *   screen       the cached terminal size
+ *   sim_fps      how many times a second the curves step; [ and ] change
+ *                it.  Separate from the ~60-a-second screen redraw
+ *   running      cleared to stop the loop (Ctrl-C / kill)
+ *   need_resize  set when the terminal was resized
  */
 typedef struct {
-    Scene                 scene;        /* simulation state                   */
-    Screen                screen;       /* terminal size cache                */
-    int                   sim_fps;      /* sim-tick rate; [ / ] adjust at runtime */
-    volatile sig_atomic_t running;      /* 0 = exit main loop  (SIGINT)       */
-    volatile sig_atomic_t need_resize;  /* 1 = re-init screen  (SIGWINCH)     */
+    Scene                 scene;
+    Screen                screen;
+    int                   sim_fps;
+    volatile sig_atomic_t running;
+    volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
@@ -1070,7 +720,7 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* ---- startup / shutdown ---------------------------------------------- */
+/* ── startup / shutdown ── */
 
 static void install_signal_handlers(void)
 {
@@ -1089,11 +739,11 @@ static void app_init(App *app)
     scene_init(&app->scene, app->screen.cols, app->screen.rows);
 }
 
-/* ---- main-loop step helpers ----------------------------------------- */
+/* ── main-loop step helpers ── */
 
-/* Respond to SIGWINCH: re-query terminal size, clear the trail (resize
- * invalidates pixel positions), and reset frame timing so the next dt
- * isn't enormous. */
+/* Handle a terminal resize: get the new size, wipe the trail (its old
+ * positions no longer line up), and restart the timing so the next frame
+ * doesn't think a huge amount of time passed. */
 static void apply_resize(App *app, int64_t *frame_time, int64_t *sim_accum)
 {
     endwin(); refresh();
@@ -1104,8 +754,8 @@ static void apply_resize(App *app, int64_t *frame_time, int64_t *sim_accum)
     *sim_accum  = 0;
 }
 
-/* Wallclock dt since the previous frame, capped at DT_CAP_NS so a long
- * pause (debugger, suspend) doesn't unleash a flood of sim ticks. */
+/* Time since the last frame, capped so a long stall doesn't unleash a
+ * flood of catch-up ticks. */
 static int64_t frame_dt_clamped(int64_t *last_ns)
 {
     int64_t now = clock_ns();
@@ -1115,8 +765,8 @@ static int64_t frame_dt_clamped(int64_t *last_ns)
     return dt;
 }
 
-/* Fixed-timestep accumulator: drain whole sim ticks at the current
- * sim_fps rate.  Decouples simulation rate from render fps. */
+/* Run as many fixed-size sim steps as the elapsed time has earned, so the
+ * curves advance at a steady rate no matter the frame rate. */
 static void frame_drain_sim_ticks(Scene *sc, int sim_fps, float dt_sec,
                                   int cols, int rows, int64_t *accum)
 {
@@ -1127,8 +777,8 @@ static void frame_drain_sim_ticks(Scene *sc, int sim_fps, float dt_sec,
     }
 }
 
-/* Rolling FPS counter -- average frames per second over the most recent
- * FPS_UPDATE_MS window, then reset. */
+/* Update the displayed frame rate: average it over a short window, then
+ * start the count over. */
 static void fps_counter_update(int64_t dt, int64_t *accum_ns,
                                int *frame_count, double *fps_out)
 {
@@ -1142,16 +792,16 @@ static void fps_counter_update(int64_t dt, int64_t *accum_ns,
     *accum_ns     = 0;
 }
 
-/* Sleep enough to maintain FRAME_PERIOD_NS, given how much wall time
- * this frame already spent. */
+/* Sleep off the rest of this frame's time budget so we hold a steady
+ * frame rate. */
 static void frame_sleep_to_target(int64_t frame_start_ns, int64_t work_so_far)
 {
     int64_t spent = clock_ns() - frame_start_ns + work_so_far;
     clock_sleep_ns(FRAME_PERIOD_NS - spent);
 }
 
-/* Pull pending keystroke; dispatch to app_handle_key.  Returns false
- * only when the user pressed a quit key. */
+/* Read a pending keypress and act on it.  Returns false only on a quit
+ * key. */
 static bool drain_input(App *app)
 {
     int ch = getch();
@@ -1159,16 +809,15 @@ static bool drain_input(App *app)
     return app_handle_key(app, ch);
 }
 
-/* Paint one complete frame: scene + HUD + present. */
+/* Draw one whole frame and push it to the terminal. */
 static void frame_render(App *app, double fps, float alpha, float dt_sec)
 {
     screen_draw(&app->screen, &app->scene, fps, app->sim_fps, alpha, dt_sec);
     screen_present();
 }
 
-/*
- * main() -- the orchestrator.  Each line names one phase of a frame.
- */
+/* The main loop: handle a resize, step the sim, draw, sleep, read input,
+ * repeat until quit. */
 int main(void)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));

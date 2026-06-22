@@ -1,129 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * geometry/delaunay_triangulation.c -- Delaunay Triangulation Visualizer
+ * Delaunay triangulation, watched as it grows.  Random points drop in one
+ * at a time and the mesh keeps the Delaunay property after each one; then a
+ * showcase pass draws each triangle's circumcircle and checks that no other
+ * point sits inside it.
  *
- * Incremental Bowyer-Watson algorithm: inserts N_POINTS random points one
- * by one, maintaining the Delaunay property after each insertion.
- *
- * After insertion, a SHOWCASE phase cycles through every triangle, draws
- * its circumcircle, and verifies no other point lies inside it (the empty
- * circumcircle property).
- *
- * Study alongside: procedural/generational/delaunay_triangulation.c --
- *       same Bowyer-Watson algorithm, framed as a generative-art demo
- *       (12 seeds drop in, edges flash on insert, super-triangle hidden
- *       at the end).  This file is the algorithmic showcase (random
- *       points + circumcircle verification phase); that one is the
- *       generative narrative.
- *
- * -------------------------------------------------------------------------
- *  Section map
- * -------------------------------------------------------------------------
- *  S1  config       -- sizes, timing, aspect ratio
- *  S2  clock        -- monotonic ns clock + sleep
- *  S3  color        -- palette
- *  S4  geometry     -- Pt/Tri/HEdge types, circumcircle math, line/ellipse draw
- *  S5  mesh         -- Mesh + Scratch structs, Bowyer-Watson in four named steps
- *  S6  scene        -- Insertion/Showcase/Scene structs, phase machine
- *  S7  render       -- per-layer renderers + render_scene driver + HUD
- *  S8  screen       -- ncurses layer
- *  S9  app          -- signals, resize, input, main loop
- * -------------------------------------------------------------------------
- *
- * Keys:  SPACE pause/resume   s single-step   r reset (new points)
- *        +/-   speed          q quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *       geometry/delaunay_triangulation.c \
- *       -o dt -lncurses -lm
+ * Algorithm: Bowyer-Watson incremental insertion (Bowyer 1981; Watson 1981;
+ *   de Berg et al., "Computational Geometry", ch. 9).
+ * Sister file: procedural/generational/delaunay_triangulation.c -- same
+ *   algorithm framed as a generative-art demo rather than this showcase.
  */
-
-/* -- CONCEPTS -----------------------------------------------------------  *
- *
- * Empty circumcircle property (S4 in_circumcircle):
- *   A triangulation is Delaunay iff for every triangle no other point in
- *   the set lies strictly inside its circumscribed circle.
- *   Equivalently, among all triangulations of the same point set, Delaunay
- *   maximises the minimum interior angle -- it avoids thin "sliver" triangles.
- *
- * Bowyer-Watson incremental insertion (S5 mesh_insert_point):
- *   To insert point P into an existing Delaunay triangulation:
- *     1. Find all "bad" triangles whose circumcircle contains P.    bw_find_bad
- *     2. Trace the boundary of the bad-triangle union -- the "hole".bw_collect_hole
- *     3. Remove bad triangles.                                      bw_remove_bad
- *     4. Connect P to every boundary edge to fill the hole.         bw_fill_hole
- *   The result is again a valid Delaunay triangulation.  Each insertion
- *   touches only O(log N) triangles on average, giving O(N log N) total.
- *
- * Mesh quality benefit (S7 render_overlay):
- *   Finite element methods and scattered-data interpolation require meshes
- *   with well-shaped elements.  Delaunay guarantees no angle < the smallest
- *   angle of the point set's convex hull -- far better than naive meshing.
- *   This is why Delaunay is the default mesh generator in physics simulators,
- *   terrain engines, and medical imaging.
- *
- * Aspect ratio correction (S4):
- *   Terminal cells are ~2x taller than wide (CELL_H/CELL_W = 2).  All
- *   circumcircle geometry is computed in "geo space" where y is doubled,
- *   then converted back for display as an aspect-corrected ellipse.
- *
- * ----------------------------------------------------------------------- */
-
-/* -- REFERENCES ---------------------------------------------------------  *
- *
- * Algorithm & theory:
- *   [1] Bowyer, A. (1981). "Computing Dirichlet tessellations."
- *       The Computer Journal 24(2), 162-166.
- *       -- one of the two namesake papers; introduces the incremental
- *          insertion idea via the dual Voronoi diagram.
- *
- *   [2] Watson, D. F. (1981). "Computing the n-dimensional Delaunay
- *       tessellation with application to Voronoi polytopes."
- *       The Computer Journal 24(2), 167-172.
- *       -- the companion paper (same issue) that gives the algorithm
- *          we implement: find bad triangles, remove, retriangulate the hole.
- *
- *   [3] Sloan, S. W. (1987). "A fast algorithm for constructing Delaunay
- *       triangulations in the plane." Advances in Engineering Software,
- *       9(1), 34-55.
- *       -- the practical engineering reference for the "huge super-
- *          triangle" trick used by S5 mesh_init_super().
- *
- *   [4] de Berg, Cheong, van Kreveld, Overmars (2008).
- *       "Computational Geometry: Algorithms and Applications" (3rd ed.),
- *       chapter 9. Springer.
- *       -- the canonical textbook treatment; best starting point if you
- *          want one source.  Proves the empty-circumcircle property and
- *          the max-min-angle theorem.
- *
- * Implementation & numerics:
- *   [5] Shewchuk, J. R. (1996). "Triangle: Engineering a 2D Quality Mesh
- *       Generator and Delaunay Triangulator." Applied Computational
- *       Geometry: Towards Geometric Engineering, LNCS 1148, 203-222.
- *       -- the most-cited practical reference; covers degeneracies,
- *          ghost triangles, and how to make Bowyer-Watson robust at scale.
- *
- *   [6] Shewchuk, J. R. (1997). "Adaptive Precision Floating-Point
- *       Arithmetic and Fast Robust Geometric Predicates." Discrete &
- *       Computational Geometry 18(3), 305-363.
- *       -- the gold standard for an exact in-circumcircle test.  Our
- *          float version (S4 in_circumcircle) is fine for 40 random
- *          points; production code uses these adaptive predicates.
- *
- * Rendering:
- *   [7] Bresenham, J. E. (1965). "Algorithm for computer control of a
- *       digital plotter." IBM Systems Journal 4(1), 25-30.
- *       -- the integer DDA line algorithm in S4 draw_line().
- *
- *   [8] Foley, van Dam, Feiner, Hughes (1995). "Computer Graphics:
- *       Principles and Practice" (2nd ed. in C), chapters 3 & 19.
- *       Addison-Wesley.
- *       -- midpoint ellipse rasterization, scan conversion theory, and
- *          background for the aspect-correction trick used in S7
- *          render_circumcircle().
- *
- * ----------------------------------------------------------------------- */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -140,9 +26,7 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* S1  config                                                             */
-/* ===================================================================== */
+/* -- S1 config -- */
 
 #define SIM_FPS_DEFAULT   8
 #define SIM_FPS_MIN       1
@@ -154,73 +38,59 @@
 #define NS_PER_MS   1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/*
- * ASPECT_Y: terminal cell height / width.
- * CELL_H=16, CELL_W=8 => aspect = 2.0.
- * Multiply cell-space y by ASPECT_Y before any distance/circumcircle
- * computation so that "circles" are metrically correct.
- */
+/* A character cell is about twice as tall as it is wide.  Stretch y by this
+ * factor before any distance or circle math, so circles come out round
+ * instead of egg-shaped. */
 #define ASPECT_Y  2.0f
 
-#define N_POINTS         40     /* random points to triangulate           */
-#define SUPER_COUNT       3     /* super-triangle vertex indices 0,1,2    */
+#define N_POINTS         40     /* how many random points to triangulate  */
+#define SUPER_COUNT       3     /* corners of the giant starter triangle  */
 #define MAX_PTS          (N_POINTS + SUPER_COUNT + 2)
 #define MAX_TRIS         (N_POINTS * 8 + 10)
 #define MAX_HOLE         (MAX_TRIS * 3)
 
-#define HUD_TOP_ROWS      4     /* rows reserved at top for data overlay  */
-#define HUD_BOTTOM_ROWS   1     /* rows reserved at bottom for actions    */
+#define HUD_TOP_ROWS      4     /* top rows kept for the stats display     */
+#define HUD_BOTTOM_ROWS   1     /* bottom row kept for the key hints       */
 #define MARGIN_X          4
 #define MARGIN_Y          3
 
-#define SHOWCASE_HOLD     1     /* sim-ticks per triangle in showcase     */
+#define SHOWCASE_HOLD     1     /* ticks to linger on each triangle        */
 #define SHOWCASE_CYCLES   1
 #define DONE_TICKS       10
 
-/* Frame pacing (S9 main loop). */
-#define DT_CAP_NS         (100 * NS_PER_MS)     /* spiral-of-death guard:
-                                                   if dt exceeds this (e.g. after
-                                                   debugger pause), absorb only
-                                                   this much so the sim doesn't
-                                                   try to "catch up" with a flood
-                                                   of ticks. */
-#define FRAME_PERIOD_NS   (NS_PER_SEC / TARGET_FPS)  /* nominal render budget */
+/* If a frame's elapsed time blows past this (e.g. the program was paused in
+ * a debugger), pretend only this much passed -- otherwise the sim would try
+ * to catch up with a flood of ticks. */
+#define DT_CAP_NS         (100 * NS_PER_MS)
+#define FRAME_PERIOD_NS   (NS_PER_SEC / TARGET_FPS)
 
-/* Numerical robustness epsilons.  Floats are good to ~6 decimal digits;
- * these tolerances live above that noise floor.  See Shewchuk 1997 [6]
- * for why exact predicates would replace these in production code. */
-#define DEGEN_TRI_EPS     1e-7f   /* twice-signed-area magnitude below which
-                                     three points are treated as colinear --
-                                     no circumcircle defined */
-#define INCIRCLE_EPS      1e-5f   /* slack on the "strictly inside" test
-                                     used by bw_find_bad */
-#define VIOLATION_EPS     1e-4f   /* same test for HUD verdict; deliberately
-                                     looser so a near-boundary point isn't
-                                     flagged as a Delaunay violator */
+/* Wiggle room for the geometry tests.  Floats are only good to ~6 digits,
+ * so we leave a little slack above that noise rather than trust exact ties. */
+#define DEGEN_TRI_EPS     1e-7f   /* below this the three points are basically
+                                     in a line, so no circle through them    */
+#define INCIRCLE_EPS      1e-5f   /* slack on "is the new point inside?"      */
+#define VIOLATION_EPS     1e-4f   /* same test for the HUD verdict, kept a bit
+                                     looser so a point right on the edge isn't
+                                     wrongly flagged                          */
 
-/* Math literals named for their geometric meaning. */
-#define TAU               (2.0f * (float)M_PI)  /* one full turn in radians */
+#define TAU               (2.0f * (float)M_PI)  /* one full turn, in radians */
 
-/* Ellipse rasterization (draw_ellipse).  Sample count tracks perimeter
- * length: a coarse approximation of the Ramanujan perimeter formula. */
-#define ELLIPSE_PERIM_FACTOR  0.75f             /* empirical scaling          */
-#define ELLIPSE_MIN_STEPS     32                /* minimum samples per ring   */
-#define ELLIPSE_MAX_STEPS    512                /* avoid pathological huge n  */
+/* How many dots to walk around a circle's outline -- more for bigger
+ * circles, with a floor so tiny ones still close up and a ceiling so huge
+ * ones don't bog down. */
+#define ELLIPSE_PERIM_FACTOR  0.75f
+#define ELLIPSE_MIN_STEPS     32
+#define ELLIPSE_MAX_STEPS    512
 
-/* Seed bumps for restart -- coprime offsets so successive runs traverse
- * different RNG sub-sequences instead of nearby states. */
-#define RESET_SEED_BUMP    9973                 /* user 'r' key            */
-#define RESTART_SEED_BUMP  7919                 /* auto-restart from DONE  */
+/* Jumps added to the random seed on restart.  These are picked to land far
+ * from the current seed, so each run looks clearly different. */
+#define RESET_SEED_BUMP    9973                 /* user presses 'r'        */
+#define RESTART_SEED_BUMP  7919                 /* auto-restart after DONE */
 
-/* HUD layout. */
-#define HUD_VERDICT_RIGHT_OFFSET  40            /* cols from right edge for
-                                                   the "empty circumcircle: YES/NO"
-                                                   verdict text */
+#define HUD_VERDICT_RIGHT_OFFSET  40            /* where the YES/NO verdict sits, from the right edge */
 #define HUD_SEPARATOR_ROW          3            /* the dashed divider line */
 
-/* ===================================================================== */
-/* S2  clock                                                              */
-/* ===================================================================== */
+/* -- S2 clock -- */
 
 static int64_t clock_ns(void)
 {
@@ -239,9 +109,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ===================================================================== */
-/* S3  color                                                              */
-/* ===================================================================== */
+/* -- S3 color -- */
 
 enum {
     CP_DEFAULT = 0,
@@ -295,102 +163,67 @@ static void color_init(void)
     }
 }
 
-/* ===================================================================== */
-/* S4  geometry primitives                                                */
-/* ===================================================================== */
+/* -- S4 geometry primitives -- */
 
 /*
- * Pt -- a 2D point.
+ * Pt -- a 2D point.  Every coordinate in the program is one of these, so
+ * the meaning of (x, y) lives in one place.
  *
- * WHY a separate type:  Every coordinate in the program travels through this
- *      type, so the meaning of (x,y) is documented in exactly one place.
+ *   x  column on screen; one unit = one character wide.
+ *   y  row on screen;    one unit = one character tall (and a character is
+ *      about twice as tall as it is wide -- see ASPECT_Y).
  *
- * Units / space:
- *      x  is in CELL columns; one unit = one character cell.
- *      y  is in CELL rows;    one unit = one character row (which is
- *         visually ~2x taller than one column -- see ASPECT_Y in S1).
- *
- * For Delaunay math we must work in metric "geometry space" where x and y
- * have the same physical scale.  Conversion is one-way and happens only at
- * the math boundary (gy() in S4, called by bw_find_bad, tri_inside_count,
- * render_circumcircle).  Pt itself always holds the cell-space form.
- *
- * float (not double):  precision is ample for ~40 points on an 80x24
- *      terminal; doubles would just double the cache footprint of Mesh.pts.
+ * A Pt is always in this screen form.  The circle math needs x and y at the
+ * same real-world scale, so it stretches y on the fly via gy() -- the point
+ * itself is never changed.  float is plenty for ~40 points on a terminal.
  */
 typedef struct { float x, y; } Pt;
 
 /*
- * Tri -- a triangle, stored as three indices into Mesh.pts (NOT three Pts).
+ * Tri -- a triangle, kept as three slot numbers into Mesh.pts, not three
+ * copies of the points.
  *
- * WHY indices, not coordinates:
- *      1. A vertex is typically shared by ~6 triangles; storing indices
- *         lets all of them refer to the same Pt and stay in sync if it
- *         ever moves.  (Not needed for static input, but a one-line
- *         habit that scales to dynamic meshes.)
- *      2. The Bowyer-Watson edge-matching predicate (bw_edge_is_shared
- *         in S5) decides whether two triangles share an edge by integer
- *         comparison -- same vertex indices, either direction.  Comparing
- *         floats would need an epsilon and could miss matches due to
- *         round-off.
- *      3. Indices 0..SUPER_COUNT-1 are reserved for the super-triangle,
- *         which lets every "is this a real triangle?" test become a
- *         single ">= SUPER_COUNT" comparison.
+ * Why slot numbers instead of coordinates:
+ *   - One point is usually a corner of several triangles; everyone pointing
+ *     at the same slot keeps them in sync.
+ *   - Checking whether two triangles share an edge is then a plain
+ *     whole-number compare (bw_edge_is_shared) -- no fuzzy float matching.
+ *   - Slots 0..SUPER_COUNT-1 are reserved for the giant starter triangle,
+ *     so "is this a real triangle?" is just "are all three slots >= that?".
  *
- * Vertex order (a, b, c) is NOT canonicalised; Bowyer-Watson does not
- * rely on CCW/CW orientation -- only on edge adjacency.  Renderers treat
- * the three edges symmetrically.
- *
- * Reference:  Shewchuk 1996 (Triangle) [5] §3 discusses the trade-offs of
- *      index-based vs. pointer-based vs. quad-edge mesh representations.
- *      Guibas & Stolfi 1985 is the alternative we are NOT using.
+ * The corner order (a, b, c) doesn't matter here -- the algorithm only cares
+ * which corners an edge connects, not which way the triangle winds.
  */
 typedef struct { int a, b, c; } Tri;
 
 /*
- * HEdge -- a half-edge / directed boundary edge, holding two Mesh.pts indices.
+ * HEdge -- one edge of the hole boundary, as the two corner slots a and b
+ * it runs between.
  *
- * WHY this exists at all:
- *      Bowyer-Watson step 2 (bw_collect_hole in S5) walks every edge of
- *      every bad triangle and records the ones that do NOT have a matching
- *      mate among the other bad triangles.  Those unmatched edges, taken
- *      together, form the star-shaped boundary of the "hole" left after
- *      bad triangles are removed.  Step 4 (bw_fill_hole) then fans the
- *      new point P into a triangle against each of those edges.
+ * When we add a point, some triangles have to be torn out, leaving a hole.
+ * The hole's outline is the set of edges that belonged to exactly one of
+ * the torn-out triangles (bw_collect_hole gathers them).  We then sew the
+ * new point onto each of these edges to fill the hole (bw_fill_hole).
  *
- * WHY directed (a -> b, not unordered):
- *      We never need to ask "is edge {a,b} present?" in a way that cares
- *      about direction -- but recording the source triangle's CCW/CW
- *      traversal order means the fill step can write Tri{ a, b, P } and
- *      get a consistent winding without an extra orientation check.
- *
- * NOT a general mesh half-edge:  this is the minimum data needed for one
- *      Bowyer-Watson hole.  A full half-edge data structure (Mantyla 1988;
- *      OpenMesh) carries next/prev/twin pointers; we do not.
+ * The order a -> b is kept, not sorted, so the new triangles come out wound
+ * the same way without an extra check.  This is just the bare minimum for
+ * one hole -- not a full mesh edge structure with neighbour links.
  */
 typedef struct { int a, b; } HEdge;
 
-/* ---- coordinate-space conversion ------------------------------------- */
-
-/* Convert cell-space y to GEOMETRY space (aspect-corrected Euclidean).
- * Every circumcircle calculation must be done in geometry space; cells
- * are ~2x taller than wide, so a Euclidean circle would render as a
- * stretched egg if we ignored ASPECT_Y. */
+/* Stretch a screen-row value into the same scale as columns, so circles
+ * come out round.  Every circle calculation goes through this. */
 static inline float gy(float cy) { return cy * ASPECT_Y; }
 
-/* ---- 2-D math primitives --------------------------------------------- */
-
-/* |(x,y)|^2 -- squared magnitude of a 2-vector.  Squared because every
- * geometric predicate in this file ("inside circle?", "below epsilon?")
- * can be answered without taking sqrt; sqrt is reserved for the one
- * radius-display path in S7. */
+/* How far (x, y) is from the origin, but left squared.  Most of our tests
+ * ("inside the circle?", "too small?") work fine on squared distances, and
+ * skipping the square root keeps them cheap; we only take the real root once,
+ * to print a radius. */
 static inline float vec2_sqr_mag(float x, float y) { return x*x + y*y; }
 
-/* 2 * SignedArea(A, B, C) -- the cross-product shoelace expression.
- *   sign:      > 0 if A,B,C are counter-clockwise, < 0 if clockwise.
- *   magnitude: twice the triangle's area; near zero iff colinear.
- * The doubled form avoids a divide-by-2 in callers that only inspect
- * sign/magnitude relative to an epsilon. */
+/* A number whose sign tells which way the corners A, B, C wind (positive =
+ * counter-clockwise) and whose size is twice the triangle's area -- near
+ * zero means the three points are nearly in a straight line. */
 static inline float tri_signed_area_doubled(float ax, float ay,
                                             float bx, float by,
                                             float cx, float cy)
@@ -398,11 +231,9 @@ static inline float tri_signed_area_doubled(float ax, float ay,
     return ax*(by-cy) + bx*(cy-ay) + cx*(ay-by);
 }
 
-/* ---- ncurses cell plotting ------------------------------------------- */
-
-/* plot_cell -- write a glyph at (x,y) in color pair cp, clipped to the
- * screen.  Every line/ellipse/dot in this file paints through this one
- * helper so the bounds check lives in one place. */
+/* Draw one character on screen, ignoring anything off the edges.  Every dot,
+ * line, and circle goes through here, so the off-screen check lives in just
+ * one spot. */
 static inline void plot_cell(int y, int x, int cp, chtype ch,
                              int rows, int cols)
 {
@@ -412,54 +243,36 @@ static inline void plot_cell(int y, int x, int cp, chtype ch,
     attroff(COLOR_PAIR(cp));
 }
 
-/* ---- circumcircle of a triangle -------------------------------------- */
-
 /*
- * circumcircle_geo() -- circumcircle of triangle in GEOMETRY space.
+ * Find the one circle that passes through all three corners of a triangle.
+ * Hands back its center (ocx, ocy) and its radius-squared (r2), all in the
+ * stretched circle-math scale the inputs are already in.  Returns false if
+ * the corners are nearly in a line, since then no such circle exists.
  *
- * Inputs are already aspect-corrected (y = cell_y * ASPECT_Y).  Outputs
- * center (ocx, ocy) and squared radius r2 in the same space.  Returns
- * false on near-colinear input (no unique circle exists).
- *
- * Derivation: the circumcenter is equidistant from A, B, C, so it lies
- * at the intersection of any two perpendicular bisectors.  Solving the
- * 2x2 linear system gives Cramer-rule formulas in terms of |A|^2, |B|^2,
- * |C|^2 and twice the signed area D:
- *
- *   D  = 2 * SignedArea(A,B,C)
- *   Ox = [|A|^2(By-Cy) + |B|^2(Cy-Ay) + |C|^2(Ay-By)] / D
- *   Oy = [|A|^2(Cx-Bx) + |B|^2(Ax-Cx) + |C|^2(Bx-Ax)] / D
- *
- * Reference: de Berg ch. 9 [4]; Shewchuk 1997 [6] for the robust version.
+ * The center is the spot equally far from all three corners; the algebra
+ * below is the standard closed-form solution for it (de Berg, ch. 9).
  */
 static bool circumcircle_geo(float ax, float ay, float bx, float by,
                               float cx, float cy,
                               float *ocx, float *ocy, float *r2)
 {
-    /* Step 1 -- twice the signed area; near-zero means colinear vertices. */
     float two_area = 2.0f * tri_signed_area_doubled(ax,ay, bx,by, cx,cy);
-    if (fabsf(two_area) < DEGEN_TRI_EPS) return false;
+    if (fabsf(two_area) < DEGEN_TRI_EPS) return false;   /* corners in a line */
 
-    /* Step 2 -- |A|^2, |B|^2, |C|^2 (Cramer numerators reuse these). */
     float ma2 = vec2_sqr_mag(ax, ay);
     float mb2 = vec2_sqr_mag(bx, by);
     float mc2 = vec2_sqr_mag(cx, cy);
 
-    /* Step 3 -- center via Cramer's rule (perpendicular-bisector solve). */
     *ocx = (ma2*(by-cy) + mb2*(cy-ay) + mc2*(ay-by)) / two_area;
     *ocy = (ma2*(cx-bx) + mb2*(ax-cx) + mc2*(bx-ax)) / two_area;
 
-    /* Step 4 -- squared radius from center to any vertex (use A). */
     *r2  = vec2_sqr_mag(*ocx - ax, *ocy - ay);
     return true;
 }
 
-/*
- * in_circumcircle() -- true iff point P lies STRICTLY inside triangle
- * (A,B,C)'s circumcircle.  Uses INCIRCLE_EPS to keep boundary cases from
- * oscillating during incremental insertion (Bowyer-Watson is sensitive
- * to ties).
- */
+/* Is point P inside the triangle's circle?  The little slack (INCIRCLE_EPS)
+ * keeps points sitting right on the rim from flickering in and out as we
+ * build the mesh. */
 static bool in_circumcircle(float ax, float ay, float bx, float by,
                              float cx, float cy, float px, float py)
 {
@@ -469,42 +282,30 @@ static bool in_circumcircle(float ax, float ay, float bx, float by,
     return vec2_sqr_mag(px - ocx, py - ocy) < r2 - INCIRCLE_EPS;
 }
 
-/* ---- line and ellipse rasterization ---------------------------------- */
-
-/*
- * draw_line() -- Bresenham's integer-only line algorithm in cell space.
- *
- * Reads as pseudocode:
- *   start at (x0,y0); each iteration plot the current cell, then advance
- *   along whichever axis is more "behind" (tracked by err) until we land
- *   on (x1,y1).
- *
- * Reference: Bresenham 1965 [7].
- */
+/* Draw a straight line of characters between two cells using only integer
+ * steps (Bresenham's classic line algorithm). */
 static void draw_line(int x0, int y0, int x1, int y1,
                       int cp, chtype ch, int rows, int cols)
 {
-    int dx = abs(x1 - x0);              /* magnitude of x-extent       */
-    int dy = abs(y1 - y0);              /* magnitude of y-extent       */
-    int step_x = (x0 < x1) ? 1 : -1;    /* unit direction in x         */
-    int step_y = (y0 < y1) ? 1 : -1;    /* unit direction in y         */
-    int err    = dx - dy;               /* deviation accumulator       */
+    int dx = abs(x1 - x0);
+    int dy = abs(y1 - y0);
+    int step_x = (x0 < x1) ? 1 : -1;
+    int step_y = (y0 < y1) ? 1 : -1;
+    int err    = dx - dy;              /* tracks which way we've drifted */
 
     for (;;) {
         plot_cell(y0, x0, cp, ch, rows, cols);
         if (x0 == x1 && y0 == y1) break;
 
-        /* Bresenham step: whichever axis is more "behind" advances. */
         int err2 = 2 * err;
-        if (err2 > -dy) { err -= dy; x0 += step_x; }   /* step in x */
-        if (err2 <  dx) { err += dx; y0 += step_y; }   /* step in y */
+        if (err2 > -dy) { err -= dy; x0 += step_x; }
+        if (err2 <  dx) { err += dx; y0 += step_y; }
     }
 }
 
-/* How many samples to draw around an ellipse perimeter.  Crude
- * Ramanujan-style perimeter scaling (~ pi * (rx + ry)) with a floor and
- * ceiling so tiny circles still close cleanly and huge ones don't melt
- * the renderer. */
+/* How many dots to space around a circle's outline -- bigger circles get
+ * more, kept between a floor (so small ones still close up) and a ceiling
+ * (so big ones stay fast). */
 static int ellipse_sample_count(float rx, float ry)
 {
     int n = (int)(TAU * (rx + ry) * ELLIPSE_PERIM_FACTOR) + ELLIPSE_MIN_STEPS;
@@ -512,14 +313,9 @@ static int ellipse_sample_count(float rx, float ry)
     return n;
 }
 
-/*
- * draw_ellipse() -- parametric ellipse rasterizer in cell space.
- *
- * Samples theta uniformly around [0, TAU), plots one cell per sample.
- * A geometric circumcircle of radius r in geo-space becomes an ellipse
- * with rx = r, ry = r / ASPECT_Y when projected back to cells -- the
- * caller (render_circumcircle) applies that aspect correction.
- */
+/* Draw an oval by stepping a dot all the way around it.  Drawing the circle
+ * as an oval (taller radius squashed) cancels out the cell aspect ratio, so
+ * it reads as a real circle on screen; the caller works out the radii. */
 static void draw_ellipse(float cx, float cy, float rx, float ry,
                          int cp, chtype ch, int rows, int cols)
 {
@@ -532,105 +328,56 @@ static void draw_ellipse(float cx, float cy, float rx, float ry,
     }
 }
 
-/* ===================================================================== */
-/* S5  mesh + Bowyer-Watson                                               */
-/* ===================================================================== */
+/* -- S5 mesh + Bowyer-Watson -- */
 
 /*
- * Mesh -- the triangulation under construction.
+ * Mesh -- the triangulation as it's being built: the points, the triangles,
+ * and how many of each are in use.  Bundling them lets every step of the
+ * algorithm take one Mesh* and stay self-contained.
  *
- * WHY a struct (and not naked globals like the first draft had):
- *      Putting pts + tris + their counts in one struct makes "the
- *      triangulation" a first-class value.  Every Bowyer-Watson step
- *      takes (Mesh *m, ...), so the algorithm is decoupled from the
- *      enclosing demo and could be lifted into another program with
- *      no edits to the math.
+ * A few things stay true the whole time:
+ *   - The first SUPER_COUNT points are the corners of the giant starter
+ *     triangle (set by mesh_init_super), placed way off-screen so every real
+ *     point lands inside it.  Bowyer-Watson needs some valid triangle to
+ *     start from, and one this big swallows everything.
+ *   - The points after that are the real ones, revealed one at a time.
+ *   - After each point is added, the triangle list is once again a proper
+ *     Delaunay triangulation of everything revealed so far -- that's the
+ *     whole promise of the algorithm.
+ *   - Triangles touching a starter corner are "ghosts": scaffolding the
+ *     algorithm needs but the user never sees (filtered out for counts and
+ *     the showcase).
  *
- * Invariants maintained at every external call site:
- *      I1.  pts[0..SUPER_COUNT-1] are the SUPER-TRIANGLE vertices.
- *           Placed far outside the screen by mesh_init_super so that
- *           every real point falls inside that giant triangle.  This
- *           lets Bowyer-Watson start from a valid one-triangle Delaunay
- *           triangulation and grow it incrementally.  See Sloan 1987 [3].
- *
- *      I2.  pts[SUPER_COUNT .. npts-1] are the real input points,
- *           filled in by mesh_gen_points and revealed one at a time by
- *           the INSERT phase.
- *
- *      I3.  tris[0..ntris-1] is a Delaunay triangulation of
- *           pts[0..npts-1].  After every mesh_insert_point() call this
- *           holds again -- that is the entire correctness claim.  See
- *           Bowyer 1981 [1], Watson 1981 [2], de Berg ch. 9 [4].
- *
- *      I4.  Triangles that touch any super-vertex (index < SUPER_COUNT)
- *           are "virtual" -- they exist so the algorithm has somewhere
- *           to anchor edges along the convex hull.  They are filtered
- *           out by mesh_real_tri_count and showcase_init.
- *
- * Fields:
- *      pts     vertex pool.  Capacity MAX_PTS = N_POINTS + SUPER_COUNT + 2
- *              -- the +2 is slack for any future "bounding rectangle"
- *              technique that could replace the super-triangle.
- *      npts    number of valid entries in pts[].
- *      tris    triangle list.  Capacity MAX_TRIS = N_POINTS*8 + 10.
- *              The 8x factor is the loose worst-case for the planar
- *              triangulation of N points (Euler's formula gives ~2N-5
- *              triangles for points in general position; the 8x leaves
- *              ample headroom for intermediate states during insertion
- *              where tris[] briefly contains both old and new entries).
- *      ntris   number of valid entries in tris[].
- *
- * Memory:  ~4 KB at MAX_PTS=45, MAX_TRIS=330.  Sits inside Scene which
- *      sits inside the static g_app -- no heap, no per-frame allocation.
+ * The array sizes are loose over-estimates with room to spare, so the lists
+ * never overflow.  It all lives in static storage -- no heap, no per-frame
+ * allocation.
  */
 typedef struct {
-    Pt   pts [MAX_PTS];    /* I1: 0..2 super-triangle; I2: 3..npts-1 real */
-    int  npts;             /* count of valid entries in pts[]             */
-    Tri  tris[MAX_TRIS];   /* I3: a Delaunay triangulation of pts[0..npts-1] */
-    int  ntris;            /* count of valid entries in tris[]            */
+    Pt   pts [MAX_PTS];    /* first SUPER_COUNT are the starter corners, rest real */
+    int  npts;             /* how many points are in use                  */
+    Tri  tris[MAX_TRIS];   /* the current triangulation                   */
+    int  ntris;            /* how many triangles are in use               */
 } Mesh;
 
 /*
- * Scratch -- per-insertion working memory for Bowyer-Watson.
+ * Scratch -- a notepad for one point insertion.  Holds the two temporary
+ * lists Bowyer-Watson needs while it works.  It belongs to the caller (not
+ * hidden statics, not a fresh malloc) so the hot path never allocates and
+ * the memory cost is plain to see.
  *
- * WHY this is its own struct:
- *      mesh_insert_point() needs two temporary arrays whose size depends
- *      on Mesh capacity (one bool per triangle, up to MAX_HOLE boundary
- *      edges).  Three options were considered:
+ *   bad   one flag per triangle: does this triangle's circle swallow the
+ *         new point, so it must be torn out?
+ *   hole  the edges left around the resulting hole, to sew the new point onto.
  *
- *        a) `static` locals inside mesh_insert_point  -- works but hides
- *           the dependency, breaks reentrancy, and prevents the demo
- *           from running two triangulations in parallel.
- *        b) heap allocation per call  -- forbidden by the "no malloc
- *           after init" rule (see CLAUDE.md).
- *        c) caller-owned struct  -- chosen.  The hot path performs zero
- *           allocation, and the cost (~8 KB sitting idle in Scene) is
- *           visible in one place.
- *
- * WHY two arrays, not one:
- *      bad[]  is indexed by triangle id, must be sized MAX_TRIS.
- *      hole[] is indexed by edge id, can hold up to 3 * MAX_TRIS edges
- *             in the pathological case (every bad triangle contributes
- *             all three of its edges as boundary).
- *      Different shapes => different types => different arrays.
- *
- * Lifecycle within one mesh_insert_point() call:
- *      bw_find_bad      writes bad[]                  (memset + flag)
- *      bw_collect_hole  reads  bad[],  writes hole[]  (returns nhole)
- *      bw_remove_bad    reads  bad[]                  (compacts tris[])
- *      bw_fill_hole     reads  hole[]                 (appends to tris[])
- *      -- both arrays become garbage between calls; no cross-call state.
+ * Both are filled fresh each insertion and mean nothing between calls.
  */
 typedef struct {
-    bool  bad [MAX_TRIS];  /* bad[i] iff tris[i]'s circumcircle contains P */
-    HEdge hole[MAX_HOLE];  /* boundary of the union of bad triangles       */
+    bool  bad [MAX_TRIS];
+    HEdge hole[MAX_HOLE];
 } Scratch;
 
-/* ---- Mesh accessors / queries ---------------------------------------- */
-
-/* Read out triangle t's three vertices already converted to GEOMETRY space.
- * Every Bowyer-Watson predicate and circumcircle renderer needs exactly
- * this -- so the gy() aspect correction lives in one place. */
+/* Hand back a triangle's three corners already stretched into circle-math
+ * scale -- the form every circle test and circle drawer wants. */
 static void tri_geo_vertices(const Mesh *m, const Tri *t,
                              float *ax, float *ay,
                              float *bx, float *by,
@@ -641,18 +388,16 @@ static void tri_geo_vertices(const Mesh *m, const Tri *t,
     *cx = m->pts[t->c].x;   *cy = gy(m->pts[t->c].y);
 }
 
-/* True iff all three vertices are real points (none is a super-vertex).
- * The "ghost triangles" anchored on the super-triangle exist for the
- * algorithm's bookkeeping but must not appear in user-visible counts. */
+/* A real triangle is one with no corner on the starter triangle -- those
+ * ghost triangles are scaffolding and shouldn't show up in counts. */
 static inline bool tri_is_real(const Tri *t)
 {
     return t->a >= SUPER_COUNT && t->b >= SUPER_COUNT && t->c >= SUPER_COUNT;
 }
 
-/* The rectangle in which random points may spawn -- shrunk away from
- * screen edges (MARGIN_X) and away from the HUD bands (HUD_TOP_ROWS,
- * HUD_BOTTOM_ROWS).  A degenerate terminal (too small) is clamped to a
- * 1-cell range so rand() % range never divides by zero. */
+/* The box random points may land in, pulled in from the screen edges and
+ * away from the HUD strips so nothing spawns under a label.  A tiny terminal
+ * is clamped to at least 1 cell wide so the random pick never divides by zero. */
 static void mesh_spawn_area(int cols, int rows,
                             int *xlo, int *xhi, int *ylo, int *yhi)
 {
@@ -664,40 +409,27 @@ static void mesh_spawn_area(int cols, int rows,
     if (*yhi <= *ylo) *yhi = *ylo + 1;
 }
 
-/* ---- Mesh constructors ---------------------------------------------- */
-
 /*
- * mesh_init_super() -- seed the triangulation with one giant "super-
- * triangle" placed far enough outside the screen that every future real
- * point will fall strictly inside it.
- *
- * Why this is necessary: Bowyer-Watson is INCREMENTAL -- it needs a
- * starting Delaunay triangulation to insert into.  The smallest such
- * triangulation is a single triangle, and the simplest way to guarantee
- * that a stream of future points all land inside it is to make it
- * absurdly large.  See Sloan 1987 [3].
- *
- * The 3x/4x screen-size offsets are loose-but-safe; precise minimal
- * super-triangles exist but are pointless at this scale.
+ * Start the mesh off as one enormous triangle drawn far off-screen, big
+ * enough that every real point to come will sit inside it.  Bowyer-Watson
+ * has to grow from some valid triangle, and one this big is the easy way to
+ * be sure nothing ever falls outside.
  */
 static void mesh_init_super(Mesh *m, int cols, int rows)
 {
     float W = (float)cols, H = (float)rows;
 
-    /* Vertices far outside the screen, indices 0/1/2 by convention. */
     m->pts[0] = (Pt){  W * 0.5f,   -H * 3.0f };   /* far above center */
     m->pts[1] = (Pt){ -W * 3.0f,    H * 4.0f };   /* far below-left   */
     m->pts[2] = (Pt){  W * 4.0f,    H * 4.0f };   /* far below-right  */
 
-    /* The whole triangulation starts as one triangle: the super-tri. */
     m->tris[0] = (Tri){ 0, 1, 2 };
     m->npts    = SUPER_COUNT;
     m->ntris   = 1;
 }
 
-/* Fill m->pts[SUPER_COUNT .. SUPER_COUNT+N_POINTS-1] with random spawn
- * positions.  Layout-aware -- avoids the HUD bands so no point spawns
- * behind a label. */
+/* Scatter the real points at random, keeping clear of the HUD strips so none
+ * lands behind a label. */
 static void mesh_gen_points(Mesh *m, int cols, int rows, unsigned seed)
 {
     srand(seed);
@@ -709,7 +441,7 @@ static void mesh_gen_points(Mesh *m, int cols, int rows, unsigned seed)
     }
 }
 
-/* Count triangles that do not touch any super-vertex. */
+/* Count the triangles the user actually sees (ghosts excluded). */
 static int mesh_real_tri_count(const Mesh *m)
 {
     int n = 0;
@@ -718,13 +450,11 @@ static int mesh_real_tri_count(const Mesh *m)
     return n;
 }
 
-/* --- Bowyer-Watson: the algorithm split into four named steps --------- */
+/* --- Bowyer-Watson, in four named steps --- */
 
-/*
- * Step 1 -- mark every triangle whose circumcircle contains P (geo space).
- * Such triangles violate Delaunay once P is added; they will be removed
- * and the cavity left behind will be re-triangulated against P.
- */
+/* Step 1 -- flag every triangle whose circle swallows the new point P.
+ * Those are the ones that go wrong once P joins, so they get torn out and
+ * the gap is re-stitched around P. */
 static void bw_find_bad(const Mesh *m, float px, float py, bool *bad)
 {
     memset(bad, 0, (size_t)m->ntris * sizeof(bool));
@@ -736,18 +466,10 @@ static void bw_find_bad(const Mesh *m, float px, float py, bool *bad)
     }
 }
 
-/*
- * Does directed edge (va -> vb) appear in any OTHER bad triangle?
- *
- * The hole boundary (step 2) is exactly the set of bad-triangle edges
- * that have NO mate among the other bad triangles.  Edges shared by
- * two bad triangles are interior to the cavity and discarded; edges
- * shared by exactly one bad triangle survive and form the hole's
- * boundary (a star-shaped polygon visible from P).
- *
- * Matching is direction-agnostic: an edge {a,b} in one triangle pairs
- * with edge {b,a} traversed the opposite way by its neighbour.
- */
+/* Does this edge also belong to some other torn-out triangle?  If two
+ * torn-out triangles share an edge, that edge is inside the hole and we drop
+ * it; an edge owned by only one survives as part of the hole's rim.  The two
+ * corners can be listed in either order and still count as the same edge. */
 static bool bw_edge_is_shared(const Mesh *m, const bool *bad,
                               int self_idx, int va, int vb)
 {
@@ -764,11 +486,8 @@ static bool bw_edge_is_shared(const Mesh *m, const bool *bad,
     return false;
 }
 
-/*
- * Step 2 -- walk every edge of every bad triangle; keep only those that
- * are NOT shared with another bad triangle.  Those unmatched edges form
- * the cavity boundary that step 4 will fan-triangulate against P.
- */
+/* Step 2 -- gather the rim of the hole: every edge of a torn-out triangle
+ * that no other torn-out triangle shares.  Step 4 fans P out to these. */
 static int bw_collect_hole(const Mesh *m, const bool *bad, HEdge *hole)
 {
     int nhole = 0;
@@ -778,15 +497,15 @@ static int bw_collect_hole(const Mesh *m, const bool *bad, HEdge *hole)
         for (int e = 0; e < 3; e++) {
             int va = vs[e];
             int vb = vs[(e + 1) % 3];
-            if (bw_edge_is_shared(m, bad, i, va, vb)) continue;   /* interior */
-            if (nhole >= MAX_HOLE) continue;                      /* safety   */
-            hole[nhole++] = (HEdge){ va, vb };                    /* boundary */
+            if (bw_edge_is_shared(m, bad, i, va, vb)) continue;   /* inside the hole */
+            if (nhole >= MAX_HOLE) continue;                      /* don't overflow  */
+            hole[nhole++] = (HEdge){ va, vb };                    /* rim edge        */
         }
     }
     return nhole;
 }
 
-/* Step 3 -- compact the triangle list, dropping every flagged triangle. */
+/* Step 3 -- drop the flagged triangles, closing the gaps in the list. */
 static void bw_remove_bad(Mesh *m, const bool *bad)
 {
     int w = 0;
@@ -795,17 +514,14 @@ static void bw_remove_bad(Mesh *m, const bool *bad)
     m->ntris = w;
 }
 
-/* Step 4 -- fan-triangulate the hole: connect P to each boundary edge. */
+/* Step 4 -- fill the hole: make a new triangle from P to each rim edge. */
 static void bw_fill_hole(Mesh *m, const HEdge *hole, int nhole, int idx)
 {
     for (int e = 0; e < nhole && m->ntris < MAX_TRIS; e++)
         m->tris[m->ntris++] = (Tri){ hole[e].a, hole[e].b, idx };
 }
 
-/*
- * mesh_insert_point() -- Bowyer-Watson driver.
- * Adds the point already stored at m->pts[idx] to the triangulation.
- */
+/* Add the point sitting at pts[idx] to the mesh -- the four steps in order. */
 static void mesh_insert_point(Mesh *m, Scratch *s, int idx)
 {
     float px = m->pts[idx].x;
@@ -817,31 +533,22 @@ static void mesh_insert_point(Mesh *m, Scratch *s, int idx)
     bw_fill_hole    (m, s->hole, nhole, idx);
 }
 
-/* ===================================================================== */
-/* S6  scene                                                              */
-/* ===================================================================== */
+/* -- S6 scene -- */
 
 /*
- * Phase -- which of the three sequential acts the demo is playing.
+ * Phase -- which of the three acts the demo is in:
+ *   PHASE_INSERT    the build -- drop in one point per tick and re-stitch.
+ *   PHASE_SHOWCASE  the proof -- walk each triangle, draw its circle, and
+ *                   check no other point is inside it (for correct output
+ *                   the count is always zero).
+ *   PHASE_DONE      a short pause, then start over with a fresh seed.
  *
- *      PHASE_INSERT     "the build": reveal one random point per sim tick,
- *                       call mesh_insert_point, draw the growing mesh.
- *                       Lasts N_POINTS ticks.
- *      PHASE_SHOWCASE   "the proof": iterate over every real triangle,
- *                       draw its circumcircle, count points inside.
- *                       For a correct implementation the count is 0
- *                       (the empty-circumcircle property -- de Berg ch. 9 [4]).
- *                       Lasts nrtris * SHOWCASE_HOLD * SHOWCASE_CYCLES ticks.
- *      PHASE_DONE       brief pause, then loop with a new seed.
- *                       Lasts DONE_TICKS ticks.
- *
- * The state machine lives in scene_tick (S6) and only that one function
- * is allowed to mutate Scene.phase.
+ * Only scene_tick is allowed to switch acts.
  */
 typedef enum { PHASE_INSERT, PHASE_SHOWCASE, PHASE_DONE } Phase;
 
-/* Human-readable name for the HUD.  Lives next to Phase so adding a new
- * phase forces the compiler to remind us to add a label here too. */
+/* Name for the HUD.  Kept next to Phase so adding an act makes the compiler
+ * nag us to add its label too. */
 static const char *phase_label(Phase p)
 {
     switch (p) {
@@ -853,108 +560,73 @@ static const char *phase_label(Phase p)
 }
 
 /*
- * Insertion -- progress state for the INSERT phase.
+ * Insertion -- where the build phase is up to.
  *
- * WHY a struct of one field:
- *      Currently there is only one cursor to track, but giving it its
- *      own struct (rather than a loose Scene.insert_idx) does two things:
- *        1. groups any future insert-phase state (e.g. interpolation
- *           progress for animated point arrival) in one place;
- *        2. makes call sites self-documenting: sc->insert.next_idx
- *           reads as "the insertion cursor", not "an int on Scene".
+ *   next_idx  the slot of the next real point to reveal and add.  It walks
+ *             from the first real point to the last; once past the last,
+ *             the demo moves on to the showcase.
  *
- * Semantics:
- *      next_idx is the index in Mesh.pts of the NEXT real point to be
- *      revealed and inserted by insertion_step.  It progresses through
- *      the half-open range [SUPER_COUNT, SUPER_COUNT + N_POINTS).
- *      When it reaches SUPER_COUNT + N_POINTS the phase transitions
- *      to SHOWCASE.
- *
- *      Convention: at any point, Mesh.npts == next_idx (the prefix of
- *      pts[] revealed so far equals the prefix processed so far).
+ * It's its own little struct (not a loose field on Scene) so the call sites
+ * read clearly and any future build-phase state has a home.
  */
 typedef struct {
-    int next_idx;    /* next point to insert; range [SUPER_COUNT, SUPER_COUNT+N_POINTS) */
+    int next_idx;
 } Insertion;
 
 /*
- * Showcase -- iterator state for the SHOWCASE phase.
+ * Showcase -- where the proof phase is up to as it visits each triangle.
  *
- * WHY rtris[] is a separate array (not just "skip super triangles inline"):
- *      The showcase cursor advances by one PER TICK across the real
- *      triangles only.  If we filtered inline ("skip if any vertex
- *      index < SUPER_COUNT") the cursor arithmetic would have to walk
- *      Mesh.tris[] from the start every tick to find the i-th real
- *      triangle.  Pre-computing the index list once (showcase_init) at
- *      INSERT->SHOWCASE transition makes per-tick access O(1).
+ *   rtris   the list of real triangles to walk, worked out once up front so
+ *           that stepping to the next one each tick is instant (rather than
+ *           re-scanning past the ghosts every time).
+ *   nrtris  how many entries rtris holds.
+ *   idx     which triangle in rtris we're showing now.
+ *   ticks   how long we've lingered on this triangle; we hold each one for a
+ *           few ticks so it's actually watchable.
+ *   pass    how many full sweeps we've made; after enough, the phase ends.
  *
- *      The cost is MAX_TRIS ints (~1.3 KB) sitting on Scene -- cheap.
- *
- * WHY (idx, ticks, pass) and not a single counter:
- *      idx     advances per triangle, used by the renderer to pick which
- *              triangle to highlight.
- *      ticks   counts sim-ticks spent on the current triangle; lets the
- *              demo "dwell" on each one for SHOWCASE_HOLD frames so a
- *              human can see it (decoupled from sim_fps speed control).
- *      pass    counts completed sweeps through rtris[]; SHOWCASE_CYCLES
- *              full passes end the phase.  Useful if we ever raise the
- *              cycle count to let the viewer see the verification twice.
- *
- *      Three separate counters mean each can change independently for
- *      reasons documented by its name.  A single packed counter would
- *      hide those three independent rates of change.
+ * Three separate counters (idx, ticks, pass) because each ticks at its own
+ * rate for its own reason.
  */
 typedef struct {
-    int rtris[MAX_TRIS];  /* pre-filtered indices into Mesh.tris (real tris only) */
-    int nrtris;           /* count of valid entries in rtris[]                    */
-    int idx;              /* cursor into rtris[]; advances when ticks >= HOLD     */
-    int ticks;            /* sim-ticks spent on rtris[idx]; resets at HOLD        */
-    int pass;             /* full sweeps through rtris[] so far; ends at CYCLES   */
+    int rtris[MAX_TRIS];
+    int nrtris;
+    int idx;
+    int ticks;
+    int pass;
 } Showcase;
 
 /*
- * Scene -- the entire simulation state in one struct.
+ * Scene -- everything the simulation needs, in one place (no globals).
+ * Keeping it together means scene_tick(Scene*) plainly states what it
+ * touches, and the whole thing can be reset or copied as a unit.
  *
- * WHY no globals:
- *      First-draft code used a fistful of g_pts/g_ntris/g_rtris globals.
- *      Folding them onto Scene buys three things:
- *        1. The function signature `scene_tick(Scene *)` documents what
- *           the simulation depends on; you cannot accidentally read
- *           triangulation state from somewhere else.
- *        2. Multiple Scenes could coexist (a future split-screen demo,
- *           or a "before/after" comparison view) with no code changes
- *           in the algorithm layer.
- *        3. Memory ownership is one variable: g_app contains the App
- *           which contains the Scene which contains everything.
- *
- * Composition (each substruct's own block-comment has the details):
- *      phase     which of the three acts is running (Phase enum above)
- *      mesh      the triangulation itself: points + triangles + counts
- *      scratch   per-insertion working memory for Bowyer-Watson
- *      insert    progress cursor for PHASE_INSERT
- *      show      iterator state for PHASE_SHOWCASE
- *
- * Loose Scene-level fields (don't belong to any sub-act):
- *      done_ticks  countdown during PHASE_DONE before scene_start_insert
- *      seed        RNG seed; bumped on reset (r key) and on auto-restart
- *      cols, rows  cached terminal dimensions; updated on SIGWINCH
- *      paused      user toggle (SPACE); freezes scene_tick
- *      step_req    user request (s key) for a single tick while paused
+ *   phase       which act is playing (only scene_tick changes it)
+ *   mesh        the triangulation itself
+ *   scratch     Bowyer-Watson's notepad for the current insertion
+ *   insert      build-phase progress
+ *   show        proof-phase progress
+ *   done_ticks  countdown during the pause before restarting
+ *   seed        the random seed; bumped on reset and on auto-restart
+ *   cols, rows  current terminal size, refreshed on resize
+ *   paused      the SPACE toggle that freezes the sim
+ *   step_req    the 's' request for a single tick while paused
  */
 typedef struct {
-    Phase     phase;       /* state-machine cursor; only scene_tick writes it */
-    Mesh      mesh;        /* the triangulation under construction            */
-    Scratch   scratch;     /* Bowyer-Watson per-call working memory           */
-    Insertion insert;      /* PHASE_INSERT progress                           */
-    Showcase  show;        /* PHASE_SHOWCASE iterator                         */
-    int       done_ticks;  /* PHASE_DONE countdown to auto-restart            */
-    unsigned  seed;        /* RNG seed; r-key adds RESET_SEED_BUMP, auto-restart adds RESTART_SEED_BUMP */
-    int       cols, rows;  /* terminal size cached from screen_init / resize  */
-    bool      paused;      /* user pause toggle (SPACE)                       */
-    bool      step_req;    /* one-shot tick request while paused (s)          */
+    Phase     phase;
+    Mesh      mesh;
+    Scratch   scratch;
+    Insertion insert;
+    Showcase  show;
+    int       done_ticks;
+    unsigned  seed;
+    int       cols, rows;
+    bool      paused;
+    bool      step_req;
 } Scene;
 
-/* Build Showcase.rtris[] -- the subset of tris that excludes the super-triangle. */
+/* Collect the real triangles (skipping ghosts) into rtris so the showcase
+ * can step through them. */
 static void showcase_init(Showcase *sh, const Mesh *m)
 {
     sh->nrtris = 0;
@@ -965,18 +637,15 @@ static void showcase_init(Showcase *sh, const Mesh *m)
     }
 }
 
-/* Index of the triangle currently being showcased, or -1 if none. */
+/* Which triangle is on display right now, or -1 if there are none. */
 static int showcase_current_tri(const Showcase *sh)
 {
     if (sh->nrtris <= 0) return -1;
     return sh->rtris[sh->idx % sh->nrtris];
 }
 
-/*
- * insertion_step() -- one sim-tick of the INSERT phase.
- * Reveals one new point and re-triangulates; when all are in, transitions
- * to SHOWCASE.
- */
+/* One tick of the build: reveal the next point and re-stitch; once they're
+ * all in, switch to the showcase. */
 static void insertion_step(Scene *sc)
 {
     if (sc->insert.next_idx < SUPER_COUNT + N_POINTS) {
@@ -990,11 +659,8 @@ static void insertion_step(Scene *sc)
     }
 }
 
-/*
- * showcase_step() -- one sim-tick of the SHOWCASE phase.
- * Advances to the next triangle every SHOWCASE_HOLD ticks; after
- * SHOWCASE_CYCLES full passes, transitions to DONE.
- */
+/* One tick of the proof: linger on each triangle a moment, move to the next,
+ * and after enough full sweeps move on to the pause. */
 static void showcase_step(Scene *sc)
 {
     sc->show.ticks++;
@@ -1012,7 +678,7 @@ static void showcase_step(Scene *sc)
     }
 }
 
-/* Begin a fresh insertion run with the current seed. */
+/* Start a fresh build from scratch with the current seed. */
 static void scene_start_insert(Scene *sc)
 {
     sc->phase           = PHASE_INSERT;
@@ -1036,14 +702,8 @@ static void scene_init(Scene *sc, int cols, int rows)
     scene_start_insert(sc);
 }
 
-/*
- * done_step() -- one sim-tick of the DONE phase.
- *
- * The DONE phase exists only to give the viewer a brief pause after the
- * SHOWCASE verifies the property.  After DONE_TICKS we bump the seed by
- * a coprime offset (so we visit a fresh RNG sub-sequence rather than a
- * neighbouring one) and start over.
- */
+/* One tick of the pause after the proof.  Once it's held long enough, jump
+ * the seed to a clearly different one and start the whole thing over. */
 static void done_step(Scene *sc)
 {
     sc->done_ticks++;
@@ -1052,15 +712,8 @@ static void done_step(Scene *sc)
     scene_start_insert(sc);
 }
 
-/*
- * scene_tick() -- one sim-tick of whichever phase is currently active.
- *
- * Reads as pseudocode:
- *   if paused (and no single-step request)  -> do nothing
- *   else                                    -> dispatch on current phase
- *
- * Only this function may transition between phases.
- */
+/* Advance whichever act is playing by one tick (unless paused).  This is the
+ * only place acts switch. */
 static void scene_tick(Scene *sc)
 {
     if (sc->paused && !sc->step_req) return;
@@ -1073,41 +726,22 @@ static void scene_tick(Scene *sc)
     }
 }
 
-/* ===================================================================== */
-/* S7  render                                                             */
-/* ===================================================================== */
+/* -- S7 render -- */
 
 /*
- * TriCells -- the three vertices of a Tri, snapped to integer cells.
- *
- * WHY a struct (not just six locals at each call site):
- *      Two renderers (render_mesh_edges, render_highlight) need exactly
- *      the same six numbers, computed exactly the same way.  Bundling
- *      them as TriCells lets one tri_cells() call replace twelve casts.
- *      The actual round-to-nearest convention is one level deeper, in
- *      cell_round() -- switching to floor()/lroundf() would change that
- *      one helper and propagate everywhere automatically.
- *
- * Coordinate space:
- *      Cell space (NOT geometry space).  Bresenham/draw_line work in
- *      whole cell units; aspect correction is the renderer's job for
- *      the circle path only (render_circumcircle), not the line path.
- *      See Bresenham 1965 [7].
- *
- * Naming: ax,ay are vertex a's column,row; bx,by vertex b; cx,cy vertex c.
- *      Two-letter names beat aliased locals because Bresenham takes
- *      pairs and the call site reads naturally as
- *          draw_line(c.ax,c.ay, c.bx,c.by, ...);
+ * TriCells -- a triangle's three corners rounded to whole screen cells, ready
+ * for the line drawer.  ax,ay is corner a's column and row, and so on.  We
+ * bundle the six numbers so the two edge-drawing functions share one rounding
+ * step instead of repeating it.  These are plain screen cells -- the round
+ * circle is the only thing that needs the aspect stretch, not the edges.
  */
 typedef struct { int ax, ay, bx, by, cx, cy; } TriCells;
 
-/* ---- coordinate helpers --------------------------------------------- */
-
-/* Round-to-nearest cell coordinates of a single Pt. */
+/* Round a coordinate to the nearest whole cell. */
 static inline int cell_round(float v) { return (int)(v + 0.5f); }
 
-/* Cell-space (integer) coordinates of a triangle's three vertices.
- * The one place rounding happens for rendering. */
+/* A triangle's three corners as whole cells -- the one spot rounding happens
+ * for drawing. */
 static TriCells tri_cells(const Mesh *m, const Tri *t)
 {
     return (TriCells){
@@ -1117,35 +751,29 @@ static TriCells tri_cells(const Mesh *m, const Tri *t)
     };
 }
 
-/* ---- circle-geometry helpers ---------------------------------------- */
-
-/* Is geo-space point (px,py) inside a circle with squared radius r2?
- * Uses VIOLATION_EPS slack so points sitting exactly on the boundary
- * aren't flagged.  Squared form -- no sqrt needed for the predicate. */
+/* Is the point inside the circle (squared radius r2)?  A touch of slack
+ * (VIOLATION_EPS) so a point sitting right on the rim isn't counted in. */
 static inline bool pt_in_circle_sqr(float px, float py,
                                     float ocx, float ocy, float r2)
 {
     return vec2_sqr_mag(px - ocx, py - ocy) < r2 - VIOLATION_EPS;
 }
 
-/* The aspect-corrected projection of a geometry-space circle into the
- * cell-space ellipse that draw_ellipse() actually rasterises.  X is
- * unchanged (cells and geo agree on width); Y compresses by ASPECT_Y. */
+/* A circle from the math turned into the squashed oval we actually draw on
+ * screen.  Width stays as is; height is compressed to undo the cell stretch. */
 typedef struct { float cx, cy, rx, ry; } CellEllipse;
 
 static CellEllipse circle_to_cell_ellipse(float ocx_geo, float ocy_geo, float r_geo)
 {
     return (CellEllipse){
-        .cx = ocx_geo,                   /* geo-x == cell-x       */
-        .cy = ocy_geo / ASPECT_Y,        /* compress y to cells   */
+        .cx = ocx_geo,
+        .cy = ocy_geo / ASPECT_Y,
         .rx = r_geo,
         .ry = r_geo / ASPECT_Y,
     };
 }
 
-/* ---- single-cell renderers ------------------------------------------ */
-
-/* Mark the circumcenter as a bright '+' dot. */
+/* Mark the circle's center with a bright '+'. */
 static void plot_circumcenter(float cx_f, float cy_f, int rows, int cols)
 {
     int x = cell_round(cx_f), y = cell_round(cy_f);
@@ -1163,7 +791,7 @@ static void plot_point(const Pt *p, int cp, int rows, int cols)
     attroff(COLOR_PAIR(cp) | A_BOLD);
 }
 
-/* Mark a Delaunay-property violator as a red 'X'. */
+/* Mark a point that broke the empty-circle rule with a red 'X'. */
 static void plot_violation(const Pt *p, int rows, int cols)
 {
     int x = cell_round(p->x), y = cell_round(p->y);
@@ -1172,16 +800,12 @@ static void plot_violation(const Pt *p, int rows, int cols)
     attroff(COLOR_PAIR(CP_POINT_IN) | A_BOLD);
 }
 
-/* ---- triangle-level geometry query ---------------------------------- */
-
 /*
- * tri_inside_count() -- count points inside triangle t's circumcircle
- * (excluding t's own vertices).  This is the Delaunay verification
- * predicate played out at the visualisation layer: zero means the
- * empty-circumcircle property holds for this triangle.
- *
- * Out-parameters expose the circle (center + radius) for HUD display;
- * pass NULL if uninterested.
+ * Count how many other points fall inside this triangle's circle (its own
+ * three corners don't count).  Zero is the goal -- it means the triangle
+ * obeys the empty-circle rule that makes the mesh Delaunay.  The circle's
+ * center and radius come back through the out-params for the HUD; pass NULL
+ * to skip them.
  */
 static int tri_inside_count(const Mesh *m, const Tri *t,
                             float *out_ocx, float *out_ocy, float *out_r)
@@ -1210,9 +834,7 @@ static int tri_inside_count(const Mesh *m, const Tri *t,
     return inside;
 }
 
-/* ---- per-layer renderers -------------------------------------------- */
-
-/* Layer 1 -- every real triangle's three edges as dim blue dots. */
+/* Draw every real triangle's three edges as dim blue dots. */
 static void render_mesh_edges(const Mesh *m, int rows, int cols)
 {
     for (int i = 0; i < m->ntris; i++) {
@@ -1225,7 +847,7 @@ static void render_mesh_edges(const Mesh *m, int rows, int cols)
     }
 }
 
-/* Layer 2 -- the showcase triangle's edges in bright yellow. */
+/* Draw the triangle on display in bright yellow. */
 static void render_highlight(const Mesh *m, const Tri *t, int rows, int cols)
 {
     TriCells c = tri_cells(m, t);
@@ -1234,7 +856,7 @@ static void render_highlight(const Mesh *m, const Tri *t, int rows, int cols)
     draw_line(c.cx,c.cy, c.ax,c.ay, CP_EDGE_HI, '+', rows,cols);
 }
 
-/* Layer 3-4 -- circumcircle ring + circumcenter dot. */
+/* Draw the triangle's circle plus a dot at its center. */
 static void render_circumcircle(const Mesh *m, const Tri *t, int rows, int cols)
 {
     float ax,ay, bx,by, cx,cy;
@@ -1248,10 +870,8 @@ static void render_circumcircle(const Mesh *m, const Tri *t, int rows, int cols)
     plot_circumcenter(e.cx, e.cy, rows, cols);
 }
 
-/*
- * Layer 5 -- every revealed real point as '@'.  In INSERT, the most-
- * recently inserted point is yellow; everything else white.
- */
+/* Draw every revealed point as '@'.  During the build, the one just added is
+ * yellow and the rest are white. */
 static void render_points(const Mesh *m, Phase phase, int newest,
                           int rows, int cols)
 {
@@ -1261,12 +881,8 @@ static void render_points(const Mesh *m, Phase phase, int newest,
     }
 }
 
-/*
- * Layer 6 -- red 'X' overlay on any point that violates the empty-
- * circumcircle property for the showcased triangle.  In a correct
- * Bowyer-Watson implementation this layer always paints zero pixels --
- * its presence on screen would mean a bug.
- */
+/* Put a red 'X' on any point caught inside the displayed triangle's circle.
+ * If the algorithm is right this never draws anything -- seeing one means a bug. */
 static void render_violations(const Mesh *m, const Tri *t, int rows, int cols)
 {
     float ax,ay, bx,by, cx,cy;
@@ -1283,7 +899,7 @@ static void render_violations(const Mesh *m, const Tri *t, int rows, int cols)
     }
 }
 
-/* render_scene() -- composite the six visualisation layers in back-to-front order. */
+/* Draw the whole picture, back layer to front. */
 static void render_scene(const Scene *sc, int rows, int cols)
 {
     const Mesh *m = &sc->mesh;
@@ -1303,9 +919,7 @@ static void render_scene(const Scene *sc, int rows, int cols)
     if (ti >= 0) render_violations(m, &m->tris[ti], rows, cols);
 }
 
-/* ---- HUD row helpers ------------------------------------------------- */
-
-/* Row 0 left -- the title block. */
+/* The title, top-left. */
 static void hud_draw_title(void)
 {
     attron(COLOR_PAIR(CP_HEADER) | A_BOLD);
@@ -1315,7 +929,7 @@ static void hud_draw_title(void)
     attroff(COLOR_PAIR(CP_HEADER) | A_BOLD);
 }
 
-/* Row 0 right -- live engine stats: render fps, sim Hz, paused/running. */
+/* Live stats top-right: frames per second, sim speed, and paused/running. */
 static void hud_draw_engine_stats(const Scene *sc, double fps, int sim_fps,
                                   int cols)
 {
@@ -1330,7 +944,7 @@ static void hud_draw_engine_stats(const Scene *sc, double fps, int sim_fps,
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/* Row 1 -- triangle count, point count, phase name. */
+/* Triangle count, point count, and current phase. */
 static void hud_draw_counts(const Scene *sc)
 {
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
@@ -1342,7 +956,7 @@ static void hud_draw_counts(const Scene *sc)
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/* Row 2 (SHOWCASE) left -- which triangle, its circumradius, its center. */
+/* During the proof: which triangle, and its circle's radius and center. */
 static void hud_draw_circle_stats(const Scene *sc, float r, float ocx, float ocy)
 {
     attron(COLOR_PAIR(CP_HUD));
@@ -1353,7 +967,7 @@ static void hud_draw_circle_stats(const Scene *sc, float r, float ocx, float ocy
     attroff(COLOR_PAIR(CP_HUD));
 }
 
-/* Row 2 (SHOWCASE) right -- the empty-circumcircle verdict, green/red. */
+/* The verdict for the current triangle: green if its circle is empty, red if not. */
 static void hud_draw_verdict(int inside, int cols)
 {
     int verdict_color = (inside == 0) ? CP_OK : CP_WARN;
@@ -1367,7 +981,7 @@ static void hud_draw_verdict(int inside, int cols)
     attroff(COLOR_PAIR(verdict_color) | A_BOLD);
 }
 
-/* Row 2 (SHOWCASE) -- compose the stats + verdict for the current triangle. */
+/* Pull the current triangle's circle stats and verdict together onto one row. */
 static void hud_draw_showcase_detail(const Scene *sc, int cols)
 {
     int ti = showcase_current_tri(&sc->show);
@@ -1381,7 +995,7 @@ static void hud_draw_showcase_detail(const Scene *sc, int cols)
     hud_draw_verdict(inside, cols);
 }
 
-/* Row 2 (INSERT) -- one-line progress tip. */
+/* During the build: a one-line progress note. */
 static void hud_draw_insert_progress(const Scene *sc)
 {
     attron(COLOR_PAIR(CP_LABEL));
@@ -1399,14 +1013,8 @@ static void hud_draw_separator(int row, int cols)
     attroff(COLOR_PAIR(CP_LABEL));
 }
 
-/*
- * render_header() -- top HUD (rows 0..HUD_TOP_ROWS-1) carries the data.
- *
- *   Row 0  title (left)                +  fps / sim Hz / paused (right)
- *   Row 1  triangles, points, phase
- *   Row 2  showcase circumcircle stats OR insertion progress
- *   Row 3  separator
- */
+/* Draw the top HUD strip: title and stats, the counts, the phase-specific
+ * line, and the divider under them. */
 static void render_header(const Scene *sc, double fps, int sim_fps,
                           int rows, int cols)
 {
@@ -1424,7 +1032,7 @@ static void render_header(const Scene *sc, double fps, int sim_fps,
     hud_draw_separator(HUD_SEPARATOR_ROW, cols);
 }
 
-/* render_overlay() -- bottom HUD (row rows-1) carries the action keys. */
+/* Draw the bottom strip listing the keys you can press. */
 static void render_overlay(int rows, int cols)
 {
     (void)cols;
@@ -1434,28 +1042,15 @@ static void render_overlay(int rows, int cols)
     attroff(COLOR_PAIR(CP_HEADER)|A_BOLD);
 }
 
-/* ===================================================================== */
-/* S8  screen                                                             */
-/* ===================================================================== */
+/* -- S8 screen -- */
 
 /*
- * Screen -- cached terminal geometry.
- *
- * WHY cache cols/rows on a struct instead of calling getmaxyx() everywhere:
- *      getmaxyx is cheap but not free, and -- more importantly -- many
- *      functions in the render layer take rows/cols as plain ints.
- *      Passing one Screen* would conflate "I need the size" with "I need
- *      to talk to ncurses".  Holding the size as a value lets the math
- *      layer stay terminal-agnostic; only screen_init / screen_resize /
- *      screen_draw ever touch ncurses.
- *
- * Update points:
- *      screen_init      -- once at startup
- *      screen_resize    -- after a SIGWINCH (raised by the kernel on
- *                          terminal resize; handled in S9 app)
- *
- * Fields are in ncurses convention: cols = X-extent, rows = Y-extent.
- * Both are 1-based counts, so valid coordinates are [0, cols-1] x [0, rows-1].
+ * Screen -- the terminal's current width and height, remembered so the
+ * drawing code can take plain numbers and never has to ask ncurses itself.
+ * Only the three functions below touch ncurses; everyone else just gets the
+ * size.  It's refreshed at startup and again whenever the window resizes.
+ * cols is the width, rows the height, so valid spots run 0..cols-1 across
+ * and 0..rows-1 down.
  */
 typedef struct { int cols, rows; } Screen;
 
@@ -1485,47 +1080,31 @@ static void screen_draw(const Screen *s, const Scene *sc,
     doupdate();
 }
 
-/* ===================================================================== */
-/* S9  app                                                                */
-/* ===================================================================== */
+/* -- S9 app -- */
 
 /*
- * App -- the top-level container.  Exists as a single static instance
- * (g_app, below) so the signal handlers can poke flags on it without
- * needing globals scattered across the file.
+ * App -- the whole program in one box, kept as a single static instance so
+ * the signal handlers have something to flip flags on without scattered
+ * globals.  Those flags live here, not on Scene, because quitting and
+ * resizing are the run loop's business, leaving Scene as pure sim state.
  *
- * WHY signal handler flags are on App, not Scene:
- *      Signals interrupt the main loop, not the simulation.  "Should I
- *      quit?" and "did the terminal change size?" are concerns of the
- *      run loop in main(), not of Bowyer-Watson.  Keeping them out of
- *      Scene means Scene stays pure simulation state -- snapshottable,
- *      restartable, testable in isolation.
+ *   scene        the simulation
+ *   screen       the terminal size
+ *   sim_fps      how fast the sim ticks; the +/- keys nudge it, separate
+ *                from how fast we redraw
+ *   running      the quit signal sets this to 0; the loop then exits cleanly
+ *   need_resize  the resize signal sets this to 1; the loop rebuilds next time
  *
- * WHY volatile sig_atomic_t (and not bool):
- *      Per POSIX, sig_atomic_t is the only integer type guaranteed
- *      atomic with respect to async signal delivery, and `volatile`
- *      forces the main loop to re-read from memory each iteration
- *      rather than caching in a register.  Without both qualifiers
- *      the compiler may legally hoist the flag read out of the loop
- *      and the program would never see the signal-set value.
- *
- * Fields:
- *      scene        the simulation itself; everything algorithm-related
- *      screen       cached terminal dimensions (see Screen above)
- *      sim_fps      tick rate of scene_tick; +/- keys adjust it within
- *                   [SIM_FPS_MIN, SIM_FPS_MAX].  Independent of render
- *                   fps (TARGET_FPS), which is fixed at 60.
- *      running      set to 0 by SIGINT/SIGTERM handler; main loop
- *                   checks each iteration and exits cleanly via atexit.
- *      need_resize  set to 1 by SIGWINCH handler; main loop calls
- *                   screen_resize + scene_init on next iteration.
+ * running and need_resize are volatile sig_atomic_t -- the one type a signal
+ * can safely set, with volatile so the loop actually re-reads it each pass
+ * instead of caching a stale copy.
  */
 typedef struct {
-    Scene                 scene;       /* simulation state                    */
-    Screen                screen;      /* terminal size cache                 */
-    int                   sim_fps;     /* sim-tick rate; +/- adjust at runtime */
-    volatile sig_atomic_t running;     /* 0 = main loop should exit (SIGINT)  */
-    volatile sig_atomic_t need_resize; /* 1 = main loop should re-init screen */
+    Scene                 scene;
+    Screen                screen;
+    int                   sim_fps;
+    volatile sig_atomic_t running;
+    volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
@@ -1560,13 +1139,8 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* ---- main-loop step helpers ----------------------------------------- */
-
-/*
- * Compute wallclock dt since the previous frame, capped at DT_CAP_NS so
- * a long pause (debugger, terminal suspend) doesn't unleash a flood of
- * sim ticks trying to catch up.
- */
+/* How much real time passed since last frame, capped so a long stall doesn't
+ * make the sim try to catch up all at once. */
 static int64_t frame_dt_clamped(int64_t *last_ns)
 {
     int64_t now = clock_ns();
@@ -1576,13 +1150,9 @@ static int64_t frame_dt_clamped(int64_t *last_ns)
     return dt;
 }
 
-/*
- * Fixed-timestep accumulator: drain whole sim ticks at the current
- * sim_fps rate.  Decouples simulation rate from render fps so visual
- * speed is the same on a 30 fps and a 144 fps terminal.
- *
- * Reference for this pattern: "Fix Your Timestep!" -- Glenn Fiedler.
- */
+/* Run as many fixed-size sim steps as the elapsed time has earned.  This
+ * keeps the sim's pace the same whatever the redraw rate.  (Glenn Fiedler,
+ * "Fix Your Timestep!") */
 static void frame_drain_sim_ticks(Scene *sc, int sim_fps, int64_t *accum)
 {
     int64_t tick_ns = TICK_NS(sim_fps);
@@ -1592,8 +1162,8 @@ static void frame_drain_sim_ticks(Scene *sc, int sim_fps, int64_t *accum)
     }
 }
 
-/* Rolling FPS counter -- average frames per second over the most recent
- * FPS_UPDATE_MS window, then reset. */
+/* Work out the average frame rate over the last little while, then start a
+ * fresh window. */
 static void fps_counter_update(int64_t dt, int64_t *accum_ns,
                                int *frame_count, double *fps_out)
 {
@@ -1607,17 +1177,15 @@ static void fps_counter_update(int64_t dt, int64_t *accum_ns,
     *accum_ns     = 0;
 }
 
-/* Sleep just long enough to maintain TARGET_FPS, given how much wall time
- * this frame already spent (work_so_far covers everything since
- * frame_start_ns). */
+/* Nap for whatever's left of this frame's time budget, so we hold a steady
+ * frame rate instead of running flat out. */
 static void frame_sleep_to_target(int64_t frame_start_ns, int64_t work_so_far)
 {
     int64_t spent = clock_ns() - frame_start_ns + work_so_far;
     clock_sleep_ns(FRAME_PERIOD_NS - spent);
 }
 
-/* Pull pending keystroke; dispatch to app_handle_key.  Returns false
- * only when the user pressed a quit key (caller should exit). */
+/* Handle one pending keypress.  Returns false only if it was a quit key. */
 static bool drain_input(App *app)
 {
     int ch = getch();
@@ -1625,8 +1193,8 @@ static bool drain_input(App *app)
     return app_handle_key(app, ch);
 }
 
-/* Respond to SIGWINCH: re-query terminal size, rebuild Scene, reset
- * timing so the next dt isn't enormous. */
+/* Handle a window resize: get the new size, rebuild the scene to fit, and
+ * reset the clock so the next frame's elapsed time isn't huge. */
 static void apply_resize(App *app, int64_t *frame_time, int64_t *sim_accum)
 {
     screen_resize(&app->screen);
@@ -1636,7 +1204,7 @@ static void apply_resize(App *app, int64_t *frame_time, int64_t *sim_accum)
     *sim_accum       = 0;
 }
 
-/* Install handlers, wire atexit cleanup. */
+/* Wire up the quit/resize signals and make sure the terminal is restored on exit. */
 static void install_signal_handlers(void)
 {
     atexit(cleanup);
@@ -1645,7 +1213,7 @@ static void install_signal_handlers(void)
     signal(SIGWINCH, on_resize);
 }
 
-/* Bring the App up: defaults, screen, scene. */
+/* Get everything ready to run: defaults, the screen, and the scene. */
 static void app_init(App *app)
 {
     app->running     = 1;
@@ -1655,9 +1223,7 @@ static void app_init(App *app)
     scene_init(&app->scene, app->screen.cols, app->screen.rows);
 }
 
-/*
- * main() -- the orchestrator.  Each line is one named phase of a frame.
- */
+/* The main loop: each pass measures time, runs the sim, draws, and reads input. */
 int main(void)
 {
     install_signal_handlers();

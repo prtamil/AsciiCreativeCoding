@@ -1,119 +1,14 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * lissajous.c — Harmonograph / Lissajous Figures
+ * lissajous.c — a "harmonograph": two swings, one left-right and one
+ * up-down, fading out as they go.  Their combined trail draws figure-8s,
+ * stars, petals and spirals that slowly morph as one swing's timing drifts.
  *
- * Two perpendicular damped oscillators:
- *   x(t) = sin(fx·t + phase)·exp(−decay·t)
- *   y(t) = sin(fy·t)       ·exp(−decay·t)
- *
- * The phase offset drifts slowly, morphing the Lissajous figure
- * through figure-8s, stars, petals, and spirals.  Drift slows near
- * symmetric phases so each named shape dwells on screen before the
- * figure transitions.  After a full 2π phase sweep the program
- * auto-advances to the next rational frequency ratio.
- *
- * Ratios:  1:2 Figure-8 · 2:3 Trefoil · 3:4 Star   · 1:3 Clover
- *          3:5 Pentagram · 2:5 Five-petal · 4:5 Crown · 1:4 Eye
- *
- * Each ratio's T_MAX scales to N_LOOPS=4 cycles of the slower
- * oscillator, and DECAY adjusts so amplitude reaches ~1% at T_MAX —
- * giving an identical spiral depth regardless of frequency ratio.
- *
- * Rendering: draw the full decaying spiral each frame (oldest innermost
- * first, newest outermost last).  Four brightness levels map to the four
- * decay loops; the outermost loop is always brightest.
- *
- * Keys:
- *   space      pause / resume
- *   n / p      next / prev ratio (resets phase to 0)
- *   + / =      faster phase drift
- *   - / _      slower phase drift
- *   c          cycle color themes (Golden / Ice / Ember / Neon)
- *   q / Q      quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra geometry/lissajous.c -o lissajous -lncurses -lm
- *
- * Sections: §1 config  §2 clock  §3 color  §4 sim  §5 scene  §6 screen  §7 app
+ * Curve names and the closed-curve idea: Lawrence, "A Catalog of Special
+ * Plane Curves" (1972).  Named after Lissajous (1857), but Bowditch drew
+ * the same family ~40 years earlier, so older texts call them Bowditch
+ * curves.  The fading instrument itself: Whitaker, Am. J. Phys. 69 (2001).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Parametric curve tracing with decaying amplitude.
- *                  The Lissajous figure is traced analytically (no ODE) by
- *                  evaluating the closed-form parametric equations at each t.
- *                  A decaying exponential envelope ensures the spiral converges
- *                  to the centre, giving finite total length.
- *
- * Math           : Lissajous figures x(t) = A sin(fx·t + φ), y(t) = B sin(fy·t).
- *                  Ratio fx:fy rational → closed curve (repeats exactly).
- *                  The figure has fx·fy/gcd(fx,fy) lobes and is symmetric about
- *                  both axes when φ=0.  Phase offset φ = π/2 → rotated figure.
- *                  With damping: x = sin(fx·t + φ) · e^(-λt)
- *                  The decay λ is set so amplitude ≈ 1% at T_MAX:
- *                    λ = ln(100) / T_MAX ≈ 4.6 / T_MAX
- *
- * Rendering      : The full curve is redrawn each frame (not accumulated).
- *                  Four brightness levels map to the four decay loops:
- *                  newest (largest amplitude) = brightest, innermost = dimmest.
- *                  Phase drifts slowly to cycle through all Lissajous shapes
- *                  for the current frequency ratio.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* -- REFERENCES ---------------------------------------------------------  *
- *
- * History & original mathematics:
- *   [1] Lissajous, J. A. (1857). "Mémoire sur l'étude optique des mouvements
- *       vibratoires." Annales de Chimie et de Physique, 51, 147-231.
- *       -- the namesake paper: figures traced by two perpendicular tuning
- *          forks observed through a mirror.  The shape catalogue that gives
- *          k_ratios[] its names (figure-8, trefoil, star, ...) traces back
- *          to this work.
- *
- *   [2] Bowditch, N. (1815). "On the motion of a pendulum suspended from
- *       two points." Memoirs of the American Academy of Arts & Sciences,
- *       3(2), 413-436.
- *       -- predates Lissajous by ~40 years; the curves are also called
- *          "Bowditch curves" in some texts.  Different derivation (compound
- *          pendulum), same family of (x(t), y(t)) = (sin fx t, sin fy t).
- *
- *   [3] Lawrence, J. D. (1972). "A Catalog of Special Plane Curves."
- *       Dover Publications.  Reprint of the 1955 edition.
- *       -- chapter on Lissajous curves: closed-curve criterion, lobe
- *          count, symmetries by phase.  The reference catalogue.
- *
- * Physics of damped oscillators (the decay envelope):
- *   [4] French, A. P. (1971). "Vibrations and Waves." MIT Introductory
- *       Physics Series, W. W. Norton.
- *       -- the canonical undergrad treatment of damped harmonic motion;
- *          source of the e^(-λt) envelope evaluated by §5 envelope_amp().
- *
- *   [5] Whitaker, R. J. (2001). "Harmonographs. I. Pendulum design" and
- *       "II. Circular design." American Journal of Physics 69(2),
- *       162-167 & 174-183.
- *       -- the harmonograph is the 19th-century mechanical instrument
- *          that DRAWS damped Lissajous spirals -- exactly what this file
- *          simulates.  These two papers derive the equations and the
- *          aesthetic effect of detuning fx:fy slightly off-rational.
- *
- * Dynamical systems context:
- *   [6] Strogatz, S. H. (2015). "Nonlinear Dynamics and Chaos: With
- *       Applications to Physics, Biology, Chemistry, and Engineering"
- *       (2nd ed.). Westview Press.
- *       -- chapters on coupled oscillators explain WHY rational fx:fy
- *          gives closed curves and irrational fx:fy gives space-filling
- *          ergodic orbits.  Same machinery, broader frame.
- *
- * Rendering:
- *   [7] Foley, van Dam, Feiner, Hughes (1995). "Computer Graphics:
- *       Principles and Practice" (2nd ed. in C), chapter 11.
- *       Addison-Wesley.
- *       -- parametric-curve discretization, uniform vs. adaptive
- *          t-sampling.  The N_CURVE_PTS uniform sampling we use is the
- *          textbook trade-off (simple, good enough at this scale; for
- *          high-curvature regions adaptive sampling would win).
- *
- * ----------------------------------------------------------------------- */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -128,67 +23,50 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
 #define TICK_NS       33333333LL   /* ~30 fps                              */
-#define N_CURVE_PTS   2500         /* parametric samples per frame          */
-#define N_LOOPS       4            /* complete cycles of slower oscillator  */
-#define DECAY_TOTAL   4.5f         /* total exponent → amp ≈ 1% at T_MAX   */
-#define CELL_ASPECT   2.0f         /* physical char height / width ratio    */
-#define AMP_FRAC      0.92f        /* fraction of screen half-size used     */
+#define N_CURVE_PTS   2500         /* points sampled along the curve        */
+#define N_LOOPS       4            /* how many loops the spiral shows       */
+#define DECAY_TOTAL   4.5f         /* fade strength: ~1% brightness at end  */
+#define CELL_ASPECT   2.0f         /* a cell is this much taller than wide   */
+#define AMP_FRAC      0.92f        /* leave a little breathing room at edge  */
 
-/* Color pairs: N_THEMES × N_LEVELS + HUD + HINT */
-#define N_LEVELS      4            /* one brightness level per decay loop   */
+/* One color slot per (theme, brightness), plus two for the HUD rows. */
+#define N_LEVELS      4            /* one brightness step per spiral loop   */
 #define N_THEMES      4
 #define CP_IDX(t,l)   ((t)*N_LEVELS + (l) + 1)
-#define CP_HUD        (N_THEMES * N_LEVELS + 1)   /* data row (top)         */
-#define CP_HINT       (N_THEMES * N_LEVELS + 2)   /* action row (bottom)    */
+#define CP_HUD        (N_THEMES * N_LEVELS + 1)   /* top info row          */
+#define CP_HINT       (N_THEMES * N_LEVELS + 2)   /* bottom keys row       */
 
-/* HUD layout — one row reserved at top for data, one at bottom for keys.
- * The drawing area is rows [HUD_TOP_ROWS, rows - HUD_BOTTOM_ROWS). */
+/* Reserve one row top and bottom for the HUD; the curve uses the middle. */
 #define HUD_TOP_ROWS     1
 #define HUD_BOTTOM_ROWS  1
 
-/* Math literals named for their geometric meaning. */
 #define TAU              (2.0f * (float)M_PI)   /* one full turn, radians */
 
-/* Rendering thresholds and tunings. */
-#define AMP_VISIBLE_MIN  0.01f   /* skip samples whose envelope amplitude
-                                    is below this -- they are below the
-                                    "1% of full" target (DECAY_TOTAL was
-                                    calibrated to bottom out exactly here). */
-#define BOLD_LEVELS      2       /* brightness tiers [0, BOLD_LEVELS) get
-                                    A_BOLD; the two dimmer tiers do not.    */
-#define EDGE_MARGIN_X    2       /* total cells reserved horizontally
-                                    (1 on each side) so the widest point
-                                    of the figure never lands on column 0
-                                    or column cols-1.                       */
+/* Once a point has faded below 1% brightness, stop drawing it. */
+#define AMP_VISIBLE_MIN  0.01f
+/* The two brightest loops get bold; the two dim ones don't. */
+#define BOLD_LEVELS      2
+/* Keep one blank column on each side so the curve never hugs the edge. */
+#define EDGE_MARGIN_X    2
 
-/* Phase drift (rad/tick; 2π ÷ (DRIFT × 30fps) = seconds per ratio) */
-#define DRIFT_DEFAULT 0.004f       /* 2π in ~1047 ticks ≈ 35 s             */
+/* How fast the figure morphs, in radians of phase per tick. */
+#define DRIFT_DEFAULT 0.004f       /* full sweep takes about 35 seconds    */
 #define DRIFT_MIN     0.0005f
 #define DRIFT_MAX     0.08f
 #define DRIFT_STEP    1.6f
 
-/*
- * Drift slow-down near symmetric phases.
- *
- * Tuning knobs for the V-shaped dwell envelope built in §4 by
- * ratio_key_period + dwell_envelope.  DWELL_WIDTH sets the V's width
- * (as a fraction of the key-phase period), DWELL_SPEED sets its floor
- * (the speed multiplier at the bottom of the V).  See dwell_envelope
- * for the full formula.
- */
-#define DWELL_WIDTH   0.25f        /* width of the dwell well, fraction of kp */
-#define DWELL_SPEED   0.25f        /* speed multiplier at the well floor      */
+/* The morph slows to a near-stop on each "named" shape so you can see it,
+ * then speeds back up.  WIDTH is how wide that slow zone is, SPEED is how
+ * slow it gets at the bottom (see dwell_envelope in §4). */
+#define DWELL_WIDTH   0.25f
+#define DWELL_SPEED   0.25f
 
 #define N_RATIOS      8
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ── */
 
 static long long clock_ns(void)
 {
@@ -204,49 +82,25 @@ static void clock_sleep_ns(long long ns)
     nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3  color ── */
 
 /*
- * Theme -- an N_LEVELS-stop color ramp paired with its display name.
+ * Theme -- one named color scheme for the spiral.
  *
- * WHY this exists:
- *   The spiral has N_LOOPS = 4 visible decay loops; each loop occupies
- *   a distinct slice of t and gets its own brightness tier so the eye
- *   reads the loops as a stack from "freshest" (outer, brightest) to
- *   "stalest" (inner, dimmest).  Two orthogonal visual channels carry
- *   the two signals: COLOR encodes the theme; BRIGHTNESS encodes the
- *   age tier.  Each (theme, tier) pair therefore needs its own ANSI
- *   color code -- the colors[] array.
+ * The spiral has four loops, drawn from outer to inner.  We use two
+ * separate cues so both are easy to read at once: the theme picks the
+ * hue family, and brightness marks the loop's age.  The outer loop is
+ * the newest and brightest; the inner loop is the oldest and dimmest.
+ * Every theme keeps that same bright-to-dim shading, so switching themes
+ * never changes which loop looks "fresh".
  *
- * WHY one struct (not two parallel arrays as the first draft had):
- *   colors[] and name were always indexed by the same theme_idx;
- *   pairing them as a record lets the type system enforce "no orphaned
- *   name".  k_themes[i].name is the HUD label; k_themes[i].colors[l]
- *   is the 256-color ANSI code for brightness tier l.
- *
- * WHY N_LEVELS = 4 (and not, say, 8):
- *   It must equal N_LOOPS so each decay loop maps to exactly one
- *   brightness tier.  More tiers would split a single loop across
- *   colors (visually confusing); fewer would merge loops (the depth
- *   stack would collapse).
- *
- * Brightness convention (every theme obeys it):
- *   l = 0                outermost loop -- newest, full amp, brightest hue
- *   l = N_LEVELS - 1     innermost loop -- oldest, tiny amp, dimmest hue
- *   Same ramp shape across all themes; only the hue FAMILY differs
- *   (Golden / Ice / Ember / Neon).  Cycling themes with the c key
- *   therefore preserves the brightness gradient -- the eye reads the
- *   same depth signal regardless of palette.
- *
- * Reference: Foley/van Dam [7] §13 on perceptual brightness ramps;
- *   we sit at the trivial end of that machinery (discrete 4-stop, no
- *   gamma correction, no LUT interpolation).
+ *   name      label shown in the HUD ("Golden", "Ice", ...)
+ *   colors    four 256-color codes, brightest (outer loop) first;
+ *             one per loop, so there are exactly N_LEVELS of them
  */
 typedef struct {
-    const char *name;             /* HUD label ("Golden", "Ice", ...)       */
-    int         colors[N_LEVELS]; /* 256-color ANSI codes; brightest first  */
+    const char *name;
+    int         colors[N_LEVELS];
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -260,10 +114,8 @@ static const Theme k_themes[N_THEMES] = {
     { "Neon",   { 118,  82,  28,  22 } },
 };
 
-/* Glyph for each brightness level, brightest first.
- * Orthogonal to Theme -- the same four characters render across every
- * hue family, so character shape carries the brightness signal and
- * color carries the theme signal. */
+/* The character drawn for each loop, brightest first.  Same four shapes
+ * in every theme, so the glyph alone tells you how fresh a loop is. */
 static const char k_lev_ch[N_LEVELS] = { '#', '*', '+', '.' };
 
 static void color_init(void)
@@ -284,52 +136,25 @@ static void color_init(void)
     }
 }
 
-/* ===================================================================== */
-/* §4  sim                                                                */
-/* ===================================================================== */
+/* ── §4  sim ── */
 
 /*
- * Ratio -- one (fx:fy) integer frequency pair plus its shape-family name.
+ * Ratio -- how fast the two swings go, and what shape that makes.
  *
- * WHY exact integers (and not floats):
- *   The integrality of fx and fy is the WHOLE REASON the Lissajous
- *   figure is a closed curve rather than a never-repeating space-filler.
- *   With fx, fy ∈ Z the parametric x(t), y(t) share a common period
+ * The whole trick is that the speeds are whole numbers.  Whole-number
+ * speeds make the trail join back up into a closed shape; any other
+ * speed ratio would never close and would just smear over the whole box.
+ * The bigger the numbers, the more lobes the figure has.
  *
- *      T = 2π · lcm(fx, fy) / (fx · fy)
+ *   fx, fy   the two swing speeds, as whole numbers (X swing, Y swing)
+ *   name     the shape this ratio makes ("Trefoil", "Pentagram", ...)
  *
- *   so the trajectory returns to (x(0), y(0)) after time T.  Irrational
- *   ratios make the curve ergodic -- it densely fills the rectangle
- *   and never closes.  See Strogatz [6] ch. 8 for the formal coupled-
- *   oscillator argument; Lawrence [3] for the classical closed-curve
- *   catalogue.
- *
- *   fx, fy are stored as int so the code reflects that exactness;
- *   callers promote to float at the math boundary (sinf / fminf).
- *
- * Lobe count (for gcd(fx, fy) = 1, phase φ = π/2):
- *   - 'fx' lobes along the X axis
- *   - 'fy' lobes along the Y axis
- *   When φ varies, the figure morphs continuously between a rotated
- *   bounding rectangle (φ = 0) and the fully-lobed figure (φ = π/2);
- *   eff_drift in §4 is what walks φ through this morph at a viewer-
- *   friendly speed.
- *
- * Convention:
- *   No required ordering between fx and fy.  Swapping them rotates the
- *   figure 90° but the shape family is unchanged (a 1:2 figure-8 lying
- *   horizontally is the same family as a 2:1 figure-8 lying vertically).
- *   k_ratios[] picks one canonical orientation per family.
- *
- * History:
- *   Lissajous 1857 [1] introduced the optical observation (perpendicular
- *   tuning forks viewed through a mirror).  Bowditch 1815 [2] derived
- *   the same family ~40 years earlier as compound-pendulum trajectories;
- *   the curves are sometimes called "Bowditch curves" in older texts.
+ * The pair is stored small-first only by habit; swapping fx and fy just
+ * turns the same shape on its side.
  */
 typedef struct {
-    int         fx, fy;       /* exact integer frequencies (Z, not Q)    */
-    const char *name;         /* visual family ("Trefoil", "Pentagram")  */
+    int         fx, fy;
+    const char *name;
 } Ratio;
 
 static const Ratio k_ratios[N_RATIOS] = {
@@ -344,56 +169,32 @@ static const Ratio k_ratios[N_RATIOS] = {
 };
 
 /*
- * Scene -- the live simulation state vector.
+ * Scene -- everything we need to remember to draw the next frame.
  *
- * In dynamical-systems language (Strogatz [6]), this is the state
- * vector of the visualiser: the minimum set of values you need to
- * render the next frame.  Everything else (CurveFrame, the trail
- * itself, HUD strings) is derived.
+ * We keep the chosen ratio and theme as small index numbers rather than
+ * pointers, so the n/p and c keys just bump a counter and wrap around.
  *
- * WHY flat (no sub-structs):
- *   Five fields, each mutated independently by exactly one of {SPACE
- *   key, c key, n/p keys, +/- keys, scene_tick}.  Grouping into sub-
- *   structs would add indirection without grouping any reads/writes
- *   that actually co-vary.
- *
- * WHY indices (ratio_idx, theme_idx), not pointers:
- *   k_ratios[] and k_themes[] are const-static §3/§4 tables.  Indices
- *   are integers that cycle modulo N_RATIOS / N_THEMES, so n/p/c keys
- *   are a single arithmetic bump -- no pointer swizzling, no risk of
- *   dangling references after a future table refactor.  Resolved to
- *   pointers at the use site by scene_current_ratio / scene_current_theme.
- *
- * Fields (range / unit / mutator):
- *   ratio_idx   [0, N_RATIOS)    --   active row of k_ratios[]
- *                                     mutator: n/p keys, scene_tick wrap
- *   theme_idx   [0, N_THEMES)    --   active row of k_themes[]
- *                                     mutator: c key
- *   phase_x     [0, 2π)          rad  X-oscillator phase offset φ;
- *                                     drifts via eff_drift; on wrap,
- *                                     scene_tick advances ratio_idx
- *                                     mutator: scene_tick
- *   drift       [DRIFT_MIN,       rad/tick   base advance per tick
- *                DRIFT_MAX]              eff_drift scales it via the
- *                                        dwell envelope
- *                                     mutator: +/- keys (geometric ×÷
- *                                              DRIFT_STEP)
- *   paused      bool             --   freezes scene_tick; rendering
- *                                     continues so the user can still
- *                                     change theme / ratio while frozen
- *                                     mutator: SPACE key
+ *   ratio_idx   which shape is showing (0..N_RATIOS-1); n/p keys, and
+ *               the tick when a sweep finishes
+ *   theme_idx   which color scheme (0..N_THEMES-1); the c key
+ *   phase_x     how far into the morph we are, 0..2π radians; the timing
+ *               offset between the two swings.  Creeps up each tick; when
+ *               it laps, we move on to the next shape
+ *   drift       base morph speed per tick, between DRIFT_MIN and MAX;
+ *               +/- keys
+ *   paused      if true, the figure holds still but you can still recolor
+ *               or switch shapes; SPACE toggles it
  */
 typedef struct {
-    int   ratio_idx;   /* [0, N_RATIOS)   index into k_ratios[]            */
-    int   theme_idx;   /* [0, N_THEMES)   index into k_themes[]            */
-    float phase_x;     /* [0, 2π)         X-oscillator phase φ, radians   */
-    float drift;       /* [MIN, MAX]      base phase advance, rad/tick     */
-    bool  paused;      /* SPACE toggles; rendering still runs              */
+    int   ratio_idx;
+    int   theme_idx;
+    float phase_x;
+    float drift;
+    bool  paused;
 } Scene;
 
-/* Const-table accessors -- one line of indirection, but every call site
- * reads as the concept ("the current ratio", "the current theme")
- * rather than as the underlying table-lookup arithmetic. */
+/* Turn the stored index back into the actual ratio / theme it points at,
+ * so the rest of the code can just ask for "the current one". */
 static inline const Ratio *scene_current_ratio(const Scene *s)
 {
     return &k_ratios[s->ratio_idx];
@@ -413,32 +214,20 @@ static void scene_init(Scene *s)
     s->paused    = false;
 }
 
-/* ---- phase-drift envelope ------------------------------------------ */
+/* ---- how fast the figure morphs ---- */
 
-/*
- * The phase distance between successive symmetric Lissajous figures.
- *
- * Symmetric (mirror-axis-aligned) figures recur every π / max(fx, fy)
- * radians of phase as φ sweeps from 0 to 2π.  These are the "named"
- * shapes the demo wants to dwell on; everything in between is a morph.
- */
+/* The clean, symmetric "named" shapes come around at evenly spaced phases.
+ * This returns that spacing, so we know where the shapes we want to pause on
+ * live. */
 static float ratio_key_period(const Ratio *r)
 {
     return (float)M_PI / fmaxf((float)r->fx, (float)r->fy);
 }
 
-/*
- * Dwell envelope: speed multiplier as a function of how close φ is to
- * the nearest key (symmetric-figure) phase.
- *
- *   distance 0           -> DWELL_SPEED       (slow, sits on the figure)
- *   distance kp·DWELL_WIDTH or more -> 1.0    (full speed, between figures)
- *   linear ramp in between
- *
- * Reading the curve: speed dips into a V-shaped well centred on each
- * key phase; the V's width is DWELL_WIDTH · kp and its floor is
- * DWELL_SPEED · base_drift.
- */
+/* A speed multiplier that dips when we're near one of those named shapes,
+ * so the figure lingers on it instead of flickering past.  Sitting right on
+ * a shape gives DWELL_SPEED (slow); far enough away gives 1.0 (full speed),
+ * with a straight ramp between. */
 static float dwell_envelope(float phase, float key_period)
 {
     float phase_mod    = fmodf(phase, key_period);
@@ -448,19 +237,14 @@ static float dwell_envelope(float phase, float key_period)
     return DWELL_SPEED + (1.0f - DWELL_SPEED) * ramp;
 }
 
-/*
- * eff_drift -- effective phase advance for this tick.
- * Base drift, multiplied by the dwell envelope so the figure "lingers"
- * on every symmetric shape before morphing.
- */
+/* How far the morph actually advances this tick: the base speed, slowed
+ * down whenever we're near a named shape. */
 static float eff_drift(const Scene *s)
 {
     float key_period = ratio_key_period(scene_current_ratio(s));
     float envelope   = dwell_envelope(s->phase_x, key_period);
     return s->drift * envelope;
 }
-
-/* ---- phase / index wrap helpers ------------------------------------- */
 
 static inline bool phase_completed_cycle(float phase) { return phase >= TAU; }
 static inline int  ratio_idx_next(int cur) { return (cur + 1) % N_RATIOS; }
@@ -475,82 +259,46 @@ static void scene_tick(Scene *s)
     }
 }
 
-/* ===================================================================== */
-/* §5  scene                                                              */
-/* ===================================================================== */
+/* ── §5  scene ── */
 
 /*
- * CurveFrame -- per-frame derived geometry for rendering the spiral.
+ * CurveFrame -- the size and placement of this frame's figure.
  *
- * WHY a struct (not six locals at the top of scene_draw):
- *   curve_frame_make() does the algebra once; scene_draw just reads
- *   the fields and rasterises.  Separating "figure out the frame
- *   parameters" from "paint the points" makes each function single-
- *   purpose -- and the algebra is testable in isolation (it's pure
- *   arithmetic, no ncurses calls).
+ * We work this out fresh every frame rather than storing it, because it
+ * depends on the terminal size and the user can resize at any moment;
+ * recomputing a handful of numbers is far cheaper than risking stale ones.
  *
- * WHY computed fresh each frame and NOT cached on Scene:
- *   Every field is a pure function of (Scene, rows, cols).  Caching on
- *   Scene would create a stale-value risk: the terminal could resize
- *   (SIGWINCH) between a cache-write and the next draw-read, leaving
- *   CurveFrame pointing at the wrong viewport.  Pure recomputation
- *   costs ~10 FLOPs/frame -- imperceptible.
- *
- * Fields & their derivations:
- *
- *   t_max  = N_LOOPS · 2π / min(fx, fy)              [rad of param t]
- *     Total parametric length: exactly N_LOOPS cycles of the SLOWER
- *     oscillator.  The slower oscillator sets the visible loop count;
- *     using min() instead of max() means a 1:5 ratio still shows
- *     N_LOOPS = 4 trips around the slow axis, just decorated with five
- *     times as much fast-axis wiggle.
- *
- *   decay  = DECAY_TOTAL / t_max                      [1/rad]
- *     Exponent rate for the e^(-decay · t) envelope.  Calibrated so
- *     amp(t_max) = exp(-DECAY_TOTAL) ≈ 1%, giving the same visible
- *     spiral depth regardless of frequency ratio.  Damped-oscillator
- *     framing in French [4]; harmonograph instrument in Whitaker [5].
- *
- *   cx, cy                                            [cell coords]
- *     Center of the figure in cell space; midpoint of the band left
- *     after HUD_TOP_ROWS + HUD_BOTTOM_ROWS reservations.
- *
- *   rx, ry                                            [cells]
- *     Aspect-corrected semi-axes.  Cells are CELL_ASPECT (~2x) taller
- *     than wide, so a geometrically round figure needs rx = ry ·
- *     CELL_ASPECT.  Horizontal budget shrinks by EDGE_MARGIN_X (1 cell
- *     on each side); vertical budget uses (draw_rows - 1) to convert a
- *     1-based row count into the max-index distance from cy.  Both
- *     scaled by AMP_FRAC so the figure leaves visible breathing room.
- *
- * Reference: Foley/van Dam [7] §11 on parametric-curve discretisation;
- *   we use uniform t-sampling (N_CURVE_PTS points), the textbook
- *   trade-off (simple, good enough at terminal resolutions).
+ *   t_max    how far we trace along the curve, picked so you always see
+ *            N_LOOPS loops no matter which shape is up
+ *   decay    how quickly the trail fades; tuned so the trail is down to
+ *            ~1% by the end, giving every shape the same spiral depth
+ *   cx, cy   where the center of the figure sits on screen
+ *   rx, ry   half-width and half-height in cells.  These differ because a
+ *            terminal cell is about twice as tall as it is wide, so a shape
+ *            that should look round needs a wider rx to compensate
  */
 typedef struct {
-    float t_max;     /* total parametric length (rad of t)               */
-    float decay;     /* envelope rate; amp(t) = exp(-decay · t)          */
-    float cx, cy;    /* figure center, cell space                        */
-    float rx, ry;    /* aspect-corrected semi-axes, cell space           */
+    float t_max;
+    float decay;
+    float cx, cy;
+    float rx, ry;
 } CurveFrame;
 
-/* ---- CurveFrame builders -------------------------------------------- */
-
-/* Total parametric length: N_LOOPS cycles of the SLOWER oscillator,
- * so visible loop count is constant across frequency ratios. */
+/* Trace length = N_LOOPS loops of the slower swing, so the loop count you
+ * see stays the same whichever shape is up. */
 static float curve_t_max(const Ratio *r)
 {
     return (float)N_LOOPS * TAU / fminf((float)r->fx, (float)r->fy);
 }
 
-/* Envelope rate calibrated so amp(t_max) = exp(-DECAY_TOTAL) ≈ 1%. */
+/* Fade rate set so the trail is down to about 1% brightness by the end. */
 static float curve_decay_rate(float t_max)
 {
     return DECAY_TOTAL / t_max;
 }
 
-/* Figure center: horizontally on the screen midline, vertically in the
- * middle of the band that survives HUD_TOP_ROWS + HUD_BOTTOM_ROWS. */
+/* Center the figure: middle of the screen across, middle of the band left
+ * over once the top and bottom HUD rows are taken out. */
 static void figure_center(int rows, int cols, float *cx, float *cy)
 {
     int draw_rows = rows - HUD_TOP_ROWS - HUD_BOTTOM_ROWS;
@@ -558,10 +306,8 @@ static void figure_center(int rows, int cols, float *cx, float *cy)
     *cy = HUD_TOP_ROWS + draw_rows * 0.5f;
 }
 
-/* Largest aspect-corrected semi-axes (rx, ry) that fit AMP_FRAC of the
- * drawable band.  EDGE_MARGIN_X reserves 1 cell on each side; the
- * "draw_rows - 1" converts a 1-based count to the max-index distance
- * from center. */
+/* Biggest figure that still fits, with cells being taller than wide taken
+ * into account and a little margin left around the edges. */
 static void fit_radii(int rows, int cols, float *rx, float *ry)
 {
     int   draw_rows = rows - HUD_TOP_ROWS - HUD_BOTTOM_ROWS;
@@ -582,25 +328,23 @@ static CurveFrame curve_frame_make(const Scene *s, int rows, int cols)
     return cf;
 }
 
-/* ---- sample-level helpers ------------------------------------------- */
+/* ---- one point at a time ---- */
 
-/* Parametric time for sample i in [0, N_CURVE_PTS).  i=0 -> t=0
- * (newest, outer), i=N-1 -> t=t_max (oldest, inner). */
+/* Where sample i sits along the curve in time.  The first sample is the
+ * newest (outer end), the last is the oldest (collapsed near the center). */
 static inline float sample_time(int i, float t_max)
 {
     return (float)i / (float)(N_CURVE_PTS - 1) * t_max;
 }
 
-/* Damped-oscillator amplitude envelope at parametric time t. */
+/* How bright a point is at time t -- it fades out the older it gets. */
 static inline float envelope_amp(float t, float decay)
 {
     return expf(-decay * t);
 }
 
-/* The Lissajous parametric trajectory in NORMALISED [-1,1]^2 space.
- *   x(t) = amp · sin(fx · t + φ)
- *   y(t) = amp · sin(fy · t)
- * The amplitude is pre-multiplied so the spiral collapses to (0,0). */
+/* One point on the curve, in a tidy -1..1 box.  The two swings combine here;
+ * we fold in the brightness too so older points pull in toward the center. */
 static inline void lissajous_point(float t, float fx, float fy,
                                    float phase_x, float amp,
                                    float *nx, float *ny)
@@ -609,11 +353,10 @@ static inline void lissajous_point(float t, float fx, float fy,
     *ny = amp * sinf(fy * t);
 }
 
-/* Round-half-up to integer cell coordinate. */
 static inline int cell_round(float v) { return (int)(v + 0.5f); }
 
-/* Project a normalised (-1..1) point through CurveFrame to a cell.
- * Returns false if the cell falls in a HUD band or off-screen. */
+/* Place a -1..1 point onto an actual screen cell.  Says false when the
+ * point would land on a HUD row or off the screen, so the caller skips it. */
 static bool project_to_cell(const CurveFrame *cf, float nx, float ny,
                             int rows, int cols, int *out_col, int *out_row)
 {
@@ -626,7 +369,8 @@ static bool project_to_cell(const CurveFrame *cf, float nx, float ny,
     return true;
 }
 
-/* Map sample age in [0, 1] to brightness tier in [0, N_LEVELS-1]. */
+/* Turn a point's age (0 = newest, 1 = oldest) into which of the four
+ * brightness loops it belongs to. */
 static inline int age_to_level(float age)
 {
     int lev = (int)(age * (float)N_LEVELS);
@@ -634,8 +378,8 @@ static inline int age_to_level(float age)
     return lev;
 }
 
-/* ncurses attribute for (theme, brightness tier).  The first
- * BOLD_LEVELS tiers get A_BOLD so they read as the bright loops. */
+/* Color and weight for a given theme and brightness loop; the bright loops
+ * also get bold. */
 static attr_t level_attr(int theme_idx, int level)
 {
     attr_t attr = COLOR_PAIR(CP_IDX(theme_idx, level));
@@ -643,7 +387,6 @@ static attr_t level_attr(int theme_idx, int level)
     return attr;
 }
 
-/* Plot one sample at (row, col) in the theme/level style. */
 static void plot_sample(int row, int col, int theme_idx, int level)
 {
     char   ch   = k_lev_ch[level];
@@ -653,18 +396,8 @@ static void plot_sample(int row, int col, int theme_idx, int level)
     attroff(attr);
 }
 
-/*
- * scene_draw -- paint the full harmonograph spiral for the current phase.
- *
- * Reads as pseudocode:
- *   for each sample i from oldest (N-1) to newest (0):
- *       compute parametric time, amplitude, normalised (x,y)
- *       project to cell coordinates; skip if off-band or off-screen
- *       map age to brightness tier; plot
- *
- * Back-to-front iteration order: newer samples overwrite older on
- * shared cells, so the outer (brightest) loop wins overlap conflicts.
- */
+/* Draw the whole spiral.  We walk from the oldest point to the newest so
+ * that where loops overlap, the brighter newer point is the one left on top. */
 static void scene_draw(const Scene *s, int rows, int cols)
 {
     CurveFrame   cf = curve_frame_make(s, rows, cols);
@@ -689,11 +422,12 @@ static void scene_draw(const Scene *s, int rows, int cols)
     }
 }
 
-/* Top HUD (row 0) — live data: ratio, phase, drift, theme, paused flag. */
+/* Top row: what's currently showing -- shape, how far into the morph,
+ * morph speed, theme, and whether we're paused. */
 static void scene_hud_top(const Scene *s, int cols)
 {
     (void)cols;
-    float phase_pi = s->phase_x / (float)M_PI;   /* display as multiples of π */
+    float phase_pi = s->phase_x / (float)M_PI;   /* show phase in units of π */
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
     mvprintw(0, 0,
              " [Lissajous]  ratio: %-14s  phase: %.2fπ  drift: %.4f  theme: %-6s  %s ",
@@ -705,7 +439,7 @@ static void scene_hud_top(const Scene *s, int cols)
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/* Bottom HUD (row rows-1) — action keys. */
+/* Bottom row: the key reminders. */
 static void scene_hud_bottom(int rows, int cols)
 {
     (void)cols;
@@ -715,34 +449,21 @@ static void scene_hud_bottom(int rows, int cols)
     attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §6  screen                                                             */
-/* ===================================================================== */
+/* ── §6  screen ── */
 
 /*
- * Screen -- cached terminal geometry.
+ * Screen -- the terminal's current size, remembered.
  *
- * WHY cache cols/rows on a struct instead of calling getmaxyx() everywhere:
- *   getmaxyx is cheap but not free.  More importantly, many functions
- *   in the render layer take rows/cols as plain ints; passing one
- *   Screen* would conflate "I need the size" with "I need to talk to
- *   ncurses".  Holding size as a value lets the math layer stay
- *   terminal-agnostic; only screen_init / screen_resize / the SIGWINCH
- *   path in main() ever write into Screen.
+ * We hold these as plain numbers so the drawing code can size the figure
+ * without having to talk to ncurses itself.  Only startup and a resize
+ * ever write to them.
  *
- * Update points:
- *   screen_init     -- once at startup
- *   screen_resize   -- after a SIGWINCH (terminal resized)
- *
- * Fields are in ncurses convention: cols = X-extent, rows = Y-extent.
- * Both are 1-based counts, so valid coordinates are
- *    [0, cols-1] × [0, rows-1].
- * The HUD reserves the first HUD_TOP_ROWS and the last HUD_BOTTOM_ROWS
- * of rows; the curve renderer must stay within the middle band.
+ *   cols   width  in character cells
+ *   rows   height in character cells
  */
 typedef struct {
-    int cols;   /* terminal width  in character cells  */
-    int rows;   /* terminal height in character cells  */
+    int cols;
+    int rows;
 } Screen;
 
 static void screen_init(Screen *sc)
@@ -764,42 +485,29 @@ static void screen_resize(Screen *sc)
     getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-/* ===================================================================== */
-/* §7  app                                                                */
-/* ===================================================================== */
+/* ── §7  app ── */
 
 /*
- * App -- the top-level container.
+ * App -- everything the program holds onto, in one place.
  *
- * Lives as a single static instance (g_app) so the signal handlers can
- * flip flags on it without scattering globals across the file.
+ * There's a single global one (g_app) so the signal handlers can reach in
+ * and set a flag without us threading it through every call.
  *
- * WHY signal handler flags are on App, not Scene:
- *   Signals interrupt the main loop, not the simulation.  "Should I
- *   quit?" and "did the terminal resize?" are run-loop concerns, not
- *   Lissajous-math concerns.  Keeping them off Scene means Scene
- *   stays PURE simulation state -- snapshottable, replayable from a
- *   seed, testable in isolation.
+ * The two flags are volatile sig_atomic_t, not bool, because a signal can
+ * land at any instant: that type is the one the standard promises is safe
+ * to touch from a handler, and volatile stops the compiler from caching the
+ * value in the loop so we'd never notice it changed.
  *
- * WHY volatile sig_atomic_t (and not bool):
- *   Per POSIX, sig_atomic_t is the only integer type guaranteed atomic
- *   with respect to async signal delivery.  `volatile` forces the
- *   main loop to re-read from memory each iteration rather than
- *   caching the flag in a register; without it the compiler may
- *   legally hoist the read out of the loop and the program would
- *   never see the signal-set value.
- *
- * Fields:
- *   scene        the live simulation state           (§4 Scene)
- *   screen       cached terminal dimensions          (§6 Screen)
- *   running      0 ⇒ main loop should exit          (SIGINT/SIGTERM)
- *   need_resize  1 ⇒ main loop should re-init screen (SIGWINCH)
+ *   scene        the live figure state
+ *   screen       the cached terminal size
+ *   running      set to 0 to ask the main loop to quit (Ctrl-C / kill)
+ *   need_resize  set to 1 when the terminal was resized
  */
 typedef struct {
-    Scene                  scene;        /* simulation state              */
-    Screen                 screen;       /* terminal size cache           */
-    volatile sig_atomic_t  running;      /* 0 = exit main loop  (SIGINT)  */
-    volatile sig_atomic_t  need_resize;  /* 1 = re-init screen  (SIGWINCH)*/
+    Scene                  scene;
+    Screen                 screen;
+    volatile sig_atomic_t  running;
+    volatile sig_atomic_t  need_resize;
 } App;
 
 static App g_app;
@@ -811,7 +519,7 @@ static void sig_handler(int sig)
 }
 static void cleanup(void) { endwin(); }
 
-/* Returns false only when the user pressed a quit key. */
+/* Act on one keypress.  Returns false only when it was a quit key. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
@@ -855,10 +563,8 @@ static void app_init(App *app)
     scene_init(&app->scene);
 }
 
-/* ---- main-loop step helpers ----------------------------------------- */
-
-/* Respond to SIGWINCH: re-query the terminal size and clear the canvas
- * so the next frame redraws from scratch. */
+/* After a resize: pick up the new size and wipe the screen so the next
+ * frame is drawn fresh. */
 static void apply_resize(App *app)
 {
     app->need_resize = 0;
@@ -866,8 +572,7 @@ static void apply_resize(App *app)
     erase();
 }
 
-/* Drain every pending keystroke through app_handle_key.
- * Returns false if a quit key was pressed (caller exits). */
+/* Handle every key waiting in the buffer.  Returns false if one was quit. */
 static bool drain_input(App *app)
 {
     int ch;
@@ -877,7 +582,7 @@ static bool drain_input(App *app)
     return true;
 }
 
-/* Tick the simulation and paint one complete frame (curve + HUDs). */
+/* Advance the figure one step and paint a full frame: curve plus both HUDs. */
 static void frame_render(App *app)
 {
     scene_tick(&app->scene);
@@ -889,9 +594,8 @@ static void frame_render(App *app)
     doupdate();
 }
 
-/* Sleep until wall-clock 'deadline', then return the NEXT deadline
- * (one TICK_NS later).  Steady-cadence pacing -- frame drift is
- * absorbed by the sleep, not by the simulation. */
+/* Wait until it's time for the next frame, then hand back when the one after
+ * that is due.  Any lateness is soaked up by the sleep, keeping a steady pace. */
 static long long pace_to_deadline(long long deadline)
 {
     deadline += TICK_NS;
@@ -899,9 +603,7 @@ static long long pace_to_deadline(long long deadline)
     return deadline;
 }
 
-/*
- * main() -- the orchestrator.  Each line names one phase of a frame.
- */
+/* The main loop: handle a resize, read keys, draw a frame, wait, repeat. */
 int main(void)
 {
     install_signal_handlers();

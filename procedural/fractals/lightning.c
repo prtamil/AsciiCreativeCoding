@@ -1,98 +1,21 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * lightning.c  —  fractal branching lightning in a dark terminal sky
+ * lightning.c — animated branching lightning in the terminal.
  *
- * THREE LAYERS, deliberately separated so the simulation is trustworthy and
- * the cosmetics are accountable:
+ * A bolt grows downward from the top of the screen as a jagged path that
+ * randomly splits into dimmer side branches, ending up like a lightning-shaped
+ * tree. We keep three things strictly apart: WHERE the bolt is (the channel),
+ * how it LOOKS (the glow and flicker), and how it's PAINTED (the renderer). The
+ * growth code only ever changes where the bolt is, so a visual tweak can never
+ * break the simulation.
  *
- *   1. CHANNEL  (§4)  — the bolt's GEOMETRY: which cells are part of the bolt.
- *                       Pure simulation state.  Just occupancy, nothing else.
- *   2. EFFECTS  (§6)  — glow halo + glyph shimmer, DERIVED from the channel.
- *                       Cosmetic only.  INVARIANT: §6 never writes the channel.
- *                       Delete §6 entirely and the bolt grows identically;
- *                       only its appearance changes.
- *   3. RENDER   (§8)  — reads channel + effects, paints glyphs.  Never mutates.
- *
- * The growth logic (§5 tip, §7 scene) touches ONLY the channel.  It cannot be
- * corrupted by a visual tweak, and every cosmetic decision lives in §6/§8 where
- * you can see all of it in one place.
- *
- * Growth algorithm — recursive tip branching (not DLA walkers):
- *   A seed cell sits at the top.  Three tips start there.  Each tick every
- *   active tip advances one cell downward, leaning left/right by its lean bias.
- *   After MIN_FORK_STEPS a tip may fork into two children (lean ±1 from parent)
- *   and retire.  This yields a fractal binary tree: single-cell-wide paths that
- *   spread apart as they descend.
- *
- * Color (a RENDER decision, by row depth): the bolt's 3-stop depth ramp and
- *   2-stop glow both come from the active Theme (§3), cycled with t / T.
- *   Default "Storm": light-blue → teal → white bolt over a teal/navy glow.
- *
- * Glow (an EFFECT): Manhattan-radius-2 halo around every bolt cell
- *   dist 1 → '|' inner-dim (inner corona)   dist 2 → '.' outer-dim (outer halo)
- *
- * Shimmer (an EFFECT): each bolt cell flickers through SPARK_CHARS so the bolt
- *   looks alive.  A fraction re-rolls per tick (a crawling crackle, not a strobe).
- *
- * Life cycle:
- *   ST_GROWING → tips advance; channel + glyphs are bold; live tips drawn as '!'
- *   ST_DONE    → all tips finished; the bolt is held ~1 s (still shimmering, not
- *                bold), then a fresh bolt auto-starts.  'r' restarts immediately.
- *
- * Keys:
- *   q / ESC   quit        r       new bolt
- *   t / T     cycle colour theme (Storm/Fire/Toxic/Plasma/Mono)
- *   + =       more forks   -      fewer forks
- *   ] [       faster / slower     p / spc  pause
+ * The branching idea comes from the dielectric-breakdown model of real
+ * lightning (Niemeyer, Pietronero & Wiesmann 1984) and the recursive
+ * "one tip becomes two" growth of L-systems (Prusinkiewicz & Lindenmayer 1990).
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra lightning.c -o lightning -lncurses
- *
- * Sections
- * --------
- *   §1  config
- *   §2  clock     — wall-clock + FrameClock (fixed-timestep pacing)
- *   §3  color     — themeable palette (bolt ramp + glow), t/T cycling
- *   §4  channel   — bolt geometry (pure simulation state); CellGrid buffer
- *   §5  tip       — Tip + TipPool: motion law + branching rule
- *   §6  effects   — glow + shimmer, derived from the channel (cosmetic only)
- *   §7  scene     — growth state machine; orchestrates sim then effects
- *   §8  render    — channel + effects → glyphs via cell_put (read-only)
- *   §9  screen    — ncurses lifecycle + HUD
- *   §10 app       — main loop
  */
-
-/* ── REFERENCES — for the concepts and the rendering ──────────────────── *
- *
- *   Fractal branching & growth  (the algorithm — §5 tip, §7 scene)
- *   ── Niemeyer, L., Pietronero, L. & Wiesmann, H. J. (1984). "Fractal
- *      Dimension of Dielectric Breakdown." Phys. Rev. Lett. 52(12), 1033.
- *      The Dielectric Breakdown Model — the physics from which fractal
- *      lightning's branching, single-channel-wide structure arises.
- *   ── Witten, T. A. & Sander, L. M. (1981). "Diffusion-Limited Aggregation,
- *      a Kinetic Critical Phenomenon." Phys. Rev. Lett. 47(19), 1400.
- *      DLA — the sibling growth model this demo deliberately is NOT; shows
- *      why tip-branching yields clean paths instead of blobby aggregates.
- *   ── Prusinkiewicz, P. & Lindenmayer, A. (1990). "The Algorithmic Beauty
- *      of Plants." Springer.  Recursive branching where one growth tip
- *      becomes two children — exactly tippool_fork() in §5.
- *   ── Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
- *      Self-similarity and fractal dimension — the O(d) spread and D ≈ 1.5
- *      path behaviour of the branching tree.
- *   ── Reed, T. & Wyvill, B. (1994). "Visual Simulation of Lightning."
- *      SIGGRAPH '94, pp. 359-364.  Recursive branching bolt with a dominant
- *      channel — the closest classic analogue to scene_grow_step().
- *
- *   Rendering  (§6 effects, §8 render)
- *   ── Kim, T. & Lin, M. C. (2004). "Physically Based Animation and Rendering
- *      of Lightning." Proc. Pacific Graphics 2004.  DBM growth plus an
- *      additive glow/corona — the model behind the halo in fx_build_glow().
- *   ── Rosenfeld, A. & Pfaltz, J. L. (1966). "Sequential Operations in Digital
- *      Picture Processing." J. ACM 13(4), 471.  City-block (Manhattan)
- *      distance transforms — the glow is a radius-2 Manhattan dilation.
- *   ── Gookin, D. (2007). "Programmer's Guide to NCURSES." Wiley.  The cell-
- *      drawing API behind cell_put(): init_pair, mvaddch, refresh, resize.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -104,9 +27,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
 enum {
     SIM_FPS_MIN     = 10,
@@ -117,63 +38,60 @@ enum {
     GRID_ROWS_MAX   =  80,
     GRID_COLS_MAX   = 300,
 
-    MAX_TIPS        =  64,   /* max simultaneous growing branch tips    */
+    MAX_TIPS        =  64,   /* most branch tips that can grow at once          */
 
-    MIN_FORK_STEPS  =   2,   /* a tip must grow this many cells first   */
-    LEAN_MAX        =   3,   /* lean bias clamped to ±LEAN_MAX          */
+    MIN_FORK_STEPS  =   2,   /* a tip must grow at least this far before splitting */
+    LEAN_MAX        =   3,   /* how far sideways a branch is allowed to lean    */
 
-    HOLD_AFTER_DONE_MS = 1000, /* finished bolt lingers, then auto-restarts    */
-    FRAME_DT_CAP_MS    =  100,  /* clamp one frame's dt — stops spiral-of-death */
-    RENDER_FPS_CAP     =   60,  /* render-rate ceiling the loop sleeps down to  */
-    MS_PER_SEC         = 1000,  /* ms<->tick conversion base (ms_to_ticks)      */
-    PERCENT            =  100,  /* denominator for percent-probability rolls    */
+    HOLD_AFTER_DONE_MS = 1000, /* how long a finished bolt lingers before the next */
+    FRAME_DT_CAP_MS    =  100,  /* ignore stalls longer than this so we don't lurch */
+    RENDER_FPS_CAP     =   60,  /* don't repaint the screen faster than this       */
+    MS_PER_SEC         = 1000,
+    PERCENT            =  100,  /* used for "X percent chance" dice rolls          */
 
-    GLOW_RADIUS     =   2,   /* Manhattan radius of ambient halo        */
+    GLOW_RADIUS     =   2,   /* how many cells out the glow reaches             */
 
-    N_THEMES        =   5,   /* colour themes, cycled with t / T              */
-    N_PALETTE       =   5,   /* themeable colour slots: 3 bolt depth + 2 glow */
+    N_THEMES        =   5,   /* number of colour themes (cycled with t / T)     */
+    N_PALETTE       =   5,   /* colours a theme sets: 3 bolt shades + 2 glow    */
 
     HUD_COLS        =  80,
     FPS_UPDATE_MS   = 500,
 
-    SPARK_UNSEEDED  = 0xFF,  /* spark slot not yet assigned a glyph     */
+    SPARK_UNSEEDED  = 0xFF,  /* "this cell hasn't picked a flicker glyph yet"   */
 };
 
 /*
- * LEAN_PCT  — percent chance a tip follows its lean each step (more = wider).
- * FORK_PCT  — percent chance a tip forks each step after MIN_FORK_STEPS.
- *             Runtime-tunable with + / - between FORK_PCT_MIN..MAX.
+ * LEAN_PCT — chance (percent) a tip leans sideways each step; higher = wider bolt.
+ * FORK_PCT — chance (percent) a tip splits each step once it's old enough to.
+ *            Adjustable at runtime with + / -, kept between MIN and MAX.
  */
 #define LEAN_PCT            60
 #define FORK_PCT_DEFAULT    30
 #define FORK_PCT_MIN         8
 #define FORK_PCT_MAX        50
-#define FORK_PCT_STEP        2   /* +/- nudge to fork probability per keypress */
+#define FORK_PCT_STEP        2
 
-/* Shimmer glyph alphabet + the fraction of cells re-rolled per tick. */
+/* The glyphs the bolt flickers through, and how many cells re-flicker per tick. */
 #define SPARK_CHARS  "#%xX*+|/\\^"
 #define SHIMMER_PCT  28
 
-/* Single-glyph constants — named so the renderers read by intent, not by char. */
-#define GLOW_INNER_GLYPH '|'   /* inner corona, 1 cell from the bolt */
-#define GLOW_OUTER_GLYPH '.'   /* outer halo,   2 cells out          */
-#define TIP_GLYPH        '!'   /* a live growth front                */
+/* Named so the drawing code reads by meaning instead of by raw character. */
+#define GLOW_INNER_GLYPH '|'   /* glow right next to the bolt */
+#define GLOW_OUTER_GLYPH '.'   /* glow one cell further out   */
+#define TIP_GLYPH        '!'   /* a tip that's still growing  */
 
 #define NS_PER_SEC   1000000000LL
 #define NS_PER_MS    1000000LL
 #define TICK_NS(f)   (NS_PER_SEC / (f))
 
 /*
- * Small shared mechanics used across sections:
- *   clamp_int    — pin a value into [lo,hi] (keeps tunables in range).
- *   roll_percent — a percentage dice roll: true with probability pct/PERCENT.
+ * clamp_int    — keep a value from straying outside [lo,hi].
+ * roll_percent — flip a weighted coin: true pct out of 100 times.
  */
 static int  clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static bool roll_percent(int pct)            { return rand() % PERCENT < pct; }
 
-/* ===================================================================== */
-/* §2  clock — wall-clock primitives + fixed-timestep frame pacing         */
-/* ===================================================================== */
+/* ── §2  clock — read the wall clock, and pace the animation ── */
 
 static int64_t clock_ns(void)
 {
@@ -193,25 +111,25 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /*
- * FrameClock — the simulation's heartbeat.  It owns every timing variable the
- * main loop needs, so the loop body reads as intent rather than bookkeeping.
+ * FrameClock — keeps the bolt growing at a steady pace no matter how fast or
+ * slow the terminal can repaint.
  *
- * WHY it exists: the render rate (how often the terminal repaints) must be
- * decoupled from the sim rate (how often the bolt advances).  The canonical fix
- * is the fixed-timestep accumulator — bank each frame's elapsed real time as a
- * "debt", then repay it in equal TICK_NS slices, one scene_tick() per slice.  So
- * the bolt grows at a constant rate on any machine, and a slow frame runs a few
- * catch-up ticks instead of one big lurch.
+ * The trick: we want the bolt to advance a fixed number of times per second,
+ * but screens repaint at all sorts of rates. So each frame we measure how much
+ * real time passed and treat it as a "debt" of growth we owe. We pay that debt
+ * off in equal-sized chunks, one growth step per chunk. A slow frame just runs
+ * a few catch-up steps instead of one giant jump, so the bolt looks the same on
+ * any machine.
  *
- * INVARIANTS: every *_ns field is nanoseconds on the CLOCK_MONOTONIC scale;
- * after the main loop's draining `while`, sim_debt is always < one TICK_NS.
+ * All *_ns fields are nanoseconds. After the main loop drains its catch-up
+ * loop, sim_debt is always less than one step's worth.
  */
 typedef struct {
-    int64_t prev_ns;     /* CLOCK_MONOTONIC stamp at this frame's start          */
-    int64_t sim_debt;    /* unspent ns owed to the fixed step; left in [0,TICK)  */
-    int64_t fps_window;  /* ns elapsed since the last fps sample was emitted     */
-    int     fps_frames;  /* frames counted since the last fps sample             */
-    double  fps;         /* smoothed frames/sec, refreshed every FPS_UPDATE_MS   */
+    int64_t prev_ns;     /* when this frame started                              */
+    int64_t sim_debt;    /* growth time owed but not yet spent                   */
+    int64_t fps_window;  /* time gathered for the next fps reading               */
+    int     fps_frames;  /* frames gathered for the next fps reading             */
+    double  fps;         /* the fps number shown in the HUD, refreshed twice/sec */
 } FrameClock;
 
 static void frameclock_init(FrameClock *fc)
@@ -223,10 +141,8 @@ static void frameclock_init(FrameClock *fc)
     fc->fps        = 0.0;
 }
 
-/*
- * frameclock_sample_fps() — fold one frame into the rolling fps sample; once the
- * window fills (FPS_UPDATE_MS), publish a fresh reading: frames / elapsed seconds.
- */
+/* Count this frame toward the fps display, and publish a fresh number every
+ * half second (counting frames more often than that would make it jittery). */
 static void frameclock_sample_fps(FrameClock *fc, int64_t dt)
 {
     fc->fps_frames++;
@@ -239,26 +155,24 @@ static void frameclock_sample_fps(FrameClock *fc, int64_t dt)
     }
 }
 
-/*
- * frameclock_begin_frame() — open a new frame as named steps: measure the real
- * time since the last frame, clamp a long stall (anti spiral-of-death), then bank
- * it as sim debt and feed the fps sample.
- */
+/* Start a new frame: see how much real time went by, ignore any huge stall (so
+ * one big pause doesn't trigger a flood of catch-up steps), and add the rest to
+ * the growth debt. */
 static void frameclock_begin_frame(FrameClock *fc)
 {
     int64_t now = clock_ns();
-    int64_t dt  = now - fc->prev_ns;                   /* time this frame represents */
+    int64_t dt  = now - fc->prev_ns;
     fc->prev_ns = now;
 
     int64_t stall_cap = FRAME_DT_CAP_MS * NS_PER_MS;
-    if (dt > stall_cap) dt = stall_cap;                /* anti spiral-of-death */
+    if (dt > stall_cap) dt = stall_cap;
 
-    fc->sim_debt += dt;                                /* owe this much to the fixed step */
+    fc->sim_debt += dt;
     frameclock_sample_fps(fc, dt);
 }
 
-/* frameclock_step_due() — true (and pays down the debt) while a fixed sim step
- * is owed.  `while (frameclock_step_due(...)) tick();` is the accumulator loop. */
+/* True while we still owe at least one growth step (and subtracts it). Call in a
+ * `while` loop to run all the steps this frame earned. */
 static bool frameclock_step_due(FrameClock *fc, int64_t tick_ns)
 {
     if (fc->sim_debt < tick_ns) return false;
@@ -266,62 +180,54 @@ static bool frameclock_step_due(FrameClock *fc, int64_t tick_ns)
     return true;
 }
 
-/*
- * frameclock_throttle() — sleep off whatever remains of this frame's budget so
- * the render loop caps near RENDER_FPS_CAP instead of busy-spinning.  `elapsed`
- * is measured from this frame's start (prev_ns), so a frame that already overran
- * its budget simply doesn't sleep.
- */
+/* If this frame finished early, nap for the leftover time so we don't burn the
+ * CPU repainting faster than RENDER_FPS_CAP. A frame that ran long won't sleep. */
 static void frameclock_throttle(const FrameClock *fc)
 {
-    int64_t budget  = NS_PER_SEC / RENDER_FPS_CAP;     /* time one frame may take */
-    int64_t elapsed = clock_ns() - fc->prev_ns;        /* spent so far this frame  */
+    int64_t budget  = NS_PER_SEC / RENDER_FPS_CAP;
+    int64_t elapsed = clock_ns() - fc->prev_ns;
     clock_sleep_ns(budget - elapsed);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3  color ── */
 
 /*
- * ColorID — the ncurses colour-PAIR slots this program uses.  Values are pair
- * indices (1..7; pair 0 is the reserved terminal default); theme_apply() and
- * color_init() bind each slot to a real foreground colour over a black ground.
- * Code names a colour by its concept (COL_BOLT2), never by a raw palette index.
+ * ColorID — the named colours this program draws with. ncurses works in numbered
+ * "pairs" (a foreground over a background); these are those numbers, but we refer
+ * to colours by meaning (COL_BOLT2) instead of by number everywhere else.
  *
- * The bolt has exactly two themeable colour concerns, and a Theme supplies both:
- *   - COL_BOLT0..2 — a 3-stop DEPTH RAMP painted down the bolt (top→bottom),
- *     chosen per cell by render_color_for_row() in §8.  The channel never stores
- *     colour; depth is a pure function of row, so it is a render decision.
- *   - COL_GLOW_I / COL_GLOW_O — the 2-stop glow pair for the halo effect (§6/§8).
- * COL_HUD / COL_HINT are theme-independent so the text stays legible on any palette.
+ * The bolt is shaded three ways from top to bottom (COL_BOLT0..2) so it looks
+ * like it brightens as it descends, and the glow has a near shade and a far
+ * shade (COL_GLOW_I / COL_GLOW_O). All five change when you switch themes. The
+ * HUD colours stay fixed so the text reads clearly against any theme.
  */
 typedef enum {
-    COL_BOLT0  = 1,   /* depth: top third (near cloud) */
-    COL_BOLT1  = 2,   /* depth: middle third           */
-    COL_BOLT2  = 3,   /* depth: bottom third (hottest) */
-    COL_GLOW_I = 4,   /* halo: inner corona            */
-    COL_GLOW_O = 5,   /* halo: outer halo              */
-    COL_HUD    = 6,   /* HUD data — bright yellow      */
-    COL_HINT   = 7,   /* HUD hint — bright cyan        */
+    COL_BOLT0  = 1,   /* bolt, top third    */
+    COL_BOLT1  = 2,   /* bolt, middle third */
+    COL_BOLT2  = 3,   /* bolt, bottom third */
+    COL_GLOW_I = 4,   /* glow, near the bolt */
+    COL_GLOW_O = 5,   /* glow, further out   */
+    COL_HUD    = 6,   /* HUD text — bright yellow */
+    COL_HINT   = 7,   /* key hints  — bright cyan */
 } ColorID;
 
 /*
- * Theme — a named palette held in one array: fg[0..2] are the bolt depth stops
- * (top→bottom), fg[3] is the glow inner stop, fg[4] the glow outer.  Cycled with
- * t / T.  Adding a theme is a single table row; the engine never changes.
+ * Theme — one named colour scheme. fg256[0..2] are the three bolt shades
+ * (top→bottom), fg256[3] is the near glow, fg256[4] the far glow. fg8 is the
+ * same set in plain 8-colour terms, used on terminals that can't do 256 colours.
+ * Adding a theme is just one more row in the table below.
  *
- * Every entry sits in the bright half of the 256-cube so even the A_DIM glow
- * stops stay visible on black (dim cube/gray indices vanish under A_DIM).
+ * Every colour is picked from the bright half of the palette on purpose: the
+ * glow is drawn dim, and dim + a dark colour would vanish against the black sky.
  */
 typedef struct {
-    const char *name;        /* HUD label, e.g. "Storm"                       */
-    int fg256[N_PALETTE];    /* xterm-256 indices; bright half only (legible) */
-    int fg8  [N_PALETTE];    /* ANSI 0-7 fallback when COLORS < 256           */
+    const char *name;        /* shown in the HUD, e.g. "Storm"          */
+    int fg256[N_PALETTE];    /* the colours on a 256-colour terminal    */
+    int fg8  [N_PALETTE];    /* the same idea, for an 8-colour terminal  */
 } Theme;
 
 static const Theme g_themes[N_THEMES] = {
-    /*            name      bolt:top mid  bot   glow:in out      8-colour fallback (same order)                               */
+    /*            name      bolt:top mid  bot   glow:near far     8-colour fallback (same order)                               */
     { "Storm",  {  45,  51, 231,  30,  26 }, { COLOR_CYAN,    COLOR_CYAN,    COLOR_WHITE, COLOR_CYAN,    COLOR_BLUE  } },
     { "Fire",   { 196, 208, 231,  94,  88 }, { COLOR_RED,     COLOR_YELLOW,  COLOR_WHITE, COLOR_RED,     COLOR_RED   } },
     { "Toxic",  {  46, 118, 231,  34,  28 }, { COLOR_GREEN,   COLOR_GREEN,   COLOR_WHITE, COLOR_GREEN,   COLOR_GREEN } },
@@ -329,7 +235,7 @@ static const Theme g_themes[N_THEMES] = {
     { "Mono",   { 245, 251, 231, 245, 240 }, { COLOR_WHITE,   COLOR_WHITE,   COLOR_WHITE, COLOR_WHITE,   COLOR_WHITE } },
 };
 
-/* theme_apply() — bind the five themeable slots (COL_BOLT0..COL_GLOW_O). */
+/* Point the five themeable colours at the chosen theme. */
 static void theme_apply(int theme)
 {
     const Theme *t = &g_themes[theme];
@@ -342,7 +248,7 @@ static void theme_apply(int theme)
 static void color_init(void)
 {
     start_color();
-    /* HUD/HINT are theme-independent — yellow data, cyan actions on any palette */
+    /* HUD colours never change with the theme, so the text always stays readable */
     if (COLORS >= 256) {
         init_pair(COL_HUD,  226, COLOR_BLACK);
         init_pair(COL_HINT,  51, COLOR_BLACK);
@@ -350,42 +256,35 @@ static void color_init(void)
         init_pair(COL_HUD,  COLOR_YELLOW, COLOR_BLACK);
         init_pair(COL_HINT, COLOR_CYAN,   COLOR_BLACK);
     }
-    theme_apply(0);   /* Storm; Scene.theme tracks the active one thereafter */
+    theme_apply(0);   /* start on Storm */
 }
 
-/* ===================================================================== */
-/* §4  channel — bolt geometry (pure simulation state)                    */
-/* ===================================================================== */
+/* ── §4  channel — where the bolt is ── */
 
 /*
- * CellGrid — one byte per terminal cell; the shape every per-cell buffer in this
- * program shares (channel occupancy, glow level, glyph index).  Naming the buffer
- * once keeps those three arrays visibly the same thing.
+ * CellGrid — one byte for every cell on the screen, addressed grid[y][x] (row
+ * first, like ncurses). Three different things in this program have this exact
+ * shape — which cells are bolt, how bright the glow is, and which flicker glyph a
+ * cell shows — so naming the layout once makes that family obvious.
  *
- * Indexed row-major as grid[y][x] (row first), matching how ncurses addresses
- * cells.  It is fixed at the largest screen we serve (GRID_ROWS_MAX x COLS_MAX)
- * and embedded by value in its owner, never malloc'd: the project bans heap
- * allocation on the hot path, so the worst case is reserved up front and only the
- * owner's active rows/cols are ever touched.
+ * It's sized for the biggest screen we'll ever handle and lives inside its owner
+ * by value (no malloc). This project never allocates memory while running, so we
+ * reserve the worst case up front and only ever touch the cells in use.
  */
 typedef uint8_t CellGrid[GRID_ROWS_MAX][GRID_COLS_MAX];
 
 /*
- * Channel — the single source of truth about the bolt: its GEOMETRY and nothing
- * else.  hit[y][x] is 1 if the cell belongs to the discharge channel, 0 if it is
- * open sky.  No colour, no glyph, no glow — those are all DERIVED later (§6/§8).
- *
- * WHY so thin: in the dielectric-breakdown picture of lightning (Niemeyer,
- * Pietronero & Wiesmann 1984) the bolt simply IS the set of broken-down cells,
- * and everything visual is a reading of that set.  Storing pure occupancy means
- * the growth code in §5/§7 can only ever change WHERE the bolt is, never how it
- * looks — so a cosmetic tweak can never corrupt the simulation.
+ * Channel — the only record of WHERE the bolt is, and nothing about how it looks.
+ * hit[y][x] is 1 when that cell is part of the bolt and 0 when it's empty sky.
+ * No colour, no glyph, no glow live here — those are all worked out later from
+ * this map. Keeping it this bare means the growth code can only change where the
+ * bolt is, so a visual change can never accidentally break the bolt's shape.
  */
 typedef struct {
-    CellGrid hit;       /* per cell: 1 = bolt channel, 0 = sky                  */
-    int      count;     /* number of 1-cells; equals lit cells, shown in HUD    */
-    int      rows;      /* active height, <= GRID_ROWS_MAX (this bolt's sky)    */
-    int      cols;      /* active width,  <= GRID_COLS_MAX                      */
+    CellGrid hit;       /* 1 = part of the bolt, 0 = empty sky          */
+    int      count;     /* how many cells are lit (shown in the HUD)    */
+    int      rows;      /* screen height in use, up to GRID_ROWS_MAX    */
+    int      cols;      /* screen width  in use, up to GRID_COLS_MAX    */
 } Channel;
 
 static void channel_init(Channel *c, int cols, int rows, int seed_x)
@@ -394,50 +293,46 @@ static void channel_init(Channel *c, int cols, int rows, int seed_x)
     c->rows = clamp_int(rows, 1, GRID_ROWS_MAX);
     memset(c->hit, 0, sizeof c->hit);
 
-    seed_x = clamp_int(seed_x, 0, c->cols - 1);   /* the bolt is born at the top edge */
+    seed_x = clamp_int(seed_x, 0, c->cols - 1);   /* the bolt starts at the top row */
     c->hit[0][seed_x] = 1;
     c->count          = 1;
 }
 
-/* cell_in_bounds() — is (x,y) inside the active grid? */
 static bool cell_in_bounds(const Channel *c, int x, int y)
 {
     return x >= 0 && x < c->cols && y >= 0 && y < c->rows;
 }
 
-/* channel_mark() — add cell (x,y) to the bolt.  Caller guarantees bounds. */
+/* Light up a cell. The caller must have already checked it's on screen. */
 static void channel_mark(Channel *c, int x, int y)
 {
     c->hit[y][x] = 1;
     c->count++;
 }
 
-/* channel_occupied() — bounds-checked: is this cell part of the bolt? */
 static bool channel_occupied(const Channel *c, int x, int y)
 {
     return cell_in_bounds(c, x, y) && c->hit[y][x] != 0;
 }
 
-/* ===================================================================== */
-/* §5  tip — one branch tip, and the pool of tips that form the bolt       */
-/* ===================================================================== */
+/* ── §5  tip — the growing ends of the bolt ── */
 
 /*
- * Tip — one actively growing branch of the bolt: a single growth front that
- * advances one cell per sim step.  This is the recursive-branching view of
- * lightning (Reed & Wyvill 1994) — a bolt is a tip that walks downward and
- * occasionally splits, rather than a potential field solved everywhere at once.
+ * Tip — one growing end of the bolt: a point that steps down one cell at a time,
+ * occasionally splitting in two. Many tips together trace out the whole jagged,
+ * branching shape. (This is the "grow it tip by tip" view of lightning rather
+ * than solving the whole field at once; Reed & Wyvill 1994.)
  *
- * Fields:
- *   x, y    current cell, always inside [0,cols) x [0,rows).
- *   lean    persistent sideways bias in [-LEAN_MAX,+LEAN_MAX].  0 = straight
- *           down; the SIGN picks the direction; the MAGNITUDE is the accumulated
- *           fork depth (children inherit lean +/-1), so deeper branches lean
- *           harder and siblings fan apart — the source of the fractal tree shape.
- *   steps   cells grown since spawn or last fork.  Forking is gated on
- *           steps >= MIN_FORK_STEPS so no segment can start as a stub.
- *   active  true while growing; cleared the step it reaches the ground, a side
- *           edge, or a cell already part of the bolt.
+ *   x, y    where the tip is right now, always on screen.
+ *   lean    how it drifts sideways. 0 means straight down; the sign says left or
+ *           right; the size says how hard it leans. Children inherit their
+ *           parent's lean nudged by one, so the deeper a branch is, the more it
+ *           leans — that's what makes siblings fan apart into a tree.
+ *   steps   how many cells this tip has grown since it was born or last split.
+ *           A tip can't split until this passes MIN_FORK_STEPS, so no branch is
+ *           born as a tiny stub.
+ *   active  true while it's still growing; turned off the moment it hits the
+ *           ground, a side wall, or a cell that's already bolt.
  */
 typedef struct {
     int  x, y;
@@ -447,19 +342,19 @@ typedef struct {
 } Tip;
 
 /*
- * TipPool — the bolt's entire advancing front: every Tip ever spawned, both
- * still-growing and retired, in one fixed array.  Modelling growth as a pool of
- * forking fronts is the L-system / branching view (Prusinkiewicz & Lindenmayer
- * 1990): the binary-tree shape emerges from a single rule — one tip becomes two.
+ * TipPool — every tip the current bolt has ever spawned, growing or finished, in
+ * one fixed array. The whole branching tree comes from a single rule applied to
+ * this pool: one tip becomes two (the L-system idea, Prusinkiewicz &
+ * Lindenmayer 1990).
  *
- * Slots are APPEND-ONLY (tippool_fork appends two children and retires the parent
- * in place) and never compacted or reordered.  WHY that matters: a Tip* taken
- * mid-step therefore stays valid for the rest of the bolt, which is exactly what
- * lets tippool_fork keep using its `parent` pointer while it appends children.
+ * Tips are only ever added, never removed or shuffled: when a tip splits we
+ * append its two children and just mark the parent finished in place. That means
+ * a pointer to a tip stays valid for the rest of the bolt, which is what lets the
+ * split code keep using its parent pointer while it appends the children.
  */
 typedef struct {
-    Tip tips[MAX_TIPS];   /* slots [0,count); a retired tip stays put, inactive  */
-    int count;            /* slots in use (active + retired); 0..MAX_TIPS        */
+    Tip tips[MAX_TIPS];   /* finished tips stay in place, just switched off  */
+    int count;            /* how many slots are used (growing + finished)    */
 } TipPool;
 
 static void tippool_clear(TipPool *p)
@@ -468,7 +363,7 @@ static void tippool_clear(TipPool *p)
     memset(p->tips, 0, sizeof p->tips);
 }
 
-/* tippool_add() — spawn a tip at (x,y) with the given lean, if a slot is free. */
+/* Start a new tip at (x,y) leaning a given way, unless the pool is full. */
 static void tippool_add(TipPool *p, int x, int y, int lean)
 {
     if (p->count >= MAX_TIPS) return;
@@ -484,80 +379,73 @@ static bool tippool_any_active(const TipPool *p)
 }
 
 /*
- * tip_next_cell() — the motion law for one tip: always descend one row, and with
- * LEAN_PCT chance also step one column toward its lean.  The column is clamped to
- * the grid; the row may fall past the bottom (caller reads that as "grounded").
+ * Work out where a tip wants to go next: always one row down, and some of the
+ * time (LEAN_PCT) also one column in its leaning direction. The column is kept on
+ * screen; the row is allowed to fall off the bottom, which the caller treats as
+ * "hit the ground".
  */
 static void tip_next_cell(const Tip *t, const Channel *c, int *nx, int *ny)
 {
     int dx = 0;
     if (t->lean != 0 && roll_percent(LEAN_PCT))
-        dx = (t->lean > 0) ? 1 : -1;                /* step toward the lean */
+        dx = (t->lean > 0) ? 1 : -1;
 
-    *nx = clamp_int(t->x + dx, 0, c->cols - 1);     /* stay on screen */
-    *ny = t->y + 1;                                 /* always descend one row */
+    *nx = clamp_int(t->x + dx, 0, c->cols - 1);
+    *ny = t->y + 1;
 }
 
 /*
- * tippool_fork() — the branching rule: replace one tip with two children whose
- * lean diverges by ±1 (clamped to ±LEAN_MAX), so siblings spread apart as they
- * descend and the bolt becomes a fractal binary tree.  The parent retires; only
- * the children carry on.  No-op when the pool has no room for two.
+ * Split one tip into two. The children start where the parent is, one leaning a
+ * touch more left and one a touch more right, so they spread apart as they fall
+ * and build up the branching tree. The parent stops; the children take over.
+ * Does nothing if there isn't room for both.
  */
 static void tippool_fork(TipPool *p, Tip *parent)
 {
-    if (p->count > MAX_TIPS - 2) return;              /* need room for two children */
+    if (p->count > MAX_TIPS - 2) return;
     int left  = clamp_int(parent->lean - 1, -LEAN_MAX, LEAN_MAX);
     int right = clamp_int(parent->lean + 1, -LEAN_MAX, LEAN_MAX);
     tippool_add(p, parent->x, parent->y, left);
     tippool_add(p, parent->x, parent->y, right);
-    parent->active = false;                           /* parent retires; children grow */
+    parent->active = false;
 }
 
-/*
- * tip_may_fork() — branching is allowed only after MIN_FORK_STEPS of straight
- * run, then fires with probability fork_pct/PERCENT; this keeps branches from
- * splitting into stubs the instant they are born.
- */
+/* A tip may split only after it's grown a little (so no stub branches), and then
+ * only on a fork_pct-out-of-100 roll. */
 static bool tip_may_fork(const Tip *t, int fork_pct)
 {
     return t->steps >= MIN_FORK_STEPS && roll_percent(fork_pct);
 }
 
-/*
- * growth_blocked() — a tip stops when its next cell falls past the ground or is
- * already part of the bolt (a discharge channel never retraces itself).
- */
+/* A tip is done if its next cell is below the ground or already part of the bolt
+ * (a real bolt never doubles back over itself). */
 static bool growth_blocked(const Channel *c, int x, int y)
 {
     return y >= c->rows || channel_occupied(c, x, y);
 }
 
-/* ===================================================================== */
-/* §6  effects — glow + shimmer, derived from the channel (cosmetic only) */
-/* ===================================================================== */
+/* ── §6  effects — the glow and the flicker (looks only) ── */
 
 /*
- * Effects — the two cosmetic layers, both DERIVED from the channel and feeding
- * back into nothing.  INVARIANT: every §6 function reads the Channel and writes
- * only Effects, so deleting this struct changes how the bolt LOOKS, never how it
- * grows.  This is where all the "make it look electric" decisions live.
+ * Effects — the two purely cosmetic layers. Both are worked out FROM the channel
+ * and feed back into nothing: every function here reads the bolt and writes only
+ * here, so you could delete this whole struct and the bolt would grow exactly the
+ * same — it'd just look plainer. This is where all the "make it look electric"
+ * choices live.
  *
- * Fields (both are per-cell CellGrids, indexed [y][x]):
- *   glow   an ambient corona around the bolt — the visible discharge halo of
- *          Kim & Lin (2004).  Built as a small city-block distance transform of
- *          the channel (Rosenfeld & Pfaltz 1966): a cell's level is GLOW_RADIUS+1
- *          minus its Manhattan distance to the nearest bolt cell, giving
- *          0 = none, 1 = outer (distance 2), 2 = inner (distance 1).  A pure
- *          function of the channel, rebuilt whenever the channel changes.
- *   spark  the shimmer: which SPARK_CHARS glyph the cell shows right now, as an
- *          index in 0..strlen(SPARK_CHARS)-1, or SPARK_UNSEEDED (0xFF) before a
- *          cell's first glyph is assigned.  Re-rolled over time so the bolt
- *          crackles instead of standing still.
+ * Both fields are one value per screen cell, addressed [y][x]:
+ *   glow   a faint halo around the bolt (the discharge corona of Kim & Lin 2004).
+ *          A cell's value is how close it is to the nearest bolt cell, measured
+ *          in steps up/down/left/right: 2 = right next to the bolt (brightest),
+ *          1 = one further out, 0 = no glow. Rebuilt whenever the bolt changes.
+ *   spark  which flicker glyph each bolt cell is currently showing (an index into
+ *          SPARK_CHARS), or SPARK_UNSEEDED if it hasn't been given one yet. We
+ *          re-roll some of these over time so the bolt crackles instead of
+ *          sitting frozen.
  */
 typedef struct {
-    CellGrid glow;     /* halo level per cell: 0 none / 1 outer / 2 inner       */
-    CellGrid spark;    /* glyph index per cell, or SPARK_UNSEEDED               */
+    CellGrid glow;     /* per cell: 0 = none, 1 = outer glow, 2 = inner glow */
+    CellGrid spark;    /* per cell: which flicker glyph, or SPARK_UNSEEDED   */
 } Effects;
 
 static void fx_clear(Effects *fx)

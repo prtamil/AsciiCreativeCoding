@@ -1,101 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * julia.c  —  Julia set fractal, animated random-pixel fill
+ * julia.c — a Julia set fractal that draws itself in, one scattered dot at a
+ * time. Each screen cell is a point on a plane; we repeatedly square it and add
+ * a fixed number, and colour it by how fast it flies off to infinity. Six
+ * preset shapes cycle on their own; q/ESC quits, n next shape, t theme,
+ * spc pause, [ / ] slower/faster.
  *
- * For every pixel (col, row) on the terminal, the position is mapped to
- * a complex number z = re + im·i and iterated under f(z) = z² + c until
- * |z| > 2 (escape) or MAX_ITER is reached (inside the set).
- *
- * Pixels are revealed in a random shuffled order, so the fractal
- * materialises from random scattered dots rather than a scan line.
- * Once all pixels are computed the animation pauses briefly, then
- * cycles to the next Julia parameter preset and redraws.
- *
- * Color — a cycle-able theme (t / T): the set body plus four escape bands
- * fading from near-boundary (bright) to far exterior (dim) to black.
- *
- * Six presets cycle automatically:
- *   douady rabbit · spiral galaxy · dendrite · flame · seahorse · basilica
- *
- * Keys:
- *   q / ESC   quit
- *   r / n     skip to next Julia preset immediately
- *   t / T     cycle color theme (Fire/Ocean/Toxic/Neon/Mono)
- *   ] [       faster / slower simulation
- *   p / spc   pause / resume
- *
- * Build (no -lm — this file uses no math-library functions):
- *   gcc -std=c11 -O2 -Wall -Wextra julia.c -o julia -lncurses
- *
- * Reading order — built bottom-up; each section uses only earlier ones.
- *   §1  config   — constants, palette slots, themes
- *   §2  clock    — monotonic time
- *   §3  complex  — Complex number + arithmetic (the plane z lives in)
- *   §4  fractal  — Julia escape iteration + escape→colour mapping
- *   §5  view     — Preset (the Julia constant c) + ViewWindow lens
- *   §6  canvas   — pixel buffer of colour bands
- *   §7  reveal   — Fisher-Yates random-fill animation
- *   §8  color    — apply a Theme to ncurses colour pairs
- *   §9  scene    — Scene: composes view + canvas + reveal into one picture
- *   §10 screen   — ncurses lifecycle + HUD
- *   §11 app      — signals, input, main loop
+ * Same engine as mandelbrot.c, but here the added number is fixed and the
+ * starting point changes per cell (Mandelbrot is the other way round).
+ * julia_explorer.c lets you drag that fixed number around live. Julia (1918);
+ * the connected-when-c-is-in-the-Mandelbrot-set fact is Douady & Hubbard's
+ * Orsay Notes (1984).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Escape-time — per-pixel iteration until escape.  Unlike
- *                  Mandelbrot (c varies per pixel, z₀ = 0), a Julia set fixes c
- *                  globally and varies the START point z₀ (= the pixel).  Each
- *                  pixel asks: does the orbit of z₀ under f(z) = z² + c stay
- *                  bounded?  Pixels are revealed in shuffled order.
- *
- * Math           : Julia–Mandelbrot duality: J(c) is connected iff c ∈ M.  Near
- *                  ∂M the Julia set is most intricate; well inside M it's a
- *                  filled blob; outside M it's disconnected dust.  Escape test
- *                  |z|² > 4 (squared, to avoid a sqrt).
- *
- * Data model     : Small structs, one idea each —
- *                    Complex     a point/number in the plane (z, c)
- *                    Preset      the Julia constant c that defines a set
- *                    ViewWindow  the rectangle of the plane on screen
- *                    Canvas      the grid of coloured cells we paint
- *                    Reveal      the random order we fill the canvas in
- *                    Scene       all of the above + which preset/theme is live
- *
- * Rendering      : Escape count → 5-slot palette (body + 4 escape bands), themed
- *                  and cycle-able.  Random pixel order makes the fractal
- *                  materialise everywhere at once instead of scan-line by line.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES ───────────────────────────────────────────────────────── *
- *
- * Concepts & maths
- *   [1] Julia, G. (1918). "Mémoire sur l'itération des fonctions rationnelles."
- *       J. Math. Pures Appl. 8:47-245.  — the founding paper; these sets carry
- *       his name.  (Fatou's parallel 1919-20 work is the other half.)
- *   [2] Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
- *       — self-similarity and the z²+c family; popularised these images.
- *   [3] Peitgen, H.-O. & Richter, P. H. (1986). "The Beauty of Fractals."
- *       Springer.  — the clearest pictures + complex-dynamics behind Julia and
- *       Mandelbrot sets; start here for intuition.
- *   [4] Douady, A. & Hubbard, J. H. (1984-85). "Étude dynamique des polynômes
- *       complexes" (the Orsay Notes).  — proves the duality used in §5: the
- *       Julia set J(c) is connected iff c lies in the Mandelbrot set.
- *
- * Rendering & escape-time
- *   [5] Peitgen, Jürgens & Saupe (1992). "Chaos and Fractals: New Frontiers of
- *       Science." Springer.  — the escape-time algorithm in full; the §4 loop
- *       is a direct descendant.
- *   [6] Vepstas, L. (2004). "Renormalizing the Mandelbrot Escape."  — the
- *       fractional escape count n + 1 − log₂(log|z|) that removes the visible
- *       banding; consult before swapping in smooth colouring for §4's bands.
- *
- * In-repo study companions
- *   [7] julia_explorer.c — interactive Mandelbrot↔Julia: move c on the
- *       Mandelbrot map and watch J(c) change, SEEING the duality [4] live.
- *   [8] mandelbrot.c — the same z²+c escape engine, but z₀ = 0 and c varies per
- *       pixel; diff it against §4 to see exactly what "Julia vs Mandelbrot" is.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -117,37 +33,36 @@ enum {
     SIM_FPS_MAX      =  60,
     SIM_FPS_STEP     =   5,
 
-    PIXELS_PER_TICK  =  60,    /* pixels computed per simulation tick    */
-    MAX_ITER         = 128,    /* Julia iteration cap                    */
-    DONE_PAUSE_TICKS =  90,    /* ticks to hold completed fractal (~3 s) */
-    N_PRESETS        =   6,    /* Julia parameter presets                */
-    N_THEMES         =   5,    /* colour themes to cycle with t/T        */
-    N_COLORS         =   5,    /* content slots: INSIDE + C2..C5         */
+    PIXELS_PER_TICK  =  60,    /* how many cells we fill in each step    */
+    MAX_ITER         = 128,    /* give up after this many tries per cell  */
+    DONE_PAUSE_TICKS =  90,    /* hold the finished picture ~3 s          */
+    N_PRESETS        =   6,    /* preset shapes                          */
+    N_THEMES         =   5,    /* colour themes, cycled with t/T         */
+    N_COLORS         =   5,    /* paintable slots: the body + 4 bands    */
 
     CANVAS_ROWS_MAX  =  80,
     CANVAS_COLS_MAX  = 300,
 
-    RENDER_FPS       =  60,    /* display refresh cap (≠ reveal speed)  */
-    MAX_FRAME_MS     = 100,    /* clamp on one frame's dt (anti spiral) */
+    RENDER_FPS       =  60,    /* how often we redraw (not the fill rate) */
+    MAX_FRAME_MS     = 100,    /* longest frame we'll believe in          */
     HUD_COLS         =  80,
-    FPS_UPDATE_MS    = 500,    /* recompute the fps readout this often  */
+    FPS_UPDATE_MS    = 500,    /* how often the fps number refreshes      */
 };
 
-/* |z| > 2 ⇒ the orbit escapes to infinity.  Compare |z|² to 4 to skip a sqrt. */
+/* A point "escapes" once it gets more than 2 away from the centre. We compare
+ * the squared distance to 4 so we never need a square root. */
 #define ESCAPE_RADIUS_SQ  4.0f
 
-/* Pixels escaping within the first 12 % of the iteration budget are far
- * exterior — left blank so the picture isn't a wall of noise. */
+/* Points that fly off almost immediately are far from anything interesting;
+ * leave them blank so the screen isn't just a fog of dots. */
 #define BACKGROUND_FRAC   0.12f
 
-/* Half-height of the complex-plane window, in imaginary units.  Fixed for all
- * presets; the real half-extent is derived from it and the terminal aspect. */
+/* How tall a slice of the plane fills the screen, top to bottom. The width is
+ * worked out from this and the terminal shape. */
 #define VIEW_HALF_IM      1.3f
 
-/*
- * ASPECT_R — terminal cell height / width ≈ 2.  Preserves the aspect ratio of
- * the complex plane when mapping (col, row) → (re, im).
- */
+/* Terminal characters are about twice as tall as they are wide. We stretch the
+ * horizontal span to match so the fractal isn't squashed. */
 #define ASPECT_R    2.0f
 
 #define NS_PER_SEC  1000000000LL
@@ -155,48 +70,42 @@ enum {
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
 /*
- * ColorID — the colour "slots" a pixel can take.
+ * ColorID — the colour a cell can be painted.
  *
- * THE colouring idea to learn: an escape-time fractal colours each pixel by HOW
- * LONG its orbit took to escape (its "escape time"; ref [5]):
- *   never escaped → COL_INSIDE  (the point belongs to the set)
- *   escaped slowly → COL_C5     (just outside the boundary — bright)
- *   escaped fast   → COL_C2     (far outside — dim)
- * Slow escape ⇒ near the intricate boundary ⇒ vivid; fast escape ⇒ far away.
- *
- * One value does double duty: it's both the ncurses colour-pair id AND the byte
- * stored in each Canvas cell.  HUD slots are theme-independent; 0 = blank.
+ * The whole idea: we colour each cell by how long it took to fly off to
+ * infinity. Points that never leave are the body of the shape; points that
+ * leave slowly are right on the lacy edge (bright); points that leave fast are
+ * far from it (dim). Each value here is used two ways at once — as the ncurses
+ * colour-pair number, and as the byte we store in a canvas cell. 0 means a
+ * blank, unpainted cell.
  */
 typedef enum {
-    COL_INSIDE = 1,   /* the set itself — orbit never escaped */
-    COL_C2     = 2,   /* far exterior   — escaped fastest     */
-    COL_C3     = 3,   /* exterior                             */
-    COL_C4     = 4,   /* mid-exterior                         */
-    COL_C5     = 5,   /* near boundary  — escaped slowest     */
-    COL_HUD    = 6,   /* HUD top data lines    — yellow       */
-    COL_HINT   = 7,   /* HUD bottom action bar — cyan         */
+    COL_INSIDE = 1,   /* part of the shape — never flew off       */
+    COL_C2     = 2,   /* flew off fastest — furthest from the edge */
+    COL_C3     = 3,
+    COL_C4     = 4,
+    COL_C5     = 5,   /* flew off slowest — right on the edge      */
+    COL_HUD    = 6,   /* HUD info lines, yellow                    */
+    COL_HINT   = 7,   /* HUD key bar, cyan                         */
 } ColorID;
 
 /*
- * Theme — a named colour scheme for the body + four escape bands, cycled t / T.
+ * Theme — a named set of five colours: the body plus the four edge bands,
+ * cycled with t / T.
  *
- * WHY it exists: the maths only ever produces a band number per pixel (a
- * ColorID); a Theme is the lookup that turns those abstract bands into real
- * on-screen colours, so the whole picture restyles by swapping one table row —
- * no recompute of the fractal.  (Same table-driven idea as buddhabrot.c's
- * palette table.)
+ * The fractal maths only ever decides which of the five slots a cell belongs
+ * to. A theme is the lookup that turns those slot numbers into actual colours,
+ * so switching themes restyles the whole picture instantly without redoing any
+ * maths. Every colour sits in the bright half of the palette on purpose: dark
+ * colours vanish against the black background.
  *
- * HOW to read the arrays, dim → bright: fg[0] = INSIDE (the body), then
- * fg[1..4] = C2..C5 (far/dim escape → near/bright escape).
- *
- * WHY every value is bright: a 256-index from the dark bottom of the cube is
- * invisible on black, so all bands sit in the bright half — even the far halo
- * stays visible; the near-boundary band (C5) is also drawn bold.
+ * The arrays run dim to bright: slot 0 is the body, then the four bands from
+ * far-and-dim to edge-and-bright.
  */
 typedef struct {
-    const char *name;            /* shown in the HUD, e.g. "Ocean"      */
-    int fg256[N_COLORS];         /* slots INSIDE, C2, C3, C4, C5 (256)  */
-    int fg8[N_COLORS];           /* same five slots, 8-colour fallback  */
+    const char *name;            /* shown in the HUD, e.g. "Ocean"           */
+    int fg256[N_COLORS];         /* the five colours on a 256-colour terminal */
+    int fg8[N_COLORS];           /* same five, for plain 8-colour terminals   */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -229,23 +138,16 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/*
- * clamp_frame_dt — cap a single frame's elapsed time.  If the program stalls
- * (debugger, laptop sleep), a huge dt would make the fixed-timestep loop run a
- * burst of catch-up ticks at once — the "spiral of death".  Capping trades one
- * slow frame for stability.
- */
+/* If the program freezes (laptop sleep, a debugger), the next frame looks
+ * enormously long. Cap it so we don't suddenly try to catch up all at once. */
 static int64_t clamp_frame_dt(int64_t dt)
 {
     int64_t cap = MAX_FRAME_MS * NS_PER_MS;
     return dt > cap ? cap : dt;
 }
 
-/*
- * frame_pace — sleep so the whole frame lasts about 1 / target_fps.
- * `frame_start` is when the frame began; `work_done` is time already spent, so
- * we sleep only the leftover budget instead of busy-waiting.
- */
+/* Sleep just long enough that the whole frame lasts 1/target_fps. We already
+ * spent some of that budget working, so only nap for what's left over. */
 static void frame_pace(int target_fps, int64_t frame_start, int64_t work_done)
 {
     int64_t budget = TICK_NS(target_fps);
@@ -254,21 +156,22 @@ static void frame_pace(int target_fps, int64_t frame_start, int64_t work_done)
 }
 
 /*
- * FpsCounter — a small running readout of frames-per-second for the HUD.  Sums
- * frames and elapsed time, then every FPS_UPDATE_MS divides the two for a smooth
- * value (raw per-frame fps jitters too much to read).
+ * FpsCounter — the frames-per-second number shown in the HUD.
+ *
+ * Measuring one frame at a time gives a jumpy number, so we tally up frames and
+ * time over half a second and divide once for a steady reading.
  */
 typedef struct {
-    int64_t accum_ns;   /* real time since the last readout update */
-    int     frames;     /* frames counted since then               */
-    double  value;      /* last computed fps — what the HUD shows  */
+    int64_t accum_ns;   /* time piled up since the last reading  */
+    int     frames;     /* frames counted in that time           */
+    double  value;      /* the steady number the HUD shows       */
 } FpsCounter;
 
 static void fps_count_frame(FpsCounter *f, int64_t dt)
 {
     f->frames   += 1;
     f->accum_ns += dt;
-    if (f->accum_ns >= FPS_UPDATE_MS * NS_PER_MS) {       /* time to refresh? */
+    if (f->accum_ns >= FPS_UPDATE_MS * NS_PER_MS) {       /* enough piled up — update */
         f->value    = (double)f->frames / ((double)f->accum_ns / (double)NS_PER_SEC);
         f->frames   = 0;
         f->accum_ns = 0;
@@ -276,44 +179,39 @@ static void fps_count_frame(FpsCounter *f, int64_t dt)
 }
 
 /* ===================================================================== */
-/* §3  complex — the number system the fractal iterates in                */
+/* §3  complex — the kind of number the fractal is built on               */
 /* ===================================================================== */
 
 /*
- * Complex — one point in the complex plane, written z = re + im·i.
+ * Complex — a single point on a flat 2-D plane, with an x part and a y part.
  *
- * WHY fractals are built on this: a complex number is a 2-D point (re, im) that
- * comes with a special multiplication — squaring a point both SCALES and
- * ROTATES it about the origin.  Repeatedly doing "square it, then add a fixed
- * point c" either flings the point off to infinity or traps it near the origin
- * forever; the razor's edge between those two fates is the fractal boundary.
- * (Iteration of complex functions: refs [1][2].)
+ * What makes it special is one trick: "squaring" such a point spins it around
+ * the centre and scales it. The fractal comes from doing that over and over and
+ * adding a fixed point each time — some starting points stay put near the
+ * centre, others race off to infinity, and the border between the two fates is
+ * the lacy shape we draw.
  *
- * In this program: every screen pixel IS one Complex number — its starting
- * point z₀ — and the Julia constant c is Complex too.  Naming the type and
- * giving it add/square lets the iteration read like its formula:  z ← z² + c.
- *
- * WHY float: the window spans only a few units, so ~7 digits is plenty, and it
- * is faster than double across the millions of iterations per frame.
+ * Here, every screen cell is one of these points, and so is the fixed number we
+ * add. We use float (not double): the picture only spans a few units, so the
+ * extra precision isn't worth the speed it costs over millions of steps.
  */
 typedef struct {
-    float re;   /* real part      — horizontal axis */
-    float im;   /* imaginary part — vertical axis   */
+    float re;   /* the x part (horizontal) */
+    float im;   /* the y part (vertical)   */
 } Complex;
 
-/* z = a + b */
 static inline Complex complex_add(Complex a, Complex b)
 {
     return (Complex){ a.re + b.re, a.im + b.im };
 }
 
-/* z² = (re² − im²) + (2·re·im)·i */
+/* Squaring a complex point — this is the spin-and-scale move the fractal runs on. */
 static inline Complex complex_square(Complex z)
 {
     return (Complex){ z.re * z.re - z.im * z.im, 2.0f * z.re * z.im };
 }
 
-/* |z|² = re² + im²  (squared modulus — compared against ESCAPE_RADIUS_SQ) */
+/* How far the point sits from the centre, squared (so we skip the square root). */
 static inline float complex_norm_sq(Complex z)
 {
     return z.re * z.re + z.im * z.im;
@@ -324,9 +222,9 @@ static inline float complex_norm_sq(Complex z)
 /* ===================================================================== */
 
 /*
- * julia_escape — how many steps the orbit of z₀ survives before it escapes the
- * radius-2 disc, under f(z) = z² + c for this set's fixed c.  Returns MAX_ITER
- * if it never escapes (z₀ is inside the set).
+ * Count how many "square it, then add c" steps a starting point survives before
+ * it races off past distance 2. Returns MAX_ITER if it never does — that point
+ * is part of the shape.
  */
 static int julia_escape(Complex z, Complex c)
 {
@@ -339,46 +237,44 @@ static int julia_escape(Complex z, Complex c)
 }
 
 /*
- * escape_to_band — turn an escape count into a Canvas colour slot.
- *   never escaped (== MAX_ITER) → COL_INSIDE
- *   escaped in first 12 %       → 0 (blank: far exterior)
- *   otherwise                   → COL_C2..COL_C5, slow escape = brighter
+ * Turn that escape count into a colour slot: never escaped is the body, the
+ * quickest escapers stay blank, and everything between gets one of the four
+ * edge bands — the slower it escaped, the closer to the bright edge.
  */
 static uint8_t escape_to_band(int escape)
 {
     if (escape >= MAX_ITER) return COL_INSIDE;
 
-    float frac = (float)escape / (float)MAX_ITER;   /* 0 = instant … →1 = slow */
+    float frac = (float)escape / (float)MAX_ITER;   /* 0 = instant, 1 = barely held on */
     if (frac < BACKGROUND_FRAC) return 0;
 
-    /* position within the coloured halo: rescale [BACKGROUND_FRAC,1) → [0,1) */
+    /* spread the surviving range across the four bands */
     float halo_pos = (frac - BACKGROUND_FRAC) / (1.0f - BACKGROUND_FRAC);
-    int   n_bands  = COL_C5 - COL_C2 + 1;           /* 4 escape bands          */
+    int   n_bands  = COL_C5 - COL_C2 + 1;
     int   band     = COL_C2 + (int)(halo_pos * (float)n_bands);
     return (uint8_t)(band > COL_C5 ? COL_C5 : band);
 }
 
 /* ===================================================================== */
-/* §5  view — the Julia constant, and the lens onto the plane             */
+/* §5  view — the fixed number, and the window onto the plane             */
 /* ===================================================================== */
 
 /*
- * Preset — one Julia set, identified by its constant c.
+ * Preset — one named shape, defined entirely by the fixed number we add.
  *
- * THE key idea to learn: there isn't one Julia set — there are infinitely many,
- * one for every value of c.  Fix c, then ask of every start point z₀ "does
- * z ← z² + c stay bounded?"  The points that DO form the Julia set J(c).  A
- * different c gives a completely different shape, which is why a Preset is just
- * a name + a c; nothing else changes.
+ * There isn't a single Julia set — there's a different one for every choice of
+ * that fixed number. Pick one, ask of every starting point "does it stay put or
+ * race off?", and the points that stay form the shape. Change the number and
+ * the whole shape changes, which is why a preset is just a name plus that one
+ * number.
  *
- * WHY these particular c's: each sits near the edge of the Mandelbrot set,
- * where J(c) is connected and most lacy — the famous rabbit, dendrite, seahorse.
- * Deep inside M it would be a plain blob; outside M, disconnected dust.  (That
- * link, J(c) connected ⇔ c ∈ M, is the Julia–Mandelbrot duality — ref [4].)
+ * These six numbers were chosen because they each land near the edge of the
+ * Mandelbrot set, where the shapes are connected and at their laciest — the
+ * famous rabbit, dendrite, seahorse, and so on.
  */
 typedef struct {
     const char *name;   /* shown in the HUD, e.g. "seahorse" */
-    Complex     c;      /* the constant in f(z) = z² + c     */
+    Complex     c;      /* the fixed number we add each step */
 } Preset;
 
 static const Preset k_presets[N_PRESETS] = {
@@ -391,24 +287,20 @@ static const Preset k_presets[N_PRESETS] = {
 };
 
 /*
- * ViewWindow — which rectangle of the (infinite) complex plane we're looking at.
+ * ViewWindow — which patch of the endless plane fills the screen.
  *
- * The plane is continuous and endless; the terminal is a fixed grid of cells.
- * This struct is the bridge: a centre point (the origin, for every Julia set)
- * plus how far the view reaches each way.  view_sample turns a cell into the
- * complex point it stands for — the ONE place screen coordinates meet the maths.
- *
- * WHY half_re ≠ half_im: terminal cells are ~2× taller than wide, so the real
- * (horizontal) half-extent is widened to match; otherwise the set would look
- * vertically stretched.
+ * The plane goes on forever; the terminal is a fixed grid. This is the bridge:
+ * the point shown at screen centre, plus how far the view reaches each way. The
+ * horizontal and vertical reaches differ because terminal characters are about
+ * twice as tall as wide — without that stretch the shape would look squashed.
  */
 typedef struct {
-    Complex center;    /* plane point shown at screen centre (origin for Julia) */
-    float   half_re;   /* half-width  in real units (aspect-corrected)          */
-    float   half_im;   /* half-height in imaginary units                        */
+    Complex center;    /* the point shown at screen centre (always the origin) */
+    float   half_re;   /* how far the view reaches left/right (stretched)      */
+    float   half_im;   /* how far the view reaches up/down                     */
 } ViewWindow;
 
-/* Build the view for the current terminal size (same window for all presets). */
+/* Size the window to the current terminal (same window for every preset). */
 static ViewWindow view_for_screen(int cols, int rows)
 {
     ViewWindow v;
@@ -419,17 +311,17 @@ static ViewWindow view_for_screen(int cols, int rows)
 }
 
 /*
- * view_sample — which complex number is the start point z₀ for screen cell
- * (col, row)?  Centre-relative offset in [-1,+1] per axis, scaled by the
- * half-extent.  The imaginary offset is negated so row 0 (top) is +im.
+ * Which point on the plane does screen cell (col, row) stand for? This is the
+ * one place screen positions become plane points. The vertical axis is flipped
+ * because screen rows grow downward but the plane's y grows upward.
  */
 static Complex view_sample(const ViewWindow *v, int col, int row, int cols, int rows)
 {
-    float fx = (float)col / (float)(cols - 1);   /* 0 → 1 left to right */
-    float fy = (float)row / (float)(rows - 1);   /* 0 → 1 top to bottom */
+    float fx = (float)col / (float)(cols - 1);   /* 0 at left edge, 1 at right */
+    float fy = (float)row / (float)(rows - 1);   /* 0 at top,       1 at bottom */
 
     float off_re =  (fx - 0.5f) * 2.0f;
-    float off_im = -(fy - 0.5f) * 2.0f;          /* flip: top of screen = +im */
+    float off_im = -(fy - 0.5f) * 2.0f;          /* flip so the top of screen is up */
 
     return (Complex){
         .re = v->center.re + off_re * v->half_re,
@@ -442,19 +334,20 @@ static Complex view_sample(const ViewWindow *v, int col, int row, int cols, int 
 /* ===================================================================== */
 
 /*
- * Canvas — the picture held in memory: one ColorID per terminal cell.
+ * Canvas — the picture held in memory, one colour slot per terminal cell.
  *
- * WHY a buffer between the maths and the screen: the escape algorithm only ever
- * writes a band number into band[row][col]; canvas_paint alone turns those
- * numbers into glyphs.  So the fractal maths never mentions ncurses, and either
- * half can change without touching the other.
+ * Keeping a buffer between the maths and the screen means the fractal code only
+ * stores slot numbers and never touches ncurses; one function (canvas_paint)
+ * turns those numbers into characters. Either side can change without disturbing
+ * the other.
  *
- * 0 = not computed yet (or fast-escape background); 1..5 = a colour band.
- * Fixed-size (this project never mallocs in the loop); rows/cols = portion used.
+ * A cell holds 0 if it hasn't been worked out yet (or is blank background), or
+ * 1..5 for a colour slot. The arrays are fixed-size so we never allocate while
+ * running; rows/cols say how much of them this terminal actually uses.
  */
 typedef struct {
-    int     rows, cols;                              /* portion in use       */
-    uint8_t band[CANVAS_ROWS_MAX][CANVAS_COLS_MAX];  /* [row][col] → ColorID */
+    int     rows, cols;                              /* part of the grid in use */
+    uint8_t band[CANVAS_ROWS_MAX][CANVAS_COLS_MAX];  /* each cell's colour slot */
 } Canvas;
 
 static void canvas_reset(Canvas *cv, int cols, int rows)
@@ -467,19 +360,18 @@ static void canvas_reset(Canvas *cv, int cols, int rows)
 }
 
 /*
- * band_glyph — the character drawn for each colour slot, indexed by ColorID.
- * NOTE: this glyph mapping is inherited from mandelbrot.c and is uneven — the
- * set interior shows as ',' and the C3 band as a blank.  Colour does the real
- * visual work; the glyph just adds a little texture.
+ * The character drawn for each colour slot. It's a bit uneven (inherited from
+ * mandelbrot.c — the body shows as ',' and one band is just blank), but colour
+ * does the real work here; the character only adds a little texture.
  */
 static chtype band_glyph(uint8_t slot)
 {
-    static const char glyph[8] = " ,. +#*";   /* [ColorID] → glyph */
+    static const char glyph[8] = " ,. +#*";
     return (chtype)(unsigned char)glyph[slot < 7 ? slot : 0];
 }
 
-/* band_attr — ncurses attributes for a slot: its colour pair, plus A_BOLD on
- * the set body and the bright near-boundary band so they stand out. */
+/* The colour and styling for a slot: its colour, plus bold for the body and the
+ * bright edge band so they pop. */
 static attr_t band_attr(uint8_t slot)
 {
     attr_t attr = COLOR_PAIR((int)slot);
@@ -492,7 +384,7 @@ static void canvas_paint(const Canvas *cv, WINDOW *w)
     for (int row = 0; row < cv->rows; row++) {
         for (int col = 0; col < cv->cols; col++) {
             uint8_t slot = cv->band[row][col];
-            if (slot == 0) continue;                 /* not computed / background */
+            if (slot == 0) continue;                 /* blank — skip it */
             attr_t attr = band_attr(slot);
             wattron(w, attr);
             mvwaddch(w, row, col, band_glyph(slot));
@@ -506,22 +398,22 @@ static void canvas_paint(const Canvas *cv, WINDOW *w)
 /* ===================================================================== */
 
 /*
- * Reveal — the ORDER cells get computed in, purely for the look: the fractal
- * condenses out of random dots instead of wiping top-to-bottom.
+ * Reveal — the order cells get filled in, purely for looks: the picture
+ * condenses out of scattered dots instead of wiping in line by line.
  *
- * order[] lists every cell's flattened index (row*cols + col) once, then a
- * Fisher-Yates shuffle randomises it (Knuth, TAOCP Vol. 2 §3.4.2); `done` walks
- * through it PIXELS_PER_TICK at a time.  Unflatten with col = idx % cols,
- * row = idx / cols.
+ * order[] is a list of every cell, shuffled into random order; `done` marks how
+ * far through that list we've gotten, advancing a batch at a time. Each entry is
+ * a cell's position folded into a single number (row * cols + col), unfolded
+ * again when we need its row and column.
  */
 typedef struct {
-    int order[CANVAS_ROWS_MAX * CANVAS_COLS_MAX];  /* shuffled flat cell indices */
-    int total;   /* cells to reveal (rows * cols) */
-    int done;    /* cells revealed so far         */
+    int order[CANVAS_ROWS_MAX * CANVAS_COLS_MAX];  /* every cell, in shuffled order */
+    int total;   /* how many cells there are to fill */
+    int done;    /* how many we've filled so far     */
 } Reveal;
 
-/* fisher_yates_shuffle — uniformly shuffle a[0..n) in place, O(n): swap each
- * slot (back to front) with a randomly chosen earlier-or-equal one. */
+/* Shuffle the list into a fair random order, in place (the classic
+ * Fisher-Yates shuffle). */
 static void fisher_yates_shuffle(int *a, int n)
 {
     for (int i = n - 1; i > 0; i--) {
@@ -534,9 +426,9 @@ static void reveal_shuffle(Reveal *r, int n_pixels)
 {
     r->total = n_pixels;
     r->done  = 0;
-    for (int i = 0; i < n_pixels; i++)            /* list every cell once     */
+    for (int i = 0; i < n_pixels; i++)            /* list every cell, in order */
         r->order[i] = i;
-    fisher_yates_shuffle(r->order, n_pixels);     /* randomise the visit order */
+    fisher_yates_shuffle(r->order, n_pixels);     /* then jumble it up         */
 }
 
 static bool reveal_complete(const Reveal *r) { return r->done >= r->total; }
@@ -547,10 +439,10 @@ static int reveal_percent(const Reveal *r)
 }
 
 /* ===================================================================== */
-/* §8  color — bind a Theme to ncurses colour pairs                       */
+/* §8  color — hand a Theme's colours to ncurses                          */
 /* ===================================================================== */
 
-/* Bind the body + four escape bands (COL_INSIDE..COL_C5) to the active theme. */
+/* Point the five paintable slots at the chosen theme's colours. */
 static void theme_apply(int theme)
 {
     const Theme *t = &k_themes[theme];
@@ -563,7 +455,7 @@ static void theme_apply(int theme)
 static void color_init(void)
 {
     start_color();
-    /* HUD/HINT are theme-independent — yellow data, cyan actions on any palette */
+    /* The HUD colours never change with the theme — yellow info, cyan keys. */
     if (COLORS >= 256) {
         init_pair(COL_HUD,  226, COLOR_BLACK);
         init_pair(COL_HINT,  51, COLOR_BLACK);
@@ -571,7 +463,7 @@ static void color_init(void)
         init_pair(COL_HUD,  COLOR_YELLOW, COLOR_BLACK);
         init_pair(COL_HINT, COLOR_CYAN,   COLOR_BLACK);
     }
-    theme_apply(0);   /* Fire; Scene.theme tracks the active one thereafter */
+    theme_apply(0);   /* start on Fire */
 }
 
 /* ===================================================================== */
@@ -579,26 +471,26 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * Scene — the whole "what is on screen" in one place: which Julia set (preset →
- * c) and palette are live, the view window, the painted canvas, and how far the
- * random fill has gotten.  Everything the program does reduces to: update a
- * Scene (scene_tick), then draw it (scene_draw).
+ * Scene — everything that's on screen, in one place: which shape and which
+ * theme are showing, the window onto the plane, the painted canvas, and how far
+ * the fill has gotten. Everything the program does comes down to: update the
+ * scene, then draw it.
  *
- * WHY ids, not pointers: preset_id / theme are plain indices into the
- * k_presets / k_themes tables — trivial to cycle ( (id+1) % N ), they read
- * straight into the HUD, and they never dangle.
+ * preset_id and theme are just positions in the preset/theme tables, not
+ * pointers — easy to step to the next one, easy to print in the HUD, and they
+ * can never go stale.
  */
 typedef struct {
-    int        preset_id;   /* which k_presets entry — the Julia constant c */
-    int        theme;       /* which k_themes palette is active             */
-    ViewWindow view;        /* the complex-plane rectangle being drawn      */
-    Canvas     canvas;      /* painted cells                                */
-    Reveal     reveal;      /* random-fill progress                         */
-    int        hold_ticks;  /* ticks held after completion, before cycling  */
-    bool       paused;      /* true = freeze the reveal                     */
+    int        preset_id;   /* which preset shape is showing      */
+    int        theme;       /* which theme is showing             */
+    ViewWindow view;        /* the patch of plane we're drawing   */
+    Canvas     canvas;      /* the painted picture                */
+    Reveal     reveal;      /* how far the fill has gotten        */
+    int        hold_ticks;  /* how long we've held a finished one */
+    bool       paused;      /* true freezes the fill              */
 } Scene;
 
-/* Point the scene at a preset: rebuild the lens, clear the canvas, reshuffle. */
+/* Switch the scene to a preset: resize the window, wipe the canvas, reshuffle. */
 static void scene_load(Scene *s, int preset_id, int cols, int rows)
 {
     s->preset_id  = preset_id % N_PRESETS;
@@ -627,11 +519,9 @@ static void scene_next_theme(Scene *s)
 }
 
 /*
- * scene_color_pixel — compute and store the colour of ONE canvas cell:
- *   1. unflatten the shuffled index into (row, col)
- *   2. ask the lens for that cell's start point z₀
- *   3. run the escape algorithm with this preset's constant c
- *   4. record the resulting colour band (skip pure-background cells)
+ * Work out and store the colour of one canvas cell: find its row and column,
+ * find the plane point it stands for, run the escape count, and record the
+ * resulting colour (leaving plain-background cells blank).
  */
 static void scene_color_pixel(Scene *s, int flat_index)
 {
@@ -645,8 +535,8 @@ static void scene_color_pixel(Scene *s, int flat_index)
     if (band) s->canvas.band[row][col] = band;
 }
 
-/* scene_reveal_batch — compute the next PIXELS_PER_TICK cells from the shuffled
- * order; the actual "grow the picture" work. */
+/* Fill in the next batch of cells from the shuffled list — the actual work of
+ * growing the picture. */
 static void scene_reveal_batch(Scene *s)
 {
     int batch_end = s->reveal.done + PIXELS_PER_TICK;
@@ -659,15 +549,14 @@ static void scene_reveal_batch(Scene *s)
 }
 
 /*
- * scene_tick — advance the picture by one tick: draw → hold → next preset.
- * While filling, reveal the next batch.  Once complete, count down the hold and
- * then auto-advance to the next Julia set.
+ * Move the picture forward one step. If it's still filling, draw the next batch;
+ * if it's done, hold it a few seconds and then move on to the next preset.
  */
 static void scene_tick(Scene *s)
 {
     if (s->paused) return;
 
-    if (reveal_complete(&s->reveal)) {                /* finished — hold, then cycle */
+    if (reveal_complete(&s->reveal)) {                /* done — hold, then move on */
         if (++s->hold_ticks >= DONE_PAUSE_TICKS)
             scene_next_preset(s, s->canvas.cols, s->canvas.rows);
         return;
@@ -682,13 +571,13 @@ static void scene_draw(const Scene *s, WINDOW *w) { canvas_paint(&s->canvas, w);
 /* ===================================================================== */
 
 /*
- * Screen — the live terminal size in character cells.  Measured at startup and
- * after every resize (SIGWINCH); the view scales to it and the HUD lays out
+ * Screen — the terminal's current size in characters. Read at startup and again
+ * whenever the window is resized; the view and the HUD both lay themselves out
  * against it.
  */
 typedef struct {
-    int cols;   /* terminal width  in characters */
-    int rows;   /* terminal height in characters */
+    int cols;   /* width  in characters */
+    int rows;   /* height in characters */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -714,9 +603,8 @@ static void screen_resize(Screen *s)
 }
 
 /*
- * hud_line — draw one HUD line at (row, x) in colour `pair`, clamped to the
- * terminal width so a long line never wraps onto the fractal.  The "%.*s"
- * precision truncates the text to the columns actually left from x.
+ * Draw one HUD line, trimmed to fit so a long line can't spill over and wrap
+ * onto the fractal.
  */
 static void hud_line(int row, int x, int pair, attr_t bold, int cols, const char *str)
 {
@@ -727,7 +615,7 @@ static void hud_line(int row, int x, int pair, attr_t bold, int cols, const char
     attroff(COLOR_PAIR(pair) | bold);
 }
 
-/* hud_data_line — row 0, right-aligned bold: title, fps, run state. */
+/* Top row, right-aligned: title, fps, and whether it's drawing/done/paused. */
 static void hud_data_line(const Screen *s, const Scene *sc, double fps)
 {
     const char *state = sc->paused ? "PAUSED "

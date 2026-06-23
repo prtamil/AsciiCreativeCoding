@@ -1,96 +1,29 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * buddhabrot.c — Buddhabrot / Anti-Buddhabrot density-accumulator fractal.
+ * buddhabrot.c — the Buddhabrot fractal, drawn as a heatmap in the terminal.
  *
- * The Buddhabrot is the "trajectory image" of the Mandelbrot iteration.
- * For every randomly sampled complex number c we iterate z → z² + c
- * starting from z = 0 and ask: does |z| ever exceed 2 (escape) within
- * `max_iter` steps?  Then we accumulate a hit counter on every screen
- * cell visited by that orbit, conditional on the escape result:
+ * The idea: throw lots of random points c into the complex plane and, for
+ * each, run the Mandelbrot iteration z = z*z + c starting from z = 0.  As we
+ * iterate, z hops around the plane — that path is its "orbit".  We tally how
+ * often each screen cell gets visited across millions of orbits.  The busiest
+ * cells glow bright, and the pile-up slowly reveals a ghostly figure.  Two
+ * flavours: BUDDHA tracks orbits that fly off to infinity (paints the famous
+ * meditating-figure outline); ANTI tracks orbits that stay trapped (paints
+ * the set's interior).  Only the ANTI preset ships; BUDDHA code is left in.
  *
- *   • BUDDHA mode — plot orbits whose c ESCAPES.  Out-of-set c values
- *     produce trajectories that visit cells around the boundary of the
- *     Mandelbrot set.  The aggregate looks like a luminous meditating
- *     Buddha figure (rotated 90° here so head is on top).
+ * Sister file: mandelbrot.c (same z=z*z+c iteration, colored by escape time
+ * instead of orbit density).
  *
- *   • ANTI  mode — plot orbits whose c does NOT escape.  In-set c
- *     values produce bounded orbits that converge to attractor cycles
- *     inside the Mandelbrot set.  The aggregate reveals the interior
- *     structure: cardioid, bulbs, period-doubling cycles.
+ * Keys: q/ESC quit · n/r next preset · p/spc pause · [/] speed · t/T theme
+ * Build: gcc -std=c11 -O2 -Wall -Wextra buddhabrot.c -o buddhabrot -lncurses -lm
  *
- * One preset is shipped (anti 1k); the buddha engine code is kept
- * intact for easy re-enable.  Cycle with `n`/`N`.
- *
- * Algorithm per tick:
- *   1. Sample SAMPLES_PER_TICK random c values from the bounding box.
- *   2. In BUDDHA mode, fast-skip the main cardioid and period-2 bulb
- *      (always-bounded regions — no escape to find).
- *   3. Pass 1 — iterate z from 0 to determine the escape status of c.
- *   4. If escape status matches the mode's filter, run Pass 2: re-
- *      iterate and increment counts[row][col] at every visited cell.
- *   5. Track the running maximum hit count for log-tone normalisation.
- *
- * Density → glyph (5-tier log-tone mapping):
- *   COL_C1   '.'   sparse (rim / faint halo)
- *   COL_C2   ':'
- *   COL_C3   '+'
- *   COL_C4   '#'
- *   COL_C5   '@'   peak (bold)
- *
- * Keys:
- *   q / ESC   quit
- *   n / r     reset / advance preset
- *   p / spc   pause / resume
- *   ] / [     faster / slower simulation
- *   t / T     next / previous theme
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra buddhabrot.c -o buddhabrot -lncurses -lm
- *
- * REFERENCES — for the concepts and the rendering.
- *
- *   Mandelbrot dynamics & the Buddhabrot
- *   ── Mandelbrot, B.B., "The Fractal Geometry of Nature", Freeman,
- *      1982.  The foundational treatise on fractals; introduces the
- *      Mandelbrot set and the z → z² + c iteration (§6 here).
- *   ── Devaney, R., "An Introduction to Chaotic Dynamical Systems",
- *      Westview, 1989.  Rigorous background on escape dynamics and
- *      the Julia/Mandelbrot family — informs the "orbit" mental
- *      model used in mandelbrot_trace_orbit().
- *   ── Green, M., "The Buddhabrot Technique", 1993.
- *      http://superliminal.com/fractals/bbrot/
- *      Original description of plotting Mandelbrot ORBITS rather
- *      than escape times — exactly what §6 does.
- *
- *   Random number generation
- *   ── Knuth, D., "The Art of Computer Programming, Vol. 2:
- *      Seminumerical Algorithms", 3rd ed., §3.2.1.  LCG theory:
- *      spectral test, period analysis, why the low bits are bad,
- *      and why the high bits (the LCG_HIGH_BITS_SHIFT trick in
- *      lcg_unit_float) recover decent uniformity.
- *   ── Graham, Knuth & Patashnik, "Concrete Mathematics", 2nd ed.,
- *      §3.3.3.  Source of LCG_MULTIPLIER (1664525) and
- *      LCG_INCREMENT (1013904223) used in §2.
- *
- *   Rendering
- *   ── Foley, van Dam, Feiner & Hughes, "Computer Graphics:
- *      Principles and Practice", 3rd ed., 2013.  §6 on aspect-
- *      preserving window-to-viewport mappings — the basis for
- *      Viewport (§4) and viewport_project().
- *   ── Draves, S. & Reckase, E., "The Fractal Flame Algorithm",
- *      2003.  https://flam3.com/flame_draves.pdf
- *      Canonical reference for accumulating fractal hits into a
- *      density buffer and rendering with log-tone mapping.
- *      DensityGrid + log_tone_map() in §5/§7 implement exactly
- *      that pattern, reduced to 5 ASCII tiers.
- *   ── Bourke, P., "Character representation of greyscale images",
- *      1997.  https://paulbourke.net/dataformats/asciiart/
- *      Origin of the ASCII density-ramp glyph ordering
- *      ('.' ':' '+' '#' '@') used by k_tier_glyphs[] in §7.
- *   ── Padala, P., "NCURSES Programming HOWTO", 2005.
- *      https://tldp.org/HOWTO/NCURSES-Programming-HOWTO/
- *      Practical reference for init_pair, mvaddch, frame pacing,
- *      resize handling — every ncurses API used in §4 / §7 / §8.
+ * References (for the things the code can't tell you):
+ *   ── Green, M., "The Buddhabrot Technique", 1993 — the original idea of
+ *      plotting orbits instead of escape times.  http://superliminal.com/fractals/bbrot/
+ *   ── Draves & Reckase, "The Fractal Flame Algorithm", 2003 — the
+ *      accumulate-into-a-density-buffer + log brightness trick used here.
+ *   ── Bourke, P., "Character representation of greyscale images", 1997 —
+ *      the '.' ':' '+' '#' '@' brightness ramp.
  *
  * §1 types & data   §2 random          §3 time
  * §4 view & palette §5 density grid    §6 Mandelbrot & chaos game
@@ -115,8 +48,8 @@
 /* ---- grid + HUD sizing ------------------------------------------ */
 #define GRID_ROWS_MAX        80
 #define GRID_COLS_MAX       300
-#define HUD_TOP_ROWS          1     /* data row at top                    */
-#define HUD_BOTTOM_ROWS       1     /* hint row at bottom                 */
+#define HUD_TOP_ROWS          1     /* status line at the top             */
+#define HUD_BOTTOM_ROWS       1     /* key hints at the bottom            */
 
 /* ---- iteration / pacing ----------------------------------------- */
 #define SIM_FPS_MIN          10
@@ -124,47 +57,47 @@
 #define SIM_FPS_MAX          60
 #define SIM_FPS_STEP          5
 
-#define SAMPLES_PER_TICK   2000     /* random c samples per simulation tick */
-#define TOTAL_SAMPLES    500000     /* target accumulation per preset       */
+#define SAMPLES_PER_TICK   2000     /* random points tried each tick           */
+#define TOTAL_SAMPLES    500000     /* stop tallying once we've tried this many */
 
 /* ---- timing ----------------------------------------------------- */
 #define NS_PER_SEC      1000000000LL
 #define NS_PER_MS          1000000LL
-#define FRAME_NS_60FPS (NS_PER_SEC / 60)       /* outer-loop pacing target */
-#define FPS_WINDOW_MS         500              /* rolling FPS window       */
-#define MAX_DT_NS    (100 * NS_PER_MS)         /* cap dt to avoid spirals  */
+#define FRAME_NS_60FPS (NS_PER_SEC / 60)       /* draw at most 60 times a second */
+#define FPS_WINDOW_MS         500              /* average the fps over half a sec */
+#define MAX_DT_NS    (100 * NS_PER_MS)         /* ignore stalls longer than this  */
 
 /* ---- Mandelbrot iteration parameters ---------------------------- */
-#define ESCAPE_RADIUS_SQ   4.0f     /* |z|² > 4  ⇔  |z| > 2 (escaped)     */
-#define MANDELBROT_Z0_RE   0.0f     /* iteration starts at z = 0          */
+#define ESCAPE_RADIUS_SQ   4.0f     /* once z gets farther than 2 from 0, it's gone */
+#define MANDELBROT_Z0_RE   0.0f     /* every orbit starts at z = 0        */
 #define MANDELBROT_Z0_IM   0.0f
-#define CARDIOID_CUSP_X    0.25f    /* main cardioid cusp position        */
-#define PERIOD2_BULB_R2    0.0625f  /* (1/4)² — bulb radius squared       */
-#define PERIOD2_BULB_CX   -1.0f     /* period-2 bulb centre x             */
+#define CARDIOID_CUSP_X    0.25f    /* shape constants for the two big "always */
+#define PERIOD2_BULB_R2    0.0625f  /* trapped" lobes we can skip-test fast    */
+#define PERIOD2_BULB_CX   -1.0f
 
 /* ---- aspect-correct projection ---------------------------------- */
-#define ASPECT_CELL_HEIGHT    2.0f    /* cells are 2× taller than wide   */
-#define ASPECT_INV            0.5f    /* 1 / ASPECT_CELL_HEIGHT          */
+#define ASPECT_CELL_HEIGHT    2.0f    /* terminal cells are about 2x taller than wide */
+#define ASPECT_INV            0.5f    /* so squash vertical distances by half         */
 
 /* ---- density tiers ---------------------------------------------- */
-#define N_DENSITY_TIERS       5     /* COL_C1..COL_C5                  */
-#define DENSITY_FLOOR_BUDDHA  0.08f /* below → invisible (rim noise)   */
-#define DENSITY_FLOOR_ANTI    0.25f /* anti has 10× max so floor is higher */
-#define EPS_LOG_MAX           1e-12f
+#define N_DENSITY_TIERS       5     /* five brightness levels, '.' up to '@' */
+#define DENSITY_FLOOR_BUDDHA  0.08f /* dimmer than this stays blank (just noise) */
+#define DENSITY_FLOOR_ANTI    0.25f /* anti's hits clump bright, so blank more   */
+#define EPS_LOG_MAX           1e-12f /* tiny guard so we never divide by ~zero    */
 
 /* ---- view rectangle --------------------------------------------- */
-#define VIEW_RE_HALF       1.75f   /* covers Mandelbrot's real extent (~3.5) */
-#define VIEW_CENTER_RE    -0.5f    /* Buddhabrot's gravitational centre      */
-#define VIEW_CENTER_IM     0.0f    /* Mandelbrot is symmetric across im=0    */
+#define VIEW_RE_HALF       1.75f   /* half the figure's height in math units */
+#define VIEW_CENTER_RE    -0.5f    /* the figure's center of mass            */
+#define VIEW_CENTER_IM     0.0f    /* it's mirror-symmetric, so center on 0  */
 
 /* ---- HUD ------------------------------------------------------- */
-#define HUD_PCT_FULL         100   /* "100%" — sample target reached         */
+#define HUD_PCT_FULL         100   /* 100% = done tallying                    */
 
 /* ---- LCG constants (Knuth's "minimal standard") ----------------- */
 #define LCG_MULTIPLIER     1664525u
 #define LCG_INCREMENT   1013904223u
-#define LCG_HIGH_BITS_SHIFT     8u      /* drop low 8 bits (worse stats)   */
-#define LCG_UNIT_DENOM     (1u << 24)   /* 2^24 — divisor for [0, 1)       */
+#define LCG_HIGH_BITS_SHIFT     8u      /* keep the top bits; the bottom ones are junk */
+#define LCG_UNIT_DENOM     (1u << 24)   /* divide by this to land in [0, 1)            */
 #define LCG_SEED_TIME_MIX   123456789LL
 
 /* ---- defaults & input ------------------------------------------- */
@@ -182,401 +115,157 @@
 /* ---- HUD --------------------------------------------------------- */
 #define HUD_BUFFER_BYTES    160
 
-/* ---- Complex — a point in the complex plane ℂ ------------------- *
+/* ---- Complex — one point on the plane the fractal lives on -------- *
  *
- * What it is: a complex number z = re + im·i, stored as two floats.
- * The whole Buddhabrot algorithm lives on the complex plane —
- * sample points c, the iteration variable z, every intermediate —
- * they're all Complex values.
+ * Just a pair of coordinates: re is the horizontal spot, im the
+ * vertical.  Everything in this program — the random points we test,
+ * the orbit as it hops around — is a Complex.  We bundle the two
+ * floats together so the math helpers can pass a point around as one
+ * value and read like the formula (z = z*z + c) instead of juggling
+ * four loose numbers.  Floats (not doubles) are plenty: a terminal
+ * cell is coarser than float precision anyway.
  *
- * Why it exists — the Mandelbrot iteration is naturally complex:
- *
- *     z → z² + c              (z and c are complex numbers)
- *
- * That one line of math is the heart of the program.  Wrapping
- * (re, im) into a named type lets every helper take and return a
- * Complex by value and read like the math —
- *     `mandelbrot_step(z, c)`     vs   `mandelbrot_step(zr, zi, cr, ci)`
- * — keeping the inner loop short and focused on the algorithm
- * instead of the bookkeeping.  Modern compilers pass small structs
- * in registers, so there's no measurable cost over loose floats.
- *
- * Why two floats (not doubles): single precision gives ~7 decimal
- * digits, plenty for terminal-resolution rendering where the
- * smallest meaningful gap is one cell.  Doubles would double the
- * memory traffic in the hot loop for no visible gain.
- *
- * Fields:
- *   re — real part (the horizontal coordinate in the ℂ plane).
- *   im — imaginary part (the vertical coordinate).
- *
- * References:
- *   ── Mandelbrot, B.B., "The Fractal Geometry of Nature", 1982 —
- *      the foundational treatment of the z → z² + c iteration.
- *   ── Devaney, R., "An Introduction to Chaotic Dynamical
- *      Systems", ch. 4 — complex dynamics and the rigorous
- *      definition of orbits in ℂ. */
+ *   re — horizontal coordinate (the "real" part).
+ *   im — vertical coordinate (the "imaginary" part). */
 typedef struct {
     float re, im;
 } Complex;
 
-/* ---- ComplexRect — a rectangle of the complex plane ------------- *
+/* ---- ComplexRect — the box we throw random points into ----------- *
  *
- * What it is: an axis-aligned rectangle of ℂ described by its real-
- * axis interval [re_min, re_max] and its imaginary-axis interval
- * [im_min, im_max].
+ * The four edges of the region we sample from.  We pick each test
+ * point uniformly at random inside this box.  There's one of these
+ * (g_sample_box), drawn a little wider than the fractal itself so we
+ * also catch the points just outside it whose orbits sweep through.
  *
- * Why it exists — the Buddhabrot sampler picks each c value
- * uniformly at random from a rectangle.  Bundling the four bounds
- * into one type gives us three things:
- *
- *   1. SHORT signatures.  `sampler_pick_c(rng, &g_sample_box)`
- *      instead of `sampler_pick_c(rng, re_min, re_max, im_min, im_max)`.
- *   2. ONE place to change the region.  Want to zoom in on the
- *      cardioid?  Edit g_sample_box.  No other code touches the
- *      bounds.
- *   3. NAMED bounds.  `re_min` is unambiguous; `bbox[0]` is not.
- *
- * The single instance in this program is `g_sample_box`, set to
- * (-2.5, 1.0) × (-1.25, 1.25) — generous enough to enclose the
- * entire Mandelbrot set plus the regions where escaping orbits
- * begin their trajectories.
- *
- * Fields:
- *   re_min, re_max — real-axis bounds (left and right edges of
- *                     the rectangle).
- *   im_min, im_max — imaginary-axis bounds (bottom and top edges). */
+ *   re_min, re_max — left and right edges.
+ *   im_min, im_max — bottom and top edges. */
 typedef struct {
     float re_min, re_max;
     float im_min, im_max;
 } ComplexRect;
 
-/* ---- BuddhMode — orbit-filter selector --------------------------- *
+/* ---- BuddhMode — which orbits we keep ----------------------------- *
  *
- * What it is: an enum naming the two flavours of orbit filtering
- * the Buddhabrot algorithm supports.
+ * Picks which test points are worth drawing.  The two modes share
+ * almost all their code; they differ only in this one choice.
  *
- *   • MODE_BUDDHA — KEEP orbits whose c ESCAPES the iteration
- *                   (|z| > 2 within max_iter steps).  Out-of-set c
- *                   values produce trajectories that visit cells
- *                   around the Mandelbrot BOUNDARY.  Aggregated,
- *                   they paint the iconic luminous "Buddha figure".
- *
- *   • MODE_ANTI   — KEEP orbits whose c does NOT escape (bounded).
- *                   In-set c values produce trajectories that
- *                   converge to attractor cycles INSIDE the
- *                   Mandelbrot set.  Aggregated, they reveal its
- *                   interior structure: cardioid, period bulbs,
- *                   period-doubling cycles, internal filaments.
- *
- * Why it exists — the two modes share 99% of the code; they
- * differ in exactly one comparison:
- *
- *     if (anti_mode == escaped) return;   // skip wrong filter
- *
- * Naming the flavours lets MandelbrotPreset DECLARE its intent in
- * its struct field, instead of passing a magic boolean through
- * the algorithm.  It also documents the design: the engine is
- * built to support both, and a third flavour (e.g. a Nebulabrot
- * iteration-window filter) would extend this enum without
- * rewriting the iteration code.
- *
- * References:
- *   ── Green, M., "The Buddhabrot Technique" (1993) — original
- *      description of the escape-filter approach.
- *   ── Wikipedia, "Buddhabrot" — accessible side-by-side of the
- *      buddha and anti flavours. */
+ *   MODE_BUDDHA — keep points whose orbit escapes to infinity.
+ *                 These trace the outline of the set and pile up into
+ *                 the famous meditating-figure shape.
+ *   MODE_ANTI   — keep points whose orbit stays trapped forever.
+ *                 These fill in the interior and show its structure. */
 typedef enum {
     MODE_BUDDHA,
     MODE_ANTI,
 } BuddhMode;
 
-/* ---- MandelbrotPreset — a named Buddhabrot variant -------------- *
+/* ---- MandelbrotPreset — one ready-made variant to look at -------- *
  *
- * What it is: everything you need to describe ONE flavour of the
- * fractal — a name (for the HUD), the iteration depth `max_iter`,
- * and the orbit-filter mode.  The chaos-game driver reads these
- * three fields and produces the corresponding image.
+ * A named set of knobs that fully describes one picture.  The drawing
+ * code is identical for every preset; only these settings change, so
+ * adding a variant is just one more entry in g_presets[].
  *
- * Why it exists — the "engine + data" pattern.  The math is the
- * SAME for every preset (Mandelbrot iteration + density
- * accumulation); only `max_iter` and `mode` differ.  Wrapping
- * those two knobs into one named type makes the engine invariant
- * under the choice of variant — pick a preset → pick a flavour.
- * Adding a new variant is one entry in g_presets[]; no algorithm
- * code changes.
- *
- * The `max_iter` trade-off:
- *
- *     ~100      coarse approximation; main shape only
- *     1000      reasonable terminal-resolution detail (this file)
- *     10000     fine threads visible (much slower, hardly resolvable
- *               at terminal scale)
- *     100000+   ultra-fine; only meaningful at print resolution
- *
- * The `mode` selector — see BuddhMode for the buddha/anti story.
- *
- * Fields:
- *   name      — short label shown in the HUD.  Keep ≤ 11 chars so
- *               it fits cleanly under the `%-11s` HUD column.
- *   max_iter  — escape-iteration cap.  Pass-1 (the escape test)
- *               runs up to max_iter steps; Pass-2 (the orbit
- *               trace) also runs up to max_iter.  Cost per
- *               sample is roughly proportional to max_iter.
- *   mode      — buddha (plot escaping orbits) or anti (plot
- *               bounded orbits).  Selects how Pass-1's escape
- *               result decides whether Pass-2 runs.
- *
- * References:
- *   ── Green, M., "The Buddhabrot Technique" (1993) — first
- *      description of plotting Mandelbrot orbits filtered by
- *      escape status. */
+ *   name      — short label for the status line (keep <= 11 chars).
+ *   max_iter  — how many steps to follow each orbit before giving up.
+ *               More steps = finer detail but slower.  ~100 is rough,
+ *               1000 (used here) is a good fit for a terminal,
+ *               10000+ only pays off at print resolution.
+ *   mode      — buddha or anti; see BuddhMode above. */
 typedef struct {
     const char *name;
     int         max_iter;
     BuddhMode   mode;
 } MandelbrotPreset;
 
-/* ---- Palette — a named density-tier colour theme ---------------- *
+/* ---- Palette — one color theme, five brightness levels ----------- *
  *
- * What it is: a named five-entry colour table.  Index by density
- * tier (L1..L5) and get back an xterm 256-colour code — or an
- * 8-colour fallback for older terminals.
+ * The five colors used from faintest cell to brightest.  Keeping
+ * colors in here (instead of sprinkled through the drawing code) means
+ * a new theme is just one more entry, and t/T can swap themes by
+ * reloading these five colors.  By convention the faintest is a dark
+ * tone for the outer haze and the brightest is near-white for the hot
+ * core; the levels in between walk across different hues so each
+ * brightness step is easy to tell apart.
  *
- * Why it exists — keeps THEMING separate from DRAWING.  The
- * renderer never sees raw colour numbers; it asks for the ncurses
- * colour pair matching a tier and draws.  Adding a new theme is
- * one entry in g_palettes[]; the rest of the program doesn't
- * notice.  The `t` / `T` keys cycle palettes by reloading just
- * the five COL_C1..COL_C5 pairs (a single init_pair per tier).
- *
- * TIER-COLOUR CONVENTION:
- *   C1 (sparsest)  — a DARKER variant of the theme's starting hue.
- *                    Painted on rim/halo cells where only a few
- *                    orbits land.  Making C1 dim keeps the outer
- *                    halo subtle so the bright body stands out.
- *   C2..C4         — progressively brighter mid-tones across
- *                    multiple HUES (not just shades of one) so
- *                    density layers contrast strongly.
- *   C5 (densest)   — peak highlight (white or hottest hue).
- *                    Drawn with A_BOLD for extra punch.
- *
- * WHY MULTI-HUE: a single-hue ramp (e.g. all greens, dim → bright)
- * still works, but it reads as flat.  Walking the ramp across
- * different hues (purple → cyan → green → yellow → white, for
- * example) makes each density layer visually distinct, and the
- * resulting fractal looks gorgeous instead of monochromatic.
- *
- * Fields:
- *   name      — short label shown in the HUD (≤ 6 chars keeps the
- *               HUD line compact).
- *   fg256[]   — xterm-256 colour codes for L1..L5.  Used when
- *               COLORS ≥ 256.  Indexed [0..4] = [L1..L5].
- *   fg8[]     — fallback colour codes for 8-colour terminals.
- *               Used when COLORS < 256.  Same indexing.
- *
- * References:
- *   ── XTerm 256-colour palette spec:
- *      https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit */
+ *   name    — short label for the status line (keep <= 6 chars).
+ *   fg256[] — colors for the five levels on a 256-color terminal.
+ *   fg8[]   — fallback colors for an old 8-color terminal. */
 typedef struct {
     const char *name;
     int  fg256[N_DENSITY_TIERS];
     int  fg8[N_DENSITY_TIERS];
 } Palette;
 
-/* ---- RandLCG — a fast linear congruential RNG ------------------- *
+/* ---- RandLCG — a tiny, fast random-number generator -------------- *
  *
- * What it is: a tiny random-number generator that holds 32 bits of
- * state and ticks forward with one multiply and one add:
+ * Holds one number and shuffles it with a multiply and an add to get
+ * the next "random" value.  We pick hundreds of thousands of points
+ * per second, so we want randomness that costs almost nothing rather
+ * than the high-quality (but slower) library generators.  This kind is
+ * known to be sloppy in its lowest bits, so lcg_unit_float only uses
+ * the better top bits.  Good enough for scattering dots; don't use it
+ * for anything that needs real randomness.
  *
- *     state = state · LCG_MULTIPLIER + LCG_INCREMENT
- *
- * That's it.  Two operations per draw.
- *
- * Why it exists — SPEED.  The Buddhabrot needs two random floats
- * per sample (one for re, one for im) and does thousands of
- * samples per frame.  At ~10⁵-10⁶ random draws per second, any
- * function-call RNG (rand(), drand48(), etc.) would dominate the
- * inner loop.  An inline LCG is a couple of cycles per draw and
- * the compiler hoists its state into a register.
- *
- * QUALITY vs. SPEED TRADE-OFF: we do NOT need cryptographic
- * randomness.  We need uniform [0, 1) values to pick random c
- * points in the sample box.  The LCG's well-known weakness is
- * correlation in the LOW bits — see Knuth TAOCP §3.2.1.  We
- * sidestep it by extracting the HIGH 24 BITS in lcg_unit_float
- * (shift right by 8), which behave much better statistically.
- * Period is 2³² (full period since LCG_MULTIPLIER ≡ 1 mod 4 and
- * gcd(LCG_INCREMENT, 2³²) = 1).
- *
- * About the LCG parameters: the pair (1664525, 1013904223) is the
- * "minimal standard" from Knuth's "Concrete Mathematics" §3.3.3.
- * Well-studied, full period, reasonable uniformity for non-
- * statistical applications.
- *
- * Fields:
- *   state — current 32-bit LCG state.  MUST be non-zero — a zero
- *           state stays zero forever under the LCG recurrence.
- *           Seeded once by lcg_seed_from_clock(); updated in place
- *           by lcg_next_u32().
- *
- * References:
- *   ── Knuth, TAOCP Vol. 2, §3.2.1 — full LCG theory, spectral
- *      test, and the choice of multiplier.
- *   ── Graham, Knuth & Patashnik, "Concrete Mathematics", §3.3.3 —
- *      the specific multiplier and increment used here.
- *   ── O'Neill, "PCG: A Family of Simple Fast Space-Efficient
- *      Statistically Good Algorithms for Random Number Generation"
- *      (2014).  Modern replacement if quality matters — we don't
- *      use it, but the paper explains LCG weaknesses cleanly. */
+ *   state — the one number it carries.  Must never be zero (a zero
+ *           gets stuck at zero forever).  Seeded once from the clock. */
 typedef struct {
     uint32_t state;
 } RandLCG;
 
-/* ---- DensityGrid — chaos-game hit accumulator ------------------ *
+/* ---- DensityGrid — the tally of how busy each cell is ------------ *
  *
- * What it is: a 2-D array of 32-bit counters, one per terminal
- * cell.  Each counter holds how many sampled orbits visited that
- * cell.  Think of it as a 2-D HISTOGRAM of orbit positions in
- * screen space.
+ * One counter per screen cell, holding how many orbits have passed
+ * through it.  This is the whole trick: a single orbit barely shows
+ * up, but after millions of them the busy cells stand out and the
+ * figure appears.  We also remember the single busiest count
+ * (max_count) so the renderer knows what "fully bright" means.  We
+ * keep max_count up to date as we go rather than rescanning the whole
+ * grid every frame — safe because counts only ever go up.
  *
- * Why it exists — DENSITY is what makes the Buddhabrot visible.
- * A single orbit visits dozens to thousands of cells; the iconic
- * figure only emerges after MILLIONS of orbits accumulate.
- * Counting hits per cell turns "did any orbit visit this cell?"
- * (binary) into "how many?" (continuous), which is what lets us
- * paint smooth brightness gradients via log-tone mapping.
+ * The grid is a fixed size (the biggest terminal we support) so it can
+ * just sit in static memory with no allocating or resizing to worry
+ * about.
  *
- * LOG-TONE MAPPING (used by grid_render):
- *
- *     normalised_t = log(1 + hits) / log(1 + max_count)
- *
- * Why log instead of linear: the brightest cells get hit 10⁵-10⁶
- * times more often than the faintest.  Linear mapping makes
- * everything below the top 1% invisible.  Log compresses that
- * dynamic range so the entire gradient is visible — the same
- * trick fractal-flame renderers use (Draves & Reckase 2003).
- *
- * RUNNING max_count: we update max_count INCREMENTALLY on each
- * grid_hit, which avoids a per-frame O(rows × cols) scan.
- * Trade-off: this only works because counts only ever GROW.  If
- * we ever decremented a cell, the running max could go stale and
- * we'd need a periodic rescan.
- *
- * Why FIXED size: we know the upper bound on terminal size at
- * compile time (GRID_ROWS_MAX × GRID_COLS_MAX), so the whole grid
- * lives in BSS — no allocation, no resize hassle.  At 80 × 300
- * cells with 4 bytes per counter, that's ~96 KB — fits in L2
- * cache, plenty fast.
- *
- * Lifecycle:
- *   • grid_clear()  — zero every counter + reset max_count.
- *                     Called on init, resize, 'r' reset,
- *                     and preset change.
- *   • grid_hit()    — increment one cell, update max_count.
- *                     Called once per visited cell during Pass 2
- *                     of every accepted orbit.
- *
- * Fields:
- *   counts[][] — hit counters indexed [row][col] in TERMINAL
- *                coordinates (not ℂ-space).  Row 0 is the top of
- *                the screen.  Counter type is uint32_t — far
- *                above any realistic max_count (~10⁶) so the
- *                4-byte saturation limit is never reached.
- *   max_count  — running maximum across counts[][].  Used as the
- *                denominator in log-tone mapping.  Reset to 0 by
- *                grid_clear().
- *
- * References:
- *   ── Draves, S. & Reckase, E., "The Fractal Flame Algorithm",
- *      2003 — canonical density-buffer + log-tone-mapping pattern
- *      for IFS-style fractal rendering.  Buddhabrot uses the same
- *      accumulator pattern.
- *   ── Bourke, P., "Character representation of greyscale images",
- *      1997 — ASCII glyph ramps for density display. */
+ *   counts[row][col] — visit count per cell, screen coordinates (row 0
+ *                      is the top).  32 bits is far more headroom than
+ *                      any real run needs.
+ *   max_count        — the highest count seen anywhere in the grid. */
 typedef struct {
     uint32_t counts[GRID_ROWS_MAX][GRID_COLS_MAX];
     uint32_t max_count;
 } DensityGrid;
 
-/* ---- Viewport — ℂ-plane → terminal cells ----------------------- *
+/* ---- Viewport — how to place a math point onto the screen -------- *
  *
- * What it is: a precomputed RECIPE for projecting a point in the
- * complex plane (a Complex z) onto a terminal cell (a col, row
- * pair).  Just a handful of numbers that, together, describe "how
- * to place the figure on screen".
+ * The few numbers needed to turn a point on the plane into a screen
+ * cell (a column and a row).  Keeping them in one place means the
+ * drawing loop just asks "where does this point go?" and doesn't care
+ * about terminal size or the reserved HUD rows; on a resize we redo
+ * these numbers once and everything follows.
  *
- * Why it exists — keep the projection IN ONE PLACE.  The chaos
- * game's inner loop calls viewport_project once per orbit point
- * and doesn't need to know about terminal size, HUD rows, or
- * cell aspect.  Resize?  Recompute the Viewport once,
- * everything downstream automatically reprojects on the next
- * frame.  One struct, one source of projection truth.
+ * Two quirks worth knowing:
  *
- * PORTRAIT ORIENTATION (rotated 90° from traditional Buddhabrot).
- * The natural figure (head, body, shoulders, tendrils) is
- * wider-than-tall in landscape orientation.  We rotate the
- * projection so the head sits at the TOP and the body extends
- * DOWNWARD — much better fit in a vertical-aspect view:
+ *  - We turn the figure on its side so it stands tall in the terminal:
+ *    its vertical axis runs left-to-right across the screen, and its
+ *    horizontal axis runs top-to-bottom (head at top, body downward).
  *
- *     col ← imaginary axis    (im_min → LEFT,  im_max → RIGHT)
- *     row ← real axis         (re_min → TOP,   re_max → BOTTOM)
+ *  - Terminal cells are about twice as tall as they are wide, so a
+ *    step "down" covers more ground than a step "across".  We measure
+ *    everything in cell-widths and halve the vertical part to keep the
+ *    figure from looking stretched.  `scale` (cells per math unit) is
+ *    chosen to fit the figure both ways without distorting it — bigger
+ *    terminal, bigger drawing.
  *
- * TWO ASPECT TRANSFORMS happen on the way to the screen,
- * captured by the single field `scale`:
- *
- *   1) ASPECT CORRECTION.  Terminal cells are ~2× taller than
- *      wide, so distances measured in rows and columns aren't
- *      directly comparable.  We work in "cell-WIDTH units"
- *      everywhere; vertical distances get multiplied by 0.5
- *      (ASPECT_INV) when converted to row counts.
- *
- *   2) ASPECT FIT.  The figure has a natural bounding box in ℂ.
- *      We pick the TIGHTER of (horizontal cell budget) vs
- *      (vertical cell budget in width-units) so the figure fits
- *      inside the terminal both ways while keeping its TRUE
- *      shape.
- *
- * One number, `scale`, captures both: visual cells (width-units)
- * per ℂ-unit.  Bigger terminal → bigger scale → bigger drawing.
- *
- * THE ARITHMETIC, in plain prose:
- *
- *     col = center_col  +  (z.im − view_mid_im) · scale
- *     row = center_row  +  (z.re − view_mid_re) · scale · 0.5
- *
- *   • shift z so the view midpoint sits at the screen centre
- *   • multiply by `scale` (width-units per ℂ-unit) for col
- *   • multiply by `scale · 0.5` for row (the aspect correction)
- *   • add the screen-centre offset
- *
- * Lifecycle: rebuilt by viewport_fit() on init and on SIGWINCH
- * resize.  Constant for many frames otherwise.
- *
- * Fields:
- *   rows, cols   — current terminal dimensions in cells.
- *   play_rows    — number of usable content rows
- *                  (= rows − HUD_TOP_ROWS − HUD_BOTTOM_ROWS).
- *                  Cached so neither the renderer nor the chaos
- *                  game has to redo the subtraction.
- *   center_col   — column where the figure's centre lands.
- *                  Equals cols / 2.
- *   center_row   — row where the figure's centre lands.  Centred
- *                  between the HUD rows.
- *   scale        — visual cells (width-units) per ℂ-unit.  Bigger
- *                  terminal → bigger scale → bigger drawing.
- *                  This is the single "size" knob.
- *   view_mid_re  — real part of the ℂ-point at the screen centre.
- *                  Set to -0.5 (the Buddhabrot's gravitational
- *                  centre).
- *   view_mid_im  — imaginary part at the screen centre.  Set to
- *                  0 (the Mandelbrot set is symmetric about the
- *                  real axis).
- *
- * References:
- *   ── Foley, van Dam, Feiner & Hughes, "Computer Graphics:
- *      Principles and Practice", 3rd ed., §6 — window-to-viewport
- *      mappings with aspect preservation. */
+ *   rows, cols    — terminal size in cells.
+ *   play_rows     — drawable rows left after the two HUD rows; cached
+ *                   so we don't redo the subtraction.
+ *   center_col    — column the figure's center lands on.
+ *   center_row    — row the figure's center lands on.
+ *   scale         — cells per math unit; the one zoom knob.
+ *   view_mid_re   — the math point that sits at screen center,
+ *   view_mid_im     horizontal and vertical (the figure's center of
+ *                   mass; vertical is 0 since it's mirror-symmetric). */
 typedef struct {
     int    rows, cols;
     int    play_rows;
@@ -585,106 +274,49 @@ typedef struct {
     float  view_mid_re, view_mid_im;
 } Viewport;
 
-/* ---- FpsCounter — rolling FPS measurement ----------------------- *
+/* ---- FpsCounter — a steady frames-per-second readout ------------- *
  *
- * What it is: a tiny stopwatch that counts frames and time inside
- * a ROLLING WINDOW (default 500 ms), then divides them to produce
- * a stable frames-per-second number for the HUD.
+ * Counts how many frames happen over about half a second, then divides
+ * to get a frame rate for the status line.  We average instead of
+ * timing a single frame because one frame's time bounces around wildly
+ * (a hiccup here, a fast frame there); the average reads as one calm
+ * number that updates a couple of times a second.
  *
- * Why it exists — RAW per-frame FPS jitters wildly.  One frame
- * might take 30 ms because of a scheduling hiccup, the next 5 ms,
- * the next 50 ms while the kernel is paging.  A naive `1 / dt`
- * reading flickers through 20–200 fps every frame and is useless
- * to look at.  Averaging across half a second smooths that out
- * into one stable number that actually reflects sustained
- * performance.
- *
- * How the windowing works:
- *
- *   each frame:
- *      accum_ns += frame_duration
- *      frames   += 1
- *      if accum_ns ≥ window:                  // ~500 ms passed
- *          display = frames / (accum_ns / 1e9)
- *          accum_ns = 0
- *          frames   = 0
- *
- * We refresh the HUD's `display` only at window boundaries, so
- * the number on screen updates ~2× per second.  Between updates
- * the HUD keeps showing the LAST computed value, which is exactly
- * what we want for stability.
- *
- * Fields:
- *   accum_ns — running sum of frame durations in the current
- *              window.  Reset to 0 at each window boundary.
- *   frames   — number of frames accumulated in the current
- *              window.  Reset to 0 at each window boundary.
- *   display  — last computed FPS value.  This is what the HUD
- *              actually reads; updated only at window boundaries.
- *
- * References:
- *   ── Standard rolling-average pattern; no specific paper. */
+ *   accum_ns — time piled up so far in this half-second window.
+ *   frames   — frames counted so far in this window.
+ *   display  — the last computed rate; what the status line shows. */
 typedef struct {
     long long accum_ns;
     int       frames;
     double    display;
 } FpsCounter;
 
-/* ---- Scene — the whole program's state -------------------------- *
+/* ---- Scene — everything the running program needs ---------------- *
  *
- * What it is: ONE struct holding everything the running program
- * needs — the density grid, the orbit RNG, the projection, the
- * theme, animation timing, and the user's control toggles.
+ * One struct holding the whole live state, so the main loop reads as a
+ * short list of steps on one thing (handle keys, advance, draw) and
+ * every helper says up front which parts it touches instead of poking
+ * at hidden globals.
  *
- * Why it exists — collapses what would otherwise be a DOZEN
- * scattered globals into one named container.  The main loop ends
- * up reading as a tiny sequence of verbs on a single noun:
+ *   What we're drawing:
+ *     grid         — the visit tally; cleared on reset/resize/preset.
+ *     preset       — which variant is active (index into g_presets[]).
+ *     samples_done — points tried so far; once it hits TOTAL_SAMPLES
+ *                    we stop and the picture holds.
+ *     rng          — random source, seeded once from the clock.
  *
- *     scene_process_input(s);   // react to keys
- *     scene_tick(s);            // run one frame of the chaos game
- *     frame_render(s);          // draw grid + HUD
+ *   How we show it:
+ *     view         — point-to-screen placement; redone on resize.
+ *     palette      — which color theme is active (index into
+ *                    g_palettes[]); changing it doesn't touch the grid.
  *
- * Every helper declares its dependency by taking the right
- * sub-pointer:
- *   • `buddhabrot_iterate(s)`     — needs grid + view + preset + rng
- *   • `grid_render(grid, view, mode)` — only the things it draws from
- *   • `viewport_project(view, z, ...)` — only the projection
- *
- * Function signatures spell out which parts of the world each
- * function touches — NO MYSTERY GLOBALS to chase.  If you ever
- * needed to checkpoint, replay, or run two instances side-by-side,
- * the whole runtime state is one POD struct you could memcpy.
- *
- * Fields, grouped by responsibility:
- *
- *   What we're computing (the fractal):
- *     grid          — density accumulator.  Cleared by grid_clear
- *                     on init / resize / reset / preset change.
- *     preset        — index into g_presets[] of the active variant.
- *                     Cycled by 'n' / 'N' / 'r' (rebuilds grid).
- *     samples_done  — count of c samples processed for this preset.
- *                     When ≥ TOTAL_SAMPLES, scene_tick stops the
- *                     chaos game and the image holds indefinitely.
- *     rng           — random source for the sampler.  Seeded once
- *                     from the wall clock by lcg_seed_from_clock.
- *
- *   How we view it (presentation):
- *     view          — ℂ → cell projection.  Re-fit on resize.
- *     palette       — index into g_palettes[] of the active theme.
- *                     Cycled by 't' / 'T'; reloads the five
- *                     COL_C1..COL_C5 ncurses pairs.  Doesn't touch
- *                     the grid.
- *
- *   Control:
- *     paused        — chaos game freezes; HUD still updates.
- *                     Toggled by 'p' or space.
- *     sim_fps       — simulation tick rate (SIM_FPS_MIN .. MAX, in
- *                     SIM_FPS_STEP increments).  Adjusted by '[' /
- *                     ']'.  Higher → more samples per second →
- *                     faster build but more CPU.
+ *   Controls:
+ *     paused       — freeze the work (status line keeps updating).
+ *     sim_fps      — how hard to work each second; higher fills the
+ *                    picture faster but uses more CPU.
  *
  *   Timing:
- *     fps           — rolling FPS counter for the HUD. */
+ *     fps          — frame-rate readout for the status line. */
 typedef struct {
     /* what we're computing */
     DensityGrid    grid;
@@ -722,18 +354,17 @@ static const ComplexRect g_sample_box = {
 };
 
 /* ---- presets (constant config) ---------------------------------- *
- * One preset shipped.  The buddha-mode engine code is kept intact
- * for future re-enable; no current preset uses MODE_BUDDHA. */
+ * Only the anti variant ships.  The buddha-mode code is still here and
+ * working; just add a MODE_BUDDHA entry to turn it back on. */
 #define N_PRESETS 1
 static const MandelbrotPreset g_presets[N_PRESETS] = {
     { "anti     1k", 1000, MODE_ANTI },
 };
 
 /* ---- palettes (constant config) --------------------------------- *
- * Each theme walks across multiple bright hues; C1 (sparsest tier)
- * is a darker variant so the rim reads as a subtle introductory
- * glow.  Per CLAUDE.md the 24-29 dim cube range is OK only at the
- * lowest tier; all C2..C5 codes are ≥ 30. */
+ * Each theme runs through several bright hues; the faintest level is a
+ * darker tone so the outer haze stays subtle.  Only that lowest level
+ * dips into the dim color range; the rest stay bright enough to read. */
 #define N_PALETTES 8
 static const Palette g_palettes[N_PALETTES] = {
 /*                       C1   C2   C3   C4   C5                     C1   C2   C3   C4   C5                                                  walk */
@@ -751,8 +382,8 @@ static const Palette g_palettes[N_PALETTES] = {
 /* §2  random — fast LCG for sample selection                             */
 /* ===================================================================== */
 
-/* Seed the LCG from the wall clock.  Any non-zero seed works; zero
- * stays zero forever under the LCG recurrence. */
+/* Kick off the generator from the current time, so each run differs.
+ * Force it away from zero, which would get stuck. */
 static void lcg_seed_from_clock(RandLCG *r)
 {
     struct timespec ts;
@@ -761,22 +392,22 @@ static void lcg_seed_from_clock(RandLCG *r)
     if (r->state == 0) r->state = 1u;
 }
 
-/* Step the LCG and return the new 32-bit state. */
+/* Advance to the next pseudo-random number. */
 static inline uint32_t lcg_next_u32(RandLCG *r)
 {
     r->state = r->state * LCG_MULTIPLIER + LCG_INCREMENT;
     return r->state;
 }
 
-/* Uniform float in [0, 1).  Uses the high 24 bits of the LCG output;
- * the low bits of an LCG have worse statistical properties. */
+/* A random number from 0 up to (but not including) 1.  Built from the
+ * top bits only, since this generator's bottom bits are low quality. */
 static inline float lcg_unit_float(RandLCG *r)
 {
     uint32_t high_bits = lcg_next_u32(r) >> LCG_HIGH_BITS_SHIFT;
     return (float)high_bits / (float)LCG_UNIT_DENOM;
 }
 
-/* Uniform float in [lo, hi). */
+/* A random number somewhere between lo and hi. */
 static inline float lcg_in_range(RandLCG *r, float lo, float hi)
 {
     return lo + lcg_unit_float(r) * (hi - lo);
@@ -803,9 +434,8 @@ static void clock_sleep_ns(long long ns)
     nanosleep(&req, NULL);
 }
 
-/* Add a frame's duration to the rolling counter; refresh the
- * displayed FPS at each window boundary so the HUD reading is
- * stable. */
+/* Tally this frame; once about half a second has built up, work out
+ * the average frame rate and start a fresh window. */
 static void fps_tick(FpsCounter *fps, long long frame_ns)
 {
     fps->accum_ns += frame_ns;
@@ -824,16 +454,15 @@ static void fps_tick(FpsCounter *fps, long long frame_ns)
 
 /* ---- viewport ---------------------------------------------------- */
 
-/* How many usable play-area rows remain after reserving HUD rows. */
+/* Rows left for the picture after the top and bottom HUD lines. */
 static int viewport_play_rows(int rows)
 {
     int n = rows - HUD_TOP_ROWS - HUD_BOTTOM_ROWS;
     return n < 1 ? 1 : n;
 }
 
-/* Choose the single aspect-correct scale.  Cells are 2× taller than
- * wide; vertical budget is play_rows × ASPECT_CELL_HEIGHT cell-widths.
- * Pick the tighter axis so the view rectangle fits both ways. */
+/* Pick the zoom that fits the figure both across and down without
+ * distorting it: try each direction, keep the tighter (smaller) one. */
 static float viewport_pick_scale(int cols, int play_rows,
                                  float re_range, float im_range)
 {
@@ -842,8 +471,7 @@ static float viewport_pick_scale(int cols, int play_rows,
     return horizontal < vertical ? horizontal : vertical;
 }
 
-/* Clamp & store the terminal dimensions in the viewport.  Anything
- * larger than the static grid limits gets capped. */
+/* Record the terminal size, capped at the grid we have room for. */
 static void viewport_set_dimensions(Viewport *v, int rows, int cols)
 {
     if (rows > GRID_ROWS_MAX) rows = GRID_ROWS_MAX;
@@ -853,10 +481,9 @@ static void viewport_set_dimensions(Viewport *v, int rows, int cols)
     v->play_rows = viewport_play_rows(rows);
 }
 
-/* Choose the ℂ-space rectangle that bounds the figure.  re_half is
- * sized to cover the Mandelbrot's real extent (~3.5 units, so
- * 2·re_half ≈ 3.5).  im_half is derived from terminal aspect so
- * the projection is aspect-correct. */
+/* Work out how much of the plane to show.  Height is fixed to cover
+ * the whole figure; width is stretched to match the terminal's shape
+ * so circles look round, not squashed. */
 static void viewport_compute_view_rectangle(const Viewport *v,
                                             float *re_half_out,
                                             float *im_half_out)
@@ -866,9 +493,7 @@ static void viewport_compute_view_rectangle(const Viewport *v,
                                 / ((float)v->play_rows * ASPECT_CELL_HEIGHT);
 }
 
-/* Place the figure's centre at the screen centre.  The Buddhabrot
- * is symmetric about im = 0 (the real axis), and its mass centres
- * around re = -0.5. */
+/* Line up the figure's center with the middle of the screen. */
 static void viewport_anchor_center(Viewport *v)
 {
     v->center_col  = v->cols / 2;
@@ -877,13 +502,7 @@ static void viewport_anchor_center(Viewport *v)
     v->view_mid_im = VIEW_CENTER_IM;
 }
 
-/* Recompute the viewport for the current terminal size.
- *
- *     1. Store dimensions      — viewport_set_dimensions
- *     2. Pick view rectangle   — viewport_compute_view_rectangle
- *     3. Pick aspect-fit scale — viewport_pick_scale
- *     4. Anchor figure centre  — viewport_anchor_center
- */
+/* Redo all the placement numbers for the current terminal size. */
 static void viewport_fit(Viewport *v, int rows, int cols)
 {
     viewport_set_dimensions(v, rows, cols);
@@ -897,11 +516,9 @@ static void viewport_fit(Viewport *v, int rows, int cols)
     viewport_anchor_center(v);
 }
 
-/* Project a ℂ-space point to a terminal cell (portrait orientation).
- *   col ← imaginary axis (small im → left,  large im → right)
- *   row ← real axis      (small re → top,   large re → bottom)
- * Vertical projection is multiplied by ASPECT_INV because cells are
- * 2× taller than wide. */
+/* Turn a point on the plane into a screen cell (column, row), turned
+ * on its side so the figure stands up.  Returns false if it falls
+ * outside the drawable area. */
 static inline bool viewport_project(const Viewport *v, Complex z,
                                     int *col_out, int *row_out)
 {

@@ -1,112 +1,31 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * tree_la.c  —  Dielectric Breakdown Model (DBM) Laplace fractal
+ * tree_la.c  —  growing electric fractals (Dielectric Breakdown Model)
  *
- * A Laplace potential field φ (∇²φ = 0) is solved over the grid.  Boundary
- * conditions impose a high-potential SOURCE (φ=1) and a grounded SINK; the growing
- * structure is itself a grounded conductor (φ=0).  Each step, one frontier cell
- * joins the structure with probability ∝ φ^η:
- *   high η → growth concentrates at high-φ tips → jagged / fractal
- *   low  η → growth spreads across the frontier → rounder / Eden-like
+ * We spread a fake "voltage" across the grid, then grow a branching shape one cell
+ * at a time, always favouring cells where the voltage is highest. That simple rule
+ * grows lightning bolts, coral, frost ferns and trees — the shape depends only on
+ * where we put the high-voltage edge and the low-voltage seed. The `eta` knob
+ * controls how greedy growth is about chasing the very hottest spots: high = jagged
+ * and spindly, low = round and bushy.
  *
- * SEPARATION OF EFFECTS FROM RENDERING — the whole point of this file's shape:
- *
- *   The world changes in exactly ONE place: scene_tick() (§7).  It relaxes the
- *   field (§5) and grows the aggregate (§6) — that pair is the entire physics step.
- *   Everything in §8 is RENDERING and takes a `const Scene *`, so the compiler
- *   guarantees a draw can never mutate φ, the aggregate, or the cell ages.  When you
- *   read §8 you KNOW nothing there is an effect; when you read scene_tick you KNOW
- *   that is the only effect.
- *
- *   Delays / gates that throttle the effect (all outside rendering): `paused`
- *   freezes scene_tick; the loop caps to RENDER_FPS; N_RELAX (field passes) and
- *   N_GROW (cells per tick) set how much physics runs per frame.
- *
- * PERFORMANCE — kept on the EFFECT side, off the render path, so each cost is clear:
- *
- *   EFFECT (scene_tick, the expensive part) is accelerated by two structures/ideas:
- *     • Frontier (§1/§6) — an explicit candidate list, so growth weighs O(frontier)
- *       cells instead of rescanning the whole O(rows·cols) grid every step.
- *     • incremental boundary conditions (§5) — occupied cells are grounded once at
- *       join and Dirichlet edges pinned once at reset, so field_relax refreshes only
- *       the moving Neumann edges per sweep, not the whole grid.
- *   RENDER (§8) is deliberately the simple, cheap half: a read-only O(occupied) blit
- *   that shares NONE of the above machinery.  Effect-perf and render-perf stay in
- *   separate structures and functions, so it is obvious which logic serves which.
- *
- * Five presets set the seed placement and boundary conditions:
- *   Tree      — seed bottom-center, φ=1 at top              (grows upward)
- *   Lightning — seed top-center, φ=1 at bottom              (grows downward)
- *   Coral     — seed center, φ=1 on all 4 edges             (grows outward)
- *   Frost     — a row of seeds along the bottom, φ=1 at top (ferns climb up)
- *   Discharge — seed center, φ=1 on left+right edges        (bilateral arc)
- *
- * Color is by age_delta = step - join_step: newest = bright/bold '@', oldest = '.'.
+ * References (the ideas the code can't explain on its own):
+ *   - Niemeyer, Pietronero & Wiesmann (1984), "Fractal Dimension of Dielectric
+ *     Breakdown," Phys. Rev. Lett. 52(12) — this is exactly the model implemented.
+ *   - Witten & Sander (1981), "Diffusion-Limited Aggregation," Phys. Rev. Lett.
+ *     47(19) — the eta=1 special case this generalises.
+ *   - Numerical Recipes (3rd ed.), Ch. 20 — the relaxation method used to solve
+ *     the voltage field in §5.
+ *   Sister file: l_system.c grows trees a different way (grammar/turtle rules).
  *
  * Keys:
- *   q / ESC   quit
- *   p / spc   pause / resume
- *   r         reset (re-seed, clear φ)
- *   1..5      switch preset (resets automatically)
- *   t / T     next / prev theme (6 themes)
- *   e / E     increase / decrease eta (1.0 .. 4.0)
+ *   q / ESC   quit            r       reset
+ *   p / spc   pause           1..5    pick a preset (Tree/Lightning/Coral/Frost/Discharge)
+ *   t / T     cycle theme     e / E   raise / lower eta
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra tree_la.c -o tree_la -lncurses -lm
- *
- * Sections
- * --------
- *   §1 config    — constants, presets, themes, and the data model (Field/Aggregate/Scene)
- *   §2 clock     — monotonic ns clock + sleep
- *   §3 rng       — per-scene LCG (weighted growth needs randomness)
- *   §4 color     — themeable age ramp + HUD pairs
- *   §5 field     — Laplace φ: boundary conditions, initial guess, Gauss-Seidel (CORE)
- *   §6 aggregate — the growing conductor: clear, seed, frontier, DBM growth (CORE)
- *   §7 scene     — state + reset/preset; scene_tick is THE simulation step
- *   §8 render    — aggregate → glyphs + HUD (READ-ONLY: const Scene *)
- *   §9 app       — main loop
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm : Dielectric Breakdown Model (Niemeyer et al. 1984).  Solve ∇²φ = 0
- *             with the aggregate held at φ=0; add one frontier cell per step with
- *             probability ∝ φ^η.  η=1 reduces to DLA; η→∞ → a single needle.
- *
- * Math      : Gauss-Seidel relaxation of the 5-point Laplacian stencil,
- *             φ(i,j) ← ¼(φ(i±1,j) + φ(i,j±1)), repeated until (near) convergence.
- *
- * Physics   : Dielectric breakdown (lightning), electrodeposition and dendritic
- *             solidification — all Laplacian growth near an absorbing boundary.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES — to understand the concepts and the rendering ───────────── *
- *
- *   The growth model — DBM / DLA  (§5 field_relax, §6 aggregate_grow)
- *   ── Niemeyer, L., Pietronero, L. & Wiesmann, H. J. (1984). "Fractal Dimension
- *      of Dielectric Breakdown." Phys. Rev. Lett. 52(12), 1033–1036.  The DBM
- *      paper itself: growth ∝ φ^η on a Laplacian field — exactly this program.
- *   ── Witten, T. A. & Sander, L. M. (1981). "Diffusion-Limited Aggregation, a
- *      Kinetic Critical Phenomenon." Phys. Rev. Lett. 47(19), 1400–1403.  DLA,
- *      the η = 1 limit; where the diffusion ↔ Laplace-potential link comes from.
- *
- *   Fractal growth, scaling & dimension  (CONCEPTS)
- *   ── Vicsek, T. (1992). "Fractal Growth Phenomena" (2nd ed.). World Scientific.
- *      The canonical text tying DLA, DBM and the η model together.
- *   ── Meakin, P. (1998). "Fractals, Scaling and Growth Far from Equilibrium."
- *      Cambridge University Press.  Comprehensive on these aggregation models.
- *   ── Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
- *      Fractal dimension and self-similarity of the resulting structures.
- *
- *   The Laplace solve — numerics  (§5)
- *   ── Press, W. H., Teukolsky, S. A., Vetterling, W. T. & Flannery, B. P. (2007).
- *      "Numerical Recipes" (3rd ed.). Cambridge.  Ch. 20: relaxation (Gauss-Seidel)
- *      for elliptic PDEs — the ∇²φ = 0 solver and its convergence.
- *
- *   Rendering  (§8)
- *   ── Gookin, D. (2007). "Programmer's Guide to NCURSES." Wiley.  The cell-
- *      drawing / colour-pair API behind the display.
- * ─────────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -129,24 +48,25 @@ enum {
 
     RENDER_FPS      =  30,
 
-    N_RELAX         =   8,   /* Gauss-Seidel passes per tick               */
-    N_GROW          =   1,   /* aggregate cells added per tick             */
+    N_RELAX         =   8,   /* how many times we smooth the voltage per frame */
+    N_GROW          =   1,   /* how many cells we add per frame                */
 
     N_THEMES        =   6,
-    N_AGE_LEVELS    =   5,   /* color pairs CP_A0 … CP_A4                  */
+    N_AGE_LEVELS    =   5,   /* five shades from newest to oldest growth        */
 
-    CP_HUD          =   1,   /* HUD data    — bright yellow (theme-independent) */
-    CP_A0           =   2,   /* newest age pair; CP_A0..CP_A0+4 are the ages    */
-    CP_HINT         =   7,   /* HUD actions — bright cyan   (theme-independent) */
+    CP_HUD          =   1,   /* yellow, used for the readout (same in every theme) */
+    CP_A0           =   2,   /* the five age colours live at CP_A0 .. CP_A0+4      */
+    CP_HINT         =   7,   /* cyan, used for the key hints (same in every theme) */
 
-    HUD_TOP_ROWS    =   2,   /* rows 0..1 reserved for the data HUD        */
-    HUD_BOT_ROWS    =   1,   /* last row reserved for the action bar       */
+    HUD_TOP_ROWS    =   2,   /* top two rows belong to the readout, not the grid */
+    HUD_BOT_ROWS    =   1,   /* bottom row belongs to the key hints              */
 
     FPS_UPDATE_MS   = 500,
-    FROST_SPACING   =   4,   /* Frost preset seeds every Nth bottom column */
+    FROST_SPACING   =   4,   /* Frost plants a seed every 4th column along the floor */
 };
 
-/* age_delta thresholds: a cell older than AGE_THRESH[i] falls into age tier i+1 */
+/* How we sort growth by age into the five shades: a cell counts as tier i while it
+ * is no older than AGE_THRESH[i] steps. Last entry is "everything older". */
 static const int AGE_THRESH[N_AGE_LEVELS] = { 5, 20, 80, 300, INT32_MAX };
 
 #define ETA_MIN   1.0f
@@ -162,11 +82,12 @@ static const int AGE_THRESH[N_AGE_LEVELS] = { 5, 20, 80, 300, INT32_MAX };
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS  1000000LL
 
-#define STENCIL_AVG_W   0.25f   /* 5-point Laplacian: a cell = ¼ · sum of its 4 neighbours */
-#define FRAME_DT_CAP_MS 200     /* clamp a frame's Δt for fps so pauses/resizes can't skew it */
+#define STENCIL_AVG_W   0.25f   /* smoothing a cell means averaging its 4 neighbours (×1/4) */
+#define FRAME_DT_CAP_MS 200     /* ignore frame gaps longer than this so a pause won't wreck the fps number */
 
-/* Preset — chooses where the seed sits and which boundaries are the φ=1 source;
- * together those fix the direction and shape the aggregate grows in (§5/§6). */
+/* A preset is one ready-made setup: where the starting seed sits and which screen
+ * edge holds the high voltage. Those two choices alone decide which way the shape
+ * grows and what it ends up looking like (see §5 and §6). */
 typedef enum {
     PRESET_TREE = 0, PRESET_LIGHTNING, PRESET_CORAL,
     PRESET_FROST, PRESET_DISCHARGE, N_PRESETS
@@ -176,80 +97,78 @@ static const char *PRESET_NAME[N_PRESETS] = {
     "Tree", "Lightning", "Coral", "Frost", "Discharge"
 };
 
-/* ── the data model: Field, Aggregate, Scene ──────────────────────────── */
+/* ── the data: the voltage field, the growing shape, and the scene that holds them ── */
 
 /*
- * Field — the Laplace potential φ over the grid: the "voltage landscape" that drives
- * growth.  In the empty space it obeys ∇²φ = 0; it is pinned to 1 on the source
- * boundary and to 0 on the grounded aggregate, and field_relax() (§5) solves it by
- * Gauss-Seidel.  Growth then favours the high-φ frontier (the exposed tips), and
- * that tip amplification is exactly what makes the result fractal.  One float per
- * cell — a scalar field sampled on the grid.
- *   Why a whole struct for one array: φ is a first-class physical object here (the
- *   DBM is *defined* on it), and naming it lets the §5 functions read as field ops.
- *   Refs: Niemeyer et al. 1984; Numerical Recipes Ch. 20 (the relaxation solver).
+ * Field — the "voltage" at every cell on the grid. This is the landscape that steers
+ * growth: cells with the most voltage are the most likely to grow next. We hold it at
+ * 1 along the chosen source edge and at 0 everywhere the shape already exists, then
+ * smooth the empty middle so voltage flows gently between them (§5 does the smoothing).
+ * The smoothing naturally piles up voltage at exposed tips, which is why the shapes
+ * come out spiky and branching. One number per cell.
+ *   Refs: Niemeyer et al. 1984; Numerical Recipes Ch. 20 for the smoothing method.
  */
 typedef struct {
-    float phi[ROWS_MAX][COLS_MAX];   /* potential ∈ [0,1]; 1 at source, 0 on aggregate */
+    float phi[ROWS_MAX][COLS_MAX];   /* voltage, 0..1: 1 on the source edge, 0 on the shape */
 } Field;
 
 /*
- * Aggregate — the growing structure itself (the DLA/DBM "cluster"): a grounded
- * conductor that absorbs the field.  `occupied` is its shape; `age` records WHEN each
- * cell joined so the renderer can fade older growth; step/size track its progress.
- * Cells join one at a time at the frontier with probability ∝ φ^η (aggregate_grow,
- * §6).  Ref: Witten & Sander 1981 (the aggregate / cluster concept).
+ * Aggregate — the growing shape itself: the set of cells that have joined so far.
+ * Cells join one at a time, each new cell snapping on next to an existing one (§6).
+ * We remember when each cell joined so the renderer can colour fresh growth bright
+ * and let old growth fade. Ref: Witten & Sander 1981 (the growing-cluster idea).
  */
 typedef struct {
-    uint8_t  occupied[ROWS_MAX][COLS_MAX];  /* 1 ⇒ this cell belongs to the aggregate     */
-    uint16_t age     [ROWS_MAX][COLS_MAX];  /* growth step at which the cell joined.        *
-                                             * 16 bits suffice: the aggregate can never     *
-                                             * exceed ROWS_MAX·COLS_MAX = 24000 < 65536,    *
-                                             * so `step` never wraps the field.             */
-    int      step;                          /* monotonically rising counter — the "now"     *
-                                             * against which a cell's age is measured        */
-    int      size;                          /* number of occupied cells                      */
+    uint8_t  occupied[ROWS_MAX][COLS_MAX];  /* 1 if this cell is part of the shape         */
+    uint16_t age     [ROWS_MAX][COLS_MAX];  /* the step number when this cell joined.       *
+                                             * 16 bits is plenty: the grid holds at most    *
+                                             * ROWS_MAX*COLS_MAX = 24000 cells, well under  *
+                                             * 65536, so the count never overflows.         */
+    int      step;                          /* counts up by one per cell added — this is    *
+                                             * "now", which we subtract from age to get how *
+                                             * old a cell is                                 */
+    int      size;                          /* how many cells the shape has                  */
 } Aggregate;
 
 #define CELLS_MAX (ROWS_MAX * COLS_MAX)
 
 /*
- * Frontier — an EFFECT-SIDE acceleration structure (pure performance, not physics):
- * the explicit list of empty cells that touch the aggregate and may grow next.  It is
- * maintained INCREMENTALLY — when a cell joins it leaves the frontier and its empty
- * neighbours enter — so each growth step weighs O(frontier) candidates instead of
- * rescanning the whole O(rows·cols) grid.  `slot` is the inverse map (cell → its index
- * in cr/cc, or −1 if absent) that makes add/remove O(1) via swap-with-last.
- *   It belongs to the simulation only: it changes inside the physics step and the
- *   renderer never touches it — keeping the effect's perf machinery off the draw path.
+ * Frontier — the list of empty cells touching the shape, i.e. the cells that could
+ * grow next. It's purely a speed trick, not part of the model: keeping this short
+ * list up to date lets each growth step look at only the candidates instead of
+ * re-scanning the entire grid. We keep it current as we go — a cell leaves the list
+ * the moment it joins the shape, and its empty neighbours get added.
+ *   `slot` is a lookup the other way: given a cell, where does it sit in cr/cc (or
+ *   -1 if it's not in the list). That lets us add and remove cells instantly by
+ *   swapping the last entry into the freed spot. Only the simulation touches this;
+ *   the renderer never does.
  */
 typedef struct {
-    uint16_t cr[CELLS_MAX];              /* row    of each frontier cell  */
-    uint16_t cc[CELLS_MAX];              /* column of each frontier cell  */
-    int      slot[ROWS_MAX][COLS_MAX];   /* cell → index in cr/cc, or −1  */
-    int      count;                      /* number of frontier cells      */
+    uint16_t cr[CELLS_MAX];              /* row of each candidate cell    */
+    uint16_t cc[CELLS_MAX];              /* column of each candidate cell */
+    int      slot[ROWS_MAX][COLS_MAX];   /* cell -> its spot in cr/cc, or -1 if not listed */
+    int      count;                      /* how many candidates there are */
 } Frontier;
 
 /*
- * Scene — the complete simulation state in one object (this is where all the old
- * globals went).  It composes the objects the model needs — the growing Aggregate,
- * the Laplace Field that drives it, and the Frontier that accelerates its growth —
- * plus the model parameters and the RNG.  It is terminal-agnostic (knows nothing of
- * ncurses or screen size), and scene_tick() (§7) is the ONLY thing that mutates it.
+ * Scene — everything the simulation needs in one bundle (no scattered globals): the
+ * growing shape, the voltage field that steers it, the candidate list that speeds it
+ * up, plus the dials (preset, eta, theme) and the random-number state. It knows
+ * nothing about the terminal or screen size. Only scene_tick() (§7) ever changes it.
  */
 typedef struct {
-    int        rows, cols;   /* active grid size (≤ ROWS/COLS_MAX)                 */
+    int        rows, cols;   /* the grid size in use (never above ROWS/COLS_MAX)  */
 
-    Aggregate  aggregate;    /* §6 the growing conductor                          */
-    Field      field;        /* §5 the Laplace potential that drives the growth   */
-    Frontier   frontier;     /* §6 growth acceleration: the cells that may grow   */
+    Aggregate  aggregate;    /* §6 the growing shape                              */
+    Field      field;        /* §5 the voltage that steers the growth             */
+    Frontier   frontier;     /* §6 the cells that could grow next                 */
 
-    Preset     preset;       /* seed placement + boundary conditions              */
-    float      eta;          /* growth nonlinearity in φ^η (jagged ↔ rounded)     */
-    int        theme;        /* age-ramp palette index; a pure recolor            */
-    bool       paused;       /* gate: freezes scene_tick (a delay, not an effect) */
+    Preset     preset;       /* which ready-made setup we're running              */
+    float      eta;          /* greed dial: high = spiky, low = round             */
+    int        theme;        /* colour scheme; affects looks only                 */
+    bool       paused;       /* when true, scene_tick does nothing                */
 
-    uint32_t   rng;          /* LCG state — growth's only source of randomness    */
+    uint32_t   rng;          /* random-number state; the only randomness in growth */
 } Scene;
 
 /* ===================================================================== */
@@ -277,8 +196,8 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  rng — per-scene linear congruential generator                     */
 /* ===================================================================== */
 
-/* lcg_f — next pseudo-random float in [0,1).  Lives on the Scene so growth is the
- * only thing that consumes randomness and there is no hidden global RNG state. */
+/* Next random number between 0 and 1. We keep the state on the Scene rather than in a
+ * hidden global so growth is the only thing pulling random numbers. */
 static float lcg_f(Scene *s)
 {
     s->rng = s->rng * 1664525u + 1013904223u;
@@ -290,16 +209,15 @@ static float lcg_f(Scene *s)
 /* ===================================================================== */
 
 /*
- * 6 themes × 5 age levels (newest → oldest).  Every stop — including the OLDEST —
- * stays in the bright half of the 256-cube so the established structure never
- * fades to invisible against black (the project's Theme Palette Brightness rule).
- *
- *   Plasma: 231 213 177 135  99  white→pink→purple
- *   Fire:   231 226 214 208 166  white→yellow→orange
- *   Ice:    231 159 117  45  39  white→pale→light blue→cyan→blue
- *   Ghost:  255 252 249 246 244  bright→mid grays
- *   Neon:   231  51  46  45  39  white→cyan→green→azure→blue
- *   Matrix: 231  47  46  40  34  white head→green digital-rain trail
+ * Six colour schemes, each five shades from newest growth to oldest. Even the oldest
+ * shade stays fairly bright on purpose, so finished growth doesn't vanish into the
+ * black background (a project-wide rule). Each row reads roughly:
+ *   Plasma  white -> pink -> purple
+ *   Fire    white -> yellow -> orange
+ *   Ice     white -> pale -> light blue -> cyan -> blue
+ *   Ghost   bright -> mid grays
+ *   Neon    white -> cyan -> green -> azure -> blue
+ *   Matrix  white head -> green falling-code trail
  */
 static const short THEME_FG[N_THEMES][N_AGE_LEVELS] = {
     { 231, 213, 177, 135,  99 },  /* Plasma */
@@ -314,12 +232,13 @@ static const char *THEME_NAME[N_THEMES] = {
     "Plasma", "Fire", "Ice", "Ghost", "Neon", "Matrix"
 };
 
-/* shared 8-color fallback (one ramp for all themes) */
+/* Fallback shades for old terminals that only have 8 colours (same for every theme). */
 static const short THEME_FG8[N_AGE_LEVELS] = {
     COLOR_WHITE, COLOR_CYAN, COLOR_CYAN, COLOR_BLUE, COLOR_BLUE
 };
 
-/* color_apply_theme — bind the HUD pairs (constant) and the age ramp (per theme). */
+/* Set up the colour slots: the fixed HUD colours plus the five age shades for the
+ * chosen theme. Falls back to the 8-colour shades when the terminal is limited. */
 static void color_apply_theme(int theme)
 {
     if (COLORS >= 256) {

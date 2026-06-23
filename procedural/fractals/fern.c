@@ -1,107 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * fern.c  —  Fern IFS fractal, animated point-by-point, four variants
+ * fern.c — draws a fern, one dot at a time, by playing the "chaos game".
  *
- * Four affine transforms (an Iterated Function System) are applied
- * repeatedly to a single point.  The orbit of the point traces out a
- * fern attractor.  Points are plotted a few hundred per tick so you can
- * watch the fern emerge gradually from what looks like random scattered
- * dots — first the stem appears, then branches, then fine frond detail.
+ * The trick: keep four little move recipes, and a single point. Each step,
+ * pick one recipe at random and use it to nudge the point somewhere new;
+ * plot it; repeat. Out of what looks like random scatter, a fern slowly
+ * appears — stem first, then branches, then fine detail.
  *
- * Four variants cycle with n / p — each is just a different table of four
- * transforms (a different fern species):
- *   Barnsley          classic upright fern
- *   Thelypteris       narrow, delicate
- *   Leptosporangiate  fuller, bushier
- *   Windswept         leaning hard to one side
- * The view bounds are auto-fitted to each variant's attractor (no per-fern
- * tuning), so any coefficient table fills the screen.
- *
- * After TOTAL_ITERS iterations the completed fern is held briefly,
- * then the screen clears and it grows again.
- *
- * Color is assigned by height (y value), via a cycle-able theme (t / T):
- *   roots (low y)   →  theme's first colour
- *   tips  (high y)  →  theme's last colour (bright, bold)
- *
- * Keys:
- *   q / ESC   quit
- *   n / p     next / previous fern variant
- *   t / T     cycle colour theme (Forest/Aurora/Sunset/Galaxy/Tropical/Neon/Fire/Ice)
- *   r         reset fern immediately
- *   ] [       faster / slower simulation
- *   spc       pause / resume
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra fern.c -o fern -lncurses -lm
- *
- * Reading order — built bottom-up; each section uses only earlier ones.
- *   §1  config   — constants, palette slots
- *   §2  clock    — monotonic time
- *   §3  plane    — Vec2 (a point in the fern's plane) + Bounds (its extent)
- *   §4  ifs      — Map + FernVariant table + chaos-game step + auto-fit
- *   §5  canvas   — Cell + Grid (cell buffer, plane→cell mapping, colour bands)
- *   §6  color    — Theme table + apply
- *   §7  scene    — Scene: orbit + growth + variant/theme = the live picture
- *   §8  screen   — ncurses lifecycle + HUD
- *   §9  app      — signals, input, main loop
+ * Reference: M. Barnsley, "Fractals Everywhere" (1993) — origin of this fern,
+ * the chaos game, and the four-recipe numbers in §4.
+ * Sister file: barnsley.c grows the SAME fern a different way (counting how
+ * often each cell is hit), so compare the two if you're curious.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : IFS "chaos game" — single-point iteration.  Repeatedly pick
- *                  one of four affine maps (weighted by probability) and apply
- *                  it to a moving point; the points it visits fill in the fern.
- *                  Plotting each point as it is generated lets the attractor
- *                  emerge from noise instead of appearing all at once.
- *
- * Math           : Combined contractivity ≤ 0.85.  Collage theorem: the IFS
- *                  attractor is the unique compact K = T₁(K)∪T₂(K)∪T₃(K)∪T₄(K).
- *                  Probabilities p_i ∝ |det(A_i)| so point density matches the
- *                  area each map covers (the near-flat stem map gets ~1-2%).
- *
- * Data model     : A few small structs, one idea each —
- *                    Vec2          a point in the plane (the orbit, the maps' I/O)
- *                    Map / FernVariant  one affine transform, and a named set of 4
- *                    Bounds        the attractor's extent, auto-fitted per variant
- *                    Grid          the cell buffer + plane→cell mapping
- *                    Growth        the grow→hold→regrow animation state
- *                    Scene         all of the above = the live picture
- *
- * Rendering      : Colour by height maps to botanical structure (dark roots,
- *                  bright tips).  The fitted view is scaled and centred to fill
- *                  the terminal, with x stretched by ASPECT_R for cell shape.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES ───────────────────────────────────────────────────────── *
- *
- * Concepts & maths
- *   [1] Barnsley, M. F. (1993). "Fractals Everywhere" (2nd ed.). Academic
- *       Press.  — the source of the chaos game, the collage theorem, and this
- *       very fern (incl. the coefficient table in §4).  Start here.
- *   [2] Hutchinson, J. E. (1981). "Fractals and Self-Similarity." Indiana Univ.
- *       Math. J. 30(5):713-747.  — the maths underneath: an IFS has a unique
- *       compact attractor (the Hutchinson operator's fixed set).
- *   [3] Barnsley, M. F. & Demko, S. (1985). "Iterated Function Systems and the
- *       Global Construction of Fractals." Proc. R. Soc. Lond. A 399:243-275.
- *       — the founding IFS paper.
- *   [4] Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
- *       — self-similarity in nature; why an IFS draws a plant.
- *
- * Rendering & the chaos game
- *   [5] Demko, S., Hodges, L. & Naylor, B. (1985). "Construction of Fractal
- *       Objects with Iterated Function Systems." SIGGRAPH '85, Computer
- *       Graphics 19(3):271-278.  — drawing an IFS by the chaos game, and the
- *       probability ∝ |det| weighting used by Map.prob_cum in §4.
- *   [6] Peitgen, Jürgens & Saupe (1992). "Chaos and Fractals: New Frontiers of
- *       Science." Springer.  — the most readable IFS / chaos-game chapter, with
- *       the fern worked end to end.
- *
- * In-repo study companions
- *   [7] barnsley.c — the SAME fern grown into a DENSITY GRID instead of
- *       plotted point-by-point; compare the two reveal styles.
- *   [8] buddhabrot.c — the palette-table pattern §6's themes borrow.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -147,10 +57,8 @@ enum {
     MARGIN_SIDE      =   1,     /* left/right padding                     */
 };
 
-/*
- * ASPECT_R — terminal cell height / width ≈ 2.
- * Used to keep the fern at its natural proportions in the terminal.
- */
+/* Terminal characters are about twice as tall as they are wide. We stretch
+ * the fern's width by this much so it doesn't look squashed. */
 #define ASPECT_R    2.0f
 
 #define NS_PER_SEC  1000000000LL
@@ -158,18 +66,17 @@ enum {
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
 /*
- * ColorID — the colour-pair "slots" used throughout the program.
+ * ColorID — the numbered colour "slots" the program uses.
  *
- * WHY a numbered enum: each value does double duty.  It is (a) the id ncurses
- * draws with (init_pair / COLOR_PAIR), and (b) the single byte each Grid cell
- * stores to remember its colour.  So one small number answers "what colour is
- * this cell?" with no extra lookup table.
+ * Each number does two jobs: it's the id ncurses paints with, AND it's the one
+ * byte we store per grid cell to remember that cell's colour. So a single small
+ * number both answers "what colour is this cell?" and draws it.
  *
- * WHY this order: the fern is coloured by HEIGHT (ref [1]) — band 1 is the
- * roots, band 5 the tips.  Climbing the slot number climbs the plant; a Theme
- * (§6) decides the actual colour each band shows.
+ * The fern is coloured by how high up a dot is, so the first five slots run
+ * bottom-to-top: 1 = roots, 5 = bright tips. A Theme (§6) decides what actual
+ * colour each of those five means.
  *
- * Value 0 is reserved: a Grid cell holding 0 means "empty / nothing plotted".
+ * Slot 0 is left out on purpose: a cell holding 0 means "empty, nothing here".
  */
 typedef enum {
     COL_FERN_1 = 1,   /* band 1 — roots / stem               */
@@ -203,10 +110,9 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /*
- * clamp_frame_dt — cap a single frame's elapsed time.  If the program stalls
- * (debugger, laptop sleep), a huge dt would make the fixed-timestep loop run a
- * burst of catch-up ticks at once — the "spiral of death".  Capping trades one
- * slow frame for stability.
+ * If the program freezes for a moment (laptop sleep, debugger), the next frame
+ * thinks a huge amount of time passed and tries to catch up all at once, which
+ * locks up. We cap how much "elapsed time" one frame can report to avoid that.
  */
 static int64_t clamp_frame_dt(int64_t dt)
 {
@@ -215,9 +121,9 @@ static int64_t clamp_frame_dt(int64_t dt)
 }
 
 /*
- * frame_pace — sleep so the whole frame lasts about 1 / target_fps.
- * `frame_start` is when the frame began; `work_done` is time already spent, so
- * we sleep only the leftover budget instead of busy-waiting.
+ * Sleep just long enough that each frame takes the same amount of time, so the
+ * animation runs at a steady speed. We subtract the work already done this frame
+ * and sleep only what's left over.
  */
 static void frame_pace(int target_fps, int64_t frame_start, int64_t work_done)
 {
@@ -227,21 +133,23 @@ static void frame_pace(int target_fps, int64_t frame_start, int64_t work_done)
 }
 
 /*
- * FpsCounter — a small running readout of frames-per-second for the HUD.  Sums
- * frames and elapsed time, then every FPS_UPDATE_MS divides the two for a smooth
- * value (raw per-frame fps jitters too much to read).
+ * FpsCounter — works out the frames-per-second number shown on screen.
+ *
+ * Measuring one frame at a time gives a jumpy number that's hard to read, so we
+ * tally up frames over a short window and only divide every FPS_UPDATE_MS to get
+ * a steady value.
  */
 typedef struct {
-    int64_t accum_ns;   /* real time since the last readout update */
-    int     frames;     /* frames counted since then               */
-    double  value;      /* last computed fps — what the HUD shows  */
+    int64_t accum_ns;   /* time piled up since we last recomputed the number */
+    int     frames;     /* frames counted in that window                     */
+    double  value;      /* the latest fps number — what's shown on screen    */
 } FpsCounter;
 
 static void fps_count_frame(FpsCounter *f, int64_t dt)
 {
     f->frames   += 1;
     f->accum_ns += dt;
-    if (f->accum_ns >= FPS_UPDATE_MS * NS_PER_MS) {       /* time to refresh? */
+    if (f->accum_ns >= FPS_UPDATE_MS * NS_PER_MS) {       /* window full — recompute */
         f->value    = (double)f->frames / ((double)f->accum_ns / (double)NS_PER_SEC);
         f->frames   = 0;
         f->accum_ns = 0;
@@ -253,46 +161,42 @@ static void fps_count_frame(FpsCounter *f, int64_t dt)
 /* ===================================================================== */
 
 /*
- * Vec2 — a single point (x, y) in the fern's continuous coordinate plane.
+ * Vec2 — one point (x, y) in the fern's own coordinate space (not the screen).
  *
- * WHY it matters: the whole "chaos game" (ref [1]) happens in this plane.  The
- * orbit is a Vec2 that hops around; each affine map takes a Vec2 and returns a
- * new one; and the fern is just the cloud of Vec2 the orbit eventually fills in.
+ * This is the star of the chaos game: the single dot that hops around is a Vec2,
+ * each move recipe takes a Vec2 and hands back a new one, and the finished fern
+ * is just the cloud of points the dot has visited. Bundling x and y into one
+ * named value keeps the code readable and lets a point flow through the moves
+ * and the plotter as a single thing.
  *
- * WHY its own type (not loose x/y floats): naming it lets the maths read
- * plainly — `orbit = chaos_step(map, orbit)` — and lets one value flow through
- * map_apply / grid_plot instead of juggling two floats everywhere.
- *
- * WHY float: coordinates are small (≈ -3..3 wide, 0..10 tall), so single
- * precision is plenty; double would only cost speed in the millions-of-steps
- * loop.
+ * Coordinates stay small (roughly -3..3 wide, 0..10 tall), so plain float is
+ * plenty of precision — and faster, which matters over millions of steps.
  */
 typedef struct {
-    float x;   /* horizontal position — grows rightward */
-    float y;   /* height              — grows upward    */
+    float x;   /* left-right position, bigger = further right */
+    float y;   /* height,             bigger = further up     */
 } Vec2;
 
 /*
- * Bounds — an axis-aligned rectangle in the plane, given by its low (bottom-
- * left) and high (top-right) corners.  Plainly: the smallest box that holds the
- * whole fern.
+ * Bounds — the smallest box that holds the whole fern, kept as its bottom-left
+ * and top-right corners.
  *
- * WHY we need it: each variant is a different size and sits in a different part
- * of the plane, but the terminal is fixed.  Measuring the box lets the canvas
- * scale the fern to fill the screen and the colour map span its full height —
- * automatically, for any variant (see variant_fit).
+ * Every fern species is a slightly different size and sits in a different spot,
+ * but the terminal is one fixed size. Knowing the fern's box lets us shrink or
+ * grow it to fill the screen, and lets the colours span exactly its height — all
+ * worked out automatically (see variant_fit).
  *
- * Built by sampling: start the box at one point (bounds_at), then stretch it to
- * swallow each new point (bounds_cover) — the standard running min/max.
+ * We build it by watching the dot wander: start the box at one point
+ * (bounds_at), then widen it to swallow each new point (bounds_cover).
  */
 typedef struct {
-    Vec2 lo;   /* smallest x and y the orbit reached (bottom-left) */
-    Vec2 hi;   /* largest  x and y the orbit reached (top-right)   */
+    Vec2 lo;   /* the lowest, leftmost point the dot reached  */
+    Vec2 hi;   /* the highest, rightmost point the dot reached */
 } Bounds;
 
 static Bounds bounds_at(Vec2 p) { return (Bounds){ p, p }; }
 
-/* Grow the box to include p (the running min/max used while sampling). */
+/* Widen the box just enough to include p. */
 static void bounds_cover(Bounds *b, Vec2 p)
 {
     if (p.x < b->lo.x) b->lo.x = p.x;
@@ -309,26 +213,26 @@ static float bounds_height(const Bounds *b) { return b->hi.y - b->lo.y; }
 /* ===================================================================== */
 
 /*
- * Map — one affine transform of the IFS (refs [1][3]):
- *     p → ( a·x + b·y + e ,  c·x + d·y + f )
+ * Map — one "move recipe": take a point, and shrink/rotate/shift it to a new
+ * spot. The fern is built from four of these, each responsible for one part:
+ * the stem, the big swirl of leaflets, and the two side fronds.
  *
- * WHAT it is, plainly: a recipe that scales, rotates, and shifts a point.
- * (a,b,c,d) is the 2×2 matrix that scales/rotates; (e,f) is the shift applied
- * after.  The fern's four maps each draw one part — the stem, the big spiral of
- * leaflets, and the two side fronds.
+ * The six numbers a,b,c,d,e,f are the recipe. a,b,c,d shrink and rotate the
+ * point; e,f then slide it sideways and up. (The formula is
+ * x' = a·x + b·y + e, y' = c·x + d·y + f, the standard affine transform.)
  *
- * prob_cum — the cumulative probability × 100, so a single rand()%100 picks a
- * map (take the first whose threshold the roll falls under).  Probabilities are
- * set ∝ |det| (ref [5]) so point density matches each map's area; the near-flat
- * stem map covers almost no area, so it gets only ~1-2%.
+ * prob_cum sets how often this recipe gets picked, written as a running total
+ * out of 100. We roll a number 0..99 and take the first recipe whose total the
+ * roll lands under. The recipes are weighted by how much area they fill, so the
+ * stem — which is almost a flat line — is picked only about 1 in 100 steps.
  */
 typedef struct {
-    float a, b, c, d;   /* 2×2 scale / rotate matrix          */
-    float e, f;         /* translation added afterwards       */
-    int   prob_cum;     /* cumulative pick threshold (0..100) */
+    float a, b, c, d;   /* shrink-and-rotate part of the recipe        */
+    float e, f;         /* slide-sideways-and-up part                  */
+    int   prob_cum;     /* running pick threshold out of 100 (see above) */
 } Map;
 
-/* Apply one affine map to a point. */
+/* Run one move recipe on a point and return where it ends up. */
 static Vec2 map_apply(const Map *m, Vec2 p)
 {
     return (Vec2){ m->a * p.x + m->b * p.y + m->e,
@@ -336,17 +240,16 @@ static Vec2 map_apply(const Map *m, Vec2 p)
 }
 
 /*
- * FernVariant — a named fern = four affine Maps.  Iterating them as a chaos
- * game (ref [1]) converges on that species' attractor.
+ * FernVariant — a named fern species: just a name plus its four move recipes.
  *
- * WHY this is the whole "species" system: swapping this 4-row table is the ONLY
- * thing that differs between ferns.  The chaos-game engine, the auto-fit, and
- * the renderer are all shared — so adding a fern is just a new table entry.
- * (Coefficients verified to render distinct ferns; bounds are auto-fitted.)
+ * This is the whole "different ferns" feature. Every fern shares the same chaos
+ * game, the same auto-fitting, and the same drawing code — the ONLY thing that
+ * changes between species is these four recipes. So adding a new fern is nothing
+ * more than adding a row to the table below.
  */
 typedef struct {
-    const char *name;     /* shown in the HUD, e.g. "Barnsley" */
-    Map         map[4];   /* the four transforms that build it */
+    const char *name;     /* shown on screen, e.g. "Barnsley"      */
+    Map         map[4];   /* the four recipes that grow this fern  */
 } FernVariant;
 
 static const FernVariant k_variants[N_VARIANTS] = {
@@ -381,9 +284,9 @@ static const FernVariant k_variants[N_VARIANTS] = {
 };
 
 /*
- * pick_map_index — roulette selection: given a roll in [0,100), return the
- * index of the first map whose cumulative threshold the roll falls under.  This
- * is what makes some maps fire more often (probability ∝ |det|).
+ * Given a dice roll of 0..99, pick which of the four recipes to use. We take the
+ * first one whose running total the roll falls under, which is what makes the
+ * common recipes get chosen more often than the rare ones.
  */
 static int pick_map_index(const Map m[4], int roll)
 {
@@ -393,9 +296,8 @@ static int pick_map_index(const Map m[4], int roll)
 }
 
 /*
- * chaos_step — one move of the chaos game: pick a map at random (weighted by
- * prob_cum) and apply it.  Iterating this from any start point converges on the
- * variant's attractor — the fern.
+ * One turn of the chaos game: roll the dice, pick a recipe, run it. Do this over
+ * and over from any starting point and the dots settle into the fern shape.
  */
 static Vec2 chaos_step(const Map m[4], Vec2 p)
 {
@@ -404,14 +306,14 @@ static Vec2 chaos_step(const Map m[4], Vec2 p)
 }
 
 /*
- * variant_fit — size a variant's view box by sweeping its attractor: discard a
- * warm-up so the orbit settles, then cover a sample of points.  Replaces
- * hand-tuned bounds — any coefficient table just works.
+ * Measure how big a fern is before drawing it: play the chaos game for a while
+ * and note the box the dots stay within. Doing this means we never have to hand-
+ * tune sizes — any set of recipes just fits the screen on its own.
  */
 static Bounds variant_fit(const Map m[4])
 {
     Vec2 p = { 0.0f, 0.0f };
-    for (int i = 0; i < FIT_WARMUP; i++)
+    for (int i = 0; i < FIT_WARMUP; i++)   /* let the dot drift onto the fern first */
         p = chaos_step(m, p);
 
     Bounds b = bounds_at(p);
@@ -427,45 +329,46 @@ static Bounds variant_fit(const Map m[4])
 /* ===================================================================== */
 
 /*
- * Cell — an integer terminal cell (column, row): the discrete screen position a
- * continuous plane point maps to.  It's the bridge between the float world
- * (Vec2) and the character grid — plane_to_cell produces one, grid_plot uses it.
+ * Cell — a whole-number spot on the terminal grid (which column, which row).
+ *
+ * A fern point lives at smooth floating coordinates; a character on screen lives
+ * at a whole row and column. Cell is the rounded-off screen spot a point lands
+ * on — the bridge between the two. plane_to_cell makes one; grid_plot uses it.
  */
 typedef struct {
-    int col;   /* terminal column (x), 0 = left */
-    int row;   /* terminal row    (y), 0 = top  */
+    int col;   /* column across the screen, 0 = far left */
+    int row;   /* row down the screen,      0 = top      */
 } Cell;
 
 /*
- * Grid — the picture in memory: one ColorID per terminal cell, plus the
- * auto-fitted lens that maps plane points onto those cells.
+ * Grid — the picture held in memory: a colour number for every screen cell, plus
+ * the settings that say where each fern point lands on screen.
  *
- * WHY a buffer: it separates "decide a point's colour" (the fractal maths) from
- * "draw the screen" (ncurses).  The chaos game only ever writes a band number
- * into cells[][]; grid_draw is the one place that turns those into glyphs.
+ * Keeping the picture in an array first, then drawing it, separates the fern math
+ * from the screen drawing. The chaos game only ever writes a colour number into
+ * cells[][]; grid_draw is the single place that turns those numbers into
+ * characters on screen.
  *
- * WHY fixed-size arrays: this project never calls malloc in the running loop —
- * the buffer is sized to the biggest terminal we support (GRID_*_MAX); rows/cols
- * say how much of it is actually in use.
- *
- * The lens: scale_x = scale_y × ASPECT_R undoes the tall-cell squash so the
- * fern keeps true proportions.
+ * The array is a fixed maximum size (we never allocate memory mid-run); rows and
+ * cols say how much of it the current terminal actually uses. view, scale_y and
+ * scale_x together are the "lens" that shrinks the fern to fit — scale_x is wider
+ * than scale_y to undo the fact that characters are tall and narrow.
  */
 typedef struct {
-    uint8_t cells[GRID_ROWS_MAX][GRID_COLS_MAX];  /* [row][col] → ColorID (0 = empty) */
-    int     rows, cols;     /* portion of the buffer in use                       */
-    Bounds  view;           /* plane box currently shown (fitted per variant)     */
-    float   scale_y;        /* plane y-unit → terminal rows                       */
-    float   scale_x;        /* plane x-unit → terminal cols (= scale_y × ASPECT_R)*/
+    uint8_t cells[GRID_ROWS_MAX][GRID_COLS_MAX];  /* colour number per cell, 0 = empty */
+    int     rows, cols;     /* how much of the array the screen uses now            */
+    Bounds  view;           /* the fern's measured box (set per species)            */
+    float   scale_y;        /* how many screen rows per unit of fern height         */
+    float   scale_x;        /* how many screen cols per unit of fern width          */
 } Grid;
 
 /*
- * height_band — map a point's height onto a colour band 1..N_FERN_COLORS over
- * the fitted y-range, so roots take the theme's first colour and tips its last.
+ * Decide which colour a point gets from how high up the fern it sits: low points
+ * get the first colour, high points the last.
  */
 static uint8_t height_band(const Grid *g, float y)
 {
-    /* how far up the fern this point is: 0 at the roots, 1 at the tips */
+    /* 0 at the bottom of the fern, 1 at the very top */
     float frac = (y - g->view.lo.y) / (g->view.hi.y - g->view.lo.y);
     int band = 1 + (int)(frac * (float)N_FERN_COLORS);
     if (band < 1) band = 1;
@@ -474,15 +377,15 @@ static uint8_t height_band(const Grid *g, float y)
 }
 
 /*
- * plane_to_cell — where does plane point p land on the terminal?
- * x is centred on the view's midpoint; y is flipped so the fitted bottom sits
- * on the second-from-bottom row (leaving the last row for the action bar) and
- * the top climbs upward.
+ * Work out which screen cell a fern point falls on. We line the fern's middle up
+ * with the middle of the screen, and flip top-for-bottom because screen rows are
+ * numbered from the top down but the fern grows upward. The fern's base sits just
+ * above the bottom edge, leaving the last row free for the key list.
  */
 static Cell plane_to_cell(const Grid *g, Vec2 p)
 {
-    float x_center  = (g->view.lo.x + g->view.hi.x) * 0.5f;  /* fern's midline */
-    int   base_row  = g->rows - MARGIN_BOTTOM;               /* roots sit here */
+    float x_center  = (g->view.lo.x + g->view.hi.x) * 0.5f;  /* fern's centre line */
+    int   base_row  = g->rows - MARGIN_BOTTOM;               /* where the roots sit */
     return (Cell){
         .col = g->cols / 2 + (int)roundf((p.x - x_center)     * g->scale_x),
         .row = base_row    - (int)roundf((p.y - g->view.lo.y) * g->scale_y),
@@ -490,9 +393,9 @@ static Cell plane_to_cell(const Grid *g, Vec2 p)
 }
 
 /*
- * grid_init — point the grid at a fitted view and pick the largest uniform
- * scale that fits the drawable area (rows 0-1 = data, last row = actions),
- * with x stretched by ASPECT_R so the shape isn't squashed by tall cells.
+ * Set the grid up for a freshly measured fern: clear it, then pick the biggest
+ * size that still fits on screen once the top rows (info) and bottom row (keys)
+ * are reserved, stretching the width so the fern doesn't look squashed.
  */
 static void grid_init(Grid *g, int cols, int rows, Bounds view)
 {
@@ -503,22 +406,20 @@ static void grid_init(Grid *g, int cols, int rows, Bounds view)
     g->cols = cols;
     g->view = view;
 
-    /* 1. drawable area = the screen minus the HUD margins */
+    /* room left for the fern once the info and key rows are set aside */
     int draw_rows = rows - (MARGIN_TOP + MARGIN_BOTTOM); if (draw_rows < 1) draw_rows = 1;
     int draw_cols = cols - 2 * MARGIN_SIDE;              if (draw_cols < 1) draw_cols = 1;
 
     float w = bounds_width(&view);  if (w < 1e-3f) w = 1e-3f;
     float h = bounds_height(&view); if (h < 1e-3f) h = 1e-3f;
 
-    /* 2. largest scale that fits both axes; x is stretched by ASPECT_R, so the
-     *    width limit is tested against the stretched scale, keeping whichever
-     *    axis runs out of room first */
+    /* find the biggest size that still fits, picking whichever runs out of room
+     * first — height or the stretched-out width */
     float fit_by_rows = (float)draw_rows / h;
     float fit_by_cols = (float)draw_cols / w;
     float unit = fit_by_rows;
     if (unit * ASPECT_R > fit_by_cols) unit = fit_by_cols / ASPECT_R;
 
-    /* 3. store the lens (x doubled to undo tall-cell squash) */
     g->scale_y = unit;
     g->scale_x = unit * ASPECT_R;
 }
@@ -550,27 +451,25 @@ static void grid_draw(const Grid *g, WINDOW *w)
 /* ===================================================================== */
 
 /*
- * Theme — a named height→colour gradient, band 1 (roots) to band 5 (tips).
+ * Theme — a named set of five colours, running from the roots up to the tips.
  *
- * WHY it exists: the maths only ever produces a band number per cell; a Theme
- * turns those abstract bands into real colours, so the whole fern restyles by
- * swapping one table row — no recompute.  Same pattern as buddhabrot.c's
- * palette table (ref [8]).  fg256[] are xterm-256 codes (modern terminals);
- * fg8[] is the 8-colour ANSI fallback for old ones.
+ * The fern math only ever produces a number 1..5 per cell. A Theme is what turns
+ * those numbers into actual colours, so switching the whole look is just picking
+ * a different row of this table — nothing is recalculated.
  *
- * WHY every band is bright: a 256-index from the dark bottom of the cube is
- * invisible on black.  All bands sit in the bright half (no value below ~39),
- * so even the roots show; the gradient is carried by HUE, not by fading to
- * dark, and the tip band (drawn bold) shines.
+ * Two colour lists per theme: fg256 holds the rich colours that modern terminals
+ * support; fg8 is a fallback of basic colours for old terminals. Every colour is
+ * deliberately on the bright side (dark colours vanish against the black
+ * background), so the look comes from the shift in hue, not from fading to dark.
  */
 typedef struct {
-    const char *name;            /* shown in the HUD, e.g. "Aurora"      */
-    int fg256[N_FERN_COLORS];    /* band 1..5 (roots → tips), 256-colour */
-    int fg8[N_FERN_COLORS];      /* same five bands, 8-colour fallback   */
+    const char *name;            /* shown on screen, e.g. "Aurora"           */
+    int fg256[N_FERN_COLORS];    /* roots → tips, rich colours (modern terms) */
+    int fg8[N_FERN_COLORS];      /* same five, basic colours (old terminals)  */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
-    /*            name        roots ─────────────────── tips     8-colour fallback (same order) */
+    /*            name        roots ─────────────────── tips     basic-colour fallback (same order) */
     { "Forest",   {  40,  76, 118, 154, 190 }, { COLOR_GREEN,   COLOR_GREEN,   COLOR_GREEN,  COLOR_YELLOW, COLOR_YELLOW } },
     { "Aurora",   {  51,  50,  47, 226, 231 }, { COLOR_CYAN,    COLOR_CYAN,    COLOR_GREEN,  COLOR_YELLOW, COLOR_WHITE  } },
     { "Sunset",   { 201, 198, 203, 214, 226 }, { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_RED,    COLOR_YELLOW, COLOR_YELLOW } },
@@ -581,7 +480,8 @@ static const Theme k_themes[N_THEMES] = {
     { "Ice",      {  39,  45,  51, 117, 231 }, { COLOR_CYAN,    COLOR_CYAN,    COLOR_CYAN,   COLOR_CYAN,   COLOR_WHITE  } },
 };
 
-/* Bind the five fern bands to the active theme (HUD/HINT stay as set below). */
+/* Point the five fern colours at the chosen theme (the info-bar colours don't
+ * change). */
 static void theme_apply(int theme)
 {
     const Theme *t = &k_themes[theme];
@@ -594,7 +494,8 @@ static void theme_apply(int theme)
 static void color_init(void)
 {
     start_color();
-    /* HUD/HINT are theme-independent — yellow data, cyan actions on any palette */
+    /* The info bar (yellow) and key list (cyan) keep these colours no matter
+     * which theme is on. */
     if (COLORS >= 256) {
         init_pair(COL_HUD,  226, COLOR_BLACK);
         init_pair(COL_HINT,  51, COLOR_BLACK);
@@ -602,7 +503,7 @@ static void color_init(void)
         init_pair(COL_HUD,  COLOR_YELLOW, COLOR_BLACK);
         init_pair(COL_HINT, COLOR_CYAN,   COLOR_BLACK);
     }
-    theme_apply(0);   /* Forest; Scene.theme tracks the active one thereafter */
+    theme_apply(0);   /* start on Forest; the scene remembers any later choice */
 }
 
 /* ===================================================================== */
@@ -610,44 +511,42 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * Growth — the grow → hold → regrow animation state, kept SEPARATE from the
- * fractal data so pausing, resizing, or restarting never touches the geometry.
+ * Growth — tracks the grow → pause → start-over loop the animation runs on.
  *
- * It's a tiny three-state cycle: while `points` < TOTAL_ITERS the fern is
- * GROWING (more points each tick); when it reaches TOTAL_ITERS it HOLDS,
- * counting `hold_ticks` up to DONE_PAUSE_TICKS; then it regrows from scratch.
+ * It's a simple cycle: while points is still climbing toward TOTAL_ITERS, the
+ * fern is filling in. Once it's full, hold_ticks counts up while the finished
+ * fern is held on screen for a moment, then everything clears and it starts
+ * over. Kept apart from the fern data so pausing or resizing never disturbs the
+ * shape itself.
  */
 typedef struct {
-    int  points;       /* orbit points plotted so far (0..TOTAL_ITERS) */
-    int  hold_ticks;   /* ticks elapsed since the fern completed       */
-    bool paused;       /* true = frozen (user pressed space)           */
+    int  points;       /* how many dots plotted so far (0..TOTAL_ITERS) */
+    int  hold_ticks;   /* how long the finished fern has been held       */
+    bool paused;       /* true while frozen (user pressed space)         */
 } Growth;
 
 /*
- * Scene — the whole "what is on screen" in one place.  Everything the program
- * does reduces to: update a Scene (scene_tick), then draw it (scene_draw).
+ * Scene — everything that's on screen, gathered in one place. The whole program
+ * boils down to: update the scene (scene_tick), then draw it (scene_draw).
  *
- * WHY bundle these: the orbit needs the variant's maps to step, the canvas
- * needs the orbit's point to plot, and the growth says when to stop — useless
- * apart.  One pointer carries the whole picture between functions.
- *
- * WHY ids, not pointers: variant / theme are plain indices into the k_variants
- * / k_themes tables — trivial to cycle ( (id+1) % N ), read straight into the
- * HUD, and never dangle.
+ * These pieces all need each other — the wandering dot needs the recipes, the
+ * picture needs the dot, the growth counter says when to stop — so they travel
+ * together as one. variant and theme are just row numbers into the species and
+ * theme tables, which makes cycling them as easy as adding one and wrapping.
  */
 typedef struct {
-    Grid   grid;       /* the painted cells + plane→cell mapping        */
-    int    variant;    /* index into k_variants — which fern            */
-    int    theme;      /* index into k_themes   — which colour gradient */
-    Vec2   orbit;      /* the current chaos-game point                  */
-    Growth growth;     /* how far the grow animation has gotten         */
+    Grid   grid;       /* the picture so far, plus its on-screen placement */
+    int    variant;    /* which fern species (row in k_variants)           */
+    int    theme;      /* which colour theme (row in k_themes)             */
+    Vec2   orbit;      /* the dot currently wandering through the fern      */
+    Growth growth;     /* how far along the grow animation is              */
 } Scene;
 
 /*
- * scene_init — (re)start the current variant: auto-fit its view, clear the
- * grid, then warm up the orbit before plotting begins.  Reads s->variant and
- * s->theme (both 0 on first call, since the App lives in zero-initialised BSS),
- * so reset and resize keep whatever fern/theme is selected.
+ * Start (or restart) the current fern from scratch: measure it, clear the
+ * picture, and let the dot wander a bit so it's on the fern before we plot. Keeps
+ * whatever species and theme are already chosen, so reset and resize don't lose
+ * the user's selection.
  */
 static void scene_init(Scene *s, int cols, int rows)
 {
@@ -660,46 +559,42 @@ static void scene_init(Scene *s, int cols, int rows)
     s->growth.hold_ticks = 0;
     s->growth.paused     = false;
 
-    for (int i = 0; i < FIT_WARMUP; i++)   /* settle onto the attractor */
+    for (int i = 0; i < FIT_WARMUP; i++)   /* let the dot drift onto the fern */
         s->orbit = chaos_step(m, s->orbit);
 }
 
-/* Switch to another variant (wraps around) and regrow it from scratch. */
+/* Switch to another fern species (wrapping past the ends) and grow it fresh. */
 static void scene_set_variant(Scene *s, int variant, int cols, int rows)
 {
     s->variant = ((variant % N_VARIANTS) + N_VARIANTS) % N_VARIANTS;
     scene_init(s, cols, rows);
 }
 
-/*
- * scene_plot_batch — take one tick's worth of chaos-game steps (N_PER_TICK) and
- * plot each point.  This is the actual "grow the fern" work.
- */
+/* Add one tick's worth of dots to the fern — this is the actual growing. */
 static void scene_plot_batch(Scene *s)
 {
     const Map *m = k_variants[s->variant].map;
     for (int i = 0; i < N_PER_TICK; i++) {
-        s->orbit = chaos_step(m, s->orbit);   /* hop to the next attractor point */
-        grid_plot(&s->grid, s->orbit);        /* paint where it landed           */
+        s->orbit = chaos_step(m, s->orbit);   /* move the dot */
+        grid_plot(&s->grid, s->orbit);        /* mark where it landed */
     }
     s->growth.points += N_PER_TICK;
 }
 
 /*
- * scene_tick — advance the picture by one tick: grow → hold → regrow.
- * While growing, plot the next batch.  Once complete, count down the hold, then
- * restart from scratch (the fern does not stay forever).
+ * Move the animation forward by one tick. If the fern isn't done, add more dots.
+ * If it is, hold it on screen for a beat, then wipe it and start over.
  */
 static void scene_tick(Scene *s)
 {
     if (s->growth.paused) return;
 
-    if (s->growth.points >= TOTAL_ITERS) {                /* finished — hold, then regrow */
+    if (s->growth.points >= TOTAL_ITERS) {                /* done — hold, then restart */
         if (++s->growth.hold_ticks >= DONE_PAUSE_TICKS)
             scene_init(s, s->grid.cols, s->grid.rows);
         return;
     }
-    scene_plot_batch(s);                                  /* still growing */
+    scene_plot_batch(s);                                  /* still filling in */
 }
 
 static void scene_draw(const Scene *s, WINDOW *w) { grid_draw(&s->grid, w); }
@@ -709,13 +604,13 @@ static void scene_draw(const Scene *s, WINDOW *w) { grid_draw(&s->grid, w); }
 /* ===================================================================== */
 
 /*
- * Screen — the live terminal size in character cells.  Measured at startup and
- * after every resize (SIGWINCH); the canvas reads it to scale the fern and the
- * HUD reads it to place its lines.
+ * Screen — the terminal's current size in characters. Measured at startup and
+ * again whenever the window is resized; the fern uses it to scale itself and the
+ * info lines use it to know where to print.
  */
 typedef struct {
-    int cols;   /* terminal width  in characters */
-    int rows;   /* terminal height in characters */
+    int cols;   /* width  in characters */
+    int rows;   /* height in characters */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -735,19 +630,20 @@ static void screen_free(Screen *s)  { (void)s; endwin(); }
 
 static void screen_resize(Screen *s)
 {
+    /* The endwin/refresh shuffle is how ncurses notices the new window size. */
     endwin();
     refresh();
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* grow_percent — how complete the current fern is, 0..100. */
+/* How far along the current fern is, as a percentage. */
 static int grow_percent(const Scene *sc)
 {
     int pct = sc->growth.points * 100 / TOTAL_ITERS;
     return pct > 100 ? 100 : pct;
 }
 
-/* hud_data_line — row 0, right-aligned bold: variant name + fps + run state. */
+/* Top-right line: fern name, frame rate, and whether it's growing or paused. */
 static void hud_data_line(const Screen *s, const Scene *sc, double fps)
 {
     const char *state = sc->growth.paused ? "PAUSED "

@@ -1,217 +1,19 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * curl_noise_vector_field.c
- *   — Divergence-free curl noise: 5 ways to see a vector field.
+ * curl_noise_vector_field.c — five ways to look at a swirling flow field.
  *
- * DEMO: Curl noise is the ∇×ψ of a scalar noise potential — a 2-D
- *       vector field that is exactly DIVERGENCE-FREE by construction.
- *       Particles flowing through it swirl into vortices and never
- *       pile up or run dry; the field's mass is conserved. Five
- *       patterns visualise the same underlying field in different ways:
- *         PARTICLES — 256 particles trace streamlines (default)
- *         VECTOR    — sparse arrow glyphs '>', '<', '^', 'v', '/', '\'
- *                     showing the field direction at lattice points
- *         POTENTIAL — render the scalar potential ψ as a heightmap
- *         CURL_MAG  — render |∇×ψ| as density heat — bright at
- *                     vortex centres, dim at irrotational regions
- *         WARPED    — particle flow over a domain-warped potential
- *                     (more chaotic, eddy-rich streamlines)
- *       Field drifts so the flow evolves rather than looping.
+ * We build a smooth flow that swirls into whirlpools but never lets
+ * particles pile up or empty out, then show the same field five ways:
+ * flowing particles, arrows, a heightmap, a brightness map, and a
+ * warped variant. The trick (rotate the slope of a noise field by 90
+ * degrees so flow circles peaks instead of climbing them) is from
+ * Bridson, Houriham & Nordenstam, "Curl-Noise for Procedural Fluid
+ * Flow", SIGGRAPH 2007.
  *
- * Study alongside:
- *   ./perin_noise_flow_showcase.c — particles flow on a noise GRADIENT
- *       (∇ψ), which is divergent. Curl flow uses the perpendicular
- *       (∇×ψ), which is divergence-free. Side-by-side: gradient
- *       streams converge to peaks; curl streams loop forever.
- *   ./domain_warped_noise_iq_style.c — domain warping technique used
- *       by the WARPED pattern here.
- *   ./worley_cellular_noise.c — discrete cells; this file is smooth.
- *
- * Section map:
- *   §1 config   — grid, particles, palette, themes
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes
- *   §5 noise    — Noise context (perm table) + Perlin + fBm + curl
- *   §6 patterns — helpers shared by the 5 visualisations
- *   §7 scene    — Scene struct composing Grid, RenderBuffers,
- *                 Particles, SimState, Controls (+ Noise from §5),
- *                 plus the per-frame tick / update pipeline
- *   §8 screen   — ASCII render: density glyphs + arrow glyphs
- *   §9 app      — signals, resize, main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reset (new permutation)
- *   n / N      next pattern
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      faster particles / drift
- *   -          slower
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra curl_noise_vector_field.c \
- *       -o curl_noise -lncurses -lm
+ * Sister files: perin_noise_flow_showcase.c (the same noise used as a
+ * slope, so particles DO pile up — the contrast case), and
+ * domain_warped_noise_iq_style.c (the warping trick the WARPED view uses).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Curl noise is a way to derive a smooth, divergence-
- *                  free 2-D vector field from a scalar noise function.
- *
- *                  Given a scalar potential ψ(x, y), define
- *                      v(x, y) = (∂ψ/∂y, −∂ψ/∂x).
- *                  This v is identically divergence-free by the
- *                  cross-derivative theorem:
- *                      ∇·v = ∂vx/∂x + ∂vy/∂y
- *                          = ∂²ψ/∂x∂y − ∂²ψ/∂y∂x = 0.
- *                  So a particle flowing along v never converges to a
- *                  source or diverges to a sink — the field has no
- *                  "wells" or "fountains". Combined with a smooth ψ
- *                  (e.g. Perlin / fBm) you get vortex-rich flow that
- *                  looks like fluid or smoke.
- *
- *                  We compute v by central finite difference:
- *                      ∂ψ/∂y ≈ (ψ(x, y+ε) − ψ(x, y−ε)) / (2ε)
- *                      ∂ψ/∂x ≈ (ψ(x+ε, y) − ψ(x−ε, y)) / (2ε)
- *                  with ε small enough to capture local curvature
- *                  but large enough to keep the noise output stable
- *                  (we use ε = 0.5 noise-units).
- *
- *                  Five patterns visualise the field; PARTICLES is the
- *                  default ("flow" view), VECTOR shows arrows at
- *                  lattice points, POTENTIAL shows the underlying
- *                  scalar ψ as a heightmap, CURL_MAG shows |v| as
- *                  density (bright at vortex cores), WARPED applies
- *                  domain warping to ψ before taking the curl.
- *
- * Data-structure : Scene is the umbrella context, composed of six
- *                  sub-structs so each layer has one clear role and
- *                  no globals leak across them:
- *                    Grid          — w, h, total_cells + idx/in_bounds.
- *                    Noise         — Perlin permutation table; passed
- *                                    by pointer to every noise call.
- *                    RenderBuffers — per-cell glow, palette index, and
- *                                    optional glyph override (the
- *                                    VECTOR pattern uses it for arrows).
- *                                    Screen reads ONLY these arrays.
- *                    Particles     — static pool for PARTICLES/WARPED.
- *                    SimState      — field_time + supernova flash
- *                                    (transient post-reset glow).
- *                    Controls      — pattern, theme, speed, drift,
- *                                    pause; mutated by the keyboard.
- *                  No heap; everything BSS.
- *
- * Rendering      : ASCII only. Density-based '.', '*', '#' for the
- *                  field-as-scalar patterns. The VECTOR pattern uses
- *                  arrow glyphs '>', '<', '^', 'v', '/', '\\' chosen
- *                  by the local velocity direction. Each pattern
- *                  writes into RenderBuffers uniformly so the colour-
- *                  banding logic in scene_draw stays the same.
- *
- * Performance    : 4 fBm calls per cell for CURL_MAG (the most
- *                  expensive pattern), each with 3 octaves. ~135 K
- *                  perlin/sec on a 200×56 grid at 60 Hz, well under
- *                  1 % of one core on modern hardware.
- *
- * References     : • Bridson, Houriham & Nordenstam (2007) — "Curl-
- *                    Noise for Procedural Fluid Flow", SIGGRAPH.
- *                    The original paper introducing this technique
- *                    to graphics — short, readable, and contains the
- *                    exact derivation reproduced in CONCEPTS above:
- *                    https://www.cs.ubc.ca/~rbridson/docs/bridson-siggraph2007-curlnoise.pdf
- *                  • Ken Perlin (2002) — "Improving Noise", SIGGRAPH.
- *                    Source of the quintic fade t·t·t·(t·(t·6−15)+10)
- *                    and the gradient-hash table used by
- *                    noise_perlin2d. NOT the 1985 original, which
- *                    used a cubic fade with visible C¹-discontinuity
- *                    artefacts at integer lattice points.
- *                  • Ebert, Musgrave, Peachey, Perlin & Worley
- *                    — "Texturing & Modeling: A Procedural Approach"
- *                    (3rd ed, 2003, Morgan Kaufmann). The
- *                    comprehensive book on procedural noise; the fBm
- *                    chapter is the canonical treatment of octaves,
- *                    amplitude / frequency ratios, and lacunarity.
- *                  • Bridson (2015) — "Fluid Simulation for Computer
- *                    Graphics" (2nd ed, CRC Press). Puts curl noise
- *                    in the broader context of divergence-free
- *                    velocity fields, incompressible flow, and
- *                    projection methods (Chorin / Helmholtz–Hodge).
- *                  • Inigo Quilez — "Domain Warping":
- *                    https://iquilezles.org/articles/warp/
- *                    The exact two-stage technique used by the
- *                    WARPED pattern — feed an fBm output back into
- *                    the input coordinates of another fBm sample.
- *                  • Marsden & Tromba — "Vector Calculus"
- *                    (W. H. Freeman). Standard undergraduate text
- *                    for gradient / divergence / curl intuition and
- *                    the cross-derivative identity that makes
- *                    ∇·(∇×ψ) ≡ 0.
- *                  • Glenn Fiedler — "Fix Your Timestep":
- *                    https://gafferongames.com/post/fix_your_timestep/
- *                    Source of the fixed-timestep accumulator + dt
- *                    clamp used in main's frame loop.
- *                  • Paul Bourke — "Character representation of grey
- *                    scale images":
- *                    https://paulbourke.net/dataformats/asciiart/
- *                    The canonical density-to-glyph ramp reference;
- *                    motivates the '.', '*', '#' band picker used in
- *                    scene_draw.
- *                  • Wikipedia — "Vector field":
- *                    https://en.wikipedia.org/wiki/Vector_field
- *                    Accessible entry point for the conservative /
- *                    solenoidal / Helmholtz decomposition vocabulary.
- *                  • Compare ./perin_noise_flow_showcase.c —
- *                    gradient flow (divergent, particles pile up at
- *                    peaks) vs curl flow (divergence-free, particles
- *                    orbit forever) — the same noise viewed two ways.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Most procedural flow demos use the GRADIENT of a noise field to
- * push particles. That works but it has a major flaw: gradients
- * point UPHILL — particles converge into local maxima and pile up.
- * Curl noise fixes this by rotating the gradient 90° (∇×ψ), which
- * gives a velocity that swirls AROUND maxima instead of toward
- * them. The result is divergence-free flow: particles never
- * accumulate; they orbit eternally.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. INIT. Shuffle the Noise.perm[] table. For PARTICLES and WARPED,
- *     spawn N particles at random in-bounds positions.
- *  2. PER FRAME:
- *     a. Drift sim.field_time by FIELD_DRIFT × dt (animated patterns).
- *     b. Pattern-specific:
- *        • PARTICLES: for each particle, compute (vx, vy) via curl
- *          of potential(x, y, t); step by v · dt; respawn on OOB.
- *        • VECTOR: at every 4×2 cell, compute v, store an arrow
- *          glyph corresponding to v's direction.
- *        • POTENTIAL: at every cell, glow = potential(x, y, t)
- *          remapped to [0, 1].
- *        • CURL_MAG: at every cell, compute v, glow = |v| / max.
- *        • WARPED: like PARTICLES but use warped_potential(x, y, t).
- *     c. Render buf.glow / buf.glyph through the standard density-
- *        band pipeline in scene_draw.
- *  3. Reshuffle perm[] on demand when the user presses 'r' (manual
- *     reset) — gives a brand-new field. The supernova flash fires
- *     as a visual confirmation of the reset.
- *
- * KEY FORMULAS
- * ────────────
- *  Scalar potential              : ψ(x, y) = fbm(x · scale, y · scale + t)
- *  Curl (2-D)                    : v = (∂ψ/∂y, −∂ψ/∂x)
- *  Central finite difference     : ∂ψ/∂x ≈ (ψ(x+ε) − ψ(x−ε)) / (2ε)
- *  Particle update               : (x, y) ← (x, y) + v · dt
- *  Divergence (zero by design)   : ∇·v = ∂vx/∂x + ∂vy/∂y = 0
- *  Curl magnitude                : |v| = √(vx² + vy²)
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -246,57 +48,59 @@ enum {
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* For PARTICLES and WARPED. */
+    /* The dot pool, used by the PARTICLES and WARPED views. */
     MAX_PARTICLES     = 1024,
     N_PARTICLES_DEF   =  256,
 
+    /* How long a dot lives before respawning, in ticks (picked at random
+     * in this range so they don't all vanish at once). */
     AGE_MIN_TICKS     =  60,
     AGE_MAX_TICKS     = 360,
 
-    /* Speed: cells/sec along the curl velocity. */
+    /* How fast the dots move, in cells per second. */
     SPEED_MIN         =   1,
     SPEED_DEF         =   8,
     SPEED_MAX         =  64,
 
-    /* VECTOR pattern: arrow lattice spacing (in cells). 4x2 chosen
-     * because terminal cells are ~2x taller than wide, so this gives
-     * a roughly square arrow grid in pixel space. */
+    /* The VECTOR view draws one arrow every few cells, not on every
+     * cell. 4 wide by 2 tall because terminal characters are about
+     * twice as tall as they are wide, so this looks roughly square. */
     VECTOR_LATTICE_X  =   4,
     VECTOR_LATTICE_Y  =   2,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Color slots. The first two are the standard HUD colours. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_BAND_BASE    =   3,    /* PAIR_BAND_BASE..+3 = 4 palette colours */
+    PAIR_BAND_BASE    =   3,    /* this plus the next 3 are the 4 ramp colours */
     PAIR_FLASH        =   7,
     PAIR_SUPERNOVA    =   8,
 };
 
-/* Glow decays for particle trails (only). Static-field patterns
- * overwrite the buffer each frame so they don't decay. */
+/* How fast a particle's trail fades. Only the particle views fade;
+ * the others repaint every cell from scratch each frame. */
 #define TRAIL_GLOW_DECAY    0.6f
 #define SUPERNOVA_DECAY     4.0f
-#define GLOW_THRESHOLD      0.05f
+#define GLOW_THRESHOLD      0.05f   /* below this a cell is treated as blank */
 
-/* Noise scale and animation speed. */
+/* How zoomed-in the noise is, and how fast the field drifts over time. */
 #define NOISE_SCALE         0.05f
 #define FIELD_DRIFT         0.10f
 #define DRIFT_MULT_MIN      1
 #define DRIFT_MULT_DEF      1
 #define DRIFT_MULT_MAX      32
 
-/* Finite-difference step for ∂ψ/∂x and ∂ψ/∂y. ε = 0.5 noise-units
- * is a sweet spot — small enough to capture local curvature, large
- * enough that float jitter doesn't dominate. */
+/* How far apart we sample the field to measure which way it slopes.
+ * Too small and float rounding swamps the answer; too big and we miss
+ * local detail. 0.5 noise-units is the sweet spot. */
 #define CURL_EPS            0.5f
 
-/* fBm octaves for the potential. */
+/* How many layers of noise we stack for detail (each finer than the last). */
 #define FBM_OCTAVES         3
 
-/* WARPED pattern: warp magnitude. */
+/* How hard the WARPED view bends the field. */
 #define WARP_AMOUNT         3.0f
 
-/* Density thresholds for the ASCII glyph ramp. */
+/* Brightness cutoffs that pick which character a cell gets. */
 #define GLYPH_HIGH_THRESH   0.65f
 #define GLYPH_MID_THRESH    0.30f
 
@@ -325,64 +129,50 @@ static const char *pattern_name(Pattern p)
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* ── Pseudocode-named constants ─────────────────────────────────────── *
- * Magic numbers extracted from inline expressions and given names that
- * convey their algorithmic / physical / display role. Grouped here so
- * one glance at §1 lists every tunable in the program. */
+/* The rest of §1: every remaining tunable, named and gathered here so
+ * one look lists all the knobs. */
 
-/* §5 noise — domain-warp offsets. Two irrational-ish constants
- * decorrelate the qx / qy fbm samples in noise_warped_potential so
- * they evolve independently (Quilez, "Domain Warping"). The exact
- * values aren't magic; any non-zero, non-equal pair works. */
+/* The WARPED view samples the noise twice for its bending; these two
+ * unequal offsets keep the two samples from moving in lockstep. Any
+ * non-zero, unequal pair works. */
 #define WARP_OFFSET_X            5.2f
 #define WARP_OFFSET_Y            1.3f
 
-/* §7 particle dynamics — minimum velocity magnitude that counts as
- * "moving". Below this, sample_unit_velocity() skips normalisation
- * to avoid the 0/0 NaN trap. */
+/* If a particle's speed is below this, treat it as standing still and
+ * don't try to scale it to unit length — that would be dividing by zero. */
 #define VELOCITY_EPSILON         1e-6f
 
-/* §7 trail rendering — intensity deposited where a particle lands.
- * Saturates the cell to full brightness; trail decay handles fade. */
+/* Brightness a particle stamps onto the cell it lands on (full, then fades). */
 #define TRAIL_HIT_INTENSITY      1.0f
 
-/* §7 supernova — initial flash glow at reset, decays via SUPERNOVA_DECAY. */
+/* Brightness of the flash that fires on reset (then fades out). */
 #define SUPERNOVA_FLASH_INIT     1.0f
 
-/* §7 visualisation gains — applied before the band quantizer.
- * CURL_MAG_VISUAL_GAIN spreads the typical |∇×ψ| histogram across
- * [0, 1]; POTENTIAL_REMAP_{MID,RANGE} convert ψ ∈ [-1, 1] → [0, 1]
- * via g = ψ·RANGE + MID. */
+/* Brightness tweaks before a cell is binned into a colour band.
+ * The first stretches the field's strength to fill the bright range;
+ * the other two shift the heightmap from its -1..1 range into 0..1. */
 #define CURL_MAG_VISUAL_GAIN     1.5f
 #define POTENTIAL_REMAP_MID      0.5f
 #define POTENTIAL_REMAP_RANGE    0.5f
 
-/* §7 banding — quantize glow ∈ [0, 1) into N_BANDS bands. The scale
- * sits just under N_BANDS so glow == 1.0 doesn't overflow into band
- * N_BANDS (which has no colour pair). */
+/* We sort each cell's brightness into one of 4 colour bands. The scale
+ * is just under 4 so a brightness of exactly 1.0 still lands in band 3,
+ * not a non-existent band 4. */
 #define N_BANDS                  4
 #define BAND_QUANTIZE_SCALE      3.999f
 
-/* §6 arrow-direction classifier. Magnitudes below STATIONARY render
- * as '.'; the AXIS_DOMINANCE ratio separates axis-aligned arrows
- * ('>' '<' '^' 'v') from diagonals ('/' '\\'). */
+/* Picking an arrow from a direction: below STATIONARY it's a dot; the
+ * DOMINANCE ratio decides whether one axis wins (straight arrow) or
+ * the two are close (diagonal). */
 #define ARROW_STATIONARY_THRESH  0.05f
 #define ARROW_AXIS_DOMINANCE     2.0f
 
-/* §8 supernova twinkle — sparse-mask period. (x ^ y) & MASK == 0
- * lights one cell out of (MASK + 1), giving a star-field look. */
+/* Lights up one cell out of (MASK+1) during the reset flash, so it
+ * looks like scattered sparkles instead of a solid sheet. */
 #define SUPERNOVA_SPARSE_MASK    3
 
-/* §8 HUD layout. The TOP HUD (rows 0..HUD_TOP_ROWS-1) carries DATA
- * — state, params, legend. The BOTTOM HUD (row N-1) carries ACTIONS
- * — key bindings. The playable map fits between them.
- *
- *   row 0          : title + state bar (fps, Hz, state, speed)
- *   row 1          : pattern, theme, palette swatch, drift, eps, map
- *   row 2          : glyph legend (.:low *:mid #:high  arrows)
- *   row HUD_TOP..N-2: playable area
- *   row N-1        : keyboard action hint
- */
+/* HUD layout. The top 3 rows show info; the bottom row lists the keys;
+ * the field fills the space between. */
 #define HUD_TOP_ROWS             3
 #define HUD_BOTTOM_ROWS          1
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
@@ -392,35 +182,25 @@ static const char *pattern_name(Pattern p)
 #define HUD_PALETTE_LABEL_W      9
 #define HUD_PALETTE_SWATCH_N     4
 
-/* §9 main loop — frame-rate cap and dt safety clamp. The DT cap is
- * the standard spiral-of-death guard from Glenn Fiedler's "Fix Your
- * Timestep" — if the frame stalled for >100 ms, pretend it didn't,
- * so the sim doesn't try to catch up with hundreds of ticks. */
+/* If one frame stalls for more than 100 ms (laptop slept, etc.),
+ * cap the elapsed time so the sim doesn't frantically run hundreds of
+ * catch-up ticks. Standard guard from Glenn Fiedler's "Fix Your Timestep". */
 #define DT_MAX_NS                (100 * NS_PER_MS)
 #define FRAME_CAP_FPS            60
 
 /*
- * Theme — a complete colour palette for one visual style. Ten of
- * these live in themes[], cycled by t/T. The structure carries the
- * smallest data needed to recolour the entire program: four ramp
- * colours and one flash highlight.
+ * Theme — one colour scheme. Ten of these live in themes[], cycled
+ * with t/T. A cell's brightness picks one of four ramp colours (dark
+ * to bright); the flash colour is used for the reset sparkle. Holding
+ * exactly four colours keeps each theme a clean dark-to-light ramp.
  *
- * INTENT. Each cell in the render buffer holds a glow value 0..1;
- * that glow is quantised into a band 0..3, which indexes band[i] to
- * pick the foreground colour. The four-band split mirrors the four
- * glyph tiers in scene_draw ('.' / '*' / '#' / brightest). Keeping
- * exactly four colours forces theme authors to design the ramp as a
- * coherent low-to-high progression rather than a random scatter —
- * the same discipline as a Houdini ramp parameter.
- *
- * Colour numbers are xterm-256 indices (NOT RGB). When the terminal
- * exposes fewer than 256 colours, theme_apply() substitutes a fixed
- * 8-colour fallback so the demo still runs on legacy TTYs.
+ * The numbers are xterm-256 colour codes, not RGB. On a terminal with
+ * fewer than 256 colours, theme_apply() falls back to a fixed 8-colour set.
  */
 typedef struct {
-    const char *name;     /* short uppercase label shown in HUD             */
-    short       band[4];  /* 4 ramp colours: 0 = dim/low, 3 = bright/high   */
-    short       flash;    /* reset-flash colour (the supernova sparkle)     */
+    const char *name;     /* short label shown in the HUD                   */
+    short       band[4];  /* the ramp: band[0] darkest, band[3] brightest   */
+    short       flash;    /* colour of the reset sparkle                    */
 } Theme;
 
 #define N_THEMES 10
@@ -503,37 +283,25 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * Noise — the entire random-source state of the program. Wrapping
- * the permutation table in a struct means there is exactly one piece
- * of mutable noise data, it lives inside Scene, and every sampler
- * takes a `const Noise *` so reads are obviously stateless.
+ * Noise — the program's one source of randomness. It's a shuffled
+ * list of the numbers 0..255 that Perlin noise uses to look up which
+ * way the field tilts at each grid corner. Reshuffling it (the 'r'
+ * key) gives a brand-new field; otherwise the same field stays put and
+ * we animate it by slowly drifting through it (see SimState.field_time).
  *
- * ALGORITHM. Classic Perlin gradient noise. The permutation table is
- * a random shuffle of [0..255] used to hash 2-D lattice coordinates
- * into gradient indices. Re-shuffling perm[] gives a completely new
- * noise field — triggered on demand by 'r' (manual reset). The
- * sim runs the SAME field indefinitely otherwise; sim.field_time
- * drifts it through noise-space so it animates without looping.
- *
- * REFERENCE. Ken Perlin (2002) — "Improving Noise" SIGGRAPH paper,
- * which describes both the perm-table hashing scheme and the
- * 8-direction gradient table used by grad() below. The 1985 original
- * used a cubic fade with visible C¹-discontinuity artefacts at
- * integer lattice points; we use the 2002 quintic fade.
+ * This is classic Perlin gradient noise (Ken Perlin, "Improving
+ * Noise", SIGGRAPH 2002).
  */
 typedef struct {
-    /* Doubled permutation: perm[i + 256] == perm[i] for i in [0..255].
-     * The doubling lets noise_perlin2d() index perm[X+1] without a
-     * modulo. X is already masked to 0..255, so X+1 is at most 256 —
-     * safely inside the doubled buffer. Classic micro-opt from
-     * Perlin's reference Java code; saves one AND per sample,
-     * roughly 10 % of the inner-loop cost in profiling. */
+    /* The shuffled list, but stored twice back-to-back (512 entries,
+     * the second half copies the first). That lets the sampler look up
+     * perm[X+1] without worrying about running off the end. A small
+     * speed trick from Perlin's own reference code. */
     uint8_t perm[512];
 } Noise;
 
-/* fisher_yates_shuffle_256 — unbiased uniform random shuffle of
- * [0..255]. Textbook Fisher-Yates: walk from the end backwards,
- * swap each element with a random earlier element. O(n). */
+/* Shuffle 0..255 into a random order, every order equally likely
+ * (textbook Fisher-Yates). */
 static void fisher_yates_shuffle_256(uint8_t base[256])
 {
     for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
@@ -543,10 +311,8 @@ static void fisher_yates_shuffle_256(uint8_t base[256])
     }
 }
 
-/* mirror_perm_for_double_lookup — copy a 256-byte permutation into
- * a 512-byte buffer twice (upper half mirrors the lower). This
- * removes a modulo from noise_perlin2d when indexing perm[X+1].
- * See Noise struct doc for the full rationale and Perlin 2002. */
+/* Copy the shuffled list into the doubled buffer so the second half
+ * repeats the first. See the Noise struct for why. */
 static void mirror_perm_for_double_lookup(uint8_t perm[512],
                                           const uint8_t base[256])
 {
@@ -563,7 +329,8 @@ static void noise_shuffle(Noise *n)
     mirror_perm_for_double_lookup  (n->perm, base);
 }
 
-/* Perlin 2002 quintic fade: 6t⁵ − 15t⁴ + 10t³. C² at lattice edges. */
+/* An S-shaped easing curve. Bends a 0..1 value so the noise blends
+ * smoothly across cell edges instead of looking faceted. (Perlin 2002.) */
 static inline float fade(float t)
 {
     return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
@@ -571,9 +338,8 @@ static inline float fade(float t)
 
 static inline float lerp_f(float a, float b, float t) { return a + t * (b - a); }
 
-/* grad — one of 8 gradient·(x, y) dot products selected by the low
- * 3 bits of `hash`. Perlin 2002's table of 8 directions: ±1·u ± 2·v
- * where (u, v) ∈ {(x, y), (y, x)}. */
+/* Picks one of 8 fixed slope directions from the low bits of the hash
+ * and measures how much the point (x, y) leans along it. */
 static inline float grad(int hash, float x, float y)
 {
     int h = hash & 7;
@@ -583,45 +349,43 @@ static inline float grad(int hash, float x, float y)
 }
 
 /*
- * noise_perlin2d — sample classic Perlin gradient noise at (x, y).
- * Output range ≈ [-1, 1]. Five algorithmic steps:
+ * Reads the noise value at point (x, y); result lands roughly in -1..1.
+ * It finds the grid square the point sits in, reads a slope at each of
+ * the four corners, and smoothly blends them based on where the point
+ * falls inside the square.
  */
 static float noise_perlin2d(const Noise *n, float x, float y)
 {
-    /* (1) Find the integer lattice cell and the fractional offset
-     *     within it. The & 255 wrap makes the noise period 256. */
+    /* Which grid square, and where inside it (0..1). The & 255 makes
+     * the noise repeat every 256 units. */
     int X = (int)floorf(x) & 255;
     int Y = (int)floorf(y) & 255;
     x -= floorf(x);
     y -= floorf(y);
 
-    /* (2) Apply the quintic fade curve — smooths derivatives at
-     *     lattice boundaries to C². */
+    /* Soften the position so the blend across edges looks smooth. */
     float u = fade(x);
     float v = fade(y);
 
-    /* (3) Hash the 4 corner indices via the perm table. A and B are
-     *     row-hashes for the left and right edges of the cell. */
+    /* Look up which slope lives at each corner of the square. */
     int A = n->perm[X    ] + Y;
     int B = n->perm[X + 1] + Y;
 
-    /* (4) Compute gradient · (offset from corner to sample point) at
-     *     each of the 4 corners — the "directional weight" of each
-     *     corner pulled toward the sample. */
+    /* How much each corner's slope leans toward our point. */
     float n00 = grad(n->perm[A    ], x,        y       );  /* corner (0,0) */
     float n10 = grad(n->perm[B    ], x - 1.0f, y       );  /* corner (1,0) */
     float n01 = grad(n->perm[A + 1], x,        y - 1.0f);  /* corner (0,1) */
     float n11 = grad(n->perm[B + 1], x - 1.0f, y - 1.0f);  /* corner (1,1) */
 
-    /* (5) Bilinear interpolation using the faded weights. */
+    /* Blend the four corners into one value. */
     return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
 }
 
 /*
- * noise_fbm — 3-octave fractional Brownian motion. Output ≈ [-1, 1].
- * Each octave doubles frequency (lacunarity = 2) and halves amplitude
- * (persistence = 0.5); total is normalised by Σamp so the output
- * scale is independent of FBM_OCTAVES. See Ebert et al., fBm chapter.
+ * Stacks several noise layers, each one finer and fainter than the
+ * last, then averages them. This adds small-scale detail on top of the
+ * broad shape so the field looks natural rather than blobby. Result
+ * still lands roughly in -1..1. (Ebert et al., "Texturing & Modeling".)
  */
 static float noise_fbm(const Noise *n, float x, float y)
 {
@@ -632,27 +396,22 @@ static float noise_fbm(const Noise *n, float x, float y)
     for (int o = 0; o < FBM_OCTAVES; o++) {
         total   += amp * noise_perlin2d(n, x * freq, y * freq);
         max_amp += amp;
-        amp     *= 0.5f;          /* persistence */
-        freq    *= 2.0f;          /* lacunarity  */
+        amp     *= 0.5f;          /* next layer is half as strong */
+        freq    *= 2.0f;          /* and twice as fine            */
     }
-    return total / max_amp;
+    return total / max_amp;       /* keep the result in -1..1 no matter how many layers */
 }
 
-/*
- * noise_potential — the scalar field ψ(x, y, t) whose curl drives
- * the visualisation. Plain fBm with time drifted into the y-axis.
- */
+/* The smooth height field whose tilt we'll turn into the flow. Drifting
+ * time into the y coordinate is what makes the field slowly evolve. */
 static inline float noise_potential(const Noise *n, float x, float y, float t)
 {
     return noise_fbm(n, x, y + t);
 }
 
-/*
- * noise_warped_potential — domain-warped ψ. One fBm sample (qx, qy)
- * perturbs the input coordinates of the final fBm sample.
- * WARP_OFFSET_X/Y decorrelate the two warp channels. Inigo Quilez's
- * technique; produces a more eddy-rich field than plain ψ.
- */
+/* A wobblier version of the height field: we use one noise sample to
+ * nudge where we read the next one, which bends the field into more
+ * eddies. (Inigo Quilez, "Domain Warping".) */
 static float noise_warped_potential(const Noise *n, float x, float y, float t)
 {
     float qx = noise_fbm(n, x,                  y                 + t);
@@ -661,11 +420,8 @@ static float noise_warped_potential(const Noise *n, float x, float y, float t)
                         y + WARP_AMOUNT * qy + t);
 }
 
-/*
- * psi_at — sample the chosen scalar potential at (x, y, t). The
- * `warp` flag selects plain vs domain-warped; this keeps
- * noise_curl_at agnostic to which one is in use.
- */
+/* Reads the height field, using the plain or warped version depending
+ * on the flag, so the flow code below doesn't have to care which. */
 static inline float psi_at(const Noise *n, float x, float y, float t, bool warp)
 {
     return warp ? noise_warped_potential(n, x, y, t)
@@ -673,29 +429,25 @@ static inline float psi_at(const Noise *n, float x, float y, float t, bool warp)
 }
 
 /*
- * noise_curl_at — central-difference 2-D curl of ψ at (x, y, t).
- *
- *   v = (∂ψ/∂y, -∂ψ/∂x)        ← curl-of-scalar identity (Bridson 2007)
- *   ∂ψ/∂y ≈ (ψ(x, y+ε) − ψ(x, y−ε)) / (2ε)
- *   ∂ψ/∂x ≈ (ψ(x+ε, y) − ψ(x−ε, y)) / (2ε)
- *
- * The resulting v is divergence-free by construction:
- *   ∇·v = ∂vx/∂x + ∂vy/∂y = ∂²ψ/∂x∂y − ∂²ψ/∂y∂x = 0.
+ * The heart of curl noise: turn the height field into a flow direction.
+ * We measure which way the field slopes (by comparing nearby samples),
+ * then rotate that slope a quarter turn. Flow that circles around peaks
+ * instead of climbing them never lets particles pile up. (Bridson 2007.)
  */
 static void noise_curl_at(const Noise *n, float x, float y, float t, bool warp,
                           float *out_vx, float *out_vy)
 {
-    /* Four ψ samples — the 4 neighbours of (x, y) at offset ε. */
+    /* Read the field just to each side of the point. */
     float psi_yp = psi_at(n, x,            y + CURL_EPS, t, warp);
     float psi_ym = psi_at(n, x,            y - CURL_EPS, t, warp);
     float psi_xp = psi_at(n, x + CURL_EPS, y,            t, warp);
     float psi_xm = psi_at(n, x - CURL_EPS, y,            t, warp);
 
-    /* Central-difference partials. */
+    /* How steeply the field rises going up vs. going right. */
     float dpsi_dy = (psi_yp - psi_ym) / (2.0f * CURL_EPS);
     float dpsi_dx = (psi_xp - psi_xm) / (2.0f * CURL_EPS);
 
-    /* Curl rotation: ∇ψ rotated -90° = (∂ψ/∂y, -∂ψ/∂x). */
+    /* Rotate that slope a quarter turn to get the flow direction. */
     *out_vx =  dpsi_dy;
     *out_vy = -dpsi_dx;
 }
@@ -709,37 +461,29 @@ static inline float clampf(float v, float lo, float hi)
     return v < lo ? lo : v > hi ? hi : v;
 }
 
-/*
- * quantize_glow_to_band — map glow ∈ [0, 1) → band 0..N_BANDS-1.
- * BAND_QUANTIZE_SCALE is N_BANDS − ε so glow == 1.0 doesn't overflow
- * into band N_BANDS (which has no colour pair). The trailing mask
- * is defence in depth against any rounding surprises.
- */
+/* Turn a brightness (0..1) into one of the 4 colour bands. The mask
+ * is a safety net so a stray value can't pick a band that doesn't exist. */
 static inline int quantize_glow_to_band(float glow)
 {
     return (int)(glow * BAND_QUANTIZE_SCALE) & (N_BANDS - 1);
 }
 
-/*
- * arrow_for — pick an arrow glyph from a velocity (vx, vy).
- * Three-stage classifier:
- *   1. STATIONARY  — both components near zero → '.'
- *   2. AXIS-ALIGNED — one component dominates by AXIS_DOMINANCE ratio
- *   3. DIAGONAL    — same-sign components → '\\'; opposite-sign → '/'
- */
+/* Pick the arrow character that best matches a flow direction: a dot
+ * if it's barely moving, a straight arrow if it's mostly horizontal or
+ * vertical, otherwise a diagonal slash. */
 static char arrow_for(float vx, float vy)
 {
     float ax = fabsf(vx), ay = fabsf(vy);
 
-    /* (1) Both axes near zero → render as stationary dot. */
+    /* Barely moving. */
     if (ax < ARROW_STATIONARY_THRESH && ay < ARROW_STATIONARY_THRESH)
         return '.';
 
-    /* (2) Axis-aligned: dominance ratio decides which axis wins. */
+    /* One direction clearly dominates. */
     if (ax > ARROW_AXIS_DOMINANCE * ay) return vx > 0.0f ? '>' : '<';
     if (ay > ARROW_AXIS_DOMINANCE * ax) return vy > 0.0f ? 'v' : '^';
 
-    /* (3) Diagonal: sign of vx·vy distinguishes the two diagonals. */
+    /* Diagonal: which way depends on whether the two parts agree in sign. */
     return ((vx * vy) > 0.0f) ? '\\' : '/';
 }
 
@@ -747,63 +491,42 @@ static char arrow_for(float vx, float vy)
 /* §7  scene                                                              */
 /* ===================================================================== */
 
-/*
- * The scene is built out of six small structs. Each owns ONE concern,
- * and Scene composes them. Splitting concerns into clearly-typed
- * sub-structs makes function signatures self-describing: any function
- * that takes `const Grid *` clearly cannot mutate buffers; any
- * function that takes `RenderBuffers *` clearly does not sample
- * noise; and so on.
- */
+/* The scene is six small structs, each in charge of one thing, bundled
+ * together by the Scene struct at the bottom. Splitting them this way
+ * keeps each function's job obvious from what it's handed. */
 
 /*
- * Particle — one walker advected by the curl field. Used by the
- * PARTICLES and WARPED patterns; the other three (VECTOR, POTENTIAL,
- * CURL_MAG) leave the pool dormant.
+ * Particle — one dot carried along by the flow. Only the PARTICLES and
+ * WARPED views use these; the other three leave them sitting idle.
  *
- * INTENT. The walker is "massless": its position is integrated
- * directly from the sampled velocity, with no momentum term. This
- * matches Bridson 2007 §3 — particles trace streamlines of v, not
- * acceleration-trajectories of a force field. The simpler
- * integration is also why divergence-freeness of v alone guarantees
- * no clumping: with momentum, particles could still bunch via
- * inertia; here, they cannot bunch at all.
+ * A particle has no momentum: each step it just moves in the flow's
+ * current direction. That's the whole point — with no inertia and a
+ * flow that can't pile things up, the dots can never bunch together.
+ * (Bridson 2007, particle update.)
  *
- * Each particle has a finite lifetime so the visualisation stays
- * lively — if particles lived forever they would gradually saturate
- * the orbits v happens to favour and the rest of the field would
- * empty out. Random max_age staggers respawns so the spatial
- * distribution stays uniform over time.
- *
- * REFERENCE. Bridson, Houriham & Nordenstam (2007) — "Curl-Noise for
- * Procedural Fluid Flow", §3 (particle update).
+ * Each one also lives for a limited time and then respawns elsewhere,
+ * so the dots keep spreading around the field instead of all draining
+ * into the same few loops. The random lifetime staggers the respawns.
  */
 typedef struct {
-    float x, y;       /* position in cell units (continuous floats)         */
-    int   color_idx;  /* 0..N_BANDS-1 — selects band from RenderBuffers.color */
-    int   age;        /* ticks since spawn                                  */
-    int   max_age;    /* respawn when age ≥ max_age (also on OOB)           */
+    float x, y;       /* position, in grid cells (fractional)               */
+    int   color_idx;  /* which of the 4 ramp colours this dot uses          */
+    int   age;        /* how many ticks it's been alive                     */
+    int   max_age;    /* respawn once age reaches this (or if it leaves the grid) */
 } Particle;
 
 /*
- * Grid — map geometry. Pure data: no buffers, no state, no allocation.
- * Lives at the top of Scene because every layer (noise sampling,
- * particle bounds-checks, screen centring) needs the dimensions.
+ * Grid — just the map's size. No pixels, no state. It sits first
+ * because everything else needs the dimensions.
  *
- * INDEXING. Row-major: cell (x, y) → y·w + x. This matches the
- * memory layout of RenderBuffers (single flat array of CELLS_MAX
- * cells), so the y-outer / x-inner loop order in scene_draw and
- * scene_update_static is cache-friendly — each row of the grid is
- * a contiguous run of bytes/floats in memory.
- *
- * INVARIANT. w · h ≤ CELLS_MAX always holds; app_pick_map_size()
- * clamps to MAP_W_MAX × MAP_H_MAX = 200 × 56 = 11200 cells, which is
- * what the RenderBuffers arrays are statically sized for. The clamp
- * is enforced once per resize; downstream code may assume it.
+ * Cells are stored row by row, so cell (x, y) lives at y*w + x. Looping
+ * y on the outside and x on the inside therefore walks straight through
+ * memory, which is fast. Width times height is always within CELLS_MAX
+ * (app_pick_map_size clamps it), so the fixed-size buffers below always fit.
  */
 typedef struct {
-    int w, h;         /* current map width / height in cells              */
-    int total_cells;  /* = w · h, cached so hot loops skip the multiply   */
+    int w, h;         /* map width / height in cells                      */
+    int total_cells;  /* w * h, kept around so hot loops skip the multiply */
 } Grid;
 
 static inline int grid_idx(const Grid *g, int x, int y) { return y * g->w + x; }
@@ -813,51 +536,28 @@ static inline bool grid_in_bounds(const Grid *g, int x, int y)
 }
 
 /*
- * RenderBuffers — the per-cell raster output. Three parallel arrays
- * indexed by grid_idx(g, x, y):
- *   glow   : intensity 0..1 — drives the density glyph + colour band
- *   color  : palette index 0..3
- *   glyph  : 0 = use the density glyph; non-zero OVERRIDES it (used
- *            by VECTOR to render arrow characters directly)
+ * RenderBuffers — what each cell should show. This is the only thing
+ * that passes from the simulation to the drawing code: the patterns
+ * fill these arrays, and the screen reads them and nothing else. That
+ * clean handoff means the drawing could change without touching any
+ * pattern. Three separate arrays (rather than one array of structs) so
+ * the screen can scan the brightness array tightly, and so one array
+ * can be wiped without disturbing the others.
  *
- * The screen layer reads ONLY these three arrays. Patterns write
- * into them. That is the entire render contract — no other channel
- * of communication between simulation and display. Splitting render
- * output from simulation state is the classic graphics-pipeline
- * decoupling (Foley & van Dam, ch. 2): the sim becomes display-
- * agnostic, and the display can be retargeted to a different glyph
- * ramp without touching pattern code.
- *
- * SoA RATIONALE. Three separate arrays (struct-of-arrays) rather
- * than one array of cell-structs because (a) the screen layer reads
- * glow far more often than color/glyph, so keeping it dense improves
- * cache use, and (b) clearing one channel without touching the
- * others is trivial — see the VECTOR wipe in scene_update_static().
- *
- * REFERENCE. The density-to-glyph mapping in scene_draw follows Paul
- * Bourke's ASCII grey-scale ramp; the band cutoffs GLYPH_MID_THRESH
- * and GLYPH_HIGH_THRESH are tuned empirically against his published
- * gradient.
+ * The brightness-to-character mapping follows Paul Bourke's ASCII
+ * grey-scale ramp.
  */
 typedef struct {
-    /* Per-cell intensity 0..1. Particle patterns deposit 1.0 and
-     * decay exponentially via expf(-TRAIL_GLOW_DECAY * dt); static
-     * patterns overwrite each frame with no decay. Below
-     * GLOW_THRESHOLD (0.05) the cell renders as blank. */
+    /* Brightness, 0..1. Particle trails stamp 1.0 and fade; the other
+     * views just overwrite this every frame. Below GLOW_THRESHOLD the
+     * cell shows nothing. */
     float   glow [CELLS_MAX];
 
-    /* Per-cell palette band 0..N_BANDS-1. Indexes into the current
-     * Theme's band[] via PAIR_BAND_BASE + color. Masked with
-     * (N_BANDS - 1) in the draw loop so any out-of-range value cannot
-     * pick a wrong pair — defence in depth, since color is uint8_t. */
+    /* Which of the 4 ramp colours this cell uses. */
     uint8_t color[CELLS_MAX];
 
-    /* Optional glyph override. 0 means "use the density-band glyph"
-     * (the default for particle trails). Non-zero replaces it —
-     * VECTOR stores arrow characters here ('>','<','^','v','/','\\'),
-     * letting one pattern render directional symbols while every
-     * other pattern stays on the density ramp. Stored as char so the
-     * override can carry any printable ASCII byte. */
+    /* A character to force, or 0 to let brightness pick one. The VECTOR
+     * view puts its arrow characters here; everything else leaves it 0. */
     char    glyph[CELLS_MAX];
 } RenderBuffers;
 
@@ -871,141 +571,74 @@ static void buffers_clear(RenderBuffers *b, int n)
 }
 
 /*
- * Particles — fixed-size pool of walkers. Standard pool-allocator
- * pattern: a max-sized array plus an active count `n`, so spawn /
- * respawn never touches the heap. Only pool[0..n-1] is alive; the
- * rest is unused storage held in reserve.
- *
- * SIZING. MAX_PARTICLES (1024) is the static upper bound;
- * N_PARTICLES_DEF (256) is what scene_reset() activates. 256 is
- * enough to populate the visible vortices of a 200×56 grid without
- * making any one streamline overwhelmingly dense. Higher counts
- * produce a smoke-like haze where individual orbits become hard to
- * read; lower counts make the field look starved.
- *
- * CACHE. Pool size matters for performance too: 1024 Particle structs
- * × ~20 B each ≈ 20 KB, easily L1-resident on any modern CPU. The
- * per-frame "step every particle" loop touches one tight contiguous
- * memory region instead of scattering through the heap.
+ * Particles — a fixed block of dots, of which the first n are alive.
+ * Pre-allocating the whole block means spawning and respawning never
+ * has to ask the system for memory. The default 256 is enough to fill
+ * the visible swirls without turning into a solid haze.
  */
 typedef struct {
-    Particle pool[MAX_PARTICLES];  /* storage; only [0..n-1] is alive */
-    int      n;                    /* active count, ≤ MAX_PARTICLES   */
+    Particle pool[MAX_PARTICLES];  /* only the first n are in use */
+    int      n;                    /* how many are alive          */
 } Particles;
 
 /*
- * SimState — values that evolve per tick under the simulation's own
- * control. Separated from Controls (keyboard-driven knobs) so it is
- * obvious at a glance what scene_tick mutates vs. what the user
- * does. Two small fields, each playing a distinct role:
- *
- *   field_time       → animates the noise field by drifting the
- *                      y-axis sample coordinate. Without it the
- *                      potential would be static and particles would
- *                      trace the same orbits forever; with it the
- *                      vortex structure slowly mutates without
- *                      changing the underlying perm[].
- *   supernova_glow_t → cosmetic flourish triggered by scene_reset()
- *                      (manual 'r' or first start). Decays exponen-
- *                      tially via SUPERNOVA_DECAY so it vanishes
- *                      within ~1 s.
+ * SimState — the parts of the world that the simulation moves on its
+ * own each tick, kept apart from the user's knobs (Controls) so it's
+ * clear what the sim changes versus what the keyboard changes.
  */
 typedef struct {
-    /* Time offset added to the noise y-coordinate before sampling.
-     * Increment per tick is FIELD_DRIFT × drift_mult × dt. Units are
-     * "noise-units" — the same scale as fx, fy in scene_update_static.
-     * Cleared to 0 by scene_reset(); otherwise grows monotonically. */
+    /* How far we've drifted through the noise. Grows a little each tick,
+     * which slowly reshapes the swirls without picking a new field. Reset
+     * back to 0 by scene_reset(). */
     float field_time;
 
-    /* Envelope for the post-reset sparkle. Set to SUPERNOVA_FLASH_INIT
-     * on reset, decays per tick by expf(-SUPERNOVA_DECAY * dt). While
-     * the envelope is above GLOW_THRESHOLD, scene_draw paints a sparse
-     * '*' field masked by (x ^ y) & SUPERNOVA_SPARSE_MASK so the flash
-     * looks like a random twinkle rather than a uniform blanket. */
+    /* Brightness of the reset sparkle. Set high on reset, fades to
+     * nothing within about a second. While it's lit, the screen shows
+     * scattered '*' sparkles. */
     float supernova_glow_t;
 } SimState;
 
 /*
- * Controls — user-facing knobs. Mutated by app_handle_key(), read by
- * scene_tick() and screen_draw(). Grouping them makes the keyboard
- * handler trivial: `Controls *c = &scene.ctrl;` once at the top of
- * the function, then every key case is a one-line mutation on `c`.
- *
- * The split between SimState and Controls is the "model vs. user
- * intent" line common to interactive programs: SimState answers
- * "where is the simulation right now"; Controls answers "what has
- * the user asked for". scene_tick reads Controls to decide what to
- * do; it never writes to it. The keyboard handler writes to
- * Controls; it never writes to SimState. This one-way dependency
- * keeps the code linear and trivially thread-safe should the demo
- * ever be split into input + sim threads.
+ * Controls — the user's knobs. The keyboard handler writes these; the
+ * simulation only reads them. Keeping them apart from SimState draws a
+ * clean line: SimState is where things are, Controls is what the user
+ * asked for.
  */
 typedef struct {
-    /* Gate for scene_tick: when true the field is frozen, but the
-     * render loop continues so the HUD stays responsive and the user
-     * can still cycle themes or patterns. */
+    /* Frozen? The sim stops but the screen keeps redrawing, so the HUD
+     * stays live and you can still switch themes or views while paused. */
     bool    paused;
 
-    /* Particle advection scale, cells/sec. Multiplied into v·dt in
-     * particle_step_curl. Doubled by '+', halved by '-', clamped to
-     * [SPEED_MIN, SPEED_MAX] = [1, 64]. The doubling step (rather
-     * than linear ±1) gives a logarithmic feel — perceptually each
-     * press is the "same size change" regardless of current speed. */
+    /* How fast the dots move, in cells per second. '+' and '-' double
+     * and halve it (doubling feels like an even step at any speed). */
     int     speed;
 
-    /* Multiplier on FIELD_DRIFT — speeds / slows the noise animation
-     * independently of particle speed, though +/- changes both in
-     * lockstep for convenience. Clamped to [DRIFT_MULT_MIN,
-     * DRIFT_MULT_MAX] = [1, 32]. */
+    /* How fast the field itself drifts, on top of the particle speed.
+     * '+' / '-' nudge this alongside speed. */
     int     drift_mult;
 
-    int     current_theme;     /* index into themes[N_THEMES]      */
-    Pattern current_pattern;   /* the active visualisation         */
+    int     current_theme;     /* index into themes[]      */
+    Pattern current_pattern;   /* which view is showing     */
 
-    /* One-tick lag of current_pattern. scene_tick uses the
-     * difference (prev != current) as an edge-detector to wipe the
-     * RenderBuffers when the user switches patterns — otherwise
-     * particle trails would ghost into VECTOR's lattice or
-     * POTENTIAL's heightmap. Standard pattern-edge technique. */
+    /* Last frame's view. Comparing it to current_pattern tells us the
+     * moment the user switched, so we can wipe the screen clean —
+     * otherwise old trails would bleed into the new view. */
     Pattern prev_pattern;
 } Controls;
 
 /*
- * Scene — the umbrella context. Reading this struct top-to-bottom is
- * meant to be the fastest way to understand the program:
- *   grid       → where things live            (geometry, no state)
- *   noise      → what the field is sampled from (perm table)
- *   buf        → what gets drawn               (render output)
- *   particles  → moving agents                 (PARTICLES/WARPED)
- *   sim        → animation state               (drift, supernova fade)
- *   ctrl       → user knobs                    (pattern, speed, …)
- *
- * ORDERING. The field order is deliberate: each sub-struct depends
- * only on those declared above it. grid is leaf-level data; noise is
- * independent of grid; buf is sized by CELLS_MAX (an upper bound on
- * grid); particles need grid bounds; sim mutates noise & buf via
- * scene_tick; ctrl decides which sim path runs. A reader scanning
- * top-down meets every concept before it is used.
- *
- * COMPOSITION. There is no Scene-wide invariant that crosses sub-
- * struct boundaries — each sub-struct can be reasoned about (and
- * tested) in isolation. The only function that sees all of Scene at
- * once is scene_tick(). This is composition over inheritance: no
- * inheritance hierarchies, no virtual dispatch — just six clearly
- * named structs glued together by direct field access.
- *
- * REFERENCE. Mike Acton — "Data-Oriented Design and C++" (CppCon
- * 2014) for the broader argument that good struct layout IS good
- * code; Robert Nystrom — "Game Programming Patterns" ch. "Component"
- * for the composition-over-inheritance variant used here.
+ * Scene — everything, in one place. The six pieces are listed in the
+ * order they depend on each other, so reading top to bottom you meet
+ * each idea before it's used: the map, the noise it samples, the cells
+ * it draws, the dots that move, the animation state, and the user's knobs.
  */
 typedef struct {
-    Grid          grid;       /* immutable per frame (only resize changes it) */
-    Noise         noise;      /* mutated only by scene_reset (shuffle)        */
-    RenderBuffers buf;        /* written by patterns, read by scene_draw      */
-    Particles     particles;  /* dormant unless ctrl.current_pattern uses them */
-    SimState      sim;        /* mutated only by scene_tick                   */
-    Controls      ctrl;       /* mutated only by app_handle_key               */
+    Grid          grid;       /* the map size; only a resize changes it       */
+    Noise         noise;      /* the field; only a reset reshuffles it        */
+    RenderBuffers buf;        /* what to draw; patterns fill it, screen reads it */
+    Particles     particles;  /* the dots; idle unless a particle view is on  */
+    SimState      sim;        /* animation state; only scene_tick changes it  */
+    Controls      ctrl;       /* user knobs; only the keyboard changes them   */
 } Scene;
 
 static void particle_spawn(Particle *p, const Grid *g)
@@ -1017,22 +650,15 @@ static void particle_spawn(Particle *p, const Grid *g)
     p->max_age   = AGE_MIN_TICKS + rand() % (AGE_MAX_TICKS - AGE_MIN_TICKS);
 }
 
-/* ── particle pipeline ────────────────────────────────────────────── *
- * particle_step_curl is the per-particle pseudocode:
- *
- *     sample unit velocity from the curl field
- *     advect by v·dt (forward Euler)
- *     deposit a trail hit at the new cell
- *     respawn if the particle is expired (age or OOB)
- *
- * Each step is one named call below. */
+/* Moving one dot: read which way the flow points here, step along it,
+ * leave a mark, and respawn if it's too old or has left the grid. The
+ * four lines of particle_step_curl below are exactly those four steps. */
 
-/* sample_unit_velocity — read the curl of ψ at the particle's
- * noise-space coordinates and normalise to unit length. We separate
- * direction (here) from magnitude (provided by ctrl.speed during
- * advection) so the particle moves uniformly regardless of where in
- * the field |∇×ψ| happens to be large or small. Below VELOCITY_EPSILON
- * we skip normalisation to avoid 0/0 → NaN. */
+/* Read the flow direction at the dot's spot and shrink it to a unit
+ * length. We strip out the strength here so every dot moves at the same
+ * pace (the speed knob sets that) no matter how strong the flow is
+ * locally. Skip the shrink if it's basically still, to avoid dividing
+ * by zero. */
 static void sample_unit_velocity(const Scene *s, float px, float py, bool warp,
                                   float *out_vx, float *out_vy)
 {
@@ -1046,10 +672,8 @@ static void sample_unit_velocity(const Scene *s, float px, float py, bool warp,
     }
 }
 
-/* advect_particle_euler — forward-Euler integration step along v.
- * (x, y) ← (x, y) + v · speed · dt. Massless advection — no inertia
- * term. Streamlines, not trajectories. See Particle struct doc for
- * why this is the right integrator for divergence-free fields. */
+/* Nudge the dot along the flow by one frame's worth of motion, and age
+ * it. No momentum — it always goes wherever the flow currently points. */
 static void advect_particle_euler(Particle *p, float vx, float vy,
                                    float dt, int speed)
 {
@@ -1058,21 +682,19 @@ static void advect_particle_euler(Particle *p, float vx, float vy,
     p->age++;
 }
 
-/* deposit_trail_hit — paint the particle's current cell at full
- * intensity. Overwrites (not blends) the cell's previous glow; the
- * trail visual effect comes from neighbouring cells decaying via
- * expf(-TRAIL_GLOW_DECAY · dt) between hits. */
+/* Light up the cell the dot is sitting on at full brightness. The
+ * trail you see is the older cells fading out behind it. */
 static void deposit_trail_hit(Scene *s, int cx, int cy, int color_idx)
 {
     if (!grid_in_bounds(&s->grid, cx, cy)) return;
     int idx = grid_idx(&s->grid, cx, cy);
     s->buf.glow [idx] = TRAIL_HIT_INTENSITY;
     s->buf.color[idx] = (uint8_t)color_idx;
-    s->buf.glyph[idx] = 0;        /* fall back to density glyph */
+    s->buf.glyph[idx] = 0;        /* let brightness pick the character */
 }
 
-/* particle_is_expired — has the walker overstayed its life or
- * walked off the grid? Either triggers a respawn. */
+/* Has this dot run out its life or wandered off the grid? Either way
+ * it's due for a respawn. */
 static bool particle_is_expired(const Particle *p, const Grid *g)
 {
     return p->age >= p->max_age
@@ -1090,20 +712,20 @@ static void particle_step_curl(Particle *p, Scene *s, float dt, bool warp)
         particle_spawn   (p, &s->grid);
 }
 
-/* ── static-field pattern pipeline ────────────────────────────────── *
- * Each non-particle pattern (VECTOR, POTENTIAL, CURL_MAG) computes
- * one CellPaint per cell. scene_update_static loops over the grid
- * and dispatches to the right per-cell function. */
+/* The three non-particle views (VECTOR, POTENTIAL, CURL_MAG) figure
+ * out what each cell should look like one cell at a time;
+ * scene_update_static walks the grid and calls the right one. */
 
-/* CellPaint — the bundle a pattern hands to write_cell(). */
+/* What one cell should look like: how bright, which colour, and which
+ * character (or 0 to let brightness decide). */
 typedef struct {
-    float glow;   /* 0..1 intensity                       */
-    int   band;   /* 0..N_BANDS-1 colour-ramp index       */
-    char  glyph;  /* 0 = use density glyph, else override */
+    float glow;   /* brightness, 0..1            */
+    int   band;   /* which ramp colour           */
+    char  glyph;  /* forced character, or 0      */
 } CellPaint;
 
-/* compute_potential_cell — POTENTIAL pattern. Render ψ as a
- * heightmap: g = ψ·RANGE + MID, which remaps [-1, 1] → [0, 1]. */
+/* POTENTIAL view: show the field's height directly as brightness. The
+ * remap shifts the height from its -1..1 range up into 0..1. */
 static CellPaint compute_potential_cell(const Noise *n, float fx, float fy, float t)
 {
     float psi  = noise_potential(n, fx, fy, t);
@@ -1113,9 +735,9 @@ static CellPaint compute_potential_cell(const Noise *n, float fx, float fy, floa
                         .glyph = 0 };
 }
 
-/* compute_curl_magnitude_cell — CURL_MAG pattern. Render |∇×ψ| as
- * density: bright at vortex cores, dim in laminar regions. The
- * visual gain spreads the typical |v| histogram across [0, 1]. */
+/* CURL_MAG view: brightness = how strongly the flow is moving here, so
+ * the whirlpool centres glow and the calm areas stay dim. The gain
+ * brightens it up to use the full range. */
 static CellPaint compute_curl_magnitude_cell(const Noise *n, float fx, float fy, float t)
 {
     float vx, vy;
@@ -1127,9 +749,8 @@ static CellPaint compute_curl_magnitude_cell(const Noise *n, float fx, float fy,
                         .glyph = 0 };
 }
 
-/* compute_vector_arrow_cell — VECTOR pattern. Sample the curl, pick
- * an arrow glyph aligned with the local direction, and use |v| as
- * the brightness so weak parts of the field render dim. */
+/* VECTOR view: an arrow pointing the way the flow goes here, with the
+ * flow's strength as its brightness so weak spots stay faint. */
 static CellPaint compute_vector_arrow_cell(const Noise *n, float fx, float fy, float t)
 {
     float vx, vy;
@@ -1141,18 +762,16 @@ static CellPaint compute_vector_arrow_cell(const Noise *n, float fx, float fy, f
                         .glyph = arrow_for(vx, vy) };
 }
 
-/* is_vector_lattice_point — VECTOR only paints arrows at every
- * (VECTOR_LATTICE_X × VECTOR_LATTICE_Y) cell; the rest stay blank
- * for legibility. */
+/* Is this one of the spaced-out cells that gets an arrow? The rest are
+ * left blank so the arrows don't crowd each other. */
 static inline bool is_vector_lattice_point(int x, int y)
 {
     return (x % VECTOR_LATTICE_X) == 0
         && (y % VECTOR_LATTICE_Y) == 0;
 }
 
-/* wipe_vector_layer — clear glow + glyph but leave color alone.
- * VECTOR needs a clean canvas each frame because only lattice
- * points get painted; everything else must read as blank. */
+/* Clear the field to blank before drawing arrows, since only a few
+ * cells get one and the rest must read as empty. */
 static void wipe_vector_layer(RenderBuffers *b, int n)
 {
     for (int i = 0; i < n; i++) {
@@ -1161,7 +780,6 @@ static void wipe_vector_layer(RenderBuffers *b, int n)
     }
 }
 
-/* write_cell — commit a CellPaint into the render buffer at idx. */
 static inline void write_cell(RenderBuffers *b, int idx, CellPaint p)
 {
     b->glow [idx] = p.glow;
@@ -1169,11 +787,8 @@ static inline void write_cell(RenderBuffers *b, int idx, CellPaint p)
     b->glyph[idx] = (uint8_t) p.glyph;
 }
 
-/*
- * scene_update_static — driver. For non-particle patterns (VECTOR,
- * POTENTIAL, CURL_MAG), recompute every cell each frame. Writes
- * into s->buf; reads from s->noise and s->sim.field_time.
- */
+/* Redraw the whole field for one of the non-particle views: walk every
+ * cell, work out its look, and store it. */
 static void scene_update_static(Scene *s, Pattern pat)
 {
     const Grid    *g = &s->grid;
@@ -1249,16 +864,10 @@ static void scene_init(Scene *s, int w, int h)
     scene_reset(s, w, h);
 }
 
-/* ── tick pipeline ────────────────────────────────────────────────── *
- * scene_tick is the per-frame pseudocode:
- *
- *     if paused: stop.
- *     handle any pending pattern switch (wipe buffers).
- *     advance time-dependent envelopes (supernova fade, field drift).
- *     simulate the active pattern (particle path or static path).
- *
- * Each line below is one named call. There is NO automatic perm
- * reshuffle — the user drives that via 'r' / scene_reset(). */
+/* One simulation step. If paused, do nothing. Otherwise: clear the
+ * screen if the user just switched views, fade the reset sparkle, drift
+ * the field, and run whichever view is active. The field never reshuffles
+ * on its own — only the 'r' key does that. */
 
 static void detect_pattern_switch_and_wipe(Scene *s)
 {
@@ -1319,17 +928,12 @@ static void scene_tick(Scene *s, float dt)
 /* §8  screen                                                             */
 /* ===================================================================== */
 
-/*
- * Screen — terminal dimensions cached after the last successful
- * getmaxyx(). Refreshed on SIGWINCH via screen_resize(). Kept tiny
- * because the rest of ncurses' state lives implicitly in stdscr; we
- * only need the dimensions to position HUD elements and centre the
- * map. Anything else (colour pairs, current attribute, cursor pos)
- * is owned by ncurses internals, not by us.
- */
+/* Screen — just the terminal's current width and height, re-read
+ * whenever the window resizes. We use it to centre the map and place
+ * the HUD; ncurses tracks everything else. */
 typedef struct {
-    int cols;   /* terminal width  in character cells */
-    int rows;   /* terminal height in character cells */
+    int cols;   /* terminal width  in characters */
+    int rows;   /* terminal height in characters */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -1352,30 +956,21 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* ── scene_draw pipeline ──────────────────────────────────────────── *
- * Per cell, scene_draw decides ONE of four things to paint (or skip).
- * The decision is a priority chain:
- *
- *     1. Supernova flash active? → twinkle '*'
- *     2. Pattern-supplied glyph override? → that glyph
- *     3. Density-band rule? → '#' / '*' / '.'
- *     4. Otherwise → blank
- *
- * Each branch returns a CellDraw; paint_cell is the SINGLE ncurses
- * I/O point for the field grid. */
+/* For each cell, the drawing code decides one of four things to show,
+ * in priority order: a reset sparkle, an arrow the view forced, a
+ * brightness character, or nothing. Each choice returns a CellDraw, and
+ * paint_cell is the only place that actually writes to the screen. */
 
 typedef struct {
-    int  pair;
-    int  attr;
-    char glyph;
-    bool skip;
+    int  pair;    /* colour to use   */
+    int  attr;    /* bold or normal  */
+    char glyph;   /* character to put */
+    bool skip;    /* true = draw nothing here */
 } CellDraw;
 
-/* compute_centred_origin — top-left corner where the map is drawn.
- * Centres horizontally; reserves HUD_BAND_RESERVED_ROWS rows total
- * (HUD_TOP_ROWS = 3 for state/params/legend + HUD_BOTTOM_ROWS = 1
- * for the action hint). Clamps so the map never overlaps the HUD
- * even on very short terminals. */
+/* Where the map's top-left corner goes: centred sideways, with rows
+ * reserved top and bottom for the HUD. Clamped so the map never spills
+ * onto the HUD on a short terminal. */
 static void compute_centred_origin(const Grid *g, int cols, int rows,
                                     int *out_gx0, int *out_gy0)
 {
@@ -1387,11 +982,9 @@ static void compute_centred_origin(const Grid *g, int cols, int rows,
     *out_gy0 = gy0;
 }
 
-/* cell_supernova_sparkle — twinkle during the post-reset flash.
- * The (x ^ y) & MASK pattern lights one cell in (MASK + 1), giving
- * a sparse star-field rather than a uniform white-out. Cells with
- * active trail glow always light, so trails remain visible through
- * the flash. */
+/* The scattered '*' sparkles during the reset flash. Only some cells
+ * sparkle (so it looks like stars, not a solid sheet), but any cell with
+ * a live trail still lights up so trails show through the flash. */
 static CellDraw cell_supernova_sparkle(int x, int y, float trail_glow)
 {
     bool sparkle_lit = ((x ^ y) & SUPERNOVA_SPARSE_MASK) == 0;
@@ -1400,8 +993,8 @@ static CellDraw cell_supernova_sparkle(int x, int y, float trail_glow)
     return (CellDraw){ .pair = PAIR_SUPERNOVA, .attr = A_BOLD, .glyph = '*' };
 }
 
-/* cell_with_override_glyph — pattern-supplied glyph (e.g. arrow from
- * VECTOR). Coloured by the band, drawn bold. */
+/* Draw the character a view forced into this cell (the VECTOR arrows),
+ * coloured by its band and bold. */
 static CellDraw cell_with_override_glyph(const RenderBuffers *b, int idx)
 {
     return (CellDraw){
@@ -1411,9 +1004,8 @@ static CellDraw cell_with_override_glyph(const RenderBuffers *b, int idx)
     };
 }
 
-/* cell_density_band — the default ASCII density ramp:
- *   '#' (high) → '*' (mid) → '.' (low) → blank.
- * Follows Bourke's grey-scale-to-character mapping. */
+/* The usual brightness characters: '#' for bright, '*' for medium,
+ * '.' for dim, nothing below that. (Bourke's grey-scale ramp.) */
 static CellDraw cell_density_band(uint8_t band, float glow)
 {
     int pair = PAIR_BAND_BASE + (band & (N_BANDS - 1));
@@ -1423,7 +1015,7 @@ static CellDraw cell_density_band(uint8_t band, float glow)
     return (CellDraw){ .skip = true };
 }
 
-/* pick_cell — execute the priority chain for one cell. */
+/* Decide what a single cell shows, trying each option in priority order. */
 static CellDraw pick_cell(const Scene *s, int x, int y)
 {
     int   idx        = grid_idx(&s->grid, x, y);
@@ -1438,7 +1030,7 @@ static CellDraw pick_cell(const Scene *s, int x, int y)
     return cell_density_band(s->buf.color[idx], trail_glow);
 }
 
-/* paint_cell — the ONE ncurses I/O point for the field grid. */
+/* The single spot that actually writes a field cell to the terminal. */
 static void paint_cell(int sy, int sx, CellDraw c)
 {
     if (c.skip) return;
@@ -1463,12 +1055,9 @@ static void scene_draw(const Scene *s, int cols, int rows)
     }
 }
 
-/* ── HUD draw pipeline ────────────────────────────────────────────── *
- * Six named drawers, one per HUD element. The TOP HUD (rows 0..2)
- * carries DATA — current state, parameter readouts, glyph legend.
- * The BOTTOM HUD (row N-1) carries ACTIONS — key bindings only.
- * screen_draw assembles them in z-order: scene first, then HUD
- * painted over the top. */
+/* The HUD, one small drawer per piece. The top three rows show info
+ * (state, settings, a key to the characters); the bottom row lists the
+ * keys you can press. */
 
 static void draw_hud_state_bar(const Screen *sc, const Scene *s,
                                 double fps, int sim_fps)
@@ -1496,8 +1085,8 @@ static void draw_hud_title(void)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* draw_palette_swatch — paint one '#' per band colour. Returns the
- * column just past the swatch so the caller can continue laying out. */
+/* Draw a little '#' in each ramp colour as a preview. Hands back the
+ * next free column so the caller can keep laying things out. */
 static int draw_palette_swatch(int row, int x)
 {
     for (int i = 0; i < HUD_PALETTE_SWATCH_N; i++) {
@@ -1539,11 +1128,7 @@ static void draw_hud_status_line(const Scene *s)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* draw_hud_glyph_legend — row 2: explains the glyph alphabet so the
- * viewer can READ what they're seeing. This is DATA, not ACTION —
- * the bottom hint is reserved for key bindings only. Drawn in
- * non-bold PAIR_HUD so it sits below the bold state bar in visual
- * hierarchy. */
+/* A key to what the characters mean, so you can read the picture. */
 static void draw_hud_glyph_legend(void)
 {
     attron (COLOR_PAIR(PAIR_HUD));
@@ -1552,9 +1137,7 @@ static void draw_hud_glyph_legend(void)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* draw_bottom_hint — row N-1: ACTIONS only (key bindings). The
- * glyph legend moved up to draw_hud_glyph_legend so this row stays
- * a single-purpose reference card for what the user can press. */
+/* The list of keys along the bottom row. */
 static void draw_bottom_hint(const Screen *sc)
 {
     attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -1567,12 +1150,12 @@ static void screen_draw(Screen *sc, const Scene *s,
                          double fps, int sim_fps)
 {
     erase();
-    scene_draw            (s, sc->cols, sc->rows);
-    draw_hud_state_bar    (sc, s, fps, sim_fps);   /* row 0  : data */
-    draw_hud_title        ();                       /* row 0  : data */
-    draw_hud_status_line  (s);                      /* row 1  : data */
-    draw_hud_glyph_legend ();                       /* row 2  : data */
-    draw_bottom_hint      (sc);                     /* row N-1: actions */
+    scene_draw            (s, sc->cols, sc->rows);  /* the field, underneath */
+    draw_hud_state_bar    (sc, s, fps, sim_fps);
+    draw_hud_title        ();
+    draw_hud_status_line  (s);
+    draw_hud_glyph_legend ();
+    draw_bottom_hint      (sc);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -1582,39 +1165,25 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — the top-level program state. ONE instance, g_app, lives in
- * BSS so the signal handlers can reach it without a global Scene
- * pointer. The App owns the Scene and the Screen and adds:
- *   • simulation parameters that are not really "scene state"
- *     (sim_fps, map_w, map_h);
- *   • signal-driven flags that must be sig_atomic_t for safety.
- *
- * SIGNAL-HANDLER DISCIPLINE. The handlers do nothing but set a
- * flag. The main loop polls those flags and performs the actual
- * work (cleanup, resize) in normal execution context. This is the
- * standard async-signal-safe pattern — see signal(7) for the rules
- * on what can and cannot be called from a handler. Anything that
- * touches ncurses or malloc MUST happen outside the handler.
- *
- * REFERENCE. W. Richard Stevens & Stephen Rago — "Advanced
- * Programming in the UNIX Environment" (3rd ed), ch. 10 on signals,
- * for the full discussion of async-signal-safety and sig_atomic_t.
+ * App — the whole program in one struct. There's a single copy, g_app,
+ * kept global so the signal handlers can reach it. It owns the scene and
+ * the screen, plus the tick rate and map size and two flags the signal
+ * handlers flip. The handlers only flip a flag; the main loop notices
+ * and does the real work (resize, cleanup), because doing it inside a
+ * handler isn't safe.
  */
 typedef struct {
-    Scene                 scene;   /* the simulation                    */
-    Screen                screen;  /* current terminal dimensions       */
+    Scene                 scene;   /* the simulation               */
+    Screen                screen;  /* terminal size                */
 
-    int                   sim_fps; /* tick rate; mutated by '[' and ']' */
-    int                   map_w;   /* chosen map width,  ≤ MAP_W_MAX    */
-    int                   map_h;   /* chosen map height, ≤ MAP_H_MAX    */
+    int                   sim_fps; /* tick rate; '[' and ']' change it */
+    int                   map_w;   /* map width  */
+    int                   map_h;   /* map height */
 
-    /* sig_atomic_t guarantees writes from a handler are observed
-     * atomically by the main loop; `volatile` prevents the compiler
-     * from caching the read in a register across loop iterations.
-     * Both qualifiers are required — sig_atomic_t alone permits
-     * caching, volatile alone permits torn writes from a handler. */
-    volatile sig_atomic_t running;       /* 0 = exit main loop          */
-    volatile sig_atomic_t need_resize;   /* 1 = pending SIGWINCH        */
+    /* Set by the signal handlers, read by the main loop. The two
+     * qualifiers together make these safe to share that way. */
+    volatile sig_atomic_t running;       /* goes 0 to quit        */
+    volatile sig_atomic_t need_resize;   /* set 1 when resized    */
 } App;
 
 static App g_app;
@@ -1643,13 +1212,9 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* ── keyboard handlers ──────────────────────────────────────────────── *
- * Each key is one named action; app_handle_key is just a dispatcher. */
-
-/* bump_speed_geometric — '+' / '-' geometric step on speed AND
- * drift_mult. Doubling / halving (rather than ±1) gives a
- * logarithmic feel: each press is the same perceptual change
- * across the full clamped range. dir = +1 doubles; -1 halves. */
+/* '+' and '-': double or halve both the particle speed and the field
+ * drift, kept within their limits. Doubling feels like the same step
+ * whether you're slow or fast. dir +1 speeds up, -1 slows down. */
 static void bump_speed_geometric(Controls *c, int dir)
 {
     if (dir > 0) {
@@ -1665,7 +1230,7 @@ static void bump_speed_geometric(Controls *c, int dir)
     }
 }
 
-/* bump_sim_fps — '[' / ']' linear step on tick rate, clamped. */
+/* '[' and ']': raise or lower the tick rate, kept within its limits. */
 static void bump_sim_fps(App *app, int delta)
 {
     app->sim_fps += delta;
@@ -1714,9 +1279,8 @@ static void install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* advance_frame_clock — read the monotonic clock, compute dt since
- * the last call, clamp dt at DT_MAX_NS (the spiral-of-death guard).
- * Updates *frame_time to "now" in place; returns dt (clamped). */
+/* How long since the last frame, capped so a long stall can't make the
+ * sim try to catch up all at once. Also moves the clock forward. */
 static int64_t advance_frame_clock(int64_t *frame_time)
 {
     int64_t now = clock_ns();
@@ -1726,10 +1290,9 @@ static int64_t advance_frame_clock(int64_t *frame_time)
     return dt;
 }
 
-/* simulate_pending_ticks — drain the fixed-timestep accumulator.
- * Runs scene_tick() once per tick_ns worth of accumulated real time;
- * the simulation logic sees a CONSTANT dt_sec independent of frame
- * rate. Source: Glenn Fiedler, "Fix Your Timestep". */
+/* Run as many fixed-size sim steps as the elapsed time has earned, so
+ * the sim always advances by the same amount per step no matter the
+ * frame rate. (Glenn Fiedler, "Fix Your Timestep".) */
 static void simulate_pending_ticks(App *app, int64_t *sim_accum,
                                     int64_t tick_ns, float dt_sec)
 {
@@ -1739,9 +1302,8 @@ static void simulate_pending_ticks(App *app, int64_t *sim_accum,
     }
 }
 
-/* maybe_update_fps_counter — every FPS_UPDATE_MS, fold the running
- * frame count into a smoothed fps reading. Returns the new fps if
- * the window just closed, otherwise the previous value. */
+/* Roughly twice a second, work out the real frame rate from the frames
+ * counted so far. The rest of the time it just returns the old number. */
 static double maybe_update_fps_counter(int64_t *fps_accum,
                                         int *frame_count,
                                         double previous)
@@ -1754,9 +1316,8 @@ static double maybe_update_fps_counter(int64_t *fps_accum,
     return fps;
 }
 
-/* cap_frame_rate — sleep so frames are at most 1/target_fps apart.
- * `work_done_ns` is the wall-clock time already consumed this frame;
- * we sleep the remainder of the per-frame budget. */
+/* Sleep off the rest of this frame's time budget so we don't run faster
+ * than the target rate (and don't burn the CPU spinning). */
 static void cap_frame_rate(int64_t work_done_ns, int target_fps)
 {
     int64_t budget = NS_PER_SEC / target_fps;

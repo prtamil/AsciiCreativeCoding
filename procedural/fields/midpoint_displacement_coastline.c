@@ -1,282 +1,29 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * midpoint_displacement_coastline.c
- *   — 1-D midpoint-displacement fractals, 30 silhouette patterns.
  *
- * DEMO: A single endpoint pair becomes a jagged fractal line through
- *       repeated midpoint-displacement subdivision: each segment's
- *       midpoint is set to the average of its endpoints plus a random
- *       jitter, with the jitter halving every level. The resulting
- *       polyline looks naturally rough — like a coastline, mountain
- *       silhouette, or lightning bolt. THIRTY pattern presets span
- *       simple → complex, organised by line count and visual style:
+ * Draws jagged fractal lines that look like coastlines, mountains, or
+ * lightning. The trick: take a straight line, push its midpoint up or
+ * down at random, then do the same to each new half with a smaller
+ * nudge each time. Thirty named presets dress the same idea up as
+ * different scenes, and every line slowly morphs between two random
+ * shapes so the picture is always moving.
  *
- *         Tier 1 — single line   : COASTLINE SKYLINE HORIZON DUNES CITY
- *         Tier 2 — paired lines  : VALLEY CAVE CLIFF PLATEAU REEF
- *         Tier 3 — small stack   : MOUNTAINS HILLS ALPS RIDGES TERRACES
- *         Tier 4 — multi-stack   : WAVES STRATA FOREST RAPIDS SEDIMENT
- *         Tier 5 — exotic        : ATOLLS CRYSTAL SAWTOOTH NEBULA STORM
- *                                  AURORA CEILING ISLANDS PETRA CHAOS
+ * Algorithm: Fournier, Fussell & Carpenter, "Computer rendering of
+ * stochastic models", CACM 25(6) 1982 — the paper that introduced this.
+ * Glyph ramps: Paul Bourke, https://paulbourke.net/dataformats/asciiart/
  *
- *       Each line slowly morphs between two random shapes over ~10s,
- *       so the silhouette evolves continuously rather than freezing.
- *       The state bar shows [N/30] so you can see where you are in
- *       the cycle. Cycle patterns with n/p, themes with t/T, glyph
- *       sets with g/G.
+ * Sister files (same scene structure, different algorithm):
+ *   ../generational/diamond_square_heightmap_showcase.c — the 2-D version
+ *   ./magnetic_fields.c, ./flow_field_particles.c, ./curl_noise_vector_field.c
  *
- * Study alongside:
- *   ../generational/diamond_square_heightmap_showcase.c — the 2-D
- *       cousin of midpoint displacement. Same recursive halving idea
- *       but in two dimensions; produces heightmaps instead of silhouettes.
- *   ./perin_noise_flow_showcase.c — Perlin noise also produces smooth
- *       fractal-like fields; midpoint displacement is the older, simpler
- *       algorithm that inspired much of fractal terrain synthesis.
- *
- * Section map:
- *   §1 config   — grid, patterns, palette, themes, named constants
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes
- *   §5 md       — midpoint displacement core
- *   §6 patterns — 30 line configurations + render-style dispatcher
- *   §7 scene    — Scene composing Grid, FractalField, SimState,
- *                 Controls; per-frame tick / morph-keyframe pipeline
- *   §8 screen   — ASCII render: silhouettes + fills + HUD drawers
- *   §9 app      — signals, resize, named main-loop helpers
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reset (regenerate all lines from scratch)
- *   n / N      next pattern
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   g / G      next / previous glyph set
- *   + / =      faster morph
- *   -          slower
- *   ] / [      raise / lower tick Hz
+ * Keys: q/ESC quit · space pause · r reset · n/p pattern · t/T theme
+ *       g/G glyph set · +/- morph speed · ]/[ tick rate
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra midpoint_displacement_coastline.c \
  *       -o md_coast -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : 1-D midpoint displacement (Fournier, Fussell &
- *                  Carpenter 1982). For a line from (0, y_left) to
- *                  (n-1, y_right):
- *
- *                    1. line[0] = y_left, line[n-1] = y_right.
- *                    2. step = n − 1, amplitude = A₀.
- *                    3. While step > 1:
- *                       For each midpoint i = step/2 + k·step:
- *                         line[i] = (line[i−step/2] + line[i+step/2]) / 2
- *                                  + random(−amp, +amp)
- *                       step ← step / 2;  amp ← amp · roughness.
- *                    4. line[] now contains a fractal polyline.
- *
- *                  The choice of `roughness` (typically 0.5–0.7)
- *                  controls how rough the line is. 0.5 gives smooth
- *                  rolling hills; 0.7 produces sharp jagged peaks
- *                  (good for cities and lightning).
- *
- *                  The output is a 1-D Brownian-like fractal — same
- *                  family as fBm noise, but built by recursive
- *                  subdivision rather than summed octaves. Cheap and
- *                  classic; what the original Star Trek II Genesis
- *                  effect used to render planet horizons in 1982.
- *
- *                  Animation: we generate two random lines (A and B)
- *                  per layer and continuously lerp between them. When
- *                  the lerp reaches 1, B becomes A and we regenerate
- *                  B. Smooth morphing with no visible "snap".
- *
- * Data-structure : Two float keyframe buffers per line (keyframe_a,
- *                  keyframe_b) plus the per-frame interpolated live[]
- *                  buffer used for rendering. Up to 8 lines per pattern
- *                  (CHAOS / STRATA need the most). 257-point lines for
- *                  full fractal resolution; rendering interpolates to
- *                  fit any terminal width.
- *
- *                  Each line carries its own LineSpec — fractal params
- *                  (y_centre, amp, roughness, endpoint asymmetry) plus
- *                  rendering hints (fill direction, palette band,
- *                  outline band, glyph density). Patterns are nothing
- *                  more than the LineSpec list returned by a small
- *                  per-pattern placer function; the renderer is
- *                  pattern-agnostic and just walks the list.
- *
- * Rendering      : ASCII only. Three render styles selected per line:
- *                    FILL_BELOW  — paint from line down to map bottom
- *                                 (coastline water, mountain mass)
- *                    FILL_ABOVE  — paint from map top down to line
- *                                 (ceiling, sky-fill, cave roof)
- *                    THIN_LINE   — paint only the line (waves, ridges)
- *                  Any of the fill styles can carry an optional thin
- *                  outline in a contrasting palette band — that's how
- *                  COASTLINE gets its bright shore-line on top of the
- *                  water fill. Multi-line patterns render back-to-front
- *                  so front layers cover rear ones; depth shading
- *                  (low/mid/high glyph density) gives the parallax
- *                  effect on MOUNTAINS / HILLS / ALPS.
- *
- * Performance    : O(N) per line generation (each level halves point
- *                  spacing but doubles point count → linear total).
- *                  Generation only on reset / morph-roll-over —
- *                  a few hundred cheap operations every ~10 s. Per-
- *                  frame: O(N · L) interpolation + O(W · H) render.
- *
- * References     : Algorithm / math
- *                  ────────────────
- *                  • Fournier, A., Fussell, D. & Carpenter, L. (1982) —
- *                    "Computer rendering of stochastic models",
- *                    Communications of the ACM 25(6):371-384. The
- *                    paper that introduced midpoint displacement to
- *                    graphics; the iterative subdivision loop in §5
- *                    is direct from this paper. Also the original
- *                    1-D coastline demo on which this file is modelled.
- *                  • Mandelbrot, B. B. (1983) — "The Fractal Geometry
- *                    of Nature", Freeman (revised "Fractals: Form,
- *                    Chance and Dimension", 1977). Mathematical context
- *                    for fractal coastlines: Hausdorff dimension, self-
- *                    similarity, and the famous "How long is the coast
- *                    of Britain?" question (Science 156(3775), 1967).
- *                    Explains why MD looks natural — it produces
- *                    statistically self-similar curves with the same
- *                    fractal dimension as a real coastline.
- *                  • Voss, R. F. (1985) — "Random fractal forgeries",
- *                    in R. A. Earnshaw, ed., "Fundamental Algorithms
- *                    for Computer Graphics", Springer NATO ASI Series.
- *                    The terrain-synthesis chapter that taught a
- *                    generation of graphics programmers MD / fBm /
- *                    successive random additions; the source of the
- *                    "roughness exponent" intuition (roughness = 2^-H
- *                    for fractal dimension D = 2 - H).
- *                  • Peitgen, H.-O. & Saupe, D., eds. (1988) — "The
- *                    Science of Fractal Images", Springer. Ch. 2
- *                    (Saupe) is the definitive MD reference: covers
- *                    the iterative implementation, the roughness ↔
- *                    fBm relationship, and the visible-crease artifact.
- *                    The most accessible book-length treatment.
- *                  • Miller, G. S. P. (1986) — "The definition and
- *                    rendering of terrain maps", SIGGRAPH '86. Documents
- *                    the well-known MD-creasing artifact (visible
- *                    discontinuities at every halving level) and
- *                    proposes the "square-square" subdivision as a fix.
- *                    Useful when learners notice the artifact and ask
- *                    "why is that happening?".
- *
- *                  Rendering / visualisation
- *                  ─────────────────────────
- *                  • Paul Bourke — "Character representation of grey
- *                    scale images":
- *                    https://paulbourke.net/dataformats/asciiart/
- *                    The canonical density → glyph ramp reference.
- *                    Underlies the GlyphDensity (LOW/MID/HIGH) mapping
- *                    in §6 and the five GlyphSet ramps in §1.
- *                  • Paul Bourke — "Fractal terrain":
- *                    https://paulbourke.net/fractals/terrain/
- *                    Hands-on examples of MD output at different
- *                    roughness values; useful side-by-side comparison
- *                    when calibrating the per-pattern roughness in §6.
- *
- *                  See also
- *                  ────────
- *                  • ../generational/diamond_square_heightmap_showcase.c
- *                    — the 2-D cousin of midpoint displacement. Same
- *                    recursive halving idea but in two dimensions,
- *                    producing heightmaps instead of silhouettes.
- *                  • ./magnetic_fields.c, ./flow_field_particles.c,
- *                    ./curl_noise_vector_field.c — the same Scene /
- *                    Grid / *Field / SimState / Controls composition
- *                    pattern applied to different algorithms; reading
- *                    them together shows how the architecture stays
- *                    constant while the algorithm changes.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Take a straight line from A to B. Find the midpoint. Push it up or
- * down by some random amount. You now have two segments. Repeat on
- * each — find each midpoint, displace by a SMALLER random amount.
- * Repeat again with even smaller amounts. After log₂(N) levels, the
- * line has N points and looks naturally rough — coastline-like at
- * one roughness, mountain-like at another, lightning-like at a third.
- * The whole concept is just "halve, jitter, halve, jitter, halve,
- * jitter".
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine drawing a profile of a coast. You start with two pencil
- * dots at left and right. You aim halfway between them — but instead
- * of drawing exactly there, you nudge your hand a bit (the random
- * jitter). Now you have three dots. You repeat the process between
- * each adjacent pair — find the midpoint, nudge a bit less. Then
- * again with even smaller nudges. After enough rounds you have
- * hundreds of dots forming a wandering line. That's a coastline.
- *
- * Visible style families:
- *   Single line   (Tier 1) : one fractal line. COASTLINE / SKYLINE /
- *                            HORIZON / DUNES / CITY differ only in
- *                            y_centre, roughness, and fill direction.
- *                            Easiest tier to read — the algorithm in
- *                            isolation.
- *   Paired lines  (Tier 2) : two lines bracketing or stacking — VALLEY
- *                            (canyon), CAVE (narrow gap), CLIFF
- *                            (asymmetric drop), PLATEAU (flat mesa),
- *                            REEF (coral + ocean floor).
- *   Small stacks  (Tier 3) : 3-4 lines with depth shading. MOUNTAINS,
- *                            HILLS, ALPS differ only in roughness;
- *                            RIDGES and TERRACES vary count and style.
- *                            The PARALLAX illusion appears here.
- *   Multi-stacks  (Tier 4) : 5-7 thin or shallow lines, low amplitude.
- *                            WAVES, STRATA, FOREST, RAPIDS, SEDIMENT
- *                            — texture-like rather than silhouette-like.
- *   Exotic        (Tier 5) : extreme roughness (CRYSTAL 0.85),
- *                            asymmetric drops (SAWTOOTH), upside-down
- *                            fills (CEILING stalactites), and CHAOS —
- *                            8 lines with everything randomised at
- *                            init time.
- *
- * Above all: the lines MORPH continuously. Each pattern stays the
- * same configuration but the actual shapes evolve smoothly.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. INIT. For each line of the active pattern, generate two random
- *     fractals (keyframe_a and keyframe_b) using midpoint displacement.
- *     morph_t = 0; live ← keyframe_a.
- *  2. PER FRAME:
- *     a. advance_morph:   morph_t += morph_rate · dt.
- *     b. morph_completed? rotate_keyframes (A ← B, regen B); reset morph_t.
- *     c. interpolate_live_lines: live[i] = lerp(keyframe_a[i],
- *                                                keyframe_b[i], morph_t).
- *     d. render_line per spec: dispatch on RenderStyle.
- *  3. The user can press 'r' to re-roll all A/B fractals (or 'n'/'p'
- *     to switch pattern, which also re-rolls). There is no automatic
- *     reset — the morph runs indefinitely.
- *
- * KEY FORMULAS
- * ────────────
- *  Midpoint with jitter         :
- *    line[mid] = midpoint_y(line[L], line[R]) + jitter(amp)
- *              = (line[L] + line[R]) · 0.5 + uniform(−amp, +amp)
- *  Amplitude decay              :
- *    A_{level+1} = A_level · roughness   (typically 0.30 to 0.85)
- *  Number of levels             :
- *    log₂(LINE_POINTS − 1)              = log₂(256) = 8
- *  Total line points after K
- *  levels                       : 2^K + 1
- *  Frame interpolation          :
- *    live[i] = (1 − morph_t) · keyframe_a[i] + morph_t · keyframe_b[i]
- *  Render-x to line-x           :
- *    line_x = (render_x · (LINE_POINTS − 1)) / (map_w − 1)
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -298,11 +45,11 @@ enum {
     MAP_H_MAX         =  56,
     CELLS_MAX         = MAP_W_MAX * MAP_H_MAX,
 
-    /* MD line resolution — must be 2^k + 1. 257 gives 256 segments
-     * → 8 levels of subdivision, plenty of fractal detail. */
+    /* How many points make up each line. Must be a power of two plus
+     * one; 257 means we halve 8 times, which is plenty of detail. */
     LINE_POINTS       = 257,
 
-    /* Maximum lines per pattern (WAVES needs 6, MOUNTAINS 4). */
+    /* Most lines any one preset draws (CHAOS uses all 8). */
     MAX_LINES         =   8,
 
     SIM_FPS_MIN       =  10,
@@ -313,78 +60,62 @@ enum {
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Colour-pair slots. The HUD slots are reserved project-wide. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_BAND_BASE    =   3,    /* PAIR_BAND_BASE..+3 = 4 palette colours */
-    PAIR_FLASH        =   7,    /* vestigial — kept for cross-file parity  */
+    PAIR_BAND_BASE    =   3,    /* first of 4 line colours: base..base+3 */
+    PAIR_FLASH        =   7,    /* unused here; kept so themes match sister files */
 };
 
-/* Morph rate base — fraction of the morph cycle per second. 0.10 →
- * full A→B over 10 seconds. */
+/* How fast a line morphs from its current shape to the next, as a
+ * fraction of the trip per second. The default finishes in 10 seconds. */
 #define MORPH_RATE_DEF      0.10f
 #define MORPH_RATE_MIN      0.01f
 #define MORPH_RATE_MAX      2.00f
 
-/* Palette width — number of distinct colour bands per theme. Each
- * LineSpec carries pair_idx ∈ [0, N_BANDS). */
+/* How many colours a theme offers. Each line picks one of them. */
 #define N_BANDS             4
 
-/* CHAOS pattern — randomisation ranges. Each parameter is drawn
- * uniformly from [LO, LO + RANGE) at INIT time. Concentrating the
- * magic numbers here makes the chaos pattern tunable without touching
- * the placer body. */
-#define CHAOS_LINES_TARGET   8       /* upper line count (clamped to max_n) */
-#define CHAOS_Y_LO           0.10f   /* y_centre fraction lo bound          */
-#define CHAOS_Y_RANGE        0.80f   /* y_centre fraction range             */
-#define CHAOS_AMP_LO         0.05f   /* amp fraction lo bound               */
-#define CHAOS_AMP_RANGE      0.20f   /* amp fraction range                  */
-#define CHAOS_ROUGH_LO       0.30f   /* roughness lo bound                  */
-#define CHAOS_ROUGH_RANGE    0.55f   /* roughness range                     */
-#define CHAOS_OUTLINE_DENOM  3       /* 1-in-N chance the line gets outline */
-#define CHAOS_STYLE_COUNT    3       /* distinct RenderStyle values         */
+/* CHAOS preset — the random ranges every line is rolled from. Pulling
+ * these out here lets you re-tune CHAOS without editing the placer. */
+#define CHAOS_LINES_TARGET   8       /* how many lines to try for (capped)  */
+#define CHAOS_Y_LO           0.10f   /* vertical position: low end          */
+#define CHAOS_Y_RANGE        0.80f   /* vertical position: spread           */
+#define CHAOS_AMP_LO         0.05f   /* jaggedness height: low end          */
+#define CHAOS_AMP_RANGE      0.20f   /* jaggedness height: spread           */
+#define CHAOS_ROUGH_LO       0.30f   /* roughness: low end                  */
+#define CHAOS_ROUGH_RANGE    0.55f   /* roughness: spread                   */
+#define CHAOS_OUTLINE_DENOM  3       /* 1-in-3 chance a line gets an outline */
+#define CHAOS_STYLE_COUNT    3       /* number of render styles to pick from */
 
-/* MD-algorithm constants. */
-#define MIDPOINT_AVG_WEIGHT  0.5f   /* in midpoint_y(L,R) = (L+R)·weight   */
-#define JITTER_HALFRANGE     0.5f   /* endpoint random jitter is ±amp·this */
+/* The two fixed numbers in the fractal step itself. */
+#define MIDPOINT_AVG_WEIGHT  0.5f   /* take the halfway point between two ends */
+#define JITTER_HALFRANGE     0.5f   /* endpoints wobble by up to half the amplitude */
 
-/* ── HUD layout ──────────────────────────────────────────────────── *
- * Top HUD carries DATA, bottom HUD carries ACTIONS:
- *   row 0           : title + state bar (fps, Hz, state + [N/M], morph)
- *   row 1           : pattern/theme/palette + lines/pts/map + glyph
- *   row HUD_TOP..N-2: silhouette field
- *   row N-1         : keyboard action hint
- *
- * Row-1 segments are laid out left-to-right at fixed column widths so
- * each segment knows where the next one starts. Centralising the
- * widths means changing one number reflows the whole row coherently. */
+/* HUD layout. Row 0 and row 1 at the top show info, the bottom row
+ * shows the key list, and the scene fills everything between. The
+ * row-1 fields sit at fixed column widths so each knows where the next
+ * begins — change one width and the whole row still lines up. */
 #define HUD_TOP_ROWS             2
 #define HUD_BOTTOM_ROWS          1
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
 #define HUD_LEFT_MARGIN          1
-#define HUD_PATTERN_FIELD_W     20    /* " pattern:XXXXXXXXX " column slot */
-#define HUD_THEME_FIELD_W       17    /* " theme:XXXXXXXX "   column slot */
-#define HUD_PALETTE_LABEL_W      9    /* " palette:"          column slot */
+#define HUD_PATTERN_FIELD_W     20    /* width of the " pattern:XXX " field */
+#define HUD_THEME_FIELD_W       17    /* width of the " theme:XXX " field   */
+#define HUD_PALETTE_LABEL_W      9    /* width of the " palette:" label     */
 
 /*
- * Pattern — 30 fractal-silhouette presets spanning simple → complex.
+ * Pattern — the 30 named scenes, from simplest to most elaborate.
  *
- * INTENT. The simulation kernel (MD-fractal generate + per-line A→B
- * morph) is identical for all patterns; only the LineSpec list
- * returned by pattern_setup changes. Adding a new pattern is one
- * placer function + one enum value + one dispatcher line — that's it.
+ * The engine (build a fractal line, morph it) is the same for all of
+ * them; a preset is just a list of lines with different settings. So
+ * adding one is three small edits: a placer function, an enum value
+ * here, and a line in the dispatcher.
  *
- * TIER ORGANISATION. Patterns are grouped in five tiers of increasing
- * visual / structural complexity:
- *   1 (1 line)   — single-line silhouettes, varying roughness + style
- *   2 (2 lines)  — paired lines bracketing or stacking
- *   3 (3-4 lines)— small layered stacks with depth shading
- *   4 (5-7 lines)— multi-layer stacks, texture-like
- *   5 (1-8 lines)— exotic: extreme params, mixed styles, CHAOS
- * Enum values are contiguous within each tier so n/p cycling naturally
- * walks through "easy first" to "complex last". N_PATTERNS = 30.
- *
- * Cycle with n/p; the HUD shows [N/30] so users see where they are.
+ * They're grouped in five tiers, simplest first, and the values run in
+ * order so pressing n/p walks from easy to hard. The tiers are: one
+ * line, two lines, a few layered lines, many shallow lines, then the
+ * exotic ones with extreme settings.
  */
 typedef enum {
     /* Tier 1 — single-line silhouettes */
@@ -471,57 +202,39 @@ static const char *pattern_name(Pattern p)
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* §9 main loop — spiral-of-death dt clamp + terminal redraw rate cap
- * (Glenn Fiedler's "Fix Your Timestep"). */
-#define DT_MAX_NS       (100 * NS_PER_MS)   /* hard cap on per-frame dt */
-#define FRAME_CAP_FPS   60                  /* terminal redraw budget   */
+/* Loop safety valves. If a frame takes too long (laptop slept, etc.)
+ * we pretend no more than 100 ms passed so the sim doesn't try to catch
+ * up forever. And we never redraw faster than this to spare the terminal.
+ * Both ideas: Glenn Fiedler, "Fix Your Timestep". */
+#define DT_MAX_NS       (100 * NS_PER_MS)
+#define FRAME_CAP_FPS   60
 
 /*
- * Theme — one complete colour palette for the silhouette layer. Ten of
- * these live in themes[], cycled by t/T.
+ * Theme — one colour scheme for the lines. Ten of them, cycled with t/T.
  *
- * INTENT. The smallest data needed to recolour every line + fill in
- * the scene: 4 ramp colours arranged dim → bright, plus a "flash"
- * accent (vestigial here — kept for cross-file palette parity with
- * curl_noise_vector_field.c, magnetic_fields.c, flow_field_particles.c,
- * domain_warped_noise_iq_style.c).
+ * Each has four colours ordered dim to bright. A line names which of
+ * the four it wants, and stacked patterns hand the brightest to the
+ * back and dimmest to the front so colour helps sell the sense of depth.
  *
- * BANDING MODEL. Each LineSpec carries a pair_idx ∈ [0, 4) selecting
- * its colour band. The four-band split forces theme authors to design
- * the ramp as a coherent low → high progression — same discipline as
- * a Houdini ramp parameter or Substance Designer gradient. Multi-layer
- * patterns (MOUNTAINS, FOREST, SEDIMENT) assign band 3 → 0 across
- * back → front layers so colour itself encodes depth, on top of the
- * GlyphDensity depth shading.
- *
- * COLOUR FORMAT. xterm-256 indices (NOT RGB). When the terminal exposes
- * fewer than 256 colours, theme_apply() substitutes a fixed 8-colour
- * cycle so the demo still runs on legacy TTYs.
- *
- * REFERENCE. The 256-colour cube layout (16 base + 6³ cube + 24-step
- * grayscale ramp) is documented in XTerm's ctlseqs.ms; the band values
- * in themes[] are picked from that cube. See also CLAUDE.md "Theme
- * Palette Brightness" for this project's bright-half constraint.
+ * The numbers are xterm-256 colour codes, not RGB. On an old terminal
+ * with fewer colours, theme_apply() falls back to a plain 8-colour set
+ * so the demo still runs.
  */
 typedef struct {
-    const char *name;                /* short uppercase label shown in HUD      */
-    short       band[N_BANDS];       /* ramp colours: 0 = dim/low, 3 = bright   */
-    short       flash;               /* vestigial — kept for cross-file parity  */
+    const char *name;                /* short label shown in the HUD            */
+    short       band[N_BANDS];       /* four colours, dim (0) to bright (3)     */
+    short       flash;               /* unused here; kept to match sister files */
 } Theme;
 
 #define N_THEMES 10
 
 /*
- * Theme palettes for this file are all SHIFTED LIGHT — every band
- * value sits in the bright half of the 256-colour cube (≥ 39 / ≥ 64
- * for greens, etc.). Reason: the coastline patterns paint solid
- * vertical FILLS below their lines, and a dark colour like 17 (navy)
- * or 22 (dark green) blends into a typical dark terminal background,
- * making the silhouette nearly invisible. Pre-shifting every theme
- * upward keeps every band bright enough to read on dark, light, and
- * "transparent" terminals alike. This is a coastline-file-specific
- * tweak — other field files don't fill regions and so can use the
- * full intensity range.
+ * Every colour here is deliberately on the bright side. These patterns
+ * paint solid blocks below their lines, and a dark colour would just
+ * vanish into a dark terminal background and leave the shape invisible.
+ * Keeping all of them light means the scene reads on dark, light, or
+ * see-through terminals alike. (Sister files that only draw thin lines
+ * don't need this and use the full range of colours.)
  */
 static const Theme themes[N_THEMES] = {
     /*           name      band0 band1 band2 band3 flash */
@@ -538,33 +251,24 @@ static const Theme themes[N_THEMES] = {
 };
 
 /*
- * GlyphSet — 3-character density ramp (slim → fat). Five sets exist
- * (SLIM → FAT thickness ramp); cycle with g/G.
+ * GlyphSet — three characters going from thin to thick. Five sets, each
+ * a different look (dots, stars, blocks...), cycled with g/G.
  *
- * INTENT. Different themes want different glyph weights to read
- * cleanly. MONO (greyscale) looks better with the fatter HEAVY ramp;
- * MATRIX looks more "wireframe" with SLIM. Decoupling glyph choice
- * from theme choice lets the user pair them freely without coding up
- * theme × ramp combinations.
+ * Some themes read better with heavier characters and some with lighter
+ * ones, so glyph choice is separate from colour choice and you can mix
+ * them however you like. A line says whether it wants the thin, middle,
+ * or thick character; the renderer looks it up here at draw time.
  *
- * USAGE. Each LineSpec carries a GlyphDensity (LOW / MID / HIGH); the
- * renderer picks the matching glyph from this struct at draw time.
- * That double-decoupling (theme picks palette, GlyphSet picks ramp,
- * LineSpec picks which slot of the ramp) is how the same five sets
- * service all 30 patterns without per-pattern customisation.
- *
- * REFERENCE. The principle of mapping density → glyph along a coarse
- * ramp is Paul Bourke's ASCII grey-scale ramp idea:
+ * The idea of using a few characters of different "weight" to stand for
+ * light and dark comes from Paul Bourke's ASCII art ramp:
  *   https://paulbourke.net/dataformats/asciiart/
- * Bourke proposes 10-step and 70-step ramps for grayscale images; we
- * use a 3-step ramp because silhouette rendering is intentionally
- * monotonic — finer steps would just add noise without information.
+ * Three steps is enough here — more would just add visual noise.
  */
 typedef struct {
-    const char *name;             /* short label shown in HUD glyph indicator */
-    char        low;              /* sparsest glyph — back layers, dim trails */
-    char        mid;              /* middle weight                            */
-    char        high;             /* densest glyph — front layers, outlines   */
+    const char *name;             /* short label shown in the HUD       */
+    char        low;              /* thinnest — used for far-back layers */
+    char        mid;              /* middle weight                      */
+    char        high;            /* thickest — used for front layers and outlines */
 } GlyphSet;
 
 #define N_GLYPH_SETS 5
@@ -638,41 +342,37 @@ static void color_init(void)
 /* §5  md — midpoint displacement core                                    */
 /* ===================================================================== */
 
-/* rand_signed — uniform sample in [-1, +1]. The atomic source of all
- * randomness in this file. */
+/* A random number between -1 and +1. Every bit of randomness here
+ * starts from this. */
 static inline float rand_signed(void)
 {
     return ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
 }
 
-/* midpoint_y — the average-of-endpoints step of one MD subdivision.
- * Named so the algorithm reads as "midpoint plus jitter" rather than
- * "(L + R) * 0.5f plus random". */
+/* The point halfway between two heights. */
 static inline float midpoint_y(float left, float right)
 {
     return (left + right) * MIDPOINT_AVG_WEIGHT;
 }
 
-/* jitter — the random-displacement step of one MD subdivision. */
+/* A random nudge up or down, no bigger than amp. */
 static inline float jitter(float amp)
 {
     return rand_signed() * amp;
 }
 
 /*
- * md_generate — fill `line[0..n-1]` with a midpoint-displacement
- * fractal connecting (0, left_y) to (n-1, right_y).
+ * Builds one fractal line into line[0..n-1], running from height left_y
+ * on the left to right_y on the right.
  *
- * n must be a power of 2 plus 1 (e.g. 257 = 2^8 + 1). amp_init is
- * the displacement magnitude at the FIRST level; it shrinks by
- * `roughness` at each subsequent level.
+ * The shape: set the two ends, find the midpoint and nudge it randomly,
+ * then do the same to each new half with a smaller nudge, and keep
+ * halving until every slot is filled. amp_init is how big the first
+ * nudge is; roughness is how much of the nudge survives to the next,
+ * finer level. n must be a power of two plus one (like 257).
  *
- * The inner-loop body now reads as the algorithm states it:
- *   line[i] = midpoint_y(line[L], line[R]) + jitter(amp)
- * which is exactly the FFC 1982 paper's recursion equation.
- *
- * Iterative implementation — easier to reason about than the
- * traditional recursive form, and avoids stack pressure for large n.
+ * Written as a loop rather than recursion — same result, no deep call
+ * stack to worry about.
  */
 static void md_generate(float *line, int n,
                         float left_y, float right_y,
@@ -695,8 +395,8 @@ static void md_generate(float *line, int n,
 }
 
 /*
- * line_lerp — populate `out[]` with the per-point linear interpolation
- * of `a[]` and `b[]` at parameter t ∈ [0, 1].
+ * Blends two lines into out[]: t=0 gives line a, t=1 gives line b, and
+ * values in between give a mix. This is what makes the shapes morph.
  */
 static void line_lerp(const float *a, const float *b, float *out, int n, float t)
 {
@@ -707,10 +407,9 @@ static void line_lerp(const float *a, const float *b, float *out, int n, float t
 }
 
 /*
- * line_sample — given the live line array (n_points entries) and a
- * render-x in [0, w − 1], return the interpolated y at that column.
- * Linear interpolation between adjacent points so the line scales to
- * any terminal width.
+ * Reads the line's height at screen column x. The line has a fixed
+ * number of points but the terminal can be any width, so this stretches
+ * it to fit, smoothing between the two nearest points.
  */
 static float line_sample(const float *line, int n_points, int w, int x)
 {
@@ -728,16 +427,12 @@ static float line_sample(const float *line, int n_points, int w, int x)
 /* ===================================================================== */
 
 /*
- * RenderStyle — what the renderer does with one line. Each LineSpec
- * carries its own style so the renderer is pattern-agnostic.
- *   FILL_BELOW — paint from the line down to the bottom of the map.
- *                Foundation of COASTLINE / CITY / MOUNTAINS / etc.
- *   FILL_ABOVE — paint from the top of the map down to the line. The
- *                visual inverse of FILL_BELOW; used for ceilings, cave
- *                roofs, sky-fill, stalactites.
- *   THIN_LINE  — paint only the line itself (one glyph per column).
- *                Used by WAVES / RIDGES / STRATA / AURORA where the
- *                line is the entire visual.
+ * RenderStyle — how a line gets painted.
+ *   FILL_BELOW — colour everything from the line down to the floor
+ *                (the ground in COASTLINE, the mass of a mountain).
+ *   FILL_ABOVE — colour everything from the ceiling down to the line
+ *                (sky, cave roofs, stalactites).
+ *   THIN_LINE  — just the line itself, one character wide.
  */
 typedef enum {
     STYLE_FILL_BELOW = 0,
@@ -746,11 +441,9 @@ typedef enum {
 } RenderStyle;
 
 /*
- * GlyphDensity — which glyph of the active GlyphSet to use for this
- * line. Multi-layer patterns vary density across layers to encode
- * depth: GLYPH_LOW (sparsest, recedes) for back layers, GLYPH_HIGH
- * (densest, prominent) for front layers. The parallax illusion on
- * MOUNTAINS / HILLS / ALPS / FOREST comes from this.
+ * GlyphDensity — which of the glyph set's three characters a line uses.
+ * Stacked patterns give far layers the thin one and near layers the
+ * thick one, which makes them look like they're at different distances.
  */
 typedef enum {
     GLYPH_LOW  = 0,
@@ -759,86 +452,62 @@ typedef enum {
 } GlyphDensity;
 
 /*
- * LineSpec — everything needed to generate ONE MD line and render it.
- * One LineSpec drives one fractal polyline through its entire life:
- * md_generate consumes the fractal params at keyframe time, render_line
- * consumes the render params at draw time.
+ * LineSpec — the full recipe for one line: how to build its shape and
+ * how to paint it. A preset is just a list of these. The first half
+ * feeds the fractal builder; the second half tells the renderer what to
+ * draw. These four shape knobs are all you need to get everything from
+ * a gentle coast to a spiky crystal.
  *
- * FRACTAL PARAMS. Fed to md_generate (§5). The four-knob design
- * (y_centre + amp + roughness + endpoint dys) is the smallest set
- * that spans every pattern in §6 — from gentle coastlines to chaotic
- * crystals. Larger sets exist (Voss successive random additions adds
- * per-level seeds; Saupe diamond-square adds 2-D constraints) but for
- * 1-D MD this is sufficient.
- *
- * ROUGHNESS NOTE. The `roughness` field is the per-level amplitude
- * multiplier. It maps to fBm's Hurst exponent H via roughness = 2^-H;
- * H ∈ [0, 1] corresponds to roughness ∈ [0.5, 1.0]. We allow the full
- * [0.30, 0.85] range — values < 0.5 give "smoother than Brownian"
- * (DUNES, PLATEAU, TERRACES); values > 0.7 give the spiky "more
- * chaotic than Brownian" look (CITY, CRYSTAL). Voss (1985) gives the
- * theoretical foundation; Saupe in Peitgen & Saupe (1988) ch. 2 has
- * the practical roughness-tuning guide.
- *
- * RENDER PARAMS. Consumed by render_line (§8). The (pair_idx, style,
- * glyph_density) triple is the minimal description of what to paint;
- * outline_idx is optional (set to -1 to skip). The render layer is
- * pattern-agnostic — every visual decision lives in the LineSpec, not
- * in scene_draw.
- *
- * REFERENCES. Fournier-Fussell-Carpenter 1982 (the MD algorithm
- * itself); Voss 1985 (roughness ↔ H mapping); Peitgen & Saupe 1988
- * ch. 2 (practical roughness tuning).
+ * The roughness knob is the interesting one: it's how much of the random
+ * nudge carries over to each finer level. Low values smooth out fast
+ * (dunes, terraces); high values keep the small wobbles all the way down
+ * (cities, crystals). Voss 1985 and Peitgen & Saupe 1988 ch.2 cover the
+ * theory and how to tune it.
  */
 typedef struct {
-    /* Fractal params — fed to md_generate(). */
+    /* --- shape: how to build the line --- */
 
-    /* Preferred mid-line y (cell units). Acts as the "anchor" of the
-     * line — keyframes will hover around this value plus jitter. */
+    /* Where the line sits vertically, in screen rows. The line wanders
+     * around this height. */
     float        y_centre;
 
-    /* Displacement magnitude at the FIRST level of subdivision (cell
-     * units). Shrinks by `roughness` at each subsequent level. Larger
-     * amp = taller peaks / deeper valleys. */
+    /* How big the first random nudge is, in rows. Bigger means taller
+     * peaks and deeper dips. */
     float        amp_init;
 
-    /* Per-level amplitude multiplier. < 0.5 = smoother than Brownian
-     * (dunes, hills), 0.5 = Brownian, > 0.5 = rougher (cities, crystals).
-     * Maps to fBm Hurst exponent H via roughness = 2^-H. */
+    /* How jagged the line is: how much of each nudge survives to the
+     * next, finer level. Below 0.5 looks smooth, above 0.5 looks rough.
+     * We use the range 0.30 to 0.85. */
     float        roughness;
 
-    /* Endpoint y-offsets relative to y_centre. Non-zero values give
-     * the line an overall slope baked into its endpoints (CLIFF,
-     * SAWTOOTH, PETRA-tilted-strata). Zero = symmetric endpoints. */
+    /* Shift the two ends up or down from y_centre. Use these to tilt the
+     * whole line (a cliff, a sawtooth, tilted rock layers). Zero means
+     * both ends sit level. */
     float        left_dy, right_dy;
 
-    /* Render params — consumed by render_line(). */
+    /* --- look: how to paint the line --- */
 
-    /* Palette band 0..3 for the fill / thin-line colour. */
+    /* Which of the theme's four colours to fill with (0..3). */
     int          pair_idx;
 
-    /* Palette band 0..3 for an optional outline drawn on top of a
-     * fill (-1 = no outline). Lets COASTLINE paint a bright shore-line
-     * over its water fill, CITY a contrasting skyline over its building
-     * mass, CRYSTAL bright tips over the crystal body. */
+    /* Optional second colour for a thin outline drawn on top of the
+     * fill, or -1 for none. This is how COASTLINE gets a bright shore
+     * line over its water and CITY a crisp skyline over its buildings. */
     int          outline_idx;
 
-    /* FILL_BELOW / FILL_ABOVE / THIN_LINE — see RenderStyle. */
+    /* Fill below, fill above, or just the line — see RenderStyle. */
     RenderStyle  style;
 
-    /* GLYPH_LOW / MID / HIGH — selects which of the GlyphSet's three
-     * glyphs the renderer uses. Drives depth shading on multi-layer
-     * patterns (back layers GLYPH_LOW, front GLYPH_HIGH). */
+    /* Which of the three glyph weights to use; far layers go thin, near
+     * layers go thick to fake depth. */
     GlyphDensity glyph_density;
 } LineSpec;
 
-/* ── tier 1 — single-line silhouettes (1-5) ─────────────────────── *
- * One MD line per pattern. Varying y_centre, roughness, and fill
- * direction gives five distinct silhouette styles from the same
- * algorithm. Easiest tier to read — the algorithm in isolation. */
+/* ── tier 1 — one line each ──────────────────────────────────────── *
+ * Just one fractal line. Changing its height, roughness, and fill
+ * direction is enough to make five different scenes. */
 
-/* COASTLINE — water below a gentle coast line. The canonical MD demo:
- * coined the name "fractal coastline" (Mandelbrot 1967). */
+/* COASTLINE — water filled below a gentle shore. The classic example. */
 static int place_coastline(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -851,8 +520,8 @@ static int place_coastline(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* SKYLINE — visual inverse of COASTLINE: fill ABOVE the line, so the
- * silhouette reads as a coloured ceiling against a clear floor. */
+/* SKYLINE — COASTLINE flipped: fill above the line, so it reads as a
+ * coloured ceiling over open ground. */
 static int place_skyline(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -865,9 +534,8 @@ static int place_skyline(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* HORIZON — bare thin line, no fill. Shows the raw MD output with
- * nothing else on screen — the "what does this algorithm actually
- * produce" pattern. */
+/* HORIZON — just the bare line, nothing filled. Shows what the
+ * algorithm produces on its own. */
 static int place_horizon(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -880,9 +548,8 @@ static int place_horizon(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* DUNES — smooth rolling silhouette. roughness=0.40 (well below
- * Brownian's 0.50) makes amp decay fast, giving a quiet line with
- * gentle large-scale undulation only — sand-dune feel. */
+/* DUNES — low roughness so the small wobbles fade fast, leaving only
+ * gentle rolling waves like sand dunes. */
 static int place_dunes(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -895,9 +562,8 @@ static int place_dunes(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* CITY — opposite of DUNES. High roughness (0.75) keeps the amp
- * alive at every level — sharp peaks become skyscrapers, valleys
- * become streets. Outline draws the skyline against the sky. */
+/* CITY — the opposite of DUNES. High roughness keeps the small wobbles,
+ * so sharp peaks read as skyscrapers and the dips as streets. */
 static int place_city(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -910,13 +576,12 @@ static int place_city(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* ── tier 2 — paired lines (6-10) ──────────────────────────────── *
- * Two MD lines bracketing or stacking. Demonstrates how FILL_ABOVE
- * and FILL_BELOW combine to build enclosed spaces. */
+/* ── tier 2 — two lines each ─────────────────────────────────────── *
+ * A fill-above line and a fill-below line together can frame an open
+ * space between them. */
 
-/* VALLEY — canyon: top line fills upward (the ceiling rock), bottom
- * line fills downward (the floor rock); the gap between is the open
- * canyon. */
+/* VALLEY — a canyon: rock filled down from the top, rock filled up from
+ * the bottom, open air in the gap between. */
 static int place_valley(LineSpec out[], int max_n, int h)
 {
     if (max_n < 2) return 0;
@@ -934,8 +599,8 @@ static int place_valley(LineSpec out[], int max_n, int h)
     return 2;
 }
 
-/* CAVE — narrow VALLEY: same construction but tighter gap (y=0.40 +
- * y=0.60) and outlined roof/floor in band[3] for the dramatic glow. */
+/* CAVE — a tighter VALLEY with a brighter outline on the roof and floor
+ * for a glowing-edge look. */
 static int place_cave(LineSpec out[], int max_n, int h)
 {
     if (max_n < 2) return 0;
@@ -953,10 +618,8 @@ static int place_cave(LineSpec out[], int max_n, int h)
     return 2;
 }
 
-/* CLIFF — asymmetric endpoints (left low, right high) plus mid
- * roughness gives the classic terrain-cliff drop. The slope is
- * baked into the endpoint dys; the MD jitter on top gives natural
- * roughness. */
+/* CLIFF — one end low, the other high, so the line slopes; the random
+ * wobble on top makes the slope look like real rock. */
 static int place_cliff(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -971,9 +634,8 @@ static int place_cliff(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* PLATEAU — very low roughness (0.30) collapses MD into a near-flat
- * line with one big midpoint displacement and nothing else — gives
- * the broad flat-top + steep-sides feel of a mesa. */
+/* PLATEAU — very low roughness flattens the line into one big step:
+ * a broad flat top with steep sides, like a mesa. */
 static int place_plateau(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -986,9 +648,8 @@ static int place_plateau(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* REEF — two stacked FILL_BELOWs: deep sea floor (low band, low
- * density) in the back, coral reef (bright band, outlined) in front.
- * Front fills cover the back so depth reads correctly. */
+/* REEF — two filled layers: a dim sea floor behind, a bright outlined
+ * coral reef in front that paints over it. */
 static int place_reef(LineSpec out[], int max_n, int h)
 {
     if (max_n < 2) return 0;
@@ -1006,13 +667,12 @@ static int place_reef(LineSpec out[], int max_n, int h)
     return 2;
 }
 
-/* ── tier 3 — small layered stacks (11-15) ─────────────────────── *
- * 3-4 lines with depth shading. The parallax illusion comes from
- * GlyphDensity rising back-to-front (low → mid → high). */
+/* ── tier 3 — a few layered lines ────────────────────────────────── *
+ * Three or four lines stacked. Far layers use the thinnest character
+ * and near layers the thickest, which gives a sense of depth. */
 
-/* MOUNTAINS — 4 ranges back-to-front. y_centre decreases as we go
- * back (further → higher on screen), pair_idx tracks depth.
- * Fournier-Fussell-Carpenter 1982 fig.3. */
+/* MOUNTAINS — four ranges, the farther ones sitting higher and dimmer.
+ * (Fournier, Fussell & Carpenter 1982, fig. 3.) */
 static int place_mountains(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1031,8 +691,7 @@ static int place_mountains(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* HILLS — MOUNTAINS with roughness dropped to 0.40 → smoother
- * silhouettes, gentler rolling. Same parallax architecture. */
+/* HILLS — MOUNTAINS but smoother, for gentle rolling shapes. */
 static int place_hills(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1051,9 +710,8 @@ static int place_hills(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* ALPS — MOUNTAINS with roughness pushed to 0.70+ → sharp jagged
- * peaks. Roughness rises with depth so the front range is the most
- * spiky of all. */
+/* ALPS — MOUNTAINS but much rougher, for sharp jagged peaks; the front
+ * range is the spikiest. */
 static int place_alps(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1073,9 +731,7 @@ static int place_alps(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* RIDGES — 4 thin lines stacked, no fill. Each line is a clear ridge
- * silhouette without the visual weight of a fill, so all 4 layers
- * stay independently visible. */
+/* RIDGES — four thin lines, no fill, so all four stay visible at once. */
 static int place_ridges(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1093,9 +749,8 @@ static int place_ridges(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* TERRACES — 4 nearly-flat FILL_BELOW lines stacked. roughness=0.30
- * makes each line flat-ish; stacked at successive y values they read
- * as a stepped agricultural-terrace silhouette. */
+/* TERRACES — four nearly-flat filled lines at rising heights, reading
+ * as stepped farming terraces. */
 static int place_terraces(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1113,13 +768,12 @@ static int place_terraces(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* ── tier 4 — multi-layer stacks (16-20) ───────────────────────── *
- * 5-7 lines with low amplitude. Texture-like rather than silhouette-
- * like; the cumulative pattern is what the user sees, not any single
- * line. */
+/* ── tier 4 — many shallow lines ─────────────────────────────────── *
+ * Five to seven low, gentle lines. The overall texture is the point,
+ * not any one line. */
 
-/* WAVES — 6 thin ocean-surface lines stacked vertically. Low amp +
- * mid roughness gives the layered ocean-cross-section look. */
+/* WAVES — six thin, shallow lines stacked up the screen, like layers of
+ * an ocean seen edge-on. */
 static int place_waves(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1135,9 +789,8 @@ static int place_waves(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* STRATA — 7 nearly-flat thin lines. Very low amp (0.02) + very low
- * roughness (0.35) → near-horizontal lines, like sedimentary rock
- * strata viewed edge-on. */
+/* STRATA — seven barely-wavy lines, like flat rock layers seen from
+ * the side. */
 static int place_strata(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1153,9 +806,8 @@ static int place_strata(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* FOREST — 5 FILL_BELOW canopy layers with elevated roughness (0.65)
- * → the bumpy tops read as treetops, the stacked layers as receding
- * tree-line. Lower amp than MOUNTAINS so the canopies stay tight. */
+/* FOREST — five filled layers with bumpy tops that read as treetops,
+ * stacked to look like a receding tree line. */
 static int place_forest(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1173,9 +825,8 @@ static int place_forest(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* RAPIDS — 5 thin lines closely spaced around mid-height, very low
- * amp + high roughness → fast-rippling water surface, like a river
- * cross-section. */
+/* RAPIDS — five thin lines bunched near the middle, low and rough, for
+ * a fast-rippling river surface. */
 static int place_rapids(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1191,10 +842,8 @@ static int place_rapids(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* SEDIMENT — 5 FILL_BELOW layers with very low roughness, palette
- * cycling top-to-bottom. The stacked fills cover earlier layers, so
- * what remains visible is the SHELF of each successive layer — exactly
- * the visual signature of a layered geological cross-section. */
+/* SEDIMENT — five smooth filled layers, each painting over the last so
+ * only a thin shelf of each shows, like a cutaway through rock layers. */
 static int place_sediment(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1212,12 +861,12 @@ static int place_sediment(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* ── tier 5 — exotic / max-complex (21-30) ─────────────────────── *
- * Extreme parameters: roughness near 1, fill-above, asymmetric
- * endpoints, full randomisation. The frontier of what MD can do. */
+/* ── tier 5 — the exotic ones ────────────────────────────────────── *
+ * Settings pushed to their limits: very rough, tilted, upside-down, or
+ * fully random. */
 
-/* ATOLLS — high-roughness shore line at low y → many small peaks
- * poking out of the "water". Each peak reads as an island in a chain. */
+/* ATOLLS — a rough shore set low, so only small peaks poke out of the
+ * "water", each reading as a little island. */
 static int place_atolls(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -1230,9 +879,8 @@ static int place_atolls(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* CRYSTAL — extreme roughness (0.85): amp barely decays across levels,
- * so high-frequency jitter is preserved all the way down. Result is a
- * sharply spiked silhouette, like a crystal cluster. */
+/* CRYSTAL — roughness near its max, so the wobbles barely shrink and the
+ * line ends up sharply spiked, like a cluster of crystals. */
 static int place_crystal(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -1245,9 +893,8 @@ static int place_crystal(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* SAWTOOTH — CLIFF amplified: large endpoint asymmetry + high amp +
- * high roughness. The big slope plus all-scale roughness give a
- * dramatic saw-toothed terrain. */
+/* SAWTOOTH — CLIFF turned up: a steeper tilt plus heavy roughness give
+ * a dramatic saw-toothed slope. */
 static int place_sawtooth(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -1262,9 +909,8 @@ static int place_sawtooth(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* NEBULA — 6 thin lines at varied y_centre with HIGH amp + LOW
- * roughness. The smooth large-scale variations + irregular spacing
- * make the lines look like overlapping gas wisps. */
+/* NEBULA — six thin lines spread unevenly, tall but smooth, so they
+ * drift like overlapping wisps of gas. */
 static int place_nebula(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1280,9 +926,8 @@ static int place_nebula(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* STORM — combination pattern: 3 FILL_ABOVE turbulent cloud layers at
- * the top + 1 FILL_BELOW ground line at the bottom. Demonstrates how
- * different styles compose into a single coherent scene. */
+/* STORM — three rough cloud layers filled down from the top plus one
+ * ground line filled up from the bottom, mixing both fill styles. */
 static int place_storm(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1309,9 +954,8 @@ static int place_storm(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* AURORA — 4 thin lines tightly clustered in the upper third of the
- * screen, low roughness for smooth flowing wisps. Reads as ribbons of
- * aurora-borealis light moving across the sky. */
+/* AURORA — four smooth thin lines clustered near the top, flowing like
+ * ribbons of northern lights. */
 static int place_aurora(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1329,8 +973,8 @@ static int place_aurora(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* CEILING — high-roughness FILL_ABOVE at low y_centre. Spikes point
- * down from the filled ceiling, reading as stalactites in a cave roof. */
+/* CEILING — a rough line filled from the top down, so the spikes hang
+ * downward like stalactites from a cave roof. */
 static int place_ceiling(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -1343,9 +987,8 @@ static int place_ceiling(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* ISLANDS — like ATOLLS but lower roughness → fewer, larger islands
- * with smoother shorelines. The contrast pair makes ATOLLS feel "rocky"
- * and ISLANDS feel "tropical". */
+/* ISLANDS — ATOLLS but smoother, giving fewer, larger islands with
+ * softer shores. */
 static int place_islands(LineSpec out[], int max_n, int h)
 {
     if (max_n < 1) return 0;
@@ -1358,10 +1001,9 @@ static int place_islands(LineSpec out[], int max_n, int h)
     return 1;
 }
 
-/* PETRA — 3 tilted sandstone layers, each with different endpoint
- * asymmetry so they don't stack flat. The visual evokes the layered
- * tilted strata of the Petra rose-city carvings. Each row of the
- * layers[] table is one stratum; the loop body is pure data → struct. */
+/* PETRA — three sandstone layers, each tilted a different way so they
+ * don't stack flat, evoking the carved rock of Petra. Each row of the
+ * table below is one layer. */
 static int place_petra(LineSpec out[], int max_n, int h)
 {
     int n = 0;
@@ -1389,22 +1031,20 @@ static int place_petra(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/* random_unit_uniform — uniform sample in [0, 1). Coarser than
- * rand_signed (~1000 steps) but the only place we need it is the
- * CHAOS placer where exact resolution doesn't matter. */
+/* A random number from 0 up to (not including) 1, in coarse steps.
+ * Only CHAOS uses it, where fine precision doesn't matter. */
 static inline float random_unit_uniform(void)
 {
     return (float)(rand() % 1000) / 1000.0f;
 }
 
-/* random_in_range — uniform sample in [lo, lo + range). */
+/* A random number somewhere in [lo, lo + range). */
 static inline float random_in_range(float lo, float range)
 {
     return lo + random_unit_uniform() * range;
 }
 
-/* random_render_style — pick FILL_BELOW / FILL_ABOVE / THIN_LINE
- * with equal probability. */
+/* Pick one of the three fill styles at random. */
 static RenderStyle random_render_style(void)
 {
     switch (rand() % CHAOS_STYLE_COUNT) {
@@ -1414,17 +1054,15 @@ static RenderStyle random_render_style(void)
     }
 }
 
-/* random_outline_band — return a palette band index or -1 (no outline).
- * The 1-in-CHAOS_OUTLINE_DENOM probability means outlines are accents,
- * not the dominant visual. */
+/* Maybe give a line an outline colour (about 1 in 3), or -1 for none,
+ * so outlines stay an accent rather than the main thing. */
 static int random_outline_band(void)
 {
     return (rand() % CHAOS_OUTLINE_DENOM == 0) ? (rand() % N_BANDS) : -1;
 }
 
-/* CHAOS — 8 lines, every parameter randomised at INIT (not per frame
- * — the morph still works). Maximum visual complexity, no two presses
- * of 'r' look alike. */
+/* CHAOS — eight lines, every setting rolled at random, so no two resets
+ * look the same. */
 static int place_chaos(LineSpec out[], int max_n, int h)
 {
     int target = CHAOS_LINES_TARGET;
@@ -1445,10 +1083,7 @@ static int place_chaos(LineSpec out[], int max_n, int h)
     return n;
 }
 
-/*
- * pattern_setup — DISPATCHER. For each pattern, call its placer and
- * return the line count. One line per case — pure pseudocode.
- */
+/* Look up a preset and run its placer; returns how many lines it made. */
 static int pattern_setup(LineSpec out[], int max_n, Pattern p, int h)
 {
     switch (p) {
@@ -1502,30 +1137,20 @@ static int pattern_setup(LineSpec out[], int max_n, Pattern p, int h)
 /* ===================================================================== */
 
 /*
- * The scene is built out of four small sub-structs. Each owns ONE
- * concern, and Scene composes them. Splitting concerns into clearly-
- * typed sub-structs makes function signatures self-describing: any
- * function that takes `const Grid *` clearly cannot mutate the fractal;
- * any function that takes `FractalField *` clearly does not advance
- * morph time; and so on. Same architectural shape as the other field
- * files in this directory.
+ * The scene splits into four small pieces, each handling one thing, and
+ * Scene bundles them together. Splitting them this way means a function's
+ * arguments tell you what it can touch: a Grid argument can't change the
+ * lines, and so on.
  */
 
 /*
- * Grid — canvas geometry. Pure data: no buffers, no state. Lives at
- * the top of Scene because every layer (line generation, screen
- * centring, the render pipeline) needs the dimensions.
- *
- * INVARIANT. w ≤ MAP_W_MAX, h ≤ MAP_H_MAX always hold. app_pick_map_size()
- * enforces the clamp once per resize; downstream code may assume it.
- *
- * NO total_cells. Unlike the cell-space files (magnetic_fields,
- * flow_field_particles) we don't index a per-cell buffer here — the
- * render reads directly from the live[] lines, so this struct stays
- * minimal.
+ * Grid — the size of the drawing area, in character cells. Sits first
+ * because everything else needs to know the dimensions. The width and
+ * height never exceed MAP_W_MAX / MAP_H_MAX; app_pick_map_size() makes
+ * sure of that, so the rest of the code can assume it.
  */
 typedef struct {
-    int w, h;     /* current map width / height in cells */
+    int w, h;     /* drawing area width and height, in cells */
 } Grid;
 
 static inline bool grid_in_bounds(const Grid *g, int x, int y)
@@ -1534,30 +1159,22 @@ static inline bool grid_in_bounds(const Grid *g, int x, int y)
 }
 
 /*
- * FractalField — the algorithm's data source. Mirrors PoleField in
- * magnetic_fields.c and AttractorPool in flow_field_particles.c:
- * a fixed-size pool of "live data" the renderer reads from.
+ * FractalField — all the line data the renderer draws from.
  *
- *   spec[]        — per-line LineSpec (fractal params + render hints).
- *   keyframe_a[]  — A keyframe per line: start of the current A→B
- *                   morph. Each keyframe is a fully-generated MD
- *                   fractal polyline.
- *   keyframe_b[]  — B keyframe per line: target of the current morph.
- *                   When the morph completes, A ← B and B is regen'd.
- *   live[]        — the per-frame interpolated line. The renderer
- *                   reads ONLY this; it is the entire render contract
- *                   between scene_tick (writer) and scene_draw (reader).
+ * For each line we keep two fully-built shapes (keyframe_a and
+ * keyframe_b) and blend between them every frame into live[]. The
+ * renderer only ever reads live[]. We build the shapes only on reset
+ * and once per morph (roughly every 10 seconds), so the per-frame cost
+ * is just the cheap blend; building a shape from scratch is the
+ * expensive part. This two-shapes-and-blend trick is the standard way
+ * to animate between key poses.
  *
- * INTENT. The A/B/live split is the classic KEYFRAME + LERP animation
- * pattern. Keyframes are expensive to compute (md_generate runs
- * log₂(LINE_POINTS-1) levels, ~256 displacements per line). By
- * generating only at scene reset + morph rollover (every ~1/morph_rate
- * seconds — default ~10s) we keep the per-frame work to a cheap
- * linear interpolation in line_lerp.
- *
- * REFERENCES. Keyframe + in-between animation, Disney 1981 (Mealing).
- * Fractional Brownian motion / MD fractals, Fournier-Fussell-Carpenter
- * 1982 — see §5 for the algorithm reference.
+ *   spec[]        — each line's recipe (its LineSpec).
+ *   keyframe_a[]  — the shape the morph is coming from.
+ *   keyframe_b[]  — the shape the morph is heading toward. When it
+ *                   arrives, b becomes the new a and a fresh b is built.
+ *   live[]        — the blended shape for this frame; the only thing
+ *                   drawn.
  */
 typedef struct {
     int      n_lines;
@@ -1568,84 +1185,54 @@ typedef struct {
 } FractalField;
 
 /*
- * SimState — the single mutable per-tick scalar. Separated from
- * Controls (keyboard-driven knobs) so it is obvious what scene_tick
- * mutates vs. what the user does.
- *
- * morph_t advances each tick by ctrl.morph_rate · dt. When it crosses
- * 1.0, the morph "rolls over": keyframe A ← keyframe B, B is
- * regenerated to a fresh fractal, and morph_t resets to 0. The next
- * morph cycle then plays out from the new starting point.
- *
- * One scalar = one named struct. Tiny but worth its own type for
- * symmetry with the other field files (SimState in magnetic_fields,
- * curl_noise, flow_field, domain_warped — all just one or two floats).
+ * SimState — how far along the current morph we are. Kept apart from the
+ * user's controls so it's clear this is the one thing the sim changes on
+ * its own each tick. When it passes 1.0 the morph is done: the target
+ * shape becomes the new start, a fresh target is built, and this resets
+ * to 0.
  */
 typedef struct {
-    float morph_t;     /* 0..1 progress along the current A→B morph */
+    float morph_t;     /* 0 = at the start shape, 1 = at the target shape */
 } SimState;
 
 /*
- * Controls — user-facing knobs. Mutated only by app_handle_key(),
- * read by scene_tick (paused, morph_rate) and screen_draw (theme,
- * glyph_set, pattern).
- *
- * INTENT. Same model-vs-user-intent split as the other field files:
- * the dependency is strictly one-way. app_handle_key writes Controls,
- * never SimState; scene_tick reads Controls but only writes SimState
- * + FractalField buffers. Keeps the code linear.
- *
- * NO prev_pattern. Switching patterns triggers a full scene_reset
- * (see cycle_pattern in §9) because each pattern needs its own
- * LineSpec list — there's no need to detect the switch with a
- * one-tick lag.
+ * Controls — everything the user sets from the keyboard. Only the key
+ * handler writes these; the sim and the renderer only read them. That
+ * keeps the flow one-way and easy to follow.
  */
 typedef struct {
-    /* Gate for scene_tick: when true the morph freezes but the render
-     * loop continues so the HUD stays responsive. */
+    /* When true the morph freezes, but drawing keeps going so the HUD
+     * still responds to keys. */
     bool    paused;
 
-    int     current_theme;       /* index into themes[N_THEMES]          */
-    int     current_glyph_set;   /* index into glyph_sets[N_GLYPH_SETS]  */
-    Pattern current_pattern;     /* the active fractal-silhouette preset */
+    int     current_theme;       /* which theme is active     */
+    int     current_glyph_set;   /* which glyph set is active */
+    Pattern current_pattern;     /* which preset is active    */
 
-    /* Fraction of an A→B morph completed per second. Doubled by '+',
-     * halved by '-', clamped to [MORPH_RATE_MIN, MORPH_RATE_MAX].
-     * 0.10 → full A→B over 10 seconds (the default). */
+    /* How fast lines morph, as a fraction of the trip per second. '+'
+     * doubles it, '-' halves it; the default finishes in 10 seconds. */
     float   morph_rate;
 } Controls;
 
 /*
- * Scene — the umbrella context. Reading this struct top-to-bottom is
- * meant to be the fastest way to understand the program:
- *   grid     → where things live      (geometry)
- *   fractal  → the MD lines           (data source / keyframes / live)
- *   sim      → animation state        (morph_t)
- *   ctrl     → user knobs             (pattern, theme, morph_rate, …)
- *
- * ORDERING. Each sub-struct depends only on those declared above it:
- * grid is leaf-level; fractal needs grid bounds for placement; sim
- * mutates fractal via interpolate_live_lines; ctrl decides which sim
- * path runs. A reader scanning top-down meets every concept before it
- * is used.
+ * Scene — the whole simulation in one place. Reading it top to bottom
+ * is the quickest way to see how the program fits together: the drawing
+ * area, then the lines, then the morph progress, then the user's
+ * settings. Each piece only needs the ones above it.
  */
 typedef struct {
-    Grid          grid;       /* canvas dimensions                          */
-    FractalField  fractal;    /* MD lines + per-line A/B keyframes + live   */
-    SimState      sim;        /* morph_t — mutated only by scene_tick       */
-    Controls      ctrl;       /* mutated only by app_handle_key             */
+    Grid          grid;       /* drawing-area size           */
+    FractalField  fractal;    /* the lines and their shapes  */
+    SimState      sim;        /* morph progress              */
+    Controls      ctrl;       /* the user's settings         */
 } Scene;
 
-/* ── fractal generation pipeline ─────────────────────────────────── *
- * MD-fractal generation factored into ONE primitive operation
- * (generate_keyframe) and named bulk operations that work on the
- * whole FractalField. */
+/* ── building the line shapes ─────────────────────────────────────── */
 
 /*
- * generate_keyframe — produce ONE fresh MD-fractal line for the given
- * spec. The endpoints are anchored at y_centre ± left_dy / ± right_dy
- * but jittered by ±amp_init/2 so successive keyframes have distinct
- * starting shapes (no two morphs are identical).
+ * Builds one fresh shape for a line. The two ends start near the line's
+ * centre height (shifted by its tilt) but get a small random wobble too,
+ * so each new shape is a little different and the morphs never repeat.
  */
 static void generate_keyframe(const LineSpec *s, float *out)
 {
@@ -1668,11 +1255,9 @@ static void generate_all_keyframes_b(FractalField *ff)
 }
 
 /*
- * rotate_keyframes — keyframe rollover at the end of each morph:
- * A ← B (the line that WAS the target becomes the new start), then B
- * is regenerated to a fresh fractal. The morph then runs again from
- * A=old_B to B=new fractal. Net effect: continuous evolution with no
- * visible snap.
+ * Called when a morph finishes: the shape we just reached becomes the
+ * new starting shape, and a fresh target is built. This is what lets the
+ * lines keep evolving without ever jumping.
  */
 static void rotate_keyframes(FractalField *ff)
 {
@@ -1693,9 +1278,8 @@ static void interpolate_live_lines(FractalField *ff, float morph_t)
                   ff->live[i], LINE_POINTS, morph_t);
 }
 
-/* ── morph clock ─────────────────────────────────────────────────── *
- * Three trivial operations on SimState, named so scene_tick reads as
- * pseudocode rather than algebra. */
+/* ── morph progress ──────────────────────────────────────────────── *
+ * Three tiny helpers, named so the tick loop reads like plain steps. */
 
 static void advance_morph(SimState *sim, float morph_rate, float dt)
 {
@@ -1712,7 +1296,7 @@ static void reset_morph(SimState *sim)
     sim->morph_t = 0.0f;
 }
 
-/* ── reset / init pipeline ───────────────────────────────────────── */
+/* ── setup and reset ─────────────────────────────────────────────── */
 
 static void apply_grid_dimensions(Grid *g, int w, int h)
 {
@@ -1746,16 +1330,11 @@ static void scene_init(Scene *s, int w, int h)
     scene_reset(s, w, h);
 }
 
-/* ── tick pipeline ───────────────────────────────────────────────── *
- * scene_tick is the per-frame pseudocode:
- *
- *     if paused: stop.
- *     advance morph_t by morph_rate · dt.
- *     if morph_t completed: rotate keyframes (A ← B, regen B), reset.
- *     interpolate every line: live ← lerp(keyframe_a, keyframe_b, t).
- *
- * Each step is one named call. */
-
+/*
+ * One simulation step: unless paused, push the morph forward a bit, swap
+ * in a new target if it finished, then blend every line's two shapes
+ * into the live shape that gets drawn.
+ */
 static void scene_tick(Scene *s, float dt)
 {
     if (s->ctrl.paused) return;
@@ -1773,23 +1352,13 @@ static void scene_tick(Scene *s, float dt)
 /* ===================================================================== */
 
 /*
- * Screen — terminal dimensions cached after the last successful
- * getmaxyx(). Refreshed on SIGWINCH via screen_resize().
- *
- * INTENT. Kept tiny because the rest of ncurses' state lives
- * implicitly in stdscr; we only need the dimensions to centre the
- * map and position HUD elements. Anything else (current attribute,
- * cursor position, colour-pair table) is owned by ncurses internals,
- * not by us — exposing it here would just duplicate state.
- *
- * NOT IN SCENE. Screen lives at App-level, not Scene, because Scene
- * is "the simulation" and the simulation is display-agnostic: any
- * scene state should be reusable on a different display backend. The
- * terminal-cell dimensions are a property of the display, not the sim.
+ * Screen — the terminal's current size in characters. We only track
+ * this much because ncurses keeps the rest of its state itself; we just
+ * need the size to centre the scene and place the HUD. Re-read on resize.
  */
 typedef struct {
-    int cols;   /* terminal width  in character cells */
-    int rows;   /* terminal height in character cells */
+    int cols;   /* terminal width  in characters */
+    int rows;   /* terminal height in characters */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -1812,11 +1381,7 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * draw_fill_below_line — for each on-screen column, fill from the
- * line's y down to the bottom of the map with the given pair / glyph.
- * Used by COASTLINE / CITY / MOUNTAINS.
- */
+/* Fills every column from the line down to the floor. */
 static void draw_fill_below_line(const float *line, int n_points,
                                  int gx0, int gy0, int map_w, int map_h,
                                  int cols, int rows, int pair, char glyph)
@@ -1838,11 +1403,7 @@ static void draw_fill_below_line(const float *line, int n_points,
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/*
- * draw_fill_above_line — visual inverse of draw_fill_below_line: for
- * each on-screen column, fill from row 0 down to the line's y. Used
- * by SKYLINE, VALLEY-top, CAVE-top, CEILING, STORM clouds.
- */
+/* Fills every column from the ceiling down to the line. */
 static void draw_fill_above_line(const float *line, int n_points,
                                   int gx0, int gy0, int map_w, int map_h,
                                   int cols, int rows, int pair, char glyph)
@@ -1864,11 +1425,8 @@ static void draw_fill_above_line(const float *line, int n_points,
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/*
- * draw_line_only — render only the line itself as a thin outline
- * (no fill below or above). Used by THIN_LINE patterns + as the
- * outline pass on top of any fill style.
- */
+/* Draws just the line, one character per column. Also used to add an
+ * outline on top of a fill. */
 static void draw_line_only(const float *line, int n_points,
                            int gx0, int gy0, int map_w, int map_h,
                            int cols, int rows, int pair, char glyph)
@@ -1887,8 +1445,7 @@ static void draw_line_only(const float *line, int n_points,
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* pick_glyph — translate LineSpec density into the matching GlyphSet
- * character. Three-tier mapping reads as pseudocode in render_line. */
+/* Picks the thin, middle, or thick character for a line's chosen weight. */
 static char pick_glyph(GlyphDensity density, const GlyphSet *gs)
 {
     switch (density) {
@@ -1899,10 +1456,8 @@ static char pick_glyph(GlyphDensity density, const GlyphSet *gs)
     return gs->high;
 }
 
-/* maybe_paint_outline — if the spec carries an outline band, draw the
- * line a second time as a thin overlay in that colour at GLYPH_HIGH.
- * Hoisted so the FILL_BELOW and FILL_ABOVE branches of render_line
- * share one outline implementation. */
+/* If the line wants an outline, draw it once more on top in the outline
+ * colour. Shared by both fill styles. */
 static void maybe_paint_outline(const LineSpec *spec, const float *line, int n_points,
                                  int gx0, int gy0, int map_w, int map_h,
                                  int cols, int rows, const GlyphSet *gs)
@@ -1913,15 +1468,9 @@ static void maybe_paint_outline(const LineSpec *spec, const float *line, int n_p
 }
 
 /*
- * render_line — the per-line render dispatcher. Reads as pseudocode:
- *   pick glyph for density.
- *   pick palette pair.
- *   switch on style → paint the matching fill / thin line.
- *   if any fill, maybe overlay an outline.
- *
- * SINGLE DISPATCH POINT. scene_draw just calls this for each line in
- * spec[]; the renderer is pattern-agnostic, every pattern's visual
- * decisions live in its LineSpec.
+ * Draws one line: pick its character and colour, paint it in the chosen
+ * style, and add an outline if it has one. Every visual choice comes
+ * from the line's own recipe, so this works for any preset.
  */
 static void render_line(const LineSpec *spec, const float *line, int n_points,
                          int gx0, int gy0, int map_w, int map_h,
@@ -1950,9 +1499,8 @@ static void render_line(const LineSpec *spec, const float *line, int n_points,
     }
 }
 
-/* compute_centred_origin — top-left corner where the map is drawn.
- * Centres horizontally; reserves HUD_BAND_RESERVED_ROWS rows total
- * (HUD_TOP_ROWS top + HUD_BOTTOM_ROWS bottom). */
+/* Finds the top-left corner to start drawing at, centring the scene and
+ * leaving room for the HUD rows top and bottom. */
 static void compute_centred_origin(const Grid *g, int cols, int rows,
                                     int *out_gx0, int *out_gy0)
 {
@@ -1972,9 +1520,9 @@ static const GlyphSet *active_glyph_set(const Controls *c)
 }
 
 /*
- * scene_draw — walk the LineSpec list in declaration order. For fill
- * styles, that's back-to-front (later lines cover earlier), which is
- * exactly what the multi-layer patterns rely on for depth shading.
+ * Draws all the lines in list order. Later lines paint over earlier
+ * ones, so listing them back-to-front makes front layers cover the ones
+ * behind — that's how the stacked scenes get their sense of depth.
  */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
@@ -1988,14 +1536,9 @@ static void scene_draw(const Scene *s, int cols, int rows)
     }
 }
 
-/* ── HUD draw pipeline ───────────────────────────────────────────── *
- * Five named drawers, called from screen_draw in z-order. The TOP HUD
- * (rows 0..1) carries DATA — current state with [N/30] index, parameter
- * readouts, palette swatch, glyph indicator. The BOTTOM HUD (row N-1)
- * carries ACTIONS — key bindings only.
- *
- * draw_hud_status_line internally composes several smaller segment
- * drawers, one per fixed-width row-1 field. */
+/* ── the HUD ──────────────────────────────────────────────────────── *
+ * The top two rows show what's going on (state, settings, colours,
+ * glyphs); the bottom row lists the keys. */
 
 static void draw_hud_state_bar(const Screen *sc, const Scene *s,
                                 double fps, int sim_fps)
@@ -2023,10 +1566,9 @@ static void draw_hud_title(void)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* ── row 1 segment drawers ───────────────────────────────────────── *
- * draw_hud_status_line lays out row 1 left-to-right as a sequence of
- * fixed-width segments. Each segment paints its content and returns
- * the new x-cursor; the last (sim_counts) does not need to return. */
+/* ── row 1 fields ─────────────────────────────────────────────────── *
+ * These paint row 1 left to right. Each draws its bit and returns where
+ * the next one should start. */
 
 static int draw_status_pattern_field(int row, int x, Pattern p)
 {
@@ -2064,8 +1606,7 @@ static int draw_palette_swatch(int row, int x)
     return x;
 }
 
-/* draw_status_sim_counts — last segment: live line + point counts +
- * map dimensions. No return — end of the row. */
+/* Last field: line count, points per line, and scene size. */
 static void draw_status_sim_counts(int row, int x, const Scene *s)
 {
     attron (COLOR_PAIR(PAIR_HUD));
@@ -2085,9 +1626,8 @@ static void draw_hud_status_line(const Scene *s)
         draw_status_sim_counts    (1, x, s);
 }
 
-/* draw_hud_glyph_indicator — right-aligned on row 1. Live sample of
- * the three glyphs in the current set so the user can see what each
- * set looks like before switching with g/G. */
+/* Right side of row 1: shows the current set's three characters so you
+ * can preview a set before switching with g/G. */
 static void draw_hud_glyph_indicator(const Scene *s, const Screen *sc)
 {
     const GlyphSet *gs = active_glyph_set(&s->ctrl);
@@ -2101,7 +1641,7 @@ static void draw_hud_glyph_indicator(const Scene *s, const Screen *sc)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* draw_bottom_hint — row N-1: ACTIONS only (key bindings). */
+/* Bottom row: the list of keys. */
 static void draw_bottom_hint(const Screen *sc)
 {
     attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -2115,11 +1655,11 @@ static void screen_draw(Screen *sc, const Scene *s,
 {
     erase();
     scene_draw              (s, sc->cols, sc->rows);
-    draw_hud_state_bar      (sc, s, fps, sim_fps);   /* row 0  : data    */
-    draw_hud_title          ();                       /* row 0  : data    */
-    draw_hud_status_line    (s);                      /* row 1  : data    */
-    draw_hud_glyph_indicator(s, sc);                  /* row 1  : data    */
-    draw_bottom_hint        (sc);                     /* row N-1: actions */
+    draw_hud_state_bar      (sc, s, fps, sim_fps);
+    draw_hud_title          ();
+    draw_hud_status_line    (s);
+    draw_hud_glyph_indicator(s, sc);
+    draw_bottom_hint        (sc);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -2129,40 +1669,28 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — top-level program state. One instance, g_app, lives in BSS
- * so the signal handlers can reach it without a global Scene pointer.
- * The App owns the Scene and the Screen and adds:
- *   • simulation parameters that are not really "scene state"
- *     (sim_fps, map_w, map_h);
- *   • signal-driven flags that must be sig_atomic_t for safety.
+ * App — the whole running program. There's one of these, g_app, kept as
+ * a global so the signal handlers can reach it. It holds the scene, the
+ * terminal size, a few settings, and the flags the handlers set.
  *
- * SIGNAL-HANDLER DISCIPLINE. The handlers do nothing but set a flag.
- * The main loop polls those flags and performs the actual work
- * (cleanup, resize) in normal execution context. Standard async-
- * signal-safe pattern — anything that touches ncurses or malloc MUST
- * happen outside the handler.
- *
- * QUALIFIER NOTE. The running / need_resize flags carry BOTH
- * `volatile` and `sig_atomic_t`. sig_atomic_t guarantees writes from
- * a handler are observed atomically by the main loop; volatile
- * prevents the compiler from caching the read in a register across
- * loop iterations. Both qualifiers are required — sig_atomic_t alone
- * permits caching, volatile alone permits torn writes from a handler.
- *
- * REFERENCE. W. Richard Stevens & Stephen Rago — "Advanced Programming
- * in the UNIX Environment" (3rd ed), ch. 10 on signals, for the full
- * discussion of async-signal-safety and sig_atomic_t.
+ * The running and need_resize flags are touched by signal handlers, so
+ * they're marked volatile sig_atomic_t: that makes a handler's write
+ * land safely and stops the main loop from caching a stale value. The
+ * handlers themselves do nothing but flip a flag; the real work happens
+ * back in the main loop, since it isn't safe to call things like ncurses
+ * from inside a handler. (Stevens & Rago, "Advanced Programming in the
+ * UNIX Environment", ch. 10, covers why.)
  */
 typedef struct {
-    Scene                 scene;     /* the simulation                       */
-    Screen                screen;    /* current terminal dimensions          */
+    Scene                 scene;     /* the simulation              */
+    Screen                screen;    /* current terminal size       */
 
-    int                   sim_fps;   /* tick rate; mutated by '[' and ']'    */
-    int                   map_w;     /* chosen map width,  ≤ MAP_W_MAX       */
-    int                   map_h;     /* chosen map height, ≤ MAP_H_MAX       */
+    int                   sim_fps;   /* tick rate, set with [ and ] */
+    int                   map_w;     /* scene width  (capped)       */
+    int                   map_h;     /* scene height (capped)       */
 
-    volatile sig_atomic_t running;       /* 0 = exit main loop               */
-    volatile sig_atomic_t need_resize;   /* 1 = pending SIGWINCH             */
+    volatile sig_atomic_t running;       /* goes to 0 to quit             */
+    volatile sig_atomic_t need_resize;   /* set to 1 when the window resizes */
 } App;
 
 static App g_app;
@@ -2191,10 +1719,10 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* ── keyboard handlers ──────────────────────────────────────────────── *
- * Each key is one named action; app_handle_key is just a dispatcher. */
+/* ── keyboard ─────────────────────────────────────────────────────── *
+ * One named action per key; app_handle_key just routes to them. */
 
-/* bump_morph_rate — '+' / '-' geometric step on morph rate. */
+/* '+' doubles the morph speed, '-' halves it, kept within limits. */
 static void bump_morph_rate(Controls *c, int dir)
 {
     if (dir > 0) c->morph_rate *= 2.0f;
@@ -2203,7 +1731,7 @@ static void bump_morph_rate(Controls *c, int dir)
     if (c->morph_rate < MORPH_RATE_MIN) c->morph_rate = MORPH_RATE_MIN;
 }
 
-/* bump_sim_fps — '[' / ']' linear step on tick rate, clamped. */
+/* '[' and ']' step the tick rate up or down, kept within limits. */
 static void bump_sim_fps(App *app, int delta)
 {
     app->sim_fps += delta;
@@ -2223,9 +1751,9 @@ static void cycle_glyph_set(Controls *c, int dir)
         (c->current_glyph_set + dir + N_GLYPH_SETS) % N_GLYPH_SETS;
 }
 
-/* cycle_pattern — n/p step + full scene reset. We reset because each
- * pattern needs its own LineSpec list; reusing the previous pattern's
- * specs would give a glitched first frame. */
+/* Move to the next or previous preset. We rebuild the whole scene because
+ * each preset has its own set of lines; reusing the old ones would flash
+ * a wrong first frame. */
 static void cycle_pattern(App *app, int dir)
 {
     Controls *c = &app->scene.ctrl;
@@ -2265,8 +1793,8 @@ static void install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* advance_frame_clock — read the monotonic clock, compute dt since
- * the last call, clamp at the spiral-of-death guard. */
+/* How long since the last frame, with an upper limit so a long pause
+ * (like the laptop sleeping) doesn't make the sim try to catch up forever. */
 static int64_t advance_frame_clock(int64_t *frame_time)
 {
     int64_t now = clock_ns();
@@ -2276,8 +1804,9 @@ static int64_t advance_frame_clock(int64_t *frame_time)
     return dt;
 }
 
-/* simulate_pending_ticks — drain the fixed-timestep accumulator.
- * Source: Glenn Fiedler, "Fix Your Timestep". */
+/* Run as many fixed-size sim steps as the elapsed time has earned, so
+ * the sim advances at a steady rate no matter the frame rate.
+ * (Glenn Fiedler, "Fix Your Timestep".) */
 static void simulate_pending_ticks(App *app, int64_t *sim_accum,
                                     int64_t tick_ns, float dt_sec)
 {
@@ -2287,8 +1816,8 @@ static void simulate_pending_ticks(App *app, int64_t *sim_accum,
     }
 }
 
-/* maybe_update_fps_counter — every FPS_UPDATE_MS, fold the running
- * frame count into a smoothed fps reading. */
+/* Every half second or so, turn the frames-since-last-check into an fps
+ * number for the HUD; otherwise leave it alone. */
 static double maybe_update_fps_counter(int64_t *fps_accum,
                                         int *frame_count,
                                         double previous)
@@ -2301,7 +1830,8 @@ static double maybe_update_fps_counter(int64_t *fps_accum,
     return fps;
 }
 
-/* cap_frame_rate — sleep so frames are at most 1/target_fps apart. */
+/* Sleep off the rest of the frame's time budget so we don't redraw
+ * faster than the target rate. */
 static void cap_frame_rate(int64_t work_done_ns, int target_fps)
 {
     int64_t budget = NS_PER_SEC / target_fps;

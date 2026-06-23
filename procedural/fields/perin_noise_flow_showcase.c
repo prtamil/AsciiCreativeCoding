@@ -1,285 +1,23 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * perin_noise_flow_showcase.c
- *   — 30 ways to visualise a 2-D Perlin-noise field.
+ * perin_noise_flow_showcase.c — 30 ways to look at a Perlin-noise field.
  *
- * DEMO: A single Perlin-noise generator drives THIRTY distinct
- *       visualisations grouped into five tiers of complexity. Four of
- *       the patterns run particles over a derived vector field (FLOW,
- *       VORTEX, CURL, JITTER); the other 26 rasterise a scalar field
- *       per frame. The field slowly drifts via a time offset so every
- *       pattern evolves rather than looping:
+ * One noise generator drives thirty visuals. Four of them push particles
+ * around like dust on the wind; the other 26 just colour every cell from
+ * a math formula each frame. The whole field drifts slowly so nothing
+ * sits still. Keys: n/p switch visuals, r makes a brand-new field, t/T
+ * change colours.
  *
- *         Tier 1 — direct vis      : FLOW HEIGHT VALLEYS BANDED BINARY
- *         Tier 2 — shape transforms: RIDGE BILLOW ZEBRA RINGS PLASMA
- *         Tier 3 — domain warps    : CONTOUR WARP WARP_DEEP WARPRIDGE SLOPE
- *         Tier 4 — fractal/octave  : FBM FBM_HIGH RIDGED TURBLENC FBM_INV
- *         Tier 5 — texture/exotic  : MARBLE WOOD FIRE CLOUDS CAVES STARS
- *                                    VORTEX CURL JITTER CHAOS
- *
- *       Press 'r' to re-shuffle the Perlin permutation table for a
- *       wholly new field; n/p cycles patterns. The state bar shows
- *       [N/30] for the active preset.
- *
- * Study alongside: ../generational/voronoi_region_map.c — the other
- *       "field over the whole grid" showcase. Voronoi answers a
- *       discrete classifier question (nearest seed); Perlin noise is
- *       a continuous scalar field that you USE to drive other things
- *       (terrain, particles, textures). This file uses it as a flow
- *       field; the same noise + a height ramp would give terrain.
- *
- * Section map:
- *   §1 config   — grid, patterns, palette, themes, named constants
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes (N_BANDS trail colours each)
- *   §5 noise    — NoiseField + Perlin 2-D + multifractal kernels +
- *                 curl noise + 26 static-field pattern_*_at evaluators
- *   §6 scene    — Scene composing Grid, RenderBuffers, Particles,
- *                 NoiseField, SimState, Controls; per-frame tick,
- *                 particle pipeline, raster dispatcher
- *   §7 screen   — ASCII render: classify_trail_cell + paint_cell + HUD drawers
- *   §8 app      — signals, resize, named main-loop helpers
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reset (new noise permutation)
- *   n / N      next pattern (cycles through all 30 in tier order)
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      faster particles / faster field drift
- *   -          slower
- *   ] / [      raise / lower tick Hz
+ * Sister file: ./curl_noise_vector_field.c. The plain FLOW visual here
+ * lets streams pile up and thin out; the CURL visual (from that file)
+ * keeps flow swirling without ever bunching together. Perlin noise is
+ * the classic reference: Ken Perlin, "An image synthesizer", SIGGRAPH '85
+ * (https://mrl.cs.nyu.edu/~perlin/paper445.pdf).
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra perin_noise_flow_showcase.c \
  *       -o perlin_flow -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two pieces composed together.
- *                  (1) Perlin noise — Ken Perlin's 1985 gradient noise
- *                      function. Pseudo-random values at integer lattice
- *                      points are smoothly interpolated to produce a
- *                      continuous, naturally-varying scalar field. We
- *                      use the standard 2-D variant with a 256-entry
- *                      permutation table (duplicated to 512 to avoid
- *                      modulo at lookup time), Perlin's quintic fade
- *                      curve t³(t·(t·6-15)+10), and 8 hashed gradient
- *                      directions per lattice corner.
- *                  (2) Flow visualisation — for each particle, read
- *                      n = perlin(x·scale, y·scale + t) and let
- *                      angle = n · 2π. Step the particle by
- *                      (cos angle, sin angle) · speed each tick.
- *                      Curving paths emerge because the noise field
- *                      is locally smooth, so neighbouring particles
- *                      follow similar directions and the system
- *                      organises into streamlines.
- *
- *                  The TIME OFFSET (the "+ t" in y) makes the field
- *                  drift slowly, so the flow evolves rather than
- *                  looping in a fixed pattern. The drift rate is
- *                  tunable; default ~0.1 noise-units per second.
- *
- * Data-structure : Scene composes six sub-structs (see §6):
- *                    Grid          — w, h, total_cells
- *                    RenderBuffers — per-cell glow + color band (the
- *                                    render contract between sim and
- *                                    display layers)
- *                    Particles     — fixed pool of MAX_PARTICLES,
- *                                    pool[0..n-1] alive
- *                    NoiseField    — Perlin permutation (perm[512]);
- *                                    registered as the active source
- *                                    via noise_activate() so perlin2d
- *                                    reads it without signature noise
- *                    SimState      — field_time (drift offset)
- *                    Controls      — paused, speed, theme, pattern
- *                  Everything BSS — no heap allocation after startup.
- *
- * Rendering      : ASCII only. Per-cell buf.glow drives a density
- *                  ramp via classify_trail_cell (§7):
- *                    glow > GLYPH_HIGH_THRESH → '#'  (BOLD)
- *                    glow > GLYPH_MID_THRESH  → '*'  (BOLD)
- *                    glow > GLOW_THRESHOLD    → '.'  (NORMAL)
- *                    else                     → blank (skip)
- *                  Each cell also tracks the COLOUR of the most-recent
- *                  particle to visit it (one of N_BANDS theme colours),
- *                  so multiple particle "tribes" produce visibly
- *                  distinct streams. The density ramp on top of the
- *                  colour variation gives the flow a textured, painted
- *                  look. paint_cell is the single ncurses-I/O point.
- *
- * Performance    : O(N_particles) per tick — each particle does 1
- *                  Perlin lookup + 1 cell paint. With 256 particles
- *                  at 60 Hz that's ~15K perlin evaluations per second,
- *                  about 120 K arithmetic ops — completely free.
- *                  Trail decay is O(W·H) per tick (one multiply per
- *                  cell), ~700 K ops per second on a 200×56 grid.
- *                  Headroom for any speedup.
- *
- * References     : Algorithm / math
- *                  ────────────────
- *                  • Perlin, K. (1985) — "An image synthesizer",
- *                    SIGGRAPH '85 Proceedings 19(3):287-296. The
- *                    original paper. Introduced gradient noise,
- *                    turbulence (Σ|octaves|), MARBLE, WOOD, FIRE —
- *                    most of Tier-5 in this file is directly from
- *                    this paper:
- *                    https://mrl.cs.nyu.edu/~perlin/paper445.pdf
- *                  • Perlin, K. (2002) — "Improving noise",
- *                    SIGGRAPH '02. The QUINTIC FADE curve in §5
- *                    (6t⁵ − 15t⁴ + 10t³) is from this paper; gives
- *                    C² continuity across lattice boundaries vs. the
- *                    1985 cubic's C¹. Why our noise looks smoother
- *                    than a naïve Perlin implementation.
- *                  • Ebert, D. S., Musgrave, F. K., Peachey, D.,
- *                    Perlin, K. & Worley, S. (2003) — "Texturing and
- *                    Modeling: A Procedural Approach" (3rd ed,
- *                    Morgan Kaufmann). The definitive reference for
- *                    procedural texture synthesis: ch. 6 (Perlin)
- *                    covers TURBULENCE / MARBLE / WOOD; ch. 16
- *                    (Musgrave) covers RIDGED multifractal and fBm
- *                    variants; ch. 18 (Worley) covers cellular noise.
- *                    Every Tier-4 and Tier-5 pattern in this file
- *                    traces back to a chapter here.
- *                  • Voss, R. F. (1985) — "Random fractal forgeries",
- *                    in R. A. Earnshaw, ed., "Fundamental Algorithms
- *                    for Computer Graphics", Springer NATO ASI.
- *                    Theoretical foundation of fBm (fbm_octaves) and
- *                    fractional Brownian terrain. Where the "octave
- *                    sum with halved amplitude / doubled frequency"
- *                    convention comes from.
- *                  • Bridson, R., Houriham, J. & Nordenstam, M.
- *                    (2007) — "Curl-noise for procedural fluid flow",
- *                    SIGGRAPH 2007. The CURL pattern is straight
- *                    out of this paper: build a divergence-free
- *                    vector field as the 2-D curl of a scalar
- *                    Perlin potential. Particles following it never
- *                    converge or diverge — incompressible flow.
- *
- *                  Visualisation
- *                  ─────────────
- *                  • Quilez, I. — "Domain warping" (interactive
- *                    article):
- *                    https://iquilezles.org/articles/warp/
- *                    WARP, WARP_DEEP, WARPRIDGE are all from this
- *                    page. Quilez also covers the 2-step recursive
- *                    warp that gives WARP_DEEP its swirly look.
- *                  • Paul Bourke — "Character representation of grey
- *                    scale images":
- *                    https://paulbourke.net/dataformats/asciiart/
- *                    The canonical density → glyph ramp reference.
- *                    Underlies the .:low / *:mid / #:high mapping
- *                    in §7's scene_draw.
- *
- *                  Online tutorials
- *                  ────────────────
- *                  • The Book of Shaders — chapter on noise:
- *                    https://thebookofshaders.com/11/
- *                    Interactive WebGL examples of the same patterns
- *                    implemented in this file. Useful side-by-side
- *                    comparison when calibrating pattern parameters.
- *                  • Wikipedia — "Perlin noise":
- *                    https://en.wikipedia.org/wiki/Perlin_noise
- *                    Concise starting point with the lattice + fade
- *                    + gradient diagrams.
- *
- *                  See also
- *                  ────────
- *                  • ./curl_noise_vector_field.c — the standalone
- *                    showcase of curl noise; CURL pattern here is its
- *                    minimal embedding. That file covers Bridson 2007
- *                    in much more depth.
- *                  • ./domain_warped_noise_iq_style.c — the WARP /
- *                    WARP_DEEP showcase as a standalone Quilez-style
- *                    demo with a deeper treatment of the technique.
- *                  • ./midpoint_displacement_coastline.c,
- *                    ./magnetic_fields.c, ./flow_field_particles.c —
- *                    same Scene / Grid / *Field / SimState / Controls
- *                    composition pattern applied to different
- *                    algorithms; reading them together shows how the
- *                    architecture stays constant while the algorithm
- *                    changes.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Perlin noise is a way to build a SMOOTH, naturally-varying scalar
- * field over an arbitrary domain. Think of it as a height map of
- * rolling hills with no axis bias and no obvious repetition. By
- * itself it's just a cloud-like pattern; combine it with anything
- * directional (here: an angle for particle motion) and you get
- * structures that look organic — wind, fluid, smoke, cellular flow.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine the screen has invisible arrows on it, one per cell. Each
- * arrow points in a direction determined by the local noise value.
- * Drop hundreds of dust particles on the screen. Each particle reads
- * its arrow and steps in that direction. The dust accumulates along
- * the streamlines — visually the same as iron filings around a
- * magnet, except the field is a 2-D Perlin "wind".
- *
- * Why does the result look organic? Because Perlin noise is
- * SPATIALLY COHERENT — neighbouring points have nearby values, so
- * neighbouring particles see similar arrows, so streams form. Pure
- * white noise (uncorrelated random per cell) would scatter the
- * particles; Perlin's smoothness is what produces flow.
- *
- * Visible layers:
- *   1. Trails of '.', '*', '#' in 4 theme colours — recently-visited
- *      cells in their colour, density-shaded by glow.
- *   2. A faint structural pattern — high-density convergence zones
- *      (where streams meet) and sparse divergence zones (where they
- *      separate) emerge naturally from the noise topology.
- *   3. The flow EVOLVES — over a few seconds you see streams curve,
- *      bifurcate, dissolve, reform. That's the field-time drift.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. INIT. Shuffle perm[256], duplicate to perm[512]. Spawn N
- *     particles at random in-bounds positions, each with a random
- *     colour (1 of 4 theme tribes) and a random max_age.
- *  2. PER FRAME (driver is scene_tick in §6):
- *     a. advance_noise_time:  sim.field_time += FIELD_DRIFT · dt.
- *     b. if particle pattern (FLOW/VORTEX/CURL/JITTER):
- *          decay_trail_glow  every cell *= exp(-GLOW_DECAY · dt).
- *          step_all_particles — per particle:
- *            sample velocity via particle_velocity_at (pattern-mode
- *              dispatcher: FLOW = angle·π, VORTEX = +π/2,
- *              CURL = curl_noise_2d (normalised), JITTER = FLOW + noise).
- *            advect_particle_euler: (x, y) ← (x, y) + (vx, vy) · dt.
- *            deposit_trail_hit: buf.glow[idx] = 1.0; buf.color[idx] = tribe.
- *            if particle_is_expired: respawn at random in-bounds.
- *        else (static-field pattern):
- *          rasterise_pattern_field — overwrite every cell from the
- *          active pattern_*_at evaluator.
- *  3. The user can press 'r' to re-shuffle perm[] and respawn all
- *     particles (or 'n'/'p' to switch pattern). There is no automatic
- *     reset — the flow runs indefinitely until you ask for a new one.
- *
- * KEY FORMULAS
- * ────────────
- *  Perlin 2-D                   :
- *    1. (X, Y) = floor(x), floor(y); (xf, yf) = x − X, y − Y
- *    2. (u, v) = fade(xf), fade(yf)   where fade(t) = 6t⁵ − 15t⁴ + 10t³
- *    3. Hash 4 lattice corners via noise.perm[] table
- *    4. Compute 4 gradient·offset dot products (grad function)
- *    5. Bilinear lerp using (u, v) → noise value in roughly [-1, 1]
- *  FLOW angle                   : θ = n · π
- *  VORTEX angle                 : θ = n · π + π/2          (tangent)
- *  JITTER angle                 : θ = n · π + uniform jitter
- *  CURL velocity                : (vx, vy) = (∂ψ/∂y, -∂ψ/∂x), ψ = perlin2d
- *  Step                         : (Δx, Δy) = velocity · dt
- *  Field-drift                  : field_time' = field_time + FIELD_DRIFT · dt
- *  Glow decay                   : glow' = glow · exp(-GLOW_DECAY · dt)
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -309,20 +47,20 @@ enum {
     MAX_PARTICLES     = 1024,
     N_PARTICLES_DEF   =  256,
 
-    /* Particle lifetime range (ticks). Random max_age in this window
-     * so different particles "tire out" at different times → the
-     * streamlines are constantly being refreshed at random points. */
-    AGE_MIN_TICKS     =  60,        /* 1.0 s @ 60 Hz */
-    AGE_MAX_TICKS     = 360,        /* 6.0 s         */
+    /* How long a particle lives, in ticks. Each one picks a random
+     * lifetime in this range so they don't all die at once — that keeps
+     * the streams fresh instead of letting old paths dominate. */
+    AGE_MIN_TICKS     =  60,        /* about 1 second at 60 Hz */
+    AGE_MAX_TICKS     = 360,        /* about 6 seconds          */
 
     SIM_FPS_MIN       =  10,
     SIM_FPS_DEFAULT   =  60,
     SIM_FPS_MAX       = 240,
     SIM_FPS_STEP      =  10,
 
-    /* Speed multiplier (cells per second per particle). Default 8 ≈
-     * 0.13 cells/tick at 60 Hz — slow enough to read individual
-     * trails, fast enough that the flow evolves visibly. */
+    /* How fast particles move, in cells per second. The default is slow
+     * enough to follow a single trail by eye, fast enough that the flow
+     * keeps changing. */
     SPEED_MIN         =   1,
     SPEED_DEF         =   8,
     SPEED_MAX         =  64,
@@ -330,103 +68,92 @@ enum {
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* ncurses colour-pair slots. PAIR_HUD/PAIR_HINT are the standard
+     * heads-up display colours used across the whole project. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_TRAIL_BASE   =   3,        /* PAIR_TRAIL_BASE..+3 = 4 trail colours */
-    PAIR_FLASH        =   7,        /* vestigial — cross-file palette parity */
+    PAIR_TRAIL_BASE   =   3,        /* first of 4 trail colours */
+    PAIR_FLASH        =   7,        /* unused here; kept to match sister files */
 
-    /* Palette width — number of distinct colour bands per theme.
-     * Every LineSpec / particle carries pair_idx ∈ [0, N_BANDS). */
+    /* How many colours a theme has. Every cell and particle carries a
+     * band number from 0 to N_BANDS-1. */
     N_BANDS           =   4,
 };
 
-/* Glow decay rate per second. 0.6 → glow ≈ 5% after 5 seconds, so
- * trails persist long enough to read but fade out cleanly. */
+/* How fast trails fade, per second. Tuned so a trail stays readable for
+ * a few seconds, then disappears cleanly. */
 #define GLOW_DECAY          0.6f
-#define GLOW_THRESHOLD      0.05f
+#define GLOW_THRESHOLD      0.05f   /* below this a cell is drawn as blank */
 
-/* ── HUD layout ──────────────────────────────────────────────────── *
- * Top HUD carries DATA, bottom HUD carries ACTIONS:
- *   row 0           : title + state bar (fps, Hz, state + [N/M], speed)
- *   row 1           : pattern/theme/palette + scale/drift/map
- *   row HUD_TOP..N-2: noise-field map
- *   row N-1         : keyboard action hint
- */
+/* The screen reserves two rows up top and one at the bottom for the
+ * heads-up display; the noise map fills everything in between. */
 #define HUD_TOP_ROWS             2
 #define HUD_BOTTOM_ROWS          1
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
 #define HUD_LEFT_MARGIN          1
 
-/* Noise scale: lower = larger features, higher = finer detail. 0.04
- * gives noise periods of ~25 cells — balanced for 200×56 grids. */
+/* How zoomed-in the noise is. Smaller = big rolling shapes, larger =
+ * fine speckly detail. */
 #define NOISE_SCALE         0.04f
 
-/* Field drift per second (in noise-coordinate units). Slow drift so
- * the flow visibly evolves but doesn't churn. */
+/* How fast the whole field drifts, per second. Slow enough that the
+ * flow keeps changing without churning. */
 #define FIELD_DRIFT         0.10f
 
-/* Density thresholds for the ASCII glyph ramp. */
+/* Brightness cutoffs for picking the trail glyph: above HIGH it's '#',
+ * above MID it's '*', otherwise a faint '.'. */
 #define GLYPH_HIGH_THRESH   0.65f
 #define GLYPH_MID_THRESH    0.30f
 
 /*
- * Pattern — 30 distinct visualisations of a Perlin-noise field,
- * spanning simple → complex. Cycle with n/p.
+ * Pattern — which of the 30 visuals is showing. Cycle with n/p.
  *
- * INTENT. The simulation kernel (Perlin noise + per-frame field drift)
- * is shared across all patterns; only the pattern-specific evaluator
- * differs. Four patterns (FLOW, VORTEX, CURL, JITTER) run particles
- * over a derived vector field; the other 26 rasterise a scalar field
- * into the trail buffer each frame.
- *
- * TIER ORGANISATION.
- *   1 (direct vis)        — single Perlin sample → glow/colour
- *   2 (shape transforms)  — ridge, billow, periodic functions of noise
- *   3 (domain warps)      — Quilez-style warps, slope, contour
- *   4 (fractal/octave)    — fBm, ridged, turbulence multifractals
- *   5 (texture + exotic)  — marble, wood, fire, particle modes, chaos
+ * All 30 share the same noise generator and the same slow drift; they
+ * only differ in how they turn a noise value into something on screen.
+ * Four of them (FLOW, VORTEX, CURL, JITTER) move particles around; the
+ * rest just recolour every cell from a formula each frame. They're
+ * grouped into five tiers, roughly simplest to most elaborate.
  */
 typedef enum {
-    /* Tier 1 — direct visualisations */
-    PATTERN_FLOW       =  0,    /* particle: angle = noise·π          */
-    PATTERN_HEIGHT     =  1,    /* glow = noise·0.5 + 0.5             */
-    PATTERN_VALLEYS    =  2,    /* glow = 1 - height                  */
-    PATTERN_BANDED     =  3,    /* quantised noise levels             */
-    PATTERN_BINARY     =  4,    /* threshold cut at 0.5               */
+    /* Tier 1 — show the noise more or less directly */
+    PATTERN_FLOW       =  0,    /* particles drift along the noise        */
+    PATTERN_HEIGHT     =  1,    /* bright where noise is high             */
+    PATTERN_VALLEYS    =  2,    /* the inverse: bright where noise is low */
+    PATTERN_BANDED     =  3,    /* snap heights into a few flat levels    */
+    PATTERN_BINARY     =  4,    /* just on or off, split down the middle  */
 
-    /* Tier 2 — shape transforms */
-    PATTERN_RIDGE      =  5,    /* 1 - |n| — sharp peaks at n=0       */
-    PATTERN_BILLOW     =  6,    /* |n| — cloud bumps                  */
-    PATTERN_ZEBRA      =  7,    /* sin(n·freq) — stripes              */
-    PATTERN_RINGS      =  8,    /* sin(radius + noise) — concentric   */
-    PATTERN_PLASMA     =  9,    /* sin(n + sin(x+y)) — plasma         */
+    /* Tier 2 — reshape a single noise sample */
+    PATTERN_RIDGE      =  5,    /* sharp ridges where noise crosses zero  */
+    PATTERN_BILLOW     =  6,    /* puffy cloud bumps (inverse of ridge)   */
+    PATTERN_ZEBRA      =  7,    /* parallel stripes                       */
+    PATTERN_RINGS      =  8,    /* rings from the centre, warped by noise */
+    PATTERN_PLASMA     =  9,    /* old-school demoscene plasma look       */
 
-    /* Tier 3 — domain warps + gradient */
-    PATTERN_CONTOUR    = 10,    /* level-set bands (topographic)      */
-    PATTERN_WARP       = 11,    /* single-step domain warp            */
-    PATTERN_WARP_DEEP  = 12,    /* recursive 2-step warp              */
-    PATTERN_WARPRIDGE  = 13,    /* ridge of warped field              */
-    PATTERN_SLOPE      = 14,    /* gradient magnitude (finite diff)   */
+    /* Tier 3 — bend the coordinates before sampling */
+    PATTERN_CONTOUR    = 10,    /* contour lines like a topographic map   */
+    PATTERN_WARP       = 11,    /* noise nudges its own coordinates once  */
+    PATTERN_WARP_DEEP  = 12,    /* warp twice for a much swirlier look    */
+    PATTERN_WARPRIDGE  = 13,    /* ridges on top of a warped field        */
+    PATTERN_SLOPE      = 14,    /* bright on steep slopes, dark on flats  */
 
-    /* Tier 4 — fractal / octave compositions */
-    PATTERN_FBM        = 15,    /* 4-octave fractional Brownian       */
-    PATTERN_FBM_HIGH   = 16,    /* 8-octave high-detail fBm           */
-    PATTERN_RIDGED     = 17,    /* Musgrave ridged multifractal       */
-    PATTERN_TURBLENC   = 18,    /* sum of |octaves| — Perlin marble   */
-    PATTERN_FBM_INV    = 19,    /* 1 - fbm                            */
+    /* Tier 4 — stack many copies of noise at different sizes */
+    PATTERN_FBM        = 15,    /* layered noise: detail at every scale   */
+    PATTERN_FBM_HIGH   = 16,    /* same idea, twice the layers / detail   */
+    PATTERN_RIDGED     = 17,    /* layered ridges → sharp mountain ranges */
+    PATTERN_TURBLENC   = 18,    /* layered |noise| → the base for marble  */
+    PATTERN_FBM_INV    = 19,    /* layered noise, inverted                */
 
-    /* Tier 5 — texture + exotic + particle modes */
-    PATTERN_MARBLE     = 20,    /* sin(x·k + turbulence·a) veins      */
-    PATTERN_WOOD       = 21,    /* fract(radius·k + turbulence·a)     */
-    PATTERN_FIRE       = 22,    /* turbulence shaped by y-mask        */
-    PATTERN_CLOUDS     = 23,    /* fbm smoothstep threshold           */
-    PATTERN_CAVES      = 24,    /* fbm inverse-threshold (carve out)  */
-    PATTERN_STARS      = 25,    /* high-octave sparse threshold       */
-    PATTERN_VORTEX     = 26,    /* particle: tangent (perp to flow)   */
-    PATTERN_CURL       = 27,    /* particle: divergence-free curl     */
-    PATTERN_JITTER     = 28,    /* particle: flow + angle jitter      */
-    PATTERN_CHAOS      = 29,    /* multi-noise composite              */
+    /* Tier 5 — textures, the moving particle modes, and chaos */
+    PATTERN_MARBLE     = 20,    /* marble veins                           */
+    PATTERN_WOOD       = 21,    /* wood-grain rings                       */
+    PATTERN_FIRE       = 22,    /* flames, hot at the bottom              */
+    PATTERN_CLOUDS     = 23,    /* soft cloud blobs                       */
+    PATTERN_CAVES      = 24,    /* carved-out cave shapes                 */
+    PATTERN_STARS      = 25,    /* sparse bright specks                   */
+    PATTERN_VORTEX     = 26,    /* particles swirl sideways to the flow   */
+    PATTERN_CURL       = 27,    /* particles in endless swirls, no piling */
+    PATTERN_JITTER     = 28,    /* FLOW with a random wobble added        */
+    PATTERN_CHAOS      = 29,    /* several noise samples mashed together  */
 
     N_PATTERNS         = 30,
 } Pattern;
@@ -468,111 +195,99 @@ static const char *pattern_name(Pattern p)
     }
 }
 
-/* WARP pattern: amount the warp distorts the input coordinates.
- * Higher = more swirly, lower = closer to plain noise. */
+/* How hard WARP bends its coordinates. Higher = more swirly. */
 #define WARP_AMOUNT         5.0f
 
-/* FBM pattern: how many octaves to stack. 4 is a good sweet spot —
- * adds visible fine detail without becoming noisy. */
+/* How many layers of noise FBM stacks. 4 looks detailed without going
+ * grainy. */
 #define FBM_OCTAVES         4
 
-/* CONTOUR pattern: noise values that draw bands. The band width
- * controls how thick each contour line appears. */
+/* The noise heights CONTOUR draws lines at, and how thick each line is. */
 #define CONTOUR_BAND_WIDTH  0.04f
 static const float CONTOUR_LEVELS[4] = { 0.20f, 0.40f, 0.60f, 0.80f };
 
-/* ── Tier-2 shape-transform constants ─────────────────────────────── */
-#define BANDED_LEVELS          6      /* quantisation steps for BANDED        */
-#define BINARY_THRESHOLD       0.5f   /* cutoff for BINARY                    */
-#define ZEBRA_FREQ             3.0f   /* sin frequency in noise units         */
-#define RING_FREQ              0.30f  /* radial wave frequency (rings/cell)   */
-#define RING_AMP               1.0f   /* noise perturbation of rings          */
-#define PLASMA_FREQ            0.05f  /* (x+y) modulation freq for PLASMA     */
+/* ── Tier-2 tuning ────────────────────────────────────────────────── */
+#define BANDED_LEVELS          6      /* how many flat steps BANDED snaps to   */
+#define BINARY_THRESHOLD       0.5f   /* where BINARY cuts on vs off           */
+#define ZEBRA_FREQ             3.0f   /* how close together ZEBRA's stripes are*/
+#define RING_FREQ              0.30f  /* how close together the rings are      */
+#define RING_AMP               1.0f   /* how much noise warps the rings        */
+#define PLASMA_FREQ            0.05f  /* size of PLASMA's diagonal waves       */
 
-/* ── Tier-3 warp + slope constants ────────────────────────────────── */
-#define WARP_DEEP_AMOUNT       8.0f   /* magnitude of 2nd-level warp          */
-#define SLOPE_EPS              1.0f   /* finite-diff step in cells            */
-#define SLOPE_GAIN             4.0f   /* multiply slope magnitude             */
+/* ── Tier-3 tuning ────────────────────────────────────────────────── */
+#define WARP_DEEP_AMOUNT       8.0f   /* strength of the second warp pass      */
+#define SLOPE_EPS              1.0f   /* how far apart SLOPE samples to measure steepness */
+#define SLOPE_GAIN             4.0f   /* brightness boost so slopes show up    */
 
-/* ── Tier-4 octave constants ──────────────────────────────────────── */
-#define FBM_HIGH_OCTAVES       8      /* high-detail fBm octave count         */
-#define MULTIFRAC_LACUNARITY   2.0f   /* per-octave frequency multiplier      */
-#define MULTIFRAC_GAIN         0.5f   /* per-octave amplitude decay           */
+/* ── Tier-4 tuning ────────────────────────────────────────────────── */
+#define FBM_HIGH_OCTAVES       8      /* layer count for the high-detail FBM   */
+/* When stacking noise layers: each layer is this much smaller (lacunarity)
+ * and this much fainter (gain) than the last. */
+#define MULTIFRAC_LACUNARITY   2.0f
+#define MULTIFRAC_GAIN         0.5f
 
-/* ── Tier-5 texture parameters ────────────────────────────────────── */
-#define MARBLE_FREQ            0.06f  /* base marble vein frequency           */
-#define MARBLE_AMP             5.0f   /* turbulence amplitude in marble sin   */
-#define WOOD_FREQ              0.08f  /* concentric grain ring frequency      */
-#define WOOD_AMP               3.0f   /* grain warp amount                    */
-#define FIRE_DRIFT_MULT        4.0f   /* fire flickers faster than base drift */
-#define CLOUDS_THRESH_LO       0.45f  /* smoothstep lo for CLOUDS             */
-#define CLOUDS_THRESH_HI       0.65f  /* smoothstep hi                        */
-#define CAVES_THRESH_LO        0.40f  /* smoothstep lo for CAVES (inverted)   */
+/* ── Tier-5 tuning ────────────────────────────────────────────────── */
+#define MARBLE_FREQ            0.06f  /* spacing of marble veins               */
+#define MARBLE_AMP             5.0f   /* how much the veins wander             */
+#define WOOD_FREQ              0.08f  /* spacing of wood-grain rings           */
+#define WOOD_AMP               3.0f   /* how much the grain wanders            */
+#define FIRE_DRIFT_MULT        4.0f   /* fire flickers faster than the rest    */
+/* CLOUDS and CAVES fade in between a low and a high noise level for a
+ * soft edge instead of a hard cut. */
+#define CLOUDS_THRESH_LO       0.45f
+#define CLOUDS_THRESH_HI       0.65f
+#define CAVES_THRESH_LO        0.40f
 #define CAVES_THRESH_HI        0.60f
-#define STARS_FREQ_MULT        4.0f   /* STARS uses ×4 noise frequency        */
-#define STARS_THRESHOLD        0.85f  /* only top 15% intensity becomes stars */
-#define JITTER_ANGLE_RANGE     1.5f   /* radians of angle jitter in JITTER    */
-#define CHAOS_WARP             10.0f  /* warp amount in CHAOS mix             */
+#define STARS_FREQ_MULT        4.0f   /* STARS samples finer noise             */
+#define STARS_THRESHOLD        0.85f  /* only the brightest ~15% become stars  */
+#define JITTER_ANGLE_RANGE     1.5f   /* how wild JITTER's random wobble is    */
+#define CHAOS_WARP             10.0f  /* warp strength in the CHAOS mix         */
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* §8 main loop — spiral-of-death dt clamp + terminal redraw cap
- * (Glenn Fiedler's "Fix Your Timestep"). */
-#define DT_MAX_NS       (100 * NS_PER_MS)   /* hard cap on per-frame dt */
-#define FRAME_CAP_FPS   60                  /* terminal redraw budget   */
+/* If a frame takes a really long time (laptop slept, terminal stalled),
+ * pretend it was at most this long so the sim doesn't try to catch up
+ * with a huge burst of ticks. Idea from Glenn Fiedler's "Fix Your
+ * Timestep". FRAME_CAP_FPS is how often we actually redraw. */
+#define DT_MAX_NS       (100 * NS_PER_MS)
+#define FRAME_CAP_FPS   60
 
-/* Particle-mode helpers — named constants for the small magic
- * numbers in particle_velocity_at and curl_noise_2d. */
-#define VORTEX_TURN_RADIANS  ((float)M_PI * 0.5f)   /* 90° perpendicular */
-#define VECTOR_EPSILON       1e-6f                  /* below this |v|, skip normalise */
+/* A quarter turn, used by VORTEX. And the smallest length we'll bother
+ * to normalise — anything shorter we leave alone to avoid divide-by-zero. */
+#define VORTEX_TURN_RADIANS  ((float)M_PI * 0.5f)
+#define VECTOR_EPSILON       1e-6f
 
-/* glow_to_col scale — multiplies a glow in [0, 1] to land in
- * [0, N_BANDS-ε]; the int-cast then floors into [0, N_BANDS-1]. */
+/* Turns a brightness from 0..1 into a colour band 0..N_BANDS-1. The odd
+ * 3.99 (instead of 4) keeps brightness 1.0 from spilling into band 4. */
 #define GLOW_COL_SCALE       3.99f
 
-/* ── HUD layout (column widths) ──────────────────────────────────── *
- * Row-1 segments are laid out left-to-right at fixed column widths so
- * each segment knows where the next one starts. */
-#define HUD_PATTERN_FIELD_W   20    /* " pattern:XXXXXXXXX " slot */
-#define HUD_THEME_FIELD_W     17    /* " theme:XXXXXXXX "   slot */
-#define HUD_PALETTE_LABEL_W    9    /* " palette:"          slot */
+/* Widths of the fields on the status row, so each one knows where the
+ * next starts. */
+#define HUD_PATTERN_FIELD_W   20    /* " pattern:XXXXXXXXX " */
+#define HUD_THEME_FIELD_W     17    /* " theme:XXXXXXXX "    */
+#define HUD_PALETTE_LABEL_W    9    /* " palette:"           */
 
 /*
- * Theme — one complete colour palette for the trail layer. Ten of
- * these live in themes[], cycled by t/T.
+ * Theme — one colour scheme for the trails. Ten of them live in
+ * themes[]; t/T cycles between them.
  *
- * INTENT. The smallest data needed to recolour every cell in the
- * render output: N_BANDS (=4) ramp colours arranged dim → bright,
- * plus a "flash" accent (vestigial here — kept for cross-file palette
- * parity with magnetic_fields.c, midpoint_displacement_coastline.c,
- * etc.). The four-band split forces theme authors to design the ramp
- * as a coherent low → high progression — same discipline as a Houdini
- * ramp parameter or Substance Designer gradient.
+ * Each theme is just four colours, arranged dark to bright. A cell's
+ * band number (0..3) picks which of the four to use: for the moving
+ * particle modes the band is the particle's own colour, picked at
+ * birth; for the formula modes it's set by how bright the cell is.
  *
- * BANDING MODEL. Both particle-mode and static-field patterns write a
- * pair_idx ∈ [0, 4) per cell into RenderBuffers.color. For particle
- * modes, the band is the spawning particle's "tribe" (rand() & 3 at
- * spawn). For static-field patterns, the band is derived from the
- * noise intensity (glow_to_col). The renderer reads buf.color[idx]
- * and looks up themes[ctrl.current_theme].trail[band] at draw time.
- *
- * COLOUR FORMAT. xterm-256 indices (NOT RGB). When the terminal
- * exposes fewer than 256 colours, theme_apply() substitutes a fixed
- * 8-colour cycle (COLOR_BLUE/CYAN/MAGENTA/YELLOW) so the demo still
- * runs on legacy TTYs.
- *
- * REFERENCE. The 256-colour cube layout (16 base + 6³ cube +
- * 24-step grayscale ramp) is documented in XTerm's ctlseqs.ms. The
- * trail values in themes[] are picked from the cube. See also
- * CLAUDE.md "Theme Palette Brightness" for the project-wide
- * bright-half constraint.
+ * The numbers are xterm-256 colour indices, not red/green/blue. On
+ * old terminals that only have 8 colours, theme_apply() swaps in a
+ * fixed blue/cyan/magenta/yellow set so the demo still runs. Keep every
+ * colour in the bright half of the palette (see CLAUDE.md "Theme Palette
+ * Brightness") or the darkest ones vanish against a black background.
  */
 typedef struct {
-    const char *name;              /* short uppercase label shown in HUD     */
-    short       trail[N_BANDS];    /* ramp: 0 = dim/low, N_BANDS-1 = bright  */
-    short       flash;             /* vestigial — kept for cross-file parity */
+    const char *name;              /* short label shown in the HUD            */
+    short       trail[N_BANDS];    /* the four colours, dark (0) to bright (3)*/
+    short       flash;             /* unused here; kept to match sister files */
 } Theme;
 
 #define N_THEMES 10
@@ -653,33 +368,24 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * NoiseField — the algorithm's data source. Holds Ken Perlin's
- * 256-entry permutation table, duplicated to perm[512] so the
- * lookups perm[X] and perm[X+1] never need an explicit modulo.
- *
- * INTENT. The noise field IS the scene's algorithm state — every
- * pattern in §6 reads from it. Placing perm[] in a struct (rather
- * than at file scope) means it lives on Scene like every other
- * piece of simulation state, and a reader of Scene can see where the
- * noise actually lives.
- *
- * REFERENCE. Perlin (1985) "An image synthesizer" — original paper.
- * The duplication trick (perm[i+256] = perm[i]) is the standard
- * accelerator from Perlin's reference implementation.
+ * NoiseField — the random ingredient every visual is built from. It's a
+ * shuffled list of the numbers 0..255 that the noise function uses as a
+ * lookup table. We store it shuffled once and then copied a second time
+ * (512 entries total) so the noise code can read two neighbouring
+ * entries without worrying about running off the end. A different
+ * shuffle gives a completely different field — that's what 'r' does.
+ * From Ken Perlin's original 1985 noise implementation.
  */
 typedef struct {
-    uint8_t perm[512];     /* shuffled 0..255 repeated twice */
+    uint8_t perm[512];     /* shuffled 0..255, then the same list again */
 } NoiseField;
 
 /*
- * g_active_noise — registered NoiseField that perlin2d() reads from.
- *
- * RATIONALE. perlin2d is called thousands of times per frame; threading
- * a NoiseField* through every pattern_*_at signature would pollute every
- * function. Instead the active NoiseField is registered once per
- * scene_reset via noise_activate(). Mirrors how ncurses' stdscr works
- * — there's logically one "current" instance and code reads it through
- * a stable global handle.
+ * The noise field that perlin2d() is currently reading from. perlin2d is
+ * called thousands of times a frame, so rather than pass the field into
+ * every single call we just point this at the active one once (in
+ * noise_activate, during reset). Same idea as ncurses' stdscr: one
+ * "current" thing everyone shares.
  */
 static const NoiseField *g_active_noise;
 
@@ -688,12 +394,8 @@ static inline void noise_activate(const NoiseField *nf)
     g_active_noise = nf;
 }
 
-/*
- * shuffle_noise_field — Fisher-Yates the 0..255 sequence using rand(),
- * duplicate into the upper half of perm[], then activate this
- * NoiseField as the current one. Different rand() state → different
- * permutation → wholly different noise field. Called at each reset.
- */
+/* Build a fresh random field: shuffle 0..255, copy it twice into perm[],
+ * and make it the active one. Each call gives a brand-new look. */
 static void shuffle_noise_field(NoiseField *nf)
 {
     uint8_t base[256];
@@ -709,12 +411,10 @@ static void shuffle_noise_field(NoiseField *nf)
     noise_activate(nf);
 }
 
-/*
- * fade — Perlin's improved-noise quintic fade curve.
- *   fade(t) = 6t⁵ − 15t⁴ + 10t³
- * Has zero first AND second derivative at t=0 and t=1, so the
- * resulting noise is C² continuous across lattice boundaries.
- */
+/* An S-shaped easing curve. When the noise blends between two grid
+ * points, feeding the blend amount through this first makes the result
+ * ease in and out instead of changing linearly, which is what keeps the
+ * field looking smooth rather than blocky. (Perlin's "improved noise".) */
 static inline float fade(float t)
 {
     return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
@@ -722,34 +422,31 @@ static inline float fade(float t)
 
 static inline float lerp(float a, float b, float t) { return a + t * (b - a); }
 
-/* ── small math helpers (used by Tier-2..5 patterns) ──────────────── */
-static inline float fract(float x)             { return x - floorf(x); }
-static inline float clampf(float x, float lo, float hi)
+/* ── small math helpers used by the Tier-2..5 visuals ──────────────── */
+static inline float fract(float x)             { return x - floorf(x); }  /* just the part after the decimal point */
+static inline float clampf(float x, float lo, float hi)  /* keep x within [lo, hi] */
 {
     return x < lo ? lo : (x > hi ? hi : x);
 }
+/* Like clampf, but eases smoothly from 0 to 1 between a and b instead of
+ * snapping — gives soft edges. */
 static inline float smoothstep(float a, float b, float x)
 {
     float t = clampf((x - a) / (b - a), 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
 }
 
-/* ridge_shape — convert raw noise n ∈ [-1, 1] to a RIDGE value in
- * [0, 1]: sharp peak at n=0, falling linearly toward |n|=1. The
- * inversion-of-absolute-value trick that Musgrave used to convert
- * fBm into ridged multifractal terrain. */
+/* Fold the noise so the middle becomes a sharp peak and both extremes
+ * become valleys — this is what makes ridges. */
 static inline float ridge_shape(float n)  { return 1.0f - fabsf(n); }
 
-/* billow_shape — convert raw noise n ∈ [-1, 1] to a BILLOW value:
- * zero at n=0, peaks at ±1. Topological inverse of ridge_shape;
- * gives cloud-like rounded bumps. */
+/* The opposite fold: the extremes become bumps and the middle a valley —
+ * gives rounded, puffy shapes. */
 static inline float billow_shape(float n) { return fabsf(n); }
 
-/*
- * grad — pick one of 8 gradient directions based on the low 3 bits
- * of the hash, and return its dot product with the offset (x, y).
- * The 8 directions are the diagonals and axes of a 2-D unit square.
- */
+/* Picks one of 8 fixed directions from the hashed table value and reports
+ * how much the offset point lines up with it. This little dot-product is
+ * the heart of why neighbouring points in the field point similar ways. */
 static inline float grad(int hash, float x, float y)
 {
     int h = hash & 7;
@@ -759,9 +456,11 @@ static inline float grad(int hash, float x, float y)
 }
 
 /*
- * perlin2d — Perlin's 2-D noise function. Returns a value roughly in
- * [-1, 1]. The magnitude bound is √(N/2) for N-D noise, ≈ 1 in 2-D
- * after the small constant scaling we apply.
+ * The noise function itself. Given any point, it returns one smoothly-
+ * varying value, roughly between -1 and 1. It works by looking at the
+ * four grid corners around the point, asking each which way it "leans",
+ * and blending those answers with the eased weights from fade(). Every
+ * visual in this file is built on top of this one call.
  */
 static float perlin2d(float x, float y)
 {
@@ -790,24 +489,19 @@ static float perlin2d(float x, float y)
     );
 }
 
-/*
- * pattern_height_at — basic noise visualization. Returns noise value
- * remapped to [0, 1] so it can be used directly as a glow intensity.
- */
+/* The plainest visual: the raw noise, shifted into a 0..1 brightness.
+ * Many other visuals start from this. */
 static float pattern_height_at(float x, float y, float t)
 {
     float n = perlin2d(x * NOISE_SCALE, y * NOISE_SCALE + t);
     return n * 0.5f + 0.5f;
 }
 
-/*
- * pattern_warp_at — domain-warped noise (Inigo Quilez style). Sample
- * the noise field, use the result to OFFSET the coordinates, then
- * sample again. Produces curving, organic-looking patterns that feel
- * less "lumpy" than raw Perlin noise. The two-step warp uses
- * different y-offsets so the qx and qy components are statistically
- * independent.
- */
+/* "Domain warp": sample the noise once, use that result to shove the
+ * coordinates sideways, then sample again at the shoved spot. The field
+ * ends up curvier and more organic than plain noise. The two shoves use
+ * different offsets so they don't move in lockstep. (Technique from
+ * Inigo Quilez.) */
 static float pattern_warp_at(float x, float y, float t)
 {
     float qx = perlin2d(x * NOISE_SCALE,
@@ -819,15 +513,11 @@ static float pattern_warp_at(float x, float y, float t)
     return n * 0.5f + 0.5f;
 }
 
-/*
- * pattern_fbm_at — fractional Brownian motion. Sums multiple octaves
- * of Perlin noise: each octave doubles the frequency and halves the
- * amplitude. The result has the same large-scale shape as plain
- * Perlin but with self-similar fine detail at smaller scales.
- *
- * For terrain, fBm is the standard way to add "rocks on hills on
- * mountains" — every scale gets a contribution.
- */
+/* Stacks several copies of the noise on top of each other — each copy
+ * smaller and fainter than the last. You get the big shapes of plain
+ * noise plus matching detail at every smaller size. This is the standard
+ * "rocks on hills on mountains" trick for natural-looking terrain.
+ * (Often called fBm, fractional Brownian motion.) */
 static float pattern_fbm_at(float x, float y, float t)
 {
     float total   = 0.0f;
@@ -844,13 +534,13 @@ static float pattern_fbm_at(float x, float y, float t)
     return (total / max_amp) * 0.5f + 0.5f;
 }
 
-/* ── generalised octave compositions ───────────────────────────────── *
- * Three multifractal kernels share the same octave-loop shape but
- * combine the per-octave contributions differently. Each returns a
- * value in roughly [0, 1] suitable for direct use as glow. */
+/* ── three ways to stack noise layers ──────────────────────────────── *
+ * These three all loop over "octaves" — layers of noise, each smaller
+ * and fainter than the last — but combine the layers differently. Each
+ * returns a 0..1 brightness. */
 
-/* fbm_octaves — generalised fBm (Voss/Mandelbrot). Sum signed octaves,
- * remap to [0, 1]. Variant of pattern_fbm_at with configurable count. */
+/* The general layer-stacker, with a tunable number of layers. Same idea
+ * as pattern_fbm_at: smooth, every-scale detail. */
 static float fbm_octaves(float x, float y, float t,
                           int octaves, float lacunarity, float gain)
 {
@@ -865,9 +555,9 @@ static float fbm_octaves(float x, float y, float t,
     return (total / max_amp) * 0.5f + 0.5f;
 }
 
-/* turbulence_octaves — sum of |perlin| across octaves (Perlin 1985).
- * Result has sharp ridges along zero-crossings — the canonical input
- * to MARBLE, FIRE, WOOD textures. */
+/* Same stacking, but each layer is folded to be always-positive first.
+ * That folding leaves sharp creases, giving a wispy, turbulent look —
+ * the starting point for the marble, wood, and fire textures. */
 static float turbulence_octaves(float x, float y, float t,
                                  int octaves, float lacunarity, float gain)
 {
@@ -882,10 +572,9 @@ static float turbulence_octaves(float x, float y, float t,
     return total / max_amp;
 }
 
-/* ridged_octaves — Musgrave's ridged multifractal: each octave squares
- * ridge_shape(noise) and weights it by the previous octave's value.
- * Produces sharp mountain-ridge topology. Reference: Musgrave (1998)
- * "Texturing & Modeling: A Procedural Approach", ch. 16. */
+/* Same stacking, but every layer is run through ridge_shape and squared
+ * to sharpen the peaks. Produces craggy mountain-ridge terrain.
+ * (Musgrave's ridged multifractal, "Texturing & Modeling", ch. 16.) */
 static float ridged_octaves(float x, float y, float t,
                              int octaves, float lacunarity, float gain)
 {
@@ -902,14 +591,12 @@ static float ridged_octaves(float x, float y, float t,
     return total / max_amp;
 }
 
-/* ── curl noise (divergence-free 2-D vector field) ─────────────────── *
- * Computed by central-difference of the scalar potential ψ = perlin2d.
- * The resulting (vx, vy) = (∂ψ/∂y, -∂ψ/∂x) has ∇·v = 0 identically,
- * so particles following it never converge or diverge — they only
- * swirl. The foundation of CURL pattern.
- *
- * Reference: Bridson, Houriham & Nordenstam (2007) "Curl-noise for
- * procedural fluid flow", SIGGRAPH. */
+/* Turns the noise into a swirling flow direction at a point. The trick:
+ * measure how the noise changes left-to-right and up-to-down, then turn
+ * those slopes a quarter turn. Flow built this way never piles up or
+ * empties out — it can only swirl, like a stirred liquid. This is what
+ * the CURL visual rides on. (Bridson et al., "Curl-noise for procedural
+ * fluid flow", SIGGRAPH 2007.) */
 static void curl_noise_2d(float x, float y, float t,
                            float *out_vx, float *out_vy)
 {
@@ -926,16 +613,10 @@ static void curl_noise_2d(float x, float y, float t,
     *out_vy = -dn_dx;
 }
 
-/*
- * pattern_contour_at — only "lights up" cells near specific noise
- * levels (CONTOUR_LEVELS). The result is intensity (1.0 at the level,
- * fading to 0 at ±CONTOUR_BAND_WIDTH) plus the index of the closest
- * level (returned via *out_band, so the caller can colour each
- * contour line distinctly).
- *
- * Visually like a topographic map — the noise value is constant along
- * each line, so neighbouring cells track each other in a smooth path.
- */
+/* Lights up only the cells whose noise value sits near one of a few
+ * chosen heights, drawing thin lines — exactly like the contour lines on
+ * a topographic map. It also reports which line a cell is closest to (via
+ * out_band) so the caller can colour each line differently. */
 static float pattern_contour_at(float x, float y, float t, int *out_band)
 {
     float n = pattern_height_at(x, y, t);
@@ -953,60 +634,56 @@ static float pattern_contour_at(float x, float y, float t, int *out_band)
     return 0.0f;
 }
 
-/* ── Tier-1 — direct visualisations ──────────────────────────────── */
+/* ── Tier-1 ──────────────────────────────────────────────────────── */
 
-/* VALLEYS — the visual inverse of HEIGHT. High noise becomes dark,
- * low noise becomes bright. Same field, opposite reading. */
+/* HEIGHT flipped: low spots glow, high spots go dark. */
 static float pattern_valleys_at(float x, float y, float t)
 {
     return 1.0f - pattern_height_at(x, y, t);
 }
 
-/* BANDED — quantise the height field to BANDED_LEVELS discrete steps.
- * Reads as terraced contours, like an old paletted heightmap. */
+/* Rounds every height down to one of a few flat levels, so the field
+ * looks terraced like a stepped hillside. */
 static float pattern_banded_at(float x, float y, float t)
 {
     float h = pattern_height_at(x, y, t);
     return floorf(h * BANDED_LEVELS) / (float)BANDED_LEVELS;
 }
 
-/* BINARY — hard threshold at 0.5: any cell above is fully on, below
- * fully off. The cellular-look limit of HEIGHT visualisation. */
+/* Pure on/off: anything above the halfway mark is full bright, the rest
+ * is dark. */
 static float pattern_binary_at(float x, float y, float t)
 {
     return pattern_height_at(x, y, t) > BINARY_THRESHOLD ? 1.0f : 0.0f;
 }
 
-/* ── Tier-2 — shape transforms ──────────────────────────────────── */
+/* ── Tier-2 ──────────────────────────────────────────────────────── */
 
-/* RIDGE — pass raw noise through ridge_shape: peaks where the noise
- * crosses zero. Gives sharp mountain-ridge silhouettes from a single
- * Perlin sample (no octave summation needed). */
+/* Fold the noise into sharp ridge lines — mountain silhouettes from a
+ * single noise sample, no layering needed. */
 static float pattern_ridge_at(float x, float y, float t)
 {
     float n = perlin2d(x * NOISE_SCALE, y * NOISE_SCALE + t);
     return ridge_shape(n);
 }
 
-/* BILLOW — pass raw noise through billow_shape: clouds at noise
- * extremes, valleys at zero-crossings. Inverse topology of RIDGE. */
+/* The opposite fold: rounded, puffy bumps instead of sharp ridges. */
 static float pattern_billow_at(float x, float y, float t)
 {
     float n = perlin2d(x * NOISE_SCALE, y * NOISE_SCALE + t);
     return billow_shape(n);
 }
 
-/* ZEBRA — apply sin to noise scaled by ZEBRA_FREQ. Produces parallel
- * stripes that curve along the noise iso-lines. */
+/* Run the noise through a wave to get parallel stripes that bend along
+ * the field. */
 static float pattern_zebra_at(float x, float y, float t)
 {
     float n = perlin2d(x * NOISE_SCALE, y * NOISE_SCALE + t);
     return 0.5f + 0.5f * sinf(n * (float)M_PI * ZEBRA_FREQ);
 }
 
-/* RINGS — concentric rings from screen centre, perturbed by noise.
- * radius·RING_FREQ provides the spacing; noise warps the rings into
- * organic, non-perfect circles. */
+/* Rings spreading out from the centre, with the noise wobbling them so
+ * they're not perfect circles. */
 static float pattern_rings_at(float x, float y, float t,
                                 float cx, float cy)
 {
@@ -1016,10 +693,8 @@ static float pattern_rings_at(float x, float y, float t,
     return 0.5f + 0.5f * sinf(r * RING_FREQ + n * RING_AMP);
 }
 
-/* PLASMA — nested sinusoid: sin(noise·π + sin((x+y)·k)). Combines a
- * spatial sin wave with a noise-driven phase shift to produce the
- * classic 90s "plasma" demoscene effect, with Perlin noise instead
- * of pure trig. */
+/* The classic 90s "plasma" wash: a diagonal wave whose phase is pushed
+ * around by the noise. */
 static float pattern_plasma_at(float x, float y, float t)
 {
     float n = perlin2d(x * NOISE_SCALE, y * NOISE_SCALE + t);
@@ -1027,11 +702,10 @@ static float pattern_plasma_at(float x, float y, float t)
                               + sinf((x + y) * PLASMA_FREQ));
 }
 
-/* ── Tier-3 — domain warps + gradient ───────────────────────────── */
+/* ── Tier-3 ──────────────────────────────────────────────────────── */
 
-/* WARP_DEEP — recursive 2-step domain warp. The output of the first
- * warp drives a second-stage offset, giving much more swirly, organic
- * structure than single WARP. Inigo Quilez's "deep warp" technique. */
+/* Like WARP, but warp a second time using the first warp's result.
+ * Far swirlier and more organic. (Quilez's "deep warp".) */
 static float pattern_warp_deep_at(float x, float y, float t)
 {
     float qx = perlin2d(x * NOISE_SCALE, y * NOISE_SCALE + t);
@@ -1046,8 +720,8 @@ static float pattern_warp_deep_at(float x, float y, float t)
     return n * 0.5f + 0.5f;
 }
 
-/* WARPRIDGE — domain-warp the input, then apply ridge_shape. The
- * warp curves the ridges into wandering rivers and canyons. */
+/* Warp the field first, then fold it into ridges — the warp bends the
+ * ridges into wandering rivers and canyons. */
 static float pattern_warpridge_at(float x, float y, float t)
 {
     float qx = perlin2d(x * NOISE_SCALE, y * NOISE_SCALE + t);
@@ -1058,9 +732,8 @@ static float pattern_warpridge_at(float x, float y, float t)
     return ridge_shape(n);
 }
 
-/* SLOPE — finite-difference gradient magnitude of the noise field.
- * Highlights iso-line edges; flat regions are dark, steep cliffs
- * bright. Mathematically: |∇perlin2d|. */
+/* Measures how steeply the field changes around each point by comparing
+ * nearby samples: flat areas stay dark, steep cliffs light up. */
 static float pattern_slope_at(float x, float y, float t)
 {
     const float eps = SLOPE_EPS;
@@ -1074,45 +747,41 @@ static float pattern_slope_at(float x, float y, float t)
     return clampf(mag * SLOPE_GAIN, 0.0f, 1.0f);
 }
 
-/* ── Tier-4 — fractal / octave compositions ─────────────────────── */
+/* ── Tier-4 ──────────────────────────────────────────────────────── */
 
-/* FBM_HIGH — FBM with FBM_HIGH_OCTAVES (default 8). Doubles the
- * detail of standard FBM at ~2× the cost. */
+/* FBM with twice as many layers — more fine detail. */
 static float pattern_fbm_high_at(float x, float y, float t)
 {
     return fbm_octaves(x, y, t, FBM_HIGH_OCTAVES,
                         MULTIFRAC_LACUNARITY, MULTIFRAC_GAIN);
 }
 
-/* RIDGED — Musgrave ridged multifractal. Sharp mountain ridges with
- * fractal detail at every scale. */
+/* Layered ridges: sharp mountain ranges with detail at every size. */
 static float pattern_ridged_at(float x, float y, float t)
 {
     return ridged_octaves(x, y, t, FBM_OCTAVES,
                            MULTIFRAC_LACUNARITY, MULTIFRAC_GAIN);
 }
 
-/* TURBLENC — Perlin's turbulence: sum of |octaves|. Sharper than
- * fBm, with discontinuous derivatives at zero-crossings. The base
- * input to MARBLE, WOOD, FIRE. */
+/* The turbulent, wispy stack — also the base ingredient for marble,
+ * wood, and fire below. */
 static float pattern_turblenc_at(float x, float y, float t)
 {
     return turbulence_octaves(x, y, t, FBM_OCTAVES,
                                MULTIFRAC_LACUNARITY, MULTIFRAC_GAIN);
 }
 
-/* FBM_INV — visual inverse of FBM. Dark regions where FBM is bright,
- * and vice versa. */
+/* FBM flipped: dark where FBM is bright and vice versa. */
 static float pattern_fbm_inv_at(float x, float y, float t)
 {
     return 1.0f - pattern_fbm_at(x, y, t);
 }
 
-/* ── Tier-5 — textures + exotic patterns ────────────────────────── */
+/* ── Tier-5 ──────────────────────────────────────────────────────── */
 
-/* MARBLE — sin(x·k + turbulence·a). The CANONICAL Perlin texture:
- * Perlin 1985 showed marble could be synthesised as a sine wave
- * warped by turbulence. Vertical-stripe marble veins emerge. */
+/* Vertical stripes warped by turbulence give marble veins. This is the
+ * famous one — Perlin showed marble was just a wave bent by turbulence
+ * back in 1985. */
 static float pattern_marble_at(float x, float y, float t)
 {
     float turb = turbulence_octaves(x, y, t, FBM_OCTAVES,
@@ -1120,9 +789,7 @@ static float pattern_marble_at(float x, float y, float t)
     return 0.5f + 0.5f * sinf(x * MARBLE_FREQ + turb * MARBLE_AMP);
 }
 
-/* WOOD — fract(radius·k + turbulence·a). Concentric grain rings
- * around the centre, warped by turbulence. Perlin 1985 wood-grain
- * texture in 2-D. */
+/* Rings around the centre, warped by turbulence — wood grain. */
 static float pattern_wood_at(float x, float y, float t,
                               float cx, float cy)
 {
@@ -1133,19 +800,18 @@ static float pattern_wood_at(float x, float y, float t,
     return fract(r * WOOD_FREQ + turb * WOOD_AMP);
 }
 
-/* FIRE — turbulence shaped by a vertical mask: hot at the bottom of
- * the screen, cooler toward the top. The drift multiplier makes fire
- * flicker faster than the default field drift. */
+/* Turbulence fading out toward the top of the screen, so flames pool at
+ * the bottom. It also flickers faster than the rest of the demo. */
 static float pattern_fire_at(float x, float y, float t, int h)
 {
     float turb = turbulence_octaves(x, y, t * FIRE_DRIFT_MULT, FBM_OCTAVES,
                                      MULTIFRAC_LACUNARITY, MULTIFRAC_GAIN);
-    float mask = 1.0f - (float)y / (float)h;   /* hot at bottom */
+    float mask = 1.0f - (float)y / (float)h;   /* hot at bottom, cool up top */
     return clampf(turb * 2.0f * mask, 0.0f, 1.0f);
 }
 
-/* CLOUDS — smoothstep(fbm) at clouds-thresholds. Hard transition
- * between cloud and clear-sky, but with a soft edge (smoothstep). */
+/* Layered noise with a soft cutoff: dense areas become cloud blobs,
+ * the rest clear sky. */
 static float pattern_clouds_at(float x, float y, float t)
 {
     float n = fbm_octaves(x, y, t, FBM_OCTAVES,
@@ -1153,8 +819,8 @@ static float pattern_clouds_at(float x, float y, float t)
     return smoothstep(CLOUDS_THRESH_LO, CLOUDS_THRESH_HI, n);
 }
 
-/* CAVES — inverse-smoothstep(fbm). Dense fbm regions become OPEN
- * caves; sparse regions become solid rock. Topology inverse of CLOUDS. */
+/* CLOUDS flipped: dense areas become hollow caves, sparse areas become
+ * solid rock. */
 static float pattern_caves_at(float x, float y, float t)
 {
     float n = fbm_octaves(x, y, t, FBM_OCTAVES,
@@ -1162,9 +828,8 @@ static float pattern_caves_at(float x, float y, float t)
     return 1.0f - smoothstep(CAVES_THRESH_LO, CAVES_THRESH_HI, n);
 }
 
-/* STARS — high-frequency Perlin → ridge → high threshold. Only the
- * sharpest peaks survive, producing a sparse stippling that reads
- * as starfield against the dark background. */
+/* Sample fine noise, sharpen it to peaks, and keep only the very
+ * brightest — a sparse scattering of specks like a starfield. */
 static float pattern_stars_at(float x, float y, float t)
 {
     float n = perlin2d(x * NOISE_SCALE * STARS_FREQ_MULT,
@@ -1173,9 +838,8 @@ static float pattern_stars_at(float x, float y, float t)
     return r > STARS_THRESHOLD ? r : 0.0f;
 }
 
-/* CHAOS — combine three noise samples at different scales, with a
- * warp and a periodic modulation, into a single complex composite.
- * No two locations look the same; maximum visual complexity. */
+/* Three noise samples at different sizes, warped and wave-mixed into one
+ * busy composite. The most complex-looking visual; nowhere repeats. */
 static float pattern_chaos_at(float x, float y, float t)
 {
     float n1 = perlin2d(x * NOISE_SCALE,
@@ -1193,74 +857,51 @@ static float pattern_chaos_at(float x, float y, float t)
 /* ===================================================================== */
 
 /*
- * The scene is built out of six small sub-structs (NoiseField from
- * §5 plus five defined below). Each owns ONE concern, and Scene
- * composes them. Splitting concerns into clearly-typed sub-structs
- * makes function signatures self-describing: any function that takes
- * `const Grid *` clearly cannot mutate buffers; any function that
- * takes `RenderBuffers *` clearly does not advance noise time; and
- * so on. Same architectural shape as the other field files
- * (magnetic_fields.c, flow_field_particles.c, midpoint_displacement_*).
+ * The whole program's state is one Scene struct, made of six smaller
+ * pieces (NoiseField from §5 plus the five below). Each piece holds one
+ * kind of thing, which also makes function signatures honest: a function
+ * handed a `const Grid *` plainly can't scribble on the buffers, and so
+ * on. The sister field files are built the same way.
  */
 
 /*
- * Particle — one flowing dust grain. Massless walker advected by the
- * active pattern's vector field.
+ * Particle — one grain of dust drifting on the flow. It has no weight or
+ * momentum: each tick it just reads the flow direction where it sits and
+ * steps that way. It doesn't remember its own trail — the fading marks it
+ * leaves behind live in RenderBuffers.glow instead.
  *
- * INTENT. Position is integrated directly from the sampled velocity
- * vector each tick, with NO momentum term — this is the standard
- * streamline-tracing integration. The particle aligns instantaneously
- * with whatever the field says at its current cell. Trail history
- * isn't stored per-particle; it lives in RenderBuffers.glow, fading
- * exponentially via decay_trail_glow.
- *
- * FINITE LIFETIME. Random max_age ∈ [AGE_MIN_TICKS, AGE_MAX_TICKS] so
- * particles "tire out" at different times — without this, streamline
- * coverage gets dominated by long-lived particles trapped in slow
- * regions, and the field's overall topology stops reading.
- *
- * REFERENCE. Streamline-tracing integration as used here is the
- * 1-D-along-velocity form of forward-Euler advection — see Helman &
- * Hesselink (1991) "Representation and Display of Vector Field
- * Topology in Fluid Flows" for the broader framework.
+ * Each particle is given a random lifespan so they don't all expire
+ * together. Without that, a few long-lived grains stuck in slow spots
+ * would hog the screen and the overall shape of the flow would stop
+ * showing.
  */
 typedef struct {
-    /* Continuous position in cell units. The renderer truncates to
-     * int when painting the trail; the float value preserves sub-cell
-     * accuracy across many sub-pixel-per-tick steps. */
+    /* Where the grain is, as fractions of a cell (so it can move less
+     * than a whole cell per tick). The renderer rounds to a whole cell
+     * only when it paints. */
     float x, y;
 
-    /* 0..N_BANDS-1 — the particle's "tribe" (one of the 4 theme
-     * palette colours), assigned at spawn via rand() & 3. Visually
-     * distinct tribes let the viewer see how streams converge/diverge
-     * even where their paths cross. */
+    /* Which of the four theme colours this grain wears, chosen at birth.
+     * Different colours let you see streams cross without merging. */
     int   color_idx;
 
-    /* Ticks since spawn. Compared against max_age each tick. */
+    /* How many ticks old it is, and the random age at which it dies and
+     * respawns somewhere new. */
     int   age;
-
-    /* Random lifetime cap; respawn once age == max_age (or particle
-     * walks out of bounds). Randomising means streamline coverage
-     * is continuously refreshed at unpredictable points. */
     int   max_age;
 } Particle;
 
 /*
- * Grid — canvas geometry. Pure data: no buffers, no state. Lives at
- * the top of Scene because every layer (rasteriser, particle step,
- * screen centring) needs the dimensions.
+ * Grid — just the size of the drawing area. Every layer needs the width
+ * and height, so it sits at the top of Scene.
  *
- * INDEXING. Row-major: cell (x, y) → y·w + x. Matches the memory
- * layout of RenderBuffers, so the y-outer / x-inner loop order in
- * rasterise_pattern_field is cache-friendly.
- *
- * INVARIANT. w · h ≤ CELLS_MAX always holds; app_pick_map_size()
- * clamps to MAP_W_MAX × MAP_H_MAX = 200 × 56 = 11 200 cells, which is
- * what the RenderBuffers arrays are statically sized for.
+ * Cells are stored row by row, so cell (x, y) lives at index y*w + x —
+ * the grid_idx helper below does that. The size is always kept within
+ * the fixed buffer limit (200x56) by app_pick_map_size.
  */
 typedef struct {
-    int w, h;            /* current map width / height in cells */
-    int total_cells;     /* = w · h, cached so hot loops skip the multiply */
+    int w, h;            /* map size in cells */
+    int total_cells;     /* w*h, kept handy so hot loops skip the multiply */
 } Grid;
 
 static inline int  grid_idx       (const Grid *g, int x, int y) { return y * g->w + x; }
@@ -1270,83 +911,55 @@ static inline bool grid_in_bounds (const Grid *g, int x, int y)
 }
 
 /*
- * RenderBuffers — per-cell raster output. Two parallel arrays indexed
- * by grid_idx(g, x, y):
- *   glow  : trail intensity 0..1 — drives the ASCII glyph ramp
- *           (>0.65 = '#', >0.30 = '*', >0.05 = '.')
- *   color : palette band 0..3 (mod N_BANDS at draw time)
+ * RenderBuffers — the picture, one entry per cell, in two arrays:
+ *   glow  : brightness 0..1, which picks the character ('.', '*', '#')
+ *   color : which of the four theme colours to use
  *
- * The screen layer reads ONLY these two arrays. particle_step writes
- * via grid_idx(...) → buf->glow[idx] = 1.0f, and rasterise_pattern_field
- * overwrites them en bloc for static-field patterns. That's the entire
- * render contract between the simulation (writer) and the display
- * (reader). Decoupling render output from simulation state is the
- * classic graphics-pipeline boundary — the sim becomes display-agnostic.
- *
- * SoA RATIONALE. Two separate arrays (struct-of-arrays) rather than
- * one array of cell-structs because decay_trail_glow touches only
- * glow; storing color separately avoids reading bytes we don't need.
+ * This is the only thing the drawing code looks at. The simulation
+ * writes here (a particle marks the cell it lands on; the formula modes
+ * fill in every cell each frame), the screen reads here, and the two
+ * sides don't otherwise touch. They're kept as two separate arrays
+ * because the fade step only needs glow, so this avoids walking over the
+ * colour bytes too.
  */
 typedef struct {
-    /* Per-cell intensity 0..1. particle_step deposits 1.0 at each
-     * landing; decay_trail_glow multiplies by expf(-GLOW_DECAY · dt)
-     * each tick to create the fading-trail effect. Static-field
-     * patterns overwrite the entire buffer each frame. */
+    /* Brightness 0..1. A particle sets its cell to 1.0; every tick all
+     * cells dim a little so trails fade. The formula modes overwrite the
+     * whole thing each frame instead. */
     float   glow [CELLS_MAX];
 
-    /* Per-cell palette band. For particle modes, inherited from the
-     * particle that last landed at the cell. For static-field patterns,
-     * derived from the noise intensity at that cell. Masked with
-     * (N_BANDS - 1) at draw time for defence-in-depth. */
+    /* Colour band 0..3. For the particle modes it's the colour of the
+     * last grain that landed; for the formula modes it comes from how
+     * bright the cell is. */
     uint8_t color[CELLS_MAX];
 } RenderBuffers;
 
 /*
- * Particles — fixed-size pool of dust grains. Standard pool-allocator
- * pattern: a max-sized array plus an active count `n`, so spawn /
- * respawn never touches the heap. Only pool[0..n-1] is alive.
- *
- * SIZING. MAX_PARTICLES (1024) is the static upper bound;
- * N_PARTICLES_DEF (256) is what scene_reset() activates. 256 is
- * enough to populate visible streamlines for all 4 particle-mode
- * patterns without saturating the screen.
+ * Particles — the bag of dust grains. It's one big array plus a count of
+ * how many are actually in use, so spawning and respawning never need to
+ * allocate memory. Only the first `n` are alive. The array is sized for
+ * the worst case; the demo normally uses far fewer.
  */
 typedef struct {
     Particle pool[MAX_PARTICLES];
-    int      n;                   /* active count, 0..MAX_PARTICLES */
+    int      n;                   /* how many are alive, 0..MAX_PARTICLES */
 } Particles;
 
 /*
- * SimState — the single mutable per-tick scalar. Separated from
- * Controls (keyboard-driven knobs) so it's obvious what scene_tick
- * mutates vs. what the user does.
- *
- * field_time threads into every noise-sampling pattern as the time
- * offset added to the noise y-coordinate. Advances by FIELD_DRIFT · dt
- * each tick. Sliding it slowly through "noise space" is what makes
- * the field visibly evolve rather than freeze.
- *
- * One scalar = one named struct. Tiny but worth its own type for
- * symmetry with the other field files.
+ * SimState — the one number that changes on its own every tick: how far
+ * the field has drifted. It's added to the noise so the whole picture
+ * slowly slides through "noise space" and keeps evolving. Kept apart from
+ * Controls (the user's knobs) so it's clear what the sim changes versus
+ * what the keyboard changes.
  */
 typedef struct {
-    float field_time;     /* drift offset added to noise y-coord */
+    float field_time;     /* how far the field has drifted so far */
 } SimState;
 
 /*
- * Controls — user-facing knobs. Mutated only by app_handle_key(),
- * read by scene_tick (paused, speed, current_pattern) and screen_draw
- * (theme, pattern).
- *
- * INTENT. Same model-vs-user-intent split as the other field files:
- * the dependency is strictly one-way. app_handle_key writes Controls,
- * never SimState; scene_tick reads Controls but only writes SimState
- * + RenderBuffers + Particles. Keeps the code linear.
- *
- * NO prev_pattern. Switching patterns triggers scene_clear_field so
- * stale particle trails don't ghost into the new pattern's view; the
- * static-field patterns then overwrite the whole buffer on their
- * first tick anyway.
+ * Controls — the knobs the keyboard turns. Only app_handle_key writes
+ * these; the sim and the drawing code only read them. Keeping that one-
+ * way means the keyboard never reaches into the simulation directly.
  */
 typedef struct {
     bool    paused;
@@ -1356,43 +969,31 @@ typedef struct {
 } Controls;
 
 /*
- * Scene — the umbrella context. Reading this struct top-to-bottom
- * is meant to be the fastest way to understand the program:
- *   grid       → where things live      (geometry)
- *   buf        → what gets drawn        (render output)
- *   particles  → moving agents          (advection walkers)
- *   noise      → the algorithm source   (NoiseField — Perlin perm[])
- *   sim        → animation state        (field_time)
- *   ctrl       → user knobs             (pattern, speed, theme, …)
- *
- * ORDERING. Each sub-struct depends only on those declared above it:
- * grid is leaf-level; buf is sized by CELLS_MAX; particles need grid
- * bounds; noise is independent; sim mutates noise input; ctrl decides
- * which sim path runs. A reader scanning top-down meets every concept
- * before it is used.
+ * Scene — everything, in one place. Reading top to bottom is the quickest
+ * way to see how the program fits together: where things live, what gets
+ * drawn, the moving grains, the noise they ride on, the drift, and the
+ * user's knobs. Each piece only relies on the ones above it.
  */
 typedef struct {
-    Grid          grid;       /* canvas dimensions                          */
-    RenderBuffers buf;        /* per-cell glow + colour band                */
-    Particles     particles;  /* fixed pool of walkers                      */
-    NoiseField    noise;      /* Perlin permutation — the algorithm source  */
-    SimState      sim;        /* field_time — mutated only by scene_tick    */
-    Controls      ctrl;       /* mutated only by app_handle_key             */
+    Grid          grid;       /* size of the drawing area              */
+    RenderBuffers buf;        /* the picture: brightness + colour       */
+    Particles     particles;  /* the drifting grains                    */
+    NoiseField    noise;      /* the random source everything rides on  */
+    SimState      sim;        /* the drift, changed only by scene_tick  */
+    Controls      ctrl;       /* user knobs, changed only by keypresses */
 } Scene;
 
-/* glow_to_col — uniform mapping of glow ∈ [0,1] to a palette band
- * 0..N_BANDS-1. Multiplies by GLOW_COL_SCALE = 4 − ε so the int cast
- * floors cleanly to [0, N_BANDS-1] even when glow == 1.0. Used by
- * every static-field pattern that doesn't have band-specific logic
- * (all of them except CONTOUR, BINARY, STARS). */
+/* Turn a brightness into one of the four colour bands. Used by the
+ * formula modes that don't have their own colour rule. */
 static inline int glow_to_col(float g)
 {
     return (int)(g * GLOW_COL_SCALE) & (N_BANDS - 1);
 }
 
 /* ── particle pipeline ───────────────────────────────────────────── *
- * One named atomic per particle stage: spawn, velocity, integrate,
- * paint, age, respawn-test. The driver functions below compose these. */
+ * One small function per step a grain goes through — born, find its
+ * direction, move, leave a mark, age, check if it's done. The bigger
+ * functions further down just string these together. */
 
 static void particle_spawn(Particle *p, const Grid *g)
 {
@@ -1403,28 +1004,23 @@ static void particle_spawn(Particle *p, const Grid *g)
     p->max_age   = AGE_MIN_TICKS + rand() % (AGE_MAX_TICKS - AGE_MIN_TICKS);
 }
 
-/* is_particle_pattern — true for the 4 patterns driven by particles. */
+/* True for the four visuals that move particles around. */
 static bool is_particle_pattern(Pattern p)
 {
     return p == PATTERN_FLOW   || p == PATTERN_VORTEX
         || p == PATTERN_CURL   || p == PATTERN_JITTER;
 }
 
-/* ── small particle-mode primitives ─────────────────────────────── *
- * Each one is exactly the named operation the algorithm refers to —
- * "sample the noise at the particle", "convert an angle to velocity",
- * etc. — so the dispatcher body reads as pure pseudocode. */
+/* ── building blocks for the particle modes ──────────────────────── */
 
-/* sample_noise_at_particle — sample raw Perlin at the particle's
- * NOISE_SCALE-scaled position, offset in y by the drifting field_time. */
+/* Read the noise right where this grain is sitting. */
 static inline float sample_noise_at_particle(const Particle *p, float field_time)
 {
     return perlin2d(p->x * NOISE_SCALE,
                     p->y * NOISE_SCALE + field_time);
 }
 
-/* velocity_from_angle — write (vx, vy) = speed·(cos θ, sin θ) into
- * the out pointers. The "angle → velocity" half of FLOW/VORTEX/JITTER. */
+/* Turn a heading (an angle) into an actual velocity at the current speed. */
 static inline void velocity_from_angle(float angle, int speed,
                                         float *out_vx, float *out_vy)
 {
@@ -1432,29 +1028,28 @@ static inline void velocity_from_angle(float angle, int speed,
     *out_vy = sinf(angle) * (float)speed;
 }
 
-/* random_jitter_angle — uniform sample in [-range/2, +range/2].
- * JITTER pattern adds this to the FLOW angle for noisy streamlines. */
+/* A small random nudge to the heading, used by JITTER to roughen up the
+ * paths. */
 static inline float random_jitter_angle(float range)
 {
     return ((float)rand() / (float)RAND_MAX - 0.5f) * range;
 }
 
-/* normalise_2d — in-place unit-length normalisation with epsilon
- * guard. CURL needs this because curl-noise magnitude varies wildly
- * across cells, but we want a uniform visual particle speed. */
+/* Rescale a direction to length 1 (skipping it if it's basically zero,
+ * to avoid dividing by nothing). CURL needs this because its raw flow
+ * strength swings wildly but we want every grain to move at one speed. */
 static inline void normalise_2d(float *vx, float *vy)
 {
     float m = sqrtf((*vx) * (*vx) + (*vy) * (*vy));
     if (m > VECTOR_EPSILON) { *vx /= m; *vy /= m; }
 }
 
-/* particle_velocity_at — per-particle-mode dispatcher. Returns the
- * (vx, vy) for the particle's current position. Each branch is one
- * named pattern in the algorithm vocabulary:
- *   FLOW   : angle = noise·π                      (the original demo)
- *   VORTEX : angle = noise·π + π/2                (tangent — swirls)
- *   CURL   : divergence-free curl noise           (Bridson 2007)
- *   JITTER : FLOW angle + uniform random jitter   (chaotic streamlines)
+/* Works out which way a grain should move, depending on the current
+ * visual:
+ *   FLOW   : head in the direction the noise points
+ *   VORTEX : same, but a quarter turn off, so grains circle instead
+ *   CURL   : follow the swirling curl flow (never piles up)
+ *   JITTER : FLOW with a random wobble added
  */
 static void particle_velocity_at(Pattern pat, const Particle *p,
                                   float field_time, int speed,
@@ -1493,8 +1088,7 @@ static void particle_velocity_at(Pattern pat, const Particle *p,
     }
 }
 
-/* advect_particle_euler — forward-Euler integration step. Massless
- * advection — no inertia term. */
+/* Move the grain by its velocity for one tick, and count it a tick older. */
 static void advect_particle_euler(Particle *p, float vx, float vy, float dt)
 {
     p->x += vx * dt;
@@ -1502,9 +1096,8 @@ static void advect_particle_euler(Particle *p, float vx, float vy, float dt)
     p->age++;
 }
 
-/* deposit_trail_hit — paint the particle's current cell at full
- * intensity. Overwrites (not blends); the trail fade comes from
- * decay_trail_glow between hits. */
+/* Light up the cell the grain is on, full brightness. The trail behind it
+ * fades on its own via the per-tick dimming. */
 static void deposit_trail_hit(RenderBuffers *buf, const Grid *g,
                                 int cx, int cy, int color_idx)
 {
@@ -1514,8 +1107,8 @@ static void deposit_trail_hit(RenderBuffers *buf, const Grid *g,
     buf->color[idx] = (uint8_t)color_idx;
 }
 
-/* particle_is_expired — has the walker overstayed its life or walked
- * off the grid? Either triggers a respawn. */
+/* Is the grain done? Either it's too old or it wandered off-screen — both
+ * mean respawn it. */
 static bool particle_is_expired(const Particle *p, const Grid *g)
 {
     return p->age >= p->max_age
@@ -1523,15 +1116,8 @@ static bool particle_is_expired(const Particle *p, const Grid *g)
         || p->y < 0.0f || p->y >= (float)g->h;
 }
 
-/*
- * particle_step — per-particle pseudocode:
- *
- *     sample velocity from the active pattern's vector field
- *     advect by velocity · dt
- *     deposit trail hit at the new cell
- *     respawn if expired (age or OOB)
- *
- * Each step is one named helper above. */
+/* One grain's whole turn: find its direction, move, mark where it lands,
+ * and respawn it if it's done. */
 static void particle_step(RenderBuffers *buf, const Grid *g,
                           Particle *p, Pattern pat,
                           float field_time, float dt, int speed)
@@ -1544,13 +1130,9 @@ static void particle_step(RenderBuffers *buf, const Grid *g,
         particle_spawn   (p, g);
 }
 
-/*
- * rasterise_pattern_field — for non-particle patterns, recompute glow
- * and colour at every cell using the active pattern's evaluator.
- * Called once per scene_tick. No decay needed because we fully
- * overwrite each frame. The switch is one line per pattern — a pure
- * pseudocode dispatcher.
- */
+/* For the formula visuals (everything that isn't a particle mode): fill
+ * in brightness and colour for every cell from the current visual's
+ * formula. Overwrites the whole picture each frame, so there's no fade. */
 static void rasterise_pattern_field(RenderBuffers *buf, const Grid *g,
                                      Pattern p, float t)
 {
@@ -1567,20 +1149,20 @@ static void rasterise_pattern_field(RenderBuffers *buf, const Grid *g,
 
             switch (p) {
 
-            /* Tier 1 — direct visualisations */
+            /* Tier 1 */
             case PATTERN_HEIGHT:    glow = pattern_height_at  (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_VALLEYS:   glow = pattern_valleys_at (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_BANDED:    glow = pattern_banded_at  (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_BINARY:    glow = pattern_binary_at  (fx, fy, t); col = glow > 0.5f ? 3 : 0; break;
 
-            /* Tier 2 — shape transforms */
+            /* Tier 2 */
             case PATTERN_RIDGE:     glow = pattern_ridge_at   (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_BILLOW:    glow = pattern_billow_at  (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_ZEBRA:     glow = pattern_zebra_at   (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_RINGS:     glow = pattern_rings_at   (fx, fy, t, cx, cy); col = glow_to_col(glow); break;
             case PATTERN_PLASMA:    glow = pattern_plasma_at  (fx, fy, t); col = glow_to_col(glow); break;
 
-            /* Tier 3 — warps + slope */
+            /* Tier 3 */
             case PATTERN_CONTOUR: {
                 int band;
                 glow = pattern_contour_at(fx, fy, t, &band);
@@ -1592,14 +1174,14 @@ static void rasterise_pattern_field(RenderBuffers *buf, const Grid *g,
             case PATTERN_WARPRIDGE: glow = pattern_warpridge_at (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_SLOPE:     glow = pattern_slope_at     (fx, fy, t); col = glow_to_col(glow); break;
 
-            /* Tier 4 — fractal compositions */
+            /* Tier 4 */
             case PATTERN_FBM:       glow = pattern_fbm_at       (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_FBM_HIGH:  glow = pattern_fbm_high_at  (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_RIDGED:    glow = pattern_ridged_at    (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_TURBLENC:  glow = pattern_turblenc_at  (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_FBM_INV:   glow = pattern_fbm_inv_at   (fx, fy, t); col = glow_to_col(glow); break;
 
-            /* Tier 5 — textures + exotic statics */
+            /* Tier 5 (the formula ones; particle modes are handled elsewhere) */
             case PATTERN_MARBLE:    glow = pattern_marble_at    (fx, fy, t); col = glow_to_col(glow); break;
             case PATTERN_WOOD:      glow = pattern_wood_at      (fx, fy, t, cx, cy); col = glow_to_col(glow); break;
             case PATTERN_FIRE:      glow = pattern_fire_at      (fx, fy, t, h); col = glow_to_col(glow); break;
@@ -1609,7 +1191,7 @@ static void rasterise_pattern_field(RenderBuffers *buf, const Grid *g,
             case PATTERN_CHAOS:     glow = pattern_chaos_at     (fx, fy, t); col = glow_to_col(glow); break;
 
             default:
-                continue;       /* particle-mode patterns handled by scene_tick */
+                continue;       /* particle modes are drawn by scene_tick, not here */
             }
 
             buf->glow [idx] = glow;
@@ -1618,23 +1200,9 @@ static void rasterise_pattern_field(RenderBuffers *buf, const Grid *g,
     }
 }
 
-/* ── tick + reset pipeline ───────────────────────────────────────── *
- * scene_tick is the per-frame pseudocode:
- *
- *     if paused: stop.
- *     advance noise time by FIELD_DRIFT · dt.
- *     if particle pattern: decay trails, step every particle.
- *     else:                rasterise the noise-derived field.
- *
- * scene_reset is the init/reset pseudocode:
- *
- *     apply grid dimensions.
- *     reset sim state.
- *     clear render buffers.
- *     install a fresh shuffled noise field.
- *     spawn all particles.
- *
- * Each step is one named call below. */
+/* ── per-frame update and reset ──────────────────────────────────── *
+ * scene_tick runs once per frame; scene_reset starts a fresh field. Both
+ * are just short lists of the named steps below. */
 
 static void apply_grid_dimensions(Grid *g, int w, int h)
 {
@@ -1669,7 +1237,7 @@ static void advance_noise_time(SimState *sim, float dt)
 
 static void install_fresh_noise(NoiseField *nf)
 {
-    shuffle_noise_field(nf);   /* shuffle + activate as current source */
+    shuffle_noise_field(nf);
 }
 
 static void spawn_all_particles(Particles *ps, const Grid *g)
@@ -1689,9 +1257,8 @@ static void step_all_particles(Scene *s, float dt)
                        s->sim.field_time, dt, spd);
 }
 
-/* scene_clear_field — wipe the render buffer. Called from
- * cycle_pattern so leftover particle trails from the previous pattern
- * don't ghost into the new one. */
+/* Wipe the picture clean. Called when switching visuals so the old
+ * trails don't haunt the new one. */
 static void scene_clear_field(Scene *s)
 {
     buffers_clear(&s->buf, s->grid.total_cells);
@@ -1737,23 +1304,15 @@ static void scene_tick(Scene *s, float dt)
 /* ===================================================================== */
 
 /*
- * Screen — terminal dimensions cached after the last successful
- * getmaxyx(). Refreshed on SIGWINCH via screen_resize().
- *
- * INTENT. Kept tiny because the rest of ncurses' state lives
- * implicitly in stdscr; we only need the dimensions to centre the
- * map and position HUD elements. Anything else (current attribute,
- * cursor position, colour-pair table) is owned by ncurses internals,
- * not by us — exposing it here would just duplicate state.
- *
- * NOT IN SCENE. Screen lives at App-level, not Scene, because Scene
- * is "the simulation" and the simulation is display-agnostic: any
- * scene state should be reusable on a different display backend. The
- * terminal-cell dimensions are a property of the display, not the sim.
+ * Screen — just the terminal's current width and height, remembered so we
+ * can centre the map and place the HUD. Refreshed when the window is
+ * resized. It's kept separate from the simulation because the sim doesn't
+ * care what it's drawn on; everything else about the terminal is ncurses'
+ * business, not ours.
  */
 typedef struct {
-    int cols;   /* terminal width  in character cells */
-    int rows;   /* terminal height in character cells */
+    int cols;   /* terminal width  in characters */
+    int rows;   /* terminal height in characters */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -1777,11 +1336,10 @@ static void screen_resize(Screen *s)
 }
 
 /*
- * CellDraw — bundle of "what to paint at this position": pair, attr,
- * glyph, plus a skip flag. classify_trail_cell decides; paint_cell
- * acts. Routing the per-cell decision through this struct keeps the
- * decision logic pure (no ncurses I/O inside the classifier) and
- * concentrates ncurses calls into ONE place (paint_cell).
+ * CellDraw — the decision of what to draw at one cell: which colour, bold
+ * or not, which character, or skip it entirely. classify_trail_cell fills
+ * one in (no terminal calls), then paint_cell does the actual drawing.
+ * Splitting it this way keeps all the ncurses calls in one spot.
  */
 typedef struct {
     int  pair;
@@ -1790,10 +1348,9 @@ typedef struct {
     bool skip;
 } CellDraw;
 
-/* classify_trail_cell — pure function. Given a cell's glow and colour
- * band, return how it should be rendered (or .skip = true if below
- * the visibility floor). Three density tiers map to the three glyphs
- * of the Bourke ASCII ramp. */
+/* Decide how to draw one cell from its brightness and colour: brighter
+ * cells get a denser character, dim ones a dot, and anything too faint is
+ * skipped. (The '.'/'*'/'#' ramp is the usual ASCII-art shading trick.) */
 static CellDraw classify_trail_cell(float glow, uint8_t color)
 {
     int pair = PAIR_TRAIL_BASE + (color & (N_BANDS - 1));
@@ -1803,7 +1360,7 @@ static CellDraw classify_trail_cell(float glow, uint8_t color)
     return (CellDraw){ .skip = true };
 }
 
-/* paint_cell — the ONE ncurses I/O point for the trail layer. */
+/* The single place that actually writes a trail character to the screen. */
 static void paint_cell(int sy, int sx, CellDraw c)
 {
     if (c.skip) return;
@@ -1812,9 +1369,8 @@ static void paint_cell(int sy, int sx, CellDraw c)
     attroff(COLOR_PAIR(c.pair) | c.attr);
 }
 
-/* compute_centred_origin — top-left corner where the map is drawn.
- * Centres horizontally; reserves HUD_BAND_RESERVED_ROWS rows total
- * (HUD_TOP_ROWS top + HUD_BOTTOM_ROWS bottom). */
+/* Work out the top-left corner to start drawing the map at, so it sits
+ * centred with the HUD rows left clear above and below. */
 static void compute_centred_origin(const Grid *g, int cols, int rows,
                                     int *out_gx0, int *out_gy0)
 {
@@ -1826,10 +1382,8 @@ static void compute_centred_origin(const Grid *g, int cols, int rows,
     *out_gy0 = gy0;
 }
 
-/*
- * scene_draw — walk every cell, classify it, paint it. The loop body
- * is exactly three named operations.
- */
+/* Draw the whole map: for every cell, decide what it should look like and
+ * paint it. */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
     const Grid          *g   = &s->grid;
@@ -1850,14 +1404,10 @@ static void scene_draw(const Scene *s, int cols, int rows)
     }
 }
 
-/* ── HUD draw pipeline ───────────────────────────────────────────── *
- * Five named drawers, called from screen_draw in z-order. The TOP HUD
- * (rows 0..1) carries DATA — current state with [N/30] index, parameter
- * readouts, palette swatch. The BOTTOM HUD (row N-1) carries ACTIONS
- * — key bindings only.
- *
- * draw_hud_status_line internally composes several smaller segment
- * drawers, one per fixed-width row-1 field. */
+/* ── the heads-up display ─────────────────────────────────────────── *
+ * The top two rows show what's going on — fps, which visual, theme, a
+ * little colour swatch, the settings. The bottom row lists the keys you
+ * can press. */
 
 static void draw_hud_state_bar(const Screen *sc, const Scene *s,
                                 double fps, int sim_fps)
@@ -1885,10 +1435,9 @@ static void draw_hud_title(void)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* ── row 1 segment drawers ───────────────────────────────────────── *
- * draw_hud_status_line lays out row 1 left-to-right as a sequence of
- * fixed-width segments. Each segment paints its content and returns
- * the new x-cursor; the last (sim_counts) does not need to return. */
+/* ── the second HUD row, piece by piece ──────────────────────────── *
+ * Each of these draws one labelled field left-to-right and returns where
+ * the next one should start. */
 
 static int draw_status_pattern_field(int row, int x, Pattern p)
 {
@@ -1926,8 +1475,7 @@ static int draw_palette_swatch(int row, int x)
     return x;
 }
 
-/* draw_status_sim_counts — last segment: noise scale + drift + map
- * dimensions. No return — end of the row. */
+/* The last field on the row: noise zoom, drift speed, and map size. */
 static void draw_status_sim_counts(int row, int x, const Grid *g)
 {
     attron (COLOR_PAIR(PAIR_HUD));
@@ -1947,7 +1495,7 @@ static void draw_hud_status_line(const Scene *s)
         draw_status_sim_counts    (1, x, &s->grid);
 }
 
-/* draw_bottom_hint — row N-1: ACTIONS only (key bindings). */
+/* The bottom row: the list of keys. */
 static void draw_bottom_hint(const Screen *sc)
 {
     attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -1961,10 +1509,10 @@ static void screen_draw(Screen *sc, const Scene *s,
 {
     erase();
     scene_draw           (s, sc->cols, sc->rows);
-    draw_hud_state_bar   (sc, s, fps, sim_fps);   /* row 0  : data    */
-    draw_hud_title       ();                       /* row 0  : data    */
-    draw_hud_status_line (s);                      /* row 1  : data    */
-    draw_bottom_hint     (sc);                     /* row N-1: actions */
+    draw_hud_state_bar   (sc, s, fps, sim_fps);
+    draw_hud_title       ();
+    draw_hud_status_line (s);
+    draw_bottom_hint     (sc);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -1974,40 +1522,27 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — top-level program state. One instance, g_app, lives in BSS
- * so the signal handlers can reach it without a global Scene pointer.
- * The App owns the Scene and the Screen and adds:
- *   • simulation parameters that are not really "scene state"
- *     (sim_fps, map_w, map_h);
- *   • signal-driven flags that must be sig_atomic_t for safety.
+ * App — the program as a whole: the simulation, the terminal size, a few
+ * settings, and a couple of flags. There's one of these, g_app, kept
+ * global so the signal handlers can reach it.
  *
- * SIGNAL-HANDLER DISCIPLINE. The handlers do nothing but set a flag.
- * The main loop polls those flags and performs the actual work
- * (cleanup, resize) in normal execution context. Standard async-
- * signal-safe pattern — anything that touches ncurses or malloc MUST
- * happen outside the handler.
- *
- * QUALIFIER NOTE. The running / need_resize flags carry BOTH
- * `volatile` and `sig_atomic_t`. sig_atomic_t guarantees writes from
- * a handler are observed atomically by the main loop; volatile
- * prevents the compiler from caching the read in a register across
- * loop iterations. Both qualifiers are required — sig_atomic_t alone
- * permits caching, volatile alone permits torn writes from a handler.
- *
- * REFERENCE. W. Richard Stevens & Stephen Rago — "Advanced Programming
- * in the UNIX Environment" (3rd ed), ch. 10 on signals, for the full
- * discussion of async-signal-safety and sig_atomic_t.
+ * The two flags are written by signal handlers (when you press Ctrl-C or
+ * resize the window). A handler can fire at any moment, so it only flips a
+ * flag and gets out; the main loop notices the flag and does the real work
+ * safely. The volatile + sig_atomic_t types are exactly what's needed for
+ * a flag shared between a handler and the main loop — see Stevens & Rago,
+ * "Advanced Programming in the UNIX Environment", ch. 10.
  */
 typedef struct {
     Scene                 scene;     /* the simulation                       */
-    Screen                screen;    /* current terminal dimensions          */
+    Screen                screen;    /* current terminal size                */
 
-    int                   sim_fps;   /* tick rate; mutated by '[' and ']'    */
-    int                   map_w;     /* chosen map width,  ≤ MAP_W_MAX       */
-    int                   map_h;     /* chosen map height, ≤ MAP_H_MAX       */
+    int                   sim_fps;   /* tick rate; changed by '[' and ']'    */
+    int                   map_w;     /* chosen map width                     */
+    int                   map_h;     /* chosen map height                    */
 
-    volatile sig_atomic_t running;       /* 0 = exit main loop               */
-    volatile sig_atomic_t need_resize;   /* 1 = pending SIGWINCH             */
+    volatile sig_atomic_t running;       /* set to 0 to quit                 */
+    volatile sig_atomic_t need_resize;   /* set to 1 when the window resized */
 } App;
 
 static App g_app;
@@ -2036,10 +1571,11 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* ── keyboard handlers ──────────────────────────────────────────────── *
- * Each key is one named action; app_handle_key is just a dispatcher. */
+/* ── keyboard ────────────────────────────────────────────────────── *
+ * One small function per action; app_handle_key just routes each key to
+ * the right one. */
 
-/* bump_speed_geometric — '+' / '-' geometric step on particle speed. */
+/* '+' doubles the speed, '-' halves it (kept within limits). */
 static void bump_speed_geometric(Controls *c, int dir)
 {
     if (dir > 0) {
@@ -2051,7 +1587,7 @@ static void bump_speed_geometric(Controls *c, int dir)
     }
 }
 
-/* bump_sim_fps — '[' / ']' linear step on tick rate, clamped. */
+/* '[' and ']' nudge the tick rate up or down (kept within limits). */
 static void bump_sim_fps(App *app, int delta)
 {
     app->sim_fps += delta;
@@ -2065,9 +1601,8 @@ static void cycle_theme(Controls *c, int dir)
     theme_apply(c->current_theme);
 }
 
-/* cycle_pattern — n/p step + clear the render buffer. We clear because
- * leftover particle trails would ghost into a static-field pattern's
- * first frame before it overwrites the buffer. */
+/* Switch to the next/previous visual and wipe the screen, so old trails
+ * don't flash through before the new visual takes over. */
 static void cycle_pattern(App *app, int dir)
 {
     Controls *c = &app->scene.ctrl;
@@ -2105,8 +1640,8 @@ static void install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* advance_frame_clock — read the monotonic clock, compute dt since
- * the last call, clamp at the spiral-of-death guard. */
+/* How long since the last frame, capped so a long stall doesn't make the
+ * sim try to fast-forward through a flood of catch-up ticks. */
 static int64_t advance_frame_clock(int64_t *frame_time)
 {
     int64_t now = clock_ns();
@@ -2116,8 +1651,9 @@ static int64_t advance_frame_clock(int64_t *frame_time)
     return dt;
 }
 
-/* simulate_pending_ticks — drain the fixed-timestep accumulator.
- * Source: Glenn Fiedler, "Fix Your Timestep". */
+/* Run as many fixed-size sim steps as the elapsed time has earned, so the
+ * sim runs at a steady rate no matter the frame rate. (Glenn Fiedler,
+ * "Fix Your Timestep".) */
 static void simulate_pending_ticks(App *app, int64_t *sim_accum,
                                     int64_t tick_ns, float dt_sec)
 {
@@ -2127,8 +1663,8 @@ static void simulate_pending_ticks(App *app, int64_t *sim_accum,
     }
 }
 
-/* maybe_update_fps_counter — every FPS_UPDATE_MS, fold the running
- * frame count into a smoothed fps reading. */
+/* Recompute the fps shown in the HUD, but only every half second so the
+ * number doesn't flicker. */
 static double maybe_update_fps_counter(int64_t *fps_accum,
                                         int *frame_count,
                                         double previous)
@@ -2141,7 +1677,8 @@ static double maybe_update_fps_counter(int64_t *fps_accum,
     return fps;
 }
 
-/* cap_frame_rate — sleep so frames are at most 1/target_fps apart. */
+/* Sleep off the rest of the frame's time budget so we don't redraw faster
+ * than needed and burn CPU. */
 static void cap_frame_rate(int64_t work_done_ns, int target_fps)
 {
     int64_t budget = NS_PER_SEC / target_fps;

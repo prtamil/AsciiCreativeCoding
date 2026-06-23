@@ -1,235 +1,34 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * signed_distance_field_jfa_showcase.c
- *   — Compute the Euclidean distance field of a set of seed points
- *     using the Jump Flood Algorithm (Rong & Tan, 2006). Visualise it
- *     30 different ways across 6 complexity tiers.
  *
- * DEMO: Scatter a handful of "seed" points on a grid. For every other
- *       cell, find the seed it's closest to (and how far). The result
- *       — the Euclidean Distance Field (EDF) — is the building block
- *       for many graphics techniques (Valve-style SDF font rendering,
- *       Voronoi diagrams, raymarching, soft shadows, outline strokes).
- *       Computed via the Jump Flood Algorithm: log₂(N) passes where
- *       each cell "looks" at neighbours k = N/2, N/4, … away and
- *       inherits whichever seed is closest. Seeds wobble continuously
- *       (sin/cos around fixed anchors) so the JFA result animates.
+ * Scatter a handful of "seed" points on a grid, then for every other
+ * cell figure out which seed is nearest and how far away it is. That
+ * map of distances is the building block behind crisp scaled fonts,
+ * Voronoi cell diagrams, glows, and outlines. We compute it the fast
+ * way using the Jump Flooding Algorithm, then draw the same answer 30
+ * different ways. The seeds drift around slowly so the picture moves.
  *
- *       30 patterns in 6 tiers (cycle with n / p):
- *         Tier 1 DISTANCE  — raw distance mappings (SDF, INVERSE …)
- *         Tier 2 BANDS     — periodic structuring (RINGS, SAW, ZEBRA …)
- *         Tier 3 VORONOI   — cell-id-driven effects (CELLS, SPECKLE …)
- *         Tier 4 CONTOURS  — iso-line effects (OUTLINE, HALO, AURA …)
- *         Tier 5 STRUCTURE — neighbour-aware Voronoi topology
- *                            (EDGES, VERTICES, SKELETON …)
- *         Tier 6 ANIMATED  — patterns driven by the wobble clock
- *                            (PULSE, SCAN, ECHO, PLASMA, CHAOS)
+ * The clever part — Jump Flooding — works like rumour spreading: each
+ * cell asks a few far-off neighbours "which seed do you know about?"
+ * and keeps the closest one it hears. Starting with big jumps and
+ * halving them each round, the right answer reaches every cell in only
+ * log2(N) rounds instead of checking every seed against every cell.
  *
- * Study alongside:
- *   ./worley_cellular_noise.c — also produces Voronoi-style cells, but
- *       streaming + analytic (3×3 hash lookup per query). This file
- *       precomputes everything via JFA — different cost trade-off.
- *   ../generational/voronoi_region_map.c — alternative precomputed
- *       Voronoi using a different algorithm.
+ * Reference for the algorithm:
+ *   Rong & Tan (2006), "Jump Flooding in GPU with Applications to
+ *   Voronoi Diagram and Distance Transform", I3D'06.
  *
- * Section map:
- *   §1 config   — grid, patterns, seed count, themes, named constants
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes
- *   §5 algorithm + data + animation + optimization
- *     §5a JFA   — JFAGrid, jfa_pass, jfa_grid_run
- *     §5b data  — Seed, seeds_scatter
- *     §5c anim  — seeds_animate (wobble around anchors)
- *     §5d opt   — sub-pixel sdf_read for smooth gradients
- *   §6 patterns — 30 visualisations of the same JFA output + dispatch
- *   §7 scene    — GlowField + GlyphRamp + PatternState + PaletteState
- *                 + Scene composition + scene_evaluate_field
- *   §8 screen   — Screen, GridPlacement, scene_draw, HUD helpers
- *   §9 app      — App harness, FrameClock, signals, main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume animation
- *   r          reset (new seed scatter)
- *   n / N      next pattern  (p / P previous)
- *   t / T      next / previous theme
- *   ] / [      raise / lower simulation tick Hz
- *   + / =      faster wobble drift (× 2)
- *   -          slower wobble drift (/ 2)
+ * Sister files worth comparing:
+ *   ./worley_cellular_noise.c        — same Voronoi look, but worked
+ *       out on the fly per query instead of precomputed.
+ *   ../generational/voronoi_region_map.c — precomputed Voronoi by a
+ *       different method (no animation).
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra signed_distance_field_jfa_showcase.c \
  *       -o sdf_jfa -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Jump Flood Algorithm (JFA). For an N×N grid with
- *                  K seed points (K ≪ N²), compute the Euclidean
- *                  distance field in O(N² log N) — way faster than
- *                  the naive O(N²·K) "check every seed per cell".
- *
- *                  Each grid cell holds a 2-int "nearest seed coords"
- *                  pair. Initialisation: seed cells point to
- *                  themselves; everyone else points to (-1, -1).
- *
- *                  For step k = N/2, N/4, N/8, ..., 1:
- *                    For each cell p:
- *                      For each of 9 offsets in {-k, 0, +k}²:
- *                        Look at the neighbour q = p + offset.
- *                        If q.seed exists AND its distance to p is
- *                        shorter than p's current best, p adopts
- *                        q's seed.
- *
- *                  After ⌈log₂(N)⌉ passes the whole grid has been
- *                  "flooded" — every cell holds its true nearest
- *                  seed. Reading distance is then a single sqrt.
- *
- * Data-structure : JFAGrid — two int16_t grids (nearest_x[],
- *                  nearest_y[]) holding each cell's currently-believed
- *                  nearest seed coords, plus a scratch_x/scratch_y
- *                  pair for ping-pong (one buffer read, one written,
- *                  swap each pass — keeps passes independent and
- *                  correct).
- *
- *                  Seed[N_SEEDS] — fixed anchor + per-axis wobble
- *                  phase + current float position (sub-pixel
- *                  sdf_read) + int snap (JFA ownership).
- *
- *                  GlowField — the per-cell (glow ∈ [0,1], band ∈
- *                  {0..3}) output buffer the renderer reads from.
- *
- * Rendering      : ASCII only. Density-graded glyphs ('.', '*', '#')
- *                  via GlyphRamp in 4 theme palette colours. Each
- *                  pattern picks (glow, band) from (distance,
- *                  seed-id, neighbour-topology) in a pattern-specific
- *                  way; the renderer is pattern-agnostic.
- *
- * Performance    : log₂(N) passes × N² cells × 9 neighbours
- *                  = 9·N²·log₂(N) cell-comparisons total.
- *                  For an 11K-cell grid, that's ~1.3M comparisons —
- *                  way under one frame. The algorithm REGENERATES
- *                  the full field every reset / animation tick (it
- *                  could be incremental, but for showcase clarity
- *                  we recompute from scratch).
- *
- * References     : JFA + DISTANCE TRANSFORMS (the algorithm)
- *                  • Rong, G. & Tan, T-S. (2006) — "Jump Flooding in
- *                    GPU with Applications to Voronoi Diagram and
- *                    Distance Transform", I3D'06. The original JFA
- *                    paper — source of the log₂(N) step schedule and
- *                    the 9-neighbour propagation rule used in §5a:
- *                    https://dl.acm.org/doi/10.1145/1111411.1111431
- *                  • Felzenszwalb, P. & Huttenlocher, D. (2012) —
- *                    "Distance Transforms of Sampled Functions",
- *                    Theory of Computing 8(19). The exact O(n)
- *                    two-pass alternative when you don't need GPU
- *                    parallelism; useful contrast to JFA's
- *                    approximate-but-trivially-parallel approach.
- *                  • Aurenhammer, F. (1991) — "Voronoi diagrams: a
- *                    survey of a fundamental geometric data
- *                    structure", ACM Comput. Surv. 23(3). Background
- *                    for the Tier-3/5 VORONOI / EDGES / VERTICES
- *                    patterns — formal definition of the cell dual,
- *                    triple-points, and the medial axis:
- *                    https://dl.acm.org/doi/10.1145/116873.116880
- *
- *                  SDF-DERIVED PATTERNS (the 30 patterns)
- *                  • Green, C. (2007) — "Improved Alpha-Tested
- *                    Magnification for Vector Textures and Special
- *                    Effects", SIGGRAPH'07 (Valve). The famous SDF-
- *                    font paper; foundational reasoning for the
- *                    Tier-4 OUTLINE / SHELL / HALO iso-line work:
- *                    https://valvesoftware.github.io/SourceEngine2007/Alpha-tested_Magnification.pdf
- *                  • Quilez, I. — "2D distance functions". The
- *                    catalogue of analytic SDFs and combinators
- *                    (union, smin, abs, mod) — direct source for
- *                    the Tier-2 RINGS/SAW/WAVE band patterns and
- *                    the Tier-4 contour effects:
- *                    https://iquilezles.org/articles/distfunctions2d/
- *                  • Quilez, I. — "Smooth minimum". The smoothstep-
- *                    blended union used as the conceptual model
- *                    behind Tier-4 AURA's multi-σ Gaussian sum:
- *                    https://iquilezles.org/articles/smin/
- *
- *                  ASCII RENDERING (SDF → terminal)
- *                  • Bourke, P. — "Character representation of grey
- *                    scale images". Source of the canonical luminance
- *                    ramps; the GlyphRamp '.', '*', '#' here is a
- *                    coarse 3-tier subset of Bourke's 10-char ramp:
- *                    http://paulbourke.net/dataformats/asciiart/
- *                  • Wikipedia — "ANSI escape code § 8-bit". The
- *                    xterm/ANSI 256-colour palette (16 system + 6³
- *                    cube + 24 greys) that themes[] in §1 indexes:
- *                    https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit
- *                  • Padala, P. — "NCURSES Programming HOWTO".
- *                    Pragmatic reference for the §3/§8 rendering
- *                    APIs (init_pair, mvaddch, doupdate, A_BOLD):
- *                    https://tldp.org/HOWTO/NCURSES-Programming-HOWTO/
- *
- *                  COMPARE IN PROJECT
- *                  • ./worley_cellular_noise.c — streaming Voronoi
- *                    via 3×3 hash lookup (no precompute); same cell
- *                    structure, very different mechanism.
- *                  • ../generational/voronoi_region_map.c —
- *                    alternative precomputed Voronoi (static
- *                    lattice, no animation) vs this file's full
- *                    JFA recompute per tick.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * "How far is every grid cell from the nearest of K marked cells?"
- * Naively: check every seed per cell → O(N²K). JFA cuts this by
- * letting cells COPY their neighbour's answer if the neighbour
- * already knows a closer seed. After log₂(N) rounds of progressively
- * smaller jumps, the right answer reaches every cell.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine the seeds as candles in a pitch-dark room laid out on
- * graph paper. You want to know, for every grid square, which candle
- * is closest. You can't see the candles directly — but you can ask
- * your immediate neighbour cells "which candle do YOU know about?"
- * and if their answer would be closer to you than yours, you adopt
- * it.
- *
- * Doing this with neighbours at distance 1 only would take O(N)
- * rounds (light propagates one square at a time). JFA's trick: also
- * ask neighbours at distance N/2, N/4, N/8, ..., 1 — large jumps
- * carry seed information across the grid quickly, smaller jumps
- * refine it locally. log₂(N) passes total.
- *
- * Once each cell knows ITS nearest seed, distance is one sqrt.
- *
- * ALGORITHM IN STEPS  (per "regenerate the field" call — jfa_grid_run)
- * ──────────────────
- *  1. Initialise: nearest_x[c] = c.x, nearest_y[c] = c.y for every
- *     SEED cell. For every other cell, nearest_x[c] = nearest_y[c]
- *     = JFA_SENTINEL.                                  (jfa_grid_init)
- *  2. For step k = max(W,H) / 2, halving each pass down to 1:
- *       a. For every cell c at (cx, cy):
- *          For each of 9 offsets in {-k, 0, +k}²:
- *            Look at neighbour q = c + offset.
- *            If q is in bounds AND q has an owner AND its owner is
- *            closer to c than c's current best, copy q's owner.
- *       b. Swap the ping-pong buffers.                       (jfa_pass)
- *  3. After log₂(N) passes, every cell knows its true nearest seed.
- *  4. Read distance: dist(c) = √((c.x − nearest_x[c])² +
- *                                (c.y − nearest_y[c])²)       (sdf_read)
- *
- * KEY FORMULAS
- * ────────────
- *  Distance                    : d(p, q) = √((px − qx)² + (py − qy)²)
- *  JFA step schedule           : k_i = ⌈N/2^(i+1)⌉, for i = 0 … log₂N
- *  Cell count examined per pass: 9 × N²  (8 neighbours + self)
- *  Total work                  : 9 · N² · log₂(N)
- *  N here                      = max(grid_w, grid_h)
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -264,12 +63,12 @@ enum {
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* JFA needs sentinel "no seed yet"; use a value that can never be
-     * a real coordinate. int16_t max = 32767 — far above MAP_W_MAX. */
+    /* A "no seed here yet" marker. We need a value no real grid
+     * coordinate could ever be; 32767 is way past the biggest grid. */
     JFA_SENTINEL      = INT16_MAX,
 
-    /* Number of seed points scattered on each reset. Sparse so cells
-     * are large and the JFA wavefronts are easy to see. */
+    /* How many seed points to scatter. Kept small so the cells are big
+     * and you can actually watch the flooding fill them in. */
     N_SEEDS           = 20,
 
     /* Color pair indices. */
@@ -279,125 +78,108 @@ enum {
 };
 
 /*
- * Continuous seed animation (Worley-style wobble).
- *
- *   WOBBLE_RADIUS_CELLS — each seed orbits its anchor with this
- *                          radius in cells. ~5 cells of drift on a
- *                          200×56 grid with 20 seeds (≈ 10-cell
- *                          average spacing) → cell boundaries shift
- *                          visibly without seeds colliding.
- *   WOBBLE_RATE         — radians per second per unit of drift_mult.
- *                          0.5 ≈ one full sine cycle per 12 seconds —
- *                          slow enough that the integer-pixel snap of
- *                          the JFA reads as smooth motion to the eye
- *                          (each pixel transition takes several
- *                          frames; faster rates make snapping visible).
+ * How the seeds drift. Each seed slowly circles a fixed home spot.
+ *   WOBBLE_RADIUS_CELLS — how far it strays from home, in cells. About
+ *                          5 keeps the cell boundaries visibly moving
+ *                          without seeds bumping into each other.
+ *   WOBBLE_RATE         — how fast it circles. Slow on purpose: faster
+ *                          and you'd see the motion jump cell-to-cell
+ *                          instead of gliding.
  */
 #define WOBBLE_RADIUS_CELLS  5.0f
 #define WOBBLE_RATE          0.5f
 
-/*
- * Sub-pixel rounding — converting a float seed position to the
- * integer cell that JFA treats as the seed's owner.  Adding 0.5f
- * before the int cast gives round-to-nearest instead of truncation
- * (round-toward-zero would jitter the integer snap by ±1 right at
- * the half-cell boundary).
- */
+/* When we turn a seed's smooth (decimal) position into a whole-number
+ * grid cell, add 0.5 first so it rounds to the nearest cell instead of
+ * always rounding down — otherwise it would twitch by one at the edges. */
 #define ROUND_TO_NEAREST_BIAS    0.5f
 
-/*
- * is_local_max tolerance (distance units).  A neighbour's distance
- * has to exceed ours by MORE than this to disqualify us from the
- * medial axis.  Without an epsilon, two cells with bit-equal
- * distance would alternately disqualify each other depending on
- * scan order — the result would be a flickering, broken ridge.
- * 0.01 cells is well below one screen pixel so the visual is unaffected.
- */
+/* A tiny slack used when finding the "ridge" line between cells. Two
+ * cells with the exact same distance shouldn't keep cancelling each
+ * other out and making the line flicker, so a neighbour must be clearly
+ * farther (by more than this) to count. Too small to see on screen. */
 #define MEDIAL_AXIS_TOLERANCE    0.01f
 
-/*
- * JFA "no candidate yet" cost.  jfa_pass tracks the best
- * squared-distance seen so far; an unseeded cell starts at this
- * value so the first valid neighbour ALWAYS wins.  INT32_MAX is
- * fine — every real squared-distance on this grid is far smaller
- * (max ≈ 200² + 56² ≈ 43 000 << 2^31).
- */
+/* A stand-in for "infinitely far" while a cell is still hunting for its
+ * nearest seed, so the very first real candidate always beats it. Any
+ * actual distance on this grid is far smaller. */
 #define JFA_INFINITE_SQ_DISTANCE INT32_MAX
 
-/*
- * Palette quantisation — continuous glow ∈ [0, 1] → discrete band
- * index ∈ {0..3}. Same scheme as the sibling field showcases.
- */
+/* Each cell's brightness (0 to 1) gets sorted into one of 4 color
+ * tiers. The 3.999 gain stops a full-brightness 1.0 from spilling into
+ * a 5th tier. */
 #define N_PALETTE_BANDS     4
 #define PALETTE_BAND_MASK   3
 #define GLOW_TO_BAND_GAIN   3.999f
 
+/* Below this brightness a cell is left blank. */
 #define GLOW_THRESHOLD      0.05f
 
-/* HUD layout — top carries data, bottom carries actions. */
+/* The HUD reserves rows at top (info) and bottom (key reminders). */
 #define HUD_TOP_ROWS             2
 #define HUD_BOTTOM_ROWS          1
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
 #define HUD_LEFT_MARGIN          1
 
-/* Drift multiplier — cranked by +/-. */
+/* How fast the seeds drift, adjustable with +/-. */
 #define DRIFT_MULT_MIN      1
 #define DRIFT_MULT_DEF      8
 #define DRIFT_MULT_MAX      16
 
-/* Density thresholds for the ASCII glyph ramp. */
+/* Brightness cutoffs for picking which ASCII character to draw. */
 #define GLYPH_HIGH_THRESH   0.65f
 #define GLYPH_MID_THRESH    0.30f
 
-/* OUTLINE pattern — which iso-distance to draw (cells). */
+/* The OUTLINE pattern draws a single ring at this distance from a seed. */
 #define OUTLINE_DISTANCE    8.0f
-#define OUTLINE_THICKNESS   1.5f    /* half-width either side of OUTLINE_DISTANCE */
+#define OUTLINE_THICKNESS   1.5f    /* how wide the ring is, each side  */
 
 /*
- * Pattern — thirty JFA-output visualisations grouped into six
- * complexity tiers, ordered simple → complex. Cycle with n/p. The
- * enum order MUST match `noise_patterns[]` in §6 (compiler enforces
- * via fixed-size [N_PATTERNS] initialiser).
+ * The 30 ways we draw the same distance map, grouped into 6 tiers from
+ * simplest to most involved. Flip through them with n/p.
  *
- *   Tier 1 DISTANCE  : SDF, INVERSE, SQRT, SQUARED, CAPPED
- *   Tier 2 BANDS     : RINGS, SAW, ZEBRA, WAVE, SHELLS
- *   Tier 3 VORONOI   : CELLS, CRACKLE, SPECKLE, RAINBOW, TWINKLE
- *   Tier 4 CONTOURS  : OUTLINE, DUAL, SHELL, HALO, AURA
- *   Tier 5 STRUCTURE : EDGES, VERTICES, INTERIOR, WEAVE, SKELETON
- *   Tier 6 ANIMATED  : PULSE, SCAN, ECHO, PLASMA, CHAOS
+ * This list must stay in the same order as noise_patterns[] in §6 —
+ * the compiler checks the count matches via the [N_PATTERNS] array.
+ *
+ *   Tier 1 DISTANCE  : plain distance, shaded a few different ways
+ *   Tier 2 BANDS     : repeating rings carved out of the distance
+ *   Tier 3 VORONOI   : color each cell by which seed owns it
+ *   Tier 4 CONTOURS  : draw rings/glows at chosen distances
+ *   Tier 5 STRUCTURE : the cell skeleton — edges, corners, ridges
+ *   Tier 6 ANIMATED  : effects that pulse and sweep over time
  */
 typedef enum {
-    /* Tier 1 — DISTANCE: raw distance mappings */
+    /* Tier 1 — plain distance, shaded different ways */
     PATTERN_SDF = 0,
     PATTERN_INVERSE,
     PATTERN_SQRT,
     PATTERN_SQUARED,
     PATTERN_CAPPED,
-    /* Tier 2 — BANDS: periodic structuring of distance */
+    /* Tier 2 — repeating rings */
     PATTERN_RINGS,
     PATTERN_SAW,
     PATTERN_ZEBRA,
     PATTERN_WAVE,
     PATTERN_SHELLS,
-    /* Tier 3 — VORONOI: cell-id-driven effects */
+    /* Tier 3 — color by which seed owns the cell */
     PATTERN_CELLS,
     PATTERN_CRACKLE,
     PATTERN_SPECKLE,
     PATTERN_RAINBOW,
     PATTERN_TWINKLE,
-    /* Tier 4 — CONTOURS: iso-line uses */
+    /* Tier 4 — rings and glows at chosen distances */
     PATTERN_OUTLINE,
     PATTERN_DUAL,
     PATTERN_SHELL,
     PATTERN_HALO,
     PATTERN_AURA,
-    /* Tier 5 — STRUCTURE: neighbour-aware (Voronoi topology) */
+    /* Tier 5 — the cell skeleton (edges, corners, ridges) */
     PATTERN_EDGES,
     PATTERN_VERTICES,
     PATTERN_INTERIOR,
     PATTERN_WEAVE,
     PATTERN_SKELETON,
-    /* Tier 6 — ANIMATED: use the wobble time directly */
+    /* Tier 6 — effects that move over time */
     PATTERN_PULSE,
     PATTERN_SCAN,
     PATTERN_ECHO,
@@ -406,8 +188,7 @@ typedef enum {
     N_PATTERNS,
 } Pattern;
 
-/* pattern_name() / pattern_tier() defined in §6 alongside the
- * dispatch table. */
+/* Defined in §6 next to the pattern table. */
 static const char *pattern_name(Pattern p);
 static const char *pattern_tier(Pattern p);
 
@@ -415,50 +196,33 @@ static const char *pattern_tier(Pattern p);
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* Frame-loop timing limits — see Glenn Fiedler "Fix Your Timestep!". */
+/* If a frame ever takes longer than this (e.g. the program was paused
+ * by the OS), pretend it was only this long so the sim doesn't try to
+ * catch up all at once. See Glenn Fiedler, "Fix Your Timestep!". */
 #define MAX_FRAME_DT_NS    (100 * NS_PER_MS)
 #define RENDER_FPS_TARGET  60
 
 /*
- * Theme — one entry in themes[]: a named 256-colour palette.
+ * Theme — a named color scheme, one row of themes[] below.
  *
- * INTENT
- *   Decouple "the colours" from "the renderer". scene_draw() never
- *   touches xterm indices directly; it just writes glow into the
- *   GlowField and lets the §3 colour pairs (rebound on every t/T
- *   key by theme_apply()) decide what those band tiers look like.
- *   Same algorithm, ten visually distinct moods.
+ * The whole point is to keep "what colors to use" separate from the
+ * drawing code. The renderer just says "this cell is brightness tier
+ * 0..3"; the theme decides what those four tiers actually look like.
+ * Pressing t/T swaps in a different theme without touching any of the
+ * math, giving the same animation ten different moods.
  *
- * CONTEXT
- *   N_THEMES const instances in themes[] (§3). Read by theme_apply()
- *   on init and on every t/T keypress; the result is pushed into
- *   ncurses colour pairs PAIR_BAND_BASE … PAIR_BAND_BASE+3 so all
- *   subsequent COLOR_PAIR() calls in §8 pick up the new palette.
- *   PaletteState.current (§7) is the index into this array.
- *
- * THE 4-TIER GRADIENT
- *   band[0] → band[3] correspond to GlowField.band ∈ {0..3}, which
- *   come from glow_to_palette_band (quartile of glow). All four
- *   entries MUST sit in the BRIGHT half of the 256-colour cube
- *   (≥ 24 for cube, ≥ 244 for greys) — bottom-of-palette colours
- *   are invisible against default-black with A_DIM. See
- *   CLAUDE.md "Theme Palette Brightness" for the rule.
- *
- *   Convention: band[0] = darkest tier (faintest glow, "void");
- *               band[3] = brightest tier (dense core).
- *   Sibling demos use the same ordering, so a theme that looks
- *   right here will look right in worley / simplex / value_noise.
- *
- * MEMBER LOGIC
- *   name    : 7-char-padded display label shown by hud_draw_theme_field.
- *             Stored as a const char* so themes[] sits in .rodata.
- *   band[4] : xterm-256 colour indices, one per GlowField.band tier.
- *             short (not uint8_t) only because init_pair takes short.
- *             Must satisfy the brightness rule above.
+ *   name    : short label shown in the HUD (padded to line up).
+ *   band[4] : four colors, darkest first, brightest last — one for
+ *             each brightness tier. These are xterm 256-color codes.
+ *             All four must come from the bright half of the palette
+ *             or the dimmest one vanishes against a black terminal
+ *             (see CLAUDE.md "Theme Palette Brightness"). They're
+ *             `short` only because the ncurses init_pair call wants
+ *             that type.
  */
 typedef struct {
-    const char *name;          /* HUD label, 7-char padded            */
-    short       band[4];       /* xterm-256 idx per GlowField.band    */
+    const char *name;          /* HUD label, padded to line up        */
+    short       band[4];       /* 4 colors, darkest -> brightest      */
 } Theme;
 
 #define N_THEMES 10
@@ -501,33 +265,24 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  color                                                              */
 /* ===================================================================== */
 
-/* terminal_supports_256_colours — wrapper for the "do we have the
- * xterm 256-colour cube?" check.  Named so the branches below read
- * as a capability question instead of an arithmetic threshold. */
+/* Does this terminal have the full 256-color palette? */
 static inline bool terminal_supports_256_colours(void) { return COLORS >= 256; }
 
-/* theme_clamp_index — fall back to theme 0 if the requested index is
- * out of range.  Defensive — only caller (app_handle_key) already
- * mods by N_THEMES, but indices arriving from elsewhere (e.g. a
- * future config file) shouldn't crash the renderer. */
+/* Snap a bad theme number back to theme 0 so nothing crashes. */
 static inline int theme_clamp_index(int idx)
 {
     return (idx < 0 || idx >= N_THEMES) ? 0 : idx;
 }
 
-/* theme_bind_palette_256 — push the 4 band colours from a Theme
- * literal straight into ncurses pairs.  256-colour terminals see
- * the exact xterm indices the theme designer chose. */
+/* Load a theme's four colors into the slots the renderer draws with. */
 static void theme_bind_palette_256(const Theme *t)
 {
     for (int band = 0; band < N_PALETTE_BANDS; band++)
         init_pair(PAIR_BAND_BASE + band, t->band[band], -1);
 }
 
-/* theme_bind_palette_fallback_8color — ANSI-only terminals lose
- * theme variety but still get a 4-tier gradient via the 8-colour
- * BLUE→CYAN→MAGENTA→YELLOW ramp.  Sibling demos use the same
- * fallback so missing themes degrade consistently. */
+/* For old terminals with only 8 colors: themes all look the same, but
+ * we still give four distinct tiers so the picture stays readable. */
 static void theme_bind_palette_fallback_8color(void)
 {
     static const short ansi_band_ramp[N_PALETTE_BANDS] = {
@@ -537,31 +292,21 @@ static void theme_bind_palette_fallback_8color(void)
         init_pair(PAIR_BAND_BASE + band, ansi_band_ramp[band], -1);
 }
 
-/*
- * theme_apply — install theme #idx's colours into ncurses.
- *
- *   STEP 1 — CLAMP the requested index to [0, N_THEMES)
- *   STEP 2 — BIND palette (256-colour path or 8-colour fallback)
- *
- * Side effect: all subsequent COLOR_PAIR(PAIR_BAND_BASE+i) calls in
- * §8 pick up the new palette.  No GlowField re-write needed.
- */
+/* Switch the live colors to theme number idx. Everything drawn after
+ * this picks up the new palette automatically. */
 static void theme_apply(int idx)
 {
-    /* STEP 1 — clamp into valid range */
     int safe_idx = theme_clamp_index(idx);
 
-    /* STEP 2 — bind via the capability-appropriate path */
     if (terminal_supports_256_colours())
         theme_bind_palette_256(&themes[safe_idx]);
     else
         theme_bind_palette_fallback_8color();
 }
 
-/* hud_bind_pairs — assign the always-on HUD/HINT pairs (bright
- * yellow + bright cyan, see CLAUDE.md "HUD Standard").  Separate
- * from theme_apply because these NEVER change — they're the
- * keyboard-legend colours, not the algorithm's palette. */
+/* The HUD's own colors (bright yellow + cyan). Kept apart from the
+ * themes because the on-screen text should always stay readable no
+ * matter which theme the animation is using. */
 static void hud_bind_pairs(void)
 {
     if (terminal_supports_256_colours()) {
@@ -573,23 +318,12 @@ static void hud_bind_pairs(void)
     }
 }
 
-/*
- * color_init — once-only bootstrap of the ncurses colour system.
- *
- *   STEP 1 — wake up colour mode + opt into "background = -1"
- *   STEP 2 — bind the fixed HUD/HINT pairs
- *   STEP 3 — install the default theme (#0) into the band pairs
- */
+/* One-time color setup at startup. */
 static void color_init(void)
 {
-    /* STEP 1 — enable colour + use the terminal's default background */
     start_color();
-    use_default_colors();
-
-    /* STEP 2 — bind HUD/HINT (theme-independent legibility) */
+    use_default_colors();        /* let cells keep the terminal's bg */
     hud_bind_pairs();
-
-    /* STEP 3 — install the default theme into the band pairs */
     theme_apply(0);
 }
 
@@ -598,170 +332,102 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * §5 is LAYERED so a learner can read the JFA algorithm cleanly
- * without rendering tricks getting in the way. The layers are:
+ * §5 is split into four layers so the core algorithm reads cleanly:
  *
- *   §5a  ALGORITHM    — JFAGrid + jfa_grid_init/pass/run.
- *                        The pure integer-grid Jump Flood Algorithm
- *                        (Rong & Tan 2006). Operates on int seed
- *                        positions only; no animation, no rendering.
+ *   §5a  ALGORITHM — the Jump Flooding itself, working purely on
+ *                    whole-number seed positions. No motion, no colors.
+ *   §5b  DATA      — the Seed: a point with a home spot plus drift state.
+ *   §5c  ANIMATION — nudging each seed around its home over time.
+ *   §5d  READOUT   — looking up "how far is this cell from its seed?"
+ *                    with a smoothing trick for nicer-looking gradients.
  *
- *   §5b  DATA         — Seed struct + seeds_scatter.
- *                        The feature points the JFA computes
- *                        distances to. Each Seed carries an anchor
- *                        (its static "home") plus animation state.
- *
- *   §5c  ANIMATION    — seeds_animate.
- *                        The wobble effect (sin/cos drift around the
- *                        anchor). Lives OUTSIDE the JFA; the JFA
- *                        consumes whatever positions seeds_animate
- *                        writes.
- *
- *   §5d  OPTIMIZATION — sdf_seed_id + sdf_read.
- *                        Sub-pixel distance read used by patterns.
- *                        Uses each seed's FLOAT position instead of
- *                        its int snap so distance gradients are
- *                        continuous within cells. Pure rendering
- *                        trick; doesn't affect what JFA computes.
- *
- * Types are declared up front (both JFAGrid and Seed) so the four
- * function layers below can reference each other freely.
+ * Both structs are declared first so the functions can use each other.
  */
 
 /* ---------- §5: types ------------------------------------------------- */
 
 /*
- * JFAGrid — the working data structure of the Jump Flood Algorithm.
+ * JFAGrid — the grid the Jump Flooding works on.
  *
- * INTENT
- *   Hold the per-cell "nearest seed" information that the JFA
- *   computes and refines across log₂(N) passes. After jfa_grid_run
- *   completes, nearest_x[c] / nearest_y[c] are the integer coords
- *   of the seed closest to cell c. Reading distance from this grid
- *   is then a single sqrt of dist_sq.
+ * For every cell it remembers the location of the nearest seed it
+ * knows about so far. The flooding keeps improving that guess over a
+ * handful of passes; when it's done, each cell holds the true nearest
+ * seed, and the distance to it is just one square-root away.
  *
- * CONTEXT
- *   One instance lives on Scene (§7). Written by jfa_grid_run() at
- *   scene_init / scene_reset and once per scene_tick. Read by every
- *   §6 pattern via sdf_read() / sdf_seed_id() / direct
- *   nearest_x/y[idx] access. Index cells with
- *   jfa_idx(grid, x, y) = y · w + x — row-major to match every
- *   loop nest in §5a / §6.
+ * One of these lives on Scene (§7). It gets rebuilt every tick as the
+ * seeds drift, and every drawing pattern reads from it.
  *
- * PING-PONG
- *   JFA passes can't read and write the same buffer mid-pass — the
- *   result of pass P depends on values from pass P-1 across the
- *   whole grid. Two buffer pairs are kept; jfa_pass reads from one,
- *   writes to the other, jfa_grid_run swaps for the next pass.
- *   After log₂(N) passes the result lives in nearest_x/y (the final
- *   copy-back step in jfa_grid_run handles parity).
+ * Why two copies of the data (the "ping-pong"):
+ *   A flooding pass needs to read the whole grid as it was BEFORE the
+ *   pass while writing the improved values somewhere else — reading and
+ *   writing the same cells mid-pass would give wrong answers. So we keep
+ *   two buffers: read from one, write to the other, then swap. After all
+ *   the passes the final answer ends up in nearest_x/nearest_y (a
+ *   copy-back at the end handles the case where it landed in scratch).
  *
- * MEMORY
- *   4 × CELLS_MAX × sizeof(int16_t) ≈ 89 KB. All in BSS — no
- *   runtime allocations. int16_t is plenty: grid up to 32767/axis,
- *   far beyond MAP_W_MAX (200) / MAP_H_MAX (56).
+ *   w, h         : grid size in cells; set before flooding starts.
+ *   nearest_x[]  : for each cell, where its nearest seed is. Value
+ *   nearest_y[]    JFA_SENTINEL means "no seed found yet" — you only
+ *                  see that briefly at the start; once flooding finishes
+ *                  every cell has a real answer. This is what the
+ *                  drawing code reads.
+ *   scratch_x[]  : spare buffer the flooding writes into, then swaps
+ *   scratch_y[]    with the pair above. Not used outside §5a.
  *
- * MEMBER LOGIC
- *   w, h         : Grid dimensions in cells. Set by jfa_grid_run's
- *                  caller (scene_reset writes them) before the
- *                  first pass. Plain int so loop-counter arithmetic
- *                  stays sign-safe across all of §5a / §6.
- *   nearest_x[]  : Post-run state — for cell c, the integer X coord
- *   nearest_y[]    of the seed closest to c. JFA_SENTINEL means "no
- *                  seed reached this cell yet" (only seen briefly
- *                  inside jfa_grid_init; after a full run, every
- *                  in-bounds cell has a valid owner). Authoritative
- *                  source for sdf_seed_id() / sdf_read().
- *   scratch_x[]  : Ping-pong scratch — receives the OUTPUT of the
- *   scratch_y[]    next jfa_pass when nearest_* is the input. Never
- *                  read outside §5a. Sized identically to nearest_*
- *                  because jfa_pass swaps buffer pointers, not
- *                  array slots.
+ * Whole thing is about 89 KB, all reserved up front — no allocation
+ * while running. int16_t is plenty: grids never approach 32767 a side.
  *
  * Ref: Rong & Tan (2006), "Jump Flooding in GPU with Applications
  *      to Voronoi Diagram and Distance Transform", I3D'06.
  */
 typedef struct {
-    int     w, h;                    /* grid dims (cells), set at reset   */
-    int16_t nearest_x[CELLS_MAX];    /* post-run: cell → nearest seed x   */
-    int16_t nearest_y[CELLS_MAX];    /* post-run: cell → nearest seed y   */
-    int16_t scratch_x[CELLS_MAX];    /* ping-pong scratch (output side)   */
-    int16_t scratch_y[CELLS_MAX];    /* ping-pong scratch (output side)   */
+    int     w, h;                    /* grid size in cells                */
+    int16_t nearest_x[CELLS_MAX];    /* cell -> nearest seed's x          */
+    int16_t nearest_y[CELLS_MAX];    /* cell -> nearest seed's y          */
+    int16_t scratch_x[CELLS_MAX];    /* spare buffer for the ping-pong    */
+    int16_t scratch_y[CELLS_MAX];    /* spare buffer for the ping-pong    */
 } JFAGrid;
 
 /*
- * Seed — one feature point with all its state.
+ * Seed — one of the points the whole picture is built around.
  *
- * INTENT
- *   One struct, one array — instead of six parallel arrays. Members
- *   partition cleanly by purpose:
+ * Each seed has a fixed home spot and slowly circles around it. We keep
+ * its position in two forms on purpose:
+ *   - a smooth decimal position (fx, fy), so distances change gradually
+ *     and the shading looks fluid;
+ *   - a rounded whole-cell position (ix, iy), which the flooding uses to
+ *     decide exactly which cell owns which seed.
+ * That split is why the gradients glide while the cell borders still
+ * snap cleanly to the grid.
  *
- *     - ANCHOR + PHASES (fixed at reset, by seeds_scatter)
- *     - CURRENT FLOAT position fx, fy   — for sub-pixel sdf_read
- *     - CURRENT INT snap     ix, iy     — for JFA ownership
+ * There are N_SEEDS of these on the Scene. seeds_scatter picks new homes
+ * on reset; seeds_animate recomputes the positions every tick.
  *
- *   The float/int split is the §5d optimisation: float drives
- *   smooth gradient reads, int drives discrete JFA ownership.
- *
- * CONTEXT
- *   N_SEEDS instances live as Scene.seeds[N_SEEDS] (§7). Lifecycle:
- *     • seeds_scatter (§5b)    — at reset: pick anchors + phases.
- *     • seeds_animate (§5c)    — every tick: compute fx/fy/ix/iy
- *                                from anchor + wobble(wobble_time).
- *     • jfa_grid_init  (§5a)   — reads ix/iy as the integer seed
- *                                coords stamped into JFAGrid.
- *     • sdf_read       (§5d)   — reads fx/fy for sub-pixel distance.
- *   The struct is therefore the BRIDGE between the wobble effect
- *   (animation), the JFA (algorithm), and the per-cell reads
- *   (optimisation) — owning them in one place makes the three roles
- *   obvious.
- *
- * MEMORY
- *   sizeof(Seed) = 2·int16 + 2·float + 2·float + 2·int16 = 24 bytes.
- *   N_SEEDS=20 → 480 bytes total on Scene. Negligible vs the JFAGrid
- *   (~89 KB) and GlowField (~88 KB).
- *
- * MEMBER LOGIC
- *   anchor_x, anchor_y : Integer home position ∈ [0, w) × [0, h).
- *                        Fixed across animation; set ONLY by
- *                        seeds_scatter (called at reset). The wobble
- *                        orbits around this point.
- *   phase_x, phase_y   : Per-axis wobble phase ∈ [0, 2π) in radians.
- *                        Independent x/y phases — set
- *                        independently at scatter time so each seed
- *                        traces ELLIPSES of its own orientation/
- *                        eccentricity instead of identical circles.
- *                        Without independent phases all seeds would
- *                        drift in lockstep along a single direction.
- *   fx, fy             : Current float position
- *                          fx = anchor_x + WOBBLE_RADIUS · sin(t + phase_x)
- *                          fy = anchor_y + WOBBLE_RADIUS · cos(t + phase_y)
- *                        clamped to [0, w-1] × [0, h-1]. Updated
- *                        every tick by seeds_animate. Used by
- *                        sdf_read for the sub-pixel distance trick
- *                        (continuous gradient inside each cell).
- *   ix, iy             : round(fx, fy). The integer coords JFA reads
- *                        for ownership. Updates by ±1 only when fx/fy
- *                        crosses a half-cell boundary — that's
- *                        why distance gradients read smooth (fx/fy)
- *                        but Voronoi cell BORDERS still snap to
- *                        integer cells.
+ *   anchor_x, anchor_y : home spot (whole cells). The seed circles this.
+ *   phase_x, phase_y   : where each seed starts in its circle. Giving x
+ *                        and y different starting points turns the path
+ *                        into a tilted oval, so the seeds don't all
+ *                        drift in lockstep. In radians.
+ *   fx, fy             : current smooth position. Used for distance reads.
+ *   ix, iy             : current position rounded to a whole cell. Used by
+ *                        the flooding to assign ownership.
  */
 typedef struct {
-    int16_t anchor_x, anchor_y;      /* fixed home position (cells)        */
-    float   phase_x,  phase_y;       /* per-axis wobble phase (radians)    */
-    float   fx, fy;                  /* sub-pixel position (for sdf_read)  */
-    int16_t ix, iy;                  /* int snap (for JFA ownership)       */
+    int16_t anchor_x, anchor_y;      /* home spot (cells)                  */
+    float   phase_x,  phase_y;       /* starting point of the circle (rad) */
+    float   fx, fy;                  /* smooth position                    */
+    int16_t ix, iy;                  /* rounded-to-cell position           */
 } Seed;
 
-/* Small helpers — used by every layer below. */
+/* Turn a cell's (x, y) into its slot in the flat arrays. */
 static inline int jfa_idx(const JFAGrid *g, int x, int y)
 {
     return y * g->w + x;
 }
 
-/* Squared Euclidean distance — sqrt deferred to the read side
- * (kept as int to avoid sqrt in the JFA's tight comparison loop). */
+/* Distance between two points, but squared (no square root). Comparing
+ * squared distances gives the same "which is closer" answer, and skipping
+ * the sqrt keeps the inner loop fast. */
 static inline int dist_sq(int ax, int ay, int bx, int by)
 {
     int dx = ax - bx;
@@ -769,13 +435,11 @@ static inline int dist_sq(int ax, int ay, int bx, int by)
     return dx * dx + dy * dy;
 }
 
-/* ---------- §5a  ALGORITHM — pure JFA on integer positions ----------- */
+/* ---------- §5a  ALGORITHM — the Jump Flooding itself ---------------- */
 
-/*
- * jfa_grid_init — STAGE 1. Reset every cell to SENTINEL ("no seed
- * yet"); stamp each seed's int position with its own coords. After
- * this, only seed cells have ownership; jfa_pass propagates from there.
- */
+/* Starting point for the flooding: mark every cell "no seed yet", then
+ * plant each seed into its own cell. From here the flooding spreads
+ * that ownership outward. */
 static void jfa_grid_init(JFAGrid *g, const Seed *seeds, int n_seeds)
 {
     int n = g->w * g->h;
@@ -793,24 +457,10 @@ static void jfa_grid_init(JFAGrid *g, const Seed *seeds, int n_seeds)
     }
 }
 
-/*
- * jfa_pass — one Jump Flood pass at step size k.
- *
- * For every cell (cx, cy), look at the 9 neighbours at offsets
- * {-k, 0, +k}² in the SOURCE grid. Inherit whichever of them has a
- * seed closer to (cx, cy) than our own current best.
- *
- * src and dst MUST be different buffers (see PING-PONG note above).
- */
-/*
- * jfa_consider_candidate_owner — inner test of the 9-neighbour probe.
- *
- * Inspect the seed-owner stored at (nx, ny) in the source grid;
- * if its seed is closer to OUR cell (cx, cy) than the best owner
- * we've found so far, adopt it.  Out-of-bounds and "no seed yet"
- * (sentinel) neighbours are no-ops.  This is the per-candidate
- * step of the propagation rule from Rong & Tan (2006) §3.
- */
+/* Look at one neighbour during the flooding: if the seed that neighbour
+ * knows about is closer to our cell than our current best, take it.
+ * Neighbours off the grid, or ones that don't know any seed yet, are
+ * simply skipped. */
 static inline void jfa_consider_candidate_owner(
     const JFAGrid *g, int cx, int cy, int nx, int ny,
     const int16_t *src_x, const int16_t *src_y,
@@ -821,10 +471,10 @@ static inline void jfa_consider_candidate_owner(
     int neigh_idx = jfa_idx(g, nx, ny);
     int candidate_sx = src_x[neigh_idx];
     int candidate_sy = src_y[neigh_idx];
-    if (candidate_sx == JFA_SENTINEL) return;        /* neighbour has no owner yet */
+    if (candidate_sx == JFA_SENTINEL) return;        /* neighbour knows no seed yet */
 
     int candidate_d = dist_sq(cx, cy, candidate_sx, candidate_sy);
-    if (candidate_d < *best_d) {                     /* closer than our current best? */
+    if (candidate_d < *best_d) {                     /* closer than what we have? */
         *best_d  = candidate_d;
         *best_sx = candidate_sx;
         *best_sy = candidate_sy;
@@ -832,16 +482,12 @@ static inline void jfa_consider_candidate_owner(
 }
 
 /*
- * jfa_pass — one Jump-Flood propagation pass at step size k.
+ * jfa_pass — one round of flooding using jump size k.
  *
- *   FOR every cell c = (cx, cy):
- *     1. LOAD current best owner from src
- *     2. PROBE the 8 neighbours at offsets {-k, 0, +k}² (skip self)
- *        — keep whichever has the closest owner-seed to c
- *     3. COMMIT the winner into dst
- *
- * src and dst MUST be different buffers (see PING-PONG note on
- * JFAGrid).
+ * Each cell looks at eight neighbours k steps away (and keeps itself in
+ * the running too), and adopts whichever knows the closest seed. Reads
+ * from src, writes the improved answers into dst — they must be
+ * different buffers (see the ping-pong note on JFAGrid).
  */
 static void jfa_pass(const JFAGrid *g, int k,
                      const int16_t *src_x, const int16_t *src_y,
@@ -851,14 +497,14 @@ static void jfa_pass(const JFAGrid *g, int k,
         for (int cx = 0; cx < g->w; cx++) {
             int self_idx = jfa_idx(g, cx, cy);
 
-            /* STEP 1 — LOAD: start with whatever owner this cell already had */
+            /* start with whatever seed this cell already knew */
             int best_sx = src_x[self_idx];
             int best_sy = src_y[self_idx];
             int best_d  = (best_sx == JFA_SENTINEL)
                         ? JFA_INFINITE_SQ_DISTANCE
                         : dist_sq(cx, cy, best_sx, best_sy);
 
-            /* STEP 2 — PROBE the 8 neighbours at jump step k */
+            /* check the eight neighbours k steps away */
             for (int dy = -k; dy <= k; dy += k) {
                 for (int dx = -k; dx <= k; dx += k) {
                     if (dx == 0 && dy == 0) continue;        /* skip self */
@@ -869,29 +515,26 @@ static void jfa_pass(const JFAGrid *g, int k,
                 }
             }
 
-            /* STEP 3 — COMMIT the winning owner into the dst buffer */
+            /* write the winner out */
             dst_x[self_idx] = (int16_t)best_sx;
             dst_y[self_idx] = (int16_t)best_sy;
         }
     }
 }
 
-/* jfa_initial_jump_step — the FIRST jump size in the halving schedule.
- * Rong & Tan use ⌊max(W,H)/2⌋ so the very first pass can already
- * carry seed information from opposite sides of the grid. */
+/* The first (biggest) jump: half the grid's longer side, so even seeds
+ * on opposite edges can reach each other in the very first pass. */
 static inline int jfa_initial_jump_step(const JFAGrid *g)
 {
     int n_max = (g->w > g->h) ? g->w : g->h;
     return n_max / 2;
 }
 
-/* jfa_next_jump_step — schedule step: halve until 1, then stop.
- * The full sequence is N/2, N/4, …, 2, 1 — log₂(N) total passes. */
+/* Halve the jump for the next pass; the sequence runs down to 1. */
 static inline int jfa_next_jump_step(int k) { return k >> 1; }
 
-/* jfa_swap_ping_pong — flip src↔dst so the next pass reads what the
- * previous pass just wrote.  Keeps the two passes operating on
- * disjoint buffers (a JFA correctness requirement). */
+/* Swap the read and write buffers so the next pass reads the freshest
+ * answers. Keeps each pass reading and writing separate memory. */
 static inline void jfa_swap_ping_pong(int16_t **src_x, int16_t **src_y,
                                       int16_t **dst_x, int16_t **dst_y)
 {
@@ -899,17 +542,14 @@ static inline void jfa_swap_ping_pong(int16_t **src_x, int16_t **src_y,
     int16_t *ty = *src_y; *src_y = *dst_y; *dst_y = ty;
 }
 
-/* jfa_finalise_into_canonical — copy-back if parity left the final
- * winners in the scratch buffer.  jfa_pass writes into dst; the next
- * iteration swaps src↔dst.  After an EVEN number of passes the
- * final result lives in nearest_*; after an ODD number, in
- * scratch_*.  Callers (and §6 patterns) ALWAYS read from
- * nearest_*, so we copy back when needed. */
+/* After all the swapping, the final answer might have landed in the
+ * scratch buffer (odd number of passes). The rest of the program always
+ * reads from nearest_*, so copy it back over if needed. */
 static inline void jfa_finalise_into_canonical(JFAGrid *g,
                                                const int16_t *final_src_x,
                                                const int16_t *final_src_y)
 {
-    if (final_src_x == g->nearest_x) return;        /* already canonical */
+    if (final_src_x == g->nearest_x) return;        /* already in the right place */
 
     int n = g->w * g->h;
     for (int i = 0; i < n; i++) {
@@ -919,23 +559,16 @@ static inline void jfa_finalise_into_canonical(JFAGrid *g,
 }
 
 /*
- * jfa_grid_run — STAGE 2.  Drive the full JFA pipeline.
+ * jfa_grid_run — build the whole distance map from scratch.
  *
- *   STEP 1 — STAMP seed coords into the grid (sentinel everywhere else)
- *   STEP 2 — RUN the halving-step schedule: k = N/2, N/4, …, 1
- *            (each pass ping-pongs through the two buffer pairs)
- *   STEP 3 — FINALISE: ensure the result lives in g->nearest_*
- *
- * After this returns, every cell's nearest_x/y points to the seed
- * (in integer coords) that owns it; sdf_read / sdf_seed_id can be
- * called on any cell.
+ * Plant the seeds, then flood with ever-smaller jumps (half the grid,
+ * then a quarter, ... down to 1) until every cell knows its nearest
+ * seed. After this, sdf_read / sdf_seed_id work on any cell.
  */
 static void jfa_grid_run(JFAGrid *g, const Seed *seeds, int n_seeds)
 {
-    /* STEP 1 — STAMP: seed cells get their own coords, others SENTINEL */
     jfa_grid_init(g, seeds, n_seeds);
 
-    /* STEP 2 — RUN: log₂(N) propagation passes, halving k each time */
     int16_t *src_x = g->nearest_x, *src_y = g->nearest_y;
     int16_t *dst_x = g->scratch_x, *dst_y = g->scratch_y;
 
@@ -944,18 +577,14 @@ static void jfa_grid_run(JFAGrid *g, const Seed *seeds, int n_seeds)
         jfa_swap_ping_pong  (&src_x, &src_y, &dst_x, &dst_y);
     }
 
-    /* STEP 3 — FINALISE: copy back if parity left winners in scratch */
     jfa_finalise_into_canonical(g, src_x, src_y);
 }
 
 /* ---------- §5b  DATA — seed scatter --------------------------------- */
 
-/*
- * seeds_scatter — randomise anchor positions and wobble phases for
- * all seeds. Called on every reset (r). Does NOT set the current
- * fx/fy/ix/iy — caller follows with seeds_animate(..., 0.0f) to
- * populate them.
- */
+/* Drop the seeds at fresh random homes with random starting angles
+ * (this is what 'r' does). It doesn't set the live positions — the
+ * caller runs seeds_animate right after to fill those in. */
 static void seeds_scatter(Seed *seeds, int n_seeds, int w, int h)
 {
     for (int s = 0; s < n_seeds; s++) {
@@ -968,15 +597,12 @@ static void seeds_scatter(Seed *seeds, int n_seeds, int w, int h)
     }
 }
 
-/* ---------- §5c  ANIMATION — wobble (independent of the JFA) --------- */
+/* ---------- §5c  ANIMATION — drifting the seeds around -------------- */
 
-/* seed_compute_wobble_offset — the wobble formula in one place.
- *
- *   offset = ( R · sin(t + φx),  R · cos(t + φy) )
- *
- * Independent x/y phases turn what would be a circle into an
- * ELLIPSE oriented per-seed; that's what makes the field look
- * organic instead of every seed orbiting in lockstep. */
+/* How far the seed is from its home right now. Using a sine for x and a
+ * cosine for y, each with its own starting angle, traces a tilted oval
+ * rather than a plain circle — that's what makes the drift look organic
+ * instead of every seed sliding the same way. */
 static inline void seed_compute_wobble_offset(const Seed *s, float t,
                                               float *wx, float *wy)
 {
@@ -984,9 +610,8 @@ static inline void seed_compute_wobble_offset(const Seed *s, float t,
     *wy = WOBBLE_RADIUS_CELLS * cosf(t + s->phase_y);
 }
 
-/* seed_clamp_to_grid — keep the float position inside the grid
- * rectangle [0, w-1] × [0, h-1].  A seed that escaped the grid
- * would hash to JFA_SENTINEL and disappear from the diagram. */
+/* Keep a seed from drifting off the grid — one that did would vanish
+ * from the picture. */
 static inline void seed_clamp_to_grid(float *fx, float *fy, int w, int h)
 {
     if (*fx < 0.0f)              *fx = 0.0f;
@@ -995,17 +620,15 @@ static inline void seed_clamp_to_grid(float *fx, float *fy, int w, int h)
     if (*fy > (float)(h - 1))    *fy = (float)(h - 1);
 }
 
-/* seed_snap_to_integer_cell — round float → nearest integer cell.
- * The +0.5 bias gives round-to-nearest instead of round-toward-zero;
- * without it, the int snap would jitter by ±1 at half-cell crossings. */
+/* Round a decimal position to the nearest whole cell. */
 static inline int16_t seed_snap_to_integer_cell(float f)
 {
     return (int16_t)(f + ROUND_TO_NEAREST_BIAS);
 }
 
-/* seed_commit_position — write the float position (used by sdf_read
- * for sub-pixel smoothness) AND the integer snap (used by JFA for
- * discrete ownership) together; the two MUST stay in sync. */
+/* Save both forms of a seed's position at once — the smooth one for
+ * shading and the rounded one for the flooding — so they never drift
+ * out of agreement. */
 static inline void seed_commit_position(Seed *s, float fx, float fy)
 {
     s->fx = fx;
@@ -1014,40 +637,27 @@ static inline void seed_commit_position(Seed *s, float fx, float fy)
     s->iy = seed_snap_to_integer_cell(fy);
 }
 
-/*
- * seeds_animate — every tick, recompute each seed's current position
- * from its anchor + wobble at time t.
- *
- *   FOR every seed s:
- *     STEP 1 — COMPUTE the wobble offset (sin/cos around the anchor)
- *     STEP 2 — APPLY: position = anchor + offset, clamped to grid
- *     STEP 3 — COMMIT: write float (sdf_read) + int snap (JFA)
- */
+/* Move every seed to where it should be at time t: its home plus a
+ * little orbit, kept on the grid. Runs once per tick. */
 static void seeds_animate(Seed *seeds, int n_seeds, int w, int h, float t)
 {
     for (int s = 0; s < n_seeds; s++) {
-        /* STEP 1 — wobble offset = (R·sin, R·cos) with independent x/y phases */
         float wx, wy;
         seed_compute_wobble_offset(&seeds[s], t, &wx, &wy);
 
-        /* STEP 2 — apply offset to the anchor, clamp inside the grid */
         float fx = (float)seeds[s].anchor_x + wx;
         float fy = (float)seeds[s].anchor_y + wy;
         seed_clamp_to_grid(&fx, &fy, w, h);
 
-        /* STEP 3 — write float position + integer snap (both consumers) */
         seed_commit_position(&seeds[s], fx, fy);
     }
 }
 
-/* ---------- §5d  OPTIMIZATION — sub-pixel distance reads ------------- */
+/* ---------- §5d  READOUT — looking up a cell's distance to its seed -- */
 
-/*
- * sdf_seed_id — for cell (x, y), return the index ∈ [0, n_seeds)
- * of the seed that owns it, or -1 if no owner. Linear search through
- * the seeds array matching the JFA grid's int coords; for n_seeds=20
- * this is well under any cache pressure.
- */
+/* Which seed owns this cell? Returns its index, or -1 if none. The grid
+ * stores the owner's coordinates, so we just find the matching seed.
+ * A plain scan is fine for only 20 seeds. */
 static inline int sdf_seed_id(const JFAGrid *grid, const Seed *seeds,
                               int n_seeds, int x, int y)
 {
@@ -1061,15 +671,13 @@ static inline int sdf_seed_id(const JFAGrid *grid, const Seed *seeds,
     return -1;
 }
 
-/*
- * sdf_read — distance from cell (x, y) to its nearest seed.
+/* How far cell (x, y) is from its nearest seed.
  *
- * Sub-pixel: looks up the owner's INDEX via the int grid, then
- * computes distance using the seed's FLOAT position. The SDF varies
- * smoothly within each cell as the float position drifts, even when
- * the int snap hasn't moved yet — that's what makes Tier 1/2/4
- * gradients feel fluid instead of stair-stepped.
- */
+ * It finds the owning seed through the grid (rounded positions), but
+ * measures the distance against the seed's smooth position. So as a seed
+ * drifts, the distance changes gradually even before its rounded cell
+ * moves — that's what keeps the shaded gradients fluid instead of
+ * looking like stair steps. */
 static inline float sdf_read(const JFAGrid *grid, const Seed *seeds,
                              int n_seeds, int x, int y)
 {
@@ -1085,34 +693,23 @@ static inline float sdf_read(const JFAGrid *grid, const Seed *seeds,
 /* ===================================================================== */
 
 /*
- * Signature: every pattern function takes
- *   (grid, seeds, n_seeds, x, y, t, &glow, &band)
- *
- *   grid     = JFA result grid (already populated by jfa_grid_run).
- *              Holds w/h plus per-cell nearest-seed coordinates.
- *   seeds    = the seed array — needed for sub-pixel sdf_read.
- *   n_seeds  = number of valid seeds.
- *   x, y     = current cell coords.
- *   t        = wobble_time (Tier 6 patterns read it for animation;
- *              others may use it for subtle modulation).
- *   out_glow = scalar ∈ [0, 1].
- *   out_band = palette index ∈ {0..3}.
- *
- * All patterns read JFA state via three accessors only:
- *   sdf_read(grid, seeds, n_seeds, x, y)      — distance to nearest seed
- *   sdf_seed_id(grid, seeds, n_seeds, x, y)   — index of nearest seed
- *   grid->nearest_x/y[jfa_idx(grid, x, y)]    — raw owner coords for hashing
- *
- * Typical max distance used to normalise the raw SDF for visualisation.
- * Empirical — half the grid diagonal would be ~100; we use 25 because
- * with 20 seeds the typical max distance in any cell is closer to 20.
+ * Every pattern below has the same shape: given a cell, it fills in a
+ * brightness (out_glow, 0 to 1) and a color tier (out_band, 0 to 3).
+ * The arguments are the finished distance grid, the seeds, the cell's
+ * (x, y), and t (the drift clock, which the Tier-6 animated patterns
+ * lean on). Patterns reach into the grid only through sdf_read,
+ * sdf_seed_id, and the raw owner coords.
  */
+
+/* Distances get divided by this to land in the 0..1 range for shading.
+ * With 20 seeds the farthest a cell usually gets is around 20, so 25
+ * keeps most of the range usable. */
 #define SDF_TYPICAL_MAX     25.0f
 
-/* Spacing of bands in Tier-2 patterns, in distance units. */
+/* How far apart the repeating rings are (Tier 2), in distance units. */
 #define BAND_SPACING        4.0f
 
-/* Halo decay scale for Tier-4 HALO / AURA (Gaussian σ in distance units). */
+/* How quickly the glow patterns (HALO / AURA) fade with distance. */
 #define HALO_SIGMA          5.0f
 
 static inline float clampf(float v, float lo, float hi)
@@ -1120,40 +717,40 @@ static inline float clampf(float v, float lo, float hi)
     return v < lo ? lo : v > hi ? hi : v;
 }
 
+/* Turn a 0..1 brightness into one of the 4 color tiers. */
 static inline int band_from_glow(float g)
 {
     return (int)(g * GLOW_TO_BAND_GAIN) & PALETTE_BAND_MASK;
 }
 
-/* Per-cell pseudo-random scalar ∈ [0, 1] derived from a uint32 — used
- * by Tier-3 RAINBOW / SPECKLE / TWINKLE for per-cell "personality". */
+/* Scramble a number into a repeatable "random" value between 0 and 1.
+ * Patterns use this to give each cell its own flavor (a color, a blink
+ * rate). Same input always gives the same output. */
 static inline float jfa_hash_to_unit(uint32_t v)
 {
-    /* Reuse Worley/Value-style splitmix mixer. */
     v = (v ^ (v >> 16)) * 0x7feb352du;
     v = (v ^ (v >> 15)) * 0x846ca68bu;
     v =  v ^ (v >> 16);
     return (float)(v & 0xFFFFu) * (1.0f / 65535.0f);
 }
 
-/* Pack the F1-seed coords into one 32-bit value, then hash. Gives a
- * stable per-cell key (every cell in the same Voronoi region produces
- * the same hash). */
+/* A single ID for a cell's owning seed, built from its coordinates.
+ * Every cell that belongs to the same seed gets the same ID, so we can
+ * give a whole region one consistent random flavor. */
 static inline uint32_t jfa_cell_key(int sx, int sy)
 {
     return ((uint32_t)(sx & 0xFFFF) << 16) | (uint32_t)(sy & 0xFFFF);
 }
 
-/* ---------- STRUCTURE helpers (used by Tier 5) ------------------------ *
+/* ---------- helpers for the cell-skeleton patterns (Tier 5) ----------- *
  *
- * These look at the 4-connectivity neighbours of a cell to detect
- * Voronoi topology: cell-boundary edges (cells whose nearest seed
- * differs from a neighbour's), triple-point vertices, and medial-axis
- * peaks.
+ * These peek at a cell's four neighbours to find the structure of the
+ * cell layout: the borders between cells, the corners where three cells
+ * meet, and the ridge lines running down the middle of each cell.
  */
 
-/* True iff at least one of the 4-neighbours of (x, y) has a different
- * F1-owner than (x, y) — i.e. (x, y) sits on a Voronoi cell edge. */
+/* Is this cell on a border between two cells? True when any of its four
+ * neighbours belongs to a different seed. */
 static bool is_voronoi_edge(const JFAGrid *g, int x, int y)
 {
     int idx_me = jfa_idx(g, x, y);
@@ -1172,9 +769,7 @@ static bool is_voronoi_edge(const JFAGrid *g, int x, int y)
     return false;
 }
 
-/* owner_already_listed — tiny linear scan: have we seen this seed
- * coord pair in the per-cell unique-owner tally yet?  N is at most 5
- * (4-neighbours + self) so a hash set would be slower than the scan. */
+/* Have we already counted this seed in the running list? */
 static inline bool owner_already_listed(const int *sx_seen, const int *sy_seen,
                                         int n, int sx, int sy)
 {
@@ -1183,18 +778,12 @@ static inline bool owner_already_listed(const int *sx_seen, const int *sy_seen,
     return false;
 }
 
-/* Count distinct F1-owners among (x, y) and its 4-neighbours.
- *
- *   FOR each of the 5 cells (self + N/E/S/W):
- *     IF in-bounds AND has-owner AND owner-not-yet-listed:
- *       append owner to the running tally
- *   RETURN tally size
- *
- * Returns 1 (interior cell) to 5 (rare).  Used by Tier-5 VERTICES:
- * 3+ means a Voronoi vertex / triple-point. */
+/* How many different seeds own this cell and its four neighbours?
+ * Result is 1 deep inside a cell, 2 along a border, and 3+ right at a
+ * corner where several cells touch (used to spot those corners). */
 static int count_distinct_neighbours(const JFAGrid *g, int x, int y)
 {
-    /* 5-step neighbourhood scan: self + 4-connectivity */
+    /* the cell itself plus its four neighbours */
     static const int neighbour_dx5[5] = { 0, -1, 1,  0, 0 };
     static const int neighbour_dy5[5] = { 0,  0, 0, -1, 1 };
 
@@ -1210,7 +799,7 @@ static int count_distinct_neighbours(const JFAGrid *g, int x, int y)
         int idx = jfa_idx(g, nx, ny);
         int neighbour_sx = g->nearest_x[idx];
         int neighbour_sy = g->nearest_y[idx];
-        if (neighbour_sx == JFA_SENTINEL) continue;        /* no owner here */
+        if (neighbour_sx == JFA_SENTINEL) continue;        /* no seed here */
 
         if (owner_already_listed(sx_seen, sy_seen, unique_count,
                                  neighbour_sx, neighbour_sy)) continue;
@@ -1222,10 +811,10 @@ static int count_distinct_neighbours(const JFAGrid *g, int x, int y)
     return unique_count;
 }
 
-/* True iff d(x, y) ≥ d at all 4-neighbours. Approximates the MEDIAL
- * AXIS — the ridge of points equidistant from 2+ seeds. Discrete-grid
- * artefacts make this a bit noisy but visually it traces the cell
- * boundaries from the SDF side (highest distance interior strips). */
+/* Is this cell at least as far from its seed as all four neighbours are
+ * from theirs? Those high points trace the ridge running between cells —
+ * roughly the skeleton of the layout. It comes out a little speckly on a
+ * grid this coarse. */
 static bool is_local_max(const JFAGrid *g, const Seed *seeds, int n_seeds,
                          int x, int y)
 {
@@ -1243,10 +832,9 @@ static bool is_local_max(const JFAGrid *g, const Seed *seeds, int n_seeds,
     return true;
 }
 
-/* ---------- Tier 1 — DISTANCE: raw distance mappings ------------------ */
+/* ---------- Tier 1 — plain distance, shaded different ways ------------ */
 
-/* SDF — raw distance; bright = far from any seed. The canonical
- * Euclidean Distance Field look. */
+/* SDF — straight distance: the farther from a seed, the brighter. */
 static void pattern_sdf(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                         float *out_glow, int *out_band)
@@ -1259,7 +847,7 @@ static void pattern_sdf(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = band_from_glow(g);
 }
 
-/* INVERSE — bright at seeds, dark at cell edges. Highlights centres. */
+/* INVERSE — the flip of SDF: bright at the seeds, dark out at the edges. */
 static void pattern_inverse(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                             float *out_glow, int *out_band)
@@ -1272,7 +860,7 @@ static void pattern_inverse(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = band_from_glow(g);
 }
 
-/* SQRT — square-root compression. Lifts the mid-range; softer contrast. */
+/* SQRT — same as SDF but brightens the mid-range, for softer contrast. */
 static void pattern_sqrt(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                          float *out_glow, int *out_band)
@@ -1285,8 +873,8 @@ static void pattern_sqrt(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = band_from_glow(g);
 }
 
-/* SQUARED — quadratic emphasis. Centres stay dark; only the far cells
- * really light up. High-contrast inverse of SQRT. */
+/* SQUARED — the opposite of SQRT: only the far cells really light up,
+ * so the contrast is sharp. */
 static void pattern_squared(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                             float *out_glow, int *out_band)
@@ -1299,9 +887,8 @@ static void pattern_squared(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = band_from_glow(*out_glow);
 }
 
-/* CAPPED — clamp the distance at half-max so far cells form a uniform
- * plateau. Gives a "filled cell interior" look without the gradient
- * roll-off near edges. */
+/* CAPPED — like SDF but everything past the halfway distance maxes out
+ * flat, giving solid-looking cell interiors instead of a fade. */
 static void pattern_capped(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                            float *out_glow, int *out_band)
@@ -1314,9 +901,9 @@ static void pattern_capped(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = band_from_glow(g);
 }
 
-/* ---------- Tier 2 — BANDS: periodic structuring of distance ---------- */
+/* ---------- Tier 2 — repeating rings carved out of the distance ------- */
 
-/* RINGS — concentric iso-distance bands via a smooth triangular wave. */
+/* RINGS — evenly spaced rings around each seed, fading in and out. */
 static void pattern_rings(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                           float *out_glow, int *out_band)
@@ -1324,14 +911,14 @@ static void pattern_rings(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     (void)t;
     float d = sdf_read(grid, seeds, n_seeds, x, y);
     if (d < 0.0f) { *out_glow = 0.0f; *out_band = 0; return; }
-    float u   = fmodf(d, BAND_SPACING) / BAND_SPACING;       /* [0, 1) */
-    float tri = (u < 0.5f) ? (u * 2.0f) : (2.0f - u * 2.0f);
+    float u   = fmodf(d, BAND_SPACING) / BAND_SPACING;       /* position in ring */
+    float tri = (u < 0.5f) ? (u * 2.0f) : (2.0f - u * 2.0f); /* up then down    */
     *out_glow = tri;
     *out_band = ((int)(d / BAND_SPACING)) & PALETTE_BAND_MASK;
 }
 
-/* SAW — sawtooth bands. Sharp drop-off → ring → drop-off. Reads as
- * directional motion outward from each seed. */
+/* SAW — rings that brighten gradually then drop off sharply, so they
+ * look like they're flowing outward from each seed. */
 static void pattern_saw(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                         float *out_glow, int *out_band)
@@ -1343,7 +930,7 @@ static void pattern_saw(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = ((int)(d / BAND_SPACING)) & PALETTE_BAND_MASK;
 }
 
-/* ZEBRA — hard binary bands. Either bright or dark, nothing in between. */
+/* ZEBRA — hard on/off rings, no shading in between. */
 static void pattern_zebra(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                           float *out_glow, int *out_band)
@@ -1356,8 +943,7 @@ static void pattern_zebra(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = ring & PALETTE_BAND_MASK;
 }
 
-/* WAVE — sine-modulated rings. Smooth peaks and troughs spreading
- * outward; reads like ripples on a pond. */
+/* WAVE — smooth rings like ripples on a pond. */
 static void pattern_wave(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                          float *out_glow, int *out_band)
@@ -1369,8 +955,8 @@ static void pattern_wave(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = ((int)(d / BAND_SPACING)) & PALETTE_BAND_MASK;
 }
 
-/* SHELLS — exponential-decay layers. Each "shell" is bright at its
- * inner edge and decays outward; multiple shells nest from each seed. */
+/* SHELLS — nested layers, each bright at its inner edge and fading out,
+ * stacked from the seed outward. */
 static void pattern_shells(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                            float *out_glow, int *out_band)
@@ -1383,11 +969,10 @@ static void pattern_shells(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = ((int)(d / BAND_SPACING)) & PALETTE_BAND_MASK;
 }
 
-/* ---------- Tier 3 — VORONOI: cell-id-driven effects ------------------ */
+/* ---------- Tier 3 — color each cell by which seed owns it ------------ */
 
-/* CELLS — solid colour per Voronoi region with a subtle inward gradient
- * (brighter at the seed, dimmer at edges) so each cell has a focal
- * point. Band index = seed id. */
+/* CELLS — each region gets its own color, a touch brighter near its
+ * seed so each cell has a center. */
 static void pattern_cells(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                           float *out_glow, int *out_band)
@@ -1400,8 +985,8 @@ static void pattern_cells(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = sid & PALETTE_BAND_MASK;
 }
 
-/* CRACKLE — Voronoi cells with dark edges. Like CELLS but actively
- * darkens away from the seed centre — reads as dried mud. */
+/* CRACKLE — colored cells that darken toward their edges, like dried
+ * cracked mud. */
 static void pattern_crackle(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                             float *out_glow, int *out_band)
@@ -1414,9 +999,7 @@ static void pattern_crackle(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = sid & PALETTE_BAND_MASK;
 }
 
-/* SPECKLE — each cell has its OWN brightness (drawn from hashing the
- * seed coords). Cell colours don't follow a gradient; they tile flat
- * at hash-derived intensities. */
+/* SPECKLE — every cell a flat random brightness of its own, no fade. */
 static void pattern_speckle(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                             float *out_glow, int *out_band)
@@ -1430,9 +1013,8 @@ static void pattern_speckle(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = (int)(v * 3.999f) & PALETTE_BAND_MASK;
 }
 
-/* RAINBOW — cell brightness from a different hash bit. Same idea as
- * SPECKLE but the band index varies per-cell as a fast hash, so
- * adjacent cells contrast visibly even when their brightnesses agree. */
+/* RAINBOW — like SPECKLE, but the color also varies per cell so
+ * neighbours stand apart even at the same brightness. */
 static void pattern_rainbow(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                             float *out_glow, int *out_band)
@@ -1443,15 +1025,14 @@ static void pattern_rainbow(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     if (sx == JFA_SENTINEL) { *out_glow = 0.0f; *out_band = 0; return; }
     uint32_t k = jfa_cell_key(sx, sy);
     float v = jfa_hash_to_unit(k);
-    /* Distance fade so cells aren't pure flat tiles. */
+    /* mix in a little fade so cells aren't perfectly flat */
     float d = sdf_read(grid, seeds, n_seeds, x, y);
     *out_glow = clampf((1.0f - d * 0.04f) * (0.3f + v * 0.7f), 0.0f, 1.0f);
     *out_band = (int)(jfa_hash_to_unit(k ^ 0xdeadbeefu) * 3.999f) & PALETTE_BAND_MASK;
 }
 
-/* TWINKLE — cells pulse in/out, with the pulse rate hashed per-cell so
- * they don't all blink in sync. Each cell flickers at its own slow
- * rhythm. */
+/* TWINKLE — each cell slowly blinks, every one at its own pace, so they
+ * never blink in sync. */
 static void pattern_twinkle(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                             float *out_glow, int *out_band)
@@ -1467,10 +1048,9 @@ static void pattern_twinkle(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = (int)k & PALETTE_BAND_MASK;
 }
 
-/* ---------- Tier 4 — CONTOURS: iso-line uses -------------------------- */
+/* ---------- Tier 4 — rings and glows at chosen distances -------------- */
 
-/* OUTLINE — single soft contour at OUTLINE_DISTANCE. Triangle falloff
- * either side gives the iso-line a glow. */
+/* OUTLINE — one soft glowing ring at a fixed distance from each seed. */
 static void pattern_outline(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                             float *out_glow, int *out_band)
@@ -1484,8 +1064,8 @@ static void pattern_outline(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = sdf_seed_id(grid, seeds, n_seeds, x, y) & PALETTE_BAND_MASK;
 }
 
-/* DUAL — two iso-lines (inner + outer), in different palette bands.
- * Shows the same seed set "nested". */
+/* DUAL — two rings around each seed, an inner and an outer, in
+ * different colors. */
 static void pattern_dual(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                          float *out_glow, int *out_band)
@@ -1493,8 +1073,8 @@ static void pattern_dual(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     (void)t;
     float d = sdf_read(grid, seeds, n_seeds, x, y);
     if (d < 0.0f) { *out_glow = 0.0f; *out_band = 0; return; }
-    float d_inner = 4.0f;
-    float d_outer = 10.0f;
+    float d_inner = 4.0f;        /* inner ring distance  */
+    float d_outer = 10.0f;       /* outer ring distance  */
     float diff_i = fabsf(d - d_inner);
     float diff_o = fabsf(d - d_outer);
     if (diff_i < OUTLINE_THICKNESS) {
@@ -1509,8 +1089,7 @@ static void pattern_dual(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     }
 }
 
-/* SHELL — soft annulus filled in the band between d=2 and d=7. Like
- * a thick OUTLINE; useful for "stroke" effects. */
+/* SHELL — a thick filled band around each seed, like a fat OUTLINE. */
 static void pattern_shell(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                           float *out_glow, int *out_band)
@@ -1518,17 +1097,17 @@ static void pattern_shell(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     (void)t;
     float d = sdf_read(grid, seeds, n_seeds, x, y);
     if (d < 0.0f) { *out_glow = 0.0f; *out_band = 0; return; }
-    float d_lo = 2.0f, d_hi = 7.0f;
+    float d_lo = 2.0f, d_hi = 7.0f;        /* the band runs from d_lo to d_hi */
     if (d < d_lo || d > d_hi) { *out_glow = 0.0f; *out_band = 0; return; }
     float u = (d - d_lo) / (d_hi - d_lo);
-    /* Smoothstep so the edges of the shell fade. */
+    /* fade the band's two edges so it doesn't end abruptly */
     *out_glow = u * u * (3.0f - 2.0f * u) * (1.0f - u) * 4.0f;
     if (*out_glow > 1.0f) *out_glow = 1.0f;
     *out_band = sdf_seed_id(grid, seeds, n_seeds, x, y) & PALETTE_BAND_MASK;
 }
 
-/* HALO — Gaussian decay around each seed. Bright at the centre,
- * fading smoothly outward. The basic "glow around a point" shape. */
+/* HALO — a simple soft glow around each seed, bright at the center and
+ * fading smoothly outward. */
 static void pattern_halo(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                          float *out_glow, int *out_band)
@@ -1540,8 +1119,8 @@ static void pattern_halo(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = sdf_seed_id(grid, seeds, n_seeds, x, y) & PALETTE_BAND_MASK;
 }
 
-/* AURA — multi-layered Gaussians. Three decay scales summed; gives
- * each cell a bright core, a halo, and a faint outer glow. */
+/* AURA — three glows of different sizes stacked, giving each seed a
+ * bright core, a halo, and a faint outer haze. */
 static void pattern_aura(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                          float *out_glow, int *out_band)
@@ -1549,9 +1128,9 @@ static void pattern_aura(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     (void)t;
     float d = sdf_read(grid, seeds, n_seeds, x, y);
     if (d < 0.0f) { *out_glow = 0.0f; *out_band = 0; return; }
-    float s1 = HALO_SIGMA * 0.5f;
-    float s2 = HALO_SIGMA;
-    float s3 = HALO_SIGMA * 2.0f;
+    float s1 = HALO_SIGMA * 0.5f;        /* tight core glow  */
+    float s2 = HALO_SIGMA;               /* mid halo         */
+    float s3 = HALO_SIGMA * 2.0f;        /* wide outer haze  */
     float g = expf(-(d * d) / (s1 * s1)) * 0.6f
             + expf(-(d * d) / (s2 * s2)) * 0.3f
             + expf(-(d * d) / (s3 * s3)) * 0.15f;
@@ -1559,10 +1138,9 @@ static void pattern_aura(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = sdf_seed_id(grid, seeds, n_seeds, x, y) & PALETTE_BAND_MASK;
 }
 
-/* ---------- Tier 5 — STRUCTURE: neighbour-aware (Voronoi topology) ---- */
+/* ---------- Tier 5 — the cell skeleton: edges, corners, ridges ------- */
 
-/* EDGES — bright on Voronoi cell boundaries (cells whose nearest seed
- * differs from a 4-neighbour). Traces the dual of the Delaunay graph. */
+/* EDGES — light up only the borders between cells. */
 static void pattern_edges(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                           float *out_glow, int *out_band)
@@ -1577,8 +1155,8 @@ static void pattern_edges(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     }
 }
 
-/* VERTICES — bright at Voronoi vertices (triple-points where 3+ cells
- * meet). Rare, isolated bright pixels. */
+/* VERTICES — light up just the corners where three or more cells meet.
+ * Only a few scattered bright dots. */
 static void pattern_vertices(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                              float *out_glow, int *out_band)
@@ -1594,8 +1172,8 @@ static void pattern_vertices(const JFAGrid *grid, const Seed *seeds, int n_seeds
     }
 }
 
-/* INTERIOR — the inverse of EDGES: bright everywhere EXCEPT on cell
- * boundaries. Reads as filled tiles with thin dark cracks. */
+/* INTERIOR — the opposite of EDGES: fill the cells, leave thin dark
+ * cracks along the borders. */
 static void pattern_interior(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                              float *out_glow, int *out_band)
@@ -1613,8 +1191,8 @@ static void pattern_interior(const JFAGrid *grid, const Seed *seeds, int n_seeds
     }
 }
 
-/* WEAVE — RINGS but masked to cell interiors. Each cell gets its own
- * concentric ring set, edges are dark. Reads as tiled water-ripples. */
+/* WEAVE — RINGS, but clipped to each cell so the borders stay dark.
+ * Looks like a tiled patchwork of little ripple patches. */
 static void pattern_weave(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                           float *out_glow, int *out_band)
@@ -1633,10 +1211,8 @@ static void pattern_weave(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = sdf_seed_id(grid, seeds, n_seeds, x, y) & PALETTE_BAND_MASK;
 }
 
-/* SKELETON — medial-axis approximation. Bright where the SDF is
- * locally maximal — i.e. the points equidistant from multiple seeds.
- * Discrete-grid noise makes the ridges patchy; reads as a sparse
- * Voronoi-graph trace. */
+/* SKELETON — light up the ridge lines running down the middle between
+ * cells. Comes out a bit patchy on a coarse grid. */
 static void pattern_skeleton(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                              float *out_glow, int *out_band)
@@ -1651,9 +1227,10 @@ static void pattern_skeleton(const JFAGrid *grid, const Seed *seeds, int n_seeds
     }
 }
 
-/* ---------- Tier 6 — ANIMATED: drive on wobble_time ------------------- */
+/* ---------- Tier 6 — effects that move over time --------------------- */
 
-/* PULSE — global brightness modulation in time. Same SDF but breathes. */
+/* PULSE — the plain SDF, but the whole thing breathes brighter and
+ * dimmer over time. */
 static void pattern_pulse(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                           float *out_glow, int *out_band)
@@ -1666,15 +1243,15 @@ static void pattern_pulse(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = band_from_glow(g);
 }
 
-/* SCAN — single iso-line whose threshold sweeps outward through time.
- * Reads as a radar pulse expanding from every seed simultaneously. */
+/* SCAN — one ring that grows outward over time, like a radar sweep
+ * expanding from every seed at once. */
 static void pattern_scan(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                          float *out_glow, int *out_band)
 {
     float d = sdf_read(grid, seeds, n_seeds, x, y);
     if (d < 0.0f) { *out_glow = 0.0f; *out_band = 0; return; }
-    /* Threshold sweeps 0..SDF_TYPICAL_MAX over one cycle. */
+    /* the ring's distance creeps outward, then jumps back to the start */
     float threshold = fmodf(t * 4.0f, SDF_TYPICAL_MAX);
     float diff = fabsf(d - threshold);
     if (diff > OUTLINE_THICKNESS * 1.5f) { *out_glow = 0.0f; *out_band = 0; return; }
@@ -1682,8 +1259,8 @@ static void pattern_scan(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = sdf_seed_id(grid, seeds, n_seeds, x, y) & PALETTE_BAND_MASK;
 }
 
-/* ECHO — multiple iso-lines, all moving outward simultaneously. Like
- * SCAN but layered — concentric pulses propagating from each seed. */
+/* ECHO — like SCAN but with many rings at once, a steady train of
+ * pulses spreading from each seed. */
 static void pattern_echo(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                          float *out_glow, int *out_band)
@@ -1698,8 +1275,8 @@ static void pattern_echo(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = ((int)(d / BAND_SPACING)) & PALETTE_BAND_MASK;
 }
 
-/* PLASMA — sin combinations of distance and time. Classic demoscene
- * plasma effect re-keyed off the SDF. */
+/* PLASMA — the classic shifting-blob plasma effect, blended from the
+ * distance plus the cell's x and y, all stirred by time. */
 static void pattern_plasma(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                            float *out_glow, int *out_band)
@@ -1714,9 +1291,7 @@ static void pattern_plasma(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = band_from_glow(g);
 }
 
-/* CHAOS — animated Voronoi: each cell pulses + brightness driven by
- * its distance to its seed + a per-cell hashed phase. Reads as a
- * field of breathing cells, each on its own clock. */
+/* CHAOS — a field of colored cells, each one breathing on its own clock. */
 static void pattern_chaos(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                           float *out_glow, int *out_band)
@@ -1733,55 +1308,28 @@ static void pattern_chaos(const JFAGrid *grid, const Seed *seeds, int n_seeds,
     *out_band = (int)k & PALETTE_BAND_MASK;
 }
 
-/* ---------- Dispatch table -------------------------------------------- */
+/* ---------- the pattern table ---------------------------------------- */
 
 typedef void (*JFAPatternFn)(const JFAGrid *grid, const Seed *seeds, int n_seeds,
                         int x, int y, float t,
                              float *out_glow, int *out_band);
 
 /*
- * NoisePattern — one entry in the §6 dispatch table.
+ * NoisePattern — one row in the table of all 30 patterns.
  *
- * INTENT
- *   Replace a giant switch(pattern) in scene_evaluate_field() with
- *   a NAMED, INDEXED table of (label, tier, sampler) records. Adding
- *   a new pattern is a 3-step recipe: write pattern_foo(), add
- *   PATTERN_FOO to the Pattern enum (§1), append one initialiser
- *   here. No call-site touches.
+ * Instead of a huge switch, each pattern is a row holding its label and
+ * a pointer to its function, looked up by the Pattern enum. To add a
+ * pattern you write the function, add its enum, and add a row here —
+ * nothing else changes.
  *
- * CONTEXT
- *   N_PATTERNS const instances in noise_patterns[] (§6), keyed by
- *   the Pattern enum. Looked up exactly once per sim tick by
- *   scene_evaluate_field() to get the active sampler; looked up by
- *   pattern_name() / pattern_tier() every frame for the HUD readout.
- *   PatternState.current (§7) is the index.
- *
- *   The 30 patterns are organised in 6 tiers (DIST / BAND / VOR /
- *   CONT / STRC / ANIM) that share a sampler signature but stress
- *   different aspects of the underlying SDF/Voronoi structure. The
- *   tier string is a HUD readout; the actual grouping is purely
- *   pedagogical (lower tiers exercise the raw distance, higher
- *   tiers exercise the cell topology + animation).
- *
- * MEMBER LOGIC
- *   name   : Pattern label shown by hud_draw_pattern_field. Always
- *            10 chars padded with trailing spaces so the HUD column
- *            stays aligned regardless of name length. The padding
- *            is BAKED INTO the literal — printf("%-10s") would work
- *            too but baking it keeps the table self-documenting.
- *   tier   : "N-LABEL " — 7-char padded tag like "1-DIST ", "5-STRC ".
- *            Read by hud_draw_tier_field. The leading digit lets the
- *            user see the curriculum order at a glance.
- *   sample : Function pointer to the pattern function. Signature is
- *            JFAPatternFn (just above): takes (grid, seeds, n_seeds,
- *            x, y, t, &glow, &band) and writes the two outputs.
- *            const because the table is static; the FUNCTION reads
- *            grid/seeds, but the TABLE entry itself never changes.
+ *   name   : label shown in the HUD, padded so the column lines up.
+ *   tier   : its tier tag, like "1-DIST" or "5-STRC", also for the HUD.
+ *   sample : the pattern function to call for each cell.
  */
 typedef struct {
-    const char   *name;         /* 10-char padded for HUD alignment  */
-    const char   *tier;         /* 7-char "N-LABEL " padded          */
-    JFAPatternFn  sample;       /* dispatched by scene_evaluate_field */
+    const char   *name;         /* HUD label, padded to line up      */
+    const char   *tier;         /* tier tag, padded to line up       */
+    JFAPatternFn  sample;       /* the pattern function              */
 } NoisePattern;
 
 static const NoisePattern noise_patterns[N_PATTERNS] = {
@@ -1841,35 +1389,23 @@ static const char *pattern_tier(Pattern p)
 /* ===================================================================== */
 
 /*
- * GlowField — the per-cell output grid the pipeline writes into and
- * the renderer reads from.
+ * GlowField — the finished picture, one cell at a time, ready to draw.
  *
- * INTENT
- *   Decouple "compute the scalar field" (scene_evaluate_field, runs
- *   on every sim tick) from "paint the scalar field" (scene_draw,
- *   runs on every render frame). The GlowField is the snapshot the
- *   renderer reads in between ticks.
+ * It sits between two jobs: the pattern code fills it in (a brightness
+ * and a color tier per cell) once per sim step, and the drawing code
+ * reads it back to put characters on screen. Keeping it as a snapshot
+ * means drawing and computing don't have to happen at the same moment.
  *
- * CONTEXT
- *   Lives on Scene. Written by scene_evaluate_field() once per sim
- *   tick after jfa_grid_run has finished; read by scene_draw() once
- *   per render frame. Index with glow_field_idx(gf, x, y) = y·w + x.
- *
- * MEMBER LOGIC
- *   w, h    : Grid dimensions in cells. Match the JFAGrid's dims.
- *   count   : w · h, cached so the buffer-clearing loop and the
- *             evaluator don't recompute it each tick.
- *   glow[]  : Per-cell scalar ∈ [0, 1]. Producer: scene_evaluate_field
- *             dispatches the active pattern's sampler at every cell
- *             and writes here. Consumer: scene_draw → GlyphRamp.
- *   band[]  : Per-cell palette band ∈ {0..3} (quartile of glow).
- *             Computed once per tick to save the renderer the work.
+ *   w, h    : grid size in cells (matches the JFAGrid).
+ *   count   : w * h, kept handy so the loops don't recompute it.
+ *   glow[]  : each cell's brightness, 0 to 1.
+ *   band[]  : each cell's color tier, 0 to 3.
  */
 typedef struct {
-    int      w, h;                   /* grid dims (cells), set at reset */
-    int      count;                  /* w * h, cached for tight loops   */
-    float    glow[CELLS_MAX];        /* per-cell scalar ∈ [0, 1]        */
-    uint8_t  band[CELLS_MAX];        /* per-cell palette tier ∈ {0..3}  */
+    int      w, h;                   /* grid size in cells              */
+    int      count;                  /* w * h                           */
+    float    glow[CELLS_MAX];        /* brightness per cell, 0..1       */
+    uint8_t  band[CELLS_MAX];        /* color tier per cell, 0..3       */
 } GlowField;
 
 static inline int glow_field_idx(const GlowField *gf, int x, int y)
@@ -1889,38 +1425,39 @@ static void glow_field_reset(GlowField *gf, int w, int h)
 }
 
 /*
- * GlyphRamp — the density → (glyph, attr) mapping. Captures "how
- * density becomes a character" as a NAMED RULE rather than an inline
- * if/else chain in the renderer.
+ * GlyphRamp — the rule for turning a brightness into an ASCII character.
  *
- *   glow > thresh_high  →  glyph_high  bold     (dense core)
- *   glow > thresh_mid   →  glyph_mid   bold     (mid density)
- *   glow > thresh_low   →  glyph_low   normal   (faint trace)
- *   else                →  not drawn            (transparent)
+ * Brighter cells get denser characters:
+ *   above thresh_high  ->  '#'  bold
+ *   above thresh_mid   ->  '*'  bold
+ *   above thresh_low   ->  '.'  normal
+ *   below that         ->  drawn as blank
  *
- * INVARIANT  thresh_high > thresh_mid > thresh_low > 0.
- * GLYPHS     '#', '*', '.' — coarse 3-tier subset of Paul Bourke's
- *            canonical luminance ramp "@%#*+=-:. " (densest → sparsest).
+ * The three cutoffs must stay in order (high > mid > low > 0). The
+ * '#', '*', '.' set is a coarse slice of Paul Bourke's classic
+ * dark-to-light character ramp.
  */
 typedef struct {
-    float thresh_high;    /* > this → glyph_high  (default 0.65)  */
-    float thresh_mid;     /* > this → glyph_mid   (default 0.30)  */
-    float thresh_low;     /* > this → glyph_low   (default 0.05)  */
-    char  glyph_high;     /* dense core    glyph                  */
-    char  glyph_mid;      /* mid-density   glyph                  */
-    char  glyph_low;      /* faint-trace   glyph                  */
+    float thresh_high;    /* above this -> glyph_high             */
+    float thresh_mid;     /* above this -> glyph_mid              */
+    float thresh_low;     /* above this -> glyph_low             */
+    char  glyph_high;     /* densest character                   */
+    char  glyph_mid;      /* mid character                       */
+    char  glyph_low;      /* faintest character                  */
 } GlyphRamp;
 
 /*
- * GlyphChoice — return value from glyph_ramp_pick(). Reads as a pure
- * function: GlyphChoice gc = glyph_ramp_pick(ramp, glow). Caller
- * composes (glyph, attr) with the palette band index they pulled
- * from elsewhere — GlyphRamp deliberately doesn't know about colour.
+ * GlyphChoice — what glyph_ramp_pick decided for one cell. The color is
+ * handled separately, so this only covers the character itself.
+ *
+ *   glyph   : the character to draw (only meaningful if visible).
+ *   attr    : bold or normal.
+ *   visible : false means leave the cell blank.
  */
 typedef struct {
-    char glyph;         /* the char to draw — only valid if visible   */
-    int  attr;          /* ncurses attribute: A_BOLD or A_NORMAL      */
-    bool visible;       /* false → leave the cell empty (transparent) */
+    char glyph;
+    int  attr;
+    bool visible;
 } GlyphChoice;
 
 static void glyph_ramp_init(GlyphRamp *gr)
@@ -1943,23 +1480,18 @@ static GlyphChoice glyph_ramp_pick(const GlyphRamp *gr, float glow)
 }
 
 /*
- * PatternState — active pattern + how the seed wobble animates.
+ * PatternState — which pattern is showing and how fast the seeds drift.
  *
- *   current    : Active pattern enum, indexes noise_patterns[].
- *                Cycled by n/N (forward) and p/P (back).
- *   wobble_time: Wobble-phase accumulator (radians). Advanced each
- *                tick by:  wobble_time += WOBBLE_RATE · drift_mult · dt
- *                Fed into seeds_animate to drive seed motion. Reset
- *                only by r (scene_reset).
- *   drift_mult : User-controlled wobble-rate multiplier in powers of
- *                2 ∈ [DRIFT_MULT_MIN, DRIFT_MULT_MAX]. Stepped *=2
- *                / /=2 by +/- so the user perceives discrete speed
- *                jumps instead of a continuous slider.
+ *   current    : the pattern on screen now; n/p flip through them.
+ *   wobble_time: the running clock that drives the drift. Ticks up a
+ *                little each step; reset to zero only on 'r'.
+ *   drift_mult : drift-speed dial, doubled/halved by +/- so speed
+ *                changes feel like steps rather than a smooth slider.
  */
 typedef struct {
-    Pattern current;       /* active pattern, indexes noise_patterns[]      */
-    float   wobble_time;   /* wobble-phase accumulator (radians)            */
-    int     drift_mult;    /* powers of 2 ∈ [DRIFT_MULT_MIN, DRIFT_MULT_MAX] */
+    Pattern current;       /* the pattern on screen                         */
+    float   wobble_time;   /* the drift clock                               */
+    int     drift_mult;    /* drift-speed dial (powers of 2)                */
 } PatternState;
 
 static void pattern_state_init(PatternState *ps)
@@ -1970,16 +1502,13 @@ static void pattern_state_init(PatternState *ps)
 }
 
 /*
- * PaletteState — the active theme index. One-int wrapper kept as a
- * named struct so "which colour scheme is showing" has a stable
- * home on Scene. On every change, the new theme's xterm indices are
- * pushed into ncurses colour pairs via theme_apply() (side effect
- * outside the struct, since ncurses owns the actual palette state).
+ * PaletteState — which color theme is showing.
  *
- *   current : Index into themes[] ∈ [0, N_THEMES). Cycled by t/T.
+ * Just an index into themes[], cycled by t/T. (The actual colors live in
+ * ncurses; theme_apply pushes them there whenever this changes.)
  */
 typedef struct {
-    int current;          /* index into themes[] ∈ [0, N_THEMES) */
+    int current;          /* index into themes[]                 */
 } PaletteState;
 
 static void palette_state_init(PaletteState *p)
@@ -1988,60 +1517,41 @@ static void palette_state_init(PaletteState *p)
 }
 
 /*
- * Scene — composite owner of ALL mutable simulation state.
+ * Scene — holds everything that changes while the program runs.
  *
- * THE PIPELINE (top to bottom = dataflow order)
+ * The pieces line up in the order the data flows each step:
+ *   seeds   -> drift to new spots
+ *   grid    -> rebuilt from the seeds (the distance map)
+ *   pattern -> turns the grid into the field
+ *   field   -> brightness + color per cell
+ *   ramp    -> turns brightness into characters (color comes from palette)
+ *   palette -> which theme; plus the paused flag
  *
- *   grid     — JFA result grid                       (the ALGORITHM)
- *               ↑ (rebuilt every tick by jfa_grid_run)
- *   seeds    — seed positions + wobble phases        (the DATA)
- *               ↑ (re-animated every tick by seeds_animate)
- *   pattern  — active pattern + wobble accumulator   (the ANIMATION)
- *               ↓ (drives scene_evaluate_field)
- *   field    — per-cell glow + band                  (the OUTPUT BUFFER)
- *               ↓ (read by scene_draw)
- *   ramp     — density → glyph mapping               (the RENDER RULE)
- *               + palette colour pairs (via ncurses, set by theme_apply)
- *               ↓
- *   palette  — active theme index                    (the COLOUR CHOICE)
- *               + paused flag                        (the CONTROL)
- *
- *   The whole pipeline at a glance: seeds → JFA grid → glow field
- *   (via pattern) → ramp + palette (via renderer).
- *
- * LIFETIME
- *   scene_init   — zero-init, set defaults, scatter seeds, run full
- *                  JFA + initial field evaluation.
- *   scene_reset  — clear field, zero wobble, re-scatter seeds, run
- *                  full JFA + initial evaluation. Called on r.
- *   scene_tick   — advance wobble, re-animate seeds, re-run JFA,
- *                  re-evaluate field.
- *   No teardown — Scene lives in BSS via App; OS reclaims it.
+ * Three calls move it through its life:
+ *   scene_init  — set up and build the first frame.
+ *   scene_reset — start over with new seeds ('r' and on resize).
+ *   scene_tick  — advance one step: drift, rebuild, re-evaluate.
+ * No cleanup needed; it lives for the whole program.
  */
 typedef struct {
-    JFAGrid       grid;            /* §5a — JFA result grid (~90 KB)         */
-    Seed          seeds[N_SEEDS];  /* §5b — seed positions + wobble state    */
-    GlowField     field;           /* per-cell (glow, band) — ~88 KB         */
-    GlyphRamp     ramp;            /* density → glyph rule (read-mostly)     */
-    PatternState  pattern;         /* active pattern + wobble + speed        */
-    PaletteState  palette;         /* active theme index                     */
-    bool          paused;          /* if true, scene_tick early-returns      */
+    JFAGrid       grid;            /* the distance map (~90 KB)              */
+    Seed          seeds[N_SEEDS];  /* the seed points                        */
+    GlowField     field;           /* the finished picture (~88 KB)          */
+    GlyphRamp     ramp;            /* brightness -> character rule           */
+    PatternState  pattern;         /* which pattern + drift speed            */
+    PaletteState  palette;         /* which theme                            */
+    bool          paused;          /* true freezes the drift                 */
 } Scene;
 
-/* glow ∈ [0, 1] → palette band ∈ {0, 1, 2, 3}. Quantises the
- * continuous scalar into a discrete colour tier. The 3.999f "almost
- * 4" gain keeps glow == 1.0 from wrapping past band 3. */
+/* Sort a 0..1 brightness into one of the 4 color tiers. The 3.999 gain
+ * keeps a full 1.0 from spilling past tier 3. */
 static inline uint8_t glow_to_palette_band(float glow)
 {
     return (uint8_t)((int)(glow * GLOW_TO_BAND_GAIN) & PALETTE_BAND_MASK);
 }
 
-/*
- * scene_recompute_jfa — re-place the seeds at their current wobble
- * positions and rebuild the JFA grid from them. Cost ≈ 800 K
- * cell-comparisons at 200×56 with log₂(200)=8 passes — well under
- * the 16 ms render budget at 60 Hz.
- */
+/* Move the seeds to their current drift positions, then rebuild the
+ * whole distance map from them. Cheap enough to do every frame. */
 static void scene_recompute_jfa(Scene *s)
 {
     seeds_animate(s->seeds, N_SEEDS, s->grid.w, s->grid.h,
@@ -2049,13 +1559,8 @@ static void scene_recompute_jfa(Scene *s)
     jfa_grid_run(&s->grid, s->seeds, N_SEEDS);
 }
 
-/* glow_field_sample_cell — one inner step of scene_evaluate_field.
- *
- *   call active pattern at (x, y, t)  →  (raw_glow, raw_band)
- *   clamp glow to [0, 1]              → safe to feed GlyphRamp
- *   mask band by PALETTE_BAND_MASK    → safe to index colour pairs
- *   write into GlowField[x, y]
- */
+/* Fill in one cell of the field: run the active pattern for it and store
+ * the brightness and color (kept in their valid ranges). */
 static inline void glow_field_sample_cell(
     GlowField *field, int x, int y,
     JFAPatternFn sample_pattern,
@@ -2070,20 +1575,10 @@ static inline void glow_field_sample_cell(
     field->band[idx] = (uint8_t)(raw_band & PALETTE_BAND_MASK);
 }
 
-/*
- * scene_evaluate_field — drive the pattern → glow pipeline for one
- * sim tick. Assumes the JFA grid + seeds are already current (caller
- * arranges that via scene_recompute_jfa).
- *
- *   STEP 1 — RESOLVE the active pattern's sampler from the dispatch table
- *   STEP 2 — SAMPLE every cell: pattern → (glow, band) → GlowField
- *
- * Hot loop — one pattern call per cell × ~11K cells × 60 Hz.  Inner
- * body kept tight via `static inline` helpers.
- */
+/* Run the active pattern over every cell to fill the field. Expects the
+ * distance map to be current already (scene_recompute_jfa did that). */
 static void scene_evaluate_field(Scene *s)
 {
-    /* STEP 1 — RESOLVE the active pattern's sampler */
     Pattern active = s->pattern.current;
     if ((unsigned)active >= (unsigned)N_PATTERNS) return;
     JFAPatternFn   sample_pattern = noise_patterns[active].sample;
@@ -2092,7 +1587,6 @@ static void scene_evaluate_field(Scene *s)
     GlowField     *field          = &s->field;
     float          t              = s->pattern.wobble_time;
 
-    /* STEP 2 — SAMPLE every cell into the GlowField */
     for (int y = 0; y < field->h; y++) {
         for (int x = 0; x < field->w; x++) {
             glow_field_sample_cell(field, x, y,
@@ -2109,7 +1603,7 @@ static void scene_reset(Scene *s, int mw, int mh)
     s->pattern.wobble_time = 0.0f;
     seeds_scatter(s->seeds, N_SEEDS, mw, mh);
     scene_recompute_jfa  (s);
-    scene_evaluate_field (s);     /* paint initial frame so paused looks ok */
+    scene_evaluate_field (s);     /* build one frame now, so a paused start still shows something */
 }
 
 static void scene_init(Scene *s, int mw, int mh)
@@ -2122,16 +1616,8 @@ static void scene_init(Scene *s, int mw, int mh)
     scene_reset(s, mw, mh);
 }
 
-/*
- * scene_tick — drive one sim step.
- *
- * The full SDF/JFA pipeline runs every tick (continuous wobble
- * animation means no shortcut):
- *   1. advance wobble accumulator
- *   2. re-animate seed positions
- *   3. re-run full JFA
- *   4. re-evaluate the active pattern → GlowField
- */
+/* One animation step: nudge the drift clock forward, then rebuild the
+ * distance map and the picture. Does nothing while paused. */
 static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
@@ -2145,44 +1631,17 @@ static void scene_tick(Scene *s, float dt)
 /* ===================================================================== */
 
 /*
- * Screen — the terminal viewport's dimensions, cached from ncurses.
+ * Screen — the terminal's current size, remembered so we don't have to
+ * ask ncurses for it on every cell. Refreshed whenever the window is
+ * resized.
  *
- * INTENT
- *   Decouple "what the terminal is" from "what the simulation is".
- *   ncurses owns the actual screen buffer, the input loop, and the
- *   colour-pair table; Screen just remembers cols × rows so we
- *   don't call getmaxyx() once per cell. Separating from Scene also
- *   matches the pattern in sibling demos where mock-rendering paths
- *   need terminal dims without simulation state.
- *
- * CONTEXT
- *   One instance lives on App (§9). Written by screen_init() (on
- *   startup) and screen_resize() (on every SIGWINCH); read by
- *   compute_grid_placement() and screen_draw() each frame to
- *   right-align the state bar and centre the GlowField.
- *
- * LIFETIME
- *   screen_init   — calls initscr(), configures ncurses, captures
- *                   cols/rows.
- *   screen_resize — re-captures cols/rows after a SIGWINCH. Owner
- *                   (App) follows up with scene_reset to re-size
- *                   the GlowField + JFAGrid.
- *   screen_free   — calls endwin() to restore the terminal.
- *
- * MEMBER LOGIC
- *   cols : Terminal width in cells. ≥ 16 enforced by
- *          app_pick_map_size — smaller and the HUD title chip plus
- *          state bar won't fit on the same row.
- *   rows : Terminal height in cells. ≥ 8 enforced by
- *          app_pick_map_size; HUD reserves HUD_TOP_ROWS + 1 rows
- *          (title + status above, action hint below).
- *   Ordering matches the ncurses getmaxyx(stdscr, rows, cols)
- *   convention — rows first because curses originally targeted
- *   line printers (lines are the primary axis).
+ *   cols : width in cells.
+ *   rows : height in cells.
+ * (rows-then-cols matches the order ncurses' getmaxyx hands them back.)
  */
 typedef struct {
-    int cols;     /* terminal width  in cells (≥ 16)  */
-    int rows;     /* terminal height in cells (≥ 8)   */
+    int cols;     /* width  in cells  */
+    int rows;     /* height in cells  */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -2205,56 +1664,21 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* ---------- scene_draw: grid → glyphs --------------------------------- */
+/* ---------- scene_draw: turn the picture into characters ------------- */
 
 /*
- * GridPlacement — the top-left screen cell where the field's (0, 0)
- * cell will be drawn. The result of centering the GlowField inside
- * the terminal viewport, holding the HUD rows clear.
+ * GridPlacement — where on screen the picture's top-left corner goes,
+ * once it's centered in the window with the HUD rows left clear.
+ * Worked out once per frame so the drawing loop doesn't redo the
+ * centering math for every cell.
  *
- * INTENT
- *   Lift the centering math out of the per-cell inner loop. Without
- *   GridPlacement the loop would have to redo `(cols - field_w) / 2`
- *   plus the HUD-row offset on every cell — w·h times per frame
- *   (~11K calls). With it, the loop body becomes `screen_y =
- *   origin_y + y` which the compiler folds into the loop induction
- *   variable.
- *
- *   Also names the "where on screen" decision — a reader sees
- *   `compute_grid_placement(...)` and immediately knows what's
- *   happening instead of staring at four lines of `/ 2` arithmetic
- *   inline.
- *
- * CONTEXT
- *   Stack-local — computed once at the top of scene_draw() (§8) by
- *   compute_grid_placement(field_w, field_h, cols, rows) and then
- *   passed implicitly via the local `place` to every cell.
- *
- *   Coordinate convention matches ncurses: (origin_y, origin_x) is
- *   the (row, col) of the top-left screen cell to start drawing at.
- *   Y grows DOWN (towards the bottom of the terminal), X grows RIGHT.
- *
- * INVARIANTS
- *   origin_x ≥ 0
- *   origin_y ≥ HUD_TOP_ROWS         (kept clear for the title bar)
- *   The bottom HUD_BOTTOM_ROWS row is kept clear by sizing the
- *   field, not by clamping here — so origin_y + field_h may run up
- *   to (rows - HUD_BOTTOM_ROWS).
- *
- *   Negative results from the centering arithmetic (over-large
- *   field on a small viewport) are clamped to the viewport edge —
- *   the field is cropped, not wrapped. The "cell off-screen?" check
- *   in the drawer's inner loop handles the rest.
- *
- * MEMBER LOGIC
- *   origin_x : Screen column (cells) of the field's leftmost cell.
- *              0 if the field is wider than the viewport.
- *   origin_y : Screen row (cells) of the field's topmost cell.
- *              HUD_TOP_ROWS at minimum (never overlaps the title bar).
+ *   origin_x : screen column of the picture's left edge (never negative).
+ *   origin_y : screen row of the top edge (never above the title bar).
+ * If the picture is bigger than the window it's just cropped at the edge.
  */
 typedef struct {
-    int origin_x;   /* screen column where field's left edge starts   */
-    int origin_y;   /* screen row    where field's top edge starts    */
+    int origin_x;   /* screen column of the left edge  */
+    int origin_y;   /* screen row of the top edge      */
 } GridPlacement;
 
 static GridPlacement compute_grid_placement(int field_w, int field_h,
@@ -2269,7 +1693,8 @@ static GridPlacement compute_grid_placement(int field_w, int field_h,
     return p;
 }
 
-/* The one-cell paint primitive: bind colour, emit glyph, unbind. */
+/* Draw one character on screen in the given color. (The cast keeps
+ * ncurses from mangling characters above 127.) */
 static inline void draw_glyph_at(int screen_y, int screen_x,
                                  char glyph, int color_pair, int attr)
 {
@@ -2278,18 +1703,14 @@ static inline void draw_glyph_at(int screen_y, int screen_x,
     attroff(COLOR_PAIR(color_pair) | attr);
 }
 
-/* band_to_color_pair — quantised band index → ncurses colour-pair
- * id.  PAIR_BAND_BASE is the first band pair (§1), bands 0..3 take
- * the next four slots.  The mask is belt-and-braces; the field's
- * band[] is already masked at write time. */
+/* Which color slot a brightness tier uses. */
 static inline int band_to_color_pair(uint8_t band)
 {
     return PAIR_BAND_BASE + (band & PALETTE_BAND_MASK);
 }
 
-/* glow_field_paint_cell — one inner step of scene_draw.  Read the
- * GlowField at (x, y), pick a glyph via the ramp, and (if visible)
- * emit a coloured character at screen position (screen_x, screen_y). */
+/* Draw one cell: read its brightness, pick a character, and if it's not
+ * blank, put it on screen in the right color. */
 static inline void glow_field_paint_cell(
     const GlowField *field, const GlyphRamp *ramp,
     int x, int y, int screen_x, int screen_y)
@@ -2304,25 +1725,16 @@ static inline void glow_field_paint_cell(
     draw_glyph_at(screen_y, screen_x, pick.glyph, color_pair, pick.attr);
 }
 
-/*
- * scene_draw — paint the GlowField into the terminal using the
- * Scene's GlyphRamp and the currently-bound colour palette.
- *
- *   STEP 1 — PLACE: centre the field inside the viewport (HUD-aware)
- *   STEP 2 — PAINT: for every cell in bounds, draw via the ramp
- *
- * Pure read of Scene state — no simulation here.
- */
+/* Draw the whole picture: center it, then paint every cell that lands
+ * on screen. Just reads the scene; doesn't change anything. */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
     const GlowField *field = &s->field;
     const GlyphRamp *ramp  = &s->ramp;
 
-    /* STEP 1 — compute the field's top-left on screen */
     GridPlacement place = compute_grid_placement(field->w, field->h,
                                                  cols, rows);
 
-    /* STEP 2 — paint every in-bounds cell */
     for (int y = 0; y < field->h; y++) {
         int screen_y = place.origin_y + y;
         if (screen_y < 0 || screen_y >= rows) continue;
@@ -2348,14 +1760,13 @@ static void scene_draw(const Scene *s, int cols, int rows)
 #define HUD_BOTTOM_HINT_TEXT \
     " n/p:pattern  t/T:theme  r:reset  spc:pause  +/-:drift  ]/[:Hz  q:quit "
 
-/* ---------- HUD: per-segment drawers ---------------------------------- *
+/* ---------- HUD: one drawer per chunk of the status line -------------- *
  *
- * Each segment takes (row, x, ...) and returns the next x cursor
- * position so the caller can chain them. Names describe what's
- * INSIDE the segment, not how it looks.
+ * Each one draws its piece and returns where the next piece should
+ * start, so the caller can lay them out left to right.
  */
 
-/* Row 0 LEFT — the program title chip. */
+/* The program title in the top-left. */
 static int hud_draw_title_chip(int row, int x)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -2364,7 +1775,7 @@ static int hud_draw_title_chip(int row, int x)
     return x + (int)strlen(HUD_TITLE_TEXT);
 }
 
-/* Row 0 RIGHT — fps + Hz + state + pattern index + drift multiplier. */
+/* Top-right status: fps, tick rate, pattern, and drift speed. */
 static void hud_draw_state_bar(int row, int cols,
                                double fps, int sim_fps,
                                const PatternState *ps, bool paused)
@@ -2383,7 +1794,7 @@ static void hud_draw_state_bar(int row, int cols,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* Row 1 segment — "pattern:<NAME>" */
+/* "pattern:<NAME>" */
 static int hud_draw_pattern_field(int row, int x, Pattern p)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -2392,7 +1803,7 @@ static int hud_draw_pattern_field(int row, int x, Pattern p)
     return x + HUD_W_PATTERN_FIELD;
 }
 
-/* Row 1 segment — "tier:<N-LABEL>" */
+/* "tier:<N-LABEL>" */
 static int hud_draw_tier_field(int row, int x, Pattern p)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -2401,7 +1812,7 @@ static int hud_draw_tier_field(int row, int x, Pattern p)
     return x + HUD_W_TIER_FIELD;
 }
 
-/* Row 1 segment — "theme:<NAME>" */
+/* "theme:<NAME>" */
 static int hud_draw_theme_field(int row, int x, int theme_idx)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -2410,10 +1821,8 @@ static int hud_draw_theme_field(int row, int x, int theme_idx)
     return x + HUD_W_THEME_FIELD;
 }
 
-/* Row 1 segment — "palette:" label + N_PALETTE_BANDS coloured swatches.
- * Each swatch is a '#' rendered in the corresponding band's colour pair
- * so the user can see at a glance what each density-tier looks like in
- * the active theme. */
+/* "palette:" followed by a small '#' in each of the theme's four colors,
+ * so you can see at a glance what the current theme looks like. */
 static int hud_draw_palette_swatches(int row, int x)
 {
     attron(COLOR_PAIR(PAIR_HUD));
@@ -2430,7 +1839,7 @@ static int hud_draw_palette_swatches(int row, int x)
     return x;
 }
 
-/* Row 1 tail — algorithm parameter readout: seed count + grid dims. */
+/* Tail of the status line: seed count and grid size. */
 static void hud_draw_stats_field(int row, int x, const GlowField *gf)
 {
     attron(COLOR_PAIR(PAIR_HUD));
@@ -2438,7 +1847,7 @@ static void hud_draw_stats_field(int row, int x, const GlowField *gf)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* Bottom row — keymap reminder. Fixed text; cyan + bold for contrast. */
+/* Bottom row — the list of keys you can press. */
 static void hud_draw_action_hint(int row)
 {
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -2448,27 +1857,19 @@ static void hud_draw_action_hint(int row)
 
 /* ---------- screen_draw: scene + full HUD ----------------------------- */
 
-/*
- * screen_draw — per-frame composite renderer. Pure read of state.
- *
- *   STEP 1  erase  — ncurses double-buffer
- *   STEP 2  scene  — paint the GlowField
- *   STEP 3  HUD row 0 — title (left) + state bar (right)
- *   STEP 4  HUD row 1 — pattern | tier | theme | swatches | stats
- *   STEP 5  HUD last row — action hint
- */
+/* Draw one full frame: clear, paint the picture, then lay out the HUD. */
 static void screen_draw(Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
     erase();
     scene_draw(s, sc->cols, sc->rows);
 
-    /* Row 0 — title + state bar */
+    /* top row: title on the left, status on the right */
     hud_draw_title_chip(HUD_TITLE_ROW, HUD_LEFT_MARGIN);
     hud_draw_state_bar (HUD_TITLE_ROW, sc->cols, fps, sim_fps,
                         &s->pattern, s->paused);
 
-    /* Row 1 — chained left-to-right segments */
+    /* second row: the info chunks laid out left to right */
     int x = HUD_LEFT_MARGIN;
     x = hud_draw_pattern_field   (HUD_STATUS_ROW, x, s->pattern.current);
     x = hud_draw_tier_field      (HUD_STATUS_ROW, x, s->pattern.current);
@@ -2476,7 +1877,6 @@ static void screen_draw(Screen *sc, const Scene *s,
     x = hud_draw_palette_swatches(HUD_STATUS_ROW, x);
     hud_draw_stats_field         (HUD_STATUS_ROW, x, &s->field);
 
-    /* Bottom row — keymap hint */
     hud_draw_action_hint(sc->rows - 1);
 }
 
@@ -2487,37 +1887,31 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — the top-level harness. Owns every other piece of state.
+ * App — the top-level box that holds everything else.
  *
- * SINGLETON
- *   One file-scope instance (g_app). Signal handlers need to reach
- *   the `running` / `need_resize` flags from outside any caller's
- *   scope; the handlers ONLY touch the two volatile sig_atomic_t
- *   flags, the main loop owns everything else.
+ * There's one global so the signal handlers can flip its flags. The
+ * handlers touch only those two flags; the main loop owns the rest.
  *
- * MEMBER LOGIC
- *   scene       : The simulation. See Scene in §7.
- *   screen      : Terminal cols/rows. Refreshed on every SIGWINCH.
- *   sim_fps     : Tick rate in Hz. ] / [ adjusts in SIM_FPS_STEP-Hz
- *                 increments, clamped to [SIM_FPS_MIN, SIM_FPS_MAX].
- *   map_w,      : Grid dims selected by app_pick_map_size() from the
- *   map_h         terminal cols/rows minus HUD reservations.
- *   running     : Cleared by SIGINT/SIGTERM or q/ESC.
- *   need_resize : Set by SIGWINCH; consumed by main loop.
+ *   scene       : the simulation (see Scene).
+ *   screen      : terminal size, refreshed on resize.
+ *   sim_fps     : how many sim steps per second; ]/[ adjust it.
+ *   map_w,      : grid size, chosen from the terminal size minus the
+ *   map_h         rows the HUD needs.
+ *   running     : turns false on quit (q/ESC or Ctrl-C).
+ *   need_resize : set when the window is resized; the loop acts on it.
  *
- *   The volatile sig_atomic_t types are required: POSIX only
- *   guarantees sig_atomic_t writes are async-safe inside a signal
- *   handler, and `volatile` prevents the compiler from caching the
- *   read in the main loop.
+ * The two flags are volatile sig_atomic_t because that's the only kind
+ * of variable a signal handler may safely set, and volatile stops the
+ * compiler from caching a stale copy in the loop.
  */
 typedef struct {
     Scene                 scene;        /* the simulation                       */
-    Screen                screen;       /* terminal dims, refreshed on resize   */
-    int                   sim_fps;      /* tick rate Hz, user-adjustable by ]/[ */
-    int                   map_w;        /* chosen grid width  (cells)           */
-    int                   map_h;        /* chosen grid height (cells)           */
-    volatile sig_atomic_t running;      /* main-loop flag, 0 → exit             */
-    volatile sig_atomic_t need_resize;  /* SIGWINCH→1, main loop consumes       */
+    Screen                screen;       /* terminal size                        */
+    int                   sim_fps;      /* sim steps per second (]/[)           */
+    int                   map_w;        /* grid width  (cells)                  */
+    int                   map_h;        /* grid height (cells)                  */
+    volatile sig_atomic_t running;      /* false -> quit                        */
+    volatile sig_atomic_t need_resize;  /* window was resized                   */
 } App;
 
 static App g_app;
@@ -2546,23 +1940,19 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* ---------- Scene action helpers (input → state mutation) ------------- *
+/* ---------- one helper per key, so the keymap stays readable ---------- *
  *
- * Each helper names ONE keystroke-triggered state change, so
- * app_handle_key reads as a keymap rather than a switch full of
- * arithmetic. Direction parameters use ±1 throughout for "next/prev"
- * symmetry.
+ * Each takes +1 for "next" or -1 for "previous" where that applies.
  */
 
-/* Cycle the active pattern by ±1 with wraparound through N_PATTERNS. */
+/* Step to the next/previous pattern, wrapping around the ends. */
 static void scene_cycle_pattern(Scene *s, int direction)
 {
     int next = ((int)s->pattern.current + direction + N_PATTERNS) % N_PATTERNS;
     s->pattern.current = (Pattern)next;
 }
 
-/* Cycle the active theme by ±1 with wraparound, then rebind ncurses
- * colour pairs to the new palette via theme_apply (side effect). */
+/* Step to the next/previous theme and load its colors. */
 static void scene_cycle_theme(Scene *s, int direction)
 {
     s->palette.current = (s->palette.current + direction + N_THEMES)
@@ -2570,8 +1960,7 @@ static void scene_cycle_theme(Scene *s, int direction)
     theme_apply(s->palette.current);
 }
 
-/* Drift speed control — clean ×2 / ÷2 steps so the user perceives
- * discrete speed changes, not a slider. */
+/* Double / halve the drift speed, so it changes in clear steps. */
 static void scene_drift_double(PatternState *ps)
 {
     if (ps->drift_mult < DRIFT_MULT_MAX) ps->drift_mult *= 2;
@@ -2583,7 +1972,7 @@ static void scene_drift_halve(PatternState *ps)
     if (ps->drift_mult < DRIFT_MULT_MIN) ps->drift_mult = DRIFT_MULT_MIN;
 }
 
-/* Adjust sim tick rate by delta Hz, clamped to [SIM_FPS_MIN, MAX]. */
+/* Nudge the sim tick rate up/down, kept within its allowed range. */
 static void app_adjust_sim_fps(App *app, int delta)
 {
     app->sim_fps += delta;
@@ -2591,11 +1980,7 @@ static void app_adjust_sim_fps(App *app, int delta)
     if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
 }
 
-/*
- * app_handle_key — the keymap. Returns false on quit, true otherwise.
- * Every arm is a single named action so the switch reads as
- * "key → behaviour" without arithmetic inline.
- */
+/* Handle one key press. Returns false if it was a quit key. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
@@ -2621,42 +2006,32 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* ---------- FrameClock: timing accumulators for the main loop --------- */
+/* ---------- FrameClock: the main loop's timekeeping ------------------ */
 
 /*
- * FrameClock — every running scalar the main loop's timing needs,
- * grouped under one name. Groups TWO independent integrator patterns
- * that share `frame_dt_ns` as their input:
+ * FrameClock — the timekeeping the main loop needs. It does two jobs:
  *
- *   1) FIXED-TIMESTEP SIM DRIVER  (sim_accum_ns)
- *      Each frame's wall-clock dt is poured into the accumulator;
- *      the accumulator is drained one TICK_NS chunk at a time into
- *      scene_tick() calls. The sim sees a STABLE per-tick dt
- *      regardless of frame jitter. (Glenn Fiedler, "Fix Your
- *      Timestep!")
+ *   1) Keep the sim running at a steady rate. Each frame's elapsed time
+ *      is added to a running total, which is then spent one fixed-size
+ *      step at a time, so the sim always advances by the same amount
+ *      regardless of how choppy the frame rate is.
+ *      (Glenn Fiedler, "Fix Your Timestep!")
  *
- *   2) FPS METER                  (fps_accum_ns + fps_frame_count)
- *      Sum frame dts and count frames; every FPS_UPDATE_MS of wall
- *      clock, divide frames/seconds to refresh `fps_display`. The
- *      HUD reads `fps_display` only — never the running accums.
+ *   2) Measure the frame rate for the HUD: count frames over a short
+ *      window and divide.
  *
- * MEMBER LOGIC
- *   frame_time_ns   : Wall clock at the START of the current frame.
- *                     Next frame's dt = clock_ns() − frame_time_ns.
- *   sim_accum_ns    : Wall-clock ns received from frames but not yet
- *                     drained into sim ticks.
- *   fps_accum_ns    : Wall-clock ns since the last FPS readout
- *                     refresh.
- *   fps_frame_count : Frames since the last FPS readout refresh.
- *   fps_display     : Last computed instantaneous frame rate (Hz) —
- *                     the ONE member the HUD actually reads.
+ *   frame_time_ns   : when the current frame started.
+ *   sim_accum_ns    : elapsed time collected but not yet spent on steps.
+ *   fps_accum_ns    : time piled up since the last fps update.
+ *   fps_frame_count : frames since the last fps update.
+ *   fps_display     : the latest fps number — the only field the HUD reads.
  */
 typedef struct {
-    int64_t frame_time_ns;     /* wall clock at start of current frame    */
-    int64_t sim_accum_ns;      /* unconsumed time → sim ticks (Fiedler)   */
-    int64_t fps_accum_ns;      /* ns since last FPS recomputation         */
-    int     fps_frame_count;   /* frames since last FPS recomputation     */
-    double  fps_display;       /* last computed FPS — the value HUD reads */
+    int64_t frame_time_ns;     /* when this frame started                 */
+    int64_t sim_accum_ns;      /* time waiting to be spent on sim steps   */
+    int64_t fps_accum_ns;      /* time since last fps update              */
+    int     fps_frame_count;   /* frames since last fps update            */
+    double  fps_display;       /* latest fps, shown in the HUD            */
 } FrameClock;
 
 static void frame_clock_init(FrameClock *fc)
@@ -2668,16 +2043,16 @@ static void frame_clock_init(FrameClock *fc)
     fc->fps_display     = 0.0;
 }
 
-/* Re-anchor the clock after a stall (e.g. SIGWINCH resize) so we don't
- * burst-tick to "catch up" on time the user wasn't seeing the sim. */
+/* Reset the clock after a pause (like a window resize) so the sim
+ * doesn't try to fast-forward through time the user never saw. */
 static void frame_clock_resync(FrameClock *fc)
 {
     fc->frame_time_ns = clock_ns();
     fc->sim_accum_ns  = 0;
 }
 
-/* Advance the frame clock; return dt since previous frame, capped at
- * MAX_FRAME_DT_NS to prevent the spiral-of-death failure mode. */
+/* Return how long since the last frame, capped so one slow frame can't
+ * make the sim try to catch up forever. */
 static int64_t frame_clock_advance(FrameClock *fc)
 {
     int64_t now = clock_ns();
@@ -2687,8 +2062,8 @@ static int64_t frame_clock_advance(FrameClock *fc)
     return dt;
 }
 
-/* FPS meter — accumulate frame dt; when FPS_UPDATE_MS worth has piled
- * up, divide frames by elapsed seconds and refresh the display value. */
+/* Count this frame; every so often work out the frame rate and update
+ * the number shown in the HUD. */
 static void fps_meter_observe(FrameClock *fc, int64_t frame_dt_ns)
 {
     fc->fps_frame_count++;
@@ -2701,12 +2076,12 @@ static void fps_meter_observe(FrameClock *fc, int64_t frame_dt_ns)
     }
 }
 
-/* ---------- Main-loop step helpers ----------------------------------- */
+/* ---------- pieces of one trip through the main loop ------------------ */
 
-/* Fiedler's fixed-timestep tick drain. Pour this frame's dt into the
- * accumulator, then consume it one TICK_NS chunk at a time, calling
- * scene_tick() with a STABLE per-tick dt — so the simulation behaves
- * identically regardless of render-frame jitter. */
+/* Add this frame's elapsed time to the pile, then run the sim one
+ * fixed-size step at a time until the pile is used up. Each step gets
+ * the same dt, so the sim runs the same whether frames are smooth or
+ * choppy. (Glenn Fiedler, "Fix Your Timestep!") */
 static void app_run_fixed_step_ticks(App *app, FrameClock *fc,
                                      int64_t frame_dt_ns)
 {
@@ -2720,7 +2095,8 @@ static void app_run_fixed_step_ticks(App *app, FrameClock *fc,
     }
 }
 
-/* Sleep so the render loop spins at RENDER_FPS_TARGET. */
+/* Sleep off the leftover time so the loop runs at the target frame rate
+ * instead of spinning as fast as it can. */
 static void app_throttle_to_render_rate(int64_t frame_start_ns,
                                         int64_t frame_dt_ns)
 {
@@ -2730,7 +2106,7 @@ static void app_throttle_to_render_rate(int64_t frame_start_ns,
     clock_sleep_ns(target_frame_period_ns - time_consumed_ns);
 }
 
-/* Drain one key event (non-blocking) and route it to app_handle_key. */
+/* Check for a key press (without blocking) and act on it. */
 static void app_pump_input(App *app)
 {
     int ch = getch();
@@ -2738,7 +2114,7 @@ static void app_pump_input(App *app)
         app->running = 0;
 }
 
-/* Wire SIGINT / SIGTERM → exit flag, SIGWINCH → resize flag. */
+/* Catch Ctrl-C / kill (quit) and window-resize signals. */
 static void app_install_signal_handlers(void)
 {
     signal(SIGINT,   on_exit_signal);
@@ -2746,18 +2122,9 @@ static void app_install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/*
- * main — top-level driver. Reads as pseudocode:
- *
- *   PHASE 1 bootstrap     (PRNG seed, signal handlers, atexit cleanup)
- *   PHASE 2 init          (terminal → map size → simulation)
- *   PHASE 3 main loop     (resize → frame_dt → fixed-step ticks →
- *                          fps meter → throttle → draw → input)
- *   PHASE 4 shutdown      (restore terminal)
- */
 int main(void)
 {
-    /* PHASE 1 — bootstrap */
+    /* set up: random seed, cleanup-on-exit, signal handlers */
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
     app_install_signal_handlers();
@@ -2766,15 +2133,15 @@ int main(void)
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
 
-    /* PHASE 2 — terminal + simulation init */
+    /* open the terminal, pick a grid size, build the simulation */
     screen_init(&app->screen);
     app_pick_map_size(app);
     scene_init(&app->scene, app->map_w, app->map_h);
 
-    /* PHASE 3 — main loop */
     FrameClock clock;
     frame_clock_init(&clock);
 
+    /* each pass: handle a resize, advance the sim, draw, read a key */
     while (app->running) {
         if (app->need_resize) {
             app_do_resize(app);
@@ -2792,7 +2159,6 @@ int main(void)
         app_pump_input(app);
     }
 
-    /* PHASE 4 — shutdown */
     screen_free(&app->screen);
     return 0;
 }

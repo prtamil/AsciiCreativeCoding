@@ -1,288 +1,44 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * reaction_diffusion_gray_scott.c
- *   — Gray-Scott reaction-diffusion: 30 chemical-pattern presets.
+ *   — Two chemicals spread and react on a grid and grow patterns on
+ *     their own: spots, stripes, mazes, coral, worms. 30 presets to
+ *     flip between with n/p. Watch each one grow from a tiny seed.
  *
- * DEMO: A 2-D reaction-diffusion system simulating two chemicals U
- *       and V that diffuse at different rates and react via
- *       U + 2V → 3V. The system is seeded with a small blob of V in
- *       the centre; over a few seconds, V "eats" U outward, and the
- *       resulting front breaks up into intricate self-organising
- *       patterns. Thirty (F, k) presets — different points in
- *       Pearson's morphology phase diagram — produce visually
- *       distinct outcomes:
+ * The idea is Alan Turing's: chemicals that spread at different speeds
+ * and feed off each other can settle into the kinds of textures you
+ * see on animal coats. The specific recipe here is Gray-Scott.
  *
- *         Tier 1 (classics)     : SPOTS STRIPES MAZES CORAL WORMS
- *         Tier 2 (Pearson α-ε)  : ALPHA BETA GAMMA DELTA EPSILON
- *         Tier 3 (named)        : MITOSIS SOLITON FINGERS SKATE PSI
- *         Tier 4 (dynamic)      : WAVES PULSES NEBULA NEURONS CHAOS
- *         Tier 5 (extreme)      : HOLES BUBBLES SLUDGE PLANKTON CRYSTAL
- *                                 THICKET DRIFT ZEBRA BANDS BARNACLE
+ * References (things the code can't tell you):
+ *   Gray & Scott (1983), Chem. Eng. Sci. 38(1):29-43 — the chemistry.
+ *   Pearson (1993), Science 261:189-192 — the map of which feed/kill
+ *     settings produce which pattern; the named presets come from here.
+ *   Munafo's xmorphia (https://mrob.com/pub/comp/xmorphia/) and Karl
+ *     Sims' interactive explorer — sources of the named presets.
  *
- *       Press n/p to switch presets — the simulation resets each time
- *       so you watch the pattern self-organise from a fresh seed. The
- *       state bar shows [N/30] for the active preset.
- *
- * Study alongside:
- *   ../../fluid/reaction_diffusion.c — same Gray-Scott algorithm, framed
- *       as PDE / numerical-methods pedagogy: 7 presets, 9-point isotropic
- *       Laplacian, cross-refs to cfl_stability_explorer.c.  This file is
- *       the lighter pattern-formation demo; that one is the deep dive.
- *   ./perin_noise_flow_showcase.c — also a "field over the grid", but
- *       the field here EVOLVES via PDE rather than being sampled
- *       from a static noise function. Reaction-diffusion is what
- *       gives biological pigmentation patterns; Perlin/simplex give
- *       static landscape patterns.
- *   ../generational/cellular_automata_cave_4-5_rule_showcase.c — a
- *       discrete cousin: cellular automata are reaction-diffusion's
- *       binary-state equivalent. Rules are integer-state, but the
- *       morphology family is similar (spots, mazes, blobs).
- *
- * Section map:
- *   §1 config   — grid, presets, palette, themes, named constants
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes (4 bands each)
- *   §5 rd       — Grid + ReactionField + PDE primitives (laplacian_5pt,
- *                 gray_scott_dU/dV, swap_pde_buffers) + seed pipeline +
- *                 step_reaction_field driver
- *   §6 patterns — GSPreset + 30 (F, k) presets across Pearson's phase
- *                 diagram + install_kinetics
- *   §7 scene    — SimState, Controls, Scene composing Grid +
- *                 ReactionField + SimState + Controls; named reset
- *                 and tick pipeline helpers
- *   §8 screen   — ASCII render: classify_v_cell + paint_cell + HUD drawers
- *   §9 app      — signals, resize, named main-loop helpers
+ * Sister files:
+ *   ../../fluid/reaction_diffusion.c — same algorithm, taught as a
+ *     deeper math/numerical-methods lesson. This file is the lighter
+ *     pattern-watching demo.
+ *   ./perin_noise_flow_showcase.c — also paints a value over a grid,
+ *     but that value is sampled from a fixed noise function instead of
+ *     growing over time like this one does.
  *
  * Keys:
  *   q / ESC    quit
  *   space      pause / resume
- *   r          reset (re-seed + perturb)
- *   n / N      next pattern preset
- *   p / P      previous pattern preset
+ *   r          reset (re-seed)
+ *   n / N      next / previous... n=next, p=previous preset
+ *   p / P      previous preset
  *   t / T      next / previous theme
- *   + / =      faster simulation (more sub-steps per frame)
+ *   + / =      faster (more sim steps per frame)
  *   -          slower
- *   ] / [      raise / lower tick Hz
+ *   ] / [      raise / lower tick rate
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra reaction_diffusion_gray_scott.c \
  *       -o gray_scott -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Gray-Scott reaction-diffusion (Gray & Scott, 1983).
- *                  Two chemical concentrations U and V on a 2-D grid,
- *                  evolving under a coupled PDE system:
- *
- *                    ∂U/∂t = D_u · ∇²U − U · V² + F · (1 − U)
- *                    ∂V/∂t = D_v · ∇²V + U · V² − (F + k) · V
- *
- *                  Reading right to left:
- *                    • Both U and V DIFFUSE (with different diffusion
- *                      constants D_u > D_v — V is heavier / slower).
- *                    • The REACTION U + 2V → 3V converts U into V at a
- *                      rate proportional to U·V². V "eats" U.
- *                    • U is FED at rate F · (1 − U) — pushed back
- *                      toward 1 wherever it dropped.
- *                    • V is KILLED at rate (F + k) · V — decays back
- *                      toward 0 wherever it isn't being created.
- *
- *                  The competition between these four processes — at
- *                  different rates F, k — produces a phase diagram
- *                  with dramatically different morphologies (Pearson
- *                  1993). We expose 5 of the named regions as
- *                  switchable presets.
- *
- *                  Numerical method: explicit forward-Euler with a
- *                  5-point Laplacian stencil. Time step dt = 1 (the
- *                  unit in which F and k are usually quoted), with
- *                  multiple sub-steps per render frame for visible
- *                  evolution. Boundary condition: NEUMANN (zero-flux,
- *                  i.e. clamp out-of-grid neighbours to the cell
- *                  itself). Periodic boundaries also work but produce
- *                  visible tile-seams when the central pattern
- *                  reaches the edges.
- *
- * Data-structure : Scene composes four sub-structs (see §7):
- *                    Grid          — w, h, total_cells
- *                    ReactionField — U, V, U_next, V_next + F, k
- *                                    (chemistry state + rate constants)
- *                    SimState      — step_count
- *                    Controls      — paused, sub_steps, theme, pattern
- *                  Two pairs of float grids in ReactionField: (U, V)
- *                  for the current state and (U_next, V_next) for the
- *                  buffer being written. Swap (memcpy) at the end of
- *                  each sub-step via swap_pde_buffers. All preset-
- *                  tuning lives in §6 patterns; the simulation itself
- *                  is parameter-agnostic. No heap allocation.
- *
- * Rendering      : ASCII only. Each cell's V value drives a density
- *                  glyph ('.', '*', '#') and a 4-band colour. V
- *                  typically lives in roughly [0, 0.4] for these
- *                  presets, so we multiply by ~2.5 for visibility.
- *
- * Performance    : 5-point Laplacian + Euler step is ≈ 12 multiply-adds
- *                  per cell per sub-step. With 4 sub-steps at 60 Hz on
- *                  a 200×56 grid that's ~32 M ops/sec — well within
- *                  budget on any modern CPU.
- *
- * References     : Algorithm / math
- *                  ────────────────
- *                  • Turing, A. M. (1952) — "The Chemical Basis of
- *                    Morphogenesis", Phil. Trans. R. Soc. B 237:37-72.
- *                    The foundational paper. Predicted — decades
- *                    before any chemical system was known to actually
- *                    do it — that reaction + diffusion of "morphogens"
- *                    could explain biological pattern formation. Gray-
- *                    Scott is one specific realisation of Turing's
- *                    general scheme; the morphologies in §6 are
- *                    Turing's "morphogen patterns" in concrete form.
- *                  • Gray, P. & Scott, S. K. (1983) — "Autocatalytic
- *                    reactions in the isothermal, continuous stirred
- *                    tank reactor", Chemical Engineering Science
- *                    38(1):29-43. The original chemical-engineering
- *                    derivation of the PDE we solve in §5. Source of
- *                    the U + 2V → 3V reaction and the (F, k) feed/kill
- *                    formulation.
- *                  • Pearson, J. E. (1993) — "Complex Patterns in a
- *                    Simple System", Science 261(5118):189-192. The
- *                    phase-diagram paper showing 11 distinct morphology
- *                    regions (Pearson's letter codes α through κ) in
- *                    (F, k) parameter space. The Tier-2 presets in §6
- *                    use his letter codes directly.
- *                  • Murray, J. D. (2003) — "Mathematical Biology II:
- *                    Spatial Models and Biomedical Applications"
- *                    (3rd ed), Springer. The standard graduate textbook
- *                    for reaction-diffusion. Ch. 2 derives the Turing
- *                    instability condition and explains why D_u ≠ D_v
- *                    is essential for patterns to form.
- *                  • Press, W. H., Teukolsky, S. A., Vetterling, W. T.
- *                    & Flannery, B. P. (2007) — "Numerical Recipes"
- *                    (3rd ed), Cambridge. §19 covers explicit forward-
- *                    Euler integration and the 5-point Laplacian
- *                    stencil — the numerical method used in
- *                    step_reaction_field. Also discusses the CFL
- *                    stability bound that constrains GS_DT in §1.
- *
- *                  Visualisation / pattern atlas
- *                  ─────────────────────────────
- *                  • Karl Sims — interactive Gray-Scott explorer
- *                    (lookup: "Karl Sims reaction diffusion"). Slider
- *                    UI for (F, k) with named preset buttons; source
- *                    of the SPOTS / STRIPES / MAZES / CORAL / WORMS
- *                    canonical preset values in §6 Tier 1.
- *                  • Robert Munafo — "xmorphia":
- *                    https://mrob.com/pub/comp/xmorphia/
- *                    Exhaustive Gray-Scott pattern catalogue —
- *                    parameter map, region names (ψ-region, u-skate
- *                    world, frogspawn, etc.), and decades of
- *                    documented experiments. Tier 3 (SKATE, PSI) and
- *                    several Tier 5 presets come straight from his
- *                    pages.
- *                  • Paul Bourke — "Character representation of grey
- *                    scale images":
- *                    https://paulbourke.net/dataformats/asciiart/
- *                    The canonical density → glyph ramp reference.
- *                    Underlies the .:low / *:mid / #:high mapping in
- *                    scene_draw.
- *
- *                  Online tutorials
- *                  ────────────────
- *                  • Wikipedia — "Reaction–diffusion system":
- *                    https://en.wikipedia.org/wiki/Reaction%E2%80%93diffusion_system
- *                    Concise starting point with the PDE form and a
- *                    summary of morphology regimes.
- *
- *                  See also
- *                  ────────
- *                  • ../../fluid/reaction_diffusion.c — same Gray-Scott
- *                    algorithm with deeper PDE / numerical-methods
- *                    pedagogy: 9-point isotropic Laplacian, more
- *                    presets, and cross-refs to CFL stability analysis.
- *                    This file is the lighter pattern-formation demo;
- *                    that one is the deep dive.
- *                  • ./perin_noise_flow_showcase.c — also a "scalar
- *                    field over the grid", but the field there is
- *                    sampled from static Perlin noise instead of
- *                    evolved from a PDE. Reading both side by side
- *                    contrasts the two main ways to generate organic-
- *                    looking 2-D patterns: analytic noise vs.
- *                    integrated dynamics.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two chemicals (U and V) compete on a grid. U is plentiful and
- * spreads slowly; V is rare and spreads slower still, but it can
- * "eat" U and reproduce. Add a slow "feed" of fresh U from outside
- * and a slow "kill" of V, and you have a system that perpetually
- * fights itself into self-organising patterns. Different F (feed)
- * and k (kill) rates change which morphology dominates: spots,
- * stripes, mazes, coral, worms — all from the same equations.
- *
- * Crucially, the patterns are NOT random — they emerge
- * deterministically from physical reaction kinetics. This is one of
- * Alan Turing's "morphogens": the chemical mechanism behind animal
- * pigmentation, fingerprint formation, and many biological textures.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture an ocean of U with a tiny droplet of V at the centre. V is
- * voracious — it converts nearby U into more V at a rate
- * proportional to U·V². At first the droplet just grows outward.
- * But V also dies (at rate F+k), and U gets refreshed (at rate F).
- * If V's spread is ROUGHLY in balance with V's death, the front
- * stops being a smooth circle — small fluctuations get amplified
- * because curvy regions of the V-front have more or less U to consume.
- * That's the morphogenic instability.
- *
- * Once the instability hits, the system evolves toward a stable
- * pattern that depends on F and k:
- *   F LOW, k LOW   — V wins everywhere, pattern dies
- *   F MID, k MID   — instability balances → the interesting morphologies
- *   F HIGH, k HIGH — V dies fast, pattern collapses to U-only
- *
- * The interesting region (Pearson's diagram) is a thin curving sliver
- * in (F, k) space. We pre-pick 5 well-known points in that sliver
- * and label them.
- *
- * Visible layers:
- *   • V CONCENTRATION — every cell's brightness shows local V level.
- *   • PALETTE BAND — quartile of V drives the colour band, so dim,
- *     mid, and bright cells get different colours.
- *   • Time evolution — the pattern develops over a few seconds from
- *     a tiny seed, then often reaches a quasi-stable configuration
- *     (spots/stripes) or keeps drifting (worms).
- *
- * ALGORITHM IN STEPS  (per sub-step — driver: step_reaction_field)
- * ──────────────────
- *  For every cell (x, y):
- *    1. lap_U = laplacian_5pt(U, idx, il, ir, iu, id)
- *    2. lap_V = laplacian_5pt(V, idx, il, ir, iu, id)
- *    3. U_next[idx] = U + dt · gray_scott_dU(u, v, lap_U, F, Du)
- *    4. V_next[idx] = V + dt · gray_scott_dV(u, v, lap_V, F, k, Dv)
- *  After all cells done: swap_pde_buffers (memcpy *_next back into U/V).
- *
- *  scene_tick.run_sub_steps drains ctrl.sub_steps Gray-Scott updates
- *  per render frame so the chemistry evolves fast enough to be
- *  watchable but stable enough to not numerically blow up.
- *
- * KEY FORMULAS
- * ────────────
- *  Diffusion (5-point Laplacian) :
- *      ∇² f(x,y) ≈ f(x-1,y) + f(x+1,y) + f(x,y-1) + f(x,y+1) − 4f(x,y)
- *  Reaction term                : r = U · V²
- *  U update                     : U' = U + dt · (D_u · ∇²U − r + F·(1−U))
- *  V update                     : V' = V + dt · (D_v · ∇²V + r − (F+k)·V)
- *  Stability bound (CFL-ish)    : dt · (D_u + D_v) · 4 ≲ 1
- *  Steady U=1, V=0 fixed point  : trivial; perturb to escape it
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -312,67 +68,59 @@ enum {
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* Sub-steps per render frame. More = faster pattern development.
-     * 6 lets a pattern emerge over ~10 seconds of wall time. */
+    /* How many simulation steps to run per drawn frame. More steps =
+     * the pattern grows faster on screen. 6 lets one settle in about
+     * ten seconds. */
     SUB_STEPS_MIN     =   1,
     SUB_STEPS_DEF     =   6,
     SUB_STEPS_MAX     = 128,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Color slots. First two are reserved for the HUD across all demos. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_BAND_BASE    =   3,    /* PAIR_BAND_BASE..+3 = 4 palette colours */
-    PAIR_FLASH        =   7,    /* vestigial — cross-file palette parity  */
+    PAIR_BAND_BASE    =   3,    /* 4 colour bands live at BASE..BASE+3 */
+    PAIR_FLASH        =   7,    /* unused here; kept so themes match sister files */
 };
 
-/* Standard Gray-Scott diffusion rates. */
+/* How fast each chemical spreads, and the time step size. These are the
+ * standard Gray-Scott numbers; V (the slower one) must spread slower than
+ * U for any pattern to form at all. */
 #define GS_DU               0.16f
 #define GS_DV               0.08f
 #define GS_DT               1.0f
 
-/* Render scaling: V values typically peak around 0.35-0.45 in the
- * pattern regions; multiply for visibility before mapping to glow. */
+/* The amount of V in a cell is usually small (peaks around 0.4), so we
+ * scale it up before turning it into brightness, otherwise everything
+ * looks faint. */
 #define V_RENDER_GAIN       2.5f
 
+/* Below this brightness a cell is left blank. */
 #define GLOW_THRESHOLD      0.05f
 
-/* ── HUD layout ──────────────────────────────────────────────────── *
- * Top HUD carries DATA, bottom HUD carries ACTIONS:
- *   row 0           : title + state bar (fps, Hz, state + [N/M], sub-steps)
- *   row 1           : pattern/theme/palette + F/k/Du/Dv/map
- *   row HUD_TOP..N-2: reaction-diffusion field
- *   row N-1         : keyboard action hint
- */
+/* Rows we keep clear for the HUD: two at the top (title + status), one
+ * at the bottom (key hints). The pattern fills everything in between. */
 #define HUD_TOP_ROWS             2
 #define HUD_BOTTOM_ROWS          1
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
 #define HUD_LEFT_MARGIN          1
 
-/* Density thresholds for the ASCII glyph ramp. */
+/* Brightness cutoffs for picking a character: above HIGH = '#',
+ * above MID = '*', otherwise '.'. */
 #define GLYPH_HIGH_THRESH   0.65f
 #define GLYPH_MID_THRESH    0.30f
 
 /*
- * Pattern presets — 30 distinct (F, k) points in Pearson's morphology
- * phase diagram, spanning simple → complex. Cycle with n/p; switching
- * resets the simulation so the chosen pattern starts forming from a
- * fresh seed.
+ * The 30 presets. Each is one feed/kill setting (F, k) that grows a
+ * different pattern; cycle with n/p. All 30 run on the exact same
+ * simulation code — only these two numbers change. To add one: add an
+ * enum value, a name in pattern_name, and a row in gs_presets.
  *
- * INTENT. The simulation kernel (5-point Laplacian + forward-Euler
- * Gray-Scott step) is identical for all 30; only the (F, k) pair
- * changes. Adding a new preset is one enum value + one pattern_name
- * case + one gs_presets row.
- *
- * TIER ORGANISATION.
- *   1 — classic stable patterns (the 5 most recognisable morphologies)
- *   2 — Pearson 1993 region letters (α through ε)
- *   3 — named morphologies from Karl Sims + Munafo's xmorphia catalogue
- *   4 — dynamic / travelling patterns
- *   5 — extreme / complex regions (boundary + chaotic)
- *
- * Values vetted from: Pearson, J. E. (1993) Science 261:189-192;
- * Karl Sims interactive explorer; Munafo's xmorphia
- * (https://mrob.com/pub/comp/xmorphia/).
+ * They're grouped into five loose tiers, easiest to wildest:
+ *   1 — the five most recognisable patterns
+ *   2 — Pearson's lettered regions (alpha through epsilon)
+ *   3 — named patterns from Karl Sims and Munafo's catalogue
+ *   4 — ones that keep moving instead of settling
+ *   5 — extreme / chaotic edges of the map
  */
 typedef enum {
     /* Tier 1 — classic stable patterns */
@@ -389,7 +137,7 @@ typedef enum {
     PATTERN_DELTA    =  8,
     PATTERN_EPSILON  =  9,
 
-    /* Tier 3 — named morphologies (Karl Sims / Munafo) */
+    /* Tier 3 — named patterns (from Karl Sims / Munafo) */
     PATTERN_MITOSIS  = 10,
     PATTERN_SOLITON  = 11,
     PATTERN_FINGERS  = 12,
@@ -456,38 +204,28 @@ static const char *pattern_name(Pattern p)
 }
 
 /*
- * GSPreset — one (F, k) point in Pearson's morphology phase diagram.
+ * GSPreset — the two dials that decide which pattern grows. Just a pair
+ * of numbers; every preset in the table below is one (F, k) setting.
  *
- * INTENT. The Gray-Scott system has a 2-D continuous parameter space
- * (F, k); different points produce wildly different morphologies. A
- * GSPreset bundles the two values together so the preset table reads
- * as a column of "named coordinates" — Tier-1 SPOTS at (0.035, 0.065),
- * Tier-3 SKATE at (0.062, 0.0609), and so on.
+ *   F — feed rate. How fast fresh U is topped up where it ran low.
+ *       Useful values run roughly 0.010 to 0.075.
+ *   k — kill rate. How fast V fades away where it isn't being made.
+ *       Useful values run roughly 0.040 to 0.070.
  *
- * PARAMETER MEANINGS.
- *   F — feed rate. How quickly U is refreshed back toward 1 wherever
- *       it has been depleted. Appears as F·(1 − U) in the U PDE.
- *       Active range roughly F ∈ [0.010, 0.075].
- *   k — kill rate. How quickly V decays back toward 0 wherever it
- *       isn't being created. Appears as (F + k)·V in the V PDE.
- *       Active range roughly k ∈ [0.040, 0.070].
+ * Stay inside those ranges. Push F+k too high (past about 0.135) and V
+ * dies off completely, leaving an empty screen. All 30 presets sit in
+ * the sweet spot.
  *
- * Bounds: outside this active region the system collapses to a
- * trivial fixed point (U = 1, V = 0) and produces no visible pattern.
- * In particular F + k ≳ 0.135 puts the system in the "kill-dominant"
- * region where V dies — the screen goes empty. The 30 presets in §6
- * all live inside the active region.
- *
- * REFERENCE. Pearson, J. E. (1993), Science 261:189-192 — Figure 1
- * shows the full phase diagram and labels 11 morphology regions.
+ * The map of which setting gives which pattern is from Pearson (1993),
+ * Science 261:189-192, Figure 1.
  */
 typedef struct {
-    float F;     /* feed rate; pushes U back toward 1 (PDE term: F·(1−U))  */
-    float k;     /* kill rate; pulls V back toward 0 (PDE term: (F+k)·V)   */
+    float F;     /* feed rate — tops U back up where it ran low      */
+    float k;     /* kill rate — fades V away where it isn't being made */
 } GSPreset;
 
 static const GSPreset gs_presets[N_PATTERNS] = {
-    /*  F        k       — vetted Gray-Scott parameter pairs */
+    /*  F        k */
 
     /* Tier 1 — classic stable patterns */
     { 0.035f, 0.065f },   /* SPOTS    — mitosis-like dividing spots (Pearson γ) */
@@ -503,7 +241,7 @@ static const GSPreset gs_presets[N_PATTERNS] = {
     { 0.042f, 0.059f },   /* DELTA    — fingerprint-like (Pearson δ)             */
     { 0.018f, 0.055f },   /* EPSILON  — labyrinth+spots (Pearson ε)              */
 
-    /* Tier 3 — named morphologies (Karl Sims / Munafo) */
+    /* Tier 3 — named patterns (from Karl Sims / Munafo) */
     { 0.0367f, 0.0649f }, /* MITOSIS  — rapid spot division (Sims preset)        */
     { 0.014f,  0.054f },  /* SOLITON  — solitary travelling waves                */
     { 0.046f,  0.065f },  /* FINGERS  — finger-growth fronts (Pearson μ)         */
@@ -534,54 +272,43 @@ static const GSPreset gs_presets[N_PATTERNS] = {
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* §9 main loop — spiral-of-death dt clamp + terminal redraw cap
- * (Glenn Fiedler's "Fix Your Timestep"). */
-#define DT_MAX_NS       (100 * NS_PER_MS)   /* hard cap on per-frame dt */
-#define FRAME_CAP_FPS   60                  /* terminal redraw budget   */
+/* If a frame takes a long time (window resize, machine stall), cap how
+ * much time we let the sim catch up so it can't get stuck. And don't
+ * redraw the terminal more than 60 times a second. */
+#define DT_MAX_NS       (100 * NS_PER_MS)
+#define FRAME_CAP_FPS   60
 
-/* V → palette band scaling. Multiplies a glow ∈ [0, 1] to land in
- * [0, N_PALETTE_BANDS − ε]; the int cast then floors cleanly into
- * [0, N_PALETTE_BANDS − 1]. */
+/* We sort each cell's brightness into one of four colour bands. The
+ * scale (just under 4) maps a 0..1 brightness onto bands 0..3. */
 #define N_PALETTE_BANDS      4
 #define GLOW_COL_SCALE       3.999f
 
-/* ── HUD layout (column widths) ──────────────────────────────────── *
- * Row-1 segments are laid out left-to-right at fixed column widths so
- * each segment knows where the next one starts. */
+/* Widths of the three fixed-width chunks on the status row, so each one
+ * knows where the next begins. */
 #define HUD_PATTERN_FIELD_W   20    /* " pattern:XXXXXXXXX " slot */
 #define HUD_THEME_FIELD_W     17    /* " theme:XXXXXXXX "   slot */
 #define HUD_PALETTE_LABEL_W    9    /* " palette:"          slot */
 
 /*
- * Theme — one complete colour palette for the V-concentration display.
- * Ten of these live in themes[], cycled by t/T.
+ * Theme — one colour scheme for the display. There are ten; cycle them
+ * with t/T.
  *
- * INTENT. The smallest data needed to recolour every cell in the
- * render output: 4 ramp colours arranged dim → bright, plus a "flash"
- * accent (vestigial here — kept for cross-file palette parity with
- * magnetic_fields.c, midpoint_displacement_coastline.c, etc.).
+ * band[] is four colours from dim to bright. We sort each cell into one
+ * of those four by how much V it holds, so the faintest cells get
+ * band[0] and the strongest get band[3]. Design a theme as a smooth
+ * dark-to-light run of four colours.
  *
- * BANDING MODEL. scene_draw maps each cell's V·V_RENDER_GAIN value
- * into [0, 1], then derives a band index 0..3 via (g * 3.999f) & 3.
- * The band selects which colour of trail[] to use. Cells in the
- * lowest V tier get band[0] (dim); cells near peak V get band[3]
- * (bright). The four-band split forces theme authors to design the
- * ramp as a coherent low → high progression.
+ * The numbers are xterm 256-colour codes, not RGB. On an old terminal
+ * with fewer colours, theme_apply falls back to a fixed set of basic
+ * colours so the demo still runs.
  *
- * COLOUR FORMAT. xterm-256 indices (NOT RGB). When the terminal
- * exposes fewer than 256 colours, theme_apply() substitutes a fixed
- * 8-colour cycle (COLOR_BLUE/CYAN/MAGENTA/YELLOW) so the demo still
- * runs on legacy TTYs.
- *
- * REFERENCE. The 256-colour cube layout (16 base + 6³ cube + 24-step
- * grayscale ramp) is documented in XTerm's ctlseqs.ms; the band values
- * in themes[] are picked from that cube. See also CLAUDE.md "Theme
- * Palette Brightness" for this project's bright-half constraint.
+ * flash is unused here — kept only so this theme layout matches the
+ * sister field demos.
  */
 typedef struct {
-    const char *name;          /* short uppercase label shown in HUD     */
-    short       band[4];       /* ramp: 0 = dim/low, 3 = bright          */
-    short       flash;         /* vestigial — kept for cross-file parity */
+    const char *name;          /* short label shown in the HUD       */
+    short       band[4];       /* four colours, dim (0) to bright (3) */
+    short       flash;         /* unused; kept to match sister files  */
 } Theme;
 
 #define N_THEMES 10
@@ -662,17 +389,15 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * Grid — canvas geometry. Pure data: no buffers, no state. Lives at
- * the top of Scene because every layer (PDE step, raster, screen
- * centring) needs the dimensions.
+ * Grid — just the size of the playing field, in cells. Nearly everything
+ * needs the width and height, so they live here at the top.
  *
- * INVARIANT. w · h ≤ CELLS_MAX always holds; app_pick_map_size()
- * clamps to MAP_W_MAX × MAP_H_MAX = 200 × 56 = 11 200 cells, which is
- * what the ReactionField arrays are statically sized for.
+ * w * h never exceeds CELLS_MAX (200 x 56) — app_pick_map_size keeps it
+ * in bounds, since that's how big the chemical arrays are.
  */
 typedef struct {
-    int w, h;            /* current map width / height in cells */
-    int total_cells;     /* = w · h, cached so hot loops skip the multiply */
+    int w, h;            /* width and height, in cells          */
+    int total_cells;     /* w * h, kept here so loops skip the multiply */
 } Grid;
 
 static inline int  grid_idx       (const Grid *g, int x, int y) { return y * g->w + x; }
@@ -682,104 +407,75 @@ static inline bool grid_in_bounds (const Grid *g, int x, int y)
 }
 
 /*
- * ReactionField — the chemistry state on the grid. Holds both the
- * dynamical variables (U, V concentrations) and the PDE rate
- * constants (F, k) for the active preset.
+ * ReactionField — how much of each chemical sits in every cell, plus the
+ * feed/kill dials for the current preset. This is the whole simulation
+ * state; the solver reads and writes only this struct.
  *
- *   U[]     : per-cell concentration of the "fed" chemical
- *   V[]     : per-cell concentration of the "consumed" chemical
- *   U_next, V_next : double-buffer for the explicit-Euler step
- *   F, k    : feed and kill rates of the active preset
+ * The two chemicals are U and V. Think of U as the plentiful background
+ * and V as the stuff that eats U and multiplies — V is what you see on
+ * screen. They spread at different speeds, and that difference is the
+ * whole trick: it's what lets patterns form instead of a smooth blur.
  *
- * INTENT. ReactionField is the algorithm's data source — same role as
- * PoleField in magnetic_fields.c, FractalField in
- * midpoint_displacement_coastline.c, NoiseField in
- * perin_noise_flow_showcase.c. The PDE solver reads and writes ONLY
- * this struct; everything else (grid dims, sim counters, controls)
- * lives outside.
- *
- * BOUNDARY CONDITION. NEUMANN (zero-flux). Out-of-grid neighbours
- * are clamped to the centre cell, so no chemical mass leaves the
- * box. Equivalent to a sealed petri dish. Periodic BCs also work but
- * produce visible tile-seams when the central pattern reaches edges.
- *
- * REFERENCE. Gray, P. & Scott, S. K. (1983), Chem. Eng. Sci.; Pearson,
- * J. E. (1993), Science 261:189–192. See CONCEPTS for the PDE form.
+ * Edges are sealed, like a petri dish — nothing leaks off the grid.
+ * (See clamp_neumann_lo/hi for how that's done.)
  */
 typedef struct {
-    /* U[idx] — per-cell concentration of the "fed" chemical. Held at
-     * the fixed point U = 1 by the F·(1 − U) term wherever V is
-     * absent. Diffuses with rate D_u = GS_DU. */
+    /* How much of the plentiful chemical is in each cell. Sits near 1
+     * wherever V isn't eating it. */
     float U     [CELLS_MAX];
 
-    /* V[idx] — per-cell concentration of the "consumed" chemical.
-     * Starts as a small central blob; grows by consuming U via the
-     * U·V² autocatalytic reaction; decays at rate (F + k)·V. Diffuses
-     * with rate D_v = GS_DV < D_u — the asymmetric diffusion is
-     * Turing's instability condition. */
+    /* How much of the active chemical is in each cell — this is what
+     * gets drawn. Starts as a tiny central blob and spreads from there. */
     float V     [CELLS_MAX];
 
-    /* U_next, V_next — double-buffer for the explicit-Euler step.
-     * step_reaction_field writes the new values here, then
-     * swap_pde_buffers memcpys them back into U/V. Necessary because
-     * each cell's update depends on its neighbours' OLD values; we
-     * can't update U in place without corrupting the neighbours we
-     * haven't visited yet. */
+    /* Scratch copies. Each step writes the new amounts here, then we copy
+     * them back. We need separate copies because every cell's new value
+     * depends on its neighbours' OLD values — overwrite in place and
+     * you'd corrupt neighbours you haven't visited yet. */
     float U_next[CELLS_MAX];
     float V_next[CELLS_MAX];
 
-    /* F — feed rate. Installed by install_kinetics() from the active
-     * preset; constant during the rest of the simulation. Active
-     * range F ∈ [0.010, 0.075]; see GSPreset doc. */
-    float F;
-
-    /* k — kill rate. Same lifecycle as F. Active range
-     * k ∈ [0.040, 0.070]. Outside the active region the system
-     * collapses to U=1, V=0 and the screen goes empty. */
-    float k;
+    /* The current preset's two dials. install_kinetics sets these; they
+     * stay fixed until you switch presets. See GSPreset for the ranges. */
+    float F;     /* feed rate */
+    float k;     /* kill rate */
 } ReactionField;
 
-/* ── Gray-Scott PDE primitives ─────────────────────────────────── *
- * Each one expresses exactly one named operation from the algorithm.
- * The step_reaction_field body composes them so the loop reads as
- * the PDE equations almost line for line. */
+/* ── the four small pieces of one simulation step ──────────────── *
+ * Each does one job. step_reaction_field below stitches them together. */
 
-/* clamp_neumann_lo / clamp_neumann_hi — zero-flux boundary lookup:
- * step back one cell unless we're at the edge, in which case use the
- * edge itself. Together they implement Neumann boundary conditions
- * without an explicit ghost-cell ring. */
+/* When a neighbour would fall off the grid, pretend the edge cell is its
+ * own neighbour instead. That seals the edges so nothing leaks out. */
 static inline int clamp_neumann_lo(int c)        { return (c > 0)     ? c - 1 : c; }
 static inline int clamp_neumann_hi(int c, int n) { return (c < n - 1) ? c + 1 : c; }
 
-/* laplacian_5pt — discrete 5-point Laplacian stencil:
- *   ∇²f(x,y) ≈ f(x-1,y) + f(x+1,y) + f(x,y-1) + f(x,y+1) − 4·f(x,y)
- * Used for both U and V diffusion. */
+/* How fast a chemical is spreading at this cell: compare it to its four
+ * neighbours. Positive means neighbours have more, so it flows in. This
+ * is what "diffusion" means in one number. */
 static inline float laplacian_5pt(const float *f,
                                    int idx, int il, int ir, int iu, int id)
 {
     return f[il] + f[ir] + f[iu] + f[id] - 4.0f * f[idx];
 }
 
-/* gray_scott_dU — right-hand side of the U PDE:
- *   ∂U/∂t = D_u · ∇²U − U·V² + F·(1 − U)
- * Returns the time-derivative; forward-Euler multiplies by dt. */
+/* The change in U for this cell over one step: it spreads in from
+ * neighbours, gets eaten where V is present, and is topped back up. */
 static inline float gray_scott_dU(float u, float v, float lap_U,
                                    float F, float Du)
 {
     return Du * lap_U - u * v * v + F * (1.0f - u);
 }
 
-/* gray_scott_dV — right-hand side of the V PDE:
- *   ∂V/∂t = D_v · ∇²V + U·V² − (F + k)·V
- * Returns the time-derivative; forward-Euler multiplies by dt. */
+/* The change in V: it spreads in, grows wherever it can eat U, and fades
+ * out everywhere at the kill rate. */
 static inline float gray_scott_dV(float u, float v, float lap_V,
                                    float F, float k, float Dv)
 {
     return Dv * lap_V + u * v * v - (F + k) * v;
 }
 
-/* swap_pde_buffers — copy *_next back to current for the next sub-step.
- * memcpy is fine; both arrays are ~45 KB at the worst-case grid. */
+/* Make the freshly-computed values the current ones, ready for the next
+ * step. */
 static void swap_pde_buffers(ReactionField *rxn, int total_cells)
 {
     size_t bytes = (size_t)total_cells * sizeof(float);
@@ -787,31 +483,24 @@ static void swap_pde_buffers(ReactionField *rxn, int total_cells)
     memcpy(rxn->V, rxn->V_next, bytes);
 }
 
-/* ── seed / step drivers ──────────────────────────────────────── */
+/* ── setting up the starting state ─────────────────────────────── */
 
-/*
- * SEED_BLOB_FRAC — central seed blob radius as a fraction of the
- * shorter grid edge. 1/12 gives a small but reliable nucleus.
- * U_BLOB / V_BLOB — concentrations inside the seed blob; the V > 0
- * patch is what kicks the system off its trivial fixed point.
- * JITTER_RANGE / JITTER_GAIN — symmetry-breaking U noise; small
- * enough not to perturb the kinetics, large enough that nearby
- * cells diverge instead of producing concentric rings.
- */
-#define SEED_BLOB_RADIUS_DENOM  12
+/* The starting seed: a small blob of V dropped in the middle. Its size is
+ * a fraction of the grid; the U/V amounts are what's inside it. The jitter
+ * is a tiny random nudge to U everywhere (see below for why). */
+#define SEED_BLOB_RADIUS_DENOM  12         /* blob is 1/12 of the shorter edge */
 #define SEED_BLOB_MIN_RADIUS    3
 #define SEED_U_BLOB             0.5f
 #define SEED_V_BLOB             0.25f
-#define JITTER_RANGE            100        /* uniform sample in [0, JITTER_RANGE) */
-#define JITTER_HALFRANGE         50        /* centre jitter on 0: sample - half  */
-#define JITTER_GAIN             0.0002f    /* multiplier; keeps jitter tiny      */
-#define LAPLACIAN_CENTRE_WEIGHT 4.0f   /* the "-4·f" in 5-pt stencil */
-#define U_FIXED_POINT           1.0f   /* trivial steady state */
+#define JITTER_RANGE            100        /* random pick from 0..99 */
+#define JITTER_HALFRANGE         50        /* shift it to -50..+49   */
+#define JITTER_GAIN             0.0002f    /* then scale it way down  */
+#define LAPLACIAN_CENTRE_WEIGHT 4.0f
+#define U_FIXED_POINT           1.0f       /* the "nothing happening" state */
 
-/* clear_concentrations — set every cell to the trivial fixed point
- * (U = 1, V = 0). Starting from this and ONLY this leaves the system
- * frozen; the seed_central_blob + symmetry-breaking jitter are what
- * actually kick it into morphogenesis. */
+/* Reset the whole grid to the calm starting state: U full everywhere, no
+ * V. On its own this just sits there frozen — the seed and jitter below
+ * are what get things moving. */
 static void clear_concentrations(ReactionField *rxn, int total_cells)
 {
     for (int i = 0; i < total_cells; i++) {
@@ -820,10 +509,8 @@ static void clear_concentrations(ReactionField *rxn, int total_cells)
     }
 }
 
-/* seed_central_blob — paint a small disc of (U = 0.5, V = 0.25) at the
- * centre. Provides the non-zero V patch the PDE needs to escape the
- * trivial fixed point. Without this, U stays at 1 and V stays at 0
- * forever. */
+/* Drop a small disc of V in the centre. Without this first patch of V,
+ * nothing ever happens — the grid stays calm forever. */
 static void seed_central_blob(ReactionField *rxn, const Grid *g)
 {
     int cx = g->w / 2;
@@ -843,22 +530,18 @@ static void seed_central_blob(ReactionField *rxn, const Grid *g)
     }
 }
 
-/* salt_with_symmetry_breaking_jitter — add tiny random perturbations
- * to U everywhere. Without this the seed blob would only produce
- * perfectly symmetric concentric rings, because the PDE preserves the
- * radial symmetry of its initial condition. The morphogenic
- * instability needs SOME asymmetry to amplify. */
+/* Sprinkle a tiny bit of randomness onto U everywhere. A perfectly
+ * symmetric start would only ever grow perfectly symmetric rings; the
+ * interesting patterns need some unevenness to feed on. */
 static void salt_with_symmetry_breaking_jitter(ReactionField *rxn, int total_cells)
 {
     for (int i = 0; i < total_cells; i++) {
-        int   centred = rand() % JITTER_RANGE - JITTER_HALFRANGE;   /* [-50, +49] */
+        int   centred = rand() % JITTER_RANGE - JITTER_HALFRANGE;
         float jitter  = (float)centred * JITTER_GAIN;
         rxn->U[i] += jitter;
     }
 }
 
-/* seed_reaction_field — the full init pipeline: trivial fixed point,
- * central seed blob, symmetry-breaking jitter. */
 static void seed_reaction_field(ReactionField *rxn, const Grid *g)
 {
     clear_concentrations                 (rxn, g->total_cells);
@@ -866,12 +549,8 @@ static void seed_reaction_field(ReactionField *rxn, const Grid *g)
     salt_with_symmetry_breaking_jitter   (rxn, g->total_cells);
 }
 
-/*
- * step_reaction_field — run one Gray-Scott sub-step on the entire
- * grid. Forward Euler with a 5-point Laplacian, Neumann boundaries.
- * Reads as the PDE equations: laplacian, then PDE right-hand side,
- * then forward-Euler integration step.
- */
+/* Advance the whole grid by one step: for every cell, see how each
+ * chemical is spreading, work out its change, and store the new amounts. */
 static void step_reaction_field(ReactionField *rxn, const Grid *g)
 {
     const float Du = GS_DU, Dv = GS_DV, dt = GS_DT;
@@ -908,12 +587,8 @@ static void step_reaction_field(ReactionField *rxn, const Grid *g)
 /* §6  patterns — preset (F, k) plug-ins                                  */
 /* ===================================================================== */
 
-/*
- * install_kinetics — copy a preset's (F, k) rate constants into the
- * ReactionField. The actual simulation kernel reads only rxn->F and
- * rxn->k; the Pattern enum and gs_presets table never escape §6.
- * Caller is responsible for re-seeding the field after switching.
- */
+/* Load a preset's two dials into the field. After calling this you must
+ * re-seed, since switching presets means starting the pattern over. */
 static void install_kinetics(ReactionField *rxn, Pattern p)
 {
     if (p < 0 || p >= N_PATTERNS) p = PATTERN_SPOTS;
@@ -926,82 +601,38 @@ static void install_kinetics(ReactionField *rxn, Pattern p)
 /* ===================================================================== */
 
 /*
- * The scene is built out of four small sub-structs (ReactionField from
- * §5 plus three defined below). Each owns ONE concern, and Scene
- * composes them. Splitting concerns into clearly-typed sub-structs
- * makes function signatures self-describing: any function that takes
- * `const Grid *` clearly cannot mutate the chemistry; any function
- * that takes `ReactionField *` clearly does not advance sim time; and
- * so on. Same architectural shape as the other field files
- * (magnetic_fields.c, flow_field_particles.c, midpoint_displacement_*).
+ * The whole program state is one Scene made of four small parts, each
+ * holding one kind of thing. Splitting it up this way means a function's
+ * arguments tell you what it can touch: take a `const Grid *` and you
+ * clearly can't change the chemistry, and so on.
  */
 
-/*
- * SimState — the single mutable per-tick scalar. Separated from
- * Controls (keyboard-driven knobs) so it is obvious what scene_tick
- * mutates vs. what the user does.
- *
- * step_count is the total number of Gray-Scott sub-steps run since
- * the last seed (i.e. since the last scene_reset). The HUD shows it
- * so the user can compare "this pattern needed N steps to settle"
- * across presets.
- */
+/* The one number the simulation itself updates each step: how many steps
+ * have run since the last reset. Shown in the HUD so you can compare how
+ * long different patterns take to settle. */
 typedef struct {
-    int step_count;       /* total sub-steps since last seed */
+    int step_count;
 } SimState;
 
-/*
- * Controls — user-facing knobs. Mutated only by app_handle_key(),
- * read by scene_tick (paused, sub_steps) and screen_draw (theme,
- * pattern).
- *
- * INTENT. Same model-vs-user-intent split as the other field files:
- * dependency is strictly one-way. app_handle_key writes Controls,
- * never SimState; scene_tick reads Controls but only writes SimState
- * + ReactionField. Keeps the code linear.
- *
- * NO prev_pattern. Switching patterns triggers a full scene_reset
- * (see cycle_pattern in §9) because each preset needs its own
- * (F, k) AND a fresh seed — there's no need to detect the switch
- * with a one-tick lag.
- */
+/* The knobs the user turns with the keyboard. Only the key handler writes
+ * these; the rest of the code just reads them. */
 typedef struct {
     bool    paused;
-    int     sub_steps;              /* Gray-Scott updates per frame */
+    int     sub_steps;              /* sim steps per drawn frame */
     int     current_theme;
     Pattern current_pattern;
 } Controls;
 
-/*
- * Scene — the umbrella context. Reading this struct top-to-bottom
- * is meant to be the fastest way to understand the program:
- *   grid       → where things live       (geometry)
- *   reaction   → chemistry state + rate  (ReactionField — U/V + F/k)
- *   sim        → simulation counter      (step_count)
- *   ctrl       → user knobs              (pattern, sub_steps, theme, …)
- *
- * ORDERING. Each sub-struct depends only on those declared above it:
- * grid is leaf-level; reaction is sized by CELLS_MAX (upper bound on
- * grid); sim mutates reaction via step_reaction_field; ctrl decides
- * which sim path runs. A reader scanning top-down meets every concept
- * before it is used.
- */
+/* Everything the program needs, in one place. Reading it top to bottom is
+ * the quickest way to understand the whole thing. */
 typedef struct {
-    Grid          grid;       /* canvas dimensions                          */
-    ReactionField reaction;   /* U, V concentrations + F, k kinetics        */
-    SimState      sim;        /* step_count — mutated only by scene_tick    */
-    Controls      ctrl;       /* mutated only by app_handle_key             */
+    Grid          grid;       /* size of the field                  */
+    ReactionField reaction;   /* the chemicals + current preset     */
+    SimState      sim;        /* step counter                       */
+    Controls      ctrl;       /* user's keyboard settings           */
 } Scene;
 
-/* ── reset / init pipeline ───────────────────────────────────────── *
- * scene_reset is the init/reset pseudocode:
- *
- *     apply grid dimensions.
- *     install kinetics from the active preset (F, k).
- *     seed the reaction field (U=1 everywhere + central V-blob + jitter).
- *     reset sim state (step_count = 0).
- *
- * Each step is one named call below. */
+/* ── starting (or restarting) the simulation ─────────────────────── */
 
 static void apply_grid_dimensions(Grid *g, int w, int h)
 {
@@ -1033,13 +664,7 @@ static void scene_init(Scene *s, int w, int h)
     scene_reset(s, w, h);
 }
 
-/* ── tick pipeline ───────────────────────────────────────────────── *
- * scene_tick is the per-frame pseudocode:
- *
- *     if paused: stop.
- *     run sub_steps Gray-Scott updates, counting each.
- *
- * Each step is one named call. */
+/* ── one frame of simulation ─────────────────────────────────────── */
 
 static void run_sub_steps(Scene *s)
 {
@@ -1053,7 +678,7 @@ static void run_sub_steps(Scene *s)
 static void scene_tick(Scene *s, float dt)
 {
     if (s->ctrl.paused) return;
-    (void)dt;     /* Gray-Scott uses fixed GS_DT, not wall dt */
+    (void)dt;     /* sim runs on its own fixed step, not real elapsed time */
 
     run_sub_steps(s);
 }
@@ -1062,24 +687,13 @@ static void scene_tick(Scene *s, float dt)
 /* §8  screen                                                             */
 /* ===================================================================== */
 
-/*
- * Screen — terminal dimensions cached after the last successful
- * getmaxyx(). Refreshed on SIGWINCH via screen_resize().
- *
- * INTENT. Kept tiny because the rest of ncurses' state lives
- * implicitly in stdscr; we only need the dimensions to centre the
- * map and position HUD elements. Anything else (current attribute,
- * cursor position, colour-pair table) is owned by ncurses internals,
- * not by us — exposing it here would just duplicate state.
- *
- * NOT IN SCENE. Screen lives at App-level, not Scene, because Scene
- * is "the simulation" and the simulation is display-agnostic: any
- * scene state should be reusable on a different display backend. The
- * terminal-cell dimensions are a property of the display, not the sim.
- */
+/* The terminal's current size. We re-read it whenever the window is
+ * resized. That's all we need to track ourselves — ncurses keeps the
+ * rest. It's kept separate from the simulation because the sim doesn't
+ * care how big the window is. */
 typedef struct {
-    int cols;   /* terminal width  in character cells */
-    int rows;   /* terminal height in character cells */
+    int cols;   /* width  in characters */
+    int rows;   /* height in characters */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -1102,13 +716,10 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * CellDraw — bundle of "what to paint at this position": pair, attr,
- * glyph, plus a skip flag. classify_v_cell decides; paint_cell acts.
- * Routing the per-cell decision through this struct keeps the
- * decision logic pure (no ncurses I/O inside the classifier) and
- * concentrates ncurses calls into ONE place (paint_cell).
- */
+/* What to paint in one cell: which colour, bold or not, which character,
+ * and whether to skip it entirely. Deciding (classify_v_cell) is kept
+ * apart from drawing (paint_cell) so the decision has no terminal calls
+ * mixed in. */
 typedef struct {
     int  pair;
     int  attr;
@@ -1116,10 +727,8 @@ typedef struct {
     bool skip;
 } CellDraw;
 
-/* normalize_v_to_glow — map raw V ∈ [0, V_peak] to glow ∈ [0, 1]. V
- * typically peaks at ~0.4 for our presets, so we multiply by
- * V_RENDER_GAIN ≈ 2.5 for visibility, then clamp into the unit
- * interval. The clamped glow drives the glyph-ramp threshold logic. */
+/* Turn a cell's raw V amount into a 0..1 brightness. V is usually small,
+ * so we scale it up first, then clamp to the 0..1 range. */
 static inline float normalize_v_to_glow(float v_raw)
 {
     float g = v_raw * V_RENDER_GAIN;
@@ -1128,18 +737,15 @@ static inline float normalize_v_to_glow(float v_raw)
     return g;
 }
 
-/* glow_to_band — derive the palette band 0..N_PALETTE_BANDS-1 from
- * the normalised glow. Same trick as in perin_noise_flow_showcase.c:
- * multiply by GLOW_COL_SCALE = 4 − ε so int-cast floors cleanly. */
+/* Pick which of the four colour bands a brightness falls into. */
 static inline int glow_to_band(float glow)
 {
     return (int)(glow * GLOW_COL_SCALE) & (N_PALETTE_BANDS - 1);
 }
 
-/* classify_v_cell — pure function. Given a cell's normalised glow,
- * return how it should be rendered (or .skip = true if below the
- * visibility floor). Three density tiers map to the three glyphs
- * of the Paul-Bourke ASCII ramp. */
+/* Given a cell's brightness, decide how to draw it: pick a character and
+ * colour, or skip it if it's too faint to bother with. Brighter cells get
+ * heavier characters ('.', '*', '#'). */
 static CellDraw classify_v_cell(float glow)
 {
     if (glow > GLYPH_HIGH_THRESH) {
@@ -1157,7 +763,7 @@ static CellDraw classify_v_cell(float glow)
     return (CellDraw){ .skip = true };
 }
 
-/* paint_cell — the ONE ncurses I/O point for the V-concentration layer. */
+/* The single place where the pattern actually gets drawn to the screen. */
 static void paint_cell(int sy, int sx, CellDraw c)
 {
     if (c.skip) return;
@@ -1166,9 +772,8 @@ static void paint_cell(int sy, int sx, CellDraw c)
     attroff(COLOR_PAIR(c.pair) | c.attr);
 }
 
-/* compute_centred_origin — top-left corner where the map is drawn.
- * Centres horizontally; reserves HUD_BAND_RESERVED_ROWS rows total
- * (HUD_TOP_ROWS top + HUD_BOTTOM_ROWS bottom). */
+/* Work out where to put the top-left corner of the pattern so it sits
+ * centred, leaving room for the HUD rows. */
 static void compute_centred_origin(const Grid *g, int cols, int rows,
                                     int *out_gx0, int *out_gy0)
 {
@@ -1180,10 +785,8 @@ static void compute_centred_origin(const Grid *g, int cols, int rows,
     *out_gy0 = gy0;
 }
 
-/*
- * scene_draw — walk every cell, normalise its V to a glow, classify,
- * paint. The loop body is exactly three named operations.
- */
+/* Draw the whole pattern: for every cell, turn its V into a brightness,
+ * decide how to draw it, and paint it. */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
     const Grid          *g   = &s->grid;
@@ -1204,14 +807,9 @@ static void scene_draw(const Scene *s, int cols, int rows)
     }
 }
 
-/* ── HUD draw pipeline ───────────────────────────────────────────── *
- * Four named drawers, called from screen_draw in z-order. The TOP HUD
- * (rows 0..1) carries DATA — current state with [N/30] index, parameter
- * readouts, palette swatch. The BOTTOM HUD (row N-1) carries ACTIONS
- * — key bindings only.
- *
- * draw_hud_status_line internally composes several smaller segment
- * drawers, one per fixed-width row-1 field. */
+/* ── the on-screen text overlay ──────────────────────────────────── *
+ * The top two rows show what's happening (fps, current preset, the
+ * numbers behind it). The bottom row lists the keys you can press. */
 
 static void draw_hud_state_bar(const Screen *sc, const Scene *s,
                                 double fps, int sim_fps)
@@ -1239,11 +837,8 @@ static void draw_hud_title(void)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* ── row 1 segment drawers ───────────────────────────────────────── *
- * draw_hud_status_line lays out row 1 left-to-right as a sequence of
- * fixed-width segments. Each segment paints its content and returns
- * the new x-cursor; the last (kinetics_readout) does not need to
- * return. */
+/* ── the status row, drawn one chunk at a time ───────────────────── *
+ * Each of these paints its chunk and returns where the next one starts. */
 
 static int draw_status_pattern_field(int row, int x, Pattern p)
 {
@@ -1281,9 +876,8 @@ static int draw_palette_swatch(int row, int x)
     return x;
 }
 
-/* draw_kinetics_readout — last segment: live (F, k, D_u, D_v) rate
- * constants + map dimensions. No return — end of the row. The
- * numbers update when the user cycles presets. */
+/* Last chunk: the actual numbers behind the current pattern (feed, kill,
+ * spread rates) and the grid size. They change as you cycle presets. */
 static void draw_kinetics_readout(int row, int x, const Scene *s)
 {
     attron (COLOR_PAIR(PAIR_HUD));
@@ -1305,7 +899,7 @@ static void draw_hud_status_line(const Scene *s)
         draw_kinetics_readout     (1, x, s);
 }
 
-/* draw_bottom_hint — row N-1: ACTIONS only (key bindings). */
+/* The bottom row: the list of keys you can press. */
 static void draw_bottom_hint(const Screen *sc)
 {
     attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -1319,10 +913,10 @@ static void screen_draw(Screen *sc, const Scene *s,
 {
     erase();
     scene_draw           (s, sc->cols, sc->rows);
-    draw_hud_state_bar   (sc, s, fps, sim_fps);   /* row 0  : data    */
-    draw_hud_title       ();                       /* row 0  : data    */
-    draw_hud_status_line (s);                      /* row 1  : data    */
-    draw_bottom_hint     (sc);                     /* row N-1: actions */
+    draw_hud_state_bar   (sc, s, fps, sim_fps);
+    draw_hud_title       ();
+    draw_hud_status_line (s);
+    draw_bottom_hint     (sc);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -1332,40 +926,25 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — top-level program state. One instance, g_app, lives in BSS
- * so the signal handlers can reach it without a global Scene pointer.
- * The App owns the Scene and the Screen and adds:
- *   • simulation parameters that are not really "scene state"
- *     (sim_fps, map_w, map_h);
- *   • signal-driven flags that must be sig_atomic_t for safety.
+ * App — the top-level state for the whole program. There's just one,
+ * g_app, kept global so the signal handlers can reach it.
  *
- * SIGNAL-HANDLER DISCIPLINE. The handlers do nothing but set a flag.
- * The main loop polls those flags and performs the actual work
- * (cleanup, resize) in normal execution context. Standard async-
- * signal-safe pattern — anything that touches ncurses or malloc MUST
- * happen outside the handler.
- *
- * QUALIFIER NOTE. The running / need_resize flags carry BOTH
- * `volatile` and `sig_atomic_t`. sig_atomic_t guarantees writes from
- * a handler are observed atomically by the main loop; volatile
- * prevents the compiler from caching the read in a register across
- * loop iterations. Both qualifiers are required — sig_atomic_t alone
- * permits caching, volatile alone permits torn writes from a handler.
- *
- * REFERENCE. W. Richard Stevens & Stephen Rago — "Advanced Programming
- * in the UNIX Environment" (3rd ed), ch. 10 on signals, for the full
- * discussion of async-signal-safety and sig_atomic_t.
+ * The two flags are written by signal handlers (when you press Ctrl-C or
+ * resize the window) and read by the main loop. The handlers only flip a
+ * flag; the actual work happens back in the main loop, because doing real
+ * work inside a signal handler isn't safe. The volatile + sig_atomic_t on
+ * those flags is what makes that hand-off safe and reliable.
  */
 typedef struct {
-    Scene                 scene;     /* the simulation                       */
-    Screen                screen;    /* current terminal dimensions          */
+    Scene                 scene;     /* the simulation              */
+    Screen                screen;    /* terminal size               */
 
-    int                   sim_fps;   /* tick rate; mutated by '[' and ']'    */
-    int                   map_w;     /* chosen map width,  ≤ MAP_W_MAX       */
-    int                   map_h;     /* chosen map height, ≤ MAP_H_MAX       */
+    int                   sim_fps;   /* tick rate; '[' and ']' change it */
+    int                   map_w;     /* grid width  (capped)        */
+    int                   map_h;     /* grid height (capped)        */
 
-    volatile sig_atomic_t running;       /* 0 = exit main loop               */
-    volatile sig_atomic_t need_resize;   /* 1 = pending SIGWINCH             */
+    volatile sig_atomic_t running;       /* set to 0 to quit        */
+    volatile sig_atomic_t need_resize;   /* set when the window resized */
 } App;
 
 static App g_app;
@@ -1394,12 +973,10 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* ── keyboard handlers ──────────────────────────────────────────────── *
- * Each key is one named action; app_handle_key is just a dispatcher. */
+/* ── keyboard ─────────────────────────────────────────────────────── */
 
-/* bump_sub_steps — '+' / '-' geometric step on per-frame sub-step count.
- * Doubling/halving gives a logarithmic feel — small/medium/large/extreme
- * are spaced exponentially rather than linearly. */
+/* +/- speed: doubles or halves the steps-per-frame, so each press makes a
+ * bigger jump than the last instead of nudging by a fixed amount. */
 static void bump_sub_steps(Controls *c, int dir)
 {
     if (dir > 0) {
@@ -1411,7 +988,6 @@ static void bump_sub_steps(Controls *c, int dir)
     }
 }
 
-/* bump_sim_fps — '[' / ']' linear step on tick rate, clamped. */
 static void bump_sim_fps(App *app, int delta)
 {
     app->sim_fps += delta;
@@ -1425,9 +1001,8 @@ static void cycle_theme(Controls *c, int dir)
     theme_apply(c->current_theme);
 }
 
-/* cycle_pattern — n/p step + full scene reset. We reset because each
- * preset has its own (F, k) AND benefits from a fresh seed so the
- * user watches the new morphology self-organise from scratch. */
+/* Switch presets with n/p, and start the new one over from scratch so you
+ * watch it grow — every preset has its own settings and its own seed. */
 static void cycle_pattern(App *app, int dir)
 {
     Controls *c = &app->scene.ctrl;
@@ -1456,7 +1031,7 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* ── main-loop helpers ──────────────────────────────────────────────── */
+/* ── the main loop's helpers ────────────────────────────────────────── */
 
 static void install_signal_handlers(void)
 {
@@ -1465,8 +1040,8 @@ static void install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* advance_frame_clock — read the monotonic clock, compute dt since
- * the last call, clamp at the spiral-of-death guard. */
+/* How much real time passed since the last frame, with a ceiling so a long
+ * pause (a stall, a resize) can't make the sim try to catch up forever. */
 static int64_t advance_frame_clock(int64_t *frame_time)
 {
     int64_t now = clock_ns();
@@ -1476,8 +1051,8 @@ static int64_t advance_frame_clock(int64_t *frame_time)
     return dt;
 }
 
-/* simulate_pending_ticks — drain the fixed-timestep accumulator.
- * Source: Glenn Fiedler, "Fix Your Timestep". */
+/* Run as many sim ticks as the elapsed time has earned, so the simulation
+ * keeps a steady pace no matter how fast the screen redraws. */
 static void simulate_pending_ticks(App *app, int64_t *sim_accum,
                                     int64_t tick_ns, float dt_sec)
 {
@@ -1487,8 +1062,8 @@ static void simulate_pending_ticks(App *app, int64_t *sim_accum,
     }
 }
 
-/* maybe_update_fps_counter — every FPS_UPDATE_MS, fold the running
- * frame count into a smoothed fps reading. */
+/* Update the displayed frames-per-second roughly twice a second, rather
+ * than recomputing it every single frame (which would jitter). */
 static double maybe_update_fps_counter(int64_t *fps_accum,
                                         int *frame_count,
                                         double previous)
@@ -1501,7 +1076,7 @@ static double maybe_update_fps_counter(int64_t *fps_accum,
     return fps;
 }
 
-/* cap_frame_rate — sleep so frames are at most 1/target_fps apart. */
+/* Wait out the rest of the frame so we don't redraw faster than needed. */
 static void cap_frame_rate(int64_t work_done_ns, int target_fps)
 {
     int64_t budget = NS_PER_SEC / target_fps;

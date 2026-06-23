@@ -1,250 +1,32 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * simplex_noise_clouds.c
- *   — Ken Perlin's simplex noise, thirty patterns across six tiers.
+ * simplex_noise_clouds.c — drifting clouds drawn in ASCII from simplex noise.
  *
- * DEMO: A flowing scalar field generated from 2-D simplex noise — the
- *       improved-noise variant Perlin published in 2001 to fix the
- *       directional bias and grid artefacts of his original 1985
- *       Perlin noise. Thirty patterns, grouped into six tiers ordered
- *       simple → complex, visualise the same noise primitive through
- *       progressively more elaborate mappings:
- *         Tier 1 RAW       — direct noise (CLOUDS, BILLOW, RIDGED,
- *                            WISPS, CRESTS)
- *         Tier 2 MAPPED    — sin/cos/pow transforms of fBm (CONTOURS,
- *                            MARBLE, ZEBRA, RIPPLES, THRESHOLD)
- *         Tier 3 TURBULENCE— Σ|octave| stacks (TURBULENCE, STORM,
- *                            INFERNO, VEINS, EMBERS)
- *         Tier 4 WARPED    — domain warping (WARP, WHIRL, DUNES,
- *                            CURRENTS, FRACTAL)
- *         Tier 5 COMPOSITE — multi-field combine (NEBULA, AURORA,
- *                            PLASMA, LIGHTNING, GALAXY)
- *         Tier 6 MASKED    — noise × spatial mask (SOLAR, MOSAIC,
- *                            VIGNETTE, COSMOS, SUPERNOVA)
- *       Field drifts so all patterns evolve. Cycle patterns with n/p,
- *       themes with t/T.
+ * Simplex noise is a way to make smooth, natural-looking random fields
+ * (think clouds, smoke, terrain). It's the 2001 follow-up to classic
+ * Perlin noise, and looks more even because it has no built-in "grain"
+ * along the screen axes. We compute one noise value per terminal cell,
+ * let the field slowly drift, and draw it with three density characters.
+ * There are 30 different "looks" (patterns) you can flip through; they
+ * all start from the same noise and just transform it in different ways.
  *
- * Study alongside:
- *   ./perin_noise_flow_showcase.c — Perlin (1985) gradient noise;
- *       the predecessor to simplex. Shape similarities; simplex is
- *       faster and less directionally biased.
- *   ./domain_warped_noise_iq_style.c — domain warping, also Perlin-
- *       based. Different "what to do with the noise" technique.
- *   ./worley_cellular_noise.c — cellular noise instead of gradient.
+ * Sister files worth a look:
+ *   ./perin_noise_flow_showcase.c   — the older Perlin noise this improves on
+ *   ./domain_warped_noise_iq_style.c — a deep dive on the warping trick (tier 4)
+ *   ./worley_cellular_noise.c        — a different kind of noise (cells, not blobs)
  *
- * Section map:
- *   §1 config   — grid, patterns, palette, themes
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes
- *   §5 noise    — Simplex 2-D + fBm
- *   §6 patterns — 30 noise mappings in 6 tiers + dispatch table
- *   §7 scene    — Field, scene state, per-frame grid update
- *   §8 screen   — ASCII render: density-graded glyphs
- *   §9 app      — signals, resize, main loop
+ * The math here follows two references the code can't restate:
+ *   Perlin, K. (2001) "Noise hardware" — the simplex idea.
+ *   Gustavson, S. (2005) "Simplex Noise Demystified" — the implementation
+ *     this file mirrors: https://weber.itn.liu.se/~stegu/simplexnoise/simplexnoise.pdf
+ *   Bourke, P. — the ASCII brightness ramp the '.', '*', '#' glyphs come from.
  *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reset (new permutation)
- *   n / N      next pattern
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      faster drift
- *   -          slower
- *   ] / [      raise / lower tick Hz
+ * Keys: q/ESC quit  space pause  r reset(new field)  n/p pattern
+ *       t/T theme  +/- drift speed  ]/[ tick rate
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra simplex_noise_clouds.c \
- *       -o simplex_clouds -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra simplex_noise_clouds.c -o simplex_clouds -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Simplex noise (Perlin 2001). The mathematical fix
- *                  for several issues with the original 1985 Perlin
- *                  noise:
- *                    • PERLIN samples a square lattice, requiring
- *                      bilinear interpolation across 4 corners. The
- *                      square has a directional bias — features tend
- *                      to align with axes.
- *                    • SIMPLEX samples a triangular (simplex) lattice
- *                      — in 2-D, a single triangle suffices, with
- *                      barycentric-style contribution from each of its
- *                      3 vertices. Triangles tile space isotropically,
- *                      so no axis bias.
- *                    • Faster too: 3 vertex contributions in 2-D vs 4
- *                      for Perlin, scaling better in higher dimensions
- *                      (the gap widens as N grows).
- *
- *                  The 2-D algorithm:
- *                    1. SKEW input (x, y) so unit squares become unit
- *                       triangles: skew factor F2 = (√3 − 1)/2.
- *                    2. Find which simplex (one of two triangles inside
- *                       each skewed unit square) contains the point —
- *                       trivially "lower" if x0 > y0, "upper" otherwise.
- *                    3. UNSKEW each of the 3 simplex vertices back to
- *                       Cartesian and compute (Δx, Δy) from the query.
- *                    4. For each vertex: t = 0.5 − Δ² (the radial
- *                       falloff; goes negative outside the support
- *                       circle, in which case the contribution is 0);
- *                       if t > 0, contribution = t⁴ × (gradient · Δ).
- *                    5. Sum the 3 contributions, scale by 70 so the
- *                       output range is roughly [−1, 1].
- *
- *                  Thirty patterns, organised into six complexity
- *                  tiers, build on this primitive — see §6.
- *
- * Data-structure : Same 256-entry permutation table as Perlin, plus a
- *                  12-direction gradient table (vs Perlin's 8). Per-cell
- *                  glow + colour buffers as in the other field files.
- *                  No allocation post-init.
- *
- * Rendering      : ASCII only, density-graded ('.', '*', '#') in 4
- *                  theme palette colours. Each pattern produces glow ∈
- *                  [0, 1] which selects both the glyph (by threshold)
- *                  and the colour band (by quartile).
- *
- * Performance    : 1 simplex_sample() call per fBm octave per cell.
- *                  Tier-1 CLOUDS uses 1 simplex_fbm() (= 4 octaves =
- *                  4 simplex_sample calls/cell). Tier-4 FRACTAL is
- *                  the worst case (2-level domain warp = 4 standalone
- *                  samples + 1 fbm = 8 calls/cell). With ~11 K cells
- *                  at 60 Hz that's ~2.6 M to ~5 M simplex calls/sec
- *                  — roughly half the cost of equivalent Perlin
- *                  thanks to the 3-vertex vs 4-vertex difference.
- *                  Fits in well under 5 % CPU on modern hardware.
- *
- * References     : NOISE THEORY
- *                  • Perlin, K. (1985) — "An Image Synthesizer",
- *                    SIGGRAPH'85, pp.287-296. The original gradient
- *                    noise paper; also defines "turbulence" Σ|fBm|
- *                    (Tier 3) and the marble derivation (Tier 2 MARBLE).
- *                  • Perlin, K. (2001) — "Noise hardware" (SIGGRAPH
- *                    course notes). The simplex variant — what
- *                    simplex_sample() implements:
- *                    https://www.csee.umbc.edu/~olano/s2002c36/ch02.pdf
- *                  • Gustavson, S. (2005) — "Simplex Noise Demystified".
- *                    Implementation walkthrough; this file's simplex
- *                    code follows it verbatim:
- *                    https://weber.itn.liu.se/~stegu/simplexnoise/simplexnoise.pdf
- *
- *                  fBm AND DERIVATIVES (the 30 patterns)
- *                  • Ebert, Musgrave, Peachey, Perlin, Worley —
- *                    "Texturing & Modeling: A Procedural Approach"
- *                    (Morgan Kaufmann, 3rd ed. 2002, ISBN 1-55860-848-6).
- *                    The foundational text. Musgrave's chapter is the
- *                    source of Tier 1 RIDGED ("ridged multifractal");
- *                    Perlin's chapter covers fBm / turbulence / marble.
- *                  • Quilez, I. — "fbm". Augmented fBm techniques
- *                    (amplitude warping, derivative-domain variants):
- *                    https://iquilezles.org/articles/fbm/
- *                  • Quilez, I. — "Domain warping". Direct source for
- *                    Tier 4 — IQ's nested fbm(p + fbm(p + fbm(p)))
- *                    construction (Tier 4 FRACTAL is this verbatim):
- *                    https://iquilezles.org/articles/warp/
- *
- *                  ASCII RENDERING (noise → terminal)
- *                  • Bourke, P. — "Character representation of grey
- *                    scale images". Source of the canonical luminance
- *                    ramps; the GlyphRamp '.', '*', '#' here is a
- *                    coarse subset of Bourke's 10-char ramp:
- *                    http://paulbourke.net/dataformats/asciiart/
- *                  • Wikipedia — "ANSI escape code § 8-bit". The
- *                    xterm/ANSI 256-colour palette (16 system + 6³
- *                    cube + 24 greys) that themes[] in §1 and the
- *                    HUD pairs in §3 index into:
- *                    https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit
- *                  • Padala, P. — "NCURSES Programming HOWTO". The
- *                    pragmatic reference for the §3/§8 rendering
- *                    APIs (init_pair, mvaddch, doupdate, A_BOLD):
- *                    https://tldp.org/HOWTO/NCURSES-Programming-HOWTO/
- *
- *                  COMPARE IN PROJECT
- *                  • ./perin_noise_flow_showcase.c — the Perlin 1985
- *                    predecessor; same fBm shape, axis-biased lattice.
- *                  • ./domain_warped_noise_iq_style.c — focused
- *                    treatment of the Tier 4 (WARPED) technique.
- *                  • ../generational/voronoi_region_map.c — cellular
- *                    "discrete regions" instead of "smooth field".
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Simplex noise produces a smooth scalar field over arbitrary
- * coordinates — like Perlin noise, but built on a triangular lattice
- * instead of a square one. The result has no preferred axis; the
- * "wind" of the noise moves diagonally just as readily as
- * horizontally. For cloud-like patterns, that isotropy reads as
- * organic — clouds shouldn't have a grain.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a tiled honeycomb of equilateral triangles. Each triangle
- * vertex has a random gradient direction. To sample at a point P:
- *   1. Find which triangle P is in.
- *   2. From each of the 3 vertices, draw a vector to P, dot it with
- *      that vertex's gradient, and weight by a radial falloff.
- *   3. Sum those 3 contributions.
- * Because triangles are isotropic (no preferred axis) and only 3
- * vertices contribute (vs 4 for square Perlin), the function is
- * cheaper AND more visually neutral.
- *
- * Layered with fractional Brownian motion (sum noise at progressively
- * doubled frequency / halved amplitude), the result is a multi-scale
- * cloud field — large rolling shapes with small bumps on top.
- *
- * The 30 patterns differ in HOW they map noise to glow. They form six
- * complexity tiers — each tier is a different *technique class*, so
- * the visual jump between tiers is obvious; within a tier the 5
- * variants explore one knob:
- *   • Tier 1 RAW        : direct noise — fBm, |fbm|, 1−|fbm|, etc.
- *   • Tier 2 MAPPED     : sin/cos/pow of fBm — bands, marble, stripes.
- *   • Tier 3 TURBULENCE : Σ|octaveᵢ| stacks — storms, embers, veins.
- *   • Tier 4 WARPED     : domain warping (sample noise at coords
- *                          themselves perturbed by noise) — swirls,
- *                          dunes, flowing currents.
- *   • Tier 5 COMPOSITE  : two or more noise/spatial fields combined
- *                          — nebula, aurora, plasma, lightning, galaxy.
- *   • Tier 6 MASKED     : noise × spatial mask (radial / quantise /
- *                          vignette) — solar corona, mosaic, supernova.
- *
- * ALGORITHM IN STEPS  (per cell, per frame)
- * ──────────────────
- *  1. Convert cell coord to noise space: (fx, fy) = (x, y) · NOISE_SCALE.
- *  2. Run the active pattern's noise function with current field_time
- *     added to fy (slow drift).
- *  3. Map noise → glow ∈ [0, 1] and colour band ∈ {0, 1, 2, 3}.
- *  4. Render: pick density glyph from glow; theme colour from band.
- *  5. The user can press 'r' to re-shuffle the permutation table for
- *     a fresh noise field (or 'n'/'p' to switch pattern). There is no
- *     automatic reset — the field drifts indefinitely.
- *
- * KEY FORMULAS
- * ────────────
- *  Simplex skew (2-D)            : F2 = (√3 − 1) / 2 ≈ 0.366
- *  Simplex unskew (2-D)          : G2 = (3 − √3) / 6 ≈ 0.211
- *  Falloff per vertex            : t = 0.5 − (Δx² + Δy²)
- *                                  contribution = t⁴ · (grad · (Δx, Δy))
- *                                  (zero if t ≤ 0)
- *  Output scale                  : multiply by 70 so result is roughly
- *                                  in [−1, 1]
- *  fBm                            : Σᵢ aᵢ · simplex(2ⁱ x), aᵢ = 1/2ⁱ
- *  Turbulence                    : Σᵢ aᵢ · |simplex(2ⁱ x)|
- *  Billow                        : |fbm(x)|
- *  Ridged                        : 1 − |fbm(x)|
- *  Domain warp (IQ, tier 4)      : fbm(x + fbm(x, y), y + fbm(x', y'))
- *  Quantise (tier 6 MOSAIC)      : floor(fbm · k) / (k − 1)
- *  Radial mask (tier 6)          : max(0, 1 − r² · falloff),
- *                                  where (nx, ny) ∈ [−1, 1]² and
- *                                  r² = nx² + ny²
- *  Per-pattern formulas inline next to each pattern_* function in §6;
- *  the dispatch table is `noise_patterns[]` (same section).
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -279,158 +61,117 @@ enum {
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* ncurses color-pair slots. 1 and 2 are the HUD colors; 3..6 are the
+     * four cloud shades; 7 is an unused accent kept for parity with sister files. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_BAND_BASE    =   3,    /* PAIR_BAND_BASE..+3 = 4 palette colours */
-    PAIR_FLASH        =   7,    /* vestigial — cross-file palette parity  */
+    PAIR_BAND_BASE    =   3,
+    PAIR_FLASH        =   7,
 };
 
 #define GLOW_THRESHOLD      0.05f
 
-/* ── HUD layout ──────────────────────────────────────────────────── *
- * Top HUD carries DATA, bottom HUD carries ACTIONS:
- *   row 0           : title + state bar (fps, Hz, state + [N/M], drift)
- *   row 1           : pattern/theme/palette + scale/oct/map
- *   row HUD_TOP..N-2: noise-field map
- *   row N-1         : keyboard action hint
- */
+/* Two rows reserved at the top for the HUD (title + readouts), one at the
+ * bottom for the key hints. The cloud field fills everything in between. */
 #define HUD_TOP_ROWS             2
 #define HUD_BOTTOM_ROWS          1
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
 #define HUD_LEFT_MARGIN          1
 
-/* Noise scale: ~0.04 noise-units per cell → ~8 noise-units across
- * the grid → 3-4 large feature periods visible. */
+/* How fast we move through "noise space" as we step from cell to cell.
+ * Smaller = larger, smoother cloud shapes spread across the screen. */
 #define NOISE_SCALE         0.04f
 
-/* Field drift in noise-coord units per second. */
+/* How far the whole field slides per second, so the clouds keep moving. */
 #define FIELD_DRIFT         0.10f
 
-/* Drift multiplier — cranked by +/-. */
+/* Drift can be sped up or slowed with +/-, doubling/halving between these. */
 #define DRIFT_MULT_MIN      1
 #define DRIFT_MULT_DEF      1
 #define DRIFT_MULT_MAX      32
 
-/* fBm stack: 4 octaves with halving amplitude / doubling frequency. */
+/* How many layers of noise we stack: each layer is finer and fainter than
+ * the last, which is what gives clouds both big shapes and small detail. */
 #define FBM_OCTAVES         4
 
-/* WISPS pattern: x-scale multiplier (smaller = longer horizontal
- * features). Y-scale stays at 1. */
+/* WISPS stretches the noise sideways so clouds become long streaks
+ * instead of round puffs (smaller number = longer streaks). */
 #define WISPS_X_SCALE       0.40f
 
-/* Density thresholds for the ASCII glyph ramp. */
+/* A cell brighter than HIGH gets the densest character, brighter than MID
+ * the medium one; dimmer cells get a faint dot or nothing. */
 #define GLYPH_HIGH_THRESH   0.65f
 #define GLYPH_MID_THRESH    0.30f
 
-/*
- * Palette quantisation — turn a continuous glow ∈ [0, 1] into a
- * discrete palette-band index ∈ {0..3}.
- *
- *   N_PALETTE_BANDS      — how many tiers the theme defines (must
- *                           match Theme.band[] array length).
- *   PALETTE_BAND_MASK    — cheap `& MASK` modulo (works because
- *                           N_PALETTE_BANDS is a power of two).
- *   GLOW_TO_BAND_GAIN    — glow * GAIN → 0..3 via integer truncation.
- *                           Set to N_PALETTE_BANDS − ε so that
- *                           glow == 1.0 still floors to band 3 instead
- *                           of overflowing to a non-existent band 4.
- */
+/* Each cell's brightness (0..1) is also sorted into one of four color
+ * shades. We multiply by "almost 4" and chop to a whole number: using
+ * exactly 4 would let a fully-bright cell (1.0) spill into a 5th shade
+ * that doesn't exist, so we stay a hair below 4. */
 #define N_PALETTE_BANDS     4
-#define PALETTE_BAND_MASK   3       /* N_PALETTE_BANDS - 1, MASK form */
-#define GLOW_TO_BAND_GAIN   3.999f  /* almost-4 to keep glow=1.0 → band 3 */
+#define PALETTE_BAND_MASK   3
+#define GLOW_TO_BAND_GAIN   3.999f
 
-/*
- * Simplex skew (F2) and unskew (G2) constants. Used in §5 to map
- * between Cartesian and triangular-lattice coordinates.
- *
- *   F2 = (√3 − 1) / 2  ≈ 0.366  — multiplied by (x + y) to shear the
- *                                  square grid into a simplex grid.
- *                                  Used inside simplex_locate.
- *   G2 = (3 − √3) / 6  ≈ 0.211  — the inverse shear. Used once in
- *                                  simplex_locate (to unskew the
- *                                  cell origin) and once per corner
- *                                  inside simplex_evaluate_corner
- *                                  (to unskew each corner's offset
- *                                  back to Cartesian space).
- *
- * Full precision matters: error in these constants propagates through
- * the floor() inside simplex_locate and can put a query point in the
- * wrong simplex cell, producing visible seam artefacts. Values from
- * Stefan Gustavson's reference implementation.
- *
- * SIMPLEX_OUTPUT_GAIN is the empirical scalar (Gustavson) that maps
- * the corner-sum into approximately [-1, 1].
- */
-#define SIMPLEX_F2            0.36602540378443864f /* skew  (sqrt(3) - 1) / 2 */
-#define SIMPLEX_G2            0.21132486540518713f /* unskew (3 - sqrt(3)) / 6 */
-#define SIMPLEX_OUTPUT_GAIN   70.0f                /* corner-sum scale → ~[-1,1] */
+/* Simplex noise lives on a grid of triangles, not squares. To get there
+ * we squash the normal x/y space a bit (F2) before snapping to a cell,
+ * then un-squash (G2) to measure where the point really sits. These exact
+ * numbers come from Gustavson's reference; rounding them causes a point to
+ * occasionally land in the wrong triangle, which shows up as visible seams.
+ * The final gain (70) just stretches the raw result back into about -1..1. */
+#define SIMPLEX_F2            0.36602540378443864f /* squash  = (sqrt(3) - 1) / 2 */
+#define SIMPLEX_G2            0.21132486540518713f /* unsquash = (3 - sqrt(3)) / 6 */
+#define SIMPLEX_OUTPUT_GAIN   70.0f
 
-/*
- * Simplex algorithm sizing constants.
- *
- *   N_SIMPLEX_CORNERS   — every 2-D simplex (triangle) has 3 vertices;
- *                          we sum one contribution per vertex.
- *   N_GRADIENT_DIRS     — grad2[] holds 12 directions (Perlin's
- *                          balanced 12-set: 4 diagonals + 4 axials
- *                          duplicated to round-out the lookup).
- *                          Used as the modulus when hashing into grad2.
- *   PERM_TABLE_SIZE     — Fisher-Yates table holds 256 unique values;
- *                          duplicated to 512 entries for wrap-free index.
- *   PERM_TABLE_INDEX_MASK — `i & MASK` is the cheap form of `i % SIZE`
- *                          (valid because SIZE is a power of two).
- */
+/* A 2-D simplex (triangle) has 3 corners; we have 12 fixed gradient
+ * directions to pick from, and a shuffled lookup table of 256 values
+ * (stored twice, 512 long, so an index that overshoots still lands safely).
+ * The "& 255" is just a fast way to keep an index inside 0..255. */
 #define N_SIMPLEX_CORNERS     3
 #define N_GRADIENT_DIRS       12
 #define PERM_TABLE_SIZE       256
-#define PERM_TABLE_INDEX_MASK 255   /* SIZE - 1; valid because SIZE = 2^8 */
+#define PERM_TABLE_INDEX_MASK 255
 
 /*
- * Pattern — thirty mappings of simplex noise, grouped into six
- * complexity tiers. Cycle with n/p. The enum order MUST match the
- * `noise_patterns[]` dispatch table in §6 (compiler enforces this
- * via the fixed-size [N_PATTERNS] array initialiser — a missing or
- * mis-ordered row is a compile error).
+ * The 30 "looks" you can flip through with n/p. They're grouped into six
+ * tiers, roughly simple to fancy: each tier is a different trick for turning
+ * the same noise into a different image, and the five patterns in a tier are
+ * variations on that one trick.
  *
- *   Tier 1 RAW        : CLOUDS, BILLOW, RIDGED, WISPS, CRESTS
- *   Tier 2 MAPPED     : CONTOURS, MARBLE, ZEBRA, RIPPLES, THRESHOLD
- *   Tier 3 TURBULENCE : TURBULENCE, STORM, INFERNO, VEINS, EMBERS
- *   Tier 4 WARPED     : WARP, WHIRL, DUNES, CURRENTS, FRACTAL
- *   Tier 5 COMPOSITE  : NEBULA, AURORA, PLASMA, LIGHTNING, GALAXY
- *   Tier 6 MASKED     : SOLAR, MOSAIC, VIGNETTE, COSMOS, SUPERNOVA
+ * The order here must line up with the noise_patterns[] table in §6 — the
+ * fixed-size array there means the compiler complains if they ever drift
+ * apart, so they can't silently get out of sync.
  */
 typedef enum {
-    /* Tier 1 — RAW: direct noise */
+    /* Tier 1 RAW — show the noise more or less straight */
     PATTERN_CLOUDS = 0,
     PATTERN_BILLOW,
     PATTERN_RIDGED,
     PATTERN_WISPS,
     PATTERN_CRESTS,
-    /* Tier 2 — MAPPED: sin/cos/pow transforms */
+    /* Tier 2 MAPPED — bend the noise into stripes, bands, marble */
     PATTERN_CONTOURS,
     PATTERN_MARBLE,
     PATTERN_ZEBRA,
     PATTERN_RIPPLES,
     PATTERN_THRESHOLD,
-    /* Tier 3 — TURBULENCE: Σ|octave| stacks */
+    /* Tier 3 TURBULENCE — folded noise for churning, fiery looks */
     PATTERN_TURBULENCE,
     PATTERN_STORM,
     PATTERN_INFERNO,
     PATTERN_VEINS,
     PATTERN_EMBERS,
-    /* Tier 4 — WARPED: domain warping */
+    /* Tier 4 WARPED — push the clouds around with more noise */
     PATTERN_WARP,
     PATTERN_WHIRL,
     PATTERN_DUNES,
     PATTERN_CURRENTS,
     PATTERN_FRACTAL,
-    /* Tier 5 — COMPOSITE: multi-field combine */
+    /* Tier 5 COMPOSITE — mix two or more fields together */
     PATTERN_NEBULA,
     PATTERN_AURORA,
     PATTERN_PLASMA,
     PATTERN_LIGHTNING,
     PATTERN_GALAXY,
-    /* Tier 6 — MASKED: noise × spatial mask */
+    /* Tier 6 MASKED — fade the clouds by where they are on screen */
     PATTERN_SOLAR,
     PATTERN_MOSAIC,
     PATTERN_VIGNETTE,
@@ -439,7 +180,7 @@ typedef enum {
     N_PATTERNS,
 } Pattern;
 
-/* pattern_name() / pattern_tier() defined in §6 alongside dispatch table. */
+/* Both defined in §6 next to the pattern table. */
 static const char *pattern_name(Pattern p);
 static const char *pattern_tier(Pattern p);
 
@@ -447,61 +188,32 @@ static const char *pattern_tier(Pattern p);
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/*
- * Frame-loop timing limits.
- *
- *   MAX_FRAME_DT_NS — cap the per-frame dt at 100 ms before feeding
- *                     it to the fixed-timestep accumulator. Without
- *                     this cap, a long stall (debugger, swap-storm,
- *                     SIGSTOP) would queue thousands of sim ticks
- *                     all firing at once when the process resumes
- *                     — the classic "spiral of death" failure mode
- *                     described in Glenn Fiedler's "Fix Your
- *                     Timestep!" article.
- *   RENDER_FPS_TARGET — render-throttle target. The sleep before
- *                     I/O paces the render loop at this rate even
- *                     when sim_fps is set higher.
- */
+/* If the program ever freezes for a moment (debugger, heavy load), we don't
+ * want it to "catch up" by running thousands of sim steps at once. Capping a
+ * single frame's elapsed time at 100 ms prevents that runaway. RENDER_FPS_TARGET
+ * is how often we actually redraw, even if the sim ticks faster. */
 #define MAX_FRAME_DT_NS    (100 * NS_PER_MS)
 #define RENDER_FPS_TARGET  60
 
 /*
- * Theme — a named 4-tier colour palette + accent for the simplex
- * cloud renderer.
+ * Theme — one named color scheme for the clouds (10 of them in themes[] below).
  *
- * INTENT
- *   Decouple the "what colours" choice from the "how to render"
- *   pipeline. The same GlowField + GlyphRamp drives 10 different
- *   visual moods just by swapping which 4 colour pairs ncurses is
- *   bound to (see theme_apply() in §3).
+ * The renderer never knows colors directly; it just asks for "shade 0..3" and a
+ * theme decides what those shades actually are. Switching themes with t/T simply
+ * re-points those four shades, so the same clouds take on a totally different mood.
  *
- * CONTEXT
- *   Indexed by PaletteState.current (§7); cycled via t / T. The
- *   four band entries map 1:1 onto GlowField.band quartile
- *   {0,1,2,3} — band 0 is the dimmest tier, band 3 the brightest.
- *   The renderer reads `themes[palette.current].band[idx]` once per
- *   theme change and rebuilds the ncurses colour pairs.
- *
- * MEMBER LOGIC
- *   name   : short uppercase label shown in HUD row 1. ≤7 chars so
- *            the "theme:%-8s" format string never overflows.
- *   band[] : xterm-256 colour-cube indices (see ANSI escape code
- *            § 8-bit). Per CLAUDE.md "Theme Palette Brightness",
- *            every entry MUST sit in the bright half of the cube
- *            (≥ 24 for the 6³ cube, ≥ 244 for the greyscale ramp).
- *            Bottom-of-palette colours go invisible against the
- *            default-black bg when rendered with A_DIM.
- *   flash  : 256-colour accent reserved for rare-event highlights.
- *            Unused in this file; kept for cross-file palette parity
- *            so a future event-flash feature (e.g. a "starburst on
- *            high-glow cell") drops in without theme rework.
- *
- * Ref: ANSI escape code § 8-bit (Wikipedia link in References block).
+ *   name   — short label shown in the HUD. Keep to 7 chars or fewer so the
+ *            "theme:%-8s" slot doesn't overflow.
+ *   band[] — the four cloud colors, dimmest first, brightest last. These are
+ *            xterm 256-color numbers. Keep every one in the bright half of the
+ *            palette: dark colors vanish against the black terminal background.
+ *   flash  — a spare accent color. Not used here; kept so the layout matches the
+ *            sister files and a future "flash on bright cells" feature can drop in.
  */
 typedef struct {
-    const char *name;        /* HUD label, ≤7 chars                         */
-    short       band[4];     /* xterm-256 idx, one per GlowField.band tier  */
-    short       flash;       /* xterm-256 accent (reserved, unused here)    */
+    const char *name;        /* HUD label, 7 chars or fewer               */
+    short       band[4];     /* the four cloud colors, dim to bright       */
+    short       flash;       /* spare accent, unused here                  */
 } Theme;
 
 #define N_THEMES 10
@@ -578,60 +290,36 @@ static void color_init(void)
 }
 
 /* ===================================================================== */
-/* §5  noise — SimplexNoise primitive + fBm stacks                        */
+/* §5  noise — simplex noise plus the layered-noise (fBm) stacks          */
 /* ===================================================================== */
 
 /*
- * SimplexNoise — the noise primitive's runtime state.
+ * SimplexNoise — the only thing the noise needs to remember between calls:
+ * a shuffled lookup table. Everything else (the 12 directions, the squash
+ * constants) is fixed math, so it lives as file-scope constants, not here.
  *
- * INTENT
- *   Encapsulate the ONE piece of mutable state simplex noise needs
- *   — its randomised permutation table — so the algorithm can be
- *   passed as `const SimplexNoise *` and its purity is type-checked.
- *   Everything else simplex needs (the 12 gradient directions,
- *   the skew constants F2/G2) is a compile-time mathematical fact
- *   and lives as file-scope const.
+ * Pattern functions take this as a const pointer — they read the noise but
+ * never change it. The only time it changes is when the user presses 'r',
+ * which reshuffles the table for a fresh-looking field.
  *
- * CONTEXT
- *   Lives on Scene (§7). Pattern functions in §6 receive a
- *   const-pointer so the dataflow at every call site reads
- *   "sample noise, don't mutate it". Reshuffling only happens via
- *   simplex_reshuffle() on user reset (r key).
+ *   perm[512] — a random shuffle of the numbers 0..255, then the same 256
+ *               values copied a second time. Why store it twice? When we look
+ *               up a gradient we add two table values together, and the sum can
+ *               run past 255; the doubled length means that overshoot still
+ *               lands on a valid slot, so we skip any wrap-around bookkeeping.
+ *               uint8_t fits 0..255 exactly — 512 bytes total.
  *
- * MEMBER LOGIC — perm[512]
- *   • Holds a Fisher-Yates permutation of 0..255 in [0..255], with
- *     the same values DUPLICATED into [256..511]. The double-length
- *     form lets us index `perm[hash_i + perm[hash_j]]` directly
- *     (the outer index can reach up to 255 + 255 = 510) without
- *     wrap-around bookkeeping. The mask in simplex_evaluate_corner
- *     keeps hash_i / hash_j in [0, 255] on the inner reads, so the
- *     doubling is only strictly needed for the OUTER read — but it
- *     simplifies the call site by making both reads bounds-safe.
- *     simplex_sample makes 6 perm reads per call (3 corner hashes
- *     × 2 reads each), so any saved bookkeeping there matters.
- *   • uint8_t: each entry holds 0..255 exactly; no headroom wasted.
- *     512 bytes total, fits in 8 cache lines.
- *   • Reshuffled at every reset so different runs (and different
- *     r-presses) produce visibly different noise fields.
- *
- * Refs: Perlin 2001 (the simplex paper), Gustavson §"Permutation
- *       array" (the doubled-perm trick comes from his canonical
- *       reference implementation).
+ * The doubled-table trick is from Gustavson's reference implementation.
  */
 typedef struct {
-    uint8_t perm[512];  /* Fisher-Yates'd 0..255 doubled into [256..511]    */
+    uint8_t perm[512];
 } SimplexNoise;
 
 /*
- * grad2[][2] — 12 gradient directions for 2-D simplex noise. The
- * standard set: edges of a regular icosahedron projected to 2-D,
- * with two of the axial directions duplicated to bring the count to
- * 12 (a power-of-12-friendly lookup via `% 12`). The 12-set is
- * balanced (sum-to-zero) and matches Perlin/Gustavson references.
- *
- * Stays file-scope const — it's mathematical, not state. Shared by
- * every SimplexNoise instance (we only ever have one, but conceptually
- * the const-ness is what matters).
+ * The 12 directions a corner's gradient can point. These are the standard
+ * balanced set used by Perlin/Gustavson (the duplicates pad the count to 12
+ * so the lookup divides evenly). It's pure math, shared by all noise, so it's
+ * a file-scope constant rather than per-instance state.
  */
 static const int8_t grad2[N_GRADIENT_DIRS][2] = {
     {  1,  1 }, { -1,  1 }, {  1, -1 }, { -1, -1 },
@@ -639,19 +327,13 @@ static const int8_t grad2[N_GRADIENT_DIRS][2] = {
     {  0,  1 }, {  0, -1 }, {  0,  1 }, {  0, -1 },
 };
 
-/*
- * simplex_reshuffle — Fisher-Yates the 0..N-1 sequence using rand,
- * then duplicate it into perm[N..2N-1] so callers can index with
- * `perm[i + offset]` without wrap-around bookkeeping. Called at each
- * reset (r key) so different runs produce different noise fields.
- */
+/* Build a fresh random shuffle of the lookup table. Run on 'r' so each
+ * reset gives a different-looking cloud field. (Shuffle method: Fisher-Yates.) */
 static void simplex_reshuffle(SimplexNoise *sn)
 {
-    /* STEP 1 — identity sequence 0..N-1 */
     uint8_t base[PERM_TABLE_SIZE];
     for (int i = 0; i < PERM_TABLE_SIZE; i++) base[i] = (uint8_t)i;
 
-    /* STEP 2 — Fisher-Yates: swap each element with a random earlier slot */
     for (int i = PERM_TABLE_SIZE - 1; i > 0; i--) {
         int     j         = rand() % (i + 1);
         uint8_t swap_tmp  = base[i];
@@ -659,135 +341,69 @@ static void simplex_reshuffle(SimplexNoise *sn)
         base[j]           = swap_tmp;
     }
 
-    /* STEP 3 — duplicate into the second half so perm[i + k] with
-     * k ∈ {0, 1, i1, j1} never crosses the table end without wrap */
+    /* Store the shuffle twice back-to-back; see the perm[] note above. */
     for (int i = 0; i < PERM_TABLE_SIZE; i++) {
         sn->perm[i]                    = base[i];
         sn->perm[i + PERM_TABLE_SIZE]  = base[i];
     }
 }
 
-/* ───── simplex_sample — types and helpers ───────────────────────────── *
+/* ───── how one simplex noise value gets computed ────────────────────── *
  *
- * The 2-D simplex algorithm decomposes naturally into 4 named stages.
- * Each stage gets a dedicated helper below; simplex_sample itself is
- * then 4 lines of real work — a pseudocode driver.
- *
- *   STAGE 1  LOCATE   — skew + unskew to find which simplex cell
- *                        contains the query and the query's offset
- *                        within it.                  → simplex_locate
- *
- *   STAGE 2  PICK     — choose which of the cell's 2 triangles holds
- *                        the query and enumerate its 3 corners as
- *                        data.                → simplex_pick_corners
- *
- *   STAGE 3  EVALUATE — per corner: displacement → gradient hash →
- *                        radial-falloff × dot product.
- *                                          → simplex_evaluate_corner
- *
- *   STAGE 4  SUM + SCALE — accumulate the 3 contributions and rescale
- *                           to roughly [-1, 1].
- *                                            → simplex_sample (body)
- *
- * Two small inline helpers (simplex_hash_gradient_at and
- * simplex_corner_contribution) break out the SMALLEST reusable
- * pieces: a perm-table lookup, and the kernel that turns
- * (gradient, displacement) into a scalar contribution.
+ * To get the noise at a point, we do four steps, one helper each:
+ *   1. LOCATE   — figure out which triangle the point falls in, and where
+ *                 inside it the point sits.            (simplex_locate)
+ *   2. PICK     — a square holds two triangles; choose the right one and
+ *                 list its 3 corners.            (simplex_pick_corners)
+ *   3. EVALUATE — for each corner, measure how much it pulls on the point.
+ *                                            (simplex_evaluate_corner)
+ *   4. ADD UP   — sum the 3 corner pulls and scale to about -1..1.
+ *                                                    (simplex_sample)
+ * Two tiny helpers handle the smallest reused bits: looking up a corner's
+ * gradient direction, and the per-corner pull formula.
  */
 
 /*
- * SimplexCornerOffset — one of the 3 vertices of a 2-D simplex unit
- * cell, expressed as an integer (di, dj) offset in the SKEWED lattice
- * from the cell's first corner.
+ * SimplexCornerOffset — which corner of the cell we mean, as a (0/1, 0/1)
+ * step from the cell's first corner.
  *
- * INTENT
- *   Turn "the 3 corners of a triangle" into data so simplex_sample's
- *   inner work can be a single for-loop over an array. Without this
- *   type the 3-fold symmetry has to be expressed as 3 unrolled blocks
- *   of identical math — which obscures the algorithm.
+ * Making the three corners into a little array lets the main routine loop
+ * over them instead of spelling out the same math three times.
  *
- * VALUES
- *   Corner 0 ≡ (0, 0)                   — cell origin (always).
- *   Corner 1 ≡ (1, 0)   LOWER triangle  (query right of y=x diagonal),
- *             (0, 1)   UPPER triangle  (query above the diagonal).
- *   Corner 2 ≡ (1, 1)                   — opposite vertex (always).
+ *   Corner 0 is always (0, 0) — the cell's origin.
+ *   Corner 1 is (1, 0) or (0, 1) depending on which of the cell's two
+ *            triangles the point landed in.
+ *   Corner 2 is always (1, 1) — the far corner.
  *
- * MEMORY / COST
- *   2 ints × 3 corners = 24 bytes per call, lives in registers; the
- *   3-iteration loop is inlined/unrolled at -O2 so this abstraction
- *   costs literally zero at runtime versus the hand-unrolled form.
- *
- * MEMBER LOGIC
- *   di : column offset in skewed lattice space, ∈ {0, 1}. Added to
- *        cell_i for both perm-table lookups and Cartesian-displacement
- *        recovery (see simplex_evaluate_corner).
- *   dj : row offset, same role on the other axis, ∈ {0, 1}.
- *
- * Ref: Gustavson §"Setting up the simplex grid" — the diagonal split
- *      and corner numbering used here come from that walkthrough.
+ *   di, dj — the step along each axis, each 0 or 1.
  */
 typedef struct {
-    int di;   /* skewed-x offset within the cell, ∈ {0, 1} */
-    int dj;   /* skewed-y offset within the cell, ∈ {0, 1} */
+    int di;
+    int dj;
 } SimplexCornerOffset;
 
 /*
- * SimplexQuery — what simplex_locate computes: enough information for
- * every later stage to derive a specific corner's displacement and
- * to seed the perm-table hash.
+ * SimplexQuery — the result of step 1: everything later steps need to know
+ * about where the point landed. Bundling it means the other helpers take one
+ * pointer instead of four loose numbers.
  *
- * INTENT
- *   Bundle STAGE-1's result (skewed cell index + Cartesian offset
- *   from cell origin) so simplex_pick_corners and
- *   simplex_evaluate_corner each take ONE `const SimplexQuery *`
- *   parameter instead of 4 loose floats / ints.
- *
- * CONTEXT
- *   Produced by simplex_locate(x, y). Consumed by:
- *     • simplex_pick_corners — reads corner0_dx/dy to decide which
- *       of the cell's two triangles contains the query.
- *     • simplex_evaluate_corner — reads everything: cell_i/j seed
- *       the perm hash, corner0_dx/dy is the base of every corner's
- *       Cartesian displacement.
- *
- * MEMBER LOGIC
- *   cell_i,         — Integer cell index in the SKEWED lattice
- *   cell_j            (after STAGE 1's skew + floor). Identifies
- *                     which unit triangle PAIR contains the query.
- *                     Used (unmasked) as input to the perm-table
- *                     hash; the mask is applied per-corner inside
- *                     simplex_evaluate_corner.
- *
- *   corner0_dx,     — Query's Cartesian displacement from the cell's
- *   corner0_dy        FIRST corner (after STAGE 1's unskew). Two
- *                     roles:
- *                       (a) base for every corner's displacement:
- *                            corner_k_disp = corner0_d − (di, dj)
- *                                            + (di + dj)·G2·(1, 1).
- *                       (b) triangle-pick test: query is in the
- *                            lower triangle iff
- *                            corner0_dx > corner0_dy (right of the
- *                            cell's y = x diagonal).
+ *   cell_i, cell_j        — which cell of the (squashed) triangle grid the
+ *                           point is in. Also seeds the gradient lookup.
+ *   corner0_dx, corner0_dy — how far the point sits from the cell's first
+ *                            corner, measured in normal x/y space. Used both
+ *                            to pick the triangle (point is in the lower one
+ *                            when dx > dy) and as the starting offset for
+ *                            every corner's pull.
  */
 typedef struct {
-    int   cell_i, cell_j;          /* integer cell index, skewed lattice  */
-    float corner0_dx, corner0_dy;  /* query's Cartesian offset from origin*/
+    int   cell_i, cell_j;
+    float corner0_dx, corner0_dy;
 } SimplexQuery;
 
-/*
- * simplex_hash_gradient_at — turn a pair of integer lattice coords
- * (already masked into the perm table's range) into a gradient-
- * direction index ∈ [0, N_GRADIENT_DIRS).
- *
- * The two-level perm[corner_hash_i + perm[corner_hash_j]] is what
- * gives Perlin-family noise its pseudo-random-but-repeatable
- * property: the same (i, j) yields the same gradient every time,
- * but the mapping looks random to a sampler walking nearby cells.
- *
- * The perm table is doubled-length (2 × PERM_TABLE_SIZE entries) so
- * the sum `corner_hash_i + perm[corner_hash_j]` (up to 510) lands
- * on a valid slot without wrap-around bookkeeping.
- */
+/* Pick a gradient direction for a corner. The double table lookup
+ * (look up one number, use it to look up another) gives noise its
+ * "random but repeatable" feel: the same corner always gets the same
+ * direction, but neighbours look unrelated. */
 static inline int simplex_hash_gradient_at(const SimplexNoise *sn,
                                            int corner_hash_i,
                                            int corner_hash_j)
@@ -796,63 +412,32 @@ static inline int simplex_hash_gradient_at(const SimplexNoise *sn,
     return sn->perm[corner_hash_i + row_offset] % N_GRADIENT_DIRS;
 }
 
-/*
- * simplex_corner_contribution — the per-corner kernel. Computes:
- *
- *     (0.5 − r²)⁴ · (gradient · displacement)
- *
- *   where r² = dx² + dy² and the gradient is one of N_GRADIENT_DIRS
- *   fixed directions in grad2[]. Returns 0 outside the corner's
- *   support disk (where r² ≥ 0.5).
- *
- * The (0.5 − r²)⁴ "radial falloff" smoothly tapers each corner's
- * influence to zero at the disk boundary; the power-of-four exponent
- * makes the noise function AND its first derivative continuous
- * across simplex boundaries (C¹ continuity).
- *
- * Ref: Gustavson §"The contribution from each corner".
- */
+/* How hard one corner pulls on the point. A corner's influence fades
+ * smoothly to zero as the point moves away, and is exactly zero once the
+ * point is too far. Within range, the pull also depends on whether the
+ * corner's gradient direction points toward or away from the point. */
 static inline float simplex_corner_contribution(int gradient_idx,
                                                 float dx, float dy)
 {
     float radial_falloff = 0.5f - dx * dx - dy * dy;
-    if (radial_falloff <= 0.0f) return 0.0f;
-    radial_falloff *= radial_falloff;       /*  (0.5 − r²)²  */
-    radial_falloff *= radial_falloff;       /*  (0.5 − r²)⁴  */
+    if (radial_falloff <= 0.0f) return 0.0f;   /* too far away to matter */
+    radial_falloff *= radial_falloff;
+    radial_falloff *= radial_falloff;          /* raise to the 4th power */
     float gradient_dot_displacement =
         (float)grad2[gradient_idx][0] * dx +
         (float)grad2[gradient_idx][1] * dy;
     return radial_falloff * gradient_dot_displacement;
 }
 
-/*
- * simplex_locate — STAGE 1: find the simplex cell containing the
- * query (xin, yin) and the query's Cartesian offset within it.
- *
- *   SKEW   — shear input space by F2 along (1, 1) so each unit
- *            Cartesian square becomes a unit-edge triangle pair.
- *            FLOOR identifies the integer simplex cell.
- *   UNSKEW — shear back by G2 to recover the cell's first corner
- *            in Cartesian space. The query's displacement from that
- *            corner is what every later stage needs.
- *
- *     F2 = (√3 − 1) / 2  ≈ 0.366
- *     G2 = (3 − √3) / 6  ≈ 0.211
- *
- * Full precision in SIMPLEX_F2 / SIMPLEX_G2 matters (see §1) to
- * avoid edge-cell artefacts where a query straddles the floor()
- * boundary.
- *
- * Ref: Gustavson §"Skewing".
- */
+/* Step 1: find which triangle cell the point is in and where inside it.
+ * We squash x/y so triangles become easy to snap to, round down to get the
+ * cell, then un-squash to measure the point's offset from the cell corner. */
 static inline SimplexQuery simplex_locate(float xin, float yin)
 {
-    /* SKEW + floor → integer simplex cell. */
     float skew_offset = (xin + yin) * SIMPLEX_F2;
     int   cell_i      = (int)floorf(xin + skew_offset);
     int   cell_j      = (int)floorf(yin + skew_offset);
 
-    /* UNSKEW the cell origin → query's offset in Cartesian. */
     float unskew_offset = (float)(cell_i + cell_j) * SIMPLEX_G2;
     SimplexQuery q;
     q.cell_i     = cell_i;
@@ -862,62 +447,24 @@ static inline SimplexQuery simplex_locate(float xin, float yin)
     return q;
 }
 
-/*
- * simplex_pick_corners — STAGE 2: choose which of the cell's two
- * triangles holds the query, then enumerate its 3 corners as data.
- *
- * The y = x diagonal of the skewed cell splits each unit Cartesian
- * square into TWO simplices:
- *
- *   • LOWER (corner 1 = (1, 0)) — query is RIGHT of the diagonal,
- *                                  i.e. corner0_dx > corner0_dy.
- *   • UPPER (corner 1 = (0, 1)) — query is ABOVE the diagonal,
- *                                  i.e. corner0_dx ≤ corner0_dy.
- *
- * Corners 0 and 2 are always (0, 0) and (1, 1); only the middle
- * one (corner 1) depends on the triangle choice.
- *
- * Writes the 3 corners into out[N_SIMPLEX_CORNERS]; the caller
- * iterates over them in simplex_sample's loop.
- */
+/* Step 2: a square cell is split into two triangles by its diagonal. The
+ * point is in the lower one if it's to the right of the diagonal (dx > dy),
+ * the upper one otherwise. Only the middle corner differs between the two;
+ * the first and last corners are always the same. */
 static inline void simplex_pick_corners(float corner0_dx, float corner0_dy,
                                         SimplexCornerOffset out[N_SIMPLEX_CORNERS])
 {
     bool is_lower_triangle = (corner0_dx > corner0_dy);
-    out[0] = (SimplexCornerOffset){ 0, 0 };           /* cell origin     */
+    out[0] = (SimplexCornerOffset){ 0, 0 };
     out[1] = is_lower_triangle
-           ? (SimplexCornerOffset){ 1, 0 }            /* LOWER  △        */
-           : (SimplexCornerOffset){ 0, 1 };           /* UPPER  △        */
-    out[2] = (SimplexCornerOffset){ 1, 1 };           /* opposite vertex */
+           ? (SimplexCornerOffset){ 1, 0 }
+           : (SimplexCornerOffset){ 0, 1 };
+    out[2] = (SimplexCornerOffset){ 1, 1 };
 }
 
-/*
- * simplex_evaluate_corner — STAGE 3: one corner's contribution to
- * the noise sum. Combines three sub-operations under a single name:
- *
- *   (a) CARTESIAN DISPLACEMENT from the query to this corner.
- *       The corner sits at skewed offset (di, dj) from the cell
- *       origin; in Cartesian space that maps to
- *
- *           (dx, dy) = (corner0_dx, corner0_dy)
- *                      − (di, dj)
- *                      + (di + dj) · G2 · (1, 1)
- *
- *       The (di + dj)·G2 term UNSKEWS the corner's offset back into
- *       the Cartesian frame where r² = dx² + dy² makes geometric
- *       sense for the contribution kernel.
- *
- *   (b) GRADIENT HASH via the perm table, seeded by (cell + (di, dj)).
- *       Both axes masked into the table's range with
- *       PERM_TABLE_INDEX_MASK (cheap `& 255`).
- *
- *   (c) CONTRIBUTION KERNEL — (0.5 − r²)⁴ × (grad · disp) — via
- *       simplex_corner_contribution above.
- *
- * Inlined at the call site at -O2 so per-corner cost is identical
- * to the original hand-unrolled body, but the call NAMES what the
- * arithmetic adds up to.
- */
+/* Step 3: one corner's contribution. Work out how far the point is from
+ * this corner (in normal x/y space), look up the corner's gradient
+ * direction, and feed both into the pull formula above. */
 static inline float simplex_evaluate_corner(const SimplexNoise *sn,
                                             const SimplexQuery *q,
                                             SimplexCornerOffset corner)
@@ -933,54 +480,27 @@ static inline float simplex_evaluate_corner(const SimplexNoise *sn,
     return simplex_corner_contribution(gradient_idx, dx, dy);
 }
 
-/*
- * simplex_sample — 2-D simplex noise. Returns roughly [-1, 1].
- *
- * Pseudocode:
- *
- *   q       = LOCATE(x, y)                       // skew + unskew
- *   corners = PICK_CORNERS(q.corner0_offset)     // 3-vertex triangle
- *   sum     = Σ  EVALUATE_CORNER(noise, q, c)    // 3 corners
- *   return    SCALE · sum
- *
- * Follows Stefan Gustavson, "Simplex Noise Demystified" — the
- * canonical reference implementation. Pure function of (sn, x, y).
- */
+/* One 2-D simplex noise value, roughly in -1..1. Just runs the four steps:
+ * find the triangle, pick its corners, add up their pulls, scale the result.
+ * Follows Gustavson's "Simplex Noise Demystified". */
 static float simplex_sample(const SimplexNoise *sn, float xin, float yin)
 {
-    /* STAGE 1 — LOCATE cell + query's offset within it. */
     SimplexQuery q = simplex_locate(xin, yin);
 
-    /* STAGE 2 — PICK simplex (lower/upper triangle) + ENUMERATE
-     *           its 3 corners as data. */
     SimplexCornerOffset corners[N_SIMPLEX_CORNERS];
     simplex_pick_corners(q.corner0_dx, q.corner0_dy, corners);
 
-    /* STAGE 3 — SUM the 3 corners' contributions. Each call does:
-     *           displacement → gradient hash → falloff · dot product. */
     float corner_sum = 0.0f;
     for (int k = 0; k < N_SIMPLEX_CORNERS; k++)
         corner_sum += simplex_evaluate_corner(sn, &q, corners[k]);
 
-    /* STAGE 4 — SCALE the sum into the conventional [-1, 1] range.
-     * SIMPLEX_OUTPUT_GAIN = 70.0f is Gustavson's empirical fit: with
-     * random gradients and the (0.5 − r²)⁴ kernel, the raw sum has
-     * standard deviation ~0.014, so ~70× maps typical values into
-     * the unit band. */
     return SIMPLEX_OUTPUT_GAIN * corner_sum;
 }
 
-/*
- * simplex_fbm — fractional Brownian motion stack of simplex_sample.
- * Sums FBM_OCTAVES bands of doubling frequency / halving amplitude.
- * Output is normalised by the running amplitude sum so it stays in
- * roughly [−1, 1].
- *
- *   fBm(x) = Σᵢ aᵢ · simplex(2ⁱx)        where aᵢ = 1/2ⁱ
- *
- * This is the "multi-scale terrain" or "natural turbulence" stack
- * Perlin first published in his 1985 paper.
- */
+/* Stack several copies of the noise, each half as strong and twice as fine
+ * as the last, and average them. This is what makes clouds look natural:
+ * big rolling shapes with smaller wisps layered on top. (The technique is
+ * called fBm; Perlin introduced it in 1985.) */
 static float simplex_fbm(const SimplexNoise *sn, float x, float y)
 {
     float total   = 0.0f;
@@ -996,15 +516,10 @@ static float simplex_fbm(const SimplexNoise *sn, float x, float y)
     return total / max_amp;
 }
 
-/*
- * simplex_fbm_abs — fBm of |simplex_sample|. Always ≥ 0 because of
- * the absolute value. This is Perlin's "turbulence" function from
- * his marble-rendering paper — the |·| introduces folds at every
- * zero crossing of the underlying noise, producing sharper-edged
- * textures than plain fBm.
- *
- *   turbulence(x) = Σᵢ aᵢ · |simplex(2ⁱx)|
- */
+/* Same stack as simplex_fbm, but folding each layer's negative values up to
+ * positive first. That fold creates sharp creases wherever the noise crosses
+ * zero, giving a rougher, more billowing "storm cloud" texture. (Perlin
+ * called this turbulence; it's the basis of his marble look.) */
 static float simplex_fbm_abs(const SimplexNoise *sn, float x, float y)
 {
     float total   = 0.0f;
@@ -1021,24 +536,19 @@ static float simplex_fbm_abs(const SimplexNoise *sn, float x, float y)
 }
 
 /* ===================================================================== */
-/* §6  patterns — 30 noise mappings in 6 tiers + dispatch table           */
+/* §6  patterns — the 30 "looks", in 6 tiers, plus the lookup table       */
 /* ===================================================================== */
 
 /*
- * Signature: all pattern functions take (sn, fx, fy, t, nx, ny) where
- *   sn      = const SimplexNoise* — the noise primitive's perm table.
- *             Threaded through every pattern so the dataflow is
- *             explicit: a pattern *samples* noise, never mutates it.
- *   fx, fy  = noise-space coords (cell × NOISE_SCALE)
- *   t       = pattern.field_time (drift accumulator)
- *   nx, ny  = screen-space coords normalised to [-1, 1] with (0, 0)
- *             at grid center — only used by radial / vertical-mask
- *             patterns (galaxy, solar, aurora, vignette, supernova,
- *             inferno). Other patterns mark (nx, ny) unused with
- *             (void) casts.
- *
- * Return value is glow ∈ [0, 1]; clamped by the caller anyway, but
- * keep it well-behaved here for HUD legibility.
+ * Every pattern function has the same shape: (sn, fx, fy, t, nx, ny).
+ *   sn      — the noise to sample (read-only).
+ *   fx, fy  — where to sample in noise space (the cell position scaled down).
+ *   t       — the drift amount, so the field keeps moving over time.
+ *   nx, ny  — the cell's position on screen as -1..1 with the centre at (0,0).
+ *             Only the patterns that care about "where on screen" (galaxy,
+ *             solar, aurora, vignette, supernova, inferno) use these; the
+ *             rest cast them to (void) to say "ignored".
+ * Each returns a brightness from 0 (dark) to 1 (bright).
  */
 
 static inline float clampf(float v, float lo, float hi)
@@ -1052,11 +562,11 @@ static inline float smoothstepf(float e0, float e1, float x)
     return t * t * (3.0f - 2.0f * t);
 }
 
-/* ---------- Tier 1 — RAW: direct noise -------------------------------- */
+/* ---------- Tier 1  RAW — the noise shown nearly straight ------------- */
 
 /*
- * CLOUDS — plain fBm mapped to [0, 1]. Soft cumulus look; the baseline
- * against which every other pattern varies.
+ * CLOUDS — the plain layered noise, shifted into 0..1. Soft puffy clouds;
+ * the starting point every other pattern builds on.
  */
 static float pattern_clouds(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1066,8 +576,8 @@ static float pattern_clouds(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * BILLOW — |fbm|. Negatives flip up so peaks form at every zero
- * crossing — bumpy puffs with dark valleys between them.
+ * BILLOW — fold the dark (negative) parts up to bright. Bumpy puffs with
+ * dark creases between them.
  */
 static float pattern_billow(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1077,9 +587,8 @@ static float pattern_billow(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * RIDGED — 1 − |fbm|. Inverse of BILLOW: peaks at noise zeros, valleys
- * at extremes. Looks like sharp cirrus ridges — Musgrave's classic
- * "ridged multifractal", here over simplex instead of Perlin.
+ * RIDGED — BILLOW flipped upside down: bright thin ridges with dark valleys.
+ * Looks like wispy cirrus cloud. (Known as ridged multifractal, from Musgrave.)
  */
 static float pattern_ridged(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1089,10 +598,8 @@ static float pattern_ridged(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * WISPS — anisotropic stretch. Sample at a smaller x-scale so
- * horizontal features last longer in screen space — cloud streaks
- * instead of round puffs. Drift accelerated ×1.5 so they appear to
- * fly past.
+ * WISPS — stretch the clouds sideways so they read as long streaks rather
+ * than round puffs, and drift a bit faster so they seem to fly past.
  */
 static float pattern_wisps(const SimplexNoise *sn, float x, float y, float t,
                            float nx, float ny)
@@ -1102,9 +609,8 @@ static float pattern_wisps(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * CRESTS — (1 − |fbm|)⁴. RIDGED raised to a high power makes the
- * peaks razor-sharp and the valleys almost-black, like windblown
- * snow crests under low sun.
+ * CRESTS — RIDGED pushed harder (raised to a power) so the ridges turn
+ * razor-thin and the gaps go nearly black, like windblown snow crests.
  */
 static float pattern_crests(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1115,12 +621,11 @@ static float pattern_crests(const SimplexNoise *sn, float x, float y, float t,
     return clampf(r, 0.0f, 1.0f);
 }
 
-/* ---------- Tier 2 — MAPPED: sin/cos/pow transforms ------------------- */
+/* ---------- Tier 2  MAPPED — bent into stripes, bands, marble --------- */
 
 /*
- * CONTOURS — fractional part of fbm · 8. Treats the noise as a height
- * map and "rolls over" every 1/8th of an isoline, producing nested
- * contour bands that follow the underlying smooth field.
+ * CONTOURS — treat the noise as terrain height and draw repeating
+ * "elevation lines", like the rings on a topographic map.
  */
 static float pattern_contours(const SimplexNoise *sn, float x, float y, float t,
                               float nx, float ny)
@@ -1131,8 +636,8 @@ static float pattern_contours(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * MARBLE — sin(x · k + fbm · K). Pure sin gives perfect stripes; the
- * fbm term wobbles the stripe phase so they bend like marble veining.
+ * MARBLE — start with clean vertical stripes, then let the noise nudge them
+ * sideways so they bend and swirl like the veins in polished marble.
  */
 static float pattern_marble(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1143,9 +648,8 @@ static float pattern_marble(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * ZEBRA — sign(sin(fbm · 12)) mapped to high/low. Hard binary stripes
- * that twist along the noise field's flow direction. Either bright
- * or dark — nothing in between.
+ * ZEBRA — like MARBLE but with no in-between: every cell is forced to
+ * either bright or dark, giving hard stripes that twist with the noise.
  */
 static float pattern_zebra(const SimplexNoise *sn, float x, float y, float t,
                            float nx, float ny)
@@ -1156,9 +660,8 @@ static float pattern_zebra(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * RIPPLES — sin(fbm · 16) · ½ + ½. Many tightly-packed concentric
- * sinusoidal bands; reads like raindrops on a still pond viewed from
- * above. CONTOURS but smooth instead of sawtooth.
+ * RIPPLES — many tightly-packed smooth rings, like raindrops spreading on a
+ * pond. Same idea as CONTOURS but with soft bands instead of sharp lines.
  */
 static float pattern_ripples(const SimplexNoise *sn, float x, float y, float t,
                              float nx, float ny)
@@ -1168,9 +671,8 @@ static float pattern_ripples(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * THRESHOLD — smoothstep at ~0.5 of (fbm + 1)/2. Binary cloud cover
- * with anti-aliased edges. The thin "smoothstep range" produces sharp
- * island shapes that morph as the field drifts.
+ * THRESHOLD — cut the clouds into solid "islands": anything above a brightness
+ * cutoff is on, below is off, with a soft edge. The islands morph as it drifts.
  */
 static float pattern_threshold(const SimplexNoise *sn, float x, float y, float t,
                                float nx, float ny)
@@ -1180,12 +682,11 @@ static float pattern_threshold(const SimplexNoise *sn, float x, float y, float t
     return smoothstepf(0.45f, 0.55f, v);
 }
 
-/* ---------- Tier 3 — TURBULENCE: Σ|octave| stacks --------------------- */
+/* ---------- Tier 3  TURBULENCE — folded noise, churning looks --------- */
 
 /*
- * TURBULENCE — Perlin's classic Σ aᵢ·|simplex(2ⁱx)|. Always ≥ 0; the
- * |·| introduces folds at every zero crossing producing the sharp-
- * edged "storm cloud" appearance.
+ * TURBULENCE — the folded noise stack shown straight: the creases give it a
+ * churning, sharp-edged "storm cloud" look.
  */
 static float pattern_turbulence(const SimplexNoise *sn, float x, float y, float t,
                                 float nx, float ny)
@@ -1195,9 +696,8 @@ static float pattern_turbulence(const SimplexNoise *sn, float x, float y, float 
 }
 
 /*
- * STORM — turbulence², gain 1.5. The squaring pushes mid-values down
- * and highlights peaks — produces darker, more violently-contrasted
- * storm cells.
+ * STORM — turbulence with the contrast cranked up: mid-tones drop away and
+ * the bright cores pop, for a darker, more violent storm.
  */
 static float pattern_storm(const SimplexNoise *sn, float x, float y, float t,
                            float nx, float ny)
@@ -1208,23 +708,21 @@ static float pattern_storm(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * INFERNO — turbulence × vertical mask (brighter near bottom). Uses
- * ny ∈ [-1, 1] from the caller. Drift accelerated ×2 so flames flick
- * upward visibly. Reads as rising heat / fire.
+ * INFERNO — turbulence that's brightest near the bottom of the screen and
+ * drifts upward fast, so it reads as rising flames and heat.
  */
 static float pattern_inferno(const SimplexNoise *sn, float x, float y, float t,
                              float nx, float ny)
 {
     (void)nx;
     float turb = simplex_fbm_abs(sn, x, y + t * 2.0f);
-    float rise = (1.0f - ny) * 0.5f + 0.25f; /* bright at bottom (ny→1) */
+    float rise = (1.0f - ny) * 0.5f + 0.25f; /* brighter toward the bottom */
     return clampf(turb * rise * 1.3f, 0.0f, 1.0f);
 }
 
 /*
- * VEINS — 1 − √turbulence. The square root crushes high turbulence
- * values toward 1; subtracting from 1 turns them into thin dark
- * lines on a bright background — like leaf veins or river deltas.
+ * VEINS — flip turbulence so its creases become thin dark lines on a bright
+ * field — like the veins of a leaf or branching rivers.
  */
 static float pattern_veins(const SimplexNoise *sn, float x, float y, float t,
                            float nx, float ny)
@@ -1235,9 +733,8 @@ static float pattern_veins(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * EMBERS — turbulence with a soft threshold at 0.55. Below the
- * threshold the value is dimmed (×0.4); above, it's amplified (×3).
- * Sparse bright "embers" glow over a dark field.
+ * EMBERS — dim almost everything down, but let the brightest bits flare up,
+ * so a few glowing embers stand out over a dark field.
  */
 static float pattern_embers(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1248,13 +745,12 @@ static float pattern_embers(const SimplexNoise *sn, float x, float y, float t,
     return v * 0.4f;
 }
 
-/* ---------- Tier 4 — WARPED: domain warping --------------------------- */
+/* ---------- Tier 4  WARPED — push the lookup around with noise -------- */
 
 /*
- * WARP — IQ-style domain warp: sample fbm at coords themselves
- * perturbed by single-octave noise. The "currents-pushing-clouds-
- * around" look; the field gains apparent advection without any time
- * integration.
+ * WARP — domain warping: instead of asking "what's the cloud here", we first
+ * use noise to nudge the lookup spot, then sample there. The clouds look like
+ * they're being pushed around by invisible currents. (IQ's technique.)
  */
 static float pattern_warp(const SimplexNoise *sn, float x, float y, float t,
                           float nx, float ny)
@@ -1266,10 +762,8 @@ static float pattern_warp(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * WHIRL — rotate (x, y) by a noise-controlled angle, then sample.
- * Where the noise rotation field has zeros/extrema, swirls and
- * vortices appear. Uses single-octave noise for the angle so the
- * vortices are large and readable.
+ * WHIRL — let noise decide how much to spin each spot before sampling. The
+ * varying spin creates big readable swirls and whirlpools.
  */
 static float pattern_whirl(const SimplexNoise *sn, float x, float y, float t,
                            float nx, float ny)
@@ -1283,9 +777,8 @@ static float pattern_whirl(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * DUNES — strong x-axis warp only. Sample fbm at x perturbed by 2·noise,
- * y at half-frequency. Produces long crescent ridges that wrap around
- * each other like sand dunes seen from a low angle.
+ * DUNES — warp strongly sideways only, and stretch vertically, so you get
+ * long curved ridges nesting into each other like sand dunes from a low angle.
  */
 static float pattern_dunes(const SimplexNoise *sn, float x, float y, float t,
                            float nx, float ny)
@@ -1296,9 +789,8 @@ static float pattern_dunes(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * CURRENTS — subtle two-axis warp (gain 0.4) so the noise field
- * gently flows rather than violently rearranges. Reads as a river
- * delta or slow ocean currents.
+ * CURRENTS — a gentle warp in both directions, so the field flows slowly
+ * rather than churning. Reads like a slow river delta or ocean current.
  */
 static float pattern_currents(const SimplexNoise *sn, float x, float y, float t,
                               float nx, float ny)
@@ -1310,10 +802,9 @@ static float pattern_currents(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * FRACTAL — IQ's 2-level domain warp: warp the warp. Produces deeply
- * nested swirly detail. Costs more simplex_sample calls than other
- * patterns (4 single-octave for warps + 1 fbm = 8 simplex calls/cell),
- * still comfortably under 1 ms for an 11K-cell grid.
+ * FRACTAL — warp the warp: do WARP's nudge twice over, which produces deeply
+ * nested swirls. It's the most expensive pattern (the most noise lookups per
+ * cell), but still fast enough to stay smooth.
  */
 static float pattern_fractal(const SimplexNoise *sn, float x, float y, float t,
                              float nx, float ny)
@@ -1326,12 +817,11 @@ static float pattern_fractal(const SimplexNoise *sn, float x, float y, float t,
     return simplex_fbm(sn, x + 2.0f * rx, y + 2.0f * ry + t) * 0.5f + 0.5f;
 }
 
-/* ---------- Tier 5 — COMPOSITE: multi-field combine ------------------- */
+/* ---------- Tier 5  COMPOSITE — several fields mixed together --------- */
 
 /*
- * NEBULA — two independent fbm fields multiplied. Where both are high
- * you get bright cores; where either is low, dim — yielding sparse
- * bright clouds against a darker void.
+ * NEBULA — multiply two separate cloud fields together. A spot is only bright
+ * where both happen to be bright, so you get sparse glowing cores in dark space.
  */
 static float pattern_nebula(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1343,9 +833,8 @@ static float pattern_nebula(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * AURORA — horizontal sin bands modulated by fbm phase, masked by a
- * Gaussian along ny (brightest at the horizon ny ≈ 0). Reads as
- * curtains of light moving across a night sky.
+ * AURORA — wavy horizontal bands of light, kept brightest across the middle of
+ * the screen and fading top and bottom — curtains of light over a night sky.
  */
 static float pattern_aurora(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1357,9 +846,8 @@ static float pattern_aurora(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * PLASMA — classic demoscene plasma: sum of three sinusoids whose
- * arguments are perturbed by shared fbm. The three sins interfere
- * to produce shifting blob fields with no preferred axis.
+ * PLASMA — the classic demoscene plasma effect: overlap three wave patterns,
+ * wobbled by noise, so they interfere into soft shifting blobs of color.
  */
 static float pattern_plasma(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1373,9 +861,8 @@ static float pattern_plasma(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * LIGHTNING — (1 − |fbm|)¹². Extreme power on the ridged primitive
- * collapses almost everything to zero except the sharpest ridges,
- * which then read as branching bolts of lightning.
+ * LIGHTNING — RIDGED pushed to an extreme: everything but the very sharpest
+ * ridges collapses to black, leaving thin branching streaks like lightning.
  */
 static float pattern_lightning(const SimplexNoise *sn, float x, float y, float t,
                                float nx, float ny)
@@ -1390,9 +877,8 @@ static float pattern_lightning(const SimplexNoise *sn, float x, float y, float t
 }
 
 /*
- * GALAXY — polar (r, θ) coords with spiral arms: sin(2θ + 6r + fbm·3).
- * The radial exp(−r/2) falloff lets the arms fade toward the rim.
- * Uses normalized screen-space (nx, ny) from the caller.
+ * GALAXY — think in terms of distance and angle from the screen centre, and
+ * draw spiral arms that wind outward, fading toward the edges.
  */
 static float pattern_galaxy(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1404,12 +890,11 @@ static float pattern_galaxy(const SimplexNoise *sn, float x, float y, float t,
                   0.0f, 1.0f);
 }
 
-/* ---------- Tier 6 — MASKED: noise × spatial mask --------------------- */
+/* ---------- Tier 6  MASKED — faded by position on screen ------------- */
 
 /*
- * SOLAR — turbulence × radial exponential. Bright corona at center
- * tapers smoothly to dark at the rim. Drift accelerated ×2 so the
- * corona seethes like a sun's surface.
+ * SOLAR — churning turbulence kept bright at the centre and fading to dark at
+ * the edges, drifting fast so it boils like the surface of the sun.
  */
 static float pattern_solar(const SimplexNoise *sn, float x, float y, float t,
                            float nx, float ny)
@@ -1421,9 +906,8 @@ static float pattern_solar(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * MOSAIC — quantise (fbm + 1)/2 into 6 discrete levels. Reads as
- * stained glass: large flat patches separated by sharp boundaries.
- * Demonstrates the same noise field through a posterise filter.
+ * MOSAIC — round the cloud brightness to just 6 fixed levels, so smooth
+ * shading becomes flat patches with hard edges, like stained glass.
  */
 static float pattern_mosaic(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1434,9 +918,8 @@ static float pattern_mosaic(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * VIGNETTE — plain fbm clouds masked by (1 − 0.8·r²). The corners go
- * dark; the field reads as if viewed through a camera with a vignette
- * lens. Subtle, but gives every other pattern a frame for comparison.
+ * VIGNETTE — plain clouds, but darkened toward the corners, the way a camera
+ * lens dims the edges of a photo. Subtle; a nice baseline to compare against.
  */
 static float pattern_vignette(const SimplexNoise *sn, float x, float y, float t,
                               float nx, float ny)
@@ -1448,10 +931,8 @@ static float pattern_vignette(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * COSMOS — dim fbm background with sparse bright "stars" picked out
- * by a high-frequency single-octave simplex thresholded at 0.6. Only
- * cells where the high-freq noise spikes are lit, producing a
- * starfield over a faint nebula glow.
+ * COSMOS — a faint cloud glow in the background, with sparse bright "stars"
+ * lit only where a fine, fast noise happens to spike. A starfield over a nebula.
  */
 static float pattern_cosmos(const SimplexNoise *sn, float x, float y, float t,
                             float nx, float ny)
@@ -1465,9 +946,8 @@ static float pattern_cosmos(const SimplexNoise *sn, float x, float y, float t,
 }
 
 /*
- * SUPERNOVA — radial rays from center (sin(8θ)) × global pulse
- * (sin(2t)) + a noise wash. The whole field breathes with the pulse;
- * eight bright spokes rotate as ny drifts.
+ * SUPERNOVA — eight bright spokes radiating from the centre, with the whole
+ * thing pulsing brighter and dimmer over time and a little noise mixed in.
  */
 static float pattern_supernova(const SimplexNoise *sn, float x, float y, float t,
                                float nx, float ny)
@@ -1481,65 +961,27 @@ static float pattern_supernova(const SimplexNoise *sn, float x, float y, float t
                   0.0f, 1.0f);
 }
 
-/* ---------- Dispatch table -------------------------------------------- */
-/*
- * NoisePatternFn — function-pointer signature shared by all 30 pattern
- * samplers. Spelt out here so the dispatch table is type-safe and so
- * a reader can grep one place to see what every pattern function MUST
- * accept.
- *
- *   sn      — read-only noise context (perm table). Threaded through
- *             so patterns can't silently mutate the primitive.
- *   fx, fy  — noise-space coords (cell × NOISE_SCALE).
- *   t       — PatternState.field_time, the drift accumulator.
- *   nx, ny  — screen-space normalized coords ∈ [-1, 1] with (0, 0)
- *             at grid centre. Only radial / vertical-mask patterns
- *             use these; the rest mark them (void) and ignore.
- *
- *   return  — glow ∈ [0, 1]. Clamped by the caller too, but each
- *             pattern keeps it well-behaved.
- */
+/* ---------- pattern lookup table -------------------------------------- */
+/* The shared shape of every pattern function (see the note above clampf). */
 typedef float (*NoisePatternFn)(const SimplexNoise *sn,
                                 float fx, float fy, float t,
                                 float nx, float ny);
 
 /*
- * NoisePattern — one row of the dispatch table: (display-name,
- * tier-label, sampler function pointer).
+ * NoisePattern — one row of the pattern table: a display name, a tier
+ * label, and the function that draws it. Using a table instead of a giant
+ * switch means each pattern's name, tier, and code sit together, and the
+ * Pattern enum just indexes into it.
  *
- * INTENT
- *   Replace what would otherwise be a 30-case switch with a table
- *   lookup keyed by the Pattern enum. Adding a new pattern is then
- *   THREE coordinated edits (enum value, table row, function body)
- *   and the compiler enforces alignment via the fixed-size [N_PATTERNS]
- *   initialiser.
- *
- * CONTEXT
- *   The whole `noise_patterns[]` array (below this typedef) is the
- *   source of truth for pattern → (name, tier, fn). The Pattern enum
- *   in §1 provides readable indices; pattern_name() and pattern_tier()
- *   in this section are the only outside accessors.
- *
- * MEMBER LOGIC
- *   name   : Display name, FIXED 10-char left-padded. The constant
- *            width is deliberate — HUD column alignment must stay
- *            stable as the user cycles patterns with n/p (otherwise
- *            the HUD jitters as each name changes length).
- *   tier   : 7-char "N-LABEL " form (e.g. "3-TURB ", "5-COMP ").
- *            Encodes both the complexity tier (1-6) and the technique
- *            class (RAW/MAP/TURB/WARP/COMP/MASK). Same fixed-width
- *            rationale as `name`.
- *   sample : Function pointer to one of the 30 pattern_* functions.
- *            Indirection cost is one indirect call per cell, dwarfed
- *            by the cost of the noise samples inside the function
- *            itself: one simplex_fbm call = FBM_OCTAVES (4) calls to
- *            simplex_sample. Tier-4 FRACTAL is the worst case at 8
- *            simplex calls per cell (4 standalone + 1 fbm).
+ *   name   — shown in the HUD. Padded to a fixed 10 characters so the HUD
+ *            doesn't jiggle as you cycle through names of different lengths.
+ *   tier   — short "N-LABEL" tag, same fixed-width reason.
+ *   sample — the function that turns a cell position into a brightness.
  */
 typedef struct {
-    const char     *name;      /* HUD-padded display name, 10 chars   */
-    const char     *tier;      /* HUD-padded tier label, "N-LABEL "   */
-    NoisePatternFn  sample;    /* the pattern's per-cell sampler      */
+    const char     *name;
+    const char     *tier;
+    NoisePatternFn  sample;
 } NoisePattern;
 
 static const NoisePattern noise_patterns[N_PATTERNS] = {
@@ -1594,62 +1036,29 @@ static const char *pattern_tier(Pattern p)
 }
 
 /* ===================================================================== */
-/* §7  scene — GlowField + GlyphRamp + PatternState + PaletteState + Scene */
+/* §7  scene — the simulation state and the per-tick field update          */
 /* ===================================================================== */
 
 /*
- * GlowField — the per-cell output grid the pipeline writes into and
- * the renderer reads from.
+ * GlowField — the grid of computed brightness, one value per terminal cell.
+ * The sim writes it; the renderer reads it. Keeping it as a middle layer means
+ * "compute the clouds" and "draw the clouds" stay separate jobs.
  *
- * INTENT
- *   Decouple "compute the scalar field" (scene_evaluate_field, runs
- *   on every sim tick) from "paint the scalar field" (scene_draw,
- *   runs on every render frame). Sim tick rate and frame rate can
- *   differ; the GlowField is the snapshot the renderer reads in
- *   between ticks. (For this file they're locked together but the
- *   abstraction holds regardless.)
+ * The buffers are sized for the largest possible grid and live in fixed
+ * storage, so we never allocate memory while running (about 88 KB worst case).
  *
- * CONTEXT
- *   Lives on Scene (§7). Written by scene_evaluate_field() once per
- *   sim tick; read by scene_draw() once per render frame. Index with
- *   glow_field_idx(gf, x, y) = y·w + x — row-major, matches the
- *   write loops in both producer and consumer.
- *
- * MEMORY
- *   No allocation post-init — both buffers are sized at CELLS_MAX
- *   in BSS storage so the hot path never touches malloc/free (per
- *   CLAUDE.md "Memory Allocation"). Worst case ~88 KB at MAP_W_MAX
- *   × MAP_H_MAX = 200×56 = 11200 cells × (4 + 1) bytes.
- *
- * MEMBER LOGIC
- *   w, h    : Grid dimensions in cells. Set by app_pick_map_size()
- *             at init and every resize. Bounded by [16, MAP_W_MAX] ×
- *             [8, MAP_H_MAX]. Plain int so loop counter arithmetic
- *             stays sign-safe.
- *   count   : w · h, cached at reset so the buffer-clearing loop
- *             and the dispatcher don't recompute it each tick.
- *             Always ≤ CELLS_MAX (enforced by app_pick_map_size).
- *   glow[]  : Per-cell scalar value ∈ [0, 1]. Producer:
- *             scene_evaluate_field() calls the active pattern's
- *             sampler at every cell and writes here. Consumer:
- *             scene_draw() reads here via GlyphRamp to pick a
- *             glyph. Float — fully sufficient for ASCII output.
- *   band[]  : Per-cell palette band ∈ {0, 1, 2, 3} — quartile of
- *             glow, computed once per tick to save the renderer the
- *             work. Formula:
- *               band = (uint8_t)((int)(glow * 3.999f) & 3)
- *             The 3.999f is "almost 4 but never exactly"; this
- *             ensures glow == 1.0 still rounds down to band 3.
- *             Multiplying by exact 4 then masking with &3 would
- *             wrap 4 → 0 at the bright tip — the .999f keeps the
- *             upper edge safely below 4.0 so the mask is a no-op.
- *             uint8_t — only 2 bits needed, 8 are cheapest.
+ *   w, h   — current grid size in cells. Set at startup and on every resize.
+ *   count  — w * h, kept around so loops don't keep recomputing it.
+ *   glow[] — each cell's brightness, 0 (dark) to 1 (bright). Index a cell with
+ *            glow_field_idx(gf, x, y).
+ *   band[] — each cell's color shade (0..3), worked out once here so the
+ *            renderer doesn't have to redo it. One byte each is plenty.
  */
 typedef struct {
-    int      w, h;                   /* grid dims (cells), set at reset */
-    int      count;                  /* w * h, cached for tight loops   */
-    float    glow[CELLS_MAX];        /* per-cell scalar ∈ [0, 1]        */
-    uint8_t  band[CELLS_MAX];        /* per-cell palette tier ∈ {0..3}  */
+    int      w, h;
+    int      count;
+    float    glow[CELLS_MAX];
+    uint8_t  band[CELLS_MAX];
 } GlowField;
 
 static inline int glow_field_idx(const GlowField *gf, int x, int y)
@@ -1669,68 +1078,37 @@ static void glow_field_reset(GlowField *gf, int w, int h)
 }
 
 /*
- * GlyphRamp — the density → (glyph, attr) mapping. The single rule
- * that turns the GlowField's float values into terminal characters.
+ * GlyphRamp — the rule for turning a cell's brightness into a character.
+ * Pulling it into a named thing keeps the cutoff values out in the open and
+ * lets a future theme swap in different characters.
  *
- * INTENT
- *   Capture "how density becomes a character" as a NAMED RULE
- *   rather than an inline if/else chain in the renderer. Three
- *   benefits: (1) the threshold values are visible as data, not
- *   magic numbers buried in code; (2) a future feature can swap
- *   ramps per theme; (3) the renderer reads `glyph_ramp_pick(...)`
- *   which scans cleaner than `if (glow > 0.65) ...`.
+ * Brightest cells get '#', medium get '*', faint get '.', and anything below
+ * the lowest cutoff is left blank so the background shows through (that's why
+ * patterns like NEBULA have visible empty space). The cutoffs must stay in
+ * order, brightest first.
  *
- * THE RAMP
- *   Three descending bands; below the lowest threshold the cell is
- *   NOT drawn (the terminal background shows through — that's why
- *   patterns like NEBULA and EMBERS have visible "void" areas).
- *
- *      glow > thresh_high  →  glyph_high  bold     (dense core)
- *      glow > thresh_mid   →  glyph_mid   bold     (mid density)
- *      glow > thresh_low   →  glyph_low   normal   (faint trace)
- *      else                →  not drawn            (transparent)
- *
- * INVARIANT
- *   thresh_high > thresh_mid > thresh_low > 0
- *   Defaults: 0.65 / 0.30 / 0.05 (from GLYPH_HIGH_THRESH /
- *   GLYPH_MID_THRESH / GLOW_THRESHOLD in §1).
- *
- * GLYPH CHOICE
- *   '#', '*', '.' is a coarse 3-tier subset of Paul Bourke's
- *   canonical 10-char luminance ramp "@%#*+=-:. " (densest →
- *   sparsest). Three tiers chosen for perceptual contrast at
- *   terminal resolution — finer ramps add bytes but no visible
- *   detail at 80×24.
- *
- * Ref: Bourke, "Character representation of grey scale images"
- *      (link in References block above).
+ * The three characters are a coarse slice of Paul Bourke's brightness ramp.
+ * Three steps is enough to read clearly in a terminal; more wouldn't show.
  */
 typedef struct {
-    float thresh_high;    /* > this → glyph_high  (default 0.65)  */
-    float thresh_mid;     /* > this → glyph_mid   (default 0.30)  */
-    float thresh_low;     /* > this → glyph_low   (default 0.05)  */
-    char  glyph_high;     /* dense core    glyph                  */
-    char  glyph_mid;      /* mid-density   glyph                  */
-    char  glyph_low;      /* faint-trace   glyph                  */
+    float thresh_high;    /* above this -> '#' */
+    float thresh_mid;     /* above this -> '*' */
+    float thresh_low;     /* above this -> '.' */
+    char  glyph_high;
+    char  glyph_mid;
+    char  glyph_low;
 } GlyphRamp;
 
 /*
- * GlyphChoice — return value from glyph_ramp_pick(). A small POD
- * struct rather than out-parameters so the call site reads as a
- * pure function:
- *
- *   GlyphChoice gc = glyph_ramp_pick(ramp, glow);
- *   if (gc.visible) draw_cell(gc.glyph, palette[band], gc.attr);
- *
- * Note: caller composes (glyph, attr) with the palette band index
- * they pulled from elsewhere — GlyphRamp deliberately doesn't know
- * about colour. Separation of concerns: ramp = density, palette =
- * colour, renderer = composition.
+ * GlyphChoice — what glyph_ramp_pick() hands back: which character to draw,
+ * whether to draw it bold, and whether to draw it at all. Returning a little
+ * struct lets the caller read it like a plain answer. Note it carries no
+ * color: the ramp only decides the character, color comes from the theme.
  */
 typedef struct {
-    char glyph;         /* the char to draw — only valid if visible   */
-    int  attr;          /* ncurses attribute: A_BOLD or A_NORMAL      */
-    bool visible;       /* false → leave the cell empty (transparent) */
+    char glyph;         /* the character to draw (only if visible)    */
+    int  attr;          /* bold or normal                             */
+    bool visible;       /* false -> leave the cell blank              */
 } GlyphChoice;
 
 static void glyph_ramp_init(GlyphRamp *gr)
@@ -1753,53 +1131,22 @@ static GlyphChoice glyph_ramp_pick(const GlyphRamp *gr, float glow)
 }
 
 /*
- * PatternState — the active pattern + how it animates over time.
+ * PatternState — which pattern is showing and how it's moving. These three
+ * values change together as you interact, so they live together.
  *
- * INTENT
- *   Group the three values that together describe "the current
- *   animation": which pattern, where in its drift cycle, and at
- *   what speed. The grouping is conceptual, not technical — they
- *   change together (user presses n/p resets nothing; +/- adjusts
- *   speed; r resets time + reshuffles noise). Pulling them onto
- *   their own struct gives the animation a name.
- *
- * CONTEXT
- *   Lives on Scene (§7). Read by scene_evaluate_field() (which
- *   dispatches `noise_patterns[current].sample` with `field_time`)
- *   and by screen_draw() (which shows pattern/tier/drift in HUD).
- *   Mutated by app_handle_key() in §9 and by scene_tick().
- *
- * MEMBER LOGIC
- *   current    : Active pattern enum, indexes noise_patterns[].
- *                Defaults to PATTERN_CLOUDS at scene_init. Cycled
- *                by n/N (forward) and p/P (back) with wraparound
- *                through N_PATTERNS.
- *
- *   field_time : Drift accumulator in noise-space units. Advanced
- *                each sim tick by:
- *                  field_time += FIELD_DRIFT × drift_mult × dt
- *                Added to the y-coordinate when sampling noise so
- *                the field appears to "scroll" indefinitely.
- *                Monotonically increasing; reset only by r
- *                (scene_reset). At drift_mult=1 it advances 0.10
- *                noise units per second; that's ~2.5 cells/s of
- *                apparent motion at NOISE_SCALE=0.04.
- *
- *                FLOAT IS FINE here even after hours of runtime —
- *                simplex_sample is periodic in 256 cell-coords, so
- *                very large t just wraps inside the perm-table
- *                hash. No accumulating precision concern.
- *
- *   drift_mult : User-controlled drift-rate multiplier, scaled by
- *                +/- keys. Always a power of 2 in [DRIFT_MULT_MIN,
- *                DRIFT_MULT_MAX] = [1, 32]. Implemented as *=2 /
- *                /=2 in the key handler so the user perceives clear
- *                ×2 / ÷2 steps rather than fine-grained interpolation.
+ *   current    — the pattern on screen; cycled with n/p.
+ *   field_time — how far the field has drifted so far. Each tick we add a bit
+ *                and use it to shift where we sample, which makes the clouds
+ *                scroll. It only grows; 'r' resets it to zero. A float is fine
+ *                even after hours, because the noise repeats every so often,
+ *                so a big value just wraps harmlessly.
+ *   drift_mult — the speed dial, doubled/halved with +/- between 1 and 32.
+ *                Stepping by doubling makes the speed changes feel distinct.
  */
 typedef struct {
-    Pattern current;      /* active pattern enum, indexes noise_patterns[] */
-    float   field_time;   /* drift accumulator (noise-space units)         */
-    int     drift_mult;   /* powers of 2 ∈ [DRIFT_MULT_MIN, DRIFT_MULT_MAX] */
+    Pattern current;
+    float   field_time;
+    int     drift_mult;
 } PatternState;
 
 static void pattern_state_init(PatternState *ps)
@@ -1810,33 +1157,13 @@ static void pattern_state_init(PatternState *ps)
 }
 
 /*
- * PaletteState — the active theme index.
- *
- * INTENT
- *   Currently a one-int wrapper, but kept as a named struct on
- *   Scene so the responsibility "which colour scheme is showing"
- *   has a stable home. Two concrete extensions this anticipates:
- *     (a) themed glyph ramps — adding a `GlyphRamp custom_ramp`
- *         field here so each theme can override '.', '*', '#';
- *     (b) interpolation between themes — adding `int from, to;
- *         float t;` for smooth crossfades.
- *   Both fit without disturbing Scene's layout.
- *
- * CONTEXT
- *   Read by screen_draw() (HUD shows `themes[current].name`) and
- *   by app_handle_key() in §9 (cycled by t / T). On every change
- *   the new theme's xterm colour indices are pushed into the
- *   ncurses colour pairs via theme_apply() in §3 — note this is a
- *   side effect outside the struct, since ncurses owns the actual
- *   palette state.
- *
- * MEMBER LOGIC
- *   current : Index into themes[] in §1. Always in [0, N_THEMES);
- *             wraparound is handled in the key handler via mod.
- *             Defaults to 0 (the "DEFAULT" theme) at scene_init.
+ * PaletteState — which theme is showing, as an index into themes[]. It's just
+ * one number today, but it's kept as its own little struct so "the current
+ * color scheme" has a clear home (and room to grow, e.g. theme crossfades).
+ * Cycled with t/T; changing it re-binds the ncurses colors via theme_apply().
  */
 typedef struct {
-    int current;          /* index into themes[] ∈ [0, N_THEMES) */
+    int current;          /* index into themes[] */
 } PaletteState;
 
 static void palette_state_init(PaletteState *p)
@@ -1845,101 +1172,57 @@ static void palette_state_init(PaletteState *p)
 }
 
 /*
- * Scene — the composite owner of ALL mutable simulation state.
+ * Scene — one struct holding everything the running simulation cares about.
+ * Functions take a Scene* instead of a long list of arguments. Reading the
+ * fields top to bottom traces the flow of work:
  *
- * INTENT
- *   ONE struct holds the whole world the simulation cares about,
- *   built from the four domain structs above plus the SimplexNoise
- *   primitive (§5). Every function that needs more than one piece
- *   of state takes `Scene *` instead of a long arg list; the call
- *   sites stay short and the dataflow is centralised.
+ *   noise   — the random source the patterns sample
+ *   pattern — which pattern is showing and how fast it drifts
+ *   field   — the brightness computed for every cell
+ *   ramp    — how brightness becomes a character
+ *   palette — which color theme is in effect
+ *   paused  — when true, the field stops updating
  *
- * THE PIPELINE (top to bottom = dataflow order)
- *
- *   noise    — the simplex permutation table        (the ALGORITHM)
- *               ↓ (sampled by pattern functions)
- *   pattern  — active pattern + drift state         (the ANIMATION)
- *               ↓ (drives scene_evaluate_field)
- *   field    — per-cell glow + band buffers         (the DATA)
- *               ↓ (read by scene_draw)
- *   ramp     — density → glyph mapping              (the RENDER RULE)
- *               + palette colour pairs (via ncurses, set by theme_apply)
- *               ↓
- *   palette  — active theme index                   (the COLOUR CHOICE)
- *               + paused flag                       (the CONTROL)
- *
- *   The whole pipeline at a glance: noise → field (via pattern) →
- *   ramp + palette (via renderer).
- *
- * MEMORY LAYOUT
- *   GlowField is by far the largest member (~88 KB for glow[] +
- *   band[] at MAP_W_MAX × MAP_H_MAX). Placed early in the struct
- *   so the noise + pattern preamble that the inner loop touches
- *   first sits in the warm cache.
- *
- * LIFETIME
- *   scene_init    — allocates nothing, just zero-inits + seeds.
- *   scene_reset   — clears the field, zeroes the drift accumulator,
- *                   reshuffles the simplex perm table. Called on r.
- *   scene_tick    — advance drift, evaluate field.
- *   No teardown — Scene lives in BSS via App in §9; OS reclaims it.
+ * The field grid is by far the biggest part; it sits early in the struct so
+ * the small parts the inner loop reads first stay together in cache. Nothing
+ * here is allocated at runtime; it all lives inside the App in §9.
  */
 typedef struct {
-    SimplexNoise  noise;     /* §5 — perm table (mutable)                   */
-    GlowField     field;     /* per-cell output grid (largest member)       */
-    GlyphRamp     ramp;      /* density → glyph rule (read-mostly)          */
-    PatternState  pattern;   /* active pattern + drift accumulator + speed  */
-    PaletteState  palette;   /* active theme index                          */
-    bool          paused;    /* if true, scene_tick early-returns           */
+    SimplexNoise  noise;
+    GlowField     field;
+    GlyphRamp     ramp;
+    PatternState  pattern;
+    PaletteState  palette;
+    bool          paused;
 } Scene;
 
-/*
- * The three per-cell coordinate mappings used by scene_evaluate_field.
- * Each names one (X → Y) transform the inner loop performs.
- */
-
-/* cell index → noise-space coordinate (cells × NOISE_SCALE). Used as
- * the (x, y) argument to every pattern sampler. */
+/* Turn a cell number into the matching spot in noise space — this is the
+ * (x, y) we hand to a pattern function. */
 static inline float cell_to_noise_coord(int cell)
 {
     return (float)cell * NOISE_SCALE;
 }
 
-/* cell index → normalized screen coordinate ∈ [-1, +1], (0, 0) at
- * grid centre. Used by radial / vertical-mask patterns to know
- * "where on screen am I" without caring about grid resolution. */
+/* Turn a cell number into a -1..1 position on screen with 0 at the centre.
+ * Patterns that care about "where on screen" (galaxy, solar, etc.) use this. */
 static inline float cell_to_normalized_coord(int cell, int n_cells)
 {
     if (n_cells <= 1) return 0.0f;
     return (float)cell * (2.0f / (float)(n_cells - 1)) - 1.0f;
 }
 
-/* glow ∈ [0, 1] → palette band ∈ {0, 1, 2, 3}. Quantises the
- * continuous scalar into a discrete colour tier. See the comment on
- * GLOW_TO_BAND_GAIN in §1 for the "almost-4" trick. */
+/* Turn a brightness (0..1) into one of the four color shades. See the
+ * "almost 4" note back in §1 for why the constant isn't exactly 4. */
 static inline uint8_t glow_to_palette_band(float glow)
 {
     return (uint8_t)((int)(glow * GLOW_TO_BAND_GAIN) & PALETTE_BAND_MASK);
 }
 
-/*
- * scene_evaluate_field — drive the whole pipeline for one sim tick.
- *
- *   FOR every cell (x, y):
- *     fx, fy = noise-space coords        // cell_to_noise_coord
- *     nx, ny = normalized [-1, 1] coords // cell_to_normalized_coord
- *     glow   = active_pattern(noise, fx, fy, drift, nx, ny)
- *     glow   = clamp(glow, 0, 1)
- *     band   = quantize(glow → 4 tiers)  // glow_to_palette_band
- *     write (glow, band) → GlowField[x, y]
- *
- * Hot loop — one pattern call per cell × ~11K cells × 60 Hz means
- * the body must stay tight. Helpers are `static inline` for zero
- * dispatch cost.
- */
+/* Recompute the whole cloud field for one sim step: for every cell, ask the
+ * current pattern how bright it is, clamp it, sort it into a color shade, and
+ * store both. This runs over every cell each tick, so it's kept tight. */
 static void scene_evaluate_field(Scene *s)
 {
-    /* STEP 1 — RESOLVE the active pattern's sampler */
     Pattern active = s->pattern.current;
     if ((unsigned)active >= (unsigned)N_PATTERNS) return;
     NoisePatternFn      sample_pattern = noise_patterns[active].sample;
@@ -1947,7 +1230,6 @@ static void scene_evaluate_field(Scene *s)
     GlowField          *field          = &s->field;
     float               drift          = s->pattern.field_time;
 
-    /* STEP 2 — SAMPLE PER CELL: pattern → glow → band, write into GlowField */
     for (int y = 0; y < field->h; y++) {
         float ny = cell_to_normalized_coord(y, field->h);
         float fy = cell_to_noise_coord(y);
@@ -1993,36 +1275,18 @@ static void scene_tick(Scene *s, float dt)
 /* ===================================================================== */
 
 /*
- * Screen — the terminal viewport's dimensions, cached from ncurses.
+ * Screen — just the terminal's current width and height, remembered so we
+ * don't ask ncurses for them once per cell. ncurses itself owns the actual
+ * drawing buffer and colors; this is only the size.
  *
- * INTENT
- *   Decouple "what the terminal is" from "what the simulation is".
- *   ncurses owns the actual screen buffer, the input loop, and the
- *   colour-pair table; Screen just remembers cols × rows so we
- *   don't call getmaxyx() once per cell. Separating from Scene
- *   also matches the pattern in sibling demos where mock-rendering
- *   paths need terminal dims without simulation state.
+ *   cols — width in characters (kept at least 16, or the HUD won't fit).
+ *   rows — height in characters (kept at least 8).
  *
- * LIFETIME
- *   screen_init   — calls initscr(), configures ncurses, captures
- *                   cols/rows.
- *   screen_resize — re-captures cols/rows after a SIGWINCH. Owner
- *                   (App) follows up with scene_reset to re-size
- *                   the GlowField.
- *   screen_free   — calls endwin() to restore the terminal.
- *
- * MEMBER LOGIC
- *   cols : terminal width  in cells.  ≥ 16 enforced by
- *          app_pick_map_size (smaller and the HUD won't fit).
- *   rows : terminal height in cells.  ≥ 8 enforced by
- *          app_pick_map_size; HUD reserves 3 rows at top/bottom.
- *   Ordering matches the ncurses getmaxyx(stdscr, rows, cols)
- *   convention — rows first because curses originally targeted
- *   line-printers (lines are the primary axis).
+ * Refreshed on every terminal resize.
  */
 typedef struct {
-    int cols;     /* terminal width  in cells (≥ 16)  */
-    int rows;     /* terminal height in cells (≥ 8)   */
+    int cols;
+    int rows;
 } Screen;
 
 static void screen_init(Screen *s)
@@ -2045,60 +1309,26 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* ---------- scene_draw: grid → glyphs ---------------------------------- */
+/* ---------- drawing the cloud field ----------------------------------- */
 
 /*
- * GridPlacement — the top-left screen cell where the field's (0, 0)
- * cell will be drawn. The result of centering the GlowField inside
- * the terminal viewport, holding the HUD rows clear.
+ * GridPlacement — the top-left corner on screen where the field starts, after
+ * centering it and leaving the HUD rows clear. Working it out once (instead of
+ * per cell) keeps the draw loop simple: a cell's screen row is just origin_y + y.
  *
- * INTENT
- *   Lift the centering math out of the per-cell inner loop. Without
- *   GridPlacement the loop would have to redo `(cols - field_w) / 2`
- *   plus the HUD-row offset on every cell — w·h times per frame.
- *   With it, the loop body becomes `screen_y = origin_y + y` which
- *   the compiler can fold into the loop induction variable.
+ *   origin_x — leftmost column the field starts at (0 if it's wider than screen).
+ *   origin_y — topmost row (never above the title bar).
  *
- *   Also names the "where on screen" decision so a reader sees
- *   `compute_grid_placement(...)` and immediately knows what's
- *   happening, instead of staring at four lines of `/ 2` arithmetic
- *   inline.
- *
- * CONTEXT
- *   Computed once at the top of scene_draw() (§8) by
- *   compute_grid_placement(field_w, field_h, cols, rows) and then
- *   passed implicitly via the local `place` to every cell.
- *
- *   Coordinate convention matches ncurses: (origin_y, origin_x) is
- *   the (row, col) of the top-left screen cell to start drawing at.
- *   Y grows DOWN (towards the bottom of the terminal), X grows RIGHT.
- *
- * INVARIANTS
- *   origin_x ≥ 0
- *   origin_y ≥ HUD_TOP_ROWS         (kept clear for the title bar)
- *   The bottom HUD_BOTTOM_ROWS rows are kept clear by sizing the
- *   field, not by clamping here — so origin_y + field_h may run up
- *   to (rows - HUD_BOTTOM_ROWS).
- *
- *   Negative results from the centering arithmetic (over-large field
- *   on a small viewport) are clamped to the viewport edge — the
- *   field is cropped, not wrapped. The "cell off-screen?" check in
- *   the drawer's inner loop handles the rest.
- *
- * MEMBER LOGIC
- *   origin_x : screen column (cells) of the field's leftmost cell.
- *              0 if the field is wider than the viewport.
- *   origin_y : screen row (cells) of the field's topmost cell.
- *              HUD_TOP_ROWS at minimum (never overlaps the title bar).
+ * If the field is bigger than the terminal, these clamp to the edge and the
+ * field gets cropped rather than wrapping around.
  */
 typedef struct {
-    int origin_x;   /* screen column where field's left edge starts   */
-    int origin_y;   /* screen row    where field's top edge starts    */
+    int origin_x;
+    int origin_y;
 } GridPlacement;
 
-/* Centre the GlowField inside the terminal viewport, respecting the
- * HUD's reserved top + bottom rows. Negative offsets are clamped to
- * the viewport edge so an over-large field is cropped, not wrapped. */
+/* Centre the field in the terminal, keeping the HUD rows clear. An over-large
+ * field is pinned to the edge and cropped, not wrapped. */
 static GridPlacement compute_grid_placement(int field_w, int field_h,
                                             int cols, int rows)
 {
@@ -2111,7 +1341,7 @@ static GridPlacement compute_grid_placement(int field_w, int field_h,
     return p;
 }
 
-/* The one-cell paint primitive: bind colour, emit glyph, unbind. */
+/* Draw a single character in a given color. */
 static inline void draw_glyph_at(int screen_y, int screen_x,
                                  char glyph, int color_pair, int attr)
 {
@@ -2120,18 +1350,9 @@ static inline void draw_glyph_at(int screen_y, int screen_x,
     attroff(COLOR_PAIR(color_pair) | attr);
 }
 
-/*
- * scene_draw — paint the GlowField into the terminal using the
- * Scene's GlyphRamp and the currently-bound colour palette.
- *
- *   place = centre field inside viewport
- *   FOR every cell:
- *     glyph_pick = ramp(glow)
- *     IF glyph_pick.visible:
- *       draw glyph_pick.glyph at place + (x, y) with band's colour
- *
- * Pure read of Scene state — no simulation here.
- */
+/* Paint the cloud field into the terminal: centre it, then for each cell pick a
+ * character from its brightness and draw it in its color shade (skipping the
+ * dim cells the ramp marks invisible). Read-only; no simulation happens here. */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
     const GlowField *field = &s->field;
@@ -2160,13 +1381,9 @@ static void scene_draw(const Scene *s, int cols, int rows)
     }
 }
 
-/* ---------- HUD layout widths ----------------------------------------- *
- *
- * Per-segment widths for the status row 1 chain. Each `hud_draw_*`
- * helper consumes (and returns) the cursor x; these widths are how
- * far each segment moves it. Kept named so a future format tweak
- * touches one line.
- */
+/* The status row is drawn left to right in chunks; each number is how wide its
+ * chunk is, so the next one starts in the right place. Named so a wording tweak
+ * is a one-line change. */
 #define HUD_W_PATTERN_FIELD   21   /* " pattern:%-10s "          */
 #define HUD_W_TIER_FIELD      15   /* " tier:%-7s "              */
 #define HUD_W_THEME_FIELD     17   /* " theme:%-8s "             */
@@ -2179,14 +1396,11 @@ static void scene_draw(const Scene *s, int cols, int rows)
     " n/p:pattern  t/T:theme  r:reset  spc:pause  +/-:drift  ]/[:Hz  q:quit "
 
 /* ---------- HUD: per-segment drawers ---------------------------------- *
- *
- * Each segment takes (row, x, ...) and returns the next x cursor
- * position so the caller can chain them. Names describe what's
- * INSIDE the segment, not how it looks ("pattern_field" not
- * "left_chunk").
+ * Each one draws its chunk at (row, x) and returns the x to continue from,
+ * so the caller can chain them across the row.
  */
 
-/* Row 0 LEFT — the program title chip. */
+/* Row 0 left — the program title. */
 static int hud_draw_title_chip(int row, int x)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -2195,7 +1409,7 @@ static int hud_draw_title_chip(int row, int x)
     return x + (int)strlen(HUD_TITLE_TEXT);
 }
 
-/* Row 0 RIGHT — fps + Hz + state + pattern index + drift multiplier. */
+/* Row 0 right — frame rate, tick rate, current pattern, and drift speed. */
 static void hud_draw_state_bar(int row, int cols,
                                double fps, int sim_fps,
                                const PatternState *ps, bool paused)
@@ -2241,10 +1455,8 @@ static int hud_draw_theme_field(int row, int x, int theme_idx)
     return x + HUD_W_THEME_FIELD;
 }
 
-/* Row 1 segment — "palette:" label + N_PALETTE_BANDS coloured swatches.
- * Each swatch is a '#' rendered in the corresponding band's colour pair
- * so the user can see at a glance what each density-tier looks like in
- * the active theme. */
+/* Row 1 segment — "palette:" plus one '#' per color shade, each in its own
+ * color, so you can see at a glance what the four cloud shades look like now. */
 static int hud_draw_palette_swatches(int row, int x)
 {
     attron(COLOR_PAIR(PAIR_HUD));
@@ -2261,9 +1473,7 @@ static int hud_draw_palette_swatches(int row, int x)
     return x;
 }
 
-/* Row 1 tail — algorithm parameter readout: noise scale, fBm octaves,
- * grid dimensions. Read-only display of the values that govern the
- * pattern functions in §6. */
+/* Row 1 tail — a readout of the noise settings: scale, layer count, grid size. */
 static void hud_draw_stats_field(int row, int x, const GlowField *gf)
 {
     attron(COLOR_PAIR(PAIR_HUD));
@@ -2272,7 +1482,7 @@ static void hud_draw_stats_field(int row, int x, const GlowField *gf)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* Bottom row — keymap reminder. Fixed text; cyan + bold for contrast. */
+/* Bottom row — the list of keys you can press. */
 static void hud_draw_action_hint(int row)
 {
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -2282,15 +1492,8 @@ static void hud_draw_action_hint(int row)
 
 /* ---------- screen_draw: scene + full HUD ----------------------------- */
 
-/*
- * screen_draw — the per-frame composite renderer. Pure read of state.
- *
- *   STEP 1  erase  — ncurses double-buffer
- *   STEP 2  scene  — paint the GlowField
- *   STEP 3  HUD row 0 — title (left) + state bar (right)
- *   STEP 4  HUD row 1 — pattern | tier | theme | swatches | stats
- *   STEP 5  HUD last row — action hint
- */
+/* Draw one whole frame: clear, paint the clouds, then lay the HUD on top
+ * (title and status up top, key hints along the bottom). Read-only. */
 static void screen_draw(Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
@@ -2321,71 +1524,33 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — the top-level harness. Owns every other piece of state.
+ * App — the one struct that holds everything: the simulation, the terminal
+ * size, the tick rate, the chosen grid size, and two flags the main loop
+ * watches. main() only ever touches this.
  *
- * INTENT
- *   ONE struct at the top of the dependency tree, holding the
- *   simulation (Scene), the terminal binding (Screen), the tick
- *   rate, the chosen map dimensions, and the two signal flags
- *   driving the main loop. main() touches App and only App; every
- *   other function takes App* (for write paths) or const App*
- *   (for read paths) — or a sub-struct pointer if it only needs
- *   part of the state.
+ * There's a single file-scope instance (g_app below). It has to be file-scope
+ * because the signal handlers need to reach the two flags, and signal handlers
+ * can't be handed a pointer.
  *
- * SINGLETON
- *   One file-scope instance (g_app, see below). Signal handlers
- *   need to reach the `running` / `need_resize` flags from outside
- *   any caller's scope, and POSIX signal handlers can't take a
- *   user pointer — a file-scope `App` is the simplest correct
- *   path. The handlers ONLY touch the volatile sig_atomic_t flags;
- *   the main loop owns everything else.
+ *   scene       — the simulation (see Scene).
+ *   screen      — terminal width/height; refreshed when the terminal resizes.
+ *   sim_fps     — how many times per second the sim updates; ]/[ change it.
+ *   map_w/map_h — the grid size, derived from the terminal minus the HUD rows.
+ *   running     — set to 0 to quit (by Ctrl-C, the q key, etc).
+ *   need_resize — set to 1 when the terminal is resized; the loop acts on it.
  *
- * LIFETIME
- *   main() does: zero-init g_app → screen_init → app_pick_map_size →
- *   scene_init → loop → screen_free. No teardown beyond endwin()
- *   via atexit() — App is in BSS so the OS reclaims it at exit.
- *
- * MEMBER LOGIC
- *   scene       : The simulation. See Scene above.
- *
- *   screen      : Terminal cols/rows. Refreshed on every SIGWINCH
- *                 by app_do_resize().
- *
- *   sim_fps     : Tick rate in Hz. Determines TICK_NS used by the
- *                 fixed-timestep accumulator in main(). Adjustable
- *                 by ] (faster) / [ (slower) keys; clamped to
- *                 [SIM_FPS_MIN, SIM_FPS_MAX] = [10, 240].
- *
- *   map_w,      : Grid dimensions selected by app_pick_map_size()
- *   map_h         from the terminal cols/rows minus HUD reservations.
- *                 Bounded by [16..MAP_W_MAX] × [8..MAP_H_MAX].
- *                 Passed to scene_reset on init and resize.
- *
- *   running     : Cleared to 0 by SIGINT or SIGTERM handlers (and
- *                 by app_handle_key on q/ESC). Main loop exits when
- *                 this goes false. `volatile sig_atomic_t` because:
- *                 (1) POSIX guarantees only sig_atomic_t writes are
- *                 async-safe inside a signal handler; (2) `volatile`
- *                 prevents the compiler from caching the read in
- *                 the main loop (the handler can flip it between
- *                 any two iterations).
- *
- *   need_resize : Set to 1 by SIGWINCH handler; consumed by main
- *                 loop, which then calls app_do_resize() and clears
- *                 it. Same volatile-sig_atomic_t rationale as
- *                 `running`. The signal → flag → main-loop-consumes
- *                 pattern keeps the handler tiny and signal-safe
- *                 (no libc calls beyond what's listed in
- *                 signal-safety(7)).
+ * The two flags are volatile sig_atomic_t because a signal handler can flip
+ * them at any moment, and that type is the only one safe to write from a
+ * handler; volatile stops the loop from caching a stale copy.
  */
 typedef struct {
-    Scene                 scene;        /* the simulation                       */
-    Screen                screen;       /* terminal dims, refreshed on resize   */
-    int                   sim_fps;      /* tick rate Hz, user-adjustable by ]/[ */
-    int                   map_w;        /* chosen grid width  (cells)           */
-    int                   map_h;        /* chosen grid height (cells)           */
-    volatile sig_atomic_t running;      /* main-loop flag, 0 → exit             */
-    volatile sig_atomic_t need_resize;  /* SIGWINCH→1, main loop consumes       */
+    Scene                 scene;
+    Screen                screen;
+    int                   sim_fps;
+    int                   map_w;
+    int                   map_h;
+    volatile sig_atomic_t running;
+    volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
@@ -2414,23 +1579,19 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* ---------- Scene action helpers (input → state mutation) ------------- *
- *
- * Each helper names ONE keystroke-triggered state change, so
- * app_handle_key reads as a keymap rather than a switch full of
- * arithmetic. Direction parameters use ±1 throughout for "next/prev"
- * symmetry.
+/* ---------- key actions ----------------------------------------------- *
+ * One small function per thing a key does, so the key handler below reads as a
+ * plain list. The +1/-1 direction argument means "next" or "previous".
  */
 
-/* Cycle the active pattern by ±1 with wraparound through N_PATTERNS. */
+/* Step to the next/previous pattern, wrapping around the ends. */
 static void scene_cycle_pattern(Scene *s, int direction)
 {
     int next = ((int)s->pattern.current + direction + N_PATTERNS) % N_PATTERNS;
     s->pattern.current = (Pattern)next;
 }
 
-/* Cycle the active theme by ±1 with wraparound, then rebind ncurses
- * colour pairs to the new palette via theme_apply (side effect). */
+/* Step to the next/previous theme and apply its colors. */
 static void scene_cycle_theme(Scene *s, int direction)
 {
     s->palette.current = (s->palette.current + direction + N_THEMES)
@@ -2438,8 +1599,7 @@ static void scene_cycle_theme(Scene *s, int direction)
     theme_apply(s->palette.current);
 }
 
-/* Drift speed control — multiplier doubles or halves in clean ×2 / ÷2
- * steps so the user perceives discrete speed changes, not a slider. */
+/* Drift speed doubles or halves, so each press is a clear step, not a nudge. */
 static void scene_drift_double(PatternState *ps)
 {
     if (ps->drift_mult < DRIFT_MULT_MAX) ps->drift_mult *= 2;
@@ -2451,7 +1611,7 @@ static void scene_drift_halve(PatternState *ps)
     if (ps->drift_mult < DRIFT_MULT_MIN) ps->drift_mult = DRIFT_MULT_MIN;
 }
 
-/* Adjust sim tick rate by delta Hz, clamped to [SIM_FPS_MIN, MAX]. */
+/* Nudge the sim's update rate up or down, kept within sane limits. */
 static void app_adjust_sim_fps(App *app, int delta)
 {
     app->sim_fps += delta;
@@ -2459,11 +1619,7 @@ static void app_adjust_sim_fps(App *app, int delta)
     if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
 }
 
-/*
- * app_handle_key — the keymap. Returns false on quit, true otherwise.
- * Every arm is a single named action so the switch reads as
- * "key → behaviour" without arithmetic inline.
- */
+/* Route a keypress to its action. Returns false only when the user wants out. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
@@ -2489,86 +1645,33 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* ---------- FrameClock: timing accumulators for the main loop --------- */
+/* ---------- the main loop's timekeeping ------------------------------- */
 
 /*
- * FrameClock — every running scalar the main loop's timing needs,
- * grouped under one name.
+ * FrameClock — the handful of timing values the main loop keeps between
+ * frames, bundled together so the loop can advance them with named steps.
  *
- * INTENT
- *   The original main loop carried FIVE loose locals (frame_time,
- *   sim_accum, fps_accum, frame_count, fps_display) that all had
- *   to be initialised together, reset together on resize, and
- *   advanced together each frame. Grouping them makes the loop
- *   body a sequence of NAMED operations on one object
- *   (`frame_clock_advance`, `fps_meter_observe`, …) instead of a
- *   collection of bare arithmetic against scattered locals.
+ * It does two separate jobs that both feed off "how long the last frame took":
  *
- * CONTEXT
- *   One instance, declared as a `FrameClock clock;` local in main()
- *   (§9). The lifetime is exactly main's stack frame. Owns no
- *   resources; never freed; reset via frame_clock_resync() after a
- *   stall (e.g. SIGWINCH).
+ *   1. Keep the sim updating at a steady pace. We pour each frame's elapsed
+ *      time into a bucket and spend it one fixed tick at a time, so the sim
+ *      always sees an even step even when frames are uneven. (This is the
+ *      well-known "fix your timestep" pattern from Glenn Fiedler.)
+ *   2. Measure the frame rate to show in the HUD.
  *
- * THE TWO SUB-ACCUMULATORS
- *   FrameClock combines two independent integrator patterns that
- *   happen to share `frame_dt_ns` as their input:
- *
- *     1) FIXED-TIMESTEP SIM DRIVER  (sim_accum_ns)
- *        Each frame's wall-clock dt is poured into the accumulator;
- *        the accumulator is drained one TICK_NS chunk at a time into
- *        scene_tick() calls. The simulation sees a STABLE per-tick
- *        dt regardless of frame jitter. This is the well-known
- *        "Glenn Fiedler / 'Fix Your Timestep!'" pattern.
- *
- *     2) FPS METER                  (fps_accum_ns + fps_frame_count)
- *        Sum frame dts and count frames; every FPS_UPDATE_MS of wall
- *        clock, divide frames/seconds to refresh `fps_display`. The
- *        HUD reads `fps_display` only — never the running accums.
- *
- * MEMORY / COST
- *   3 × int64 + 1 × int + 1 × double = 36 bytes. Stack-resident in
- *   main(). Touched a handful of times per frame; cache cost trivial.
- *
- * MEMBER LOGIC
- *   frame_time_ns   : Wall clock (CLOCK_MONOTONIC, in nanoseconds)
- *                     at the START of the current frame. The next
- *                     frame's dt = clock_ns() − frame_time_ns.
- *                     int64 because nanoseconds since boot doesn't
- *                     fit in 32 bits.
- *
- *   sim_accum_ns    : Wall-clock ns received from frames but not yet
- *                     drained into sim ticks. Always ≥ 0; never
- *                     resets except on stall (frame_clock_resync).
- *                     In steady state it oscillates between 0 and
- *                     TICK_NS as the loop pumps it.
- *
- *   fps_accum_ns    : Wall-clock ns since the last FPS readout
- *                     refresh. Reset to 0 every FPS_UPDATE_MS.
- *
- *   fps_frame_count : Number of frames observed since the last FPS
- *                     readout refresh. Reset alongside fps_accum_ns.
- *                     Plain int — even 10,000 fps for 500 ms is
- *                     5000, nowhere near INT_MAX.
- *
- *   fps_display     : Last computed instantaneous frame rate
- *                     (frames per second, as a double). The ONE
- *                     member the renderer / HUD actually reads;
- *                     the accumulators above only feed this.
- *
- * Refs:
- *   • Glenn Fiedler, "Fix Your Timestep!" (gafferongames.com)
- *     — canonical write-up of the accumulator+fixed-step pattern.
- *   • POSIX clock_gettime(CLOCK_MONOTONIC) — the wall-clock source
- *     (in §2 clock); guaranteed strictly increasing, immune to NTP
- *     jumps, suitable for frame timing.
+ *   frame_time_ns   — the clock reading at the start of this frame; next
+ *                     frame subtracts it to learn how long this one took.
+ *   sim_accum_ns    — leftover time waiting to be spent on sim ticks.
+ *   fps_accum_ns    — time piled up since we last recomputed the frame rate.
+ *   fps_frame_count — frames counted since then.
+ *   fps_display     — the latest frame rate; the only field the HUD reads.
  */
 typedef struct {
-    int64_t frame_time_ns;     /* wall clock at start of current frame    */
-    int64_t sim_accum_ns;      /* unconsumed time → sim ticks (Fiedler)   */
-    int64_t fps_accum_ns;      /* ns since last FPS recomputation         */
-    int     fps_frame_count;   /* frames since last FPS recomputation     */
-    double  fps_display;       /* last computed FPS — the value HUD reads */
+    int64_t frame_time_ns;
+    int64_t sim_accum_ns;
+    int64_t fps_accum_ns;
+    int     fps_frame_count;
+    double  fps_display;
 } FrameClock;
 
 static void frame_clock_init(FrameClock *fc)
@@ -2580,16 +1683,16 @@ static void frame_clock_init(FrameClock *fc)
     fc->fps_display     = 0.0;
 }
 
-/* Re-anchor the clock after a stall (e.g. SIGWINCH resize) so we don't
- * burst-tick to "catch up" on time the user wasn't seeing the sim. */
+/* Reset the clock after a pause (like a resize) so we don't try to "catch up"
+ * on all the time that passed while nothing was being shown. */
 static void frame_clock_resync(FrameClock *fc)
 {
     fc->frame_time_ns = clock_ns();
     fc->sim_accum_ns  = 0;
 }
 
-/* Advance the frame clock; return dt since previous frame, capped at
- * MAX_FRAME_DT_NS to prevent the spiral-of-death failure mode. */
+/* Start a new frame; return how long since the last one, capped so a long
+ * freeze can't make the sim try to catch up all at once. */
 static int64_t frame_clock_advance(FrameClock *fc)
 {
     int64_t now = clock_ns();
@@ -2599,8 +1702,8 @@ static int64_t frame_clock_advance(FrameClock *fc)
     return dt;
 }
 
-/* FPS meter — accumulate frame dt; when FPS_UPDATE_MS worth has piled
- * up, divide frames by elapsed seconds and refresh the display value. */
+/* Count frames and elapsed time; every half second or so, work out the frame
+ * rate from them and refresh the number the HUD shows. */
 static void fps_meter_observe(FrameClock *fc, int64_t frame_dt_ns)
 {
     fc->fps_frame_count++;
@@ -2613,12 +1716,11 @@ static void fps_meter_observe(FrameClock *fc, int64_t frame_dt_ns)
     }
 }
 
-/* ---------- Main-loop step helpers ----------------------------------- */
+/* ---------- main-loop steps ------------------------------------------- */
 
-/* Fiedler's fixed-timestep tick drain. Pour this frame's dt into the
- * accumulator, then consume it one TICK_NS chunk at a time, calling
- * scene_tick() with a STABLE per-tick dt — so the simulation behaves
- * identically regardless of render-frame jitter. */
+/* Spend this frame's elapsed time on sim updates, one fixed-size tick at a
+ * time, so the sim always advances by an even step no matter how jumpy the
+ * frame rate is. */
 static void app_run_fixed_step_ticks(App *app, FrameClock *fc,
                                      int64_t frame_dt_ns)
 {
@@ -2632,9 +1734,8 @@ static void app_run_fixed_step_ticks(App *app, FrameClock *fc,
     }
 }
 
-/* Sleep so the render loop spins at RENDER_FPS_TARGET. Compute how
- * much wall-clock has been consumed this iteration (tick work + the
- * frame-to-frame gap) and sleep the remainder of the frame budget. */
+/* Sleep just long enough to hold the redraw rate steady: figure out how much
+ * of this frame's time budget is already used up and wait out the rest. */
 static void app_throttle_to_render_rate(int64_t frame_start_ns,
                                         int64_t frame_dt_ns)
 {
@@ -2644,8 +1745,7 @@ static void app_throttle_to_render_rate(int64_t frame_start_ns,
     clock_sleep_ns(target_frame_period_ns - time_consumed_ns);
 }
 
-/* Drain one key event (non-blocking) and route it to app_handle_key.
- * Quit returns false from the handler → we clear app->running. */
+/* Grab a key if one's waiting and act on it; quitting stops the main loop. */
 static void app_pump_input(App *app)
 {
     int ch = getch();
@@ -2653,9 +1753,8 @@ static void app_pump_input(App *app)
         app->running = 0;
 }
 
-/* Wire SIGINT / SIGTERM → exit flag, SIGWINCH → resize flag.
- * Handler bodies are tiny (one volatile flip each) so they stay
- * inside the POSIX signal-safety envelope. */
+/* Hook up Ctrl-C / kill to quit, and terminal-resize to the resize flag.
+ * The handlers only flip one flag each, which is all that's safe to do here. */
 static void app_install_signal_handlers(void)
 {
     signal(SIGINT,   on_exit_signal);
@@ -2664,24 +1763,13 @@ static void app_install_signal_handlers(void)
 }
 
 /*
- * main — top-level driver. Reads as pseudocode:
- *
- *   bootstrap (PRNG seed, signal handlers, atexit cleanup)
- *   init terminal → pick grid size → init simulation
- *   init frame clock
- *   LOOP until app.running goes false:
- *     handle pending resize
- *     advance frame clock → frame_dt
- *     run fixed-step sim ticks (Fiedler)
- *     fps meter
- *     throttle to render rate
- *     draw scene + HUD; present
- *     pump input (may clear running)
- *   shutdown terminal
+ * main — set things up, then loop: handle any resize, update the sim by the
+ * right amount, draw a frame, read input, repeat until the user quits.
  */
 int main(void)
 {
-    /* STEP 1 — bootstrap */
+    /* Seed randomness, make sure the terminal gets restored on exit, listen
+     * for signals. */
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
     app_install_signal_handlers();
@@ -2690,12 +1778,11 @@ int main(void)
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
 
-    /* STEP 2 — terminal + simulation init */
+    /* Start the terminal, size the grid to fit, build the simulation. */
     screen_init(&app->screen);
     app_pick_map_size(app);
     scene_init(&app->scene, app->map_w, app->map_h);
 
-    /* STEP 3 — main loop */
     FrameClock clock;
     frame_clock_init(&clock);
 
@@ -2717,7 +1804,6 @@ int main(void)
         app_pump_input(app);
     }
 
-    /* STEP 4 — shutdown */
     screen_free(&app->screen);
     return 0;
 }

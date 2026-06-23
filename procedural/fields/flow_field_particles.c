@@ -1,354 +1,26 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * flow_field_particles.c
- *   — Particles streaming through closed-form 2-D vector fields.
  *
- * DEMO: 256 particles flow through one of THIRTY algebraically-defined
- *       2-D vector fields. Unlike the noise-based showcases in this
- *       folder, every field here is a CLOSED-FORM expression — pure
- *       (x, y, t) → (vx, vy) math, no Perlin / Worley / etc. The
- *       patterns span the canonical dynamical-systems and fluid-
- *       dynamics textbook taxonomy:
+ * Drop a few hundred dust specks onto an invisible "wind" and watch
+ * them trace it. Each of the 30 wind patterns is written out as a
+ * plain formula (no random noise) — swirls, magnets, waves, and the
+ * famous phase-plane pictures from dynamical-systems textbooks.
+ * Bright '@' marks the special points each wind spins around.
  *
- *         Rotational           : VORTICES SPIRAL CIRCULAR CHAIN GRID
- *                                GALAXY TURBULENT EDDY HURRICANE
- *         Radial / linear      : SADDLE MAGNET RADIAL SHEAR JET
- *                                GRADIENT QUADPOLE PITCHFORK
- *         Time-varying waves   : WAVE RIPPLE STANDING PLANE WAKE
- *         Nonlinear oscillators: DUFFING VANDERPOL PENDULUM LOTKA HOPF
- *                                HAMILTON NEWTON HENON
+ * Sister files (same particle engine, different wind source):
+ *   ./perin_noise_flow_showcase.c — wind comes from Perlin noise.
+ *   ./curl_noise_vector_field.c   — swirl-only noise; nothing converges.
  *
- *       The top HUD shows the current pattern + [N/30] index. n/p
- *       cycles. Equilibria / singularities / poles are drawn as
- *       bright '@' glyphs on top of the particle trails so the
- *       field's salient points stay visible. Themes shape colour.
- *
- * Study alongside:
- *   ./perin_noise_flow_showcase.c — same particle-flow architecture,
- *       but the field source is Perlin noise. Compare the streamline
- *       SHAPES: noise gives organic eddies, this file gives clean
- *       textbook fields.
- *   ./curl_noise_vector_field.c — divergence-free curl-of-noise
- *       fields. Particles never converge there; here, MAGNET and
- *       SADDLE explicitly DO converge / diverge.
- *
- * Section map:
- *   §1 config   — grid, particles, palette, themes, named constants
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes
- *   §5 fields   — 30 closed-form (vx, vy) functions
- *   §6 attractors — per-pattern centre / equilibrium placement
- *   §7 scene    — Scene struct composing Grid, RenderBuffers,
- *                 Particles, AttractorPool, SimState, Controls; the
- *                 per-frame tick / particle-step pipeline
- *   §8 screen   — ASCII render: density glyphs + attractor markers
- *                 + named HUD drawers
- *   §9 app      — signals, resize, named main-loop helpers
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reset (re-seed particles, re-randomise field state)
- *   n / N      next pattern
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   g / G      next / previous glyph set (slim → fat)
- *   + / =      faster particles
- *   -          slower
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra flow_field_particles.c \
- *       -o flow_field -lncurses -lm
+ * Where the patterns come from:
+ *   Strogatz, "Nonlinear Dynamics and Chaos" — the textbook tour of
+ *     saddles, spirals, limit cycles, and bifurcations seen here.
+ *   Guckenheimer & Holmes — the rigorous normal forms for Duffing,
+ *     Van der Pol, Hopf, Hamilton.
+ *   Hénon (1976), Comm. Math. Phys. 50:69 — the (a,b)=(1.4,0.3) map.
+ *   von Kármán (1911) — the alternating vortex street (CHAIN, WAKE).
+ *   Bourke ASCII grey-scale ramp — the low/mid/high glyph idea.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Particle advection through a time-varying 2-D vector
- *                  field. For each particle, look up (vx, vy) at its
- *                  current position, step by (vx, vy) · dt, paint a
- *                  trail. Thirty patterns expose thirty different
- *                  field generators; the particle simulation is
- *                  identical across all of them.
- *
- *                  Field generators (closed-form, no noise) span four
- *                  families:
- *
- *                  Rotational / vortex:
- *                    VORTICES, SPIRAL, CIRCULAR, CHAIN, GRID, GALAXY,
- *                    TURBULENT, EDDY, HURRICANE — vortex sums, single
- *                    swirls, Gaussian-envelope hurricanes, etc.
- *
- *                  Radial / linear:
- *                    SADDLE, MAGNET, RADIAL, SHEAR, JET, GRADIENT,
- *                    QUADPOLE, PITCHFORK — source/sink, attract/repel,
- *                    pure outflow, parabolic flow, gradient descent.
- *
- *                  Time-varying waves:
- *                    WAVE, RIPPLE, STANDING, PLANE, WAKE — sinusoidal
- *                    flows, expanding waves, standing patterns,
- *                    plane-wave directional flow, Kármán wakes.
- *
- *                  Nonlinear oscillators (textbook phase planes):
- *                    DUFFING, VANDERPOL, PENDULUM, LOTKA, HOPF,
- *                    HAMILTON, NEWTON, HENON — the canonical
- *                    Strogatz / Guckenheimer-Holmes phase portraits.
- *
- *                  Attractor / vortex POSITIONS that belong to "live"
- *                  patterns drift slowly (orbit around their nominal
- *                  centres) so the flow evolves without resetting.
- *
- * Data-structure : Scene is the umbrella context, composed of six
- *                  sub-structs so each layer has ONE clear role and
- *                  no globals leak across them:
- *                    Grid          — w, h, total_cells + grid_idx() /
- *                                    grid_in_bounds().
- *                    RenderBuffers — per-cell glow + colour band; the
- *                                    complete render contract between
- *                                    the particle layer (§7) and the
- *                                    screen layer (§8).
- *                    Particles     — fixed pool of advection walkers
- *                                    (pool[], n).
- *                    AttractorPool — base list of Attractors plus a
- *                                    per-frame "active" copy with
- *                                    drift applied. Drives the field
- *                                    for attractor-based patterns and
- *                                    supplies '@' marker positions
- *                                    for all patterns.
- *                    SimState      — field_time (the only mutable
- *                                    sim scalar).
- *                    Controls      — paused / speed / theme / glyph
- *                                    set / pattern; mutated only by
- *                                    the keyboard.
- *                  No heap; everything BSS.
- *
- * Rendering      : ASCII only. Density-graded trail glyphs chosen
- *                  from one of five GlyphSets (slim → fat) in 4 theme
- *                  colours. Bright '@' over attractor positions
- *                  (vortex centres, magnet poles, oscillator
- *                  equilibria) so the field's salient points are
- *                  visible against the streamline pattern.
- *
- * Performance    : 1–20 attractor evaluations per particle per frame
- *                  (TURBULENT and GRID are the heaviest at ~20 / 9).
- *                  With 256 particles at 60 Hz that's < 1 % of one
- *                  core on modern hardware.
- *
- * References     : Dynamical-systems theory (covers most patterns)
- *                  ─────────────────────────────────────────────────
- *                  • Strogatz, S. — "Nonlinear Dynamics and Chaos"
- *                    (2nd ed, Westview). THE foundational text for
- *                    everything in this file: phase plane analysis
- *                    (saddle / centre / spiral / node classification),
- *                    separatrix, bifurcations (pitchfork in ch. 3,
- *                    Hopf in ch. 8), limit cycles (Van der Pol in
- *                    ch. 7), basin separators (Duffing). Reads like
- *                    a textbook tour of the patterns in §5.
- *                  • Guckenheimer, J. & Holmes, P. — "Nonlinear
- *                    Oscillations, Dynamical Systems, and Bifurcations
- *                    of Vector Fields" (Springer). The rigorous
- *                    companion to Strogatz; source for the canonical
- *                    DUFFING, VANDERPOL, HOPF, HAMILTON normal forms.
- *                  • Devaney, R. — "An Introduction to Chaotic
- *                    Dynamical Systems" (3rd ed). Newton's-method
- *                    fractals (NEWTON pattern, ch. 11) and iterated
- *                    maps with strange attractors (HENON, ch. 9).
- *
- *                  Seminal papers behind specific patterns
- *                  ───────────────────────────────────────
- *                  • Lotka, A. J. (1925) — "Elements of Physical
- *                    Biology" + Volterra, V. (1926) — "Variazioni e
- *                    fluttuazioni del numero d'individui in specie
- *                    animali conviventi". Independent originals of
- *                    the predator-prey equations the LOTKA pattern
- *                    visualises.
- *                  • von Kármán, T. (1911) — "Über den Mechanismus
- *                    des Widerstandes, den ein bewegter Körper in
- *                    einer Flüssigkeit erfährt", Göttinger Nachr.
- *                    Original analysis of the alternating vortex
- *                    street that CHAIN and WAKE display.
- *                  • Hénon, M. (1976) — "A two-dimensional mapping
- *                    with a strange attractor", Comm. Math. Phys.
- *                    50:69-77. The HENON map; one of the first
- *                    explicitly-computed strange attractors and the
- *                    direct source of the (a, b) = (1.4, 0.3) values.
- *
- *                  Rendering / numerical practice
- *                  ──────────────────────────────
- *                  • Inigo Quilez — "Distance functions for 2-D
- *                    primitives":
- *                    https://iquilezles.org/articles/distfunctions2d/
- *                    Practical stable forms for the inverse-square
- *                    attractor with a softening epsilon (the EPS_R2
- *                    trick used throughout §5).
- *                  • Paul Bourke — "Character representation of grey
- *                    scale images":
- *                    https://paulbourke.net/dataformats/asciiart/
- *                    The canonical density → glyph ramp reference
- *                    behind the trail-density tiers (low / mid /
- *                    high) and the five GlyphSet ramps in §1.
- *
- *                  See also
- *                  ────────
- *                  • Compare ./perin_noise_flow_showcase.c (noise-
- *                    based particle flow) and
- *                    ./curl_noise_vector_field.c (divergence-free
- *                    curl flow) — same particle architecture, but
- *                    the field source differs in revealing ways.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A 2-D vector field assigns a velocity to every point. Drop particles,
- * read off their local velocity, step them forward. The choice of
- * field determines the streamlines: rotational fields make swirls,
- * radial fields make spokes, periodic fields make waves, nonlinear
- * oscillators make limit cycles. All thirty patterns here are pure
- * math — no random component except the seeding of vortex positions.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine the screen as a windy plain. The "wind" pattern is what we
- * draw. Drop dust on it and watch the dust trace the wind. Each
- * pattern is a different wind, grouped by family:
- *
- *   Rotational fields:
- *     VORTICES  — four hurricanes spinning at quarter-points.
- *     SPIRAL    — single hurricane that ALSO sucks dust inward.
- *     CIRCULAR  — gentle uniform rotation, concentric orbits.
- *     CHAIN     — Kármán vortex street: alternating-spin row.
- *     GRID      — 3×3 checkerboard of alternating mini-tornadoes.
- *     GALAXY    — central swirl with cos(2θ) spiral arms.
- *     TURBULENT — many small whirlwinds chaotically interacting.
- *     EDDY      — single smooth Gaussian-falloff swirl (no singularity).
- *     HURRICANE — vortex + inflow with a clear calm eye and bright
- *                 eyewall — Maxwell-envelope wind profile.
- *
- *   Radial / linear fields:
- *     RADIAL    — pure source; dust radiates outward.
- *     SADDLE    — wind blows OUT along x and IN along y.
- *     SHEAR     — horizontal wind, faster the further N/S you are.
- *     MAGNET    — opposing poles; flow from − to +.
- *     JET       — parabolic pipe flow; fast centre line.
- *     GRADIENT  — steepest descent on a Gaussian well; converges
- *                 to centre from every direction.
- *     QUADPOLE  — four alternating poles at square corners.
- *     PITCHFORK — pitchfork bifurcation: two stable wells, saddle
- *                 separator on the y-axis.
- *
- *   Time-varying / wave fields:
- *     WAVE      — wind blowing in undulating waves like ocean swell.
- *     RIPPLE    — circular wavefronts radiating from the centre.
- *     STANDING  — standing wave: spatial pattern pulses in time.
- *     PLANE     — directional travelling plane wave.
- *     WAKE      — uniform freestream + Kármán wake downstream of an
- *                 obstacle.
- *
- *   Nonlinear oscillators (phase-plane portraits):
- *     DUFFING   — Duffing oscillator: two stable wells, basin separator.
- *     VANDERPOL — Van der Pol limit cycle (self-sustaining oscillation).
- *     PENDULUM  — simple pendulum: separatrix between libration and
- *                 rotation.
- *     LOTKA     — Lotka-Volterra predator-prey closed orbits.
- *     HOPF      — Hopf bifurcation: limit cycle born "out of nothing".
- *     HAMILTON  — Hamiltonian double-well: figure-eight separatrix.
- *     NEWTON    — Newton's method for z³=1: three basins, fractal
- *                 boundary.
- *     HENON     — continuous-time Hénon strange attractor.
- *
- * Each pattern has its own SIGNATURE streamlines. With practice you
- * can identify the field type at a glance from the particle trails.
- *
- * Visible layers:
- *   1. PARTICLE TRAILS — fading paths (theme-coloured) showing where
- *      particles have flowed. Density encodes how often particles
- *      cross each cell.
- *   2. ATTRACTORS '@' — bright glyphs marking vortex centres, magnet
- *      poles, oscillator equilibria, basin separators. Visible over
- *      the trails so you can see exactly which singularities are
- *      driving the flow.
- *   3. SLOW DRIFT — vortex / magnet positions orbit around their
- *      nominal centres at ~0.2 rad/s, so the flow evolves rather
- *      than freezing. (Time-varying patterns get their time
- *      variation from the formula itself.)
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. INIT. Spawn N particles uniformly in-bounds. Initialise the
- *     pattern's attractors (count + positions vary per pattern).
- *  2. PER FRAME:
- *     a. Decay the per-cell trail glow exponentially.
- *     b. Advance sim.field_time by dt.
- *     c. Refresh active attractor positions from base + drift.
- *     d. For each particle:
- *        i.   Sample (vx, vy) from the active pattern's field
- *             function at the particle's position.
- *        ii.  Normalise to unit direction.
- *        iii. Step by direction · speed · dt; increment age.
- *        iv.  Paint a trail hit at the new cell.
- *        v.   If age ≥ max_age or position out of bounds, respawn.
- *     e. Render trails (density glyphs) + attractor markers ('@').
- *  3. The user can press 'r' to re-seed particles and re-randomise
- *     attractor positions. There is no automatic reset — the field
- *     runs indefinitely until you ask for a new one.
- *
- * KEY FORMULAS
- * ────────────
- *  Vortex contribution           :
- *    v_i = (−Δy, Δx) · S / max(r², ε)
- *  Spiral (vortex + inflow)      :
- *    v = (−Δy, Δx) · S/r²  +  −(Δx, Δy) · I/r²
- *  Circular (uniform rotation)   :
- *    v = (−Δy, Δx) · α
- *  Galaxy (with spiral arms)     :
- *    arm = 1 + κ · cos(2θ − r·k_arm)
- *    v = (−Δy, Δx) · S·arm/r²  +  −(Δx, Δy) · I/r²
- *  Saddle (hyperbolic)           :
- *    vx = α · (x − cx),  vy = −α · (y − cy)
- *  Radial source                 :
- *    v = (Δx, Δy) · α
- *  Shear (Couette)               :
- *    vx = α · (y − cy),  vy = 0
- *  Magnet (gravity-style)        :
- *    v_i = −sign · (Δx, Δy) / max(r², ε)
- *  Jet (Poiseuille)              :
- *    vx = α · (1 − ((y − cy)/H)²),  vy = 0
- *  Gradient descent              :
- *    v = −∇exp(−r²/2σ²) = −(Δx, Δy)/σ² · exp(−r²/2σ²)
- *  Wave field                    :
- *    vx = sin(ωy + t),  vy = cos(ωx − t)
- *  Ripple (radial wave)          :
- *    v = (Δx/r, Δy/r) · sin(r·k − t·ω) · A
- *  Standing wave                 :
- *    v = (sin(kx), sin(ky)) · cos(ωt) · A
- *  Plane wave                    :
- *    v = (k_x, k_y) / |k| · sin(k·r − ωt) · A
- *  Duffing oscillator            :
- *    vx = y',  vy = −x' − δy' − x'³
- *  Van der Pol oscillator        :
- *    vx = y',  vy = μ(1 − x'²)y' − x'
- *  Pendulum                      :
- *    vx = y',  vy = −sin(x')
- *  Lotka-Volterra                :
- *    vx = αx' − βx'y',  vy = δx'y' − γy'
- *  Hopf bifurcation              :
- *    vx = μx' − y' − x'·(x'² + y'²)
- *    vy = x' + μy' − y'·(x'² + y'²)
- *  Hamilton (double-well)        :
- *    vx = y',  vy = x' − 2x'³
- *  Pitchfork bifurcation         :
- *    vx = μx' − x'³,  vy = −y'
- *  Newton (z³ − 1)               :
- *    v = −f(z)/f'(z),  f(z) = z³ − 1
- *  Hénon (continuous form)       :
- *    vx = 1 − ax'² + y' − x',  vy = bx' − y'
- *  Step (all patterns)           :
- *    (Δx, Δy) = unit(v) · speed · dt
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -383,95 +55,95 @@ enum {
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* Particle pool. */
+    /* How many dust specks. The pool is sized big; we only switch on 256. */
     MAX_PARTICLES     = 1024,
     N_PARTICLES_DEF   =  256,
 
-    /* Particle lifetime (ticks). Different per particle to break the
-     * lockstep "everyone respawns at the same time" effect. */
+    /* How many frames a speck lives before it's recycled. Each speck
+     * gets a random lifetime in this range so they don't all vanish
+     * and respawn together in one ugly blink. */
     AGE_MIN_TICKS     =  60,
     AGE_MAX_TICKS     = 360,
 
-    /* Speed: cells per second. */
+    /* How fast specks move, in cells per second. */
     SPEED_MIN         =   1,
     SPEED_DEF         =   8,
     SPEED_MAX         =  64,
 
-    /* Maximum simultaneous attractors (max needed: TURBULENT = 20). */
+    /* Room for the most crowded pattern (TURBULENT uses 20). */
     MAX_ATTRACTORS    =  32,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Colour-pair slots. HUD/HINT slots are reserved project-wide. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_TRAIL_BASE   =   3,    /* PAIR_TRAIL_BASE..+(N_BANDS-1) palette  */
-    PAIR_ATTRACT      =   7,    /* '@' attractor markers                  */
+    PAIR_TRAIL_BASE   =   3,    /* the 4 trail colours start here */
+    PAIR_ATTRACT      =   7,    /* the bright '@' marker colour   */
 };
 
-#define TRAIL_GLOW_DECAY    0.6f
-#define GLOW_THRESHOLD      0.05f
-#define VELOCITY_EPSILON    1e-6f   /* below this magnitude, skip normalize */
-#define TRAIL_HIT_INTENSITY 1.0f    /* glow value deposited at particle cell */
+#define TRAIL_GLOW_DECAY    0.6f    /* how fast trails fade out */
+#define GLOW_THRESHOLD      0.05f   /* dimmer than this and a cell shows nothing */
+#define VELOCITY_EPSILON    1e-6f   /* basically-zero wind: don't try to normalise it */
+#define TRAIL_HIT_INTENSITY 1.0f    /* brightness a speck stamps onto its cell */
 
-#define DRIFT_RATE          0.2f    /* attractor orbital rate (rad/s) */
+#define DRIFT_RATE          0.2f    /* how fast the '@' points slowly wander (rad/s) */
 
-/* Field strength scales — tuned so particle motion is consistent
- * across all patterns at SPEED_DEF. Output magnitudes get normalised
- * to unit length in particle_step, so the values below mostly
- * control which attractor wins in multi-attractor sums. */
+/* How strong each kind of wind pushes. The speck's step is normalised
+ * to one unit anyway, so for single-source winds these numbers barely
+ * matter — they mostly decide which source wins when several add up. */
 #define VORTEX_STRENGTH     80.0f
 #define MAGNET_STRENGTH     50.0f
 #define TURBULENT_STRENGTH   6.0f
 #define WAVE_FREQ           0.15f
 #define SADDLE_RATE         0.05f
-#define EPS_R2              4.0f    /* softening: avoid divide-by-zero at attractor centres */
+#define EPS_R2              4.0f    /* tiny cushion so we never divide by zero at a source */
 
-/* SPIRAL — vortex + radial inflow. Both components decay as 1/r² so
- * the spiral has constant pitch (logarithmic spiral, Bernoulli). */
+/* SPIRAL — a swirl that also pulls inward, so specks corkscrew toward
+ * the middle. */
 #define SPIRAL_STRENGTH     80.0f
 #define SPIRAL_INFLOW       20.0f
 
-/* RADIAL — pure source radiating outward from map centre. */
+/* RADIAL — everything pushed straight out from the centre. */
 #define RADIAL_RATE          0.5f
 
-/* SHEAR — linear horizontal shear; vx grows with vertical distance
- * from the centre line. Classic Couette-flow profile. */
+/* SHEAR — a flat horizontal wind that's faster the further up or down
+ * you go (like layers sliding past each other). */
 #define SHEAR_RATE           0.3f
 
-/* RIPPLE — radial sinusoidal wave from map centre. */
-#define RIPPLE_WAVENUMBER    0.3f   /* spatial frequency along r       */
-#define RIPPLE_FREQUENCY     1.5f   /* temporal frequency              */
+/* RIPPLE — rings of wind spreading out from the centre. */
+#define RIPPLE_WAVENUMBER    0.3f   /* how tightly packed the rings are */
+#define RIPPLE_FREQUENCY     1.5f   /* how fast they pulse              */
 #define RIPPLE_AMPLITUDE     5.0f
 
-/* CIRCULAR — uniform rotation around map centre. */
+/* CIRCULAR — gentle even spin around the centre. */
 #define CIRCULAR_RATE        0.3f
 
-/* CHAIN — Kármán vortex street: row of alternating-sign mini-vortices. */
+/* CHAIN — a row of swirls that spin in alternating directions. */
 #define CHAIN_STRENGTH      50.0f
 #define CHAIN_COUNT          6
-#define CHAIN_ZIGZAG_Y       4.0f   /* alternating vertical offset     */
+#define CHAIN_ZIGZAG_Y       4.0f   /* nudge each swirl up/down so the row isn't a straight line */
 
-/* GRID — N×N checkerboard of alternating vortices. */
+/* GRID — a 3x3 checkerboard of swirls, neighbours spinning opposite ways. */
 #define GRID_STRENGTH       30.0f
-#define GRID_COUNT           3      /* 3×3 grid                        */
+#define GRID_COUNT           3
 
-/* GALAXY — central vortex with cos(2θ − k·r) arm modulation. */
+/* GALAXY — a central swirl with brighter spiral arms. */
 #define GALAXY_STRENGTH     80.0f
-#define GALAXY_ARM_AMP       0.4f   /* arm contrast (0 = uniform)      */
-#define GALAXY_ARM_PITCH     0.15f  /* radial slope of arm phase       */
+#define GALAXY_ARM_AMP       0.4f   /* how much the arms stand out (0 = no arms) */
+#define GALAXY_ARM_PITCH     0.15f  /* how tightly the arms wind up            */
 #define GALAXY_INFLOW       20.0f
 
-/* DUFFING — phase plane of the Duffing oscillator. */
+/* DUFFING — oscillator with two resting spots and a divide between them. */
 #define DUFFING_DAMPING      0.2f
-#define DUFFING_SCALE        0.05f
+#define DUFFING_SCALE        0.05f   /* shrinks screen coords into the math's range */
 
-/* VANDERPOL — Van der Pol limit-cycle oscillator. */
+/* VANDERPOL — oscillator that settles onto one steady loop. */
 #define VANDERPOL_MU         1.5f
 #define VANDERPOL_SCALE      0.07f
 
-/* PENDULUM — phase plane of a simple pendulum (vx = y', vy = -sin x'). */
+/* PENDULUM — the classic swing picture: small wiggles vs. full spins. */
 #define PENDULUM_SCALE       0.08f
 
-/* LOTKA — Lotka-Volterra predator-prey. */
+/* LOTKA — predator-prey cycles (foxes and rabbits chasing each other). */
 #define LOTKA_ALPHA          1.0f
 #define LOTKA_BETA           1.0f
 #define LOTKA_GAMMA          1.0f
@@ -479,78 +151,73 @@ enum {
 #define LOTKA_SCALE          0.012f
 #define LOTKA_OFFSET         1.0f
 
-/* HOPF bifurcation. */
+/* HOPF — a steady loop that appears as the wind strengthens. */
 #define HOPF_MU              1.0f
 #define HOPF_SCALE           0.06f
 
-/* NEWTON — Newton's method for z³ = 1. */
+/* NEWTON — the root-finding flow for z^3 = 1; three basins meet at a
+ * jagged border. */
 #define NEWTON_SCALE         0.04f
 
-/* JET — parabolic pipe-flow (Poiseuille) profile. */
+/* JET — pipe flow: fast down the middle, still at the walls. */
 #define JET_STRENGTH         5.0f
 
-/* HURRICANE — vortex + inflow with Maxwell-like radial envelope. */
+/* HURRICANE — a swirl with inflow and a calm eye in the centre. */
 #define HURRICANE_RADIUS    15.0f
 #define HURRICANE_STRENGTH  10.0f
 #define HURRICANE_INFLOW     3.0f
 
-/* HAMILTON — Hamiltonian double-well. */
+/* HAMILTON — double-well flow shaped like a figure eight. */
 #define HAMILTON_SCALE       0.07f
 
-/* WAKE — uniform freestream + downstream Kármán-street vortices. */
+/* WAKE — steady wind blowing past an obstacle, leaving swirls behind it. */
 #define WAKE_FREESTREAM      3.0f
-#define WAKE_OBSTACLE_REL    0.30f   /* obstacle at 30 % of map width */
-#define WAKE_OBSTACLE_GAP    8.0f    /* downstream gap before first vortex */
-#define WAKE_ZIGZAG_AMP      3.0f    /* alternating vertical offset of vortices */
+#define WAKE_OBSTACLE_REL    0.30f   /* obstacle sits 30% across the map */
+#define WAKE_OBSTACLE_GAP    8.0f    /* gap before the first trailing swirl */
+#define WAKE_ZIGZAG_AMP      3.0f    /* swirls staggered above/below the line */
 #define WAKE_VORTEX_COUNT    5
 #define WAKE_VORTEX_STR     30.0f
 
-/* STANDING wave. */
+/* STANDING — a wave that stays put and pulses in place. */
 #define STANDING_K           0.3f
 #define STANDING_OMEGA       1.0f
 #define STANDING_AMP         5.0f
 
-/* PLANE wave. */
+/* PLANE — a wave marching steadily in one direction. */
 #define PLANE_KX             0.2f
 #define PLANE_KY             0.1f
 #define PLANE_OMEGA          0.7f
 #define PLANE_AMP            5.0f
 
-/* QUADPOLE — 4 alternating poles at corners of a square. */
+/* QUADPOLE — four poles at the corners of a square, signs alternating. */
 #define QUADPOLE_STRENGTH   30.0f
 #define QUADPOLE_SEPARATION  0.18f
 
-/* GRADIENT descent on a 2-D Gaussian well. */
+/* GRADIENT — everything rolls downhill into one central dip. */
 #define GRADIENT_SIGMA      10.0f
 #define GRADIENT_STRENGTH   80.0f
 
-/* EDDY — single Gaussian-falloff vortex. */
+/* EDDY — one soft swirl that fades smoothly with distance, no sharp centre. */
 #define EDDY_SIGMA          12.0f
 #define EDDY_STRENGTH        2.0f
 
-/* PITCHFORK bifurcation. */
+/* PITCHFORK — one resting spot splits into two as the wind strengthens. */
 #define PITCHFORK_MU         1.0f
 #define PITCHFORK_SCALE      0.05f
 
-/* HENON map (continuous-time interpretation). */
+/* HENON — flow version of the famous strange-attractor map. */
 #define HENON_A              1.4f
 #define HENON_B              0.3f
 #define HENON_SCALE          0.03f
 
-/* Number of palette bands per theme. Quartile of trail color. */
+/* Trails come in 4 colour shades, dim to bright. */
 #define N_BANDS              4
 
-#define GLYPH_HIGH_THRESH   0.65f
-#define GLYPH_MID_THRESH    0.30f
+#define GLYPH_HIGH_THRESH   0.65f   /* brightest trails use the "high" glyph */
+#define GLYPH_MID_THRESH    0.30f   /* medium trails use the "mid" glyph     */
 
-/* ── HUD layout ──────────────────────────────────────────────────── *
- * Top HUD carries DATA, bottom HUD carries ACTIONS:
- *   row 0           : title + state bar (fps, Hz, state + [N/M], speed)
- *   row 1           : pattern/theme/palette/parts left, glyph indicator right
- *   row 2           : legend (trails / attractor glyph meanings)
- *   row HUD_TOP..N-2: playable field
- *   row N-1         : keyboard action hint
- */
+/* Where the on-screen info sits. Top three rows show status; the
+ * bottom row lists the keys; the map fills the middle. */
 #define HUD_TOP_ROWS             3
 #define HUD_BOTTOM_ROWS          1
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
@@ -560,15 +227,9 @@ enum {
 #define HUD_PALETTE_LABEL_W       9
 
 /*
- * Pattern — thirty algebraic vector fields. Cycle with n/p.
- *
- *   Rotational:   VORTICES SPIRAL CIRCULAR CHAIN GRID GALAXY TURBULENT
- *                 EDDY HURRICANE
- *   Radial/lin :  SADDLE MAGNET RADIAL SHEAR JET GRADIENT QUADPOLE
- *                 PITCHFORK
- *   Time-vary :   WAVE RIPPLE STANDING PLANE WAKE
- *   Nonlinear  :  DUFFING VANDERPOL PENDULUM LOTKA HOPF HAMILTON
- *                 NEWTON HENON
+ * Pattern — which of the 30 winds is showing. The user cycles through
+ * these with n/p. Roughly: swirls, magnets/poles, travelling waves,
+ * and the textbook oscillator pictures.
  */
 typedef enum {
     PATTERN_VORTICES  =  0,
@@ -645,36 +306,30 @@ static const char *pattern_name(Pattern p)
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* §9 main loop — spiral-of-death dt clamp + frame rate cap (Glenn
- * Fiedler's "Fix Your Timestep"). DT_MAX_NS uses NS_PER_MS so it
- * has to be defined here, after the NS_PER_* macros. */
+/* If the program stalls (e.g. you drag the window), one frame's dt
+ * could be huge. Cap it so we don't try to simulate a thousand steps
+ * at once and lock up. See Glenn Fiedler, "Fix Your Timestep". */
 #define DT_MAX_NS       (100 * NS_PER_MS)
 #define FRAME_CAP_FPS   60
 
 /*
- * Theme — one complete colour palette for the program. Ten of these
- * live in themes[], cycled by t/T.
+ * Theme — one colour scheme. Four trail shades (dim to bright) plus
+ * one bright "flash" colour reserved for the '@' markers, so the
+ * markers stay readable no matter which theme is on. Ten of these
+ * live in themes[]; the user flips through them with t/T.
  *
- * INTENT. The smallest data needed to recolour every visible cell:
- * N_BANDS = 4 trail colours arranged dim → bright, plus a single
- * "flash" accent reused for the bright '@' attractor markers (so the
- * markers stay legible against any palette, theme-independent of the
- * trail).
+ * Each speck is assigned one of the four shades when it's born and
+ * keeps it for life, so a trail reads as one consistent colour even
+ * where it crosses cells another speck painted.
  *
- * BANDING MODEL. Each particle gets a stable color_idx ∈ [0, N_BANDS)
- * at spawn time; the deposited trail then carries that band as the
- * cell's palette index. The four-band split forces theme authors to
- * design the ramp as a coherent low → high progression rather than
- * a random scatter — same discipline as a Houdini ramp parameter.
- *
- * COLOUR FORMAT. xterm-256 indices (NOT RGB). When the terminal
- * exposes fewer than 256 colours, theme_apply() falls back to a
- * fixed 8-colour cycle so the demo still runs on legacy TTYs.
+ * The numbers are xterm-256 colour codes, not red/green/blue values.
+ * On old terminals with fewer colours, theme_apply() swaps in a
+ * basic 8-colour set instead.
  */
 typedef struct {
-    const char *name;             /* short uppercase label shown in HUD */
-    short       trail[N_BANDS];   /* ramp colours: 0 = dim, 3 = bright  */
-    short       flash;            /* '@' attractor marker colour        */
+    const char *name;             /* short label shown in the HUD              */
+    short       trail[N_BANDS];   /* the 4 trail shades, dim (0) to bright (3) */
+    short       flash;            /* colour of the '@' markers                 */
 } Theme;
 
 #define N_THEMES 10
@@ -694,40 +349,28 @@ static const Theme themes[N_THEMES] = {
 };
 
 /*
- * GlyphSet — three ASCII characters representing low / mid / high
- * trail density. Five sets exist (SLIM → FAT thickness ramp); cycle
- * with g/G.
- *
- * INTENT. Different themes want different glyph weights to read
- * cleanly. MONO (greyscale) looks better with the fatter HEAVY ramp;
- * MATRIX looks more "wireframe" with SLIM. Decoupling glyph choice
- * from theme choice lets the user pair them freely without coding
- * up theme × ramp combinations.
- *
- * Three tiers map to the three GLYPH_*_THRESH cutoffs in §1
- * (low ≥ GLOW_THRESHOLD, mid ≥ GLYPH_MID_THRESH, high ≥
- * GLYPH_HIGH_THRESH). The principle behind density → glyph mapping
- * is Paul Bourke's ASCII grey-scale ramp; we use a coarser 3-step
- * ramp here because the field rendering is monotonic-direction
- * (particles flow ALONG streamlines) — finer ramps would just trail
- * more visual noise.
+ * GlyphSet — the three characters used for faint, medium, and strong
+ * trails. Five sets go from thin to chunky; the user picks one with
+ * g/G. Glyph choice is kept separate from theme so any look can pair
+ * with any colour scheme. The three steps line up with the
+ * GLYPH_*_THRESH brightness cutoffs in §1.
  */
 typedef struct {
-    const char *name;       /* short label shown in HUD glyph indicator */
-    char        low;        /* glow > GLOW_THRESHOLD                    */
-    char        mid;        /* glow > GLYPH_MID_THRESH                  */
-    char        high;       /* glow > GLYPH_HIGH_THRESH                 */
+    const char *name;       /* short label shown in the HUD          */
+    char        low;        /* used for the faintest visible trails  */
+    char        mid;        /* used for medium trails                */
+    char        high;       /* used for the brightest trails         */
 } GlyphSet;
 
 #define N_GLYPH_SETS 5
 
 static const GlyphSet glyph_sets[N_GLYPH_SETS] = {
-    /*  name      low  mid  high   visual progression       */
-    { "SLIM",    '.', '\'', ':' },   /* thinnest, sparse     */
-    { "LIGHT",   '.', '*',  '+' },   /* small but visible    */
-    { "MEDIUM",  '.', '*',  '#' },   /* standard (default)   */
-    { "HEAVY",   'o', 'O',  '@' },   /* round, dense         */
-    { "FAT",     '+', '#',  'M' },   /* maximum coverage     */
+    /*  name      low  mid  high */
+    { "SLIM",    '.', '\'', ':' },
+    { "LIGHT",   '.', '*',  '+' },
+    { "MEDIUM",  '.', '*',  '#' },   /* the default */
+    { "HEAVY",   'o', 'O',  '@' },
+    { "FAT",     '+', '#',  'M' },
 };
 
 /* ===================================================================== */
@@ -792,59 +435,44 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * Attractor — the static description of one salient point in the
- * field: a vortex centre, magnet pole, oscillator equilibrium, or
- * decorative '@' marker. Fixed at scene reset; never mutated by
- * the per-tick simulation.
+ * Attractor — one special point in a wind: a swirl centre, a magnet
+ * pole, an oscillator's resting spot, or just a place to draw an '@'.
+ * Set up when the pattern loads and never changed during play.
  *
- * INTENT. Encodes both the FIXED part of the point (nominal centre
- * + strength) and the SLOW DRIFT orbit applied each frame. The
- * orbit is a circular Lissajous of independent radii (ox, oy), so
- * different attractors trace different ellipses around their base
- * — the asymmetry keeps multi-attractor patterns visually alive
- * rather than rigidly locked. Phase φ is per-attractor so they
- * don't all swing in lockstep.
- *
- * Live position is:
- *   x = bx + ox · cos(t · DRIFT_RATE + φ)
- *   y = by + oy · sin(t · DRIFT_RATE + φ)
- *
- * Computed once per frame in compute_active_attractors(), stored
- * in ActiveAttractor (below).
+ * Besides where it sits, it also carries a slow wandering orbit. Each
+ * frame the point drifts a little around its home spot, tracing a
+ * small ellipse (radii ox, oy). Giving each point its own ellipse and
+ * its own starting phase keeps busy multi-swirl patterns from looking
+ * frozen — they breathe instead. The actual wandered position is
+ * worked out each frame into an ActiveAttractor (below).
  */
 typedef struct {
-    float bx, by;     /* base position (drift orbit centre)              */
-    float ox, oy;     /* orbital radii — ellipse semi-axes               */
-    float phase;      /* phase offset φ so attractors drift independently */
-    float strength;   /* multiplier; 0 = marker-only, no field contribution */
-    int   sign;       /* +1 = attractor / CCW vortex, −1 = repeller / CW */
+    float bx, by;     /* home position (centre of the wander ellipse)        */
+    float ox, oy;     /* how far it wanders left/right and up/down           */
+    float phase;      /* its own starting point in the wander, so points     */
+                      /* don't all sway together                             */
+    float strength;   /* how hard it pushes; 0 = just a marker, no push      */
+    int   sign;       /* +1 = pull in / spin one way, -1 = push out / other  */
 } Attractor;
 
 /*
- * ActiveAttractor — the per-frame "live" position of one Attractor
- * after drift is applied. This is what field functions and the
- * renderer both consume.
- *
- * INTENT. Classic graphics-pipeline PRECOMPUTE PATTERN, analogous
- * to vertex-skinning: the expensive trig (cos / sin in the drift
- * formula) is evaluated ONCE per frame for the few dozen attractors
- * we have, not at every field-sample call inside particle_step
- * (which runs 256 × 30 ≈ 8000 times per frame).
- *
- * Decoupling from Attractor also lets field functions take just the
- * "live" slice (x, y, strength, sign) without needing the orbit
- * parameters — tighter signature, more obvious data dependencies.
+ * ActiveAttractor — an Attractor's actual spot for this one frame,
+ * after the wander is applied. The wind formulas and the renderer
+ * both read this. We compute it once per frame for the handful of
+ * points we have, instead of redoing the sin/cos wander math inside
+ * the speck loop (which runs thousands of times a frame).
  */
 typedef struct {
-    float x, y;       /* drifted position, this frame                   */
-    float strength;   /* carried through from Attractor.strength        */
-    int   sign;       /* carried through from Attractor.sign            */
+    float x, y;       /* this frame's position                          */
+    float strength;   /* copied from the Attractor                      */
+    int   sign;       /* copied from the Attractor                      */
 } ActiveAttractor;
 
 /*
- * field_vortices — sum of N vortex contributions. Shared kernel for
- * VORTICES / TURBULENT / CHAIN / GRID — they only differ in attractor
- * placement. Each vortex contributes a tangential velocity ~ 1/r².
+ * field_vortices — add up the push from every swirl. Shared by
+ * VORTICES, TURBULENT, CHAIN, and GRID; those only differ in where
+ * the swirls sit. Each swirl pushes sideways (round it) and weaker
+ * the further away you are.
  */
 static void field_vortices(const ActiveAttractor *att, int n_att,
                            float x, float y,
@@ -863,7 +491,7 @@ static void field_vortices(const ActiveAttractor *att, int n_att,
     *out_vy = vy;
 }
 
-/* field_wave — sinusoidal flow. */
+/* field_wave — wind that rolls in smooth crisscrossing waves. */
 static void field_wave(float x, float y, float t,
                        float *out_vx, float *out_vy)
 {
@@ -871,7 +499,8 @@ static void field_wave(float x, float y, float t,
     *out_vy = cosf(x * WAVE_FREQ - t * 0.7f) * 5.0f;
 }
 
-/* field_saddle — hyperbolic stagnation point. */
+/* field_saddle — pushes out sideways and pulls in vertically, so the
+ * centre is a "pass" specks rush through. */
 static void field_saddle(float x, float y, float cx, float cy,
                          float *out_vx, float *out_vy)
 {
@@ -879,7 +508,8 @@ static void field_saddle(float x, float y, float cx, float cy,
     *out_vy = -(y - cy) * SADDLE_RATE;
 }
 
-/* field_magnet — gravitational dipole (inverse-square attract/repel). */
+/* field_magnet — each pole pulls or pushes straight toward/away,
+ * stronger up close, like gravity or a magnet. */
 static void field_magnet(const ActiveAttractor *att, int n_att,
                          float x, float y,
                          float *out_vx, float *out_vy)
@@ -897,7 +527,8 @@ static void field_magnet(const ActiveAttractor *att, int n_att,
     *out_vy = vy;
 }
 
-/* field_spiral — vortex + 1/r² radial inflow → logarithmic spiral. */
+/* field_spiral — a swirl plus a pull inward, so specks corkscrew
+ * steadily toward the centre. */
 static void field_spiral(const ActiveAttractor *att, int n_att,
                           float x, float y,
                           float *out_vx, float *out_vy)
@@ -917,7 +548,7 @@ static void field_spiral(const ActiveAttractor *att, int n_att,
     *out_vy = vy;
 }
 
-/* field_radial — pure outflow from centre. */
+/* field_radial — everything sprays straight out from the centre. */
 static void field_radial(float x, float y, float cx, float cy,
                           float *out_vx, float *out_vy)
 {
@@ -925,7 +556,8 @@ static void field_radial(float x, float y, float cx, float cy,
     *out_vy = (y - cy) * RADIAL_RATE;
 }
 
-/* field_shear — linear horizontal Couette flow. */
+/* field_shear — flat horizontal wind, faster the further from the
+ * middle line; top and bottom slide opposite ways. */
 static void field_shear(float x, float y, float cy,
                          float *out_vx, float *out_vy)
 {
@@ -934,7 +566,8 @@ static void field_shear(float x, float y, float cy,
     *out_vy = 0.0f;
 }
 
-/* field_ripple — radial sinusoidal wave from centre. */
+/* field_ripple — rings of wind spreading out from the centre, like
+ * dropping a stone in a pond. */
 static void field_ripple(float x, float y, float t, float cx, float cy,
                           float *out_vx, float *out_vy)
 {
@@ -946,7 +579,7 @@ static void field_ripple(float x, float y, float t, float cx, float cy,
     *out_vy = (dy / r) * wave * RIPPLE_AMPLITUDE;
 }
 
-/* field_circular — pure uniform rotation around centre. */
+/* field_circular — even spin around the centre, like a record player. */
 static void field_circular(float x, float y, float cx, float cy,
                             float *out_vx, float *out_vy)
 {
@@ -954,7 +587,8 @@ static void field_circular(float x, float y, float cx, float cy,
     *out_vy =  (x - cx) * CIRCULAR_RATE;
 }
 
-/* field_galaxy — central vortex with cos(2θ − k·r) arm modulation. */
+/* field_galaxy — a central swirl whose strength ripples around the
+ * circle, carving out brighter spiral arms. */
 static void field_galaxy(const ActiveAttractor *att, int n_att,
                           float x, float y,
                           float *out_vx, float *out_vy)
@@ -977,7 +611,8 @@ static void field_galaxy(const ActiveAttractor *att, int n_att,
     *out_vy = vy;
 }
 
-/* field_duffing — vx = y',  vy = −x' − δy' − x'³. */
+/* field_duffing — the swing-pattern of a spring with two resting
+ * spots; specks fall toward one or the other. */
 static void field_duffing(float x, float y, float cx, float cy,
                            float *out_vx, float *out_vy)
 {
@@ -987,7 +622,8 @@ static void field_duffing(float x, float y, float cx, float cy,
     *out_vy = -xp - DUFFING_DAMPING * yp - xp * xp * xp;
 }
 
-/* field_van_der_pol — vx = y',  vy = μ(1 − x'²)·y' − x'. */
+/* field_van_der_pol — an oscillator that, from anywhere, settles onto
+ * one steady repeating loop. */
 static void field_van_der_pol(float x, float y, float cx, float cy,
                                float *out_vx, float *out_vy)
 {
@@ -997,8 +633,8 @@ static void field_van_der_pol(float x, float y, float cx, float cy,
     *out_vy = VANDERPOL_MU * (1.0f - xp * xp) * yp - xp;
 }
 
-/* field_pendulum — vx = y',  vy = −sin(x'). Separatrix between
- * libration and rotation. */
+/* field_pendulum — a swing: gentle pushes make it rock back and forth,
+ * a hard push sends it spinning all the way over. */
 static void field_pendulum(float x, float y, float cx, float cy,
                             float *out_vx, float *out_vy)
 {
@@ -1008,8 +644,8 @@ static void field_pendulum(float x, float y, float cx, float cy,
     *out_vy = -sinf(xp);
 }
 
-/* field_lotka — Lotka-Volterra predator-prey. Closed orbits around
- * (γ/δ, α/β) = (1, 1) in dynsys coords. */
+/* field_lotka — predators and prey rising and falling forever in
+ * closed loops (more rabbits, then more foxes, then fewer rabbits...). */
 static void field_lotka(float x, float y, float cx, float cy,
                          float *out_vx, float *out_vy)
 {
@@ -1021,7 +657,8 @@ static void field_lotka(float x, float y, float cx, float cy,
     *out_vy = LOTKA_DELTA * xp * yp - LOTKA_GAMMA * yp;
 }
 
-/* field_hopf — Hopf bifurcation: attracting limit cycle at r = √μ. */
+/* field_hopf — specks spiral onto a single steady ring from both
+ * inside and outside. */
 static void field_hopf(float x, float y, float cx, float cy,
                         float *out_vx, float *out_vy)
 {
@@ -1032,7 +669,8 @@ static void field_hopf(float x, float y, float cx, float cy,
     *out_vy = xp + HOPF_MU * yp - yp * r2;
 }
 
-/* field_newton — Newton's method on z³ = 1; three basins of attraction. */
+/* field_newton — the root-finding flow for z^3 = 1: three pull-points
+ * whose territories meet along a jagged, fractal border. */
 static void field_newton(float x, float y, float cx, float cy,
                           float *out_vx, float *out_vy)
 {
@@ -1047,7 +685,8 @@ static void field_newton(float x, float y, float cx, float cy,
     *out_vy = -(fz_im * fp_re - fz_re * fp_im) / denom;
 }
 
-/* field_jet — parabolic Poiseuille pipe-flow profile. */
+/* field_jet — flow through a pipe: fastest down the middle, dead still
+ * at the top and bottom walls. */
 static void field_jet(float x, float y, float cy, float h_half,
                        float *out_vx, float *out_vy)
 {
@@ -1059,7 +698,8 @@ static void field_jet(float x, float y, float cy, float h_half,
     *out_vy = 0.0f;
 }
 
-/* field_hurricane — vortex + inflow with Maxwell-like radial envelope. */
+/* field_hurricane — a swirl that also draws inward, with the wind
+ * peaking in a ring (the eyewall) and dying down in the calm eye. */
 static void field_hurricane(float x, float y, float cx, float cy,
                              float *out_vx, float *out_vy)
 {
@@ -1073,7 +713,8 @@ static void field_hurricane(float x, float y, float cx, float cy,
     *out_vy = ( dx * HURRICANE_STRENGTH + -dy * HURRICANE_INFLOW) * envelope * invr;
 }
 
-/* field_hamilton — Hamiltonian double-well: figure-eight separatrix. */
+/* field_hamilton — two side-by-side loops that meet in the middle,
+ * tracing a figure eight. */
 static void field_hamilton(float x, float y, float cx, float cy,
                             float *out_vx, float *out_vy)
 {
@@ -1083,7 +724,8 @@ static void field_hamilton(float x, float y, float cx, float cy,
     *out_vy = xp - 2.0f * xp * xp * xp;
 }
 
-/* field_wake — freestream + downstream alternating vortices. */
+/* field_wake — a steady wind blowing right, plus the alternating
+ * swirls that peel off behind the obstacle. */
 static void field_wake(const ActiveAttractor *att, int n_att,
                         float x, float y,
                         float *out_vx, float *out_vy)
@@ -1101,7 +743,8 @@ static void field_wake(const ActiveAttractor *att, int n_att,
     *out_vy = vy;
 }
 
-/* field_standing — standing wave: nodes pulse, antinodes oscillate. */
+/* field_standing — a wave that doesn't travel; the whole pattern just
+ * grows and shrinks in place. */
 static void field_standing(float x, float y, float t,
                             float *out_vx, float *out_vy)
 {
@@ -1110,7 +753,8 @@ static void field_standing(float x, float y, float t,
     *out_vy = sinf(y * STANDING_K) * temporal * STANDING_AMP;
 }
 
-/* field_plane — directional travelling plane wave. */
+/* field_plane — a wave that marches steadily across the screen in one
+ * fixed direction. */
 static void field_plane(float x, float y, float t,
                          float *out_vx, float *out_vy)
 {
@@ -1121,7 +765,8 @@ static void field_plane(float x, float y, float t,
     *out_vy = (PLANE_KY / kmag) * wave;
 }
 
-/* field_gradient — steepest descent on a 2-D Gaussian well. */
+/* field_gradient — there's a dip in the ground at the centre and
+ * everything rolls downhill straight into it. */
 static void field_gradient(float x, float y, float cx, float cy,
                             float *out_vx, float *out_vy)
 {
@@ -1134,7 +779,8 @@ static void field_gradient(float x, float y, float cx, float cy,
     *out_vy = -dy / sigma2 * falloff * GRADIENT_STRENGTH;
 }
 
-/* field_eddy — smooth Gaussian-falloff vortex (no singularity). */
+/* field_eddy — one soft swirl that fades out smoothly with distance,
+ * with no sharp spike at the middle. */
 static void field_eddy(float x, float y, float cx, float cy,
                         float *out_vx, float *out_vy)
 {
@@ -1146,7 +792,8 @@ static void field_eddy(float x, float y, float cx, float cy,
     *out_vy =  dx * EDDY_STRENGTH * falloff;
 }
 
-/* field_pitchfork — vx = μx' − x'³, vy = −y'. Two stable equilibria. */
+/* field_pitchfork — the middle is unstable, so specks fall off to one
+ * of two resting spots on either side. */
 static void field_pitchfork(float x, float y, float cx, float cy,
                              float *out_vx, float *out_vy)
 {
@@ -1156,7 +803,8 @@ static void field_pitchfork(float x, float y, float cx, float cy,
     *out_vy = -yp;
 }
 
-/* field_henon — continuous-time interpretation of the Hénon map. */
+/* field_henon — a flowing version of Hénon's famous map, which folds
+ * specks into a wispy strange attractor. */
 static void field_henon(float x, float y, float cx, float cy,
                          float *out_vx, float *out_vy)
 {
@@ -1171,12 +819,11 @@ static void field_henon(float x, float y, float cx, float cy,
 /* ===================================================================== */
 
 /* ── attractor builders ──────────────────────────────────────────── *
- * Small named factories that compress the repeated boilerplate of
- * attractor construction. Used by the per-pattern placers below. */
+ * Tiny helpers so each pattern's setup below stays short and readable. */
 
-/* make_marker — single-point '@' marker. Strength = 0 means the
- * marker shows up in the render layer but contributes nothing to
- * any field sum (used by patterns whose field is closed-form). */
+/* make_marker — a point that only gets an '@' drawn on it and pushes
+ * nothing (strength 0). For patterns whose wind comes from a formula,
+ * not from these points. */
 static Attractor make_marker(float x, float y)
 {
     return (Attractor){
@@ -1186,9 +833,8 @@ static Attractor make_marker(float x, float y)
     };
 }
 
-/* make_drifting_vortex — vortex that orbits its anchor with small
- * Lissajous radii. The orbit keeps multi-vortex patterns visually
- * alive rather than rigidly locked. */
+/* make_drifting_vortex — a swirl that slowly wanders around its home
+ * spot, so busy patterns keep moving instead of freezing. */
 static Attractor make_drifting_vortex(float bx, float by, float ox, float oy,
                                        float phase, float strength, int sign)
 {
@@ -1200,9 +846,8 @@ static Attractor make_drifting_vortex(float bx, float by, float ox, float oy,
     };
 }
 
-/* place_centre_marker — convenience for the most common case:
- * a single '@' marker at the map centre, no drift. Returns the
- * number of attractors emitted (1 if there's room, else 0). */
+/* place_centre_marker — just one '@' in the middle. Returns how many
+ * points it wrote (1, or 0 if there's no room). */
 static int place_centre_marker(Attractor out[], int max_n, float cx, float cy)
 {
     if (max_n < 1) return 0;
@@ -1211,13 +856,12 @@ static int place_centre_marker(Attractor out[], int max_n, float cx, float cy)
 }
 
 /* ── per-pattern placers ─────────────────────────────────────────── *
- * Each placer knows the attractor layout for one pattern. They all
- * have the same shape: write into out[], up to max_n, return the
- * count. pattern_init_attractors below is just a dispatcher. */
+ * One per pattern: each lays out that pattern's special points. They
+ * all write into out[] (up to max_n) and return how many they wrote.
+ * pattern_init_attractors below just picks the right one. */
 
-/* VORTICES — 4 alternating-spin vortices at the corners of an inner
- * square of half-axes (w/4, h/4) around the map centre. Phases offset
- * by 0.7 rad so they drift independently. */
+/* VORTICES — four swirls spinning in alternating directions, set in a
+ * square around the centre. */
 static int place_vortices_quarters(Attractor out[], int max_n,
                                     float cx, float cy, int w, int h)
 {
@@ -1228,17 +872,17 @@ static int place_vortices_quarters(Attractor out[], int max_n,
         float ang = (float)i * (float)M_PI * 0.5f;
         out[n++] = make_drifting_vortex(
             cx + rx * cosf(ang), cy + ry * sinf(ang),
-            4.0f, 4.0f,                  /* drift orbit radii */
-            (float)i * 0.7f,             /* phase desync     */
+            4.0f, 4.0f,                  /* how far it wanders        */
+            (float)i * 0.7f,             /* each starts wandering off-beat */
             VORTEX_STRENGTH,
-            (i & 1) ? -1 : +1            /* alternate spin   */
+            (i & 1) ? -1 : +1            /* every other one spins back */
         );
     }
     return n;
 }
 
-/* MAGNET — opposing poles 40 % of the map width apart, drifting in
- * phase-anti-phase so they oscillate toward and away from each other. */
+/* MAGNET — two opposite poles set apart left and right, wandering in
+ * and out so they breathe toward and away from each other. */
 static int place_magnet_dipole(Attractor out[], int max_n,
                                 float cx, float cy, int w)
 {
@@ -1251,7 +895,8 @@ static int place_magnet_dipole(Attractor out[], int max_n,
     return 2;
 }
 
-/* TURBULENT — 20 random-sign mini-vortices scattered uniformly. */
+/* TURBULENT — 20 small swirls scattered at random, spinning random
+ * ways, so the flow looks chaotic. */
 static int place_turbulent_field(Attractor out[], int max_n, int w, int h)
 {
     int n = 0;
@@ -1267,7 +912,7 @@ static int place_turbulent_field(Attractor out[], int max_n, int w, int h)
     return n;
 }
 
-/* SPIRAL — one strong vortex at the map centre (no drift). */
+/* SPIRAL — one strong swirl parked at the centre. */
 static int place_spiral_centre(Attractor out[], int max_n, float cx, float cy)
 {
     if (max_n < 1) return 0;
@@ -1276,8 +921,8 @@ static int place_spiral_centre(Attractor out[], int max_n, float cx, float cy)
     return 1;
 }
 
-/* GALAXY — single central vortex (no drift); the spiral arms come
- * from the cos(2θ − k·r) modulation inside field_galaxy. */
+/* GALAXY — one central swirl; the spiral arms are added by the wind
+ * formula itself, not by extra points. */
 static int place_galaxy_centre(Attractor out[], int max_n, float cx, float cy)
 {
     if (max_n < 1) return 0;
@@ -1286,9 +931,9 @@ static int place_galaxy_centre(Attractor out[], int max_n, float cx, float cy)
     return 1;
 }
 
-/* CHAIN — Kármán vortex street: row of alternating-sign vortices
- * across the map width, with a small vertical zigzag to break the
- * line's symmetry. */
+/* CHAIN — a row of swirls across the map spinning in alternating
+ * directions, staggered up and down a touch so the line isn't dead
+ * straight. */
 static int place_chain_alternating(Attractor out[], int max_n,
                                     float cy, int w)
 {
@@ -1307,8 +952,8 @@ static int place_chain_alternating(Attractor out[], int max_n,
     return n;
 }
 
-/* GRID — 3×3 checkerboard of mini-vortices, neighbours spin opposite
- * directions (gx + gy parity flips sign). */
+/* GRID — a 3x3 checkerboard of swirls; like a checkerboard, neighbours
+ * spin opposite ways. */
 static int place_grid_checkerboard(Attractor out[], int max_n, int w, int h)
 {
     float dx = (float)w / (float)(GRID_COUNT + 1);
@@ -1330,9 +975,8 @@ static int place_grid_checkerboard(Attractor out[], int max_n, int w, int h)
     return n;
 }
 
-/* WAKE — cylinder marker at WAKE_OBSTACLE_REL of map width plus
- * WAKE_VORTEX_COUNT alternating-sign vortices downstream forming
- * the Kármán wake. */
+/* WAKE — a marker for the obstacle, plus a line of alternating swirls
+ * trailing off behind it. */
 static int place_wake_obstacle(Attractor out[], int max_n, float cy, int w)
 {
     if (max_n < 1) return 0;
@@ -1355,9 +999,8 @@ static int place_wake_obstacle(Attractor out[], int max_n, float cy, int w)
     return n;
 }
 
-/* QUADPOLE — 4 alternating poles at the corners of an inner square,
- * separation QUADPOLE_SEPARATION of map w/h. Signs walk +−+− around
- * the perimeter for a true quadrupole field. */
+/* QUADPOLE — four poles at the corners of a square, alternating
+ * push/pull as you go around. */
 static int place_quadpole_corners(Attractor out[], int max_n,
                                    float cx, float cy, int w, int h)
 {
@@ -1374,9 +1017,8 @@ static int place_quadpole_corners(Attractor out[], int max_n,
     return n;
 }
 
-/* DUFFING — two stable equilibria at x' = ±1, y' = 0 in dynsys
- * coords, mapped back to cells via 1/DUFFING_SCALE. Markers only;
- * field is closed-form. */
+/* DUFFING — '@' markers on the two resting spots. The wind comes from
+ * the formula; these are just labels. */
 static int place_duffing_equilibria(Attractor out[], int max_n,
                                      float cx, float cy)
 {
@@ -1387,7 +1029,7 @@ static int place_duffing_equilibria(Attractor out[], int max_n,
     return 2;
 }
 
-/* NEWTON — three cube roots of unity, mapped to cells. */
+/* NEWTON — '@' markers on the three pull-points (the three roots). */
 static int place_newton_roots(Attractor out[], int max_n, float cx, float cy)
 {
     if (max_n < 3) return 0;
@@ -1399,19 +1041,21 @@ static int place_newton_roots(Attractor out[], int max_n, float cx, float cy)
     return 3;
 }
 
-/* HAMILTON — saddle at origin + two centres at x' = ±1/√2. */
+/* HAMILTON — '@' markers on the pinch point in the middle and the two
+ * loop centres on either side. */
 static int place_hamilton_equilibria(Attractor out[], int max_n,
                                       float cx, float cy)
 {
     if (max_n < 3) return 0;
     float d = 1.0f / ((float)sqrt(2.0) * HAMILTON_SCALE);
-    out[0] = make_marker(cx,     cy);   /* saddle */
-    out[1] = make_marker(cx + d, cy);   /* +centre */
-    out[2] = make_marker(cx - d, cy);   /* -centre */
+    out[0] = make_marker(cx,     cy);   /* the pinch point  */
+    out[1] = make_marker(cx + d, cy);   /* right loop centre */
+    out[2] = make_marker(cx - d, cy);   /* left loop centre  */
     return 3;
 }
 
-/* PITCHFORK — saddle at origin + two stable equilibria at x' = ±√μ. */
+/* PITCHFORK — '@' markers on the unstable middle and the two resting
+ * spots it splits into. */
 static int place_pitchfork_equilibria(Attractor out[], int max_n,
                                        float cx, float cy)
 {
@@ -1424,16 +1068,9 @@ static int place_pitchfork_equilibria(Attractor out[], int max_n,
 }
 
 /*
- * pattern_init_attractors — DISPATCHER. For each pattern, call its
- * placer and return the count. The dispatcher reads as one line per
- * pattern — pure pseudocode.
- *
- * Patterns fall into four groups:
- *   • Multi-attractor / structured layout  → dedicated placer
- *   • Single centre marker (closed-form
- *     fields whose centre is salient)      → place_centre_marker
- *   • Equilibrium-pair markers              → dedicated placer
- *   • No salient point                      → 0 attractors
+ * pattern_init_attractors — set up the right special points for the
+ * chosen pattern by calling its placer. Some patterns have a full
+ * layout, some just one '@' in the middle, and some have none at all.
  */
 static int pattern_init_attractors(Attractor out[], int max_n,
                                    Pattern p, int w, int h)
@@ -1443,7 +1080,7 @@ static int pattern_init_attractors(Attractor out[], int max_n,
 
     switch (p) {
 
-    /* Structured multi-attractor layouts. */
+    /* Patterns with a full arrangement of points. */
     case PATTERN_VORTICES:   return place_vortices_quarters    (out, max_n, cx, cy, w, h);
     case PATTERN_MAGNET:     return place_magnet_dipole        (out, max_n, cx, cy, w);
     case PATTERN_TURBULENT:  return place_turbulent_field      (out, max_n, w, h);
@@ -1454,13 +1091,13 @@ static int pattern_init_attractors(Attractor out[], int max_n,
     case PATTERN_WAKE:       return place_wake_obstacle        (out, max_n, cy, w);
     case PATTERN_QUADPOLE:   return place_quadpole_corners     (out, max_n, cx, cy, w, h);
 
-    /* Equilibrium-pair / triple markers (closed-form fields). */
+    /* Patterns that just get '@' labels on their resting spots. */
     case PATTERN_DUFFING:    return place_duffing_equilibria   (out, max_n, cx, cy);
     case PATTERN_NEWTON:     return place_newton_roots         (out, max_n, cx, cy);
     case PATTERN_HAMILTON:   return place_hamilton_equilibria  (out, max_n, cx, cy);
     case PATTERN_PITCHFORK:  return place_pitchfork_equilibria (out, max_n, cx, cy);
 
-    /* Single centre marker — closed-form fields with one salient point. */
+    /* Patterns with one important point: just mark the centre. */
     case PATTERN_RADIAL:
     case PATTERN_RIPPLE:
     case PATTERN_CIRCULAR:
@@ -1473,7 +1110,7 @@ static int pattern_init_attractors(Attractor out[], int max_n,
     case PATTERN_EDDY:
         return place_centre_marker(out, max_n, cx, cy);
 
-    /* No salient point worth marking — pure flow patterns. */
+    /* Patterns with no single point worth marking. */
     case PATTERN_WAVE:
     case PATTERN_SADDLE:
     case PATTERN_SHEAR:
@@ -1487,8 +1124,8 @@ static int pattern_init_attractors(Attractor out[], int max_n,
 }
 
 /*
- * compute_active_attractors — derive each frame's "live" attractor
- * positions from base + orbital drift.
+ * compute_active_attractors — work out where each point actually sits
+ * this frame, applying its slow wander to its home spot.
  */
 static int compute_active_attractors(const Attractor src[], int n_src,
                                      ActiveAttractor out[], float t)
@@ -1508,57 +1145,38 @@ static int compute_active_attractors(const Attractor src[], int n_src,
 /* ===================================================================== */
 
 /*
- * The scene is built out of six small structs. Each owns ONE concern,
- * and Scene composes them. Splitting concerns into clearly-typed
- * sub-structs makes function signatures self-describing: any
- * function that takes `const Grid *` clearly cannot mutate buffers;
- * any function that takes `AttractorPool *` clearly does not advance
- * sim time; and so on.
+ * The scene is built from six small structs, each handling one job,
+ * with Scene bundling them together. Splitting them up also makes
+ * function signatures honest: anything handed a `const Grid *` plainly
+ * can't change the drawing buffers, and so on.
  */
 
 /*
- * Particle — one walker advected by the active pattern's velocity
- * field. Paints a coloured trail; respawns on OOB or max_age.
+ * Particle — one dust speck riding the wind. It paints a coloured
+ * trail as it goes, and is recycled (respawned somewhere new) when it
+ * runs off the edge or its lifetime runs out.
  *
- * INTENT. The walker is "massless": its position is integrated
- * directly from the sampled velocity, with NO momentum term. This
- * is the standard streamline-tracing integration in flow
- * visualisation — particles trace streamlines of v, not
- * acceleration-trajectories of a force field. The simpler integrator
- * also means visual speed is controlled entirely by ctrl.speed,
- * independent of which field function is active.
+ * The speck has no weight or momentum: it just goes wherever the wind
+ * points right now. That's exactly what you want to *see* the wind's
+ * shape, and it means the user's speed knob controls pace cleanly no
+ * matter which pattern is on.
  *
- * FINITE LIFETIME. Each particle has a random max_age so the field
- * visualisation stays lively. If particles lived forever they would
- * gradually saturate the streamlines v happens to favour and the
- * rest of the field would empty out (the failure mode you see in
- * naive flow-vis implementations). Random max_age STAGGERS respawn
- * times so the population distribution stays roughly uniform.
- *
- * STABLE COLOUR. color_idx is fixed at spawn and never changes
- * during the particle's life — gives each trail a consistent colour
- * even as it crosses cells previously painted by other particles.
+ * Each speck also gets a random lifetime, so they don't all die and
+ * respawn at the same instant — otherwise the screen would empty and
+ * refill in distracting pulses.
  */
 typedef struct {
-    float x, y;       /* position in cell units (continuous floats)         */
-    int   color_idx;  /* 0..N_BANDS-1 — palette band for this trail         */
-    int   age;        /* ticks since spawn                                  */
-    int   max_age;    /* respawn when age ≥ max_age (also respawn on OOB)   */
+    float x, y;       /* position, in cells (fractional)                    */
+    int   color_idx;  /* which of the 4 trail shades; fixed for life        */
+    int   age;        /* frames lived so far                                */
+    int   max_age;    /* recycle once age reaches this (or it leaves the map) */
 } Particle;
 
 /*
- * Grid — map geometry. Pure data: no buffers, no state. Lives at the
- * top of Scene because every layer (field sampling, screen centring,
- * the particle loop) needs the dimensions.
- *
- * INDEXING. Row-major: cell (x, y) → y·w + x. This matches the
- * memory layout of RenderBuffers (single flat array of CELLS_MAX
- * cells), so the y-outer / x-inner loop order in scene_draw is
- * cache-friendly — each row is contiguous.
- *
- * INVARIANT. w · h ≤ CELLS_MAX always holds; app_pick_map_size()
- * clamps to MAP_W_MAX × MAP_H_MAX. The clamp is enforced once per
- * resize; downstream code may assume it.
+ * Grid — just the map's size. A flat cell at (x, y) lives at index
+ * y*w + x in the drawing buffers. The size is always kept within
+ * MAP_W_MAX x MAP_H_MAX (clamped on every resize), so the rest of the
+ * code can trust w*h never overflows the buffers.
  */
 typedef struct {
     int w, h;
@@ -1572,19 +1190,16 @@ static inline bool grid_in_bounds (const Grid *g, int x, int y)
 }
 
 /*
- * RenderBuffers — per-cell raster output. Two parallel arrays
- * indexed by grid_idx(g, x, y):
- *   glow  : trail intensity 0..1 — drives glyph picker
- *   color : palette band 0..N_BANDS-1
+ * RenderBuffers — what to draw at each cell, in two arrays:
+ *   glow  : how bright the trail is, 0..1 (picks the glyph)
+ *   color : which of the 4 trail shades
+ * Specks write these as they move; the drawing code reads only these
+ * to paint the trails. The '@' markers are handled separately.
  *
- * The screen layer reads ONLY these two arrays. particle_step writes
- * into them. That is the entire render contract for the streamline
- * layer; the attractor markers live separately in AttractorPool.
- *
- * SoA RATIONALE. Two arrays (struct-of-arrays) rather than one array
- * of cell-structs because glow is read every cell every frame, while
- * color is read only for non-blank cells. Keeping glow dense gives
- * better cache hit rate on the dense draw loop.
+ * They're kept as two separate arrays (not one array of pairs) because
+ * glow is touched for every cell every frame while color is read only
+ * where something was drawn — separating them is friendlier to the CPU
+ * cache.
  */
 typedef struct {
     float   glow [CELLS_MAX];
@@ -1600,142 +1215,85 @@ static void buffers_clear(RenderBuffers *b, int n)
 }
 
 /*
- * Particles — fixed-size pool of walkers. Standard pool-allocator
- * pattern: a max-sized array plus an active count `n`, so spawn /
- * respawn never touches the heap. Only pool[0..n-1] is alive; the
- * rest is unused storage held in reserve.
- *
- * SIZING. MAX_PARTICLES (1024) is the static upper bound;
- * N_PARTICLES_DEF (256) is what scene_reset() activates. 256 covers
- * a 200×56 grid with visible streamline density without saturating
- * the cells (each cell averages ~1 hit per 4 frames at SPEED_DEF).
- * Higher counts produce a denser, more "drawn-in" look; lower
- * counts give sparser, more skeletal streamlines.
- *
- * CACHE. 1024 × sizeof(Particle) ≈ 24 KB sits comfortably in L1.
- * The per-frame step_all_particles loop walks one tight contiguous
- * memory region rather than scattering through the heap — relevant
- * because particle_step calls field_velocity_at, which can dispatch
- * to attractor-sum kernels with their own memory traffic.
+ * Particles — the speck pool. A big fixed array plus a count of how
+ * many are currently in use, so spawning and recycling never touch the
+ * heap (only pool[0..n-1] are alive). We allocate room for 1024 but
+ * normally run 256, which fills a full-size grid nicely without turning
+ * it into a solid blob.
  */
 typedef struct {
-    Particle pool[MAX_PARTICLES];   /* storage; only [0..n-1] is alive */
-    int      n;                     /* active count, ≤ MAX_PARTICLES   */
+    Particle pool[MAX_PARTICLES];   /* storage; only [0..n-1] are alive */
+    int      n;                     /* how many are in use              */
 } Particles;
 
 /*
- * AttractorPool — base list (attractor anchors with drift orbits) +
- * per-frame "active" list (drift applied). The active list is what
- * field functions and the renderer both read. Recomputed once per
- * scene_tick via refresh_active_attractors().
+ * AttractorPool — the pattern's special points in two forms: the home
+ * list (set at load time, with each point's wander) and the live list
+ * (where each point actually is this frame). The wind formulas and the
+ * renderer read the live list, which is recomputed once per frame so we
+ * do the wander math once, not for every speck.
  *
- * INTENT. The base/active split avoids re-running cos/sin trig at
- * every cell of every field function — drift is computed once per
- * frame, not per field-sample. Mirrors the classic graphics-pipeline
- * "skinned-vertex" precompute pattern.
- *
- * MARKER ENTRIES. Patterns that don't compute the field from an
- * attractor sum (closed-form patterns like RADIAL, DUFFING, HAMILTON)
- * still populate the pool with strength=0 entries at salient points
- * — equilibria, sources, eye centres — so they show up as bright
- * '@' glyphs. Field functions with `strength · ...` terms see 0 and
- * contribute nothing.
+ * Some patterns get their wind from a formula, not from these points;
+ * those still put strength-0 entries here just so the '@' marks show up.
+ * A strength of 0 means they add nothing to any wind.
  */
 typedef struct {
-    Attractor       base [MAX_ATTRACTORS];
+    Attractor       base [MAX_ATTRACTORS];   /* home positions + wander */
     int             n_base;
-    ActiveAttractor active[MAX_ATTRACTORS];
+    ActiveAttractor active[MAX_ATTRACTORS];  /* this frame's positions  */
     int             n_active;
 } AttractorPool;
 
 /*
- * SimState — the single mutable per-tick scalar (kept as a struct
- * for parallelism with the other refactored files in the project
- * and to leave room for future per-tick state — energy, total flux,
- * particle-count histogram, etc.).
- *
- * INTENT. Separated from Controls (keyboard-driven knobs) so it is
- * obvious what scene_tick mutates vs. what the user does. The model
- * vs. user-intent split common to interactive programs: SimState
- * answers "where is the simulation right now"; Controls answers
- * "what has the user asked for".
- *
- * ROLE OF field_time. Threads into:
- *   • Every time-varying field formula — WAVE, RIPPLE, STANDING,
- *     PLANE — as the `t` argument that drives oscillation.
- *   • Every attractor's drift orbit, via the cos/sin terms in
- *     compute_active_attractors(): orbit angle = t·DRIFT_RATE + φ.
- * Same scalar both places, which keeps wave phases and attractor
- * positions in sync (visually: when a wave crest "hits" an
- * attractor, the attractor's orbital position is reproducible).
+ * SimState — the simulation's own clock, kept apart from the user's
+ * knobs (Controls) so it's clear what the simulation changes versus
+ * what the user changes. field_time is the seconds the wind has been
+ * running. It drives both the time-varying patterns (WAVE, RIPPLE,
+ * STANDING, PLANE) and the slow wander of the '@' points, so the two
+ * stay in step. (It's a struct of one field to match the other files
+ * and leave room to grow.)
  */
 typedef struct {
-    /* Wall time since last scene_reset(), in seconds. Incremented by
-     * dt each tick. Cleared to 0 by reset_sim_state(); otherwise
-     * grows monotonically. Units: seconds. */
+    /* Seconds since the last reset; starts at 0, only grows. */
     float field_time;
 } SimState;
 
 /*
- * Controls — user-facing knobs. Mutated by app_handle_key(), read by
- * scene_tick() and screen_draw(). Grouping them makes the keyboard
- * handler trivial: `Controls *c = &scene.ctrl;` once at the top,
- * then every key case is a one-line mutation on `c`.
- *
- * INTENT. The split between SimState and Controls is the "model
- * vs. user intent" boundary common to interactive programs. The
- * dependency is strictly one-way: app_handle_key writes Controls,
- * never SimState; scene_tick reads Controls but writes only
- * SimState + buffers. Keeps the code linear and trivially
- * thread-safe should the demo ever be split into input + sim
- * threads.
- *
- * NO prev_pattern. Unlike particle-decay demos in the project,
- * switching patterns here triggers a full scene_reset (see
- * cycle_pattern in §9) because each pattern needs its own attractor
- * layout — there's no need to detect the switch with a one-tick lag.
+ * Controls — everything the user can change from the keyboard. The
+ * keyboard handler writes these; the simulation and the renderer only
+ * read them. Keeping them separate from SimState makes it clear which
+ * changes come from the user and which from the simulation itself.
  */
 typedef struct {
-    /* Gate for scene_tick: when true the field freezes but the
-     * render loop continues so the HUD stays responsive and the
-     * user can still cycle themes / glyph sets. */
+    /* When true, the wind freezes but the screen keeps refreshing, so
+     * the HUD stays live and you can still change theme or glyphs. */
     bool    paused;
 
-    /* Particle advection scale, cells / sec. Multiplied into v·dt
-     * in advect_particle_euler. Doubled by '+', halved by '-',
-     * clamped to [SPEED_MIN, SPEED_MAX] = [1, 64]. The doubling
-     * step (rather than ±1) gives a logarithmic feel — perceptually
-     * each press is the same-size change regardless of current
-     * speed. */
+    /* Speck speed, cells per second. '+' doubles it, '-' halves it
+     * (kept between 1 and 64). Doubling rather than stepping by one
+     * makes each press feel like the same-sized change. */
     int     speed;
 
-    int     current_theme;       /* index into themes[N_THEMES]   */
+    int     current_theme;       /* which colour scheme is on */
 
-    /* Index into glyph_sets[N_GLYPH_SETS]. Mutated by g/G via
-     * cycle_glyph_set(). Note: changing the glyph set does NOT
-     * trigger a scene_reset — only the rendering layer reads it,
-     * not the simulation. */
+    /* Which glyph set is on. Changing it only affects drawing, so it
+     * doesn't restart the simulation. */
     int     current_glyph_set;
 
-    /* The active visualisation; mutated by n/p via cycle_pattern.
-     * Each switch triggers a full scene_reset to install the new
-     * pattern's attractor layout. */
+    /* Which wind is showing. Switching it does a full reset, because
+     * each pattern needs its own set of special points. */
     Pattern current_pattern;
 } Controls;
 
 /*
- * Scene — the umbrella context. Reading this struct top-to-bottom is
- * meant to be the fastest way to understand the program:
- *   grid       → where things live      (geometry)
- *   buf        → what gets drawn        (render output)
- *   particles  → moving agents          (advection walkers)
- *   attractors → field's salient points (vortex centres, equilibria)
- *   sim        → animation state        (field_time)
- *   ctrl       → user knobs             (pattern, speed, …)
- *
- * REFERENCE. Mike Acton — "Data-Oriented Design and C++" (CppCon
- * 2014) for the broader argument that good struct layout IS good
- * code.
+ * Scene — everything, in one place. Reading the fields top to bottom
+ * is a quick tour of the program:
+ *   grid       — the map's size
+ *   buf        — what to draw at each cell
+ *   particles  — the dust specks
+ *   attractors — the wind's special points
+ *   sim        — the simulation clock
+ *   ctrl       — the user's settings
  */
 typedef struct {
     Grid          grid;
@@ -1747,14 +1305,9 @@ typedef struct {
 } Scene;
 
 /* ── particle pipeline ────────────────────────────────────────────── *
- * particle_step is the per-particle pseudocode:
- *
- *     sample unit velocity from active pattern's field
- *     advect by v·speed·dt
- *     deposit trail hit
- *     respawn if expired (age or OOB)
- *
- * Each step is a named helper below. */
+ * What happens to one speck each frame: read the wind where it is,
+ * nudge it that way, stamp its trail, and recycle it if it's done.
+ * Each step is a small helper below. */
 
 static void particle_spawn(Particle *p, const Grid *g)
 {
@@ -1766,10 +1319,9 @@ static void particle_spawn(Particle *p, const Grid *g)
 }
 
 /*
- * field_velocity_at — dispatch on pattern, compute velocity at (x, y).
- * Reads from scene->attractors.active for attractor-based patterns;
- * computes closed-form for the rest. The single seam between the
- * "which pattern is active" decision and the per-cell math.
+ * field_velocity_at — the one place that picks the active wind and
+ * asks it for the push at a point. Some winds read the special points;
+ * the rest just compute from a formula.
  */
 static void field_velocity_at(const Scene *s, Pattern pat,
                               float x, float y,
@@ -1797,8 +1349,8 @@ static void field_velocity_at(const Scene *s, Pattern pat,
 
     case PATTERN_MAGNET:
     case PATTERN_QUADPOLE:
-        /* QUADPOLE reuses the MAGNET kernel — only attractor layout
-         * (4 alternating poles at square corners) differs. */
+        /* QUADPOLE uses the same magnet math; only where the poles sit
+         * is different. */
         field_magnet(ap->active, ap->n_active, x, y, out_vx, out_vy);
         break;
 
@@ -1897,10 +1449,9 @@ static void field_velocity_at(const Scene *s, Pattern pat,
     }
 }
 
-/* sample_unit_velocity — sample the field at (px, py) and normalise.
- * Decoupling direction from magnitude here lets ctrl.speed control
- * visual pace independently of which pattern is active (raw
- * magnitudes vary across patterns by orders of magnitude). */
+/* sample_unit_velocity — get the wind's direction at a point, dropping
+ * its strength (length 1). That way the user's speed knob sets the
+ * pace, not the raw numbers, which differ wildly between patterns. */
 static void sample_unit_velocity(const Scene *s, Pattern pat,
                                   float px, float py,
                                   float *out_vx, float *out_vy)
@@ -1913,9 +1464,8 @@ static void sample_unit_velocity(const Scene *s, Pattern pat,
     }
 }
 
-/* advect_particle_euler — forward-Euler integration step. Massless
- * advection: (x, y) ← (x, y) + v · speed · dt. Streamlines, not
- * trajectories (no inertia). */
+/* advect_particle_euler — slide the speck along the wind by one step.
+ * No momentum: it goes purely where the wind points. */
 static void advect_particle_euler(Particle *p, float vx, float vy,
                                    float dt, int speed)
 {
@@ -1924,9 +1474,8 @@ static void advect_particle_euler(Particle *p, float vx, float vy,
     p->age++;
 }
 
-/* deposit_trail_hit — paint the particle's current cell at full
- * intensity. Overwrites (not blends); the trail fade comes from
- * decay_trail_glow between hits. */
+/* deposit_trail_hit — light up the cell the speck is on. The fading is
+ * handled elsewhere; here we just stamp it bright. */
 static void deposit_trail_hit(Scene *s, int cx, int cy, int color_idx)
 {
     if (!grid_in_bounds(&s->grid, cx, cy)) return;
@@ -1935,8 +1484,8 @@ static void deposit_trail_hit(Scene *s, int cx, int cy, int color_idx)
     s->buf.color[idx] = (uint8_t)color_idx;
 }
 
-/* particle_is_expired — has the walker overstayed its life or
- * walked off the grid? Either triggers a respawn. */
+/* particle_is_expired — has the speck run out of life or wandered off
+ * the map? Either way it's time to recycle it. */
 static bool particle_is_expired(const Particle *p, const Grid *g)
 {
     return p->age >= p->max_age
@@ -1956,15 +1505,9 @@ static void particle_step(Scene *s, Particle *p, Pattern pat,
 }
 
 /* ── tick pipeline ────────────────────────────────────────────────── *
- * scene_tick is the per-frame pseudocode:
- *
- *     if paused: stop.
- *     decay all trail glows exponentially.
- *     advance field_time by dt.
- *     refresh attractor positions from base + drift.
- *     step every particle.
- *
- * Each step below is one named helper. */
+ * One simulation step: fade the old trails a bit, advance the clock,
+ * move the special points along their wander, then move every speck.
+ * Each line below is a small helper. */
 
 static void decay_trail_glow(RenderBuffers *b, int n, float dt)
 {
@@ -2055,18 +1598,13 @@ static void scene_tick(Scene *s, float dt)
 /* ===================================================================== */
 
 /*
- * Screen — terminal dimensions cached after the last successful
- * getmaxyx(). Refreshed on SIGWINCH via screen_resize().
- *
- * INTENT. Kept tiny because the rest of ncurses' state lives
- * implicitly in stdscr; we only need the dimensions to centre the
- * map and position HUD elements. Anything else (current attribute,
- * cursor position, colour-pair table) is owned by ncurses internals,
- * not by us — exposing it here would just duplicate state.
+ * Screen — the terminal's current size. That's all we need to remember
+ * to centre the map and place the HUD; ncurses tracks everything else.
+ * Refreshed whenever the window is resized.
  */
 typedef struct {
-    int cols;   /* terminal width  in character cells */
-    int rows;   /* terminal height in character cells */
+    int cols;   /* width in characters  */
+    int rows;   /* height in characters */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -2090,44 +1628,25 @@ static void screen_resize(Screen *s)
 }
 
 /* ── scene_draw pipeline ──────────────────────────────────────────── *
- * Two passes:
- *
- *     1. Trail layer — density glyphs from the current GlyphSet,
- *        coloured by buf.color band.
- *     2. Attractor layer — bright '@' markers on top, in the theme's
- *        flash colour. */
+ * Drawn in two passes: first the trails, then the bright '@' markers
+ * on top so they're never hidden. */
 
 /*
- * CellDraw — the output of the per-cell density-band classifier in
- * scene_draw. A tiny value-type bundling "what to paint at this
- * position"; paint_cell() converts it into the actual ncurses
- * attron / mvaddch / attroff triple.
- *
- * INTENT. cell_density_band is a pure function — given (band, glow,
- * GlyphSet) it returns a CellDraw with no side effects. Routing it
- * through CellDraw rather than calling ncurses directly keeps the
- * decision logic separate from the I/O. paint_cell is then the
- * SINGLE place the program touches ncurses for the trail layer,
- * which makes the renderer trivial to retarget (a test harness
- * could collect CellDraws into a buffer for snapshot comparison
- * without ever opening a terminal).
- *
- * The `skip` flag is the explicit "blank — don't draw anything"
- * signal. Distinct from drawing a space character because skipping
- * preserves whatever was painted before (we erase() once per frame,
- * not per cell). Most cells skip — full grid is mostly empty unless
- * particles cross it.
+ * CellDraw — a little "here's what to put in this cell" note: which
+ * colour, which character, or skip it entirely. We work out this note
+ * first (a plain decision, no drawing) and let one function turn it
+ * into actual output. Skipping leaves whatever was there, which is most
+ * cells, since the map is mostly empty between trails.
  */
 typedef struct {
-    int  pair;   /* colour pair index — PAIR_TRAIL_BASE + band index   */
-    int  attr;   /* ncurses attributes — A_BOLD for mid/high, A_NORMAL */
-    char glyph;  /* ASCII byte from the active GlyphSet                */
-    bool skip;   /* true → render nothing for this cell                */
+    int  pair;   /* which colour to use     */
+    int  attr;   /* bold for brighter trails, normal otherwise */
+    char glyph;  /* which character to draw  */
+    bool skip;   /* true = draw nothing here */
 } CellDraw;
 
-/* compute_centred_origin — top-left corner where the map is drawn.
- * Centres horizontally; reserves HUD_BAND_RESERVED_ROWS rows total
- * (HUD_TOP_ROWS top + HUD_BOTTOM_ROWS bottom). */
+/* compute_centred_origin — where to start drawing the map so it sits
+ * centred, leaving room for the HUD rows above and below. */
 static void compute_centred_origin(const Grid *g, int cols, int rows,
                                     int *out_gx0, int *out_gy0)
 {
@@ -2139,7 +1658,8 @@ static void compute_centred_origin(const Grid *g, int cols, int rows,
     *out_gy0 = gy0;
 }
 
-/* cell_density_band — pick the density-band glyph for a cell. */
+/* cell_density_band — pick the character and brightness for a cell
+ * based on how strong its trail is. */
 static CellDraw cell_density_band(uint8_t band, float glow, const GlyphSet *gs)
 {
     int pair = PAIR_TRAIL_BASE + (band & (N_BANDS - 1));
@@ -2149,7 +1669,7 @@ static CellDraw cell_density_band(uint8_t band, float glow, const GlyphSet *gs)
     return (CellDraw){ .skip = true };
 }
 
-/* paint_cell — the ONE ncurses I/O point for the trail layer. */
+/* paint_cell — actually draw one cell's CellDraw note to the screen. */
 static void paint_cell(int sy, int sx, CellDraw c)
 {
     if (c.skip) return;
@@ -2158,7 +1678,7 @@ static void paint_cell(int sy, int sx, CellDraw c)
     attroff(COLOR_PAIR(c.pair) | c.attr);
 }
 
-/* draw_trail_layer — pass 1. */
+/* draw_trail_layer — pass 1: the speck trails. */
 static void draw_trail_layer(const Scene *s, int gx0, int gy0, int cols, int rows,
                               const GlyphSet *gs)
 {
@@ -2176,7 +1696,7 @@ static void draw_trail_layer(const Scene *s, int gx0, int gy0, int cols, int row
     }
 }
 
-/* draw_attractor_layer — pass 2: bright '@' markers on top. */
+/* draw_attractor_layer — pass 2: the bright '@' markers, drawn on top. */
 static void draw_attractor_layer(const AttractorPool *ap,
                                   int gx0, int gy0, int cols, int rows)
 {
@@ -2208,14 +1728,9 @@ static void scene_draw(const Scene *s, int cols, int rows)
 }
 
 /* ── HUD draw pipeline ────────────────────────────────────────────── *
- * Six named drawers, called from screen_draw in z-order. The TOP HUD
- * (rows 0..2) carries DATA — current state with [N/30] index,
- * parameter readouts, glyph indicator, legend. The BOTTOM HUD
- * (row N-1) carries ACTIONS — key bindings only.
- *
- * draw_hud_status_line internally composes four smaller segment
- * drawers (one per fixed-width row-1 field); see "row 1 segment
- * drawers" below. */
+ * The top three rows show what's going on (pattern, theme, counts,
+ * legend); the bottom row lists the keys. Each piece has its own small
+ * drawer below. */
 
 static void draw_hud_state_bar(const Screen *sc, const Scene *s,
                                 double fps, int sim_fps)
@@ -2243,8 +1758,8 @@ static void draw_hud_title(void)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* draw_palette_swatch — paint one '#' per band colour. Returns the
- * next x-cursor so the caller can continue laying out. */
+/* draw_palette_swatch — show one '#' in each of the four trail colours
+ * so you can see the theme. Returns where to draw next. */
 static int draw_palette_swatch(int row, int x)
 {
     for (int i = 0; i < N_BANDS; i++) {
@@ -2258,10 +1773,8 @@ static int draw_palette_swatch(int row, int x)
 }
 
 /* ── row 1 segment drawers ──────────────────────────────────────────── *
- * draw_hud_status_line lays out row 1 left-to-right as a sequence of
- * fixed-width segments. Each segment is a named drawer that takes the
- * current x-cursor, paints its content, and returns the new x-cursor.
- * The driver function then reads as pure pseudocode. */
+ * Row 1 is built left to right from fixed-width pieces. Each piece
+ * draws its part and returns where the next one should start. */
 
 static int draw_status_pattern_field(int row, int x, Pattern p)
 {
@@ -2287,9 +1800,8 @@ static int draw_status_palette_label(int row, int x)
     return x + HUD_PALETTE_LABEL_W;
 }
 
-/* draw_status_sim_counts — last segment: live simulation statistics
- * (particle count, attractor count, map dimensions). No return — end
- * of the row. */
+/* draw_status_sim_counts — the last piece: live counts (specks, marker
+ * points, map size). */
 static void draw_status_sim_counts(int row, int x, const Scene *s)
 {
     attron (COLOR_PAIR(PAIR_HUD));
@@ -2310,10 +1822,9 @@ static void draw_hud_status_line(const Scene *s)
         draw_status_sim_counts    (1, x, s);
 }
 
-/* draw_hud_glyph_indicator — right-aligned on row 1. Live sample of
- * the three glyphs in the current set so the user can see what each
- * set looks like before switching with g/G. Right-aligned so it
- * doesn't collide with the variable-width sim counts on the left. */
+/* draw_hud_glyph_indicator — shows the current set's three characters
+ * so you can preview a look before switching with g/G. Pinned to the
+ * right so it won't bump into the counts on the left. */
 static void draw_hud_glyph_indicator(const Scene *s, const Screen *sc)
 {
     const GlyphSet *gs = active_glyph_set(s);
@@ -2327,9 +1838,7 @@ static void draw_hud_glyph_indicator(const Scene *s, const Screen *sc)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* draw_hud_legend — row 2: glyph-meaning reference. Belongs in the
- * top HUD because it's DATA (how to READ the screen), not an
- * ACTION (what you can press). */
+/* draw_hud_legend — row 2: a reminder of what the glyphs mean. */
 static void draw_hud_legend(void)
 {
     attron (COLOR_PAIR(PAIR_HUD));
@@ -2338,7 +1847,7 @@ static void draw_hud_legend(void)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* draw_bottom_hint — row N-1: ACTIONS only (key bindings). */
+/* draw_bottom_hint — bottom row: the list of keys you can press. */
 static void draw_bottom_hint(const Screen *sc)
 {
     attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -2352,12 +1861,12 @@ static void screen_draw(Screen *sc, const Scene *s,
 {
     erase();
     scene_draw              (s, sc->cols, sc->rows);
-    draw_hud_state_bar      (sc, s, fps, sim_fps);   /* row 0  : data    */
-    draw_hud_title          ();                       /* row 0  : data    */
-    draw_hud_status_line    (s);                      /* row 1  : data    */
-    draw_hud_glyph_indicator(s, sc);                  /* row 1  : data    */
-    draw_hud_legend         ();                       /* row 2  : data    */
-    draw_bottom_hint        (sc);                     /* row N-1: actions */
+    draw_hud_state_bar      (sc, s, fps, sim_fps);   /* row 0  */
+    draw_hud_title          ();                       /* row 0  */
+    draw_hud_status_line    (s);                      /* row 1  */
+    draw_hud_glyph_indicator(s, sc);                  /* row 1  */
+    draw_hud_legend         ();                       /* row 2  */
+    draw_bottom_hint        (sc);                     /* bottom */
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -2367,15 +1876,13 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — top-level program state. One instance, g_app, lives in BSS
- * so signal handlers can reach it without a global Scene pointer.
- * The App owns the Scene and the Screen and adds simulation
- * parameters (sim_fps, map_w, map_h) plus signal-driven flags.
+ * App — the whole program in one bundle: the scene, the screen, the
+ * tick rate, the map size, and a couple of flags. There's a single
+ * global copy (g_app) so signal handlers can reach it.
  *
- * SIGNAL-HANDLER DISCIPLINE. Handlers do nothing but set a flag; the
- * main loop polls and performs the actual work in normal context.
- * Standard async-signal-safe pattern — see signal(7), and Stevens &
- * Rago "Advanced Programming in the UNIX Environment" ch. 10.
+ * The running and need_resize flags are the only thing the signal
+ * handlers touch — they just flip a flag and the main loop does the
+ * real work. That's the safe way to handle signals.
  */
 typedef struct {
     Scene                 scene;
@@ -2413,11 +1920,10 @@ static void app_do_resize(App *app)
 }
 
 /* ── keyboard handlers ──────────────────────────────────────────────── *
- * Each key is one named action; app_handle_key is just a dispatcher. */
+ * One small function per key; app_handle_key just routes to them. */
 
-/* bump_speed_geometric — '+' / '-' geometric step. Doubling /
- * halving gives a logarithmic feel: each press is the same
- * perceptual change across the full clamped range. */
+/* bump_speed_geometric — '+' doubles speed, '-' halves it. Doubling
+ * makes each press feel like the same-sized change. */
 static void bump_speed_geometric(Controls *c, int dir)
 {
     if (dir > 0) {
@@ -2429,7 +1935,8 @@ static void bump_speed_geometric(Controls *c, int dir)
     }
 }
 
-/* bump_sim_fps — '[' / ']' linear step on tick rate, clamped. */
+/* bump_sim_fps — '[' / ']' change how many times a second the
+ * simulation steps, kept within limits. */
 static void bump_sim_fps(App *app, int delta)
 {
     app->sim_fps += delta;
@@ -2449,9 +1956,9 @@ static void cycle_glyph_set(Controls *c, int dir)
         (c->current_glyph_set + dir + N_GLYPH_SETS) % N_GLYPH_SETS;
 }
 
-/* cycle_pattern — n/p step + full scene reset. We reset because each
- * pattern needs its own attractor configuration; reusing the
- * previous pattern's attractors would give a glitched first frame. */
+/* cycle_pattern — switch winds with n/p, then fully reset. We reset
+ * because each wind has its own special points; keeping the old ones
+ * would make the first frame look wrong. */
 static void cycle_pattern(App *app, int dir)
 {
     Controls *c = &app->scene.ctrl;
@@ -2491,8 +1998,8 @@ static void install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* advance_frame_clock — read the monotonic clock, compute dt since
- * the last call, clamp at the spiral-of-death guard. */
+/* advance_frame_clock — how long since the last frame, capped so a big
+ * stall doesn't make us try to catch up all at once. */
 static int64_t advance_frame_clock(int64_t *frame_time)
 {
     int64_t now = clock_ns();
@@ -2502,8 +2009,9 @@ static int64_t advance_frame_clock(int64_t *frame_time)
     return dt;
 }
 
-/* simulate_pending_ticks — drain the fixed-timestep accumulator.
- * Source: Glenn Fiedler, "Fix Your Timestep". */
+/* simulate_pending_ticks — run as many fixed-size simulation steps as
+ * the elapsed time has earned, so the sim runs at a steady rate no
+ * matter the frame rate. See Glenn Fiedler, "Fix Your Timestep". */
 static void simulate_pending_ticks(App *app, int64_t *sim_accum,
                                     int64_t tick_ns, float dt_sec)
 {
@@ -2513,8 +2021,8 @@ static void simulate_pending_ticks(App *app, int64_t *sim_accum,
     }
 }
 
-/* maybe_update_fps_counter — every FPS_UPDATE_MS, fold the running
- * frame count into a smoothed fps reading. */
+/* maybe_update_fps_counter — every half second, work out the frame
+ * rate from the frames counted so far (otherwise leave it unchanged). */
 static double maybe_update_fps_counter(int64_t *fps_accum,
                                         int *frame_count,
                                         double previous)
@@ -2527,7 +2035,8 @@ static double maybe_update_fps_counter(int64_t *fps_accum,
     return fps;
 }
 
-/* cap_frame_rate — sleep so frames are at most 1/target_fps apart. */
+/* cap_frame_rate — nap for whatever's left in this frame's time budget
+ * so we don't run faster than the target frame rate. */
 static void cap_frame_rate(int64_t work_done_ns, int target_fps)
 {
     int64_t budget = NS_PER_SEC / target_fps;

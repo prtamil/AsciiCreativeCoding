@@ -1,104 +1,23 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * sierpinski.c  —  Sierpinski triangle by recursive subdivision
+ * sierpinski.c — draws the Sierpinski triangle, the classic three-cornered fractal.
  *
- * Start with one triangle.  Connect its three edge midpoints: that cuts it into
- * four half-size triangles.  Keep the three at the corners, drop the middle one
- * — the dropped middle IS the hole.  Recurse on each corner.  After N levels
- * there are 3^N filled triangles forming the classic self-similar gasket.
+ * The idea: take a triangle, cut it into four half-size triangles by joining the
+ * midpoints of its sides, throw away the middle one (that gap is the hole), and
+ * repeat on the three corners. Do this a few times and you get the familiar
+ * self-similar gasket. The +/- keys change how many times we repeat.
  *
- * DEPTH is the knob this demo is built around — it sets how many triangles:
- *   depth 1 →   3      depth 4 →  81      depth 7 → 2187
- *   depth 2 →   9      depth 5 → 243
- *   depth 3 →  27      depth 6 → 729
- * Small depth shows a few big triangles; large depth shows a fine gasket.
+ * For the cousins that draw fractals by chance instead of by subdivision, see the
+ * chaos-game demos barnsley.c and fern.c.
  *
- * FOUR LAYERS, separated so the geometry is trustworthy and it is clear what runs
- * apart from drawing:
- *
- *   §4 CORE   — pure geometry: a triangle, and the rule that splits it into three
- *               corner sub-triangles (the dropped central one is the hole).
- *   §5 LAYOUT — where the base triangle sits on screen (the math shape → cells).
- *   §6 RASTER — the cached image: the recursive build paints the gasket into a
- *               cell buffer.  This is the ONLY heavy work and a PURE FUNCTION of
- *               (depth, size) — so it is gated by Scene.dirty and runs only on a
- *               depth or resize change, never per frame.
- *   §8 RENDER — reads the cell buffer and blits glyphs.  Cheap; every frame.
- *   §7 SCENE  — orchestration: depth + theme + canvas + the dirty flag.
- *
- * EFFECTS / DELAYS: there are none.  This is a static explorer — no animation, no
- * reveal, no timer.  Changing depth rebuilds the canvas instantly; changing the
- * theme is a pure recolor (it re-binds palette pairs; the canvas is NOT rebuilt).
- *
- * Color is by which top-level corner a triangle descends from (bottom-left → V1,
- * bottom-right → V2, top → V3), so the three main sub-triangles read as distinct
- * hues and the tricolor repeats self-similarly at every scale.
- *
- * Keys:
- *   q / ESC   quit
- *   + / -     increase / decrease depth (1..7)
- *   r         reset to default depth
- *   t / T     cycle color theme forward / back (10 themes)
+ * Reference: Sierpinski, W. (1915), "Sur une courbe dont tout point est un point
+ * de ramification" — the original construction. Peitgen, Jurgens & Saupe, "Chaos
+ * and Fractals" (Springer) is the friendliest modern explanation. The triangle
+ * filling follows Pineda's edge-function method (SIGGRAPH '88).
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra sierpinski.c -o sierpinski -lncurses -lm
- *
- * Sections
- * --------
- *   §1 config   — constants, base-triangle shape, theme table
- *   §2 clock    — monotonic ns clock + sleep
- *   §3 color    — themeable corner palette (t/T) + HUD pairs
- *   §4 geometry — Pt, Tri, midpoint, the subdivision rule (PURE)
- *   §5 layout   — the base triangle placed in screen space (DOMAIN)
- *   §6 raster   — Canvas cell buffer + scan-fill + the recursive gasket build
- *   §7 scene    — orchestration: depth + theme + canvas + dirty flag
- *   §8 render   — canvas → glyphs + HUD (READ-ONLY)
- *   §9 app      — main loop
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm : Recursive subdivision.  tri_corners() splits a triangle into its
- *             three corner sub-triangles (omitting the central hole); recurse to
- *             level 0, then fill.  3^depth leaves.
- *
- * Math      : Self-similar set, Hausdorff dimension D = log 3 / log 2 ≈ 1.585.
- *             Each level halves linear size and triples the count, so filled area
- *             scales as (3/4)^level → 0: zero 2D area, non-zero fractal measure.
- *
- * Rendering : Each leaf triangle is scan-filled by an edge-function inside-test
- *             over its bounding box; a centroid mark keeps sub-cell leaves visible.
- *
- * Alternative view : cell (n,k) of Pascal's triangle is filled iff C(n,k) is odd
- *             — the same gasket "mod 2".
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES — to understand the concepts and the rendering ───────────── *
- *
- *   The gasket & how it is built  (§4 geometry, §6 raster)
- *   ── Sierpiński, W. (1915). "Sur une courbe dont tout point est un point de
- *      ramification." C. R. Acad. Sci. Paris 160, 302–305.  The original
- *      construction of the triangle this whole demo draws.
- *   ── Peitgen, H.-O., Jürgens, H. & Saupe, D. (2004). "Chaos and Fractals"
- *      (2nd ed.). Springer.  The most approachable account of the recursive
- *      construction and the Pascal's-triangle-mod-2 view — best starting point.
- *   ── Barnsley, M. F. (1993). "Fractals Everywhere" (2nd ed.). Academic Press.
- *      The gasket as the attractor of three contraction maps (the IFS / chaos-game
- *      view) — why subdivision and the random game reach the same set.
- *
- *   Why it is a fractal — self-similarity & dimension  (CONCEPTS)
- *   ── Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
- *      Self-similarity and the gasket as a canonical fractal.
- *   ── Falconer, K. (2003). "Fractal Geometry: Mathematical Foundations and
- *      Applications" (2nd ed.). Wiley.  Rigorous Hausdorff dimension; D = log3/log2.
- *
- *   Rendering  (§6 canvas_fill_tri, §8)
- *   ── Pineda, J. (1988). "A Parallel Algorithm for Polygon Rasterization."
- *      Computer Graphics (SIGGRAPH '88) 22(4), 17–20.  The edge-function /
- *      barycentric triangle fill behind canvas_fill_tri().
- *   ── Gookin, D. (2007). "Programmer's Guide to NCURSES." Wiley.  The cell-
- *      drawing / colour-pair API behind §8.
- * ─────────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -128,39 +47,40 @@ enum {
 };
 
 /*
- * Base triangle in math space: V1=bottom-left, V2=bottom-right, V3=top-center.
- * x ∈ [0,1], y ∈ [0, √3/2 ≈ 0.866] — an equilateral triangle.
+ * The starting triangle, written as plain coordinates: bottom-left corner, then
+ * bottom-right, then the peak in the top-center. It is an equilateral triangle one
+ * unit wide; the height 0.866 is just how tall an equilateral triangle of width 1
+ * happens to be.
  */
 #define V1X  0.0f
 #define V1Y  0.0f
 #define V2X  1.0f
 #define V2Y  0.0f
 #define V3X  0.5f
-#define V3Y  0.8660254f   /* √3/2 */
+#define V3Y  0.8660254f
 
-/* ASPECT_R — terminal cell height / width ≈ 2.  Width is stretched by this so the
- * triangle reads as equilateral despite the tall character cells. */
+/* Terminal characters are about twice as tall as they are wide, so a shape drawn
+ * square would look squashed. We stretch the width by this factor to make the
+ * triangle look properly equilateral on screen. */
 #define ASPECT_R    2.0f
 
 #define NS_PER_SEC  1000000000LL
 
-/* Margins (in cells) left around the triangle so the HUD has room top and bottom. */
+/* Blank cells kept around the triangle so the HUD lines at top and bottom have room. */
 #define MARGIN_ROWS 3
 #define MARGIN_COLS 4
 
 /*
- * Theme — one bright color per top-level corner (the HUD has its own
- * theme-independent colors, so it is not part of the trio).
- *   c[0] = COL_V1 (bottom-left sub-triangle)
- *   c[1] = COL_V2 (bottom-right sub-triangle)
- *   c[2] = COL_V3 (top sub-triangle)
- * Each trio is visually distinct so the three sub-triangles read clearly at any
- * scale of the fractal's self-similarity.
+ * A color theme: one bright color for each of the three top-level corners, so the
+ * three big sub-triangles stand out from each other (and the pattern repeats that
+ * tricolor at every smaller scale). The HUD has its own fixed colors and isn't part
+ * of this trio.
+ *   c[0] = bottom-left corner, c[1] = bottom-right, c[2] = top.
  */
 typedef struct {
     const char *name;
-    int c[3];    /* 256-color   */
-    int c8[3];   /* 8-color fallback */
+    int c[3];    /* colors for 256-color terminals */
+    int c8[3];   /* fallback colors for plain 8-color terminals */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -201,17 +121,17 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  color                                                              */
 /* ===================================================================== */
 
-/* Colour-pair slots.  COL_V1..V3 are the three corner tints, re-bound per theme.
- * COL_HUD / COL_HINT are theme-independent. */
+/* Names for our ncurses color slots. The three corner colors get swapped out when
+ * you change theme; the two HUD colors stay the same no matter the theme. */
 typedef enum {
-    COL_V1   = 1,   /* bottom-left  corner tint                          */
-    COL_V2   = 2,   /* bottom-right corner tint                          */
-    COL_V3   = 3,   /* top          corner tint                          */
-    COL_HUD  = 4,   /* HUD data     — bright yellow (theme-independent)  */
-    COL_HINT = 5,   /* HUD actions  — bright cyan   (theme-independent)  */
+    COL_V1   = 1,   /* bottom-left corner */
+    COL_V2   = 2,   /* bottom-right corner */
+    COL_V3   = 3,   /* top corner */
+    COL_HUD  = 4,   /* HUD readouts — bright yellow */
+    COL_HINT = 5,   /* HUD key hints — bright cyan */
 } ColorID;
 
-/* theme_apply — bind the three corner tints to theme t. */
+/* Point the three corner color slots at the chosen theme's colors. */
 static void theme_apply(int t)
 {
     const Theme *th = &k_themes[t];
@@ -224,7 +144,7 @@ static void theme_apply(int t)
 static void color_init(void)
 {
     start_color();
-    /* HUD pairs stay constant across themes: bright yellow data, bright cyan actions */
+    /* The HUD colors never change with the theme: bright yellow readouts, bright cyan hints. */
     if (COLORS >= 256) {
         init_pair(COL_HUD,  226, COLOR_BLACK);
         init_pair(COL_HINT,  51, COLOR_BLACK);
@@ -232,18 +152,19 @@ static void color_init(void)
         init_pair(COL_HUD,  COLOR_YELLOW, COLOR_BLACK);
         init_pair(COL_HINT, COLOR_CYAN,   COLOR_BLACK);
     }
-    theme_apply(0);   /* Classic at boot; Scene.theme tracks the active one after */
+    theme_apply(0);   /* start on the first theme */
 }
 
 /* ===================================================================== */
-/* §4  geometry — the subdivision rule (PURE)                             */
+/* §4  geometry — the subdivision rule                                    */
 /* ===================================================================== */
 
-/* Pt — a point in screen coordinates (col, row), kept as floats so the midpoints
- * stay exact all the way down the recursion. */
+/* A point on screen. x is the column, y is the row. We keep them as floats (not
+ * whole numbers) so that the midpoints stay accurate as we cut the triangle smaller
+ * and smaller. */
 typedef struct { float x, y; } Pt;
 
-/* Tri — the geometric primitive the whole algorithm operates on: a triangle. */
+/* A triangle, given by its three corners. This is the one shape everything works on. */
 typedef struct { Pt a, b, c; } Tri;
 
 static Pt midpoint(Pt p, Pt q)
@@ -258,27 +179,25 @@ static Pt tri_centroid(Tri t)
 }
 
 /*
- * tri_corners — THE Sierpinski rule.  Connecting a triangle's edge midpoints cuts
- * it into four congruent half-size triangles; we return the three at the original
- * corners and never form the central one — that omission IS the hole.  Both the
- * top-level split and every deeper level go through this single function, so the
- * fractal's defining step lives in exactly one place.
+ * This is the whole Sierpinski rule in one place. Join the midpoints of the three
+ * sides and you've split the triangle into four smaller ones. We hand back the three
+ * at the corners and simply never build the middle one — leaving it out is what makes
+ * the hole. Every level of the fractal is just this same step applied again.
  */
 static void tri_corners(Tri t, Tri out[3])
 {
     Pt ab = midpoint(t.a, t.b);
     Pt bc = midpoint(t.b, t.c);
     Pt ca = midpoint(t.c, t.a);
-    out[0] = (Tri){ t.a, ab,  ca  };   /* corner at a */
-    out[1] = (Tri){ ab,  t.b, bc  };   /* corner at b */
-    out[2] = (Tri){ ca,  bc,  t.c };   /* corner at c */
+    out[0] = (Tri){ t.a, ab,  ca  };   /* keeps corner a */
+    out[1] = (Tri){ ab,  t.b, bc  };   /* keeps corner b */
+    out[2] = (Tri){ ca,  bc,  t.c };   /* keeps corner c */
 }
 
 /*
- * edge_side — the cross product of edge a→b with a→p, i.e. twice the signed area
- * of triangle (a, b, p).  Its SIGN says which side of the directed edge a→b the
- * point p lies on.  This is Pineda's "edge function" (see REFERENCES), the building
- * block of triangle rasterization.
+ * Tells you which side of the line from a to b the point p is on. The result is
+ * positive on one side, negative on the other, zero right on the line. This little
+ * test is the standard trick for filling triangles (Pineda's "edge function").
  */
 static float edge_side(Pt a, Pt b, Pt p)
 {
@@ -286,10 +205,9 @@ static float edge_side(Pt a, Pt b, Pt p)
 }
 
 /*
- * point_in_tri — true when p lies inside (or on the border of) triangle t.  p is
- * inside exactly when it is on the same side of all three directed edges — i.e. the
- * three edge functions share a sign.  Testing "not both a positive and a negative"
- * makes it work for either winding (clockwise or counter-clockwise).
+ * Is point p inside triangle t (edges count as inside)? It's inside when it sits on
+ * the same side of all three edges. We check that the three side-tests never disagree
+ * (no mix of positive and negative), which works whichever way the corners are wound.
  */
 static bool point_in_tri(Tri t, Pt p)
 {
@@ -302,15 +220,14 @@ static bool point_in_tri(Tri t, Pt p)
 }
 
 /* ===================================================================== */
-/* §5  layout — where the base triangle sits on screen (DOMAIN)           */
+/* §5  layout — where the base triangle sits on screen                    */
 /* ===================================================================== */
 
 /*
- * base_triangle — the largest equilateral triangle that fits the terminal, in
- * screen coordinates.  Picks the scale that fits both vertically (y ∈ [0,V3Y])
- * and horizontally (x ∈ [0,1] after the ASPECT_R width stretch), then centres it
- * left-to-right and seats it near the bottom rows.  The recursion runs entirely
- * in this screen space, so no per-point math→cell conversion is needed later.
+ * Work out the biggest triangle that fits this terminal, already placed in screen
+ * coordinates. We pick the size that fits both the height and the width, center it
+ * left-to-right, and sit it near the bottom. Because we build the whole fractal in
+ * these screen coordinates, there's no separate math-to-screen conversion later.
  */
 static Tri base_triangle(int cols, int rows)
 {
@@ -319,8 +236,8 @@ static Tri base_triangle(int cols, int rows)
     float scale_y  = fminf(fit_rows, fit_cols);
     float scale_x  = scale_y * ASPECT_R;
 
-    float left     = (cols - scale_x) * 0.5f;   /* so the triangle is centered */
-    float baseline = (float)(rows - 2);         /* screen row of fy = 0        */
+    float left     = (cols - scale_x) * 0.5f;   /* centers it left-to-right */
+    float baseline = (float)(rows - 2);         /* the screen row that is the triangle's base */
 
     Tri t;
     t.a = (Pt){ left + V1X * scale_x, baseline - V1Y * scale_y };
@@ -334,10 +251,13 @@ static Tri base_triangle(int cols, int rows)
 /* ===================================================================== */
 
 /*
- * Canvas — the cached image: one colour id per cell (0 = empty, COL_V1..V3 = a
- * filled triangle).  It is a pure function of (depth, size): gasket_build() writes
- * it, the renderer (§8) only reads it.  Rebuilding it is the one heavy operation,
- * so the Scene rebuilds only when it must (Scene.dirty), never per frame.
+ * The finished picture, stored one cell at a time. Each cell holds a color: 0 means
+ * empty, COL_V1..V3 mean a filled triangle of that corner's color. gasket_build()
+ * fills this in; the drawing code (§8) only reads it. Filling it is the only slow
+ * part of the program, so we redo it only when we have to — never on a quiet frame.
+ *
+ *   cell  — the grid of colors, [row][col].
+ *   rows, cols — how much of that grid is actually in use this run.
  */
 typedef struct {
     uint8_t cell[GRID_ROWS_MAX][GRID_COLS_MAX];
@@ -355,11 +275,12 @@ static void canvas_clear(Canvas *cv)
     memset(cv->cell, 0, sizeof cv->cell);
 }
 
-/* CellBox — the rectangle of cell indices a triangle can touch, clamped to the
- * canvas.  Lets the rasterizer scan a tight region instead of the whole grid. */
+/* The little rectangle of cells a triangle might cover (kept inside the canvas).
+ * Knowing it lets us check just those cells instead of the whole grid.
+ *   r0,r1 = top and bottom rows; c0,c1 = left and right columns. */
 typedef struct { int r0, r1, c0, c1; } CellBox;
 
-/* tri_cell_box — triangle t's bounding box in cell indices, clamped to bounds. */
+/* Find that surrounding rectangle for triangle t, trimmed to stay on the canvas. */
 static CellBox tri_cell_box(const Canvas *cv, Tri t)
 {
     CellBox b;
@@ -374,7 +295,7 @@ static CellBox tri_cell_box(const Canvas *cv, Tri t)
     return b;
 }
 
-/* canvas_mark — set one cell if it is in bounds (the rasterizer's only guarded write). */
+/* Color one cell, but only if it's actually on the canvas. */
 static void canvas_mark(Canvas *cv, int row, int col, uint8_t color)
 {
     if (row >= 0 && row < cv->rows && col >= 0 && col < cv->cols)
@@ -382,10 +303,9 @@ static void canvas_mark(Canvas *cv, int row, int col, uint8_t color)
 }
 
 /*
- * canvas_fill_tri — rasterize triangle t into the buffer in `color`:
- *   1. mark its centroid, so a leaf smaller than one cell still leaves a point;
- *   2. scan its (clamped) cell bounding box, keeping every cell whose centre
- *      falls inside the triangle.
+ * Paint triangle t onto the canvas in the given color. First we color its center
+ * point, so that even a triangle too small to cover a whole cell still leaves a mark.
+ * Then we walk the cells around it and color any whose center lands inside.
  */
 static void canvas_fill_tri(Canvas *cv, Tri t, uint8_t color)
 {
@@ -403,9 +323,9 @@ static void canvas_fill_tri(Canvas *cv, Tri t, uint8_t color)
 }
 
 /*
- * gasket_paint — paint triangle t as a Sierpinski gasket `levels` deep, all leaves
- * in `color`.  Level 0 is a leaf (fill it); otherwise apply the subdivision rule
- * and recurse on the three corners one level shallower.
+ * Draw triangle t as a Sierpinski gasket, going `levels` deep, all in one color.
+ * When there are no levels left we just fill the triangle. Otherwise we split it
+ * into its three corners and do the same thing to each, one level shallower.
  */
 static void gasket_paint(Canvas *cv, Tri t, int levels, uint8_t color)
 {
@@ -420,10 +340,9 @@ static void gasket_paint(Canvas *cv, Tri t, int levels, uint8_t color)
 }
 
 /*
- * gasket_build — THE processing: rebuild the cached image for a given depth.  The
- * first split is done here so the three top-level corners can take distinct hues
- * (COL_V1/2/3); each hue then carries down to all of that branch's leaves.  Total
- * leaves = 3^depth.
+ * Build the whole picture from scratch for the chosen depth. We do the very first
+ * split here ourselves so the three big corners can each get their own color; that
+ * color then flows down into every smaller triangle in that branch.
  */
 static void gasket_build(Canvas *cv, int depth)
 {
@@ -435,14 +354,20 @@ static void gasket_build(Canvas *cv, int depth)
 }
 
 /* ===================================================================== */
-/* §7  scene — orchestration: depth + theme + canvas + dirty              */
+/* §7  scene — what we're showing right now                               */
 /* ===================================================================== */
 
+/* Everything that describes the current view, in one place.
+ *   depth  — how many times we split; more depth means more, smaller triangles.
+ *   theme  — which color theme is active. Changing it just recolors, no rebuild.
+ *   canvas — the picture we've already drawn for the current depth.
+ *   dirty  — set when the depth or the window size changed, so we know the picture
+ *            is out of date and needs rebuilding before the next frame. */
 typedef struct {
-    int    depth;    /* recursion depth — the triangle-count knob: 3^depth leaves    */
-    int    theme;    /* palette index; changing it is a pure recolor, not a rebuild  */
-    Canvas canvas;   /* §6 cached raster of the gasket at `depth`                     */
-    bool   dirty;    /* depth or terminal size changed — the canvas must be rebuilt   */
+    int    depth;
+    int    theme;
+    Canvas canvas;
+    bool   dirty;
 } Scene;
 
 static void scene_init(Scene *s, int cols, int rows)

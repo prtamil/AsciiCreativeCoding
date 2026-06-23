@@ -1,44 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * apollonian.c — Apollonian Gasket: a recursive 2D circle packing.
+ * apollonian.c — an Apollonian gasket drawn in the terminal.
  *
- * An Apollonian gasket starts with four mutually-tangent circles: an
- * outer disc and three inner discs tangent to it and to each other.
- * In every curvilinear gap formed by three mutually-tangent circles,
- * inscribe the unique fourth circle that touches all three.  Recurse
- * to fill the gasket up to a chosen depth.
- *
- * Descartes' Circle Theorem gives both the curvature and the centre
- * of that fourth circle in closed form:
- *
- *      k₄    = k₁+k₂+k₃ ± 2√(k₁k₂ + k₂k₃ + k₃k₁)
- *      k₄·z₄ = k₁z₁+k₂z₂+k₃z₃ ± 2√(k₁k₂z₁z₂+k₂k₃z₂z₃+k₃k₁z₃z₁)
- *
- * The two ± signs are independent, so the formula has FOUR algebraic
- * (k₄, z₄) solutions per triple.  Two correspond to real tangent
- * circles (the new gap-filler and an ancestor already in the set);
- * the other two are spurious — they satisfy the algebra but don't
- * actually touch all three inputs.  Every candidate is gated by two
- * geometric invariants:
- *
- *   • fits inside the outer disc:  |c₄ − c_outer| + r₄ ≤ r_outer
- *   • disjoint or tangent to every existing inner disc:
- *                                  |c₄ − c_E| ≥ r₄ + r_E
- *
- * Real Apollonian children satisfy both by construction; spurious
- * algebraic solutions get rejected.
- *
- * Rendering: every inner circle is either a flat-filled disc or an
- * outline ring (`f` toggles).  The outer disc is always an outline so
- * it doesn't tint the play area.
- *
- * Animation: a single clock t drives a construction sweep.
- * sweep_visible_depth(t) ramps 0 → depth_max over SWEEP_PER_DEPTH_S ×
- * depth_max seconds, holds at the ceiling for SWEEP_HOLD_S, then
- * snaps back to zero.  Each circle's drawn radius is multiplied by
- * alpha = clamp(visible − depth + 1, 0, 1), so it blossoms from a
- * point to full size as the cutoff crosses its depth layer.  Hue
- * rotates independently through the active palette's 7-colour ramp.
+ * Start with a big circle and a few smaller circles snug inside it,
+ * all touching.  Wherever three circles touch they leave a little
+ * curved gap; there's exactly one circle that fits perfectly into
+ * that gap, touching all three.  Drop it in, and now you have new,
+ * smaller gaps to fill.  Keep going and you get this lacy fractal.
+ * The math that finds each gap-filler is Descartes' Circle Theorem.
  *
  * Keys:
  *   q  quit         p  pause            r  reset (rewinds the sweep)
@@ -49,45 +18,16 @@
  *   gcc -std=c11 -O2 -Wall -Wextra procedural/fractals/apollonian.c \
  *       -o apollonian -lncurses -lm
  *
- * REFERENCES — for the concepts behind this program.
- *
- *   Mathematics & Algorithm
- *   ── Mumford, Series & Wright, "Indra's Pearls: The Vision of Felix
- *      Klein", Cambridge University Press, 2002.  The definitive
- *      pictorial introduction to circle packings, Möbius groups and
- *      Apollonian limit sets.  The single most useful book for
- *      SEEING what this program computes.
+ * References (things the code can't tell you):
+ *   ── Mumford, Series & Wright, "Indra's Pearls", Cambridge, 2002 —
+ *      the best book for SEEING what this draws.
  *   ── Lagarias, Mallows & Wilks, "Beyond the Descartes Circle
- *      Theorem", American Mathematical Monthly 109 (2002), 338–361.
- *      Modern derivation of BOTH the curvature and the complex-
- *      centre forms of Descartes used in gasket_try_descartes (§3).
- *      JSTOR: https://www.jstor.org/stable/2695498
- *   ── Graham, Lagarias, Mallows, Wilks & Yan, "Apollonian Circle
- *      Packings: Number Theory", Journal of Number Theory 100
- *      (2003), 1–45.  Why the integer pack (−1, 2, 2, 3) and
- *      (−1, 2, 3, 6) work, with the algebraic structure of all
- *      integer Apollonian gaskets.
- *   ── Coxeter, H. S. M., "Introduction to Geometry", 2nd ed.,
- *      Wiley, 1969.  Inversive geometry foundations and the
- *      classical statement of Descartes' Circle Theorem.
- *   ── Soddy, F., "The Kiss Precise", Nature 137 (1936), 1021.
- *      A one-page verse statement of Descartes' theorem; charming
- *      historical primary source.
- *
- *   Rendering
- *   ── Foley, van Dam, Feiner & Hughes, "Computer Graphics:
- *      Principles and Practice", 3rd ed., Addison-Wesley, 2013.
- *      Standard reference for the circle outline (midpoint /
- *      Bresenham) and scanline disc-fill primitives draw_ring and
- *      draw_disc are direct expressions of.
- *   ── Bourke, P., "Character representation of greyscale images",
- *      1997.  https://paulbourke.net/dataformats/asciiart/
- *      Origin of the density-ramp idea behind ASCII intensity
- *      glyphs ('@', '#', '*', '+', ':', '.').
- *   ── Padala, P., "NCURSES Programming HOWTO", 2005.
- *      https://tldp.org/HOWTO/NCURSES-Programming-HOWTO/
- *      Practical reference for `init_pair`, `mvaddch`, frame pacing
- *      and the resize/cleanup conventions used in §5 and §7.
+ *      Theorem", AMM 109 (2002), 338–361 — the curvature and centre
+ *      formulas used in §3.  https://www.jstor.org/stable/2695498
+ *   ── Graham et al., "Apollonian Circle Packings: Number Theory",
+ *      JNT 100 (2003), 1–45 — why the integer seed packs work.
+ *   ── Soddy, "The Kiss Precise", Nature 137 (1936), 1021 — Descartes'
+ *      theorem stated as a poem; the charming original.
  *
  * §1 types & data   §2 math   §3 gasket
  * §4 time & sweep   §5 view   §6 render & HUD   §7 scene & main
@@ -119,37 +59,44 @@
 #define RENDER_NS           (1000000000LL / 30)   /* ~30 fps budget     */
 #define NS_PER_SECOND       1.0e9f
 
-/* ---- Descartes gates ---------------------------------------------- */
-#define MIN_VALID_CURVATURE   1.0f     /* k₄ < 1 ⇒ radius > outer disc        */
-#define EPS_NONZERO_CURV      1e-6f    /* |k₄| ≈ 0 means degenerate (line)     */
-#define GEOM_TANGENT_TOL      1e-3f    /* tangent vs overlap (gasket units)    */
-#define DEDUP_REL_TOL         2e-3f    /* relative (k, kz) match window        */
-#define DEDUP_SCALE_BIAS      2.0f     /* keeps DEDUP tolerance positive at k≈0*/
+/* ---- when to accept a candidate circle ---------------------------- */
+#define MIN_VALID_CURVATURE   1.0f     /* below this, the circle is bigger than
+                                          the outer disc — not a real child   */
+#define EPS_NONZERO_CURV      1e-6f    /* a near-zero curvature means a line,
+                                          not a circle — throw it out         */
+#define GEOM_TANGENT_TOL      1e-3f    /* wiggle room for "just touching" vs
+                                          "overlapping" (in gasket units)     */
+#define DEDUP_REL_TOL         2e-3f    /* how close two circles must be to
+                                          count as the same one               */
+#define DEDUP_SCALE_BIAS      2.0f     /* keeps that tolerance sane for the
+                                          big outer circle (curvature near 0) */
 
-/* ---- terminal cell aspect (cells are 2× taller than wide) --------- */
-#define ASPECT_CELL_HEIGHT    2.0f     /* multiply row-stride by this to get */
-                                       /* the equivalent in cell-WIDTH units */
-#define ASPECT_INV            0.5f     /* 1 / ASPECT_CELL_HEIGHT              */
+/* ---- terminal cell shape ------------------------------------------ *
+ * Terminal characters are about twice as tall as they are wide.  So a
+ * step of one row covers twice the distance of a step of one column.
+ * We do all our math in "column widths" and convert when we touch rows. */
+#define ASPECT_CELL_HEIGHT    2.0f     /* rows -> column-widths              */
+#define ASPECT_INV            0.5f     /* column-widths -> rows             */
 
-/* ---- rendering thresholds & glyphs -------------------------------- */
-#define SUBPIXEL_RADIUS       0.5f     /* r_col below ⇒ render as single dot */
-#define BOUNDARY_BAND_CELLS   1.0f     /* width of bold-edge disc band       */
-#define DISC_MATH_CLIP        0.0f     /* strict — no antialias fringe       */
-#define ROUNDING_BIAS         0.5f     /* (int)(x + 0.5f) rounds to nearest  */
-#define SLOPE_SQRT3           1.73f    /* √3 — slope threshold in ring_char  */
+/* ---- drawing thresholds & glyphs ---------------------------------- */
+#define SUBPIXEL_RADIUS       0.5f     /* smaller than this, just draw a dot */
+#define BOUNDARY_BAND_CELLS   1.0f     /* how thick the bold disc edge is    */
+#define DISC_MATH_CLIP        0.0f     /* hard edge, no soft fade            */
+#define ROUNDING_BIAS         0.5f     /* add then truncate = round to nearest*/
+#define SLOPE_SQRT3           1.73f    /* picks where / \ flip to | or -     */
 
 #define GLYPH_SUBPIXEL        '.'
 #define GLYPH_DISC_INTERIOR   '#'
 #define GLYPH_DISC_BOUNDARY   '@'
 
-/* ---- ring sampling (parametric outline) --------------------------- */
-#define RING_BASE_STEPS       8        /* minimum samples on any ring         */
-#define RING_STEPS_PER_RAD    2.5f     /* samples per cell-arc length        */
-#define RING_MAX_STEPS        1024     /* cap so very big radii don't bloat  */
+/* ---- how finely to trace a circle outline ------------------------- */
+#define RING_BASE_STEPS       8        /* fewest dots, even on a tiny ring   */
+#define RING_STEPS_PER_RAD    2.5f     /* more dots as the ring gets bigger  */
+#define RING_MAX_STEPS        1024     /* but cap it so huge rings stay cheap */
 
-/* ---- construction sweep timing ------------------------------------ */
-#define SWEEP_PER_DEPTH_S     1.5f     /* seconds per layer of blossom       */
-#define SWEEP_HOLD_S          3.0f     /* hold at full depth before re-ramp  */
+/* ---- the grow-in animation ---------------------------------------- */
+#define SWEEP_PER_DEPTH_S     1.5f     /* seconds for one layer to grow in   */
+#define SWEEP_HOLD_S          3.0f     /* pause on the full picture, then redo*/
 
 /* ---- HUD & input ------------------------------------------------- */
 #define HUD_BUFFER_BYTES      220
@@ -164,134 +111,97 @@
 
 /* ---- Circle — one circle in the gasket ---------------------------- *
  *
- * What it is: a single circle.  Has a CURVATURE k = 1/r and a
- * complex CENTRE z = x + iy.  Curvature carries a useful sign:
- *   • k > 0  — a normal inner disc
- *   • k < 0  — the outer "containing" disc; negative curvature is
- *              the standard convention for circles that hold
- *              everything else inside
- *   • k = 0  — a straight line (not used here)
+ * One circle.  We describe it by curvature (k = 1 / radius) instead
+ * of radius, because that's the form Descartes' theorem works in.
+ * The sign of the curvature is meaningful:
+ *   • k > 0  — a normal circle sitting inside the gasket
+ *   • k < 0  — the big outer circle that holds everything else
+ *              (the standard convention: a circle you live inside
+ *               gets a negative curvature)
  *
- * Why it exists: this is the basic thing the whole program moves
- * around.  Descartes takes three Circles and produces a fourth; the
- * renderer takes one Circle and draws it; the animation takes one
- * Circle and a clock and decides how big to draw it.  Giving the
- * bundle (curvature, centre, depth) a name lets us pass it by
- * pointer instead of by four loose floats.
- *
- * One quirk worth knowing: we store kz = k·z PRE-MULTIPLIED rather
- * than z itself.  The complex Descartes formula
- *
- *      k₄·z₄ = k₁·z₁ + k₂·z₂ + k₃·z₃ ± 2·√(k₁·k₂·z₁·z₂ + …)
- *
- * works directly on k·z values, so storing them avoids a division
- * inside the inner loop.  We recover z = kz/k once at render time.
+ * Storage quirk: instead of the centre point itself, we store the
+ * centre already multiplied by the curvature (the "kz" values).
+ * Descartes' centre formula is written in terms of those products,
+ * so keeping them pre-multiplied saves a divide every time we run
+ * the formula.  We undo it once at draw time to get the real centre.
  *
  * Fields:
- *   k       — curvature.  r = 1/|k|; k < 0 means this is the outer.
- *   zx, zy  — real and imaginary parts of k·z.  Centre is:
- *                 cx = zx / k,   cy = zy / k
- *   depth   — which recursion layer this circle came from:
- *               0    — outer seed
- *               1    — initial inner discs from the seed pack
- *               2+   — circles found by Descartes recursion
- *             Drives the blossom animation: a circle starts
- *             appearing when the sweep reaches its layer and is
- *             at full size one layer later.
+ *   k       — curvature, 1/radius.  Radius is 1/|k|; negative means
+ *             this is the outer circle.
+ *   zx, zy  — the centre times the curvature.  Real centre is
+ *             (zx/k, zy/k).
+ *   depth   — which round of the build produced this circle:
+ *               0  the outer circle
+ *               1  the first few circles from the seed pack
+ *               2+ everything found by filling gaps
+ *             The grow-in animation uses this so each layer fades
+ *             in one after another.
  *
- * References:
- *   ── Mumford, Series & Wright, "Indra's Pearls", §3.
- *   ── Lagarias, Mallows & Wilks, "Beyond the Descartes Circle
- *      Theorem", AMM 109 (2002), eqs. (1.4) and (4.1). */
+ * Ref: Lagarias, Mallows & Wilks, AMM 109 (2002), eqs. (1.4), (4.1). */
 typedef struct {
     float k;
     float zx, zy;
     int   depth;
 } Circle;
 
-/* ---- DescartesTriple — three tangent circles + a depth tag ------- *
+/* ---- DescartesTriple — three touching circles, one gap to fill --- *
  *
- * What it is: three circles in the gasket (by index) that all touch
- * each other.  Together they bound one curvilinear gap — the kind
- * of gap Descartes' theorem fills with a unique fourth circle.
+ * A reminder to ourselves: "these three circles all touch, go find
+ * the circle that fits in the gap between them."  It's one item of
+ * work on a to-do list.  We pull one off, fill its gap, and the new
+ * circle creates more gaps that go back on the list.
  *
- * Why it exists: the build is iterative.  We pop one of these,
- * compute the gap-filler, push the three new triples it spawns
- * with its parents — and repeat.  Giving the work-item a name
- * makes the recursion loop read like English:
- *
- *     while there is a pending triple:
- *         pop it, expand it, push the new triples it spawns
- *
- * Why indices instead of pointers: the circles[] array grows
- * during the build.  Pointers would risk going stale; indices
- * stay valid no matter what.
- *
- * Why a queue, not actual recursion: an explicit LIFO stack
- * bounds the working set (n_pending ≤ 4·MAX_CIRCLES — at most
- * three sub-triples pushed per pop) and would let us pause and
- * resume the build in chunks if we ever wanted to.
+ * We point at the three circles by their array slot number, not by
+ * a pointer, because the circles array keeps growing as we build —
+ * a stored pointer could go stale, an index won't.
  *
  * Fields:
- *   i1, i2, i3 — indices of the three parent circles.  Order
- *                doesn't matter to the math.
- *   depth      — depth label to give whichever new circle this
- *                triple yields.  Pre-set by whoever pushed it.
+ *   i1, i2, i3 — slot numbers of the three touching circles.  Order
+ *                doesn't matter.
+ *   depth      — the layer number to stamp on whatever circle this
+ *                gap produces (set by whoever added this to-do item).
  *
- * Invariant: the three circles are pairwise tangent.  Seed packs
- * pick valid starting triples by hand; each new circle is tangent
- * to all three of its parents, so the sub-triples we push from it
- * are tangent too.  The invariant is preserved by construction. */
+ * Important assumption: the three circles really do touch each other.
+ * The seed packs hand-pick valid starting triples, and every gap we
+ * fill yields a circle that touches its three neighbours, so this
+ * stays true automatically as the build goes. */
 typedef struct { int i1, i2, i3, depth; } DescartesTriple;
 
-/* ---- Gasket — the recursive packing ------------------------------ *
+/* ---- Gasket — the whole packing, plus its build state ------------ *
  *
- * What it is: everything we've built so far.  All the circles we've
- * placed, the triples still waiting to be expanded, and the
- * recursion depth ceiling.
+ * Everything we've built so far: the circles we've placed, the
+ * gaps still waiting to be filled, and how deep we're willing to go.
+ * Keeping it all in one struct means every operation is just a
+ * function that takes a Gasket* — no globals to chase.
  *
- * Why it exists: the algorithm is just "state + operations".  Put
- * the state in one struct and every operation becomes a function
- * that takes `Gasket *`.  No globals, no surprise dependencies —
- * same gasket plus same operations always gives the same result.
+ * The build, in plain steps:
+ *     while there's a gap to fill:
+ *         take one off the list
+ *         work out the circle that fits it
+ *         if it's a real new circle, add it and put its new gaps
+ *         on the list
+ * (Descartes' formula spits out four candidate circles per gap;
+ *  usually one is the new gap-filler, one is a circle we already
+ *  have, and two are garbage.  The checks in §3 keep the good one.)
  *
- * How the recursion works:
- *
- *     while there is a pending triple:
- *         pop it
- *         try all four Descartes sign combinations
- *         for each one that produces a new valid circle:
- *             add the circle
- *             push three new triples for its three sub-gaps
- *
- * Of the four sign combinations, usually one yields the new
- * gap-filler, one is the ancestor we already have (rejected as a
- * duplicate), and two are spurious roots (rejected as geometrically
- * invalid).  See §3 for the gate functions.
- *
- * Why fixed-size arrays: the build is offline (one synchronous pass
- * at startup or on parameter change), and at depth 7 the integer
- * Apollonian gasket has only a few thousand circles — well under
- * MAX_CIRCLES.  Static storage, no malloc.
- *
- * Why pending[] is 4× MAX_CIRCLES: each pop pushes up to three
- * triples.  Most reject immediately; 4× is generous headroom.
+ * The build runs all at once — at startup or whenever you change a
+ * setting — so we just use fixed-size arrays and never malloc.
  *
  * Fields:
- *   circles[]  — every circle found so far.  Index 0 is always the
- *                outer (k < 0); the rest are inner discs in
- *                insertion order, which is also the render order.
- *   n          — how many entries in circles[] are valid.
- *   pending[]  — LIFO stack of pending triples.  LIFO means we go
- *                depth-first, which keeps the queue small.
- *   n_pending  — how many entries in pending[] are valid.
- *   depth_max  — recursion ceiling (1..DEPTH_MAX).  Adjusted by
- *                '+' / '-' at runtime.  Smaller = faster build
- *                and faster render.
+ *   circles[]  — every circle so far.  Slot 0 is always the outer
+ *                circle; the rest are in the order we found them,
+ *                which is also the order we draw them.
+ *   n          — how many slots in circles[] are used.
+ *   pending[]  — the to-do list of gaps.  We always take the most
+ *                recently added one (it's a stack), which keeps the
+ *                list short.  Sized 4x MAX_CIRCLES: each gap can add
+ *                up to three more, so there's plenty of headroom.
+ *   n_pending  — how many slots in pending[] are used.
+ *   depth_max  — how many layers deep to build (1..DEPTH_MAX).  The
+ *                +/- keys change it; lower means a faster, sparser
+ *                picture.
  *
- * References:
- *   ── Graham, Lagarias, Mallows, Wilks & Yan, "Apollonian Circle
- *      Packings: Number Theory", JNT 100 (2003), §2. */
+ * Ref: Graham et al., JNT 100 (2003), §2. */
 typedef struct {
     Circle           circles[MAX_CIRCLES];
     int              n;
@@ -300,194 +210,123 @@ typedef struct {
     int              depth_max;
 } Gasket;
 
-/* ---- Palette — a depth-to-colour theme --------------------------- *
+/* ---- Palette — a colour theme, one colour per depth layer -------- *
  *
- * What it is: a named 7-entry colour table.  Index by a circle's
- * depth (1..7); get back an xterm 256-colour code.
+ * A named list of seven colours, one for each depth layer (1..7).
+ * Keeping colour choices here, away from the drawing code, means a
+ * new theme is just one more entry in g_palettes[] and the 't' key
+ * cycling through them.
  *
- * Why it exists: keeps theming separate from drawing.  The renderer
- * never sees raw colour codes — it asks for the ncurses colour pair
- * matching a depth and draws with that.  Adding a new theme is one
- * entry in g_palettes[]; the rest of the program doesn't notice.
- * The `t` key just bumps an index and reloads pairs.
+ * Colour choice rule (project CLAUDE.md "Theme Palette Brightness"):
+ * every colour has to stay readable on a black background.  The very
+ * darkest xterm colours (16-23 and 232-239) disappear, so we never
+ * use them; the next step up (24-29, 240-243) is only safe for the
+ * biggest, lowest layer; anything 30+ / 244+ is fine anywhere.
  *
- * Brightness rules (from project CLAUDE.md "Theme Palette
- * Brightness"):
- *   • Every entry must sit in the bright half of the 256-colour
- *     cube — must remain legible on a default-black background.
- *   • Ranges 16-23 (cube) and 232-239 (gray) vanish under A_DIM —
- *     never use them.
- *   • Ranges 24-29 / 240-243 are dim enough that we only allow
- *     them for the lowest tier (depth 1, biggest visual mass).
- *   • Ranges 30+ / 244+ are safe in every slot.
- *
- * Why exactly 7 colours: depth_max is 7 here, and anything deeper
- * is sub-pixel — it gets clamped to the deepest slot by
- * hue_shift().
+ * Seven colours because we build seven layers deep; anything finer
+ * than that is too small to see and just reuses the last colour.
  *
  * Fields:
- *   name      — short string shown in the HUD.
- *   colors[]  — 256-colour codes for depths 1..7, outermost to
- *               innermost.  Gradient palettes walk one tone from
- *               one end to the other; "rainbow" cycles through
- *               distinct hues.
- *
- * References:
- *   ── XTerm 256-colour palette:
- *      https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit */
+ *   name      — short label shown in the HUD.
+ *   colors[]  — the seven xterm colour codes, outer layer first.
+ *               Most themes fade one tone across the seven;
+ *               "rainbow" jumps between distinct hues. */
 typedef struct {
     const char *name;
     int         colors[DEPTH_PAIRS];
 } Palette;
 
-/* ---- SeedPack — a starting configuration ------------------------- *
+/* ---- SeedPack — a named starting arrangement of circles ---------- *
  *
- * What it is: a named function that lays down the first few
- * mutually-tangent circles and pushes the initial recursion tasks.
- *
- * Why it exists: an Apollonian gasket is determined by its first
- * few mutually-tangent circles.  Different starting picks give
- * visually different fractals.  By making each pack a function
- * pointer behind a name, we can offer several variants and cycle
- * between them at runtime ('n' key) with no branching inside the
- * recursion — the Gasket primitives don't know which seed they're
- * running.
- *
- * Why a function pointer instead of static data: each seed needs
- * its own arithmetic — Descartes math, geometry-specific kz
- * coordinates that often involve √3 and the like.  Inline code
- * expresses that clearly; static initialisers can't.
+ * A function that drops in the first handful of touching circles and
+ * lists their gaps.  That starting arrangement decides the whole
+ * fractal, and different starts make different-looking ones, so we
+ * keep a few and let the 'n' key switch between them.  Each is a
+ * function (not just data) because laying out the circles takes a
+ * bit of arithmetic — easier to write as code than as a table.
  *
  * Fields:
- *   name   — short string shown in the HUD.
- *   seed   — populates g->circles[] and g->pending[] from scratch.
- *            Caller (gasket_build) zeroes the counters first.
+ *   name   — short label shown in the HUD.
+ *   seed   — fills in the starting circles and gaps from scratch
+ *            (gasket_build resets the counters before calling it).
  *
- * Seeds shipped here:
- *   classic  (−1, 2, 2, 3, 3) — the canonical integer gasket;
- *                                left-right + top-bottom symmetric.
- *   trefoil  (−1, κ, κ, κ)   — three equal inner circles with
- *                                3-fold rotational symmetry;
- *                                κ = 1/(2√3 − 3) ≈ 2.155.
- *   coxeter  (−1, 2, 3, 6)   — asymmetric integer gasket;
- *                                recursion fills the missing
- *                                mirror circles.
+ * The three shipped here:
+ *   classic — the textbook one, symmetric left-right and top-bottom.
+ *   trefoil — three equal circles with three-fold pinwheel symmetry.
+ *   coxeter — a lopsided one; the build fills in the missing mirror
+ *             circles as it goes.
  *
- * References:
- *   ── Graham et al., "Apollonian Circle Packings: Number Theory",
- *      JNT 100 (2003), Table 1 — admissible integer quadruples.
- *   ── Indra's Pearls, §7 — geometric intuition behind 3-fold
- *      symmetric packings. */
+ * Ref: Graham et al., JNT 100 (2003), Table 1 — the integer starting
+ * sets these are drawn from. */
 typedef struct {
     const char *name;
     void (*seed)(Gasket *);
 } SeedPack;
 
-/* ---- Viewport — gasket coords → terminal cells ------------------ *
+/* ---- Viewport — how to place the gasket on the screen ------------ *
  *
- * What it is: the recipe for turning a point in the (mathematical)
- * gasket into a (visual) terminal cell.
+ * The recipe for turning a point in the gasket's own coordinates into
+ * a row and column on screen.  Keeping it here means the drawing code
+ * never has to think about terminal size; on a window resize we just
+ * refit this one struct and everything follows.
  *
- * Why it exists: keeps the projection in one place.  The renderer
- * doesn't need to know about terminal dimensions or cell aspect —
- * it just asks the Viewport to project for it.  When the terminal
- * resizes, viewport_fit() updates one struct and everything else
- * does the right thing on the next frame.
+ * Two things it sorts out:
+ *   1) Characters are taller than wide, so a circle drawn naively
+ *      would look like a tall egg.  We squash the vertical direction
+ *      to compensate.
+ *   2) The gasket should fill the window without spilling off either
+ *      edge, whatever the window's shape.  We take whichever fits
+ *      tighter, width or height, and use that for both.
  *
- * Two things have to happen on the way to the screen:
- *
- *   1) ASPECT CORRECTION.  Terminal cells are roughly 2× taller
- *      than wide.  Distances in rows and columns aren't directly
- *      comparable.  We work in "cell-WIDTH units" everywhere and
- *      multiply vertical distances by 0.5 when converting to rows.
- *
- *   2) ASPECT FIT.  The gasket is a unit disc; we want it to fit
- *      inside the terminal no matter the shape.  Pick the smaller
- *      of the horizontal and vertical budgets and use that for
- *      both axes — the disc stays inside the play area.
- *
- * One value, `scale`, captures both: visual cells (width-units)
- * per gasket unit.  Bigger terminal → bigger scale → bigger draw.
- *
- * Aspect-fit budget (in cell-WIDTH units):
- *     horizontal  =  (cols − 2) / 2
- *     vertical    =  (rows − HUD_ROWS − 2)        ← already in
- *                                                   width-units
- *                                                   because cells
- *                                                   are 2× taller
- *     scale       =  min(horizontal, vertical)
- *
- * Projection (gasket → cell):
- *     col  =  cx_center  +  round( x · scale         )
- *     row  =  cy_center  −  round( y · scale · 0.5   )
- *
- * The −0.5× on rows is the aspect correction; the − sign flips
- * gasket-y (up positive) to terminal-y (down positive).
+ * Both come down to one number, `scale`: how many screen columns wide
+ * one gasket unit is.  Bigger window, bigger scale, bigger picture.
  *
  * Fields:
- *   rows, cols    — current terminal dimensions in cells.
- *   cx_center     — column where gasket origin (0, 0) lands.
- *                   Equals cols/2.
- *   cy_center     — row where gasket origin lands.  Vertically
- *                   centred between the HUD row and the hint row.
- *   scale         — visual cells (width-units) per gasket unit.
- *                   The unit disc is 2·scale cells wide and
- *                   scale cells tall.
+ *   rows, cols  — the terminal's current size, in characters.
+ *   cx_center,
+ *   cy_center   — the screen cell where the gasket's centre (0,0)
+ *                 lands, sitting between the HUD line and the hint
+ *                 line.
+ *   scale       — columns per gasket unit (see above).
  *
- * References:
- *   ── Foley, van Dam, Feiner & Hughes, "Computer Graphics:
- *      Principles and Practice", 3rd ed., §6 — window-to-viewport
- *      mappings with aspect preservation. */
+ * Ref: Foley et al., "Computer Graphics", 3rd ed., §6 — fitting a
+ * picture into a window while keeping its shape. */
 typedef struct {
     int   rows, cols;
     int   cx_center, cy_center;
     float scale;
 } Viewport;
 
-/* ---- Scene — the whole program's state -------------------------- *
+/* ---- Scene — everything the running program needs ---------------- *
  *
- * What it is: one struct holding everything the running program
- * needs — the gasket, the projection, the animation clock, and the
- * user's render/theme/seed choices.
+ * One struct with the whole program's state: the gasket, how to put
+ * it on screen, the animation clock, and the user's current choices.
+ * It lets the main loop read as a short to-do list: handle a key,
+ * advance time, draw a frame.
  *
- * Why it exists: makes the main loop read as a short sequence of
- * verbs on a single noun:
+ * Fields, grouped by what they're for:
  *
- *     scene_handle_key(s, ch);
- *     scene_tick(s, dt);
- *     frame_render(s);
+ *   The shape:
+ *     gasket  — the circles and their build state.
+ *     seed    — which starting arrangement (index into g_seeds[]).
+ *               'n' cycles it.
  *
- * Every helper takes only the piece it actually needs — `Gasket *`
- * for recursion, `Viewport *` for projection, `Scene *` only for
- * orchestration — so each function signature spells out what that
- * function depends on.  No mystery globals to chase.
- *
- * Fields, grouped by responsibility:
- *
- *   What we're packing:
- *     gasket     — the circles plus the pending recursion.
- *     seed       — index into g_seeds[].  Cycled by 'n'.
- *
- *   How we view it:
- *     view       — the projection.  Re-fit on every resize.
- *     palette    — index into g_palettes[].  Cycled by 't';
- *                  reloads the CP_D1..CP_D7 pairs each time.
- *     filled     — true:  inner discs are flat-filled.
- *                  false: inner discs are outline rings.
- *                  The outer is always an outline either way.
- *                  Toggled by 'f'.
+ *   How it looks:
+ *     view    — the screen-placement recipe; refit on resize.
+ *     palette — which colour theme (index into g_palettes[]).
+ *               't' cycles it and reloads the colours.
+ *     filled  — true draws solid discs, false draws hollow rings.
+ *               The outer circle is always a ring either way.
+ *               'f' toggles it.
  *
  *   Animation:
- *     t          — seconds since the last reset.  Drives both
- *                  the construction sweep and the hue rotation.
- *                  Advances when !paused.
- *     paused     — animation freeze.  HUD shows "PAUSED".
- *                  Toggled by 'p'.
- *     hue_speed  — palette-rotation rate in steps per second.
- *                  Signed: negative reverses direction.
- *                  Adjusted by ',' / '.' in HUE_SPEED_STEP
- *                  increments, clamped to ±HUE_SPEED_MAX by
- *                  scene_adjust_hue_speed. */
+ *     t         — seconds since the last reset.  Drives both the
+ *                 grow-in and the colour rotation.  Frozen while
+ *                 paused.
+ *     paused    — 'p' toggles; HUD shows "PAUSED".
+ *     hue_speed — how fast colours rotate, in steps per second.
+ *                 Negative rotates the other way.  ',' and '.'
+ *                 nudge it, kept within +/-HUE_SPEED_MAX. */
 typedef struct {
     /* what we're packing */
     Gasket   gasket;
@@ -504,10 +343,11 @@ typedef struct {
     float    hue_speed;
 } Scene;
 
-/* ---- colour-pair slots -------------------------------------------- */
+/* ncurses colour-pair slot numbers: seven for the depth layers,
+ * two for the HUD text. */
 enum { CP_D1 = 1, CP_D2, CP_D3, CP_D4, CP_D5, CP_D6, CP_D7, CP_HUD, CP_HINT };
 
-/* ---- palettes (constant config) ----------------------------------- */
+/* ---- the colour themes -------------------------------------------- */
 static const Palette g_palettes[] = {
     { "rainbow", { 226, 118,  51,  33,  93, 201, 196 } },   /* yellow→red       */
     { "ocean",   {  31,  38,  45,  51, 117, 159, 195 } },   /* teal→pale cyan   */
@@ -534,12 +374,9 @@ static const SeedPack g_seeds[] = {
 /* §2  math — complex arithmetic primitives                               */
 /* ===================================================================== */
 
-/* Principal complex square root of (ax + i·ay).
- *
- * Strategy: convert to polar, halve the angle, take real √r.  This
- * always returns the root with positive real part (or zero), which
- * is what Descartes' formula expects when combined with our (sk, sz)
- * sign convention. */
+/* Square root of a complex number.  A number can have two square
+ * roots; we always return the same one (the one pointing "rightward"),
+ * which is what Descartes' formula below expects. */
 static void complex_sqrt(float ax, float ay, float *rx, float *ry)
 {
     float magnitude_sqrt = sqrtf(sqrtf(ax*ax + ay*ay));
@@ -548,7 +385,6 @@ static void complex_sqrt(float ax, float ay, float *rx, float *ry)
     *ry = magnitude_sqrt * sinf(half_angle);
 }
 
-/* Complex multiplication (ax + i·ay)·(bx + i·by). */
 static void complex_mul(float ax, float ay, float bx, float by,
                         float *rx, float *ry)
 {
@@ -560,14 +396,10 @@ static void complex_mul(float ax, float ay, float bx, float by,
 /* §3  gasket — Descartes recursion and seed packs                        */
 /* ===================================================================== */
 
-/* ---- duplicate detection ------------------------------------------- */
-
-/* Does the gasket already contain this (k, kz)?
- *
- * Tolerance is relative because float error in Descartes compounds
- * roughly linearly with k — a fixed absolute eps lets deep duplicates
- * slip through; a scaled eps catches them without falsely merging
- * genuinely-distinct nearby circles. */
+/* Do we already have this circle?  Descartes hands back circles we've
+ * seen before, so we check before adding.  The "close enough" margin
+ * grows with the circle's curvature, because the math gets fuzzier for
+ * tightly-curved circles — a fixed margin would miss some duplicates. */
 static bool gasket_has(const Gasket *g, float k, float kzx, float kzy)
 {
     for (int i = 0; i < g->n; i++) {
@@ -582,18 +414,11 @@ static bool gasket_has(const Gasket *g, float k, float kzx, float kzy)
     return false;
 }
 
-/* ---- geometric admissibility -------------------------------------- */
-
-/* Does a candidate (k4, c4, r4=1/k4) satisfy the Apollonian invariants
- * relative to every circle already in the gasket?
- *
- *   vs OUTER (k<0):  candidate must fit inside the outer disc.
- *                    reject if  d + r4  >  r_outer + TOL
- *
- *   vs INNER (k>0):  candidate must be externally disjoint or tangent.
- *                    reject if  d       <  r4 + r_E - TOL
- *                    (one inequality catches overlap, internal tangent
- *                     and full containment all at once) */
+/* Sanity-check a candidate circle: does it actually fit?  Descartes'
+ * formula is just algebra and sometimes returns circles that don't
+ * really belong, so we check it against every circle we already have.
+ * It must sit fully inside the outer circle, and it must not overlap
+ * any of the inner ones (touching is fine). */
 static bool gasket_admits(const Gasket *g, float k4, float c4x, float c4y)
 {
     float r4 = 1.f / k4;
@@ -608,18 +433,19 @@ static bool gasket_admits(const Gasket *g, float k4, float c4x, float c4y)
         float d   = sqrtf(dx*dx + dy*dy);
 
         if (e->k < 0.f) {
-            if (d + r4 > re + GEOM_TANGENT_TOL) return false;   /* breaches outer */
+            if (d + r4 > re + GEOM_TANGENT_TOL) return false;   /* pokes out of the outer */
         } else {
-            if (d < r4 + re - GEOM_TANGENT_TOL) return false;   /* overlaps inner */
+            if (d < r4 + re - GEOM_TANGENT_TOL) return false;   /* overlaps an inner one  */
         }
     }
     return true;
 }
 
-/* ---- Descartes' theorem primitives -------------------------------- */
-
-/* Curvature root k₄ = k₁+k₂+k₃ ± 2·√(k₁k₂+k₂k₃+k₃k₁).
- * Returns false if the radicand is negative (no real root). */
+/* ---- Descartes' Circle Theorem ------------------------------------ *
+ * Given three circles that touch, this is the part of the theorem that
+ * gives the curvature (1/radius) of the fourth circle in the gap.  The
+ * sign `sk` picks one of the two answers it offers.  Returns false if
+ * the formula can't give a real answer for this triple. */
 static bool descartes_curvature_root(float k1, float k2, float k3,
                                      int sk, float *k4_out)
 {
@@ -629,9 +455,8 @@ static bool descartes_curvature_root(float k1, float k2, float k3,
     return true;
 }
 
-/* The complex radicand for the centre formula:
- *   (k₁z₁)(k₂z₂) + (k₂z₂)(k₃z₃) + (k₃z₃)(k₁z₁)
- * computed directly from the stored kz values via complex products. */
+/* The bit that goes under the square root in the centre formula below.
+ * It works directly on the pre-multiplied centre values we store. */
 static void descartes_centre_radicand(const Circle *c1, const Circle *c2,
                                       const Circle *c3,
                                       float *rx, float *ry)
@@ -644,7 +469,8 @@ static void descartes_centre_radicand(const Circle *c1, const Circle *c2,
     *ry = p12y + p23y + p31y;
 }
 
-/* Complex centre root:  k₄z₄ = Σ(k_i z_i) ± 2·√(radicand). */
+/* The other half of the theorem: where the new circle's centre is.
+ * Like the curvature, it has two answers and `sz` picks one. */
 static void descartes_centre_root(const Circle *c1, const Circle *c2,
                                   const Circle *c3,
                                   int sz, float *kz4x_out, float *kz4y_out)
@@ -678,10 +504,9 @@ static DescartesTriple gasket_pop_triple(Gasket *g)
     return g->pending[--g->n_pending];
 }
 
-/* When a new circle joins the gasket, three new gaps appear — one
- * between the new circle and each pair of its parents.  Push a
- * recursion task for each, unless we're at the depth ceiling or the
- * queue is full. */
+/* A freshly added circle makes three new gaps — one with each pair of
+ * the three circles it just landed between.  Add each to the to-do
+ * list, unless we've hit the depth limit or run out of room. */
 static void gasket_push_subgaps(Gasket *g, const DescartesTriple *parent, int child_idx)
 {
     int child_depth = parent->depth + 1;
@@ -698,18 +523,10 @@ static void gasket_push_subgaps(Gasket *g, const DescartesTriple *parent, int ch
         (DescartesTriple){parent->i2, parent->i3, child_idx, child_depth};
 }
 
-/* ---- the Descartes attempt ---------------------------------------- *
- *
- * Try one (sk, sz) sign combination for the given triple.  Returns
- * true iff a geometrically-valid new circle was appended to the
- * gasket.  Reads top-to-bottom as a sequence of named gates:
- *
- *     compute curvature root → bail if no root, too big, too deep
- *     compute centre root
- *     bail if degenerate
- *     bail if duplicate
- *     bail if geometrically inadmissible
- *     append */
+/* Try one of the four answers Descartes gives for a gap, and add the
+ * circle if it checks out.  Returns true if a circle was added.  Reads
+ * top to bottom as: work out the circle, then a string of "is it real?
+ * is it new? does it fit?" checks before we keep it. */
 static bool gasket_try_descartes(Gasket *g,
                                  int i1, int i2, int i3,
                                  int sk, int sz, int depth)
@@ -736,9 +553,9 @@ static bool gasket_try_descartes(Gasket *g,
     return true;
 }
 
-/* Exhaust all four (sk, sz) sign combinations for one triple.  For
- * each new child found, push its three sub-gaps onto the pending
- * stack.  Returns true if any of the four attempts succeeded. */
+/* Try all four of Descartes' answers for one gap, and for every real
+ * new circle, queue up the gaps it just created.  Returns true if any
+ * of the four panned out. */
 static bool gasket_try_all_descartes_signs(Gasket *g, const DescartesTriple *t)
 {
     bool any = false;
@@ -751,9 +568,9 @@ static bool gasket_try_all_descartes_signs(Gasket *g, const DescartesTriple *t)
     return any;
 }
 
-/* Pop one pending triple, exhaust its Descartes children, push their
- * sub-gaps.  Returns true if progress was made — call repeatedly
- * until it returns false (which means the gasket is complete). */
+/* Do one unit of work: take the next gap off the list and fill it.
+ * Returns true while there's still work; call it in a loop until it
+ * returns false, meaning the gasket is finished. */
 static bool gasket_step(Gasket *g)
 {
     while (g->n_pending > 0) {
@@ -766,11 +583,11 @@ static bool gasket_step(Gasket *g)
 
 /* ---- seed packs --------------------------------------------------- */
 
-/* CLASSIC — the integer Apollonian gasket k = (−1, 2, 2, 3, 3).  Top
- * and bottom (both k=3) are NOT tangent to each other, so triples
- * mentioning both are omitted.  The triple (outer, right, left) is
- * also omitted because its two Descartes children are exactly the
- * hard-coded top and bottom. */
+/* CLASSIC — the textbook gasket: one outer circle, a left and right
+ * pair, and a top and bottom pair.  We skip the gaps that would just
+ * rediscover circles we've already placed by hand (top and bottom
+ * don't touch each other, and the left-right-outer gap is exactly
+ * where top and bottom already sit). */
 static void seed_classic(Gasket *g)
 {
     g->circles[0] = (Circle){ -1.f, 0.f,  0.f, 0 };
@@ -788,14 +605,10 @@ static void seed_classic(Gasket *g)
     g->pending[g->n_pending++] = (DescartesTriple){1, 2, 4, 2};
 }
 
-/* TREFOIL — three equal inner circles k = 1/(2√3 − 3) ≈ 2.155
- * arranged with 3-fold rotational symmetry.  Each inner centre sits
- * at distance (1 − r) from the origin; the three centres are at
- * angles 90°, 210°, 330° (i.e. 120° apart).  In stored (kz) form
- * with h = k − 1:
- *     top         (0,         h    )
- *     lower-left  (−h·√3/2,  −h/2  )
- *     lower-right ( h·√3/2,  −h/2  ) */
+/* TREFOIL — three identical circles spaced evenly inside the outer
+ * one, 120 degrees apart like a three-bladed pinwheel: one up top,
+ * two along the bottom.  The numbers below place those three centres;
+ * `h` is just a shorthand the placement uses. */
 static void seed_trefoil(Gasket *g)
 {
     float r              = 2.f * sqrtf(3.f) - 3.f;
@@ -816,8 +629,8 @@ static void seed_trefoil(Gasket *g)
     g->pending[g->n_pending++] = (DescartesTriple){1, 2, 3, 2};
 }
 
-/* COXETER — the asymmetric integer gasket (−1, 2, 3, 6).  Descartes
- * recursion fills the missing mirror circles. */
+/* COXETER — a lopsided starting set of three differently-sized
+ * circles.  The build fills in the missing mirror circles as it runs. */
 static void seed_coxeter(Gasket *g)
 {
     g->circles[0] = (Circle){ -1.f, 0.f, 0.f, 0 };
@@ -859,9 +672,9 @@ static void clock_sleep_ns(long long ns)
     nanosleep(&ts, NULL);
 }
 
-/* Sawtooth visibility cutoff for the construction sweep.  Ramps
- * 0 → depth_max over T_sweep seconds, holds for SWEEP_HOLD_S, then
- * snaps back to 0 and re-ramps. */
+/* How many layers deep the grow-in has reached at time t.  Climbs
+ * steadily from 0 up to the full depth, sits there a moment, then
+ * jumps back to 0 and replays — over and over. */
 static float sweep_visible_depth(float t, int depth_max)
 {
     float dmax           = (float)depth_max;
@@ -873,10 +686,10 @@ static float sweep_visible_depth(float t, int depth_max)
     return dmax;
 }
 
-/* Blossom factor for a circle at the given depth.  Grows linearly
- * from 0 to 1 across one depth layer of the sweep, then stays at 1.
- * A circle "starts to appear" when visible_depth crosses depth−1
- * and "reaches full size" when visible_depth reaches depth. */
+/* How big to draw one circle right now, as a fraction of full size
+ * (0 = invisible, 1 = full).  A circle starts as a speck when the
+ * grow-in reaches its layer and swells to full size over the next
+ * layer's worth of time. */
 static float blossom_alpha(float visible_depth, int circle_depth)
 {
     float a = visible_depth - (float)circle_depth + 1.0f;
@@ -885,11 +698,10 @@ static float blossom_alpha(float visible_depth, int circle_depth)
     return a;
 }
 
-/* Integer rotation through the 7-pair depth ramp at rate hue_speed.
- * Returns a colour-pair index in [CP_D1 .. CP_D7].  The (+N)%N
- * sandwich is the standard positive-modulo trick so negative
- * hue_speed (rotating the other direction) still yields a valid
- * non-negative index. */
+/* Pick the colour for a circle at this depth, shifted over time so the
+ * colours rotate through the layers.  Returns a colour-pair slot
+ * (CP_D1..CP_D7).  The doubled "+ N then % N" guards against a negative
+ * result when hue_speed runs the rotation backwards. */
 static int hue_shift(int depth, float t, float hue_speed)
 {
     int clamped_depth = depth < 1            ? 1
@@ -904,8 +716,8 @@ static int hue_shift(int depth, float t, float hue_speed)
 /* §5  view — palette + viewport                                          */
 /* ===================================================================== */
 
-/* Install the seven depth-colour pairs from the active palette.
- * Called at startup and whenever the palette is cycled. */
+/* Load the current theme's seven colours into ncurses.  Called at
+ * startup and each time the 't' key switches themes. */
 static void palette_apply(int idx)
 {
     if (COLORS >= 256) {
@@ -913,7 +725,7 @@ static void palette_apply(int idx)
         for (int i = 0; i < DEPTH_PAIRS; i++)
             init_pair(CP_D1 + i, p->colors[i], -1);
     } else {
-        /* 8-colour fallback — palettes degenerate to rainbow defaults */
+        /* On an old 8-colour terminal, ignore themes and use basics. */
         init_pair(CP_D1, COLOR_YELLOW,  -1);
         init_pair(CP_D2, COLOR_GREEN,   -1);
         init_pair(CP_D3, COLOR_CYAN,    -1);
@@ -924,7 +736,7 @@ static void palette_apply(int idx)
     }
 }
 
-/* HUD colour pairs are static — they don't change with theme cycling. */
+/* The HUD's own colours, set once — theme cycling doesn't touch them. */
 static void palette_init_static_pairs(void)
 {
     if (COLORS >= 256) {
@@ -936,15 +748,15 @@ static void palette_init_static_pairs(void)
     }
 }
 
-/* Aspect-fit the unit gasket disc into the current terminal.  Scale
- * is the largest value that keeps the disc fully inside the play
- * area both horizontally AND vertically. */
+/* Work out the screen placement for the current window size: the
+ * biggest the gasket can be drawn while still fitting inside, both
+ * across and down. */
 static void viewport_fit(Viewport *v, int rows, int cols)
 {
     v->rows = rows;
     v->cols = cols;
 
-    /* Both budgets in cell-WIDTH units */
+    /* Both measured in column-widths so they're comparable. */
     float horizontal_budget = (float)(cols - 2) * 0.5f;
     float vertical_budget   = (float)(rows - HUD_ROWS - 2);
 

@@ -1,98 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * julia_explorer.c — Interactive Julia Set Explorer
+ * julia_explorer.c — drag a point around the Mandelbrot set on the left and
+ * watch its matching Julia set redraw on the right, side by side.
  *
- * Split-screen layout:
- *   LEFT  — Mandelbrot set (precomputed at start/resize)
- *           A crosshair marks the selected c = cr + ci·i
- *   RIGHT — Julia set for current c, redrawn every frame
- *           z → z² + c,  escape radius 2,  MAX_ITER 128
+ * Both pictures come from repeating the same step, z = z*z + c. The trick:
+ * the Mandelbrot set is a map of every possible choice of c, and each point
+ * on that map "owns" one Julia set. So picking a point here picks a picture
+ * there. See julia.c and mandelbrot.c for each panel on its own.
  *
- * Moving the crosshair on the Mandelbrot map with arrow keys instantly
- * redraws the Julia panel.  Every pixel of the Julia set is recomputed
- * analytically each frame, so response to keystrokes is immediate.
- *
- * Auto-wander ('a') orbits c along a slow ellipse through the Mandelbrot
- * boundary, revealing many distinct Julia morphologies automatically.
- *
- * Keys:
- *   q / ESC     quit
- *   Arrow keys  move c  (fine step 0.015)
- *   h j k l     move c  (coarse step 0.08)
- *   t / T       next / prev color theme  (Fire/Ocean/Toxic/Neon/Mono)
- *   r           reset c → −0.7 + 0.27i  (Douady rabbit)
- *   z / Z       Julia view: zoom in / out
- *   a           toggle auto-wander
- *   p / spc     pause / resume auto-wander
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra julia_explorer.c -o julia_explorer -lncurses -lm
- *
- * Reading order — built bottom-up; each section uses only earlier ones.
- *   §1  config   — constants, colour slots
- *   §2  clock    — monotonic time
- *   §3  complex  — Complex number + arithmetic (the plane z lives in)
- *   §4  escape   — escape_time(z,c): the engine BOTH panels share + level map
- *   §5  view     — ViewWindow lens: cell ↔ complex point, both directions
- *   §6  color    — themes + apply
- *   §7  scene    — Scene: cursor c, julia zoom, theme, wander, layout, Mandelbrot cache
- *   §8  render   — draw the two panels, divider, crosshair, HUD
- *   §9  app      — signals, input, main loop
+ * Why c near the edge of the Mandelbrot set gives the prettiest Julia sets:
+ * Douady & Hubbard, "Étude dynamique des polynômes complexes" (1984-85).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two views of the SAME iteration z ← z² + c, side by side.
- *                  Left  (Mandelbrot): for each pixel, c = pixel, z starts at 0.
- *                  Right (Julia):      for each pixel, z = pixel, c is fixed (the
- *                  cursor).  One escape_time() engine drives both — only what you
- *                  hold fixed changes.  The Mandelbrot panel is cached (it never
- *                  changes as you move c); the Julia panel is recomputed live.
- *
- * Math           : Mandelbrot/Julia duality, made interactive.  Each point c of
- *                  the Mandelbrot set "indexes" a whole Julia set J(c); moving
- *                  the crosshair sweeps through them.  Auto-wander walks c around
- *                  an ellipse near ∂M, where the Julia sets are richest.
- *
- * Data model     : Small structs, one idea each —
- *                    Complex      a point/number in the plane (z, c)
- *                    ViewWindow   the rectangle of the plane a panel shows
- *                    Wander       the auto-orbit state of the cursor
- *                    Layout       the split-screen geometry
- *                    MandelCache  the precomputed left panel
- *                    Scene        all of the above = the explorer's state
- *
- * Performance    : Julia panel is recomputed per-frame (W/2 × H × MAX_ITER);
- *                  the Mandelbrot panel is computed once per resize and cached,
- *                  so cursor movement stays instant.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES ───────────────────────────────────────────────────────── *
- *
- * Concepts & maths
- *   [1] Douady, A. & Hubbard, J. H. (1984-85). "Étude dynamique des polynômes
- *       complexes" (the Orsay Notes).  — proves the duality this whole tool
- *       demonstrates: J(c) is connected iff c lies in the Mandelbrot set.
- *   [2] Peitgen, H.-O. & Richter, P. H. (1986). "The Beauty of Fractals."
- *       Springer.  — the clearest pictures of how a c-point "indexes" a Julia
- *       set; start here for the intuition behind the two panels.
- *   [3] Julia, G. (1918). "Mémoire sur l'itération des fonctions rationnelles."
- *       J. Math. Pures Appl. 8:47-245.  — the founding paper on iteration.
- *   [4] Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
- *
- * Rendering & escape-time
- *   [5] Peitgen, Jürgens & Saupe (1992). "Chaos and Fractals: New Frontiers of
- *       Science." Springer.  — the escape-time algorithm in full; §4 is a
- *       direct descendant, shared here by both panels.
- *   [6] Vepstas, L. (2004). "Renormalizing the Mandelbrot Escape."  — the
- *       fractional escape count that smooths the integer levels of §4.
- *
- * In-repo study companions
- *   [7] mandelbrot.c — the LEFT panel as a standalone (cached escape-time +
- *       preset zoom windows).
- *   [8] julia.c — the RIGHT panel as a standalone (fixed-c Julia presets +
- *       themes).  This explorer is those two married by a shared engine.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -114,59 +32,66 @@
 #define RENDER_FPS   30
 
 enum {
-    MAX_ITER        = 128,
-    N_LEVELS        = 8,     /* colour bands: 0 = bg (not drawn), 1–7 = gradient */
+    MAX_ITER        = 128,   /* give up after this many steps and call it "inside" */
+    N_LEVELS        = 8,     /* 0 = background (left blank), 1..7 = the colour ramp */
     N_THEMES        = 5,
     ROWS_MAX        = 80,
     COLS_MAX        = 300,
-    MANDEL_COLS_MAX = COLS_MAX / 2 + 2,   /* widest the left panel can get */
+    MANDEL_COLS_MAX = COLS_MAX / 2 + 2,   /* widest the left panel can ever get */
 
-    CP_HUD   = 1,    /* top data lines — yellow */
-    CP_DIV   = 2,    /* panel divider  — gray   */
-    CP_XHAIR = 3,    /* crosshair      — yellow */
-    CP_LEV1  = 4,    /* pairs CP_LEV1 .. CP_LEV1+6  →  fractal levels 1..7 */
-    CP_HINT  = CP_LEV1 + N_LEVELS - 1,    /* = 11, past the level pairs — cyan actions */
+    /* ncurses colour-pair slot numbers we reserve */
+    CP_HUD   = 1,    /* top text lines */
+    CP_DIV   = 2,    /* the divider between the two panels */
+    CP_XHAIR = 3,    /* the crosshair marker */
+    CP_LEV1  = 4,    /* fractal levels 1..7 take slots CP_LEV1 .. CP_LEV1+6 */
+    CP_HINT  = CP_LEV1 + N_LEVELS - 1,    /* bottom key-hint line; sits just past the level slots */
 };
 
-/* |z| > 2 ⇒ the orbit escapes; compare |z|² to 4 to skip a sqrt. */
+/* A point counts as "escaped" once it gets farther than 2 from the origin.
+ * We compare distance-squared to 4 so we never have to take a square root. */
 #define ESCAPE_RADIUS_SQ  4.0f
 
-/* Terminal aspect: cell height ≈ 2 × cell width */
+/* Terminal cells are about twice as tall as they are wide; we stretch the
+ * picture horizontally to undo that and keep the fractal from looking squashed. */
 #define ASPECT_R    2.0f
 
-/* Default cursor: the Douady rabbit */
+/* Where the crosshair starts: the classic "Douady rabbit" Julia set. */
 #define C_INIT_RE  (-0.7f)
 #define C_INIT_IM  ( 0.27f)
 
-/* Julia view defaults */
+/* How much of the plane the Julia panel shows, and how zoom in/out scales it. */
 #define J_IM_HALF_DEF  1.5f
 #define J_ZOOM_IN      0.85f
 #define J_ZOOM_OUT    (1.0f / J_ZOOM_IN)
 #define J_IM_HALF_MIN  0.25f
 #define J_IM_HALF_MAX  3.0f
 
-/* Mandelbrot fixed view: classic framing */
+/* The slice of the plane the left (Mandelbrot) panel shows — the usual framing
+ * that fits the whole set on screen. */
 #define M_RE_MIN    (-2.5f)
 #define M_RE_MAX    ( 1.0f)
-#define M_IM_HALF    1.25f   /* ±1.25 imaginary */
+#define M_IM_HALF    1.25f
 
-/* Interaction step sizes */
+/* How far one keypress nudges the crosshair: small for arrows, big for hjkl. */
 #define FINE_STEP   0.015f
 #define COARSE_STEP 0.08f
 
-/* Auto-wander: c orbits a squished ellipse (keeps it near the boundary) */
+/* Auto-wander drives the crosshair around an oval that hugs the set's edge,
+ * where the Julia sets are most interesting. R is its width, YSHRK squashes it
+ * vertically, SPEED is how fast it travels (one lap takes roughly 35 s). */
 #define WANDER_R      0.72f
 #define WANDER_YSHRK  0.65f
-#define WANDER_SPEED  0.006f   /* rad/frame  ≈ 35 s per orbit at 30 fps */
+#define WANDER_SPEED  0.006f
 
-/* fps readout: recompute over a rolling window this long */
+/* The fps number is averaged over this many milliseconds so it stops flickering. */
 #define FPS_WINDOW_MS  500
 
-/* escape colouring: pixels escaping in the first 7 % of the budget → background */
+/* Points that escape almost instantly (first 7% of the step budget) are the
+ * boring far-away region — we leave them blank instead of colouring them. */
 #define BACKGROUND_FRAC  0.07f
 
-/* crosshair arm half-lengths, in cells (horizontal a touch longer than vertical
- * because terminal cells are taller than wide) */
+/* Half-length of the crosshair arms, in cells. The horizontal arm is a little
+ * longer so the cross looks even, since cells are taller than they are wide. */
 #define XHAIR_ARM_H  4
 #define XHAIR_ARM_V  3
 
@@ -191,22 +116,22 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* frame_pace — sleep whatever is left of this frame's 1/target_fps budget, so
- * the loop holds a steady frame rate regardless of how long the work took. */
+/* If this frame finished early, sleep off the rest of its time slice so the
+ * program runs at a steady speed no matter how fast the machine is. */
 static void frame_pace(int target_fps, int64_t frame_start)
 {
     clock_sleep_ns(NS_PER_SEC / target_fps - (clock_ns() - frame_start));
 }
 
 /*
- * FpsCounter — a smooth frames-per-second readout for the HUD.  Counts frames
- * over a rolling FPS_WINDOW_MS window, then divides to get the rate (per-frame
- * fps jitters too much to display).
+ * Keeps a steady frames-per-second number for the on-screen display. We count
+ * how many frames go by over a short window, then divide; measuring frame by
+ * frame would make the number jump around too much to read.
  */
 typedef struct {
-    int64_t window_start;   /* clock_ns when this counting window began */
-    int     frames;         /* frames counted since then                */
-    double  value;          /* last computed fps — what the HUD shows   */
+    int64_t window_start;   /* when the current counting window started */
+    int     frames;         /* frames seen since then                   */
+    double  value;          /* the latest fps, i.e. what we show        */
 } FpsCounter;
 
 static void fps_count_frame(FpsCounter *f, int64_t now)
@@ -221,56 +146,53 @@ static void fps_count_frame(FpsCounter *f, int64_t now)
 }
 
 /* ===================================================================== */
-/* §3  complex — the number system both panels iterate in                 */
+/* §3  complex — the numbers both panels work with                        */
 /* ===================================================================== */
 
 /*
- * Complex — one point in the complex plane, written z = re + im·i.
- *
- * WHY fractals are built on this: a complex number is a 2-D point (re, im) with
- * a special multiplication that both scales AND rotates.  Both panels are the
- * orbit of z ← z² + c; whether that orbit escapes to infinity or stays bounded
- * is what decides every pixel's colour.  (Iteration of complex maps: refs [3][4].)
- *
- * Naming the type lets §4's loop read like the formula instead of juggling
- * zr/zi floats — and who plays z vs c is the whole Mandelbrot/Julia difference
- * (see §4).  float is plenty for these zoom depths and faster in the per-frame
- * inner loop.
+ * A "complex number" is really just a point on a 2-D plane: one number for
+ * how far across (re) and one for how far up (im). The whole fractal comes from
+ * repeating one step on these points, z = z*z + c, and watching whether the
+ * point shoots off to infinity or stays put. We give it a name so the step
+ * below reads like the math instead of four loose floats. float is accurate
+ * enough here and keeps the tight inner loop fast.
  */
 typedef struct {
-    float re;   /* real part      — horizontal axis */
-    float im;   /* imaginary part — vertical axis   */
+    float re;   /* how far across (left-right) */
+    float im;   /* how far up    (down-up)     */
 } Complex;
 
-/* z = a + b */
 static inline Complex complex_add(Complex a, Complex b)
 {
     return (Complex){ a.re + b.re, a.im + b.im };
 }
 
-/* z² = (re² − im²) + (2·re·im)·i */
+/* Squaring a complex number twists and stretches it; this is what makes the
+ * fractal's swirly shapes. */
 static inline Complex complex_square(Complex z)
 {
     return (Complex){ z.re * z.re - z.im * z.im, 2.0f * z.re * z.im };
 }
 
-/* |z|² = re² + im²  (compared against ESCAPE_RADIUS_SQ) */
+/* Distance from the origin, but squared (we skip the square root and compare
+ * against ESCAPE_RADIUS_SQ instead). */
 static inline float complex_norm_sq(Complex z)
 {
     return z.re * z.re + z.im * z.im;
 }
 
 /* ===================================================================== */
-/* §4  escape — the one engine that draws both panels                     */
+/* §4  escape — the one routine that draws both panels                    */
 /* ===================================================================== */
 
 /*
- * escape_time — iterate z ← z² + c from a given z; return the number of steps
- * until |z| > 2, or MAX_ITER if it never escapes.
+ * Repeat the step z = z*z + c and count how many steps it takes before the
+ * point runs off to infinity. If it never does within our budget, return the
+ * max — that point is "inside" the set.
  *
- * This is the whole "Mandelbrot vs Julia" story in one function:
- *   Mandelbrot pixel → escape_time(z = 0,     c = pixel)   (vary c, z₀ fixed)
- *   Julia pixel      → escape_time(z = pixel, c = cursor)  (vary z₀, c fixed)
+ * The only difference between the two panels is what you keep fixed:
+ *   Mandelbrot: start z at 0, let c be the pixel  (the map of every c)
+ *   Julia:      let z be the pixel, fix c at the crosshair  (one chosen c)
  */
 static int escape_time(Complex z, Complex c)
 {
@@ -283,20 +205,19 @@ static int escape_time(Complex z, Complex c)
 }
 
 /*
- * escape_level — map an escape count to a colour level.
- *   iter == MAX_ITER → 7 (inside the set — brightest, drawn bold)
- *   fast escape      → 0 (background, not drawn)
- *   otherwise        → 1..6 by fraction of MAX_ITER
+ * Turn a step count into a colour band (0..7): never escaped means inside the
+ * set (band 7, the brightest), escaped right away means blank background
+ * (band 0), and everything in between gets a band along the gradient.
  */
 static uint8_t escape_level(int iter)
 {
-    if (iter >= MAX_ITER) return (uint8_t)(N_LEVELS - 1);  /* never escaped → inside */
+    if (iter >= MAX_ITER) return (uint8_t)(N_LEVELS - 1);  /* stayed put → inside the set */
 
-    float frac = (float)iter / (float)MAX_ITER;            /* 0 = fast … →1 = slow   */
-    if (frac < BACKGROUND_FRAC) return 0;                  /* far exterior → blank   */
+    float frac = (float)iter / (float)MAX_ITER;            /* 0 = escaped fast, 1 = escaped slow */
+    if (frac < BACKGROUND_FRAC) return 0;                  /* escaped almost instantly → blank   */
 
-    /* halo_pos: where in the coloured range this pixel sits, 0..1 */
-    int   n_bands  = N_LEVELS - 2;                         /* drawable bands 1..6    */
+    /* Spread the rest across the drawable bands (1..6). */
+    int   n_bands  = N_LEVELS - 2;
     float halo_pos = (frac - BACKGROUND_FRAC) / (1.0f - BACKGROUND_FRAC);
     int   band     = 1 + (int)(halo_pos * (float)n_bands + 0.5f);
     if (band < 1)       band = 1;
@@ -305,25 +226,23 @@ static uint8_t escape_level(int iter)
 }
 
 /* ===================================================================== */
-/* §5  view — the lens between screen cells and the complex plane          */
+/* §5  view — converting between screen cells and plane coordinates        */
 /* ===================================================================== */
 
 /*
- * ViewWindow — the rectangle of the (infinite) complex plane a panel shows,
- * given by its corners.  Both panels carry one: the Mandelbrot's is fixed
- * framing, the Julia's zooms with z/Z.
- *
- * WHY corners (not centre + half-extent): the panels map a cell with the plain
- * "min + fraction·range" formula, so storing the edges keeps that mapping a
- * one-liner.  view_sample goes cell → point (to compute a pixel); view_locate
- * is the inverse, point → cell (to drop the crosshair at the cursor).
+ * Which rectangle of the (endless) plane a panel is looking at, stored as its
+ * four edges. Each panel has one: the left panel's never moves, the right one's
+ * grows and shrinks when you zoom. We keep the edges (not a centre + size)
+ * because that makes the cell-to-point math a single clean line. view_sample
+ * goes screen cell -> plane point; view_locate goes the other way, so we can
+ * find where on screen the crosshair belongs.
  */
 typedef struct {
-    float re_min, re_max;   /* left / right edge, real axis              */
-    float im_min, im_max;   /* bottom / top edge; im_max maps to screen row 0 */
+    float re_min, re_max;   /* left and right edges  */
+    float im_min, im_max;   /* bottom and top edges; the top edge is screen row 0 */
 } ViewWindow;
 
-/* cell (col,row) → the complex point it samples */
+/* Which point on the plane does this screen cell land on? */
 static Complex view_sample(const ViewWindow *v, int col, int row, int cols, int rows)
 {
     int   cols1 = (cols > 1) ? cols - 1 : 1;
@@ -332,11 +251,11 @@ static Complex view_sample(const ViewWindow *v, int col, int row, int cols, int 
     float fy = (float)row / (float)rows1;
     return (Complex){
         .re = v->re_min + fx * (v->re_max - v->re_min),
-        .im = v->im_max - fy * (v->im_max - v->im_min),   /* row 0 = top = im_max */
+        .im = v->im_max - fy * (v->im_max - v->im_min),   /* row 0 is the top, so it maps to the top edge */
     };
 }
 
-/* complex point → the cell that lands on (inverse of view_sample) */
+/* Which screen cell does this point on the plane land on? (the reverse of above) */
 static void view_locate(const ViewWindow *v, Complex p, int cols, int rows,
                         int *out_col, int *out_row)
 {
@@ -347,38 +266,34 @@ static void view_locate(const ViewWindow *v, Complex p, int cols, int rows,
 }
 
 /* ===================================================================== */
-/* §6  color — themes bound to ncurses pairs                              */
+/* §6  color — the colour themes                                          */
 /* ===================================================================== */
 
 /*
- * Theme table — each row is 8 xterm-256 foreground colours for levels 0..7.
- * Both panels colour a cell by its escape level, so one table restyles the
- * whole screen by swapping a row — table-driven, same idea as julia.c [8] and
- * buddhabrot.c.
- *   fg[0]  unused (level 0 = background, not drawn)
- *   fg[1..6]  the escape gradient, dim → bright
- *   fg[7]  inside the set (brightest; also drawn A_BOLD for a glow)
- *
- * Same theme set + hue families as julia.c, expanded to 7 levels.  Every level
- * sits in the BRIGHT half of the cube (no value below ~39, no 232-239 gray),
- * so even the lowest band stays visible on black.
+ * One colour theme per row: a name plus a colour for each of the 8 bands.
+ * Since every cell is coloured by its band, changing the whole look is just a
+ * matter of switching to another row.
+ *   fg[0]  unused (band 0 is background, never drawn)
+ *   fg[1..6]  the gradient, faint up to bright
+ *   fg[7]  the inside of the set (brightest, and drawn bold so it glows)
+ * Every colour is from the bright half of the palette so even the faintest band
+ * still shows up against a black terminal.
  */
 static const struct {
-    const char *name;          /* shown in the HUD, e.g. "Ocean" */
-    short       fg[N_LEVELS];   /* colour per escape level 0..7   */
+    const char *name;          /* what shows in the top bar, e.g. "Ocean" */
+    short       fg[N_LEVELS];   /* the colour for each band 0..7           */
 } k_themes[N_THEMES] = {
-    /*            name     bg  level1 ───────────────────────── level7 (inside) */
-    { "Fire",   { -1, 160, 202, 208, 214, 220, 226, 231 } },  /* red → orange → yellow → white */
-    { "Ocean",  { -1,  39,  45,  51,  87, 123, 159, 231 } },  /* blue → cyan → aqua → white     */
-    { "Toxic",  { -1,  46,  82, 118, 154, 190, 226, 231 } },  /* green → lime → yellow → white  */
-    { "Neon",   { -1,  99, 141, 171, 201, 207, 213, 231 } },  /* indigo → magenta → pink → white*/
-    { "Mono",   { -1, 244, 246, 248, 250, 252, 254, 231 } },  /* grey ramp → white              */
+    { "Fire",   { -1, 160, 202, 208, 214, 220, 226, 231 } },  /* red to orange to yellow to white */
+    { "Ocean",  { -1,  39,  45,  51,  87, 123, 159, 231 } },  /* blue to cyan to white            */
+    { "Toxic",  { -1,  46,  82, 118, 154, 190, 226, 231 } },  /* green to yellow to white         */
+    { "Neon",   { -1,  99, 141, 171, 201, 207, 213, 231 } },  /* purple to pink to white          */
+    { "Mono",   { -1, 244, 246, 248, 250, 252, 254, 231 } },  /* grey to white                    */
 };
 
-/* Characters assigned to each level (denser → brighter → higher level) */
+/* The character drawn for each band — busier marks for the higher bands. */
 static const char k_chars[N_LEVELS] = { ' ', '.', ',', ':', '+', '#', '@', '*' };
 
-/* 8-color terminal fallback palette */
+/* Stand-in colours for old terminals that only have 8 colours. */
 static const short k_fb8[N_LEVELS] = {
     -1, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN,
     COLOR_GREEN, COLOR_YELLOW, COLOR_WHITE, COLOR_WHITE,
@@ -395,73 +310,70 @@ static void theme_apply(int t)
 static void colors_init(int theme)
 {
     start_color();
-    init_pair(CP_HUD,   (COLORS >= 256) ? 226 : COLOR_YELLOW, COLOR_BLACK);  /* yellow data  */
-    init_pair(CP_HINT,  (COLORS >= 256) ?  51 : COLOR_CYAN,   COLOR_BLACK);  /* cyan actions */
-    init_pair(CP_DIV,   (COLORS >= 256) ? 240 : COLOR_WHITE,  COLOR_BLACK);  /* gray divider */
-    init_pair(CP_XHAIR, (COLORS >= 256) ? 226 : COLOR_YELLOW, COLOR_BLACK);  /* yellow xhair */
+    init_pair(CP_HUD,   (COLORS >= 256) ? 226 : COLOR_YELLOW, COLOR_BLACK);
+    init_pair(CP_HINT,  (COLORS >= 256) ?  51 : COLOR_CYAN,   COLOR_BLACK);
+    init_pair(CP_DIV,   (COLORS >= 256) ? 240 : COLOR_WHITE,  COLOR_BLACK);
+    init_pair(CP_XHAIR, (COLORS >= 256) ? 226 : COLOR_YELLOW, COLOR_BLACK);
     theme_apply(theme);
 }
 
 /* ===================================================================== */
-/* §7  scene — the whole explorer state                                   */
+/* §7  scene — everything the explorer keeps track of                     */
 /* ===================================================================== */
 
 /*
- * Wander — the cursor's auto-orbit ('a' toggles it).  When active and not
- * paused, scene_wander_step walks c around a squished ellipse (radii WANDER_R
- * across, WANDER_R·WANDER_YSHRK tall) that hugs the Mandelbrot boundary —
- * exactly where the Julia sets are most intricate (refs [1][2]) — so the right
- * panel keeps morphing through interesting shapes hands-free.
+ * The "hands-free tour" state (press 'a' to turn it on). While it's running it
+ * slides the crosshair around an oval that follows the edge of the Mandelbrot
+ * set — the spot where the Julia sets are the most interesting — so the right
+ * panel keeps changing shape on its own.
  */
 typedef struct {
-    bool  active;   /* is auto-wander on?                */
-    bool  paused;   /* frozen by the user (space)?       */
-    float phase;    /* angle around the ellipse, radians */
+    bool  active;   /* is the tour turned on?              */
+    bool  paused;   /* did the user freeze it (spacebar)?  */
+    float phase;    /* how far around the oval we are now  */
 } Wander;
 
 /*
- * Layout — the split-screen geometry derived from the terminal size: the two
- * panel widths, with a one-column divider between them at x = mandel_w.  Left
- * half is the Mandelbrot map, right half the live Julia set.
+ * How the screen is split into two panels, worked out from the terminal size.
+ * The left panel is the Mandelbrot map, the right is the live Julia set, with a
+ * single column between them for the divider line.
  */
 typedef struct {
-    int rows, cols;   /* terminal size (clamped to ROWS_MAX / COLS_MAX) */
-    int mandel_w;     /* left  (Mandelbrot) panel width                 */
-    int julia_w;      /* right (Julia) panel width                      */
+    int rows, cols;   /* terminal size (capped at ROWS_MAX / COLS_MAX) */
+    int mandel_w;     /* width of the left  (Mandelbrot) panel         */
+    int julia_w;      /* width of the right (Julia) panel              */
 } Layout;
 
 /*
- * MandelCache — the left panel's escape levels, computed once per resize.
- *
- * WHY cache it: the Mandelbrot picture is the MAP of all c-values and never
- * changes as you move the cursor, so recomputing it every frame would be wasted
- * work.  Filling it once (scene_recompute_mandel) keeps cursor movement instant;
- * only the Julia panel — which DOES depend on c — is redrawn live each frame.
+ * The finished left panel, saved so we don't redraw it constantly. The
+ * Mandelbrot picture is the map of every possible c and doesn't change as you
+ * move the crosshair, so we work it out once (and again on resize) and just
+ * reuse it. That's what keeps the crosshair feeling instant — only the right
+ * panel, which actually depends on c, is recomputed each frame.
  */
 typedef struct {
-    ViewWindow view;                              /* fixed Mandelbrot framing      */
-    int        rows, cols;                        /* cached dimensions             */
-    uint8_t    level[ROWS_MAX][MANDEL_COLS_MAX];  /* escape level (0..7) per cell  */
+    ViewWindow view;                              /* which part of the plane it shows */
+    int        rows, cols;                        /* the size it was computed at      */
+    uint8_t    level[ROWS_MAX][MANDEL_COLS_MAX];  /* the colour band (0..7) of every cell */
 } MandelCache;
 
 /*
- * Scene — everything the explorer holds, in one place.  The main loop reduces
- * to: read keys into the Scene, scene_wander_step, then draw it.
- *
- * WHY bundle them: the cursor picks which Julia set, the zoom frames it, the
- * cache backs the left panel, the layout sizes both — they only make sense
- * together, and one &scene carries the lot between functions.
+ * All of the explorer's state in one bundle. Each frame the main loop just
+ * reads keys into this, takes one tour step, and draws it. They belong together:
+ * the crosshair chooses the Julia set, the zoom frames it, the cache is the left
+ * panel, the layout sizes both — and passing one &scene hands the lot around.
  */
 typedef struct {
-    Complex     cursor;      /* selected c = cr + ci·i — drives the Julia panel */
-    float       julia_zoom;  /* Julia view half-height (imaginary units)        */
-    int         theme;       /* index into k_themes                             */
-    Wander      wander;      /* auto-orbit state                                */
-    Layout      layout;      /* split-screen geometry                           */
-    MandelCache mandel;      /* precomputed left panel                          */
+    Complex     cursor;      /* the chosen c — this is what picks the Julia set */
+    float       julia_zoom;  /* how zoomed in the Julia panel is                */
+    int         theme;       /* which colour theme is active                    */
+    Wander      wander;      /* the hands-free tour state                       */
+    Layout      layout;      /* how the screen is split                         */
+    MandelCache mandel;      /* the saved left panel                            */
 } Scene;
 
-/* The Julia panel's current view (origin-centred, aspect-corrected, zoomed). */
+/* Work out the slice of the plane the Julia panel should show right now,
+ * centred on the origin and adjusted for zoom and cell shape. */
 static ViewWindow scene_julia_view(const Scene *s)
 {
     float im_half = s->julia_zoom;
@@ -469,7 +381,7 @@ static ViewWindow scene_julia_view(const Scene *s)
     return (ViewWindow){ -re_half, re_half, -im_half, im_half };
 }
 
-/* Recompute the Mandelbrot cache for the current layout. */
+/* Draw the whole left panel once and save it. */
 static void scene_recompute_mandel(Scene *s)
 {
     MandelCache *m = &s->mandel;
@@ -484,8 +396,7 @@ static void scene_recompute_mandel(Scene *s)
         }
 }
 
-/* (Re)compute the split-screen layout from a raw terminal size, then refill
- * the Mandelbrot cache. */
+/* Work out the panel sizes from the terminal size, then redraw the left panel. */
 static void scene_layout(Scene *s, int term_rows, int term_cols)
 {
     int rows = term_rows, cols = term_cols;
@@ -497,12 +408,12 @@ static void scene_layout(Scene *s, int term_rows, int term_cols)
     s->layout.rows     = rows;
     s->layout.cols     = cols;
     s->layout.mandel_w = cols / 2;
-    s->layout.julia_w  = cols - s->layout.mandel_w - 1;   /* -1 for the divider */
+    s->layout.julia_w  = cols - s->layout.mandel_w - 1;   /* one column goes to the divider */
 
     scene_recompute_mandel(s);
 }
 
-/* Nudge the cursor (and cancel auto-wander — the user took the wheel). */
+/* Moving the crosshair by hand also stops the hands-free tour. */
 static void scene_move_cursor(Scene *s, float dre, float dim)
 {
     s->cursor.re += dre;
@@ -510,7 +421,6 @@ static void scene_move_cursor(Scene *s, float dre, float dim)
     s->wander.active = false;
 }
 
-/* Zoom the Julia view, clamped to its range. */
 static void scene_zoom_julia(Scene *s, float factor)
 {
     s->julia_zoom *= factor;
@@ -518,21 +428,21 @@ static void scene_zoom_julia(Scene *s, float factor)
     if (s->julia_zoom > J_IM_HALF_MAX) s->julia_zoom = J_IM_HALF_MAX;
 }
 
-/* Snap the cursor back to the Douady rabbit. */
 static void scene_reset(Scene *s)
 {
     s->cursor = (Complex){ C_INIT_RE, C_INIT_IM };
     s->wander.active = false;
 }
 
-/* Cycle the theme (dir = +1 next, −1 prev). */
+/* dir is +1 for the next theme, -1 for the previous one. */
 static void scene_cycle_theme(Scene *s, int dir)
 {
     s->theme = (s->theme + dir + N_THEMES) % N_THEMES;
     theme_apply(s->theme);
 }
 
-/* Toggle auto-wander; on enable, sync the phase so the cursor doesn't jump. */
+/* When the tour starts, line it up with where the crosshair already is so it
+ * doesn't suddenly jump. */
 static void scene_toggle_wander(Scene *s)
 {
     s->wander.active = !s->wander.active;
@@ -540,7 +450,7 @@ static void scene_toggle_wander(Scene *s)
         s->wander.phase = atan2f(s->cursor.im / WANDER_YSHRK, s->cursor.re / WANDER_R);
 }
 
-/* One step of auto-wander: advance the phase and place the cursor on the ellipse. */
+/* Move the crosshair one notch further around the tour's oval. */
 static void scene_wander_step(Scene *s)
 {
     if (!s->wander.active || s->wander.paused) return;
@@ -550,10 +460,10 @@ static void scene_wander_step(Scene *s)
 }
 
 /* ===================================================================== */
-/* §8  render — paint the panels, divider, crosshair and HUD              */
+/* §8  render — drawing the panels, divider, crosshair and text           */
 /* ===================================================================== */
 
-/* attributes for a level: its colour pair, plus bold on the inside-the-set band */
+/* The colour for a band, plus bold for the brightest band so the inside glows. */
 static attr_t level_attr(uint8_t lev)
 {
     attr_t attr = COLOR_PAIR(CP_LEV1 + (int)lev - 1);
@@ -566,7 +476,7 @@ static chtype level_glyph(uint8_t lev)
     return (chtype)(unsigned char)k_chars[lev];
 }
 
-/* Left panel — straight from the cache (no recompute). */
+/* Left panel — just copy out the saved picture. */
 static void mandelbrot_draw(const Scene *s)
 {
     const MandelCache *m = &s->mandel;
@@ -582,13 +492,13 @@ static void mandelbrot_draw(const Scene *s)
     }
 }
 
-/* Right panel — the Julia set for the current cursor, recomputed live. */
+/* Right panel — the Julia set for wherever the crosshair is, drawn fresh. */
 static void julia_draw(const Scene *s)
 {
     if (s->layout.julia_w <= 0 || s->layout.rows <= 0) return;
 
     ViewWindow v = scene_julia_view(s);
-    int x0 = s->layout.mandel_w + 1;   /* first column right of the divider */
+    int x0 = s->layout.mandel_w + 1;   /* the first column past the divider */
 
     for (int row = 0; row < s->layout.rows; row++) {
         for (int col = 0; col < s->layout.julia_w; col++) {
@@ -611,7 +521,7 @@ static void divider_draw(const Scene *s)
     attroff(COLOR_PAIR(CP_DIV));
 }
 
-/* Crosshair marking the cursor's position on the Mandelbrot panel. */
+/* Draw the crosshair on the left panel to show which c is selected. */
 static void crosshair_draw(const Scene *s)
 {
     int xc, xr;
@@ -628,9 +538,9 @@ static void crosshair_draw(const Scene *s)
 }
 
 /*
- * hud_line — draw one HUD line at (row, x) in colour `pair`, clamped to the
- * terminal width so a long line never wraps onto the panels.  The "%.*s"
- * precision truncates the text to the columns left from x.
+ * Print one line of text, cut off at the right edge of the screen so a long
+ * line can't wrap down over the fractal. (The "%.*s" trick limits the text to
+ * however many columns are left.)
  */
 static void hud_line(int row, int x, int pair, int cols, const char *str)
 {
@@ -642,23 +552,20 @@ static void hud_line(int row, int x, int pair, int cols, const char *str)
 }
 
 /*
- * hud_draw — top is data, bottom is actions:
- *   row 0 left   MANDELBROT label + global data (theme, fps)
- *   row 0 right  JULIA label + this set's data (c, zoom, run state)
- *   row rows-1   every interactive key
- * Each line is clamped to the terminal width by hud_line.
+ * The status text: a label and info over each panel along the top row, and the
+ * list of keys along the bottom row.
  */
 static void hud_draw(const Scene *s, double fps)
 {
     const Layout *L = &s->layout;
     char buf[128];
 
-    /* top-left — Mandelbrot panel + global data */
+    /* over the left panel: theme and frame rate */
     snprintf(buf, sizeof buf, " MANDELBROT   theme:%s  %.0f fps ",
              k_themes[s->theme].name, fps);
     hud_line(0, 1, CP_HUD, L->cols, buf);
 
-    /* top-right — Julia panel + the current set's data */
+    /* over the right panel: the chosen c, zoom, and whether the tour is running */
     float zoom = J_IM_HALF_DEF / s->julia_zoom;
     const char *state = s->wander.paused ? "PAUSED"
                       : (s->wander.active ? "wander" : "manual");
@@ -666,7 +573,7 @@ static void hud_draw(const Scene *s, double fps)
              (double)s->cursor.re, (double)s->cursor.im, (double)zoom, state);
     hud_line(0, L->mandel_w + 2, CP_HUD, L->cols, buf);
 
-    /* bottom — actions */
+    /* the keys, along the bottom */
     int last = (L->rows > 1) ? L->rows - 1 : 0;
     hud_line(last, 0, CP_HINT, L->cols,
         " q:quit  arrows/hjkl:move c  z/Z:zoom  t/T:theme  a:wander  spc:pause  r:reset ");
@@ -687,19 +594,19 @@ static void on_signal(int s)
 
 static void cleanup(void) { endwin(); }
 
-/* Map one keypress to a scene action.  Returns false to quit. */
+/* Do whatever a single keypress asks for. Returns false when it's time to quit. */
 static bool app_handle_key(Scene *s, int ch)
 {
     switch (ch) {
     case 'q': case 'Q': case 27: return false;
 
-    /* fine c movement — arrow keys */
+    /* arrow keys: nudge the crosshair a little */
     case KEY_UP:    scene_move_cursor(s,  0.0f,       +FINE_STEP); break;
     case KEY_DOWN:  scene_move_cursor(s,  0.0f,       -FINE_STEP); break;
     case KEY_LEFT:  scene_move_cursor(s, -FINE_STEP,   0.0f);      break;
     case KEY_RIGHT: scene_move_cursor(s, +FINE_STEP,   0.0f);      break;
 
-    /* coarse c movement — hjkl (vim: h=left j=down k=up l=right) */
+    /* hjkl: nudge the crosshair a lot (vim layout: h left, j down, k up, l right) */
     case 'k': scene_move_cursor(s,  0.0f,        +COARSE_STEP); break;
     case 'j': scene_move_cursor(s,  0.0f,        -COARSE_STEP); break;
     case 'h': scene_move_cursor(s, -COARSE_STEP,  0.0f);        break;

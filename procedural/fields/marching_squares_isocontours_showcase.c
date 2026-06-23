@@ -1,246 +1,32 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * marching_squares_isocontours_showcase.c
- *   — Extract iso-contours from a scalar field using marching squares.
- *     The 2-D ancestor of marching cubes. 30 visualisations explore
- *     single iso-lines, multi-threshold topographic maps, case-aware
- *     topology highlights, region fills, and time-varying thresholds.
  *
- * DEMO: Take any scalar field (here: a small Perlin/value-noise stack
- *       drifting in time). Pick a threshold T. For every 2×2 grid of
- *       samples, classify each corner as ABOVE or BELOW T → 4-bit
- *       case index ∈ {0..15}. A lookup table tells you which edge(s)
- *       of the cell the iso-line crosses; linear interpolation along
- *       each edge gives the actual crossing points. Connect them →
- *       the iso-contour.
+ * Draws contour lines through a field of numbers, the way a map draws
+ * the coastline at a chosen sea level. Pick a level T; the "marching
+ * squares" trick looks at the four corners of each little square of the
+ * grid, notes which corners are above T and which are below, and from
+ * that picks the right line glyph to draw. 30 different ways to colour
+ * and combine those lines, cycled with n/p.
  *
- *       30 patterns in 6 tiers (cycle with n / p):
- *         Tier 1 SINGLE   — basic single-iso renderings (CONTOUR,
- *                           THICK, INVERT, DOTS, UNIFORM)
- *         Tier 2 MULTI    — multiple evenly-spaced thresholds
- *                           (TOPO, DENSE, SPARSE, STEPS, RAINBOW)
- *         Tier 3 PAIRS    — specific T combinations (DUAL, SHELL,
- *                           INNER, OUTER, SANDWICH)
- *         Tier 4 TOPOLOGY — case-aware masks: only certain MS cases
- *                           drawn (SADDLE, ORTHO, DIAGONALS,
- *                           JUNCTIONS, ROUGHNESS)
- *         Tier 5 REGIONS  — filled-region visualisations (ABOVE,
- *                           BELOW, STRIPE, ZEBRA, PERIMETER)
- *         Tier 6 ANIMATED — time-varying thresholds (SWEEP, PULSE,
- *                           RIPPLE, STAIRS, CHAOS)
+ * The field of numbers here is some gently drifting noise, but marching
+ * squares doesn't care where the numbers come from — a heightmap or a
+ * distance field would work just as well.
  *
- * Study alongside:
- *   ./perin_noise_flow_showcase.c — the source field we contour over.
- *   ./worley_cellular_noise.c — another field type you could feed
- *       into this iso-contour extractor.
- *   ./value_noise_showcase.c — the simplest noise; gives blocky
- *       contours with visible lattice artefacts.
+ * Sister files:
+ *   ./perin_noise_flow_showcase.c        — the noise field we contour.
+ *   ./signed_distance_field_jfa_showcase.c — its OUTLINE does a soft
+ *       version of the same idea without marching squares.
  *
- * Section map:
- *   §1 config   — grid bounds, T constants, themes, HUD widths,
- *                 sim/render budgets, fBm octave parameters
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD pairs + 10 themes (PAIR_BAND_BASE+0..3)
- *   §5 field    — ScalarField (3-octave fBm value noise)
- *   §6 ms       — marching-squares classifier (4-bit case index)
- *   §7 patterns — 30 contour visualisations + dispatch table
- *   §8 scene    — ScalarField + ContourGrid + Pattern/Palette state;
- *                 per-frame tick + evaluate
- *   §9 screen   — viewport + ContourGrid renderer + HUD layout
- *   §10 app     — signals, resize, key dispatch, main game loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume animation
- *   r          reset (new noise seed)
- *   n / N      next pattern  (p / P previous)
- *   t / T      next / previous theme
- *   > / <      raise / lower user threshold T  (. / , as easier-typed aliases)
- *   + / =      faster drift (× 2)
- *   -          slower drift (/ 2)
- *   ] / [      raise / lower simulation tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *       marching_squares_isocontours_showcase.c -o marching_squares \
- *       -lncurses -lm
+ * Marching squares / cubes references:
+ *   Lorensen & Cline (1987), "Marching Cubes", SIGGRAPH'87 — the
+ *     original; marching squares is its 2-D simplification.
+ *   Nielson & Hamann (1991), "The Asymptotic Decider", IEEE Vis'91 —
+ *     the reference on the ambiguous saddle cases (5 and 10).
+ *   Bourke, P. — "Polygonising a scalar field":
+ *     http://paulbourke.net/geometry/polygonise/  (all the cases drawn).
+ *   Wikipedia — "Marching squares".
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Marching squares. Given a 2-D scalar field f(x, y)
- *                  sampled on a grid and an iso-threshold T, the
- *                  algorithm:
- *                    1. For each 2×2 block of corner samples, classify
- *                       each corner as 1 (≥ T) or 0 (< T).
- *                    2. Pack the 4 bits into a 4-bit case ∈ {0..15}.
- *                    3. Look up the case in a table that describes
- *                       which cell edges the iso-line crosses
- *                       (0, 1, or 2 edges).
- *                    4. For each crossing edge, linear-interpolate
- *                       the exact crossing position along the edge:
- *                       t = (T − f_lo) / (f_hi − f_lo).
- *                    5. Connect the crossing points → a line segment
- *                       (or two, in ambiguous cases 5 and 10).
- *
- *                  Cases 5 (0101) and 10 (1010) are SADDLES:
- *                  diagonally-opposite corners are above T. The
- *                  algorithm has to choose between two valid pairings
- *                  of the four edge crossings — sample f at the cell
- *                  centre to break the tie consistently.
- *
- *                  Output: a set of line segments approximating the
- *                  contour curve {f(x, y) = T}.
- *
- * Data-structure : Just the source scalar field (a Field of floats)
- *                  plus a 16-entry case → glyph lookup table for the
- *                  ASCII rendering. No persistent contour storage —
- *                  we rebuild it every frame.
- *
- * Rendering      : The "natural" marching-squares output is a set of
- *                  line segments. For ASCII we use a case → glyph
- *                  table that picks the best single character for
- *                  the line direction implied by the case:
- *                    cases 1, 14 (one corner above)     → '/' or '\'
- *                    cases 2, 13                        → '\' or '/'
- *                    cases 3, 12 (horizontal split)     → '-'
- *                    cases 6, 9  (vertical split)       → '|'
- *                    cases 5, 10 (saddle - ambiguous)   → 'X'
- *                    cases 7, 8  / 4, 11 (corners)      → '+' or '*'
- *                    cases 0, 15 (entirely below/above) → empty
- *                  TOPO and DUAL modes overlay multiple contour sets,
- *                  colouring by which threshold the contour belongs to.
- *
- * Performance    : O(W · H) per frame — one case classification + one
- *                  glyph lookup per cell. The source-field sampling
- *                  dominates: 4 corner samples per cell, each a
- *                  ~20-op noise function = ~80 noise ops/cell.
- *                  On an 11K-cell grid at 60 Hz that's ~5 M ops/sec
- *                  — completely trivial.
- *
- * References     : MARCHING SQUARES / CUBES
- *                  • Lorensen, W. E. & Cline, H. E. (1987) —
- *                    "Marching Cubes: A High Resolution 3D Surface
- *                    Construction Algorithm", SIGGRAPH'87. The
- *                    foundational paper; marching squares is the
- *                    direct 2-D simplification.
- *                  • Nielson, G. M. & Hamann, B. (1991) — "The
- *                    Asymptotic Decider: Resolving the Ambiguity in
- *                    Marching Cubes", IEEE Visualization '91. THE
- *                    reference on the saddle-case ambiguity (cases
- *                    5 and 10); directly underpins the SADDLE
- *                    pattern in §7.
- *                  • Newman, T. S. & Yi, H. (2006) — "A survey of
- *                    the marching cubes algorithm", Computers &
- *                    Graphics 30(5). Comprehensive review of
- *                    variants, ambiguity resolution, and
- *                    topology-preserving extensions.
- *                  • Maple, C. (2003) — "Geometric design and space
- *                    planning using the marching squares and
- *                    marching cube algorithms", IV'03. Practical
- *                    coverage of edge cases including saddle
- *                    disambiguation.
- *                  • Bourke, P. — "Polygonising a scalar field":
- *                    http://paulbourke.net/geometry/polygonise/
- *                    The most-cited practical reference — all 256
- *                    MC cases drawn out; the 16-entry MS table here
- *                    is the 2-D projection of the same construction.
- *                  • Wikipedia — "Marching squares":
- *                    https://en.wikipedia.org/wiki/Marching_squares
- *
- *                  BOOKS
- *                  • Schroeder, W., Martin, K. & Lorensen, B. —
- *                    "The Visualization Toolkit" (4th ed., Kitware,
- *                    2006). The iso-contouring chapter is the
- *                    definitive textbook treatment; co-authored by
- *                    the original Marching Cubes author.
- *
- *                  PROCEDURAL SOURCE FIELD (§5 ScalarField)
- *                  • Perlin, K. (1985) — "An Image Synthesizer",
- *                    SIGGRAPH'85.  Foundational noise paper.  The
- *                    3-octave fBm value-noise stack feeding §5 is a
- *                    simpler hash-lattice variant of Perlin's
- *                    gradient noise — the only "source" the
- *                    contour extractor sees.
- *                  • Quilez, I. — "2D distance functions" — useful
- *                    alternative scalar source: many of the example
- *                    shapes ARE iso-contours of distance fields:
- *                    https://iquilezles.org/articles/distfunctions2d/
- *
- *                  ASCII RENDERING
- *                  • Bourke, P. — "Character representation of grey
- *                    scale images":
- *                    http://paulbourke.net/dataformats/asciiart/
- *
- *                  COMPARE IN PROJECT
- *                  • ./perin_noise_flow_showcase.c — the source field
- *                    we contour over.
- *                  • ./signed_distance_field_jfa_showcase.c — the
- *                    OUTLINE pattern there is a "soft" alternative
- *                    iso-line via SDF thresholding, no marching
- *                    squares needed.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * "Where does this scalar field equal T?" If you have function
- * values at every grid point, the iso-line {f = T} must cross
- * certain CELL EDGES — specifically, the edges where one corner is
- * above T and the other is below. Look at all 4 corners of one
- * 2×2 cell as a 4-bit number and look up the geometry of the cross-
- * ings in a 16-entry table.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine flooding the field with water up to height T. Land sticks
- * up above the water, sea floor stays below. Marching squares
- * draws the COASTLINE — the boundary between wet and dry. For each
- * 2×2 patch of cells, the corners tell you how many neighbours are
- * wet vs dry, which sub-edges the coast crosses, and (via linear
- * interp) WHERE along each edge it crosses.
- *
- * 16 cases × 1 cell type = the entire algorithm.
- *
- * AMBIGUOUS SADDLES
- *   Cases 5 (corners 0 and 2 above, 1 and 3 below) and 10 (corners
- *   1 and 3 above, 0 and 2 below) have two valid contour pairings:
- *   you could connect the four crossing points as two arcs going
- *   ROUND each above-corner, OR as two arcs going BETWEEN the two
- *   above-corners. Both are topologically consistent. To pick one,
- *   sample f at the cell centre — whichever pair its sign agrees
- *   with becomes the connection. See the SADDLE pattern.
- *
- * ALGORITHM IN STEPS  (per cell, per frame)
- * ──────────────────
- *  1. Sample the source field at the 4 corners of every 2×2 cell.
- *  2. For each cell:
- *       a. Build the case bitmask:
- *            bit 0 ← (corner BL ≥ T)
- *            bit 1 ← (corner BR ≥ T)
- *            bit 2 ← (corner TR ≥ T)
- *            bit 3 ← (corner TL ≥ T)
- *          case_index ∈ {0..15}
- *       b. Look up case_glyph[case_index] → the ASCII character that
- *          best represents the contour passing through this cell.
- *       c. For SADDLE cases (5, 10), optionally disambiguate by
- *          sampling the cell centre.
- *  3. Render the glyph (or blank for cases 0/15 = entirely below/
- *     above threshold).
- *  4. TOPO / DUAL modes loop over multiple thresholds and overlay
- *     the results, colouring by threshold index.
- *
- * KEY FORMULAS
- * ────────────
- *  case_index            : 4-bit packing of (corner ≥ T)
- *  Edge crossing position: t = (T − f_lo) / (f_hi − f_lo)    along the
- *                          edge from f_lo to f_hi
- *  Saddle disambiguation : sample f(centre); centre's relation to T
- *                          picks one of the two pairings
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -280,47 +66,49 @@ enum {
     PAIR_BAND_BASE    =   3,
 };
 
-/* HUD layout — top carries data, bottom carries actions. */
+/* The HUD lives on three rows: two info rows up top, one key-hint row
+ * at the bottom. The rest of the screen is the drawing area. */
 #define HUD_TOP_ROWS             2
 #define HUD_BOTTOM_ROWS          1
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
 #define HUD_LEFT_MARGIN          1
 
-/* HUD row-1 column widths — MUST match the printf format-string widths
- * the corresponding hud_field_* helpers emit, otherwise consecutive
- * fields overlap or leave gaps. */
+/* Column widths for the fields on the second HUD row. Each must match
+ * the width its hud_field_* helper actually prints, or neighbouring
+ * fields will overlap or leave gaps. */
 #define HUD_PATTERN_FIELD_W     21
 #define HUD_TIER_FIELD_W        15
 #define HUD_THEME_FIELD_W       17
 #define HUD_PALETTE_LABEL_W      9
 #define HUD_N_PALETTE_BANDS      4
 
-/* Viewport-derived grid floor: the algorithm needs at least one
- * MS cell, but anything tinier than this is unreadable. */
+/* Smallest grid we'll draw — anything tinier is unreadable. */
 #define MAP_W_MIN               16
 #define MAP_H_MIN                8
 
-/* Render-loop budget — sleep target for the per-frame throttle. */
+/* How fast we aim to redraw the screen, and the matching time budget
+ * per frame that the throttle sleeps down to. */
 #define RENDER_FPS_TARGET       60
 #define RENDER_FRAME_BUDGET_NS  (NS_PER_SEC / RENDER_FPS_TARGET)
 
-/* Spiral-of-death guard for the fixed-timestep accumulator: cap any
- * single frame's dt so a slow terminal can't trigger unbounded tick
- * catch-up.  See Fiedler "Fix Your Timestep!" (cited on App, §10). */
+/* If one frame takes much longer than usual (slow terminal, the window
+ * was dragged), don't try to "catch up" with a flood of sim steps.
+ * Cap how much time one frame is allowed to count. See Fiedler, "Fix
+ * Your Timestep!" (cited on App, §10). */
 #define SIM_MAX_FRAME_DT_MS    100
 
-/* Source-field scale: smaller → bigger smooth blobs, coarser contours. */
+/* How zoomed-in we sample the noise: smaller means bigger, smoother
+ * blobs and coarser contours. */
 #define FIELD_SCALE         0.08f
 
-/* Time drift on the source field — slow so the topology of the
- * contour can be tracked by eye. */
+/* How fast the field drifts over time — kept slow so the eye can
+ * follow how the contour shapes change. */
 #define FIELD_DRIFT         0.20f
 
-/* fBm value-noise stack — 3 octaves, classic Mandelbrot fBm shape.
- * Each successive octave doubles in frequency (lacunarity = 2) and
- * carries less amplitude.  Amps sum to 1.0 so the result stays in
- * [0, 1] without an explicit normalisation step (the clamp01 in
- * fbm_3oct is defensive against numeric drift, not normalisation). */
+/* The noise is three layers of detail added together: each layer is
+ * twice as fine as the last (that doubling is the "lacunarity") and
+ * adds a little less. The three amounts sum to 1.0 so the result
+ * naturally lands in [0, 1]. */
 #define FBM_LACUNARITY      2.0f
 #define FBM_OCT0_FREQ       1.0f
 #define FBM_OCT1_FREQ       (FBM_LACUNARITY)
@@ -329,28 +117,30 @@ enum {
 #define FBM_OCT1_AMP        0.3f
 #define FBM_OCT2_AMP        0.2f
 
-/* Drift multiplier — cranked by +/-, capped low. */
+/* Speed-up factor for the drift, doubled/halved by +/-. */
 #define DRIFT_MULT_MIN      1
 #define DRIFT_MULT_DEF      1
 #define DRIFT_MULT_MAX      16
 
-/* CONTOUR / SADDLE — default + step for user-adjustable threshold. */
+/* The sea level the user picks with </>: starting value, step size,
+ * and the range it's allowed to roam in. */
 #define CONTOUR_T_DEFAULT   0.50f
 #define CONTOUR_T_STEP      0.05f
 #define CONTOUR_T_MIN       0.05f
 #define CONTOUR_T_MAX       0.95f
 
-/* Tier 1 — THICK pattern: half-width of the fat-contour band around T. */
+/* THICK pattern: how far above and below the level still counts as
+ * "on the line", to make it look fat. */
 #define THICK_BAND_HALF     0.04f
 
-/* Tier 2 — multi-threshold variants: how many evenly-spaced levels. */
+/* How many evenly-spaced contour levels each multi-level pattern draws. */
 #define TOPO_N_LEVELS       8
 #define DENSE_N_LEVELS     16
 #define SPARSE_N_LEVELS     4
 #define STEPS_N_LEVELS      6
 #define RAINBOW_N_LEVELS   12
 
-/* Tier 3 — fixed-T combinations. */
+/* Fixed sea levels for the patterns that draw two or three set lines. */
 #define DUAL_T_LOW          0.35f
 #define DUAL_T_HIGH         0.65f
 #define SHELL_T_LOW         0.46f
@@ -361,11 +151,11 @@ enum {
 #define SANDWICH_T_MID     0.50f
 #define SANDWICH_T_HIGH     0.70f
 
-/* Tier 5 — region fills. */
+/* Region-fill patterns: stripe thickness and how many zebra bands. */
 #define STRIPE_HALFWIDTH    0.07f
 #define ZEBRA_N_BANDS       8
 
-/* Tier 6 — animated thresholds. */
+/* Timing and sizes for the patterns whose sea level moves on its own. */
 #define SWEEP_T_PERIOD_SEC  6.0f
 #define PULSE_PERIOD_SEC    3.0f
 #define RIPPLE_AMP          0.10f
@@ -376,49 +166,48 @@ enum {
 #define CHAOS_AMP           0.10f
 
 /*
- * Pattern — 30 marching-squares visualisations in 6 complexity tiers.
- * Cycle with n/p. Enum order MUST match `noise_patterns[]` in §7
- * (compiler enforces via fixed-size [N_PATTERNS] initialiser).
+ * Pattern — the 30 ways to draw the contours, cycled with n/p.
+ * Grouped into six tiers from simplest to fanciest. This list and the
+ * noise_patterns[] table in §7 must stay in the same order; the
+ * fixed-size [N_PATTERNS] table makes the compiler catch any mismatch.
  *
- *   Tier 1 SINGLE    : CONTOUR, THICK, INVERT, DOTS, UNIFORM
- *   Tier 2 MULTI     : TOPO, DENSE, SPARSE, STEPS, RAINBOW
- *   Tier 3 PAIRS     : DUAL, SHELL, INNER, OUTER, SANDWICH
- *   Tier 4 TOPOLOGY  : SADDLE, ORTHO, DIAGONALS, JUNCTIONS, ROUGHNESS
- *   Tier 5 REGIONS   : ABOVE, BELOW, STRIPE, ZEBRA, PERIMETER
- *   Tier 6 ANIMATED  : SWEEP, PULSE, RIPPLE, STAIRS, CHAOS
+ *   Tier 1 SINGLE   : one line  (CONTOUR, THICK, INVERT, DOTS, UNIFORM)
+ *   Tier 2 MULTI    : evenly-spaced lines, like a topo map
+ *                     (TOPO, DENSE, SPARSE, STEPS, RAINBOW)
+ *   Tier 3 PAIRS    : a few set lines (DUAL, SHELL, INNER, OUTER, SANDWICH)
+ *   Tier 4 TOPOLOGY : show only certain kinds of cell
+ *                     (SADDLE, ORTHO, DIAGONALS, JUNCTIONS, ROUGHNESS)
+ *   Tier 5 REGIONS  : fill areas, not just lines
+ *                     (ABOVE, BELOW, STRIPE, ZEBRA, PERIMETER)
+ *   Tier 6 ANIMATED : the sea level moves on its own
+ *                     (SWEEP, PULSE, RIPPLE, STAIRS, CHAOS)
  */
 typedef enum {
-    /* Tier 1 — SINGLE: basic single-iso renderings */
     PATTERN_CONTOUR = 0,
     PATTERN_THICK,
     PATTERN_INVERT,
     PATTERN_DOTS,
     PATTERN_UNIFORM,
-    /* Tier 2 — MULTI: evenly-spaced thresholds */
     PATTERN_TOPO,
     PATTERN_DENSE,
     PATTERN_SPARSE,
     PATTERN_STEPS,
     PATTERN_RAINBOW,
-    /* Tier 3 — PAIRS: specific T combinations */
     PATTERN_DUAL,
     PATTERN_SHELL,
     PATTERN_INNER,
     PATTERN_OUTER,
     PATTERN_SANDWICH,
-    /* Tier 4 — TOPOLOGY: case-aware masks */
     PATTERN_SADDLE,
     PATTERN_ORTHO,
     PATTERN_DIAGONALS,
     PATTERN_JUNCTIONS,
     PATTERN_ROUGHNESS,
-    /* Tier 5 — REGIONS: filled visualisations */
     PATTERN_ABOVE,
     PATTERN_BELOW,
     PATTERN_STRIPE,
     PATTERN_ZEBRA,
     PATTERN_PERIMETER,
-    /* Tier 6 — ANIMATED: time-varying thresholds */
     PATTERN_SWEEP,
     PATTERN_PULSE,
     PATTERN_RIPPLE,
@@ -427,34 +216,21 @@ typedef enum {
     N_PATTERNS,
 } Pattern;
 
-/* pattern_name() / pattern_tier() defined in §7 alongside the
- * dispatch table. Forward-declared so the HUD code in §9 can call
- * them without seeing the table. */
+/* Defined down in §7 next to the pattern table; named here so the HUD
+ * code in §9 can ask for the current pattern's label. */
 static const char *pattern_name(Pattern p);
 static const char *pattern_tier(Pattern p);
 
 /*
- * Case → ASCII glyph lookup. Index = 4-bit case packing of
- * (BL, BR, TR, TL) ≥ T. The complement pairs (case k ↔ case 15-k)
- * have the SAME contour topology — only above/below swap — so they
- * share a glyph.
+ * Picks the line character for each of the 16 corner-patterns.
  *
- *   0  / 15 → ' '  (no contour: all below / all above)
- *   1  / 14 → '/'  (single BL corner above)         "
- *   2  / 13 → '\'  (single BR corner above)         "
- *   3  / 12 → '-'  (bottom edge horizontal split)
- *   4  / 11 → '\'  (single TR corner above)
- *   5  /  5 → 'X'  (saddle — ambiguous)
- *   6  /  9 → '|'  (right edge vertical split)
- *   7  /  8 → '/'  (single TL/BR diagonal)
- *   8  /  7 → '/'  (mirror)
- *   9  /  6 → '|'  (mirror)
- *  10  / 10 → 'X'  (saddle — ambiguous)
- *  11  /  4 → '\'  (mirror)
- *  12  /  3 → '-'  (mirror)
- *  13  /  2 → '\'  (mirror)
- *  14  /  1 → '/'  (mirror)
- *  15  /  0 → ' '
+ * Look at one square's four corners, mark each one above the sea level
+ * (1) or below (0), and read them off as a 4-bit number 0..15. That
+ * number is the index into this table, and the character is the line
+ * that best matches how the contour cuts through the square: a slash
+ * for one raised corner, a dash for a flat split, a bar for a vertical
+ * split, and 'X' for the two awkward "saddle" squares where the contour
+ * could go two ways. All-below (0) and all-above (15) draw nothing.
  */
 static const char ms_case_glyph[16] = {
     /* 0  */ ' ',
@@ -475,7 +251,7 @@ static const char ms_case_glyph[16] = {
     /* 15 */ ' ',
 };
 
-/* True for the two ambiguous saddle cases. SADDLE pattern uses this. */
+/* The two awkward squares where the contour could be drawn two ways. */
 static inline bool ms_case_is_saddle(int c) { return c == 5 || c == 10; }
 
 #define NS_PER_SEC  1000000000LL
@@ -483,44 +259,28 @@ static inline bool ms_case_is_saddle(int c) { return c == 5 || c == 10; }
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
 /*
- * Theme — a named 4-colour band ramp defining one visual style.
+ * Theme — one named colour scheme: a name plus four colours going from
+ * dim to bright.
  *
- * INTENT
- *   Decouple "which colours" from "where they're used".  Pattern
- *   code in §7 emits a band index ∈ {0..3} per cell; theme_apply()
- *   in §3 binds that index to one of the four xterm-256 colours
- *   stored here.  Cycling themes (t/T) re-binds the ncurses pairs
- *   in place — no §6/§7/§8 code has to know about colour at all.
+ * This keeps "which colours" separate from "how they're used". A
+ * pattern only ever says "draw this cell in colour slot 0..3"; the
+ * theme decides what those four slots actually look like. Pressing t/T
+ * swaps in a different theme's four colours, and no drawing code has to
+ * change.
  *
- * CONTEXT
- *   themes[N_THEMES] in §1 is the static table of options.  The
- *   active selection lives in PaletteState.current (an index into
- *   themes[]).  theme_apply() pushes this row's colours into
- *   PAIR_BAND_BASE..+3; the renderer then reads those pairs via
- *   COLOR_PAIR(PAIR_BAND_BASE + band).
+ * The four slots go from dimmest to brightest, used roughly as:
+ *   band[0] dim    — faint background strokes
+ *   band[1] low    — outer / lower lines
+ *   band[2] mid    — the main line for most patterns
+ *   band[3] bright — inner lines and highlights
  *
- * PALETTE LOGIC
- *   The 4 band slots form a perceptual ramp, NOT arbitrary colours:
- *     band[0] — dimmest   : dim context strokes (DOTS, OUTER)
- *     band[1] — low       : OUTER contour, lower thresholds
- *     band[2] — mid       : the "primary" iso-line for most patterns
- *     band[3] — bright    : INNER contour, saddle highlights
- *   Every entry MUST sit ≥ index 24 in the xterm-256 cube so that
- *   ramp tier 0 stays legible against default-black with A_BOLD.
- *   (See CLAUDE.md § Theme Palette Brightness.)
- *
- * MEMBER LOGIC
- *   name    : ≤ 8-char ALL-CAPS label.  Stored as a literal pointer
- *             (no copy); HUD reads themes[palette.current].name
- *             directly.
- *   band[4] : xterm-256 colour indices for bands 0..3.  Picked as a
- *             monotone-brightness ramp; the RELATIVE gradient gives
- *             a theme its character, not absolute hue.
- *
- * REFERENCES
- *   • xterm-256 colour cube — indices 16..231 = 6×6×6 RGB cube,
- *     232..255 = 24-step grayscale ramp.
- *   • ncurses(3X) — start_color, init_pair, COLOR_PAIR.
+ * name    : short all-caps label shown in the HUD; just a pointer to a
+ *           string literal, not copied.
+ * band[4] : the four colours, as xterm-256 colour numbers. Every entry
+ *           must be at least 24 so even the dimmest stays readable on a
+ *           black background (see CLAUDE.md, Theme Palette Brightness).
+ *           What gives a theme its feel is the jump from dim to bright,
+ *           not the exact hue.
  */
 typedef struct {
     const char *name;
@@ -602,62 +362,31 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * ScalarField — the 2-D float grid we extract iso-contours from.
+ * ScalarField — the grid of numbers we draw contours through.
  *
- * INTENT
- *   Decouple "what we're contouring" from "how we contour it".  Any
- *   continuous scalar function f: ℝ² → ℝ could be plugged in here;
- *   marching squares does not care about the source.  For this
- *   showcase the values come from a small 3-octave fBm value-noise
- *   stack with time drift (smooth blobs that read pleasingly under
- *   any iso threshold), but a heightmap, an SDF, a fluid-simulation
- *   pressure field, or any other smooth scalar would all plug in
- *   without changes to §6/§7.
+ * Think of it as a heightmap: one float per cell saying how "high" the
+ * field is there. Marching squares doesn't care where these numbers
+ * come from — here they're gently drifting noise, but a real heightmap
+ * or a distance field would slot in with no other changes.
  *
- * CONTEXT
- *   One instance lives on Scene (§8).  Rebuilt every sim tick by
- *   scalar_field_rebuild() (advances the time axis); read by:
- *     • §6 ms_classify         — 4 corner samples per MS cell.
- *     • §7 region-test patterns — Tier 5 ABOVE/BELOW/STRIPE/ZEBRA
- *                                 sample a single corner per cell.
- *   Patterns receive a `const ScalarField *` so they cannot mutate
- *   it during the per-cell sweep.
+ * One of these lives on Scene (§8). It's recomputed every sim tick
+ * (the time value shifts so the field appears to drift), then read by
+ * the marching-squares classifier and the patterns. Patterns get it as
+ * const, so they can only read it.
  *
- * MEMORY
- *   samples[CELLS_MAX] ≈ 44 KB in BSS — no allocation.  At the
- *   default caps of MAP_W_MAX = 200 × MAP_H_MAX = 56 = 11 200
- *   cells × 4 bytes/float.
+ * w, h    : grid size in cells, set at reset, kept within the screen
+ *           limits.
+ * count   : w * h, stored so loops don't keep recomputing it.
+ * seed    : a fresh random number each reset (r), so every run gets a
+ *           different-looking field. We mix it into the noise instead
+ *           of touching rand()'s global state.
+ * samples : the actual numbers, one per cell, each in [0, 1]. Laid out
+ *           row by row, so cell (x, y) is at samples[y * w + x].
  *
- * MEMBER LOGIC
- *   w, h    : Grid dimensions in cells.  Set by scalar_field_reset()
- *             at scene reset; bounded by [16, MAP_W_MAX] × [8, MAP_H_MAX].
- *   count   : w · h, cached so the rebuild loop and the per-cell
- *             reads don't recompute the product.
- *   seed    : Per-run hash seed mixed into the lattice-corner hash.
- *             Re-rolled at every reset (r press) so each run
- *             produces a fresh field topology without coupling to
- *             rand() state (we don't want srand() side-effects here).
- *   samples : Per-cell scalar ∈ [0, 1] — fBm of (x · FIELD_SCALE,
- *             y · FIELD_SCALE + time) at lattice corner (x, y).
- *             Row-major: cell (x, y) = samples[y · w + x].  The MS
- *             classifier samples the 4 corners (x, y), (x+1, y),
- *             (x+1, y+1), (x, y+1) per cell — so each cell reads 4
- *             entries that overlap with its neighbours.
- *
- * REFERENCES
- *   • Perlin, K. (1985) — "An Image Synthesizer", SIGGRAPH'85.
- *     Foundational noise paper.  Value noise (used here) is the
- *     simpler cousin of gradient/Perlin noise: hash lattice corners,
- *     then bilerp with smoothstep'd interpolants.
- *   • Mandelbrot, B. & Van Ness, J. (1968) — "Fractional Brownian
- *     motions, fractional noises and applications", SIAM Review
- *     10(4).  The fBm octave-stacking model used by fbm_3oct().
- *   • Quilez, I. — "Value noise" / "More noise":
- *     https://iquilezles.org/articles/morenoise/
- *     Practical write-up of value-noise + fBm in shader form.
- *   • Wang, T. (1997) — "Integer hash function".  hash32() belongs
- *     to the same family of multiply-xor mixers used in value-noise
- *     lattices to avoid storing a permutation table.
+ * The noise is "value noise" stacked into "fBm" (a few layers of
+ * detail at finer and finer scales). References:
+ *   Perlin, K. (1985), "An Image Synthesizer", SIGGRAPH'85.
+ *   Quilez, I. — "More noise": https://iquilezles.org/articles/morenoise/
  */
 typedef struct {
     int      w, h;
@@ -666,11 +395,9 @@ typedef struct {
     float    samples[CELLS_MAX];
 } ScalarField;
 
-/* Clamped per-cell read — out-of-bounds queries clamp to the nearest
- * edge cell.  Used by patterns (Tier 5 fills, RIPPLE radial term).
- * The cost of the clamp is one comparison per axis on cells that
- * are NEVER out of bounds for the inner pattern loops (which use
- * [0, w) × [0, h)) — the branch predictor eats it. */
+/* Read one cell's value, but snap any out-of-range coordinate back to
+ * the nearest edge cell. Lets patterns near the border ask about cells
+ * that don't exist without special-casing the edges. */
 static inline float scalar_field_at(const ScalarField *src, int x, int y)
 {
     if (x < 0)             x = 0;
@@ -690,9 +417,9 @@ static inline uint32_t hash32(uint32_t x)
     return x;
 }
 
-/* Pseudo-random scalar at integer lattice corner (xi, yi) ∈ [0, 1].
- * The same (xi, yi, seed) triple ALWAYS produces the same value —
- * that's what makes value noise "noise" and not "random". */
+/* A repeatable "random" value in [0, 1] for a whole-number grid corner.
+ * Same corner and seed always give the same number — that repeatability
+ * is what makes noise look like terrain instead of static. */
 static inline float lattice_scalar(const ScalarField *src, int xi, int yi)
 {
     uint32_t h = (uint32_t)xi * 374761393u
@@ -709,8 +436,9 @@ static inline float clamp01(float v)
     return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
-/* Single-octave smooth value noise — bilinear blend of the 4 lattice
- * corners surrounding (x, y), with smoothstep'd interpolants. */
+/* One layer of smooth noise: take the four whole-number corners around
+ * (x, y) and blend between them, easing the blend near the corners so
+ * there are no hard creases. */
 static float value_noise(const ScalarField *src, float x, float y)
 {
     int   xi = (int)floorf(x);
@@ -726,10 +454,10 @@ static float value_noise(const ScalarField *src, float x, float y)
     return lerpf(top, bot, uy);
 }
 
-/* 3-octave fBm — what we actually contour.  Multiple frequencies
- * stacked with halving amplitude give the contour interesting
- * topology (lakes, peninsulas, saddles) at any threshold.
- * Each octave: amp · value_noise(x · freq, y · freq). */
+/* The field we actually draw: three layers of noise added together,
+ * each finer and fainter than the last. Stacking them this way gives
+ * the contours their interesting shapes — lakes, peninsulas, pinch
+ * points — at whatever sea level you pick. */
 static float fbm_3oct(const ScalarField *src, float x, float y)
 {
     float oct0 = value_noise(src, x * FBM_OCT0_FREQ, y * FBM_OCT0_FREQ) * FBM_OCT0_AMP;
@@ -740,8 +468,8 @@ static float fbm_3oct(const ScalarField *src, float x, float y)
 
 /* ---------- ScalarField lifecycle ---------------------------------- */
 
-/* scalar_field_reset — establish dims + fresh hash seed; samples[]
- * stays uninitialised here (scalar_field_rebuild will overwrite). */
+/* Set the grid size and pick a fresh seed. Doesn't fill in the values
+ * — scalar_field_rebuild does that next. */
 static void scalar_field_reset(ScalarField *src, int w, int h)
 {
     src->w     = w;
@@ -750,9 +478,9 @@ static void scalar_field_reset(ScalarField *src, int w, int h)
     src->seed  = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
 }
 
-/* scalar_field_rebuild — overwrite samples[] with f(x, y + t) for the
- * current time t.  Time is added to the y-axis so the field appears
- * to "drift downward" as scene_tick advances. */
+/* Fill in every cell's value for the current moment in time. Time is
+ * folded into the vertical coordinate, so as time advances the whole
+ * field looks like it's scrolling downward. */
 static void scalar_field_rebuild(ScalarField *src, float t)
 {
     for (int y = 0; y < src->h; y++) {
@@ -769,19 +497,13 @@ static void scalar_field_rebuild(ScalarField *src, float t)
 /* ===================================================================== */
 
 /*
- * ms_classify — compute the 4-bit marching-squares case at cell
- * (x, y) for threshold T against the given ScalarField.
- *
- *   bit 0 ← bottom-left  corner (x,   y+1) ≥ T
- *   bit 1 ← bottom-right corner (x+1, y+1) ≥ T
- *   bit 2 ← top-right    corner (x+1, y)   ≥ T
- *   bit 3 ← top-left     corner (x,   y)   ≥ T
- *
- * Returns ∈ {0..15}. Cell (x, y) here means "the 2×2 block whose
- * top-left corner is sample (x, y)".  Pure function: same field +
- * same (x, y, T) → same case.  The dispatch in §7 calls this once
- * per cell per pattern; some patterns scan multiple T values per
- * cell (TOPO, JUNCTIONS, SANDWICH).
+ * The heart of marching squares. For the little square whose top-left
+ * is cell (x, y), check each of its four corners against the sea level:
+ * a corner above the level sets its bit, below leaves it clear. Pack
+ * the four answers into one number 0..15 — that number tells you the
+ * shape of the contour through this square (see ms_case_glyph above).
+ * Same field and same level always give the same answer. Some patterns
+ * call this several times per square with different levels.
  */
 static inline int ms_classify(const ScalarField *src,
                               int x, int y, float threshold)
@@ -799,49 +521,42 @@ static inline int ms_classify(const ScalarField *src,
 /* ===================================================================== */
 
 /*
- * Pattern signature
+ * How a pattern works. Every pattern is a function called once for each
+ * grid square. It's told where the square is (x, y) and the current
+ * controls: user_t (the sea level the user set), field_time (how far
+ * the field has drifted, in seconds), and sweep_phase (a 0..1 counter
+ * for the patterns that move the level on their own).
  *
- *   Each pattern is called PER CELL.  It receives (x, y) and the
- *   current "control" inputs:
- *     user_t      — the user-adjustable threshold (+/- on the keyboard)
- *     field_time  — drift accumulator on the source field (seconds)
- *     sweep_phase — cyclic 0..1 phase tied to drift, for animated T
+ * In return it fills in three answers for that square:
+ *   out_glow  — 1.0 to draw it, 0.0 to leave it blank
+ *   out_band  — which of the four theme colours to use (0..3)
+ *   out_glyph — which character to draw
  *
- *   Each pattern writes THREE per-cell outputs:
- *     out_glow    — 1.0 = "this cell visible", 0.0 = skip
- *     out_band    — colour band ∈ {0..3} → indexes PAIR_BAND_BASE+band
- *     out_glyph   — exact ASCII character to draw; 0 = skip even if
- *                   glow > 0 (defensive)
- *
- *   Patterns that need the marching-squares case glyph for a specific
- *   threshold call ms_classify(src, x, y, T) → c, then ms_case_glyph[c].
- *   Patterns that want a uniform glyph (multi-T overlays, region
- *   fills) write their own char.
- *
- *   The §9 renderer is dumb — it reads the three buffers and paints.
+ * A pattern that wants the "true" contour line asks ms_classify for the
+ * corner-pattern and looks up ms_case_glyph; others just pick their own
+ * character. The renderer in §9 only reads these three answers and
+ * paints — it knows nothing about marching squares.
  */
 
-/* Helpers — predicates over the 16 marching-squares cases. */
-
-/* Cases where the contour is a horizontal/vertical split (no
- * corners alone) — the "ortho" subset. */
+/* Is this corner-pattern one of the four flat splits — a plain
+ * horizontal or vertical cut, no single corner sticking out? */
 static inline bool ms_case_is_ortho(int c)
 {
     return c == 3 || c == 6 || c == 9 || c == 12;
 }
 
-/* Cases where the contour cuts off a single corner — the "diagonal"
- * subset.  Includes both 1-corner-above and 1-corner-below (3-above)
- * configurations, which are diagonal mirrors of each other. */
+/* Is this one of the squares where the contour slices off a single
+ * corner (a diagonal cut)? Covers both one-corner-up and one-corner-
+ * down, which are just mirror images of each other. */
 static inline bool ms_case_is_diagonal(int c)
 {
     return c == 1 || c == 2 || c == 4  || c == 7
         || c == 8 || c == 11|| c == 13 || c == 14;
 }
 
-/* Cell-level emit helpers — set all three outputs in one place so each
- * pattern function reads as a sequence of named "what to draw" decisions
- * instead of three scattered writes. */
+/* Two little helpers so each pattern can say "skip this square" or
+ * "draw this character in this colour" in one line instead of three
+ * scattered assignments. */
 static inline void cell_skip(float *gl, uint8_t *bn, char *gy)
 {
     *gl = 0.0f; *bn = 0; *gy = 0;
@@ -852,9 +567,9 @@ static inline void cell_emit(float *gl, uint8_t *bn, char *gy,
     *gl = 1.0f; *bn = (uint8_t)(band & 3); *gy = glyph;
 }
 
-/* Emit the case-aware glyph at threshold T; skip if the case is empty
- * (0 = all below, 15 = all above).  Shared by every single-threshold
- * pattern that wants a "real" marching-squares glyph. */
+/* Draw the proper contour line for one square at the given sea level,
+ * or skip it if the contour doesn't pass through. Used by every pattern
+ * that wants the real marching-squares line. */
 static inline void cell_emit_case_glyph(const ScalarField *src,
                                         int x, int y, float t, int band,
                                         float *gl, uint8_t *bn, char *gy)
@@ -865,10 +580,10 @@ static inline void cell_emit_case_glyph(const ScalarField *src,
     cell_emit(gl, bn, gy, band, glyph);
 }
 
-/* ---------- Tier 1 — SINGLE: basic single-iso visualisations --------- */
+/* ---------- Tier 1 — SINGLE: one line ------------------------------- */
 
-/* CONTOUR — single iso-line at the user-controlled threshold.
- * Classic marching-squares output: case-specific glyph per cell. */
+/* CONTOUR — the plain single line at the level the user picked. The
+ * basic marching-squares look. */
 static void pattern_contour(const ScalarField *src, int x, int y,
                             float user_t, float field_time, float sweep_phase,
                             float *gl, uint8_t *bn, char *gy)
@@ -877,9 +592,9 @@ static void pattern_contour(const ScalarField *src, int x, int y,
     cell_emit_case_glyph(src, x, y, user_t, 2, gl, bn, gy);
 }
 
-/* THICK — fat contour band. A cell fires if user_t falls inside any
- * of three nearby thresholds (T-half, T, T+half); the glyph is the
- * proper case glyph if the cell IS on the T iso, else '#' fill. */
+/* THICK — the same line, drawn fat. A square lights up if the contour
+ * passes through at the level or just above or below it; squares right
+ * on the line keep their line character, the rest fill with '#'. */
 static void pattern_thick(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -898,9 +613,9 @@ static void pattern_thick(const ScalarField *src, int x, int y,
     cell_emit(gl, bn, gy, 2, glyph);
 }
 
-/* INVERT — case-coloured contour: each MS case maps to its own
- * colour band (c & 3) so adjacent contour cells with different
- * geometries read in different tints. */
+/* INVERT — the same line, but coloured by which corner-pattern each
+ * square has, so squares with different line shapes show in different
+ * tints. */
 static void pattern_invert(const ScalarField *src, int x, int y,
                            float user_t, float field_time, float sweep_phase,
                            float *gl, uint8_t *bn, char *gy)
@@ -912,8 +627,7 @@ static void pattern_invert(const ScalarField *src, int x, int y,
     cell_emit(gl, bn, gy, c & 3, glyph);
 }
 
-/* DOTS — same contour cells as CONTOUR but rendered with '.' glyphs
- * in the dimmer band 1. Reads as a stippled outline. */
+/* DOTS — the same line, drawn as a faint trail of dots. */
 static void pattern_dots(const ScalarField *src, int x, int y,
                          float user_t, float field_time, float sweep_phase,
                          float *gl, uint8_t *bn, char *gy)
@@ -924,9 +638,8 @@ static void pattern_dots(const ScalarField *src, int x, int y,
     cell_emit(gl, bn, gy, 1, '.');
 }
 
-/* UNIFORM — same contour cells but rendered with a single '+' glyph,
- * dropping the case information. Useful for "where is the contour"
- * without the orientation noise that varying case glyphs introduce. */
+/* UNIFORM — the same line, but every square drawn as a plain '+'. Shows
+ * where the contour is without the slashes and bars cluttering it. */
 static void pattern_uniform(const ScalarField *src, int x, int y,
                             float user_t, float field_time, float sweep_phase,
                             float *gl, uint8_t *bn, char *gy)
@@ -937,11 +650,12 @@ static void pattern_uniform(const ScalarField *src, int x, int y,
     cell_emit(gl, bn, gy, 2, '+');
 }
 
-/* ---------- Tier 2 — MULTI: evenly-spaced thresholds ----------------- */
+/* ---------- Tier 2 — MULTI: evenly-spaced lines --------------------- */
 
-/* Shared multi-threshold sampler — emit '+' wherever any of n_levels
- * evenly-spaced thresholds fires, with the LAST firing level winning
- * the colour band (produces nested ring colouring). */
+/* Shared by the topo-map patterns. Tries several evenly-spaced sea
+ * levels; if the contour at any of them runs through this square, draw
+ * a '+'. The highest such level decides the colour, so the rings end up
+ * tinted from outer to inner. */
 static inline void cell_emit_multi_levels(const ScalarField *src,
                                           int x, int y, int n_levels,
                                           float *gl, uint8_t *bn, char *gy)
@@ -955,7 +669,7 @@ static inline void cell_emit_multi_levels(const ScalarField *src,
     }
 }
 
-/* TOPO — 8 evenly-spaced thresholds, classic topographic map. */
+/* TOPO — 8 evenly-spaced lines: a classic contour map. */
 static void pattern_topo(const ScalarField *src, int x, int y,
                          float user_t, float field_time, float sweep_phase,
                          float *gl, uint8_t *bn, char *gy)
@@ -964,8 +678,7 @@ static void pattern_topo(const ScalarField *src, int x, int y,
     cell_emit_multi_levels(src, x, y, TOPO_N_LEVELS, gl, bn, gy);
 }
 
-/* DENSE — 16 levels: closely-spaced contours reveal subtle field
- * structure (small bumps, gentle slopes). */
+/* DENSE — 16 lines packed close together, so even gentle bumps show. */
 static void pattern_dense(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -974,7 +687,7 @@ static void pattern_dense(const ScalarField *src, int x, int y,
     cell_emit_multi_levels(src, x, y, DENSE_N_LEVELS, gl, bn, gy);
 }
 
-/* SPARSE — 4 levels: just the major elevation bands. */
+/* SPARSE — just 4 lines: only the big shapes. */
 static void pattern_sparse(const ScalarField *src, int x, int y,
                            float user_t, float field_time, float sweep_phase,
                            float *gl, uint8_t *bn, char *gy)
@@ -983,9 +696,8 @@ static void pattern_sparse(const ScalarField *src, int x, int y,
     cell_emit_multi_levels(src, x, y, SPARSE_N_LEVELS, gl, bn, gy);
 }
 
-/* STEPS — 6 levels, identical to TOPO/DENSE but with the case glyph
- * preserved on the highest firing level for a "stepped contour"
- * look (rings + visible orientation). */
+/* STEPS — like TOPO but keeps the real line characters (the highest
+ * level wins each square), so you see both the rings and their slope. */
 static void pattern_steps(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1000,8 +712,8 @@ static void pattern_steps(const ScalarField *src, int x, int y,
     }
 }
 
-/* RAINBOW — 12 levels with the band hashed by (level + case) so
- * adjacent cells along the same contour can sit in different bands. */
+/* RAINBOW — 12 lines, colour mixed up from both the level and the
+ * square's shape so the colour shifts along each line. */
 static void pattern_rainbow(const ScalarField *src, int x, int y,
                             float user_t, float field_time, float sweep_phase,
                             float *gl, uint8_t *bn, char *gy)
@@ -1016,9 +728,10 @@ static void pattern_rainbow(const ScalarField *src, int x, int y,
     }
 }
 
-/* ---------- Tier 3 — PAIRS: specific T combinations ------------------ */
+/* ---------- Tier 3 — PAIRS: a few set lines ------------------------- */
 
-/* DUAL — two fixed thresholds in distinct colours. */
+/* DUAL — two fixed lines, a low one and a high one, in different
+ * colours. */
 static void pattern_dual(const ScalarField *src, int x, int y,
                          float user_t, float field_time, float sweep_phase,
                          float *gl, uint8_t *bn, char *gy)
@@ -1031,9 +744,9 @@ static void pattern_dual(const ScalarField *src, int x, int y,
     if (c_hi > 0 && c_hi < 15) cell_emit(gl, bn, gy, 3, ms_case_glyph[c_hi]);
 }
 
-/* SHELL — fill cells whose field value sits in the narrow band
- * [SHELL_T_LOW, SHELL_T_HIGH].  Reads as a thick contour "wall"
- * rather than a one-cell line. */
+/* SHELL — fill every square whose value sits in a narrow band of
+ * heights, making the contour look like a solid wall instead of a
+ * thin line. */
 static void pattern_shell(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1046,8 +759,7 @@ static void pattern_shell(const ScalarField *src, int x, int y,
         cell_skip(gl, bn, gy);
 }
 
-/* INNER — only the HIGH-T contour (peaks of the field, small closed
- * loops around the local maxima). */
+/* INNER — only the high line: tight loops around the field's peaks. */
 static void pattern_inner(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1056,8 +768,8 @@ static void pattern_inner(const ScalarField *src, int x, int y,
     cell_emit_case_glyph(src, x, y, INNER_T, 3, gl, bn, gy);
 }
 
-/* OUTER — only the LOW-T contour (basins / "coastline" at the
- * field's low watermark; long meandering shapes). */
+/* OUTER — only the low line: the long, wandering coastline near the
+ * field's low points. */
 static void pattern_outer(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1066,9 +778,8 @@ static void pattern_outer(const ScalarField *src, int x, int y,
     cell_emit_case_glyph(src, x, y, OUTER_T, 1, gl, bn, gy);
 }
 
-/* SANDWICH — three iso-lines (low / mid / high), each in its own
- * band. Shows the field's nested elevation structure with only
- * three rings instead of TOPO's eight. */
+/* SANDWICH — three lines (low, middle, high), each its own colour. The
+ * nested-rings look of TOPO but with only three levels. */
 static void pattern_sandwich(const ScalarField *src, int x, int y,
                              float user_t, float field_time, float sweep_phase,
                              float *gl, uint8_t *bn, char *gy)
@@ -1083,10 +794,10 @@ static void pattern_sandwich(const ScalarField *src, int x, int y,
     if (c_hi  > 0 && c_hi  < 15) cell_emit(gl, bn, gy, 3, ms_case_glyph[c_hi ]);
 }
 
-/* ---------- Tier 4 — TOPOLOGY: case-aware masks ---------------------- */
+/* ---------- Tier 4 — TOPOLOGY: show only certain squares ------------ */
 
-/* SADDLE — full contour, with the two ambiguous saddle cases (5/10)
- * highlighted in band 3 + 'X' glyph, normal cells in band 1. */
+/* SADDLE — the full line, but the two awkward "could-go-two-ways"
+ * squares are flagged bright with an 'X'; everything else stays dim. */
 static void pattern_saddle(const ScalarField *src, int x, int y,
                            float user_t, float field_time, float sweep_phase,
                            float *gl, uint8_t *bn, char *gy)
@@ -1098,8 +809,8 @@ static void pattern_saddle(const ScalarField *src, int x, int y,
     else                            cell_emit(gl, bn, gy, 1, ms_case_glyph[c]);
 }
 
-/* ORTHO — draw only the horizontal/vertical split cases (3, 6, 9, 12).
- * Reveals the axis-aligned "spine" of the contour. */
+/* ORTHO — draw only the squares with a flat horizontal or vertical cut,
+ * showing the straight parts of the contour. */
 static void pattern_ortho(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1110,7 +821,8 @@ static void pattern_ortho(const ScalarField *src, int x, int y,
     cell_emit(gl, bn, gy, 2, ms_case_glyph[c]);
 }
 
-/* DIAGONALS — only the corner-cut cases.  The complement of ORTHO. */
+/* DIAGONALS — the opposite of ORTHO: only the slanted, corner-cutting
+ * squares. */
 static void pattern_diagonals(const ScalarField *src, int x, int y,
                               float user_t, float field_time, float sweep_phase,
                               float *gl, uint8_t *bn, char *gy)
@@ -1121,23 +833,21 @@ static void pattern_diagonals(const ScalarField *src, int x, int y,
     cell_emit(gl, bn, gy, 2, ms_case_glyph[c]);
 }
 
-/* JUNCTIONS — scan a stack of thresholds and mark every cell that hits
- * a saddle case (5 or 10) on ANY of them with a bright 'X'.  Cells
- * that aren't saddles but lie on the user_t contour are drawn dimly
- * underneath as context.
+/* JUNCTIONS — find the awkward "two-ways" squares anywhere in the
+ * field's height range and mark them with a bright 'X'; the user's
+ * current line is drawn faintly underneath for context.
  *
- * The single-threshold version would be near-empty: saddles are
- * topologically rare on a smooth field at any one T.  Scanning across
- * TOPO_N_LEVELS thresholds collects them all so the X's read as a
- * map of "places where the topology is ambiguous somewhere in the
- * field's elevation range" — which is the pedagogical point. */
+ * Why check many levels instead of one: at any single level these
+ * awkward squares are rare, so checking a stack of levels gathers them
+ * all and gives a fuller picture of where the field is genuinely
+ * ambiguous. */
 static void pattern_junctions(const ScalarField *src, int x, int y,
                               float user_t, float field_time, float sweep_phase,
                               float *gl, uint8_t *bn, char *gy)
 {
     (void)field_time; (void)sweep_phase;
 
-    /* Pass 1 — collect saddles across a stack of evenly-spaced T. */
+    /* First: does this square go two ways at any of the levels? */
     bool is_saddle_somewhere = false;
     for (int level = 0; level < TOPO_N_LEVELS; level++) {
         float t = (float)(level + 1) / (float)(TOPO_N_LEVELS + 1);
@@ -1148,16 +858,14 @@ static void pattern_junctions(const ScalarField *src, int x, int y,
     }
     if (is_saddle_somewhere) { cell_emit(gl, bn, gy, 3, 'X'); return; }
 
-    /* Pass 2 — dim context: the user_t contour, drawn faintly so the
-     * X's stand out against it. */
+    /* Otherwise draw the user's line faintly, so the X's stand out. */
     int c = ms_classify(src, x, y, user_t);
     if (c > 0 && c < 15) cell_emit(gl, bn, gy, 1, ms_case_glyph[c]);
     else                 cell_skip(gl, bn, gy);
 }
 
-/* ROUGHNESS — full contour, band = case index mod 4.  Adjacent
- * cells with different MS geometries fall in different colour bands,
- * making the contour look "rough" where the geometry varies fast. */
+/* ROUGHNESS — the full line, colour chosen by each square's shape, so
+ * the line looks jagged and "rough" where its shape changes quickly. */
 static void pattern_roughness(const ScalarField *src, int x, int y,
                               float user_t, float field_time, float sweep_phase,
                               float *gl, uint8_t *bn, char *gy)
@@ -1168,10 +876,9 @@ static void pattern_roughness(const ScalarField *src, int x, int y,
     cell_emit(gl, bn, gy, c & 3, ms_case_glyph[c]);
 }
 
-/* ---------- Tier 5 — REGIONS: filled visualisations ------------------ */
+/* ---------- Tier 5 — REGIONS: fill areas, not lines ---------------- */
 
-/* ABOVE — fill cells whose corner value is above user_t (the
- * "land" side of the iso-line, painted solid). */
+/* ABOVE — fill the "land": every square above the sea level. */
 static void pattern_above(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1181,7 +888,7 @@ static void pattern_above(const ScalarField *src, int x, int y,
     else                          cell_skip(gl, bn, gy);
 }
 
-/* BELOW — inverse of ABOVE: fill the "sea" side. */
+/* BELOW — the opposite of ABOVE: fill the "sea". */
 static void pattern_below(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1191,8 +898,8 @@ static void pattern_below(const ScalarField *src, int x, int y,
     else                          cell_skip(gl, bn, gy);
 }
 
-/* STRIPE — fill cells in the band [user_t - half, user_t + half].
- * Equivalent to SHELL but tied to the USER threshold. */
+/* STRIPE — fill a band of heights around the user's level. Like SHELL,
+ * but it follows the level the user sets. */
 static void pattern_stripe(const ScalarField *src, int x, int y,
                            float user_t, float field_time, float sweep_phase,
                            float *gl, uint8_t *bn, char *gy)
@@ -1205,9 +912,8 @@ static void pattern_stripe(const ScalarField *src, int x, int y,
         cell_skip(gl, bn, gy);
 }
 
-/* ZEBRA — fill alternate equi-spaced bands ⌊v · ZEBRA_N_BANDS⌋.
- * Half the field is solid, half is empty — striking horizontal
- * stripes when the field is monotone. */
+/* ZEBRA — slice the height range into equal bands and fill every other
+ * one, giving solid-and-empty stripes across the field. */
 static void pattern_zebra(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1219,9 +925,8 @@ static void pattern_zebra(const ScalarField *src, int x, int y,
     else                 cell_skip(gl, bn, gy);
 }
 
-/* PERIMETER — fill every cell that lies on any non-empty MS case
- * (i.e. ANY edge crossing).  The result is the contour drawn solidly
- * with '#' rather than the case-specific orientation glyphs. */
+/* PERIMETER — fill every square the contour touches with a solid '#',
+ * so the contour reads as a thick outline instead of thin glyphs. */
 static void pattern_perimeter(const ScalarField *src, int x, int y,
                               float user_t, float field_time, float sweep_phase,
                               float *gl, uint8_t *bn, char *gy)
@@ -1232,11 +937,10 @@ static void pattern_perimeter(const ScalarField *src, int x, int y,
     cell_emit(gl, bn, gy, 2, '#');
 }
 
-/* ---------- Tier 6 — ANIMATED: time-varying thresholds --------------- */
+/* ---------- Tier 6 — ANIMATED: the sea level moves itself ----------- */
 
-/* SWEEP — single contour with T sine-animating between CONTOUR_T_MIN
- * and CONTOUR_T_MAX.  Reads as the iso-line "panning" through the
- * elevation range. */
+/* SWEEP — one line whose level slides smoothly up and down on its own,
+ * so the contour appears to sweep through all the field's heights. */
 static void pattern_sweep(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1250,8 +954,8 @@ static void pattern_sweep(const ScalarField *src, int x, int y,
     cell_emit_case_glyph(src, x, y, t, 2, gl, bn, gy);
 }
 
-/* PULSE — squared-sine T animation (sharper rise/fall than SWEEP).
- * Drives the contour outward in a "breath" rhythm. */
+/* PULSE — like SWEEP but the level moves with sharper rises and falls,
+ * giving the contour a breathing rhythm. */
 static void pattern_pulse(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1260,13 +964,12 @@ static void pattern_pulse(const ScalarField *src, int x, int y,
     float lo  = CONTOUR_T_MIN;
     float hi  = CONTOUR_T_MAX;
     float s   = sinf(field_time * (2.0f * (float)M_PI / PULSE_PERIOD_SEC));
-    float t   = lo + (hi - lo) * (s * s);     /* squared → 0..1 with sharper edges */
+    float t   = lo + (hi - lo) * (s * s);     /* squaring sharpens the in/out */
     cell_emit_case_glyph(src, x, y, t, 2, gl, bn, gy);
 }
 
-/* RIPPLE — per-cell T = user_t + amp · sin(distance/freq − speed·time).
- * Concentric waves emanating from the grid centre; iso-lines wobble
- * in radial sympathy. */
+/* RIPPLE — the level nudges up and down in rings spreading out from the
+ * centre, so the contour ripples like a stone dropped in a pond. */
 static void pattern_ripple(const ScalarField *src, int x, int y,
                            float user_t, float field_time, float sweep_phase,
                            float *gl, uint8_t *bn, char *gy)
@@ -1282,8 +985,8 @@ static void pattern_ripple(const ScalarField *src, int x, int y,
     cell_emit_case_glyph(src, x, y, t, 2, gl, bn, gy);
 }
 
-/* STAIRS — T cycles through STAIRS_N_LEVELS discrete values.  The
- * contour "snaps" between elevations rather than gliding. */
+/* STAIRS — the level jumps between a few fixed steps instead of sliding,
+ * so the contour snaps from one height to the next. */
 static void pattern_stairs(const ScalarField *src, int x, int y,
                            float user_t, float field_time, float sweep_phase,
                            float *gl, uint8_t *bn, char *gy)
@@ -1296,8 +999,8 @@ static void pattern_stairs(const ScalarField *src, int x, int y,
     cell_emit_case_glyph(src, x, y, t, (step & 3), gl, bn, gy);
 }
 
-/* CHAOS — per-cell T = user_t + hash(x, y, time) · amp.  The contour
- * shimmers with noise on top of its base shape. */
+/* CHAOS — each square jitters its level by a little random amount that
+ * changes over time, so the contour shimmers around its real shape. */
 static void pattern_chaos(const ScalarField *src, int x, int y,
                           float user_t, float field_time, float sweep_phase,
                           float *gl, uint8_t *bn, char *gy)
@@ -1318,47 +1021,26 @@ typedef void (*ContourPatternFn)(const ScalarField *src, int x, int y,
                                  float *out_glow, uint8_t *out_band, char *out_glyph);
 
 /*
- * ContourPattern — one row of the §7 pattern dispatch table.
+ * ContourPattern — one row of the table that lists all 30 patterns:
+ * its HUD name, its tier label, and the function that draws it.
  *
- * INTENT
- *   Replace a per-cell switch(Pattern) with a single function-pointer
- *   indirect call.  The hot loop in scene_evaluate_contours becomes
- *   `sample(src, x, y, ut, ft, sp, …)` — no branch on pattern type,
- *   one cache-friendly table.  Adding a new pattern is a three-line
- *   edit: write the fn, append a row here, add its enum.  The
- *   fixed-size [N_PATTERNS] initialiser keyed by enum makes the
- *   compiler complain if the table is incomplete or mis-ordered.
+ * Keeping the patterns in a table means the per-square loop just calls
+ * "the current pattern's function" through this row — no big switch to
+ * pick the right one. Adding a pattern is: write its function, add an
+ * enum, add a row here. The fixed-size table keyed by the enum makes
+ * the compiler complain if anything is missing or out of order.
  *
- * CONTEXT
- *   noise_patterns[N_PATTERNS] in §7 is the singular static table.
- *   Read by scene_evaluate_contours() (resolves .sample), and by
- *   pattern_name() / pattern_tier() for the HUD readout.  Never
- *   mutated at runtime — defined `const` so it lives in .rodata.
- *
- * MEMBER LOGIC
- *   name   : HUD label, RIGHT-padded to exactly 10 chars so the
- *            HUD format string produces aligned columns when the
- *            user cycles through patterns via n/p.
- *   tier   : "N-XXXX " 7-char label encoding tier index (1..6) plus
- *            a 4-char mnemonic (SING/MULT/PAIR/TOPO/REGN/ANIM).
- *            Displayed next to the pattern name in the HUD.
- *   sample : Per-cell function pointer matching ContourPatternFn.
- *            Called once per cell per sim tick (~11K cells × 60 Hz
- *            = ~660K calls/sec).  Writes the three output slots
- *            (glow, band, glyph) in the ContourGrid; never reads
- *            them back.
- *
- * REFERENCES
- *   • Designated initialisers (C99 §6.7.9) — `[INDEX] = { … }` lets
- *     the table be defined out of declaration order while staying
- *     enum-keyed.
- *   • Function-pointer dispatch — see Bryant & O'Hallaron,
- *     "Computer Systems: A Programmer's Perspective" §3.10 for the
- *     compiled-code shape of an indirect call vs a switch.
+ * name   : the HUD label, padded out to 10 characters so the columns
+ *          line up as you flip through patterns.
+ * tier   : a short "N-XXXX" tag (tier number plus a 4-letter group
+ *          name) shown next to the name.
+ * sample : the pattern's drawing function. Called once per square every
+ *          sim tick; it writes the square's three answers (draw?,
+ *          colour, character).
  */
 typedef struct {
-    const char       *name;     /* 10-char padded for HUD alignment    */
-    const char       *tier;     /* 7-char "N-LABEL " padded            */
+    const char       *name;     /* padded to 10 chars for HUD alignment */
+    const char       *tier;     /* "N-LABEL" tag, 7 chars               */
     ContourPatternFn  sample;
 } ContourPattern;
 
@@ -1418,59 +1100,28 @@ static const char *pattern_tier(Pattern p)
 /* ===================================================================== */
 
 /*
- * ContourGrid — per-cell render-output buffer (the §7 → §9 hand-off).
+ * ContourGrid — the scratch sheet between deciding and drawing. For
+ * each square it holds three things: should we draw it, what colour,
+ * and which character.
  *
- * INTENT
- *   Decouple "compute what to draw" (scene_evaluate_contours, runs
- *   every sim tick) from "actually draw it" (scene_draw, runs every
- *   render frame).  Patterns write (glow, band, glyph) triples here;
- *   the renderer just looks up and paints.  Conceptually this is a
- *   tile/cell framebuffer in a software renderer — same idea as the
- *   cbuf[] in this project's raster/ files, but per-character-cell
- *   instead of per-pixel.
+ * This splits the work in two. Once per sim tick, the active pattern
+ * fills this sheet in (it figures out the right character, whether
+ * that's a real contour line or its own '+' or '#'). Once per frame,
+ * the renderer just reads the sheet and paints — it never needs to
+ * know what marching squares is.
  *
- *   Glyph is BAKED IN by the pattern.  Case-aware patterns write
- *   ms_case_glyph[c]; region/multi-T patterns write their own '+',
- *   '#', 'X', '.', etc.  The renderer is intentionally dumb — it
- *   does not know what marching squares is.
+ * One of these lives on Scene (§8). Index a square the same row-by-row
+ * way as the field: cell (x, y) is at y * w + x.
  *
- * CONTEXT
- *   One instance lives on Scene (§8).  Written by
- *   scene_evaluate_contours() once per sim tick (one pattern fn call
- *   per cell).  Read by scene_draw() once per render frame.  Index
- *   with contour_grid_idx(cg, x, y) = y · w + x — row-major.
- *
- * MEMORY
- *   glow[] + band[] + glyph[] = 4 + 1 + 1 = 6 bytes/cell × CELLS_MAX
- *   ≈ 66 KB in BSS.  No allocation.  Cache-cold only at the start of
- *   each evaluate pass; the (read, classify, write) cycle stays
- *   inside the inner loop.
- *
- * MEMBER LOGIC
- *   w, h    : Grid dimensions in cells.  Always match the source
- *             ScalarField's dims — set together at scene_reset().
- *   count   : w · h, cached for the zero-init loop and any other
- *             count-based traversal.
- *   glow[]  : Per-cell visibility flag: > 0.0 = paint, ≤ 0.0 = skip.
- *             Stored as float (not bool) so patterns COULD scale it
- *             for intensity if a future feature needs it; the
- *             renderer currently just thresholds against 0.
- *   band[]  : Palette band ∈ {0..3} → PAIR_BAND_BASE + band.
- *             Bottom 2 bits are used (`band & 3` clamps); patterns
- *             are expected to write a clean value, the mask is
- *             defensive.
- *   glyph[] : ASCII character the renderer will emit.  0 = also skip
- *             (defensive double-gate, in case a pattern set glow > 0
- *             but forgot to pick a glyph — which would be a bug).
- *
- * REFERENCES
- *   • Deferred-shading pattern — separate "decide what to draw" from
- *     "draw it" via an intermediate buffer.  Akenine-Möller et al.,
- *     "Real-Time Rendering" (4th ed.) §20.1.
- *   • Struct-of-Arrays (three parallel arrays) instead of
- *     Array-of-Structs (one packed record per cell) — chosen because
- *     the renderer iterates the three fields in lock-step and the
- *     SoA layout avoids padding waste on the 1-byte fields.
+ * w, h    : grid size, always the same as the field's.
+ * count   : w * h, kept handy for the clear-everything loop.
+ * glow[]  : draw flag per square — above 0 means draw, 0 or below means
+ *           skip. It's a float, not a bool, leaving room for a future
+ *           "how strong" use; today the renderer just checks > 0.
+ * band[]  : which theme colour (0..3) to draw the square in.
+ * glyph[] : the character to draw. 0 also means skip — a second safety
+ *           check in case a pattern marked a square to draw but forgot
+ *           to set a character.
  */
 typedef struct {
     int      w, h;
@@ -1498,49 +1149,27 @@ static void contour_grid_reset(ContourGrid *cg, int w, int h)
 }
 
 /*
- * PatternState — active pattern + every scalar the patterns consume.
+ * PatternState — everything about "what's happening right now": which
+ * pattern is showing and the handful of numbers the patterns read.
+ * These five move and are read together, and all get handed to the
+ * per-square function, so they're grouped here.
  *
- * INTENT
- *   Group the five values that together describe "what's animating
- *   right now": which pattern is active, where we are in the field-
- *   drift cycle, where we are in the sweep-phase cycle, at what user
- *   threshold, and at what drift speed.  They change together, they
- *   are read together, and they ALL get forwarded to the per-cell
- *   pattern function — packing them in one struct keeps the call
- *   sites short and the dataflow centralised.
+ * Lives on Scene (§8). The keys change them (n/p the pattern, </> the
+ * level, +/- the speed); scene_tick advances the two clocks each tick;
+ * the patterns and the HUD read them.
  *
- * CONTEXT
- *   Lives on Scene (§8).  Read by:
- *     • scene_evaluate_contours() — passes user_t / field_time /
- *       sweep_phase down to the active pattern fn.
- *     • scene_tick()              — advances field_time and
- *       sweep_phase by drift_mult · dt each tick.
- *     • screen_draw()             — HUD readouts (pattern name, T).
- *   Mutated by app_handle_key():
- *     • n/p   → current        (modular wraparound through N_PATTERNS)
- *     • </>   → user_t         (clamped to [CONTOUR_T_MIN, _MAX])
- *     • +/-   → drift_mult     (clamped to [DRIFT_MULT_MIN, _MAX])
- *
- * MEMBER LOGIC
- *   current     : Active pattern enum, indexes noise_patterns[].
- *                 Defaults to PATTERN_CONTOUR.
- *   user_t      : User-adjustable iso threshold ∈ [CONTOUR_T_MIN,
- *                 CONTOUR_T_MAX].  Stepped by CONTOUR_T_STEP via
- *                 </> (or . , as easier-to-type aliases).  Read by
- *                 Tier 1/3/4/5 patterns directly; Tier 6 animated
- *                 patterns modulate it with time.
- *   field_time  : Drift accumulator (seconds).  Added to the y-axis
- *                 sample coordinate so the source field appears to
- *                 "scroll downward" as ticks advance.  Monotonically
- *                 increasing within a run; reset only by r.
- *   sweep_phase : Cyclic 0..1 phase that completes one cycle every
- *                 SWEEP_T_PERIOD_SEC of wall-clock at drift_mult=1.
- *                 Drives the Tier-6 SWEEP pattern's sinusoidal T.
- *                 Wraps mod 1.0 each cycle.
- *   drift_mult  : Power-of-2 speed multiplier ∈ [DRIFT_MULT_MIN,
- *                 DRIFT_MULT_MAX] that scales both field_time and
- *                 sweep_phase increments.  Stepped via +/-.  Same
- *                 convention as the sibling showcases in this dir.
+ * current     : which pattern is active. Starts at CONTOUR.
+ * user_t      : the sea level the user picks with </>, kept in range.
+ *               Most patterns use it as-is; the animated ones build on
+ *               it with time.
+ * field_time  : how long the field has been drifting, in seconds. Folded
+ *               into the field so it appears to scroll. Only grows; r
+ *               resets it.
+ * sweep_phase : a 0..1 counter that loops once every SWEEP_T_PERIOD_SEC
+ *               (at normal speed). Drives the SWEEP pattern's moving
+ *               level.
+ * drift_mult  : speed-up factor (a power of two) applied to both clocks.
+ *               Doubled/halved by +/-.
  */
 typedef struct {
     Pattern current;
@@ -1559,9 +1188,9 @@ static void pattern_state_init(PatternState *ps)
     ps->drift_mult  = DRIFT_MULT_DEF;
 }
 
-/* pattern_state_advance_clocks — one frame of clock integration.
- * field_time accumulates linearly (drives field "scroll"); sweep_phase
- * wraps mod 1.0 each cycle (drives Tier-6 SWEEP sinusoidal T). */
+/* Move both clocks forward one frame. The drift clock just keeps
+ * growing (scrolls the field); the sweep counter wraps back around
+ * after it passes 1. */
 static void pattern_state_advance_clocks(PatternState *ps, float dt)
 {
     float drift = (float)ps->drift_mult;
@@ -1570,8 +1199,7 @@ static void pattern_state_advance_clocks(PatternState *ps, float dt)
     if (ps->sweep_phase > 1.0f) ps->sweep_phase -= 1.0f;
 }
 
-/* pattern_state_cycle_to_next/prev — modular pattern cycle through
- * the N_PATTERNS dispatch table.  Bound to n/N and p/P. */
+/* Step to the next/previous pattern, wrapping around the ends. */
 static void pattern_state_cycle_to_next(PatternState *ps)
 {
     ps->current = (Pattern)(((int)ps->current + 1) % N_PATTERNS);
@@ -1581,8 +1209,7 @@ static void pattern_state_cycle_to_prev(PatternState *ps)
     ps->current = (Pattern)(((int)ps->current + N_PATTERNS - 1) % N_PATTERNS);
 }
 
-/* pattern_state_drift_faster/slower — power-of-2 step on drift_mult,
- * clamped to [DRIFT_MULT_MIN, DRIFT_MULT_MAX].  Bound to +/-. */
+/* Double or halve the drift speed, staying within the allowed range. */
 static void pattern_state_drift_faster(PatternState *ps)
 {
     if (ps->drift_mult < DRIFT_MULT_MAX) ps->drift_mult *= 2;
@@ -1594,8 +1221,7 @@ static void pattern_state_drift_slower(PatternState *ps)
     if (ps->drift_mult < DRIFT_MULT_MIN) ps->drift_mult = DRIFT_MULT_MIN;
 }
 
-/* pattern_state_raise/lower_threshold — step user_t by CONTOUR_T_STEP,
- * clamped to [CONTOUR_T_MIN, CONTOUR_T_MAX].  Bound to </>. */
+/* Nudge the sea level up or down one step, staying within range. */
 static void pattern_state_raise_threshold(PatternState *ps)
 {
     ps->user_t += CONTOUR_T_STEP;
@@ -1608,27 +1234,15 @@ static void pattern_state_lower_threshold(PatternState *ps)
 }
 
 /*
- * PaletteState — index of the currently-active Theme.
+ * PaletteState — just which theme is showing right now.
  *
- * INTENT
- *   A one-int wrapper is overkill data-wise but valuable
- *   structurally: it gives "which colour scheme is showing" a stable
- *   home on Scene, matches the sub-struct convention used by sibling
- *   showcases, and makes the t/T key handler read as
- *   `s->palette.current = …` instead of `s->theme_idx = …`.
+ * A whole struct for one number is overkill data-wise, but it gives the
+ * "current colour scheme" a tidy home on Scene and matches how the
+ * sibling demos are laid out. Lives on Scene (§8); t/T change it.
  *
- * CONTEXT
- *   Lives on Scene (§8).  Mutated by app_handle_key() on t/T (with
- *   modular wraparound through N_THEMES) and by palette_state_init()
- *   at reset.  Whenever it changes, theme_apply() (§3) MUST be
- *   called to push the new Theme's colour indices into the ncurses
- *   colour pairs — this struct holds the index, ncurses holds the
- *   actual pair bindings.  Read by screen_draw() for the HUD label.
- *
- * MEMBER LOGIC
- *   current : Index into themes[] ∈ [0, N_THEMES).  Anything outside
- *             that range is invalid; theme_apply() clamps to 0
- *             defensively.
+ * current : index into themes[]. After changing it you MUST call
+ *           theme_apply() — this number only says which theme; ncurses
+ *           holds the actual colours.
  */
 typedef struct {
     int current;
@@ -1636,10 +1250,8 @@ typedef struct {
 
 static void palette_state_init(PaletteState *p) { p->current = 0; }
 
-/* palette_state_cycle_to_next/prev — modular theme cycle.  Caller MUST
- * call theme_apply() afterwards to push the new colour indices into
- * the ncurses pairs (PaletteState holds the index, ncurses holds the
- * binding).  Bound to t/T. */
+/* Step to the next/previous theme, wrapping around. The caller must
+ * then call theme_apply() to actually load the new colours. */
 static void palette_state_cycle_to_next(PaletteState *p)
 {
     p->current = (p->current + 1) % N_THEMES;
@@ -1650,80 +1262,45 @@ static void palette_state_cycle_to_prev(PaletteState *p)
 }
 
 /*
- * Scene — composite owner of ALL mutable simulation state.
+ * Scene — holds all the moving parts of the demo in one place, shared
+ * by the main loop, the per-tick update, and the renderer.
  *
- * INTENT
- *   Single root that the main loop (§10), the simulation step
- *   (scene_tick), and the renderer (scene_draw) all share.  Composes
- *   the four sub-domains as named members so their roles are
- *   explicit at the type level instead of hidden in a flat field
- *   list.  Each sub-struct owns one concern; Scene owns the
- *   composition + the global paused gate.
+ * The data flows through it in order:
  *
- * THE PIPELINE (top to bottom = dataflow order)
+ *   source  — the field of numbers we contour      (the data)
+ *      ↓ (read by ms_classify and the patterns)
+ *   pattern — which pattern, the sea level, clocks  (the controls)
+ *      ↓ (decides what to draw)
+ *   grid    — the draw/colour/character sheet       (the output)
+ *      ↓ (painted by the renderer)
+ *   palette — which theme's colours                 (the colours)
+ *   paused  — whether the demo is frozen            (the on/off)
  *
- *   source   — the scalar field we contour              (the DATA)
- *               ↓ (sampled by §6 ms_classify + §7 patterns)
- *   pattern  — active pattern + user_t + drift state    (the CONTROL)
- *               ↓ (drives scene_evaluate_contours)
- *   grid     — per-cell (glow, band, glyph) buffer      (the OUTPUT)
- *               ↓ (read by scene_draw in §9)
- *   palette  — active theme index                       (the COLOUR)
- *               + paused flag                           (the GATE)
+ * One instance, owned by App (§10), only ever touched from the main
+ * thread. scene_init sets it up, scene_reset re-seeds it (on r or a
+ * resize), scene_tick advances it one step.
  *
- *   At a glance:
- *     ScalarField → (pattern + ms_classify) → ContourGrid → renderer
- *
- * CONTEXT
- *   One instance, owned by App in §10.  Touched only from the main
- *   thread — the §10 signal handlers do NOT reach into Scene; they
- *   flip volatile flags on App and let the main loop respond at the
- *   next frame boundary.
- *
- * LIFETIME
- *   scene_init   : zero-init, sub-struct defaults, call scene_reset.
- *   scene_reset  : re-seed ScalarField, zero clocks, rebuild field,
- *                  evaluate contours.  Called on r and on
- *                  SIGWINCH-driven resize.
- *   scene_tick   : advance clocks, rebuild field, re-evaluate.
- *   No teardown — Scene lives in BSS via App; OS reclaims at exit.
- *
- * MEMBER LOGIC
- *   source  : ScalarField  — the scalar source we contour over.
- *   grid    : ContourGrid  — per-cell render-output buffer.
- *   pattern : PatternState — active pattern + clocks + user_t.
- *   palette : PaletteState — active theme index.
- *   paused  : When true, scene_tick early-returns, freezing both
- *             the field-drift clock and the contour re-evaluation.
- *             Renderer keeps drawing the last computed grid → the
- *             user sees a still frame.  Toggled by space.
+ * paused : while true, scene_tick does nothing — the clocks and the
+ *          field freeze and the renderer keeps showing the last frame.
+ *          Toggled by space.
  */
 typedef struct {
-    ScalarField  source;   /* §5 — scalar field we contour                */
-    ContourGrid  grid;     /* per-cell (glow, band, glyph) output         */
-    PatternState pattern;  /* active pattern + user_t + drift state       */
-    PaletteState palette;  /* active theme index                          */
-    bool         paused;   /* if true, scene_tick early-returns           */
+    ScalarField  source;   /* the field of numbers we contour            */
+    ContourGrid  grid;     /* the draw/colour/character sheet            */
+    PatternState pattern;  /* active pattern, sea level, clocks          */
+    PaletteState palette;  /* active theme                               */
+    bool         paused;   /* if true, the demo is frozen                */
 } Scene;
 
-/*
- * scene_recompute_field — rebuild the ScalarField at the current
- * field_time.  Pure side-effect on source.samples[]; the §6/§7
- * functions read from those samples on the next evaluate pass.
- */
+/* Refill the field for the current moment in time. */
 static void scene_recompute_field(Scene *s)
 {
     scalar_field_rebuild(&s->source, s->pattern.field_time);
 }
 
-/* contour_grid_evaluate_all_cells — sweep the grid, calling `sample`
- * once per cell with the current control state (ut, ft, sp).  Pure
- * dispatch: the pattern fn knows what to compute; this just walks
- * the SoA buffers and feeds each cell's three output slots in.
- *
- * Hot loop — one pattern call per cell × ~11K cells × 60 Hz.  Inner
- * body stays a single indirect call thanks to the §7 cell_emit /
- * cell_skip inline helpers each pattern uses. */
+/* Walk every square and let the chosen pattern fill in its three
+ * answers, passing along the current controls (sea level, the two
+ * clocks). */
 static void contour_grid_evaluate_all_cells(ContourGrid *grid,
                                             const ScalarField *src,
                                             ContourPatternFn sample,
@@ -1740,22 +1317,16 @@ static void contour_grid_evaluate_all_cells(ContourGrid *grid,
     }
 }
 
-/*
- * scene_evaluate_contours — dispatch the active pattern at every
- * cell.  Assumes the ScalarField is already current (caller arranges
- * that via scene_recompute_field).
- *
- *   STEP 1 — RESOLVE the active pattern's sampler from the dispatch table
- *   STEP 2 — SAMPLE every cell into the ContourGrid
- */
+/* Run the active pattern over the whole grid. Expects the field to be
+ * up to date already (the caller refills it first). */
 static void scene_evaluate_contours(Scene *s)
 {
-    /* STEP 1 — RESOLVE the active pattern */
+    /* look up the current pattern's drawing function... */
     Pattern active = s->pattern.current;
     if ((unsigned)active >= (unsigned)N_PATTERNS) return;
     ContourPatternFn sample = noise_patterns[active].sample;
 
-    /* STEP 2 — SAMPLE every cell into the ContourGrid */
+    /* ...then let it fill in every square. */
     contour_grid_evaluate_all_cells(&s->grid, &s->source, sample,
                                     s->pattern.user_t,
                                     s->pattern.field_time,
@@ -1770,7 +1341,7 @@ static void scene_reset(Scene *s, int mw, int mh)
     s->pattern.sweep_phase = 0.0f;
     s->pattern.user_t      = CONTOUR_T_DEFAULT;
     scene_recompute_field   (s);
-    scene_evaluate_contours (s);    /* paint initial frame so paused looks ok */
+    scene_evaluate_contours (s);    /* draw a first frame so a paused start isn't blank */
 }
 
 static void scene_init(Scene *s, int mw, int mh)
@@ -1782,13 +1353,8 @@ static void scene_init(Scene *s, int mw, int mh)
     scene_reset(s, mw, mh);
 }
 
-/*
- * scene_tick — drive one sim step.
- *
- *   STEP 1 — ADVANCE the per-frame clocks (field-drift, sweep-phase)
- *   STEP 2 — REBUILD the ScalarField for the new field_time
- *   STEP 3 — RE-EVALUATE the active pattern into the ContourGrid
- */
+/* One step of the demo: move the clocks, refill the field, redraw the
+ * grid. Does nothing while paused. */
 static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
@@ -1802,26 +1368,13 @@ static void scene_tick(Scene *s, float dt)
 /* ===================================================================== */
 
 /*
- * Screen — ncurses viewport dimensions cache.
+ * Screen — remembers how big the terminal is right now (width and
+ * height in characters), so the drawing code can centre the grid and
+ * right-align the HUD without asking ncurses every frame. Refreshed at
+ * startup and whenever the window is resized.
  *
- * INTENT
- *   ncurses owns the terminal state.  We just need to know "how
- *   wide / tall is the drawable area right now" so scene_draw can
- *   centre the grid and screen_draw can right-align the HUD without
- *   re-querying ncurses on every paint.  Updated lazily on resize.
- *
- * CONTEXT
- *   One instance lives on App (§10).  Refreshed by screen_init() at
- *   startup and screen_resize() on SIGWINCH.  Read by every render
- *   fn that needs to know where edges or centres are.
- *
- * MEMBER LOGIC
- *   cols : Viewport width in character cells.  Source of truth is
- *          getmaxyx(stdscr, ..., cols) inside screen_init /
- *          screen_resize.
- *   rows : Viewport height in character cells.  Includes the HUD
- *          band — render fns subtract HUD_BAND_RESERVED_ROWS as
- *          needed to get the drawable interior.
+ * rows includes the HUD rows; drawing code subtracts those when it
+ * needs just the usable area.
  */
 typedef struct { int cols, rows; } Screen;
 
@@ -1847,11 +1400,9 @@ static void screen_resize(Screen *s)
 
 /* ---------- scene_draw helpers (field painter) ----------------------- */
 
-/* viewport_centre_grid_origin — compute the top-left screen cell where
- * a grid_w × grid_h contour grid should sit inside the cols × rows
- * viewport.  HUD-aware: leaves HUD_TOP_ROWS reserved above and
- * HUD_BOTTOM_ROWS below.  Falls back to the HUD edge if the grid is
- * larger than the drawable interior. */
+/* Work out where the top-left of the grid goes so it sits centred on
+ * screen, leaving the HUD rows clear top and bottom. If the grid is
+ * bigger than the space, it just starts at the edge. */
 static void viewport_centre_grid_origin(int cols, int rows,
                                         int grid_w, int grid_h,
                                         int *gx0, int *gy0)
@@ -1863,9 +1414,9 @@ static void viewport_centre_grid_origin(int cols, int rows,
     if (*gy0 < HUD_TOP_ROWS) *gy0 = HUD_TOP_ROWS;
 }
 
-/* contour_cell_paint — emit one cell from the ContourGrid at screen
- * (sx, sy), gated by glow > 0 and a non-empty glyph.  band & 3 is
- * defensive — patterns are expected to write a clean 0..3. */
+/* Draw one square at screen position (sx, sy): skip it unless it's
+ * marked to draw and has a real character, then paint that character
+ * in its theme colour. */
 static void contour_cell_paint(const ContourGrid *grid, int gx, int gy,
                                int sx, int sy)
 {
@@ -1880,13 +1431,8 @@ static void contour_cell_paint(const ContourGrid *grid, int gx, int gy,
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* scene_draw — paint the ContourGrid's per-cell (glow, band, glyph)
- * buffers into the terminal.  The pattern already decided what to
- * draw; the renderer just looks it up and paints.
- *
- *   STEP 1 — CENTRE the grid inside the viewport (HUD-aware)
- *   STEP 2 — PAINT every in-bounds cell the pattern marked visible
- */
+/* Paint the whole grid: centre it, then draw each square that's on
+ * screen. The pattern already decided everything; this just paints. */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
     const ContourGrid *grid = &s->grid;
@@ -1906,10 +1452,9 @@ static void scene_draw(const Scene *s, int cols, int rows)
 
 /* ---------- screen_draw helpers (HUD layout) ------------------------- */
 
-/* hud_resolve_displayed_threshold — pick the T value the HUD should
- * show.  For SWEEP, T is animating sinusoidally between CONTOUR_T_MIN
- * and CONTOUR_T_MAX; for every other pattern, the user-set T is what
- * the renderer is actually drawing.  Same formula as pattern_sweep. */
+/* Which sea level the HUD should show. Usually it's the user's level,
+ * but SWEEP moves the level itself, so we report where SWEEP has it
+ * right now (matching pattern_sweep). */
 static float hud_resolve_displayed_threshold(const PatternState *ps)
 {
     if (ps->current != PATTERN_SWEEP) return ps->user_t;
@@ -1920,7 +1465,7 @@ static float hud_resolve_displayed_threshold(const PatternState *ps)
     return mid + amp * sinf(ps->sweep_phase * 2.0f * (float)M_PI);
 }
 
-/* hud_draw_top_left_title — fixed "MARCHING SQUARES" chip on row 0. */
+/* The "MARCHING SQUARES" title in the top-left corner. */
 static void hud_draw_top_left_title(void)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1928,9 +1473,8 @@ static void hud_draw_top_left_title(void)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* hud_draw_top_right_status — fps · sim Hz · state · pattern N/M · T,
- * right-justified on row 0.  Falls back to column 0 if the formatted
- * string is wider than the viewport. */
+/* The status readout in the top-right: frame rate, sim rate, state,
+ * which pattern, and the sea level. */
 static void hud_draw_top_right_status(int cols, double fps, int sim_fps,
                                       const char *state_str,
                                       int current_idx_zero_based,
@@ -1948,8 +1492,8 @@ static void hud_draw_top_right_status(int cols, double fps, int sim_fps,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* hud_field_bold_label — draw one bold HUD_PAIR field on row 1
- * starting at column `x`, advance by `width`, return the new x. */
+/* Draw one labelled field on the second HUD row and return where the
+ * next field should start. */
 static int hud_field_bold_label(int x, const char *fmt,
                                 const char *val, int width)
 {
@@ -1959,9 +1503,8 @@ static int hud_field_bold_label(int x, const char *fmt,
     return x + width;
 }
 
-/* hud_field_palette_swatch — "palette:####" segment on row 1: a label
- * in plain HUD pair, then HUD_N_PALETTE_BANDS '#' chars each in their
- * own band colour.  Returns the new x. */
+/* The "palette:####" swatch: the four theme colours shown as coloured
+ * '#' marks, so you can see the current theme at a glance. */
 static int hud_field_palette_swatch(int x)
 {
     attron(COLOR_PAIR(PAIR_HUD));
@@ -1978,7 +1521,8 @@ static int hud_field_palette_swatch(int x)
     return x;
 }
 
-/* hud_field_meta — trailing "scale · drift · map dims" on row 1. */
+/* The trailing extras on the second HUD row: zoom, drift speed, and
+ * grid size. */
 static void hud_field_meta(int x, int drift_mult, int grid_w, int grid_h)
 {
     attron(COLOR_PAIR(PAIR_HUD));
@@ -1987,9 +1531,8 @@ static void hud_field_meta(int x, int drift_mult, int grid_w, int grid_h)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* hud_draw_param_row — row 1 dashboard: pattern, tier, theme,
- * palette swatch, meta.  Each helper returns the next x so the row
- * reads as a left-to-right pipeline. */
+/* The second HUD row: pattern, tier, theme, the colour swatch, and the
+ * extras, laid out left to right. */
 static void hud_draw_param_row(const Scene *s)
 {
     const PatternState *ps = &s->pattern;
@@ -2004,7 +1547,7 @@ static void hud_draw_param_row(const Scene *s)
     hud_field_meta(x, ps->drift_mult, s->grid.w, s->grid.h);
 }
 
-/* hud_draw_bottom_hint — single-row key-binding bar at the bottom. */
+/* The key list along the bottom of the screen. */
 static void hud_draw_bottom_hint(int rows)
 {
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -2013,14 +1556,8 @@ static void hud_draw_bottom_hint(int rows)
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/* screen_draw — full frame composer.
- *
- *   STEP 1 — CLEAR the back buffer
- *   STEP 2 — PAINT the contour field
- *   STEP 3 — OVERLAY the top HUD row (title + right-aligned status)
- *   STEP 4 — OVERLAY the row-1 parameter dashboard
- *   STEP 5 — OVERLAY the bottom key-hint bar
- */
+/* Build one full frame: clear, draw the contours, then lay the HUD
+ * (title, status, parameter row, key list) on top. */
 static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
 {
     erase();
@@ -2045,47 +1582,27 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — top-level program state; the BSS root.
+ * App — the whole program in one box: the scene, the screen size, the
+ * target sim rate, the grid size, and two flags the signal handlers
+ * use to talk to the main loop.
  *
- * INTENT
- *   Single owner for the simulation, the screen, the sim-rate
- *   target, the active map size, and the two volatile signal flags.
- *   Lives in BSS as g_app (file-scope) for one specific reason:
- *   POSIX signal handlers can ONLY safely touch global async-signal-
- *   safe state, so the two sig_atomic_t flags must be reachable
- *   without arguments.  Everything else on App is touched from the
- *   main thread only.
+ * There's exactly one, g_app, at file scope. It has to be a global
+ * because signal handlers can't take arguments and can only safely
+ * touch a couple of simple global flags — that's why running and
+ * need_resize are here and are the special sig_atomic_t type. The
+ * handlers just flip a flag; the main loop notices and does the real
+ * work at the start of the next frame.
  *
- * CONTEXT
- *   Exactly one instance: g_app at file scope.  Built in main(),
- *   driven by the main game loop, torn down by atexit(cleanup).
- *   on_exit_signal / on_resize_signal flip the flags; the main loop
- *   polls them at frame boundaries and reacts (clean exit / lazy
- *   resize) — keeping all the heavy work off the signal handler.
+ * sim_fps     : how many times a second the demo updates (separate from
+ *               how often we redraw); ]/[ change it.
+ * map_w/h     : the grid size, worked out from the window size and
+ *               re-done on resize.
+ * running     : set to 0 to quit — by Ctrl-C/kill or by q/ESC.
+ * need_resize : set when the window was resized; the loop handles it
+ *               next frame.
  *
- * MEMBER LOGIC
- *   scene       : All mutable simulation state (§8).  See Scene doc
- *                 above for the dataflow pipeline.
- *   screen      : Viewport dimensions cache (§9).
- *   sim_fps     : Target simulation Hz ∈ [SIM_FPS_MIN, SIM_FPS_MAX].
- *                 Drives the fixed-timestep accumulator in main();
- *                 stepped by ]/[ keys.  Independent of render FPS.
- *   map_w, map_h: Grid dims chosen by app_pick_map_size() from the
- *                 current Screen.  Re-derived on resize; clamped to
- *                 [16, MAP_W_MAX] × [8, MAP_H_MAX] (BSS cap).
- *   running     : 0 = exit the main loop next iteration.  Cleared by
- *                 the SIGINT/SIGTERM handlers and by q/ESC in
- *                 app_handle_key().  sig_atomic_t for handler safety.
- *   need_resize : Set by the SIGWINCH handler; main loop polls it
- *                 before the next frame and calls app_do_resize().
- *                 sig_atomic_t for handler safety.
- *
- * REFERENCES
- *   • Fix Your Timestep! — Glenn Fiedler:
- *     https://gafferongames.com/post/fix_your_timestep/
- *     The fixed-timestep accumulator pattern main() uses.
- *   • POSIX.1-2017 § 2.4.3 — async-signal-safe functions and signal
- *     handler discipline.  Why running/need_resize are sig_atomic_t.
+ * The update loop uses Glenn Fiedler's fixed-timestep approach:
+ * https://gafferongames.com/post/fix_your_timestep/
  */
 typedef struct {
     Scene                 scene;
@@ -2102,9 +1619,8 @@ static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-/* app_pick_map_size — derive the contour grid dims from the current
- * viewport, leaving HUD_BAND_RESERVED_ROWS for the dashboard, then
- * clamp to [MAP_*_MIN, MAP_*_MAX] (the BSS cap on samples[]). */
+/* Pick the grid size from the current window: as big as the window,
+ * minus the HUD rows, kept within the smallest/largest we allow. */
 static void app_pick_map_size(App *app)
 {
     int mw = app->screen.cols;
@@ -2117,8 +1633,8 @@ static void app_pick_map_size(App *app)
     app->map_h = mh;
 }
 
-/* app_do_resize — full re-init after SIGWINCH: re-read viewport
- * dims, re-derive map size, rebuild the scene at the new size. */
+/* Handle a window resize: re-read the new size, repick the grid size,
+ * and rebuild the scene to fit. */
 static void app_do_resize(App *app)
 {
     screen_resize(&app->screen);
@@ -2127,8 +1643,7 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* app_sim_rate_faster/slower — step sim_fps by SIM_FPS_STEP, clamped
- * to [SIM_FPS_MIN, SIM_FPS_MAX].  Bound to ]/[. */
+/* Speed up or slow down how often the demo updates, kept within range. */
 static void app_sim_rate_faster(App *app)
 {
     app->sim_fps += SIM_FPS_STEP;
@@ -2140,9 +1655,8 @@ static void app_sim_rate_slower(App *app)
     if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
 }
 
-/* app_handle_key — keyboard dispatch.  Each case forwards to a tiny
- * named mutator so the switch reads as a pseudocode binding table.
- * Returns false on exit-request (q/Q/ESC); true otherwise. */
+/* Act on one keypress. Returns false only when the user asked to quit
+ * (q/Q/ESC); true otherwise. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
@@ -2182,9 +1696,9 @@ static bool app_handle_key(App *app, int ch)
 
 /* ---------- main-loop helpers ---------------------------------------- */
 
-/* main_install_signal_handlers — clean exit on SIGINT/SIGTERM, lazy
- * resize on SIGWINCH.  POSIX async-signal-safe path: handlers touch
- * only the sig_atomic_t flags on g_app. */
+/* Wire up the signals: quit cleanly on Ctrl-C/kill, note window
+ * resizes. The handlers only flip the two flags, which is all that's
+ * safe to do inside a signal handler. */
 static void main_install_signal_handlers(void)
 {
     atexit(cleanup);
@@ -2193,7 +1707,7 @@ static void main_install_signal_handlers(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* app_bootstrap — ncurses + viewport + scene initial state. */
+/* Start everything up: ncurses, window size, and the scene. */
 static void app_bootstrap(App *app)
 {
     app->running = 1;
@@ -2203,9 +1717,8 @@ static void app_bootstrap(App *app)
     scene_init(&app->scene, app->map_w, app->map_h);
 }
 
-/* app_handle_pending_resize — if SIGWINCH flagged a resize, do it
- * and reset the frame clocks so dt doesn't include the resize cost
- * (which would falsely trigger the spiral-of-death cap below). */
+/* If the window was resized, handle it now and reset the frame clock,
+ * so the time the resize took doesn't count as one giant slow frame. */
 static void app_handle_pending_resize(App *app,
                                       int64_t *frame_time,
                                       int64_t *sim_accum)
@@ -2216,9 +1729,8 @@ static void app_handle_pending_resize(App *app,
     *sim_accum  = 0;
 }
 
-/* app_compute_frame_dt — clock delta since last frame, clamped at
- * SIM_MAX_FRAME_DT_MS so a slow terminal can't trigger unbounded
- * sim-tick catch-up below (spiral-of-death guard). */
+/* How much time passed since the last frame, but capped: if one frame
+ * was very slow, we don't let it pile up a huge backlog of updates. */
 static int64_t app_compute_frame_dt(int64_t *frame_time)
 {
     int64_t now = clock_ns();
@@ -2229,9 +1741,9 @@ static int64_t app_compute_frame_dt(int64_t *frame_time)
     return dt;
 }
 
-/* app_drain_fixed_timestep — Fiedler accumulator: integrate as many
- * fixed-rate sim ticks as fit into the elapsed dt, so the sim runs
- * at exactly sim_fps Hz regardless of render FPS jitter. */
+/* Run as many fixed-size update steps as the elapsed time allows, so
+ * the demo always updates at its set rate no matter how the frame rate
+ * wobbles. */
 static void app_drain_fixed_timestep(App *app, int64_t dt, int64_t *sim_accum)
 {
     int64_t tick_ns = TICK_NS(app->sim_fps);
@@ -2243,8 +1755,7 @@ static void app_drain_fixed_timestep(App *app, int64_t dt, int64_t *sim_accum)
     }
 }
 
-/* app_update_fps_meter — sliding-window average over the last
- * FPS_UPDATE_MS of wall-clock time. */
+/* Keep a running average frame rate, refreshed every FPS_UPDATE_MS. */
 static void app_update_fps_meter(int64_t dt,
                                  int *frame_count,
                                  int64_t *fps_accum,
@@ -2260,23 +1771,23 @@ static void app_update_fps_meter(int64_t dt,
     }
 }
 
-/* app_throttle_to_render_target — sleep for the remainder of the
- * RENDER_FRAME_BUDGET so the loop doesn't burn CPU between frames. */
+/* Sleep off whatever's left of the frame's time budget, so we don't
+ * spin the CPU drawing faster than we need to. */
 static void app_throttle_to_render_target(int64_t frame_time, int64_t dt)
 {
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(RENDER_FRAME_BUDGET_NS - elapsed);
 }
 
-/* app_present_frame — render the world + flush ncurses back-buffer. */
+/* Draw the frame and push it to the terminal. */
 static void app_present_frame(App *app, double fps_display)
 {
     screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
     screen_present();
 }
 
-/* app_poll_keyboard — non-blocking getch + dispatch.  Returns false
- * iff the user requested exit (q / Q / ESC). */
+/* Check for a keypress without waiting and act on it. Returns false
+ * only if the user asked to quit. */
 static bool app_poll_keyboard(App *app)
 {
     int ch = getch();
@@ -2284,19 +1795,9 @@ static bool app_poll_keyboard(App *app)
     return app_handle_key(app, ch);
 }
 
-/* main — game-loop driver.
- *
- *   STEP 1 — SEED rng + INSTALL signal handlers + BOOTSTRAP app
- *   STEP 2 — LOOP:
- *              a. honour any pending resize
- *              b. compute dt (clamped)
- *              c. drain fixed-timestep sim ticks
- *              d. update fps meter
- *              e. throttle to render budget
- *              f. present the frame
- *              g. poll input → maybe exit
- *   STEP 3 — TEARDOWN screen
- */
+/* The main loop. Set up, then each frame: handle any resize, see how
+ * much time passed, run the due updates, refresh the fps reading, sleep
+ * to pace the frame, draw, and check the keyboard. Quit when asked. */
 int main(void)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));

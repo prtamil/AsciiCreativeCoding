@@ -1,111 +1,23 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * snowflake.c  —  Dendritic snowflake fractal (recursive 6-fold branching)
+ * snowflake.c  —  a snowflake drawn as a fractal.
  *
- * A real snow crystal is a DENDRITE: six arms radiate from a centre, and each
- * arm sprouts smaller side-branches, which sprout smaller ones again — the same
- * shape at every scale.  This demo draws that directly as a deterministic fractal:
+ * A snow crystal has six arms, and each arm grows smaller branches, which grow
+ * smaller branches again — the same shape repeating at every size.  We draw that
+ * with one rule that calls itself: draw a line, then sprout two half-size copies
+ * of the whole rule off it, angled left and right.  Six arms 60° apart around a
+ * centre, and the snowflake's six-way symmetry just appears on its own.
  *
- *   - six arms at 60° apart (the hexagonal symmetry of ice, H2O ice Ih);
- *   - along each arm, at fixed fractions, a mirror-paired branch sprouts left and
- *     right at ±60°, each a half-size copy of the whole rule;
- *   - recurse to DEPTH levels.
+ * The + / - keys change the depth (how many times the rule recurses), which is
+ * the only real knob: more depth = a finer, lacier crystal.
  *
- * Because the rule is deterministic and left/right symmetric, all six arms come
- * out identical and mirror-symmetric — so the full D6 snowflake symmetry (6
- * rotations × 2 reflections) falls out for free, with no symmetry bookkeeping.
+ * Sister file koch.c draws the snowflake's OUTLINE as a fractal instead of its arms.
+ * Snowflake physics: Nakaya, "Snow Crystals" (1954); Libbrecht, Rep. Prog. Phys.
+ * 68 (2005), 855.  Self-similar branching: Mandelbrot, "The Fractal Geometry of
+ * Nature" (1982).
  *
- * This is the snowflake's ARMS as a fractal.  Its sibling koch.c draws the
- * snowflake's BOUNDARY as a fractal (the Koch curve); the two are complementary.
- *
- * DEPTH is the knob: depth 1 = bare arms + first branches; higher depth = a finer,
- * lacier crystal.  Colour runs by recursion level (deep core → bright tips).
- *
- * FOUR LAYERS, separated so the geometry is trustworthy and it is clear what runs
- * apart from drawing:
- *
- *   §4 GEOMETRY  — pure vector math: the plane the crystal lives in.
- *   §5 CANVAS    — the cached image: a cell buffer, the math→cell projection, and
- *                  a line-stroke primitive (the WRITE side).
- *   §6 SNOWFLAKE — the recursive branching build that strokes the crystal into the
- *                  canvas.  This is the ONLY heavy work and a PURE FUNCTION of
- *                  (depth, size) — gated by Scene.dirty, run only on a depth or
- *                  resize change, never per frame.
- *   §8 RENDER    — reads the cell buffer and blits glyphs (the READ side).
- *   §7 SCENE     — orchestration: depth + theme + canvas + the dirty flag.
- *
- * EFFECTS / DELAYS: there are none.  This is a static explorer — no animation, no
- * reveal, no timer.  Changing depth rebuilds the canvas instantly; changing the
- * theme is a pure recolor (it re-binds palette pairs; the canvas is NOT rebuilt).
- *
- * Keys:
- *   q / ESC   quit
- *   + / -     increase / decrease depth (1..6)
- *   r         reset to default depth
- *   t / T     cycle color theme forward / back
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra snowflake.c -o snowflake -lncurses -lm
- *
- * Sections
- * --------
- *   §1 config    — constants, branch rule, theme table
- *   §2 clock     — monotonic ns clock + sleep
- *   §3 color     — themeable core→tip ramp (t/T) + HUD pairs
- *   §4 geometry  — Vec2 + add / scale / rotate / from-angle (PURE)
- *   §5 canvas    — cell buffer + math→cell projection + line stroke
- *   §6 snowflake — the recursive 6-fold branching build
- *   §7 scene     — orchestration: depth + theme + canvas + dirty flag
- *   §8 render    — canvas → glyphs + HUD (READ-ONLY)
- *   §9 app       — main loop
+ * Build: gcc -std=c11 -O2 -Wall -Wextra snowflake.c -o snowflake -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm : A symmetric fractal tree.  snowflake_branch() draws one segment,
- *             then sprouts a half-size copy of itself left and right (±60°) at
- *             each of N_BRANCH_PTS fixed points; six arms tile that around a hub.
- *
- * Math      : Self-similar.  Each level multiplies the branch count by
- *             B = N_BRANCH_PTS × 2 and shrinks length by BRANCH_SCALE, so the
- *             branch set has similarity dimension D = log B / log(1/BRANCH_SCALE).
- *             The ±60° branch angle and 6 arms come from ice's hexagonal lattice.
- *
- * Physics   : Real snow crystals grow as dendrites branching at 60°; this is the
- *             deterministic, idealized version of that morphology (contrast the
- *             stochastic DLA growth model).
- *
- * Rendering : Every branch is a Bresenham line; its glyph follows its direction
- *             (- | / \\), and its colour follows its recursion level.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES — to understand the concepts and the rendering ───────────── *
- *
- *   Self-similar trees, branching & dimension  (§6, CONCEPTS)
- *   ── Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
- *      Self-similar trees and natural branching; the language of fractal dimension.
- *   ── Barnsley, M. F. (1993). "Fractals Everywhere" (2nd ed.). Academic Press.
- *      Deterministic fractals as collections of contraction maps — exactly the
- *      "half-size copy of myself at ±60°" rule used here.
- *   ── Falconer, K. (2003). "Fractal Geometry: Mathematical Foundations and
- *      Applications" (2nd ed.). Wiley.  The similarity dimension D = log B /
- *      log(1/scale) the CONCEPTS block quotes, done rigorously.
- *   ── Prusinkiewicz, P. & Lindenmayer, A. (1990). "The Algorithmic Beauty of
- *      Plants." Springer.  Recursive branching geometry (turtle / L-systems).
- *
- *   The physics of the shape  (CONCEPTS)
- *   ── Nakaya, U. (1954). "Snow Crystals: Natural and Artificial." Harvard Univ.
- *      Press.  The founding study of snow-crystal morphology — why the six arms
- *      and their dendritic branches form (the Nakaya diagram).
- *   ── Libbrecht, K. G. (2005). "The physics of snow crystals." Rep. Prog. Phys.
- *      68(4), 855–895.  The modern review of hexagonal dendrite growth.
- *
- *   Rendering  (§5, §8)
- *   ── Bresenham, J. E. (1965). "Algorithm for computer control of a digital
- *      plotter." IBM Systems Journal 4(1), 25–30.  The integer line stroke.
- *   ── Gookin, D. (2007). "Programmer's Guide to NCURSES." Wiley.  The cell-
- *      drawing / colour-pair API behind §8.
- * ─────────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -132,47 +44,47 @@ enum {
     GRID_ROWS_MAX =  80,
     GRID_COLS_MAX = 300,
 
-    RENDER_FPS    =  30,     /* idle redraw / input-poll rate */
-    RAMP_LEN      =   6,     /* colour stops, core → tip      */
+    RENDER_FPS    =  30,     /* how often we redraw and check for keys */
+    RAMP_LEN      =   6,     /* number of colours in a theme, core to tip */
     N_THEMES      =   6,
 };
 
-/* The crystal's shape, all in math space (the hub is the origin, arm length 1). */
-#define N_ARMS         6                  /* 6-fold hexagonal symmetry        */
-#define ARM_LENGTH     1.0f               /* main arm length (math units)     */
-#define ARM_STEP       (2.0f * PI / N_ARMS)   /* angle between arms (= 60°)   */
-#define BRANCH_ANGLE   (PI / 3.0f)        /* side branches sprout at ±60°     */
-#define BRANCH_SCALE   0.40f              /* each level is this fraction long */
-#define N_BRANCH_PTS   2                  /* sprout points per segment        */
-static const float BRANCH_FRAC[N_BRANCH_PTS] = { 0.40f, 0.72f };   /* along the segment */
+/* The crystal's shape.  Everything here is in "math space": the centre is at
+ * (0,0) and a main arm is 1 unit long.  Cells on screen come later. */
+#define N_ARMS         6                  /* a snowflake has six arms        */
+#define ARM_LENGTH     1.0f
+#define ARM_STEP       (2.0f * PI / N_ARMS)   /* turn between arms = 60°     */
+#define BRANCH_ANGLE   (PI / 3.0f)        /* side branches angle off at ±60° */
+#define BRANCH_SCALE   0.40f              /* each branch is this fraction of its parent's length */
+#define N_BRANCH_PTS   2                  /* how many spots along a line sprout branches */
+static const float BRANCH_FRAC[N_BRANCH_PTS] = { 0.40f, 0.72f };   /* where along the line, 0=start 1=tip */
 
-/* EXTENT — how far (in math units) the crystal reaches from the hub; the canvas
- * scales so a disc of this radius fits the terminal.  A little generous; the
- * rasterizer clips anything that still spills over. */
+/* How far the crystal reaches from the centre.  The canvas shrinks to fit a
+ * circle this big on screen; anything still poking past the edge is clipped. */
 #define EXTENT       1.3f
 #define MARGIN_CELLS 2
 
-#define ASPECT_R    2.0f       /* cell height / width ≈ 2; stretches x so the crystal is round */
+#define ASPECT_R    2.0f       /* terminal cells are about twice as tall as wide; we stretch x to match so the snowflake looks round, not squashed */
 
-/* GLYPH_AXIS_RATIO — when a stroke's run exceeds this multiple of its rise (or vice
- * versa) it is drawn as an axis glyph ('-' or '|') rather than a diagonal. */
+/* When a line is much more horizontal than vertical (or the reverse) by this
+ * factor, draw it as '-' or '|' instead of a diagonal. */
 #define GLYPH_AXIS_RATIO  2.0f
 
 #define NS_PER_SEC  1000000000LL
 
 /*
- * Theme — a colour ramp from the crystal's core (c[0]) to its tips (c[RAMP_LEN-1]).
- * The renderer colours every branch by its recursion LEVEL (see level_color), so
- * this ramp turns "how deep in the fractal a branch is" into "how bright it is":
- * the long main arms read deep, the fine outer tracery reads bright — which is how
- * the eye separates the fractal's levels at a glance.  Every stop is kept in the
- * bright half of the 256-cube (>= ~33) so even the core stays legible on black
- * (the project's Theme Palette Brightness rule).
+ * Theme — a run of colours from the crystal's centre to its tips.
+ *
+ * We colour each line by how deep it is in the fractal, so depth becomes
+ * brightness: the big main arms look dark, the fine outer lacework looks
+ * bright.  That's what lets your eye tell the layers apart at a glance.
+ * Every colour is kept in the brighter half of the palette so even the centre
+ * stays visible against a black background (project palette-brightness rule).
  */
 typedef struct {
-    const char *name;   /* HUD label; how the user names the theme when cycling (t/T)        */
-    int c [RAMP_LEN];   /* 256-color ramp, ordered core → tip (deep → bright)               */
-    int c8[RAMP_LEN];   /* 8-color fallback, same ordering; the ramp collapses to a few hues */
+    const char *name;   /* shown in the HUD when you cycle themes with t/T */
+    int c [RAMP_LEN];   /* the 256-colour version, ordered centre -> tip */
+    int c8[RAMP_LEN];   /* fallback for terminals with only 8 colours, same order */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -215,23 +127,23 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  color                                                              */
 /* ===================================================================== */
 
-/* Palette pairs: 1..RAMP_LEN are the core→tip ramp (re-bound per theme);
- * COL_HUD / COL_HINT are theme-independent. */
-#define COL_RAMP 1                       /* ramp occupies pairs 1 .. RAMP_LEN */
+/* ncurses colour-pair slots.  Slots 1..RAMP_LEN hold the theme colours (these
+ * get reassigned when you switch themes); the two HUD slots never change. */
+#define COL_RAMP 1
 enum {
-    COL_HUD  = 1 + RAMP_LEN,   /* HUD data    — bright yellow */
-    COL_HINT,                  /* HUD actions — bright cyan   */
+    COL_HUD  = 1 + RAMP_LEN,   /* yellow status text */
+    COL_HINT,                  /* cyan key hints     */
 };
 
-/* level_color — the colour pair for a branch at recursion `level` (0 = arm/core),
- * clamped to the ramp so very deep branches keep the brightest tip colour. */
+/* Which colour a line gets, given how deep it is (0 = the main arms).  Anything
+ * deeper than we have colours for just keeps the brightest tip colour. */
 static int level_color(int level)
 {
     int idx = level < RAMP_LEN ? level : RAMP_LEN - 1;
     return COL_RAMP + idx;
 }
 
-/* theme_apply — bind the core→tip ramp to theme t. */
+/* Load theme t's colours into the ncurses palette slots. */
 static void theme_apply(int t)
 {
     const Theme *th = &k_themes[t];
@@ -244,7 +156,7 @@ static void theme_apply(int t)
 static void color_init(void)
 {
     start_color();
-    /* HUD pairs stay constant across themes: bright yellow data, bright cyan actions */
+    /* The HUD colours are fixed: yellow status text, cyan key hints */
     if (COLORS >= 256) {
         init_pair(COL_HUD,  226, COLOR_BLACK);
         init_pair(COL_HINT,  51, COLOR_BLACK);
@@ -252,30 +164,30 @@ static void color_init(void)
         init_pair(COL_HUD,  COLOR_YELLOW, COLOR_BLACK);
         init_pair(COL_HINT, COLOR_CYAN,   COLOR_BLACK);
     }
-    theme_apply(0);   /* Ice at boot; Scene.theme tracks the active one after */
+    theme_apply(0);   /* start on the first theme (Ice) */
 }
 
 /* ===================================================================== */
-/* §4  geometry — the plane the crystal lives in (PURE)                   */
+/* §4  geometry — the math plane the crystal lives in                     */
 /* ===================================================================== */
 
 /*
- * Vec2 — a point or vector in MATH space (x right, y up; the hub is the origin).
- * The whole crystal is built in this clean continuous space — arms, ±60° rotations,
- * branch nodes — and only projected to integer cells at stroke time (§5).  Keeping
- * the geometry in floats is what lets midpoints and rotations stay exact all the
- * way down the recursion.  (Vectors & 2-D rotation: any linear-algebra text.)
+ * Vec2 — a point (or direction) in the math plane: x goes right, y goes up,
+ * and the snowflake's centre is at (0,0).  We build the whole crystal here in
+ * smooth decimal coordinates and only turn it into screen cells at the last
+ * moment (§5).  Staying in floats keeps the angles and midpoints exact no
+ * matter how deep the recursion goes.
  */
 typedef struct {
-    float x;   /* horizontal component (math units; the main arm length is 1.0) */
-    float y;   /* vertical   component (math units; y increases upward)         */
+    float x;   /* left-right (a main arm is 1.0 long) */
+    float y;   /* up-down (bigger y = higher up)      */
 } Vec2;
 
 static Vec2 vec_add(Vec2 a, Vec2 b)        { return (Vec2){ a.x + b.x, a.y + b.y }; }
 static Vec2 vec_scale(Vec2 v, float s)     { return (Vec2){ v.x * s, v.y * s }; }
 static Vec2 vec_from_angle(float radians)  { return (Vec2){ cosf(radians), sinf(radians) }; }
 
-/* vec_rotate — rotate v by `radians` counter-clockwise (standard 2-D rotation). */
+/* Spin a direction by some angle (counter-clockwise). */
 static Vec2 vec_rotate(Vec2 v, float radians)
 {
     float c = cosf(radians), s = sinf(radians);
@@ -287,11 +199,10 @@ static Vec2 vec_rotate(Vec2 v, float radians)
 /* ===================================================================== */
 
 /*
- * Pt — a point in SCREEN space (col, row).  Deliberately a different type from
- * Vec2 so the two coordinate systems can never be mixed up: Vec2 is the ideal
- * plane, Pt is where a Vec2 lands on the terminal after canvas_project() (which
- * flips y and stretches x by ASPECT_R).  Kept sub-cell precise; rounded to ints
- * only inside the Bresenham stroke.
+ * Pt — a spot on the screen, measured in columns and rows.  It's a separate
+ * type from Vec2 on purpose so we can't accidentally mix the math plane up with
+ * the screen.  A Vec2 becomes a Pt through canvas_project() below.  We keep
+ * fractional precision here and only round to whole cells when actually drawing.
  */
 typedef struct {
     float x;   /* column */
@@ -299,30 +210,29 @@ typedef struct {
 } Pt;
 
 /*
- * Cell — one drawn cell of the cached image: everything the renderer needs and
- * nothing about the geometry that produced it.  This split is exactly why the heavy
- * build (§6) and the cheap per-frame blit (§8) stay separate — the Canvas caches a
- * grid of these, and the renderer only reads them.
+ * Cell — one character of the finished picture: just its colour and glyph,
+ * nothing about the geometry that put it there.  We keep a whole grid of these
+ * so the slow drawing happens once and every frame just copies them to screen.
  */
 typedef struct {
-    uint8_t color;   /* colour-pair slot: a ramp pair (1..RAMP_LEN), or 0 = empty/background */
-    char    glyph;   /* line glyph ('-' '|' '/' '\\') chosen from the branch's screen direction */
+    uint8_t color;   /* colour slot 1..RAMP_LEN, or 0 for "empty / background" */
+    char    glyph;   /* the line character: '-' '|' '/' or '\\' */
 } Cell;
 
 /*
- * Canvas — the cached image plus the math→screen projection that produced it.
- * gasket-style cache: snowflake_build() writes it, the renderer (§8) only reads
- * it.  scale_x/scale_y and (cx, cy) place a disc of radius EXTENT, centred, with
- * x stretched by ASPECT_R so the hexagon is not squashed by tall cells.
+ * Canvas — the finished picture plus the numbers used to draw it.  The build
+ * step (§6) fills this in once; the renderer (§8) only ever reads it.
+ * scale_x/scale_y and (cx, cy) are what place a centred circle of the crystal
+ * on screen, with x stretched so it doesn't come out squashed.
  */
 typedef struct {
-    /* Row-major cached image, [row][col].  Statically sized to the largest terminal
-       we support so the hot path never allocates (project rule); only the top-left
-       rows×cols sub-rectangle is live in any given frame. */
+    /* The picture grid, [row][col].  Sized big enough for the largest terminal
+       up front so we never allocate while running; only the top-left rows x cols
+       corner is actually used at any moment. */
     Cell  cell[GRID_ROWS_MAX][GRID_COLS_MAX];
-    int   rows, cols;         /* live size, clamped to the GRID_*_MAX bounds            */
-    float scale_x, scale_y;   /* math unit → cells per axis; scale_x = scale_y·ASPECT_R */
-    int   cx, cy;             /* screen cell of the hub (math origin) — the centre      */
+    int   rows, cols;         /* the part actually in use, capped to the grid size */
+    float scale_x, scale_y;   /* how many cells per math unit (x is ASPECT_R wider) */
+    int   cx, cy;             /* the cell the centre of the crystal sits on */
 } Canvas;
 
 static void canvas_resize(Canvas *cv, int cols, int rows)
@@ -330,7 +240,7 @@ static void canvas_resize(Canvas *cv, int cols, int rows)
     cv->cols = cols < 1 ? 1 : (cols > GRID_COLS_MAX ? GRID_COLS_MAX : cols);
     cv->rows = rows < 1 ? 1 : (rows > GRID_ROWS_MAX ? GRID_ROWS_MAX : rows);
 
-    /* Largest scale fitting a radius-EXTENT disc in both axes (x is ASPECT_R wider). */
+    /* Biggest the crystal can be while still fitting both ways (x runs wider). */
     float fit_y = ((float)cv->rows * 0.5f - MARGIN_CELLS) / EXTENT;
     float fit_x = ((float)cv->cols * 0.5f - MARGIN_CELLS) / (EXTENT * ASPECT_R);
     cv->scale_y = fminf(fit_y, fit_x);
@@ -345,14 +255,16 @@ static void canvas_clear(Canvas *cv)
     memset(cv->cell, 0, sizeof cv->cell);
 }
 
-/* canvas_project — math-space point → screen point.  y flips (math up = row up). */
+/* Turn a math-plane point into a screen spot.  We subtract for y because on
+ * screen rows count downward, but in the math plane up is positive. */
 static Pt canvas_project(const Canvas *cv, Vec2 v)
 {
     return (Pt){ (float)cv->cx + v.x * cv->scale_x,
                  (float)cv->cy - v.y * cv->scale_y };
 }
 
-/* canvas_mark — write one cell if it is in bounds (the only guarded write). */
+/* Set one cell, but only if it's actually on the grid.  This bounds check is
+ * the one place we guard against drawing off the edge. */
 static void canvas_mark(Canvas *cv, int row, int col, uint8_t color, char glyph)
 {
     if (row >= 0 && row < cv->rows && col >= 0 && col < cv->cols) {
@@ -361,8 +273,8 @@ static void canvas_mark(Canvas *cv, int row, int col, uint8_t color, char glyph)
     }
 }
 
-/* stroke_glyph — pick a line glyph from a screen-space direction (rows grow down):
- * mostly-horizontal → '-', mostly-vertical → '|', else the matching diagonal. */
+/* Pick the character for a line based on which way it runs (remember rows count
+ * downward): mostly sideways -> '-', mostly up/down -> '|', else a slash. */
 static char stroke_glyph(float dx, float dy)
 {
     float run = fabsf(dx), rise = fabsf(dy);
@@ -372,10 +284,9 @@ static char stroke_glyph(float dx, float dy)
 }
 
 /*
- * canvas_draw_line — Bresenham integer line from (x0,y0) to (x1,y1), writing
- * glyph/color into every cell it crosses.  `err` is the running decision
- * accumulator: doubling it each step (the 2·err) lets the choice of which axis to
- * advance be made with integers only — the whole point of Bresenham.
+ * Draw a straight line of cells from (x0,y0) to (x1,y1).  This is Bresenham's
+ * line algorithm: it walks one cell at a time and uses `err` to decide whether
+ * to step sideways, downward, or both, using only whole-number math.
  */
 static void canvas_draw_line(Canvas *cv, int x0, int y0, int x1, int y1,
                              uint8_t color, char glyph)
@@ -388,17 +299,13 @@ static void canvas_draw_line(Canvas *cv, int x0, int y0, int x1, int y1,
         canvas_mark(cv, y0, x0, color, glyph);
         if (x0 == x1 && y0 == y1) break;
         int err2 = 2 * err;
-        if (err2 >= span_y) { err += span_y; x0 += step_x; }   /* advance the column */
-        if (err2 <= span_x) { err += span_x; y0 += step_y; }   /* advance the row    */
+        if (err2 >= span_y) { err += span_y; x0 += step_x; }   /* step a column */
+        if (err2 <= span_x) { err += span_x; y0 += step_y; }   /* step a row    */
     }
 }
 
-/*
- * canvas_stroke — draw the math-space segment a→b in `color`, in three steps:
- *   1. project both endpoints to screen cells;
- *   2. choose the line glyph from the screen direction;
- *   3. rasterize the line between them.
- */
+/* Draw one math-plane segment onto the canvas: find where its two ends land on
+ * screen, pick a line character for its slope, then draw between them. */
 static void canvas_stroke(Canvas *cv, Vec2 a, Vec2 b, uint8_t color)
 {
     Pt   pa    = canvas_project(cv, a);
@@ -413,10 +320,11 @@ static void canvas_stroke(Canvas *cv, Vec2 a, Vec2 b, uint8_t color)
 /* ===================================================================== */
 
 /*
- * snowflake_branch — THE fractal rule.  Draw one segment from `base` along `dir`
- * for `length`; then, if depth remains, sprout a half-size copy of this very rule
- * to the left and right (±BRANCH_ANGLE) at each fixed fraction along the segment.
- * `level` only colours the result (0 = arm/core, deeper = brighter tips).
+ * The fractal rule, and the heart of the whole program.  Draw one line starting
+ * at `base`, heading in direction `dir`, `length` long.  Then, if there's depth
+ * left, sprout the very same rule again at a couple of points along the line,
+ * angled left and right and shrunk down — so each call grows smaller copies of
+ * itself.  `level` only picks the colour (0 = the main arm, deeper = brighter).
  */
 static void snowflake_branch(Canvas *cv, Vec2 base, Vec2 dir, float length,
                              int level, int max_level)

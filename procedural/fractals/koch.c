@@ -1,121 +1,23 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * koch.c  —  Koch snowflake fractal, animated level-by-level
+ * koch.c — the Koch snowflake, drawn one stroke at a time.
  *
- * The Koch snowflake starts as an equilateral triangle.  Each straight
- * edge is repeatedly replaced by four shorter edges: the middle third is
- * removed and replaced with an outward equilateral bump.  Repeating this
- * rule produces the classic snowflake fractal boundary.
+ * Start with a triangle. Take every straight edge, pinch out a little
+ * triangular bump in the middle, and you now have four shorter edges where
+ * there was one. Do that again to all of them, and again — the outline gets
+ * more and more crinkled. That repeated bump-the-middle rule is the whole
+ * idea, and it makes the classic snowflake shape.
  *
- * Animation — the outline is drawn stroke-by-stroke at one detail level.
- * Five levels are available; 'n' steps to the next (no auto-advance — the
- * view holds once a level finishes drawing).  Level 3 is shown at start.
+ * Press 'n' to step up a detail level (the picture holds when it finishes;
+ * it won't auto-advance). The drawing animates along the outline so you can
+ * watch the colour sweep around as it fills in.
  *
- *   Level 1 :   12 segments  — triangle with bumps
- *   Level 2 :   48 segments  — bumps on bumps
- *   Level 3 :  192 segments  — fine detail emerging   ← default
- *   Level 4 :  768 segments  — very fine detail
- *   Level 5 : 3072 segments  — near-fractal resolution
- *
- * Colour runs along the curve (first segment → last) and is themeable
- * with t / T.
- *
- * Koch subdivision rule — for segment A → B:
- *   P = A + (B-A)/3
- *   Q = A + (B-A)*2/3
- *   M = P + R(+60°)(Q-P)       ← outward equilateral bump peak
- *   Replace with: A→P, P→M, M→Q, Q→B
- *
- * All segment geometry is stored in Euclidean coordinates (circumradius=1)
- * and converted to terminal (col, row) at draw time, applying ASPECT_R to
- * keep the snowflake circular rather than squashed.
- *
- * Keys:
- *   q / ESC   quit
- *   n         next level
- *   t / T     cycle color theme (Aurora/Fire/Ice/Toxic/Mono)
- *   r         reset to the default level (3)
- *   ] [       faster / slower simulation
- *   p / spc   pause / resume
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra koch.c -o koch -lncurses -lm
- *
- * Reading order — built bottom-up; each section uses only earlier ones.
- *   §1  config   — constants, palette slots, themes
- *   §2  clock    — monotonic time
- *   §3  geometry — Vec2 (the plane the snowflake lives on) + a subtract helper
- *   §4  curve    — Segment, KochCurve, the subdivision rule + build
- *   §5  color    — gradient-along-curve + theme apply
- *   §6  canvas   — cell buffer, Euclid→cell projection, Bresenham stroke
- *   §7  reveal   — stroke-by-stroke draw progress
- *   §8  scene    — Scene: curve + canvas + reveal + theme
- *   §9  screen   — ncurses lifecycle + HUD
- *   §10 app      — signals, input, main loop
+ * References the code can't give you:
+ *   - von Koch (1904), the original paper introducing this curve.
+ *   - Mandelbrot, "The Fractal Geometry of Nature" (1982), for why it matters.
+ *   - Sister files: dragon_curve.c (same stroke animation, different rule),
+ *     l_system.c (draws Koch from a rewrite grammar instead).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Iterative edge-replacement (segment subdivision).  At each
- *                  level every segment A→B becomes four: A→P, P→M, M→Q, Q→B,
- *                  where M is the peak of an outward equilateral bump on the
- *                  middle third.  No recursion stack of state — segments are
- *                  written straight into a flat array.
- *
- * Math           : After n levels — segment count 3·4ⁿ, segment length (1/3)ⁿ,
- *                  perimeter (4/3)ⁿ → ∞, enclosed area → (2/5)·triangle.  Fractal
- *                  dimension D = log4/log3 ≈ 1.26 (between a curve and an area).
- *                  The bump peak comes from rotating the edge's middle third by
- *                  +60° (equilateral-triangle geometry).
- *
- * Data model     : Small structs, one idea each —
- *                    Vec2        a point in the snowflake's plane
- *                    Segment     one edge A→B; the curve is an array of these
- *                    KochCurve   the segments + level (the geometry)
- *                    Canvas      the cell buffer + Euclid→cell projection
- *                    Reveal      the stroke-by-stroke draw progress
- *                    Scene       all of the above = the live picture
- *
- * Rendering      : Each Euclidean segment is projected to terminal cells (centre
- *                  + scale + ASPECT_R) and rasterised with Bresenham; colour
- *                  runs along the curve so you watch it draw.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── REFERENCES ───────────────────────────────────────────────────────── *
- *
- * Concepts & maths
- *   [1] von Koch, H. (1904). "Sur une courbe continue sans tangente, obtenue
- *       par une construction géométrique élémentaire." Arkiv för Matematik 1:
- *       681-704.  — the original paper that introduced the curve as an example
- *       of a continuous, nowhere-differentiable function.  The source.
- *   [2] Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
- *       — the Koch curve as the canonical fractal: infinite perimeter bounding
- *       finite area, and self-similarity dimension D = log4/log3 ≈ 1.26.  Start
- *       here for the why.
- *   [3] Peitgen, Jürgens & Saupe (1992). "Chaos and Fractals: New Frontiers of
- *       Science." Springer.  — the most readable construction chapter: the
- *       edge-replacement rule (§4), the length (4/3)ⁿ→∞ and area→(2/5)·triangle
- *       limits, and the dimension worked end to end.
- *   [4] Falconer, K. (2003). "Fractal Geometry: Mathematical Foundations and
- *       Applications" (2nd ed.). Wiley.  — rigorous Hausdorff dimension; derives
- *       D = log4/log3 for the Koch curve as a self-similar set.
- *
- * Rendering, L-systems & line drawing
- *   [5] Prusinkiewicz, P. & Lindenmayer, A. (1990). "The Algorithmic Beauty of
- *       Plants." Springer (free at algorithmicbotany.org).  — the Koch curve as
- *       the L-system F→F+F--F+F; the edge-rewriting view that §4's subdivision
- *       implements directly, without a symbol string.
- *   [6] Bresenham, J. E. (1965). "Algorithm for computer control of a digital
- *       plotter." IBM Systems Journal 4(1):25-30.  — the integer line-stepping
- *       algorithm canvas_stroke uses in §6 to rasterise each segment.
- *
- * In-repo study companions
- *   [7] dragon_curve.c — another fractal curve traced as segments; same
- *       Reveal-style stroke animation, a different replacement rule.
- *   [8] l_system.c — draws the Koch curve from a rewrite grammar; contrast its
- *       generic symbol rewriting with the explicit subdivision in §4.
- *   [9] buddhabrot.c — the palette-table pattern §1/§5's themes borrow.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -138,17 +40,15 @@ enum {
     SIM_FPS_MAX     =  60,
     SIM_FPS_STEP    =   5,
 
-    MAX_LEVEL       =   5,    /* highest detail level                   */
-    DEFAULT_LEVEL   =   3,    /* level shown at start and on reset       */
-    N_KOCH_COLORS   =   5,    /* color bands along the drawn curve       */
-    N_THEMES        =   5,    /* colour themes to cycle with t/T         */
+    MAX_LEVEL       =   5,    /* how crinkled the outline can get         */
+    DEFAULT_LEVEL   =   3,    /* level shown at start and on reset        */
+    N_KOCH_COLORS   =   5,    /* how many colour bands run along the line  */
+    N_THEMES        =   5,    /* colour themes to cycle with t/T          */
 
-    LEVEL_DRAW_TICKS = 60,    /* ticks to draw a whole level (~2 s @30fps) */
+    LEVEL_DRAW_TICKS = 60,    /* spread the draw over this many ticks (~2 s @30fps) */
 
-    /*
-     * MAX_SEGS must hold the largest level: 3 × 4^MAX_LEVEL.
-     * Level 5 → 3 × 1024 = 3072.  4096 gives a safe margin.
-     */
+    /* Big enough for the busiest level. Each level quadruples the edge
+     * count; level 5 is 3072 edges, so 4096 leaves headroom. */
     MAX_SEGS        = 4096,
 
     CANVAS_ROWS_MAX =  80,
@@ -158,13 +58,11 @@ enum {
     FPS_UPDATE_MS   = 500,
 };
 
-/*
- * ASPECT_R — terminal cell height / width ≈ 2.  Corrects for non-square cells
- * so the snowflake looks circular rather than squashed.
- *
- * SIN60 / COS60 — the 60° rotation used to find the bump peak.
- */
+/* Terminal characters are about twice as tall as they are wide, so without a
+ * fudge the snowflake comes out squashed. ASPECT_R squeezes it back to round. */
 #define ASPECT_R  2.0f
+/* The bump in the middle of each edge is an equilateral triangle, so finding
+ * its tip means turning a direction by 60 degrees. These are sin/cos of 60. */
 #define SIN60     0.8660254f
 #define COS60     0.5f
 
@@ -173,36 +71,37 @@ enum {
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
 /*
- * ColorID — the colour-pair slots.  A drawn cell holds COL_K1..K5, the gradient
- * ALONG the curve (first segment drawn → last); the HUD pairs are theme-
- * independent so the text stays legible on any palette.
+ * ColorID — the slots ncurses uses for colour. K1..K5 are the five bands that
+ * run along the outline as it draws (K1 the first strokes, K5 the last), so the
+ * colour you see tells you how recently a stretch was drawn. The two HUD slots
+ * are kept separate from the themes so the on-screen text stays readable no
+ * matter which palette is active.
  */
 typedef enum {
-    COL_K1  = 1,   /* first segments drawn */
+    COL_K1  = 1,   /* earliest strokes */
     COL_K2  = 2,
     COL_K3  = 3,
     COL_K4  = 4,
-    COL_K5  = 5,   /* last segments drawn  */
-    COL_HUD = 6,   /* top data lines    — yellow */
-    COL_HINT = 7,  /* bottom action bar — cyan   */
+    COL_K5  = 5,   /* latest strokes   */
+    COL_HUD = 6,   /* top status text — yellow */
+    COL_HINT = 7,  /* bottom key bar  — cyan   */
 } ColorID;
 
 /*
- * Theme — a named 5-colour gradient painted ALONG the curve (K1 first segment
- * drawn → K5 last), cycled with t / T.
+ * Theme — a named set of five colours that shade the outline from start to end,
+ * swapped live with t / T.
  *
- * WHY a table of colours, not one: the snowflake is one continuous stroke, so a
- * gradient along draw-order turns "when was this drawn" into a visible hue — you
- * watch the colour sweep around the outline as it fills in.
- * CONTEXT: every value is kept in the bright half of the 256-cube so the whole
- * stroke stays legible on black (dim cube/gray indices vanish under A_DIM).
- * Adding a theme is a single table row — the palette-table pattern from
- * buddhabrot.c (ref [9]); the engine never changes.
+ * The snowflake is drawn as one long stroke, so colouring it by draw order
+ * (first strokes one colour, last strokes another) turns "when did this get
+ * drawn" into something you can see — the colour sweeps around as it fills in.
+ * Every colour here sits in the bright half of the palette on purpose: the dark
+ * end of the range disappears against a black terminal. To add a theme, just
+ * add a row; nothing else changes.
  */
 typedef struct {
-    const char *name;            /* shown in the HUD, e.g. "Aurora"          */
-    int fg256[N_KOCH_COLORS];    /* xterm-256 codes, K1..K5 (preferred)       */
-    int fg8[N_KOCH_COLORS];      /* 8-colour ANSI fallback, same K1..K5 order */
+    const char *name;            /* shown in the HUD, e.g. "Aurora"           */
+    int fg256[N_KOCH_COLORS];    /* the colours on a 256-colour terminal      */
+    int fg8[N_KOCH_COLORS];      /* fallback for old 8-colour terminals       */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -240,22 +139,20 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Vec2 — a point (or direction) in the snowflake's continuous Euclidean plane.
+ * Vec2 — a point (or an arrow pointing somewhere) on the flat plane the
+ * snowflake lives on.
  *
- * WHY name the type: the whole curve is built from these, and the Koch rule (§4)
- * is pure 2-D vector geometry — thirds along an edge, a +60° rotation for the
- * bump.  Giving the pair a name lets §4 read like the formula (ref [1]) instead
- * of a tangle of x1/y1/x2/y2 floats.
- * CONTEXT: coordinates are resolution-independent — the snowflake is defined at
- * circumradius 1, centred on the origin, and only mapped to cells at draw time
- * (canvas_project, §6).  So the geometry never depends on terminal size.
+ * The shape is described in its own clean coordinates that have nothing to do
+ * with the terminal: it sits centred on the origin at size 1, and only gets
+ * mapped onto actual character cells when it's time to draw (canvas_project).
+ * That keeps the math simple and means the shape never depends on window size.
  */
 typedef struct {
-    float x;   /* horizontal, +x right; the triangle spans x ∈ [−√3/2, √3/2] */
-    float y;   /* vertical,   +y up;    apex at y = 1, base at y = −1/2       */
+    float x;   /* left-right, bigger is right */
+    float y;   /* up-down,    bigger is up    */
 } Vec2;
 
-/* b − a, used as a direction vector */
+/* The arrow from b to a (i.e. a − b): which way you'd go from b to reach a. */
 static inline Vec2 vec2_sub(Vec2 a, Vec2 b) { return (Vec2){ a.x - b.x, a.y - b.y }; }
 
 /* ===================================================================== */
@@ -263,37 +160,37 @@ static inline Vec2 vec2_sub(Vec2 a, Vec2 b) { return (Vec2){ a.x - b.x, a.y - b.
 /* ===================================================================== */
 
 /*
- * Segment — one straight edge A→B of the curve, in Euclidean coordinates.
- * The atom of the whole construction: subdivision turns one Segment into four
- * (ref [1]), and the final curve is just an ordered array of them.  Order is the
- * walk around the outline, which is also the draw order the gradient follows.
+ * Segment — one straight piece of the outline, from point a to point b. This is
+ * the building block of everything: the bump rule turns one segment into four,
+ * and the finished snowflake is just a list of these in the order you'd walk
+ * around the edge — which is also the order they're drawn and coloured.
  */
 typedef struct {
-    Vec2 a;   /* start point of the edge */
-    Vec2 b;   /* end point   of the edge */
+    Vec2 a;   /* where this piece starts */
+    Vec2 b;   /* where it ends           */
 } Segment;
 
 /*
- * KochCurve — the fractal flattened to an ordered list of segments at one fold
- * level.  koch_build fills it; the renderer (§6) just walks seg[0..count).
+ * KochCurve — the whole snowflake at one detail level, laid out flat as a plain
+ * list of segments. koch_build fills it once; drawing then just walks the list.
  *
- * WHY flatten instead of recurse at draw time: building once into an array means
- * the hot loop is a linear scan (no per-frame recursion, no malloc), and the
- * stroke order gives the colour gradient and the reveal animation for free.
- * SIZING: at level n the 3 triangle edges become 3·4ⁿ segments (ref [3]); seg[]
- * is sized for the largest level (see MAX_SEGS in §1).
+ * It's built into an array up front rather than figured out fresh every frame,
+ * so the drawing loop is a simple sweep with no recursion or allocation while
+ * it runs. The walk order also gives the colour shading and the draw animation
+ * for free. Each level has four times as many segments as the one below, and
+ * seg[] is sized for the busiest level (MAX_SEGS).
  */
 typedef struct {
-    int     level;            /* fold depth this was built at, 1..MAX_LEVEL    */
-    int     count;            /* live segments in seg[]; equals 3·4^level      */
-    Segment seg[MAX_SEGS];    /* the outline, in walk order (= draw/colour order) */
+    int     level;            /* current detail level, 1..MAX_LEVEL            */
+    int     count;            /* how many segments are actually in seg[]        */
+    Segment seg[MAX_SEGS];    /* the outline, in walk-around (= draw) order      */
 } KochCurve;
 
 /*
- * koch_subdivide — THE rule.  Replace edge A→B with four edges A→P→M→Q→B:
- *   P, Q  cut the edge into thirds
- *   M     pushes the middle third out into an equilateral bump (rotate +60°)
- * Recurse on each of the four until depth 0, where the segment is emitted.
+ * koch_subdivide — the bump rule, applied recursively. Take edge a→b, find the
+ * two points a third and two-thirds of the way along, push the middle out into a
+ * little triangular tip, and you now have four shorter edges a→p→m→q→b. Keep
+ * doing that to each of the four until `depth` runs out, then record the edge.
  */
 static void koch_subdivide(KochCurve *k, Vec2 a, Vec2 b, int depth)
 {
@@ -301,12 +198,14 @@ static void koch_subdivide(KochCurve *k, Vec2 a, Vec2 b, int depth)
         if (k->count < MAX_SEGS) k->seg[k->count++] = (Segment){ a, b };
         return;
     }
-    /* P, Q cut the edge into thirds; M is the middle third rotated +60° outward */
+    /* p and q split the edge into three equal parts. m is the middle part's tip:
+     * take the middle third as a direction, turn it 60 degrees so it points
+     * outward, and that lands you on the peak of the bump. */
     Vec2 p = { a.x + (b.x - a.x) / 3.0f,        a.y + (b.y - a.y) / 3.0f };
     Vec2 q = { a.x + (b.x - a.x) * 2.0f / 3.0f, a.y + (b.y - a.y) * 2.0f / 3.0f };
-    Vec2 d = vec2_sub(q, p);                     /* the middle third, as a vector */
-    Vec2 m = { p.x + COS60 * d.x - SIN60 * d.y,  /* d rotated +60° (2-D rotation), */
-               p.y + SIN60 * d.x + COS60 * d.y };/* offset from P → the bump peak  */
+    Vec2 d = vec2_sub(q, p);
+    Vec2 m = { p.x + COS60 * d.x - SIN60 * d.y,
+               p.y + SIN60 * d.x + COS60 * d.y };
 
     koch_subdivide(k, a, p, depth - 1);
     koch_subdivide(k, p, m, depth - 1);
@@ -315,11 +214,9 @@ static void koch_subdivide(KochCurve *k, Vec2 a, Vec2 b, int depth)
 }
 
 /*
- * koch_build — start from a CW equilateral triangle (circumradius 1) and
- * subdivide each edge to `level`.
- *   V1 = (0, 1)        top
- *   V2 = (√3/2, −1/2)  bottom-right
- *   V3 = (−√3/2, −1/2) bottom-left
+ * koch_build — make the snowflake by starting from a plain triangle and bumping
+ * every edge `level` times. The three corners sit at the top, bottom-right, and
+ * bottom-left of a triangle centred on the origin.
  */
 static void koch_build(KochCurve *k, int level)
 {
@@ -341,8 +238,9 @@ static void koch_build(KochCurve *k, int level)
 /* ===================================================================== */
 
 /*
- * curve_band — colour band 1..N_KOCH_COLORS for the segment at draw index `idx`,
- * so the colour sweeps along the curve from K1 (first drawn) to K5 (last).
+ * curve_band — which of the five colour bands a segment belongs to, based on how
+ * far along the outline it sits. Early segments get band 1, late ones band 5, so
+ * the colour shifts smoothly as the drawing sweeps around.
  */
 static uint8_t curve_band(int idx, int count)
 {
@@ -350,7 +248,7 @@ static uint8_t curve_band(int idx, int count)
     return (uint8_t)(band > N_KOCH_COLORS ? N_KOCH_COLORS : band);
 }
 
-/* Bind the five curve bands (COL_K1..K5) to the active theme. */
+/* Point the five outline colours at whichever theme is currently selected. */
 static void theme_apply(int theme)
 {
     const Theme *t = &k_themes[theme];
@@ -362,7 +260,8 @@ static void theme_apply(int theme)
 static void color_init(void)
 {
     start_color();
-    /* HUD/HINT are theme-independent — yellow data, cyan actions on any palette */
+    /* The HUD colours don't follow the themes — yellow status, cyan keys, so the
+     * text reads clearly whatever palette the outline is using. */
     if (COLORS >= 256) {
         init_pair(COL_HUD,  226, COLOR_BLACK);
         init_pair(COL_HINT,  51, COLOR_BLACK);
@@ -370,7 +269,7 @@ static void color_init(void)
         init_pair(COL_HUD,  COLOR_YELLOW, COLOR_BLACK);
         init_pair(COL_HINT, COLOR_CYAN,   COLOR_BLACK);
     }
-    theme_apply(0);   /* Aurora; Scene.theme tracks the active one thereafter */
+    theme_apply(0);   /* start on Aurora; Scene.theme tracks it from here on */
 }
 
 /* ===================================================================== */
@@ -378,30 +277,31 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * Cell — an integer terminal cell (column, row): where a continuous Euclidean
- * point lands after projection.  The bridge between the float world (Vec2) and
- * the character grid — canvas_project makes one, canvas_stroke walks between two.
+ * Cell — a spot on the character grid (column, row): where one of the
+ * snowflake's points ends up once it's mapped onto the screen. It's the bridge
+ * between the smooth-coordinate world (Vec2) and the blocky terminal grid.
  */
 typedef struct {
-    int col;   /* terminal column (x), 0 = left */
-    int row;   /* terminal row    (y), 0 = top  */
+    int col;   /* column, 0 = left */
+    int row;   /* row,    0 = top  */
 } Cell;
 
 /*
- * Canvas — the picture in memory: one ColorID per terminal cell, plus the lens
- * that maps the unit snowflake onto those cells.
+ * Canvas — the picture held in memory: a grid that remembers a colour for every
+ * character cell, plus the settings for fitting the snowflake onto that grid.
  *
- * WHY a buffer instead of drawing straight to ncurses: it splits "where does the
- * geometry land + what colour" (the fractal) from "push bytes to the terminal"
- * (canvas_paint).  The reveal animation also just re-paints the same buffer.
- * PROJECTION (ref [6] for the stroke that fills it): a point is centred, scaled
- * by `scale` columns per Euclidean unit, and its row divided by ASPECT_R so the
- * shape reads as a circle on tall terminal cells rather than a squashed oval.
+ * Drawing into a buffer first (instead of straight to the terminal) keeps two
+ * jobs apart: working out where the shape lands and what colour it is, versus
+ * actually pushing characters to the screen (canvas_paint). The draw animation
+ * is just repainting this same grid as it fills up.
+ *
+ * `scale` is how many columns one unit of the shape stretches to, and rows get
+ * divided by ASPECT_R so the snowflake looks round rather than tall and squashed.
  */
 typedef struct {
-    int     rows, cols;                              /* live drawing area in cells   */
-    float   scale;                                   /* columns per Euclidean unit   */
-    uint8_t cell[CANVAS_ROWS_MAX][CANVAS_COLS_MAX];  /* 0 = empty, else COL_K1..K5   */
+    int     rows, cols;                              /* drawing area, in cells       */
+    float   scale;                                   /* columns per unit of the shape */
+    uint8_t cell[CANVAS_ROWS_MAX][CANVAS_COLS_MAX];  /* 0 = blank, else a colour band */
 } Canvas;
 
 static void canvas_reset(Canvas *cv, int cols, int rows)
@@ -412,13 +312,15 @@ static void canvas_reset(Canvas *cv, int cols, int rows)
     cv->rows = rows;
     memset(cv->cell, 0, sizeof cv->cell);
 
-    /* fit the radius-1 shape, constrained by both width and height */
+    /* Size the shape to fit, picking whichever of width or height is tighter so
+     * it never spills off the screen. */
     float by_cols = (float)cols * 0.45f;
     float by_rows = (float)rows * 0.45f * ASPECT_R;
     cv->scale = (by_cols < by_rows) ? by_cols : by_rows;
 }
 
-/* project a Euclidean point to a terminal cell (centred, aspect-corrected) */
+/* Turn one of the snowflake's points into a grid cell: centre it, scale it up,
+ * and correct for the tall-character squash. */
 static Cell canvas_project(const Canvas *cv, Vec2 p)
 {
     return (Cell){
@@ -428,8 +330,9 @@ static Cell canvas_project(const Canvas *cv, Vec2 p)
 }
 
 /*
- * canvas_stroke — rasterise one segment into the cell buffer with Bresenham's
- * line algorithm (the standard integer DDA — no floating point per pixel).
+ * canvas_stroke — draw one straight segment into the grid, one cell at a time.
+ * It uses Bresenham's line algorithm, the classic trick for drawing a straight
+ * line on a grid using only whole-number steps (no decimals per cell).
  */
 static void canvas_stroke(Canvas *cv, Segment s, uint8_t color)
 {
@@ -457,7 +360,7 @@ static void canvas_paint(const Canvas *cv, WINDOW *w)
             uint8_t c = cv->cell[row][col];
             if (c == 0) continue;
             attr_t attr = COLOR_PAIR((int)c);
-            if (c >= COL_K4) attr |= A_BOLD;          /* brighten the late strokes */
+            if (c >= COL_K4) attr |= A_BOLD;          /* make the newest strokes pop */
             wattron(w, attr);
             mvwaddch(w, row, col, (chtype)'*');
             wattroff(w, attr);
@@ -470,28 +373,27 @@ static void canvas_paint(const Canvas *cv, WINDOW *w)
 /* ===================================================================== */
 
 /*
- * Reveal — the stroke-by-stroke draw progress: how much of the curve is on
- * screen and how fast more appears.
+ * Reveal — tracks how much of the outline has been drawn so far and how quickly
+ * the rest keeps appearing.
  *
- * WHY animate at all: drawing the outline in walk order makes the construction
- * legible — you see the gradient sweep around as edges fill in, instead of the
- * finished shape popping in at once.  `drawn` climbs by `per_tick` each tick
- * until it reaches curve.count, then the picture simply holds (no auto-advance).
- * TUNING: per_tick is derived from the segment count so every level finishes in
- * roughly the same wall-clock time (~LEVEL_DRAW_TICKS), whether it's 12 segments
- * or 3072 — see reveal_begin.
+ * Drawing the outline gradually, in order, is what lets you watch it being made
+ * and see the colour sweep around — rather than the whole shape just popping
+ * into view. `drawn` grows by `per_tick` segments each tick until the outline is
+ * finished, then it holds (it won't move to the next level on its own).
+ * `per_tick` is set from the segment count so every level takes about the same
+ * amount of time on the clock, whether it's a dozen segments or a few thousand.
  */
 typedef struct {
-    int  drawn;       /* segments painted so far, 0..curve.count           */
-    int  per_tick;    /* segments added each tick (∝ count, set by reveal_begin) */
-    bool paused;      /* spc/p freezes the reveal; survives level change & resize */
+    int  drawn;       /* how many segments are on screen so far               */
+    int  per_tick;    /* how many more to add each tick (set by reveal_begin)  */
+    bool paused;      /* frozen by spc/p; stays frozen across level/resize     */
 } Reveal;
 
 static void reveal_begin(Reveal *r, int count)
 {
     r->drawn    = 0;
     r->per_tick = count / LEVEL_DRAW_TICKS + 1;
-    /* paused is left as-is, so it survives a level change / resize */
+    /* deliberately don't touch `paused` — a pause should survive a level change */
 }
 
 static bool reveal_complete(const Reveal *r, int count) { return r->drawn >= count; }
@@ -501,25 +403,25 @@ static bool reveal_complete(const Reveal *r, int count) { return r->drawn >= cou
 /* ===================================================================== */
 
 /*
- * Scene — the whole live picture in one place: the geometry, the buffer it's
- * painted into, the animation that fills it, and the active palette.
+ * Scene — everything making up the live picture, in one place: the shape, the
+ * grid it's painted onto, the draw-in animation, and the current colour theme.
  *
- * WHY group them: they share a lifecycle.  A level change, a reset, or a resize
- * rebuilds the curve, re-fits the canvas, and restarts the reveal together; one
- * struct keeps those moves atomic and gives the §10 input layer a single handle
- * to act on.  The split mirrors the pipeline: geometry → buffer → reveal → colour.
+ * These belong together because they change together. Stepping a level,
+ * resetting, or resizing all rebuild the shape, refit the grid, and restart the
+ * animation as one move, and the input handling in §10 has a single thing to act
+ * on.
  */
 typedef struct {
-    KochCurve curve;     /* the fractal geometry at the current level   */
-    Canvas    canvas;    /* the cell buffer it's projected & drawn into  */
-    Reveal    reveal;    /* how far the stroke-by-stroke draw has got    */
-    int       theme;     /* index into k_themes, cycled with t / T       */
+    KochCurve curve;     /* the shape at the current detail level        */
+    Canvas    canvas;    /* the grid it's drawn onto                      */
+    Reveal    reveal;    /* how far the draw-in has got                   */
+    int       theme;     /* which colour theme, cycled with t / T         */
 } Scene;
 
 /*
- * scene_setup — (re)build the snowflake at `level` for the current screen size:
- * size the canvas, build the curve, restart the reveal.  Leaves theme and the
- * paused flag alone, so resize / next-level keep them.
+ * scene_setup — (re)build the snowflake at a given level for the current window
+ * size. It rebuilds the shape, refits the grid, and restarts the draw-in, but
+ * leaves the theme and the pause state alone so a resize or level step keeps them.
  */
 static void scene_setup(Scene *s, int cols, int rows, int level)
 {
@@ -528,7 +430,7 @@ static void scene_setup(Scene *s, int cols, int rows, int level)
     reveal_begin(&s->reveal, s->curve.count);
 }
 
-/* First start / reset: the default level (theme & paused stay at BSS defaults). */
+/* Used for the first start and for reset: go back to the default level. */
 static void scene_init(Scene *s, int cols, int rows)
 {
     scene_setup(s, cols, rows, DEFAULT_LEVEL);
@@ -536,7 +438,7 @@ static void scene_init(Scene *s, int cols, int rows)
 
 static void scene_next_level(Scene *s, int cols, int rows)
 {
-    scene_setup(s, cols, rows, s->curve.level % MAX_LEVEL + 1);   /* wraps 5 → 1 */
+    scene_setup(s, cols, rows, s->curve.level % MAX_LEVEL + 1);   /* loops back to 1 after the top */
 }
 
 static void scene_cycle_theme(Scene *s)
@@ -546,8 +448,8 @@ static void scene_cycle_theme(Scene *s)
 }
 
 /*
- * scene_tick — draw the next batch of strokes.  Holds once the level is fully
- * drawn (no auto-advance — press 'n' for the next level).
+ * scene_tick — draw the next handful of strokes. Once the outline is complete it
+ * just sits there; press 'n' to move on to the next level.
  */
 static void scene_tick(Scene *s)
 {
@@ -570,13 +472,13 @@ static void scene_draw(const Scene *s, WINDOW *w) { canvas_paint(&s->canvas, w);
 /* ===================================================================== */
 
 /*
- * Screen — the terminal's current size, cached so layout (HUD position, canvas
- * fit) reads it without calling getmaxyx every frame.  Refreshed on init and on
- * every SIGWINCH (screen_resize); the canvas re-fits to whatever it holds.
+ * Screen — the terminal's current width and height, remembered so the layout
+ * doesn't have to ask ncurses for it every single frame. It's updated at startup
+ * and again whenever the window is resized.
  */
 typedef struct {
-    int cols;   /* terminal width  in cells (getmaxyx x) */
-    int rows;   /* terminal height in cells (getmaxyx y) */
+    int cols;   /* width  in characters */
+    int rows;   /* height in characters */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -602,8 +504,8 @@ static void screen_resize(Screen *s)
 }
 
 /*
- * hud_line — draw one HUD line at (row, x) in colour `pair`, clamped to the
- * terminal width so a long line never wraps onto the snowflake.
+ * hud_line — print one line of status text, trimmed to fit the window so a long
+ * line can't wrap around and scribble over the snowflake.
  */
 static void hud_line(int row, int x, int pair, attr_t bold, int cols, const char *str)
 {
@@ -615,10 +517,10 @@ static void hud_line(int row, int x, int pair, attr_t bold, int cols, const char
 }
 
 /*
- * HUD layout — top is data, bottom is actions:
- *   row 0      (bold,  right)  title, fps, run state
- *   row 1      (plain, left)   level N/total, theme, % complete, speed
- *   row rows-1 (cyan,  left)   every interactive key
+ * The status display: facts up top, keys along the bottom.
+ *   row 0      title, frame rate, and what it's doing
+ *   row 1      level, theme, how far along, and speed
+ *   last row   every key you can press
  */
 static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps)
 {
@@ -633,16 +535,16 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps)
 
     char buf[HUD_COLS + 1];
 
-    /* row 0 — primary data, right-aligned + bold */
+    /* row 0 — the headline, pushed to the right and bold */
     snprintf(buf, sizeof buf, " KochSnowflake  %5.1f fps  %s ", fps, state);
     hud_line(0, s->cols - (int)strlen(buf), COL_HUD, A_BOLD, s->cols, buf);
 
-    /* row 1 — parameter readouts, not bold so row 0 stays dominant */
+    /* row 1 — the details, kept un-bold so row 0 stands out */
     snprintf(buf, sizeof buf, " level %d/%d  theme:%s  %d%%  spd:%d Hz ",
              sc->curve.level, MAX_LEVEL, k_themes[sc->theme].name, pct, sim_fps);
     hud_line(1, 0, COL_HUD, A_NORMAL, s->cols, buf);
 
-    /* last row — actions, bright cyan + bold */
+    /* bottom row — the keys, in bright cyan */
     hud_line(s->rows - 1, 0, COL_HINT, A_BOLD, s->cols,
              " q:quit  n:next level  t:theme  r:reset  spc:pause  [ / ]:speed ");
 }
@@ -654,19 +556,19 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — the whole running program: what to draw (scene), where (screen), and how
- * fast the reveal advances (sim_fps).  One value lives in main as static (BSS)
- * because Scene embeds the large seg[]/cell[] arrays — too big for the stack.
- * It's the single object every input handler and the main loop mutate.
+ * App — the running program bundled together: the picture (scene), the window
+ * size (screen), and how fast the drawing animates (sim_fps). There's one of
+ * these, kept in fixed storage rather than on the stack because Scene holds some
+ * big arrays. Every key press and the main loop work on this one object.
  */
 typedef struct {
-    Scene  scene;       /* the live picture (geometry + canvas + reveal + theme) */
-    Screen screen;      /* cached terminal size for layout                       */
-    int    sim_fps;     /* reveal ticks/sec, SIM_FPS_MIN..MAX, stepped by [ / ]  */
+    Scene  scene;       /* the live picture                                      */
+    Screen screen;      /* the window size                                       */
+    int    sim_fps;     /* animation speed, stepped by [ and ]                   */
 } App;
 
-/* The only globals: POSIX signal handlers take no arguments, so they must
- * write a flag the main loop polls. */
+/* These two are global because signal handlers can't take arguments — all they
+ * can do is set a flag that the main loop checks each time around. */
 static volatile sig_atomic_t g_should_quit   = 0;
 static volatile sig_atomic_t g_should_resize = 0;
 
@@ -681,7 +583,7 @@ static void cleanup(void) { endwin(); }
 static void app_resize(App *a)
 {
     screen_resize(&a->screen);
-    /* preserve the current level across a resize (only the fit scale changes) */
+    /* stay on the same level after a resize — only the fit-to-window size changes */
     scene_setup(&a->scene, a->screen.cols, a->screen.rows, a->scene.curve.level);
     g_should_resize = 0;
 }
@@ -708,7 +610,7 @@ static bool app_handle_key(App *a, int ch)
         break;
 
     case 'r': case 'R':
-        scene_init(&a->scene, a->screen.cols, a->screen.rows);   /* default level */
+        scene_init(&a->scene, a->screen.cols, a->screen.rows);   /* back to the default level */
         break;
 
     case 'p': case 'P': case ' ':
@@ -730,7 +632,7 @@ int main(void)
     signal(SIGTERM,  on_signal);
     signal(SIGWINCH, on_signal);
 
-    /* static (BSS) — Scene holds large arrays; keep them off the stack */
+    /* not on the stack — App contains big arrays that wouldn't comfortably fit */
     static App app = { .sim_fps = SIM_FPS_DEFAULT };
 
     screen_init(&app.screen);

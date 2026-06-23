@@ -1,284 +1,26 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * worley_cellular_noise.c
- *   — Steven Worley's cellular / Voronoi-style noise, 30 patterns
- *     across 6 tiers.
+ * worley_cellular_noise.c — Steven Worley's cellular noise, the "scatter
+ * random dots and shade every point by how far it is from the nearest dot"
+ * texture. One hidden dot per grid tile; 30 different ways to turn those
+ * distances into a picture, in 6 groups you cycle with n/p. The dots drift
+ * slowly so the whole thing breathes instead of freezing.
  *
- * DEMO: A scattered field of "feature points" — one per integer tile
- *       of noise space — drives 30 visually distinct patterns, all
- *       genuinely derived from the Worley/Voronoi primitive. For any
- *       cell on screen the algorithm finds the three nearest feature
- *       points among the 3×3 surrounding tiles, then the active
- *       pattern decides what to render with those distances. Patterns
- *       are grouped in 6 complexity tiers (cycle with n/p):
- *         Tier 1 F-FUNCTIONS — raw F_n outputs (F1, F2, F3, F2−F1,
- *                              F1/F2): the classic Worley building
- *                              blocks
- *         Tier 2 F-COMBOS    — other arithmetic on F values (F1+F2,
- *                              F1·F2, F3−F2, 1−(F2−F1), 1−F1)
- *         Tier 3 METRICS     — F1 with non-Euclidean distance norms
- *                              (Manhattan, Chebyshev, super-ellipse
- *                              Lp=3, star Lp=½, stretched anisotropic)
- *         Tier 4 IDENTITY    — cell_id hash drives a visual property
- *                              (solid colour, multiplicatively-weighted
- *                              Voronoi, twinkle, random glow, crackle)
- *         Tier 5 MULTI-SCALE — Worley fBm stacks (fBm, turbulence,
- *                              ridged, nested, checker)
- *         Tier 6 HYBRIDS     — Worley-on-Worley compositions
- *                              (domain warp, metric blend, halo,
- *                              energy, chaos)
- *       Feature points wobble slightly with time, so all patterns
- *       evolve organically rather than freezing.
+ * Sister files (the comparison the code can't show you):
+ *   ./domain_warped_noise_iq_style.c — Perlin noise: smooth rolling hills
+ *       instead of these hard-edged cells. Same "shade every cell" loop.
+ *   ../generational/voronoi_region_map.c — the same cell idea, but
+ *       precomputed once into a static map; this file computes on the fly.
  *
- * Study alongside:
- *   ./domain_warped_noise_iq_style.c — Perlin-based field showcases.
- *       Worley vs Perlin: same "evaluate a noise field at every cell"
- *       skeleton, but Worley is DISCRETE (distance to feature points)
- *       where Perlin is CONTINUOUS (smooth gradient noise). Perlin
- *       gives rolling hills; Worley gives cells with hard or soft
- *       edges depending on the chosen distance function.
- *   ../generational/voronoi_region_map.c — Worley's CELL_ID pattern
- *       is essentially a streaming Voronoi diagram. The voronoi file
- *       precomputes everything; this one evaluates on-demand and
- *       lets every cell's owner change as feature points wobble.
- *
- * Section map:
- *   §1 config   — grid, patterns, scale, themes
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — HUD reserved + 10 themes (4 palette colours each)
- *   §5 noise    — hash, feature-point sampling, F1/F2/F3 query
- *                  under N distance metrics
- *   §6 patterns — 30 noise mappings in 6 tiers + dispatch table
- *   §7 scene    — Field, scene state, per-frame grid update
- *   §8 screen   — ASCII render: density-graded glyphs
- *   §9 app      — signals, resize, main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reset (new feature-point hash seed)
- *   n / N      next pattern
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      faster wobble drift
- *   -          slower
- *   ] / [      raise / lower tick Hz
+ * Reference: Worley, S. (1996) "A cellular texture basis function",
+ *   SIGGRAPH'96 — the original paper. The F1/F2/F3 naming and the
+ *   3x3-tile search both come from here.
+ *   https://dl.acm.org/doi/10.1145/237170.237267
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra worley_cellular_noise.c \
  *       -o worley -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Worley noise (Worley 1996, "A cellular texture basis
- *                  function"). Divide the plane into integer-aligned
- *                  unit tiles. Each tile contains exactly one "feature
- *                  point" whose sub-tile position is determined by a
- *                  deterministic hash of the tile coordinates plus a
- *                  per-run seed. To evaluate the noise at a query
- *                  point (x, y):
- *                    1. Find the integer tile (xi, yi) containing it.
- *                    2. For each of the 3×3 neighbouring tiles
- *                       (xi+dx, yi+dy), dx, dy ∈ {-1, 0, 1}:
- *                       a. Hash the tile coords to get the feature
- *                          point's position in [0, 1)² inside the tile.
- *                       b. Compute the Euclidean (or Manhattan, or
- *                          Chebyshev) distance from (x, y) to that
- *                          point.
- *                    3. Track F1 = nearest, F2 = second-nearest.
- *                  The 3×3 lookup is sufficient: any feature point in
- *                  a tile further than 1 cell away is necessarily
- *                  beyond distance √2, larger than any in-bounds F1
- *                  candidate. The function is fast (constant work per
- *                  query) and produces patterns whose CELL STRUCTURE
- *                  matches a Voronoi diagram of the feature points.
- *
- *                  Thirty patterns, organised into six tiers, build on
- *                  this primitive: raw F_n values (F1/F2/F3/F2−F1/…),
- *                  arithmetic combos, alternative distance metrics
- *                  (Manhattan/Chebyshev/Minkowski-p), cell-id-driven
- *                  effects (multiplicatively-weighted Voronoi,
- *                  twinkle), Worley fBm stacks at multiple scales,
- *                  and Worley-on-Worley compositions (domain warp,
- *                  metric blend, halo). They share the same query
- *                  loop; only the metric and the post-query mapping
- *                  differ.
- *
- * Data-structure : One uint32_t hash seed (re-rolled at reset) and a
- *                  hash function — no pre-allocated point list. Every
- *                  feature point is implicit: (cx, cy) → hash → (ox, oy).
- *                  That makes Worley noise infinite-extent and
- *                  zero-memory; we don't store any of it.
- *
- *                  Per-cell glow + colour buffers as in the other
- *                  field showcases. Field overwritten each frame.
- *
- * Rendering      : ASCII only. Density-graded glyphs ('.', '*', '#')
- *                  in 4 theme palette colours. Pattern picks both glow
- *                  and colour band from F1/F2/F3 and the cell identity.
- *                  Animation: each feature point wobbles with a phase
- *                  derived from its hash + a time accumulator, so cell
- *                  boundaries breathe and shift slowly.
- *
- * Performance    : 1+ worley_query per cell per frame. Each query
- *                  examines N_WORLEY_NEIGHBOURS (9) tiles → 9 hashes
- *                  + 9 distance computations. Tier 1-4 patterns call
- *                  worley_query once; Tier 5 (multi-scale fBm) and
- *                  Tier 6 (hybrids) call it 2-3 times. On a 200×56
- *                  grid at 60 Hz that's ~6 M hashes/sec for Tier 1-4
- *                  and up to ~18 M/sec for the heaviest patterns —
- *                  still well under CPU budget. The hash itself is a
- *                  4-mul integer mixer; no float math beyond the
- *                  distance calculation.
- *
- * References     : CELLULAR / VORONOI THEORY
- *                  • Worley, S. (1996) — "A cellular texture basis
- *                    function", SIGGRAPH'96. The original paper.
- *                    F1/F2/F3 conventions and the 3×3-tile lookup
- *                    invariant come from here:
- *                    https://dl.acm.org/doi/10.1145/237170.237267
- *                  • Ebert, Musgrave, Peachey, Perlin, Worley —
- *                    "Texturing & Modeling: A Procedural Approach"
- *                    (Morgan Kaufmann, 3rd ed. 2002, ISBN
- *                    1-55860-848-6). Worley's own chapter expands
- *                    the F_n combos used in Tier 1-2 (F1+F2, F1·F2,
- *                    F3−F2 …) and discusses the metric variants of
- *                    Tier 3.
- *                  • Aurenhammer, F. (1991) — "Voronoi diagrams: a
- *                    survey of a fundamental geometric data
- *                    structure", ACM Comput. Surv. 23(3). Reference
- *                    for the multiplicatively-weighted Voronoi
- *                    diagram (Tier 4 WEIGHTED) and the metric-
- *                    dependent cell shapes (Tier 3):
- *                    https://dl.acm.org/doi/10.1145/116873.116880
- *
- *                  WORLEY-DERIVED PATTERNS (the 30 patterns)
- *                  • Quilez, I. — "Voronoi - basic / Voronoi lines".
- *                    The F2 − F1 edge trick (this file's default
- *                    boot pattern), with the "thinness multiplier"
- *                    explained:
- *                    https://iquilezles.org/articles/voronoilines/
- *                  • Quilez, I. — "Voronoise". Parameterised
- *                    interpolation between cellular noise and a
- *                    Perlin-like smooth field; generalises Tier 4
- *                    RANDOM_GLOW / TWINKLE:
- *                    https://iquilezles.org/articles/voronoise/
- *                  • Quilez, I. — "Domain warping". Direct source
- *                    for Tier 6 DOMAIN_WARP and CHAOS — IQ's
- *                    fbm(p + fbm(p)) construction applies to
- *                    Worley fields just as well:
- *                    https://iquilezles.org/articles/warp/
- *
- *                  ASCII RENDERING (noise → terminal)
- *                  • Bourke, P. — "Character representation of grey
- *                    scale images". Source of the canonical luminance
- *                    ramps; the GlyphRamp '.', '*', '#' here is a
- *                    coarse subset of Bourke's 10-char ramp:
- *                    http://paulbourke.net/dataformats/asciiart/
- *                  • Wikipedia — "ANSI escape code § 8-bit". The
- *                    xterm/ANSI 256-colour palette (16 system + 6³
- *                    cube + 24 greys) that themes[] in §1 indexes:
- *                    https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit
- *                  • Padala, P. — "NCURSES Programming HOWTO".
- *                    Pragmatic reference for the §3/§8 rendering
- *                    APIs (init_pair, mvaddch, doupdate, A_BOLD):
- *                    https://tldp.org/HOWTO/NCURSES-Programming-HOWTO/
- *
- *                  COMPARE IN PROJECT
- *                  • ./simplex_noise_clouds.c — simplex's smooth
- *                    gradient field vs Worley's discrete cells;
- *                    same fBm idea, very different visuals.
- *                  • ./perin_noise_flow_showcase.c — Perlin's 1985
- *                    predecessor (gradient noise, not cellular).
- *                  • ../generational/voronoi_region_map.c — a
- *                    precomputed Voronoi diagram (static lattice)
- *                    vs this file's on-demand feature-point hashing
- *                    (streaming, wobbling).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Scatter random "stars" across a grid, one per square tile. For any
- * point in space, ask "how far am I from the closest star?". That
- * distance is your noise value. Repeat for every screen cell and you
- * get a cellular pattern — dark near each star, brighter as you move
- * away from any star, brightest along the lines exactly between two
- * stars. Different distance metrics (Euclidean / Manhattan /
- * Chebyshev) produce different cell shapes (circles / diamonds /
- * squares). Different functions of the distances (F1 / F2 / F2-F1)
- * highlight different features (centres / edges / blobs).
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Each tile of the grid harbours one hidden firefly. The firefly's
- * exact position in the tile is determined by a HASH — the same tile
- * coordinates always give the same firefly position, but two adjacent
- * tiles see un-correlated positions. To shade any pixel, ask: "of
- * the 9 nearby fireflies (this tile + 8 neighbours), which is closest?"
- * Use that distance as the brightness. The result is a pattern where
- * every firefly is at a dark centre, bordered by bright "moats"
- * exactly halfway to its neighbours.
- *
- * Visible layers:
- *   1. The CELL STRUCTURE — visible in every pattern as the locus of
- *      brightest cells, which traces the Voronoi diagram of the
- *      hidden feature points.
- *   2. The PATTERN-SPECIFIC mapping — what we DO with F1/F2/F3 and
- *      cell-id determines whether centres or edges are bright,
- *      whether cells are circles or diamonds, whether each cell has
- *      its own colour or fades smoothly into the next.
- *   3. The TIME WOBBLE — feature points oscillate slightly within
- *      their tiles, so cell boundaries shift continuously. The Voronoi
- *      structure is visible but never frozen.
- *
- * ALGORITHM IN STEPS  (per cell, per frame)
- * ──────────────────
- *  1. Convert cell coordinate to noise space: (fx, fy) = (x, y) ·
- *     NOISE_SCALE.
- *  2. Find integer tile: (xi, yi) = (⌊fx⌋, ⌊fy⌋).
- *  3. Initialise F1 = F2 = F3 = +∞, cell_id = 0.
- *  4. For each of the 9 tiles around (xi, yi):
- *     a. Hash tile coords + run-seed → 32-bit value h.
- *     b. Extract (ox, oy) ∈ [0, 1)² from h's bits.
- *     c. Wobble: ox += A · sin(t + phase_x); oy += A · cos(t + phase_y).
- *        Phases come from other bits of h so neighbouring fireflies
- *        wobble at different rates.
- *     d. Feature point position: (cx + ox, cy + oy).
- *     e. Distance d to (fx, fy) under the active metric.
- *     f. If d < F1: F3=F2; F2=F1; F1=d; cell_id=h.
- *        Else if d < F2: F3=F2; F2=d.
- *        Else if d < F3: F3=d.
- *  5. Pattern function: turn (F1, F2, F3, cell_id) into (glow, colour
- *     band). Tier-5 and Tier-6 patterns call worley_query multiple
- *     times (different scales / different metrics / warped coords)
- *     and combine the results.
- *  6. Write to GlowField.glow[cell] and GlowField.band[cell].
- *
- * KEY FORMULAS
- * ────────────
- *  Hash mixer (32-bit)         : h = mix(xi · 374761393 + yi · 668265263 + seed)
- *  Feature pos in tile         : (ox, oy) = (high_16(h), low_16(h)) / 2¹⁶
- *  Wobble                      : ox' = ox + W · sin(t + phase),
- *                                oy' = oy + W · cos(t + phase)
- *  Euclidean distance (L²)     : √(Δx² + Δy²)
- *  Manhattan distance (L¹)     : |Δx| + |Δy|
- *  Chebyshev distance (L∞)     : max(|Δx|, |Δy|)
- *  Minkowski distance (Lp)     : (|Δx|^p + |Δy|^p)^(1/p)
- *  Star "metric" (L½, non-norm): (√|Δx| + √|Δy|)²
- *  F2 − F1 (edge highlight)    : near-zero on cell boundaries
- *  Worley fBm                  : Σᵢ aᵢ · F1(2ⁱ·x), aᵢ = 1/2ⁱ
- *  Weighted Voronoi            : argmin over points  d_i / w_i,
- *                                w_i = hash-derived "radius"; cells
- *                                with bigger w_i claim more territory
- *  Per-pattern formulas inline next to each pattern_* function in §6;
- *  dispatch table is `noise_patterns[]` (same section).
- *
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -313,178 +55,121 @@ enum {
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* ncurses colour-pair slots. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_BAND_BASE    =   3,    /* PAIR_BAND_BASE..+3 = 4 palette colours */
-    PAIR_FLASH        =   7,    /* vestigial — cross-file palette parity  */
+    PAIR_BAND_BASE    =   3,    /* the 4 palette colours live in slots 3..6 */
+    PAIR_FLASH        =   7,    /* unused here; kept so themes match sibling demos */
 };
 
 #define GLOW_THRESHOLD      0.05f
 
-/* ── HUD layout ──────────────────────────────────────────────────── *
- * Top HUD carries DATA, bottom HUD carries ACTIONS:
- *   row 0           : title + state bar (fps, Hz, pattern, drift)
- *   row 1           : pattern + theme + palette swatches + parameters
- *   row HUD_TOP..N-2: noise-field map
- *   row N-1         : keyboard action hint
- */
+/* The HUD reserves two rows at the top (title + status) and one at the
+ * bottom (key hints); the noise fills everything in between. */
 #define HUD_TOP_ROWS             2
 #define HUD_BOTTOM_ROWS          1
 #define HUD_BAND_RESERVED_ROWS   (HUD_TOP_ROWS + HUD_BOTTOM_ROWS)
 #define HUD_LEFT_MARGIN          1
 
-/* Noise scale: ~0.1 noise-units per cell → 1 tile every 10 cells →
- * about 20 × 6 = 120 cells across a 200 × 56 grid. */
+/* How zoomed-in the noise is: one tile (one hidden dot) every ~10 cells. */
 #define NOISE_SCALE         0.10f
 
-/* Field drift in noise-coord units per second (drives the wobble's
- * time component). */
+/* How fast the dots drift over time (the "breathing" speed). */
 #define FIELD_DRIFT         0.40f
 
-/* Wobble amplitude. Keep < 0.4 to ensure feature points stay roughly
- * inside their original tiles (preserves the 3×3 lookup invariant). */
+/* How far each dot wanders from its home spot. Keep under ~0.4 so dots
+ * stay roughly inside their own tile — that's what lets the 3x3 search
+ * below find the true nearest dot. */
 #define WOBBLE_AMOUNT       0.20f
 
-/* Drift multiplier — scaled by +/-, capped low so the cells don't
- * boil too aggressively. */
+/* Drift-speed multiplier, nudged by +/-. Capped low so cells don't boil. */
 #define DRIFT_MULT_MIN      1
 #define DRIFT_MULT_DEF      1
 #define DRIFT_MULT_MAX      16
 
-/* Density thresholds for the ASCII glyph ramp. */
+/* Brightness cutoffs for the three ASCII glyphs (faint/medium/dense). */
 #define GLYPH_HIGH_THRESH   0.65f
 #define GLYPH_MID_THRESH    0.30f
 
-/*
- * Palette quantisation — continuous glow ∈ [0, 1] → discrete band
- * index ∈ {0..3}. Same scheme as the simplex file.
- *
- *   N_PALETTE_BANDS    — # of tiers (matches Theme.band[] length).
- *   PALETTE_BAND_MASK  — cheap `& MASK` modulo (works because
- *                         N_PALETTE_BANDS is a power of two).
- *   GLOW_TO_BAND_GAIN  — glow * GAIN → int 0..3 via truncation.
- *                         Set to N_PALETTE_BANDS − ε so glow == 1.0
- *                         still floors to band 3 (not band 4).
- */
+/* Turning a brightness in [0,1] into one of 4 colour tiers. The gain is
+ * just under 4 so a brightness of exactly 1.0 lands in tier 3, not 4.
+ * The mask is a fast stand-in for "mod 4" (works because 4 is a power
+ * of two). */
 #define N_PALETTE_BANDS     4
 #define PALETTE_BAND_MASK   3       /* N_PALETTE_BANDS - 1 */
-#define GLOW_TO_BAND_GAIN   3.999f  /* almost-4 to keep glow=1.0 → band 3 */
+#define GLOW_TO_BAND_GAIN   3.999f
 
-/*
- * Worley algorithm sentinels & sizing.
- *
- *   WORLEY_DISTANCE_INF      — "no candidate seen yet" sentinel for
- *                               F1/F2/F3 in worley_result_empty.
- *                               Any plausible distance under our
- *                               metrics is < 5, so 1e10 is "definitely
- *                               larger than any real candidate".
- *   WORLEY_NEIGHBOUR_RADIUS  — radius of the 3×3 tile scan (=1).
- *                               Provably sufficient under L¹/L²/L∞
- *                               when WOBBLE_AMOUNT < 0.5; see CONCEPTS.
- *   N_WORLEY_NEIGHBOURS      — (2·R + 1)² = 9 tiles examined per query.
- */
+/* A starting "distance" so big that the first real dot always beats it
+ * (any real distance here is under 5). The search looks at the 3x3 block
+ * of tiles around a point — the nearest dot can't be further out than
+ * that as long as the wobble stays small. */
 #define WORLEY_DISTANCE_INF      1.0e10f
-#define WORLEY_NEIGHBOUR_RADIUS  1
-#define N_WORLEY_NEIGHBOURS      9
+#define WORLEY_NEIGHBOUR_RADIUS  1   /* 1 tile in each direction = 3x3 block */
+#define N_WORLEY_NEIGHBOURS      9   /* (2*1+1)^2 tiles checked per point */
 
-/*
- * Hash → unit-float / phase / byte conversions.
- *
- *   HASH_UNIT_FROM_16BIT  — convert a 16-bit hash slice (0..65535)
- *                            to a unit float in [0, 1]. Used by
- *                            hash_to_offset to place a feature point
- *                            inside its tile.
- *   HASH_UNIT_FROM_BYTE   — convert one hash byte (0..255) to [0, 1].
- *                            Used by Tier-4 patterns for per-cell
- *                            random properties.
- *   HASH_PHASE_FROM_BYTE  — convert one hash byte to a phase in
- *                            radians. /40 ≈ 2π/255 spans roughly one
- *                            full sine cycle, so different bytes
- *                            give visually independent wobble phases.
- *   HASH_PERSONALITY_SALT — XOR'd into cell_id before re-hashing in
- *                            cell_hash_to_unit. The 0xa5 alternating-
- *                            bits byte is a canonical debug pattern;
- *                            its role here is to decorrelate
- *                            consecutive cell_ids in the rare event
- *                            two adjacent cells hash close together.
- */
+/* Pulling small random numbers out of a 32-bit hash:
+ *   FROM_16BIT — a 16-bit chunk (0..65535) becomes a float in [0,1].
+ *   FROM_BYTE  — one byte (0..255) becomes a float in [0,1].
+ *   PHASE_FROM_BYTE — one byte becomes an angle, so different dots wobble
+ *                     out of step with each other.
+ *   PERSONALITY_SALT — mixed into a tile's id before re-hashing, so two
+ *                     neighbouring cells don't end up with similar values. */
 #define HASH_UNIT_FROM_16BIT    (1.0f / 65535.0f)
 #define HASH_UNIT_FROM_BYTE     (1.0f / 255.0f)
 #define HASH_PHASE_FROM_BYTE    (1.0f / 40.0f)
 #define HASH_PERSONALITY_SALT   0xa5a5a5a5u
 
-/*
- * Weighted Voronoi (Tier 4 WEIGHTED).
- *
- * Each feature point in the weighted variant has a "territory weight"
- * drawn from one hash byte:  w = WEIGHTED_W_MIN + b/255 · RANGE.
- * The cell boundary between two weighted points sits where d/w
- * equalises — points with larger w claim more area. [0.5, 1.5] gives
- * roughly 3:1 area asymmetry between the extreme cases.
- */
+/* Weighted variant (Tier 4 WEIGHTED): each dot gets a "pull" between 0.5
+ * and 1.5 from its hash. Dots with a stronger pull grab more territory,
+ * so cells come out unevenly sized instead of all about the same. */
 #define WEIGHTED_W_MIN          0.5f
-#define WEIGHTED_W_RANGE        1.0f   /* MAX = MIN + RANGE = 1.5 */
+#define WEIGHTED_W_RANGE        1.0f   /* so the max pull is 1.5 */
 
-/*
- * Stretched metric (Tier 3 STRETCHED). Anisotropic Manhattan:
- *   d = STRETCHED_X_WEIGHT · |Δx|  +  |Δy|
- * with x-weight > 1 the cells stretch along the y-axis (a horizontal
- * unit step costs more than a vertical one).
- */
+/* Stretched variant (Tier 3 STRETCHED): horizontal steps count double,
+ * which squashes the cells taller and thinner. */
 #define STRETCHED_X_WEIGHT      2.0f
 
 /*
- * Pattern — thirty Worley/Voronoi mappings, grouped into six
- * complexity tiers. Cycle with n/p. The enum order MUST match the
- * `noise_patterns[]` dispatch table in §6 (compiler enforces this
- * via the fixed-size [N_PATTERNS] array initialiser — a missing or
- * mis-ordered row is a compile error).
- *
- *   Tier 1 F-FUNCTIONS : F1, F2, F3, F2_F1, F1_OVER_F2
- *   Tier 2 F-COMBOS    : F1_PLUS_F2, F1_TIMES_F2, F3_F2,
- *                         F2_F1_INV, F1_INV
- *   Tier 3 METRICS     : MANHATTAN, CHEBYSHEV, SUPERELLIPSE,
- *                         STAR, STRETCHED
- *   Tier 4 IDENTITY    : CELL_ID, WEIGHTED, TWINKLE,
- *                         RANDOM_GLOW, CRACKLE
- *   Tier 5 MULTI-SCALE : WORLEY_FBM, WORLEY_TURBULENCE,
- *                         WORLEY_RIDGED, NESTED, CHECKER
- *   Tier 6 HYBRIDS     : DOMAIN_WARP, METRIC_BLEND, HALO,
- *                         ENERGY, CHAOS
+ * Pattern — the 30 ways to turn the distances into a picture, in 6
+ * groups. Cycle with n/p. This list MUST stay in the same order as the
+ * noise_patterns[] table in §6 — the compiler catches a mismatch because
+ * that table is a fixed [N_PATTERNS] array indexed by these names.
  */
 typedef enum {
-    /* Tier 1 — F-FUNCTIONS: raw F_n outputs */
+    /* Tier 1 — the raw distances: nearest dot, 2nd-nearest, 3rd, and
+     * a couple of simple combinations of them. */
     PATTERN_F1 = 0,
     PATTERN_F2,
     PATTERN_F3,
     PATTERN_F2_F1,
     PATTERN_F1_OVER_F2,
-    /* Tier 2 — F-COMBOS: arithmetic on F values */
+    /* Tier 2 — more arithmetic on those same distances. */
     PATTERN_F1_PLUS_F2,
     PATTERN_F1_TIMES_F2,
     PATTERN_F3_F2,
     PATTERN_F2_F1_INV,
     PATTERN_F1_INV,
-    /* Tier 3 — METRICS: F1 with different distance norms */
+    /* Tier 3 — same idea, different way of measuring distance, which
+     * changes the cell shape (diamonds, squares, stars...). */
     PATTERN_MANHATTAN,
     PATTERN_CHEBYSHEV,
     PATTERN_SUPERELLIPSE,
     PATTERN_STAR,
     PATTERN_STRETCHED,
-    /* Tier 4 — IDENTITY: cell_id hash drives a visual property */
+    /* Tier 4 — each cell's own random id picks its look (a fixed colour,
+     * its own flicker, etc.). */
     PATTERN_CELL_ID,
     PATTERN_WEIGHTED,
     PATTERN_TWINKLE,
     PATTERN_RANDOM_GLOW,
     PATTERN_CRACKLE,
-    /* Tier 5 — MULTI-SCALE: Worley fBm stacks */
+    /* Tier 5 — stack the noise at several zoom levels and add it up. */
     PATTERN_WORLEY_FBM,
     PATTERN_WORLEY_TURBULENCE,
     PATTERN_WORLEY_RIDGED,
     PATTERN_NESTED,
     PATTERN_CHECKER,
-    /* Tier 6 — HYBRIDS: Worley-on-Worley compositions */
+    /* Tier 6 — feed one noise field into another to smear or twist it. */
     PATTERN_DOMAIN_WARP,
     PATTERN_METRIC_BLEND,
     PATTERN_HALO,
@@ -493,25 +178,21 @@ typedef enum {
     N_PATTERNS,
 } Pattern;
 
-/* pattern_name() / pattern_tier() defined in §6 alongside dispatch table. */
+/* Defined in §6 next to the table they read from. */
 static const char *pattern_name(Pattern p);
 static const char *pattern_tier(Pattern p);
 
 /*
- * Distance metrics — Lp norms plus one anisotropic variant.
- * Used by worley_query as a per-call parameter; each pattern picks
- * its own (Tier 3 patterns vary the metric, the rest default to
- * Euclidean).
+ * Metric — the rule for "how far apart are two points", which decides
+ * what shape the cells come out. Passed into the search; most patterns
+ * use plain straight-line distance, the Tier-3 ones swap it out.
  *
- *   EUCLIDEAN    p = 2     — round cells (default; Worley's
- *                             original)
- *   MANHATTAN    p = 1     — diamond cells (L¹ taxicab)
- *   CHEBYSHEV    p = ∞     — square cells (L∞)
- *   SUPERELLIPSE p = 3     — rounded squares (Lp, p > 2)
- *   STAR         p = 0.5   — concave 4-pointed stars (not a true
- *                             metric; triangle inequality fails)
- *   STRETCHED    weighted  — Manhattan-like with 2× weight on x:
- *                             2|Δx| + |Δy| → cells stretched along y
+ *   EUCLIDEAN    straight-line distance — round cells (the default)
+ *   MANHATTAN    only-horizontal-and-vertical steps — diamond cells
+ *   CHEBYSHEV    the bigger of the two gaps — square cells
+ *   SUPERELLIPSE between round and square — rounded squares
+ *   STAR         a quirky measure that pinches inward — pointy stars
+ *   STRETCHED    Manhattan but horizontal counts double — tall cells
  */
 typedef enum {
     METRIC_EUCLIDEAN    = 0,
@@ -526,60 +207,30 @@ typedef enum {
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/*
- * Frame-loop timing limits.
- *
- *   MAX_FRAME_DT_NS    — cap per-frame dt at 100 ms before feeding
- *                         the fixed-timestep accumulator. Without
- *                         this cap, a long stall (debugger, SIGSTOP,
- *                         swap-storm) would queue thousands of sim
- *                         ticks to fire when the process resumes —
- *                         the "spiral of death" failure mode (see
- *                         Glenn Fiedler, "Fix Your Timestep!").
- *   RENDER_FPS_TARGET  — render-throttle target. The sleep before
- *                         I/O paces the render loop at this rate
- *                         even when sim_fps is set higher.
- */
+/* MAX_FRAME_DT_NS — if a frame takes longer than 100 ms (a debugger
+ * pause, the laptop sleeping), pretend only 100 ms passed. Otherwise the
+ * sim would try to "catch up" all at once and lock up.
+ * RENDER_FPS_TARGET — redraw the screen about 60 times a second even if
+ * the sim is set to tick faster. */
 #define MAX_FRAME_DT_NS    (100 * NS_PER_MS)
 #define RENDER_FPS_TARGET  60
 
 /*
- * Theme — a named 4-tier colour palette + accent for the cellular
- * noise renderer.
+ * Theme — one named colour scheme. Ten of these let you re-skin the whole
+ * picture (t/T to cycle) without touching any of the drawing code.
  *
- * INTENT
- *   Decouple the "what colours" choice from the "how to render"
- *   pipeline. The same GlowField + GlyphRamp drives 10 different
- *   visual moods just by swapping which 4 colour pairs ncurses is
- *   bound to (see theme_apply() in §3).
- *
- * CONTEXT
- *   Indexed by PaletteState.current (§7); cycled via t / T. The
- *   four band entries map 1:1 onto GlowField.band quartile
- *   {0,1,2,3} — band 0 is the dimmest tier, band 3 the brightest.
- *   The renderer reads `themes[palette.current].band[idx]` once per
- *   theme change and rebuilds the ncurses colour pairs.
- *
- * MEMBER LOGIC
- *   name   : short uppercase label shown in HUD row 1. ≤7 chars so
- *            the "theme:%-8s" format string never overflows.
- *   band[] : xterm-256 colour-cube indices (see ANSI escape code
- *            § 8-bit). Per CLAUDE.md "Theme Palette Brightness",
- *            every entry MUST sit in the bright half of the cube
- *            (≥ 24 for the 6³ cube, ≥ 244 for the greyscale ramp).
- *            Bottom-of-palette colours go invisible against the
- *            default-black bg when rendered with A_DIM.
- *   flash  : 256-colour accent reserved for rare-event highlights.
- *            Vestigial in this file (no event flash) — kept so the
- *            theme table stays compatible with sibling demos that
- *            DO use the accent.
- *
- * Ref: ANSI escape code § 8-bit (link in References block).
+ *   name   : short label shown in the HUD (kept to 7 chars so it fits).
+ *   band[] : four colours, dim to bright, one per brightness tier the
+ *            renderer uses. These are xterm 256-colour numbers; all of
+ *            them sit in the bright half of the palette on purpose, so
+ *            even the "dimmest" one is still visible on a black terminal.
+ *   flash  : an accent colour. Unused here, but kept so this table stays
+ *            interchangeable with the sibling demos that do use it.
  */
 typedef struct {
-    const char *name;        /* HUD label, ≤7 chars                         */
-    short       band[4];     /* xterm-256 idx, one per GlowField.band tier  */
-    short       flash;       /* xterm-256 accent (reserved, unused here)    */
+    const char *name;        /* HUD label, <=7 chars                        */
+    short       band[4];     /* one colour per brightness tier, dim to bright */
+    short       flash;       /* accent (reserved, unused here)              */
 } Theme;
 
 #define N_THEMES 10
@@ -660,34 +311,21 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * WorleyNoise — the noise primitive's runtime state. Just a 32-bit
- * seed; cellular noise (unlike Perlin/simplex) doesn't need any
- * permutation table — the per-tile feature point is HASHED on demand
- * from (xi, yi, seed). That makes the noise infinite-extent and
- * zero-memory.
+ * WorleyNoise — the entire state of the noise: a single seed. We never
+ * store the dots themselves. Each dot's position is computed fresh from
+ * its tile coordinates and this seed whenever we need it, so the noise
+ * covers infinite space for free. Reset (r key) rolls a new seed for a
+ * fresh layout.
  *
- * The struct lives on Scene (§7). Pattern functions in §6 receive
- * `const WorleyNoise *` so the dataflow is explicit at the call site:
- * a pattern *samples* noise but never *mutates* it. Reseeding happens
- * only via worley_reseed() on user reset (r key).
- *
- * Ref: Worley 1996 §4 — "A perfect hash function of three integers
- *      (i, j, k) → number of points in tile (i, j, k)" is how the
- *      paper avoids storing the feature points.
+ *   seed : changes the whole dot pattern; same seed always gives the
+ *          same dots.
  */
 typedef struct {
     uint32_t seed;
 } WorleyNoise;
 
-/*
- * hash32 — small integer mixer. 4 multiplies + 4 shifts. Output is a
- * decent-quality 32-bit hash for visual noise (passes basic chi-square
- * but not crypto-grade). Good enough for picking feature-point
- * positions deterministically.
- *
- * Constants from the "splitmix64" family adapted to 32 bits — see
- * Murmur / xxHash literature for similar mixers.
- */
+/* Scrambles an integer into a well-mixed 32-bit number. Not for security,
+ * just to turn tile coordinates into believable randomness. */
 static inline uint32_t hash32(uint32_t x)
 {
     x = (x ^ (x >> 16)) * 0x7feb352du;
@@ -696,11 +334,8 @@ static inline uint32_t hash32(uint32_t x)
     return x;
 }
 
-/*
- * tile_hash — 32-bit hash of (xi, yi, wn->seed). Different (xi, yi)
- * pairs almost always give different hash values; the seed re-rolls
- * the entire space for variety across runs.
- */
+/* The random fingerprint of one tile. Same tile always gives the same
+ * number; neighbouring tiles get unrelated ones. */
 static inline uint32_t tile_hash(const WorleyNoise *wn, int xi, int yi)
 {
     uint32_t h = (uint32_t)xi * 374761393u
@@ -709,15 +344,9 @@ static inline uint32_t tile_hash(const WorleyNoise *wn, int xi, int yi)
     return hash32(h);
 }
 
-/*
- * hash_byte / hash_halfword — extract a named bit-slice from a 32-bit
- * hash so the noise code reads "byte 1 of the hash" instead of
- * "(h >> 8) & 0xFFu". Each call costs one shift + one mask; inlined
- * everywhere.
- *
- *   byte_idx ∈ {0..3}  → bits [8·idx, 8·idx + 8)
- *   half_idx ∈ {0, 1}  → bits [16·idx, 16·idx + 16)
- */
+/* Pull one byte (0..3) or one 16-bit half (0 or 1) out of a hash, so the
+ * code can say "byte 1 of the hash" instead of bit-shuffling inline. One
+ * hash gives several independent random values this way. */
 static inline uint32_t hash_byte(uint32_t h, int byte_idx)
 {
     return (h >> (byte_idx * 8)) & 0xFFu;
@@ -728,35 +357,23 @@ static inline uint32_t hash_halfword(uint32_t h, int half_idx)
     return (h >> (half_idx * 16)) & 0xFFFFu;
 }
 
-/*
- * hash_to_offset — pick a feature point's position in [0, 1)² inside
- * a tile, from a 32-bit hash. High 16 bits drive ox, low 16 bits
- * drive oy — statistically uncorrelated enough for visual noise.
- */
+/* Turn a tile's hash into where its dot sits inside the tile: an x and y
+ * offset, each somewhere in 0..1. */
 static inline void hash_to_offset(uint32_t h, float *ox, float *oy)
 {
     *ox = (float)hash_halfword(h, 1) * HASH_UNIT_FROM_16BIT;
     *oy = (float)hash_halfword(h, 0) * HASH_UNIT_FROM_16BIT;
 }
 
-/*
- * worley_reseed — reroll wn->seed. Called at every reset (r key) so
- * different runs produce visibly different feature-point fields.
- */
+/* Roll a brand-new seed. Called on reset (r) so each run looks different. */
 static void worley_reseed(WorleyNoise *wn)
 {
     wn->seed = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
 }
 
-/*
- * metric_distance — distance from (ex, ey) under the requested norm.
- * Used inside the 3×3 query loop; isolated as a helper so each Tier-3
- * pattern selects a metric and the query loop stays metric-agnostic.
- *
- * SUPERELLIPSE and STAR are cubics / sqrt-based; both still cheap
- * (no transcendentals), so the per-query cost stays within ~2× of
- * pure Euclidean even for the most exotic metric.
- */
+/* How far apart two points are, measured the way the chosen metric says.
+ * Swapping the rule here is what gives each Tier-3 pattern its cell shape;
+ * everything else stays the same. (ex, ey) is the gap between the points. */
 static inline float metric_distance(Metric metric, float ex, float ey)
 {
     float ax = fabsf(ex);
@@ -764,8 +381,8 @@ static inline float metric_distance(Metric metric, float ex, float ey)
     switch (metric) {
     case METRIC_MANHATTAN:    return ax + ay;
     case METRIC_CHEBYSHEV:    return ax > ay ? ax : ay;
-    case METRIC_SUPERELLIPSE: return cbrtf(ax*ax*ax + ay*ay*ay);  /* L³ */
-    case METRIC_STAR: {                                           /* L½ */
+    case METRIC_SUPERELLIPSE: return cbrtf(ax*ax*ax + ay*ay*ay);
+    case METRIC_STAR: {
         float sx = sqrtf(ax);
         float sy = sqrtf(ay);
         float s  = sx + sy;
@@ -778,95 +395,42 @@ static inline float metric_distance(Metric metric, float ex, float ey)
 }
 
 /*
- * WorleyResult — what one worley_query call returns for a single
- * noise-space point.
+ * WorleyResult — everything one lookup tells us about a point. We always
+ * find the three nearest dots in one pass, so any pattern can build its
+ * look from these without re-running the search.
  *
- * INTENT
- *   Bundle the three Worley F-distances plus the F1-owning tile's
- *   hash so pattern functions can compose ANY combination they
- *   need (F1, F2, F3, F2−F1, F1/F2, F1+F2, F1·F2, F3−F2, …) from
- *   ONE query call. Without this, each pattern would have to
- *   re-run the 3×3 lookup with a different "what to track" rule.
- *
- * CONTEXT
- *   Returned by worley_query() (§5) and the weighted variant.
- *   Consumed by all 30 pattern_* functions in §6. Tier 1-2
- *   patterns read only the F-fields; Tier 4 patterns also read
- *   cell_id to derive a per-cell visual property.
- *
- * MEMBER LOGIC
- *   f1 : Distance to the NEAREST feature point under the active
- *        metric. Always finite; in Euclidean, bounded by ~√2 inside
- *        the central tile.
- *   f2 : Distance to the SECOND-nearest. Always ≥ f1. The Voronoi
- *        edge of the F1-owning cell lies where f1 → f2 (so
- *        f2 − f1 → 0).
- *   f3 : Distance to the THIRD-nearest. Always ≥ f2. Required for
- *        Tier 1 PATTERN_F3 and Tier 2 PATTERN_F3_F2. If only
- *        f1/f2 are needed the loop still tracks f3 — the extra
- *        comparison is essentially free.
- *   cell_id : 32-bit hash of the F1-owning tile's integer coords.
- *        Deterministic per tile (same coords → same hash) and
- *        well-mixed (adjacent tiles have un-correlated hashes).
- *        Tier 4 patterns derive band, brightness, twinkle phase,
- *        etc. from this.
- *
- * Ref: Worley 1996, §3 — defines the F_n family of functions over
- *      the cellular distance set.
+ *   f1 : distance to the nearest dot.
+ *   f2 : distance to the second-nearest (always >= f1). Where f1 and f2
+ *        are nearly equal, you're on the border between two cells.
+ *   f3 : distance to the third-nearest. Some patterns want it; tracking
+ *        it costs almost nothing.
+ *   cell_id : the fingerprint of the tile that owns the nearest dot —
+ *        i.e. which cell you're standing in. Tier-4 patterns use it to
+ *        give each cell its own colour, flicker, etc.
  */
 typedef struct {
-    float    f1;        /* distance to nearest feature point        */
-    float    f2;        /* distance to second-nearest               */
-    float    f3;        /* distance to third-nearest                */
-    uint32_t cell_id;   /* hash of F1-owning tile (per-cell identity) */
+    float    f1;        /* distance to nearest dot       */
+    float    f2;        /* distance to second-nearest    */
+    float    f3;        /* distance to third-nearest     */
+    uint32_t cell_id;   /* which cell we're in           */
 } WorleyResult;
 
-/* ───── worley_query — types and helpers ─────────────────────────────── *
- *
- * The Worley query decomposes naturally into 3 named stages. Each
- * stage gets a dedicated helper below; worley_query itself becomes a
- * pseudocode driver of "locate central tile → init cascade → scan
- * neighbourhood".
- *
- *   STAGE 1  LOCATE TILE — floor(fx, fy) → integer cell (xi, yi)
- *   STAGE 2  INIT CASCADE — F1=F2=F3=INF, cell_id=0
- *                                                  → worley_result_empty
- *   STAGE 3  SCAN 3×3 — for each neighbouring tile:
- *              · feature_point_at(tile, t)   — hashed + wobbled point
- *              · metric_distance(...)        — under the active norm
- *              · consider_distance(&r, d, h) — update F-cascade
- */
-
 /*
- * WorleyFeaturePoint — the wobbling feature point that lives in one
- * lattice tile.
+ * WorleyFeaturePoint — one dot, ready to measure against: where it ended
+ * up after wobbling, plus the fingerprint of the tile it came from.
  *
- * INTENT
- *   Bundle the three values worley_feature_point_at returns: the
- *   Cartesian position (after wobble) and the hash that identifies
- *   the owning tile. Without this struct the inner loop would
- *   carry six separate locals (cx, cy, h, ox, oy, then px, py).
- *
- * CONTEXT
- *   Produced by worley_feature_point_at(). Consumed by the
- *   worley_query inner loop, which subtracts the query point from
- *   (px, py) to get displacement and passes hash to
- *   worley_consider_distance for cell_id tracking.
- *
- * MEMBER LOGIC
- *   px, py : Cartesian position of the feature point AFTER wobble.
- *            Lives in noise space (same coordinate frame as the
- *            query point); subtract query coords to get displacement.
- *   hash   : 32-bit hash of (tile_x, tile_y, seed). Tier 4 patterns
- *            key off this for per-cell visual properties.
+ *   px, py : the dot's position (after wobble), in the same coordinate
+ *            space as the point we're shading.
+ *   hash   : the owning tile's fingerprint, carried along so the search
+ *            can record which cell won.
  */
 typedef struct {
-    float    px, py;    /* Cartesian position (after wobble offset)     */
-    uint32_t hash;      /* hash of the source tile (carries cell_id)    */
+    float    px, py;    /* dot position after wobble  */
+    uint32_t hash;      /* owning tile's fingerprint  */
 } WorleyFeaturePoint;
 
-/* Sentinel-initialised empty result. F1 ≤ F2 ≤ F3 = INF means any
- * real distance will replace the cascade slot it lands in. */
+/* A fresh result with all distances set huge, so the first real dot
+ * always replaces them. */
 static inline WorleyResult worley_result_empty(void)
 {
     WorleyResult r = {
@@ -878,33 +442,21 @@ static inline WorleyResult worley_result_empty(void)
     return r;
 }
 
-/*
- * worley_feature_point_at — locate the wobbling feature point in
- * tile (cx, cy) at simulation time t. Fuses three sub-operations:
- *
- *   (a) HASH the tile coords → 32-bit identity.
- *   (b) PLACE the base point in [0, 1)² from the hash's bit slices
- *       (hash_to_offset).
- *   (c) WOBBLE the position with a hash-derived phase so neighbouring
- *       tiles oscillate out of sync (otherwise everything would
- *       breathe in lockstep).
- *
- * The returned Cartesian position lets the caller subtract the query
- * point to get displacement; the hash is returned so cell_id-aware
- * patterns get it for free.
- */
+/* Find where tile (cx, cy)'s dot is right now: start from its fixed spot
+ * inside the tile, then nudge it with a slow wobble. Each dot wobbles on
+ * its own schedule so they don't all sway together. Time t drives the
+ * wobble. */
 static inline WorleyFeaturePoint worley_feature_point_at(
     const WorleyNoise *wn, int cx, int cy, float t)
 {
     WorleyFeaturePoint fp;
     fp.hash = tile_hash(wn, cx, cy);
 
-    /* Base position in [0, 1)² inside the tile. */
+    /* The dot's resting spot inside the tile. */
     float ox, oy;
     hash_to_offset(fp.hash, &ox, &oy);
 
-    /* Per-point wobble phase ∈ ~[0, 2π) from independent hash bytes
-     * so adjacent points oscillate at unrelated phases. */
+    /* Each dot starts its sway at a different point in the cycle. */
     float phase_x = (float)hash_byte(fp.hash, 1) * HASH_PHASE_FROM_BYTE;
     float phase_y = (float)hash_byte(fp.hash, 3) * HASH_PHASE_FROM_BYTE;
     ox += WOBBLE_AMOUNT * sinf(t + phase_x);
@@ -915,17 +467,8 @@ static inline WorleyFeaturePoint worley_feature_point_at(
     return fp;
 }
 
-/*
- * worley_consider_distance — update the F-cascade (F1 ≤ F2 ≤ F3)
- * with one new candidate distance. When d becomes the new minimum
- * we also remember the source hash as cell_id (only F1 has an
- * identity; F2 / F3 owners aren't tracked because no pattern needs
- * them).
- *
- * The 3-way comparison cascade is what makes worley_query's loop
- * THE SAME WORK regardless of how many F_n's the caller needs —
- * tracking F3 alongside F1/F2 costs one extra branch per tile.
- */
+/* Slot one more dot's distance into the top-three. If it's the new
+ * closest, also note which cell that dot belongs to. */
 static inline void worley_consider_distance(WorleyResult *r,
                                             float d, uint32_t source_hash)
 {
@@ -943,38 +486,23 @@ static inline void worley_consider_distance(WorleyResult *r,
 }
 
 /*
- * worley_query — for the noise-space point (fx, fy), find F1, F2, F3
- * feature-point distances under the requested metric, plus the hash
- * of the F1-owning tile.
- *
- * Pseudocode shape:
- *
- *   tile          = floor(fx, fy)                  // STAGE 1
- *   r             = empty WorleyResult             // STAGE 2
- *   for each of the 9 neighbouring tiles:          // STAGE 3
- *     fp = feature_point_at(neighbour, t)
- *     d  = metric_distance(fp − query)
- *     consider_distance(r, d, fp.hash)
- *   return r
- *
- * With WOBBLE_AMOUNT < 0.4 every feature point stays roughly inside
- * its tile, so the 3×3 lookup is provably complete for L¹/L²/L∞.
- * Non-metric distances (STAR) lose this guarantee but the visual
- * effect remains well-defined.
+ * The heart of the whole file: for a point (fx, fy), find how far the
+ * three nearest dots are and which cell it's in. Look at the 3x3 block of
+ * tiles around the point, check each tile's dot, and keep the closest few.
+ * Because dots stay near their home tile, the nearest one is always inside
+ * this block. The metric argument decides what "near" means.
  */
 static WorleyResult worley_query(const WorleyNoise *wn,
                                  float fx, float fy,
                                  float t, Metric metric)
 {
-    /* STAGE 1 — LOCATE central tile containing the query point. */
+    /* Which tile the point sits in. */
     int xi = (int)floorf(fx);
     int yi = (int)floorf(fy);
 
-    /* STAGE 2 — INIT the F-cascade to "no candidate yet". */
     WorleyResult r = worley_result_empty();
 
-    /* STAGE 3 — SCAN the 3×3 neighbourhood; each tile's wobbling
-     * feature point is a candidate for the cascade. */
+    /* Check the dot in this tile and its 8 neighbours. */
     for (int dy = -WORLEY_NEIGHBOUR_RADIUS; dy <= WORLEY_NEIGHBOUR_RADIUS; dy++) {
         for (int dx = -WORLEY_NEIGHBOUR_RADIUS; dx <= WORLEY_NEIGHBOUR_RADIUS; dx++) {
             WorleyFeaturePoint fp = worley_feature_point_at(wn, xi + dx, yi + dy, t);
@@ -985,40 +513,27 @@ static WorleyResult worley_query(const WorleyNoise *wn,
     return r;
 }
 
-/*
- * worley_query_weighted — multiplicatively-weighted Voronoi variant.
- *
- * Same 3-stage shape as worley_query, but each feature point has a
- * hash-derived "territory weight" w ∈ [WEIGHTED_W_MIN, MIN+RANGE];
- * the comparison distance is the raw Euclidean d divided by w, so
- * points with bigger w claim more area.
- *
- *   Weighted Voronoi conventionally uses L² distance — see
- *   Aurenhammer 1991 §3 for the geometric construction.
- *
- * Used only by Tier 4 PATTERN_WEIGHTED.
- */
+/* Same search, but each dot has a "pull" that shrinks its measured
+ * distance, so stronger dots win more ground and cells come out uneven.
+ * Used only by the WEIGHTED pattern. */
 static WorleyResult worley_query_weighted(const WorleyNoise *wn,
                                           float fx, float fy, float t)
 {
-    /* STAGE 1 — LOCATE central tile. */
     int xi = (int)floorf(fx);
     int yi = (int)floorf(fy);
 
-    /* STAGE 2 — INIT the F-cascade. */
     WorleyResult r = worley_result_empty();
 
-    /* STAGE 3 — SCAN the 3×3 neighbourhood with weight-divided d. */
     for (int dy = -WORLEY_NEIGHBOUR_RADIUS; dy <= WORLEY_NEIGHBOUR_RADIUS; dy++) {
         for (int dx = -WORLEY_NEIGHBOUR_RADIUS; dx <= WORLEY_NEIGHBOUR_RADIUS; dx++) {
             WorleyFeaturePoint fp = worley_feature_point_at(wn, xi + dx, yi + dy, t);
 
-            /* Raw Euclidean distance (weighted Voronoi uses L² only). */
             float ex    = fp.px - fx;
             float ey    = fp.py - fy;
             float d_raw = sqrtf(ex * ex + ey * ey);
 
-            /* Per-point territory weight ∈ [WEIGHTED_W_MIN, MIN + RANGE]. */
+            /* This dot's pull (0.5..1.5); dividing by it lets strong dots
+             * reach further. */
             float weight = WEIGHTED_W_MIN
                          + (float)hash_byte(fp.hash, 2) * HASH_UNIT_FROM_BYTE
                                                         * WEIGHTED_W_RANGE;
@@ -1033,16 +548,12 @@ static WorleyResult worley_query_weighted(const WorleyNoise *wn,
 /* ===================================================================== */
 
 /*
- * Signature: all pattern functions take (wn, fx, fy, t, &glow, &band):
- *   wn       = const WorleyNoise *  — the seed-holding primitive,
- *              threaded through every pattern so the dataflow is
- *              explicit and the function can't silently mutate it.
- *   fx, fy   = noise-space coords (cell × NOISE_SCALE).
- *   t        = pattern.field_time — the wobble drift accumulator.
- *   out_glow = scalar ∈ [0, 1] — the cell's brightness.
- *   out_band = palette index ∈ {0..3}; Tier 4 patterns derive this
- *              from cell_id, every other tier derives it from the
- *              glow quartile (band_from_glow).
+ * Every pattern below has the same shape. It gets the noise, a point
+ * (fx, fy), the current time t, and writes back two things:
+ *   out_glow — the cell's brightness, 0 to 1.
+ *   out_band — which of the 4 colours to use.
+ * Most patterns pick the colour from the brightness; the Tier-4 ones pick
+ * it from the cell's id instead.
  */
 
 static inline float clampf(float v, float lo, float hi)
@@ -1050,30 +561,25 @@ static inline float clampf(float v, float lo, float hi)
     return v < lo ? lo : v > hi ? hi : v;
 }
 
-/* glow ∈ [0, 1] → palette band ∈ {0, 1, 2, 3}.
- * The almost-4 gain keeps glow=1.0 inside band 3 instead of
- * overflowing past it. */
+/* Brightness (0..1) to one of the 4 colour tiers. */
 static inline int band_from_glow(float g)
 {
     return (int)(g * GLOW_TO_BAND_GAIN) & PALETTE_BAND_MASK;
 }
 
-/* cell_id hash → deterministic [0, 1] scalar.
- * Used by Tier-4 RANDOM_GLOW / TWINKLE / HALO patterns so every
- * Voronoi cell has its own "personality" without storing any
- * per-cell state. The XOR + re-hash with HASH_PERSONALITY_SALT
- * decorrelates consecutive cell_ids; the low half-word of the
- * remix gives ~16 bits of independent entropy per cell. */
+/* Give a cell its own fixed random number (0..1) from its id, so each
+ * cell can have its own brightness, flicker rate, and so on without us
+ * storing anything per cell. */
 static inline float cell_hash_to_unit(uint32_t cell_id)
 {
     uint32_t remixed = hash32(cell_id ^ HASH_PERSONALITY_SALT);
     return (float)hash_halfword(remixed, 0) * HASH_UNIT_FROM_16BIT;
 }
 
-/* ---------- Tier 1 — F-FUNCTIONS: raw F_n outputs --------------------- */
+/* ---------- Tier 1 — the raw distances -------------------------------- */
 
-/* F1 — distance to nearest feature point. Dark cell centres, bright
- * cell edges. The baseline cellular noise. */
+/* Brightness from distance to the nearest dot: dark at cell centres,
+ * bright at the edges. The plain cellular noise. */
 static void pattern_f1(const WorleyNoise *wn, float fx, float fy, float t,
                        float *out_glow, int *out_band)
 {
@@ -1083,8 +589,7 @@ static void pattern_f1(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = band_from_glow(g);
 }
 
-/* F2 — distance to second-nearest. Smoother, larger blobs since the
- * second-nearest point's "territory" is intrinsically wider. */
+/* Distance to the second-nearest dot: smoother, with bigger blobs. */
 static void pattern_f2(const WorleyNoise *wn, float fx, float fy, float t,
                        float *out_glow, int *out_band)
 {
@@ -1094,8 +599,7 @@ static void pattern_f2(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = band_from_glow(g);
 }
 
-/* F3 — distance to third-nearest. Even smoother than F2; reads as a
- * faint, low-frequency cell structure. */
+/* Distance to the third-nearest dot: smoother still, a faint structure. */
 static void pattern_f3(const WorleyNoise *wn, float fx, float fy, float t,
                        float *out_glow, int *out_band)
 {
@@ -1105,8 +609,9 @@ static void pattern_f3(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = band_from_glow(g);
 }
 
-/* F2−F1 — sharp Voronoi edges. Near zero at cell boundaries (where
- * F1 ≈ F2); inverted so boundaries are BRIGHT. The classic. */
+/* The gap between the two nearest dots. It shrinks to zero right on a
+ * cell border, so flipping it makes the borders glow — crisp cell outlines.
+ * The classic look, and the default on startup. */
 static void pattern_f2_f1(const WorleyNoise *wn, float fx, float fy, float t,
                           float *out_glow, int *out_band)
 {
@@ -1116,8 +621,8 @@ static void pattern_f2_f1(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = band_from_glow(clampf(r.f1 / 1.414f, 0.0f, 1.0f));
 }
 
-/* F1 / F2 — the ratio. → 0 at cell centres (F1 tiny), → 1 at cell
- * edges (F1 ≈ F2). Like F1 but with a non-linear gradient. */
+/* The nearest distance as a fraction of the second: 0 at a cell's centre,
+ * 1 at its edge. Like the F1 look but with a different falloff. */
 static void pattern_f1_over_f2(const WorleyNoise *wn, float fx, float fy, float t,
                                float *out_glow, int *out_band)
 {
@@ -1127,10 +632,10 @@ static void pattern_f1_over_f2(const WorleyNoise *wn, float fx, float fy, float 
     *out_band = band_from_glow(g);
 }
 
-/* ---------- Tier 2 — F-COMBOS: other arithmetic on F values ----------- */
+/* ---------- Tier 2 — more arithmetic on the distances ----------------- */
 
-/* F1 + F2 — additive. Bright everywhere except cell centres; reads
- * as a "soft cushion" cellular field. */
+/* The two nearest distances added together: bright everywhere except the
+ * cell centres, a soft cushiony field. */
 static void pattern_f1_plus_f2(const WorleyNoise *wn, float fx, float fy, float t,
                                float *out_glow, int *out_band)
 {
@@ -1140,8 +645,7 @@ static void pattern_f1_plus_f2(const WorleyNoise *wn, float fx, float fy, float 
     *out_band = band_from_glow(g);
 }
 
-/* F1 · F2 — multiplicative. Strongly suppressed near cell centres
- * (F1 → 0); reads as cells with bright outlines and very dark cores. */
+/* The two nearest distances multiplied: very dark cores, bright outlines. */
 static void pattern_f1_times_f2(const WorleyNoise *wn, float fx, float fy, float t,
                                 float *out_glow, int *out_band)
 {
@@ -1151,8 +655,8 @@ static void pattern_f1_times_f2(const WorleyNoise *wn, float fx, float fy, float
     *out_band = band_from_glow(g);
 }
 
-/* F3 − F2 — third-vs-second edges. Thinner and more "branching"
- * than F2−F1; highlights the dual edges of the Voronoi graph. */
+/* The gap between the third- and second-nearest dots: thinner, more
+ * branch-like lines than the F2-F1 edges. */
 static void pattern_f3_f2(const WorleyNoise *wn, float fx, float fy, float t,
                           float *out_glow, int *out_band)
 {
@@ -1162,8 +666,7 @@ static void pattern_f3_f2(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = band_from_glow(g);
 }
 
-/* 1 − (F2 − F1) → not inverted. Edges DARK, cells BRIGHT — the
- * complement of the standard F2_F1 pattern. */
+/* The F2-F1 edges, but not flipped: dark borders, bright cell interiors. */
 static void pattern_f2_f1_inv(const WorleyNoise *wn, float fx, float fy, float t,
                               float *out_glow, int *out_band)
 {
@@ -1173,8 +676,7 @@ static void pattern_f2_f1_inv(const WorleyNoise *wn, float fx, float fy, float t
     *out_band = band_from_glow(g);
 }
 
-/* 1 − F1 — bright centres. The complement of F1. Each cell has a
- * bright core that fades toward the edges. */
+/* The F1 look flipped: each cell has a bright core fading to dark edges. */
 static void pattern_f1_inv(const WorleyNoise *wn, float fx, float fy, float t,
                            float *out_glow, int *out_band)
 {
@@ -1184,9 +686,9 @@ static void pattern_f1_inv(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = band_from_glow(g);
 }
 
-/* ---------- Tier 3 — METRICS: F1 with different distance norms -------- */
+/* ---------- Tier 3 — different ways to measure distance --------------- */
 
-/* MANHATTAN — F1 with L¹: cells become diamonds (45°-aligned). */
+/* Distance measured in only-horizontal-and-vertical steps: diamond cells. */
 static void pattern_manhattan(const WorleyNoise *wn, float fx, float fy, float t,
                               float *out_glow, int *out_band)
 {
@@ -1196,8 +698,7 @@ static void pattern_manhattan(const WorleyNoise *wn, float fx, float fy, float t
     *out_band = band_from_glow(g);
 }
 
-/* CHEBYSHEV — F1 with L∞ (= max(|Δx|, |Δy|)): cells become axis-
- * aligned squares. Max distance inside any cell is 1.0. */
+/* Distance = the bigger of the horizontal and vertical gaps: square cells. */
 static void pattern_chebyshev(const WorleyNoise *wn, float fx, float fy, float t,
                               float *out_glow, int *out_band)
 {
@@ -1207,9 +708,7 @@ static void pattern_chebyshev(const WorleyNoise *wn, float fx, float fy, float t
     *out_band = band_from_glow(g);
 }
 
-/* SUPERELLIPSE — F1 with L³: cells become rounded squares
- * (super-ellipses). The smooth interpolation between L² (circle)
- * and L∞ (square). */
+/* A distance halfway between round and square: rounded-square cells. */
 static void pattern_superellipse(const WorleyNoise *wn, float fx, float fy, float t,
                                  float *out_glow, int *out_band)
 {
@@ -1219,9 +718,8 @@ static void pattern_superellipse(const WorleyNoise *wn, float fx, float fy, floa
     *out_band = band_from_glow(g);
 }
 
-/* STAR — F1 with L½ ("(√|Δx|+√|Δy|)²"): cells become concave
- * 4-pointed stars. Not strictly a metric (triangle inequality
- * fails) but produces a striking pattern. */
+/* A quirky distance that pinches the cells inward into 4-pointed stars.
+ * Not a "real" distance rule, but it looks striking. */
 static void pattern_star(const WorleyNoise *wn, float fx, float fy, float t,
                          float *out_glow, int *out_band)
 {
@@ -1231,9 +729,8 @@ static void pattern_star(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = band_from_glow(g);
 }
 
-/* STRETCHED — F1 with anisotropic Manhattan (2|Δx| + |Δy|): cells
- * stretched along the y-axis. Demonstrates how weighted norms
- * deform the cell shape without changing point positions. */
+/* Like Manhattan but horizontal steps count double, so cells come out
+ * tall and thin. The dots don't move; only the measuring rule changes. */
 static void pattern_stretched(const WorleyNoise *wn, float fx, float fy, float t,
                               float *out_glow, int *out_band)
 {
@@ -1243,11 +740,10 @@ static void pattern_stretched(const WorleyNoise *wn, float fx, float fy, float t
     *out_band = band_from_glow(g);
 }
 
-/* ---------- Tier 4 — IDENTITY: cell_id hash drives a visual property -- */
+/* ---------- Tier 4 — each cell's id drives its look ------------------- */
 
-/* CELL_ID — solid colour per Voronoi cell. The classic Voronoi
- * region map; band index = cell_id mod 4. Glow has a slight
- * inward gradient so each cell has a focal point. */
+/* Each cell gets one solid colour chosen from its id, with a gentle glow
+ * toward its centre. The classic patchwork-of-regions look. */
 static void pattern_cell_id(const WorleyNoise *wn, float fx, float fy, float t,
                             float *out_glow, int *out_band)
 {
@@ -1256,10 +752,8 @@ static void pattern_cell_id(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = (int)(r.cell_id & PALETTE_BAND_MASK);
 }
 
-/* WEIGHTED — multiplicatively-weighted Voronoi. Each feature point
- * has a hash-derived "radius" wᵢ ∈ [0.5, 1.5]; the cell boundary
- * is where d₁/w₁ = d₂/w₂. Points with bigger wᵢ claim more
- * territory — irregular cell sizes instead of uniform. */
+/* Patchwork cells, but some dots pull harder than others (see the weighted
+ * search above), so the cells come out unevenly sized. */
 static void pattern_weighted(const WorleyNoise *wn, float fx, float fy, float t,
                              float *out_glow, int *out_band)
 {
@@ -1268,8 +762,7 @@ static void pattern_weighted(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = (int)(r.cell_id & PALETTE_BAND_MASK);
 }
 
-/* TWINKLE — per-cell brightness modulated by sin(t · rate(cell_id)).
- * Each cell flickers at its own rate, derived from its hash. */
+/* Each cell pulses brighter and dimmer at its own speed, set by its id. */
 static void pattern_twinkle(const WorleyNoise *wn, float fx, float fy, float t,
                             float *out_glow, int *out_band)
 {
@@ -1281,9 +774,8 @@ static void pattern_twinkle(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = (int)(r.cell_id & PALETTE_BAND_MASK);
 }
 
-/* RANDOM_GLOW — per-cell static brightness from cell_id. Each cell
- * gets a fixed pseudo-random glow ∈ [0, 1]; the visual is a
- * Voronoi mosaic where every cell has its own tone. */
+/* Each cell gets one fixed random brightness from its id: a flat mosaic
+ * where every cell is its own shade. */
 static void pattern_random_glow(const WorleyNoise *wn, float fx, float fy, float t,
                                 float *out_glow, int *out_band)
 {
@@ -1292,9 +784,8 @@ static void pattern_random_glow(const WorleyNoise *wn, float fx, float fy, float
     *out_band = (int)(r.cell_id & PALETTE_BAND_MASK);
 }
 
-/* CRACKLE — F2−F1 edges combined with cell-id-derived darkening.
- * Sharp Voronoi edges, but each cell's interior brightness varies
- * by hash. Reads like dried mud / lava cracks. */
+/* Crisp cell borders, but each cell's interior is a different shade.
+ * Looks like cracked dried mud or cooling lava. */
 static void pattern_crackle(const WorleyNoise *wn, float fx, float fy, float t,
                             float *out_glow, int *out_band)
 {
@@ -1305,18 +796,18 @@ static void pattern_crackle(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = (int)(r.cell_id & PALETTE_BAND_MASK);
 }
 
-/* ---------- Tier 5 — MULTI-SCALE: Worley fBm stacks ------------------- *
+/* ---------- Tier 5 — stack the noise at several zoom levels ----------- *
  *
- * Three octaves of F1 sampled at frequencies 1·x, 2·x, 4·x with
- * amplitudes 1, ½, ¼. The amplitude-normaliser is the sum of those
- * amplitudes (1.75) so the output stays in roughly [0, 1].
+ * Add up three copies of the noise: big cells at full strength, plus
+ * half-size cells at half strength, plus quarter-size at a quarter. The
+ * 1.75 below is the total of those strengths, used to keep the result in
+ * roughly 0..1.
  */
 #define WORLEY_FBM_OCTAVES   3
 #define WORLEY_FBM_AMP_SUM   1.75f   /* 1 + 0.5 + 0.25 */
 
-/* WORLEY_FBM — Σ aᵢ · F1(2ⁱ·x). Classic cellular fBm; resembles
- * stacked cellular noise — looks like clusters of cells of mixed
- * sizes. */
+/* Three zoom levels of the basic F1 noise added together: clusters of
+ * cells in mixed sizes. */
 static void pattern_worley_fbm(const WorleyNoise *wn, float fx, float fy, float t,
                                float *out_glow, int *out_band)
 {
@@ -1334,8 +825,7 @@ static void pattern_worley_fbm(const WorleyNoise *wn, float fx, float fy, float 
     *out_band = band_from_glow(g);
 }
 
-/* WORLEY_TURBULENCE — Σ aᵢ · (1 − (F2−F1))(2ⁱ·x). Multi-scale
- * Voronoi edges — fine edges overlaid on coarse edges. */
+/* The edge look stacked at three zoom levels: fine edges over coarse ones. */
 static void pattern_worley_turbulence(const WorleyNoise *wn, float fx, float fy, float t,
                                       float *out_glow, int *out_band)
 {
@@ -1354,9 +844,8 @@ static void pattern_worley_turbulence(const WorleyNoise *wn, float fx, float fy,
     *out_band = band_from_glow(g);
 }
 
-/* WORLEY_RIDGED — Σ aᵢ · (1 − F1)(2ⁱ·x). Inverted Worley fBm;
- * sharp bright cell centres at every scale. Resembles cloud
- * surface from above. */
+/* The bright-centres look stacked at three zoom levels: looks like the
+ * tops of clouds seen from above. */
 static void pattern_worley_ridged(const WorleyNoise *wn, float fx, float fy, float t,
                                   float *out_glow, int *out_band)
 {
@@ -1375,9 +864,8 @@ static void pattern_worley_ridged(const WorleyNoise *wn, float fx, float fy, flo
     *out_band = band_from_glow(g);
 }
 
-/* NESTED — F1(x) + ½ · F1(2x), averaged. Large cells with smaller
- * cells overlaid; gives a 2-tier hierarchy without the full fBm
- * stack cost. */
+/* Big cells with smaller cells laid over them: a two-level pattern,
+ * cheaper than the full stacks above. */
 static void pattern_nested(const WorleyNoise *wn, float fx, float fy, float t,
                            float *out_glow, int *out_band)
 {
@@ -1388,9 +876,8 @@ static void pattern_nested(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = band_from_glow(g);
 }
 
-/* CHECKER — alternate fine / coarse scale per integer cell parity.
- * Adjacent cells of the noise lattice display Worley at different
- * frequencies; the result is a 2-tier patchwork. */
+/* Like a checkerboard: tiles alternate between fine and coarse noise,
+ * making a patchwork of two cell sizes. */
 static void pattern_checker(const WorleyNoise *wn, float fx, float fy, float t,
                             float *out_glow, int *out_band)
 {
@@ -1402,11 +889,10 @@ static void pattern_checker(const WorleyNoise *wn, float fx, float fy, float t,
     *out_band = band_from_glow(g);
 }
 
-/* ---------- Tier 6 — HYBRIDS: Worley-on-Worley compositions ----------- */
+/* ---------- Tier 6 — feed one noise field into another --------------- */
 
-/* DOMAIN_WARP — F1 sampled at coords perturbed by another Worley
- * field. Cells appear "smudged" or "flowing" — the same kind of
- * trick IQ uses on Perlin, applied here to cellular noise. */
+/* Before shading a point, shove it sideways by an amount read from a
+ * second, coarser noise field. The cells come out smudged and flowing. */
 static void pattern_domain_warp(const WorleyNoise *wn, float fx, float fy, float t,
                                 float *out_glow, int *out_band)
 {
@@ -1420,9 +906,8 @@ static void pattern_domain_warp(const WorleyNoise *wn, float fx, float fy, float
     *out_band = band_from_glow(g);
 }
 
-/* METRIC_BLEND — average of F1 under Euclidean and Manhattan. The
- * cell shapes interpolate between rounded and diamond — visually a
- * hybrid you can't get from any single metric. */
+/* Average the round-cell and diamond-cell looks: a halfway shape you
+ * can't get from either measuring rule on its own. */
 static void pattern_metric_blend(const WorleyNoise *wn, float fx, float fy, float t,
                                  float *out_glow, int *out_band)
 {
@@ -1433,43 +918,42 @@ static void pattern_metric_blend(const WorleyNoise *wn, float fx, float fy, floa
     *out_band = band_from_glow(g);
 }
 
-/* HALO — each cell has a bright "core" with a halo decaying outward.
- * The halo's peak brightness varies per cell via cell_id; reads
- * like glowing fireflies hovering in their cells. */
+/* A bright glowing dot at each cell's centre, fading out, each one a
+ * different peak brightness. Looks like fireflies hovering in the cells. */
 static void pattern_halo(const WorleyNoise *wn, float fx, float fy, float t,
                          float *out_glow, int *out_band)
 {
     WorleyResult r        = worley_query(wn, fx, fy, t, METRIC_EUCLIDEAN);
     float        peak     = 0.5f + 0.5f * cell_hash_to_unit(r.cell_id);
-    float        falloff  = expf(-r.f1 * 4.0f);          /* tight halo around centre */
+    float        falloff  = expf(-r.f1 * 4.0f);          /* drops off fast away from the dot */
     *out_glow = clampf(peak * falloff, 0.0f, 1.0f);
     *out_band = (int)(r.cell_id & PALETTE_BAND_MASK);
 }
 
-/* ENERGY — pow(1 − F1, 8). Extreme power on (1 − F1) produces
- * razor-sharp bright pinpoints exactly at the cell centres,
- * everything else dark. Reads as plasma sparks. */
+/* The bright-centres look pushed to an extreme: tiny razor-sharp sparks
+ * at the cell centres, everything else dark. */
 static void pattern_energy(const WorleyNoise *wn, float fx, float fy, float t,
                            float *out_glow, int *out_band)
 {
     WorleyResult r = worley_query(wn, fx, fy, t, METRIC_EUCLIDEAN);
     float v = 1.0f - clampf(r.f1 / 1.414f, 0.0f, 1.0f);
-    float g = v * v;      /* ²  */
-    g     *= g;            /* ⁴  */
-    g     *= g;            /* ⁸  */
+    /* Square it three times over to raise it to the 8th power — that's
+     * what turns the gentle glow into a sharp pinpoint. */
+    float g = v * v;
+    g     *= g;
+    g     *= g;
     *out_glow = clampf(g * 1.5f, 0.0f, 1.0f);
     *out_band = band_from_glow(*out_glow);
 }
 
-/* CHAOS — domain-warped turbulence. Combines two of the heavier
- * techniques: warp the query coords by a coarse F1 field, then
- * read fine F2−F1 edges. Looks like turbulent fluid cells. */
+/* The works: shove the point around using a coarse field, then read the
+ * fine edges. Looks like turbulent, swirling fluid. */
 static void pattern_chaos(const WorleyNoise *wn, float fx, float fy, float t,
                           float *out_glow, int *out_band)
 {
     WorleyResult warp = worley_query(wn, fx * 0.5f, fy * 0.5f, t, METRIC_EUCLIDEAN);
     float        wx   = (warp.f1 - 0.5f) * 2.0f;
-    float        wy   = (warp.cell_id & 1u) ? wx : -wx;    /* asymmetric warp */
+    float        wy   = (warp.cell_id & 1u) ? wx : -wx;    /* push x and y differently for a lopsided swirl */
     WorleyResult r    = worley_query(wn, fx + wx, fy + wy, t, METRIC_EUCLIDEAN);
     float        edges = 1.0f - clampf((r.f2 - r.f1) * 2.5f, 0.0f, 1.0f);
     *out_glow = clampf(edges, 0.0f, 1.0f);
@@ -1478,53 +962,25 @@ static void pattern_chaos(const WorleyNoise *wn, float fx, float fy, float t,
 
 /* ---------- Dispatch table -------------------------------------------- */
 
-/*
- * NoisePatternFn — one signature shared by all 30 pattern samplers.
- * Spelt out here so the dispatch table is type-safe and a reader can
- * grep ONE place to see what every pattern function MUST accept.
- */
+/* The shared shape of all 30 pattern functions. */
 typedef void (*NoisePatternFn)(const WorleyNoise *wn,
                                float fx, float fy, float t,
                                float *out_glow, int *out_band);
 
 /*
- * NoisePattern — one row of the dispatch table: (display-name,
- * tier-label, sampler function pointer).
+ * NoisePattern — one row of the lookup table: a pattern's name, its group
+ * label, and the function that draws it. The table replaces a giant
+ * switch; pick a pattern by enum and call its function. The names are
+ * padded to a fixed width so the HUD doesn't jiggle as you cycle through.
  *
- * INTENT
- *   Replace what would otherwise be a 30-case switch with a table
- *   lookup keyed by the Pattern enum. Adding a new pattern is then
- *   THREE coordinated edits (enum value, table row, function body)
- *   and the compiler enforces alignment via the fixed-size [N_PATTERNS]
- *   initialiser — a missing or mis-ordered row is a compile error.
- *
- * CONTEXT
- *   The whole `noise_patterns[]` array (below this typedef) is the
- *   source of truth for pattern → (name, tier, fn). The Pattern enum
- *   in §1 provides readable indices; pattern_name() and pattern_tier()
- *   in this section are the only outside accessors. scene_evaluate_field
- *   in §7 fetches `noise_patterns[active].sample` once per tick.
- *
- * MEMBER LOGIC
- *   name   : Display name, FIXED 10-char left-padded. The constant
- *            width is deliberate — HUD column alignment must stay
- *            stable as the user cycles patterns with n/p (otherwise
- *            the HUD jitters as each name changes length).
- *   tier   : 7-char "N-LABEL " form (e.g. "1-FN   ", "5-MULTI",
- *            "6-HYB  "). Encodes both the complexity tier (1-6) and
- *            the technique class (F-FUNCTIONS / F-COMBOS / METRICS /
- *            IDENTITY / MULTI-SCALE / HYBRIDS). Same fixed-width
- *            rationale as `name`.
- *   sample : Function pointer to one of the 30 pattern_* functions.
- *            Indirection cost is one indirect call per cell, dwarfed
- *            by the cost of worley_query inside the function (9
- *            hashes + 9 distance evaluations per query, and Tier
- *            5-6 patterns call worley_query 2-3× per cell).
+ *   name   : display name shown in the HUD (padded to 10 chars).
+ *   tier   : group label, like "1-FN" or "6-HYB" (padded to 7 chars).
+ *   sample : the function that shades one point for this pattern.
  */
 typedef struct {
-    const char     *name;      /* HUD-padded display name, 10 chars */
-    const char     *tier;      /* HUD-padded tier label, 7 chars    */
-    NoisePatternFn  sample;    /* the pattern's per-cell sampler    */
+    const char     *name;      /* HUD name, padded to 10 chars */
+    const char     *tier;      /* HUD group label, padded to 7 */
+    NoisePatternFn  sample;    /* the pattern's draw function   */
 } NoisePattern;
 
 static const NoisePattern noise_patterns[N_PATTERNS] = {
@@ -1583,43 +1039,23 @@ static const char *pattern_tier(Pattern p)
 /* ===================================================================== */
 
 /*
- * GlowField — the per-cell output grid that the pipeline writes into
- * and the renderer reads from.
+ * GlowField — the finished picture as plain numbers, one entry per screen
+ * cell. The sim fills it in once per tick; the renderer reads it to draw.
+ * Keeping them separate means drawing can happen between sim ticks. The
+ * buffers are sized for the biggest possible grid up front, so the busy
+ * loop never has to allocate memory.
  *
- * INTENT
- *   Decouple "compute the cellular noise field" (scene_evaluate_field,
- *   runs once per sim tick) from "paint the cellular noise field"
- *   (scene_draw, runs once per render frame). The GlowField is the
- *   snapshot the renderer reads in between ticks.
- *
- * CONTEXT
- *   Lives on Scene (§7). Written by scene_evaluate_field() — one
- *   pattern-sampler call per cell, results written here. Read by
- *   scene_draw() — uses glow + band via the GlyphRamp to pick a
- *   glyph + colour pair. Index with glow_field_idx(gf, x, y) =
- *   y · w + x (row-major).
- *
- * MEMORY
- *   No allocation post-init. Both buffers are sized at CELLS_MAX in
- *   BSS storage so the hot path never touches malloc/free.
- *
- * MEMBER LOGIC
- *   w, h    : Grid dimensions in cells. Set by app_pick_map_size()
- *             at init and on every resize. Bounded by [16..MAP_W_MAX]
- *             × [8..MAP_H_MAX].
- *   count   : w · h, cached at reset so the clearing loop and the
- *             dispatcher don't recompute it each tick.
- *   glow[]  : Per-cell scalar ∈ [0, 1]. The pattern sampler in §6
- *             writes here.
- *   band[]  : Per-cell palette band ∈ {0, 1, 2, 3}. Tier-4 patterns
- *             derive it from cell_id; every other tier from glow
- *             quartile.
+ *   w, h   : grid size in cells, set at startup and on every resize.
+ *   count  : w * h, kept around so loops don't recompute it.
+ *   glow[] : each cell's brightness, 0 to 1.
+ *   band[] : each cell's colour, 0 to 3.
+ * Find a cell with glow_field_idx(gf, x, y).
  */
 typedef struct {
-    int      w, h;                   /* grid dims (cells), set at reset */
-    int      count;                  /* w * h, cached for tight loops   */
-    float    glow[CELLS_MAX];        /* per-cell scalar ∈ [0, 1]        */
-    uint8_t  band[CELLS_MAX];        /* per-cell palette tier ∈ {0..3}  */
+    int      w, h;                   /* grid size in cells          */
+    int      count;                  /* w * h                       */
+    float    glow[CELLS_MAX];        /* per-cell brightness 0..1    */
+    uint8_t  band[CELLS_MAX];        /* per-cell colour 0..3        */
 } GlowField;
 
 static inline int glow_field_idx(const GlowField *gf, int x, int y)
@@ -1639,55 +1075,38 @@ static void glow_field_reset(GlowField *gf, int w, int h)
 }
 
 /*
- * GlyphRamp — the density → (glyph, attr) mapping.
+ * GlyphRamp — the rule for turning a brightness into a character. Brighter
+ * cells get a denser character; the dimmest are left blank. Keeping it as
+ * data (rather than if/else in the drawer) makes the cutoffs easy to see
+ * and would let a future theme swap in different characters.
  *
- * INTENT
- *   Capture "how density becomes a character" as a NAMED RULE
- *   rather than an inline if/else in the renderer. Three benefits:
- *   (1) the threshold values are visible as data; (2) a future
- *   feature can swap ramps per theme; (3) the renderer reads
- *   `glyph_ramp_pick(...)` which scans cleaner than `if (glow > X)`.
- *
- * THE RAMP
- *      glow > thresh_high  →  glyph_high  bold     (dense core)
- *      glow > thresh_mid   →  glyph_mid   bold     (mid density)
- *      glow > thresh_low   →  glyph_low   normal   (faint trace)
- *      else                →  not drawn            (transparent)
- *
- * INVARIANT
- *   thresh_high > thresh_mid > thresh_low > 0
- *   Defaults from GLYPH_HIGH_THRESH / GLYPH_MID_THRESH / GLOW_THRESHOLD.
- *
- * GLYPH CHOICE
- *   '#', '*', '.' is a coarse 3-tier subset of Paul Bourke's
- *   canonical 10-char luminance ramp "@%#*+=-:. ". Three tiers
- *   chosen for perceptual contrast at terminal resolution.
- *
- * Ref: Bourke, "Character representation of grey scale images".
+ *   thresh_high/mid/low : the brightness cutoffs, must go high > mid > low.
+ *   glyph_high/mid/low  : the character drawn at each level.
+ * The three characters '#', '*', '.' are a coarse slice of Paul Bourke's
+ * dark-to-light character ramp.
  */
 typedef struct {
-    float thresh_high;   /* > this → glyph_high  (default 0.65) */
-    float thresh_mid;    /* > this → glyph_mid   (default 0.30) */
-    float thresh_low;    /* > this → glyph_low   (default 0.05) */
-    char  glyph_high;    /* dense core   glyph                  */
-    char  glyph_mid;     /* mid-density  glyph                  */
-    char  glyph_low;     /* faint-trace  glyph                  */
+    float thresh_high;   /* above this -> densest char  (default 0.65) */
+    float thresh_mid;    /* above this -> medium char   (default 0.30) */
+    float thresh_low;    /* above this -> faintest char (default 0.05) */
+    char  glyph_high;    /* densest char  */
+    char  glyph_mid;     /* medium char   */
+    char  glyph_low;     /* faintest char */
 } GlyphRamp;
 
 /*
- * GlyphChoice — return value from glyph_ramp_pick(). Small POD struct
- * so the call site reads as a pure function:
+ * GlyphChoice — what glyph_ramp_pick() decided for one cell: which
+ * character, whether to bold it, and whether to draw it at all. The colour
+ * is decided separately, so this doesn't carry one.
  *
- *   GlyphChoice gc = glyph_ramp_pick(ramp, glow);
- *   if (gc.visible) draw_cell(gc.glyph, palette[band], gc.attr);
- *
- * Caller composes (glyph, attr) with the palette band index from
- * elsewhere — GlyphRamp deliberately doesn't know about colour.
+ *   glyph   : the character to draw (only meaningful if visible).
+ *   attr    : bold or normal.
+ *   visible : false means leave the cell blank.
  */
 typedef struct {
-    char glyph;         /* the char to draw — only valid if visible   */
-    int  attr;          /* ncurses attribute: A_BOLD or A_NORMAL      */
-    bool visible;       /* false → leave the cell empty (transparent) */
+    char glyph;         /* char to draw (only if visible)   */
+    int  attr;          /* A_BOLD or A_NORMAL               */
+    bool visible;       /* false -> leave the cell blank    */
 } GlyphChoice;
 
 static void glyph_ramp_init(GlyphRamp *gr)
@@ -1710,53 +1129,36 @@ static GlyphChoice glyph_ramp_pick(const GlyphRamp *gr, float glow)
 }
 
 /*
- * PatternState — the active pattern + how it animates over time.
+ * PatternState — which pattern is showing and how it's animating.
  *
- * INTENT
- *   Group the three values that together describe "the current
- *   animation": which pattern, where in its drift cycle, and at
- *   what speed. They change together, so giving them a struct
- *   gives the animation a name.
- *
- * MEMBER LOGIC
- *   current    : Active pattern enum, indexes noise_patterns[].
- *                Defaults to PATTERN_F2_F1 (the sharpest Voronoi-
- *                edge pattern — best boot frame). Cycled by n/p.
- *   field_time : Wobble-drift accumulator (noise-space units).
- *                Advanced each tick by FIELD_DRIFT × drift_mult × dt.
- *                Feeds the per-tile wobble phase inside worley_query.
- *                Monotonically increasing; never reset except on r.
- *   drift_mult : User-controlled drift-rate multiplier. Power of 2
- *                in [DRIFT_MULT_MIN, DRIFT_MULT_MAX] = [1, 16].
+ *   current    : the active pattern. Starts on the crisp-edge one, which
+ *                makes the best first impression. Cycled with n/p.
+ *   field_time : a clock that keeps climbing; it's what makes the dots
+ *                wobble. Only resets on r.
+ *   drift_mult : how fast that clock runs (1, 2, 4 ... up to 16), set by +/-.
  */
 typedef struct {
-    Pattern current;          /* active pattern enum                  */
-    float   field_time;       /* drift accumulator (noise-space units)*/
-    int     drift_mult;       /* powers of 2 ∈ [MIN, MAX]             */
+    Pattern current;          /* active pattern               */
+    float   field_time;       /* drift clock                  */
+    int     drift_mult;       /* drift speed, 1..16           */
 } PatternState;
 
 static void pattern_state_init(PatternState *ps)
 {
-    ps->current    = PATTERN_F2_F1;   /* boundary-line pattern by default */
+    ps->current    = PATTERN_F2_F1;   /* crisp-edge pattern by default */
     ps->field_time = 0.0f;
     ps->drift_mult = DRIFT_MULT_DEF;
 }
 
 /*
- * PaletteState — the active theme index.
+ * PaletteState — which colour theme is showing. Just an index for now,
+ * but kept as its own struct so the "current colours" idea has a home if
+ * theming grows later.
  *
- * INTENT
- *   Currently a one-int wrapper, but kept as a named struct on
- *   Scene so the responsibility "which colour scheme is showing"
- *   has a stable home. Future themed-glyph support or theme
- *   crossfades would extend this struct without disturbing Scene.
- *
- * MEMBER LOGIC
- *   current : Index into themes[] in §1. Always in [0, N_THEMES);
- *             wraparound is handled in the key handler via mod.
+ *   current : index into themes[]; the key handler wraps it around.
  */
 typedef struct {
-    int current;              /* index into themes[] ∈ [0, N_THEMES) */
+    int current;              /* index into themes[]  */
 } PaletteState;
 
 static void palette_state_init(PaletteState *p)
@@ -1765,59 +1167,40 @@ static void palette_state_init(PaletteState *p)
 }
 
 /*
- * Scene — composite owner of ALL mutable simulation state.
+ * Scene — holds everything that changes while the program runs. The fields
+ * are listed in the order data flows: the noise seed feeds the active
+ * pattern, which fills the field, which the ramp and theme turn into
+ * pictures on screen.
  *
- * THE PIPELINE (top to bottom = dataflow order)
- *
- *   noise    — the WorleyNoise seed                  (the ALGORITHM)
- *               ↓ (sampled by pattern functions)
- *   pattern  — active pattern + drift state         (the ANIMATION)
- *               ↓ (drives scene_evaluate_field)
- *   field    — per-cell glow + band buffers         (the DATA)
- *               ↓ (read by scene_draw)
- *   ramp     — density → glyph mapping              (the RENDER RULE)
- *               + palette colour pairs (via ncurses)
- *               ↓
- *   palette  — active theme index                   (the COLOUR CHOICE)
- *               + paused flag                       (the CONTROL)
- *
- *   Reads in dataflow order: noise → field (via pattern) →
- *   ramp + palette (via renderer).
+ *   noise   : the seed the dots come from.
+ *   field   : the finished brightness/colour grid.
+ *   ramp    : brightness-to-character rule.
+ *   pattern : which pattern and how it's animating.
+ *   palette : which colour theme.
+ *   paused  : when true, the sim stops updating.
  */
 typedef struct {
-    WorleyNoise   noise;     /* §5 — seed-holding primitive (mutable)       */
-    GlowField     field;     /* per-cell output grid (largest member)       */
-    GlyphRamp     ramp;      /* density → glyph rule (read-mostly)          */
-    PatternState  pattern;   /* active pattern + drift accumulator + speed  */
-    PaletteState  palette;   /* active theme index                          */
-    bool          paused;    /* if true, scene_tick early-returns           */
+    WorleyNoise   noise;     /* the dot field's seed              */
+    GlowField     field;     /* finished grid (biggest member)    */
+    GlyphRamp     ramp;      /* brightness -> character rule      */
+    PatternState  pattern;   /* active pattern + animation        */
+    PaletteState  palette;   /* active colour theme               */
+    bool          paused;    /* true -> sim frozen                */
 } Scene;
 
-/* ---------- Per-cell mapping helper used by scene_evaluate_field ----- */
-
-/* cell index → noise-space coordinate (cells × NOISE_SCALE). Used as
- * the (x, y) argument to every pattern sampler. */
+/* Turn a cell's grid position into the coordinate the patterns work in. */
 static inline float cell_to_noise_coord(int cell)
 {
     return (float)cell * NOISE_SCALE;
 }
 
-/*
- * scene_evaluate_field — drive the whole pipeline for one sim tick.
- *
- *   FOR every cell (x, y):
- *     fx, fy = noise-space coords          // cell_to_noise_coord
- *     (glow, band) = active_pattern(noise, fx, fy, drift)
- *     write (glow, band) → GlowField[x, y]
- *
- * Hot loop — one pattern call per cell × ~11K cells × 60 Hz. The
- * pattern functions are tiny but worley_query itself examines 9
- * tiles per call; the heaviest patterns (Tier 5 fBm, Tier 6 hybrids)
- * call worley_query 2-3× per cell.
- */
+/* Fill the whole grid for one sim tick: run the active pattern at every
+ * cell and store the brightness and colour it returns. This is the busy
+ * part of the program — it runs the lookup for thousands of cells, many
+ * times a second. */
 static void scene_evaluate_field(Scene *s)
 {
-    /* STEP 1 — RESOLVE the active pattern's sampler. */
+    /* Look up the active pattern's draw function once, up front. */
     Pattern active = s->pattern.current;
     if ((unsigned)active >= (unsigned)N_PATTERNS) return;
     NoisePatternFn      sample_pattern = noise_patterns[active].sample;
@@ -1825,7 +1208,6 @@ static void scene_evaluate_field(Scene *s)
     GlowField          *field          = &s->field;
     float               drift          = s->pattern.field_time;
 
-    /* STEP 2 — SAMPLE PER CELL: pattern writes (glow, band) directly. */
     for (int y = 0; y < field->h; y++) {
         float fy = cell_to_noise_coord(y);
         for (int x = 0; x < field->w; x++) {
@@ -1861,7 +1243,7 @@ static void scene_init(Scene *s, int mw, int mh)
 static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
-    /* Drive the per-tile wobble (drift accumulator advances drift_mult× rate). */
+    /* Advance the wobble clock, faster or slower per the drift setting. */
     s->pattern.field_time += FIELD_DRIFT * (float)s->pattern.drift_mult * dt;
     scene_evaluate_field(s);
 }
@@ -1871,35 +1253,17 @@ static void scene_tick(Scene *s, float dt)
 /* ===================================================================== */
 
 /*
- * Screen — the terminal viewport's dimensions, cached from ncurses.
+ * Screen — just the terminal's current width and height, remembered so we
+ * don't ask ncurses for them on every cell. Set up at startup, refreshed
+ * whenever the window resizes, and torn down at exit (which restores the
+ * terminal).
  *
- * INTENT
- *   Decouple "what the terminal is" from "what the simulation is".
- *   ncurses owns the actual screen buffer, the input loop, and the
- *   colour-pair table; Screen just remembers cols × rows so we
- *   don't call getmaxyx() once per cell. Separating from Scene
- *   also matches the pattern in sibling demos.
- *
- * LIFETIME
- *   screen_init   — calls initscr(), configures ncurses, captures
- *                   cols/rows.
- *   screen_resize — re-captures cols/rows after a SIGWINCH. Owner
- *                   (App) follows up with scene_reset to re-size
- *                   the GlowField.
- *   screen_free   — calls endwin() to restore the terminal.
- *
- * MEMBER LOGIC
- *   cols : terminal width  in cells. ≥ 16 enforced by
- *          app_pick_map_size (smaller and the HUD won't fit).
- *   rows : terminal height in cells. ≥ 8 enforced by
- *          app_pick_map_size; HUD reserves 3 rows top/bottom.
- *   Ordering matches the ncurses getmaxyx(stdscr, rows, cols)
- *   convention — rows first because curses originally targeted
- *   line-printers.
+ *   cols : terminal width in cells.
+ *   rows : terminal height in cells.
  */
 typedef struct {
-    int cols;     /* terminal width  in cells (≥ 16)  */
-    int rows;     /* terminal height in cells (≥ 8)   */
+    int cols;     /* terminal width in cells   */
+    int rows;     /* terminal height in cells  */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -1925,57 +1289,20 @@ static void screen_resize(Screen *s)
 /* ---------- scene_draw: grid → glyphs ---------------------------------- */
 
 /*
- * GridPlacement — the top-left screen cell where the field's (0, 0)
- * cell will be drawn. The result of centering the GlowField inside
- * the terminal viewport, holding the HUD rows clear.
+ * GridPlacement — where on screen the top-left of the grid goes, worked
+ * out once so the drawing loop doesn't redo the centering math per cell.
+ * If the grid is bigger than the window, it's clamped to the edge and
+ * cropped (never wrapped). It never overlaps the title rows.
  *
- * INTENT
- *   Lift the centering math out of the per-cell inner loop. Without
- *   GridPlacement the loop would have to redo `(cols - field_w) / 2`
- *   plus the HUD-row offset on every cell — w·h times per frame.
- *   With it, the loop body becomes `screen_y = origin_y + y` which
- *   the compiler can fold into the loop induction variable.
- *
- *   Also names the "where on screen" decision so a reader sees
- *   `compute_grid_placement(...)` and immediately knows what's
- *   happening, instead of staring at four lines of `/ 2` arithmetic
- *   inline.
- *
- * CONTEXT
- *   Computed once at the top of scene_draw() (§8) by
- *   compute_grid_placement(field_w, field_h, cols, rows) and then
- *   passed implicitly via the local `place` to every cell.
- *
- *   Coordinate convention matches ncurses: (origin_y, origin_x) is
- *   the (row, col) of the top-left screen cell to start drawing at.
- *   Y grows DOWN (toward bottom of terminal), X grows RIGHT.
- *
- * INVARIANTS
- *   origin_x ≥ 0
- *   origin_y ≥ HUD_TOP_ROWS         (kept clear for the title bar)
- *   The bottom HUD_BOTTOM_ROWS rows are kept clear by sizing the
- *   field, not by clamping here — so origin_y + field_h may run up
- *   to (rows − HUD_BOTTOM_ROWS).
- *
- *   Negative results from the centering arithmetic (over-large
- *   field on a small viewport) are clamped to the viewport edge —
- *   the field is cropped, not wrapped. The "cell off-screen?"
- *   check in the drawer's inner loop handles the rest.
- *
- * MEMBER LOGIC
- *   origin_x : screen column (cells) of the field's leftmost cell.
- *              0 if the field is wider than the viewport.
- *   origin_y : screen row (cells) of the field's topmost cell.
- *              HUD_TOP_ROWS at minimum (never overlaps title bar).
+ *   origin_x : screen column of the grid's left edge.
+ *   origin_y : screen row of the grid's top edge.
  */
 typedef struct {
-    int origin_x;   /* screen column where field's left edge starts */
-    int origin_y;   /* screen row    where field's top edge starts  */
+    int origin_x;   /* grid's left edge, in screen columns */
+    int origin_y;   /* grid's top edge, in screen rows     */
 } GridPlacement;
 
-/* Centre the GlowField inside the terminal viewport, respecting the
- * HUD's reserved top + bottom rows. Negative offsets are clamped so
- * an over-large field is cropped, not wrapped. */
+/* Centre the grid in the window, leaving the HUD rows clear. */
 static GridPlacement compute_grid_placement(int field_w, int field_h,
                                             int cols, int rows)
 {
@@ -1988,7 +1315,7 @@ static GridPlacement compute_grid_placement(int field_w, int field_h,
     return p;
 }
 
-/* The one-cell paint primitive: bind colour, emit glyph, unbind. */
+/* Draw one character at one spot in the chosen colour. */
 static inline void draw_glyph_at(int screen_y, int screen_x,
                                  char glyph, int color_pair, int attr)
 {
@@ -1997,18 +1324,9 @@ static inline void draw_glyph_at(int screen_y, int screen_x,
     attroff(COLOR_PAIR(color_pair) | attr);
 }
 
-/*
- * scene_draw — paint the GlowField using the Scene's GlyphRamp and
- * the currently-bound colour palette.
- *
- *   place = centre field inside viewport
- *   FOR every cell:
- *     glyph_pick = ramp(glow)
- *     IF glyph_pick.visible:
- *       draw glyph_pick.glyph at place + (x, y) with band's colour
- *
- * Pure read of Scene state — no simulation here.
- */
+/* Draw the finished grid: for each cell, pick a character from its
+ * brightness and a colour from its tier, and place it. Cells off the edge
+ * or too dim to show are skipped. Only reads state, never changes it. */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
     const GlowField *field = &s->field;
@@ -2036,12 +1354,8 @@ static void scene_draw(const Scene *s, int cols, int rows)
     }
 }
 
-/* ---------- HUD layout widths ----------------------------------------- *
- *
- * Per-segment widths for the status row 1 chain. Each hud_draw_*
- * helper consumes (and returns) the cursor x; these widths are how
- * far each segment moves it.
- */
+/* How wide each piece of the status row is, so the drawers below can sit
+ * side by side. */
 #define HUD_W_PATTERN_FIELD   21   /* " pattern:%-10s "          */
 #define HUD_W_TIER_FIELD      15   /* " tier:%-7s "              */
 #define HUD_W_THEME_FIELD     17   /* " theme:%-8s "             */
@@ -2053,14 +1367,10 @@ static void scene_draw(const Scene *s, int cols, int rows)
 #define HUD_BOTTOM_HINT_TEXT \
     " n/p:pattern  t/T:theme  r:reset  spc:pause  +/-:drift  ]/[:Hz  q:quit "
 
-/* ---------- HUD: per-segment drawers ---------------------------------- *
- *
- * Each segment takes (row, x, ...) and returns the next x cursor
- * position so the caller can chain them. Names describe what's
- * INSIDE the segment, not how it looks.
- */
+/* Each drawer below paints one piece of a HUD row and returns where the
+ * next piece should start, so they can be chained left to right. */
 
-/* Row 0 LEFT — the program title chip. */
+/* Top-left: the program title. */
 static int hud_draw_title_chip(int row, int x)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -2069,7 +1379,7 @@ static int hud_draw_title_chip(int row, int x)
     return x + (int)strlen(HUD_TITLE_TEXT);
 }
 
-/* Row 0 RIGHT — fps + Hz + state + pattern index + drift multiplier. */
+/* Top-right: frame rate, tick rate, current pattern, and drift speed. */
 static void hud_draw_state_bar(int row, int cols,
                                double fps, int sim_fps,
                                const PatternState *ps, bool paused)
@@ -2088,7 +1398,7 @@ static void hud_draw_state_bar(int row, int cols,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* Row 1 segment — "pattern:<NAME>" */
+/* Status row: the pattern's name. */
 static int hud_draw_pattern_field(int row, int x, Pattern p)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -2097,7 +1407,7 @@ static int hud_draw_pattern_field(int row, int x, Pattern p)
     return x + HUD_W_PATTERN_FIELD;
 }
 
-/* Row 1 segment — "tier:<N-LABEL>" */
+/* Status row: which group the pattern is in. */
 static int hud_draw_tier_field(int row, int x, Pattern p)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -2106,7 +1416,7 @@ static int hud_draw_tier_field(int row, int x, Pattern p)
     return x + HUD_W_TIER_FIELD;
 }
 
-/* Row 1 segment — "theme:<NAME>" */
+/* Status row: the colour theme's name. */
 static int hud_draw_theme_field(int row, int x, int theme_idx)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -2115,9 +1425,7 @@ static int hud_draw_theme_field(int row, int x, int theme_idx)
     return x + HUD_W_THEME_FIELD;
 }
 
-/* Row 1 segment — "palette:" label + N_PALETTE_BANDS coloured
- * swatches so the user can see each density-tier's colour at a glance
- * in the active theme. */
+/* Status row: little coloured blocks showing the theme's four colours. */
 static int hud_draw_palette_swatches(int row, int x)
 {
     attron(COLOR_PAIR(PAIR_HUD));
@@ -2134,8 +1442,7 @@ static int hud_draw_palette_swatches(int row, int x)
     return x;
 }
 
-/* Row 1 tail — algorithm parameter readout: noise scale, wobble
- * amplitude, grid dimensions. */
+/* Status row tail: zoom, wobble amount, and grid size. */
 static void hud_draw_stats_field(int row, int x, const GlowField *gf)
 {
     attron(COLOR_PAIR(PAIR_HUD));
@@ -2144,7 +1451,7 @@ static void hud_draw_stats_field(int row, int x, const GlowField *gf)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* Bottom row — keymap reminder. Fixed text; cyan + bold for contrast. */
+/* Bottom row: the list of keys you can press. */
 static void hud_draw_action_hint(int row)
 {
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -2154,27 +1461,19 @@ static void hud_draw_action_hint(int row)
 
 /* ---------- screen_draw: scene + full HUD ----------------------------- */
 
-/*
- * screen_draw — the per-frame composite renderer. Pure read of state.
- *
- *   STEP 1  erase  — ncurses double-buffer
- *   STEP 2  scene  — paint the GlowField
- *   STEP 3  HUD row 0 — title (left) + state bar (right)
- *   STEP 4  HUD row 1 — pattern | tier | theme | swatches | stats
- *   STEP 5  HUD last row — action hint
- */
+/* Draw one full frame: clear, paint the noise, then lay the HUD on top. */
 static void screen_draw(Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
     erase();
     scene_draw(s, sc->cols, sc->rows);
 
-    /* Row 0 — title + state bar */
+    /* Top row: title on the left, live stats on the right. */
     hud_draw_title_chip(HUD_TITLE_ROW, HUD_LEFT_MARGIN);
     hud_draw_state_bar (HUD_TITLE_ROW, sc->cols, fps, sim_fps,
                         &s->pattern, s->paused);
 
-    /* Row 1 — chained left-to-right segments */
+    /* Status row: each piece picks up where the last left off. */
     int x = HUD_LEFT_MARGIN;
     x = hud_draw_pattern_field   (HUD_STATUS_ROW, x, s->pattern.current);
     x = hud_draw_tier_field      (HUD_STATUS_ROW, x, s->pattern.current);
@@ -2182,7 +1481,6 @@ static void screen_draw(Screen *sc, const Scene *s,
     x = hud_draw_palette_swatches(HUD_STATUS_ROW, x);
     hud_draw_stats_field         (HUD_STATUS_ROW, x, &s->field);
 
-    /* Bottom row — keymap hint */
     hud_draw_action_hint(sc->rows - 1);
 }
 
@@ -2193,71 +1491,32 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — the top-level harness. Owns every other piece of state.
+ * App — the one struct that owns everything. main() only ever touches
+ * this; other functions get it or a piece of it. There's a single global
+ * copy (g_app) because signal handlers have to reach the two flags below,
+ * and signal handlers can't be handed a pointer.
  *
- * INTENT
- *   ONE struct at the top of the dependency tree, holding the
- *   simulation (Scene), the terminal binding (Screen), the tick
- *   rate, the chosen map dimensions, and the two signal flags
- *   driving the main loop. main() touches App and only App; every
- *   other function takes App* (for write paths) or const App*
- *   (for read paths) — or a sub-struct pointer if it only needs
- *   part of the state.
- *
- * SINGLETON
- *   One file-scope instance (g_app, see below). Signal handlers
- *   need to reach the `running` / `need_resize` flags from outside
- *   any caller's scope, and POSIX signal handlers can't take a
- *   user pointer — a file-scope `App` is the simplest correct
- *   path. The handlers ONLY touch the volatile sig_atomic_t flags;
- *   the main loop owns everything else.
- *
- * LIFETIME
- *   main() does: zero-init g_app → screen_init → app_pick_map_size
- *   → scene_init → loop → screen_free. No teardown beyond endwin()
- *   via atexit() — App is in BSS so the OS reclaims it at exit.
- *
- * MEMBER LOGIC
- *   scene       : The simulation. See Scene above.
- *
- *   screen      : Terminal cols/rows. Refreshed on every SIGWINCH
- *                 by app_do_resize().
- *
- *   sim_fps     : Tick rate in Hz. Determines TICK_NS used by the
- *                 fixed-timestep accumulator in main(). Adjustable
- *                 by ] (faster) / [ (slower) keys; clamped to
- *                 [SIM_FPS_MIN, SIM_FPS_MAX] = [10, 240].
- *
- *   map_w,      : Grid dimensions selected by app_pick_map_size()
- *   map_h         from the terminal cols/rows minus HUD reservations.
- *                 Bounded by [16..MAP_W_MAX] × [8..MAP_H_MAX].
- *                 Passed to scene_reset on init and resize.
- *
- *   running     : Cleared to 0 by SIGINT / SIGTERM handlers (and
- *                 by app_handle_key on q/ESC). Main loop exits when
- *                 this goes false. `volatile sig_atomic_t` because:
- *                 (1) POSIX guarantees only sig_atomic_t writes are
- *                 async-safe inside a signal handler; (2) `volatile`
- *                 prevents the compiler from caching the read in
- *                 the main loop (the handler can flip it between
- *                 any two iterations).
- *
- *   need_resize : Set to 1 by SIGWINCH handler; consumed by main
- *                 loop, which then calls app_do_resize() and clears
- *                 it. Same volatile-sig_atomic_t rationale as
- *                 `running`. The signal → flag → main-loop-consumes
- *                 pattern keeps the handler tiny and signal-safe
- *                 (no libc calls beyond what's listed in
- *                 signal-safety(7)).
+ *   scene       : the simulation.
+ *   screen      : terminal size, refreshed on resize.
+ *   sim_fps     : how many times a second the sim updates (]/[ to change).
+ *   map_w,
+ *   map_h       : the grid size, picked from the terminal size.
+ *   running     : the main loop runs while this is true; q, ESC, or a
+ *                 kill signal clears it.
+ *   need_resize : a resize signal sets this; the main loop notices and
+ *                 re-fits the grid.
+ * The two flags are volatile sig_atomic_t: that's the only kind of
+ * variable a signal handler is allowed to set safely, and volatile stops
+ * the loop from caching a stale value.
  */
 typedef struct {
-    Scene                 scene;        /* the simulation                       */
-    Screen                screen;       /* terminal dims, refreshed on resize   */
-    int                   sim_fps;      /* tick rate Hz, user-adjustable by ]/[ */
-    int                   map_w;        /* chosen grid width  (cells)           */
-    int                   map_h;        /* chosen grid height (cells)           */
-    volatile sig_atomic_t running;      /* main-loop flag, 0 → exit             */
-    volatile sig_atomic_t need_resize;  /* SIGWINCH→1, main loop consumes       */
+    Scene                 scene;        /* the simulation                  */
+    Screen                screen;       /* terminal size                   */
+    int                   sim_fps;      /* sim updates per second          */
+    int                   map_w;        /* grid width  (cells)             */
+    int                   map_h;        /* grid height (cells)             */
+    volatile sig_atomic_t running;      /* main loop runs while true       */
+    volatile sig_atomic_t need_resize;  /* set by a resize signal          */
 } App;
 
 static App g_app;
@@ -2286,23 +1545,17 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* ---------- Scene action helpers (input → state mutation) ------------- *
- *
- * Each helper names ONE keystroke-triggered state change, so
- * app_handle_key reads as a keymap rather than a switch full of
- * arithmetic. Direction parameters use ±1 throughout for next/prev
- * symmetry.
- */
+/* Each helper below is one thing a keypress does, so the key handler reads
+ * as a tidy list. The +1/-1 direction means next/previous. */
 
-/* Cycle the active pattern by ±1 with wraparound through N_PATTERNS. */
+/* Move to the next or previous pattern, wrapping around the ends. */
 static void scene_cycle_pattern(Scene *s, int direction)
 {
     int next = ((int)s->pattern.current + direction + N_PATTERNS) % N_PATTERNS;
     s->pattern.current = (Pattern)next;
 }
 
-/* Cycle the active theme by ±1 with wraparound, then rebind ncurses
- * colour pairs to the new palette via theme_apply (side effect). */
+/* Move to the next or previous theme, then load its colours. */
 static void scene_cycle_theme(Scene *s, int direction)
 {
     s->palette.current = (s->palette.current + direction + N_THEMES)
@@ -2310,8 +1563,7 @@ static void scene_cycle_theme(Scene *s, int direction)
     theme_apply(s->palette.current);
 }
 
-/* Drift speed control — multiplier doubles or halves in clean ×2 / ÷2
- * steps so the user perceives discrete speed changes, not a slider. */
+/* Drift speed doubles or halves so the change feels like clear steps. */
 static void scene_drift_double(PatternState *ps)
 {
     if (ps->drift_mult < DRIFT_MULT_MAX) ps->drift_mult *= 2;
@@ -2323,7 +1575,7 @@ static void scene_drift_halve(PatternState *ps)
     if (ps->drift_mult < DRIFT_MULT_MIN) ps->drift_mult = DRIFT_MULT_MIN;
 }
 
-/* Adjust sim tick rate by delta Hz, clamped to [SIM_FPS_MIN, MAX]. */
+/* Speed the sim up or slow it down, kept within sane limits. */
 static void app_adjust_sim_fps(App *app, int delta)
 {
     app->sim_fps += delta;
@@ -2331,11 +1583,7 @@ static void app_adjust_sim_fps(App *app, int delta)
     if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
 }
 
-/*
- * app_handle_key — the keymap. Returns false on quit, true otherwise.
- * Every arm is a single named action so the switch reads as
- * "key → behaviour" without arithmetic inline.
- */
+/* Do what one keypress asks. Returns false only when the user wants to quit. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
@@ -2361,46 +1609,26 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* ---------- FrameClock: timing accumulators for the main loop --------- */
-
 /*
- * FrameClock — every running scalar the main loop's timing needs,
- * grouped under one name.
+ * FrameClock — the timekeeping the main loop needs, in one place. It does
+ * two jobs that both start from "how long did this frame take":
+ *   - It keeps the sim ticking at a steady rate no matter how choppy the
+ *     drawing is: bank up elapsed time and spend it one fixed tick at a
+ *     time (the classic "fix your timestep" approach).
+ *   - It works out the frame rate to show in the HUD.
  *
- * INTENT
- *   The original main loop carried FIVE loose locals (frame_time,
- *   sim_accum, fps_accum, frame_count, fps_display) that all had
- *   to be initialised together, reset together on resize, and
- *   advanced together each frame. Grouping them makes the loop
- *   body a sequence of NAMED operations on one object
- *   (frame_clock_advance, fps_meter_observe, …) instead of a
- *   collection of bare arithmetic against scattered locals.
- *
- * THE TWO SUB-ACCUMULATORS
- *   FrameClock combines two independent integrator patterns that
- *   happen to share `frame_dt_ns` as their input:
- *
- *     1) FIXED-TIMESTEP SIM DRIVER  (sim_accum_ns)
- *        Each frame's wall-clock dt is poured into the accumulator;
- *        drained one TICK_NS chunk at a time into scene_tick() calls.
- *        The "Glenn Fiedler / 'Fix Your Timestep!'" pattern.
- *
- *     2) FPS METER                  (fps_accum_ns + fps_frame_count)
- *        Sum frame dts and count frames; every FPS_UPDATE_MS of wall
- *        clock, divide frames/seconds to refresh `fps_display`. The
- *        HUD reads `fps_display` only.
- *
- * Refs:
- *   • Glenn Fiedler, "Fix Your Timestep!" (gafferongames.com)
- *   • POSIX clock_gettime(CLOCK_MONOTONIC) — the wall-clock source
- *     in §2 clock_ns(); strictly increasing, immune to NTP jumps.
+ *   frame_time_ns   : when the current frame started.
+ *   sim_accum_ns    : banked-up time still waiting to be turned into ticks.
+ *   fps_accum_ns,
+ *   fps_frame_count : time and frames counted toward the next fps figure.
+ *   fps_display     : the latest frame rate, which the HUD reads.
  */
 typedef struct {
-    int64_t frame_time_ns;     /* wall clock at start of current frame    */
-    int64_t sim_accum_ns;      /* unconsumed time → sim ticks (Fiedler)   */
-    int64_t fps_accum_ns;      /* ns since last FPS recomputation         */
-    int     fps_frame_count;   /* frames since last FPS recomputation     */
-    double  fps_display;       /* last computed FPS — the value HUD reads */
+    int64_t frame_time_ns;     /* when this frame started              */
+    int64_t sim_accum_ns;      /* time banked for sim ticks            */
+    int64_t fps_accum_ns;      /* time counted toward the fps figure   */
+    int     fps_frame_count;   /* frames counted toward the fps figure */
+    double  fps_display;       /* latest fps, shown in the HUD         */
 } FrameClock;
 
 static void frame_clock_init(FrameClock *fc)
@@ -2412,16 +1640,16 @@ static void frame_clock_init(FrameClock *fc)
     fc->fps_display     = 0.0;
 }
 
-/* Re-anchor the clock after a stall (e.g. SIGWINCH resize) so we don't
- * burst-tick to "catch up" on time the user wasn't seeing the sim. */
+/* After a pause (like a window resize), reset the clock so the sim doesn't
+ * try to fast-forward through the time the user wasn't watching. */
 static void frame_clock_resync(FrameClock *fc)
 {
     fc->frame_time_ns = clock_ns();
     fc->sim_accum_ns  = 0;
 }
 
-/* Advance the frame clock; return dt since previous frame, capped at
- * MAX_FRAME_DT_NS to prevent the spiral-of-death failure mode. */
+/* Tick the clock over to now and report how long the last frame took,
+ * capped so a long stall can't make the sim try to catch up all at once. */
 static int64_t frame_clock_advance(FrameClock *fc)
 {
     int64_t now = clock_ns();
@@ -2431,8 +1659,7 @@ static int64_t frame_clock_advance(FrameClock *fc)
     return dt;
 }
 
-/* FPS meter — accumulate frame dt; when FPS_UPDATE_MS worth has piled
- * up, divide frames by elapsed seconds and refresh the display value. */
+/* Count this frame; every half-second or so, recompute the frame rate. */
 static void fps_meter_observe(FrameClock *fc, int64_t frame_dt_ns)
 {
     fc->fps_frame_count++;
@@ -2445,12 +1672,9 @@ static void fps_meter_observe(FrameClock *fc, int64_t frame_dt_ns)
     }
 }
 
-/* ---------- Main-loop step helpers ----------------------------------- */
-
-/* Fiedler's fixed-timestep tick drain. Pour this frame's dt into the
- * accumulator, then consume it one TICK_NS chunk at a time, calling
- * scene_tick() with a STABLE per-tick dt — so the simulation behaves
- * identically regardless of render-frame jitter. */
+/* Bank this frame's time, then spend it on sim ticks in fixed chunks. Each
+ * tick advances the sim by the same amount, so it behaves the same whether
+ * the screen is drawing smoothly or stuttering. */
 static void app_run_fixed_step_ticks(App *app, FrameClock *fc,
                                      int64_t frame_dt_ns)
 {
@@ -2464,9 +1688,8 @@ static void app_run_fixed_step_ticks(App *app, FrameClock *fc,
     }
 }
 
-/* Sleep so the render loop spins at ~60 Hz. Compute how much wall-
- * clock has been consumed this iteration (tick work + frame-to-frame
- * gap) and sleep the remainder of the frame budget. */
+/* Sleep off whatever's left of this frame's time budget so the screen
+ * refreshes around 60 times a second instead of as fast as possible. */
 static void app_throttle_to_render_rate(int64_t frame_start_ns,
                                         int64_t frame_dt_ns)
 {
@@ -2476,8 +1699,7 @@ static void app_throttle_to_render_rate(int64_t frame_start_ns,
     clock_sleep_ns(target_frame_period_ns - time_consumed_ns);
 }
 
-/* Drain one key event (non-blocking) and route it to app_handle_key.
- * Quit returns false from the handler → we clear app->running. */
+/* Grab a keypress if there is one and act on it; quit clears running. */
 static void app_pump_input(App *app)
 {
     int ch = getch();
@@ -2485,9 +1707,9 @@ static void app_pump_input(App *app)
         app->running = 0;
 }
 
-/* Wire SIGINT / SIGTERM → exit flag, SIGWINCH → resize flag.
- * Handler bodies are tiny (one volatile flip each) so they stay
- * inside the POSIX signal-safety envelope. */
+/* Hook up the signals: Ctrl-C / kill end the program, a resize re-fits
+ * the grid. The handlers only flip a flag, which is all they're allowed
+ * to do safely. */
 static void app_install_signal_handlers(void)
 {
     signal(SIGINT,   on_exit_signal);
@@ -2496,24 +1718,13 @@ static void app_install_signal_handlers(void)
 }
 
 /*
- * main — top-level driver. Reads as pseudocode:
- *
- *   bootstrap (PRNG seed, signal handlers, atexit cleanup)
- *   init terminal → pick grid size → init simulation
- *   init frame clock
- *   LOOP until app.running goes false:
- *     handle pending resize
- *     advance frame clock → frame_dt
- *     run fixed-step sim ticks (Fiedler)
- *     fps meter
- *     throttle to render rate
- *     draw scene + HUD; present
- *     pump input (may clear running)
- *   shutdown terminal
+ * main — set things up, then loop: handle any resize, advance the clock,
+ * run the sim, pace the frame rate, draw, and read input, until the user
+ * quits. Then put the terminal back the way it was.
  */
 int main(void)
 {
-    /* STEP 1 — bootstrap */
+    /* Seed randomness, make sure the terminal gets restored on exit. */
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
     app_install_signal_handlers();
@@ -2522,12 +1733,11 @@ int main(void)
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
 
-    /* STEP 2 — terminal + simulation init */
+    /* Start the terminal and the simulation. */
     screen_init(&app->screen);
     app_pick_map_size(app);
     scene_init(&app->scene, app->map_w, app->map_h);
 
-    /* STEP 3 — main loop */
     FrameClock clock;
     frame_clock_init(&clock);
 
@@ -2549,7 +1759,6 @@ int main(void)
         app_pump_input(app);
     }
 
-    /* STEP 4 — shutdown */
     screen_free(&app->screen);
     return 0;
 }

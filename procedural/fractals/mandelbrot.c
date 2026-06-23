@@ -1,78 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * mandelbrot.c — the Mandelbrot set, revealed as scattered dots
+ * mandelbrot.c — draws the Mandelbrot set, building up from scattered dots.
  *
- * Each cell maps to a complex number c; starting from z = 0 the iteration
- * z → z² + c is repeated until |z| > 2 (escape) or MAX_ITER (inside the set).
- * The escape count colours the cell; the interior is drawn solid.
+ * The Mandelbrot set is a test you run on each point of the screen: keep
+ * squaring a number and adding the point back in; if the result stays small
+ * forever the point is "inside" the set, and if it runs off toward infinity
+ * it's outside. How fast it runs off picks the colour. See julia.c and
+ * burning_ship.c for close cousins of this same idea.
  *
- * FOUR LAYERS, deliberately separated so the maths is trustworthy and the things
- * that happen "over time" are obvious:
- *
- *   §4 CORE   — the pure maths: complex iteration → escape count → colour band.
- *               Given a point c it returns a cell value.  It touches no grid, no
- *               clock, no screen, so the fractal definition is safe.
- *   §5 FIELD  — the cell grid plus the complex-plane window it samples and the
- *               cell → c mapping.  Pure data.
- *   §6 REVEAL — the EFFECTS & DELAYS, all in one place: the shuffled pixel order
- *               (so the image materialises from scattered dots), the per-tick
- *               pixel budget (so a frame never stalls), and the hold before the
- *               next preset.  Remove it and the picture would simply appear in
- *               scan order at once; nothing else is applied over time but drawing.
- *   §8 RENDER — reads the field and paints glyphs.  Mutates nothing.
- *   §7 SCENE  — orchestration: field + reveal + preset + theme.
- *
- * Six preset zoom windows auto-advance, each a different region of the set
- * (full set, seahorse valley, north antenna, deep spiral, mini mandelbrot,
- * antenna tip).
- *
- * Keys:
- *   q / ESC   quit
- *   r / n     skip to the next preset
- *   t / T     next / prev colour theme
- *   ] [       faster / slower simulation
- *   p / spc   pause / resume
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra mandelbrot.c -o mandelbrot -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config   — constants, themes
- *   §2  clock    — monotonic ns clock + FrameClock (fixed-timestep pacing)
- *   §3  color    — themeable content palette (t/T) + HUD pairs
- *   §4  core     — complex iteration + escape count + band classify (PURE MATH)
- *   §5  field    — cell grid + complex-plane view + cell→c mapping (DATA)
- *   §6  reveal   — shuffled progressive fill + done-hold (EFFECTS & DELAYS)
- *   §7  scene    — orchestration: field + reveal + preset + theme
- *   §8  render   — field → glyphs (READ-ONLY)
- *   §9  screen   — ncurses lifecycle + HUD
- *   §10 app      — main loop
+ * Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
+ * Peitgen & Richter (1986). "The Beauty of Fractals." Springer — the
+ * escape-time colouring scheme used here.
  */
-
-/* ── REFERENCES — for the concepts and the rendering ──────────────────── *
- *
- *   The Mandelbrot set & escape-time  (§4 core)
- *   ── Brooks, R. & Matelski, J. P. (1981). "The Dynamics of 2-Generator
- *      Subgroups of PSL(2,C)." In Riemann Surfaces & Related Topics, Annals of
- *      Math. Studies 97, 65-71.  The first published picture of the set.
- *   ── Mandelbrot, B. B. (1980). "Fractal Aspects of the Iteration of z → λz(1−z)
- *      for Complex λ and z." Annals NY Acad. Sci. 357, 249-259.  The set and the
- *      escape-time view.
- *   ── Mandelbrot, B. B. (1982). "The Fractal Geometry of Nature." Freeman.
- *      Self-similarity and fractal dimension of the boundary.
- *   ── Douady, A. & Hubbard, J. H. (1982). "Itération des polynômes quadratiques
- *      complexes." C. R. Acad. Sci. Paris 294, 123-126.  Proof that the set is
- *      connected — the structure these zoom presets explore.
- *   ── Peitgen, H.-O. & Richter, P. H. (1986). "The Beauty of Fractals." Springer.
- *      The standard reference for escape-time colouring (cell_for_escape).
- *
- *   Rendering  (§6 reveal, §9 screen)
- *   ── Fisher, R. A. & Yates, F. (1938). "Statistical Tables." (Knuth, TAOCP
- *      Vol. 2, §3.4.2.)  The unbiased shuffle behind the random reveal order.
- *   ── Gookin, D. (2007). "Programmer's Guide to NCURSES." Wiley.  The cell-
- *      drawing API behind §8/§9.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -94,30 +33,33 @@ enum {
     SIM_FPS_MAX      =  60,
     SIM_FPS_STEP     =   5,
 
-    PIXELS_PER_TICK  =  60,    /* pixels revealed per sim tick (the build-up rate) */
-    MAX_ITER         = 256,    /* Mandelbrot iteration cap                         */
-    DONE_PAUSE_TICKS =  90,    /* ticks to hold a finished view (~3 s) before next */
+    PIXELS_PER_TICK  =  60,    /* how many dots to fill in each tick (the build-up speed) */
+    MAX_ITER         = 256,    /* give up after this many squarings; if still small, call it "inside" */
+    DONE_PAUSE_TICKS =  90,    /* how long to admire a finished picture (~3 s) before moving on */
     N_PRESETS        =   6,
-    N_COLORS         =   5,    /* INSIDE + 4 escape bands (C2..C5)                 */
+    N_COLORS         =   5,    /* one colour for "inside", plus four for how fast a point escaped */
     N_THEMES         =  10,
 
     GRID_ROWS_MAX    =  80,
     GRID_COLS_MAX    = 300,
 
-    HUD_TOP_ROWS     =   2,    /* rows 0..1 — data HUD (status + parameters) */
-    HUD_BOT_ROWS     =   1,    /* last row  — action / key-hint bar          */
+    HUD_TOP_ROWS     =   2,    /* rows 0..1 reserved for the status/info bar at the top */
+    HUD_BOT_ROWS     =   1,    /* bottom row reserved for the key-hints bar */
     HUD_COLS         =  96,
     FPS_UPDATE_MS    = 500,
-    FRAME_DT_CAP_MS  = 100,    /* clamp one frame's dt — stops spiral-of-death */
-    RENDER_FPS_CAP   =  60,    /* render-rate ceiling the loop sleeps down to  */
+    FRAME_DT_CAP_MS  = 100,    /* never let one slow frame count as more than this, so we don't snowball */
+    RENDER_FPS_CAP   =  60,    /* draw at most this many frames per second */
 };
 
-/* Escape test: |z| > 2  ⟺  |z|² > 4. */
+/* A point has "escaped" once it gets bigger than 2. We compare the squared
+ * size against 4 instead, which means one less square root per pixel. */
 #define ESCAPE_R2        4.0f
-/* Escapes faster than this fraction of MAX_ITER are background (too far out). */
+/* Points that escape almost instantly are far outside the set; we leave those
+ * blank rather than colouring them, so only the interesting halo shows. */
 #define ESCAPE_FRAC_MIN  0.10f
 
-/* ASPECT_R — terminal cell height / width ≈ 2; undistorts the complex mapping. */
+/* Terminal cells are about twice as tall as they are wide. We stretch the
+ * horizontal span by this much so the fractal looks round, not squashed. */
 #define ASPECT_R    2.0f
 
 #define NS_PER_SEC  1000000000LL
@@ -125,20 +67,19 @@ enum {
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
 /*
- * Theme — the five content colours of one palette: the escape-time ramp that maps
- * how slowly a pixel escaped onto a colour (Peitgen & Richter 1986), reading
- * inside → boundary halo.
- *   c[0] = COL_INSIDE  (fractal body)
- *   c[1] = COL_C2      (fastest shown escape band, the far halo)
- *   c[2] = COL_C3, c[3] = COL_C4, c[4] = COL_C5 (progressively nearer the body)
- * c8[] is the 8-colour fallback.  The HUD is theme-independent (yellow data, cyan
- * actions) per the project standard, so a theme carries no HUD colour.  Adding a
- * palette is one table row; the engine never changes.
+ * Theme — one colour scheme. Five colours, going from the body of the fractal
+ * out to its edge, picked by how fast each point escaped (Peitgen & Richter 1986):
+ *   c[0] = the solid interior (points that never escaped)
+ *   c[1] = points that escaped quickest — the faint outer halo
+ *   c[2..4] = slower and slower escapes, working in toward the body
+ * c8[] is a plain-8-colour version for terminals that can't do 256 colours.
+ * The HUD keeps its own fixed colours (yellow + cyan) so it stays readable on
+ * any theme. To add a palette, add one row to the table below; nothing else changes.
  */
 typedef struct {
-    const char *name;   /* shown in the HUD                   */
-    int c[5];           /* 256-colour: INSIDE, C2, C3, C4, C5 */
-    int c8[5];          /* 8-colour fallback, same order      */
+    const char *name;   /* shown in the info bar */
+    int c[5];           /* the five colours, for 256-colour terminals */
+    int c8[5];          /* same five, fallback for 8-colour terminals */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -177,17 +118,17 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /*
- * FrameClock — the fixed-timestep heartbeat.  Real frames arrive irregularly, but
- * the simulation must advance in equal slices: each frame we bank the elapsed real
- * time as `sim_debt`, then repay it one TICK_NS step at a time.  The fps_* fields
- * measure a smoothed rate for the HUD.
+ * FrameClock — keeps the animation running at a steady pace. Real frames come in
+ * at uneven times, but we want the picture to fill in by equal amounts. So each
+ * frame we add up the real time that passed (sim_debt) and "pay it back" in
+ * fixed-size steps. The fps fields just measure the current frame rate to show it.
  */
 typedef struct {
-    int64_t prev_ns;     /* CLOCK_MONOTONIC stamp at this frame's start          */
-    int64_t sim_debt;    /* unspent ns owed to the fixed step; left in [0,TICK)  */
-    int64_t fps_window;  /* ns elapsed since the last fps sample was emitted     */
-    int     fps_frames;  /* frames counted since the last fps sample             */
-    double  fps;         /* smoothed frames/sec, refreshed every FPS_UPDATE_MS   */
+    int64_t prev_ns;     /* the clock reading when this frame started, in nanoseconds */
+    int64_t sim_debt;    /* time that's passed but not yet turned into steps */
+    int64_t fps_window;  /* time gathered toward the next frame-rate measurement */
+    int     fps_frames;  /* frames counted toward the next frame-rate measurement */
+    double  fps;         /* the frame rate to display, refreshed twice a second */
 } FrameClock;
 
 static void frameclock_init(FrameClock *fc)
@@ -211,7 +152,7 @@ static void frameclock_sample_fps(FrameClock *fc, int64_t dt)
     }
 }
 
-/* Open a frame: measure dt since the last one, clamp a long stall, bank it. */
+/* Start a frame: see how long since the last one, cap any big hiccup, save it. */
 static void frameclock_begin_frame(FrameClock *fc)
 {
     int64_t now = clock_ns();
@@ -225,7 +166,7 @@ static void frameclock_begin_frame(FrameClock *fc)
     frameclock_sample_fps(fc, dt);
 }
 
-/* True (and pays down the debt) while a fixed sim step is owed. */
+/* Returns true while we still owe another step, subtracting one step each time. */
 static bool frameclock_step_due(FrameClock *fc, int64_t tick_ns)
 {
     if (fc->sim_debt < tick_ns) return false;
@@ -233,7 +174,7 @@ static bool frameclock_step_due(FrameClock *fc, int64_t tick_ns)
     return true;
 }
 
-/* Sleep off the remainder of this frame's budget to cap the render rate. */
+/* If we finished the frame early, sleep the leftover time so we don't run too fast. */
 static void frameclock_throttle(const FrameClock *fc)
 {
     int64_t budget  = NS_PER_SEC / RENDER_FPS_CAP;
@@ -246,21 +187,21 @@ static void frameclock_throttle(const FrameClock *fc)
 /* ===================================================================== */
 
 /*
- * Colour-pair slots.  COL_INSIDE / COL_C2..C5 are the content ramp, rebound by
- * theme_apply().  COL_HUD (data) and COL_HINT (actions) are theme-independent so
- * the HUD stays legible over any palette.
+ * Names for ncurses colour slots. INSIDE and C2..C5 are the fractal's five
+ * colours and get swapped out whenever the theme changes. HUD and HINT keep
+ * their own fixed colours so the on-screen text stays readable on any theme.
  */
 typedef enum {
-    COL_INSIDE = 1,   /* fractal interior            */
-    COL_C2     = 2,   /* fastest shown escape (far)  */
+    COL_INSIDE = 1,   /* the solid body of the set   */
+    COL_C2     = 2,   /* quickest escape — far halo  */
     COL_C3     = 3,
     COL_C4     = 4,
-    COL_C5     = 5,   /* slowest escape (near body)  */
-    COL_HUD    = 6,   /* HUD data       — bright yellow */
-    COL_HINT   = 7,   /* HUD action bar — bright cyan   */
+    COL_C5     = 5,   /* slowest escape — near body  */
+    COL_HUD    = 6,   /* info text     — bright yellow */
+    COL_HINT   = 7,   /* key-hint bar  — bright cyan   */
 } ColorID;
 
-/* theme_apply() — bind the five content pairs to a theme (HUD pairs are fixed). */
+/* Point the five fractal colours at the chosen theme (the HUD colours don't change). */
 static void theme_apply(int t)
 {
     const Theme *th = &k_themes[t];
@@ -273,7 +214,7 @@ static void theme_apply(int t)
 static void color_init(void)
 {
     start_color();
-    /* HUD pairs are theme-independent — yellow data, cyan actions */
+    /* The info text and key hints always use these colours, whatever the theme. */
     if (COLORS >= 256) {
         init_pair(COL_HUD,  226, COLOR_BLACK);
         init_pair(COL_HINT,  51, COLOR_BLACK);
@@ -281,7 +222,7 @@ static void color_init(void)
         init_pair(COL_HUD,  COLOR_YELLOW, COLOR_BLACK);
         init_pair(COL_HINT, COLOR_CYAN,   COLOR_BLACK);
     }
-    theme_apply(0);   /* Electric; the Scene tracks the active theme thereafter */
+    theme_apply(0);   /* start on the first theme; the Scene remembers it from here on */
 }
 
 /* ===================================================================== */
@@ -289,31 +230,33 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * Complex — a point a + b·i in the complex plane (Mandelbrot 1980).  Two roles:
- * `c` is a pixel's fixed coordinate, and `z` is the moving orbit that the
- * iteration z → z² + c walks.  Whether that orbit stays bounded is the entire
- * question the program answers per pixel.  Held as scalars for speed in the hot
- * loop; the compiler inlines the helpers below to plain float arithmetic.
+ * Complex — a "complex number," which is really just a pair of numbers (a point
+ * with a left-right part and an up-down part). The whole fractal is built from
+ * one rule for multiplying these pairs. Two of them matter here: the point on the
+ * screen we're testing, and the running value we keep squaring. We store the two
+ * parts as plain floats so the inner loop stays fast.
  */
 typedef struct {
-    float re;   /* real part      (the a in a + b·i; maps along screen columns) */
-    float im;   /* imaginary part (the b; maps up the screen rows)              */
+    float re;   /* the left-right part; maps across the screen columns */
+    float im;   /* the up-down part; maps along the screen rows */
 } Complex;
 
-/* complex_sqr_add() — one Mandelbrot step: z² + c. */
+/* One step of the rule: square z and add c. (Squaring a complex number works out
+ * to these two lines.) */
 static Complex complex_sqr_add(Complex z, Complex c)
 {
     return (Complex){ z.re * z.re - z.im * z.im + c.re,
                       2.0f * z.re * z.im        + c.im };
 }
 
-/* complex_norm2() — |z|², compared against ESCAPE_R2 to avoid a square root. */
+/* How far z is from the centre, squared. We square it to skip a slow square root;
+ * the escape test was set up to compare against the squared distance to match. */
 static float complex_norm2(Complex z) { return z.re * z.re + z.im * z.im; }
 
 /*
- * mandelbrot_escape() — iterations for the orbit of 0 under z → z² + c to escape
- * |z| > 2, or MAX_ITER if it stays bounded (c is inside the set).  Pure: same c,
- * same count.
+ * The core test for one point. Start at zero and keep squaring-and-adding. Return
+ * how many steps it took to run off to infinity, or MAX_ITER if it never did
+ * (that means the point is inside the set). Same point in, same count out.
  */
 static int mandelbrot_escape(Complex c)
 {
@@ -327,9 +270,10 @@ static int mandelbrot_escape(Complex c)
 }
 
 /*
- * escape_band() — map an escape fraction in [ESCAPE_FRAC_MIN, 1) onto one of the
- * exterior bands COL_C2 (far) .. COL_C5 (near the body).  `t` is the normalized
- * position within the visible escape range; slower escape = higher band.
+ * Turn "how slowly it escaped" into one of the four halo colours. Points that
+ * took longer to escape (closer to the body) get the higher colours; the quickest
+ * escapes shown get the lowest. The math just spreads the slow-to-fast range
+ * evenly across the four colours.
  */
 static uint8_t escape_band(float frac)
 {
@@ -339,16 +283,16 @@ static uint8_t escape_band(float frac)
 }
 
 /*
- * cell_for_escape() — the drawn cell value for an escape count:
- *   never escaped (>= MAX_ITER)         → COL_INSIDE
- *   escaped slower, by how slow         → COL_C2 (far) .. COL_C5 (near the body)
- *   escaped faster than ESCAPE_FRAC_MIN → 0 (background, not drawn)
+ * Decide which colour a point gets from its escape count:
+ *   never escaped         -> the solid interior colour
+ *   escaped, by how slow  -> one of the four halo colours
+ *   escaped almost at once -> blank, so distant points stay empty
  */
 static uint8_t cell_for_escape(int iter)
 {
-    if (iter >= MAX_ITER) return (uint8_t)COL_INSIDE;   /* inside the set */
+    if (iter >= MAX_ITER) return (uint8_t)COL_INSIDE;   /* never escaped: it's inside */
     float frac = (float)iter / (float)MAX_ITER;
-    if (frac < ESCAPE_FRAC_MIN) return 0;               /* escaped too fast → background */
+    if (frac < ESCAPE_FRAC_MIN) return 0;               /* escaped too fast: leave blank */
     return escape_band(frac);
 }
 
@@ -357,12 +301,13 @@ static uint8_t cell_for_escape(int iter)
 /* ===================================================================== */
 
 /*
- * ViewPreset — a zoom window: the complex-plane centre and half its vertical
- * extent (re_half is derived at runtime from the terminal aspect).
+ * ViewPreset — a saved place to look. It says where to centre the view and how
+ * tall a slice to show; the width is worked out later from the terminal shape.
  */
 typedef struct {
-    float       cr, ci, im_half;
-    const char *name;
+    float       cr, ci;     /* centre point: left-right (cr) and up-down (ci) */
+    float       im_half;    /* half the height of the slice to show */
+    const char *name;       /* shown in the info bar */
 } ViewPreset;
 
 static const ViewPreset k_presets[N_PRESETS] = {
@@ -375,30 +320,31 @@ static const ViewPreset k_presets[N_PRESETS] = {
 };
 
 /*
- * View — a window into the complex plane: where it is centred and how far it
- * reaches.  This is the mathematical domain the grid samples; a zoom preset is
- * just a named View.  re_half is scaled by the terminal aspect so circles stay
- * round rather than stretching.
+ * View — the actual patch of the plane we're looking at: its centre and how far
+ * it reaches left-right and up-down. A preset becomes one of these once we know
+ * the screen size. The width is widened by the terminal's tall-cell shape so
+ * round shapes look round instead of stretched.
  */
 typedef struct {
     Complex center;
-    float   re_half;   /* half-width  along the real axis      */
-    float   im_half;   /* half-height along the imaginary axis */
+    float   re_half;   /* half the width  (left-right reach from the centre) */
+    float   im_half;   /* half the height (up-down reach from the centre) */
 } View;
 
-/* view_from_preset() — the View a preset defines on a cols x rows grid. */
+/* Build the View that a preset describes, once we know the grid is cols x rows. */
 static View view_from_preset(int preset, int cols, int rows)
 {
     const ViewPreset *p = &k_presets[preset % N_PRESETS];
     View v;
     v.center  = (Complex){ p->cr, p->ci };
     v.im_half = p->im_half;
-    v.re_half = p->im_half * (float)cols / (float)rows / ASPECT_R;   /* undistort */
+    v.re_half = p->im_half * (float)cols / (float)rows / ASPECT_R;   /* keep it from looking squashed */
     return v;
 }
 
-/* view_point() — the complex coordinate at normalized position (fx, fy) in [0,1];
- * fy = 0 is the top, since the imaginary axis points up the screen. */
+/* Given a spot in the view as fractions from 0 to 1 (0,0 is the top-left), return
+ * the actual plane coordinate there. fy = 0 is the top because up-down runs
+ * upward but screen rows count downward. */
 static Complex view_point(View v, float fx, float fy)
 {
     return (Complex){
@@ -408,20 +354,20 @@ static Complex view_point(View v, float fx, float fy)
 }
 
 /*
- * Field — the sampled image: one colour band per cell over an active rows x cols
- * area, plus the View it samples.  Pure data; field_point() turns a cell into the
- * point c that §4 evaluates there.
+ * Field — the picture itself: a colour for every cell we've worked out, plus the
+ * View those cells come from. Just storage; field_point() below tells you which
+ * plane coordinate a given cell stands for.
  */
 typedef struct {
-    uint8_t cell[GRID_ROWS_MAX][GRID_COLS_MAX];  /* 0 = bg/unsampled, 1..5 = band */
-    int     rows, cols;                          /* active extent (canvas band)   */
-    View    view;                                /* the complex-plane window       */
+    uint8_t cell[GRID_ROWS_MAX][GRID_COLS_MAX];  /* 0 = empty/not done yet, 1..5 = a colour */
+    int     rows, cols;                          /* how much of the grid we're actually using */
+    View    view;                                /* the patch of plane these cells show */
 } Field;
 
 static void field_init(Field *f, int cols, int rows, int preset)
 {
     if (cols > GRID_COLS_MAX) cols = GRID_COLS_MAX;
-    rows -= HUD_TOP_ROWS + HUD_BOT_ROWS;          /* leave room for the HUD bands */
+    rows -= HUD_TOP_ROWS + HUD_BOT_ROWS;          /* don't draw over the top and bottom bars */
     if (rows < 1)             rows = 1;
     if (rows > GRID_ROWS_MAX) rows = GRID_ROWS_MAX;
 
@@ -431,7 +377,7 @@ static void field_init(Field *f, int cols, int rows, int preset)
     memset(f->cell, 0, sizeof f->cell);
 }
 
-/* field_point() — the complex coordinate sampled at cell (col, row). */
+/* The plane coordinate that cell (col, row) stands for. */
 static Complex field_point(const Field *f, int col, int row)
 {
     float fx = (f->cols > 1) ? (float)col / (float)(f->cols - 1) : 0.5f;
@@ -444,23 +390,23 @@ static Complex field_point(const Field *f, int col, int row)
 /* ===================================================================== */
 
 /*
- * Reveal — every time-based behaviour, isolated here so the maths (§4) and the
- * drawing (§8) stay free of it:
- *   - order[]      a shuffled list of pixel indices, so the fractal materialises
- *                  from scattered dots instead of scanning line by line;
- *   - progress     how many of those pixels are computed so far;
- *   - hold_ticks   how long a finished image has been held before auto-advancing.
- * reveal_step() calls the pure core to fill the field; it only chooses the ORDER
- * and the per-tick budget — never a colour or a screen position.
+ * Reveal — controls the "fill in over time" effect, kept separate so the math
+ * and the drawing don't have to know about timing:
+ *   - order[]      the cells listed in a shuffled order, so the picture appears
+ *                  as scattered dots instead of sweeping line by line;
+ *   - progress     how many cells we've filled in so far;
+ *   - hold_ticks   how long we've sat on a finished picture before moving on.
+ * It only decides WHICH cells to do next and how many per tick — the colours and
+ * positions still come from the math and the drawing.
  */
 typedef struct {
-    int order[GRID_ROWS_MAX * GRID_COLS_MAX];  /* pixel indices in shuffled order */
-    int n;            /* total pixels (= field rows*cols)        */
-    int progress;     /* pixels computed so far (cursor into order[]) */
-    int hold_ticks;   /* ticks held since completion             */
+    int order[GRID_ROWS_MAX * GRID_COLS_MAX];  /* the cells, in shuffled order */
+    int n;            /* total number of cells (rows * cols) */
+    int progress;     /* how far through order[] we've gotten */
+    int hold_ticks;   /* ticks waited since the picture finished */
 } Reveal;
 
-/* shuffle() — Fisher-Yates: put a[0..n-1] into a uniformly random order. */
+/* Shuffle a[0..n-1] into a random order (the standard Fisher-Yates method). */
 static void shuffle(int *a, int n)
 {
     for (int i = n - 1; i > 0; i--) {

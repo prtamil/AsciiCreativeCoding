@@ -1,480 +1,53 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * sparks.c — fast electric sparks with motion-blur trails, bouncing
- *            off the floor with elastic restitution.
+ * sparks.c — fast flying sparks that arc under gravity, bounce off the
+ *            floor, and drag a short fading streak behind them.
  *
- * DEMO: Bright, FAST sparks fly out of an emitter on cone-shaped
- *       initial trajectories, arc under gravity, and BOUNCE off the
- *       floor (the row above the HUD) with energy loss given by the
- *       pattern's restitution coefficient. Each spark drags a short
- *       motion-blur trail of dimmer glyphs behind it — the head is
- *       hot/bright, the tail is dark/dim, a learner-readable picture
- *       of the spark's recent path. Distinct from `embers.c`:
+ * Sparks shoot out of an emitter, curve down as gravity pulls on them,
+ * and bounce off the floor (the row just above the key-hint bar),
+ * losing a bit of energy each bounce. The bright dot you watch is the
+ * spark's "head"; the dim tail behind it is just where the spark was
+ * a moment ago, so it reads like motion blur. Ten built-in effects
+ * (welder, grinder, campfire, Tesla coil, sparkler, ground spinner,
+ * and so on) all run on the same code — what makes them look different
+ * is one row of numbers in the pattern_params[] table.
  *
- *         embers.c — slow rising particles, no trail, no bounce,
- *                    cool over a long lifetime (fire flicker).
- *         sparks.c — FAST flying particles, motion-blur trails,
- *                    elastic floor bounces, short crackly lifetime.
- *
- *       Patterns (10 effects, each anchored where its physics reads
- *       cleanest):
- *         WELDING        (left-mid)  horizontal jet of orange-yellow
- *                                    sparks arcing rightward across
- *                                    the screen; floor bounces 1–2.
- *         GRINDER        (bottom)    tight up-and-right cone from the
- *                                    floor — very fast, strong gravity,
- *                                    multiple floor bounces.
- *         CAMPFIRE       (bottom)    gentle sparks straight up from
- *                                    the floor; soft gravity, sparse.
- *         TESLA          (centre)    short-lived omnidirectional
- *                                    crackle; low gravity.
- *         SPARKLERS      (centre)    tiny sparks in every direction;
- *                                    each parent pops MID-FLIGHT into
- *                                    3 smaller secondaries — a multi-
- *                                    level crackle like a real sparkler.
- *         SPINNER        (centre)    a rotating wheel at the hub
- *                                    (visible | / - \ axle) throws
- *                                    sparks TANGENTIALLY off two
- *                                    opposing rim points, painting a
- *                                    circular spiral pattern.
- *         FLOWERPOT      (bottom)    tall vertical fountain from the
- *                                    floor — high upward speed, strong
- *                                    gravity, dramatic arcs back down.
- *         CHRYSANTHEMUM  (centre)    large slow radial bloom — sparks
- *                                    hang in the air, fading together.
- *         WILLOW         (bottom)    wide upward fan from the floor
- *                                    that immediately droops — sparks
- *                                    coast outward as they fall,
- *                                    mimicking weeping-willow branches.
- *         WATERFALL      (top)       narrow downward cone from near
- *                                    the ceiling — sparks rain the
- *                                    full height of the screen.
- *
- * Study alongside:
- *   embers.c    — same pool / spawn / tick / draw skeleton, but
- *                 buoyancy + cooling instead of gravity + bounce.
- *                 Read first; sparks.c is the "FAST + BOUNCY"
- *                 counterpart.
- *   fountain.c  — also gravity + bouncing particles. Compare the
- *                 emit cone and trail rendering.
- *   fireworks.c — radial bursts; TESLA pattern is its closest cousin.
+ * The closest sibling is embers.c: same skeleton, but embers rise and
+ * cool with no bounce, while sparks fall fast and bounce. Read embers.c
+ * first; this is the fast-and-bouncy version. fountain.c also bounces;
+ * fireworks.c is the radial-burst cousin of the TESLA effect here.
  *
  * Section map:
- *   §1 config   — constants, pattern params, theme heat ramps
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 8-pair heat ramp with 8-colour fallback
- *   §4 spark    — Spark struct + motion-blur trail history
- *   §5 scene    — pool, spawn, tick (integrate + bounce), draw (trail+head)
- *   §6 screen   — ncurses init / draw / resize
- *   §7 app      — signals, fixed-step main loop
+ *   §1 config — constants, the ten pattern presets, the colour themes
+ *   §2 clock  — a steady timer and a sleep
+ *   §3 color  — the cool-to-hot colour ramp
+ *   §4 spark  — one spark: its state, physics, and trail
+ *   §5 scene  — the spark pool: spawn, simulate, draw
+ *   §6 screen — ncurses setup, drawing, and the HUD
+ *   §7 app    — signals and the main loop
  *
  * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reseed (clear pool)
- *   n / N      next pattern   (WELDING → GRINDER → CAMPFIRE → TESLA →
- *                              SPARKLERS → SPINNER → FLOWERPOT →
- *                              CHRYSANTHEMUM → WILLOW → WATERFALL)
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      faster      (sim speed multiplier)
- *   -          slower
- *   ] / [      raise / lower tick Hz
+ *   q / ESC    quit                 space      pause / resume
+ *   r          clear and restart    n / N      next / prev effect
+ *   p / P      previous effect      t / T      next / prev theme
+ *   + / =      faster               -          slower
+ *   ] / [      raise / lower tick rate
  *   w / W      shift emitter right / left
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra particle_systems/sparks.c \
  *       -o sparks -lncurses -lm
+ *
+ * References (ideas the code can't show you on its own):
+ *   Reeves (1983), "Particle Systems", ACM TOG 2(2) — the spawn /
+ *     simulate / cull / draw pool design, and the idea of one engine
+ *     plus a small table of constants per effect.
+ *   Hertz (1882) — the bounciness number (restitution) used at the floor.
+ *   Bourg & Bywalec (2013), "Physics for Game Developers" — gravity +
+ *     drag motion, and the rotating-circle math behind the SPINNER.
+ *   Millington (2010), "Game Physics Engine Development", Ch. 6 — the
+ *     frame-rate-independent drag and the "let tired sparks sleep" idea.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Pool-based 2-D particle system with one species
- *                  (spark) and a short motion-blur history per particle.
- *                  Each tick:
- *
- *                    0. WHEEL PHASE. Advance SPINNER's wheel rotation
- *                       by SPINNER_OMEGA·dt; wrap to [0, 2π).  Runs
- *                       every tick so the axle keeps turning even when
- *                       SPINNER isn't the active pattern.
- *
- *                    1. SPAWN. Top up the active pool to the pattern's
- *                       target.  Standard patterns sample from a
- *                       (angle, speed) CONE around the emitter; SPINNER
- *                       overrides with a TANGENT emission from a
- *                       rotating wheel rim.  SPARKLERS counts PARENTS
- *                       only — has_split=false sparks — so cascade
- *                       children don't throttle new parent emission.
- *
- *                    2. INTEGRATE. Push each spark's previous (x, y)
- *                       into a short ring of trail history, then update:
- *                          vy  += gravity · dt
- *                          v   *= drag_factor                (per tick)
- *                          x   += vx · dt
- *                          y   += vy · dt
- *                          age += dt
- *
- *                    3. BOUNCE. If the spark crosses the FLOOR while
- *                       moving downward, it bounces ELASTICALLY with
- *                       Hertz restitution e ∈ (0, 1):
- *                          y'  = floor_y − (y − floor_y)         // reflect
- *                          vy' = −vy · e                         // flip + lose
- * energy vx' = vx · floor_friction             // tangential friction If both
- * speed components are below the SETTLE threshold, the spark is killed (it
- * would otherwise micro-bounce forever).
- *
- *                    4. KILL. age >= life, off-screen, or settled.
- *
- *                    5. SPARKLERS CASCADE (this pattern only).  Each
- *                       parent (has_split=false) that has crossed
- *                       SPARKLER_SPLIT_AGE_FRAC of its life pops into
- *                       SPARKLER_CHILDREN_PER_SPLIT smaller secondaries
- *                       at its current (x, y).  has_split latches so
- *                       the cascade caps at 2 generations.
- *
- *                    6. RENDER. Draw each trail-history point as a dim
- *                       glyph from the cool end of the heat ramp; draw
- *                       the head with a hot/bold glyph from the high
- *                       end.  Head ramp slot reads remaining-life
- *                       fraction T = 1 − age/life.  SPINNER also paints
- *                       a rotating axle glyph at the wheel hub.
- *
- *                  Distinct from `embers.c` in three concrete ways:
- *
- *                    – embers have buoyancy (vy negative); sparks have
- *                      gravity (vy grows positive).
- *                    – embers have no trail; sparks store TRAIL_LEN
- *                      previous positions and render them dimly.
- *                    – embers die when they cool/exit; sparks also
- *                      bounce off the floor with restitution and die
- *                      when they settle (low |v|).
- *
- * Data-structure : Spark[MAX_SPARKS] object pool with `active` flag
- *                  and a small ring of `(trail_x, trail_y)` history.
- *                  No malloc, linear-scan spawn (small N — fine).
- *
- * Rendering      : ASCII only. Trail glyphs are sparse (`,` `.` `:`),
- *                  head glyphs are dense (`*` `+` `#`). Colour from a
- *                  theme heat ramp by remaining-life fraction; the
- *                  trail uses a slot 1–3 below the head's slot so it
- *                  fades behind the spark.
- *
- * Performance    : O(MAX_SPARKS · (1 + TRAIL_LEN)) per frame. With
- *                  TRAIL_LEN = 3 and MAX_SPARKS ≈ 800, that is at most
- *                  ~3200 mvaddch per frame. Trivial at 60 fps.
- *
- * References
- * ──────────
- *   PAPERS
- *     Reeves, W. T. (1983)
- *       "Particle Systems — A Technique for Modeling a Class of
- *       Fuzzy Objects"
- *       ACM Transactions on Graphics 2(2): 91-108.
- *       Foundational paper.  The pool-based spawn / integrate /
- *       cull / draw skeleton used in §5 is straight from Reeves §3.
- *       §4 covers natural-phenomena pools parameterised by a
- *       struct of physical constants — exactly the PatternParams
- *       design used for the ten pattern presets here.
- *
- *     Hertz, H. (1882)
- *       "Über die Berührung fester elastischer Körper"
- *       J. reine angew. Math. 92: 156-171.
- *       Classical contact-mechanics derivation of the coefficient
- *       of restitution e ∈ (0, 1).  This file's `pp->restitution`
- *       is exactly Hertz's e; the floor-bounce rule
- *       `vy' = −e · vy` is the macroscopic energy-loss model from
- *       Hertz's elastic-collision analysis applied to a 2-D
- *       particle.
- *
- *   BOOKS
- *     Millington, I. (2010)
- *       "Game Physics Engine Development" (2nd ed, Morgan Kaufmann).
- *       Ch. 6 "Particle Physics" — semi-implicit Euler integration
- *       and frame-rate-independent damping
- *       (drag_factor = exp(−drag_coeff · dt)) used here in
- *       scene_tick.  Ch. 7 "Particle Contacts" — the impulse-based
- *       bounce + settle/sleep criterion that backs SETTLE_VY /
- *       SETTLE_VX so settled sparks don't burn ticks micro-bouncing.
- *
- *     Bourg, D. M. & Bywalec, B. (2013)
- *       "Physics for Game Developers" (2nd ed, O'Reilly).
- *       Ch. 2-3 — ballistic motion under gravity + drag, basis of
- *       the gravity + drag integration step.  Ch. 8 §1 — the
- *       parametric circle x(t) = cx + R·cos(ω·t),
- *       y(t) = cy + R·sin(ω·t) that drives the SPINNER wheel's
- *       rotating emission points.
- *
- *     Akenine-Möller, T., Haines, E. & Hoffman, N. (2018)
- *       "Real-Time Rendering" (4th ed, CRC Press).
- *       §13.7 — point-sprite particle rendering.  The
- *       remaining-life → heat-ramp-slot mapping used for
- *       HEAD_GLYPHS / TRAIL_GLYPHS is the ASCII analogue of
- *       size-by-mass point-sprite sizing described there.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE — DATA-DRIVEN PATTERN ENGINE ────────────────────────── *
- *
- * Ten spark effects (WELDING, GRINDER, CAMPFIRE, TESLA, SPARKLERS,
- * SPINNER, FLOWERPOT, CHRYSANTHEMUM, WILLOW, WATERFALL) are
- * produced by a SINGLE generic ballistic-particle engine driven by
- * an array of PatternParams structs.  scene_tick and scene_draw
- * read pattern_params[s->current_pattern] and behave accordingly;
- * adding a new effect is mostly a matter of appending one row to
- * pattern_params[].
- *
- * THE TWO EXCEPTIONS — pattern-aware branches in the engine:
- *
- *   (a) SPINNER overrides the polar (angle, speed) cone with a
- *       TANGENTIAL emission off a rotating wheel rim.  The override
- *       lives in scene_spawn_spark; PatternParams provides the
- *       speed range, but the angle and spawn position come from
- *       wheel_compute_tangential_emission.
- *
- *   (b) SPARKLERS adds a MID-LIFE CASCADE pass: parents pop into
- *       smaller children (cascade_sparkler_split_pass) and the
- *       spawn loop counts PARENTS only (count_active_parent_sparks)
- *       so the cascade's children don't throttle parent emission.
- *
- * Every other variation between the ten effects comes from
- * PatternParams alone.
- *
- *
- * THE GENERIC ENGINE (pseudocode)
- * ───────────────────────────────
- *
- *   loop forever (each tick of dt seconds):
- *
- *     pp = pattern_params[scene.current_pattern]   # read inputs
- *
- *     # 0. WHEEL PHASE — tick the SPINNER axle (always, no-op for others)
- *     scene.spinner_phase += SPINNER_OMEGA · dt    # wrap to [0, 2π)
- *
- *     # 1. SPAWN — top up parent pool toward target density.
- *     #    SPARKLERS counts has_split=false sparks only; others count all.
- *     active   = (pp == SPARKLERS) ? count_parents() : count_all()
- *     to_spawn = compute_spawn_count_for_tick(active, pp, dt)
- *     repeat to_spawn times:
- *         e = next_inactive_slot()
- *         if pp == SPINNER:
- *             # tangent off rotating rim — exception (a)
- *             (e.x, e.y, angle) = wheel_compute_tangential_emission(
- *                                     scene.spinner_phase, cx, cy)
- *         else:
- *             # standard cone — angle in [pp.angle_min, pp.angle_max]
- *             (e.x, e.y, angle) = cone_compute_emission(rng, pp, cx, cy)
- *         speed   = uniform(pp.speed_min, pp.speed_max)
- *         e.life  = uniform(pp.life_min,  pp.life_max)
- *         e.vx, e.vy = velocity_from_polar(speed, angle)
- *         e.has_split = false                       # parent
- *         e.active    = true
- *
- *     # 2. INTEGRATE every active spark — Bourg semi-implicit Euler
- *     drag = exp(-pp.drag_coeff · dt)               # frame-rate independent
- *     for e in active:
- *         spark_shift_trail_history(e)              # ring shift for blur
- *         e.vy  += pp.gravity · dt                  # gravity into vy first
- *         e.vx  *= drag
- *         e.vy  *= drag
- *         e.x   += e.vx · dt;   e.y += e.vy · dt
- *         e.age += dt
- *
- *     # 3. FLOOR BOUNCE — Hertz reflection + settle test
- *     for e in active where crossed_floor_descending(e):
- *         e.y  = reflect_about_floor(e.y, floor)
- *         e.vy = -e.vy · pp.restitution             # Hertz e
- *         e.vx *=         pp.floor_friction         # tangential loss
- *         if |vx|, |vy| both below SETTLE: kill (no more visible bounces)
- *
- *     # 4. KILL — age >= life, off-screen-x, or above TOP_KILL_MARGIN
- *     for e in active:
- *         if spark_should_die(e, scene.cols):  e.active = false
- *
- *     # 5. SPARKLERS CASCADE — exception (b)
- *     if pp == SPARKLERS:
- *         for parents that have crossed pp.life · SPARKLER_SPLIT_AGE_FRAC:
- *             spawn SPARKLER_CHILDREN_PER_SPLIT children at (e.x, e.y)
- *             with reduced speed, reduced life, has_split=true
- *             e.has_split = true                    # latch (no recursion)
- *
- *     # 6. RENDER — trails first (dim, behind), heads on top (bright),
- *     #             SPINNER axle glyph at the wheel hub.
- *     spark_pool_draw_trails(scene)
- *     spark_pool_draw_heads(scene)
- *     if pp == SPINNER: wheel_axle_draw(scene)
- *
- *
- * PATTERNPARAMS FIELD → ENGINE HOOK
- * ─────────────────────────────────
- *
- *   target_sparks      →  spawn-loop refill cap        (parent density)
- *   emitter            →  scene_emitter_xy dispatch    (CENTER_LEFT etc.)
- *   emit_x_jitter      →  spawn-x jitter               (cone emission)
- *   emit_y_jitter      →  spawn-y jitter               (cone emission)
- *   speed_min          →  spawn speed range            (polar cone)
- *   speed_max
- *   angle_min          →  spawn angle range            (polar cone)
- *   angle_max                                          (ignored by SPINNER)
- *   gravity            →  vy update each tick          (Bourg Ch. 2)
- *   drag_coeff         →  drag = exp(-c·dt)            (Millington Ch. 6)
- *   restitution        →  vy reflection scale          (Hertz e)
- *   floor_friction     →  vx scale per bounce          (tangential loss)
- *   life_min           →  spark lifetime range         (heat-ramp clock)
- *   life_max
- *
- * Every other engine constant — MAX_SPARKS, TRAIL_LEN, SETTLE_VY,
- * SETTLE_VX, TOP_KILL_MARGIN, EMITTER_SHIFT_STEP, plus the
- * SPARKLER_* and SPINNER_* tuning knobs — is GLOBAL.  Patterns
- * differ ONLY in the fields above (plus belonging to one of the
- * two exception classes above for SPINNER / SPARKLERS).
- *
- *
- * ARCHITECTURAL REFERENCES
- * ────────────────────────
- *
- *   Reeves, W. T. (1983)
- *     "Particle Systems — A Technique for Modeling a Class of
- *     Fuzzy Objects", ACM TOG 2(2): 91-108.
- *     §4 makes the explicit argument that ONE engine + a struct
- *     of physical constants per phenomenon is the right
- *     architecture for natural-particle simulations.  Reeves
- *     enumerates sparks specifically as a use case; this file
- *     applies the idea to ten different spark effects with two
- *     small principled exceptions where the data-only model
- *     wasn't expressive enough (SPINNER's tangential geometry,
- *     SPARKLERS' generational cascade).
- *
- *   Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994)
- *     "Design Patterns" (Addison-Wesley) — STRATEGY pattern (§5.9).
- *     A family of algorithms (the ten spark effects) interchangeable
- *     behind a single interface (the engine reading PatternParams).
- *     In procedural C the "interface" is the struct shape;
- *     "concrete strategies" are the rows of pattern_params[];
- *     "selecting a strategy" is updating scene.current_pattern.
- *     The two pattern-aware branches in scene_tick / scene_spawn_spark
- *     are TEMPLATE METHOD hooks (§5.10) — one engine skeleton, two
- *     pattern-specific override points.
- *
- *   Acton, M. (2014)
- *     "Data-Oriented Design and C++" (CppCon 2014 keynote).
- *     Argues that variation between behaviours should be
- *     represented as DATA (struct fields) rather than as control
- *     flow (if/switch on type).  pattern_params[] is the data
- *     table; the two if-branches in scene_tick are the explicit
- *     compromises where the data-only design didn't fit.
- *
- *   Nystrom, R. (2014)
- *     "Game Programming Patterns" (Genever Benning).
- *     TYPE OBJECT chapter — PatternParams is a Type Object: one
- *     shared instance per spark effect.  DATA LOCALITY chapter —
- *     Spark is a flat-laid-out POD swept linearly by the integrator
- *     each tick.  OBJECT POOL chapter — fixed-size BSS array
- *     implements Nystrom's pool idiom directly (active flag +
- *     linear scan), with has_split as the cascade-generation tag.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A spark is a fast, short-lived projectile with memory. Each spark
- * remembers its last few positions; the screen shows that memory as
- * a fading streak behind a bright head. Gravity arcs the spark down,
- * the floor bounces it back up with an energy loss, and the heat
- * ramp colours it from white-hot at birth to dark and dead at the
- * end of its life.  Hundreds of these together look like a welder,
- * grinder, Tesla coil, sparkler, ground-spinner, or firework display
- * — same engine driving all ten patterns; the only physics that
- * varies between effects is one row of pattern_params[].
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- * (Each step names the helper it dispatches to in §5; the drivers
- * scene_tick / scene_spawn_spark / scene_draw are pure pseudocode
- * over these.)
- *
- *  0. WHEEL PHASE ADVANCE.  wheel_phase_advance_and_wrap(s, dt) —
- *     SPINNER's axle rotates at ω = SPINNER_OMEGA rad/sec, wrapped
- *     to [0, 2π).  Always advances so the wheel keeps spinning
- *     across pattern swaps.
- *
- *  1. EMIT.
- *     active   = SPARKLERS ? count_active_parent_sparks  // cascade-aware
- *                          : count_active_sparks
- *     to_spawn = compute_spawn_count_for_tick(active, pp, dt)
- *     spark_pool_topup_parents(s, to_spawn)
- *
- *     scene_spawn_spark picks (origin, direction) via either:
- *       wheel_compute_tangential_emission   (SPINNER — tangent off
- *                                            the rotating rim)
- *       cone_compute_emission               (every other pattern —
- *                                            random angle in cone,
- *                                            position with jitter)
- *     ...then sample_speed_from_cone, sample_lifetime_from_pattern,
- *     spark_init_kinematics, spark_seed_trail_at_position.
- *
- *  2. INTEGRATE PER SPARK.
- *     spark_shift_trail_history(e)             // drop oldest, push curr.
- *     integrate_spark_semi_implicit_euler(e, g, drag, dt)
- *         → Bourg Ch. 2 semi-implicit Euler:
- *             vy += g·dt;  v *= exp(−drag·dt);  x += vx·dt;  y += vy·dt
- *
- *  3. BOUNCE.
- *     if spark_crossed_floor_descending(e, floor_y) &&
- *        reflect_spark_off_floor_and_test_settle(e, floor_y,
- *                                                restitution, friction):
- *         kill (settled too gently to bounce visibly)
- *     reflect = y reflected, vy *= -e (Hertz), vx *= friction.
- *
- *  4. KILL.  spark_should_die catches lifetime expiry + off-screen
- *     culls (x bounds, y above TOP_KILL_MARGIN).
- *
- *  5. SPARKLERS CASCADE.  cascade_sparkler_split_pass — parents that
- *     have crossed SPARKLER_SPLIT_AGE_FRAC · life pop into
- *     SPARKLER_CHILDREN_PER_SPLIT children at their current (x, y).
- *     has_split latches so each parent only pops once.
- *
- *  6. RENDER.
- *     spark_pool_draw_trails(s, rows_eff)    // dim, behind
- *     spark_pool_draw_heads(s, rows_eff)     // bright, on top
- *     if SPINNER: wheel_axle_draw            // | / - \ at hub
- *
- *     Per-head heat slot:
- *       T          = max(0, 1 − age / life)
- *       head_slot  = ⌊T · 7.999⌋
- *       head_attr  = A_BOLD (slot ≥ 6) | A_DIM (slot ≤ 1) | A_NORMAL
- *
- *  7. HUD.  Two-row layout painted over the scene by §6 screen —
- *     top row (status) PAIR_HUD + A_BOLD, bottom row (key hints)
- *     PAIR_HINT + A_BOLD.
- *
- * KEY FORMULAS
- * ────────────
- *  Initial velocity (cone emission):
- *    angle = angle_min + r · (angle_max − angle_min)
- *    speed = speed_min + r · (speed_max − speed_min)
- *    vx    = speed · cos(angle)
- *    vy    = speed · sin(angle)        // y increases downward
- *
- *  Gravity update (positive = downward):
- *    vy += gravity · dt
- *
- *  Continuous drag (frame-rate-independent damping):
- *    drag_factor = exp(−drag_coeff · dt)
- *    v          *= drag_factor
- *
- *  Floor bounce (about the line y = floor_y):
- *    y'  = 2·floor_y − y                // reflect
- *    vy' = −vy · restitution
- *    vx' = vx · floor_friction
- *
- *  Heat-ramp slot from remaining life:
- *    T          = max(0, 1 − age / life)
- *    head_slot  = ⌊T · 7.999⌋           // 0..7
- *    trail_slot = max(0, head_slot − 1 − k)  // dimmer for older trail points
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -492,9 +65,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
   SIM_FPS_MIN = 10,
@@ -507,60 +78,57 @@ enum {
   SPEED_MAX = 64,
 
   MAX_SPARKS = 800,
-  TRAIL_LEN = 3, /* motion-blur history slots          */
+  TRAIL_LEN = 3, /* how many past positions each spark remembers */
 
   HUD_COLS = 80,
   FPS_UPDATE_MS = 500,
 
-  /* Color pair indices. PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+  /* Colour-pair slots. The HUD and hint bar get fixed colours; the
+   * eight ramp slots (PAIR_HEAT_BASE + 0..7) go from dim to bright. */
   PAIR_HUD = 1,
   PAIR_HINT = 2,
-  PAIR_HEAT_BASE = 3, /* +0..+7 = 8 heat ramp slots         */
+  PAIR_HEAT_BASE = 3,
 };
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* Emitter horizontal-shift step (cells) when the user presses w/W. */
+/* How far w/W slides the emitter sideways, in cells. */
 #define EMITTER_SHIFT_STEP 8.0f
 
-/* Bounce settle thresholds (cells/sec). Below these magnitudes after
- * a bounce, the spark is killed — it has too little energy to make a
- * visible bounce and would otherwise keep micro-bouncing forever.
- * Tuned by visual inspection — high enough to cull sliding sparks
- * within ~1 second, low enough that real bounces still register. */
+/* When a spark is moving this slowly after a bounce, we just kill it.
+ * It no longer has enough energy to make a bounce you'd notice, and
+ * left alone it would jitter against the floor forever. The numbers
+ * are tuned by eye: high enough to retire a sliding spark within about
+ * a second, low enough that real bounces still happen. (cells/sec) */
 #define SETTLE_VY 6.0f
 #define SETTLE_VX 10.0f
 
-/* Off-screen kill margin. A spark whose y goes more than this many
- * cells above the screen never comes back (drag dominates), so kill
- * early to free the pool slot. */
+/* If a spark flies this many cells above the top of the screen it's
+ * never coming back (drag wins), so we retire it early and free the slot. */
 #define TOP_KILL_MARGIN 4.0f
 
-/* SPARKLERS multi-level cascade — each parent spark pops at
- * SPLIT_AGE_FRAC of its lifetime into CHILDREN_PER_SPLIT smaller
- * secondaries.  The children fly off omnidirectionally from the
- * parent's position with reduced speed and shorter life, mimicking
- * the crackle of a handheld sparkler (parent stick → secondary
- * popping sparks). */
-#define SPARKLER_SPLIT_AGE_FRAC 0.40f
+/* SPARKLERS: a parent spark "pops" partway through its life into a few
+ * smaller sparks that scatter in all directions from where the parent
+ * was, slower and shorter-lived. That second burst is what gives a
+ * sparkler its crackle. */
+#define SPARKLER_SPLIT_AGE_FRAC 0.40f   /* pop at 40% of the parent's life */
 #define SPARKLER_CHILDREN_PER_SPLIT 3
 #define SPARKLER_CHILD_SPEED_MIN 14.0f
 #define SPARKLER_CHILD_SPEED_MAX 26.0f
 #define SPARKLER_CHILD_LIFE_MIN 0.3f
 #define SPARKLER_CHILD_LIFE_MAX 0.7f
 
-/* SPINNER rotating-wheel parameters — emission points sit on a small
- * circle of radius SPINNER_RADIUS rotating at SPINNER_OMEGA rad/sec.
- * Each spawn picks one of two opposing rim points (50/50); the
- * emission angle is TANGENT to the circle (perpendicular to radial),
- * so sparks fly OFF the rim like a real pyrotechnic ground spinner. */
-#define SPINNER_OMEGA 14.0f          /* rad/sec ≈ 2.2 rotations/sec */
-#define SPINNER_RADIUS 5.0f          /* cells from centre to rim    */
-#define SPINNER_TANGENT_JITTER 0.25f /* ± rad around the tangent    */
+/* SPINNER: sparks fly off the rim of a spinning wheel. The launch
+ * points ride a small circle around the centre, the wheel turns at
+ * SPINNER_OMEGA, and sparks leave sideways (along the rim, not straight
+ * out) so it reads as a real pinwheel rather than a centred blast. */
+#define SPINNER_OMEGA 14.0f          /* turn speed, ~2.2 spins/sec */
+#define SPINNER_RADIUS 5.0f          /* wheel radius, in cells     */
+#define SPINNER_TANGENT_JITTER 0.25f /* a little wobble on the launch angle */
 
-/* Pattern enum. */
+/* The ten effects, in the order n/p cycle through them. */
 typedef enum {
   PATTERN_WELDING = 0,
   PATTERN_GRINDER = 1,
@@ -602,134 +170,100 @@ static const char *pattern_name(Pattern p) {
   }
 }
 
-/* Where on the screen the emitter is anchored.  Four positions cover
- * the ten patterns — physics-friendly placement for each effect. */
+/* Where on the screen sparks are born. Four spots cover all ten
+ * effects — each effect is placed where it has room to do its thing. */
 typedef enum {
-  EMIT_CENTER_LEFT,   /* x = 6,        y = rows/2  (WELDING)   */
-  EMIT_CENTER_BOTTOM, /* x = cols/2,   y = rows-4  (GRINDER, CAMPFIRE,
-                         FLOWERPOT, WILLOW)   */
-  EMIT_CENTER,        /* x = cols/2,   y = rows/2  (TESLA, SPARKLERS, SPINNER,
-                         CHRYSANTH)   */
-  EMIT_CENTER_TOP,    /* x = cols/2,   y = 3       (WATERFALL)    */
+  EMIT_CENTER_LEFT,   /* left edge, mid-height — WELDING jets rightward  */
+  EMIT_CENTER_BOTTOM, /* bottom-centre — ground effects rise and fall back
+                         (GRINDER, CAMPFIRE, FLOWERPOT, WILLOW)          */
+  EMIT_CENTER,        /* dead centre — all-directions bursts use the whole
+                         screen (TESLA, SPARKLERS, SPINNER, CHRYSANTHEMUM) */
+  EMIT_CENTER_TOP,    /* top-centre — WATERFALL rains down the full height */
 } EmitPos;
 
 /*
- * PatternParams — per-pattern physics + emission cone + lifetime.
+ * PatternParams — the recipe for one effect: where sparks start, how
+ * fast and which way they fly, how heavy they are, how bouncy, and how
+ * long they live. There's one of these per effect; switching effects
+ * just means reading a different row. This is the whole trick of the
+ * file: the simulation code never asks "which effect is this?" — it
+ * just reads these numbers and does what they say.
  *
- * REFERENCES (each cited at the field it backs):
- *   Reeves, W. T. (1983) "Particle Systems — A Technique for
- *     Modeling a Class of Fuzzy Objects", ACM TOG 2(2): 91-108.
- *     §4 argues that natural-phenomena particle pools should be
- *     parameterised by a small struct of physical constants.
- *     PatternParams IS that struct — one row of pattern_params[]
- *     per effect.
+ * (Two effects need a little extra code the numbers can't express:
+ * SPINNER launches sparks off a spinning rim, and SPARKLERS pops each
+ * spark into smaller ones partway through its life. Everything else is
+ * pure data.)
  *
- *   Hertz, H. (1882) "Über die Berührung fester elastischer Körper".
- *     Coefficient of restitution e ∈ (0, 1) — the `restitution`
- *     field is literally Hertz's e.
- *
- *   Bourg, D. M. & Bywalec, B. (2013) "Physics for Game Developers".
- *     Ch. 2-3 — gravity + drag conventions.  `gravity` is a
- *     positive scalar applied to vy each tick; `drag_coeff` is a
- *     continuous (frame-rate-independent) coefficient applied as
- *     exp(−drag_coeff · dt) — see Millington (2010) Ch. 6 for the
- *     same form in engine code.
- *
- * INTENT
- *   Same simulation engine, ten different effects.  scene_tick never
- *   branches on the pattern enum for the physics — it just reads
- *   these fields and behaves accordingly.  The only pattern-aware
- *   branches in the engine are:
- *     (a) SPINNER's tangential emission override in scene_spawn_spark
- *     (b) SPARKLERS' mid-life cascade in scene_tick
- *     (c) SPARKLERS' parent-only count for spawn budgeting
- *   Every other variation between effects comes from THIS struct.
+ * The design — one engine plus a table of constants per effect — comes
+ * from Reeves' particle-systems paper (1983, §4).
  *
  * FIELDS:
- *   target_sparks  Steady-state active "parent" count the spawn loop
- *                  refills toward each tick (per-tick cap proportional
- *                  to dt so a long pause doesn't dump everyone at
- *                  once).  Higher = denser visual.  Range across
- *                  patterns: 200 (SPARKLERS — leaves pool room for
- *                  cascade children) to 400 (FLOWERPOT, dense
- *                  fountain).  Reeves 1983 §3 — "steady-state pool".
+ *   target_sparks  How many sparks the effect tries to keep alive at
+ *                  once. We top up toward this each frame (gradually,
+ *                  so resuming after a pause doesn't dump them all at
+ *                  once). Bigger means a denser, busier look. Ranges
+ *                  from 200 (SPARKLERS — leaves room in the pool for
+ *                  the extra sparks it spawns) up to 400 (FLOWERPOT, a
+ *                  thick fountain).
  *
- *   emitter        EmitPos enum tag.  scene_emitter_xy dispatches
- *                  on this to compute (cx, cy).  Patterns choose
- *                  the position that makes their physics read
- *                  cleanest:
- *                    CENTER_LEFT     WELDING — room to fly right.
- *                    CENTER_BOTTOM   GRINDER / CAMPFIRE / FLOWERPOT /
- *                                    WILLOW — ground-rising effects.
- *                    CENTER          TESLA / SPARKLERS / SPINNER /
- *                                    CHRYSANTHEMUM — omni bursts use
- *                                    the whole canvas radially.
- *                    CENTER_TOP      WATERFALL — sparks rain the full
- *                                    height of the screen.
+ *   emitter        Which of the four launch spots to use (see EmitPos).
  *
- *   emit_x_jitter  ± cells of uniform spawn-position jitter around
- *   emit_y_jitter  the emitter (cx, cy).  Adds a small fuzz so the
- *                  emission point doesn't read as a single pinpoint.
- *                  CAMPFIRE uses 3.0/0.5 — a wide horizontal base
- *                  and thin vertically — for a flame-base feel.
- *                  Most patterns use ~0.5 (subtle).
+ *   emit_x_jitter  How much to randomly fuzz the birth position, in
+ *   emit_y_jitter  cells, left/right and up/down. Without this the
+ *                  sparks all pour out of one exact point and look
+ *                  mechanical. CAMPFIRE uses a wide-but-flat fuzz
+ *                  (3.0 / 0.5) to spread out like the base of a flame;
+ *                  most effects use about 0.5.
  *
- *   speed_min      Polar (angle, speed) cone — speed range in
- *   speed_max      cells/sec, sampled uniformly at spawn.
- *                  vx = speed·cos(angle), vy = speed·sin(angle).
- *                  Higher = sparks travel farther before drag +
- *                  gravity catch them.  Range: 28-50 (SPARKLERS,
- *                  gentle fizz) to 100-150 (FLOWERPOT, tall fountain).
+ *   speed_min      How fast a new spark flies, in cells/sec, picked at
+ *   speed_max      random between these two. Faster sparks travel
+ *                  farther before gravity and drag slow them down.
+ *                  Ranges from 28-50 (SPARKLERS, a gentle fizz) up to
+ *                  100-150 (FLOWERPOT, a tall fountain).
  *
- *   angle_min      Cone angle range in radians.  Conventions:
- *   angle_max        0 = +x (right), −π/2 = −y (up),
- *                    +π/2 = +y (down), ±π = left.
- *                  Span ≥ 2π gives full omnidirectional emission
- *                  (TESLA / SPARKLERS / SPINNER / CHRYSANTHEMUM).
- *                  Narrow ranges shape the cone:
- *                    WELDING ±0.55 around 0   (horizontal-right)
- *                    GRINDER  (−1.3, −0.4)    (up-and-right)
- *                    FLOWERPOT ±0.6 around −π/2 (vertical-up)
- *                    WILLOW  ±1.2 around −π/2  (wide upward fan)
- *                    WATERFALL ±0.35 around +π/2 (vertical-down).
- *                  SPINNER's pattern angle is ignored — emission
- *                  angle is computed tangentially from spinner_phase.
+ *   angle_min      Which directions sparks can launch, as an angle in
+ *   angle_max      radians, picked at random in this range. 0 points
+ *                  right, -π/2 points straight up, +π/2 straight down,
+ *                  ±π points left (y grows downward on screen). A full
+ *                  2π-wide range fires in every direction (TESLA,
+ *                  SPARKLERS, SPINNER, CHRYSANTHEMUM); narrow ranges
+ *                  shape a cone — e.g. WELDING fires roughly rightward,
+ *                  WATERFALL roughly downward, FLOWERPOT roughly up.
+ *                  SPINNER ignores this; its launch angle comes from
+ *                  the wheel instead.
  *
- *   gravity        Downward acceleration in cells/sec² (always
- *                  positive — Bourg Ch. 2 convention).  Applied to
- *                  vy each tick BEFORE drag (semi-implicit Euler:
- *                  velocity update, then position update).  Range:
- *                  18 (CHRYSANTHEMUM — sparks hang in air) to 100
- *                  (WILLOW — heavy drooping branches).
+ *   gravity        Downward pull, in cells/sec² (always positive since
+ *                  y grows downward). Applied to a spark's vertical
+ *                  speed every frame. Low gravity (18, CHRYSANTHEMUM)
+ *                  lets sparks hang in the air; high gravity (100,
+ *                  WILLOW) yanks them straight back down.
  *
- *   drag_coeff     Continuous-damping coefficient (1/sec) used as
- *                  drag_factor = exp(−drag_coeff · dt).  Frame-rate
- *                  independent — commutes correctly across substeps,
- *                  unlike v *= 0.99 which is dt-dependent and breaks
- *                  if the tick rate changes.  Range: 0.15 (WILLOW,
- *                  NOVA — sparks coast a long way) to 0.55
- *                  (CAMPFIRE — sparks settle quickly).
- *                  Millington 2010 Ch. 6 for the exp-form rationale.
+ *   drag_coeff     How quickly air resistance bleeds off speed. We use
+ *                  it as a fading factor each frame, written so the
+ *                  result is the same no matter the frame rate (unlike
+ *                  a plain "multiply speed by 0.99", which would change
+ *                  if the tick rate changed). Low (0.15, WILLOW — sparks
+ *                  coast far) to high (0.55, CAMPFIRE — sparks settle
+ *                  fast). The fade-factor form is from Millington (2010)
+ *                  Ch. 6.
  *
- *   restitution    Floor-bounce energy retention, Hertz e ∈ [0, 1].
- *                  vy' = −restitution · vy after a downward floor
- *                  contact.  e = 0 → spark sticks dead on first hit;
- *                  e = 1 → perfectly elastic, bounces forever.
- *                  Range: 0.30 (WILLOW — thuds) to 0.65 (TESLA,
- *                  WATERFALL — bouncy).
+ *   restitution    How bouncy the floor is, 0 to 1. After a downward
+ *                  hit the upward speed is this fraction of the old
+ *                  speed: 0 means the spark sticks dead on first touch,
+ *                  1 would bounce forever. This is the classic
+ *                  "coefficient of restitution" from Hertz (1882).
+ *                  Range: 0.30 (WILLOW thuds) to 0.65 (TESLA, WATERFALL
+ *                  stay bouncy).
  *
- *   floor_friction Tangential vx multiplier per bounce.  Modelled
- *                  as a per-event scalar rather than continuous
- *                  surface friction (simpler, no need to track time
- *                  spent in contact).  Range: 0.60-0.78.
+ *   floor_friction How much sideways speed survives a bounce, as a
+ *                  fraction. A simple per-bounce scaling rather than
+ *                  true sliding friction. Range 0.60-0.78.
  *
- *   life_min       Lifetime range in seconds; sampled uniformly at
- *   life_max       spawn.  Drives the heat-ramp fade — the head
- *                  colour reads remaining-life fraction T =
- *                  1 − age/life (Akenine-Möller 2018 §13.7 —
- *                  point-sprite life→intensity analogue).  Range:
- *                  0.4-1.0 (SPARKLERS — crackly short bursts) to
- *                  3.0-4.5 (CHRYSANTHEMUM — slow majestic bloom).
+ *   life_min       How long a spark lives, in seconds, picked at random
+ *   life_max       in this range. Lifetime also drives the colour fade:
+ *                  a fresh spark is white-hot, an old one is dim. Short
+ *                  (0.4-1.0, SPARKLERS crackle) to long (3.0-4.5,
+ *                  CHRYSANTHEMUM's slow bloom).
  */
 typedef struct {
   int target_sparks;
@@ -745,18 +279,15 @@ typedef struct {
   float life_min, life_max;
 } PatternParams;
 
-/* Angle conventions for the cones below.
- *   +0.0           = pointing right (+x)
- *   -M_PI/2  ≈ -1.57 = pointing straight up (-y)
- *   +M_PI/2  ≈ +1.57 = pointing straight down (+y)
- *   ±M_PI    ≈ ±3.14 = pointing left
- *
- * To get an "up-and-right" cone you want angles in (-π/2, 0). To get
- * "everywhere" you want a 2π-wide range. */
+/* Quick reminder on launch angles below (in radians):
+ *   0      points right        -π/2 (≈ -1.57)  points straight up
+ *   ±π     points left         +π/2 (≈ +1.57)  points straight down
+ * So an up-and-right spray wants angles between -π/2 and 0, and a
+ * "fires everywhere" spray wants a full 2π-wide range. */
 static const PatternParams pattern_params[N_PATTERNS] = {
-    /* Field order:
-     *  target  emitter             emit_jx emit_jy  spd_min spd_max  ang_min
-     * ang_max               grav   drag   rest  fric   lmin  lmax
+    /* Columns, in order:
+     *  target  emitter  jitter_x jitter_y  speed_min speed_max
+     *  angle_min angle_max  gravity drag  bounce friction  life_min life_max
      */
     /* WELDING       */ {380, EMIT_CENTER_LEFT, 1.0f, 1.0f, 55.0f, 90.0f,
                          -0.55f, 0.55f, 78.0f, 0.40f, 0.55f, 0.78f, 1.0f, 2.2f},
@@ -792,27 +323,26 @@ static const PatternParams pattern_params[N_PATTERNS] = {
 };
 
 /*
- * Themes — each is an 8-step HEAT RAMP from cool/dim (slot 0) to
- * hot/bright (slot 7).  Each theme commits to ONE hue family so the
- * `t` / `T` cycle is visually obvious — no two themes share a colour
- * story.  The standout is NOVA, the only multi-hue ramp (blue →
- * magenta → orange → yellow → white) so a real supernova spectrum
- * passes through the spark trail.
+ * Themes — each one is an 8-colour ramp running from dim (slot 0) to
+ * bright (slot 7), used to colour a spark by how hot it still is.
+ * Each theme sticks to one colour family so flipping themes with t/T
+ * is obviously different. NOVA is the odd one out — it sweeps through
+ * several hues (blue → magenta → orange → yellow → white) like a real
+ * supernova.
  *
- *   MATRIX   pure phosphor green        FOREST   olive → leaf → gold
- *   FIRE     coal → flame → white-hot   DESERT   dune brown → cream
- *   OCEANIC  deep blue → teal (no white) NEON    purple → hot pink
- *   ICE      pale frost → pure white    ECLIPSE  void purple → crimson
- *   NOVA     blue → magenta → yellow    MONO     grayscale
+ *   MATRIX   green          FOREST   olive → leaf → gold
+ *   FIRE     coal → white   DESERT   sand → cream
+ *   OCEANIC  blue → teal    NEON     purple → hot pink
+ *   ICE      frost → white  ECLIPSE  purple → crimson
+ *   NOVA     full spectrum  MONO     grayscale
  *
- * All entries sit in the BRIGHT HALF of the 256-colour cube per the
- * CLAUDE.md "Theme Palette Brightness" rule, so even ramp[0]
- * (the dimmest "tail" colour) stays visible against a black terminal
- * with A_DIM applied.
+ * Even the dimmest colour in each ramp is kept out of the darkest part
+ * of the palette, so a faded tail stays visible on a black terminal
+ * (the "Theme Palette Brightness" rule in CLAUDE.md).
  */
 typedef struct {
-  const char *name;
-  short heat[8]; /* cool → hot */
+  const char *name; /* shown in the HUD */
+  short heat[8];    /* dim (oldest/coolest) → bright (newest/hottest) */
 } Theme;
 
 #define N_THEMES 10
@@ -833,17 +363,15 @@ static const Theme themes[N_THEMES] = {
 };
 
 /*
- * Glyph ramps for the head and trail. The head uses dense punctuation
- * (`*` `+` `#`) to read as a hot point. The trail uses sparse glyphs
- * (`,` `.` `:`) to read as a fading streak BEHIND the head. Both are
- * indexed cool (slot 0, dim) → hot (slot 7, bright).
+ * Which character to draw, by heat. The head uses solid-looking marks
+ * (* + # @) so it reads as a bright point; the trail uses lighter ones
+ * (, . :) so it reads as a fading streak behind. Both go from faint
+ * (slot 0) to bold (slot 7).
  */
 static const char HEAD_GLYPHS[8] = {'`', '.', ':', ';', '*', '+', '#', '@'};
 static const char TRAIL_GLYPHS[8] = {'`', '.', '.', ',', ':', ';', '+', '*'};
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -861,9 +389,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color ── */
 
 static void theme_apply(int idx) {
   if (idx < 0 || idx >= N_THEMES)
@@ -873,7 +399,7 @@ static void theme_apply(int idx) {
     for (int i = 0; i < 8; i++)
       init_pair((short)(PAIR_HEAT_BASE + i), t->heat[i], -1);
   } else {
-    /* 8-colour fallback: roughly cool→hot using basic palette. */
+    /* On a basic 8-colour terminal, fake the ramp with red→yellow→white. */
     static const short fb[8] = {
         COLOR_RED,    COLOR_RED,    COLOR_RED,    COLOR_YELLOW,
         COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE,
@@ -887,8 +413,8 @@ static void color_init(void) {
   start_color();
   use_default_colors();
   if (COLORS >= 256) {
-    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
-    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow status bar */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan key-hint bar */
   } else {
     init_pair(PAIR_HUD, COLOR_YELLOW, -1);
     init_pair(PAIR_HINT, COLOR_CYAN, -1);
@@ -896,119 +422,67 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  spark                                                              */
-/* ===================================================================== */
+/* ── §4 spark ── */
 
 /*
- * Spark — one projectile with motion-blur history.
+ * Spark — one flying spark, plus the short memory of where it just was
+ * (that memory is what we draw as the fading trail).
  *
- * REFERENCES:
- *   Reeves, W. T. (1983) "Particle Systems — A Technique for
- *     Modeling a Class of Fuzzy Objects", ACM TOG 2(2): 91-108.
- *     The fixed pool + per-particle state + lifetime-via-age-and-
- *     off-screen-cull model is straight from Reeves §3.  §4 names
- *     sparks specifically as a natural-phenomena instance of his
- *     framework.
+ * Every spark lives in one slot of a fixed array set up once at startup
+ * — there's no allocation while the demo runs. The `active` flag says
+ * whether a slot is in use; to make a new spark we just scan for the
+ * first free slot. Keeping all of a spark's numbers together in one
+ * struct (rather than in separate arrays) is friendly to the CPU cache,
+ * since the simulation touches them together every frame.
  *
- *   Hertz, H. (1882) "Über die Berührung fester elastischer Körper",
- *     J. reine angew. Math. 92: 156-171.
- *     Coefficient of restitution e ∈ (0, 1) governs the floor
- *     bounce — the rule vy' = −e · vy mutates this struct's vy.
+ * A spark's life:
+ *   born   — placed at the emitter (with a little random fuzz), aimed
+ *            in some direction at some speed, trail seeded at its start.
+ *   each frame — remember the current spot, then move: gravity pulls it
+ *            down, drag bleeds off speed, position advances, it ages.
+ *   bounce — if it hits the floor heading down, it flips upward (losing
+ *            energy) and loses a little sideways speed. If it's barely
+ *            moving afterward we retire it instead of letting it jitter.
+ *   pop    — SPARKLERS only: partway through its life a spark bursts
+ *            into a few smaller ones.
+ *   dies   — when it's too old, flies off-screen, or settles. Its slot
+ *            is then free for a new spark.
  *
- *   Bourg, D. M. & Bywalec, B. (2013) "Physics for Game Developers",
- *     2nd ed (O'Reilly).  Ch. 2-3 — ballistic motion under gravity
- *     + drag.  The semi-implicit Euler step that mutates this
- *     struct each tick:
- *           vy += gravity · dt
- *           v  *= exp(−drag · dt)
- *           x  += vx · dt;   y += vy · dt
- *
- *   Akenine-Möller, T., Haines, E. & Hoffman, N. (2018) "Real-Time
- *     Rendering", 4th ed (CRC Press).  §13.7 — point-sprite particle
- *     rendering.  The remaining-life → heat-ramp-slot mapping in
- *     spark_head_slot() is the ASCII analogue of size-by-mass
- *     point-sprite sizing described there.
- *
- * INTENT
- *   Hold every per-particle value the integrator needs in a flat
- *   layout that fits into a fixed-size BSS pool — MAX_SPARKS of
- *   these are allocated once at program start, no malloc after init.
- *   The `active` flag is the single source of truth for pool-slot
- *   occupancy; spawn finds the first inactive index via a linear
- *   scan (small N, fine).  Per-spark layout is hot-path-friendly:
- *   each tick reads x/y/vx/vy/age/trail consecutively per spark, so
- *   keeping these in a flat struct (not parallel arrays) wins on
- *   cache locality.
- *
- * LIFECYCLE
- *   SPAWN (scene_spawn_spark / scene_spawn_child_spark):
- *     position from emitter + jitter, velocity from a polar
- *     (angle, speed) cone, trail filled with the spawn position,
- *     active=true.  has_split = false for parents, true for cascade
- *     children.
- *   INTEGRATE (scene_tick):
- *     trail shifted by one slot, then semi-implicit Euler advances
- *     vy by gravity·dt, applies exp-drag to v, advances (x, y),
- *     and ages the spark.
- *   BOUNCE (scene_tick):
- *     when y crosses the floor moving down, reflect y, scale vy by
- *     −restitution (Hertz e), scale vx by floor_friction.  Settle
- *     criterion kills sparks with too little energy to bounce
- *     visibly so they don't burn ticks micro-bouncing.
- *   CASCADE (scene_tick, SPARKLERS only):
- *     when age crosses SPARKLER_SPLIT_AGE_FRAC · life, parent pops
- *     into SPARKLER_CHILDREN_PER_SPLIT children at its current
- *     (x, y); has_split latches to true.
- *   KILL: age ≥ life, x off-screen, y above TOP_KILL_MARGIN, or
- *     settled at floor.  Slot is reused by the next spawn.
+ * The pool-and-lifetime design is from Reeves (1983); the bounciness
+ * number is Hertz's coefficient of restitution (1882); the gravity +
+ * drag motion is standard game physics (Bourg & Bywalec 2013).
  *
  * FIELDS:
- *   x, y          Position in cells.  +y is downward (ncurses
- *                 convention), so gravity adds POSITIVE vy.  Sub-cell
- *                 precision is preserved as float; rendering rounds
- *                 to the nearest integer cell.
+ *   x, y          Where the spark is, in cells. y grows downward (the
+ *                 ncurses convention), so gravity pushes y up in value.
+ *                 Kept as floats for smooth motion; drawing rounds to
+ *                 the nearest cell.
  *
- *   vx, vy        Velocity in cells/sec.  Composed at spawn from
- *                 polar (angle, speed) via cos/sin, then mutated
- *                 each tick by gravity + drag + bounce (Bourg
- *                 Ch. 2-3).
+ *   vx, vy        How fast and which way the spark is moving, in
+ *                 cells/sec. Set from its launch angle and speed at
+ *                 birth, then changed every frame by gravity, drag, and
+ *                 bounces.
  *
- *   age, life     Seconds.  `age` advances at dt each tick (scaled
- *                 by user speed multiplier); `life` is sampled once
- *                 at spawn from [pp->life_min, pp->life_max] and
- *                 never changes.  Death at age ≥ life (Reeves 1983
- *                 §3 — lifetime cull) and head colour fades along
- *                 the heat ramp as T = 1 − age/life shrinks
- *                 (Akenine-Möller §13.7).
+ *   age, life     Both in seconds. `age` counts up every frame; `life`
+ *                 is rolled once at birth and never changes. The spark
+ *                 dies when age reaches life, and its colour fades from
+ *                 hot to dim as it ages.
  *
- *   trail_x[]     Ring of TRAIL_LEN previous positions, oldest at
- *   trail_y[]     index 0, newest (most recent prev) at index
- *                 TRAIL_LEN-1.  Filled with the spawn (x, y) at
- *                 birth so the renderer never sees uninitialised
- *                 history — otherwise fresh sparks would draw a
- *                 streak from a random previous occupant's last
- *                 position.  Shifted by one slot per tick; scene_draw
- *                 renders the ring as a fading streak BEHIND the
- *                 head.
+ *   trail_x[]     The last few positions the spark held, oldest first.
+ *   trail_y[]     We fill these with the birth position so a brand-new
+ *                 spark draws its trail right on top of itself (no
+ *                 streak) until it actually moves. Drawn as the fading
+ *                 tail behind the head.
  *
- *   active        Pool-slot occupancy flag.  Inactive slots are
- *                 skipped by every loop; spawn linear-scans for the
- *                 first inactive index (O(MAX_SPARKS), free at 60 fps
- *                 with MAX_SPARKS=800).  Reeves 1983 §3 — pool slot.
+ *   active        Whether this slot holds a live spark. Dead slots are
+ *                 skipped everywhere and reused by the next new spark.
  *
- *   has_split     SPARKLERS multi-level cascade flag, two roles:
- *                   (a) gate for the cascade — true means this spark
- *                       has already popped into children (or is
- *                       itself a child), and won't pop again.  Caps
- *                       the cascade at 2 generations.
- *                   (b) generation tag for spawn budgeting — the
- *                       SPARKLERS parent-target refill loop counts
- *                       only has_split=false sparks, so cascade
- *                       children flooding the pool don't throttle
- *                       new parent emission.
- *                 Unused (always false) for every non-SPARKLERS
- *                 pattern.
+ *   has_split     SPARKLERS only. Marks a spark that has already popped
+ *                 into smaller ones (or is itself one of those smaller
+ *                 ones), so it won't pop again — that caps the chain at
+ *                 two generations. It also lets the spawn logic count
+ *                 only the original sparks, so the extra ones don't
+ *                 crowd out new launches. Always false for other effects.
  */
 typedef struct {
   float x, y;
@@ -1020,8 +494,8 @@ typedef struct {
   bool has_split;
 } Spark;
 
-/* Cheap LCG — same constants as embers.c so the visual "noise feel"
- * is consistent across the particle_systems/ family. */
+/* A tiny, fast random-number generator. Same constants as embers.c so
+ * the sibling demos share the same "feel" of randomness. */
 static inline uint32_t lcg_next(uint32_t *st) {
   *st = *st * 1664525u + 1013904223u;
   return *st;
@@ -1030,34 +504,32 @@ static inline float lcg_unit(uint32_t *st) {
   return (float)(lcg_next(st) >> 8) / (float)(1u << 24);
 }
 
-/* ── Sampling primitives ───────────────────────────────────────────────── */
+/* ── Random sampling ── */
 
-/* Uniform sample over [lo, hi) — base primitive for every other sampler. */
+/* A random number somewhere between lo and hi. Everything else builds on this. */
 static inline float sample_uniform_in_range(uint32_t *rng, float lo, float hi) {
   return lo + lcg_unit(rng) * (hi - lo);
 }
 
-/* Random angle in [-π, π) — used for omnidirectional emission of
- * SPARKLERS cascade children where direction is fully random. */
+/* A fully random direction (any angle). Used when SPARKLERS children
+ * scatter every which way. */
 static inline float sample_random_phase_2pi(uint32_t *rng) {
   return lcg_unit(rng) * 2.0f * (float)M_PI - (float)M_PI;
 }
 
-/* ── Polar emission + initial kinematics ─────────────────────────────── */
+/* ── Launch and initial state ── */
 
-/* Polar → Cartesian: split a (speed, angle) cone vector into its (vx, vy)
- * components.  Angle convention matches the rest of the file:
- *   0 = +x (right), -π/2 = -y (up), +π/2 = +y (down).  */
+/* Turn a speed and a direction into left/right and up/down motion.
+ * (0 = right, -π/2 = up, +π/2 = down, matching the rest of the file.) */
 static inline void velocity_from_polar(float speed, float angle, float *vx,
                                        float *vy) {
   *vx = speed * cosf(angle);
   *vy = speed * sinf(angle);
 }
 
-/* Fill every trail slot with the spawn (x, y) so a fresh spark draws
- * its trail on TOP of its head — invisible until the spark moves and
- * the ring naturally stretches.  Without this, the renderer would
- * draw a streak from the previous occupant's last position. */
+/* Start a new spark's trail sitting exactly where the spark is, so it
+ * shows no streak until it actually moves. Skip this and a fresh spark
+ * would draw a trail back to wherever the slot's previous spark died. */
 static inline void spark_seed_trail_at_position(Spark *e, float x, float y) {
   for (int k = 0; k < TRAIL_LEN; k++) {
     e->trail_x[k] = x;
@@ -1065,9 +537,10 @@ static inline void spark_seed_trail_at_position(Spark *e, float x, float y) {
   }
 }
 
-/* Initialise the kinematic state of a spark from polar (speed, angle).
- * Pure write — does not touch active or has_split (caller's responsibility
- * since those depend on whether this is a parent or cascade child). */
+/* Set up a fresh spark's position, motion, and age from a speed and
+ * direction. Leaves `active` and `has_split` alone — the caller sets
+ * those, since they depend on whether this is an original spark or a
+ * popped child. */
 static inline void spark_init_kinematics(Spark *e, float x, float y,
                                          float speed, float angle, float life) {
   e->x = x;
@@ -1077,19 +550,19 @@ static inline void spark_init_kinematics(Spark *e, float x, float y,
   e->life = life;
 }
 
-/* ── Per-tick physics ─────────────────────────────────────────────────── */
+/* ── Physics, one frame at a time ── */
 
-/* Continuous-time damping factor applied per tick: drag = exp(−c·dt).
- * Frame-rate independent — commutes correctly across substeps, unlike
- * the multiplicative form v *= 0.99 which depends on tick rate.
- * Millington (2010) Ch. 6 — "exponential drag for stable physics". */
+/* The factor speed gets multiplied by this frame to model air drag.
+ * Written so the slowdown is the same regardless of frame rate — a
+ * plain "speed *= 0.99" would drift if the tick rate changed.
+ * Millington (2010) Ch. 6. */
 static inline float compute_drag_factor_continuous(float drag_coeff, float dt) {
   return expf(-drag_coeff * dt);
 }
 
-/* Drop oldest trail point, push current (x, y) as the newest prev.
- * Called BEFORE integration so the newest trail slot stores where the
- * spark IS RIGHT NOW (the visual head→trail link). */
+/* Push the current position into the trail history (dropping the oldest
+ * one). Done before the spark moves, so the newest trail point is
+ * exactly where the spark is now and the streak connects to the head. */
 static inline void spark_shift_trail_history(Spark *e) {
   for (int k = 0; k < TRAIL_LEN - 1; k++) {
     e->trail_x[k] = e->trail_x[k + 1];
@@ -1099,11 +572,10 @@ static inline void spark_shift_trail_history(Spark *e) {
   e->trail_y[TRAIL_LEN - 1] = e->y;
 }
 
-/* Semi-implicit Euler step (Bourg 2013 Ch. 2 / Millington Ch. 6):
- *   1. Velocity update: gravity into vy first, then drag scales v.
- *   2. Position update with the NEW velocity (this is the "semi-
- *      implicit" part — explicit Euler would use the OLD velocity).
- *   3. Age advances by dt. */
+/* Advance one spark by one frame: update its speed first (gravity pulls
+ * it down, drag bleeds speed off), then move it using that new speed,
+ * then age it. Updating speed before position is what keeps the motion
+ * stable (Bourg 2013 Ch. 2 / Millington Ch. 6). */
 static inline void integrate_spark_semi_implicit_euler(Spark *e, float gravity,
                                                        float drag_factor,
                                                        float dt) {
@@ -1115,34 +587,33 @@ static inline void integrate_spark_semi_implicit_euler(Spark *e, float gravity,
   e->age += dt;
 }
 
-/* True when the spark has just crossed the floor moving downward —
- * the trigger condition for a Hertz reflection. */
+/* True when the spark has dipped to or below the floor while heading
+ * down — that's the moment to bounce it. */
 static inline bool spark_crossed_floor_descending(const Spark *e,
                                                   float floor_y) {
   return e->y >= floor_y && e->vy > 0.0f;
 }
 
-/* Hertz floor bounce + settle test.  Reflects y about the floor line,
- * scales vy by −restitution (Hertz e ∈ [0, 1]) and vx by floor_friction.
- * Returns true if the post-bounce energy is too small to make a visible
- * bounce — caller should then deactivate the spark to avoid burning
- * ticks micro-bouncing it forever. */
+/* Bounce a spark off the floor: lift it back above the floor, flip it
+ * upward keeping `restitution` of its speed (the bounciness number),
+ * and shave its sideways speed by `friction`. Returns true if it ended
+ * up barely moving — the caller should then retire it, so it doesn't
+ * sit there jittering against the floor forever. */
 static inline bool reflect_spark_off_floor_and_test_settle(Spark *e,
                                                            float floor_y,
                                                            float restitution,
                                                            float friction) {
   float overshoot = e->y - floor_y;
-  e->y = floor_y - overshoot; /* reflect about floor */
+  e->y = floor_y - overshoot; /* mirror it back above the floor   */
   if (e->y > floor_y)
-    e->y = floor_y;             /* numeric safety      */
-  e->vy = -e->vy * restitution; /* Hertz energy loss   */
-  e->vx *= friction;            /* tangential friction */
+    e->y = floor_y;             /* guard against rounding past it  */
+  e->vy = -e->vy * restitution; /* flip upward, lose some energy   */
+  e->vx *= friction;            /* lose some sideways speed too    */
   return fabsf(e->vy) < SETTLE_VY && fabsf(e->vx) < SETTLE_VX;
 }
 
-/* Death conditions: lifetime expired (Reeves 1983 §3 — age cull),
- * x off-screen (sideways drift cull), or y above the kill margin
- * (upward escape cull, e.g. a TESLA spark fired hard upward). */
+/* Should this spark go away? Yes if it's lived out its life, drifted
+ * off the sides, or shot up off the top of the screen. */
 static inline bool spark_should_die(const Spark *e, int cols) {
   if (e->age >= e->life)
     return true;
@@ -1153,126 +624,82 @@ static inline bool spark_should_die(const Spark *e, int cols) {
   return false;
 }
 
-/* ===================================================================== */
-/* §5  scene — pool, tick, draw                                          */
-/* ===================================================================== */
+/* ── §5 scene — pool, tick, draw ── */
 
 /*
- * Scene — owns every piece of mutable state for the sparks demo.
+ * Scene — all the state that changes while the demo runs, in one place.
  *
- * Two clearly-separated halves:
+ * The fields split into two groups by who touches them. The simulation
+ * (scene_tick) reads and writes the first group: which effect is
+ * playing, the emitter shift, the spinner's angle, the random-number
+ * state, the screen size, and the spark pool itself. The drawing code
+ * only needs the current theme. They're grouped this way partly to make
+ * the code easier to follow and partly because the simulation runs every
+ * frame, so keeping its fields close together is friendlier to the cache.
  *
- *   SIMULATION HALF — read + written by scene_tick.  Owns the active
- *                     pattern, force overrides, RNG, cached terminal
- *                     dimensions, spinner-wheel phase, and the spark
- *                     pool itself.  Mutated by scene_tick and the
- *                     key handler.
- *
- *   RENDER HALF     — what scene_draw consults to pick colours.
- *                     Purely visual selection index; never read
- *                     inside the physics tick.
- *
- * LOCALITY
- *   Grouping by access pattern matters for two reasons.  Conceptually:
- *   a reader scanning scene_tick wants every field that mutates each
- *   frame in one block (not interleaved with render-only fields), and
- *   vice versa for scene_draw.  Mechanically: the hot path is the
- *   tick — its 9 small simulation fields fit in one or two cache
- *   lines and stay warm across the whole tick.  current_theme sits
- *   in the render half because the physics tick never touches it.
- *
- * REFERENCES (cited inline at the relevant field):
- *   Reeves (1983)        — particle pool design
- *   Hertz (1882)         — coefficient of restitution
- *   Bourg/Bywalec (2013) — gravity + drag + rotating reference frame
- *
- * SEPARATION OF CONCERNS
- *   The Scene knows nothing about ncurses.  Physics writes to the
- *   pool + scalar state; the render layer reads them.  That split
- *   lets the simulation be exercised without a terminal (e.g. for
- *   profiling) and keeps the layering explicit.
+ * The Scene knows nothing about ncurses: the simulation writes here, the
+ * drawing code reads from here. That clean split means you could run the
+ * simulation with no terminal at all (say, to profile it).
  */
 typedef struct {
-  /* ──────────────────────────────────────────────────────────────
-   *  SIMULATION HALF — physics tick reads + writes these
-   * ────────────────────────────────────────────────────────────── */
+  /* ── Simulation: the tick reads and writes these ── */
 
-  /* PAUSE — scene_tick early-returns when set.  Render keeps
-   * running, so the user sees a frozen frame with sparks held
-   * mid-arc and trails frozen behind them.  Toggled by SPACE. */
+  /* When true, the simulation freezes but drawing keeps going, so you
+   * see a still frame with every spark held mid-flight. Toggled by space. */
   bool paused;
 
-  /* SPEED — integer multiplier on dt.  SPEED_DEF = 1× wall clock;
-   * +/= keys double, − halves; bounded by SPEED_MIN/MAX.  Doesn't
-   * change physics constants — just compresses or stretches
-   * simulated time so the user can slow-mo / fast-forward the
-   * same physics. */
+  /* A time multiplier for slow-mo / fast-forward. It just speeds up or
+   * slows down simulated time — the physics itself is unchanged. +/=
+   * doubles it, - halves it, within SPEED_MIN/MAX. */
   int speed;
 
-  /* PATTERN — index into pattern_params[] (WELDING … WATERFALL).
-   * Cycled by n / N.  Switching pattern doesn't rebuild the pool —
-   * existing sparks finish their lifetimes under the old physics
-   * and fade away while new ones spawn under the new pattern.
-   * Press r to clear instantly.  Read by scene_tick (spawn loop +
-   * cascade gate) AND scene_draw (SPINNER core glyph); the only
-   * field used by both halves. */
+  /* Which effect is playing (an index into pattern_params[]). n/p cycle
+   * through them. Switching doesn't wipe the screen — old sparks fade
+   * out under the old rules while new ones launch under the new ones;
+   * press r to clear instantly. This is the one field both the
+   * simulation and the drawing code read. */
   Pattern current_pattern;
 
-  /* EMITTER OFFSET — added to the emitter's cx so the user can
-   * drag the show sideways with w/W without changing the
-   * pattern's identity.  Same physics, displaced origin.  Persists
-   * across pattern switches; reset to 0 by r. */
+  /* How far the whole show is shifted sideways, set by w/W. Lets you
+   * slide any effect left or right without changing what it is. Survives
+   * effect switches; r resets it to 0. */
   float emitter_offset_x;
 
-  /* SPINNER WHEEL PHASE — angle in radians, advanced by
-   * SPINNER_OMEGA · dt each tick and wrapped to [0, 2π).  Drives:
-   *   – two opposing rotating emission points on a circle of
-   *     radius SPINNER_RADIUS around the emitter (scene_spawn_spark)
-   *   – the rotating axle glyph at the wheel hub (scene_draw)
-   * Bourg & Bywalec Ch. 8 §1 — the parametric circle
-   *   x(t) = cx + R·cos(ωt),  y(t) = cy + R·sin(ωt).
-   * Only meaningful when current_pattern == PATTERN_GROUND_SPINNER,
-   * but advances unconditionally so the SPINNER axle picks up
-   * smoothly where it left off after a pattern swap. */
+  /* The SPINNER wheel's current angle, in radians. It turns a steady
+   * amount each frame (wrapped so it never grows without bound) and
+   * drives both where SPINNER sparks launch from and the spinning axle
+   * drawn at the hub. It keeps turning even when SPINNER isn't the
+   * current effect, so the wheel picks up smoothly when you switch to
+   * it. The circle math is from Bourg & Bywalec Ch. 8. */
   float spinner_phase;
 
-  /* RNG — per-scene LCG state, seeded from clock_ns() at init and
-   * re-seeded (XOR'd with a sentinel) on r.  Used by every
-   * randomness consumer: spawn jitter (angle, speed, position,
-   * life), SPARKLERS child spawn (direction + life), SPINNER rim
-   * side + tangent jitter.  No globals — full state in this
-   * single 32-bit word. */
+  /* The random-number state for this scene. Seeded from the clock at
+   * startup and re-rolled on r. Everything random pulls from here:
+   * launch fuzz, speeds, lifetimes, SPARKLERS scatter, SPINNER wobble.
+   * No globals — the whole generator is this one 32-bit value. */
   uint32_t rng;
 
-  /* CACHED TERMINAL DIMENSIONS — read every frame by spawn
-   * (emitter coords), the integrator (off-screen kill check), and
-   * the renderer (cell bounds).  Cached at init and on SIGWINCH
-   * so the hot path never calls getmaxyx().  Strictly speaking
-   * these are SHARED between sim and render — both halves see the
-   * same dimensions — but they're written only by the tick layer
-   * so they live with the SIMULATION block. */
+  /* The terminal size, remembered here so the hot path never has to ask
+   * ncurses for it. Refreshed at startup and whenever the window
+   * resizes. Used for the emitter position, off-screen checks, and
+   * drawing bounds. */
   int rows, cols;
 
-  /* SPARK POOL — fixed-size BSS array, no allocation after init.
-   * See Spark for per-slot detail.  spark_pool_find_inactive
-   * linear-scans for the first inactive index when spawn needs a
-   * slot.  Reeves 1983 §3 — the particle pool. */
+  /* The spark pool — a fixed array set up once, never resized or
+   * reallocated. Spawning a spark scans for the first free slot. See
+   * the Spark struct for what each slot holds. */
   Spark sparks[MAX_SPARKS];
 
-  /* ──────────────────────────────────────────────────────────────
-   *  RENDER HALF — scene_draw reads this; physics tick ignores it
-   * ────────────────────────────────────────────────────────────── */
+  /* ── Rendering: only the drawing code reads this ── */
 
-  /* THEME — index into themes[].  Cycled by t / T.  Selects the
-   * 8-step heat ramp (remaining-life → colour) used for both
-   * heads and trails.  Pure render concern — spark physics
-   * behaves identically regardless of which theme is active.
-   * theme_apply rewrites pairs PAIR_HEAT_BASE..+7 on change. */
+  /* Which colour theme is active (an index into themes[]). t/T cycle
+   * through them. Purely cosmetic — sparks behave the same whatever
+   * theme is showing. Changing it repaints the colour ramp. */
   int current_theme;
 } Scene;
 
-/* The floor — sparks bounce off the row above the HUD. The HUD lives
- * on row (rows - 1); sparks reflect about y = rows - 2. */
+/* Sparks bounce off the floor, which sits one row above the key-hint
+ * bar (the bar is on the very bottom row). */
 static inline float scene_floor_y(const Scene *s) {
   return (float)(s->rows - 2);
 }
@@ -1289,22 +716,8 @@ static void scene_clear_sparks(Scene *s) {
     s->sparks[i].active = false;
 }
 
-/*
- * scene_emitter_xy — compute the emitter's (cx, cy) for the current
- * pattern.  Four anchor positions cover the ten patterns:
- *
- *   CENTER_LEFT    horizontal-jet origin for WELDING — sparks fly
- *                  rightward across the whole screen.
- *   CENTER_BOTTOM  ground origin for GRINDER / CAMPFIRE / FLOWERPOT /
- *                  WILLOW — sparks rise and arc back to the floor.
- *   CENTER         radial origin for omnidirectional bursts —
- *                  TESLA, SPARKLERS, SPINNER, CHRYSANTHEMUM.
- *   CENTER_TOP     ceiling origin for WATERFALL — sparks rain down
- *                  the full height of the screen.
- *
- * The w/W keys shift `emitter_offset_x` so the user can drag any
- * pattern sideways without rebuilding the table.
- */
+/* Work out where sparks are born for the current effect — one of four
+ * spots (see EmitPos), shifted sideways by the w/W offset. */
 static void scene_emitter_xy(const Scene *s, float *cx, float *cy) {
   const PatternParams *pp = &pattern_params[s->current_pattern];
   switch (pp->emitter) {
@@ -1329,41 +742,39 @@ static void scene_emitter_xy(const Scene *s, float *cx, float *cy) {
   *cx += s->emitter_offset_x;
 }
 
-/* ── Emission cone primitives ─────────────────────────────────────────── */
+/* ── Picking a launch direction and spot ── */
 
-/* Sample speed from pattern's (speed_min, speed_max) cone. */
+/* Roll a launch speed inside the effect's allowed range. */
 static inline float sample_speed_from_cone(uint32_t *rng,
                                            const PatternParams *pp) {
   return sample_uniform_in_range(rng, pp->speed_min, pp->speed_max);
 }
 
-/* Sample lifetime from pattern's (life_min, life_max) range — drives
- * the heat-ramp fade (Akenine-Möller 2018 §13.7). */
+/* Roll how long this spark will live, inside the effect's range. */
 static inline float sample_lifetime_from_pattern(uint32_t *rng,
                                                  const PatternParams *pp) {
   return sample_uniform_in_range(rng, pp->life_min, pp->life_max);
 }
 
-/* Parametric circle: point on the SPINNER wheel rim at angle `phase`,
- * radius SPINNER_RADIUS, around centre (cx, cy).  Bourg & Bywalec
- * Ch. 8 §1 — x(t) = cx + R·cos(ωt),  y(t) = cy + R·sin(ωt). */
+/* Find the point on the spinning wheel's rim at the current angle.
+ * The rim point rides a circle of radius SPINNER_RADIUS around the
+ * centre (Bourg & Bywalec Ch. 8). */
 static inline void wheel_rim_position(float cx, float cy, float phase,
                                       float *out_x, float *out_y) {
   *out_x = cx + SPINNER_RADIUS * cosf(phase);
   *out_y = cy + SPINNER_RADIUS * sinf(phase);
 }
 
-/* Tangent direction at a rim point — perpendicular to the radial
- * (spoke) at that angle.  Sparks fly OFF the wheel in this direction,
- * not radially outward, which is what makes the SPINNER read as a
- * rotating wheel rather than a centred burst. */
+/* The direction a spark leaves the rim: sideways along the wheel, not
+ * straight out from the centre. Launching along the rim is what makes
+ * the SPINNER look like a spinning pinwheel instead of a plain burst. */
 static inline float wheel_tangent_angle(float phase) {
   return phase + (float)M_PI / 2.0f;
 }
 
-/* SPINNER emission: pick one of two opposing rim points (50/50), spawn
- * a spark on that rim, and emit tangent to the circle with a small
- * angular jitter so the stream isn't perfectly straight. */
+/* SPINNER launch: pick one of the two rim points on opposite sides
+ * (50/50), put a spark there, and send it off along the rim with a
+ * touch of random wobble so the stream isn't a perfectly straight line. */
 static void wheel_compute_tangential_emission(uint32_t *rng, float phase_now,
                                               float cx, float cy,
                                               float *spawn_x, float *spawn_y,
@@ -1375,9 +786,9 @@ static void wheel_compute_tangential_emission(uint32_t *rng, float phase_now,
   *emit_angle = wheel_tangent_angle(phase) + jitter;
 }
 
-/* Standard cone emission: random angle from the pattern's range,
- * spawn position around the emitter centre with rectangular jitter.
- * Used by every pattern except SPINNER. */
+/* The ordinary launch used by every effect except SPINNER: pick a
+ * random direction inside the effect's allowed range, and a birth spot
+ * near the emitter with a little random fuzz. */
 static void cone_compute_emission(uint32_t *rng, const PatternParams *pp,
                                   float cx, float cy, float *spawn_x,
                                   float *spawn_y, float *emit_angle) {
@@ -1386,16 +797,10 @@ static void cone_compute_emission(uint32_t *rng, const PatternParams *pp,
   *spawn_y = cy + (lcg_unit(rng) - 0.5f) * 2.0f * pp->emit_y_jitter;
 }
 
-/*
- * scene_spawn_spark — emit one "parent" spark for the current pattern.
- *
- *   1. Pick origin + direction:
- *        SPINNER → tangent off the rotating rim
- *        else    → standard cone emission with positional jitter
- *   2. Sample speed + life from pattern.
- *   3. Initialise kinematics and seed the trail at the spawn point.
- *   4. Mark active, has_split=false (parents are split-eligible).
- */
+/* Launch one new spark for the current effect. SPINNER throws it off
+ * the spinning rim; every other effect uses the ordinary cone launch.
+ * Marked has_split=false, meaning it's an original (a SPARKLERS one is
+ * still allowed to pop later). */
 static void scene_spawn_spark(Scene *s) {
   int idx = spark_pool_find_inactive(s);
   if (idx < 0)
@@ -1423,16 +828,14 @@ static void scene_spawn_spark(Scene *s) {
   e->active = true;
 }
 
-/*
- * scene_spawn_child_spark — secondary spark from a SPARKLERS cascade.
- * Reads as: random omni direction, child-scale speed and lifetime,
- * spawn at the parent's current position, mark already-split so the
- * cascade caps at 2 generations.
- */
+/* Spawn one of the smaller sparks when a SPARKLERS spark pops: a random
+ * direction, slower and shorter-lived, starting where the parent was.
+ * Marked has_split=true so it can't pop again (caps the chain at two
+ * generations). */
 static void scene_spawn_child_spark(Scene *s, float x, float y) {
   int idx = spark_pool_find_inactive(s);
   if (idx < 0)
-    return; /* pool full — accept that some children fail */
+    return; /* pool's full — fine to drop a few of these */
   Spark *e = &s->sparks[idx];
 
   float angle = sample_random_phase_2pi(&s->rng);
@@ -1443,7 +846,7 @@ static void scene_spawn_child_spark(Scene *s, float x, float y) {
 
   spark_init_kinematics(e, x, y, speed, angle, life);
   spark_seed_trail_at_position(e, x, y);
-  e->has_split = true; /* no recursive splitting */
+  e->has_split = true; /* a popped spark never pops again */
   e->active = true;
 }
 
@@ -1472,19 +875,18 @@ static void scene_reseed(Scene *s) {
   scene_clear_sparks(s);
 }
 
-/* ── Tick orchestration helpers ───────────────────────────────────────── */
+/* ── Running one tick ── */
 
-/* Advance the SPINNER wheel rotation by ω·dt and wrap to [0, 2π) so
- * the accumulated phase never grows unboundedly.  Runs unconditionally
- * so the wheel picks up smoothly where it left off after a pattern
- * swap; harmless when the current pattern isn't SPINNER. */
+/* Turn the SPINNER wheel a little this frame, wrapping the angle so it
+ * never grows without bound. Always runs, so the wheel keeps its
+ * position even while another effect is on screen. */
 static inline void wheel_phase_advance_and_wrap(Scene *s, float dt) {
   s->spinner_phase += SPINNER_OMEGA * dt;
   if (s->spinner_phase > 2.0f * (float)M_PI)
     s->spinner_phase -= 2.0f * (float)M_PI;
 }
 
-/* Total population census — linear scan of the pool's active flags. */
+/* Count every live spark. */
 static int count_active_sparks(const Scene *s) {
   int n = 0;
   for (int i = 0; i < MAX_SPARKS; i++)
@@ -1493,9 +895,9 @@ static int count_active_sparks(const Scene *s) {
   return n;
 }
 
-/* Population census restricted to PARENTS (has_split=false).  Used by
- * SPARKLERS so the cascade's children don't fill the budget and
- * throttle new parent emission. */
+/* Count only the original sparks (not the popped children). SPARKLERS
+ * uses this so its extra sparks don't get counted toward the target and
+ * choke off new launches. */
 static int count_active_parent_sparks(const Scene *s) {
   int n = 0;
   for (int i = 0; i < MAX_SPARKS; i++)
@@ -1504,9 +906,9 @@ static int count_active_parent_sparks(const Scene *s) {
   return n;
 }
 
-/* Spawn budget for this tick — refill toward pattern.target_sparks,
- * but cap the per-tick burst proportional to dt so a long pause
- * doesn't dump the entire pool in a single frame on resume. */
+/* How many sparks to launch this frame: enough to climb back toward the
+ * effect's target, but capped per frame (the cap scales with frame time)
+ * so resuming after a long pause doesn't spit them all out at once. */
 static int compute_spawn_count_for_tick(int active, const PatternParams *pp,
                                         float dt) {
   int target = pp->target_sparks;
@@ -1521,17 +923,15 @@ static int compute_spawn_count_for_tick(int active, const PatternParams *pp,
   return n;
 }
 
-/* Spawn `n` new parent sparks via the pattern's emission rules. */
+/* Launch n new sparks. */
 static void spark_pool_topup_parents(Scene *s, int n) {
   for (int k = 0; k < n; k++)
     scene_spawn_spark(s);
 }
 
-/* SPARKLERS multi-level cascade pass — every still-eligible parent
- * spark (active && !has_split) that has crossed
- * SPARKLER_SPLIT_AGE_FRAC of its lifetime pops into
- * SPARKLER_CHILDREN_PER_SPLIT secondaries at its current (x, y).  The
- * parent's has_split latches to true so it can't pop again. */
+/* The SPARKLERS pop: any original spark that's lived past 40% of its
+ * life bursts into a few smaller ones where it currently is, then is
+ * marked so it won't burst again. */
 static void cascade_sparkler_split_pass(Scene *s) {
   for (int i = 0; i < MAX_SPARKS; i++) {
     Spark *e = &s->sparks[i];
@@ -1552,17 +952,17 @@ static void scene_tick(Scene *s, float dt) {
 
   const PatternParams *pp = &pattern_params[s->current_pattern];
 
-  /* 0. Tick the SPINNER wheel rotation. */
+  /* Turn the spinner wheel. */
   wheel_phase_advance_and_wrap(s, dt);
 
-  /* 1. Top up the spark pool toward the pattern's target density. */
+  /* Launch enough new sparks to stay near the effect's target count. */
   int active = (s->current_pattern == PATTERN_SPARKLERS)
                    ? count_active_parent_sparks(s)
                    : count_active_sparks(s);
   int to_spawn = compute_spawn_count_for_tick(active, pp, dt);
   spark_pool_topup_parents(s, to_spawn);
 
-  /* 2. Integrate every active spark; resolve floor bounce + death. */
+  /* Move every spark, then bounce or retire the ones that need it. */
   float floor_y = scene_floor_y(s);
   float drag_factor = compute_drag_factor_continuous(pp->drag_coeff, dt);
 
@@ -1577,7 +977,7 @@ static void scene_tick(Scene *s, float dt) {
     if (spark_crossed_floor_descending(e, floor_y) &&
         reflect_spark_off_floor_and_test_settle(e, floor_y, pp->restitution,
                                                 pp->floor_friction)) {
-      e->active = false; /* settled — kill, skip death checks */
+      e->active = false; /* settled at the floor — retire it */
       continue;
     }
 
@@ -1585,17 +985,14 @@ static void scene_tick(Scene *s, float dt) {
       e->active = false;
   }
 
-  /* 3. SPARKLERS multi-level cascade — parents pop at mid-life. */
+  /* SPARKLERS: pop the sparks that have reached the right age. */
   if (s->current_pattern == PATTERN_SPARKLERS)
     cascade_sparkler_split_pass(s);
 }
 
-/*
- * spark_head_slot — heat-ramp slot for the spark's head from its
- * remaining-life fraction. T = 1 at birth (slot 7, white-hot), T = 0
- * at death (slot 0, dim). Same mapping as ember temperature in
- * embers.c so trained eyes read sparks consistently.
- */
+/* Pick the colour/brightness slot for a spark's head based on how much
+ * life it has left: a fresh spark is the brightest slot, a dying one is
+ * the dimmest. Same fade as the embers in embers.c. */
 static inline int spark_head_slot(const Spark *e) {
   float T = 1.0f - e->age / e->life;
   if (T < 0.0f)
@@ -1610,18 +1007,18 @@ static inline int spark_head_slot(const Spark *e) {
   return slot;
 }
 
-/* ── Render primitives ────────────────────────────────────────────────── */
+/* ── Drawing ── */
 
-/* Older trail points (lower k) get cooler ramp slots — the streak
- * fades behind the spark as you walk back through the ring buffer.
- * Returns -1 when the offset has cooled below the ramp's bottom. */
+/* Colour slot for one point of the trail: dimmer the farther back you
+ * go, so the streak fades behind the head. Returns -1 once a point is
+ * too dim to bother drawing. */
 static inline int trail_ramp_slot_for_offset(int head_slot, int k) {
   return head_slot - (TRAIL_LEN - k);
 }
 
-/* Brightness attribute by ramp slot — top of ramp BOLD, bottom DIM.
- * Shared between trail and head so both layers read the gradient
- * consistently. */
+/* Boldness for a colour slot: bright slots drawn bold, dim slots drawn
+ * faint, the rest normal. Used for both heads and trails so they share
+ * the same gradient feel. */
 static inline int head_attr_by_brightness_slot(int slot) {
   if (slot >= 6)
     return A_BOLD;
@@ -1630,23 +1027,22 @@ static inline int head_attr_by_brightness_slot(int slot) {
   return A_NORMAL;
 }
 
-/* Phase ∈ [0, 2π) → one of four rotation glyphs in equal slices.
- * The cycle | / - \ reads as a visibly spinning axle when the SPINNER
- * phase advances at SPINNER_OMEGA rad/sec. */
+/* Pick the spinning-axle character (| / - \) from the wheel's angle, so
+ * the hub looks like it's turning along with the rim. */
 static inline char wheel_axle_glyph_for_phase(float phase) {
   static const char rot_chars[4] = {'|', '/', '-', '\\'};
   int rot_idx = ((int)(phase * (2.0f / (float)M_PI))) & 3;
   return rot_chars[rot_idx];
 }
 
-/* Draw the entire motion-blur trail of one spark — TRAIL_LEN faded
- * glyphs, oldest dimmest, ramping up to one slot below the head. */
+/* Draw one spark's fading tail — the remembered positions, oldest and
+ * dimmest first, brightening up to just below the head. */
 static void trail_draw_one_spark(const Spark *e, int head_slot, int cols,
                                  int rows_eff) {
   for (int k = 0; k < TRAIL_LEN; k++) {
     int slot = trail_ramp_slot_for_offset(head_slot, k);
     if (slot < 0)
-      continue; /* cooled below the ramp */
+      continue; /* too dim to draw */
 
     int ix = (int)(e->trail_x[k] + 0.5f);
     int iy = (int)(e->trail_y[k] + 0.5f);
@@ -1664,8 +1060,7 @@ static void trail_draw_one_spark(const Spark *e, int head_slot, int cols,
   }
 }
 
-/* Draw the bright "head" glyph of one spark at its current (x, y).
- * Head_slot encodes the heat ramp from remaining-life fraction. */
+/* Draw the bright dot — the spark's head — at where it is now. */
 static void head_draw_one_spark(const Spark *e, int cols, int rows_eff) {
   int ix = (int)(e->x + 0.5f);
   int iy = (int)(e->y + 0.5f);
@@ -1683,9 +1078,8 @@ static void head_draw_one_spark(const Spark *e, int cols, int rows_eff) {
   attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* All trails first — they sit BEHIND the heads after the head pass
- * overwrites them where they crossed (the bright dot the eye tracks
- * is never shadowed by a passing streak). */
+/* Draw all the tails first, so the bright heads (drawn next) land on
+ * top and a passing streak never covers up the dot you're watching. */
 static void spark_pool_draw_trails(const Scene *s, int rows_eff) {
   for (int i = 0; i < MAX_SPARKS; i++) {
     const Spark *e = &s->sparks[i];
@@ -1694,7 +1088,7 @@ static void spark_pool_draw_trails(const Scene *s, int rows_eff) {
   }
 }
 
-/* Heads on top — drawn after trails so they sit on the streaks. */
+/* Draw all the heads, on top of the tails. */
 static void spark_pool_draw_heads(const Scene *s, int rows_eff) {
   for (int i = 0; i < MAX_SPARKS; i++) {
     const Spark *e = &s->sparks[i];
@@ -1703,8 +1097,7 @@ static void spark_pool_draw_heads(const Scene *s, int rows_eff) {
   }
 }
 
-/* SPINNER core glyph at the wheel hub — visible | / - \ axle that
- * cycles in lockstep with the rim's emission phase. */
+/* Draw the spinning axle (| / - \) at the centre of the SPINNER wheel. */
 static void wheel_axle_draw(const Scene *s, int rows_eff) {
   float cx, cy;
   scene_emitter_xy(s, &cx, &cy);
@@ -1723,19 +1116,16 @@ static void wheel_axle_draw(const Scene *s, int rows_eff) {
 }
 
 static void scene_draw(const Scene *s) {
-  int rows_eff = s->rows - 1; /* leave bottom row for HUD */
+  int rows_eff = s->rows - 1; /* keep the bottom row for the hint bar */
 
-  spark_pool_draw_trails(s, rows_eff); /* dim — drawn first       */
-  spark_pool_draw_heads(s, rows_eff);  /* bright — sit on top     */
+  spark_pool_draw_trails(s, rows_eff); /* dim tails first    */
+  spark_pool_draw_heads(s, rows_eff);  /* bright heads on top */
 
   if (s->current_pattern == PATTERN_GROUND_SPINNER)
-    wheel_axle_draw(s, rows_eff); /* spinning axle at hub    */
+    wheel_axle_draw(s, rows_eff);
 }
-/* ── end §5 — to understand the ncurses I/O wrapper, read §6 screen ── */
 
-/* ===================================================================== */
-/* §6  screen                                                             */
-/* ===================================================================== */
+/* ── §6 screen ── */
 
 typedef struct {
   int cols, rows;
@@ -1770,19 +1160,10 @@ static int scene_active_count(const Scene *s) {
   return n;
 }
 
-/*
- * screen_draw — render the scene, then paint a two-layer HUD over it:
- *
- *   Row 0        STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
- *                Live state: pattern (or PAUSED), theme, spark count,
- *                emitter offset, fps, sim Hz, speed multiplier.
- *   Row rows-1   KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
- *                Every interactive key the demo accepts.
- *
- * Both rows are pre-filled with their pair colour so the coloured
- * background spans the full width, and drawn AFTER scene_draw so
- * sparks never bleed through the bars.
- */
+/* Draw the sparks, then lay two bars over them: a status line across
+ * the top (effect, theme, spark count, fps, etc.) and a key-hint line
+ * across the bottom. Both bars fill their whole row with colour and are
+ * drawn last, so no spark shows through them. */
 static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
   erase();
   scene_draw(s);
@@ -1791,7 +1172,7 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
   const char *state_str =
       s->paused ? "PAUSED   " : pattern_name(s->current_pattern);
 
-  /* ── Top row: dynamic status ─────────────────────────────── */
+  /* Top row: the live status line. */
   char status[220];
   snprintf(status, sizeof status,
            " SPARKS   %s   theme:%-8s   sparks:%4d   "
@@ -1805,7 +1186,7 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
   mvprintw(0, 0, "%s", status);
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-  /* ── Bottom row: every interactive key ───────────────────── */
+  /* Bottom row: the key hints. */
   const char *hints = " q:quit  spc:pause  r:reseed  n/p:pattern  t/T:theme  "
                       "w/W:emitter  +/-:speed  ]/[:Hz ";
 
@@ -1822,9 +1203,7 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §7  app                                                                */
-/* ===================================================================== */
+/* ── §7 app ── */
 
 typedef struct {
   Scene scene;

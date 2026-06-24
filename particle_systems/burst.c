@@ -1,166 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * burst.c — fireworks-style radial particle bursts on a persistent scorch grid.
+ * burst.c — fireworks in the terminal.  Bursts go off at random spots,
+ * each one flashing then throwing a fan of ASCII sparks that fly out, fade,
+ * and die.  Spots that sparks pass over keep a faint scorch mark, so the
+ * screen slowly remembers where past bursts happened.
  *
- * Each burst walks a 3-state FSM (IDLE → FLASH → LIVE → IDLE).  On
- * ignite it picks a random detonation centre, primes a one-frame
- * '*+'-cross flash, then emits BURST_PARTICLES particles in a fan of
- * BURST_WAVE_COUNT staggered waves around 360°.  Particles are
- * advanced with explicit Euler + exponential per-tick drag + linear
- * life decay; the visible glyph and brightness fade through a
- * 9-slot ramp indexed by remaining life.  Cells touched by any
- * particle are marked in a persistent SCORCH grid so the screen
- * "remembers" past bursts.  Ten themes cycle the colour pairs.
+ * The idea of throwing lots of tiny short-lived particles to fake fire and
+ * smoke comes from Reeves (1983), "Particle Systems", ACM TOG 2(2): 91.
  *
- * Section map
- *   §1  config         constants — sim, burst, particle, scorch
- *   §2  clock          monotonic-ns timer + sleep
- *   §3  random + math  uniform samples + integer clamp
- *   §4  themes         10 hue palettes + Hue enum + theme_apply
- *   §5  debug overlay  d/D cycle through inspection modes
- *   §6  particle       Particle struct + spawn + tick + draw
- *   §7  burst FSM      Burst struct + state enum + burst_ignite
- *   §8  burst tick     FSM advance + complete + re-arm
- *   §9  burst render   flash cross + fuse overlay + burst_draw
- *   §10 field          burst pool + persistent scorch grid
- *   §11 screen + HUD   ncurses init + status strip
- *   §12 app            App struct + signal handlers + key dispatch
- *   §13 main           fixed-step main loop
+ * Build:  gcc -std=c11 -O2 -Wall -Wextra particle_systems/burst.c \
+ *             -o burst -lncurses -lm
  */
-
-/* ── CONCEPTS & ALGORITHMS ───────────────────────────────────────────── *
- *
- *   Particle system        Pool of free particles, each with pos, vel,
- *                          life, glyph, hue.  Per-frame integrate + cull.
- *                          → Reeves (1983), ACM TOG 2(2): 91
- *
- *   Burst FSM              IDLE → FLASH (1 frame) → LIVE (until all
- *                          particles dead) → IDLE.  Re-armed with a
- *                          random delay.  Three states, three transitions.
- *                          → standard explosion/effects-engine pattern
- *
- *   Wave-staggered fan     N particles split into K waves; each wave
- *                          fires (max_delay · wave / (K-1)) frames after
- *                          ignite.  Reads as a shockwave, not a single
- *                          instant ring.
- *                          → Doom-style burst convention
- *
- *   Exponential drag       v *= exp(-DRAG_PER_TICK · dt)  (analytic
- *                          per-frame form; stable under any dt).
- *
- *   Life-keyed ramp        slot = clamp(floor((life/max_life)·9), 0..8)
- *                          → glyph from k_syms; colour pair from theme.
- *                          → ember/cooling-palette pattern (this repo)
- *
- *   Scorch overlay         Persistent uint8 grid; particles increment
- *                          their cell on every visible draw.  Renders
- *                          UNDER active particles so trails accumulate.
- *                          → frame-buffer "trail" technique
- *
- *   Object pool            Fixed-size Burst[BURST_COUNT]; no malloc in
- *                          the hot path.  Each Burst owns its own
- *                          particle pool inline.
- *
- *   Fixed-step accumulator Deterministic per-tick physics regardless
- *                          of render Hz.
- *                          → Glenn Fiedler, "Fix Your Timestep!" (2004)
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── OVERALL PSEUDOCODE ──────────────────────────────────────────────── *
- *
- *   init:
- *     install signals; start ncurses (themes + HUD/HINT pairs)
- *     field_init: alloc burst pool + scorch grid; arm initial timers
- *
- *   loop while running:
- *     if need_resize:        endwin → refresh → field re-init
- *     dt = clock_now − last_frame_time      (capped at 100 ms)
- *     while sim_accum ≥ tick_ns:
- *       field_tick:          for each burst: burst_tick (FSM advance)
- *       sim_accum -= tick_ns
- *     screen_draw_field:     scorch layer + active-burst layer
- *     screen_draw_hud        fps + theme + bursts + sim_fps
- *     screen_present
- *     getch + app_handle_key q/space/t/d/+
- *     sleep to ~60 fps
- *
- *   cleanup:
- *     atexit endwin restores the terminal
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── DRIVER PSEUDOCODE ───────────────────────────────────────────────── *
- *
- * particle_tick(p, cols, rows):                   (per-particle physics)
- *   if !p->alive:           return
- *   if p->delay > 0:        p->delay--; return    wave-stagger countdown
- *   p->vx *= exp(-DRAG · dt);  p->vy *= exp(-DRAG · dt)   exponential drag
- *   p->px += p->vx;  p->py += p->vy                       explicit Euler
- *   p->life -= LIFE_DECAY                                 linear cooling
- *   if p->life ≤ 0 OR off-screen:  p->alive = false
- *
- *   Order: drag BEFORE integrate so dt-cap doesn't tunnel the particle
- *   past the screen edge in one frame.
- *
- *
- * burst_tick(b, cols, rows, ignite_chance, particle_count):    (FSM advance)
- *   switch (b->state):
- *     BS_IDLE     b->idle_ticks--; if reached 0 + roll < ignite_chance:
- *                 burst_ignite(b, cols, rows)         transition → FLASH
- *     BS_FLASH    b->flash_ttl--; if 0:                transition → LIVE
- *     BS_LIVE     for each p in b->particles:
- *                   particle_tick(p, cols, rows)
- *                   if alive: scorch_grid[p.cell]++
- *                 if no particles alive:
- *                   burst_complete_and_rearm(b)       transition → IDLE
- *
- *   The FSM is the entire algorithmic spine of this file.  Every visual
- *   you see traces back to one of these three states.
- *
- *
- * burst_draw(b, w, cols, rows):                    (per-burst render)
- *   if BS_FLASH:    draw_flash_cross(centre)        bright '*+' cross
- *   if BS_LIVE:     for each alive p: particle_draw(p, w)
- *                                                    (glyph + hue + bold tier)
- *                   draw_fuse_overlay(b)             debug-mode-only
- *
- *   Flash and live phases are mutually exclusive (the FSM enforces it),
- *   so no z-order conflicts in the same burst.  Active bursts paint OVER
- *   the persistent scorch layer.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/*
- * Keys
- *   q | Q | ESC      quit                space      pause / resume
- *   t / T            next / prev theme
- *   d / D            cycle debug overlay (off / vector / fuse / cell-grid)
- *   + / =            ignite an extra burst right now (manual trigger)
- *   ] / [            sim Hz up / down
- *
- * Build
- *   gcc -std=c11 -O2 -Wall -Wextra particle_systems/burst.c \
- *       -o burst -lncurses -lm
- */
-
-/* ── REFERENCES ──────────────────────────────────────────────────────── *
- *
- * PAPERS
- *   Reeves, W. T. (1983)
- *     "Particle Systems: A Technique for Modelling a Class of Fuzzy Objects"
- *     ACM Transactions on Graphics 2(2): 91–108.
- *
- * BOOKS
- *   Press et al. — "Numerical Recipes in C"  (3rd ed., 2007)
- *     §17.x covers the fixed-step accumulator pattern; §1.1.3 the
- *     squared-distance / no-sqrt idiom used in particle culling.
- *   Watt, A. & Watt, M. — "Advanced Animation and Rendering Techniques"
- *     (Addison-Wesley, 1992)
- *     Ch. 13 covers explicit Euler + exponential damping for particle
- *     systems and the trade-offs vs Verlet integration.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -178,9 +28,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
 enum {
   SIM_FPS_MIN = 5,
@@ -192,44 +40,40 @@ enum {
   BURSTS_DEFAULT = 5,
   BURSTS_MAX = 16,
 
-  PARTICLES = 48,   /* sparks per burst                          */
-  BURST_TICKS = 22, /* max LIVE-state duration                   */
-  FUSE_MIN = 8,     /* idle-fuse minimum (ticks)                 */
-  FUSE_RANGE = 20,  /* idle-fuse extra uniform range             */
+  PARTICLES = 48,   /* sparks thrown by one burst                */
+  BURST_TICKS = 22, /* hard cap on how long sparks fly           */
+  FUSE_MIN = 8,     /* shortest wait before a burst goes off     */
+  FUSE_RANGE = 20,  /* random extra wait on top of the minimum   */
 
-  BURST_WAVES = 4,     /* concentric rings inside one burst         */
-  BURST_MAX_DELAY = 5, /* outermost wave's spawn delay (ticks)      */
+  BURST_WAVES = 4,     /* sparks leave in this many timed rings      */
+  BURST_MAX_DELAY = 5, /* head start gap between first and last ring */
 
-  HUD_COLS = 64, /* fits fps + spd + burst + [theme] + dbg    */
+  HUD_COLS = 64, /* width of the top-right status text         */
   FPS_UPDATE_MS = 500,
 };
 
-/*
- * Float constants that read better as #define than as enum.  Grouped by
- * concept and annotated with units / role so the inner loops below stay
- * pure mechanics — every magic number lives here.
- */
-#define DRAG_FACTOR 0.82f /* per-tick velocity retention (≈18% loss) */
-#define FLASH_LIFE_THRESHOLD 0.65f /* sparks bold while life > this */
+/* The tuning knobs below are fractions, so they live as #define rather than
+ * the integer enum above.  Every magic number sits here, leaving the loops
+ * further down free of bare literals. */
+#define DRAG_FACTOR 0.82f          /* speed kept each tick; the rest is lost */
+#define FLASH_LIFE_THRESHOLD 0.65f /* a spark glows bold while younger than this */
 
-#define BURST_ANGLE_JITTER 0.2f /* radians of extra angle per spark        */
-#define BURST_SPEED_MIN 1.8f    /* pixels / tick (lower bound)             */
-#define BURST_SPEED_MAX 4.6f    /* pixels / tick (upper bound)             */
+#define BURST_ANGLE_JITTER 0.2f /* random wobble added to each spark's heading */
+#define BURST_SPEED_MIN 1.8f    /* slowest a fresh spark can fly */
+#define BURST_SPEED_MAX 4.6f    /* fastest a fresh spark can fly */
 
-#define PARTICLE_LIFE_MIN 0.8f   /* fresh-spawn life (lower bound)          */
-#define PARTICLE_LIFE_MAX 1.0f   /* fresh-spawn life (upper bound)          */
-#define PARTICLE_DECAY_MIN 0.05f /* per-tick life decay (lower bound)       */
-#define PARTICLE_DECAY_MAX 0.09f /* per-tick life decay (upper bound)       */
+#define PARTICLE_LIFE_MIN 0.8f   /* a fresh spark starts with at least this much life */
+#define PARTICLE_LIFE_MAX 1.0f   /* ...and at most this much */
+#define PARTICLE_DECAY_MIN 0.05f /* slowest a spark fades per tick */
+#define PARTICLE_DECAY_MAX 0.09f /* fastest a spark fades per tick */
 
-#define FUSE_NEVER (INT32_MAX / 2) /* idle slot's fuse: never fires */
+#define FUSE_NEVER (INT32_MAX / 2) /* a parked burst slot that never lights itself */
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(fps) (NS_PER_SEC / (fps))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -247,11 +91,10 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  random + math — uniform samples + integer clamp                   */
-/* ===================================================================== */
+/* ── §3  random + math ── */
 
-/* rand_unit / rand_range / rand_int_below / clamp_int — named primitives. */
+/* Small helpers for random numbers and clamping, named so the call sites
+ * below read like plain English. */
 static inline float rand_unit(void) { return (float)rand() / RAND_MAX; }
 static inline float rand_range(float lo, float hi) {
   return lo + rand_unit() * (hi - lo);
@@ -261,10 +104,11 @@ static inline int clamp_int(int v, int lo, int hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/* ===================================================================== */
-/* §4  themes — 10 hue palettes + Hue enum + theme_apply + color_init    */
-/* ===================================================================== */
+/* ── §4  themes ── */
 
+/* The seven spark colours.  Each name is also the ncurses colour-pair id
+ * it gets bound to (C_RED is pair 1, and so on), so we can pass a Hue
+ * straight into COLOR_PAIR(). */
 typedef enum {
   C_RED = 1,
   C_ORANGE = 2,
@@ -276,22 +120,22 @@ typedef enum {
   C_COUNT = 7,
 } Hue;
 
-/* HUD/HINT pairs sit OUTSIDE the 7-hue rendering range so theme cycling
- * never clobbers them. */
+/* The status-bar colours get pair ids past the seven spark colours, so
+ * switching themes never accidentally repaints the HUD. */
 #define PAIR_HUD 8
 #define PAIR_HINT 9
 
 /*
- * BurstTheme — one palette: 7 hue slots indexed by the Hue enum.
+ * BurstTheme — one named colour scheme for the sparks.
  *
- *   name        cycled label, shown in HUD
- *   fg256       256-cube colour per slot  (rich terminals)
- *   fg8         8-colour fallback per slot
+ *   name    the label shown in the status bar when this theme is active
+ *   fg256   a colour for each of the 7 spark slots, on terminals that
+ *           support the full 256-colour range
+ *   fg8     a fallback colour per slot for plain 8-colour terminals
  *
- * Lifecycle: const table indexed at runtime by the t/T key handler.
- *   theme_apply() rebinds colour-pair IDs 1..C_COUNT to the chosen
- *   entry; live particles + scorch pick up the new colour on the next
- *   mvaddch — no clear, no flicker.
+ * The table of themes is read-only.  Pressing t/T just changes which row
+ * we point at and re-binds the colour pairs; sparks already on screen pick
+ * up the new colours on their next redraw, with no flicker.
  */
 typedef struct {
   const char *name;
@@ -344,11 +188,11 @@ static const BurstTheme k_themes[THEME_COUNT] = {
       COLOR_CYAN, COLOR_CYAN}},
 };
 
-/* theme_apply — rebind the 7 hue pair IDs (1..C_COUNT) to k_themes[theme]. */
+/* Point the 7 spark colour pairs at the chosen theme's colours. */
 static void theme_apply(int theme) {
   const BurstTheme *th = &k_themes[theme];
   for (int i = 0; i < C_COUNT; i++) {
-    int slot = i + 1; /* C_RED=1 .. C_MAGENTA=7 */
+    int slot = i + 1; /* slot 0 of the array is pair 1 (C_RED), etc. */
     if (COLORS >= 256)
       init_pair(slot, th->fg256[i], COLOR_BLACK);
     else
@@ -356,25 +200,23 @@ static void theme_apply(int theme) {
   }
 }
 
-/* color_init — start_color + apply initial theme + pin HUD/HINT + debug pairs.
- */
+/* Turn on colour and set up every pair once at startup. */
 static void color_init(int theme) {
   start_color();
   use_default_colors();
   theme_apply(theme);
 
-  /* HUD pairs are theme-independent — init ONCE, theme_apply leaves them alone.
-   */
+  /* The status bar colours never change with the theme, so set them once. */
   init_pair(PAIR_HUD, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
   init_pair(PAIR_HINT, COLORS >= 256 ? 51 : COLOR_CYAN, -1);
 
-  /* Debug overlay pairs (pairs 10..13) — also theme-independent.
-   * Used only by debug rendering modes; reserved bright distinct hues. */
+  /* Four bright, easy-to-tell-apart colours used only by the debug views,
+   * one per wave.  Also fixed, untouched by theme switching. */
   if (COLORS >= 256) {
-    init_pair(10, 196, -1); /* wave 0: red       */
-    init_pair(11, 226, -1); /* wave 1: yellow    */
-    init_pair(12, 46, -1);  /* wave 2: green     */
-    init_pair(13, 51, -1);  /* wave 3: cyan      */
+    init_pair(10, 196, -1); /* wave 0: red    */
+    init_pair(11, 226, -1); /* wave 1: yellow */
+    init_pair(12, 46, -1);  /* wave 2: green  */
+    init_pair(13, 51, -1);  /* wave 3: cyan   */
   } else {
     init_pair(10, COLOR_RED, -1);
     init_pair(11, COLOR_YELLOW, -1);
@@ -385,15 +227,15 @@ static void color_init(int theme) {
 
 static Hue hue_rand(void) { return (Hue)(1 + rand() % C_COUNT); }
 
-/* ===================================================================== */
-/* §5  debug overlay — turn the simulation into a learning instrument    */
-/* ===================================================================== */
+/* ── §5  debug overlay ── */
 
+/* Extra ways to draw the sparks so you can see what's going on under the
+ * hood.  Press d/D to cycle through them. */
 typedef enum {
-  DBG_NORMAL = 0,   /* production rendering (artistic view)            */
-  DBG_WAVES = 1,    /* colour each spark by wave index (visible stagger)*/
-  DBG_VELOCITY = 2, /* replace glyph with arrow showing velocity dir   */
-  DBG_FUSE = 3,     /* write FSM countdown/age as number at centre    */
+  DBG_NORMAL = 0,   /* the normal pretty view                          */
+  DBG_WAVES = 1,    /* colour each spark by its wave, so the rings show */
+  DBG_VELOCITY = 2, /* draw an arrow pointing where each spark is going */
+  DBG_FUSE = 3,     /* print each burst's countdown / age at its centre */
   DBG_COUNT = 4,
 } DebugMode;
 
@@ -406,7 +248,7 @@ static const char *const k_debug_names[DBG_COUNT] = {
 
 static DebugMode g_debug = DBG_NORMAL;
 
-/* dir_char — atan2(vy, vx) → 8-octant ASCII arrow for DBG_VELOCITY. */
+/* Turn a velocity into one of eight arrow glyphs pointing that way. */
 static char dir_char(float vx, float vy) {
   static const char k_dirs[8] = {'>', '\\', 'v', '/', '<', '\\', '^', '/'};
   float a = atan2f(vy, vx);
@@ -416,37 +258,40 @@ static char dir_char(float vx, float vy) {
   return k_dirs[idx];
 }
 
-/* Wave index → debug-palette colour pair (10..13). */
+/* Map a wave number to its debug colour pair (the four set up above). */
 static int wave_pair(int wave) { return 10 + (wave & 3); }
 
-/* ===================================================================== */
-/* §6  particle — Particle struct + spawn + tick + draw                   */
-/* ===================================================================== */
+/* ── §6  particle ── */
 
+/* Terminal cells are about twice as tall as they are wide, so a step of the
+ * same size sideways covers more screen than the same step up or down.  We
+ * multiply horizontal distance by this to make motion look even. */
 #define ASPECT 2.0f
 
 /*
- * Particle — the atom of the simulation.  One ASCII spark.
+ * Particle — one ASCII spark, the smallest piece of the whole show.
  *
- *   cx, cy      burst centre anchor                 (terminal CELLS)
- *   rx, ry      offset from centre                  (pixels — sub-cell)
- *   vx, vy      velocity                            (pixels/tick)
- *   life        remaining lifetime                  (1.0 fresh → 0.0 dead)
- *   decay       per-tick life loss                  (per-particle jitter)
- *   delay       wave-stagger countdown              (frames before active)
- *   wave        0..3 — set at spawn, read by DBG_WAVES overlay
- *   sym         glyph fixed at spawn for trackability
- *   hue         colour pair fixed at spawn
- *   alive       false → particle slot is free, skip in tick + draw
+ *   cx, cy   the burst's centre, in terminal cells.  Fixed once at spawn;
+ *            this is the point the spark flies away from.
+ *   rx, ry   how far the spark has drifted from that centre, kept in fine
+ *            sub-cell units so slow motion still looks smooth.
+ *   vx, vy   current speed in each direction (sub-cells per tick).
+ *   life     how much glow is left: starts near 1.0, dies at 0.0.
+ *   decay    how much life this spark loses each tick (each spark a touch
+ *            different so they don't all wink out together).
+ *   delay    ticks to wait before this spark starts moving; this is what
+ *            makes the burst leave in rings instead of all at once.
+ *   wave     which ring (0..3) this spark belongs to; only the "waves"
+ *            debug view actually looks at it.
+ *   sym      the character drawn for this spark, picked once so the eye
+ *            can follow a single spark across the screen.
+ *   hue      the spark's colour, also fixed at spawn.
+ *   alive    false means the slot is free and gets skipped everywhere.
  *
- * Lifecycle: particle_spawn at burst ignite → particle_tick per frame →
- *   particle_draw per frame.  When life ≤ 0 OR off-screen, alive=false
- *   and the slot becomes available (no malloc/free; pool is fixed).
- *
- * Why pixel-space offset (not cell): sub-cell precision keeps motion
- * smooth at low speeds.  ASPECT (=2) compensates for terminal cells
- * being ~2× as tall as wide; without it horizontal motion would look
- * 2× faster than vertical at the same |vx|=|vy|.
+ * A spark is filled in at burst time, nudged once per tick, and drawn once
+ * per frame.  When its life runs out or it leaves the screen, alive flips
+ * to false and the slot is ready to be reused.  No allocation ever happens
+ * here — every burst owns a fixed array of these.
  */
 typedef struct {
   float cx, cy;
@@ -464,90 +309,68 @@ typedef struct {
 static const char k_syms[] = "*.+o#@%&$!^~-=|/\\:;,`'\"";
 #define NSYMS (int)(sizeof k_syms - 1)
 
-/* particle_spawn — fill one Particle at burst-ignite time. */
+/* Set up one fresh spark when a burst goes off. */
 static void particle_spawn(Particle *p, float cx, float cy, float angle,
                            float speed, int delay_ticks, int wave) {
-  /* Anchor — burst centre in CELL space, never moves after spawn. */
+  /* Remember where it started from; this never changes. */
   p->cx = cx;
   p->cy = cy;
 
-  /* Offset — pixel-space deviation from centre, grows during tick. */
+  /* It hasn't drifted yet. */
   p->rx = 0.0f;
   p->ry = 0.0f;
 
-  /* Velocity — radial outward fan (polar → Cartesian). */
+  /* Turn a heading + speed into sideways and vertical speed. */
   p->vx = cosf(angle) * speed;
   p->vy = sinf(angle) * speed;
 
-  /* Life budget — fresh in [LIFE_MIN, LIFE_MAX), drains by `decay`/tick. */
+  /* Give it a random starting glow and a random fade rate. */
   p->life = rand_range(PARTICLE_LIFE_MIN, PARTICLE_LIFE_MAX);
   p->decay = rand_range(PARTICLE_DECAY_MIN, PARTICLE_DECAY_MAX);
 
-  /* FSM bookkeeping — wave index and per-spark spawn delay. */
+  /* Which ring it's in and how long to hold before it starts moving. */
   p->delay = delay_ticks;
   p->wave = wave;
 
-  /* Appearance — glyph and hue fixed at spawn so the eye can track. */
+  /* Lock in a character and colour so it's easy to follow. */
   p->sym = k_syms[rand_int_below(NSYMS)];
   p->hue = hue_rand();
   p->alive = true;
 }
 
 /*
- * particle_tick — DRIVER.  One frame of per-spark physics.
+ * Move one spark forward by a tick: slow it down, drift it, fade it, and
+ * retire it if it has burned out or flown off-screen.
  *
- *   if !p->alive:           return                       dead → inert
- *   if p->delay > 0:        p->delay--;  return          wave-stagger gate
- *   p->vx *= DRAG_FACTOR                                 multiplicative drag
- *   p->vy *= DRAG_FACTOR
- *   p->rx += p->vx;  p->ry += p->vy                      explicit Euler in
- *                                                         pixel space
- *   p->life -= p->decay                                  linear life loss
- *   screen = p->cx + p->rx · ASPECT, p->cy + p->ry        ASPECT-corrected
- *   if life ≤ 0 OR off-screen:  p->alive = false
- *
- * INPUTS / UNITS
- *   p              Particle mutated in place.
- *   cols, rows     terminal extent in CELLS, for the off-screen test.
- *   vx, vy in pixels/tick; rx, ry in pixels.  ASPECT (=2) compensates
- *   for terminal cell aspect ratio at the screen-bounds check (and at
- *   particle_draw — the same one place that owns the pixel→cell map).
- *
- * WHY DRAG BEFORE INTEGRATE
- *   Drag-then-integrate uses the new (slowed) velocity for this frame's
- *   step, matching how a Stokes drag actually behaves and preventing
- *   the "tunnelling past the wall" artefact when dt-cap kicks in.
- *
- * WHY IT EXISTS (vs. inlining in burst_tick)
- *   burst_tick orchestrates the FSM and counts living sparks.  Keeping
- *   per-spark physics here means burst_tick stays at FSM level — no
- *   mixing of state-machine and integrator concerns.
+ * We slow the spark down BEFORE moving it.  That matches how air drag really
+ * feels, and it stops a spark from leaping clean off the screen in a single
+ * big step when the frame timing hiccups.
  */
 static void particle_tick(Particle *p, int cols, int rows) {
-  /* Gate 1 — dead sparks are inert. */
+  /* Already dead? Nothing to do. */
   if (!p->alive)
     return;
 
-  /* Gate 2 — wave-stagger delay holds the spark in its starting cell. */
+  /* Still waiting for its ring's turn — sit tight and count down. */
   if (p->delay > 0) {
     p->delay--;
     return;
   }
 
-  /* Step 1 — multiplicative drag (Stokes-like: force ∝ velocity). */
+  /* Bleed off a little speed (air drag). */
   p->vx *= DRAG_FACTOR;
   p->vy *= DRAG_FACTOR;
 
-  /* Step 2 — explicit Euler integration in pixel space. */
+  /* Drift by the current speed. */
   p->rx += p->vx;
   p->ry += p->vy;
 
-  /* Step 3 — age the life counter. */
+  /* Dim a little. */
   p->life -= p->decay;
 
-  /* Step 4 — die if life is exhausted OR the spark left the screen.
-   *           ASPECT compensation applied so the bounds test matches
-   *           what particle_draw will actually paint. */
+  /* Retire it if it's faded out or wandered off the screen.  We work out the
+   * real screen position the same way the drawing code does, so the two agree
+   * on where the spark is. */
   float screen_x = p->cx + p->rx * ASPECT;
   float screen_y = p->cy + p->ry;
   bool burned_out = (p->life <= 0.0f);
@@ -557,16 +380,16 @@ static void particle_tick(Particle *p, int cols, int rows) {
     p->alive = false;
 }
 
-/* particle_pixel_to_cell — pixel-space → terminal cell with ×ASPECT in x. */
+/* Work out which screen cell a spark currently sits in. */
 static void particle_pixel_to_cell(const Particle *p, int *cell_x,
                                    int *cell_y) {
   *cell_x = (int)(p->cx + p->rx * ASPECT);
   *cell_y = (int)(p->cy + p->ry);
 }
 
-/* particle_draw — paint one spark; switches on g_debug for overlay modes. */
+/* Draw one spark.  The current debug mode decides what it looks like. */
 static void particle_draw(const Particle *p, WINDOW *w, int cols, int rows) {
-  /* Gates — same suppression rules as particle_tick. */
+  /* Skip dead or still-waiting sparks, same as the movement code. */
   if (!p->alive || p->delay > 0)
     return;
 
@@ -575,27 +398,24 @@ static void particle_draw(const Particle *p, WINDOW *w, int cols, int rows) {
   if (cell_x < 0 || cell_x >= cols || cell_y < 0 || cell_y >= rows)
     return;
 
-  /*
-   * Debug-mode dispatch — pick (glyph, attr) per mode.  Physics is
-   * identical across modes; only the rendering changes.
-   */
+  /* Same spark either way — only its glyph and colour change with the mode. */
   chtype glyph;
   attr_t attr;
   switch (g_debug) {
   case DBG_WAVES:
-    /* Colour by wave (0..3) so staggered emission is legible. */
+    /* Tint by ring so you can see the waves leave one after another. */
     glyph = (chtype)(unsigned char)p->sym;
     attr = COLOR_PAIR(wave_pair(p->wave)) | A_BOLD;
     break;
   case DBG_VELOCITY:
-    /* Replace glyph with an arrow showing velocity direction. */
+    /* Show an arrow pointing the way the spark is moving. */
     glyph = (chtype)(unsigned char)dir_char(p->vx, p->vy);
     attr = COLOR_PAIR(p->hue) | A_BOLD;
     break;
   case DBG_FUSE:
   case DBG_NORMAL:
   default: {
-    /* Production view — fixed glyph + fading bold gate. */
+    /* The normal look: its own glyph, drawn bold while it's still bright. */
     bool is_fresh_spark = (p->life > FLASH_LIFE_THRESHOLD);
     glyph = (chtype)(unsigned char)p->sym;
     attr = COLOR_PAIR(p->hue) | (is_fresh_spark ? A_BOLD : 0);
@@ -608,39 +428,38 @@ static void particle_draw(const Particle *p, WINDOW *w, int cols, int rows) {
   wattroff(w, attr);
 }
 
-/* ===================================================================== */
-/* §7  burst FSM — Burst struct + state enum + burst_ignite               */
-/* ===================================================================== */
+/* ── §7  burst FSM ── */
 
+/* The three things a burst can be doing at any moment. */
 typedef enum {
-  BS_IDLE = 0,  /* fuse counting down; no visible state                */
-  BS_FLASH = 1, /* exactly ONE tick of central '*+' cross flash        */
-  BS_LIVE = 2,  /* particles flying; transitions back to IDLE when all dead */
+  BS_IDLE = 0,  /* waiting, fuse ticking down; nothing on screen */
+  BS_FLASH = 1, /* one single frame of a bright '*+' flash       */
+  BS_LIVE = 2,  /* sparks flying; goes back to idle once they're all gone */
 } BurstState;
 
 /*
- * Burst — one explosion.  A pool of Particles plus a 3-state FSM.
+ * Burst — one firework: a batch of sparks plus a tiny state machine that
+ * runs it through wait → flash → sparks → wait again.
  *
- *   cx, cy      detonation centre              (terminal CELLS)
- *   state       BS_IDLE / BS_FLASH / BS_LIVE
- *   ticks       counts UP from 0 in BS_LIVE; reset on each ignite
- *   fuse        counts DOWN in BS_IDLE; ignites at 0 (probabilistic)
- *   parts       inline pool of PARTICLES (=48) sparks
+ *   cx, cy   where this burst goes off, in terminal cells.
+ *   state    which of the three phases it's in right now (see above).
+ *   ticks    while sparks are flying, counts up from 0; used to force the
+ *            burst to end after BURST_TICKS even if a few sparks linger.
+ *   fuse     while waiting, counts down to 0; at 0 the burst lights.
+ *   parts    this burst's own fixed batch of sparks.
  *
- * Lifecycle:
- *   IDLE  ── fuse hits 0 ─────▶ FLASH   (burst_ignite spawns all sparks)
- *   FLASH ── one tick ────────▶ LIVE
- *   LIVE  ── all dead OR ticks≥BURST_TICKS ─▶ IDLE  (re-arm fuse)
+ * The cycle:
+ *   waiting ── fuse hits 0 ──▶ flash (all sparks are created here)
+ *   flash   ── one frame   ──▶ sparks flying
+ *   sparks  ── all gone, or out of time ──▶ waiting again (fuse re-rolled)
  *
- * Why three states (vs single "active" flag): the FLASH frame's bright
- * central '*+' cross gives the explosion its "BANG, then shrapnel"
- * reading.  Without that one-frame anchor, the burst looks like just
- * a puff of particles — which doesn't read as an explosion.
+ * Why bother with a separate one-frame flash instead of just "on/off"? That
+ * single bright pop is what sells it as an explosion — a bang, then debris.
+ * Skip it and the burst just looks like a puff of dots appearing.
  *
- * The IDLE fuse gives the screen its rhythm: 16 bursts each independently
- * counting down (8–28 ticks) means roughly one burst per
- * (sim_fps / N_BURSTS / mean_fuse) seconds.  Each slot is independent
- * — no global scheduler.
+ * Each burst keeps its own fuse and runs on its own clock, knowing nothing
+ * about the others.  A screenful of them ticking down independently is what
+ * gives the display its uneven, natural rhythm.
  */
 typedef struct {
   float cx, cy;
@@ -650,8 +469,8 @@ typedef struct {
   Particle parts[PARTICLES];
 } Burst;
 
-/* pick_detonation_centre — random (cx, cy) inside a safe area for the FLASH
- * cross. */
+/* Pick a random spot to go off, kept a couple cells in from the edges so
+ * the flash cross always has room to draw. */
 static void pick_detonation_centre(int cols, int rows, float *cx, float *cy) {
   int safe_cols_extent = (cols - 4) > 1 ? (cols - 4) : 1;
   int safe_rows_extent = (rows - 2) > 1 ? (rows - 2) : 1;
@@ -659,8 +478,8 @@ static void pick_detonation_centre(int cols, int rows, float *cx, float *cy) {
   *cy = (float)(1 + rand_int_below(safe_rows_extent));
 }
 
-/* compute_emission_angle — (i/total)·2π + small jitter; organic, not
- * mathematical. */
+/* Spread the sparks evenly around the full circle, with a little random
+ * wobble so the fan looks natural instead of mechanical. */
 static float compute_emission_angle(int i, int total_particles) {
   float evenly_spaced =
       ((float)i / (float)total_particles) * 2.0f * (float)M_PI;
@@ -668,17 +487,16 @@ static float compute_emission_angle(int i, int total_particles) {
   return evenly_spaced + jitter;
 }
 
-/* compute_emission_speed — uniform in [BURST_SPEED_MIN, BURST_SPEED_MAX). */
+/* A random launch speed for one spark. */
 static float compute_emission_speed(void) {
   return rand_range(BURST_SPEED_MIN, BURST_SPEED_MAX);
 }
 
 /*
- * compute_wave_delay() — staggered spawn delay so the burst expands as
- * a multi-ring shockwave instead of a single instant ring.
- *
- *   delay = wave × MAX_DELAY / (waves - 1)
- *   With waves=4, MAX_DELAY=5 → delays 0, 1 (rounded down), 3, 5 ticks.
+ * Give each ring a slightly longer head start so the burst goes out as a few
+ * spreading rings rather than one instant circle.  Ring 0 leaves now, the
+ * last ring waits the longest.  With 4 rings and a max delay of 5, the waits
+ * come out to 0, 1, 3, and 5 ticks.
  */
 static int compute_wave_delay(int wave, int wave_count, int max_delay) {
   if (wave_count <= 1)
@@ -686,23 +504,16 @@ static int compute_wave_delay(int wave, int wave_count, int max_delay) {
   return (wave * max_delay) / (wave_count - 1);
 }
 
-/*
- * burst_ignite() — pick a detonation point and seed all 48 sparks.
- *
- *   The body is three labelled steps:
- *     Step 1 — pick the detonation centre (safe-area clamp).
- *     Step 2 — enter FLASH state for exactly one tick.
- *     Step 3 — spawn PARTICLES sparks in a wave-staggered radial fan.
- */
+/* Light the burst: choose a spot, flash, and create all its sparks. */
 static void burst_ignite(Burst *b, int cols, int rows) {
-  /* Step 1 — detonation point. */
+  /* Where it goes off. */
   pick_detonation_centre(cols, rows, &b->cx, &b->cy);
 
-  /* Step 2 — enter FLASH state. */
+  /* Show the one-frame flash next. */
   b->state = BS_FLASH;
   b->ticks = 0;
 
-  /* Step 3 — spawn the radial fan. */
+  /* Throw the sparks out in a fan, ring by ring. */
   for (int i = 0; i < PARTICLES; i++) {
     float angle = compute_emission_angle(i, PARTICLES);
     float speed = compute_emission_speed();
@@ -712,12 +523,10 @@ static void burst_ignite(Burst *b, int cols, int rows) {
   }
 }
 
-/* ===================================================================== */
-/* §8  burst tick — FSM advance + complete + re-arm                       */
-/* ===================================================================== */
+/* ── §8  burst tick ── */
 
-/* burst_advance_live_particles — tick every spark; return whether any survived.
- */
+/* Move every spark of this burst one tick, and report whether any are still
+ * alive (so the burst knows when it's over). */
 static bool burst_advance_live_particles(Burst *b, int cols, int rows) {
   bool any_alive = false;
   for (int i = 0; i < PARTICLES; i++) {
@@ -728,7 +537,9 @@ static bool burst_advance_live_particles(Burst *b, int cols, int rows) {
   return any_alive;
 }
 
-/* burst_complete_and_rearm — fire scorch_cb; set new random fuse; → IDLE. */
+/* The burst just finished: leave a scorch mark, roll a fresh wait, and go
+ * back to waiting.  The mark is left through a callback so this code doesn't
+ * need to know the scorch grid exists. */
 static void burst_complete_and_rearm(Burst *b,
                                      void (*scorch_cb)(int, int, void *),
                                      void *ud) {
@@ -739,43 +550,27 @@ static void burst_complete_and_rearm(Burst *b,
 }
 
 /*
- * burst_tick — DRIVER.  Run one Burst FSM step.
+ * One step of a single burst.  This is the heart of the file: whatever you
+ * see a burst doing on screen, it's in one of these three branches.
  *
- *   switch (b->state):
- *     BS_IDLE   b->fuse--; if fuse ≤ 0:  burst_ignite     IDLE → FLASH
- *     BS_FLASH  b->state = BS_LIVE; b->ticks = 0           FLASH → LIVE
- *     BS_LIVE   any_alive = burst_advance_live_particles(b)
- *               b->ticks++
- *               if !any_alive OR b->ticks ≥ BURST_TICKS:
- *                   burst_complete_and_rearm(b, scorch_cb, ud)
- *                                                          LIVE → IDLE
+ *   waiting  — count the fuse down; light the burst when it hits zero.
+ *   flash    — the flash only lasts a frame, so move straight to the sparks.
+ *   sparks   — move them all; when they're gone (or we've waited long enough)
+ *              wrap up and start waiting again.
  *
- * INPUTS / UNITS
- *   b              Burst mutated; state machine + every parts[i] advance.
- *   cols, rows     terminal extent (passed through to particle_tick).
- *   scorch_cb, ud  callback fired ONCE on LIVE → IDLE; stamps the scorch
- *                  grid with the burst's centre.
- *
- * The FSM is the algorithmic spine of this file.  Every visible
- * frame-by-frame change traces back to one of these three branches.
- *
- * WHY IT EXISTS (vs. inlining in field_tick)
- *   field_tick is a one-line loop over the burst pool; all FSM detail
- *   lives here.  Engine vs orchestrator — each burst owns its own
- *   clock and never knows other bursts exist.
+ * scorch_cb is called once, right when a burst ends, to mark where it was;
+ * pass NULL to skip leaving marks entirely.
  */
 static void burst_tick(Burst *b, int cols, int rows,
                        void (*scorch_cb)(int x, int y, void *ud), void *ud) {
   switch (b->state) {
   case BS_IDLE:
-    /* Countdown the fuse; ignite at zero. */
     b->fuse--;
     if (b->fuse <= 0)
       burst_ignite(b, cols, rows);
     break;
 
   case BS_FLASH:
-    /* FLASH lasts exactly one tick. */
     b->state = BS_LIVE;
     b->ticks = 0;
     break;
@@ -791,12 +586,9 @@ static void burst_tick(Burst *b, int cols, int rows,
   }
 }
 
-/* ===================================================================== */
-/* §9  burst render — flash cross + fuse overlay + burst_draw             */
-/* ===================================================================== */
+/* ── §9  burst render ── */
 
-/* draw_flash_cross — central '*' + four cardinal '+' in bright yellow + bold.
- */
+/* Draw the opening flash: a bright '*' with a '+' on each side. */
 static void draw_flash_cross(WINDOW *w, int cx, int cy, int cols, int rows) {
   if (cx < 0 || cx >= cols || cy < 0 || cy >= rows)
     return;
@@ -814,8 +606,8 @@ static void draw_flash_cross(WINDOW *w, int cx, int cy, int cols, int rows) {
   wattroff(w, COLOR_PAIR(C_YELLOW) | A_BOLD);
 }
 
-/* draw_fuse_overlay — DBG_FUSE annotation: "f<fuse>" (IDLE) or "t<ticks>"
- * (LIVE). */
+/* Debug helper: print a little number at the burst's centre — "f" plus the
+ * fuse while it's waiting, "t" plus the age while its sparks are flying. */
 static void draw_fuse_overlay(const Burst *b, WINDOW *w, int cx, int cy,
                               int cols, int rows) {
   bool centre_in_bounds = (cx >= 0 && cx < cols - 3 && cy >= 0 && cy < rows);
@@ -836,27 +628,9 @@ static void draw_fuse_overlay(const Burst *b, WINDOW *w, int cx, int cy,
 }
 
 /*
- * burst_draw — DRIVER.  State-dependent per-burst render.
- *
- *   if BS_FLASH:    draw_flash_cross(centre)         '*'+ '+'cross, return
- *   if BS_LIVE:     for each alive p: particle_draw(p)   spark fan
- *   (BS_IDLE)       invisible — scorch layer is the field's job
- *
- *   if g_debug == DBG_FUSE:  draw_fuse_overlay overlays FSM counter
- *
- * INPUTS / UNITS
- *   b              Burst to render (const).
- *   w              destination WINDOW.
- *   cols, rows     terminal extent in cells.
- *
- * State branches are mutually exclusive (the FSM enforces it), so no
- * z-order conflicts within a single Burst.  Active Bursts paint OVER
- * the persistent scorch layer (field_draw_scorch_layer runs first).
- *
- * WHY IT EXISTS (vs. inlining in field_draw)
- *   field_draw is a one-line loop over the burst pool; per-state visual
- *   logic stays here.  Adding a new state's visual touches ONLY this
- *   function.
+ * Draw a burst based on what it's doing: the flash if it just lit, its
+ * flying sparks if they're out, nothing while it's just waiting.  The fuse
+ * number is drawn on top only in the matching debug view.
  */
 static void burst_draw(const Burst *b, WINDOW *w, int cols, int rows) {
   int cx = (int)b->cx;
@@ -876,25 +650,23 @@ static void burst_draw(const Burst *b, WINDOW *w, int cols, int rows) {
     draw_fuse_overlay(b, w, cx, cy, cols, rows);
 }
 
-/* ===================================================================== */
-/* §10  field — burst pool + persistent scorch grid                       */
-/* ===================================================================== */
+/* ── §10  field ── */
 
 /*
- * Field — burst pool + persistent scorch grid.
+ * Field — the whole scene: every burst, plus the memory of past ones.
  *
- *   bursts[BURSTS_MAX]    independent Burst slots; each owns its own FSM
- *   scorch[cols × rows]   char grid: '.' at every past burst's centre
- *   cols, rows            terminal extent in cells
- *   active_bursts         live count [0, BURSTS_MAX]
+ *   bursts          all the burst slots; each runs itself independently.
+ *   scorch          one character per screen cell: a '.' is left wherever
+ *                   a burst has gone off, '\0' everywhere else.  This is
+ *                   what makes the screen "remember".  Owned here, freed by
+ *                   field_free.
+ *   cols, rows      screen size in cells.
+ *   active_bursts   how many of the slots are currently switched on.
  *
- * Lifecycle: field_init at startup + on resize + on 'r' → field_tick
- *   per frame → field_draw per frame → field_free at exit.
- *
- * Why scorch is callback-driven (not direct call): burst_tick doesn't
- * know about scorch — it just fires a callback when LIVE ends.  That
- * decoupling means burst.c could be reused with scorch_cb = NULL for
- * a memoryless "sky" variant.
+ * Set up at startup (and again on resize or 'r'), stepped and drawn every
+ * frame, freed at exit.  Bursts leave their scorch marks through a callback
+ * rather than touching the grid directly, so a burst on its own knows
+ * nothing about scorch.
  */
 typedef struct {
   Burst bursts[BURSTS_MAX];
@@ -904,23 +676,23 @@ typedef struct {
   int active_bursts;
 } Field;
 
-/* field_scorch_cb — burst_tick LIVE→IDLE callback; stamps '.' at (x, y). */
+/* The callback bursts use to leave their scorch mark when they finish. */
 static void field_scorch_cb(int x, int y, void *ud) {
   Field *f = (Field *)ud;
   if (x >= 0 && x < f->cols && y >= 0 && y < f->rows)
     f->scorch[y * f->cols + x] = '.';
 }
 
-/* field_init — alloc scorch + init all slots; active slots get staggered fuses.
- */
+/* Set up the scene: allocate the scorch grid and prime every burst slot. */
 static void field_init(Field *f, int cols, int rows, int burst_count) {
   f->cols = cols;
   f->rows = rows;
   f->active_bursts = burst_count;
   f->scorch = calloc((size_t)(cols * rows), sizeof(char));
 
-  /* Active slots get staggered fuses so they don't all fire on frame 0;
-   * inactive slots sit at FUSE_NEVER until '+' wakes them. */
+  /* Start the on bursts with spread-out fuses so they don't all pop on the
+   * very first frame; the off ones get a fuse that never fires until '+'
+   * switches them on. */
   int stagger_step =
       FUSE_MIN + (burst_count > 0 ? FUSE_RANGE / burst_count : 0);
 
@@ -931,20 +703,19 @@ static void field_init(Field *f, int cols, int rows, int burst_count) {
   }
 }
 
-/* field_free — free scorch grid; zero the struct. */
+/* Release the scorch grid and blank the struct. */
 static void field_free(Field *f) {
   free(f->scorch);
   *f = (Field){0};
 }
 
-/* field_tick — burst_tick over every active slot. */
+/* Advance every switched-on burst by one tick. */
 static void field_tick(Field *f) {
   for (int i = 0; i < f->active_bursts; i++)
     burst_tick(&f->bursts[i], f->cols, f->rows, field_scorch_cb, f);
 }
 
-/* field_draw_scorch_layer — paint every non-zero scorch cell in dim orange.
- * Drawn first so live sparks overlay it. */
+/* Paint the faint scorch marks first, so the live sparks sit on top. */
 static void field_draw_scorch_layer(const Field *f, WINDOW *w) {
   int total_cells = f->cols * f->rows;
 
@@ -960,22 +731,19 @@ static void field_draw_scorch_layer(const Field *f, WINDOW *w) {
   wattroff(w, COLOR_PAIR(C_ORANGE) | A_DIM);
 }
 
-/* field_draw_active_bursts — burst_draw over every active slot (atop scorch).
- */
+/* Draw every switched-on burst, on top of the scorch layer. */
 static void field_draw_active_bursts(const Field *f, WINDOW *w) {
   for (int i = 0; i < f->active_bursts; i++)
     burst_draw(&f->bursts[i], w, f->cols, f->rows);
 }
 
-/* field_draw — two passes: scorch underneath, active bursts on top. */
+/* Draw the whole scene: scorch underneath, live bursts over it. */
 static void field_draw(const Field *f, WINDOW *w) {
   field_draw_scorch_layer(f, w);
   field_draw_active_bursts(f, w);
 }
 
-/* ===================================================================== */
-/* §11  screen + HUD — ncurses init + status strip                        */
-/* ===================================================================== */
+/* ── §11  screen + HUD ── */
 
 typedef struct {
   int cols;
@@ -1006,22 +774,20 @@ static void screen_resize(Screen *s) {
 }
 
 static void screen_draw_field(Screen *s, const Field *f) {
-  (void)s; /* s only needed for HUD; field draw uses stdscr directly */
+  (void)s; /* the size is only needed for the HUD; the field draws to stdscr */
   erase();
   field_draw(f, stdscr);
 }
 
 /*
- * HUD layout per CLAUDE.md:
- *   row 0        — fps + sim_fps + burst count in bright bold yellow
- * (top-right) row rows-1   — every interactive key in bright bold cyan
- * (bottom-left) Both pairs are dedicated (PAIR_HUD / PAIR_HINT), never reused
- * by sparks or scorch, so the colour stays stable across all bursts.
+ * Draw the two status lines: stats in the top-right corner, the key list
+ * along the bottom.  Both use their own colour pairs that the sparks never
+ * touch, so the text stays readable no matter what's going off behind it.
  */
 static void screen_draw_hud(Screen *s, double fps, int sim_fps, int bursts,
                             int theme) {
   char buf[HUD_COLS + 1];
-  /* Debug-mode suffix only shown when non-normal; keeps top-right tidy. */
+  /* Only show the debug label when a debug view is on, to keep it tidy. */
   if (g_debug == DBG_NORMAL) {
     snprintf(buf, sizeof buf, " %5.1f fps  spd:%d  burst:%d  [%s] ", fps,
              sim_fps, bursts, k_themes[theme].name);
@@ -1049,16 +815,14 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §12  app — App struct + signal handlers + key dispatch                 */
-/* ===================================================================== */
+/* ── §12  app ── */
 
 typedef struct {
   Field field;
   Screen screen;
   int sim_fps;
   int bursts;
-  int theme; /* index into k_themes[] */
+  int theme; /* which row of the theme table is active */
   volatile sig_atomic_t running;
   volatile sig_atomic_t need_resize;
 } App;
@@ -1146,9 +910,7 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
-/* ===================================================================== */
-/* §13  main — fixed-step loop                                            */
-/* ===================================================================== */
+/* ── §13  main ── */
 
 int main(void) {
   srand((unsigned int)clock_ns());
@@ -1162,7 +924,7 @@ int main(void) {
   app->running = 1;
   app->sim_fps = SIM_FPS_DEFAULT;
   app->bursts = BURSTS_DEFAULT;
-  app->theme = 0; /* start on "rainbow" */
+  app->theme = 0; /* start on the first theme in the table */
 
   screen_init(&app->screen, app->theme);
   field_init(&app->field, app->screen.cols, app->screen.rows, app->bursts);
@@ -1175,21 +937,23 @@ int main(void) {
 
   while (app->running) {
 
-    /* ── resize ──────────────────────────────────────────────── */
+    /* Rebuild everything if the terminal was resized. */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
       sim_accum = 0;
     }
 
-    /* ── dt ──────────────────────────────────────────────────── */
+    /* How long since the last frame, capped so a long pause (or a debugger
+     * stop) can't make the sim try to catch up with a huge burst of ticks. */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
     if (dt > 100 * NS_PER_MS)
       dt = 100 * NS_PER_MS;
 
-    /* ── sim accumulator ─────────────────────────────────────── */
+    /* Run the sim at a steady tick rate no matter the frame rate: bank the
+     * elapsed time and spend it one fixed tick at a time. */
     int64_t tick_ns = TICK_NS(app->sim_fps);
     sim_accum += dt;
     while (sim_accum >= tick_ns) {
@@ -1199,7 +963,7 @@ int main(void) {
     float alpha = (float)sim_accum / (float)tick_ns;
     (void)alpha;
 
-    /* ── HUD counter ─────────────────────────────────────────── */
+    /* Refresh the on-screen fps number a couple times a second. */
     frame_count++;
     fps_accum += dt;
     if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1209,17 +973,18 @@ int main(void) {
       fps_accum = 0;
     }
 
-    /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+    /* Sleep to hold ~60 fps.  We sleep before drawing so the time spent
+     * writing to the terminal doesn't slowly push the frame rate off. */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
-    /* ── render + HUD ────────────────────────────────────────── */
+    /* Draw the scene and the status bars. */
     screen_draw_field(&app->screen, &app->field);
     screen_draw_hud(&app->screen, fps_display, app->sim_fps, app->bursts,
                     app->theme);
     screen_present();
 
-    /* ── input ───────────────────────────────────────────────── */
+    /* Handle one keypress, if any. */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;

@@ -1,193 +1,19 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * particle_systems/particle_engine.c — 2-D Terminal Particle Simulation Engine
+ * particle_systems/particle_engine.c — a tiny 2-D particle playground in the
+ * terminal. It spawns lots of little dots, pushes them around with gravity
+ * and drag, bounces or kills them at the screen edges, and draws the result.
+ * Four built-in presets (fountain, fireworks, rainfall, explosion) are just
+ * different settings for the same machinery.
  *
- * Reusable foundation for fluid, smoke, fire, gravity, sand, and explosion
- * effects.  Every subsystem lives in its own numbered section and is written
- * to be extracted into a separate compilation unit as the project grows.
+ * The fixed-timestep main loop and the ncurses display layer mirror the
+ * project's shared framework.c — see that file for the loop walkthrough.
  *
- * ─────────────────────────────────────────────────────────────────────────
- *  Section map
- * ─────────────────────────────────────────────────────────────────────────
- *  §1  config    — all tunable constants in one place
- *  §2  clock     — monotonic nanosecond clock + sleep
- *  §3  theme     — color palettes (ramps + theme-independent HUD pairs)
- *  §4  structs   — Particle and Emitter data structures
- *  §5  pool      — static particle pool, O(1)-amortised slot allocator
- *  §6  forces    — gravity, drag; force-accumulation pattern
- *  §7  physics   — symplectic Euler integrator (update_particles)
- *                  + per-wall collision response (handle_collisions)
- *  §8  emitter   — continuous emission and burst spawning
- *  §9  render    — DensityField + four render modes + stats overlay
- *  §10 presets   — fountain, fireworks, rainfall, explosion
- *  §11 scene     — Scene struct (SIMULATION + RENDER halves), tick + draw
- *  §12 screen    — ncurses display + two-layer HUD (status bar + key hints)
- *  §13 app       — signals, resize, input, main loop
- * ─────────────────────────────────────────────────────────────────────────
- *
- * Keys:
- *   q / ESC    quit                 b     spawn burst
- *   space      pause / resume       e     toggle emitter
- *   g / G      gravity ±            d     toggle drag
- *   r          reset simulation     p/P   cycle presets
- *   t          cycle themes         v     cycle render modes
- *   ] / [      sim Hz up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra particle_systems/particle_engine.c \
- *       -o particle_engine -lncurses -lm
+ * References: Reeves, "Particle Systems" (ACM TOG, 1983) for the pool +
+ * emitter + per-particle loop; Witkin & Baraff SIGGRAPH course notes for
+ * force accumulation; Hairer/Lubich/Wanner on why symplectic Euler keeps
+ * energy from drifting over long runs.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Particle integration (§7):
- *   Symplectic (semi-implicit) Euler integration is used:
- *     vel += accel * dt        ← velocity updated FIRST
- *     pos += vel   * dt        ← position updated with NEW velocity
- *   Unlike explicit Euler (pos updated with old vel), symplectic Euler is
- *   energy-conserving for harmonic oscillators and stays bounded for
- *   gravity wells.  For visual particle effects the difference is subtle,
- *   but the habit is important for any physics-accurate simulation.
- *
- * Force accumulation (§6):
- *   At the start of each tick, acceleration is cleared to zero.
- *   Each force function then ADDS its contribution to accel.
- *   This keeps forces completely modular: commenting out one function
- *   disables that force without touching anything else.
- *   F = ma → a = F/m.  Here 'density' plays the role of mass-per-volume.
- *   A denser particle (density > 1) responds less to the same force.
- *
- * Velocity update — drag (§7):
- *   Drag is NOT added as an acceleration; instead velocity is scaled:
- *     vx *= 1 - drag_coeff * density * dt
- *   This is the analytical solution of dv/dt = -k*v over interval dt.
- *   It never overshoots zero (no oscillation at large timesteps), whereas
- *   adding drag as an acceleration a = -k*v can flip sign if k*dt > 2.
- *
- * Boundary handling (§7):
- *   Three policies: BOUNCE (reflect + energy damping), KILL (particle dies),
- *   WRAP (teleport to opposite wall).  Each wall can have its own policy.
- *   Bounce damping < 1.0 removes energy on impact (inelastic collision).
- *   Kill policy is used for rain (drops vanish at floor) and sparks.
- *
- * Visual encoding (§9):
- *   Speed   → char density:  fast ↔ dense glyph ('O','@'), slow ↔ sparse ('.')
- *   Life    → brightness:    A_DIM when lifetime fraction < 0.3
- *   Angle   → arrow glyph:   8-way '>\/^<\/v/' encodes flow direction
- *   Trail   → spatial path:  ring buffer of past cell positions shows
- * trajectory Heat    → density grid:  Gaussian splat accumulates per-cell
- * brightness
- *
- * References
- * ──────────
- *   PAPERS
- *     Reeves, W. T. (1983)
- *       "Particle Systems — A Technique for Modeling a Class of Fuzzy Objects"
- *       ACM Transactions on Graphics 2(2): 91-108.
- *       Foundational paper.  The pool + cone-emitter + per-particle
- *       integration loop in §5..§8 is exactly the model Reeves
- *       defines, including the rate-accumulator emission with
- *       fractional carry that we use to keep birth counts stable
- *       across frames.  §4 of the paper covers presets like fire
- *       and fireworks — the same parameter classes we expose in §10.
- *
- *     Witkin, A. & Baraff, D. (2001)
- *       "Physically Based Modeling: Principles and Practice"
- *       SIGGRAPH course notes (online proceedings).
- *       §1 — particle dynamics with explicit force accumulation
- *       (clear accel, add each force, integrate) is exactly the
- *       pattern §6 + §7 use.  §2 covers numerical integrators,
- *       including the symplectic-vs-explicit Euler distinction this
- *       file's §7 takes a stance on.
- *
- *   BOOKS
- *     Hairer, E., Lubich, C. & Wanner, G. — "Geometric Numerical
- *       Integration: Structure-Preserving Algorithms for Ordinary
- *       Differential Equations" (2nd ed, Springer, 2006).
- *       Authoritative reference on symplectic integrators.  Explains
- *       WHY swapping the order of v += a·dt and x += v·dt (i.e.
- *       using explicit instead of symplectic Euler) causes energy
- *       to drift over long simulations — visible as "ghost rises"
- *       in a fountain run for thousands of ticks.
- *
- *     Bourg, D. M. & Bywalec, B. — "Physics for Game Developers"
- *       (2nd ed, O'Reilly, 2013).  Chapters 2-4 cover ballistic
- *       motion under gravity, restitution at bounce boundaries, and
- *       linear-velocity drag.  Direct support for §6 (gravity/drag),
- *       §7 (collisions), and the preset values chosen in §10.
- *
- *     Akenine-Möller, T., Haines, E. & Hoffman, N. — "Real-Time
- *       Rendering" (4th ed, CRC Press, 2018).
- *       §13.7 covers point-sprite particle rendering — the speed-
- *       to-glyph-density mapping in §9 is the ASCII analogue of
- *       size-by-velocity point sprites.  §5.6 motivates the gamma
- *       correction used in the LUT ramp index (^1/2.2 in KEY FORMULAS).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A particle system is just an object pool plus three independent layers:
- * (1) where particles are BORN (emitter), (2) what FORCES act on them
- * (gravity/drag), (3) what happens at the EDGE (bounce/kill/wrap). Every
- * preset — fountain, fireworks, rainfall, explosion — is just different
- * values for these three knobs over the same fixed-step integrator. Master
- * this single file and you can build any 2-D particle effect.
- *
- * ALGORITHM IN STEPS  (each step = one helper in §5..§11)
- * ──────────────────
- *  Initial setup (per scene_init):
- *    1. Pool: 2048 Particle slots in BSS. pool_alloc() linear-scans
- *       from a cursor for the first !alive slot; returns NULL when
- *       full (spawn silently dropped). No malloc after init.
- *
- *  Per tick (scene_tick at fixed dt = 1/sim_fps):
- *    2. scene_advance_clock  — bump dt_sec + simulation_time.
- *    3. scene_spawn_step:
- *         emitter_tick: rate_accum += rate·dt; spawn ⌊accum⌋ particles
- *                       into the cone (angle ± spread/2). Carry the
- *                       fractional remainder for exact long-term rate.
- *         auto-burst:   countdown burst_timer; on cross-zero fire
- *                       spawn_burst(burst_count).
- *    4. scene_physics_step → update_particles, per alive particle:
- *         apply_forces                   → clear (ax,ay), add gravity
- *         particle_apply_drag            → v *= (1 − k·ρ·dt) closed-form
- *         particle_integrate_symplectic  → v += a·dt; x += v·dt
- *         particle_age                   → lifetime -= dt; kill at 0
- *         particle_push_trail            → record cell to ring buffer
- *         accumulate Σ|v| and Σ½ρv²
- *    5. scene_physics_step → handle_collisions, per alive particle,
- *       short-circuit on kill:
- *         particle_resolve_floor / ceiling / left_wall / right_wall
- *       each KILL or BOUNCE (reflect + BOUNCE_DAMPING restitution).
- *    6. scene_measure_stats — recount alive for the HUD.
- *
- *  Per frame (scene_draw → render_particles):
- *    7. Render dispatch by mode:
- *       GLYPH / TRAIL / ARROW → render_per_particle, per particle:
- *            particle_ramp_level   speed → ramp index 1..RAMP_N-1
- *            particle_render_attr  theme colour + A_DIM if dying
- *            particle_draw_trail   (TRAIL only) ring-buffer walk
- *            particle_draw_head    glyph at current cell
- *       HEATMAP → render_heatmap, three passes over DensityField:
- *            heatmap_clear_emptied_cells   dirty-rect blank
- *            heatmap_accumulate_density    density_field_splat per particle
- *            heatmap_blit_density_field    density → ramp glyph
- *    8. screen_draw paints the two-layer HUD (top status, bottom keys)
- *       and the render_overlay panel on top of the particle layer.
- *
- * KEY FORMULAS
- * ────────────
- *  v += a·dt; x += v·dt           symplectic Euler (v BEFORE x)
- *  v *= 1 − k·ρ·dt                drag: closed-form of dv/dt = -k·v
- *  bounce:  v ← −v · DAMPING      1 − DAMPING² fraction of KE lost
- *  rate accumulator: spawn ⌊accum⌋ each tick, keep frac for fairness
- *  pixel↔cell: cx = ⌊px/CELL_W + 0.5⌋ where CELL_W=8, CELL_H=16
- *  ramp_idx = first i where v^(1/2.2) ≥ k_lut_breaks[i]    gamma-corrected
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #define _USE_MATH_DEFINES
@@ -205,63 +31,53 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
-/*
- * All magic numbers live here.  Changing behaviour means editing this
- * block only — never scatter literals through implementation code.
- */
+/* Every tunable number lives here, so changing how the demo behaves means
+ * editing this one block instead of hunting through the code. */
 
-/* ── loop / display ─────────────────────────────────────────────────── */
+/* ── loop / display ── */
 enum {
   SIM_FPS_MIN = 10,
   SIM_FPS_DEFAULT = 60,
   SIM_FPS_MAX = 120,
   SIM_FPS_STEP = 10,
 
-  TARGET_FPS = 60,     /* render cap                               */
-  FPS_UPDATE_MS = 500, /* recalculate displayed fps every 500 ms   */
-  HUD_COLS = 72,       /* max width of any HUD string              */
+  TARGET_FPS = 60,     /* how many frames we aim to draw per second  */
+  FPS_UPDATE_MS = 500, /* how often the on-screen fps number refreshes */
+  HUD_COLS = 72,       /* widest a HUD string is allowed to get       */
 };
 
-/* ── particle pool ──────────────────────────────────────────────────── */
+/* ── particle pool ── */
 enum {
-  MAX_PARTICLES = 2048, /* hard pool ceiling — never reallocated    */
-  TRAIL_LEN = 6,        /* positions kept in each particle's trail  */
-  MAX_BURST = 300,      /* hard cap: particles per single burst     */
+  MAX_PARTICLES = 2048, /* the most particles that can be alive at once */
+  TRAIL_LEN = 6,        /* how many past positions each particle remembers */
+  MAX_BURST = 300,      /* the most particles a single burst can spawn  */
 };
 
-/* ── physics ────────────────────────────────────────────────────────── */
-/*
- * All physics values are in PIXEL SPACE (see §4 / CELL_W, CELL_H).
- * Typical terminal is ~200 px wide × 800 px tall in pixel space.
- */
-#define GRAVITY_DEFAULT 200.0f /* px / s²  downward                 */
-#define GRAVITY_STEP 30.0f     /* change per 'g'/'G' keypress        */
+/* ── physics ── */
+/* All of these are in pixel units (see CELL_W / CELL_H below). A typical
+ * terminal works out to roughly 200 px wide by 800 px tall. */
+#define GRAVITY_DEFAULT 200.0f /* default downward pull, pixels per second² */
+#define GRAVITY_STEP 30.0f     /* how much each g / G keypress changes it    */
 #define GRAVITY_MIN 0.0f
 #define GRAVITY_MAX 600.0f
-#define DRAG_COEFF 0.80f      /* velocity fraction removed per s    */
-#define BOUNCE_DAMPING 0.45f  /* kinetic energy fraction kept per bounce */
-#define MAX_SPEED_NORM 650.0f /* px/s mapped to highest ramp level  */
+#define DRAG_COEFF 0.80f      /* how strongly drag slows things down        */
+#define BOUNCE_DAMPING 0.45f  /* speed kept after a bounce (rest is lost)   */
+#define MAX_SPEED_NORM 650.0f /* speed that maps to the brightest glyph     */
 
-/* ── density grid (heatmap mode) ────────────────────────────────────── */
-/*
- * Static grid sized for the largest terminal we expect to support.
- * 300 × 100 × 4 bytes = 120 KB in BSS — no heap needed.
- */
+/* ── density grid (heatmap mode) ── */
+/* A fixed-size grid big enough for the largest terminal we support, so it
+ * can live in static memory and never needs the heap (about 120 KB). */
 #define GRID_MAX_W 300
 #define GRID_MAX_H 100
 
-/* ── coordinate system ──────────────────────────────────────────────── */
-/*
- * Terminal cells are ~2× taller than wide in physical pixels.
- * Physics runs in PIXEL SPACE; rendering converts to CELL SPACE once.
- * See §12 for the coordinate system explanation from framework.c.
- */
-#define CELL_W 8  /* logical sub-pixel steps per column */
-#define CELL_H 16 /* logical sub-pixel steps per row    */
+/* ── coordinate system ── */
+/* A terminal cell is about twice as tall as it is wide. We run the physics
+ * in fine-grained pixel units and only convert to whole cells when drawing,
+ * which lets particles drift smoothly instead of jumping cell to cell. */
+#define CELL_W 8  /* pixel steps across one column */
+#define CELL_H 16 /* pixel steps down one row      */
 
 static inline int pw(int cols) { return cols * CELL_W; }
 static inline int ph(int rows) { return rows * CELL_H; }
@@ -272,19 +88,19 @@ static inline int px_to_cy(float py) {
   return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ── render modes ───────────────────────────────────────────────────── */
+/* ── render modes ── */
 enum {
-  RENDER_GLYPH = 0,   /* char density ∝ speed, brightness ∝ life  */
-  RENDER_TRAIL = 1,   /* glyph + dim spatial history               */
-  RENDER_HEATMAP = 2, /* Gaussian-splatted density grid + LUT      */
-  RENDER_ARROW = 3,   /* 8-way direction glyph per velocity angle  */
+  RENDER_GLYPH = 0,   /* faster = denser character, dimmer as it dies */
+  RENDER_TRAIL = 1,   /* same, plus a fading tail of past positions   */
+  RENDER_HEATMAP = 2, /* particles blur together into a smoke/heat map */
+  RENDER_ARROW = 3,   /* an arrow showing which way each one is moving */
   RENDER_COUNT = 4,
 };
 
 static const char *const k_render_names[RENDER_COUNT] = {"glyph", "trail",
                                                          "heatmap", "arrow"};
 
-/* ── presets ────────────────────────────────────────────────────────── */
+/* ── presets ── */
 enum {
   PRESET_FOUNTAIN = 0,
   PRESET_FIREWORKS = 1,
@@ -296,14 +112,12 @@ enum {
 static const char *const k_preset_names[PRESET_COUNT] = {
     "fountain", "fireworks", "rainfall", "explosion"};
 
-/* ── timing ─────────────────────────────────────────────────────────── */
+/* ── timing ── */
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -321,40 +135,24 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ===================================================================== */
-/* §3  theme — color palettes, ASCII ramps, LUT pipeline                 */
-/* ===================================================================== */
+/* ── §3 theme — palettes, the brightness ramp, and the value→glyph lookup ── */
 
-/*
- * ASCII ramp — characters ordered by visual ink density (sparse → dense).
- * These are the 9 display levels the rendering pipeline quantises to.
- * Chosen to match ncurses character-cell perception on dark terminals.
- *
- *   ' '  0%   cold / empty
- *   '.'  8%   trace / faint
- *   ':'  18%  low intensity
- *   '+'  29%  medium-low
- *   'x'  39%  medium
- *   '*'  50%  medium-high
- *   'X'  62%  high
- *   '#'  75%  very high
- *   '@'  90%  peak / core
- */
+/* The brightness ramp: nine characters from emptiest to most solid-looking.
+ * Anything we draw is boiled down to one of these nine levels — a faint '.'
+ * for something dim, a packed '@' for something intense. */
 static const char k_ramp[] = " .:+x*X#@";
-#define RAMP_N (int)(sizeof k_ramp - 1) /* 9 levels */
+#define RAMP_N (int)(sizeof k_ramp - 1) /* nine levels */
 
-/*
- * LUT breakpoints — gamma-corrected thresholds for each ramp level.
- * Gamma correction: raw_value → pow(v, 1/2.2) before lookup.
- * This maps physics-linear values to perceptually-uniform brightness
- * so mid-intensity particles aren't all the same dim character.
- */
+/* The cut-off value for each ramp level. We don't compare raw numbers
+ * directly: the eye sees brightness unevenly, so we first squash the value
+ * with a gamma curve (pow(v, 1/2.2)). That spreads the mid-tones out so they
+ * don't all collapse into the same dull character. */
 static const float k_lut_breaks[RAMP_N] = {
     0.000f, 0.080f, 0.180f, 0.290f, 0.390f, 0.500f, 0.620f, 0.750f, 0.900f,
 };
 
+/* Turn a 0..1 brightness value into a ramp level (0..RAMP_N-1). */
 static int lut_index(float v) {
-  /* Clamp, gamma-correct, then binary-scan for the highest level ≤ v */
   if (v <= 0.0f)
     return 0;
   if (v >= 1.0f)
@@ -369,33 +167,30 @@ static int lut_index(float v) {
   return idx;
 }
 
-/*
- * Themes — four palettes, each mapping RAMP_N levels to colors.
- * We define all four simultaneously so switching themes at runtime
- * costs nothing (no init_pair calls, just change the color-pair base).
+/* Four colour themes, one colour per ramp level. We set all four up at
+ * startup, so the 't' key can switch between them instantly — there's no
+ * work to do, just a different base offset into the colour pairs.
  *
  *   theme 0  fire    — red / orange / yellow   (fireworks, explosion)
  *   theme 1  ocean   — blue / cyan / white      (fountain, rainfall)
  *   theme 2  nature  — green / lime             (general, organic)
  *   theme 3  cosmic  — violet / magenta / white (cosmic, energy)
  *
- * Color pair layout:
- *   pairs [ CP_BASE + theme*RAMP_N .. CP_BASE + theme*RAMP_N + RAMP_N-1 ]
- *   Max pair id = CP_BASE + 4*9 - 1 = 36.  ncurses supports ≥ 256.
- */
-#define CP_BASE                                                                \
-  1 /* first theme/ramp pair id we own (1..36 = 4 themes × 9 levels) */
-#define PAIR_HUD                                                               \
-  40 /* full-width top status bar — bright yellow, theme-independent */
-#define PAIR_HINT                                                              \
-  41 /* full-width bottom key-hint bar — bright cyan, theme-independent */
+ * The colour pairs are laid out so each theme owns a contiguous block of
+ * RAMP_N pairs, leaving the highest ids for the HUD bars. */
+#define CP_BASE 1     /* first colour pair we use (1..36: 4 themes × 9 levels) */
+#define PAIR_HUD 40   /* the top status bar — bright yellow, same in every theme */
+#define PAIR_HINT 41  /* the bottom key-hint bar — bright cyan, same everywhere   */
 #define N_THEMES 4
 
+/* One colour theme: its name plus a colour for each of the nine ramp levels.
+ * We keep both a rich 256-colour version and a plain 8-colour fallback so the
+ * demo still looks right on a basic terminal. */
 typedef struct {
   const char *name;
-  int fg256[RAMP_N];    /* xterm-256 foreground per level               */
-  int fg8[RAMP_N];      /* 8-color fallback                             */
-  attr_t attr8[RAMP_N]; /* A_BOLD / A_DIM / A_NORMAL per level (8-clr)  */
+  int fg256[RAMP_N];    /* 256-colour value for each ramp level     */
+  int fg8[RAMP_N];      /* fallback colour for 8-colour terminals   */
+  attr_t attr8[RAMP_N]; /* bold/dim/normal per level, 8-colour only */
 } PTheme;
 
 static const PTheme k_themes[N_THEMES] = {
@@ -449,8 +244,8 @@ static void color_init(void) {
         init_pair(pair, k_themes[t].fg8[i], COLOR_BLACK);
     }
   }
-  /* Theme-independent HUD bars — bright high-contrast colours per
-   * CLAUDE.md "HUD Standard" so they stay legible against any theme. */
+  /* The HUD bars use fixed bright colours that don't change with the theme,
+   * so they stay easy to read no matter what's animating behind them. */
   if (COLORS >= 256) {
     init_pair(PAIR_HUD, 226, COLOR_BLACK); /* bright yellow */
     init_pair(PAIR_HINT, 51, COLOR_BLACK); /* bright cyan   */
@@ -460,7 +255,8 @@ static void color_init(void) {
   }
 }
 
-/* Return ncurses attribute for (theme, ramp_level). */
+/* Hand back the colour-and-brightness to draw with for a given theme and
+ * ramp level — what the rest of the renderer turns on before printing. */
 static attr_t theme_attr(int theme, int level) {
   int pair = CP_BASE + theme * RAMP_N + level;
   attr_t a = COLOR_PAIR(pair);
@@ -473,184 +269,92 @@ static attr_t theme_attr(int theme, int level) {
   return a;
 }
 
-/* ===================================================================== */
-/* §4  structs — Particle and Emitter                                     */
-/* ===================================================================== */
+/* ── §4 structs — Particle and Emitter ── */
 
-/*
- * Particle — one element in the static pool.
+/* Particle — one dot in the world, and one slot in the fixed-size pool.
  *
- * INTENT: hold every piece of per-entity state the physics tick (§7)
- * and render pass (§9) need, in a flat layout that fits into a single
- * fixed-size BSS array (no malloc after init). One Particle slot can
- * be in one of two states: alive (participates in tick + draw) or
- * dead (skipped; available for reuse by pool_alloc).
+ * It carries everything the physics step and the renderer need: where it is,
+ * how it's moving, how long it has left to live, and a short memory of where
+ * it just was (for drawing trails). A slot is either alive (updated and
+ * drawn) or dead (skipped, free to be reused for a new particle).
  *
- * LIFECYCLE: spawn_particle() initialises every field of a free slot
- * (alive flips to true); update_particles() integrates motion and
- * decrements lifetime; when lifetime ≤ 0 or a kill-boundary is hit,
- * alive flips back to false and the slot becomes available again.
+ * Life story of a slot: spawn_one fills in every field and flips it alive;
+ * each tick it moves and ages a little; once its lifetime runs out or it
+ * hits a wall set to "kill", it goes dead and the slot is free again.
  *
- * COORDINATE SPACE: position + velocity live in PIXEL space
- * (sub-cell: CELL_W=8 px/col, CELL_H=16 px/row). Only the trail and
- * the final render write convert to CELL space. Pixel precision is
- * what lets a particle move sub-cell distances per frame so motion
- * reads as smooth instead of snapping between cells.
- *
- *   x, y         : current position in pixel space. Read by render,
- *                  mutated by the integrator (symplectic Euler):
- *                  x += vx · dt, y += vy · dt.
- *   vx, vy       : velocity in px/sec. Set at spawn from emitter
- *                  cone; mutated each tick by `vx += ax·dt` (and
- *                  multiplicatively scaled by drag, if enabled).
- *                  Sign convention: vy < 0 = rising (ncurses y
- *                  increases downward), vy > 0 = falling.
- *   ax, ay       : acceleration accumulator (px/s²). CLEARED at the
- *                  top of every tick (apply_forces); each active
- *                  force (gravity, future fields…) ADDS its
- *                  contribution. Modular by design — comment out
- *                  one force function to disable it.
- *   lifetime     : seconds remaining before death. Decremented by
- *                  dt each tick. When ≤ 0 the particle dies and the
- *                  slot returns to the free pool.
- *   max_lifetime : ORIGINAL lifetime at spawn — never mutated.
- *                  Render needs it to compute the fade fraction
- *                  `lifetime / max_lifetime`: < 0.3 → A_DIM.
- *   density      : mass-like parameter ∈ [0.1, 3.0]. Two effects:
- *                  (1) force response — acceleration is divided by
- *                      density so heavier particles accelerate less.
- *                  (2) drag scaling — drag damps heavier particles
- *                      FASTER (more cross-section per unit area).
- *                  density > 1: sluggish + heavy; < 1: light, buoyant.
- *   color        : optional ramp-level override [0..RAMP_N-1].
- *                  0 = auto (render picks level from speed).
- *                  Non-zero is rarely used — reserved for presets
- *                  that want a fixed colour regardless of speed.
- *   alive        : pool-slot occupancy flag. False means this slot
- *                  is skipped by every loop AND available to
- *                  pool_alloc — same single source of truth.
- *   trail_cx[]   : ring buffer of TRAIL_LEN most recent CELL x-coords.
- *   trail_cy[]   : ring buffer of TRAIL_LEN most recent CELL y-coords.
- *                  Stored in CELL space (not pixel) so the TRAIL
- *                  render mode can blit them directly without
- *                  re-converting every frame. Updated once per tick
- *                  AFTER position integration.
- *   trail_head   : ring buffer write cursor. The newest entry is at
- *                  (trail_head - 1) mod TRAIL_LEN. trail_head wraps
- *                  forever — readers always work mod TRAIL_LEN.
- */
+ * Positions and velocities are kept in fine pixel units, not whole cells, so
+ * a particle can move a fraction of a cell per frame and look like it's
+ * gliding. We only round to a cell at the moment we draw it. */
 typedef struct {
-  float x, y;
-  float vx, vy;
-  float ax, ay;
-  float lifetime;
-  float max_lifetime;
-  float density;
-  int color;
-  bool alive;
-  int trail_cx[TRAIL_LEN];
-  int trail_cy[TRAIL_LEN];
-  int trail_head;
+  float x, y;          /* where it is now, in pixels                         */
+  float vx, vy;        /* how fast it's moving, pixels/sec (vy<0 = going up) */
+  float ax, ay;        /* this tick's pushes, wiped and rebuilt every step   */
+  float lifetime;      /* seconds left to live; hits 0 → the particle dies   */
+  float max_lifetime;  /* the lifetime it started with; used for the fade    */
+  float density;       /* its "heaviness": heavier ones speed up less and    */
+                       /* are slowed by drag faster (range about 0.1 .. 3.0) */
+  int color;           /* optional fixed ramp level; 0 means pick by speed   */
+  bool alive;          /* true = in use; false = empty slot, free to reuse   */
+  int trail_cx[TRAIL_LEN]; /* recent cell positions, kept for drawing the    */
+  int trail_cy[TRAIL_LEN]; /* trail (already in cells so we don't re-convert)*/
+  int trail_head;          /* where the next trail entry gets written        */
 } Particle;
 
-/*
- * Emitter — the "spigot" that drips new particles into the pool.
+/* Emitter — the nozzle that makes new particles. It holds the recipe for a
+ * fresh particle: where to put it, which way to fling it, how fast, how long
+ * it lives, how heavy it is. It only creates particles — once one is born the
+ * emitter has nothing more to do with it. Switching preset replaces the whole
+ * recipe at once (see preset_apply in §10).
  *
- * INTENT: encapsulate every knob needed to randomise spawn parameters
- * for a new particle. The Emitter never owns particles — it only
- * SPAWNS them; once a particle is born, the emitter has no further
- * influence on it. Switching preset rewrites every field at once
- * (see preset_apply in §10).
- *
- * EMISSION MODES (driven by Scene, not the emitter itself):
- *   - CONTINUOUS: active == true and rate > 0 → spawn at a fixed
- *                 rate every tick. Used by fountain + rainfall.
- *   - BURST:      caller invokes spawn_burst(N) at chosen moments,
- *                 emitter parameters describe ONE burst's geometry.
- *                 Used by fireworks + explosion.
- *
- * The two modes can coexist (active emitter + manual burst on 'b').
- *
- *   x, y         : emitter position in PIXEL space. Set by preset
- *                  from terminal dims (e.g. fountain → bottom-centre,
- *                  rainfall → top-edge). Mutated only on resize.
- *   angle        : mean emission direction (radians). Convention:
- *                  -π/2 = straight up (fountain), +π/2 = down
- *                  (rainfall). Per-particle angle is sampled uniformly
- *                  from [angle − spread/2, angle + spread/2].
- *   spread       : total angular cone width (radians). Fountain uses
- *                  π/3 (60°), explosion uses 2π (full radial burst).
- *   speed_min,   : birth speed range in px/sec. Per-particle initial
- *   speed_max     speed sampled uniformly between min/max. Higher =
- *                  particles reach higher apex (v²/(2g) for upward).
- *   life_min,    : lifetime range in seconds — sampled per particle
- *   life_max      at spawn into Particle.max_lifetime. Sets how long
- *                  the particle stays alive AFTER spawn.
- *   density_min, : density range — per-particle density sampled
- *   density_max   uniformly and stored in Particle.density. Affects
- *                  acceleration response and drag scaling.
- *   rate         : continuous emission rate, particles per second.
- *                  0 = no continuous emission (burst-only presets).
- *                  Read by spawn_continuous each tick.
- *   rate_accum   : FRACTIONAL particle accumulator. Each tick we add
- *                  `rate · dt` to rate_accum, spawn floor(rate_accum)
- *                  particles, then `rate_accum -= floor(rate_accum)`.
- *                  Why: rate · dt may be < 1, so naive int truncation
- *                  would never spawn anything. The fractional carry
- *                  gives an EXACT long-term average rate.
- *   spawn_width  : x-axis scatter half-width in pixels.
- *                  0     = point source (fountain, explosion).
- *                  pw(c) = whole-screen-width (rainfall fills the top
- *                  edge). Per-particle x sampled in [x − w, x + w].
- *   active       : enable/disable continuous emission entirely.
- *                  Toggled by the 'e' key. Burst mode ignores this
- *                  flag — bursts always fire when requested.
- */
+ * Two ways particles come out, both driven by the Scene, not the emitter:
+ *   - steady stream: while `active` and `rate` > 0, drip out particles every
+ *     tick (fountain, rainfall).
+ *   - bursts: something calls spawn_burst(N) at a chosen moment and a whole
+ *     clump appears at once (fireworks, explosion). Bursts ignore `active`.
+ * Both can happen together — e.g. a running stream plus a manual 'b' burst. */
 typedef struct {
-  float x, y;
-  float angle;
-  float spread;
-  float speed_min;
-  float speed_max;
-  float life_min;
-  float life_max;
-  float density_min;
-  float density_max;
-  float rate;
-  float rate_accum;
-  float spawn_width;
-  bool active;
+  float x, y;        /* where particles are born, in pixels                 */
+  float angle;       /* the average direction to fling them (radians):      */
+                     /* -90° points straight up, +90° straight down         */
+  float spread;      /* width of the spray cone; 0 = a tight jet,           */
+                     /* a full circle = blast out in every direction        */
+  float speed_min;   /* birth speed range, pixels/sec — each particle gets  */
+  float speed_max;   /* a random speed picked between these two             */
+  float life_min;    /* how many seconds a new particle lives — picked      */
+  float life_max;    /* at random in this range                             */
+  float density_min; /* heaviness range — picked at random per particle     */
+  float density_max; /* (see Particle.density for what heaviness does)      */
+  float rate;        /* steady-stream rate, particles per second;           */
+                     /* 0 means burst-only (no steady stream)               */
+  float rate_accum;  /* leftover fraction of a particle carried between     */
+                     /* ticks, so a slow rate still spawns the right number */
+                     /* on average instead of rounding down to zero forever */
+  float spawn_width; /* how far to scatter births sideways; 0 = a point,    */
+                     /* full screen width = spread across the whole top edge*/
+  bool active;       /* is the steady stream on? toggled by the 'e' key     */
 } Emitter;
 
-/* ===================================================================== */
-/* §5  pool — static particle pool, no-malloc allocator                  */
-/* ===================================================================== */
+/* ── §5 pool — fixed-size particle storage, no malloc ── */
 
-/*
- * g_particles[] is a BSS-segment static array — allocated at program start,
- * never reallocated.  The "no heap allocation inside the update loop"
- * requirement is satisfied because spawn_particle() only sets fields inside
- * an already-allocated slot; it never calls malloc/realloc.
+/* All the particles live in one fixed array set aside when the program
+ * starts. We never grow or shrink it, so spawning a particle is just filling
+ * in an empty slot — there's no malloc anywhere in the hot loop.
  *
- * Allocation strategy: linear cursor scan.
- *   The cursor advances from its last position, wrapping around.
- *   Because birth_rate ≈ death_rate in steady state, the cursor
- *   travels an expected O(N / free_fraction) before finding a free slot —
- *   essentially O(1) amortised when the pool is < 90% full.
+ * To find a free slot, pool_alloc keeps a cursor and scans forward from where
+ * it left off, wrapping around the end. Since particles are born and dying at
+ * a similar pace, an empty slot is almost always close by, so this is cheap.
  *
- * When the pool is completely full, pool_alloc() returns NULL and the
- * spawn is silently dropped.  The simulation degrades gracefully rather
- * than crashing or heap-allocating.
- */
+ * If every slot is taken, pool_alloc just returns NULL and the new particle
+ * is quietly skipped — the demo keeps running instead of crashing. */
 static Particle g_particles[MAX_PARTICLES];
-static int g_cursor = 0; /* allocation cursor */
+static int g_cursor = 0; /* where the next slot search starts from */
 
 static void pool_clear(void) {
   memset(g_particles, 0, sizeof g_particles);
   g_cursor = 0;
 }
 
-/* Find a free slot; returns NULL if pool is full. */
+/* Hand back a free slot, or NULL if the pool is completely full. */
 static Particle *pool_alloc(void) {
   for (int i = 0; i < MAX_PARTICLES; i++) {
     int idx = (g_cursor + i) % MAX_PARTICLES;
@@ -662,7 +366,7 @@ static Particle *pool_alloc(void) {
   return NULL;
 }
 
-/* Count alive particles (used for stats; called once per tick). */
+/* Count how many particles are currently alive (for the on-screen stats). */
 static int pool_alive_count(void) {
   int n = 0;
   for (int i = 0; i < MAX_PARTICLES; i++)
@@ -671,87 +375,44 @@ static int pool_alive_count(void) {
   return n;
 }
 
-/* ===================================================================== */
-/* §6  forces — gravity, drag; force-accumulation pattern                */
-/* ===================================================================== */
+/* ── §6 forces — gravity and drag ── */
 
-/*
- * apply_forces() — accumulate all active forces into particle acceleration.
- *
- * PATTERN: This function is called FIRST each physics tick, before
- * velocity and position are integrated.  It clears accel then adds each
- * force separately.  To disable a force, simply comment out its line —
- * nothing else changes.
- *
- * Forces currently modelled:
- *   1. Gravity  — constant downward acceleration.
- *      In screen space +y points down, so gravity is positive ay.
- *      Galileo's principle: gravity is independent of mass/density.
- *      (To add buoyancy for smoke: ay += gravity * (1.0 - density) )
- *
- *   2. Drag     — velocity-proportional deceleration.
- *      Applied as a velocity scale in update_particles() (not here),
- *      because scaling is the exact analytical solution of dv/dt = -k*v
- *      and never goes unstable.  See §7.
- *
- * Extending: add wind, vortices, attractors, etc. as:
- *   p->ax += wind_force_x / p->density;
- *   p->ay += wind_force_y / p->density;
- */
+/* Work out the pushes on one particle for this tick. We wipe last tick's
+ * pushes and add each force in turn. Forces are kept separate on purpose: to
+ * switch one off you just delete its line, nothing else changes. Right now
+ * the only push is gravity; drag is handled separately in §7 because it works
+ * better as a slow-down on speed than as another push. */
 static void apply_forces(Particle *p, float gravity) {
-  /* Clear: forces are re-evaluated fresh every tick */
+  /* start fresh — forces are recomputed from scratch every tick */
   p->ax = 0.0f;
   p->ay = 0.0f;
 
-  /* Gravity: uniform downward field.
-   * Independent of density (equivalence principle). */
+  /* gravity pulls everything down equally, no matter how heavy */
   p->ay += gravity;
 }
 
-/* ===================================================================== */
-/* §7  physics — update_particles, handle_collisions                     */
-/* ===================================================================== */
+/* ── §7 physics — moving particles and bouncing them off walls ── */
 
-/*
- * update_particles() — advance all alive particles by one fixed timestep.
- *
- * Called from the scene_tick() accumulator loop; dt is always the fixed
- * tick duration (1 / sim_fps seconds).  Never called with variable dt.
- *
- * Per-particle steps (order matters):
- *   1. apply_forces()  — clear accel, re-accumulate forces
- *   2. Drag damping    — scale velocity before integration (exact solution)
- *   3. Symplectic Euler integration
- *                        vel += accel * dt   (velocity from NEW accel)
- *                        pos += vel   * dt   (position from NEW vel)
- *   4. Age the particle — decrease lifetime
- *   5. Update trail ring buffer
- *   6. Kill if lifetime expired
- *
- * The spawn_out / energy accumulators are for the overlay stats panel.
- */
-/* ── Per-particle math (pure / no side effects) ──────────────────── */
+/* ── per-particle helpers that only read (no changes) ── */
 
-/* Instantaneous speed |v| = √(vx² + vy²). */
+/* How fast this particle is going (the length of its velocity). */
 static inline float particle_speed(const Particle *p) {
   return sqrtf(p->vx * p->vx + p->vy * p->vy);
 }
 
-/* Kinetic energy ½·ρ·v² — density playing the role of mass per
- * unit area in this 2-D system. Summed into Scene.energy_estimate
- * to give a rough "is the simulation conserving energy?" gauge. */
+/* A rough "energy" number for this particle — heavier and faster means more.
+ * We add these up across all particles as a sanity gauge: on a sealed-up
+ * simulation the total shouldn't wander far. */
 static inline float particle_kinetic_energy(const Particle *p) {
   return 0.5f * p->density * (p->vx * p->vx + p->vy * p->vy);
 }
 
-/* ── Per-particle physics (mutating) ─────────────────────────────── */
+/* ── per-particle helpers that change the particle ── */
 
-/* Multiplicative linear drag — analytic solution of dv/dt = −k·v
- * over interval dt, density-scaled:
- *     v(t+dt) = v(t) · (1 − k·ρ·dt)        (first-order expansion)
- * Floored at 0 so a huge dt cannot flip the velocity's sign — the
- * additive-acceleration form a -= k·v would explode when k·dt > 2,
- * this form is unconditionally stable. */
+/* Slow a particle down a touch to mimic air resistance. We scale its speed
+ * down rather than adding a backwards push: scaling can never overshoot and
+ * fling the particle backwards, even with a big timestep, so it's rock
+ * stable. Heavier particles are slowed more. */
 static inline void particle_apply_drag(Particle *p, float dt) {
   float damp = 1.0f - DRAG_COEFF * p->density * dt;
   if (damp < 0.0f)
@@ -760,12 +421,10 @@ static inline void particle_apply_drag(Particle *p, float dt) {
   p->vy *= damp;
 }
 
-/* Symplectic (semi-implicit) Euler step:
- *     v ← v + a · dt          (velocity FIRST)
- *     x ← x + v_new · dt       (position uses the JUST-updated v)
- * The order is the difference from explicit Euler — symplectic
- * conserves energy to first order on Hamiltonian systems, so
- * long-running fountains don't drift upward over time. */
+/* Move the particle one step. First update its speed from the pushes, then
+ * move it using that brand-new speed. Doing it in that order (speed first,
+ * then position) keeps energy from slowly creeping up, so a fountain left
+ * running for a long time won't drift higher and higher. */
 static inline void particle_integrate_symplectic(Particle *p, float dt) {
   p->vx += p->ax * dt;
   p->vy += p->ay * dt;
@@ -773,8 +432,8 @@ static inline void particle_integrate_symplectic(Particle *p, float dt) {
   p->y += p->vy * dt;
 }
 
-/* Decrement remaining lifetime by dt; flip `alive` false when it
- * expires. Returns true if the particle survived this tick. */
+/* Age the particle by one tick; mark it dead once its time runs out.
+ * Returns true if it's still alive afterwards. */
 static inline bool particle_age(Particle *p, float dt) {
   p->lifetime -= dt;
   if (p->lifetime <= 0.0f) {
@@ -784,25 +443,21 @@ static inline bool particle_age(Particle *p, float dt) {
   return true;
 }
 
-/* Push the particle's current CELL coordinates onto its trail ring.
- * Stored in CELL space (not pixel) so the trail renderer can blit
- * directly without re-converting every frame. trail_head wraps
- * mod TRAIL_LEN; the oldest entry is silently overwritten. */
+/* Remember where the particle is now by adding its current cell to its little
+ * trail memory. We store it in cells (not pixels) so the trail can be drawn
+ * straight away without converting. The memory holds the last few spots and
+ * the oldest one quietly drops off. */
 static inline void particle_push_trail(Particle *p) {
   p->trail_cx[p->trail_head] = px_to_cx(p->x);
   p->trail_cy[p->trail_head] = px_to_cy(p->y);
   p->trail_head = (p->trail_head + 1) % TRAIL_LEN;
 }
 
-/* ── Driver — one tick over the whole pool ───────────────────────── */
+/* ── one update step over every particle ── */
 
-/* Pseudocode per alive particle, in order:
- *   1. apply_forces            — clear accel, add gravity (+ future fields)
- *   2. particle_apply_drag      — closed-form velocity damping (if enabled)
- *   3. particle_integrate_symplectic — vel += a·dt; pos += v_new·dt
- *   4. particle_age             — lifetime -= dt; kill if expired
- *   5. particle_push_trail      — record current cell for trail render
- *   6. accumulate stats         — Σ|v| and Σ½ρv² for the HUD overlay */
+/* For each alive particle: figure out the pushes, optionally slow it with
+ * drag, move it, age it, record its trail spot, and tally up speed and energy
+ * for the stats panel. */
 static void update_particles(float dt, float gravity, bool drag_on,
                              float *out_avg_vel, float *out_energy) {
   double vel_sum = 0.0;
@@ -831,33 +486,17 @@ static void update_particles(float dt, float gravity, bool drag_on,
   *out_energy = (float)energy_sum;
 }
 
-/*
- * handle_collisions() — enforce world boundaries on all alive particles.
- *
- * World boundaries are 0 and pw(cols)-1 in x, 0 and ph(rows)-1 in y.
- * Three policies per wall:
- *   BOUNCE  — reflect the relevant velocity component and apply BOUNCE_DAMPING.
- *             Kinetic energy is reduced by (1 - BOUNCE_DAMPING²) per bounce.
- *   KILL    — mark particle dead.  Used for rainfall drops, spark embers.
- *   WRAP    — teleport to opposite side.  Used for wind-tunnel loops.
- *
- * The floor_kills / ceiling_kills / wall_kills booleans in Scene map to:
- *   true  → KILL policy
- *   false → BOUNCE policy
- * WRAP is not exposed as a preset option here but is trivial to add.
- */
-/* ── Per-wall boundary response ──────────────────────────────────── *
- *
- * Each helper checks one wall. If the particle has crossed it:
- *   - kills == true → flip alive=false (return false to caller)
- *   - kills == false → snap to the wall, reflect the normal-component
- *                      velocity, multiply by BOUNCE_DAMPING (loss of
- *                      1 − BOUNCE_DAMPING² of kinetic energy per bounce
- *                      — inelastic restitution).
- *   - no cross → particle untouched, return true.
- * Caller threads the booleans so a kill on one wall short-circuits the
- * remaining wall checks for that particle.
- */
+/* Keep particles inside the screen. Each of the four edges is set up to do
+ * one of two things when a particle reaches it: kill it (it just disappears,
+ * like raindrops hitting the ground) or bounce it back (with some speed lost,
+ * so it doesn't bounce forever). The Scene's three "kills" flags pick which
+ * behaviour each edge uses. */
+
+/* ── one helper per edge ── *
+ * Each one checks a single edge. If the particle hasn't reached it, leave it
+ * alone and return true. If it has: either kill it (return false) or nudge it
+ * back inside, flip the right part of its velocity, and bleed off some speed
+ * so the bounce isn't perfectly elastic. */
 
 static inline bool particle_resolve_floor(Particle *p, float world_h,
                                           bool kills) {
@@ -868,8 +507,8 @@ static inline bool particle_resolve_floor(Particle *p, float world_h,
     return false;
   }
   p->y = world_h;
-  p->vy = -fabsf(p->vy) * BOUNCE_DAMPING; /* normal reflection upward */
-  p->vx *= BOUNCE_DAMPING;                /* tangential floor friction */
+  p->vy = -fabsf(p->vy) * BOUNCE_DAMPING; /* send it back up        */
+  p->vx *= BOUNCE_DAMPING;                /* scrub off sideways speed */
   return true;
 }
 
@@ -881,7 +520,7 @@ static inline bool particle_resolve_ceiling(Particle *p, bool kills) {
     return false;
   }
   p->y = 0.0f;
-  p->vy = fabsf(p->vy) * BOUNCE_DAMPING; /* reflect downward */
+  p->vy = fabsf(p->vy) * BOUNCE_DAMPING; /* send it back down */
   return true;
 }
 
@@ -893,7 +532,7 @@ static inline bool particle_resolve_left_wall(Particle *p, bool kills) {
     return false;
   }
   p->x = 0.0f;
-  p->vx = fabsf(p->vx) * BOUNCE_DAMPING; /* reflect right */
+  p->vx = fabsf(p->vx) * BOUNCE_DAMPING; /* send it back right */
   return true;
 }
 
@@ -906,19 +545,15 @@ static inline bool particle_resolve_right_wall(Particle *p, float world_w,
     return false;
   }
   p->x = world_w;
-  p->vx = -fabsf(p->vx) * BOUNCE_DAMPING; /* reflect left */
+  p->vx = -fabsf(p->vx) * BOUNCE_DAMPING; /* send it back left */
   return true;
 }
 
-/* ── Driver — apply every wall to every alive particle ───────────── */
+/* ── check every edge against every particle ── */
 
-/* Pseudocode per particle:
- *   if killed by floor    → done
- *   if killed by ceiling  → done
- *   if killed by left     → done
- *   if killed by right    → done
- *   otherwise: continue to next particle. Non-fatal crosses bounce
- *   in-place and the particle keeps participating in remaining checks. */
+/* For each particle, test the four edges in turn. The moment one edge kills
+ * it, stop and move on to the next particle; a bounce just nudges it back and
+ * the remaining edge checks still run. */
 static void handle_collisions(int cols, int rows, bool floor_kills,
                               bool ceiling_kills, bool wall_kills) {
   float world_w = (float)pw(cols) - 1.0f;
@@ -940,36 +575,27 @@ static void handle_collisions(int cols, int rows, bool floor_kills,
   }
 }
 
-/* ===================================================================== */
-/* §8  emitter — continuous emission and burst spawning                  */
-/* ===================================================================== */
+/* ── §8 emitter — spawning a steady stream and spawning bursts ── */
 
-/*
- * rand_float() — uniform random float in [lo, hi).
- * Uses integer rand() to avoid floating-point random state issues.
- */
+/* A random number somewhere between lo and hi. */
 static float rand_float(float lo, float hi) {
   return lo + ((float)(rand() % 100000) / 100000.0f) * (hi - lo);
 }
 
-/*
- * spawn_one() — fill a pool slot with one freshly born particle.
- *
- * Birth position is emitter.x ± spawn_width/2 (x) and emitter.y (y).
- * Birth velocity is emitter.speed in direction (angle ± spread/2).
- * Returns true if a slot was found, false if the pool was full.
- */
+/* Make one new particle following the emitter's recipe: pick a spot, a
+ * direction within the spray cone, a speed, a lifetime, and a heaviness, all
+ * randomly within the emitter's ranges. Returns false if the pool was full. */
 static bool spawn_one(const Emitter *em, int theme) {
   Particle *p = pool_alloc();
   if (!p)
     return false;
 
-  /* Scatter x for wide emitters (e.g. rainfall across full top edge) */
+  /* scatter the start sideways for wide emitters (rain across the top edge) */
   float bx =
       em->x + rand_float(-em->spawn_width * 0.5f, em->spawn_width * 0.5f);
   float by = em->y;
 
-  /* Random emission angle within the cone */
+  /* pick a direction somewhere inside the spray cone */
   float a = em->angle + rand_float(-em->spread * 0.5f, em->spread * 0.5f);
   float s = rand_float(em->speed_min, em->speed_max);
 
@@ -985,12 +611,12 @@ static bool spawn_one(const Emitter *em, int theme) {
   p->lifetime = life;
   p->max_lifetime = life;
   p->density = density;
-  p->color = theme; /* store theme so theme-change affects live particles */
+  p->color = theme;
   p->alive = true;
   p->trail_head = 0;
 
-  /* Pre-fill trail with birth position so first TRAIL_LEN frames
-   * don't show trails from (0,0) interpolating to birth pos.    */
+  /* Seed the whole trail with the birth spot, otherwise the first few frames
+   * would draw a trail streaking in from the top-left corner. */
   int cx = px_to_cx(bx), cy = px_to_cy(by);
   for (int t = 0; t < TRAIL_LEN; t++) {
     p->trail_cx[t] = cx;
@@ -999,16 +625,12 @@ static bool spawn_one(const Emitter *em, int theme) {
   return true;
 }
 
-/*
- * emitter_tick() — continuous emission for one physics tick.
- *
- * Fractional accumulator pattern: we want `rate` particles per SECOND,
- * but ticks are shorter than a second.  We accumulate rate*dt each tick
- * and spawn floor(accum) particles, keeping the fractional remainder.
- * This gives an accurate average birth rate with no systematic bias.
- *
- * Returns number of particles actually spawned this tick (for stats).
- */
+/* Drip out the steady stream for one tick. The emitter's rate is "per
+ * second", but a tick is much shorter, so a tick might earn less than one
+ * whole particle. We keep the leftover fraction and carry it forward; once it
+ * adds up to a full particle, one is born. Over time this hits the rate
+ * exactly instead of always rounding down to nothing.
+ * Returns how many were actually spawned this tick. */
 static int emitter_tick(Emitter *em, float dt, int theme) {
   if (!em->active)
     return 0;
@@ -1026,12 +648,9 @@ static int emitter_tick(Emitter *em, float dt, int theme) {
   return spawned;
 }
 
-/*
- * spawn_burst() — immediately emit `count` particles.
- *
- * Used for: manual 'b' keypress, auto-burst timer, firework explosions.
- * Ignores emitter.active — bursts always fire regardless of toggle state.
- */
+/* Spit out a clump of `count` particles all at once. Used by the 'b' key, the
+ * auto-burst timer, and firework pops. Bursts always fire, even when the
+ * steady stream is switched off. */
 static int spawn_burst(const Emitter *em, int count, int theme) {
   if (count > MAX_BURST)
     count = MAX_BURST;
@@ -1042,80 +661,55 @@ static int spawn_burst(const Emitter *em, int count, int theme) {
   return spawned;
 }
 
-/* ===================================================================== */
-/* §9  render — four render modes + overlay stats panel                  */
-/* ===================================================================== */
+/* ── §9 render — four ways to draw the particles, plus a stats panel ── */
 
-/* ── DensityField — scalar heat grid for the heatmap render mode ───── *
+/* DensityField — the grid that powers the smoke/heat-map view.
  *
- * INTENT: a single named home for the two parallel density buffers
- * the heatmap mode needs, instead of two loose `g_density` /
- * `g_prev_density` globals scattered through the file. The
- * abstraction encodes the "double-buffer for dirty-cell diffing"
- * pattern that the three-pass heatmap pipeline depends on.
+ * Instead of drawing each particle as a dot, the heat map smears them into a
+ * grid of "how much stuff is here" values, one number per cell, then colours
+ * each cell by how crowded it is. That gives the soft, glowing look.
  *
- * SPACE: CELL space (rows × cols), not pixel. Sized to GRID_MAX_H ×
- * GRID_MAX_W so the grid is allocated once in BSS and the render path
- * never calls malloc. The bounds-check in density_field_splat clamps
- * any cell outside that hard cap.
+ * It keeps two grids:
+ *   curr : this frame's totals. Wiped clean each frame, then every particle
+ *          dabs a little blob into it. The drawing pass reads this.
+ *   prev : last frame's totals, kept so we can spot cells that just went
+ *          empty and blank only those — much cheaper than clearing the whole
+ *          screen every frame, which would make the terminal flicker.
  *
- * BUFFERS:
- *   curr : this frame's accumulated density. Zeroed at the start of
- *          each render via density_field_begin_frame, then filled by
- *          density_field_splat per alive particle. Read by the blit
- *          pass to pick glyph + colour.
- *   prev : last frame's snapshot of `curr`. Compared against `curr`
- *          to find cells that DROPPED below the visibility threshold
- *          since last frame — those cells get a single space char
- *          written (dirty-rectangle erase), keeping the terminal
- *          write count proportional to changed cells.
- *
- * LIFETIME: single static instance `g_field`. density_field_reset()
- * zeros both buffers, called at scene_init / scene_reset / preset
- * switch / render-mode switch — anywhere a stale frame would bleed
- * through into the new state.
- */
+ * It's one fixed-size grid sized for the biggest terminal we support, so it
+ * sits in static memory and never needs the heap. There's a single shared
+ * instance, g_field, cleared whenever the scene resets or the view changes so
+ * an old frame can't bleed into a new one. */
 typedef struct {
-  float curr[GRID_MAX_H][GRID_MAX_W];
-  float prev[GRID_MAX_H][GRID_MAX_W];
+  float curr[GRID_MAX_H][GRID_MAX_W]; /* this frame's per-cell totals */
+  float prev[GRID_MAX_H][GRID_MAX_W]; /* last frame's, for spotting cleared cells */
 } DensityField;
 
 static DensityField g_field;
 
-/* Zero BOTH buffers — called on scene reset, preset switch, and when
- * switching INTO heatmap mode, so the new frame starts from a blank
- * field. */
+/* Wipe both grids — used on reset and when switching into the heat-map view,
+ * so the new frame starts from a blank field. */
 static inline void density_field_reset(void) {
   memset(g_field.curr, 0, sizeof g_field.curr);
   memset(g_field.prev, 0, sizeof g_field.prev);
 }
 
-/* Zero only `curr` — top of an accumulation pass. `prev` is left
- * intact so the next clear-emptied pass can diff against it. */
+/* Wipe only this frame's grid, ready to be filled in again. Last frame's grid
+ * is left alone so we can still compare against it. */
 static inline void density_field_begin_frame(void) {
   memset(g_field.curr, 0, sizeof g_field.curr);
 }
 
-/* Copy curr → prev. Called after the dirty-cell clear has finished
- * reading `prev`, snapshotting the just-rendered frame so NEXT frame
- * can diff against it. */
+/* Save this frame's grid as last frame's, so next frame has something to
+ * compare against when it looks for cells that went empty. */
 static inline void density_field_snapshot(void) {
   memcpy(g_field.prev, g_field.curr, sizeof g_field.curr);
 }
 
-/*
- * density_field_splat() — deposit a Gaussian blob into curr[].
- *
- * 3×3 normalised kernel (Σ = 1.0):
- *   corners     : 0.0625  (1/16)
- *   edge-centres: 0.125   (2/16)
- *   centre      : 0.25    (4/16)
- *
- * Weight is whatever the caller pre-computed (typically
- * particle_heat_weight = speed × life_fraction, clamped). Cells
- * outside the visible region OR outside the hard GRID_MAX cap are
- * silently skipped — no out-of-bounds writes.
- */
+/* Dab one soft 3×3 blob into the grid, centred on a cell, so a single
+ * particle spreads a little glow over its neighbours instead of lighting just
+ * one cell. The centre gets the most, the corners the least, and it all adds
+ * up to the particle's full weight. Anything off-grid is skipped. */
 static void density_field_splat(int cx, int cy, float weight, int cols,
                                 int rows) {
   static const float k[3][3] = {
@@ -1136,83 +730,43 @@ static void density_field_splat(int cx, int cy, float weight, int cols,
   }
 }
 
-/*
- * 8-way direction arrows for RENDER_ARROW mode.
- *
- * Octant mapping (screen space: +x right, +y DOWN):
- *   angle = atan2(vy, vx)  — gives angle in [-π, π]
- *   We map this to 8 octants (0 = right, going clockwise).
- *
- * Characters '/' and '\' appear twice because they are symmetric —
- * the same slash encodes both (right-up) and (left-down) motion.
- * This is accurate: think of '/' as "the particle is going diagonally
- * along this stroke's direction", same for '\'.
- */
+/* The eight little arrows for the arrow view, one per direction of travel,
+ * going clockwise starting from "moving right". '/' and '\' each show up
+ * twice because the same stroke fits two opposite diagonals. */
 static const char k_arrows[8] = {
-    '>',  /* 0: right        [−π/8 ,  π/8)  */
-    '\\', /* 1: right-down   [ π/8 , 3π/8)  */
-    'v',  /* 2: down         [3π/8 , 5π/8)  */
-    '/',  /* 3: left-down    [5π/8 , 7π/8)  */
-    '<',  /* 4: left         [7π/8 ,−7π/8)  */
-    '\\', /* 5: left-up      [−7π/8,−5π/8)  */
-    '^',  /* 6: up           [−5π/8,−3π/8)  */
-    '/',  /* 7: right-up     [−3π/8,−π/8)   */
+    '>',  /* right      */
+    '\\', /* right-down */
+    'v',  /* down       */
+    '/',  /* left-down  */
+    '<',  /* left       */
+    '\\', /* left-up    */
+    '^',  /* up         */
+    '/',  /* right-up   */
 };
 
+/* Pick the arrow that matches which way a particle is heading. */
 static char velocity_arrow(float vx, float vy) {
-  float angle = atan2f(vy, vx);     /* [-π, π]          */
-  float norm = angle + (float)M_PI; /* [0, 2π)          */
+  float angle = atan2f(vy, vx);
+  float norm = angle + (float)M_PI;
   int oct = (int)(norm / (float)M_PI * 4.0f) % 8;
   return k_arrows[oct];
 }
 
-/*
- * render_heatmap() — continuous density-field view of the particle cloud.
- *
- * This mode treats all particles as sources of a scalar density field rather
- * than discrete points.  The result looks like infrared heat or smoke density.
- *
- * Algorithm (three passes):
- *
- *   PASS 1 — erase stale cells:
- *     Cells that had density > threshold last frame but are now empty need
- *     explicit blanking.  We compare g_prev_density vs g_density (before
- *     rebuilding) instead of clearing the whole screen each frame.
- *     WHY: clearing all ROWS×COLS cells each frame causes terminal flicker
- *     because ncurses still has to repaint them all.  Differential erase
- *     only touches cells that actually changed.
- *
- *   PASS 2 — accumulate density:
- *     g_density is zeroed, then every alive particle splats a 3×3 Gaussian
- *     blob weighted by (speed / MAX_SPEED_NORM) × life_fraction.
- *     WHY weight by speed: fast particles carry more kinetic energy and should
- *     appear brighter (hotter).  A stationary particle contributes nothing.
- *     WHY weight by life_frac: dying particles fade out naturally in the field
- *     without needing per-particle dim logic.
- *
- *   PASS 3 — render density grid:
- *     Normalised density → lut_index → k_ramp character + theme colour pair.
- *     Cells below 0.01 are skipped (background stays dark).
- */
-/* ── Heatmap helpers — three-pass density pipeline ───────────────── */
+/* ── the heat-map view, done in three passes ── */
 
-/* Per-particle heat contribution to the density field:
- *   weight = clamp(|v| / MAX_SPEED_NORM × lifetime_fraction, 0, 1)
- * Fast YOUNG particles add the most heat; stationary particles add
- * zero; dying particles fade out automatically without per-particle
- * dim logic. The clamp keeps the splat amplitude bounded. */
+/* How much glow one particle adds to the heat map. Fast, young particles
+ * glow brightest; a particle sitting still adds nothing; a fading one dims on
+ * its own, so we don't need special dimming logic. Capped at 1. */
 static inline float particle_heat_weight(const Particle *p) {
   float lf = p->lifetime / p->max_lifetime;
   float w = (particle_speed(p) / MAX_SPEED_NORM) * lf;
   return (w > 1.0f) ? 1.0f : w;
 }
 
-/* PASS 1 — clear cells that DROPPED below the visibility threshold
- * this frame (compares last frame's snapshot vs current density,
- * emits a space at any cell that lost its occupancy), then snapshot
- * current density for next frame's diff. Dirty-rectangle trick that
- * keeps the terminal write count proportional to changed cells, not
- * total cells. */
+/* Pass 1 — blank out only the cells that lit up last frame but are empty now.
+ * We compare last frame's grid to this one and erase just those, then save
+ * this frame's grid for next time. Touching only the cells that changed keeps
+ * the terminal from flickering. */
 static void heatmap_clear_emptied_cells(WINDOW *w, int cols, int rows) {
   for (int r = 0; r < rows && r < GRID_MAX_H; r++)
     for (int c = 0; c < cols && c < GRID_MAX_W; c++)
@@ -1221,10 +775,9 @@ static void heatmap_clear_emptied_cells(WINDOW *w, int cols, int rows) {
   density_field_snapshot();
 }
 
-/* PASS 2 — accumulate the density field from scratch. Each alive
- * particle splats a 3×3 Gaussian (handled by splat_density) weighted
- * by particle_heat_weight. Re-build, don't increment, so dead-now
- * particles don't leave ghosts. */
+/* Pass 2 — rebuild the grid from scratch: wipe it, then have every alive
+ * particle dab its glow into it. Rebuilding (rather than adding onto last
+ * frame) means particles that just died leave no ghost behind. */
 static void heatmap_accumulate_density(int cols, int rows) {
   density_field_begin_frame();
   for (int i = 0; i < MAX_PARTICLES; i++) {
@@ -1236,9 +789,9 @@ static void heatmap_accumulate_density(int cols, int rows) {
   }
 }
 
-/* PASS 3 — map density value → ramp level → glyph + theme colour,
- * write to the window. Cells below 0.01 are skipped — they were
- * already blanked in PASS 1 (or were never lit). */
+/* Pass 3 — actually draw the grid: for each lit cell, turn its value into a
+ * ramp character in the theme's colour. Near-empty cells are skipped (pass 1
+ * already blanked the ones that just emptied). */
 static void heatmap_blit_density_field(WINDOW *w, int cols, int rows,
                                        int theme) {
   for (int r = 0; r < rows && r < GRID_MAX_H; r++) {
@@ -1257,38 +810,24 @@ static void heatmap_blit_density_field(WINDOW *w, int cols, int rows,
   }
 }
 
-/* ── Driver — render the heatmap mode as three sequential passes ─── */
+/* Draw the heat-map view: blank emptied cells, rebuild the grid, draw it. */
 static void render_heatmap(WINDOW *w, int cols, int rows, int theme) {
   heatmap_clear_emptied_cells(w, cols, rows);
   heatmap_accumulate_density(cols, rows);
   heatmap_blit_density_field(w, cols, rows, theme);
 }
 
-/*
- * render_per_particle() — GLYPH / TRAIL / ARROW modes.
- *
- * Every alive particle is drawn as a single character at its current cell
- * position.  The three modes share the same speed→level and life→dim logic;
- * they differ only in which character is placed:
- *
- *   GLYPH  — k_ramp[lvl]: density glyph encodes kinetic energy directly.
- *   TRAIL  — draws TRAIL_LEN-1 past cell positions first (fading), then the
- *             current glyph.  Older trail entries are dimmer (tlvl -= t/2).
- *             WHY draw trail before current: ensures the head glyph is on top
- *             and not overwritten by a trail entry from the next particle.
- *   ARROW  — velocity_arrow(vx, vy): 8-way direction char instead of density.
- *             Good for visualising flow fields and force alignment.
- *
- * Life-based dimming at 30%:
- *   At lifetime_fraction < 0.30, A_DIM replaces A_BOLD.  This creates a
- *   visible "dying" fade that doesn't require gradual alpha — just two
- *   brightness levels available in all ncurses terminals.
- */
-/* ── Per-particle render helpers ─────────────────────────────────── */
+/* The other three views (glyph, trail, arrow), which all draw one character
+ * per particle. They share the same "faster = brighter, dying = dimmer" logic
+ * and only differ in which character lands on the screen: a density character
+ * for glyph and trail, a direction arrow for arrow. Trail also paints a short
+ * fading tail behind each particle first. */
 
-/* Speed → ramp level in [1, RAMP_N-1]. Faster particle = denser glyph.
- * Floored at 1 so any alive particle is at least faintly visible
- * (otherwise stationary particles would vanish into the background). */
+/* ── helpers for drawing one particle ── */
+
+/* Turn a particle's speed into a brightness level. Faster looks denser. We
+ * never let it fall below 1, so even a still particle stays faintly visible
+ * instead of disappearing. */
 static inline int particle_ramp_level(const Particle *p) {
   float n = particle_speed(p) / MAX_SPEED_NORM;
   if (n > 1.0f)
@@ -1297,10 +836,9 @@ static inline int particle_ramp_level(const Particle *p) {
   return (lvl < 1) ? 1 : lvl;
 }
 
-/* Compose the base render attribute: theme colour at the given ramp
- * level, with A_BOLD swapped for A_DIM when the particle is in the
- * last 30% of its life. Two-tier brightness fade (BOLD → DIM) works
- * on every ncurses terminal without needing alpha blending. */
+/* Work out the colour-and-brightness to draw a particle with: the theme
+ * colour for its level, dimmed once it's into the last third of its life so
+ * it visibly fades out as it dies. */
 static inline attr_t particle_render_attr(const Particle *p, int theme,
                                           int level) {
   attr_t a = theme_attr(theme, level);
@@ -1310,11 +848,10 @@ static inline attr_t particle_render_attr(const Particle *p, int theme,
   return a;
 }
 
-/* Walk the trail ring buffer backwards (newest first), drawing each
- * past CELL position one level dimmer per 2 steps. Older entries are
- * always A_DIM. Drawn BEFORE the head glyph so the head paints on
- * top and stays crisp — otherwise a trail entry from the next
- * particle could overwrite this particle's head. */
+/* Draw the fading tail: step back through the particle's recent positions,
+ * newest first, each one a little dimmer than the last. We draw the tail
+ * before the head so the head can be painted on top and stay sharp, instead
+ * of being smudged by the next particle's tail. */
 static void particle_draw_trail(WINDOW *w, const Particle *p, int cols,
                                 int rows, int level, int theme) {
   for (int t = 0; t < TRAIL_LEN - 1; t++) {
@@ -1333,9 +870,8 @@ static void particle_draw_trail(WINDOW *w, const Particle *p, int cols,
   }
 }
 
-/* Draw the particle's HEAD glyph at its current cell. mode picks:
- *   RENDER_ARROW → velocity_arrow(vx, vy)  (8-way direction char)
- *   otherwise    → k_ramp[level]            (density glyph by speed) */
+/* Draw the particle itself at its current cell: a direction arrow in arrow
+ * view, otherwise a density character chosen by its speed. */
 static inline void particle_draw_head(WINDOW *w, const Particle *p, int cx,
                                       int cy, int mode, int level,
                                       attr_t attr) {
@@ -1346,14 +882,9 @@ static inline void particle_draw_head(WINDOW *w, const Particle *p, int cx,
   wattroff(w, attr);
 }
 
-/* ── Driver — GLYPH / TRAIL / ARROW modes ────────────────────────── */
-
-/* Pseudocode per alive particle:
- *   1. cell coords  = pixel → cell conversion
- *   2. ramp level   = particle_ramp_level (speed → density glyph)
- *   3. base attr    = particle_render_attr (theme colour + dim-if-dying)
- *   4. if TRAIL  → particle_draw_trail (paint history first)
- *   5. head glyph → particle_draw_head (paint current cell on top) */
+/* Draw the glyph / trail / arrow views: for each alive particle, find its
+ * cell, pick its brightness and colour, paint the tail first if we're in
+ * trail view, then paint the particle on top. */
 static void render_per_particle(WINDOW *w, int cols, int rows, int mode,
                                 int theme) {
   for (int i = 0; i < MAX_PARTICLES; i++) {
@@ -1375,16 +906,7 @@ static void render_per_particle(WINDOW *w, int cols, int rows, int mode,
   }
 }
 
-/*
- * render_particles() — dispatch to the active render mode.
- *
- * Visual encoding summary by mode:
- *   HEATMAP — continuous density field (Gaussian splat per particle).
- *             Best for fluid/smoke where individual identity is irrelevant.
- *   GLYPH   — per-particle: speed → character density.
- *   TRAIL   — per-particle: past positions fading behind each particle.
- *   ARROW   — per-particle: velocity angle → 8-way direction glyph.
- */
+/* Draw the particles using whichever view is currently selected. */
 static void render_particles(WINDOW *w, int cols, int rows, int mode,
                              int theme) {
   if (mode == RENDER_HEATMAP) {
@@ -1394,24 +916,16 @@ static void render_particles(WINDOW *w, int cols, int rows, int mode,
   }
 }
 
-/*
- * render_overlay() — stats panel in the bottom-left corner.
- *
- * Displays the six key simulation metrics requested by the spec:
- *   particle_count, dt, simulation_time, spawn_rate, avg_velocity,
- *   energy_estimate.
- *
- * Also shows active preset, theme, render mode, and gravity so the
- * user always knows the current simulation state.
- *
- * Drawn LAST inside screen_draw so it appears on top of particles.
- */
+/* Draw the little stats panel in the bottom-left corner: live counts, timing,
+ * speed and energy readouts, plus the current preset / theme / view / gravity
+ * so you can always see what state the demo is in. Drawn last so it sits on
+ * top of the particles. */
 static void render_overlay(WINDOW *w, int cols, int rows, int particle_count,
                            float dt_sec, float sim_time, int spawn_rate,
                            float avg_vel, float energy, float gravity,
                            bool drag_on, int preset_id, int theme_id,
                            int render_mode, bool paused) {
-  /* Choose a position that fits: bottom-left, 28 cols wide, 10 rows tall */
+  /* a small fixed-size box near the bottom-left */
   int panel_w = 28;
   int panel_h = 10;
   int ox = 1;
@@ -1419,13 +933,13 @@ static void render_overlay(WINDOW *w, int cols, int rows, int particle_count,
   if (oy < 0)
     oy = 0;
   if (ox + panel_w > cols)
-    return; /* terminal too narrow — skip */
+    return; /* screen too narrow for the panel — just skip it */
 
-  /* Box top */
+  /* top border */
   wattron(w, COLOR_PAIR(CP_BASE + theme_id * RAMP_N + 5) | A_DIM);
   mvwprintw(w, oy, ox, "+-- PARTICLE ENGINE ------+");
 
-  /* Stats rows */
+  /* the readouts */
   mvwprintw(w, oy + 1, ox, "| cnt  %5d / %-5d      |", particle_count,
             MAX_PARTICLES);
   mvwprintw(w, oy + 2, ox, "| dt   %7.4f s          |", dt_sec);
@@ -1434,53 +948,34 @@ static void render_overlay(WINDOW *w, int cols, int rows, int particle_count,
   mvwprintw(w, oy + 5, ox, "| avgv %7.1f px/s       |", avg_vel);
   mvwprintw(w, oy + 6, ox, "| nrg  %9.1f          |", energy);
 
-  /* State row */
+  /* current preset / theme / view / gravity */
   mvwprintw(w, oy + 7, ox, "| %-6s %-6s %-4s %4.0fg |",
             k_preset_names[preset_id], k_themes[theme_id].name,
             k_render_names[render_mode], gravity);
 
-  /* Box bottom */
+  /* drag + pause state, then the bottom border */
   mvwprintw(w, oy + 8, ox, "| drag:%-3s  %s              |",
             drag_on ? "ON " : "OFF", paused ? "PAUSED " : "running");
   mvwprintw(w, oy + 9, ox, "+-------------------------+");
   wattroff(w, COLOR_PAIR(CP_BASE + theme_id * RAMP_N + 5) | A_DIM);
 }
 
-/* ===================================================================== */
-/* §10 presets — fireworks, fountain, rainfall, explosion                 */
-/* ===================================================================== */
+/* ── §10 presets — fountain, fireworks, rainfall, explosion ── */
 
-/*
- * Each preset configures the Scene's emitter + physics parameters.
- * Presets require cols/rows because the emitter position is derived
- * from the terminal dimensions (pixel space).
+/* Each preset is just one set of emitter + physics settings that produces a
+ * recognisable effect. They take the terminal size because the emitter's
+ * position depends on where the edges and centre of the screen are.
  *
- * Design notes per preset:
- *
- *   FOUNTAIN  — classic upward spray. Gravity curves arcs downward.
- *               Drag is OFF so the closed-form ballistic apex
- *               (v²/(2g)) is reached and the column reads tall on
- *               screen. Bounce floor so drops accumulate visually.
- *               60° cone, rate 80/s, speed 380-500 → ~300 alive.
- *
- *   FIREWORKS — burst-only (no continuous emission), 600 sparks per
- *               burst on a 1.8 s cadence so successive bursts overlap
- *               with the previous one's still-flying debris. Full
- *               radial cone (spread = 2π), low drag, kill at walls.
- *               Steady-state ≈ 800-1000 sparks on screen.
- *
- *   RAINFALL  — particles fill the entire top edge (spawn_width = pw(cols)).
- *               Strong gravity, narrow downward cone, kill at floor so drops
- *               don't bounce (realistic rain behaviour).
- *               Arrow render mode makes the fall direction clearly visible.
- *
- *   EXPLOSION — radial burst (spread = 2π) from screen centre.
- *               Strong drag dissipates the burst quickly.  Heatmap mode
- *               shows the density shockwave expanding outward.
- *               Auto-burst every 3 s with brief quiet gap.
- */
+ *   fountain  — a tall upward spray that arcs back down; drops bounce at the
+ *               floor and pile up. Drag is off so the jet reaches full height.
+ *   fireworks — repeated pops of sparks; bursts overlap so the sky keeps
+ *               shimmering. No steady stream, sparks die at the edges.
+ *   rainfall  — drops falling from across the whole top edge; they die at the
+ *               floor instead of bouncing, like real rain. Shown as arrows.
+ *   explosion — a blast outward in every direction from the centre; strong
+ *               drag makes it dissipate fast. Shown as an expanding heat map. */
 
-/* Forward declaration — Emitter lives in Scene defined in §11 */
+/* Scene is defined in §11; presets fill it in, so we name it early here. */
 typedef struct Scene Scene;
 
 static void preset_fountain(Scene *s, int cols, int rows);
@@ -1490,99 +985,58 @@ static void preset_explosion(Scene *s, int cols, int rows);
 
 static void preset_apply(Scene *s, int id, int cols, int rows);
 
-/* ===================================================================== */
-/* §11 scene — top-level simulation state; tick + draw                   */
-/* ===================================================================== */
+/* ── §11 scene — the whole simulation's state, plus tick and draw ── */
 
-/*
- * Scene — owns every piece of mutable state that isn't on individual
- * particles. Two clearly-separated halves:
+/* Scene — all the changeable state that doesn't live on individual particles.
+ * It splits cleanly into two halves: the simulation half (what the physics
+ * step reads and writes) and the render half (what the drawing step uses to
+ * pick colours and glyphs). The render half never affects the physics, so the
+ * particles behave the same no matter which theme or view is showing.
  *
- *   SIMULATION half — what the physics tick reads/writes. Owns the
- *                     emitter, force constants, boundary policies,
- *                     the auto-burst scheduler, the paused flag,
- *                     and the per-tick measured statistics. Mutated
- *                     by scene_tick() and the key handler.
- *
- *   RENDER half     — what scene_draw() consults to pick colours,
- *                     glyphs, and overlays. Purely visual selection
- *                     indices; never read inside the physics tick.
- *
- * The Scene knows nothing about ncurses — it integrates physics and
- * writes to a WINDOW* passed in by screen_draw. That separation lets
- * the physics be exercised without a terminal (useful for headless
- * scripted runs or future tests).
- */
+ * The Scene knows nothing about ncurses; it's handed a window to draw into.
+ * That keeps the physics separate from the display, so it could in principle
+ * be run with no terminal at all. */
 struct Scene {
-  /* ──────────────────────────────────────────────────────────────
-   *  SIMULATION HALF — physics tick reads + writes these
-   * ────────────────────────────────────────────────────────────── */
+  /* ── simulation half: the physics step reads and writes these ── */
 
-  /* SOURCE — the particle factory. preset_apply replaces every
-   * Emitter field at once; the 'e' key toggles its `active` flag. */
+  /* the nozzle that makes new particles; preset_apply rewrites it wholesale,
+   * the 'e' key just flips its steady stream on or off */
   Emitter emitter;
 
-  /* FORCES — global physics parameters applied to every alive
-   * particle in apply_forces (§6).
-   *   gravity : downward acceleration in px/s². Bumped/lowered
-   *             by g/G keys. Set by preset_apply at preset switch.
-   *             Larger → flatter arcs, faster fall.
-   *   drag_on : enable linear-velocity drag? When true, every
-   *             velocity is multiplied by exp(-k·density·dt) each
-   *             tick (closed-form decay; unconditionally stable).
-   *             Toggled by 'd' key. Off = pure ballistic motion. */
+  /* the global forces applied to every particle:
+   *   gravity : downward pull; g/G change it, presets set it. Bigger means
+   *             flatter arcs and a quicker fall.
+   *   drag_on : is air resistance on? 'd' toggles it. Off = pure arcs. */
   float gravity;
   bool drag_on;
 
-  /* BOUNDARY POLICIES — what happens when a particle crosses an
-   * edge. Each wall has its own policy (set by preset_apply).
-   *   floor_kills   : true  → particle dies at floor (rainfall).
-   *                   false → particle bounces with energy damping.
-   *   ceiling_kills : true  → particle dies at top (fountain peak).
-   *   wall_kills    : true  → particle dies at left/right edges
-   *                          (fireworks, explosion).
-   * Bouncing branches in handle_collisions apply restitution
-   * (DAMPING) so each bounce loses ~30% of kinetic energy. */
+  /* what each edge does when a particle reaches it: true = the particle dies
+   * there, false = it bounces back (losing some speed). Presets set these —
+   * e.g. rain kills at the floor, a fountain bounces there. */
   bool floor_kills;
   bool ceiling_kills;
   bool wall_kills;
 
-  /* PAUSE — when true, scene_tick is a no-op (no force application,
-   * no integration, no spawn). Render keeps running so the user
-   * sees a frozen frame. Toggled by space-bar. */
+  /* when true the simulation freezes (space-bar toggles it). Drawing keeps
+   * going so you see a still frame rather than a blank screen. */
   bool paused;
 
-  /* AUTO-BURST SCHEDULER — drives burst-only presets (fireworks,
-   * explosion). Every burst_interval seconds the scene fires a
-   * spawn_burst(burst_count) automatically.
-   *   burst_interval : seconds between auto-bursts. 0 disables
-   *                    the scheduler entirely (fountain/rainfall).
-   *   burst_timer    : countdown — decrements by dt every tick,
-   *                    triggers a burst when it crosses 0 and
-   *                    reloads to burst_interval.
-   *   burst_count    : number of particles per scheduled burst.
-   *                    Higher = denser explosion / fireworks. */
+  /* the timer that fires bursts on its own, for fireworks and explosions:
+   *   burst_interval : seconds between automatic bursts; 0 turns it off
+   *   burst_timer    : counts down each tick and fires a burst at zero
+   *   burst_count    : how many particles each automatic burst makes */
   float burst_interval;
   float burst_timer;
   int burst_count;
 
-  /* CLOCK + MEASURED STATS — written at the end of each
-   * scene_tick; read by render_overlay AND the top HUD bar.
-   * Treated as read-only outside scene_tick.
-   *   dt_sec          : the dt the most recent tick used.
-   *                     Surfaces variable step length in the HUD.
-   *   simulation_time : monotonically-increasing wall-clock of
-   *                     simulated seconds. Resets on 'r' key.
-   *   particle_count  : number of alive slots after the tick.
-   *                     The "live count" displayed in the HUD.
-   *   spawn_rate_last : particles spawned in this tick. Useful
-   *                     to confirm rate accumulator behaviour.
-   *   avg_velocity    : Σ|v| / particle_count over alive set.
-   *                     Read by render_overlay as a temperature-ish
-   *                     gauge.
-   *   energy_estimate : Σ(½·m·v² + m·g·y) over alive set. A loose
-   *                     proxy for total kinetic+potential energy;
-   *                     should be near-constant on a closed sim. */
+  /* numbers measured at the end of each tick and shown in the HUD; nothing
+   * outside the tick should change them:
+   *   dt_sec          : the length of the last step, in seconds
+   *   simulation_time : seconds simulated so far (the 'r' key resets it)
+   *   particle_count  : how many particles are alive right now
+   *   spawn_rate_last : how many were born in the last tick
+   *   avg_velocity    : average speed across the live particles
+   *   energy_estimate : a rough total-energy gauge across all particles */
   float dt_sec;
   float simulation_time;
   int particle_count;
@@ -1590,62 +1044,49 @@ struct Scene {
   float avg_velocity;
   float energy_estimate;
 
-  /* CURRENT PRESET — index into the preset table. Cycled by p/P
-   * keys. Switching preset overwrites every SIMULATION field above
-   * via preset_apply, so this is the load-state pointer; the per-
-   * field values are the live truth. Lives in the SIMULATION half
-   * because changing it changes physics, not just visuals. */
+  /* which preset is loaded (p/P cycle through them). It lives on the
+   * simulation side because switching it rewrites all the physics settings
+   * above, not just the look. */
   int preset_id;
 
-  /* ──────────────────────────────────────────────────────────────
-   *  RENDER HALF — scene_draw reads these; physics tick ignores them
-   * ────────────────────────────────────────────────────────────── */
+  /* ── render half: the drawing step reads these, the physics ignores them ── */
 
-  /* COLOUR PALETTE — index into k_themes. Cycled by 't' key.
-   * theme_attr(theme_id, level) maps a ramp level to the actual
-   * ncurses pair + attribute for the current theme. Pure render
-   * concern — particles look different but behave identically
-   * regardless of which theme is active. */
+  /* which colour theme is showing ('t' cycles). Pure looks — particles behave
+   * the same whatever theme is active. */
   int theme_id;
 
-  /* RENDER MODE — which of the four visual encodings to use:
-   *   RENDER_GLYPH   : speed → density-ramp char + life → A_DIM
-   *   RENDER_TRAIL   : glyph + dim trail of past CELL positions
-   *   RENDER_HEATMAP : Gaussian-splat density grid, ramp by total
-   *   RENDER_ARROW   : 8-way arrow glyph from atan2(vy, vx)
-   * Cycled by 'v' key. Same particles, different visualisation. */
+  /* which of the four views is showing — glyph, trail, heat map, or arrows
+   * ('v' cycles). Same particles, just drawn differently. */
   int render_mode;
 };
 
-/* ── preset implementations ────────────────────────────────────────── */
+/* ── the four presets ── */
 
 static void preset_fountain(Scene *s, int cols, int rows) {
   Emitter *em = &s->emitter;
   em->x = (float)pw(cols) * 0.5f;
   em->y = (float)ph(rows) - 2.0f;
   em->angle = -(float)M_PI * 0.5f; /* straight up */
-  em->spread = (float)M_PI / 3.0f; /* 60° cone    */
-  /* Apex (no drag) = v²/(2·g). With g = 200, speed 380→apex 361 px
-   * = ~22 cells; speed 500→apex 625 px = ~39 cells. So even the
-   * slowest particles clear ~half a 30-row terminal, fastest reach
-   * the ceiling on standard terminals. */
+  em->spread = (float)M_PI / 3.0f; /* a 60-degree spray */
+  /* These speeds are tuned so the jet rises about half to all of a normal
+   * terminal's height — tall enough to read clearly as a fountain. */
   em->speed_min = 380.0f;
   em->speed_max = 500.0f;
   em->life_min = 2.5f;
   em->life_max = 5.0f;
   em->density_min = 0.6f;
   em->density_max = 1.2f;
-  /* 80/s × ~3.75 s avg life → ~300 alive steady-state — dense column. */
+  /* this rate and lifetime settle at roughly 300 particles — a dense column */
   em->rate = 80.0f;
   em->rate_accum = 0.0f;
   em->spawn_width = 0.0f;
   em->active = true;
 
   s->gravity = 200.0f;
-  /* Drag OFF — drag was cutting the apex roughly in half; turning it
-   * off restores the full ballistic arc so the fountain reads tall. */
+  /* Drag off on purpose: with it on the jet only rose about half as high.
+   * Off, it reaches full height and reads clearly as a fountain. */
   s->drag_on = false;
-  s->floor_kills = false; /* bounce at floor */
+  s->floor_kills = false; /* drops bounce at the floor */
   s->ceiling_kills = true;
   s->wall_kills = false;
   s->burst_interval = 0.0f;
@@ -1658,15 +1099,15 @@ static void preset_fireworks(Scene *s, int cols, int rows) {
   Emitter *em = &s->emitter;
   em->x = (float)pw(cols) * 0.5f;
   em->y = (float)ph(rows) - 2.0f;
-  em->angle = -(float)M_PI * 0.5f; /* upward launch */
-  em->spread = 2.0f * (float)M_PI; /* full radial   */
+  em->angle = -(float)M_PI * 0.5f; /* launched upward */
+  em->spread = 2.0f * (float)M_PI; /* spray in every direction */
   em->speed_min = 200.0f;
   em->speed_max = 600.0f;
   em->life_min = 1.5f;
   em->life_max = 3.5f;
   em->density_min = 0.4f;
   em->density_max = 0.9f;
-  em->rate = 0.0f; /* burst-only, no continuous */
+  em->rate = 0.0f; /* no steady stream — bursts only */
   em->rate_accum = 0.0f;
   em->spawn_width = 0.0f;
   em->active = false;
@@ -1676,13 +1117,11 @@ static void preset_fireworks(Scene *s, int cols, int rows) {
   s->floor_kills = true;
   s->ceiling_kills = false;
   s->wall_kills = true;
-  /* 600 sparks per burst × overlap (interval 1.8s vs avg life 2.5s) →
-   * roughly 800-1000 alive at any moment, well under MAX_PARTICLES.
-   * Previous burst's sparks are still in flight when the next fires,
-   * which is what gives the sky a continuous shimmer. */
+  /* New bursts fire before the previous one's sparks have died, so a few
+   * pops are always overlapping — that's what keeps the sky shimmering. */
   s->burst_interval = 1.8f;
   s->burst_count = 600;
-  s->burst_timer = 0.5f; /* first burst soon after switch */
+  s->burst_timer = 0.5f; /* fire the first burst soon after switching in */
   s->render_mode = RENDER_GLYPH;
   s->theme_id = 0; /* fire */
 }
@@ -1692,8 +1131,8 @@ static void preset_rainfall(Scene *s, int cols, int rows) {
   Emitter *em = &s->emitter;
   em->x = (float)pw(cols) * 0.5f;
   em->y = 0.0f;
-  em->angle = (float)M_PI * 0.5f; /* straight down  */
-  em->spread = 0.25f;             /* narrow cone    */
+  em->angle = (float)M_PI * 0.5f; /* falling straight down */
+  em->spread = 0.25f;             /* barely any spread     */
   em->speed_min = 180.0f;
   em->speed_max = 380.0f;
   em->life_min = 1.5f;
@@ -1702,7 +1141,7 @@ static void preset_rainfall(Scene *s, int cols, int rows) {
   em->density_max = 1.0f;
   em->rate = 45.0f;
   em->rate_accum = 0.0f;
-  em->spawn_width = (float)pw(cols); /* scatter across full top */
+  em->spawn_width = (float)pw(cols); /* born anywhere along the top edge */
   em->active = true;
 
   s->gravity = 280.0f;
@@ -1721,7 +1160,7 @@ static void preset_explosion(Scene *s, int cols, int rows) {
   em->x = (float)pw(cols) * 0.5f;
   em->y = (float)ph(rows) * 0.5f;
   em->angle = 0.0f;
-  em->spread = 2.0f * (float)M_PI; /* full 360° */
+  em->spread = 2.0f * (float)M_PI; /* blast out in every direction */
   em->speed_min = 40.0f;
   em->speed_max = 480.0f;
   em->life_min = 0.8f;
@@ -1746,7 +1185,8 @@ static void preset_explosion(Scene *s, int cols, int rows) {
 }
 
 static void preset_apply(Scene *s, int id, int cols, int rows) {
-  /* Reset burst timer so presets don't inherit stale countdown */
+  /* park the burst timer far out so a half-finished countdown from the old
+   * preset can't trigger a stray burst; each preset sets its own value */
   s->burst_timer = 9999.0f;
 
   switch (id) {
@@ -1768,7 +1208,7 @@ static void preset_apply(Scene *s, int id, int cols, int rows) {
   s->preset_id = id;
 }
 
-/* ── scene lifecycle ────────────────────────────────────────────────── */
+/* ── setting up and resetting the scene ── */
 
 static void scene_init(Scene *s, int cols, int rows) {
   memset(s, 0, sizeof *s);
@@ -1784,35 +1224,21 @@ static void scene_reset(Scene *s, int cols, int rows) {
   pool_clear();
   density_field_reset();
   s->simulation_time = 0.0f;
-  /* Re-apply current preset to reset emitter state */
+  /* reload the current preset to put the emitter back to defaults */
   preset_apply(s, s->preset_id, cols, rows);
 }
 
-/*
- * scene_tick() — advance the simulation by one fixed timestep.
- *
- * Called from the accumulator loop in §13.  dt is always exactly
- * 1.0 / sim_fps seconds.  The order of operations is important:
- *
- *   1. Emitter tick       — spawn new particles (fractional accumulator)
- *   2. Auto-burst timer   — fire periodic bursts
- *   3. update_particles   — forces → drag → integrate → age → trail
- *   4. handle_collisions  — enforce world boundaries
- *   5. Update stats       — particle_count, avg_vel, energy (for overlay)
- */
-/* ── Scene step helpers ──────────────────────────────────────────── */
+/* ── one simulation tick, broken into small steps ── */
 
-/* Advance the wall clock used by stats + the auto-burst timer. */
+/* Move the simulation's clock forward by one step. */
 static inline void scene_advance_clock(Scene *s, float dt) {
   s->dt_sec = dt;
   s->simulation_time += dt;
 }
 
-/* Run the spawn pipeline for one tick. Two parallel sources:
- *   CONTINUOUS: emitter_tick — floor(rate · dt) births with fractional carry.
- *   BURST     : auto-burst timer counts down; when it crosses 0 we
- *               fire spawn_burst(burst_count) and reload the timer.
- * Returns total particles spawned this tick (for the HUD). */
+/* Make whatever new particles this tick calls for: the steady stream from the
+ * emitter, plus an automatic burst if the burst timer just ran out. Returns
+ * the total spawned, for the stats panel. */
 static int scene_spawn_step(Scene *s, float dt) {
   int spawned = emitter_tick(&s->emitter, dt, s->theme_id);
 
@@ -1826,10 +1252,9 @@ static int scene_spawn_step(Scene *s, float dt) {
   return spawned;
 }
 
-/* One physics half-step: integrate every alive particle one symplectic
- * Euler step, then resolve boundary collisions. avg_velocity and
- * energy_estimate are written directly into the scene by
- * update_particles so the HUD picks them up next frame. */
+/* Move every particle one step, then bounce or kill the ones that hit an
+ * edge. The average-speed and energy numbers get written straight into the
+ * scene here so the stats panel can show them. */
 static inline void scene_physics_step(Scene *s, float dt, int cols, int rows) {
   update_particles(dt, s->gravity, s->drag_on, &s->avg_velocity,
                    &s->energy_estimate);
@@ -1837,21 +1262,13 @@ static inline void scene_physics_step(Scene *s, float dt, int cols, int rows) {
                     s->wall_kills);
 }
 
-/* Recount the live pool — exposed to HUD + overlay. avg_velocity and
- * energy_estimate are already in the scene from scene_physics_step;
- * this only updates the alive count. */
+/* Update the live particle count for the stats panel. */
 static inline void scene_measure_stats(Scene *s) {
   s->particle_count = pool_alive_count();
 }
 
-/* ── Driver — one simulation tick ────────────────────────────────── */
-
-/* Pseudocode:
- *   if paused                  → no-op
- *   scene_advance_clock        — dt_sec, simulation_time
- *   scene_spawn_step           — continuous + burst emission
- *   scene_physics_step         — forces → drag → integrate → collide
- *   scene_measure_stats        — alive count for the HUD */
+/* One full simulation step: do nothing if paused, otherwise advance the
+ * clock, spawn, move and collide everything, then refresh the stats. */
 static void scene_tick(Scene *s, float dt, int cols, int rows) {
   if (s->paused)
     return;
@@ -1862,15 +1279,10 @@ static void scene_tick(Scene *s, float dt, int cols, int rows) {
   scene_measure_stats(s);
 }
 
-/*
- * scene_draw() — render all particles and the overlay into WINDOW *w.
- *
- * alpha is the sub-tick interpolation factor ∈ [0,1).
- * For a pure particle system we could lerp positions by alpha * vel * dt,
- * but at 60 fps the visual difference is imperceptible for fast particles.
- * We accept alpha for API consistency and use it only to skip the render
- * while paused (alpha = 0 implies no progress to show).
- */
+/* Draw the whole scene into the given window: the particles first, then the
+ * stats panel on top. `alpha` (how far we are between physics steps) is taken
+ * for a consistent signature but isn't used — at 60 fps smoothing the
+ * positions with it makes no visible difference. */
 static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
                        float alpha, float dt_sec) {
   (void)alpha;
@@ -1884,20 +1296,11 @@ static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
                  s->theme_id, s->render_mode, s->paused);
 }
 
-/* ===================================================================== */
-/* §12 screen — ncurses double-buffer display layer                      */
-/* ===================================================================== */
+/* ── §12 screen — the ncurses display layer ── */
 
-/*
- * Screen — the ncurses display layer (identical to framework.c §7).
- *
- * FRAME SEQUENCE (one atomic write per frame):
- *   erase()              — blank newscr
- *   scene_draw()         — particle render + overlay
- *   key hint row         — always written last, always on top
- *   wnoutrefresh(stdscr) — mark newscr ready; no terminal I/O yet
- *   doupdate()           — ONE diff write to the terminal fd
- */
+/* Screen — the terminal display, the same setup the project's framework.c
+ * uses. Each frame is built up off-screen and then pushed out in one write,
+ * so the terminal never flickers. It just remembers the current size. */
 typedef struct {
   int cols;
   int rows;
@@ -1926,24 +1329,11 @@ static void screen_resize(Screen *s) {
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * screen_draw — two-layer HUD over the scene:
- *
- *   Row 0           STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
- *                   Refreshed every frame from live Scene state — the
- *                   "dynamic window" of simulation status: preset,
- *                   theme, render mode, alive count / capacity,
- *                   simulation time, fps, sim Hz, paused indicator.
- *                   Drag/gravity toggles also surface here.
- *   Row rows-1      KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
- *                   Every interactive key the demo accepts, grouped.
- *
- * Both rows are pre-filled with their pair colour so the coloured
- * background spans the full width regardless of text length, and
- * are drawn AFTER scene_draw so particles never bleed through the
- * HUD bars. The render_overlay panel inside scene_draw remains
- * untouched — it surfaces the longer detailed stats list.
- */
+/* Draw the two HUD bars over the scene: a live status line along the top
+ * (preset, theme, view, counts, timing, fps...) and a key-hint line along the
+ * bottom. Each bar is painted with a solid colour across the full width so it
+ * stays readable, and both go on after the particles so nothing bleeds
+ * through them. The detailed stats box is handled separately in scene_draw. */
 static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
                         float alpha, float dt_sec) {
   (void)dt_sec;
@@ -1952,7 +1342,7 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
 
   scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
-  /* ── Top row: dynamic status ─────────────────────────────── */
+  /* top bar: live status, rebuilt every frame */
   char status[200];
   snprintf(status, sizeof status,
            " PARTICLES   preset:%-9s  theme:%-6s  view:%-7s  "
@@ -1970,7 +1360,7 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
   mvprintw(0, 0, "%s", status);
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-  /* ── Bottom row: every interactive key ───────────────────── */
+  /* bottom bar: the full list of keys you can press */
   const char *hints = " q:quit  spc:pause  b:burst  e:emitter  g/G:grav  "
                       "d:drag  r:reset  p/P:preset  t:theme  v:view  ]/[:Hz ";
 
@@ -1987,9 +1377,7 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §13 app — signals, resize, input, main loop                           */
-/* ===================================================================== */
+/* ── §13 app — signals, resize, keyboard, and the main loop ── */
 
 typedef struct {
   Scene scene;
@@ -2013,26 +1401,19 @@ static void cleanup(void) { endwin(); }
 
 static void app_do_resize(App *app) {
   screen_resize(&app->screen);
-  /* Re-apply current preset so emitter positions use new dimensions */
+  /* reload the preset so the emitter snaps to the new screen size */
   preset_apply(&app->scene, app->scene.preset_id, app->screen.cols,
                app->screen.rows);
   app->need_resize = 0;
 }
 
-/*
- * app_handle_key() — all user input in one place.
- *
- * Returns false to signal quit; true to continue.
- * Controls are grouped by category:
- *   navigation (q/ESC/space), spawning (b/e), physics (g/G/d),
- *   simulation (r/p/P), visual (t/v), Hz (]/[).
- */
+/* Handle one keypress. Returns false only when it's time to quit. */
 static bool app_handle_key(App *app, int ch) {
   Scene *s = &app->scene;
   Screen *sc = &app->screen;
 
   switch (ch) {
-  /* ── quit / pause ──────────────────────────────────────────── */
+  /* quit / pause */
   case 'q':
   case 'Q':
   case 27:
@@ -2041,9 +1422,7 @@ static bool app_handle_key(App *app, int ch) {
     s->paused = !s->paused;
     break;
 
-  /* ── spawning ────────────────────────────────────────────────
-   * 'b' triggers an immediate burst regardless of emitter state.
-   * 'e' toggles the continuous emitter on/off.               */
+  /* 'b' fires a burst right now; 'e' turns the steady stream on or off */
   case 'b':
   case 'B':
     spawn_burst(&s->emitter, s->burst_count, s->theme_id);
@@ -2053,9 +1432,7 @@ static bool app_handle_key(App *app, int ch) {
     s->emitter.active = !s->emitter.active;
     break;
 
-  /* ── gravity ─────────────────────────────────────────────────
-   * 'g' increases gravity (heavier), 'G' decreases (lighter).
-   * Gravity can go to zero for zero-g particle clouds.       */
+  /* stronger / weaker gravity; can go all the way to zero for floaty clouds */
   case 'g':
     s->gravity += GRAVITY_STEP;
     if (s->gravity > GRAVITY_MAX)
@@ -2067,24 +1444,19 @@ static bool app_handle_key(App *app, int ch) {
       s->gravity = GRAVITY_MIN;
     break;
 
-  /* ── drag ────────────────────────────────────────────────────
-   * Toggling drag off lets particles travel in pure ballistic
-   * arcs — useful for visualising initial velocity directions. */
+  /* turn drag on/off; off lets particles fly in clean arcs */
   case 'd':
   case 'D':
     s->drag_on = !s->drag_on;
     break;
 
-  /* ── reset ───────────────────────────────────────────────────
-   * Clears all particles and resets the emitter to preset defaults. */
+  /* clear everything and start the current preset over */
   case 'r':
   case 'R':
     scene_reset(s, sc->cols, sc->rows);
     break;
 
-  /* ── cycle presets ───────────────────────────────────────────
-   * 'p' advances forward, 'P' goes backward through the 4 presets.
-   * Resets the particle pool so the new effect starts clean.  */
+  /* step to the next/previous preset, clearing the screen so it starts fresh */
   case 'p':
     pool_clear();
     density_field_reset();
@@ -2097,17 +1469,14 @@ static bool app_handle_key(App *app, int ch) {
                  sc->rows);
     break;
 
-  /* ── cycle themes ────────────────────────────────────────────
-   * No color pair reinitialisation needed — all 4×9 = 36 pairs
-   * were defined at startup.  Switching is zero-cost.        */
+  /* next colour theme — instant, since all the colours are already set up */
   case 't':
   case 'T':
     s->theme_id = (s->theme_id + 1) % N_THEMES;
     break;
 
-  /* ── cycle render modes ──────────────────────────────────────
-   * Switching modes is instant; no state to reset except the
-   * density grid which we clear to avoid a stale frame.      */
+  /* next view; clear the heat-map grid when switching to it so no old frame
+   * lingers */
   case 'v':
   case 'V':
     s->render_mode = (s->render_mode + 1) % RENDER_COUNT;
@@ -2115,9 +1484,7 @@ static bool app_handle_key(App *app, int ch) {
       density_field_reset();
     break;
 
-  /* ── simulation Hz ───────────────────────────────────────────
-   * Higher Hz = finer physics timestep = more accurate but
-   * more CPU.  Lower Hz = coarser but cheaper.               */
+  /* faster / slower physics updates: higher is smoother but uses more CPU */
   case ']':
     app->sim_fps += SIM_FPS_STEP;
     if (app->sim_fps > SIM_FPS_MAX)
@@ -2135,13 +1502,10 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
-/* ─────────────────────────────────────────────────────────────────────
- * main() — fixed-timestep accumulator game loop
- *
- * Identical in structure to framework.c main().  Only scene_*() calls
- * change between animations.  See framework.c §8 for a detailed
- * explanation of each loop phase.
- * ───────────────────────────────────────────────────────────────────── */
+/* The main loop. The physics runs at a steady rate no matter how fast the
+ * screen draws, and we draw as often as we can up to a frame cap. This is the
+ * same loop shape the project's framework.c uses; see there for the full
+ * walkthrough. */
 int main(void) {
   srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
   atexit(cleanup);
@@ -2165,24 +1529,23 @@ int main(void) {
 
   while (app->running) {
 
-    /* ── resize ──────────────────────────────────────────────── */
+    /* the window was resized — rebuild for the new size */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
       sim_accum = 0;
     }
 
-    /* ── dt ──────────────────────────────────────────────────── */
+    /* how long since the last frame */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
     if (dt > 100 * NS_PER_MS)
-      dt = 100 * NS_PER_MS; /* pause guard */
+      dt = 100 * NS_PER_MS; /* cap it, so a long pause can't fast-forward */
 
-    /* ── sim accumulator (fixed timestep) ────────────────────── *
-     * Physics always runs at exactly sim_fps Hz regardless of the
-     * render frame rate.  The leftover in sim_accum carries forward
-     * to the next frame — no time is ever lost or invented.      */
+    /* Run as many fixed-size physics steps as the elapsed time covers. Any
+     * leftover time is kept and used next frame, so the simulation stays in
+     * step with the clock no matter how often we draw. */
     int64_t tick_ns = TICK_NS(app->sim_fps);
     float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
 
@@ -2192,10 +1555,10 @@ int main(void) {
       sim_accum -= tick_ns;
     }
 
-    /* ── alpha — sub-tick render interpolation factor ─────────── */
+    /* how far we are between physics steps (handed to the renderer) */
     float alpha = (float)sim_accum / (float)tick_ns;
 
-    /* ── FPS counter (500 ms sliding window) ─────────────────── */
+    /* recompute the displayed fps every so often */
     frame_count++;
     fps_accum += dt;
     if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -2205,19 +1568,17 @@ int main(void) {
       fps_accum = 0;
     }
 
-    /* ── frame cap — sleep BEFORE render ─────────────────────── *
-     * Sleeping before render means terminal I/O time is NOT charged
-     * against the frame budget.  The next frame's dt measurement
-     * starts after the sleep ends, not after doupdate() returns.  */
+    /* Sleep to hit the frame cap, and do it before drawing so the time spent
+     * writing to the terminal isn't counted against the next frame's budget. */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / TARGET_FPS - elapsed);
 
-    /* ── draw + present ──────────────────────────────────────── */
+    /* draw the frame and push it to the terminal */
     screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps, alpha,
                 dt_sec);
     screen_present();
 
-    /* ── input ───────────────────────────────────────────────── */
+    /* handle one keypress, if any */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;

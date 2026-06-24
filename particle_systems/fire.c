@@ -1,433 +1,22 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * fire.c — three fire-simulation algorithms rendered into ASCII glyphs.
+ * fire.c — a flame that fills the terminal, painted in ASCII characters.
  *
- * DEMO
- * ────
- * A live flame fills the terminal.  Three completely different physics
- * engines take turns producing it: a cellular automaton, a pool of
- * Lagrangian particles, and a procedural plasma defined by three sine
- * harmonics.  Whichever engine fills the grid, the renderer is the
- * same — gamma-correct the heat values, dither them down with
- * Floyd-Steinberg error diffusion, and look up one of nine ramp
- * glyphs per cell.  Six tinted palettes recolour the flame without
- * touching the physics.  Wind shears the source arch.  Fuel intensity
- * raises or lowers the average flame top.
+ * Three completely different ways of making the fire take turns: a
+ * cellular automaton (the old Doom fire trick), a swarm of rising
+ * particles, and a procedural plasma built from sine waves.  All three
+ * just fill a grid of heat values; one shared renderer turns that heat
+ * into glyphs.  Press a key to swap engines, themes, wind, or fuel.
  *
- * Study alongside:
- *   particle_systems/particles.c       — broader particle-system patterns
- *   grids/rect_grids/01_uniform_rect.c — canonical Phase 3 reference file
+ * Doom fire trick: Sanglard, "How DOOM Fire Was Done" (fabiensanglard.net).
+ * Dithering: Floyd & Steinberg, "An adaptive algorithm for spatial gray
+ * scale" (Proc. SID 17/2, 1976).
  *
- * Section map
- * ───────────
- *   §1  includes        — system headers only (no project locals)
- *   §2  loop presets    — sim fps min/max, hud column width
- *   §3  source presets  — arch margin, fuel jitter, warmup ticks
- *   §4  ca presets      — Doom-CA decay tuning
- *   §5  particle presets— life, velocity, spawn, damping
- *   §6  plasma presets  — three sine harmonics
- *   §7  monotonic clock — clock_ns + sleep
- *   §8  ramp + lut      — 9 glyphs and their intensity thresholds
- *   §9  theme palettes  — six colour ramps (256-colour + 8-colour fall-back)
- *   §10 colour setup    — init_pair calls, HUD reserved pairs
- *   §11 grid storage    — Grid, FirePart, allocation, resize
- *   §12 shared helpers  — clampf, warmup, wind, arch, fuel-row seed, splat
- *   §13 algo 0  CA      — Doom-style cellular automaton
- *   §14 algo 1  particle— Lagrangian fire (FirePart pool + 3×3 Gaussian splat)
- *   §15 algo 2  plasma  — procedural fire from three sine harmonics
- *   §16 dispatch        — grid_tick switch on algo index
- *   §17 render pipeline — gamma → Floyd-Steinberg dither → ramp glyph
- *   §18 debug overlays  — d / D cycle through four diagnostic modes
- *   §19 scene           — owns grid + pause + needs_clear flag
- *   §20 screen + hud    — ncurses init, hud, key hint
- *   §21 application     — keys, signal handlers, main loop
- *
- * Keys
- * ────
- *   q / ESC   quit
- *   space     pause / resume
- *   a         next algorithm (CA → particle → plasma → CA)
- *   t         next theme (cycles six palettes)
- *   g / G     fuel intensity up / down
- *   w / W     wind right / left
- *   0         calm (no wind)
- *   [ / ]     sim Hz down / up
- *   d / D     next / previous debug overlay
- *
- * Build
- * ─────
  *   gcc -std=c11 -O2 -Wall -Wextra fire.c -o fire -lncurses -lm
  */
 
-/* ── HOW TO READ THIS FILE ────────────────────────────────────────────── *
- *
- * READING ORDER
- *   1. Read CONCEPTS for a one-paragraph answer per algorithm.
- *   2. Read MENTAL MODEL for the unified picture: three sources, one
- *      heat field, one renderer.  An ASCII diagram shows the data flow.
- *   3. Walk GUIDED TUTORIAL §1..§10 in order.  Each tutorial starts
- *      with a question, answers it in plain English, then sketches
- *      pseudocode.  By tutorial 10 you should be able to reimplement
- *      the file blindfolded.
- *   4. Now read code §1..§21.  Every section opens with a preamble
- *      explaining what it adds to the pipeline, and every non-trivial
- *      function carries Purpose / Pseudocode / Mental model / I/O
- *      blocks above its signature.
- *
- * NAMING CONVENTION
- *   Long descriptive names everywhere — `warmup_scale_factor`, not `ws`.
- *   Inside tight loops (≤ 5 lines, single concept) one-letter
- *   coordinates like `x` and `y` are acceptable because the surrounding
- *   context is one glance away.  All tunable constants use
- *   SCREAMING_SNAKE_CASE with a units comment on the same line.
- *
- * REQUIRED BACKGROUND
- *   • Basic C (structs, function pointers, calloc).
- *   • ncurses fundamentals (cell-based output, colour pairs, attributes).
- *   • Cartesian grids — the file treats screen as a (cols × rows) array
- *     where y = 0 is the top row and y = rows − 1 is the bottom row.
- *   No calculus is needed; the only trig used is sin().  Gamma
- *   correction and dithering are introduced from scratch in
- *   GUIDED TUTORIAL §8..§9.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm
- * ─────────
- * Three independent fire simulations share one output buffer:
- *   • Doom-style cellular automaton — bottom row holds maximum heat
- *     fuel; every cell above pulls its value from the row below with
- *     a lateral jitter of ±1 cell and a random per-cell decay.  Heat
- *     rises by diffusion; the flame top emerges where decay accumulates
- *     to equal the source value.
- *   • Lagrangian particles        — a fixed pool of FirePart structs.
- *     Each particle is born at the source arch with an upward velocity,
- *     rises, fades, and on render-time stamps a 3×3 Gaussian splat of
- *     heat onto the grid centred at its current position.
- *   • Procedural plasma           — no carry-over state between frames.
- *     For every column we compute a tongue height as the sum of three
- *     sine harmonics whose phase drifts in time, then shade cells below
- *     the tongue tip with a smooth gradient.
- *
- * Data structure
- * ──────────────
- * Grid::heat is a flat (cols × rows) float array in [0, MAX_HEAT].
- * One cell = one float = one temperature reading.  Grid::prev_heat
- * tracks the previous frame so cells that *were* lit but went cold
- * can be explicitly erased.  Grid::dither is a scratch buffer for
- * Floyd-Steinberg quantisation.  The particle pool is a fixed array
- * of MAX_FIRE_PARTS FirePart structs so the hot path performs no
- * runtime allocation.
- *
- * Rendering
- * ─────────
- * heat[i] → pow(heat[i], 1/2.2)             (perceptual gamma)
- *        → Floyd-Steinberg error diffusion  (visual smoothing)
- *        → 9-step LUT bucket index          (quantisation)
- *        → glyph from " .:+x*X#@"           (ramp character)
- *        → ncurses attribute = colour pair × bold/normal
- * Cells that are cold this frame but were lit last frame receive a
- * literal ' ' to wipe the stale character; cells that have been cold
- * for ≥ 2 frames are skipped entirely so the ncurses diff write stays
- * tiny.
- *
- * Performance
- * ───────────
- * • Allocation only at startup / resize.  Hot path is malloc-free.
- * • CA and plasma are O(cols × rows) per tick.  Particles add
- *   O(MAX_FIRE_PARTS) per tick — 800 entries is well under any sane
- *   terminal cell budget.
- * • Render runs at 60 fps; simulation runs at its own configurable
- *   Hz via a fixed-timestep accumulator.
- *
- * References
- * ──────────
- *   • Sanglard, Fabien.  "How DOOM Fire Was Done."  fabiensanglard.net,
- *     2014.  Reverse-engineering of the original 1993 CA algorithm.
- *   • Floyd, R. W. & Steinberg, L.  "An adaptive algorithm for spatial
- *     gray scale."  Proceedings of the SID, vol 17/2, 1976.  The
- *     canonical error-diffusion dithering paper.
- *   • Sims, Karl.  "Particle Animation and Rendering Using Data
- *     Parallel Computation."  Computer Graphics (SIGGRAPH), 1990.
- *   • Poynton, Charles.  Digital Video and HD: Algorithms and
- *     Interfaces, ch 24 "Gamma".  Morgan Kaufmann, 2003.
- *   • Quilez, Inigo.  "smoothstep" and related articles.
- *     iquilezles.org/articles.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Treat the terminal as a grid of thermometers.  Each tick, one of
- * three heaters writes a fresh temperature into every cell.  A single
- * renderer — shared by all three heaters — converts the temperature
- * grid into ASCII glyphs.  Because the renderer is shared, swapping
- * heaters is a one-line switch.  Everything you read in this file is
- * either a heater that fills the temperature grid or a renderer that
- * consumes it.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine an oven with the lid open.  Inside, thermometers cover every
- * grid cell.  Beneath the oven the cook can plug in one of three heat
- * sources.  Whichever source is plugged in, the thermometers all read
- * a fresh value each tick.  A photographer in the back room reads the
- * temperatures, converts them to glyphs, and prints the image:
- *
- *   +--------------- terminal cells ---------------+
- *   |  '.'  ' '  ' '  ' '  '.'  ' '  ' '  ' '      |   <- cool tops
- *   |  '+'  '.'  '.'  ':'  '+'  ':'  '.'  ' '      |
- *   |  'x'  '*'  '+'  'X'  '*'  '+'  '.'  ' '      |
- *   |  '#'  'X'  '*'  '@'  'X'  '*'  '+'  '.'      |   <- hot body
- *   |  '@'  '#'  'X'  '@'  '#'  'X'  '*'  '+'      |   <- fuel arch
- *   +-----^------------^-------------^-------------+
- *         |            |             |
- *   +------------+ +------------+ +------------+
- *   |  CA logic  | |  particle  | |   plasma   |
- *   |   (Doom)   | |  splatter  | |  sin wave  |
- *   +------------+ +------------+ +------------+
- *           Only one source is plugged in at a time.
- *           Thermometers + photographer never change.
- *
- * DRAWING METHOD  /  ALGORITHM IN STEPS
- * ─────────────────────────────────────
- *   Per-tick (one of three heaters; selected by Grid::algo):
- *     CA      : seed bottom row with arch-shaped fuel; for each cell
- *               from row 1 upward, pull heat from (y+1, x ± jitter)
- *               and subtract a random decay.
- *     Particle: advance every active particle (turbulence, velocity,
- *               heat decay); spawn new particles at the source arch;
- *               clear heat grid; for each active particle 3×3 splat
- *               its current heat onto the grid.
- *     Plasma  : advance plasma_t; for each column compute a tongue
- *               height = base + sum of three sine harmonics times
- *               fuel × warmup × sqrt(arch); for each row shade the
- *               cell from 1.0 at the base to 0 at the tongue tip.
- *
- *   Per-frame (shared by all heaters; runs in grid_draw):
- *     1. For every cell, gamma-correct: v = pow(heat / MAX_HEAT, 1/2.2).
- *     2. For every cell, Floyd-Steinberg quantise: bucket = lut_index(v);
- *        error = v − bucket_midpoint; push error onto four neighbours.
- *     3. Draw glyph k_ramp[bucket] with theme colour attribute.
- *     4. For every cell that was lit last frame but is cold now, draw
- *        a literal ' ' to erase it.
- *     5. Swap heat ↔ prev_heat so next frame can detect what changed.
- *
- * KEY FORMULAS
- * ────────────
- *   CA propagation:
- *     heat[y][x] = max(0, heat[y+1][x + jitter] − decay)
- *     decay      = MAX_HEAT / (rows × CA_REACH_FRAC) × (BASE + rand×RAND)
- *     so the expected flame top sits CA_REACH_FRAC of the way up.
- *
- *   Arch envelope (shared by every heater for the source):
- *     t    = (x − margin − wind_acc) / (cols − 2 × margin)   ∈ [0, 1]
- *     edge = min(t, 1 − t) × 2                               ∈ [0, 1]
- *     arch = edge²                                           peaked centre
- *
- *   3×3 Gaussian splat kernel (sum = 1):
- *       0.0625   0.125   0.0625
- *       0.125    0.25    0.125
- *       0.0625   0.125   0.0625
- *
- *   Plasma tongue:
- *     tongue(x, t) = 0.50
- *                  + 0.28 × sin(wx × 5  + t × 2.2)
- *                  + 0.18 × sin(wx × 11 − t × 1.6)
- *                  + 0.10 × sin(wx × 3  + t × 0.7)
- *     heat(x, y)   = clamp((y/rows − (1 − tongue)) / tongue, 0, 1)
- *
- *   Gamma + Floyd-Steinberg:
- *     v_perceptual = pow(v_linear, 1/2.2)
- *     error        = v_perceptual − lut_midpoint(bucket)
- *     error × 7/16 → right       error × 3/16 → down-left
- *     error × 5/16 → down        error × 1/16 → down-right
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Tiny terminals (rows < 5): the CA decay computed from height
- *     collapses to near zero — heat would never die out.  CA_DECAY_*_MIN
- *     floors the constants so the visual remains sensible on a 24-line
- *     window.
- *   • Particle pool saturation: at full warmup the spawn loop may
- *     exhaust the 800-entry pool.  The spawner walks up to
- *     MAX_FIRE_PARTS round-robin slots before giving up cleanly rather
- *     than overwriting active embers.
- *   • Plasma tongue overshoot: the three harmonics + base can sum to
- *     1.06 in the worst case (0.50 + 0.28 + 0.18 + 0.10).  The
- *     clampf(tongue, 0, 1) call inside the column loop keeps the
- *     per-row gradient sane.
- *   • Floyd-Steinberg leaking into cold cells: cold cells are tagged
- *     dither_buffer[i] = −1.  Each diffusion step guards `≥ 0` before
- *     adding, otherwise stray error would make cold cells flicker.
- *   • Wind wrap: wind_acc resets to 0 once |wind_acc| ≥ cols so the
- *     arch never drifts off-screen permanently.  At max wind ±3 the
- *     flame visibly snaps when it crosses the screen edge — acceptable
- *     in a demo, would need ring-buffer smoothing for production.
- *   • Algorithm switch: the renderer's previous frame is stale and
- *     glyphs from the old algorithm would linger.  Scene::needs_clear
- *     forces a single erase() on the next frame after 'a' or 't'.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Press 'a' while paused: the glyph layout changes shape entirely,
- *     yet the theme colour and ramp characters stay identical — proof
- *     that the renderer is decoupled from the heater.
- *   • Hold 'G' to drop fuel toward 0.10: the flame shrinks to ankle
- *     height within ~3 seconds.  Hold 'g' back up to 1.00: the flame
- *     regrows to roughly 75 % of the screen.
- *   • Press 'w' to add right wind: the arch base leans right and the
- *     entire flame slants in the same direction; '0' resets to vertical.
- *     At max wind ±3 the lean is visible within 5 ticks.
- *   • Press 'd': overlay 1 shows raw linear heat (no gamma, no dither) —
- *     coarse banding visible; overlay 2 shows gamma-corrected heat with
- *     no dither — banding shifted toward the highlights; overlay 3
- *     shows the arch envelope alone — confirms the source distribution.
- *   • Press 't' to cycle themes: the ramp glyph layout stays identical;
- *     only the colour tint shifts.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ──────────────────────────────────────────────────── *
- *
- * Ten short lessons that build the file from first principles.  Read in
- * order; each lesson assumes the previous one.
- *
- * TUTORIAL 1 — Why a heat field?
- * ──────────────────────────────
- * Fire on a CRT looks continuous, but a terminal can only paint cells.
- * If we tried to draw fire as moving glyphs we would get sparse sparks,
- * not the dense glowing body we expect.  The fix: store a real-valued
- * temperature per cell, then map each cell's temperature to a glyph
- * that resembles its intensity.  Temperatures live in [0, 1] where 0
- * is cold (space) and 1 is white-hot ('@').  Once we have such a heat
- * field, any physics that fills it works.
- *
- * TUTORIAL 2 — Three heaters, one output.
- * ───────────────────────────────────────
- * We provide three completely different ways to fill the heat field:
- *   • a cellular automaton modelled on the original Doom fire,
- *   • a pool of rising particles that splat heat onto the grid,
- *   • a procedural plasma defined by three sine harmonics.
- * The renderer below never inspects which heater filled the field; it
- * only reads cell heat values.  Why bother?  Because each heater
- * teaches a different physics paradigm — Eulerian grid, Lagrangian
- * particles, closed-form procedural — on a shared canvas.  Reading
- * all three side-by-side is the easiest way to feel the difference.
- *
- * TUTORIAL 3 — How does cellular-automaton fire work?
- * ───────────────────────────────────────────────────
- * Fabien Sanglard's reverse-engineering of Doom revealed a rule so
- * simple it fits in two lines:
- *     pulled_value  = heat[y + 1][x + random_jitter(-1, 0, +1)]
- *     heat[y][x]    = max(0, pulled_value − random_decay)
- * Apply this to every cell from bottom to top, with the bottom row
- * held permanently at maximum fuel.  Heat naturally flows upward
- * because each cell copies from the row below.  Each step loses a
- * little energy to the decay term, so by some height the heat reaches
- * zero — and that's where the flame top emerges.  The lateral jitter
- * spreads heat sideways and produces the characteristic licking
- * spires.
- *
- * TUTORIAL 4 — Why the lateral jitter?
- * ────────────────────────────────────
- * Drop the jitter (use x instead of x + rand{−1, 0, +1}) and the
- * flame becomes a set of vertical stripes — every column rises
- * straight up with no mixing.  Add the jitter and adjacent columns
- * exchange heat, which is what gives real flames their twisting
- * motion.  The "right amount" of jitter is exactly ±1 cell per step:
- * enough to mix neighbours, not enough to teleport heat across the
- * screen.
- *
- * TUTORIAL 5 — Where do particles fit?
- * ────────────────────────────────────
- * CA is Eulerian: the grid stays fixed, fluid quantities flow through
- * it.  Particles are Lagrangian: tiny tracers carry their own state
- * and move through space.  For fire, particles let us model individual
- * embers — each rises with its own velocity, decays independently,
- * and feels "turbulence" as random sideways nudges.  When it is time
- * to render, each particle stamps a 3×3 Gaussian blob of heat onto
- * the grid wherever it is.  Sum many particles and you get a dense
- * flame body.
- *
- * TUTORIAL 6 — The 3×3 Gaussian splat.
- * ────────────────────────────────────
- * A single particle that painted only its own cell would produce a
- * thin sparkly flame, not a filled body.  Instead, each particle
- * deposits its heat over a 3×3 neighbourhood using a discrete
- * Gaussian kernel:
- *     1/16   2/16   1/16        =       0.0625   0.125   0.0625
- *     2/16   4/16   2/16                0.125    0.25    0.125
- *     1/16   2/16   1/16                0.0625   0.125   0.0625
- * The kernel sums to 1, which means total deposited energy equals the
- * particle's heat — splatting is just smearing, not amplifying.  The
- * centre cell receives the most, the corners the least, which matches
- * what one would expect from a Gaussian point-spread.
- *
- * TUTORIAL 7 — Plasma without state.
- * ──────────────────────────────────
- * The plasma algorithm is the odd one out: it carries no information
- * between frames.  For every column x we compute a "tongue height":
- *     tongue(x, t) = base + a1 × sin(b1 × x + c1 × t)
- *                         + a2 × sin(b2 × x − c2 × t)
- *                         + a3 × sin(b3 × x + c3 × t)
- * then for every row y we shade cells below the tongue tip with a
- * smooth gradient from hot (base) to cold (tip).  The three sines
- * run at different spatial frequencies (5, 11, 3 cycles across the
- * screen) and different time speeds (+2.2, −1.6, +0.7), so the
- * tongues never repeat exactly and look organic.
- *
- * TUTORIAL 8 — Why gamma correction?
- * ──────────────────────────────────
- * Human eyes don't perceive brightness linearly: a heat value of 0.5
- * does *not* look halfway between 0 and 1.  We perceive luminance
- * roughly as the 2.2 power of physical intensity.  To make the ramp
- * progression look uniform, we apply pow(v, 1/2.2) before quantising.
- * Without gamma correction, the bottom of the ramp would look almost
- * identical between adjacent buckets, while the top would look like a
- * staircase.  Toggling the debug overlay shows the difference.
- *
- * TUTORIAL 9 — Floyd-Steinberg dithering.
- * ───────────────────────────────────────
- * With only nine ramp glyphs we cannot directly represent the
- * hundreds of distinct intensities present in a continuous heat
- * field.  Naive nearest-neighbour quantisation produces obvious
- * banding.  Dithering trades spatial detail for tonal detail: every
- * time we round a value to a ramp bucket, we measure the error
- * (rounded value − exact value) and push that error onto neighbouring
- * cells before they are quantised.  The neighbours absorb the error
- * and produce compensating high/low buckets, which the eye averages
- * back into a smooth gradient.  Floyd-Steinberg's weights — 7/16
- * right, 3/16 down-left, 5/16 down, 1/16 down-right — are the
- * canonical four-neighbour error distribution.
- *
- * TUTORIAL 10 — The borderless redraw trick.
- * ──────────────────────────────────────────
- * Calling erase() every frame would write a space to every cell, and
- * ncurses' diff would conclude that every cell changed.  Instead we
- * keep prev_heat alongside heat.  On the next frame:
- *   • If current and previous are both 0 → skip (no write).
- *   • If current > 0                    → draw the appropriate glyph.
- *   • If current == 0 but previous > 0  → write a single ' ' to erase.
- * Result: the only cells written each frame are the few that actually
- * changed, which keeps the ncurses doupdate() diff blazingly small.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ===================================================================== */
-/* §1  includes                                                           */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   System headers only.  This file deliberately includes no project-
- *   local header — every dependency must be either part of libc, math,
- *   or ncurses.  The _POSIX_C_SOURCE feature-test macro exposes
- *   clock_gettime() and nanosleep() from <time.h>.
- */
+/* ── §1  includes ── */
+/* The feature-test macro turns on clock_gettime() and nanosleep(). */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -441,17 +30,10 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §2  loop presets                                                       */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Tunable constants that govern the outer game loop.  The simulation
- *   advances at SIM_FPS_DEFAULT Hz initially; the user can bracket
- *   between SIM_FPS_MIN and SIM_FPS_MAX with [ and ].  Render is
- *   pinned to 60 fps inside main().  HUD_COLS bounds the width of the
- *   right-aligned status string so it never wraps.
- */
+/* ── §2  loop presets ── */
+/* Knobs for the outer loop. The picture redraws at a fixed 60 fps; the
+ * simulation runs at its own rate, which [ and ] adjust between the min
+ * and max below. */
 
 enum {
   SIM_FPS_MIN = 5,      /* lower bound for [/] cycling                */
@@ -474,80 +56,54 @@ enum {
 #define NS_PER_MS 1000000LL
 #define TICK_NS(hz) (NS_PER_SEC / (hz))
 
-/* ===================================================================== */
-/* §3  source presets                                                     */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Constants that shape the fuel source — the arch along the bottom
- *   row from which every algorithm draws heat.  ARCH_MARGIN_FRAC keeps
- *   the leftmost and rightmost ARCH_MARGIN_FRAC × cols cells cold,
- *   FUEL_JITTER_* adds per-cell randomness so the source line flickers,
- *   and WARMUP_TICKS ramps fuel from 0 to 1 over the first ~2.7 seconds
- *   of life so the flame builds gradually rather than popping into
- *   existence.
- */
+/* ── §3  source presets ── */
+/* These shape the fuel along the bottom row — the arch every engine
+ * draws heat from. The margins stay cold, a little randomness makes the
+ * base flicker, and the warmup count lets the flame build up instead of
+ * popping into existence at full size. */
 
-#define ARCH_MARGIN_FRAC 0.04f  /* 4 % of cols kept cold at each side       */
-#define FUEL_JITTER_BASE 0.82f  /* min random multiplier on fuel             */
-#define FUEL_JITTER_RANGE 0.18f /* additional random range 0 → 0.18 */
-#define WARMUP_TICKS 80 /* linear 0 → 1 over the first 80 ticks      */
+#define ARCH_MARGIN_FRAC 0.04f  /* fraction of width kept cold at each side  */
+#define FUEL_JITTER_BASE 0.82f  /* smallest random fuel multiplier           */
+#define FUEL_JITTER_RANGE 0.18f /* random amount added on top, 0 to 0.18     */
+#define WARMUP_TICKS 80 /* ticks to fade fuel from 0 up to full      */
 
-/* ===================================================================== */
-/* §4  ca presets                                                         */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Constants for algorithm 0 (Doom-style cellular automaton).
- *   CA_REACH_FRAC sets the target average flame height as a fraction of
- *   terminal rows; the per-tick decay is derived from this so the
- *   visual stays consistent across resolutions.  The _MIN floors keep
- *   tiny terminals (rows < 5) from collapsing the decay to zero.
- */
+/* ── §4  ca presets ── */
+/* Tuning for the Doom-style cellular automaton (engine 0). We aim the
+ * flame top at a chosen fraction of the screen height and work out how
+ * fast heat must fade to land there, so it looks the same on any size
+ * terminal. The floors stop a tiny window from fading to nothing. */
 
-#define CA_REACH_FRAC 0.75f /* expected flame peak at 75 % of rows       */
+#define CA_REACH_FRAC 0.75f /* aim the flame top at 75% of the height    */
 #define CA_DECAY_BASE_FRAC                                                     \
-  0.55f /* base decay   = avg_decay × this            */
+  0.55f /* steady part of the fade, as a share of avg  */
 #define CA_DECAY_RAND_FRAC                                                     \
-  0.90f /* random range = avg_decay × this            */
+  0.90f /* random part of the fade, as a share of avg  */
 #define CA_DECAY_BASE_MIN                                                      \
-  0.010f /* floor for tiny terminals                   */
+  0.010f /* smallest steady fade, for tiny terminals   */
 #define CA_DECAY_RAND_MIN                                                      \
-  0.015f /* floor for tiny terminals                   */
+  0.015f /* smallest random fade, for tiny terminals   */
 
-/* ===================================================================== */
-/* §5  particle presets                                                   */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Constants for algorithm 1 (Lagrangian particles).  PART_LIFE_*
- *   control how long each ember lives, PART_VY_* the initial upward
- *   thrust, PART_VX_SPREAD a tiny lateral kick at birth, PART_TURB_STEP
- *   a per-tick random nudge that produces flicker, and PART_VX_DAMP a
- *   damping factor so accumulated lateral drift decays.  SPAWN_PER_TICK
- *   is the equilibrium birth rate at full warmup.
- */
+/* ── §5  particle presets ── */
+/* Tuning for the rising-particle engine (engine 1). These set how long
+ * each ember lives, how fast it shoots up, a small sideways kick at
+ * birth, a random nudge each tick that makes it wander, how quickly
+ * sideways drift settles, and how many new embers appear per tick. */
 
-#define PART_LIFE_MIN 15.f   /* minimum lifetime, in ticks                 */
-#define PART_LIFE_RANGE 20.f /* uniform random range added on top          */
-#define PART_VY_BASE 0.5f    /* minimum upward speed (cells / tick)        */
-#define PART_VY_RANGE 0.8f   /* uniform random extra upward speed          */
-#define PART_VX_SPREAD 0.5f  /* width of birth lateral kick (±SPREAD/2)    */
-#define PART_TURB_STEP 0.15f /* per-tick random nudge on vx                */
-#define PART_VX_DAMP 0.96f   /* lateral damping per tick                   */
-#define SPAWN_PER_TICK 20    /* equilibrium birth rate at full warmup      */
+#define PART_LIFE_MIN 15.f   /* shortest ember lifetime, in ticks          */
+#define PART_LIFE_RANGE 20.f /* extra random lifetime added on top         */
+#define PART_VY_BASE 0.5f    /* slowest upward speed, cells per tick        */
+#define PART_VY_RANGE 0.8f   /* extra random upward speed                   */
+#define PART_VX_SPREAD 0.5f  /* size of the sideways kick at birth          */
+#define PART_TURB_STEP 0.15f /* random sideways nudge each tick             */
+#define PART_VX_DAMP 0.96f   /* how fast sideways drift settles each tick   */
+#define SPAWN_PER_TICK 20    /* new embers per tick once fully warmed up    */
 
-/* ===================================================================== */
-/* §6  plasma presets                                                     */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Constants for algorithm 2 (procedural plasma).  PLASMA_TIME_STEP is
- *   the per-tick advance of the internal phase counter.  PLASMA_BASE
- *   is the DC offset so the tongue is always positive.  H1/H2/H3 each
- *   contribute one sine harmonic.  XFREQ counts cycles across the
- *   screen, TSPD counts radians-per-tick of phase drift.
- */
+/* ── §6  plasma presets ── */
+/* Tuning for the sine-wave plasma engine (engine 2). TIME_STEP is how
+ * far the animation clock advances each tick. BASE keeps the flame
+ * height positive. The three H1/H2/H3 groups are three sine waves added
+ * together: AMP is the wave's strength, XFREQ how many ripples fit
+ * across the screen, TSPD how fast it drifts over time. */
 
 #define PLASMA_TIME_STEP 0.07f
 #define PLASMA_BASE 0.50f
@@ -561,45 +117,19 @@ enum {
 #define PLASMA_H3_XFREQ 3.0f
 #define PLASMA_H3_TSPD 0.7f
 
-/* ===================================================================== */
-/* §7  monotonic clock                                                    */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Two thin wrappers around CLOCK_MONOTONIC.  clock_ns() returns
- *   wall-clock nanoseconds since an arbitrary epoch; clock_sleep_ns()
- *   suspends the thread for a given duration.  Both are used by the
- *   main loop's fixed-timestep accumulator.
- */
+/* ── §7  monotonic clock ── */
+/* The loop's clock. We use the monotonic clock — a stopwatch that only
+ * counts forward and never jumps, even if someone resets the system
+ * time — so the animation never stutters. */
 
-/*
- * clock_ns() — read the monotonic clock in nanoseconds.
- *
- *   Purpose      : single source of time for the fixed-timestep loop.
- *   Pseudocode   : t ← clock_gettime(CLOCK_MONOTONIC); return t.sec * 1e9 +
- * t.nsec Mental model : a stopwatch that never resets and never jumps even when
- * the wall clock is adjusted by NTP. Inputs       : none Output       : int64_t
- * nanoseconds since an unspecified epoch Why it lives here: the simulation must
- * never depend on system time changes; CLOCK_MONOTONIC guarantees that.
- */
 static int64_t clock_ns(void) {
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
   return (int64_t)now.tv_sec * NS_PER_SEC + now.tv_nsec;
 }
 
-/*
- * clock_sleep_ns() — sleep for the given number of nanoseconds.
- *
- *   Purpose      : pace the render loop to 60 fps.
- *   Pseudocode   : if (ns ≤ 0) return; ts ← (ns/1e9, ns mod 1e9); nanosleep(ts)
- *   Mental model : a timed pause; the kernel returns control after at
- *                  least the requested duration has elapsed.
- *   Inputs       : ns — duration in nanoseconds (≤ 0 is a no-op)
- *   Output       : none
- *   Why it lives here: keeps sleep duration encapsulated so the main
- *                      loop reads as one line.
- */
+/* Pause for the given time so the loop holds 60 fps. A zero or negative
+ * request just returns. */
 static void clock_sleep_ns(int64_t ns) {
   if (ns <= 0)
     return;
@@ -607,31 +137,11 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §8  ramp + lut                                                         */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   The visual ramp.  k_ramp is the nine ASCII glyphs the renderer can
- *   pick from, ordered from cold-empty to hot-core.  k_lut_breaks is
- *   the gamma-corrected intensity threshold above which each glyph
- *   becomes the chosen bucket.  Breakpoints are clustered in the
- *   0.3 – 0.75 range because that is where the eye discriminates flame
- *   curvature most strongly.
- *
- *   Glyph chart:
- *
- *     index   glyph   threshold   meaning
- *       0      ' '      0.000      cold / empty
- *       1      '.'      0.080      faint ember glow
- *       2      ':'      0.180      low flame
- *       3      '+'      0.290      mid-low flame
- *       4      'x'      0.390      mid flame
- *       5      '*'      0.500      mid-high flame
- *       6      'X'      0.620      hot flame
- *       7      '#'      0.750      very hot
- *       8      '@'      0.900      peak core
- */
+/* ── §8  ramp + lut ── */
+/* The nine characters we paint with, coldest to hottest, plus the
+ * brightness cutoff at which each one kicks in. A space is cold/empty,
+ * '@' is the white-hot core. The cutoffs bunch up in the middle because
+ * that is where the eye notices flame detail most. */
 
 static const char k_ramp[] = " .:+x*X#@";
 #define RAMP_N (int)(sizeof k_ramp - 1) /* 9 visible glyphs */
@@ -648,18 +158,8 @@ static const float k_lut_breaks[RAMP_N] = {
     0.900f, /* '@'  core      */
 };
 
-/*
- * lut_index() — gamma-corrected intensity → ramp bucket [0..RAMP_N-1].
- *
- *   Purpose      : pick the right glyph for a given perceptual heat.
- *   Pseudocode   : scan thresholds from top to bottom;
- *                  return the highest bucket whose threshold ≤ v.
- *   Mental model : staircase function: each step is one glyph wide.
- *   Inputs       : v — gamma-corrected heat in [0, 1]
- *   Output       : int in [0, RAMP_N-1]
- *   Why it lives here: the only spot that maps continuous heat to
- *                      discrete glyphs; centralises the staircase.
- */
+/* Pick which of the nine characters fits a brightness in [0,1]: return
+ * the highest one whose cutoff it clears. */
 static int lut_index(float v) {
   int bucket = 0;
   for (int i = RAMP_N - 1; i >= 0; i--)
@@ -670,20 +170,9 @@ static int lut_index(float v) {
   return bucket;
 }
 
-/*
- * lut_midpoint() — representative intensity of bucket idx.
- *
- *   Purpose      : compute the dither error for a quantised cell.
- *   Pseudocode   : if idx == 0       return 0
- *                  if idx == RAMP_N-1 return 1
- *                  else                return (break[idx] + break[idx+1]) / 2
- *   Mental model : "what would v have been if it sat exactly in this
- *                   bucket?"  The error is v − midpoint.
- *   Inputs       : idx — bucket index
- *   Output       : float midpoint intensity in [0, 1]
- *   Why it lives here: Floyd-Steinberg needs a representative value
- *                      per bucket to compute the error to diffuse.
- */
+/* The "typical" brightness a character stands for — the middle of its
+ * range. Dithering compares the real value against this to find how much
+ * rounding error to spread around. */
 static float lut_midpoint(int idx) {
   if (idx <= 0)
     return 0.f;
@@ -692,28 +181,22 @@ static float lut_midpoint(int idx) {
   return (k_lut_breaks[idx] + k_lut_breaks[idx + 1]) * 0.5f;
 }
 
-/* ===================================================================== */
-/* §9  theme palettes                                                     */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Six fire palettes.  Each palette assigns one foreground colour per
- *   ramp index.  Design constraints:
- *
- *     • The lowest entries (indices 0-2) sit in the visible-but-faint
- *       range so flame wisps stay readable.  No near-black entries
- *       (xterm 232-236) — they vanish on default dark terminals.
- *     • The highest entries (indices 7-8) burn near-white so the flame
- *       core punches through any background.
- *     • The 8-colour fallback uses base ANSI colours plus A_DIM/A_BOLD
- *       attributes to approximate the gradient on minimal terminals.
- */
+/* ── §9  theme palettes ── */
+/* Six colour schemes for the flame. Each one gives a colour to every
+ * character in the ramp. The faint end stays bright enough to read (no
+ * near-black, which vanishes on dark terminals) and the hot end is
+ * near-white so the core always stands out. Old terminals that only have
+ * eight colours fall back to a coarser version. */
 
+/* One colour scheme. For each of the nine ramp characters it stores the
+ * colour to use, both as a full 256-colour value and as a basic
+ * eight-colour fallback with a dim/normal/bold tweak to fake the
+ * in-between shades. */
 typedef struct {
-  const char *name;
-  int fg256[RAMP_N];    /* xterm 256-colour indices, per bucket */
-  int fg8[RAMP_N];      /* 8-colour fallback                    */
-  attr_t attr8[RAMP_N]; /* fallback attribute (DIM/NORMAL/BOLD) */
+  const char *name;     /* scheme name shown in the HUD             */
+  int fg256[RAMP_N];    /* colour per character, 256-colour palette */
+  int fg8[RAMP_N];      /* colour per character, basic 8-colour set */
+  attr_t attr8[RAMP_N]; /* dim/normal/bold tweak for the 8-colour set */
 } FireTheme;
 
 #define CP_BASE 1 /* ramp pairs: CP_BASE .. CP_BASE+RAMP_N-1 */
@@ -769,30 +252,13 @@ static const FireTheme k_themes[] = {
 
 #define THEME_COUNT (int)(sizeof k_themes / sizeof k_themes[0])
 
-/* ===================================================================== */
-/* §10 colour setup                                                       */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   ncurses pair registration.  theme_apply() rewrites the ramp pairs
- *   for the requested theme; it is called from color_init() and again
- *   whenever the user cycles themes with 't'.  PAIR_HUD and PAIR_HINT
- *   are registered exactly once and never touched by theme_apply, so
- *   HUD legibility is independent of the active palette.
- */
+/* ── §10 colour setup ── */
+/* Tells ncurses which colours to use. The flame colours are re-pointed
+ * whenever the user cycles themes, but the HUD colours are set once and
+ * left alone, so the readout stays legible no matter the theme. */
 
-/*
- * theme_apply() — rewrite ramp colour pairs CP_BASE..CP_BASE+RAMP_N-1.
- *
- *   Purpose      : swap the flame's tint without changing HUD pairs.
- *   Pseudocode   : for i in 0..RAMP_N-1:
- *                      init_pair(CP_BASE + i, theme.fg[i], COLOR_BLACK)
- *   Mental model : a single palette swap on the ramp; HUD stays put.
- *   Inputs       : theme_index — which entry of k_themes to apply
- *   Output       : ncurses pair table mutated in place
- *   Why it lives here: separation of concerns — theme_apply touches
- *                      only ramp pairs, color_init also touches HUD pairs.
- */
+/* Re-point the flame's colours to the chosen theme. Leaves the HUD
+ * colours untouched. */
 static void theme_apply(int theme_index) {
   const FireTheme *theme = &k_themes[theme_index];
   for (int i = 0; i < RAMP_N; i++) {
@@ -803,23 +269,8 @@ static void theme_apply(int theme_index) {
   }
 }
 
-/*
- * color_init() — one-time colour setup at program start.
- *
- *   Purpose      : register ramp pairs for the initial theme plus the
- *                  two HUD pairs that persist for the program's life.
- *   Pseudocode   : start_color();
- *                  theme_apply(initial_theme);
- *                  init_pair(PAIR_HUD,  bright_yellow, black);
- *                  init_pair(PAIR_HINT, bright_cyan,   black);
- *   Mental model : a paint-store opening — all the dye buckets get
- *                  filled once at the start of the day.
- *   Inputs       : initial_theme — index into k_themes for first frame
- *   Output       : ncurses pair table populated
- *   Why it lives here: HUD pairs must be initialised once and survive
- *                      every subsequent theme cycle, so this is the
- *                      one function that must touch them.
- */
+/* One-time colour setup at startup: load the first theme's flame colours
+ * and the two HUD colours, which then stay fixed for the whole run. */
 static void color_init(int initial_theme) {
   start_color();
   theme_apply(initial_theme);
@@ -833,24 +284,10 @@ static void color_init(int initial_theme) {
   }
 }
 
-/*
- * ramp_attr() — combine a ramp colour pair with theme-specific attrs.
- *
- *   Purpose      : produce the ncurses attribute to pass to attron().
- *   Pseudocode   : a ← COLOR_PAIR(CP_BASE + idx)
- *                  if COLORS ≥ 256 and idx ≥ RAMP_N-2: a |= A_BOLD
- *                  else:                                a |= theme.attr8[idx]
- *                  return a
- *   Mental model : in 256-colour mode the colour itself is bright
- *                  enough, so we only bold the top two buckets.  In
- *                  8-colour mode the theme's attr8 array does the
- *                  dim/normal/bold work.
- *   Inputs       : idx          — ramp bucket index
- *                  theme_index  — which palette is active (for attr8)
- *   Output       : attr_t suitable for attron / attroff
- *   Why it lives here: keeps the per-bucket attribute decision in one
- *                      spot, so the renderer reads as one line.
- */
+/* The full drawing style for one ramp character: its colour plus a bold
+ * touch. With 256 colours the colour is vivid enough on its own, so only
+ * the two hottest characters get bolded; with eight colours the theme's
+ * dim/normal/bold table fills in the missing shades. */
 static attr_t ramp_attr(int idx, int theme_index) {
   attr_t attr = COLOR_PAIR(CP_BASE + idx);
   if (COLORS >= 256) {
@@ -862,70 +299,67 @@ static attr_t ramp_attr(int idx, int theme_index) {
   return attr;
 }
 
-/* ===================================================================== */
-/* §11 grid storage                                                       */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Persistent simulation state.  FirePart is one Lagrangian particle;
- *   the Grid owns three float buffers (current heat, previous heat,
- *   dither scratch), the algorithm-selector, the user-controlled
- *   wind/fuel knobs, and the entire particle pool inline (no pointer
- *   chasing in the hot path).
- */
+/* ── §11 grid storage ── */
+/* The simulation's lasting state. The Grid holds the heat values and the
+ * user's wind/fuel/theme choices; FirePart is one ember used by the
+ * particle engine. The whole ember pool lives inside the Grid so the hot
+ * loop never has to chase a pointer or allocate memory. */
 
-/*
- * FirePart — one short-lived ember in algorithm 1.
- *
- *   Born at the source arch, drifts upward, heat fades by `decay` per
- *   tick.  The renderer reads heat × kernel for each splat.  active=false
- *   slots are recycled by fire_part_spawn().
+/* One short-lived ember in the particle engine. It is born at the base,
+ * floats up, and its heat fades a little every tick until it burns out.
+ *   x, y    where the ember is, in grid cells
+ *   vx, vy  how fast it is moving, in cells per tick; negative vy is up
+ *   heat    how hot it glows right now, from 1 down toward 0
+ *   decay   how much heat it loses each tick (1 / lifetime)
+ *   active  false means this slot is free for a new ember
  */
 typedef struct {
-  float x, y;   /* current position in grid-cell coordinates           */
-  float vx, vy; /* velocity in cells / tick; vy < 0 = upward            */
-  float heat;   /* current heat, fades from 1 toward 0                  */
-  float decay;  /* heat lost per tick (= 1 / lifetime)                  */
-  bool active;  /* false slots are available for re-spawning            */
+  float x, y;
+  float vx, vy;
+  float heat;
+  float decay;
+  bool active;
 } FirePart;
 
-/*
- * Grid — all algorithm state in one struct.
- *
- *   Buffers are flat (cols * rows) float arrays, indexed [y * cols + x].
- *   Row 0 is the top of the terminal; row (rows - 1) holds fuel.
- *   The particle pool is inline rather than a pointer so resize() never
- *   has to relocate it.
+/* Everything the simulation needs in one place. The three buffers are
+ * flat arrays the size of the screen, read as [y * cols + x]; row 0 is
+ * the top of the terminal and the last row is the fuel line. The ember
+ * pool sits inline so a resize never has to move it.
+ *   heat       this frame's temperature for every cell, 0 to MAX_HEAT
+ *   prev_heat  last frame's temperature, used to tell what changed
+ *   dither     scratch space for the dithering pass
+ *   cols, rows grid size in cells
+ *   fuel       how strong the fire is, user-set, 0.1 to 1.0
+ *   wind       sideways push the user sets, -WIND_MAX to WIND_MAX
+ *   wind_acc   running sideways offset the arch has drifted so far
+ *   theme      which colour scheme is active
+ *   warmup     counts up to WARMUP_TICKS then stops; fades the fire in
+ *   algo       which engine is running (0 CA, 1 particle, 2 plasma)
+ *   plasma_t   the plasma engine's animation clock
+ *   parts      the fixed pool of embers
+ *   part_idx   where the spawner last looked for a free ember slot
  */
 typedef struct {
-  float *heat;      /* [rows × cols] current heat                   */
-  float *prev_heat; /* [rows × cols] last frame's heat              */
-  float *dither;    /* [rows × cols] FS scratch buffer              */
+  float *heat;
+  float *prev_heat;
+  float *dither;
   int cols, rows;
 
-  float fuel;     /* user-controlled fuel intensity in [0.1, 1.0] */
-  int wind;       /* user-controlled wind in [-WIND_MAX, WIND_MAX] */
-  int wind_acc;   /* accumulated wind offset for arch shifting    */
-  int theme;      /* index into k_themes                          */
-  int warmup;     /* counts up 0 → WARMUP_TICKS, then sticks      */
-  int algo;       /* 0=CA   1=Particle   2=Plasma                 */
-  float plasma_t; /* plasma phase counter, advanced each tick     */
+  float fuel;
+  int wind;
+  int wind_acc;
+  int theme;
+  int warmup;
+  int algo;
+  float plasma_t;
 
   FirePart parts[MAX_FIRE_PARTS];
-  int part_idx; /* round-robin spawn cursor                     */
+  int part_idx;
 } Grid;
 
-/*
- * grid_alloc() — allocate the three heat buffers for the given size.
- *
- *   Purpose      : reserve memory once at startup / resize.
- *   Pseudocode   : record cols, rows; calloc three buffers of cols*rows.
- *   Mental model : pour concrete for three slabs of identical shape.
- *   Inputs       : grid pointer, cols, rows
- *   Output       : grid->heat, prev_heat, dither point to zeroed memory
- *   Why it lives here: keeps allocation in one spot; the hot path is
- *                      malloc-free as required by project guidelines.
- */
+/* Reserve the three screen-sized buffers, zeroed. Called once at startup
+ * and again on resize, so the running loop never allocates. The caller
+ * owns this memory and must free it with grid_free(). */
 static void grid_alloc(Grid *grid, int cols, int rows) {
   grid->cols = cols;
   grid->rows = rows;
@@ -934,12 +368,7 @@ static void grid_alloc(Grid *grid, int cols, int rows) {
   grid->dither = calloc((size_t)(cols * rows), sizeof(float));
 }
 
-/*
- * grid_free() — release the three heat buffers.
- *
- *   Pseudocode   : free three buffers; zero the struct.
- *   Mental model : demolish the three slabs, level the lot.
- */
+/* Give back the three buffers and blank the struct. */
 static void grid_free(Grid *grid) {
   free(grid->heat);
   free(grid->prev_heat);
@@ -947,26 +376,15 @@ static void grid_free(Grid *grid) {
   memset(grid, 0, sizeof *grid);
 }
 
-/*
- * grid_resize() — free and re-allocate at new dimensions.
- *
- *   Pseudocode   : free; alloc with new size.
- *   Mental model : terminal resize blows the world away — the next
- *                  tick repopulates from fresh fuel + warmup ramp.
- */
+/* Throw away the old buffers and make new ones at the new size. The fire
+ * starts over from cold; the next ticks rebuild it. */
 static void grid_resize(Grid *grid, int cols, int rows) {
   grid_free(grid);
   grid_alloc(grid, cols, rows);
 }
 
-/*
- * grid_init() — first-time setup at program start.
- *
- *   Pseudocode   : alloc; set fuel=1, wind=0, theme=given, warmup=0,
- *                  algo=0 (CA), plasma_t=0, part_idx=0.
- *   Mental model : factory defaults: classic Doom fire, full fuel,
- *                  no wind, starting from cold.
- */
+/* First-time setup: allocate, then set the starting defaults — classic
+ * Doom fire, full fuel, no wind, starting from cold. */
 static void grid_init(Grid *grid, int cols, int rows, int theme) {
   grid_alloc(grid, cols, rows);
   grid->fuel = 1.0f;
@@ -979,22 +397,11 @@ static void grid_init(Grid *grid, int cols, int rows, int theme) {
   grid->part_idx = 0;
 }
 
-/* ===================================================================== */
-/* §12 shared helpers                                                     */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Helpers used by more than one algorithm.  Every fire algorithm
- *   wants:
- *     • a clampf() for saturating arithmetic,
- *     • a warmup_scale_factor() that grows from 0 to 1 over the first
- *       WARMUP_TICKS so the flame doesn't pop into existence,
- *     • a wind accumulator that wraps at ±cols so the arch never drifts
- *       off-screen permanently,
- *     • an arch_envelope() that describes the source distribution along
- *       the bottom row.
- *   Algorithm 0 and 1 additionally use seed_fuel_row() / splat3x3().
- */
+/* ── §12 shared helpers ── */
+/* Little tools that more than one engine reaches for: clamping numbers
+ * to a range, the fade-in counter, the sideways drift of the fuel arch,
+ * the bell shape of the fuel along the bottom, and the routines that
+ * seed fuel and stamp a soft blob of heat. */
 
 static inline float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
@@ -1004,37 +411,19 @@ static inline int clamp_int(int v, int lo, int hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/*
- * Named random primitives.  Every algorithm below uses these instead of
- * raw rand() expressions, so the reader can tell what the value MEANS
- * (a unit interval sample, a centred kick, a one-cell jitter) without
- * decoding the arithmetic.
- *
- *   rand_unit()           — uniform sample in [0, 1)
- *   rand_signed_unit()    — uniform sample in [-0.5, 0.5)
- *   rand_lateral_jitter() — uniform integer in {-1, 0, +1}
+/* Named random helpers, so the engines can say what a random value means
+ * instead of spelling out rand() arithmetic:
+ *   rand_unit()           — a random number from 0 up to 1
+ *   rand_signed_unit()    — a random number from -0.5 up to 0.5
+ *   rand_lateral_jitter() — a random one-cell nudge: -1, 0, or +1
  */
 static inline float rand_unit(void) { return (float)rand() / RAND_MAX; }
 static inline float rand_signed_unit(void) { return rand_unit() - 0.5f; }
 static inline int rand_lateral_jitter(void) { return (rand() % 3) - 1; }
 
-/*
- * warmup_scale_factor() — 0 → 1 ramp over the first WARMUP_TICKS ticks.
- *
- *   Purpose      : prevent a sudden flame pop at program start /
- *                  algorithm switch.
- *   Pseudocode   : if grid->warmup < WARMUP_TICKS:
- *                      scale ← warmup / WARMUP_TICKS
- *                      warmup++
- *                  else:
- *                      scale ← 1
- *                  return scale
- *   Mental model : a dimmer knob being turned up steadily.
- *   Inputs       : grid (read warmup; possibly increment)
- *   Output       : float in [0, 1]
- *   Why it lives here: every algorithm needs the same ramp behaviour,
- *                      so the counter and the formula live together.
- */
+/* A fade-in dial that climbs from 0 to 1 over the first WARMUP_TICKS
+ * ticks, so the fire builds up instead of popping in. Also ticks the
+ * counter forward, so call it once per frame. */
 static float warmup_scale_factor(Grid *grid) {
   float scale = (grid->warmup < WARMUP_TICKS)
                     ? (float)grid->warmup / (float)WARMUP_TICKS
@@ -1044,45 +433,18 @@ static float warmup_scale_factor(Grid *grid) {
   return scale;
 }
 
-/*
- * advance_wind() — shift wind_acc by one tick's worth of wind.
- *
- *   Purpose      : translate the source arch left or right over time.
- *   Pseudocode   : grid->wind_acc += grid->wind
- *                  if |wind_acc| ≥ cols: wind_acc ← 0   (wrap)
- *   Mental model : a conveyor belt under the source arch, moving the
- *                  whole flame sideways.
- *   Inputs       : grid (mutated)
- *   Output       : none
- *   Why it lives here: every algorithm passes wind_acc to arch_envelope,
- *                      so the accumulator lives in one place.
- */
+/* Slide the fuel arch sideways by one tick of wind. It snaps back to
+ * centre once it has drifted a full screen width, so the fire never
+ * wanders off and stays gone. */
 static void advance_wind(Grid *grid) {
   grid->wind_acc += grid->wind;
   if (grid->wind_acc >= grid->cols || grid->wind_acc <= -grid->cols)
     grid->wind_acc = 0;
 }
 
-/*
- * arch_envelope() — bell-shaped weight along the bottom row.
- *
- *   Purpose      : describe how strongly each column is fuelled.
- *   Pseudocode   : margin ← cols × ARCH_MARGIN_FRAC
- *                  span   ← cols − 2 × margin
- *                  shifted ← x − margin − wind_acc
- *                  t      ← shifted / span
- *                  if t outside [0, 1]: return 0
- *                  edge   ← min(t, 1 − t) × 2
- *                  return edge²
- *   Mental model : a squared triangular hat function: zero at the
- *                  margins, 1.0 at the centre, sharper rolloff than a
- *                  cosine.
- *   Inputs       : x         — column index
- *                  cols      — terminal width in cells
- *                  wind_acc  — current wind offset
- *   Output       : float weight in [0, 1]
- *   Why it lives here: shared by every algorithm's source step.
- */
+/* How much fuel a given column gets: a hump that is zero at the cold
+ * margins, full in the middle, and falls off smoothly toward the edges.
+ * The hump slides with the wind. Returns a weight from 0 to 1. */
 static float arch_envelope(int x, int cols, int wind_acc) {
   float margin = (float)cols * ARCH_MARGIN_FRAC;
   float span = (float)cols - 2.f * margin;
@@ -1095,23 +457,10 @@ static float arch_envelope(int x, int cols, int wind_acc) {
   return weight * weight;
 }
 
-/*
- * seed_fuel_row() — write arch-shaped fuel into the bottom row.
- *
- *   Purpose      : provide the source for the CA algorithm (also used
- *                  to seed the plasma's per-column gradient indirectly).
- *   Pseudocode   : for every column x:
- *                      a ← arch_envelope(x)
- *                      if a == 0: cell ← 0, continue
- *                      jitter ← BASE + RANGE × rand()
- *                      cell  ← MAX_HEAT × fuel × a × jitter × warmup
- *   Mental model : a row of gas burners, each set to its own knob.
- *   Inputs       : grid, warmup_scale
- *   Output       : grid->heat bottom row mutated
- *   Why it lives here: bottom row seeding is the only place an
- *                      algorithm explicitly touches the source, so it
- *                      is centralised.
- */
+/* Lay down the hump of fuel along the bottom row — think a row of gas
+ * burners, each turned up by the arch shape, the fuel knob, the warmup
+ * fade, and a little random flicker. This is the heat the CA engine
+ * draws upward from. */
 static void seed_fuel_row(Grid *grid, float warmup_scale) {
   int cols = grid->cols;
   int fuel_y = grid->rows - 1;
@@ -1131,23 +480,10 @@ static void seed_fuel_row(Grid *grid, float warmup_scale) {
   }
 }
 
-/*
- * splat3x3() — deposit value v over a 3×3 Gaussian kernel.
- *
- *   Purpose      : translate one particle's heat into nine cell
- *                  contributions.
- *   Pseudocode   : kernel ←  0.0625 0.125 0.0625
- *                            0.125  0.25  0.125
- *                            0.0625 0.125 0.0625
- *                  for dy in -1..1, dx in -1..1:
- *                      if (cx+dx, cy+dy) is in-bounds:
- *                          heat[cy+dy][cx+dx] += v * kernel[dy+1][dx+1]
- *   Mental model : stamp a tiny Gaussian heat blob centred on (cx, cy).
- *   Inputs       : heat array, cols, rows, centre (cx, cy), value v
- *   Output       : heat array mutated additively
- *   Why it lives here: shared with future splat-based effects; also
- *                      neatly encapsulates the kernel constants.
- */
+/* Stamp a soft 3x3 blob of heat centred on a cell: the middle gets the
+ * most, the corners the least, and the nine weights add up to 1 so the
+ * blob spreads the heat without inventing any extra. Adds to whatever is
+ * already there. Used to paint each rising ember. */
 static void splat3x3(float *heat_grid, int cols, int rows, int cx, int cy,
                      float v) {
   static const float kernel[3][3] = {
@@ -1164,37 +500,20 @@ static void splat3x3(float *heat_grid, int cols, int rows, int cx, int cy,
   }
 }
 
-/* ===================================================================== */
-/* §13 algo 0 — Doom CA fire                                              */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   The first algorithm: a cellular automaton modelled after the fire
- *   effect in Doom (1993).  Every tick the bottom row is reset to a
- *   fresh arch-shaped fuel pattern; every other row pulls its value
- *   from the row below, with a ±1 lateral jitter and a random per-cell
- *   decay.  See GUIDED TUTORIAL §3 for the derivation; this section is
- *   the literal implementation.
- *
- *   The decay is computed adaptively from screen height so that the
- *   expected flame top sits at CA_REACH_FRAC × rows regardless of the
- *   user's terminal size.
- */
+/* ── §13 algo 0 — Doom CA fire ── */
+/* Engine 0: the cellular automaton from Doom (1993). Each tick refreshes
+ * the fuel along the bottom, then every cell above copies heat from the
+ * cell below it (shifted a random step left or right) minus a little
+ * fade. Heat drifts upward and dies out near the top. The fade is sized
+ * to the screen so the flame reaches the same relative height on any
+ * terminal. */
 
-/*
- * ca_compute_adaptive_decay() — pick base + range so the flame's mean
- * peak lands at CA_REACH_FRAC × rows.
- *
- *   Reasoning:
- *      "average decay per step" × "steps from base to peak" ≈ MAX_HEAT
- *      so   avg_decay ≈ MAX_HEAT / (rows × CA_REACH_FRAC)
- *      then base and range are fixed fractions of avg_decay,
- *      with a floor for tiny terminals (rows < 5).
- *
- *   Outputs:
- *      *decay_base, *decay_range — used in the propagation loop as
- *      decay = base + rand_unit() × range.
- */
+/* Work out how fast heat must fade per step so the flame top lands near
+ * the target height. Roughly: fade-per-step times steps-to-the-top
+ * should use up all the heat, so fade ~= full heat / number of rows it
+ * should climb. Hands back a steady part and a random part via the two
+ * out-pointers; the propagation loop adds them as
+ * fade = base + random * range. Floored so tiny terminals still work. */
 static void ca_compute_adaptive_decay(int rows, float *decay_base_out,
                                       float *decay_range_out) {
   float reach_height_in_rows = (float)rows * CA_REACH_FRAC;
@@ -1213,19 +532,10 @@ static void ca_compute_adaptive_decay(int rows, float *decay_base_out,
   *decay_range_out = decay_range;
 }
 
-/*
- * ca_propagate_one_cell() — one cell's value from the row below.
- *
- *   The five labelled intermediates mirror the algorithm in steps:
- *     lateral_offset    ← random {-1, 0, +1}   (mixing in x)
- *     source_column     ← x + lateral_offset   (clamped to grid)
- *     source_heat       ← heat[y+1][source_column]
- *     energy_lost       ← decay_base + rand_unit() × decay_range
- *     propagated_heat   ← max(0, source_heat − energy_lost)
- *
- *   Returning the new value (rather than mutating in place) keeps the
- *   inner loop a single assignment.
- */
+/* The heart of the Doom trick: a cell's new heat is the heat from the
+ * cell just below — nudged one step left, right, or not at all — minus a
+ * little random fade, never going below zero. The sideways nudge is what
+ * makes the flames lick and twist instead of rising in straight stripes. */
 static float ca_propagate_one_cell(const float *heat_grid, int cols, int x,
                                    int y, float decay_base, float decay_range) {
   int lateral_offset = rand_lateral_jitter();
@@ -1236,28 +546,24 @@ static float ca_propagate_one_cell(const float *heat_grid, int cols, int x,
   return (propagated_heat < 0.f) ? 0.f : propagated_heat;
 }
 
-/*
- * ca_fire_tick() — orchestrate one Doom-CA frame.  The body reads as
- * the four algorithm steps, one per line.
- */
+/* One frame of the Doom CA fire, in four plain steps. */
 static void ca_fire_tick(Grid *grid) {
   int cols = grid->cols;
   int rows = grid->rows;
   float *heat_grid = grid->heat;
 
-  /* Step 1 — warmup ramp + per-tick wind shift of the source. */
+  /* fade the fire in and drift it with the wind */
   float warmup_scale = warmup_scale_factor(grid);
   advance_wind(grid);
 
-  /* Step 2 — refresh the bottom-row fuel arch. */
+  /* lay down fresh fuel along the bottom */
   seed_fuel_row(grid, warmup_scale);
 
-  /* Step 3 — calibrate decay so the average flame top lands at
-   *          CA_REACH_FRAC of the terminal height. */
+  /* size the fade so the flame reaches the target height */
   float decay_base, decay_range;
   ca_compute_adaptive_decay(rows, &decay_base, &decay_range);
 
-  /* Step 4 — propagate heat upward, row by row, bottom-most up. */
+  /* pull heat upward, one cell at a time, from each row below */
   for (int y = 0; y < rows - 1; y++) {
     for (int x = 0; x < cols; x++) {
       heat_grid[y * cols + x] =
@@ -1266,62 +572,16 @@ static void ca_fire_tick(Grid *grid) {
   }
 }
 
-/* ===================================================================== */
-/* §14 algo 1 — particle fire                                             */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   The second algorithm: a Lagrangian particle pool.  Two functions
- *   live in this section — fire_part_spawn() births one particle at
- *   the arch source, and particle_fire_tick() advances every active
- *   particle, spawns new ones up to SPAWN_PER_TICK × warmup, and
- *   3×3-Gaussian-splats each onto the heat grid.
- *
- *   See GUIDED TUTORIAL §5..§6 for the conceptual background.
- */
+/* ── §14 algo 1 — particle fire ── */
+/* Engine 1: a pool of rising embers. Each tick every live ember moves
+ * and cools, new embers are born along the fuel arch, and then each
+ * ember stamps a soft blob of heat onto the grid for the shared renderer
+ * to draw. */
 
-/*
- * fire_part_spawn() — birth one particle at the source arch.
- *
- *   Purpose      : pick a birth column weighted by arch_envelope, then
- *                  initialise velocity, heat, and lifetime.
- *   Pseudocode   : margin ← cols × ARCH_MARGIN_FRAC
- *                  span   ← cols − 2 × margin
- *                  for up to 8 tries:
- *                      t ← rand()
- *                      cx ← margin + t × span + wind_acc
- *                      arch ← (min(t, 1-t) × 2)²
- *                      if rand() < arch × fuel × warmup_scale:
- *                          birth_column ← cx; break
- *                  if no try succeeded: birth at cols / 2
- *                  vx ← (rand() − 0.5) × VX_SPREAD
- *                  vy ← -(VY_BASE + rand() × VY_RANGE)
- *                  life ← LIFE_MIN + rand() × LIFE_RANGE
- *                  heat ← 1; decay ← 1 / life; active ← true
- *   Mental model : rejection sampling: throw darts at the arch
- *                  envelope until one sticks; that x becomes the birth
- *                  column.  Centre cells are likelier than edges.
- *   Inputs       : particle, grid, warmup_scale
- *   Output       : particle initialised, active = true
- *   Why it lives here: separates the "where does a particle come from"
- *                      decision from the "how does it move" loop.
- */
-/*
- * rejection_sample_birth_column() — pick birth x weighted by the arch.
- *
- *   Algorithm (rejection sampling):
- *      repeat up to 8 times:
- *          t                ← rand_unit()
- *          candidate_column ← margin + t × span + wind_acc
- *          arch_weight      ← (min(t, 1-t) × 2)²    (squared arch)
- *          acceptance_prob  ← arch_weight × fuel × warmup
- *          if rand_unit() < acceptance_prob: return candidate_column
- *      return cols / 2   (fallback after 8 misses)
- *
- *   Rejection sampling gives the right distribution without computing
- *   a CDF: the arch_weight × fuel × warmup product IS the probability
- *   that a candidate is kept.  Centre columns are kept more often.
- */
+/* Pick the column a new ember is born in, favouring the middle of the
+ * arch. We pick a random spot and keep it with a chance equal to how
+ * much fuel is there — so the busy centre gets picked more often. Try a
+ * few times; if nothing sticks, just use the centre. */
 static float rejection_sample_birth_column(Grid *grid, float warmup_scale) {
   int cols = grid->cols;
   float source_margin = (float)cols * ARCH_MARGIN_FRAC;
@@ -1341,43 +601,34 @@ static float rejection_sample_birth_column(Grid *grid, float warmup_scale) {
   return fallback_centre;
 }
 
-/*
- * fire_part_spawn() — birth one particle at the source arch.
- *
- *   The body is four labelled steps: pick column → set position →
- *   set velocity → set lifetime.  No nested arithmetic.
- */
+/* Bring one new ember to life at the bottom of the arch: choose its
+ * column, place it, give it a small sideways kick and a strong upward
+ * push, and set how long it will live. */
 static void fire_part_spawn(FirePart *particle, Grid *grid,
                             float warmup_scale) {
-  /* Step 1 — pick a birth column, biased toward the arch centre. */
+  /* choose a column, leaning toward the centre */
   float birth_column = rejection_sample_birth_column(grid, warmup_scale);
 
-  /* Step 2 — birth position lives on the bottom row. */
+  /* start it on the bottom row */
   particle->x = birth_column;
   particle->y = (float)(grid->rows - 1);
 
-  /* Step 3 — initial velocity: small lateral kick, large upward thrust. */
+  /* small sideways kick, strong push upward */
   float initial_vx = rand_signed_unit() * PART_VX_SPREAD;
   float initial_vy = -(PART_VY_BASE + rand_unit() * PART_VY_RANGE);
   particle->vx = initial_vx;
   particle->vy = initial_vy;
 
-  /* Step 4 — lifetime → per-tick heat decay rate. */
+  /* turn a lifetime into a per-tick cooling rate */
   float lifetime_ticks = PART_LIFE_MIN + rand_unit() * PART_LIFE_RANGE;
   particle->heat = 1.0f;
   particle->decay = 1.0f / lifetime_ticks;
   particle->active = true;
 }
 
-/*
- * particle_advance_one() — one tick of motion + heat decay for one ember.
- *
- *   turbulence_kick   ← rand_signed_unit() × PART_TURB_STEP
- *   vx                ← (vx + turbulence_kick) × PART_VX_DAMP
- *   position          ← position + velocity
- *   heat              ← heat - decay
- *   active            ← heat > 0  AND  ember still on grid
- */
+/* Move one ember for a tick: give it a random sideways wobble, let that
+ * drift settle a little, slide it by its speed, and cool it. If it has
+ * burned out or wandered off the grid, mark its slot free. */
 static void particle_advance_one(FirePart *ember, int cols) {
   float turbulence_kick = rand_signed_unit() * PART_TURB_STEP;
   ember->vx = (ember->vx + turbulence_kick) * PART_VX_DAMP;
@@ -1392,9 +643,7 @@ static void particle_advance_one(FirePart *ember, int cols) {
     ember->active = false;
 }
 
-/*
- * phase_a_advance_active_particles() — move every alive ember one tick.
- */
+/* Move every live ember forward one tick. */
 static void phase_a_advance_active_particles(Grid *grid) {
   int cols = grid->cols;
   for (int i = 0; i < MAX_FIRE_PARTS; i++) {
@@ -1405,12 +654,8 @@ static void phase_a_advance_active_particles(Grid *grid) {
   }
 }
 
-/*
- * phase_b_spawn_new_particles() — birth up to SPAWN_PER_TICK × warmup embers.
- *
- *   For each desired spawn, walk round-robin through the pool until an
- *   inactive slot is found; initialise it via fire_part_spawn.
- */
+/* Light up a batch of new embers this tick (fewer while still warming
+ * up). For each one, scan the pool for a free slot and fill it. */
 static void phase_b_spawn_new_particles(Grid *grid, float warmup_scale) {
   int spawn_target = (int)((float)SPAWN_PER_TICK * warmup_scale) + 1;
 
@@ -1426,12 +671,9 @@ static void phase_b_spawn_new_particles(Grid *grid, float warmup_scale) {
   }
 }
 
-/*
- * phase_c_splat_all_to_grid() — clear heat grid; stamp 3×3 splat per ember.
- *
- *   Converts the Lagrangian particle pool back to an Eulerian grid that
- *   the shared renderer can consume.
- */
+/* Wipe the heat grid, then stamp each live ember's soft blob onto it.
+ * This turns the moving embers back into a plain heat grid that the
+ * shared renderer knows how to draw. */
 static void phase_c_splat_all_to_grid(Grid *grid) {
   int cols = grid->cols, rows = grid->rows;
 
@@ -1448,13 +690,9 @@ static void phase_c_splat_all_to_grid(Grid *grid) {
   }
 }
 
-/*
- * phase_d_clamp_oversaturation() — cap cells where several splats overlap.
- *
- *   The 3×3 Gaussian kernel sums to 1 for a single particle, but many
- *   embers may occupy overlapping neighbourhoods.  Cap the sum at
- *   MAX_HEAT so the gamma + dither passes see a value in [0, 1].
- */
+/* Where several embers pile up, their blobs add together and can push a
+ * cell past full heat. Cap every cell at MAX_HEAT so the renderer always
+ * sees a value in range. */
 static void phase_d_clamp_oversaturation(Grid *grid) {
   int total_cells = grid->cols * grid->rows;
   for (int i = 0; i < total_cells; i++)
@@ -1462,10 +700,8 @@ static void phase_d_clamp_oversaturation(Grid *grid) {
       grid->heat[i] = MAX_HEAT;
 }
 
-/*
- * particle_fire_tick() — orchestrate one particle frame.  The body
- * is six lines, one per algorithm phase.
- */
+/* One frame of the particle fire: warm up and drift, move the embers,
+ * spawn new ones, paint them onto the grid, then cap the heat. */
 static void particle_fire_tick(Grid *grid) {
   float warmup_scale = warmup_scale_factor(grid);
   advance_wind(grid);
@@ -1476,38 +712,17 @@ static void particle_fire_tick(Grid *grid) {
   phase_d_clamp_oversaturation(grid);
 }
 
-/* ===================================================================== */
-/* §15 algo 2 — plasma fire                                               */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   The third algorithm: stateless procedural fire.  Each column gets a
- *   tongue-height function defined as the sum of three sine harmonics;
- *   below the tongue tip we shade cells with a smooth gradient from hot
- *   to cold.  No information is carried between frames except the
- *   global phase counter plasma_t.  See GUIDED TUTORIAL §7 for the
- *   derivation.
- */
+/* ── §15 algo 2 — plasma fire ── */
+/* Engine 2: a fire drawn straight from math, with no memory between
+ * frames except an animation clock. For each column we work out how tall
+ * the flame reaches, then shade the cells below that height from hot at
+ * the bottom to cold at the tip. */
 
-/*
- * plasma_tongue_height() — sum three sines, then scale by source weight.
- *
- *   The three harmonics use intentionally non-commensurate frequency /
- *   speed pairs so the pattern never repeats exactly:
- *
- *      H1   amp 0.28   xfreq 5    tspd +2.2     (primary undulation)
- *      H2   amp 0.18   xfreq 11   tspd −1.6     (fine flicker, opposite drift)
- *      H3   amp 0.10   xfreq 3    tspd +0.7     (slow base sway)
- *
- *   Steps:
- *      harmonic_n   ← amp_n × sin(wx × xfreq_n ± t × tspd_n)
- *      raw_tongue   ← base + h1 + h2 + h3
- *      clamped      ← clamp(raw_tongue, 0, 1)        keep in [0,1]
- *      final_height ← clamped × fuel × warmup × √arch_weight
- *
- *   sqrtf(arch_weight) is used (instead of arch_weight directly) so the
- *   tongue falls off more gently at the edges than the squared arch.
- */
+/* How tall the flame reaches in one column. We add three sine waves of
+ * different sizes and speeds — chosen so they never line up the same way
+ * twice, which makes the flicker look organic — then scale the result by
+ * the fuel, the warmup fade, and the arch shape. The arch is softened
+ * with a square root so the flame tapers off gently at the edges. */
 static float plasma_tongue_height(float wind_shifted_x, float phase_t,
                                   float fuel, float warmup_scale,
                                   float arch_weight) {
@@ -1525,17 +740,8 @@ static float plasma_tongue_height(float wind_shifted_x, float phase_t,
   return final_tongue;
 }
 
-/*
- * plasma_shade_column() — write per-row heat below the tongue tip.
- *
- *   normalised_y     ← y / rows                     (0 = top, 1 = bottom)
- *   tongue_tip_ny    ← 1 − tongue_height            (where flame begins)
- *   above_tip        ← normalised_y − tongue_tip_ny (>0 inside flame)
- *   heat             ← clamp(above_tip / tongue_height, 0, 1)
- *
- *   The cell at the bottom (normalised_y = 1) gets heat ≈ 1, the cell
- *   at the tongue tip gets 0, and rows above the tip get 0 by clamp.
- */
+/* Paint one column of the plasma flame: full heat at the bottom fading
+ * smoothly to zero at the flame's tip, and nothing above the tip. */
 static void plasma_shade_column(Grid *grid, int x, float tongue_height) {
   int cols = grid->cols;
   int rows = grid->rows;
@@ -1551,9 +757,7 @@ static void plasma_shade_column(Grid *grid, int x, float tongue_height) {
   }
 }
 
-/*
- * plasma_clear_column() — zero an entire column (used outside the arch).
- */
+/* Blank a whole column — used for the cold margins outside the arch. */
 static void plasma_clear_column(Grid *grid, int x) {
   int cols = grid->cols;
   int rows = grid->rows;
@@ -1561,23 +765,20 @@ static void plasma_clear_column(Grid *grid, int x) {
     grid->heat[y * cols + x] = 0.f;
 }
 
-/*
- * plasma_fire_tick() — orchestrate one plasma frame.  The per-column
- * loop body reads as the algorithm: compute coordinates → measure arch
- * weight → either clear or compute-tongue-and-shade.
- */
+/* One frame of the plasma fire: for every column, either blank it (cold
+ * margin) or work out its flame height and shade it from hot to cold. */
 static void plasma_fire_tick(Grid *grid) {
   int cols = grid->cols;
 
-  /* Step 1 — warmup ramp + per-tick wind shift. */
+  /* fade in and drift with the wind */
   float warmup_scale = warmup_scale_factor(grid);
   advance_wind(grid);
 
-  /* Step 2 — advance the global phase counter. */
+  /* tick the animation clock forward */
   float phase_t = grid->plasma_t;
   grid->plasma_t += PLASMA_TIME_STEP;
 
-  /* Step 3 — for each column: compute tongue height, then shade rows. */
+  /* for each column: find the flame height, then shade it */
   for (int x = 0; x < cols; x++) {
     float normalised_x = (float)x / (float)cols;
     float wind_shifted_x = normalised_x + (float)grid->wind_acc / (float)cols;
@@ -1594,19 +795,11 @@ static void plasma_fire_tick(Grid *grid) {
   }
 }
 
-/* ===================================================================== */
-/* §16 dispatch                                                           */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   One-line indirection that lets the renderer be ignorant of which
- *   heater is active.  The user presses 'a' to advance grid->algo;
- *   grid_tick() is the only place the algorithm index is consulted.
- */
+/* ── §16 dispatch ── */
+/* The one spot that checks which engine is selected, so the rest of the
+ * code never has to. Pressing 'a' changes the choice. */
 
-/*
- * grid_tick() — dispatch to the selected algorithm's tick function.
- */
+/* Run one tick of whichever engine is currently selected. */
 static void grid_tick(Grid *grid) {
   switch (grid->algo) {
   case 0:
@@ -1623,54 +816,32 @@ static void grid_tick(Grid *grid) {
   }
 }
 
-/* ===================================================================== */
-/* §17 render pipeline                                                    */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   The shared renderer.  Heat values are turned into ASCII glyphs in
- *   four passes:
- *     1. Gamma-correct every cell from linear to perceptual.
- *     2. Floyd-Steinberg quantise into one of RAMP_N buckets, pushing
- *        the rounding error onto the four-cell forward neighbourhood.
- *     3. Draw the glyph with the correct theme attribute.
- *     4. Erase cells that went from hot to cold via a literal ' '.
- *
- *   Cells that were never lit and remain cold are skipped entirely —
- *   ncurses leaves them at the terminal background, which is what we
- *   want for the borderless flame effect.
- *
- *   The §18 debug overlays plug into this pipeline by replacing pass 1
- *   and/or pass 2 with diagnostic variants; see below.
- */
+/* ── §17 render pipeline ── */
+/* The shared renderer that turns the heat grid into characters,
+ * whichever engine filled it. It adjusts each cell's brightness so the
+ * shading looks even to the eye, spreads the rounding error to
+ * neighbours so the gradient stays smooth, draws the matching character,
+ * and erases cells that just went cold. Cells that were already cold are
+ * skipped so the screen update stays tiny. */
 
-/*
- * Forward declaration for the debug-overlay helpers — defined in §18.
- */
+/* Which diagnostic overlay is showing, if any. The debug helper that
+ * uses these modes lives down in §18; this declares it early so the
+ * renderer can call it. */
 typedef enum {
-  DEBUG_OFF = 0,
-  DEBUG_RAW_HEAT = 1,
-  DEBUG_GAMMA_NO_DITHER = 2,
-  DEBUG_ARCH_ENVELOPE = 3,
+  DEBUG_OFF = 0,             /* normal fire                            */
+  DEBUG_RAW_HEAT = 1,        /* heat with no brightness adjustment     */
+  DEBUG_GAMMA_NO_DITHER = 2, /* adjusted brightness but no smoothing   */
+  DEBUG_ARCH_ENVELOPE = 3,   /* just the fuel-arch shape               */
 } DebugMode;
 
 static DebugMode g_debug_mode = DEBUG_OFF;
 
 static void debug_fill_dither_buffer(Grid *grid);
 
-/*
- * pipeline_pass1_gamma_correct() — fill dither_buffer with perceptual heat.
- *
- *   For every cell:
- *      linear_heat     ← grid->heat[i]
- *      if cold:        dither_buffer[i] ← -1     (skip sentinel)
- *      else:           saturated   ← min(1, linear_heat / MAX_HEAT)
- *                      perceptual  ← pow(saturated, 1/2.2)
- *                      dither_buffer[i] ← perceptual
- *
- *   The −1 sentinel lets pass 2 distinguish "draw a glyph", "erase a
- *   stale glyph", and "do nothing" without re-reading the heat field.
- */
+/* Pass 1: copy each cell's heat into the scratch buffer, adjusted so
+ * equal steps look equally bright to the eye (our eyes don't see
+ * brightness in a straight line). Cold cells get -1 as a flag, which
+ * tells the next pass to erase or skip them instead of drawing. */
 static void pipeline_pass1_gamma_correct(Grid *grid) {
   int total_cells = grid->cols * grid->rows;
   float *heat_grid = grid->heat;
@@ -1688,15 +859,10 @@ static void pipeline_pass1_gamma_correct(Grid *grid) {
   }
 }
 
-/*
- * pipeline_diffuse_quant_error() — push one cell's rounding error to
- * neighbours.
- *
- *   Floyd-Steinberg distribution (cold-tagged neighbours skipped):
- *
- *      ── current ─────► 7/16 → (x+1, y)
- *      3/16 → (x-1, y+1) ── 5/16 → (x, y+1) ── 1/16 → (x+1, y+1)
- */
+/* Spread one cell's rounding error onto its not-yet-drawn neighbours so
+ * the gradient stays smooth instead of banding (the classic
+ * Floyd-Steinberg pattern: most goes right, the rest to the three cells
+ * below). Cells already flagged cold are skipped so they don't flicker. */
 static void pipeline_diffuse_quant_error(float *dither_buffer, int cols,
                                          int rows, int x, int y,
                                          float quant_error) {
@@ -1715,14 +881,9 @@ static void pipeline_diffuse_quant_error(float *dither_buffer, int cols,
   }
 }
 
-/*
- * pipeline_draw_lit_cell() — quantise one cell and draw its glyph.
- *
- *   bucket        ← lut_index(perceptual)
- *   if dithering: error ← perceptual − lut_midpoint(bucket)
- *                 diffuse error to four-cell forward neighbourhood
- *   draw k_ramp[bucket] with the theme's ramp attribute
- */
+/* Draw one lit cell: pick the character for its brightness, optionally
+ * pass the leftover error to its neighbours, and paint it in the theme's
+ * colour. */
 static void pipeline_draw_lit_cell(Grid *grid, int x, int y, float perceptual,
                                    bool apply_dither) {
   int bucket = lut_index(perceptual);
@@ -1740,13 +901,9 @@ static void pipeline_draw_lit_cell(Grid *grid, int x, int y, float perceptual,
   attroff(glyph_attr);
 }
 
-/*
- * pipeline_pass2_quantise_and_draw() — walk dither_buffer, draw or erase.
- *
- *   For every cell visible to the terminal:
- *      cold sentinel        → if previous frame lit: write a single ' '
- *      lit                  → pipeline_draw_lit_cell()
- */
+/* Pass 2: walk every on-screen cell. Draw the lit ones; for a cell now
+ * cold but lit last frame, write a single space to wipe the old
+ * character; leave cells that were already cold alone. */
 static void pipeline_pass2_quantise_and_draw(Grid *grid, int tcols, int trows,
                                              bool apply_dither) {
   int cols = grid->cols;
@@ -1774,14 +931,10 @@ static void pipeline_pass2_quantise_and_draw(Grid *grid, int tcols, int trows,
   }
 }
 
-/*
- * pipeline_pass3_archive_current_frame() — record current heat as previous.
- *
- *   swap pointers: prev ↔ cur   (cheap pointer assignment, no copy)
- *   memcpy cur ← prev            (so next tick's writers see the right
- *                                 buffer, and pass 2 can compare against
- *                                 prev to detect just-extinguished cells)
- */
+/* Pass 3: remember this frame's heat as "last frame" so the next frame
+ * can tell which cells just went cold. We swap the two buffers (cheap)
+ * and copy back, leaving the working buffer holding the same values for
+ * the next round of engine writes. */
 static void pipeline_pass3_archive_current_frame(Grid *grid) {
   int total_cells = grid->cols * grid->rows;
   float *tmp = grid->prev_heat;
@@ -1790,72 +943,37 @@ static void pipeline_pass3_archive_current_frame(Grid *grid) {
   memcpy(grid->heat, grid->prev_heat, (size_t)total_cells * sizeof(float));
 }
 
-/*
- * grid_draw() — orchestrate the three passes.  The body is the algorithm:
- *      pass 1   load perceptual values (or a debug overlay)
- *      pass 2   quantise + draw, optionally diffuse error
- *      pass 3   archive current frame for next frame's "did this cell
- *               just go cold?" decision
- */
+/* Draw one frame by running the three passes in order. In a debug mode
+ * the first pass is swapped for a diagnostic fill and the smoothing is
+ * turned off. */
 static void grid_draw(Grid *grid, int tcols, int trows) {
   bool is_normal_render = (g_debug_mode == DEBUG_OFF);
 
-  /* Pass 1 — fill dither_buffer from gamma or a debug overlay. */
+  /* fill the scratch buffer: normal brightness, or a debug overlay */
   if (is_normal_render)
     pipeline_pass1_gamma_correct(grid);
   else
     debug_fill_dither_buffer(grid);
 
-  /* Pass 2 — quantise + draw; dithering only in normal-render mode. */
+  /* draw the cells; only smooth in normal mode */
   pipeline_pass2_quantise_and_draw(grid, tcols, trows, is_normal_render);
 
-  /* Pass 3 — archive current frame so next frame can detect changes. */
+  /* save this frame so the next one can spot the changes */
   pipeline_pass3_archive_current_frame(grid);
 }
 
-/* ===================================================================== */
-/* §18 debug overlays                                                     */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   Three pedagogical overlays the user can cycle with 'd' (forward)
- *   and 'D' (backward).  Each replaces only the first pass of the
- *   renderer (gamma correction) with a diagnostic variant; the
- *   quantisation and glyph drawing then proceed normally but with
- *   dithering disabled so the staircase is visible.
- *
- *     mode 0   DEBUG_OFF             — normal render (no override)
- *     mode 1   DEBUG_RAW_HEAT        — heat fed directly to the LUT;
- *                                      no gamma curve.  Coarse banding
- *                                      proves why gamma correction is
- *                                      needed.
- *     mode 2   DEBUG_GAMMA_NO_DITHER — gamma is applied but dithering
- *                                      is disabled.  Banding visible
- *                                      in the highlights — proves why
- *                                      dithering is needed.
- *     mode 3   DEBUG_ARCH_ENVELOPE   — every cell is set to its column's
- *                                      arch_envelope() value.  Reveals
- *                                      the source distribution that
- *                                      every algorithm sits on top of.
- */
+/* ── §18 debug overlays ── */
+/* Three teaching views the user cycles with 'd' and 'D'. Each one only
+ * changes what the renderer feeds in, so the drawing stays the same:
+ *   raw-heat   — skip the brightness fix; the coarse banding shows why
+ *                the fix is needed.
+ *   gamma-only — keep the fix but drop the smoothing; the leftover
+ *                banding shows why the smoothing is needed.
+ *   arch       — show just the fuel-arch shape every engine sits on. */
 
-/*
- * debug_fill_dither_buffer() — populate dither_buffer for overlay modes.
- *
- *   Purpose      : replace gamma correction with a diagnostic mapping
- *                  so the next pass renders the chosen overlay.
- *   Pseudocode   : switch g_debug_mode:
- *                      RAW_HEAT:        v ← clamp(heat / MAX_HEAT, 0, 1)
- *                      GAMMA_NO_DITHER: v ← pow(clamp(heat / MAX_HEAT), 1/2.2)
- *                      ARCH_ENVELOPE:   v ← arch_envelope(x, cols, wind_acc)
- *                  v ≤ 0 → mark cold (-1).
- *   Mental model : three different "what to print here" rules; the
- *                  rest of the pipeline is reused unchanged.
- *   Inputs       : grid (read-only except via dither_buffer write)
- *   Output       : grid->dither populated with overlay-specific values
- *   Why it lives here: keeps every diagnostic mapping in one place; the
- *                      hot path stays free of overlay code paths.
- */
+/* Fill the scratch buffer for whichever debug view is active, instead of
+ * the normal brightness fill. Each view is a different rule for "what
+ * brightness goes here"; the rest of the renderer is reused as-is. */
 static void debug_fill_dither_buffer(Grid *grid) {
   int cols = grid->cols;
   int rows = grid->rows;
@@ -1904,9 +1022,7 @@ static void debug_fill_dither_buffer(Grid *grid) {
   }
 }
 
-/*
- * debug_mode_name() — short label for the active overlay.
- */
+/* Short label for the active overlay, shown in the HUD. */
 static const char *debug_mode_name(DebugMode mode) {
   switch (mode) {
   case DEBUG_OFF:
@@ -1922,22 +1038,16 @@ static const char *debug_mode_name(DebugMode mode) {
   }
 }
 
-/* ===================================================================== */
-/* §19 scene                                                              */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   The scene layer wraps the grid with two pieces of UI state: the
- *   pause flag (set by SPACE, suppresses grid_tick) and the
- *   needs_clear flag (set by algorithm/theme/resize transitions, forces
- *   one erase() on the next frame so stale glyphs from the previous
- *   algo or palette do not linger).
- */
+/* ── §19 scene ── */
+/* Wraps the grid with two bits of UI state: whether we're paused, and a
+ * one-shot "clear the screen next frame" flag. The clear flag is raised
+ * after switching engine, theme, or size so leftover characters from the
+ * old look don't linger. */
 
 typedef struct {
   Grid grid;
-  bool paused;
-  bool needs_clear;
+  bool paused;      /* SPACE toggles this; pauses the simulation */
+  bool needs_clear; /* wipe the screen once on the next frame    */
 } Scene;
 
 static void scene_init(Scene *scene, int cols, int rows, int theme) {
@@ -1947,16 +1057,9 @@ static void scene_init(Scene *scene, int cols, int rows, int theme) {
 
 static void scene_free(Scene *scene) { grid_free(&scene->grid); }
 
-/*
- * scene_resize() — react to SIGWINCH by re-allocating at new size.
- *
- *   Pseudocode   : remember theme/fuel/wind/algo
- *                  grid_resize to new dimensions
- *                  restore remembered settings
- *                  reset warmup to 0; raise needs_clear
- *   Mental model : the world map is redrawn but the player's choices
- *                  (theme, fuel, wind, algo) survive the redraw.
- */
+/* Handle a terminal resize: rebuild the grid at the new size, but keep
+ * the user's theme, fuel, wind, and engine choices. The fire fades back
+ * in from cold. */
 static void scene_resize(Scene *scene, int cols, int rows) {
   int saved_theme = scene->grid.theme;
   float saved_fuel = scene->grid.fuel;
@@ -1983,24 +1086,13 @@ static void scene_draw(Scene *scene, int cols, int rows) {
   grid_draw(&scene->grid, cols, rows);
 }
 
-/* ===================================================================== */
-/* §20 screen + hud                                                       */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   The screen layer is the only place ncurses initialisation lives.
- *   screen_init() configures the terminal for full-screen rendering;
- *   screen_resize() handles SIGWINCH; screen_draw() composes the HUD;
- *   screen_present() flushes the diff to the terminal.
- *
- *   HUD layout:
- *     row 0           — bright yellow + bold:  fps, sim Hz, paused state
- *     row 1           — bright yellow:        theme, algo, fuel, wind, debug
- *     row rows - 1    — bright cyan + bold:   every interactive key
- */
+/* ── §20 screen + hud ── */
+/* The only place that talks to ncurses for setup and the status display.
+ * The HUD is three lines: frame rate and pause state up top right, the
+ * current settings just below, and the list of keys along the bottom. */
 
 typedef struct {
-  int cols, rows;
+  int cols, rows; /* current terminal size in cells */
 } Screen;
 
 static void screen_init(Screen *screen, int initial_theme) {
@@ -2039,20 +1131,7 @@ static const char *algo_name(int algo_index) {
   }
 }
 
-/*
- * screen_draw() — paint scene then HUD.
- *
- *   Purpose      : drive one frame's output.
- *   Pseudocode   : if needs_clear: erase(); clear flag
- *                  scene_draw(...)
- *                  row 0  bright-yellow bold "fps / Hz / paused"
- *                  row 1  bright-yellow      "theme / algo / fuel / wind / dbg"
- *                  row -1 bright-cyan  bold  "<keys>"
- *   Inputs       : screen, scene, fps_smoothed, sim_fps
- *   Output       : stdscr written, prev_heat updated by grid_draw
- *   Why it lives here: §20 is the only place that knows where the HUD
- *                      anchors live (row 0, row 1, row -1).
- */
+/* Draw one whole frame: the fire, then the HUD on top of it. */
 static void screen_draw(Screen *screen, Scene *scene, double fps, int sim_fps) {
   if (scene->needs_clear) {
     erase();
@@ -2063,7 +1142,7 @@ static void screen_draw(Screen *screen, Scene *scene, double fps, int sim_fps) {
   const Grid *grid = &scene->grid;
   char buf[HUD_COLS + 1];
 
-  /* row 0 — primary status (bright yellow + bold, right-aligned) */
+  /* top line: frame rate, sim speed, paused state */
   snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  %s ", fps, sim_fps,
            scene->paused ? "PAUSED " : "running");
   int row0_x = screen->cols - (int)strlen(buf);
@@ -2073,7 +1152,7 @@ static void screen_draw(Screen *screen, Scene *scene, double fps, int sim_fps) {
   mvprintw(0, row0_x, "%s", buf);
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-  /* row 1 — secondary readouts (same pair, no bold, right-aligned) */
+  /* second line: current settings */
   const char *wind_arrow = grid->wind > 0   ? ">>>"
                            : grid->wind < 0 ? "<<<"
                                             : "---";
@@ -2087,7 +1166,7 @@ static void screen_draw(Screen *screen, Scene *scene, double fps, int sim_fps) {
   mvprintw(1, row1_x, "%s", buf);
   attroff(COLOR_PAIR(PAIR_HUD));
 
-  /* row rows-1 — key hint (bright cyan + bold, left-aligned) */
+  /* bottom line: the keys you can press */
   attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
   mvprintw(screen->rows - 1, 0,
            " q:quit  spc:pause  a:algo  t:theme  g/G:fuel  w/W:wind  0:calm  "
@@ -2100,24 +1179,18 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §21 application                                                        */
-/* ===================================================================== */
-/*
- * SECTION PREAMBLE
- *   The outermost layer: signal handlers, key bindings, fixed-timestep
- *   accumulator, fps averaging.  Render is pinned to 60 fps regardless
- *   of the simulation rate.  SIGINT / SIGTERM clear app->running;
- *   SIGWINCH raises app->need_resize so the main loop can re-init the
- *   grid on the next iteration.
- */
+/* ── §21 application ── */
+/* The outermost layer: signal handlers, key handling, and the main loop.
+ * The picture redraws at a steady 60 fps while the simulation runs at its
+ * own rate. Ctrl-C asks the loop to stop; a resize asks it to rebuild the
+ * grid on the next pass. */
 
 typedef struct {
   Scene scene;
   Screen screen;
-  int sim_fps;
-  volatile sig_atomic_t running;
-  volatile sig_atomic_t need_resize;
+  int sim_fps;                          /* simulation ticks per second  */
+  volatile sig_atomic_t running;        /* cleared by a quit signal     */
+  volatile sig_atomic_t need_resize;    /* raised by a resize signal    */
 } App;
 
 static App g_app;
@@ -2131,32 +1204,9 @@ static void on_resize_signal(int s) {
 }
 static void cleanup_on_exit(void) { endwin(); }
 
-/*
- * app_handle_key() — dispatch one key press.
- *
- *   Purpose      : convert a keystroke into a state mutation.
- *   Pseudocode   : switch on character:
- *                      q,Q,ESC : return false (request shutdown)
- *                      space   : toggle paused
- *                      a,A     : next algorithm; reset warmup + particles
- *                      t,T     : next theme; reapply pairs
- *                      g       : fuel += 0.05 (capped at 1.0)
- *                      G       : fuel -= 0.05 (floored at 0.1)
- *                      w       : wind++ (capped at +WIND_MAX)
- *                      W       : wind-- (floored at −WIND_MAX)
- *                      0       : wind ← 0
- *                      ]       : sim_fps += STEP (capped at MAX)
- *                      [       : sim_fps -= STEP (floored at MIN)
- *                      d       : debug mode ← (mode + 1) % N_DEBUG_MODES
- *                      D       : debug mode ← (mode + N − 1) % N_DEBUG_MODES
- *   Mental model : a switch where every entry is a single, named user
- *                  intention.  Add a key by adding a case.
- *   Inputs       : app, character read by getch()
- *   Output       : returns false if the user wants to quit, true to keep
- *                  running
- *   Why it lives here: keeps every state mutation triggered by user
- *                      input in exactly one function.
- */
+/* Act on one key press. Returns false only when the user asks to quit
+ * (q, Q, or ESC); every other key just changes a setting. One case per
+ * key, so adding a control means adding a case. */
 static bool app_handle_key(App *app, int ch) {
   Grid *grid = &app->scene.grid;
   switch (ch) {
@@ -2238,31 +1288,11 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
-/*
- * main() — fixed-timestep loop with 60 fps render cap.
- *
- *   Purpose      : entry point; orchestrates the simulation, the
- *                  renderer, the input pump, and the resize flag.
- *   Pseudocode   :
- *      seed RNG; register signal handlers and atexit cleanup.
- *      screen_init; scene_init.
- *      loop:
- *          if need_resize: screen_resize; scene_resize; clear sim_acc.
- *          now ← clock_ns(); dt ← clamped(now - frame_time)
- *          frame_time ← now
- *          sim_accumulator += dt
- *          while sim_accumulator ≥ TICK_NS(sim_fps):
- *              scene_tick(); sim_accumulator -= TICK_NS(sim_fps)
- *          fps_window_count += 1; fps_window_ns += dt
- *          if fps_window_ns ≥ FPS_UPDATE_MS:
- *              fps_smoothed ← count / (window_ns / 1e9); reset
- *          clock_sleep_ns(1/60 s − elapsed_this_iteration)
- *          screen_draw(); screen_present()
- *          ch ← getch(); if app_handle_key returns false: exit
- *      cleanup.
- *   Mental model : a heartbeat — every cycle does the same six things
- *                  in the same order.
- */
+/* The program's heartbeat. Each pass: handle a resize if one happened,
+ * measure how much time passed, run as many simulation ticks as that
+ * time allows, update the frame-rate readout, sleep to hold 60 fps, draw
+ * the frame, then read one key. The fixed-time-per-tick trick keeps the
+ * fire moving at the same speed no matter how fast the terminal draws. */
 int main(void) {
   srand((unsigned int)clock_ns());
   atexit(cleanup_on_exit);

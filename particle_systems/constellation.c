@@ -1,149 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * constellation.c — drifting stars wired by an O(N²) proximity graph.
+ * constellation.c — drifting stars that draw lines to nearby neighbours.
  *
- * Stars wander with a bounded random walk in pixel space; every render
- * frame, all C(N, 2) pairs are scanned and pairs within CONNECT_DIST get
- * a thin ASCII line in one of three brightness tiers.  The graph has
- * ZERO state — it's recomputed from positions each frame.  Seven themes
- * cycle the seven rendering pair IDs without redrawing.
+ * Stars wander slowly; every frame we check all pairs and draw a faint
+ * line between any two that are close enough. The lines aren't stored,
+ * just recomputed each frame from where the stars currently are.
  *
- * Section map
- *   §1 config       sim/display constants, themes table, connect presets
- *   §2 clock        monotonic-ns timer + sleep
- *   §3 color        7-theme palette + theme_apply + color_init
- *   §4 coords       pw/ph + px_to_cell_*: the ONE aspect-ratio fix
- *   §5 star         Star struct + star_spawn + star_tick (5 steps)
- *   §6 scene        Scene + lifecycle + scene_tick + draw_line + scene_draw
- *   §7 screen       ncurses init/draw/resize, HUD + HINT bars
- *   §8 app          signals, fixed-step main loop with lerp alpha
+ * References (the things the code alone can't tell you):
+ *   Bresenham (1965), IBM Systems J. 4(1): 25 — the thin-line drawing trick
+ *   Uhlenbeck & Ornstein (1930), Phys. Rev. 36: 823 — the wandering-walk idea
+ *   bounce_ball.c (this repo) — origin of the pixel/cell split used in §4
  */
-
-/* ── CONCEPTS & ALGORITHMS ───────────────────────────────────────────── *
- *
- *   Proximity graph        O(N²) per-frame pair scan; redraw from current
- *                          state — no edge list to maintain, no staleness.
- *                          → Newman, *Networks: An Introduction*, Ch. 6
- *
- *   Ornstein-Uhlenbeck     Bounded random walk: random kick + magnitude
- *                          clamp.  Direction wanders, speed bounded.
- *                          → Uhlenbeck & Ornstein (1930), Phys. Rev. 36: 823
- *
- *   Bresenham line (thin)  ONE cell per MAJOR-axis step + slope-matched
- *                          glyph.  Vanilla Bresenham doubles diagonals.
- *                          → Bresenham (1965), IBM Systems J. 4(1): 25
- *
- *   Pixel/cell split       Physics in square pixels (CELL_W=8, CELL_H=16);
- *                          rendering in cells.  ONE conversion at draw time.
- *                          → bounce_ball.c §4 (this repo) — first appearance
- *
- *   Render lerp            draw_p = prev_p + (p − prev_p)·alpha   (BACKWARDS
- *                          interpolation; never overshoots the next tick).
- *                          → Glenn Fiedler, "Fix Your Timestep!" (2004)
- *
- *   Painter's algorithm    Lines under, stars over.  Foreground always wins.
- *                          → Newell, Newell & Sancha (1972) hidden-surface
- *
- *   Squared-distance cull  d² < D²  instead of  d < D.  sqrt only runs for
- *                          pairs that actually draw — kills ~95% of sqrtfs.
- *                          → standard numerical-recipes idiom
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── OVERALL PSEUDOCODE ──────────────────────────────────────────────── *
- *
- *   init:
- *     install signals; start ncurses (themes + HUD/HINT pairs)
- *     scene_init: spawn STARS_DEFAULT stars at random positions
- *
- *   loop while running:
- *     if need_resize:        re-query terminal; clamp out-of-bounds stars
- *     dt   = clock_now − last_frame_time              (capped at 100 ms)
- *     while sim_accum ≥ tick_ns:                       fixed-step physics
- *       scene_tick(dt_sec)
- *       sim_accum -= tick_ns
- *     alpha = sim_accum / tick_ns                      ∈ [0, 1)
- *     update fps_display every FPS_UPDATE_MS
- *     sleep to ~60 fps render
- *     scene_draw(alpha) + screen_draw(HUD, HINT) + screen_present
- *     getch + app_handle_key                            non-blocking input
- *
- *   cleanup:
- *     atexit endwin restores the terminal
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── DRIVER PSEUDOCODE ───────────────────────────────────────────────── *
- *
- * scene_tick(dt):
- *   if paused: return
- *   max_px, max_py ← pw(cols)-1, ph(rows)-1
- *   for each star in stars[0..n-1]:
- *     star_tick(s, dt, max_px, max_py)
- *
- *   Pure physics; never touches ncurses.  Stars do NOT see each other
- *   here — that's a render-time concern (scene_draw_connections).
- *
- *
- * star_tick(s, dt, max_px, max_py):                    (5 labelled steps)
- *   Step 1  prev_px, prev_py ← px, py                  save for render lerp
- *   Step 2  v += uniform(±WANDER_ACCEL) · dt           Ornstein-Uhlenbeck
- *   Step 3  if |v| > SPEED_CAP: v *= SPEED_CAP / |v|   magnitude clamp
- *   Step 4  px, py += v · dt                           explicit Euler
- *   Step 5  for each wall: snap into bounds + negate normal vel
- *
- *   Order matters: step 1 saves prev BEFORE integration so the renderer
- *   lerps between the OLD and NEW positions.  Step 3 (cap) before step 4
- *   (integrate) so a spike of wander can't briefly produce a velocity
- *   huge enough to teleport past the wall in one frame.
- *
- *
- * scene_draw(alpha):                                    (3 labelled steps)
- *   Step 1  compute_lerp_positions  → dpx/dpy/dcx/dcy caches
- *   Step 2  cell_used ← zero        per-frame VLA bool[rows][cols]
- *           scene_draw_connections  O(N²/2) pair scan + brightness buckets
- *                                    + thin-Bresenham draw_line
- *   Step 3  scene_draw_stars        paint star glyphs LAST (foreground wins)
- *
- *   `Scene *` is const throughout.  cell_used is the only allocation in
- *   the hot path — first-writer-wins prevents overlapping lines from
- *   producing mojibake.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/*
- * Keys
- *   q | Q | ESC      quit                spc        pause / resume
- *   r                randomise all stars
- *   = / +            add a star          -          remove a star (down to
- * STARS_MIN) c                cycle connect preset (tight / normal / wide) t /
- * T            next / prev theme ] / [            raise / lower sim_fps
- *
- * Build
- *   gcc -std=c11 -O2 -Wall -Wextra particle_systems/constellation.c \
- *       -o constellation -lncurses -lm
- */
-
-/* ── REFERENCES ──────────────────────────────────────────────────────── *
- *
- * PAPERS
- *   Bresenham, J. E. (1965)
- *     "Algorithm for computer control of a digital plotter"
- *     IBM Systems Journal 4(1): 25–30.
- *   Uhlenbeck, G. E. & Ornstein, L. S. (1930)
- *     "On the Theory of the Brownian Motion"
- *     Phys. Rev. 36: 823–841.
- *   Newell, M. E., Newell, R. G. & Sancha, T. L. (1972)
- *     "A solution to the hidden surface problem"
- *     Proc. ACM Annual Conference: 443–450.  (Painter's algorithm.)
- *
- * BOOKS
- *   Newman, M. — "Networks: An Introduction"  (Oxford UP, 2010)
- *     Ch. 6 covers proximity / threshold graphs.
- *   Press et al. — "Numerical Recipes in C"  (3rd ed., 2007)
- *     §1.1.3 squared-distance idiom; §17.1 fixed-step integration.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -157,9 +24,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
   SIM_FPS_MIN = 10,
@@ -167,39 +32,38 @@ enum {
   SIM_FPS_MAX = 60,
   SIM_FPS_STEP = 5,
 
-  HUD_COLS = 64, /* widened to fit [theme] suffix             */
+  HUD_COLS = 64, /* wide enough to fit the theme name on the end */
   FPS_UPDATE_MS = 500,
 
   STARS_DEFAULT = 30,
   STARS_MIN = 5,
   STARS_MAX = 80,
 
-  N_STAR_COLORS = 6, /* color pairs 1..6 for stars               */
-  CONN_PAIR = 7,     /* color pair for all connection lines       */
-  HUD_PAIR = 8,      /* bright yellow 226 + A_BOLD — top-right    */
-  HINT_PAIR = 9,     /* bright cyan   51  + A_BOLD — bottom-left  */
+  N_STAR_COLORS = 6, /* stars use colour slots 1..6        */
+  CONN_PAIR = 7,     /* every connection line uses slot 7   */
+  HUD_PAIR = 8,      /* status text, top-right (yellow)     */
+  HINT_PAIR = 9,     /* key hints, bottom-left (cyan)       */
 };
 
-/* Sub-pixel units per terminal cell.  16/8 = 2 matches a typical
- * monospace cell's pixel aspect ratio, which is what makes physics in
- * (CELL_W, CELL_H) units render isotropic on screen. */
+/* We do the motion math in tiny "pixels" and only turn them into screen
+ * cells when drawing. A cell is 8 pixels wide and 16 tall, which matches
+ * the roughly 1:2 shape of a real terminal character — so a star moving
+ * the same speed sideways and downways looks the same speed on screen. */
 #define CELL_W 8
 #define CELL_H 16
 
-/* Star initial speed range (pixels/second).  Slow on purpose — fast
- * stars produce visible staircase aliasing on near-axis-aligned motion;
- * wander force + lerp interpolation handle the rest. */
+/* How fast a star starts out (pixels per second). Kept slow on purpose:
+ * fast stars draw an ugly staircase on near-straight paths. */
 #define SPEED_MIN 50.0f
 #define SPEED_MAX 120.0f
 
-/* Wander envelope: WANDER_ACCEL bounds the random-kick magnitude per
- * second; SPEED_CAP bounds the resulting velocity magnitude. */
+/* The wander limits. WANDER_ACCEL caps how hard the random nudge each
+ * second can be; SPEED_CAP caps the top speed it can build up to. */
 #define WANDER_ACCEL 20.0f
 #define SPEED_CAP 130.0f
 
-/* Connection distance presets in PIXELS — cycled by the 'c' key.  At
- * 200 px on a 200×50 terminal (1600×800 px), each star's connect
- * circle covers ~10 % of screen area, yielding ~45 lines at N=30. */
+/* How close two stars must be to get a line, in pixels. The 'c' key
+ * cycles these: tighter draws fewer lines, wider draws more. */
 static const float k_connect_presets[] = {120.0f, 200.0f, 280.0f};
 static const char *k_connect_names[] = {"tight", "normal", "wide"};
 enum { N_CONNECT_PRESETS = 3 };
@@ -212,9 +76,7 @@ enum { N_CONNECT_PRESETS = 3 };
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -232,37 +94,36 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color ── */
 
 /*
- * ConstTheme — one palette: 6 star hues + 1 connection-line hue.
+ * ConstTheme — one named colour scheme: six colours for the stars plus
+ * one for the connection lines. Picking a theme is purely cosmetic.
  *
- *   name        cycled label, shown in HUD
- *   star_fg256  256-colour palette (rich terminals)
- *   star_fg8    8-colour fallback  (basic terminals)
- *   conn_fg256  connection-line colour, 256-mode
- *   conn_fg8    connection-line colour, 8-mode
+ *   name        the label shown in the status bar (cycled by t/T)
+ *   star_fg256  the six star colours on a modern 256-colour terminal
+ *   star_fg8    the same six, dumbed down for an old 8-colour terminal
+ *   conn_fg256  the line colour on a 256-colour terminal
+ *   conn_fg8    the line colour on an 8-colour terminal
  *
- * Lifecycle: const table; theme_apply rebinds colour-pair IDs 1..7 to a
- *   chosen entry on startup and on every t/T keystroke.  Existing glyphs
- *   on screen pick up the new colour on the next mvaddch — no clear, no
- *   redraw.  HUD_PAIR=8 / HINT_PAIR=9 sit OUTSIDE this range so the
- *   chrome never changes colour as themes cycle.
+ * The table never changes. Switching theme just re-points colour slots
+ * 1..7 at a different row (see theme_apply); already-drawn characters
+ * pick up the new colour on their next repaint, so there's no flicker.
+ * The status/hint colours (slots 8,9) sit outside this range on purpose
+ * so the on-screen text stays the same colour no matter the theme.
  */
 typedef struct {
   const char *name;
-  int star_fg256[6]; /* 256-colour palette (rich terminals)    */
-  int star_fg8[6];   /* 8-colour fallback (basic terminals)    */
-  int conn_fg256;    /* connection-line colour, 256-mode       */
-  int conn_fg8;      /* connection-line colour, 8-mode         */
+  int star_fg256[6]; /* star colours, 256-colour terminal   */
+  int star_fg8[6];   /* star colours, 8-colour terminal     */
+  int conn_fg256;    /* line colour, 256-colour terminal    */
+  int conn_fg8;      /* line colour, 8-colour terminal      */
 } ConstTheme;
 
 #define N_THEMES 7
 
 static const ConstTheme k_themes[N_THEMES] = {
-    /* The classic — was the only palette before theme support was added. */
+    /* The original look, from before themes existed. */
     {"night",
      {15, 51, 39, 201, 147, 159},
      {COLOR_WHITE, COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA, COLOR_CYAN,
@@ -317,7 +178,7 @@ static const ConstTheme k_themes[N_THEMES] = {
      COLOR_WHITE},
 };
 
-/* theme_apply — rebind the 7 rendering pair IDs (1..7) to theme[idx]. */
+/* Point the seven drawing colour slots at the chosen theme's colours. */
 static void theme_apply(int theme) {
   const ConstTheme *th = &k_themes[theme];
   if (COLORS >= 256) {
@@ -331,7 +192,7 @@ static void theme_apply(int theme) {
   }
 }
 
-/* color_init — start_color + apply initial theme + pin HUD/HINT pairs. */
+/* Turn colour on, load the starting theme, and fix the status/hint colours. */
 static void color_init(int theme) {
   start_color();
   use_default_colors();
@@ -345,15 +206,14 @@ static void color_init(int theme) {
   }
 }
 
-/* ===================================================================== */
-/* §4  coords — the one place aspect ratio is handled                    */
-/* ===================================================================== */
+/* ── §4 coords ── */
+/* The one place we convert between motion-pixels and screen-cells. */
 
-/* pw / ph — cells → pixels.  The only callers of CELL_W/CELL_H proper. */
+/* Turn a count of cells into a count of pixels. */
 static inline int pw(int cols) { return cols * CELL_W; }
 static inline int ph(int rows) { return rows * CELL_H; }
 
-/* px_to_cell_x / _y — pixel → cell (round half up; see bounce_ball.c §4). */
+/* Turn a pixel position into the cell it lands in (rounding to nearest). */
 static inline int px_to_cell_x(float px) {
   return (int)floorf(px / (float)CELL_W + 0.5f);
 }
@@ -361,44 +221,40 @@ static inline int px_to_cell_y(float py) {
   return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  star                                                               */
-/* ===================================================================== */
+/* ── §5 star ── */
 
 /*
- * Star — the actor.  Drifts across the screen with a bounded random
- * walk; connection lines are derived from pairs at draw time, NOT stored.
+ * Star — one drifting star. It only knows where it is and where it's
+ * going; the lines between stars are worked out fresh each frame, never
+ * stored on the star itself.
  *
- *   px, py            position THIS tick      (pixels, float)
- *   prev_px, prev_py  position at LAST tick   (pixels) — for render lerp
- *   vx, vy            velocity                (pixels/sec)
- *   color             colour-pair id          1..N_STAR_COLORS
- *   ch                glyph chosen at spawn from k_star_chars  ("*+o@.")
+ *   px, py            where it is right now        (pixels)
+ *   prev_px, prev_py  where it was last step       (pixels)
+ *   vx, vy            how fast it's moving         (pixels/sec)
+ *   color             which colour slot, 1..N_STAR_COLORS
+ *   ch                which glyph it draws as, one of "*+o@."
  *
- * Lifecycle:
- *   spawn at scene_init / on 'r' / from app_do_resize for out-of-bounds
- *   slots.  No destruction — Scene.n defines the live slice [0..n-1];
- *   "remove a star" is `n--`, slots stay allocated.
+ * We keep the previous position so the renderer can draw the star part
+ * way between its old and new spot for smooth motion (it slides along the
+ * line between the two). That's exact no matter how the star accelerated;
+ * guessing ahead from the current position would drift off course.
  *
- * Why prev_px / prev_py:
- *   wander adds random acceleration each tick; forward-extrapolation
- *   from the current state would diverge from the next real tick.  Lerp
- *   between (prev) and (curr) is exact for any acceleration profile.
+ * Stars are never freed. A live count (Scene.n) marks how many of the
+ * fixed pool are in use; "remove a star" just lowers that count.
  */
 typedef struct {
-  float px, py;           /* current-tick position  (pixel space)    */
-  float prev_px, prev_py; /* previous-tick position (pixel space)    */
-  float vx, vy;           /* velocity (px/s)                         */
-  int color;              /* colour-pair id (1..N_STAR_COLORS)        */
-  char ch;                /* star glyph from k_star_chars            */
+  float px, py;           /* current position  (pixels)          */
+  float prev_px, prev_py; /* previous position (pixels)          */
+  float vx, vy;           /* velocity (pixels/sec)               */
+  int color;              /* colour slot, 1..N_STAR_COLORS       */
+  char ch;                /* glyph, one of k_star_chars          */
 } Star;
 
-/* Glyph alphabet for stars — cycled by index so 30 stars cover all 5. */
+/* The glyphs stars can be drawn as; picked by index so a crowd varies. */
 static const char k_star_chars[] = "*+o@.";
 static const int k_n_star_chars = (int)(sizeof k_star_chars - 1);
 
-/* star_spawn — fill one Star slot with a random in-bounds pos + isotropic vel.
- */
+/* Drop one star at a random spot with a random direction at random speed. */
 static void star_spawn(Star *s, int idx, int cols, int rows) {
   int pxw = pw(cols);
   int pxh = ph(rows);
@@ -408,7 +264,8 @@ static void star_spawn(Star *s, int idx, int cols, int rows) {
   s->prev_px = s->px;
   s->prev_py = s->py;
 
-  /* Rejection-sample inside the unit disk for uniform direction. */
+  /* Pick a random direction by throwing darts at a square and keeping
+   * only the ones inside a circle, so every angle is equally likely. */
   float dx, dy, len;
   do {
     dx = (float)(rand() % 2001 - 1000) / 1000.0f;
@@ -426,44 +283,31 @@ static void star_spawn(Star *s, int idx, int cols, int rows) {
 }
 
 /*
- * star_tick — DRIVER.  One frame of per-star physics.
+ * Move one star forward by one step: nudge it in a random direction,
+ * keep its speed in check, slide it along, and bounce it off the edges.
  *
- *   Step 1   prev_px, prev_py ← px, py             save for render lerp
- *   Step 2   v += uniform(±WANDER_ACCEL) · dt      Ornstein-Uhlenbeck wander
- *   Step 3   if |v| > SPEED_CAP: v *= SPEED_CAP/|v| magnitude clamp
- *   Step 4   px, py += v · dt                      explicit Euler
- *   Step 5   for each wall: snap + negate normal vel    elastic reflection
+ *   s              the star to move (changed in place)
+ *   dt             how much time this step covers, in seconds
+ *   max_px, max_py the far edges of the play area, in pixels
  *
- * INPUTS / UNITS
- *   s              Star to advance (mutated)
- *   dt             frame time in seconds (typically 1 / sim_fps)
- *   max_px, max_py playable rectangle bounds in pixels: pw(cols)-1, ph(rows)-1
- *
- * WHY THE STEP ORDER MATTERS
- *   Step 1 must precede 2-4 so prev tracks the LAST tick's position, not
- *   this one — that's what makes render lerp interpolate between two
- *   known endpoints.  Step 3 (cap) before step 4 (integrate) so a spike
- *   of wander can't briefly produce a velocity huge enough to teleport
- *   past a wall in one frame.  Step 5 after step 4 so we test the
- *   FRESHLY integrated position against the bounds.
- *
- * WHY IT EXISTS (vs inlining in scene_tick)
- *   scene_tick stays at orchestrator level — "for each active star,
- *   advance".  If we ever swap wander for gravity or attractor physics,
- *   only star_tick changes.
+ * The order is deliberate. We save the old position first so the smooth-
+ * motion blend has both endpoints to slide between. We cap the speed
+ * before moving, so one big random nudge can't fling a star clear through
+ * a wall in a single step. We check the walls last, against the position
+ * it just landed on.
  */
 static void star_tick(Star *s, float dt, float max_px, float max_py) {
-  /* Step 1 — save position for render lerp. */
+  /* Step 1 — remember where it was, for the smooth-motion blend. */
   s->prev_px = s->px;
   s->prev_py = s->py;
 
-  /* Step 2 — wander: random acceleration in ±WANDER_ACCEL. */
+  /* Step 2 — give it a small random shove so it wanders. */
   float ax = ((float)(rand() % 2001) - 1000.0f) / 1000.0f * WANDER_ACCEL;
   float ay = ((float)(rand() % 2001) - 1000.0f) / 1000.0f * WANDER_ACCEL;
   s->vx += ax * dt;
   s->vy += ay * dt;
 
-  /* Step 3 — magnitude clamp so wander can't run away. */
+  /* Step 3 — if it's going too fast, scale it back to the speed limit. */
   float spd = sqrtf(s->vx * s->vx + s->vy * s->vy);
   if (spd > SPEED_CAP) {
     float inv = SPEED_CAP / spd;
@@ -471,11 +315,11 @@ static void star_tick(Star *s, float dt, float max_px, float max_py) {
     s->vy *= inv;
   }
 
-  /* Step 4 — explicit Euler integration. */
+  /* Step 4 — move it: position += velocity * time. */
   s->px += s->vx * dt;
   s->py += s->vy * dt;
 
-  /* Step 5 — elastic wall reflection (snap into bounds + negate vel). */
+  /* Step 5 — if it hit an edge, pin it back inside and bounce it off. */
   if (s->px < 0.0f) {
     s->px = 0.0f;
     s->vx = -s->vx;
@@ -494,34 +338,33 @@ static void star_tick(Star *s, float dt, float max_px, float max_py) {
   }
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6 scene ── */
 
 /*
- * Scene — owns the star pool plus run-time knobs.  The whole simulation
- * state in one struct.  No malloc after init; no other dynamic state.
+ * Scene — the whole world in one struct: the stars plus the few things
+ * the user can tweak at runtime. Everything is allocated up front; no
+ * memory is grabbed or freed while it's running.
  *
- *   stars            fixed-size pool of STARS_MAX = 80 stars
- *   n                active count; live slice is stars[0..n-1]
- *   paused           if true, scene_tick early-returns
- *   connect_preset   index into k_connect_presets — distance threshold
- *   current_theme    index into k_themes[] — palette
+ *   stars            a fixed pool of room for STARS_MAX stars
+ *   n                how many are actually in use right now
+ *   paused           when true, the stars stop moving
+ *   connect_preset   which line-distance from k_connect_presets is active
+ *   current_theme    which colour scheme from k_themes is active
  *
- * The "active prefix" pattern (no per-slot `active` flag) works because
- * stars are interchangeable — once spawned, no slot identity matters.
- *   add a star    → star_spawn(&stars[n]); n++   (O(1) write)
- *   remove a star → n--                          (O(1), no resource freed)
+ * The live stars are always the first n in the pool. Stars are all alike
+ * once placed, so there's no need to track which slot is which:
+ *   add one    → fill slot n, then n++
+ *   remove one → n--   (the slot's memory just sits unused)
  */
 typedef struct {
   Star stars[STARS_MAX];
-  int n; /* active prefix: stars[0..n-1] live */
+  int n; /* the first n stars are the live ones */
   bool paused;
-  int connect_preset; /* index into k_connect_presets */
-  int current_theme;  /* index into k_themes[]        */
+  int connect_preset; /* which entry of k_connect_presets */
+  int current_theme;  /* which entry of k_themes          */
 } Scene;
 
-/* scene_init — zero the Scene, install defaults, spawn STARS_DEFAULT stars. */
+/* Clear everything, set the defaults, and scatter the opening stars. */
 static void scene_init(Scene *sc, int cols, int rows) {
   memset(sc, 0, sizeof *sc);
   sc->n = STARS_DEFAULT;
@@ -532,22 +375,9 @@ static void scene_init(Scene *sc, int cols, int rows) {
 }
 
 /*
- * scene_tick — DRIVER.  Per-frame physics orchestrator.
- *
- *   if paused:  return
- *   max_px, max_py ← pw(cols)-1, ph(rows)-1     right + bottom walls in pixels
- *   for i = 0..n-1:
- *     star_tick(stars[i], dt, max_px, max_py)
- *
- * INPUTS / UNITS
- *   sc          Scene mutated; every active star advances by dt
- *   dt          frame time in seconds (after any global speed scaling)
- *   cols, rows  terminal extent in cells; converted to pixel walls here
- *
- * Stars do NOT see each other in tick — that's a render-time concern,
- * handled by scene_draw_connections via the pair scan.  Tick is pure
- * physics, never touches ncurses; this is what lets a future test
- * harness or batch renderer drive the same Scene without scaffolding.
+ * Move every live star forward one step (unless paused). Stars don't
+ * notice each other here — the lines between them are purely a drawing
+ * thing, handled later. This does no screen work at all, just the math.
  */
 static void scene_tick(Scene *sc, float dt, int cols, int rows) {
   if (sc->paused)
@@ -560,8 +390,12 @@ static void scene_tick(Scene *sc, float dt, int cols, int rows) {
     star_tick(&sc->stars[i], dt, max_px, max_py);
 }
 
-/* draw_line — thin-Bresenham + slope glyph + stipple stride +
- * first-writer-wins. */
+/*
+ * Draw a thin straight line between two cells using one character per
+ * step, picking - | / or \ to match the slope. `stipple` lets us skip
+ * cells to fade a line out. `used` marks cells already drawn this frame
+ * so the first line to reach a cell keeps it (stops glyphs clashing).
+ */
 static void draw_line(WINDOW *w, int x0, int y0, int x1, int y1, chtype attr,
                       int stipple, int cols, int rows, bool *used) {
   int adx = abs(x1 - x0), sx = (x0 < x1) ? 1 : -1;
@@ -580,7 +414,7 @@ static void draw_line(WINDOW *w, int x0, int y0, int x1, int y1, chtype attr,
   }
 
   if (adx >= ady) {
-    /* shallow: one cell per column */
+    /* mostly horizontal: step one column at a time */
     int err = adx / 2;
     for (int x = x0; x != x1 + sx; x += sx) {
       int next_err = err - ady;
@@ -600,7 +434,7 @@ static void draw_line(WINDOW *w, int x0, int y0, int x1, int y1, chtype attr,
       }
     }
   } else {
-    /* steep: one cell per row */
+    /* mostly vertical: step one row at a time */
     int err = ady / 2;
     for (int y = y0; y != y1 + sy; y += sy) {
       int next_err = err - adx;
@@ -622,7 +456,7 @@ static void draw_line(WINDOW *w, int x0, int y0, int x1, int y1, chtype attr,
   }
 }
 
-/* clamp_cell_{x,y} — pin a cell index into [0, extent). */
+/* Keep a cell index from falling off the screen edges. */
 static inline int clamp_cell_x(int v, int cols) {
   if (v < 0)
     return 0;
@@ -638,7 +472,11 @@ static inline int clamp_cell_y(int v, int rows) {
   return v;
 }
 
-/* compute_lerp_positions — fill dpx/dpy/dcx/dcy caches for n active stars. */
+/*
+ * Work out where to actually draw each star this frame: blend between its
+ * old and new spot (alpha says how far along) for smooth motion, in both
+ * pixels (dpx/dpy, for measuring distance) and cells (dcx/dcy, for drawing).
+ */
 static void compute_lerp_positions(const Scene *sc, float alpha, int cols,
                                    int rows, float *dpx, float *dpy, int *dcx,
                                    int *dcy) {
@@ -651,7 +489,11 @@ static void compute_lerp_positions(const Scene *sc, float alpha, int cols,
   }
 }
 
-/* pick_connect_style — three brightness buckets from ratio ∈ [0, 1). */
+/*
+ * Choose how a line looks from how stretched it is (ratio: 0 = stars
+ * touching, near 1 = barely in range). Close pairs get a bold solid line;
+ * the farther apart, the dimmer and more dotted it gets.
+ */
 static void pick_connect_style(float ratio, chtype *out_attr,
                                int *out_stipple) {
   if (ratio < 0.50f) {
@@ -666,7 +508,10 @@ static void pick_connect_style(float ratio, chtype *out_attr,
   }
 }
 
-/* scene_draw_connections — O(N²/2) pair scan; squared-distance cull, then draw.
+/*
+ * Check every pair of stars and draw a line between the close ones. We
+ * compare squared distances to skip the costly square root for pairs that
+ * are too far apart, and only take the real distance for the few that draw.
  */
 static void scene_draw_connections(const Scene *sc, WINDOW *w, int cols,
                                    int rows, const float *dpx, const float *dpy,
@@ -680,10 +525,10 @@ static void scene_draw_connections(const Scene *sc, WINDOW *w, int cols,
       float dy_px = dpy[j] - dpy[i];
       float dist_sq = dx_px * dx_px + dy_px * dy_px;
       if (dist_sq >= cdist_sq)
-        continue; /* cull, no sqrt */
+        continue; /* too far apart — skip without the square root */
 
       float dist = sqrtf(dist_sq);
-      float ratio = dist / connect_dist; /* 0=close, 1=edge */
+      float ratio = dist / connect_dist; /* 0 = touching, 1 = at the limit */
 
       chtype attr;
       int stipple;
@@ -695,7 +540,7 @@ static void scene_draw_connections(const Scene *sc, WINDOW *w, int cols,
   }
 }
 
-/* scene_draw_stars — paint star glyphs LAST so they sit on top of any line. */
+/* Draw the star glyphs. Done last so a star always sits on top of a line. */
 static void scene_draw_stars(const Scene *sc, WINDOW *w, const int *dcx,
                              const int *dcy) {
   for (int i = 0; i < sc->n; i++) {
@@ -707,41 +552,20 @@ static void scene_draw_stars(const Scene *sc, WINDOW *w, const int *dcx,
 }
 
 /*
- * scene_draw — DRIVER.  Per-frame render orchestrator at sub-tick alpha.
- *
- *   Step 1   compute_lerp_positions  → dpx/dpy/dcx/dcy caches (n stars)
- *   Step 2   cell_used ← zero        per-frame VLA bool[rows][cols]
- *            scene_draw_connections  pair scan + brightness buckets +
- *                                    thin-Bresenham draw_line
- *   Step 3   scene_draw_stars        paint glyphs LAST (foreground wins)
- *
- * INPUTS / UNITS
- *   sc          Scene to read (const).
- *   w           destination WINDOW (typically stdscr).
- *   cols, rows  terminal extent in cells; sizes the cell_used VLA.
- *   alpha       ∈ [0, 1).  0 = at last tick; →1 = at next tick.
- *
- * WHY THE LAYER ORDER
- *   Lines first, stars last (painter's algorithm).  Reverse and a star's
- *   glyph can be overwritten by a later line passing through the same
- *   cell — visible "missing star" artefact.
- *
- * WHY IT EXISTS (vs inlining the three steps in screen_draw)
- *   The cache arrays (dpx/dpy/dcx/dcy) are computed ONCE here and read
- *   by both downstream passes.  Splitting further would either re-lerp
- *   (wasted work) or thread a "PrecomputedPositions" struct through
- *   every signature.  Three named steps in one function reads as the
- *   algorithm.
+ * Draw one full frame: figure out where everything is, draw the lines,
+ * then draw the stars on top. Lines first and stars last so a star is
+ * never hidden by a line crossing the same spot. `alpha` is how far we
+ * are between the last and next movement step (0 = just stepped).
  */
 static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows,
                        float alpha) {
-  /* Step 1 — lerp every star into pixel + cell caches. */
+  /* Step 1 — work out the on-screen spot for every star, once. */
   float dpx[STARS_MAX], dpy[STARS_MAX];
   int dcx[STARS_MAX], dcy[STARS_MAX];
   compute_lerp_positions(sc, alpha, cols, rows, dpx, dpy, dcx, dcy);
 
-  /* Step 2 — proximity-graph pair scan, drawing connection lines.
-   * cell_used is cleared per frame; first-writer wins inside draw_line. */
+  /* Step 2 — draw the lines. cell_used starts blank each frame and lets
+   * the first line into a cell win, so overlapping lines don't clash. */
   bool cell_used[rows][cols];
   memset(cell_used, 0, sizeof cell_used);
 
@@ -749,14 +573,13 @@ static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows,
   scene_draw_connections(sc, w, cols, rows, dpx, dpy, dcx, dcy, connect_dist,
                          &cell_used[0][0]);
 
-  /* Step 3 — paint stars LAST so they sit on top of any line glyphs. */
+  /* Step 3 — draw the stars on top of the lines. */
   scene_draw_stars(sc, w, dcx, dcy);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen ── */
 
+/* The current terminal size, in cells. */
 typedef struct {
   int cols;
   int rows;
@@ -827,10 +650,18 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app ── */
 
+/*
+ * App — everything the program holds together while it runs: the world,
+ * the screen size, the chosen update rate, and two flags that the OS
+ * signal handlers flip. They're sig_atomic_t because a signal can change
+ * them at any instant, even mid-instruction.
+ *
+ *   sim_fps      how many movement steps per second
+ *   running      cleared when it's time to quit
+ *   need_resize  set when the terminal window changed size
+ */
 typedef struct {
   Scene scene;
   Screen screen;
@@ -963,21 +794,21 @@ int main(void) {
 
   while (app->running) {
 
-    /* ── resize ──────────────────────────────────────────────── */
+    /* Handle a window resize before anything else this frame. */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
       sim_accum = 0;
     }
 
-    /* ── dt ──────────────────────────────────────────────────── */
+    /* How much real time passed since the last frame. */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
     if (dt > 100 * NS_PER_MS)
-      dt = 100 * NS_PER_MS; /* pause guard */
+      dt = 100 * NS_PER_MS; /* if we stalled, don't try to catch up forever */
 
-    /* ── fixed-timestep sim accumulator ─────────────────────── */
+    /* Run as many fixed-size movement steps as the elapsed time earns. */
     int64_t tick_ns = TICK_NS(app->sim_fps);
     float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
 
@@ -988,14 +819,13 @@ int main(void) {
     }
 
     /*
-     * alpha = fractional tick elapsed since last physics step.
-     * Passed to scene_draw for lerp interpolation.
-     *   alpha = 0.0 → draw at ticked position (no change)
-     *   alpha = 0.9 → draw 90 % of the way toward the next tick
+     * How far we are between the last movement step and the next one.
+     * The renderer uses it to draw stars part way along for smooth motion:
+     * 0.0 = right on the last step, 0.9 = almost at the next one.
      */
     float alpha = (float)sim_accum / (float)tick_ns;
 
-    /* ── FPS counter ─────────────────────────────────────────── */
+    /* Update the on-screen frames-per-second figure now and then. */
     frame_count++;
     fps_accum += dt;
     if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1005,15 +835,15 @@ int main(void) {
       fps_accum = 0;
     }
 
-    /* ── frame cap ───────────────────────────────────────────── */
+    /* Sleep just enough to hold the draw rate near 60 frames a second. */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
-    /* ── draw + present ─────────────────────────────────────── */
+    /* Draw the frame and flush it to the terminal. */
     screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps, alpha);
     screen_present();
 
-    /* ── input ───────────────────────────────────────────────── */
+    /* Read a key if one's waiting (this doesn't block). */
     int key = getch();
     if (key != ERR && !app_handle_key(app, key))
       app->running = 0;

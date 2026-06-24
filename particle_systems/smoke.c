@@ -1,279 +1,30 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * smoke.c  —  ncurses ASCII smoke, five physics algorithms
+ * smoke.c — ASCII smoke in the terminal, five ways.
  *
- * ALGORITHMS (cycle with 'a'):
+ * One shared grid of "how much smoke is here" (0 = clear, 1 = thick).
+ * Five interchangeable methods fill that grid each tick, then one shared
+ * renderer turns the numbers into soft round glyphs.  Press 'a' to cycle:
+ *   0 particle — fly little puffs upward and dab them onto the grid
+ *   1 vortex   — stir with a few whirlpools (you see curls and swirls)
+ *   2 curl     — stir with smooth random flow (no obvious centres)
+ *   3 buoyancy — the smoke lifts itself because thick = hot = rises
+ *   4 breeze   — a swaying side-wind bends the column like a curtain
  *
- *   0  Particle Puffs   — Pool of MAX_PARTS Lagrangian particles born at the
- *                         source zone with upward velocity and a random
- *                         lifetime.  Density = life² (quadratic fade).
- *                         Particles bilinear-splat onto the float density
- *                         grid before the shared rendering pipeline runs.
+ * Methods 1..4 share one trick (semi-Lagrangian advection): they only
+ * differ in how they compute the wind at each cell — everything else is
+ * shared in §4.  Sister file fire.c uses the same dithered renderer.
  *
- *   Algos 1..4 are all Eulerian semi-Lagrangian advection — same back-trace
- *   + bilinear-sample + decay + arch-source pipeline; only the velocity field
- *   differs:
- *
- *   1  Vortex Advection — N_VORTS=3 orbiting point vortices generate the
- *                         velocity field via 2D Biot-Savart.  Mixed +/−
- *                         chirality gives counter-rotating eddies; visible
- *                         signature is obvious curls and swirls.
- *
- *   2  Curl Noise       — velocity = curl of a smooth scalar noise potential
- *                         (divergence-free by construction).  Smooth
- *                         distributed flow, no obvious centres; smoke
- *                         meanders organically over the whole frame.
- *
- *   3  Buoyancy Plume   — vy = −rise · density[here]  (Boussinesq: hot rises).
- *                         Density doubles as temperature; tall thin plumes
- *                         that mushroom-cap where buoyancy balances decay.
- *
- *   4  Breeze           — vx(y, t) = amp · sin(t + y · k); vy = small rise.
- *                         Closed-form laminar pattern.  Smoke rises as a
- *                         waving curtain, each row at its own sway phase.
- *
- * All five algorithms write into the same [rows × cols] float density grid.
- * The shared rendering path runs Floyd-Steinberg dithering then maps density
- * to one of 9 ASCII chars via a perceptual LUT (identical to fire.c).
- *
- * Keys:
- *   q / ESC   quit
- *   space     pause / resume
- *   a         next algorithm (cycle 0..4)
- *   t / T     next / previous theme
- *   g  G      source intensity up / down
- *   w  W      wind right / left
- *   0         calm (no wind)
- *   ]  [      sim Hz up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra smoke.c -o smoke -lncurses -lm
- *
- * Sections
- * --------
- *   §1  presets       — all tunable constants, grouped by sub-system
- *   §2  clock
- *   §3  theme         — 10 palettes, Floyd-Steinberg + LUT pipeline
- *   §4  shared helpers— warmup_scale, clampf, bilinear_sample,
- *                       SLCtx + semi-Lagrangian kernel (sl_step_cell)
- *   §5  algo 0        — particle puffs
- *   §6  algo 1        — vortex advection
- *   §7  algo 2        — curl-noise advection
- *   §8  algo 3        — buoyancy plume
- *   §9  algo 4        — breeze advection
- *   §10 scene         — owns all state, dispatches tick / draw
- *   §11 screen        — ncurses layer + HUD
- *   §12 app           — main loop
+ * References (the ideas behind the code, where the code can't tell you):
+ *   Reeves (1983), "Particle Systems", ACM TOG 2(2):91-108 — method 0.
+ *   Stam (1999), "Stable Fluids", SIGGRAPH '99:121-128 — methods 1..4.
+ *   Floyd & Steinberg (1976), "An Adaptive Algorithm for Spatial
+ *     Greyscale", Proc. SID 17(2):75-77 — the dithering in scene_draw.
+ *   Bridson (2015), "Fluid Simulation for Computer Graphics", 2nd ed,
+ *     ch.3 (advection) and §2.3 (point vortices).
+ *   Akenine-Moller et al. (2018), "Real-Time Rendering", 4th ed,
+ *     §5.6 (gamma) and §13.7 (soft particle splatting).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm 0 — Particle System (Reeves):
- *   Particles carry (x, y, vx, vy, life).  Each tick: turbulence random
- *   walk on vx, upward vy drift, life decreases.  density = life² gives a
- *   quadratic fade so particles are bright at birth and fade out smoothly.
- *   Bilinear splat distributes density across 4 surrounding grid cells
- *   (1-pixel tent filter) for soft-edged smoke puffs.
- *
- * Algorithms 1..4 — Eulerian semi-Lagrangian (Stam):
- *   Four different ways to define the velocity field that stirs the
- *   density grid.  Each tick, for every cell:
- *       v   = velocity_field_at(x, y, t)
- *       sx  = x − vx·ADV_DT;  sy = y − vy·ADV_DT     (back-trace)
- *       new = bilinear_sample(density, sx, sy) · (1 − decay) + source(p)
- *   Differs only in how the velocity field is computed:
- *
- *   1 — Vortex Advection:
- *       N_VORTS=3 orbiting point vortices each contribute via 2D Biot-Savart
- *       vx += strength × (−dy) / (r² + VORT_EPS)
- *       vy += strength × ( dx) / (r² + VORT_EPS)
- *       Mixed +/− chirality across vortices → counter-rotating eddies.
- *
- *   2 — Curl-Noise Advection:
- *       velocity = curl of a smooth scalar noise potential.  Divergence-
- *       free by construction (∇·v ≡ 0) — density is conserved without
- *       artificial sinks.  Time-varying via t-offset on the noise coord.
- *       Visible signature: smooth distributed flow, no obvious centres.
- *
- *   3 — Buoyancy Plume (Boussinesq):
- *       vy = −BUOY_RISE · density[here]   (hot rises, cold sinks)
- *       vx = mild noise-driven horizontal turbulence
- *       Density doubles as temperature.  Visible signature: tall thin
- *       plume that mushroom-caps where buoyancy balances decay.
- *
- *   4 — Breeze Advection:
- *       vx(y, t) = BREEZE_AMP · sin(t + y · BREEZE_K)   (laminar sway)
- *       vy       = −BREEZE_RISE                          (gentle rise)
- *       Closed-form 1-D pattern, no noise table.  Visible signature:
- *       smoke rises as a waving curtain, each row at its own phase.
- *
- *   All four share the same CFL clamp (ADV_VEL_CAP=2 cells/tick) and the
- *   same arch-shaped source injection on the bottom row.  Wind is
- *   accumulated once in scene_tick() and passed to each algo — algos
- *   must NOT advance wind_acc themselves.
- *
- * Rendering (shared):
- *   Same Floyd-Steinberg + gamma-corrected LUT pipeline as fire.c.
- *   Ramp: " .,:coO0#"  (soft round chars for a smoky feel).
- *   Only cells that were non-zero last frame and are now zero get an
- *   explicit erase — same borderless diff trick as fire.c.
- *
- * References
- * ──────────
- *   PAPERS
- *     Reeves, W. T. (1983)
- *       "Particle Systems — A Technique for Modeling a Class of Fuzzy Objects"
- *       ACM Transactions on Graphics 2(2): 91-108.
- *       Foundational paper.  Algo 1 (Particle System) is a direct
- *       Reeves system — pool, life-decay, per-particle update with
- *       turbulence + drift.  The bilinear splat that scatters life²
- *       across 4 cells is the ASCII-cell analogue of Reeves' point-
- *       sprite rendering.
- *
- *     Stam, J. (1999)
- *       "Stable Fluids"
- *       SIGGRAPH '99 Proceedings: 121-128.
- *       THE paper for semi-Lagrangian advection.  Shared by Algos
- *       1..4 (vortex, curl, buoy, breeze) via the sl_step_cell
- *       kernel: the back-trace formula new_density(p) =
- *       bilinear(old, p − v·ΔT) and the CFL stability bound
- *       (ADV_DT·|v_max| ≤ 1.6 cells) come straight from Stam §3.
- *       The velocity-cap at ADV_VEL_CAP=2 is exactly the CFL clamp
- *       Stam recommends for unconditional stability.
- *
- *     Floyd, R. W. & Steinberg, L. (1976)
- *       "An Adaptive Algorithm for Spatial Greyscale"
- *       Proc. Society for Information Display 17(2): 75-77.
- *       The 7/16, 3/16, 5/16, 1/16 error-diffusion mask scene_draw
- *       uses to dither the continuous density grid into the 9-step
- *       ASCII ramp.  Same coefficients, two dimensions short of a
- *       printer driver.
- *
- *   BOOKS
- *     Bridson, R. — "Fluid Simulation for Computer Graphics"
- *       (2nd ed, CRC Press, 2015).
- *       Definitive textbook on grid-based fluid sim.  Chapter 3
- *       covers semi-Lagrangian advection — the shared kernel that
- *       drives Algos 1..4.  §2.3 on Biot-Savart point vortices
- *       grounds the v = strength · (-dy, dx) / (r² + ε) formula
- *       Algo 1 (vortex_tick) uses, and the role of ε (= VORT_EPS)
- *       as a regulariser preventing the singularity at the vortex
- *       centre.
- *
- *     Witkin, A. & Baraff, D. (2001)
- *       "Physically Based Modeling: Principles and Practice"
- *       SIGGRAPH course notes (online proceedings).  §1 — particle
- *       dynamics with explicit force accumulation, the pattern Algo
- *       1's per-particle update follows (vx += turbulence, vx *=
- *       0.97 damping, life -= decay).
- *
- *     Akenine-Möller, T., Haines, E. & Hoffman, N. — "Real-Time
- *       Rendering" (4th ed, CRC Press, 2018).
- *       §5.6 — gamma correction (the pow(density, 1/2.2) in
- *       scene_draw maps linear-light density to perceptually-uniform
- *       brightness); §13.7 — point-sprite particle rendering with
- *       soft-edged tent-filter falloff, the bilinear splat being the
- *       cell-grid analogue.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Five different ways of stirring a single shared float density grid,
- * then one shared dithered renderer that maps density to round soft
- * glyphs.  Algo 0 (particle) flies puffs upward and bilinear-splats
- * their life² onto 4 neighbouring cells (soft tent-filter blobs).
- * Algos 1..4 are all Eulerian semi-Lagrangian advections sharing the
- * same back-trace + bilinear-sample + decay + arch-source pipeline,
- * differing only in HOW THEY COMPUTE THE VELOCITY at each cell:
- *   1 (vortex) — sum of Biot-Savart contributions from 3 orbiting
- *                point vortices (curls + swirls are the streamlines)
- *   2 (curl)   — curl of a smooth scalar noise field (divergence-free
- *                distributed flow, no centres)
- *   3 (buoy)   — vy = −rise·density (hot rises, mushroom-cap plumes)
- *   4 (breeze) — vx(y,t) = amp·sin(t + y·k)  (swaying laminar curtain)
- *
- * ALGORITHM IN STEPS  (per tick)
- * ──────────────────
- *  scene_tick (always):
- *    1. wind_acc += wind; wrap at ±cols.
- *    2. dispatch by algo.
- *
- *  Algo 0 — Particle Puffs (particle_tick):
- *    a. for each active particle:
- *         vx += turb±0.06; vx *= 0.97; x+=vx; y+=vy; life-=decay
- *         deactivate if life≤0 or off-grid.
- *    b. spawn SPAWN_PER_TICK new particles via arch-rejection sampling.
- *    c. clear density grid; bilinear-splat life² into 4 cells per
- *       particle:  weight(x0,y0) = (1-tx)(1-ty), etc.
- *    d. clamp density ≤ 1.
- *
- *  Algos 1..4 — Semi-Lagrangian advection (vortex_tick / curl_tick /
- *               buoy_tick / breeze_tick).  Identical structure; only
- *               the velocity-field computation differs.
- *    a. compute decay from VORT_REACH_FRAC and rows.
- *    b. for each cell (x,y):
- *       — compute v = velocity_field_for_this_algo(x, y, t)
- *                  1 vortex : sum of Biot-Savart over N_VORTS
- *                  2 curl   : (∂P/∂y, −∂P/∂x) where P is curl_noise2d
- *                  3 buoy   : (turb·noise(x,y,t), −rise·density[here])
- *                  4 breeze : (amp·sin(t + y·k), −rise)
- *       — clamp |v| ≤ ADV_VEL_CAP=2 (CFL stability).
- *       — sx = x − vx·ADV_DT; sy = y − vy·ADV_DT (back-trace).
- *       — adv = bilinear_sample(density, sx, sy).
- *       — src = arch·intensity·jitter·wscale on bottom row only.
- *       — work[y][x] = adv·(1−decay) + src.
- *    c. memcpy work → density.
- *
- *  scene_draw (shared):
- *    1. for each density cell: if d=0 mark −1; else d = pow(d,1/2.2).
- *    2. Floyd-Steinberg dither: err = d − lut_midpoint(idx);
- *       diffuse 7/16, 3/16, 5/16, 1/16 to neighbours.
- *    3. mvaddch(y, x, k_ramp[idx]) with theme attribute.
- *    4. cells that were non-zero last frame but zero now → ' '.
- *    5. swap density ↔ prev_density.
- *
- * KEY FORMULAS
- * ────────────
- *  Arch envelope:
- *      t = (x − margin − wind_acc) / span
- *      arch = (min(t, 1−t) · 2)²                    0 at edges, 1 ctr
- *
- *  Particle bilinear splat (life² distributed across 4 cells):
- *      w00 = (1-tx)(1-ty)   w10 = tx(1-ty)
- *      w01 = (1-tx)ty       w11 = tx·ty
- *      density[y0..y1][x0..x1] += life² · w
- *
- *  Semi-Lagrangian advection (shared by algos 1..4):
- *      density'(p) = density(p − v(p)·ΔT)·(1−decay) + source(p)
- *      ΔT = ADV_DT = 0.8                            CFL: |v|·ΔT ≤ 1.6 cells
- *
- *  Velocity fields per algo:
- *      1 vortex : vx += s·(−dy)/(r² + VORT_EPS)     Biot-Savart point vortex
- *                 vy += s·( dx)/(r² + VORT_EPS)
- *                 ε = 6.0 prevents singularity at vortex centre
- *                 orbits r·{0.20, 0.30, 0.18}·cols, ω ∈ {+0.018, −0.011,
- * +0.025} strengths {+2.5, −1.8, +1.4} → mixed chirality
- *
- *      2 curl   : vx =  CURL_AMP · (P(x, y+h) − P(x, y-h)) / 2h
- *                 vy = −CURL_AMP · (P(x+h, y) − P(x-h, y)) / 2h
- *                 P = curl_noise2d(scale·x, scale·y + t)
- *                 vy −= CURL_UPWARD_BIAS                 (smoke rises)
- *
- *      3 buoy   : vx = (curl_noise2d(...) − 0.5) · 2·BUOY_TURB_AMP
- *                 vy = −BUOY_RISE · density[here]       Boussinesq buoyancy
- *
- *      4 breeze : vx = BREEZE_AMP · sin(t + y · BREEZE_K)
- *                 vy = −BREEZE_RISE
- *
- *  Dither + LUT:
- *      d = pow(density, 1/2.2)                      gamma to perceptual
- *      idx = lut_index(d) ∈ 0..8
- *      glyph = " .,:coO0#"[idx]
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -291,11 +42,9 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  presets                                                            */
-/* ===================================================================== */
+/* ── §1 presets — every tunable number, grouped by what it controls ── */
 
-/* ── loop / display ─────────────────────────────────────────────────── */
+/* ── loop / display ── */
 enum {
   SIM_FPS_MIN = 5,
   SIM_FPS_DEFAULT = 30,
@@ -306,35 +55,34 @@ enum {
   FPS_UPDATE_MS = 500,
 
   N_ALGOS = 5,
-  MAX_PARTS = 400, /* particle pool size                          */
-  N_VORTS = 3,     /* number of orbiting vortices                 */
+  MAX_PARTS = 400, /* how many smoke puffs can be alive at once  */
+  N_VORTS = 3,     /* how many whirlpools method 1 uses          */
 };
 
-#define WIND_MAX 3 /* max wind offset in cells/tick               */
+#define WIND_MAX 3 /* most the wind can shift the smoke, cells per tick */
 
-/* ── source zone (shared by all five algos) ──────────────────────────
- * The smoke source is an arch shape along the bottom row.
- *   ARCH_MARGIN_FRAC  : fraction of cols kept empty at each side edge
- *   SRC_JITTER_BASE   : minimum random multiplier on source (prevents flat
- * line) SRC_JITTER_RANGE  : random range added on top of BASE (0 → RANGE)
- *   WARMUP_TICKS      : linear ramp 0→1 at startup so smoke builds gradually
- *   WARMUP_CAP        : warmup counter is clamped here (prevents int overflow
- *                       and keeps warmup_scale() at exactly 1.0 after startup)
- * ─────────────────────────────────────────────────────────────────────*/
-#define ARCH_MARGIN_FRAC 0.06f /* 6% of cols kept empty at each side    */
-#define SRC_JITTER_BASE 0.80f  /* min random multiplier on source       */
-#define SRC_JITTER_RANGE 0.20f /* extra random range 0→0.20            */
-#define WARMUP_TICKS 80        /* ramp 0→1 over first 80 ticks         */
-#define WARMUP_CAP 200         /* counter capped here; scale stays 1.0  */
+/* ── the smoke source, shared by all five methods ──
+ * Smoke is fed in along the bottom row, strongest in the middle and fading
+ * to nothing at the edges (an arch shape).  These shape and warm-up it.
+ *   ARCH_MARGIN_FRAC : how much of each side edge stays empty
+ *   SRC_JITTER_BASE  : smallest flicker multiplier, so the base never goes flat
+ *   SRC_JITTER_RANGE : extra random flicker added on top
+ *   WARMUP_TICKS     : ease the smoke in over this many ticks at startup
+ *   WARMUP_CAP       : stop counting here so the counter never overflows and
+ *                      the warm-up multiplier stays pinned at 1.0 afterwards */
+#define ARCH_MARGIN_FRAC 0.06f
+#define SRC_JITTER_BASE 0.80f
+#define SRC_JITTER_RANGE 0.20f
+#define WARMUP_TICKS 80
+#define WARMUP_CAP 200
 
-/* ── algo 0: particle puffs ─────────────────────────────────────────────
- *   PART_LIFE_MIN/RANGE  : lifetime = MIN + rand×RANGE ticks
- *   PART_VY_BASE/RANGE   : upward speed = BASE + rand×RANGE (vy negative)
- *   PART_VX_SPREAD       : birth lateral kick ±SPREAD/2
- *   PART_TURB_STEP       : per-tick turbulence on vx (random ±TURB/2)
- *   PART_VX_DAMP         : vx damping per tick
- *   SPAWN_PER_TICK       : new particles each tick
- * ─────────────────────────────────────────────────────────────────────*/
+/* ── method 0: particle puffs ──
+ *   PART_LIFE_MIN/RANGE : each puff lives MIN + random*RANGE ticks
+ *   PART_VY_BASE/RANGE  : upward speed at birth (vy is negative = up)
+ *   PART_VX_SPREAD      : random sideways kick at birth
+ *   PART_TURB_STEP      : random wobble added to sideways speed each tick
+ *   PART_VX_DAMP        : sideways speed bleeds off a little each tick
+ *   SPAWN_PER_TICK      : new puffs born each tick */
 #define PART_LIFE_MIN 35.f
 #define PART_LIFE_RANGE 35.f
 #define PART_VY_BASE 0.25f
@@ -344,28 +92,28 @@ enum {
 #define PART_VX_DAMP 0.97f
 #define SPAWN_PER_TICK 5
 
-/* ── shared semi-Lagrangian config (used by algos 1..4) ────────────────
- *   ADV_DT             : semi-Lagrangian time step (cells/tick); ≤1 for
- * stability ADV_VEL_CAP        : clamp every velocity field so back-trace ≤ 2
- * cells away VORT_REACH_FRAC    : target smoke height as fraction of rows (for
- * decay) VORT_DECAY_SCALE   : decay = (1/target) × this VORT_DECAY_MIN     :
- * floor on decay so tiny terminals still dissipate
- * ─────────────────────────────────────────────────────────────────────*/
+/* ── shared settings for methods 1..4 (the advection methods) ──
+ *   ADV_DT          : how far back in time we look each step (keep small)
+ *   ADV_VEL_CAP     : cap on any wind so the look-back stays nearby (~2 cells)
+ *   VORT_REACH_FRAC : how tall the smoke column should climb, as a fraction
+ *                     of screen height; the fade rate is derived from it
+ *   VORT_DECAY_SCALE: tuning knob multiplied into that fade rate
+ *   VORT_DECAY_MIN  : smallest fade rate, so even tiny terminals clear out */
 #define ADV_DT 0.8f
 #define ADV_VEL_CAP 2.0f
 #define VORT_REACH_FRAC 0.55f
 #define VORT_DECAY_SCALE 0.9f
 #define VORT_DECAY_MIN 0.010f
 
-/* ── algo 1: vortex advection ───────────────────────────────────────────
- *   VORT_EPS           : Biot-Savart softening (avoids singularity at centre)
- *
- * Vortex orbital presets (indices match N_VORTS=3):
- *   VORT_ORB_FRACS[]   : orbit radius as fraction of cols
- *   VORT_ORB_SPDS[]    : orbital angular speed (rad/tick); negative = clockwise
- *   VORT_STRENGTHS[]   : Biot-Savart strength; positive = CCW, negative = CW
- *   VORT_INIT_ANGLES[] : starting orbital angle (radians)
- * ─────────────────────────────────────────────────────────────────────*/
+/* ── method 1: vortex (whirlpool) advection ──
+ *   VORT_EPS : softening so the wind doesn't blow up at a whirlpool's centre
+ * The four arrays describe the N_VORTS=3 whirlpools, one entry each:
+ *   VORT_ORB_FRACS   : how far each one circles from screen centre (× cols)
+ *   VORT_ORB_SPDS    : how fast it circles (radians/tick); sign = which way
+ *   VORT_STRENGTHS   : how hard it spins the smoke; sign = clockwise or not.
+ *                      Mixing signs gives counter-rotating swirls, not one
+ *                      big spin
+ *   VORT_INIT_ANGLES : where on its circle each one starts */
 #define VORT_EPS 6.0f
 
 static const float VORT_ORB_FRACS[N_VORTS] = {0.20f, 0.30f, 0.18f};
@@ -373,34 +121,31 @@ static const float VORT_ORB_SPDS[N_VORTS] = {0.018f, -0.011f, 0.025f};
 static const float VORT_STRENGTHS[N_VORTS] = {2.5f, -1.8f, 1.4f};
 static const float VORT_INIT_ANGLES[N_VORTS] = {0.0f, 2.1f, 4.3f};
 
-/* ── algo 2: curl-noise advection ───────────────────────────────────────
- *   CURL_SCALE         : noise frequency (cells⁻¹); higher = tighter swirls
- *   CURL_AMP           : peak curl velocity in cells/tick
- *   CURL_TIME_RATE     : how fast the noise field morphs (rad-ish/tick)
- *   CURL_UPWARD_BIAS   : constant upward push added so smoke rises
- * ─────────────────────────────────────────────────────────────────────*/
+/* ── method 2: curl-noise advection ──
+ *   CURL_SCALE       : noise zoom; higher = smaller, tighter swirls
+ *   CURL_AMP         : how strong the swirling flow is
+ *   CURL_TIME_RATE   : how fast the flow pattern slowly reshapes
+ *   CURL_UPWARD_BIAS : steady upward nudge so the smoke actually rises */
 #define CURL_SCALE 0.10f
 #define CURL_AMP 3.5f
 #define CURL_TIME_RATE 0.012f
 #define CURL_UPWARD_BIAS 0.5f
 
-/* ── algo 3: buoyancy plume ─────────────────────────────────────────────
- *   BUOY_RISE          : upward velocity = -BUOY_RISE · density (hot rises)
- *   BUOY_TURB_AMP      : horizontal turbulence amplitude (cells/tick)
- *   BUOY_TURB_SCALE    : turbulence noise frequency
- *   BUOY_TURB_RATE     : how fast the turbulence field morphs
- * ─────────────────────────────────────────────────────────────────────*/
+/* ── method 3: buoyancy plume ──
+ *   BUOY_RISE       : how fast thick smoke lifts itself (thick = hot = rises)
+ *   BUOY_TURB_AMP   : how much it also wobbles sideways
+ *   BUOY_TURB_SCALE : zoom of that sideways wobble pattern
+ *   BUOY_TURB_RATE  : how fast the wobble pattern reshapes */
 #define BUOY_RISE 2.5f
 #define BUOY_TURB_AMP 0.6f
 #define BUOY_TURB_SCALE 0.18f
 #define BUOY_TURB_RATE 0.020f
 
-/* ── algo 4: breeze advection ───────────────────────────────────────────
- *   BREEZE_AMP         : peak horizontal sway in cells/tick
- *   BREEZE_K           : sine wavelength along y (rad/cell)
- *   BREEZE_RATE        : sine phase advance per tick (rad/tick)
- *   BREEZE_RISE        : constant upward drift in cells/tick
- * ─────────────────────────────────────────────────────────────────────*/
+/* ── method 4: breeze advection ──
+ *   BREEZE_AMP  : how far the side-sway pushes
+ *   BREEZE_K    : how quickly the sway angle changes going up the screen
+ *   BREEZE_RATE : how fast the whole sway shifts over time
+ *   BREEZE_RISE : steady upward drift */
 #define BREEZE_AMP 1.4f
 #define BREEZE_K 0.25f
 #define BREEZE_RATE 0.05f
@@ -410,9 +155,7 @@ static const float VORT_INIT_ANGLES[N_VORTS] = {0.0f, 2.1f, 4.3f};
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -427,39 +170,22 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ===================================================================== */
-/* §3  theme + rendering pipeline                                         */
-/* ===================================================================== */
+/* ── §3 theme + rendering pipeline ── */
 
-/*
- * Ramp — ASCII chars ordered light-to-dense, chosen for soft smoky shapes.
- *
- *   ' '  empty / transparent
- *   '.'  wispy trail
- *   ','  thin curl
- *   ':'  light body
- *   'c'  billow edge  (round, small)
- *   'o'  billow mid   (round)
- *   'O'  dense billow
- *   '0'  opaque core
- *   '#'  thick / black smoke
- */
+/* The glyphs we draw smoke with, faintest first, densest last.  Round soft
+ * shapes were picked on purpose so the smoke reads as smoke. */
 static const char k_ramp[] = " .,:coO0#";
 #define RAMP_N (int)(sizeof k_ramp - 1) /* 9 */
 
-#define CP_BASE 1 /* CP_BASE .. CP_BASE+RAMP_N-1 = 1..9 (theme ramp) */
-#define PAIR_HUD                                                                \
-  (CP_BASE + RAMP_N) /* 10 — top status bar, bright yellow, theme-independent \
-                      */
-#define PAIR_HINT                                                              \
-  (CP_BASE + RAMP_N +                                                          \
-   1) /* 11 — bottom key hints,  bright cyan,   theme-independent */
+/* Colour-pair numbering: the theme ramp takes pairs 1..9, then the two HUD
+ * bars sit just above it.  The HUD colours never change with the theme. */
+#define CP_BASE 1
+#define PAIR_HUD (CP_BASE + RAMP_N)      /* 10 — top status bar  */
+#define PAIR_HINT (CP_BASE + RAMP_N + 1) /* 11 — bottom key hints */
 
-/*
- * LUT break points — gamma-corrected density thresholds per ramp level.
- * Bunched in the 0.2–0.7 range so mid-density billows use the most chars
- * (most visible part of a smoke column).
- */
+/* How thick the smoke must be to earn each glyph.  The steps are bunched
+ * in the middle of the range so the mid-thickness billows — the part you
+ * look at most — get the widest variety of characters. */
 static const float k_lut_breaks[RAMP_N] = {
     0.000f, /* ' '  empty        */
     0.060f, /* '.'  wisp         */
@@ -491,24 +217,25 @@ static float lut_midpoint(int idx) {
 }
 
 /*
- * Themes — 10 smoke palettes.  Each is a 9-step foreground ramp from
- * faint wispy edge (ramp[0]) to dense bright core (ramp[8]).  All
- * entries sit in the BRIGHT HALF of the 256-colour cube per the
- * CLAUDE.md "Theme Palette Brightness" rule — even the faintest
- * wisp is visible against a dark terminal background.
+ * SmokeTheme — one colour scheme for the smoke.
  *
- * Cycled by t / T (forward / back).  Default = MATRIX (idx 0).
+ * Each theme is a 9-colour ramp from the faintest wisp (ramp[0]) to the
+ * brightest dense core (ramp[8]); the renderer picks a colour by how thick
+ * the smoke is.  Every colour sits in the bright half of the palette (the
+ * CLAUDE.md brightness rule) so even the faintest wisp shows up on a dark
+ * terminal.  Cycle with t / T; MATRIX is the default.
  *
- *   0  MATRIX  — dark green → lime → cream      (digital rain smoke)
- *   1  FIRE    — dark red → orange → yellow     (fire-lit smoke)
- *   2  OCEANIC — deep teal → cyan → white       (underwater plume)
- *   3  NEON    — violet → pink → white          (retro-arcade haze)
- *   4  MONO    — gray ramp → white              (classic chimney)
- *   5  ICE     — navy → pale blue → white       (frozen vapour)
- *   6  NOVA    — deep blue → white → yellow     (supernova plume)
- *   7  FOREST  — dark green → gold → cream      (canopy mist)
- *   8  DESERT  — wine → tan → cream             (dust storm)
- *   9  ECLIPSE — dark red → peach               (bloodmoon vapour)
+ *   name  : shown in the HUD
+ *   fg256 : the 9 colours on a 256-colour terminal
+ *   fg8   : fallback 9 colours when only 8 colours are available
+ *   attr8 : per-step bold/dim flags for that fallback, to fake brightness
+ *           levels the 8-colour set can't express on its own
+ *
+ *   0 MATRIX  green to cream     5 ICE     navy to white
+ *   1 FIRE    red to yellow      6 NOVA    blue to white to yellow
+ *   2 OCEANIC teal to white      7 FOREST  green to cream
+ *   3 NEON    violet to white    8 DESERT  wine to cream
+ *   4 MONO    gray to white      9 ECLIPSE red to peach
  */
 typedef struct {
   const char *name;
@@ -605,8 +332,8 @@ static void theme_apply(int t) {
 static void color_init(int theme) {
   start_color();
   theme_apply(theme);
-  /* Theme-independent HUD bars — bright high-contrast colours per
-   * CLAUDE.md "HUD Standard" so they stay legible against any theme. */
+  /* The two HUD bars keep the same bright colours no matter which theme is
+   * active, so they stay readable over any smoke. */
   if (COLORS >= 256) {
     init_pair(PAIR_HUD, 226, COLOR_BLACK); /* bright yellow */
     init_pair(PAIR_HINT, 51, COLOR_BLACK); /* bright cyan   */
@@ -627,21 +354,16 @@ static attr_t ramp_attr(int i, int theme) {
   return a;
 }
 
-/* ===================================================================== */
-/* §4  shared helpers                                                     */
-/* ===================================================================== */
+/* ── §4 shared helpers ── */
 
 static inline float clampf(float v, float lo, float hi) {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
-/*
- * warmup_scale() — linear ramp 0→1 over the first WARMUP_TICKS ticks.
- *
- * *warmup is the counter stored in the Scene; it is incremented here and
- * clamped at WARMUP_CAP so it never wraps and the scale stays at 1.0
- * after the warmup period ends.  Call once per tick per algo function.
- */
+/* Ease the smoke in at startup: returns a fade-in factor that climbs from
+ * 0 to 1 over the first WARMUP_TICKS, then stays at 1.  Also advances the
+ * shared counter (stored in the Scene) and stops it before it can overflow.
+ * Call exactly once per tick. */
 static float warmup_scale(int *warmup) {
   float s =
       (*warmup < WARMUP_TICKS) ? (float)*warmup / (float)WARMUP_TICKS : 1.f;
@@ -651,10 +373,10 @@ static float warmup_scale(int *warmup) {
   return s;
 }
 
-/*
- * bilinear_sample() — sample float grid at non-integer position (sx, sy).
- * Clamps at boundaries (Neumann: zero gradient at edges).
- */
+/* Read the grid at an in-between spot like (3.4, 7.8) by blending the four
+ * cells around it, weighted by how close the spot is to each — so the value
+ * changes smoothly instead of jumping cell to cell.  Off the edge, it just
+ * reuses the nearest edge cell. */
 static float bilinear_sample(const float *grid, float sx, float sy, int cols,
                              int rows) {
   int x0 = (int)sx, y0 = (int)sy;
@@ -695,89 +417,51 @@ static float bilinear_sample(const float *grid, float sx, float sy, int cols,
          (1.f - tx) * ty * v01 + tx * ty * v11;
 }
 
-/* ── Semi-Lagrangian shared kernel (used by algos 1..4) ──────────────── *
+/* ── §4a the shared stir-the-grid kernel (methods 1..4) ──
  *
- * REFERENCES:
- *   Stam, J. (1999) "Stable Fluids", SIGGRAPH '99 Proc.: 121-128.
- *     §3 — the unconditionally-stable advection scheme: for each grid
- *     cell, BACK-TRACE one Δt along the velocity field to find where the
- *     fluid that's NOW at (x, y) came FROM, then bilinear-sample the
- *     previous-frame density there.  No explicit forward step → no CFL
- *     blow-up regardless of |v|·Δt.  We still clamp velocity (Stam's
- *     §3.2 advice) so the sample point stays in a small neighbourhood
- *     where the interpolation is accurate.
+ * Methods 1..4 all move smoke the same clever way, called semi-Lagrangian
+ * advection (Stam, "Stable Fluids", 1999).  Instead of pushing each cell's
+ * smoke forward along the wind (which can blow up), we ask the reverse
+ * question for every cell: "given the wind here, where was this smoke one
+ * step ago?"  Step backward to that spot, read the smoke that was there,
+ * and that becomes the new value here.  Reading the past instead of writing
+ * the future is what keeps it stable no matter how strong the wind.
  *
- *   Bridson, R. (2015) "Fluid Simulation for Computer Graphics", 2nd ed.
- *     Chapter 3 covers semi-Lagrangian advection in textbook detail.
- *     The CFL stability bound (ADV_DT · |v_max| ≤ a few cells) we use
- *     directly is from §3.5.
+ * What every cell does each tick:
+ *   - work out the wind at this cell      (the ONLY part each method changes)
+ *   - cap the wind so the look-back stays nearby and the read stays accurate
+ *   - step backward along the wind one short step
+ *   - read the smoke that was there (blended, via bilinear_sample)
+ *   - fade it a touch, and if this is the bottom row add fresh source smoke
  *
- * SCHEMA (the inner loop body the helper executes per cell):
- *   v   = velocity_field_at(x, y, t)    THE algo-specific part
- *   v   = clamp(v, ±ADV_VEL_CAP)         CFL stability clamp
- *   sx  = x − vx · ADV_DT                back-trace one step
- *   sy  = y − vy · ADV_DT
- *   adv = bilinear_sample(density, sx, sy)
- *   src = sl_source_at(c, x, y) · intensity · jitter · wscale   (if y == fy)
- *   new = adv · (1 − decay) + src        Stam Eq. 14-ish
+ * So each method below is just "compute the wind, hand it to sl_step_cell" —
+ * the difference between vortex / curl / buoyancy / breeze IS the wind, and
+ * everything else lives here.
  *
- * The only thing that varies between vortex / curl / buoy / breeze is
- * how the velocity is computed.  Everything else — CFL clamp, back-trace,
- * bilinear sample, arch source on bottom row, blend with decay, clamp
- * to [0, 1] — is identical.  Factoring those into one helper makes each
- * algo a tight pseudocode listing where only the velocity model differs
- * (which is also where the conceptual difference between the algos lives).
+ * SLCtx — the bundle of values the per-cell step needs.
  *
- * SLCtx — per-tick context object.
+ * These are all the same for every cell in a tick, so we compute them once
+ * (sl_make_ctx) and pass the bundle by pointer rather than 10 loose
+ * arguments per cell.
  *
- * INTENT: pack all the loop-invariant constants the SL inner loop needs
- * into one struct passed by pointer, instead of threading 10+ scalar
- * arguments through `sl_step_cell()` for every (x, y).  Computed once
- * per tick by `sl_make_ctx`, read read-only by the per-cell helper.
- * Reading a struct via pointer is the same cost as reading individual
- * locals — the compiler will register-allocate the fields it uses.
- *
- *   density   : READ pointer — previous-frame density field, sampled
- *               at the back-traced position via bilinear_sample.
- *               Marked const to enforce read-only access from the helper.
- *
- *   work      : WRITE pointer — buffer that receives the new-frame
- *               density.  After the per-cell loop completes, the caller
- *               memcpy's work → density so the next tick reads what we
- *               just wrote.  Aliased with scene_draw's dither scratch
- *               (Scene.work) — order of operations keeps them separate.
- *
- *   cols, rows: cached grid dimensions, used by bilinear_sample for
- *               boundary clamping and by the per-cell loop bounds.
- *
- *   fy        : bottom-row index (rows − 1).  Source injection happens
- *               ONLY at y == fy; every other row receives `0` for src.
- *               Caching avoids a `rows - 1` subtraction per cell.
- *
- *   margin    : arch envelope start column = cols × ARCH_MARGIN_FRAC.
- *               Columns [0, margin) and (cols−margin, cols) receive no
- *               source — keeps the smoke base away from screen edges.
- *
- *   span      : arch envelope width = cols − 2·margin.  Source position
- *               is parameterised as t = (x − margin − wind_acc) / span
- *               so the arch lives in t ∈ [0, 1] regardless of cols.
- *
- *   wind_acc  : current wind offset, shifts the arch horizontally so a
- *               steady wind makes the smoke base actually MOVE rather
- *               than just lean.  Advanced once per tick in scene_tick.
- *
- *   intensity : user source-intensity multiplier ∈ [0.1, 1.0] from
- *               the g / G keys.  Scales the arch envelope's peak.
- *
- *   wscale    : current warmup scale ∈ [0, 1] from warmup_scale().
- *               Multiplied into source so smoke fades IN at startup
- *               rather than appearing fully-formed on tick 1.
- *
- *   decay     : per-tick fractional density loss, computed once via
- *               sl_decay_for_grid().  After (1 − decay)^t steps, a
- *               cell loses 1−exp(−decay·t) ≈ decay·t fraction of its
- *               density.  Tuned so the smoke column lands at
- *               ~VORT_REACH_FRAC·rows under unit upward velocity.
+ *   density   : the previous frame's smoke, read-only here — this is what
+ *               the backward look-up samples from
+ *   work      : where this tick's new smoke is written; the caller copies
+ *               it back over `density` afterward.  (Same buffer the renderer
+ *               later borrows as scratch — the tick finishes first, so they
+ *               never collide.)
+ *   cols, rows: grid size, cached so we don't re-ask ncurses every cell
+ *   fy        : the bottom row's index; only that row gets fresh source smoke
+ *   margin    : how many columns at each side stay empty (no source)
+ *   span      : the width of the source region between the margins
+ *   wind_acc  : how far sideways wind has pushed the source so far, so a
+ *               steady wind makes the whole smoke base actually slide along,
+ *               not just lean.  Advanced once per tick by scene_tick.
+ *   intensity : the source-strength knob from the g / G keys (0.1 .. 1.0)
+ *   wscale    : the startup fade-in factor from warmup_scale (0 .. 1)
+ *   decay     : how much smoke each cell loses per tick, tuned from screen
+ *               height so the column climbs to about VORT_REACH_FRAC of the
+ *               screen before fading out
  * ──────────────────────────────────────────────────────────────────── */
 typedef struct {
   const float *density;
@@ -792,10 +476,9 @@ typedef struct {
   float decay;
 } SLCtx;
 
-/* Decay scalar derived from screen height so the smoke column lands at
- * ~VORT_REACH_FRAC·rows.  After (1−decay)^t steps, a cell that travels
- * upward at 1 cell/tick fades to ~0.37 after `target` ticks; the source
- * keeps pushing replacement density up from below. */
+/* Pick a fade rate from the screen height so the smoke column climbs to
+ * roughly VORT_REACH_FRAC of the screen and no higher.  Taller screens fade
+ * more slowly so the smoke can reach the same relative height. */
 static inline float sl_decay_for_grid(int rows) {
   float target = (float)rows * VORT_REACH_FRAC;
   float d = (target > 1.f) ? (1.f / target) * VORT_DECAY_SCALE : VORT_DECAY_MIN;
@@ -804,7 +487,7 @@ static inline float sl_decay_for_grid(int rows) {
   return d;
 }
 
-/* Pack the per-tick constants once. */
+/* Fill the shared bundle once at the start of a tick. */
 static inline SLCtx sl_make_ctx(const float *density, float *work, int cols,
                                 int rows, float intensity, int wind_acc,
                                 float wscale) {
@@ -823,9 +506,9 @@ static inline SLCtx sl_make_ctx(const float *density, float *work, int cols,
   return c;
 }
 
-/* CFL clamp: keep the back-trace within ADV_VEL_CAP·ADV_DT ≈ 1.6 cells
- * of the origin so bilinear_sample reads a well-defined neighbourhood.
- * Same clamp Stam recommends for unconditional stability. */
+/* Cap the wind so the backward look-up never lands more than a cell or two
+ * away — close enough that the blended read stays accurate and the sim
+ * stays stable. */
 static inline void sl_clamp_velocity(float *vx, float *vy) {
   if (*vx > ADV_VEL_CAP)
     *vx = ADV_VEL_CAP;
@@ -837,10 +520,10 @@ static inline void sl_clamp_velocity(float *vx, float *vy) {
     *vy = -ADV_VEL_CAP;
 }
 
-/* Arch-shaped source injection at the bottom row.  Returns the density
- * to add to (x, y); 0 for any non-source row.  Squared edge function
- * gives 0 at margins, 1 at centre, with per-tick jitter so the source
- * flickers naturally. */
+/* How much fresh smoke to feed into this cell.  Only the bottom row gets
+ * any; across it the amount peaks in the middle and fades to nothing at the
+ * edges (the arch shape), with a little random flicker so the base looks
+ * alive rather than a flat line.  Returns 0 for every other cell. */
 static inline float sl_source_at(const SLCtx *c, int x, int y) {
   if (y != c->fy)
     return 0.f;
@@ -854,9 +537,9 @@ static inline float sl_source_at(const SLCtx *c, int x, int y) {
   return c->intensity * arch * jit * c->wscale;
 }
 
-/* One semi-Lagrangian cell step given the algo's velocity at this cell.
- * Caller hands in (vx, vy); helper does clamp + back-trace + sample +
- * source-injection + blend + clamp + write. */
+/* Update one cell once the method has worked out the wind here: cap the
+ * wind, step backward, read the old smoke, fade it, add any source, and
+ * write the result.  This is the shared body of all four advection methods. */
 static inline void sl_step_cell(const SLCtx *c, int x, int y, float vx,
                                 float vy) {
   sl_clamp_velocity(&vx, &vy);
@@ -874,77 +557,36 @@ static inline void sl_step_cell(const SLCtx *c, int x, int y, float vx,
   c->work[y * c->cols + x] = v;
 }
 
-/* ===================================================================== */
-/* §5  algo 0 — particle puffs                                            */
-/* ===================================================================== */
+/* ── §5 method 0 — particle puffs ── */
 
 /*
- * Particle — one smoke puff (consumed only by Algo 0, the Particle System).
+ * Particle — one little smoke puff.  Method 0 only; the other methods
+ * ignore these entirely and fill the grid directly.
  *
- * REFERENCES:
- *   Reeves, W. T. (1983) "Particle Systems — A Technique for Modeling
- *     a Class of Fuzzy Objects", ACM TOG 2(2): 91-108.
- *     The original.  Reeves defines the fixed-size pool, the per-particle
- *     (position, velocity, lifetime, density) state, and the stochastic
- *     update model that this struct implements.  §4 covers fire and
- *     smoke specifically — the (life-decay → density-fade) model used
- *     here is from §4.2.
+ * The idea (Reeves, "Particle Systems", 1983): instead of working on the
+ * grid, keep a crowd of tiny puffs.  Each is born at the base, drifts up
+ * with a bit of random wobble, and fades over a fixed lifetime.  Every tick
+ * we wipe the grid and re-stamp each living puff onto it, so the smoke you
+ * see is the overlap of the whole crowd.
  *
- *   Witkin, A. & Baraff, D. (2001) "Physically Based Modeling: Principles
- *     and Practice", SIGGRAPH course notes.  §1 — particle dynamics with
- *     EXPLICIT FORCE ACCUMULATION: clear accel, add each force, integrate.
- *     The per-tick `vx += turbulence; vx *= damp` pattern in
- *     particle_integrate is Witkin & Baraff's accumulate-then-damp idiom
- *     applied to the horizontal axis only.
+ * One nice touch: a puff stamps its brightness as life squared, not life.
+ * Squaring means a fresh puff looks solid right away but trails off gently
+ * at the end, instead of popping out of existence (Reeves §4.2).
  *
- *   Akenine-Möller, T. et al. (2018) "Real-Time Rendering", 4th ed.
- *     §13.7 — POINT-SPRITE particles with soft-edged falloff.  Our
- *     bilinear "tent filter" splat (particle_splat_bilinear) is the
- *     ASCII-cell analogue of Akenine-Möller's screen-space sprite blur.
+ * Life: a puff is born, drifts and fades each tick, and when its life runs
+ * out or it leaves the screen its slot is freed for the next new puff.
  *
- * INTENT: hold every per-puff value the integrator (particle_tick) and
- * the splat pass (particles_rebuild_density) need, in a flat layout
- * that fits into a fixed-size BSS array (no malloc after init).
- * Algos 1..4 ignore this entirely — they fill `density` directly via
- * semi-Lagrangian advection.
- *
- * LIFECYCLE: spawn at the arch source zone with life = 1.0 → integrate
- * forward each tick (vx random-walk + upward drift; life -= decay) →
- * when life <= 0 or position leaves the grid, flip `active` false and
- * the slot becomes available to the next particle_spawn.
- *
- * QUADRATIC FADE: the splat pass writes density = life², not life.
- * Quadratic gives fast initial opacity (a fresh puff appears solid)
- * with a long gentle tail (the wisp lingers), instead of a harsh
- * linear cutoff at end-of-life that would look like a sudden pop.
- * This matches Reeves §4.2's "intensity ∝ remaining_life^p" recommendation
- * (he uses p ∈ [1, 3]; p = 2 is the cheap-but-good middle ground).
- *
- *   x, y    : position in GRID CELLS (float). Sub-cell precision is
- *             what lets the bilinear splat scatter density across
- *             4 surrounding cells with continuously-varying weight
- *             — without it, puffs would snap-blink between cells.
- *
- *   vx, vy  : velocity in cells/tick. Sign convention: vy NEGATIVE
- *             = rising (ncurses y increases downward). At spawn vy
- *             ≈ −0.5 cells/tick (upward drift); vx starts near zero
- *             and accumulates ±PART_TURB_STEP/2 turbulence per tick
- *             with PART_VX_DAMP = 0.97 damping.  Force-accumulation
- *             pattern (Witkin & Baraff §1).
- *
- *   life    : [1.0 → 0.0] linear lifetime counter. Decremented by
- *             `decay` each tick. The splat writes life² as density,
- *             so a half-dead puff (life=0.5) renders at 0.25 density.
- *
- *   decay   : life lost per tick.  Pre-computed at spawn as
- *             1.0 / lifetime where lifetime is randomly drawn from
- *             [PART_LIFE_MIN, PART_LIFE_MIN + PART_LIFE_RANGE].
- *             Caching it avoids a division in every tick's update —
- *             Reeves §3 specifically calls out this micro-optimisation.
- *
- *   active  : pool-slot occupancy flag. Inactive slots are skipped
- *             by both the integrator and the splat pass; spawn finds
- *             the next inactive slot via the part_idx round-robin cursor.
+ *   x, y   : where the puff is, in grid cells, kept as decimals so it can
+ *            sit between cells — that's what lets the stamp spread softly
+ *            instead of snapping cell to cell
+ *   vx, vy : how fast it's moving, cells per tick.  vy is negative going up
+ *            (screen rows count downward).  Sideways speed starts near zero
+ *            and picks up small random nudges that slowly bleed off
+ *   life   : counts down from 1 to 0; the stamp uses life squared as
+ *            brightness, so a half-spent puff (0.5) draws at 0.25
+ *   decay  : how much life is lost each tick, set at birth to 1/lifetime so
+ *            no division is needed every tick
+ *   active : is this slot in use?  Empty slots are skipped and reused
  */
 typedef struct {
   float x, y;
@@ -954,14 +596,10 @@ typedef struct {
   bool active;
 } Particle;
 
-/*
- * particle_spawn() — birth one particle at the arch source zone.
- *
- * Spawn column is rejection-sampled weighted by the inline arch envelope
- * (edge² shape, zero at margins, 1 at centre) so most particles emerge
- * from the centre of the smoke base.  Up to 8 attempts before falling
- * back to the centre column — keeps spawning bounded under heavy load.
- */
+/* Birth one puff along the bottom.  We pick its column by rolling dice and
+ * accepting more often near the middle, so most puffs come from the centre
+ * of the base (matching the arch source shape).  After 8 tries we just use
+ * the centre, so a busy frame can't get stuck here. */
 static void particle_spawn(Particle *p, int cols, int rows, float intensity,
                            int wind_acc, int warmup) {
   float wscale =
@@ -993,14 +631,11 @@ static void particle_spawn(Particle *p, int cols, int rows, float intensity,
   p->active = true;
 }
 
-/* ── Per-particle physics helpers ────────────────────────────────── */
+/* ── moving one puff ── */
 
-/* One-tick integration of a single particle:
- *   vx += random turbulence kick ±PART_TURB_STEP/2  (Witkin & Baraff
- *                                                    force accumulation)
- *   vx *= PART_VX_DAMP                              viscous damping
- *   x  += vx;  y += vy                              explicit Euler position
- *   life -= decay                                   linear lifetime counter */
+/* Advance a single puff by one tick: nudge its sideways speed randomly and
+ * let a little of it bleed off, slide it by its speed, and tick its life
+ * down. */
 static inline void particle_integrate(Particle *p) {
   p->vx += ((float)rand() / RAND_MAX - 0.5f) * PART_TURB_STEP;
   p->vx *= PART_VX_DAMP;
@@ -1009,23 +644,21 @@ static inline void particle_integrate(Particle *p) {
   p->life -= p->decay;
 }
 
-/* Return true if the particle is still alive AND on-grid after this step.
- * Caller flips active=false when this returns false. */
+/* True if the puff still has life left and hasn't drifted off the screen.
+ * When this turns false the caller frees the puff's slot. */
 static inline bool particle_still_alive(const Particle *p, int cols, int rows) {
   return p->life > 0.f && p->x >= 0.f && p->x < (float)cols && p->y >= 0.f &&
          p->y < (float)rows;
 }
 
-/* Bilinear "tent-filter" splat of one particle's life² density across the
- * four cells surrounding (x, y).  Weights:
- *     w00 = (1-tx)(1-ty)   w10 = tx(1-ty)
- *     w01 = (1-tx)ty       w11 = tx·ty            Σ w = 1
- * Each cell that falls inside the grid receives life² · w added to it.
- * Smaller weight per cell + 4 cells per particle → soft, fuzzy puffs
- * instead of a hard one-cell stamp. */
+/* Stamp one puff's brightness onto the grid, spread across the four cells
+ * around it.  Each cell gets a share based on how close the puff sits to it,
+ * and the four shares add up to the whole.  Spreading over four cells (and
+ * the next puff doing the same) is what makes puffs look soft and fuzzy
+ * instead of a hard single-cell dot. */
 static inline void particle_splat_bilinear(const Particle *p, float *density,
                                            int cols, int rows) {
-  float pd = p->life * p->life; /* quadratic density fade */
+  float pd = p->life * p->life; /* brightness = life squared (gentle fade) */
   int x0 = (int)p->x, y0 = (int)p->y;
   int x1 = x0 + 1, y1 = y0 + 1;
   float tx = p->x - (float)x0;
@@ -1041,9 +674,9 @@ static inline void particle_splat_bilinear(const Particle *p, float *density,
     density[y1 * cols + x1] += pd * tx * ty;
 }
 
-/* ── Pool sweep helpers ──────────────────────────────────────────── */
+/* ── sweeping the whole crowd ── */
 
-/* Integrate every alive particle; deactivate those that died this tick. */
+/* Move every living puff one step and retire the ones that just died. */
 static void particles_integrate_all(Particle *parts, int cols, int rows) {
   for (int i = 0; i < MAX_PARTS; i++) {
     Particle *p = &parts[i];
@@ -1055,10 +688,9 @@ static void particles_integrate_all(Particle *parts, int cols, int rows) {
   }
 }
 
-/* Spawn SPAWN_PER_TICK new particles via round-robin search for free slots.
- * Each attempt advances *next_idx; if the slot is taken, try the next.
- * Bounded by MAX_PARTS tries so we don't loop forever when the pool is
- * full — in that case the spawn is silently dropped (graceful saturation). */
+/* Birth a few new puffs, walking forward from the last slot we used to find
+ * empty ones.  If the crowd is completely full we just skip the birth rather
+ * than spin forever. */
 static void particles_spawn_burst(Particle *parts, int *next_idx, int cols,
                                   int rows, float intensity, int wind_acc,
                                   int warmup) {
@@ -1074,9 +706,9 @@ static void particles_spawn_burst(Particle *parts, int *next_idx, int cols,
   }
 }
 
-/* Zero the density field, then splat every alive particle.  We REBUILD
- * the field every tick (rather than incrementing) so dead-now particles
- * leave no ghost density behind. */
+/* Wipe the grid and re-stamp every living puff.  We rebuild from scratch
+ * each tick rather than adding on, so puffs that just died leave no ghost
+ * smoke behind. */
 static void particles_rebuild_density(Particle *parts, float *density, int cols,
                                       int rows) {
   memset(density, 0, (size_t)(cols * rows) * sizeof(float));
@@ -1085,127 +717,61 @@ static void particles_rebuild_density(Particle *parts, float *density, int cols,
       continue;
     particle_splat_bilinear(&parts[i], density, cols, rows);
   }
-  /* Cells where multiple particles overlapped can exceed 1.0; clamp
-   * so the dither LUT stays in its valid range. */
+  /* Where puffs piled up a cell can read above 1; pin it back to 1 so the
+   * renderer stays in range. */
   for (int i = 0; i < cols * rows; i++)
     if (density[i] > 1.f)
       density[i] = 1.f;
 }
 
-/*
- * particle_tick — one step of "Reeves Lagrangian particle smoke".
- *
- * ALGORITHM (Reeves 1983 particle system + bilinear tent-filter render):
- *
- *   Unlike algos 1..4 (which work on the density grid directly), this
- *   algo maintains a POOL of discrete particle objects.  Each particle
- *   has its own (x, y, vx, vy, life) and lives until it leaves the
- *   grid or its life counter hits zero.  The density grid is recomputed
- *   from scratch every tick by splatting each alive particle.
- *
- *   Pseudocode per tick:
- *     1. particles_integrate_all — move every alive particle one step,
- *                                   reap dead ones.
- *     2. particles_spawn_burst   — birth SPAWN_PER_TICK new particles at
- *                                   the arch source zone (round-robin slot
- *                                   allocator).
- *     3. warmup_scale            — advance the shared warmup counter; the
- *                                   spawn step already read it.
- *     4. particles_rebuild_density — zero density, splat life² of every
- *                                     alive particle into 4 surrounding
- *                                     cells via bilinear weights.
- *
- * What you SEE: discrete puffs that you can almost count.  Each puff
- * is a soft 2×2 cell blob (the tent filter) that quadratically fades
- * over its lifetime.  The smoke as a whole is the union of those blobs
- * — no continuous flow field, just a moving cloud of overlapping
- * Gaussian-ish bumps.  Best for "low-density, lots of detail" smoke;
- * the Eulerian algos win at high density where particles would have to
- * overlap heavily anyway.
- */
+/* One tick of method 0: move the crowd, retire the dead, birth a few new
+ * ones, advance the startup fade-in, then rebuild the grid from whatever's
+ * still alive.  What you see is a cloud of soft little blobs you can almost
+ * count, each fading over its own short life — great for thin, detailed
+ * smoke (the grid-based methods look better when the smoke gets dense). */
 static void particle_tick(Particle *parts, int *next_idx, float *density,
                           int cols, int rows, float intensity, int wind_acc,
                           int *warmup) {
   particles_integrate_all(parts, cols, rows);
   particles_spawn_burst(parts, next_idx, cols, rows, intensity, wind_acc,
                         *warmup);
-  warmup_scale(warmup); /* advance counter; return value unused */
+  warmup_scale(warmup); /* just advancing the counter; the value isn't used */
   particles_rebuild_density(parts, density, cols, rows);
 }
 
-/* ===================================================================== */
-/* §6  algo 1 — vortex advection                                          */
-/* ===================================================================== */
+/* ── §6 method 1 — vortex (whirlpool) advection ── */
 
 /*
- * Vortex — a 2D point vortex (consumed only by Algo 1, Vortex Advection).
+ * Vortex — one spinning whirlpool that stirs the smoke.  Method 1 only.
  *
- * REFERENCES:
- *   Lamb, H. (1932) "Hydrodynamics", 6th ed., Cambridge University Press.
- *     §155-158 — the classical theory of POINT VORTICES in 2D inviscid
- *     flow.  The velocity field around an isolated point vortex of
- *     circulation Γ at the origin is
- *         v_θ(r) = Γ / (2π r)
- *     tangential to the radius; equivalently in Cartesian coords
- *         v = (Γ / 2π) · (−y, x) / r²
- *     The (strength · (−dy, dx) / r²) formula below is exactly this,
- *     with `strength` absorbing the Γ/(2π) factor.
+ * A point vortex is the classic textbook whirlpool (Lamb, "Hydrodynamics",
+ * 1932): it sets up a circular flow around itself that spins fast up close
+ * and trails off with distance.  The vortex is never drawn — it only
+ * decides which way the wind blows at each cell, and method 1 sums up the
+ * pull of all three to get the wind everywhere.
  *
- *   Bridson, R. (2015) "Fluid Simulation for Computer Graphics", 2nd ed.
- *     §2.3 — vortex-particle methods for incompressible flow.
- *     Justifies the +ε regulariser at r² → 0: real vortex cores are
- *     viscous and the velocity peaks at a finite value (Lamb-Oseen
- *     vortex); the ε approximates that smooth core cheaply.
+ * A tiny softening term (VORT_EPS) keeps the flow from blowing up to
+ * infinity right at the centre, which is both physically truer (real
+ * whirlpools have a calm eye) and stops the sim reading garbage there
+ * (Bridson §2.3).
  *
- * INTENT: hold the moving source of one rotational velocity field
- * contribution. The vortex itself isn't drawn — its only effect is
- * to STIR the density grid via Biot-Savart at every sample point.
+ * Each whirlpool also circles slowly around the screen centre on its own
+ * little orbit.  Giving them mixed spin directions and orbit directions is
+ * what produces several counter-rotating swirls instead of one big spin.
  *
- * BIOT-SAVART CONTRIBUTION at sample point (px, py):
- *   dx = px − cx;  dy = py − cy;  r² = dx² + dy²
- *   vx += strength · (−dy) / (r² + VORT_EPS)
- *   vy += strength · ( dx) / (r² + VORT_EPS)
- * The (−dy, dx) rotation gives counter-clockwise flow for positive
- * `strength`. VORT_EPS regularises the singularity at the vortex
- * centre — without it, r² → 0 produces an infinite velocity and the
- * semi-Lagrangian back-trace reads garbage.
- *
- * ORBITING vs FIXED: each vortex has its OWN circular orbit around
- * the screen centre, advanced by orb_spd each tick.  Mixing positive
- * and negative orb_spd / strength across N_VORTS=3 gives the
- * counter-rotating-eddy look — no uniform whole-frame rotation.
- * (Mathematically this is a TIME-VARYING velocity field that's
- * divergence-free at every instant — Bridson §2.3.)
- *
- *   cx, cy   : current vortex CENTRE in grid cells (float). Updated
- *              each tick by vortex_advance_orbits as
- *              (cx, cy) = screen_centre + orb_r · (cos orb_a, sin orb_a).
- *              Read by every sample point as the (px-cx, py-cy)
- *              distance in the Biot-Savart formula.
- *
- *   strength : Biot-Savart strength constant. Positive = CCW (counter-
- *              clockwise) rotation viewed with y-axis pointing down;
- *              negative = CW. Magnitude controls how strongly the
- *              vortex stirs nearby density — typical |strength| ∈
- *              [1.4, 2.5] gives visible curls without blowing past
- *              the ADV_VEL_CAP=2 CFL clamp.
- *
- *   orb_r    : orbital radius in grid cells around the screen centre.
- *              Larger = vortex sweeps a wider arc and visits more of
- *              the frame; smaller = vortex stays near centre and
- *              produces tighter local swirls. Preset fractions in
- *              VORT_ORB_FRACS[] are multiplied by cols at init.
- *
- *   orb_a    : current orbital ANGLE in radians, advanced by orb_spd
- *              each tick. Determines where the vortex is on its
- *              orbit right now. Initialised with VORT_ORB_PHASE_OFFS
- *              so the three vortices don't start at the same angle.
- *
- *   orb_spd  : angular speed in radians/tick. Sign flips orbital
- *              direction (so a positive-strength CCW vortex can ORBIT
- *              CW around centre, giving the meta-rotation extra
- *              visual interest). Magnitude controls how quickly the
- *              swirl positions shift in the frame.
+ *   cx, cy   : where this whirlpool is right now, in grid cells; moved
+ *              along its orbit each tick
+ *   strength : how hard it spins the smoke, and which way (sign).  Around
+ *              1.4 to 2.5 gives clear curls without overpowering the wind cap
+ *   orb_r    : how far from screen centre it circles, in cells.  Bigger
+ *              sweeps across more of the screen; smaller stays central and
+ *              makes tighter local swirls
+ *   orb_a    : where it is on that circle right now (an angle), nudged
+ *              forward each tick; the three start at different angles so
+ *              they don't bunch up
+ *   orb_spd  : how fast it circles, and which way (sign).  A whirlpool can
+ *              spin one way while circling the other, which adds visual
+ *              interest
  */
 typedef struct {
   float cx, cy;
@@ -1215,10 +781,8 @@ typedef struct {
   float orb_spd;
 } Vortex;
 
-/*
- * vortex_init() — set up N_VORTS vortices using the preset arrays from §1.
- * Radii from VORT_ORB_FRACS[] are stored as absolute grid cells.
- */
+/* Place the three whirlpools using the preset arrays from §1, turning each
+ * orbit fraction into an actual cell distance. */
 static void vortex_init(Vortex vorts[N_VORTS], int cols, int rows) {
   float cx = (float)cols * 0.5f;
   float cy = (float)rows * 0.5f;
@@ -1244,12 +808,10 @@ static void vortex_advance_orbits(Vortex vorts[N_VORTS], int cols, int rows) {
   }
 }
 
-/* Velocity at (x, y) = Σ Biot-Savart contributions from all N_VORTS
- * vortices.  Each vortex contributes a rotating field whose strength
- * decays as 1/r² and whose direction is perpendicular to (px-cx, py-cy):
- *     dv = strength · (-dy, dx) / (r² + ε)
- * Mixed signs across vortices (some CW, some CCW) cancel in some regions
- * and reinforce in others → counter-rotating eddies. */
+/* The wind at one cell is the sum of the pull from all three whirlpools.
+ * Each pulls in a circle around its own centre, strong up close and weaker
+ * with distance.  Where their mixed spins agree they reinforce; where they
+ * fight they cancel — that's what carves out the separate swirls. */
 static inline void vortex_velocity_at(int x, int y, const Vortex vorts[N_VORTS],
                                       float *out_vx, float *out_vy) {
   float vx = 0.f, vy = 0.f;
@@ -1264,36 +826,10 @@ static inline void vortex_velocity_at(int x, int y, const Vortex vorts[N_VORTS],
   *out_vy = vy;
 }
 
-/*
- * vortex_tick — one step of "smoke stirred by 3 orbiting whirlpools".
- *
- * ALGORITHM (Stam 1999 semi-Lagrangian + Biot-Savart velocity field):
- *
- *   1. Advance each vortex one step along its orbit (orb_a += orb_spd).
- *      The vortex centres trace circles around the screen centre; their
- *      mixed +/− chirality is what produces multiple counter-rotating
- *      eddies in the smoke rather than a single uniform swirl.
- *
- *   2. For each cell (x, y):
- *      a. Sum Biot-Savart contributions from every vortex →
- *         a velocity vector v(x, y).  Far from any vortex centre, the
- *         field is weak (1/r² falloff).  Near a centre the velocity
- *         peaks but is bounded by the +VORT_EPS regulariser.
- *      b. CFL clamp the velocity to ADV_VEL_CAP cells/tick so the
- *         back-trace below reads a small, well-defined neighbourhood.
- *      c. SEMI-LAGRANGIAN BACK-TRACE: "where was the smoke at this
- *         cell one tick ago?"  Answer: (x − vx·dt, y − vy·dt).
- *         Bilinear-sample the previous-frame density there.
- *      d. Add arch-shaped source on the bottom row, fade by (1 − decay).
- *
- *   3. memcpy work → density.
- *
- * What you SEE: curls and swirls.  The streamlines of the velocity
- * field ARE the visible smoke patterns — anywhere the field rotates,
- * the smoke curls; anywhere it converges or diverges (numerically
- * impossible for Biot-Savart, which is divergence-free, but visually
- * possible near the regulariser cutoff), the smoke piles or thins.
- */
+/* One tick of method 1: nudge each whirlpool along its orbit, then for every
+ * cell work out the combined whirlpool wind and hand it to the shared step.
+ * What you see is curls and swirls — the smoke simply follows the spinning
+ * flow the whirlpools set up. */
 static void vortex_tick(float *density, float *work, Vortex vorts[N_VORTS],
                         int cols, int rows, float intensity, int wind_acc,
                         int *warmup) {
@@ -1313,23 +849,21 @@ static void vortex_tick(float *density, float *work, Vortex vorts[N_VORTS],
   memcpy(density, work, (size_t)(cols * rows) * sizeof(float));
 }
 
-/* ===================================================================== */
-/* §7  algo 2 — curl-noise advection                                      */
-/* ===================================================================== */
+/* ── §7 method 2 — curl-noise advection ── */
 
 /*
- * Curl-noise smoke: a smooth divergence-free velocity field generated
- * from a scalar Perlin-style noise potential, advected semi-Lagrangianly.
- *
- *   velocity = curl(P)   where P is a smooth scalar noise field
- *   in 2D:   vx =  ∂P/∂y      vy = -∂P/∂x
- * Curl of a scalar is automatically divergence-free (∇·v ≡ 0), so
- * density is preserved under advection — no artificial sinks/sources.
- * Different from vortex: smooth distributed flow rather than discrete
- * point vortices.  See Bridson §4 "Vortex methods and noise advection".
+ * Curl-noise smoke: stir with a smooth, swirly random flow instead of a few
+ * sharp whirlpools.  We start from a soft blobby random field and take its
+ * "curl" — the swirl direction at each point.  A handy property of curl is
+ * that the flow neither piles smoke up nor drains it away anywhere, so the
+ * total amount of smoke is preserved on its own (Bridson §4).  Compared to
+ * the vortex method, the flow is gentle and spread out with no obvious
+ * centres.
  */
 
-/* Cheap integer hash → unit float [0, 1).  Avalanche-style scramble. */
+/* Scramble two grid coordinates into a repeatable random value in [0, 1).
+ * Same input always gives the same number, which is what makes the noise
+ * stable from frame to frame. */
 static inline float curl_hash01(int ix, int iy, int seed) {
   uint32_t h = (uint32_t)(ix * 374761393 + iy * 668265263 + seed * 1274126177);
   h = (h ^ (h >> 13)) * 1274126177u;
@@ -1337,13 +871,15 @@ static inline float curl_hash01(int ix, int iy, int seed) {
   return (float)(h & 0xFFFFFFu) / (float)0x1000000; /* [0, 1) */
 }
 
-/* 2D smooth value noise: cosine-eased bilinear blend of 4 hashed corners. */
+/* Smooth random value at any spot: grab the four random corners around it
+ * and blend them with an easing curve, so the field rolls gently instead of
+ * jumping between corners. */
 static inline float curl_noise2d(float x, float y, int seed) {
   int ix = (int)floorf(x);
   int iy = (int)floorf(y);
   float fx = x - (float)ix;
   float fy = y - (float)iy;
-  float sx = fx * fx * (3.f - 2.f * fx); /* smoothstep ease */
+  float sx = fx * fx * (3.f - 2.f * fx); /* S-shaped ease, no sharp corners */
   float sy = fy * fy * (3.f - 2.f * fy);
   float v00 = curl_hash01(ix, iy, seed);
   float v10 = curl_hash01(ix + 1, iy, seed);
@@ -1354,11 +890,10 @@ static inline float curl_noise2d(float x, float y, int seed) {
   return a + (b - a) * sy;
 }
 
-/* Curl of the scalar noise field — gives a divergence-free 2D velocity.
- *     vx =  ∂P/∂y     vy = −∂P/∂x          where P is the noise potential
- * Finite differences with h = 0.5 cells.  Time-varying via a t-offset on
- * the noise coordinate.  Bias the y component downward (positive vy means
- * downward in ncurses) so smoke rises rather than just swirling in place. */
+/* Read the swirl direction of the noise field at this cell, by comparing the
+ * noise just to each side of the cell.  We slide the noise slowly with time
+ * (t) so the flow keeps reshaping, and add a steady upward nudge so the smoke
+ * climbs instead of just swirling on the spot. */
 static inline void curl_velocity_at(int x, int y, float t, float *out_vx,
                                     float *out_vy) {
   float h = 0.5f;
@@ -1372,37 +907,11 @@ static inline void curl_velocity_at(int x, int y, float t, float *out_vx,
   *out_vy = -CURL_AMP * (xp - xm) / (2.f * h) - CURL_UPWARD_BIAS;
 }
 
-/*
- * curl_tick — one step of "smoke stirred by a smooth divergence-free
- * noise field".
- *
- * ALGORITHM (Stam 1999 SL + curl-of-noise velocity field, Bridson §4):
- *
- *   Mathematically: if P(x, y, t) is any smooth scalar field, then
- *   v = ∇×P (which in 2D collapses to (∂P/∂y, −∂P/∂x)) is automatically
- *   divergence-free: ∇·v = ∂²P/∂x∂y − ∂²P/∂y∂x = 0.  Advecting a density
- *   along a divergence-free field PRESERVES total density — no
- *   artificial sources or sinks.  This is the property real fluids
- *   have (incompressibility), achieved here for free without solving
- *   a pressure-projection step.
- *
- *   Each tick:
- *     1. Compute t = warmup · CURL_TIME_RATE so the noise field
- *        evolves slowly over many ticks (full re-shuffle ≈ 60 sec).
- *     2. For each cell (x, y):
- *        a. Sample the noise potential P at four offset points
- *           (h = 0.5 cells) and take the curl by finite differences.
- *           Add a constant upward bias (CURL_UPWARD_BIAS) so the
- *           smoke actually rises — pure curl has no preferred direction.
- *        b. Same CFL clamp + back-trace + bilinear sample + arch source
- *           + blend as vortex_tick (via sl_step_cell).
- *     3. memcpy work → density.
- *
- * What you SEE: smooth distributed flow, no obvious centres or curls.
- * Smoke meanders organically through the frame — visually closer to
- * real turbulence than the discrete vortex algo because the velocity
- * is continuous everywhere instead of peaking at point sources.
- */
+/* One tick of method 2: advance the noise's slow drift, then for each cell
+ * read the swirly noise wind and hand it to the shared step.  Because this
+ * kind of flow neither gathers nor drains smoke, the column holds together
+ * and meanders through the frame with no obvious centres — closer to real
+ * turbulence than the sharp whirlpools of method 1. */
 static void curl_tick(float *density, float *work, int cols, int rows,
                       float intensity, int wind_acc, int *warmup) {
   float wscale = warmup_scale(warmup);
@@ -1419,29 +928,19 @@ static void curl_tick(float *density, float *work, int cols, int rows,
   memcpy(density, work, (size_t)(cols * rows) * sizeof(float));
 }
 
-/* ===================================================================== */
-/* §8  algo 3 — buoyancy plume (Boussinesq)                               */
-/* ===================================================================== */
+/* ── §8 method 3 — buoyancy plume ── */
 
 /*
- * Buoyancy plume: the density itself drives upward velocity at each
- * cell — hot (dense) regions rise faster than cold ones.
- *
- *   vy = -BUOY_RISE · density[here]      (hot rises)
- *   vx = mild noise-driven horizontal turbulence
- *
- * This is the Boussinesq approximation collapsed onto a single field:
- * density doubles as temperature.  Different from vortex (which has
- * external stirring) and curl (which has noise-driven flow) — here the
- * smoke moves itself.  Visible signature: tall thin plume that
- * mushroom-caps at the top when buoyancy stalls against decay.
+ * Buoyancy plume: the smoke lifts itself because thicker smoke counts as
+ * hotter, and hot things rise.  There's no outside stirring here — the
+ * upward push at each cell just comes from how much smoke is sitting there
+ * (the Boussinesq idea, where smoke thickness stands in for temperature).
+ * The look: a tall thin column that flattens into a mushroom cap near the
+ * top, where the smoke has thinned enough that it stops rising.
  */
-/* Velocity at (x, y) for the buoyancy plume.
- *   vy = -BUOY_RISE · density[here]        Boussinesq: hot rises faster
- *   vx = (noise − 0.5) · 2·BUOY_TURB_AMP   mild horizontal turbulence
- * The local density itself drives the upward push — empty regions get
- * zero upward force, dense regions get a strong one.  That's what gives
- * buoyancy its characteristic "the smoke pulls itself up" feel. */
+/* The wind at one cell for the plume: a strong upward pull where the smoke
+ * is thick and none where it's empty, plus a little sideways wobble so the
+ * column doesn't rise perfectly straight (which never looks natural). */
 static inline void buoy_velocity_at(int x, int y, float t, const float *density,
                                     int cols, float *out_vx, float *out_vy) {
   float d_here = density[y * cols + x];
@@ -1451,39 +950,11 @@ static inline void buoy_velocity_at(int x, int y, float t, const float *density,
   *out_vy = -BUOY_RISE * d_here;
 }
 
-/*
- * buoy_tick — one step of "smoke that pulls itself up because it's hot".
- *
- * ALGORITHM (Stam 1999 SL + Boussinesq density-driven buoyancy):
- *
- *   The Boussinesq approximation says that in a slightly-heated fluid,
- *   density variations enter the momentum equation as a single buoyancy
- *   term:  vertical force per unit mass = -β · (T - T_ref).  Here we
- *   collapse temperature onto the density field itself — density doubles
- *   as a temperature proxy.  Cold (empty) cells get no buoyancy; hot
- *   (full) cells rise fastest.  Strict positive feedback: dense plumes
- *   rise quickly into emptiness, the void leaves an even hotter pocket
- *   below, which then rises faster.
- *
- *   Each tick:
- *     1. Compute decay + turbulence time t.
- *     2. For each cell (x, y):
- *        a. Read density[y,x] = "local temperature".
- *        b. Velocity:  vy = −BUOY_RISE · density  (rising; sign negative
- *                                                  because ncurses y is
- *                                                  positive-down)
- *                      vx = small noise-driven horizontal sway
- *                      (without it the plume goes dead-straight up,
- *                      which doesn't look natural)
- *        c. Same CFL clamp + back-trace + arch source + blend.
- *     3. memcpy work → density.
- *
- * What you SEE: tall narrow plumes that climb quickly through empty
- * space, then MUSHROOM-CAP at the top where the buoyancy force has
- * weakened (density × rise) below the decay rate.  The cap is the
- * literal momentum-vs-dissipation balance point.  Without that decay
- * the plume would punch right through the ceiling.
- */
+/* One tick of method 3: for each cell, read how thick the smoke is there,
+ * turn that into an upward pull (plus a little sideways wobble), and hand it
+ * to the shared step.  Thick smoke rises fast and leaves an even thicker
+ * pocket below, so the column shoots up in a narrow plume, then mushrooms
+ * out near the top where it has thinned and the lift gives out. */
 static void buoy_tick(float *density, float *work, int cols, int rows,
                       float intensity, int wind_acc, int *warmup) {
   float wscale = warmup_scale(warmup);
@@ -1500,66 +971,29 @@ static void buoy_tick(float *density, float *work, int cols, int rows,
   memcpy(density, work, (size_t)(cols * rows) * sizeof(float));
 }
 
-/* ===================================================================== */
-/* §9  algo 4 — breeze advection (sinusoidal laminar flow)                */
-/* ===================================================================== */
+/* ── §9 method 4 — breeze advection ── */
 
 /*
- * Breeze advection: time-varying laminar horizontal flow with a small
- * upward drift.  The velocity is constant along x for each row, varies
- * with y as a sine wave, and shifts phase with time:
- *
- *     vx(y, t) = BREEZE_AMP · sin(t + y · BREEZE_K)
- *     vy       = -BREEZE_RISE                       (gentle upward)
- *
- * Visual signature: density rises as a swaying curtain — each row drifts
- * at its own phase, so the plume bends like seaweed in a current.
- * Different from curl (which has 2-D structured noise) and buoyancy
- * (which has local self-driven velocity) — here the velocity is a
- * cheap closed-form 1-D pattern, no noise table involved.
+ * Breeze advection: a gentle side-wind that sways back and forth and slowly
+ * shifts over time, plus a steady upward drift.  The side-push is the same
+ * everywhere across a row, but the rows are slightly out of step with each
+ * other, so the column bends like a curtain in a draught.  No noise tables
+ * here — the wind is just a sine wave, the cheapest of the four methods.
  */
-/* Per-row sinusoidal sway — the velocity depends only on y and t,
- * NOT on x.  That's what makes the breeze laminar: every column in
- * the same row gets the same horizontal push.  The y-modulation makes
- * different rows sway out of phase, producing the curtain-bend look.
- *
- *     vx(y, t) = BREEZE_AMP · sin(t + y · BREEZE_K)
- *     vy       = −BREEZE_RISE                          gentle upward drift
- */
+/* The side-sway for a whole row: it depends only on which row and on time,
+ * never on the column, so every cell in a row gets the same push (that's why
+ * the flow stays smooth).  Neighbouring rows are slightly out of step, which
+ * is what gives the curtain-bend look.  Plus a steady upward drift. */
 static inline void breeze_velocity_at(int y, float t, float *out_vx,
                                       float *out_vy) {
   *out_vx = BREEZE_AMP * sinf(t + (float)y * BREEZE_K);
   *out_vy = -BREEZE_RISE;
 }
 
-/*
- * breeze_tick — one step of "smoke caught in a swaying horizontal wind".
- *
- * ALGORITHM (Stam 1999 SL + analytic laminar-flow velocity):
- *
- *   Unlike vortex/curl/buoy which use noise tables or per-cell sums,
- *   the breeze velocity is a CLOSED-FORM 1-D pattern: a sine wave whose
- *   phase advances with time and whose argument depends on row.  Two
- *   handy properties:
- *
- *     - velocity is constant along x for a fixed row  → laminar flow,
- *       no shear within a row, smoke moves as a coherent layer
- *     - the per-row phase offset (y · BREEZE_K) makes adjacent rows
- *       move at different sway phases → the column visibly BENDS
- *       like a curtain in a current.
- *
- *   Each tick:
- *     1. t = warmup · BREEZE_RATE advances the sine phase.
- *     2. For each row y, precompute vx_row = AMP · sin(t + y·k) once
- *        (it's the same for every cell in that row).
- *     3. For each cell, call sl_step_cell with (vx_row, -BREEZE_RISE).
- *     4. memcpy work → density.
- *
- * What you SEE: smoke rises as a swaying curtain.  Watching a single
- * row reveals a clean horizontal oscillation; watching a vertical
- * stripe reveals a snake-like bend as the phase walks up.  No
- * turbulence, no curls — just rhythmic laminar flow.
- */
+/* One tick of method 4: advance the sway over time, then for each row work
+ * out its single side-push once and apply it across the whole row.  You see
+ * the smoke rise as a swaying curtain — a clean back-and-forth in any one
+ * row, and a snaking bend reading up a column, with no turbulence or curls. */
 static void breeze_tick(float *density, float *work, int cols, int rows,
                         float intensity, int wind_acc, int *warmup) {
   float wscale = warmup_scale(warmup);
@@ -1567,7 +1001,7 @@ static void breeze_tick(float *density, float *work, int cols, int rows,
   float t = (float)*warmup * BREEZE_RATE;
 
   for (int y = 0; y < rows; y++) {
-    /* Per-row sway, computed once outside the inner loop. */
+    /* This row's side-push, found once and reused across the row. */
     float vx, vy;
     breeze_velocity_at(y, t, &vx, &vy);
 
@@ -1577,154 +1011,101 @@ static void breeze_tick(float *density, float *work, int cols, int rows,
   memcpy(density, work, (size_t)(cols * rows) * sizeof(float));
 }
 
-/* ===================================================================== */
-/* §10 scene                                                              */
-/* ===================================================================== */
+/* ── §10 scene ── */
 
 /*
- * Scene — owns every piece of mutable state for the smoke simulation.
+ * Scene — all the state the simulation owns, in one place.
  *
- * DESIGN INTENT: cleanly separate the PHYSICS-AND-STATE (what scene_tick
- * mutates) from the RENDER-SELECTION (what scene_draw consults).  Most
- * of the file's runtime memory lives here — three cols×rows float fields,
- * the MAX_PARTS particle pool, the N_VORTS vortex array — and pulling
- * them all into one struct makes scene_alloc / scene_free / scene_resize
- * trivial (one calloc set, one free set, one re-allocation on SIGWINCH).
+ * Almost everything that changes at runtime lives here: the smoke grid and
+ * its two scratch copies, the particle crowd, the whirlpools, plus the knobs
+ * (which method, wind, source strength, theme, paused).  Keeping it in one
+ * struct makes setup, teardown, and resize one-liners.
  *
- * Two clearly-separated halves:
+ * It's split into two halves on purpose.  The simulation half is everything
+ * the physics tick reads and writes; the render half is just the look (theme
+ * and a redraw flag) and the physics never touches it — changing the theme
+ * mid-plume only repaints, it doesn't change how the smoke moves.  The Scene
+ * knows nothing about the terminal: physics fills the grid, the renderer
+ * reads it, so the sim could run with no screen at all.
  *
- *   SIMULATION half — what scene_tick reads + writes.
- *                     Owns the shared density grid (and its prev/work
- *                     scratch buffers), the active algorithm selector,
- *                     the warmup ramp, wind state, the particle pool
- *                     (Algo 0, Reeves 1983), and the vortex array
- *                     (Algo 1, Lamb's Hydrodynamics + Bridson §2.3).
- *                     Algos 2..4 are STATELESS — they only need the
- *                     shared density + work + warmup, so no extra
- *                     fields are required for them.
- *                     Mutated by scene_tick and the key handler.
- *
- *   RENDER half     — what scene_draw / screen_draw consult.
- *                     Theme selection (palette table lookup) and the
- *                     next-frame full-erase flag.  Never read inside
- *                     the physics tick — flipping the theme during a
- *                     buoy_tick wouldn't make the smoke move any
- *                     differently, only look different.
- *
- * REFERENCES:
- *   Reeves (1983), Stam (1999), Bridson (2015), Floyd & Steinberg (1976)
- *   — see the References block at the top of the file.  Each Scene
- *   member's comment cites the specific algorithm it serves.
- *
- * The Scene knows nothing about ncurses — physics writes to the
- * density grid, the render layer reads it via Floyd-Steinberg dither
- * → ramp lookup.  That separation lets the simulation be exercised
- * without a terminal (useful for headless snapshot tests).
+ * Most fields serve one method only: the particle crowd is method 0's, the
+ * whirlpools are method 1's; methods 2..4 carry no extra state and just use
+ * the shared grid.
  */
 typedef struct {
-  /* ──────────────────────────────────────────────────────────────
-   *  SIMULATION HALF — physics tick reads + writes these
-   * ────────────────────────────────────────────────────────────── */
+  /* ── simulation half — the physics tick reads and writes these ── */
 
-  /* DENSITY GRID — the single shared float field all five algos
-   * write into. Read by scene_draw via Floyd-Steinberg + LUT.
-   * Range [0, 1]; -1 in scene_draw is a sentinel for "this cell
-   * is empty, don't propagate dither error here".  Sized cols×rows. */
+  /* The smoke grid: how thick the smoke is in each cell, 0 to 1.  Every
+   * method writes here and the renderer reads it.  (The renderer briefly
+   * stuffs -1 into a working copy to mark "empty cell"; the real grid stays
+   * 0 to 1.) */
   float *density;
 
-  /* PREV-FRAME DENSITY — snapshot taken at the END of scene_draw,
-   * used by the NEXT frame's clear pass to find cells that
-   * transitioned from non-zero to zero (dirty-rectangle erase).
-   * Same size and layout as density. */
+  /* Last frame's grid, saved at the end of drawing.  The next frame compares
+   * against it to find cells that just went empty, so it only needs to erase
+   * those rather than the whole screen. */
   float *prev_density;
 
-  /* WORK SCRATCH — dual-use buffer reused for two different
-   * purposes back-to-back per tick:
-   *   (1) Algos 1..4 (semi-Lagrangian) write the new advected
-   *       density here, then memcpy()s back into `density`.
-   *   (2) scene_draw uses it as the gamma-corrected dither scratch.
-   * Order matters: the tick runs before scene_draw, so the memcpy
-   * happens first and the dither overwrites cleanly. */
+  /* A scratch buffer borrowed for two jobs in turn each frame: first the
+   * advection methods write their new grid here before copying it back, then
+   * the renderer reuses it as dither scratch.  The tick always runs before
+   * the draw, so the two never overlap. */
   float *work;
 
-  /* CACHED GRID DIMENSIONS — set at scene_alloc / resize, read by
-   * every loop. Avoids calling getmaxyx() in the hot path. */
+  /* Grid size, remembered here so the inner loops don't have to ask ncurses
+   * every cell. */
   int cols, rows;
 
-  /* ALGORITHM SELECTOR — 0 = Particle System, 1 = Vortex Advection,
-   * 2 = Curl Noise, 3 = Buoyancy Plume, 4 = Breeze. Cycled by 'a'.
-   * scene_tick dispatches on this value to the correct *_tick
-   * function; all five write into the same `density` field. */
+  /* Which method is running: 0 particle, 1 vortex, 2 curl, 3 buoyancy,
+   * 4 breeze.  Cycled by 'a'; they all fill the same grid. */
   int algo;
 
-  /* WARMUP COUNTER — shared across all algos. Increments every tick
-   * until it hits WARMUP_TICKS, then saturates. The source-row
-   * intensity is multiplied by (warmup / WARMUP_TICKS) during the
-   * ramp, so the smoke fades IN at start instead of appearing
-   * fully-formed on the first frame.  Reset to 0 on algo switch
-   * and on resize so transitions don't show stale density. */
+  /* Startup fade-in counter, shared by every method.  Climbs each tick then
+   * holds; while it climbs the source is scaled down so the smoke eases in
+   * instead of popping up full.  Reset to 0 when the method changes or the
+   * window resizes so the new start looks clean. */
   int warmup;
 
-  /* SOURCE INTENSITY — multiplier on the bottom-row arch envelope,
-   * range [0.1, 1.0]. Adjusted by g / G keys. Controls how much
-   * density the source injects per tick — low value = thin wisp
-   * barely reaches mid-screen, full value = thick column reaching
-   * the top. */
+  /* Source strength knob (0.1 to 1.0), set by g / G.  Low feeds a thin wisp
+   * that barely climbs; full feeds a thick column that reaches the top. */
   float source;
 
-  /* WIND — signed step in cells/tick, positive = rightward,
-   * adjusted by w / W keys, '0' resets to 0. Read once per tick
-   * to advance wind_acc. */
+  /* Wind step per tick: positive blows right, set by w / W, '0' clears it.
+   * Read once a tick to push wind_acc along. */
   int wind;
 
-  /* WIND ACCUMULATOR — running offset (mod cols) that shifts the
-   * arch envelope horizontally over time. scene_tick advances this
-   * ONCE per tick by adding `wind` and wrapping — each algo then
-   * reads wind_acc (without re-advancing) when computing the
-   * source position. Critical: the algos must NOT increment
-   * wind_acc themselves or wind would double per tick. */
+  /* How far the wind has pushed the smoke base sideways so far.  scene_tick
+   * adds `wind` to this exactly once per tick (wrapping around the screen);
+   * the methods only read it.  If a method advanced it too, the wind would
+   * count twice. */
   int wind_acc;
 
-  /* PAUSE FLAG — scene_tick is a no-op when set. Toggled by space.
-   * Render keeps running so the user sees the frozen frame; for
-   * Algo 1 the vortex orbital phase is preserved so resume picks
-   * up exactly where pause left off. */
+  /* Paused?  When set the tick does nothing, but drawing continues so you see
+   * the frozen frame.  The whirlpools keep their positions, so resuming picks
+   * up right where it left off. */
   bool paused;
 
-  /* PARTICLE POOL — Algo 0 only. Fixed-size array of smoke puffs.
-   * Algos 1..4 leave this untouched. See Particle for per-slot detail. */
+  /* The puff crowd — method 0 only; the others leave it alone.  See Particle. */
   Particle parts[MAX_PARTS];
 
-  /* PARTICLE-SPAWN CURSOR — index into parts[] hinting where the
-   * next spawn should look. Advances on each spawn; wraps mod
-   * MAX_PARTS. Cheap round-robin allocator that avoids a linear
-   * scan on every spawn when the pool is mostly full. */
+  /* Where the next puff search should start looking for a free slot.  Walking
+   * forward from here beats scanning the whole crowd every time. */
   int part_idx;
 
-  /* VORTEX ARRAY — Algo 1 only. Fixed-size array of N_VORTS=3
-   * orbiting point vortices. See Vortex for per-slot detail.
-   * Initialised by vortex_init at scene_alloc with mixed
-   * chirality (some CW, some CCW) so the smoke gets multiple
-   * counter-rotating eddies, not a uniform whole-frame swirl. */
+  /* The three whirlpools — method 1 only; see Vortex.  Set up with mixed spin
+   * directions so the smoke gets several counter-rotating swirls, not one big
+   * spin. */
   Vortex vorts[N_VORTS];
 
-  /* ──────────────────────────────────────────────────────────────
-   *  RENDER HALF — scene_draw reads these; physics tick ignores them
-   * ────────────────────────────────────────────────────────────── */
+  /* ── render half — only the drawing reads these; physics ignores them ── */
 
-  /* THEME SELECTOR — index into k_themes[]. Cycled by t / T.
-   * Selects the 9-step foreground ramp used to colour the dither
-   * output. Pure render concern — smoke physics is identical
-   * regardless of which theme is active.  theme_apply rewrites
-   * pairs CP_BASE..CP_BASE+RAMP_N-1 when this changes. */
+  /* Which colour scheme is active, an index into k_themes; cycled by t / T.
+   * Purely cosmetic — the smoke moves the same whatever theme is chosen. */
   int theme;
 
-  /* FORCE-CLEAR FLAG — set when the screen needs a full erase()
-   * on the NEXT scene_draw (e.g. after algo change, theme change,
-   * resize). The default render path uses a dirty-rectangle
-   * compare against prev_density to keep the write count down;
-   * this flag bypasses that optimisation for the one frame after
-   * a state change. */
+  /* Set this to force the next frame to wipe the whole screen (after a method
+   * change, theme change, or resize).  Normally drawing only touches cells
+   * that changed; this flag overrides that for the one frame after a jump. */
   bool needs_clear;
 } Scene;
 
@@ -1779,12 +1160,8 @@ static void scene_resize(Scene *sc, int cols, int rows) {
   sc->part_idx = 0;
 }
 
-/*
- * scene_tick() — advance wind once then dispatch to the active algo.
- *
- * Wind is accumulated here, exactly once per tick, before calling the
- * algo.  No algo function should advance wind_acc independently.
- */
+/* One step of the whole sim: push the wind along once (this is the only
+ * place that does so), then run whichever method is active. */
 static void scene_tick(Scene *sc) {
   if (sc->paused)
     return;
@@ -1817,13 +1194,12 @@ static void scene_tick(Scene *sc) {
   }
 }
 
-/* ── Render-pass helpers ─────────────────────────────────────────── */
+/* ── turning the grid into glyphs ── */
 
-/* PASS 1 — gamma correction.  Map linear-light density [0, 1] to
- * perceptually-uniform brightness via v' = v^(1/2.2).  Empty cells
- * become −1 so the Floyd-Steinberg pass can use that as a "do not
- * propagate error here" sentinel — otherwise mid-density error would
- * leak into supposedly-black background and the empty space sparkles. */
+/* Step 1: nudge the brightness so it matches how the eye sees it (raw smoke
+ * thickness looks too dark in the middle).  Empty cells are flagged with -1
+ * so the next step knows to leave the background alone and not sprinkle stray
+ * dots into it. */
 static void render_density_to_gamma(const float *density, float *scratch,
                                     int cols, int rows) {
   for (int i = 0; i < cols * rows; i++) {
@@ -1832,11 +1208,11 @@ static void render_density_to_gamma(const float *density, float *scratch,
   }
 }
 
-/* Diffuse the quantisation error from this cell to its four neighbours
- * using Floyd & Steinberg's 1976 mask:
- *           [      *   7 ]
- *           [  3   5   1 ]   / 16
- * Skip empty (−1) neighbours so the sentinel stays a sentinel. */
+/* Dithering, part of step 2.  Picking a glyph rounds the brightness off; this
+ * spreads the leftover rounding error onto the neighbours not yet drawn, so
+ * the smoke shades smoothly instead of showing hard bands.  The 7/3/5/1-over-16
+ * shares are the classic Floyd-Steinberg pattern (1976).  Empty (-1) cells are
+ * skipped so they stay part of the background. */
 static inline void floyd_steinberg_diffuse(float *d, int i, int x, int y,
                                            int cols, int rows, float err) {
   if (x + 1 < cols && d[i + 1] >= 0.f)
@@ -1851,11 +1227,10 @@ static inline void floyd_steinberg_diffuse(float *d, int i, int x, int y,
   }
 }
 
-/* PASS 2 — dither + emit one cell.  Maps the gamma-corrected scratch
- * value to a ramp index, computes the quantisation error against the
- * ramp midpoint, diffuses the error forward, and writes the glyph.
- * For empty cells (scratch < 0) emit a space ONLY if this cell was lit
- * last frame (dirty-rectangle erase). */
+/* Step 2 for one cell: pick the glyph for this brightness, push the rounding
+ * error onto the neighbours, and draw it in the theme colour.  An empty cell
+ * draws a blank only if it was lit last frame — that's how we erase smoke that
+ * just cleared without repainting the whole background. */
 static inline void render_cell_emit(int x, int y, int i, float v,
                                     float *scratch, const float *prev, int cols,
                                     int rows, int theme) {
@@ -1875,10 +1250,9 @@ static inline void render_cell_emit(int x, int y, int i, float v,
   attroff(attr);
 }
 
-/* PASS 3 — snapshot density for next frame's dirty-cell diff.
- * Swaps the pointer (current density becomes prev_density next frame),
- * then memcpy preserves the current density values so the next tick's
- * algo still reads from a populated buffer. */
+/* Step 3: remember this frame's grid as "last frame" for the next erase pass.
+ * We swap the two buffers, then copy the values back so the next tick still
+ * has the current smoke to work from. */
 static void render_swap_density_snapshot(Scene *sc) {
   int cols = sc->cols, rows = sc->rows;
   float *tmp = sc->prev_density;
@@ -1887,25 +1261,14 @@ static void render_swap_density_snapshot(Scene *sc) {
   memcpy(sc->density, sc->prev_density, (size_t)(cols * rows) * sizeof(float));
 }
 
-/*
- * scene_draw — three-pass dithered render (same pipeline as fire.c).
- *
- * Pseudocode:
- *   1. render_density_to_gamma   — density^(1/2.2) into work[] (empty = −1)
- *   2. for each cell within the terminal viewport:
- *        render_cell_emit         — pick ramp glyph + dither + draw, OR
- *                                    erase if dropped to empty since last frame
- *   3. render_swap_density_snapshot — current density → prev_density
- *
- * Gamma correction gives mid-density billows the widest character
- * variety (linear values cluster near the dark end of the perceptual
- * curve and would crush detail).  Floyd-Steinberg dithering trades
- * a small amount of spatial noise for smoother brightness gradients
- * — without it, the 9-step ramp's banding is obvious on subtle plumes.
- */
+/* Draw the whole smoke field (same renderer as fire.c).  Three steps:
+ * fix the brightness, then for each visible cell pick a glyph and dither it,
+ * then save the grid for next frame's erase pass.  The brightness fix gives
+ * the mid-thick smoke the most glyph variety, and the dithering smooths the
+ * shading so the nine glyphs don't show as hard bands. */
 static void scene_draw(Scene *sc, int tcols, int trows) {
   int cols = sc->cols, rows = sc->rows;
-  float *scratch = sc->work; /* algo's advection already memcpy'd out */
+  float *scratch = sc->work; /* the method already copied its result out */
   float *prev = sc->prev_density;
 
   render_density_to_gamma(sc->density, scratch, cols, rows);
@@ -1921,9 +1284,7 @@ static void scene_draw(Scene *sc, int tcols, int trows) {
   render_swap_density_snapshot(sc);
 }
 
-/* ===================================================================== */
-/* §11 screen                                                             */
-/* ===================================================================== */
+/* ── §11 screen — the ncurses layer and the HUD ── */
 
 typedef struct {
   int cols, rows;
@@ -1967,20 +1328,10 @@ static const char *algo_name(int a) {
   }
 }
 
-/*
- * screen_draw — render the smoke field, then paint a two-layer HUD over it:
- *
- *   Row 0          STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
- *                  Live state: paused/run, algorithm, theme, source
- *                  intensity, wind direction (>>> / <<< / ---) +
- *                  magnitude, fps, sim Hz.
- *   Row rows-1     KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
- *                  Every interactive key the demo accepts.
- *
- * Both rows are pre-filled with their pair colour so the coloured
- * background spans the full width, and drawn AFTER scene_draw so
- * smoke never bleeds through the bars.
- */
+/* Draw the smoke, then lay the two HUD bars on top: the status line across
+ * the top (paused/running, method, theme, source, wind, fps) and the key
+ * list across the bottom.  Both bars fill their whole row with colour and go
+ * down after the smoke, so no smoke shows through them. */
 static void screen_draw(Screen *s, Scene *sc, double fps, int sfps) {
   if (sc->needs_clear) {
     erase();
@@ -1988,7 +1339,7 @@ static void screen_draw(Screen *s, Scene *sc, double fps, int sfps) {
   }
   scene_draw(sc, s->cols, s->rows);
 
-  /* ── Top row: dynamic status ─────────────────────────────── */
+  /* ── top row: live status ── */
   const char *wstr = sc->wind > 0 ? ">>>" : sc->wind < 0 ? "<<<" : "---";
 
   char status[200];
@@ -2004,7 +1355,7 @@ static void screen_draw(Screen *s, Scene *sc, double fps, int sfps) {
   mvprintw(0, 0, "%s", status);
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-  /* ── Bottom row: every interactive key ───────────────────── */
+  /* ── bottom row: every key you can press ── */
   const char *hints = " q:quit  spc:pause  a/A:algo  t/T:theme  g/G:source  "
                       "w/W:wind  0:calm  ]/[:Hz ";
 
@@ -2021,9 +1372,7 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §12 app                                                                */
-/* ===================================================================== */
+/* ── §12 app — the main loop ── */
 
 typedef struct {
   Scene scene;

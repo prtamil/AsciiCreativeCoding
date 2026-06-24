@@ -1,333 +1,26 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * comet.c — moving-emitter comets that drop a fading trail and detonate on
- * impact.
+ * comet.c — comets that fly in from a screen edge, leave a fading trail,
+ * and burst into sparks when they hit the floor.
  *
- * Comets enter from a random screen edge aimed at a random point in
- * the opposite quadrant.  As each comet flies it spawns trail
- * particles AT ITS CURRENT POSITION (without inheriting velocity), so
- * the trail "falls behind" as a tapered streak coloured through an
- * 8-step theme ramp.  When a comet crosses the floor heading down it
- * detonates: a one-frame '*+' flash followed by a 32-spark wave-
- * staggered radial fan that drags to a halt over ~0.6 s.  Three
- * patterns: SHOOTING_STAR, FIREBALL, PLASMA_BOLT.  10 themes cycle
- * the colour-pair IDs without redrawing.
+ * There are three looks (SHOOTING_STAR, FIREBALL, PLASMA_BOLT) and 10
+ * colour themes you can flip between live. The trick that makes the trail
+ * lag behind the comet (drop dots where the comet is, but don't give them
+ * the comet's speed) comes from Reeves, "Particle Systems", ACM TOG 2(2),
+ * 1983.
  *
- * Section map
- *   §1 config       sim/pattern/blast constants + theme table
- *   §2 clock        monotonic-ns timer + sleep
- *   §3 color        palette + theme cycle
- *   §4 comet        Comet struct + LCG + render-time named primitives
- *   §5 trail/blast  TrailParticle, BlastParticle, Blast structs
- *   §6 scene        pools, lifecycle, tick phases, draw layers
- *   §7 screen       ncurses init/draw/resize, HUD bar
- *   §8 app          signals, fixed-step main loop
- */
-
-/* ── CONCEPTS & ALGORITHMS ───────────────────────────────────────────── *
- *
- *   Moving-emitter trick   Emitter moves; particles spawn at its CURRENT
- *                          position with NO inherited velocity → trail
- *                          falls behind naturally as a tapered streak.
- *                          → Reeves (1983), ACM TOG 2(2): 91
- *
- *   Bresenham accumulator  Fractional emission carry: emit_carry +=
- *                          rate · dt; spawn floor(carry); keep remainder.
- *                          → Bresenham (1965); standard DDA pattern
- *
- *   Polar emission         Radial fan from a centre: vel = (cos α, sin α)·s.
- *                          Used for impact-blast wave-staggered emission.
- *
- *   2-D rotation matrix    PLASMA_BOLT angular kick preserves |v|; naive
- *                          additive jitter would change speed magnitude.
- *                          → Foley et al. §5.6
- *
- *   Exponential drag       v *= exp(-rate · dt); analytic per-frame form,
- *                          stable under any dt.
- *
- *   Object pool            Three fixed-size pools (comets/trail/blasts)
- *                          with `active` flag + linear-scan find-free-slot.
- *                          No malloc after init.
- *
- *   Painter's algorithm    3 z-ordered layers: trail (background) →
- *                          blasts (mid) → comets (foreground).
- *                          → Newell, Newell & Sancha (1972)
- *
- *   Fixed-step loop        Deterministic physics; render Hz independent.
- *                          → Glenn Fiedler, "Fix Your Timestep!" (2004)
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE — DATA-DRIVEN PATTERN ENGINE ────────────────────────── *
- *
- * Three comet effects (SHOOTING_STAR, FIREBALL, PLASMA_BOLT) are
- * produced by a SINGLE generic moving-emitter + trail engine driven
- * by an array of PatternParams structs.  scene_tick reads
- * pattern_params[s->current_pattern] and behaves accordingly — the
- * four phases (top-up / advance comets / advance trail / advance
- * blasts) never branch on the pattern enum to decide HOW the physics
- * works.  Adding a new comet effect is a matter of appending one row
- * to pattern_params[]; no new code paths.
- *
- *
- * THE GENERIC ENGINE (pseudocode)
- * ───────────────────────────────
- *
- *   loop forever (each tick of dt seconds):
- *
- *     pp = pattern_params[scene.current_pattern]   # read inputs
- *
- *     # 1. TOP UP COMET POOL — spawn until count == pp.max_comets
- *     while count(active comets) < pp.max_comets:
- *         c = next_inactive_comet_slot()
- *         edge      = pick_spawn_edge_weighted(rng)        # TOP/L/R/BOT
- *         spawn_pt  = compute_spawn_point(edge, scene)
- *         target_pt = compute_target_point(edge, scene)    # opposite quad
- *         speed     = pp.speed · jitter(±pp.speed_jitter)
- *         c.pos     = spawn_pt
- *         c.vel     = unit(target_pt − spawn_pt) · speed
- *         c.active  = true
- *
- *     # 2. ADVANCE EACH COMET — angular kick + integrate + emit trail
- *     for c in active comets:
- *         apply_2d_rotation(c.vel, uniform(-pp.angular_kick,
- *                                          +pp.angular_kick))  # |v| preserved
- *         c.pos += c.vel · dt
- *         # Bresenham fractional accumulator: fire pp.emit_rate Hz
- *         c.emit_carry += pp.emit_rate · dt
- *         while c.emit_carry >= 1:
- *             scene_emit_trail(c, pp)                          # see THE TRICK
- *             c.emit_carry -= 1
- *         if c.pos exits screen + EDGE_MARGIN:
- *             blast_ignite(s, c.pos)                           # impact flash
- *             c.active = false
- *
- *     # 3. ADVANCE TRAIL POOL — exponential drag + Euler + age
- *     drag = exp(-pp.trail_drag · dt)
- *     for p in active trail:
- *         p.vel *= drag
- *         p.pos += p.vel · dt
- *         p.age += dt
- *         if p.age >= p.life:  p.active = false
- *
- *     # 4. ADVANCE BLAST POOL — flash TTL + per-spark tick (independent
- *     #    of pp; uses BLAST_* global constants).
- *     for b in active blasts:
- *         b.flash_ttl -= dt
- *         for sp in b.parts:  blast_spark_tick(sp, dt)
- *         if all sparks dead:  b.active = false
- *
- *   # Render — 3-layer painter's algorithm (Newell, Newell & Sancha 1972):
- *   scene_draw_trail_layer    # background
- *   scene_draw_blast_layer    # mid
- *   scene_draw_comet_layer    # foreground (head glyph: pp.head_glyph)
- *
- *
- *   THE TRICK (scene_emit_trail) — moving emitter, decoupled trail vel:
- *     perp = perpendicular(c.vel)                              # 90° CCW
- *     kick = uniform(-1, 1) · 2 · pp.particle_spread
- *     p.pos = c.pos + perp · kick                              # offset
- *     p.vel = perp · kick · pp.spread_drift_factor             # NOT c.vel!
- *     p.life = pp.particle_life · uniform(0.7, 1.3)
- *
- *   p.vel deliberately does NOT inherit from c.vel — that's why the
- *   trail "falls behind" as a tapered streak instead of flying along
- *   with the comet.  Reeves (1983) called this the moving-emitter trick.
- *
- *
- * PATTERNPARAMS FIELD → ENGINE HOOK
- * ─────────────────────────────────
- *
- *   max_comets            →  spawn-loop refill cap        (concurrent count)
- *   speed                 →  spawn velocity magnitude     (× jitter)
- *   speed_jitter          →  ± fraction on speed at spawn
- *   angular_kick          →  per-tick rotation amplitude  (rotation matrix)
- *   emit_rate             →  trail emission rate (Hz)     (Bresenham accum)
- *   particle_life         →  trail lifetime               (× uniform 0.7-1.3)
- *   particle_spread       →  ± perpendicular spawn offset (cells)
- *   spread_drift_factor   →  perp_kick · this = p.vel     (0 = static trail)
- *   trail_drag            →  drag = exp(-rate·dt)         (Millington Ch.6)
- *   head_glyph            →  comet-layer paint glyph      (visual identity)
- *
- * Every other engine constant — MAX_COMETS, MAX_TRAIL, MAX_BLASTS,
- * EDGE_MARGIN, plus the BLAST_* tuning knobs — is a GLOBAL knob
- * shared across all patterns.  Patterns differ ONLY in the ten
- * fields above.  Note that BLAST_* parameters are NOT per-pattern
- * (every comet's impact uses the same blast tuning); this is a
- * deliberate uniformity choice, not an oversight — the impact
- * flash should read consistently across patterns.
- *
- *
- * ARCHITECTURAL REFERENCES
- * ────────────────────────
- *
- *   Reeves, W. T. (1983)
- *     "Particle Systems — A Technique for Modeling a Class of
- *     Fuzzy Objects", ACM TOG 2(2): 91-108.
- *     §4 makes the explicit argument that ONE engine + a struct
- *     of physical constants per phenomenon is the right
- *     architecture for natural-particle simulations.  The moving-
- *     emitter trick (decoupled trail velocity) appears in §3.2 of
- *     Reeves' paper as the canonical mechanism for trailing
- *     phenomena — comets, missiles, fireballs.
- *
- *   Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994)
- *     "Design Patterns" (Addison-Wesley) — STRATEGY pattern (§5.9).
- *     A family of algorithms (SHOOTING_STAR / FIREBALL /
- *     PLASMA_BOLT) interchangeable behind a single interface (the
- *     engine reading PatternParams).  In procedural C the
- *     "interface" is the struct shape; "concrete strategies" are
- *     the rows of pattern_params[]; "selecting a strategy" is
- *     updating scene.current_pattern.
- *
- *   Acton, M. (2014)
- *     "Data-Oriented Design and C++" (CppCon 2014 keynote).
- *     Argues that variation between behaviours should be
- *     represented as DATA (struct fields) rather than as control
- *     flow (if/switch on type).  pattern_params[] is a compact
- *     data table; scene_tick has zero per-pattern code paths.
- *
- *   Nystrom, R. (2014)
- *     "Game Programming Patterns" (Genever Benning).
- *     TYPE OBJECT chapter — PatternParams is a Type Object: one
- *     shared instance per "kind" of comet.  OBJECT POOL chapter —
- *     three independent fixed-size BSS pools (comets / trail /
- *     blasts) implement Nystrom's pool idiom directly.  PAINTER'S
- *     ALGORITHM chapter — the three-layer z-by-category render
- *     order (trail → blasts → comets) is Nystrom's preferred
- *     ordering for layered 2-D scenes.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── OVERALL PSEUDOCODE ──────────────────────────────────────────────── *
- *
- *   init:
- *     install signals; start ncurses (themes + HUD/HINT pairs)
- *     scene_init: clear pools; spawn ONE seed comet so screen is not empty
- *
- *   loop while running:
- *     if need_resize:        endwin → refresh → re-query terminal extent
- *     dt = clock_now − last_frame_time      (capped at 100 ms)
- *     dt *= speed_mul                       (user "+/-" time dial)
- *     while sim_accum ≥ tick_ns:
- *       scene_tick(dt_sec):  4 phases (top-up + advance + trail + blasts)
- *       sim_accum -= tick_ns
- *     scene_draw:            3-layer painter (trail, blasts, comets)
- *     screen_draw HUD bottom-bar: pattern + theme + counts + fps + speed
- *     screen_present
- *     getch + app_handle_key q/spc/r/n/p/t/T/+/-/]/[
- *     sleep to ~60 fps
- *
- *   cleanup:
- *     atexit endwin restores the terminal
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── DRIVER PSEUDOCODE ───────────────────────────────────────────────── *
- *
- * scene_tick(dt):                              (per-frame physics, 4 phases)
- *   if paused:  return
- *   dt *= speed / SPEED_DEF                    user time dial
- *   pp ← pattern_params[current_pattern]
- *   phase1_topup_comet_pool   (s, pp)          spawn until pool reaches max
- *   phase2_advance_all_comets (s, dt, pp)      kick → integrate → die → emit
- *   phase3_advance_trail      (s, dt, pp)      drag + Euler + age
- *   phase4_advance_all_blasts (s, dt)          flash TTL + per-spark tick
- *
- *   Phase order matters: 1 produces actors, 2 reads them and emits trail,
- *   3 ages the just-emitted trail, 4 is independent and runs last.
- *
- *
- * scene_draw(s):                               (3-layer painter's algorithm)
- *   rows_playable ← rows - 1                   bottom row reserved for HUD
- *   scene_draw_trail_layer  (s)                LAYER A (background)
- *   scene_draw_blast_layer  (s)                LAYER B (mid-ground)
- *   scene_draw_comet_layer  (s)                LAYER C (foreground; on top)
- *
- *   Layer order is z-by-category, not by depth.  Trails are "the past",
- *   comets are "the present" — comets win every cell collision.
- *
- *
- * scene_emit_trail(s, c):                      (THE moving-emitter trick)
- *   slot ← trail_pool_find_inactive             bail if pool full
- *   speed ← |c->vel|; if < 1e-3: speed = 1.0   unit-vector safety
- *   perp ← (-vy/speed, vx/speed)                90° CCW rotation
- *   kick ← uniform(-1, 1) · 2 · particle_spread
- *   p->pos ← c->pos + perp · kick               offset along perpendicular
- *   p->vel ← perp · kick · spread_drift_factor  drift (NOT inherited from c)
- *   p->life ← particle_life · uniform(0.7, 1.3)
- *
- *   The decoupling of p->vel from c->vel is the mechanism that makes
- *   the trail "fall behind" — break it and the trail flies along with
- *   the comet (no streak).
- *
- *
- * blast_ignite(s, cx, cy):                     (impact-blast spawn)
- *   slot ← blast_pool_find_inactive             bail if pool full
- *   b->centre ← (cx, cy);  b->flash_ttl ← BLAST_FLASH_SEC
- *   for i = 0..BLAST_PARTICLES-1:
- *     angle  = blast_emission_angle(i, N, rng)  ∈ [π, 2π] (UPPER hemisphere)
- *     speed  = blast_emission_speed(rng)
- *     wave   = i mod BLAST_WAVE_COUNT
- *     delay  = blast_wave_delay(wave, count, max)
- *     blast_spawn_one_spark(b->parts[i], angle, speed, delay, rng)
- *
- *   Angle restricted to [π, 2π] so sparks rise/spread sideways (sin≤0
- *   in screen coords).  Wave-stagger gives the burst a shockwave reading
- *   instead of a single instantaneous ring.
- *
- *
- * scene_spawn_comet(s):                        (edge-pick + opposite-aim)
- *   slot ← comet_pool_find_inactive             bail if pool full
- *   edge ← pick_spawn_edge(rng)                 weighted: TOP 45 / L 25 / R 25
- * / BOT 5 spawn_pt  ← compute_spawn_point(edge)       just OUTSIDE that edge
- *   target_pt ← compute_target_point(edge)      opposite-quadrant band
- *   d ← target_pt - spawn_pt
- *   speed ← compute_speed_with_jitter(pp)
- *   c->pos ← spawn_pt
- *   c->vel ← d / |d| · speed                    unit-vector toward target
- *
- *   Aiming at the opposite quadrant guarantees a diagonal arc that
- *   visibly crosses the screen.  Uniform-direction random vectors
- *   would half the time send the comet back out the edge it entered on.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/*
  * Keys
- *   q | Q | ESC      quit                spc        pause / resume
- *   r                reseed pools (clear + spawn one fresh comet)
- *   n / N            next pattern        p / P      prev pattern
- *   t / T            next / prev theme
- *   + / =            speed × 2           -          speed ÷ 2
- *   ] / [            raise / lower sim_fps
+ *   q | Q | ESC   quit                spc   pause / resume
+ *   r             clear and respawn one fresh comet
+ *   n / N         next look           p / P  previous look
+ *   t / T         next / prev theme
+ *   + / =         go faster           -      go slower
+ *   ] / [         raise / lower sim rate
  *
  * Build
  *   gcc -std=c11 -O2 -Wall -Wextra particle_systems/comet.c \
  *       -o comet -lncurses -lm
  */
-
-/* ── REFERENCES ──────────────────────────────────────────────────────── *
- *
- * PAPERS
- *   Reeves, W. T. (1983)
- *     "Particle Systems: A Technique for Modelling a Class of Fuzzy Objects"
- *     ACM Transactions on Graphics 2(2): 91–108.
- *   Bresenham, J. E. (1965)
- *     "Algorithm for computer control of a digital plotter"
- *     IBM Systems Journal 4(1): 25–30.   (Fractional accumulator pattern.)
- *   Newell, M. E., Newell, R. G. & Sancha, T. L. (1972)
- *     "A solution to the hidden surface problem"
- *     Proc. ACM Annual Conference: 443–450.   (Painter's algorithm.)
- *
- * BOOKS
- *   Foley, J. et al. — "Computer Graphics: Principles and Practice"
- *     (Addison-Wesley, 2nd ed. 1990)
- *     §5.6 covers 2-D rotation matrices; §17.x particle-system mechanics.
- *   Press et al. — "Numerical Recipes in C"  (3rd ed., 2007)
- *     §17.x fixed-step integration; §7.1.2 LCG random number primitives.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -345,9 +38,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
   SIM_FPS_MIN = 10,
@@ -361,17 +52,17 @@ enum {
 
   MAX_COMETS = 8,
   MAX_TRAIL = 1000,
-  MAX_BLASTS = 8, /* one per comet possible at impact */
+  MAX_BLASTS = 8, /* every comet can be mid-explosion at once */
 
   HUD_COLS = 80,
   FPS_UPDATE_MS = 500,
 
-  /* Color pair indices. PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+  /* Colour-pair slot numbers. The HUD/HINT pairs are reserved project-wide. */
   PAIR_HUD = 1,
   PAIR_HINT = 2,
-  PAIR_RAMP_BASE = 3, /* +0..+7 = 8 trail tints (cool→hot)   */
-  PAIR_HEAD = 11,     /* always-bright head colour            */
-  PAIR_HALO = 12,     /* head halo                            */
+  PAIR_RAMP_BASE = 3, /* +0..+7: the 8 trail shades, dim/cool up to bright/hot */
+  PAIR_HEAD = 11,     /* the bright dot at the comet's head */
+  PAIR_HALO = 12,     /* the faint glow around the head */
   PAIR_SKY = 13,
 };
 
@@ -379,20 +70,19 @@ enum {
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* Cells of slack outside the screen before a spawned/dead comet is killed. */
+/* How far a comet may drift past the edge before we let it off the screen. */
 #define EDGE_MARGIN 3.0f
 
-/* Impact-blast tuning (seconds-based; drag 3.0/s ≈ 95% loss/s, 4 waves @ 0.1s
- * spread). */
-#define BLAST_PARTICLES 32        /* sparks per blast */
-#define BLAST_FLASH_SEC 0.06f     /* central '*+' flash duration */
-#define BLAST_LIFE_BASE 0.50f     /* baseline spark lifetime */
-#define BLAST_LIFE_JITTER 0.25f   /* + uniform[0, this] for variety */
-#define BLAST_SPEED_MIN 18.0f     /* initial spark speed lower bound */
-#define BLAST_SPEED_MAX 42.0f     /* initial spark speed upper bound */
-#define BLAST_DRAG_PER_SEC 3.0f   /* exponential vel decay rate */
-#define BLAST_WAVE_COUNT 4        /* shockwave rings */
-#define BLAST_MAX_DELAY_SEC 0.10f /* delay of last wave behind wave 0 */
+/* Knobs for the explosion when a comet hits the floor. */
+#define BLAST_PARTICLES 32        /* sparks thrown per explosion */
+#define BLAST_FLASH_SEC 0.06f     /* how long the bright '*+' cross shows */
+#define BLAST_LIFE_BASE 0.50f     /* how long a spark lives, before jitter */
+#define BLAST_LIFE_JITTER 0.25f   /* random extra life added on top, for variety */
+#define BLAST_SPEED_MIN 18.0f     /* slowest a fresh spark can fly */
+#define BLAST_SPEED_MAX 42.0f     /* fastest a fresh spark can fly */
+#define BLAST_DRAG_PER_SEC 3.0f   /* how fast sparks slow down (about 95%/sec) */
+#define BLAST_WAVE_COUNT 4        /* sparks go out in this many ripples */
+#define BLAST_MAX_DELAY_SEC 0.10f /* head start of the first ripple over the last */
 
 typedef enum {
   PATTERN_SHOOTING_STAR = 0,
@@ -401,7 +91,7 @@ typedef enum {
   N_PATTERNS = 3,
 } Pattern;
 
-/* pattern_name — HUD label for the active pattern (padded to fixed width). */
+/* The labels are padded to the same width so the HUD doesn't jump around. */
 static const char *pattern_name(Pattern p) {
   switch (p) {
   case PATTERN_SHOOTING_STAR:
@@ -415,17 +105,35 @@ static const char *pattern_name(Pattern p) {
   }
 }
 
+/*
+ * PatternParams — the recipe for one comet "look". One generic engine reads
+ * the row for the active look and behaves accordingly, so adding a new comet
+ * type means adding a row here, not new code. The three rows below are
+ * SHOOTING_STAR (fast, tight), FIREBALL (slow, puffy), PLASMA_BOLT (fast,
+ * wobbling).
+ *
+ *   max_comets           how many of this comet may fly at once
+ *   speed                how fast it travels, in cells per second
+ *   speed_jitter         random wiggle on the speed, as a fraction (0.2 = ±10%)
+ *   angular_kick         tiny random steering each tick, in radians (0 = straight)
+ *   emit_rate            trail dots dropped per second
+ *   particle_life        how long a trail dot lives, in seconds
+ *   particle_spread      how far sideways a dot can land from the comet, in cells
+ *   spread_drift_factor  how much a dot drifts outward as it fades (0 = sits still)
+ *   trail_drag           how fast trail dots slow their drift, per second
+ *   head_glyph           the character drawn at the comet's head
+ */
 typedef struct {
-  int max_comets;            /* simultaneous active comets */
-  float speed;               /* comet speed (cells/sec) */
-  float speed_jitter;        /* ± fraction of speed */
-  float angular_kick;        /* per-tick random rotation (rad) */
-  float emit_rate;           /* trail particles emitted per second */
-  float particle_life;       /* trail particle lifetime (sec) */
-  float particle_spread;     /* ± perpendicular spawn offset (cells) */
-  float spread_drift_factor; /* perp-kick · this becomes vel; 0 = static */
-  float trail_drag;          /* per-second velocity damping for trail */
-  char head_glyph;           /* single character drawn at the comet head */
+  int max_comets;
+  float speed;
+  float speed_jitter;
+  float angular_kick;
+  float emit_rate;
+  float particle_life;
+  float particle_spread;
+  float spread_drift_factor;
+  float trail_drag;
+  char head_glyph;
 } PatternParams;
 
 static const PatternParams pattern_params[N_PATTERNS] = {
@@ -439,12 +147,24 @@ static const PatternParams pattern_params[N_PATTERNS] = {
     {2, 130.0f, 0.30f, 0.10f, 150.0f, 0.80f, 1.0f, 3.0f, 1.5f, '*'},
 };
 
+/*
+ * Theme — one named colour scheme. Themes only change which 256-colour codes
+ * the pairs point at, so flipping a theme recolours everything instantly with
+ * no redraw.
+ *
+ *   name   shown in the HUD
+ *   ramp   the 8 trail shades, from a faded dying dot (slot 0) to a fresh
+ *          bright one (slot 7)
+ *   head   the bright colour of the comet's head
+ *   halo   the softer colour of the glow around the head
+ *   sky    a background tint; kept for completeness but not drawn right now
+ */
 typedef struct {
   const char *name;
-  short ramp[8]; /* slot 0 = dying/dim → slot 7 = fresh/bright */
-  short head;    /* always-bright head colour */
-  short halo;    /* halo around the head */
-  short sky;     /* (reserved; not currently rendered) */
+  short ramp[8];
+  short head;
+  short halo;
+  short sky;
 } Theme;
 
 #define N_THEMES 10
@@ -465,23 +185,19 @@ static const Theme themes[N_THEMES] = {
     {"VIOLET", {53, 54, 91, 134, 135, 176, 213, 219}, 225, 219, 233},
 };
 
-/* Trail glyph ramp (dying → fresh). */
+/* The character used for a trail dot, from faintest (dying) to boldest (fresh). */
 static const char RAMP_GLYPHS[8] = {'`', '.', ',', ':', ';', '-', '+', '*'};
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
-/* Two POSIX-clock wrappers used by the main loop: a monotonic ns timer
- * and a non-blocking sleep that no-ops on negative durations. */
+/* ── §2 clock ── */
 
-/* clock_ns — current monotonic time in nanoseconds. */
+/* A steady clock (never jumps backward), counted in nanoseconds. */
 static int64_t clock_ns(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
   return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-/* clock_sleep_ns — sleep ns nanoseconds; safe to call with ns <= 0. */
+/* Sleep for this many nanoseconds. Asking for zero or less just returns. */
 static void clock_sleep_ns(int64_t ns) {
   if (ns <= 0)
     return;
@@ -492,11 +208,10 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color ── */
 
-/* theme_apply — rebind the 8 ramp pairs + head/halo/sky for theme[idx]. */
+/* Point all the colour pairs at the chosen theme's colours. Falls back to
+ * plain white when the terminal can't do 256 colours. */
 static void theme_apply(int idx) {
   if (idx < 0 || idx >= N_THEMES)
     idx = 0;
@@ -516,7 +231,7 @@ static void theme_apply(int idx) {
   }
 }
 
-/* color_init — start_color + pin HUD/HINT pairs + apply theme 0. */
+/* Turn colour on, set up the fixed HUD/HINT pairs, and load the first theme. */
 static void color_init(void) {
   start_color();
   use_default_colors();
@@ -530,24 +245,23 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  comet                                                              */
-/* ===================================================================== */
+/* ── §4 comet ── */
 
 /*
- * Comet — the moving emitter.  No glyph or colour stored here; those come
- * from pattern_params + themes at draw time, so any (pattern × theme)
- * combination works without respawning.
+ * Comet — the flying head that leaves a trail. It stores no glyph or colour;
+ * those come from the current look and theme at draw time, so changing either
+ * recolours a comet already in flight, no respawn needed.
  *
- *   x, y         centre in cells (float for sub-cell motion)
- *   vx, vy       velocity in cells/sec
- *   emit_carry   Bresenham fractional accumulator for trail emission
- *   age          seconds since spawn (HUD-only; doesn't drive death)
- *   active       pool slot in use?
+ *   x, y         position in cells; kept as floats so it can move smoothly
+ *   vx, vy       velocity in cells per second
+ *   emit_carry   leftover fraction of a trail dot owed from last tick (so a
+ *                rate like 90.5 dots/sec doesn't lose the half each frame)
+ *   age          seconds alive; only used by the HUD, not for dying
+ *   active       is this pool slot in use?
  *
- * Lifecycle: scene_spawn_comet at startup / 'r' / pool top-up →
- *   phase2_advance_one_comet per tick (kick + integrate + die-check + emit) →
- *   active=false on ground impact OR off-screen.
+ * Life story: born in scene_spawn_comet (startup, 'r', or topping up the pool)
+ * → moved and aged each tick → marked inactive when it hits the floor or
+ * drifts off the screen.
  */
 typedef struct {
   float x, y;
@@ -557,24 +271,25 @@ typedef struct {
   bool active;
 } Comet;
 
-/* lcg_next — Numerical Recipes LCG; one mul, one add per call. */
+/* A tiny, fast random-number generator (the classic one from Numerical
+ * Recipes). Each call scrambles the state and hands back the new value. */
 static inline uint32_t lcg_next(uint32_t *st) {
   *st = *st * 1664525u + 1013904223u;
   return *st;
 }
 
-/* lcg_unit — uniform float in [0, 1).  Top 24 bits → 24-bit precision. */
+/* A random float from 0 up to (but not including) 1. */
 static inline float lcg_unit(uint32_t *st) {
   return (float)(lcg_next(st) >> 8) / (float)(1u << 24);
 }
 
-/* lcg_signed — uniform in [-0.5, 0.5). */
+/* A random float from -0.5 up to 0.5 — handy for "wiggle either way". */
 static inline float lcg_signed(uint32_t *rng) { return lcg_unit(rng) - 0.5f; }
-/* lcg_range — uniform in [lo, hi). */
+/* A random float somewhere between lo and hi. */
 static inline float lcg_range(uint32_t *rng, float lo, float hi) {
   return lo + lcg_unit(rng) * (hi - lo);
 }
-/* clamp_int / clampf — clamp value to closed interval [lo, hi]. */
+/* Pin a value so it can't go below lo or above hi. */
 static inline int clamp_int(int v, int lo, int hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -582,38 +297,38 @@ static inline float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/* ramp_slot_from_freshness — clamp(floor(freshness · 7.999), 0, 7).  The
- * 7.999 multiplier (not 8) prevents freshness=1 from rounding to slot 8. */
+/* Turn a freshness of 0..1 into one of the 8 shade slots. We multiply by
+ * 7.999 rather than 8 so a perfectly fresh dot lands in slot 7, not slot 8. */
 static inline int ramp_slot_from_freshness(float freshness_0_to_1) {
   float clamped = clampf(freshness_0_to_1, 0.0f, 1.0f);
   int bucket = (int)(clamped * 7.999f);
   return clamp_int(bucket, 0, 7);
 }
 
-/* round_to_cell — float position → integer cell index (round half up). */
+/* Snap a smooth float position to the nearest whole character cell. */
 static inline int round_to_cell(float v) { return (int)(v + 0.5f); }
 
-/* cell_visible — true if (cell_x, cell_y) is inside the playable area. */
+/* Is this cell actually on screen (and above the HUD row)? */
 static inline bool cell_visible(int cell_x, int cell_y, int cols,
                                 int rows_playable) {
   return cell_x >= 0 && cell_x < cols && cell_y >= 0 && cell_y < rows_playable;
 }
 
-/* trail_freshness — 1.0 at birth, linearly down to 0.0 at age == life. */
+/* How fresh a trail dot is: 1 when newborn, fading evenly to 0 at death. */
 static inline float trail_freshness(float age, float life) {
   if (life <= 0.0f)
     return 0.0f;
   return 1.0f - age / life;
 }
 
-/* blast_freshness — 1.0 at birth, 0.0 at death (life counts DOWN). */
+/* Same idea for a spark, whose life counts down: 1 when newborn, 0 at death. */
 static inline float blast_freshness(float remaining_life, float max_life) {
   if (max_life <= 0.0f)
     return 0.0f;
   return remaining_life / max_life;
 }
 
-/* trail_attr_for_slot — slot 6+ BOLD, slot 0/1 DIM, else NORMAL. */
+/* Brightest trail shades draw bold, faintest draw dim, the rest plain. */
 static inline int trail_attr_for_slot(int ramp_slot) {
   if (ramp_slot >= 6)
     return A_BOLD;
@@ -622,13 +337,14 @@ static inline int trail_attr_for_slot(int ramp_slot) {
   return A_NORMAL;
 }
 
-/* blast_attr_for_slot — slot 6+ BOLD, else NORMAL.  No DIM tier:
- * a faint blast spark reads as a smudge, so they vanish instead of fading. */
+/* Sparks get bold or plain, never dim: a dim spark just looks like a smudge,
+ * so faint ones simply disappear instead of fading out. */
 static inline int blast_attr_for_slot(int ramp_slot) {
   return (ramp_slot >= 6) ? A_BOLD : A_NORMAL;
 }
 
-/* paint_cell — one mvaddch wrapped in attron/off so callers stay one-liners. */
+/* Draw one character with a colour and style, turning the style on and off
+ * around it so every caller stays a single line. */
 static inline void paint_cell(int cell_y, int cell_x, char glyph,
                               int color_pair, int attr) {
   attron(COLOR_PAIR(color_pair) | attr);
@@ -636,21 +352,19 @@ static inline void paint_cell(int cell_y, int cell_x, char glyph,
   attroff(COLOR_PAIR(color_pair) | attr);
 }
 
-/* ===================================================================== */
-/* §5  trail + blast particles                                            */
-/* ===================================================================== */
+/* ── §5 trail + blast particles ── */
 
 /*
- * TrailParticle — fading dot left behind by a moving comet.
+ * TrailParticle — one fading dot the comet left behind.
  *
- *   x, y         ABSOLUTE position in cells (NOT relative to comet)
- *   vx, vy       drift velocity in cells/sec (NOT inherited from comet)
- *   age, life    age counts UP; particle dies when age ≥ life
- *   active       pool slot in use?
+ *   x, y      where it sits on screen, in cells (its own spot, not the comet's)
+ *   vx, vy    its own slow drift, in cells per second — deliberately NOT the
+ *             comet's velocity, which is exactly why the trail lags behind
+ *   age, life age counts up; the dot dies once its age reaches its life
+ *   active    is this pool slot in use?
  *
- * Lifecycle: scene_emit_trail spawns ~emit_rate per second per active
- *   comet → phase3_advance_trail per tick (drag + Euler + age) →
- *   active=false at age ≥ life.
+ * Life story: dropped by scene_emit_trail as the comet flies → drifts and
+ * ages each tick → marked inactive when its age reaches its life.
  */
 typedef struct {
   float x, y;
@@ -660,19 +374,19 @@ typedef struct {
 } TrailParticle;
 
 /*
- * BlastParticle — one spark in an impact blast.
+ * BlastParticle — one spark flung out by an explosion.
  *
- *   rx, ry       OFFSET from parent Blast centre, in cells (NOT absolute)
- *   vx, vy       velocity in cells/sec
- *   life         remaining seconds; counts DOWN to zero
- *   max_life     original life at spawn (for freshness ratio = life / max_life)
- *   delay        wave-stagger countdown in seconds; spark gated until 0
- *   sym          glyph chosen at spawn from "*+.,oO!#" — fixed for spark's life
- *   alive        pool slot in use?
+ *   rx, ry    position measured from the blast's centre, not the screen origin
+ *   vx, vy    velocity in cells per second
+ *   life      seconds of life remaining; counts down to zero
+ *   max_life  the life it started with, so we can tell how fresh it still is
+ *   delay     a short hold before this spark starts moving, so the sparks go
+ *             out in ripples instead of all at once; counts down to zero
+ *   sym       its character, picked once at birth from "*+.,oO!#"
+ *   alive     is this pool slot in use?
  *
- * Position is OFFSET (not absolute) so the parent Blast owns one centre
- * and all 32 sparks compose against it.  Centralises bounds-clipping
- * in the draw layer.
+ * Positions are stored relative to the blast's centre so all 32 sparks share
+ * one centre, which keeps the on-screen clipping in one place (the draw step).
  */
 typedef struct {
   float rx, ry;
@@ -685,16 +399,16 @@ typedef struct {
 } BlastParticle;
 
 /*
- * Blast — one impact event: central '*+' flash + 32-spark radial fan.
+ * Blast — one explosion: a brief bright cross plus a fan of 32 sparks.
  *
- *   cx, cy                impact centre in cells
- *   flash_ttl             '*+' cross seconds remaining; 0 = no flash
- *   active                pool slot in use?
- *   parts[BLAST_PARTICLES] inline pool — Blast OWNS its 32 sparks
+ *   cx, cy                where the comet hit, in cells
+ *   flash_ttl             seconds left to show the bright '*+' cross; 0 = gone
+ *   active                is this pool slot in use?
+ *   parts[BLAST_PARTICLES] this blast's own 32 sparks, stored inline
  *
- * Lifecycle: blast_ignite called the frame a comet crosses the floor →
- *   phase4_advance_one_blast per tick (flash TTL + per-spark tick) →
- *   active=false once flash has expired AND every spark is dead.
+ * Life story: created by blast_ignite the moment a comet reaches the floor →
+ * advanced each tick → marked inactive once the cross is gone AND every spark
+ * has died.
  */
 typedef struct {
   float cx, cy;
@@ -703,28 +417,27 @@ typedef struct {
   BlastParticle parts[BLAST_PARTICLES];
 } Blast;
 
-/* ===================================================================== */
-/* §6  scene — pools, tick, draw                                         */
-/* ===================================================================== */
+/* ── §6 scene — pools, tick, draw ── */
 
 /*
- * Scene — owns three fixed-size pools + run-time knobs.  Whole simulation
- * state in one struct.  No malloc after init; no other dynamic state.
+ * Scene — the whole running simulation in one struct: three fixed-size pools
+ * of objects plus the live settings. Everything is allocated up front; nothing
+ * is allocated while it runs.
  *
- *   paused              if true, scene_tick early-returns
- *   speed               time-dial multiplier; SPEED_DEF = 1.0×
- *   current_theme       index into themes[] (cycled by t/T)
- *   current_pattern     index into pattern_params[] (cycled by n/p)
- *   rng                 LCG state — single source of randomness
- *   rows, cols          terminal extent in cells
- *   comets[MAX_COMETS=8]      moving emitter pool
- *   trail [MAX_TRAIL=1000]    fading trail pool
- *   blasts[MAX_BLASTS=8]      one impact-blast slot per possible comet
+ *   paused           when true, time stops (nothing moves)
+ *   speed            time dial set by +/-; SPEED_DEF means normal speed
+ *   current_theme    which colour theme is showing (flipped by t/T)
+ *   current_pattern  which comet look is active (flipped by n/p)
+ *   rng              the random-number state, the one source of all randomness
+ *   rows, cols       terminal size in cells
+ *   comets           the comet pool (up to MAX_COMETS in flight)
+ *   trail            the trail-dot pool (up to MAX_TRAIL)
+ *   blasts           the explosion pool (one slot per possible comet)
  *
- * Lifecycle: scene_init at startup → scene_tick + scene_draw per frame →
- *   scene_resize on SIGWINCH (no realloc; pools are fixed) →
- *   scene_reseed on 'r' (clear + spawn one).  Pool find_inactive helpers
- *   do an O(n) scan; at sizes 8/1000/8 this is cheaper than a free-list.
+ * Life story: set up once by scene_init → advanced and drawn every frame →
+ * told the new size on a terminal resize → cleared and reseeded on 'r'. To
+ * find a free slot we just scan the pool; at these small sizes that's faster
+ * than keeping a list of free slots.
  */
 typedef struct {
   bool paused;
@@ -739,8 +452,7 @@ typedef struct {
   Blast blasts[MAX_BLASTS];
 } Scene;
 
-/* {comet,trail,blast}_pool_find_inactive — O(n) scan; returns slot index or -1.
- */
+/* Find a free slot in each pool, or return -1 when the pool is full. */
 static int comet_pool_find_inactive(Scene *s) {
   for (int i = 0; i < MAX_COMETS; i++)
     if (!s->comets[i].active)
@@ -762,7 +474,7 @@ static int blast_pool_find_inactive(Scene *s) {
   return -1;
 }
 
-/* scene_clear_pools — flag every slot inactive; O(MAX_TRAIL) dominated. */
+/* Empty all three pools by marking every slot free. */
 static void scene_clear_pools(Scene *s) {
   for (int i = 0; i < MAX_COMETS; i++)
     s->comets[i].active = false;
@@ -772,27 +484,29 @@ static void scene_clear_pools(Scene *s) {
     s->blasts[i].active = false;
 }
 
-/* blast_emission_angle — π + (i/N)·π + jitter ∈ [π, 2π], upper hemisphere. */
+/* Pick the direction for spark number i. The angle is spread across the upper
+ * half-circle so sparks fly up and sideways, never down through the floor. */
 static float blast_emission_angle(int i, int total, uint32_t *rng) {
   float evenly_spaced = (float)M_PI + ((float)i / (float)total) * (float)M_PI;
   float jitter = lcg_signed(rng) * 0.2f;
   return evenly_spaced + jitter;
 }
 
-/* blast_emission_speed — uniform in [BLAST_SPEED_MIN, BLAST_SPEED_MAX). */
+/* Pick a random launch speed for a spark. */
 static float blast_emission_speed(uint32_t *rng) {
   return lcg_range(rng, BLAST_SPEED_MIN, BLAST_SPEED_MAX);
 }
 
-/* blast_wave_delay — staggered spawn delay for shockwave reading. */
+/* How long this ripple waits before its sparks start moving, so the explosion
+ * reads as expanding rings rather than one instant flash. */
 static float blast_wave_delay(int wave, int wave_count, float max_delay_sec) {
   if (wave_count <= 1)
     return 0.0f;
   return (float)wave * (max_delay_sec / (float)(wave_count - 1));
 }
 
-/* blast_spawn_one_spark — fill one BlastParticle: pos=0, polar→Cartesian vel,
- * life, sym. */
+/* Set up one spark: it starts at the blast centre, flies off in the given
+ * direction at the given speed, and gets a random life and character. */
 static void blast_spawn_one_spark(BlastParticle *p, float angle, float speed,
                                   float delay_sec, uint32_t *rng) {
   static const char k_blast_syms[] = "*+.,oO!#";
@@ -811,46 +525,31 @@ static void blast_spawn_one_spark(BlastParticle *p, float angle, float speed,
 }
 
 /*
- * blast_ignite — DRIVER.  Spawn one ground-impact blast at (cx, cy).
+ * Start one explosion at the spot a comet hit. Claims a free blast slot, sets
+ * its centre and bright cross, then fills it with 32 sparks fanned across the
+ * upper half-circle and split into a few timed ripples.
  *
- *   Step 1   slot ← blast_pool_find_inactive            bail if pool full
- *   Step 2   b->centre ← (cx, cy);  b->flash_ttl ← BLAST_FLASH_SEC; active=true
- *   Step 3   for i = 0..BLAST_PARTICLES-1:
- *              angle = blast_emission_angle(i, N, rng)   ∈ [π, 2π]  (UPPER
- * hemi) speed = blast_emission_speed(rng) wave  = i mod BLAST_WAVE_COUNT delay
- * = blast_wave_delay(wave, count, max) blast_spawn_one_spark(&parts[i], angle,
- * speed, delay, rng)
+ * Sparks only aim upward and sideways: on screen, down is the +y direction, so
+ * a downward spark would instantly fall off the bottom — pointless. The ripple
+ * timing turns one flat ring into a wave of expanding rings, which looks more
+ * like a real shockwave.
  *
- * INPUTS / UNITS
- *   s          Scene mutated; one Blast slot becomes active.
- *   cx, cy     impact centre in cells (cy is the floor row, rows-2).
- *
- * WHY UPPER-HEMISPHERE ONLY
- *   In screen coordinates +y is DOWN.  Sparks aimed downward (angles
- *   in [0, π]) would immediately leave the playable area below the floor.
- *   Restricting to [π, 2π] gives sin(angle) ≤ 0 → vy ≤ 0 → all sparks
- *   rise or fly sideways.
- *
- * WHY WAVE STAGGER
- *   Without staggered delays, all 32 sparks fire in the same frame and
- *   the burst reads as a single instantaneous ring.  4 waves with
- *   delays 0/0.033/0.067/0.10 s give the burst a "shockwave" reading
- *   — a leading ring expands while a second ring is still spawning.
+ * Takes the impact centre (cx, cy) in cells; cy is the floor row.
  */
 static void blast_ignite(Scene *s, float cx, float cy) {
-  /* Step 1 — locate an inactive Blast slot; bail if pool full. */
+  /* Grab a free explosion slot; if every one is busy, skip this blast. */
   int slot_index = blast_pool_find_inactive(s);
   if (slot_index < 0)
     return;
   Blast *b = &s->blasts[slot_index];
 
-  /* Step 2 — initialise centre + central-flash TTL. */
+  /* Place the centre and start the bright cross. */
   b->cx = cx;
   b->cy = cy;
   b->flash_ttl = BLAST_FLASH_SEC;
   b->active = true;
 
-  /* Step 3 — spawn the upper-hemisphere spark fan, wave-staggered. */
+  /* Throw the spark fan, each spark assigned to one of the timed ripples. */
   for (int i = 0; i < BLAST_PARTICLES; i++) {
     float angle = blast_emission_angle(i, BLAST_PARTICLES, &s->rng);
     float speed = blast_emission_speed(&s->rng);
@@ -861,7 +560,7 @@ static void blast_ignite(Scene *s, float cx, float cy) {
   }
 }
 
-/* SpawnEdge — which side of the screen a fresh comet enters from. */
+/* Which side of the screen a new comet flies in from. */
 typedef enum {
   EDGE_TOP = 0,
   EDGE_LEFT = 1,
@@ -869,7 +568,8 @@ typedef enum {
   EDGE_BOTTOM = 3,
 } SpawnEdge;
 
-/* pick_spawn_edge — weighted: TOP 45% / LEFT 25% / RIGHT 25% / BOTTOM 5%. */
+/* Pick an entry edge, weighted so most comets fall from the top: top 45%,
+ * left 25%, right 25%, bottom only 5%. */
 static SpawnEdge pick_spawn_edge(uint32_t *rng) {
   float u = lcg_unit(rng);
   if (u < 0.45f)
@@ -881,8 +581,8 @@ static SpawnEdge pick_spawn_edge(uint32_t *rng) {
   return EDGE_BOTTOM;
 }
 
-/* compute_spawn_point — (x, y) just OUTSIDE chosen edge so entry reads "from
- * off-screen". */
+/* Pick the comet's start point, placed just past the chosen edge so it looks
+ * like it's flying in from off screen. */
 static void compute_spawn_point(SpawnEdge edge, int cols, int rows,
                                 uint32_t *rng, float *spawn_x, float *spawn_y) {
   float along_edge = lcg_unit(rng);
@@ -906,8 +606,8 @@ static void compute_spawn_point(SpawnEdge edge, int cols, int rows,
   }
 }
 
-/* compute_target_point — point in the OPPOSITE-edge quadrant band; guarantees
- * diagonal arc. */
+/* Pick a point to aim at, over on the far side of the screen, so the comet
+ * cuts a clear diagonal across instead of nicking the corner it entered from. */
 static void compute_target_point(SpawnEdge edge, int cols, int rows,
                                  uint32_t *rng, float *target_x,
                                  float *target_y) {
@@ -933,7 +633,8 @@ static void compute_target_point(SpawnEdge edge, int cols, int rows,
   }
 }
 
-/* compute_speed_with_jitter — pp.speed · uniform[1 − jit/2, 1 + jit/2). */
+/* Take the look's base speed and nudge it up or down a little at random, so
+ * the comets don't all move in lockstep. */
 static float compute_speed_with_jitter(const PatternParams *pp, uint32_t *rng) {
   float jitter_lo = 1.0f - pp->speed_jitter * 0.5f;
   float jitter_hi = jitter_lo + pp->speed_jitter;
@@ -941,53 +642,36 @@ static float compute_speed_with_jitter(const PatternParams *pp, uint32_t *rng) {
 }
 
 /*
- * scene_spawn_comet — DRIVER.  Top up the pool with one new comet.
+ * Add one new comet to the pool: pick an entry edge, a start point just past
+ * it, and a target on the far side, then aim the comet from start to target at
+ * a slightly randomised speed.
  *
- *   Step 1   slot ← comet_pool_find_inactive            bail if pool full
- *   Step 2   edge ← pick_spawn_edge(rng)                 weighted edge selector
- *   Step 3   spawn  ← compute_spawn_point(edge, ...)     just OUTSIDE edge
- *   Step 4   target ← compute_target_point(edge, ...)    opposite-quadrant band
- *   Step 5   d ← target − spawn
- *            speed ← compute_speed_with_jitter(pp)
- *   Step 6   c.pos ← spawn
- *            c.vel ← (speed·d.x/|d|, speed·d.y/|d|)      unit-vector · speed
- *            c.emit_carry ← 0; c.age ← 0; c.active ← true
- *
- * INPUTS / UNITS
- *   s   Scene mutated; one inactive Comet slot becomes active.
- *   pos in cells, vel in cells/sec.
- *
- * WHY THE OPPOSITE-QUADRANT TARGET
- *   Aiming at the opposite quadrant guarantees a diagonal arc that
- *   visibly crosses the screen.  Uniform-direction random vectors would
- *   half the time send the comet back out the edge it entered on
- *   (invisible flight, frustrating "where did it go?" effect).
- *
- * WHY IT EXISTS (vs. inlining in scene_tick / phase1)
- *   phase1_topup_comet_pool stays at orchestrator level — "top up until
- *   pool reaches max".  All edge-picking + target-aiming + velocity
- *   computation lives here as one ~30-line unit.
+ * Aiming across the screen is the point — a purely random direction would,
+ * half the time, send the comet straight back out the edge it came in on, so
+ * you'd never see it. Does nothing if every comet slot is already in use.
  */
 static void scene_spawn_comet(Scene *s) {
-  /* Step 1 — find free slot. */
+  /* Grab a free comet slot, or give up if the pool is full. */
   int slot_index = comet_pool_find_inactive(s);
   if (slot_index < 0)
     return;
   Comet *c = &s->comets[slot_index];
   const PatternParams *pp = &pattern_params[s->current_pattern];
 
-  /* Step 2 — pick a weighted spawn edge. */
+  /* Pick which edge it enters from. */
   SpawnEdge edge = pick_spawn_edge(&s->rng);
 
-  /* Step 3 — spawn point just outside the edge. */
+  /* Its start point, just outside that edge. */
   float spawn_x, spawn_y;
   compute_spawn_point(edge, s->cols, s->rows, &s->rng, &spawn_x, &spawn_y);
 
-  /* Step 4 — target point in the opposite quadrant. */
+  /* A point on the far side to head toward. */
   float target_x, target_y;
   compute_target_point(edge, s->cols, s->rows, &s->rng, &target_x, &target_y);
 
-  /* Step 5 — velocity = unit(target − spawn) × speed. */
+  /* Turn "start to target" into a direction, then scale it to the speed.
+   * The tiny-distance guard avoids dividing by zero if the two points land
+   * on top of each other. */
   float delta_x = target_x - spawn_x;
   float delta_y = target_y - spawn_y;
   float distance = sqrtf(delta_x * delta_x + delta_y * delta_y);
@@ -995,7 +679,7 @@ static void scene_spawn_comet(Scene *s) {
     distance = 1.0f;
   float speed = compute_speed_with_jitter(pp, &s->rng);
 
-  /* Step 6 — write the slot. */
+  /* Fill in the comet. */
   c->x = spawn_x;
   c->y = spawn_y;
   c->vx = speed * delta_x / distance;
@@ -1006,73 +690,54 @@ static void scene_spawn_comet(Scene *s) {
 }
 
 /*
- * scene_emit_trail — DRIVER.  Drop ONE trail particle at the comet's position.
- *                    THE moving-emitter mechanism — the file's algorithmic
- * core.
+ * Drop one trail dot at the comet's current spot. This is the heart of the
+ * whole effect.
  *
- *   Step 1   slot ← trail_pool_find_inactive             bail if pool full
- *   Step 2   speed ← |comet.vel|;  if < 1e-3 set to 1.0  unit-vector safety
- *   Step 3   perp ← (-vy/speed, vx/speed)                90° CCW rotation
- *   Step 4   kick ← uniform(-1, 1) · 2 · particle_spread lateral cells
- *   Step 5   offset ← perp · kick                        position offset
- *   Step 6   drift ← offset · spread_drift_factor        DRIFT VELOCITY
- *                                                         (NOT inherited from
- * comet) Step 7   life ← particle_life · uniform(0.7, 1.3)    ±30% jitter write
- * slot: pos=c.pos+offset, vel=drift, age=0, life, active
+ * The dot lands a little to the side of the comet (a random nudge across the
+ * comet's flight direction), and it's given only a slow drift of its own — NOT
+ * the comet's speed. That's the key: the comet races on while the dot barely
+ * moves, so the dot is left behind and the line of dots reads as a streak. If
+ * you instead handed the dot the comet's velocity, it would ride along and
+ * there'd be no streak at all.
  *
- * INPUTS / UNITS
- *   s   Scene mutated; one inactive TrailParticle slot becomes active.
- *   c   emitting comet (const — read only).
- *   pos in cells, vel in cells/sec, life in seconds.
- *
- * WHY THE TRAIL "FALLS BEHIND" — THE WHOLE POINT
- *   The drift velocity at Step 6 is NOT the comet's velocity.  It's a
- *   small perpendicular kick.  Because the trail particle moves slowly
- *   (or barely at all) while the comet keeps flying at its full speed,
- *   the trail visually trails BEHIND the comet — exactly because the
- *   particle did NOT inherit the comet's motion.  Break this decoupling
- *   (e.g. p->vx = c->vx) and the trail rides along with the comet,
- *   producing no streak.
- *
- * WHY IT EXISTS (vs. inlining in comet_emit_trail_particles)
- *   comet_emit_trail_particles handles the fractional-carry accumulator
- *   that decides HOW MANY particles to spawn this frame.  This function
- *   handles WHERE each one goes.  Two responsibilities, two functions.
+ * Reads the emitting comet, writes one trail dot into the pool. Does nothing
+ * if the trail pool is full.
  */
 static void scene_emit_trail(Scene *s, const Comet *c) {
-  /* Step 1 — find an inactive TrailParticle slot; bail if pool full. */
+  /* Grab a free trail slot, or give up if the pool is full. */
   int slot_index = trail_pool_find_inactive(s);
   if (slot_index < 0)
     return;
   TrailParticle *p = &s->trail[slot_index];
   const PatternParams *pp = &pattern_params[s->current_pattern];
 
-  /* Step 2 — perpendicular unit vector to the comet's flight direction.
-   *          In 2-D, rotating (vx, vy) by 90° CCW gives (-vy, vx). */
+  /* A unit-length direction at right angles to the comet's flight, so we can
+   * nudge the dot sideways. The tiny-speed guard keeps the division safe if
+   * the comet is momentarily near-still. */
   float comet_speed = sqrtf(c->vx * c->vx + c->vy * c->vy);
   if (comet_speed < 1e-3f)
     comet_speed = 1.0f;
   float perp_x = -c->vy / comet_speed;
   float perp_y = c->vx / comet_speed;
 
-  /* Step 3 — lateral kick magnitude, uniform in ±particle_spread cells. */
+  /* How far sideways this dot lands, random within the look's spread. */
   float kick_magnitude = lcg_signed(&s->rng) * 2.0f * pp->particle_spread;
 
-  /* Step 4 — position offset along the perpendicular axis. */
+  /* Turn that into an actual sideways offset. */
   float offset_x = perp_x * kick_magnitude;
   float offset_y = perp_y * kick_magnitude;
 
-  /* Step 5 — drift velocity. 0 for SHOOTING_STAR (tight streak); >0 for
-   *          FIREBALL/PLASMA_BOLT (sparks puff outward as they age). */
+  /* The dot's own slow drift. Zero for SHOOTING_STAR (a tight line); larger
+   * for FIREBALL/PLASMA_BOLT, so their dots puff outward as they fade. */
   float drift_vx = offset_x * pp->spread_drift_factor;
   float drift_vy = offset_y * pp->spread_drift_factor;
 
-  /* Step 6 — per-particle lifetime jitter, uniform in 0.7×..1.3× the
-   *          pattern's base particle_life. */
+  /* Give each dot a slightly different lifespan (about 0.7x to 1.3x the
+   * look's base) so the trail doesn't vanish all at once. */
   float life_factor = lcg_range(&s->rng, 0.7f, 1.3f);
   float life_sec = pp->particle_life * life_factor;
 
-  /* Step 7 — write the slot. */
+  /* Fill in the dot. */
   p->x = c->x + offset_x;
   p->y = c->y + offset_y;
   p->vx = drift_vx;
@@ -1082,7 +747,8 @@ static void scene_emit_trail(Scene *s, const Comet *c) {
   p->active = true;
 }
 
-/* scene_init — zero Scene, install defaults, spawn one seed comet. */
+/* Wipe the scene, set the starting options, and launch one comet so the
+ * screen isn't blank at startup. */
 static void scene_init(Scene *s, int cols, int rows) {
   memset(s, 0, sizeof *s);
   s->paused = false;
@@ -1096,21 +762,21 @@ static void scene_init(Scene *s, int cols, int rows) {
   scene_spawn_comet(s);
 }
 
-/* scene_resize — record new terminal extent; pools are fixed-size, so nothing
- * else to do. */
+/* Remember the new terminal size. The pools are fixed-size, so there's
+ * nothing else to do on a resize. */
 static void scene_resize(Scene *s, int cols, int rows) {
   s->cols = cols;
   s->rows = rows;
 }
 
-/* scene_reseed — bound to 'r': clear all pools, reseed RNG, spawn one comet. */
+/* The 'r' key: clear everything, freshen the random seed, launch one comet. */
 static void scene_reseed(Scene *s) {
   s->rng = (uint32_t)clock_ns() ^ 0xC0FFEEu;
   scene_clear_pools(s);
   scene_spawn_comet(s);
 }
 
-/* count_active_comets — how many comet slots are currently in flight. */
+/* How many comets are in flight right now. */
 static int count_active_comets(const Scene *s) {
   int active = 0;
   for (int i = 0; i < MAX_COMETS; i++)
@@ -1119,7 +785,7 @@ static int count_active_comets(const Scene *s) {
   return active;
 }
 
-/* phase1_topup_comet_pool — spawn enough comets to reach pp->max_comets. */
+/* Phase 1: spawn comets until we're back up to the look's allowed count. */
 static void phase1_topup_comet_pool(Scene *s, const PatternParams *pp) {
   int active_now = count_active_comets(s);
   int target_count =
@@ -1128,8 +794,9 @@ static void phase1_topup_comet_pool(Scene *s, const PatternParams *pp) {
     scene_spawn_comet(s);
 }
 
-/* comet_apply_plasma_kick — 2-D rotation by uniform(-k, +k); preserves |v|.
- * k=0 (SHOOTING_STAR/FIREBALL) → early return; only PLASMA_BOLT rotates. */
+/* Steer the comet a random tiny amount left or right. We rotate the velocity
+ * rather than just adding to it, so the comet keeps the same speed and only
+ * changes direction. Only PLASMA_BOLT uses this; the others pass 0 and skip. */
 static void comet_apply_plasma_kick(Comet *c, uint32_t *rng,
                                     float kick_strength) {
   if (kick_strength <= 0.0f)
@@ -1144,8 +811,8 @@ static void comet_apply_plasma_kick(Comet *c, uint32_t *rng,
   c->vy = new_vy;
 }
 
-/* comet_hit_ground — predicate+side-effect: if vy>0 and y≥rows-2, ignite blast
- * + deactivate. */
+/* Did this comet just reach the floor heading down? If so, set off an
+ * explosion there, retire the comet, and report true. */
 static bool comet_hit_ground(Scene *s, Comet *c) {
   float ground_y = (float)s->rows - 2.0f;
   if (!(c->vy > 0.0f && c->y >= ground_y))
@@ -1157,8 +824,8 @@ static bool comet_hit_ground(Scene *s, Comet *c) {
   return true;
 }
 
-/* comet_off_screen — predicate-with-side-effect.  Deactivates a comet
- * that has drifted ±EDGE_MARGIN past any edge; returns true if it did. */
+/* Has this comet drifted past any edge (with a little slack)? If so, retire it
+ * and report true. */
 static bool comet_off_screen(Scene *s, Comet *c) {
   bool off_left = (c->x < -EDGE_MARGIN);
   bool off_right = (c->x > (float)s->cols + EDGE_MARGIN);
@@ -1171,8 +838,9 @@ static bool comet_off_screen(Scene *s, Comet *c) {
   return false;
 }
 
-/* comet_emit_trail_particles — Bresenham fractional carry: spawn floor(carry)
- * per frame. */
+/* Decide how many trail dots to drop this frame. We add up the dots owed
+ * (rate times elapsed time), drop the whole ones now, and carry the leftover
+ * fraction to next frame so nothing is lost to rounding. */
 static void comet_emit_trail_particles(Scene *s, Comet *c, float dt,
                                        const PatternParams *pp) {
   c->emit_carry += pp->emit_rate * dt;
@@ -1182,29 +850,26 @@ static void comet_emit_trail_particles(Scene *s, Comet *c, float dt,
     scene_emit_trail(s, c);
 }
 
-/* phase2_advance_one_comet — per-comet body: plasma kick → integrate → die →
- * emit. */
+/* Move one comet through a single frame: maybe steer it, slide it forward,
+ * check whether it died, and if it's still alive, drop its trail dots. We
+ * check for a floor hit before going off-screen so an explosion still fires. */
 static void phase2_advance_one_comet(Scene *s, Comet *c, float dt,
                                      const PatternParams *pp) {
-  /* Step 1 — pattern-specific velocity rotation. */
   comet_apply_plasma_kick(c, &s->rng, pp->angular_kick);
 
-  /* Step 2 — integrate position. */
   c->x += c->vx * dt;
   c->y += c->vy * dt;
   c->age += dt;
 
-  /* Step 3 — death tests (impact takes precedence over off-screen). */
   if (comet_hit_ground(s, c))
     return;
   if (comet_off_screen(s, c))
     return;
 
-  /* Step 4 — emit trail particles for this frame. */
   comet_emit_trail_particles(s, c, dt, pp);
 }
 
-/* phase2_advance_all_comets — iterate every active comet slot. */
+/* Phase 2: advance every comet that's currently in flight. */
 static void phase2_advance_all_comets(Scene *s, float dt,
                                       const PatternParams *pp) {
   for (int i = 0; i < MAX_COMETS; i++) {
@@ -1215,8 +880,8 @@ static void phase2_advance_all_comets(Scene *s, float dt,
   }
 }
 
-/* phase3_advance_trail — drag + explicit Euler + age + deactivate at age≥life.
- */
+/* Phase 3: move and age every trail dot. Each dot drifts a bit, slows down,
+ * gets older, and is retired once it's lived out its lifespan. */
 static void phase3_advance_trail(Scene *s, float dt, const PatternParams *pp) {
   float drag_factor = expf(-pp->trail_drag * dt);
 
@@ -1235,32 +900,34 @@ static void phase3_advance_trail(Scene *s, float dt, const PatternParams *pp) {
   }
 }
 
-/* blast_particle_tick_one — wave-delay gate, then drag + integrate + age + die.
- */
+/* Move one spark through a frame. Returns true if it's still alive afterward.
+ * A spark that's still waiting for its ripple just holds at the centre; once
+ * released it slows down, drifts, ages, and dies when its life runs out or it
+ * leaves the screen. */
 static bool blast_particle_tick_one(BlastParticle *p, const Blast *b,
                                     float drag_factor, float dt, int cols,
                                     int rows) {
   if (!p->alive)
     return false;
 
-  /* Gate — wave-stagger countdown holds the spark at centre. */
+  /* Still waiting for its ripple's turn — sit tight at the centre. */
   if (p->delay > 0.0f) {
     p->delay -= dt;
     return true;
   }
 
-  /* Step 1 — multiplicative drag (exponential decay). */
+  /* Slow it down a touch. */
   p->vx *= drag_factor;
   p->vy *= drag_factor;
 
-  /* Step 2 — explicit Euler integration in offset space. */
+  /* Slide it along by its velocity. */
   p->rx += p->vx * dt;
   p->ry += p->vy * dt;
 
-  /* Step 3 — age the life counter. */
+  /* Count down its remaining life. */
   p->life -= dt;
 
-  /* Step 4 — death test (life exhausted OR left the playable area). */
+  /* Die if life ran out or it left the screen. */
   float screen_x = b->cx + p->rx;
   float screen_y = b->cy + p->ry;
   bool burned_out = (p->life <= 0.0f);
@@ -1273,8 +940,9 @@ static bool blast_particle_tick_one(BlastParticle *p, const Blast *b,
   return true;
 }
 
-/* phase4_advance_one_blast — flash TTL + per-spark tick; returns "stay active".
- */
+/* Advance one explosion: count down its bright cross and tick all its sparks.
+ * Returns true while the blast still has something to show (the cross is up or
+ * at least one spark is alive). */
 static bool phase4_advance_one_blast(Blast *b, float drag_factor, float dt,
                                      int cols, int rows) {
   if (b->flash_ttl > 0.0f)
@@ -1290,7 +958,8 @@ static bool phase4_advance_one_blast(Blast *b, float drag_factor, float dt,
   return any_alive || !flash_done;
 }
 
-/* phase4_advance_all_blasts — drag factor once, then per-blast tick. */
+/* Phase 4: advance every active explosion. We work out the slow-down factor
+ * once and reuse it for all of them. */
 static void phase4_advance_all_blasts(Scene *s, float dt) {
   float drag_factor = expf(-BLAST_DRAG_PER_SEC * dt);
 
@@ -1304,28 +973,14 @@ static void phase4_advance_all_blasts(Scene *s, float dt) {
 }
 
 /*
- * scene_tick — DRIVER.  Advance the whole simulation one frame (4 phases).
+ * Advance the whole simulation by one step, in four phases: spawn comets, move
+ * comets (which drop trail dots), age the trail, then update explosions. The
+ * speed dial scales the time step first, so one knob speeds up or slows down
+ * everything at once. Does nothing while paused.
  *
- *   if paused:                                    return
- *   dt *= speed / SPEED_DEF                       user "+/-" time dial
- *   pp ← pattern_params[current_pattern]
- *   phase1_topup_comet_pool   (s, pp)             spawn new comets
- *   phase2_advance_all_comets (s, dt, pp)         per-comet kick/move/emit/die
- *   phase3_advance_trail      (s, dt, pp)         trail drag + Euler + age
- *   phase4_advance_all_blasts (s, dt)             blast flash + per-spark tick
- *
- * INPUTS / UNITS
- *   s   Scene mutated; every active slot in every pool advances by dt.
- *   dt  frame time in seconds (capped at 100 ms by the main loop).
- *   speed multiplier scales dt before any phase runs — one knob slows or
- *   speeds the entire simulation uniformly.
- *
- * WHY THE PHASES ARE IN THIS ORDER
- *   1 first   need comets to integrate.
- *   2 next    trail emission reads comet.pos updated in this same step.
- *   3 after 2 lets trail particles cull before they're rendered.
- *   4 last    blasts are independent; doing them last keeps the comet/trail
- *             working set tighter in cache.
+ * The order matters: comets must exist before we move them, and they drop
+ * their trail dots as they move, so the trail must be aged after that. The
+ * explosions don't depend on any of it, so they go last.
  */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
@@ -1341,7 +996,8 @@ static void scene_tick(Scene *s, float dt) {
   phase4_advance_all_blasts(s, dt);
 }
 
-/* draw_one_trail_particle — round to cell, freshness→slot→glyph+attr, paint. */
+/* Draw one trail dot: find its cell, pick the character and shade from how
+ * fresh it still is, and paint it. */
 static void draw_one_trail_particle(const TrailParticle *p, int cols,
                                     int rows_playable) {
   int cell_x = round_to_cell(p->x);
@@ -1358,7 +1014,7 @@ static void draw_one_trail_particle(const TrailParticle *p, int cols,
   paint_cell(cell_y, cell_x, glyph, color_pair, attr);
 }
 
-/* scene_draw_trail_layer — LAYER A: paint every active trail particle. */
+/* Bottom layer: paint all the trail dots. */
 static void scene_draw_trail_layer(const Scene *s, int rows_playable) {
   for (int i = 0; i < MAX_TRAIL; i++) {
     const TrailParticle *p = &s->trail[i];
@@ -1368,7 +1024,8 @@ static void scene_draw_trail_layer(const Scene *s, int rows_playable) {
   }
 }
 
-/* draw_blast_flash — central '*' + 3 '+' (left/right/above; below omitted). */
+/* Draw the explosion's bright cross: a '*' at the centre with '+' to the left,
+ * right, and above. Nothing below, since that's into the floor. */
 static void draw_blast_flash(const Blast *b, int cols, int rows_playable) {
   if (b->flash_ttl <= 0.0f)
     return;
@@ -1387,8 +1044,9 @@ static void draw_blast_flash(const Blast *b, int cols, int rows_playable) {
     paint_cell(cy - 1, cx, '+', PAIR_HEAD, A_BOLD);
 }
 
-/* draw_one_blast_spark — gate dead/delayed; offset→absolute;
- * freshness→slot+attr; paint. */
+/* Draw one spark, if it's alive and past its ripple delay. Its offset is added
+ * to the blast centre to find its cell, and its shade comes from how fresh it
+ * still is. */
 static void draw_one_blast_spark(const Blast *b, const BlastParticle *p,
                                  int cols, int rows_playable) {
   if (!p->alive || p->delay > 0.0f)
@@ -1407,14 +1065,14 @@ static void draw_one_blast_spark(const Blast *b, const BlastParticle *p,
   paint_cell(cell_y, cell_x, p->sym, color_pair, attr);
 }
 
-/* draw_one_blast — flash + every spark of one Blast slot. */
+/* Draw one whole explosion: its bright cross, then all of its sparks. */
 static void draw_one_blast(const Blast *b, int cols, int rows_playable) {
   draw_blast_flash(b, cols, rows_playable);
   for (int j = 0; j < BLAST_PARTICLES; j++)
     draw_one_blast_spark(b, &b->parts[j], cols, rows_playable);
 }
 
-/* scene_draw_blast_layer — LAYER B: paint every active Blast. */
+/* Middle layer: paint all the explosions. */
 static void scene_draw_blast_layer(const Scene *s, int rows_playable) {
   for (int i = 0; i < MAX_BLASTS; i++) {
     const Blast *b = &s->blasts[i];
@@ -1424,8 +1082,8 @@ static void scene_draw_blast_layer(const Scene *s, int rows_playable) {
   }
 }
 
-/* draw_comet_halo — 8 neighbours: '+' on cardinals (BOLD), ':' on diagonals
- * (DIM). */
+/* Draw the glow around the comet head: the 8 surrounding cells, with a bold
+ * '+' straight up/down/left/right and a dim ':' on the diagonals. */
 static void draw_comet_halo(int head_x, int head_y, int cols,
                             int rows_playable) {
   for (int dy = -1; dy <= 1; dy++) {
@@ -1447,7 +1105,7 @@ static void draw_comet_halo(int head_x, int head_y, int cols,
   }
 }
 
-/* draw_one_comet — halo first, then the head glyph on top of it. */
+/* Draw one comet: the glow first, then its head on top. */
 static void draw_one_comet(const Comet *c, char head_glyph, int cols,
                            int rows_playable) {
   int head_x = round_to_cell(c->x);
@@ -1460,7 +1118,7 @@ static void draw_one_comet(const Comet *c, char head_glyph, int cols,
   paint_cell(head_y, head_x, head_glyph, PAIR_HEAD, A_BOLD);
 }
 
-/* scene_draw_comet_layer — LAYER C: paint every active comet. */
+/* Top layer: paint all the comets. */
 static void scene_draw_comet_layer(const Scene *s, int rows_playable) {
   const PatternParams *pp = &pattern_params[s->current_pattern];
   for (int i = 0; i < MAX_COMETS; i++) {
@@ -1472,23 +1130,10 @@ static void scene_draw_comet_layer(const Scene *s, int rows_playable) {
 }
 
 /*
- * scene_draw — DRIVER.  Three-layer painter's algorithm.
- *
- *   rows_playable ← rows - 1                bottom row reserved for HUD
- *   scene_draw_trail_layer  (s)             LAYER A: background (past)
- *   scene_draw_blast_layer  (s)             LAYER B: mid-ground (event)
- *   scene_draw_comet_layer  (s)             LAYER C: foreground (present)
- *
- * INPUTS / UNITS
- *   s   Scene to read (const).
- *
- * Layer order is z-by-category, not by depth.  Trails are "the past",
- * blasts are "the event", comets are "the present" — comets win every
- * cell collision.
- *
- * WHY IT EXISTS (vs inlining in screen_draw)
- *   screen_draw stays at "erase + scene + HUD".  All scene-rendering
- *   detail lives here as one 4-line orchestrator.
+ * Draw the whole scene back to front: trails first, then explosions, then
+ * comets on top. We paint in that order so that wherever things land on the
+ * same cell, the comet (the "now") wins over the explosion, which wins over
+ * the old trail. The bottom screen row is left for the HUD.
  */
 static void scene_draw(const Scene *s) {
   int rows_playable = s->rows - 1;
@@ -1497,10 +1142,9 @@ static void scene_draw(const Scene *s) {
   scene_draw_comet_layer(s, rows_playable);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen ── */
 
+/* The terminal's current size in characters. */
 typedef struct {
   int cols, rows;
 } Screen;
@@ -1579,10 +1223,19 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app ── */
 
+/*
+ * App — ties everything together: the simulation, the terminal size, the
+ * chosen sim rate, and two flags the signal handlers flip.
+ *
+ *   sim_fps      how many simulation steps per second we aim for ([ and ])
+ *   running      cleared to stop the main loop (also set by Ctrl-C / kill)
+ *   need_resize  set when the terminal was resized, handled next loop pass
+ *
+ * The two flags are sig_atomic_t because they're written from signal handlers,
+ * which can fire between any two instructions.
+ */
 typedef struct {
   Scene scene;
   Screen screen;

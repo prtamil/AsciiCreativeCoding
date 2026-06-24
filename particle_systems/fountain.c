@@ -1,333 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * fountain.c — water particles ejected from a source, arc back under gravity
+ * fountain.c — water shoots up from a source and arcs back down under gravity.
  *
- * DEMO: A source position emits water particles each tick — narrow
- *       column for GEYSER, wide cone for FOUNTAIN, falling sheet for
- *       WATERFALL, hot wide cone for VOLCANIC. Each particle has an
- *       initial velocity from the source's cone (small angle =
- *       narrow stream; wide angle = spray); gravity pulls them back
- *       toward the ground. When a particle hits the ground it
- *       SPLASHES — small bouncing fragments — and dies.
+ * One little engine drives four looks: a thin GEYSER jet, a wide
+ * FOUNTAIN cone, a falling WATERFALL sheet, and a hot VOLCANIC spray.
+ * Each drop is launched at a random angle inside a cone, gravity bends
+ * its path into an arc, and when it hits the floor it bursts into a few
+ * short-lived splash specks. The four looks differ only in the numbers
+ * fed to the engine (see pattern_params below), never in the code path.
  *
- *       Patterns:
- *         GEYSER     thin vertical column, fast
- *         FOUNTAIN   wide cone, classic park-fountain shape
- *         WATERFALL  wide downward sheet from the top of the screen
- *         VOLCANIC   wide hot cone — uses the lava palette
- *
- * Study alongside:
- *   rain.c            — same particle-pool + splash mechanism.
- *   snow.c            — same per-particle jitter for organic feel.
- *   physics/bounce_ball.c — same parabolic ballistics (constant gravity).
- *
- * Section map:
- *   §1 config    — constants, themes, per-pattern parameters
- *   §2 clock     — monotonic timer + sleep
- *   §3 color     — theme ramp (water + lava) + splash + sky pairs
- *   §4 drop      — Drop struct, drop_glyph_for_velocity
- *   §5 splash    — Splash struct
- *   §6 scene     — pools, spawn/emit, tick + helpers, draw + helpers, reseed
- *   §7 screen    — ncurses init / draw / resize
- *   §8 app       — signals, fixed-step main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reseed (clear pools; emission refills on next tick)
- *   n / N      next pattern   (GEYSER → FOUNTAIN → WATERFALL → VOLCANIC)
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      faster (speed multiplier ×2)
- *   -          slower (÷2)
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra particle_systems/fountain.c \
- *       -o fountain -lncurses -lm
+ * Sister files: rain.c (same pool + splash trick),
+ * physics/bounce_ball.c (same gravity-arc motion).
+ * Idea credit: Reeves, "Particle Systems", ACM TOG 2(2), 1983.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Pool-based 2-D particle system with two species —
- *                  DROPS ejected from a source, SPLASH particles emitted
- *                  on ground impact. Each pattern defines a SOURCE
- *                  (position + x spread) and an EJECTION CONE (initial
- *                  speed magnitude + half-angle). At spawn time we draw
- *                  a random angle in [-half_angle, +half_angle] and
- *                  random speed within ±15 % of the base, then resolve
- *                  to (vx, vy) = speed · (sin α, −cos α) for upward
- *                  patterns or (sin α, +cos α) for the falling
- *                  WATERFALL pattern.
- *
- *                  Each tick: each drop integrates explicit Euler
- *                  under constant gravity (vy += g·dt); the parabolic
- *                  trajectory is the result. When y reaches the bottom
- *                  HUD-edge row, the drop spawns N splashes (per
- *                  pattern.splash_mul) and dies.
- *
- *                  Pattern.hot_palette flag selects the LAVA colour
- *                  ramp (orange/red gradient) instead of the WATER
- *                  ramp (blue) without changing any other parameters.
- *                  Same engine, different colour interpretation.
- *
- * Data-structure : Drop[MAX_DROPS] + Splash[MAX_SPLASHES] object pools
- *                  with `active` flag — same shape as rain.c. Linear-
- *                  scan spawn (small N — fine), no malloc at runtime.
- *
- * Rendering      : ASCII only. Five drop glyphs picked from velocity
- *                  (drop_glyph_for_velocity): apex / near-stationary
- *                  → `*`; rising → `'` (slow) or `^` (fast); falling
- *                  → `.` (slow) or `,` (fast). Colour from the active
- *                  theme's water or lava ramp indexed by drop HEIGHT
- *                  fraction (peak = brightest). No background fill.
- *
- * Performance    : O(MAX_DROPS + MAX_SPLASHES) per tick. With FOUNTAIN
- *                  defaults (380 target drops + ~250 splashes), that's
- *                  ~630 particles × 1-cell render ≈ 630 mvaddch per
- *                  frame. Trivial at 60 fps.
- *
- * References
- * ──────────
- *   PAPERS
- *     Reeves, W. T. (1983)
- *       "Particle Systems — A Technique for Modeling a Class of Fuzzy Objects"
- *       ACM Transactions on Graphics 2(2): 91-108.
- *       Foundational paper.  Source-with-cone-ejection is exactly the
- *       drop-spawn model used here; splashes are a second species pool.
- *
- *     Witkin, A. & Baraff, D. (2001)
- *       "Physically Based Modeling: Principles and Practice"
- *       SIGGRAPH course notes (online proceedings).
- *       §1 — particle dynamics under constant force fields, the
- *       integrator drop_step_ballistic implements.
- *
- *   BOOKS
- *     Bourg, D. M. & Bywalec, B. — "Physics for Game Developers" (2nd ed,
- *       O'Reilly, 2013).  Ch. 2-4: ballistic projectile motion under
- *       gravity, closed-form parabolic trajectory + the explicit Euler
- *       discretisation used by drop_step_ballistic.
- *
- *     Akenine-Möller, T., Haines, E. & Hoffman, N. — "Real-Time Rendering"
- *       (4th ed, CRC Press, 2018).  §13.7 covers point-sprite particle
- *       rendering; the height-fraction → ramp-slot trick is the same
- *       intensity-from-state pattern.
- *
- *     Foley, J. D., van Dam, A., Feiner, S. K. & Hughes, J. F. — "Computer
- *       Graphics: Principles and Practice" (3rd ed, Addison-Wesley, 2013).
- *       §17.6.2: particle systems as stochastic modelling primitive,
- *       cone-ejection as the canonical fountain/spray generator.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE — DATA-DRIVEN PATTERN ENGINE ────────────────────────── *
- *
- * Four fountain effects (GEYSER, FOUNTAIN, WATERFALL, VOLCANIC) are
- * produced by a SINGLE generic two-species engine — ballistic DROPS
- * + bouncing SPLASH particles — driven by an array of PatternParams
- * structs.  scene_tick and the render layer never branch on the
- * pattern enum to decide HOW the physics works; they read
- * pattern_params[s->current_pattern] and compute accordingly.
- * Adding a new fountain is a matter of appending one row to
- * pattern_params[]; no new code paths.
- *
- *
- * THE GENERIC ENGINE (pseudocode)
- * ───────────────────────────────
- *
- *   loop forever (each tick of dt seconds):
- *
- *     pp = pattern_params[scene.current_pattern]   # read inputs
- *
- *     # 1. SPAWN DROPS — top up pool toward target density
- *     while count(active drops) < pp.target_drops:
- *         d = next_inactive_drop_slot()
- *         d.x      = scene.cols/2 + uniform(-pp.source_x_spread,
- *                                           +pp.source_x_spread)
- *         d.y      = pp.source_top ? top_row : (scene.rows - 2)
- *         alpha    = uniform(-pp.cone_half_angle, +pp.cone_half_angle)
- *         speed    = pp.speed_init · jitter(±15%)        # Reeves stochastic
- *         d.vx     = speed · sin(alpha)
- *         d.vy     = (pp.upward ? -1 : +1) · speed · cos(alpha)
- *         d.life   = uniform(pp.life_max·0.6, pp.life_max)
- *         d.active = true
- *
- *     # 2. INTEGRATE DROPS — semi-implicit Euler with constant gravity
- *     for d in active drops:
- *         d.vy += pp.gravity · dt                        # always positive
- *         d.x  += d.vx · dt
- *         d.y  += d.vy · dt
- *         d.age += dt
- *
- *     # 3. FLOOR IMPACT — drop hits floor → spawn splashes
- *     for d in active drops where d.y >= floor:
- *         n_splash = round(SPLASH_BASE_PER_DROP · pp.splash_mul)
- *         for k in 0..n_splash:
- *             s = next_inactive_splash_slot()
- *             s.x, s.y = d.x, floor
- *             (s.vx, s.vy) = polar(angle≈up_jitter, speed_jitter)
- *             s.life       = SPLASH_LIFE
- *             s.active     = true
- *         d.active = false
- *
- *     # 4. INTEGRATE SPLASHES — Euler with gravity + drag
- *     for s in active splashes:
- *         s.vy += GRAVITY · dt
- *         s.vx *= SPLASH_DRAG_FACTOR
- *         s.x  += s.vx · dt
- *         s.y  += s.vy · dt
- *         s.age += dt
- *         if s.age >= s.life:  s.active = false
- *
- *     # 5. CULL — drops past lifetime cap or off-screen
- *     for d in active drops:
- *         if d.age >= d.life or d.x off-screen:  d.active = false
- *
- *     # 6. RENDER — drops by height-fraction along ramp,
- *     #             splashes as small dim glyphs.
- *     ramp = pp.hot_palette ? theme.lava : theme.water
- *     for d in active drops:
- *         f    = drop_height_fraction(d, pp, scene.rows)
- *         slot = ⌊f · 7⌋
- *         paint(round(d.x), round(d.y), DROP_GLYPHS[slot], ramp[slot])
- *     for s in active splashes:
- *         paint(round(s.x), round(s.y), '·', PAIR_SPLASH)
- *
- *
- * PATTERNPARAMS FIELD → ENGINE HOOK
- * ─────────────────────────────────
- *
- *   target_drops      →  spawn-loop refill cap        (stream density)
- *   source_top        →  spawn-y row + ramp direction (top vs bottom emit)
- *   source_x_spread   →  spawn-x jitter               (jet vs sheet)
- *   speed_init        →  base spawn speed             (× ±15% jitter)
- *   cone_half_angle   →  α range at spawn             (Foley cone-ejection)
- *   upward            →  sign of vy at spawn          (-1 up, +1 down)
- *   gravity           →  vy update each tick          (Bourg Ch. 3)
- *   life_max          →  drop lifetime cap            (zombie cull)
- *   hot_palette       →  ramp[] choice                (water vs lava)
- *   splash_mul        →  splashes per impact          (= mul·SPLASH_BASE)
- *
- * Every other engine constant — MAX_DROPS, MAX_SPLASHES,
- * SPLASH_BASE_PER_DROP, SPLASH_LIFE, SPLASH_DRAG_FACTOR,
- * DROP_SPEED_VARIANCE, DROP_GLYPHS layout — is a GLOBAL tuning knob
- * shared across all patterns.  Patterns differ ONLY in the ten
- * fields above.
- *
- *
- * ARCHITECTURAL REFERENCES
- * ────────────────────────
- *
- *   Reeves, W. T. (1983)
- *     "Particle Systems — A Technique for Modeling a Class of
- *     Fuzzy Objects", ACM TOG 2(2): 91-108.
- *     §4 makes the explicit argument that ONE engine + a struct
- *     of physical constants per phenomenon is the right
- *     architecture for natural-particle simulations.  Reeves
- *     enumerates fountain/spray as a canonical use case for
- *     stochastic cone emission — exactly what scene_spawn_drop
- *     does here under cone_half_angle.
- *
- *   Foley, van Dam, Feiner & Hughes (2013)
- *     "Computer Graphics: Principles and Practice" (3rd ed),
- *     §17.6.2.  Treats particle systems as a stochastic modelling
- *     primitive and cone-ejection as the canonical generator —
- *     this file is a textbook implementation of that pattern.
- *
- *   Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994)
- *     "Design Patterns" (Addison-Wesley) — STRATEGY pattern (§5.9).
- *     A family of algorithms (GEYSER / FOUNTAIN / WATERFALL /
- *     VOLCANIC) interchangeable behind a single interface (the
- *     engine reading PatternParams).  In procedural C the
- *     "interface" is the struct shape; "concrete strategies" are
- *     the rows of pattern_params[]; "selecting a strategy" is
- *     updating scene.current_pattern.
- *
- *   Acton, M. (2014)
- *     "Data-Oriented Design and C++" (CppCon 2014 keynote).
- *     Argues that variation between behaviours should be
- *     represented as DATA (struct fields) rather than as control
- *     flow (if/switch on type).  pattern_params[] is a compact
- *     data table; the engine has no per-pattern code paths.
- *
- *   Nystrom, R. (2014)
- *     "Game Programming Patterns" (Genever Benning).
- *     TYPE OBJECT chapter — PatternParams is a Type Object: one
- *     shared instance per "kind" of fountain.  DATA LOCALITY
- *     chapter — Drop and Splash are flat-laid-out PODs swept
- *     linearly by the integrator each tick, exactly the layout
- *     Nystrom recommends for hot inner loops.  OBJECT POOL chapter
- *     — fixed-size BSS arrays implement Nystrom's pool idiom
- *     directly.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * ALGORITHM IN STEPS  (each numbered step = one helper in §6)
- * ──────────────────
- *  1. SPAWN.  drops_emit_to_target (calls scene_spawn_drop per slot).
- *     Count active drops; if below `pattern.target_drops`, spawn the
- *     difference (capped per tick so a long pause doesn't dump a flood).
- *     At spawn:
- *       angle  = (rand − 0.5) · 2 · cone_half_angle
- *       speed  = speed_init · (0.85 + rand · 0.30)
- *       vx     = speed · sin α
- *       vy     = upward ? -speed · cos α  :  +speed · cos α
- *       (x, y) = source position with small x scatter
- *
- *  2. INTEGRATE per drop.  drop_step_ballistic (explicit Euler):
- *       drop.vy += pattern.gravity · dt
- *       drop.x  += drop.vx · dt
- *       drop.y  += drop.vy · dt
- *       drop.age += dt
- *
- *  3. KILL & SPLASH.  drops_integrate_and_cull (calls scene_emit_splashes
- *     on impact).  When drop.y >= rows-2 (or drop.age > life_max, or
- *     drop drifts off-screen sideways) the drop dies; on ground impact
- *     it spawns `K = round(splash_mul · SPLASH_BASE)` splashes at
- *     (x, y_floor).
- *
- *  4. INTEGRATE SPLASHES.  splashes_integrate_and_cull (calls
- *     splash_step_kinematic per active splash; same bounce-ball physics
- *     as rain.c):
- *       splash.vy += SPLASH_GRAVITY · dt
- *       splash.vx *= exp(-SPLASH_DRAG · dt)
- *       update position; deactivate when age >= life.
- *
- *  5. RENDER.  scene_draw → drops_render + splashes_render.
- *     Drop glyph from velocity (drop_glyph_for_velocity: apex `*`,
- *     rising `'`/`^`, falling `.`/`,`). Colour from height fraction
- *     (drop_height_fraction → ramp slot 0..7, peak = brightest) using
- *     the WATER ramp by default and the LAVA ramp when
- *     pattern.hot_palette is set. Splash glyph from age/life ratio
- *     (splash_life_phase): fresh = `*`, mid = `+`, old = `.`.
- *
- *  6. HUD on bottom row (screen_draw).
- *
- * KEY FORMULAS
- * ────────────
- *  Cone-distributed initial velocity:
- *    α = (r − 0.5) · 2 · cone_half_angle    (r ∈ [0,1])
- *    v = speed_init · (0.85 + r' · 0.30)
- *    vx = v · sin α
- *    vy = ∓ v · cos α                       (− for upward, + for waterfall)
- *
- *  Closed-form parabolic peak (for an upward fountain at gravity g):
- *    apex_height = (v · cos α)² / (2 · g)        // cells above source
- *    flight_time = 2 · v · cos α / g              // sec from launch to landing
- *    horizontal_range = v · sin α · flight_time   // cells horizontal travel
- *
- *  Height fraction for ramp lookup:
- *    h_frac = clamp((source_y - drop.y) / source_y, 0, 1)   // 0 at ground, 1
- * at top ramp_idx = round(h_frac · 7)
- *
- *  Velocity-based glyph (drop_glyph_for_velocity, threshold 6 / 40 c/s):
- *    if |vy| < 6 c/s             : '*'   (apex / hovering)
- *    elif vy > 0 (falling)       : '.'  (|vy| ≤ 40)   ','  (|vy| > 40)
- *    else (rising)               : '\'' (|vy| ≤ 40)   '^'  (|vy| > 40)
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -345,9 +30,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
   SIM_FPS_MIN = 10,
@@ -366,11 +49,12 @@ enum {
   HUD_COLS = 80,
   FPS_UPDATE_MS = 500,
 
-  /* Color pair indices. PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+  /* Slot numbers for our color pairs. HUD and HINT slots are fixed
+     project-wide so every demo's status bars match. */
   PAIR_HUD = 1,
   PAIR_HINT = 2,
-  PAIR_WATER_BASE = 3, /* +0..+7 = 8 water tints (low→high)  */
-  PAIR_LAVA_BASE = 11, /* +0..+7 = 8 lava  tints (low→high)  */
+  PAIR_WATER_BASE = 3, /* this slot plus the next 7 = water ramp, dim to bright */
+  PAIR_LAVA_BASE = 11, /* this slot plus the next 7 = lava ramp,  dim to bright */
   PAIR_SPLASH = 19,
   PAIR_SKY = 20,
 };
@@ -379,7 +63,7 @@ enum {
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* Splash physics. */
+/* How the little splash specks behave when a drop lands. */
 #define SPLASH_GRAVITY 220.0f
 #define SPLASH_KICK_UP 25.0f
 #define SPLASH_KICK_X 20.0f
@@ -387,10 +71,11 @@ enum {
 #define SPLASH_LIFE_MIN 0.25f
 #define SPLASH_LIFE_MAX 0.55f
 
-/* Per-drop spawn jitter. */
-#define DROP_SPEED_VARIANCE 0.30f /* ±15% per-drop speed */
+/* Each drop's launch speed is wiggled by this much so the stream isn't
+   robotically uniform — here, give or take 15%. */
+#define DROP_SPEED_VARIANCE 0.30f
 
-/* Pattern enum. */
+/* The four fountain looks. */
 typedef enum {
   PATTERN_GEYSER = 0,
   PATTERN_FOUNTAIN = 1,
@@ -415,46 +100,43 @@ static const char *pattern_name(Pattern p) {
 }
 
 /*
- * PatternParams — physics + visual knobs that distinguish one fountain
- * style from another. The simulation engine never branches on pattern
- * TYPE; it reads these fields and behaves accordingly. Same code, four
- * very different fountains.
+ * PatternParams — the recipe for one fountain look.
  *
- *   target_drops     : steady-state count of active drops.
- *                      drops_emit_to_target refills toward this each
- *                      tick (with a per-tick cap so a long pause does
- *                      not flood the pool when the loop resumes).
- *                      Higher = denser stream.
- *   source_top       : true  → spawn near top edge (WATERFALL falls
- *                              INTO the frame from above).
- *                      false → spawn just above the bottom HUD row.
- *                      Also flips the colour-ramp direction in
- *                      drop_height_fraction (top bright vs apex bright).
- *   source_x_spread  : ± cells around horizontal centre where new
- *                      drops appear. Tight (GEYSER ≈ 2) → a column;
- *                      wide (WATERFALL = 28) → a sheet across the top.
- *   speed_init       : nominal initial speed magnitude (cells/sec).
- *                      ACTUAL spawn speed is jittered ±15 % around
- *                      this — see DROP_SPEED_VARIANCE.
- *   cone_half_angle  : half of cone opening, in radians. Spawn draws
- *                      α uniformly ∈ [-half, +half]. 0.10 ≈ 6° (narrow
- *                      jet); 0.75 ≈ 43° (wide spray).
- *   upward           : true  → vy_init = -speed·cos α (cone points up;
- *                              gravity arcs drops back down).
- *                      false → vy_init = +speed·cos α (cone points
- *                              down; WATERFALL drops fall with extra g).
- *   gravity          : downward acceleration (cells/sec²). Tunes arc
- *                      height for a given speed_init — bigger g =
- *                      flatter arcs, faster fall.
- *   life_max         : hard cap on drop lifetime (sec). Prevents
- *                      zombies that drift sideways forever (e.g. when
- *                      |vx| > 0 but vy stays near zero).
- *   hot_palette      : true  → LAVA ramp (orange/red) + warm splash
- *                              colour. VOLCANIC only.
- *                      false → WATER ramp (blue/cyan).
- *   splash_mul       : scales SPLASH_BASE_PER_DROP at impact.
- *                      VOLCANIC's 1.40 = chunky lava splatters;
- *                      GEYSER's 0.50 = thin water mist.
+ * This is the heart of the "one engine, four looks" idea: the engine
+ * code never asks "which pattern is this?". It just reads the numbers
+ * below and does the same thing every time. Swap the numbers and you
+ * get a geyser instead of a waterfall, no new code.
+ *
+ *   target_drops    : how many drops to keep in the air at once. The
+ *                     spawner tops the stream up toward this number
+ *                     each tick. Bigger = thicker stream.
+ *   source_top      : where the drops are born. true = up at the top
+ *                     edge, so they rain down into view (the waterfall).
+ *                     false = just above the bottom status bar, so they
+ *                     shoot up. Also decides which end of the colour
+ *                     ramp is the bright end (see drop_height_fraction).
+ *   source_x_spread : how far left/right of centre, in cells, drops can
+ *                     appear. Small (about 2) makes a narrow column;
+ *                     large (28) makes a wide curtain.
+ *   speed_init      : how fast a drop is launched, in cells per second.
+ *                     The real speed is nudged a little each time so the
+ *                     stream looks alive (see DROP_SPEED_VARIANCE).
+ *   cone_half_angle : how wide the spray fans out, in radians (half the
+ *                     full cone). Small (0.10, about 6 degrees) is a
+ *                     tight jet; large (0.75, about 43 degrees) is a
+ *                     broad spray.
+ *   upward          : true = drops are flung up and gravity arcs them
+ *                     back; false = drops are aimed down (the waterfall).
+ *   gravity         : how hard down-pull tugs each tick, in cells per
+ *                     second squared. More gravity = lower, snappier arcs.
+ *   life_max        : oldest a drop may get, in seconds. A safety net so
+ *                     a drop drifting sideways forever eventually dies
+ *                     instead of haunting the screen.
+ *   hot_palette     : true = colour drops with the hot lava ramp (the
+ *                     volcanic look); false = the cool water ramp.
+ *   splash_mul      : how many splash specks each landing throws, as a
+ *                     multiple of the base count. 1.40 = chunky lava
+ *                     splatter, 0.50 = light water mist.
  */
 typedef struct {
   int target_drops;
@@ -469,9 +151,10 @@ typedef struct {
   float splash_mul;
 } PatternParams;
 
+/* The four recipes. Fields in order: target_drops, source_top,
+   source_x_spread, speed_init, cone_half_angle, upward, gravity,
+   life_max, hot_palette, splash_mul. */
 static const PatternParams pattern_params[N_PATTERNS] = {
-    /*                  target  top   xspr  speed  cone(rad)  upward  grav life
-       hot   splash */
     /* GEYSER     */ {240, false, 2.0f, 85.0f, 0.10f, true, 120.0f, 5.0f, false,
                       0.50f},
     /* FOUNTAIN   */
@@ -483,20 +166,27 @@ static const PatternParams pattern_params[N_PATTERNS] = {
 };
 
 /*
- * Themes — two 8-step ramps per theme:
- *   water[8] — cool ramp, used by GEYSER/FOUNTAIN/WATERFALL
- *   lava [8] — hot ramp,  used by VOLCANIC
+ * Theme — one colour scheme for the whole fountain.
  *
- * Each ramp: index 0 = bottom-of-arc dim tint, index 7 = peak-of-arc
- * brightest tint.
+ * Each theme carries two 8-colour gradients ("ramps"): a cool water ramp
+ * for the normal fountains and a hot lava ramp for the volcanic one.
+ * A drop picks a colour from the ramp by how high it is — low drops use
+ * the dim end (slot 0), drops near the peak use the bright end (slot 7).
  *
- * All entries sit in the BRIGHT HALF of the 256-colour cube per the
- * CLAUDE.md "Theme Palette Brightness" rule.
+ * The colour numbers are deliberately all kept in the brighter half of
+ * the terminal's 256-colour set so nothing turns invisible on a black
+ * background (project palette rule).
+ *
+ *   name   : label shown in the status bar.
+ *   water  : 8 colours, dim (slot 0) to bright (slot 7), for water drops.
+ *   lava   : 8 colours, dim to bright, for volcanic drops.
+ *   splash : single colour for the splash specks.
+ *   sky    : background tint (currently unused for fill, kept per theme).
  */
 typedef struct {
   const char *name;
-  short water[8]; /* bottom → peak */
-  short lava[8];  /* bottom → peak */
+  short water[8];
+  short lava[8];
   short splash;
   short sky;
 } Theme;
@@ -505,8 +195,6 @@ typedef struct {
 
 static const Theme themes[N_THEMES] =
     {
-        /* name        water[0..7] lava[0..7] splash sky */
-
         {"OCEANIC",
          {24, 30, 31, 38, 44, 51, 87, 159},
          {30, 36, 73, 79, 122, 159, 195, 231},
@@ -559,9 +247,7 @@ static const Theme themes[N_THEMES] =
          232},
 };
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -579,9 +265,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color ── */
 
 static void theme_apply(int idx) {
   if (idx < 0 || idx >= N_THEMES)
@@ -617,28 +301,22 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  drop                                                               */
-/* ===================================================================== */
+/* ── §4 drop ── */
 
 /*
- * Drop — one water particle ejected from the source on its parabolic arc.
+ * Drop — one flying water particle, mid-arc.
  *
- *   x, y    : current position in cells (float for sub-cell precision).
- *             The fractional bits are what make the arc read as smooth
- *             motion instead of snapping between integer rows each tick;
- *             round-to-nearest happens once, at render time, in drop_render.
- *   vx, vy  : velocity in cells/sec. Sign convention: vy < 0 = RISING
- *             (ncurses y increases downward), vy > 0 = FALLING. The pair
- *             encodes both the cone angle the drop was launched at AND
- *             its instantaneous position along the arc — vy ≈ 0 is the
- *             apex, which drop_glyph_for_velocity renders as '*'.
- *   age     : seconds since spawn. drops_integrate_and_cull tests this
- *             against pattern.life_max so drops that drift sideways with
- *             a tiny vy still eventually die.
- *   active  : pool-slot occupancy flag. Inactive slots are skipped by
- *             every loop; spawn finds the first inactive index via
- *             linear scan (cheap at MAX_DROPS = 900).
+ *   x, y   : where it is right now, measured in cells. Kept as floats so
+ *            motion looks smooth; we only round to a whole cell at the
+ *            last moment, when drawing.
+ *   vx, vy : how fast it's moving, in cells per second. Remember the
+ *            screen's y grows downward, so a NEGATIVE vy means going UP
+ *            and a positive vy means falling. When vy is near zero the
+ *            drop is at the very top of its arc.
+ *   age    : seconds since it was born. Used to retire a drop that has
+ *            been around too long (a drifting one that never lands).
+ *   active : is this pool slot in use? Dead slots are skipped, and the
+ *            spawner reuses the first free one it finds.
  */
 typedef struct {
   float x, y;
@@ -647,7 +325,8 @@ typedef struct {
   bool active;
 } Drop;
 
-/* Cheap LCG */
+/* A tiny, fast random-number generator (the classic "linear congruential"
+   trick) so we don't lean on rand() in the hot loop. */
 static inline uint32_t lcg_next(uint32_t *st) {
   *st = *st * 1664525u + 1013904223u;
   return *st;
@@ -657,51 +336,40 @@ static inline float lcg_unit(uint32_t *st) {
 }
 
 /*
- * drop_glyph_for_velocity — pick a glyph that reads as motion
- * direction at terminal resolution. Five outcomes, thresholds at
- * |vy| = 6 (apex band) and |vy| = 40 (slow / fast band):
- *
- *   |vy| <  6                : '*'   apex / nearly stopped — the
- *                                    brightest moment of the arc
- *   vy < 0,  6 ≤ |vy| ≤ 40   : '\''  rising, slow
- *   vy < 0,      |vy| > 40   : '^'   rising, fast
- *   vy > 0,  6 ≤ |vy| ≤ 40   : '.'   falling, slow
- *   vy > 0,      |vy| > 40   : ','   falling, fast
+ * Pick the character to draw for a drop based on how it's moving, so the
+ * stream visibly rises, hangs at the top, and falls. Barely moving up or
+ * down looks like the peak ('*'); rising shows '^' or '\''; falling
+ * shows ',' or '.', with the faster one in each pair being the punchier
+ * glyph.
  */
 static char drop_glyph_for_velocity(float vy) {
   float a = fabsf(vy);
   if (a < 6.0f)
-    return '*'; /* near apex */
+    return '*'; /* hanging at the top of the arc */
   if (vy < 0.0f)
     return (a > 40.0f ? '^' : '\'');
   return (a > 40.0f) ? ',' : '.';
 }
 
-/* ===================================================================== */
-/* §5  splash                                                             */
-/* ===================================================================== */
+/* ── §5 splash ── */
 
 /*
- * Splash — short-lived fragment emitted at the impact point when a Drop
- * hits the ground row. Same kinematics as Drop, plus an explicit `life`
- * field so each fragment fades at its own random pace.
+ * Splash — one tiny speck thrown off when a drop hits the floor. It
+ * pops up, fans out, falls back, and quickly fades. Like a Drop, but it
+ * carries its own lifespan so each speck dies at a slightly different
+ * moment, which reads as a natural fizzle rather than all at once.
  *
- *   x, y    : current position in cells. Initialised to (impact_x,
- *             impact_y) by scene_emit_splashes.
- *   vx, vy  : velocity in cells/sec. vy starts NEGATIVE (upward kick of
- *             magnitude SPLASH_KICK_UP × random ∈ [0.6, 1.0]); vx is
- *             symmetric around zero (±SPLASH_KICK_X) so fragments fan
- *             outward from the impact. During integration vx decays
- *             exponentially via SPLASH_DRAG while vy accumulates
- *             SPLASH_GRAVITY → the classic bounce-and-fall trajectory.
- *   age     : seconds since this splash was emitted.
- *   life    : random target lifetime drawn at spawn from
- *             [SPLASH_LIFE_MIN, SPLASH_LIFE_MAX]. When age >= life the
- *             splash deactivates. Per-splash randomness scatters the
- *             death moments — what reads as organic fade. life is also
- *             the denominator in the glyph/attr lookup (see
- *             splash_life_phase): fresh '*' → mid '+' → dying '.'.
- *   active  : pool-slot occupancy flag (same role as Drop.active).
+ *   x, y   : where the speck is, in cells. Starts at the landing spot.
+ *   vx, vy : its speed, in cells per second. It launches upward (vy
+ *            starts negative) and a random amount left or right, so the
+ *            burst fans out. As it flies the sideways speed fades away
+ *            (drag) while gravity pulls it back down.
+ *   age    : seconds since this speck appeared.
+ *   life   : how long this speck is allowed to live, picked at random in
+ *            the SPLASH_LIFE_MIN..MAX range. Once age reaches life it
+ *            disappears. The age/life ratio also drives the fade from
+ *            '*' (fresh) to '+' to '.' (about to vanish).
+ *   active : is this pool slot in use? (same idea as Drop.active.)
  */
 typedef struct {
   float x, y;
@@ -710,9 +378,7 @@ typedef struct {
   bool active;
 } Splash;
 
-/* ===================================================================== */
-/* §6  scene — pools, tick, draw                                         */
-/* ===================================================================== */
+/* ── §6 scene — pools, tick, draw ── */
 
 typedef struct {
   bool paused;
@@ -748,13 +414,10 @@ static void scene_clear_pools(Scene *s) {
 }
 
 /*
- * scene_spawn_drop — emit one drop from the pattern's source with a
- * cone-distributed initial velocity.
- *
- *   angle  ∈ [-cone_half_angle, +cone_half_angle]
- *   speed  ∈ speed_init · [0.85, 1.15]
- *   vx     = speed · sin α
- *   vy     = ∓ speed · cos α     (− for upward fountain, + for waterfall)
+ * Launch one new drop. It picks a random angle inside the pattern's
+ * spray cone and a slightly random speed, then turns that angle+speed
+ * into sideways and up/down velocity. Upward patterns aim up; the
+ * waterfall aims down.
  */
 static void scene_spawn_drop(Scene *s) {
   int idx = drop_pool_find_inactive(s);
@@ -768,12 +431,12 @@ static void scene_spawn_drop(Scene *s) {
   float r2 = lcg_unit(&s->rng);
   float r3 = lcg_unit(&s->rng);
 
-  /* Source position. */
+  /* Where the drop is born. */
   float src_cx = (float)s->cols * 0.5f;
   float src_x = src_cx + (r1 - 0.5f) * 2.0f * pp->source_x_spread;
   float src_y = pp->source_top ? (-1.0f - r2 * 1.5f) : (float)(s->rows - 3);
 
-  /* Cone angle + speed. */
+  /* Random aim within the cone, and a slightly random launch speed. */
   float angle = (r2 - 0.5f) * 2.0f * pp->cone_half_angle;
   float speed = pp->speed_init * ((1.0f - DROP_SPEED_VARIANCE * 0.5f) +
                                   r3 * DROP_SPEED_VARIANCE);
@@ -788,7 +451,7 @@ static void scene_spawn_drop(Scene *s) {
   d->active = true;
 }
 
-/* Emit splash particles at impact point. */
+/* Throw a little burst of splash specks at the spot where a drop landed. */
 static void scene_emit_splashes(Scene *s, float impact_x, float impact_y) {
   const PatternParams *pp = &pattern_params[s->current_pattern];
   int n = (int)((float)SPLASH_BASE_PER_DROP * pp->splash_mul + 0.5f);
@@ -834,8 +497,8 @@ static void scene_reseed(Scene *s) {
   scene_clear_pools(s);
 }
 
-/* Count currently-occupied drop slots — the feedback signal for the
- * Reeves emission-rate controller below. */
+/* How many drops are alive right now — the spawner uses this to decide
+   how many more to add. */
 static int drops_count_active(const Scene *s) {
   int n = 0;
   for (int i = 0; i < MAX_DROPS; i++)
@@ -845,11 +508,10 @@ static int drops_count_active(const Scene *s) {
 }
 
 /*
- * drops_emit_to_target — Reeves emission step.
- * Refill the drop pool toward pp->target_drops, but cap emissions per
- * tick at (target × dt × 4 + 4) so a frame stall or a long pause does
- * not release a flood when the loop resumes — the cap is proportional
- * to dt so steady-state emission rate is dt-independent.
+ * Top the stream up toward its target drop count. We add only a few per
+ * tick (a cap that scales with the time step) so that after a pause or a
+ * hiccup the fountain refills smoothly instead of belching out a huge
+ * clump all at once.
  */
 static void drops_emit_to_target(Scene *s, float dt) {
   const PatternParams *pp = &pattern_params[s->current_pattern];
@@ -866,12 +528,9 @@ static void drops_emit_to_target(Scene *s, float dt) {
 }
 
 /*
- * drop_step_ballistic — explicit Euler integration of one drop under
- * constant downward gravity:
- *     vy ← vy + g·dt
- *     (x, y) ← (x + vx·dt, y + vy·dt)
- *     age ← age + dt
- * This is the discretised form of the closed-form parabolic projectile.
+ * Move one drop forward by one small time step: gravity speeds it
+ * downward, then it slides over by its current speed. Doing this every
+ * tick is what bends the straight launch into a falling arc.
  */
 static void drop_step_ballistic(Drop *d, float gravity, float dt) {
   d->vy += gravity * dt;
@@ -881,11 +540,10 @@ static void drop_step_ballistic(Drop *d, float gravity, float dt) {
 }
 
 /*
- * drops_integrate_and_cull — advance every drop one step and reap those
- * that died this frame. Death causes (checked in this order):
- *   - age exceeds pattern.life_max          (timeout — drifting drops die)
- *   - drifted off screen sideways           (off-domain cull, ±8 cells slack)
- *   - reached the ground row → emit splash  (impact event, the visual payoff)
+ * Move every live drop one step, then retire the ones that are done.
+ * A drop dies if it's too old, if it has wandered off the sides, or if
+ * it reached the floor — and a floor landing is the fun part, since it
+ * kicks off a splash.
  */
 static void drops_integrate_and_cull(Scene *s, float dt) {
   const PatternParams *pp = &pattern_params[s->current_pattern];
@@ -914,14 +572,10 @@ static void drops_integrate_and_cull(Scene *s, float dt) {
 }
 
 /*
- * splash_step_kinematic — Euler integration of one splash under gravity
- * with linear-velocity drag:
- *     vy ← vy + g·dt                  (constant gravity)
- *     vx ← vx · exp(-k·dt)            (closed-form decay over dt)
- *     (x, y) ← (x + vx·dt, y + vy·dt)
- *     age ← age + dt
- * The drag factor is precomputed once per tick by the caller — it is
- * the same for every active splash this frame.
+ * Move one splash speck forward one step: gravity pulls it down and its
+ * sideways speed bleeds off a bit (drag), then it slides to its new
+ * spot. The caller works out the drag amount once and shares it across
+ * all specks this frame.
  */
 static void splash_step_kinematic(Splash *sp, float drag_factor, float dt) {
   sp->vy += SPLASH_GRAVITY * dt;
@@ -931,8 +585,8 @@ static void splash_step_kinematic(Splash *sp, float drag_factor, float dt) {
   sp->age += dt;
 }
 
-/* Advance every splash one step and deactivate those past their `life`
- * or that fell below the ground row. */
+/* Move every splash speck one step and retire any that have used up
+   their lifespan or dropped below the floor. */
 static void splashes_integrate_and_cull(Scene *s, float dt) {
   float kill_y = (float)(s->rows - 2);
   float drag_factor = expf(-SPLASH_DRAG * dt);
@@ -958,14 +612,11 @@ static void scene_tick(Scene *s, float dt) {
 }
 
 /*
- * drop_height_fraction — map a drop's vertical position to a [0,1]
- * colour-ramp coordinate, with 1.0 = brightest ramp end.
- *   - upward patterns: fraction = (source_y - drop.y) / (source_y + 1)
- *                      → 0 at the source row, 1 at the apex.
- *   - WATERFALL (source_top): fraction = 1 - drop.y / kill_y
- *                      → 1 at the top of the screen, 0 at the ground.
- * The +1 in the upward denominator avoids divide-by-zero when the
- * screen is so short that source_y = 0.
+ * Turn a drop's height into a 0-to-1 number that picks its colour, where
+ * 1 is the bright end of the ramp. For upward fountains, higher = brighter
+ * (the peak glows). For the waterfall, the top of the screen is brightest
+ * and it dims on the way down. The little "+1" just guards against
+ * dividing by zero on a very short screen.
  */
 static float drop_height_fraction(const Drop *d, const PatternParams *pp,
                                   int rows, float kill_y) {
@@ -983,9 +634,8 @@ static float drop_height_fraction(const Drop *d, const PatternParams *pp,
   return h;
 }
 
-/* Three-tier emphasis on the 8-step ramp: the bright end gets A_BOLD,
- * the dim end gets A_DIM, the middle stays A_NORMAL — pushes contrast
- * past what 8 palette entries alone can give. */
+/* Squeeze a bit more contrast out of the 8-colour ramp: make the top
+   colours bold and the bottom ones dim, leaving the middle plain. */
 static int ramp_slot_attr(int slot) {
   if (slot >= 6)
     return A_BOLD;
@@ -994,7 +644,7 @@ static int ramp_slot_attr(int slot) {
   return A_NORMAL;
 }
 
-/* Render one drop. Skips drops that round outside the drawable region. */
+/* Draw one drop, skipping it if it rounds to a spot off the screen. */
 static void drop_render(const Drop *d, const PatternParams *pp, int pair_base,
                         int rows, int cols, float kill_y) {
   int ix = (int)(d->x + 0.5f);
@@ -1031,11 +681,9 @@ static void drops_render(const Scene *s, const PatternParams *pp, int pair_base,
 }
 
 /*
- * splash_life_phase — map a splash's age/life ratio ∈ [0, 1] to a
- * (glyph, attr) pair so each splash visibly fades over its lifetime:
- *     [0.00, 0.30) → '*' A_BOLD     (fresh, brightest)
- *     [0.30, 0.65) → '+' A_NORMAL   (mid-life)
- *     [0.65, 1.00] → '.' A_DIM      (dying)
+ * Choose how a splash speck looks based on how far through its life it
+ * is, so it visibly fades out: a fresh, bright '*', then a plainer '+',
+ * then a dim '.' just before it vanishes.
  */
 static void splash_life_phase(float life_ratio, char *out_glyph,
                               int *out_attr) {
@@ -1064,8 +712,8 @@ static void splash_render(const Splash *sp, const PatternParams *pp, int rows,
   int attr;
   splash_life_phase(sp->age / sp->life, &glyph, &attr);
 
-  /* VOLCANIC splashes glow with the brightest LAVA tint; the rest use
-   * the dedicated PAIR_SPLASH (water-tinted white). */
+  /* Volcanic specks glow with the hottest lava colour; everything else
+     uses the plain splash colour. */
   int splash_pair = pp->hot_palette ? (PAIR_LAVA_BASE + 6) : PAIR_SPLASH;
   attron(COLOR_PAIR(splash_pair) | attr);
   mvaddch(iy, ix, (chtype)(unsigned char)glyph);
@@ -1090,9 +738,7 @@ static void scene_draw(const Scene *s) {
   splashes_render(s, pp);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen ── */
 
 typedef struct {
   int cols, rows;
@@ -1132,19 +778,11 @@ static void scene_counts(const Scene *s, int *out_drops, int *out_spl) {
 }
 
 /*
- * screen_draw — render the scene, then paint a two-layer HUD over it:
- *
- *   Row 0          — STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
- *                    Shows pattern (or PAUSED), theme, active particle
- *                    counts, render fps, sim Hz, and the speed multiplier.
- *   Row rows-1     — KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
- *                    Lists every interactive key the demo accepts so the
- *                    reader never has to dig through the source.
- *
- * Both rows are cleared with their pair colour first so the coloured
- * background fills the whole row even when the text is shorter than
- * sc->cols. Drawing the HUD AFTER scene_draw guarantees particles
- * never bleed through the bars.
+ * Draw the fountain, then lay the two status bars on top: a bright info
+ * line across the top (pattern, theme, counts, speed) and a key-list line
+ * across the bottom. We paint the bars last so no drop ever shows through
+ * them, and we fill each bar's whole row with colour even where the text
+ * runs short.
  */
 static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
   erase();
@@ -1156,7 +794,7 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
   const char *state_str =
       s->paused ? "PAUSED   " : pattern_name(s->current_pattern);
 
-  /* ── Top row: status ──────────────────────────────────────── */
+  /* Top bar: what's running. */
   char status[200];
   snprintf(status, sizeof status,
            " FOUNTAIN   %s   theme:%-9s   drops:%4d  splashes:%3d   "
@@ -1170,7 +808,7 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
   mvprintw(0, 0, "%s", status);
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-  /* ── Bottom row: key hints (every interactive key) ────────── */
+  /* Bottom bar: every key you can press. */
   const char *hints = " q:quit  spc:pause  r:reseed  n/p:pattern  t/T:theme  "
                       "+/-:speed  ]/[:Hz ";
 
@@ -1187,9 +825,7 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app ── */
 
 typedef struct {
   Scene scene;

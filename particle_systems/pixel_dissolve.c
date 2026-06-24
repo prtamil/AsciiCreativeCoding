@@ -1,234 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * pixel_dissolve.c — text rendered as particles that disintegrate
- *                    and reform into the next word
+ * pixel_dissolve.c — a word is drawn as a cloud of glowing dots, then
+ * the dots scatter and fly back together to spell the next word, over
+ * and over.
  *
- * DEMO: A short word ("BOOM" / "ASCII" / "PIXEL" / …) appears on
- *       screen rendered as a bitmap of glowing particles — each "on"
- *       pixel of the embedded 5×7 font is one particle. After a
- *       few seconds the word DISSOLVES — every particle gets a
- *       velocity (explosion, swirl, rain, or drift depending on
- *       pattern). After the dissolve the next word's targets are
- *       computed, and the SAME particles spring back through the
- *       air to form the next word. Loops continuously.
+ * How it works: each lit pixel of a small built-in 5x7 font becomes a
+ * few particles. A spring pulls each particle to its spot so the word
+ * snaps into place, holds for a moment, then every particle gets a
+ * shove (blow apart, swirl, rain down, or drift off) and the cycle
+ * repeats with the next word.
  *
- *       Patterns:
- *         EXPLODE  particles fly OUTWARD from word centre
- *         SWIRL    particles spin TANGENTIALLY (vortex dissolve)
- *         RAIN     particles FALL away under gravity
- *         DRIFT    particles drift in random direction (smoke fade)
- *
- * Study alongside:
- *   physics/cloth.c          — same damped-spring integration
- *                               idiom (each particle pulled to a
- *                               target rest position).
- *   particle_systems/comet.c — same moving-emitter framework but
- *                               here the emitter is the WORD itself
- *                               (a snapshot in space-time).
- *
- * Section map:
- *   §1 config    — constants, themes, patterns, word list, font
- *   §2 clock     — monotonic timer + sleep
- *   §3 color     — 8-pair colour ramp + accent pairs
- *   §4 font      — 5×7 bitmap font lookup
- *   §5 particle  — Particle struct
- *   §6 scene     — pool, target builder, phase machine, tick, draw
- *   §7 screen    — ncurses init / draw / resize
- *   §8 app       — signals, fixed-step main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reseed (jump to next word, clear & reform)
- *   n / N      next dissolve pattern  (EXPLODE → SWIRL → RAIN → DRIFT)
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      faster (speed multiplier ×2)
- *   -          slower (÷2)
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra particle_systems/pixel_dissolve.c \
- *       -o pixel_dissolve -lncurses -lm
+ * The 5x7 font follows the public-domain Adafruit GFX layout
+ * (7 bytes per character, one byte per row, leftmost column = top bit).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Particle-per-pixel rendering of a bitmap font, with
- *                  a 3-state PHASE MACHINE driving each cycle:
- *
- *                    ASSEMBLE  →  HOLD  →  DISSOLVE  →  TRANSITION
- *                                                            ↓
- *                                                       ASSEMBLE …
- *
- *                  Each cycle:
- *                    1. ASSEMBLE: each particle springs toward its
- *                       target position via a damped harmonic
- *                       oscillator (`F = K·(target − pos) − D·v`).
- *                       Particles smoothly arrive and settle.
- *                    2. HOLD: spring continues (now keeping particles
- *                       at target); small Brownian-jitter is added to
- *                       give "alive" feel — letters appear to subtly
- *                       breathe rather than be a static glyph. Lasts
- *                       a few seconds for legibility.
- *                    3. DISSOLVE: each particle is given an explosion
- *                       velocity per pattern (radial outward / tangent
- *                       /downward / random). Spring is OFF so they
- *                       freely drift. Mild drag bleeds energy.
- *                    4. TRANSITION: pick next word from the cycle
- *                       list, recompute targets, REASSIGN particles
- *                       (sequential mapping), reactivate excess /
- *                       spawn new for shortfalls. Phase resets to
- *                       ASSEMBLE — particles spring from their
- *                       current scattered positions to the new word.
- *
- *                  The bitmap font is a 5×7 monospaced set, embedded
- *                  inline as `uint8_t font_5x7[256][7]` (covers A-Z,
- *                  0-9, plus a few symbols). For each character of
- *                  the word, we walk the 5×7 grid and emit a particle
- *                  target for every "on" bit. The whole word is then
- *                  centered on the screen.
- *
- *                  Particle colour is set by HORIZONTAL POSITION in
- *                  the word — a left-to-right gradient through the
- *                  active theme's 8-step ramp. So each word reads
- *                  like a colour-graded title screen.
- *
- * Data-structure : Particle[MAX_PARTICLES] object pool with `active`
- *                  flag and a target `(tx, ty)` per slot. Linear-
- *                  scan everywhere; N is bounded by font geometry
- *                  (longest word ~150 pixels at 5×7).
- *
- * Rendering      : ASCII only. Each particle renders as a single
- *                  glyph at its current cell. Glyph fades during
- *                  DISSOLVE so far-flung particles look diffuse.
- *
- * Performance    : O(N · 1) per tick where N ≤ 200. Trivial. Phase
- *                  transitions are O(N²) only if we used optimal
- *                  matching; we use sequential matching which is O(N).
- *
- * References
- * ──────────
- *   PAPERS
- *     Reeves, W. T. (1983)
- *       "Particle Systems — A Technique for Modeling a Class of Fuzzy Objects"
- *       ACM Transactions on Graphics 2(2): 91-108.
- *       Foundational paper.  The fixed-size pool + per-particle
- *       independent update used here is the model Reeves defines.
- *       The DISSOLVE phase pattern set (radial, tangent, downward,
- *       random) maps directly to Reeves' "stochastic spawn vectors"
- *       categorisation.
- *
- *     Witkin, A. & Baraff, D. (2001)
- *       "Physically Based Modeling: Principles and Practice"
- *       SIGGRAPH course notes (online proceedings).
- *       §3 — soft-body constraints implemented as spring-damper
- *       forces F = K·(target − x) − D·v, the exact pattern
- *       ASSEMBLE/HOLD uses to pull particles onto bitmap targets.
- *
- *   BOOKS
- *     Bourg, D. M. & Bywalec, B. — "Physics for Game Developers"
- *       (2nd ed, O'Reilly, 2013).  Chapter on harmonic oscillators
- *       and damping — Hooke's law F = -K·x, critical damping
- *       D_crit = 2√(K·m), why our K=18 / D=8 choice is slightly
- *       underdamped (gives the "boing" overshoot on settle).
- *
- *     Hairer, E., Lubich, C. & Wanner, G. — "Geometric Numerical
- *       Integration: Structure-Preserving Algorithms for Ordinary
- *       Differential Equations" (2nd ed, Springer, 2006).
- *       §I.1 — symplectic Euler analysis: the v-then-x update order
- *       used in scene_tick keeps the spring oscillator energy-bounded
- *       over thousands of ticks, where explicit Euler would gradually
- *       inflate the orbit.
- *
- *     Akenine-Möller, T., Haines, E. & Hoffman, N. —
- *       "Real-Time Rendering" (4th ed, CRC Press, 2018).
- *       §13.7 — point-sprite particle rendering.  Per-particle glyph
- *       selection by distance-to-target (`*` settled, `+` flying,
- *       `.` dispersed) is the ASCII analogue of the size-by-distance
- *       point sprite pattern.
- *
- *   FONT
- *     Adafruit GFX — public-domain 5×7 bitmap font; the embedded
- *     font_5x7[256][7] table follows Adafruit's 7-byte-per-glyph
- *     encoding (one row per byte, MSB = leftmost column).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A WORD is a SET OF TARGET POSITIONS. Each particle has a target
- * and a current position. A spring force pulls the particle to its
- * target; the particle SETTLES into place over a second or two. To
- * dissolve, give the particle a velocity and turn the spring off:
- * it drifts away. To reform into a new word, recompute targets and
- * turn the spring back on: the particles spring from wherever they
- * happen to be to the new positions.
- *
- * ALGORITHM IN STEPS  (each step = one helper in §6)
- * ──────────────────
- *  1. BUILD TARGETS (scene_build_targets → target_color_slot +
- *     target_emit_pixel_replicas). For the active word, walk each
- *     character; for each "on" pixel of the 5×7 bitmap, emit
- *     PARTICLES_PER_PIXEL (=3) targets with sub-cell jitter.  Total
- *     ≈ on-pixel-count × 3 (≈ 270 for an 8-letter word).
- *
- *  2. PER TICK (scene_tick):
- *     ASSEMBLE / HOLD → scene_step_spring_layer →
- *                       particle_integrate_spring:
- *       fx = K · (tx − px) − D · vx
- *       fy = K · (ty − py) / ASPECT_Y − D · vy   (aspect-corrected y)
- *       v += f · dt;  p += v · dt   (symplectic Euler: v BEFORE p)
- *       HOLD phase adds Brownian jitter so the word breathes.
- *
- *     DISSOLVE → scene_step_drift_layer → particle_integrate_drift:
- *       v *= exp(-DISSOLVE_DRAG · dt)   (closed-form linear drag)
- *       p += v · dt
- *       PATTERN_RAIN gets an extra vy += RAIN_GRAVITY · dt.
- *
- *  3. PHASE MACHINE (scene_advance_phase_machine):
- *     advance phase_t by dt; transition when the timer elapses:
- *       ASSEMBLE → HOLD     after ASSEMBLE_DUR
- *       HOLD     → DISSOLVE after HOLD_DUR  + scene_apply_dissolve_velocity
- *                                            (via particle_kick_explode /
- *                                             swirl / rain / drift)
- *       DISSOLVE → ASSEMBLE after DISSOLVE_DUR — LOOPS THE SAME WORD:
- *                  scene_clear_particles + scene_load_word reload the
- *                  current (word, theme, pattern). User keys r / t / n
- *                  are the only way to advance any of those indices.
- *
- *  4. RENDER (scene_draw): for each active particle,
- *     particle_phase_glyph maps distance-to-target² to (glyph, attr):
- *       d² <  1 → '*' A_BOLD   (settled)
- *       d² < 25 → '+' A_NORMAL (mid-flight)
- *       else    → '.' A_DIM    (dispersed)
- *     painted in the theme's left-to-right gradient ramp slot.
- *
- * KEY FORMULAS
- * ────────────
- *  Damped spring (per particle, per axis):
- *    f = K · (target − pos) − D · vel
- *    vel += f · dt
- *    pos += vel · dt
- *
- *  Critical damping (no overshoot):
- *    D_crit = 2 · √(K · m)
- *  We use K=18, D=8 → slightly underdamped; particles overshoot
- *  slightly then settle — gives a snappy "boing" feel.
- *
- *  Dissolve velocity:
- *    EXPLODE: v = (p − centre)/r · SPEED
- *    SWIRL:   v = ((-uy, ux))      · SPEED      (perpendicular to radial)
- *    RAIN:    vx = (r-0.5)·SCATTER; vy = +SPEED
- *    DRIFT:   vx = (r-0.5)·SPEED;  vy = (r-0.5)·SPEED
- *
- *  Aspect-correct spring (cells are 2× taller than wide so vertical
- *  spring needs proportionally less force to look balanced):
- *    fy = (K · (ty − py)) / ASPECT_Y - D · vy
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -246,9 +30,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
   SIM_FPS_MIN = 10,
@@ -261,17 +43,17 @@ enum {
   SPEED_MAX = 64,
 
   MAX_PARTICLES =
-      1500, /* PARTICLES_PER_PIXEL × longest-word pixel count, with headroom */
+      1500, /* enough dots for the longest word, with room to spare */
   PARTICLES_PER_PIXEL =
-      3, /* particles assigned to each lit pixel — denser-looking word     */
+      3, /* a few dots per lit pixel so the word looks dense       */
 
   HUD_COLS = 80,
   FPS_UPDATE_MS = 500,
 
-  /* Color pair indices. PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+  /* Colour-pair slots. HUD and HINT are reserved for the on-screen text. */
   PAIR_HUD = 1,
   PAIR_HINT = 2,
-  PAIR_RAMP_BASE = 3, /* +0..+7 = horizontal-gradient ramp   */
+  PAIR_RAMP_BASE = 3, /* slots +0..+7 hold the left-to-right colour gradient */
   PAIR_SKY = 11,
 };
 
@@ -279,29 +61,38 @@ enum {
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-#define ASPECT_Y 2.0f /* terminal cells 2× taller       */
+#define ASPECT_Y 2.0f /* a terminal cell is about twice as tall as it is wide */
 
-/* Spring physics (damped harmonic oscillator). */
+/* The spring that pulls each dot to its spot: K is how hard it pulls,
+ * D is how much it brakes. These two are tuned to overshoot a touch
+ * and settle with a little "boing" rather than glide in dead-flat. */
 #define SPRING_K 18.0f
 #define SPRING_D 8.0f
-#define HOLD_JITTER 4.0f   /* cells/sec² Brownian jitter     */
-#define DISSOLVE_DRAG 0.6f /* per-second exp damping         */
+#define HOLD_JITTER 4.0f   /* tiny random nudges so a held word seems to breathe */
+#define DISSOLVE_DRAG 0.6f /* how fast scattered dots lose speed each second      */
 
-/* Phase durations (seconds). Slower default cadence so the word is
- * legible during HOLD and the dissolve has room to breathe. The user
- * can still press '+' to speed up. */
+/* How long each stage lasts, in seconds. Kept generous so the word is
+ * readable while it holds and the scatter has time to play out; press
+ * '+' to run the whole thing faster. */
 #define ASSEMBLE_DUR 2.5f
 #define HOLD_DUR 6.0f
 #define DISSOLVE_DUR 2.5f
 
-/* Dissolve initial velocity speeds. */
+/* How hard each scatter style flings the dots when the word breaks apart. */
 #define EXPLODE_SPEED 45.0f
 #define SWIRL_SPEED 35.0f
 #define RAIN_SPEED 50.0f
 #define RAIN_GRAVITY 120.0f
 #define DRIFT_SPEED 25.0f
 
-/* Pattern enum. */
+/*
+ * Pattern — the four ways a word can break apart when it dissolves.
+ *   EXPLODE  dots fly straight out from the centre of the word
+ *   SWIRL    dots spin around the centre, like water down a drain
+ *   RAIN     dots fall down under gravity
+ *   DRIFT    dots wander off in random directions, like smoke
+ * N_PATTERNS is the count, used for cycling through them with n/p.
+ */
 typedef enum {
   PATTERN_EXPLODE = 0,
   PATTERN_SWIRL = 1,
@@ -325,7 +116,12 @@ static const char *pattern_name(Pattern p) {
   }
 }
 
-/* Phase enum. */
+/*
+ * Phase — which stage of the loop the word is in right now.
+ *   ASSEMBLE  dots are flying in and snapping into the word
+ *   HOLD      the word sits readable for a few seconds
+ *   DISSOLVE  the word has broken apart and the dots are scattering
+ */
 typedef enum {
   PHASE_ASSEMBLE = 0,
   PHASE_HOLD = 1,
@@ -333,12 +129,13 @@ typedef enum {
 } Phase;
 
 /*
- * Themes — 8-step horizontal gradient. Each particle's colour is
- * its slot in the gradient based on its target's horizontal position
- * in the word — leftmost = ramp[0], rightmost = ramp[7].
- *
- * All entries sit in the BRIGHT HALF of the 256-colour cube per the
- * CLAUDE.md "Theme Palette Brightness" rule.
+ * Theme — one colour scheme for the word.
+ *   name  what it's called, shown in the status bar
+ *   ramp  eight colours from left edge of the word to the right edge,
+ *         so each word fades across like a graded title screen
+ *   sky   the background tone for this theme
+ * All colours stay in the bright half of the 256-colour set so even
+ * the darkest one is still visible.
  */
 typedef struct {
   const char *name;
@@ -363,7 +160,7 @@ static const Theme themes[N_THEMES] = {
     {"MATRIX", {22, 28, 34, 40, 46, 82, 118, 154}, 232},
 };
 
-/* Word cycle list. */
+/* The words the demo cycles through. */
 static const char *WORDS[] = {
     "BOOM", "ASCII",    "PIXEL",   "MORPH", "DUST",
     "CODE", "DISSOLVE", "USELESS", "TAMIL",
@@ -371,13 +168,12 @@ static const char *WORDS[] = {
 #define N_WORDS ((int)(sizeof WORDS / sizeof WORDS[0]))
 
 /*
- * font_5x7 — 5-column × 7-row monospaced bitmap font.
+ * font_5x7 — the shape of each letter, 5 dots wide by 7 dots tall.
  *
- * Each entry is 7 bytes (one per row, top-to-bottom). Bits within a
- * byte represent the 5 columns: bit 4 = column 0 (leftmost), bit 0 =
- * column 4 (rightmost). Entries not listed are zero (blank).
- *
- * Covers: space, A-Z, 0-9, '!' '?' '.'.
+ * One row per byte, top to bottom. Inside a byte the five low bits are
+ * the five columns: bit 4 is the leftmost dot, bit 0 the rightmost. A
+ * set bit means "draw a dot here". Indexed by character code, so the
+ * unlisted slots stay all-zero (blank). Covers space, A-Z, 0-9, ! ? .
  */
 static const uint8_t font_5x7[256][7] = {
     [' '] = {0, 0, 0, 0, 0, 0, 0},
@@ -427,14 +223,10 @@ static const uint8_t font_5x7[256][7] = {
 #define FONT_W 5
 #define FONT_H 7
 #define FONT_KERN                                                              \
-  3 /* cells between letters — wider gap so the                              \
-     * letters read clearly (each glyph is 5 cells                             \
-     * wide; a 1-cell kern made adjacent strokes                               \
-     * blur into each other) */
+  3 /* blank columns between letters. A 1-cell gap let neighbouring          \
+     * strokes blur together, so we space them out wider. */
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -452,9 +244,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color ── */
 
 static void theme_apply(int idx) {
   if (idx < 0 || idx >= N_THEMES)
@@ -484,11 +274,9 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  font                                                               */
-/* ===================================================================== */
+/* ── §4 font ── */
 
-/* Width in cells of a rendered word (FONT_W per char + FONT_KERN between). */
+/* How many columns wide the whole word will be once drawn. */
 static int word_width_cells(const char *word) {
   int n = (int)strlen(word);
   if (n <= 0)
@@ -496,31 +284,57 @@ static int word_width_cells(const char *word) {
   return n * FONT_W + (n - 1) * FONT_KERN;
 }
 
-/* ===================================================================== */
-/* §5  particle                                                           */
-/* ===================================================================== */
+/* ── §5 particle ── */
 
+/*
+ * Particle — one glowing dot. The whole demo is just a pool of these.
+ *   px, py       where it is now, in screen cells
+ *   vx, vy       how fast it's moving, in cells per second
+ *   tx, ty       the spot in the word it wants to reach
+ *   color_slot   0..7, which colour in the theme gradient it wears
+ *   active       false means this slot is unused right now
+ */
 typedef struct {
-  float px, py;   /* current position (cell coords)             */
-  float vx, vy;   /* velocity (cells/sec)                       */
-  float tx, ty;   /* target position when assembled             */
-  int color_slot; /* 0..7 — picks ramp slot                     */
+  float px, py;
+  float vx, vy;
+  float tx, ty;
+  int color_slot;
   bool active;
 } Particle;
 
-/* Cheap LCG */
+/* A fast, throwaway random-number generator (good enough for jitter). */
 static inline uint32_t lcg_next(uint32_t *st) {
   *st = *st * 1664525u + 1013904223u;
   return *st;
 }
+/* A random number between 0 and 1. */
 static inline float lcg_unit(uint32_t *st) {
   return (float)(lcg_next(st) >> 8) / (float)(1u << 24);
 }
 
-/* ===================================================================== */
-/* §6  scene — pool, target builder, phase machine, tick, draw           */
-/* ===================================================================== */
+/* ── §6 scene ── */
 
+/*
+ * Scene — the whole running demo in one place: the dots plus all the
+ * state that decides what they're doing.
+ *
+ *   paused / speed              user controls: frozen, and how fast time runs
+ *   current_theme               which colour scheme is active
+ *   current_pattern             which scatter style the next dissolve uses
+ *   rng                         seed for the throwaway random generator
+ *   rows, cols                  current terminal size
+ *
+ *   phase / phase_t             which stage we're in, and how long we've
+ *                               been in it (seconds)
+ *   word_idx                    which word from WORDS is showing
+ *   word_cx, word_cy            centre of the word, remembered so the
+ *                               scatter styles know where to push out from
+ *   word_w_cells                width of the word, kept for the colour gradient
+ *
+ *   n_particles                 how many dots are in use right now
+ *   particles                   the fixed pool of dots (slots past
+ *                               n_particles are inactive)
+ */
 typedef struct {
   bool paused;
   int speed;
@@ -532,8 +346,8 @@ typedef struct {
   Phase phase;
   float phase_t;
   int word_idx;
-  float word_cx, word_cy; /* cached centre of current word    */
-  int word_w_cells;       /* cached width                    */
+  float word_cx, word_cy;
+  int word_w_cells;
 
   int n_particles;
   Particle particles[MAX_PARTICLES];
@@ -545,11 +359,10 @@ static void scene_clear_particles(Scene *s) {
     s->particles[i].active = false;
 }
 
-/* ── Bitmap → target list helpers ────────────────────────────────── */
+/* ── turning a word into a list of target spots ── */
 
-/* Horizontal position → 8-step ramp slot (left = 0, right = 7).
- * The whole word inherits the left-to-right gradient; every replica
- * of one lit pixel shares the same slot. */
+/* Picks which of the 8 gradient colours a dot wears, based on how far
+ * across the word it sits: left edge gets colour 0, right edge gets 7. */
 static inline int target_color_slot(float pixel_x, float start_x, int word_w) {
   float frac = (pixel_x - start_x) / (float)(word_w > 1 ? word_w - 1 : 1);
   int slot = (int)(frac * 7.999f);
@@ -560,13 +373,11 @@ static inline int target_color_slot(float pixel_x, float start_x, int word_w) {
   return slot;
 }
 
-/* Emit PARTICLES_PER_PIXEL targets for one lit font pixel.
- *   replica 0     sits dead-centre at (px, py)
- *   replicas 1..N get sub-cell jitter ±0.25 in x and y
- * They all converge to (almost) the same spot during ASSEMBLE so the
- * word reads as a single bright pixel; during DISSOLVE they fan out
- * independently because each gets its own random initial velocity.
- * Returns false when n_total has hit max_targets — caller short-circuits. */
+/* Makes the few dots that share one lit pixel. The first sits dead on
+ * the pixel; the rest are nudged a fraction of a cell off it. While
+ * the word holds they pile up into one bright spot, but when it
+ * scatters each drifts its own way. Returns false once the target list
+ * is full so the caller can stop. */
 static bool target_emit_pixel_replicas(Scene *s, float *out_x, float *out_y,
                                        int *out_slot, int *n_total,
                                        int max_targets, float px, float py,
@@ -584,16 +395,11 @@ static bool target_emit_pixel_replicas(Scene *s, float *out_x, float *out_y,
   return true;
 }
 
-/* ── Driver — rasterise the word into a target list ──────────────── */
+/* ── building the full target list for a word ── */
 
-/* Pseudocode:
- *   compute centred (start_x, start_y) for the whole word
- *   for each character in word:
- *       for each (row, col) in the 5×7 grid where the font bit is lit:
- *           slot = horizontal-position → ramp slot
- *           emit PARTICLES_PER_PIXEL targets for that pixel
- *       advance char_x by FONT_W + FONT_KERN
- *   cache word centre + width on the Scene (read by dissolve patterns) */
+/* Walks the word letter by letter, lights up the font dots for each
+ * one centred on screen, and records every spot a dot should fly to.
+ * Also remembers the word's centre and width for later. */
 static int scene_build_targets(Scene *s, const char *word, float *out_targets_x,
                                float *out_targets_y, int *out_color_slots,
                                int max_targets) {
@@ -635,11 +441,10 @@ done:
   return n_total;
 }
 
-/* ── Particle inflow helpers ─────────────────────────────────────── */
+/* ── adding and removing dots from the pool ── */
 
-/* Spawn one particle at a random screen edge (top / left / right /
- * bottom, ±3 cells beyond the visible region). vx = vy = 0 so the
- * upcoming ASSEMBLE spring pulls it cleanly toward its target. */
+/* Drops a fresh dot just off one of the four screen edges, standing
+ * still, so the spring can sweep it into the word from outside. */
 static inline void particle_spawn_at_edge(Particle *p, uint32_t *rng, int cols,
                                           int rows) {
   int edge = (int)(lcg_unit(rng) * 4.0f);
@@ -667,8 +472,7 @@ static inline void particle_spawn_at_edge(Particle *p, uint32_t *rng, int cols,
   p->active = true;
 }
 
-/* Grow the pool by spawning new edge-particles until n_particles == n_targets.
- */
+/* Adds dots until we have one per target spot. */
 static void particle_pool_grow_to(Scene *s, int n_targets) {
   while (s->n_particles < n_targets) {
     particle_spawn_at_edge(&s->particles[s->n_particles], &s->rng, s->cols,
@@ -677,17 +481,16 @@ static void particle_pool_grow_to(Scene *s, int n_targets) {
   }
 }
 
-/* Shrink the pool by deactivating slots [n_targets, n_particles). */
+/* Switches off the leftover dots when the new word needs fewer. */
 static void particle_pool_shrink_to(Scene *s, int n_targets) {
   for (int i = n_targets; i < s->n_particles; i++)
     s->particles[i].active = false;
   s->n_particles = n_targets;
 }
 
-/* Sequential target assignment: particle[i] → target[i]. Cheap O(N)
- * — optimal matching (Hungarian) would minimise total travel but is
- * visually indistinguishable here; the varied paths actually look
- * MORE organic than "everything moves the shortest distance". */
+/* Hands each dot the next target in line. We don't bother pairing dots
+ * to their closest spot; the random crossing paths actually look livelier
+ * than if everything took the shortest route. */
 static void particle_pool_assign_targets(Scene *s, const float *tx,
                                          const float *ty, const int *slot,
                                          int n) {
@@ -699,12 +502,10 @@ static void particle_pool_assign_targets(Scene *s, const float *tx,
   }
 }
 
-/* ── Driver — load current word into the particle pool ───────────── */
+/* ── loading a word into the dot pool ── */
 
-/* Pseudocode:
- *   build target list for the active word
- *   resize pool: grow with edge-spawns / shrink by deactivation
- *   assign each particle its target position and colour slot */
+/* Gets the current word ready to assemble: works out its target spots,
+ * resizes the dot pool to match, and tells each dot where to go. */
 static void scene_load_word(Scene *s) {
   static float targets_x[MAX_PARTICLES];
   static float targets_y[MAX_PARTICLES];
@@ -718,13 +519,12 @@ static void scene_load_word(Scene *s) {
   particle_pool_assign_targets(s, targets_x, targets_y, color_slots, n_targets);
 }
 
-/* ── Dissolve-kick helpers (one per pattern) ─────────────────────── */
+/* ── the shove each scatter style gives a dot ── */
 
-/* Aspect-corrected radial unit vector pointing from word centre to
- * the particle. If the particle is essentially AT the centre (r < 0.5)
- * the direction is degenerate, so we pick a uniformly-random angle —
- * keeps EXPLODE / SWIRL from producing zero-velocity outliers stuck
- * at the centre. */
+/* Works out which way a dot points away from the word's centre, used
+ * by the explode and swirl styles. A dot sitting right on the centre
+ * has no real direction, so we just pick a random one to avoid leaving
+ * it stuck in place. */
 static inline void particle_radial_unit(const Particle *p, float cx, float cy,
                                         uint32_t *rng, float *out_ux,
                                         float *out_uy) {
@@ -741,7 +541,7 @@ static inline void particle_radial_unit(const Particle *p, float cx, float cy,
   *out_uy = dy / r;
 }
 
-/* EXPLODE — radial outward velocity, magnitude EXPLODE_SPEED · [0.7, 1.3]. */
+/* EXPLODE — fling the dot straight outward, with a bit of speed variety. */
 static inline void particle_kick_explode(Particle *p, float ux, float uy,
                                          uint32_t *rng) {
   float speed = EXPLODE_SPEED * (0.7f + lcg_unit(rng) * 0.6f);
@@ -749,33 +549,31 @@ static inline void particle_kick_explode(Particle *p, float ux, float uy,
   p->vy = uy * speed / ASPECT_Y;
 }
 
-/* SWIRL — tangential velocity (radial rotated 90°), magnitude SWIRL_SPEED ·
- * [0.7, 1.3]. */
+/* SWIRL — push the dot sideways instead of outward, so it spins around
+ * the centre rather than away from it. */
 static inline void particle_kick_swirl(Particle *p, float ux, float uy,
                                        uint32_t *rng) {
   float speed = SWIRL_SPEED * (0.7f + lcg_unit(rng) * 0.6f);
-  p->vx = -uy * speed; /* perpendicular to radial */
+  p->vx = -uy * speed; /* turned 90 degrees from "straight out" */
   p->vy = ux * speed / ASPECT_Y;
 }
 
-/* RAIN — small horizontal scatter, strong downward velocity. */
+/* RAIN — drop the dot downward with just a little sideways wobble. */
 static inline void particle_kick_rain(Particle *p, uint32_t *rng) {
   p->vx = (lcg_unit(rng) - 0.5f) * 6.0f;
   p->vy = RAIN_SPEED * (0.7f + lcg_unit(rng) * 0.5f);
 }
 
-/* DRIFT — random isotropic scatter, magnitude DRIFT_SPEED. */
+/* DRIFT — send the dot off in a fully random direction, like smoke. */
 static inline void particle_kick_drift(Particle *p, uint32_t *rng) {
   p->vx = (lcg_unit(rng) - 0.5f) * 2.0f * DRIFT_SPEED;
   p->vy = (lcg_unit(rng) - 0.5f) * 2.0f * DRIFT_SPEED / ASPECT_Y;
 }
 
-/* ── Driver — apply the dissolve kick to every active particle ───── */
+/* ── breaking the word apart ── */
 
-/* Pseudocode:
- *   for each active particle:
- *     compute aspect-corrected radial unit from word centre
- *     dispatch to the pattern's per-particle kick function */
+/* The moment the word dissolves: gives every dot the right shove for
+ * the chosen scatter style. */
 static void scene_apply_dissolve_velocity(Scene *s) {
   for (int i = 0; i < s->n_particles; i++) {
     Particle *p = &s->particles[i];
@@ -825,7 +623,7 @@ static void scene_init(Scene *s, int cols, int rows) {
 static void scene_resize(Scene *s, int cols, int rows) {
   s->cols = cols;
   s->rows = rows;
-  /* Recompute targets for new screen size. */
+  /* Re-place the word now that the screen is a different size. */
   scene_load_word(s);
 }
 
@@ -837,14 +635,14 @@ static void scene_reseed(Scene *s) {
   scene_load_word(s);
 }
 
-/* ── Per-particle integrators (one step, one particle) ──────────── */
+/* ── moving one dot forward by a small time step ── */
 
-/* Damped harmonic oscillator pull toward target:
- *     fx = K · (tx − px) − D · vx                  (Hooke + viscous damping)
- *     fy = K · (ty − py) / ASPECT_Y − D · vy        (aspect-corrected)
- * HOLD phase adds Brownian jitter so the held word visibly breathes.
- * Explicit Euler then advances v, then p — same v-then-p order used
- * in the rest of the project's particle code (symplectic Euler). */
+/* The spring step, used while the word is assembling and holding. It
+ * pulls the dot toward its spot and brakes it so it doesn't oscillate
+ * forever. The vertical pull is eased because cells are tall, keeping
+ * the word from looking squashed. While holding, tiny random nudges
+ * make the word seem to breathe. We update speed first, then position
+ * (the order that keeps the bouncing stable over long runs). */
 static inline void particle_integrate_spring(Particle *p, float dt,
                                              bool holding, uint32_t *rng) {
   float fx = SPRING_K * (p->tx - p->px) - SPRING_D * p->vx;
@@ -859,9 +657,10 @@ static inline void particle_integrate_spring(Particle *p, float dt,
   p->py += p->vy * dt;
 }
 
-/* Free-drift integration during DISSOLVE: linear drag on velocity,
- * plus an extra gravity term for the RAIN pattern only. The drag
- * factor is exp(-k·dt), pre-computed once per tick by the caller. */
+/* The free-flight step, used while the word is scattered. No spring
+ * here: the dot just coasts and slowly loses speed to drag. The rain
+ * style also adds gravity so its dots fall. The caller works out the
+ * drag amount once per frame and passes it in. */
 static inline void particle_integrate_drift(Particle *p, float drag, float dt,
                                             bool gravity_on) {
   if (gravity_on)
@@ -872,11 +671,11 @@ static inline void particle_integrate_drift(Particle *p, float drag, float dt,
   p->py += p->vy * dt;
 }
 
-/* ── Phase machine + layer drivers ───────────────────────────────── */
+/* ── the stage timer ── */
 
-/* Advance the phase timer and run the transition + entry hook when
- * the current phase elapses. Phase ASSEMBLE → HOLD → DISSOLVE →
- * ASSEMBLE (looping same scene; user keys advance word/theme/pattern). */
+/* Counts down the current stage and moves to the next when its time is
+ * up: assemble, then hold, then dissolve, then back to assemble. The
+ * word, colour, and scatter style only change when the user presses a key. */
 static void scene_advance_phase_machine(Scene *s) {
   switch (s->phase) {
   case PHASE_ASSEMBLE:
@@ -889,14 +688,14 @@ static void scene_advance_phase_machine(Scene *s) {
     if (s->phase_t >= HOLD_DUR) {
       s->phase = PHASE_DISSOLVE;
       s->phase_t = 0.0f;
-      scene_apply_dissolve_velocity(s); /* entry hook */
+      scene_apply_dissolve_velocity(s); /* shove every dot as we enter */
     }
     break;
   case PHASE_DISSOLVE:
     if (s->phase_t >= DISSOLVE_DUR) {
-      /* Loop SAME (word, theme, pattern) — kill all particles
-       * so they respawn fresh at screen edges via scene_load_word.
-       * User keys r / t / n are what change the indices. */
+      /* Replay the same word: clear the scattered dots and let them
+       * respawn fresh at the edges. The r/t/n keys are what pick a
+       * different word, colour, or scatter style. */
       scene_clear_particles(s);
       scene_load_word(s);
       s->phase = PHASE_ASSEMBLE;
@@ -906,7 +705,7 @@ static void scene_advance_phase_machine(Scene *s) {
   }
 }
 
-/* Sweep the pool with the drift integrator (DISSOLVE phase). */
+/* Moves every scattered dot one step (used while dissolving). */
 static void scene_step_drift_layer(Scene *s, float dt) {
   float drag = expf(-DISSOLVE_DRAG * dt);
   bool rain_gravity = (s->current_pattern == PATTERN_RAIN);
@@ -918,7 +717,7 @@ static void scene_step_drift_layer(Scene *s, float dt) {
   }
 }
 
-/* Sweep the pool with the damped-spring integrator (ASSEMBLE / HOLD). */
+/* Moves every dot one step toward its spot (used while assembling/holding). */
 static void scene_step_spring_layer(Scene *s, float dt) {
   bool holding = (s->phase == PHASE_HOLD);
   for (int i = 0; i < s->n_particles; i++) {
@@ -929,14 +728,10 @@ static void scene_step_spring_layer(Scene *s, float dt) {
   }
 }
 
-/* ── Driver — one simulation tick ────────────────────────────────── */
+/* ── one step of the whole simulation ── */
 
-/* Pseudocode:
- *   if paused                       → no-op
- *   dt *= speed multiplier
- *   phase_t += dt
- *   scene_advance_phase_machine     — handle phase transitions
- *   if DISSOLVE → drift layer        else → spring layer */
+/* Advances time by one step: scale it by the speed control, tick the
+ * stage timer, then move the dots the right way for the current stage. */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
@@ -951,23 +746,20 @@ static void scene_tick(Scene *s, float dt) {
     scene_step_spring_layer(s, dt);
 }
 
-/* ── Per-particle render helpers ─────────────────────────────────── */
+/* ── choosing how each dot looks ── */
 
-/* Squared distance from particle to its target.  Used as a cheap
- * proxy for "where in the phase arc is this particle" — settled
- * vs. mid-flight vs. dispersed — without taking a sqrt. */
+/* How far a dot is from its spot (squared, to skip a square root). We
+ * use it as a quick gauge of whether the dot is parked, on its way, or
+ * far gone. */
 static inline float particle_target_dist_sq(const Particle *p) {
   float dx = p->tx - p->px;
   float dy = p->ty - p->py;
   return dx * dx + dy * dy;
 }
 
-/* Map distance² to (glyph, attr) using three tiers — gives the word
- * a visible "settled / flying / dispersed" emphasis without needing
- * a phase parameter:
- *     d² <  1 → '*' A_BOLD     (on-target — settled bright pixel)
- *     d² < 25 → '+' A_NORMAL   (mid-flight — assembling or dissolving)
- *     else    → '.' A_DIM      (far — dispersed) */
+/* Picks the character and brightness for a dot from how close it is:
+ * a bright '*' when parked on its spot, a plain '+' while in flight,
+ * and a faint '.' once it's scattered far away. */
 static inline void particle_phase_glyph(const Particle *p, char *out_glyph,
                                         int *out_attr) {
   float d2 = particle_target_dist_sq(p);
@@ -983,14 +775,11 @@ static inline void particle_phase_glyph(const Particle *p, char *out_glyph,
   }
 }
 
-/* ── Driver — render all active particles ────────────────────────── */
+/* ── drawing the dots ── */
 
-/* Pseudocode:
- *   for each active particle:
- *     round pixel position to a (ix, iy) cell
- *     reject if outside drawable region (skip HUD rows)
- *     pick glyph + attr from distance-to-target tier
- *     paint with the gradient pair from the particle's slot */
+/* Paints every active dot: round its position to a cell, skip it if
+ * it's off-screen or under the top status bar, then draw it in its
+ * gradient colour with the character its distance picked. */
 static void scene_draw(const Scene *s) {
   int rows_eff = s->rows - 1;
   for (int i = 0; i < s->n_particles; i++) {
@@ -1016,10 +805,9 @@ static void scene_draw(const Scene *s) {
   }
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen ── */
 
+/* Screen — the terminal's current size in columns and rows. */
 typedef struct {
   int cols, rows;
 } Screen;
@@ -1059,18 +847,10 @@ static const char *phase_str(Phase p) {
 }
 
 /*
- * screen_draw — render the scene, then paint a two-layer HUD over it:
- *
- *   Row 0          STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
- *                  Live state: pattern (or PAUSED), theme, current
- *                  word, phase (ASSEMBLE / HOLD / DISSOLVE), particle
- *                  count, render fps, sim Hz, speed multiplier.
- *   Row rows-1     KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
- *                  Every interactive key the demo accepts.
- *
- * Both rows are pre-filled with their pair colour so the coloured
- * background spans the full width, and drawn AFTER scene_draw so
- * particles never bleed through the bars.
+ * Draws the dots, then lays two text bars on top: a status line along
+ * the top (what's playing right now) and a key-hint line along the
+ * bottom. Both bars get a full-width coloured background and are drawn
+ * last so no flying dot pokes through them.
  */
 static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
   erase();
@@ -1079,7 +859,7 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
   const char *state_str =
       s->paused ? "PAUSED " : pattern_name(s->current_pattern);
 
-  /* ── Top row: dynamic status ─────────────────────────────── */
+  /* Top bar: live status. */
   char status[220];
   snprintf(status, sizeof status,
            " PIXEL_DISSOLVE   %s   theme:%-8s   word:'%-8s'   phase:%s   "
@@ -1093,7 +873,7 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
   mvprintw(0, 0, "%s", status);
   attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-  /* ── Bottom row: every interactive key ───────────────────── */
+  /* Bottom bar: the keys you can press. */
   const char *hints =
       " q:quit  spc:pause  r:next-word  n/p:pattern  t/T:theme  "
       "+/-:speed  ]/[:Hz ";
@@ -1111,10 +891,18 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app ── */
 
+/*
+ * App — ties everything together for the main loop.
+ *   scene        the dots and their state
+ *   screen       the terminal size
+ *   sim_fps      how many simulation steps per second we aim for
+ *   running      set to 0 by a quit key or signal to end the loop
+ *   need_resize  set by the resize signal so the loop refits next frame
+ * The two flags are touched from signal handlers, so they're marked
+ * volatile sig_atomic_t to stay safe across that boundary.
+ */
 typedef struct {
   Scene scene;
   Screen screen;
@@ -1146,7 +934,7 @@ static bool app_handle_key(App *app, int ch) {
   switch (ch) {
   case 'q':
   case 'Q':
-  case 27 /* ESC */:
+  case 27: /* the Escape key */
     return false;
   case ' ':
     s->paused = !s->paused;

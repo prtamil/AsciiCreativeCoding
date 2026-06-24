@@ -1,135 +1,92 @@
 /*  conjugate_gradient_linear_solver.c
  *
- *  Conjugate Gradient (CG) vs Steepest Descent (SD) — side by side.
+ *  Two ways to solve the same linear system Ax = b, racing side by side.
+ *  Both walk downhill to the bottom of a bowl-shaped surface; the bottom
+ *  is the answer. Conjugate Gradient (green) gets there in just two steps.
+ *  Steepest Descent (red) follows the slope and zig-zags forever. Drawing
+ *  both paths on one bowl makes the difference obvious at a glance.
  *
- *  Both algorithms solve the same SPD system Ax = b by walking to the
- *  bottom of the energy bowl f(x) = (1/2) x^T A x - b^T x.  CG provably
- *  converges in exactly N steps.  SD chases the gradient and zig-zags
- *  forever.  Drawing both paths on one bowl makes the difference
- *  immediately legible.
+ *  The system is 2x2, so the bowl you see on screen IS the real surface
+ *  the math walks on — nothing is faked or flattened.
  *
- *  N = 2 — the bowl on screen IS the actual energy surface.  No
- *  projection trickery; what you see is what the algorithms see.
- *
- *  Layout:
- *    row 0           canonical top HUD (title + status)
- *    row 1           divider
- *    rows 2..N-9     iso-contour bowl (left) + eigenmode panel (right)
- *    rows N-8..N-2   narrator (7 rows)
- *    row N-1         canonical bottom HUD (actions)
- *
- *  Themes (10, cycle with t/T): drive the iso-contour ramp only.
- *  CG green / SD red / target gold / eigen-bar cyan stay fixed across
- *  every theme so the story stays readable.
- *
- *    Matrix, Fire, Oceanic, Neon, Mono, Ice, Nova, Forest, Desert, Eclipse
- *
- *  Build:
- *    gcc -std=c11 -O2 -Wall -Wextra \
- *        physics/conjugate_gradient_linear_solver.c \
- *        -o cg_solver -lncurses -lm
- *
- *  Keys:  SPACE  pause / resume
- *         r      new random SPD system
- *         t / T  next / previous theme
- *         + / -  speed up / slow down
- *         q      quit
+ *  Best companion read: Shewchuk's "Conjugate Gradient Without the
+ *  Agonizing Pain" (CMU CS-94-125, 1994) — start there if CG is new.
+ *  The CONCEPTS block below explains the idea; the references at its end
+ *  cite the original papers.
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+/* ── CONCEPTS ──
  *
- * The problem    : Solve Ax = b where A is symmetric positive definite.
- *                  Equivalent to minimising the quadratic energy
- *                      f(x) = (1/2) x'Ax  -  b'x
- *                  whose gradient grad f(x) = Ax - b vanishes exactly
- *                  when Ax = b.  So "solve a linear system" =
- *                  "walk to the bottom of a paraboloid bowl".
+ * The problem    : Solve Ax = b. Here A is "symmetric positive definite"
+ *                  — a matrix whose energy surface is a clean bowl with a
+ *                  single bottom, no saddles or ridges. Solving the system
+ *                  is the same as finding the lowest point of that bowl,
+ *                  because the slope is zero exactly where Ax = b. So
+ *                  "solve the equations" turns into "walk to the bottom".
  *
- * Algorithm (CG) : Hestenes & Stiefel 1952.
- *                    r0  = b - A x0     (initial residual)
- *                    p0  = r0           (first search direction)
- *                    for k = 0, 1, ... :
- *                        alpha = (r·r) / (p·A·p)         ← optimal step
- *                        x_new = x + alpha · p
- *                        r_new = r - alpha · A·p          (recurrence)
- *                        beta  = (r_new · r_new)/(r · r)
- *                        p_new = r_new + beta · p
- *                  Cost: one mat-vec (A·p) per step + a few dot products.
- *                  Stops in <= N iterations (exact arithmetic).
+ * Conjugate      : Hestenes & Stiefel, 1952. Keeps a current guess x, the
+ * Gradient (CG)    leftover error r = b - Ax (how wrong we still are), and
+ *                  a chosen direction p to step along. Each step takes the
+ *                  exact best stride down p, then picks the next direction
+ *                  cleverly so it never undoes earlier progress. On a 2x2
+ *                  bowl that means done in 2 steps. One matrix-times-vector
+ *                  multiply per step, plus a couple of dot products.
  *
- * Algorithm (SD) : Cauchy 1847 steepest descent.
- *                    alpha = (r·r)/(r·A·r)              ← optimal step
- *                    x_new = x + alpha · r
- *                    r_new = r - alpha · A·r
- *                  Each new gradient r_new is orthogonal to the OLD r
- *                  (r_new · r = 0 by construction), so on an elongated
- *                  bowl the iterates bounce between the long and short
- *                  axes — zig-zag forever.
+ * Steepest       : Cauchy, 1847. The naive method: always step straight
+ * Descent (SD)     downhill (along r), as far as helps. The catch — each
+ *                  new downhill direction comes out at a right angle to the
+ *                  last one, so on a long stretched bowl the path bounces
+ *                  side to side and crawls toward the bottom. It works, but
+ *                  slowly.
  *
- * Why CG wins    : A-conjugacy.  CG's directions satisfy
- *                      p_i · A · p_j = 0   for i != j.
- *                  Each step lands on a "ridge" never used before, so
- *                  all N dimensions get cleaned up exactly once.  No
- *                  re-walked direction → no zig-zag.
+ * Why CG wins    : CG's directions are picked so that, in the bowl's own
+ *                  stretched geometry, each is "independent" of the others.
+ *                  Every step cleans up one direction once and for all and
+ *                  never revisits it — so no zig-zag.
  *
- * Spectral view  : Write the error e_k = x_k - x* in A's eigenbasis.
- *                  In that basis the problem decouples — each eigenmode
- *                  decays independently at a rate set by the eigenvalue
- *                  ratio.  Convergence speed depends on the condition
- *                  number  kappa(A) = lambda_max / lambda_min :
- *                    SD: error shrinks by factor (kappa - 1)/(kappa + 1)
- *                        per step — terrible when kappa is large.
- *                    CG: bound is sqrt(kappa) instead of kappa — much
- *                        better, and N-step exact termination.
- *                  The right-hand "EIGENMODES" panel projects the error
- *                  onto v1, v2 so the viewer SEES which mode dies first.
+ * The eigen-panel: A bowl can be stretched more along one axis than
+ *                  another. Those two natural axes (the eigenvectors) and
+ *                  how stretched each is (the eigenvalues) decide how hard
+ *                  the problem is — the more lopsided the stretch, the more
+ *                  SD struggles. The right-hand panel splits each method's
+ *                  leftover error along those two axes so you can watch
+ *                  which one dies first: CG kills both fast, SD lets the
+ *                  hard one linger.
  *
- * Why N = 2      : With two coordinates the bowl on screen IS the actual
- *                  energy surface — no projection lie.  CG provably
- *                  terminates in 2 steps, which is the dramatic punch.
- *                  Higher N would force a misleading 2D slice through
- *                  N-D motion (the prior version of this demo did that,
- *                  and the walk on screen never matched the math).
+ * Why 2x2        : With two unknowns the bowl on screen is the actual
+ *                  surface — the path you watch matches the math exactly.
+ *                  Bigger systems would need a flattened slice that lies
+ *                  about the motion.
  *
- * Rendering      : Iso-energy contour rings — quantise f into N levels,
- *                  mark a cell only if a 4-neighbour has a different
- *                  level (cheap "marching squares" cousin).  The result
- *                  reads as a topographic map of the bowl instead of a
- *                  density character fill.
- *                  Trails are DDA-style: dotted line between consecutive
- *                  iterates + an `o` bullet at each one, so the walk
- *                  reads as a path, not scattered marks.
- *                  CG green / SD red / target gold stay fixed across
- *                  every theme so the story stays legible.
+ * Drawing        : The bowl is shown as contour rings (like a topographic
+ *                  map): chop the height into bands and mark a cell only
+ *                  where it sits on the edge between two bands. The two
+ *                  paths are drawn as dotted lines with a dot at each stop,
+ *                  so each reads as a trail you can follow with your eye.
+ *                  CG green / SD red / target gold never change with the
+ *                  theme, so the story stays readable.
  *
  * References     :
  *   • Hestenes, M. R. & Stiefel, E. (1952) "Methods of Conjugate
  *     Gradients for Solving Linear Systems", J. Res. NBS 49(6), 409-436.
- *     — The original paper.  CG was invented here.  Direct, terse.
+ *     — The original paper where CG was invented. Direct, terse.
  *
  *   • Shewchuk, J. R. (1994) "An Introduction to the Conjugate Gradient
- *     Method Without the Agonizing Pain", CMU CS-94-125 (tech report).
- *     — By far the best pedagogical introduction.  Geometric intuition
- *       (ellipses, A-conjugacy explained pictorially), steepest descent
- *       vs CG comparison, every formula derived from first principles.
- *       Read this BEFORE anything else if CG is new.
+ *     Method Without the Agonizing Pain", CMU CS-94-125.
+ *     — The best place to learn CG: pictures, intuition, every formula
+ *       built up from scratch. Read this first if CG is new.
  *
  *   • Saad, Y. (2003) "Iterative Methods for Sparse Linear Systems"
- *     (2nd ed.), SIAM.
- *     — The reference text for Krylov subspace methods.  Chapter 6
- *       covers CG in depth; chapter 9 covers preconditioning, which is
- *       what makes CG work on real-world ill-conditioned systems.
+ *     (2nd ed.), SIAM. — The reference text; ch. 6 covers CG in depth.
  *
  *   • Trefethen, L. N. & Bau, D. (1997) "Numerical Linear Algebra", SIAM.
- *     — Clean modern textbook.  Lecture 38 = CG with the spectral /
- *       polynomial-residual perspective.  Lectures 24-28 cover the
- *       eigenvalue analysis this demo's eigen-panel depends on.
+ *     — Lecture 38 is CG; lectures 24-28 cover the eigenvalue picture the
+ *       eigen-panel draws.
  *
  *   • Bresenham, J. E. (1965) "Algorithm for computer control of a
  *     digital plotter", IBM Systems Journal 4(1), 25-30.
- *     — The DDA segment rasteriser our trail rendering descends from.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ *     — The line-drawing trick the dotted trails descend from.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -146,30 +103,30 @@
 #include <string.h>
 #include <time.h>
 
-/* ── §1 config ──────────────────────────────────────────────────── */
+/* ── §1 config ── */
 
-#define N 2                 /* honest 2D — no projection lie  */
-#define MAX_ITER_CG (N + 2) /* CG converges in <= N steps     */
-#define MAX_ITER_SD 80      /* SD bound (effectively forever) */
+#define N 2                 /* two unknowns — the bowl on screen is the real one */
+#define MAX_ITER_CG (N + 2) /* CG finishes in at most N steps */
+#define MAX_ITER_SD 80      /* SD cap (high enough to feel endless) */
 #define HISTORY_LEN_CG (MAX_ITER_CG + 2)
 #define HISTORY_LEN_SD (MAX_ITER_SD + 2)
 
-#define SIM_FPS_DEFAULT 30 /* render+tick rate (Hz)          */
+#define SIM_FPS_DEFAULT 30 /* how many times a second we tick + redraw */
 #define SIM_FPS_MIN 6
 #define SIM_FPS_MAX 120
-#define CG_STEP_TICKS 60 /* one CG step every 2.0s @ 30 Hz */
-#define SD_STEP_TICKS 20 /* one SD step every 0.67s (3x faster) */
-#define HOLD_TICKS 90    /* 3s pause after both converge   */
+#define CG_STEP_TICKS 60 /* CG takes a step every 2 seconds */
+#define SD_STEP_TICKS 20 /* SD steps 3x as often, so you watch it limp */
+#define HOLD_TICKS 90    /* freeze 3s after both finish, then restart */
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-#define RES_NORM_TOL 1e-6f
-#define EIGEN_PANEL_W 24 /* right panel reservation (cols) */
-#define N_CONTOURS 9     /* iso-energy ring count          */
+#define RES_NORM_TOL 1e-6f /* "close enough to the answer" cutoff */
+#define EIGEN_PANEL_W 24   /* columns set aside for the right-hand panel */
+#define N_CONTOURS 9       /* how many contour rings to draw */
 #define N_THEMES 10
 
-/* ── §2 clock ───────────────────────────────────────────────────── */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -187,25 +144,19 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ── §3 color — themes + fixed marker chrome ────────────────────── */
+/* ── §3 color — themes + fixed marker colours ── */
 
 /*
- * Theme-driven roles (change with the active palette):
- *   CP_E_LOW..CP_E_PEAK   four-tier iso-energy contour ramp
+ * Colour slots. The four contour-ring colours follow the active theme;
+ * everything else is fixed so the story reads the same in every theme.
  *
- * Fixed roles (theme-independent — green/red/gold stay readable):
- *   CP_CG       bright green — Conjugate Gradient trail and (X) marker
- *   CP_SD       bright red   — Steepest Descent  trail and (Y) marker
- *   CP_TARGET   bright gold  — true solution [*] marker
- *   CP_EIGEN    bright cyan  — eigen-panel labels
- *
- * Canonical chrome (CLAUDE.md):
- *   CP_HUD      light grey         — overlay body text
- *   CP_HEADER   cyan + bold        — section titles
- *   CP_LABEL    medium grey        — axis labels / dividers
- *   CP_EXPLAIN  yellow             — narrator body text
- *   CP_TOP      bright yellow+bold — top status bar
- *   CP_HINT     bright cyan+bold   — bottom action bar
+ *   CP_E_LOW..CP_E_PEAK   the four contour-ring shades, dark to bright
+ *   CP_CG                 green  — CG's trail and (X) marker
+ *   CP_SD                 red    — SD's trail and (Y) marker
+ *   CP_TARGET             gold   — the true answer, marked [*]
+ *   CP_EIGEN              cyan   — labels in the right-hand panel
+ *   CP_HUD / CP_HEADER / CP_LABEL / CP_EXPLAIN / CP_TOP / CP_HINT
+ *                         the standard overlay/status colours (CLAUDE.md)
  */
 enum {
   CP_DEFAULT = 0,
@@ -226,14 +177,19 @@ enum {
   CP_COUNT
 };
 
-/* Theme — one palette tuned for iso-contour ring rendering. */
+/*
+ * Theme — a named four-colour set for the contour rings.
+ *   name   shown in the status bar; cycled with t/T.
+ *   ramp   four 256-colour codes, darkest to brightest, used for the
+ *          contour bands from the bowl's floor up to its rim.
+ */
 typedef struct {
   const char *name;
   short ramp[4];
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
-    /*  name        ramp[0]  ramp[1]  ramp[2]  ramp[3]                       */
+    /*  name        ramp: darkest .. brightest                              */
     {"Matrix", {28, 34, 40, 46}},      /* cyber green       */
     {"Fire", {130, 208, 202, 196}},    /* warm → red        */
     {"Oceanic", {24, 31, 39, 51}},     /* teal → cyan       */
@@ -287,10 +243,10 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ── §4 linear algebra (N=2 dense) ──────────────────────────────── */
+/* ── §4 linear algebra (small 2x2 / 2-vector helpers) ── */
 
-typedef float Mat[N * N];
-typedef float Vec[N];
+typedef float Mat[N * N]; /* a 2x2 matrix, stored row by row */
+typedef float Vec[N];     /* a 2-element vector */
 
 static void mat_vec_mul(const float *A, const float *x, float *out) {
   for (int i = 0; i < N; i++) {
@@ -310,21 +266,16 @@ static float vdot(const float *a, const float *b) {
 
 static float vnorm(const float *v) { return sqrtf(vdot(v, v)); }
 
-/* out = a + alpha * b  (BLAS daxpy).  Aliasing out==a is safe. */
+/* out = a + alpha*b. Safe to pass the same array as both out and a. */
 static void vaxpy(float *out, const float *a, float alpha, const float *b) {
   for (int i = 0; i < N; i++)
     out[i] = a[i] + alpha * b[i];
 }
 
 /*
- * solve_secular_eq_2x2 — characteristic polynomial of symmetric 2x2.
- *
- * Roots of  det(A - λI) = λ² - tr·λ + det = 0   with
- *   tr  = a + c
- *   det = ac - b²
- *   disc = sqrt((tr/2)² - det)        (real, since A is symmetric)
- *
- * Returns the two eigenvalues sorted so *out_l1 >= *out_l2.
+ * The two eigenvalues of a symmetric 2x2 matrix — how much it stretches
+ * along each of its two natural axes. Closed-form (just a quadratic), so
+ * no iteration. Returned largest first (*out_l1 >= *out_l2).
  */
 static void solve_secular_eq_2x2(float a, float b, float c, float *out_l1,
                                  float *out_l2) {
@@ -336,19 +287,17 @@ static void solve_secular_eq_2x2(float a, float b, float c, float *out_l1,
 }
 
 /*
- * eigenvector_for_value_2x2 — unit eigenvector for a known eigenvalue.
- *
- * From  A v = λ v   we get   (a - λ) v[0] + b v[1] = 0
- * → v ∝ (b, λ - a).  Falls back to an axis-aligned unit vector when
- * b ≈ 0 (A already diagonal — eigenvectors are just the standard basis).
+ * The natural axis (unit length) that goes with one eigenvalue — i.e. a
+ * direction the matrix only stretches, never turns. If the matrix is
+ * already aligned to the x/y axes (b ~ 0), just hand back x or y.
  */
 static void eigenvector_for_value_2x2(float a, float b, float lambda, Vec out) {
   if (fabsf(b) > 1e-10f) {
     out[0] = b;
     out[1] = lambda - a;
   } else {
-    /* A diagonal: λ matches either A[0,0]=a or A[1,1]=c.  Pick the
-     * matching standard-basis vector.                                */
+    /* Already axis-aligned: pick whichever of x or y this eigenvalue
+     * belongs to. */
     if (fabsf(lambda - a) < 1e-10f) {
       out[0] = 1.0f;
       out[1] = 0.0f;
@@ -364,25 +313,17 @@ static void eigenvector_for_value_2x2(float a, float b, float lambda, Vec out) {
   }
 }
 
-/*
- * perpendicular_2d — 90° rotation in the plane.
- * For an orthonormal basis in 2D, v2 ⊥ v1 = (-v1.y, v1.x).
- */
+/* The direction at a right angle to `in` (turned 90 degrees). */
 static void perpendicular_2d(const Vec in, Vec out) {
   out[0] = -in[1];
   out[1] = in[0];
 }
 
 /*
- * eigen2 — closed-form eigendecomposition for symmetric 2x2.
- *
- * Reads like the math:
- *   1) solve the characteristic polynomial          → eigenvalues
- *   2) lift one eigenvalue to its eigenvector       → v1
- *   3) take the perpendicular                       → v2
- *
- * The eigen-panel uses (l1, l2, v1, v2) to project the error onto each
- * axis so the viewer SEES which mode each algorithm kills first.
+ * Finds the bowl's two natural axes and how stretched it is along each:
+ * the two eigenvalues (l1 >= l2) and the matching directions (v1, v2,
+ * which sit at right angles). The eigen-panel uses these to split each
+ * method's leftover error per axis.
  */
 static void eigen2(const Mat A, float *out_l1, float *out_l2, Vec out_v1,
                    Vec out_v2) {
@@ -392,14 +333,13 @@ static void eigen2(const Mat A, float *out_l1, float *out_l2, Vec out_v1,
   perpendicular_2d(out_v1, out_v2);
 }
 
-/* ── §5 SPD generation + reference solution ─────────────────────── */
+/* ── §5 build a random problem + solve it exactly ── */
 
 /*
- * Build a 2x2 SPD matrix with controlled eigenvalue separation so the
- * bowl is reliably elongated (otherwise CG vs SD look identical).
- *
- * Procedure: pick two random eigenvalues with a 3-6× ratio, pick a
- * random rotation θ, set A = R diag(λ1, λ2) Rᵀ.
+ * Make a random bowl that's reliably stretched, so the two methods look
+ * different (on a round bowl they'd behave the same and the demo would be
+ * dull). We pick how much it stretches along each axis, pick a random
+ * tilt, and build the matrix from that.
  */
 static void build_spd(Mat A, unsigned seed) {
   srand(seed);
@@ -419,13 +359,9 @@ static void build_spd(Mat A, unsigned seed) {
 }
 
 /*
- * cholesky_decompose — A = L · Lᵀ for SPD A (lower-triangular L).
- *
- * Standard "outer product" form: for each row i, fill L[i][0..i].
- *   diagonal:     L[i][i] = sqrt(A[i][i] - Σ_{k<i} L[i][k]²)
- *   below-diag:   L[i][j] = (A[i][j] - Σ_{k<j} L[i][k]·L[j][k]) / L[j][j]
- *
- * Reference: Golub & Van Loan, Matrix Computations, §4.2.
+ * Cholesky: split A into L times its own mirror image (a triangular L,
+ * the matrix "square root"). This is the prep step that makes solving
+ * Ax = b a quick two-pass sweep. Reference: Golub & Van Loan §4.2.
  */
 static void cholesky_decompose(const float *A, float *L) {
   memset(L, 0, sizeof(float) * N * N);
@@ -444,8 +380,8 @@ static void cholesky_decompose(const float *A, float *L) {
 }
 
 /*
- * forward_substitute — solve L · y = b for y (L is lower-triangular).
- * Sweep from row 0 down:  y[i] = (b[i] − Σ_{k<i} L[i][k]·y[k]) / L[i][i]
+ * Solve L*y = b by sweeping top to bottom — each row has only one new
+ * unknown, so you just read them off in order.
  */
 static void forward_substitute(const float *L, const float *b, float *y) {
   for (int i = 0; i < N; i++) {
@@ -457,9 +393,8 @@ static void forward_substitute(const float *L, const float *b, float *y) {
 }
 
 /*
- * back_substitute_transpose — solve Lᵀ · x = y for x.
- * Sweep from the bottom up:  x[i] = (y[i] − Σ_{k>i} L[k][i]·x[k]) / L[i][i]
- * (the entries above the diagonal of Lᵀ come from below the diagonal of L)
+ * The mirror of forward_substitute: solve Lᵀ*x = y by sweeping bottom to
+ * top instead. Together the two passes finish solving the system.
  */
 static void back_substitute_transpose(const float *L, const float *y,
                                       float *x) {
@@ -472,14 +407,10 @@ static void back_substitute_transpose(const float *L, const float *y,
 }
 
 /*
- * cholesky_solve — direct solver for x* = A⁻¹ b, A symmetric positive definite.
- *
- *   1) decompose A = L Lᵀ        (Cholesky)
- *   2) forward-solve L · y = b
- *   3) back-solve   Lᵀ · x = y
- *
- * Drawn on screen as [*] — the "ground truth" the iterative solvers
- * race toward.  Used only at reset; the hot loop never calls this.
+ * The exact answer to Ax = b, computed in one shot (split A, then sweep
+ * down and back up). This is the gold target drawn as [*] that the two
+ * iterative methods race toward. Called once per new problem, never in
+ * the animation loop.
  */
 static void cholesky_solve(const float *A, const float *b, float *x) {
   float L[N * N];
@@ -489,106 +420,98 @@ static void cholesky_solve(const float *A, const float *b, float *x) {
   back_substitute_transpose(L, y, x);
 }
 
-/* ── §6 solvers — CG and SD ─────────────────────────────────────── */
+/* ── §6 solvers — CG and SD ── */
 
-/* ─────────────────────────────────────────────────────────────────────
- * CGSolver — one running instance of Conjugate Gradient.
+/*
+ * CGSolver — everything one run of Conjugate Gradient needs to remember.
+ * The first group is the live working state, kept exactly as the 1952
+ * Hestenes-Stiefel recipe describes it; the rest is bookkeeping for
+ * stopping and for drawing the trail. Fields are grouped by who touches
+ * them, not by type.
  *
- * Mirrors the Hestenes-Stiefel 1952 iteration field-for-field — every
- * member here corresponds to a named quantity in the textbook write-up,
- * so the struct doubles as a glossary of the algorithm:
+ *   working state — read and rewritten on every step:
+ *     x      the current guess (the answer so far)
+ *     r      how wrong we still are: r = b - A*x (also points downhill)
+ *     p      the direction we'll step along next — chosen so it doesn't
+ *            undo any earlier step
+ *     Ap     A applied to p, saved so we don't recompute it
+ *     rr     r dotted with itself, saved to avoid redoing that dot product
+ *     alpha  how far we stepped on the last step
+ *     beta   how much of the old direction we mixed into the new one
  *
- *     x_k       current iterate (the answer so far)
- *     r_k       residual b − A x_k = − grad f(x_k)
- *     p_k       search direction (A-conjugate to all previous)
- *     A p_k     cached mat-vec product (avoid redundant work)
+ *   stopping — set by cg_step, read by everyone:
+ *     iter       how many steps are done (0..MAX_ITER_CG-1)
+ *     converged  once true, cg_step does nothing more
  *
- *     alpha_k   step size,   = (r·r) / (p·A·p)         optimal along p
- *     beta_k    blend coeff, = ‖r_new‖² / ‖r_old‖²     Fletcher-Reeves
- *     rr        cached r·r   (saves one dot product per step)
+ *   trail snapshot — written once per step, read every frame to draw:
+ *     hist[k]  where the guess was at step k (its x,y)
+ *     res[k]   how wrong it was at step k. Room for MAX_ITER_CG+2 stops,
+ *              plenty for a 2x2 problem.
  *
- * Members are grouped by access pattern, NOT by type:
- *
- *   iteration state  : x, r, p, Ap, rr, alpha, beta
- *       Hot path.  Read+written every cg_step.  Pixel-space N-vectors.
- *
- *   termination      : iter, converged
- *       Loop control.  cg_step writes both; everything else only reads.
- *
- *   render snapshot  : hist[], res[]
- *       Write-once per CG step (latest position + residual norm).  Read
- *       every render frame by the trail / narrator code.  hist[k][0..1]
- *       is the 2D position of iterate k; res[k] is ‖r_k‖.  Sized to
- *       hold MAX_ITER_CG+2 entries — more than enough for N=2.
- *
- * References: Hestenes & Stiefel 1952 (original) — section 3 defines
- *             every variable above.
- *             Shewchuk 1994 — §B7 has the same recurrence with picture
- *             intuition for what each variable does geometrically.
- * ───────────────────────────────────────────────────────────────────── */
+ * References: Hestenes & Stiefel 1952 §3 names each quantity above;
+ *             Shewchuk 1994 §B7 shows the same steps with pictures.
+ */
 typedef struct {
-  /* ─ iteration state — read+write every cg_step ─────────────────── */
-  Vec x;       /* current iterate x_k, the answer-in-progress     */
-  Vec r;       /* residual r_k = b − A x_k                        */
-  Vec p;       /* search direction p_k (A-conjugate to past p_j)  */
-  Vec Ap;      /* cached A · p_k (saves a mat-vec in α denom)     */
-  float rr;    /* cached r·r (saves a dot product in β numerator) */
-  float alpha; /* step size for the LAST step taken               */
-  float beta;  /* direction blend coeff for the LAST step taken   */
+  /* working state — read+written every cg_step */
+  Vec x;       /* current guess */
+  Vec r;       /* how wrong we still are: b - A*x */
+  Vec p;       /* next direction to step along */
+  Vec Ap;      /* A applied to p, cached */
+  float rr;    /* r dotted with itself, cached */
+  float alpha; /* how far the last step went */
+  float beta;  /* how much of the old direction the new one kept */
 
-  /* ─ termination — set by cg_step ───────────────────────────────── */
-  int iter;       /* count of completed steps, 0..MAX_ITER_CG-1      */
-  bool converged; /* true → cg_step is a no-op afterwards            */
+  /* stopping — set by cg_step */
+  int iter;       /* steps completed, 0..MAX_ITER_CG-1 */
+  bool converged; /* once true, cg_step is a no-op */
 
-  /* ─ render snapshot — written 1× per step, read 30× / sec ──────── */
-  float hist[HISTORY_LEN_CG][2]; /* (x[0], x[1]) at each iterate     */
-  float res[HISTORY_LEN_CG];     /* ‖r_k‖ for the narrator's "was X"*/
+  /* trail snapshot — written once per step, read every frame */
+  float hist[HISTORY_LEN_CG][2]; /* guess position at each step */
+  float res[HISTORY_LEN_CG];     /* how wrong it was at each step */
 } CGSolver;
 
-/* ─────────────────────────────────────────────────────────────────────
- * SDSolver — one running instance of Steepest Descent (Cauchy 1847).
+/*
+ * SDSolver — one run of Steepest Descent (Cauchy 1847), the foil to CG.
+ * Simpler than CG: there's no chosen direction to remember, because SD
+ * always just steps straight downhill (along r). That's also its flaw —
+ * each new downhill comes out at a right angle to the last, so on a
+ * stretched bowl the path zig-zags and crawls. Same field layout as
+ * CGSolver so the two read side by side.
  *
- * The comparison foil to CG.  SD's update is much simpler than CG's:
+ *   working state — read and rewritten each step:
+ *     x      the current guess
+ *     r      how wrong we still are / the downhill direction
+ *     alpha  how far the last step went
  *
- *     alpha = (r · r) / (r · A · r)        optimal step along r
- *     x_new = x + alpha · r
- *     r_new = r - alpha · A · r
+ *   stopping:
+ *     iter       steps completed (0..MAX_ITER_SD-1)
+ *     converged  reached tolerance, or hit the step cap
  *
- * No search direction state and no β: the search direction IS just r
- * each iteration.  That simplicity is also SD's curse — consecutive
- * gradients are exactly orthogonal (r_new · r = 0), so on an elongated
- * elliptic bowl the iterates zig-zag between the long and short axes
- * and inch forward by tiny amounts.  Convergence rate is governed by
- * ((κ − 1)/(κ + 1))^k where κ = λ_max / λ_min.
+ *   trail snapshot — written once per step, read every frame:
+ *     hist[k]  the zig-zag path, position at each step
+ *     res[k]   how wrong it was at each step. Sized MAX_ITER_SD+2 — SD
+ *              takes dozens of steps where CG takes two.
  *
- * Same field grouping as CGSolver so the two are 1-to-1 readable:
- *
- *   iteration state  : x, r, alpha
- *   termination      : iter, converged
- *   render snapshot  : hist[], res[]   (sized MAX_ITER_SD+2 — SD takes
- *                                       dozens of steps where CG takes 2)
- *
- * References: Cauchy 1847 (the very first descent method paper).
- *             Trefethen & Bau 1997 — Lecture 38 §38.3 shows the
- *             zig-zag pattern and derives the (κ−1)/(κ+1) bound.
- *             Shewchuk 1994 — §6 contrasts SD vs CG geometrically.
- * ───────────────────────────────────────────────────────────────────── */
+ * References: Cauchy 1847 (the original descent method); Trefethen & Bau
+ *             1997 §38.3 explains the zig-zag; Shewchuk 1994 §6 compares
+ *             SD and CG with pictures.
+ */
 typedef struct {
-  /* ─ iteration state — read+write every sd_step ─────────────────── */
-  Vec x;       /* current iterate                                 */
-  Vec r;       /* residual (also the negative gradient)           */
-  float alpha; /* step size for the LAST step taken               */
+  /* working state — read+written every sd_step */
+  Vec x;       /* current guess */
+  Vec r;       /* how wrong we still are / the downhill direction */
+  float alpha; /* how far the last step went */
 
-  /* ─ termination ───────────────────────────────────────────────── */
-  int iter;       /* count of completed steps, 0..MAX_ITER_SD-1      */
-  bool converged; /* true → SD's tolerance reached or step bound hit */
+  /* stopping */
+  int iter;       /* steps completed, 0..MAX_ITER_SD-1 */
+  bool converged; /* reached tolerance or hit the step cap */
 
-  /* ─ render snapshot — written 1× per step ──────────────────────── */
-  float hist[HISTORY_LEN_SD][2]; /* zig-zag trail in 2D              */
-  float res[HISTORY_LEN_SD];     /* per-step residual norm           */
+  /* trail snapshot — written once per step, read every frame */
+  float hist[HISTORY_LEN_SD][2]; /* the zig-zag path */
+  float res[HISTORY_LEN_SD];     /* how wrong it was at each step */
 } SDSolver;
 
-/* cg_reset — x0 = 0, r0 = b - Ax0 = b, p0 = r0 */
+/* Start CG fresh from the origin, ready for a new problem. */
 static void cg_reset(CGSolver *s, const Mat A, const Vec b) {
   memset(s->x, 0, sizeof s->x);
   memcpy(s->r, b, sizeof s->r);
@@ -605,15 +528,10 @@ static void cg_reset(CGSolver *s, const Mat A, const Vec b) {
 }
 
 /*
- * cg_should_stop — early-exit predicates.
- *
- * Three reasons to skip a CG step:
- *   1. already converged
- *   2. step count hit MAX_ITER_CG (safety bound)
- *   3. residual already within tolerance
- *
- * Mutates s->converged when (2) or (3) trip so the caller's next visit
- * also short-circuits.
+ * When CG has nothing left to do. Stops if it already finished, if it
+ * hit the safety cap on steps, or if it's now close enough to the
+ * answer. The last two also latch the "finished" flag so later calls
+ * bail straight away.
  */
 static bool cg_should_stop(CGSolver *s) {
   if (s->converged)
@@ -630,16 +548,10 @@ static bool cg_should_stop(CGSolver *s) {
 }
 
 /*
- * cg_optimal_step_size — α_k = (r·r) / (p·A·p).
- *
- * The α that exactly minimises f(x + α·p) along the search direction p.
- * Derivation: ∂f/∂α = pᵀ(A x − b) + α pᵀA p = -pᵀr + α pᵀA p,
- * setting to zero gives α = pᵀr / pᵀA p = rᵀr / pᵀA p (using pᵀr = rᵀr
- * which holds when p is generated by the CG recurrence).
- *
- * Returns the step size.  Sets s->converged if pᵀA p is degenerate
- * (numerically zero — the search direction is in A's null space, which
- * shouldn't happen for SPD A but the guard is cheap insurance).
+ * How far to step along the current direction — the exact stride that
+ * reaches the lowest point on that line, no guessing. If the direction
+ * somehow has no slope to descend (shouldn't happen on a real bowl, but
+ * cheap to guard), it marks itself finished and steps nowhere.
  */
 static float cg_optimal_step_size(CGSolver *s) {
   float pAp = vdot(s->p, s->Ap);
@@ -651,12 +563,9 @@ static float cg_optimal_step_size(CGSolver *s) {
 }
 
 /*
- * cg_walk_and_update_residual — apply the position and residual updates.
- *
- *   x_{k+1} = x_k + α p_k          (walk along search direction)
- *   r_{k+1} = r_k − α A p_k        (residual recurrence — no extra mat-vec)
- *
- * Refreshes the cached rr = r·r so the Fletcher-Reeves β can read it.
+ * Take the step: slide the guess along the chosen direction, and update
+ * how-wrong-we-are the cheap way (a running formula, no fresh matrix
+ * multiply). Refreshes the cached r·r that the next-direction step needs.
  */
 static void cg_walk_and_update_residual(CGSolver *s, float alpha) {
   vaxpy(s->x, s->x, alpha, s->p);
@@ -665,12 +574,10 @@ static void cg_walk_and_update_residual(CGSolver *s, float alpha) {
 }
 
 /*
- * cg_new_direction_fletcher_reeves — pick the next A-conjugate p.
- *
- *   β_k    = ‖r_{k+1}‖² / ‖r_k‖²          (Fletcher-Reeves form)
- *   p_{k+1} = r_{k+1} + β_k · p_k          (A-conjugate to all past p_j)
- *
- * Also refreshes the cached A·p for the NEXT step's α denominator.
+ * Choose the next direction to step in. It's a blend of straight downhill
+ * plus a little of the old direction — mixed just so that this step won't
+ * spoil any earlier one (that's the trick that kills the zig-zag). Also
+ * caches the matrix-times-direction the next step will reuse.
  */
 static void cg_new_direction_fletcher_reeves(CGSolver *s, float rr_old,
                                              const Mat A) {
@@ -679,7 +586,8 @@ static void cg_new_direction_fletcher_reeves(CGSolver *s, float rr_old,
   mat_vec_mul(A, s->p, s->Ap);
 }
 
-/* cg_record_step — bump iter counter and snapshot history for render. */
+/* Save where this step landed so the trail can be drawn, and note if
+ * we've arrived. */
 static void cg_record_step(CGSolver *s) {
   s->iter++;
   if (s->iter < HISTORY_LEN_CG) {
@@ -692,12 +600,9 @@ static void cg_record_step(CGSolver *s) {
 }
 
 /*
- * cg_step — one CG iteration.  Reads like the textbook recipe:
- *
- *   1. step size:        α = rᵀr / pᵀA p
- *   2. position+residual: x ← x + α p,   r ← r − α A p
- *   3. new direction:     β = ‖r_new‖²/‖r_old‖²,  p ← r + β p,  cache A p
- *   4. record:            iter++, snapshot history, maybe converged
+ * One CG step, in the four moves of the recipe: figure out how far to go,
+ * take the step (and update how wrong we are), pick the next direction,
+ * then record the result.
  */
 static void cg_step(CGSolver *s, const Mat A) {
   if (cg_should_stop(s))
@@ -742,14 +647,10 @@ static bool sd_should_stop(SDSolver *s) {
 }
 
 /*
- * sd_optimal_step_size — α = (r·r) / (r·A·r).
- *
- * The α that exactly minimises f(x + α·r) along the gradient r.  Same
- * line-search principle as CG, but the search direction IS r each step
- * (no orthogonalisation against previous directions — which is the
- * whole reason SD zig-zags).
- *
- * Sets s->converged if rᵀA r is degenerate.
+ * How far to step straight downhill — the exact stride that bottoms out
+ * along the downhill line. Same idea as CG's stride, but SD always heads
+ * straight downhill and never adjusts for past steps, which is exactly
+ * why it zig-zags. Marks itself finished if there's no slope to descend.
  */
 static float sd_optimal_step_size(SDSolver *s, const Vec Ar) {
   float rr = vdot(s->r, s->r);
@@ -762,14 +663,10 @@ static float sd_optimal_step_size(SDSolver *s, const Vec Ar) {
 }
 
 /*
- * sd_walk_and_update_residual — apply the position and residual updates.
- *
- *   x_{k+1} = x_k + α r_k         (walk along the gradient)
- *   r_{k+1} = r_k − α A r_k        (recurrence — saves a mat-vec)
- *
- * Math fact: by construction r_{k+1} · r_k = 0.  That's why SD's
- * trajectory turns exactly 90° every step — and on an elongated bowl
- * that means perpetual zig-zag.
+ * Take the step downhill and update how-wrong-we-are the cheap way. A
+ * quirk of the math: each new downhill direction comes out at a right
+ * angle to the last one — which is what makes the path bounce side to
+ * side forever on a stretched bowl.
  */
 static void sd_walk_and_update_residual(SDSolver *s, float alpha,
                                         const Vec Ar) {
@@ -777,7 +674,7 @@ static void sd_walk_and_update_residual(SDSolver *s, float alpha,
   vaxpy(s->r, s->r, -alpha, Ar);
 }
 
-/* sd_record_step — bump iter counter and snapshot history for render. */
+/* Save where this step landed for the trail, and note if we've arrived. */
 static void sd_record_step(SDSolver *s) {
   s->iter++;
   if (s->iter < HISTORY_LEN_SD) {
@@ -790,12 +687,8 @@ static void sd_record_step(SDSolver *s) {
 }
 
 /*
- * sd_step — one Steepest Descent iteration.  Cauchy 1847 recipe:
- *
- *   1. cache A·r            (reused by both α denominator and recurrence)
- *   2. step size:           α = rᵀr / rᵀA r
- *   3. position+residual:   x ← x + α r,   r ← r − α A r
- *   4. record:              iter++, snapshot history, maybe converged
+ * One SD step (Cauchy 1847): work out how far to step straight downhill,
+ * take it, and record the result.
  */
 static void sd_step(SDSolver *s, const Mat A) {
   if (sd_should_stop(s))
@@ -813,88 +706,82 @@ static void sd_step(SDSolver *s, const Mat A) {
   sd_record_step(s);
 }
 
-/* ── §7 scene ───────────────────────────────────────────────────── */
+/* ── §7 scene ── */
 
-/* ─────────────────────────────────────────────────────────────────────
- * Scene — the entire demo's state.
+/*
+ * Scene — everything the demo needs to remember, in one place.
  *
- * One Scene IS the demo.  Both solvers, the problem definition (A, b),
- * the spectral analysis (eigenvalues + eigenvectors), the pacing clocks,
- * and the UI state all live here.  Pass &scene to anything that needs
- * anything; there's no shared mutable state outside.
+ * One Scene IS the whole demo: both racers, the problem they solve (A
+ * and b), the answer, the bowl's natural axes, the timing counters, and
+ * the on-screen settings. Pass &scene around; nothing important lives
+ * outside it. Fields are grouped by who uses them, and the drawing code
+ * only ever reads them, never writes.
  *
- * Members grouped by what TOUCHES them, per CLAUDE.md "locality" rule.
- * Simulation-side groups (problem / spectral / solvers / pacing) live
- * separately from UI state, and the render side reads but never writes.
+ *   the problem — A, b, x_true
+ *       A and b are the system Ax = b; x_true is the exact answer, found
+ *       once up front and drawn as the gold [*] goal. Set when a new
+ *       problem starts; read by both racers every step and by the bowl
+ *       drawing every frame.
  *
- *   problem definition  : A, b, x_true
- *       The linear system Ax = b and the reference answer.  Set once
- *       per scene_reset; read by both solvers every step and by the
- *       bowl renderer every frame.
+ *   the bowl's natural axes — l1, l2, v1, v2
+ *       v1 and v2 are the two directions the bowl is stretched along;
+ *       l1 and l2 say how stretched (l1 the bigger). Neither racer needs
+ *       these — only the right-hand panel does, to split the leftover
+ *       error per axis.
  *
- *   spectral analysis   : l1, l2, v1, v2
- *       Eigendecomposition of A (computed once per reset by eigen2).
- *       Pure metadata — neither solver uses it; only the eigen-panel
- *       renderer reads it to project the error onto v1/v2.
+ *   the two racers — cg, sd
+ *       Conjugate Gradient and Steepest Descent, both working the same
+ *       bowl. Stepped at their own rhythms; drawing reads their state.
  *
- *   solvers (sim)       : cg, sd
- *       The two algorithms racing on the same bowl.  Stepped by
- *       scene_tick at independent rates; render code reads their state.
+ *   timing — cg_acc, sd_acc, hold
+ *       cg_acc / sd_acc count ticks so each racer steps on its own beat
+ *       (CG slow, SD fast — how you see CG sprint and SD limp). Once
+ *       both finish, hold counts up to HOLD_TICKS, then a fresh random
+ *       problem starts.
  *
- *   tick pacing (sim)   : cg_acc, sd_acc, hold
- *       Per-tick counters that throttle solver stepping.  cg_step fires
- *       every CG_STEP_TICKS ticks (≈ 2 s); sd_step every SD_STEP_TICKS
- *       (≈ 0.67 s).  After both converge, hold counts up to HOLD_TICKS
- *       then triggers auto-restart with a new random A.
+ *   on-screen settings — paused, theme
+ *       Changed only by key presses. paused freezes the sim; theme picks
+ *       the colour set.
  *
- *   UI state            : paused, theme
- *       Written only by app_handle_key; read by scene_tick (paused) and
- *       rendering (theme).  No render-only fields live elsewhere on the
- *       Scene — the render pipeline takes &scene and never mutates.
+ *   restart — seed
+ *       The random seed for the NEXT problem. Bumped on the `r` key and
+ *       on auto-restart.
  *
- *   restart driver      : seed
- *       The RNG seed for the NEXT call to scene_reset.  Bumped on `r`
- *       key and on auto-restart.
- *
- * Reference: Shewchuk 1994 §B treats the entire CG-vs-SD comparison
- *            as one geometric story on one bowl — that's the framing
- *            this scene exists to put on screen.
- * ───────────────────────────────────────────────────────────────────── */
+ * Reference: Shewchuk 1994 §B tells the whole CG-vs-SD story as one
+ *            picture on one bowl — what this scene puts on screen.
+ */
 typedef struct {
-  /* ─ problem definition — set once per reset, read everywhere ───── */
-  Mat A;      /* SPD matrix the solvers are working on        */
-  Vec b;      /* right-hand side (non-zero so x* != origin)   */
-  Vec x_true; /* reference solution via Cholesky — drawn as [*]*/
+  /* the problem — set once per new problem, read everywhere */
+  Mat A;      /* the matrix both racers work on */
+  Vec b;      /* right-hand side (non-zero, so the answer isn't the origin) */
+  Vec x_true; /* the exact answer, drawn as the gold [*] */
 
-  /* ─ spectral analysis — pure metadata, read only by eigen panel ── */
-  float l1, l2; /* eigenvalues of A, l1 >= l2 (so kappa=l1/l2)  */
-  Vec v1, v2;   /* corresponding orthonormal eigenvectors        */
+  /* the bowl's natural axes — only the right-hand panel reads these */
+  float l1, l2; /* how stretched along each axis, bigger first */
+  Vec v1, v2;   /* the two axes themselves (at right angles, unit length) */
 
-  /* ─ solvers (simulation, hot path) ─────────────────────────────── */
-  CGSolver cg; /* Conjugate Gradient state                      */
-  SDSolver sd; /* Steepest Descent  state                       */
+  /* the two racers */
+  CGSolver cg; /* Conjugate Gradient */
+  SDSolver sd; /* Steepest Descent */
 
-  /* ─ tick pacing (simulation driver) ────────────────────────────── *
-   * scene_tick increments cg_acc / sd_acc each call, fires the
-   * corresponding solver step when the counter crosses its threshold.
-   * Asymmetric thresholds give CG 1 step / 2 s and SD ~3 steps / 2 s
-   * — exactly the rhythm where you watch CG sprint and SD limp.      */
+  /* timing — each tick bumps a counter; a racer steps when its counter
+   * crosses its threshold. Different thresholds give CG one slow step
+   * for every few quick SD steps. */
   int cg_acc;
   int sd_acc;
-  int hold; /* counts up to HOLD_TICKS post-converge, then  */
-            /* triggers auto-restart                         */
+  int hold; /* after both finish, counts up to HOLD_TICKS, then restart */
 
-  /* ─ UI state — written only by app_handle_key ──────────────────── */
-  bool paused; /* space: freezes scene_tick                     */
-  int theme;   /* t/T: index into k_themes[]                    */
+  /* on-screen settings — changed only by key presses */
+  bool paused; /* space freezes the sim */
+  int theme;   /* t/T picks the colour set */
 
-  /* ─ restart driver ────────────────────────────────────────────── */
-  unsigned seed; /* RNG seed for the NEXT scene_reset             */
+  /* restart */
+  unsigned seed; /* random seed for the next problem */
 } Scene;
 
 static void scene_reset(Scene *sc) {
   build_spd(sc->A, sc->seed);
-  /* Non-zero RHS so x* isn't at the origin. */
+  /* Pick a non-zero right-hand side so the answer isn't at the origin. */
   sc->b[0] = 1.4f;
   sc->b[1] = 0.7f;
   cholesky_solve(sc->A, sc->b, sc->x_true);
@@ -976,53 +863,47 @@ static void scene_tick(Scene *sc) {
   pace_sd_step(sc);
 }
 
-/* ── §8 rendering ───────────────────────────────────────────────── */
+/* ── §8 rendering ── */
 
 #define HDR_ROWS 2 /* row 0 status, row 1 divider */
 #define FTR_ROWS 8 /* 7 rows narrator + 1 row action HUD */
 
-/* ─────────────────────────────────────────────────────────────────────
- * View — the per-frame camera onto the (x1, x2) world.
+/*
+ * View — where the camera is pointed this frame.
  *
- * Pure RENDER-side metadata.  No simulation function touches it; no
- * Scene member depends on it.  Lifetime: one frame.  Created by
- * compute_view from the current Scene, then passed by const-ref to
- * every sub-renderer so they share one consistent projection.
+ * Pure drawing-side info: no sim code touches it, and it lasts only one
+ * frame. compute_view builds it from the current Scene, then hands it
+ * (read-only) to every drawing helper so they all agree on where things
+ * land on screen. Bundling it in one struct beats passing the same six
+ * numbers to every helper.
  *
- * Why a struct: the bowl, the trails, the markers, and the axis labels
- * each independently need (plot_w, ph, xlo..yhi).  Computing the window
- * in each renderer would be duplicate work; passing six floats per call
- * is noisy.  One View bundles them.
+ * Two coordinate worlds meet here:
  *
- * Two coordinate systems involved:
+ *   world coordinates — the real (x1, x2) space the algorithms move in.
+ *                       A guess sits at something like (0.42, -0.18). The
+ *                       visible window is xlo..xhi across and ylo..yhi up.
  *
- *   world space    — the actual (x1, x2) Lagrangian space where the
- *                    algorithms operate.  Iterates have positions like
- *                    (0.42, -0.18).  Axis range = [xlo, xhi] × [ylo, yhi].
+ *   screen cells      — terminal character cells, (0, 0) at top-left.
+ *                       The bowl fills columns 1..plot_w-2 and rows
+ *                       HDR_ROWS..HDR_ROWS+ph-1.
  *
- *   cell space     — terminal character cells.  Top-left = (0, 0).
- *                    The bowl occupies columns 1..plot_w-2 and rows
- *                    HDR_ROWS..HDR_ROWS+ph-1.
+ * to_col / to_row convert a world point to a cell. The row direction is
+ * flipped (high y at the top row) to match how screens count rows.
  *
- * to_col / to_row do the affine map world → cell.  Y is inverted
- * (yhi maps to top row HDR_ROWS) to match the screen convention.
- *
- * The window auto-zooms each frame: compute_view starts at a small
- * range centred on x*, then expands to include every iterate of both
- * algorithms.  Lets SD's wandering trail stay in frame without losing
- * the bowl's structure when iterates are still near the origin.
- * ───────────────────────────────────────────────────────────────────── */
+ * The window re-fits itself every frame: it starts small around the
+ * answer, then grows to take in every step of both racers. That keeps
+ * SD's wandering trail on screen without losing the bowl while the early
+ * steps are still huddled near the origin.
+ */
 typedef struct {
-  /* ─ layout (cell space) — set once by compute_view ─────────────── */
-  int plot_w; /* columns reserved for the bowl region        */
-  int ph;     /* bowl height in rows                         */
+  /* the bowl's size on screen — set once per frame */
+  int plot_w; /* how many columns the bowl gets */
+  int ph;     /* how many rows the bowl gets */
 
-  /* ─ camera window (world space) ─────────────────────────────────── *
-   * Affine map: cell c → world x = xlo + (xhi-xlo) · (c-1)/(plot_w-3)
-   *             cell r → world y = yhi - (yhi-ylo) · r/(ph-1)
-   * (yhi at the top row matches screen convention: low row = high y.) */
-  float xlo, xhi; /* visible x1 range                            */
-  float ylo, yhi; /* visible x2 range                            */
+  /* the visible window in world coordinates — high y maps to the top
+   * row, matching the screen's top-down row order */
+  float xlo, xhi; /* visible left-right range */
+  float ylo, yhi; /* visible bottom-top range */
 } View;
 
 static int to_col(float v, float lo, float hi, int c0, int c1) {
@@ -1068,9 +949,8 @@ static void view_layout(int rows, int cols, int *out_plot_w, int *out_ph) {
 }
 
 /*
- * expand_range_to_fit_trail — grow the half-width `range` so every
- * iterate in `hist[0..n_iter]` falls inside the [cx ± range] × [cy ± range]
- * square (with a 0.2 padding margin so trails don't kiss the edge).
+ * Widen the view's reach so every step of a racer's path stays on
+ * screen, with a little padding so the trail never touches the edge.
  */
 static void expand_range_to_fit_trail(const float (*hist)[2], int n_iter,
                                       float cx, float cy, float *range) {
@@ -1111,8 +991,8 @@ static View compute_view(const Scene *sc, int rows, int cols) {
 }
 
 /*
- * cell_to_world — inverse of the View's affine map.
- * Maps a (column, row) inside the bowl region back to world coordinates.
+ * Turn a screen cell back into the world point it stands for — the
+ * reverse of placing a world point on screen.
  */
 static void cell_to_world(const View *v, int c, int r, float *out_xv,
                           float *out_yv) {
@@ -1122,9 +1002,9 @@ static void cell_to_world(const View *v, int c, int r, float *out_xv,
 }
 
 /*
- * find_energy_window — pass 1 of the contour renderer.
- * Scan every cell to find the [emin, emax] energy range we'll quantise
- * into N_CONTOURS buckets.
+ * First pass of the topo-map drawing: walk every cell to find the lowest
+ * and highest height on screen, so the next pass can slice that range
+ * into even bands.
  */
 static void find_energy_window(const Scene *sc, const View *v, float *out_emin,
                                float *out_emax) {
@@ -1145,18 +1025,13 @@ static void find_energy_window(const Scene *sc, const View *v, float *out_emin,
 }
 
 /*
- * contour_classify_cell — does this cell sit on a contour line?
- *
- * Compare the quantised energy level of (c, r) against its RIGHT and
- * DOWN 4-neighbours.  If the level differs from either neighbour, the
- * iso-line passes through this cell:
- *
- *   horizontal change only → contour runs vertically here  → '|'
- *   vertical change only   → contour runs horizontally here → '-'
- *   both changed           → corner / curved bit            → '.'
- *
- * Returns true if the cell is on a contour; out_level and out_ch are
- * set accordingly.  Cells inside a uniform level return false (blank).
+ * Decide whether a cell sits on the edge between two height bands — i.e.
+ * on a contour ring of the topo map. Looks at the cell's own band and
+ * its neighbours to the right and below; if a neighbour is in a
+ * different band, a ring passes through here, and the change direction
+ * picks the glyph ('|' for a vertical edge, '-' for horizontal, '.' for
+ * a corner). Cells deep inside one band aren't on a ring, so they stay
+ * blank.
  */
 static bool contour_classify_cell(const Scene *sc, const View *v, int c, int r,
                                   float emin, float step, int *out_level,
@@ -1181,8 +1056,8 @@ static bool contour_classify_cell(const Scene *sc, const View *v, int c, int r,
   return true;
 }
 
-/* level_to_tier_pair — map quantised energy level (0..N_CONTOURS-1) to
- * one of the four CP_E_LOW..CP_E_PEAK colour-pair indices. */
+/* Pick which of the four ring shades (floor up to rim) a given height
+ * band gets. */
 static int level_to_tier_pair(int level) {
   int tier = (level * 4) / N_CONTOURS;
   if (tier < 0)
@@ -1193,14 +1068,9 @@ static int level_to_tier_pair(int level) {
 }
 
 /*
- * render_bowl_contours — discrete iso-energy rings, not a density fill.
- *
- * Two passes over the bowl region:
- *   1) find_energy_window   → [emin, emax]
- *   2) for each cell: contour_classify_cell → maybe draw
- *
- * Result: nested elliptic rings that read instantly as "topo map of a
- * bowl" instead of a confusing wall-to-wall character grid.
+ * Draw the bowl as a topo map — nested rings, not a solid fill, so it
+ * reads at a glance. First find the height range, then mark only the
+ * cells that sit on a ring.
  */
 static void render_bowl_contours(const Scene *sc, const View *v) {
   float emin, emax;
@@ -1233,7 +1103,7 @@ static void render_axis_labels(const View *v) {
   attroff(COLOR_PAIR(CP_LABEL));
 }
 
-/* iterate_to_cell — affine map from world iterate to bowl cell. */
+/* Place one step of a racer's path onto its screen cell. */
 static void iterate_to_cell(const float (*hist)[2], int k, const View *v,
                             int *out_c, int *out_r) {
   *out_c = to_col(hist[k][0], v->xlo, v->xhi, 1, v->plot_w - 2);
@@ -1246,8 +1116,8 @@ static bool cell_in_bowl(int c, int r, const View *v) {
 }
 
 /*
- * draw_dotted_segment — DDA line of '.' between two cells.
- * Skips the endpoints (they get the bullet glyph from the caller).
+ * Draw a dotted straight line of '.' between two cells. Leaves the two
+ * endpoints alone — the caller stamps a dot there instead.
  */
 static void draw_dotted_segment(int c0, int r0, int c1, int r1, const View *v) {
   int dx = c1 - c0, dy = r1 - r0;
@@ -1348,15 +1218,10 @@ static void eigen_panel_header(int x0, int top) {
 }
 
 /*
- * project_error_onto_eigvec — error magnitude in one eigendirection.
- *
- * For each algorithm, computes |⟨x_alg − x*, v⟩| — the absolute value
- * of the error projected onto eigenvector v.  Also returns the starting
- * projected error (|⟨x_true, v⟩|, since x_0 = 0) so the caller can
- * normalise: bar fraction = current / start.
- *
- * Reference: Shewchuk 1994 §B7 — the eigenvalue analysis of CG/SD
- * decomposes the error in this basis.
+ * How much of each racer's leftover error points along one of the bowl's
+ * natural axes. Returns that amount for CG and SD, plus the amount they
+ * both started with, so the caller can show it as a "fraction still
+ * left" bar. Reference: Shewchuk 1994 §B7 splits the error this way.
  */
 static void project_error_onto_eigvec(const Scene *sc, const Vec v,
                                       float *out_cg_err, float *out_sd_err,
@@ -1398,9 +1263,9 @@ static void draw_eigenmode_section(int *y, int x0, int bar_w, const char *label,
 }
 
 /*
- * draw_kappa_footer — condition number + helper text.
- * κ(A) = λ_max / λ_min governs how hard the problem is.  Display it
- * with a short legend so the viewer knows what "shorter bar" means.
+ * Show how lopsided the bowl is — the ratio of its biggest stretch to
+ * its smallest. The more lopsided, the harder SD struggles. A short
+ * legend tells the viewer what a shorter bar means.
  */
 static void draw_kappa_footer(int *y, int x0, float l1, float l2) {
   float kappa = (l2 > 1e-10f) ? (l1 / l2) : 0.0f;
@@ -1420,7 +1285,7 @@ static void draw_kappa_footer(int *y, int x0, float l1, float l2) {
  *   1. title bar
  *   2. λ1 block (CG bar + SD bar)        — the "easy" mode
  *   3. λ2 block (CG bar + SD bar)        — the "hard" mode (slow)
- *   4. κ(A) footer
+ *   4. the lopsidedness footer
  *
  * Watching CG kill both modes in two steps while SD's λ2 bar barely
  * shrinks is the educational payoff of this panel.
@@ -1483,8 +1348,8 @@ static void narrator_divider(int hud, int cols) {
 
 /*
  * narrator_step_bars — row 1: live progress for both solvers.
- * Each algorithm gets a label, a fraction-complete bar (driven by
- * residual norm), and a "DONE" / "..." status.
+ * Each racer gets a label, a how-far-along bar (based on how wrong it
+ * still is), and a "DONE" / "..." status.
  */
 static void narrator_step_bars(int row, int cols, const Scene *sc) {
   float cg_frac = 1.0f - vnorm(sc->cg.r) / (sc->cg.res[0] + 1e-12f);
@@ -1623,7 +1488,7 @@ static void draw_hud_bottom(int cols, int rows) {
   attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ── §9 screen + app ────────────────────────────────────────────── */
+/* ── §9 screen + app ── */
 
 typedef struct {
   int cols, rows;

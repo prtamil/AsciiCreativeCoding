@@ -1,215 +1,21 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * waves.c — Scalar 2-D wave field, two engines side-by-side
+ * waves.c — ripples and interference patterns on the terminal grid.
  *
- * DEMO   : Interference patterns on the terminal grid, computed two ways.
- *           Press `m` to toggle between:
+ * The same physics, two ways of computing it. Press `m` to switch.
+ *   FDTD     — step a grid of "water height" cells forward in time; ripples
+ *              spread, bounce off the walls, and fade. This is the honest
+ *              numerical simulation.
+ *   ANALYTIC — skip the simulation and just add up the sine waves coming
+ *              from each source. No grid, instant, always stable.
+ * Both read the same list of wave sources, so the picture matches. Presets
+ * 1-5 arrange the sources into famous setups (double-slit, ripple tank, etc.).
  *
- *             FDTD       — Finite-Difference Time-Domain numerical integration
- *                          of  ∂²u/∂t² = c² ∇²u.  Three time levels stored,
- *                          inner stencil + hard-wall reflections + damping.
- *                          Sources DRIVE the field by adding A·sin(ωt+φ_0)
- *                          to their cell every sub-step.
- *
- *             ANALYTIC   — Closed-form superposition u = Σ_i sin(ω_i t − k_i
- * r_i + φ_0i). No grid state, no CFL stability worry, no warm-up. Phase term
- * k_i·r_i − φ_0i  is cached per source per cell so the hot path is N_active ×
- * sinf() per cell.
- *
- *          Same source list feeds both engines.  Same themes, same HUD.  Five
- *          presets (1–5) reseat the source array into known interference
- *          configurations: double-slit, ripple tank, beat, radial star,
- *          five-oscillator default.
- *
- * SECTIONS §1 config  §2 clock  §3 color  §4 fdtd-grid  §5 sources
- *          §6 analytic §7 scene  §8 screen §9 app
- *
- * KEYS
- *   q / ESC    quit
- *   m          switch engine (FDTD ↔ analytic)
- *   space      pause / resume
- *   r          reset / re-apply current preset
- *   1–5        preset: 1 DBL-SLIT  2 RIPPLE  3 BEAT  4 RADIAL  5 FIVE-OSC
- *   t / T      next / previous theme  (10 themes)
- *   TAB / BTAB select source (cycle forward / back)
- *   arrows     move selected source by 1 cell
- *   n          add new source at centre   x   delete selected
- *   + / -      analytic: selected source wavelength  λ
- *              FDTD    : FDTD sub-steps per render frame
- *   f / F      selected source angular frequency  ω
- *   d / D      FDTD damping coefficient
- *   p          FDTD: drop a Gaussian impulse at centre
- *
- * BUILD
- *   gcc -std=c11 -O2 -Wall -Wextra physics/waves.c -o waves -lncurses -lm
- *
- * SCOPE NOTE
- *   This file is ~1500 lines — larger than the 250-450 phase-1 target —
- *   because it deliberately carries TWO engines + rich pedagogical
- *   commentary.  The contrast (numerical vs analytic, same physics, two
- *   solvers) IS the teaching value.  §4 (FDTD) and §6 (analytic) are
- *   independent ~80-line modules; §5 (sources) and §7 (scene) are the
- *   glue.  Splitting would lose the side-by-side comparison.
+ * References the code can't give you:
+ *   FDTD grid method        — Yee 1966; Taflove, "Computational Electrodynamics"
+ *   wave physics / optics    — Crawford "Waves"; Hecht "Optics"; Born & Wolf
+ *   ASCII intensity ramp     — Bourke, paulbourke.net/dataformats/asciiart
  */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * System architecture
- *
- *           USER KEYS / SIGNALS
- *                   |
- *                   v
- *          +------------------+
- *          |  App + main()    |   §9   signal-driven loop
- *          +--------+---------+
- *                   | owns
- *                   v
- *          +------------------+
- *          |  Scene           |   §7   ←─ the integration point
- *          +--+------+--------+
- *             |      |        \---- runs ----+
- *             v      v                       v
- *          Screen   Grid              Engine = FDTD or ANALYTIC
- *           §8      §4                       |
- *          ncurses  FDTD field      +--------+--------+
- *                                   |                 |
- *                                   v                 v
- *                            (reads from)        (reads from)
- *                            g_src[] §5          g_src[]   §5
- *                                                g_at      §6 phase cache
- *
- *   Scene OWNS Grid and Screen.  Source list (g_src[]) and analytic
- *   phase cache (g_at) are file-scope globals shared by both engines.
- *
- * Reading paths through this file
- *
- *   FIRST READ (the overview tour, ~5 min):
- *     this header → CONCEPTS → MENTAL MODEL → §1 config → §7 Scene struct
- *
- *   FDTD path  (how does the numerical PDE solver work?):
- *     §4 Grid struct → grid_tick orchestrator
- *       └─ laplacian_4point_cross  +  wave_central_difference_step
- *       └─ sweep_interior_with_central_diff
- *       └─ rotate_time_level_buffers
- *     §7 scene_fdtd_inject  →  tick_fdtd_engine
- *
- *   ANALYTIC path  (how does the closed-form solver work?):
- *     §5 Source struct  →  §6 AnalyticTable struct
- *     §6 analytic_recompute  →  analytic_field
- *     §7 tick_analytic_engine
- *
- *   RENDERING path  (how does drawing work?):
- *     §3 Theme  +  amplitude_level  +  level_attr   (signed glyph ramp)
- *     §7 paint_field_cell  →  scene_draw_field / scene_draw_sources
- *     §8 hud_draw  →  screen_draw  →  screen_present
- *
- *   UI / PRESETS path  (how do user keys reshape the simulation?):
- *     §5 source_* helpers  →  preset_apply  →  seed_double_slit / …
- *     §9 app_handle_key (m, 1-5, TAB, arrows, n, x, +/-, f/F, d/D, p)
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two solvers for the same scalar 2-D wave PDE.
- *                    (1) FDTD — explicit 2nd-order central differences:
- *                        u_new = 2·u − u_prev + C²·(Σ neighbours − 4u)
- *                        then multiplied by damping ∈ (0,1) to dissipate
- * energy. (2) ANALYTIC — closed-form Σ sin(ω t − k r + φ_0). k = 2π / (λ ·
- * CELL_W) ; r = pixel-space distance.
- *
- * Physics        : Linear scalar wave equation  ∂²u/∂t² = c² ∇²u.
- *                  Each source is a cylindrical Huygens emitter.
- *                  Superposition (linearity) gives interference patterns:
- *                  constructive when crests align (u ≈ N·A), destructive
- *                  when crest meets trough (u ≈ 0 → nodal lines).
- *
- * Stability      : FDTD only.  CFL: c·√2 ≤ 1 → c ≤ 0.707.
- *                  Here C_SPEED=0.45 → CFL=0.636 (stable margin).
- *                  Analytic is unconditionally stable — no time integration.
- *
- * Performance    : FDTD: O(W·H·STEPS) per render — STEPS sub-steps decouples
- *                  visual speed from CFL.  ~150 K ops at 200×60.
- *                  Analytic: O(N_active·W·H) per render — Σ sinf() per cell.
- *                  Phase table precomputed once per source-move amortises r.
- *
- * References     :
- *   ── Wave physics / interference ──────────────────────────────────
- *    [1] Crawford, F. S., "Waves", Berkeley Physics Course Vol. III
- *        (McGraw-Hill 1968).  Best intuitive intro to the linear scalar
- *        wave equation, superposition, beats, and standing waves.
- *    [2] Hecht, E., "Optics", 5th ed. (Pearson 2017), ch. 7 & 9 —
- *        Huygens-Fresnel principle, double-slit fringes, coherence;
- *        directly explains presets 1 (DBL-SLIT) and 2 (RIPPLE).
- *    [3] Born, M. & Wolf, E., "Principles of Optics", 7th ed. (CUP
- *        1999) — rigorous treatment of cylindrical-wave superposition
- *        underpinning the ANALYTIC engine.
- *    [4] Griffiths, D. J., "Introduction to Electrodynamics", 4th ed.
- *        ch. 9 — derivation of the scalar wave equation ∂²u/∂t² = c²∇²u.
- *
- *   ── FDTD / numerical PDE ─────────────────────────────────────────
- *    [5] Yee, K. S. (1966), "Numerical solution of initial boundary
- *        value problems involving Maxwell's equations in isotropic
- *        media", IEEE Trans. Antennas Propag. AP-14, pp. 302-307 —
- *        THE original FDTD paper; our explicit 2nd-order stencil is
- *        the scalar special case.
- *    [6] Taflove, A. & Hagness, S. C., "Computational Electrodynamics:
- *        The Finite-Difference Time-Domain Method", 3rd ed. (Artech
- *        2005) — the FDTD bible.
- *    [7] Strikwerda, J. C., "Finite Difference Schemes and Partial
- *        Differential Equations", 2nd ed. (SIAM 2004) — CFL stability
- *        theorems that justify the c·√2 ≤ 1 condition.
- *    [8] LeVeque, R. J., "Finite Difference Methods for ODEs and
- *        PDEs" (SIAM 2007) — explicit Euler / FDTD theory, energy
- *        conservation arguments for the damping multiplier.
- *
- *   ── Rendering / ncurses ──────────────────────────────────────────
- *    [9] Raymond, E. S., "NCURSES Programming HOWTO" —
- *        tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers the
- *        newscr/curscr diff model used in screen_draw and the
- *        init_pair / use_default_colors semantics for our themes.
- *   [10] Bourke, P. (1997), "Character representation of grayscale
- *        images", paulbourke.net/dataformats/asciiart — design of
- *        ASCII intensity ramps; the signed 8-level ramp
- *        ", . - ~ + * # @" was tuned by hand against Bourke's logic.
- *
- *   ── Online quick reference ───────────────────────────────────────
- *   [11] https://en.wikipedia.org/wiki/Finite-difference_time-domain_method
- *   [12] https://en.wikipedia.org/wiki/Huygens%E2%80%93Fresnel_principle
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- *   The same physics can be computed by stepping a grid (FDTD) or by summing
- *   sinusoids (ANALYTIC).  The grid solver KNOWS NOTHING about its sources
- *   except where they inject energy each tick; it produces interference as
- *   an emergent consequence of wave propagation.  The analytic solver
- *   computes the field exactly from the source list — no field state exists.
- *
- * ALGORITHM IN STEPS  (per render frame)
- *   FDTD mode:
- *     1. for sub_i in [0, STEPS):
- *          - for each active source: u_cur[src_xy] += A·sin(ω·t + φ_0)
- *          - for each inner cell: u_new = 2u − u_prev + C²·(Σ neighbours − 4u)
- *          - u_new *= damping; rotate (prev,cur,next)
- *          - t += 1/STEPS
- *     2. draw cells using amplitude_to_glyph(u_cur)
- *
- *   ANALYTIC mode:
- *     1. if any source moved: recompute kphase[s][r][c] = k_s·dist(s,r,c) −
- * φ_0s
- *     2. t += 1
- *     3. for each cell: u = Σ_s sin(ω_s · t − kphase[s][r][c])
- *     4. draw cell using amplitude_to_glyph(u / N_active)
- *
- * KEY FORMULAS
- *   FDTD inject       : u[src] += A·sin(ω t + φ_0)
- *   FDTD step         : u_new = (2u − u_prev + C²·∇²u) · damping
- *   FDTD CFL          : c·√2 ≤ 1
- *   Analytic field    : u(x,y,t) = Σ_s sin(ω_s t − k_s r_s + φ_0s)
- *   Wave number       : k = 2π / λ_pixels
- *   Aspect-corrected r: r² = (Δx·CELL_W)² + (Δy·CELL_H)²
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -226,80 +32,70 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
-/* What you get: every tunable constant in one place — magic numbers
- *               are banned in the code below.  Most defaults trade off
- *               smoothness vs CPU cost (FDTD substeps, render fps) or
- *               vs visual range (lambda, omega).                        */
+/* ── §1 config ── */
+/* Every knob lives here so there are no mystery numbers further down. */
 
-/* Terminal cell pixel dimensions (project convention) — used for aspect
- * correction when computing source-to-cell distance in the analytic engine. */
+/* A terminal cell is taller than it is wide. These are its pixel size, used
+ * so ripples come out round instead of squashed in the analytic engine. */
 #define CELL_W 8
 #define CELL_H 16
 
-/* Field caps (clamped at runtime to terminal extent) */
+/* Biggest field we'll ever allocate (the real size is clamped to the window). */
 #define GRID_W_MAX 300
 #define GRID_H_MAX 100
 
-/* HUD layout (per CLAUDE.md): row 0 right-aligned status, row 1 left
- * parameter readouts, row rows-1 left-aligned hint. */
+/* How many rows the HUD steals: two at the top, one at the bottom. */
 #define HUD_ROWS_TOP 2
 #define HUD_ROWS_BOT 1
 
-/* ── FDTD engine ────────────────────────────────────────────────────── */
-#define C_SPEED 0.45f /* cells/tick; CFL: c·√2 ≤ 1 → ≤ 0.707  */
+/* ── FDTD engine ── */
+#define C_SPEED 0.45f /* wave speed in cells/tick; staying under 0.707 keeps it stable */
 #define C_SQ (C_SPEED * C_SPEED)
 #define DAMPING_DEF 0.993f
 #define DAMPING_STEP 0.002f
 #define DAMPING_MIN 0.960f
 #define DAMPING_MAX 0.999f
-#define FDTD_STEPS_DEF 4 /* sub-steps per render frame */
+#define FDTD_STEPS_DEF 4 /* tiny physics steps run per drawn frame */
 #define FDTD_STEPS_MIN 1
 #define FDTD_STEPS_MAX 16
 #define SOURCE_AMP 3.0f
 #define IMPULSE_AMP 6.0f
 #define IMPULSE_RADIUS 3
 
-/* ── Analytic engine ────────────────────────────────────────────────── */
-#define OMEGA_DEF 0.15f /* rad per render-frame; ~42 frames/cycle */
+/* ── Analytic engine ── */
+#define OMEGA_DEF 0.15f /* how fast a source cycles, in radians per frame */
 #define OMEGA_STEP 0.01f
-#define LAMBDA_DEF 20.0f /* wavelength in columns */
+#define LAMBDA_DEF 20.0f /* wavelength, measured in columns */
 #define LAMBDA_STEP 2.0f
 #define LAMBDA_MIN 6.0f
 #define LAMBDA_MAX 60.0f
 
-/* ── Shared rendering ───────────────────────────────────────────────── */
-#define MAX_AMP 4.0f    /* normalisation ceiling for FDTD */
-#define ZERO_BAND 0.06f /* |u/MAX| < this → blank (nodal lines show) */
-#define N_LEVELS 4      /* ramp tiers per sign */
-#define N_FIELD_CP 8    /* 4 trough + 4 crest pairs */
+/* ── Shared rendering ── */
+#define MAX_AMP 4.0f    /* what counts as "full height" when picking a glyph */
+#define ZERO_BAND 0.06f /* heights this close to flat are left blank, so still water (nodal lines) shows */
+#define N_LEVELS 4      /* glyph steps per side (crest or trough) */
+#define N_FIELD_CP 8    /* 4 trough colours + 4 crest colours */
 #define N_THEMES 10
 #define N_SRC_MAX 8
 
-/* ── Colour pair indices ────────────────────────────────────────────── */
+/* ── Colour pair slots ── */
 enum {
-  CP_FIELD0 = 1, /* trough levels 0..3 (faintest → strongest) ... */
+  CP_FIELD0 = 1, /* the 8 field colours: 0-3 troughs, 4-7 crests */
   CP_FIELD7 = CP_FIELD0 + N_FIELD_CP - 1,
-  CP_HUD,     /* top status row 0 + param row 1                 */
-  CP_HINT,    /* bottom hint row rows-1                         */
-  CP_SRC_SEL, /* selected source marker                         */
-  CP_SRC_OFF, /* unselected source marker                       */
+  CP_HUD,     /* HUD text (status + params) */
+  CP_HINT,    /* bottom key hint */
+  CP_SRC_SEL, /* the source you're currently editing */
+  CP_SRC_OFF, /* every other source */
 };
 
-/* ── Timing ─────────────────────────────────────────────────────────── */
+/* ── Timing ── */
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define RENDER_FPS 30
 #define RENDER_NS (NS_PER_SEC / RENDER_FPS)
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
-/* What you get: monotonic ns clock + sleep wrapper.  Used only by the
- *               main loop in §9 for frame timing.  Nothing here is
- *               algorithm-specific — pure boilerplate.                  */
+/* ── §2 clock ── */
+/* Read the time and sleep. Only the main loop uses these, for frame timing. */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -314,50 +110,36 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
-/* What you get: 10 named themes (k_themes[]), the signed amplitude →
- *               (glyph + colour-pair + attr) mapping used by every cell
- *               painter, and the colour-pair indices.  Themes touch
- *               ONLY the field pairs — HUD pairs are fixed yellow/cyan
- *               so the readout always wins legibility.                  */
+/* ── §3 color ── */
+/* The 10 named colour schemes, the glyph-and-colour ramp for a wave height,
+ * and theme switching. Themes only recolour the water; the HUD stays a fixed
+ * bright yellow/cyan so it's always readable. */
 
 /*
- * Theme — palette bundle for ONE of the 10 named looks (MATRIX, FIRE, …).
+ * Theme — one of the 10 named colour schemes (MATRIX, FIRE, ...).
  *
- * Intent
- *   Each theme defines exactly the 8 colour pairs in the signed FIELD
- *   ramp (CP_FIELD0 .. CP_FIELD7): four trough tiers (indices 0-3,
- *   "cool / receding") and four crest tiers (indices 4-7, "warm /
- *   emerging").  The HUD pairs (CP_HUD bright-yellow, CP_HINT bright-
- *   cyan) are NOT themed — they stay maximally legible against any
- *   field animation, per CLAUDE.md HUD spec.
+ * Each theme colours the 8 height levels: the four trough colours (the wave
+ * dipping below flat) and the four crest colours (rising above it). It does
+ * NOT touch the HUD colours — those are kept a loud yellow/cyan on purpose so
+ * the readout stays legible over any animation.
  *
- * Why two palette tracks
- *   fg256 holds 256-colour cube/gray indices used when COLORS >= 256.
- *   fg8_neg / fg8_pos are the SINGLE colour applied to all four trough
- *   tiers / all four crest tiers respectively on 8-colour terminals.
- *   The two-bucket fallback is intentional — 8-colour systems can't
- *   show four distinct trough intensities, so we pick a sign-meaningful
- *   pair (e.g. blue troughs, cyan crests) and let the glyph ramp
- *   communicate intensity instead.
+ * Two colour tracks because not every terminal is the same:
+ *   - fg256 is the nice 256-colour version (one shade per level).
+ *   - fg8_neg / fg8_pos are the fallback for old 8-colour terminals, which
+ *     can't show four shades — so all troughs share one colour, all crests
+ *     another, and the glyph shape carries the intensity instead.
  *
- * Brightness rule (CLAUDE.md "Theme Palette Brightness")
- *   Every fg256[i] is kept ≥ 24 in the cube range so even the faintest
- *   tier stays visible.  Cube indices 16-23 / gray 232-239 read as
- *   black against the terminal's default background.
+ * Every fg256 value is kept fairly bright (>= 24); the darkest cube/gray
+ * colours would just read as black on a default terminal background.
  *
- * References
- *   [9]  Raymond, "NCURSES Programming HOWTO" — init_pair() semantics.
- *   [10] Bourke, "Character representation of grayscale images" — the
- *        glyph ramp ", . - ~ + * # @" pairs with these colour tiers.
+ * The glyph ramp ", . - ~ + * # @" that pairs with these colours follows
+ * Bourke's classic ASCII-grayscale design.
  */
 typedef struct {
-  const char *name;        /* short ASCII label shown in HUD     */
-  short fg256[N_FIELD_CP]; /* 8 indices: [0..3]=trough,[4..7]=crest */
-  short fg8_neg;           /* fallback colour for all trough tiers  */
-  short fg8_pos;           /* fallback colour for all crest tiers   */
+  const char *name;        /* short label shown in the HUD */
+  short fg256[N_FIELD_CP]; /* 256-colour shades: [0..3] troughs, [4..7] crests */
+  short fg8_neg;           /* 8-colour fallback: the one trough colour */
+  short fg8_pos;           /* 8-colour fallback: the one crest colour */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -385,11 +167,8 @@ static const Theme k_themes[N_THEMES] = {
      COLOR_WHITE},
 };
 
-/*
- * 8-level signed glyph ramp.
- *   troughs:  ',' '.' '-' '~'   (hollow / receding)
- *   crests :  '+' '*' '#' '@'   (solid  / emerging)
- */
+/* The eight glyphs, faint to bold. The first four are for dips below flat,
+ * the last four for peaks above it. */
 static const char k_field_chars[N_FIELD_CP] = {',', '.', '-', '~',
                                                '+', '*', '#', '@'};
 
@@ -412,12 +191,10 @@ static void color_init(int theme) {
   theme_apply(theme);
 }
 
-/*
- * amplitude_level — map normalised u ∈ [−1, 1] to ramp index.
- *   |u| ≤ ZERO_BAND  → −1 (draw nothing; background shows nodal lines)
- *   u < 0            → trough tier 0..3
- *   u > 0            → crest  tier 4..7
- */
+/* Turn a height (between -1 and 1) into which glyph to draw. Almost-flat water
+ * returns -1, meaning "leave it blank" — that's how the calm still lines
+ * between ripples show up. Below flat picks a trough glyph, above flat picks a
+ * crest glyph, brighter the further from flat. */
 static int amplitude_level(float u_norm) {
   if (u_norm > 1.f)
     u_norm = 1.f;
@@ -440,61 +217,47 @@ static attr_t level_attr(int lv) {
   return a;
 }
 
-/* ===================================================================== */
-/* §4  fdtd-grid                                                          */
-/* ===================================================================== */
-/* What you get: the FDTD engine's field state (Grid struct) and ONE
- *               update step (grid_tick).  Self-contained — this section
- *               knows nothing about sources, themes, or rendering.
- *               grid_tick is a pseudocode orchestrator over 4 named
- *               helpers (Laplacian, central-diff, sweep, rotate).       */
+/* ── §4 fdtd-grid ── */
+/* The honest simulation: a grid of water-height cells we step forward in
+ * time. This section only knows about the grid itself — not about wave
+ * sources, colours, or drawing. grid_tick does one step by calling four
+ * small helpers in order. */
 
 /*
- * Grid — FDTD field state, three time levels stored explicitly.
+ * Grid — the water surface for the simulation, kept as three snapshots in time.
  *
- * Intent
- *   The wave equation ∂²u/∂t² = c²∇²u is 2nd-order in time, so the
- *   explicit central-difference scheme needs THREE adjacent slices to
- *   compute the next one:
- *      u_new = 2·u − u_prev + C²·∇²u
- *   We allocate three buffers and ROTATE pointers each step rather than
- *   copying data — the slots cycle prev ← cur ← next, scratch becomes
- *   the new `next`.  See [5] Yee 1966; [6] Taflove §3.6.
+ * To work out the next instant of the water, you need to know not just where
+ * the surface is now, but where it was a moment ago — that's how you tell
+ * which way each point is moving. So we keep three full copies: the surface a
+ * moment ago, the surface now, and the new surface we're writing.
  *
- * Why pointer rotation instead of memcpy
- *   Rotating three pointers is O(1) per step vs O(W·H) for memcpy.
- *   On a 300×100 grid that's 30 000 cells avoided × FDTD_STEPS substeps
- *   × 30 fps ≈ 3.6 M cells/s saved.
+ * When a step finishes we don't copy the data around — we just relabel the
+ * three buffers (a moment ago ← now ← new), which is instant no matter how big
+ * the grid is. The classic grid method for waves (Yee 1966; Taflove §3.6).
  *
- * Why damping lives here (not in Scene)
- *   damping is a per-Grid setting (the user adjusts it with d/D in
- *   FDTD mode and it has no meaning in analytic mode).  Multiplied
- *   into u_new each step, amplitude decays as damping^N over N steps —
- *   converts boundary reflections from a permanent "box mode" into a
- *   slow energy bleed.  See [8] LeVeque §1.6 on stability via
- *   numerical dissipation.
+ * Fields:
+ *   prev, cur, next — the three snapshots (a moment ago / now / being written).
+ *                     Each is a flat cols×rows array, stored row by row.
+ *   cols, rows      — grid size in cells.
+ *   damping         — how fast ripples fade, a touch below 1.0. Each step
+ *                     multiplies the surface by this, so energy slowly bleeds
+ *                     away instead of bouncing around the box forever. The
+ *                     user nudges it with d/D in FDTD mode; it means nothing
+ *                     in analytic mode, which is why it lives on the grid and
+ *                     not on the scene.
  *
- * Memory note
- *   The three buffers are calloc'd once at scene_init (and reallocated
- *   only on SIGWINCH).  The hot path makes no allocations.
+ * The three buffers are allocated once at startup (and again only on a window
+ * resize). Nothing here allocates while running.
  */
 typedef struct {
-  /* ── Three time levels of the central-difference scheme ───────── *
-   * Indexed row-major y*cols + x.  prev = u(t-Δt), cur = u(t),      *
-   * next = u(t+Δt) being written this step.  Pointers ROTATE each  *
-   * step (no data copy).                                            */
-  float *prev;
-  float *cur;
-  float *next;
+  float *prev; /* the surface a moment ago */
+  float *cur;  /* the surface right now */
+  float *next; /* the new surface being written this step */
 
-  /* ── Grid extent in cells ─────────────────────────────────────── */
   int cols;
   int rows;
 
-  /* ── Per-step amplitude multiplier ∈ (DAMPING_MIN, DAMPING_MAX)  *
-   * Applied to u_new every FDTD step; damping^N ≈ 0.5 sets the     *
-   * half-life of an injected pulse.                                 */
-  float damping;
+  float damping; /* per-step fade factor, just under 1.0 */
 } Grid;
 
 static void grid_alloc(Grid *g, int cols, int rows) {
@@ -527,28 +290,27 @@ static void grid_resize(Grid *g, int cols, int rows) {
   g->damping = d;
 }
 
-/* 4-point cross Laplacian at interior cell i:
- *   ∇²u ≈ u_E + u_W + u_N + u_S − 4·u_C
- * Grid spacing h = 1 cell, absorbed into the stability number C².
- * Refs [5] Yee 1966; [6] Taflove §3.6. */
+/* How curved the surface is at one cell: compare it to its four neighbours.
+ * If they're all higher, the cell is in a dip and will get pushed up; if all
+ * lower, it'll get pushed down. This bulge-or-dip number is what makes ripples
+ * spread. (Yee 1966; Taflove §3.6.) */
 static inline float laplacian_4point_cross(const float *u, int i, int north_i,
                                            int south_i) {
   return u[i + 1] + u[i - 1] + u[north_i] + u[south_i] - 4.f * u[i];
 }
 
-/* Central-difference time step for the scalar wave equation:
- *   u_new = 2·u_cur − u_prev + C²·∇²u
- * 2nd-order accurate in both time and space.  Refs [5] Yee 1966;
- * [8] LeVeque §1.4. */
+/* Work out where this cell will be a moment from now. Take where it is now,
+ * add how it's been moving (now minus a moment ago), and bend it by the
+ * bulge-or-dip number so ripples spread. This is the standard wave-equation
+ * step (Yee 1966; LeVeque §1.4). */
 static inline float wave_central_difference_step(float u_cur, float u_prev,
                                                  float laplacian, float csq) {
   return 2.f * u_cur - u_prev + csq * laplacian;
 }
 
-/* Sweep all INTERIOR cells of the grid with the central-difference scheme
- * and multiply by the per-step damping factor.  Boundary rows/cols are
- * left at 0 → hard reflecting walls; damping converts what would be a
- * permanent box-mode standing wave into a slow energy bleed.            */
+/* Step every inside cell forward one tick and fade it a touch. The edge cells
+ * are left at zero, so they act like solid walls the waves bounce off; the
+ * fading stops those bounces from echoing around the box forever. */
 static void sweep_interior_with_central_diff(Grid *g) {
   const int cols = g->cols, rows = g->rows;
   const float csq = C_SQ;
@@ -568,9 +330,10 @@ static void sweep_interior_with_central_diff(Grid *g) {
   }
 }
 
-/* Rotate the three time-level pointers: prev ← cur ← next, scratch
- * becomes the new `next`.  Three-pointer cycle is O(1) vs O(W·H) for
- * an equivalent memcpy.  See Grid doc.                                  */
+/* Hand the three snapshots their new jobs: now becomes a-moment-ago, the
+ * freshly-written surface becomes now, and the old a-moment-ago is recycled as
+ * scratch for next time. Just swaps labels, so it's instant however big the
+ * grid is — no copying. See the Grid note. */
 static inline void rotate_time_level_buffers(Grid *g) {
   float *tmp = g->prev;
   g->prev = g->cur;
@@ -578,26 +341,16 @@ static inline void rotate_time_level_buffers(Grid *g) {
   g->next = tmp;
 }
 
-/*
- * grid_tick — ONE FDTD step of the scalar wave equation.
- *
- * Pseudocode:
- *   for each interior cell c:
- *     ∇²u ← 4-point cross Laplacian
- *     u_new[c] ← (2·u[c] − u_prev[c] + C²·∇²u) · damping
- *   rotate time-level buffers (prev ← cur ← next)
- */
+/* One step of the simulation: work out the next surface for every inside cell,
+ * then shuffle the three snapshots along so "now" points at the new surface. */
 static void grid_tick(Grid *g) {
   sweep_interior_with_central_diff(g);
   rotate_time_level_buffers(g);
 }
 
-/*
- * grid_impulse — Gaussian blob centred at (cx, cy).
- * Initial conditions: set both cur and prev to the same blob so the wave
- * starts at rest with non-zero amplitude.  (If only cur is set with prev=0,
- * the first step gives velocity 2·cur — not what we want.)
- */
+/* Plop a soft round bump into the water at (cx, cy) — like dropping a pebble.
+ * We poke the same bump into both "now" and "a moment ago" so the water starts
+ * still and then falls, instead of being flung upward on the very first step. */
 static void grid_impulse(Grid *g, int cx, int cy) {
   int R = IMPULSE_RADIUS;
   for (int dy = -R; dy <= R; dy++) {
@@ -614,74 +367,57 @@ static void grid_impulse(Grid *g, int cx, int cy) {
   }
 }
 
-/* ===================================================================== */
-/* §5  sources                                                            */
-/* ===================================================================== */
-/* What you get: the Source struct (shared by BOTH engines), the global
- *               g_src[] array + g_nactive + g_selected, the source-
- *               editing helpers (add/delete/move/select), and the 5
- *               preset seeders (double-slit, ripple, beat, radial,
- *               five-oscillator) dispatched by preset_apply.            */
+/* ── §5 sources ── */
+/* A "source" is a point that makes waves, like a finger tapping the water.
+ * Both engines read the same list of sources, so the picture matches. This
+ * section has the Source struct, the list of sources, the helpers to
+ * add/delete/move/pick one, and the 5 presets that arrange them into the
+ * famous setups (double-slit, ripple tank, beat, radial, five-oscillator). */
 
 /*
- * Source — one coherent cylindrical point emitter, shared by BOTH engines.
+ * Source — one point that makes waves, like a finger dipping into the water
+ * over and over at a steady beat. Both engines read the same source list, so
+ * a preset looks the same whichever engine is drawing it. (The analytic engine
+ * is just what the honest simulation settles into; Born & Wolf §8.6.)
  *
- * Intent
- *   The FDTD inject step and the analytic field sum read THE SAME
- *   N_SRC_MAX-element g_src[] array.  Keeping one schema means presets
- *   look the same in both engines — the analytic version is the exact
- *   limit of the FDTD version as Δt → 0.
+ * Position (x, y) is in grid cells inside the water area, not pixels and not
+ * counted from the top-left of the terminal. The two engines use the position
+ * differently: the simulation rounds it to a whole cell and taps that cell; the
+ * analytic engine measures the real distance from the source to each cell
+ * (stretched to match the cell's tall shape, so the rings come out round).
  *
- * Coordinate convention
- *   x, y are CELL coordinates inside the field rect (NOT pixel, NOT
- *   terminal-relative).  The field rect starts at row HUD_ROWS_TOP and
- *   is gw×gh cells.  Each engine maps these to its own draw position:
- *     FDTD     → integer (int)x, (int)y as the cell to inject into
- *     ANALYTIC → real distance r_s(c,r) = √((Δx·CELL_W)² + (Δy·CELL_H)²)
- *                aspect-corrected so cylindrical wavefronts look round
- *                instead of vertically stretched [3] Born & Wolf §8.6.
+ * omega is "how fast it cycles," measured per drawn frame — NOT per tiny
+ * physics step. The simulation divides it down internally so a source completes
+ * the same amount of cycle per frame no matter how many physics steps run. That
+ * way the waves look the same speed when you switch engines or change steps.
  *
- * Why omega is in render-frame units
- *   ω is rad PER RENDER FRAME (not per FDTD substep).  In FDTD mode
- *   scene_fdtd_inject scales by 1/fdtd_steps internally so the source
- *   completes ω of phase per render frame regardless of fdtd_steps.
- *   This keeps the VISIBLE frequency identical when the user toggles
- *   engines or adjusts steps — the engine-toggle invariant.
+ * Two phase fields because they play different roles:
+ *   phase_init  the source's fixed head-start, set by the preset (the radial
+ *               preset spaces these out to make the rotating star). Both
+ *               engines read it.
+ *   phase_run   a running clock the simulation advances every step. It starts
+ *               at phase_init. The analytic engine ignores it — it works the
+ *               phase out straight from the source position and time.
  *
- * Why two phase fields
- *   phase_init is the FIXED offset set by the preset (the radial-star
- *   preset gives source i an offset 2π·i/N to produce the rotation
- *   symmetry).  Read by BOTH engines:
- *     FDTD     uses phase_run as a running accumulator, initialised to
- *              phase_init at preset load
- *     ANALYTIC reads phase_init as the −φ_0 term in sin(ωt − kr + φ_0)
- *   phase_run is FDTD-only working state — kept on Source so each
- *   source carries its own phase clock through preset switches.
- *
- * Why lambda is analytic-only
- *   FDTD's spatial wavelength is implicitly determined by ω and the
- *   wave speed C_SPEED.  lambda is consumed only by the analytic engine
- *   via k = 2π / (λ · CELL_W).  Adjusting lambda while in FDTD mode is
- *   harmless but invisible — hence +/- has engine-dependent semantics
- *   in app_handle_key.
- *
- * Reference [3] Born & Wolf §8.6 — cylindrical-wave superposition.
+ * lambda (wavelength, in columns) is only used by the analytic engine. The
+ * simulation's wavelength is decided for it by omega and the wave speed, so
+ * changing lambda in simulation mode does nothing visible — that's why +/- mean
+ * different things in the two engines (see app_handle_key).
  */
 typedef struct {
-  /* ── Geometry inside the field rect ──────────────────────────── */
-  float x; /* cell column, 0 .. gw                       */
-  float y; /* cell row,    0 .. gh                       */
+  /* Where the source sits, in grid cells inside the water area. */
+  float x; /* column, 0 .. gw */
+  float y; /* row,    0 .. gh */
 
-  /* ── Frequency and wavelength (engine-dependent meaning) ─────── */
-  float omega;  /* rad / render frame     (both engines)      */
-  float lambda; /* wavelength in columns  (analytic only)     */
+  /* How fast and how wide the waves are. */
+  float omega;  /* cycle speed, per drawn frame (both engines)        */
+  float lambda; /* wavelength in columns       (analytic engine only) */
 
-  /* ── Phase bookkeeping ─────────────────────────────────────── */
-  float phase_init; /* fixed offset set by preset                 */
-  float phase_run;  /* FDTD running phase (advances each substep) */
+  /* Phase = where in its cycle the source is. */
+  float phase_init; /* fixed head-start from the preset             */
+  float phase_run;  /* running clock the simulation advances (sim)  */
 
-  /* ── Lifecycle ──────────────────────────────────────────────── */
-  bool active; /* toggled by source_add / source_delete      */
+  bool active; /* is this source currently switched on? */
 } Source;
 
 static Source g_src[N_SRC_MAX];
@@ -749,10 +485,9 @@ static void source_move(int dc, int dr, int gw, int gh) {
     s->y = (float)(gh - 1);
 }
 
-/* Preset 1 — DOUBLE SLIT.  Two coherent, in-phase sources on a vertical
- * line in the left quarter; the right half displays the classic hyperbolic
- * nodal/antinodal fringe pattern of Young's double-slit experiment.
- * Ref [2] Hecht ch. 9. */
+/* Preset 1 — DOUBLE SLIT. Two sources side by side on the left, beating in
+ * step. Their ripples cross on the right and form bright and dark stripes —
+ * Young's famous two-slit experiment (Hecht ch. 9). */
 static inline void seed_double_slit(int gw, int gh, float omega, float lambda) {
   float cy = (float)gh * 0.5f;
   float x = (float)gw * 0.28f;
@@ -761,10 +496,9 @@ static inline void seed_double_slit(int gw, int gh, float omega, float lambda) {
   source_add(x, cy + sep * 0.5f, omega, lambda, 0.f);
 }
 
-/* Preset 2 — RIPPLE TANK.  Four corner emitters, same frequency and phase.
- * The linear superposition Σ sin(ωt − kr_i) produces a 4-fold cross-hatch
- * fringe pattern — the geometry of mechanical ripple tanks used in optics
- * teaching labs.  Ref [1] Crawford ch. 4. */
+/* Preset 2 — RIPPLE TANK. One source in each corner, all in step. Their
+ * ripples overlap into a criss-cross grid — like the water tanks used to teach
+ * waves (Crawford ch. 4). */
 static inline void seed_ripple_tank(int gw, int gh, float omega, float lambda) {
   float cx = (float)gw * 0.5f, cy = (float)gh * 0.5f;
   float rx = (float)gw * 0.32f, ry = (float)gh * 0.30f;
@@ -774,10 +508,9 @@ static inline void seed_ripple_tank(int gw, int gh, float omega, float lambda) {
   source_add(cx + rx, cy + ry, omega, lambda, 0.f);
 }
 
-/* Preset 3 — BEAT.  Two sources with Δω/ω ≈ 15%.  Trig identity:
- *   sin(ω₁ t) + sin(ω₂ t) = 2 cos((Δω/2)·t) · sin(ω̄·t)
- * gives a slowly-drifting amplitude envelope at frequency Δω/2 — the
- * classic beat phenomenon.  Ref [1] Crawford ch. 1. */
+/* Preset 3 — BEAT. Two sources cycling at slightly different speeds. They drift
+ * in and out of step, so the combined wave swells loud then fades quiet over
+ * and over — the "beat" you hear from two almost-tuned strings (Crawford ch. 1). */
 static inline void seed_beat(int gw, int gh, float omega, float lambda) {
   float cy = (float)gh * 0.5f;
   float x0 = (float)gw * 0.30f, x1 = (float)gw * 0.70f;
@@ -785,15 +518,14 @@ static inline void seed_beat(int gw, int gh, float omega, float lambda) {
   source_add(x1, cy, omega * 1.15f, lambda, 0.f);
 }
 
-/* Preset 4 — RADIAL STAR.  Six sources equally spaced around an aspect-
- * corrected ellipse (Ry = R/2 to undo the terminal's 2:1 cell aspect
- * ratio) with progressive phase offsets 2π·i/6.  Yields a 6-fold radial
- * standing-wave pattern from rotational interference symmetry.  Refs
- * [3] Born & Wolf §8.6. */
+/* Preset 4 — RADIAL STAR. Six sources spaced evenly around a ring, each given a
+ * small head-start so the pattern spins. The result is a six-armed star of
+ * standing ripples (Born & Wolf §8.6). The ring is squashed vertically because
+ * terminal cells are tall, so it ends up looking round. */
 static inline void seed_radial_star(int gw, int gh, float omega, float lambda) {
   float cx = (float)gw * 0.5f, cy = (float)gh * 0.5f;
   float R = fminf(cx, cy) * 0.55f;
-  float Ry = R * 0.5f; /* aspect correction */
+  float Ry = R * 0.5f; /* squash vertically so the ring looks round */
   const int N = 6;
   for (int i = 0; i < N; i++) {
     float a = (float)i * 2.f * (float)M_PI / (float)N;
@@ -802,10 +534,9 @@ static inline void seed_radial_star(int gw, int gh, float omega, float lambda) {
   }
 }
 
-/* Preset 5 — FIVE OSCILLATOR.  Four corners + centre with five slightly
- * detuned frequencies (0.190..0.260 rad/frame) straddling a common
- * value.  Adjacent pairs beat slowly against each other, producing a
- * complex never-quite-repeating fringe pattern across the whole grid. */
+/* Preset 5 — FIVE OSCILLATOR. Four corners plus the centre, each cycling at a
+ * slightly different speed. Every pair beats slowly against its neighbours, so
+ * the whole pool shifts around and never quite repeats. */
 static inline void seed_five_oscillator_grid(int gw, int gh, float lambda) {
   const float fx[5] = {0.22f, 0.78f, 0.50f, 0.22f, 0.78f};
   const float fy[5] = {0.25f, 0.25f, 0.50f, 0.75f, 0.75f};
@@ -814,20 +545,7 @@ static inline void seed_five_oscillator_grid(int gw, int gh, float lambda) {
     source_add(fx[i] * (float)gw, fy[i] * (float)gh, freq[i], lambda, 0.f);
 }
 
-/*
- * preset_apply — clear g_src[] and reseed it with one of 5 named
- * interference configurations.  Each seeder is named after the physics
- * it demonstrates; preset_apply itself is just the dispatcher.
- *
- * Pseudocode:
- *   clear all sources
- *   dispatch on p:
- *     1 → seed_double_slit
- *     2 → seed_ripple_tank
- *     3 → seed_beat
- *     4 → seed_radial_star
- *     else → seed_five_oscillator_grid
- */
+/* Wipe the sources and lay out one of the five named setups. */
 static void preset_apply(int p, int gw, int gh) {
   source_clear_all();
   const float o = OMEGA_DEF;
@@ -852,57 +570,36 @@ static void preset_apply(int p, int gw, int gh) {
   }
 }
 
-/* ===================================================================== */
-/* §6  analytic field                                                     */
-/* ===================================================================== */
-/* What you get: the analytic engine — closed-form Σ sin(ωt − kr + φ_0).
- *               AnalyticTable caches the time-independent (k·r − φ_0)
- *               term per source per cell so the per-frame field-eval
- *               drops to ONE sinf() per active source per cell.         */
+/* ── §6 analytic field ── */
+/* The shortcut engine. Instead of simulating water, it just adds up the sine
+ * waves coming from each source at every cell. No grid, instant, always stable.
+ * AnalyticTable below saves the slow part of that sum so each frame is cheap. */
 
 /*
- * AnalyticTable — precomputed phase cache for the analytic engine.
+ * AnalyticTable — a saved-answers table for the shortcut engine.
  *
- * Intent
- *   The analytic field at cell (r,c) and time t is:
+ * For each source and cell, the wave height is a sine of two things added: a
+ * part that changes with time (how far the source has cycled) and a part that
+ * doesn't (how far the cell is from the source, plus the source's head-start).
+ * Only the time part changes between frames, so we work out the unchanging part
+ * once and stash it here. Then drawing a frame is just one sine per source per
+ * cell — fast. (Adding waves up like this is Born & Wolf §8.6.)
  *
- *      u(r,c,t)  =  Σ_s  sin( ω_s · t  −  k_s · r_s(c,r)  +  φ_0s )
+ * We rebuild the table only when a source actually moves or changes, which only
+ * happens when you press a key — so the rebuild cost is invisible.
  *
- *   The term [k_s · r_s − φ_0s] depends only on the source's position,
- *   wavelength, and phase offset — NOT on time.  Cache it once per
- *   source-move and per-frame cost drops to ONE sinf() per active
- *   source per cell:
- *
- *      u(r,c,t)  =  Σ_s  sin( ω_s · t  −  kphase[s][r][c] )
- *
- *   This is a textbook lookup-table-vs-recomputation trade in
- *   superposition computation.  See [3] Born & Wolf §8.6.
- *
- * Why BSS storage
- *     N_SRC_MAX × GRID_H_MAX × GRID_W_MAX × sizeof(float)
- *       = 8 × 100 × 300 × 4  =  960 KB
- *   Free in BSS — zero-cost allocation, lazily paged in.  Mallocing
- *   this on every source-move would cost a real syscall.  CLAUDE.md
- *   "No dynamic allocation after init" — this is exactly the use case.
- *
- * Why a single dirty flag and not a per-source generation counter
- *   Invalidation is atomic: ANY source position / lambda / active /
- *   phase change rebuilds the WHOLE table.  We never rebuild a subset,
- *   so a single bool is sufficient.  Source editing (Tab + arrows + n
- *   + x + +/- + f/F) is human-scale interactive — even at 30 events/s
- *   the full O(N_SRC · gw · gh) recompute is a few ms.
- *
- * Indexing
- *   [source][row][col] order — innermost iteration over col is unit
- *   stride and matches the scene_draw_field row-major scan order, so
- *   the hot read in analytic_field() is cache-friendly.
+ * The table is a plain global array (about 960 KB) rather than something we
+ * malloc, because the project rule is "no allocating once running" and a global
+ * costs nothing to set aside.
  */
 typedef struct {
-  /* Per-source-per-cell phase: kphase[s][r][c] = k_s·r_s(c,r) − φ_0s */
+  /* The saved unchanging part of each source's wave at each cell.
+   * Laid out [source][row][col] so scanning a row reads straight through
+   * memory, matching how the field is drawn. */
   float kphase[N_SRC_MAX][GRID_H_MAX][GRID_W_MAX];
 
-  /* If true, analytic_recompute() rebuilds the whole table at the
-   * start of the next scene_tick. */
+  /* Set when a source changed, telling the next frame to rebuild the table
+   * before it draws. One flag is enough because any change rebuilds it all. */
   bool dirty;
 } AnalyticTable;
 
@@ -936,31 +633,23 @@ static float analytic_field(int r, int c, float t) {
   return u;
 }
 
-/* ===================================================================== */
-/* §7  scene                                                              */
-/* ===================================================================== */
-/* What you get: Scene composes everything above + the Engine toggle.
- *               scene_tick drives the active engine (FDTD substeps OR
- *               analytic cache refresh).  scene_draw_field paints
- *               u(r,c) → glyphs through the shared paint_field_cell.
- *               This is where Source data, the FDTD Grid, and the
- *               AnalyticTable cache all meet.                           */
+/* ── §7 scene ── */
+/* Scene ties everything above together and owns the engine switch. scene_tick
+ * runs whichever engine is active; scene_draw_field turns the wave heights into
+ * glyphs. This is where the sources, the simulation grid, and the shortcut
+ * engine's table all meet. */
 
 /*
- * Engine — which solver computes u(x,y,t) for the current frame.
+ * Engine — which of the two ways we compute the water this frame.
  *
- *   ENGINE_FDTD     Explicit central-difference time stepping of the
- *                    scalar wave PDE.  Field state lives in Grid; the
- *                    bob of energy injected at a source propagates
- *                    outward at speed C_SPEED.  Subject to CFL [7].
- *                    Refs [5][6].
- *   ENGINE_ANALYTIC Closed-form Σ sin(ωt − kr + φ_0) per cell using
- *                    AnalyticTable as a phase cache.  No field state,
- *                    no time-stepping, unconditionally stable.  Refs
- *                    [2][3].
+ *   ENGINE_FDTD     The honest simulation: step a grid forward in time, ripples
+ *                   spreading and bouncing. Can blow up if pushed too fast,
+ *                   which is why the wave speed is kept low (Yee 1966; Taflove).
+ *   ENGINE_ANALYTIC The shortcut: add up the sine waves from each source. No
+ *                   grid, no stepping, never blows up (Hecht; Born & Wolf).
  *
- * Toggled by 'm'; the toggle clears Grid and resets each source's
- * phase_run so the two engines start from the same observable state.
+ * 'm' flips between them. The flip wipes the grid and resets each source's
+ * running clock so both engines start the picture from the same place.
  */
 typedef enum { ENGINE_FDTD = 0, ENGINE_ANALYTIC = 1 } Engine;
 
@@ -969,87 +658,44 @@ static const char *engine_name(Engine e) {
 }
 
 /*
- * Scene — the single owner of everything visible on screen.
+ * Scene — the one place that owns everything you see on screen.
  *
- * Intent
- *   Scene is the integration point between the SIMULATION (Grid plus
- *   the file-scope g_src[] and g_at, none of which know about a
- *   terminal) and the RENDERING (an ncurses surface that doesn't know
- *   about wave PDEs).  The two layers never talk directly — they meet
- *   here.  Anything that doesn't fit in Grid, Source, AnalyticTable,
- *   or Screen lives in Scene.
+ * It sits between the wave math (the grid, the source list, the shortcut table
+ * — none of which know a terminal exists) and the drawing (which doesn't know
+ * any wave physics). The two sides never talk to each other directly; they meet
+ * here. Anything that doesn't belong to the grid, a source, the table, or the
+ * screen lives in Scene.
  *
- * Locality (sim vs render)
- *   The fields below are EXPLICITLY GROUPED so a reader can tell at a
- *   glance which subsystem reads each one:
- *     - scene_tick reads it                 → simulation
- *     - scene_draw_field / scene_draw_sources / hud_draw reads it
- *                                          → rendering
- *     - both sides read it (gw, gh)        → geometry
- *
- *   Mis-classifying a field is a real source of bugs — a render-only
- *   value accidentally read by the tick would couple physics to the
- *   terminal extent, defeating the engine-toggle invariant ("same
- *   source list ⇒ same physics regardless of how it is drawn").
- *
- * Why these specific fields and no others
- *   - engine        Chooses backend in scene_tick AND branch in
- *                   scene_draw_field.  Toggling clears Grid + resets
- *                   source phase_run so visuals stay continuous.
- *   - grid          Allocated EVEN in analytic mode so engine toggle
- *                   is alloc-free.  See Grid doc.
- *   - t             Render-frame clock, read by BOTH engines:
- *                     FDTD     → scene_fdtd_inject phase argument
- *                     analytic → ω·t term in sin(ω·t − kphase)
- *   - gw, gh        Field rect in cells.  Simulation reads gw,gh in
- *                   analytic_recompute (sets the kphase extent).
- *                   Rendering reads them as clip bounds.
- *   - preset        Selects which preset_apply() row reset reloads;
- *                   also the label shown in HUD.
- *   - theme         Pure render — repaints colour pairs via
- *                   theme_apply() on cycle.  Survives engine toggle.
- *   - fdtd_steps    Sim tuning — substeps per render frame.
- *                   Meaningless in analytic mode (no time-stepping).
- *   - paused        Gate for scene_tick (no-op when set).
- *   - needs_redraw  Render-only flag that forces erase() on the next
- *                   frame after theme or engine change so stale field
- *                   glyphs don't linger.
- *
- * Things that DO NOT live here
- *   - Source list                → g_src[] (file-scope; both engines
- *                                   plus source_* helpers share it)
- *   - Analytic phase cache       → g_at (file-scope, 960 KB BSS)
- *   - Frame-timing accumulators  → locals in main()
- *   - Signal flags               → App
- *   - ncurses buffers            → owned by the library
- *
- * Reference [6] Taflove §3.6 on state ownership in FDTD implementations.
+ * The fields are grouped on purpose by who reads them — the simulation, the
+ * drawing, or both — because mixing them up causes real bugs. If a draw-only
+ * value (like the colour theme) crept into the simulation, switching engines or
+ * resizing the window could change the physics, which it must never do: the
+ * same source list should give the same waves no matter how they're coloured.
  */
 typedef struct {
-  /* ── Geometry  (shared by simulation AND rendering) ─────────── *
-   * Field rect in cells; gw × gh.  Updated only at scene_init and *
-   * scene_resize.  Both analytic_recompute (sim) and the draw     *
-   * functions (render) read these.                                */
+  /* ── Size, read by both sides ──
+   * The water area, gw columns by gh rows of cells. Set once at startup and on
+   * resize. The math uses it to know how big the field is; the drawing uses it
+   * to know where to stop. */
   int gw;
   int gh;
 
-  /* ── Simulation  (read by scene_tick) ──────────────────────── *
-   * The actual field state plus control flags that gate it.       *
-   * Engine selects the backend; preset is "control" but grouped   *
-   * here because it survives a theme change.                      */
+  /* ── Simulation, read by scene_tick ──
+   * The actual wave state plus the knobs that steer it. preset is really a
+   * control, but it lives here because it survives a colour change. */
   Engine engine;
   Grid grid;
-  float t;        /* render-frame clock                   */
-  int preset;     /* 1 .. 5; reset reloads this row       */
-  int fdtd_steps; /* FDTD substeps per render frame       */
-  bool paused;    /* if true scene_tick is a no-op        */
+  float t;        /* frame counter, ticks up once per drawn frame */
+  int preset;     /* which setup (1..5); reset reloads this one   */
+  int fdtd_steps; /* physics steps per drawn frame (sim only)     */
+  bool paused;    /* when true, the simulation holds still        */
 
-  /* ── Rendering  (read by scene_draw_field / hud_draw only) ──── *
-   * Pure user-visible choices.  Changing theme MUST NOT touch the *
-   * simulation — it only repaints colour pairs.  needs_redraw is  *
-   * a one-shot flag cleared by the next erase().                  */
-  int theme;         /* 0 .. N_THEMES-1; indexes k_themes[]  */
-  bool needs_redraw; /* forces erase() after theme/engine    */
+  /* ── Drawing, read by the draw and HUD functions ──
+   * Just look-and-feel choices. Changing the theme only recolours; it must not
+   * touch the simulation. needs_redraw is a one-shot "wipe the screen next
+   * frame" flag so old glyphs don't linger after a theme or engine change. */
+  int theme;         /* which colour scheme (0 .. N_THEMES-1) */
+  bool needs_redraw; /* force a full wipe on the next frame   */
 } Scene;
 
 static void scene_init(Scene *s, int term_cols, int term_rows) {
@@ -1113,11 +759,10 @@ static void scene_toggle_engine(Scene *s) {
   s->needs_redraw = true;
 }
 
-/*
- * FDTD inject: each active source adds A·sin(phase_run) to its cell, then
- * advances phase_run by ω/STEPS so the source completes ω rad of cycle per
- * render frame (matching the analytic engine's time base).
- */
+/* Tap each source's cell to keep its waves going, then nudge the source a
+ * little further along its cycle. The nudge is sized so the source covers the
+ * same amount of cycle per drawn frame however many physics steps run — that's
+ * what keeps the wave speed matched to the shortcut engine. */
 static void scene_fdtd_inject(Scene *s) {
   float dphase = 1.f / (float)s->fdtd_steps;
   for (int i = 0; i < N_SRC_MAX; i++) {
@@ -1135,11 +780,10 @@ static void scene_fdtd_inject(Scene *s) {
   }
 }
 
-/* Run one render-frame's worth of FDTD substeps.  Each substep injects
- * the active sources, then advances the wave one tick via grid_tick.
- * fdtd_steps decouples visual wavefront speed from the CFL stability
- * constraint — more substeps per render frame → faster-looking waves
- * without changing the per-step C².  See [6] Taflove §3.6.             */
+/* One drawn frame of the honest simulation: run several physics steps, each
+ * one tapping the sources then advancing the water. Running more steps per
+ * frame makes the waves look faster without speeding up any single step — which
+ * matters because a single step that's too fast makes the simulation blow up. */
 static void tick_fdtd_engine(Scene *s) {
   for (int i = 0; i < s->fdtd_steps; i++) {
     scene_fdtd_inject(s);
@@ -1147,30 +791,19 @@ static void tick_fdtd_engine(Scene *s) {
   }
 }
 
-/* The analytic engine has no field state to evolve — u(r,c,t) is
- * computed directly from sources every frame in scene_draw_field.  All
- * this tick has to do is REBUILD THE PHASE CACHE if a source moved
- * (source-editing keys set g_at.dirty).  See AnalyticTable doc.        */
+/* The shortcut engine has no water to step — it works out each cell straight
+ * from the sources when it draws. So all this does is rebuild the saved-answers
+ * table when a source has moved. See the AnalyticTable note. */
 static void tick_analytic_engine(Scene *s) {
   if (g_at.dirty)
     analytic_recompute(s->gw, s->gh);
 }
 
-/* Advance the render-frame clock that BOTH engines read:
- *   FDTD     → scene_fdtd_inject uses t for source phase
- *   ANALYTIC → analytic_field uses t as the ω·t term in sin(ω·t − kphase) */
+/* Tick the frame counter that both engines use to know how far time has moved. */
 static inline void advance_render_frame_clock(Scene *s) { s->t += 1.f; }
 
-/*
- * scene_tick — one render-frame of simulation work.
- *
- * Pseudocode:
- *   if paused → no-op
- *   dispatch on engine:
- *     FDTD     → run fdtd_steps substeps of (inject + grid_tick)
- *     ANALYTIC → rebuild phase cache if dirty
- *   advance the render-frame clock
- */
+/* One frame of wave work: run whichever engine is active, then move the clock.
+ * Does nothing while paused. */
 static void scene_tick(Scene *s) {
   if (s->paused)
     return;
@@ -1183,12 +816,9 @@ static void scene_tick(Scene *s) {
   advance_render_frame_clock(s);
 }
 
-/* Paint ONE field cell.  Maps the normalised amplitude u ∈ [-1, 1] to a
- * signed glyph + colour pair via amplitude_level → k_field_chars[] +
- * level_attr().  Level −1 (dead zone around u=0) leaves the cell blank
- * so nodal lines show through as background.  Display row is offset by
- * HUD_ROWS_TOP so the HUD rows stay clear.  Ref [10] Bourke for the
- * intensity-ramp design. */
+/* Draw one cell: pick a glyph and colour for its height, or leave it blank if
+ * the water there is basically flat (so the calm lines show). The row is shifted
+ * down so it doesn't draw over the HUD at the top. (Glyph ramp: Bourke.) */
 static inline void paint_field_cell(int field_r, int field_c, float u_norm) {
   int lv = amplitude_level(u_norm);
   if (lv < 0)
@@ -1200,9 +830,8 @@ static inline void paint_field_cell(int field_r, int field_c, float u_norm) {
   attroff(at);
 }
 
-/* FDTD field reader: row-major scan of grid.cur, normalised by MAX_AMP
- * because the FDTD field grows freely (bounded only by damping and CFL).
- * Inner loop is unit-stride and cache-friendly. */
+/* Draw the simulation's water: read each cell's height and scale it down to the
+ * -1..1 range the glyph picker wants (the simulation's heights can grow large). */
 static void paint_field_from_fdtd(Scene *s) {
   const float *cu = s->grid.cur;
   const int cols = s->grid.cols;
@@ -1213,10 +842,9 @@ static void paint_field_from_fdtd(Scene *s) {
   }
 }
 
-/* Analytic field reader: sums the N_active sinusoidal source
- * contributions per cell via analytic_field(), normalised by 1/N_active
- * so peak |u| stays ≈ 1 regardless of source count.  The spatial term
- * is served from the precomputed AnalyticTable cache. */
+/* Draw the shortcut engine's water: for each cell add up the wave from every
+ * source, then divide by the source count so the total never overshoots the
+ * -1..1 range no matter how many sources are switched on. */
 static void paint_field_from_analytic(Scene *s) {
   float norm = (g_nactive > 0) ? 1.f / (float)g_nactive : 1.f;
   for (int r = 0; r < s->gh; r++) {
@@ -1225,15 +853,8 @@ static void paint_field_from_analytic(Scene *s) {
   }
 }
 
-/*
- * scene_draw_field — render the gw × gh field rect at display origin
- * (HUD_ROWS_TOP, 0).  Engine selects which reader supplies u(r,c); the
- * glyph mapping is shared across engines.
- *
- * Pseudocode:
- *   if engine == FDTD     → paint_field_from_fdtd     (read grid.cur)
- *   else                  → paint_field_from_analytic (sum sinusoids)
- */
+/* Draw the whole water area, letting the active engine supply the heights.
+ * Both engines hand off to the same glyph-and-colour code. */
 static void scene_draw_field(Scene *s) {
   if (s->engine == ENGINE_FDTD)
     paint_field_from_fdtd(s);
@@ -1260,38 +881,25 @@ static void scene_draw_sources(Scene *s) {
   }
 }
 
-/* ===================================================================== */
-/* §8  screen                                                             */
-/* ===================================================================== */
-/* What you get: terminal extent (Screen struct), the three CLAUDE.md
- *               HUD rows (status row 0 right yellow + bold, params row
- *               1 left yellow, hint row rows-1 left cyan + bold), and
- *               the diff-buffer present pipeline.                       */
+/* ── §8 screen ── */
+/* The terminal size, the three HUD rows, and the one call per frame that pushes
+ * everything to the terminal. */
 
 /*
- * Screen — terminal-extent record.
+ * Screen — just the terminal's width and height in cells.
  *
- * Intent
- *   Screen is deliberately tiny.  The actual back-buffer (newscr) and
- *   front-buffer (curscr) live INSIDE ncurses; we only carry the cell
- *   dimensions so callers can place HUD rows and bound the field rect.
- *   A user-managed back-buffer would just duplicate ncurses's diff
- *   model with no improvement on flicker.
+ * It's tiny on purpose. ncurses keeps its own copy of the screen and works out
+ * what changed each frame, so we don't keep our own — we only need the size, to
+ * place the HUD rows and to know where the water area ends.
  *
- * Render pipeline (one frame)
- *   erase()              clears newscr in memory only, NO terminal I/O
- *   scene_draw_field     writes field glyphs → newscr
- *   scene_draw_sources   writes source markers → newscr
- *   hud_draw()           writes HUD rows → newscr (LAST so HUD wins
- *                        overlap with the field)
- *   wnoutrefresh(stdscr) marks newscr ready, STILL no terminal I/O
- *   doupdate()           ONE atomic diff (newscr vs curscr) → terminal
- *
- * Reference [9] ESR's NCURSES HOWTO §11 — the newscr/curscr diff model.
+ * Each frame goes: wipe the in-memory screen, draw the water, draw the source
+ * markers, then draw the HUD last so it sits on top — and finally one call hands
+ * it all to ncurses, which redraws only the cells that actually changed (less
+ * flicker; see the ncurses HOWTO §11).
  */
 typedef struct {
-  int cols; /* terminal width  in cells (getmaxyx)         */
-  int rows; /* terminal height in cells (getmaxyx)         */
+  int cols; /* terminal width  in cells */
+  int rows; /* terminal height in cells */
 } Screen;
 
 static void screen_init(Screen *sc, int theme) {
@@ -1332,13 +940,9 @@ static const char *preset_name(int p) {
   }
 }
 
-/*
- * HUD layout per CLAUDE.md spec:
- *   row 0       : right-aligned bright-yellow + bold status (fps, engine,
- * state) row 1       : left-aligned  bright-yellow no-bold parameter readouts
- *   row rows-1  : left-aligned  bright-cyan + bold key hint
- * Everything between is the field.
- */
+/* Draw the three info rows: top-right shows engine, fps, and paused/running;
+ * the line below it shows the current settings; the bottom row lists the keys.
+ * Everything in between is the water. */
 static void hud_draw(Screen *sc, Scene *s, double fps) {
   char status[80];
   snprintf(status, sizeof status, " %s  %5.1f fps  %s ", engine_name(s->engine),
@@ -1398,46 +1002,29 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §9  app                                                                */
-/* ===================================================================== */
-/* What you get: the main loop + signal handlers + key dispatch.  This
- *               is where user keystrokes meet the simulation — every
- *               key in the HOW TO READ keys list is wired here.  The
- *               loop is the standard fixed-render-rate pattern: read
- *               input, tick scene, sleep, draw, present.               */
+/* ── §9 app ── */
+/* The main loop, the signal handlers, and the key handling — where your
+ * keystrokes meet the simulation. Each pass reads a key, ticks the scene,
+ * sleeps to hold a steady frame rate, then draws. */
 
 /*
- * App — top-level container, lives in BSS as the single g_app instance.
+ * App — the whole program in one box, kept as a single global (g_app).
  *
- * Intent
- *   The signal handlers (on_exit_sig, on_resize) need to reach state
- *   that the main loop polls.  Stashing it in main()'s locals would
- *   force handlers to use globals anyway, so we declare g_app globally
- *   and let handlers and main() share it.
+ * It's global because the signal handlers below need to reach it, and a handler
+ * can only touch global state. The two flags are written by handlers and read
+ * by the loop: one says "time to quit," the other says "the window resized." A
+ * handler can do almost nothing safely, so it just flips a flag and the loop
+ * does the real work next time around.
  *
- * Why the volatile sig_atomic_t flags
- *   POSIX requires signal handlers touch only sig_atomic_t variables
- *   and only with simple writes — any wider type or operation is
- *   undefined.  `volatile` forces every read in the main loop to go
- *   back to memory (the compiler must not cache the value into a
- *   register across signal arrival).  Together they form the standard
- *   "wake the main loop" pattern: handler flips a bit, main loop
- *   notices, main loop does the work in user context.
- *
- * What is NOT here
- *   - Frame-timing accumulators (sim_accum, fps_accum, frame_time);
- *     those are pure locals in main().  Lifting them to App would leak
- *     loop bookkeeping into App's public footprint.
- *   - Render FPS / sim FPS:  fixed by RENDER_FPS / RENDER_NS, not
- *     user-adjustable here (sim cadence in FDTD is controlled by
- *     Scene.fdtd_steps instead).
+ * The flags are `volatile sig_atomic_t` for two reasons: that type is the only
+ * kind a signal handler is allowed to write, and `volatile` stops the compiler
+ * from caching the value so the loop always sees the latest one.
  */
 typedef struct {
-  Scene scene;                       /* the whole world             */
-  Screen screen;                     /* terminal extent             */
-  volatile sig_atomic_t running;     /* SIGINT/TERM clears this     */
-  volatile sig_atomic_t need_resize; /* SIGWINCH sets this          */
+  Scene scene;                       /* the whole world           */
+  Screen screen;                     /* terminal size             */
+  volatile sig_atomic_t running;     /* cleared when asked to quit */
+  volatile sig_atomic_t need_resize; /* set when the window resizes */
 } App;
 
 static App g_app;
@@ -1451,13 +1038,10 @@ static void on_resize(int s) {
 }
 static void cleanup(void) { endwin(); }
 
-/*
- * key dispatch — engine-context-aware where it matters.
- *   '+' '-' adjust selected source λ in ANALYTIC mode, FDTD sub-steps in FDTD.
- *   'p' drops impulse only in FDTD (analytic has no field state to perturb).
- *   'd' 'D' adjust damping only in FDTD.
- *   Other keys do the same thing in both engines.
- */
+/* Handle one keypress. A few keys mean different things per engine: +/- change
+ * the source's wavelength in the shortcut engine but the step count in the
+ * simulation; 'p' (drop a pebble) and d/D (fade rate) only do anything in the
+ * simulation, since the shortcut engine has no water to disturb. */
 static bool app_handle_key(App *a, int ch) {
   Scene *sc = &a->scene;
 

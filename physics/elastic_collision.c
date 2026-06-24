@@ -1,112 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * elastic_collision.c — Hard Sphere Billiards
+ * elastic_collision.c — bouncing billiard discs
  *
- * 25 discs with randomised radii and velocities bouncing off walls and
- * each other.  Perfectly elastic collisions preserve kinetic energy and
- * momentum.  After N² pair checks each tick, colliding discs flash with
- * the active theme's accent colour.
+ * 25 discs of random size and speed bounce off the walls and off each
+ * other. Hits are "perfectly elastic": no energy is lost, so the discs
+ * keep rattling around forever. When two collide they flash for a moment.
  *
- * Physics in pixel space (CELL_W=8, CELL_H=16 px per terminal cell).
- * Disc mass proportional to radius² (equal density).
- *
- * Themes (t / T cycle, 10 total): Matrix, Fire, Oceanic, Neon, Mono,
- *   Ice, Nova, Forest, Desert, Eclipse.  Drive disc speed-tier colours
- *   (slow/med/fast) plus the collision flash accent.  Top yellow / bottom
- *   cyan HUD chrome stays fixed across every theme.
- *
- * Keys:
- *   q / ESC   quit
- *   p         pause / resume
- *   r         reset (new random layout)
- *   t / T     next / previous theme
- *   + / -     sim speed (1x..8x)
- *   space     add random impulse to every disc
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/elastic_collision.c \
- *       -o elastic_collision -lncurses -lm
+ * The two-body collision math is the standard textbook result
+ * (Goldstein, Classical Mechanics, ch. 3). For pushing this past ~100
+ * discs without the pair-checking getting slow, see Lubachevsky 1991,
+ * "How to Simulate Billiards and Similar Systems".
  *
  * §1 config  §2 clock  §3 color  §4 physics  §5 draw  §6 app
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Impulse-based elastic collision resolution.
- *                  For each overlapping pair, a single impulse along the
- *                  collision normal simultaneously adjusts both velocities
- *                  so the constraint (non-penetration + elastic restitution)
- *                  is satisfied in one step.
- *
- * Physics        : Conservation laws for elastic collisions:
- *                  (1) Conservation of momentum: m₁v₁ + m₂v₂ = const
- *                  (2) Conservation of kinetic energy: ½m₁v₁² + ½m₂v₂² = const
- *                  Combined, for collision along normal n̂:
- *                    impulse J = 2·m₁·m₂/(m₁+m₂) · Δv·n̂
- *                  Velocities updated: v₁ -= J/m₁·n̂;  v₂ += J/m₂·n̂
- *
- * Performance    : O(N²) pair checks per tick — acceptable for N=25.
- *                  For N>100 broad-phase (spatial hash or sweep-and-prune)
- *                  would reduce to O(N) average checks.
- *
- * Mass model     : mass = r²  (area of 2D disc × uniform density).
- *                  Heavier discs (larger radius) deflect smaller ones
- *                  more, matching intuition about billiard balls.
- *
- * Rendering      : Each disc drawn as an ASCII ellipse — `O` at the
- *                  centre plus rim chars chosen by row (`|` at the
- *                  leftmost/rightmost columns, `-` everywhere else).
- *                  The ellipse equation y = ry · sqrt(1 − (dc/rx)²)
- *                  gives the rim row offset per column.  Speed-based
- *                  colour from theme ramp (slow → ramp[0]; med →
- *                  ramp[2]; fast → ramp[3]); collision tick paints the
- *                  theme's `flash` accent for FLASH_S seconds.
- *
- * References     :
- *   • Alder, B. J. & Wainwright, T. E. (1959) "Studies in Molecular
- *     Dynamics. I. General Method", J. Chem. Phys. 31(2), 459-466.
- *     — The first hard-sphere molecular dynamics simulation.  The
- *       overlap-detect / impulse-resolve loop we use is a direct
- *       descendant of their event-driven scheme (with continuous-time
- *       collision detection traded for discrete fixed-dt overlap
- *       resolution for visual smoothness).
- *
- *   • Goldstein, H., Poole, C. P. & Safko, J. L. (2001) "Classical
- *     Mechanics" (3rd ed.), Addison-Wesley.  Chapter 3 §3.10-3.11.
- *     — Standard textbook derivation of two-body elastic collisions.
- *       The impulse formula J = 2·m₁·m₂/(m₁+m₂) · Δv·n̂ in §4 of this
- *       file is the centre-of-momentum result derived there.
- *
- *   • Mirtich, B. (1996) "Impulse-based Dynamic Simulation of Rigid
- *     Body Systems", PhD thesis, UC Berkeley.
- *     — The canonical reference for impulse-based collision response.
- *       Generalises to arbitrary geometry but reduces to our scalar
- *       impulse formula for spheres along the contact normal.
- *
- *   • Witkin, A. & Baraff, D. (1997) "Physically Based Modeling:
- *     Principles and Practice", SIGGRAPH Course Notes.
- *     — Game-physics canonical course notes.  §F covers rigid-body
- *       contact and impulse forces with worked examples.
- *
- *   • Lubachevsky, B. D. (1991) "How to Simulate Billiards and Similar
- *     Systems", J. Computational Physics 94(2), 255-283.
- *     — Specifically targets large-N billiard simulation with broad-
- *       phase culling.  Start here when N grows past ~100 and the
- *       O(N²) pair loop becomes a bottleneck.
- *
- *   • Sinai, Ya. G. (1970) "Dynamical Systems with Elastic Reflections.
- *     Ergodic Properties of Dispersing Billiards", Russian Math.
- *     Surveys 25(2), 137-189.
- *     — The mathematical foundation of "billiards as dynamical systems"
- *       — including the proof that hard-sphere systems are chaotic,
- *       which is what you watch unfold every reset of this demo.
- *
- *   • Foley, J. D., van Dam, A., Feiner, S. K., Hughes, J. F. (1995)
- *     "Computer Graphics: Principles and Practice" (2nd ed., C ed.),
- *     Addison-Wesley.  §3.3 covers ellipse rasterisation.
- *     — Standard reference for the row-by-row ellipse algorithm
- *       draw_disc uses.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -118,56 +24,55 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
+/* Physics runs in "pixels", with each terminal cell worth 8 px wide and
+ * 16 px tall. Cells are about twice as tall as they are wide, so this
+ * keeps round things looking round. */
 #define CELL_W 8
 #define CELL_H 16
 #define N_DISCS 25
 
-/* R_MIN/R_MAX: disc radius range in pixels.
- * R_MIN = 1.5 cells wide — large enough to be visible on screen.
- * R_MAX = 4 cells wide — at N=25 discs, max radius must not make placement
- * impossible; 4 cells keeps most random layouts placeable within 200 tries. */
+/* How big a disc can be. The smallest is still a cell and a half wide so
+ * you can see it; the biggest is capped at 4 cells so that 25 of them
+ * still fit when we drop them in at random (see the placement code). */
 #define R_MIN (CELL_W * 1.5f)
 #define R_MAX (CELL_W * 4.0f)
 
-/* V_MAX: initial speed cap (px/s).  180 px/s at CELL_W=8 ≈ 22.5 cells/s.
- * At 60 fps that's 0.375 cells per frame — fast enough to look dynamic
- * but slow enough that a disc doesn't skip over another in one tick.      */
+/* Top starting speed. Fast enough to look lively, slow enough that a disc
+ * never jumps clean past another between two physics steps. */
 #define V_MAX 180.f
 
-/* FLASH_S: impact flash duration (seconds).
- * 0.4 s is just above typical human reaction time (~0.25 s), making
- * collision flashes easy to notice without looking persistent.            */
+/* How long a disc glows after a hit, in seconds. About a blink — long
+ * enough to catch your eye, short enough not to linger. */
 #define FLASH_S 0.4f
 
-/* SIM_FPS: physics tick rate.  120 Hz gives dt ≈ 8.3 ms — small enough
- * that at V_MAX a disc moves only 1.5 px per tick, preventing tunnelling. */
+/* Physics runs 120 times a second. The small time step keeps fast discs
+ * from skipping through each other. */
 #define SIM_FPS 120
-#define RENDER_NS (1000000000LL / 60) /* 60 fps render period (ns) */
+#define RENDER_NS (1000000000LL / 60) /* redraw 60 times a second */
 
-/* Canonical HUD chrome — 1 row top status + 1 row bottom action bar.
- * Discs render in rows TOP_HUD_H .. rows - BOT_HUD_H - 1.            */
+/* Two reserved rows: a status line up top and a key-hint line at the
+ * bottom. Discs only get the space in between. */
 #define TOP_HUD_H 1
 #define BOT_HUD_H 1
 #define HUD_ROWS (TOP_HUD_H + BOT_HUD_H)
 
 #define N_THEMES 10 /* see k_themes[] in §3 */
 
+/* Color slots. Discs are tinted by how fast they're going, with a special
+ * flash color for the moment of impact; the last two keep the HUD readable
+ * no matter which theme is on. */
 enum {
-  CP_SLOW = 1, /* slow-speed discs   — theme ramp[0]               */
-  CP_MED,      /* mid-speed discs    — theme ramp[2]               */
-  CP_FAST,     /* fast-speed discs   — theme ramp[3] (brightest)   */
-  CP_FLASH,    /* collision flash    — theme `flash` accent        */
-  CP_HUD,      /* canonical top status — bright yellow + bold      */
-  CP_HINT,     /* canonical bottom action bar — bright cyan + bold */
+  CP_SLOW = 1, /* slowest discs                    */
+  CP_MED,      /* mid-speed discs                  */
+  CP_FAST,     /* fastest discs (brightest)        */
+  CP_FLASH,    /* the flash when two discs collide */
+  CP_HUD,      /* top status line                  */
+  CP_HINT,     /* bottom key-hint line             */
 };
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static long long clock_ns(void) {
   struct timespec ts;
@@ -182,20 +87,22 @@ static void clock_sleep_ns(long long ns) {
   nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color — themes + canonical HUD chrome                              */
-/* ===================================================================== */
+/* ── §3 color — themes + HUD colors ── */
 
 /*
- * Theme — speed ramp + collision flash accent.
- *   ramp[4]    speed tiers dim→bright; CP_SLOW = ramp[0], CP_MED =
- *              ramp[2], CP_FAST = ramp[3] (the brightest tier).
- *   flash      collision-instant highlight (chosen to contrast the
- *              ramp so impacts always pop, even in low-contrast themes).
+ * A look for the discs. Each theme has four colors going from dim to
+ * bright (used to shade discs by speed) plus one bold "flash" color for
+ * the instant two discs hit. The flash is picked to stand out from the
+ * four so impacts always pop, even on a low-contrast theme.
  *
- * Brightness safety (CLAUDE.md): all entries sit at index ≥ 30, or
- * 24-29 / 240-243 only as the lowest ramp tier.  16-23 / 232-239 are
- * forbidden — they vanish on default-black terminals.
+ *   name   what shows in the HUD
+ *   ramp   four shades, dim to bright (slow discs get ramp[0], the
+ *          fastest get ramp[3])
+ *   flash  the collision-flash color
+ *
+ * All color numbers stay in the bright half of the palette on purpose;
+ * the dim end of the terminal palette disappears against a black
+ * background.
  */
 typedef struct {
   const char *name;
@@ -218,17 +125,10 @@ static const Theme k_themes[N_THEMES] = {
 };
 
 /*
- * theme_apply — install the palette for theme index t.
- *
- *   Theme-driven:
- *     CP_SLOW  = ramp[0]   (dim)
- *     CP_MED   = ramp[2]   (skip ramp[1] for more contrast between slow/med)
- *     CP_FAST  = ramp[3]   (brightest tier)
- *     CP_FLASH = flash     (theme-specific accent)
- *
- *   Fixed chrome (theme-independent — always readable):
- *     CP_HUD   bright yellow + bold (top status)
- *     CP_HINT  bright cyan   + bold (bottom action bar)
+ * Switch to theme t and wire up the color slots. The disc shades come
+ * from the theme, but the two HUD colors stay fixed so the text is always
+ * readable whichever theme you pick. (We skip ramp[1] for the mid tier to
+ * leave a clearer gap between slow and medium.)
  */
 static void theme_apply(int t) {
   const Theme *th = &k_themes[t % N_THEMES];
@@ -238,10 +138,10 @@ static void theme_apply(int t) {
     init_pair(CP_MED, th->ramp[2], -1);
     init_pair(CP_FAST, th->ramp[3], -1);
     init_pair(CP_FLASH, th->flash, -1);
-    init_pair(CP_HUD, 226, -1); /* canonical yellow */
-    init_pair(CP_HINT, 51, -1); /* canonical cyan   */
+    init_pair(CP_HUD, 226, -1); /* yellow */
+    init_pair(CP_HINT, 51, -1); /* cyan   */
   } else {
-    /* 8-colour fallback — theme-independent. */
+    /* Older terminals with only 8 colors get a fixed set. */
     init_pair(CP_SLOW, COLOR_BLUE, -1);
     init_pair(CP_MED, COLOR_CYAN, -1);
     init_pair(CP_FAST, COLOR_WHITE, -1);
@@ -256,154 +156,92 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  physics                                                            */
-/* ===================================================================== */
-
-/* ─────────────────────────────────────────────────────────────────────
- * Disc — one hard-sphere particle in the billiard pool.
- *
- * The simulation runs in PIXEL space (CELL_W=8, CELL_H=16 px per
- * terminal cell); cell-space coordinates appear only in the renderer.
- * So a disc with r = 24 px occupies 3 cells horizontally and ~1.5 cells
- * vertically (terminal aspect ≈ 2:1 px:px).
- *
- * Members grouped by access pattern, NOT by type — locality + clarity:
- *
- *   kinematic state  : x, y, vx, vy
- *       Hot path.  Written and read every physics step by scene_tick:
- *           1. integrate    x += vx·dt,  y += vy·dt
- *           2. wall bounce  clamp position + sign-flip velocity
- *           3. pair check   resolve overlap + apply elastic impulse
- *
- *   geometry         : r, mass
- *       Set ONCE at scene_init, constant for the disc's lifetime.
- *       mass = r² (area of 2D disc × uniform density), so heavier
- *       discs deflect lighter ones more through the impulse formula
- *           J = 2·m₁·m₂ / (m₁+m₂) · Δv
- *       (Goldstein 2001 §3.10 centre-of-momentum result).
- *
- *   render hook      : flash
- *       The single member that crosses the sim/render boundary.
- *       scene_tick sets it to FLASH_S seconds on collision; each
- *       subsequent tick counts it down.  speed_tier_pair() reads it
- *       to override the speed-band colour with the theme accent.
- *       Sim writes, render reads — kept on Disc instead of a parallel
- *       array so it travels with its owner.
- *
- * References:
- *   • Alder & Wainwright 1959 — the (position, velocity, radius)
- *     hard-sphere representation we use here is identical to theirs.
- *   • Goldstein 2001 §3.10 — physics encoded in the (vx, vy, mass)
- *     fields and the impulse formula in scene_tick.
- * ───────────────────────────────────────────────────────────────────── */
-typedef struct {
-  /* ─ kinematic state — read+written every scene_tick ─ */
-  float x, y;   /* centre position, pixel space (origin top-left) */
-  float vx, vy; /* velocity, px/s                                 */
-
-  /* ─ geometry — set once at scene_init, constant after ─ */
-  float r;    /* radius, px (range R_MIN..R_MAX)                */
-  float mass; /* m = r² (uniform 2D-disc density)               */
-
-  /* ─ render hook — written by sim on collision, read by render ─ */
-  float flash; /* seconds remaining of collision flash highlight;
-                  > 0 → paint CP_FLASH instead of speed-band tier*/
-} Disc;
-
-/* ─────────────────────────────────────────────────────────────────────
- * Scene — the entire demo state.
- *
- * One Scene IS the demo.  Every non-trivial function takes a Scene*
- * (or const Scene* for read-only) and operates on it.  Only the two
- * signal-handler flags in §6 (g_quit, g_resize) remain global, because
- * the C signal API has no context pointer.
- *
- * Members are grouped by what TOUCHES them, separating SIMULATION
- * concerns from RENDERING concerns per the locality principle:
- *
- *   ── SIMULATION ───────────────────────────────────────────────────
- *
- *   particle pool         : discs
- *       Fixed-size pool of N_DISCS hard spheres.  scene_init reseeds
- *       the pool from scratch (radii, velocities, non-overlapping
- *       positions); scene_tick updates every entry each physics step.
- *
- *   wall box              : pw, ph
- *       Pixel-space simulation domain — the inside of the box the
- *       discs bounce against.  Computed from screen dimensions and
- *       the HUD chrome budget at scene_init time.
- *
- *   collision counter     : coll_total
- *       Running tally of pair collisions; incremented by scene_tick.
- *       Read by the HUD as a presentational metric — but lives on the
- *       sim side because the integrator is what writes it.
- *
- *   integrator controls   : paused, speed
- *       User-driven knobs that gate the physics.
- *         paused  → scene_tick early-returns (entire sim frozen).
- *         speed   → sub-divides each frame into 1..8 physics steps;
- *                   higher values give a sharper-looking sim at the
- *                   cost of more O(N²) pair checks per frame.
- *
- *   ── RENDERING ────────────────────────────────────────────────────
- *
- *   screen dimensions     : rows, cols
- *       Cell-space terminal size, refreshed on SIGWINCH.  Used by
- *       scene_init (to compute the wall box from the chrome budget)
- *       AND by every renderer (to clip discs and place the HUD bars).
- *       Read everywhere, written only by scene_init / resize.
- *
- *   palette index         : theme
- *       Active entry in k_themes[].  Pure presentation — t/T cycles
- *       it, theme_apply installs the colour pairs, no simulation
- *       field depends on it.  Lives on Scene only because the HUD
- *       needs to print the name.
- *
- * References:
- *   • Alder & Wainwright 1959 — the particle-pool + pair-check scheme
- *     `discs[]` implements is descended from their hard-sphere MD.
- *   • Goldstein 2001 §3.10 — elastic-collision physics encoded in the
- *     (x, y, vx, vy, r, mass) per-Disc state plus the wall-box bounce.
- *   • Sinai 1970 — the dynamical-systems interpretation of "billiard
- *     in a box" that this Scene implements visually.
- * ───────────────────────────────────────────────────────────────────── */
-typedef struct {
-  /* ── SIMULATION ─────────────────────────────────────────────────
-   * Physics state + integrator controls.  Written by scene_tick (and
-   * for paused/speed by the key dispatcher); read by scene_tick and
-   * by the renderer for presentational purposes only.              */
-  Disc discs[N_DISCS];  /* hard-sphere particle pool          */
-  float pw, ph;         /* pixel-space wall box (px × px)     */
-  long long coll_total; /* running pair-collision tally       */
-  bool paused;          /* p   : scene_tick early-returns     */
-  int speed;            /* +/- : sub-steps per frame (1..8)   */
-
-  /* ── RENDERING ──────────────────────────────────────────────────
-   * Presentation-only state.  Never feeds back into the integrator;
-   * mutating these never invalidates physics.                       */
-  int rows, cols; /* terminal cell-space size (SIGWINCH)*/
-  int theme;      /* t/T : index into k_themes[]        */
-} Scene;
+/* ── §4 physics ── */
 
 /*
- * seed_random_radius_mass — uniform random r ∈ [R_MIN, R_MAX], then
- * derive mass = r² (uniform 2D-disc density).  Heavier discs deflect
- * lighter ones more in the elastic-impulse formula downstream.
+ * Disc — one bouncing ball.
+ *
+ * Everything here lives in pixels (the drawing code is the only place
+ * that converts to terminal cells). The fields are grouped by how often
+ * they change:
+ *
+ *   x, y      where the disc's center is right now
+ *   vx, vy    how fast it's moving, in pixels per second
+ *             (these four change every physics step)
+ *
+ *   r         radius in pixels, somewhere between R_MIN and R_MAX
+ *   mass      how heavy it is. We use mass = r², so a disc the size of
+ *             a coin weighs as much as its area — bigger discs are
+ *             heavier and shove smaller ones around more. Set once and
+ *             never changes.
+ *
+ *   flash     seconds of glow left after a collision. The physics sets
+ *             it to FLASH_S on a hit and ticks it down; while it's above
+ *             zero the disc is drawn in the flash color instead of its
+ *             usual speed color. This is the one field the drawing code
+ *             reads — it rides along on the disc so it stays paired with
+ *             the right ball.
  */
+typedef struct {
+  float x, y;   /* center position (top-left is the origin) */
+  float vx, vy; /* velocity, pixels per second              */
+
+  float r;    /* radius in pixels (R_MIN..R_MAX)            */
+  float mass; /* weight, equal to r²                        */
+
+  float flash; /* seconds of post-hit glow left; >0 means flashing */
+} Disc;
+
+/*
+ * Scene — all of the demo's state in one place.
+ *
+ * Passing one Scene around is how everything talks to everything else;
+ * the only things that live outside it are the two flags the signal
+ * handler sets, because C signal handlers can't be handed a pointer.
+ *
+ * The fields split into two halves — the physics, and the presentation:
+ *
+ *   discs       the 25 balls themselves
+ *   pw, ph      the size of the box they bounce inside, in pixels.
+ *               Worked out from the screen size minus the two HUD rows.
+ *   coll_total  how many collisions have happened so far (shown in the
+ *               HUD; lives here because the physics is what counts them)
+ *   paused      when true, the physics simply stops
+ *   speed       how many physics steps to run per frame, 1 to 8. Higher
+ *               looks crisper but does more work, since each step
+ *               re-checks every pair of discs.
+ *
+ *   rows, cols  the terminal's size in cells, kept fresh when the window
+ *               is resized. Used both to lay out the box and to clip the
+ *               discs and place the HUD.
+ *   theme       which look is active (an index into k_themes). Purely
+ *               cosmetic — nothing in the physics depends on it.
+ */
+typedef struct {
+  /* The physics side. */
+  Disc discs[N_DISCS];  /* the 25 balls                       */
+  float pw, ph;         /* box size in pixels                 */
+  long long coll_total; /* total collisions so far            */
+  bool paused;          /* physics frozen when true           */
+  int speed;            /* physics steps per frame (1..8)     */
+
+  /* The display side — changing these never disturbs the physics. */
+  int rows, cols; /* terminal size in cells              */
+  int theme;      /* which look is active                */
+} Scene;
+
+/* Give a disc a random size, then set its weight to match (r²). */
 static void seed_random_radius_mass(Disc *d) {
   d->r = R_MIN + (float)rand() / RAND_MAX * (R_MAX - R_MIN);
   d->mass = d->r * d->r;
 }
 
 /*
- * seed_non_overlapping_position — rejection-sample a position inside
- * the wall box that doesn't intersect any previously-placed disc.
- *
- * For each try: sample a uniform position keeping the full disc inside
- * the walls, then check overlap against discs[0..placed_count-1].
- * Bails after max_tries attempts (placement may fail under dense
- * packing — sim will resolve any residual overlap on the first tick).
+ * Drop a disc somewhere inside the box where it doesn't land on top of a
+ * disc already placed. We just keep picking random spots until one is
+ * clear, giving up after max_tries. If we run out of tries we leave it
+ * where it last landed — the very first physics step will nudge any
+ * leftover overlap apart.
  */
 static void seed_non_overlapping_position(Disc *d, const Scene *s,
                                           int placed_count, int max_tries) {
@@ -421,14 +259,12 @@ static void seed_non_overlapping_position(Disc *d, const Scene *s,
     if (ok)
       return;
   }
-  /* Fall through: keep the last sampled position even if overlapping;
-   * scene_tick's positional resolver will separate it next tick.     */
+  /* Out of tries: leave it where it is and let the physics sort it out. */
 }
 
 /*
- * seed_random_velocity — uniform random direction (0..2π), speed
- * sampled from [60 px/s, V_MAX].  The 60 px/s lower bound prevents
- * "stuck" discs that move imperceptibly on screen.
+ * Send a disc off in a random direction at a random speed. We never let
+ * the speed drop below 60 px/s, so no disc just sits there barely moving.
  */
 static void seed_random_velocity(Disc *d) {
   float speed = 60.f + (float)rand() / RAND_MAX * (V_MAX - 60.f);
@@ -438,14 +274,10 @@ static void seed_random_velocity(Disc *d) {
 }
 
 /*
- * scene_init — fresh sim state for the given screen size.
- *
- *   1. record screen + recompute the pixel-space wall box
- *   2. reset the collision counter
- *   3. for each disc: geometry → non-overlapping placement → velocity
- *
- * Does NOT touch paused / speed / theme — UI state survives reset and
- * resize so the user's selections stick.
+ * Start (or restart) the demo at the given screen size: size the box,
+ * zero the collision count, and lay out fresh random discs. It leaves
+ * pause/speed/theme alone on purpose, so hitting reset or resizing the
+ * window keeps the choices you made.
  */
 static void scene_init(Scene *s, int cols, int rows) {
   s->rows = rows;
@@ -464,12 +296,9 @@ static void scene_init(Scene *s, int cols, int rows) {
 }
 
 /*
- * integrate_disc — explicit-Euler drift step + flash countdown.
- *   x ← x + vx · dt
- *   y ← y + vy · dt
- *   flash ← max(flash − dt, 0)
- * No forces are integrated here — between collisions the discs move in
- * straight lines (Galilean inertia), so a one-step Euler is exact.
+ * Move a disc forward by dt seconds and let its flash fade a little.
+ * Between collisions a disc just coasts in a straight line, so moving it
+ * is as simple as position += velocity × time — no forces to worry about.
  */
 static void integrate_disc(Disc *d, float dt) {
   d->x += d->vx * dt;
@@ -480,12 +309,9 @@ static void integrate_disc(Disc *d, float dt) {
 }
 
 /*
- * reflect_off_walls — elastic wall reflection on the axis-aligned box
- * [0, pw] × [0, ph].  For each side: position-clamp first (so a disc
- * that overshot the wall this tick is pulled back inside), then force
- * the velocity component normal to the violated wall to point inward
- * (sign-flip via fabsf).  Position-clamp + sign-flip is equivalent to
- * a perfectly elastic reflection across the wall plane.
+ * Bounce a disc off the four walls. For any wall it has crossed, we pull
+ * it back inside and flip the matching part of its velocity to point
+ * back inward — exactly like a ball rebounding off a hard edge.
  */
 static void reflect_off_walls(Disc *d, float pw, float ph) {
   if (d->x - d->r < 0.f) {
@@ -507,10 +333,10 @@ static void reflect_off_walls(Disc *d, float pw, float ph) {
 }
 
 /*
- * pair_overlaps — geometric overlap test for two discs.
- * Returns true iff the discs intersect.  Outputs unit normal n̂ from a
- * to b and the positive penetration depth (min_d − dist).  Skips when
- * centres coincide (dist² < ε) to avoid normal-vector NaN.
+ * Are these two discs touching? If so, also report the direction from a
+ * to b and how deeply they're overlapping (the caller uses both to push
+ * them apart and bounce them). If their centers sit exactly on top of
+ * each other we bail out, since there'd be no clear direction to use.
  */
 static bool pair_overlaps(const Disc *a, const Disc *b, float *out_nx,
                           float *out_ny, float *out_overlap) {
@@ -527,11 +353,9 @@ static bool pair_overlaps(const Disc *a, const Disc *b, float *out_nx,
 }
 
 /*
- * resolve_overlap_positional — push the discs apart along n̂ by the
- * penetration depth, mass-weighted so the lighter disc moves more
- * (Baraff-style positional correction).  Conserves the centre of mass.
- *     a ← a − (m_b / (m_a+m_b)) · overlap · n̂
- *     b ← b + (m_a / (m_a+m_b)) · overlap · n̂
+ * Two overlapping discs shouldn't share space, so shove them apart until
+ * they just touch. The lighter one gives way more than the heavier one,
+ * and they split the gap so their shared center of gravity doesn't move.
  */
 static void resolve_overlap_positional(Disc *a, Disc *b, float nx, float ny,
                                        float overlap) {
@@ -543,17 +367,12 @@ static void resolve_overlap_positional(Disc *a, Disc *b, float nx, float ny,
 }
 
 /*
- * apply_elastic_impulse — exchange momentum along the collision normal.
- *
- *   dv  = (v_a − v_b) · n̂           relative velocity along n̂
- *   J   = 2·m_a·m_b/(m_a+m_b) · dv   impulse magnitude
- *   v_a ← v_a − (J / m_a) · n̂
- *   v_b ← v_b + (J / m_b) · n̂
- *
- * Derived from simultaneous conservation of momentum and kinetic
- * energy (Goldstein 2001 §3.10).  Returns false (no impulse applied)
- * when dv ≤ 0 — the discs are already separating along n̂, which can
- * happen after positional resolution.
+ * The actual bounce: swap momentum between two discs along the line that
+ * joins their centers, so they ricochet the way real balls do (no energy
+ * lost). The amount each one's velocity changes depends on the weights —
+ * this is the standard two-body elastic-collision result (Goldstein,
+ * ch. 3). If the discs are already drifting apart we do nothing and
+ * return false, so a glancing touch doesn't get a phantom kick.
  */
 static bool apply_elastic_impulse(Disc *a, Disc *b, float nx, float ny) {
   float dv = (a->vx - b->vx) * nx + (a->vy - b->vy) * ny;
@@ -569,14 +388,9 @@ static bool apply_elastic_impulse(Disc *a, Disc *b, float nx, float ny) {
 }
 
 /*
- * pair_collide — full collision-resolution pass for one disc pair.
- *   1. test overlap
- *   2. positional correction (separate overlapping discs)
- *   3. elastic impulse (skip if already separating)
- *   4. mark both discs as flashing
- *
- * Returns true iff an impulse was actually applied, so the caller can
- * increment the running collision counter.
+ * Handle one pair of discs end to end: if they're touching, pull them
+ * apart, bounce them, and light them both up. Returns true only when a
+ * real bounce happened, so the caller knows when to bump the counter.
  */
 static bool pair_collide(Disc *a, Disc *b) {
   float nx, ny, overlap;
@@ -591,23 +405,22 @@ static bool pair_collide(Disc *a, Disc *b) {
 }
 
 /*
- * scene_tick — one physics step of dt seconds.
- *   1. drift  : integrate position, decay flash
- *   2. walls  : reflect off the box edges (elastic)
- *   3. pairs  : O(N²) collision resolution
- * No-op when s->paused is true.
+ * Advance the whole world by dt seconds: move every disc and bounce it
+ * off the walls, then check every pair for collisions. Does nothing while
+ * paused.
  */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused)
     return;
 
-  /* free flight + wall reflections */
+  /* Move each disc and bounce it off the walls. */
   for (int i = 0; i < N_DISCS; i++) {
     integrate_disc(&s->discs[i], dt);
     reflect_off_walls(&s->discs[i], s->pw, s->ph);
   }
 
-  /* O(N²) pair check + collision resolution */
+  /* Check every disc against every other one. Fine for 25 discs; for a
+   * lot more you'd want a smarter scheme so you don't test all pairs. */
   for (int i = 0; i < N_DISCS - 1; i++) {
     for (int j = i + 1; j < N_DISCS; j++) {
       if (pair_collide(&s->discs[i], &s->discs[j]))
@@ -616,9 +429,7 @@ static void scene_tick(Scene *s, float dt) {
   }
 }
 
-/* ===================================================================== */
-/* §5  draw                                                               */
-/* ===================================================================== */
+/* ── §5 draw ── */
 
 static int px_to_cell_x(float px) { return (int)(px / CELL_W + .5f); }
 static int px_to_cell_y(float py) {
@@ -626,12 +437,11 @@ static int px_to_cell_y(float py) {
 }
 
 /*
- * disc_to_cell_geometry — pixel-space disc → cell-space render geometry.
- *
- * Centre converted via px_to_cell_*.  Independent rx / ry rounding
- * because terminal cells have a ~2:1 aspect (CELL_H = 2·CELL_W), so
- * the same physical radius gives a wider rx than ry in cells.  Both
- * clamped to a minimum of 1 cell so the disc is always visible.
+ * Work out where a disc lands on the character grid and how many cells
+ * wide and tall it should be drawn. We measure the radius separately for
+ * width and height because cells are about twice as tall as they are wide,
+ * so the same disc spans more columns than rows. Tiny discs are bumped up
+ * to at least one cell each way so they never vanish.
  */
 static void disc_to_cell_geometry(const Disc *d, int *cx, int *cy, int *rx,
                                   int *ry) {
@@ -646,9 +456,8 @@ static void disc_to_cell_geometry(const Disc *d, int *cx, int *cy, int *rx,
 }
 
 /*
- * draw_disc_center — single 'O' at the disc's centre cell, clipped
- * against both top and bottom HUD chrome so discs never paint over
- * the canonical bars.
+ * Put a single 'O' at the disc's center. We skip it if it would land on
+ * the top or bottom HUD rows, so a disc never paints over the status text.
  */
 static void draw_disc_center(int cx, int cy, int cols, int rows) {
   if (cy >= TOP_HUD_H && cy < rows - BOT_HUD_H && cx >= 0 && cx < cols)
@@ -656,20 +465,13 @@ static void draw_disc_center(int cx, int cy, int cols, int rows) {
 }
 
 /*
- * draw_ellipse_rim — ASCII outline of an axis-aligned ellipse via the
- * standard equation
- *
- *     (dc/rx)² + (dr/ry)² = 1     ⇒    dr = ry · √(1 − (dc/rx)²)
- *
- * For each horizontal offset dc ∈ [−rx, rx] we paint two cells (top
- * and bottom) at the corresponding row offsets ±dr.  Glyph picks:
- *   • '|' at the leftmost / rightmost columns and at dc=0 (vertical
- *     tangent points — slope-vertical visually);
- *   • '-' elsewhere (slope-horizontal).
- * All cells clipped against top and bottom HUD chrome.
- *
- * Reference: Foley et al. *Computer Graphics: Principles & Practice*
- * §3.3 — row-by-row ellipse rasterisation.
+ * Trace the outline of the disc one column at a time. For each column we
+ * figure out how far up and down the rim reaches and drop a character
+ * there — a top half and a bottom half. We use '|' at the far left, far
+ * right, and the very top/bottom where the edge runs steeply, and '-'
+ * everywhere else where it runs flat. Anything landing on a HUD row is
+ * skipped. (Standard column-by-column ellipse drawing; Foley et al.,
+ * Computer Graphics, §3.3.)
  */
 static void draw_ellipse_rim(int cx, int cy, int rx, int ry, int cols,
                              int rows) {
@@ -691,9 +493,9 @@ static void draw_ellipse_rim(int cx, int cy, int rx, int ry, int cols,
 }
 
 /*
- * draw_disc — paint one disc as `O` at the centre + ASCII ellipse rim.
- * Two passes share the same colour attribute so a single attron/attroff
- * wraps the whole disc.
+ * Draw one whole disc: the 'O' at its center and the outline around it,
+ * both in the given color. We set the color once for both so the disc is
+ * a single shade.
  */
 static void draw_disc(const Disc *d, int cp, int cols, int rows) {
   int cx, cy, rx, ry;
@@ -706,10 +508,10 @@ static void draw_disc(const Disc *d, int cp, int cols, int rows) {
 }
 
 /*
- * speed_tier_pair — map a disc's speed (and flash state) to one of the
- * theme-driven colour pairs.  Thresholds at 40 % and 80 % of V_MAX so
- * the three speed bands roughly divide the visible range evenly; the
- * collision flash overrides everything for FLASH_S seconds.
+ * Pick a disc's color from how fast it's going: slow, medium, or fast,
+ * split at 40% and 80% of the top speed so the three bands are roughly
+ * even. A disc that just collided wins out and shows the flash color
+ * until its glow fades.
  */
 static int speed_tier_pair(const Disc *d) {
   if (d->flash > 0.f)
@@ -723,9 +525,9 @@ static int speed_tier_pair(const Disc *d) {
 }
 
 /*
- * draw_hud_top — canonical top status bar (row 0).
- * Right-aligned: disc count, total collisions, sim speed, theme, paused.
- * CP_HUD (bright yellow + bold).
+ * The status line along the top: how many discs, how many collisions so
+ * far, the speed setting, the theme name, and whether we're paused. It's
+ * right-aligned so it tucks into the corner out of the way.
  */
 static void draw_hud_top(const Scene *s) {
   char buf[160];
@@ -742,9 +544,8 @@ static void draw_hud_top(const Scene *s) {
 }
 
 /*
- * draw_hud_bottom — canonical bottom action bar (row -1).
- * Left-aligned key list; short fallback if the terminal is narrow.
- * CP_HINT (bright cyan + bold).
+ * The key reminders along the bottom. If the window is too narrow to fit
+ * the full list we show a shorter one instead so it never gets cut off.
  */
 static void draw_hud_bottom(const Scene *s) {
   const char *hint_full =
@@ -760,7 +561,7 @@ static void draw_hud_bottom(const Scene *s) {
 }
 
 /*
- * scene_draw — paint every disc speed-tinted, then HUD chrome on top.
+ * Draw a frame: every disc first (colored by speed), then the HUD on top.
  */
 static void scene_draw(const Scene *s) {
   for (int i = 0; i < N_DISCS; i++) {
@@ -771,9 +572,7 @@ static void scene_draw(const Scene *s) {
   draw_hud_bottom(s);
 }
 
-/* ===================================================================== */
-/* §6  app                                                                */
-/* ===================================================================== */
+/* ── §6 app ── */
 
 static volatile sig_atomic_t g_quit = 0;
 static volatile sig_atomic_t g_resize = 0;

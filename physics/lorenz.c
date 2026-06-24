@@ -1,215 +1,23 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * lorenz.c — Lorenz Strange Attractor [1, 2]
+ * lorenz.c — the Lorenz "butterfly" attractor, drawn live in the terminal.
  *
- * Integrates the three Lorenz ODEs with RK4 [6].  Multiple trajectories
- * run in parallel: a main trajectory plus 5 "ghost" ε-offset companions
- * that diverge on the Lyapunov timescale [7], making chaos visible.
+ * We follow a point as it loops forever through the three Lorenz equations,
+ * tracing the famous butterfly shape.  Alongside it we run a few near-identical
+ * "ghost" points started a hair apart; watching them fan out is chaos made
+ * visible — tiny differences blow up fast.
  *
- * Framework: follows framework.c §1–§8 skeleton.
- *
- * ═════════════════════════════════════════════════════════════════════
- *  WHAT YOU SEE ON SCREEN
- * ═════════════════════════════════════════════════════════════════════
- *
- *  A "butterfly" — the famous Lorenz strange attractor [1, 4] — drawn
- *  as a glowing 3-D trail rotating slowly through space.  The trajectory
- *  weaves between two unstable spiral fixed points (marked '+'), tracing
- *  a bounded but never-repeating orbit.  A sparse starfield drifts past
- *  in the background for parallax; a fan of fainter ghost trajectories
- *  spreads alongside the main one — Lyapunov chaos rendered visceral.
- *
- *  Each frame paints back-to-front:
- *
- *    1. STARFIELD   — 60 ambient '.' stars in deep space, rotating with
- *                     the attractor for parallax (cheap volumetric cue
- *                     [8]).
- *    2. EQUILIBRIA  — three '+' crosshairs at the fixed points: the
- *                     origin (saddle), and the two unstable spirals
- *                     C± = (±√72, ±√72, 27) that each lobe orbits [2].
- *    3. GHOSTS      — 5 ε-offset trajectories, ε ∈ {0.001 .. 0.1}.
- *                     They start clustered, then fan out exponentially
- *                     as Lyapunov divergence kicks in (λ ≈ 0.9 → ε
- *                     doubles every 0.77 Lorenz-time, reaching attractor
- *                     scale in ~10 real seconds [7]).  Toggle with g.
- *    4. MAIN TRAIL  — newest 2 points = 'O' BOLD + 4-cross '+' bloom
- *                     halo (comet head); oldest 80% = fading '.' in
- *                     theme tail colour.  DEPTH CUEING [8, 9] — points
- *                     close to the camera paint BOLD, ones behind fade
- *                     A_DIM, so the trail visibly pulses in and out of
- *                     the page as the view rotates.
- *    5. ε-SEP TEXT  — live distance from main trajectory to smallest-ε
- *                     ghost.  Watch it climb from 0.001 to ~30 over
- *                     ~10 real seconds — the Lyapunov timescale.
- *
- *  Two alternate views (single-key toggles):
- *
- *    LOBE MODE (l)    — colour by attractor wing (sign of x): right
- *                       wing in theme head, left wing in theme ghost.
- *                       Each chaotic wing-switch becomes a vivid hue
- *                       flip — Lorenz bistability [3] made visceral.
- *    DENSITY MODE (h) — replace the trail with a 2-D screen-space
- *                       heatmap of trail visits.  Reveals the attractor's
- *                       invariant measure — where the trajectory actually
- *                       spends its time [3, 4].  Resets on rotation so
- *                       each angle re-accumulates from scratch.
- *
- *  THEMES (t / T): 10 four-anchor palettes (MATRIX / FIRE / OCEANIC /
- *  NEON / MONO / ICE / NOVA / FOREST / DESERT / ECLIPSE) re-skin every
- *  coloured element coherently.  Themes are pure rendering — the
- *  physics is identical across all 10.
- *
- * PHYSICS SUMMARY
- * ─────────────────────────────────────────────────────────────────────
- * Lorenz ODEs [1] (σ=10, ρ=28, β=8/3 — the classical chaotic regime):
- *   dx/dt = σ(y − x)            σ = Prandtl number      [5]
- *   dy/dt = x(ρ − z) − y        ρ = Rayleigh ratio       [5]
- *   dz/dt = xy − βz             β = convection geometry  [5]
- *
- * Integrated with classical four-stage Runge-Kutta (RK4) [6], step
- * h = 0.005 Lorenz-time units.  SUB_STEPS = 8 sub-steps per sim tick
- * → 0.04 Lorenz-time / tick.  At 60 ticks/s: 2.4 Lorenz-time/s advance.
- *
- * Lyapunov exponent λ ≈ 0.9 [7] → e-folding time ≈ 1.11 Lorenz-time.
- * Smallest ghost ε = 0.001 reaches attractor scale (~30) after ~37
- * doublings ≈ 13 Lorenz-time ≈ 5.4 s real-time.  Visible divergence
- * within 4 s.
- *
- * PROJECTION  (implemented as the 5-step pipeline in §4)
- * ─────────────────────────────────────────────────────────────────────
- * Orthographic with azimuth φ and elevation θ.  Attractor centred at
- * (0,0,25) before projection; the rotated z-component sz is kept as
- * camera-axis depth and used by the renderer for depth cueing [8].
- *   pz  = z − 25                            (centre on origin)
- *   rx  =  x·cosφ + y·sinφ                  (rotate around z by φ)
- *   ry  = −x·sinφ + y·cosφ
- *   sx  = rx                                (tilt around x by θ)
- *   sy  =  ry·cosθ + pz·sinθ
- *   sz  = −ry·sinθ + pz·cosθ                ← depth (+ = behind, − = in front)
- *   col = cx + sx·scale
- *   row = cy − sy·scale·ASPECT
- *
- * Keys:
- *   q / ESC   quit
- *   space     pause / resume
- *   r         restart trajectories (also resets density heatmap)
- *   g         toggle multi-ghost shower (5 ε-offset trajectories)
- *   l         toggle LOBE coloring (colour by attractor wing)
- *   h         toggle DENSITY HEATMAP view (replaces trail)
- *   a         toggle auto-rotation
- *   ← →       azimuth (manual)
- *   ↑ ↓       elevation
- *   ] / [     sim Hz up / down
- *   t / T     next / previous theme (10 four-anchor palettes)
- *
- * ═════════════════════════════════════════════════════════════════════
- *  REFERENCES  (cite inline as [n])
- * ═════════════════════════════════════════════════════════════════════
- *
- *  ── Lorenz system & chaos theory ────────────────────────────────────
- *
- *   [1] Lorenz, E. N. (1963) — "Deterministic Nonperiodic Flow",
- *       *Journal of the Atmospheric Sciences* 20 (2), 130-141.  THE
- *       original paper.  Derives the three-equation simplification from
- *       atmospheric convection and first demonstrates "sensitive
- *       dependence on initial conditions" — what every ghost-shower
- *       frame in this demo re-proves.
- *
- *   [2] Strogatz, S. H. (2014) — *Nonlinear Dynamics and Chaos*, 2nd ed.,
- *       Westview Press.  The canonical chaos textbook; Ch.9 covers the
- *       Lorenz attractor in 30 readable pages — strange attractor,
- *       Lyapunov exponents, bifurcations.  Best single entry point if
- *       you want to understand WHY the butterfly is shaped this way.
- *
- *   [3] Sparrow, C. (1982) — *The Lorenz Equations: Bifurcations, Chaos,
- *       and Strange Attractors*, Springer Applied Mathematical Sciences
- *       41.  Deep monograph: bifurcation diagrams, return maps, hetero
- *       and homoclinic orbits, the invariant measure on the attractor.
- *       The reference for what density mode is showing.
- *
- *   [4] Tucker, W. (1999) — "The Lorenz attractor exists", *Comptes
- *       Rendus de l'Académie des Sciences Paris* 328 (12), 1197-1202.
- *       Computer-assisted proof that the observed object is a genuine
- *       chaotic attractor (not a numerical artefact).  Makes the
- *       "strange attractor" terminology mathematically rigorous.
- *
- *   [5] Saltzman, B. (1962) — "Finite Amplitude Free Convection as an
- *       Initial Value Problem—I", *J. Atmos. Sci.* 19 (4), 329-341.
- *       The 7-mode convection model that Lorenz [1] truncated to 3
- *       modes.  Source of the physical interpretation of σ (Prandtl),
- *       ρ (Rayleigh-ratio), β (convection-cell geometry).
- *
- *  ── Numerical integration & Lyapunov analysis ──────────────────────
- *
- *   [6] Press, W. H.; Teukolsky, S. A.; Vetterling, W. T.; Flannery,
- *       B. P. (2007) — *Numerical Recipes*, 3rd ed., Cambridge.
- *       Ch.17 covers classical RK4 derivation, local-error analysis,
- *       and the step-size / accuracy trade-off.  Backs the L_H = 0.005
- *       choice (RK4 global error ≈ h⁴ ≈ 6×10⁻¹⁰ per step).
- *
- *   [7] Wolf, A.; Swift, J. B.; Swinney, H. L.; Vastano, J. A. (1985) —
- *       "Determining Lyapunov exponents from a time series", *Physica D*
- *       16 (3), 285-317.  Foundational paper on numerical Lyapunov
- *       computation.  λ ≈ 0.9056 for σ=10, ρ=28, β=8/3 comes from here;
- *       it sets the timescale on which the ε-sep indicator climbs.
- *
- *  ── Visualisation ──────────────────────────────────────────────────
- *
- *   [8] Ware, C. (2020) — *Information Visualization: Perception for
- *       Design*, 4th ed., Morgan Kaufmann.  Ch.4 on perceptual contrast
- *       backs the depth × age brightness coding; Ch.5 on motion and
- *       depth backs the auto-rotation + parallax-starfield strategy.
- *
- *   [9] Foley, J. D.; van Dam, A.; Feiner, S. K.; Hughes, J. F. (1995) —
- *       *Computer Graphics: Principles and Practice*, 2nd ed., Addison-
- *       Wesley.  Ch.6 / 12 cover orthographic projection math — the
- *       azimuth-elevation rotation in §4 project() comes straight from
- *       this textbook.
- *
- * ═════════════════════════════════════════════════════════════════════
+ * References the code can't tell you on its own:
+ *   Lorenz, E. N. (1963), "Deterministic Nonperiodic Flow", J. Atmos. Sci.
+ *     20(2), 130-141 — the original equations.
+ *   Strogatz, Nonlinear Dynamics and Chaos (2014), Ch.9 — best gentle intro.
+ *   Press et al., Numerical Recipes (2007), Ch.17 — the RK4 step we use.
+ *   Wolf et al. (1985), Physica D 16(3), 285-317 — where the chaos rate
+ *     λ ≈ 0.9 comes from (how fast the ghosts pull apart).
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra lorenz.c -o lorenz -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Classical four-stage Runge-Kutta (RK4) [6] applied to
- *                  the autonomous 3-variable Lorenz ODE.  Autonomous =
- *                  no explicit t in dx/dt = f(x,y,z), so each RK4 step
- *                  uses only the current state.  Step size L_H is fixed
- *                  in Lorenz-time units regardless of display fps —
- *                  decouples physics from rendering speed.
- *
- * Physics/Math   : Deterministic chaos on a strange attractor [1, 4].
- *                  Lorenz (1963) derived these equations from Saltzman's
- *                  truncated convection model [5]:
- *                    σ (sigma) = Prandtl number  (ν/κ)
- *                    ρ (rho)   = Rayleigh-ratio  (Ra / Ra_critical)
- *                    β (beta)  = convection-cell geometric factor
- *                  At σ=10, ρ=28, β=8/3 the system has a STRANGE
- *                  ATTRACTOR: bounded but never repeating, Lyapunov
- *                  exponent λ ≈ 0.9 [7], Hausdorff dimension ≈ 2.06.
- *                  Tucker [4] proved the geometric existence of this
- *                  attractor in 1999 (computer-assisted), settling the
- *                  question whether the picture was a numerical artefact.
- *
- * Rendering      : Orthographic projection [9] with azimuth φ and
- *                  elevation θ.  The 3-D point (x,y,z) is rotated around
- *                  the z-axis by φ, then the (ry, z) plane is tilted by θ
- *                  to produce screen (sx, sy) plus a camera-axis depth sz
- *                  (the latter drives the depth-cue brightness [8]).
- *                  ASPECT compensates for non-square terminal cell ratio.
- *                  Multi-layer pipeline (back-to-front): starfield →
- *                  equilibrium markers → ghosts → main trail (with
- *                  bloom + depth) OR density heatmap.
- *
- * Data-structure : Ring-buffer trail (TRAIL_LEN=2500 points) per
- *                  trajectory; 1 main + 5 ghost = 6 trails total.
- *                  At 60 fps × 8 sub-steps = 480 points/s, 2500 points
- *                  ≈ 5.2 s of trajectory history — long enough for the
- *                  full butterfly shape to be visible at any moment.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -227,9 +35,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
 enum {
   SIM_FPS_MIN = 10,
@@ -238,57 +44,49 @@ enum {
   SIM_FPS_STEP = 10,
   FPS_UPDATE_MS = 500,
   N_COLORS = 7,
-  TRAIL_LEN = 2500, /* ring-buffer length per trajectory          */
-  SUB_STEPS = 8,    /* RK4 sub-steps per sim tick                 */
+  TRAIL_LEN = 2500, /* how many past points each trail remembers   */
+  SUB_STEPS = 8,    /* physics steps taken per on-screen tick       */
 };
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* Lorenz system parameters — classic "chaotic" values:
- * σ=10 (Prandtl ≈ air), ρ=28 (Rayleigh just above onset of turbulence),
- * β=8/3 (geometry factor for a square convection cell).
- * Changing any of these shifts the system between periodic, quasi-periodic,
- * and chaotic regimes.  ρ < 1 → all trajectories converge to origin.
- * ρ ≈ 24.74 → onset of chaos.  ρ > 28 → fully developed butterfly attractor. */
+/* The three knobs in the Lorenz equations.  These exact values are the
+ * famous chaotic ones that give the butterfly; nudge them and the shape
+ * changes (too small and the point just spirals to a stop instead). */
 #define L_SIGMA 10.0f
 #define L_RHO 28.0f
 #define L_BETA (8.0f / 3.0f)
 
-/* L_H: fixed RK4 step in Lorenz time units.
- * At h=0.005 the RK4 global error is O(h⁴) ≈ 6×10⁻¹⁰ per step — far
- * below float precision over the first 10 s.  Larger h (e.g. 0.02) causes
- * the trajectory to visibly drift off the true attractor.                 */
+/* How big a step the physics takes each time.  Small means accurate but
+ * slow; this value is small enough that the trail stays glued to the real
+ * butterfly.  Make it much bigger and the curve visibly drifts off. */
 #define L_H 0.005f
 
-/* N_GHOSTS: number of ε-offset ghost trajectories shown alongside the
- * main trajectory.  Each ghost gets a different initial offset from
- * GHOST_EPS_TABLE below.  The fan-out from initially-close ghosts to
- * fully-spread ghosts IS the visual signature of Lyapunov chaos. */
+/* How many "ghost" points we run beside the main one.  Each starts a tiny
+ * bit apart; watching them spread out is the whole point of the demo. */
 #define N_GHOSTS 5
 
-/* GHOST_EPS_TABLE: per-ghost initial x-offset (Lorenz units).
- * Spans four orders of magnitude (0.001 → 0.1) so the divergence
- * timescale is visible across one viewing session: the smallest ε
- * stays close to the main trail for ~5 Lyapunov times before fully
- * spreading; the largest ε reaches attractor scale almost immediately.
- * Lyapunov exponent λ ≈ 0.9 → ε doubles every ~0.77 Lorenz-time. */
+/* How far each ghost starts from the main point (a nudge in x).  We pick a
+ * wide spread, from a whisker (0.001) to a noticeable gap (0.1), so within
+ * one sitting you can see the close one slowly pull away while the far one
+ * scatters almost at once. */
 static const float GHOST_EPS_TABLE[N_GHOSTS] = {0.001f, 0.005f, 0.01f, 0.05f,
                                                 0.1f};
 
 /* View */
 #define CELL_W 8
 #define CELL_H 16
-#define ASPECT ((float)CELL_W / (float)CELL_H) /* ≈ 0.5 */
+/* Terminal cells are taller than they are wide, so we squash the vertical
+ * axis by this ratio to keep the butterfly from looking stretched. */
+#define ASPECT ((float)CELL_W / (float)CELL_H)
 
-#define VIEW_PHI_DEFAULT 0.5f    /* initial azimuth (rad)               */
-#define VIEW_THETA_DEFAULT 0.55f /* initial elevation (rad)             */
-#define VIEW_PHI_SPEED 0.08f     /* auto-rotation speed (rad/s)         */
+#define VIEW_PHI_DEFAULT 0.5f    /* starting left/right spin angle      */
+#define VIEW_THETA_DEFAULT 0.55f /* starting up/down tilt angle         */
+#define VIEW_PHI_SPEED 0.08f     /* how fast the hands-free spin turns  */
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -306,57 +104,43 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color / theme                                                      */
-/* ===================================================================== */
+/* ── §3  color / theme ── */
 
 enum {
-  CP_TRAIL_HEAD = 1, /* newest trail tier — theme head colour       */
-  CP_TRAIL_MID = 2,  /* mid-age trail tier — theme mid colour       */
-  CP_TRAIL_TAIL = 3, /* oldest trail tier — theme tail colour       */
-  CP_GHOST = 4,      /* ghost trajectory + ε-sep indicator          */
-  CP_HUD = 5,        /* status bar — canonical bright yellow (226)  */
-  CP_HINT = 6,       /* action keys — canonical bright cyan  (51)   */
+  CP_TRAIL_HEAD = 1, /* newest part of the trail — brightest colour  */
+  CP_TRAIL_MID = 2,  /* middle-aged part of the trail                */
+  CP_TRAIL_TAIL = 3, /* oldest, fading part of the trail             */
+  CP_GHOST = 4,      /* the ghost trails and the gap-size readout    */
+  CP_HUD = 5,        /* top status bar — bright yellow               */
+  CP_HINT = 6,       /* bottom key hints — bright cyan               */
 };
 
 /*
- * Theme — 4 colour anchors for the Lorenz trail visualisation.
+ * Theme — the four colours one look uses for the trail.
  *
- * The trail is rendered with an AGE-BASED COLOUR RAMP: newest points
- * paint with `head` + A_BOLD, mid-age points use `mid`, oldest points
- * use `tail` (with A_DIM for the very oldest tier).  The `ghost`
- * colour paints both the ε-offset trajectory and the inline
- * separation indicator.
+ * The trail fades with age: its newest stretch is painted in `head`
+ * (and bold), the middle in `mid`, the old end in `tail`.  `ghost`
+ * colours the faint shadow trails and the gap-size readout text.
  *
- * Picking themes is just choosing 4 coordinated hues — no ramp logic,
- * no interpolation.  Each theme tells a different visual story while
- * preserving the same age-to-brightness signal (newest = brightest).
+ * Switching themes is just swapping these four colours — no blending or
+ * math.  Every theme keeps the same rule (newest = brightest) so the
+ * trail still reads the same way, just in different hues.
  *
- * Fixed pairs across all themes:
- *   CP_HUD   bright yellow 226 (status bar, CLAUDE.md canonical)
- *   CP_HINT  bright cyan   51  (action keys, CLAUDE.md canonical)
+ * Two more colours stay fixed no matter the theme: yellow for the status
+ * bar and cyan for the key hints (set up once in color_init).
  */
 typedef struct {
   const char *name;
-  short head;  /* newest trail tier — painted with A_BOLD           */
-  short mid;   /* mid-age trail tier                                */
-  short tail;  /* oldest trail tier — A_DIM for ancient subtier     */
-  short ghost; /* ghost trajectory + ε-sep indicator                */
+  short head;  /* newest trail colour (drawn bold)                  */
+  short mid;   /* middle-aged trail colour                          */
+  short tail;  /* oldest, fading trail colour                       */
+  short ghost; /* ghost trails + gap-size readout                   */
 } Theme;
 
 /*
- * 10 themes — hand-picked 4-anchor palettes in the xterm-256 palette.
- *
- *   MATRIX  — phosphor green CRT
- *   FIRE    — red / orange / yellow flame (original default)
- *   OCEANIC — deep blue → bright cyan
- *   NEON    — hot pink electric on purple
- *   MONO    — pure greyscale
- *   ICE     — pale blue / white frost
- *   NOVA    — white star burst with purple shadow
- *   FOREST  — lime / olive / dark green
- *   DESERT  — gold / orange / brown
- *   ECLIPSE — bright red fading into purple shadow
+ * Ten ready-made looks, each just four colours picked to go together.
+ * Names hint at the mood: MATRIX (green CRT), FIRE (flame), OCEANIC,
+ * NEON, MONO (greyscale), ICE, NOVA, FOREST, DESERT, ECLIPSE.
  */
 static const Theme THEMES[] = {
     /*  name         head  mid  tail  ghost */
@@ -368,15 +152,13 @@ static const Theme THEMES[] = {
 };
 #define N_THEMES ((int)(sizeof THEMES / sizeof THEMES[0]))
 
-/* Active theme index — cycled by t/T keys.  File-scope so theme_apply
- * is callable from both startup (color_init) and the runtime key
- * handler. */
+/* Which theme is showing right now; the t/T keys step through them.
+ * Kept here at file scope so both startup and the key handler can read it. */
 static int g_theme_idx = 0;
 
 /*
- * theme_apply — rebuild the THEME-DEPENDENT colour pairs for theme
- * `idx`.  Fixed pairs (CP_HUD, CP_HINT) are NOT touched — they live
- * in color_init() and stay constant across themes.
+ * Switches the trail colours over to theme `idx`.  Leaves the fixed
+ * yellow/cyan UI colours alone — only the four trail/ghost colours change.
  */
 static void theme_apply(int idx) {
   if (idx < 0 || idx >= N_THEMES)
@@ -389,7 +171,8 @@ static void theme_apply(int idx) {
     init_pair(CP_TRAIL_TAIL, t->tail, -1);
     init_pair(CP_GHOST, t->ghost, -1);
   } else {
-    /* 8-colour ANSI fallback — themes collapse to one palette */
+    /* Old 8-colour terminal: no room for themes, so fall back to one
+     * fixed set of basic colours. */
     init_pair(CP_TRAIL_HEAD, COLOR_RED, -1);
     init_pair(CP_TRAIL_MID, COLOR_YELLOW, -1);
     init_pair(CP_TRAIL_TAIL, COLOR_GREEN, -1);
@@ -398,16 +181,16 @@ static void theme_apply(int idx) {
 }
 
 /*
- * color_init — one-shot at startup.  Binds the two FIXED HUD pairs
- * (yellow status, cyan hints) and then applies the initial theme.
+ * Sets up colours once at startup: the fixed yellow status bar and cyan
+ * hints, then the starting theme.
  */
 static void color_init(void) {
   start_color();
   use_default_colors();
 
   if (COLORS >= 256) {
-    init_pair(CP_HUD, 226, -1); /* canonical bright yellow */
-    init_pair(CP_HINT, 51, -1); /* canonical bright cyan   */
+    init_pair(CP_HUD, 226, -1); /* bright yellow */
+    init_pair(CP_HINT, 51, -1); /* bright cyan   */
   } else {
     init_pair(CP_HUD, COLOR_YELLOW, -1);
     init_pair(CP_HINT, COLOR_CYAN, -1);
@@ -416,21 +199,16 @@ static void color_init(void) {
   theme_apply(g_theme_idx);
 }
 
-/* ===================================================================== */
-/* §4  coords — orthographic 3-D → 2-D projection                        */
-/* ===================================================================== */
+/* ── §4  coords — turning a 3-D point into a screen cell ── */
 
-/* ── project() math primitives ──────────────────────────────────────── *
- *
- * The full 3-D → 2-D pipeline is four named transformations applied in
- * order — translate the world so the attractor is centred at the origin,
- * rotate around z by azimuth φ, tilt around x by elevation θ, then map
- * (sx, sy) to a terminal cell.  Each step gets a tiny helper so the
- * orchestrator project() reads as the textbook recipe.                */
+/* Turning a point in 3-D space into a spot on the flat screen takes four
+ * little steps, done in order: slide the whole shape so it's centred,
+ * spin it left/right, tilt it up/down, then place it on a terminal cell.
+ * Each step is its own tiny helper so project() below reads like a recipe. */
 
-/* (1) TRANSLATE — recentre Lorenz space so the attractor (which sits
- *     mostly in z ∈ [0, 50]) is centred on the origin (z = 0 after
- *     translation).  Pure shift; x and y unchanged. */
+/* Step 1: slide the shape so it sits centred on screen.  The butterfly
+ * naturally floats above the origin, so we just pull it down; left/right
+ * and depth stay put. */
 static inline void world_center_at_attractor(float lx, float ly, float lz,
                                              float *px, float *py, float *pz) {
   *px = lx;
@@ -438,19 +216,19 @@ static inline void world_center_at_attractor(float lx, float ly, float lz,
   *pz = lz - 25.0f;
 }
 
-/* (2) ROTATE AROUND Z by azimuth φ.  Stand 2-D rotation in the (x, y)
- *     plane; the convention here puts the camera implicitly along +y
- *     after rotation, so ry becomes the "into-screen" axis. [9] */
+/* Step 2: spin the shape left/right by angle phi, like turning a model on
+ * a lazy Susan.  After the spin, ry measures how far "into the screen" a
+ * point sits. */
 static inline void rotate_around_z_axis(float px, float py, float phi,
                                         float *rx, float *ry) {
   *rx = px * cosf(phi) + py * sinf(phi);
   *ry = -px * sinf(phi) + py * cosf(phi);
 }
 
-/* (3) TILT AROUND X by elevation θ.  Rotates the (ry, pz) plane.  After
- *     tilt, sy is the vertical screen coord and sz is the camera-axis
- *     depth (positive = behind centre / farther; negative = in front /
- *     closer).  Used downstream for depth-cued shading. [8, 9] */
+/* Step 3: tilt the shape up/down by angle theta, like nodding it toward
+ * or away from you.  sy comes out as the up/down screen position; sz is
+ * how near or far the point ended up (negative = toward you / closer,
+ * positive = away / farther).  We use sz later to brighten near points. */
 static inline void tilt_around_x_axis(float ry, float pz, float theta,
                                       float *sy, float *sz) {
   *sy = ry * cosf(theta) + pz * sinf(theta);
@@ -458,90 +236,67 @@ static inline void tilt_around_x_axis(float ry, float pz, float theta,
 }
 
 /*
- * project() — map a Lorenz-space point to terminal (col, row, depth).
+ * Takes one 3-D point and works out which terminal cell it lands on, plus
+ * how near/far it is.  Runs the four steps above (centre, spin, tilt,
+ * place), then checks the result is actually on screen.
  *
- * Pseudocode pipeline (matches the helpers above):
+ * Pass NULL for out_depth if you don't care about near/far (the fixed-point
+ * markers and the heatmap don't).  The trail and stars pass a real pointer
+ * so closer points can be drawn brighter.
  *
- *   (1) translate world so attractor centres on origin
- *   (2) rotate around z by azimuth φ        → (rx, ry, pz)
- *   (3) tilt   around x by elevation θ      → screen (sx=rx, sy) + depth sz
- *   (4) scale  + offset to cell coords      → (col, row)
- *   (5) clip   to the renderable band       → return false if off-screen
- *
- * out_depth: pass NULL when the caller doesn't need depth shading
- * (e.g. equilibrium markers, density binning).  Trail rendering and
- * starfield pass &depth so closer points get a brightness boost.
- *
- * Returns false if (col, row) falls outside the renderable band
- * (rows [1, rows-2], cols [0, cols-1]).
+ * Returns false when the point would land off-screen.
  */
 static bool project(float lx, float ly, float lz, float phi, float theta,
                     float scale, int cx, int cy, int cols, int rows,
                     int *out_col, int *out_row, float *out_depth) {
   float px, py, pz;
-  world_center_at_attractor(lx, ly, lz, &px, &py, &pz); /* (1) */
+  world_center_at_attractor(lx, ly, lz, &px, &py, &pz); /* centre */
 
   float rx, ry;
-  rotate_around_z_axis(px, py, phi, &rx, &ry); /* (2) */
+  rotate_around_z_axis(px, py, phi, &rx, &ry); /* spin */
 
   float sx = rx;
   float sy, sz;
-  tilt_around_x_axis(ry, pz, theta, &sy, &sz); /* (3) */
+  tilt_around_x_axis(ry, pz, theta, &sy, &sz); /* tilt */
 
-  int col = cx + (int)(sx * scale); /* (4) */
+  /* scale up and shift to the middle of the screen */
+  int col = cx + (int)(sx * scale);
   int row = cy - (int)(sy * scale * ASPECT);
 
   *out_col = col;
   *out_row = row;
   if (out_depth)
     *out_depth = sz;
-  return (col >= 0 && col < cols && row >= 1 && row < rows - 1); /* (5) */
+  return (col >= 0 && col < cols && row >= 1 && row < rows - 1); /* on screen? */
 }
 
-/* ===================================================================== */
-/* §5  entity — Lorenz                                                    */
-/* ===================================================================== */
+/* ── §5  entity — Lorenz ── */
 
 /*
- * Trail — bounded history of integration points for one trajectory.
+ * Trail — the recent path of one moving point, so we can draw it as a
+ * fading streak instead of a lone dot.
  *
- * WHY a ring buffer (and not a linear append-only array):
- *   the integration runs forever; a linear buffer would either grow
- *   unbounded (memory leak) or stop recording after some cap (info
- *   loss).  A ring of TRAIL_LEN slots overwrites the oldest sample
- *   on each push — bounded memory, O(1) push, and the last
- *   TRAIL_LEN samples are always available.  TRAIL_LEN = 2500 covers
- *   ≈ 5.2 s of trajectory at our 60-fps × 8-substep cadence — long
- *   enough for the full butterfly outline to be visible at any time
- *   without storing minutes of history.
+ * It's a ring buffer: a fixed block of slots that we write round and
+ * round, overwriting the oldest point each time.  The simulation runs
+ * forever, so we can't just keep adding to a list — this keeps memory
+ * flat while always holding the most recent TRAIL_LEN points.  That's
+ * about five seconds of motion, enough to see the whole butterfly at once.
  *
- * WHY {head, count} (and not {head, tail}):
- *   the buffer fills monotonically (no element is ever removed
- *   except by overwrite), so a tail pointer would just be
- *   head − count + 1 mod TRAIL_LEN — redundant.  count also gives
- *   the renderer a free progress signal: count < TRAIL_LEN means the
- *   ring isn't full yet, so the oldest-end shows what's actually
- *   there rather than uninitialised noise.
+ * We track where the newest point is (head) and how many points we have
+ * so far (count) — not a separate "oldest" marker, since that's just
+ * implied by those two.  count also tells the renderer whether the trail
+ * has filled up yet, so it never draws leftover garbage slots.
  *
- * WHY parallel x[]/y[]/z[] arrays (not an array of {x,y,z} structs):
- *   the renderer walks the ring projecting one point at a time and
- *   reads all three coords for each point — so SoA vs AoS makes no
- *   cache-locality difference here.  Parallel arrays match the
- *   trail_push / trail_clear interface (three scalars in) and avoid
- *   needing a Vec3 type that doesn't exist elsewhere in the file.
+ * The three coordinates live in separate arrays purely because it matches
+ * how points go in and out (three plain numbers at a time); it makes no
+ * speed difference here.
  */
 typedef struct {
-  float x[TRAIL_LEN]; /* x coordinates of the last TRAIL_LEN samples  */
-  float y[TRAIL_LEN]; /* y coordinates                                */
-  float z[TRAIL_LEN]; /* z coordinates                                */
-  int head;
-  /* Index of the NEWEST sample.  trail_push advances head before
-   * writing.  Renderer iterates k = 0..count-1 with index
-   * (head - k + TRAIL_LEN) % TRAIL_LEN → newest first. */
-  int count;
-  /* Number of valid samples, ≤ TRAIL_LEN.  Saturates at
-   * TRAIL_LEN once the ring is full.  Drives the renderer's
-   * age normalisation: age = k / (count - 1).                 */
+  float x[TRAIL_LEN]; /* the last TRAIL_LEN points, split by coordinate */
+  float y[TRAIL_LEN];
+  float z[TRAIL_LEN];
+  int head;  /* slot holding the newest point                          */
+  int count; /* how many slots are filled so far (caps at TRAIL_LEN)    */
 } Trail;
 
 static void trail_push(Trail *t, float x, float y, float z) {
@@ -585,129 +340,92 @@ static void lorenz_rk4(float *x, float *y, float *z, float h) {
   *z += (h / 6.0f) * (k1z + 2.0f * k2z + 2.0f * k3z + k4z);
 }
 
-/* ── Lorenz entity ─────────────────────────────────────────────────── *
+/*
+ * Lorenz — the whole visible world in one box.
  *
- * The entire visible world in one struct: 6 trajectories (1 main +
- * 5 ghosts), their per-trail ring buffers, the camera, and the
- * render-toggle latches.
+ * It holds six moving points (one main point plus five ghosts), the
+ * trail behind each, where the camera is looking, and a handful of
+ * on/off switches for the different views.  We keep it all in one
+ * struct so a single `Lorenz *l` can be handed to the update, draw,
+ * and key-handling code without passing fifteen separate arguments.
  *
- * WHY a struct (and not loose globals): every field shares the same
- *   lifetime — born at scene_init, dies at scene_free (none today,
- *   but the API supports it).  Bundling lets `Lorenz *l` carry the
- *   whole world through lorenz_tick / lorenz_draw / handle_key
- *   without 15-argument function signatures.
- *
- * WHY ONE struct (not separate SimState + RenderState):
- *   the renderer reads simulation fields (trajectory positions) every
- *   frame; the simulation never reads render state.  Splitting would
- *   force the renderer to take two arguments and would buy nothing —
- *   the lifetime is identical.  We use comment dividers below to mark
- *   the sim/render boundary INSIDE the struct.
- *
- * LOCALITY INTENT (fields grouped, top-to-bottom):
- *
- *   SIMULATION HALF  — physics state, advanced by lorenz_tick:
- *     mx, my, mz, mt              main trajectory + trail
- *     gx[], gy[], gz[], gt[]      N_GHOSTS ghost trajectories + trails
- *
- *   VIEW (shared)    — written by handle_key (manual), read by every
- *                      renderer.  auto_rotate also lets lorenz_tick
- *                      drift phi for hands-free demos:
- *     phi, theta                  azimuth + elevation (radians)
- *     auto_rotate                 hands-free rotation on/off
- *
- *   RENDERING / UI latches — written by handle_key only, read by
- *                            lorenz_draw and the HUD overlay:
- *     show_ghost                  g — multi-ghost shower
- *     show_lobe                   l — colour by attractor wing
- *     show_density                h — density heatmap (replaces trail)
- *     paused                      space — lorenz_tick early-returns
- *
- * References for the field semantics: [1] for the trajectory ODE,
- * [7] for the Lyapunov-driven ghost divergence timescale, [3] for
- * the attractor's invariant measure (what density mode reveals),
- * [9] for the (phi, theta) projection conventions.
+ * It's one struct, not two (a "simulation" half and a "drawing" half),
+ * because the drawing code reads the point positions every frame while
+ * the simulation never looks at the view switches — splitting them
+ * would just mean passing two things everywhere for no gain.  The
+ * fields below are still grouped by job: the moving points first, then
+ * the camera, then the view switches.
  */
 typedef struct {
 
-  /* ── SIMULATION: main trajectory ─────────────────────────────── */
+  /* ── the main point ── */
   float mx, my, mz;
-  /* Current 3-D state of the MAIN trajectory in Lorenz space.
-   * Advanced by lorenz_rk4 once per sub-step.  Initial state
-   * (1, 1, 1) — approximately on the attractor.            [1] */
+  /* Where the main point is right now in 3-D space.  Nudged forward
+   * a little each step.  It starts at (1, 1, 1), which sits right on
+   * the butterfly, so the trail joins the shape almost at once. */
 
   Trail mt;
-  /* Ring-buffer history of the main trajectory — see Trail
-   * doc.  Pushed once per sub-step; rendered with age + depth
-   * + (optional) lobe colouring + bloom on the head.        */
+  /* The path the main point has traced — its fading streak.  A new
+   * spot is added every step; see the Trail doc above. */
 
-  /* ── SIMULATION: N_GHOSTS ε-offset shadow trajectories ────────── */
+  /* ── the ghost points ── */
   float gx[N_GHOSTS], gy[N_GHOSTS], gz[N_GHOSTS];
-  /* Each ghost g starts at (1 + ε_g, 1, 1) where ε_g comes
-   * from GHOST_EPS_TABLE (0.001..0.1 spanning four decades).
-   * Same Lorenz ODE as the main — by construction they
-   * differ ONLY in initial conditions, so any divergence is
-   * pure deterministic chaos (sensitive dependence on i.c.).
-   * Diverge exponentially as exp(λ t), λ ≈ 0.9 [7].         */
+  /* Where each ghost point is right now.  Every ghost starts a tiny
+   * nudge away from the main point (the nudges come from
+   * GHOST_EPS_TABLE) and then obeys the exact same rules.  Because
+   * the only difference is that first tiny nudge, watching them drift
+   * apart is chaos itself — small starts, wildly different endings. */
 
   Trail gt[N_GHOSTS];
-  /* Per-ghost ring buffer.  Rendered in CP_GHOST + A_DIM with
-   * ',' glyph (no lobe colouring, no bloom).  The widest-ε
-   * ghost paints first so the close ghosts overlay it —
-   * visual order matches the divergence order.             */
+  /* The fading streak behind each ghost.  Drawn faint, with a comma,
+   * and the widest-nudge ghost is painted first so the closer ones
+   * land on top. */
 
-  /* ── VIEW (written by handle_key, read by every renderer) ─────── */
+  /* ── where the camera looks ── */
   float phi;
-  /* Azimuth in radians — rotation around the z-axis.  Auto-
-   * incremented by VIEW_PHI_SPEED·dt when auto_rotate is on;
-   * adjusted by ←/→ keys (which also disable auto_rotate).
-   * Sets the rx/ry plane in project(). [9]                  */
+  /* Left/right spin angle of the view.  Creeps along on its own when
+   * auto-spin is on, and the left/right arrow keys nudge it by hand
+   * (which also turns auto-spin off). */
 
   float theta;
-  /* Elevation in radians — tilt of the (ry, z) plane toward
-   * the camera.  Adjusted by ↑/↓; clamped to [0.1, 1.4] so
-   * the view stays away from gimbal singularities.          */
+  /* Up/down tilt angle of the view.  The up/down arrows change it,
+   * kept inside a sensible range so the view never flips over or
+   * goes flat. */
 
   bool auto_rotate;
-  /* If true, lorenz_tick drifts phi for a hands-free demo.
-   * Toggled by 'a'; also disabled implicitly by any manual
-   * ←/→ keypress so the user never has to fight the drift. */
+  /* When on, the view slowly spins by itself for a hands-free show.
+   * Toggled with 'a', and also switched off the moment you steer with
+   * the arrow keys, so you're never fighting the drift. */
 
-  /* ── RENDERING / UI latches (never affect physics) ───────────── */
+  /* ── view switches (these only change what you see, never the math) ── */
   bool show_ghost;
-  /* g — draw the 5-ghost Lyapunov shower under the main
-   * trail.  Off → only the main trail and the ε-sep number
-   * indicator are visible.                                  */
+  /* g — show the five ghost trails under the main one.  Off, and you
+   * just see the main trail and the gap-size readout. */
 
   bool show_lobe;
-  /* l — LOBE MODE.  When on, main trail colour is keyed by
-   * sign(x): right wing → CP_TRAIL_HEAD, left wing →
-   * CP_GHOST.  Reveals the chaotic wing-switches as vivid
-   * hue flips — the Lorenz bistability [3] made visceral.
-   * Age still controls A_BOLD / NORMAL / DIM intensity.    */
+  /* l — colour the main trail by which wing of the butterfly it's on:
+   * one colour for the right wing, another for the left.  The colour
+   * flips every time the point jumps wings, which is the chaos you
+   * can't predict, shown as a sudden change of hue. */
 
   bool show_density;
-  /* h — DENSITY MODE.  Replaces the trail with a 2-D
-   * screen-space heatmap accumulating trail-cell visits.
-   * Reveals the attractor's invariant measure [3] — where
-   * the trajectory actually spends its time.  Auto-resets
-   * on rotation (each angle re-accumulates).               */
+  /* h — swap the trail for a heatmap: instead of the path, show where
+   * the point spends most of its time, brightest where it lingers.
+   * It's tied to one camera angle, so it clears itself whenever you
+   * turn the view. */
 
   bool paused;
-  /* space — physics freeze.  lorenz_tick early-returns; the
-   * renderer keeps painting (so the user can study a frozen
-   * state).  View rotation also halts (no auto_rotate while
-   * paused, since rotation lives in lorenz_tick).          */
+  /* space — freeze the motion.  The math stops, but drawing keeps
+   * going so you can study the frozen shape.  The auto-spin pauses
+   * too, since the spin happens inside the same update step. */
 } Lorenz;
 
-/* ── lorenz_init step-helpers ───────────────────────────────────────── *
- *
- * Initialisation is four named steps: seed the main trajectory, seed
- * the ghost shower, reset the view, reset the render toggles.        */
+/* Setup is four small steps: place the main point, place the ghosts,
+ * reset the camera, reset the view switches. */
 
-/* (1) SEED MAIN TRAJECTORY at (1,1,1) — approximately on the attractor,
- *     so the trail joins the butterfly almost immediately rather than
- *     having a long transient flying-into-frame. */
+/* Drop the main point at (1,1,1), which sits right on the butterfly, so
+ * the trail joins the shape straight away instead of flying in from far
+ * off. */
 static void seed_main_trajectory(Lorenz *l) {
   l->mx = 1.0f;
   l->my = 1.0f;
@@ -716,10 +434,9 @@ static void seed_main_trajectory(Lorenz *l) {
   trail_push(&l->mt, l->mx, l->my, l->mz);
 }
 
-/* (2) SEED GHOST SHOWER — N_GHOSTS trajectories at (1 + ε_g, 1, 1)
- *     where ε_g comes from GHOST_EPS_TABLE.  All ghosts share an
- *     initial y/z; only x differs by ε.  After integration each
- *     ghost diverges exponentially at rate λ ≈ 0.9 [7]. */
+/* Place the ghosts, each one a tiny nudge in x away from the main point
+ * (the nudges come from GHOST_EPS_TABLE).  Same start in y and z; only
+ * x differs.  From there they pull apart fast — that's the whole show. */
 static void seed_ghost_shower(Lorenz *l) {
   for (int g = 0; g < N_GHOSTS; g++) {
     l->gx[g] = 1.0f + GHOST_EPS_TABLE[g];
@@ -730,16 +447,16 @@ static void seed_ghost_shower(Lorenz *l) {
   }
 }
 
-/* (3) RESET VIEW DEFAULTS — camera angles + auto-rotate. */
+/* Put the camera back to its starting angles, with auto-spin on. */
 static void reset_view_defaults(Lorenz *l) {
   l->phi = VIEW_PHI_DEFAULT;
   l->theta = VIEW_THETA_DEFAULT;
   l->auto_rotate = true;
 }
 
-/* (4) RESET RENDER TOGGLES — show_ghost on (the multi-ghost shower
- *     is the default visual signature); lobe + density off (those are
- *     alternate views user must opt into); paused off. */
+/* Reset the view switches: ghosts on (that's the demo's signature
+ * look), the wing-colour and heatmap views off (you opt into those),
+ * and not paused. */
 static void reset_render_toggles(Lorenz *l) {
   l->show_ghost = true;
   l->show_lobe = false;
@@ -747,14 +464,11 @@ static void reset_render_toggles(Lorenz *l) {
   l->paused = false;
 }
 
-/*
- * lorenz_init — four-step recipe; body reads as the recipe.
- */
 static void lorenz_init(Lorenz *l) {
-  seed_main_trajectory(l); /* (1) main at (1,1,1)                 */
-  seed_ghost_shower(l);    /* (2) N_GHOSTS at (1 + ε_g, 1, 1)     */
-  reset_view_defaults(l);  /* (3) phi / theta / auto_rotate       */
-  reset_render_toggles(l); /* (4) show_ghost / lobe / density …   */
+  seed_main_trajectory(l); /* place the main point */
+  seed_ghost_shower(l);    /* place the ghosts     */
+  reset_view_defaults(l);  /* reset the camera     */
+  reset_render_toggles(l); /* reset view switches  */
 }
 
 static void lorenz_tick(Lorenz *l, float dt) {
@@ -774,14 +488,12 @@ static void lorenz_tick(Lorenz *l, float dt) {
   }
 }
 
-/* ── BACKGROUND STARFIELD ────────────────────────────────────────────── *
- *
- * ~60 fixed 3-D star positions scattered in a box around the attractor.
- * They project + paint each frame BEFORE the trail, so the attractor
- * appears in front of an ambient star backdrop.  Because the stars
- * rotate with the same azimuth as the lattice, you get parallax — the
- * stars sweep behind the attractor as the view spins (a strong depth
- * cue, even without proper z-buffering).                                */
+/* ── starfield backdrop ── */
+
+/* About 60 fixed stars scattered in a box around the butterfly.  They're
+ * drawn first, so the butterfly sits in front of them.  They spin with
+ * the same view, so as you turn, the stars slide past behind the shape —
+ * a cheap but convincing sense of depth. */
 
 #define N_STARS 60
 
@@ -790,8 +502,8 @@ static float g_star_y[N_STARS];
 static float g_star_z[N_STARS];
 static bool g_stars_initialised = false;
 
-/* Tiny LCG for star positions — avoids touching the main srand() state
- * so star placement stays reproducible regardless of when init runs. */
+/* Its own little random-number generator, kept separate from the program's
+ * main one so the stars land in the same spots every run. */
 static unsigned int stars_lcg_next(unsigned int *s) {
   *s = (*s) * 1103515245u + 12345u;
   return (*s) >> 16;
@@ -822,8 +534,8 @@ static void stars_draw(float phi, float theta, float scale, int cx, int cy,
     if (!project(g_star_x[i], g_star_y[i], g_star_z[i], phi, theta, scale, cx,
                  cy, cols, rows, &col, &row, &depth))
       continue;
-    /* Closer stars get A_NORMAL, far stars A_DIM — even the
-     * background has a faint depth signal. */
+    /* Near stars a touch brighter than far ones, so even the backdrop
+     * hints at depth. */
     attr_t at = (depth < -10.0f) ? A_NORMAL : A_DIM;
     wattron(w, COLOR_PAIR(CP_TRAIL_TAIL) | at);
     mvwaddch(w, row, col, '.');
@@ -831,25 +543,21 @@ static void stars_draw(float phi, float theta, float scale, int cx, int cy,
   }
 }
 
-/* ── EQUILIBRIUM (FIXED-POINT) MARKERS ───────────────────────────────── *
- *
- * The Lorenz system has 3 fixed points where d/dt = 0:
- *
- *   origin (0, 0, 0)        — unstable saddle for ρ > 1
- *   C+ = (+√(β(ρ−1)), +√(β(ρ−1)), ρ−1) = (+√72, +√72, 27)
- *   C- = (−√72, −√72, 27)
- *
- * For ρ ≈ 28 (our default) C± are unstable spirals — the two lobes of
- * the strange attractor each orbit AROUND one of them.  Marking the
- * fixed points shows the "skeleton" the chaotic trajectory wraps.    */
+/* ── the three still points ── */
 
-#define FP_C_XY 8.485281f /* √72 */
+/* The butterfly has three special spots where a point placed exactly
+ * there would never move: the centre (0,0,0) and one in the heart of
+ * each wing.  Nothing actually rests there — the two wings circle around
+ * those spots — so marking them shows the frame the whole shape is built
+ * on.  We draw a '+' at each. */
+
+#define FP_C_XY 8.485281f /* the wing-centre offset (square root of 72) */
 #define FP_C_Z 27.0f
 
 static const float FIXED_POINTS[3][3] = {
-    {0.0f, 0.0f, 0.0f},           /* origin */
-    {FP_C_XY, FP_C_XY, FP_C_Z},   /* C+     */
-    {-FP_C_XY, -FP_C_XY, FP_C_Z}, /* C-     */
+    {0.0f, 0.0f, 0.0f},           /* centre     */
+    {FP_C_XY, FP_C_XY, FP_C_Z},   /* right wing */
+    {-FP_C_XY, -FP_C_XY, FP_C_Z}, /* left wing  */
 };
 
 static void equilibria_draw(float phi, float theta, float scale, int cx, int cy,
@@ -865,19 +573,13 @@ static void equilibria_draw(float phi, float theta, float scale, int cx, int cy,
   }
 }
 
-/* ── DENSITY HEATMAP (alternate view) ────────────────────────────────── *
- *
- * 2-D screen-space accumulator: for each rendered frame (when the
- * density toggle is on) we project every trail point and increment a
- * per-cell counter.  Cells coloured by tier:
- *
- *   1..3       → CP_TRAIL_TAIL  A_DIM      '.'
- *   4..15      → CP_TRAIL_MID   A_NORMAL   '*'
- *   16+        → CP_TRAIL_HEAD  A_BOLD     '#'
- *
- * Density is in SCREEN coordinates, so it's valid only for a single
- * view.  When the view changes (rotation or elevation tilt) we reset
- * — gives the user a fresh accumulation at the new angle.            */
+/* ── heatmap of where the point lingers ── */
+
+/* A tally per screen cell: each frame we mark every cell the trail
+ * passes over and bump its count.  Cells that get visited often are
+ * drawn brighter ('.' for a few visits, '*' for more, '#' for a lot) —
+ * so you can see where the point really spends its time.  The tally is
+ * tied to one camera angle, so we wipe it whenever the view turns. */
 
 #define DENSITY_MAX_COLS 600
 #define DENSITY_MAX_ROWS 200
@@ -892,10 +594,9 @@ static void density_reset(void) {
   g_density_view_theta = -999.0f;
 }
 
-/* (a) View-change INVALIDATION — density is in SCREEN coords, so the
- *     accumulator is only valid for one (phi, theta).  If the camera
- *     has rotated past a small threshold (~3°), reset the buffer so
- *     the user sees a fresh accumulation at the new angle.        */
+/* The tally only makes sense for the angle it was built at.  If the
+ * camera has turned more than a hair since last time, wipe it and start
+ * fresh at the new angle. */
 static void density_invalidate_on_view_change(float phi, float theta) {
   if (fabsf(phi - g_density_view_phi) > 0.05f ||
       fabsf(theta - g_density_view_theta) > 0.05f) {
@@ -905,9 +606,8 @@ static void density_invalidate_on_view_change(float phi, float theta) {
   }
 }
 
-/* (b) Saturating BIN INCREMENT for one (col, row).  Bounds-checks the
- *     buffer extents and stops counting at 255 (uint8 saturation) —
- *     long sessions don't wrap to zero. */
+/* Bump the tally for one cell.  Ignores cells off the edge, and stops at
+ * 255 so a long session never rolls the count back around to zero. */
 static void density_bin_sample(int col, int row) {
   if (col < 0 || col >= DENSITY_MAX_COLS)
     return;
@@ -917,10 +617,8 @@ static void density_bin_sample(int col, int row) {
     g_density[row][col]++;
 }
 
-/*
- * density_accumulate — invalidate-on-view-change + walk the trail,
- * project each sample, bin it.  Body reads as two steps + a project loop.
- */
+/* Wipe the tally if the view turned, then run down the trail marking
+ * every cell it crosses. */
 static void density_accumulate(const Trail *t, float phi, float theta,
                                float scale, int cx, int cy, int cols,
                                int rows) {
@@ -967,30 +665,13 @@ static void density_draw(WINDOW *w, int cols, int rows) {
   }
 }
 
-/* ── lorenz_draw_trail step-helpers ─────────────────────────────────── *
- *
- * Painting one trail point is four orthogonal decisions:
- *
- *   COLOUR tier (which hue from the active theme):
- *     lobe-mode OFF → age tier:  head (newest) / mid / tail (oldest)
- *     lobe-mode ON  → wing sign: sign(x) > 0 head, else ghost colour
- *
- *   ATTRIBUTE tier (DIM / NORMAL / BOLD intensity):
- *     depth tier:  closer to camera → BOLD, mid → NORMAL, far → DIM
- *     OVERRIDE 1:  newest 2 points always A_BOLD (comet head)
- *     OVERRIDE 2:  oldest 20% always A_DIM (fading-memory tail)
- *
- *   GLYPH:
- *     head marker on k=0 ('O' main / 'x' ghost); else '.' or ','
- *
- *   BLOOM halo (main trail only, newest 2):
- *     4-cross '+' painted in theme head colour AROUND the head cell;
- *     visible perpendicular to motion (parallel cells get overdrawn
- *     by subsequent tail samples) → soft comet-head glow.
- *
- * Each gets a named helper so the inner loop reads as the four steps. */
+/* Drawing one dot of a trail comes down to four separate choices: which
+ * colour, how bright, which character, and whether to add a little glow.
+ * Each gets its own small helper so the loop below reads as those four
+ * steps. */
 
-/* COLOUR tier — pick a theme colour pair for this sample. */
+/* Which colour.  Normally it's by age — newest, middling, oldest.  In
+ * wing-colour mode it's by which wing the point is on instead. */
 static inline short trail_sample_color_pair(bool show_lobe, float lx,
                                             float age) {
   if (show_lobe)
@@ -1002,8 +683,9 @@ static inline short trail_sample_color_pair(bool show_lobe, float lx,
   return CP_TRAIL_TAIL;
 }
 
-/* ATTRIBUTE tier — pick A_DIM / A_NORMAL / A_BOLD from depth, with the
- * two age-extreme overrides for the comet head and fading tail. */
+/* How bright.  Mostly by depth — nearer is bolder — but the very newest
+ * dots are always bold (the bright comet head) and the very oldest are
+ * always faint (the fading tail). */
 static inline attr_t trail_sample_depth_attr(float depth, int k, float age) {
   attr_t at;
   if (depth < -10.0f)
@@ -1019,15 +701,17 @@ static inline attr_t trail_sample_depth_attr(float depth, int k, float age) {
   return at;
 }
 
-/* GLYPH — head marker (k=0) or trail dot.  Ghosts use ',' / 'x'. */
+/* Which character: the leading dot gets a marker, the rest a plain dot.
+ * Ghosts use their own quieter pair. */
 static inline char trail_sample_glyph(bool is_ghost, int k) {
   if (k == 0)
     return is_ghost ? 'x' : 'O';
   return is_ghost ? ',' : '.';
 }
 
-/* 4-cross BLOOM HALO around the comet head — perpendicular '+' marks
- * give the head a wide, glowing footprint without obscuring the trail. */
+/* A little glow around the leading dot: '+' marks just above, below, and
+ * to the sides, so the head looks bright and fat without smearing over
+ * the trail behind it. */
 static inline void paint_bloom_halo(int row, int col, int cols, int rows,
                                     WINDOW *w) {
   static const int hdr[4] = {-1, 1, 0, 0};
@@ -1041,12 +725,9 @@ static inline void paint_bloom_halo(int row, int col, int cols, int rows,
   wattroff(w, COLOR_PAIR(CP_TRAIL_HEAD));
 }
 
-/*
- * lorenz_draw_trail — walk one trail newest → oldest, project + paint
- * each sample with the four named encodings above, plus bloom halo on
- * the newest two main-trail samples.  Ghost trails skip lobe mode and
- * bloom (always CP_GHOST + A_DIM with ',' glyph).
- */
+/* Draw one trail, newest dot to oldest, using the four choices above,
+ * plus a glow on the newest couple of dots.  Ghost trails skip the
+ * wing-colour and the glow — they're always the same quiet grey comma. */
 static void lorenz_draw_trail(const Trail *t, bool is_ghost, bool show_lobe,
                               float phi, float theta, float scale, int cx,
                               int cy, int cols, int rows, WINDOW *w) {
@@ -1062,7 +743,8 @@ static void lorenz_draw_trail(const Trail *t, bool is_ghost, bool show_lobe,
                  cols, rows, &col, &row, &depth))
       continue;
 
-    /* skip duplicate cell to bound draw calls along the dense curve */
+    /* The curve is dense, so many points land on the same cell — skip
+     * the repeat to save needless drawing. */
     if (col == last_col && row == last_row)
       continue;
     last_col = col;
@@ -1088,24 +770,19 @@ static void lorenz_draw_trail(const Trail *t, bool is_ghost, bool show_lobe,
   }
 }
 
-/* ── lorenz_draw layer-orchestration helpers ────────────────────────── *
- *
- * lorenz_draw is a back-to-front layer stack: starfield → equilibrium
- * markers → trajectory (trails or density) → ε-sep text.  Each layer
- * gets a tiny named helper so the orchestrator reads top-to-bottom as
- * the visual recipe.                                                  */
+/* The full picture is painted back to front: stars, then the still-point
+ * markers, then the trails (or the heatmap), then the gap-size readout.
+ * Each layer gets its own little helper. */
 
-/* Pick the lattice scale factor for the current terminal: fill ~80%
- * of the usable vertical band, accounting for the ASPECT non-square-
- * cell correction.  Max projected |sy| ≈ 39 at default elevation. */
+/* Pick how big to draw the butterfly so it fills about 80% of the screen
+ * height, allowing for the fact that terminal cells aren't square. */
 static inline float compute_view_scale(int rows) {
   float usable = (float)(rows - 4);
   return usable * 0.80f / (39.0f * ASPECT);
 }
 
-/* Layer 3a — TRAJECTORY view.  Draw all ghosts (widest-ε first so the
- * close ghosts overlay them), then the main trail with full
- * depth/lobe/bloom encoding on top. */
+/* The normal view: draw the ghost trails first (widest-nudge one first
+ * so the closer ones sit on top), then the main trail over them. */
 static void draw_trajectory_layer(const Lorenz *l, float scale, int cx, int cy,
                                   int cols, int rows, WINDOW *w) {
   if (l->show_ghost) {
@@ -1117,19 +794,18 @@ static void draw_trajectory_layer(const Lorenz *l, float scale, int cx, int cy,
                     cy, cols, rows, w);
 }
 
-/* Layer 3b — DENSITY view (alternate mode 'h').  Accumulate this
- * frame's main-trail samples into the screen-space heatmap, then
- * paint the buffer.  Trails are NOT drawn in this mode. */
+/* The heatmap view ('h').  Add this frame's trail into the tally, then
+ * paint it.  No trails are drawn in this mode. */
 static void draw_density_layer(const Lorenz *l, float scale, int cx, int cy,
                                int cols, int rows, WINDOW *w) {
   density_accumulate(&l->mt, l->phi, l->theta, scale, cx, cy, cols, rows);
   density_draw(w, cols, rows);
 }
 
-/* Layer 4 — ε-SEP INDICATOR.  Inline text reporting the live distance
- * from the main trajectory to the smallest-ε ghost (g0).  g0 is the
- * most meaningful "shadow" — the wider-ε ghosts saturate at attractor
- * scale (~30) within a few seconds and no longer change. */
+/* A line of text showing the live gap between the main point and the
+ * closest ghost.  We track that one because the others quickly fly so
+ * far apart their gap stops changing — the closest is where you watch
+ * the slow pull-apart happen. */
 static void draw_sep_indicator(const Lorenz *l, WINDOW *w, int rows) {
   float dx = l->gx[0] - l->mx;
   float dy = l->gy[0] - l->my;
@@ -1141,15 +817,8 @@ static void draw_sep_indicator(const Lorenz *l, WINDOW *w, int rows) {
   wattroff(w, COLOR_PAIR(CP_GHOST) | A_DIM);
 }
 
-/*
- * lorenz_draw — back-to-front layer stack, body reads as the recipe:
- *
- *   1. starfield               (ambient background with parallax)
- *   2. equilibrium markers     (fixed-point '+' crosshairs)
- *   3. trajectory layer        (ghosts + main trail with depth/bloom)
- *      OR density layer        (replaces trail entirely)
- *   4. ε-sep inline indicator  (distance from main to smallest-ε ghost)
- */
+/* Paint the whole frame back to front: stars, the still-point markers,
+ * then either the trails or the heatmap, and finally the gap readout. */
 static void lorenz_draw(const Lorenz *l, WINDOW *w, int cols, int rows) {
   int cx = cols / 2;
   int cy = rows / 2;
@@ -1166,45 +835,20 @@ static void lorenz_draw(const Lorenz *l, WINDOW *w, int cols, int rows) {
   draw_sep_indicator(l, w, rows); /* 4 */
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6  scene ── */
 
 /*
- * Scene — thin wrapper around the Lorenz entity.
+ * Scene — a thin box around the Lorenz world.
  *
- * The Scene currently holds a single Lorenz, which IS the visible
- * world: the Lorenz struct already contains the simulation half
- * (trajectories + trails), the view (azimuth + elevation), and the
- * render/UI latches (show_ghost / show_lobe / show_density / paused).
- *
- * WHY wrap it in a Scene then?  Forward cover.  If we ever need
- *   per-scene state that DOESN'T belong inside Lorenz — a particle
- *   tracer overlay, an annotation layer, a saved-state buffer for
- *   replay, a second attractor for comparison — it goes here as a
- *   new field without changing every function signature that
- *   already takes Scene*.  The scene_init / scene_tick / scene_draw
- *   contract is stable; adding to Scene leaves the call sites in
- *   §8 (app loop) untouched.
- *
- * LOCALITY: the simulation-vs-rendering separation lives INSIDE the
- * Lorenz struct (see its "SIMULATION HALF / VIEW / RENDERING/UI
- * latches" field groups in §5), not at the Scene level.  Scene is
- * currently a placeholder ready for future per-scene additions.
- *
- * The full per-frame pipeline:
- *   scene_init   — zero the wrapper + lorenz_init (place trajectory
- *                  at the seed point, build trails, set defaults).
- *   scene_tick   — advance physics by dt: lorenz_tick → SUB_STEPS
- *                  RK4 steps for main + every ghost, plus an auto-
- *                  rotation drift on phi.
- *   scene_draw   — paint the back-to-front layer stack (starfield →
- *                  equilibria → ghosts → main trail or density →
- *                  ε-sep text).  No-op when nothing visible has
- *                  changed (renderer still paints — caller compares).
+ * Right now it just holds the one Lorenz, which already is the whole
+ * visible world.  The wrapper exists as room to grow: if we ever want
+ * something that doesn't belong inside Lorenz — a second butterfly to
+ * compare, an overlay, a saved state for replay — it can be added here
+ * without touching every function that already takes a Scene.  The
+ * three Scene calls (set up, advance one tick, draw) stay the same.
  */
 typedef struct {
-  Lorenz lorenz; /* the entire visible world — see §5 Lorenz struct */
+  Lorenz lorenz; /* the entire visible world — see the Lorenz struct in §5 */
 } Scene;
 
 static void scene_init(Scene *s) {
@@ -1225,28 +869,17 @@ static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
   lorenz_draw(&s->lorenz, w, cols, rows);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7  screen ── */
 
 /*
- * Screen — terminal-geometry container.
- *
- * Distinct from anything in §5 Lorenz so terminal-size changes don't
- * leak into simulation state.  Recomputed by screen_init at startup
- * and by screen_resize on SIGWINCH; nothing else writes it.  The
- * value drives:
- *
- *   - the render-layer call sites (project takes cx = cols/2, cy =
- *     rows/2 and clips to [0, cols) × [1, rows-1])
- *   - the HUD layout in screen_draw (top row 0, bottom row rows-1,
- *     status string right-justified at cols - strlen(buf))
- *   - the trail's automatic scale: usable = rows-4, scale fills ~80%
- *
- * Holds no allocation — just a (cols, rows) pair.
+ * Screen — just the current terminal size, kept apart from the
+ * simulation so resizing the window can't disturb the math.  It's set
+ * once at startup and again whenever the window changes size, and
+ * nothing else writes it.  Everything that needs to know where the
+ * middle of the screen is, or how big to draw, reads it from here.
  */
 typedef struct {
-  int cols, rows; /* current terminal width × height in cells */
+  int cols, rows; /* current terminal width and height, in cells */
 } Screen;
 
 static void screen_init(Screen *s) {
@@ -1272,17 +905,10 @@ static void screen_resize(Screen *s) {
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * screen_draw — canonical CLAUDE.md two-row HUD.
- *
- *   Row 0          : title (theme-coordinated CP_TRAIL_HEAD + A_BOLD)
- *                    left-justified; status block (CP_HUD + A_BOLD,
- *                    canonical bright yellow) right-justified with
- *                    fps / sim Hz / ghost / rotation / theme / paused.
- *   Row rows-1     : action keys, CP_HINT + A_BOLD (canonical cyan,
- *                    NEVER A_DIM — must stay legible against the
- *                    animated trail).
- */
+/* Draws the two status bars: the top row carries the title and a live
+ * readout (frame rate, speed, which views are on, theme), and the bottom
+ * row lists the keys.  Both are drawn bright and bold so they stay
+ * readable over the moving trail. */
 static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
                         float alpha, float dt_sec) {
   erase();
@@ -1290,12 +916,12 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
 
   const Lorenz *l = &sc->lorenz;
 
-  /* ── Top row 0 LEFT: title in active theme's head colour ───────── */
+  /* top-left: the title, in the current theme's brightest colour */
   attron(COLOR_PAIR(CP_TRAIL_HEAD) | A_BOLD);
   mvprintw(0, 1, " LORENZ ATTRACTOR ");
   attroff(COLOR_PAIR(CP_TRAIL_HEAD) | A_BOLD);
 
-  /* ── Top row 0 RIGHT: status (canonical yellow + A_BOLD) ───────── */
+  /* top-right: the live readout */
   char buf[200];
   snprintf(buf, sizeof buf,
            " %5.1f fps  sim:%3d Hz  ghost:%s  lobe:%s  density:%s  rot:%s"
@@ -1311,7 +937,7 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
   mvprintw(0, hx, "%s", buf);
   attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-  /* ── Bottom row rows-1: ACTION keys (canonical cyan + A_BOLD) ──── */
+  /* bottom row: the key list */
   attron(COLOR_PAIR(CP_HINT) | A_BOLD);
   mvprintw(s->rows - 1, 0,
            " q:quit  spc:pause  r:reset  g:ghost  l:lobe  h:density"
@@ -1324,58 +950,36 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8  app ── */
 
 /*
- * App — top-level lifecycle container; everything in one place.
+ * App — the program as a whole, gathered in one place: the world, the
+ * screen size, the speed setting, and a couple of flags the rest of the
+ * loop watches.
  *
- * WHY a struct (and not loose globals): the App lifecycle is well-
- *   defined — born at main() init, dies at main() return.  Bundling
- *   lets a single App* propagate through the loop helpers
- *   (app_do_resize, app_handle_key) without a forest of unrelated
- *   globals.
+ * sim_fps (the speed) lives here, not with the math, because it's about
+ * how fast you watch — how many simulation steps happen each real second
+ * — not about the math itself.  Turning it up or down with [ and ] just
+ * fast-forwards or slows the very same butterfly.
  *
- * WHY sim_fps lives in App (not in Lorenz): it's a LOOP-LEVEL knob,
- *   not a physics constant.  The integrator step L_H is fixed in
- *   Lorenz-time; sim_fps controls how many sim ticks happen per
- *   real second of wall clock, decoupling the apparent animation
- *   speed from the integrator accuracy.  Adjusting with [/] changes
- *   how fast you watch the same exact trajectory unroll.
- *
- * WHY signal flags live inside App (with the volatile sig_atomic_t
- * dance):
- *
- *   The C signal-handler signature is `void handler(int)` — no place
- *   to pass an App* into it.  So we keep a SINGLE static App g_app
- *   instance at file scope; on_exit_signal / on_resize_signal write
- *   to its flags.
- *
- *   The flags themselves MUST be `volatile sig_atomic_t` because:
- *     - volatile      — the main-loop read can't be optimised away
- *                       (the compiler doesn't know a signal will
- *                       fire and mutate the variable from outside).
- *     - sig_atomic_t  — the C standard guarantees these reads/writes
- *                       are atomic w.r.t. signal interruption; other
- *                       integer types may not be.
- *
- *   Signal handlers ONLY SET FLAGS; the main loop reads them and
- *   does the real work.  Doing the work IN the handler is unsafe —
- *   endwin / ncurses calls / malloc / free are not signal-safe.
- *
- *     running       — clear (= 0) to break the main loop and exit
- *                     cleanly through atexit(cleanup).
- *     need_resize   — set on SIGWINCH; main loop services it by
- *                     re-fitting Screen to the new terminal size on
- *                     the next iteration.
+ * The last two fields are flags the operating system can flip from
+ * outside the loop: one to ask the program to quit (Ctrl-C), one to note
+ * the window was resized.  Those handlers can't take any arguments, so
+ * we keep one App at file scope (g_app) for them to poke.  The flags are
+ * marked `volatile sig_atomic_t` for two reasons: `volatile` stops the
+ * compiler from assuming they never change behind its back, and
+ * `sig_atomic_t` is the one integer type the language promises can be
+ * read and written safely even mid-interruption.  The handlers only flip
+ * a flag and return — the loop does the real work next time around,
+ * because the cleanup and screen calls aren't safe to run inside a
+ * handler.
  */
 typedef struct {
-  Scene scene;                       /* §6 — the world container         */
-  Screen screen;                     /* §7 — terminal geometry           */
-  int sim_fps;                       /* sim Hz (10..120, +/- via [/])    */
-  volatile sig_atomic_t running;     /* SIGINT/SIGTERM → 0 → exit        */
-  volatile sig_atomic_t need_resize; /* SIGWINCH → 1 → resize next iter  */
+  Scene scene;                       /* the world (§6)                       */
+  Screen screen;                     /* terminal size (§7)                   */
+  int sim_fps;                       /* how fast we watch (10..120, [/] keys)*/
+  volatile sig_atomic_t running;     /* set to 0 to quit cleanly             */
+  volatile sig_atomic_t need_resize; /* set when the window was resized      */
 } App;
 
 static App g_app;
@@ -1411,7 +1015,7 @@ static bool app_handle_key(App *app, int ch) {
   case 'r':
   case 'R':
     lorenz_init(l);
-    density_reset(); /* fresh density accumulation after restart */
+    density_reset(); /* start the heatmap tally over after a restart */
     break;
 
   case 'g':

@@ -1,124 +1,22 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * barnes_hut.c — Barnes–Hut O(N log N) Gravity Simulation
+ * barnes_hut.c — a galaxy of up to 800 stars pulling on each other.
  *
- * Up to 800 bodies in pixel space. A quadtree is rebuilt every tick;
- * each body's force is computed by the Barnes–Hut criterion:
- *   if  s / d  <  θ  →  treat node as a single point mass
- *   else             →  recurse into children
+ * The honest way to compute gravity is to check every star against every
+ * other one, which gets slow fast. The Barnes-Hut trick groups far-away
+ * stars into one blob and treats the whole blob as a single pull, so the
+ * work grows gently instead of exploding. Three scenes to watch: a
+ * spinning galaxy, a cloud collapsing in on itself, and two clusters
+ * crashing together.
  *
- * Rendering: layered for depth.  An additive brightness buffer captures
- * Bresenham streaks along each body's orbit arc and decays at 0.93/frame,
- * so paths persist as glowing trails.  Per-body glyphs sit on top,
- * coloured by speed with two glyph variants per band so the cloud reads
- * as textured rather than stencilled.  The central black hole pulses
- * with a sin() phase and is wreathed in a small aspect-corrected
- * accretion halo, so the mass anchor visibly acts the part.  Seven
- * themes recolour everything without touching the physics (t / T).
- *
- * Framework: follows framework.c §1–§8 skeleton.
- *
- * PHYSICS SUMMARY
- * ─────────────────────────────────────────────────────────────────────
- * Quadtree node stores:
- *   total_mass, cx, cy  (centre of mass)
- *   child[4]            (NW=0, NE=1, SW=2, SE=3)
- *   body_idx            (≥0 if leaf with one body, else -1)
- *
- * Force criterion (s = node side, d = distance to node COM):
- *   s / d < θ  →  F = G · m_i · M_node / (d² + ε²)^(3/2)
- *   else       →  recurse children
- *
- * Integration: symplectic Euler (v += a·dt, x += v·dt)
- *
- * Galaxy:  body 0 = central massive anchor (mass = N×3).
- *          Others placed in Keplerian orbits: v = sqrt(G·M_c / r).
- *          Differential rotation shears the disk into spiral patterns.
- *
- * Cluster: cold uniform disc — self-gravity drives collapse into a
- *          tight core, then virialises and oscillates dramatically.
- *
- * Binary:  two rotating clusters approach and merge — tidal streams
- *          and chaotic ejections during the collision.
- *
- * Three presets:
- *   1  Galaxy  — central BH + Keplerian disk
- *   2  Cluster — cold collapse + virialisation
- *   3  Binary  — cluster merger
- *
- * Keys:
- *   q / ESC   quit
- *   p / space pause / resume
- *   r         reset current preset
- *   1 / 2 / 3 select preset
- *   t / T     theme next / prev (7 themes: Galaxy / Nebula / Fire / Ice /
- *                                 Mono / Aurora / Plasma)
- *   o         toggle quadtree overlay
- *   f         toggle fast-forward (4× speed)
- *   + / -     add / remove bodies (±50)
- *   g / G     gravity constant up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/barnes_hut.c -o barnes_hut -lncurses
- * -lm
+ * The grouping trick: Barnes & Hut, "A hierarchical O(N log N)
+ * force-calculation algorithm", Nature 324 (1986). Softening, orbits, and
+ * the galaxy/cluster physics: Aarseth, "Gravitational N-Body Simulations"
+ * (2003) and Binney & Tremaine, "Galactic Dynamics", 2nd ed. (2008). The
+ * glowing trails use Bresenham line-drawing (Foley et al., "Computer
+ * Graphics", 3rd ed., 2013, ch. 2). Brightness/colour ramps follow Ware,
+ * "Information Visualization", 4th ed. (2020).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Barnes-Hut tree-code (Barnes & Hut, 1986).
- *                  Reduces N-body gravitational force from O(N²) to O(N log N)
- *                  by grouping distant bodies into their centre-of-mass using a
- *                  quadtree.  The approximation criterion θ (opening angle):
- *                    if s/d < θ → accept the node as a point mass
- *                    else       → recurse into children
- *                  Smaller θ → more accurate, more expensive; θ=0 → exact
- * O(N²).
- *
- * Physics        : Softened Newtonian gravity:
- *                    F = G · mᵢ · Mⱼ / (d² + ε²)^(3/2)  (in 2-D pixel space)
- *                  Softening ε² prevents singularities at close approach (r→0).
- *                  Galaxy preset uses Keplerian IC: v_orbit = √(G·M_central /
- * r) so each body starts in a circular orbit — differential rotation then winds
- * the disk into spiral arms over time.
- *
- * Data-structure : Quadtree with a pre-allocated node pool (NODE_POOL_MAX
- * nodes). Pool avoids dynamic malloc per node; rebuilt each tick. Leaves store
- * one body index; internal nodes store aggregated (total_mass, cx, cy) = centre
- * of mass of all bodies below.
- *
- * Performance    : Typical cost at N=400: ~O(400 × log₂400 × θ_factor) ≈ 3600
- *                  force evaluations vs 400² / 2 = 80000 for brute force.
- *                  QT_MAX_DEPTH=32 caps recursion; NODE_POOL_MAX=16000 supports
- *                  up to 800 bodies in a well-distributed quadtree.
- *
- * References     : 1. Barnes, J. & Hut, P. — "A hierarchical O(N log N)
- *                     force-calculation algorithm", Nature 324, pp. 446-
- *                     449 (1986).  The original paper.  Defines the
- *                     s/d < θ opening criterion the §6 quadtree
- *                     implements; θ = 0.5 is the value Barnes & Hut
- *                     recommended for general-purpose accuracy.
- *                  2. Aarseth, S. J. — "Gravitational N-Body Simulations:
- *                     Tools and Algorithms", Cambridge Univ. Press (2003).
- *                     Comprehensive textbook on N-body methods: softening
- *                     (our ε² in F = G·m·M/(d²+ε²)^(3/2)), time integration,
- *                     tree-code variants, energy diagnostics.
- *                  3. Binney, J. & Tremaine, S. — "Galactic Dynamics",
- *                     2nd ed., Princeton Univ. Press (2008).  The
- *                     galactic-dynamics standard.  Keplerian orbits,
- *                     virial theorem, spiral-structure formation through
- *                     differential rotation — directly justifies the
- *                     setup of all three presets (galaxy / cluster / binary).
- *                  4. Foley, J. D.; van Dam, A.; Feiner, S. K.; Hughes,
- *                     J. F. — "Computer Graphics: Principles and Practice",
- *                     3rd ed., Addison-Wesley (2013).  Ch. 2 covers
- *                     Bresenham's line algorithm, used by streak_glow()
- *                     to lay orbit arcs into the brightness buffer.
- *                  5. Ware, C. — "Information Visualization: Perception
- *                     for Design", 4th ed., Morgan Kaufmann (2020).
- *                     Perceptually-ordered colour and luminance ramps —
- *                     backs the 5-level brightness palette (CP_L1..CP_L5)
- *                     and the per-band glyph density ramp '.:*o@'.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -136,9 +34,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
 enum {
   RENDER_FPS = 30,
@@ -166,27 +62,30 @@ enum {
 #define CELL_W 8
 #define CELL_H 16
 
-#define G_DEF                                                                  \
-  12.0f /* gravitational constant in pixel² units; tuned so                   \
-         * galaxy-disk bodies orbit in ~10–20 seconds on screen */
+/* How strong gravity is. Tuned so galaxy stars circle in ~10-20 seconds. */
+#define G_DEF 12.0f
 #define G_STEP 2.0f
 #define G_MIN 1.0f
 #define G_MAX 200.0f
 
+/* A little fudge distance added to every gap so two stars that get very
+ * close don't fling each other away with a near-infinite kick. */
 #define SOFTENING 10.0f
 #define SOFT2 (SOFTENING * SOFTENING)
 
+/* How loose the "treat a far group as one blob" rule is. Smaller is more
+ * accurate but slower; 0.5 is the value the original paper recommends. */
 #define THETA_DEF 0.5f
 
-/* Glow layer: slow decay so orbital paths stay visible */
+/* How much the glowing trails fade each frame. Just under 1, so paths
+ * linger for a while instead of vanishing instantly. */
 #define DECAY 0.93f
 
-/* Galaxy: central black hole mass = N_BODIES_DEF × BH_MASS_FACTOR */
+/* The central black hole is this many times heavier than the star count,
+ * so the disk has something firm to orbit around. */
 #define BH_MASS_FACTOR 3.0f
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -204,30 +103,36 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color / themes                                                     */
-/* ===================================================================== */
+/* ── §3  color / themes ── */
 
+/* Named slots for ncurses colour pairs. The five L1..L5 slots are a
+ * dim-to-bright ramp: slow/faint stars use L1, fast/dense ones use L5. */
 enum {
-  CP_HUD = 1, /* top status bar (bright yellow)         */
-  CP_L1 = 2,  /* dim  — slow/far glow                   */
+  CP_HUD = 1, /* top status bar (bright yellow) */
+  CP_L1 = 2,  /* faintest glow */
   CP_L2 = 3,
   CP_L3 = 4,
   CP_L4 = 5,
-  CP_L5 = 6, /* bright — fast/dense                    */
+  CP_L5 = 6, /* brightest glow */
   CP_TREE = 7,
-  CP_BH = 8,   /* central black hole                     */
-  CP_HINT = 9, /* bottom hint bar (bright cyan)          */
+  CP_BH = 8,   /* the central black hole */
+  CP_HINT = 9, /* bottom hint bar (bright cyan) */
 };
 
+/*
+ * Theme — one named colour scheme for the whole scene. Switching themes
+ * only repaints; it never touches the physics. Each theme carries two
+ * sets of numbers: one for terminals with 256 colours, one fallback for
+ * old 8-colour terminals.
+ */
 typedef struct {
   const char *name;
-  int hi256[5];
-  int hi8[5];
-  int tree256;
-  int tree8;
-  int bh256;
-  int bh8;
+  int hi256[5]; /* the five-step glow ramp, 256-colour terminals */
+  int hi8[5];   /* same ramp for 8-colour terminals */
+  int tree256;  /* quadtree overlay lines, 256-colour */
+  int tree8;    /* quadtree overlay lines, 8-colour */
+  int bh256;    /* the black hole's colour, 256-colour */
+  int bh8;      /* the black hole's colour, 8-colour */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -325,9 +230,12 @@ static void color_init(int theme) {
   }
 }
 
-/* ===================================================================== */
-/* §4  coords — pixel ↔ cell                                              */
-/* ===================================================================== */
+/* ── §4  coords — pixel <-> cell ── *
+ *
+ * Stars move in fine-grained "pixel" space; the terminal can only draw on
+ * a coarse grid of character cells. These helpers convert between the two:
+ * pw/ph give a screen's size in pixels, and px_to_cell_* round a pixel
+ * position to the character cell it lands in. */
 
 static inline int pw(int cols) { return cols * CELL_W; }
 static inline int ph(int rows) { return rows * CELL_H; }
@@ -339,73 +247,58 @@ static inline int px_to_cell_y(float py) {
   return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  entity — Body                                                      */
-/* ===================================================================== */
+/* ── §5  entity — Body ── */
 
 /*
- * Body — one gravitational mass point in the N-body system.
+ * Body — one star (or the central black hole) in the simulation.
  *
- * Lifecycle:
- *   - created by a preset (preset_galaxy / preset_cluster / preset_binary)
- *   - integrated each sim tick by scene_tick() unless anchor=true
- *   - may be deactivated if it escapes far outside the view bounds
- *   - rendered each draw frame in scene_draw()
+ * A body is born in one of the presets, nudged once per simulation step
+ * by the gravity it feels, and drawn each frame. If it drifts way off
+ * screen we quietly switch it off to save work.
  *
- * Why pixel-space (not cell-space) positions:
- *   The integrator advances positions smoothly between cells at sub-cell
- *   precision so orbits look continuous. px_to_cell_x/y rounds to a
- *   character cell only at render time. Storing px/py in cells would
- *   discretise every motion to integer steps — slow bodies would appear
- *   stationary for many frames, fast bodies would teleport.
+ * Positions are kept in fine "pixel" units, not whole character cells, so
+ * motion looks smooth — we only round to a cell when it's time to draw.
+ * If we stored cell positions instead, slow stars would sit frozen for
+ * many frames and fast ones would jump in chunks.
  *
- * Why prev_px / prev_py:
- *   scene_tick snapshots the pre-step position into these before
- *   advancing px/py. streak_glow() then draws a Bresenham line from
- *   (prev_*, prev_*) to (px, py) into the brightness buffer, so fast
- *   bodies leave visible orbit arcs instead of flickering trails of
- *   isolated cells. Without this, a body moving 4 cells/frame would
- *   skip 3 cells between draws.
+ * prev_px/prev_py remember where the body was one step ago. The trail
+ * renderer draws a line from there to the new spot, so a fast star leaves
+ * a smooth glowing streak instead of a dotted line of skipped cells.
  *
- * Why both active and anchor flags (and not just one):
- *   active=false bodies are skipped entirely by both integrator and
- *   renderer; used to remove escapees (positions beyond an extended
- *   bound) cheaply without reallocating arrays.
- *   anchor=true bodies stay active and visible but skip force
- *   integration — they never move regardless of net force. Models a
- *   central black hole that is much heavier than the disk and (in our
- *   approximation) fixed at the centre. Galaxy preset uses one anchor;
- *   cluster and binary use none.
+ * The two flags do different jobs. 'active' off means "ignore me
+ * completely" — that's how we drop runaways without shuffling arrays.
+ * 'anchor' means "stay put no matter what" — gravity never moves an
+ * anchor. The galaxy's central black hole is an anchor; the cluster and
+ * binary scenes have none.
  *
- * Integration scheme — symplectic Euler:
- *   v += a · dt   (kick)
- *   x += v · dt   (drift)
- *   Symplectic schemes conserve a "shadow" Hamiltonian over long runs,
- *   so total energy stays bounded indefinitely — critical for galaxy
- *   stability over the thousands of ticks a long-running disc needs.
+ * How a body moves each step (symplectic Euler — a stable little
+ * two-liner): first nudge its speed by the pull it feels, then slide it
+ * along at that new speed. This particular order keeps the total energy
+ * from drifting over the thousands of steps a long galaxy run takes, so
+ * orbits stay tidy instead of slowly spiralling apart.
  *
- * Algorithm refs (header [n]):
- *   Softened gravity   F = G·mᵢ·M/(d²+ε²)^(3/2)   — Aarseth §2.4 [2]
- *   Symplectic Euler                              — Aarseth §2.2 [2]
- *   Keplerian initial conditions (galaxy preset)  — Binney&Tremaine §3.1 [3]
- *   Cold-collapse virialisation (cluster preset)  — Binney&Tremaine §8.5.4 [3]
+ * Physics references: softened gravity and the symplectic step, Aarseth
+ * (2003) §2.2 and §2.4; the galaxy's starting orbits, Binney & Tremaine
+ * (2008) §3.1; the cluster's collapse-and-settle, the same book §8.5.4.
  */
 typedef struct {
-  float px, py;           /* current position, pixel space             */
-  float prev_px, prev_py; /* position one sim step ago — for streak    */
-  float vx, vy;           /* current velocity, pixel-units/sim-second  */
-  float mass;             /* gravitational mass; 1.0 for ordinary
-                           * bodies, ≫1 for the central anchor        */
-  bool active;            /* false = removed (escapee or unused slot)  */
-  bool anchor;            /* true = skip force integration entirely    */
+  float px, py;           /* where it is now, in pixel units */
+  float prev_px, prev_py; /* where it was one step ago (for the trail) */
+  float vx, vy;           /* how fast it's moving, pixel units per sim second */
+  float mass;             /* its heft; 1.0 for an ordinary star,
+                           * much larger for the central black hole */
+  bool active;            /* false = switched off (ran away, or unused slot) */
+  bool anchor;            /* true = pinned in place, gravity can't move it */
 } Body;
 
-/* Body instances live in the §7 Scene struct (defined just below in
- * §6 for forward-declaration reasons). The deterministic RNG state
- * below is kept at file scope so the rng_*() pure utilities don't
- * need a Scene*. */
+/* The bodies themselves live inside the Scene struct down in §6 (it has
+ * to be defined early so the quadtree code can reach it). The random-
+ * number state below stays a plain file-scope variable so the little
+ * rng helpers don't have to be handed a Scene every call. */
 
-/* Simple LCG */
+/* A tiny, fast, repeatable random-number generator (a linear congruential
+ * generator). Same seed gives the same scene every time, which makes a
+ * reset reproducible. */
 static uint32_t g_rng = 12345u;
 static uint32_t rng_next(void) {
   g_rng = g_rng * 1664525u + 1013904223u;
@@ -416,152 +309,115 @@ static float rng_f(void) {
 }
 static float rng_range(float lo, float hi) { return lo + rng_f() * (hi - lo); }
 
-/* ===================================================================== */
-/* §6  quadtree                                                           */
-/* ===================================================================== */
+/* ── §6  quadtree ── */
 
 /*
- * QNode — one node of the Barnes–Hut quadtree.
+ * QNode — one box in the tree that organises the stars by where they are.
  *
- * Why a tree at all:
- *   Direct N-body force evaluation is O(N²): for N=400 that's 80 000
- *   pair computations per tick.  Barnes & Hut (1986) showed that a
- *   hierarchical spatial decomposition lets you approximate the
- *   gravitational influence of distant body clusters as a single point
- *   mass at their centre of mass, dropping the cost to O(N log N).
+ * The whole point of the tree is speed. Checking every star against every
+ * other is fine for a handful but brutal for hundreds. So we carve the
+ * screen into nested boxes; each box remembers the combined weight and
+ * the balance point of all the stars inside it. When a star is far from a
+ * box, we can treat that whole box as one distant lump instead of looking
+ * at its stars one by one. That's the Barnes & Hut (1986) idea, and it
+ * turns a punishing amount of work into a manageable amount.
  *
- * Why quadtree specifically:
- *   We simulate in 2-D, so a quadtree (2-D space → 4 children per node)
- *   is the right shape.  3-D would use an octree with 8 children; the
- *   algorithm structure is identical.
+ * Because the screen is 2-D, each box splits into four smaller boxes (a
+ * quadtree). The same idea in 3-D would split into eight.
  *
- * Node anatomy:
- *   x0, y0, x1, y1     Axis-aligned bounding box in pixel space.
- *                      Side length s = (x1 - x0) — the size used by
- *                      the BH opening criterion s/d < θ.
- *   total_mass         Σ mass of every body inside this subtree.
- *                      Updated incrementally during qt_insert so we
- *                      avoid a separate aggregation pass.
- *   cx, cy             Centre of mass of every body inside the subtree:
- *                        cx = Σ(mᵢ · pxᵢ) / Σ mᵢ
- *                        cy = Σ(mᵢ · pyᵢ) / Σ mᵢ
- *                      Also incremental — qt_insert does one weighted
- *                      average per inserted body.
- *   child[4]           Quadrant children: NW=0, NE=1, SW=2, SE=3.
- *                      -1 in any slot means "no body in that quadrant".
- *                      Leaves have all four slots = -1 (no children);
- *                      internal nodes have at least one ≥ 0.
- *   body_idx           ≥0 only for a leaf containing exactly one body
- *                      (the index into scene.bodies[]). -1 for empty leaves
- *                      and for all internal nodes. When a second body
- *                      arrives at a single-body leaf, qt_insert pushes
- *                      the resident body into a subdivided quadrant and
- *                      sets body_idx = -1.
- *   depth              Distance from the root (root = 0). Used to cap
- *                      recursion at QT_MAX_DEPTH so that two bodies at
- *                      numerically-identical positions don't subdivide
- *                      forever.
+ * What each field holds:
+ *   x0, y0, x1, y1   The box's edges, in pixel units. Its width
+ *                    (x1 - x0) is the "how big is this box" number used
+ *                    when deciding whether it's far enough to lump.
+ *   total_mass       Combined weight of every star inside this box and
+ *                    its sub-boxes. Tallied up as stars are added.
+ *   cx, cy           The balance point (centre of mass) of all those
+ *                    stars — the spot where the lumped weight sits.
+ *   child[4]         The four sub-boxes: NW=0, NE=1, SW=2, SE=3. A slot
+ *                    of -1 means that quarter is empty. A box with all
+ *                    four empty is a leaf (holds at most one star).
+ *   body_idx         If this is a leaf holding exactly one star, this is
+ *                    that star's index; otherwise -1. When a second star
+ *                    lands in a one-star leaf, the box splits and the
+ *                    resident star moves down into a sub-box.
+ *   depth            How deep this box sits below the top (top = 0).
+ *                    Capped at QT_MAX_DEPTH so two stars at the exact
+ *                    same spot can't make the tree split forever.
  *
- * Force evaluation — the Barnes–Hut opening criterion (see qt_force):
+ * The "is this box far enough to lump?" test lives in qt_force: compare
+ * the box's width to how far the star is from the box's balance point. If
+ * the box looks small from where the star stands, lump it; otherwise look
+ * inside at its four sub-boxes. The threshold THETA_DEF = 0.5 is the
+ * paper's recommended balance of accuracy and speed.
  *
- *     s = x1 - x0         (this node's side length)
- *     d = |p_body − COM|  (distance from query body to node COM)
+ * All the boxes are handed out from one fixed array (scene.pool); we never
+ * call malloc while the simulation runs. The tree is thrown away and
+ * rebuilt from scratch every step, which is simpler and faster than
+ * patching an old tree as stars move.
  *
- *     if s / d < θ:
- *         treat node as a single point mass at (cx, cy)
- *         contribute F = G · m_body · total_mass / (d² + ε²)^(3/2)
- *     else:
- *         recurse into the four children
- *
- *   θ = 0.5 is Barnes & Hut's recommended value — small enough for
- *   ~1% RMS force error on a typical body distribution, large enough
- *   to keep the cost near O(N log N) in practice.  Smaller θ → more
- *   accurate, more expensive; θ = 0 → exact O(N²) brute force.
- *
- * Pool allocation:
- *   Every node lives in a static pool scene.pool[NODE_POOL_MAX]; qt_alloc()
- *   bumps an integer (no malloc/free in the hot path).  The whole tree
- *   is rebuilt every sim tick from scene.pool_top = 0; building from scratch
- *   is cheap and avoids the bookkeeping of incremental tree updates.
- *
- * Algorithm refs (header [n]):
- *   The original tree-code paper            — Barnes & Hut (1986) [1]
- *   Practical tree-code performance / θ     — Aarseth §6.2 [2]
- *   Incremental COM update                  — Aarseth §6.2 [2]
+ * References: the original tree-code, Barnes & Hut (1986); the practical
+ * accuracy/speed trade-off and the running-tally balance point, Aarseth
+ * (2003) §6.2.
  */
 typedef struct {
-  float x0, y0, x1, y1; /* bounding box, pixel space             */
-  float total_mass;     /* Σ mass of all bodies in this subtree  */
-  float cx, cy;         /* centre of mass of all bodies below    */
-  int child[4];         /* NW=0, NE=1, SW=2, SE=3; -1 = absent   */
-  int body_idx;         /* ≥0 if leaf with one body, else -1     */
-  int depth;            /* distance from root, capped at QT_MAX  */
+  float x0, y0, x1, y1; /* the box's edges, in pixel units */
+  float total_mass;     /* combined weight of all stars inside this box */
+  float cx, cy;         /* balance point of those stars */
+  int child[4];         /* the four sub-boxes; NW=0 NE=1 SW=2 SE=3, -1=empty */
+  int body_idx;         /* one-star leaf: that star's index; else -1 */
+  int depth;            /* how deep below the top, capped at QT_MAX_DEPTH */
 } QNode;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Scene — all state that persists between scene_tick() and scene_draw().
+/*
+ * Scene — everything the simulation needs to remember between one step and
+ * the next, and between one drawn frame and the next.
  *
- * Defined here (rather than in §7 with the scene_* functions) because §6
- * quadtree functions below reference scene.pool / scene.pool_top, so the
- * Scene type and instance must exist before they're used.  All scene_*
- * functions and presets that follow in §7 use this same `scene` global.
+ * It's defined up here (not down in §7 with the scene_* functions) because
+ * the quadtree code above already reaches into it. There is exactly one of
+ * these, a single big file-scope variable; it's around 760 KB (the star
+ * list, the box pool, and the glow grid), too large to pass around by
+ * value, so everything just refers to the one `scene`.
  *
- * Fields are split into two clearly-labelled groups:
+ * The fields fall into two groups, and the split is for the reader's sake:
  *
- *   Simulation params — advanced by scene_tick(); mutated only by
- *     physics-affecting input (pause / preset / reset / +/- bodies /
- *     g/G gravity / f fast-forward).
+ *   Simulation fields are the real state of the physics. Only physics keys
+ *   (pause, reset, pick a scene, add/remove stars, change gravity,
+ *   fast-forward) change them.
  *
- *   Rendering params  — read by scene_draw() and the HUD; do NOT alter
- *     physics in any way.  A theme change or overlay toggle drawn
- *     against the same Scene must produce identical body positions,
- *     velocities, and tree structure.
+ *   Rendering fields only affect what's drawn. Changing the theme or
+ *   toggling the overlay must leave every star in exactly the same place —
+ *   if it didn't, display and physics would be tangled, which is the bug
+ *   the split is meant to prevent. New flags should land on the right side.
  *
- * Locality rationale:
- *   The split between sim and render fields exists for the READER, not
- *   the CPU.  A new sim flag accidentally placed in the rendering block
- *   would silently couple physics to display state — exactly the bug
- *   the separation prevents.  Future changes know which side to land on.
- *
- * One global instance (`static Scene scene`):
- *   The struct is large (Bodies + QNode pool + brightness grid ≈ 760 KB)
- *   so it lives in .bss as a single file-static, accessed as
- *   `scene.<field>` throughout.
- *
- * State kept OUTSIDE this struct (intentionally):
- *   g_rng     deterministic RNG state used by rng_*().  Kept separate
- *             so the pure-utility rng helpers don't need a Scene*.
- *   g_resize  signal-handler flag; must be a file-static volatile
- *             sig_atomic_t for async-signal safety.
- * ─────────────────────────────────────────────────────────────────────── */
+ * Two pieces of state deliberately live OUTSIDE this struct: g_rng (the
+ * random-number state, kept separate so the small rng helpers stay simple)
+ * and g_resize (the resize-signal flag, which has to be a special
+ * signal-safe variable).
+ */
 typedef struct {
-  /* ── Simulation parameters ─────────────────────────────────── */
-  Body bodies[N_BODIES_MAX]; /* all body slots (active + inactive) */
-  int n_bodies;              /* current body count (+/- adjustable) */
-  float G;                   /* gravitational constant (g/G keys)  */
-  bool paused;               /* if true, scene_tick is a no-op     */
-  int preset;                /* index into preset_* dispatch       */
-  bool fastfwd;              /* 4× sim time per render frame       */
-  float sim_dt;              /* fixed-timestep (sim seconds)       */
+  /* ── simulation state ── */
+  Body bodies[N_BODIES_MAX]; /* every star slot, switched on or off */
+  int n_bodies;              /* how many slots are in use (+/- keys) */
+  float G;                   /* strength of gravity (g/G keys) */
+  bool paused;               /* true = freeze the physics */
+  int preset;                /* which scene is loaded (0..2) */
+  bool fastfwd;              /* true = run physics 4x faster */
+  float sim_dt;              /* length of one physics step, in seconds */
 
-  /* Quadtree scratch — rebuilt from pool_top=0 every sim tick. */
-  QNode pool[NODE_POOL_MAX]; /* pre-allocated node pool            */
-  int pool_top;              /* bump pointer into pool[]           */
-  int qt_root;               /* root index into pool[]             */
+  /* The box tree, thrown away and rebuilt from scratch every step. */
+  QNode pool[NODE_POOL_MAX]; /* the fixed pile of boxes to hand out */
+  int pool_top;              /* how many boxes are handed out so far */
+  int qt_root;               /* which box is the top of the tree */
 
-  /* ── Rendering parameters ──────────────────────────────────── */
-  float bright[GRID_ROWS_MAX][GRID_COLS_MAX]; /* additive glow buffer
-                                               * (streaks + body
-                                               * deposits + halo;
-                                               * decays 0.93/frame) */
-  float bright_max; /* EMA-smoothed max for colour norm   */
-  float v_max;      /* rolling max speed for colour bands;
-                     * tracked from physics, used only by
-                     * the renderer for colour mapping    */
-  int theme;        /* index into k_themes[] (§3)         */
-  bool overlay;     /* draw quadtree on top               */
-  int frame_tick;   /* monotonic counter; drives BH pulse
-                     * and accretion-halo phase           */
+  /* ── rendering state ── */
+  float bright[GRID_ROWS_MAX][GRID_COLS_MAX]; /* glow on each cell; stars and
+                                               * their trails add to it, and
+                                               * it fades a little each frame */
+  float bright_max; /* a smoothed "brightest cell" used to scale colours */
+  float v_max;      /* a smoothed "fastest star" used to pick speed colours */
+  int theme;        /* which colour scheme is active (index into k_themes) */
+  bool overlay;     /* true = draw the box tree on top */
+  int frame_tick;   /* frames drawn so far; drives the black hole's pulse */
 } Scene;
 
 static Scene scene = {
@@ -611,14 +467,14 @@ static void qt_insert(int ni, int bi) {
   QNode *n = &scene.pool[ni];
   Body *b = &scene.bodies[bi];
 
-  /* Incremental COM update */
+  /* Fold this star into the box's running weight and balance point. */
   float new_mass = n->total_mass + b->mass;
   n->cx = (n->cx * n->total_mass + b->px * b->mass) / new_mass;
   n->cy = (n->cy * n->total_mass + b->py * b->mass) / new_mass;
   n->total_mass = new_mass;
 
   if (n->body_idx < 0 && n->child[0] < 0) {
-    /* Empty leaf */
+    /* Empty leaf: just drop the star here. */
     n->body_idx = bi;
     return;
   }
@@ -626,7 +482,7 @@ static void qt_insert(int ni, int bi) {
     return;
 
   if (n->body_idx >= 0) {
-    /* Occupied leaf: push existing body down */
+    /* Leaf already has a star: split the box and push that star down. */
     int existing = n->body_idx;
     n->body_idx = -1;
     qt_subdivide(n);
@@ -656,7 +512,7 @@ static void qt_force(int ni, int bi, float *fx, float *fy) {
   if (n->total_mass == 0.0f)
     return;
   if (n->body_idx == bi)
-    return; /* skip self at leaf */
+    return; /* a star doesn't pull on itself */
 
   Body *b = &scene.bodies[bi];
   float dx = n->cx - b->px;
@@ -675,7 +531,8 @@ static void qt_force(int ni, int bi, float *fx, float *fy) {
     qt_force(n->child[c], bi, fx, fy);
 }
 
-/* Draw quadtree grid lines for depth ≤ 3 */
+/* Sketch the top few levels of the box tree so you can see how the
+ * stars are being grouped. Only the first few depths, or it's clutter. */
 static void qt_draw_overlay(int ni, int rows, int cols) {
   if (ni < 0)
     return;
@@ -706,33 +563,23 @@ static void qt_draw_overlay(int ni, int rows, int cols) {
     qt_draw_overlay(n->child[c], rows, cols);
 }
 
-/* ===================================================================== */
-/* §7  scene — state that spans across ticks and frames                   */
-/* ===================================================================== */
+/* ── §7  scene — state that spans across ticks and frames ── *
+ *
+ * The Scene struct itself is up in §6 (the quadtree code needed it early).
+ * Everything below — the three scene setups and the per-step / per-frame
+ * work — operates on that one `scene`. */
 
-/* The Scene struct is defined in §6 (just after QNode) because the
- * quadtree functions above reference scene.pool.  The presets and the
- * scene_* functions below all operate on the same `scene` instance. */
-
-/* ── Presets ─────────────────────────────────────────────────────────── */
+/* ── the three scenes ── */
 
 /*
- * Preset 1 — Galaxy
- *
- * Body 0 = central black hole (anchor, mass = N × BH_MASS_FACTOR).
- * Remaining bodies on Keplerian circular orbits: v = √(G · M_bh / r).
- * Differential rotation (inner orbits faster than outer) shears the
- * disk into spontaneous spiral structure over a few orbital periods.
- *
- * Pseudocode:
- *   compute disk geometry (centre, radius, M_bh)
- *   spawn the central black hole at body 0
- *   for each remaining body i:
- *       spawn one Keplerian orbiter at a uniform-area random radius
+ * Galaxy. A heavy black hole sits pinned at the centre, and every other
+ * star starts on a circular orbit around it — inner stars circle faster
+ * than outer ones, and that uneven spin naturally winds the disk into
+ * spiral arms after a few turns.
  */
 
-/* Place a stationary anchor body of mass M at (cx, cy). Anchor means
- * the integrator will skip it — see Body.anchor field. */
+/* Drop a pinned, heavy body at (cx, cy). "Pinned" means gravity won't
+ * budge it — see the anchor flag on Body. */
 static void spawn_central_bh(int idx, float cx, float cy, float M) {
   scene.bodies[idx].px = cx;
   scene.bodies[idx].py = cy;
@@ -744,37 +591,27 @@ static void spawn_central_bh(int idx, float cx, float cy, float M) {
 }
 
 /*
- * sample_disk_radius_uniform_area — sample a radius r in [r_min·R, R]
- * such that the resulting points distribute UNIFORMLY by area (not by
- * radius). Picking r linearly would concentrate bodies near the centre
- * because the circle area at radius r grows as 2πr — equal-radius
- * shells have unequal area. The √(u) inverse-CDF gives equal area
- * per body, so the rendered disk looks uniformly dense.
- *
- * Mathematically:
- *   PDF over r ∝ r   (area weight)
- *   CDF: F(r) = (r/R)²
- *   Inverse: r = R · √u  where u ~ U(0,1)
- * We additionally clamp away from the very centre (0.08·R) so bodies
- * don't spawn inside the BH.
+ * Pick a distance from the centre to drop a star, so the disk ends up
+ * evenly speckled instead of bunched up in the middle. The catch: a thin
+ * ring far out covers far more area than a ring of the same width near
+ * the centre, so simply picking the distance at random would crowd the
+ * core. Taking a square root spreads the stars out so every patch of the
+ * disk gets its fair share. We also keep them a bit out from dead centre
+ * so none spawn inside the black hole.
  */
 static float sample_disk_radius_uniform_area(float R) {
   return R * (0.08f + 0.92f * sqrtf(rng_f()));
 }
 
 /*
- * spawn_keplerian_body — place body idx at a random point on a disk of
- * radius R around (cx, cy), with a velocity that produces a circular
- * orbit around a central point mass M_bh.
+ * Drop one star somewhere on the disk and give it just the right speed and
+ * direction to circle the central mass — fast enough not to fall in, slow
+ * enough not to fly off. The speed for a steady circle depends on how far
+ * out the star is; it points sideways (across the line to the centre) so
+ * the star goes round. A tiny ~6% nudge to each speed makes the orbits
+ * slightly oval, so the disk looks alive rather than mechanically perfect.
  *
- *   v_kep = √(G · M_bh / r)         (Keplerian circular velocity)
- *   direction: tangent to the radial vector, CCW
- *   small ±6% scatter on |v| → slightly elliptical orbits so the disk
- *   looks dynamically rich rather than perfectly regular.
- *
- * Algorithm refs (header [n]):
- *   Keplerian initial conditions    — Binney & Tremaine §3.1 [3]
- *   Inverse-CDF sampling             — standard MC technique
+ * Starting orbits follow Binney & Tremaine (2008) §3.1.
  */
 static void spawn_keplerian_body(int idx, float cx, float cy, float R,
                                  float M_bh) {
@@ -787,7 +624,7 @@ static void spawn_keplerian_body(int idx, float cx, float cy, float R,
   float v_kep = sqrtf(scene.G * M_bh / r);
   float v = v_kep * (1.0f + rng_range(-0.06f, 0.06f));
 
-  /* Unit tangent: perpendicular to radius, CCW (cross product with +z) */
+  /* Aim the velocity sideways to the centre line, so the star circles. */
   float tx = -(by - cy) / r;
   float ty = (bx - cx) / r;
 
@@ -801,7 +638,7 @@ static void spawn_keplerian_body(int idx, float cx, float cy, float R,
 }
 
 static void preset_galaxy(int cols, int rows) {
-  /* 1. Disk geometry: centred on screen, radius fits the shorter axis. */
+  /* Centre the disk; size it to the shorter side of the screen. */
   float cx = (float)pw(cols) * 0.5f;
   float cy = (float)ph(rows) * 0.5f;
   float half = (float)pw(cols);
@@ -810,34 +647,32 @@ static void preset_galaxy(int cols, int rows) {
   half *= 0.5f;
   float R = half * 0.75f;
 
-  /* 2. Central black hole mass scales with body count so the
-   *    orbital periods stay roughly constant across +/- presses. */
+  /* Make the black hole heavier when there are more stars, so the orbits
+   * keep their pace as you add or remove stars with +/-. */
   float M_bh = (float)scene.n_bodies * BH_MASS_FACTOR;
 
-  /* 3. Spawn the anchor at body 0. */
   spawn_central_bh(0, cx, cy, M_bh);
 
-  /* 4. Spawn N-1 disk orbiters with Keplerian velocities. */
   for (int i = 1; i < scene.n_bodies; i++)
     spawn_keplerian_body(i, cx, cy, R, M_bh);
 }
 
 /*
- * Preset 2 — Cold Collapse
- *
- * Uniform disc, zero initial velocity.  Self-gravity drives rapid
- * collapse into a dense core → virialises → oscillates.  The
- * collapse happens fast enough to watch (a few seconds).
+ * Cold collapse. A round cloud of stars sitting almost still. With nothing
+ * holding it up, its own gravity yanks it inward into a dense knot, which
+ * then overshoots and bounces, settling into a wobble. It all happens in a
+ * few seconds, so it's fun to watch. Settling behaviour: Binney & Tremaine
+ * (2008) §8.5.4.
  */
 static void preset_cluster(int cols, int rows) {
   float cx = (float)pw(cols) * 0.5f;
   float cy = (float)ph(rows) * 0.5f;
-  /* Compact radius → strong gravity → fast collapse */
+  /* Keep it compact: tighter cloud means stronger pull, faster collapse. */
   float R = (float)(pw(cols) < ph(rows) ? pw(cols) : ph(rows)) * 0.28f;
 
-  /* Slight spin so it doesn't just collapse to a point */
+  /* A touch of spin so it doesn't collapse to a single dot. */
   float M_tot = (float)scene.n_bodies;
-  float v_spin = sqrtf(scene.G * M_tot / R) * 0.12f; /* 12% of virial speed */
+  float v_spin = sqrtf(scene.G * M_tot / R) * 0.12f;
 
   for (int i = 0; i < scene.n_bodies; i++) {
     float r = R * sqrtf(rng_f());
@@ -845,7 +680,7 @@ static void preset_cluster(int cols, int rows) {
     float bx = cx + cosf(theta) * r;
     float by = cy + sinf(theta) * r;
 
-    /* Tangential spin */
+    /* Point the spin sideways so the cloud rotates. */
     float nx = -(by - cy) / (r + 1.0f);
     float ny = (bx - cx) / (r + 1.0f);
 
@@ -860,10 +695,9 @@ static void preset_cluster(int cols, int rows) {
 }
 
 /*
- * Preset 3 — Binary Merger
- *
- * Two counter-rotating clusters approach each other.  Tidal forces
- * strip outer bodies into long streams; the cores merge with a burst.
+ * Two clusters, spinning opposite ways, drifting toward each other. As
+ * they pass, each one's gravity tears long streamers off the other's
+ * edges, and the two dense centres finally crash together in a burst.
  */
 static void preset_binary(int cols, int rows) {
   float cx = (float)pw(cols) * 0.5f;
@@ -934,28 +768,17 @@ static void scene_reset(int cols, int rows) {
   }
 }
 
-/* ── scene_tick ──────────────────────────────────────────────────────── */
+/* ── scene_tick ── */
 
-/*
- * rebuild_force_tree — fresh O(N log N) Barnes–Hut tree over the active
- * bodies. The tree is thrown away and rebuilt every sim step (no
- * incremental updates) because that is cheaper than maintaining
- * positions inside a long-lived tree.
- */
+/* Build the grouping tree fresh each step. Starting over every time is
+ * simpler and faster than nudging an old tree as the stars move. */
 static void rebuild_force_tree(int cols, int rows) {
   scene.qt_root = qt_build(cols, rows);
 }
 
-/*
- * mark_inactive_if_escaped — bodies that have wandered far beyond the
- * visible region cannot meaningfully participate in the scene any more.
- * Setting active=false makes the integrator and renderer skip them on
- * subsequent ticks, which keeps the per-frame cost bounded.
- *
- * The slack zone (2× width horizontally, 3× height vertically) gives
- * room for hyperbolic trajectories to swing past the edge and come
- * back before we deactivate them.
- */
+/* Switch off any star that has wandered far off-screen, so we stop
+ * spending work on it. We allow generous slack past the edges first,
+ * since a star can swing way out and still loop back into view. */
 static void mark_inactive_if_escaped(Body *b, float W, float H) {
   if (b->px < -W || b->px > 2.0f * W)
     b->active = false;
@@ -964,88 +787,77 @@ static void mark_inactive_if_escaped(Body *b, float W, float H) {
 }
 
 /*
- * integrate_body_symplectic_euler — one sim step for body i.
- *
- *   v += (F / m) · dt     (kick)
- *   x += v          · dt  (drift)
- *
- * Symplectic Euler conserves a "shadow" Hamiltonian over long runs so
- * orbital energy stays bounded — important for galaxy stability over
- * the thousands of ticks a long-running disc accumulates.  Force is
- * computed via the Barnes–Hut criterion in qt_force (§6).
- *
- * Side effects per call:
- *   - snapshot pre-step position for the renderer's streak pass
- *   - mark body inactive if it has escaped the slack zone
- *   - update scene.v_max for colour-band normalisation
+ * Move one star forward by a single step: first nudge its speed by the
+ * pull it feels, then slide it along at that new speed. Doing it in that
+ * order (speed first, then position) is the trick that keeps long galaxy
+ * runs from slowly spiralling apart — see the Body note in §5. Along the
+ * way we remember where it was (for the trail) and switch it off if it
+ * has escaped. Aarseth (2003) §2.4.
  */
 static void integrate_body_symplectic_euler(int i, float W, float H) {
   Body *b = &scene.bodies[i];
   if (!b->active || b->anchor)
     return;
 
-  /* Snapshot pre-step position for streak rendering. */
+  /* Remember where it was, so the trail can draw a line from there. */
   b->prev_px = b->px;
   b->prev_py = b->py;
 
-  /* Force from the Barnes–Hut tree (excludes self at leaf). */
+  /* Total pull on this star, gathered from the grouping tree. */
   float fx = 0.0f, fy = 0.0f;
   qt_force(scene.qt_root, i, &fx, &fy);
 
-  /* Kick — accelerate from current force. */
+  /* First nudge the speed by that pull... */
   float ax = fx / b->mass;
   float ay = fy / b->mass;
   b->vx += ax * scene.sim_dt;
   b->vy += ay * scene.sim_dt;
 
-  /* Drift — advance position using the new velocity. */
+  /* ...then slide it along at the new speed. */
   b->px += b->vx * scene.sim_dt;
   b->py += b->vy * scene.sim_dt;
 
   mark_inactive_if_escaped(b, W, H);
 
-  /* Update rolling max speed for the renderer's colour bands. */
+  /* Keep track of the fastest star, which sets the colour scale. */
   float spd = sqrtf(b->vx * b->vx + b->vy * b->vy);
   if (spd > scene.v_max)
     scene.v_max = spd;
 }
 
-/*
- * relax_speed_normalisation — slowly decay the rolling max speed so the
- * colour scale tracks the CURRENT dynamics rather than the fastest body
- * the simulation has ever produced (which would never come back down
- * after a single hot transient).  Decay factor and floor are tuned so
- * a galaxy disk settles within a few seconds.
- */
+/* Let the "fastest star" figure ease back down over time, so colours
+ * follow how things move right now instead of staying stuck on one brief
+ * burst of speed that may never happen again. */
 static void relax_speed_normalisation(void) {
   scene.v_max *= 0.9995f;
   if (scene.v_max < 0.1f)
     scene.v_max = 0.1f;
 }
 
-/* Top-level: one fixed-timestep simulation step. */
+/* One step of the whole simulation. */
 static void scene_tick(int cols, int rows) {
-  /* 1. Rebuild the Barnes–Hut force tree for this step. */
+  /* 1. Rebuild the box tree that groups the stars. */
   rebuild_force_tree(cols, rows);
 
-  /* 2. Advance every active, non-anchor body one symplectic Euler step. */
+  /* 2. Move every live, unpinned star forward one step. */
   float W = (float)pw(cols);
   float H = (float)ph(rows);
   for (int i = 0; i < scene.n_bodies; i++)
     integrate_body_symplectic_euler(i, W, H);
 
-  /* 3. Adapt the colour normalisation toward current dynamics. */
+  /* 3. Ease the colour scale back toward how things move now. */
   relax_speed_normalisation();
 }
 
-/* ── scene_draw ──────────────────────────────────────────────────────── */
+/* ── scene_draw ── */
 
 /*
- * streak_glow — additive Bresenham line from (x0,y0) to (x1,y1) in
- * pixel space, depositing `intensity` units of brightness into each
- * cell the line passes through. Skips the endpoint so the body's own
- * per-frame deposit isn't doubled. Hard cap on iterations prevents
- * runaway streaks if a body's position jumped wildly (e.g. resize).
+ * Smear glow along the line a star travelled this step, so a fast star
+ * leaves a smooth streak instead of a dotted trail of skipped cells. It
+ * walks the line cell by cell (the classic Bresenham line-stepping trick)
+ * and adds a little brightness to each one. We stop short of the end cell
+ * — the star itself lights that one — and cap the number of steps so a
+ * wild jump (say, after a resize) can't paint a streak across the screen.
  */
 static void streak_glow(float x0, float y0, float x1, float y1, float intensity,
                         int rows, int cols) {
@@ -1077,14 +889,12 @@ static void streak_glow(float x0, float y0, float x1, float y1, float intensity,
 }
 
 /*
- * deposit_accretion_halo — bleed extra brightness into the cells around
- * the anchor, aspect-corrected so the halo appears circular on the
- * terminal grid (each row is ~2× as tall as wide, so column offsets
- * count quarter-weight in the distance norm: d² = dr² + (dc/2)²).
- *
- * Intensity falls as 1 / (1 + d²) so the central cell is brightest and
- * the halo fades by the edge. The pulse argument modulates total
- * brightness with the BH's sinusoidal phase.
+ * Spread a soft glow around the black hole so it visibly pulls in light.
+ * The glow is brightest dead centre and fades with distance. Terminal
+ * cells are about twice as tall as they are wide, so we count sideways
+ * distance less than up-down distance; otherwise the glow would look
+ * squashed into an oval instead of a round halo. The pulse value makes
+ * the whole halo breathe in and out.
  */
 static void deposit_accretion_halo(int cr, int cc, int rows, int cols,
                                    float pulse) {
@@ -1103,13 +913,10 @@ static void deposit_accretion_halo(int cr, int cc, int rows, int cols,
 }
 
 /*
- * accumulate_glow_field — for each active body, deposit brightness at
- * its current cell plus a half-strength streak along its motion arc
- * from prev → current (Bresenham, via streak_glow). The anchor instead
- * gets an aspect-corrected accretion halo so it visibly pulls light.
- *
- * After this pass, scene.bright[][] holds the additive glow snapshot
- * for the frame and is ready for normalisation + painting.
+ * Lay down this frame's glow. Every star lights up its own cell and
+ * leaves a faint streak behind it; the black hole gets its round halo
+ * instead. When this is done, the brightness grid holds the full picture,
+ * ready to be scaled and painted.
  */
 static void accumulate_glow_field(int cols, int rows) {
   float halo_pulse = 1.0f + 0.4f * sinf((float)scene.frame_tick * 0.18f);
@@ -1138,12 +945,10 @@ static void accumulate_glow_field(int cols, int rows) {
 }
 
 /*
- * update_brightness_norm — EMA-smooth the max of scene.bright[][] used
- * for colour normalisation. Plain frame-by-frame max would let a single
- * bright transient (close pass, flyby) rescale the whole field for ~30
- * frames as the decay slowly chews it down. 85/15 mix adapts over ~7
- * frames — fast enough to track real changes, slow enough to ignore
- * spikes.
+ * Track the brightest cell so we can scale colours against it. We blend
+ * the new reading gently into the old one rather than jumping to it, so
+ * one fleeting hot spot — a near miss between two stars — doesn't wash
+ * out the whole picture for the next second.
  */
 static void update_brightness_norm(int cols, int rows) {
   float frame_max = 1.0f;
@@ -1157,9 +962,9 @@ static void update_brightness_norm(int cols, int rows) {
 }
 
 /*
- * paint_glow_layer — render the brightness buffer to the screen, then
- * apply the per-frame decay multiplier. Density ramp '.' → '@'; top
- * two tiers get A_BOLD so hot cells punch through.
+ * Draw the glow grid to the screen, picking a denser character for
+ * brighter cells, then fade every cell a touch so old trails slowly
+ * dim away over the next few frames instead of vanishing at once.
  */
 static void paint_glow_layer(int cols, int rows) {
   static const char k_glow[] = ".:*o@";
@@ -1186,10 +991,9 @@ static void paint_glow_layer(int cols, int rows) {
 }
 
 /*
- * paint_anchor_pulse — animated black-hole glyph. Phase from the same
- * frame_tick × 0.18 sin() used for the halo, so the core compresses
- * ('@') and brackets brighten in time with the halo's expansion, then
- * relaxes ('*') with dimmed brackets.
+ * Draw the black hole as a little pulsing symbol. It uses the same beat
+ * as its halo, so the core and the brackets around it swell and dim in
+ * time with the glow breathing in and out.
  */
 static void paint_anchor_pulse(int cr, int cc, int cols) {
   float ph = sinf((float)scene.frame_tick * 0.18f);
@@ -1213,9 +1017,10 @@ static void paint_anchor_pulse(int cr, int cc, int cols) {
 }
 
 /*
- * paint_field_body — non-anchor body. Speed-band colour with a two-
- * variant glyph picked by (i & 1) so a swarm of bodies at the same
- * speed reads as a textured cloud, not a stencil pattern.
+ * Draw one ordinary star: faster stars get hotter colours and bolder
+ * symbols. We also alternate between two look-alike characters so a
+ * crowd of stars moving at the same speed reads as a textured cloud
+ * rather than a flat, repeating pattern.
  */
 static void paint_field_body(int i, const Body *b, int cr, int cc) {
   float spd = sqrtf(b->vx * b->vx + b->vy * b->vy);
@@ -1254,9 +1059,8 @@ static void paint_field_body(int i, const Body *b, int cr, int cc) {
 }
 
 /*
- * paint_bodies — render every active body's glyph on top of the glow
- * layer. The anchor uses its own pulsing renderer; everything else
- * uses the speed-banded body renderer.
+ * Draw every star on top of the glow. The black hole gets its own
+ * pulsing symbol; all the others are coloured by how fast they move.
  */
 static void paint_bodies(int cols, int rows) {
   for (int i = 0; i < scene.n_bodies; i++) {
@@ -1276,32 +1080,29 @@ static void paint_bodies(int cols, int rows) {
   }
 }
 
-/* Top-level: one frame as five named passes. */
+/* One drawn frame, built up in five passes. */
 static void scene_draw(int cols, int rows, float alpha) {
   (void)alpha;
   scene.frame_tick++;
 
-  /* 1. Deposit body + streak + accretion-halo brightness for this frame. */
+  /* 1. Lay down this frame's glow: stars, trails, and the halo. */
   accumulate_glow_field(cols, rows);
 
-  /* 2. EMA-smooth the brightness normalisation against transients. */
+  /* 2. Find the brightest cell to scale colours against. */
   update_brightness_norm(cols, rows);
 
-  /* 3. Paint the glow buffer (with per-frame decay multiplier). */
+  /* 3. Paint the glow, fading old trails as we go. */
   paint_glow_layer(cols, rows);
 
-  /* 4. Paint body glyphs on top of the glow (anchor pulses, others
-   *    are speed-band coloured with two-variant glyphs). */
+  /* 4. Paint the stars on top of the glow. */
   paint_bodies(cols, rows);
 
-  /* 5. Optional quadtree overlay for the Barnes–Hut decomposition. */
+  /* 5. If asked, sketch the box tree over everything. */
   if (scene.overlay)
     qt_draw_overlay(scene.qt_root, rows, cols);
 }
 
-/* ===================================================================== */
-/* §8  screen / HUD                                                       */
-/* ===================================================================== */
+/* ── §8  screen / HUD ── */
 
 /*
  * Two-bar HUD per CLAUDE.md convention:
@@ -1363,9 +1164,7 @@ static void hud_draw(int cols, int rows, double fps) {
   attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §9  app                                                                */
-/* ===================================================================== */
+/* ── §9  app ── */
 
 static volatile sig_atomic_t g_resize = 0;
 static void on_sigwinch(int sig) {

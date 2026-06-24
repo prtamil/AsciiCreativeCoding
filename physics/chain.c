@@ -1,142 +1,20 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * chain.c — Hanging Chain & Swinging Rope
+ * chain.c — a hanging chain / swinging rope you can watch in the terminal.
  *
- * A chain of point masses connected by inextensible links, simulated with
- * Position-Based Dynamics (PBD):
+ * The rope is a row of beads joined by links that don't stretch. Instead of
+ * tracking forces and velocities, we just nudge bead positions until every
+ * link is back to its proper length — repeat that nudge a few times and the
+ * rope holds together. This trick is Position-Based Dynamics; it never blows
+ * up no matter how stiff you make it. Ten presets show it off: a plain hang,
+ * a pendulum, a sagging bridge, a driven wave, and so on (see §6).
  *
- *   1. Verlet predict:  x_pred = x + (x - x_old)*DAMP + g*dt²
- *   2. Project constraints (N_ITER times):
- *        for each link (a, b):
- *          d = x_pred[b] - x_pred[a]
- *          corr = (|d| - rest) / |d|
- *          x_pred[a] += 0.5 * corr * d   (split equally; skip if pinned)
- *          x_pred[b] -= 0.5 * corr * d
- *   3. Derive velocity: v ≈ (x_pred - x_old) / dt  (implicit in Verlet)
- *   4. x_old = x; x = x_pred
- *
- * PBD is unconditionally stable for any stiffness — no spring constant to
- * tune for stability. More iterations = stiffer chain.
- *
- * Presets:
- *   0  Hanging    — pinned at top, gravity + sinusoidal wind
- *   1  Pendulum   — pinned at top, released from 60°; swings freely
- *   2  Bridge     — pinned at both ends, catenary sag; gust from below
- *   3  Wave       — top node driven horizontally; standing waves emerge
- *   4  Festoon    — three pins at top, double-catenary garland with breeze
- *   5  Snake      — bridge geometry + vertical drive on one end; slithers
- *   6  Storm      — hanging chain with 4× violent wind; whips around
- *   7  Slingshot  — pendulum from 150° (chain inverted); dramatic full swing
- *   8  Flag       — top-left pin, horizontal start, sustained strong wind
- *   9  Double     — two pins (anchor + side-hook), lower pendulum at 45°
- *
- * Keys:
- *   q / ESC    quit
- *   space / p  pause / resume
- *   r          reset current preset
- *   n / N      next / previous preset
- *   t / T      next / previous theme  (10 palettes:
- *                Matrix  Fire    Oceanic  Neon    Mono
- *                Ice     Nova    Forest   Desert  Eclipse)
- *   + / -      more / fewer constraint iterations (stiffness)
- *   w          toggle wind / gust
- *   ] / [      simulation FPS up / down
- *
- * HUD: canonical CLAUDE.md two-bar — row 0 right shows live status
- * (preset, theme, iter, wind, fps, paused/running); row rows-1 lists
- * the action keys.
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/chain.c -o chain -lncurses -lm
- *
- * Sections: §1 config  §2 clock  §3 color  §4 coords  §5 physics
- *           §6 scene   §7 screen §8 app
+ * Background, if you want the real names and the papers behind them:
+ *   PBD position-nudging idea       — Müller et al., "Position Based Dynamics" (2007)
+ *   the Verlet + relaxation recipe  — Jakobsen, "Advanced Character Physics" (GDC 2001)
+ *   pendulum / sag / wave behaviour — Goldstein, Classical Mechanics; Crawford, Waves
+ *   safe theme colour ramps         — Ware, Information Visualization
  */
-
-/* ── CONCEPTS ────────────────────────────────────────────────────────── *
- *
- * Algorithm     : Position-Based Dynamics (PBD / XPBD) [1].
- *                 Instead of integrating forces to get acceleration and then
- *                 velocity, PBD works directly on positions.  Each constraint
- *                 (link length) is projected to satisfaction by moving the
- *                 endpoints.  Repeating N_ITER times → stiffer chain.  The
- *                 practical Verlet + iterative-relaxation pattern used here
- *                 is the one popularised for game ragdolls in [2].
- *
- * Physics        : Verlet integration + constraint projection [1, 2].
- *                 Velocity is implicit: v ≈ (x_current − x_prev) / dt.
- *                 There is no explicit velocity variable — damping multiplies
- *                 the positional delta before the predict step.
- *
- *                 Visible physics across the 10 presets is standard
- *                 classical mechanics [3]: catenary (Bridge, Festoon),
- *                 simple/large-angle pendulum (Pendulum, Slingshot,
- *                 Double), forced oscillation, beat patterns.  Wave-on-a-
- *                 string behaviour (Wave, Snake) — reflections off fixed
- *                 ends, standing modes at resonance — follows the
- *                 transverse-wave equation derived in [4].
- *
- * Math           : Constraint projection formula (per link), from [1]:
- *                 correction = (|d| − rest) / |d|  ·  d_vector
- *                 Each free endpoint absorbs half the correction (equal
- *                 mass assumption).  A pinned node absorbs none (infinite
- *                 mass).
- *
- * Performance    : Sub-stepping (SUB_STEPS=8) divides dt into 8 smaller
- *                 steps.  Each sub-step runs the full constraint loop.
- *                 This improves stability for stiff constraints without
- *                 shrinking the render frame rate or using an implicit
- *                 (matrix-solving) integrator.  Cost: O(N · I · S) per
- *                 frame where N=nodes, I=iterations, S=sub-steps.
- *
- * Stability      : PBD is unconditionally stable [1] — no spring constant to
- *                 blow up.  Stiffness is purely iteration count, not a
- *                 numerical parameter.  More iterations → stiffer rope,
- *                 but each iteration is just a few multiplies.
- *
- * Data-structure : Ring-buffer trail (TRAIL_LEN entries) for the last
- *                 free node.  Oldest entry is trail_head wrapped by modulo
- *                 arithmetic — no shifts needed.
- *
- * Rendering      : 10 brightness-safe theme palettes [5] — link-tier ramp
- *                 (link_lo / link_mid / link_hi) is a perceptually-ordered
- *                 gradient mapped to strain (relaxed / stretched / taut),
- *                 so the rope visibly "heats up" wherever it is being
- *                 pulled.  Canonical two-bar HUD: row 0 right shows live
- *                 status; row rows-1 lists the action keys.
- *
- * References (cite inline as [n]):
- *
- *   [1] Müller, M.; Heidelberger, B.; Hennix, M.; Ratcliff, J. (2007) —
- *       "Position Based Dynamics", *J. Visual Communication and Image
- *       Representation* 18 (2), 109–118.  The seminal PBD paper:
- *       constraint-projection iteration, unconditional stability, and
- *       the half-half mass-split formula used in chain_pbd_step (§5).
- *
- *   [2] Jakobsen, T. (2001) — "Advanced Character Physics", GDC.
- *       The practical Verlet + iterative-relaxation paper from
- *       Hitman: Codename 47.  Concrete recipe almost identical to ours:
- *       Verlet predict, then N_ITER passes of pairwise distance
- *       constraints, pinned nodes via infinite mass.  Highly readable
- *       game-dev primer.
- *
- *   [3] Goldstein, H.; Poole, C.; Safko, J. — *Classical Mechanics*,
- *       3rd ed., Addison-Wesley (2002).  Pendulum dynamics (small- and
- *       large-angle), catenary curve (variational form), constrained
- *       systems, coupled oscillators.  Backs the qualitative behaviour
- *       of every preset in §6.
- *
- *   [4] Crawford, F. S. — *Waves*, Berkeley Physics Course vol. 3,
- *       McGraw-Hill (1968).  Transverse waves on a string: wave
- *       equation ∂²y/∂t² = c² ∂²y/∂x², reflection at fixed boundaries,
- *       standing-wave modes.  Backs the Wave and Snake presets and
- *       the resonance pattern formation in chain_pbd_step.
- *
- *   [5] Ware, C. — *Information Visualization: Perception for Design*,
- *       4th ed., Morgan Kaufmann (2020).  Perceptually-ordered colour
- *       and luminance ramps (Ch. 4) back the link-strain ramp and the
- *       10 brightness-safe theme palettes in §3 (k_themes).
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -153,78 +31,65 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
-  SIM_FPS_DEFAULT = 60, /* target render/sim rate (frames per second)  */
+  SIM_FPS_DEFAULT = 60, /* how many frames per second we aim for       */
   SIM_FPS_MIN = 10,
   SIM_FPS_MAX = 120,
   SIM_FPS_STEP = 10,
 
-  N_NODES_MAX = 32, /* max chain nodes (including anchor nodes)    */
-  N_NODES_DEF = 24, /* default node count; more → smoother but     */
-                    /* O(N) constraint passes per sub-step         */
-  N_ITER_DEF = 20,  /* constraint iterations per sub-step:         */
-                    /* more → stiffer rope, no instability risk    */
+  N_NODES_MAX = 32, /* most beads a rope can have                   */
+  N_NODES_DEF = 24, /* beads in a normal rope; more = smoother but  */
+                    /* slower, since every bead is work each step   */
+  N_ITER_DEF = 20,  /* how many times we re-nudge the links each    */
+                    /* step; more passes = stiffer rope, always safe*/
   N_ITER_MIN = 5,
   N_ITER_MAX = 60,
-  SUB_STEPS = 8, /* physics sub-steps per rendered frame:       */
-                 /* effective dt = frame_dt / SUB_STEPS         */
-                 /* smaller sub-dt → more accurate constraint   */
-                 /* projection without changing display fps     */
+  SUB_STEPS = 8, /* we split each frame into this many tiny physics */
+                 /* steps; smaller steps keep a stiff rope steady   */
+                 /* without speeding up or slowing down the display */
 
-  TRAIL_LEN = 90, /* ring-buffer trail depth for bottom node;    */
-                  /* at 60 fps ≈ 1.5 s of history               */
-  N_PRESETS = 10, /* 0..3 original + 4..9 complex (see §6)        */
-  N_THEMES = 10,  /* MATRIX..ECLIPSE — see k_themes in §3 */
+  TRAIL_LEN = 90, /* how many past positions of the swinging tip we  */
+                  /* remember for the fading trail (~1.5 s at 60 fps)*/
+  N_PRESETS = 10, /* number of built-in scenes (see §6)              */
+  N_THEMES = 10,  /* number of colour palettes (see k_themes in §3)  */
 };
 
 #define NS_PER_SEC 1000000000LL       /* nanoseconds in one second      */
 #define TICK_NS(f) (NS_PER_SEC / (f)) /* nanoseconds per frame at fps f */
 
-/* Terminal cell dimensions in pixels (ncurses coordinate space).
- * CELL_W × CELL_H is the logical pixel size of one character cell.
- * CELL_H / CELL_W ≈ 2 because typical monospace fonts are taller than wide.
- * All physics runs in pixel-space; px_to_cx / px_to_cy convert to cells.*/
+/* We do all the physics in tiny "pixels", then round to character cells only
+ * when drawing. One cell is 8 pixels wide and 16 tall — about twice as tall
+ * as wide, which matches how monospace fonts look. */
 #define CELL_W 8
 #define CELL_H 16
 
-/* GRAVITY: downward acceleration in terminal pixel-space (px/s²).
- * Real gravity = 9.81 m/s².  If we define 1 m ≡ CELL_H px (≈ one cell
- * height), then a screen of 40 cells ≈ 40 m — too slow visually.
- * Chosen empirically so the chain sways at a pleasing rate on a typical
- * 80-row terminal.  Scale: ~38.7 px per "metre", giving 9.81×38.7 ≈ 380. */
+/* How hard gravity pulls the beads down (in pixels per second, per second).
+ * Real-world gravity feels too slow at this scale, so this number was just
+ * tuned by eye until the rope sways at a nice pace on a normal terminal. */
 #define GRAVITY 380.f
 
-/* DAMP: fraction of velocity kept after each sub-step (dimensionless 0–1).
- * Applied as: velocity *= DAMP each sub-step (via positional delta).
- * At SUB_STEPS=8 and 60 fps: 0.997^(8×60) ≈ 0.30 per second — gentle
- * energy drain that prevents perpetual oscillation without overdamping. */
+/* Tiny bit of drag so the rope eventually settles instead of swinging
+ * forever. Each step we keep 99.7% of a bead's motion and shed the rest. */
 #define DAMP 0.997f
 
-/* WIND_FREQ: frequency of the sinusoidal wind force (Hz).
- * 0.35 Hz ≈ one full left-right cycle every 2.9 s — slow enough to look
- * like natural wind gusts rather than rapid mechanical oscillation.       */
+/* How fast the wind swings left and right. 0.35 Hz is one slow gust every
+ * ~3 seconds — feels like a breeze, not a buzzing motor. */
 #define WIND_FREQ 0.35f
 
-/* Driven-anchor parameters — shared by the Wave (preset 3, horizontal)
- * and Snake (preset 5, vertical, 0.5× amplitude to fight gravity) drivers. */
+/* The "Wave" and "Snake" presets grab the top bead and shake it like a hand
+ * holding a jump rope. These set how fast and how far that shake goes. */
 
-/* WAVE_FREQ: driver frequency for the moving anchor (Hz).
- * 1.8 Hz was tuned to fall near the second normal mode of a 24-node chain
- * at the default tension, producing visible standing-wave patterns.       */
+/* How fast the shaking hand moves. Tuned so the ripples line up into a clean
+ * standing pattern on a normal-length rope. */
 #define WAVE_FREQ 1.8f
 
-/* WAVE_AMPL: peak displacement of the driven anchor (pixels).
- * At CELL_W=8 this is ~2.75 character columns — large enough to see the
- * wave clearly without the chain folding over itself.                     */
+/* How far the shaking hand moves (in pixels) — about 3 cells, big enough to
+ * see the wave clearly but not so big the rope folds over itself. */
 #define WAVE_AMPL 22.f
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -242,20 +107,20 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color / theme                                                      */
-/* ===================================================================== */
+/* ── §3 color / theme ── */
 
 /*
- * Color pair assignments:
- *   1   link — relaxed  (near rest length)        — per theme
- *   2   link — stretched                          — per theme
- *   3   link — very stretched / taut              — per theme
- *   4   node — free                               — per theme
- *   5   node — pinned / driven anchor             — per theme
- *   6   trail (last free node, fading)            — per theme
- *   7   HUD — top status, bright yellow + bold    — theme-independent chrome
- *   8   HINT — bottom action bar, cyan + bold     — theme-independent chrome
+ * Each thing we draw gets its own colour slot. The first six change with the
+ * chosen theme; the last two (the status bar and the key hints) stay the same
+ * on every theme so they're always readable.
+ *   1   link — relaxed (close to its proper length)
+ *   2   link — stretched
+ *   3   link — really stretched / about to snap-taut
+ *   4   bead — free to swing
+ *   5   bead — pinned in place, or the bead being shaken
+ *   6   the fading trail behind the swinging tip
+ *   7   top status bar (fixed: bright yellow)
+ *   8   bottom key hints (fixed: cyan)
  */
 enum {
   CP_LINK_LO = 1,
@@ -269,16 +134,24 @@ enum {
 };
 
 /*
- * Theme — six 256-colour cube indices, one per data role on the chain.
- * The link-tier ramp (link_lo → link_mid → link_hi) is a perceptual
- * gradient mapped to constraint strain (relaxed → taut), so the rope
- * visibly "heats up" where it's stretched.  CP_HUD / CP_HINT are NOT
- * in the theme — they stay fixed across all palettes so the HUD chrome
- * is always legible.
+ * Theme — one colour palette for the rope. Each field is a terminal colour
+ * number (from the 256-colour set) picked for one part of the picture.
  *
- * Brightness safety (CLAUDE.md): every entry sits at index ≥ 30, or
- * 24-29 / 240-243 only as the lowest ramp tier.  16-23 / 232-239 are
- * forbidden — they vanish on default-background terminals.
+ *   name              what to show in the HUD (e.g. "Matrix")
+ *   link_lo/mid/hi    three shades for the rope links, from relaxed to taut.
+ *                     They go light-to-hot on purpose, so a stretched link
+ *                     "heats up" in colour and you can see where the strain is.
+ *   node              colour of a free, swinging bead
+ *   anchor            colour of a pinned bead, or the bead being shaken
+ *   trail             colour of the fading trail behind the tip
+ *
+ * The status bar and key-hint colours are NOT here — they're fixed across
+ * every theme so the text on screen is always readable.
+ *
+ * One rule on the numbers: keep every colour bright enough to show up on a
+ * default (often black) background. Very dark indices (16-23, 232-239) vanish,
+ * so we never use those; the darkest we allow is the 24-29 / 240-243 range,
+ * and only as a link_lo.
  */
 typedef struct {
   const char *name;
@@ -300,10 +173,9 @@ static const Theme k_themes[N_THEMES] = {
     {"Eclipse", 240, 244, 196, 255, 226, 124}, /* gray + red  */
 };
 
-/* Active theme index is owned by Scene (g_scene.theme, defined in §6).
- * theme_apply takes the index as a parameter so it doesn't need to
- * forward-reference the Scene struct. */
-
+/* Takes the theme number as an argument (rather than reaching into the Scene
+ * struct, which isn't defined until §6) so this can live up here near the
+ * palette table it uses. */
 static void theme_apply(int t) {
   const Theme *th = &k_themes[t % N_THEMES];
   if (COLORS >= 256) {
@@ -313,11 +185,11 @@ static void theme_apply(int t) {
     init_pair(CP_NODE, th->node, -1);
     init_pair(CP_ANCHOR, th->anchor, -1);
     init_pair(CP_TRAIL, th->trail, -1);
-    /* Fixed chrome — same on every theme so the HUD stays legible. */
+    /* The two HUD bars stay the same on every theme so they're always legible. */
     init_pair(CP_HUD, 226, -1); /* bright yellow */
     init_pair(CP_HINT, 51, -1); /* bright cyan   */
   } else {
-    /* 8-colour fallback — theme-independent. */
+    /* Plain 8-colour terminals: a simple fallback, ignores the theme. */
     init_pair(CP_LINK_LO, COLOR_CYAN, -1);
     init_pair(CP_LINK_MID, COLOR_YELLOW, -1);
     init_pair(CP_LINK_HI, COLOR_RED, -1);
@@ -335,164 +207,120 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  coords                                                             */
-/* ===================================================================== */
+/* ── §4 coords ── */
 
-/* Convert pixel-space coordinates to terminal cell coordinates.
- * + 0.5f performs nearest-cell rounding (equivalent to floorf(x + 0.5)). */
+/* Turn a fine-grained pixel position into a character-cell row or column.
+ * Adding 0.5 before chopping to an int rounds to the nearest cell. */
 static inline int px_to_cx(float px) { return (int)(px / CELL_W + 0.5f); }
 static inline int px_to_cy(float py) { return (int)(py / CELL_H + 0.5f); }
 
-/* ===================================================================== */
-/* §5  physics — Position-Based Dynamics (PBD) chain                     */
-/*                                                                       */
-/* Data structures (ChainNode, Chain) plus the named-step PBD pipeline.  */
-/* The integration loop is laid out across compute_wind_force →          */
-/* verlet_predict_node → project_link_constraint → relax_link_constraints*/
-/* → chain_pbd_step, each with its own docstring.  The driver chain_tick */
-/* sequences sub-steps and applies preset-specific anchor drivers.       */
-/* ===================================================================== */
+/* ── §5 physics ── */
 
 /*
- * ChainNode — one mass point in the PBD chain.
+ * ChainNode — one bead of the rope.
  *
- * Why two positions (x, ox) instead of a (position, velocity) pair:
- *   The integrator is Verlet [2] — velocity is IMPLICIT in the
- *   difference between two consecutive positions:
+ *   x, y      where the bead is right now, in pixels
+ *   ox, oy    where it was on the previous step, also in pixels
+ *   pinned    true if this bead is held in place (an anchor, or the bead
+ *             being shaken) instead of swinging freely
  *
- *       v ≈ (x − ox) / dt
+ * Why store the old position instead of a velocity? Speed is just "how far
+ * the bead moved last step" — so the gap between (x,y) and (ox,oy) already
+ * tells us that, and we never store a separate velocity. This keeps the
+ * update to one line, makes drag a simple multiply, and means our position
+ * nudges automatically carry over as next step's motion. (This is Verlet
+ * integration; the trick comes from Jakobsen.)
  *
- *   Storing (x, ox) instead of (x, v) gives us:
- *     • a one-line predict step:  x_new = x + (x − ox) + a·dt²
- *     • damping is just a multiplier on (x − ox) before reuse, so we
- *       never need to compute or store v explicitly
- *     • constraint projection moves x directly without converting
- *       back into velocity space — the next tick's "velocity" is
- *       exactly the projected position delta, automatically.
+ * Positions are floats, not whole cells, so the rope moves smoothly instead
+ * of jumping a full character at a time; we round to cells only when drawing.
  *
- *   Cost: one extra (ox, oy) per node, ~16 bytes — negligible.  Payoff:
- *   stable integrator with zero coupling between numerical timestep
- *   and constraint stiffness (PBD's headline property [1]).
- *
- * Why floats (sub-pixel precision):
- *   Cells are 8×16 pixels (CELL_W × CELL_H).  Quantising to integer
- *   cells would jitter the chain like a low-resolution Bresenham line
- *   every frame.  The renderer quantises only at draw time via
- *   px_to_cx / px_to_cy (§4).
- *
- * The `pinned` flag:
- *   pinned = true → position is set externally each tick (a constant
- *   anchor for static pins, or a sinusoidal driver for the Wave and
- *   Snake presets).  The PBD constraint loop SKIPS pinned nodes —
- *   they model an infinite-mass endpoint.  When only one end of a
- *   link is pinned, the other absorbs the FULL correction (not half).
- *
- * Algorithm refs (header REFERENCES):
- *   Verlet two-position storage      — Jakobsen [2]
- *   Pinned / infinite-mass handling  — Müller PBD [1]
+ * A pinned bead is left where some other code puts it each step and is
+ * skipped by the link-fixing loop — think of it as infinitely heavy, so it
+ * never gets pushed around. When a link has one pinned end, the free end
+ * takes the whole correction instead of splitting it.
  */
 typedef struct {
-  float x, y;   /* current position (pixels)                       */
-  float ox, oy; /* previous-step position — Verlet (v = (x-ox)/dt) */
-  bool pinned;  /* true → position set externally; PBD skips it    */
+  float x, y;   /* where the bead is now (pixels)                  */
+  float ox, oy; /* where it was last step (pixels)                 */
+  bool pinned;  /* held in place? if so, the link loop skips it    */
 } ChainNode;
 
 /*
- * Chain — the full PBD simulation state for one chain instance.
+ * Chain — everything about one rope, in a single bundle: the beads
+ * themselves, the wind, the live settings you change with the keyboard, which
+ * preset is running, and the trail history we draw behind the tip. It's all
+ * here together because resetting a scene and stepping the physics both touch
+ * all of it at once.
  *
- * Why one struct holding everything (vs. separate arrays):
- *   Chain bundles the physics (nodes, link_rest), the active control
- *   knobs (pause, iter count, wind), the preset identity, and the
- *   renderer's trail ring buffer.  Everything scene_init() resets
- *   together belongs together; everything chain_tick() reads/writes
- *   is one pointer dereference away.
+ * The fields fall into a few groups, matching the layout below:
  *
- * Field groups (mirrored by the layout below):
+ *   The rope          nodes[], n_nodes, link_rest — the beads, how many
+ *                     there are, and how long each link should be.
  *
- *   Geometry         nodes[], n_nodes, link_rest — the bonded
- *                    mass-point graph the PBD solver iterates over.
+ *   Wind              wind_phase, wind_str, wind_on — a side-to-side breeze.
+ *                     phase is where the gust is in its swing, str is how
+ *                     hard it blows (different per preset — gentle for a
+ *                     bridge, fierce for a storm), on/off is the 'w' key.
  *
- *   Wind forcing     wind_phase, wind_str, wind_on — sinusoidal
- *                    horizontal driver added in the Verlet predict
- *                    step.  Strength varies per preset (140 default,
- *                    580 in Storm, 320 in Flag, 110 in Bridge, etc.).
+ *   Live settings     paused, n_iter — paused freezes the rope; n_iter is how
+ *                     many link-fixing passes we do, i.e. how stiff the rope
+ *                     feels (more passes = stiffer, and always stable).
  *
- *   Control state    paused, n_iter — interactive knobs.  n_iter
- *                    controls effective stiffness: more constraint
- *                    projection passes per sub-step → stiffer rope.
- *                    No instability risk; PBD is unconditionally stable.
+ *   Which scene       preset — picks which built-in scene is running, and lets
+ *                     the step code turn on the special shaking for the Wave
+ *                     and Snake scenes.
  *
- *   Preset identity  preset (∈ [0, N_PRESETS)) — chain_tick reads it
- *                    to enable per-preset drivers (preset 3 = Wave's
- *                    horizontal drive on node 0; preset 5 = Snake's
- *                    vertical drive on node 0).
+ *   Shaking state     wave_phase, wave_ax, wave_ay — for the two scenes that
+ *                     shake the top bead: where the hand started and where it
+ *                     is in its motion. Ignored by the other scenes.
  *
- *   Driver state     wave_phase, wave_ax, wave_ay — anchor position
- *                    and phase for the driven-endpoint presets (3, 5).
- *                    Unused for static-pin presets but always present.
+ *   Trail history     trail_px/py plus trail_head/trail_cnt — a fixed-size
+ *                     circular log of the swinging tip's recent positions.
+ *                     head is where the next sample goes; cnt is how many
+ *                     we've collected (it stops growing once the log is full).
+ *                     We reuse the oldest slot instead of shifting everything.
  *
- *   Trail (renderer) trail_px / trail_py ring buffer for the bottom
- *                    free node.  Drawn newest-to-oldest with fading
- *                    glyphs in chain_draw — visualises the recent path.
- *
- * Why a fixed N_NODES_MAX array (not heap-allocated):
- *   Chain length never exceeds N_NODES_MAX, and an embedded array keeps
- *   the whole Chain in one contiguous block — better cache behaviour
- *   for the per-frame O(N · I · S) constraint loop and zero allocation
- *   in the hot path.
- *
- * Algorithm refs (header REFERENCES):
- *   PBD constraint-projection loop  — Müller [1]
- *   Verlet + iterative relaxation   — Jakobsen [2]
- *   Catenary / pendulum behaviour   — Goldstein [3]
- *   Wave reflection / standing modes — Crawford [4]
+ * The bead array has a fixed maximum size and lives inside the struct (no
+ * heap allocation) — a rope never gets longer than that, and keeping it all
+ * in one block is fast for the tight per-frame loop.
  */
 typedef struct {
-  /* ── Geometry (PBD operates on these) ─────────────────────────── */
+  /* ── the rope ── */
   ChainNode nodes[N_NODES_MAX];
   int n_nodes;
-  float link_rest; /* rest length of each link, pixels             */
+  float link_rest; /* how long each link wants to be, in pixels    */
 
-  /* ── Wind forcing (added in the predict step) ─────────────────── */
-  float wind_phase; /* radians; advanced at WIND_FREQ Hz            */
-  float wind_str;   /* peak amplitude, pixels/s² (set per preset)   */
-  bool wind_on;     /* w / W key toggles                            */
+  /* ── wind ── */
+  float wind_phase; /* where the gust is in its left-right swing    */
+  float wind_str;   /* how hard it blows (set per preset)           */
+  bool wind_on;     /* 'w' key turns it on/off                      */
 
-  /* ── Interactive control state ────────────────────────────────── */
-  bool paused; /* p / space — chain_tick is a no-op when true  */
-  int n_iter;  /* constraint iterations per sub-step (+/- keys)
-                * acts as stiffness, clamped [N_ITER_MIN, MAX] */
+  /* ── live settings ── */
+  bool paused; /* freeze the rope (space / 'p')                */
+  int n_iter;  /* link-fixing passes per step = how stiff the
+                * rope feels; '+'/'-' keys, clamped to a range */
 
-  /* ── Preset identity (drives per-preset code paths in tick) ───── */
-  int preset; /* ∈ [0, N_PRESETS); selects driver branch     */
+  /* ── which scene ── */
+  int preset; /* which built-in scene is running             */
 
-  /* ── Wave/Snake driver state (presets 3 & 5 only) ─────────────── */
-  float wave_phase; /* radians; advanced at WAVE_FREQ Hz            */
-  float wave_ax;    /* anchor x for the driven endpoint             */
-  float wave_ay;    /* anchor y for the driven endpoint             */
+  /* ── shaking state (Wave & Snake scenes only) ── */
+  float wave_phase; /* where the shaking hand is in its motion      */
+  float wave_ax;    /* where the shaken bead started (x)            */
+  float wave_ay;    /* where the shaken bead started (y)            */
 
-  /* ── Trail ring buffer (read by chain_draw in §5) ─────────────── */
+  /* ── trail history (used only for drawing) ── */
   float trail_px[TRAIL_LEN];
   float trail_py[TRAIL_LEN];
-  int trail_head; /* next write index ∈ [0, TRAIL_LEN)            */
-  int trail_cnt;  /* valid sample count, saturates at TRAIL_LEN   */
+  int trail_head; /* slot the next sample goes into               */
+  int trail_cnt;  /* how many samples we have (caps at TRAIL_LEN) */
 } Chain;
 
-/* ── Draw helper: DDA segment ─────────────────────────────────────── */
+/* ── drawing a link ── */
 
-/*
- * slope_glyph — pick the ASCII glyph that visually approximates a
- * segment's slope, quantised into four orientation bands:
- *
- *   |dx| ≥ 2 · |dy|   →  '-'    near-horizontal
- *   |dy| ≥ 2 · |dx|   →  '|'    near-vertical
- *   dx·dy > 0         →  '\\'   down-right / up-left diagonal
- *   otherwise         →  '/'    down-left / up-right diagonal
- *
- * The same glyph fills every cell of the segment so the eye reads it
- * as one continuous stroke rather than a stippled line.
- */
+/* Pick the character that best looks like the tilt of a link: '-' if it's
+ * mostly flat, '|' if it's mostly upright, and '\' or '/' for the two
+ * diagonals. We use one character for the whole link so it reads as a single
+ * stroke. */
 static char slope_glyph(int dx, int dy) {
   int adx = abs(dx), ady = abs(dy);
   if (adx >= 2 * ady)
@@ -505,22 +333,9 @@ static char slope_glyph(int dx, int dy) {
     return '/';
 }
 
-/*
- * seg_draw — DDA line from (x0, y0) to (x1, y1) filling every cell
- * with one slope-picked glyph.  Cells outside [0, cols) horizontally
- * and [1, rows-1) vertically are clipped (the row 0 / rows-1 HUD
- * bands are protected).  Degenerate zero-length segments paint a
- * single 'o' at the start.
- *
- * Pseudocode:
- *   dx, dy ← (x1, y1) − (x0, y0)
- *   steps  ← max(|dx|, |dy|)
- *   if steps == 0: paint 'o' at (x0, y0); return
- *   ch ← slope_glyph(dx, dy)
- *   for k in [0, steps]:
- *       (cx, cy) ← (x0, y0) + (k/steps) · (dx, dy)
- *       if in-chamber: mvaddch(cy, cx, ch)
- */
+/* Draws a straight line of characters from one bead to the next. Anything off
+ * the sides, or on the top and bottom rows (kept clear for the HUD), is
+ * skipped. A link with both ends in the same cell just gets a single 'o'. */
 static void seg_draw(int x0, int y0, int x1, int y1, int cols, int rows,
                      chtype attr) {
   int dx = x1 - x0;
@@ -548,34 +363,18 @@ static void seg_draw(int x0, int y0, int x1, int y1, int cols, int rows,
   attroff(attr);
 }
 
-/* ── PBD sub-step ─────────────────────────────────────────────────── */
+/* ── one physics step ── */
 
-/*
- * compute_wind_force — sinusoidal horizontal forcing at the current
- * wind_phase.  Returns 0 when wind is toggled off.
- *
- *     F_wind = wind_str · sin(wind_phase)
- *
- * Added to each free node's predict step as an external acceleration.
- */
+/* How hard the wind is blowing right now — it swings smoothly left and right.
+ * Returns zero when the wind is switched off. */
 static float compute_wind_force(const Chain *c) {
   return c->wind_on ? c->wind_str * sinf(c->wind_phase) : 0.f;
 }
 
-/*
- * verlet_predict_node — advance one mass point by one Verlet step.
- *
- *     v_x   = (x − ox) · DAMP           // implicit damped velocity x
- *     v_y   = (y − oy) · DAMP           // implicit damped velocity y
- *     x_new = x + v_x + wind · dt²      // wind = horizontal force
- *     y_new = y + v_y + GRAVITY · dt²   // gravity is +y (down)
- *     (ox, oy) ← (x, y)                 // save current as "old"
- *     (x, y)   ← (x_new, y_new)
- *
- * Pinned nodes are no-ops (their position is set externally each tick).
- *
- * Algorithm ref: Verlet integration with damping — Jakobsen [2].
- */
+/* Move one free bead forward by a step: it keeps drifting the way it was
+ * already going (a little slower, thanks to drag), plus gravity pulls it down
+ * and the wind nudges it sideways. Then today's spot becomes "last step's".
+ * Pinned beads don't move here — something else places them. */
 static void verlet_predict_node(ChainNode *n, float dt2, float wind_force) {
   if (n->pinned)
     return;
@@ -589,25 +388,14 @@ static void verlet_predict_node(ChainNode *n, float dt2, float wind_force) {
   n->y = new_y;
 }
 
-/*
- * project_link_constraint — one Gauss-Seidel relaxation pass on a
- * single link (a, b) with target rest length.
- *
- *     d    = b.pos − a.pos
- *     dist = |d|                                (current length)
- *     inv  = (dist − rest) / dist               (normalised violation)
- *     corr = inv · d                            (full correction vector)
- *
- * Mass distribution (equal mass = 1 per free node):
- *   • both pinned    → no correction (whatever the pins enforce)
- *   • only a pinned  → b absorbs the FULL correction (infinite mass a)
- *   • only b pinned  → a absorbs the FULL correction
- *   • neither pinned → both absorb HALF (split equally)
- *
- * Degenerate zero-length links are skipped to avoid the 1/0 in `inv`.
- *
- * Algorithm ref: PBD constraint projection — Müller [1].
- */
+/* Fix one link back toward its proper length by sliding its two beads along
+ * the line between them — apart if it's too short, together if it's too long.
+ * How the fix is shared:
+ *   both ends pinned   → leave it; the pins win
+ *   one end pinned     → the free end does all the moving
+ *   neither pinned     → the two beads split the move evenly
+ * If the two beads sit on top of each other we skip it (no direction to push
+ * in, and it would divide by zero). This is the heart of PBD (Müller). */
 static void project_link_constraint(ChainNode *a, ChainNode *b, float rest) {
   float dx = b->x - a->x;
   float dy = b->y - a->y;
@@ -620,32 +408,25 @@ static void project_link_constraint(ChainNode *a, ChainNode *b, float rest) {
   float cy = inv * dy;
 
   if (a->pinned && b->pinned) {
-    return; /* both fixed — no correction */
+    return;
   } else if (a->pinned) {
     b->x -= cx;
-    b->y -= cy; /* b absorbs full correction */
+    b->y -= cy;
   } else if (b->pinned) {
     a->x += cx;
-    a->y += cy; /* a absorbs full correction */
+    a->y += cy;
   } else {
     a->x += 0.5f * cx;
-    a->y += 0.5f * cy; /* split 50/50 */
+    a->y += 0.5f * cy;
     b->x -= 0.5f * cx;
     b->y -= 0.5f * cy;
   }
 }
 
-/*
- * relax_link_constraints — N_ITER Gauss-Seidel passes across all links.
- *
- * Each outer iteration walks the chain end-to-end, calling
- * project_link_constraint on every consecutive pair.  More passes →
- * stiffer rope (the chain converges closer to its rest-length
- * configuration each iteration).  Unconditionally stable — no spring
- * constant to blow up, no implicit matrix solve.
- *
- * Algorithm refs: iterative constraint relaxation — Müller [1], Jakobsen [2].
- */
+/* Fix every link, several times over. One pass alone leaves the rope a bit
+ * loose, because fixing one link tugs its neighbours out of shape; doing it
+ * again and again settles the whole rope. More passes = a stiffer rope, and
+ * it never becomes unstable. */
 static void relax_link_constraints(Chain *c) {
   for (int iter = 0; iter < c->n_iter; iter++) {
     for (int i = 0; i < c->n_nodes - 1; i++)
@@ -653,14 +434,9 @@ static void relax_link_constraints(Chain *c) {
   }
 }
 
-/*
- * chain_pbd_step — one PBD sub-step on the whole chain.
- *
- * Pseudocode:
- *   wind ← compute_wind_force(c)
- *   for each node:  verlet_predict_node(n, dt², wind)
- *   relax_link_constraints(c)                   // N_ITER projection passes
- */
+/* One tiny physics step for the whole rope: work out the wind, let every bead
+ * drift forward under gravity and wind, then fix the links back to length a
+ * bunch of times so the rope holds together. */
 static void chain_pbd_step(Chain *c, float dt) {
   float dt2 = dt * dt;
   float wind = compute_wind_force(c);
@@ -671,36 +447,23 @@ static void chain_pbd_step(Chain *c, float dt) {
   relax_link_constraints(c);
 }
 
-/* ── Chain tick ───────────────────────────────────────────────────── */
+/* ── one frame of physics ── */
 
-/*
- * advance_phase_wrapped — increment a sinusoidal driver's phase by
- * one tick's worth of angular motion and wrap it back into [0, 2π).
- *
- *   phase ← phase + freq · 2π · dt
- *   if phase ≥ 2π: phase ← phase − 2π
- *
- * Wrapping keeps the phase from growing without bound over a long
- * run (which would erode float precision in sin/cos).
- */
+/* Nudges a wave's "where are we in the swing" counter forward by one tick,
+ * then folds it back to the start once it passes a full circle. Folding it
+ * back stops the number from growing forever, which over a long run would
+ * slowly make the sin/cos wobble lose accuracy. */
 static void advance_phase_wrapped(float *phase, float freq, float dt) {
   *phase += freq * 2.f * (float)M_PI * dt;
   if (*phase > 2.f * (float)M_PI)
     *phase -= 2.f * (float)M_PI;
 }
 
-/*
- * drive_wave_anchor_horizontal — Wave preset's driver: rewrite node 0's
- * (x, ox) pair so the chain sees a sinusoidal HORIZONTAL motion at the
- * top.  The wave then propagates downward via PBD constraint projection.
- *
- *   node[0].x  = wave_ax + WAVE_AMPL · sin(phase_now)
- *   node[0].ox = wave_ax + WAVE_AMPL · sin(phase_prev)
- *
- * Setting BOTH x and ox preserves the implicit Verlet velocity
- * v = (x − ox)/dt for the next predict step — the driven node arrives
- * at the constraint loop already moving.
- */
+/* The Wave preset: shake the top bead side to side, and the ripple travels
+ * down the rope on its own as the links pull each bead along. We set both
+ * where the bead is and where it was a moment ago — setting both is what tells
+ * the rope the bead is already moving when the link-fixing starts, so the
+ * shake carries through smoothly. */
 static void drive_wave_anchor_horizontal(Chain *c, int sub_step, float dt,
                                          float sub_dt) {
   float sub_t = (float)sub_step / (float)SUB_STEPS;
@@ -713,16 +476,12 @@ static void drive_wave_anchor_horizontal(Chain *c, int sub_step, float dt,
   c->nodes[0].oy = c->wave_ay;
 }
 
-/*
- * drive_wave_anchor_vertical — Snake preset's driver: same closed-form
- * sinusoid as the horizontal driver but applied to Y instead of X.
- * Launches a TRANSVERSE wave down a horizontal chain; the standing-
- * wave pattern emerges from reflection at the far fixed end (Crawford [4]).
- *
- * Amplitude is reduced to 0.5 × WAVE_AMPL because vertical motion
- * fights against gravity — full amplitude would simply yank node 0 out
- * of the screen.
- */
+/* The Snake preset: same shake as the Wave one, but up-and-down instead of
+ * side to side, on a rope strung out flat. The wiggle runs along the rope,
+ * bounces off the pinned far end, and overlaps itself into a slithering
+ * pattern (Crawford, Waves). We shake it half as hard here because up-and-down
+ * motion fights gravity — a full-size shake would just fling the bead off the
+ * top of the screen. */
 static void drive_wave_anchor_vertical(Chain *c, int sub_step, float dt,
                                        float sub_dt) {
   float sub_t = (float)sub_step / (float)SUB_STEPS;
@@ -735,11 +494,8 @@ static void drive_wave_anchor_vertical(Chain *c, int sub_step, float dt,
   c->nodes[0].oy = c->wave_ay + WAVE_AMPL * 0.5f * sinf(phase_prev);
 }
 
-/*
- * apply_preset_driver — dispatch to the active preset's driven-anchor
- * routine.  Only presets 3 (Wave) and 5 (Snake) have one; all other
- * presets leave node positions to PBD's constraint loop.
- */
+/* Only two scenes shake a bead by hand — Wave and Snake. The rest just let the
+ * rope fall and swing on its own, so this does nothing for them. */
 static void apply_preset_driver(Chain *c, int sub_step, float dt,
                                 float sub_dt) {
   if (c->preset == 3)
@@ -748,11 +504,9 @@ static void apply_preset_driver(Chain *c, int sub_step, float dt,
     drive_wave_anchor_vertical(c, sub_step, dt, sub_dt);
 }
 
-/*
- * record_bottom_trail_sample — push the LAST FREE node's position into
- * the ring-buffer trail.  Skipped when the last node is pinned (e.g.
- * Bridge / Festoon where both ends are anchored — no motion to trail).
- */
+/* Remember where the bottom bead is right now, so we can draw its fading trail.
+ * Skipped when the bottom bead is pinned (like Bridge or Festoon) — a bead
+ * that never moves leaves no trail worth showing. */
 static void record_bottom_trail_sample(Chain *c) {
   int last = c->n_nodes - 1;
   if (c->nodes[last].pinned)
@@ -764,19 +518,9 @@ static void record_bottom_trail_sample(Chain *c) {
     c->trail_cnt++;
 }
 
-/*
- * chain_tick — one frame of physics.
- *
- * Pseudocode:
- *   if paused: return
- *   sub_dt ← dt / SUB_STEPS
- *   advance_phase_wrapped(&wind_phase, WIND_FREQ, dt)
- *   advance_phase_wrapped(&wave_phase, WAVE_FREQ, dt)
- *   for s in [0, SUB_STEPS):
- *       apply_preset_driver(c, s, dt, sub_dt)
- *       chain_pbd_step(c, sub_dt)
- *   record_bottom_trail_sample(c)
- */
+/* One frame of the rope's life: nudge the wind and shake along, then run the
+ * physics in several tiny steps so a stiff rope stays calm, and finally jot
+ * down where the tip is for the trail. */
 static void chain_tick(Chain *c, float dt) {
   if (c->paused)
     return;
@@ -794,15 +538,11 @@ static void chain_tick(Chain *c, float dt) {
   record_bottom_trail_sample(c);
 }
 
-/* ── Chain draw ───────────────────────────────────────────────────── */
+/* ── drawing the rope ── */
 
-/*
- * link_strain — dimensionless strain ε of one link vs its rest length.
- *
- *     ε = |dist − rest| / rest          0 ≈ relaxed, 1 ≈ 100% stretched
- *
- * +0.001f in the denominator is defensive against any zero-rest links.
- */
+/* How far this link is stretched, as a fraction of its proper length: 0 means
+ * relaxed, 1 means stretched to double. The tiny +0.001 just guards against
+ * dividing by zero if a link's proper length is ever zero. */
 static float link_strain(const ChainNode *a, const ChainNode *b, float rest) {
   float dx = b->x - a->x;
   float dy = b->y - a->y;
@@ -810,17 +550,10 @@ static float link_strain(const ChainNode *a, const ChainNode *b, float rest) {
   return fabsf(dist - rest) / (rest + 0.001f);
 }
 
-/*
- * strain_color_pair — three-tier strain → CP_LINK_* selector.
- *
- *     ε < 0.04          →  CP_LINK_LO    relaxed (cool theme tier)
- *     0.04 ≤ ε < 0.12   →  CP_LINK_MID   stretched
- *     ε ≥ 0.12          →  CP_LINK_HI    taut / overstretched (warning)
- *
- * Thresholds tuned so a real rope's visible colour-change-under-load
- * shows at roughly the same strain values.  The ramp is theme-mapped
- * in §3 so it reads as a perceptual "rope heats up where stretched".
- */
+/* Pick a colour for a link based on how stretched it is: relaxed, stretched,
+ * or really taut. The two cut-offs were tuned by eye so the colour shifts at
+ * about the strain where a real rope would visibly tighten. With the §3
+ * palettes this makes the rope look like it "heats up" where it's pulled. */
 static int strain_color_pair(float strain) {
   if (strain < 0.04f)
     return CP_LINK_LO;
@@ -829,15 +562,10 @@ static int strain_color_pair(float strain) {
   return CP_LINK_HI;
 }
 
-/*
- * paint_trail — render the ring-buffer trail oldest-to-newest with a
- * fading glyph age ramp:
- *
- *     newest 40% (age > 0.6)  →  '*' bold      (bright fresh path)
- *     older 60%               →  '.' normal    (faded history)
- *
- * No per-entry alpha is stored — read order alone encodes the fade.
- */
+/* Draw the fading trail behind the tip, oldest dots first so newer ones land
+ * on top. The freshest part of the path shows as bright '*'; older history
+ * fades to a dim '.'. We don't store a brightness per dot — just walking the
+ * list from old to new is enough to know how faded each one should be. */
 static void paint_trail(const Chain *c, int cols, int rows) {
   int start = (c->trail_head - c->trail_cnt + TRAIL_LEN) % TRAIL_LEN;
   for (int i = 0; i < c->trail_cnt; i++) {
@@ -855,15 +583,7 @@ static void paint_trail(const Chain *c, int cols, int rows) {
   }
 }
 
-/*
- * paint_links — render every link as a strain-coloured DDA segment.
- *
- * Pseudocode:
- *   for each link (a, b):
- *       ε  ← link_strain(a, b, rest)
- *       cp ← strain_color_pair(ε)
- *       seg_draw(a → b, COLOR_PAIR(cp) | A_BOLD)
- */
+/* Draw every link as a short line, coloured by how stretched it is. */
 static void paint_links(const Chain *c, int cols, int rows) {
   for (int i = 0; i < c->n_nodes - 1; i++) {
     const ChainNode *a = &c->nodes[i];
@@ -877,17 +597,10 @@ static void paint_links(const Chain *c, int cols, int rows) {
   }
 }
 
-/*
- * paint_nodes — render every node as a role-coded glyph:
- *
- *     pinned + endpoint (i = 0 or N-1)   →  '#'  bold   (wall anchor)
- *     pinned + interior                  →  '*'  bold   (hook / brace)
- *     free                               →  'o'         (mass point)
- *
- * Wall anchors get '#' to read as fixed mounts; interior pins (Festoon
- * middle, Double hook) get '*' so they're distinguishable from end
- * walls.  Free nodes are plain 'o' to keep them visually receding.
- */
+/* Draw every bead, with its look hinting at its job: a pinned bead at either
+ * end is a '#' (a mount on the wall), a pinned bead in the middle is a '*' (a
+ * hook the rope hangs from), and a free, swinging bead is a plain 'o'. The
+ * different shapes just make it easy to tell anchors apart at a glance. */
 static void paint_nodes(const Chain *c, int cols, int rows) {
   int N = c->n_nodes;
   for (int i = 0; i < N; i++) {
@@ -908,78 +621,57 @@ static void paint_nodes(const Chain *c, int cols, int rows) {
   }
 }
 
-/*
- * chain_draw — render the chain in three layered passes.
- *
- * Pseudocode:
- *   paint_trail(c)   // bottom layer: motion-history dots
- *   paint_links(c)   // middle layer: strain-coloured DDA segments
- *   paint_nodes(c)   // top layer: anchors and free nodes
- */
+/* Draw the rope back to front: the faint trail first, then the links over it,
+ * then the beads on top so they're never hidden. */
 static void chain_draw(const Chain *c, int cols, int rows) {
   paint_trail(c, cols, rows);
   paint_links(c, cols, rows);
   paint_nodes(c, cols, rows);
 }
 
-/* ===================================================================== */
-/* §6  scene — preset initialisation & lifecycle                         */
-/*                                                                       */
-/* Each preset places the chain nodes at specific initial positions and  */
-/* pins selected nodes.  The physics §5 then evolves the system forward. */
-/*                                                                       */
-/* Preset geometry is expressed as fractions of screen dimensions so the */
-/* simulation looks proportional regardless of terminal size.            */
-/* ===================================================================== */
+/* ── §6 scene ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Scene — top-level state spanning physics ticks, draw calls, and the
- * main loop.  Groups the file-scope simulation / render globals under
- * one named container.
+/* Each preset lays out the beads in a starting pose and pins whichever ones
+ * stay fixed; the physics in §5 takes it from there. Positions are given as
+ * fractions of the screen so every scene looks right at any terminal size. */
+
+/*
+ * Scene — all the live state for one run, gathered in one place: the rope
+ * itself, plus the handful of settings you change from the keyboard. It's
+ * split into two groups, and the split is for the reader, not the computer:
  *
- * The struct splits into two clearly-labelled groups:
+ *   Simulation  — anything that changes how the rope MOVES (the rope state,
+ *                 the sim speed). Touched by the keys that affect physics:
+ *                 n / N (next/prev scene), r (reset), p / space (pause),
+ *                 +/- (stiffness), w (wind), ] / [ (sim speed).
  *
- *   Simulation parameters  — consumed by chain_tick and the preset_*()
- *     init functions.  Anything that affects the PHYSICS lives here.
- *     Mutated by physics-affecting keys: n / N (preset cycle), r
- *     (reset), p / space (pause), +/- (stiffness), w (wind toggle),
- *     ] / [ (sim fps).
+ *   Rendering   — anything that only changes how it LOOKS (the colour theme).
+ *                 Touched by the cosmetic keys t / T. Flipping a theme while
+ *                 paused must not budge the rope by a hair — only colours.
  *
- *   Rendering parameters   — consumed by theme_apply and draw_hud_top.
- *     Toggling these while paused must leave the chain positions and
- *     velocities byte-identical; only colours may differ.  Mutated by
- *     purely cosmetic keys: t / T (theme).
+ * Why keep them apart? So a new setting doesn't quietly let a "looks" change
+ * leak into "moves". When you add a field, ask: does this change how the rope
+ * moves? If yes it's simulation; if no it's rendering.
  *
- * Locality rationale (this contract matters, not the bytes):
- *   The split exists for the READER, not the CPU.  A new flag landing
- *   in the rendering group when it actually changes how chain_tick
- *   advances state would silently couple display to physics — exactly
- *   the bug the separation prevents.  When adding a field, ask: does
- *   this change what chain_tick or any preset_*() produces?  If yes,
- *   simulation; if no, rendering.
+ *   fields
+ *     chain     the rope and its physics (see §5)
+ *     sim_fps   how many physics/draw frames per second, 10–120, ] / [ keys
+ *     theme     which colour palette, an index into k_themes[] in §3, t / T keys
  *
- * Single instance (file-scope `g_scene`):
- *   Chain.nodes[] is the bulk of the storage (~25 KB), so the struct
- *   lives in BSS as a file-static rather than being passed by pointer.
- *   All scene state is accessed as `g_scene.<field>` from the helpers
- *   and the main loop.
- *
- * What stays OUTSIDE this struct (intentionally):
- *   g_quit_flag / g_resize_flag    sig_atomic_t flags read by signal
- *                                  handlers; must stay at file scope
- *                                  for async-signal safety.
- *   g_rows / g_cols                screen geometry tracked by the main
- *                                  loop; Scene stays geometry-agnostic
- *                                  so resize handling is the main
- *                                  loop's concern, not the renderer's.
- * ─────────────────────────────────────────────────────────────────────── */
+ * There's just one of these (the file-wide g_scene). The rope's bead array is
+ * by far the biggest part (~25 KB), so the whole thing lives in static memory
+ * instead of being passed around by pointer. A couple of things stay OUTSIDE
+ * on purpose: the quit/resize flags (they're poked by signal handlers and must
+ * stay at file scope to be signal-safe), and the screen size (the main loop
+ * owns that, so the rope code never has to care about resizing).
+ */
 typedef struct {
-  /* ── Simulation parameters ────────────────────────────────────── */
-  Chain chain; /* the physics state itself (§5)              */
-  int sim_fps; /* sim/render rate, ] / [ keys (10–120)       */
+  /* ── simulation ── */
+  Chain chain; /* the rope and its physics (§5)               */
+  int sim_fps; /* physics/draw frames per second, ] / [ keys (10–120) */
 
-  /* ── Rendering parameters ─────────────────────────────────────── */
-  int theme; /* index into k_themes[] in §3; t / T keys   */
+  /* ── rendering ── */
+  int theme; /* which palette, an index into k_themes[] in §3; t / T keys */
 } Scene;
 
 static Scene g_scene = {
@@ -987,18 +679,15 @@ static Scene g_scene = {
     /* .chain is BSS-zeroed; scene_init() populates it before any read. */
 };
 
-/* Screen geometry — main-loop bookkeeping, not scene state
- * (see Scene docstring above). */
+/* Current screen size. The main loop owns this, not the rope (see Scene above). */
 static int g_rows, g_cols;
 
 static const char *k_preset_names[N_PRESETS] = {
     "Hanging", "Pendulum", "Bridge",    "Wave", "Festoon",
     "Snake",   "Storm",    "Slingshot", "Flag", "Double"};
 
-/*
- * Common initialisation: zero the chain, set n_nodes, compute link_rest
- * so the full chain is ~55% of screen height.
- */
+/* Shared setup every preset starts from: wipe the rope clean and fill in the
+ * basics — how many beads, how long each link should be, default stiffness. */
 static void chain_init_common(Chain *c, int n_nodes, float link_rest) {
   memset(c, 0, sizeof *c);
   c->n_nodes = n_nodes;
@@ -1009,12 +698,9 @@ static void chain_init_common(Chain *c, int n_nodes, float link_rest) {
   c->trail_cnt = 0;
 }
 
-/* ── Preset 0: Hanging ────────────────────────────────────────────── */
-/*
- * Top node pinned at screen centre-top.
- * Nodes hang straight down initially.
- * Wind oscillates left-right; produces sway.
- */
+/* ── Preset 0: Hanging ── */
+/* A plain rope pinned at the top-centre, hanging straight down. A gentle wind
+ * swings it slowly side to side. */
 static void preset_hanging(Chain *c) {
   float anchor_x = (float)g_cols * CELL_W * 0.5f;
   float anchor_y = (float)g_rows * CELL_H * 0.07f;
@@ -1033,11 +719,9 @@ static void preset_hanging(Chain *c) {
   }
 }
 
-/* ── Preset 1: Pendulum ───────────────────────────────────────────── */
-/*
- * Top node pinned. Chain starts at 60° from vertical.
- * Released from rest — swings back and forth, wave patterns emerge.
- */
+/* ── Preset 1: Pendulum ── */
+/* Pinned at the top and started leaning well off to one side, then let go. It
+ * swings back and forth, with little ripples running along the rope. */
 static void preset_pendulum(Chain *c) {
   float anchor_x = (float)g_cols * CELL_W * 0.5f;
   float anchor_y = (float)g_rows * CELL_H * 0.07f;
@@ -1049,9 +733,9 @@ static void preset_pendulum(Chain *c) {
   c->wind_on = false;
   c->preset = 1;
 
-  float angle = (float)M_PI / 3.f; /* 60° from vertical (π/3 radians)
-                                    * Large enough angle for dramatic
-                                    * swing without going past horizontal */
+  float angle = (float)M_PI / 3.f; /* lean 60° off straight-down — far enough
+                                    * for a dramatic swing, not so far it flips
+                                    * past sideways */
   float sin_a = sinf(angle), cos_a = cosf(angle);
 
   for (int i = 0; i < N; i++) {
@@ -1062,21 +746,17 @@ static void preset_pendulum(Chain *c) {
   }
 }
 
-/* ── Preset 2: Bridge ─────────────────────────────────────────────── */
-/*
- * Two anchor nodes pinned at equal height, separated by ~65% screen width.
- * Link rest length is 1.25× the straight distance / (N-1) → natural sag.
- * Wind gusts upward (like a flag in the wind from below).
- */
+/* ── Preset 2: Bridge ── */
+/* Pinned at both ends, same height, with some slack rope between them so it
+ * sags into a hammock shape. A breeze makes it billow. */
 static void preset_bridge(Chain *c) {
   float span = (float)g_cols * CELL_W * 0.65f;
   float ax = (float)g_cols * CELL_W * 0.175f;
   float ay = (float)g_rows * CELL_H * 0.28f;
   int N = N_NODES_DEF;
-  /* rest 25% longer than the straight-line distance between anchors:
-   * Catenary physics: a chain longer than the span must sag.  The
-   * extra 25% of length has to go somewhere — it forms a parabolic
-   * (approximately catenary) droop.  More excess → deeper sag.        */
+  /* Make the rope 25% longer than the gap between the two pins. The extra
+   * length has nowhere to go but down, so the rope droops into a sag — the
+   * more slack, the deeper the droop. */
   float rest = span * 1.25f / (float)(N - 1);
 
   chain_init_common(c, N, rest);
@@ -1084,7 +764,7 @@ static void preset_bridge(Chain *c) {
   c->wind_on = true;
   c->preset = 2;
 
-  /* initialise along straight line between the two anchors */
+  /* lay the beads out in a straight line between the two pins */
   for (int i = 0; i < N; i++) {
     float t = (float)i / (float)(N - 1);
     c->nodes[i].x = c->nodes[i].ox = ax + t * span;
@@ -1093,13 +773,10 @@ static void preset_bridge(Chain *c) {
   }
 }
 
-/* ── Preset 3: Wave ───────────────────────────────────────────────── */
-/*
- * Top node driven with sinusoidal horizontal displacement.
- * Wave travels down the chain, reflects at the free bottom end, and
- * interferes with the incident wave — standing waves emerge at resonant
- * frequencies. The wave speed varies with tension (higher near the top).
- */
+/* ── Preset 3: Wave ── */
+/* The top bead is shaken side to side. The ripple runs down the rope, bounces
+ * off the loose bottom end, and overlaps itself — at the right shake speed the
+ * overlaps line up into a clean standing pattern that seems to hold still. */
 static void preset_wave(Chain *c) {
   float anchor_x = (float)g_cols * CELL_W * 0.5f;
   float anchor_y = (float)g_rows * CELL_H * 0.06f;
@@ -1122,13 +799,10 @@ static void preset_wave(Chain *c) {
   }
 }
 
-/* ── Preset 4: Festoon ────────────────────────────────────────────── */
-/*
- * Three pins evenly placed along the top edge (at indices 0, N/2, N-1).
- * Total chain length is 1.5× the pin-to-pin distance so each of the two
- * segments forms a relaxed catenary sag — a Christmas-garland silhouette.
- * Gentle wind makes the festoons sway as a coupled pair.
- */
+/* ── Preset 4: Festoon ── */
+/* Pinned in three spots across the top — both ends and the middle — with extra
+ * slack so the two halves droop into matching swags, like a string of garland.
+ * A soft breeze rocks both swags together. */
 static void preset_festoon(Chain *c) {
   int N = N_NODES_DEF;
   float W = (float)g_cols * CELL_W;
@@ -1136,12 +810,13 @@ static void preset_festoon(Chain *c) {
   float px0 = W * 0.10f;
   float px1 = W * 0.50f;
   float px2 = W * 0.90f;
-  /* Total chain length = 1.5 × full span (each segment gets ~1.5× sag). */
+  /* Make the rope half again as long as the full pin-to-pin width, so each
+   * half has slack to droop. */
   float total = (px2 - px0) * 1.50f;
   float rest = total / (float)(N - 1);
 
   chain_init_common(c, N, rest);
-  c->wind_str = 60.f; /* gentle gust so festoons rock slowly   */
+  c->wind_str = 60.f; /* soft breeze, so the swags rock slowly */
   c->wind_on = true;
   c->preset = 4;
 
@@ -1156,21 +831,17 @@ static void preset_festoon(Chain *c) {
   }
 }
 
-/* ── Preset 5: Snake ──────────────────────────────────────────────── */
-/*
- * Bridge geometry (both ends pinned at equal height), slight slack.
- * chain_tick drives node 0 sinusoidally in Y (vertical), so a transverse
- * wave propagates along the chain, reflects off the far fixed end, and
- * interferes — the chain slithers like a serpent.
- *
- * Drive is rewired in chain_tick under `if (c->preset == 5)`.
- */
+/* ── Preset 5: Snake ── */
+/* A rope strung out flat, pinned at both ends. The top bead is shaken up and
+ * down, so a wiggle runs along the rope, bounces off the far pin, and overlaps
+ * itself — the rope slithers like a snake. (The up-and-down shaking is set up
+ * in chain_tick for this preset.) */
 static void preset_snake(Chain *c) {
   int N = N_NODES_DEF;
   float span = (float)g_cols * CELL_W * 0.70f;
   float ax = (float)g_cols * CELL_W * 0.15f;
   float ay = (float)g_rows * CELL_H * 0.45f;
-  float rest = span * 1.05f / (float)(N - 1); /* 5% slack             */
+  float rest = span * 1.05f / (float)(N - 1); /* a touch of slack (5%) */
 
   chain_init_common(c, N, rest);
   c->wind_on = false;
@@ -1179,7 +850,7 @@ static void preset_snake(Chain *c) {
   c->wave_ay = ay;
   c->wave_phase = 0.f;
 
-  /* Initial: straight horizontal — drive in tick produces the wave. */
+  /* Start flat and straight; the shaking in chain_tick makes the wave. */
   for (int i = 0; i < N; i++) {
     float t = (float)i / (float)(N - 1);
     c->nodes[i].x = c->nodes[i].ox = ax + t * span;
@@ -1188,12 +859,9 @@ static void preset_snake(Chain *c) {
   }
 }
 
-/* ── Preset 6: Storm ──────────────────────────────────────────────── */
-/*
- * Same geometry as Hanging but the wind is dialed up by ~4× — strong
- * enough that gravity is no longer the dominant force.  The chain
- * whips into near-horizontal arcs at each gust peak.
- */
+/* ── Preset 6: Storm ── */
+/* Same hanging rope as preset 0, but the wind is cranked way up — strong
+ * enough to beat gravity. At each gust the rope whips out almost sideways. */
 static void preset_storm(Chain *c) {
   int N = N_NODES_DEF;
   float ax = (float)g_cols * CELL_W * 0.5f;
@@ -1202,7 +870,7 @@ static void preset_storm(Chain *c) {
   float rest = total / (float)(N - 1);
 
   chain_init_common(c, N, rest);
-  c->wind_str = 580.f; /* ≈ 1.5× gravity at peak gust          */
+  c->wind_str = 580.f; /* at peak gust, stronger than gravity  */
   c->wind_on = true;
   c->preset = 6;
 
@@ -1213,17 +881,14 @@ static void preset_storm(Chain *c) {
   }
 }
 
-/* ── Preset 7: Slingshot ──────────────────────────────────────────── */
-/*
- * Pendulum geometry, but released from 150° (chain points up-and-right,
- * 30° from vertical-up).  Anchor sits low on screen so the full ~330°
- * sweep fits inside the frame.  No wind, no drag damping beyond DAMP;
- * the swing is the entire show.
- */
+/* ── Preset 7: Slingshot ── */
+/* Like the pendulum, but hauled almost all the way up to one side before
+ * release, so it swings through a huge arc. The pin sits low on screen to
+ * leave room for the whole sweep. No wind — the big swing is the whole show. */
 static void preset_slingshot(Chain *c) {
   int N = N_NODES_DEF;
   float ax = (float)g_cols * CELL_W * 0.5f;
-  float ay = (float)g_rows * CELL_H * 0.60f; /* low — leave swing room */
+  float ay = (float)g_rows * CELL_H * 0.60f; /* low, to leave room to swing */
   float total = (float)g_rows * CELL_H * 0.40f;
   float rest = total / (float)(N - 1);
 
@@ -1231,23 +896,20 @@ static void preset_slingshot(Chain *c) {
   c->wind_on = false;
   c->preset = 7;
 
-  float angle = 150.f * (float)M_PI / 180.f; /* 150° from +y (down) */
+  float angle = 150.f * (float)M_PI / 180.f; /* hauled 150° round from straight-down — nearly straight up */
   float sin_a = sinf(angle), cos_a = cosf(angle);
   for (int i = 0; i < N; i++) {
     float t = (float)i * rest;
     c->nodes[i].x = c->nodes[i].ox = ax + sin_a * t;
-    c->nodes[i].y = c->nodes[i].oy = ay + cos_a * t; /* cos(150°) < 0 → up */
+    c->nodes[i].y = c->nodes[i].oy = ay + cos_a * t; /* this tilt points the rope upward */
     c->nodes[i].pinned = (i == 0);
   }
 }
 
-/* ── Preset 8: Flag ───────────────────────────────────────────────── */
-/*
- * Single pin at the top-left, chain initialised stretched horizontally
- * to the right.  Strong sustained wind drives the chain into a flapping
- * banner motion — gravity wants to fold it down, wind wants to push it
- * right, the constraint network mediates a curling, flag-like waveform.
- */
+/* ── Preset 8: Flag ── */
+/* Pinned at the top-left and laid out flat to the right, with a steady strong
+ * wind. Gravity pulls it down while the wind pushes it sideways, and the rope
+ * settles the tug-of-war into a curling, flapping banner. */
 static void preset_flag(Chain *c) {
   int N = N_NODES_DEF;
   float pin_x = (float)g_cols * CELL_W * 0.10f;
@@ -1256,7 +918,7 @@ static void preset_flag(Chain *c) {
   float rest = total / (float)(N - 1);
 
   chain_init_common(c, N, rest);
-  c->wind_str = 320.f; /* strong horizontal gust               */
+  c->wind_str = 320.f; /* strong steady sideways wind          */
   c->wind_on = true;
   c->preset = 8;
 
@@ -1267,13 +929,11 @@ static void preset_flag(Chain *c) {
   }
 }
 
-/* ── Preset 9: Double ─────────────────────────────────────────────── */
-/*
- * Two pins: i = 0 (anchor) and i = N/3 (side-hook).  The upper third is
- * a straight diagonal between the pins; the lower two-thirds hangs as a
- * free pendulum from the hook, released at 45° from vertical.  Visually
- * a coupled-pendulum / clock-arm setup that swings around the hook.
- */
+/* ── Preset 9: Double ── */
+/* Pinned in two spots: the very top, and a hook a third of the way down. The
+ * top third is a taut diagonal between them; the rest hangs free from the
+ * hook, tilted to one side and released, and swings around it like a clock
+ * arm. */
 static void preset_double(Chain *c) {
   int N = N_NODES_DEF;
   int p_mid = N / 3;
@@ -1291,7 +951,7 @@ static void preset_double(Chain *c) {
   c->wind_on = false;
   c->preset = 9;
 
-  float lo_ang = (float)M_PI / 4.f; /* 45° from vertical */
+  float lo_ang = (float)M_PI / 4.f; /* lean the hanging part 45° off straight-down */
   float lo_sx = sinf(lo_ang), lo_cx = cosf(lo_ang);
   for (int i = 0; i < N; i++) {
     if (i <= p_mid) {
@@ -1343,9 +1003,7 @@ static void scene_init(int preset) {
   }
 }
 
-/* ===================================================================== */
-/* §7  screen / HUD                                                       */
-/* ===================================================================== */
+/* ── §7 screen / HUD ── */
 
 static void screen_init(void) {
   initscr();
@@ -1358,11 +1016,8 @@ static void screen_init(void) {
   color_init();
 }
 
-/*
- * Two-bar HUD per CLAUDE.md convention:
- *   row 0  right (CP_HUD  bright yellow + bold)  — live status
- *   row -1 left  (CP_HINT bright cyan   + bold)  — actions / keys
- */
+/* The top status bar: shows the current scene, theme, settings, and frame rate
+ * in bright yellow along the top-right. */
 static void draw_hud_top(const Chain *c, int fps) {
   char top[180];
   snprintf(top, sizeof top,
@@ -1378,6 +1033,8 @@ static void draw_hud_top(const Chain *c, int fps) {
   attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
+/* The bottom key hints. On a narrow terminal the full list won't fit, so we
+ * fall back to a shorter one rather than let it spill and wrap. */
 static void draw_hud_bottom(void) {
   const char *hint_full = " q:quit  p:pause  r:reset  n/N:preset  t/T:theme  "
                           "+/-:iter  w:wind  ]/[:fps ";
@@ -1391,9 +1048,7 @@ static void draw_hud_bottom(void) {
   attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_quit_flag = 0;
 static volatile sig_atomic_t g_resize_flag = 0;
@@ -1415,13 +1070,12 @@ int main(void) {
   screen_init();
   getmaxyx(stdscr, g_rows, g_cols);
 
-  /* Initial preset = 0 (Hanging); scene_init writes g_scene.chain.preset
-   * so subsequent code reads the active preset from there. */
+  /* Start on scene 0, the plain hanging rope. */
   scene_init(0);
 
   int64_t t_last = clock_ns();
 
-  /* FPS counter */
+  /* for measuring and showing the real frame rate */
   int64_t fps_acc = 0;
   int fps_cnt = 0;
   int fps_disp = 0;
@@ -1510,12 +1164,11 @@ int main(void) {
     int64_t t_now = clock_ns();
     int64_t t_used = t_now - t_last;
     t_last = t_now;
-    /* Cap dt at 100 ms (= 10 fps equivalent).
-     * If the process was suspended (e.g., Ctrl-Z, terminal resize storm),
-     * t_used could be seconds.  Feeding that into the physics would
-     * launch nodes off-screen.  100 ms is a safe upper bound.          */
+    /* Never let one frame count as more than 100 ms. If the program was paused
+     * by the OS (Ctrl-Z, a flurry of resizes), the real gap could be seconds;
+     * handing that to the physics would fling the beads off-screen in one jump. */
     if (t_used > 100000000LL)
-      t_used = 100000000LL; /* 100 ms cap */
+      t_used = 100000000LL;
 
     float dt = (float)t_used * 1e-9f;
     chain_tick(&g_scene.chain, dt);

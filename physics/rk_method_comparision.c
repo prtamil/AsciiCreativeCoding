@@ -2,133 +2,18 @@
 /*
  * rk_method_comparision.c
  *
- * ODE Integrator Comparison — Euler / RK2 / RK4 / Verlet
+ * Race four ways of stepping an ODE forward in time — Euler, RK2, RK4, and
+ * Verlet — against a near-exact reference, all from the same starting point.
+ * The left panel plots position vs velocity (you can literally watch Euler
+ * spiral out of control and Verlet stay on a clean closed loop); the right
+ * panel scrolls position over time.  The point: a method's accuracy "order"
+ * isn't the whole story — Verlet and RK2 share the same order, yet only
+ * Verlet keeps energy honest over the long haul.
  *
- * ═══════════════════════════════════════════════════════════════════════
- *  WHAT YOU SEE
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  Two panels run simultaneously from the same initial condition:
- *
- *    LEFT  — Phase portrait  (position q  vs  velocity p)
- *    RIGHT — Time series     (q(t), scrolling left)
- *
- *  Four integrators advance in parallel.  A high-accuracy reference
- *  solution (RK4, 32 micro-substeps, shown in white) is the ground truth.
- *
- *    Euler  (red)    — orbit spirals outward  : energy grows without bound
- *    RK2    (yellow) — slight inward drift    : amplitude slowly decays
- *    RK4    (green)  — indistinguishable from reference at moderate dt
- *    Verlet (cyan)   — orbit stays closed     : no long-term energy drift
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  THEORY — INTEGRATION ORDER
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  Each step of an integrator introduces a local truncation error (LTE).
- *  After N steps covering total time T = N·h the global error scales as:
- *
- *    Euler:   LTE = O(h²)  →  global error = O(h)
- *             Keeps one term of the Taylor series.
- *
- *    RK2:     LTE = O(h³)  →  global error = O(h²)
- *             Midpoint correction cancels the O(h) term.
- *
- *    RK4:     LTE = O(h⁵)  →  global error = O(h⁴)
- *             Four stages cancel through the h⁴ term.
- *             Halving h shrinks error by 16× — very fast convergence.
- *
- *    Verlet:  LTE = O(h³)  →  global error = O(h²)
- *             Same asymptotic order as RK2 but symplectic (see below).
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  THEORY — STABILITY LIMITS
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  For the test ODE dy/dt = λy, stability requires |R(λh)| ≤ 1 where
- *  R is the amplification factor.  For a harmonic oscillator λ = ±iω,
- *  so we need |R(iωh)| ≤ 1.
- *
- *    Euler:   |R(iωh)| = √(1 + ω²h²) > 1  always.
- *             Euler is unconditionally UNSTABLE for oscillators.
- *             Any h > 0 causes the orbit to spiral out.
- *
- *    RK2:     stable when ωh ≤ √2  ≈ 1.41
- *    RK4:     stable when ωh ≤ 2√2 ≈ 2.83
- *    Verlet:  stable when ωh ≤ 2   (same as leapfrog)
- *
- *  Press + to raise dt and watch Euler blow up first, then RK2.
- *  At ωh = 0.3 (default): Euler drifts slowly, others look fine.
- *  At ωh = 1.0: Euler spirals rapidly off screen within seconds.
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  THEORY — SYMPLECTIC INTEGRATORS
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  A symplectic integrator preserves the phase-space volume element
- *  dq ∧ dp  (Liouville's theorem).  For Hamiltonian systems this means:
- *
- *    — No secular energy drift:  E(t) oscillates near E(0) forever.
- *      Euler gains energy; RK2/RK4 lose it slowly.
- *    — The computed orbit lies on a slightly perturbed Hamiltonian's
- *      exact trajectory (shadow orbit property).
- *    — Critical for long-time simulation: solar system, molecular
- *      dynamics, particle accelerators.
- *
- *  Velocity Verlet IS symplectic.  RK4 is NOT.  At moderate dt for
- *  short runs they look identical — but run for 10⁴+ periods and only
- *  Verlet's orbit remains closed.
- *
- *  Velocity Verlet algorithm for H = ½p² + V(q):
- *    q_{n+1} = q_n + p_n·h + ½·a_n·h²
- *    a_{n+1} = -∂V/∂q at q_{n+1}
- *    p_{n+1} = p_n + ½·(a_n + a_{n+1})·h
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  THEORY — ACCURACY DIFFERENCE DEMONSTRATED
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  Phase portrait reveals the character of the error:
- *
- *    Euler:   orbit drifts outward — total mechanical energy grows.
- *             E(t) = E₀·(1 + ω²h²)^n  →  ∞ as n → ∞.
- *             Position error grows unboundedly.
- *
- *    RK2:     orbit drifts inward — amplitude slowly decays.
- *             |R(iωh)| = √(1 - ω⁴h⁴/4) < 1 for ωh < 2^½.
- *             Not symplectic — energy leaks to numerical dissipation.
- *
- *    RK4:     orbit practically closed — error only visible at large dt.
- *             Still not symplectic: very slow energy drift over long runs.
- *
- *    Verlet:  orbit perfectly closed — phase portrait is a fixed ellipse.
- *             Energy oscillates O(h²) around E₀, no secular trend.
- *             Same positional accuracy as RK2 but structurally superior.
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  Keys:
- *    q/ESC    quit               space    pause/resume
- *    s        switch system      1-4      toggle Euler/RK2/RK4/Verlet
- *    +/-      increase/decrease timestep dt
- *    r        reset simulation   t/T      cycle theme (10 palettes)
- *
- *  Build:
- *    gcc -std=c11 -O2 -Wall -Wextra \
- *        physics/rk_method_comparision.c \
- *        -o rk_compare -lncurses -lm
- *
- * ─────────────────────────────────────────────────────────────────────
- *  §1  config           §2  clock            §3  color / themes
- *  §4  ode              — State, Method, ODE structs + Hamiltonian primitives
- *  §5  integrators      — forward_euler, midpoint, classical_rk4,
- *                          velocity_verlet, reference, dispatch +
- *                          ode_advance_one_tick pipeline
- *  §6  error analysis   — compute_method_errors, energy_drift_pct
- *  §7  plot panels      — render_phase_portrait, render_time_series
- *  §8  HUD overlay      — top status bar + per-method lines + bottom hints
- *  §9  scene            — Scene struct, scene_init / _tick / _render / _key
- *  §10 screen           §11 app
- * ─────────────────────────────────────────────────────────────────────
+ * Background reading (the math behind why each method behaves as it does):
+ *   Hairer, Lubich, Wanner, "Geometric Numerical Integration" — the modern
+ *   reference on symplectic integrators (energy-preserving steppers).
+ *   Goldstein, "Classical Mechanics" Ch. 8 — Hamiltonian phase space.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -143,120 +28,69 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
-/* DT_DEFAULT = 0.05: ωh = 0.05 rad (with ω=1 rad/s default).
- * Well within the stability limit for all four methods.
- * Small enough that drift is slow and clearly visible over many seconds. */
+/* The time step. Small steps are accurate but slow to watch; big steps
+ * make the inaccurate methods misbehave faster. The user nudges it with
+ * +/- between MIN and MAX; STEP is how much each press moves it. */
 #define DT_DEFAULT 0.05f
-
-/* DT_MIN = 0.005: smallest timestep the user can dial down to.
- * Prevents animation from becoming uselessly slow (too many tiny steps);
- * differences between methods are still visible even at this fine scale. */
 #define DT_MIN 0.005f
-
-/* DT_MAX = 0.35: ωh = 0.35 rad at the ceiling.
- * For Euler: |R(iωh)| = √(1 + 0.35²) ≈ √1.1225 ≈ 1.060 per step
- * → orbit amplitude grows by 6% every step — exponential blow-up is
- * dramatically visible.  RK2 remains stable up to ωh ≈ 1.41, so it
- * still tracks the reference while Euler flies off screen. */
+/* At the ceiling Euler grows about 6% per step — its blow-up becomes
+ * dramatic and obvious, while the better methods still hold steady. */
 #define DT_MAX 0.35f
-
-/* DT_STEP = 0.005: increment/decrement per + or - keypress.
- * Fine enough for interactive control; each press changes ωh by 0.005,
- * letting the user nudge into or out of each method's stability region. */
 #define DT_STEP 0.005f
 
-/* OMEGA = 1.0 rad/s: angular frequency of the harmonic oscillator.
- * Period T = 2π/ω = 2π ≈ 6.28 s.  Setting ω=1 makes "ωh" numerically
- * equal to dt, simplifying the stability analysis in the header. */
+/* Spring stiffness, set to 1 so the oscillator's period is a clean 2*PI. */
 #define OMEGA 1.0f /* oscillator angular frequency (rad/s) */
 
-/* G_OVER_L = 1.0: effective gravity / pendulum length = 1 (unit pendulum).
- * At small angles the pendulum period = 2π√(L/g) = 2π√(1/1) = 2π s,
- * matching the harmonic oscillator period.  At Q0_PEND = 1.40 rad the
- * nonlinear term makes the actual period noticeably longer than 2π. */
+/* Pendulum gravity-over-length, also 1 (a "unit" pendulum). */
 #define G_OVER_L 1.0f /* pendulum g/L (unit pendulum) */
 
-/* Q0_OSC = 1.0: initial displacement of the harmonic oscillator.
- * With p0=0 this sets the orbit radius in phase space: the exact
- * solution traces a circle of radius 1 in the (q, p/ω) plane. */
+/* Where each system starts, released from rest (velocity 0). */
 #define Q0_OSC 1.0f /* oscillator initial displacement */
 
-/* Q0_PEND = 1.40 rad ≈ 80°: initial angle for the pendulum.
- * This is deliberately a LARGE angle so nonlinear effects dominate.
- * The small-angle approximation (period ≈ 2π) is noticeably wrong here:
- * the exact period is longer, visible as a phase lag vs the oscillator.
- * The pendulum is NOT a simple sine wave at this amplitude. */
+/* A deliberately big swing (~80 degrees) so the pendulum's nonlinearity
+ * shows: at this angle it's clearly not a plain sine wave, and its period
+ * runs noticeably longer than the small-angle guess. */
 #define Q0_PEND 1.40f /* pendulum initial angle (rad), ~80 deg */
 
-/* REF_SUBSTEPS = 32: the reference integrator runs RK4 with 32 sub-steps
- * of size h/32 for each display step h.  Global error ≈ O((h/32)⁴)
- * ≈ O(h⁴ / 10⁶) — effectively machine-precision for these parameters.
- * All four methods are compared against this "exact" solution. */
+/* The reference "truth" solver does 32 tiny sub-steps per display step,
+ * which makes its error far smaller than the methods we're judging. */
 #define REF_SUBSTEPS 32
 
-/* STEPS_PER_FRAME = 3: the simulation advances 3 × dt per rendered frame.
- * At 30 fps this gives 3 × 0.05 = 0.15 sim-seconds per wall-second,
- * so one full oscillator period (T ≈ 6.28 s) takes ~42 wall seconds —
- * slow enough to watch drift accumulate in real time. */
+/* Run a few physics steps per drawn frame so motion is smooth but slow
+ * enough that you can actually see the drift pile up second by second. */
 #define STEPS_PER_FRAME 3
 #define TARGET_FPS 30
 #define FRAME_US (1000000 / TARGET_FPS)
 
-/* TRAJ_LEN = 1024: ring buffer capacity for phase-portrait trail dots.
- * 1024 past states are kept per method.  Too short → orbit looks partial
- * (less than one full loop visible).  Too long → drawing loop slows down.
- * Ring buffer means the oldest entry is silently overwritten; no malloc. */
+/* How much past history each method keeps. The phase trail wants enough
+ * points to show a full loop; the time series wants roughly one sample
+ * per terminal column. Both are fixed-size rings (oldest point is
+ * overwritten), so there's no allocation at runtime. */
 #define TRAJ_LEN 1024 /* phase portrait history per method */
+#define TIME_LEN 512  /* time-series samples per method */
 
-/* TIME_LEN = 512: ring buffer capacity for the time-series panel.
- * Each stored sample maps to one terminal column, so 512 should match
- * or exceed the width of a typical wide terminal (e.g. 220 columns).
- * Same ring-buffer overwrite strategy as TRAJ_LEN. */
-#define TIME_LEN 512 /* time-series samples per method */
-
-/* HUD_TOP_ROWS = 5 — terminal rows consumed by the top overlay:
- *   row 0       — top status bar (CP_HUD, bright yellow + bold,
- *                  right-aligned).  Carries system / dt / t / theme /
- *                  fps / paused.
- *   rows 1..4   — one per integrator (M_EULER..M_VERLET).  Each row is
- *                  drawn in that method's color and shows err_cur,
- *                  err_max, E_drift, and the method's accuracy order.
- *
- * HUD_BOT_ROWS = 1 — terminal rows consumed by the bottom overlay:
- *   row rows-1  — action key bar (CP_HINT, bright cyan + bold).
- *
- * Plot area occupies rows HUD_TOP_ROWS .. rows-HUD_BOT_ROWS-1. */
+/* Rows the HUD eats: 5 at the top (one status line + one per method),
+ * 1 at the bottom for the key hints. The plots fill what's left. */
 #define HUD_TOP_ROWS 5
 #define HUD_BOT_ROWS 1
 
-/* N_THEMES = 10 — palettes in k_themes[] (§3).  t / T keys wrap modulo
- * this; must match the literal array length. */
+/* Must match the number of palettes in k_themes[] (§3). */
 #define N_THEMES 10
 
-/* N_METHODS = 4 — number of integrators compared side-by-side.  Defined
- * up here (rather than down in §4 with M_EULER..M_VERLET) because §3
- * theme_apply needs to iterate methods[] when installing a palette. */
+/* The four methods being compared. Lives up here because §3's theme code
+ * needs the count before §4 defines the method ids. */
 #define N_METHODS 4
 
-/* PHASE_SCALE_OSC = 3.0: the phase-portrait viewport spans
- * ±(Q0_OSC × 3.0) = ±3.0 in both q and p (scaled by ω).
- * The extra headroom (3× the initial amplitude) is needed so Euler's
- * exponentially growing orbit stays on screen for a useful demo time. */
+/* How far the phase-portrait view zooms out, as a multiple of the start
+ * amplitude. The oscillator needs extra room so Euler's growing spiral
+ * stays on screen; the pendulum can't swing past its release angle, so a
+ * tighter view is fine. */
 #define PHASE_SCALE_OSC 3.0f
-
-/* PHASE_SCALE_PEND = 1.6: pendulum viewport spans ±(Q0_PEND × 1.6).
- * The pendulum's position is bounded by ±Q0_PEND (it can't swing past
- * its release angle), so less headroom is needed than for the oscillator.
- * Velocity range is also bounded (energy conservation), so 1.6× suffices. */
 #define PHASE_SCALE_PEND 1.6f
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ── */
 
 static long now_us(void) {
   struct timespec ts;
@@ -264,34 +98,18 @@ static long now_us(void) {
   return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
 }
 
-/* ===================================================================== */
-/* §3  color / theme — 10 brightness-safe palettes + fixed HUD chrome    */
-/* ===================================================================== */
+/* ── §3  color / theme ── */
 
-/*
- * Color-pair layout (§3):
- *   CP_M0..CP_M3   per-integrator colors — THEME-DRIVEN, dim → bright
- *                  ramp matched to physical "worst→best" (Euler dimmest,
- *                  Verlet brightest).  Cycling themes only repaints
- *                  these pairs — the State of every integrator stays
- *                  byte-identical, so theme is a render param (§9 Scene).
- *   CP_REF         the reference solution ('*' dots) — theme-driven,
- *                  always picked as the theme's brightest accent so it
- *                  reads on top of every method ramp.
- *   CP_GRID        axes / panel separators / inactive labels — dim grey
- *                  that doesn't compete with the integrator data.
- *   CP_TITLE       panel titles ("Phase Portrait", "Time Series") —
- *                  theme-driven, bright accent.
- *   CP_HUD         top status bar — FIXED bright yellow + bold,
- *                  theme-INDEPENDENT (CLAUDE.md HUD standard).
- *   CP_HINT        bottom action bar — FIXED bright cyan + bold,
- *                  theme-INDEPENDENT.
- */
+/* Color slots ncurses uses to paint each part of the screen. The four
+ * method colors run dim to bright on purpose: the worst method (Euler)
+ * is the dimmest so it doesn't shout, the best (Verlet) reads crisp. The
+ * HUD and hint bars get fixed bright yellow/cyan so they stay readable on
+ * every theme. */
 enum {
   CP_M0 = 1,
   CP_M1,
   CP_M2,
-  CP_M3, /* method colors, dim → bright */
+  CP_M3, /* method colors, dim -> bright */
   CP_REF,
   CP_GRID,
   CP_TITLE,
@@ -300,27 +118,27 @@ enum {
 };
 
 /*
- * Theme — perceptual palette for one rendering of the demo.
+ * One color palette for the whole demo. Switching themes only repaints
+ * these colors — it never touches the simulation, so it's purely a look
+ * change. The methods[] ramp runs dimmest (Euler) to brightest (Verlet)
+ * to match worst-to-best.
  *
- * The methods[4] ramp is monotonic DIM → BRIGHT and indexed by method
- * id (M_EULER=0 .. M_VERLET=3).  Mapping the "worst" integrator to the
- * dimmest stop is deliberate: Euler is the loud cautionary tale and
- * benefits visually from being subdued, while Verlet (best) reads
- * crisply.  This matches the original red→cyan semantic — red is the
- * dimmest of the 8-color palette by perceptual luminance.
+ *   name      what the t/T key shows for this palette
+ *   methods   one color per method, dim -> bright (Euler..Verlet)
+ *   ref       the reference "truth" dots; the theme's brightest accent
+ *             so they read on top of everything
+ *   grid      axes and separators; a quiet grey that stays out of the way
+ *   title     panel headings
  *
- * Brightness safety (CLAUDE.md):
- *   - methods[0]: lowest tier; allowed in 24-29 / 240-243 only
- *   - methods[1..3], ref, title: must be ≥ 30 in the 256-cube
- *   - grid:      may use 240+ (dim grey is fine for axes)
- *   - 16-23 / 232-239 forbidden (vanish on default-bg terminals)
+ * Every color sits in the bright half of the 256-color space so nothing
+ * vanishes against a black terminal (project palette rule in CLAUDE.md).
  */
 typedef struct {
   const char *name;
-  short methods[4]; /* M_EULER, M_RK2, M_RK4, M_VERLET — dim → bright */
-  short ref;        /* reference solution ('*') */
-  short grid;       /* axes, panel separators, inactive method label */
-  short title;      /* panel titles */
+  short methods[4];
+  short ref;
+  short grid;
+  short title;
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -337,19 +155,14 @@ static const Theme k_themes[N_THEMES] = {
     {"Eclipse", {240, 124, 196, 220}, 231, 240, 208}, /* dark → corona */
 };
 
-/* Fixed HUD chrome — same on every theme so status / hint stay legible. */
+/* HUD colors, same on every theme so the status/hint bars stay legible. */
 #define CHROME_HUD_256 226 /* bright yellow */
 #define CHROME_HINT_256 51 /* bright cyan   */
 
 static bool g_256;
 
-/*
- * theme_apply — push the chosen palette into ncurses' colour-pair table.
- * Idempotent; safe to call from t / T handlers and at startup.  `idx`
- * is wrapped negative-safe so callers don't need to pre-modulo.  CP_HUD
- * and CP_HINT are reinstated every call so a future bug that overwrites
- * them can't outlive one keypress.
- */
+/* Repaints the color slots for the chosen palette. Safe to call any time
+ * (startup, theme key); idx is wrapped so negative values are fine. */
 static void theme_apply(int idx) {
   const Theme *t = &k_themes[((idx % N_THEMES) + N_THEMES) % N_THEMES];
   if (g_256) {
@@ -361,7 +174,7 @@ static void theme_apply(int idx) {
     init_pair(CP_HUD, CHROME_HUD_256, -1);
     init_pair(CP_HINT, CHROME_HINT_256, -1);
   } else {
-    /* 8-colour fallback: theme-independent semantic palette. */
+    /* Old 8-color terminals: ignore themes, use fixed sensible colors. */
     init_pair(CP_M0, COLOR_RED, -1);
     init_pair(CP_M1, COLOR_YELLOW, -1);
     init_pair(CP_M2, COLOR_GREEN, -1);
@@ -381,123 +194,55 @@ static void init_colors(int boot_theme) {
   theme_apply(boot_theme);
 }
 
-/* ===================================================================== */
-/* §4  ode  —  Hamiltonian system data model + the five integrator instances */
-/* ===================================================================== */
+/* ── §4  ode ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * State — one point in the phase space of a 1-DOF Hamiltonian system.
+/*
+ * One snapshot of a moving system: where it is and how fast it's going.
+ * Both test systems are set up so velocity is just p directly (no mass to
+ * divide out), which is why the same two numbers describe a sliding spring
+ * and a swinging pendulum.
  *
- * Hamiltonian mechanics (Goldstein, *Classical Mechanics*, Ch. 8):
- *   The generalized coordinate q and conjugate momentum p span the
- *   phase plane.  Time evolution is governed by Hamilton's equations
+ *   q  position — distance from rest for the spring, or angle from
+ *      straight-down for the pendulum (radians)
+ *   p  velocity — how fast q is changing (linear speed, or angular speed)
  *
- *       dq/dt =  ∂H/∂p
- *       dp/dt = -∂H/∂q                                  (Eq. 8.18)
- *
- *   For our two test systems with mass m = 1 absorbed into the time
- *   scale:
- *       H_osc(q,p)  = ½ p² + ½ ω² q²                    quadratic
- *       H_pend(q,p) = ½ p² + (g/L)(1 - cos q)           nonlinear
- *
- *   In both cases dq/dt = p, so p numerically equals dq/dt — that's why
- *   the type can describe both "(displacement, velocity)" for the
- *   oscillator and "(angle, angular velocity)" for the pendulum.
- *
- * Why this matters for the demo:
- *   - Phase trajectories of a conservative Hamiltonian are LEVEL SETS
- *     of H — closed curves for bound motion (the oscillator is exact
- *     ellipses; the pendulum is libration-ellipses that distort with
- *     amplitude).  A SYMPLECTIC integrator's numerical orbit lies on
- *     a shadow Hamiltonian's exact level set — that's why Verlet's
- *     phase portrait is a closed loop after 10⁴ steps while RK4's
- *     slowly spirals.
- *   - Liouville's theorem: the flow preserves the phase-space area
- *     element dq ∧ dp.  Symplectic integrators preserve this exactly;
- *     non-symplectic ones don't, and the area drift IS the energy drift.
- *
- * Refs: Goldstein §8.1–8.4 (Hamilton's equations, phase space);
- *       Arnold, *Mathematical Methods of Classical Mechanics*, Ch. 8
- *       (symplectic structure, Liouville's theorem); Hairer, Lubich,
- *       Wanner, *Geometric Numerical Integration*, Ch. VI (the modern
- *       textbook on symplectic integrators).
- * ─────────────────────────────────────────────────────────────────────── */
+ * In physics terms this is a point in "phase space," and the path it
+ * traces is what the left panel draws. For a perfectly conserved system
+ * that path is a closed loop; whether a method keeps it closed is exactly
+ * the thing the demo is testing. (Goldstein, Classical Mechanics, Ch. 8.)
+ */
 typedef struct {
-  /* q — generalized position in the system's natural coordinates:
-   *
-   *   SYS_OSCILLATOR  displacement from equilibrium (dimensionless,
-   *                   normalised so the unit oscillator has q ∈ [−1, 1]
-   *                   at the initial amplitude Q0_OSC = 1.0).
-   *   SYS_PENDULUM    angle from the downward vertical (radians);
-   *                   ode_init sets q₀ = Q0_PEND = 1.40 rad ≈ 80°
-   *                   so the cos-series nonlinearity dominates and
-   *                   the period stretches ~15 % over small-angle
-   *                   prediction (Hairer-Wanner §I.14 worked example).
-   *
-   * Because mass m = 1 in our normalisation, q's time derivative is
-   * recoverable directly from p (see below) — no mass division needed
-   * in any integrator. */
-  float q;
-
-  /* p — generalized momentum conjugate to q.  Hamilton's equation
-   *   dq/dt = ∂H/∂p
-   * collapses to dq/dt = p for both our test systems since
-   *   H = ½p² + V(q)
-   * has p² as the entire kinetic part.  Concrete interpretation:
-   *
-   *   SYS_OSCILLATOR  p = dq/dt  (linear velocity)
-   *   SYS_PENDULUM    p = dθ/dt  (angular velocity, rad/s)
-   *
-   * The integrator primitives in §5 use p both as "the momentum to
-   * update next tick" AND as "the current slope of q" — that dual
-   * role is what makes the leapfrog form of velocity Verlet work
-   * (the OLD p drives the position update; the new p is averaged
-   * across the two endpoints). */
-  float p;
+  float q; /* position: spring displacement, or pendulum angle (rad) */
+  float p; /* velocity: how fast q changes (also doubles as q's slope) */
 } State;
 
-/* ── System catalogue ─────────────────────────────────────────────────── *
+/* The two systems we can switch between with the 's' key.  They sit on
+ * opposite sides of the simple/hard line:
  *
- * Two test problems sit on opposite ends of the linear/nonlinear divide:
+ *   SYS_OSCILLATOR  A perfect spring.  Its true motion is a clean ellipse
+ *                   in the phase view, and one full swing always takes the
+ *                   same time no matter how big the swing.  This is the
+ *                   meanest test for Euler — its orbit spirals outward from
+ *                   the very first step.
  *
- *   SYS_OSCILLATOR  Linear: H(q,p) = ½p² + ½ω²q².  Closed-form orbit is
- *                   a perfect ellipse; period T = 2π/ω is amplitude-
- *                   independent.  Hardest test case for Euler (orbit
- *                   spirals outward immediately — any |R(iωh)| > 1).
- *
- *   SYS_PENDULUM    Nonlinear: H(q,p) = ½p² + (g/L)(1 − cos q).
- *                   At small q the cos series cos q ≈ 1 − q²/2 reduces
- *                   it to the oscillator; at large q (e.g. Q0_PEND = 1.4
- *                   rad ≈ 80°) the period stretches by ~15 % over the
- *                   small-angle prediction.  RK4 tracks the true period
- *                   easily; Verlet is symplectic so it tracks the
- *                   long-term energy band even if its phase drifts.
- * ─────────────────────────────────────────────────────────────────────── */
+ *   SYS_PENDULUM    A real swinging pendulum.  For tiny swings it acts just
+ *                   like the spring, but our starting angle (~80 degrees) is
+ *                   big, so its motion isn't a plain sine wave and one swing
+ *                   takes noticeably longer.  A good test of whether a method
+ *                   keeps the right shape, not just the right speed. */
 #define SYS_OSCILLATOR 0
 #define SYS_PENDULUM 1
 
-/* SYS_NAME — full equation form, kept in source comments for reference
- * (and so future code can surface it if a "show equation" key is added).
- * The HUD uses SYS_SHORT_NAME below to keep the top bar width-bounded.
- *
+/* The actual equations of motion, kept here for the curious (the HUD shows
+ * just the short names to keep the top bar narrow):
  *     Harmonic Oscillator   x'' = -w^2 x
  *     Nonlinear Pendulum    t'' = -(g/L) sin t                          */
 
-/* ── Integrator catalogue ────────────────────────────────────────────── *
- *
- * Four candidate integrators run against a high-accuracy reference.
- * Indices match the 1..4 toggle keys.  ORDER lists the GLOBAL error
- * order (LTE − 1) — see file-header THEORY for the derivation:
- *
- *   M_EULER   Forward Euler          — O(h)    non-symplectic, unstable
- *   M_RK2     Explicit Midpoint      — O(h²)   non-symplectic
- *   M_RK4     Classical Runge-Kutta  — O(h⁴)   non-symplectic
- *   M_VERLET  Velocity Verlet        — O(h²)   SYMPLECTIC
- *
- * Verlet has the same global order as RK2 yet behaves qualitatively
- * better — the entire point of the demo is to show that ORDER does not
- * equal STRUCTURE-PRESERVATION.
- * ─────────────────────────────────────────────────────────────────────── */
+/* The four contestants, in the order the 1..4 keys toggle them. They run
+ * from worst to best: Euler is crude and unstable, RK2 and RK4 are
+ * progressively more careful, and Verlet is special — it's no more
+ * "accurate" than RK2 on paper, but it keeps energy honest over the long
+ * haul, which is the whole point the demo is built to show. */
 #define M_EULER 0
 #define M_RK2 1
 #define M_RK4 2
@@ -512,20 +257,11 @@ static const char *METHOD_ORDER[N_METHODS] = {"O(h)", "O(h^2)", "O(h^4)",
  * have the equation appended (~40 chars) which is too wide. */
 static const char *SYS_SHORT_NAME[2] = {"Oscillator", "Pendulum"};
 
-/* ── Initial condition + force law + Hamiltonian energy ───────────────── *
- *
- *   initial_condition(sys)      → State at t = 0
- *   acceleration_at(q, sys)     → d²q/dt² as a function of q
- *   state_derivative(s, sys)    → (dq/dt, dp/dt) = (p, accel)
- *   hamiltonian_energy(s, sys)  → H(q, p)
- *
- * These four are the ONLY system-dependent primitives.  Every
- * integrator in §5 calls state_derivative or acceleration_at and
- * acceleration_at; ode_init seeds the simulation with initial_condition
- * and stores hamiltonian_energy(s, sys) as e0 for drift analysis (§6).
- * Adding a new system means writing a new case in each of these four —
- * the integrators stay untouched.
- * ─────────────────────────────────────────────────────────────────────── */
+/* These four little functions are the only place the chosen system
+ * (spring vs pendulum) actually matters: where it starts, the force on it,
+ * the full rate-of-change it feels, and its energy. Every integrator in §5
+ * goes through them, so teaching the demo a new system means just adding a
+ * case to each of the four — the integrators never change. */
 
 /* initial_condition — release the system from rest at its starting q. */
 static State initial_condition(int sys) {
@@ -534,34 +270,26 @@ static State initial_condition(int sys) {
   /* SYS_PENDULUM */ return (State){Q0_PEND, 0.0f};
 }
 
-/* acceleration_at — d²q/dt² for the given system.  Used by Verlet
- * (which only needs the force law, not the full state derivative). */
+/* acceleration_at — the push the system feels right now, given where it is.
+ * Verlet only needs this force, not the fuller derivative below. */
 static float acceleration_at(float q, int sys) {
   if (sys == SYS_OSCILLATOR)
     return -(OMEGA * OMEGA * q);                   /* SHM    */
   /* SYS_PENDULUM */ return -(G_OVER_L * sinf(q)); /* nonlin */
 }
 
-/* state_derivative — the right-hand side of Hamilton's equations:
- *   d(q,p)/dt = (p, acceleration_at(q))
- * Used by Euler / RK2 / RK4 which need the full vector field. */
+/* state_derivative — how fast position and velocity are each changing right
+ * now: position changes at the current velocity, velocity changes at the
+ * current acceleration. Euler/RK2/RK4 all need this full picture. */
 static State state_derivative(State s, int sys) {
   return (State){s.p, acceleration_at(s.q, sys)};
 }
 
-/*
- * hamiltonian_energy — H(q, p) for the active system.
- *
- *   Oscillator: H = ½p² + ½ω²q²                  (quadratic potential)
- *   Pendulum  : H = ½p² + (g/L)(1 − cos q)        (exact nonlinear)
- *
- * Used to track energy drift per method (§6).  Expected signs of the
- * fractional drift (E(t) − E₀)/E₀ at moderate dt:
- *   Euler  → positive drift (gains energy)
- *   RK2    → negative drift (numerical dissipation)
- *   RK4    → tiny drift, sign depends on dt
- *   Verlet → oscillates near 0 % — no secular trend (symplectic)
- */
+/* hamiltonian_energy — the system's total energy: motion energy plus stored
+ * "stretch" energy. A perfect system keeps this fixed forever, so §6 watches
+ * how much each method lets it wander. The telltale pattern: Euler steadily
+ * gains energy, RK2 steadily bleeds it away, RK4 barely moves, and Verlet
+ * wobbles around the start without ever drifting off. */
 static float hamiltonian_energy(State s, int sys) {
   float kinetic = 0.5f * s.p * s.p;
   if (sys == SYS_OSCILLATOR)
@@ -570,170 +298,86 @@ static float hamiltonian_energy(State s, int sys) {
   return kinetic + G_OVER_L * (1.0f - cosf(s.q));
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Method — per-integrator workspace.
+/*
+ * Method — everything one contestant needs to run and be drawn.
  *
- * One instance per candidate integrator (Euler, RK2, RK4, Verlet).  All
- * four share the same initial condition (set by ode_init) but evolve
- * independently from there.  At any time t the four Methods' states
- * diverge in characteristic ways the demo is built to show:
+ * There's one of these per integrator (Euler, RK2, RK4, Verlet). All four
+ * start from the exact same point, then go their separate ways — and that
+ * parting of ways is the whole show: Euler spirals outward, RK2 spirals
+ * inward, RK4 nearly closes its loop, and Verlet closes it cleanly. Each
+ * keeps its own little recorder of past positions so the panels can draw
+ * the trail behind it. About 12 KB each, all in fixed storage, no malloc.
  *
- *   M_EULER   spirals OUTWARD          non-symplectic, energy injection
- *   M_RK2     spirals INWARD           non-symplectic, dissipation
- *   M_RK4     nearly closed orbit      high accuracy, NOT symplectic
- *   M_VERLET  exactly closed orbit     SYMPLECTIC; E oscillates near E₀
- *
- * Storage: ~12 KB per Method (the two ring buffers dominate).  All BSS,
- * no allocation.  Per-field documentation lives in the typedef body
- * below; this preamble covers only the high-level intent.
- *
- * Ring buffer contract (used by phase_history_push / time_history_push
- * in §5):
- *   - head always points at the NEXT write slot
- *   - count saturates at capacity (stops growing when full)
- *   - readers walk forward from (head − count + cap) % cap for count
- *     entries to get chronological order
- *   - O(1) push, no malloc, oldest entries are silently overwritten
- * ─────────────────────────────────────────────────────────────────────── */
+ * The trails are "ring buffers" — fixed-size lists that wrap around, so the
+ * newest point quietly overwrites the oldest. For each ring, `head` marks
+ * where the next point goes and `count` stops growing once it's full. To
+ * replay a ring oldest-to-newest, start at (head − count) and walk forward,
+ * wrapping at the end.
+ */
 typedef struct {
-  /* ── State + history ──────────────────────────────────────────────
-   * The integrator-output state plus two parallel ring buffers for
-   * the two visualisation panels.  Both rings follow the SAME write-
-   * head + saturating-count contract described above; only the
-   * element type differs (State for phase, float for time-series).
-   */
-
-  /* s — current (q, p) of THIS integrator.  Written every tick by
-   * dispatch_integrator (§5).  Read by:
-   *   §6 compute_method_errors    (err_cur = |s.q − ref.q|)
-   *   §6 energy_drift_pct         (H(s, system) vs e0 baseline)
-   *   §7 draw_method_phase_head   (bold method-id glyph in panel)
-   *   §8 render_overlay           (the per-method status line)
-   * Each tick the four Method.s values diverge from each other and
-   * from o->ref — that divergence is the entire demo. */
+  /* s — where this contestant is right now (its current position+velocity).
+   * Updated every tick. The four methods' s values drifting apart from each
+   * other and from the reference is the entire demo. */
   State s;
 
-  /* traj[] — TRAJ_LEN-entry ring of phase-portrait history (q, p).
-   * Element traj[i] is NOT the i-th oldest: walk the ring in
-   * chronological order via
-   *   start = (traj_head − traj_count + TRAJ_LEN) % TRAJ_LEN
-   *   for k in 0..traj_count-1 : traj[(start + k) % TRAJ_LEN]
-   * TRAJ_LEN = 1024 sized to comfortably hold one full oscillator
-   * period at STEPS_PER_FRAME × dt × TARGET_FPS — so the closed
-   * loop of Verlet stays visible without truncation. */
+  /* traj[] — recent (position, velocity) points, for the phase panel's
+   * trail. Sized (1024) to comfortably hold one full loop, so Verlet's
+   * closed orbit shows without the tail getting cut off. */
   State traj[TRAJ_LEN];
-  int traj_head;  /* next-write slot, ≡ traj_count + start mod TRAJ_LEN */
-  int traj_count; /* valid entries, saturates at TRAJ_LEN               */
+  int traj_head;  /* where the next point goes */
+  int traj_count; /* how many points are stored, capped at the size */
 
-  /* tser[] — TIME_LEN-entry ring of q-only samples for the scrolling
-   * time-series panel.  Same ring discipline.  Capacity (=512) sized
-   * to match or exceed the terminal width of typical wide displays;
-   * narrower terminals just render the last `cols` samples. */
+  /* tser[] — recent positions only, for the scrolling time panel. Same ring
+   * idea. Sized (512) to cover wide terminals; narrow ones just show the
+   * last few columns' worth. */
   float tser[TIME_LEN];
   int tser_head;
   int tser_count;
 
-  /* ── Error accumulators  (refreshed every tick by §6) ─────────────
-   * Position-only error tracking.  We deliberately do NOT track
-   * |p − p_ref| separately: for bound motion |p| ≤ √(2H) is
-   * automatically bounded by the energy_drift readout below, and
-   * adding a second error number would be visual noise.
-   */
+  /* How far this method has strayed from the reference "truth". We track
+   * position only — velocity error stays small for this kind of motion, and
+   * a second number would just clutter the readout. */
 
-  /* err_cur — |q − q_ref| at the current tick.  Instantaneous
-   * absolute error in position.  Updated every tick by
-   * compute_method_errors.  Used both for err_max accumulation and
-   * for the per-method HUD line in §8. */
+  /* err_cur — how far off position is this very tick. */
   float err_cur;
 
-  /* err_max — monotonic running max of err_cur since the last reset.
-   * NEVER decreases except via r/R reset (which calls ode_init,
-   * which zeroes the whole struct).  Useful for "what was the worst
-   * divergence so far?" rather than instantaneous noise. */
+  /* err_max — the worst it's ever been since the last reset. Only ever goes
+   * up (until a reset wipes it), so it answers "what was the worst gap so
+   * far?" rather than the noisy moment-to-moment value. */
   float err_max;
 
-  /* e0 — Hamiltonian energy H(s, system) captured at t = 0 and
-   * stored once by ode_init.  Baseline for the relative drift
-   * readout in §6:
-   *   energy_drift_pct = (H(s_now) − e0) / e0 × 100%
-   * Storing the baseline (rather than recomputing from initial
-   * conditions every frame) lets the drift readout survive even if
-   * IC formulas change at runtime in a future feature.  Near-zero
-   * e0 (degenerate q₀ = p₀ = 0 case) is guarded by an explicit zero
-   * return in energy_drift_pct. */
+  /* e0 — the energy this method had at the very start, recorded once. §6
+   * compares the current energy against this baseline to show drift. We save
+   * the starting value rather than recompute it so the readout still works
+   * if the starting conditions ever change. */
   float e0;
 
-  /* ── Render gate ──────────────────────────────────────────────────
-   * Per-method visibility flag, NOT a pause.  Important to keep
-   * physics evolution running while hidden: when the user re-shows
-   * a method with the same numbered key, its state must be the same
-   * one it would have had had it stayed visible — otherwise toggling
-   * would distort the comparison.
-   */
-
-  /* active — toggled by keys 1..4 (§9 scene_key).  Affects RENDER
-   * ONLY: §7 phase / time draw helpers `return` immediately when
-   * !active, and the §8 status line shows a "(hidden)" placeholder.
-   * The integrator itself still advances every tick.  scene_key
-   * also clears the ring buffers on toggle so the dots vanish
-   * immediately instead of leaving a stale tail. */
+  /* active — whether this method is shown, toggled by keys 1..4. This hides
+   * it from the panels only; the physics keeps running underneath. That
+   * matters: re-showing a method must reveal exactly where it would have
+   * been all along, otherwise toggling would skew the comparison. */
   bool active;
 } Method;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * ODE — top-level simulation state shared across all integrators.
+/*
+ * ODE — the whole simulation in one place.
  *
- * Five integrators run in parallel from the same initial condition:
- *   m[0..3]   the four candidate methods being compared
- *   ref       the reference solution (RK4 with REF_SUBSTEPS=32 micro-
- *             steps per display tick → global error O((h/32)⁴) ≈ machine
- *             precision; the ground truth all four candidates are
- *             measured against)
- *
- * Why ref is a State on ODE rather than a fifth Method:
- *   The reference is conceptually different — a benchmark, not a
- *   candidate.  Keeping it off the Method[] array means iteration over
- *   "the candidates being compared" never accidentally includes the
- *   reference (which would defeat the comparison).  Its ring buffers
- *   live on ODE alongside its State for the same locality reason.
- *
- * Per-field details (shared simulation knobs, pre-computed display
- * ranges, locality contract for q_range / p_range) are documented in
- * the typedef body below.
- * ─────────────────────────────────────────────────────────────────────── */
+ * Five things move forward together from the same start: the four
+ * contestants in m[], plus ref, the reference "truth". The reference is
+ * just RK4 run with 32 tiny sub-steps per display tick, which makes its
+ * error far too small to see — close enough to call exact. We keep it as
+ * its own field rather than a fifth method on purpose: it's the yardstick,
+ * not a contestant, so loops over m[] never accidentally sweep it in (which
+ * would defeat the comparison), and it's drawn differently anyway.
+ */
 typedef struct {
-  /* ── Candidate integrators  (the four being compared) ───────────── */
-
-  /* m[] — one Method per candidate integrator, indexed by M_EULER..
-   * M_VERLET so dispatch_integrator (§5) can switch on the loop index
-   * directly.  All four start from identical initial conditions in
-   * ode_init and evolve INDEPENDENTLY thereafter — that divergence
-   * is the data the demo visualises.  The array is fixed-size so
-   * the entire ODE struct lives in BSS / stack with no allocation. */
+  /* m[] — the four contestants, indexed by M_EULER..M_VERLET. They start
+   * identical and then drift apart; that drift is the data we draw. */
   Method m[N_METHODS];
 
-  /* ── Reference solution  (the ground truth they're judged against) */
-
-  /* ref — current (q, p) of the high-accuracy reference integrator,
-   * advanced each tick by reference_solution_step (= classical_rk4
-   * with REF_SUBSTEPS=32 micro-steps).  Effective global error
-   * ≈ O((h/32)⁴), well below single-precision noise for our (h, T)
-   * regime — close enough to call "exact".
-   *
-   * Why ref is a State on ODE rather than a fifth Method:
-   *   1. It's a BENCHMARK, not a candidate.  Loops over m[] never
-   *      include it — that would defeat the comparison.
-   *   2. It has different rendering (white '*' / 'R' glyphs vs the
-   *      coloured '.' / digit glyphs the methods use).
-   *   3. It has no err / e0 / active fields — those concepts don't
-   *      apply to the ground truth.
-   */
+  /* ref — where the reference "truth" is right now. Its own trail rings sit
+   * right beside it for the same reason the methods carry theirs. */
   State ref;
-
-  /* ref_traj[] / ref_tser[] — reference history rings, mirroring
-   * the ones on Method.  Live on ODE rather than a fifth Method for
-   * the locality reason above.  Both follow the same ring contract
-   * (write head + saturating count) as the per-method buffers. */
   State ref_traj[TRAJ_LEN];
   int ref_traj_head;
   int ref_traj_count;
@@ -741,133 +385,65 @@ typedef struct {
   int ref_tser_head;
   int ref_tser_count;
 
-  /* ── Shared simulation knobs  (apply uniformly to ref + every method) */
-
-  /* dt — current step size h (s).  Mutable: + / − keys nudge by
-   * DT_STEP within [DT_MIN, DT_MAX].  Applies UNIFORMLY to ref and
-   * every candidate so the comparison stays apples-to-apples even
-   * as the user dials dt up to provoke Euler-blow-up.  At ωh = 0.35
-   * Euler grows by 6 %/step — the entire demo's "danger zone" is
-   * just this number being tuned past method stability limits. */
+  /* dt — the time step, the same for everyone so the race stays fair. The
+   * +/- keys nudge it; turning it up is how you provoke Euler into blowing
+   * up while the better methods hold. */
   float dt;
 
-  /* t — accumulated simulation time (s) since last reset.  Sum of
-   * dt over all ticks.  Surface in the HUD; not read by any
-   * integrator (each integrator only needs dt and current state). */
+  /* t — how much simulated time has passed since the last reset (just the
+   * sum of all the steps). Shown in the HUD; the integrators don't use it. */
   float t;
 
-  /* system — SYS_OSCILLATOR (=0) or SYS_PENDULUM (=1).  Toggled by
-   * the 's' key, which triggers a full ode_init() so initial
-   * conditions, e0 baselines, and the display ranges below all get
-   * re-derived for the new system.  All §5 primitives branch on
-   * this through state_derivative / acceleration_at. */
+  /* system — which setup is running, spring or pendulum. The 's' key flips
+   * it and triggers a full reset so everything is re-seeded for the new one. */
   int system;
 
-  /* paused — when true, scene_tick (§9) skips the entire
-   * ode_advance_one_tick pipeline.  Every Method.s and ref stay
-   * frozen — unpause continues from the EXACT same state, no
-   * discontinuity, no "catch-up" jump.  Mirrored to the HUD via
-   * the "PAUSED " badge in §8. */
+  /* paused — when set, the simulation freezes in place. Unpausing picks up
+   * from the exact same spot, with no jump. */
   bool paused;
 
-  /* step_count — monotonically increasing tick counter.  Reset by
-   * ode_init.  Useful for the user to gauge "how many time-steps
-   * have accumulated when comparing divergence rates" — visible in
-   * the HUD via §8. */
+  /* step_count — how many steps have run since reset; handy for gauging how
+   * fast the methods are pulling apart. Shown in the HUD. */
   int step_count;
 
-  /* ── Display window  (rendering only, derived from physics) ────── *
-   *
-   * q_range / p_range are PHYSICS-INDEPENDENT rendering parameters
-   * cached on ODE for performance.  They live here (not on Scene)
-   * because they depend on the SYSTEM choice:
-   *
-   *   - oscillator needs ~3× the initial amplitude as range (so
-   *     Euler's growing spiral has room to be visible)
-   *   - pendulum is bounded by ±Q0_PEND in q (energy conservation),
-   *     so 1.6× suffices and gives a tighter view
-   *
-   * Computed once per system in ode_init (sqrt + cos for pendulum
-   * p_range) and then read every frame by §7 — caching avoids
-   * recomputing the transcendentals in the render hot loop.
-   *
-   * Locality contract:  mutating q_range / p_range does NOT change
-   * what any integrator produces.  They satisfy the "rendering
-   * parameter" test from Scene's locality contract — they just
-   * happen to live on ODE rather than Scene for the dependency-on-
-   * system reason above.
-   */
-
-  /* q_range — half-range of the q axis used by BOTH the phase panel
-   * (horizontal axis) AND the time panel (vertical axis).  The
-   * viewport spans [−q_range, +q_range].  Values outside that range
-   * (e.g. Euler's spiraling orbit past the initial amplitude)
-   * clamp to the panel edge via physics_value_to_screen_*. */
+  /* q_range / p_range — how far the phase view zooms out, half the width and
+   * half the height of the window it shows. They depend on which system is
+   * running (the oscillator needs extra room for Euler's growing spiral; the
+   * pendulum can't swing past its start, so a tighter view fits). Worked out
+   * once per system at reset and just read while drawing — they don't change
+   * the physics, only the view. Anything outside the window gets pinned to
+   * the panel edge instead of spilling over. */
   float q_range;
-
-  /* p_range — half-range of the p axis used ONLY by the phase panel.
-   * Computed from system-specific max-velocity estimate:
-   *   oscillator:  Q0_OSC · ω · PHASE_SCALE_OSC          (linear)
-   *   pendulum :   √(2·g/L·(1−cos Q0_PEND)) · scale      (energy cons.)
-   * The pendulum form is the maximum speed at the swing's bottom,
-   * derived from H = E₀ ⇒ ½p_max² = (g/L)(1 − cos Q0). */
   float p_range;
 } ODE;
 
-/* ===================================================================== */
-/* §5  integrators + one-tick evolution pipeline                          */
-/*                                                                       */
-/* ode_advance_one_tick() is the per-frame heartbeat:                     */
-/*                                                                       */
-/*     advance_reference_solution(o)   // RK4 × REF_SUBSTEPS micro-steps  */
-/*     advance_candidate_methods(o)    // 4 dispatched integrator steps   */
-/*     accumulate_simulation_clock(o)  // t += dt ; step_count++          */
-/*                                                                       */
-/* Each candidate is implemented by a single integrator primitive named  */
-/* after its standard mathematical identity:                              */
-/*                                                                       */
-/*     forward_euler_step       O(h)      explicit Euler                 */
-/*     explicit_midpoint_step   O(h²)     RK2 midpoint rule              */
-/*     classical_rk4_step       O(h⁴)     Kutta 1901 four-stage RK       */
-/*     velocity_verlet_step     O(h²)     SYMPLECTIC leapfrog            */
-/*                                                                       */
-/* The reference solution is just classical_rk4_step run REF_SUBSTEPS×    */
-/* (=32) micro-steps per display tick, giving effective machine-precision */
-/* truth.  See the file-header THEORY section for the derivation of each */
-/* method's stability bound and accuracy order.                           */
-/* ===================================================================== */
+/* ── §5  integrators + one-tick evolution pipeline ── */
 
-/*
- * forward_euler_step — explicit (forward) Euler.  One state_derivative
- * evaluation, advance by h:
+/* Every frame does the same three things, in this order:
+ *     advance_reference_solution(o)   // step the near-perfect "truth"
+ *     advance_candidate_methods(o)    // step the four contestants
+ *     accumulate_simulation_clock(o)  // bump the clock and the tick count
  *
- *     y_{n+1} = y_n + h · f(y_n)
- *
- * First-order accurate: the Taylor expansion keeps only the O(h) term,
- * so local truncation error is O(h²) and global error is O(h).  For
- * any oscillator the amplification factor satisfies
- *     |R(iωh)| = √(1 + ω²h²) > 1   for all h > 0
- * → the orbit ALWAYS spirals outward.  Euler is therefore UNCONDITIONALLY
- * UNSTABLE on harmonic oscillators (Hairer-Wanner I §I.7).
- */
+ * Each contestant gets its own little stepper, named after the real
+ * method it implements (Euler, RK2 midpoint, classic RK4, velocity
+ * Verlet).  The "truth" is just RK4 run with 32 tiny sub-steps per
+ * frame, which makes its error too small to see. */
+
+/* forward_euler_step — the simplest possible stepper: look at how things are
+ * changing right now, and assume they keep changing that way for the whole
+ * step. Quick and crude. On a spring it always overshoots a little every
+ * step, so its orbit spirals outward no matter how small the step — which is
+ * exactly the cautionary tale the demo wants to show. */
 static State forward_euler_step(State s, float dt, int sys) {
   State d = state_derivative(s, sys);
   return (State){s.q + dt * d.q, s.p + dt * d.p};
 }
 
-/*
- * explicit_midpoint_step — RK2 midpoint rule.  Two state_derivative
- * evaluations:
- *
- *     k₁ = f(y_n)                    — slope at the interval start
- *     k₂ = f(y_n + ½h · k₁)          — slope at the estimated midpoint
- *     y_{n+1} = y_n + h · k₂
- *
- * Using the midpoint slope k₂ instead of the endpoint slope k₁ cancels
- * the leading error term, lifting global error to O(h²).  The orbit
- * drifts INWARD because |R(iωh)| = √(1 − ω⁴h⁴/4) < 1 for ωh < √2 —
- * symptom of non-symplectic energy DISSIPATION.
- */
+/* explicit_midpoint_step — RK2: peek ahead to the middle of the step to get a
+ * better sense of how things are changing, then take the whole step using
+ * that mid-step rate. Much more accurate than Euler for the same step size.
+ * It errs the other way, though — its orbit slowly drifts inward, quietly
+ * losing energy. */
 static State explicit_midpoint_step(State s, float dt, int sys) {
   State k1 = state_derivative(s, sys);
   State mid = {s.q + 0.5f * dt * k1.q, s.p + 0.5f * dt * k1.p};
@@ -875,21 +451,11 @@ static State explicit_midpoint_step(State s, float dt, int sys) {
   return (State){s.q + dt * k2.q, s.p + dt * k2.p};
 }
 
-/*
- * classical_rk4_step — Kutta's 1901 four-stage Runge-Kutta.  Four
- * state_derivative evaluations, weighted Simpson-style:
- *
- *     k₁ = f(y_n)
- *     k₂ = f(y_n + ½h · k₁)
- *     k₃ = f(y_n + ½h · k₂)
- *     k₄ = f(y_n +  h · k₃)
- *     y_{n+1} = y_n + h · (k₁ + 2k₂ + 2k₃ + k₄) / 6
- *
- * The weighted average (with midpoint stages double-counted) cancels
- * error terms through O(h⁴), giving global error O(h⁴) — halving h
- * shrinks the error by 16× (Hairer-Norsett-Wanner I §II.1).  Still NOT
- * symplectic; energy drift is tiny but secular over long integrations.
- */
+/* classical_rk4_step — the workhorse RK4 (Kutta, 1901). It samples the rate
+ * of change four times across the step — start, two guesses at the middle,
+ * and the end — then blends them, leaning hardest on the middle ones. Very
+ * accurate: halve the step and the error shrinks about sixteenfold. But it
+ * still isn't energy-honest, so over very long runs its energy creeps. */
 static State classical_rk4_step(State s, float dt, int sys) {
   State k1 = state_derivative(s, sys);
   State s2 = {s.q + 0.5f * dt * k1.q, s.p + 0.5f * dt * k1.p};
@@ -902,27 +468,16 @@ static State classical_rk4_step(State s, float dt, int sys) {
                  s.p + dt * (k1.p + 2.0f * k2.p + 2.0f * k3.p + k4.p) / 6.0f};
 }
 
-/*
- * velocity_verlet_step — symplectic leapfrog.  Requires only the force
- * law (acceleration_at), not the full state_derivative.
+/* velocity_verlet_step — the star of the demo. It moves the position using
+ * the OLD velocity, then averages the force before and after to update the
+ * velocity. That little ordering trick is what keeps it energy-honest: its
+ * energy wobbles around the starting value forever but never drifts off,
+ * even over millions of steps. On paper it's no more accurate than RK2, yet
+ * its orbit stays a clean closed loop — which is why it's the method of
+ * choice for planetary orbits and molecular dynamics.
  *
- *     a_n     = acceleration_at(q_n)                  — old force
- *     q_{n+1} = q_n + p_n·h + ½ a_n h²                — drift  (uses OLD p)
- *     a_{n+1} = acceleration_at(q_{n+1})              — new force
- *     p_{n+1} = p_n + ½ (a_n + a_{n+1}) · h           — kick   (trapezoid)
- *
- * Symplectic because the position update uses p_n (the OLD momentum):
- * the resulting Jacobian has unit determinant, so dq ∧ dp is preserved
- * exactly each step.  Consequence: energy E(t) oscillates O(h²) around
- * E₀ FOREVER — no secular drift even over millions of steps.  Global
- * position error is the same O(h²) as RK2 but the orbit STRUCTURE is
- * exact-shadow-Hamiltonian, which is what makes Verlet the right choice
- * for solar-system / molecular-dynamics work.
- *
- * Refs: Hairer / Lubich / Wanner [HLW], *Geometric Numerical Integration*,
- *       Ch. VI §VI.3 (the velocity Verlet form); Verlet (1967),
- *       "Computer Experiments on Classical Fluids".
- */
+ * Refs: Hairer, Lubich, Wanner, "Geometric Numerical Integration" Ch. VI;
+ *       Verlet (1967), "Computer Experiments on Classical Fluids". */
 static State velocity_verlet_step(State s, float dt, int sys) {
   float a_old = acceleration_at(s.q, sys);
   float q_new = s.q + s.p * dt + 0.5f * a_old * dt * dt;
@@ -931,13 +486,10 @@ static State velocity_verlet_step(State s, float dt, int sys) {
   return (State){q_new, p_new};
 }
 
-/*
- * reference_solution_step — the "ground truth" integrator.  Just
- * classical_rk4_step run REF_SUBSTEPS=32 micro-steps of size h/32 per
- * display tick.  Total global error ≈ O((h/32)⁴) ≈ machine precision
- * for our (h, T) regime — close enough to call it exact.  Every
- * candidate method is compared against this reference in §6.
- */
+/* reference_solution_step — our stand-in for the exact answer. It's just RK4
+ * again, but chopped into 32 tiny sub-steps per display step, which shrinks
+ * its error below what we could ever notice. Everything else is measured
+ * against this in §6. */
 static State reference_solution_step(State s, float dt, int sys) {
   float micro_h = dt / (float)REF_SUBSTEPS;
   for (int i = 0; i < REF_SUBSTEPS; i++)
@@ -945,12 +497,9 @@ static State reference_solution_step(State s, float dt, int sys) {
   return s;
 }
 
-/*
- * dispatch_integrator — single point that maps a method index to its
- * implementing primitive.  Keeps the per-method ID → function mapping
- * in ONE table-driven place so adding a new integrator means writing
- * the primitive + adding one case here (plus an enum/name entry).
- */
+/* dispatch_integrator — the one spot that picks which stepper a given method
+ * uses. Keeping the choice here means adding a new method is just writing its
+ * stepper and adding one case. */
 static State dispatch_integrator(int method, State s, float dt, int sys) {
   switch (method) {
   case M_EULER:
@@ -966,14 +515,12 @@ static State dispatch_integrator(int method, State s, float dt, int sys) {
   }
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Ring-buffer history primitives  (used by both candidate methods and
- * the reference).  Both follow the "write head + saturating count"
- * pattern documented on the Method struct above.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Two tiny helpers for adding a point to a trail. Both work the same way:
+ * drop the new point in, advance the write spot, and stop the count growing
+ * once the trail is full (so the oldest point gets overwritten). */
 
-/* phase_history_push — append one (q, p) sample to a TRAJ_LEN ring.
- * Used for the phase-portrait panel.  O(1) — one write, one mod-incr. */
+/* phase_history_push — record one position+velocity point for the phase
+ * panel's trail. */
 static void phase_history_push(State *ring, int *head, int *count, State s) {
   ring[*head] = s;
   *head = (*head + 1) % TRAJ_LEN;
@@ -981,8 +528,8 @@ static void phase_history_push(State *ring, int *head, int *count, State s) {
     (*count)++;
 }
 
-/* time_history_push — same ring pattern, but for a scalar (q only).
- * Used for the scrolling time-series panel. */
+/* time_history_push — record one position value for the scrolling time
+ * panel's trail. */
 static void time_history_push(float *ring, int *head, int *count, float v) {
   ring[*head] = v;
   *head = (*head + 1) % TIME_LEN;
@@ -990,16 +537,9 @@ static void time_history_push(float *ring, int *head, int *count, float v) {
     (*count)++;
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * One-tick evolution pipeline.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/*
- * advance_reference_solution — step the ground-truth integrator by dt
- * and push its new (q, p) and q onto the reference's ring buffers.
- * Runs FIRST in the tick so the candidate methods can be compared
- * against the freshest reference value (§6).
- */
+/* advance_reference_solution — move the "truth" forward one step and record
+ * it. Goes first each tick so the contestants are judged against the
+ * freshest reference value. */
 static void advance_reference_solution(ODE *o) {
   o->ref = reference_solution_step(o->ref, o->dt, o->system);
   phase_history_push(o->ref_traj, &o->ref_traj_head, &o->ref_traj_count,
@@ -1008,11 +548,8 @@ static void advance_reference_solution(ODE *o) {
                     o->ref.q);
 }
 
-/*
- * advance_candidate_methods — step every Method by dt and push its
- * new state onto its phase / time ring buffers.  Order: M_EULER..
- * M_VERLET, deterministic so reproducible debug runs are possible.
- */
+/* advance_candidate_methods — move all four contestants forward one step and
+ * record each one's new spot on its trails. */
 static void advance_candidate_methods(ODE *o) {
   for (int mi = 0; mi < N_METHODS; mi++) {
     Method *m = &o->m[mi];
@@ -1022,44 +559,26 @@ static void advance_candidate_methods(ODE *o) {
   }
 }
 
-/* accumulate_simulation_clock — bump the simulation time and tick count.
- * Kept as its own helper so the pipeline reads as three named stages. */
+/* accumulate_simulation_clock — bump the running clock and step counter. Its
+ * own helper so the tick below reads as three clean named stages. */
 static void accumulate_simulation_clock(ODE *o) {
   o->t += o->dt;
   o->step_count += 1;
 }
 
-/*
- * ode_advance_one_tick — full per-tick pipeline.  Reads as the
- * pseudocode pinned to the top of §5:
- *
- *     advance_reference_solution(o);
- *     advance_candidate_methods(o);
- *     accumulate_simulation_clock(o);
- *
- * Called STEPS_PER_FRAME times per rendered frame from scene_tick (§9).
- */
+/* ode_advance_one_tick — one full step of the simulation: move the truth,
+ * move the contestants, tick the clock. Run a few times per drawn frame. */
 static void ode_advance_one_tick(ODE *o) {
   advance_reference_solution(o);
   advance_candidate_methods(o);
   accumulate_simulation_clock(o);
 }
 
-/* ===================================================================== */
-/* §6  error analysis  (position error vs reference + energy drift)       */
-/* ===================================================================== */
+/* ── §6  error analysis  (position error vs truth + energy drift) ── */
 
-/*
- * compute_method_errors — refresh err_cur / err_max for every method
- * using the reference's CURRENT q as ground truth.
- *
- *     err_cur = |q_method − q_ref|       (this tick only)
- *     err_max = max(err_max, err_cur)    (monotone, reset by ode_init)
- *
- * Only the q error is tracked — momentum errors are dominated by the q
- * errors here (both systems are bound, so |p| ≤ √(2H) is small) and
- * adding a p-error would just be visual noise.
- */
+/* compute_method_errors — for each contestant, measure how far its position
+ * has strayed from the truth this tick, and remember the worst gap so far.
+ * Position only — see the err fields on Method for why velocity is skipped. */
 static void compute_method_errors(ODE *o) {
   for (int mi = 0; mi < N_METHODS; mi++) {
     Method *m = &o->m[mi];
@@ -1069,20 +588,10 @@ static void compute_method_errors(ODE *o) {
   }
 }
 
-/*
- * energy_drift_pct — fractional change of the Hamiltonian since t = 0,
- * expressed as a percentage:
- *
- *     drift(t) = (H(s_method(t), sys) − H₀) / H₀ × 100%
- *
- * where H₀ = m->e0 was stored once at reset (so the percentage is
- * always relative to the initial energy, not the previous tick).  The
- * sign carries information: Euler always >0 (gains energy), RK2 always
- * <0 (dissipates), Verlet oscillates near 0 forever (symplectic).
- *
- * Guard against division by near-zero H₀ (would happen at q₀ = p₀ = 0,
- * a degenerate equilibrium).
- */
+/* energy_drift_pct — how far a method's energy has wandered from its starting
+ * value, as a percent. The sign tells the story: Euler reads positive (gains
+ * energy), RK2 negative (loses it), Verlet hovers near zero forever. The
+ * guard avoids dividing by zero if the system starts perfectly at rest. */
 static float energy_drift_pct(const Method *m, int sys) {
   float e_cur = hamiltonian_energy(m->s, sys);
   if (fabsf(m->e0) < 1e-9f)
@@ -1090,30 +599,13 @@ static float energy_drift_pct(const Method *m, int sys) {
   return (e_cur - m->e0) / m->e0 * 100.0f;
 }
 
-/* ===================================================================== */
-/* §7  plot panels — phase portrait + scrolling time series              */
-/* ===================================================================== */
+/* ── §7  plot panels — phase portrait + scrolling time series ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Physics-to-screen coordinate mappings.
- *
- * Both panels need to map a physical scalar (q ∈ [−qr, +qr] or p ∈
- * [−pr, +pr]) onto a 1-D screen interval.  We split this into two
- * helpers so the intent of each callsite is clear:
- *
- *   physics_value_to_screen_row(v, range, base, span)
- *     y-style mapping where +range → TOP of panel, −range → BOTTOM
- *     (standard math convention; screen-rows happen to grow downward
- *     so the formula flips the sign internally).
- *
- *   physics_q_to_screen_col(q, qr, base, span)
- *     x-style mapping where −qr → LEFT of panel, +qr → RIGHT.
- *     No sign flip — screen columns and the q-axis both grow rightward.
- *
- * Both clamp the output to [base, base+span−1] so out-of-range values
- * (e.g. Euler's spiraling orbit beyond ±qr) get pinned to the panel
- * edge instead of corrupting neighbouring panels.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Two helpers that turn a physical number into a screen cell. One maps a
+ * value to a row (bigger is higher up, since math goes up but screen rows go
+ * down, the helper flips it); the other maps position to a column (left is
+ * negative, right is positive). Both pin anything off the edge to the edge,
+ * so a runaway orbit can't scribble into the neighbouring panel. */
 
 static int physics_value_to_screen_row(float v, float range, int base,
                                        int span) {
@@ -1136,29 +628,13 @@ static int physics_q_to_screen_col(float q, float qr, int base, int span) {
   return c;
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Phase-portrait renderer  (q vs p).
- *
- * render_phase_portrait() is the orchestrator.  It dispatches:
- *
- *     draw_phase_grid              q=0 / p=0 axes
- *     for each active method:
- *         draw_method_phase_trail  history dots
- *         draw_method_phase_head   current-position glyph (bold)
- *     draw_reference_phase_trail   ground truth on top
- *     draw_reference_phase_head    bold 'R' for ref's current point
- *     draw_panel_title             "Phase Portrait q vs p"
- *
- * Z-order rationale (ncurses writes overwrite):
- *   - Methods drawn in index order so later methods cover earlier ones
- *     where they overlap.
- *   - Reference drawn LAST so its '*' dots always win — the ground
- *     truth must be readable even when a method's trail crosses it.
- *   - Title is painted last so it survives every preceding draw call.
- * ─────────────────────────────────────────────────────────────────────── */
+/* The left panel: position across, velocity up the side. The drawing order
+ * matters because later dots paint over earlier ones — the reference "truth"
+ * is drawn last so it always stays readable on top, and the title is painted
+ * last of all so nothing covers it. */
 
-/* Plot a single dot at the screen position corresponding to (q, p) if
- * the cell lies inside the panel.  Shared by every trail/head helper. */
+/* plot_phase_dot — drop one dot where a position+velocity pair lands, but
+ * only if it's actually inside the panel. */
 static void plot_phase_dot(float q, float p, float qr, float pr, int px, int py,
                            int pw, int ph, char glyph) {
   int sx = physics_q_to_screen_col(q, qr, px, pw);
@@ -1167,7 +643,8 @@ static void plot_phase_dot(float q, float p, float qr, float pr, int px, int py,
     mvaddch(sy, sx, (chtype)glyph);
 }
 
-/* Draw the q=0 / p=0 axes for the phase portrait. */
+/* draw_phase_grid — the crosshair axes through the center of the phase
+ * panel, marking zero position and zero velocity. */
 static void draw_phase_grid(float qr, float pr, int px, int py, int pw,
                             int ph) {
   int ax = physics_q_to_screen_col(0.0f, qr, px, pw);     /* col q=0 */
@@ -1255,23 +732,11 @@ static void render_phase_portrait(const ODE *o, int px, int py, int pw,
   attrset(A_NORMAL);
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Time-series renderer  (q vs t, scrolling left).
- *
- * Same orchestration pattern as the phase portrait:
- *
- *     draw_time_zero_line          horizontal q=0 reference line
- *     for each active method:
- *         draw_method_time_trace   each tick = one column
- *     draw_reference_time_trace    ground truth '*' on top
- *     draw_panel_title             "Time Series q(t)"
- *
- * Scrolling: the rightmost column shows the newest sample (head-1),
- * each leftward column is one tick older.  show = min(count, pw) so
- * partially-filled rings still align to the right edge.
- * ─────────────────────────────────────────────────────────────────────── */
+/* The right panel: position over time, scrolling left. The rightmost column
+ * is the newest moment; each column to its left is one step older. Same idea
+ * as the phase panel — reference last so it stays on top, title last of all. */
 
-/* Horizontal q = 0 line across the time panel. */
+/* draw_time_zero_line — the horizontal baseline marking zero position. */
 static void draw_time_zero_line(float qr, int px, int py, int pw, int ph) {
   int zy = physics_value_to_screen_row(0.0f, qr, py, ph);
   attrset((chtype)COLOR_PAIR(CP_GRID) | A_BOLD);
@@ -1279,9 +744,9 @@ static void draw_time_zero_line(float qr, int px, int py, int pw, int ph) {
     mvaddch(zy, x, '-');
 }
 
-/* Walk a scalar ring (m->tser or o->ref_tser) newest-LAST so the right
- * edge of the panel always shows the most recent sample.  Shared by
- * method + reference traces (different glyph + color). */
+/* plot_time_ring — draw one trail of positions across the panel, oldest on
+ * the left and newest on the right edge. Shared by the methods and the
+ * reference (they just pass a different glyph and color). */
 static void plot_time_ring(const float *ring, int head, int count, float qr,
                            int px, int py, int pw, int ph, char glyph) {
   int show = (count < pw) ? count : pw;
@@ -1327,37 +792,15 @@ static void render_time_series(const ODE *o, int px, int py, int pw, int ph) {
   attrset(A_NORMAL);
 }
 
-/* ===================================================================== */
-/* §8  HUD overlay — top status bar + per-method lines + bottom hints    */
-/* ===================================================================== */
+/* ── §8  HUD overlay — top status bar + per-method lines + bottom hints ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * HUD overlay  (top status bar + per-method lines + bottom hint bar)
- *
- * render_overlay() is the orchestrator.  Reads as pseudocode:
- *
- *     draw_top_status_bar(o, cols, theme, fps)        // row 0
- *     for mi in 0..N_METHODS:
- *         draw_method_status_line(o.m[mi], mi, system, row=1+mi)
- *     draw_bottom_action_bar(rows, cols)              // row rows-1
- *
- * The two chrome bars (top status, bottom hint) use FIXED bright
- * yellow / cyan that stay legible on every theme palette per the
- * CLAUDE.md HUD convention.  Per-method lines use the method's own
- * theme color so colour-to-trail association is unambiguous when the
- * reader scans between the panels and the status block.
- * ─────────────────────────────────────────────────────────────────────── */
+/* The on-screen readouts: a status line up top, one line per method, and a
+ * key-hint bar at the bottom. The top and bottom bars stay a fixed bright
+ * yellow/cyan so they're readable on every theme; each method line uses that
+ * method's own color so you can match a line to its dots at a glance. */
 
-/*
- * draw_top_status_bar — paint the live "what is the demo doing" line
- * at row 0, RIGHT-aligned in bright yellow + bold (CP_HUD).
- *
- * Fields: active system name, current step size dt, accumulated
- * simulation time t, current theme name, paused/running badge, and
- * the most recent rolling-window fps reading.  Right alignment keeps
- * the chrome out of the way when the terminal is wider than the
- * status string.
- */
+/* draw_top_status_bar — the live "what's it doing right now" line at the top
+ * right: system, step size, elapsed time, theme, paused/running, and fps. */
 static void draw_top_status_bar(const ODE *o, int cols, int theme_idx,
                                 int fps) {
   char buf[200];
@@ -1374,21 +817,10 @@ static void draw_top_status_bar(const ODE *o, int cols, int theme_idx,
   mvaddnstr(0, col, buf, cols);
 }
 
-/*
- * draw_method_status_line — paint one row of per-integrator diagnostic
- * data in the method's own theme color.
- *
- *   Active  : " [N] Name  err=… max=… E_drift=…%  O(h^k) [symplectic] "
- *   Hidden  : " [N] Name  (hidden — press N to show) "        (CP_GRID)
- *
- * `err_cur` and `err_max` are absolute position errors against the
- * reference (§6); the energy_drift_pct comes from H(s_now)/H₀ − 1
- * (§6).  The accuracy-order tag at the right is the most important
- * pedagogical cue: pairs of methods with the same order (RK2 and
- * Verlet, both O(h²)) line up here, so the reader can SEE that order
- * alone doesn't predict long-term behaviour — Verlet's symplecticity
- * still wins.
- */
+/* draw_method_status_line — one method's readout: its current and worst-ever
+ * position error, its energy drift, and its accuracy tag. The tag is the key
+ * takeaway: RK2 and Verlet share the same tag, yet only Verlet keeps energy
+ * steady — proof that the accuracy label alone doesn't tell the whole story. */
 static void draw_method_status_line(const Method *m, int mi, int system,
                                     int row) {
   if (m->active) {
@@ -1405,15 +837,8 @@ static void draw_method_status_line(const Method *m, int mi, int system,
   clrtoeol();
 }
 
-/*
- * draw_bottom_action_bar — paint the action-key reference at row
- * rows-1, LEFT-aligned in bright cyan + bold (CP_HINT).
- *
- * Two variants:
- *   `full`  — every key mapped, fits ~80+ cols
- *   `shrt`  — minimal essentials, fits even on narrow terminals
- * The narrower string is chosen when the full one would overflow.
- */
+/* draw_bottom_action_bar — the key-hint bar along the bottom. Falls back to a
+ * shorter version when the terminal is too narrow to fit the full list. */
 static void draw_bottom_action_bar(int rows, int cols) {
   const char *full = " q:quit  spc:pause  s:system  r:reset  1-4:toggle  "
                      "+/-:dt  t/T:theme ";
@@ -1424,10 +849,8 @@ static void draw_bottom_action_bar(int rows, int cols) {
   mvaddnstr(rows - 1, 0, line, cols);
 }
 
-/*
- * render_overlay — top-level HUD orchestrator.  Per the pseudocode at
- * the top of §8 — three named stages with no inline content of its own.
- */
+/* render_overlay — paint all the readouts: top bar, the per-method lines,
+ * and the bottom hint bar. */
 static void render_overlay(const ODE *o, int rows, int cols, int theme_idx,
                            int fps) {
   attrset(A_NORMAL);
@@ -1442,94 +865,47 @@ static void render_overlay(const ODE *o, int rows, int cols, int theme_idx,
   attrset(A_NORMAL);
 }
 
-/* ===================================================================== */
-/* §9  scene                                                              */
-/* ===================================================================== */
+/* ── §9  scene ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Scene — top-level UI state bundling the ODE simulation with the
- * window-side bookkeeping the main loop needs.  Single instance `sc`
- * lives on main()'s stack.
+/*
+ * Scene — the simulation plus the bits the window loop needs around it. One
+ * of these lives on main's stack.
  *
- * Field locality (the same simulation-vs-rendering contract as the
- * other physics demos):
- *
- *   ode        ALL simulation state — every integrator, every history
- *              ring, every Hamiltonian/error accumulator.  Mutated by
- *              ode_advance_one_tick (§5) and ode_init (§9).
- *
- *   rows, cols cached terminal geometry; refreshed on SIGWINCH.  Lives
- *              here (not in g_*) so the renderer doesn't need globals.
- *
- *   theme      index into k_themes[] (§3).  Cycling themes is a PURE
- *              VISUAL change: ode state is byte-identical before and
- *              after t / T, only colour-pair RGB is repainted.  This
- *              is what justifies theme being on Scene rather than on
- *              ODE — it's a render param.
- *
- *   fps_disp   rolling 1-second frame-rate readout for the top HUD.
- *              Updated by main()'s frame-counter once per second; the
- *              renderer just consumes it.
- *
- * Why ode is embedded (not a pointer):
- *   ODE is ~12 KB × 4 methods + 12 KB ref + scalars ≈ 60 KB.  Embedding
- *   it lets the whole simulation live on the stack with one Scene
- *   instance — zero malloc, byte-copy snapshotting is trivial if a
- *   future feature wants undo/replay.
- * ─────────────────────────────────────────────────────────────────────── */
+ *   ode       the entire simulation (every method, every trail, every
+ *             reading). The whole thing is embedded, not pointed to, so it
+ *             all sits on the stack with no malloc anywhere.
+ *   rows,cols the terminal size, refreshed when the window is resized.
+ *   theme     which color palette is active. Changing it is purely cosmetic
+ *             — the simulation is untouched — which is why it lives here
+ *             rather than alongside the physics.
+ *   fps_disp  the once-a-second frame-rate reading shown in the HUD.
+ */
 typedef struct {
   ODE ode;
   int rows, cols;
-  int theme;    /* index into k_themes[]; cycled by t / T   */
-  int fps_disp; /* most recent rolling-window fps reading   */
+  int theme;    /* which palette, cycled by t / T */
+  int fps_disp; /* most recent frame-rate reading */
 } Scene;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * ode_init — full simulation reset.  Reads as pseudocode:
- *
- *     saved_dt = preserve_user_timestep(o)
- *     clear_simulation_buffers(o)
- *     o.system = sys ; o.dt = saved_dt
- *     apply_initial_condition_to_all(o, sys)
- *     derive_phase_space_window(o, sys)
- *
- * Called at boot, on r/R reset, and whenever the user switches system
- * with 's'.  The only piece of state that SURVIVES a reset is the user-
- * tuned step size dt — every other field is zeroed and re-seeded.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Resetting the whole simulation, used at startup, on the reset key, and when
+ * switching systems. Everything gets wiped and re-seeded except one thing:
+ * the step size the user has dialed in stays put across a reset. */
 
-/*
- * preserve_user_timestep — extract the dt the user has interactively
- * tuned (with +/-) so it survives the memset that follows.  Returns
- * DT_DEFAULT when no valid dt is found, i.e. on the first call when
- * o is freshly zeroed BSS.
- *
- * Why this matters: pressing r should keep the user's last dt choice
- * — otherwise every reset would snap dt back to DT_DEFAULT and the
- * "+/- to provoke Euler blow-up" workflow becomes infuriating.
- */
+/* preserve_user_timestep — grab the user's chosen step size before the reset
+ * clears everything, so pressing reset doesn't snap it back to the default
+ * and undo their "+/- to provoke a blow-up" tinkering. */
 static float preserve_user_timestep(const ODE *o) {
   return (o->dt >= DT_MIN) ? o->dt : DT_DEFAULT;
 }
 
-/*
- * clear_simulation_buffers — wipe every per-integrator state, every
- * history ring, every error accumulator, every clock.  Implemented as
- * a memset because Method / ODE are POD with no embedded pointers, so
- * "all zero" is a valid initial value for every field.
- */
+/* clear_simulation_buffers — zero out everything: states, trails, readings,
+ * clock. Safe as a plain wipe since none of these fields hold pointers. */
 static void clear_simulation_buffers(ODE *o) { memset(o, 0, sizeof(*o)); }
 
-/*
- * apply_initial_condition_to_all — broadcast the system's t=0 state to
- * the reference solver and every candidate Method, and capture the
- * baseline Hamiltonian energy on each Method for later drift analysis.
- *
- * After this call every integrator starts from the same (q₀, p₀), so
- * any subsequent divergence in §7's panels is purely a property of the
- * INTEGRATOR, not the initial condition — exactly the experimental
- * isolation the demo needs.
- */
+/* apply_initial_condition_to_all — put the reference and all four methods at
+ * the exact same starting point, and record each one's starting energy.
+ * Identical starts are the whole point: any difference you see later is the
+ * method's doing, not a head start. */
 static void apply_initial_condition_to_all(ODE *o, int sys) {
   State s0 = initial_condition(sys);
   float e0 = hamiltonian_energy(s0, sys);
@@ -1542,29 +918,11 @@ static void apply_initial_condition_to_all(ODE *o, int sys) {
   }
 }
 
-/*
- * derive_phase_space_window — compute the (q_range, p_range) half-
- * extents of the phase-portrait viewport for the given system.  Cached
- * on ODE so the render hot loop (§7) doesn't redo the transcendentals.
- *
- *   SYS_OSCILLATOR:
- *       q_range = Q0_OSC · PHASE_SCALE_OSC          (linear)
- *       p_range = Q0_OSC · ω · PHASE_SCALE_OSC      (linear, scaled by ω)
- *       Extra headroom (PHASE_SCALE_OSC=3) so Euler's exponentially
- *       growing orbit stays on screen long enough to be educational.
- *
- *   SYS_PENDULUM:
- *       q_range = Q0_PEND · PHASE_SCALE_PEND        (bounded by ±Q0)
- *       p_range = √(2·g/L·(1−cos Q0_PEND)) · scale
- *
- *       The p_range formula is the max angular speed at the swing's
- *       bottom, from energy conservation:
- *           H(Q0, 0) = H(0, p_max) = ½ p_max²
- *           p_max    = √(2 · (g/L) · (1 − cos Q0_PEND))
- *       PHASE_SCALE_PEND=1.6 is just enough headroom since the orbit
- *       is BOUNDED by energy (closed curve) — no Euler-style growth
- *       to worry about for the pendulum.
- */
+/* derive_phase_space_window — work out how far the phase view should zoom out
+ * for the chosen system. The spring gets generous headroom (about 3x) so
+ * Euler's growing spiral stays on screen; the pendulum can't swing past its
+ * release angle, so its fastest point (at the bottom of the swing) sets a
+ * tighter view. Done once per system so drawing doesn't redo the math. */
 static void derive_phase_space_window(ODE *o, int sys) {
   if (sys == SYS_OSCILLATOR) {
     o->q_range = Q0_OSC * PHASE_SCALE_OSC;
@@ -1576,9 +934,8 @@ static void derive_phase_space_window(ODE *o, int sys) {
   }
 }
 
-/*
- * ode_init — orchestrator (5-line pseudocode of the pipeline above).
- */
+/* ode_init — the full reset: keep the user's step size, wipe everything,
+ * put all integrators at the start, and set up the view. */
 static void ode_init(ODE *o, int sys) {
   float saved_dt = preserve_user_timestep(o);
 
@@ -1689,9 +1046,7 @@ static void scene_key(Scene *sc, int ch) {
   }
 }
 
-/* ===================================================================== */
-/* §10  screen                                                            */
-/* ===================================================================== */
+/* ── §10  screen ── */
 
 static volatile sig_atomic_t g_resize = 0;
 static volatile sig_atomic_t g_quit = 0;
@@ -1717,9 +1072,7 @@ static void screen_init(int boot_theme) {
 
 static void screen_fini(void) { endwin(); }
 
-/* ===================================================================== */
-/* §11  app                                                               */
-/* ===================================================================== */
+/* ── §11  app ── */
 
 int main(void) {
   signal(SIGWINCH, handle_sigwinch);

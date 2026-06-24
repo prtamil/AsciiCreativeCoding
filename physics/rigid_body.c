@@ -1,146 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * rigid_body.c — 2D Rigid Body Simulation (translation only, no rotation)
+ * rigid_body.c — falling cubes and spheres that bounce, stack, and settle
+ * in the terminal.  No spin: bodies only slide and fall, never rotate.
  *
- * Bodies: cube (AABB rectangle) · sphere (drawn as circle, AABB physics).
- * Implicit floor at the bottom of the screen.  Bodies never penetrate.
+ * The physics is the classic game-engine recipe: every body is wrapped in
+ * a box, overlapping boxes get pushed apart and bounced, and bodies that
+ * go quiet long enough are put to sleep to save work.
  *
- * Why AABB for spheres?
- *   Terminal chars are ~2× taller than wide.  A sphere is drawn as a
- *   circle of visual radius r (cols) × r (rows).  Its physics AABB is
- *   hw=r, hh=2r so the bounding box aligns with the drawing exactly.
- *   A naive circle-distance check using radius r for both axes detected
- *   collision only when bodies were already r rows deep inside each
- *   other — fixed by switching to AABB overlap [4].
- *
- * Collision detection: AABB overlap, minimum-penetration axis [4]
- *   — same function for cube-cube, sphere-sphere, cube-sphere —
- *
- * Resolution — two separate passes per iteration (Box2D pattern [2]):
- *
- *   Pass A — POSITIONAL CORRECTION  (ALWAYS, even when separating)
- *     corr = max(depth - SLOP, 0) * BAUMGARTE / (imA + imB)
- *     Critical: unconditional correction.  An earlier version guarded
- *     this on (vn > 0); bodies that spawned overlapping or shared a
- *     velocity along the contact axis were never separated and fell
- *     through each other.  The Baumgarte feedback term [1] stabilises
- *     the constraint without solving the actual constrained dynamics.
- *
- *   Pass B — VELOCITY IMPULSE  (only when approaching, vn > 0)
- *     j = (1 + e_eff) * vn / (imA + imB)               [3, §3.2]
- *     e_eff = (vn > REST_THRESH) ? e : 0   ← no micro-bounce at rest
- *     Coulomb friction tangent: |jt| ≤ μ·j              [5, §1.5]
- *
- * Floor / walls: full snap + impulse (no fraction — hard boundary).
- *   Runs for ALL bodies (sleeping included) to counter Baumgarte drift.
- *
- * Spawn: 8-attempt random placement, reject if no clear spot found.
- *
- * Sleep: SLEEP_FRAMES quiet frames → frozen.  Woken by impulse > WAKE_IMP
- *        or by positional correction > WAKE_IMP (sleep heuristic [2]).
- *
- * Keys  c add cube     s add sphere    x remove last   r reset
- *       p / SPC pause  g gravity       e/E restitution
- *       t/T theme      q quit
- *
- * Build
- *   gcc -std=c11 -O2 -Wall -Wextra physics/rigid_body.c -o rigid_body -lncurses
- * -lm
- *
- * Sections  §1 config  §2 clock  §3 color  §4 body + scene  §5 framebuf
- *           §6 physics §7 scene  §8 draw   §9 screen §10 app
+ * Worth reading alongside the code: Box2D and Erin Catto's GDC talks
+ * (box2d.org) for the two-pass solver and the sleep trick; Baumgarte 1972
+ * for the gentle "nudge apart" position fix; Ericson, *Real-Time Collision
+ * Detection* §4.2/§5.4 for the box-overlap and friction math.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Iterative impulse-based collision resolution [2][3]
- *                  with Baumgarte stabilisation [1].
- *                  SOLVER_ITERS constraint passes per step.  Each pass:
- *                  AABB overlap test [4], compute minimum-penetration
- *                  axis, apply positional correction (Pass A), then
- *                  velocity impulse (Pass B).  More passes → stiffer
- *                  stacks at higher CPU cost; ~10 is a good 2D balance,
- *                  matching Catto's empirical recommendation [2].
- *
- * Physics        : 2D rigid-body mechanics with restitution and friction
- *                  [5, §3.13 + §1.5].
- *                  Restitution (REST_DEF=0.35): e=0 → perfectly inelastic
- *                  (no bounce), e=1 → perfectly elastic (infinite bounce).
- *                  Friction (FRICTION=0.35): Coulomb model |jt| ≤ μ·jn —
- *                  tangential impulse is clamped to μ times the normal
- *                  impulse, so a body resting on the floor cannot be
- *                  slid by a force smaller than μ·m·g.
- *                  REST_THRESH suppresses micro-bounce below 0.20 px/step.
- *
- * Engineering    : SLOP — penetration depth below which no correction
- *                  fires (dead-zone).  Without slop, tiny floating-point
- *                  overlaps cause perpetual jitter [2, "Solver Setup"].
- *                  BAUMGARTE — fraction of penetration corrected each
- *                  iteration [1, eq. 14].  1.0 → sharp but can overshoot;
- *                  0.5 is the value Catto recommends for real-time use [2].
- *                  Sleep system [2, "Sleeping"]: bodies quiet for
- *                  SLEEP_FRAMES frames are frozen; pair-test loop skips
- *                  all-sleeping pairs, saving O(s²) work where s is the
- *                  number of sleeping bodies.
- *
- * Rendering      : 10 brightness-safe theme palettes — 6-stop body ramps
- *                  cycled with t / T.  Bodies are rasterised into a
- *                  cell-grid framebuffer (g_fb / g_fcp in §5) and then
- *                  blitted via fb_flush; this decouples physics-space
- *                  drawing from ncurses I/O and lets fb_put do a single
- *                  bounds check per cell instead of one per primitive.
- *                  HUD chrome (CP_HUD bright yellow, CP_HINT bright cyan)
- *                  is theme-independent so it stays legible everywhere.
- *                  Drawn via ncurses single-buffer + doupdate() diff [6].
- *
- * References (cite inline as [n]):
- *
- *   [1] Baumgarte, J. (1972) — "Stabilization of constraints and
- *       integrals of motion in dynamical systems", *Computer Methods in
- *       Applied Mechanics and Engineering* 1 (1), 1–16.  The original
- *       paper for the feedback term that turns a position constraint
- *       into a stable spring-damper; we use the BAUMGARTE factor in
- *       Pass A.  Eq. 14 gives the standard β / γ split; we use β only
- *       (γ=0) since velocity correction is handled by Pass B's impulse.
- *
- *   [2] Catto, E. (2005, 2006, 2009) — GDC talks "Iterative Dynamics
- *       with Temporal Coherence", "Modeling and Solving Constraints",
- *       and the open-source Box2D engine (https://box2d.org).
- *       Practical reference for the two-pass solver architecture
- *       (positional then velocity), the SLOP / Baumgarte tuning numbers,
- *       the sleep heuristic, and the empirical observation that
- *       ~10 iterations give a good stack-stability vs. cost trade-off
- *       in 2D.  Everything labelled "Box2D pattern" in this file
- *       traces back to these talks.
- *
- *   [3] Mirtich, B. V. (1996) — *Impulse-Based Dynamic Simulation of
- *       Rigid Body Systems*, PhD thesis, U.C. Berkeley.  Foundational
- *       work on impulse-based methods; §3.2 derives the contact impulse
- *       j = (1+e)·v_n / (imA+imB) used in our Pass B and discusses why
- *       impulses are preferable to penalty forces for stiff contacts
- *       (no springs to tune, no integrator stiffness, naturally
- *       single-step convergent for binary contact).
- *
- *   [4] Ericson, C. (2005) — *Real-Time Collision Detection*, Morgan
- *       Kaufmann.  THE reference for game-engine collision math.
- *       §4.2 covers the AABB overlap test, the minimum-translation-
- *       vector concept, and the trick of resolving along the axis of
- *       smaller penetration that col_bodies() uses.  §5.4 covers the
- *       Coulomb friction model we apply in Pass B.
- *
- *   [5] Goldstein, H.; Poole, C.; Safko, J. (2002) — *Classical
- *       Mechanics*, 3rd ed., Addison-Wesley.  §1.5 (constraints,
- *       D'Alembert's principle), §3.13 (elastic / inelastic collisions
- *       and the coefficient of restitution), and Ch. 5 (rigid body
- *       motion).  The textbook backing for "why does e ∈ [0, 1] and
- *       what does e=0.35 mean physically?".
- *
- *   [6] Padala, P. — *NCURSES Programming HOWTO*, The Linux
- *       Documentation Project.  Authoritative free reference for the
- *       rendering layer: init_pair / COLOR_PAIR semantics, the
- *       wnoutrefresh + doupdate diff model that prevents tearing, and
- *       signal-safe SIGWINCH handling.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -152,177 +23,112 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
-/* ── world bounds (compile-time) ─────────────────────────────────────── */
+/* All distances are in "pixels": each terminal cell is 1 px wide and 2 px
+ * tall, since cells are about twice as tall as they are wide. */
 
-/* ROWS_MAX / COLS_MAX — upper bound on terminal geometry we statically
- * pre-allocate the framebuffer for (§5 g_fb / g_fcp).  Sized generously
- * (128×512 cells covers ultrawide monitors at small font sizes); actual
- * drawing is clipped to runtime g_rows / g_cols, so over-provisioning
- * only costs BSS pages, not draw time. */
+/* How big a terminal we plan for.  We reserve fixed-size buffers up front;
+ * anything bigger than the real window is simply never drawn. */
 #define ROWS_MAX 128
 #define COLS_MAX 512
 
-/* MAX_BODIES — pool size for Scene.b[].  The pair-wise collision test
- * in scene_step is O(MAX_BODIES²) per iteration × SOLVER_ITERS
- * iterations per step ⇒ ~10 240 col_bodies calls at peak.  Comfortably
- * within a single-frame budget at SIM_FPS=20 Hz; larger values would
- * saturate the screen visually before they saturate CPU. */
+/* Most bodies allowed on screen at once.  Collision checking compares every
+ * body against every other, so this stays modest. */
 #define MAX_BODIES 32
 
-/* N_THEMES — number of palettes in k_themes[] (§3).  Must match the
- * literal array length; the t / T key handlers wrap modulo this. */
+/* How many colour themes live in k_themes[] below.  Must match the array. */
 #define N_THEMES 10
 
-/* HUD_TOP_PX — pixel units (one cell-row = 2 px in this sim) reserved
- * at the top of the world for the status bar.  resolve_ceiling (§6)
- * treats this as the ceiling so bodies never draw into row 0, leaving
- * row 0 free for the top HUD overlay.  Row g_rows-1 is similarly
- * reserved for the bottom hint bar, achieved by WH() = (g_rows - 2)*2
- * in §4. */
+/* Empty space kept at the very top so the status bar has a clear row. */
 #define HUD_TOP_PX 2.0f
 
-/* ── physics ─────────────────────────────────────────────────────────── */
+/* ── physics ── */
 
-/* GRAVITY — downward acceleration per physics step (px / step²).  Acts
- * on vy of awake bodies in scene_step (§6).  Practical terminal
- * velocity is MAX_SPEED (the cap fires before DAMPING-vs-gravity
- * equilibrium); tune higher to make drops snappier, lower for a
- * "lunar" look. */
+/* Downward pull added to a body's speed each step.  Higher = snappier
+ * drops, lower = a floaty, lunar feel. */
 #define GRAVITY 0.05f
 
-/* REST_DEF — boot default for the restitution coefficient e ∈ [0, 1]
- * (Goldstein [5, §3.13]).  0 = perfectly inelastic (no bounce); 1 =
- * perfectly elastic.  0.35 ≈ rubber ball on concrete — lively but not
- * bouncy.  e > ~0.8 destabilises stacks: each contact injects (1+e)·v_n
- * and the spurious energy accumulates faster than DAMPING removes it. */
+/* Bounciness when the demo starts.  0 = no bounce (lands dead), 1 = perfect
+ * bounce.  0.35 is roughly a rubber ball on concrete.  Above ~0.8, stacks
+ * fall apart because each hit adds energy faster than damping removes it. */
 #define REST_DEF 0.35f
 
-/* REST_STEP — granularity of the e / E key handlers (one keypress
- * shifts Scene.rest by this).  0.05 gives 19 steps across the legal
- * [0.05, 0.95] range — coarse enough to feel responsive, fine enough
- * to find a sweet spot. */
+/* How much one e/E keypress changes the bounciness. */
 #define REST_STEP 0.05f
 
-/* FRICTION — Coulomb friction coefficient μ (Ericson [4, §5.4]).
- * apply_coulomb_friction (§6) clamps the tangential impulse to
- * |jt| ≤ μ·jn; resolve_floor uses μ scaled by (1+e_eff) on the slide
- * term so a bouncier collision also leaves more horizontal speed.
- * 0.35 ≈ rubber on wood — bodies coast briefly then stop, not sticky. */
+/* How grippy surfaces are (friction).  0.35 is roughly rubber on wood:
+ * bodies coast a little, then stop, instead of sliding forever or sticking. */
 #define FRICTION 0.35f
 
-/* DAMPING — velocity retained per step (dimensionless ∈ [0, 1]).
- * Applied AFTER integrate, BEFORE constraint solve, so it acts on
- * "free flight" velocity only.  0.991^20 ≈ 0.835 / second — bodies
- * slow noticeably across one second, preventing infinite sliding on a
- * frictionless wall.  Lower values look "underwater". */
+/* Speed kept each step — a gentle drag so nothing slides on forever.
+ * Over one second this slows a body to about 83% of its speed. */
 #define DAMPING 0.991f
 
-/* MAX_SPEED — velocity cap in px / step, applied AFTER damping.
- * Prevents tunnelling: a body moving > ~CUBE_HW per step could cross a
- * thin wall in less than one step and skip the overlap test.  Capping
- * keeps motion below one body-radius per step so SOLVER_ITERS
- * iterations can always converge. */
+/* Top speed.  Capped so a fast body can't jump clean through a thin wall
+ * in a single step and miss the collision check entirely. */
 #define MAX_SPEED 22.0f
 
-/* ── solver  (impulse-based, Baumgarte-stabilised) ──────────────────── */
+/* ── solver (how hard it works to keep bodies apart) ── */
 
-/* SOLVER_ITERS — constraint solver passes per physics step (Catto
- * [2, "Iteration count"]).  Each pass runs the full O(nb²) col_bodies
- * loop, so wall-clock cost is linear in this constant.  10 is a good
- * 2D balance: stable 3-tall stacks, no visible jitter.  3D rigid-body
- * engines typically use 4–20.  Drop to 4 if profiling shows physics
- * as the hot spot; raise to 20 if stacks feel like jelly. */
+/* How many times per step we re-check and re-fix every overlap.  More
+ * passes = firmer stacks but more CPU; 10 keeps a few-tall stack steady. */
 #define SOLVER_ITERS 10
 
-/* BAUMGARTE — fraction of penetration resolved per constraint pass
- * (Baumgarte [1, eq. 14]), used in Pass A of col_bodies.  1.0 corrects
- * fully each pass (sharp but can overshoot and pop bodies out of
- * stacks); 0.5 (the value Catto recommends [2]) removes half each
- * pass, so after SOLVER_ITERS=10 passes residual penetration is
- * ~(0.5)^10 ≈ 0.1 % of the original. */
+/* How much of an overlap we nudge away each pass.  Half each pass settles
+ * smoothly; correcting the full amount tends to overshoot and pop bodies
+ * out of stacks. */
 #define BAUMGARTE 0.50f
 
-/* SLOP — penetration depth (px) below which no positional correction
- * fires (dead-zone).  Without slop, tiny float-precision overlaps
- * trigger micro-corrections every frame and bodies visibly jitter.
- * 0.05 px ≈ sub-pixel — absorbs numerical noise without producing
- * visible drift.  Catto [2] uses ~0.005 m in Box2D's SI units; ours
- * is the equivalent in pixel-space. */
+/* Tiny overlaps we ignore.  Without this slack, sub-pixel rounding noise
+ * would make bodies jitter forever. */
 #define SLOP 0.05f
 
-/* REST_THRESH — approach speed (px / step) below which e_eff is forced
- * to 0 in Pass B.  Prevents micro-bounce: a body resting on the floor
- * has tiny vy noise from solver residuals; without this gate, every
- * contact would apply a (1+e)·v_n impulse and bodies would vibrate
- * forever.  0.20 px/step ≈ ¼ pixel per frame — well below visible
- * motion but above the solver noise floor. */
+/* Below this approach speed we turn bounce off, so a resting body doesn't
+ * buzz from the solver's tiny leftover wobble. */
 #define REST_THRESH 0.20f
 
-/* ── sleep system  (Catto / Box2D [2, "Sleeping"]) ──────────────────── */
+/* ── sleep (freeze bodies that have gone still, to save work) ── */
 
-/* SLEEP_VEL — speed threshold (px / step) under which Body.sleep_cnt
- * increments each frame.  Above this the body is considered "moving"
- * and sleep_cnt resets to 0.  Chosen LOWER than REST_THRESH so a body
- * that still micro-bounces can't accidentally sleep. */
+/* A body slower than this counts as "still" for one frame.  Kept below
+ * REST_THRESH so a body that's still micro-bouncing can't fall asleep. */
 #define SLEEP_VEL 0.07f
 
-/* SLEEP_FRAMES — consecutive quiet frames before Body.sleeping latches
- * true.  30 frames at SIM_FPS=20 = 1.5 s — long enough that a momen-
- * tarily quiet body in flight doesn't freeze mid-air, short enough
- * that a settled stack actually sleeps within the user's attention
- * span (and frees up the O(nb²) pair loop). */
+/* How many still frames in a row before a body freezes.  At 20 steps/sec
+ * that's 1.5 s — long enough not to freeze something mid-flight, short
+ * enough that a settled pile actually goes to sleep. */
 #define SLEEP_FRAMES 30
 
-/* WAKE_IMP — wake threshold: positional correction or velocity
- * impulse magnitude (px or px/step) above which a sleeping body is
- * forcibly woken via body_wake().  Pegged near SLOP so that any
- * non-noise interaction wakes the sleeper while normal solver drift
- * does not.  Box2D calls this the "wake threshold" in [2]. */
+/* A push or bounce bigger than this wakes a sleeping body back up; smaller
+ * nudges (normal solver noise) leave it asleep. */
 #define WAKE_IMP 0.05f
 
-/* ── body geometry  (px, terminal aspect 1 col : 2 rows) ────────────── */
+/* ── body sizes (pixels; remember a cell is 1 wide, 2 tall) ── */
 
-/* CUBE_HW / CUBE_HH — cube half-extents.  Visual size on screen is
- * (2·HW cols) × (HH cell-rows) because one cell-row = 2 px.  Chosen so
- * the cube reads roughly square on screen (14 cols × 5 rows ≈ visually
- * matched at typical 1:2 font aspect). */
+/* Half-width and half-height of a cube, picked so it looks roughly square
+ * on screen given the tall cells. */
 #define CUBE_HW 7.0f
 #define CUBE_HH 5.0f
 
-/* SPH_R — sphere visual radius in BOTH cols and screen rows, so the
- * drawn circle is round on screen (not vertically stretched).  Physics
- * AABB uses hw = SPH_R, hh = 2·SPH_R to bound the elliptical pixel-
- * space footprint — see the file header "Why AABB for spheres" and the
- * Body.hw/hh docstring (§4). */
+/* Sphere radius, equal in width and height so the drawn circle looks round.
+ * Its collision box uses hh = 2*SPH_R to match — see the Body hw/hh note. */
 #define SPH_R 4.0f
 
-/* DENSITY — uniform mass-per-AABB-area ρ.  Mass = ρ · (4·hw·hh) at
- * spawn in body_init_mass (§4); Goldstein [5, §1.6] uniform-density
- * rigid-body model.  Value chosen so a typical cube has mass ≈ 1.12
- * and a typical sphere ≈ 1.02 — bodies feel "equivalent" so a sphere
- * doesn't punt a cube across the screen on first contact. */
+/* How heavy bodies are for their size.  Tuned so a cube and a sphere weigh
+ * about the same, so a sphere can't punt a cube across the screen. */
 #define DENSITY 0.008f
 
-/* ── timing ──────────────────────────────────────────────────────────── */
+/* ── timing ── */
 
-/* SIM_FPS — fixed physics rate (Hz).  scene_step runs at most once per
- * (1 s / SIM_FPS) of wall time; the render loop runs uncapped and does
- * NOT interpolate — each frame just draws the latest step's state.
- * 20 Hz is plenty for the visual coarseness of cell-grid rendering. */
+/* Physics steps per second.  Drawing runs as fast as it can on top of this;
+ * 20 steps/sec looks smooth at this chunky resolution. */
 #define SIM_FPS 20
 
-/* NS_PER_S — wall-clock conversion factor for clock_ns() / sleep_ns().
- * Long-suffixed (LL) because clock_ns() returns int64_t and 32-bit
- * arithmetic would overflow at ~4.3 seconds. */
+/* Nanoseconds in a second.  LL-suffixed so the 64-bit clock math doesn't
+ * overflow. */
 #define NS_PER_S 1000000000LL
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -336,74 +142,32 @@ static void sleep_ns(int64_t d) {
   nanosleep(&t, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color / theme — 10 brightness-safe palettes + fixed HUD chrome    */
-/* ===================================================================== */
+/* ── §3 color / theme ── */
 
-/*
- * Color-pair layout:
- *   1..6     body slots — theme-driven; cubes/spheres cycle through them
- *            via `1 + (count % 6)`.
- *   CP_FLOOR floor line — theme-independent dim grey
- *   CP_HUD   top status bar (bright yellow + bold) — theme-independent
- *   CP_HINT  bottom action bar (bright cyan + bold) — theme-independent
- *
- * Keeping CP_FLOOR / CP_HUD / CP_HINT outside the theme means the chrome
- * stays legible against every body palette without per-theme tuning.
- */
+/* Colour-pair slots 1..6 hold the current theme's body colours; bodies
+ * pick one as they spawn.  These three are fixed chrome, the same on every
+ * theme, so the floor line and HUD stay readable no matter the palette. */
 #define CP_FLOOR 9
 #define CP_HUD 10
 #define CP_HINT 11
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Theme — a 6-stop perceptual gradient palette for the body slots.
+/* A Theme is just the look of the bodies — six colours, nothing about how
+ * they move.  Switching theme is purely cosmetic: positions, speeds, and
+ * sleep state stay exactly the same, only the colour changes.  That's why
+ * the theme index lives in the rendering half of Scene, not the physics.
  *
- * Intent:
- *   A single Theme describes "how the bodies LOOK" — nothing about how
- *   they MOVE.  Cycling themes must be a pure visual change: pause the
- *   demo, press t, and every body's position, velocity, mass, and
- *   sleep state is byte-identical, only the rendered colour shifts.
- *   This is the locality rule that lets us treat the theme index as a
- *   render param on Scene (§4) rather than as physics state.
- *
- * Why 6 stops:
- *   Bodies pick a colour-pair slot via `1 + (count % 6)` so the
- *   palette must contain exactly 6 colours.  Six is enough for visual
- *   distinction without crowding the 8-colour fallback path (which
- *   can only emit COLOR_RED .. COLOR_WHITE anyway).
- *
- * Why ramp[0] → ramp[5] is a monotonic dim→bright gradient:
- *   Adjacent bodies often end up bunched mid-stack; a monotonic
- *   brightness ramp keeps them distinguishable since two consecutive
- *   indices differ in brightness even when their hue is similar.
- *   Arbitrary permutations of the same six colours were tried and
- *   rejected because stacks of "all green" bodies became impossible
- *   to count by eye.
- *
- * Brightness safety (CLAUDE.md, see documentation/COLOR.md):
- *   Every entry sits at 256-cube index ≥ 24.  Indices 16-23 / 232-239
- *   are forbidden — they render as pure background-black on default-bg
- *   terminals and the body simply disappears.
- *
- * Algorithm refs:
- *   256-colour cube structure   — XTerm Control Sequences §
- *                                 "ISO-8613-3 Controls".
- *   Perceptual luminance order  — ITU-R BT.601 luma weighting was
- *                                 the heuristic used when ranking
- *                                 ramp stops by brightness for the
- *                                 audit.
- * ─────────────────────────────────────────────────────────────────────── */
+ * The six colours run dim to bright on purpose: bodies bunched in a stack
+ * stay countable by eye because neighbours differ in brightness even when
+ * their hue is close.  Every colour is kept bright enough to show up on a
+ * black terminal (see the brightness rules in documentation/COLOR.md). */
 typedef struct {
-  /* Human-readable label shown in the top HUD.  ≤ 7 chars so the full
-   * status line fits on an 80-column terminal alongside the other
-   * fields (cubes:, spheres:, rest:, grav:, paused/running, fps). */
+  /* Short label shown in the status bar.  Keep it under ~7 chars so the
+   * whole status line still fits on an 80-column terminal. */
   const char *name;
 
-  /* Six ordered 256-cube indices forming a low→high ramp.
-   * ramp[0] = dim end (used by the first-spawned cube/sphere);
-   * ramp[5] = bright end (sixth-spawned, then wraps back to ramp[0]
-   * on the seventh via modulo).  All entries audited against the
-   * brightness-safety bands above. */
+  /* Six body colours, ordered dim (ramp[0]) to bright (ramp[5]).  The
+   * first body spawned uses ramp[0], the next ramp[1], and so on, wrapping
+   * back to ramp[0] after six. */
   short ramp[6];
 } Theme;
 
@@ -421,23 +185,18 @@ static const Theme k_themes[N_THEMES] = {
     {"Eclipse", {124, 160, 196, 202, 208, 220}}, /* dark → corona     */
 };
 
-/* Fixed chrome — same indices on every theme so the HUD stays legible. */
-#define CHROME_FLOOR_256 240 /* dim grey           */
-#define CHROME_HUD_256 226   /* bright yellow      */
-#define CHROME_HINT_256 51   /* bright cyan        */
+/* Fixed chrome colours — the same on every theme. */
+#define CHROME_FLOOR_256 240 /* dim grey      */
+#define CHROME_HUD_256 226   /* bright yellow */
+#define CHROME_HINT_256 51   /* bright cyan   */
 
-/* g_256 is a boot-time TERMINAL CAPABILITY, not scene state — it never
- * changes after screen_init() probes COLORS, so it lives at file scope
- * rather than on g_scene. */
+/* True when the terminal supports 256 colours.  Set once at startup and
+ * never changes, so it lives here rather than in the scene. */
 static bool g_256;
 
-/*
- * theme_apply — push the chosen palette into ncurses' colour-pair table.
- * Idempotent; safe to call from t/T handlers and at startup.  ti is
- * wrapped negative-safe so callers don't need to pre-modulo.  Chrome
- * pairs (CP_FLOOR / CP_HUD / CP_HINT) are reinstated every call so a
- * future bug that overwrites them can't outlive one keypress.
- */
+/* Loads a theme's colours into ncurses.  Safe to call any time; it also
+ * re-sets the chrome colours each call so a stray bug can't leave them
+ * wrong for more than one frame.  ti can be any int — it wraps safely. */
 static void theme_apply(int ti) {
   const Theme *t = &k_themes[((ti % N_THEMES) + N_THEMES) % N_THEMES];
   for (int i = 0; i < 6; i++) {
@@ -449,307 +208,156 @@ static void theme_apply(int ti) {
   init_pair(CP_HINT, g_256 ? CHROME_HINT_256 : COLOR_CYAN, -1);
 }
 
-/* ===================================================================== */
-/* §4  body + scene                                                       */
-/* ===================================================================== */
+/* ── §4 body + scene ── */
 
-/*
- * Kind — body-shape discriminator.  ONLY consumed by draw_body (§8)
- * to pick rectangle-vs-circle glyphs; the physics step (§6) never
- * reads it because both shapes share the same AABB-overlap path
- * (Ericson [4, §4.2]).  Adding a new shape means: (a) extend this
- * enum, (b) add a draw branch in draw_body, (c) ensure scene_add_*
- * fills hw/hh sensibly — no physics changes needed.
- */
+/* Which shape a body is.  Only the drawing code cares — the physics treats
+ * cubes and spheres identically, since both collide as boxes.  To add a new
+ * shape: add it here, add a draw case, and set sensible hw/hh when spawning. */
 typedef enum { KIND_CUBE = 0, KIND_SPHERE } Kind;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Body — one rigid mass-point with AABB extent.
+/* A Body is one falling thing — a cube or a sphere.  Both share this one
+ * struct because collisions only ever use the body's bounding box, so the
+ * physics code never needs to know which shape it is.
  *
- * Why one struct for cubes AND spheres:
- *   The collision math is AABB-overlap-only [4, §4.2] — one function
- *   handles every pairing (cube-cube, sphere-sphere, cube-sphere).
- *   The visual shape (rectangle vs circle) is purely a §8 draw concern,
- *   gated by `kind`.  Putting cubes and spheres in separate types would
- *   duplicate the entire physics path for no gain.
+ * Bodies don't spin in this demo: they only slide and fall.  Adding spin
+ * would mean tracking rotation and a much heavier contact solver, so we
+ * leave it out and keep the physics small.
  *
- * Why no rotation:
- *   This is a translational-rigid-body demo: bodies have no angular
- *   velocity, no angular impulse, no moment of inertia.  Rotation would
- *   need (θ, ω, I⁻¹, tangential cross terms) plus a full polygon
- *   contact solver — see Catto [2] for that path.  Keeping translation-
- *   only keeps the entire physics step under 100 lines while still
- *   showing the iterative impulse + Baumgarte [1] structure.
+ * It's a plain value type with no pointers — bodies just sit in the scene's
+ * array, and nothing is allocated while the demo runs.
  *
- * Storage / memory model:
- *   POD struct, ~36 bytes, packed into Scene.b[] in §4.  No pointers,
- *   no ownership — everything in BSS, zero allocation in the hot path.
- *
- * Field groups (in order below):
- *   shape    kind, hw, hh           — geometry, set once at spawn
- *   state    x, y, vx, vy           — integrated every tick (§6)
- *   mass     mass, imass            — derived from area at spawn
- *   render   cp                     — theme-driven colour slot
- *   sleep    sleep_cnt, sleeping    — engine optimisation [2]
- *
- * Algorithm refs:
- *   AABB overlap test               — Ericson [4, §4.2]
- *   Min-translation-vector resolve  — Ericson [4, §4.2]
- *   Impulse-response derivation     — Mirtich [3, §3.2]
- *   Sleep heuristic                 — Catto / Box2D [2, "Sleeping"]
- *   Mass from area (uniform ρ)      — Goldstein [5, §1.6]
- * ─────────────────────────────────────────────────────────────────────── */
+ * The fields come in groups: shape (set once when spawned), motion (updated
+ * every step), mass, colour, and sleep bookkeeping. */
 typedef struct {
-  /* ── shape ────────────────────────────────────────────────────────
-   * Set once at spawn by scene_add_* (§7); never modified after
-   * body_init_mass.  Treat as const after construction.
-   */
+  /* ── shape: set once when the body spawns, then left alone ── */
 
-  /* kind — see Kind docstring above.  Physics treats both values
-   * identically; only draw_body (§8) branches on it. */
+  /* Cube or sphere.  Only the drawing code reads this. */
   Kind kind;
 
-  /* hw, hh — AABB half-extents in pixel-space (one cell-row = 2 px).
-   *   cube   : hw = CUBE_HW,  hh = CUBE_HH
-   *   sphere : hw = SPH_R,    hh = 2 * SPH_R   ← aspect correction
-   * Terminal cells are ~2× taller than wide; a circle drawn with the
-   * same visual radius in cols and rows needs twice the y-extent in
-   * pixel-space to bound it.  An earlier version used hh = SPH_R and
-   * missed every vertical sphere collision until the bodies were
-   * already half-overlapping — see the file header "Why AABB for
-   * spheres".  Both shapes use the same AABB-overlap test [4]. */
+  /* Half the collision box's width and height, in pixels.  A cube uses its
+   * real half-sizes.  A sphere uses hw = radius but hh = 2*radius, because
+   * cells are twice as tall as wide: a circle that looks round on screen is
+   * actually twice as tall in pixels, and the box has to match or vertical
+   * sphere hits get missed until the bodies are already half inside. */
   float hw, hh;
 
-  /* ── kinematic state ──────────────────────────────────────────────
-   * Advanced by scene_step's pipeline (§6) in this order:
-   *     apply_gravity_to_awake:    vy += GRAVITY     (skipped if sleeping)
-   *     integrate_motion:          x += v ; v *= DAMPING ; cap to MAX_SPEED
-   *     solve_contact_constraints: col_bodies → Pass A correction + Pass B
-   * impulses enforce_world_boundaries:  resolve_floor / _walls / _ceiling
-   * snap+reflect
-   */
+  /* ── motion: updated every step ── */
 
-  /* x, y — body centre in pixel-space.  y increases DOWNWARD (screen
-   * convention, not maths), so gravity is +y and the floor is the
-   * largest y.  prow() / pcol() in §4 collapse this to cell rows /
-   * cols for ncurses output. */
+  /* Centre of the body, in pixels.  y grows downward (screen-style), so
+   * gravity pulls toward larger y and the floor is at the bottom. */
   float x, y;
 
-  /* vx, vy — linear velocity in px / tick.  Capped at MAX_SPEED in
-   * scene_step to prevent tunnelling — a faster body could cross a
-   * 1-cell wall in less than one step and skip the overlap test
-   * entirely.  Cap is applied AFTER damping each step so the implicit
-   * terminal velocity stays MAX_SPEED · DAMPING / (1 − DAMPING). */
+  /* Velocity, in pixels per step.  Capped at MAX_SPEED so a body can't skip
+   * through a wall between steps. */
   float vx, vy;
 
-  /* ── mass ─────────────────────────────────────────────────────────
-   * imass = 1 / mass is what the solver actually uses; mass itself is
-   * kept for any future debug print.  An "infinite mass" body (static
-   * wall) would have imass = 0; the solver math already handles it
-   * because denom = imA + imB collapses to imA or imB.  Currently
-   * unused — every spawned body has finite mass.
-   */
+  /* ── mass ── */
 
-  /* mass — derived as (AABB area) × DENSITY in body_init_mass.  Using
-   * AABB area means a sphere has the effective mass of its bounding
-   * box (≈ 4/π × what a true disc of the same radius would have) — a
-   * deliberate simplification: pair-wise behaviour is unaffected
-   * since both bodies in any contact compute mass the same way, and
-   * the impulse formula j = (1+e)·v_n / (imA+imB) [3, §3.2] is
-   * homogeneous in mass under uniform density. */
+  /* Mass, from box area times DENSITY.  Using the box area (not the true
+   * disc area for a sphere) is a deliberate simplification; since every
+   * body measures mass the same way, collisions still behave sensibly. */
   float mass;
 
-  /* imass — 1 / mass, the inverse-mass term the solver multiplies by
-   * when distributing positional correction (Pass A) and velocity
-   * impulse (Pass B).  Stored to avoid a per-tick division in the
-   * hot loop, which under SOLVER_ITERS = 10 fires up to
-   * 10 · nb · (nb − 1) / 2 times per step. */
+  /* One over the mass.  The collision math always multiplies by this, so we
+   * store it once to skip a divide in the inner loop.  A value of 0 would
+   * mean "immovable" — the math already handles that, though nothing here
+   * spawns such a body. */
   float imass;
 
-  /* ── rendering ────────────────────────────────────────────────────
-   * Body has no other render state; the glyph and slope-derived char
-   * are computed per frame in draw_body from kind + AABB extents.
-   */
+  /* ── colour ── */
 
-  /* cp — ncurses colour-pair ID in [1, 6].  Assigned at spawn from
-   * the current theme via `1 + (ncubes % 6)` or `1 + (nsphs % 6)`
-   * so a sequence of bodies cycles through the theme ramp.  Survives
-   * theme changes: theme_apply() rewrites the SAME pair indices with
-   * new RGB, so bodies don't need to be re-tagged on cycle. */
+  /* Which body colour-pair slot (1..6) this body draws in, chosen at spawn
+   * so successive bodies cycle through the theme.  Survives theme changes
+   * because theme_apply just rewrites these same slots with new colours. */
   int cp;
 
-  /* ── sleep system ─────────────────────────────────────────────────
-   * Box2D-style sleep heuristic [2, "Sleeping"].  Bodies whose speed
-   * stays under SLEEP_VEL for SLEEP_FRAMES consecutive frames are
-   * frozen.  The pipeline stages apply_gravity_to_awake, integrate_
-   * motion, and update_sleep_state all skip sleeping bodies, and
-   * solve_contact_constraints short-circuits any pair where BOTH
-   * bodies are sleeping — that's where the real CPU win lives,
-   * since the inner loop is O(nb²).
-   */
+  /* ── sleep ── */
 
-  /* sleep_cnt — quiet-frame counter.  Incremented by update_sleep_state
-   * when speed < SLEEP_VEL, reset to 0 on a noisy frame, latched at
-   * SLEEP_FRAMES when `sleeping` is set true.  Lives on the body
-   * (not in Scene) so each body sleeps independently. */
+  /* How many steps in a row this body has been nearly still.  Once it
+   * reaches SLEEP_FRAMES the body freezes.  Per-body so each sleeps on its
+   * own schedule. */
   int sleep_cnt;
 
-  /* sleeping — when true: apply_gravity_to_awake and integrate_motion
-   * skip the body, and solve_contact_constraints skips any pair where
-   * both bodies are sleeping.  Cleared by body_wake() whenever a
-   * positional correction (baumgarte_correct_pair) or velocity
-   * impulse (apply_contact_impulse) exceeds WAKE_IMP — the "wake
-   * threshold" of Catto's Box2D [2]. */
+  /* True once the body has frozen.  Frozen bodies are skipped by gravity,
+   * movement, and any collision where both bodies are asleep — that skip is
+   * the whole point, since checking is the expensive part.  A big enough
+   * push or bounce wakes it again (see body_wake). */
   bool sleeping;
 } Body;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Scene — top-level state spanning physics ticks, draw calls, and the
- * main loop.  Bundles every file-scope mutable that survives across
- * iterations.  Single instance `g_scene`; lives in BSS because the
- * body array (~3 KB) is the only large field and passing the struct
- * by pointer everywhere would just clutter helper signatures without
- * buying any encapsulation.
+/* Scene holds everything that lives between frames: the bodies and the
+ * knobs the user can turn.  There's a single instance, g_scene.
  *
- * The struct splits into two clearly-labelled groups:
- *
- *   Simulation parameters — consumed by scene_step's pipeline stages
- *     (§6: apply_gravity_to_awake, integrate_motion, solve_contact_
- *     constraints, enforce_world_boundaries, update_sleep_state) and by
- *     scene_add_*() / scene_init() (§7).  Anything that changes WHERE
- *     THE BODIES ARE or HOW THEY MOVE belongs here.  Mutated by physics-
- *     affecting keys: c / s / x (spawn / remove), r (reset),
- *     p / SPACE (pause), g (gravity), e / E (restitution).
- *
- *   Rendering parameters — consumed by theme_apply (§3) and draw_hud_*()
- *     (§8).  Toggling these must leave the body array byte-identical;
- *     only colours change.  Mutated by purely cosmetic keys: t / T.
- *
- * Locality rationale (this contract matters, not the bytes):
- *   The split exists for the READER, not the CPU.  A new flag landing
- *   in the rendering group when it actually changes how scene_step()
- *   advances state would silently couple display to physics — exactly
- *   the bug the separation prevents.  When adding a field, ask: does
- *   this change what any scene_step pipeline stage produces?  If yes,
- *   simulation; if no, rendering.
- *
- * What stays OUTSIDE this struct (intentionally):
- *
- *   g_rows / g_cols       screen geometry tracked by the main loop's
- *                         SIGWINCH handler; Scene stays geometry-
- *                         agnostic so resize logic is the main loop's
- *                         concern, not the simulator's.
- *
- *   g_quit / g_resize     volatile sig_atomic_t flags written by the
- *                         signal handler; must stay at file scope for
- *                         async-signal-safety.
- *
- *   g_256                 boot-time terminal capability set once in
- *                         screen_init(); not state that evolves.
- *
- *   fps_disp / fps_frames / fps_window_start
- *                         rolling-window FPS bookkeeping; lives as
- *                         locals in main() since it has no readers
- *                         outside the loop body.
- * ─────────────────────────────────────────────────────────────────────── */
+ * The fields fall into two groups, and the split is a promise: the physics
+ * group is anything that changes where bodies are or how they move; the
+ * rendering group is purely how things look.  Pressing a theme key must
+ * never touch the physics group — that's what lets you recolour mid-bounce
+ * without disturbing the simulation.  When adding a field, ask which group
+ * it belongs to: does it change what the bodies do, or only how they look? */
 typedef struct {
-  /* ── Simulation parameters ────────────────────────────────────────
-   * Everything below feeds the physics step.  The pipeline stages
-   * (§6) read/write b[] and tick; apply_contact_impulse and the
-   * resolve_*() helpers read rest; spawners (§7) read rng and the
-   * ncubes/nsphs counters.
-   */
+  /* ── physics state ── */
 
-  /* b[0..nb) — packed array of active bodies.  Insertion appends,
-   * deletion by scene_remove_last() just decrements nb (LIFO, no
-   * compaction needed).  Capacity is MAX_BODIES; once full, spawn
-   * helpers reject new bodies.  The AABB-pair test in scene_step
-   * is O(nb²) so MAX_BODIES is set with that quadratic in mind. */
+  /* The active bodies, b[0..nb-1].  Spawning appends; deleting just drops
+   * the last one.  Capacity is MAX_BODIES; spawns are refused when full. */
   Body b[MAX_BODIES];
   int nb;
 
-  /* ncubes / nsphs — cumulative spawn counts, used solely to pick a
-   * colour-pair slot via `1 + (count % 6)` in scene_add_*.  Decoupled
-   * from nb so deleting and respawning still cycles through the
-   * palette predictably.  Reset by scene_init. */
+  /* How many cubes / spheres have ever spawned, used only to pick the next
+   * body's colour so successive bodies cycle through the theme.  Kept apart
+   * from nb so deleting and respawning still steps through the palette. */
   int ncubes, nsphs;
 
-  /* rest — coefficient of restitution e ∈ [0.05, 0.95].  Scales the
-   * (1+e_eff) factor in the velocity impulse (Pass B in col_bodies),
-   * the floor bounce, and the wall bounce.  Capped below 1.0 because
-   * higher values inject energy each contact and destabilise stacks. */
+  /* Bounciness, 0.05 to 0.95.  Scales every bounce (body-body, floor,
+   * walls).  Held below 1 because higher adds energy and blows up stacks. */
   float rest;
 
-  /* grav — gravity gate.  When false, vy is no longer biased downward
-   * in scene_step (§6); existing motion still decays via DAMPING so
-   * the bodies coast to rest. */
+  /* Gravity on/off.  When off, bodies keep their motion but stop being
+   * pulled down and slowly coast to a stop. */
   bool grav;
 
-  /* paused — when true, main() skips scene_step() entirely.  All body
-   * positions / velocities stay frozen, so unpause continues exactly
-   * from the last simulated tick — no discontinuity. */
+  /* When true, the simulation is frozen and unpausing resumes exactly where
+   * it left off. */
   bool paused;
 
-  /* tick — monotonically increasing physics-step counter, reset by
-   * scene_init.  Available for any future "every N ticks" effect; not
-   * read by the physics math itself. */
+  /* Step counter, available for any "every N steps" effect.  Not used by
+   * the physics itself. */
   long tick;
 
-  /* rng — xorshift32 state used by rng_f() for spawn-position jitter
-   * and initial-vx randomness.  Re-seeded from time() at boot and at
-   * every reset so two runs of the demo differ. */
+  /* Random-number state for spawn jitter.  Re-seeded from the clock at boot
+   * and on reset so each run differs. */
   uint32_t rng;
 
-  /* ── Rendering parameters ─────────────────────────────────────────
-   * Pure cosmetic state.  Mutating these MUST be a no-op for the
-   * physics step — that contract is what keeps "press t mid-bounce"
-   * from disturbing the simulation.
-   */
+  /* ── rendering state (cosmetic only) ── */
 
-  /* theme — index into k_themes[] (§3).  Cycled forward by 't',
-   * backward by 'T'; both call theme_apply() to push the new ramp
-   * into the ncurses colour-pair table.  Always normalised to
-   * [0, N_THEMES) by the t / T handlers; theme_apply() still wraps
-   * defensively as a safety net for any future caller. */
+  /* Which theme is active, an index into k_themes[].  Cycled by t / T. */
   int theme;
 } Scene;
 
-/*
- * g_scene — the one Scene instance.  Default-initialised here so the
- * file compiles even before scene_init() runs (b[] BSS-zeroed → nb=0
- * → all readers see an empty world).  Non-zero defaults set explicitly:
- *   rest = REST_DEF       sensible bounciness on first frame
- *   grav = true           bodies fall by default
- *   rng  = 0xDEAD1234u    valid seed in case rng_f() is called before
- *                         the time()-based reseed in main / scene_init
- */
+/* The one and only scene.  Sensible starting values: a bit bouncy, gravity
+ * on, and a fixed RNG seed so it's valid even before scene_init reseeds it
+ * from the clock.  Everything else starts zeroed (empty world). */
 static Scene g_scene = {
     .rest = REST_DEF,
     .grav = true,
     .rng = 0xDEAD1234u,
 };
 
-/* Screen geometry — main-loop bookkeeping, not scene state
- * (see Scene docstring above). */
+/* Current terminal size.  Tracked by the main loop on resize, kept out of
+ * Scene so the simulation doesn't need to care about the window. */
 static int g_rows, g_cols;
 
 static inline float WW(void) { return (float)g_cols; }
 
-/* World height in pixel units.  Reserves:
- *   row 0           — top HUD (status)            ← via HUD_TOP_PX ceiling
- *   row g_rows - 2  — floor line                  ← prow(WH()) = g_rows-2
- *   row g_rows - 1  — bottom HUD (actions)
- * Game area is therefore rows 1 .. g_rows-3, plus the floor row g_rows-2. */
+/* Height of the play area, in pixels.  The top row is the status bar, the
+ * bottom two rows are the floor line and the key hints, so bodies live in
+ * the rows between. */
 static inline float WH(void) { return (float)((g_rows - 2) * 2); }
 
 static inline int pcol(float x) { return (int)(x + 0.5f); }
 static inline int prow(float y) { return (int)(y * 0.5f + 0.5f); }
 
-/*
- * rng_f — xorshift32 → uniform float in [0, 1).  Stateful via g_scene.rng.
- * Cheap (3 shifts + 3 xors) and good enough for spawn jitter; not a
- * cryptographic RNG.
- */
+/* A fast, cheap random float in [0, 1).  Fine for scattering spawns; not for
+ * anything that needs real randomness. */
 static float rng_f(void) {
   uint32_t r = g_scene.rng;
   r ^= r << 13;
@@ -760,7 +368,7 @@ static float rng_f(void) {
 }
 
 static void body_init_mass(Body *b) {
-  float area = 4.f * b->hw * b->hh; /* AABB area */
+  float area = 4.f * b->hw * b->hh; /* box area */
   b->mass = area * DENSITY;
   b->imass = 1.f / b->mass;
 }
@@ -770,9 +378,11 @@ static void body_wake(Body *b) {
   b->sleep_cnt = 0;
 }
 
-/* ===================================================================== */
-/* §5  framebuffer                                                        */
-/* ===================================================================== */
+/* ── §5 framebuffer ── */
+
+/* We draw bodies into these character + colour grids first, then copy the
+ * grids to the screen in one pass.  This keeps the drawing math separate
+ * from ncurses and lets every cell share one bounds check. */
 
 static char g_fb[ROWS_MAX][COLS_MAX];
 static int g_fcp[ROWS_MAX][COLS_MAX];
@@ -782,8 +392,8 @@ static void fb_clear(void) {
   memset(g_fcp, 0, sizeof g_fcp);
 }
 static void fb_put(int r, int c, char ch, int cp) {
-  /* Clip against the chrome rows: row 0 (top HUD) and row g_rows-2..-1
-   * (floor line + bottom HUD).  Floor and HUDs are painted separately. */
+  /* Skip the reserved rows: the top status bar, the floor line, and the
+   * bottom hints are all drawn separately. */
   if (r < 1 || r >= g_rows - 2 || c < 0 || c >= g_cols)
     return;
   g_fb[r][c] = ch;
@@ -799,8 +409,8 @@ static void fb_vline(int c, int y0, int y1, char ch, int cp) {
 }
 
 static void fb_flush(void) {
-  /* Walk the game area only — rows 1 .. g_rows-3 (floor + HUDs handled
-   * separately by the caller).  Range matches the fb_put clip above. */
+  /* Copy only the play-area rows to the screen; the floor and HUDs are the
+   * caller's job.  Same row range fb_put allows. */
   for (int r = 1; r < g_rows - 2; r++)
     for (int c = 0; c < g_cols; c++) {
       if (!g_fb[r][c])
@@ -811,70 +421,43 @@ static void fb_flush(void) {
     }
 }
 
-/* ===================================================================== */
-/* §6  physics                                                            */
-/*                                                                       */
-/* scene_step() is a 5-stage pipeline:                                    */
-/*                                                                       */
-/*     apply_gravity_to_awake();     // a_y += g     for awake bodies     */
-/*     integrate_motion();           // x += v ; v *= DAMPING ; |v|≤MAX   */
-/*     solve_contact_constraints();  // SOLVER_ITERS × all pairs          */
-/*     enforce_world_boundaries();   // floor + 3 walls, hard half-spaces */
-/*     update_sleep_state();         // sleep counter + freeze            */
-/*                                                                       */
-/* Each stage is its own helper named for the physics / algorithm        */
-/* concept it implements.  Pair resolution (col_bodies) and per-body     */
-/* boundary handling (resolve_*) decompose further into smaller          */
-/* primitives — aabb_contact, baumgarte_correct_pair, apply_contact_     */
-/* impulse, apply_coulomb_friction — so the math is readable top-down.   */
-/* ===================================================================== */
+/* ── §6 physics ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Contact — outcome of an AABB-pair overlap test.
- *
- * (nx, ny) is the contact NORMAL, conventionally pointing from a TOWARD
- * b — equivalently the direction of the Minimum Translation Vector
- * (MTV).  For axis-aligned boxes the normal is always one of ±x̂ or ±ŷ,
- * so exactly one of nx / ny is non-zero.  `depth` is the positive
- * penetration to resolve along that normal.  `overlapping` distinguishes
- * "no contact" from "contact with zero depth" (defensive — the latter
- * never happens in this solver but keeps callers honest).
- *
- * Inspired by the "Contact Manifold" of Catto's Box2D [2]; we don't
- * store contact POINTS because translation-only physics needs only the
- * normal + depth — there are no torques about a contact point.
- * ─────────────────────────────────────────────────────────────────────── */
+/* One simulation step does five things in order: add gravity, move the
+ * bodies, push apart and bounce any that overlap, keep everyone inside the
+ * floor and walls, and put still bodies to sleep.  Each gets its own helper
+ * below, and the overlap-and-bounce step breaks down further into the small
+ * pieces that follow. */
+
+/* The result of checking two bodies for overlap.  When they overlap,
+ * (nx, ny) points the shortest way to push them apart — for boxes that's
+ * always straight up/down or left/right, so one of the two is zero — and
+ * depth is how far they're overlapping along that direction.  We only need
+ * direction and depth, not the exact touch point, since bodies don't spin. */
 typedef struct {
-  float nx, ny; /* MTV direction, points a → b (unit vector)        */
-  float depth;  /* penetration along (nx, ny), ≥ 0 when overlapping */
+  float nx, ny; /* shortest push-apart direction, points from a to b */
+  float depth;  /* how deep the overlap is along that direction      */
   bool overlapping;
 } Contact;
 
-/*
- * aabb_contact — test two AABBs for overlap and, if overlapping, return
- * the Minimum Translation Vector (Ericson [4, §4.2]).
- *
- * Algorithm:
- *   1. Per-axis overlap = (sum of half-widths) − |Δcenter|.
- *      A non-positive value on either axis ⇒ no contact, return early.
- *   2. If both axes overlap, the MTV runs along the axis of SMALLER
- *      overlap (that's the shortest push out of the contact).
- *   3. Normal sign points from a's centre toward b's centre on that
- *      axis — the convention every helper below relies on.
- */
+/* Checks whether two boxes overlap and, if so, finds the shortest way to
+ * push them apart.  On each axis the overlap is "how close their centres are
+ * vs. how wide they both are"; if either axis isn't overlapping they're not
+ * touching.  When both overlap, the smaller of the two is the shortest way
+ * out, and we point the push from a toward b. */
 static Contact aabb_contact(const Body *a, const Body *b) {
   Contact c = {0};
   float ox = (a->hw + b->hw) - fabsf(b->x - a->x);
   float oy = (a->hh + b->hh) - fabsf(b->y - a->y);
   if (ox <= 0.f || oy <= 0.f)
-    return c; /* no overlap */
+    return c; /* not touching */
 
   c.overlapping = true;
-  if (ox < oy) { /* x axis is the shorter MTV */
+  if (ox < oy) { /* shorter to push sideways */
     c.nx = (b->x > a->x) ? 1.f : -1.f;
     c.ny = 0.f;
     c.depth = ox;
-  } else { /* y axis is shorter */
+  } else { /* shorter to push up/down */
     c.nx = 0.f;
     c.ny = (b->y > a->y) ? 1.f : -1.f;
     c.depth = oy;
@@ -882,35 +465,27 @@ static Contact aabb_contact(const Body *a, const Body *b) {
   return c;
 }
 
-/* Relative velocity of a w.r.t. b projected onto the contact normal:
- *   v_n = (v_a − v_b) · n
- * Positive ⇒ a is approaching b; Pass B applies a bounce only then. */
+/* How fast the two bodies are closing along the push direction.  Positive
+ * means they're moving into each other, which is the only time we bounce. */
 static inline float relative_normal_velocity(const Body *a, const Body *b,
                                              float nx, float ny) {
   return (a->vx - b->vx) * nx + (a->vy - b->vy) * ny;
 }
 
-/*
- * baumgarte_correct_pair — Pass A: positional stabilisation
- * (Baumgarte [1, eq. 14]).
- *
- *   corr = max(depth − SLOP, 0) · BAUMGARTE / (imA + imB)
- *
- * Distributes the push by inverse mass so a heavy body barely moves
- * while a light one is shoved out.  Runs ALWAYS — even when bodies are
- * separating — so a pair that spawned overlapping is pushed apart
- * regardless of relative velocity.  SLOP is the dead-zone that absorbs
- * solver noise [2, "Solver Setup"]; a correction exceeding WAKE_IMP
- * wakes the affected body so a nudged sleeping pile comes back to life.
- */
+/* Step one of fixing an overlap: gently slide the two bodies apart.  We only
+ * move a fraction of the overlap each call (the rest gets fixed on later
+ * passes), and a heavier body moves less than a lighter one.  This runs even
+ * when bodies are drifting apart, so a pair that spawns overlapping still
+ * separates.  Small overlaps (within SLOP) are left alone to avoid jitter,
+ * and a big enough shove wakes a sleeping body. */
 static void baumgarte_correct_pair(Body *a, Body *b, const Contact *c) {
   float denom = a->imass + b->imass;
   if (denom < 1e-12f)
-    return; /* both infinite-mass */
+    return; /* both immovable */
 
   float corr = fmaxf(c->depth - SLOP, 0.f) * BAUMGARTE / denom;
   if (corr <= 0.f)
-    return; /* inside the slop dead-zone */
+    return; /* overlap too small to bother with */
 
   float ca = corr * a->imass;
   float cb = corr * b->imass;
@@ -924,20 +499,11 @@ static void baumgarte_correct_pair(Body *a, Body *b, const Contact *c) {
     body_wake(b);
 }
 
-/*
- * apply_contact_impulse — Pass B normal: Newton's contact impulse
- * (Mirtich [3, §3.2]).
- *
- *   j_n = (1 + e_eff) · v_n / (imA + imB)
- *   e_eff = (v_n > REST_THRESH) ? g_scene.rest : 0
- *
- * The adaptive restitution gate suppresses micro-bounce: a body
- * resting on another has tiny solver residual vn; without the gate it
- * would apply a (1+e)·vn impulse every step and vibrate forever.
- *
- * Caller has already screened for v_n > 0; this helper does not.
- * Returns j_n so the friction helper can clamp |j_t| ≤ μ · j_n.
- */
+/* Step two: the bounce.  Knocks the closing speed back out, scaled by the
+ * bounciness, and shares it between the two bodies by weight.  When the
+ * approach is barely a wobble we drop the bounce entirely so a resting body
+ * doesn't buzz forever.  Returns the bounce strength so friction can size
+ * itself against it.  The caller has already checked the bodies are closing. */
 static float apply_contact_impulse(Body *a, Body *b, float nx, float ny,
                                    float vn) {
   float denom = a->imass + b->imass;
@@ -955,19 +521,10 @@ static float apply_contact_impulse(Body *a, Body *b, float nx, float ny,
   return jn;
 }
 
-/*
- * apply_coulomb_friction — Pass B tangent: Coulomb's law of dry
- * friction (Ericson [4, §5.4]).
- *
- *   t        = (−ny, nx)             // 90° CCW from contact normal
- *   v_t      = (v_a − v_b) · t       // relative tangential velocity
- *   j_t      = −v_t / (imA + imB)    // impulse to ZERO tangential vel
- *   |j_t|   ≤ μ · j_n                // Coulomb clamp
- *
- * v_t is re-derived from the POST-normal-impulse velocities (the
- * "sequential impulse" pattern of Box2D [2]); friction acts on the
- * already-corrected velocity rather than the pre-impulse one.
- */
+/* Step three: friction.  Slows the sideways sliding along the contact, but
+ * never by more than the bounce strength times the friction setting — so a
+ * gentle contact grips a little, a hard one grips more.  Works on the speed
+ * left after the bounce, so the two effects stack cleanly. */
 static void apply_coulomb_friction(Body *a, Body *b, float nx, float ny,
                                    float jn) {
   float denom = a->imass + b->imass;
@@ -986,19 +543,10 @@ static void apply_coulomb_friction(Body *a, Body *b, float nx, float ny,
   b->vy -= ty * jt * b->imass;
 }
 
-/*
- * col_bodies — resolve one body pair (the per-pair primitive called
- * O(nb²) × SOLVER_ITERS times per step).  Reads as pseudocode:
- *
- *   1. AABB overlap test                                          [4]
- *   2. Pass A — Baumgarte positional correction (always)          [1]
- *   3. relative normal velocity
- *   4. if separating (v_n ≤ 0) → done (Pass B is bounce-only)
- *   5. Pass B normal  — contact impulse along n                   [3]
- *   6. Pass B tangent — Coulomb friction along t                  [4]
- *
- * Pass A is intentionally unconditional — see baumgarte_correct_pair.
- */
+/* Handles one pair of bodies: if they overlap, push them apart, then (only
+ * if they're moving into each other) bounce and apply friction.  The
+ * push-apart always runs; the bounce and friction don't if the bodies are
+ * already drifting apart. */
 static void col_bodies(Body *a, Body *b) {
   Contact c = aabb_contact(a, b);
   if (!c.overlapping)
@@ -1008,55 +556,46 @@ static void col_bodies(Body *a, Body *b) {
 
   float vn = relative_normal_velocity(a, b, c.nx, c.ny);
   if (vn <= 0.f)
-    return; /* separating — skip Pass B */
+    return; /* drifting apart — no bounce needed */
 
   float jn = apply_contact_impulse(a, b, c.nx, c.ny, vn);
   apply_coulomb_friction(a, b, c.nx, c.ny, jn);
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * World-boundary constraints (floor + 3 walls).
- *
- * Each surface is a hard half-space: position is SNAPPED (no Baumgarte
- * fraction), then the normal velocity component is reflected with
- * adaptive restitution.  Hard rather than iterative because the
- * boundaries are static infinite-mass surfaces — there is no other
- * side to push back on, so an exact clamp is both stable and cheaper.
- *
- * Only resolve_floor adds dynamic friction (vx · (1 − μ(1+e_eff))) —
- * the floor is the only surface bodies actually slide along long-term;
- * adding friction to the walls / ceiling would make the demo feel
- * sticky on brief side contacts.
- * ─────────────────────────────────────────────────────────────────────── */
+/* The floor and three walls.  Unlike body-body contacts, these are solid and
+ * immovable, so a body that crosses one is snapped right back to the edge and
+ * its speed into the surface is reflected — no gradual nudging needed.  Only
+ * the floor adds sliding friction, since that's the only surface bodies rest
+ * and slide on; friction on the walls would feel sticky on a glancing touch. */
 
-/* resolve_floor — half-space y + hh ≤ WH().  Snap + reflect + friction. */
+/* Floor: keep the body above it, bounce, and rub off some sideways speed. */
 static void resolve_floor(Body *b) {
   float wh = WH();
   if (b->y + b->hh <= wh)
     return;
-  b->y = wh - b->hh; /* exact snap to floor */
+  b->y = wh - b->hh; /* snap to the floor */
 
   if (b->vy <= 0.f)
-    return; /* already moving upward */
+    return; /* already heading up */
   float e_eff = (b->vy > REST_THRESH) ? g_scene.rest : 0.f;
   b->vy = -b->vy * e_eff;
-  b->vx *= (1.f - FRICTION * (1.f + e_eff)); /* dynamic slide friction */
+  b->vx *= (1.f - FRICTION * (1.f + e_eff)); /* sliding friction */
   if (fabsf(b->vx) < SLEEP_VEL)
-    b->vx = 0.f; /* kill near-zero drift */
+    b->vx = 0.f; /* stop the last bit of crawl */
 }
 
-/* resolve_left_wall — half-space x − hw ≥ 0. */
+/* Left wall: keep the body to its right and bounce. */
 static void resolve_left_wall(Body *b) {
   if (b->x - b->hw >= 0.f)
     return;
   b->x = b->hw;
   if (b->vx >= 0.f)
-    return; /* already moving right */
+    return; /* already heading right */
   float e_eff = (fabsf(b->vx) > REST_THRESH) ? g_scene.rest : 0.f;
   b->vx = -b->vx * e_eff;
 }
 
-/* resolve_right_wall — half-space x + hw ≤ WW().  Mirror of the left. */
+/* Right wall: mirror image of the left. */
 static void resolve_right_wall(Body *b) {
   float ww = WW();
   if (b->x + b->hw <= ww)
@@ -1068,8 +607,8 @@ static void resolve_right_wall(Body *b) {
   b->vx = -b->vx * e_eff;
 }
 
-/* resolve_ceiling — half-space y − hh ≥ HUD_TOP_PX.  The ceiling sits
- * at HUD_TOP_PX (not 0) so row 0 stays clear for the top HUD overlay. */
+/* Ceiling: sits a little below the very top so the status bar's row stays
+ * clear; bounces a body that hits it back down. */
 static void resolve_ceiling(Body *b) {
   if (b->y - b->hh >= HUD_TOP_PX)
     return;
@@ -1080,16 +619,10 @@ static void resolve_ceiling(Body *b) {
   b->vy = -b->vy * e_eff;
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * scene_step pipeline — five named stages.
- * ─────────────────────────────────────────────────────────────────────── */
+/* ── the five steps of one tick ── */
 
-/*
- * apply_gravity_to_awake — bias vy by GRAVITY for every awake body.
- * Sleeping bodies are skipped: they have vy = 0 and adding gravity
- * would immediately re-wake them on the next sleep check.  Gated by
- * g_scene.grav so the user can suspend gravity at runtime (g key).
- */
+/* Pull every awake body downward.  Sleeping bodies are skipped so they stay
+ * frozen, and the whole thing is off when the user toggles gravity. */
 static void apply_gravity_to_awake(void) {
   if (!g_scene.grav)
     return;
@@ -1098,19 +631,8 @@ static void apply_gravity_to_awake(void) {
       g_scene.b[i].vy += GRAVITY;
 }
 
-/*
- * integrate_motion — explicit Euler position update, followed by linear
- * damping and the MAX_SPEED tunnelling-prevention cap.
- *
- *   x += vx ; y += vy            (explicit Euler position step)
- *   v  *= DAMPING                (linear drag analogue)
- *   |v|  clamped to MAX_SPEED    (so |v|·dt < CUBE_HW)
- *
- * Order matters: damping AFTER position means v is the "free flight"
- * velocity before any contact impulses; capping AFTER damping pins
- * terminal velocity at MAX_SPEED rather than MAX_SPEED · DAMPING.
- * Sleeping bodies are skipped.
- */
+/* Move every awake body by its speed, bleed off a little to drag, then cap
+ * the speed so nothing moves far enough in one step to skip through a wall. */
 static void integrate_motion(void) {
   for (int i = 0; i < g_scene.nb; i++) {
     Body *b = &g_scene.b[i];
@@ -1131,17 +653,10 @@ static void integrate_motion(void) {
   }
 }
 
-/*
- * solve_contact_constraints — SOLVER_ITERS iterations of the all-pairs
- * collision loop, each iteration calling col_bodies on every (i, j)
- * pair with i < j.
- *
- * The outer iteration is what gives the solver its "iterative" name
- * (Catto [2]): a single pass would resolve one contact at a time, but
- * stacks need each contact to RE-resolve as bodies above shift the
- * bodies below.  Sleeping pairs are skipped — the entire CPU win of
- * the sleep system, since the inner loop is O(nb²).
- */
+/* Check and fix every pair of bodies, several times over.  Repeating is what
+ * lets stacks settle: fixing one contact shifts the bodies around it, so they
+ * all need re-checking.  Pairs where both bodies are asleep are skipped, and
+ * that's where the sleep system pays off, since this is the costliest loop. */
 static void solve_contact_constraints(void) {
   for (int iter = 0; iter < SOLVER_ITERS; iter++) {
     for (int i = 0; i < g_scene.nb; i++) {
@@ -1156,13 +671,9 @@ static void solve_contact_constraints(void) {
   }
 }
 
-/*
- * enforce_world_boundaries — apply the four static half-space
- * constraints (floor, ceiling, two walls) to every body, sleeping
- * INCLUDED.  We process sleeping bodies because Baumgarte drift in a
- * tall stack can otherwise nudge a sleeper through the floor across
- * many ticks; the snap keeps geometry honest.
- */
+/* Keep every body inside the floor and walls — including sleeping ones,
+ * because the gentle push-apart in a tall stack can slowly creep a sleeper
+ * through the floor otherwise, and the snap keeps things honest. */
 static void enforce_world_boundaries(void) {
   for (int i = 0; i < g_scene.nb; i++) {
     Body *b = &g_scene.b[i];
@@ -1173,16 +684,9 @@ static void enforce_world_boundaries(void) {
   }
 }
 
-/*
- * update_sleep_state — Box2D-style sleep heuristic [2, "Sleeping"].
- *
- *   speed < SLEEP_VEL      →  sleep_cnt++
- *   sleep_cnt ≥ SLEEP_FRAMES  →  body is frozen (v zeroed, sleeping=true)
- *   any noisier frame      →  sleep_cnt reset to 0
- *
- * Wake-up is handled by body_wake() called from baumgarte_correct_pair,
- * apply_contact_impulse, and (implicitly) by external resets.
- */
+/* Count how long each body has been nearly still, and freeze it once it's
+ * been still long enough.  Any real motion resets the count.  Waking back up
+ * happens elsewhere, whenever a body gets a solid push or bounce. */
 static void update_sleep_state(void) {
   for (int i = 0; i < g_scene.nb; i++) {
     Body *b = &g_scene.b[i];
@@ -1201,11 +705,7 @@ static void update_sleep_state(void) {
   }
 }
 
-/*
- * scene_step — one simulation tick.  Reads as the pipeline described
- * at the top of §6: each line is an independently-named stage whose
- * helper above implements one well-defined physics / algorithm concept.
- */
+/* One simulation tick: the five steps, in order. */
 static void scene_step(void) {
   apply_gravity_to_awake();
   integrate_motion();
@@ -1215,16 +715,10 @@ static void scene_step(void) {
   g_scene.tick++;
 }
 
-/* ===================================================================== */
-/* §7  scene management                                                   */
-/* ===================================================================== */
+/* ── §7 scene management ── */
 
-/*
- * aabb_overlaps_any — spawn-time overlap test: does candidate `c`
- * collide with any body already in the pool?  Used by try_place_at_top
- * to reject occupied spawn positions.  O(nb), runs ≤ 8 times per
- * spawn so the worst case is negligible compared to the physics step.
- */
+/* Would a body placed here land on top of an existing one?  Used to find a
+ * clear spot when spawning. */
 static bool aabb_overlaps_any(const Body *c) {
   for (int i = 0; i < g_scene.nb; i++) {
     const Body *b = &g_scene.b[i];
@@ -1235,12 +729,8 @@ static bool aabb_overlaps_any(const Body *c) {
   return false;
 }
 
-/*
- * body_init_shape — set the immutable shape / colour fields of a Body
- * and derive its mass from AABB area.  After this call b has valid
- * kind / hw / hh / cp / mass / imass but x / y / vx / vy are still
- * zero — those are placed by try_place_at_top.
- */
+/* Fill in a body's shape, colour, and mass.  Its position and speed are set
+ * separately, when it's placed. */
 static void body_init_shape(Body *b, Kind kind, float hw, float hh, int cp) {
   b->kind = kind;
   b->hw = hw;
@@ -1249,14 +739,9 @@ static void body_init_shape(Body *b, Kind kind, float hw, float hh, int cp) {
   body_init_mass(b);
 }
 
-/*
- * try_place_at_top — find a free spawn position along the ceiling row
- * (y = hh + HUD_TOP_PX) using rejection sampling.  Up to `attempts`
- * uniformly-random x values are tried in the middle 80 % of the world
- * width with a 1 px wall margin; first non-overlapping candidate wins.
- * Returns true on success (b->x, b->y written) or false if every
- * attempt overlapped — caller drops the spawn in that case.
- */
+/* Try to drop the body in near the top at a random x, retrying a few times
+ * until it finds a spot that doesn't land on another body.  Returns false if
+ * every try was blocked, so the caller can skip the spawn. */
 static bool try_place_at_top(Body *b, int attempts) {
   float ww = WW();
   for (int i = 0; i < attempts; i++) {
@@ -1273,16 +758,8 @@ static bool try_place_at_top(Body *b, int attempts) {
   return false;
 }
 
-/*
- * scene_add_cube — drop a new cube at the ceiling with mild horizontal
- * jitter.  Reads as pseudocode:
- *
- *   1. reject if pool is full
- *   2. build a fresh cube body (shape + mass + colour slot)
- *   3. find a free spawn position (≤ 8 attempts)
- *   4. give it gentle horizontal velocity
- *   5. push it onto Scene.b[]
- */
+/* Drop a new cube in near the top with a small random sideways nudge.  Does
+ * nothing if the scene is full or no clear spot is found. */
 static bool scene_add_cube(void) {
   if (g_scene.nb >= MAX_BODIES)
     return false;
@@ -1292,17 +769,14 @@ static bool scene_add_cube(void) {
   if (!try_place_at_top(&b, 8))
     return false;
 
-  b.vx = (rng_f() - 0.5f) * 2.f; /* ±1 px/step jitter */
+  b.vx = (rng_f() - 0.5f) * 2.f; /* small sideways nudge */
   g_scene.b[g_scene.nb++] = b;
   g_scene.ncubes++;
   return true;
 }
 
-/*
- * scene_add_sphere — mirror of scene_add_cube; the only differences are
- * the shape kind, the aspect-corrected AABB extent (hh = 2 · SPH_R),
- * and the colour-pair counter (g_scene.nsphs).
- */
+/* Same as scene_add_cube, but spawns a sphere (with its taller collision box
+ * and its own colour counter). */
 static bool scene_add_sphere(void) {
   if (g_scene.nb >= MAX_BODIES)
     return false;
@@ -1323,11 +797,8 @@ static void scene_remove_last(void) {
     g_scene.nb--;
 }
 
-/*
- * scene_init — initial-world setup: clears the pool, reseeds the RNG,
- * and places a sleeping cube on the floor with a sphere dropping from
- * the ceiling onto it.  Called at boot and on every r / R reset.
- */
+/* Set up the opening scene (and reset back to it): a resting cube on the
+ * floor with a sphere falling toward it.  Called at startup and on reset. */
 static void scene_init(void) {
   g_scene.nb = g_scene.ncubes = g_scene.nsphs = 0;
   g_scene.tick = 0;
@@ -1335,7 +806,7 @@ static void scene_init(void) {
 
   float ww = WW(), wh = WH();
 
-  /* cube pre-placed at rest on floor (sleeping so it doesn't drift). */
+  /* a cube parked on the floor, asleep so it stays put */
   Body c = {0};
   body_init_shape(&c, KIND_CUBE, CUBE_HW, CUBE_HH, 1);
   c.x = ww * 0.50f;
@@ -1344,7 +815,7 @@ static void scene_init(void) {
   g_scene.b[g_scene.nb++] = c;
   g_scene.ncubes++;
 
-  /* sphere dropping from the ceiling — falls onto the cube. */
+  /* a sphere up top, about to drop onto the cube */
   Body s = {0};
   body_init_shape(&s, KIND_SPHERE, SPH_R, 2.f * SPH_R, 4);
   s.x = ww * 0.50f;
@@ -1353,16 +824,12 @@ static void scene_init(void) {
   g_scene.nsphs++;
 }
 
-/* ===================================================================== */
-/* §8  draw                                                               */
-/* ===================================================================== */
+/* ── §8 draw ── */
 
-/*
- * Sphere is drawn using hw (x) and hh (y) so the ellipse matches the
- * AABB exactly.  prow(y + hh*sin) = (y + 2r*sin) / 2 → r rows from
- * center on screen.  pcol(x + hw*cos) = x + r cols from center.
- * The result is a circle of radius r on screen, matching the physics box.
- */
+/* Draws one body into the framebuffer: a sphere as a ring of 'O' around its
+ * centre, a cube as a box of '#', each with a '+' marking the middle.  The
+ * sphere uses its (wider-than-tall) collision box for the radii, which is
+ * exactly what makes it come out round on screen. */
 static void draw_body(const Body *b) {
   int cp = b->cp;
   if (b->kind == KIND_SPHERE) {
@@ -1384,11 +851,7 @@ static void draw_body(const Body *b) {
   }
 }
 
-/*
- * Two-bar HUD per CLAUDE.md convention:
- *   row 0       right (CP_HUD  bright yellow + bold) — live status
- *   row rows-1  left  (CP_HINT bright cyan   + bold) — actions / keys
- */
+/* The status line across the top: body counts and the current settings. */
 static void draw_hud_top(int fps) {
   int nc = 0, ns = 0;
   for (int i = 0; i < g_scene.nb; i++) {
@@ -1413,6 +876,8 @@ static void draw_hud_top(int fps) {
   attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
+/* The key hints across the bottom, with a shorter version for narrow
+ * windows. */
 static void draw_hud_bottom(void) {
   const char *full = " q:quit  p:pause  r:reset  c:cube  s:sphere  x:del  "
                      "e/E:rest  g:gravity  t/T:theme ";
@@ -1429,27 +894,24 @@ static void scene_draw(int fps) {
   erase();
   fb_clear();
 
-  /* floor line — drawn first so body chars overlap it where they sit. */
+  /* floor line first, so bodies sitting on it draw over it */
   int floor_row = prow(WH());
   attron(COLOR_PAIR(CP_FLOOR));
   for (int c = 0; c < g_cols; c++)
     mvaddch(floor_row, c, '=');
   attroff(COLOR_PAIR(CP_FLOOR));
 
-  /* bodies via framebuffer (clipped to rows 1..g_rows-3 by fb_put). */
+  /* then the bodies */
   for (int i = 0; i < g_scene.nb; i++)
     draw_body(&g_scene.b[i]);
   fb_flush();
 
-  /* HUD overlays — painted after the world so they always win row 0
-   * and row g_rows-1 even if a body would have drawn there. */
+  /* HUD last, so the top and bottom bars always stay on top */
   draw_hud_top(fps);
   draw_hud_bottom();
 }
 
-/* ===================================================================== */
-/* §9  screen                                                             */
-/* ===================================================================== */
+/* ── §9 screen ── */
 
 static volatile sig_atomic_t g_resize = 0, g_quit = 0;
 static void on_sigwinch(int s) {
@@ -1470,7 +932,7 @@ static void screen_init(void) {
   curs_set(0);
   typeahead(-1);
   start_color();
-  use_default_colors(); /* enable -1 (transparent) bg in init_pair */
+  use_default_colors(); /* lets -1 mean the terminal's own background */
   g_256 = (COLORS >= 256);
   theme_apply(g_scene.theme);
 }
@@ -1484,9 +946,7 @@ static void screen_resize(void) {
   g_resize = 0;
 }
 
-/* ===================================================================== */
-/* §10  app                                                               */
-/* ===================================================================== */
+/* ── §10 app ── */
 
 int main(void) {
   signal(SIGWINCH, on_sigwinch);
@@ -1565,7 +1025,7 @@ int main(void) {
       next = now + NS_PER_S / SIM_FPS;
     }
 
-    /* rolling 1-second fps window */
+    /* count frames over each one-second window for the fps readout */
     fps_frames++;
     if (now - fps_window_start >= NS_PER_S) {
       fps_disp = fps_frames;

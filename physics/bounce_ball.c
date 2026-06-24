@@ -1,88 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * bounce.c  —  ncurses bouncing balls, smooth terminal-aware motion
+ * bounce_ball.c — balls bouncing around the terminal with smooth, even motion.
  *
- * ROOT FIX: physics runs in square pixel space, not cell space.
- * RENDER INTERPOLATION: draw positions are lerp'd between ticks using alpha.
- *
- * The core problem with a naive terminal bouncing ball:
- *   - Terminal cells are ~2× taller than wide in physical pixels.
- *   - If you store position in cell coords, dx=1 and dy=1 cover
- *     very different physical distances on screen.
- *   - A ball moving diagonally looks faster horizontally than vertically.
- *   - Speed feels uneven, circles become ellipses, angles look wrong.
- *
- * The fix — two coordinate spaces, one conversion point:
- *
- *   PIXEL SPACE  (physics lives here)
- *     Square grid.  One unit = one physical pixel (approximately).
- *     Width  = cols * CELL_W   (e.g. 200 cols × 8px  = 1600 px wide)
- *     Height = rows * CELL_H   (e.g.  50 rows × 16px =  800 px tall)
- *     Ball position, velocity, speed — all in pixel units.
- *     Balls travel equal physical distance in all directions.
- *
- *   CELL SPACE   (drawing happens here)
- *     Terminal columns and rows.
- *     cell_x = pixel_x / CELL_W
- *     cell_y = pixel_y / CELL_H
- *     One call: px_to_cell().  Nowhere else touches cell coords.
- *
- * With this, 1 pixel/tick is the same physical distance in X and Y.
- * Diagonal motion looks diagonal.  Speed is isotropic.
- * No aspect ratio hacks scattered through the code.
- *
- * RENDER INTERPOLATION (alpha):
- *
- *   The sim accumulator runs fixed-timestep ticks. After draining the
- *   accumulator, sim_accum holds the *leftover* time — how far we are
- *   into the next tick that has not run yet.
- *
- *   Without interpolation:
- *     We draw balls at their last *ticked* position.
- *     That position is up to one full tick behind "now".
- *     At 60 Hz sim / 60 Hz render this lag is 0–16 ms — visible as
- *     micro-stutter when the render frame happens to land just before
- *     a tick fires.
- *
- *   With interpolation:
- *     alpha = sim_accum / tick_ns            ∈ [0.0, 1.0)
- *     draw_px = ball.px + ball.vx * alpha * dt_sec
- *     draw_py = ball.py + ball.vy * alpha * dt_sec
- *
- *     This projects each ball forward by the fractional tick time,
- *     so the drawn position matches "now" to within rendering error.
- *     Motion becomes silky smooth regardless of whether the render
- *     frame lands just before or just after a physics tick.
- *
- *   Interpolation vs extrapolation:
- *     This is technically *extrapolation* (we predict forward from the
- *     last known state).  True interpolation would require storing the
- *     previous tick's position and blending between prev and current.
- *     For constant-velocity balls with elastic wall bounces, forward
- *     extrapolation is numerically identical to interpolation and
- *     requires no extra storage.  If you add acceleration or non-linear
- *     forces, switch to storing prev_px/prev_py and lerp between them.
- *
- * Keys:
- *   q / ESC   quit
- *   space     pause / resume
- *   =  -      add / remove a ball
- *   r         randomise all balls
- *   ]  [      faster / slower simulation
- *
- * Build (this comment block is already the CONCEPTS section — see above).
- *   gcc -std=c11 -O2 -Wall -Wextra bounce.c -o bounce -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config   — every tunable constant
- *   §2  clock    — monotonic ns clock + sleep
- *   §3  color    — one color pair per ball
- *   §4  coords   — pixel↔cell conversion; the one aspect-ratio fix
- *   §5  ball     — physics in pixel space; spawn; tick
- *   §6  scene    — ball pool; tick; draw  ← draw now accepts alpha
- *   §7  screen   — single stdscr buffer + HUD
- *   §8  app      — dt loop, input, resize, cleanup
+ * The trick: terminal cells are about twice as tall as they are wide, so a
+ * naive ball looks faster sideways than up-down and circles come out as
+ * ovals. We dodge that by running all the physics in a square "pixel" space
+ * and only converting to terminal cells at the last moment, when we draw.
+ * We also nudge each ball a fraction ahead of its last update so the motion
+ * looks silky instead of stuttery.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -97,9 +22,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
   SIM_FPS_MIN = 10,
@@ -117,46 +40,20 @@ enum {
 };
 
 /*
- * CELL_W, CELL_H — logical sub-pixel resolution per terminal cell.
- *
- * These are NOT actual screen pixel sizes — they are the number of
- * sub-steps we divide each cell into for physics precision.
- *
- * Higher values = more sub-steps = smoother apparent motion for slow balls.
- *
- * CELL_H/CELL_W must equal the terminal cell aspect ratio (~2.0).
- *
- * With CELL_W=8, CELL_H=16:
- *   A 200×50 terminal → pixel space 1600×800
- *   A ball at speed 160px/s at 60fps moves 2.67px/tick
- *   → 2.67/8 = 0.33 cols/tick  horizontally
- *   → 2.67/16 = 0.17 rows/tick vertically
- *   Crosses a horizontal cell every ~3 ticks, vertical every ~6 ticks.
- *   That is the staircase threshold — so SPEED_MIN must guarantee
- *   at least ~2px/tick to cross cells often enough to look smooth.
- *
- * The staircase rule:
- *   To avoid staircase, ball must cross at least one cell every N ticks.
- *   speed_px_per_tick = speed / sim_fps
- *   cell_crossings_per_tick_x = speed_px_per_tick / CELL_W
- *   cell_crossings_per_tick_y = speed_px_per_tick / CELL_H
- *   For smooth motion: cell_crossings >= 1 every 4 ticks at minimum.
- *   So: speed >= CELL_H * sim_fps / 4
- *       speed >= 16 * 60 / 4 = 240 px/s  (minimum for vertical smoothness)
+ * How many invisible "pixels" we pretend each terminal cell is made of.
+ * A cell is roughly twice as tall as it is wide, so we use 8 across and 16
+ * down — that ratio is what makes diagonal motion come out straight. Bigger
+ * numbers just give finer sub-cell precision; the ratio is the thing that
+ * matters.
  */
 #define CELL_W 8
 #define CELL_H 16
 
 /*
- * Speed in pixels per second.
- * SPEED_MIN must be high enough that even the slowest ball crosses
- * cell boundaries frequently — otherwise staircase reappears.
- *
- * Formula: SPEED_MIN >= CELL_H * SIM_FPS / 4
- *          = 16 * 60 / 4 = 240
- *
- * We use 300 as the minimum (comfortable margin above the threshold)
- * and 600 as maximum for fast balls.
+ * Ball speed range, in pixels per second. The floor is kept fairly high on
+ * purpose: a ball that creeps along jumps cell-to-cell too rarely and the
+ * motion looks like a staircase. 300 keeps even the slowest ball moving
+ * smoothly; 600 is a brisk fast ball.
  */
 #define SPEED_MIN 300.0f
 #define SPEED_MAX 600.0f
@@ -165,9 +62,7 @@ enum {
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -185,9 +80,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color ── */
 
 static void color_init(void) {
   start_color();
@@ -210,52 +103,27 @@ static void color_init(void) {
   }
 }
 
-/* ===================================================================== */
-/* §4  coords — the one place aspect ratio is handled                     */
-/* ===================================================================== */
+/* ── §4 coords ── */
 
 /*
- * This section is the entire fix.  Everything else in the program
- * uses pixel coords.  Only here do we convert to cell coords for drawing.
- *
- * pixel space:  width = cols*CELL_W,  height = rows*CELL_H
- *               square — one unit is one physical pixel
- *
- * cell space:   width = cols,  height = rows
- *               non-square — cells are CELL_H/CELL_W taller than wide
- *
- * px_to_cell_x(px, cols) — convert pixel x → terminal column
- * px_to_cell_y(py, rows) — convert pixel y → terminal row
- *
- * pw(cols) — pixel space width  given terminal cols
- * ph(rows) — pixel space height given terminal rows
+ * This little section is the whole reason the motion looks right. Everything
+ * else works in square pixel space; only here do we turn a pixel position
+ * into the terminal column/row we actually draw at. pw/ph give the pixel
+ * size of the whole screen for a given number of columns and rows.
  */
 
 static inline int pw(int cols) { return cols * CELL_W; }
 static inline int ph(int rows) { return rows * CELL_H; }
 
 /*
- * px_to_cell_x/y — convert pixel coordinate to terminal cell.
+ * Turn a pixel position into the terminal cell it lands in.
  *
- * We use floorf(px/CELL_W + 0.5f) — "round half up" — instead of
- * roundf() or truncation.
- *
- * WHY NOT roundf:
- *   C's roundf uses "round half to even" (banker's rounding).
- *   When px/CELL_W is exactly 0.5 it rounds to 0 one call and 1
- *   the next depending on the FPU state.  A ball sitting on a cell
- *   boundary oscillates between two cells every frame — visible as
- *   a doubled/flickering character.
- *
- * WHY NOT truncation (int)(px/CELL_W):
- *   Always rounds down regardless of fractional part.
- *   Creates asymmetric dwell time — staircase pattern.
- *
- * WHY floorf(px/CELL_W + 0.5f):
- *   Adds 0.5 before flooring.  This is "round half up" — always
- *   rounds to the nearest cell, and always breaks ties in the same
- *   direction (up).  Deterministic on every call, no oscillation.
- *   Symmetric dwell time like roundf but without the tie-breaking bug.
+ * We round to the nearest cell by hand (add a half, then floor) rather than
+ * using roundf(). roundf() breaks exact ties toward even numbers, so a ball
+ * parked right on a cell edge would flip between two cells frame after frame
+ * and flicker. Plain truncation has the opposite problem — it always rounds
+ * down, which makes the ball linger unevenly and look like a staircase.
+ * Adding a half and flooring always rounds the same way, so it's steady.
  */
 static inline int px_to_cell_x(float px) {
   return (int)floorf(px / (float)CELL_W + 0.5f);
@@ -264,18 +132,17 @@ static inline int px_to_cell_y(float py) {
   return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  ball                                                               */
-/* ===================================================================== */
+/* ── §5 ball ── */
 
 /*
- * Ball — all positions and velocities are in PIXEL SPACE.
+ * One bouncing ball. Everything here lives in pixel space — the square
+ * coordinate world the physics uses — never in terminal cells. We only
+ * convert to a cell at draw time, and nowhere else.
  *
- *   px, py    position in pixels  (float for sub-pixel precision)
- *   vx, vy    velocity in pixels per second
- *
- * At draw time:  cell_x = px_to_cell_x(px),  cell_y = px_to_cell_y(py)
- * That is the only conversion. Physics never touches cell coordinates.
+ *   px, py   where the ball is, in pixels (float so it can sit between cells)
+ *   vx, vy   how fast it's moving, in pixels per second
+ *   color    which color pair to draw it with
+ *   ch       which character to draw (o, *, O, @, +)
  */
 typedef struct {
   float px, py;
@@ -287,13 +154,7 @@ typedef struct {
 static const char k_chars[] = "o*O@+";
 static const int k_nchars = (int)(sizeof k_chars - 1);
 
-/*
- * ball_spawn() — place ball at random pixel position with random velocity.
- *
- * Velocity direction is a random angle so balls move in all directions
- * equally — not just axis-aligned.  Speed is uniform in pixel space,
- * so a ball moving NE covers the same physical distance as one moving E.
- */
+/* Drop a ball at a random spot heading in a random, evenly-spread direction. */
 static void ball_spawn(Ball *b, int i, int cols, int rows) {
   int pxw = pw(cols);
   int pxh = ph(rows);
@@ -302,12 +163,11 @@ static void ball_spawn(Ball *b, int i, int cols, int rows) {
   b->py = (float)(CELL_H + rand() % (pxh - 2 * CELL_H));
 
   /*
-   * Random angle gives isotropic direction distribution.
-   * Without this, using separate random vx/vy produces more
-   * diagonal balls than axis-aligned ones (non-uniform angle dist).
-   *
-   * We avoid math.h by using a simple rejection-sample unit vector:
-   * pick random (dx, dy) in [-1,1]², keep if inside unit circle.
+   * Pick a random direction that's fair to every angle. Picking vx and vy
+   * separately would favor the diagonals, so instead we keep throwing darts
+   * at a square and only accept the ones that land inside a circle — those
+   * are spread evenly around. (Doing it this way also avoids needing an
+   * angle function from math.h.)
    */
   float dx, dy, len;
   do {
@@ -316,7 +176,7 @@ static void ball_spawn(Ball *b, int i, int cols, int rows) {
     len = dx * dx + dy * dy;
   } while (len < 0.01f || len > 1.0f);
 
-  /* Normalise to unit vector then scale to random speed */
+  /* Shrink that direction to length 1, then scale it up to a random speed. */
   float mag = sqrtf(len);
   float speed = SPEED_MIN + (float)(rand() % (int)(SPEED_MAX - SPEED_MIN + 1));
   b->vx = (dx / mag) * speed;
@@ -327,15 +187,10 @@ static void ball_spawn(Ball *b, int i, int cols, int rows) {
 }
 
 /*
- * ball_tick() — advance one ball by dt seconds, purely in pixel space.
- *
- * Receives pre-computed pixel boundaries (max_px, max_py) from scene_tick.
- * Has zero knowledge of terminal columns, rows, CELL_W, or CELL_H.
- *
- * Physics:
- *   move:     position += velocity * dt
- *   reflect:  if wall hit, flip the relevant velocity component
- *             and clamp position back inside the boundary
+ * Move one ball forward by dt seconds and bounce it off the walls. It's
+ * handed the edges in pixels, so it never has to know anything about the
+ * terminal. Hitting a wall just flips the matching speed and nudges the ball
+ * back inside.
  */
 static void ball_tick(Ball *b, float dt, float max_px, float max_py) {
   b->px += b->vx * dt;
@@ -359,10 +214,15 @@ static void ball_tick(Ball *b, float dt, float max_px, float max_py) {
   }
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6 scene ── */
 
+/*
+ * The whole collection of balls and the sim's running state.
+ *
+ *   balls   fixed pool, room for BALLS_MAX of them (no allocation at runtime)
+ *   n       how many of those are actually live right now
+ *   paused  true when the user has frozen the simulation
+ */
 typedef struct {
   Ball balls[BALLS_MAX];
   int n;
@@ -378,58 +238,32 @@ static void scene_init(Scene *s, int cols, int rows) {
 }
 
 /*
- * scene_tick() — advance the simulation one step.
- *
- * This is the only function in §6 that calls pw/ph.
- * It converts terminal dimensions (cell space) into pixel boundaries
- * once, then passes those pixel values to ball_tick.
- *
- * Data flow:
- *   cell space (cols, rows)
- *       ↓  pw() / ph()          ← conversion happens exactly here
- *   pixel space (max_px, max_py)
- *       ↓  ball_tick()
- *   physics (position, velocity) — knows nothing about cells
+ * Step every ball forward once. This works out where the walls are in pixels
+ * (the one spot that turns screen size into pixel size) and then lets each
+ * ball move and bounce without caring about the terminal at all.
  */
 static void scene_tick(Scene *s, float dt, int cols, int rows) {
   if (s->paused)
     return;
 
-  float max_px = (float)(pw(cols) - 1); /* pixel space right edge  */
-  float max_py = (float)(ph(rows) - 1); /* pixel space bottom edge */
+  float max_px = (float)(pw(cols) - 1); /* right edge, in pixels  */
+  float max_py = (float)(ph(rows) - 1); /* bottom edge, in pixels */
 
   for (int i = 0; i < s->n; i++)
     ball_tick(&s->balls[i], dt, max_px, max_py);
 }
 
 /*
- * scene_draw() — interpolated draw.
+ * Draw the balls, nudged a little ahead so the motion looks smooth.
  *
- * alpha ∈ [0.0, 1.0) is the fractional tick time remaining in sim_accum.
+ * The physics only updates in fixed ticks, but a frame usually lands partway
+ * between two ticks. alpha (between 0 and 1) says how far along we are, and
+ * we slide each ball that fraction of a step forward before drawing it — so
+ * it shows up where it really is "now" instead of lagging behind the last
+ * tick. The fraction is always less than a full step, so a ball can't slip
+ * past a wall it just bounced off; the clamp below mops up any rounding.
  *
- *   draw_px = ball.px + ball.vx * alpha * dt_sec
- *   draw_py = ball.py + ball.vy * alpha * dt_sec
- *
- * This projects each ball forward by the sub-tick remainder so the
- * rendered position matches "wall-clock now" rather than "last tick".
- *
- * WHY this is safe (no wall-check needed on draw position):
- *   alpha < 1.0 always, so the projected position overshoots by less
- *   than one full tick.  After a wall bounce the velocity is already
- *   reversed, so the projection moves *away* from the wall — it can
- *   never escape the pixel boundary by more than ~1 tick worth of travel,
- *   which is sub-cell and invisible.  The clamp below catches any
- *   floating-point edge cases anyway.
- *
- * WHY not store prev_px/prev_py and lerp between them:
- *   For constant-velocity elastic bounces, forward extrapolation from
- *   the current state is numerically identical to interpolation between
- *   prev and current.  It requires no extra fields in Ball.
- *   If you add gravity or non-linear forces, switch to prev/current lerp.
- *
- * This is the ONLY function that calls px_to_cell_x/y.
- * Physics above never sees cell coordinates.
- * Drawing below never sees pixel coordinates.
+ * This is the only place pixel positions get turned into terminal cells.
  */
 static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
                        float alpha, float dt_sec) {
@@ -439,24 +273,11 @@ static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
   for (int i = 0; i < s->n; i++) {
     const Ball *b = &s->balls[i];
 
-    /*
-     * Interpolated draw position.
-     * Project the ball forward by (alpha * dt_sec) seconds from
-     * its last ticked position using its current velocity.
-     *
-     * alpha = sim_accum / tick_ns   (computed in the main loop)
-     *
-     * Example: sim runs at 60 Hz (tick every 16.67 ms).
-     *   Render fires 10 ms after last tick → alpha ≈ 0.60
-     *   A ball at px=100 with vx=300 px/s:
-     *     draw_px = 100 + 300 * 0.60 * (1/60) = 100 + 3.0 = 103
-     *   Without interpolation it would draw at 100 — 3 px behind.
-     *   At CELL_W=8, 3px = 0.375 cells of lag, visible as stutter.
-     */
+    /* Slide the ball forward by the leftover fraction of a step. */
     float draw_px = b->px + b->vx * alpha * dt_sec;
     float draw_py = b->py + b->vy * alpha * dt_sec;
 
-    /* Clamp interpolated position to pixel boundary (safety net) */
+    /* Keep that nudge from poking past the edges, just in case. */
     if (draw_px < 0.0f)
       draw_px = 0.0f;
     if (draw_px > max_px)
@@ -469,7 +290,7 @@ static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
     int cx = px_to_cell_x(draw_px);
     int cy = px_to_cell_y(draw_py);
 
-    /* Clamp to visible cell area */
+    /* And keep the cell on screen. */
     if (cx < 0)
       cx = 0;
     if (cx >= cols)
@@ -485,43 +306,20 @@ static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
   }
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen ── */
 
 /*
- * Screen — the ncurses display layer.
+ * Current terminal size, refreshed whenever the window changes.
  *
- * Architecture: ONE window (stdscr), ONE flush (doupdate).
+ *   cols, rows   width and height of the terminal in cells
  *
- * Why no second WINDOW at all:
- *
- *   ncurses maintains two virtual screens internally:
- *     curscr  — what ncurses believes is on the physical terminal now
- *     newscr  — the target state you are building this frame
- *
- *   Every mvwaddch/werase/wattron writes into newscr.
- *   doupdate() computes (newscr - curscr), sends only changed cells,
- *   then sets curscr = newscr.
- *
- *   This IS the double buffer. It is always present. It is not optional.
- *   Adding your own back/front WINDOW pair creates a third virtual screen
- *   that ncurses does not know about, breaking the diff accuracy and
- *   producing ghost trails.
- *
- * The correct model:
- *   erase()                — clear newscr (the "back buffer")
- *   mvwaddch(stdscr, …)    — write scene into newscr
- *   mvwprintw(stdscr, …)   — write HUD into newscr (same buffer, last)
- *   wnoutrefresh(stdscr)   — mark newscr ready (no terminal I/O yet)
- *   doupdate()             — one write: send diff to terminal
- *
- * HUD is written into stdscr after balls so it overwrites any ball
- * that happens to be on the HUD row — correct Z-order, no separate window.
- *
- * No flicker:  ncurses' diff engine never shows a partial frame.
- * No ghost:    curscr is always accurate — one source of truth.
- * No tear:     doupdate() is one atomic write to the terminal fd.
+ * We draw everything onto the one screen ncurses gives us (stdscr) and let it
+ * do its own behind-the-scenes double-buffering: it remembers what's already
+ * on the terminal and, when we flush, only sends the cells that changed. So
+ * there's no flicker and no need to juggle our own pair of buffers — and we
+ * deliberately don't, since a homemade buffer ncurses doesn't know about
+ * would just leave ghost trails. We draw the balls, then the status line on
+ * top, then flush once.
  */
 typedef struct {
   int cols;
@@ -535,7 +333,7 @@ static void screen_init(Screen *s) {
   curs_set(0);
   nodelay(stdscr, TRUE);
   keypad(stdscr, TRUE);
-  typeahead(-1); /* never interrupt output to check for input    */
+  typeahead(-1); /* don't pause drawing to peek at the keyboard — avoids tearing */
   color_init();
   getmaxyx(stdscr, s->rows, s->cols);
 }
@@ -547,32 +345,22 @@ static void screen_free(Screen *s) {
 
 static void screen_resize(Screen *s) {
   endwin();
-  refresh(); /* re-reads LINES and COLS      */
+  refresh(); /* makes ncurses pick up the new window size */
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
 /*
- * screen_draw() — build the complete frame in stdscr (newscr).
- *
- * alpha   — render interpolation factor ∈ [0.0, 1.0)
- * dt_sec  — fixed sim tick duration in seconds (needed for extrapolation)
- *
- * Order:
- *   1. erase()      — clear newscr so stale ball positions become spaces
- *   2. scene_draw() — write all balls into newscr at interpolated positions
- *   3. HUD line     — write status bar into newscr, top-right corner
- *                     (drawn last so it is always on top)
- *
- * Nothing reaches the terminal until screen_present() is called.
+ * Build one full frame: wipe the screen, draw the balls, then lay the status
+ * line on top. Drawing the HUD last means it always wins over any ball
+ * sitting on the same row. Nothing actually shows until screen_present runs.
  */
 static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
                         float alpha, float dt_sec) {
   erase();
 
-  /* balls — drawn at interpolated positions */
   scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
-  /* HUD — written directly into stdscr after balls */
+  /* Status line, on top of the balls. */
   char buf[HUD_COLS + 1];
   snprintf(buf, sizeof buf, "%5.1f fps  balls:%-2d  %s  spd:%d", fps, sc->n,
            sc->paused ? "PAUSED " : "running", sim_fps);
@@ -584,21 +372,26 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
   attroff(COLOR_PAIR(3) | A_BOLD);
 }
 
-/*
- * screen_present() — flush newscr to terminal.
- *
- * wnoutrefresh(stdscr) — copy stdscr into ncurses' newscr model
- * doupdate()           — diff newscr vs curscr, one write, update curscr
- */
+/* Push the finished frame to the terminal in one go. */
 static void screen_present(void) {
   wnoutrefresh(stdscr);
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app ── */
 
+/*
+ * Everything the program holds onto while running.
+ *
+ *   scene        the balls and pause state
+ *   screen       current terminal size
+ *   sim_fps      how many physics steps per second
+ *   running      cleared by Ctrl-C / quit to break the main loop
+ *   need_resize  set when the terminal changes size; handled next frame
+ *
+ * The two flags are touched from signal handlers, so they're sig_atomic_t —
+ * safe to read and write from inside a signal.
+ */
 typedef struct {
   Scene scene;
   Screen screen;
@@ -708,21 +501,21 @@ int main(void) {
 
   while (app->running) {
 
-    /* ── resize ──────────────────────────────────────────────── */
+    /* Window changed size? Re-measure and pull stray balls back inside. */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
       sim_accum = 0;
     }
 
-    /* ── dt ──────────────────────────────────────────────────── */
+    /* How long since the last frame? Cap it so a hiccup can't snowball. */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
     if (dt > 100 * NS_PER_MS)
       dt = 100 * NS_PER_MS;
 
-    /* ── sim accumulator ─────────────────────────────────────── */
+    /* Run as many fixed physics steps as the elapsed time has earned. */
     int64_t tick_ns = TICK_NS(app->sim_fps);
     float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
 
@@ -733,35 +526,15 @@ int main(void) {
     }
 
     /*
-     * ── render interpolation alpha ────────────────────────────
-     *
-     * sim_accum is the leftover nanoseconds after draining all
-     * complete ticks — i.e. how far we are into the *next* tick
-     * that has not fired yet.
-     *
-     * alpha = sim_accum / tick_ns  ∈ [0.0, 1.0)
-     *
-     * alpha = 0.0 → render fires exactly on a tick boundary
-     *               draw position == physics position  (no change)
-     * alpha = 0.9 → render fires 90% of the way through the tick
-     *               draw position is projected 90% of a tick ahead
-     *
-     * Passed to screen_draw → scene_draw, which adds
-     *   ball.vx * alpha * dt_sec  to each ball's draw_px.
-     *
-     * When paused, alpha is still computed but ball velocities
-     * are non-zero — however scene_tick is skipped, so physics
-     * positions do not change, and the projected draw position
-     * creeps slightly.  This is imperceptible (< 1 cell drift
-     * over the pause duration) and correct behaviour —
-     * extrapolation from a frozen state converges to zero effect
-     * once alpha wraps around on the next tick boundary.
-     * If you want pixel-perfect freeze, zero alpha when paused:
-     *   float alpha = app->scene.paused ? 0.0f : ...
+     * How far we are into the next physics step that hasn't run yet, as a
+     * fraction from 0 up to 1. The draw code uses it to slide each ball that
+     * much further along so the motion looks smooth between steps. (While
+     * paused this can make a ball drift a hair, but it's well under one cell
+     * and snaps back on the next step.)
      */
     float alpha = (float)sim_accum / (float)tick_ns;
 
-    /* ── FPS counter ─────────────────────────────────────────── */
+    /* Keep a running frames-per-second figure for the status line. */
     frame_count++;
     fps_accum += dt;
     if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -771,16 +544,16 @@ int main(void) {
       fps_accum = 0;
     }
 
-    /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+    /* Hold steady at 60 fps. Sleep before drawing so write time can't drift. */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
-    /* ── draw + present (one doupdate flush) ─────────────────── */
+    /* Draw the frame and send it to the terminal. */
     screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps, alpha,
                 dt_sec);
     screen_present();
 
-    /* ── input ───────────────────────────────────────────────── */
+    /* Read one keypress, if any. */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;

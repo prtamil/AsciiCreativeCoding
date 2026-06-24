@@ -1,140 +1,19 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * spring_pendulum.c  —  ncurses ASCII spring pendulum
+ * spring_pendulum.c  —  a weight on a stretchy spring, drawn in ASCII
  *
- * A mass hangs from a fixed pivot at the top centre via a spring that
- * can both rotate (pendulum) and stretch/compress (spring motion).
- * When ω_spring ≈ 2 × ω_pendulum the two modes exchange energy and
- * the bob traces a complex rosette path before slowly settling.
+ * A weight hangs from a fixed point at the top from a spring that can both
+ * swing side to side (like a pendulum) and bounce up and down (like a
+ * spring). When the bounce is about twice as fast as the swing, the two
+ * motions trade energy back and forth and the weight traces a looping
+ * flower-like path before slowly settling.
  *
- * Physics: polar-coordinate spring pendulum (Lagrangian mechanics).
+ * Ten built-in presets go from a plain swinging pendulum to wild,
+ * never-repeating chaos. The math is the classic "elastic pendulum"; for
+ * the full story see Lynch 2002 and Goldstein's "Classical Mechanics".
  *
- *   r   — current spring length  (pixels)
- *   θ   — angle from downward vertical  (rad, + = right)
- *
- *   Equations of motion (y-axis positive downward):
- *     r̈  =  r·θ̇²  +  g·cos θ  −  (k/m)·(r − r₀)  −  d·ṙ
- *     θ̈  =  −[g·sin θ + 2·ṙ·θ̇] / r  −  d·θ̇
- *
- *   Integration: semi-implicit (symplectic) Euler.
- *     Velocities are updated first, then positions.
- *     Conserves the symplectic structure — no long-term energy drift.
- *
- * The Preset table drives the initial conditions AND the constants
- * (k, g, damping, rest length) — same code, ten very different motions
- * from a simple straight pendulum to chaotic large-angle coupling.
- *
- * Coordinate spaces (same convention as bounce_ball.c):
- *   Pixel space  — square, CELL_W × CELL_H sub-pixels per cell.
- *                  All physics lives here.
- *   Cell space   — terminal columns and rows.
- *                  Only drawing converts to cell coords.
- *
- * Rendering (three independent tricks layered):
- *   1. Fixed-step sim + render interpolation: sim ticks at 120 Hz,
- *      frames render at ~60 Hz.  (prev_r, prev_θ) is the state at the
- *      end of the previous tick; the draw state lerps between prev_*
- *      and current with alpha = sim_accum / tick_ns.  See [6].
- *   2. Bresenham line rasterisation between spring-coil nodes — the
- *      glyph per step ('\' '/' '-' '|') is chosen from the local step
- *      direction so the spring stays visually connected at any angle.
- *   3. ncurses internal double buffer (newscr / curscr) — erase()
- *      clears the back buffer in memory only; wnoutrefresh()+doupdate()
- *      writes ONE diff to the terminal per frame, eliminating flicker.
- *
- * Keys:
- *   q / ESC   quit
- *   space     pause / resume
- *   r         reset (re-apply current preset's initial conditions)
- *   n / p     next / previous preset (10 presets, simple → very complex)
- *   t / T     next / previous theme   (10 themes)
- *   ]  [      decrease / increase damping
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra spring_pendulum.c -o spring_pendulum
- * -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config    — every tunable constant
- *   §2  clock     — monotonic ns clock + sleep
- *   §3  color     — 10 themes; HUD pairs fixed across themes
- *   §4  coords    — pixel↔cell conversion; aspect-ratio fix
- *   §5  pendulum  — state struct + EOM phase helpers + tick orchestrator
- *   §6  presets   — 10 named regimes (ICs + constants + pedagogical context)
- *   §7  scene     — composition + Bresenham helpers + scene_draw layers
- *                   (bar → wire → coils → nodes → bob)
- *   §8  screen    — single stdscr; CLAUDE.md HUD layout
- *   §9  app       — dt loop, input, resize, cleanup
+ * Sister file: bounce_ball.c shares the pixel-vs-cell coordinate setup.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Symplectic (semi-implicit) Euler integration.
- *                  Update velocities ṙ, θ̇ from accelerations r̈, θ̈ first,
- *                  then update positions r, θ using the new velocities.
- *                  This "leapfrog" ordering conserves a modified Hamiltonian
- *                  — bounded energy error, no secular drift.  See [4].
- *
- * Physics        : Spring pendulum (elastic pendulum / "swinging spring").
- *                  Two coupled oscillators in polar coordinates:
- *                    Pendulum mode ω_pend   = √(g/r₀)
- *                    Spring   mode ω_spring = √(k/m)
- *                  At ω_spring ≈ 2·ω_pend (parametric 2:1 resonance):
- *                  energy flows periodically between the two modes — the bob
- *                  traces a spirograph-like rosette before slowly reversing.
- *                  Full beat / precession analysis in Lynch 2002 [3].
- *
- * Math           : Polar-coordinate Lagrangian equations of motion.
- *                  Coriolis-like term 2·ṙ·θ̇/r in θ̈ comes from the
- *                  non-inertial polar frame.  Singular at r → 0 — hence the
- *                  radial clamp at 0.2·r₀ with velocity-zero stop, otherwise
- *                  high-energy presets (SLINGSHOT) pump unbounded angular
- *                  velocity through the 1/r term over a few oscillations.
- *
- * Rendering      : Three independent tricks layered together:
- *                    (1) Fixed-step sim + render interpolation: sim at
- *                        120 Hz, frames at ~60 Hz, draw state lerps from
- *                        (prev_r, prev_θ) to (r, θ) by alpha = sim_accum
- *                        / tick_ns.  Smooth motion regardless of frame
- *                        jitter.  Method from Fiedler [6].
- *                    (2) Bresenham line rasterisation [7] between spring
- *                        coil nodes — glyph per step ('\' '/' '-' '|')
- *                        picked from local step direction so the line
- *                        stays visually connected at any angle.
- *                    (3) ncurses internal double-buffer [8] — erase()
- *                        clears the back buffer in memory only;
- *                        wnoutrefresh()+doupdate() writes one diff to the
- *                        terminal per frame, eliminating flicker.
- *
- * References     :  [1] Goldstein, Poole & Safko, "Classical Mechanics",
- *                       3rd ed. (Addison-Wesley 2002) — Lagrangian
- *                       polar-coordinate EOM derivation, chap. 1-2.
- *                   [2] Hand & Finch, "Analytical Mechanics" (CUP 1998) §6
- *                       — coupled oscillators and parametric resonance.
- *                   [3] Lynch, P. (2002), "The Swinging Spring: A Simple
- *                       Model of Atmospheric Balance", Large-Scale
- *                       Atmosphere-Ocean Dynamics II, CUP — canonical
- *                       2:1-resonance analysis for the elastic pendulum.
- *                   [4] Hairer, Lubich, Wanner, "Geometric Numerical
- *                       Integration", 2nd ed. (Springer 2006) §VI —
- *                       symplectic-Euler bounded-energy theorem.
- *                   [5] Bender & Orszag, "Advanced Mathematical Methods
- *                       for Scientists and Engineers" (McGraw-Hill 1978)
- *                       ch. 11 — parametric resonance asymptotics.
- *                   [6] Fiedler, G., "Fix Your Timestep!" (2004) —
- *                       gafferongames.com/post/fix_your_timestep, the
- *                       definitive fixed-step + interpolation writeup.
- *                   [7] Bresenham, J. E. (1965), "Algorithm for computer
- *                       control of a digital plotter", IBM Syst. J. 4(1)
- *                       pp. 25-30 — the integer line rasteriser used for
- *                       the spring coil between nodes.
- *                   [8] Raymond, E. S., "NCURSES Programming HOWTO" —
- *                       tldp.org/HOWTO/NCURSES-Programming-HOWTO, covers
- *                       the newscr/curscr diff buffer used in scene_draw.
- *                   [9] https://en.wikipedia.org/wiki/Elastic_pendulum
- *                  [10] https://en.wikipedia.org/wiki/Symplectic_integrator
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -152,52 +31,44 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
-  SIM_FPS_DEFAULT = 120, /* high rate — spring ODEs need small steps  */
+  SIM_FPS_DEFAULT = 120, /* the spring math needs tiny time steps to stay stable */
   SIM_FPS_MIN = 30,
   SIM_FPS_MAX = 120,
 
   FPS_UPDATE_MS = 500,
 
-  N_COILS = 8, /* spring coils drawn between pivot and bob  */
+  N_COILS = 8, /* how many spring coils we draw between the top and the weight */
 
   N_THEMES = 10,
   N_PRESETS = 10,
 
-  THEME_DEFAULT = 2,  /* OCEANIC                                   */
-  PRESET_DEFAULT = 4, /* RES-2:1 (the classic spirograph orbit)    */
+  THEME_DEFAULT = 2,  /* OCEANIC */
+  PRESET_DEFAULT = 4, /* RES-2:1, the classic looping-flower orbit */
 
-  /* CLAUDE.md HUD layout:
-   *   row 0       — right-aligned bright-yellow + BOLD status
-   *   row 1       — left-aligned  bright-yellow  no-bold  parameters
-   *   row rows-1  — left-aligned  bright-cyan   + BOLD    key hint
-   *   The bar lives just inside the field (row HUD_ROWS_TOP); the pivot
-   *   sits one cell below the bar.                                       */
+  /* Two rows are reserved at the top for the readout, one at the bottom for
+   * the key hint. The horizontal bar sits on the top reserved row; the point
+   * the spring hangs from is one cell below it. */
   HUD_ROWS_TOP = 2,
   HUD_ROWS_BOT = 1,
 };
 
 /*
- * CELL_W / CELL_H — sub-pixel resolution per terminal cell.
- * Must match the terminal cell aspect ratio (~2 tall : 1 wide).
- * Physics uses pixel units; cell coords only appear in the draw step.
+ * How many sub-pixels make up one terminal cell. A cell is about twice as
+ * tall as it is wide, so we split it 8 wide by 16 tall and do all the physics
+ * in these sub-pixels; only drawing rounds back to whole cells.
  */
 #define CELL_W 8
 #define CELL_H 16
 
-/*
- * COIL_SPREAD — perpendicular half-width of the spring zigzag, pixels.
- * Two cells wide on each side of the spring axis.
- */
+/* How far the spring zigzag swings out to either side of the centre line. */
 #define COIL_SPREAD (CELL_W * 2)
 
 /*
- * Damping bounds.  Default value is per-preset; the user can still nudge
- * it with [ and ] while a preset is running.  Clamped to [MIN, MAX].
+ * How strongly the motion is slowed by drag. Each preset picks its own
+ * starting value; [ and ] nudge it live, kept inside these limits.
  */
 #define DAMPING_STEP 0.02f
 #define DAMPING_MIN 0.00f
@@ -207,9 +78,7 @@ enum {
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -227,16 +96,14 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3 color ── */
 
 /*
- * 5 colour-pair slots.  The four scene pairs (BAR / WIRE / SPRING / BALL)
- * are repainted by theme_apply().  The two HUD pairs are fixed across
- * themes so the status text and key hint always read clearly — bright
- * yellow (226) on default bg for the top status / params, bright cyan
- * (51) for the bottom hint, both with A_BOLD.
+ * The colour slots the program paints with. The four scene slots (the bar,
+ * the straight wire, the spring, the weight) get repainted when you switch
+ * themes. The two readout slots never change so the text always stays easy
+ * to read on any animation: bright yellow for the status and parameters,
+ * bright cyan for the bottom key hint.
  */
 enum {
   CP_BAR = 1,
@@ -248,48 +115,34 @@ enum {
 };
 
 /*
- * Theme — a palette bundle for ONE of the 10 named looks (MATRIX, FIRE …).
+ * One colour scheme for the whole picture — picked from 10 named looks like
+ * MATRIX or FIRE. Each scheme just names a colour for the four things that
+ * change colour: the top bar, the straight wire, the spring, and the weight.
+ * The readout colours are deliberately left out here so they never change.
  *
- * Intent
- *   The four scene elements that change colour per theme are exactly the
- *   four colour pairs CP_BAR / CP_WIRE / CP_SPRING / CP_BALL.  Themes do
- *   NOT touch CP_HUD or CP_HINT — those stay bright-yellow / bright-cyan
- *   forever so the readout stays legible against any animation.  This
- *   separation is mandated by the CLAUDE.md HUD spec.
- *
- * Why two palette tracks
- *   bar256 … ball256 are 256-colour cube/gray-ramp indices used when the
- *   terminal supports it (COLORS >= 256).  bar8 … ball8 are the 8-colour
- *   fallbacks (one of COLOR_RED, COLOR_GREEN, …).  Picking by terminal
- *   capability at init time means the demo renders cleanly on PuTTY's
- *   8-colour default and on a modern xterm-256color session alike.
- *
- * Brightness rule (CLAUDE.md "Theme Palette Brightness")
- *   Every 256-index in this table sits at ≥ 24 in the cube or ≥ 240 in
- *   the gray ramp.  Anything in 16–23 or 232–239 reads as black against
- *   the terminal's default background and becomes invisible.
- *
- * Reference [8] ESR's NCURSES HOWTO §6 explains init_pair() semantics.
+ * Two colours are listed for each thing because terminals differ. The 256
+ * ones are used on modern terminals; the plain 8 (red, green, …) are the
+ * fallback so it still looks right on an old 8-colour terminal. Every 256
+ * colour was chosen from the bright half of the palette so even the dimmest
+ * one stays visible against a black background.
  */
 typedef struct {
-  const char *name; /* short ASCII label shown in HUD            */
-  /* 256-colour palette (preferred path)                                */
-  short bar256;    /* CP_BAR  — pivot bar across the top        */
-  short wire256;   /* CP_WIRE — straight stubs pivot↔coil↔bob   */
-  short spring256; /* CP_SPRING — coil nodes + connecting lines */
-  short ball256;   /* CP_BALL — the iron bob "(@)"              */
-  /* 8-colour fallback (low-COLORS terminals)                           */
+  const char *name; /* short label shown in the readout */
+
+  /* preferred colours on a 256-colour terminal */
+  short bar256;    /* the horizontal bar across the top */
+  short wire256;   /* the straight wire stubs joining bar, spring, and weight */
+  short spring256; /* the spring coils and their connecting lines */
+  short ball256;   /* the weight, drawn as "(@)" */
+
+  /* fallback colours on an 8-colour terminal, same order */
   short bar8;
   short wire8;
   short spring8;
   short ball8;
 } Theme;
 
-/*
- * Ten themes.  Each entry has been kept inside the safe-brightness band
- * (cube ≥ 24, gray ≥ 240) so even the "dim" wire colour stays visible
- * over a black background per CLAUDE.md theme rules.
- */
+/* The ten colour schemes you cycle through with t / T. */
 static const Theme k_themes[N_THEMES] = {
     {"MATRIX", /* 256 */ 46, 28, 82, 154,
      /* 8   */ COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN},
@@ -330,14 +183,12 @@ static void color_init(int theme) {
   theme_apply(theme);
 }
 
-/* ===================================================================== */
-/* §4  coords — the one place aspect ratio is handled                     */
-/* ===================================================================== */
+/* ── §4 coords ── */
 
 /*
- * Same pixel↔cell convention as bounce_ball.c.
- * Physics operates entirely in pixel space.
- * px_to_cell_x/y are the only calls that cross into cell space.
+ * The one place we deal with cells being taller than they are wide. Physics
+ * runs in fine sub-pixels; px_to_cell_x/y are the only spots that round back
+ * to whole terminal cells. Same setup as bounce_ball.c.
  */
 static inline int pw(int cols) { return cols * CELL_W; }
 static inline int ph(int rows) { return rows * CELL_H; }
@@ -352,133 +203,114 @@ static inline int px_to_cell_y(float py) {
 /* Forward declaration — preset table defined in §6, used by §5. */
 typedef struct Preset Preset;
 
-/* ===================================================================== */
-/* §5  pendulum                                                           */
-/* ===================================================================== */
+/* ── §5 pendulum ── */
 
 /*
- * Pendulum — complete spring-pendulum state.
+ * Pendulum — everything we know about the weight right now.
  *
- * Coordinate system: polar (r, θ) with origin AT THE PIVOT.
- *   ball_px = pivot_px + r · sin(θ)
- *   ball_py = pivot_py + r · cos(θ)        (y axis positive downward)
+ * We describe where the weight is using two numbers measured from the
+ * pivot point at the top: how long the spring is (r) and which way it
+ * leans (theta, the angle off straight-down). This pairing is natural
+ * because those two things — stretch and swing — are exactly the two
+ * motions a stretchy pendulum has. The screen position falls right out:
+ *   x = pivot_x + r·sin(theta)
+ *   y = pivot_y + r·cos(theta)   (y grows downward on a terminal)
  *
- * Why polar instead of Cartesian
- *   The natural degrees of freedom of an elastic pendulum are exactly the
- *   spring length r and the swing angle θ.  In Cartesian (x, y) we would
- *   have to enforce the spring extension as a derived quantity each step;
- *   in polar coordinates the EOM derived from the Lagrangian decomposes
- *   cleanly into one radial and one angular equation [1] Goldstein, §1-2;
- *   [3] Lynch 2002.
+ * We keep speeds as well as positions because the motion equations are
+ * the kind that need both to step forward in time. Storing the speeds
+ * directly (rather than guessing them from the last position) is what
+ * keeps the simulation's energy from quietly drifting off over minutes.
  *
- * Why velocities AND positions are stored
- *   The EOM is 2nd-order — the symplectic Euler integrator [4] needs the
- *   full state (r, θ, ṙ, θ̇).  Storing ṙ / θ̇ explicitly (instead of
- *   deriving them from successive positions) is what makes the integrator
- *   *symplectic* rather than just "finite-difference Verlet".
+ * prev_r / prev_theta are only a drawing aid — the physics never reads
+ * them. Each step stashes the old position so the drawing code can slide
+ * smoothly between the last step and the new one, so motion looks fluid
+ * even though the physics ticks faster than the screen redraws.
  *
- * Why prev_r / prev_theta exist
- *   Pure render aid — they are NOT used by the physics step.  Each tick
- *   snapshots the previous (r, θ) so scene_draw can lerp between
- *   (prev_r, prev_θ) and (r, θ) by alpha = sim_accum / tick_ns.  This
- *   decouples the 120 Hz sim from the ~60 Hz render and gives sub-tick
- *   smoothness.  See [6] Fiedler, "Fix Your Timestep!".
+ * The spring constants live inside each weight (not as global #defines)
+ * because every preset sets its own stiffness, gravity, and so on. That
+ * way the step function only ever reads from the weight handed to it.
  *
- * Why the constants live PER INSTANCE
- *   Each preset reconfigures (spring_k, gravity, damping, r₀, …) so they
- *   cannot be #define-level globals.  Keeping them inside Pendulum means
- *   pendulum_tick reads only from its argument — no global state, easy
- *   to reason about and trivially reentrant if we ever want a second bob.
+ * For the physics of the swinging spring see Lynch 2002 and Goldstein's
+ * Classical Mechanics, §1-2.
  */
 typedef struct {
-  /* ── State (the EOM unknowns) ─────────────────────────────────── */
-  float r;     /* current spring length (pixels), > 0          */
-  float theta; /* angle from downward vertical (rad, + = right)*/
+  /* Where the weight is, measured from the pivot. */
+  float r;     /* spring length in pixels, always > 0                */
+  float theta; /* lean angle off straight-down, radians (+ = right)  */
 
-  /* ── Velocities (full state for 2nd-order ODE) ────────────────── */
-  float r_dot;  /* radial velocity        (px/s)                */
-  float th_dot; /* angular velocity       (rad/s)               */
+  /* How fast those two are changing right now. */
+  float r_dot;  /* stretch speed, pixels per second                  */
+  float th_dot; /* swing speed, radians per second                   */
 
-  /* ── Render-interpolation snapshot (NOT read by physics) ──────── */
-  float prev_r;     /* r at the end of the previous tick            */
-  float prev_theta; /* theta at the end of the previous tick        */
+  /* Last step's position, kept only so drawing can blend between
+   * frames. The physics never touches these. */
+  float prev_r;
+  float prev_theta;
 
-  /* ── Fixed pivot in pixel space (recomputed only on SIGWINCH) ─── */
-  float pivot_px; /* horizontal pivot,   pw(cols) / 2             */
-  float pivot_py; /* vertical pivot, one cell below the top bar   */
+  /* The fixed point at the top the spring hangs from, in pixels.
+   * Only recomputed when the terminal is resized. */
+  float pivot_px; /* centre column of the field                     */
+  float pivot_py; /* one cell below the top bar                     */
 
-  /* ── Per-preset physical constants (mass = 1 throughout) ──────── */
-  float r0;       /* natural rest length of the spring (px)       */
-  float spring_k; /* spring stiffness; ω_spring = √k              */
-  float gravity;  /* g, in px/s²; ω_pend = √(g/r₀)                */
-  float damping;  /* linear damping on both ṙ and θ̇               */
+  /* The spring's character — each preset fills these in (weight = 1). */
+  float r0;       /* the spring's relaxed length in pixels           */
+  float spring_k; /* stiffness: bigger = snappier bounce             */
+  float gravity;  /* downward pull, pixels per second squared        */
+  float damping;  /* drag that slowly bleeds off both motions        */
 } Pendulum;
 
 static void pendulum_init(Pendulum *p, int cols, int rows, const Preset *pr);
 
-/* ── Phase 0: snapshot for render interpolation ─────────────────────── *
- * Save (r, θ) so scene_draw can lerp from this frame's starting state to
- * the new state after the tick — see [6] Fiedler.  Pure render aid;
- * nothing physics-side reads prev_*.                                    */
+/* Remember where the weight is before we move it, so drawing can slide
+ * smoothly from the old spot to the new one. */
 static inline void snapshot_state_for_interpolation(Pendulum *p) {
   p->prev_r = p->r;
   p->prev_theta = p->theta;
 }
 
-/* ── Phase 1a: radial Lagrangian EOM ────────────────────────────────── *
- *   r̈ = r·θ̇²  +  g·cos θ  −  k·(r − r₀)  −  d·ṙ
- *   ┊    ┊         ┊            ┊              ┊
- *   ┊    ┊         ┊            ┊              └─ linear damping
- *   ┊    ┊         ┊            └──────────────── Hooke's-law spring
- *   ┊    ┊         └──────────────────────────── gravity (radial proj)
- *   ┊    └────────────────────────────────────── centripetal (pseudo)
- *   See [1] Goldstein §1-2 for the polar Lagrangian derivation.         */
+/* How fast the spring's stretch is changing — the up/down "bounce" push.
+ * Four pulls add up: the swing trying to fling the weight outward, gravity
+ * pulling along the spring, the spring pulling back toward its rest length,
+ * and drag slowing the stretch. See Goldstein, Classical Mechanics §1-2. */
 static inline float compute_radial_acceleration(const Pendulum *p) {
   return p->r * p->th_dot * p->th_dot + p->gravity * cosf(p->theta) -
          p->spring_k * (p->r - p->r0) - p->damping * p->r_dot;
 }
 
-/* ── Phase 1b: angular Lagrangian EOM ───────────────────────────────── *
- *   θ̈ = −[ g·sin θ + 2·ṙ·θ̇ ] / r  −  d·θ̇
- *           ┊             ┊       ┊        ┊
- *           ┊             ┊       ┊        └─── damping on θ̇
- *           ┊             ┊       └──────────── 1/r term — singular at
- *           ┊             ┊                     r → 0, tamed by the
- *           ┊             ┊                     radial clamp below
- *           ┊             └──────────────────── Coriolis-like coupling
- *           └────────────────────────────────── gravity (tangential)   */
+/* How fast the swing is changing — the side-to-side push. Gravity tries to
+ * pull the weight back toward straight-down, and stretching while swinging
+ * speeds up or slows the swing (a skater pulling their arms in spins faster).
+ * Dividing by the spring length is why a very short spring would misbehave,
+ * which is what the length clamp below guards against. */
 static inline float compute_angular_acceleration(const Pendulum *p) {
   return -(p->gravity * sinf(p->theta) + 2.f * p->r_dot * p->th_dot) / p->r -
          p->damping * p->th_dot;
 }
 
-/* ── Phase 2: symplectic-Euler step 1 — velocities advance first ────── *
- * The "leapfrog" ordering (velocities BEFORE positions) is what makes
- * the integrator symplectic.  It conserves a modified Hamiltonian and
- * gives bounded energy error to all orders.  See [4] Hairer §VI.        */
+/* Nudge the two speeds forward a tiny step using the pushes we just found.
+ * Updating speeds BEFORE positions (next function) is the trick that keeps
+ * the simulation's energy from slowly drifting off over long runs — the
+ * weight keeps swinging believably for minutes. See Hairer, Geometric
+ * Numerical Integration §VI. */
 static inline void integrate_velocities_symplectic(Pendulum *p, float r_ddot,
                                                    float th_ddot, float dt) {
   p->r_dot += r_ddot * dt;
   p->th_dot += th_ddot * dt;
 }
 
-/* ── Phase 3: symplectic-Euler step 2 — positions use NEW velocities ── *
- * The defining feature of semi-implicit Euler: positions are advanced
- * from the just-updated velocities, equivalent to leapfrog up to a
- * half-step phase shift.                                                */
+/* Now move the weight using the just-updated speeds. Using the new speeds
+ * (not the old ones) is the second half of the energy-stable trick above. */
 static inline void integrate_positions_from_new_velocities(Pendulum *p,
                                                            float dt) {
   p->r += p->r_dot * dt;
   p->theta += p->th_dot * dt;
 }
 
-/* ── Phase 4: keep r out of the 1/r singularity ─────────────────────── *
- * r is clamped to [0.20·r₀, 3.5·r₀].  At each wall the radial velocity
- * pointing INTO the wall is zeroed (inelastic stop) so the bob does not
- * keep injecting momentum frame after frame.  Energy lost here is the
- * cost of staying numerically bounded for high-energy presets like
- * SLINGSHOT — without it the angular EOM's 1/r term pumps θ̇ to
- * arbitrarily large values within a few oscillations.                   */
+/* Don't let the spring get too short or stretch too far. The swing math
+ * blows up if the spring shrinks to nothing, so we pin the length between
+ * sane limits. When the weight hits a limit we also stop it pushing further
+ * into the wall, otherwise it would keep pumping energy every frame and the
+ * wild presets (like SLINGSHOT) would spin out of control. */
 static inline void enforce_radial_clamp_with_inelastic_stop(Pendulum *p) {
   const float r_min = p->r0 * 0.20f;
   const float r_max = p->r0 * 3.5f;
@@ -495,15 +327,11 @@ static inline void enforce_radial_clamp_with_inelastic_stop(Pendulum *p) {
 }
 
 /*
- * pendulum_tick — ONE symplectic-Euler step of the elastic-pendulum EOM.
- *
- * Pseudocode of the orchestrator below:
- *   snapshot the current state for render interpolation
- *   r̈ ← radial   EOM          (centripetal + gravity + spring + damping)
- *   θ̈ ← angular  EOM          (gravity + Coriolis − damping, has 1/r)
- *   ṙ, θ̇ ← integrate velocities (symplectic order: velocity FIRST)
- *   r, θ ← integrate positions  (using the NEW velocities)
- *   clamp r away from the polar singularity, zero ṙ at the wall
+ * Move the weight forward by one tiny time step. The order matters:
+ *   remember where we are (so drawing can blend frames)
+ *   work out the bounce push and the swing push
+ *   update both speeds first, then the position (keeps energy stable)
+ *   keep the spring length sane so the swing math doesn't blow up
  */
 static void pendulum_tick(Pendulum *p, float dt) {
   snapshot_state_for_interpolation(p);
@@ -517,169 +345,91 @@ static void pendulum_tick(Pendulum *p, float dt) {
   enforce_radial_clamp_with_inelastic_stop(p);
 }
 
-/* ===================================================================== */
-/* §6  presets                                                            */
-/* ===================================================================== */
+/* ── §6 presets ── */
 
 /*
- * Preset — one named "regime" of the elastic pendulum.
+ * Preset — one ready-made "flavour" of motion the user picks with n/p.
  *
- * Intent
- *   A preset is what the user picks with n/p.  It is NOT just an
- *   initial-conditions vector — each preset bundles the FULL setup that
- *   makes its motion look qualitatively different: the four state ICs
- *   (θ₀, r/r₀, ṙ₀, θ̇₀) AND the four physical constants (k, g, damping,
- *   rest length).  This is essential because the conceptual difference
- *   between, say, ELLIPSE and CIRCLE is not just velocity — it's also
- *   the spring stiffness that decides whether the spring "fights back"
- *   or stays nearly rigid.  Lynch [3] classifies the elastic pendulum's
- *   dynamical regimes by exactly these parameter ratios.
+ * A preset isn't just a starting position. It bundles the whole setup that
+ * makes its motion look different: where the weight starts and how fast it's
+ * already moving, plus the spring's character (stiffness, gravity, drag, rest
+ * length). That full bundle matters — the difference between, say, the ELLIPSE
+ * and CIRCLE flavours isn't only the starting spin, it's also how stiff the
+ * spring is, which decides whether it springs back or stays nearly rigid.
  *
- * Ordering
- *   The k_presets[] table is sorted simple → very complex so n cycles
- *   through a teaching progression:
- *     1 PENDULUM (1 mode) → 2 SPRING (1 mode) → 3 ELLIPSE (linear 2D) →
- *     4 CIRCLE (centripetal balance) → 5,6 RES (resonance) →
- *     7 PRECESS → 8 SLINGSHOT → 9 CHAOS → 10 DECAY.
+ * The table is ordered simplest → wildest so tapping n walks you through a
+ * little tour: a plain swing, a plain bounce, then the two motions mixing in
+ * ever more interesting ways, ending in chaos and a slow settle.
  *
- * Frequency rule of thumb (50-row terminal, field_h ≈ 47 rows ≈ 752 px):
- *   r₀       = rest_len_frac · 752 px
- *   ω_pend   = √(g / r₀)             [pendulum mode]
- *   ω_spring = √(k)        (m = 1)   [spring mode]
- *
- * Reference
- *   [3] Lynch, P. (2002), "The Swinging Spring" — full regime taxonomy.
+ * The classic study of this "swinging spring" and its flavours is
+ * Lynch, "The Swinging Spring" (2002).
  */
 struct Preset {
-  const char *name; /* short ASCII label shown in HUD            */
+  const char *name; /* short label shown in the readout          */
 
-  /* ── State at t = 0 (initial conditions) ──────────────────────── */
-  float theta0_deg; /* initial angle in degrees from vertical    */
-  float r_stretch;  /* r_init / r₀  (1.0 = exactly at rest len)  */
-  float r_dot0;     /* initial radial velocity   (px/s)          */
-  float th_dot0;    /* initial angular velocity  (rad/s)         */
+  /* Where the weight starts and how it's already moving. */
+  float theta0_deg; /* starting lean angle, degrees off straight-down */
+  float r_stretch;  /* starting length as a multiple of rest length (1.0 = relaxed) */
+  float r_dot0;     /* starting bounce speed,  pixels per second  */
+  float th_dot0;    /* starting swing speed,   radians per second */
 
-  /* ── Physical constants (consumed by pendulum_tick) ───────────── */
-  float spring_k;      /* spring stiffness; ω_spring = √k           */
-  float gravity;       /* g in px/s²;       ω_pend  = √(g/r₀)       */
-  float damping;       /* linear damping on ṙ and θ̇                 */
-  float rest_len_frac; /* r₀ as fraction of field-pixel height      */
+  /* The spring's character (handed straight to the physics step). */
+  float spring_k;      /* stiffness: bigger = snappier, faster bounce */
+  float gravity;       /* downward pull, pixels per second squared    */
+  float damping;       /* drag that slowly bleeds off the motion      */
+  float rest_len_frac; /* relaxed length as a fraction of the field height */
 };
 
 static const Preset k_presets[N_PRESETS] = {
-    /* ─────────────────────────────────────────────────────────────────
-     *  1 PENDULUM
-     *  Rigid-spring limit.  k = 400 puts ω_spring ≈ 20 rad/s far above
-     *  ω_pend = √(g/r₀) ≈ 2.5 rad/s, so the spring stays nearly at rest
-     *  length and all energy lives in the swing.  Initial 25° is well
-     *  inside the small-angle (sin θ ≈ θ) regime so the motion is a
-     *  clean simple-harmonic swing with period 2π·√(r₀/g) ≈ 2.5 s.
-     *  Pedagogy: the baseline against which every other preset compares.
-     * ───────────────────────────────────────────────────────────────── */
+    /* 1 PENDULUM — the baseline. A very stiff spring barely stretches, so
+     * almost all the motion is a clean side-to-side swing, like a clock
+     * pendulum. The simplest thing to watch; everything else is a variation. */
     {"PENDULUM", 25.0f, 1.00f, 0.0f, 0.0f, 400.0f, 2000.0f, 0.05f, 0.40f},
 
-    /* ─────────────────────────────────────────────────────────────────
-     *  2 SPRING
-     *  Pure radial mode.  θ₀ = 0 and θ̇₀ = 0 leave nothing to break the
-     *  vertical symmetry, so g·sin θ ≡ 0 and the angular EOM gives
-     *  θ̈ = 0 forever.  The bob bounces straight down/up with
-     *  ω_spring = √30 ≈ 5.5 rad/s.
-     *  Pedagogy: no coupling means no rosette — just a hanging weight.
-     * ───────────────────────────────────────────────────────────────── */
+    /* 2 SPRING — the opposite of PENDULUM. It starts hanging dead straight
+     * with no sideways push, so it only bounces straight up and down and
+     * never swings. Just a weight bobbing on a spring. */
     {"SPRING", 0.0f, 1.60f, 0.0f, 0.0f, 30.0f, 2000.0f, 0.05f, 0.40f},
 
-    /* ─────────────────────────────────────────────────────────────────
-     *  3 ELLIPSE
-     *  Linear 2-D harmonic oscillator.  Small tangential nudge
-     *  (θ̇₀ = 2 rad/s) with the spring near rest length and k = 120
-     *  (stiff enough that r barely changes) produces a slowly-rotating
-     *  ellipse — the textbook 2-D simple-harmonic motion.
-     *  Pedagogy: in the limit k → ∞ the elastic pendulum collapses to a
-     *  plain 2-D harmonic oscillator [1] Goldstein §3-3.
-     * ───────────────────────────────────────────────────────────────── */
+    /* 3 ELLIPSE — give it a small sideways nudge on a fairly stiff spring and
+     * the weight traces a slowly-turning oval, like a marble circling the rim
+     * of a bowl. The simplest mix of swinging and a touch of stretch. */
     {"ELLIPSE", 30.0f, 1.00f, 0.0f, 2.0f, 120.0f, 2000.0f, 0.00f, 0.40f},
 
-    /* ─────────────────────────────────────────────────────────────────
-     *  4 CIRCLE
-     *  Centripetal balance.  Spinning at θ̇₀ = 5 rad/s with r = 1.2·r₀
-     *  and k = 220, the spring tension k·(r − r₀) supplies just enough
-     *  inward force to nearly balance gravity at all angles.  Zero
-     *  damping → the orbit is stable indefinitely.  r₀ shortened to
-     *  0.30·field so the orbit fits visibly on a small terminal.
-     *  Pedagogy: a Hooke's-law spring sustains a circle just as well as
-     *  the inverse-square law does (Bertrand's theorem [1] §3-6).
-     * ───────────────────────────────────────────────────────────────── */
+    /* 4 CIRCLE — spin it fast enough and the spring's pull-back exactly
+     * balances the spin, so the weight whirls around in a steady circle, like
+     * a ball on a string swung overhead. No drag, so it keeps going. */
     {"CIRCLE", 0.0f, 1.20f, 0.0f, 5.0f, 220.0f, 2000.0f, 0.00f, 0.30f},
 
-    /* ─────────────────────────────────────────────────────────────────
-     *  5 RES-2:1
-     *  Parametric 2:1 resonance — the canonical "swinging spring" of
-     *  Lynch 2002 [3].  With r₀ = 0.40·field and k = 25 on a 50-row
-     *  terminal:
-     *      ω_pend  = √(2000 / r₀) ≈ 2.50 rad/s
-     *      ω_spring = √25         = 5.00 rad/s  →  ratio = 2.00 ✓
-     *  Energy slowly transfers between the two modes; the bob traces a
-     *  rosette that contracts, reverses, and re-expands every ~10 s.
-     *  Pedagogy: the textbook example of a parametric resonator.
-     * ───────────────────────────────────────────────────────────────── */
+    /* 5 RES-2:1 — the star of the show. The bounce here runs about twice as
+     * fast as the swing, and at that magic ratio the two motions feed each
+     * other: energy sloshes back and forth so the path keeps tightening into a
+     * flower, reversing, and opening back up every ten seconds or so. */
     {"RES-2:1", 40.0f, 1.15f, 0.0f, 0.0f, 25.0f, 2000.0f, 0.06f, 0.40f},
 
-    /* ─────────────────────────────────────────────────────────────────
-     *  6 RES-3:1
-     *  3:1 parametric resonance.  k bumped to 56 → ω_spring ≈ 7.5 ≈
-     *  3·ω_pend.  Higher-order resonances exist but with smaller
-     *  energy-transfer amplitudes per mode-coupling order, so the
-     *  rosette is denser and the breathing is subtler than the 2:1 case.
-     *  Pedagogy: not every integer ratio gives equally dramatic beating.
-     * ───────────────────────────────────────────────────────────────── */
+    /* 6 RES-3:1 — same idea as RES-2:1 but the bounce runs three times as
+     * fast as the swing. The two motions still trade energy, but more weakly,
+     * so the flower is denser and the breathing in and out is gentler. */
     {"RES-3:1", 40.0f, 1.10f, 0.0f, 0.0f, 56.0f, 2000.0f, 0.06f, 0.40f},
 
-    /* ─────────────────────────────────────────────────────────────────
-     *  7 PRECESS
-     *  Driven precession.  Fast spin (θ̇₀ = 3 rad/s) with a very stiff
-     *  spring (k = 300) keeps r close to r₀; the small residual radial
-     *  breathing drives a slow rotation of the orbital ellipse's major
-     *  axis.  Damping = 0 lets the precession run indefinitely.
-     *  Pedagogy: analogous to the Foucault-pendulum plane drift, but the
-     *  drift is driven by internal elastic coupling, not Earth rotation.
-     * ───────────────────────────────────────────────────────────────── */
+    /* 7 PRECESS — a spinning oval whose long axis slowly rotates, so the whole
+     * pattern turns like the hands of a clock. The tiny leftover bounce in a
+     * stiff spring is what nudges it around, little by little. */
     {"PRECESS", 30.0f, 1.00f, 0.0f, 3.0f, 300.0f, 2000.0f, 0.00f, 0.35f},
 
-    /* ─────────────────────────────────────────────────────────────────
-     *  8 SLINGSHOT
-     *  Energetic snap-in.  Released from r = 2.5·r₀ with the spring
-     *  pre-loaded.  Initial spring PE = ½·k·(1.5·r₀)² ≈ 1.45 M px²/s²
-     *  for a 50-row terminal.  Bob whips inward fast, reflects off the
-     *  0.20·r₀ radial clamp (see pendulum_tick → the 1/r-singularity
-     *  fix), then oscillates radially with slow decay at d = 0.04.
-     *  Pedagogy: energy initially stored in the spring redistributes
-     *  between modes via the Coriolis-like 2ṙθ̇/r coupling.
-     * ───────────────────────────────────────────────────────────────── */
+    /* 8 SLINGSHOT — starts pulled way out with the spring loaded like a
+     * catapult. It whips inward fast, gets caught by the short-length limit,
+     * then bounces and swings as the stored energy spreads into the swing. */
     {"SLINGSHOT", 30.0f, 2.50f, 0.0f, 0.0f, 30.0f, 2000.0f, 0.04f, 0.35f},
 
-    /* ─────────────────────────────────────────────────────────────────
-     *  9 CHAOS
-     *  Past the small-angle horizon.  120° puts the bob nearly inverted
-     *  at t = 0 where sin θ is large and the angular EOM is firmly
-     *  nonlinear.  Add 1 rad/s spin and zero damping and the trajectory
-     *  is non-repeating in any practical sense — sensitive to ICs, no
-     *  symmetries, no closed orbits.
-     *  Pedagogy: "small-angle ≠ small motion".  Large-angle pendulums are
-     *  chaotic; their phase-space trajectories never close.
-     * ───────────────────────────────────────────────────────────────── */
+    /* 9 CHAOS — start it almost upside-down with a spin and no drag. The
+     * motion never repeats and never settles into a pattern; the smallest
+     * change in the start would send it somewhere completely different. */
     {"CHAOS", 120.0f, 1.40f, 0.0f, 1.0f, 25.0f, 2000.0f, 0.00f, 0.40f},
 
-    /* ─────────────────────────────────────────────────────────────────
-     * 10 DECAY
-     *  Over-damped collapse.  d = 0.50 (5/8 of DAMPING_MAX) bleeds energy
-     *  faster than the modes can couple — by the time 2:1 beating would
-     *  start, both modes are already attenuated.  High damping
-     *  linearises the response and the bob spirals to rest along its
-     *  slowest exponential.
-     *  Pedagogy: useful as a clean "watch it stop" reference; also
-     *  illustrates that damping eventually wins over every conservative
-     *  coupling, no matter how clever the ICs are.
-     * ───────────────────────────────────────────────────────────────── */
+    /* 10 DECAY — heavy drag. Whatever it starts doing, friction wins quickly
+     * and the weight spirals to a dead stop. A calm "watch it settle" ending
+     * to the tour. */
     {"DECAY", 80.0f, 1.50f, 0.0f, 1.5f, 25.0f, 2000.0f, 0.50f, 0.40f},
 };
 
@@ -704,75 +454,39 @@ static void pendulum_init(Pendulum *p, int cols, int rows, const Preset *pr) {
   p->prev_theta = p->theta;
 }
 
-/* ===================================================================== */
-/* §7  scene                                                              */
-/* ===================================================================== */
+/* ── §7 scene ── */
 
 /*
- * Scene — the single owner of everything that lives on screen.
+ * Scene — the one place the physics and the drawing meet.
  *
- * Intent
- *   Scene is the integration point between the PHYSICS (a Pendulum that
- *   doesn't know what a terminal is) and the RENDERING (an ncurses
- *   surface that doesn't know what an EOM is).  The two layers never
- *   talk directly — they meet here.  Anything that doesn't need to live
- *   in either Pendulum or Screen lives in Scene.
+ * The Pendulum doesn't know what a terminal is, and the drawing code doesn't
+ * know any physics. Scene holds both plus the few odds and ends (which preset,
+ * which theme, paused or not) that don't belong to either. The fields are
+ * grouped by who reads them so it stays obvious which side touches what — if a
+ * drawing-only field ever leaked into the physics step, the motion would start
+ * depending on the window size, which is exactly the bug this layout prevents.
  *
- * Locality (sim vs render)
- *   The fields below are explicitly grouped so a reader can tell at a
- *   glance which subsystem reads each one.  When in doubt: if scene_tick
- *   reads it → simulation; if scene_draw / hud_draw reads it → rendering;
- *   if BOTH read it (cols, rows) → geometry.  Mis-classifying a field is
- *   a source of subtle bugs — a "render" field accidentally read by the
- *   tick would couple physics to the terminal extent, defeating the
- *   sim/render separation that fixed-step + interpolation rests on [6].
- *
- *   The Pendulum itself is the LARGEST piece of simulation state; it's
- *   composed-in rather than allocated separately so a Scene is one
- *   compact struct on the stack (or in BSS as part of g_app).
- *
- * Why these specific fields and no others
- *   - pend                — the only mutable physics state we own.
- *   - preset_idx          — needed by scene_tick? no.  Needed by reset
- *                            ('r') and by HUD?  yes.  Lives here because
- *                            it is "control state" — user choice that
- *                            outlives any single frame.
- *   - paused              — control flag for scene_tick.
- *   - cols, rows          — geometry, shared by sim (pivot placement,
- *                            r₀ computation) and render (clip bounds,
- *                            HUD positioning).  Updated only on resize.
- *   - theme_idx           — pure-render user choice; outlives a resize.
- *
- * Things that DO NOT live here
- *   - Frame timing (sim_accum, frame_count)         → in main()
- *   - Signal flags (running, need_resize)           → in App
- *   - Render buffers                                → owned by ncurses
- *   - Pivot pixel coords                            → in Pendulum
- *   - Active sim FPS                                → in App
+ * Things that live elsewhere on purpose: frame timing is in main(), the
+ * signal flags and sim rate are in App, the pivot point is in Pendulum, and
+ * ncurses owns the actual screen buffer.
  */
 typedef struct {
-  /* ── Geometry  (shared by simulation AND rendering) ───────────── *
-   * Terminal cell extent.  pendulum_init reads these to place the   *
-   * pivot at pw(cols)/2 and to compute r₀ as a fraction of pixel-   *
-   * space field height.  scene_draw and hud_draw read these as      *
-   * clip bounds and HUD row positions.  Reset on SIGWINCH.          */
+  /* Window size in cells — read by both the physics (to place the pivot and
+   * size the spring) and the drawing (to clip and position the readout).
+   * Only changes when the terminal is resized. */
   int cols;
   int rows;
 
-  /* ── Simulation  (read by scene_tick) ─────────────────────────── *
-   * The actual mechanics state plus the control flags that gate it. *
-   * preset_idx is technically "control" (selects which row of       *
-   * k_presets[] reset reloads from), but it is grouped with sim     *
-   * because it survives a theme change unchanged.                   */
+  /* The physics state and the flags that gate it. preset_idx is really a user
+   * choice, but it's grouped here because it picks which preset 'r' reloads
+   * and it survives a theme change untouched. */
   Pendulum pend;
-  int preset_idx; /* 0 .. N_PRESETS-1                          */
-  bool paused;    /* if true scene_tick is a no-op             */
+  int preset_idx; /* which preset, 0 .. N_PRESETS-1            */
+  bool paused;    /* when true the physics step does nothing   */
 
-  /* ── Rendering  (read by scene_draw / hud_draw only) ──────────── *
-   * Pure-render user choice.  Changing theme_idx must NEVER touch   *
-   * the simulation — it just calls theme_apply() to repaint the     *
-   * colour pairs.  Survives SIGWINCH unchanged.                     */
-  int theme_idx; /* 0 .. N_THEMES-1                           */
+  /* Pure drawing choice — changing the theme only repaints colours, it never
+   * touches the physics. Survives a resize untouched. */
+  int theme_idx; /* which colour scheme, 0 .. N_THEMES-1      */
 } Scene;
 
 static void scene_init(Scene *s, int cols, int rows, int preset_idx,
@@ -790,22 +504,22 @@ static void scene_tick(Scene *s, float dt) {
     pendulum_tick(&s->pend, dt);
 }
 
-/* ── drawing helpers ─────────────────────────────────────────────────── */
+/* ── drawing helpers ── */
 
 /*
- * Bresenham integer-DDA state.  Just the bookkeeping needed by the
- * original 1965 algorithm [7]: per-axis distances, per-axis unit step
- * direction, and the residual that triggers each axis advance.
+ * Bookkeeping for drawing a straight line one cell at a time, using only
+ * integer math (Bresenham's line algorithm, 1965). It tracks how far apart
+ * the endpoints are, which way to step on each axis, and a running tally that
+ * decides when to step sideways versus down.
  */
 typedef struct {
-  int dx, dy; /* |x1-x0|, |y1-y0|             */
-  int sx, sy; /* unit step ±1 in each axis    */
-  int err;    /* cumulative slope residual    */
+  int dx, dy; /* horizontal and vertical distance between the endpoints */
+  int sx, sy; /* step direction on each axis, +1 or -1                  */
+  int err;    /* running tally that triggers the next step              */
 } BresenhamState;
 
-/* Initialise the DDA state for a line from (x0,y0) to (x1,y1).
- * Reference [7] Bresenham 1965, IBM Syst. J., the 4-quadrant symmetric
- * formulation. */
+/* Set up the line-drawing state for a line from (x0,y0) to (x1,y1).
+ * Bresenham 1965, IBM Systems Journal. */
 static inline void bresenham_init(BresenhamState *b, int x0, int y0, int x1,
                                   int y1) {
   b->dx = abs(x1 - x0);
@@ -815,11 +529,9 @@ static inline void bresenham_init(BresenhamState *b, int x0, int y0, int x1,
   b->err = b->dx - b->dy;
 }
 
-/* Pick the glyph from the LOCAL step direction so the line looks
- * connected at any slope:
- *     both axes advance  → '/' (anti-diagonal) or '\' (diagonal)
- *     x-only step        → '-'
- *     y-only step        → '|'                                          */
+/* Pick the character for this step so the line looks connected at any angle:
+ * a slash when moving diagonally, a dash when moving sideways, a bar when
+ * moving straight down. */
 static inline chtype slope_glyph(const BresenhamState *b) {
   int e2 = 2 * b->err;
   bool step_x = (e2 > -b->dy);
@@ -832,8 +544,8 @@ static inline chtype slope_glyph(const BresenhamState *b) {
   return '|';
 }
 
-/* Plot only inside the field rect [0, cols) × [HUD_TOP, rows-HUD_BOT)
- * so the spring never overdraws the HUD rows. */
+/* Draw only inside the play area so the spring never paints over the readout
+ * rows at the top or the key hint at the bottom. */
 static inline void plot_clipped(int x, int y, chtype glyph, attr_t attr,
                                 int cols, int rows) {
   int ymin = HUD_ROWS_TOP;
@@ -845,8 +557,8 @@ static inline void plot_clipped(int x, int y, chtype glyph, attr_t attr,
   attroff(attr);
 }
 
-/* Advance the DDA one cell along the dominant axis (or both axes if the
- * residual permits a diagonal step). */
+/* Step one cell toward the endpoint — sideways, down, or both for a diagonal,
+ * whichever the running tally calls for. */
 static inline void bresenham_advance(BresenhamState *b, int *x, int *y) {
   int e2 = 2 * b->err;
   if (e2 > -b->dy) {
@@ -859,16 +571,8 @@ static inline void bresenham_advance(BresenhamState *b, int *x, int *y) {
   }
 }
 
-/*
- * draw_line — slope-glyph Bresenham line, clipped to the field rect.
- *
- * Pseudocode:
- *   bresenham_init
- *   loop:
- *       plot current cell with slope_glyph, clipped to the field
- *       if at endpoint, break
- *       bresenham_advance
- */
+/* Draw a straight line between two cells, stepping one cell at a time and
+ * stopping at the endpoint, kept inside the play area. */
 static void draw_line(int x0, int y0, int x1, int y1, int cols, int rows,
                       attr_t attr) {
   BresenhamState b;
@@ -882,22 +586,24 @@ static void draw_line(int x0, int y0, int x1, int y1, int cols, int rows,
   }
 }
 
-/* A polar sample (r, θ).  Used as the render-interpolated draw state. */
+/* A length-and-angle pair — the smoothed position the drawing code uses. */
 typedef struct {
   float r, theta;
 } PolarSample;
 
-/* The spring's local 2-D basis at angle θ.  axis points pivot→bob,
- * perp is 90° CCW from axis.  Both unit vectors. */
+/* Two directions for laying out the spring at a given lean: "axis" points
+ * straight down the spring from the top to the weight, and "perp" points
+ * sideways across it. We zigzag the coils along axis, offset by perp. */
 typedef struct {
   float ax, ay;
   float perp_x, perp_y;
 } SpringBasis;
 
-/* ── Geometry helpers ────────────────────────────────────────────── */
+/* ── geometry helpers ── */
 
-/* Sub-tick render interpolation: blend (prev_r, prev_θ) → (r, θ).
- * alpha ∈ [0,1): fraction of the next tick elapsed.  [6] Fiedler.       */
+/* Blend last step's position toward this step's, so motion looks smooth even
+ * though the physics ticks faster than we redraw. alpha goes 0 → 1 as the next
+ * tick approaches. See Fiedler, "Fix Your Timestep". */
 static inline PolarSample lerp_polar_state(const Pendulum *p, float alpha) {
   PolarSample s;
   s.r = p->prev_r + (p->r - p->prev_r) * alpha;
@@ -905,17 +611,16 @@ static inline PolarSample lerp_polar_state(const Pendulum *p, float alpha) {
   return s;
 }
 
-/* Polar (r, θ) anchored at pixel pivot → cell coordinates.
- *   ball_px = pivot_px + r·sin θ
- *   ball_py = pivot_py + r·cos θ      (y positive downward)              */
+/* Turn a length-and-angle from the pivot into a cell on screen — basic
+ * trigonometry, remembering that rows count downward. */
 static inline void polar_to_cell(float pivot_px, float pivot_py, float r,
                                  float theta, int *cx, int *cy) {
   *cx = px_to_cell_x(pivot_px + r * sinf(theta));
   *cy = px_to_cell_y(pivot_py + r * cosf(theta));
 }
 
-/* Clamp the bob cell to the visible field rect (pure display clip; the
- * physics position is not modified).                                    */
+/* Keep the drawn weight inside the play area. This only nudges where it's
+ * drawn — the real physics position is left alone. */
 static inline void clamp_bob_to_field(int *cx, int *cy, int cols, int rows) {
   int ymin = HUD_ROWS_TOP + 1;
   int ymax = rows - HUD_ROWS_BOT - 1;
@@ -929,8 +634,8 @@ static inline void clamp_bob_to_field(int *cx, int *cy, int cols, int rows) {
     *cy = ymax;
 }
 
-/* Build the spring's local frame: unit axis pivot→bob, unit perpendicular
- * 90° CCW.  Length normalisation is free because sin²+cos²=1.            */
+/* Work out the down-the-spring and across-the-spring directions for the
+ * current lean, ready for laying out the coils. */
 static inline SpringBasis compute_spring_basis(float theta) {
   SpringBasis b;
   b.ax = sinf(theta);
@@ -940,9 +645,9 @@ static inline SpringBasis compute_spring_basis(float theta) {
   return b;
 }
 
-/* Lay out 2·N_COILS spring nodes along the axis with alternating
- * ±COIL_SPREAD perpendicular offsets.  Parameter t = (i+1)/(N+1) keeps
- * the endpoints free for the wire stubs at pivot and bob.               */
+/* Place the zigzag points of the spring evenly down its length, kicking each
+ * one alternately left and right to make the coils. The very ends are left
+ * just short so the short straight wires can join up to the pivot and weight. */
 static inline void lay_out_zigzag_coils(const Pendulum *p, float draw_r,
                                         SpringBasis basis, float *node_px,
                                         float *node_py, int n_nodes) {
@@ -956,11 +661,11 @@ static inline void lay_out_zigzag_coils(const Pendulum *p, float draw_r,
   }
 }
 
-/* ── Layer painters (back → front so each layer can overwrite the
- *    cells of the layer beneath it) ──────────────────────────────── */
+/* ── layer painters ── */
+/* Painted back to front, so each layer can cover up the one beneath it. */
 
-/* Layer 1: horizontal pivot bar at row HUD_ROWS_TOP with a 'v' marker
- * pointing down to the actual pivot column. */
+/* The bar across the top the spring hangs from, with a 'v' marking the exact
+ * spot the spring attaches. */
 static inline void draw_pivot_bar(int cols, int pivot_cx) {
   attron(COLOR_PAIR(CP_BAR) | A_BOLD);
   for (int x = 0; x < cols; x++)
@@ -970,15 +675,14 @@ static inline void draw_pivot_bar(int cols, int pivot_cx) {
   attroff(COLOR_PAIR(CP_BAR) | A_BOLD);
 }
 
-/* Layers 2 & 4: a straight wire stub (Bresenham line in CP_WIRE).  Same
- * routine for both stubs — only the endpoints differ. */
+/* A short straight wire — one joins the top bar to the spring, the other joins
+ * the spring to the weight. Same routine, just different endpoints. */
 static inline void draw_wire_stub(int x0, int y0, int x1, int y1, int cols,
                                   int rows) {
   draw_line(x0, y0, x1, y1, cols, rows, COLOR_PAIR(CP_WIRE));
 }
 
-/* Layer 3: Bresenham segments between adjacent coil nodes — these form
- * the zigzag legs of the spring. */
+/* Draw the zigzag legs of the spring by joining each coil point to the next. */
 static inline void draw_coil_segments(const float *node_px,
                                       const float *node_py, int n_nodes,
                                       int cols, int rows) {
@@ -991,8 +695,8 @@ static inline void draw_coil_segments(const float *node_px,
   }
 }
 
-/* Layer 5: a '*' glyph at every coil node.  Drawn AFTER the segments so
- * the node cell is unambiguous even when several segments cross it. */
+/* Mark each coil point with a '*'. Drawn after the legs so the corners stay
+ * clear even where several legs cross the same cell. */
 static inline void draw_coil_nodes(const float *node_px, const float *node_py,
                                    int n_nodes, int cols, int rows) {
   int ymin = HUD_ROWS_TOP + 1;
@@ -1007,8 +711,8 @@ static inline void draw_coil_nodes(const float *node_px, const float *node_py,
   attroff(COLOR_PAIR(CP_SPRING) | A_BOLD);
 }
 
-/* Layer 6: the iron bob "(@)", drawn last so its three cells are
- * unambiguous over any wire/spring glyphs underneath. */
+/* The weight itself, drawn as "(@)". Drawn last so it sits cleanly on top of
+ * any wire or spring underneath. */
 static inline void draw_iron_bob(int bob_cx, int bob_cy, int cols) {
   attron(COLOR_PAIR(CP_BALL) | A_BOLD);
   if (bob_cx > 0 && bob_cx < cols - 1) {
@@ -1022,21 +726,9 @@ static inline void draw_iron_bob(int bob_cx, int bob_cy, int cols) {
 }
 
 /*
- * scene_draw — composite spring-pendulum frame.
- *
- * Pseudocode (each line is one named helper):
- *   draw_state ← lerp_polar_state(prev, curr, alpha)
- *   pivot_cell ← px_to_cell(pivot_px, pivot_py)
- *   bob_cell   ← polar_to_cell(pivot, draw_state); clamp_bob_to_field
- *   basis      ← compute_spring_basis(draw_theta)
- *   nodes      ← lay_out_zigzag_coils(pivot, draw_r, basis)
- *   ── paint back-to-front so each layer overwrites the one beneath ──
- *   draw_pivot_bar
- *   draw_wire_stub (pivot → first coil)
- *   draw_coil_segments
- *   draw_wire_stub (last coil → bob)
- *   draw_coil_nodes
- *   draw_iron_bob
+ * Draw one whole frame: figure out the smoothed position, work out where the
+ * pivot, weight, and coils land on screen, then paint the bar, wires, spring,
+ * and weight from back to front.
  */
 static void scene_draw(const Scene *s, float alpha) {
   const Pendulum *p = &s->pend;
@@ -1074,38 +766,24 @@ static void scene_draw(const Scene *s, float alpha) {
   draw_iron_bob(bob_cx, bob_cy, cols);
 }
 
-/* ===================================================================== */
-/* §8  screen                                                             */
-/* ===================================================================== */
+/* ── §8 screen ── */
 
 /*
- * Screen — terminal-extent record + an implicit ncurses double-buffer.
+ * Screen — just the terminal's size in cells.
  *
- * Intent
- *   Screen is deliberately tiny.  The actual back-buffer (newscr) and
- *   front-buffer (curscr) live inside ncurses; we only carry the cell
- *   dimensions so callers can clip and place HUD rows.  Everything else
- *   ncurses owns — we never call mvprintw against a private buffer.
+ * It's deliberately tiny. ncurses keeps the actual off-screen copy of the
+ * picture for us; all we need to remember is how wide and tall the terminal
+ * is, so the rest of the code knows where to clip and where to put the
+ * readout rows.
  *
- * Render pipeline (one frame)
- *   erase()              clears newscr in memory only, NO terminal I/O
- *   scene_draw()         writes spring + bob → newscr
- *   hud_draw()           writes status / params / hint → newscr (last,
- *                        so HUD always wins overlap with the spring)
- *   wnoutrefresh(stdscr) marks newscr ready, STILL no terminal I/O
- *   doupdate()           ONE atomic diff (newscr vs curscr) → terminal
- *
- * Why one buffer is enough
- *   A second user-managed buffer would just duplicate what ncurses
- *   already does.  The diff in doupdate() only emits the cells that
- *   changed since the last frame, which is what eliminates flicker —
- *   you cannot improve on that by writing your own back-buffer.
- *
- * Reference [8] ESR's NCURSES HOWTO §11 covers the newscr/curscr model.
+ * A frame goes: erase the off-screen copy, draw the spring and weight onto it,
+ * draw the readout last so it always wins, then let ncurses send only the
+ * cells that actually changed to the real terminal. Sending only the changes
+ * is what keeps the display from flickering.
  */
 typedef struct {
-  int cols; /* terminal width  in cells (getmaxyx)          */
-  int rows; /* terminal height in cells (getmaxyx)          */
+  int cols; /* terminal width in cells   */
+  int rows; /* terminal height in cells  */
 } Screen;
 
 static void screen_init(Screen *s, int theme) {
@@ -1132,26 +810,22 @@ static void screen_resize(Screen *s) {
 }
 
 /*
- * hud_draw() — three HUD elements per CLAUDE.md spec.
- *
- *   row 0       — right-aligned bright-yellow + BOLD: fps + preset + state
- *   row 1       — left-aligned  bright-yellow no-bold: pendulum parameters
- *   row rows-1  — left-aligned  bright-cyan   + BOLD: complete key hint
- *
- * The bottom hint lists every interactive key (q, spc, r, n/p, t/T, [/]).
+ * Draw the readout: frame rate, preset, and paused state across the top right;
+ * the current angle, stretch, and spring settings on the line below; and the
+ * full list of keys along the bottom.
  */
 static void hud_draw(Screen *s, const Scene *sc, double fps) {
   const Pendulum *p = &sc->pend;
   float deg = p->theta * (float)(180.0 / M_PI);
-  /* normalise displayed angle to [-180, 180] so the readout stays bounded
-   * even when the pendulum spins past full revolutions (CHAOS / CIRCLE). */
+  /* Wrap the shown angle into -180..180 so the number stays sane even when the
+   * weight spins round and round (as in CHAOS or CIRCLE). */
   while (deg > 180.f)
     deg -= 360.f;
   while (deg <= -180.f)
     deg += 360.f;
   float stretch = (p->r - p->r0) / p->r0 * 100.0f;
 
-  /* ── row 0: right-aligned status ──────────────────────────────── */
+  /* top right: frame rate, preset, paused state */
   char status[80];
   int pn = sc->preset_idx + 1;
   snprintf(status, sizeof status, " %5.1f fps  PRESET %2d %-10s  %s ", fps, pn,
@@ -1163,7 +837,7 @@ static void hud_draw(Screen *s, const Scene *sc, double fps) {
   mvprintw(0, hx, "%s", status);
   attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-  /* ── row 1: left-aligned parameters ───────────────────────────── */
+  /* second line: angle, stretch, and the spring settings */
   char params[160];
   snprintf(params, sizeof params,
            " theta:%+6.1f deg  dr:%+6.1f%%  damp:%.2f  "
@@ -1174,7 +848,7 @@ static void hud_draw(Screen *s, const Scene *sc, double fps) {
   mvprintw(1, 0, "%s", params);
   attroff(COLOR_PAIR(CP_HUD));
 
-  /* ── row rows-1: left-aligned key hint ────────────────────────── */
+  /* bottom line: every key you can press */
   attron(COLOR_PAIR(CP_HINT) | A_BOLD);
   mvprintw(s->rows - 1, 0,
            " q:quit  spc:pause  r:reset  n/p:preset  t/T:theme  [/]:damp ");
@@ -1192,48 +866,28 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §9  app                                                                */
-/* ===================================================================== */
+/* ── §9 app ── */
 
 /*
- * App — top-level container, lives in BSS as the single g_app instance.
+ * App — the one top-level box holding the whole program. There's a single
+ * global copy so the signal handlers (which can't be handed a pointer) and the
+ * main loop can both reach it.
  *
- * Intent
- *   The signal handlers (on_exit_signal, on_resize_signal) need to
- *   reach SOMETHING that the main loop polls.  Stashing it on the
- *   stack inside main() would force handlers to use globals anyway,
- *   so we just declare g_app globally and let handlers and main()
- *   share it.
+ * The two flags are how a signal talks to the loop: a handler flips a bit, the
+ * loop checks it next time round and does the real work. They're typed and
+ * marked the special way the C standard demands so a handler can safely touch
+ * them and the loop always reads the fresh value instead of a stale copy.
  *
- * Why the volatile sig_atomic_t flags
- *   POSIX requires signal handlers touch only sig_atomic_t variables
- *   and only with simple writes — any wider type or operation is
- *   undefined.  `volatile` forces every read in the main loop to go
- *   back to memory (the compiler must not cache the value into a
- *   register across signal arrival).  Together they form the standard
- *   signal-driven "wake up the main loop" pattern: handler flips a
- *   bit, main loop notices, main loop does the work in user context.
- *
- * Why sim_fps is here, not in Scene
- *   sim_fps is a frame-loop concern (it picks the inner-loop tick
- *   period TICK_NS(sim_fps)) — it has no meaning inside scene_tick
- *   which receives the resulting dt as a parameter.  Putting it in
- *   App keeps Scene free of timing details.  RENDER_FPS stays fixed
- *   at 60; only the sim rate is App-tunable.  See [6] Fiedler for
- *   the fixed-sim / variable-render rationale.
- *
- * What is NOT here
- *   No frame-timing accumulators (sim_accum, fps_accum, frame_time);
- *   those are pure locals inside main().  Bringing them here would
- *   leak loop bookkeeping into App's public footprint.
+ * sim_fps lives here rather than in Scene because it's about how often we run
+ * the physics, which is the loop's job, not the physics step's. The redraw
+ * rate stays fixed at 60; only the physics rate is adjustable.
  */
 typedef struct {
-  Scene scene;                       /* world + control state         */
-  Screen screen;                     /* terminal extent               */
-  int sim_fps;                       /* sim tick rate, 30..120 Hz     */
-  volatile sig_atomic_t running;     /* SIGINT/TERM clears this       */
-  volatile sig_atomic_t need_resize; /* SIGWINCH sets this            */
+  Scene scene;                       /* the world plus user choices   */
+  Screen screen;                     /* terminal size                 */
+  int sim_fps;                       /* physics steps per second, 30..120 */
+  volatile sig_atomic_t running;     /* quit signals clear this       */
+  volatile sig_atomic_t need_resize; /* a resize signal sets this     */
 } App;
 
 static App g_app;
@@ -1275,9 +929,8 @@ static bool app_handle_key(App *app, int ch) {
     pendulum_init(p, sc->cols, sc->rows, &k_presets[sc->preset_idx]);
     break;
 
-  /* n/p debounced ~200 ms so a held key doesn't rapid-cycle and
-   * blur the bob through every preset's initial conditions.  Single
-   * taps always pass.                                              */
+  /* Ignore repeats within 200 ms so holding n or p doesn't blur through every
+   * preset at once; single taps always go through. */
   case 'n':
   case 'N': {
     static int64_t last_ns = 0;
@@ -1350,21 +1003,21 @@ int main(void) {
 
   while (app->running) {
 
-    /* ── resize ──────────────────────────────────────────────── */
+    /* handle a pending resize */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
       sim_accum = 0;
     }
 
-    /* ── dt ──────────────────────────────────────────────────── */
+    /* time since last frame, capped so a hiccup can't make us catch up forever */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
     if (dt > 100 * NS_PER_MS)
       dt = 100 * NS_PER_MS;
 
-    /* ── sim accumulator ─────────────────────────────────────── */
+    /* run the physics in fixed little steps, however many fit in this frame */
     int64_t tick_ns = TICK_NS(app->sim_fps);
     float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
 
@@ -1375,7 +1028,7 @@ int main(void) {
     }
     float alpha = (float)sim_accum / (float)tick_ns;
 
-    /* ── FPS counter ─────────────────────────────────────────── */
+    /* update the frame-rate number a couple of times a second */
     frame_count++;
     fps_accum += dt;
     if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1385,15 +1038,15 @@ int main(void) {
       fps_accum = 0;
     }
 
-    /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+    /* hold a steady 60 fps; sleep before drawing so write time doesn't drift it */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
-    /* ── draw + present ──────────────────────────────────────── */
+    /* draw the frame and send it to the terminal */
     screen_draw(&app->screen, &app->scene, fps_display, alpha);
     screen_present();
 
-    /* ── input ───────────────────────────────────────────────── */
+    /* check for a keypress */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;

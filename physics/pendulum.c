@@ -1,179 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * pendulum.c  —  N-link chaotic pendulum (N = 1..5) terminal demo
+ * pendulum.c — a chain of 1 to 5 swinging rods that hangs from a fixed
+ * point and swings under gravity. One rod just rocks back and forth;
+ * two or more rods go chaotic — tiny differences in the start blow up
+ * fast. A dim "ghost" chain starts a hair's-breadth off the main one to
+ * show that blow-up happen live.
  *
- * A chain of N rigid rods with unit-mass bobs at each joint.  All arm
- * lengths equal L, no damping, gravity straight down.  Boots as the
- * single pendulum (N = 1, the textbook periodic setup); n adds links
- * up to N = 5, p removes them.  Each N gives qualitatively different
- * motion:
- *
- *     N = 1   simple pendulum — periodic (the textbook setup, no chaos)
- *     N = 2   double — chaotic but tame; the classic Lyapunov demo
- *     N = 3   triple — wilder, the end bob whips
- *     N = 4   quadruple — increasingly violent chaos
- *     N = 5   quintuple — fully unhinged, dramatic
- *
- *   Equations of motion (Lagrangian, equal masses m_i = 1, equal arms L):
- *
- *     M(θ) · α  =  b(θ, θ̇)
- *
- *     M[j][k]   =  L² · (N − max(j,k) + 1) · cos(θⱼ − θₖ)
- *     b[j]      = −L² · Σₖ (N − max(j,k) + 1) · sin(θⱼ − θₖ) · ωₖ²
- *                 − g · L · (N − j + 1) · sin(θⱼ)
- *
- *   Each tick: build M and b, solve M·α = b for the angular accels
- *   by Gaussian elimination with partial pivoting (≤ 5×5 system),
- *   integrate the state (θ, ω) by 4th-order Runge-Kutta.  For N=2 this
- *   reduces to the closed-form double-pendulum equations.  For N=1 it
- *   collapses to θ̈ = −(g/L)·sin θ.  The general matrix form keeps the
- *   code uniform across all N.
- *
- * Integration: 4th-order Runge-Kutta.
- *   RK4 is essential for chaotic systems — lower-order integrators
- *   (e.g. Euler) accumulate phase errors on the Lyapunov time-scale
- *   (~3–5 s) that are visually indistinguishable from real chaos.
- *
- * Chaos demo:
- *   A dim "ghost" pendulum starts with θ₁ + GHOST_EPSILON.  Both
- *   trajectories are identical at first; after ~3–5 s (N ≥ 2) they
- *   diverge completely, demonstrating sensitive dependence on initial
- *   conditions.  The HUD shows the total angular separation growing
- *   exponentially.  N = 1 is non-chaotic, so the ghost stays glued.
- *
- * Trail:
- *   The end-bob (last joint) traces a colour-faded ring-buffer trail.
- *   Recent positions are bright red/orange; older ones fade to dim grey.
- *   Reveals the complex attractor geometry as the system evolves.
- *
- * Themes (t / T cycle, 10 total): Matrix, Fire, Oceanic, Neon, Mono,
- *   Ice, Nova, Forest, Desert, Eclipse.  Drive arm / joint / bob / trail
- *   / ghost colours.  Pivot bracket and the HUD chrome (top yellow,
- *   bottom cyan) stay fixed across every theme so the structure and
- *   key list remain legible whichever palette is active.
- *
- * Keys:
- *   q / ESC   quit
- *   space     pause / resume
- *   r         reset (same initial conditions; ghost re-syncs)
- *   n / p     more / fewer links  (1..5)
- *   t / T     next / previous theme
- *   g         toggle ghost pendulum
- *   l         toggle trail (was 't' — moved so 't' can cycle theme)
- *   + =       longer trail
- *   -         shorter trail
- *   ] [       faster / slower simulation
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/pendulum.c \
- *       -o pendulum -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config
- *   §2  clock
- *   §3  color
- *   §4  coords
- *   §5  physics — StateN, deriv, RK4, NPend, npend_positions
- *   §6  scene   — Scene, trail ring-buffer, draw
- *   §7  screen
- *   §8  app
+ * The motion comes from the standard physics of a hanging chain of rods
+ * (Lagrangian mechanics). For the double pendulum see Shinbrot et al.,
+ * "Chaos in a double pendulum", Am. J. Phys. 60(6) (1992); for the
+ * chaos background, Strogatz, "Nonlinear Dynamics and Chaos" (2014).
+ * Sister file: double_pendulum.c (the fixed N = 2 case).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : 4th-order Runge-Kutta (RK4) integration of an N-link
- *                  chain whose accelerations come from solving a small
- *                  linear system each derivative evaluation.  RK4 makes
- *                  four derivative calls per step (k1..k4), so per RK4
- *                  step we solve four ≤5×5 linear systems — still cheap.
- *
- * Physics        : Lagrangian mechanics, classical chaos.
- *                  For N ≥ 2 the system is chaotic: a tiny perturbation
- *                  in θ₁ (the ghost's GHOST_EPSILON ≈ 0.057°) grows
- *                  exponentially at rate e^(λt) where λ is the Lyapunov
- *                  exponent.  Visible divergence in ~3–5 s.  N = 1 is
- *                  integrable — periodic motion, ghost never separates.
- *
- * Math           : Mass matrix M and force vector b derived from the
- *                  Lagrangian T − V for equal m_i = 1 and L_i = L.
- *                  M is symmetric and (for our initial conditions and
- *                  N ≤ 5) well-conditioned, so Gaussian elimination
- *                  with partial pivoting solves M·α = b stably.
- *
- *                    M[j][k] = (N − max(j,k) + 1) · L² · cos(θⱼ − θₖ)
- *                    b[j]    = −Σₖ (N − max(j,k) + 1) · L² · sin(θⱼ − θₖ) · ωₖ²
- *                              − g · L · (N − j + 1) · sin(θⱼ)
- *
- *                  (Indices above are 1-based to match textbook
- *                  conventions; the code uses 0-based indices, with the
- *                  factor (N − max + 1) replaced by (N − max_0idx).)
- *
- * Performance    : Render-interpolation (alpha).  Sim runs at 300 Hz,
- *                  display at ~60 Hz.  Between sim ticks the angles are
- *                  linearly interpolated by alpha ∈ [0,1] for smooth
- *                  motion without needing 300-Hz rendering.
- *
- * Data-structure : Ring-buffer trail (TRAIL_LEN positions) iterated
- *                  oldest→newest by offset arithmetic — no shifting.
- *
- * Rendering      : Arm segments rasterised by a Bresenham line walk,
- *                  glyph chosen by step direction (`-` | `|` / `\`).
- *                  Trail drawn from a ring buffer in three brightness
- *                  tiers (newest → oldest).  Render uses linear angle
- *                  interpolation between consecutive sim ticks so the
- *                  display can refresh at any rate without juddering.
- *                  Themes drive arm / joint / bob / trail / ghost
- *                  colours; pivot bracket and HUD chrome stay fixed.
- *
- * References     :
- *   • Lagrange, J. L. (1788) "Mécanique analytique", Paris.
- *     — The foundation of Lagrangian mechanics.  The M·α = b formulation
- *       we build each step descends directly from the Euler-Lagrange
- *       equations introduced here.
- *
- *   • Goldstein, H., Poole, C. P., Safko, J. L. (2001) "Classical
- *     Mechanics" (3rd ed.), Addison-Wesley.  Chapters 1-2 and 8.
- *     — Standard graduate textbook.  Cleanest modern derivation of the
- *       Lagrangian equations of motion for a chain of rigid links.
- *
- *   • Shinbrot, T., Grebogi, C., Wisdom, J., Yorke, J. A. (1992)
- *     "Chaos in a double pendulum", Am. J. Phys. 60(6), 491-499.
- *     — The canonical paper on double-pendulum chaos.  Derives the
- *       Lyapunov exponent and shows experimentally that the ghost test
- *       (two near-identical pendulums diverging exponentially) is
- *       definitive evidence of chaos.
- *
- *   • Strogatz, S. H. (2014) "Nonlinear Dynamics and Chaos: With
- *     Applications to Physics, Biology, Chemistry, and Engineering"
- *     (2nd ed.), Westview Press.
- *     — The best pedagogical introduction to chaos theory: Lyapunov
- *       exponents, sensitive dependence on initial conditions, the
- *       butterfly effect.  Ch. 9-12 specifically cover the chaotic
- *       behaviour we visualise with the ghost pendulum.
- *
- *   • Lorenz, E. N. (1963) "Deterministic Nonperiodic Flow", J.
- *     Atmospheric Sciences 20(2), 130-141.
- *     — Founded modern chaos theory.  Same sensitive-dependence result
- *       we demonstrate here, in a 3-equation atmospheric model.
- *
- *   • Press, W. H., Teukolsky, S. A., Vetterling, W. T., Flannery,
- *     B. P. (2007) "Numerical Recipes" (3rd ed.), Cambridge.  Ch. 17.
- *     — The pragmatic reference for RK4 and adaptive stepping with
- *       working code.  Start here if you want to upgrade rk4_step_n to
- *       RK45 (Dormand-Prince) or a symplectic integrator.
- *
- *   • Hairer, E., Nørsett, S. P., Wanner, G. (1993) "Solving Ordinary
- *     Differential Equations I: Nonstiff Problems" (2nd ed.), Springer.
- *     — Rigorous reference for explicit Runge-Kutta methods; error
- *       analysis and order conditions that justify why RK4's O(dt⁴)
- *       global error is enough for chaotic systems on our time-scales.
- *
- *   • Bresenham, J. E. (1965) "Algorithm for computer control of a
- *     digital plotter", IBM Systems Journal 4(1), 25-30.
- *     — Original digital line drawing.  The arm rendering in
- *       draw_line() is a direct descendant.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -191,72 +29,59 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
-  N_MAX = 5,     /* maximum number of pendulum links        */
-  N_DEFAULT = 1, /* boot configuration — single pendulum     */
-  N_THEMES = 10, /* see k_themes[] in §3                     */
+  N_MAX = 5,     /* most rods we allow in the chain          */
+  N_DEFAULT = 1, /* start with a single rod                  */
+  N_THEMES = 10, /* number of colour palettes (see §3)       */
 
-  /* 300 Hz sim gives dt ≈ 3.3 ms per RK4 step.  RK4 global error
-   * O(dt⁴) ≈ 1e-10 per step — negligible on the few-second time
-   * scales we care about.  Lower fps → visible divergence from the
-   * true trajectory in just 2–3 seconds.                                */
+  /* How many physics steps per second. Higher is more accurate; we run
+   * fast (300) because chaos punishes a sloppy integrator — drop too low
+   * and the simulated chain drifts off the true path within seconds. */
   SIM_FPS_DEFAULT = 300,
   SIM_FPS_MIN = 60,
   SIM_FPS_MAX = 600,
   SIM_FPS_STEP = 60,
 
-  TRAIL_LEN = 500, /* ring-buffer capacity (max trail positions) */
-  TRAIL_DEF = 360, /* positions drawn by default (newest 360)    */
+  TRAIL_LEN = 500, /* how many past bob positions we keep      */
+  TRAIL_DEF = 360, /* how many of them we draw by default      */
   TRAIL_MIN = 20,
   TRAIL_STEP = 20,
 
-  HUD_COLS = 64,       /* fixed-width HUD string length            */
-  FPS_UPDATE_MS = 500, /* FPS display refresh interval (ms)        */
+  HUD_COLS = 64,
+  FPS_UPDATE_MS = 500, /* how often the fps number refreshes (ms)  */
 };
 
-/* CELL_W / CELL_H — sub-pixel resolution.  Physics in pixel space;
- * terminal cells only appear in the draw step. */
+/* How many fine "pixels" fit in one terminal cell. The physics works in
+ * these pixels; we only round to whole cells at the moment we draw. */
 #define CELL_W 8
 #define CELL_H 16
 
-/*
- * MAX_REACH_FRAC — total chain length as a fraction of pixel-space
- * height (so the whole pendulum can hang fully extended without going
- * off-screen).  Each arm = MAX_REACH_FRAC / N.  At 0.44 a fully-extended
- * chain covers 44 % of screen height, matching the old double-pendulum
- * visual when N = 2.
- */
+/* How tall the fully-stretched chain is, as a fraction of the screen
+ * height, so it never hangs off the bottom. Each rod gets 1/N of this. */
 #define MAX_REACH_FRAC 0.44f
 
-/* GRAVITY_PX: acceleration in terminal pixel-space (px/s²).
- * Empirical 2000 gives a dramatic swing — the same as double_pendulum.c. */
+/* Strength of gravity, in pixels per second squared. Tuned by eye for a
+ * lively swing (same value as double_pendulum.c). */
 #define GRAVITY_PX 2000.0f
 
-/*
- * INIT_THETA_DEG — starting angle for every link, from straight-down.
- * 120° puts each arm 30° past horizontal — high energy, chaotic onset
- * within ~1 s for N ≥ 2.  All links start at the same angle so the
- * chain is initially fully extended at 120°.
- */
+/* The angle every rod starts at, measured from straight-down. 120° is
+ * well past horizontal — lots of energy, so chaos kicks in within about
+ * a second once there are two or more rods. */
 #define INIT_THETA_DEG 120.0f
 
-/* GHOST_EPSILON: initial θ₁ perturbation for the ghost (radians).
- * 0.001 rad ≈ 0.057° — within typical angle-measurement precision.
- * Demonstrates that chaos is not an artifact of large errors: even
- * this nanoscopic difference grows exponentially in ~3–5 s.            */
+/* How far the ghost's top angle is nudged from the real chain, in
+ * radians. 0.001 rad is about 0.057° — a difference far too small to see
+ * — yet two or more rods will blow it up into total divergence in a few
+ * seconds. That's the whole point of the ghost. */
 #define GHOST_EPSILON 0.001f
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -274,22 +99,19 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color — themes + canonical HUD chrome                              */
-/* ===================================================================== */
+/* ── §3 color — themes + fixed HUD colours ── */
 
 /*
- * Theme-driven roles (change with the active palette):
- *   CP_ARM1..CP_ARM5  arm segments (5-colour cycle drawn from theme)
- *   CP_JOINT          intermediate joint markers (theme mid tier)
- *   CP_BOB            end-bob accent (brightest theme highlight)
- *   CP_TR1, CP_TR2, CP_TR3  trail tiers newest → oldest
- *   CP_GHOST          ghost pendulum (dim, theme-tinted)
- *
- * Fixed chrome (theme-independent):
- *   CP_BAR    pivot bracket [+] (bright white — structural anchor)
- *   CP_HUD    canonical top status (bright yellow + bold)
- *   CP_HINT   canonical bottom action bar (bright cyan + bold)
+ * Colour slots. Most follow the active theme; the last three are fixed
+ * so the structure and on-screen text stay readable in every palette.
+ *   CP_ARM1..CP_ARM5  the rods (each rod a different shade)
+ *   CP_JOINT          the joints between rods
+ *   CP_BOB            the swinging weight on the end
+ *   CP_TR1..CP_TR3    the trail, brightest (newest) to dimmest (oldest)
+ *   CP_GHOST          the faint ghost chain
+ *   CP_BAR            the [+] mark at the fixed pivot point
+ *   CP_HUD            top status line
+ *   CP_HINT           bottom key-list line
  */
 enum {
   CP_BAR = 1,
@@ -309,15 +131,16 @@ enum {
 };
 
 /*
- * Theme — one palette covering every theme-driven role.
- *   ramp[4]   four colour tiers, dim → bright.  Used for arms 0..3
- *             (arm 4 = accent), trail tiers, and joint colour.
- *   accent    brightest highlight — end bob + arm-5 cap colour.
- *   ghost     dim theme-tinted shade for the perturbed ghost pendulum.
+ * Theme — one named colour palette for the whole demo.
+ *   name    what to show in the HUD ("Matrix", "Fire", ...).
+ *   ramp    four shades from dim to bright; the rods, joints, and trail
+ *           tiers all pick from here.
+ *   accent  the brightest, most eye-catching colour — used for the
+ *           end weight and the last rod's cap.
+ *   ghost   a faint shade for the barely-there ghost chain.
  *
- * Brightness safety (CLAUDE.md): every entry sits at index ≥ 30, or
- * 24-29 / 240-243 only as the lowest ramp tier.  The forbidden zones
- * (16-23 cube, 232-239 gray) would vanish against default-black.
+ * Every colour is picked from the brighter half of the palette so it
+ * stays visible against a black background (see CLAUDE.md).
  */
 typedef struct {
   const char *name;
@@ -327,7 +150,6 @@ typedef struct {
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
-    /*  name        ramp[0..3]                  accent  ghost              */
     {"Matrix", {28, 34, 40, 46}, 82, 28},        /* cyber green  */
     {"Fire", {130, 208, 202, 196}, 226, 88},     /* warm → red   */
     {"Oceanic", {24, 31, 39, 51}, 195, 24},      /* teal → cyan  */
@@ -340,20 +162,9 @@ static const Theme k_themes[N_THEMES] = {
     {"Eclipse", {240, 244, 124, 196}, 226, 240}, /* gray + red   */
 };
 
-/*
- * theme_apply — install the palette for theme index t.
- *
- * Mapping per theme:
- *   CP_ARM1..4 = ramp[0..3]              (5-arm chain cycles arm0..3
- *   CP_ARM5    = accent                   then highlight on arm 4)
- *   CP_JOINT   = ramp[2]                  (mid tier — visible joints)
- *   CP_BOB     = accent                   (brightest highlight)
- *   CP_TR1..3  = ramp[3], [2], [1]        (newest→oldest trail tiers)
- *   CP_GHOST   = ghost
- *
- * Fixed chrome (CP_BAR / CP_HUD / CP_HINT) never changes — stays
- * readable across every theme.
- */
+/* Switch the live colours to theme t. The last three slots (pivot mark
+ * and the two HUD lines) are set the same way every time so the text
+ * never gets lost in a dark palette. */
 static void theme_apply(int t) {
   const Theme *th = &k_themes[t % N_THEMES];
   if (COLORS >= 256) {
@@ -396,7 +207,7 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* arm_pair — colour cycle for the n-th arm segment (0-indexed). */
+/* Which colour slot the n-th rod uses (counting from 0). */
 static int arm_pair(int link) {
   static const int arms[N_MAX] = {CP_ARM1, CP_ARM2, CP_ARM3, CP_ARM4, CP_ARM5};
   if (link < 0)
@@ -406,9 +217,7 @@ static int arm_pair(int link) {
   return arms[link];
 }
 
-/* ===================================================================== */
-/* §4  coords                                                             */
-/* ===================================================================== */
+/* ── §4 coords ── */
 
 static inline int pw(int cols) { return cols * CELL_W; }
 static inline int ph(int rows) { return rows * CELL_H; }
@@ -420,38 +229,27 @@ static inline int px_to_cell_y(float py) {
   return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  physics                                                            */
-/* ===================================================================== */
+/* ── §5 physics ── */
 
-/* ─────────────────────────────────────────────────────────────────────
- * StateN — phase-space state vector for an N-link chain.
- *
- * The state of a Lagrangian system with n generalised coordinates lives
- * in 2n-dimensional phase space.  Here:
- *
- *     th[i]   generalised coordinate θᵢ — angle of link i from vertical
- *     om[i]   generalised velocity   ωᵢ = θ̇ᵢ
- *
- * Stored as parallel arrays so the RK4 update can do component-wise
- * arithmetic without struct gymnastics.  Sized N_MAX (5) at compile
- * time so an NPend doesn't need a malloc; only the first n slots are
- * touched per call (n comes from the enclosing NPend).
- *
- * Slot ordering:
- *     index 0   = topmost link, attached to the pivot
- *     index n-1 = bottommost link, carrying the end bob
- *
- * Reference:
- *   • Goldstein 2001 §1.4 — generalised coordinates and the (q, q̇)
- *     state vector this struct represents.
- * ───────────────────────────────────────────────────────────────────── */
+/*
+ * StateN — a complete snapshot of where the chain is and how fast it's
+ * moving, at one instant. That's all the physics needs to step forward.
+ *   th[i]   the angle of rod i, in radians, measured from straight-down.
+ *   om[i]   how fast that angle is changing, in radians per second.
+ * Two flat arrays (rather than an array of pairs) so the integrator can
+ * add and scale them rod-by-rod with simple loops. Sized for the most
+ * rods we ever allow, so no chain ever needs to allocate memory; only
+ * the first n entries are live, where n is the chain's rod count.
+ * Entry 0 is the top rod (at the pivot); entry n-1 is the bottom rod
+ * carrying the end weight.
+ */
 typedef struct {
-  float th[N_MAX]; /* θᵢ (radians, 0 = straight down) for i=0..n-1   */
-  float om[N_MAX]; /* ωᵢ = θ̇ᵢ (radians/second)         for i=0..n-1   */
+  float th[N_MAX]; /* angle of each rod, radians, 0 = straight down  */
+  float om[N_MAX]; /* how fast each angle changes, radians/second    */
 } StateN;
 
-/* state_step_n — out = s + dt * k  (used by RK4 intermediate stages) */
+/* Take a trial step forward from where the chain is, following the slope
+ * k. The stepper below uses this to build its in-between probes. */
 static void state_step_n(int n, const StateN *s, float dt, const StateN *k,
                          StateN *out) {
   for (int i = 0; i < n; i++) {
@@ -460,11 +258,8 @@ static void state_step_n(int n, const StateN *s, float dt, const StateN *k,
   }
 }
 
-/*
- * find_pivot_row — partial-pivot row index for column i.
- * Returns the row r ∈ [i, n) whose |M[r][i]| is largest — the most
- * numerically stable choice for the next elimination step.
- */
+/* Pick the best row to work with next: the one with the biggest number
+ * in column i. Using the biggest keeps the arithmetic from blowing up. */
 static int find_pivot_row(int n, float M[N_MAX][N_MAX], int i) {
   int piv = i;
   float maxv = fabsf(M[i][i]);
@@ -477,11 +272,8 @@ static int find_pivot_row(int n, float M[N_MAX][N_MAX], int i) {
   return piv;
 }
 
-/*
- * swap_rows_augmented — exchange two rows of the augmented system
- * [M | b].  Row swap on M alone changes the solution; swapping b in
- * lockstep keeps the system equivalent.
- */
+/* Swap two equations. The right-hand side b must swap along with M, or
+ * we'd be solving a different problem. */
 static void swap_rows_augmented(int n, float M[N_MAX][N_MAX], float b[N_MAX],
                                 int i, int j) {
   for (int c = 0; c < n; c++) {
@@ -494,11 +286,9 @@ static void swap_rows_augmented(int n, float M[N_MAX][N_MAX], float b[N_MAX],
   b[j] = t;
 }
 
-/*
- * eliminate_below_pivot — zero column i in every row r > i by the
- * elementary row operation  rowₚ ← rowₚ − f · rowᵢ  where
- * f = M[r][i] / M[i][i].  The pivot row M[i][·] is left intact.
- */
+/* Subtract the right multiple of equation i from each equation below it
+ * so that column i becomes zero there — one step of working the system
+ * down to a staircase shape we can read off bottom-up. */
 static void eliminate_below_pivot(int n, float M[N_MAX][N_MAX], float b[N_MAX],
                                   int i) {
   for (int r = i + 1; r < n; r++) {
@@ -510,9 +300,9 @@ static void eliminate_below_pivot(int n, float M[N_MAX][N_MAX], float b[N_MAX],
 }
 
 /*
- * back_substitute — solve the upper-triangular system left by the
- * forward elimination.  Walks bottom row up; at row i:
- *   x[i] = (b[i] − Σ_{j>i} M[i][j] · x[j]) / M[i][i]
+ * Second half of the solver. By now the equations form a staircase: the
+ * last one has a single unknown, so solve it, then plug that answer into
+ * the one above, and walk up to the top.
  */
 static void back_substitute(int n, float M[N_MAX][N_MAX], float b[N_MAX],
                             float x[N_MAX]) {
@@ -525,35 +315,31 @@ static void back_substitute(int n, float M[N_MAX][N_MAX], float b[N_MAX],
 }
 
 /*
- * solve_linear — in-place M·x = b by Gaussian elimination with partial
- * pivoting.  n ≤ N_MAX.  Stable for the well-conditioned mass matrices
- * deriv_n produces (M is symmetric positive-definite when the chain
- * is well-posed — i.e. no two consecutive links exactly aligned).
- *
- * Reads like the textbook recipe:
- *   1. forward elimination → upper-triangular
- *   2. back-substitution    → x
- *
- * Reference: Golub & Van Loan §3.4 (Gaussian elimination with partial
- * pivoting); Press et al. "Numerical Recipes" §2.2.
+ * Solves a small set of linear equations M·x = b for the unknowns x —
+ * here, the rods' accelerations. The plan is the one from school: clear
+ * out variables one column at a time until the equations form a
+ * staircase, then read the answers back off bottom-up. Picking the
+ * biggest row to work with each step (see find_pivot_row) keeps the
+ * arithmetic well-behaved. Reference: Golub & Van Loan §3.4; Press et
+ * al. "Numerical Recipes" §2.2.
  */
 static void solve_linear(int n, float M[N_MAX][N_MAX], float b[N_MAX],
                          float x[N_MAX]) {
-  /* forward elimination: turn M into an upper-triangular U */
+  /* work the equations down into staircase shape */
   for (int i = 0; i < n; i++) {
     int piv = find_pivot_row(n, M, i);
     if (piv != i)
       swap_rows_augmented(n, M, b, i, piv);
     eliminate_below_pivot(n, M, b, i);
   }
-  /* back-substitute: solve U·x = b */
+  /* read the answers back off, bottom-up */
   back_substitute(n, M, b, x);
 }
 
 /*
- * copy_velocities_to_thetadot — trivial half of the EOM:  θ̇ = ω.
- * The state vector for an N-link chain in phase space is (θ, ω); the
- * derivative is (ω, α).  The "ω" component is just a copy.
+ * The easy half of the motion. We track each rod's angle and its turning
+ * speed; how fast an angle is changing is just its turning speed, so this
+ * is a plain copy. The hard half (how the speeds change) is solved below.
  */
 static void copy_velocities_to_thetadot(int n, const StateN *s, StateN *out) {
   for (int i = 0; i < n; i++)
@@ -561,17 +347,11 @@ static void copy_velocities_to_thetadot(int n, const StateN *s, StateN *out) {
 }
 
 /*
- * assemble_mass_matrix — fill the symmetric N×N matrix M(θ).
- *
- *   M[j][k] = (N − max(j, k)) · L² · cos(θⱼ − θₖ)
- *
- * The factor (N − max(j,k)) counts how many links of mass contribute
- * to the kinetic-energy cross-term between coordinates j and k; the
- * cosine couples their angular velocities via the geometric overlap.
- *
- * Reference: Goldstein 2001 §1.6 — Lagrangian mass matrix for chains
- * of rigid bodies; same construction as the finite-element "consistent
- * mass matrix".
+ * Builds the grid of numbers that says how much each rod's motion drags
+ * on every other rod's — heavy rods near the top pull on more of the
+ * chain, and rods pointing the same way push and pull together more. The
+ * rest of the physics is solving against this grid. Reference: Goldstein
+ * 2001 §1.6 (the same "mass matrix" idea used for any chain of rods).
  */
 static void assemble_mass_matrix(int n, const StateN *s, float L,
                                  float M[N_MAX][N_MAX]) {
@@ -586,14 +366,11 @@ static void assemble_mass_matrix(int n, const StateN *s, float L,
 }
 
 /*
- * assemble_force_vector — fill the generalised-force vector b(θ, ω).
- *
- *   b[j] = −Σₖ (N − max(j,k)) · L² · sin(θⱼ − θₖ) · ωₖ²    ← centrifugal
- *          − g · L · (N − j) · sin(θⱼ)                     ← gravity
- *
- * The first sum is the Coriolis / centrifugal coupling between links;
- * the second is the gravity moment on link j (which the (N−j) masses
- * below it all contribute to).
+ * Builds the list of pushes acting on each rod right now. Two things push:
+ * gravity pulling each rod back toward straight-down, and the fling from
+ * the other rods already whipping around (the force you feel on a fast
+ * merry-go-round). Together with the drag grid above, these decide how the
+ * turning speeds change this instant.
  */
 static void assemble_force_vector(int n, const StateN *s, float L, float g,
                                   float b[N_MAX]) {
@@ -610,20 +387,11 @@ static void assemble_force_vector(int n, const StateN *s, float L, float g,
 }
 
 /*
- * deriv_n — equations of motion for the N-link pendulum.
- *
- * Returns ds/dt = (ω_i, α_i) where α = θ̈ are the angular accelerations
- * obtained by solving the Lagrangian linear system  M(θ) · α = b(θ, ω):
- *
- *     1.  θ̇ = ω                          (trivial half of phase space)
- *     2.  assemble M(θ)                   (mass matrix from Lagrangian T)
- *     3.  assemble b(θ, ω)                (Coriolis + gravity terms)
- *     4.  solve M · α = b                 (Gaussian elim + back-sub)
- *
- * Sanity checks (matches the textbook double-pendulum derivation):
- *   N=1:  M = [L²], b = [−gL sin θ₁]  →  α = −(g/L)·sin θ₁  ✓
- *   N=2:  same equations as double_pendulum.c's closed form  ✓
- *
+ * The heart of the physics: given where the chain is and how fast it's
+ * turning, work out how all of that is changing right now. The angles
+ * change at the turning speeds (easy). The turning speeds change by an
+ * amount we have to solve for — build the drag grid and the push list,
+ * then solve one set of equations to get every rod's acceleration at once.
  * Reference: Goldstein 2001 §1.6, Shinbrot et al. 1992.
  */
 static void deriv_n(int n, const StateN *s, float L, float g, StateN *out) {
@@ -634,16 +402,14 @@ static void deriv_n(int n, const StateN *s, float L, float g, StateN *out) {
   assemble_mass_matrix(n, s, L, M);
   assemble_force_vector(n, s, L, g, b);
 
-  /* α = M⁻¹ · b — written into out->om to complete the (ω, α) pair */
+  /* solve drag · acceleration = push; the answers fill out->om */
   solve_linear(n, M, b, out->om);
 }
 
 /*
- * rk4_slope_at — evaluate the derivative at s + dt_frac · prev_slope.
- *
- * The middle two RK4 stages probe the midpoint (dt_frac = dt/2); the
- * fourth probes the endpoint (dt_frac = dt).  Each uses the previous
- * stage's slope as the predictor.
+ * Take a trial hop forward using the last slope we measured, then measure
+ * the slope again there. The stepper below uses this to peek ahead a
+ * little before committing to the real step.
  */
 static void rk4_slope_at(int n, const StateN *s, float dt_frac,
                          const StateN *prev_slope, float L, float g,
@@ -653,14 +419,10 @@ static void rk4_slope_at(int n, const StateN *s, float dt_frac,
 }
 
 /*
- * rk4_combine_simpson — Simpson's-rule weighted average of the four
- * slopes, applied to advance the state by one full dt:
- *
- *     s ← s + (dt / 6) · (k1 + 2·k2 + 2·k3 + k4)
- *
- * The (1, 2, 2, 1) weights come from approximating ∫₀^dt f(s(t)) dt
- * by Simpson's rule using the four sampled slopes.  This is what
- * gives classical RK4 its O(dt⁴) global accuracy.
+ * Take the four slopes we measured across the step and blend them into one
+ * best-guess slope, trusting the two middle measurements twice as much,
+ * then actually move the chain forward by it. Averaging four probes
+ * instead of trusting the first is what makes the step accurate.
  */
 static void rk4_combine_simpson(int n, StateN *s, float dt, const StateN *k1,
                                 const StateN *k2, const StateN *k3,
@@ -675,22 +437,16 @@ static void rk4_combine_simpson(int n, StateN *s, float dt, const StateN *k1,
 }
 
 /*
- * rk4_step_n — one classical 4th-order Runge-Kutta step.
- *
- * Reads like the textbook recipe:
- *   k1 = slope at start
- *   k2 = slope at midpoint, using k1's prediction
- *   k3 = slope at midpoint, using k2's correction
- *   k4 = slope at endpoint, using k3's prediction
- *   s  = s + (dt/6) · (k1 + 2k2 + 2k3 + k4)            (Simpson weights)
- *
- * 4th-order globally accurate; for chaotic systems the lower orders
- * lose phase tracking within seconds.  See Hairer-Nørsett-Wanner 1993
- * for the order analysis.
+ * Move the chain forward by one small time step, accurately. Instead of
+ * trusting a single slope, it probes four: at the start, twice in the
+ * middle, and at the end, each guided by the one before, then blends them.
+ * The accuracy matters here — a chaotic chain drifts off the true path
+ * fast if each step is sloppy. This is the classic Runge-Kutta method;
+ * see Hairer-Nørsett-Wanner 1993.
  */
 static void rk4_step_n(int n, StateN *s, float L, float g, float dt) {
-  /* Zero-initialise — only entries [0..n) are touched, but gcc can't
-   * see that and emits maybe-uninitialised warnings otherwise.        */
+  /* Zero them out: we only fill the first n slots, but gcc can't tell and
+   * would warn about the rest looking uninitialised.                     */
   StateN k1, k2, k3, k4, tmp;
   memset(&k1, 0, sizeof k1);
   memset(&k2, 0, sizeof k2);
@@ -698,92 +454,78 @@ static void rk4_step_n(int n, StateN *s, float L, float g, float dt) {
   memset(&k4, 0, sizeof k4);
   memset(&tmp, 0, sizeof tmp);
 
-  deriv_n(n, s, L, g, &k1);                            /* k1: start    */
-  rk4_slope_at(n, s, 0.5f * dt, &k1, L, g, &k2, &tmp); /* k2: mid (k1) */
-  rk4_slope_at(n, s, 0.5f * dt, &k2, L, g, &k3, &tmp); /* k3: mid (k2) */
-  rk4_slope_at(n, s, dt, &k3, L, g, &k4, &tmp);        /* k4: endpoint */
+  deriv_n(n, s, L, g, &k1);                            /* slope at start    */
+  rk4_slope_at(n, s, 0.5f * dt, &k1, L, g, &k2, &tmp); /* slope at midpoint */
+  rk4_slope_at(n, s, 0.5f * dt, &k2, L, g, &k3, &tmp); /* midpoint, refined */
+  rk4_slope_at(n, s, dt, &k3, L, g, &k4, &tmp);        /* slope at the end  */
 
   rk4_combine_simpson(n, s, dt, &k1, &k2, &k3, &k4);
 }
 
-/* ─────────────────────────────────────────────────────────────────────
- * NPend — one complete N-link pendulum chain.
+/*
+ * NPend — one whole pendulum chain: where it is, how it's shaped, and
+ * how many rods it has. Two of these live in the Scene — the bright one
+ * you watch, and a faint "ghost" started a tiny bit off it so you can
+ * see chaos pull them apart.
  *
- * Bundles the dynamical state (s, prev) with the fixed geometry
- * (pivot, arm_len) and the topology field (n).  Two NPends live in
- * Scene: the primary chain the user sees, and a "ghost" started with
- * θ₁ + GHOST_EPSILON to visualise chaotic divergence.
+ * The fields fall into three groups:
  *
- * Members are grouped by access pattern:
+ *   What's moving:
+ *     s      where the chain is right now (every rod's angle and how
+ *            fast it's turning).
+ *     prev   where it was at the start of this physics step. We keep
+ *            both so the drawing can blend between them — that lets the
+ *            motion look smooth even when we draw far less often than we
+ *            do the physics (the "fixed timestep + interpolation" trick,
+ *            Fiedler 2004).
  *
- *   simulation state  : s, prev
- *       Hot path.  Read+written every RK4 step via rk4_step_n.
- *       npend_tick snapshots s into prev BEFORE the integration so the
- *       renderer can lerp between (prev, s) by alpha for smooth motion
- *       at any frame rate.  This is the standard "fixed-timestep +
- *       render interpolation" trick (Fiedler 2004).
+ *   Fixed shape (set once when the chain is built, never changes after):
+ *     pivot_px, pivot_py   where the top of the chain is pinned.
+ *     arm_len              how long each rod is. Every rod is the same
+ *                          length, sized so the whole chain reaches the
+ *                          same fraction of the screen no matter how
+ *                          many rods there are.
  *
- *   geometry          : pivot_px, pivot_py, arm_len
- *       Set once by npend_init from the screen size and the chosen N,
- *       constant for the chain's lifetime.  arm_len = MAX_REACH_FRAC ·
- *       screen_height / N — every link the same length, total chain
- *       reach the same fraction of the screen regardless of N.
- *
- *   topology          : n
- *       Active link count.  Set at init; controls how many slots of
- *       s.th[]/s.om[] are alive.  Changing n requires a fresh
- *       npend_init (which scene_init handles when the user hits n/p).
- *
- * References:
- *   • Shinbrot, Grebogi, Wisdom & Yorke 1992 — defines the canonical
- *     double-pendulum experimental setup; this struct is the N-link
- *     generalisation.
- *   • Goldstein 2001 §1.4-1.6 — Lagrangian state representation that
- *     the (s, prev) pair encodes.
- *   • Fiedler, G. (2004) "Fix Your Timestep" — the lerp between prev
- *     and current state is the technique we use for `alpha`.
- * ───────────────────────────────────────────────────────────────────── */
+ *   How many rods:
+ *     n      the rod count, 1..N_MAX. Says how many slots of s and prev
+ *            are actually in use. Changing it rebuilds the chain.
+ */
 typedef struct {
-  /* ─ simulation state — hot path, read+write every tick ─ */
-  StateN s;    /* current (θ, ω) for all n links            */
-  StateN prev; /* snapshot taken at the start of the current
-                  physics tick; renderer lerps (prev, s) by
-                  alpha for smooth sub-tick motion          */
+  /* ── what's moving (changes every tick) ── */
+  StateN s;    /* where the chain is right now              */
+  StateN prev; /* where it was at the start of this step;
+                  the drawing blends prev→s for smoothness  */
 
-  /* ─ geometry — set once at npend_init, constant after ─ */
-  float pivot_px; /* anchor x in pixel space (chain top)       */
-  float pivot_py; /* anchor y in pixel space                   */
-  float arm_len;  /* link length L (px); all arms equal so
-                     chain total = MAX_REACH_FRAC × screen_h   */
+  /* ── fixed shape (set once when built) ── */
+  float pivot_px; /* x of the pinned top, in pixel units       */
+  float pivot_py; /* y of the pinned top, in pixel units       */
+  float arm_len;  /* length of each rod; all equal so the
+                     chain's total reach is screen-relative    */
 
-  /* ─ topology — set at init, read every tick ─ */
-  int n; /* active link count, 1..N_MAX               */
+  /* ── how many rods ── */
+  int n; /* rod count in use, 1..N_MAX                */
 } NPend;
 
-/*
- * place_pivot_at_screen_center — anchor the chain at the centre of the
- * pixel-space terminal so the swing has room above and below.
- */
+/* Pin the top of the chain at the middle of the screen, so it has room to
+ * swing both above and below. */
 static void place_pivot_at_screen_center(NPend *p, int cols, int rows) {
   p->pivot_px = (float)pw(cols) * 0.5f;
   p->pivot_py = (float)ph(rows) * 0.5f;
 }
 
 /*
- * size_arms_for_n_links — each link L = MAX_REACH_FRAC · screen_h / N,
- * so the fully-extended chain occupies the SAME fraction of the screen
- * regardless of N.  N=1 → one big arm; N=5 → five short arms with the
- * same overall reach.
+ * Pick the rod length so the whole chain reaches the same way down the
+ * screen no matter how many rods it has — split the fixed total reach
+ * evenly. One rod is long; five rods are short but reach just as far.
  */
 static void size_arms_for_n_links(NPend *p, int n_links, int rows) {
   p->arm_len = (float)ph(rows) * MAX_REACH_FRAC / (float)n_links;
 }
 
 /*
- * set_uniform_initial_angles — seed every link with the same angle
- * (INIT_THETA_DEG = 120°) and zero angular velocity.  The chain
- * starts fully extended at that angle — a high-energy configuration
- * that hits chaotic onset within ~1 s for N ≥ 2.
+ * Set every rod to the same starting angle and at rest. The chain begins
+ * stretched out and lifted well past horizontal — lots of stored energy,
+ * so with two or more rods it goes chaotic within about a second.
  */
 static void set_uniform_initial_angles(NPend *p, int n_links, float theta_deg) {
   float theta_rad = (float)(theta_deg * M_PI / 180.0);
@@ -794,27 +536,20 @@ static void set_uniform_initial_angles(NPend *p, int n_links, float theta_deg) {
 }
 
 /*
- * perturb_first_angle — add `extra_deg` to θ₀ only.  Used to seed the
- * "ghost" pendulum with GHOST_EPSILON ≈ 0.057°.  After ~3-5 s (N ≥ 2)
- * this nanoscopic difference grows exponentially and the two chains
- * diverge completely — the visual signature of chaos.
- *
- * For the primary pendulum the caller passes 0.0f, leaving angles
- * untouched.
+ * Nudge just the top rod's angle by a tiny amount. This is how we make the
+ * ghost: a difference far too small to see (~0.057°) that, with two or
+ * more rods, grows into total divergence in a few seconds — chaos made
+ * visible. The real chain passes 0 here, so it's left untouched.
  */
 static void perturb_first_angle(NPend *p, float extra_deg) {
   p->s.th[0] += (float)(extra_deg * M_PI / 180.0);
 }
 
 /*
- * npend_init — fresh pendulum at the boot configuration.
- *
- *   1. record N
- *   2. anchor pivot at screen centre
- *   3. size arms so total reach fits
- *   4. seed every angle to INIT_THETA_DEG, zero velocities
- *   5. (optional) perturb θ₀ — used to spawn the ghost
- *   6. snapshot prev = s so the first render lerp has both ends
+ * Build a fresh chain in its starting pose. th_extra_deg is the little
+ * nudge for the ghost (the real chain passes 0). The last step copies the
+ * current pose into prev so the very first frame has a "before" to blend
+ * from.
  */
 static void npend_init(NPend *p, int n_links, int cols, int rows,
                        float th_extra_deg) {
@@ -832,14 +567,10 @@ static void npend_tick(NPend *p, float dt) {
 }
 
 /*
- * npend_positions — joint pixel coordinates for given (interpolated)
- * angles th[0..n-1].
- *
- *   xs[0], ys[0]  = pivot
- *   xs[i+1] = xs[i] + L · sin(θᵢ)
- *   ys[i+1] = ys[i] + L · cos(θᵢ)      (y axis points DOWN)
- *
- * The end bob sits at xs[n], ys[n].
+ * Turn the chain's angles into actual on-screen points. Start at the
+ * pinned top and follow each rod in turn — its angle says which way it
+ * points, so step that rod's length in that direction to reach the next
+ * joint. The very last point is the swinging weight.
  */
 static void npend_positions(const NPend *p, const float *th, float *xs,
                             float *ys) {
@@ -851,42 +582,32 @@ static void npend_positions(const NPend *p, const float *th, float *xs,
   }
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6 scene ── */
 
-/* ─────────────────────────────────────────────────────────────────────
- * Trail — ring buffer of past end-bob pixel positions.
+/*
+ * Trail — the breadcrumb trail the swinging weight leaves behind. We
+ * remember its last few hundred positions and draw them as a fading
+ * tail, which is what makes the looping, never-repeating path visible.
  *
- * The end bob traces a chaotic curve through space; the trail is what
- * makes the attractor geometry visible.  A ring buffer is the right
- * data structure because every tick pushes ONE new sample and the
- * oldest expires automatically — O(1) per push, no shifting, no
- * allocation, no enumeration of "live" entries.
+ * It's a ring buffer: a fixed-size circular list. Every tick we drop one
+ * new position in and the oldest one quietly falls off the back, so we
+ * never shift anything or allocate memory — just overwrite in a loop.
  *
- * Semantics:
- *   head     index of the NEXT slot to write   (0..TRAIL_LEN-1)
- *   count    number of valid entries already written, saturates at
- *            TRAIL_LEN once the buffer fills
+ *   px, py   the remembered positions, in fine "pixel" units
+ *   head     where the next position will be written
+ *   count    how many positions we've stored so far; stops growing once
+ *            the buffer is full
  *
- * Iterate oldest → newest in the live window:
- *     start = (head − count + TRAIL_LEN) % TRAIL_LEN
- *     for k = 0..count-1:  idx = (start + k) % TRAIL_LEN
- *
- * Scene::trail_draw further limits how many of those `count` entries
- * paint each frame (user-adjustable via +/-), so a long buffer is
- * always available but the user controls the visual tail length
- * independently.
- *
- * Reference:
- *   • Knuth, TAOCP Vol. 1 §2.2.2 — sequential allocation with circular
- *     queues.  Standard ring-buffer construction.
- * ───────────────────────────────────────────────────────────────────── */
+ * To walk the trail oldest-first, start at (head − count) wrapped around
+ * and step forward, wrapping at the end. How many of these we actually
+ * paint each frame is a separate user-adjustable number (see trail_draw
+ * in Scene), so we can keep a long memory but show a short tail.
+ */
 typedef struct {
-  float px[TRAIL_LEN]; /* recorded x position (pixel space)         */
-  float py[TRAIL_LEN]; /* recorded y position (pixel space)         */
-  int head;            /* next-write index (advances mod TRAIL_LEN) */
-  int count;           /* live entries, 0..TRAIL_LEN (saturates)    */
+  float px[TRAIL_LEN]; /* remembered x position (pixel units)       */
+  float py[TRAIL_LEN]; /* remembered y position (pixel units)       */
+  int head;            /* where the next position goes (wraps round) */
+  int count;           /* how many we've stored, up to TRAIL_LEN     */
 } Trail;
 
 static void trail_push(Trail *t, float px, float py) {
@@ -902,81 +623,53 @@ static void trail_clear(Trail *t) {
   t->count = 0;
 }
 
-/* ─────────────────────────────────────────────────────────────────────
- * Scene — the entire demo state.
+/*
+ * Scene — everything the demo needs to run, in one bundle. Pretty much
+ * every function takes a Scene* and works on it. The only state living
+ * outside is the two signal flags in §8, which have to be globals
+ * because C's signal handlers can't be handed a pointer.
  *
- * One Scene IS the demo.  Every non-trivial function takes a Scene*
- * (or const Scene* for read-only) and does its work on it; the only
- * mutable state outside Scene is the two signal-handler flags in §8
- * (which must be globals because the C signal API has no context
- * pointer).
+ * The fields split into two camps: the ones the physics touches, and the
+ * ones only the drawing touches.
  *
- * Members are grouped by what TOUCHES them, separating SIMULATION-side
- * concerns from RENDER-only concerns per the locality principle:
+ *   The physics side:
+ *     primary, ghost  Two identical chains. The ghost starts a hair off
+ *                     the real one (one top angle nudged by ~0.057°).
+ *                     Both step forward every tick. With two or more
+ *                     rods the gap between them explodes — that's the
+ *                     live proof of chaos, shown in the HUD as "div:".
+ *                     With one rod they stay locked together; a single
+ *                     pendulum isn't chaotic.
+ *     n_links         How many rods, shared by both chains. Changing it
+ *                     rebuilds the scene from scratch (the n/p keys).
+ *     paused          When true the physics simply doesn't step. Drawing
+ *                     still happens, so the chain freezes on screen.
  *
- *   ── SIMULATION ───────────────────────────────────────────────────
- *
- *   simulation pendulums   : primary, ghost
- *       Two NPends running the same equations of motion at the same N
- *       and arm_len, but the ghost starts θ₁ + GHOST_EPSILON (≈ 0.057°)
- *       ahead of the primary.  scene_tick steps BOTH each tick.  Their
- *       angular divergence — shown in the HUD as `div:` — is the visual
- *       evidence of sensitive dependence on initial conditions for
- *       N ≥ 2 (chaos).  For N = 1 the two stay glued; pendulum 1 is
- *       integrable, not chaotic.
- *
- *   simulation parameters  : n_links
- *       The N for both pendulums (always kept in sync).  Set only at
- *       scene_init; changing N requires a fresh scene_init (which the
- *       n/p key handler does).  Read every tick by deriv_n.
- *
- *   simulation switch      : paused
- *       Treated as simulation state because it gates the integrator
- *       (scene_tick early-returns when true), not the renderer.  Set
- *       by app_handle_key, read by scene_tick.
- *
- *   ── RENDERING ────────────────────────────────────────────────────
- *
- *   render-side history    : trail
- *       Ring buffer of the primary end-bob's past pixel positions.
- *       Written once per tick by scene_tick (right after the integrator
- *       update), read every frame by draw_trail.  Purely a render
- *       artefact — the simulation never reads it.
- *
- *   screen dimensions      : cols, rows
- *       Cell-space terminal size, refreshed by app_do_resize after
- *       SIGWINCH.  Read everywhere in the render code, never written
- *       outside the resize path.
- *
- *   render-only parameters : theme, show_ghost, show_trail, trail_draw
- *       Pure presentation knobs — none feed back into the integrator.
- *       Set by app_handle_key, read by the renderers.  Cycling theme
- *       calls theme_apply but does not perturb any physical state.
- *
- * References:
- *   • Shinbrot, Grebogi, Wisdom & Yorke 1992 — the primary/ghost
- *     comparison-pendulum setup this Scene implements.  See the
- *     CONCEPTS header for the full reference list.
- *   • Goldstein 2001 — Lagrangian state representation used in
- *     primary/ghost (each NPend holds one (θ, ω) pair).
- * ───────────────────────────────────────────────────────────────────── */
+ *   The drawing side (none of this feeds back into the physics):
+ *     trail           The weight's breadcrumb trail. Filled in once per
+ *                     tick, read every frame when we paint the tail.
+ *     cols, rows      Terminal size in cells, refreshed after a resize.
+ *     theme           Which colour palette is active (t/T to cycle).
+ *     show_ghost      Whether to draw the ghost chain at all (g).
+ *     show_trail      Whether to draw the trail at all (l).
+ *     trail_draw      How much of the stored trail to actually paint
+ *                     (+/- to lengthen or shorten the visible tail).
+ */
 typedef struct {
-  /* ─ SIMULATION ──────────────────────────────────────────────────
-   * Pendulum chains and the integrator gate.                       */
-  NPend primary; /* the chain rendered in full theme colour  */
-  NPend ghost;   /* identical NPend, θ₁ + GHOST_EPSILON;
-                    dim render — the chaos divergence demo   */
-  int n_links;   /* shared N for both pendulums, 1..N_MAX     */
-  bool paused;   /* spc: scene_tick is a no-op when true      */
+  /* ── physics side ── */
+  NPend primary; /* the chain shown in full colour            */
+  NPend ghost;   /* twin chain, top angle nudged a hair; the
+                    faint one that proves chaos               */
+  int n_links;   /* rod count, shared by both, 1..N_MAX       */
+  bool paused;   /* spc: when true the physics stops stepping */
 
-  /* ─ RENDERING ───────────────────────────────────────────────────
-   * Pure presentation state — never feeds back into the integrator.*/
-  Trail trail;     /* ring buffer of primary end-bob positions  */
-  int cols, rows;  /* cell-space terminal size (post-SIGWINCH)  */
-  int theme;       /* t/T: index into k_themes[]                */
-  bool show_ghost; /* g  : toggle ghost-pendulum rendering      */
-  bool show_trail; /* l  : toggle end-bob trail rendering       */
-  int trail_draw;  /* +/-: how many recorded samples to paint   */
+  /* ── drawing side (never affects the physics) ── */
+  Trail trail;     /* the weight's breadcrumb trail             */
+  int cols, rows;  /* terminal size in cells (after a resize)   */
+  int theme;       /* t/T: which colour palette is active       */
+  bool show_ghost; /* g  : draw the faint ghost chain?          */
+  bool show_trail; /* l  : draw the breadcrumb trail?           */
+  int trail_draw;  /* +/-: how much of the trail to paint       */
 } Scene;
 
 static void scene_init(Scene *s, int n_links, int cols, int rows) {
@@ -1015,11 +708,12 @@ static void scene_tick(Scene *s, float dt) {
   trail_push(&s->trail, xs[s->n_links], ys[s->n_links]);
 }
 
-/* ── draw helpers ──────────────────────────────────────────────────── */
+/* ── draw helpers ── */
 
 /*
- * draw_line — Bresenham line; character chosen by step direction.
- * Identical to double_pendulum.c.
+ * Draw a straight line between two cells, picking the character that best
+ * matches the line's slope (-, |, / or \). Same routine as in
+ * double_pendulum.c.
  */
 static void draw_line(int x0, int y0, int x1, int y1, int cols, int rows,
                       attr_t attr) {
@@ -1058,15 +752,14 @@ static void draw_line(int x0, int y0, int x1, int y1, int cols, int rows,
   }
 }
 
-/* interp_angles — lerp prev→current angles by alpha for smooth render. */
+/* Blend last tick's angles toward this tick's by alpha, so the on-screen
+ * motion stays smooth even when we draw less often than we step. */
 static void interp_angles(const NPend *p, float alpha, float *out) {
   for (int i = 0; i < p->n; i++)
     out[i] = p->prev.th[i] + (p->s.th[i] - p->prev.th[i]) * alpha;
 }
 
-/*
- * draw_pivot_marker — '[+]' bracket at the chain's anchor.
- */
+/* Mark the pinned top of the chain with a little [+]. */
 static void draw_pivot_marker(const NPend *p, int cols, int rows) {
   int cx = px_to_cell_x(p->pivot_px);
   int cy = px_to_cell_y(p->pivot_py);
@@ -1080,9 +773,9 @@ static void draw_pivot_marker(const NPend *p, int cols, int rows) {
 }
 
 /*
- * draw_trail — three-tier coloured tail: newest 30% bright red, middle
- * 35% orange, oldest 35% dim grey.  Gives a visually fading tail
- * without per-entry alpha.
+ * Paint the weight's trail as a fading tail. Rather than fade each dot
+ * individually, we split the tail into three bands — newest is brightest,
+ * oldest is dimmest — which looks like a smooth fade for far less work.
  */
 static void draw_trail(const Scene *s) {
   if (!s->show_trail || s->trail.count == 0)
@@ -1121,13 +814,9 @@ static void draw_trail(const Scene *s) {
 }
 
 /*
- * interpolated_joint_positions — render-time forward kinematics.
- *
- * Lerps the chain's previous and current angles by alpha (so the
- * display reads smoothly even at frame rates much lower than the
- * physics rate), then walks the chain to fill xs[]/ys[] with the
- * pixel-space positions of the pivot (index 0) and every joint
- * (indices 1..n).  xs[n], ys[n] is the end bob.
+ * Work out where to draw the chain this frame: blend last tick's angles
+ * toward this tick's for smoothness, then turn those angles into points.
+ * Fills the pivot, every joint, and the end weight (the last point).
  */
 static void interpolated_joint_positions(const NPend *p, float alpha, float *xs,
                                          float *ys) {
@@ -1137,10 +826,9 @@ static void interpolated_joint_positions(const NPend *p, float alpha, float *xs,
 }
 
 /*
- * draw_arm_segments — paint the n line segments between consecutive
- * joints.  Each arm uses its own colour (theme-driven cycle via
- * arm_pair) for the primary chain; the ghost chain paints all arms
- * in a single dim theme-tinted colour.
+ * Draw the rods as lines between the joints. On the real chain each rod
+ * gets its own colour so you can tell them apart; the ghost draws all its
+ * rods in one faint colour so it stays in the background.
  */
 static void draw_arm_segments(const NPend *p, const float *xs, const float *ys,
                               int cols, int rows, bool is_ghost) {
@@ -1154,9 +842,9 @@ static void draw_arm_segments(const NPend *p, const float *xs, const float *ys,
 }
 
 /*
- * draw_intermediate_joints — 'O' markers at every joint EXCEPT the
- * pivot (drawn elsewhere as a [+] bracket) and the end bob (drawn as
- * (@) below).  Skipped entirely for the ghost chain to keep it dim.
+ * Mark the joints in the middle of the chain with 'O'. The top (a [+])
+ * and the end weight (a (@)) are drawn elsewhere, so skip those. The ghost
+ * skips these entirely to stay faint.
  */
 static void draw_intermediate_joints(const NPend *p, const float *xs,
                                      const float *ys, int cols, int rows) {
@@ -1172,9 +860,8 @@ static void draw_intermediate_joints(const NPend *p, const float *xs,
 }
 
 /*
- * draw_end_bob — final joint marker.
- *   primary: bright bracketed (@) — the eye should track this.
- *   ghost  : single dim 'x'      — readable but subordinate.
+ * Draw the swinging weight at the chain's tip. The real one is a bright
+ * (@) so your eye follows it; the ghost is just a faint 'x'.
  */
 static void draw_end_bob(const NPend *p, const float *xs, const float *ys,
                          int cols, int rows, bool is_ghost) {
@@ -1203,9 +890,9 @@ static void draw_end_bob(const NPend *p, const float *xs, const float *ys,
 }
 
 /*
- * draw_chain — orchestrator: kinematics → arms → joints → end bob.
- * Three passes so each draw uses the same xs/ys snapshot; nothing
- * shifts mid-frame.
+ * Draw one whole chain: figure out the points once, then paint the rods,
+ * the middle joints, and the end weight from that one snapshot so nothing
+ * shifts partway through the frame.
  */
 static void draw_chain(const NPend *p, float alpha, int cols, int rows,
                        bool is_ghost) {
@@ -1219,13 +906,9 @@ static void draw_chain(const NPend *p, float alpha, int cols, int rows,
 }
 
 /*
- * scene_draw — render one frame with render-interpolation alpha.
- *
- * Draw order (back → front so key elements overwrite background detail):
- *   1. Pivot marker
- *   2. Trail (oldest → newest, three brightness tiers)
- *   3. Ghost chain (if enabled) — drawn dim under the primary
- *   4. Primary chain — arms, intermediate joints, end bob
+ * Draw one full frame, back to front so the important stuff lands on top:
+ * pivot mark, then the trail, then the faint ghost, then the real chain
+ * over everything.
  */
 static void scene_draw(const Scene *s, float alpha) {
   draw_pivot_marker(&s->primary, s->cols, s->rows);
@@ -1235,9 +918,7 @@ static void scene_draw(const Scene *s, float alpha) {
   draw_chain(&s->primary, alpha, s->cols, s->rows, /*is_ghost=*/false);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen ── */
 
 typedef struct {
   int cols, rows;
@@ -1266,10 +947,7 @@ static void screen_resize(Screen *s) {
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * pendulum_count_name — friendly name for the chain length used in the
- * HUD: "single", "double", "triple", "quadruple", "quintuple".
- */
+/* Spell out the chain length for the HUD: "single", "double", and so on. */
 static const char *pendulum_count_name(int n) {
   static const char *names[N_MAX] = {
       "single", "double", "triple", "quadruple", "quintuple",
@@ -1282,15 +960,15 @@ static const char *pendulum_count_name(int n) {
 }
 
 /*
- * draw_hud_top — canonical top status bar (row 0).
- * Right-aligned: fps + chain name + end-bob angle + ghost divergence +
- * trail length + theme + paused.  CP_HUD (bright yellow + bold).
+ * Top status line: frame rate, chain length, the end weight's angle, how
+ * far the ghost has drifted from the real chain, trail length, theme, and
+ * whether we're paused.
  */
 static void draw_hud_top(Screen *s, const Scene *sc, double fps) {
   const NPend *p = &sc->primary;
   const NPend *g = &sc->ghost;
 
-  /* Total angular divergence — sum of |Δθᵢ| in degrees. */
+  /* How far the ghost has drifted: add up the angle gap across all rods. */
   float div_deg = 0.0f;
   for (int i = 0; i < p->n; i++)
     div_deg += fabsf(p->s.th[i] - g->s.th[i]);
@@ -1298,7 +976,7 @@ static void draw_hud_top(Screen *s, const Scene *sc, double fps) {
   if (div_deg > 9999.0f)
     div_deg = 9999.0f;
 
-  /* End-bob angle for the HUD (most informative single number). */
+  /* The end weight's angle — the single most telling number to show. */
   float th_end_deg = p->s.th[p->n - 1] * (float)(180.0 / M_PI);
 
   char buf[220];
@@ -1319,9 +997,8 @@ static void draw_hud_top(Screen *s, const Scene *sc, double fps) {
 }
 
 /*
- * draw_hud_bottom — canonical bottom action bar (row -1).
- * Left-aligned key list; short fallback if the terminal is narrow.
- * CP_HINT (bright cyan + bold).
+ * Bottom line: the list of keys. Falls back to a shorter list when the
+ * terminal is too narrow to fit them all.
  */
 static void draw_hud_bottom(Screen *s) {
   const char *hint_full = " q:quit  spc:pause  r:reset  n/p:N  t/T:theme  "
@@ -1348,9 +1025,7 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app ── */
 
 typedef struct {
   Scene scene;

@@ -1,159 +1,24 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * beam_bending.c — Euler-Bernoulli Beam Bending + Vibration Simulator
+ * beam_bending.c — watch a beam bend and wobble under load, in the terminal.
  *
- * ═══════════════════════════════════════════════════════════════════════
- *  PHYSICS OVERVIEW
- * ═══════════════════════════════════════════════════════════════════════
+ * We pick a beam (pinned, clamped one end, or clamped both ends), drop a
+ * load on it, and draw how far it sags. A second mode lets the beam ring
+ * like a struck tuning fork instead of sitting still. The classic
+ * small-deflection beam theory (Euler-Bernoulli) gives us exact formulas
+ * for the shape, so there's no step-by-step solver — we just evaluate the
+ * formulas and the vibration as a sum of natural ringing patterns.
  *
- *  The Euler-Bernoulli beam model assumes:
- *    1. Cross-sections remain plane and perpendicular to the neutral axis.
- *    2. Deflections are small (linear theory — no geometric nonlinearity).
- *    3. Material is linearly elastic (stress proportional to strain).
- *
- *  Governing equation (beam axis = x, transverse deflection = w):
- *
- *      EI · d⁴w/dx⁴ = q(x)
- *
- *  where:
- *    E  = Young's modulus   [Pa]   — material stiffness
- *    I  = second moment of area [m⁴] — cross-section shape resistance
- *    EI = flexural rigidity — the single stiffness parameter that matters
- *    q  = distributed transverse load [N/m]
- *    w  = transverse deflection [m]   (positive = downward here)
- *
- *  Bending moment — what you feel as a beam bends:
- *      M(x) = EI · d²w/dx²    (curvature × stiffness)
- *
- *  Bending stress at distance y from neutral axis:
- *      σ(x,y) = M(x)·y / I
- *  → High |M| = high stress = higher risk of yielding/fracture.
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  BOUNDARY CONDITIONS — what makes each beam type unique
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  Simply Supported (SS):   w(0)=0, M(0)=0, w(L)=0, M(L)=0
- *    Both ends pinned. Beam can rotate at supports. Moment is zero at
- *    the pins — the support can only push up/down, not apply a couple.
- *    → Symmetric deflection under symmetric loads.
- *    → Max deflection = PL³/(48EI) at midspan for centre point load.
- *
- *  Cantilever (Fixed-Free): w(0)=0, w'(0)=0, M(L)=0, V(L)=0
- *    Left end fully clamped — cannot deflect or rotate. Right end free.
- *    The wall provides both a reaction force AND a reaction moment.
- *    → Largest tip deflection: PL³/(3EI) — 16× more than SS midspan!
- *    → Moment is maximum at the wall and zero at the free tip.
- *
- *  Fixed-Fixed (FF):        w(0)=0, w'(0)=0, w(L)=0, w'(L)=0
- *    Both ends fully clamped. Both ends provide moment reactions.
- *    → Stiffest configuration: midspan deflection PL³/(192EI).
- *    → Hogging moments (tension at top) develop at both clamped ends.
- *    → Sagging moment at midspan. Moment diagram crosses zero twice.
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  DYNAMIC MODE — modal superposition
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  Free vibration: each mode n has a natural frequency ωₙ and a mode
- *  shape φₙ(x). The response is a sum over all modes:
- *
- *      w(x,t) = Σ qₙ(t) · φₙ(x)
- *
- *  Each modal coordinate qₙ(t) obeys an independent damped oscillator:
- *
- *      q̈ₙ + 2ζωₙ q̇ₙ + ωₙ² qₙ = Fₙ(t)
- *
- *  where ζ = damping ratio, Fₙ = modal load = ∫ q(x)φₙ(x)dx / Mₙ.
- *
- *  Stepped with exact transition matrix (unconditionally stable).
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  VISUALIZATION DESIGN
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  Main area:  deflected beam shape, curvature shading, support symbols,
- *              load arrows. Character density encodes |M(x)|/M_max.
- *              Stress ramp colours are theme-driven (lo → med → hi).
- *              Dynamic mode adds motion-blur trails behind the live
- *              beam — a 12-frame ring buffer of past shapes drawn as
- *              fading dots so the oscillation envelope reads at a glance.
- *  Side panel: bending moment diagram, horizontal bars ±M(x)/M_max.
- *
- *  HUD layout (canonical CLAUDE.md two-bar + secondary line):
- *    row 0 right (bright yellow + bold)  — live status: P, exag, theme,
- *                                          paused / dynamic, fps.
- *    row 1 left  (bright yellow)         — context: BC name, load name,
- *                                          max deflection, max moment,
- *                                          [VIBRATING] badge.
- *    row rows-1  (bright cyan + bold)    — actions / key reference.
- *
- *  Themes (10 palettes; cycle with t / T):
- *    Matrix, Fire, Oceanic, Neon, Mono, Ice, Nova, Forest, Desert, Eclipse.
- *  Theme only swaps colours — physics, geometry, and HUD layout unchanged.
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  REFERENCES
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  Five sources, three on the physics and two on the implementation,
- *  cover everything in this file. Inline comments cite them as [n].
- *
- *  [1] Gere, J. M. & Goodno, B. J. — "Mechanics of Materials", 9th ed.,
- *      Cengage Learning (2018).
- *      Foundational Euler-Bernoulli theory: derivation of EI·d²w/dx² = M,
- *      sign conventions, support reactions, deflection of beams (Ch. 9).
- *      Read this first if you want to understand why §4-§5 look the way
- *      they do, before diving into specific formulas.
- *
- *  [2] Young, W. C.; Budynas, R. G.; Sadegh, A. M. — "Roark's Formulas
- *      for Stress and Strain", 8th ed., McGraw-Hill (2011).
- *      Tables 8.1-8.10 give the closed-form M(x) and w(x) for every
- *      BC × load combination implemented in §5. solve_beam is essentially
- *      a transcription of these tables; cross-check any formula here.
- *
- *  [3] Rao, S. S. — "Mechanical Vibrations", 6th ed., Pearson (2017).
- *      Ch. 8 (continuous systems) covers the eigenvalue problem
- *      EI·φ'''' = ρA·ω²·φ, the characteristic equations for each BC,
- *      modal superposition, modal damping, and the step response of a
- *      damped oscillator. Backs everything in §6 (dynamics).
- *
- *  [4] Blevins, R. D. — "Formulas for Natural Frequency and Mode Shape",
- *      Krieger Publishing (1979, reissued 2001).
- *      Definitive tabulated source for the βₙ·L roots and σₙ coefficients
- *      used in dyn_setup. Table 8-1: SS = nπ exactly; Cantilever = 1.87510,
- *      4.69409, 7.85476, 10.99554; FF = 4.73004, 7.85321, 10.99561,
- *      14.13717. If a mode shape ever looks wrong, verify against Blevins.
- *
- *  [5] Ware, C. — "Information Visualization: Perception for Design",
- *      4th ed., Morgan Kaufmann (2020).
- *      Perceptually-ordered colour and luminance ramps (Ch. 4) back the
- *      lo→med→hi stress ramp; quantitative-magnitude encoding by character
- *      density (Ch. 5) backs the " .-~=*#@" glyph ramp; two-colour sign
- *      encoding (Ch. 4) backs the sag/hog moment bars. The 10 themes in
- *      §3 all respect the brightness-ordering principle Ware advocates.
- *
- * Keys:
- *   q/ESC  quit             space   pause/resume    r       reset
- *   d      toggle vibration i / I   impulse kick    g / G   toggle trails
- *   n / p  next / prev BC   l       cycle load
- *   +/-    load P           e / E   deflection exag
- *   z / Z  damping ratio    s / S   time speed
- *   t / T  next / previous theme
- *
- * Boots into dynamic mode with a cantilever + tip load — beam is
- * already vibrating when the demo opens. Cycling BC or load re-excites
- * the modes in place; you don't drop back to static.
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/beam_bending.c -o beam_bending
- * -lncurses -lm
- *
- * ─────────────────────────────────────────────────────────────────────
- *  §1 config   §2 clock    §3 color
- *  §4 beam     §5 solver   §6 dynamics   §7 render   §8 scene
- *  §9 screen   §10 app
- * ─────────────────────────────────────────────────────────────────────
+ * Sources the code can't tell you on its own:
+ *   [1] Gere & Goodno, "Mechanics of Materials", 9th ed. — the beam theory
+ *       behind §4-§5.
+ *   [2] Roark's "Formulas for Stress and Strain", 8th ed., Tables 8.1-8.10
+ *       — the exact sag/moment formulas §5 transcribes.
+ *   [3] Rao, "Mechanical Vibrations", 6th ed., Ch. 8 — the vibration math §6.
+ *   [4] Blevins, "Formulas for Natural Frequency and Mode Shape", Table 8-1
+ *       — the magic ringing-pattern numbers in §6.
+ *   [5] Ware, "Information Visualization", 4th ed. — why the colour and
+ *       character-density ramps read the way they do.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -167,42 +32,39 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
-#define N_NODES 200       /* beam discretisation points                 */
-#define N_TRAIL 12        /* past beam shapes kept for motion-blur trail */
-#define BEAM_HEIGHT 3     /* visible cross-section height in rows (odd) */
-#define PANEL_W 22        /* right-side moment diagram width (cols)     */
-#define BEAM_X_MARGIN 4   /* empty cols on each side of beam span       */
-#define LOAD_ARROW_H 4    /* rows of load arrow above beam top          */
-#define TARGET_FPS 30     /* render frame cap                           */
-#define RAMP_SPEED 0.7f   /* load ramp: full load in ~1.4 s             */
-#define N_MODES 4         /* eigenmodes used in dynamic superposition   */
-#define MODAL_DAMP 0.025f /* ζ — damping ratio (2.5 % of critical)      */
+#define N_NODES 200       /* how many points we sample along the beam   */
+#define N_TRAIL 12        /* past beam shapes kept for the blur trail   */
+#define BEAM_HEIGHT 3     /* how tall the beam looks, in rows (odd)     */
+#define PANEL_W 22        /* width of the moment chart on the right     */
+#define BEAM_X_MARGIN 4   /* blank columns left and right of the beam   */
+#define LOAD_ARROW_H 4    /* how tall the load arrows are, in rows      */
+#define TARGET_FPS 30     /* frames per second we aim for               */
+#define RAMP_SPEED 0.7f   /* a new load fades in over ~1.4 s            */
+#define N_MODES 4         /* how many ringing patterns we add up        */
+#define MODAL_DAMP 0.025f /* how fast the wobble dies down (2.5%)       */
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 
 /*
- * Color pairs — role-named so colour choices don't spread through code.
- * Theme array (see §3) drives the data roles (LO/MED/HI/MOM_P/MOM_N/
- * LOAD/SUPP/HDR). HUD/HINT/DIM are fixed across themes — CLAUDE.md
- * HUD convention (bright yellow + bright cyan) so the chrome stays
- * legible regardless of which palette is active.
+ * Colour slots, named by what they show so colour choices stay in one place.
+ * The theme table in §3 fills in the data slots (stress levels, moment bars,
+ * load, supports, panel header). The HUD, hint, and dim-grey slots stay the
+ * same across every theme so the on-screen text is always readable.
  */
-#define CP_LO 1    /* low  stress zone  — per theme */
-#define CP_MED 2   /* mid  stress zone  — per theme */
-#define CP_HI 3    /* high stress zone  — per theme */
-#define CP_MOM_P 4 /* sagging (positive) moment bar — per theme */
-#define CP_MOM_N 5 /* hogging (negative) moment bar — per theme */
-#define CP_LOAD 6  /* load arrow / label            — per theme */
-#define CP_SUPP 7  /* support symbols               — per theme */
-#define CP_HUD 8   /* HUD top status — bright yellow + bold */
-#define CP_DIM 9   /* reference lines / dim text    — grey   */
-#define CP_HDR 10  /* panel header                  — per theme */
-#define CP_HINT 11 /* HUD bottom hint bar — bright cyan + bold */
+#define CP_LO 1    /* low-stress part of the beam   — per theme */
+#define CP_MED 2   /* medium-stress part           — per theme */
+#define CP_HI 3    /* high-stress part             — per theme */
+#define CP_MOM_P 4 /* downward-bowing moment bar    — per theme */
+#define CP_MOM_N 5 /* upward-bowing moment bar      — per theme */
+#define CP_LOAD 6  /* load arrows and label        — per theme */
+#define CP_SUPP 7  /* support symbols              — per theme */
+#define CP_HUD 8   /* top status line — bright yellow + bold    */
+#define CP_DIM 9   /* faint reference lines        — grey       */
+#define CP_HDR 10  /* moment-panel header          — per theme */
+#define CP_HINT 11 /* bottom key-hint line — bright cyan + bold */
 
 #define N_THEMES 10
 
@@ -220,9 +82,7 @@ static const char *ld_names[LD_COUNT] = {
     "Offset Point (3/4 span)",
 };
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -237,25 +97,24 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color / themes                                                     */
-/* ===================================================================== */
+/* ── §3 color / themes ── */
 
 /*
- * Theme — eight theme-driven 256-colour cube indices, one per data role.
+ * Theme — one colour scheme: eight colour numbers, one for each thing we draw.
  *
- *   lo / med / hi   stress ramp; perceptually ordered low → high so a
- *                   glance reads "where is the beam working hardest?".
- *   mom_p / mom_n   sagging / hogging moment bar. Direction is already
- *                   encoded by '>' vs '<' glyphs, so these two need
- *                   only be distinguishable, not opposite-coded.
- *   load            arrow + 'P' label glyph above the load point.
- *   supp            support symbols (pin 'A' / wall '#' / "free").
- *   hdr             panel header (' MOMENT +/- ' and 'sag+ hog-').
+ * Each field is a 256-colour terminal palette number. The fields:
+ *   name          what to show in the HUD when this theme is active.
+ *   lo / med / hi  three shades for the beam, from least to most stressed,
+ *                  so a glance tells you where the beam is working hardest.
+ *   mom_p / mom_n  colours for the two moment bars (beam bowing down vs up).
+ *                  The '>' / '<' glyphs already show which way, so these two
+ *                  just need to look different, not be opposites.
+ *   load          colour of the load arrows and the 'P' label.
+ *   supp          colour of the support symbols (pin 'A', wall '#', "free").
+ *   hdr           colour of the moment panel's header text.
  *
- * Brightness safety (CLAUDE.md): every entry sits at index ≥ 30, or
- * 24-29 / 240-243 only as the lowest ramp tier. 16-23 / 232-239 are
- * forbidden — they vanish on default-bg terminals.
+ * Every colour is picked bright enough to stay visible on a default-dark
+ * terminal — see the brightness rule in CLAUDE.md.
  */
 typedef struct {
   const char *name;
@@ -285,12 +144,12 @@ static void color_init(int theme) {
   use_default_colors();
   const Theme *th = &themes[theme];
   if (COLORS >= 256) {
-    /* Fixed HUD chrome (theme-independent for legibility). */
+    /* HUD colours stay the same in every theme so the text stays readable. */
     init_pair(CP_HUD, 226, -1); /* bright yellow */
     init_pair(CP_HINT, 51, -1); /* bright cyan   */
     init_pair(CP_DIM, 240, -1); /* dark grey     */
 
-    /* Theme-driven data roles. */
+    /* The rest come from the chosen theme. */
     init_pair(CP_LO, th->lo, -1);
     init_pair(CP_MED, th->med, -1);
     init_pair(CP_HI, th->hi, -1);
@@ -300,7 +159,7 @@ static void color_init(int theme) {
     init_pair(CP_SUPP, th->supp, -1);
     init_pair(CP_HDR, th->hdr, -1);
   } else {
-    /* 8-colour fallback: ignore theme, keep the original mapping. */
+    /* Old 8-colour terminal: ignore the theme, use these basic colours. */
     init_pair(CP_HUD, COLOR_YELLOW, -1);
     init_pair(CP_HINT, COLOR_CYAN, -1);
     init_pair(CP_DIM, COLOR_WHITE, -1);
@@ -315,200 +174,137 @@ static void color_init(int theme) {
   }
 }
 
-/* ===================================================================== */
-/* §4  beam entity                                                        */
-/* ===================================================================== */
+/* ── §4 beam entity ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * DynBeam — modal state for the free-vibration solver (§6).
+/*
+ * DynBeam — everything we need to make the beam wobble (§6).
  *
- * Why a separate struct (vs. inlining into Beam):
- *   The modal coordinates, mode shapes, and generalised forces only
- *   exist when dynamic mode is active. Grouping them under one named
- *   type makes the lifecycle explicit — dyn_activate populates it,
- *   dyn_tick_modes advances it, dyn_impulse perturbs it, the 'd' key
- *   flips d->active. A reader scanning Beam sees `DynBeam dyn` and
- *   knows where to look for vibration state without wading through
- *   ~10 loose g_dyn_* fields.
+ * The idea: a vibrating beam doesn't move in some random way. It rings in a
+ * few fixed patterns at the same time, like the harmonics of a guitar string.
+ * Each pattern is a fixed shape along the beam (a "mode shape") that always
+ * looks the same, paired with an amount that swings up and down over time.
+ * Add the patterns up and you get the live shape of the beam. We track four
+ * patterns; more would barely change the picture.
  *
- * What it represents (the derivation in one breath):
- *   For free vibration of an Euler-Bernoulli beam we look for solutions
- *   of the form w(x,t) = Σₙ φₙ(x)·qₙ(t). Substituting into the PDE and
- *   separating variables splits the problem in two:
+ * We keep this in its own struct because it only matters while the beam is
+ * vibrating: dyn_activate fills it in, dyn_tick_modes moves it forward each
+ * frame, dyn_impulse kicks it, and the 'd' key flips `active` on and off.
  *
- *       EI·φ''''  = ρA·ω²·φ          (spatial eigenvalue ODE)
- *       q̈ₙ + 2ζωₙq̇ₙ + ωₙ²qₙ = Fₙ(t)  (per-mode temporal ODE)
+ * The fixed numbers that define each ringing pattern (one set per beam type)
+ * are tabulated constants — see dyn_setup and Blevins Table 8-1 [4].
  *
- *   The spatial ODE has a four-parameter general solution:
+ * Why dyn_setup does its math in double, not float: the higher patterns for
+ * clamped beams involve subtracting two big, nearly equal numbers, which
+ * eats up precision. Double has enough digits to survive it; the final shape
+ * is stored back as float since the renderer just reads it.
  *
- *       φₙ(x) = C₁cosh(βₙx) + C₂sinh(βₙx) + C₃cos(βₙx) + C₄sin(βₙx)
- *
- *   where β⁴ = ρA·ω²/(EI). Applying the four boundary conditions of the
- *   chosen BC reduces the system to a single characteristic equation in
- *   βL whose roots tabulate the eigenvalues.
- *
- * Tabulated βₙ·L roots (ρA = EI = 1 → ωₙ = βₙ²):
- *
- *     SS:    βₙL = nπ            (exact — char. eq. sin(βL) = 0)
- *     Cant:  cos(βL)·cosh(βL) + 1 = 0
- *            βₙL = 1.87510, 4.69409, 7.85476, 10.99554
- *     FF:    cos(βL)·cosh(βL) - 1 = 0
- *            βₙL = 4.73004, 7.85321, 10.99561, 14.13717
- *
- *   dyn_setup hard-codes these. Source: Blevins Table 8-1 [4].
- *
- * Numerical-precision note (why dyn_setup uses double):
- *   High-order Cantilever / FF mode shapes contain cosh(βₙL) terms that
- *   grow as e^(βₙL)/2 — by mode 4 cosh ≈ 3 × 10⁴. The mode-shape formula
- *   subtracts nearly equal cosh and σₙ·sinh terms; in float (24-bit
- *   mantissa) this destroys 5+ significant digits and the shape collapses
- *   to noise. Double (53-bit) survives the cancellation. The final shape
- *   is stored as float — it's only read by the renderer, not differentiated.
- *
- * Algorithm refs (header REFERENCES):
- *   Eigenvalue problem + modal superposition   — Rao Ch. 8 [3]
- *   Tabulated β·L roots and σₙ coefficients    — Blevins Table 8-1 [4]
- *   Exact transition matrix (damped oscillator) — Rao Ch. 2 [3]
- * ─────────────────────────────────────────────────────────────────────── */
+ * Background math: Rao Ch. 8 [3] (the patterns and how they add up),
+ * Blevins Table 8-1 [4] (the tabulated numbers).
+ */
 typedef struct {
-  /* ── Pre-computed at dyn_activate; constant for the whole run ────── */
-  float phi[N_MODES][N_NODES]; /* mode shape φₙ(xᵢ) sampled once at the
-                                * N_NODES stations; the tick loop just
-                                * forms qₙ·φₙ — no trig per frame.     */
-  float omega[N_MODES];        /* natural frequency ωₙ = βₙ²
-                                * (EI = ρA = 1 in normalised units)    */
-  float modal_mass[N_MODES]; /* Mₙ = ρA·∫₀ᴸφₙ²dx — trapezoidal in
-                              * dyn_setup. Normalises Fₙ so each
-                              * mode's equation is q̈+2ζωq̇+ω²q=F.    */
-  float Fn[N_MODES];         /* pre-divided modal force =
-                              * (1/Mₙ)·∫q(x)·φₙ(x)dx. Recomputed in
-                              * dyn_load when load magnitude changes;
-                              * otherwise constant. Storing the divide
-                              * here keeps dyn_tick_modes branch-free.*/
+  /* ── Set once when vibration starts, then never changes ── */
+  float phi[N_MODES][N_NODES]; /* the four ringing patterns: for each one,
+                                * its fixed shape sampled at every point
+                                * along the beam. Computed once so the
+                                * per-frame loop is just multiply-and-add. */
+  float omega[N_MODES];        /* how fast each pattern swings (its natural
+                                * frequency) — higher patterns ring faster. */
+  float modal_mass[N_MODES];   /* a normalising weight per pattern, so the
+                                * load pushes each one by the right amount.
+                                * Computed by integrating the shape squared
+                                * along the beam (see dyn_setup).           */
+  float Fn[N_MODES];           /* how hard the current load pushes each
+                                * pattern. Already divided by modal_mass so
+                                * the per-frame step needs no division.
+                                * Refreshed by dyn_load when the load changes.*/
 
-  /* ── Time-varying state advanced every sim step ──────────────────── */
-  float q[N_MODES];    /* modal coordinate qₙ(t) — the live DOF
-                        * the integrator advances.            */
-  float qdot[N_MODES]; /* modal velocity q̇ₙ(t) — kept so the
-                        * exact-step transition matrix has
-                        * both (q, q̇) state to evolve.        */
+  /* ── Updated every simulation step ── */
+  float q[N_MODES];    /* how much of each pattern is in play right now —
+                        * this is what swings up and down over time. */
+  float qdot[N_MODES]; /* how fast each of those amounts is changing —
+                        * needed to step the swing forward.          */
 
-  /* ── Display / lifecycle ─────────────────────────────────────────── */
-  float ref_max_w; /* visual y-scale frozen at activation
-                    * (= static peak |w| from solve_beam).
-                    * Only grows, never shrinks (see
-                    * dyn_tick_modes) → no scale jitter
-                    * as the beam crosses zero deflection.*/
-  bool active;     /* true  → scene_tick runs dyn_tick_modes
-                    * false → solve_beam (static) drives w[]
-                    * Toggled by 'd' key.                  */
+  /* ── Display scale and on/off state ── */
+  float ref_max_w; /* the vertical zoom level for drawing, locked in when
+                    * vibration starts. Only ever grows, never shrinks, so
+                    * the beam doesn't appear to zoom in and out as it
+                    * swings through the flat resting position.            */
+  bool active;     /* true  → the beam is vibrating (dyn_tick_modes drives it)
+                    * false → the beam sits still (the static solver drives it)
+                    * Flipped by the 'd' key.                              */
 
-  /* ── Motion-blur trail (read by §7 render_trails) ────────────────── */
-  float trail_w[N_TRAIL][N_NODES]; /* ring buffer of past w[] snapshots
-                                    * pushed by dyn_tick_modes; render_
-                                    * trails reads back from head-1, -2,
-                                    * ... so older frames fade sparser. */
-  int trail_head;                  /* next write slot ∈ [0, N_TRAIL); wraps
-                                    * via (head + 1) % N_TRAIL.            */
+  /* ── Fading after-image trail (drawn by §7 render_trails) ── */
+  float trail_w[N_TRAIL][N_NODES]; /* a rolling record of the last few beam
+                                    * shapes, kept so we can draw faint
+                                    * after-images behind the live beam.   */
+  int trail_head;                  /* where the next snapshot goes; wraps
+                                    * around the ring of N_TRAIL slots.    */
 } DynBeam;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Beam — complete simulator state for one Euler-Bernoulli beam.
+/*
+ * Beam — everything about one beam: its shape, its load, and how it's wobbling.
  *
- * Why L = EI = 1 (the normalisation choice):
- *   The governing equation EI·d⁴w/dx⁴ = q(x) becomes dimensionless when
- *   we pick L = EI = 1. Closed-form formulas in §5 then read directly
- *   without unit baggage — e.g. cantilever tip deflection is just "P/3"
- *   instead of "PL³/(3EI)". The screen never shows physical units anyway
- *   (only a visual exaggeration), so the loss of dimensionality costs
- *   nothing in clarity and buys readable formulas in solve_beam.
+ * To keep the formulas tidy we measure the beam in its own units: length 1,
+ * stiffness 1. That strips the units out of the §5 formulas (a cantilever tip
+ * sags by "P/3" instead of "PL³/(3EI)") and costs nothing, since the screen
+ * only shows a visually-exaggerated picture, never real metres.
  *
- * Why fixed-grid sampling (N_NODES = 200):
- *   The closed-form solutions are continuous functions of x. We sample
- *   them at N_NODES equally-spaced stations so the renderer can map
- *   beam-node → screen-column with one integer divide (node_col in §7).
- *   Re-evaluating the closed-form at each screen column instead would
- *   couple the renderer to the analytic formulas and break the §5 / §7
- *   boundary that lets us swap solvers (e.g. dyn_tick_modes overwrites
- *   the same w[] without touching anything else).
+ * We don't store one continuous curve — we store the beam's height at 200
+ * evenly-spaced points along it. That makes drawing easy: each point maps
+ * straight to a screen column. The static and vibrating modes both just
+ * overwrite the same height array, so the rest of the code doesn't care which
+ * one produced it.
  *
- * Deflection convention (positive = downward):
- *   w[i] is stored in normalised L-units (same as x[i]). The renderer
- *   applies `exag` purely as a visual multiplier — without it, even
- *   PL³/(3EI) for a cantilever lives within a single character cell.
- *   The physics never sees `exag`; it is consumed only in defl_row (§7).
+ * Heights are stored with "down" being positive. The renderer multiplies by
+ * `exag` to make tiny real sags big enough to see; the physics never touches
+ * `exag`.
  *
- * Field groups (mirrored by the struct layout below):
- *   Discrete samples — w, M, x: closed-form values at each node.
- *   Beam constants   — L, EI, P, exag (P/exag interactive; L/EI fixed).
- *   Time-varying     — load_anim, damping_ratio, paused.
- *   Configuration    — bc, load: drive the §5 / §6 dispatch.
- *   Solver outputs   — max_deflection, max_moment: renderer normalises
- *                      against these for stress-band colouring + bars.
- *   Dynamic state    — nested DynBeam, only meaningful when dyn.active.
- *
- * Algorithm refs (header REFERENCES):
- *   Euler-Bernoulli foundation (EI·w'' = M, sign conventions) — Gere [1]
- *   Closed-form M(x), w(x) per BC × load type                — Roark [2]
- *   Modal superposition (dyn sub-state)                      — Rao [3]
- * ─────────────────────────────────────────────────────────────────────── */
+ * Background math: Gere [1] (the beam theory), Roark [2] (the §5 formulas),
+ * Rao [3] (the vibration sub-state).
+ */
 typedef struct {
-  /* ── Discrete samples of the continuous beam (i ∈ [0, N_NODES-1]) ─ */
-  float w[N_NODES]; /* deflection at xᵢ
-                     * (positive = downward, L-units)    */
-  float M[N_NODES]; /* bending moment at xᵢ (sagging = +)*/
-  float x[N_NODES]; /* xᵢ = i/(N_NODES-1) ∈ [0,1]; cached
-                     * once at init so the §5 inner loop
-                     * doesn't re-divide every node.     */
+  /* ── The beam sampled at 200 points along its length ── */
+  float w[N_NODES]; /* how far the beam has sagged at this point (down = +) */
+  float M[N_NODES]; /* the bending effort at this point (bowing down = +)   */
+  float x[N_NODES]; /* this point's position along the beam, 0 to 1.
+                     * Computed once at startup so §5 doesn't redo it.    */
 
-  /* ── Beam constants (physics + one cosmetic) ─────────────────────── */
-  float L;    /* beam length — fixed at 1.0 (norm.)*/
-  float EI;   /* flexural rigidity — fixed at 1.0  */
-  float P;    /* load magnitude — interactive (+/-)
-               * Range 0.05 – 100; multiplied by
-               * load_anim before reaching M / w.  */
-  float exag; /* render-only visual multiplier
-               * (e / E keys, 0.5×–20×). Strictly
-               * cosmetic — never enters physics.  */
+  /* ── Fixed beam properties, plus one drawing knob ── */
+  float L;    /* beam length — always 1 in our units */
+  float EI;   /* beam stiffness — always 1 in our units */
+  float P;    /* how heavy the load is (+/- keys, 0.05 to 100).
+               * Multiplied by load_anim before it bends the beam. */
+  float exag; /* drawing-only exaggeration of the sag (e / E keys,
+               * 0.5x to 20x). Never affects the physics.          */
 
-  /* ── Time-varying / interactive state ────────────────────────────── */
-  float load_anim;     /* ∈ [0,1]. Static mode: ramps in over
-                        * RAMP_SPEED seconds so a fresh load
-                        * grows in instead of snapping.
-                        * Dynamic mode: dyn_activate clamps
-                        * to 1.0 — modes see a step input.  */
-  float damping_ratio; /* ζ in q̈+2ζωq̇+ω²q=F (z / Z keys)
-                        * Range 0.001 (almost undamped, long
-                        * ringdown) to 0.5 (heavily damped,
-                        * ~no oscillation). Default 0.025
-                        * matches structural steel.         */
-  bool paused;         /* spc key — freezes every sim tick
-                        * (beam_tick is a no-op).           */
+  /* ── Things that change while running ── */
+  float load_anim;     /* how much of the load is "on" right now, 0 to 1.
+                        * When sitting still, a new load fades in over a
+                        * fraction of a second instead of popping on.
+                        * When vibrating, it's snapped straight to 1.   */
+  float damping_ratio; /* how quickly the wobble dies down (z / Z keys).
+                        * 0.001 = rings for ages; 0.5 = stops almost at
+                        * once. Default 0.025 is about right for steel. */
+  bool paused;         /* spacebar — freezes the whole simulation.       */
 
-  /* ── Configuration (drives §5 solve_beam / §6 dyn_setup dispatch) ── */
-  BCType bc;   /* SS / Cantilever / FF — n / p keys */
-  LDType load; /* centre / UDL / offset — l key     */
+  /* ── Which beam and which load (picks the §5 / §6 formula) ── */
+  BCType bc;   /* how the ends are held — n / p keys */
+  LDType load; /* where the load sits — l key        */
 
-  /* ── Solver outputs (refreshed each tick; consumed by renderer) ──── */
-  float max_deflection; /* max |w[i]| over the beam.
-                         * Renderer uses this as the y-scale
-                         * in defl_row(). In dynamic mode
-                         * it's frozen via DynBeam.ref_max_w
-                         * to avoid scale jitter at zero
-                         * crossings.                        */
-  float max_moment;     /* max |M[i]| over the beam. Drives
-                         * the stress-band threshold in
-                         * draw_curvature_column and the bar
-                         * normalisation in the moment panel.*/
+  /* ── Peak values, recomputed each step, used to scale the drawing ── */
+  float max_deflection; /* the biggest sag anywhere on the beam — sets the
+                         * vertical zoom. While vibrating this is frozen so
+                         * the beam doesn't appear to zoom in and out.   */
+  float max_moment;     /* the biggest bending effort anywhere — sets the
+                         * stress colours and the length of the moment bars.*/
 
-  /* ── Free-vibration sub-state (only meaningful when dyn.active) ──── */
+  /* ── Vibration state (only meaningful while dyn.active) ── */
   DynBeam dyn;
 } Beam;
 
-/* apply_load — set BC, load type, and load magnitude on the beam.
- * Does NOT reset load_anim; callers (init_beam, the n/p/l key handlers)
- * touch the ramp explicitly when they want the new load to grow in
- * from zero instead of snapping to the current ramp position. */
+/* Sets which beam, which load, and how heavy. Deliberately leaves the
+ * fade-in alone — callers reset it themselves when they want the new load
+ * to fade in from nothing. */
 static void apply_load(Beam *b, BCType bc, LDType ld, float P) {
   b->bc = bc;
   b->load = ld;
@@ -525,47 +321,31 @@ static void init_beam(Beam *b) {
   b->paused = false;
   for (int i = 0; i < N_NODES; i++)
     b->x[i] = (float)i / (float)(N_NODES - 1);
-  /* Default to the most visually dramatic configuration: cantilever +
-   * tip load. Largest absolute deflection of any BC; slowest mode-1
-   * period so the eye can track the oscillation; longest ringdown
-   * because the mode is far from the high-frequency damped regime. */
+  /* Start with the most fun setup: a diving-board beam with a weight on the
+   * tip. It sags the most and wobbles the slowest, so it's the easiest to
+   * watch. */
   apply_load(b, BC_CANT, LD_CENTER, 1.0f);
 }
 
-/* ===================================================================== */
-/* §5  solver — closed-form Euler-Bernoulli solutions                     */
-/* ===================================================================== */
+/* ── §5 solver — exact beam-shape formulas ── */
 
 /*
- * The static solver evaluates the analytic (M, w) at every beam node by
- * dispatching to a per-(BC, load) helper.  All closed forms come from
- * Roark Tables 8.1 – 8.10 [2]; they are derived by integrating
- * EI·w'''' = q(x) four times and applying the four boundary conditions
- * of the chosen BC.  Sign convention: w positive downward, M positive
- * sagging.
+ * For a beam sitting still, we don't simulate anything — there's a known
+ * formula for the exact sag and bending at every point, for each combination
+ * of beam type and load. The helpers below are those formulas, copied from
+ * Roark's tables [2]. Each takes a position and the load and hands back the
+ * sag and bending there; none of them touch any shared state.
  *
- * The helpers below are pure: they read no Beam state, only their
- * arguments, and write (M, w) through output pointers.  Each comment
- * gives the closed-form expression next to the code that implements it
- * — read the docstring before the body.
+ * solve_beam picks the right helper for the current beam/load, runs it at
+ * every point, and notes the biggest sag and bending for the drawing code.
  *
- * solve_beam itself is the dispatch table plus the per-node bookkeeping
- * (max_w, max_M for renderer normalisation).
+ * Throughout: sag is positive downward, and bending is positive when the
+ * beam bows downward (smiling) and negative when it bows up (frowning).
  */
 
 /*
- * simply_supported_point_load — pin-pin beam, point load P at x = a.
- *
- * Roark Table 8.1 [2].  With b = L - a:
- *
- *   x ≤ a:  M(x) = P·b·x / L
- *           w(x) = P·b·x·(L² - b² - x²) / (6·EI·L)
- *   x > a:  M and w of the right segment via symmetric substitution
- *           xs = L - x, swap a ↔ b.
- *
- * Reactions:    R_left = P·b/L,  R_right = P·a/L.
- * Moment peak:  M_max = P·a·b/L at x = a.
- * For a = L/2:  δ_max = PL³/(48·EI), M_max = PL/4 — textbook midspan.
+ * Pinned at both ends, with a single weight somewhere along it (at x = a).
+ * Both ends rest on supports they can pivot on. Roark Table 8.1 [2].
  */
 static void simply_supported_point_load(float x, float L, float EI, float P,
                                         float a, float *M, float *w) {
@@ -581,15 +361,8 @@ static void simply_supported_point_load(float x, float L, float EI, float P,
 }
 
 /*
- * simply_supported_udl — pin-pin beam, uniform load q over full span.
- *
- * Roark Table 8.1 [2].
- *
- *   M(x) = q·x·(L - x) / 2          (parabola, peak qL²/8 at midspan)
- *   w(x) = q·x·(L³ - 2L·x² + x³) / (24·EI)
- *
- * 4th-order polynomial in x.  Symmetric: w(x) = w(L - x).
- * δ_max = 5qL⁴/(384·EI) at midspan.
+ * Pinned at both ends, with the load spread evenly along the whole beam
+ * (like its own weight). Sags most in the middle. Roark Table 8.1 [2].
  */
 static void simply_supported_udl(float x, float L, float EI, float q, float *M,
                                  float *w) {
@@ -598,15 +371,9 @@ static void simply_supported_udl(float x, float L, float EI, float q, float *M,
 }
 
 /*
- * cantilever_tip_point_load — fixed-free beam, point load P at the tip.
- *
- * Roark Table 8.2 [2].
- *
- *   M(x) = P·(L - x)           (linear, max at wall, zero at tip)
- *   w(x) = P·x²·(3L - x) / (6·EI)
- *
- * δ_tip = PL³/(3·EI) — 16× the SS midspan deflection for the same P.
- * The clamped wall carries BOTH the shear P and the moment M_wall = PL.
+ * A diving board: clamped into a wall at one end, free at the other, with a
+ * weight hung on the free tip. Sags the most of any setup here, and all the
+ * bending effort piles up at the wall. Roark Table 8.2 [2].
  */
 static void cantilever_tip_point_load(float x, float L, float EI, float P,
                                       float *M, float *w) {
@@ -615,22 +382,14 @@ static void cantilever_tip_point_load(float x, float L, float EI, float P,
 }
 
 /*
- * cantilever_intermediate_point_load — fixed-free, point load P at x = a < L.
- *
- * Roark Table 8.2 (intermediate load) [2].
- *
- *   x ≤ a:  M(x) = P·(a - x)
- *           w(x) = P·x²·(3a - x) / (6·EI)
- *   x > a:  M(x) = 0
- *           w(x) = P·a²·(3x - a) / (6·EI)   (rigid extension)
- *
- * Beyond the load, the beam carries no internal moment, so it continues
- * as a straight tangent line from the deflection at a.
+ * Same diving board, but the weight sits partway out (at x = a), not on the
+ * tip. Past the weight the beam carries no bending, so the leftover stub just
+ * sticks out straight at whatever angle it had reached. Roark Table 8.2 [2].
  */
 static void cantilever_intermediate_point_load(float x, float L, float EI,
                                                float P, float a, float *M,
                                                float *w) {
-  (void)L; /* helper is L-agnostic — only a matters here */
+  (void)L; /* the formula only needs the load position, not the length */
   if (x <= a) {
     *M = P * (a - x);
     *w = P * x * x * (3.0f * a - x) / (6.0f * EI);
@@ -641,15 +400,9 @@ static void cantilever_intermediate_point_load(float x, float L, float EI,
 }
 
 /*
- * cantilever_udl — fixed-free beam, uniform load q over full span.
- *
+ * Diving board again, but loaded evenly along its whole length instead of at
+ * one spot. The wall takes the most strain of any diving-board case here.
  * Roark Table 8.2 [2].
- *
- *   M(x) = q·(L - x)² / 2          (max qL²/2 at wall, zero at tip)
- *   w(x) = q·x²·(6L² - 4L·x + x²) / (24·EI)
- *
- * δ_tip = qL⁴/(8·EI).  Wall stress is the highest of any canonical
- * cantilever loading — total load qL acts with moment arm L/2.
  */
 static void cantilever_udl(float x, float L, float EI, float q, float *M,
                            float *w) {
@@ -659,20 +412,10 @@ static void cantilever_udl(float x, float L, float EI, float q, float *M,
 }
 
 /*
- * fixed_fixed_center_point_load — both ends clamped, point load at L/2.
- *
- * Roark Table 8.3 [2].  Symmetric problem.
- *
- *   Fixed-end moments: M_A = M_B = -PL/8  (hogging)
- *   Reactions:         R_A = R_B = P/2
- *
- *   x ≤ L/2:  M(x) = P·x/2 - PL/8        (linear, crosses zero at x = L/4)
- *             w(x) = P·x²·(3L - 4x) / (48·EI)
- *   x > L/2:  mirror substitution xs = L - x.
- *
- * Stiffest of the three canonical BCs: δ_max = PL³/(192·EI), only ¼ of
- * the SS midspan deflection.  Moment diagram crosses zero TWICE
- * (sagging midspan, hogging walls).
+ * Both ends clamped into walls, with a single weight right in the middle.
+ * This is the stiffest setup here — it sags only a quarter as much as the
+ * pinned beam, because the walls fight the bending. The beam bows up near
+ * the walls and down in the middle. Roark Table 8.3 [2].
  */
 static void fixed_fixed_center_point_load(float x, float L, float EI, float P,
                                           float *M, float *w) {
@@ -687,17 +430,10 @@ static void fixed_fixed_center_point_load(float x, float L, float EI, float P,
 }
 
 /*
- * fixed_fixed_udl — both ends clamped, uniform load q over full span.
- *
+ * Both ends clamped, load spread evenly along the whole beam. The walls
+ * take the most strain here; the middle sags but bows the other way near
+ * each wall. Sags only a fifth as much as the same load on a pinned beam.
  * Roark Table 8.3 [2].
- *
- *   Fixed-end moments: M_A = M_B = -qL²/12
- *   M(x) = q·x·(L - x)/2 - qL²/12
- *   w(x) = q·x²·(L - x)² / (24·EI)
- *
- * Inflection points at x = L/2 ± L/(2√3).  Wall moment qL²/12 is the
- * largest stress concentration; midspan moment is qL²/24.
- * δ_max = qL⁴/(384·EI) — one-fifth of SS midspan UDL deflection.
  */
 static void fixed_fixed_udl(float x, float L, float EI, float q, float *M,
                             float *w) {
@@ -707,21 +443,10 @@ static void fixed_fixed_udl(float x, float L, float EI, float q, float *M,
 }
 
 /*
- * fixed_fixed_offset_point_load — both ends clamped, point load P at x = a.
- *
- * Roark Table 8.3 (intermediate point load) [2], stiffness-method form.
- * With b = L - a:
- *
- *   Fixed-end moments: M_A = -P·a·b² / L²,   M_B = -P·a²·b / L²
- *   Wall reaction:     R_A = P·b²·(3a + b) / L³
- *
- *   x ≤ a:  M(x) = -M_A + R_A·x
- *           w(x) = P·b²·x²·(3aL - (3a + b)·x) / (6·EI·L³)
- *   x > a:  M(x) = -M_A + R_A·x - P·(x - a)
- *           Using xs = L - x:
- *           w(x) = P·a²·xs²·(3bL - (3b + a)·xs) / (6·EI·L³)
- *
- * Reduces to fixed_fixed_center_point_load when a = b = L/2.
+ * Both ends clamped, but the weight sits off to one side (at x = a) instead
+ * of the middle. The lopsided position means each wall pulls a different
+ * amount. If the weight were centred this would match the center-load case
+ * above. Roark Table 8.3 (intermediate point load) [2].
  */
 static void fixed_fixed_offset_point_load(float x, float L, float EI, float P,
                                           float a, float *M, float *w) {
@@ -743,17 +468,9 @@ static void fixed_fixed_offset_point_load(float x, float L, float EI, float P,
 }
 
 /*
- * solve_beam — dispatch closed-form (M(x), w(x)) per node, then record
- * the field maxima for renderer normalisation.
- *
- * Pseudocode:
- *   P_eff ← b->P · b->load_anim                 (animated load ramp)
- *   for each node i:
- *       x ← b->x[i] · L
- *       dispatch on (b->bc, b->load) → one of the 8 helpers above,
- *           writing (M[i], w[i]).
- *   max_deflection ← max |w[i]|
- *   max_moment     ← max |M[i]|
+ * Fills in the whole beam shape for whatever's set up right now: picks the
+ * matching formula above, runs it at every point, and notes the biggest sag
+ * and bending so the drawing code knows how far to zoom and how to colour.
  */
 static void solve_beam(Beam *b) {
   float L = b->L;
@@ -821,7 +538,7 @@ static void solve_beam(Beam *b) {
     b->M[i] = M;
   }
 
-  /* Field extrema for renderer normalisation (stress ramp + moment bars). */
+  /* Note the biggest sag and bending — drives the zoom and the colours. */
   float max_w = 0.0f, max_M = 0.0f;
   for (int i = 0; i < N_NODES; i++) {
     if (fabsf(b->w[i]) > max_w)
@@ -833,37 +550,25 @@ static void solve_beam(Beam *b) {
   b->max_moment = max_M;
 }
 
-/* ===================================================================== */
-/* §6  dynamics — modal superposition                                     */
-/* ===================================================================== */
+/* ── §6 dynamics — making the beam wobble ── */
 
 /*
- * Mode-shape helpers — one per BC.  Each precomputes ωₙ and φₙ(xᵢ) for
- * N_MODES eigenmodes.  All work in double precision (see DynBeam
- * docstring) and write the final shape as float into d->phi for the
- * renderer / synthesis loop.
+ * Each helper below works out the ringing patterns for one kind of beam:
+ * the fixed shape of each pattern at every point, plus how fast it swings.
+ * There's one helper per beam type because the wall-vs-pin ends change the
+ * shapes. They all do their math in double precision for accuracy (see the
+ * DynBeam note in §4), then store the shape as float for the drawing code.
  *
- * The common form for the fixed-end cases (cantilever, FF) is:
+ * The pinned beam's patterns are simple sine waves. The clamped ones need
+ * a curvier shape that flattens out hard against each wall.
  *
- *     φₙ(x) = cosh(βₙx) - cos(βₙx) - σₙ·(sinh(βₙx) - sin(βₙx))
- *
- * where σₙ is the BC-specific coefficient that enforces the boundary
- * conditions at x = L.  The simply-supported case collapses to pure
- * sines and skips the hyperbolic terms entirely.
- *
- * Algorithm refs: Rao §8 [3], Blevins Table 8-1 [4].
+ * Background math: Rao §8 [3], Blevins Table 8-1 [4].
  */
 
 /*
- * setup_simply_supported_modes — pure sine eigenmodes for the pin-pin beam.
- *
- * Characteristic equation: sin(βL) = 0  ⇒  βₙL = nπ  (closed-form roots).
- * With ρA = EI = 1:
- *     ωₙ      = βₙ² = (nπ/L)²
- *     φₙ(x)   = sin(βₙ·x)
- *
- * Pure sines have no near-equal-magnitude cancellation; double promotion
- * here is purely for consistency with the other two helpers.
+ * Pinned-at-both-ends beam: its ringing patterns are just plain sine waves,
+ * like the shapes a guitar string makes. The nth pattern fits n humps
+ * between the ends, and the more humps, the faster it swings.
  */
 static void setup_simply_supported_modes(DynBeam *d, const Beam *b) {
   double L = (double)b->L;
@@ -876,16 +581,12 @@ static void setup_simply_supported_modes(DynBeam *d, const Beam *b) {
 }
 
 /*
- * setup_cantilever_modes — fixed-free eigenmodes.
- *
- * Characteristic equation: cos(βL)·cosh(βL) + 1 = 0
- * Roots (Blevins Table 8-1 [4]):  βₙL = 1.87510, 4.69409, 7.85476, 10.99554
- *
- *     σₙ = (cos βₙL + cosh βₙL) / (sin βₙL + sinh βₙL)
- *     ωₙ = βₙ²    (EI = ρA = 1)
- *
- * Computed in double — cosh(βₙL) ≈ 30 000 at n = 4 destroys 5+ digits in
- * float during the cosh - σ·sinh subtraction.
+ * Diving-board beam (clamped one end, free at the other): its ringing
+ * patterns are flat against the wall and free to flap at the tip. The four
+ * `lam` numbers are tabulated constants that pin down each pattern's shape
+ * — there's no neat formula for them, so they're looked up (Blevins [4]).
+ * Done in double because the higher patterns subtract two huge nearly-equal
+ * numbers, which would wreck the accuracy in plain float.
  */
 static void setup_cantilever_modes(DynBeam *d, const Beam *b) {
   static const double lam[N_MODES] = {1.87510, 4.69409, 7.85476, 10.99554};
@@ -903,17 +604,11 @@ static void setup_cantilever_modes(DynBeam *d, const Beam *b) {
 }
 
 /*
- * setup_fixed_fixed_modes — clamped-clamped eigenmodes.
- *
- * Characteristic equation: cos(βL)·cosh(βL) - 1 = 0
- * Roots (Blevins Table 8-1 [4]):  βₙL = 4.73004, 7.85321, 10.99561, 14.13717
- *
- *     σₙ = (cos βₙL - cosh βₙL) / (sinh βₙL - sin βₙL)
- *     ωₙ = βₙ²    (EI = ρA = 1)
- *
- * Same cancellation concern as cantilever — double promotion required.
- * Falls back to σₙ = -1 if the denominator collapses (shouldn't occur
- * for the tabulated roots, but defensive against numerical drift).
+ * Both-ends-clamped beam: its ringing patterns are flat against both walls
+ * and bulge in between. Like the diving board, the four `lam` numbers are
+ * looked-up constants (Blevins [4]) and the math runs in double to survive
+ * the same big-number cancellation. The `sig` guard falls back to -1 if a
+ * divide would blow up — shouldn't happen with these numbers, just safety.
  */
 static void setup_fixed_fixed_modes(DynBeam *d, const Beam *b) {
   static const double lam[N_MODES] = {4.73004, 7.85321, 10.99561, 14.13717};
@@ -933,18 +628,12 @@ static void setup_fixed_fixed_modes(DynBeam *d, const Beam *b) {
 }
 
 /*
- * integrate_modal_masses_trapezoidal — Mₙ = ρA · ∫₀ᴸ φₙ²(x) dx, computed
- * by the trapezoidal rule on the uniform N_NODES grid.
+ * Works out a "weight" for each ringing pattern by adding up its shape
+ * squared along the beam. This is what lets the load push each pattern by
+ * the right amount later. If the sum comes out tiny (which shouldn't
+ * happen), we clamp it to 1 so nothing divides by zero downstream.
  *
- *     Mₙ ≈ ρA · Σᵢ φₙ²(xᵢ) · Δx     (Δx = L / (N_NODES - 1))
- *
- * With ρA = 1, Mₙ has units of length.  Used to normalise the
- * generalised force Fₙ so each mode's equation reads
- *     q̈ + 2ζωq̇ + ω²q = Fₙ
- * with consistent units. Clamps Mₙ to 1.0 if it numerically degenerates,
- * preventing a downstream division by zero in dyn_load.
- *
- * Algorithm ref: Rao §8 (modal mass) [3].
+ * Background math: Rao §8 (modal mass) [3].
  */
 static void integrate_modal_masses_trapezoidal(DynBeam *d, const Beam *b) {
   double dx = (double)b->L / (double)(N_NODES - 1);
@@ -957,18 +646,11 @@ static void integrate_modal_masses_trapezoidal(DynBeam *d, const Beam *b) {
 }
 
 /*
- * dyn_setup — pre-compute the modal basis (ωₙ, φₙ, Mₙ) for the current BC.
- *
- * Pseudocode:
- *   dispatch on b->bc:
- *       SS    → setup_simply_supported_modes  (pure sines)
- *       Cant  → setup_cantilever_modes        (hyperbolic-trig hybrid)
- *       FF    → setup_fixed_fixed_modes       (hyperbolic-trig hybrid)
- *   integrate_modal_masses_trapezoidal        (∫ φₙ² dx for each mode)
- *
- * Called once at dyn_activate (or re-call when BC / load changes mid-
- * vibration via n / p / l).  The result is frozen for the duration of
- * the run — q(t) varies every tick, φ(x) does not.
+ * Sets up the ringing patterns for whichever beam is selected: picks the
+ * right pattern-builder, then works out each pattern's weight. Run once when
+ * vibration starts, and again if you switch beam type or load mid-wobble.
+ * The patterns don't change after this — only how much of each is in play
+ * changes from frame to frame.
  */
 static void dyn_setup(Beam *b) {
   DynBeam *d = &b->dyn;
@@ -991,14 +673,10 @@ static void dyn_setup(Beam *b) {
 }
 
 /*
- * dyn_load — project load q(x) onto each mode to get generalised forces.
- *
- *   Fₙ = (1/Mₙ) · ∫ q(x)·φₙ(x) dx
- *
- * For point loads at position xf, the Dirac-delta integral gives:
- *   Fₙ = P·φₙ(xf) / Mₙ
- *
- * For UDL, numerical integration (rectangle rule) over all nodes.
+ * Works out how hard the current load pushes on each ringing pattern. A
+ * pattern that's tall where the load sits gets pushed a lot; one that's flat
+ * there barely feels it. For a spread-out load we add up the push along the
+ * whole beam; for a single weight we just sample the pattern where it lands.
  */
 static void dyn_load(Beam *b) {
   DynBeam *d = &b->dyn;
@@ -1021,38 +699,23 @@ static void dyn_load(Beam *b) {
 }
 
 /*
- * dyn_activate — switch from static to dynamic oscillation mode.
- *
- * Initial conditions: q = q̇ = 0 — the beam starts from rest at zero
- * deflection and the load is then applied as a step function.
- *
- * Dynamic magnification:  under a suddenly-applied constant load the
- * response overshoots the static deflection by up to 2× on the first
- * half-cycle (DMF = 2 for the undamped case).  Damping reduces this.
- * The damping ratio lives on the Beam as b->damping_ratio and is
- * interactive (z / Z keys); init_beam seeds it from MODAL_DAMP (2.5%,
- * a typical structural-steel value), but each call to dyn_activate
- * just consumes whatever value is currently there.
- *
- * Steps performed:
- *   1. Snap load_anim to 1.0 (modes see a clean step, not a ramp).
- *   2. Run solve_beam once to get b->max_deflection — captured as the
- *      locked visual scale (ref_max_w) so the display doesn't rezoom
- *      as the beam swings through equilibrium.
- *   3. Pre-compute the modal basis (dyn_setup) and the generalised
- *      forces (dyn_load) for the current BC and load.
- *   4. Zero out the modal coordinates / velocities and the trail ring
- *      buffer; flip d->active so beam_tick routes to dyn_tick_modes.
+ * Flips the beam from sitting-still mode into wobbling mode. The beam starts
+ * flat and at rest, then the load drops on all at once — which is why it
+ * overshoots and swings past where it would settle, before damping reins it
+ * in (a suddenly-dropped load makes a beam dip about twice as far on the
+ * first swing as it eventually rests). It locks in the zoom level first so
+ * the beam doesn't appear to grow and shrink as it swings through flat, then
+ * builds the ringing patterns and clears the wobble state.
  */
 static void dyn_activate(Beam *b) {
   b->load_anim = 1.0f;
-  solve_beam(b); /* compute b->max_deflection   */
+  solve_beam(b); /* get the resting sag so we can lock the zoom */
 
   DynBeam *d = &b->dyn;
-  d->ref_max_w = b->max_deflection; /* freeze the visual y-scale   */
+  d->ref_max_w = b->max_deflection; /* lock the vertical zoom */
 
-  dyn_setup(b); /* mode shapes + modal masses  */
-  dyn_load(b);  /* generalised forces Fₙ       */
+  dyn_setup(b); /* build the ringing patterns     */
+  dyn_load(b);  /* work out the per-pattern push  */
 
   for (int n = 0; n < N_MODES; n++) {
     d->q[n] = 0.0f;
@@ -1064,37 +727,24 @@ static void dyn_activate(Beam *b) {
 }
 
 /*
- * advance_damped_oscillator_exact — single-mode step under the exact
- * transition matrix for q̈ + 2ζω·q̇ + ω²·q = F (F constant over the step).
+ * Moves one ringing pattern forward a small step in time. Think of each
+ * pattern as a damped spring-and-weight that swings, slows, and settles.
  *
- * WHY exact, not Euler / RK:  explicit Euler maps the homogeneous
- * eigenvalues e^(±iωdt) to (1 ± iωdt), which grows in magnitude as soon
- * as ω·dt > 2.  At ω₄ ≈ 120 rad/s and dt = 1/30 s, ω·dt ≈ 4 — Euler
- * diverges within a few frames.  The closed-form transition matrix
- * below has eigenvalues whose magnitude is exactly e^(-ζωdt) < 1, so
- * it is unconditionally stable for any dt and any ω.
+ * Instead of nudging it forward in tiny numerical steps, we use the exact
+ * formula for where a damped swing lands after a given amount of time. The
+ * reason matters: the simple step-it-forward methods blow up when the
+ * pattern swings fast relative to the frame rate — and the fastest patterns
+ * here do exactly that. The exact formula always stays stable and always
+ * decays, no matter how fast the swing or how big the step.
  *
- * Derivation (F constant on [t, t+dt]):
- *
- *   Static offset:   q_s = F / ω²
- *   Let η = q - q_s.  Then η̈ + 2ζω·η̇ + ω²·η = 0     (homogeneous)
- *
- *   η(t + dt) = e^(-ζω·dt) · [ A·cos(ω_d·dt) + B·sin(ω_d·dt) ]
- *   η̇(t + dt) = e^(-ζω·dt) · [ (-ζω·A + ω_d·B)·cos(ω_d·dt)
- *                              + (-ζω·B - ω_d·A)·sin(ω_d·dt) ]
- *
- *   ω_d = ω · √(1 - ζ²)              (damped natural frequency)
- *   A   = η(t)
- *   B   = (η̇(t) + ζω·η(t)) / ω_d
- *
- * Algorithm ref: Rao Ch. 2 (single-DOF damped vibration) [3].
+ * Background math: Rao Ch. 2 (damped vibration of one spring-mass) [3].
  */
 static void advance_damped_oscillator_exact(float omega, float zeta, float F,
                                             float dt, float *q, float *qdot) {
   float q_s = (omega > 1e-6f) ? F / (omega * omega) : 0.0f;
   float wd = omega * sqrtf(1.0f - zeta * zeta);
   if (wd < 1e-6f)
-    wd = 1e-6f; /* critical-damping floor */
+    wd = 1e-6f; /* keep the swing rate above zero so nothing divides by it */
 
   float eta = *q - q_s;
   float etad = *qdot;
@@ -1110,19 +760,12 @@ static void advance_damped_oscillator_exact(float omega, float zeta, float F,
 }
 
 /*
- * synthesise_deflection_from_modes — modal-superposition synthesis.
+ * Builds the live beam shape by adding the ringing patterns together: at
+ * each point, take how much of each pattern is in play right now and stack
+ * them up. Also hands back the biggest sag so the caller can adjust the zoom
+ * without a second pass over the beam.
  *
- *     w(xᵢ) = Σₙ qₙ(t) · φₙ(xᵢ)
- *
- * The integrator advances qₙ(t) in modal coordinates (each mode
- * independent — that's the whole point of solving the eigenvalue
- * problem). This helper performs the inverse transform back to
- * physical space, the "synthesis" half of modal superposition.
- *
- * Returns max |w| over the beam so the caller can grow the visual
- * y-scale in a single pass.
- *
- * Algorithm ref: Rao §8 modal superposition [3].
+ * Background math: Rao §8 (adding patterns up) [3].
  */
 static float synthesise_deflection_from_modes(Beam *b) {
   const DynBeam *d = &b->dyn;
@@ -1139,9 +782,8 @@ static float synthesise_deflection_from_modes(Beam *b) {
 }
 
 /*
- * push_trail_snapshot — copy the current w[] into the motion-blur ring
- * buffer and advance the head.  Renderer reads back from head-1, -2, …
- * so older snapshots fade to sparser stippling (§7 render_trails).
+ * Saves a snapshot of the current beam shape into the rolling record, so the
+ * renderer can draw faint after-images of where the beam just was (§7).
  */
 static void push_trail_snapshot(DynBeam *d, const float *w) {
   memcpy(d->trail_w[d->trail_head], w, sizeof(float) * N_NODES);
@@ -1149,16 +791,11 @@ static void push_trail_snapshot(DynBeam *d, const float *w) {
 }
 
 /*
- * grow_visual_scale_with_hysteresis — let the display y-scale ref_max_w
- * grow but never shrink.
- *
- * Why one-way:  as the beam swings through equilibrium, the instantaneous
- * max |w| dips toward zero. A two-way scale would rapidly rezoom and the
- * eye would see the BEAM appear to shrink/grow — visually disorienting
- * and physically wrong (the oscillation ENVELOPE hasn't changed).
- *
- * 5% hysteresis prevents micro-noise (numerical roundoff) from
- * inflating the scale frame by frame.
+ * Lets the zoom level grow but never shrink. As the beam swings through the
+ * flat position its sag briefly drops near zero; if the zoom tracked that,
+ * the beam would seem to balloon and shrink every swing, which is both
+ * dizzying and wrong — the swing itself hasn't gotten any smaller. The 5%
+ * margin stops tiny rounding wobble from creeping the zoom up frame by frame.
  */
 static void grow_visual_scale_with_hysteresis(DynBeam *d, float current_max) {
   if (current_max > d->ref_max_w * 1.05f)
@@ -1166,19 +803,10 @@ static void grow_visual_scale_with_hysteresis(DynBeam *d, float current_max) {
 }
 
 /*
- * dyn_tick_modes — advance every mode, synthesise w(x), record the
- * trail, then update the display scale.
- *
- * Pseudocode:
- *   for each mode n:
- *       advance_damped_oscillator_exact(ωₙ, ζ, Fₙ, dt, qₙ, q̇ₙ)
- *   max_w ← synthesise_deflection_from_modes(b)
- *   push_trail_snapshot(b->w)
- *   grow_visual_scale_with_hysteresis(max_w)
- *   b->max_deflection ← d->ref_max_w        (renderer reads this)
- *
- * One driver, four physics-named steps — each line of the body reads
- * as a step in modal-superposition theory, not as arithmetic.
+ * One frame of wobble: swing every ringing pattern forward a step, add them
+ * up into the new beam shape, save a trail snapshot, and nudge the zoom if
+ * the beam swung wider than before. This is the whole vibrating mode in one
+ * place — the static formulas in §5 don't run while this is driving.
  */
 static void dyn_tick_modes(Beam *b, float dt) {
   DynBeam *d = &b->dyn;
@@ -1195,22 +823,15 @@ static void dyn_tick_modes(Beam *b, float dt) {
 }
 
 /*
- * dyn_impulse — instantaneous velocity kick at the load location.
- *
- * For a Dirac impulse P·δ(t)·δ(x-xf), the integrated equation of motion
- * for each mode gives a discrete velocity jump:
- *
- *     Δq̇ₙ = P · φₙ(xf) / Mₙ
- *
- * Strikes the beam like a tuning fork — re-excites all modes coherently
- * (in phase with where the kick lands). Use to refresh a decayed
- * oscillation without changing BC or load.
+ * Whacks the beam like a tuning fork — a sudden tap at the load spot that
+ * sets every ringing pattern going again. Handy for re-energising a wobble
+ * that's almost died out, without changing the beam or its load.
  */
 static void dyn_impulse(Beam *b, float impulse) {
   DynBeam *d = &b->dyn;
   float xf = 0.5f;
   if (b->bc == BC_CANT)
-    xf = 1.0f; /* free tip */
+    xf = 1.0f; /* tap the free tip of the diving board */
   else if (b->load == LD_OFFSET)
     xf = 0.75f;
   int ni = (int)(xf * (float)(N_NODES - 1) + 0.5f);
@@ -1220,7 +841,8 @@ static void dyn_impulse(Beam *b, float impulse) {
     d->qdot[n] += impulse * d->phi[n][ni] / d->modal_mass[n];
 }
 
-/* beam_tick — per-frame update dispatcher */
+/* One frame: either keep the beam wobbling, or (sitting still) fade the
+ * load in and recompute the resting shape from the formulas. */
 static void beam_tick(Beam *b, float dt) {
   if (b->paused)
     return;
@@ -1228,7 +850,7 @@ static void beam_tick(Beam *b, float dt) {
   if (b->dyn.active) {
     dyn_tick_modes(b, dt);
   } else {
-    /* Static mode: animate the load ramp, then re-solve analytically */
+    /* Sitting still: ease the load in, then recompute the exact sag. */
     if (b->load_anim < 1.0f) {
       b->load_anim += dt * RAMP_SPEED;
       if (b->load_anim > 1.0f)
@@ -1238,21 +860,17 @@ static void beam_tick(Beam *b, float dt) {
   }
 }
 
-/* ===================================================================== */
-/* §7  render                                                             */
-/* ===================================================================== */
+/* ── §7 render ── */
 
-/* node_col — map beam node index to screen column */
+/* Which screen column a given beam point lands in. */
 static int node_col(int i, int x0, int x1) {
   return x0 + i * (x1 - x0) / (N_NODES - 1);
 }
 
 /*
- * defl_row — convert deflection w to row offset from the neutral axis.
- *
- * The base_rows range is rows/6 (a fraction of screen height), scaled
- * by the exaggeration factor so even tiny deflections become visible.
- * Clamped to 3×base_rows so the beam never exits the visible area.
+ * Turns a sag amount into how many rows below (or above) the centre line to
+ * draw it. Real sags are tiny, so we blow them up by the exaggeration knob,
+ * then cap the result so the beam can never slide off the screen.
  */
 static int defl_row(float w, float max_w, int base_rows, float exag) {
   if (max_w < 1e-9f)
@@ -1263,20 +881,12 @@ static int defl_row(float w, float max_w, int base_rows, float exag) {
 }
 
 /*
- * draw_curvature_column — render one column of the beam cross-section.
- *
- * Character density encodes |M|/M_max (bending stress proxy):
- *   " .-~=*#@"  — 8 levels, sparse = low stress, dense = high stress.
- *
- * Color encodes the same quantity coarsely:
- *   green (< 35 %) → yellow (35–70 %) → red (> 70 %)
- *
- * The top and bottom flanges are always '=' to hint at the cross-section
- * shape; the web is the density character for interior cells.
- *
- * WHY this mapping: the visible character density intuitively reads as
- * "how hard is the material working here?" — dense chars look stressed.
- * Color reinforces it with traffic-light semantics (green = safe).
+ * Draws one vertical slice of the beam. How busy the character looks and its
+ * colour both show how hard the beam is working at this point: sparse green
+ * where it's loafing, dense red where it's strained. The top and bottom
+ * edges are always '=' to suggest the beam's I-shaped cross-section. The
+ * idea is that a packed character just looks more stressed than a faint dot,
+ * with the green-yellow-red colours backing it up like a traffic light.
  */
 static void draw_curvature_column(int col, int mid_row, float kn, int half_h,
                                   int rows) {
@@ -1305,25 +915,16 @@ static void draw_curvature_column(int col, int mid_row, float kn, int half_h,
 }
 
 /*
- * Load-glyph helpers — draw the load application symbols above the
- * beam.  The wrapper draw_load_arrows applies the colour / bold
- * attribute once and dispatches; helpers are attribute-agnostic.
+ * The next few helpers draw the load symbols sitting above the beam. The
+ * wrapper draw_load_arrows turns the colour on once and picks the right one;
+ * the helpers themselves don't fuss with colour.
  */
 
 /*
- * draw_point_load_glyph — single point-load marker at fractional span
- * xfrac ∈ [0, 1] (e.g. 0.5 for centre, 0.75 for offset).
- *
- * Layout above the local beam top at column lc:
- *
- *     [top - LOAD_ARROW_H]    P        <- label
- *     [top - LOAD_ARROW_H+1]  |
- *            ...              |        <- stem
- *     [top - 1]               v        <- arrowhead just above beam
- *
- * The marker tracks the deflected position because `top` is recomputed
- * from b->w[ni] every frame — under vibration the arrow oscillates
- * with the beam.
+ * Draws one downward arrow (a 'P' label, a stem, an arrowhead) at a chosen
+ * spot along the beam — say the middle, or three-quarters out. The arrow
+ * rides up and down with the beam because we re-read the sag at that spot
+ * every frame, so during a wobble it bobs along too.
  */
 static void draw_point_load_glyph(const Beam *b, float xfrac, int x0, int x1,
                                   int neutral_row, int base_rows, int half_h,
@@ -1333,24 +934,19 @@ static void draw_point_load_glyph(const Beam *b, float xfrac, int x0, int x1,
   int dr = defl_row(b->w[ni], b->max_deflection, base_rows, b->exag);
   int top = neutral_row + dr - half_h;
 
-  /* Stem */
   for (int rr = top - LOAD_ARROW_H; rr < top - 1; rr++)
     if (rr >= 2 && rr < rows - 2)
       mvaddch(rr, lc, '|');
-  /* Label */
   if (top - LOAD_ARROW_H >= 2)
     mvprintw(top - LOAD_ARROW_H, lc - 1, "P");
-  /* Arrowhead */
   if (top - 1 >= 2)
     mvaddch(top - 1, lc, 'v');
 }
 
 /*
- * draw_distributed_load_glyphs — UDL: rake of arrows every 3rd column.
- *
- * Each arrow contours the deformed shape because its `top` is sampled
- * from the local node's deflection — so the rake of arrowheads traces
- * the beam's profile.  A centred 'q=N.NN' label sits above the rake.
+ * Draws a row of little arrows along the whole beam for an evenly-spread
+ * load. Each arrow sits at the local sag, so the line of arrowheads traces
+ * the beam's bent shape. A 'q=...' label floats above the middle.
  */
 static void draw_distributed_load_glyphs(const Beam *b, int x0, int x1,
                                          int neutral_row, int base_rows,
@@ -1373,16 +969,8 @@ static void draw_distributed_load_glyphs(const Beam *b, int x0, int x1,
     mvprintw(neutral_row - half_h - 3, mc - 3, "q=%.2f", b->P * b->load_anim);
 }
 
-/*
- * draw_load_arrows — dispatch on load type, apply colour once.
- *
- * Pseudocode:
- *   attron(CP_LOAD | bold)
- *   if    load == CENTER:  draw_point_load_glyph   at xfrac = 0.5
- *   elif  load == OFFSET:  draw_point_load_glyph   at xfrac = 0.75
- *   elif  load == UDL:     draw_distributed_load_glyphs across the span
- *   attroff
- */
+/* Picks the right load symbol for the current load and draws it, turning the
+ * load colour on once around the whole thing. */
 static void draw_load_arrows(const Beam *b, int x0, int x1, int neutral_row,
                              int base_rows, int half_h, int cols, int rows) {
   (void)cols;
@@ -1409,11 +997,9 @@ static void draw_load_arrows(const Beam *b, int x0, int x1, int neutral_row,
 }
 
 /*
- * draw_supports — draw boundary condition symbols.
- *
- * SS:  'A' triangles + '/_%c\' base line (standard pin-on-roller symbol).
- * Cantilever: hatch '#' on left wall; "free" label at right tip.
- * Fixed-Fixed: hatch '#' walls on both ends.
+ * Draws the symbols showing how the ends are held: little triangle supports
+ * for a pinned beam, a hatched wall for a clamped end, and a "free" label
+ * where the diving board sticks out into nothing.
  */
 static void draw_supports(BCType bc, int x0, int x1, int neutral_row,
                           int half_h, int cols, int rows) {
@@ -1470,18 +1056,12 @@ static void draw_supports(BCType bc, int x0, int x1, int neutral_row,
 }
 
 /*
- * render_trails — motion-blur echo of recent beam shapes.
- *
- * Iterates the DynBeam.trail_w ring buffer from oldest to newest, drawing
- * each past shape as faint dots behind the current beam. The character
- * glyph and sampling stride both fade with age so older trails read as
- * sparse stippling rather than a solid band.
- *
- * Trails use CP_LO (the active theme's lowest-stress accent) so they
- * blend with the palette but stay legible without A_DIM (which would
- * make them vanish on themes with lo=24/28).
- *
- * No-op when not in dynamic mode — a stationary beam has nothing to blur.
+ * Draws faint after-images of where the beam just was, like motion blur.
+ * Older snapshots are drawn with sparser, fainter dots so they fade out
+ * instead of smearing into a solid band. They borrow the theme's lowest
+ * colour so they stay visible without using dim (which would make them
+ * vanish on some themes). Does nothing while the beam is sitting still —
+ * there's no motion to blur.
  */
 static void render_trails(const Beam *b, int cols, int rows) {
   if (!b->dyn.active)
@@ -1499,10 +1079,10 @@ static void render_trails(const Beam *b, int cols, int rows) {
 
   const DynBeam *d = &b->dyn;
 
-  /* Oldest first so newer trails overpaint. */
+  /* Draw oldest first so the newer, brighter trails land on top. */
   for (int k = N_TRAIL; k >= 1; k--) {
     int idx = (d->trail_head - k + N_TRAIL) % N_TRAIL;
-    int stride = (k <= 3) ? 3 : (k <= 7) ? 5 : 7; /* sparser with age */
+    int stride = (k <= 3) ? 3 : (k <= 7) ? 5 : 7; /* older = fewer dots */
     char gl = (k <= 3) ? '.' : (k <= 7) ? ',' : '`';
 
     attron(COLOR_PAIR(CP_LO));
@@ -1522,17 +1102,9 @@ static void render_trails(const Beam *b, int cols, int rows) {
 }
 
 /*
- * render_beam — compose the deflected beam: trails, neutral axis, body,
- * loads, supports.
- *
- * Layer order (bottom to top of z-stack):
- *   render_trails          — motion-blur of past dynamic shapes
- *   neutral axis           — '-' reference line at w=0
- *   draw_curvature_column  — one column of beam cross-section
- *   draw_load_arrows       — load application markers
- *   draw_supports          — boundary condition symbols
- *
- * All layers share the same base geometry (x0/x1/neutral_row/base_rows).
+ * Draws the whole beam, back to front: first the faint trails, then a thin
+ * centre line marking the unbent position, then the beam itself column by
+ * column, then the load arrows and the end supports on top.
  */
 static void render_beam(const Beam *b, bool show_trails, int cols, int rows) {
   int x0 = BEAM_X_MARGIN;
@@ -1546,23 +1118,22 @@ static void render_beam(const Beam *b, bool show_trails, int cols, int rows) {
     base_rows = 3;
   int half_h = BEAM_HEIGHT / 2;
 
-  /* Neutral axis reference line — where w=0 */
+  /* Thin line marking where the beam would sit if it weren't bent. */
   attron(COLOR_PAIR(CP_DIM) | A_DIM);
   for (int c = x0; c <= x1; c++)
     mvaddch(neutral_row, c, '-');
   attroff(COLOR_PAIR(CP_DIM) | A_DIM);
 
-  /* Motion-blur trails behind the live beam. */
   if (show_trails)
     render_trails(b, cols, rows);
 
-  /* Beam body — one column per node */
+  /* The beam itself, one vertical slice per point. */
   for (int i = 0; i < N_NODES; i++) {
     int c = node_col(i, x0, x1);
     if (c < 0 || c >= cols)
       continue;
 
-    /* kn = normalised curvature proxy |M(x)|/M_max ∈ [0,1] */
+    /* How hard the beam is working here, as 0..1 of the worst spot. */
     float kn = (b->max_moment > 1e-9f) ? fabsf(b->M[i]) / b->max_moment : 0.0f;
 
     int dr = defl_row(b->w[i], b->max_deflection, base_rows, b->exag);
@@ -1574,16 +1145,12 @@ static void render_beam(const Beam *b, bool show_trails, int cols, int rows) {
 }
 
 /*
- * render_moment_panel — right-side bending moment diagram.
- *
- * Layout: each screen row maps to a beam station; horizontal bars show
- * M / M_max.  Positive (sagging) bars extend rightward with '>' chars,
- * negative (hogging) bars extend leftward with '<' chars.
- *
- * WHY two colors: sign of M determines whether the top or bottom fibre
- * is in tension.  Sagging = tension at bottom (green — common/OK).
- * Hogging = tension at top (magenta — less obvious, more dangerous in
- * concrete which is weak in tension at top).
+ * Draws the bending chart down the right side. Each row is one spot along
+ * the beam, and a horizontal bar shows how much it's bending there. Bars for
+ * downward bowing (smiling) point right with '>'; upward bowing (frowning)
+ * points left with '<'. The two colours separate them because the two kinds
+ * of bending stress different parts of the beam — and one of them is the
+ * dangerous one for materials like concrete that crack easily on top.
  */
 static void render_moment_panel(const Beam *b, int cols, int rows) {
   int px = cols - PANEL_W;
@@ -1592,7 +1159,7 @@ static void render_moment_panel(const Beam *b, int cols, int rows) {
   if (rows - 4 < 3 || px < 1)
     return;
 
-  /* Panel separator */
+  /* Divider line between the beam and this panel. */
   attron(COLOR_PAIR(CP_DIM) | A_DIM);
   for (int r = 1; r < rows - 1; r++)
     mvaddch(r, px - 1, '|');
@@ -1602,7 +1169,7 @@ static void render_moment_panel(const Beam *b, int cols, int rows) {
   mvprintw(1, px, " MOMENT  +/- ");
   attroff(COLOR_PAIR(CP_HDR) | A_BOLD);
 
-  /* Zero-moment vertical axis */
+  /* Centre line the bars grow out from — no bending means no bar. */
   attron(COLOR_PAIR(CP_DIM) | A_DIM);
   for (int r = 2; r < rows - 2; r++)
     mvaddch(r, zero, '|');
@@ -1612,14 +1179,14 @@ static void render_moment_panel(const Beam *b, int cols, int rows) {
     return;
 
   for (int r = 2; r < rows - 2; r++) {
-    /* Map screen row → beam node (linear interpolation) */
+    /* Which point along the beam this chart row stands for. */
     int ni = (r - 2) * (N_NODES - 1) / (rows - 4);
     if (ni < 0)
       ni = 0;
     if (ni >= N_NODES)
       ni = N_NODES - 1;
 
-    float mn = b->M[ni] / b->max_moment; /* -1..1 */
+    float mn = b->M[ni] / b->max_moment; /* -1..1, share of the worst spot */
     int len = (int)(fabsf(mn) * (float)(half - 1) + 0.5f);
     if (len > half - 1)
       len = half - 1;
@@ -1645,19 +1212,14 @@ static void render_moment_panel(const Beam *b, int cols, int rows) {
 }
 
 /*
- * render_overlay — three-bar HUD per CLAUDE.md convention.
- *
- *   Row 0 right (CP_HUD + bold)   live status: P, exag, theme, state, fps
- *   Row 1 left  (CP_HUD)          context: BC name, load name, max defl,
- *                                          max moment, [VIBRATING]
- *   Row rows-1  (CP_HINT + bold)  actions / key reference
- *
- * Row 1 is clipped at cols-PANEL_W-1 so it never paints over the
- * moment panel header at (1, cols-PANEL_W).
+ * Draws the on-screen text: live status in the top-right corner, the current
+ * beam and load with its numbers along the second row, and the key list
+ * across the bottom. The second row is cut short so it never bleeds over the
+ * bending panel's header on the right.
  */
 static void render_overlay(const Beam *b, int theme, float time_scale,
                            double fps, int cols, int rows) {
-  /* Row 0 — right-aligned live state. */
+  /* Top-right: load, zoom, damping, speed, theme, state, fps. */
   char top[224];
   const char *state = "running";
   if (b->paused)
@@ -1677,7 +1239,7 @@ static void render_overlay(const Beam *b, int theme, float time_scale,
   mvaddnstr(0, top_col, top, cols);
   attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-  /* Row 1 — left-aligned context + computed values; clipped before panel. */
+  /* Second row: beam and load names plus their numbers; cut before panel. */
   char sub[160];
   snprintf(sub, sizeof sub, " %s  |  %s  |  Defl=%7.5f  M=%7.5f%s",
            bc_names[b->bc], ld_names[b->load], b->max_deflection, b->max_moment,
@@ -1689,7 +1251,7 @@ static void render_overlay(const Beam *b, int theme, float time_scale,
   mvaddnstr(1, 0, sub, row1_max);
   attroff(COLOR_PAIR(CP_HUD));
 
-  /* Bottom hint — actions. */
+  /* Bottom: the key list (short version if the window is too narrow). */
   const char *hint_full =
       " q:quit  spc:pause  r:reset  n/p:BC  l:load  +/-:P  e/E:exag  "
       "d:vibrate  i:kick  z/Z:zeta  s/S:speed  g:trails  t/T:theme ";
@@ -1703,78 +1265,42 @@ static void render_overlay(const Beam *b, int theme, float time_scale,
   attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §8  scene                                                              */
-/* ===================================================================== */
+/* ── §8 scene ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Scene — state that spans scene_tick() and scene_draw() invocations.
+/*
+ * Scene — everything the running program holds onto between frames.
  *
- * The struct splits into two clearly-labelled groups:
+ * The fields fall into two groups on purpose, and the split is for the
+ * reader, not the machine: things that change the beam's motion, and things
+ * that only change how it looks. The test for which group a new field goes
+ * in: "does it change what the beam actually does?" If yes it's a simulation
+ * field; if it only affects colours or overlays it's a rendering field.
+ * Keeping them apart stops a cosmetic toggle from quietly altering the
+ * physics — so flipping a theme or a trail while paused leaves the beam
+ * exactly where it was.
  *
- *   Simulation parameters  — consumed by scene_tick → beam_tick →
- *     solve_beam / dyn_tick_modes. Anything that affects the BEAM
- *     PHYSICS (positions, velocities, modal coords, moment field) lives
- *     here. Mutated by physics-affecting keys: n / p (BC), l (load),
- *     +/− (P), d / i (vibrate / impulse), z / Z (ζ), s / S (time speed),
- *     r (reset), spc (pause).
- *
- *   Rendering parameters   — consumed by scene_draw → render_*. Theme
- *     palettes and overlay toggles live here. Do NOT alter physics.
- *     Toggling any of these while paused must leave the beam shape
- *     and modal state byte-identical; only colours / overlays may differ.
- *
- * Locality rationale (this contract matters, not the bytes):
- *   The split exists for the READER, not the CPU. A new flag that
- *   accidentally lands in the rendering group would silently couple
- *   physics to display state — exactly the bug the separation prevents.
- *   When adding a field, pick the group by asking: "does this affect
- *   what the integrator does?" If yes, simulation; if no, rendering.
- *
- * Single instance (lives inside g_app, file scope):
- *   Scene sits inside `App g_app` rather than as its own static so that
- *   signal handlers (which need access to running / need_resize on the
- *   same struct) can reach the whole context through one symbol without
- *   a pointer chase. scene_init resets only the beam — theme, time_scale,
- *   and show_trails persist across 'r' reset so cosmetic choices aren't
- *   lost.
- *
- * What stays OUTSIDE this struct (intentionally):
- *   running / need_resize    sig_atomic_t flags live on App, not Scene.
- *                            They're polled by the main loop, never read
- *                            by scene_tick or scene_draw.
- *   Screen (cols, rows)      window geometry is App-level; passed into
- *                            scene_draw as parameters rather than held
- *                            here, because resize handling is the App's
- *                            job (Scene is geometry-agnostic).
- * ─────────────────────────────────────────────────────────────────────── */
+ * One copy lives inside the App struct, so the signal handlers can reach the
+ * whole program through a single global. Resetting with 'r' rebuilds only
+ * the beam; your theme, speed, and trail choice carry over.
+ */
 typedef struct {
-  /* ── Simulation parameters ───────────────────────────────────────── */
-  Beam beam;        /* the simulator core itself (§4) —
-                     * Body + DynBeam + arrays + config  */
-  float time_scale; /* dt multiplier applied in the main
-                     * loop before scene_tick is called.
-                     * Range 0.1× – 4.0× (s / S keys).
-                     * Counted as SIMULATION because it
-                     * scales the advance of q(t) and the
-                     * static load_anim ramp — physics is
-                     * not invariant under this knob.    */
+  /* ── Simulation: these change the beam's motion ── */
+  Beam beam;        /* the beam itself (§4): shape, load, and wobble state */
+  float time_scale; /* speed knob, 0.1x to 4x (s / S keys). Counts as
+                     * physics because it stretches how fast the wobble
+                     * and the load fade-in advance per real second.    */
 
-  /* ── Rendering parameters ────────────────────────────────────────── */
-  int theme;        /* index into themes[] in §3 (t / T) */
-  bool show_trails; /* motion-blur trails behind the live
-                     * beam (g / G). Pure overlay — the
-                     * trail ring buffer is always pushed
-                     * by dyn_tick_modes; this flag only
-                     * gates whether render_trails reads
-                     * it back.                          */
+  /* ── Rendering: these only change how it looks ── */
+  int theme;        /* which colour scheme from §3 (t / T keys) */
+  bool show_trails; /* draw the motion-blur trails or not (g / G). The
+                     * trail snapshots are always recorded while wobbling;
+                     * this flag just decides whether we draw them.      */
 } Scene;
 
 static void scene_init(Scene *s) {
-  /* Cosmetic/scene-level fields (theme, time_scale, show_trails) are
-   * preserved across reset — only the beam is rebuilt. */
+  /* Only the beam is rebuilt; theme, speed, and trail choice stay put. */
   init_beam(&s->beam);
-  dyn_activate(&s->beam); /* boot directly into the vibrating state */
+  dyn_activate(&s->beam); /* start out already wobbling */
 }
 
 static void scene_tick(Scene *s, float dt) { beam_tick(&s->beam, dt); }
@@ -1786,9 +1312,7 @@ static void scene_draw(const Scene *s, int cols, int rows, double fps) {
   render_overlay(&s->beam, s->theme, s->time_scale, fps, cols, rows);
 }
 
-/* ===================================================================== */
-/* §9  screen                                                             */
-/* ===================================================================== */
+/* ── §9 screen ── */
 
 typedef struct {
   int cols, rows;
@@ -1817,9 +1341,7 @@ static void screen_resize(Screen *s) {
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* ===================================================================== */
-/* §10  app                                                               */
-/* ===================================================================== */
+/* ── §10 app ── */
 
 typedef struct {
   Scene scene;
@@ -1856,7 +1378,7 @@ static bool app_handle_key(App *app, int ch) {
   case 'N':
     b->bc = (BCType)((b->bc + 1) % BC_COUNT);
     if (b->dyn.active) {
-      dyn_activate(b); /* re-fit modes for the new BC, keep vibrating */
+      dyn_activate(b); /* rebuild the patterns for the new beam, keep wobbling */
     } else {
       b->load_anim = 0.0f;
       solve_beam(b);
@@ -1888,7 +1410,7 @@ static bool app_handle_key(App *app, int ch) {
   case 'd':
   case 'D':
     if (b->dyn.active) {
-      /* Toggle back to static */
+      /* Stop wobbling and settle into the resting shape. */
       b->dyn.active = false;
       b->load_anim = 1.0f;
       solve_beam(b);
@@ -2010,22 +1532,23 @@ int main(void) {
       sim_accum = 0;
     }
 
-    /* Fixed-timestep accumulator */
+    /* Measure how long the last frame took, capped so a hiccup can't
+     * make the simulation try to catch up in one giant lurch. */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
     if (dt > 100 * NS_PER_MS)
-      dt = 100 * NS_PER_MS; /* spiral-of-death guard */
+      dt = 100 * NS_PER_MS;
 
+    /* Step the simulation in fixed-size ticks so it runs the same on any
+     * machine. The speed knob stretches each tick's worth of sim time. */
     sim_accum += dt;
     while (sim_accum >= tick_ns) {
-      /* time_scale (s/S keys) stretches sim seconds per wall tick
-       * — slow-mo for inspecting modes, fast-forward for ringdown. */
       scene_tick(&app->scene, dt_sec * app->scene.time_scale);
       sim_accum -= tick_ns;
     }
 
-    /* fps rolling average (update every 0.5 s) */
+    /* Smooth the on-screen fps over half a second so it doesn't jitter. */
     frame_count++;
     fps_accum += dt;
     if (fps_accum >= 500 * NS_PER_MS) {
@@ -2035,7 +1558,8 @@ int main(void) {
       fps_accum = 0;
     }
 
-    /* Frame cap — sleep before rendering to bound CPU usage */
+    /* Sleep off the rest of the frame's budget before drawing, so we hit
+     * our target rate without pinning a CPU core. */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / TARGET_FPS - elapsed);
 

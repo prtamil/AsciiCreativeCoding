@@ -1,175 +1,23 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * nbody.c — N-Body Gravity Simulation
+ * nbody.c — gravity sandbox in the terminal
  *
- * Point masses with softened 1/r² gravity integrated with velocity Verlet.
- * Trails reveal orbital paths, slingshots, ejections, and figure-8
- * choreographies.
+ * A handful of point masses pull on each other through gravity, and we draw
+ * where they go.  Ten ready-made setups (presets) range from one clean orbit
+ * to whole galaxies colliding; trails show the paths so you can watch orbits,
+ * slingshots, ejections, and the famous figure-8 dance.
  *
- * Framework: follows framework.c §1–§8 skeleton.
- *
- * PHYSICS SUMMARY
- * ─────────────────────────────────────────────────────────────────────
- * Force on body i from body j:
- *   F_ij = G · m_i · m_j · (r_j − r_i) / (|r_j − r_i|² + ε²)^(3/2)
- *
- * ε (softening) prevents 1/r² singularity when bodies pass close.
- *
- * Velocity Verlet integration (2nd-order symplectic):
- *   x_new = x + v·dt + ½·a·dt²
- *   compute a_new from x_new
- *   v_new = v + ½·(a + a_new)·dt
- *
- * Physics lives in pixel space (px, py).
- *   pw = cols × CELL_W,  ph = rows × CELL_H
- *   Body drawn at: px_to_cell_x(px), px_to_cell_y(py)
- *
- * Ten presets, simple → complex (cycle with n / p).
- * Each row: setup + what you should see on screen.
- *   0  Kepler          1 heavy + 1 light; closed ellipse, textbook orbit
- *   1  Binary Star     2 equal masses; mirror-image dance around the midpoint
- *   2  Solar System    sun + 4 planets; outer planets visibly slower (T ∝
- * r^1.5) 3  Lagrange Tri    3 equal masses at corners; rigid equilateral
- * rotation 4  Figure-8        3 bodies chasing each other along an ∞ curve 5
- * Pythagorean     m=3,4,5 at rest; chaotic close encounters, ejection 6  Black
- * Hole      heavy yellow giant + 20 orbiters; precessing rosettes 7  Galaxy 20
- * random bodies in a disc; mildly elliptical swirl 8  Binary BH       2 heavies
- * + 20 testers; resonances, slingshot ejects 9  Galaxy Merger   2 clusters
- * approach; tidal tails strip stars on flyby
- *
- * WHAT YOU SEE ON SCREEN
- * ─────────────────────────────────────────────────────────────────────
- *
- * Top HUD (2 rows):
- *   row 0   " N-BODY [i/10]: <preset> "   (orange, left)
- *           " <fps> fps   sim:<hz> Hz "   (yellow, right)
- *   row 1   " bodies: N   trails: on "    (yellow)  +
- *           " PAUSED " / " running "      (red / green)
- *
- * Scene (middle band, between the HUDs):
- *   Bodies   one glyph at the current pixel position, color = identity.
- *            Glyph is picked by mass:
- *              '@'  m > 50      black-hole-class (heaviest)
- *              'O'  m >  3      medium star
- *              'o'  m >  1.5    light star
- *              '*'  otherwise   test particle / dust
- *   Trails   '.' marks of the last TRAIL_LEN positions per body.
- *            Recent trail (age < 40%) drawn bold; older fades to dim --
- *            so the curve in front of the body is bright and the
- *            history dims behind.  Toggle with 't'.
- *   Eject    Bodies wandering past EJECT_FACTOR × screen vanish silently
- *            (common in Pythagorean / Binary BH / Galaxy Merger).
- *
- * Bottom HUD (1 row): action keys, bright cyan + bold.
- *
- * Visual cues to recognise each preset family:
- *   Closed loops    perfectly periodic orbits     (Kepler, Binary, Solar,
- *                                                  Lagrange, Figure-8)
- *   Rosettes        nearly-closed orbits that
- *                   slowly rotate their pericentre (Black Hole)
- *   Chaos           irregular swings, near-misses,
- *                   sudden ejections             (Pythagorean, Binary BH)
- *   Tidal tails     long streams of particles
- *                   pulled between heavy bodies   (Galaxy Merger)
- *
- * ─────────────────────────────────────────────────────────────────────
- *
- * Keys:
- *   q / ESC   quit
- *   space     pause / resume
- *   r         restart current preset
- *   n / p     next / previous preset
- *   t         toggle trails
- *   ] / [     sim Hz up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra nbody.c -o nbody -lncurses -lm
+ * Worth knowing that the code can't tell you:
+ *   - The figure-8 setup uses published exact starting numbers
+ *     (Chenciner & Montgomery, Annals of Mathematics 152(3), 2000).
+ *   - The "Pythagorean" chaotic setup follows Burrau (1913); its classic
+ *     numerical solution is Szebehely & Peters, Astronomical J. 72, 1967.
+ *   - The galaxy-merger tidal tails are inspired by Toomre & Toomre,
+ *     Astrophysical J. 178, 1972.
+ *   - For the why-orbits-don't-spiral theory behind the integrator, see
+ *     Hairer, Lubich & Wanner, "Geometric Numerical Integration," 2nd ed.,
+ *     Springer 2006, Ch. VI.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Velocity Verlet (Störmer-Verlet) integration.
- *                  2nd-order symplectic integrator — conserves a modified
- *                  Hamiltonian (energy drifts only by round-off, not by
- *                  accumulating phase error like explicit Euler).
- *                  x_new = x + v·dt + ½·a·dt²
- *                  a_new = F(x_new)/m
- *                  v_new = v + ½·(a + a_new)·dt
- *
- * Physics        : Softened Newtonian gravity.
- *                  Real 1/r² force → singularity when r→0.  Softening ε
- *                  (SOFT2 = ε²) limits force magnitude at close approach,
- *                  modelling extended mass distributions or simply
- *                  preventing numerical blow-up.  The force becomes:
- *                  F = G·m₁·m₂·r / (r² + ε²)^(3/2)
- *
- * Performance    : O(N²) force computation each sub-step (brute force).
- *                  For N≤32 this is fast; N-body above ~1000 would need
- *                  Barnes-Hut (O(N log N)) or FMM (O(N)).
- *                  SUB_STEPS=4 improves accuracy without changing display fps.
- *
- * Math           : Figure-8 choreography (Chenciner & Montgomery, 2000).
- *                  An exact periodic solution where 3 equal masses chase
- *                  each other around a figure-8 curve.  Initial conditions
- *                  in natural units (G=1, m=1) are rescaled to pixel space
- *                  using dimensional analysis.
- *
- * Data-structure : Per-body ring-buffer trails; each body stores its own
- *                  TRAIL_LEN positions.  Memory: 32 bodies × 150 × 8 B
- *                  = 38 KB — fits easily in L1 cache for small N.
- *
- * References
- * ─────────────────────────────────────────────────────────────────────
- *
- *   Integration & N-body methods:
- *
- *   [1] Hairer, Lubich, Wanner.  "Geometric Numerical Integration,"
- *       2nd ed.  Springer, 2006.  Ch. VI is the canonical theory of
- *       symplectic integrators; velocity Verlet is the lowest-order
- *       example.  Read first if you want to know WHY orbits don't
- *       spiral despite the round-off.
- *
- *   [2] Press, Teukolsky, Vetterling, Flannery.  "Numerical Recipes,"
- *       3rd ed.  §17.4 (Verlet) and §20.5 (softening) are the practical
- *       C-language references closest in spirit to this file.
- *
- *   [3] Aarseth, S. J.  "Gravitational N-Body Simulations: Tools and
- *       Algorithms."  Cambridge University Press, 2003.  Standard
- *       reference for production N-body codes — softening regimes,
- *       neighbour schemes, regularisation of close encounters.
- *
- *   Classical 3-body solutions (presets 3, 4, 5):
- *
- *   [4] Lagrange, J.-L.  "Essai sur le problème des trois corps."
- *       Œuvres complètes, vol. 6, 1772.  Original derivation of the
- *       five Lagrange points; the equilateral L4/L5 family is preset 3.
- *
- *   [5] Chenciner, A. & Montgomery, R.  "A remarkable periodic solution
- *       of the three-body problem in the case of equal masses."
- *       Annals of Mathematics 152(3), 881-901, 2000.  Figure-8
- *       existence proof; preset 4 uses these published ICs verbatim.
- *
- *   [6] Szebehely, V. & Peters, C. F.  "Complete solution of a general
- *       problem of three bodies."  Astronomical Journal 72, 876-883,
- *       1967.  Canonical numerical integration of Burrau's Pythagorean
- *       problem (preset 5) -- where the now-classic chaotic behaviour
- *       and ejection event were first traced.
- *
- *   Astrophysics (preset 9 inspiration):
- *
- *   [7] Toomre, A. & Toomre, J.  "Galactic bridges and tails."
- *       Astrophysical Journal 178, 623-666, 1972.  The pioneering
- *       restricted-N-body simulation of galaxy mergers; the long
- *       spiral tails in preset 9 come straight out of this paper.
- *
- *   Rendering:
- *
- *   [8] Bourke, P.  "Character representation of grey scale images."
- *       paulbourke.net/dataformats/asciiart/  Tradition of ordering
- *       ASCII glyphs by density; informs the '@' / 'O' / 'o' / '*'
- *       mass-glyph scale in glyph_for_mass().
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -187,9 +35,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
 enum {
   SIM_FPS_MIN = 10,
@@ -200,8 +46,8 @@ enum {
   N_COLORS = 7,
 
   MAX_BODIES = 32,
-  TRAIL_LEN = 150, /* trail ring-buffer length per body     */
-  SUB_STEPS = 4,   /* velocity-Verlet sub-steps per tick    */
+  TRAIL_LEN = 150, /* how many past positions each body remembers for its trail */
+  SUB_STEPS = 4,   /* physics steps per tick; more = steadier orbits */
   N_PRESETS = 10,
 };
 
@@ -209,45 +55,33 @@ enum {
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* G_CONST: gravitational constant in pixel-space units (px³ / (mass · s²)).
- * In SI: G = 6.67×10⁻¹¹ N·m²/kg².  Here we define G empirically so that
- * two unit-mass bodies 200 px apart produce a visually interesting orbital
- * period of a few seconds.  Circular orbit period: T = 2π√(r³/GM).
- * At r=200 px, T = 2π√(8e6/5e5) ≈ 2π·4 ≈ 25 s — gentle galactic timescale. */
+/* How strong gravity is here.  Not the real-world number; it's tuned by hand
+ * so a typical orbit takes a few pleasant seconds to go around on screen. */
 #define G_CONST 500000.0f
 
-/* SOFT2: softening length squared (ε² in pixels²).  ε = 40 px.
- * Without softening, two bodies passing within 1 px would produce
- * force ∝ 1/r² → ∞, flinging them off-screen.
- * ε = 40 px is ~5% of a typical 800 px wide screen — suppresses
- * singularity at close approach while leaving distant gravity accurate.  */
+/* A little fudge that keeps two bodies from feeling infinite force when they
+ * pass nearly on top of each other (which would fling them off-screen).
+ * We store the value squared.  It works out to a softening of 40 px. */
 #define SOFT2 (40.0f * 40.0f)
 
-/* F8_SCALE: natural length unit for the figure-8 choreography (pixels).
- * The published ICs use G=1, m=1.  F8_SCALE converts natural length → pixels.
- * Time and velocity scales are derived from F8_SCALE and G_CONST via
- * dimensional analysis: t_scale = sqrt(L³/G), v_scale = L/t_scale.       */
+/* Size, in pixels, that the figure-8 setup is drawn at.  Its published
+ * starting numbers assume an abstract unit grid; this scales them to fit. */
 #define F8_SCALE 150.0f
 
-/* EJECT_FACTOR: body deactivated when |pos| > EJECT_FACTOR × screen half-size.
- * 2.5 gives a buffer zone outside the visible area before discarding.     */
+/* How far a body may wander before we give up on it and let it vanish:
+ * this many times the screen size, leaving a margin past the visible edge. */
 #define EJECT_FACTOR 2.5f
 
-/* Cell dimensions for pixel↔cell conversion */
+/* How many physics pixels make up one terminal character, across and down. */
 #define CELL_W 8
 #define CELL_H 16
 
-/* HUD layout: status zone on top, action zone on bottom.
- *   TOP    = title + fps/sim Hz on row 0; bodies/trails/paused on row 1
- *   BOTTOM = single action-key row
- * Body and trail rendering clip out these rows so the HUD is never
- * overwritten by orbital motion. */
+/* The two text bars take up these rows (top and bottom).  Bodies and trails
+ * skip them so flying particles never scribble over the readouts. */
 #define TOP_HUD_ROWS 2
 #define BOTTOM_HUD_ROWS 1
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -265,9 +99,7 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3  color ── */
 
 static void color_init(void) {
   start_color();
@@ -291,9 +123,7 @@ static void color_init(void) {
   }
 }
 
-/* ===================================================================== */
-/* §4  coords — pixel ↔ cell                                              */
-/* ===================================================================== */
+/* ── §4  coords — pixel ↔ cell ── */
 
 static inline int pw(int cols) { return cols * CELL_W; }
 static inline int ph(int rows) { return rows * CELL_H; }
@@ -305,87 +135,62 @@ static inline int px_to_cell_y(float py) {
   return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  entity — Body, NBody                                               */
-/* ===================================================================== */
+/* ── §5  entity — Body, NBody ── */
 
-/* ── Body ──────────────────────────────────────────────────────────── */
+/* ── Body ── */
 
 /*
- * Body -- one point-mass particle.
+ * One body: a single dot of mass moving under gravity.
  *
- * INTENT: hold every per-particle quantity the integrator needs to
- * advance a body by one velocity-Verlet half-step, plus the trail
- * ring buffer that paints the orbit on screen.  Sized so MAX_BODIES
- * copies fit comfortably in L1 cache (~38 KB total at MAX_BODIES=32).
+ * Everything the physics needs to push this body forward one step lives here,
+ * plus the little memory of where it has been so we can draw its trail.  The
+ * fields fall into four groups:
  *
- * Members are grouped by purpose:
+ *   WHERE IT IS AND HOW IT'S MOVING (all in pixels, the physics works in pixels):
+ *     x, y      its position on screen.
+ *     vx, vy    how fast it's moving, in pixels per second.
+ *     ax, ay    how hard gravity is currently pushing it (its acceleration).
+ *               We hang onto this between steps because the stepping method
+ *               needs both the old push and the freshly-computed new push to
+ *               update the velocity correctly.
+ *     mass      how heavy it is.  Heavier bodies pull harder and are nudged
+ *               less by others' pull.
  *
- *   STATE VECTOR -- the 6-tuple (x,y, vx,vy, ax,ay) that Verlet steps.
- *     x, y         position in PIXEL units (px).  All physics lives in
- *                  pixel space; conversion to terminal cells happens
- *                  only at draw time via px_to_cell_x/y().
- *     vx, vy       velocity in px/s.
- *     ax, ay       acceleration from the most recent force evaluation.
- *                  Velocity Verlet needs the OLD a to step position
- *                  and the NEW a to step velocity, so the current a
- *                  is always cached here between sub-steps:
- *                      x_new = x + v dt + ½ a_old dt²
- *                      a_new = F(x_new) / m
- *                      v_new = v + ½ (a_old + a_new) dt
- *     mass         scalar; enters in two places:
- *                    F_ij = G m_i m_j r_ij / (|r_ij|² + ε²)^(3/2)
- *                    a_i  = F_i / m_i
- *                  Used by accumulate_pair_gravity() to apply equal-
- *                  and-opposite a's (Newton's 3rd law).
+ *   HOW IT LOOKS:
+ *     color     which color this body (and its trail) is drawn in; also acts
+ *               as its identity tag.  The actual character is chosen from the
+ *               mass at draw time, not stored here.
  *
- *   APPEARANCE -- read by paint_body_trail() / paint_body_glyph().
- *     color        1-based ncurses color-pair index; per-body identity
- *                  tag, also used to tint the trail.  Glyph itself is
- *                  picked from mass by glyph_for_mass() at draw time
- *                  (@ / O / o / *).
+ *   ITS TRAIL (a fixed-size loop of recent positions, oldest overwritten):
+ *     tx[], ty[]  the last TRAIL_LEN positions it visited, in pixels.
+ *     thead       slot holding the most recent position.
+ *     tcount      how many slots actually hold real positions yet — kept
+ *                 separate from thead so a brand-new body doesn't draw a
+ *                 trail through empty (zeroed) slots it never visited.
  *
- *   TRAIL RING BUFFER -- visualises orbital history.
- *     tx[], ty[]   last TRAIL_LEN positions in pixel units; ring
- *                  buffer with newest at thead.
- *     thead        index of the newest sample (0..TRAIL_LEN-1).
- *     tcount       number of VALID samples, clamped at TRAIL_LEN.
- *                  Distinct from thead so early frames don't render
- *                  zeroed slots as fake trail points.
- *
- *   LIFECYCLE:
- *     active       false once the body has been ejected past
- *                  EJECT_FACTOR × screen.  Inactive bodies are skipped
- *                  by force, integrator, and renderer alike -- they
- *                  vanish silently.  Common in chaotic presets (5, 8, 9).
- *
- * References:
- *   [1] Hairer, Lubich, Wanner.  Geometric Numerical Integration,
- *       2nd ed., Springer 2006.  Ch. VI; velocity Verlet is the
- *       canonical low-order symplectic scheme that integrates the
- *       state vector below.
- *   [2] Aarseth.  Gravitational N-Body Simulations, CUP 2003, §1.2 --
- *       discusses softening parameter ε and its role in the
- *       gravitational force computation that mutates (ax, ay).
+ *   WHETHER IT STILL COUNTS:
+ *     active    becomes false once the body drifts too far off-screen; after
+ *               that the physics and the drawing both ignore it and it quietly
+ *               disappears.  Happens a lot in the chaotic setups (5, 8, 9).
  */
 typedef struct {
-  /* state vector (pixel space) */
-  float x, y;   /* position (px)              */
-  float vx, vy; /* velocity (px/s)            */
-  float ax, ay; /* cached accel from last F   */
-  float mass;   /* scalar mass                */
+  /* where it is and how it's moving (pixels) */
+  float x, y;   /* position */
+  float vx, vy; /* velocity (px/s) */
+  float ax, ay; /* current gravity push, kept for the next step */
+  float mass;   /* heavier = pulls harder, nudged less */
 
-  /* appearance */
-  int color; /* 1-based ncurses pair index */
+  /* how it looks */
+  int color; /* color-pair index and identity tag */
 
-  /* trail ring-buffer */
-  float tx[TRAIL_LEN]; /* historical x positions     */
-  float ty[TRAIL_LEN]; /* historical y positions     */
-  int thead;           /* newest sample index (mod)  */
-  int tcount;          /* valid samples, <= TRAIL_LEN */
+  /* its trail: a loop of recent positions, oldest gets overwritten */
+  float tx[TRAIL_LEN]; /* past x positions */
+  float ty[TRAIL_LEN]; /* past y positions */
+  int thead;           /* slot with the newest position */
+  int tcount;          /* how many slots hold real positions yet */
 
-  /* lifecycle */
-  bool active; /* false once ejected off-screen */
+  /* whether it still counts */
+  bool active; /* false once it wanders too far off-screen */
 } Body;
 
 static void body_trail_push(Body *b, float x, float y) {
@@ -396,61 +201,38 @@ static void body_trail_push(Body *b, float x, float y) {
     b->tcount++;
 }
 
-/* ── NBody ─────────────────────────────────────────────────────────── */
+/* ── NBody ── */
 
 /*
- * NBody -- the full N-particle system + sim-level scheduler flags.
+ * The whole bunch of bodies, plus a few switches that belong to the group
+ * rather than to any one body.
  *
- * INTENT: bundle the array of Body's with state that is NOT a
- * per-particle property: how many bodies are populated, whether the
- * integrator is paused, whether trails are drawn, and which preset
- * is loaded.
+ * The bodies live in a fixed-size array rather than a growable list — we just
+ * reserve room for the most we'll ever need (MAX_BODIES) and use however many
+ * the current setup wants.  Simple, fast, and the memory cost is tiny.
  *
- * The Body array is a fixed-size MAX_BODIES slab embedded in BSS,
- * not a dynamic vector.  Rationale: the O(N²) force kernel benefits
- * from contiguous memory, and the inner loop produces tighter code
- * when the array bound is a compile-time constant.  Memory cost is
- * predictable (MAX_BODIES × sizeof(Body) ≈ 38 KB), entirely L1-cache
- * resident for the typical N ≤ 26.
- *
- * Members:
- *
- *   bodies[]      Backing slab.  Only indices [0, n) are populated;
- *                 unused slots are memset to zero by nbody_init().
- *   n             Number of bodies in the current preset
- *                 (2..MAX_BODIES).  Inner loops cap at n, not
- *                 MAX_BODIES, so unused slots cost nothing.
- *   show_trails   bool, toggled by 't'.  When false, nbody_draw()
- *                 skips the trail render, but body_trail_push()
- *                 keeps recording -- so toggling back resumes the
- *                 trail mid-flight rather than restarting blank.
- *   paused        bool, toggled by SPACE.  Short-circuits
- *                 nbody_tick(); positions, velocities, accelerations,
- *                 AND trails freeze.  Force values stay valid so
- *                 resume is seamless.
- *   preset        Current preset index in [0, N_PRESETS).  Used by
- *                 'r' (restart same preset) and shown in the top HUD
- *                 as "[i/N]".
- *
- * Reference:
- *   Aarseth, S. J.  Gravitational N-Body Simulations, CUP 2003.
- *   Ch. 1-3 lay out the standard structure for direct-summation
- *   N-body codes; the (bodies[], n) pair is the textbook layout.
+ *   bodies[]      the array; only the first n entries are in use.
+ *   n             how many bodies the current setup has.
+ *   show_trails   whether trails are drawn ('t' toggles it).  Even when off,
+ *                 we keep recording positions, so turning it back on picks up
+ *                 mid-flight instead of starting from a blank trail.
+ *   paused        whether the simulation is frozen (space toggles it).  When
+ *                 paused, nothing moves and no new trail points are recorded.
+ *   preset        which of the ten setups is loaded; shown in the top bar and
+ *                 used when 'r' restarts the same one.
  */
 typedef struct {
-  Body bodies[MAX_BODIES]; /* backing slab; only [0,n) live */
-  int n;                   /* active count for current preset */
+  Body bodies[MAX_BODIES]; /* only the first n are in use */
+  int n;                   /* how many bodies in the current setup */
   bool show_trails;        /* 't' toggle */
-  bool paused;             /* SPACE toggle */
-  int preset;              /* index in preset_fns[] */
+  bool paused;             /* space toggle */
+  int preset;              /* which setup is loaded */
 } NBody;
 
-/* ── Force computation: O(N²) softened Newtonian gravity ─────────────── */
+/* ── Force computation: every body pulls on every other ── */
 
-/*
- * zero_accelerations() -- reset a's to zero before the pair-sum.
- * Force computation accumulates; we start each call from a clean slate.
- */
+/* We add up each body's pull one pair at a time, so start the running totals
+ * back at zero. */
 static void zero_accelerations(Body *bodies, int n) {
   for (int i = 0; i < n; i++) {
     bodies[i].ax = 0.0f;
@@ -458,40 +240,27 @@ static void zero_accelerations(Body *bodies, int n) {
   }
 }
 
-/*
- * accumulate_pair_gravity() -- add the softened gravitational pull
- * between two bodies into BOTH of their accelerations.
- *
- *   F_ij = G m_i m_j (r_j - r_i) / (|r|² + ε²)^(3/2)
- *   a_i  = F_i / m_i = sum_j G m_j (r_j - r_i) / (|r|² + ε²)^(3/2)
- *
- * Implementation detail: the per-mass factor G / (r² + ε²)^(3/2) is
- * computed once as `inv` and multiplied by the OTHER body's mass.
- * Newton's third law is exploited by applying the same `inv * (dx,dy)`
- * with opposite sign and the other body's mass -- so each unordered
- * pair costs one inv-sqrt, half the work of a naive double loop.
- *
- * Softening ε (SOFT2 = ε²) prevents 1/r² blow-up at close approach
- * (Aarseth, §1.2).
- */
+/* Work out the gravity between two bodies and add it to both of them at once.
+ * The pull is equal and opposite (one tugs the other just as hard the other
+ * way), so handling the pair together does the work once instead of twice.
+ * The SOFT2 fudge in the distance keeps the force finite when they're nearly
+ * touching, so close passes don't blow up. */
 static void accumulate_pair_gravity(Body *bi, Body *bj) {
   float dx = bj->x - bi->x;
   float dy = bj->y - bi->y;
-  float r2 = dx * dx + dy * dy + SOFT2; /* softened |r|² */
+  float r2 = dx * dx + dy * dy + SOFT2; /* squared distance, softened */
   float r = sqrtf(r2);
-  float inv = G_CONST / (r2 * r); /* G / (|r|² + ε²)^(3/2) */
+  float inv = G_CONST / (r2 * r);
 
-  /* Newton's 3rd law: equal-magnitude, opposite-direction a's */
+  /* same pull, opposite directions, scaled by the other body's mass */
   bi->ax += inv * bj->mass * dx;
   bi->ay += inv * bj->mass * dy;
   bj->ax -= inv * bi->mass * dx;
   bj->ay -= inv * bi->mass * dy;
 }
 
-/*
- * nbody_forces() -- recompute a's for every body from current positions.
- * Pseudocode: clear all a's, then sum over each unordered active pair.
- */
+/* Recompute the gravity push on every body: clear the totals, then add up the
+ * pull from each pair of bodies still in play. */
 static void nbody_forces(Body *bodies, int n) {
   zero_accelerations(bodies, n);
   for (int i = 0; i < n; i++) {
@@ -505,29 +274,20 @@ static void nbody_forces(Body *bodies, int n) {
   }
 }
 
-/* ── Velocity Verlet integrator (drift → forces → kick) ──────────────── *
+/* ── Moving the bodies forward one step ──
  *
- * The four helpers below implement the canonical velocity-Verlet step:
- *
- *   x_new = x + v dt + ½ a_old dt²        (DRIFT, with a_old)
- *   a_new = F(x_new) / m                  (FORCE evaluation)
- *   v_new = v + ½ (a_old + a_new) dt      (KICK, averaging a_old and a_new)
- *
- * Splitting it this way preserves the integrator's 2nd-order symplectic
- * property (Hairer-Lubich-Wanner Ch. VI): the modified Hamiltonian is
- * conserved up to round-off, so energy doesn't drift secularly the way
- * it does with explicit Euler.
- *
- * "Drift" and "kick" are standard symplectic-integrator names:
- *   drift    advance position holding momentum fixed
- *   kick     advance momentum (velocity) holding position fixed
+ * We move everything ahead a tiny slice of time using a method called
+ * velocity Verlet.  The trick that makes it good: it moves each body using
+ * the gravity push from the START of the step, then changes its speed using
+ * the AVERAGE of the start push and the end push.  That little averaging is
+ * why orbits keep their shape over time instead of slowly winding inward or
+ * drifting outward.  One step goes: remember the old push, move the bodies,
+ * drop any that flew off, work out the new push, update the speeds.
  */
 
-/*
- * verlet_stash_old_accelerations() -- copy current (ax, ay) into
- * the caller's temp arrays.  We need a_old AFTER the position update
- * (which overwrites a via nbody_forces), so we cache them up front.
- */
+/* Keep a copy of each body's current gravity push.  We need it again at the
+ * end of the step, but working out the new push overwrites it, so copy it
+ * aside first. */
 static void verlet_stash_old_accelerations(const NBody *nb, float *ax_old,
                                            float *ay_old) {
   for (int i = 0; i < nb->n; i++) {
@@ -536,12 +296,8 @@ static void verlet_stash_old_accelerations(const NBody *nb, float *ax_old,
   }
 }
 
-/*
- * verlet_drift_positions() -- the position half of Verlet:
- *   x += v dt + ½ a_old dt²
- * Uses a_old (passed in) because by the time the matching kick runs,
- * a will have been replaced with a_new from the force evaluation.
- */
+/* Move each body to its new spot, using its current speed and the gravity
+ * push from the start of the step (the old push we saved). */
 static void verlet_drift_positions(NBody *nb, const float *ax_old,
                                    const float *ay_old, float dt) {
   for (int i = 0; i < nb->n; i++) {
@@ -553,11 +309,8 @@ static void verlet_drift_positions(NBody *nb, const float *ax_old,
   }
 }
 
-/*
- * mark_ejected_bodies() -- post-drift cull.  Bodies that have wandered
- * past EJECT_FACTOR × screen are marked inactive (vanish silently);
- * subsequent force/integrator/render passes skip them.
- */
+/* Any body that has drifted far past the screen edge is switched off and
+ * quietly forgotten, so the physics and drawing stop bothering with it. */
 static void mark_ejected_bodies(NBody *nb, int cols, int rows) {
   float limit_x = (float)pw(cols) * EJECT_FACTOR;
   float limit_y = (float)ph(rows) * EJECT_FACTOR;
@@ -570,12 +323,9 @@ static void mark_ejected_bodies(NBody *nb, int cols, int rows) {
   }
 }
 
-/*
- * verlet_kick_velocities() -- the velocity half of Verlet:
- *   v += ½ (a_old + a_new) dt
- * Averaging a_old and a_new is what makes the scheme 2nd-order and
- * symplectic (a simple v += a_new dt would be 1st-order semi-implicit).
- */
+/* Update each body's speed using the average of the gravity push at the
+ * start and end of the step.  That averaging is the bit that keeps orbits
+ * from slowly winding in or out. */
 static void verlet_kick_velocities(NBody *nb, const float *ax_old,
                                    const float *ay_old, float dt) {
   for (int i = 0; i < nb->n; i++) {
@@ -587,10 +337,9 @@ static void verlet_kick_velocities(NBody *nb, const float *ax_old,
   }
 }
 
-/*
- * nbody_step() -- one velocity-Verlet substep.  Reads as the 5-line
- * algorithm: stash, drift, cull, recompute forces, kick.
- */
+/* One small step forward in time, reading as five plain moves: save the old
+ * push, move the bodies, drop the ones that flew off, work out the new push,
+ * update the speeds. */
 static void nbody_step(NBody *nb, float dt, int cols, int rows) {
   float ax_old[MAX_BODIES], ay_old[MAX_BODIES];
   verlet_stash_old_accelerations(nb, ax_old, ay_old);
@@ -600,65 +349,51 @@ static void nbody_step(NBody *nb, float dt, int cols, int rows) {
   verlet_kick_velocities(nb, ax_old, ay_old, dt);
 }
 
-/* ── Preset initialisation ──────────────────────────────────────────────
+/* ── Presets ──
  *
- * Ten presets in simple → complex order.  Index = complexity rank:
- *   0  Kepler          2 bodies, clean circular orbit
- *   1  Binary Star     2 equal masses, common barycenter
- *   2  Solar System    1 sun + 4 planets (Kepler's 3rd law)
- *   3  Lagrange Tri    3 equal masses, equilateral rigid rotation
- *   4  Figure-8        Chenciner-Montgomery 3-body choreography
- *   5  Pythagorean     Burrau 1913: m=3,4,5 at rest, chaotic
- *   6  Black Hole      central mass + 20 orbiters
+ * Ten ready-made setups, ordered simplest first:
+ *   0  Kepler          one clean orbit
+ *   1  Binary Star     two equal stars circling each other
+ *   2  Solar System    a sun and four planets
+ *   3  Lagrange Tri    three stars in a rigidly spinning triangle
+ *   4  Figure-8        three bodies chasing each other on a figure-8
+ *   5  Pythagorean     three at rest that fall into chaos
+ *   6  Black Hole      one heavy centre with 20 orbiters
  *   7  Galaxy          20 random bodies in a disc
- *   8  Binary BH       2 heavy + 20 test particles
- *   9  Galaxy Merger   2 clusters on collision course
+ *   8  Binary BH       two heavy centres plus 20 light particles
+ *   9  Galaxy Merger   two clusters on a collision course
  *
- * Every preset finishes with nbody_forces() so a-values are seeded
- * for the first velocity-Verlet half-step.
- * ───────────────────────────────────────────────────────────────────── */
-
-/* ── Preset construction helpers ─────────────────────────────────────── *
- *
- * Six small named operations every preset is built from.  They turn
- * each factory from a wall of struct-field assignments into a flat
- * pseudocode list of physics statements: "place body here at this
- * mass with this circular-orbit speed".
+ * Each setup ends by calling nbody_forces() so every body has its
+ * starting gravity push ready before the first move.
  */
 
-/*
- * random01() -- uniform sample in [0, 1) from libc rand().
- * Used wherever a preset needs randomness (radii, angles, masses).
+/* ── Preset building blocks ──
+ *
+ * A few small helpers each setup is assembled from, so the setups read
+ * as a plain list ("put a body here, this heavy, moving this fast")
+ * instead of a wall of field assignments.
  */
+
+/* A random number from 0 up to (but not including) 1, for picking random
+ * distances, angles, and masses in the setups. */
 static inline float random01(void) { return (float)rand() / (float)RAND_MAX; }
 
-/*
- * screen_min_dim() -- shorter of the two screen pixel dimensions.
- * Used as the natural length scale for placing bodies so layouts
- * stay framed when the terminal is much wider than tall (or v.v.).
- */
+/* The shorter side of the screen, in pixels.  We size layouts against this so
+ * they stay nicely framed even on a very wide or very tall terminal. */
 static inline float screen_min_dim(int cols, int rows) {
   return (float)(pw(cols) < ph(rows) ? pw(cols) : ph(rows));
 }
 
-/*
- * kepler_circular_speed() -- tangential speed for a closed CIRCULAR
- * orbit around a single point mass at the origin:
- *
- *   v = sqrt(G·M / r)
- *
- * Smaller v gives an ellipse with the start point at apoapsis; larger
- * v puts it at periapsis; v² > 2·G·M/r is unbound (parabolic/hyperbolic).
- */
+/* The sideways speed that gives a perfect circle around a single heavy body
+ * at distance r.  Go slower and the orbit becomes an oval; go fast enough and
+ * the body escapes entirely.  (v = sqrt(G*M / r)) */
 static inline float kepler_circular_speed(float central_mass, float radius) {
   return sqrtf(G_CONST * central_mass / radius);
 }
 
-/*
- * body_set() -- one-line body initialisation used by every preset.
- * Fills the state vector (x, y, vx, vy), zeroes a, sets mass/color,
- * clears the trail ring buffer, and marks the body active.
- */
+/* Set up one body in a single call: its place, speed, weight, and colour,
+ * with a clean (empty) trail and switched on.  Every setup builds its bodies
+ * with this. */
 static void body_set(Body *b, float x, float y, float vx, float vy, float mass,
                      int color) {
   b->x = x;
@@ -674,13 +409,9 @@ static void body_set(Body *b, float x, float y, float vx, float vy, float mass,
   b->tcount = 0;
 }
 
-/*
- * subtract_com_velocity() -- shift into the centre-of-mass (barycentric)
- * frame so the cluster as a whole stays put on screen.
- *
- *   p_total = Σ m_i v_i        v_CoM = p_total / Σ m_i
- *   v_i' = v_i - v_CoM    →    Σ m_i v_i' = 0
- */
+/* Cancel out the group's overall drift so the whole cluster stays centred on
+ * screen instead of sliding off.  We work out how fast the group as a whole
+ * is moving and subtract that from every body. */
 static void subtract_com_velocity(NBody *nb) {
   float pcx = 0, pcy = 0, total = 0;
   for (int i = 0; i < nb->n; i++) {
@@ -696,17 +427,9 @@ static void subtract_com_velocity(NBody *nb) {
   }
 }
 
-/*
- * build_cluster() -- populate bodies[start..start+n_orbiters] with a
- * heavy central body + n_orbiters in random circular orbits around it.
- * The cluster as a whole drifts at (vx, vy).  Used by preset_merger
- * to assemble the two galaxies symmetrically.
- *
- *   r ∈ [0.3R, R]            uniform in radius (not in area)
- *   ang ∈ [0, 2π)            uniform tangent direction
- *   v_orbit = sqrt(G·M_central / r)   circular around M_central
- *   v_body  = v_drift + v_orbit_tangent
- */
+/* Build one little galaxy: a heavy body in the middle with a handful of light
+ * ones circling it, and the whole bunch gliding along at (vx, vy).  The merger
+ * setup uses this twice to make two galaxies that then crash together. */
 static void build_cluster(NBody *nb, int start, int n_orbiters, float cx,
                           float cy, float vx, float vy, float M_central,
                           float R, int color_central, int color_orbiters) {
@@ -721,13 +444,8 @@ static void build_cluster(NBody *nb, int start, int n_orbiters, float cx,
   }
 }
 
-/*
- * Preset 0 — Kepler (Two-Body Orbit)
- * 1 heavy + 1 light body in a near-circular Kepler orbit.  The cleanest
- * gravitational system; an exact closed-form elliptical solution.
- *
- *   v = sqrt(G·M / r)        (circular orbit speed)
- */
+/* Preset 0 — Kepler: the simplest case.  One heavy body sits still while a
+ * light one circles it in a clean, almost-perfect ring. */
 static void preset_kepler(NBody *nb, int cols, int rows) {
   nb->n = 2;
   float cx = (float)pw(cols) * 0.5f;
@@ -741,15 +459,8 @@ static void preset_kepler(NBody *nb, int cols, int rows) {
   nbody_forces(nb->bodies, nb->n);
 }
 
-/*
- * Preset 1 — Binary Star
- * Two equal masses orbiting their common barycenter.
- *
- *   For equal mass m at half-separation R from CoM (full separation 2R):
- *     gravity   F = G·m² / (2R)²
- *     centripetal F = m·v² / R
- *     => v = (1/2) · sqrt(G·m / R)
- */
+/* Preset 1 — Binary Star: two equal stars waltzing around the point exactly
+ * between them. */
 static void preset_binary(NBody *nb, int cols, int rows) {
   nb->n = 2;
   float cx = (float)pw(cols) * 0.5f;
@@ -764,14 +475,9 @@ static void preset_binary(NBody *nb, int cols, int rows) {
   nbody_forces(nb->bodies, nb->n);
 }
 
-/*
- * Preset 2 — Solar System
- * Central "sun" + 4 "planets" at increasing radii.  Demonstrates
- * Kepler's 3rd law visually: T² ∝ r³, so outer planets sweep
- * noticeably slower than inner ones.
- *
- *   v(r) = sqrt(G·M_sun / r)
- */
+/* Preset 2 — Solar System: a sun with four planets at growing distances.  You
+ * can see the rule that the farther-out planets crawl around noticeably slower
+ * than the inner ones (Kepler's third law). */
 static void preset_solar(NBody *nb, int cols, int rows) {
   nb->n = 5;
   float cx = (float)pw(cols) * 0.5f;
@@ -792,30 +498,18 @@ static void preset_solar(NBody *nb, int cols, int rows) {
   nbody_forces(nb->bodies, nb->n);
 }
 
-/*
- * Preset 3 — Lagrange Equilateral Triangle (Euler-Lagrange, 1772)
- * 3 equal masses at the vertices of an equilateral triangle, rotating
- * rigidly as a single body.  One of Lagrange's 5 explicit central-
- * configuration solutions of the 3-body problem.
- *
- *   side length L, vertex-to-centroid distance r = L/√3
- *   Two gravity forces project onto the centroid direction at 30°:
- *     F_centripetal = 2 · G·m²/L² · cos(30°) = G·m²·√3 / L²
- *   Equating to m·ω²·r and solving:
- *     ω = sqrt(3 G m / L³),  v = ω·r = sqrt(G·m / L)
- *
- * For equal masses the triangular L4/L5 equilibrium is marginally
- * stable (Gascheau 1843): perfect ICs hold for many revolutions before
- * numerical drift compounds.
- */
+/* Preset 3 — Lagrange Triangle: three equal stars at the corners of a triangle
+ * that spins as one rigid shape, the corners forever holding their distances.
+ * One of Lagrange's exact three-body solutions (1772).  It only just barely
+ * holds together, so small rounding errors eventually pull it apart. */
 static void preset_lagrange(NBody *nb, int cols, int rows) {
   nb->n = 3;
   float cx = (float)pw(cols) * 0.5f;
   float cy = (float)ph(rows) * 0.5f;
-  float L = screen_min_dim(cols, rows) * 0.28f; /* triangle side  */
-  float r = L / sqrtf(3.0f);                    /* vertex→centroid */
+  float L = screen_min_dim(cols, rows) * 0.28f; /* length of one side    */
+  float r = L / sqrtf(3.0f);                    /* corner to the middle  */
   float m = 3.0f;
-  float v = sqrtf(G_CONST * m / L); /* Lagrange tangent */
+  float v = sqrtf(G_CONST * m / L); /* speed that keeps the triangle rigid */
 
   const int colors[3] = {1, 4, 5};
   for (int i = 0; i < 3; i++) {
@@ -829,34 +523,21 @@ static void preset_lagrange(NBody *nb, int cols, int rows) {
   nbody_forces(nb->bodies, nb->n);
 }
 
-/*
- * Preset 4 — Figure-8 (Chenciner & Montgomery, 2000)
- * Three equal masses chasing each other along a single figure-8 curve.
- * An exact periodic solution of the 3-body problem, discovered
- * numerically by Moore (1993) and proven to exist by Chenciner and
- * Montgomery (Annals of Mathematics, 2000).
- *
- * Natural units: G=1, m=1.  Rescaled to pixel space:
- *   pos_scale  = F8_SCALE
- *   time_scale = sqrt(F8_SCALE³ / G_CONST)
- *   vel_scale  = F8_SCALE / time_scale
- *
- * Published ICs:
- *   q1 = (-0.97000436,  0.24308753),  q3 = ( 0.97000436, -0.24308753)
- *   v1 = v3 = ( 0.46620369,  0.43236573)
- *   v2 = (-0.93240737, -0.86473146)
- */
+/* Preset 4 — Figure-8: three equal stars chasing each other forever around a
+ * single figure-8 loop.  The exact starting numbers below are the published
+ * ones (Chenciner & Montgomery, 2000); they're written for an abstract grid,
+ * so we scale them up to fit the screen. */
 static void preset_figure8(NBody *nb, int cols, int rows) {
   nb->n = 3;
   float cx = (float)pw(cols) * 0.5f;
   float cy = (float)ph(rows) * 0.5f;
 
-  /* natural-unit -> pixel-unit conversion factors */
+  /* scale the abstract published numbers up to screen pixels */
   float L = F8_SCALE;
-  float ts = sqrtf(L * L * L / G_CONST); /* sec per natural-time unit */
-  float vs = L / ts;                     /* px/s per natural-velocity */
+  float ts = sqrtf(L * L * L / G_CONST); /* scales the time numbers  */
+  float vs = L / ts;                     /* scales the speed numbers */
 
-  /* published ICs (Chenciner-Montgomery 2000) */
+  /* the exact published starting positions and speeds */
   const float q1x = -0.97000436f, q1y = 0.24308753f;
   const float q3x = 0.97000436f, q3y = -0.24308753f;
   const float v1x = 0.46620369f, v1y = 0.43236573f;
@@ -871,21 +552,15 @@ static void preset_figure8(NBody *nb, int cols, int rows) {
   nbody_forces(nb->bodies, nb->n);
 }
 
-/*
- * Preset 5 — Pythagorean Three-Body (Burrau, 1913)
- * Masses 3, 4, 5 placed at rest at the corners of a 3-4-5 right
- * triangle.  Famously chaotic: the trio undergoes close encounters,
- * slingshots, and (in the canonical numerical integration by Szebehely
- * & Peters, 1967) one body is eventually ejected to infinity.
- *
- * Burrau ICs (vertex opposite m_k has length k):
- *   m=3 at ( 1,  3),  m=4 at (-2, -1),  m=5 at ( 1, -1)
- */
+/* Preset 5 — Pythagorean: three bodies of weight 3, 4, and 5 dropped from rest
+ * at the corners of a 3-4-5 triangle (Burrau, 1913).  Famously chaotic — they
+ * swing past each other, sling each other around, and one eventually gets
+ * flung away for good. */
 static void preset_pythagorean(NBody *nb, int cols, int rows) {
   nb->n = 3;
   float cx = (float)pw(cols) * 0.5f;
   float cy = (float)ph(rows) * 0.5f;
-  /* S = pixels per natural length unit; smaller -> faster dynamics */
+  /* how big to draw the triangle; smaller makes the action faster */
   float S = screen_min_dim(cols, rows) * 0.10f;
 
   const float xs[3] = {1.0f, -2.0f, 1.0f};
@@ -900,14 +575,9 @@ static void preset_pythagorean(NBody *nb, int cols, int rows) {
   nbody_forces(nb->bodies, nb->n);
 }
 
-/*
- * Preset 6 — Black Hole
- * Central mass=100 at screen centre + 20 orbiting light bodies.
- *
- *   v = sqrt(G·M_central / r) * 0.98
- *   0.98 ≈ near-circular: a slight under-circular factor keeps orbits
- *   from being perfectly periodic so precession is visible.
- */
+/* Preset 6 — Black Hole: one very heavy body in the middle with 20 light ones
+ * orbiting.  We start them a touch slower than a perfect circle (the 0.98) so
+ * the orbits slowly turn over time and you can watch them drift. */
 static void preset_blackhole(NBody *nb, int cols, int rows) {
   nb->n = 21;
   float cx = (float)pw(cols) * 0.5f;
@@ -921,7 +591,7 @@ static void preset_blackhole(NBody *nb, int cols, int rows) {
   for (int i = 1; i < nb->n; i++) {
     float r = min_r + (max_r - min_r) * random01();
     float ang = 2.0f * (float)M_PI * random01();
-    float v = kepler_circular_speed(M_bh, r) * 0.98f; /* see comment */
+    float v = kepler_circular_speed(M_bh, r) * 0.98f; /* slightly slow */
     body_set(&nb->bodies[i], cx + r * cosf(ang), cy + r * sinf(ang),
              -v * sinf(ang), v * cosf(ang), /* CCW tangent */
              1.0f, ((i - 1) % (N_COLORS - 1)) + 1);
@@ -930,22 +600,16 @@ static void preset_blackhole(NBody *nb, int cols, int rows) {
   nbody_forces(nb->bodies, nb->n);
 }
 
-/*
- * Preset 7 — Galaxy
- * 20 random bodies (mass 1–4) placed in a disc, each given near-
- * circular velocity around the system's centre of mass.  CoM
- * velocity is then subtracted so the cluster as a whole stays put.
- *
- *   v = sqrt(G·M_total / r) * 0.75   (under-circularised for
- *                                     mildly elliptical, livelier orbits)
- */
+/* Preset 7 — Galaxy: 20 random bodies scattered across a disc, each set
+ * circling the middle.  We start them a fair bit slower than a perfect circle
+ * (the 0.75) so the orbits are ovals and the whole thing looks livelier. */
 static void preset_galaxy(NBody *nb, int cols, int rows) {
   nb->n = 20;
   float cx = (float)pw(cols) * 0.5f;
   float cy = (float)ph(rows) * 0.5f;
   float R = screen_min_dim(cols, rows) * 0.30f;
 
-  /* place bodies in a sqrt-warped disc (uniform AREA density) */
+  /* scatter the bodies evenly across the disc, not bunched at the centre */
   for (int i = 0; i < nb->n; i++) {
     float r = R * sqrtf(random01());
     float ang = 2.0f * (float)M_PI * random01();
@@ -954,12 +618,12 @@ static void preset_galaxy(NBody *nb, int cols, int rows) {
              1.0f + 3.0f * random01(), (i % N_COLORS) + 1);
   }
 
-  /* total mass used as the "central" mass for orbital speed estimate */
+  /* add up all the weight to estimate how fast each body should circle */
   float M_total = 0;
   for (int i = 0; i < nb->n; i++)
     M_total += nb->bodies[i].mass;
 
-  /* under-circular tangential velocity → mildly elliptical orbits */
+  /* aim each body sideways, a bit slow, so its orbit is a gentle oval */
   for (int i = 0; i < nb->n; i++) {
     Body *b = &nb->bodies[i];
     float dx = b->x - cx, dy = b->y - cy;
@@ -974,19 +638,13 @@ static void preset_galaxy(NBody *nb, int cols, int rows) {
     b->vy = dx / r * v;
   }
 
-  subtract_com_velocity(nb); /* transform to CoM frame */
+  subtract_com_velocity(nb); /* keep the whole cluster centred on screen */
   nbody_forces(nb->bodies, nb->n);
 }
 
-/*
- * Preset 8 — Binary Black Holes
- * Two heavy masses orbiting each other + 20 light test particles in a
- * surrounding disc.  The time-varying binary potential drives the test
- * particles through complex resonances and frequent slingshot ejections.
- *
- *   binary velocity from preset 1 formula
- *   test-particle orbits assume combined point mass at centre
- */
+/* Preset 8 — Binary Black Holes: two heavy bodies circling each other, ringed
+ * by 20 light test particles.  Because the two heavies keep shifting around,
+ * the light ones get jostled, swung about, and often flung clear off. */
 static void preset_binary_bh(NBody *nb, int cols, int rows) {
   nb->n = 22;
   float cx = (float)pw(cols) * 0.5f;
@@ -994,13 +652,13 @@ static void preset_binary_bh(NBody *nb, int cols, int rows) {
   float Rbh = screen_min_dim(cols, rows) * 0.08f;
   float Rmax = screen_min_dim(cols, rows) * 0.34f;
   float M_bh = 50.0f;
-  float v_bh = 0.5f * kepler_circular_speed(M_bh, Rbh); /* binary speed */
+  float v_bh = 0.5f * kepler_circular_speed(M_bh, Rbh); /* binary-star speed */
 
-  /* the two black holes orbit each other */
+  /* the two black holes circle each other */
   body_set(&nb->bodies[0], cx - Rbh, cy, 0, -v_bh, M_bh, 3);
   body_set(&nb->bodies[1], cx + Rbh, cy, 0, v_bh, M_bh, 3);
 
-  /* test particles in a distant disc around the combined point mass */
+  /* light test particles in a wide ring, circling the pair's combined weight */
   for (int i = 2; i < nb->n; i++) {
     float r = Rbh * 3.0f + (Rmax - Rbh * 3.0f) * random01();
     float ang = 2.0f * (float)M_PI * random01();
@@ -1013,31 +671,29 @@ static void preset_binary_bh(NBody *nb, int cols, int rows) {
   nbody_forces(nb->bodies, nb->n);
 }
 
-/*
- * Preset 9 — Galaxy Merger
- * Two compact clusters on collision course.  Each cluster = a heavy
- * central body + 12 orbiters.  Tidal forces strip stars from both as
- * they approach, leaving the long spiral tails seen in real merger
- * observations (e.g. the Antennae galaxies NGC 4038/4039).
- */
+/* Preset 9 — Galaxy Merger: two small galaxies (a heavy centre plus 12
+ * orbiters each) aimed at each other.  As they pass, each one's gravity tears
+ * stars off the other, drawing the long curling tails you see in photos of
+ * real galaxy collisions (like the Antennae galaxies). */
 static void preset_merger(NBody *nb, int cols, int rows) {
   nb->n = 26;
   float W = (float)pw(cols);
   float H = (float)ph(rows);
-  float D = screen_min_dim(cols, rows) * 0.30f; /* half-separation */
-  float R = screen_min_dim(cols, rows) * 0.10f; /* cluster radius  */
+  float D = screen_min_dim(cols, rows) * 0.30f; /* how far apart they start */
+  float R = screen_min_dim(cols, rows) * 0.10f; /* size of each galaxy      */
   float Mc = 50.0f;
-  float v_app = 0.4f * kepler_circular_speed(Mc, D); /* approach speed  */
+  float v_app = 0.4f * kepler_circular_speed(Mc, D); /* closing speed */
 
-  /* Two symmetric clusters approaching each other along the x-axis */
+  /* two matching galaxies heading toward each other across the screen */
   build_cluster(nb, 0, 12, W * 0.5f - D, H * 0.5f, v_app, 0, Mc, R, 3, 1);
   build_cluster(nb, 13, 12, W * 0.5f + D, H * 0.5f, -v_app, 0, Mc, R, 3, 5);
 
   nbody_forces(nb->bodies, nb->n);
 }
 
-/* ── Dispatch table ─────────────────────────────────────────────────── *
- * Display name + factory pointer, both indexed by the preset number.  */
+/* ── Preset lookup tables ──
+ * The on-screen name and the build function for each setup, both looked up by
+ * the preset number. */
 
 static const char *preset_names[N_PRESETS] = {
     "Kepler",        /* 0 */
@@ -1077,7 +733,7 @@ static void nbody_tick(NBody *nb, float dt, int cols, int rows) {
   float sub_dt = dt / (float)SUB_STEPS;
   for (int s = 0; s < SUB_STEPS; s++) {
     nbody_step(nb, sub_dt, cols, rows);
-    /* record trail every sub-step */
+    /* save each body's spot so the trail stays smooth, not jumpy */
     for (int i = 0; i < nb->n; i++) {
       if (nb->bodies[i].active)
         body_trail_push(&nb->bodies[i], nb->bodies[i].x, nb->bodies[i].y);
@@ -1085,10 +741,8 @@ static void nbody_tick(NBody *nb, float dt, int cols, int rows) {
   }
 }
 
-/*
- * nbody_count_active() -- number of bodies that have not been ejected.
- * Used by the top-HUD status row.
- */
+/* How many bodies are still in play (haven't been flung off-screen); shown in
+ * the top status bar. */
 static int nbody_count_active(const NBody *nb) {
   int n = 0;
   for (int i = 0; i < nb->n; i++)
@@ -1097,17 +751,13 @@ static int nbody_count_active(const NBody *nb) {
   return n;
 }
 
-/* ── nbody_draw decomposition: trail and glyph rendering ─────────────── */
+/* ── Drawing the bodies and their trails ── */
 
-/*
- * glyph_for_mass() -- pick an ASCII glyph whose ink density tracks
- * the body's mass.  Order follows the Bourke density ramp tradition:
- *
- *   '@'  m > 50    black-hole / supergiant (densest)
- *   'O'  m >  3    medium star
- *   'o'  m >  1.5  light star
- *   '*'  otherwise dust / test particle
- */
+/* Pick the character to draw a body with, so heavier bodies look denser:
+ *   '@'  the heaviest — black holes, giant stars
+ *   'O'  medium stars
+ *   'o'  light stars
+ *   '*'  dust and test particles */
 static char glyph_for_mass(float mass) {
   if (mass > 50.0f)
     return '@';
@@ -1118,20 +768,15 @@ static char glyph_for_mass(float mass) {
   return '*';
 }
 
-/*
- * cell_in_scene_band() -- viewport clip predicate.  Excludes the top
- * and bottom HUD strips so motion never overwrites the UI.
- */
+/* True if a cell is in the drawable area — on screen and clear of the top and
+ * bottom status bars, so flying bodies never scribble over the text. */
 static bool cell_in_scene_band(int cx, int cy, int cols, int y_min, int y_max) {
   return cx >= 0 && cx < cols && cy >= y_min && cy < y_max;
 }
 
-/*
- * paint_body_trail() -- draw the orbital history of one body as '.'
- * marks.  Walks the ring buffer newest -> oldest.  Age fade: the
- * front 40% of the trail is bold; the back 60% is dim, so the curve
- * dims behind the body and brightens in front of it.
- */
+/* Draw one body's recent path as a line of dots, walking from newest to
+ * oldest.  The freshest part of the trail is bright and the older part is
+ * faded, so the line glows just behind the body and dims away behind that. */
 static void paint_body_trail(WINDOW *w, const Body *b, int cols, int y_min,
                              int y_max) {
   for (int k = 1; k < b->tcount; k++) {
@@ -1149,11 +794,8 @@ static void paint_body_trail(WINDOW *w, const Body *b, int cols, int y_min,
   }
 }
 
-/*
- * paint_body_glyph() -- draw the body itself at its current cell
- * position.  Glyph picked by mass; identity color + A_BOLD makes the
- * body pop against its own dim trail.
- */
+/* Draw the body itself where it is right now.  Its character comes from its
+ * weight, and we draw it bright so it stands out against its own faded trail. */
 static void paint_body_glyph(WINDOW *w, const Body *b, int cols, int y_min,
                              int y_max) {
   int cx = px_to_cell_x(b->x);
@@ -1166,10 +808,8 @@ static void paint_body_glyph(WINDOW *w, const Body *b, int cols, int y_min,
   wattroff(w, COLOR_PAIR(b->color) | A_BOLD);
 }
 
-/*
- * nbody_draw() -- render every active body's trail (optional) and
- * glyph into the scene band between the top and bottom HUDs.
- */
+/* Draw all the live bodies — each one's trail (if trails are on) and then the
+ * body on top — into the area between the two status bars. */
 static void nbody_draw(const NBody *nb, WINDOW *w, int cols, int rows) {
   const int y_min = TOP_HUD_ROWS;
   const int y_max = rows - BOTTOM_HUD_ROWS; /* exclusive */
@@ -1184,67 +824,32 @@ static void nbody_draw(const NBody *nb, WINDOW *w, int cols, int rows) {
   }
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6  scene ── */
 
 /*
- * Scene -- the simulation's persistent state, lifespan = whole program.
+ * Scene -- everything the simulation is doing right now.  Lives for the whole
+ * run, owned by App, and rebuilt from scratch whenever you restart ('r') or
+ * switch setups ('n' / 'p').
  *
- * INTENT: single source of truth for "what the simulation is doing
- * right now."  Owned by App; snapshotted whenever 'r' restarts a
- * preset or 'n'/'p' switches to a new one.
+ * Why it's so small: we keep the *simulation* facts here and let the drawing
+ * side work out everything it needs on the fly.  The two run on separate
+ * clocks (physics ticks at its own rate, drawing at about 60 a second), and
+ * keeping them apart is what lets the window resize without ever disturbing
+ * the physics.  The rough rule: if building a setup or stepping the physics
+ * needs to read a value, it lives here; if only the drawing code needs it,
+ * it's worked out per frame and not stored.
  *
- * LOCALITY PRINCIPLE -- where simulation vs. rendering state lives
- * --------------------------------------------------------------
- * The codebase runs two clocks at different rates (sim at sim_fps,
- * render at ~60 Hz).  Cleanly separating sim from render state is
- * what lets the render side reflow on SIGWINCH without disturbing
- * the integrator, and lets the integrator step at any rate without
- * needing to know what the screen looks like.
- *
- *   SIMULATION state (persistent, lives HERE):
- *     nbody         all bodies + sim-level flags
- *                   (paused, show_trails, preset, n).
- *     cols, rows    LAST KNOWN terminal size at the most recent tick.
- *                   Cached here so preset_*() factories and
- *                   nbody_step() can place bodies / check ejection
- *                   against the actual screen without taking a
- *                   Screen* parameter.  Keeps the preset functions
- *                   decoupled from the §7 ncurses layer.  Refreshed
- *                   each scene_tick() from App-supplied dims --
- *                   that's the only sync point with the render side.
- *
- *   RENDER state (ephemeral, lives ELSEWHERE):
- *     Screen.cols / Screen.rows
- *                   live ncurses size in §7.  Refreshed only on
- *                   SIGWINCH; Scene's mirror lags by at most one tick.
- *     glyph / colour picking
- *                   pure functions of mass and color, recomputed per
- *                   frame by glyph_for_mass() / paint_body_glyph().
- *                   Nothing to cache.
- *     trail-age dim cutoff
- *                   computed per frame inside paint_body_trail() from
- *                   the ring-buffer offset.  Stateless.
- *     CELL_W, CELL_H, EJECT_FACTOR, TRAIL_LEN, TOP_HUD_ROWS, ...
- *                   constants in §1 -- configuration, not state.
- *     HUD text strings (fps, sim hz, body count, paused indicator)
- *                   formatted per frame by render_top_hud().
- *                   Stateless.
- *
- *   APP-CONTROL state (lives in App, §8):
- *     sim_fps, running, need_resize -- loop driver, neither sim nor
- *     render.  Mutated by the keyboard handler and by signals.
- *
- * Rule of thumb: if a preset_*() factory or nbody_tick() READS a
- * value, it goes here.  If only nbody_draw() / render_top_hud() /
- * render_bottom_hud() read it, it lives in Screen or is recomputed.
- * That is why Scene is tiny: almost everything the renderer needs is
- * a pure function of body state.
+ *   nbody       all the bodies plus the group switches (paused, trails on/off,
+ *               which setup, how many bodies).
+ *   cols, rows  the terminal size as of the last physics tick.  Kept here so
+ *               the setup builders and the ejection check can place bodies and
+ *               measure against the real screen without reaching into the
+ *               ncurses layer.  Refreshed each tick -- the one spot where the
+ *               physics and the screen size meet.
  */
 typedef struct {
-  NBody nbody;    /* particle system + sim flags */
-  int cols, rows; /* mirror of last-known terminal size */
+  NBody nbody;    /* the bodies plus the group switches */
+  int cols, rows; /* terminal size as of the last tick */
 } Scene;
 
 static void scene_init(Scene *s, int cols, int rows) {
@@ -1267,27 +872,19 @@ static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
   nbody_draw(&s->nbody, w, cols, rows);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7  screen ── */
 
 /*
- * Screen -- cached terminal dimensions.
+ * Screen -- the current terminal size, remembered so the drawing code doesn't
+ * have to ask ncurses for it every frame.  Set once at startup and updated
+ * whenever the window is resized.
  *
- * INTENT: hold the live ncurses dims so render functions don't have
- * to call getmaxyx() per frame.  Refreshed on boot in screen_init()
- * and on every SIGWINCH in screen_resize().
+ * Only the drawing side looks at this; the physics keeps its own copy.  So
+ * when you resize the window, the bodies carry on exactly where they were --
+ * only the status bars and the edge clipping rearrange to fit the new size.
  *
- * Pure render-side state -- the simulation never reads it directly
- * (Scene keeps its own mirror, updated each scene_tick()).  When the
- * terminal is resized the bodies keep their pixel positions and
- * velocities unchanged; only HUD layout and the top/bottom-strip
- * clipping in nbody_draw() reflow against the new dims.  This is
- * the locality principle from Scene's comment in practice: sim
- * untouched, render refreshed.
- *
- *   cols    last-known terminal column count  (ncurses COLS)
- *   rows    last-known terminal row count     (ncurses LINES)
+ *   cols    how many columns wide the terminal is
+ *   rows    how many rows tall the terminal is
  */
 typedef struct {
   int cols, rows;
@@ -1316,13 +913,12 @@ static void screen_resize(Screen *s) {
   getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * render_top_hud() -- 2-row status zone at the top of the screen.
- *   Row 0: preset title (left, orange) + fps / sim Hz (right, yellow)
- *   Row 1: bodies count, trails state, paused/running indicator
- */
+/* The two-row status bar at the top.
+ *   Top row:    which setup you're watching (left) and the speed readouts (right)
+ *   Second row: how many bodies are left, whether trails are on, and
+ *               paused-or-running. */
 static void render_top_hud(const NBody *nb, int cols, double fps, int sim_fps) {
-  /* -- Row 0: title left, fps/sim right ----------------------------- */
+  /* top row: setup name on the left, speed readouts on the right */
   attron(COLOR_PAIR(2) | A_BOLD);
   mvprintw(0, 1, " N-BODY [%d/%d]: %s ", nb->preset + 1, N_PRESETS,
            preset_names[nb->preset]);
@@ -1338,7 +934,7 @@ static void render_top_hud(const NBody *nb, int cols, double fps, int sim_fps) {
   mvprintw(0, fps_col, "%s", fps_buf);
   attroff(COLOR_PAIR(3) | A_BOLD);
 
-  /* -- Row 1: bodies / trails / paused-state ------------------------ */
+  /* second row: body count, trails on/off, and the paused/running word */
   int active = nbody_count_active(nb);
   char status[64];
   int status_len = snprintf(status, sizeof status, " bodies: %2d   trails: %s ",
@@ -1347,7 +943,7 @@ static void render_top_hud(const NBody *nb, int cols, double fps, int sim_fps) {
   mvprintw(1, 1, "%s", status);
   attroff(COLOR_PAIR(3) | A_BOLD);
 
-  /* paused indicator: bright red when paused, green when running */
+  /* red when paused, green when running */
   int cp_state = nb->paused ? 1 : 4;
   const char *state = nb->paused ? "PAUSED " : "running";
   attron(COLOR_PAIR(cp_state) | A_BOLD);
@@ -1355,11 +951,8 @@ static void render_top_hud(const NBody *nb, int cols, double fps, int sim_fps) {
   attroff(COLOR_PAIR(cp_state) | A_BOLD);
 }
 
-/*
- * render_bottom_hud() -- 1-row action zone at the bottom of the screen.
- * Lists every interactive key.  Bright cyan + A_BOLD per project HUD
- * standard (never A_DIM -- the row must stay legible over any animation).
- */
+/* The one-row key hint along the bottom, listing every key you can press.
+ * Drawn bright so it stays readable over whatever's moving behind it. */
 static void render_bottom_hud(int rows) {
   attron(COLOR_PAIR(5) | A_BOLD);
   mvprintw(rows - 1, 0,
@@ -1380,54 +973,41 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8  app ── */
 
 /*
- * App -- top-level lifecycle bundle, lives in g_app for the program's
- * entire lifetime.
+ * App -- the whole program in one bundle, living for the entire run.  It owns
+ * the simulation (scene) and the screen size (screen), and holds the few
+ * loop-control values that belong to neither.
  *
- * INTENT: composition root.  App OWNS the Scene (sim) and the Screen
- * (cached render dims), and carries the loop-driver fields
- * (sim_fps, running, need_resize) that don't belong to either
- * sub-component.
+ * There's a single global copy (g_app) for one reason: the signal handlers,
+ * which fire when you press Ctrl-C or resize the window, can't be handed a
+ * pointer to anything.  Putting the handoff in one named global keeps that
+ * narrow -- the handlers touch only the two flags below and nothing else.
  *
- * Why a single g_app global and not pass-by-pointer everywhere:
- * signal handlers (SIGINT, SIGTERM, SIGWINCH) cannot accept user
- * pointers.  Centralising the mutable handoff in one named global
- * keeps the signal contract narrow and explicit -- handlers touch
- * exactly two flags (running, need_resize), nothing more.
+ *   scene         the simulation -- see Scene.
+ *   screen        the terminal size -- see Screen.
+ *   sim_fps       how many physics ticks per second, adjustable with '[' and
+ *                 ']'.  Separate from the drawing rate, so you can speed the
+ *                 physics up or slow it down without touching the frame rate.
+ *   running       set to 0 to quit.  Pressing 'q'/ESC or hitting Ctrl-C clears
+ *                 it.  Marked `volatile sig_atomic_t` because a signal handler
+ *                 may flip it at any instant while the main loop is reading it,
+ *                 which is the only safe way to share a flag across that line.
+ *   need_resize   raised by the resize signal, handled on the next loop pass
+ *                 (which re-reads the new terminal size).  Same reason for the
+ *                 volatile sig_atomic_t.
  *
- *   scene         simulation state -- see Scene.
- *   screen        cached render dims -- see Screen.
- *   sim_fps       solver ticks per second; SIM_FPS_MIN..SIM_FPS_MAX,
- *                 stepped by SIM_FPS_STEP via '[' / ']'.  Independent
- *                 of the ~60 Hz render rate so you can crank physics
- *                 up or slow it down without disturbing the HUD fps
- *                 readout.
- *   running       Main-loop sentinel.  Cleared by SIGINT / SIGTERM
- *                 handlers and by 'q' / ESC.  Declared
- *                 `volatile sig_atomic_t` because a signal handler
- *                 writes it asynchronously while the main loop reads
- *                 it -- the only portable way to share a flag across
- *                 that boundary.
- *   need_resize   SIGWINCH flag.  Set by on_resize_signal(); drained
- *                 next iteration by app_do_resize(), which refreshes
- *                 Screen.cols/rows from ncurses.  Same volatile
- *                 sig_atomic_t rationale.
- *
- * Reference:
- *   POSIX.1-2017, §2.4 Signal Concepts.  sig_atomic_t is the standard
- *   idiom for cross-handler flags; volatile prevents the compiler
- *   from caching the value across the main-loop body.
+ * Reference: POSIX.1-2017, §2.4 Signal Concepts -- sig_atomic_t is the
+ * standard type for a flag shared with a signal handler, and volatile stops
+ * the compiler from caching it across the loop.
  */
 typedef struct {
-  Scene scene;                       /* simulation state */
-  Screen screen;                     /* cached render dims */
-  int sim_fps;                       /* solver ticks per second */
-  volatile sig_atomic_t running;     /* 0 = exit main loop */
-  volatile sig_atomic_t need_resize; /* 1 = SIGWINCH pending */
+  Scene scene;                       /* the simulation */
+  Screen screen;                     /* the terminal size */
+  int sim_fps;                       /* physics ticks per second */
+  volatile sig_atomic_t running;     /* 0 = quit */
+  volatile sig_atomic_t need_resize; /* 1 = window was resized */
 } App;
 
 static App g_app;

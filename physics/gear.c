@@ -1,234 +1,23 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * gear.c — wireframe rotating gear with themed spark effects
+ * gear.c — a spinning wireframe gear that throws sparks off its teeth.
  *
- * 10 spark/gear themes cycled with 't'.
- * Every tooth tip emits sparks carrying the gear's tangential surface
- * velocity. Faster rotation = faster sparks + more of them.
+ * The gear isn't a stored shape: every frame, each screen cell asks
+ * "am I on the hub, a spoke, a tooth, or empty?" and draws itself. The
+ * sparks are the opposite — real particles flung off the tooth tips,
+ * carrying the rim's speed, then falling and fading. Spin faster and the
+ * sparks fly faster and there are more of them.
  *
- * Keys:
- *   q / ESC   quit
- *   spc       pause / resume
- *   r         reset
- *   + / -     spin faster / slower
- *   ] / [     more / fewer sparks
- *   t / T     next / prev theme
- *   1–5       speed presets  (very slow → screaming fast)
- *
- * Themes:
- *   0 FIRE    1 MATRIX   2 PLASMA   3 NOVA     4 POISON
- *   5 OCEAN   6 GOLD     7 NEON     8 ARCTIC   9 LAVA
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/gear.c -o gear -lncurses -lm
+ * References (the code can't tell you these):
+ *   Particle systems — Reeves 1983, ACM ToG 2(2):91–108. The emit/age/
+ *     move/kill loop that gear_tick and draw_sparks follow.
+ *   Gear tooth shape — Buckingham, Analytical Mechanics of Gears (1949).
+ *   Drawing a shape by testing each cell against a curve — Bloomenthal,
+ *     Introduction to Implicit Surfaces (1997).
  *
  * §1 config  §2 clock  §3 theme  §4 color  §5 coords
  * §6 entity  §7 draw   §8 screen §9 app
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Analytic polar gear geometry [4] + particle-system
- *                  sparks [1].  Gear outline computed each frame from
- *                  N_TEETH tooth definitions (outer radius, inner radius,
- *                  hub) using polar angle stepping.  No mesh storage —
- *                  geometry is regenerated every frame from the current
- *                  rotation angle.  Particle pipeline (emit → age →
- *                  integrate → render) is the classical Reeves loop [1]
- *                  with per-stage glyph/colour variants in the spirit of
- *                  Sims [5].
- *
- * Math           : Involute gear tooth approximated as trapezoid in polar
- *                  coordinates [2].  Tooth tip position at angle α:
- *                    (x,y) = GEAR_R_OUTER × (cos α, sin α)
- *                  Tangential surface velocity at tooth tip:
- *                    v_tip = GEAR_R_OUTER × ω  (ω = angular speed rad/s)
- *                  Spark initial velocity = tangential v_tip
- *                                         + radial outward kick
- *                                         + uniform scatter.
- *
- * Physics        : Per-spark semi-implicit Euler [3] in integrate_spark:
- *                    vy += g · dt          (gravity)
- *                    v  *= exp(−k · dt)    (exponential drag, closed-form)
- *                    pos += v · dt
- *                  Closed-form drag stays stable for any dt — a poor-man's
- *                  symplectic step that's fine for short-lived particles.
- *
- * Rendering      : Cell-aspect correction: CELL_W=8, CELL_H=16 → pixels
- *                  are taller than wide; using identical r=√(dx²+dy²) on
- *                  screen-pixel space keeps the gear visually circular.
- *                  Edge glyphs picked by 8-sector quantisation of the
- *                  local angle [6] (one of {-, \, |, /} per 45° sector).
- *                  Fresh sparks (stages 0..2) render as fading comet
- *                  streaks (bright head + dim tail along velocity);
- *                  cooler sparks (3..6) fall back to the theme dot glyph.
- *                  Theme palettes [7] are perceptually-ordered cooling
- *                  ramps (white-hot → ember) in the 256-colour cube.
- *
- * Data-structure : Spark pool — fixed array of MAX_SPARKS structs with
- *                  active flag (life > 0).  O(N) per frame; emission rate
- *                  scales with ω and is hard-capped at 1200 sparks/s.
- *
- * References (cite inline as [n]):
- *
- *   [1] Reeves, W. T. (1983) — "Particle Systems — A Technique for
- *       Modeling a Class of Fuzzy Objects", *ACM Transactions on
- *       Graphics* 2 (2), 91–108.  The foundational particle-system
- *       paper: emit at a source, age each particle, integrate
- *       position/velocity, kill when life ≤ 0, render per-frame.
- *       Our gear_tick / spark_emit / draw_sparks follow this loop
- *       verbatim — and the original Genesis-effect demo is the
- *       direct ancestor of every "spray of glowing sparks" since.
- *
- *   [2] Buckingham, E. (1949) — *Analytical Mechanics of Gears*,
- *       McGraw-Hill (reprinted Dover, 1988).  Classic engineering
- *       reference for involute tooth geometry: addendum/dedendum,
- *       pitch circle, tooth thickness as a fraction of the wedge
- *       (our TOOTH_DUTY = 0.42).  Backs the trapezoidal tooth
- *       approximation used in draw_gear (§7).
- *
- *   [3] Witkin, A.; Baraff, D. (2001) — "Physically Based Modeling:
- *       Principles and Practice", SIGGRAPH course notes.  Practical
- *       recipes for Euler / semi-implicit integration of particle
- *       motion under gravity and drag, including the closed-form
- *       exp(−k·dt) damping factor used in integrate_spark.
- *
- *   [4] Bloomenthal, J. (ed.) (1997) — *Introduction to Implicit
- *       Surfaces*, Morgan Kaufmann.  Per-cell evaluation of analytic
- *       predicates on (r, θ) is exactly what draw_gear does: instead
- *       of rasterising stored geometry, every cell asks "am I on the
- *       hub ring / a spoke / a tooth side / an arc?" against thin
- *       thresholds around each implicit curve.
- *
- *   [5] Sims, K. (1990) — "Particle Animation and Rendering Using
- *       Data Parallel Computation", *SIGGRAPH '90 Proceedings*,
- *       vol. 24 (4), 405–413.  Per-particle attributes (life,
- *       colour, size) varying with age — the source of our 7-stage
- *       cooling ladder of glyphs, colours and attributes per theme.
- *
- *   [6] Bresenham, J. E. (1965) — "Algorithm for Computer Control
- *       of a Digital Plotter", *IBM Systems Journal* 4 (1), 25–30.
- *       Two uses in this file: (a) 8-direction line discretisation
- *       — 360° quantised into eight 45° sectors mapped to {-, \, |,
- *       /}, used in line_char and direction_glyph; (b) the DDA
- *       integer-from-real-rate accumulator pattern used by
- *       emit_via_dda_accumulator to emit floor(rate·dt) sparks per
- *       frame on average, carrying the fractional remainder.
- *
- *   [7] Ware, C. (2020) — *Information Visualization: Perception
- *       for Design*, 4th ed., Morgan Kaufmann.  Perceptually-ordered
- *       luminance ramps (Ch. 4) back the 10 theme palettes in §3:
- *       each spark_fg[0..6] sequence is a monotonic cooling ramp in
- *       the 256-colour cube, so the spray reads as fire fading even
- *       when individual hues differ wildly between themes.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The gear is an IMPLICIT FIELD, not a mesh.  For every cell on screen
- * within the gear's bounding box, ask: "given my polar (r, θ) relative
- * to the gear centre and rotation, do I lie on the hub ring, on a spoke,
- * on a tooth side, or on the inner/outer arc?"  Each test is a thin
- * threshold around an analytic curve.  Sparks are the OPPOSITE: explicit
- * particles emitted from tooth tips, carrying the gear's tangential
- * surface velocity, then integrating gravity + drag + turbulence until
- * their life timer expires through 7 cooling stages.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * The gear is like checking whether you're standing on a painted line
- * by looking at your GPS coordinates — no need to walk the line.  For
- * every screen cell, convert to (r, θ), subtract the gear's rotation,
- * and run a 7-tier priority chain (5 bright wireframe outlines + 2 dim
- * interior fills) — see classify_gear_cell.  The teeth appear because
- * the outer-arc test only fires when the local θ falls inside a tooth
- * slice (TOOTH_DUTY = 42 % of each 1/N_TEETH wedge).  Sparks then are
- * tiny welding chips flying off the spinning rim — they inherit the
- * rim's tangential speed plus an outward radial kick, then gravity
- * wins and they arc downward as they cool through 7 colours.
- *
- * ALGORITHM IN STEPS  (per frame — helper names track the code)
- * ──────────────────
- *  gear_tick(g, dt):
- *    1. gear_advance_rotation     :  angle += ω·dt; wrap mod TAU.
- *    2. emit_via_dda_accumulator  :  emit_acc += emission_rate_hz·dt;
- *                                    while (acc ≥ 1) pick a random
- *                                    tooth and spark_emit at its
- *                                    tooth_tip_angle.
- *    3. spark_emit                :  acquire_free_spark_slot,
- *                                    spawn_at_tooth_tip (position
- *                                    + zero velocity),
- *                                    v += rim_tangential_velocity
- *                                       + radial_outward_kick
- *                                       + uniform_jitter,
- *                                    seed_lifetime ∈ [0.85, 1.00].
- *    4. integrate_spark (each)    :  age → gravity → turb → drag → pos;
- *                                    kill if off-screen.
- *
- *  scene_draw(s, win):
- *    5. draw_sparks               :  stage = first STAGE_THRESH index
- *                                    where life > thresh; stages 0..2
- *                                    render as streaks, 3..6 as theme
- *                                    dot glyphs.
- *    6. draw_gear                 :  for each cell in clipped_gear_bbox:
- *                                      cell_to_gear_polar → (rad, ang_g,
- *                                                            ang_l);
- *                                      classify_gear_cell → CellPaint;
- *                                      paint_cell (skip if transparent).
- *
- * KEY FORMULAS
- * ────────────
- *  Tooth tip angle    :  α_t = gear.angle + (t + duty/2) · TAU / N_TEETH
- *  Tip world position :  (cx + R_outer·cos α, cy + R_outer·sin α)
- *  Tangential velocity:  v_tang = ω · R_outer · TANG_SCALE,
- *                        direction = (−sin α, cos α)
- *  Radial kick        :  v_kick  = (cos α, sin α) · U(KICK_MIN, KICK_MAX)
- *  Local angle        :  ang_l   = atan2(dy, dx) − gear.angle
- *  Tooth phase        :  phase   = frac(ang_l · N_TEETH / TAU)  ∈ [0,1)
- *  In-tooth test      :  phase < TOOTH_DUTY  (42 %)
- *  Spark life decay   :  life -= dt / SPARK_LIFE  (1.9 s total)
- *  Spark drag         :  v *= exp(−DRAG · dt)
- *  Stage              :  smallest i in 0..6 with life > STAGE_THRESH[i]
- *  Cell aspect fix    :  CELL_W=8, CELL_H=16 — pixel space already y-tall,
- *                        so the same r=√(dx²+dy²) gives a circular gear.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Spark pool exhaustion — acquire_free_spark_slot returns NULL when
- *    all 1500 are alive; spark_emit silently no-ops (fine for visual;
- *    rate self-throttles via emit_via_dda_accumulator).
- *  • emission_rate_hz is hard-capped at 1200 sparks/s to prevent
- *    runaway when ω is high AND density is high.
- *  • Theme switch must call color_apply_theme() to re-init pairs CP_S0..
- *    CP_S6; sparks already in flight immediately swap palette.
- *  • Inside classify_gear_cell, FIRST match wins — change the order
- *    and the gear loses parts.  Hub ring before spokes, spokes before
- *    tooth sides, etc.  See its priority-order doc for the full list.
- *  • Sparks dying off-screen: integrate_spark zeros life when px/py
- *    leave [0, max_px] × [0, max_py]; resize updates these before the
- *    next tick.
- *  • Tooth count and TOOTH_DUTY are tuned together — at 10 teeth and
- *    duty 0.42, gap is 0.58 of each wedge so tips read clearly.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Press `1` (slow): rotation visible, spark count low (~50–100).
- *    Press `5` (fast): emission climbs near 1200/s cap, sparks form a
- *    bright halo, gear nearly blurs.
- *  • Spark stream ALWAYS leaves a tooth tip tangent-first — at any
- *    instant the freshest sparks lie on the tangent line through the
- *    spinning tooth they just left.
- *  • Sparks fall — vy increases monotonically until drag balances
- *    gravity, so the spray bows downward, never upward, regardless of
- *    rotation direction.
- *  • Theme cycle: press `t` 10 times → returns to FIRE; spark glyphs
- *    and colour ramp change but spark physics is identical.
- *  • Pause (space): gear freezes mid-rotation; sparks freeze in place.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -240,9 +29,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 #define CELL_W 8
 #define CELL_H 16
@@ -271,7 +58,7 @@
 #define SPARK_KICK_MIN 35.0f
 #define SPARK_KICK_MAX 120.0f
 #define SPARK_SCATTER 25.0f /* keep low so streaks stay directional */
-#define SPARK_TURB 15.0f    /* keep low so trails stay clean        */
+#define SPARK_TURB 15.0f    /* keep low so trails stay clean */
 #define SPARK_GRAVITY 28.0f
 #define SPARK_DRAG 0.4f
 #define SPARK_LIFE 1.9f
@@ -286,9 +73,7 @@
 
 enum { TARGET_FPS = 60, FPS_UPDATE_MS = 500 };
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -306,17 +91,21 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  themes                                                             */
-/* ===================================================================== */
+/* ── §3 themes ── */
 
 /*
- * Each theme describes:
- *   gear_fg      — 256-color index for bright gear wireframe
- *   gear_dim_fg  — 256-color index for dim gear lines
- *   spark_fg[7]  — color per cooling stage (freshest → dead)
- *   spark_ch[7]  — character per stage
- *   spark_at[7]  — attribute per stage: 1=A_BOLD 0=A_NORMAL 2=A_DIM
+ * Theme — one complete colour-and-glyph look for the gear and its sparks.
+ * Switching themes (t/T) only swaps the look; the motion is identical.
+ *
+ * As a spark cools from fresh to dead it walks through 7 stages, and the
+ * three [7] arrays give its colour, character, and brightness at each one.
+ *
+ *   name         label shown in the HUD
+ *   gear_fg      256-colour index for the bright gear lines
+ *   gear_dim_fg  256-colour index for the faint gear lines
+ *   spark_fg[7]  colour at each cooling stage (freshest first, dead last)
+ *   spark_ch[7]  character at each stage
+ *   spark_at[7]  brightness at each stage, encoded 0=normal 1=bold 2=dim
  */
 typedef struct {
   const char *name;
@@ -329,12 +118,9 @@ typedef struct {
 
 #define N_THEMES 10
 
-/* spark_at encoding: 0=A_NORMAL  1=A_BOLD  2=A_DIM */
-
 static const Theme THEMES[N_THEMES] = {
 
-    /* ── 0  FIRE ─────────────────────────────────────────────────────── */
-    /* white-hot → yellow → amber → orange → red-orange → red → ember    */
+    /* 0 FIRE — white-hot → yellow → amber → orange → red → ember */
     {"FIRE",
      153,
      67,
@@ -342,8 +128,7 @@ static const Theme THEMES[N_THEMES] = {
      {'*', '*', '+', '+', '.', '.', ','},
      {1, 1, 1, 0, 0, 2, 2}},
 
-    /* ── 1  MATRIX ───────────────────────────────────────────────────── */
-    /* white flash → lime → green → mid-green → dark; digital rain vibe  */
+    /* 1 MATRIX — white flash → lime → green → dark; digital-rain look */
     {"MATRIX",
      34,
      22,
@@ -351,8 +136,7 @@ static const Theme THEMES[N_THEMES] = {
      {'@', '#', '*', '+', ';', ':', '.'},
      {1, 1, 1, 0, 0, 2, 2}},
 
-    /* ── 2  PLASMA ───────────────────────────────────────────────────── */
-    /* white → pink → hot-magenta → purple → deep violet; electric arc   */
+    /* 2 PLASMA — white → pink → magenta → purple → violet; electric arc */
     {"PLASMA",
      99,
      57,
@@ -360,8 +144,7 @@ static const Theme THEMES[N_THEMES] = {
      {'*', '*', '+', '+', '.', '.', ','},
      {1, 1, 1, 0, 0, 2, 2}},
 
-    /* ── 3  NOVA ─────────────────────────────────────────────────────── */
-    /* white → bright-cyan → cyan → sky-blue → blue → deep-blue; stellar */
+    /* 3 NOVA — white → cyan → sky-blue → blue → deep-blue; stellar */
     {"NOVA",
      69,
      27,
@@ -369,8 +152,7 @@ static const Theme THEMES[N_THEMES] = {
      {'*', '*', '+', '+', '.', '.', ','},
      {1, 1, 1, 0, 0, 2, 2}},
 
-    /* ── 4  POISON ───────────────────────────────────────────────────── */
-    /* white → bright-yellow → yellow-green → lime → green; toxic waste  */
+    /* 4 POISON — white → yellow → yellow-green → lime → green; toxic */
     {"POISON",
      64,
      22,
@@ -378,8 +160,7 @@ static const Theme THEMES[N_THEMES] = {
      {'*', '*', '+', '+', '.', '.', ','},
      {1, 1, 1, 0, 0, 2, 2}},
 
-    /* ── 5  OCEAN ────────────────────────────────────────────────────── */
-    /* white → ice → cyan → ocean → deep-blue; bioluminescent            */
+    /* 5 OCEAN — white → ice → cyan → ocean → deep-blue; bioluminescent */
     {"OCEAN",
      31,
      23,
@@ -387,8 +168,7 @@ static const Theme THEMES[N_THEMES] = {
      {'~', 'o', '~', '+', '.', ',', '.'},
      {1, 1, 1, 0, 0, 2, 2}},
 
-    /* ── 6  GOLD ─────────────────────────────────────────────────────── */
-    /* white → pale-gold → gold → ochre → dark-gold → bronze → copper    */
+    /* 6 GOLD — white → pale-gold → gold → ochre → bronze → copper */
     {"GOLD",
      136,
      94,
@@ -396,8 +176,7 @@ static const Theme THEMES[N_THEMES] = {
      {'*', '*', '+', '+', '.', '.', ','},
      {1, 1, 1, 0, 0, 2, 2}},
 
-    /* ── 7  NEON ─────────────────────────────────────────────────────── */
-    /* white → light-pink → hot-pink → magenta → deep-pink; synthwave    */
+    /* 7 NEON — white → light-pink → hot-pink → magenta → deep-pink */
     {"NEON",
      201,
      164,
@@ -405,8 +184,7 @@ static const Theme THEMES[N_THEMES] = {
      {'*', '*', '+', '+', '.', '.', ','},
      {1, 1, 1, 0, 0, 2, 2}},
 
-    /* ── 8  ARCTIC ───────────────────────────────────────────────────── */
-    /* white → pale-blue → ice → steel → periwinkle → cornflower → grey  */
+    /* 8 ARCTIC — white → pale-blue → ice → steel → cornflower → grey */
     {"ARCTIC",
      153,
      67,
@@ -414,8 +192,7 @@ static const Theme THEMES[N_THEMES] = {
      {'*', '*', '+', '.', '.', ',', '`'},
      {1, 1, 1, 0, 2, 2, 2}},
 
-    /* ── 9  LAVA ─────────────────────────────────────────────────────── */
-    /* white → amber → deep-orange → red → dark-red → crimson → black-red*/
+    /* 9 LAVA — white → amber → orange → red → dark-red → crimson */
     {"LAVA",
      88,
      52,
@@ -424,7 +201,8 @@ static const Theme THEMES[N_THEMES] = {
      {1, 1, 1, 0, 0, 2, 2}},
 };
 
-/* life thresholds for the 7 spark stages (inclusive lower bound)        */
+/* A spark cools through 7 stages as its life ticks down; these are the
+ * life cut-offs for each stage, brightest first. */
 static const float STAGE_THRESH[7] = {0.85f, 0.70f, 0.55f, 0.38f,
                                       0.22f, 0.10f, 0.00f};
 
@@ -435,19 +213,16 @@ static inline int spark_stage(float life) {
   return 6;
 }
 
-/* ===================================================================== */
-/* §4  color                                                              */
-/* ===================================================================== */
+/* ── §4 color ── */
 
 enum {
-  CP_GEAR = 1,     /* bright gear wireframe                           */
-  CP_GEAR_DIM = 2, /* dim gear lines                                  */
-  CP_S0 = 3,       /* spark stage 0 (freshest)                        */
-  /* CP_S1 = 4 … CP_S6 = 9 implicit */
+  CP_GEAR = 1,     /* bright gear lines */
+  CP_GEAR_DIM = 2, /* faint gear lines */
+  CP_S0 = 3,       /* freshest spark; stages 1..6 follow at 4..9 */
   CP_HUD = 10,
 };
 
-/* Decode attr int (0/1/2) → ncurses attr_t */
+/* Turn a theme's brightness code (0/1/2) into the matching ncurses flag. */
 static const attr_t ATTR_DEC[3] = {A_NORMAL, A_BOLD, A_DIM};
 
 static void color_apply_theme(int idx) {
@@ -459,7 +234,7 @@ static void color_apply_theme(int idx) {
       init_pair(CP_S0 + i, th->spark_fg[i], -1);
     init_pair(CP_HUD, 226, -1);
   } else {
-    /* 8-color fallback: white gear, yellow/red sparks                */
+    /* Plain 8-colour terminal: white gear, yellow-to-red sparks. */
     init_pair(CP_GEAR, COLOR_WHITE, -1);
     init_pair(CP_GEAR_DIM, COLOR_WHITE, -1);
     int fb[7] = {COLOR_WHITE, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW,
@@ -476,103 +251,76 @@ static void color_init(int theme) {
   color_apply_theme(theme);
 }
 
-/* ===================================================================== */
-/* §5  coords                                                             */
-/* ===================================================================== */
+/* ── §5 coords ── */
 
+/* Physics runs in fine pixels; these turn a pixel into its terminal cell. */
 static inline int px_col(float px) { return (int)floorf(px / CELL_W); }
 static inline int px_row(float py) { return (int)floorf(py / CELL_H); }
 
-/* ===================================================================== */
-/* §6  entity                                                             */
-/* ===================================================================== */
+/* ── §6 entity ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Spark — one particle in the Reeves emit/age/integrate/render pipeline [1].
+/*
+ * Spark — one glowing chip thrown off the gear's rim.
  *
- * Why a fixed flat struct (no linked list, no absolute birth time):
- *   The pool (Gear.sparks[MAX_SPARKS]) is scanned linearly every frame.
- *   Storing absolute birth time would force every stage lookup to
- *   recompute age = now − birth; storing a *countdown* collapses that to
- *   "first STAGE_THRESH index crossed" — a single linear probe in
- *   spark_stage().  Cache line is already hot from integration.
+ * Each spark just remembers where it is, how fast it's going, and how
+ * much life it has left. Sparks live in one big fixed array (the "pool")
+ * that we sweep through every frame.
  *
- * Lifetime contract:
- *   life > 0   → slot is alive; gear_tick integrates and ages it.
- *   life ≤ 0   → slot is free; spark_emit may overwrite it.
- *   spark_emit seeds life ∈ [0.85, 1.00] so freshly born sparks all land
- *   in stage 0 (the brightest tier in STAGE_THRESH).  Total life span
- *   is SPARK_LIFE (1.9 s) since decay = dt / SPARK_LIFE per frame.
+ * The life field doubles as a clock: instead of remembering when the
+ * spark was born and doing subtraction later, we count it down from ~1
+ * toward 0. When it reaches 0 the spark is dead and its slot is free for
+ * the next one. A fresh spark starts near 1.0 and lives about SPARK_LIFE
+ * (1.9 s); along the way it passes through 7 colour stages.
  *
- * Why px/py are pixel-space sub-cell floats (not cell-row/col ints):
- *   Sparks move at well under 1 cell per frame; quantising at the
- *   integration step would freeze slow sparks in place.  Cell mapping
- *   happens only at draw time via px_col / px_row.  Pixel space is the
- *   project-wide physics convention (CELL_W=8, CELL_H=16; see CLAUDE.md).
- * ─────────────────────────────────────────────────────────────────────── */
+ *   px, py  position, in fine pixels (not whole cells, so slow sparks
+ *           don't freeze on a grid); we only round to a cell when drawing
+ *   vx, vy  velocity in pixels per second; pushed around by gravity,
+ *           drag, and turbulence
+ *   life    1.0 = just born, 0.0 = dead; also picks the colour stage
+ */
 typedef struct {
-  /* ── Kinematic state (pixel space; integrated by gear_tick) ───── */
-  float px, py; /* position in pixels; clamped to framebuffer rect */
-  float vx, vy; /* velocity in pixels/sec; gravity + drag + turb   */
-
-  /* ── Age / colour selector (Reeves-style attribute aging [5]) ──── */
-  float life; /* 1.0 = just born, 0.0 = dead; drives stage 0..6
-               * via spark_stage() → STAGE_THRESH[] → glyph/colr */
+  float px, py;
+  float vx, vy;
+  float life;
 } Spark;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Gear — the spinning ring + its particle pool, in one struct.
+/*
+ * Gear — the spinning ring plus the whole pool of sparks it throws.
  *
- * Why a single owner (gear + sparks together):
- *   Sparks are emitted from teeth and inherit the rim's tangential
- *   velocity — their entire existence is bound to the gear.  Reset (r)
- *   zeros the whole struct in one call; sub-step integration touches
- *   every field through one pointer.  Splitting them into a Gear and a
- *   ParticleSystem would force every emit to take both pointers and
- *   re-derive the rim velocity each call — pure ceremony.
+ * Gear and sparks live together in one struct on purpose: sparks are born
+ * from the teeth and inherit the rim's speed, so they belong to the gear.
+ * Reset just zeroes the whole thing in one go.
  *
- * Coupling via rot_speed (the ONE knob the user spins, +/- and 1..5):
- *     (a) visible rotation:  angle      += rot_speed · dt        (gear_tick)
- *     (b) emission rate:     total_rate ∝ rot_speed / GEAR_ROT_BASE
- *                                                                (gear_tick)
- *     (c) tangential v_tip:  rot_speed · GEAR_R_OUTER · TANG_SCALE
- *                                                                (spark_emit)
- *   A faster gear visibly throws faster sparks AND more of them — the
- *   perceptual coupling between speed and intensity is what makes the
- *   demo read as "machine working harder", not "knob turned".
+ * rot_speed is the one knob the user turns (+/- and 1..5), and it drives
+ * three things at once: how fast the gear visibly spins, how many sparks
+ * fly per second, and how fast each spark is thrown. That's deliberate —
+ * a faster gear that also sprays more, faster sparks reads as a machine
+ * working harder, not just a slider moving.
  *
- * Why a flat pool (not linked free-list) — Reeves 1983 [1]:
- *   MAX_SPARKS=1500.  Linear scan in spark_emit is O(N) worst case but
- *   typically finds a free slot in the first few entries (sparks die
- *   in roughly emission order under uniform life).  A free-list would
- *   save scans but cost a pointer per slot and cache-thrash on every
- *   emit / death.  No malloc on the hot path — strict project rule.
+ * The sparks live in a plain fixed array, never grown or freed (the
+ * project forbids allocating mid-run). To find a free slot we just scan
+ * for a dead one; dead sparks cluster near the front so it's usually quick.
  *
- * Why emit_acc is a float (not an integer counter) — DDA/Bresenham [6]:
- *   Emission rate is real-valued (e.g. 19.2 sparks/frame at 60 fps with
- *   rot_speed=2.0).  emit_acc += rate · dt then `while (acc ≥ 1) emit()`
- *   is the classical integer-from-real-rate pattern: emits exactly
- *   floor(rate · dt) on average each frame, carrying the fractional
- *   remainder forward.  Equivalent to a leaky bucket of size 1.
- * ─────────────────────────────────────────────────────────────────────── */
+ *   cx, cy         gear centre in pixels (middle of the screen)
+ *   angle          current rotation in radians; wrapped back under TAU
+ *                  each tick so it never grows large enough to lose
+ *                  precision
+ *   rot_speed      spin speed in rad/s, range [0.2, 20.0]
+ *   spark_density  extra spray multiplier (] / [ keys), range [0.2, 6.0];
+ *                  separate from rot_speed so you can add sparks without
+ *                  changing the visible spin
+ *   sparks         the pool; a spark is alive while life > 0, free at <= 0
+ *   emit_acc       runs the spark "tap": we add the per-second rate times
+ *                  the timestep, and every time it crosses 1.0 we release
+ *                  one spark, carrying the leftover fraction to next frame
+ */
 typedef struct {
-  /* ── Gear pose (pixel space; polar parameters from §1) ────────── */
-  float cx, cy;    /* gear centre in pixels (mid-screen)    */
-  float angle;     /* current rotation in radians; wraps
-                    * mod TAU each tick to avoid float drift */
-  float rot_speed; /* ω in rad/s; +/- keys, range [0.2, 20.0]
-                    * couples to emission rate AND v_tip    */
-
-  /* ── User-controlled emission knob ────────────────────────────── */
-  float spark_density; /* multiplier on emission rate; ] / [ keys
-                        * range [0.2, 6.0], independent of ω so
-                        * the user can dial intensity without
-                        * also changing visible spin            */
-
-  /* ── Particle pool (Reeves-style fixed allocation [1]) ────────── */
-  Spark sparks[MAX_SPARKS]; /* life > 0 → active; life ≤ 0 → free    */
-  float emit_acc;           /* fractional sparks owed to emission;
-                             * DDA accumulator (see docstring above) */
+  float cx, cy;
+  float angle;
+  float rot_speed;
+  float spark_density;
+  Spark sparks[MAX_SPARKS];
+  float emit_acc;
 } Gear;
 
 static float randf(void) { return (float)rand() / (float)RAND_MAX; }
@@ -588,11 +336,11 @@ static void gear_init(Gear *g, float max_px, float max_py) {
     g->sparks[i].life = 0.0f;
 }
 
-/* ── particle pool [1] ─────────────────────────────────────────────── */
+/* ── §6 spark pool ── */
 
-/* Linear scan for the first dead slot.  Returns NULL if the pool is
- * full — caller should silently skip (rate self-throttles via the
- * DDA accumulator in emit_via_dda_accumulator). */
+/* Find a free spot in the spark pool by scanning for a dead one. Returns
+ * nothing if the pool is full — the caller just skips that spark, and the
+ * spawn rate quietly settles down on its own. */
 static Spark *acquire_free_spark_slot(Spark *pool, int n) {
   for (int i = 0; i < n; i++)
     if (pool[i].life <= 0.0f)
@@ -600,16 +348,15 @@ static Spark *acquire_free_spark_slot(Spark *pool, int n) {
   return NULL;
 }
 
-/* ── velocity composition (each helper ADDS one term to s->v) ─────── *
+/* ── §6 building a new spark's velocity ── *
  *
- * Reeves-style multi-source velocity composition [1]: spawn places the
- * spark and zeroes its velocity; each apply_*() then adds one physical
- * contribution.  Reading spark_emit top-to-bottom = reading the
- * velocity equation term-by-term.
- * ─────────────────────────────────────────────────────────────────── */
+ * A new spark's speed and direction are built up one push at a time.
+ * First we place it and set its speed to zero, then each helper below adds
+ * one more shove. Read spark_emit from top to bottom and you're reading
+ * the recipe in order. (Particle systems, Reeves 1983 [1].) */
 
-/* Place the spark at the tip of the tooth currently at tip_ang and
- * zero its velocity — ready for apply_*() to add velocity terms. */
+/* Put the spark at the tip of the tooth and start it at a standstill,
+ * ready for the helpers below to push it around. */
 static void spawn_spark_at_tooth_tip(Spark *s, float cx, float cy,
                                      float tip_ang) {
   s->px = cx + GEAR_R_OUTER * cosf(tip_ang);
@@ -618,11 +365,9 @@ static void spawn_spark_at_tooth_tip(Spark *s, float cx, float cy,
   s->vy = 0.0f;
 }
 
-/* Add the rim's tangential surface velocity at tip_ang.
- *   |v| = rot_speed · R_outer · TANG_SCALE
- *   dir = (−sin α, cos α)  — perpendicular to the radial, in the
- *                            spin direction.
- * This is what makes sparks fly off the rim tangent-first. */
+/* Give the spark the speed of the spinning rim it's leaving, pointed the
+ * way the rim is moving (sideways, along the spin). This is what makes a
+ * spark shoot off following the gear's turn rather than straight out. */
 static void apply_rim_tangential_velocity(Spark *s, float rot_speed,
                                           float tip_ang) {
   float v = rot_speed * GEAR_R_OUTER * TANG_SCALE;
@@ -630,40 +375,31 @@ static void apply_rim_tangential_velocity(Spark *s, float rot_speed,
   s->vy += cosf(tip_ang) * v;
 }
 
-/* Add a radial outward kick along (cos α, sin α) with random magnitude
- * in [KICK_MIN, KICK_MAX].  Gives the spark its initial "thrown off
- * the rim" character before tangential carry takes over. */
+/* Give the spark a shove straight outward from the centre, with a random
+ * strength so they don't all leave at the same speed. This is the "flung
+ * off the edge" kick. */
 static void apply_radial_outward_kick(Spark *s, float tip_ang) {
   float kick = SPARK_KICK_MIN + randf() * (SPARK_KICK_MAX - SPARK_KICK_MIN);
   s->vx += cosf(tip_ang) * kick;
   s->vy += sinf(tip_ang) * kick;
 }
 
-/* Add a symmetric uniform jitter in [−spread/2, +spread/2] per axis.
- * Without it, every spark from a given tooth would lie on the same
- * tangent line; with it, they spread into a visible spray. */
+/* Nudge the spark a little in a random direction. Without this, every
+ * spark from one tooth would fly along the exact same line; with it, they
+ * fan out into a spray. */
 static void apply_uniform_jitter(Spark *s, float spread) {
   s->vx += (randf() - 0.5f) * spread;
   s->vy += (randf() - 0.5f) * spread;
 }
 
-/* Seed the life timer.  Range [0.85, 1.00] places every newborn in
- * stage 0 (the brightest tier in STAGE_THRESH).  decay = dt/SPARK_LIFE
- * per frame → total lifespan ≈ SPARK_LIFE seconds. */
+/* Start the spark's life clock just under full, so every newborn begins
+ * in the brightest stage and lives for about SPARK_LIFE seconds. */
 static void spark_seed_lifetime(Spark *s) { s->life = 0.85f + randf() * 0.15f; }
 
 /*
- * spark_emit — the Reeves emit step [1].  Claim a slot, position it,
- * compose its velocity from three physical sources, seed its life.
- *
- * Pseudocode:
- *   slot = acquire_free_spark_slot(pool)
- *   if pool full: return            (emission self-throttles)
- *   spawn_at_tooth_tip(slot)        // position, zero velocity
- *   v += rim_tangential_velocity    // spin carry
- *   v += radial_outward_kick        // "thrown off"
- *   v += uniform_jitter             // spread into a spray
- *   seed_lifetime(slot)
+ * Make one new spark: grab a free slot, place it at a tooth tip, build up
+ * its velocity push by push, and start its life clock. If the pool is
+ * full we just don't make one.
  */
 static void spark_emit(Gear *g, float tip_ang) {
   Spark *s = acquire_free_spark_slot(g->sparks, MAX_SPARKS);
@@ -677,38 +413,37 @@ static void spark_emit(Gear *g, float tip_ang) {
   spark_seed_lifetime(s);
 }
 
-/* ── per-tick gear update ─────────────────────────────────────────── */
+/* ── §6 one simulation step ── */
 
-/* Advance gear rotation: angle += ω·dt, wrapped mod TAU to bound
- * float precision under indefinite spinning. */
+/* Turn the gear a little for this frame, and wrap the angle back around
+ * once it passes a full turn so it never grows large enough to lose
+ * accuracy over a long run. */
 static void gear_advance_rotation(Gear *g, float dt) {
   g->angle += g->rot_speed * dt;
   if (g->angle > TAU)
     g->angle -= TAU;
 }
 
-/* Current spark emission rate (sparks/sec).
- *   rate = SPARK_BASE_RATE · (ω / ω_base) · density
- * Hard-capped at 1200/s so "screaming fast × max density" doesn't
- * starve the frame budget. */
+/* How many sparks to throw off per second right now. A faster spin and a
+ * higher density both make more. Capped at 1200/s so cranking both to the
+ * max doesn't flood the frame and slow everything down. */
 static float emission_rate_hz(const Gear *g) {
   float speed_norm = g->rot_speed / GEAR_ROT_BASE;
   float rate = SPARK_BASE_RATE * speed_norm * g->spark_density;
   return rate > 1200.0f ? 1200.0f : rate;
 }
 
-/* World-space tip angle of tooth t for the gear's current rotation.
- *   α_t = gear.angle + (t + TOOTH_DUTY/2) · TAU / N_TEETH
- * The +duty/2 centres emission inside the tooth wedge, not on its
- * leading edge. */
+/* Which direction tooth number t is pointing right now. The half-tooth
+ * offset aims at the middle of the tooth, so sparks come off the centre of
+ * the tip instead of its leading corner. */
 static float tooth_tip_angle(const Gear *g, int t) {
   return g->angle + (t + TOOTH_DUTY * 0.5f) * TAU / N_TEETH;
 }
 
-/* DDA-style emission step — integer-from-real-rate [6]:
- *   emit_acc += rate·dt   (accumulate fractional sparks "owed")
- *   while (acc ≥ 1) emit one, subtract 1 (carry remainder forward)
- * Average emission rate matches emission_rate_hz over many frames. */
+/* Release the sparks owed this frame. The rate might say "3.4 sparks this
+ * frame," so we keep a running tally: add what's owed, hand out whole
+ * sparks, and carry the leftover fraction to next frame. Over time the
+ * average comes out exactly right. */
 static void emit_via_dda_accumulator(Gear *g, float dt) {
   g->emit_acc += emission_rate_hz(g) * dt;
   while (g->emit_acc >= 1.0f) {
@@ -719,17 +454,11 @@ static void emit_via_dda_accumulator(Gear *g, float dt) {
 }
 
 /*
- * integrate_spark — per-spark physics: semi-implicit Euler with
- * closed-form exponential drag [3].  Order is significant — age first
- * (kills before integrating dead particles), then gravity → turbulence
- * → drag → position.
- *
- *   age      :  life -= dt / SPARK_LIFE          (linear countdown)
- *   gravity  :  vy   += g · dt                    (constant downward)
- *   turb     :  v    += U(−s/2, +s/2) · dt        (stochastic forcing)
- *   drag     :  v    *= exp(−k · dt)              (closed-form damping)
- *   advance  :  pos  += v · dt                    (explicit step)
- *   kill     :  if off-screen, life = 0
+ * Move one spark forward by a single frame. We age it first and bail if
+ * it just died, then let gravity pull it down, add a little random wobble,
+ * slow it with drag, and finally slide it to its new spot. If it ends up
+ * off-screen we kill it so its slot frees up. The order matters — aging
+ * first avoids doing work on a spark that's already gone.
  */
 static void integrate_spark(Spark *s, float dt, float max_px, float max_py) {
   s->life -= dt / SPARK_LIFE;
@@ -738,36 +467,32 @@ static void integrate_spark(Spark *s, float dt, float max_px, float max_py) {
     return;
   }
 
-  /* gravity — constant vertical acceleration */
+  /* gravity pulls the spark down */
   s->vy += SPARK_GRAVITY * dt;
 
-  /* turbulence — anisotropic (vertical 40 % of horizontal) so trails
-   * stay readable as streaks rather than dissolving into noise */
+  /* a little random wobble — weaker up-and-down than side-to-side, so the
+   * trails stay readable as streaks instead of dissolving into noise */
   s->vx += (randf() - 0.5f) * SPARK_TURB * dt;
   s->vy += (randf() - 0.5f) * SPARK_TURB * 0.4f * dt;
 
-  /* drag — exp(−k·dt) is the closed-form solution to dv/dt = −k·v,
-   * stable for any dt unlike the explicit form v -= k·v·dt */
+  /* drag — shave a fraction off the speed each frame so sparks ease to a
+   * stop; this form stays well-behaved no matter how long the frame was */
   float damp = expf(-SPARK_DRAG * dt);
   s->vx *= damp;
   s->vy *= damp;
 
-  /* advance position */
+  /* move to the new position */
   s->px += s->vx * dt;
   s->py += s->vy * dt;
 
-  /* off-screen sparks die so they free pool slots */
+  /* a spark that left the screen dies, freeing its slot */
   if (s->px < 0 || s->px > max_px || s->py < 0 || s->py > max_py)
     s->life = 0.0f;
 }
 
 /*
- * gear_tick — one fixed-dt step of the gear simulation.
- *
- * Pseudocode:
- *   1. gear_advance_rotation     // angle += ω·dt
- *   2. emit_via_dda_accumulator  // emit pending sparks
- *   3. integrate_spark for each live slot
+ * One step of the whole simulation: turn the gear, throw off any new
+ * sparks it owes, then move every live spark forward.
  */
 static void gear_tick(Gear *g, float dt, float max_px, float max_py) {
   gear_advance_rotation(g, dt);
@@ -779,14 +504,11 @@ static void gear_tick(Gear *g, float dt, float max_px, float max_py) {
   }
 }
 
-/* ===================================================================== */
-/* §7  draw                                                               */
-/* ===================================================================== */
+/* ── §7 draw ── */
 
-/* paint_cell — bounds-checked single-glyph put with given attr.
- * Shared by every draw_* helper to write one cell into the framebuffer.
- * (Defined first so draw_gear below — and the spark drawers further
- * down — can both call it.) */
+/* Put one character on the screen, but only if it's actually on-screen.
+ * Every draw helper goes through here, so the bounds check lives in one
+ * place. Defined first so the gear and spark drawers below can call it. */
 static void paint_cell(WINDOW *win, int r, int c, chtype ch, int cp, attr_t at,
                        int cols, int rows) {
   if (c < 0 || c >= cols || r < 0 || r >= rows)
@@ -797,11 +519,10 @@ static void paint_cell(WINDOW *win, int r, int c, chtype ch, int cp, attr_t at,
 }
 
 /*
- * line_char — wireframe edge glyph picked by 8-sector quantisation of
- * ang (Bresenham-style 8-direction line discretisation [6]).
- *   ang=0   → '-'   ang=π/4 → '\'   ang=π/2 → '|'   ang=3π/4 → '/'
- * The same four glyphs repeat in the opposite half — direction doesn't
- * matter for an unoriented line, only its slope.
+ * Pick the character that best looks like a line pointing in direction
+ * `ang`. We only have four to work with: '-' '\' '|' '/'. The circle is
+ * split into eight slices, and opposite slices reuse the same glyph since
+ * a line looks the same drawn either way along it.
  */
 static chtype line_char(float ang) {
   float a = fmodf(ang + TAU, TAU);
@@ -822,14 +543,13 @@ static chtype line_char(float ang) {
   return '/';
 }
 
-/* ── gear cell sampler & implicit-field tests [4] ─────────────────── */
+/* ── §7 gear cell tests ── */
 
 /*
- * Rectangle (in cells) covering the gear, clipped to the visible
- * window.  Lets draw_gear iterate only cells that could possibly hit
- * any part of the gear (anything beyond R_OUTER + THRESH_CIRC is
- * culled by the per-cell rad test anyway, but the bbox saves the
- * per-cell sqrt for the vast empty space around the gear).
+ * Work out the box of cells the gear could possibly touch, trimmed to
+ * what's on screen. draw_gear only loops over this box instead of the
+ * whole window, so we skip the expensive distance math for the big empty
+ * space around the gear.
  */
 static void clipped_gear_bbox(const Gear *g, int cols, int rows, int *r_lo,
                               int *r_hi, int *c_lo, int *c_hi) {
@@ -848,16 +568,14 @@ static void clipped_gear_bbox(const Gear *g, int cols, int rows, int *r_lo,
 }
 
 /*
- * Convert cell (r, c) into polar coordinates relative to the gear
- * centre.  Sample point is the cell's PIXEL CENTRE for sub-cell
- * accuracy.
- *   rad   = √(dx² + dy²)                        (radius in pixels)
- *   ang_g = atan2(dy, dx)                       (world-frame angle)
- *   ang_l = ang_g − gear.angle                  (gear's rotating frame)
- *
- * ang_g picks the line glyph (geometry is rotation-invariant in the
- * viewer's frame); ang_l drives the tooth/spoke tests (geometry is
- * fixed in the gear's frame).
+ * For one cell, find how far it is from the gear's centre and in which
+ * direction. We measure from the cell's centre point so the gear stays
+ * crisp at sub-cell detail. Two angles come out:
+ *   ang_g  the direction as the viewer sees it — used to pick the line
+ *          character, which doesn't care how the gear is turned.
+ *   ang_l  the same direction but as the gear sees it (with its spin
+ *          subtracted out) — used to test for teeth and spokes, which
+ *          are fixed to the gear and turn with it.
  */
 static void cell_to_gear_polar(int r, int c, const Gear *g, float *rad,
                                float *ang_g, float *ang_l) {
@@ -869,10 +587,9 @@ static void cell_to_gear_polar(int r, int c, const Gear *g, float *rad,
 }
 
 /*
- * tooth_phase — fractional position within the current tooth period
- * (wedge of width TAU/N_TEETH).  phase ∈ [0, 1):
- *   [0, TOOTH_DUTY)         → tooth zone
- *   [TOOTH_DUTY, 1.0)       → gap zone
+ * Where we are inside one tooth-and-gap slice, as a fraction from 0 to 1.
+ * The first chunk (up to TOOTH_DUTY) is the tooth; the rest is the gap
+ * between teeth.
  */
 static float tooth_phase(float ang_l) {
   float phase = fmodf(ang_l * N_TEETH / TAU, 1.0f);
@@ -882,24 +599,24 @@ static float tooth_phase(float ang_l) {
 }
 
 /*
- * Arc-length (in pixels) from the sample point to the nearest tooth-
- * side boundary at this radius.  Tooth sides sit at phase=0 and
- * phase=TOOTH_DUTY; take whichever is nearer (wrap-around at phase>0.5
- * for the 0-side), then convert phase distance → angle → arc length.
+ * How far (in pixels) the sample point is from the nearest edge of a
+ * tooth, measured along the circle. A tooth has two side edges; we take
+ * the closer one. Used to know when a cell sits right on a tooth's side
+ * so we can draw that edge.
  */
 static float arclen_to_tooth_side(float phase, float rad) {
-  float d0 = phase;                     /* dist to phase = 0    */
-  float dT = fabsf(phase - TOOTH_DUTY); /* dist to phase = duty */
+  float d0 = phase;
+  float dT = fabsf(phase - TOOTH_DUTY);
   if (d0 > 0.5f)
-    d0 = 1.0f - d0;                       /* wrap-around          */
-  float nearest = (d0 < dT) ? d0 : dT;    /* whichever is closer  */
-  return nearest * (TAU / N_TEETH) * rad; /* phase → arc length   */
+    d0 = 1.0f - d0; /* the gap wraps around, so measure the short way */
+  float nearest = (d0 < dT) ? d0 : dT;
+  return nearest * (TAU / N_TEETH) * rad;
 }
 
 /*
- * Arc-length (in pixels) to nearest spoke axis.  Spokes sit at the
- * wedge midpoints (one per tooth period).  modulo ang_l by the period
- * → angular distance to spoke; arc-length = ang_dist · rad.
+ * How far (in pixels) the sample point is from the nearest spoke, along
+ * the circle. There's one spoke per tooth, lined up with the middle of
+ * each slice. Used to know when a cell sits on a spoke.
  */
 static float arclen_to_spoke(float ang_l, float rad) {
   float period = TAU / N_TEETH;
@@ -910,89 +627,53 @@ static float arclen_to_spoke(float ang_l, float rad) {
   return ang_d * rad;
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * CellPaint — what to paint at one gear cell.
+/*
+ * CellPaint — the answer to "what should I draw at this one cell?"
  *
- * Output of the implicit-field classifier [4]: instead of having
- * classify_gear_cell mutate caller-side ch/at/cp locals (or return
- * those via three out-pointers), it returns one CellPaint value per
- * sampled cell.  Compound-literal init `(CellPaint){...}` lets each
- * priority-chain branch return its result on a single line — the
- * classifier reads as a flat decision table, not a nested if-then.
+ * For every cell near the gear we ask which part of the gear it lands on,
+ * and the answer comes back as one of these little bundles: a character,
+ * how bright to draw it, and which colour to use. Bundling the three
+ * together keeps the deciding ("what's here?") cleanly separate from the
+ * drawing ("put it on screen") — one function decides and hands back a
+ * CellPaint, the other just paints it.
  *
- * Why a struct (not three separate variables / out-pointers):
- *   The three fields are inseparable — a glyph without its attribute
- *   and colour-pair index is meaningless to ncurses.  Bundling them
- *   keeps "classify" (decide what's there) and "paint" (write the
- *   cell) syntactically separate: classify_gear_cell returns the
- *   bundle, draw_gear forwards it straight to paint_cell.  Classic
- *   separation of decision from effect.
+ * Brighter parts of the gear sit on top of dimmer ones. The bright
+ * outline (hub, spokes, tooth edges) is checked first and wins; the dim
+ * fills (tooth interior, body disc) only show through where there's no
+ * outline. So brightness here also doubles as draw order.
  *
- * Transparency sentinel:
- *   ch == 0 means "nothing to paint here" — the sample point sits in
- *   empty space (outside every gear region).  Zero is safe because no
- *   printable ASCII glyph (0x20..0x7E) has value 0.  draw_gear checks
- *   `if (!p.ch) continue;` instead of carrying a separate bool.
- *
- * Brightness ladder encoded by (at, cp) — used in priority order by
- * classify_gear_cell to give the gear visual depth:
- *
- *   A_BOLD   + CP_GEAR      → brightest  hub ring, spokes, tooth sides,
- *                                         outer tooth arc (the outline)
- *   A_NORMAL + CP_GEAR_DIM  → medium     inner arc in gap zone (fades
- *                                         the body→gap transition)
- *   A_DIM    + CP_GEAR      → dim        tooth interior ':' fill
- *                                         (theme bright colour, low attr)
- *   A_DIM    + CP_GEAR_DIM  → dimmest    body disc '.' fill
- *
- * Outlines paint OVER fills because classify_gear_cell tests outline
- * regions first (see its priority-order doc); the brightness ladder
- * is therefore also a z-order — bright always wins over dim below it.
- * ─────────────────────────────────────────────────────────────────────── */
+ *   ch  the character to draw. One of the line shapes ('-' '\' '|' '/')
+ *       for edges, or a fill ('.' for the body, ':' inside teeth).
+ *       A value of 0 is the special "draw nothing here" marker — the
+ *       cell is empty space. 0 is safe to mean this because no real
+ *       printable character has that value.
+ *   at  how bright: A_BOLD (bright outline), A_NORMAL (medium), or
+ *       A_DIM (the faint interior fills).
+ *   cp  which colour pair to use: CP_GEAR (the theme's bright gear
+ *       colour) or CP_GEAR_DIM (its muted one). Switching theme changes
+ *       what these colours actually look like, but this choice between
+ *       bright and muted stays the same.
+ */
 typedef struct {
-  chtype ch; /* ncurses glyph — printable ASCII (0x20..0x7E), or
-              * 0 as the "transparent" sentinel.  Picked by
-              * line_char() for wireframe edges (one of {-, \, |,
-              * /} based on local angle [6]) or a fixed fill char
-              * (':' for tooth interior, '.' for body disc).     */
-
-  attr_t at; /* ncurses attribute mask — controls perceptual
-              * intensity at the same underlying colour.  One of:
-              *   A_BOLD    bright wireframe outline
-              *   A_NORMAL  medium tier (inner arc in gap zone)
-              *   A_DIM     interior fills (tooth body, disc)    */
-
-  int cp; /* ncurses colour-pair index — selects the fg/bg
-           * mapping registered in color_apply_theme().  One of:
-           *   CP_GEAR      theme's bright gear colour
-           *   CP_GEAR_DIM  theme's muted gear colour
-           * Theme [7] swaps the underlying RGB; this index
-           * never changes between themes — only what it
-           * resolves to does.                                 */
+  chtype ch;
+  attr_t at;
+  int cp;
 } CellPaint;
 
 /*
- * classify_gear_cell — the implicit-field test [4].
+ * Given where a cell sits relative to the gear (how far out, and which
+ * way), figure out which part of the gear it's on and what to draw there.
  *
- * Given polar coordinates of one sample point, decide which gear
- * region (if any) it belongs to and return the glyph/attr/color pair
- * to paint there.
- *
- * Tests run in PRIORITY ORDER — FIRST hit wins:
- *
- *   bright wireframe outline (in this exact order):
- *     1. hub ring          band of width 2·THRESH_CIRC around R_HUB
- *     2. spokes            radial spokes, hub → inner
- *     3. tooth sides       radial cuts at the tooth/gap boundaries
- *     4. inner arc (gaps)  R_INNER, only where phase ∈ gap zone
- *     5. outer arc (teeth) R_OUTER, only where phase ∈ tooth zone
- *
- *   dim interior fill (only when no outline matched):
- *     6. tooth interior    ':' between R_INNER and R_OUTER in teeth
- *     7. body disc         '.' between hub ring and inner ring
- *
- * Reordering breaks the gear — fills would paint over outlines, or
- * the tooth-side cuts would land inside the tooth-interior fill.
+ * The checks run in order and the first match wins. Order matters: the
+ * bright outline parts are checked before the dim fills, so the outline
+ * always paints on top instead of being buried under a fill. The order is:
+ *   1. hub ring         the small circle in the middle
+ *   2. spokes           the lines from hub out to the inner ring
+ *   3. tooth sides      the straight edges of each tooth
+ *   4. inner ring       only across the gaps between teeth
+ *   5. outer ring       only across the tips of the teeth
+ *   6. tooth interior   ':' filling the body of each tooth
+ *   7. body disc        '.' filling the flat plate inside the teeth
  */
 static CellPaint classify_gear_cell(float rad, float ang_g, float ang_l) {
   float phase = tooth_phase(ang_l);
@@ -1000,7 +681,7 @@ static CellPaint classify_gear_cell(float rad, float ang_g, float ang_l) {
   float arc_side = arclen_to_tooth_side(phase, rad);
   float arc_spoke = arclen_to_spoke(ang_l, rad);
 
-  /* ── bright wireframe outline ─────────────────────────────────── */
+  /* ── bright outline (checked first, drawn on top) ── */
   if (fabsf(rad - GEAR_R_HUB) < THRESH_CIRC) /* hub ring */
     return (CellPaint){line_char(ang_g + TAU * 0.25f), A_BOLD, CP_GEAR};
 
@@ -1018,7 +699,7 @@ static CellPaint classify_gear_cell(float rad, float ang_g, float ang_l) {
   if (in_tooth && fabsf(rad - GEAR_R_OUTER) < THRESH_CIRC) /* outer arc */
     return (CellPaint){line_char(ang_g + TAU * 0.25f), A_BOLD, CP_GEAR};
 
-  /* ── dim interior fill (only reached when no outline matched) ── */
+  /* ── dim fills (only where no outline matched) ── */
   if (in_tooth && rad > GEAR_R_INNER && rad < GEAR_R_OUTER) /* tooth fill */
     return (CellPaint){':', A_DIM, CP_GEAR};
 
@@ -1030,15 +711,9 @@ static CellPaint classify_gear_cell(float rad, float ang_g, float ang_l) {
 }
 
 /*
- * draw_gear — implicit-field rasteriser [4].
- *
- * Pseudocode:
- *   bbox = clipped_gear_bbox(g, viewport)
- *   for each cell in bbox:
- *     (rad, ang_g, ang_l) = cell_to_gear_polar(cell, g)
- *     if rad outside the gear's outermost band: skip
- *     paint = classify_gear_cell(rad, ang_g, ang_l)
- *     if paint not transparent: paint_cell(paint)
+ * Draw the whole gear by walking the cells around it and asking each one
+ * which part of the gear it belongs to, then painting the answer. Cells
+ * too far out to be any part of the gear are skipped.
  */
 static void draw_gear(WINDOW *win, const Gear *g, int cols, int rows) {
   int r_lo, r_hi, c_lo, c_hi;
@@ -1060,12 +735,10 @@ static void draw_gear(WINDOW *win, const Gear *g, int cols, int rows) {
 }
 
 /*
- * direction_glyph — line glyph picked from the velocity's angle.
- *   ~horizontal   → '-'
- *   ~vertical     → '|'
- *   diagonal NE/SW→ '/'
- *   diagonal NW/SE→ '\'
- * Eight 45°-sectors covering the full circle.
+ * Pick the line character that points the way a spark is moving, so a
+ * spark heading sideways looks like '-', one falling looks like '|', and
+ * so on. Same idea as line_char, just driven by velocity instead of an
+ * angle.
  */
 static chtype direction_glyph(float vx, float vy) {
   float a = atan2f(vy, vx);
@@ -1089,18 +762,10 @@ static chtype direction_glyph(float vx, float vy) {
 }
 
 /*
- * draw_spark_streak — fresh spark rendered as a directional streak.
- *
- * One bright "head" at the spark's current position painted with a
- * line-shaped glyph picked from the velocity angle, followed by
- * `n_tail` dim cells stepping BACKWARD along velocity.  Tail step is
- * 1 cell wide / 1 cell tall (anisotropic — terminal cells are
- * CELL_W × CELL_H px), so each tail cell sits roughly one cell behind
- * its predecessor regardless of direction.
- *
- * The cascading head→tail brightness reads as a comet (bright leading
- * tip, fading trail) — much more "spray of streaks" than scattered
- * dots.
+ * Draw a fresh spark as a little streak, like a comet: a bright head where
+ * the spark is, plus a few dim cells trailing behind it along the way it
+ * came from. The fading tail reads as motion, so the screen looks like a
+ * spray of streaks rather than a scatter of dots.
  */
 static void draw_spark_streak(WINDOW *win, const Spark *s, int st, int cp,
                               attr_t head_attr, int n_tail, int cols,
@@ -1109,7 +774,8 @@ static void draw_spark_streak(WINDOW *win, const Spark *s, int st, int cp,
   paint_cell(win, px_row(s->py), px_col(s->px), glyph, cp, head_attr, cols,
              rows);
 
-  /* Tail — only meaningful if the spark is actually moving. */
+  /* A streak only makes sense if the spark is moving — a still spark has
+   * no direction to trail behind it. */
   float speed = sqrtf(s->vx * s->vx + s->vy * s->vy);
   if (speed < 1.0f)
     return;
@@ -1123,7 +789,8 @@ static void draw_spark_streak(WINDOW *win, const Spark *s, int st, int cp,
   (void)st; /* kept for future per-stage tail tuning */
 }
 
-/* draw_spark_dot — cooled spark rendered as the theme's dot glyph. */
+/* Draw a cooled-down spark as a single dot — the theme says which
+ * character and colour to use for how faded it is. */
 static void draw_spark_dot(WINDOW *win, const Spark *s, const Theme *th, int st,
                            int cols, int rows) {
   chtype ch = (chtype)(unsigned char)th->spark_ch[st];
@@ -1133,14 +800,9 @@ static void draw_spark_dot(WINDOW *win, const Spark *s, const Theme *th, int st,
 }
 
 /*
- * Draw sparks.  Fresh sparks (stages 0..2) render as directional
- * streaks with fading tails; cooler sparks (stages 3..6) fall back
- * to the theme's per-stage dot glyph so they fade into the background.
- *
- *   stage 0  head + 2 dim tails    (comet — longest streak)
- *   stage 1  head + 1 dim tail
- *   stage 2  head only (still directional)
- *   stage 3+ theme dot glyph (current behaviour)
+ * Draw all the live sparks. The freshest ones get drawn as streaks with a
+ * trailing tail; as a spark cools it loses its tail and finally becomes a
+ * plain fading dot, so it quietly settles into the background.
  */
 static void draw_sparks(WINDOW *win, const Gear *g, int cols, int rows,
                         int theme_idx) {
@@ -1164,67 +826,53 @@ static void draw_sparks(WINDOW *win, const Gear *g, int cols, int rows,
   }
 }
 
-/* ===================================================================== */
-/* §8  screen / scene                                                     */
-/* ===================================================================== */
+/* ── §8 screen / scene ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Scene — top-level state spanning physics ticks, draw calls, and the
- * main loop.  Wraps the gear simulation together with the per-frame
- * control knobs the user can toggle.
+/*
+ * Scene — everything the simulation and the drawing need, in one place.
  *
- * The struct splits into two clearly-labelled groups:
+ * The fields fall into two groups, and the split is there to keep the
+ * reader honest about which knobs change the picture and which change the
+ * physics:
  *
- *   Simulation parameters  — consumed by scene_tick / gear_tick.
- *     Anything that affects the PHYSICS lives here.  Mutated by
- *     physics-affecting keys: r (reset), space (pause), +/- and
- *     1..5 (rot_speed), ] / [ (spark_density), and SIGWINCH (which
- *     rewrites max_px / max_py from the new terminal size).
+ *   Simulation — anything that affects how the gear and sparks behave.
+ *   Changed by the keys that touch the motion: reset, pause, speed,
+ *   density, and resize.
  *
- *   Rendering parameters   — consumed by draw_sparks / draw_gear and
- *     by color_apply_theme.  Toggling these while paused must leave
- *     gear angle and every spark byte-identical; only colours/glyphs
- *     change.  Mutated by purely cosmetic keys: t / T (theme).
+ *   Rendering — purely how it looks. Changing these while paused leaves
+ *   every spark exactly where it was; only the colours and characters
+ *   change. Changed by the theme keys.
  *
- * Locality rationale (the contract that matters, not the byte layout):
- *   The split is for the READER, not the CPU.  max_px / max_py LOOK
- *   like screen geometry but they live with the simulation because
- *   gear_tick KILLS sparks that drift out of [0, max_px] × [0, max_py]
- *   — changing them silently changes which particles survive.  A new
- *   knob landing in the rendering group when it actually steers
- *   gear_tick would couple display to physics — exactly the bug this
- *   separation is here to prevent.  When adding a field, ask: does
- *   this change what gear_tick produces?  If yes → simulation; if
- *   purely visual → rendering.
+ * Watch out: max_px / max_py LOOK like screen size, but they belong with
+ * the simulation, because gear_tick kills any spark that drifts past them.
+ * Change them and you silently change which sparks survive. So when you
+ * add a field, ask: does it change how the gear behaves? If yes it's a
+ * simulation field; if it's only about looks it's a rendering field.
  *
- * What stays OUTSIDE this struct (intentionally):
- *   App.running / App.need_resize     volatile sig_atomic_t flags
- *                                     written from signal handlers;
- *                                     must stay on the file-scope
- *                                     App for async-signal safety.
- *   App.screen (cols, rows)           terminal geometry tracked by
- *                                     the main loop; Scene stays
- *                                     window-agnostic so resize is
- *                                     the main loop's concern.
+ *   gear            the gear and its whole pool of sparks (see §6)
+ *   paused          when true, scene_tick does nothing and everything
+ *                   freezes in place
+ *   max_px, max_py  the size of the play area in pixels; sparks that
+ *                   leave it die, so this is simulation state, not just
+ *                   screen geometry
+ *   theme           which look from THEMES[] (§3) is active; the theme
+ *                   keys cycle it, and it never changes the physics
  *
- * Single instance: lives inside file-scope `g_app` (§9).  Gear.sparks[]
- * alone is ~30 KB (1500 × 20 B), so the App / Scene sits in BSS rather
- * than being passed by value anywhere.
- * ─────────────────────────────────────────────────────────────────────── */
+ * The quit/resize flags and the terminal size live on App (§9) instead of
+ * here: the flags are written from signal handlers and must stay there to
+ * be safe, and keeping the window size out of Scene lets the simulation
+ * stay unaware of the terminal. There's only ever one Scene, tucked inside
+ * the single App, and it's big (the spark pool alone is tens of KB) so
+ * it's never copied around by value.
+ */
 typedef struct {
-  /* ── Simulation parameters (read & written by gear_tick) ──────── */
-  Gear gear;            /* physics state — see Gear docstring §6   */
-  bool paused;          /* space toggles; scene_tick is a no-op
-                         * when true — sparks freeze in place      */
-  float max_px, max_py; /* simulation arena bounds in pixels; also
-                         * the framebuffer extent.  Sparks outside
-                         * this rect die in gear_tick — so this is
-                         * simulation state, not rendering state.  */
+  /* ── simulation (read & written by gear_tick) ── */
+  Gear gear;
+  bool paused;
+  float max_px, max_py;
 
-  /* ── Rendering parameters (no physics side-effects) ───────────── */
-  int theme; /* index into THEMES[] in §3; t / T cycles.
-              * Purely cosmetic — physics is identical
-              * across all 10 themes                    */
+  /* ── rendering (no effect on the physics) ── */
+  int theme;
 } Scene;
 
 static void scene_init(Scene *s, int cols, int rows) {
@@ -1241,7 +889,7 @@ static void scene_tick(Scene *s, float dt) {
   gear_tick(&s->gear, dt, s->max_px, s->max_py);
 }
 
-/* Census of active sparks — used in the HUD readout. */
+/* Count how many sparks are currently alive, for the HUD readout. */
 static int count_live_sparks(const Gear *g) {
   int n = 0;
   for (int i = 0; i < MAX_SPARKS; i++)
@@ -1250,16 +898,16 @@ static int count_live_sparks(const Gear *g) {
   return n;
 }
 
-/* Layered composite: bottom layer first (sparks), gear painted on top
- * so its bright wireframe is never obscured by spray. */
+/* Draw the sparks first, then the gear on top, so the bright gear is
+ * never hidden behind its own spray. */
 static void compose_scene_layers(WINDOW *win, const Scene *s, int cols,
                                  int rows) {
   draw_sparks(win, &s->gear, cols, rows, s->theme);
   draw_gear(win, &s->gear, cols, rows);
 }
 
-/* Top-row HUD: live simulation metrics (fps, ω, density, spark count,
- * theme).  Per the project HUD standard — PAIR_HUD + A_BOLD. */
+/* Top row of the readout: the live numbers — fps, spin speed, density,
+ * how many sparks are alive, and the theme. */
 static void hud_draw_top(WINDOW *win, const Scene *s, double fps, int live) {
   wattron(win, COLOR_PAIR(CP_HUD) | A_BOLD);
   mvwprintw(win, 0, 0,
@@ -1270,7 +918,7 @@ static void hud_draw_top(WINDOW *win, const Scene *s, double fps, int live) {
   wattroff(win, COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/* Bottom-row HUD: static key legend (lists every interactive key). */
+/* Bottom row of the readout: the list of keys you can press. */
 static void hud_draw_bottom(WINDOW *win, int rows) {
   wattron(win, COLOR_PAIR(CP_HUD) | A_BOLD);
   mvwprintw(win, rows - 1, 0,
@@ -1279,14 +927,7 @@ static void hud_draw_bottom(WINDOW *win, int rows) {
   wattroff(win, COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/*
- * scene_draw — one full frame.
- *
- * Pseudocode:
- *   compose_scene_layers   // sparks (bottom) + gear (top)
- *   hud_draw_top           // live metrics
- *   hud_draw_bottom        // key legend
- */
+/* Draw one whole frame: the scene, then the two readout rows. */
 static void scene_draw(const Scene *s, WINDOW *win, int cols, int rows,
                        double fps) {
   compose_scene_layers(win, s, cols, rows);
@@ -1327,10 +968,19 @@ static void screen_render(Screen *sc, const Scene *s, double fps) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §9  app                                                                */
-/* ===================================================================== */
+/* ── §9 app ── */
 
+/*
+ * App — the one top-level bundle the whole program runs on.
+ *
+ *   scene        the gear, sparks, and view settings (§8)
+ *   screen       the current terminal size (§8)
+ *   running      set to 0 to ask the main loop to stop; written from the
+ *                quit/interrupt signal handler, so it's marked volatile
+ *                sig_atomic_t to be safe to touch from a signal
+ *   need_resize  set to 1 by the window-resize signal so the loop knows
+ *                to re-measure the terminal; volatile for the same reason
+ */
 typedef struct {
   Scene scene;
   Screen screen;

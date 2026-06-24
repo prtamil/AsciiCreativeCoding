@@ -1,162 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * magnetic_field.c — 2D Magnetic Field Lines from Configurable Dipoles
+ * magnetic_field.c — magnetic field lines from a handful of bar magnets.
  *
- * Visualises the static magnetic field of 1–4 bar magnets (dipoles)
- * placed on screen [1, 4].  Each dipole is modelled as a pair of equal-
- * and-opposite magnetic charges (monopoles) separated by a fixed length
- * — a two-pole approximation valid for r >> dipole length [2, 3].  The
- * field at every point is the vector superposition of Coulomb-like
- * fields from all monopoles:
+ * Each magnet is treated as two opposite "magnetic charges" at its ends.
+ * We add up the pull of every charge to get the field at any point, then
+ * trace the curving lines that follow it — the iron-filing pattern you'd
+ * see around real magnets. Four presets show classic arrangements.
  *
- *   B(r) = sum_i  q_i * (r − r_i) / |r − r_i|³
- *
- * Field lines (the curves everywhere tangent to B, in Faraday's original
- * sense [4]) are traced by 4th-order Runge-Kutta streamline integration
- * [5] along B, seeded at N_SEEDS points around each positive pole.
- * Arrows on each line segment show the field direction; the 3-tier
- * brightness ramp [8] encodes distance from the source pole.
- *
- * Presets:
- *   0  Dipole      — single bar magnet, classic closed-loop lines
- *   1  Quadrupole  — two magnets head-to-head, X-type neutral point
- *   2  Attract     — two magnets N→S facing each other
- *   3  Repel       — two magnets N→N facing each other
- *
- * Keys:
- *   q / ESC    quit
- *   r          restart / rebuild current preset
- *   n / N      next / previous preset
- *   t / T      next / previous theme
- *   ] / [      trace speed up / down  (lines per tick)
- *   p / space  pause / resume
- *
- * ═════════════════════════════════════════════════════════════════════
- *  REFERENCES  (cite inline as [n])
- * ═════════════════════════════════════════════════════════════════════
- *
- *  ── Magnetism & dipole-field theory ────────────────────────────────
- *
- *   [1] Griffiths, D. J. (2017) — *Introduction to Electrodynamics*,
- *       4th ed., Cambridge University Press.  Ch.5-6 cover magnetic
- *       dipoles and the inverse-cube far-field decay used in the
- *       monopole-pair approximation of §4.  Best gentle starting
- *       point for the physics.
- *
- *   [2] Jackson, J. D. (1998) — *Classical Electrodynamics*, 3rd ed.,
- *       Wiley.  Ch.5 covers magnetostatics and the multipole
- *       expansion; gives the conditions under which the "two-
- *       monopole bar magnet" approximation is valid (r ≫ ℓ_dipole)
- *       and how it breaks down at close range.  Graduate-level
- *       reference; the deeper read after [1].
- *
- *   [3] Purcell, E. M.; Morin, D. J. (2013) — *Electricity and
- *       Magnetism*, 3rd ed., Cambridge.  Famous for its geometric
- *       intuition.  Ch.6 gives the clearest derivation of why field
- *       lines look the way they do — including the loop-closure
- *       property you see in preset 0 (single dipole) and the
- *       X-shaped null point in preset 1 (quadrupole).
- *
- *   [4] Faraday, M. (1855) — *Experimental Researches in Electricity*,
- *       Vol. III, Taylor & Francis.  Series XXVIII (paragraph
- *       3243+).  THE ORIGINAL concept of magnetic FIELD LINES as a
- *       way to visualise the invisible field — the direct ancestor
- *       of the streamlines this demo traces.  Historical primary
- *       source.
- *
- *  ── Numerical streamline integration ───────────────────────────────
- *
- *   [5] Press, W. H.; Teukolsky, S. A.; Vetterling, W. T.; Flannery,
- *       B. P. (2007) — *Numerical Recipes*, 3rd ed., Cambridge.
- *       Ch.17 covers classical RK4 with local-error analysis and
- *       step-size control.  Backs the RK4_H = 0.35 step-size choice
- *       (cell-resolution integration error well below the visible
- *       pixel grid).
- *
- *  ── Vector-field visualisation ─────────────────────────────────────
- *
- *   [6] Helman, J. L.; Hesselink, L. (1991) — "Visualizing Vector
- *       Field Topology in Fluid Flows", *IEEE Computer Graphics &
- *       Applications* 11 (3), 36-46.  Foundational paper on
- *       streamline-based vector-field visualisation.  Catalogues the
- *       "critical points" of a vector field (saddles, foci, nodes)
- *       where streamline integration fails — exactly the null points
- *       this code stops at via the B_MIN cutoff.
- *
- *   [7] Cabral, B.; Leedom, L. C. (1993) — "Imaging vector fields
- *       using line integral convolution", *Proceedings of SIGGRAPH
- *       '93*, 263-270.  Classic alternative to streamline tracing
- *       (the LIC technique fills space with noise-convolved
- *       direction texture).  Cited for context — this demo's
- *       streamline+arrow approach trades smooth coverage for
- *       directional clarity, well-suited to terminal output.
- *
- *  ── Perception & rendering ─────────────────────────────────────────
- *
- *   [8] Ware, C. (2020) — *Information Visualization: Perception
- *       for Design*, 4th ed., Morgan Kaufmann.  Ch.4 on perceptual
- *       contrast and SEQUENTIAL colour mapping backs the three-tier
- *       brightness ramp (CP_LINE_DIM / MID / BRT) encoding distance
- *       from the source pole — the textbook "monotone-luminance"
- *       sequential map.
- *
- * ═════════════════════════════════════════════════════════════════════
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/magnetic_field.c \
- *       -o magnetic_field -lncurses -lm
+ * The physics (two-charge magnet model, fields just add) is in Griffiths,
+ * Introduction to Electrodynamics, ch.5-6, and Purcell, Electricity and
+ * Magnetism, ch.6. The line-following math (RK4 streamline tracing) is in
+ * Numerical Recipes ch.17. The "where the field is zero" spots the lines
+ * stop at are the critical points of Helman & Hesselink (1991).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Classical four-stage Runge-Kutta (RK4) streamline
- *                  integration of a 2-D vector field [5, 6].  A field
- *                  line is a curve everywhere tangent to B(r) — the
- *                  original Faraday concept [4].  Starting at seed
- *                  points near the positive poles, RK4 integrates the
- *                  unit-arc-length ODE:
- *                      dx/ds = B(x) / |B(x)|
- *                  Step size RK4_H = 0.35 cells balances visual
- *                  resolution against the cost of up to 600 RK4 steps
- *                  per line (~10 µs / line on commodity CPU).
- *
- * Physics        : Magnetic dipole field via the monopole approximation
- *                  [1, 2].  A bar magnet is modelled as two equal-and-
- *                  opposite "magnetic charges" at its ends; each
- *                  contributes B ∝ q·r̂/r² (Coulomb-like).  The total
- *                  field at any point is the linear superposition
- *                  (Maxwell's equations are linear in B → fields just
- *                  add).  Valid for r >> dipole length [3]; near each
- *                  pole the SOFT regulator caps the inverse-cube
- *                  divergence at a finite value.
- *
- * Math           : NULL POINTS — locations where B = 0 — appear naturally
- *                  between opposing poles (preset 1 quadrupole, preset
- *                  3 repel).  At a null, dx/ds = 0/0 is undefined and
- *                  streamline integration becomes numerically unstable;
- *                  we cut traces at |B| < B_MIN.  Helman & Hesselink [6]
- *                  catalogue these "critical points" as the fundamental
- *                  structural features of a vector field's topology.
- *
- * Rendering      : Three-tier theme-coloured BRIGHTNESS RAMP [8] —
- *                  CP_LINE_BRT for cells close to the source pole (a
- *                  fresh-line look), CP_LINE_MID for mid-distance, and
- *                  CP_LINE_DIM for the tail of the line approaching a
- *                  null point or the other pole.  Per-segment arrow
- *                  glyphs `> v < ^` every ARR_STRIDE step show flow
- *                  direction.  N/S pole markers use the theme's accent
- *                  colours.  Canonical CLAUDE.md two-row HUD: bright
- *                  yellow status (row 0) + bright cyan key legend (row
- *                  rows-1), both A_BOLD across every theme.
- *
- * Performance    : Lines traced progressively — LINES_PER_TICK fully-
- *                  traced lines are REVEALED per render frame.  This
- *                  keeps the UI responsive during tracing: each tick
- *                  draws a few more lines rather than blocking for
- *                  seconds at startup.  Internally trace_line is still
- *                  O(MAX_LINE_STEPS) per line; the throttle is purely
- *                  for visual pacing.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -173,9 +29,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
   SIM_FPS_DEFAULT = 30,
@@ -183,16 +37,16 @@ enum {
   SIM_FPS_MAX = 60,
   SIM_FPS_STEP = 5,
 
-  MAX_MONOPOLES = 8,    /* max magnetic charges (2 per dipole)        */
-  MAX_DIPOLES = 4,      /* max bar magnets                            */
-  N_SEEDS = 16,         /* field lines seeded around each + pole      */
-  MAX_LINE_STEPS = 600, /* max RK4 steps per field line               */
-  MAX_LINES = MAX_DIPOLES * N_SEEDS, /* total lines to trace     */
+  MAX_MONOPOLES = 8,    /* most charges we hold (2 per magnet)       */
+  MAX_DIPOLES = 4,      /* most bar magnets on screen at once        */
+  N_SEEDS = 16,         /* how many lines start around each N pole   */
+  MAX_LINE_STEPS = 600, /* hard cap on how long one line can get     */
+  MAX_LINES = MAX_DIPOLES * N_SEEDS, /* every line we might trace    */
 
   N_PRESETS = 4,
   N_THEMES = 5,
 
-  LINES_PER_TICK_DEF = 2, /* field lines traced per tick                */
+  LINES_PER_TICK_DEF = 2, /* lines revealed each tick by default     */
   LINES_PER_TICK_MIN = 1,
   LINES_PER_TICK_MAX = 8,
 
@@ -203,22 +57,20 @@ enum {
 #define NS_PER_SEC 1000000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* RK4 step size in normalised cell units */
+/* How far each line step moves, measured in cells. */
 #define RK4_H 0.35f
-/* Stop tracing if |B| < this (near null points) */
+/* Stop a line once the field gets this weak (we're near a dead spot). */
 #define B_MIN 1e-6f
-/* Monopole softening radius in cell units */
+/* Smooths the field right next to a pole so it doesn't blow up to infinity. */
 #define SOFT 0.8f
-/* Seed circle radius around a pole, in cell units */
+/* Radius of the ring of starting points placed around each N pole, in cells. */
 #define SEED_R 1.2f
-/* Arrow placed every ARR_STRIDE steps along a line */
+/* Drop a direction arrow every this-many steps along a line. */
 #define ARR_STRIDE 18
-/* Aspect ratio correction: terminal cells are ~2x taller than wide */
+/* Terminal cells are about twice as tall as they are wide; this corrects for that. */
 #define ASPECT_R 2.0f
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -236,24 +88,13 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color / theme                                                      */
-/* ===================================================================== */
+/* ── §3 color / theme ── */
 
 /*
- * Color pair assignments:
- *   1   field lines (positive/dim) — theme-dependent
- *   2   field lines (stronger)     — theme-dependent
- *   3   field lines (brightest)    — theme-dependent
- *   4   North pole symbol (N)      — theme-dependent
- *   5   South pole symbol (S)      — theme-dependent
- *   6   dipole body                — theme-dependent
- *   7   HUD status (top row)       — canonical bright yellow 226
- *   8   HINT action keys (bot row) — canonical bright cyan  51
- *
- * CP_HUD and CP_HINT are CANONICAL (CLAUDE.md HUD Standard) — they
- * stay yellow/cyan across every theme so the two reserved HUD rows
- * remain legible against any field-line palette.
+ * Names for the colour slots we paint with. The first six change with the
+ * chosen theme; the last two (the on-screen text) always stay bright
+ * yellow and cyan so they stay readable no matter what the field looks
+ * like behind them.
  */
 enum {
   CP_LINE_DIM = 1,
@@ -266,70 +107,43 @@ enum {
   CP_HINT = 8,
 };
 
-/* HUD inset rows reserved at the top + bottom of the terminal.  Field
- * lines render in the band [HUD_TOP_ROWS, term_rows - HUD_BOT_ROWS). */
+/* We keep one text row at the top and one at the bottom for the on-screen
+ * readout; the field draws in the band between them. */
 #define HUD_TOP_ROWS 1
 #define HUD_BOT_ROWS 1
 
 /*
- * Theme — one named visual identity (256-colour primary + 8-colour fallback).
+ * Theme — one complete colour scheme for the whole picture.
  *
- * WHY a struct, not loose const arrays:
- *   The three field-line ramp colours (dim → mid → bright) must form
- *   a PERCEPTUALLY MONOTONE LUMINANCE sequence so the brightness ramp
- *   reads as "distance from the source pole" (Ware [ref 8], Ch.4
- *   sequential colour maps).  The pole/body markers must contrast
- *   against the ramp.  Bundling these correlated colours together
- *   forbids accidentally mixing ramp tier 0 of theme A with ramp
- *   tier 1 of theme B during edits.
+ * Each theme carries two full sets of colours: a rich one for modern
+ * terminals (256 colours) and a plain one for old or bare-bones terminals
+ * (only 8 colours). At startup we pick whichever set the terminal can
+ * actually show, so the same program looks right everywhere.
  *
- * WHY a dual palette (256 + 8):
- *   Modern terminals expose 256 indexed colours; legacy TTYs and
- *   minimal $TERM values ("linux", "dumb") expose only 8.
- *   theme_apply() inspects ncurses COLORS at runtime and binds the
- *   matching pair set — no #ifdef ladder, the same binary works in
- *   both environments.  Both sets describe the SAME theme intent;
- *   the 8-colour set is just a coarser approximation.
+ * The three line colours go from dim to bright on purpose: a line is
+ * brightest where it leaves a pole and fades as it travels, so brightness
+ * reads as "how far along this line am I". Keeping all of a theme's colours
+ * together means you can't accidentally mix one theme's bright with
+ * another's dim while editing. (The dim/mid/bright fade idea follows Ware,
+ * Information Visualization, ch.4 on sequential colour.)
  *
- * WHY CP_HUD / CP_HINT are deliberately NOT here:
- *   The CLAUDE.md HUD Standard fixes them at bright yellow (226) +
- *   bright cyan (51) GLOBALLY so they remain legible against any
- *   field-line palette.  Putting them in a per-theme struct would
- *   invite drift toward dim/coloured HUDs that disappear on busy
- *   backgrounds.  color_init() binds them once; theme_apply() never
- *   touches them.
- *
- * Brightness floor:  Every entry must sit in the bright half of the
- * 256-colour space (CLAUDE.md Theme Palette Brightness — colours
- * 16-23 / 232-239 become invisible against default-black + A_DIM).
+ * The two text colours (yellow status, cyan keys) are NOT here on purpose:
+ * they stay fixed across every theme so the readout never vanishes against
+ * a busy background.
  */
 typedef struct {
-  /* ── 256-colour palette (preferred when COLORS >= 256) ────────── *
-   * Indices into the xterm-256 cube.  Listed in the order they
-   * appear visually on a traced line — dim at the far/null end,
-   * brightest at the source-pole end. */
-  short line_dim; /* CP_LINE_DIM — tail of line near a null point or
-                   *               the opposite pole; LOWEST luminance
-                   *               tier of the ramp [ref 8]            */
-  short line_mid; /* CP_LINE_MID — middle third of the line;
-                   *               medium luminance tier               */
-  short line_brt; /* CP_LINE_BRT — first third near the source pole,
-                   *               the "freshest" look; BRIGHTEST tier */
-  short north;    /* CP_NORTH    — 'N' pole marker, bold accent —
-                   *               must POP against the ramp           */
-  short south;    /* CP_SOUTH    — 'S' pole marker, contrasting accent
-                   *               (typically the colour-wheel opposite
-                   *               of `north` for visual polarity)     */
-  short body;     /* CP_BODY     — '=' body line drawn between N and S
-                   *               poles of the same magnet; subdued
-                   *               so it doesn't compete with the ramp */
+  /* Colours for a 256-colour terminal, listed the way you'd see them
+   * along a line: dim at the fading tail, bright at the pole it left. */
+  short line_dim; /* faded tail of the line, near a dead spot or the far pole */
+  short line_mid; /* middle stretch of the line                               */
+  short line_brt; /* freshest part, right where the line leaves its pole       */
+  short north;    /* the 'N' marker — a bold accent that should pop            */
+  short south;    /* the 'S' marker — a contrasting accent, opposite of north  */
+  short body;     /* the '=' bar drawn between a magnet's two poles; kept quiet */
 
-  /* ── 8-colour ANSI fallback (used when COLORS < 256) ──────────── *
-   * Same semantic roles as above, expressed in the 8-colour ANSI
-   * basis (COLOR_RED, COLOR_BLUE, …).  Granularity is coarser, so
-   * the ramp here uses one accent colour repeated rather than three
-   * luminance tiers — readability is preserved by relying on
-   * line-density gradients instead of colour-tier separation. */
+  /* The same six roles again, for an 8-colour terminal. With only 8
+   * colours there isn't room for a dim/mid/bright fade, so the three line
+   * slots reuse one accent and we lean on line density to show depth. */
   short line_dim8, line_mid8, line_brt8;
   short north8, south8, body8;
 } Theme;
@@ -352,7 +166,8 @@ static const Theme k_themes[N_THEMES] = {
      COLOR_RED, COLOR_BLUE, COLOR_WHITE},
 };
 
-/* Theme-dependent pairs only — CP_HUD / CP_HINT live in color_init(). */
+/* Bind the six theme colours for the chosen theme (the two text colours
+ * are set once in color_init and never touched here). */
 static void theme_apply(int t) {
   const Theme *th = &k_themes[t];
   if (COLORS >= 256) {
@@ -372,15 +187,15 @@ static void theme_apply(int t) {
   }
 }
 
-/* One-shot at startup — binds the two CANONICAL HUD pairs (bright
- * yellow status, bright cyan hint) then applies the initial theme. */
+/* Set up colours once at startup: lock in the fixed yellow/cyan text
+ * colours, then load the starting theme. */
 static void color_init(void) {
   start_color();
   use_default_colors();
 
   if (COLORS >= 256) {
-    init_pair(CP_HUD, 226, -1); /* canonical bright yellow */
-    init_pair(CP_HINT, 51, -1); /* canonical bright cyan   */
+    init_pair(CP_HUD, 226, -1); /* bright yellow */
+    init_pair(CP_HINT, 51, -1); /* bright cyan   */
   } else {
     init_pair(CP_HUD, COLOR_YELLOW, -1);
     init_pair(CP_HINT, COLOR_CYAN, -1);
@@ -389,102 +204,67 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  magnetic physics                                                   */
-/* ===================================================================== */
+/* ── §4 magnetic physics ── */
 
 /*
- * Monopole — a single magnetic point charge.
+ * Monopole — a single magnetic "charge", one end of a bar magnet.
  *
- * ALGORITHM context (Griffiths Ch.5 [ref 1], Jackson §5 [ref 2]):
- *   The demo models each bar magnet as a MONOPOLE PAIR — two
- *   equal-and-opposite point charges separated by a fixed length.
- *   Each pole contributes a Coulomb-like 2-D field at any sample
- *   point r:
+ * We pretend each bar magnet is two opposite charges sitting at its ends: a
+ * north (lines flow out of it) and a south (lines flow into it). Each charge
+ * tugs on the field everywhere, and the real field is just all those tugs
+ * added together. That adding-up is field_at(), the busiest part of the
+ * program.
  *
- *       B_i(r) = q_i * (r − r_i) / |r − r_i|^3
+ * Why two separate charges instead of one neat magnet formula? Because a flat
+ * list of charges makes the adding-up trivial — one loop handles any number
+ * of magnets at any angle — and the neat formula actually misbehaves up close
+ * between two poles, which is exactly where this demo gets interesting (the
+ * dead spots and X-crossings). Purcell's textbook uses the same trick.
  *
- *   The total field at r is the LINEAR SUPERPOSITION of every
- *   monopole's contribution (Maxwell's equations are linear in B,
- *   so fields add).  This is the workhorse formula evaluated inside
- *   field_at() — the hot loop of the whole simulation.
- *
- * WHY split a dipole into two monopoles (vs. an analytic dipole formula):
- *   Treating poles INDIVIDUALLY makes superposition trivial — one
- *   uniform loop in field_at() handles N dipoles regardless of
- *   their orientation.  The analytic point-dipole formula (with a
- *   moment vector m) is mathematically tighter but breaks down in
- *   the near field where r ~ ℓ_dipole — exactly where the most
- *   interesting structure of this demo lives (null points between
- *   poles, X-saddles in the quadrupole preset).  Purcell [ref 3]
- *   uses the same pole-pair picture for the same pedagogical reason.
- *
- * Physical caveat:
- *   Isolated magnetic monopoles have never been observed.  But at
- *   scales r >> ℓ_dipole the field of a real bar magnet is
- *   INDISTINGUISHABLE from a pair of opposite charges at its ends
- *   — that's the modelling trick this struct encodes.
+ * (Lone magnetic charges have never actually been found, but from far enough
+ * away a real magnet looks just like this two-charge stand-in.)
  */
 typedef struct {
-  float cx, cy; /* centre in CELL coords (not pixels) — physics and
-                 * rendering share the same grid, so no coordinate
-                 * conversion is needed between field_at() and
-                 * scene_draw().  Floats because the integrator
-                 * advances in sub-cell RK4 steps (RK4_H = 0.35). */
-  float q;      /* magnetic "charge":
-                 *   +1.0f = NORTH  (field SOURCE — lines emerge),
-                 *   -1.0f = SOUTH  (field SINK   — lines converge).
-                 * Magnitude is in ARBITRARY UNITS — only the
-                 * ratio between poles affects line shape.  |B|'s
-                 * absolute scale is normalised away by the
-                 * unit-arc-length ODE in trace_line(), which
-                 * divides by |B| at every step. */
+  float cx, cy; /* where this charge sits, in grid cells. The math and the
+                 * drawing share one grid, so no conversion is ever needed.
+                 * Floats, because lines step in fractions of a cell. */
+  float q;      /* the charge: +1 for north (lines flow out), -1 for south
+                 * (lines flow in). Only the sign and the balance between poles
+                 * matter for the line shapes — the actual size cancels out
+                 * when we trace, so we just use +1 / -1. */
 } Monopole;
 
 /*
- * Dipole — a bar magnet, kept as a RENDER-ONLY twin of two Monopoles.
+ * Dipole — a whole bar magnet, used only for drawing.
  *
- * DUAL representation (this is the key design idea):
- *   Each magnet exists TWICE inside Scene —
- *     • PHYSICALLY as two entries in Scene.mp[]   (used by field_at)
- *     • VISUALLY  as one  entry  in Scene.dp[]   (used by scene_draw)
- *
- * WHY the duplication is intentional (not a code smell):
- *   The physics layer wants a FLAT list of point charges to loop
- *   over — adding a "magnet body" concept there would slow the inner
- *   loop with no physical effect (the body itself has no charge).
- *   The render layer wants the OPPOSITE — knowing which N and which
- *   S belong to the same magnet so it can draw the '=' body line and
- *   the matching N/S markers as a single coherent shape.
- *   scene_add_dipole() writes both views atomically so they can't
- *   desync; nothing else touches mp[] / dp[] after that.
- *
- * Memory locality note:
- *   mp[] and dp[] live back-to-back inside Scene (see Scene's locality
- *   regions A and B).  scene_draw() iterates dp[] sequentially in
- *   cache-friendly order; field_at() iterates mp[] the same way.
- *   Neither pass ever touches the other's array.
+ * Each magnet is stored two ways. The math sees it as its two charges in the
+ * charge list; the drawing sees it as one magnet here. That looks like
+ * duplication, but it's on purpose: the math just wants a plain list of
+ * charges to add up (a "magnet body" means nothing to it — the body has no
+ * charge), while the drawing needs to know which north and which south belong
+ * together so it can draw the bar and the two letters as one shape. Both
+ * copies are written together when the magnet is added, so they can't fall
+ * out of step.
  */
 typedef struct {
-  float nx, ny; /* NORTH pole position (cell coords) — matches the
-                 * q=+1 monopole that scene_add_dipole() spawned for
-                 * this magnet.  Duplicates information in mp[] but
-                 * spares scene_draw() a search through mp[]. */
-  float sx, sy; /* SOUTH pole position (cell coords) — matches the
-                 * q=−1 monopole partner of (nx, ny). */
-  int color;    /* colour-pair index for the body glyph (the '='
-                 * line between N and S).  Currently always CP_BODY;
-                 * field is reserved for per-magnet tinting if a
-                 * future preset wants colour-coded magnets (e.g.
-                 * red for the "active" one).  Kept as a struct
-                 * field rather than a global so the choice is
-                 * per-dipole rather than per-frame. */
+  float nx, ny; /* north pole position, in cells. Same spot as this magnet's
+                 * +1 charge — kept here so the drawing doesn't have to go
+                 * hunting for it in the charge list. */
+  float sx, sy; /* south pole position, in cells (the -1 charge). */
+  int color;    /* colour of the '=' bar. Always CP_BODY today; kept as a
+                 * field so a future preset could tint magnets individually
+                 * (say, red for the active one). */
 } Dipole;
 
 /*
- * Compute B field at (px, py) from all monopoles.
- * B += q_i * (r - r_i) / |r - r_i|^3
- * Softening avoids divergence at the pole center.
+ * The field at one point: add up the pull of every charge.
+ *
+ * Each charge tugs the field toward or away from itself, harder when it's
+ * close. We sum those tugs to get the combined arrow (bx, by) at (px, py).
+ * The SOFT fudge in r2 keeps things sane right on top of a charge, where
+ * the raw formula would otherwise blow up to infinity. The y stretch by
+ * ASPECT_R is because terminal cells are taller than wide, so a "round"
+ * field needs the vertical distance scaled to match.
  */
 static void field_at(const Monopole *mp, int nm, float px, float py, float *bx,
                      float *by) {
@@ -492,7 +272,7 @@ static void field_at(const Monopole *mp, int nm, float px, float py, float *bx,
   *by = 0.0f;
   for (int i = 0; i < nm; i++) {
     float dx = px - mp[i].cx;
-    float dy = (py - mp[i].cy) * ASPECT_R; /* aspect correction */
+    float dy = (py - mp[i].cy) * ASPECT_R; /* stretch y so cells look square */
     float r2 = dx * dx + dy * dy + SOFT * SOFT;
     float r = sqrtf(r2);
     float inv3 = mp[i].q / (r2 * r);
@@ -501,224 +281,133 @@ static void field_at(const Monopole *mp, int nm, float px, float py, float *bx,
   }
 }
 
-/* ===================================================================== */
-/* §5  scene — field lines & dipoles                                      */
-/* ===================================================================== */
+/* ── §5 scene — field lines & dipoles ── */
 
 /*
- * FieldLine — one fully pre-rasterised streamline.
+ * FieldLine — one finished field line, already turned into cells to draw.
  *
- * ALGORITHM context (Helman & Hesselink [ref 6], Numerical Recipes
- * Ch.17 [ref 5]):
- *   A streamline is a curve everywhere tangent to a vector field —
- *   for a static B, it IS a Faraday field line [ref 4].
- *   trace_line() integrates the UNIT-ARC-LENGTH ODE
+ * A field line is the curving path you'd walk if you always stepped in the
+ * direction the field points — the same shape iron filings make around a
+ * magnet. We start near a north pole and creep along the field, dropping a
+ * character in each cell we pass, until one of three things happens: we
+ * walk off the screen, the field fades to nothing (a "dead spot" where it
+ * has no direction to follow), or we hit the step limit. Each step is the
+ * same small length no matter how strong the field is, so a line near a
+ * pole doesn't leap ahead while a faraway one barely crawls.
  *
- *       dx/ds = B(x) / |B(x)|
+ * We trace each line ONCE and store the finished cells here, rather than
+ * re-walking the field every frame. Tracing is slow (hundreds of steps,
+ * four field samples each); redrawing stored cells is just a tight loop of
+ * "put this character here", with no math. So a line redraws for free
+ * every frame until the scene changes.
  *
- *   with classical 4th-order Runge-Kutta, starting from a seed point
- *   near a north pole.  Integration stops at whichever comes first:
- *     • the curve leaves the visible grid,
- *     • |B| < B_MIN — a NULL POINT (Helman & Hesselink "critical
- *                     point" [ref 6]; integrator divides by 0 there),
- *     • MAX_LINE_STEPS exhausted (hard cap, guarantees bounded work).
+ * The four arrays (col, row, ch, cp) are kept side by side, one per cell,
+ * sharing the same index. It reads clearly — "this is the column array" —
+ * and keeps each kind of value packed together for fast scanning.
  *
- *   Normalising by |B| means the line advances in EQUAL ARC-LENGTH
- *   STEPS regardless of field strength — without this, a strong field
- *   near a pole would overshoot wildly while a weak field far away
- *   would crawl pixel by pixel.
+ * (The step-along-the-field idea is classic streamline tracing, Numerical
+ * Recipes ch.17; the dead spots are the critical points of Helman &
+ * Hesselink 1991.)
  *
- * WHY pre-rasterise (= store col/row/ch/cp instead of float curves):
- *   Tracing is expensive (up to 600 RK4 evaluations × 4 field_at
- *   calls each); drawing must be cheap (every frame, ~60 Hz).
- *   Rasterising once at trace time means scene_draw() degenerates
- *   to a tight mvaddch loop with no math, no field_at calls, no
- *   character or colour decisions per frame.  A traced line "redraws
- *   for free" every frame until the preset changes.
- *
- * WHY parallel arrays (not an array of step-structs):
- *   The render loop reads col/row to position, then ch + cp to paint.
- *   Parallel arrays put each access onto its own contiguous run of
- *   memory, friendly to the prefetcher.  A struct-of-cells layout
- *   (Step{col,row,ch,cp}[]) would pull all four fields into cache
- *   lines that the render loop doesn't fully use per element.
- *   At MAX_LINE_STEPS=600 the absolute savings are small; the bigger
- *   win is the clearer intent: "this is the column array".
- *
- * Memory cost:  ~4.8 KB / line × MAX_LINES (64) ≈ 310 KB scene-wide.
- * All BSS-resident inside Scene — no malloc on the hot path
- * (CLAUDE.md Memory rule).
+ * Cost: about 4.8 KB per line, ~310 KB across the whole scene. It all
+ * lives inside Scene with no run-time allocation.
  */
 typedef struct {
-  /* Pre-rasterised cell trail.  ALL four arrays share index i:
-   * index 0 = seed cell near the +pole, index len-1 = terminus
-   * (off-grid, near a null, or step cap).  Entries past `len` are
-   * uninitialised — DO NOT read past len. */
-  int col[MAX_LINE_STEPS]; /* terminal COLUMN of step i (cell coords) */
-  int row[MAX_LINE_STEPS]; /* terminal ROW    of step i (cell coords) */
-  char ch[MAX_LINE_STEPS]; /* glyph chosen at TRACE TIME from the
-                            * tangent direction:
-                            *   '- | / \'  line segment (line_char,
-                            *              8-way angle bucket)
-                            *   '> v < ^'  ARROW glyph every
-                            *              ARR_STRIDE steps
-                            *              (direction_arrow) so the
-                            *              reader sees the FLOW
-                            *              DIRECTION, not just the
-                            *              line geometry            */
-  int cp[MAX_LINE_STEPS];  /* CP_LINE_DIM / MID / BRT — distance-
-                            * from-source brightness ramp [ref 8].
-                            * Filled AFTER the full trace (need to
-                            * know `len` to split into three tiers
-                            * — see line_color_pair).               */
-  int len;                 /* steps actually used (0..MAX_LINE_STEPS).
-                            * 0 means the seed was already at a
-                            * null/off-grid — caller still treats
-                            * the line as done.                     */
-  bool done;               /* trace completed marker — set true at
-                            * the END of trace_line().  Guards the
-                            * render pass from drawing a partially-
-                            * traced line if tracing ever becomes
-                            * incremental in the future.            */
+  /* All four arrays line up by index: 0 is the seed cell near the north
+   * pole, len-1 is the last cell. Don't read past len — those slots are
+   * garbage. */
+  int col[MAX_LINE_STEPS]; /* screen column of each cell */
+  int row[MAX_LINE_STEPS]; /* screen row of each cell    */
+  char ch[MAX_LINE_STEPS]; /* the character drawn there: usually a slanted
+                            * line piece ('- | / \') showing the line's
+                            * tilt, but every so often an arrow
+                            * ('> v < ^') so you can see which way the
+                            * field flows, not just the shape. */
+  int cp[MAX_LINE_STEPS];  /* colour of each cell — bright near the pole,
+                            * fading along the line. Filled in after the
+                            * whole line is traced, since the fade is
+                            * split by total length. */
+  int len;                 /* how many cells this line actually used.
+                            * 0 means the seed started on a dead spot or
+                            * off-screen; the line is still "done". */
+  bool done;               /* set true once tracing finishes. Lets the
+                            * draw pass know the line is safe to paint. */
 } FieldLine;
 
 /*
- * Scene — every piece of state for one (preset × theme × terminal-size)
- *         combination.  Rebuilt atomically on any of those changing.
+ * Scene — everything the program needs to show one picture.
  *
- * LAYOUT — fields are grouped into FOUR locality regions, ordered the
- * way each per-frame pass touches them:
+ * A picture is one preset (which magnets, where) shown in one theme at one
+ * terminal size. Change any of those and we throw the whole thing away and
+ * rebuild it from scratch, so every field below lives and dies together.
  *
- *   ┌─────────────────────────────────────────────────────────────────┐
- *   │ (A) PHYSICS     — mp[], nm                                       │
- *   │     read by  : field_at()    (hot loop, ~600 calls per line)     │
- *   │     written  : scene_add_dipole() at init only                   │
- *   │                                                                  │
- *   │ (B) RENDER     — dp[], nd, lines[], n_lines, lines_traced        │
- *   │     read by  : scene_draw()  (every frame)                       │
- *   │     written  : scene_seed_lines() at init, scene_tick() per tick │
- *   │                                                                  │
- *   │ (C) ANIMATION — lines_per_tick, paused, preset, theme            │
- *   │     read by  : scene_tick(), screen_draw_hud()                   │
- *   │     written  : input handler in main()                           │
- *   │                                                                  │
- *   │ (D) GEOMETRY  — cols, rows                                       │
- *   │     read by  : scene_draw(), trace_line() bounds check           │
- *   │     written  : scene_init() ONLY (one-shot at init/resize)       │
- *   └─────────────────────────────────────────────────────────────────┘
+ * The fields are grouped by who uses them, in the order each frame touches
+ * them — physics first, then the things we draw, then the user's settings,
+ * then the screen size. Each group is filled at build time and then mostly
+ * left alone, so it's easy to see what's frozen and what changes per frame.
  *
- * WHY this grouping (locality + clarity):
- *   • Each per-frame pass touches a CONTIGUOUS region — friendly to
- *     the prefetcher and to a reader scanning top-to-bottom (the
- *     access pattern matches the file layout).
- *   • Tick reads (C), writes (C) — no surprise mutations to (A)/(B).
- *   • Draw reads (B) + (D) — no read of physics arrays (mp[]).
- *   • Init writes everything; after that, (A) and (D) are frozen for
- *     the scene's lifetime and (B) is frozen after seeding completes.
- *   This separation is enforced by CONVENTION here, not by separate
- *   structs — see "why one big struct" below.
- *
- * WHY ONE big struct (not split PhysicsScene + RenderScene + UIScene):
- *   The entire scene rebuilds atomically on preset / theme / resize
- *   change.  Keeping it together makes scene_init() = memset + fill,
- *   and makes every field's lifetime obvious (= lifetime of Scene
- *   itself).  Splitting would introduce a pointer hop and a second
- *   allocation site with no behavioural win, and risk drift between
- *   the splits (e.g. a resize that rebuilds physics but forgets
- *   visuals).  CLAUDE.md memory rule also wants ZERO malloc on the
- *   hot path — a single stack/BSS Scene satisfies that trivially.
- *
- * Size:  ~310 KB (dominated by lines[]).  Sits in main()'s stack
- * frame; no dynamic allocation.
+ * It's one big struct on purpose. Since everything rebuilds together,
+ * keeping it in one place makes building it a single clear-and-fill, makes
+ * every field's lifetime obvious, and means no run-time allocation at all
+ * (the whole thing is roughly 310 KB, almost all of it the line cells).
  */
 typedef struct {
-  /* ── (A) PHYSICS DATA ─────────────────────────────────────────── *
-   * Flat array of magnetic point charges, the INPUT to field_at().
-   * Order is arbitrary — superposition is commutative (refs [1, 2])
-   * — so a single uniform loop handles N dipoles of any orientation.
-   * Indexed 0 .. nm-1; entries past nm are uninitialised garbage. */
-  Monopole mp[MAX_MONOPOLES]; /* the point charges (2 per dipole) */
-  int nm;                     /* live count — ALWAYS even (poles
-                               * come in N/S pairs)              */
+  /* The magnetic charges — what the field math reads. Just a flat list, in
+   * any order, since the field is the same however you add up the pulls.
+   * Two charges per magnet, so nm is always even. */
+  Monopole mp[MAX_MONOPOLES]; /* the charges, 2 per magnet */
+  int nm;                     /* how many charges are live */
 
-  /* ── (B) RENDER DATA — visual representation, decoupled from (A) ─ *
-   * Two sub-pools:
-   *   dp[]     — magnet bodies (knowing which N and S pair up)
-   *   lines[]  — pre-rasterised streamlines, traced ONCE in
-   *              scene_seed_lines() then redrawn every frame.
-   * scene_draw() touches ONLY this region (+ region D); the physics
-   * arrays are never read during rendering. */
-  Dipole dp[MAX_DIPOLES]; /* magnet bodies (N→S geometry pairs) */
-  int nd;                 /* live dipole count                  */
+  /* The magnet bodies — what the drawing code reads to place the '=' bar
+   * and the N/S letters. Kept apart from the charges above so each side
+   * stays simple: the math sees a plain list of charges, the drawing sees
+   * whole magnets. */
+  Dipole dp[MAX_DIPOLES]; /* the magnet bodies */
+  int nd;                 /* how many magnets are live */
 
-  FieldLine lines[MAX_LINES]; /* pre-rasterised streamlines, BSS-
-                               * resident — no malloc on hot path  */
-  int n_lines;                /* total lines TRACED for this preset
-                               * (set once during seeding)         */
-  int lines_traced;           /* lines REVEALED to the viewer so far
-                               * (≤ n_lines).  Progressive reveal:
-                               * scene_draw() paints only
-                               * lines[0 .. lines_traced) so the
-                               * startup isn't a blocking pause —
-                               * the user sees field lines appear
-                               * one batch per tick.               */
+  FieldLine lines[MAX_LINES]; /* all the field lines, traced once at build */
+  int n_lines;                /* how many lines this preset traced */
+  int lines_traced;           /* how many we've shown so far. We reveal a few
+                               * more each tick instead of all at once, so the
+                               * lines appear to grow rather than pop in. */
 
-  /* ── (C) ANIMATION CONTROL — user-tunable per-frame state ────── *
-   * These are the keybind targets — every value here is owned by
-   * the input handler in main() and read by tick + HUD draw.  No
-   * physics ever depends on these (changing preset/theme rebuilds
-   * regions A/B from scratch via scene_init).                       */
-  int lines_per_tick; /* [/]+ keys — lines revealed per
-                       * tick.  Visual PACING only; the
-                       * underlying trace work is already
-                       * done at seed time.               */
-  bool paused;        /* space / p — freeze the reveal
-                       * animation.  Physics is static, so
-                       * "pause" only halts incrementing
-                       * lines_traced.                    */
-  int preset;         /* 0 .. N_PRESETS-1 active scenario
-                       * (Dipole / Quadrupole / Attract /
-                       * Repel).  Changing this triggers a
-                       * full scene rebuild.              */
-  int theme;          /* 0 .. N_THEMES-1 active palette.
-                       * Changing this re-binds colour
-                       * pairs but does NOT rebuild lines
-                       * — line geometry is theme-free.   */
+  /* The user's live settings — what the keys change. Nothing in the field
+   * math depends on these; changing the preset or theme rebuilds the scene
+   * anyway. */
+  int lines_per_tick; /* how many new lines to reveal each tick — pure
+                       * pacing, the tracing is already done */
+  bool paused;        /* freeze the reveal. The field never moves, so all
+                       * "pause" does is stop revealing more lines */
+  int preset;         /* which arrangement of magnets is showing */
+  int theme;          /* which colour scheme is showing — swapping it just
+                       * recolours, it doesn't re-trace the lines */
 
-  /* ── (D) GEOMETRY — render-band dimensions ───────────────────── *
-   * The INSET render band size, NOT full terminal dimensions:
-   *   rows = term_rows − HUD_TOP_ROWS − HUD_BOT_ROWS
-   *   cols = term_cols
-   * The HUD rows live OUTSIDE this coordinate system — scene_draw()
-   * shifts every mvaddch by HUD_TOP_ROWS so the canvas starts at
-   * terminal row 1.  Set once per init/resize and frozen thereafter. */
+  /* The drawing area, in cells. This is the band BETWEEN the two HUD rows,
+   * not the whole terminal: we trim a row off the top and bottom for the
+   * status and key-hint lines. Set once per build/resize. */
   int cols, rows;
 } Scene;
 
-/* ── Arrow glyph from tangent direction (4-way, picked from 8 sectors) ─ *
- * Bucket the unit tangent into one of 8 angular sectors of width π/4,
- * then map antipodal sectors to the same glyph: → and ← collapse onto
- * '>' / '<', ↓ and ↑ onto 'v' / '^'.  4 distinct outputs is enough — a
- * field line at 90° vs 270° points the SAME way along its trail; only
- * the cardinal direction matters for the reader.                       */
+/* Pick an arrow ('> v < ^') for which way the field points here. We only
+ * need the four compass directions — that's enough for the eye to read the
+ * flow along a line. */
 static char direction_arrow(float dx, float dy) {
   float angle = atan2f(dy * ASPECT_R, dx);
   if (angle < 0)
-    angle += 2.0f * (float)M_PI; /* → [0, 2π)  */
+    angle += 2.0f * (float)M_PI;
   int sector = (int)(angle / ((float)M_PI / 4.0f) + 0.5f) % 8;
   static const char sym[4] = {'>', 'v', '<', '^'};
   return sym[sector % 4];
 }
 
-/* ── Line character from direction ────────────────────────────────── */
-
+/* Pick a slanted line piece ('- \ | /') that matches the field's tilt here,
+ * so the trail looks like a smooth curve. */
 static char line_char(float dx, float dy) {
   float angle = atan2f(dy * ASPECT_R, dx);
   if (angle < 0)
     angle += (float)M_PI;
   if (angle >= (float)M_PI)
     angle -= (float)M_PI;
-  /* normalize to [0, pi) and pick character */
   float deg = angle * 180.0f / (float)M_PI;
   if (deg < 22.5f || deg >= 157.5f)
     return '-';
@@ -729,10 +418,9 @@ static char line_char(float dx, float dy) {
   return '/';
 }
 
-/* ── Color pair for a step along a line based on distance from pole ── */
-
+/* Brightest where a line leaves its pole, fading along the way. We split
+ * the line into thirds and colour each third. */
 static int line_color_pair(int step, int total) {
-  /* bright near source pole, dim farther away */
   if (total <= 0)
     return CP_LINE_DIM;
   int third = total / 3;
@@ -743,13 +431,11 @@ static int line_color_pair(int step, int total) {
   return CP_LINE_DIM;
 }
 
-/* ── Helpers for trace_line — each one names a single algorithmic step ─ */
+/* ── Helpers for trace_line — one small step of following a line ── */
 
-/* GRID DOMAIN — is the current integrator position inside the renderable
- * grid?  Tested as float (the integrator advances in sub-cell steps) AND
- * as the rounded cell index (defensive against floor/ceil rounding at
- * the boundary).  Returns the rounded cell via out-params so the caller
- * doesn't repeat the same rounding. */
+/* Are we still on screen? We walk in sub-cell amounts, so check both the
+ * raw position and the rounded cell (rounding can nudge a borderline point
+ * over the edge). Hands back the rounded cell so the caller doesn't redo it. */
 static bool cell_in_grid(float px, float py, int cols, int rows, int *out_col,
                          int *out_row) {
   if (px < 0 || px >= (float)cols || py < 0 || py >= (float)rows)
@@ -763,21 +449,14 @@ static bool cell_in_grid(float px, float py, int cols, int rows, int *out_col,
   return true;
 }
 
-/* CLASSICAL RK4 EVALUATION (Numerical Recipes Ch.17 [ref 5]) —
- * one step of the streamline ODE
- *
- *     dx/ds = B(x)
- *
- * with four field samples at (start, mid₁, mid₂, end) blended via
- *
- *     B̄ = (k₁ + 2k₂ + 2k₃ + k₄) / 6
- *
- * giving local truncation error O(h⁵).  Then the result is NORMALISED
- * to unit length so the caller advances in equal arc-length steps
- * (without normalisation, near-pole fields would overshoot wildly).
- *
- * Returns false when |B̄| < B_MIN — the position is at a NULL POINT
- * [ref 6] where the tangent is undefined and integration must stop. */
+/* Work out which way to step next, accurately. Instead of just sampling the
+ * field once, we sample it four times around the next little stretch and
+ * average them — a standard recipe (RK4, Numerical Recipes ch.17) that
+ * follows curves much more faithfully than a single sample would. We then
+ * shrink the answer to a fixed length so every step covers the same
+ * distance; otherwise a strong field near a pole would fling the line too
+ * far. Returns false at a dead spot (field too weak to point anywhere),
+ * which tells the caller to stop the line. */
 static bool rk4_unit_tangent(const Monopole *mp, int nm, float px, float py,
                              float h, float *tx, float *ty) {
   float k1x, k1y, k2x, k2y, k3x, k3y, k4x, k4y;
@@ -790,26 +469,23 @@ static bool rk4_unit_tangent(const Monopole *mp, int nm, float px, float py,
   float by = (k1y + 2.0f * k2y + 2.0f * k3y + k4y) / 6.0f;
   float bmag = sqrtf(bx * bx + by * by);
   if (bmag < B_MIN)
-    return false; /* null point — stop */
+    return false; /* dead spot — nowhere to step, stop */
 
-  *tx = bx / bmag; /* unit-arc-length tangent */
+  *tx = bx / bmag; /* shrink to a fixed step length */
   *ty = by / bmag;
   return true;
 }
 
-/* GLYPH SELECTION — every ARR_STRIDE steps we punctuate the trail with
- * a direction arrow so the reader sees FLOW DIRECTION (where does this
- * line point?); the steps in between get the 4-way angle-bucketed line
- * glyph for shape.  Step 0 is always a line glyph — placing an arrow on
- * the seed cell would visually compete with the 'N' pole marker. */
+/* Most cells get a line piece for shape; every so often we drop an arrow
+ * instead so you can see which way the field flows. Never on the very first
+ * cell — that sits on the 'N' marker and would clash with it. */
 static char glyph_for_step(int step, float tx, float ty) {
   bool is_arrow_step = (step > 0 && step % ARR_STRIDE == 0);
   return is_arrow_step ? direction_arrow(tx, ty) : line_char(tx, ty);
 }
 
-/* APPEND ONE TRACED CELL — pure side-effect on fl, no math.  Colour
- * pair is left at 0 (= "unassigned"); the full-trace distance ramp
- * fills it in after the loop, once `len` is known. */
+/* Tack one more cell onto the line. Colour is left blank for now; we fill
+ * the fade in afterwards, once we know how long the line ended up. */
 static void record_traced_cell(FieldLine *fl, int col, int row, char ch) {
   fl->col[fl->len] = col;
   fl->row[fl->len] = row;
@@ -818,31 +494,18 @@ static void record_traced_cell(FieldLine *fl, int col, int row, char ch) {
   fl->len++;
 }
 
-/* DISTANCE-FROM-SOURCE BRIGHTNESS RAMP [Ware ref 8] — split the line
- * into thirds, brightest near the source pole, dimmest near the
- * terminus (null point or off-grid).  Runs AFTER the trace because the
- * three tiers are defined relative to `len`, which is only known when
- * the integrator stops. */
+/* Colour the finished line so it's bright at the pole and fades toward the
+ * end. Done after tracing, since the fade is measured against the line's
+ * final length. */
 static void apply_distance_brightness_ramp(FieldLine *fl) {
   for (int i = 0; i < fl->len; i++) {
     fl->cp[i] = line_color_pair(i, fl->len);
   }
 }
 
-/* ── RK4 streamline trace — Faraday field line from one seed ─────────
- *
- * Pseudocode (Helman & Hesselink streamline integration [ref 6]):
- *
- *     position ← seed
- *     for step = 0 .. MAX_LINE_STEPS:
- *         if position outside grid:           break
- *         tangent ← RK4 unit-direction at position
- *         if no valid tangent (null point):   break
- *         glyph   ← arrow at stride / line otherwise
- *         record cell at position
- *         position ← position + h · tangent
- *     colour the trail by distance from source
- */
+/* Trace one whole field line: start at the seed and keep stepping in the
+ * field's direction, dropping a character each step, until we leave the
+ * screen, hit a dead spot, or run out of steps. Then colour the trail. */
 static void trace_line(FieldLine *fl, const Monopole *mp, int nm, float sx,
                        float sy, int cols, int rows) {
   fl->len = 0;
@@ -868,8 +531,8 @@ static void trace_line(FieldLine *fl, const Monopole *mp, int nm, float sx,
   apply_distance_brightness_ramp(fl);
 }
 
-/* ── Add a dipole: north at (nx,ny), south at (sx,sy) ────────────── */
-
+/* Add one magnet: record its two charges (for the math) and its body
+ * geometry (for drawing) together, so the two views can't drift apart. */
 static void scene_add_dipole(Scene *s, float nx, float ny, float sx, float sy) {
   if (s->nd >= MAX_DIPOLES || s->nm + 2 > MAX_MONOPOLES)
     return;
@@ -883,21 +546,16 @@ static void scene_add_dipole(Scene *s, float nx, float ny, float sx, float sy) {
   s->nd++;
 }
 
-/* ── Seed field lines from every north pole ──────────────────────────
- *
- * Around each +q monopole, place N_SEEDS seed points on a small circle
- * of radius SEED_R (aspect-corrected in y so the circle LOOKS round
- * on terminals with ~2:1 cell aspect), and trace one streamline from
- * each.  Tracing is done eagerly here — the per-tick "reveal" later
- * only advances the visible count, not the trace itself.
- */
+/* Start the field lines. Around each north pole we sprinkle a ring of
+ * starting points and trace one line out of each. We do all the tracing now;
+ * the per-tick reveal later just decides how many to show. */
 static void scene_seed_lines(Scene *s) {
   s->n_lines = 0;
   s->lines_traced = 0;
 
   for (int i = 0; i < s->nm && s->n_lines < MAX_LINES; i++) {
     if (s->mp[i].q < 0)
-      continue; /* only +q (north) poles seed lines */
+      continue; /* lines start at north poles only */
 
     for (int k = 0; k < N_SEEDS && s->n_lines < MAX_LINES; k++) {
       float angle = (float)k / (float)N_SEEDS * 2.0f * (float)M_PI;
@@ -910,80 +568,59 @@ static void scene_seed_lines(Scene *s) {
   }
 }
 
-/* ── Preset layouts — one helper per magnetic configuration ──────────
+/* ── Preset layouts — one helper per magnet arrangement ──
  *
- * Each helper places magnets around the scene centre (cx, cy) using
- * scaled offsets (dx, dy).  Naming is physics-led: the function name
- * is the configuration name as you'd find it in a magnetostatics text
- * (Purcell Ch.6 [ref 3] — "single dipole", "quadrupole", "facing
- * pairs in attract / repel arrangement").
+ * Each one places its magnets relative to the centre (cx, cy) using offsets
+ * scaled to the terminal size, so the picture fits any window. The names are
+ * the textbook names for these classic setups (Purcell ch.6).
  */
 
-/* PRESET 0 — single bar magnet, horizontal.  Classic CLOSED-LOOP field
- * lines emerging from N, sweeping around, returning to S.  The most
- * basic dipole pattern (Griffiths §5 [ref 1]). */
+/* One bar magnet lying flat. The plainest case: lines loop out of N, curve
+ * around, and come back into S. */
 static void preset_single_bar_magnet(Scene *s, float cx, float cy, float dx) {
   scene_add_dipole(s, cx - dx, cy, /* north pole — left */
                    cx + dx, cy);   /* south pole — right */
 }
 
-/* PRESET 1 — magnetic QUADRUPOLE.  Two crossed dipoles share a centre:
- * one vertical (N on top), one horizontal.  The four poles form a
- * symmetric arrangement whose superposed field has a CRITICAL POINT
- * of saddle topology (X-shaped null) at the centre — the canonical
- * "X-type neutral point" of Helman & Hesselink [ref 6]. */
+/* Two magnets crossing at the centre, one upright and one flat. The four
+ * poles together leave an X-shaped dead spot in the middle where the lines
+ * split apart. */
 static void preset_quadrupole(Scene *s, float cx, float cy, float dx,
                               float dy) {
-  scene_add_dipole(s, cx, cy - dy * 0.8f, /* vertical dipole: N on top */
-                   cx, cy + dy * 0.8f);   /*                  S on bottom */
-  scene_add_dipole(s, cx - dx * 1.4f, cy, /* horizontal dipole: N far-left */
-                   cx + dx * 1.4f, cy);   /*                    S far-right */
+  scene_add_dipole(s, cx, cy - dy * 0.8f, /* upright magnet: N on top */
+                   cx, cy + dy * 0.8f);   /*                 S on bottom */
+  scene_add_dipole(s, cx - dx * 1.4f, cy, /* flat magnet: N far-left */
+                   cx + dx * 1.4f, cy);   /*              S far-right */
 }
 
-/* PRESET 2 — ATTRACT pair (N→S facing N→S).  Two horizontal magnets
- * laid end-to-end with OPPOSITE poles meeting at the centre:
- *
- *     N------S    N------S
- *   ←─ left ─┘    └─ right ─→
- *
- * Equivalent to one long bar magnet — field lines stream continuously
- * from the far-left N to the far-right S through the inner S/N pair. */
+/* Two magnets in a row with opposite poles facing (N-S  N-S). They attract,
+ * and act like one long magnet: lines run straight through from the far-left
+ * N to the far-right S. */
 static void preset_attract_pair(Scene *s, float cx, float cy, float dx) {
   scene_add_dipole(s, cx - dx * 1.8f,
-                   cy, /* LEFT magnet:  N far-left,  S near-centre */
+                   cy, /* left magnet:  N far-left,  S near-centre */
                    cx - dx * 0.4f, cy);
   scene_add_dipole(s, cx + dx * 0.4f,
-                   cy, /* RIGHT magnet: N near-centre, S far-right */
+                   cy, /* right magnet: N near-centre, S far-right */
                    cx + dx * 1.8f, cy);
 }
 
-/* PRESET 3 — REPEL pair (N→N facing N→N).  Two horizontal magnets laid
- * end-to-end with LIKE poles meeting at the centre:
- *
- *     S------N    N------S
- *   ←─ left ─┘    └─ right ─→
- *
- * The two near-centre N poles push each other away — the field has a
- * null point between them (Helman & Hesselink saddle [ref 6]).  Lines
- * curve sharply outward, never crossing the midplane. */
+/* Two magnets in a row with like poles facing (N-N). They repel: the two
+ * inner N poles shove each other away, leaving a dead spot between them and
+ * lines that swerve outward without crossing the middle. */
 static void preset_repel_pair(Scene *s, float cx, float cy, float dx) {
   scene_add_dipole(s, cx - dx * 0.4f,
-                   cy, /* LEFT magnet:  N near-centre, S far-left  */
+                   cy, /* left magnet:  N near-centre, S far-left  */
                    cx - dx * 1.8f, cy);
   scene_add_dipole(s, cx + dx * 0.4f,
-                   cy, /* RIGHT magnet: N near-centre, S far-right */
+                   cy, /* right magnet: N near-centre, S far-right */
                    cx + dx * 1.8f, cy);
 }
 
-/*
- * scene_build_preset — dispatch the preset id to one of the four
- * magnetic configurations above.  Reads as pure preset SELECTION; all
- * placement math lives in the named helpers.
- */
+/* Lay out the magnets for whichever preset is selected. */
 static void scene_build_preset(Scene *s) {
-  /* Reference frame for placement: scene centre + scaled half-spans.
-   * Layouts express positions as cx ± k·dx, cy ± k·dy so they
-   * auto-scale with the terminal size. */
+  /* Centre of the screen and how far out to push the magnets, both scaled to
+   * the window so the layout fits any size. */
   float cx = (float)s->cols * 0.5f;
   float cy = (float)s->rows * 0.5f;
   float dx = (float)s->cols * 0.18f;
@@ -1020,8 +657,7 @@ static void scene_init(Scene *s, int cols, int rows, int preset, int theme) {
   scene_seed_lines(s);
 }
 
-/* ── Tick: reveal next batch of lines ────────────────────────────── */
-
+/* One tick: show a few more of the already-traced lines, unless paused. */
 static void scene_tick(Scene *s) {
   if (s->paused)
     return;
@@ -1031,18 +667,15 @@ static void scene_tick(Scene *s) {
   }
 }
 
-/* ── Render helpers — one per visual element of the scene ────────────
+/* ── Render helpers — one per thing we draw ──
  *
- * The painter's algorithm: field lines paint first (BACKGROUND), then
- * magnet bodies and N/S markers on top (FOREGROUND).  Every helper
- * treats the scene grid as LOGICAL coordinates (s->cols × s->rows)
- * covering only the renderable inset band — paint_cell() shifts row
- * by HUD_TOP_ROWS so the canvas starts at terminal row 1, and the
- * bottom HUD row is excluded implicitly via
- *     s->rows = term_rows − HUD_TOP_ROWS − HUD_BOT_ROWS.
+ * We paint back to front: field lines first, then the magnets on top, so the
+ * bold N/S letters never get buried under a line. Everything works in the
+ * drawing band's own coordinates; paint_cell nudges each row down by one to
+ * leave the top HUD row clear.
  */
 
-/* Paint one cell with a glyph + attribute, clipped to the scene grid. */
+/* Put one character in one cell, ignoring anything off the drawing area. */
 static void paint_cell(int row, int col, char ch, int attr, int grid_cols,
                        int grid_rows) {
   if (row < 0 || row >= grid_rows || col < 0 || col >= grid_cols)
@@ -1050,9 +683,8 @@ static void paint_cell(int row, int col, char ch, int attr, int grid_cols,
   mvaddch(row + HUD_TOP_ROWS, col, (chtype)(unsigned char)ch | attr);
 }
 
-/* LAYER 1 — paint a single pre-rasterised streamline cell-by-cell.
- * Distance ramp colour is stored per cell at trace time, so this is
- * pure mvaddch — no math, no field_at calls. */
+/* Draw one field line, cell by cell. The colours were worked out when the
+ * line was traced, so this is just placing characters — no math. */
 static void draw_field_line(const FieldLine *fl, int grid_cols, int grid_rows) {
   for (int i = 0; i < fl->len; i++) {
     int cp = fl->cp[i] ? fl->cp[i] : CP_LINE_DIM;
@@ -1061,39 +693,37 @@ static void draw_field_line(const FieldLine *fl, int grid_cols, int grid_rows) {
   }
 }
 
-/* LAYER 1 driver — paint the REVEALED portion of the streamline pool
- * (lines[0 .. lines_traced)).  Lines past lines_traced are still being
- * "revealed" by the progressive-reveal animation and stay hidden. */
+/* Draw only the lines revealed so far; the rest are still waiting their turn
+ * in the grow-in animation. */
 static void draw_revealed_field_lines(const Scene *s) {
   for (int li = 0; li < s->lines_traced; li++) {
     draw_field_line(&s->lines[li], s->cols, s->rows);
   }
 }
 
-/* LAYER 2a — '=' line connecting the N and S poles of one magnet.
- * Sampled at 2 points per cell of pole-to-pole distance so the line
- * stays continuous at any angle without explicit Bresenham.  A_DIM so
- * the body subdues itself behind the bright N/S markers. */
+/* Draw the '=' bar joining a magnet's two poles. We step along it twice per
+ * cell so it stays unbroken at any angle, and keep it dim so it sits quietly
+ * behind the N/S letters. */
 static void draw_magnet_body_line(const Dipole *dp, int grid_cols,
                                   int grid_rows) {
   float dx = dp->sx - dp->nx;
   float dy = dp->sy - dp->ny;
   float dist = sqrtf(dx * dx + dy * dy);
   if (dist <= 0.5f)
-    return; /* coincident poles — skip */
+    return; /* poles on the same spot — nothing to draw */
 
   int steps = (int)(dist * 2);
   int attr = COLOR_PAIR(CP_BODY) | A_DIM;
   for (int k = 0; k <= steps; k++) {
-    float t = (float)k / (float)steps; /* parametric in [0,1]    */
+    float t = (float)k / (float)steps; /* 0 at N, 1 at S */
     int c = (int)(dp->nx + t * dx + 0.5f);
     int r = (int)(dp->ny + t * dy + 0.5f);
     paint_cell(r, c, '=', attr, grid_cols, grid_rows);
   }
 }
 
-/* LAYER 2b — bold 'N' / 'S' marker.  These sit ON TOP of the body line
- * (painter's algorithm) so the pole identity always wins legibility. */
+/* Draw a bold 'N' or 'S' on a pole. Painted last so the letter always shows
+ * clearly over the bar. */
 static void draw_pole_marker(float px, float py, char glyph, int cp,
                              int grid_cols, int grid_rows) {
   int r = (int)(py + 0.5f);
@@ -1101,25 +731,14 @@ static void draw_pole_marker(float px, float py, char glyph, int cp,
   paint_cell(r, c, glyph, COLOR_PAIR(cp) | A_BOLD, grid_cols, grid_rows);
 }
 
-/* LAYER 2 driver — one full magnet (body line + both pole markers). */
+/* Draw one whole magnet: the bar, then both pole letters. */
 static void draw_magnet(const Dipole *dp, int grid_cols, int grid_rows) {
   draw_magnet_body_line(dp, grid_cols, grid_rows);
   draw_pole_marker(dp->nx, dp->ny, 'N', CP_NORTH, grid_cols, grid_rows);
   draw_pole_marker(dp->sx, dp->sy, 'S', CP_SOUTH, grid_cols, grid_rows);
 }
 
-/*
- * scene_draw — painter's-algorithm composite of the magnetostatic scene.
- *
- * Pseudocode:
- *     LAYER 1  draw revealed field lines (background)
- *     LAYER 2  draw each magnet on top   (foreground)
- *
- * Coordinate convention:  scene grid is INSET — every paint helper
- * shifts row by HUD_TOP_ROWS via paint_cell() so the canvas starts at
- * terminal row 1.  The bottom HUD row is excluded by sizing:
- *     s->rows = term_rows − HUD_TOP_ROWS − HUD_BOT_ROWS.
- */
+/* Paint the whole picture: field lines first, then the magnets on top. */
 static void scene_draw(const Scene *s) {
   draw_revealed_field_lines(s);
 
@@ -1128,9 +747,7 @@ static void scene_draw(const Scene *s) {
   }
 }
 
-/* ===================================================================== */
-/* §6  screen / HUD                                                       */
-/* ===================================================================== */
+/* ── §6 screen / HUD ── */
 
 static void screen_init(void) {
   initscr();
@@ -1141,22 +758,12 @@ static void screen_init(void) {
   curs_set(0);
 }
 
-/*
- * screen_draw_hud — canonical CLAUDE.md two-row HUD.
+/* Draw the two text rows: a status line up top (what's showing, how far
+ * along, fps) and the key reminders along the bottom. Both stay bright so
+ * they read over any field colour.
  *
- *   Row 0          : STATUS — title, preset, theme, trace speed,
- *                    progress %, fps, paused state.  CP_HUD (bright
- *                    yellow 226) + A_BOLD.
- *   Row term_rows-1: ACTION keys — q / r / n / N / t / T / ] / [ /
- *                    p.  CP_HINT (bright cyan 51) + A_BOLD.  NEVER
- *                    A_DIM (CLAUDE.md: dim text vanishes against any
- *                    animated palette).
- *
- * Takes terminal dims (cols, term_rows) explicitly — the scene's own
- * rows count is the INSET render band (term_rows − 2), not the full
- * terminal height, so passing term_rows separately keeps the HUD at
- * the screen edges regardless of scene sizing.
- */
+ * It takes the full terminal height separately because the scene's own row
+ * count is just the band between these two lines, not the whole screen. */
 static void screen_draw_hud(const Scene *s, int cols, int term_rows, int fps) {
   static const char *preset_names[N_PRESETS] = {"Dipole", "Quadrupole",
                                                 "Attract", "Repel"};
@@ -1165,7 +772,7 @@ static void screen_draw_hud(const Scene *s, int cols, int term_rows, int fps) {
 
   int pct = s->n_lines > 0 ? s->lines_traced * 100 / s->n_lines : 100;
 
-  /* ── Top row 0: STATUS (canonical yellow + A_BOLD) ─────────────── */
+  /* ── top status line ── */
   move(0, 0);
   clrtoeol();
   attron(COLOR_PAIR(CP_HUD) | A_BOLD);
@@ -1176,7 +783,7 @@ static void screen_draw_hud(const Scene *s, int cols, int term_rows, int fps) {
            pct, fps, s->paused ? "PAUSED " : "running");
   attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-  /* ── Bottom row term_rows-1: ACTION keys (canonical cyan + BOLD) ─ */
+  /* ── bottom key-hint line ── */
   int bot = term_rows - 1;
   move(bot, 0);
   clrtoeol();
@@ -1186,12 +793,10 @@ static void screen_draw_hud(const Scene *s, int cols, int term_rows, int fps) {
            "  p|spc:pause ");
   attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 
-  (void)cols; /* clrtoeol takes the row; cols reserved for future */
+  (void)cols; /* unused here, kept for a consistent signature */
 }
 
-/* ===================================================================== */
-/* §7  signal handling                                                    */
-/* ===================================================================== */
+/* ── §7 signal handling ── */
 
 static volatile sig_atomic_t g_resize = 0;
 static volatile sig_atomic_t g_quit = 0;
@@ -1205,42 +810,36 @@ static void handle_sigterm(int s) {
   g_quit = 1;
 }
 
-/* ===================================================================== */
-/* §8  main loop                                                          */
-/* ===================================================================== */
+/* ── §8 main loop ── */
 
-/* ── Bootstrap helpers ──────────────────────────────────────────────── */
+/* ── Bootstrap helpers ── */
 
-/* Wire SIGINT / SIGTERM → graceful quit and SIGWINCH → deferred resize.
- * The handlers themselves only flip volatile flags — all real work
- * happens synchronously from the main loop. */
+/* Catch the quit and resize signals. The handlers only set a flag; the real
+ * work happens back in the main loop, where it's safe. */
 static void install_signal_handlers(void) {
   signal(SIGWINCH, handle_sigwinch);
   signal(SIGTERM, handle_sigterm);
   signal(SIGINT, handle_sigterm);
 }
 
-/* Build (or REBUILD) the scene for the current terminal size.  Hides
- * the HUD inset arithmetic (`rows − HUD_TOP_ROWS − HUD_BOT_ROWS`) at
- * the single call site that needs to know it. */
+/* Build the scene to fit the current terminal, reserving the top and bottom
+ * rows for the HUD. The one place that subtracts those rows. */
 static void rebuild_scene_for_terminal(Scene *scene, int term_rows,
                                        int term_cols, int preset, int theme) {
   scene_init(scene, term_cols, term_rows - HUD_TOP_ROWS - HUD_BOT_ROWS, preset,
              theme);
 }
 
-/* Modular cyclic step (+1 / −1 with wrap-around).  Named so the keybind
- * cases read as "advance preset by +1, wrap mod N_PRESETS" instead of
- * the slightly cryptic `(x + N - 1) % N` reverse-wrap trick. */
+/* Step a value forward or back by one and wrap around the ends. Named so the
+ * key handlers read clearly instead of spelling out the wrap arithmetic. */
 static void cycle_index(int *value, int step, int n) {
   *value = (*value + n + step) % n;
 }
 
-/* ── Per-frame stage helpers — each one is one phase of the sim loop ── */
+/* ── Per-frame stage helpers — one phase of the loop each ── */
 
-/* RESIZE handling — SIGWINCH set the flag asynchronously; we drain it
- * here, ask ncurses for fresh terminal dimensions, and rebuild the
- * scene to match (line geometry depends on grid size). */
+/* Handle a window resize. If one happened, grab the new size and rebuild the
+ * scene, since the lines are traced to fit the old grid. */
 static void consume_resize_event(Scene *scene, int *rows, int *cols, int preset,
                                  int theme) {
   if (!g_resize)
@@ -1252,9 +851,7 @@ static void consume_resize_event(Scene *scene, int *rows, int *cols, int preset,
   rebuild_scene_for_terminal(scene, *rows, *cols, preset, theme);
 }
 
-/* INPUT — drain every queued key and dispatch.  Mutates scene state +
- * the three "session" knobs (preset, theme, sim_fps).  Sets g_quit on
- * q/ESC.  Keeps `rows`/`cols` as plain values since they're only read. */
+/* Handle every key waiting in the queue. */
 static void process_input(Scene *scene, int *cur_preset, int *cur_theme,
                           int *sim_fps, int rows, int cols) {
   int ch;
@@ -1310,10 +907,8 @@ static void process_input(Scene *scene, int *cur_preset, int *cur_theme,
   }
 }
 
-/* RENDER one frame: clear → paint scene → paint HUD → flush.
- * Uses `wnoutrefresh + doupdate` (single diff write) instead of
- * plain `refresh()` to avoid flicker on slow terminals — CLAUDE.md
- * ncurses Bug Table. */
+/* Draw one frame. The wnoutrefresh + doupdate pair sends a single update
+ * instead of a full redraw, which avoids flicker on slow terminals. */
 static void render_frame(const Scene *scene, int rows, int cols, int fps_disp) {
   erase();
   scene_draw(scene);
@@ -1322,26 +917,21 @@ static void render_frame(const Scene *scene, int rows, int cols, int fps_disp) {
   doupdate();
 }
 
-/* FRAME PACING — fixed-timestep cap to sim_fps.  Sleeps the leftover of
- * (tick budget − time already spent on this iteration), then re-reads
- * the clock so `t_last` is the start of the NEXT iteration's budget.
- * Writes the measured frame-work time via out-param so the FPS counter
- * can use the same measurement without re-reading the clock. */
+/* Hold the frame rate steady. Sleep off whatever time is left in this frame's
+ * budget, then read the clock again to start the next frame's. Also reports
+ * how long the work took, so the fps counter can reuse that number. */
 static int64_t pace_frame_to_fps(int64_t t_last, int sim_fps,
                                  int64_t *out_work_ns) {
   int64_t t_now = clock_ns();
   int64_t t_work = t_now - t_last;
   int64_t t_tick = TICK_NS(sim_fps);
-  clock_sleep_ns(t_tick - t_work); /* clamped to 0 inside sleep */
+  clock_sleep_ns(t_tick - t_work); /* a negative gap just means "don't sleep" */
   *out_work_ns = t_work;
   return clock_ns();
 }
 
-/* FPS COUNTER — accumulate per-frame elapsed time; every half second,
- * convert (frames in window × 2) into a displayed fps value.  Uses the
- * fact that `work + max(0, tick − work) = max(work, tick)` to count
- * either a budgeted or a busted frame correctly without a branch on
- * the displayed value. */
+/* Measure the frame rate. Add up time across frames and, every half second,
+ * report how many frames fit in that window (doubled to get per-second). */
 static void update_fps_counter(int64_t work_ns, int sim_fps, int64_t *fps_acc,
                                int *fps_cnt, int *fps_disp) {
   int64_t t_tick = TICK_NS(sim_fps);
@@ -1349,18 +939,15 @@ static void update_fps_counter(int64_t work_ns, int sim_fps, int64_t *fps_acc,
   *fps_acc += work_ns + (slack > 0 ? slack : 0);
   (*fps_cnt)++;
   if (*fps_acc >= NS_PER_SEC / 2) {
-    *fps_disp = *fps_cnt * 2; /* half-second window → ×2 */
+    *fps_disp = *fps_cnt * 2; /* counted over half a second, so double it */
     *fps_acc = 0;
     *fps_cnt = 0;
   }
 }
 
-/* AUTO-ADVANCE — once all field lines for the current preset are fully
- * revealed and the user hasn't paused, hold the finished view for
- * ~3 seconds then cycle to the next preset.  Gives the demo a
- * self-running showreel feel; user input can override at any time
- * (process_input mutates cur_preset, which `hold_ticks` doesn't care
- * about — the wraparound stays consistent). */
+/* When the current preset has fully drawn and isn't paused, pause on it for
+ * about three seconds, then move to the next one. Makes the demo play itself;
+ * the user can still flip presets by hand at any time. */
 static void auto_advance_preset_if_complete(Scene *scene, int *cur_preset,
                                             int cur_theme, int sim_fps,
                                             int rows, int cols) {
@@ -1376,22 +963,9 @@ static void auto_advance_preset_if_complete(Scene *scene, int *cur_preset,
   }
 }
 
-/*
- * main — standard fixed-timestep sim loop.
- *
- * Pseudocode:
- *     install signals; init terminal; init colours
- *     build initial scene at current terminal size
- *     loop until quit:
- *         drain SIGWINCH      (rebuild scene if resized)
- *         drain keyboard      (mutate scene / preset / theme / fps)
- *         tick                (reveal next batch of lines)
- *         render              (scene + HUD)
- *         pace                (sleep to sim_fps deadline)
- *         update fps counter
- *         auto-advance        (cycle preset once current one is done)
- *     teardown terminal
- */
+/* Set everything up, then loop: handle resize and keys, reveal a few more
+ * lines, draw, wait out the rest of the frame, and auto-advance when a preset
+ * finishes. */
 int main(void) {
   install_signal_handlers();
   screen_init();

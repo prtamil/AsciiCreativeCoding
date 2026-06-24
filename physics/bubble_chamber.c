@@ -1,135 +1,66 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * bubble_chamber.c — Charged Particles in a Magnetic Field
+ * bubble_chamber.c — charged particles curling in a magnetic field.
  *
- * Simulates a bubble chamber: charged particles travel through a region of
- * uniform magnetic field (B perpendicular to the screen) and leave curved
- * ionisation tracks as they lose energy.
+ * A bubble chamber lets you "see" subatomic particles: a charged particle
+ * flying through a magnetic field curves, and leaves a fading trail behind
+ * it. Lighter particles curl tightly, heavier ones barely bend, and every
+ * particle slowly spirals inward as it loses speed.
  *
- * Physics
- *   Lorentz force (2D, B along z-axis):
- *     Rotate velocity by  omega = (q/m_eff) * B  each step.
- *     v' = R(omega) · v   — exact rotation matrix; no Euler spiral drift.
- *   Ionisation drag:
- *     |v| *= (1 − DRAG)  each step  →  orbit spirals inward.
- *   Cyclotron radius:
- *     r = |v| / |omega|   →  light particles curl tight, heavy ones arc gently.
- *
- * Particle types  (q/m_eff tuned for clear visual curvature on a terminal;
- *                  colour is theme-driven — see Themes below)
- *   e⁻  electron   qm = −0.20   tight spiral
- *   e⁺  positron   qm = +0.20   tight spiral, opposite curl to e⁻
- *   μ   muon       qm = −0.07   medium arc
- *   π   pion       qm = +0.045  wide arc
- *   p   proton     qm = +0.022  barely curves
- *
- * Trails are ring buffers drawn with age-faded characters:
- *   O head  * fresh  + medium  . fading
- *
- * Keys
- *   n  burst from centre     e  burst from edge
- *   b/B  field strength      Space  flip field direction
- *   k/K  cycle spawn type    t/T  cycle theme
- *   r  reset                 p  pause                q  quit
- *
- * Parameter-tuning keys (b/B, Space, k/K) auto-respawn a fresh centre
- * burst so the new field strength / direction / spawn type is visible
- * immediately on freshly-launched particles — no manual r needed.
- *
- * HUD: canonical CLAUDE.md two-bar — row 0 right shows live status
- * (field, alive, spawn, theme, paused/running); row rows-1 lists
- * the action keys.
- *
- * Themes (10 palettes; cycle with t / T): Matrix, Fire, Oceanic, Neon,
- * Mono, Ice, Nova, Forest, Desert, Eclipse.  Each theme provides five
- * distinguishable colours, slot-mapped to the five particle types.
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/bubble_chamber.c \
- *       -o bubble_chamber -lncurses -lm
- *
- * §1 config  §2 clock  §3 species/themes/color  §4 physics  §5 scene
- * §6 draw    §7 app
+ * The physics ideas (Lorentz turning, drag, cyclotron radius) and where they
+ * come from are explained in the CONCEPTS block below; the per-particle
+ * settings live in §3 (k_types).
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+/* ── CONCEPTS ── *
  *
- * Algorithm      : Exact rotation integration for charged particle motion [4].
- *                  Instead of Euler-approximating the Lorentz force (which
- *                  introduces spiral drift errors), each step applies an exact
- *                  2D rotation matrix R(ω·dt) to the velocity vector.
- *                  This preserves the orbital radius exactly (no energy drift)
- *                  — a key advantage over naive force integration for circular
- * motion.
+ * Turning the velocity:
+ *   A magnetic field doesn't speed a particle up or slow it down — it just
+ *   bends its path, the way a string bends a ball you swing around. Each
+ *   step we turn the velocity arrow by a small angle (faster for light,
+ *   strongly-charged particles). We do the turn with an exact rotation
+ *   rather than nudging it with a force, so the circle stays a perfect
+ *   circle instead of slowly drifting bigger or smaller over time [4].
  *
- * Physics        : Lorentz force in a uniform B-field perpendicular to the
- *                  screen [1]:
- *                    F = q · v × B  → angular velocity ω = (q/m) · B
- *                  The cyclotron (gyro) radius r = |v| / |ω| = m·|v| / (q·B).
- *                  Higher q/m → tighter curve (electrons), lower → gentle arc
- * (protons).
+ * Drag makes it spiral in:
+ *   As a particle plows through the chamber's liquid it loses a little speed
+ *   every step. Slower speed means a tighter circle, so the path spirals
+ *   inward — the signature look of a real bubble-chamber photo [2][3].
  *
- *                  Ionisation energy loss: |v| multiplied by (1−DRAG) each step
- *                  approximates the Bethe-Bloch slowing of a charged particle
- *                  in a medium [2].  The orbit spirals inward as the particle
- *                  loses energy — exactly the spiral-tightening signature of
- *                  real bubble chamber tracks photographed since Glaser's
- *                  invention of the device [3].
+ * Why these particles curl differently:
+ *   How tightly something curls depends on its charge-to-mass ratio. Light
+ *   electrons curl tightly; heavy protons almost go straight. We use tuned
+ *   ratios (not the real physical ones) so every track is visible at terminal
+ *   scale — details and the radius table are in §3 (k_types) [1][2].
  *
- *                  Particle species (lepton / hadron classifications, q/m
- *                  ratios) follow standard particle-physics texts [2]:
- *                    e⁻ / e⁺ (leptons, tight curl)
- *                    μ       (heavier lepton)
- *                    π       (meson, hadronic)
- *                    p       (baryon, heaviest here → barely curves).
+ * The fading trail:
+ *   Each particle remembers its recent positions and draws them as a trail
+ *   that fades from a bright head to faint dots, so you can read which way it
+ *   was going. This mimics the bubbles a real particle leaves behind [3][5].
  *
- * Math           : Rotation matrix application:
- *                    v_x' = v_x · cos(ω) − v_y · sin(ω)
- *                    v_y' = v_x · sin(ω) + v_y · cos(ω)
- *                  Each particle stores a ring-buffer of TRAIL_LEN=300
- * positions; the head index advances each step, overwriting the oldest.
+ * References:
  *
- * Performance    : STEPS_PER_FRAME=4 sub-steps smooth the curvature at 30fps.
- *                  Cost: O(MAX_PARTICLES × TRAIL_LEN) drawing +
- * O(MAX_PARTICLES) physics.
+ *   [1] Griffiths, D. J. — Introduction to Electrodynamics, 4th ed.,
+ *       Cambridge Univ. Press (2017).  Lorentz force and cyclotron motion;
+ *       the radius formula r = mv / (qB) used to pick the qm values in §3.
  *
- * Rendering      : 10 brightness-safe theme palettes [5] — each maps the
- *                  five particle types to distinguishable colours within
- *                  one theme's mood.  Trail-age glyph ramp (O · * + .)
- *                  fades each track from a bold head to dim ionisation
- *                  history, so the eye reads time-direction along the curl.
+ *   [2] Griffiths, D. J. — Introduction to Elementary Particles, 2nd ed.,
+ *       Wiley-VCH (2008).  The particle families and energy-loss-by-drag
+ *       (Bethe-Bloch) idea behind §3's species and qm values.
  *
- * References (cite inline as [n]):
+ *   [3] Glaser, D. A. (1952) — "Some Effects of Ionizing Radiation on the
+ *       Formation of Bubbles in Liquids", Phys. Rev. 87, 665.  The original
+ *       bubble-chamber paper: charged particles leave visible trails of
+ *       bubbles — what the trail ring buffer imitates.
  *
- *   [1] Griffiths, D. J. — *Introduction to Electrodynamics*, 4th ed.,
- *       Cambridge Univ. Press (2017).  §5.1 Lorentz force; §5.4 cyclotron
- *       motion, gyroradius r = mv / (qB).  Foundational physics for §4
- *       (particle_step).
+ *   [4] Birdsall, C. K. & Langdon, A. B. — Plasma Physics via Computer
+ *       Simulation, IOP / CRC Press (2004).  Why the naive force-nudge drifts
+ *       and the exact-rotation scheme (used in particle_step) keeps energy.
  *
- *   [2] Griffiths, D. J. — *Introduction to Elementary Particles*,
- *       2nd ed., Wiley-VCH (2008).  Lepton / hadron classifications,
- *       q/m ratios, ionisation energy loss (Bethe-Bloch).  Backs the
- *       choice of species and qm values in §3 (k_types).
- *
- *   [3] Glaser, D. A. (1952) — "Some Effects of Ionizing Radiation on
- *       the Formation of Bubbles in Liquids", *Phys. Rev.* 87, 665.
- *       The original bubble-chamber paper (Nobel Prize, 1960).  Explains
- *       why charged particles leave visible tracks: ionisation along
- *       the path nucleates bubbles in a superheated liquid — the visual
- *       analogue our trail ring buffer models.
- *
- *   [4] Birdsall, C. K. & Langdon, A. B. — *Plasma Physics via Computer
- *       Simulation*, IOP / CRC Press (2004).  §4 covers charged-particle
- *       pushers (Boris, Vay, and the exact-rotation scheme we use in
- *       particle_step).  Argues why naive Euler diverges and rotation-
- *       based schemes preserve energy.
- *
- *   [5] Ware, C. — *Information Visualization: Perception for Design*,
- *       4th ed., Morgan Kaufmann (2020).  Perceptually-ordered colour
- *       and luminance ramps (Ch. 4) back the 10 brightness-safe theme
- *       palettes in §3 (g_themes) and the age-faded trail glyph ramp
- *       in §6 (draw_particle).
- * ─────────────────────────────────────────────────────────────────────── */
+ *   [5] Ware, C. — Information Visualization: Perception for Design, 4th ed.,
+ *       Morgan Kaufmann (2020).  How to order colours and brightness so the
+ *       eye reads them easily — behind the themes and the fading trail.
+ * ── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -140,50 +71,42 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 #define MAX_PARTICLES 20
-#define TRAIL_LEN 300 /* ring-buffer length per particle            */
+#define TRAIL_LEN 300 /* how many past positions each trail remembers */
 #define N_TYPES 5
-#define N_THEMES 10 /* MATRIX..ECLIPSE (see g_themes in §3)       */
+#define N_THEMES 10
 
-/* HUD: canonical CLAUDE.md two-bar — top row right = live status,
- * bottom row left = action keys.  Particles draw between them. */
+/* One status line at the top, one key-hint line at the bottom; particles
+ * draw in the rows between. */
 #define HUD_TOP 1
 #define HUD_BOT 1
 
-/* magnetic field */
-#define B_INIT 1.0f /* default field strength                     */
+/* magnetic field — higher strength means tighter curls */
+#define B_INIT 1.0f
 #define B_MIN 0.1f
 #define B_MAX 4.0f
 #define B_STEP 0.1f
 
 /* particle motion */
-#define V_SPAWN                                                                \
-  2.2f /* initial speed in cell/step; at STEPS_PER_FRAME=4,                    \
-        * electron (qm=0.20, B=1.0) cyclotron radius ≈ 11 cells */
-#define V_SPREAD                                                               \
-  0.4f /* ±40% speed variation for visual spread of radii        */
-#define DRAG                                                                   \
-  0.003f /* 0.3% speed loss per step (ionisation); particle covers             \
-          * ~1/0.003 ≈ 333 steps before halving — trails ~1000 px */
-#define SPEED_DEAD                                                             \
-  0.22f /* stop when radius < 1 cell (V/ω < 1); prevents                      \
-         * particles spinning invisibly in a single cell         */
+#define V_SPAWN 2.2f /* starting speed; gives an electron a curl roughly 11 \
+                      * cells wide at the default field strength             */
+#define V_SPREAD 0.4f /* spread the starting speeds ±20% so radii vary       */
+#define DRAG 0.003f   /* speed lost per step; ~330 steps to halve, so trails \
+                       * run about a thousand cells long before fading out   */
+#define SPEED_DEAD 0.22f /* once this slow the curl is under one cell wide — \
+                          * retire the particle so it doesn't spin in place  */
 
-/* spawn */
-#define BURST_MIN 2 /* particles per burst                        */
+/* how many particles a single burst makes */
+#define BURST_MIN 2
 #define BURST_MAX 5
 
-/* timing */
+/* timing — four physics steps per drawn frame, redrawn 30 times a second */
 #define STEPS_PER_FRAME 4
 #define RENDER_NS (1000000000LL / 30)
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static long long clock_ns(void) {
   struct timespec ts;
@@ -197,56 +120,42 @@ static void clock_sleep_ns(long long ns) {
   nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  species / themes / color                                           */
-/* ===================================================================== */
+/* ── §3 species / themes / color ── */
 
 /*
- * PType — descriptor for one particle species (electron, positron, …).
+ * PType — one kind of particle (electron, positron, muon, pion, proton).
  *
- * Why a struct (vs three parallel const arrays):
- *   Each species bundles three coupled descriptors: a human-readable
- *   name, a 2-char HUD symbol, and a charge/mass ratio.  Grouping
- *   under one named type makes "for each species, do X" loops read
- *   naturally (k_types[i].qm, k_types[i].symbol) — no parallel-array
- *   indexing gymnastics.
+ * Each particle type carries three things bundled together so the rest of
+ * the code can say k_types[i].qm and k_types[i].symbol instead of juggling
+ * three separate look-up arrays:
+ *   name    full word shown nowhere on screen, handy for reference
+ *   symbol  the 2-character tag shown in the HUD ("e-", "mu", "p ")
+ *   qm      charge-to-mass ratio — the one number that decides how tightly
+ *           this type curls. Bigger size = tighter curl. Its sign decides
+ *           which way it turns: negative curls clockwise, positive the other
+ *           way (with the default field). Flipping the field reverses both.
  *
- * Why TUNED q/m (not real Standard-Model values):
- *   Real q/m ratios put electrons at cyclotron radius ~10⁻³ cells and
- *   protons at ~1.8 cells given the demo's V_SPAWN / B_INIT.  Most
- *   species would barely curve, or curve so tightly the curl is one
- *   sub-cell wide.  The qm values here are calibrated so each species
- *   lands at a visually useful radius:
+ * The qm values are tuned for the screen, not real physics. Real ratios would
+ * make electrons curl in a speck and protons go almost straight — nothing you
+ * could see. These values keep the same ordering (electrons tightest, protons
+ * loosest) but spread the curls out to readable sizes:
  *
- *      species   qm        r = V_SPAWN / |qm·B|   relative curl
- *      e⁻       −0.200     ≈ 11 cells              tight
- *      e⁺       +0.200     ≈ 11 cells              tight, opposite curl
- *      μ        −0.070     ≈ 31 cells              medium arc
- *      π        +0.045     ≈ 49 cells              wide arc
- *      p        +0.022     ≈ 100 cells             barely curves
+ *      type      qm        curl radius      look
+ *      e-       -0.200     ~11 cells         tight
+ *      e+       +0.200     ~11 cells         tight, turns the other way
+ *      mu       -0.070     ~31 cells         medium arc
+ *      pi       +0.045     ~49 cells         wide arc
+ *      p        +0.022     ~100 cells        barely bends
  *
- *   Ratios between species (e.g. e/μ ≈ 200/70) are preserved on a log
- *   scale even though absolute values are scaled.
- *
- * Sign convention (with B > 0 = field out of the screen, default):
- *     qm < 0  →  clockwise curl
- *     qm > 0  →  counter-clockwise curl
- *   Flipping B (Space key) negates every curl — the visual signature
- *   of charge symmetry / pair production.
- *
- * Why colour is NOT in this struct:
- *   Themes (§3 g_themes) supply per-species colour at runtime so the
- *   same particle list can render under 10 different palettes without
- *   editing PType.  Colour lives orthogonal to the physics descriptors.
- *
- * Algorithm refs (header REFERENCES):
- *   Lorentz force, cyclotron radius mv/(qB)   — Griffiths E&M [1] §5.4
- *   Lepton / hadron taxonomy, real q/m values — Griffiths Elementary [2]
+ * Colour isn't stored here on purpose — it comes from the current theme
+ * (g_themes below), so the same particles can be recoloured without touching
+ * their physics. See [1][2] for the real Lorentz/cyclotron and particle-family
+ * ideas these values are loosely based on.
  */
 typedef struct {
-  const char *name;   /* full display name ("electron")          */
-  const char *symbol; /* 2-char HUD label ("e-", "mu", "p ")     */
-  float qm;           /* tuned charge/mass ratio (see table)     */
+  const char *name;   /* full name, e.g. "electron"              */
+  const char *symbol; /* 2-char HUD tag, e.g. "e-", "mu", "p "   */
+  float qm;           /* charge/mass ratio — sets curl tightness and direction */
 } PType;
 
 static const PType k_types[N_TYPES] = {
@@ -256,13 +165,13 @@ static const PType k_types[N_TYPES] = {
 };
 
 /*
- * Theme — five 256-colour cube indices, slot-mapped to the five
- * particle types (electron, positron, muon, pion, proton).  Each
- * theme provides distinct colours within the theme's mood so the
- * track types are still visually separable.
- *
- * Brightness safety (CLAUDE.md): every entry ≥ 30, or 24-29 / 240-243
- * only used as the dimmest slot.  Forbidden 16-23 / 232-239 avoided.
+ * Theme — one named colour palette: five colours, one per particle type
+ * in the same order as k_types (electron, positron, muon, pion, proton).
+ *   name  what shows in the HUD ("Matrix", "Fire", ...)
+ *   fg    the five colours, as 256-colour codes
+ * Every colour is kept bright enough to stay visible on a dark terminal
+ * (project rule), and the five within a theme stay distinct so you can still
+ * tell the track types apart.
  */
 typedef struct {
   const char *name;
@@ -283,13 +192,13 @@ static const Theme g_themes[N_THEMES] = {
     {"Eclipse", {196, 244, 240, 124, 88}}, /* corona red + grays        */
 };
 
-/* 8-colour fallback — fixed mapping (themes can't add variety here). */
+/* Fixed colours for the few terminals that only have 8 — themes don't apply. */
 static const short g_8fg[N_TYPES] = {COLOR_BLUE, COLOR_RED, COLOR_GREEN,
                                      COLOR_YELLOW, COLOR_CYAN};
 
-/* Color pair layout: 1..N_TYPES are particle types, then HUD + HINT. */
-#define CP_HUD (N_TYPES + 1)  /* top status — bright yellow + bold */
-#define CP_HINT (N_TYPES + 2) /* bottom hint bar — bright cyan + bold */
+/* Colour slots: 1..N_TYPES are the particle types, then the two HUD bars. */
+#define CP_HUD (N_TYPES + 1)
+#define CP_HINT (N_TYPES + 2)
 
 static bool g_256color;
 
@@ -304,8 +213,8 @@ static void color_init(int theme_idx) {
     init_pair(1 + i, fg, -1);
   }
   if (g_256color) {
-    init_pair(CP_HUD, 226, -1); /* bright yellow */
-    init_pair(CP_HINT, 51, -1); /* bright cyan   */
+    init_pair(CP_HUD, 226, -1);
+    init_pair(CP_HINT, 51, -1);
   } else {
     init_pair(CP_HUD, COLOR_YELLOW, -1);
     init_pair(CP_HINT, COLOR_CYAN, -1);
@@ -314,155 +223,100 @@ static void color_init(int theme_idx) {
 
 static inline int particle_cp(int kind) { return 1 + kind; }
 
-/* ===================================================================== */
-/* §4  physics                                                            */
-/* ===================================================================== */
+/* ── §4 physics ── */
 
 /*
- * Particle — one charged-track instance in the chamber.
+ * Particle — one moving track in the chamber, with the fading trail behind it.
  *
- * Why a trail ring buffer (not re-derive the path each frame):
- *   The visual signature of a bubble chamber is the lingering trail of
- *   ionisation bubbles along the path.  Re-deriving the path each
- *   frame would need either a long backward time-integration (expensive)
- *   or a closed-form orbit equation (only valid before drag changes the
- *   speed).  A fixed-size ring buffer of TRAIL_LEN past positions
- *   instead lets us draw the recorded history directly, in O(N) per draw.
+ * Position and velocity (x, y, vx, vy) are kept as floats, in cell units. We
+ * need the in-between fractions because a curl spanning 10–100 cells would look
+ * jagged if we tracked whole cells only; we round to a whole cell just before
+ * drawing.
  *
- * Why a ring buffer (not a growing array):
- *   Bounded memory + O(1) push.  The oldest sample is silently
- *   overwritten when the buffer wraps — the trail naturally has a
- *   maximum age, which matches the visual "ionisation fades" model.
+ * kind picks which row of k_types this particle is (and so how it curls).
+ * alive marks whether the particle is still moving; when it stops, the slot
+ * can be handed to a new particle (see find_dead_slot), but the trail is left
+ * untouched so the old track lingers until that slot is actually reused.
  *
- * Index convention (consumed in §6 draw_particle):
- *   tx[] / ty[]   recorded positions
- *   thead         NEXT write slot — advance after each push
- *   tlen          how many slots are valid (saturates at TRAIL_LEN)
- *
- *   Reading newest-to-oldest at distance i ∈ [0, tlen):
- *     idx = (thead − 1 − i + TRAIL_LEN) mod TRAIL_LEN
- *   Age fraction:
- *     age = i / tlen          (i = 0 newest, i = tlen−1 oldest)
- *
- * Why floats for x/y/vx/vy:
- *   Sub-cell precision is needed for smooth cyclotron orbits at
- *   r ≈ 10–100 cells.  Integer-cell coordinates would quantise the
- *   velocity direction to a handful of steps and the curl would look
- *   stair-stepped.  Quantisation to integer cells happens only at
- *   render time via `(int)(p->x + 0.5f)`.
- *
- * Why an explicit `alive` flag (not implicit via NULL slot):
- *   Slots are reused on respawn via find_dead_slot().  The flag
- *   explicit-marks the logical state; the trail buffer is left intact
- *   so a short-lived particle's track stays visible until overwritten
- *   when the slot is reused.
- *
- * Algorithm refs (header REFERENCES):
- *   Exact rotation integrator     — Birdsall & Langdon [4] §4
- *   Ionisation drag (Bethe-Bloch) — Griffiths Elementary [2]
- *   Bubble-chamber track imaging  — Glaser 1952 [3]
+ * The trail is a fixed-size circular log of recent positions (tx/ty). Rather
+ * than re-computing the whole past path every frame, we just remember the last
+ * TRAIL_LEN spots and draw them. "Circular" means when it fills up, the newest
+ * write lands on top of the oldest spot, so the trail always shows the most
+ * recent stretch and naturally forgets the rest — which is exactly the
+ * fade-out we want.
+ *   thead  where the NEXT position will be written
+ *   tlen   how many spots are filled so far (stops growing at TRAIL_LEN)
+ * §6 walks this newest-first to fade the trail; see [3][4] for the physics.
  */
 typedef struct {
-  /* ── Phase-space state (advanced each step by particle_step) ─── */
-  float x, y;   /* current position, cell-space floats     */
-  float vx, vy; /* current velocity, cells per sim step    */
+  /* where it is and how it's moving (updated every step) */
+  float x, y;   /* position, in cells */
+  float vx, vy; /* velocity, in cells per step */
 
-  /* ── Identity / lifecycle ─────────────────────────────────────── */
-  int kind;   /* index into k_types[] in §3              */
-  bool alive; /* false → slot recyclable by find_dead_slot */
+  /* which kind it is, and whether it's still going */
+  int kind;   /* row in k_types (§3) */
+  bool alive; /* false = this slot can be reused */
 
-  /* ── Trail ring buffer (read newest-to-oldest by §6) ──────────── */
-  float tx[TRAIL_LEN]; /* recorded x-positions, oldest-overwritten */
-  float ty[TRAIL_LEN]; /* recorded y-positions                     */
-  int thead;           /* next write index ∈ [0, TRAIL_LEN)        */
-  int tlen;            /* valid sample count, saturates at TRAIL_LEN */
+  /* the fading trail: a circular log read newest-first by §6 */
+  float tx[TRAIL_LEN]; /* past x positions, oldest gets overwritten */
+  float ty[TRAIL_LEN]; /* past y positions */
+  int thead;           /* next write slot */
+  int tlen;            /* how many slots are filled (caps at TRAIL_LEN) */
 } Particle;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Scene — state that spans physics ticks, draw calls, and the main loop.
+/*
+ * Scene — all the world state in one place: the particles plus the few knobs
+ * the keys turn. There's a single copy of it (g_scene) because the particle
+ * array is large (over a megabyte), so it lives as one file-wide variable
+ * instead of being copied around.
  *
- * The struct splits into two clearly-labelled groups:
+ * The fields are split into two groups on purpose, to keep "what the particles
+ * do" separate from "how they look":
+ *   simulation  things that affect the physics — the particles, the field,
+ *               whether we're paused, and what new bursts spawn as.
+ *   rendering   things that only affect appearance — currently just the theme.
+ *               Changing these never moves a particle.
+ * The rule of thumb when adding a field: if it changes where particles go, it
+ * belongs in the simulation group; if it only changes colour, the rendering
+ * group.
  *
- *   Simulation parameters  — consumed by scene_step and the spawn
- *     helpers.  Anything that affects the PHYSICS (particle state,
- *     field, who-spawns-what) lives here.  Mutated by physics-
- *     affecting keys: b / B (field), Space (flip), k / K (spawn
- *     type), p (pause), r (reset), n / e (bursts).
- *
- *   Rendering parameters   — consumed by scene_draw and the HUD only.
- *     Toggling these while paused must leave particle positions and
- *     velocities byte-identical; only colours may differ.  Mutated by
- *     purely cosmetic keys: t / T (theme).
- *
- * Locality rationale:
- *   The split exists for the READER, not the CPU.  A new flag landing
- *   in the rendering group when it actually steers a particle (or
- *   spawn behaviour) would silently couple display to physics —
- *   exactly the bug the separation prevents.  When adding a field,
- *   ask: does this change what scene_step or the spawn helpers
- *   produce?  If yes, simulation; if no, rendering.
- *
- * Single instance (file-scope `g_scene`):
- *   particles[] dominates the footprint (~1.4 MB at TRAIL_LEN=300,
- *   MAX_PARTICLES=20), so the struct lives in BSS as a file-static
- *   rather than being passed by pointer.  All scene state is accessed
- *   as `g_scene.<field>` from the helpers and the main loop.
- *
- * What stays OUTSIDE this struct (intentionally):
- *   g_quit / g_resize    sig_atomic_t flags read by signal handlers;
- *                        must stay at file scope for async-signal safety.
- *   g_256color           one-shot colour-capability flag set at startup;
- *                        never mutated — no benefit in scene membership.
- *   g_rows / g_cols      screen geometry tracked by the main loop;
- *                        Scene stays geometry-agnostic so resize handling
- *                        is the main loop's concern, not the renderer's.
- * ─────────────────────────────────────────────────────────────────────── */
+ * A few globals deliberately live outside this struct: the quit/resize flags
+ * (they're touched by signal handlers and must stay simple and separate), the
+ * one-time colour-support flag, and the screen size (which the main loop owns
+ * so the scene needn't care about resizing).
+ */
 typedef struct {
-  /* ── Simulation parameters ────────────────────────────────────── */
+  /* simulation — affects the physics */
   Particle particles[MAX_PARTICLES];
-  float B;        /* magnetic-field strength, signed.  Space
-                   * key flips the sign (reverses every curl).
-                   * Magnitude in [B_MIN, B_MAX]; b / B step it. */
-  bool paused;    /* true → scene_step is a no-op (p key)       */
-  int spawn_kind; /* species index for new bursts:
-                   *   −1       = random
-                   *   0..N_TYPES−1 = fixed species.
-                   * Cycled by k / K keys.                       */
+  float B;        /* field strength, with a sign. Space flips the sign (curls
+                   * reverse). Magnitude stays within [B_MIN, B_MAX]; b/B step it. */
+  bool paused;    /* true freezes the simulation (p key) */
+  int spawn_kind; /* what new bursts are: -1 = random, otherwise a fixed type
+                   * (0..N_TYPES-1). The k/K keys cycle it. */
 
-  /* ── Rendering parameters ─────────────────────────────────────── */
-  int theme; /* index into g_themes[] (§3); cycled by t/T.
-              * Pure cosmetic — never alters physics.       */
+  /* rendering — affects only appearance */
+  int theme; /* which palette in g_themes (§3); t/T cycle it. Cosmetic only. */
 } Scene;
 
 static Scene g_scene = {
     .B = B_INIT, .paused = false, .spawn_kind = -1, .theme = 0,
-    /* .particles[] is BSS-zeroed; respawn_centre_burst fills it. */
+    /* particles[] starts all-zero; respawn_centre_burst fills it. */
 };
 
-/* Screen geometry — main-loop bookkeeping, not scene state
- * (see Scene docstring above). */
+/* Current terminal size, owned by the main loop (not part of the scene). */
 static int g_rows, g_cols;
 
 /*
- * Per-step physics helpers — each isolates one operator in the
- * symplectic-Euler-like sequence rotate → drag → drift → record →
- * test-death.  particle_step is then a five-line pseudocode driver.
- *
- * Algorithm refs (header REFERENCES):
- *   Exact rotation for Lorentz force         — Birdsall & Langdon §4 [4]
- *   Bethe-Bloch ionisation drag (approximated) — Griffiths Elem. [2]
- *   Bubble-chamber track imaging             — Glaser 1952 [3]
+ * The work of one physics step is split into small helpers, run in order:
+ * turn the velocity, slow it a touch, move, log the position, then check if
+ * it's too slow to bother with. particle_step just calls them in sequence.
  */
 
 /*
- * rotate_velocity_exact — closed-form 2-D rotation of the velocity:
- *
- *     v' = R(ω) · v,    R = [[cos ω, −sin ω], [sin ω, cos ω]]
- *
- * Exact solution of dv/dt = ω × v for a constant ω = (q/m)·B over one
- * unit time-step.  Unlike Euler (v += (ω × v)·dt), which inflates |v|
- * by O(ω²dt²) each step, this preserves |v| exactly — no energy drift,
- * perfect circular orbits in the absence of drag.
+ * Turn the velocity arrow by a fixed angle, keeping its length exactly the
+ * same. Doing the turn as a true rotation (instead of nudging it with a force)
+ * is what keeps the circle from slowly growing or shrinking over many steps —
+ * a magnetic field bends a path but never changes its speed [4].
  */
 static void rotate_velocity_exact(Particle *p, float omega) {
   float ca = cosf(omega), sa = sinf(omega);
@@ -473,46 +327,21 @@ static void rotate_velocity_exact(Particle *p, float omega) {
 }
 
 /*
- * apply_ionisation_drag — multiplicative speed decay per step.
- *
- *     v ← v · (1 − DRAG)
- *
- * Approximates the Bethe-Bloch dE/dx slowing of a charged particle
- * traversing a medium.  Over many steps the particle decelerates,
- * the cyclotron radius r = |v|/|ω| shrinks, and the orbit spirals
- * inward — the classic bubble-chamber signature.
+ * Shave a tiny bit off the speed each step, as if the particle were rubbing
+ * through the chamber's liquid. Slower speed makes a tighter curl, so over
+ * time the path spirals inward — the look of a real bubble-chamber track [2].
  */
 static void apply_ionisation_drag(Particle *p) {
   p->vx *= (1.f - DRAG);
   p->vy *= (1.f - DRAG);
 }
 
-/*
- * advance_position — symplectic-Euler drift step.
- *
- *     x ← x + v_x        (rotated, dragged velocity from this step)
- *     y ← y + v_y
- *
- * Position is updated with the END-of-step velocity, which makes the
- * pair (rotate, drift) symplectic for constant ω.  Sub-cell precision
- * keeps the curl smooth at r ≈ 10–100 cells.
- */
 static void advance_position(Particle *p) {
   p->x += p->vx;
   p->y += p->vy;
 }
 
-/*
- * record_trail_sample — push the current (x, y) into the ring buffer.
- *
- *   tx[thead] ← x;  ty[thead] ← y
- *   thead     ← (thead + 1) mod TRAIL_LEN
- *   tlen      ← min(tlen + 1, TRAIL_LEN)
- *
- * The oldest sample is silently overwritten when the buffer wraps —
- * the trail therefore has a bounded maximum age, matching the visual
- * "ionisation fades" model.
- */
+/* Append the current spot to the trail; once full it overwrites the oldest. */
 static void record_trail_sample(Particle *p) {
   p->tx[p->thead] = p->x;
   p->ty[p->thead] = p->y;
@@ -522,35 +351,21 @@ static void record_trail_sample(Particle *p) {
 }
 
 /*
- * is_subgyro_dead — has drag slowed the particle below visible radius?
- *
- *     |v| < SPEED_DEAD  ⇒  cyclotron radius r = |v|/|ω| < 1 cell
- *
- * Below this threshold the particle would orbit invisibly inside a
- * single character cell.  Marking it dead lets find_dead_slot recycle
- * the slot for a fresh particle.
+ * True once the particle is so slow its curl would fit inside one character
+ * cell — at that point it'd just spin in place, so we retire it and let its
+ * slot be reused.
  */
 static int is_subgyro_dead(const Particle *p) {
   float spd2 = p->vx * p->vx + p->vy * p->vy;
   return spd2 < SPEED_DEAD * SPEED_DEAD;
 }
 
-/*
- * particle_step — one physics step in the Lorentz + drag system.
- *
- * Pseudocode:
- *   if not alive: return
- *   ω ← k_types[kind].qm · g_scene.B
- *   rotate_velocity_exact(p, ω)     // Lorentz turn (exact)
- *   apply_ionisation_drag(p)        // Bethe-Bloch slowing
- *   advance_position(p)             // kinematic drift
- *   record_trail_sample(p)          // ring-buffer push
- *   if is_subgyro_dead(p): p->alive ← false
- */
+/* One full step for a particle: turn, slow, move, log, then maybe retire. */
 static void particle_step(Particle *p) {
   if (!p->alive)
     return;
 
+  /* turn angle this step: bigger for strongly-charged types and stronger fields */
   float omega = k_types[p->kind].qm * g_scene.B;
   rotate_velocity_exact(p, omega);
   apply_ionisation_drag(p);
@@ -560,19 +375,16 @@ static void particle_step(Particle *p) {
     p->alive = false;
 }
 
-/* ===================================================================== */
-/* §5  scene                                                              */
-/* ===================================================================== */
+/* ── §5 scene ── */
 
 static void scene_reset(void) {
   memset(g_scene.particles, 0, sizeof g_scene.particles);
 }
 
 /*
- * init_particle() — fill one particle slot.
- * cx, cy  : spawn centre (physics col/row coordinates)
- * angle   : initial velocity direction (radians)
- * kind    : particle type (−1 = random)
+ * Set up one particle slot: place it at (cx, cy), launch it in direction
+ * `angle`, as type `kind` (pass -1 to pick a random type). Speed is randomised
+ * a little so a burst fans out into different radii.
  */
 static void init_particle(Particle *p, float cx, float cy, float angle,
                           int kind) {
@@ -588,9 +400,7 @@ static void init_particle(Particle *p, float cx, float cy, float angle,
   p->alive = true;
 }
 
-/*
- * find_dead_slot() — return index of first non-alive particle, or −1 if full.
- */
+/* Find a free particle slot to reuse, or -1 if all are in use. */
 static int find_dead_slot(void) {
   for (int i = 0; i < MAX_PARTICLES; i++)
     if (!g_scene.particles[i].alive)
@@ -598,10 +408,8 @@ static int find_dead_slot(void) {
   return -1;
 }
 
-/*
- * spawn_burst_centre() — n particles from screen centre, random directions.
- * Models a head-on collision vertex.
- */
+/* Spray n particles outward from the middle of the screen, like a collision
+ * happening right in the centre. */
 static void spawn_burst_centre(int n) {
   float cx = (float)g_cols * 0.5f;
   float cy = (float)(g_rows - HUD_TOP - HUD_BOT) * 0.5f;
@@ -617,17 +425,10 @@ static void spawn_burst_centre(int n) {
 }
 
 /*
- * edge_entry_geometry — uniformly-random point on a chosen screen edge
- * plus the inward-pointing base velocity angle for that edge.
- *
- *     edge 0 (top)    : cx = U(0,W); cy = 0;     base_angle = +π/2 (down)
- *     edge 1 (bottom) : cx = U(0,W); cy = H−1;   base_angle = −π/2 (up)
- *     edge 2 (left)   : cx = 0;     cy = U(0,H); base_angle =  0   (right)
- *     edge 3 (right)  : cx = W−1;   cy = U(0,H); base_angle =  π   (left)
- *
- * H is the particle-area height (excludes the HUD top/bottom rows).
- * Used by spawn_burst_edge to model a beam entering the chamber from
- * an arbitrary side.
+ * Pick a random spot along one of the four screen edges, and the direction a
+ * particle should head to travel inward from there (down from the top, up from
+ * the bottom, and so on). H is the height of the particle area, not counting
+ * the HUD rows. Used by spawn_burst_edge to make particles enter from a side.
  */
 static void edge_entry_geometry(int edge, float W, float H, float *cx,
                                 float *cy, float *base_angle) {
@@ -657,12 +458,8 @@ static void edge_entry_geometry(int edge, float W, float H, float *cx,
 }
 
 /*
- * inward_velocity_angle — perturb base_angle by ±half_spread (radians).
- *
- *   angle = base_angle + U(−1, 1) · half_spread
- *
- * Models a beam with finite angular dispersion: every spawned particle
- * is launched inward along the edge normal plus a small random spread.
+ * Nudge the inward direction by a small random amount, so a burst fans out a
+ * little instead of every particle flying in along the exact same line.
  */
 static float inward_velocity_angle(float base_angle, float half_spread) {
   float u = (float)rand() / (float)RAND_MAX;
@@ -670,17 +467,8 @@ static float inward_velocity_angle(float base_angle, float half_spread) {
 }
 
 /*
- * spawn_burst_edge — n particles entering from a random screen edge,
- * velocity directed inward ± 30°.  Models a beam crashing into the
- * chamber from outside.
- *
- * Pseudocode:
- *   edge ← rand mod 4
- *   edge_entry_geometry(edge, W, H) → (cx, cy, base_angle)
- *   k ← g_scene.spawn_kind            (−1 = random species per particle)
- *   for i in [0, n):
- *       angle ← inward_velocity_angle(base_angle, ±30°)
- *       init_particle at (cx, cy) with angle and kind k
+ * Send n particles in from a random screen edge, each aimed inward with a
+ * little spread — like a beam crashing into the chamber from outside.
  */
 static void spawn_burst_edge(int n) {
   int edge = rand() % 4; /* 0=top 1=bottom 2=left 3=right */
@@ -690,7 +478,7 @@ static void spawn_burst_edge(int n) {
   float cx, cy, base_angle;
   edge_entry_geometry(edge, W, H, &cx, &cy, &base_angle);
 
-  int k = g_scene.spawn_kind; /* −1 propagates to init_particle as random */
+  int k = g_scene.spawn_kind; /* -1 means let each particle pick a random type */
   for (int i = 0; i < n; i++) {
     int slot = find_dead_slot();
     if (slot < 0)
@@ -706,12 +494,10 @@ static void scene_step(void) {
 }
 
 /*
- * respawn_centre_burst — clear the chamber and spawn a fresh centre burst.
- *
- * Used by 'r' (explicit reset) and by parameter-change keys (b/B/space/
- * k/K) so the user sees the new parameter's effect immediately on fresh
- * particles rather than having to wait for the existing ones (which
- * already locked in their trail/cyclotron-radius before the change).
+ * Wipe the chamber and start a fresh burst from the centre. The reset key and
+ * the parameter keys (field strength, flip, type) call this so you see the new
+ * setting take effect right away on new particles — the ones already flying
+ * locked in their curl before the change and wouldn't show it.
  */
 static void respawn_centre_burst(void) {
   scene_reset();
@@ -727,29 +513,22 @@ static int alive_count(void) {
   return n;
 }
 
-/* ===================================================================== */
-/* §6  draw                                                               */
-/* ===================================================================== */
+/* ── §6 draw ── */
 
 /*
- * Trail-rendering helpers — pick the glyph for each age slice, project
- * ring-buffer samples to screen coordinates, and paint the trail and
- * live head.  draw_particle is then the four-line dispatcher.
- *
- * Algorithm ref: perceptual age-fade glyph ramp — Ware [5].
+ * The trail is drawn oldest-to-newest in a few brightness bands. These small
+ * helpers pick the character for a given age, turn a remembered position into
+ * a screen spot, and paint the trail and the bright head; draw_particle ties
+ * them together. The fade idea — bright fresh, fainter as it ages — follows
+ * Ware [5].
  */
 
 /*
- * trail_age_glyph — choose glyph + extra attribute from age ∈ [0, 1].
- *
- *   age < 0.25 :  '*' bold      — bright fresh ionisation
- *   age < 0.55 :  '+' normal    — settled trail
- *   age < 0.80 :  '.' normal    — fading ionisation
- *   age ≥ 0.80 :  return 0      — too old, skip (saves the inner loop)
- *
- * The four bands approximate an exponential brightness decay using the
- * available ASCII density and bold flag — coarse but readable on a
- * low-resolution terminal.
+ * Pick the character and boldness for a trail dot, given how old it is (0 =
+ * just laid down, 1 = oldest we keep). Fresh dots are a bold '*', middle-aged
+ * ones a plain '+', old ones a faint '.', and anything past 0.8 we skip — that
+ * lets the caller stop early since dots only get older from there. Just three
+ * coarse bands, but they read as a clean bright-to-faint fade on a terminal.
  */
 static int trail_age_glyph(float age, chtype *ch, attr_t *extra_attr) {
   if (age >= 0.80f)
@@ -768,15 +547,10 @@ static int trail_age_glyph(float age, chtype *ch, attr_t *extra_attr) {
 }
 
 /*
- * trail_sample_to_screen — ring-buffer sample i (newest = 0) → screen
- * (col, row), accounting for the HUD top-row offset.
- *
- *   idx = (thead − 1 − i + TRAIL_LEN · 2) mod TRAIL_LEN
- *   col = round(tx[idx])
- *   row = round(ty[idx]) + HUD_TOP
- *
- * Returns 1 if on-screen (caller draws), 0 if outside the visible draw
- * area (caller skips).
+ * Turn the i-th remembered position (i = 0 is the newest) into a screen
+ * column and row, nudging down by one for the top status line. Returns 1 if
+ * that spot is on screen so the caller draws it, 0 if it's off the edge so the
+ * caller skips it.
  */
 static int trail_sample_to_screen(const Particle *p, int i, int draw_rows,
                                   int *col, int *row) {
@@ -787,10 +561,9 @@ static int trail_sample_to_screen(const Particle *p, int i, int draw_rows,
 }
 
 /*
- * paint_trail_history — render every age-eligible ring-buffer sample
- * in the particle's colour, newest-to-oldest.  Breaks out of the loop
- * as soon as trail_age_glyph rejects an age (samples are sorted by
- * age, so all remaining ones are older).
+ * Draw the whole trail in the particle's colour, newest dot first. We stop the
+ * moment a dot is too old to draw — since they only get older after that,
+ * there's no point checking the rest.
  */
 static void paint_trail_history(const Particle *p, int draw_rows, int cp) {
   int denom = p->tlen > 1 ? p->tlen : 1;
@@ -813,9 +586,8 @@ static void paint_trail_history(const Particle *p, int draw_rows, int cp) {
 }
 
 /*
- * paint_live_head — render the live particle as a bold 'O' at its
- * current sub-cell position (snapped to nearest cell), one cell ahead
- * of the freshest trail sample.
+ * Draw the particle itself as a bright 'O' at its current spot — the bright
+ * head leading the fading trail.
  */
 static void paint_live_head(const Particle *p, int draw_rows, int cp) {
   int col = (int)(p->x + 0.5f);
@@ -827,15 +599,7 @@ static void paint_live_head(const Particle *p, int draw_rows, int cp) {
   attroff(COLOR_PAIR(cp) | A_BOLD);
 }
 
-/*
- * draw_particle — render one particle (trail + live head).
- *
- * Pseudocode:
- *   if dead and trail empty: return
- *   cp ← particle_cp(p->kind)
- *   paint_trail_history(p, draw_rows, cp)
- *   if alive: paint_live_head(p, draw_rows, cp)
- */
+/* Draw one particle: its fading trail, plus the bright head if it's alive. */
 static void draw_particle(const Particle *p, int draw_rows) {
   if (!p->alive && p->tlen == 0)
     return;
@@ -847,31 +611,24 @@ static void draw_particle(const Particle *p, int draw_rows) {
 }
 
 /*
- * HUD-top helpers — three formatters for the right-aligned status row,
- * one painter for the spawn-type bracket that does the in-place colour
- * swap, and a dispatcher.  Layout:
+ * The top status line is built in three pieces so its middle "[type]" tag can
+ * be coloured to match the particle it names — a tiny legend. The rest of the
+ * line stays bright yellow, so the bar reads as one yellow stripe broken only
+ * by that coloured tag. Layout:
  *
  *   " B=N.NN[(flipped)]  alive=K/M  spawn=[X]  theme:NAME  STATE "
- *   |_______ before _______________________| |_tag_| |__ after _|
+ *   |________ prefix ______________________| |_tag_| |__ suffix _|
  *
- * The middle segment is recoloured with the particle's own pair so the
- * tag doubles as a colour legend.  CP_HUD wraps before/after so the bar
- * reads as a single bright-yellow line broken only by the tag.
- *
- * Algorithm ref: perceptual-cue colour use — Ware [5].
+ * Colour-as-legend idea from Ware [5].
  */
 
-/*
- * format_hud_status_prefix — left segment: field, alive count, "spawn=".
- */
+/* Left piece: field strength, how many are alive, and "spawn=". */
 static void format_hud_status_prefix(char *buf, size_t n) {
   snprintf(buf, n, " B=%.2f%s  alive=%d/%d  spawn=", (double)fabsf(g_scene.B),
            g_scene.B < 0 ? "(flipped)" : "", alive_count(), MAX_PARTICLES);
 }
 
-/*
- * format_hud_spawn_tag — middle segment: "[rand]" or "[sym]".
- */
+/* Middle piece: "[rand]", or the type tag like "[e-]" when a type is pinned. */
 static void format_hud_spawn_tag(char *buf, size_t n) {
   if (g_scene.spawn_kind < 0)
     snprintf(buf, n, "[rand]");
@@ -879,22 +636,17 @@ static void format_hud_spawn_tag(char *buf, size_t n) {
     snprintf(buf, n, "[%s]", k_types[g_scene.spawn_kind].symbol);
 }
 
-/*
- * format_hud_status_suffix — right segment: theme + pause/run state.
- */
+/* Right piece: current theme name and whether we're paused or running. */
 static void format_hud_status_suffix(char *buf, size_t n) {
   snprintf(buf, n, "  theme:%s  %s ", g_themes[g_scene.theme % N_THEMES].name,
            g_scene.paused ? "PAUSED" : "running");
 }
 
 /*
- * paint_spawn_tag_with_particle_colour — write the spawn-type tag at
- * the current cursor with the particle's own colour as a legend cue.
- *
- * Caller must already have CP_HUD + A_BOLD active.  This swap-pair-
- * swap-back leaves the surrounding HUD attribute intact so before/
- * after continue to read as a single yellow line.  Random-species
- * spawns (spawn_kind = −1) fall through to plain HUD styling.
+ * Print the spawn-type tag in that type's own colour, then switch back to the
+ * yellow HUD colour so the rest of the line is unaffected. The caller has the
+ * yellow style on already; we only borrow it for the tag. Random spawns have
+ * no single type, so they just print in plain yellow.
  */
 static void paint_spawn_tag_with_particle_colour(const char *tag) {
   if (g_scene.spawn_kind < 0) {
@@ -909,19 +661,7 @@ static void paint_spawn_tag_with_particle_colour(const char *tag) {
   attron(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
-/*
- * draw_hud_top — row 0 right-aligned live status (CP_HUD bright yellow + bold).
- *
- * Pseudocode:
- *   format prefix, spawn_tag, suffix into local buffers
- *   col ← g_cols − (len_prefix + len_tag + len_suffix)
- *   move to (0, col)
- *   attron CP_HUD + bold
- *     write prefix
- *     paint_spawn_tag_with_particle_colour(tag)   // in-place colour swap
- *     write suffix
- *   attroff
- */
+/* Draw the status line, right-aligned along the top row in bright yellow. */
 static void draw_hud_top(void) {
   char before[80], spawn_tag[16], after[64];
   format_hud_status_prefix(before, sizeof before);
@@ -942,9 +682,8 @@ static void draw_hud_top(void) {
 }
 
 /*
- * draw_hud_bottom — row rows-1 left-aligned action keys (CP_HINT bright cyan +
- * bold). Short fallback fires when the terminal is too narrow for the full
- * list.
+ * Draw the key-hint line along the bottom row. Falls back to a shorter list
+ * when the terminal is too narrow to fit the full one.
  */
 static void draw_hud_bottom(void) {
   const char *hint_full =
@@ -962,8 +701,8 @@ static void draw_hud_bottom(void) {
 }
 
 static void scene_draw(void) {
-  /* Particle draw area: between top status (row 0) and bottom hint
-   * (row rows-1).  draw_rows is the exclusive upper bound. */
+  /* Particles fill the rows between the top status line and the bottom hint
+   * line; draw_rows is the first row past the area, where we stop. */
   int draw_rows = g_rows - HUD_BOT;
 
   for (int i = 0; i < MAX_PARTICLES; i++)
@@ -973,9 +712,7 @@ static void scene_draw(void) {
   draw_hud_bottom();
 }
 
-/* ===================================================================== */
-/* §7  app                                                                */
-/* ===================================================================== */
+/* ── §7 app ── */
 
 static volatile sig_atomic_t g_quit = 0;
 static volatile sig_atomic_t g_resize = 0;

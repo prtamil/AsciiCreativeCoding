@@ -1,147 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * cloth.c — Spring-Mass Cloth Simulation
+ * cloth.c — a hanging sheet of cloth, simulated as a grid of little weights
+ * joined by springs.  Gravity pulls it down, wind pushes it sideways, and the
+ * springs fight to keep their shape; every thread is coloured by how hard it's
+ * being stretched, so you watch tension ripple through the fabric.  Ten preset
+ * setups (flag, sail, hammock, ...) change which corners are pinned and how the
+ * wind blows; 14 colour themes cycle with t/T.
  *
- * Grid of point masses connected by structural, shear, and bend springs.
- * Integrated with symplectic Euler; spring forces computed explicitly
- * (Hooke's law + relative-velocity damping).  Ten presets vary pin
- * topology and wind mode (sin / const / gust / none).  Edges are
- * coloured by strain so the fabric reads as a live tension map; 14
- * themes cycle with t/T.
- *
- * Framework: follows framework.c §1–§8 skeleton.
- *
- * PHYSICS SUMMARY
- * ─────────────────────────────────────────────────────────────────────
- * Explicit spring force between nodes a, b:
- *   d = b.pos − a.pos
- *   dist = |d|
- *   stretch = dist − rest_len
- *   v_rel = dot(b.vel − a.vel, d̂)          (relative velocity along spring)
- *   F_mag = k * stretch + kd * v_rel
- *   F = F_mag * d̂                            (force on a; −F on b)
- *
- * Symplectic Euler integration (per node):
- *   vel += accel * dt
- *   vel *= DAMP                              (global velocity damping)
- *   pos += vel * dt
- *
- * Spring types:
- *   structural — adjacent nodes (H and V)
- *   shear      — diagonal neighbours
- *   bend       — next-nearest (skip 1 node)
- *
- * Physics in pixel space; only scene_draw calls px_to_cell.
- *
- * Cell spacing:
- *   REST_H = CELL_W × NODE_GAP   (horizontal spacing in pixels)
- *   REST_V = CELL_H × NODE_GAP   (vertical spacing in pixels)
- *
- * Ten presets (preset 0 boots first):
- *   0  Hanging Cloth  — full top row pinned, sin wind
- *   1  Flag           — left column pinned, constant rightward wind
- *   2  Hammock        — top corners only, sin gusts
- *   3  Curtain        — sparse top pins (every 4 cols), pleats
- *   4  Banner         — single top-left pin, strong constant wind
- *   5  Tapestry       — top + bottom rows pinned, gusty middle
- *   6  Tablecloth     — single centre-top pin, radial drape
- *   7  Sail           — 3 corners pinned (TL, TR, BR), constant leftward wind
- *   8  Trampoline     — all 4 corners pinned, wind off — gravity dish
- *   9  Sash           — diagonal corners (TL + BR), twisted drape
- *
- * Keys:
- *   q / ESC   quit
- *   space     pause / resume
- *   r         restart current preset
- *   n / p     next / previous preset
- *   t / T     next / previous theme
- *   w         toggle wind on / off
- *   + / -     wind strength up / down (10 px/s² per press, range 0..150)
- *   ] / [     sim Hz up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra cloth.c -o cloth -lncurses -lm
+ * The classic recipe for this is Provot 1995, "Deformation Constraints in a
+ * Mass-Spring Model to Describe Rigid Cloth Behaviour" (Graphics Interface
+ * '95) — it's where the three spring kinds (structural / shear / bend) come
+ * from.  physics/chain.c is a sibling demo that solves the same problem a
+ * different way (position-based dynamics instead of forces).
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Explicit spring-mass simulation with symplectic Euler.
- *                  "Symplectic" means velocity is updated before position:
- *                    vel_new = vel + F/m · dt  (update velocity first)
- *                    pos_new = pos + vel_new · dt  (use new velocity)
- *                  This preserves the Hamiltonian structure — no long-term
- *                  energy drift (unlike pure explicit Euler where energy
- *                  grows unboundedly without damping).
- *
- * Physics        : Hooke's law spring force + relative-velocity damping.
- *                  Three spring types build in the mechanical response:
- *                  - Structural: resists stretching/compression (strong)
- *                  - Shear:      resists diagonal deformation (medium)
- *                  - Bend:       resists out-of-plane bending (weak)
- *                  Without bend springs, cloth wrinkles freely; with strong
- *                  bend springs it becomes stiff fabric.
- *
- * Stability      : Symplectic Euler stability bound: k·dt² < 2.
- *                  At sub-step dt ≈ 2 ms, max k ≈ 462000 px/s² — all
- *                  spring constants are far below this limit.
- *
- * Wind models    : Five WindModes — sin, const_R, const_L, gust, none.
- *                  All collapse to a single scalar wind_dir applied
- *                  uniformly across the cloth (wind_dir_from_mode), then
- *                  scaled by wind_strength and a y-amplitude curve
- *                  (scalar_wind_force).  The y-curve makes the bottom
- *                  of the cloth bilge harder than the pinned region.
- *
- * Rendering      : Strain-based colour — every horizontal / vertical edge
- *                  takes a colour tier (CP_ROW_0..3) chosen by its current
- *                  stretch ratio (strain_tier).  Each theme's ramp goes
- *                  cool/dim → hot/bright, so taut springs always glow
- *                  brighter and the cloth reads as a live tension map:
- *                  load travels through the fabric as visible waves of
- *                  colour.  Segments are rasterised by DDA (Bresenham-
- *                  style); glyph picked from slope (-, |, /, \).
- *                  Free-node markers are intentionally NOT drawn — only
- *                  pinned anchors render — so the eye reads "fabric"
- *                  instead of "graph paper grid".
- *
- * Performance    : SUB_STEPS=8 divides each frame into 8 mini-steps.
- *                  Cost: O(N_SPRINGS) per sub-step = O(CLOTH_W×CLOTH_H×6)
- *                  per frame.  At 30×18 nodes ≈ 3240 spring force evals/frame.
- *
- * References     :
- *   • Provot, X. (1995) "Deformation Constraints in a Mass-Spring Model
- *     to Describe Rigid Cloth Behaviour", Graphics Interface '95.
- *     — The foundational mass-spring cloth paper.  Introduces the exact
- *       structural / shear / bend spring triad used here.  Start here.
- *
- *   • Baraff, D. & Witkin, A. (1998) "Large Steps in Cloth Simulation",
- *     SIGGRAPH '98.
- *     — The canonical cloth paper.  We use symplectic Euler instead of
- *       their implicit method, but the framework, terminology, and
- *       trade-offs are everyone's starting vocabulary.
- *
- *   • Witkin, A. & Baraff, D. (1997) "Physically Based Modeling:
- *     Principles and Practice", SIGGRAPH Course Notes.
- *     — The clearest pedagogical introduction to particle systems,
- *       constraints, and integration.  Read alongside Baraff-Witkin '98.
- *
- *   • Müller, M., Heidelberger, B., Hennix, M., Ratcliff, J. (2007)
- *     "Position Based Dynamics", J. Visual Communication & Image
- *     Representation, 18(2), 109-118.
- *     — Alternative formulation that bypasses forces entirely.  Useful
- *       for understanding why force-based integration is the harder
- *       road, and to cross-reference physics/chain.c which uses PBD.
- *
- *   • Hairer, E., Lubich, C. & Wanner, G. (2006) "Geometric Numerical
- *     Integration: Structure-Preserving Algorithms for ODEs", Springer.
- *     — Why symplectic / semi-implicit Euler preserves energy.  The
- *       reference for understanding the integrator we picked.
- *
- *   • Bresenham, J. E. (1965) "Algorithm for computer control of a
- *     digital plotter", IBM Systems Journal, 4(1), 25-30.
- *     — Original digital line drawing.  The DDA segment rasteriser in
- *       draw_segment is a descendant.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -159,9 +30,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
   SIM_FPS_MIN = 10,
@@ -170,72 +39,65 @@ enum {
   SIM_FPS_STEP = 10,
   FPS_UPDATE_MS = 500,
 
-  CLOTH_W = 30,  /* nodes horizontally                        */
-  CLOTH_H = 18,  /* nodes vertically                          */
-  NODE_GAP = 2,  /* terminal cells between adjacent nodes     */
-  SUB_STEPS = 8, /* physics sub-steps per sim tick            */
+  CLOTH_W = 30,  /* how many weights across the sheet         */
+  CLOTH_H = 18,  /* how many weights down the sheet           */
+  NODE_GAP = 2,  /* terminal cells between neighbouring weights */
+  SUB_STEPS = 8, /* split each physics tick into this many tiny steps */
   N_PRESETS = 10,
-  N_THEMES = 14, /* MATRIX..ECLIPSE + AMBER..VIOLET unicolor  */
+  N_THEMES = 14,
 
-  WIND_MIN = 0,   /* px/s² — wind force cap, lower bound       */
-  WIND_MAX = 150, /* px/s² — wind force cap, upper bound       */
-  WIND_STEP = 10, /* px/s² — increment per +/- key press       */
+  WIND_MIN = 0,   /* px/s² — weakest wind we allow             */
+  WIND_MAX = 150, /* px/s² — strongest wind we allow           */
+  WIND_STEP = 10, /* px/s² — how much +/- changes wind by      */
 };
 
 #define CLOTH_N (CLOTH_W * CLOTH_H)
 
-/* Spring counts (upper bounds) */
+/* Each weight links to at most 6 springs (right/down × 3 spring kinds), so
+ * this is a safe upper bound on how many springs we'll ever build.        */
 #define MAX_SPRINGS (CLOTH_W * CLOTH_H * 6)
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* Pixel cell dimensions */
+/* Physics runs in "pixels", with each terminal cell worth CELL_W × CELL_H of
+ * them, so motion stays smooth even though the screen is coarse.          */
 #define CELL_W 8
 #define CELL_H 16
 
-/* Node pixel spacing */
-#define REST_H (CELL_W * NODE_GAP) /* horizontal rest length (px) */
-#define REST_V (CELL_H * NODE_GAP) /* vertical rest length (px)   */
+/* How far apart neighbouring weights sit when the cloth is relaxed (pixels). */
+#define REST_H (CELL_W * NODE_GAP)
+#define REST_V (CELL_H * NODE_GAP)
 
-/* GRAVITY: downward acceleration in pixel space (px/s²).
- * Lower than chain.c (380) because cloth has many nodes resisting the
- * fall — too high a value causes the top-row springs to overshoot
- * violently before damping.  200 gives natural drape.                     */
+/* How hard gravity pulls everything down (px/s²).  Gentler than chain.c's 380
+ * — the cloth has many weights sharing the load, so a big value makes the top
+ * springs snap and overshoot before damping calms them.  200 drapes nicely.  */
 #define GRAVITY 200.0f
 
-/* WIND_FREQ: sinusoidal wind oscillation rate (Hz).
- * 0.40 Hz ≈ 2.5 s per cycle — slow enough to produce cloth flutter
- * rather than rapid shaking.  Combine with preset wind strengths for
- * different feel per preset.                                               */
+/* How fast the swaying wind oscillates (cycles per second).  0.40 Hz is one
+ * gentle swing every ~2.5 s — a flutter, not a shake.                      */
 #define WIND_FREQ 0.40f
 
-/*
- * DAMP — velocity retention per sub-step.
- * SUB_STEPS=8 at 60 Hz → 480 sub-steps/s.
- * 0.9993^480 ≈ 0.718 → cloth settles in a few seconds.
- */
-#define DAMP 0.9993f /* velocity retention per sub-step          */
+/* How much speed each tiny step keeps (the rest leaks away as drag).  Just shy
+ * of 1, so motion barely loses energy per step but the cloth still settles
+ * after a few seconds of accumulated steps.                                */
+#define DAMP 0.9993f
 
-/*
- * Spring stiffness and damping per type.
- * k  (px/s² per px) — restoring force per unit extension
- * kd (s⁻¹)          — damping proportional to relative velocity along spring
- *
- * Stability check (symplectic Euler):  k * dt² < 2
- * dt = 1/(60*8) ≈ 0.00208 s → k < 2/dt² ≈ 462 000.  All values well inside.
- */
-#define K_STRUCT 400.0f /* structural spring stiffness                 */
-#define K_SHEAR 100.0f  /* shear spring stiffness                      */
-#define K_BEND 40.0f    /* bend spring stiffness                       */
-#define KD_STRUCT 4.0f  /* structural spring damping                   */
-#define KD_SHEAR 2.0f   /* shear spring damping                        */
-#define KD_BEND 0.5f    /* bend spring damping                         */
+/* The three kinds of spring, ordered stiffest to softest.  K is how hard a
+ * spring pulls back per pixel of stretch; KD is how strongly it resists being
+ * stretched/squashed *quickly* (it eats the bouncy oscillation energy).
+ * Structural springs hold the weave; shear ones stop diagonal skew; bend ones
+ * keep the sheet from creasing.  All are far below the value that would make
+ * the simulation explode.                                                  */
+#define K_STRUCT 400.0f
+#define K_SHEAR 100.0f
+#define K_BEND 40.0f
+#define KD_STRUCT 4.0f
+#define KD_SHEAR 2.0f
+#define KD_BEND 0.5f
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -253,19 +115,13 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color — themes + HUD chrome                                        */
-/* ===================================================================== */
+/* ── §3 color — themes + HUD chrome ── */
 
 /*
- * Color pair layout:
- *   1..4  CP_ROW_0..3 — cloth row gradient, top → bottom
- *   5     CP_PIN      — pinned anchor nodes (bright highlight)
- *   6     CP_HUD      — top status bar (bright yellow + bold)
- *   7     CP_HINT     — bottom action bar (bright cyan + bold)
- *
- * CP_HUD / CP_HINT are NOT theme-driven — fixed across all palettes so
- * the HUD stays legible against any cloth color scheme.
+ * The colour slots we use.  The four ROW colours form a gradient from slack
+ * threads to taut ones; PIN highlights the points holding the cloth up; the
+ * two HUD slots are deliberately fixed (not theme-driven) so the status text
+ * stays readable no matter which cloth palette is on screen.
  */
 enum {
   CP_ROW_0 = 1,
@@ -278,19 +134,19 @@ enum {
 };
 
 /*
- * Theme — four-tier row ramp (top→bottom) plus pin highlight.
+ * Theme — one named colour scheme for the cloth.
  *
- * ramp[0] colours the top row of the cloth; ramp[3] colours the bottom.
- * Direction is theme-dependent: cool→warm (Matrix, Fire) or dark→bright
- * (Mono, Amber).  Each theme keeps a consistent visual gradient.
+ *   name  — what the t/T menu shows.
+ *   ramp  — four colours laid along the strain gradient, ramp[0] for the
+ *           slackest threads up to ramp[3] for the tautest.  Each theme
+ *           keeps a consistent feel (some cool→warm, some dark→bright).
+ *   pin   — a bright accent for the anchor points holding the cloth up.
  *
- * Brightness safety (CLAUDE.md): every entry sits at index ≥ 30, or
- * 24-29 / 240-243 only as the lowest ramp tier.  16-23 / 232-239 are
- * forbidden — they vanish on default-background terminals.
- *
- * The last four entries (Amber, Crimson, Azure, Violet) are *unicolor*:
- * a single hue ramped through four luminance steps.  These give the
- * cloth a classic phosphor-CRT feel without any rainbow.
+ * Colours are kept in the bright half of the 256-colour space on purpose;
+ * the very dark indices vanish against a black terminal background (see
+ * CLAUDE.md's brightness rule).  The last four entries are single-hue
+ * "unicolor" themes — one colour ramped from dim to bright — for a classic
+ * glowing-CRT look without any rainbow.
  */
 typedef struct {
   const char *name;
@@ -310,7 +166,7 @@ static const Theme k_themes[N_THEMES] = {
     {"Forest", {58, 100, 142, 190}, 226},   /* leaves/bark   */
     {"Desert", {130, 178, 214, 220}, 226},  /* sand/gold     */
     {"Eclipse", {240, 244, 124, 196}, 226}, /* gray + red    */
-    /* ── unicolor themes (single hue, four luminance tiers) ─────────────── */
+    /* ── single-hue themes (one colour from dim to bright) ── */
     {"Amber", {130, 172, 214, 220}, 226},  /* CRT amber     */
     {"Crimson", {88, 124, 160, 196}, 231}, /* deep red      */
     {"Azure", {25, 32, 39, 45}, 195},      /* solid blue    */
@@ -325,11 +181,11 @@ static void theme_apply(int t) {
     init_pair(CP_ROW_2, th->ramp[2], -1);
     init_pair(CP_ROW_3, th->ramp[3], -1);
     init_pair(CP_PIN, th->pin, -1);
-    /* Fixed chrome — same on every theme so the HUD stays legible. */
+    /* Status bars are the same on every theme so they stay readable. */
     init_pair(CP_HUD, 226, -1); /* bright yellow */
     init_pair(CP_HINT, 51, -1); /* bright cyan   */
   } else {
-    /* 8-colour fallback — theme-independent. */
+    /* On terminals with only 8 colours, fall back to fixed picks. */
     init_pair(CP_ROW_0, COLOR_CYAN, -1);
     init_pair(CP_ROW_1, COLOR_GREEN, -1);
     init_pair(CP_ROW_2, COLOR_YELLOW, -1);
@@ -346,9 +202,7 @@ static void color_init(void) {
   theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  coords — pixel ↔ cell                                              */
-/* ===================================================================== */
+/* ── §4 coords — pixel ↔ cell ── */
 
 static inline int px_to_cell_x(float px) {
   return (int)floorf(px / (float)CELL_W + 0.5f);
@@ -357,126 +211,83 @@ static inline int px_to_cell_y(float py) {
   return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
-/* ===================================================================== */
-/* §5  entity — Node, Spring, Cloth                                       */
-/* ===================================================================== */
-
-/* ─────────────────────────────────────────────────────────────────────
- * Node — one point mass in the cloth grid.
- *
- * The cloth is a Lagrangian particle system: the continuous fabric is
- * sampled at a fixed CLOTH_W × CLOTH_H grid of points, and each Node is
- * one such sample.  Between nodes, springs (next struct) interpolate
- * the elastic response — there is no continuum field, no FEM mesh.
- *
- * Each Node carries three SEMANTICALLY DIFFERENT groups of state.  They
- * are grouped here by *access pattern* (who reads, who writes, when),
- * because that's what governs cache locality and correctness of the
- * lerp-on-render trick:
- *
- *   simulation state    : x, y, vx, vy
- *       Read AND written every physics sub-step in cloth_step.  Pixel
- *       coordinates (origin top-left, +y = down to match ncurses).
- *
- *   render snapshot     : rx, ry
- *       Written ONCE per physics tick (in cloth_tick, before the sub-
- *       step loop).  Read every render frame by cloth_draw, which lerps
- *       between (rx,ry) and (x,y) with alpha = sim_accum / TICK_NS to
- *       hide sub-tick discreteness.  Without rx/ry the render snaps to
- *       the latest sub-step and you can see the 8-step granularity.
- *
- *   topology            : pinned
- *       Set ONCE at preset init, never changed during a run.  A pinned
- *       node is a Dirichlet boundary condition — cloth_step skips
- *       integration for it entirely, so the preset's chosen pin pattern
- *       *is* the cloth's boundary condition.
- *
- * Reference: Provot 1995 §2 (mass-spring discretisation of cloth)
- *           Baraff & Witkin 1998 §3 (continuum → particle system)
- * ───────────────────────────────────────────────────────────────────── */
-typedef struct {
-  /* ─ simulation state (hot path — read+write every sub-step) ─ */
-  float x, y;   /* position in pixel space, +y = down              */
-  float vx, vy; /* velocity in px/s                                */
-
-  /* ─ render interpolation snapshot (written 1×/tick, read N×/frame) ─ */
-  float rx, ry; /* position at start of the latest physics tick.
-                   cloth_draw lerps (rx,ry)→(x,y) with sub-tick
-                   alpha so render motion stays smooth between
-                   SUB_STEPS=8 physics updates per tick.            */
-
-  /* ─ topology (write 1× at preset init, read every sub-step) ─ */
-  bool pinned; /* true → Dirichlet BC: this node never integrates,
-                  its (x,y) stay at whatever the preset set them
-                  to.  The set of pinned nodes IS the cloth's
-                  boundary condition.                              */
-} Node;
-
-/* ─────────────────────────────────────────────────────────────────────
- * Spring — one Hookean elastic connection with linear damping.
- *
- * Models a damped linear spring between two Nodes a and b.  Per
- * cloth_step:
- *
- *     d   = b.pos − a.pos              (vector along the spring)
- *     d̂   = d / |d|                    (unit axis, undefined if |d|=0)
- *     v_rel = (b.vel − a.vel) · d̂       (signed: + = stretching)
- *
- *     F_mag = k · (|d| − rest)         ← Hookean restoring force
- *           + kd · v_rel               ← relative-velocity damping
- *
- *     F_on_a =  F_mag · d̂   (a is pulled toward b when stretched)
- *     F_on_b = −F_mag · d̂   (Newton's 3rd: equal & opposite)
- *
- * The cloth's three "spring kinds" — structural / shear / bend — are
- * NOT a type field.  They are three POPULATIONS of Spring instances
- * created at cloth_build_springs time with different connectivity and
- * different (k, kd, rest) values:
- *
- *   structural  : grid 4-neighbours (col±1 or row±1)   K=400  KD=4
- *   shear       : grid diagonals    (col±1 AND row±1)  K=100  KD=2
- *   bend        : skip-one along col or row            K= 40  KD=0.5
- *
- * Stiffness drops by ≈10× between tiers (Provot 1995 §3 rationale):
- * structural resists stretching, shear resists in-plane skew, bend
- * resists wrinkling.  Drop bend → cloth wrinkles freely; raise bend →
- * stiff fabric / canvas.
- *
- * Reference: Provot 1995 §3 (structural / shear / bend triad)
- *           Hooke 1660s (F = −kx, the underlying constitutive law)
- *           Baraff & Witkin 1998 §4 (spring force in cloth context)
- * ───────────────────────────────────────────────────────────────────── */
-typedef struct {
-  /* ─ topology — undirected edge between two nodes ─ */
-  int a, b; /* indices into Cloth::nodes[]; convention a < b
-               is not enforced and not required.                */
-
-  /* ─ physics — set at cloth_build_springs, constant thereafter ─ */
-  float rest; /* rest length in pixels.  Zero force when |d| = rest.
-                 Structural: REST_H or REST_V.
-                 Shear:      sqrt(REST_H² + REST_V²).
-                 Bend:       2·REST_H or 2·REST_V.               */
-  float k;    /* stiffness, px/s² per pixel of stretch.  Bounded
-                 above by symplectic-Euler stability:  k·dt² < 2,
-                 i.e. k < 2/(1/(60·8))² ≈ 462000 — all values
-                 used here are well under this.                  */
-  float kd;   /* damping coefficient, s⁻¹.  Force component along
-                 the spring axis proportional to v_rel.  Required
-                 to bleed off oscillation energy that the pure
-                 Hookean term alone would conserve forever.       */
-} Spring;
-
-/* ── Wind modes ────────────────────────────────────────────────────── */
+/* ── §5 entity — Node, Spring, Cloth ── */
 
 /*
- * WindMode — per-preset wind behaviour, chosen to suit the cloth's
- * pinning topology and give each preset its own visual signature.
+ * Node — one little weight in the cloth.  We don't simulate continuous
+ * fabric; we sprinkle a CLOTH_W × CLOTH_H grid of these weights and let the
+ * springs (next struct) pull them around.  Each weight carries three kinds of
+ * info, grouped below by who touches them and when:
  *
- *   WIND_SIN       ±1 sinusoidal — cloth swings side-to-side smoothly
- *   WIND_CONST_R   constant +1   — cloth blown rightward always (flag-like)
- *   WIND_CONST_L   constant -1   — cloth blown leftward  always (sail-fill)
- *   WIND_GUST      0.6 + 0.4·sin(2φ) — mostly one direction with fast pulses
- *   WIND_NONE      0             — pure gravity, no wind force
+ *   - position and speed: where the weight is and how fast it's moving. This
+ *     is the part physics keeps rewriting, many tiny steps per frame.
+ *   - a render snapshot (rx, ry): where the weight sat at the start of the
+ *     current tick. Drawing blends from this toward the live position so the
+ *     motion looks smooth even though physics jumps in 8 discrete sub-steps;
+ *     without it you'd see the cloth stutter.
+ *   - pinned: whether this weight is nailed in place. Pinned weights never
+ *     move — gravity and wind ignore them. Which weights are pinned is exactly
+ *     what makes a flag a flag and a hammock a hammock.
+ *
+ * Reference: Provot 1995 §2 (treating cloth as a grid of weights and springs).
+ */
+typedef struct {
+  /* where it is and how fast it's moving (pixels; +y points down, matching
+   * the screen).  Rewritten every tiny physics step.                     */
+  float x, y;
+  float vx, vy;
+
+  /* where it sat at the start of this tick; drawing blends from here to the
+   * live (x, y) so motion stays smooth between physics steps.            */
+  float rx, ry;
+
+  /* true means nailed in place — never moves, set once when a preset loads. */
+  bool pinned;
+} Node;
+
+/*
+ * Spring — one stretchy connection between two weights.  When it's stretched
+ * past its relaxed length it pulls the two ends together; when squashed it
+ * pushes them apart (the classic spring law, Hooke).  It also has a little
+ * "shock absorber" that fights quick stretching or squashing, so the cloth
+ * settles instead of bouncing forever.
+ *
+ * The three "kinds" of spring aren't stored as a type — they're just springs
+ * built with different reach and stiffness when the cloth is wired up:
+ *
+ *   structural  : joins next-door weights (across / down)       — stiffest
+ *   shear       : joins diagonal weights, stops the grid skewing — medium
+ *   bend        : reaches over one weight, stops sharp creases   — softest
+ *
+ * Each kind is about 10× softer than the last (Provot 1995 §3).  Soften the
+ * bend springs and the cloth wrinkles freely; stiffen them and you get rigid
+ * canvas.
+ */
+typedef struct {
+  /* the two weights this spring connects (indices into Cloth::nodes[]). */
+  int a, b;
+
+  /* relaxed length in pixels — no force when the ends are exactly this far
+   * apart.  Set once when the cloth is built, then left alone.           */
+  float rest;
+  /* stiffness: how hard it pulls back per pixel of stretch.              */
+  float k;
+  /* the shock absorber: how strongly it resists being stretched quickly.
+   * Needed because a plain spring would store energy and bounce forever. */
+  float kd;
+} Spring;
+
+/* ── Wind modes ── */
+
+/*
+ * WindMode — how the wind blows for a given preset.  Each preset picks the
+ * one that suits its pinning, giving it a recognisable look:
+ *
+ *   WIND_SIN      swings smoothly side to side (a sheet swaying)
+ *   WIND_CONST_R  steady push to the right (flies a flag out)
+ *   WIND_CONST_L  steady push to the left (fills a sail)
+ *   WIND_GUST     mostly one way, with quick pulses on top
+ *   WIND_NONE     no wind at all — just gravity
  */
 typedef enum {
   WIND_SIN = 0,
@@ -486,73 +297,40 @@ typedef enum {
   WIND_NONE,
 } WindMode;
 
-/* ─────────────────────────────────────────────────────────────────────
- * Cloth — the entire cloth simulation state.
+/*
+ * Cloth — everything the simulation needs, in one struct.  There's no global
+ * state: the physics and drawing functions all take a Cloth* and work on it,
+ * which keeps the line between "moving the cloth" and "drawing the cloth" just
+ * one function call wide.
  *
- * One Cloth IS the simulation.  No global mutable state; cloth_step,
- * cloth_tick, cloth_draw all take a Cloth* and do their work on it.
- * That lets the renderer take a const Cloth* even while the physics
- * mutates its own pointer — the boundary between sim and render is
- * exactly one function call deep.
+ * The weight and spring arrays are fixed-size, filled in once at startup and
+ * never resized (this demo never allocates memory while running).  Fields are
+ * grouped below by what touches them, not by type.
  *
- * Storage is entirely static (per the project's "no malloc in hot path"
- * rule from CLAUDE.md): nodes[] and springs[] are fixed-size arrays
- * sized at compile time from CLOTH_N and MAX_SPRINGS.  Worst-case
- * MAX_SPRINGS = 6·CLOTH_W·CLOTH_H accommodates structural + shear +
- * bend density at full coverage.
- *
- * Members are grouped by what TOUCHES them, not by type — that's the
- * locality grouping CLAUDE.md asks for:
- *
- *   pools (body)        : the cloth itself — nodes + springs.
- *                         Read every sub-step, written by integration.
- *
- *   wind driver state   : per-preset wind dynamics.  Advanced once per
- *                         cloth_tick (wind_phase), read every sub-step
- *                         (wind_strength, wind_on, wind_mode), set at
- *                         preset init.
- *
- *   ui state            : user-controlled run state.  Written by
- *                         app_handle_key only, read by step + render.
- *
- * Reference: Baraff & Witkin 1998 §6 (cloth as a system of particles
- *                                     + constraints — what to store)
- *           Witkin & Baraff 1997 SIGGRAPH notes §3.1 (particle system
- *                                     bookkeeping patterns)
- * ───────────────────────────────────────────────────────────────────── */
+ * Reference: Baraff & Witkin 1998 §6 (what state a cloth simulation needs).
+ */
 typedef struct {
-  /* ─ pools — the cloth body ──────────────────────────────────────
-   * Allocated once, never resized.  nodes[] is row-major; the helper
-   * node_idx(col,row) returns row·CLOTH_W + col.  springs[] is a
-   * compact pool: only the first n_springs entries are live, the
-   * rest are uninitialised slack (capacity MAX_SPRINGS).            */
+  /* The cloth body: the weights and the springs joining them.  nodes[] is
+   * stored row by row (node_idx maps col,row → index).  Only the first
+   * n_springs entries of springs[] are real; the rest is spare room.      */
   Node nodes[CLOTH_N];
   Spring springs[MAX_SPRINGS];
-  int n_springs; /* live count in springs[], 0..MAX_SPRINGS */
+  int n_springs;
 
-  /* ─ wind driver state ───────────────────────────────────────────
-   * The cloth is driven by gravity + wind.  Wind has its own little
-   * clock (wind_phase, radians) that advances by WIND_FREQ·2π·dt per
-   * cloth_tick, wrapping at 2π.  wind_mode picks one of five formulas
-   * (sin / const_R / const_L / gust / none) that collapse wind_phase
-   * into a single scalar wind_dir; that scalar is then applied
-   * uniformly across the cloth with a y-amplitude curve.            */
-  float wind_phase;    /* radians; clock for periodic wind motion   */
-  float wind_strength; /* px/s²; force magnitude; user adjusts +/-  */
-  bool wind_on;        /* user toggle (w); false zeros wind force   */
-  WindMode wind_mode;  /* selects the wind_dir formula              */
+  /* The wind.  It keeps its own little clock (wind_phase) that ticks forward
+   * every frame; wind_mode picks how that clock turns into a push direction,
+   * wind_strength scales it, and wind_on is the on/off switch.             */
+  float wind_phase;    /* where we are in the wind's swing cycle (radians) */
+  float wind_strength; /* how hard the wind pushes (px/s²); +/- adjusts it */
+  bool wind_on;        /* the w key's on/off toggle                        */
+  WindMode wind_mode;  /* which wind pattern this preset uses              */
 
-  /* ─ ui state ────────────────────────────────────────────────────
-   * User-controlled.  Written exclusively by app_handle_key, read
-   * (but not modified) by cloth_step / cloth_tick / cloth_draw and
-   * the HUD.  No render-only fields live on Cloth — render state is
-   * either in Node (rx,ry) or in Scene (theme).                       */
-  bool paused; /* space; true → cloth_tick skips integration       */
-  int preset;  /* current preset index, 0..N_PRESETS-1; the only
-                  breadcrumb that says "which scenario am I running" */
+  /* Run state the user controls with keys. */
+  bool paused; /* space bar; true means the cloth holds still      */
+  int preset;  /* which of the ten scenarios is currently loaded   */
 } Cloth;
 
-/* ── Helpers ───────────────────────────────────────────────────────── */
+/* ── Helpers ── */
 
 static inline int node_idx(int col, int row) { return row * CLOTH_W + col; }
 
@@ -568,15 +346,10 @@ static void cloth_add_spring(Cloth *c, int a, int b, float rest, float k,
   sp->kd = kd;
 }
 
-/* ── Preset initialisation ─────────────────────────────────────────── */
+/* ── Preset initialisation ── */
 
-/*
- * cloth_reset_positions — place nodes in their rest grid.
- *
- * The top-left node starts at pixel (ox0, oy0).
- * REST_H pixels between horizontal neighbours.
- * REST_V pixels between vertical neighbours.
- */
+/* Lay the weights out in a neat relaxed grid, with the top-left corner at
+ * pixel (ox0, oy0) and the spacing taken from REST_H / REST_V.            */
 static void cloth_reset_positions(Cloth *c, float ox0, float oy0) {
   for (int row = 0; row < CLOTH_H; row++) {
     for (int col = 0; col < CLOTH_W; col++) {
@@ -589,12 +362,9 @@ static void cloth_reset_positions(Cloth *c, float ox0, float oy0) {
   }
 }
 
-/*
- * add_structural_springs — Provot's first population.
- * Each interior grid node gets two structural springs: one to its right
- * 4-neighbour and one to its bottom 4-neighbour.  Stiff (K_STRUCT) so
- * the cloth resists stretching/compression like real fabric warp+weft.
- */
+/* The stiff springs that hold the weave together: each weight gets one to its
+ * right neighbour and one below it, so the cloth resists being pulled apart
+ * like the warp and weft of real fabric.                                    */
 static void add_structural_springs(Cloth *c) {
   for (int row = 0; row < CLOTH_H; row++) {
     for (int col = 0; col < CLOTH_W; col++) {
@@ -609,12 +379,9 @@ static void add_structural_springs(Cloth *c) {
   }
 }
 
-/*
- * add_shear_springs — Provot's second population.
- * Each grid quad gets both diagonals (NW-SE and NE-SW), resisting in-
- * plane skew so the cloth keeps its rectangular character instead of
- * collapsing into a rhombus.  Medium stiffness (K_SHEAR).
- */
+/* The medium springs that stop the cloth from skewing: each little square in
+ * the grid gets both of its diagonals, so the squares can't slump sideways
+ * into slanted diamonds.                                                     */
 static void add_shear_springs(Cloth *c) {
   float diag = sqrtf((float)(REST_H * REST_H + REST_V * REST_V));
   for (int row = 0; row + 1 < CLOTH_H; row++) {
@@ -627,12 +394,9 @@ static void add_shear_springs(Cloth *c) {
   }
 }
 
-/*
- * add_bend_springs — Provot's third population.
- * Skip-one connections along col and row.  Weak (K_BEND) so the cloth
- * can curve naturally but resists the unphysical sharp-fold mode that
- * pure structural+shear permits.  Drop these → cloth wrinkles freely.
- */
+/* The soft springs that keep the sheet from creasing: each weight links to the
+ * one two steps away (across and down), reaching over its neighbour.  The cloth
+ * can still curve gently, but it won't fold into a sharp knife-edge.          */
 static void add_bend_springs(Cloth *c) {
   for (int row = 0; row < CLOTH_H; row++) {
     for (int col = 0; col < CLOTH_W; col++) {
@@ -647,12 +411,9 @@ static void add_bend_springs(Cloth *c) {
   }
 }
 
-/*
- * cloth_build_springs — wire up Provot 1995's three-population triad.
- * Order doesn't matter for correctness (springs accumulate forces
- * commutatively), but the ordering here mirrors Provot's paper for
- * readability.
- */
+/* Build all three kinds of spring that hold the cloth together.  The order
+ * doesn't affect the result — the forces add up the same either way — it just
+ * follows the paper (Provot 1995) so it's easy to compare.                    */
 static void cloth_build_springs(Cloth *c) {
   c->n_springs = 0;
   add_structural_springs(c);
@@ -924,13 +685,11 @@ static void cloth_init(Cloth *c, int preset, int cols, int rows) {
   cloth_build_springs(c);
 }
 
-/* ── Physics tick ──────────────────────────────────────────────────── */
+/* ── Physics tick ── */
 
-/*
- * wind_dir_from_mode — collapse WindMode + wind_phase into a single
- * scalar direction in [-1, +1].  Applied uniformly across the cloth
- * in scalar_wind_force; the modes differ only in this scalar.
- */
+/* Turn the current wind mode and its little clock into one number from -1
+ * (full push left) to +1 (full push right).  The whole cloth feels this same
+ * push; the modes only differ in how this one number swings over time.       */
 static float wind_dir_from_mode(const Cloth *c) {
   switch (c->wind_mode) {
   case WIND_CONST_R:
@@ -947,23 +706,17 @@ static float wind_dir_from_mode(const Cloth *c) {
   }
 }
 
-/*
- * scalar_wind_force — uniform horizontal wind with a y-amplitude curve.
- * Returns ax in px/s².  Amplitude grows toward the bottom of the cloth
- * (0.4 + 0.6·y_frac) so the unconstrained edge bilges harder than the
- * pinned region — matches how a real hanging sheet behaves in wind.
- */
+/* How hard the wind pushes one weight sideways.  The push grows stronger toward
+ * the bottom of the sheet, so the free lower edge billows out more than the
+ * pinned top — just like a real sheet flapping in the breeze.                 */
 static inline float scalar_wind_force(const Cloth *c, float y_frac,
                                       float wind_dir) {
   return c->wind_strength * wind_dir * (0.4f + 0.6f * y_frac);
 }
 
-/*
- * accumulate_external_forces — body forces on every free node.
- * Body forces in continuum mechanics = forces acting per particle
- * irrespective of neighbours (here: gravity and wind).  Pinned nodes
- * get ax = ay = 0 since they don't integrate.
- */
+/* The outside pushes on every free weight: gravity pulling down and wind
+ * pushing sideways.  These act on each weight on its own, no neighbours
+ * involved.  Pinned weights get zero — they never move.                       */
 static void accumulate_external_forces(const Cloth *c, float *ax, float *ay,
                                        float wind_dir) {
   for (int i = 0; i < CLOTH_N; i++) {
@@ -982,19 +735,13 @@ static void accumulate_external_forces(const Cloth *c, float *ax, float *ay,
   }
 }
 
-/*
- * hooke_damped_force — restoring force on endpoint a from one spring.
+/* Work out the pull one spring puts on its first weight.  Two parts add up: the
+ * spring pulls harder the more it's stretched past its relaxed length, plus a
+ * shock-absorber part that fights quick stretching so it doesn't bounce forever.
+ * The other weight feels the exact opposite pull (the caller handles that).
  *
- *   d   = b.pos − a.pos
- *   d̂   = d / |d|
- *   F_mag = k · (|d| − rest)      ← Hookean restoring term
- *         + kd · v_rel·d̂          ← linear damping along axis
- *   F_on_a =  F_mag · d̂
- *   F_on_b = −F_mag · d̂   (Newton's 3rd)
- *
- * Degenerate case (|d| ≈ 0): force is undefined; we return zero so the
- * caller doesn't divide by zero or apply NaN.
- */
+ * If the two weights land on top of each other there's no direction to push, so
+ * we return zero rather than divide by zero and spit out garbage.             */
 static void hooke_damped_force(const Node *na, const Node *nb, float rest,
                                float k, float kd, float *out_fx,
                                float *out_fy) {
@@ -1015,11 +762,8 @@ static void hooke_damped_force(const Node *na, const Node *nb, float rest,
   *out_fy = fmag * ey;
 }
 
-/*
- * accumulate_spring_forces — internal forces.
- * Each spring contributes equal-and-opposite forces to its two endpoints
- * (Newton's 3rd).  Pinned endpoints simply don't receive the force.
- */
+/* Add up every spring's pull on the weights it joins.  Each spring tugs its two
+ * ends in opposite directions; a pinned end just ignores the tug.             */
 static void accumulate_spring_forces(const Cloth *c, float *ax, float *ay) {
   for (int s = 0; s < c->n_springs; s++) {
     const Spring *sp = &c->springs[s];
@@ -1040,16 +784,14 @@ static void accumulate_spring_forces(const Cloth *c, float *ax, float *ay) {
   }
 }
 
-/*
- * integrate_symplectic_euler — semi-implicit (a.k.a. symplectic) Euler.
- * Velocity is updated FIRST using current acceleration, then position is
- * updated using the NEW velocity.  Order matters: this preserves the
- * Hamiltonian structure and keeps long-term energy bounded, unlike
- * naïve explicit Euler which would blow up.  Global DAMP factor bleeds
- * energy out of every step so the cloth eventually settles.
+/* Push every free weight forward a tiny step in time.  The trick is the order:
+ * update the speed first using the forces, then move the weight using that NEW
+ * speed.  Doing it this way keeps the cloth from slowly gaining fake energy and
+ * blowing up, which the obvious order would.  DAMP bleeds a sliver of speed off
+ * each step so the cloth eventually comes to rest.
  *
- * Reference: Hairer, Lubich & Wanner 2006 ch. VI (symplectic methods).
- */
+ * This ordering is the "symplectic Euler" method (Hairer, Lubich & Wanner 2006,
+ * ch. VI) — symplectic just means it keeps the energy honest over time.       */
 static void integrate_symplectic_euler(Cloth *c, const float *ax,
                                        const float *ay, float dt) {
   for (int i = 0; i < CLOTH_N; i++) {
@@ -1063,14 +805,9 @@ static void integrate_symplectic_euler(Cloth *c, const float *ax,
   }
 }
 
-/*
- * cloth_step — one physics sub-step of the cloth.
- * Reads like the pseudocode of a force-based explicit integrator:
- *   1. resolve wind direction (one scalar from WindMode)
- *   2. body forces      (gravity + uniform wind)
- *   3. internal forces  (springs: Hooke + relative-velocity damping)
- *   4. integrate        (symplectic Euler with global DAMP)
- */
+/* One tiny step of the simulation: figure out the wind, add up the outside
+ * forces (gravity + wind) and the spring forces, then move everything forward a
+ * hair.  The body below reads as those four steps in order.                   */
 static void cloth_step(Cloth *c, float dt) {
   float ax[CLOTH_N], ay[CLOTH_N]; /* per-node acceleration accumulators */
 
@@ -1084,12 +821,9 @@ static void cloth_tick(Cloth *c, float dt) {
   if (c->paused)
     return;
 
-  /*
-   * Snapshot node positions BEFORE physics runs.
-   * cloth_draw lerps between (rx,ry) and (x,y) using the sub-tick
-   * alpha so that every render frame gets a smooth intermediate
-   * position rather than the hard physics-tick position.
-   */
+  /* Remember where every weight is right now, before physics moves it.  Drawing
+   * blends from this saved spot toward the new one, so the cloth glides between
+   * physics steps instead of jumping.                                         */
   for (int i = 0; i < CLOTH_N; i++) {
     c->nodes[i].rx = c->nodes[i].x;
     c->nodes[i].ry = c->nodes[i].y;
@@ -1105,17 +839,11 @@ static void cloth_tick(Cloth *c, float dt) {
   }
 }
 
-/* ── Drawing ───────────────────────────────────────────────────────── */
+/* ── Drawing ── */
 
-/*
- * draw_segment — DDA fill between two cell positions.
- *
- * Chooses the most appropriate ASCII char for the segment direction:
- *   nearly horizontal → '-'
- *   nearly vertical   → '|'
- *   positive slope    → '\'
- *   negative slope    → '/'
- */
+/* Draw a straight line of characters from one cell to another, picking the
+ * character that best matches the line's slant: '-' for mostly flat, '|' for
+ * mostly upright, and '\' or '/' for the two diagonals.                       */
 static void draw_segment(WINDOW *w, int x0, int y0, int x1, int y1, int cols,
                          int rows, chtype attr) {
   int dx = x1 - x0;
@@ -1151,13 +879,9 @@ static void draw_segment(WINDOW *w, int x0, int y0, int x1, int y1, int cols,
   wattroff(w, attr);
 }
 
-/*
- * node_lerp_cell — lerp a node's pixel position and convert to cell.
- *
- * alpha ∈ [0,1) is the sub-tick interpolation factor:
- *   alpha = sim_accum / tick_ns
- * Lerps between snapshot (rx,ry) and physics position (x,y).
- */
+/* Find where a weight should be drawn this frame and which terminal cell that
+ * lands in.  alpha (0 to 1) says how far we are between the last physics step
+ * and the next, so we blend between the saved spot and the live one.          */
 static inline void node_lerp_cell(const Node *n, float alpha, int *out_cx,
                                   int *out_cy) {
   float draw_x = n->rx + (n->x - n->rx) * alpha;
@@ -1166,23 +890,19 @@ static inline void node_lerp_cell(const Node *n, float alpha, int *out_cx,
   *out_cy = px_to_cell_y(draw_y);
 }
 
-/*
- * strain_tier — map a spring's stretch ratio to one of the four ramp tiers.
+/* Pick a colour for one thread based on how stretched it is.  The four colours
+ * run dim/cool for slack threads up to bright/hot for taut ones, so the picture
+ * works as a live tension map — and because every theme is built that way, the
+ * effect survives no matter which palette is on.  This is what makes the cloth
+ * feel alive: waves of colour ripple through it as it swings.
  *
- * Each theme's ramp is calibrated dim/cool → bright/hot, so taut springs
- * always glow brighter than slack ones regardless of palette.  This is
- * what makes the cloth feel alive: as gravity, wind, and swinging push
- * tension through the fabric, you see waves of colour travel across it.
+ *   squashed a bit      → ROW_0 (the coolest colour)
+ *   near its rest length → ROW_1
+ *   stretched, holding load → ROW_2
+ *   very taut            → ROW_3 (the hottest colour)
  *
- *   strain < -2 %    compressed / sagging         → CP_ROW_0 (cool/dim)
- *   strain < +2 %    near rest length             → CP_ROW_1
- *   strain < +8 %    stretched, carrying load     → CP_ROW_2
- *   strain ≥ +8 %    very taut (load-bearing)     → CP_ROW_3 (hot/bright)
- *
- * Vertical structural springs near the top of a hanging cloth carry the
- * weight of everything below them and sit firmly in ROW_2/ROW_3.
- * Horizontal springs in folded regions sit in ROW_0/ROW_1.
- */
+ * The upright threads near the top of a hanging sheet hold the weight of
+ * everything below, so they glow hottest; slack folds sit cool.              */
 static inline int strain_tier(const Node *a, const Node *b, float rest) {
   float dx = b->x - a->x;
   float dy = b->y - a->y;
@@ -1198,11 +918,8 @@ static inline int strain_tier(const Node *a, const Node *b, float rest) {
     return CP_ROW_3;
 }
 
-/*
- * draw_strained_edge — render one inter-node edge with strain-tier colour.
- * Compute the spring's current stretch ratio, pick the matching CP_ROW_*
- * tier, lerp both endpoints to cell coordinates, draw a DDA segment.
- */
+/* Draw the thread between two neighbouring weights, coloured by how stretched
+ * it is right now.                                                            */
 static void draw_strained_edge(WINDOW *w, const Node *na, const Node *nb,
                                float rest, float alpha, int cols, int rows) {
   int ax, ay, bx, by;
@@ -1212,15 +929,10 @@ static void draw_strained_edge(WINDOW *w, const Node *na, const Node *nb,
   draw_segment(w, ax, ay, bx, by, cols, rows, (chtype)COLOR_PAIR(tier));
 }
 
-/*
- * draw_strain_weave — the cloth body as a strain-coloured wireframe.
- *
- * For every interior node, draw the structural edge to its right
- * neighbour and the structural edge to its bottom neighbour.  Each
- * edge's colour is driven by its current stretch — so the mesh reads
- * as a live tension map: load-carrying threads glow hot, slack ones
- * sit cool.  When the cloth swings, waves of colour travel through it.
- */
+/* Draw the whole sheet as a mesh of threads.  For each weight we draw the thread
+ * to its right neighbour and the one below it, colouring each by how stretched it
+ * is — so the picture reads as a live tension map that ripples as the cloth
+ * swings.                                                                      */
 static void draw_strain_weave(const Cloth *c, WINDOW *w, int cols, int rows,
                               float alpha) {
   for (int row = 0; row < CLOTH_H; row++) {
@@ -1238,14 +950,10 @@ static void draw_strain_weave(const Cloth *c, WINDOW *w, int cols, int rows,
   }
 }
 
-/*
- * draw_pinned_anchors — overlay the cloth's boundary conditions.
- * Pinned nodes are Dirichlet BCs in the simulation; visually they read
- * as the points that hold the cloth up.  Drawn last so they paint over
- * any edge that happens to cross them.  Free nodes are deliberately NOT
- * drawn — only the wireframe defines them, which keeps the cloth
- * surface reading as fabric rather than a graph-paper grid.
- */
+/* Mark the pinned weights — the points holding the cloth up — with a bright '#'.
+ * Drawn last so they sit on top of any thread crossing them.  Free weights get
+ * no marker on purpose; letting only the threads show keeps the picture reading
+ * as fabric instead of dotted graph paper.                                    */
 static void draw_pinned_anchors(const Cloth *c, WINDOW *w, int cols, int rows,
                                 float alpha) {
   for (int i = 0; i < CLOTH_N; i++) {
@@ -1262,20 +970,15 @@ static void draw_pinned_anchors(const Cloth *c, WINDOW *w, int cols, int rows,
   }
 }
 
-/*
- * cloth_draw — the cloth as the user sees it.
- * Two passes: the wireframe weave (every edge, coloured by strain),
- * then the pinned anchors on top.
- */
+/* Draw the cloth in two passes: the mesh of threads first, then the pins on
+ * top.                                                                        */
 static void cloth_draw(const Cloth *c, WINDOW *w, int cols, int rows,
                        float alpha) {
   draw_strain_weave(c, w, cols, rows, alpha);
   draw_pinned_anchors(c, w, cols, rows, alpha);
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6 scene ── */
 
 typedef struct {
   Cloth cloth;
@@ -1301,9 +1004,7 @@ static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
   cloth_draw(&s->cloth, w, cols, rows, alpha);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7 screen ── */
 
 typedef struct {
   int cols, rows;
@@ -1385,9 +1086,7 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8 app ── */
 
 typedef struct {
   Scene scene;

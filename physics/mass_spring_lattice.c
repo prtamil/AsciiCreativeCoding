@@ -1,207 +1,55 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * physics/mass_spring_lattice.c — 2D Mass-Spring Lattice as a Stress Field
+ * physics/mass_spring_lattice.c — a grid of masses joined by springs,
+ * drawn so you only see the parts that are under strain.
  *
- * Classical mass-spring lattice (Hooke's law springs + symplectic Euler
- * integration) rendered as a STRESS FIELD instead of a wireframe mesh:
- * springs at rest are INVISIBLE — only stressed springs glow.  When the
- * lattice is undisturbed the screen shows a faint dot grid (the
- * rest-state nodes); when an impulse strikes, waves of bright `-` `=`
- * `#` edges radiate outward, reflect off boundaries, interfere, and
- * fade as damping does its work.
- *
- * The demo is SELF-RUNNING: a "struck membrane" showcase cycles through
- * four impulse patterns (CENTER, CORNER, TWO-POINT, LINE) on a ~12-second
- * loop.  No menu, no cursor — sit and watch the wave physics.
- *
- * ═════════════════════════════════════════════════════════════════════
- *  WHAT YOU ARE SEEING ON SCREEN
- * ═════════════════════════════════════════════════════════════════════
- *
- *  ┌───────────────────────────────────────────────────────────────┐
- *  │ MassSpring  scenario:Center  theme:Classic  k=60  E=…  60fps  │ ← row 0
- * HUD STATUS (bright yellow + bold) │ │ │   . . . . . . . . . . . . . . . . . .
- * . . . .                 │ ← faint '.' = rest-state NODES.  Every dot is a │
- * . . . . . . . . . . . . . . . . . . . . . .                 │   point mass at
- * its anchor position; they form │   . . . . #=#=*           . . . . . . . . .
- * .                 │   the LATTICE you'd see if everything were quiet. │   . .
- * #=#=O O=#-          . . . . . . . . . .                 │ │   . . *=#=*=#- .
- * . . . . . . . . .                 │ ← bright glyphs = STRESSED SPRINGS. │   .
- * . . . . . . . . . . . . . . . . . . . . .                 │     -  |   mild
- * stress   (dim colour) │   . . . . . . . . . . . . . . . . . . . . . . │     =
- * H   medium stress (bright colour) │   . . . . . . . . . . . . . . . . . . . .
- * . .                 │     #      EXTREME stress (bright + bold) │ │   COLOUR
- * encodes sign: │ q:quit  spc:pause  r:reset  n:next  t/T:theme  k/K:stiff … │
- * ← row n-1  CYAN ↘ compressed (springs pushed in)
- *  └───────────────────────────────────────────────────────────────┘ YELLOW/RED
- * ↗ stretched (springs pulled out) bright cyan + bold
- *
- *   MOVING NODES — overlay the rest-grid dots:
- *     .    rest    (speed < 0.6 cell/s)   — almost still
- *     o    slow    (0.6 .. 5 cell/s)      — oscillating
- *     O    fast    (> 5 cell/s)           — just struck, peak energy (bold)
- *
- *   READING THE PATTERNS:
- *     • A wave front travels at the lattice's natural speed
- *           c ≈ √(k/m) · spacing      (here ~ √60 · 4 ≈ 31 cell/s)
- *       so on a ~30-cell-wide lattice the first front crosses in ~1 s.
- *     • CENTER strike    → an expanding RING; the bright halo is the
- *                          wave front, the dim trail behind is residual
- *                          oscillation that damping is still draining.
- *     • CORNER strike    → a QUARTER-CIRCLE that reflects off the two
- *                          near edges, producing herringbone interference.
- *     • TWO-POINT strike → two rings collide near the midline; bright
- *                          bands appear where they ADD (constructive
- *                          interference), gaps where they CANCEL.
- *     • LINE strike      → a PLANAR wave marching across — the closest
- *                          thing to a 1-D textbook wave on this 2-D grid.
- *     • Watch the HUD's  E  (total kinetic + potential energy) — it
- *       falls monotonically as damping converts motion to heat (which
- *       this simulation does not model, only the loss).
- *
- * ═════════════════════════════════════════════════════════════════════
- *  SECTION MAP
- * ═════════════════════════════════════════════════════════════════════
- *   §1  config       — tunable constants (lattice size, k, damping…)
- *   §2  clock        — monotonic ns clock + sleep
- *   §3  color/theme  — stress + node palette (per CLAUDE.md HUD standard)
- *   §4  lattice      — Node / Spring structs + BSS arrays
- *   §5  physics      — Hooke's law forces + symplectic Euler
- *   §6  scenarios    — strike patterns + auto-advance
- *   §7  render       — stress-glow paint pipeline
- *   §8  main         — fixed-timestep sim loop + HUD + signals
+ * A spring sitting at its natural length is invisible; only springs that
+ * are squashed or stretched glow.  At rest the screen is just a faint dot
+ * grid (the masses sitting still).  Tap it and ripples of bright glyphs
+ * spread out, bounce off the edges, cross each other, and slowly die down
+ * as friction drains the motion.  It runs itself: four taps (center,
+ * corner, two-point, and a line) take turns on about a 12-second loop.
  *
  * Keys:
- *   q / ESC      quit                  space / p    pause / resume
- *   r            re-trigger scenario   n            next scenario
- *   t / T        next / previous theme
- *   k / K        softer / stiffer springs
- *   d / D        less / more damping
+ *   q / ESC  quit            space / p  pause          r  re-tap
+ *   n  next pattern          t / T  cycle theme
+ *   k / K  softer / stiffer springs    d / D  less / more friction
  *
- * ═════════════════════════════════════════════════════════════════════
- *  REFERENCES   (cite inline as [n])
- * ═════════════════════════════════════════════════════════════════════
- *
- *  ── Physics: elasticity, mass-spring & cloth ───────────────────────
- *
- *   [1] Hooke, R. (1678) — *De Potentia Restitutiva, or of Spring*.
- *       Royal Society of London.  The HISTORICAL primary publication
- *       of "ut tensio, sic vis" (F = −k·x) — the single equation that
- *       every spring in this lattice obeys.  Cited for provenance.
- *
- *   [2] Witkin, A.; Baraff, D. (2001) — "Physically Based Modeling:
- *       Principles and Practice", SIGGRAPH Course Notes, ACM.  THE
- *       standard practitioner reference for mass-spring systems,
- *       constrained dynamics, and the cloth simulation pipeline.
- *       Read this first if you want to build off the §5 solver.
- *
- *   [3] Provot, X. (1995) — "Deformation Constraints in a Mass-Spring
- *       Model to Describe Rigid Cloth Behaviour", *Graphics Interface
- *       '95*, 147-154.  Introduced the H/V structural + diagonal shear
- *       + bend spring taxonomy that nearly all subsequent cloth /
- *       lattice work has used.  This demo deliberately drops shear
- *       springs for visual clarity — Provot explains what you lose.
- *
- *  ── Numerical integration ──────────────────────────────────────────
- *
- *   [4] Hairer, E.; Lubich, C.; Wanner, G. (2006) — *Geometric
- *       Numerical Integration*, 2nd ed., Springer.  Chapters I-VI
- *       cover SYMPLECTIC INTEGRATORS — why our "velocity-first" Euler
- *       (§5 integrate_step) conserves a shadow Hamiltonian and
- *       therefore doesn't blow up over thousands of steps the way
- *       explicit Euler does.  The deeper read after a numerics 101.
- *
- *  ── Wave physics & vibrating membranes ─────────────────────────────
- *
- *   [5] Rayleigh, J. W. S. (1877) — *The Theory of Sound*, Vol. I,
- *       Macmillan, London.  Chapters IX-X derive the modes of
- *       vibrating membranes — the analytical counterpart to what
- *       you see in the CENTER (Bessel-like radial modes) and
- *       TWO-POINT (interference of two sources) scenarios.
- *
- *   [6] Crawford, F. S. (1968) — *Waves*, Berkeley Physics Course
- *       Vol. 3, McGraw-Hill.  The most accessible undergraduate
- *       treatment of waves on lattices, dispersion, reflection at
- *       boundaries, and standing-wave / travelling-wave duality —
- *       all of which appear plainly in this demo.
- *
- *  ── Visualisation & perception ─────────────────────────────────────
- *
- *   [7] Ware, C. (2020) — *Information Visualization: Perception for
- *       Design*, 4th ed., Morgan Kaufmann.  Ch.4 (colour, sequential
- *       maps) backs the LO→HI brightness ramp per stress sign; Ch.5
- *       (pre-attentive features) backs the "rest = invisible" choice
- *       that makes wave fronts pop instead of competing with a mesh.
- *
- *   [8] Tufte, E. R. (2001) — *The Visual Display of Quantitative
- *       Information*, 2nd ed., Graphics Press.  The "data-ink ratio"
- *       principle (minimise non-data ink) is the design philosophy
- *       behind dropping the old wireframe mesh entirely — every
- *       glowing character on screen now encodes a stress value.
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/mass_spring_lattice.c \
- *       -o mass_spring -lncurses -lm
+ * The physics is the standard mass-spring setup from Witkin & Baraff,
+ * "Physically Based Modeling" (SIGGRAPH notes, 2001); the only-H/V spring
+ * layout and what you give up by skipping diagonals is Provot,
+ * "Deformation Constraints in a Mass-Spring Model" (Graphics Interface
+ * '95).  Why the velocity-first time step doesn't drift over thousands of
+ * frames: Hairer/Lubich/Wanner, Geometric Numerical Integration (2006).
+ * The wave patterns (rings, edge reflections, two-source interference)
+ * are the membrane modes from Rayleigh, The Theory of Sound (1877) and
+ * Crawford, Waves (Berkeley Physics Vol. 3, 1968).
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────── *
+/* ── How it works ───────────────────────────────────────────────────
  *
- * Algorithm     : Mass-spring lattice on a rectangular grid (Witkin &
- *                 Baraff [ref 2]).  Each node obeys Newton's 2nd law
- *                 (F = m·a); each spring contributes a Hooke restoring
- *                 force [ref 1] to its two endpoints.  Time integration
- *                 is SYMPLECTIC EULER [ref 4] — update velocity first
- *                 using current force, then update position using the
- *                 NEW velocity.  Costs the same as explicit Euler but
- *                 conserves a shadow Hamiltonian, so the lattice does
- *                 not drift in energy over thousands of steps.
+ * Each dot is a little mass.  Springs join neighbours left-right and
+ * up-down (no diagonals, which keeps the ripples clean and easy to
+ * read).  Every frame we add up the pull of each spring on its two
+ * masses, add a bit of friction that fights motion, then nudge each
+ * mass: speed up first using the force we just found, then move using
+ * the new speed.  Doing speed-first is the trick that keeps the whole
+ * thing from slowly gaining fake energy and flying apart over time.
  *
- * Physics       : Hooke's law per spring [ref 1]:
- *                     F = -k · (|d| - L₀) · d̂
- *                 acting equal-and-opposite on the two endpoints
- *                 (Newton's 3rd law).  Plus a global velocity damping
- *                 F_damp = -c·v that drains kinetic energy over time —
- *                 the reason a struck membrane eventually goes quiet.
- *                 This demo uses H+V structural springs only; Provot
- *                 [ref 3] adds diagonal shear + bend springs for cloth
- *                 rigidity, deliberately omitted here for visual clarity.
+ * How stretched or squashed a spring is decides how it's drawn.  We
+ * measure "strain" = how far its length is from its resting length, as
+ * a fraction.  Nearly-resting springs aren't drawn at all, so only the
+ * ripples show:
  *
- * Numerics      : Stability requires dt < 2/ω_max where ω_max ≈
- *                 √(N_neighbours·k/m).  With 4-neighbour (H+V)
- *                 connectivity, k=60, m=1: dt_crit ≈ 2·√(1/240) ≈
- *                 0.13 s — our 1/120 s sub-step is well inside.
- *                 Wave propagation speed on the lattice is c ≈
- *                 √(k/m)·spacing (Crawford [ref 6], waves on lattices).
+ *     strain (size)   glyph     look
+ *     near 0          (none)    invisible — at rest
+ *     small           - or |    dim
+ *     medium          = or H    bright
+ *     large           #         bright + bold
  *
- * Visualisation : STRESS-FIELD GLOW — rest-length springs (|σ| < 0.04)
- *                 are not drawn at all (Tufte data-ink minimisation
- *                 [ref 8]).  Strain σ = (|d|-L₀)/L₀ maps to a glyph +
- *                 colour tier:
- *
- *                     |σ| tier     glyph          colour
- *                     ──────────   ───────────    ──────────────────
- *                     [.04, .15)   - or |         dim   (cyan/yellow)
- *                     [.15, .35)   = or H         bright (cyan/red)
- *                     ≥ .35        # (any axis)   bright + A_BOLD
- *
- *                     σ < 0 → COOL ramp (compressed) — cyan family
- *                     σ > 0 → HOT  ramp (stretched)  — yellow → red
- *
- *                 The signed sequential colour mapping (Ware [ref 7],
- *                 Ch.4) makes compression vs tension instantly readable;
- *                 the dropout for low stress exploits pre-attentive
- *                 luminance contrast (Ware [ref 7], Ch.5) so wave fronts
- *                 POP against an empty background instead of competing
- *                 with a static mesh.
- *
- * Showcase      : "Struck membrane" — four impulse patterns cycle on a
- *                 ~12-s timer (CENTER strike, CORNER strike, TWO-POINT
- *                 interference, LINE strike).  Each one produces a
- *                 classical vibrating-membrane mode (Rayleigh [ref 5]):
- *                 radial Bessel-like waves, edge reflections, two-source
- *                 interference fringes, and planar travelling waves.
- *
- * ─────────────────────────────────────────────────────────────────── */
+ * Colour says which way: a cool colour means squashed, a warm colour
+ * means stretched, so you can tell compression from tension at a glance.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -217,23 +65,21 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ════════════════════════════════════════════════════════════════════
- * §1  CONFIG
- * ════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 enum {
   TARGET_FPS = 60,
-  SUBSTEPS = 2, /* physics sub-steps per render frame */
+  SUBSTEPS = 2, /* physics steps per drawn frame */
 
-  NODE_DX = 4, /* cell columns between adjacent nodes */
-  NODE_DY = 2, /* cell rows between adjacent nodes */
+  NODE_DX = 4, /* gap between neighbours, in screen columns */
+  NODE_DY = 2, /* gap between neighbours, in screen rows */
   MAX_NX = 40,
   MAX_NY = 18,
   MAX_NODES = MAX_NX * MAX_NY,
   MAX_SPRINGS = MAX_NX * MAX_NY * 2,
 
   SCENARIO_COUNT = 4,
-  SCENARIO_TICKS = 12 * TARGET_FPS, /* ~12 s per scenario */
+  SCENARIO_TICKS = 12 * TARGET_FPS, /* hold each pattern ~12 s */
 
   N_THEMES = 3,
 };
@@ -251,21 +97,20 @@ enum {
 #define DAMPING_MIN 0.0f
 #define DAMPING_MAX 8.0f
 
-/* Strain magnitude thresholds — boundaries between visual tiers */
-#define STRAIN_NULL 0.04f /* below → spring not drawn (THE GLOW) */
-#define STRAIN_MID 0.15f  /* low → mid tier                       */
-#define STRAIN_HIGH 0.35f /* mid → high tier                      */
+/* How much strain a spring needs before it's drawn, and the cutoffs
+ * between dim / bright / bold. */
+#define STRAIN_NULL 0.04f /* under this the spring is left invisible */
+#define STRAIN_MID 0.15f  /* dim below, bright above                 */
+#define STRAIN_HIGH 0.35f /* bright below, bold above                */
 
-/* Speed thresholds — boundaries between node visual tiers */
+/* How fast a mass must move to show as 'o' (moving) then 'O' (just hit). */
 #define SPEED_REST 0.6f
 #define SPEED_FAST 5.0f
 
 #define HUD_TOP_ROWS 1
 #define HUD_BOT_ROWS 1
 
-/* ════════════════════════════════════════════════════════════════════
- * §2  CLOCK
- * ════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 #define NS_PER_SEC 1000000000LL
 #define TICK_NS(fps) (NS_PER_SEC / (fps))
@@ -286,18 +131,12 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * §3  COLOR / THEME
- * ════════════════════════════════════════════════════════════════════ *
+/* ── §3 color / theme ──
  *
- * Two CANONICAL pairs (CLAUDE.md HUD Standard): CP_HUD bright yellow,
- * CP_HINT bright cyan, both A_BOLD.  The rest is theme-dependent:
- *   COMPRESS_LO/HI — cool ramp for σ < 0
- *   TENSION_LO/HI  — hot  ramp for σ > 0
- *   NODE_REST      — dim grey, the rest-state lattice dots
- *   NODE_SLOW/FAST — moving-node tiers
- *   NODE_PIN       — bold anchor (unused in default scenarios)
- */
+ * Two colours are fixed (the bright-yellow status line and bright-cyan
+ * key hints).  Everything else comes from the active theme: a cool pair
+ * for squashed springs, a warm pair for stretched ones, and three
+ * brightnesses for the moving masses. */
 
 enum {
   CP_HUD = 1,
@@ -313,89 +152,68 @@ enum {
 };
 
 /*
- * Theme — one named visual identity bundling every theme-dependent
- *         colour-pair value as a tightly correlated set.
+ * Theme — one named look: all the colours that change together when you
+ * cycle the palette, kept in a single struct.
  *
- * WHY a struct (not loose const arrays):
- *   The four stress colours (compress LO, compress HI, tension LO,
- *   tension HI) must form TWO perceptually monotone sequential ramps
- *   — one cool, one hot — so that brightness encodes |strain|
- *   consistently within each sign (Ware [ref 7], Ch.4 sequential
- *   colour maps).  Bundling them together prevents accidentally
- *   pairing compress LO of theme A with compress HI of theme B at
- *   edit time.  Same argument for the three node tiers — rest/slow/
- *   fast must share a luminance ordering, not just an arbitrary
- *   palette.
+ * The point of bundling them is that they have to agree.  Squashed and
+ * stretched springs each get a two-step ramp (mild then strong), and the
+ * moving masses get three brightnesses (still / moving / just-hit).
+ * Within each ramp the brighter colour must mean "more": if a theme
+ * accidentally paired the strong colour of one theme with the mild of
+ * another, brightness would stop meaning "more strain".  Holding them
+ * side by side makes a mismatch obvious when you edit the table.
  *
- * WHY DUAL palettes (256 + 8):
- *   Modern terminals expose 256 indexed colours; legacy TTYs and
- *   minimal $TERM values ("linux", "dumb") expose only 8.
- *   theme_apply() inspects ncurses COLORS at runtime and binds the
- *   matching set — no #ifdef ladder.  The 8-colour fallback is a
- *   coarser approximation of the same theme INTENT (cool / hot ramps,
- *   bright accent for nodes), preserving sign discrimination even when
- *   per-tier luminance can't be expressed.
+ * Each theme carries two copies of its palette.  Most terminals can show
+ * 256 colours and get the nice version; very old or minimal ones can only
+ * show 8, so there's a coarse fallback that keeps cool-vs-warm even if it
+ * can't keep mild-vs-strong.  theme_apply() picks which copy to use by
+ * asking ncurses how many colours it has.
  *
- * WHY CP_HUD / CP_HINT live OUTSIDE this struct:
- *   The CLAUDE.md HUD Standard fixes them at bright yellow (226) +
- *   bright cyan (51) GLOBALLY — they must stay legible against any
- *   stress palette.  Putting them in a per-theme struct would invite
- *   drift toward dim or coloured HUDs that disappear against active
- *   animation.  color_init() binds them once at startup; theme_apply()
- *   never touches them.
+ * Two colours are deliberately NOT in here: the status line and key
+ * hints (fixed bright yellow + cyan so they stay readable over any
+ * theme), and the pinned-mass marker (always white-on-blue so anchors
+ * look the same everywhere).  Those are set once and never re-themed.
  *
- * WHY CP_NODE_PIN is also outside:
- *   The pinned-node marker is bold WHITE-ON-BLUE everywhere — it's a
- *   "structural anchor" indicator that must read identically across
- *   every theme so a viewer can spot anchors at a glance.  Hard-coded
- *   in theme_apply() rather than per-theme.
- *
- * Brightness floor:  Every 256-colour entry sits in the bright half
- *   of the cube (CLAUDE.md Theme Palette Brightness rule — colours
- *   16-23 / 232-239 become invisible against default-black + A_DIM).
+ * Every 256-colour value is kept in the bright half of the palette;
+ * the dark end vanishes against a black background.
  */
 typedef struct {
-  /* ── 256-colour palette (preferred when COLORS >= 256) ────────── *
-   * Pairs are listed in visual order: the COOL ramp encodes
-   * compression (σ<0), the HOT ramp encodes tension (σ>0).  Each
-   * ramp goes LO → HI as |σ| crosses STRAIN_MID into STRAIN_HIGH. */
-  short compress_lo; /* CP_COMPRESS_LO — mild compression, |σ|∈[.04,.15) */
-  short compress_hi; /* CP_COMPRESS_HI — strong/extreme compression      */
-  short tension_lo;  /* CP_TENSION_LO  — mild tension                    */
-  short tension_hi;  /* CP_TENSION_HI  — strong/extreme tension          */
+  /* The 256-colour palette (used when the terminal supports it).
+   * Cool pair = squashed spring, warm pair = stretched; each goes
+   * mild then strong. */
+  short compress_lo; /* squashed, mild   */
+  short compress_hi; /* squashed, strong */
+  short tension_lo;  /* stretched, mild   */
+  short tension_hi;  /* stretched, strong */
 
-  /* Node luminance tiers — must form a monotone ramp REST → FAST so
-   * the viewer reads "this node is moving" as "this node is brighter
-   * than its neighbours" without consulting a legend. */
-  short node_rest; /* CP_NODE_REST — speed < SPEED_REST, the dot grid */
-  short node_slow; /* CP_NODE_SLOW — SPEED_REST ≤ speed < SPEED_FAST  */
-  short node_fast; /* CP_NODE_FAST — speed ≥ SPEED_FAST (impact peak) */
+  /* Brightness of a mass by how fast it's moving — must climb still ->
+   * moving -> just-hit so a moving mass simply looks brighter. */
+  short node_rest; /* sitting still (the dot grid) */
+  short node_slow; /* moving                       */
+  short node_fast; /* just struck                  */
 
-  /* ── 8-colour ANSI fallback ──────────────────────────────────── *
-   * Same semantic roles, coarser granularity.  Within each ramp the
-   * fallback typically collapses LO and HI onto a single colour
-   * (sign discrimination preserved, intensity discrimination not). */
+  /* The same colours for 8-colour terminals: same meanings, less detail
+   * (mild and strong often collapse to one colour). */
   short compress_lo8, compress_hi8;
   short tension_lo8, tension_hi8;
   short node_rest8, node_slow8, node_fast8;
 
-  const char *name; /* shown in the HUD's `theme:` field         */
+  const char *name; /* shown after "theme:" in the status line */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
-    /* Classic — cyan compression, red tension */
+    /* Classic — cyan squashed, red stretched */
     {51, 195, 220, 196, 245, 46, 207, COLOR_CYAN, COLOR_WHITE, COLOR_YELLOW,
      COLOR_RED, COLOR_WHITE, COLOR_GREEN, COLOR_MAGENTA, "Classic"},
-    /* Cold — blue/cyan compression, white-hot tension */
+    /* Cold — blue/cyan squashed, white-hot stretched */
     {39, 87, 255, 226, 244, 51, 213, COLOR_BLUE, COLOR_CYAN, COLOR_WHITE,
      COLOR_YELLOW, COLOR_WHITE, COLOR_CYAN, COLOR_MAGENTA, "Cold"},
-    /* Plasma — magenta/violet compression, gold tension */
+    /* Plasma — violet squashed, gold stretched */
     {99, 207, 214, 196, 246, 156, 213, COLOR_MAGENTA, COLOR_WHITE, COLOR_YELLOW,
      COLOR_RED, COLOR_WHITE, COLOR_GREEN, COLOR_MAGENTA, "Plasma"},
 };
 
-/* Bind the canonical HUD pairs once at startup — they NEVER change
- * across theme cycling (CLAUDE.md: dim/coloured HUDs disappear). */
+/* The status line and key hints never re-theme, so set them once here. */
 static void color_init(void) {
   start_color();
   use_default_colors();
@@ -431,270 +249,154 @@ static void theme_apply(int t) {
   init_pair(CP_NODE_PIN, COLOR_WHITE, COLOR_BLUE);
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * §4  LATTICE — Node, Spring, and the Scene that owns them
- * ════════════════════════════════════════════════════════════════════ *
+/* ── §4 lattice — the masses, the springs, and the box that holds them ──
  *
- * The mass-spring system is captured in two primary record types
- * (Node, Spring) plus an axis enum (SpringKind), all gathered inside
- * the Scene struct further down.  The data model follows the standard
- * Witkin & Baraff [ref 2] particle-system layout: positions, velocities
- * and per-step force accumulators on each particle; sparse spring
- * records pointing at particle indices.
- */
+ * Three types here: a Node (one mass), a Spring (one connector), and a
+ * tag for which way a spring points.  The big Scene struct lower down
+ * owns all of them.  This is the textbook layout: each mass carries its
+ * own position, speed, and running force total; each spring just stores
+ * the two masses it links. */
 
 /*
- * SpringKind — axis tag identifying whether a spring lies along the
- * horizontal or vertical lattice direction.
+ * SpringKind — which way a spring runs: across (horizontal) or down
+ * (vertical).
  *
- * WHY tag the axis at all (the endpoints already encode it):
- *   The RENDERER needs the axis at draw time to pick the right glyph
- *   ('-' for H, '|' for V) WITHOUT recomputing the angle of every
- *   spring every frame.  The PHYSICS doesn't care — Hooke's law treats
- *   every spring uniformly — but rendering's hot loop reads `kind` per
- *   spring per frame, so storing it once is cheaper than reading both
- *   endpoint positions to infer it.
+ * We store this even though you could work it out from the two ends.
+ * The drawing code reads it every frame to pick the glyph ('-' for
+ * across, '|' for down), and reading a stored tag is cheaper than
+ * re-checking both endpoints each time.  The physics ignores it — a
+ * spring is a spring.
  *
- * WHY only H and V (no diagonals):
- *   Provot [ref 3] introduces three spring families — STRUCTURAL (H/V),
- *   SHEAR (diagonal), BEND (skip-one).  Shear/bend springs are what
- *   make cloth feel stiff and what gives a lattice rigid-body modes.
- *   This demo intentionally drops them: with only H/V structurals the
- *   wave fronts are SHARPER and SIMPLER to read, which is the whole
- *   point of the stress-glow visualisation.  Restoring shear is a
- *   one-line addition to springs_build().
+ * Only across and down springs exist; there are no diagonals.  Diagonals
+ * would make the grid stiffer (the way real cloth resists shearing), but
+ * leaving them out keeps the ripples sharp and easy to read, which is the
+ * whole point.  Adding them back would be a one-line change in
+ * springs_build().
  */
 typedef enum {
-  SPRING_H = 0, /* horizontal: dx = NODE_DX, dy = 0  →  glyph '-' */
-  SPRING_V = 1, /* vertical:   dx = 0, dy = NODE_DY  →  glyph '|' */
+  SPRING_H = 0, /* across: drawn as '-' */
+  SPRING_V = 1, /* down:   drawn as '|' */
 } SpringKind;
 
 /*
- * Node — one point mass in the lattice.
+ * Node — one little mass in the grid.
  *
- * ALGORITHM context:
- *   Each node obeys Newton's 2nd law (F = m·a) with force accumulated
- *   from every spring touching it (Hooke [ref 1]) plus a linear damping
- *   term.  Time integration is symplectic Euler [ref 4]:
+ * It keeps two positions: where it is right now, and where it belongs
+ * when everything's quiet (its home spot).  We keep the home spot so we
+ * can snap the grid back to calm between taps, and so the faint dot grid
+ * is drawn in the right place even while a mass is off riding a ripple.
  *
- *       v_new = v + (f / m) · dt          ← uses CURRENT force
- *       x_new = x + v_new · dt            ← uses NEW velocity
+ * It also keeps a running force total that gets rebuilt every step: we
+ * zero it, add up the spring pulls, then subtract a bit for friction.
+ * Keeping it on the mass lets those two passes pile into the same spot
+ * instead of needing a scratch buffer.
  *
- *   Cheap (two scalar updates per axis) and energy-preserving on
- *   average — explicit Euler would inject phantom energy and the
- *   lattice would drift apart over time.
- *
- * WHY both rest (rx, ry) AND current (x, y) positions:
- *   • (x, y)   is the SIMULATION state — what the integrator updates,
- *               what every render pass reads to place the node glyph.
- *   • (rx, ry) is the LATTICE-ANCHOR position — the cell where this
- *               node would sit if everything were quiet.  Two uses:
- *                 - scenario_quiet() snaps (x, y) back to (rx, ry) when
- *                   re-triggering a scenario, so prior energy doesn't
- *                   bleed in to the next strike.
- *                 - rebuilding the lattice on resize: (rx, ry) tells
- *                   the renderer where the "rest dot" should be even
- *                   when the node is currently displaced mid-wave.
- *   Storing both costs 8 bytes per node; in exchange the integrator
- *   never recomputes rest positions and resets are O(N).
- *
- * WHY force accumulators (fx, fy) live in the struct, not on the stack:
- *   compute_forces() runs TWO passes over the data — pass 1 (springs)
- *   adds spring forces to each endpoint; pass 2 (damping) reads
- *   velocity, adds -c·v, and stores into the same accumulator.  Keeping
- *   fx/fy in the struct lets these two passes write to the same memory
- *   without an intermediate buffer.  Zeroed at the start of every
- *   compute_forces() call.
- *
- * Memory layout note:
- *   Position pair, velocity pair, force pair, rest pair — listed in
- *   the order the inner loops touch them, so a node fits in roughly
- *   one cache line and per-pass scans are prefetcher-friendly.
+ * The fields are laid out in the order the inner loops touch them, so one
+ * mass sits in about one cache line.
  */
 typedef struct {
-  float x, y;   /* CURRENT position (cell coords).  Floats because the
-                 * integrator advances in sub-cell steps. */
-  float rx, ry; /* REST / lattice-anchor position.  Set once in
-                 * lattice_init(); never modified after.  Used by
-                 * scenario_quiet() and rest-grid drawing. */
-  float vx, vy; /* velocity [cells/s].  Symplectic Euler updates this
-                 * FIRST inside integrate_step() using f/m·dt. */
-  float fx, fy; /* force accumulator [N].  Cleared at the top of every
-                 * compute_forces() call; receives spring contributions
-                 * (Hooke [ref 1]) and damping (-c·v) in two passes. */
-  bool pinned;  /* if true: forces are still computed but integrate_step
-                 * skips this node, so it acts as a fixed anchor.
-                 * Not used in the default showcase scenarios. */
+  float x, y;   /* where it is now (fractional so motion is smooth) */
+  float rx, ry; /* its home spot; set once at build, never changed   */
+  float vx, vy; /* how fast it's moving                              */
+  float fx, fy; /* force piling up this step (springs, then friction) */
+  bool pinned;  /* if set, this mass never moves — a fixed anchor.
+                 * The built-in patterns don't use it. */
 } Node;
 
 /*
- * Spring — one Hooke connector linking two nodes (a, b).
+ * Spring — one connector joining two masses.
  *
- * ALGORITHM context:
- *   Each spring contributes a force pair to compute_forces() per step:
+ * Each step it pulls its two ends back toward its resting length: pull
+ * harder the further it's off, and in opposite directions on the two
+ * ends.  That's Hooke's law (the force in the famous spring equation).
+ * A pinned end feels the pull but doesn't move; it still counts toward
+ * how stretched the spring looks, so anchors still glow.
  *
- *       d   = pos_b - pos_a              (displacement)
- *       L   = |d|                        (current length)
- *       F   = k · (L − L₀) · (d / L)     (Hooke [ref 1])
+ * It remembers its current strain (how far off its resting length it is,
+ * as a fraction) because the force math has to work that out anyway, and
+ * the drawing code wants exactly that number to pick a colour and glyph —
+ * so caching it saves the drawing pass from redoing a square root every
+ * frame.
  *
- *       a.f +=  F                        (pulled toward b if extended)
- *       b.f += -F                        (Newton's 3rd law)
+ * Each spring also carries its own resting length rather than looking it
+ * up from its direction. They're equal today (across springs rest at the
+ * column gap, down springs at the row gap), but per-spring is the obvious
+ * home if a future tweak ever wants varied lengths.
  *
- *   Pinned endpoints skip the accumulation but still participate in
- *   the strain calculation so the spring still glows visually.
- *
- * WHY store strain on the spring (not recompute at render time):
- *   The strain ratio σ = (L − L₀)/L₀ is the value the renderer needs
- *   to pick a colour tier + glyph.  compute_forces() already computes
- *   it for the force expression, so caching it on the spring costs
- *   nothing per step and saves the renderer a sqrt() per spring per
- *   frame.  The renderer is the ONLY reader; one writer, one reader,
- *   same struct = clear ownership.
- *
- * WHY store rest_len per spring (not as a global derived from kind):
- *   H springs have rest = NODE_DX, V springs have rest = NODE_DY —
- *   that's true today.  But pinning/breaking/anisotropy mods would
- *   want per-spring rest lengths, so the field is here from day one.
- *   Cost is 4 bytes per spring; future-proofing for free.
- *
- * Connectivity (a, b are INDICES into Scene.nodes[]):
- *   Indices, not pointers — the array is contiguous and re-allocated
- *   on resize; storing pointers would invalidate them on rebuild.
- *   Index order matters: a is the "lower" index (smaller row*nx+col)
- *   by springs_build() construction, so a < b always.  No code
- *   currently depends on this, but it's a convenient invariant.
+ * The two ends are stored as positions in the masses array, not pointers,
+ * because that array gets rebuilt on resize and pointers wouldn't survive
+ * it. By the way they're built, the smaller index always comes first.
  */
 typedef struct {
-  int a, b;        /* node indices into Scene.nodes[] (a < b) */
-  float rest_len;  /* relaxed length L₀ [cells].  H: NODE_DX,
-                    * V: NODE_DY (set in springs_build).      */
-  float strain;    /* σ = (|d| - L₀) / L₀ — signed strain.
-                    * WRITTEN by compute_forces() each step;
-                    * READ by render_spring() each frame.
-                    * Sign convention: <0 = compressed, >0 = stretched. */
-  SpringKind kind; /* axis tag (H/V) — picks renderer glyph    */
+  int a, b;        /* the two masses it links (positions in the array) */
+  float rest_len;  /* the length it wants to be                        */
+  float strain;    /* how far off that length, as a fraction:
+                    * negative = squashed, positive = stretched.
+                    * Set by the physics, read by the drawing code. */
+  SpringKind kind; /* across or down — picks the glyph                 */
 } Spring;
 
 /*
- * Scene — every piece of mutable state for one running session.
+ * Scene — all the state for one running session, in one place.
  *
- * Replaces what used to be a scattered set of file-scope globals
- * (g_nodes / g_springs / g_nn / g_ns / g_nx / g_ny / g_x0 / g_y0)
- * plus a pile of locals inside main() (k, damping, scenario, theme…).
- * Gathering them into ONE struct does three things:
+ * Everything the program can change lives here, so any helper just takes
+ * a Scene* and there's no hidden global it secretly reads.  On a resize
+ * or reset the whole thing is wiped and rebuilt at once, so no stale
+ * leftovers can sneak between rebuilds.
  *
- *   1. Makes the data flow explicit — every function that needs scene
- *      state takes Scene* / const Scene*; no implicit "this function
- *      reads the lattice from globals" surprises.
- *   2. Documents ownership — each field belongs to exactly one of the
- *      four locality regions below, and the regions name who writes
- *      and who reads them.
- *   3. Makes the lifetime obvious — the WHOLE struct is rebuilt
- *      atomically on terminal resize or full reset; no partial state
- *      can leak between rebuilds.
+ * The fields fall into four groups, listed in roughly the order each
+ * frame touches them:
+ *   (A) the actual masses and springs, plus how many are in use
+ *   (B) the grid's size and where it sits on screen (only changes on
+ *       resize)
+ *   (C) the physics knobs you can turn at runtime (stiffness, friction…)
+ *   (D) which pattern is playing, the theme, paused, the shown fps
+ * Keeping physics (A, C) apart from the on-screen stuff (D) means a bug
+ * in one can't quietly corrupt the other.
  *
- * LAYOUT — fields are grouped into FOUR locality regions ordered the
- * way each pass touches them:
- *
- *   ┌─────────────────────────────────────────────────────────────────┐
- *   │ (A) PHYSICS DATA     — nodes[], springs[], counts                │
- *   │     read by  : compute_forces, integrate_step (HOT, per substep) │
- *   │     written  : compute_forces (forces), integrate_step (v, x),   │
- *   │                lattice_init / springs_build (init)               │
- *   │                                                                  │
- *   │ (B) GEOMETRY         — nx, ny, x0, y0, term_cols, term_rows      │
- *   │     read by  : render passes, scenario_apply                     │
- *   │     written  : lattice_init / fit_lattice — ONCE per (re)build   │
- *   │                                                                  │
- *   │ (C) SIM PARAMS       — k, damping, mass, dt, sim_fps, substeps   │
- *   │     read by  : compute_forces, integrate_step                    │
- *   │     written  : main()'s input handler (user knobs)               │
- *   │                                                                  │
- *   │ (D) ANIMATION + UI   — scenario, sc_tick, theme, paused,         │
- *   │                        fps_disp                                  │
- *   │     read by  : scene_tick, scene_draw, render_hud                │
- *   │     written  : main()'s input handler + per-frame counters       │
- *   └─────────────────────────────────────────────────────────────────┘
- *
- * WHY this grouping (locality + clarity):
- *   • Each per-frame pass touches a CONTIGUOUS region — prefetcher
- *     stays happy, and a reader scanning top-to-bottom sees the
- *     order in which the loop body reads each region.
- *   • PHYSICS hot loops (A+C) never touch UI (D); UI never touches
- *     force accumulators.  A bug in one region can't silently
- *     corrupt another.
- *   • GEOMETRY (B) is FROZEN between resizes, so any function in
- *     the per-frame critical path can hold (B) values in registers
- *     without re-reading.
- *
- * WHY ONE big struct (not split PhysicsScene + RenderScene + UIScene):
- *   On preset / theme / resize change the WHOLE scene rebuilds
- *   atomically.  Keeping it together makes the rebuild = "memset +
- *   refill" and makes every field's lifetime obvious (= lifetime of
- *   Scene itself).  Splitting would introduce a pointer hop, a second
- *   allocation site, and risk drift between the splits.
- *
- * Storage:  ~80 KB (dominated by nodes[] + springs[]).  Lives as a
- *   single file-scope BSS variable `g_scene` — zero malloc on the hot
- *   path (CLAUDE.md Memory rule).
+ * It's about 80 KB, almost all the masses and springs, and lives as one
+ * file-scope variable so nothing is malloc'd while running.
  */
 typedef struct {
-  /* ── (A) PHYSICS DATA — input + state for compute_forces / integrate_step ─
-   * Flat arrays.  nn / ns track how many entries are live;
-   * indices past those are uninitialised garbage. */
-  Node nodes[MAX_NODES];       /* point-mass states (pos, vel, force)    */
-  Spring springs[MAX_SPRINGS]; /* Hooke connectors with cached strain    */
-  int nn;                      /* live node   count (= nx * ny)          */
-  int ns;                      /* live spring count (set by springs_build) */
+  /* (A) the masses and springs themselves. nn / ns say how many of each
+   * are actually in use; anything past those is leftover junk. */
+  Node nodes[MAX_NODES];
+  Spring springs[MAX_SPRINGS];
+  int nn; /* masses in use (= nx * ny) */
+  int ns; /* springs in use            */
 
-  /* ── (B) GEOMETRY — lattice topology + terminal anchor ─────── *
-   * Set ONCE per (re)build by lattice_init() / fit_lattice() and
-   * frozen until the next resize.  The renderer reads these every
-   * frame to clip drawing to the visible band. */
-  int nx, ny;               /* nodes per row, per column           */
-  int x0, y0;               /* cell coords of the top-left REST node
-                             * (the renderer's anchor for the
-                             *  faint dot grid)                    */
-  int term_cols, term_rows; /* current ncurses terminal dims        */
+  /* (B) the grid's shape and where it sits. Set when the grid is built
+   * and left alone until the next resize. */
+  int nx, ny;               /* masses across, masses down            */
+  int x0, y0;               /* screen spot of the top-left mass       */
+  int term_cols, term_rows; /* current terminal size                  */
 
-  /* ── (C) SIM PARAMS — physics knobs, user-tunable at runtime ─ *
-   * compute_forces() + integrate_step() read these per substep.
-   * Mutated by the keyboard handler (k/K, d/D) in main(); also
-   * touched by scenario_apply() if a preset wants a different
-   * damping/k for its visual.  Independent of region (A): changing
-   * `k` doesn't rewrite the lattice, only the forces it generates. */
-  float k;       /* Hooke spring constant [N/m, scaled] */
-  float damping; /* linear velocity damping coefficient */
-  float mass;    /* per-node mass (uniform lattice)     */
-  float dt;      /* one physics substep duration [s]    */
-  int sim_fps;   /* render-frame cap (Hz)                */
-  int substeps;  /* physics substeps per render frame    */
+  /* (C) physics knobs. The keyboard changes stiffness and friction;
+   * turning them only changes the forces, not the grid layout. */
+  float k;       /* spring stiffness        */
+  float damping; /* how strongly friction fights motion */
+  float mass;    /* weight of each mass      */
+  float dt;      /* length of one physics step, in seconds */
+  int sim_fps;   /* frames per second target */
+  int substeps;  /* physics steps per frame  */
 
-  /* ── (D) ANIMATION + UI — showcase + HUD state ───────────────── *
-   * Mutated by main()'s input handler and the per-frame counters;
-   * read by scenario_apply, render_hud, and the auto-cycle logic.
-   * No physics function reads these — they're presentation only. */
-  int scenario; /* 0..SCENARIO_COUNT-1, active strike */
-  int sc_tick;  /* frames since this scenario started */
-  int theme;    /* 0..N_THEMES-1, active palette       */
-  bool paused;  /* freeze tick() but keep rendering    */
-  int fps_disp; /* live FPS shown in the HUD (smoothed) */
+  /* (D) what's on screen. None of the physics reads these. */
+  int scenario; /* which tap pattern is playing */
+  int sc_tick;  /* frames since it started      */
+  int theme;    /* which palette                */
+  bool paused;  /* frozen but still drawing     */
+  int fps_disp; /* fps shown in the status line */
 } Scene;
 
-/* THE single scene instance — file-scope BSS, no malloc.  Treated as
- * a parameter (Scene *) by every helper below; the symbol exists at
- * file scope only because signal handlers + main() need somewhere to
- * anchor it.                                                          */
+/* The one and only scene. It's file-scope (rather than a local in main)
+ * only because the signal handlers need to reach it too. */
 static Scene g_scene;
 
-/* ════════════════════════════════════════════════════════════════════
- * §5  PHYSICS
- * ════════════════════════════════════════════════════════════════════ */
+/* ── §5 physics ── */
 
-/* CENTRE THE LATTICE — solve for the top-left cell (x0, y0) so the
- * (nx-1)·DX by (ny-1)·DY bounding box of the rest grid sits in the
- * middle of the renderable band (HUD rows excluded).  Clamps to a
- * minimum margin so a tiny terminal can't push the grid off-screen. */
+/* Work out the screen spot for the top-left mass so the whole grid lands
+ * centered between the two HUD rows. Won't let it slide off a tiny
+ * terminal. */
 static void compute_lattice_anchor(Scene *s, int nx, int ny) {
   int lat_w = (nx - 1) * NODE_DX;
   int lat_h = (ny - 1) * NODE_DY;
@@ -707,9 +409,7 @@ static void compute_lattice_anchor(Scene *s, int nx, int ny) {
     s->y0 = HUD_TOP_ROWS;
 }
 
-/* STAMP ONE NODE at its lattice-anchor cell (x0 + c·DX, y0 + r·DY).
- * Current position equals rest position; velocity / force / pin all
- * zero — the standard "quiescent lattice" initial condition. */
+/* Place one mass at its home spot, sitting perfectly still. */
 static void stamp_rest_node(Node *n, int x0, int y0, int c, int r) {
   n->rx = (float)(x0 + c * NODE_DX);
   n->ry = (float)(y0 + r * NODE_DY);
@@ -722,10 +422,9 @@ static void stamp_rest_node(Node *n, int x0, int y0, int c, int r) {
   n->pinned = false;
 }
 
-/* Initialise the lattice: pick the anchor, then stamp every node at
- * its rest position.  Spring topology is built separately
- * (springs_build) so a future variant can swap H+V for H+V+shear
- * without re-touching this function. */
+/* Build the grid of masses at rest. The springs are wired up separately
+ * (springs_build) so a variant could change the wiring without touching
+ * this. */
 static void lattice_init(Scene *s, int nx, int ny) {
   s->nx = nx;
   s->ny = ny;
@@ -741,9 +440,8 @@ static void lattice_init(Scene *s, int nx, int ny) {
   }
 }
 
-/* Wire up the H+V structural-spring topology over the current node
- * grid.  Each interior cell contributes a right neighbour and a down
- * neighbour; boundaries contribute the ones that fit. */
+/* Join each mass to its right and down neighbour (the ones that exist),
+ * which covers every left-right and up-down link exactly once. */
 static void springs_build(Scene *s) {
   s->ns = 0;
   float h_rest = (float)NODE_DX;
@@ -761,8 +459,7 @@ static void springs_build(Scene *s) {
   }
 }
 
-/* CLEAR ACCUMULATORS — every force pass starts from zero so the two
- * physical contributions (spring + damping) can simply += in. */
+/* Wipe each mass's force back to zero so this step's pulls add up fresh. */
 static void clear_force_accumulators(Scene *s) {
   for (int i = 0; i < s->nn; i++) {
     s->nodes[i].fx = 0.0f;
@@ -770,20 +467,11 @@ static void clear_force_accumulators(Scene *s) {
   }
 }
 
-/* HOOKE'S LAW PAIR [ref 1] — for one spring, compute the restoring
- * force from its current extension and accumulate it on both endpoints
- * with opposite signs (Newton's 3rd law).  Also caches the signed
- * strain σ = (L − L₀)/L₀ on the spring so the renderer can read it.
- *
- *     d   = pos_b - pos_a
- *     L   = |d|
- *     F   = k · (L − L₀) · (d / L)
- *     a.f +=  F                          (pulled toward b if extended)
- *     b.f += -F
- *
- * Degenerate-length guard: if the two nodes have coincided exactly
- * (numerical artefact at blow-up), the direction is undefined — we
- * skip the force and just record zero strain. */
+/* For one spring: measure how far off its resting length it is, push its
+ * two ends back toward that length (harder the further off, opposite ways
+ * on the two ends), and remember the strain so the drawing code can read
+ * it. If the two ends sit exactly on top of each other there's no "which
+ * way to push", so we skip the push for that frame. */
 static void accumulate_hooke_pair(Scene *s, Spring *sp) {
   Node *a = &s->nodes[sp->a];
   Node *b = &s->nodes[sp->b];
@@ -812,18 +500,17 @@ static void accumulate_hooke_pair(Scene *s, Spring *sp) {
   }
 }
 
-/* SPRING-FORCE PASS — apply Hooke to every spring.  This is the
- * dominant cost of compute_forces (O(N_springs · constant)). */
+/* Apply every spring's pull. This is the bulk of the work each step. */
 static void apply_hooke_spring_forces(Scene *s) {
   for (int i = 0; i < s->ns; i++) {
     accumulate_hooke_pair(s, &s->springs[i]);
   }
 }
 
-/* VELOCITY DAMPING PASS — Stokes-style linear drag: F_damp = -c·v.
- * Drains kinetic energy each step; the reason a struck membrane
- * eventually goes quiet.  No gravity in this showcase — free
- * membrane, isotropic damping is the only sink. */
+/* Add a little friction: a drag that always opposes motion, scaled by how
+ * fast the mass is going. It's what makes the ripples fade out and go
+ * quiet. There's no gravity here, so this is the only thing draining
+ * energy. */
 static void apply_velocity_damping(Scene *s) {
   for (int i = 0; i < s->nn; i++) {
     if (s->nodes[i].pinned)
@@ -833,18 +520,17 @@ static void apply_velocity_damping(Scene *s) {
   }
 }
 
-/* Per-step force assembly.  Reads as the physical decomposition:
- *     start from zero      → add Hooke restoring forces
- *                          → add linear velocity damping.
- * The integrator then consumes node.f in the next half of the step. */
+/* The full force tally for one step: start at zero, add the springs, add
+ * the friction. The move step then uses these totals. */
 static void compute_forces(Scene *s) {
   clear_force_accumulators(s);
   apply_hooke_spring_forces(s);
   apply_velocity_damping(s);
 }
 
-/* Symplectic Euler: velocity updates first using the CURRENT force,
- * then position uses the NEW velocity.  Cheap and energy-conserving. */
+/* Move everything one step. Speed up first (from the force we just
+ * tallied), then move using the new speed. Doing it in that order is what
+ * keeps the grid from slowly gaining fake energy and flying apart. */
 static void integrate_step(Scene *s) {
   float inv_m = 1.0f / s->mass;
   float dt = s->dt;
@@ -858,8 +544,9 @@ static void integrate_step(Scene *s) {
   }
 }
 
-/* NaN/Inf detector — if a stiffness change pushed dt past the stability
- * limit and the lattice exploded, scenarios reset it; this just reports. */
+/* Check whether the numbers have gone haywire (any position or speed not
+ * a real value). Happens if springs get too stiff for the step size; the
+ * caller resets when this returns true. */
 static bool lattice_blown_up(const Scene *s) {
   for (int i = 0; i < s->nn; i++) {
     if (!isfinite(s->nodes[i].x) || !isfinite(s->nodes[i].y) ||
@@ -869,30 +556,22 @@ static bool lattice_blown_up(const Scene *s) {
   return false;
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * §6  SCENARIOS — the auto-cycling impulse showcase
- * ════════════════════════════════════════════════════════════════════ *
+/* ── §6 scenarios — the four taps that take turns ──
  *
- * Four strike patterns rotate every SCENARIO_TICKS frames.  Each
- * scenario_apply() call resets the lattice to rest (scenario_quiet)
- * then dispatches to the named strike helper for that id:
- *
- *   0 CENTER     — strike_center_pulse           : clean expanding ring
- *   1 CORNER     — strike_corner_pulse           : edge-reflected wave
- *   2 TWO-POINT  — strike_twopoint_interference  : interference fringes
- *   3 LINE       — strike_line_planar            : 1-D travelling wave
- *
- * scenario_strike_radial is the shared primitive — a circular impulse
- * with linear falloff that the first three strikes compose into their
- * patterns.  LINE bypasses it for a sinusoidal-velocity column.
+ * Each one calms the grid first, then gives some masses a shove. Three of
+ * them are a round shove (a "ring" outward); the fourth shakes a whole
+ * column. They look like:
+ *   center    — a clean ring spreading from the middle
+ *   corner    — a quarter-ring that bounces off the two near edges
+ *   two-point — two rings that cross and form bright/dark bands
+ *   line      — a flat wave marching sideways
  */
 
 static const char *const k_scenario_names[SCENARIO_COUNT] = {
     "Center", "Corner", "TwoPoint", "Line"};
 
-/* Re-snap every node to its rest position and zero everything else.
- * Called at the start of each scenario_apply so prior energy doesn't
- * bleed in to the next strike. */
+/* Settle the whole grid back to rest. Run before each tap so leftover
+ * motion from the last one doesn't bleed in. */
 static void scenario_quiet(Scene *s) {
   for (int i = 0; i < s->nn; i++) {
     s->nodes[i].x = s->nodes[i].rx;
@@ -907,9 +586,9 @@ static void scenario_quiet(Scene *s) {
     s->springs[idx].strain = 0.0f;
 }
 
-/* Stamp a radial impulse on every node inside `radius` of (cr, cc).
- * Velocity magnitude falls off linearly with distance from centre,
- * pointing outward — produces the classic expanding-ring stress wave. */
+/* Shove every mass within `radius` of a center point outward, gently
+ * nearer the edge of the circle and hardest at the middle. That outward
+ * shove is what becomes an expanding ring. */
 static void scenario_strike_radial(Scene *s, int cr, int cc, float speed,
                                    int radius) {
   if (cr < 0 || cr >= s->ny || cc < 0 || cc >= s->nx)
@@ -930,32 +609,27 @@ static void scenario_strike_radial(Scene *s, int cr, int cc, float speed,
   }
 }
 
-/* The "minor axis" cell count — used to scale strike radius so each
- * scenario looks the same on any aspect ratio. */
+/* The shorter side of the grid. Strike sizes scale off this so a tap
+ * looks the same whether the grid is wide or tall. */
 static int lattice_minor_axis(const Scene *s) {
   return (s->nx < s->ny ? s->nx : s->ny);
 }
 
-/* STRIKE 0 — CENTER PULSE.  One radial kick at the lattice midpoint.
- * Produces a clean expanding stress ring (the closest 2-D analogue
- * to Rayleigh's circular-membrane fundamental mode [ref 5]). */
+/* One shove in the middle: a clean ring spreads outward. */
 static void strike_center_pulse(Scene *s) {
   int radius = lattice_minor_axis(s) / 5;
   scenario_strike_radial(s, s->ny / 2, s->nx / 2, HAMMER_VEL, radius);
 }
 
-/* STRIKE 1 — CORNER PULSE.  Off-axis impulse near (1,1) — the wave
- * front is a quarter-circle that reflects off the two near edges
- * almost immediately, generating herringbone interference. */
+/* A shove up in a corner: the ring is only a quarter and immediately
+ * bounces off the two nearby edges, so the reflections cross. */
 static void strike_corner_pulse(Scene *s) {
   int radius = lattice_minor_axis(s) / 6;
   scenario_strike_radial(s, 1, 1, HAMMER_VEL * 1.2f, radius);
 }
 
-/* STRIKE 2 — TWO-POINT INTERFERENCE.  Two equal pulses at the left
- * and right quarter columns.  The two expanding rings collide along
- * the midline: constructive interference fringes where they ADD,
- * cancellation gaps where they SUBTRACT (Crawford [ref 6]). */
+/* Two shoves, left and right. Where the two rings meet they reinforce
+ * into bright bands and cancel into dark gaps. */
 static void strike_twopoint_interference(Scene *s) {
   int radius = lattice_minor_axis(s) / 7;
   int mid_r = s->ny / 2;
@@ -964,10 +638,8 @@ static void strike_twopoint_interference(Scene *s) {
                          radius);
 }
 
-/* STRIKE 3 — LINE / PLANAR WAVE.  Sinusoidal vertical velocity along
- * a single column.  The whole column oscillates IN PHASE along its
- * length but with one full spatial period — closest thing to a
- * textbook 1-D travelling wave on this 2-D grid. */
+/* Shake one whole column up and down in a smooth wave shape, so a flat
+ * wave marches sideways across the grid. */
 static void strike_line_planar(Scene *s) {
   int col = s->nx / 3;
   for (int r = 0; r < s->ny; r++) {
@@ -976,10 +648,7 @@ static void strike_line_planar(Scene *s) {
   }
 }
 
-/* Dispatch the scenario id to the matching strike helper.  Body reads
- * as pure SELECTION; every velocity-stamping detail lives in the
- * named helpers above.  scenario_quiet resets state so prior energy
- * doesn't bleed between scenarios. */
+/* Calm the grid, then run the tap for the given pattern number. */
 static void scenario_apply(Scene *s, int id) {
   scenario_quiet(s);
   s->scenario = id;
@@ -1001,13 +670,11 @@ static void scenario_apply(Scene *s, int id) {
   }
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * §7  RENDER — the stress-glow paint pipeline
- * ════════════════════════════════════════════════════════════════════ */
+/* ── §7 render ── */
 
-/* Strain → (color pair, glyph, bold).
- * Returns false when the spring is at rest and should NOT be drawn —
- * the dropout that makes wave fronts pop against an invisible mesh. */
+/* Turn a spring's strain into a colour, glyph, and bold flag. Returns
+ * false for a near-resting spring, which is the "leave it invisible" case
+ * that makes the ripples stand out. */
 static bool strain_visual(float strain, SpringKind kind, int *out_cp,
                           char *out_glyph, bool *out_bold) {
   float a = fabsf(strain);
@@ -1031,9 +698,9 @@ static bool strain_visual(float strain, SpringKind kind, int *out_cp,
   return true;
 }
 
-/* CLIPPED PAINT — single mvaddch with bounds-check against the
- * scene's renderable band (HUD rows excluded).  Every render helper
- * funnels through this so clipping logic lives in exactly one place. */
+/* Draw one character, but only if it lands inside the play area (not off
+ * screen, not on the HUD rows). Everything draws through here so the
+ * "stay in bounds" check lives in one spot. */
 static void paint_cell_clipped(const Scene *s, int row, int col, char glyph,
                                int attr) {
   if (col < 0 || col >= s->term_cols)
@@ -1043,12 +710,10 @@ static void paint_cell_clipped(const Scene *s, int row, int col, char glyph,
   mvaddch(row, col, (chtype)(unsigned char)glyph | attr);
 }
 
-/* PARAMETRIC LINE WALK — visit the INTERIOR cells of segment A→B
- * (k = 1 .. steps-1) and paint each with the same glyph + attribute.
- * Endpoints belong to the nodes, so this never overlaps the node
- * markers.  Using a parametric walk instead of Bresenham keeps each
- * cell at its "fair share" of the line — important for short H/V
- * spans (NODE_DX = 4 or NODE_DY = 2) where Bresenham would clump. */
+/* Fill the cells between two masses with the spring's glyph, skipping the
+ * two ends (those belong to the masses). We step evenly along the line
+ * rather than using the usual line-drawing trick, because these springs
+ * are very short and the even spacing keeps them from clumping. */
 static void paint_spring_interior(const Scene *s, int x0, int y0, int x1,
                                   int y1, int steps, char glyph, int attr) {
   for (int k = 1; k < steps; k++) {
@@ -1059,16 +724,8 @@ static void paint_spring_interior(const Scene *s, int x0, int y0, int x1,
   }
 }
 
-/*
- * render_spring — paint one spring as a glowing line, if it's
- * stressed enough to be visible.
- *
- * Pseudocode:
- *     classify strain → (glyph, colour, bold) or "at rest, skip"
- *     fetch the two endpoint nodes
- *     guard against NaN/Inf positions (post-blow-up frames)
- *     walk the interior cells, painting each with the chosen glyph
- */
+/* Draw one spring as a glowing line, but only if it's stressed enough to
+ * show. (The bad-number check guards the frame right after a blow-up.) */
 static void render_spring(const Scene *s, const Spring *sp) {
   int cp;
   char glyph;
@@ -1090,15 +747,11 @@ static void render_spring(const Scene *s, const Spring *sp) {
   paint_spring_interior(s, x0, y0, x1, y1, steps, glyph, attr);
 }
 
-/* NODE VISUAL FROM SPEED — classify a node into one of four visual
- * states by speed.  The thresholds (SPEED_REST, SPEED_FAST) are
- * calibrated to make "moving" pop against the rest grid without
- * flicker (Ware [ref 7], pre-attentive luminance contrast).
- *
- *   pinned (any speed)         → '@' bold WHITE/BLUE   structural anchor
- *   speed < SPEED_REST         → '.' dim   NODE_REST   the lattice baseline
- *   speed < SPEED_FAST         → 'o'       NODE_SLOW   oscillating
- *   speed ≥ SPEED_FAST         → 'O' bold  NODE_FAST   peak energy
+/* Pick how a mass looks based on how fast it's moving:
+ *   pinned        '@'  a fixed anchor
+ *   barely moving '.'  the resting dot grid
+ *   moving        'o'
+ *   just struck   'O'  (bold)
  */
 static void node_visual_from_speed(const Node *n, char *out_glyph, int *out_cp,
                                    int *out_attr) {
@@ -1124,14 +777,8 @@ static void node_visual_from_speed(const Node *n, char *out_glyph, int *out_cp,
   }
 }
 
-/*
- * render_node — paint one node glyph at its CURRENT position.
- *
- * Pseudocode:
- *     guard NaN/Inf positions
- *     classify visual state from speed (pinned / rest / slow / fast)
- *     paint clipped cell with chosen glyph + colour + attribute
- */
+/* Draw one mass at where it is now. (Bad-number check guards post-blow-up
+ * frames.) */
 static void render_node(const Scene *s, const Node *n) {
   if (!isfinite(n->x) || !isfinite(n->y))
     return;
@@ -1155,8 +802,9 @@ static void render_lattice(const Scene *s) {
     render_node(s, &s->nodes[i]);
 }
 
-/* Total kinetic + potential energy — a global "is the lattice ringing"
- * gauge surfaced in the HUD so the viewer can see decay numerically. */
+/* A single number for "how much is the grid still ringing" — the motion
+ * of the masses plus the strain stored in the springs. Shown in the HUD
+ * so you can watch it fall as things settle. */
 static float total_energy(const Scene *s) {
   float ke = 0.0f, pe = 0.0f;
   for (int i = 0; i < s->nn; i++) {
@@ -1172,7 +820,7 @@ static float total_energy(const Scene *s) {
 }
 
 static void render_hud(const Scene *s) {
-  /* Top row 0 — canonical bright-yellow status, A_BOLD. */
+  /* Top row: status line, bright yellow. */
   char buf[160];
   snprintf(buf, sizeof buf,
            " MassSpring  scenario:%-8s  theme:%-7s  k=%-4.0f  damp=%-3.1f"
@@ -1186,7 +834,7 @@ static void render_hud(const Scene *s) {
   mvprintw(0, 0, "%s", buf);
   attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-  /* Bottom row — canonical bright-cyan keys, A_BOLD. */
+  /* Bottom row: key hints, bright cyan. */
   int bot = s->term_rows - 1;
   move(bot, 0);
   clrtoeol();
@@ -1197,9 +845,7 @@ static void render_hud(const Scene *s) {
   attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * §8  MAIN — bootstrap helpers, per-frame stage helpers, and the loop
- * ════════════════════════════════════════════════════════════════════ */
+/* ── §8 main — setup, the per-frame steps, and the loop ── */
 
 static volatile sig_atomic_t g_resize = 0;
 static volatile sig_atomic_t g_quit = 0;
@@ -1213,8 +859,8 @@ static void on_sigterm(int s) {
   g_quit = 1;
 }
 
-/* Fit a lattice to current terminal dims (capped to MAX_NX/NY).
- * Writes nx/ny back into Scene region (B) GEOMETRY. */
+/* Pick how many masses across and down fit the current terminal, within
+ * sane minimums and the array's maximum. */
 static void fit_lattice(Scene *s) {
   int avail_w = s->term_cols - 4;
   int avail_h = s->term_rows - HUD_TOP_ROWS - HUD_BOT_ROWS - 2;
@@ -1232,9 +878,9 @@ static void fit_lattice(Scene *s) {
   s->ny = ny;
 }
 
-/* Full scene rebuild — call after a resize or a destructive reset.
- * Re-fits the lattice to terminal dims, re-stamps node positions,
- * re-builds spring topology, and re-applies the current scenario. */
+/* Rebuild everything from scratch — after a resize or a blow-up. Resize
+ * the grid, place the masses, re-wire the springs, replay the current
+ * tap. */
 static void rebuild_for_terminal(Scene *s) {
   fit_lattice(s);
   lattice_init(s, s->nx, s->ny);
@@ -1242,9 +888,8 @@ static void rebuild_for_terminal(Scene *s) {
   scenario_apply(s, s->scenario);
 }
 
-/* Populate Scene's SIM PARAMS (C) and ANIMATION+UI (D) regions with
- * defaults.  Region A (physics data) + B (geometry) are filled by
- * rebuild_for_terminal afterwards. */
+/* Set the starting knobs and UI state. The grid itself gets filled in by
+ * rebuild_for_terminal right after. */
 static void scene_defaults(Scene *s) {
   s->k = K_DEF;
   s->damping = DAMPING_DEF;
@@ -1260,20 +905,19 @@ static void scene_defaults(Scene *s) {
   s->fps_disp = s->sim_fps;
 }
 
-/* ── Bootstrap helpers ──────────────────────────────────────────────── */
+/* ── startup helpers ── */
 
-/* SIGNAL HANDLERS — SIGINT / SIGTERM → graceful quit; SIGWINCH →
- * deferred resize.  The handlers only flip volatile flags; all real
- * work happens synchronously from the main loop. */
+/* Catch Ctrl-C / kill (quit) and terminal-resize. The handlers just set a
+ * flag; the loop does the real work when it's safe. */
 static void install_signal_handlers(void) {
   signal(SIGWINCH, on_sigwinch);
   signal(SIGTERM, on_sigterm);
   signal(SIGINT, on_sigterm);
 }
 
-/* TERMINAL SETUP — ncurses raw-keys mode + no echo + no cursor +
- * non-blocking input + typeahead off so output isn't interrupted
- * (CLAUDE.md ncurses Bug Table). */
+/* Put the terminal into game mode: keys come straight through, nothing
+ * echoes, no cursor, input never blocks. typeahead(-1) stops ncurses from
+ * pausing the screen update to peek at the keyboard. */
 static void terminal_setup(void) {
   initscr();
   cbreak();
@@ -1284,15 +928,13 @@ static void terminal_setup(void) {
   typeahead(-1);
 }
 
-/* Modular cyclic step (+1 / −1 with wrap-around).  Makes the keybind
- * cases read as "advance by +1, wrap mod N" instead of the cryptic
- * `(x + N - 1) % N` reverse-wrap trick. */
+/* Step a value forward or back by one and wrap around the ends. The +n
+ * keeps it positive so stepping back from 0 lands on the last entry. */
 static void cycle_index(int *value, int step, int n) {
   *value = (*value + n + step) % n;
 }
 
-/* Clamp a float to [lo, hi] in place — keeps the k / damping keybind
- * arithmetic short and reads as a single intent line. */
+/* Keep a value from straying outside its min/max. */
 static void clamp_float(float *v, float lo, float hi) {
   if (*v < lo)
     *v = lo;
@@ -1300,11 +942,10 @@ static void clamp_float(float *v, float lo, float hi) {
     *v = hi;
 }
 
-/* ── Per-frame stage helpers — one phase of the sim loop each ────── */
+/* ── one frame, step by step ── */
 
-/* RESIZE — SIGWINCH set the flag asynchronously; we drain it here,
- * ask ncurses for fresh terminal dimensions, and rebuild the entire
- * scene (lattice topology depends on terminal size). */
+/* If the terminal was resized, grab the new size and rebuild the grid to
+ * fit (its size depends on the terminal). */
 static void consume_resize_event(Scene *s) {
   if (!g_resize)
     return;
@@ -1315,9 +956,7 @@ static void consume_resize_event(Scene *s) {
   rebuild_for_terminal(s);
 }
 
-/* INPUT — drain every queued key and dispatch.  Mutates the
- * ANIMATION+UI region (paused, scenario, theme) and the SIM PARAMS
- * region (k, damping); sets g_quit on q/ESC. */
+/* Handle every key waiting in the buffer. */
 static void process_input(Scene *s) {
   int ch;
   while ((ch = getch()) != ERR) {
@@ -1365,8 +1004,8 @@ static void process_input(Scene *s) {
   }
 }
 
-/* AUTO-ADVANCE — when a scenario's hold time expires, switch to the
- * next one.  Showcase auto-cycle so a passive viewer sees variety. */
+/* Once a pattern has had its turn, move on to the next so the show keeps
+ * changing on its own. */
 static void auto_advance_scenario(Scene *s) {
   s->sc_tick++;
   if (s->sc_tick < SCENARIO_TICKS)
@@ -1375,9 +1014,8 @@ static void auto_advance_scenario(Scene *s) {
   scenario_apply(s, s->scenario);
 }
 
-/* STEP PHYSICS — run substeps of (compute_forces → integrate_step),
- * detect numerical blow-up, and let the scenario auto-cycle tick.
- * Skipped entirely while paused. */
+/* Advance the physics a few small steps, recover if it blew up, and let
+ * the show auto-advance. Does nothing while paused. */
 static void step_physics(Scene *s) {
   if (s->paused)
     return;
@@ -1387,15 +1025,14 @@ static void step_physics(Scene *s) {
     integrate_step(s);
   }
   if (lattice_blown_up(s)) {
-    /* k pushed past stability — rebuild current scenario */
+    /* springs got too stiff and the numbers went wild — start over */
     rebuild_for_terminal(s);
   }
   auto_advance_scenario(s);
 }
 
-/* RENDER FRAME — painter's-order composite: clear → lattice → HUD →
- * flush.  `wnoutrefresh + doupdate` (single diff write) avoids
- * flicker on slow terminals (CLAUDE.md ncurses Bug Table). */
+/* Draw one frame: wipe, then the grid, then the HUD on top. The two-step
+ * flush sends only what changed, which avoids flicker on slow terminals. */
 static void render_frame(const Scene *s) {
   erase();
   render_lattice(s);
@@ -1404,25 +1041,23 @@ static void render_frame(const Scene *s) {
   doupdate();
 }
 
-/* FRAME PACING — fixed-timestep cap to sim_fps.  Sleeps the leftover
- * of (tick budget − work already done), then re-reads the clock so
- * the returned value is the start of the NEXT iteration's budget.
- * Reports the measured frame-work duration via out-param so the FPS
- * counter doesn't have to re-read the clock. */
+/* Hold a steady frame rate: sleep off whatever time is left in this
+ * frame's budget, then read the clock again as the start of the next one.
+ * Also hands back how long the work took so the fps counter needn't re-read
+ * the clock. */
 static int64_t pace_frame_to_fps(int64_t t_last, int sim_fps,
                                  int64_t *out_work_ns) {
   int64_t t_now = clock_ns();
   int64_t t_work = t_now - t_last;
   int64_t t_tick = TICK_NS(sim_fps);
-  clock_sleep_ns(t_tick - t_work); /* clamped to 0 inside sleep */
+  clock_sleep_ns(t_tick - t_work); /* a negative sleep just does nothing */
   *out_work_ns = t_work;
   return clock_ns();
 }
 
-/* FPS COUNTER — accumulate per-frame elapsed time; every half second,
- * convert (frames in window × 2) into a displayed fps value.  Uses
- * `work + max(0, tick − work) = max(work, tick)` to count both
- * budgeted and busted frames uniformly. */
+/* Count frames and, twice a second, update the fps number shown in the
+ * HUD. Counts a frame as a whole budget even if the work overran, so the
+ * reading stays steady. */
 static void update_fps_counter(Scene *s, int64_t work_ns, int64_t *fps_acc,
                                int *fps_cnt) {
   int64_t t_tick = TICK_NS(s->sim_fps);
@@ -1430,26 +1065,15 @@ static void update_fps_counter(Scene *s, int64_t work_ns, int64_t *fps_acc,
   *fps_acc += work_ns + (slack > 0 ? slack : 0);
   (*fps_cnt)++;
   if (*fps_acc >= NS_PER_SEC / 2) {
-    s->fps_disp = *fps_cnt * 2; /* half-second window → ×2 */
+    s->fps_disp = *fps_cnt * 2; /* counted over half a second, so double */
     *fps_acc = 0;
     *fps_cnt = 0;
   }
 }
 
 /*
- * main — fixed-timestep sim loop.
- *
- * Pseudocode:
- *     install signals; ncurses + colours; scene defaults; theme
- *     fit lattice to current terminal; trigger initial scenario
- *     loop until quit:
- *         drain SIGWINCH    (rebuild scene if resized)
- *         drain keyboard    (mutate sim / UI knobs)
- *         step physics      (substeps + blow-up check + auto-cycle)
- *         render frame      (lattice + HUD)
- *         pace to sim_fps
- *         update fps counter
- *     teardown ncurses
+ * The whole program: set up, then loop until quit — handle a resize,
+ * handle keys, step the physics, draw, hold the frame rate, update fps.
  */
 int main(void) {
   install_signal_handlers();

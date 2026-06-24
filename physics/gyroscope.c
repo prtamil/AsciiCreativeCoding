@@ -1,182 +1,71 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * gyroscope.c — Spinning Top / Euler Equations
+ * gyroscope.c — a spinning top you can watch tumble.
  *
- * Rigid-body rotation via Euler's equations integrated with RK4.
- * Orientation stored as a unit quaternion — no gimbal lock, no drift.
- * Gram-Schmidt re-orthogonalises the extracted rotation axes each frame
- * as an additional numerical safeguard.
+ * Simulates how a rigid body spins and wobbles in 3-D, then draws it as a
+ * wireframe in the terminal.  Eight presets show off the classic behaviours
+ * of tops and tumbling objects (steady precession, gravity wobble, the
+ * tennis-racket flip).  Cycle them with n / p; full key list is in §8.
  *
- * Eight presets (cycle with n / p):
- *   0  Euler's Top    — torque-free symmetric top; body Z traces a cone
- *                        around the fixed angular momentum vector
- *   1  Gravity Top    — gravity-driven precession + nutation; the wobble
- *                        tightens as spin rate increases
- *   2  Dzhanibekov    — asymmetric torque-free; rotation near the
- *                        intermediate I axis is unstable → 180° flips
- *                        (tennis-racket / T-handle effect)
- *   3  Oblate Top     — symmetric with I3 > I1=I2; opposite-sign Euler
- *                        precession from preset 0 (body cone outside)
- *   4  Sleeping Top   — gravity + very fast spin; the classic "barely
- *                        wobbles, stays nearly upright" regime
- *   5  Slow Heavy Top — gravity + slow spin; wide precession circles
- *                        with visible nutation cusps
- *   6  Stable Major   — asymmetric, spin on largest-I axis (stable)
- *   7  Stable Minor   — asymmetric, spin on smallest-I axis (stable);
- *                        with preset 2 demonstrates the intermediate-
- *                        axis theorem (only the middle I is unstable)
+ * The interesting physics it captures: a spinning object's axis traces a
+ * cone instead of pointing in one place (precession), it bobs up and down
+ * while it does (nutation), and an asymmetric object spun about its middle
+ * axis flips over unpredictably (the Dzhanibekov effect).
  *
- * Framework: follows framework.c §1–§8 skeleton.
+ * Built on the project's framework.c §1–§8 layout.
  *
- * ─────────────────────────────────────────────────────────────────────
- *  Section map
- * ─────────────────────────────────────────────────────────────────────
- *   §1  config   — presets, constants
- *   §2  clock    — monotonic ns clock + sleep
- *   §3  themes   — 10 palettes + color-pair init (axes/L/ground/trail/disc/HUD)
- *   §4  coords   — CELL_W/H aspect correction; 3-D→2-D projection
- *   §5  entity   — Gyro: physics blocks (gravity / Euler / kinematics)
- *                  → gyro_deriv → RK4 step → drift projection → draw layers
- *   §6  scene
- *   §7  screen
- *   §8  app
- * ─────────────────────────────────────────────────────────────────────
- *
- * PHYSICS SUMMARY
- * ─────────────────────────────────────────────────────────────────────
- * State vector (7 floats):  s = [ωx, ωy, ωz, qw, qx, qy, qz]
- *
- * Euler's equations (body frame, with optional gravity torque τ):
- *   I₁ω̇x = (I₂−I₃)ωy·ωz + τx
- *   I₂ω̇y = (I₃−I₁)ωz·ωx + τy
- *   I₃ω̇z = (I₁−I₂)ωx·ωy + τz
- *
- * Gravity torque on a top pivoting at origin, CM at l·ez (body Z):
- *   τ_body = mgl · (gz_by, −gz_bx, 0)
- *   where gz_b = R^T · Ẑworld = world-Z unit vector expressed in
- *   the body frame, read from the rotation matrix derived from q.
- *
- * Quaternion kinematics (ω in body frame):
- *   q̇ = ½ · q ⊗ (0, ωx, ωy, ωz)
- *   → dqw = ½(−qx·ωx − qy·ωy − qz·ωz)
- *      dqx = ½( qw·ωx + qy·ωz − qz·ωy)
- *      dqy = ½( qw·ωy − qx·ωz + qz·ωx)
- *      dqz = ½( qw·ωz + qx·ωy − qy·ωx)
- *
- * After each RK4 step: project_quaternion_to_unit() snaps q back
- * onto S³ (the unit sphere), so R stays in SO(3).
- *
- * SO(3) DRIFT PREVENTION
- * ─────────────────────────────────────────────────────────────────────
- * Two cleanup steps run at the tail of every gyro_step:
- *
- *   project_quaternion_to_unit(q)   — q /= |q|, keeps |q|=1 so the
- *                                     derived rotation matrix R is
- *                                     orthogonal by construction.
- *   refresh_body_axes(g)            — quat_to_axes + gram_schmidt;
- *                                     re-orthonormalises the extracted
- *                                     (ex, ey, ez) triad so float
- *                                     round-off in the quaternion →
- *                                     matrix formula can't accumulate
- *                                     into non-orthogonal frame axes.
- *
- * PROJECTION
- * ─────────────────────────────────────────────────────────────────────
- * Orthographic projection with azimuth φ and elevation θ:
- *   rx =  wx·cos φ + wy·sin φ          (horizontal after azimuth rotation)
- *   ry = −wx·sin φ + wy·cos φ          (depth    after azimuth rotation)
- *   screen_x =  rx
- *   screen_y =  ry·cos θ + wz·sin θ    (up on screen)
- *   depth    = −ry·sin θ + wz·cos θ    (depth, used for shading)
- * Terminal column = cx + screen_x · scale
- * Terminal row    = cy − screen_y · scale · ASPECT   (ASPECT≈0.5)
- *
- * Keys:
- *   q / ESC      quit
- *   space        pause / resume
- *   n / p        next / previous preset
- *   g            toggle gravity (affects any preset)
- *   l            toggle polhode trail   (the trace line)
- *   t / T        next / previous theme
- *   ← →          rotate view azimuth
- *   ↑ ↓          tilt view elevation
- *   r            restart preset
- *   ] / [        raise / lower sim Hz
- *
- * Themes (12 bipolar 8-step ramps shared with charged_particles.c):
- *   0 VOLT     1 COPPER   2 NEON     3 ICE_FIRE  4 AURORA   5 VIOLET
- *   6 CYBER    7 PASTEL   8 TWILIGHT 9 SODIUM   10 ECLIPSE 11 MONO
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/gyroscope.c -o gyroscope -lncurses
- * -lm
+ * The physics and rendering ideas, and where they come from, are written
+ * up in the CONCEPTS block just below.
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : RK4 [6] integration of a 7-component state vector.
- *                  [ωx, ωy, ωz] — angular velocity in body frame (rad/s)
- *                  [qw, qx, qy, qz] — orientation quaternion (unit length)
- *                  RK4 is used because Euler's equations are nonlinear:
- *                  the cross-products (I₂−I₃)ωy·ωz etc. couple the
- *                  components, and explicit Euler drifts visibly within
- *                  a few seconds of simulation.  SUB_STEPS=8 sub-steps
- *                  per render frame keep dt small relative to the fastest
- *                  oscillation period in any preset.
+ * How it moves   : We track the body's spin rate and which way it's facing,
+ *                  then step both forward a tiny bit at a time using RK4 — a
+ *                  well-known recipe for advancing physics accurately [6].
+ *                  We need the accurate recipe because the spin equations
+ *                  feed back on themselves; the cheap method (plain Euler
+ *                  steps) visibly drifts within seconds.  We take 8 small
+ *                  sub-steps per frame so even the fastest wobble is captured.
  *
- * Physics        : Euler's equations of rigid-body rotation [1, 2].
- *                  In the body frame (principal axes) the inertia tensor
- *                  is diagonal with eigenvalues I₁, I₂, I₃.  Three
- *                  classical regimes are realised across the 8 presets:
- *                    • Symmetric torque-free top (Euler precession) [1]
- *                          — presets 0, 3
- *                    • Heavy symmetric top with gravity (Lagrange top,
- *                          precession + nutation, sleeping stability
- *                          ω² > 4·mgl·I₁/I₃²) [1, 2]
- *                          — presets 1, 4, 5
- *                    • Intermediate-axis instability [3]
- *                          — preset 2 (unstable) versus 6, 7 (stable):
- *                          rotation about the MIDDLE principal axis is
- *                          unstable, while rotation about the smallest
- *                          or largest is stable (tennis-racket /
- *                          Dzhanibekov theorem).
+ * The physics    : Euler's equations — the rules for how a rigid body's
+ *                  spin changes over time [1, 2].  Each object has three
+ *                  "how hard to spin about this axis" numbers (I1, I2, I3).
+ *                  The 8 presets show three famous situations:
+ *                    • A symmetric top spinning freely — its axis sweeps
+ *                          out a steady cone [1]            (presets 0, 3)
+ *                    • A top under gravity — it wobbles and bobs; spin it
+ *                          fast enough and it "sleeps" nearly upright [1, 2]
+ *                                                           (presets 1, 4, 5)
+ *                    • The tennis-racket flip [3] — spin an asymmetric
+ *                          object about its MIDDLE axis and it keeps
+ *                          flipping over; about the biggest or smallest
+ *                          axis it's perfectly steady (preset 2 vs 6, 7).
  *
- * Math           : Quaternion orientation tracking [4].
- *                  A unit quaternion q = (qw, qx, qy, qz) encodes 3-D
- *                  rotation without gimbal lock or singularities.  The
- *                  rotation matrix R(q) is derived analytically in
- *                  quat_to_axes (§5).  Quaternion kinematics
- *                    q̇ = ½ · q ⊗ (0, ω)        (quaternion_kinematics)
- *                  live on the unit sphere S³ ⊂ ℝ⁴; RK4 drifts off the
- *                  sphere by O(dt⁵) per step, so project_quaternion_
- *                  to_unit snaps q back after every step — the cheapest
- *                  case of geometric-integration projection [5].
- *                  refresh_body_axes runs gram_schmidt for the same
- *                  reason: keep R numerically in SO(3), not just
- *                  analytically.
+ * Which way it   : We store orientation as a quaternion — four numbers that
+ * faces          :  encode a 3-D rotation cleanly, with none of the jams or
+ *                  blind spots that plague the simpler angle methods [4].
+ *                  quat_to_axes (§5) turns it back into the three body axes.
+ *                  Stepping it forward nudges it slightly off being a valid
+ *                  rotation, so after each step project_quaternion_to_unit
+ *                  rescales it and refresh_body_axes squares the axes back up
+ *                  (Gram-Schmidt) — cheap fixes that keep things honest [5].
  *
- * Rendering      : Orthographic projection of a 3-D wireframe [8] in
- *                  six painter's-order layers (draw_ground_ring →
- *                  draw_world_z_reference → draw_body_disc_equator →
- *                  draw_polhode_trail → draw_body_axes_depth_sorted →
- *                  draw_angular_momentum_vector).  All projection
- *                  parameters bundled into a Viewport struct so each
- *                  layer takes the same context.  ASPECT = CELL_W /
- *                  CELL_H ≈ 0.5 compensates for non-square terminal
- *                  cells so circles appear round, not elliptical.
- *                  Edge glyphs picked by 8-sector quantisation of the
- *                  screen-space angle [7] (one of {-, /, |, \} per
- *                  45° sector, in dir_char).  Depth-cueing via A_BOLD
- *                  (near, depth < 0) / A_DIM (far) gives a z-buffer
- *                  effect at zero memory cost.
+ * How it's drawn : A flat 3-D-to-2-D projection of a wireframe [8], painted
+ *                  back-to-front in six layers (ground ring → upright marker
+ *                  → body disc → trail → body axes → momentum arrow) so
+ *                  nearer parts cover farther ones.  All the camera numbers
+ *                  ride together in one Viewport struct.  Terminal cells are
+ *                  about twice as tall as wide, so ASPECT ≈ 0.5 squashes the
+ *                  vertical to keep circles round.  Each line picks a glyph
+ *                  (- / | \) from its on-screen angle [7], and nearer parts
+ *                  are bold while farther parts dim — a depth effect for free.
  *
- * Themes         : 12 bipolar diverging palettes [9] — each is an
- *                  8-step cool family → bright neutral → warm family
- *                  ramp.  Body X / Y get cool-mid / warm-mid hues so
- *                  they're distinguishable at a glance; body Z (spin
- *                  axis) and L (angular momentum) get the saturated
- *                  extremes so the physics protagonists read first
- *                  regardless of which theme is active.
+ * The colours    : 12 diverging palettes [9] — each runs cool → bright →
+ *                  warm.  The body's X and Y axes get the cool and warm mid
+ *                  tones so you can tell them apart; the spin axis (Z) and
+ *                  the momentum arrow (L) get the brightest extremes so the
+ *                  two stars of the show stand out in any theme.
  *
  * References (cite inline as [n]):
  *
@@ -263,9 +152,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ───────────────────────────────────────────────────────── */
 
 enum {
   SIM_FPS_MIN = 20,
@@ -273,10 +160,10 @@ enum {
   SIM_FPS_MAX = 120,
   SIM_FPS_STEP = 10,
 
-  SUB_STEPS = 8,   /* RK4 sub-steps per sim tick (stability) */
-  TRAIL_LEN = 300, /* polhode trail ring-buffer length        */
-  DISC_PTS = 32,   /* points on the body-disc equator         */
-  GROUND_PTS = 48, /* points on the ground reference ring     */
+  SUB_STEPS = 8,   /* small physics steps per frame; more = steadier */
+  TRAIL_LEN = 300, /* how many past trail dots we remember            */
+  DISC_PTS = 32,   /* dots drawn around the spinning disc             */
+  GROUND_PTS = 48, /* dots drawn around the ground ring               */
   FPS_UPDATE_MS = 500,
   N_COLORS = 7,
   N_PRESETS = 8,
@@ -289,104 +176,81 @@ enum {
 /* ── Preset table ────────────────────────────────────────────────────── */
 
 /*
- * GPreset — initial-conditions record for one demonstration scenario.
+ * GPreset — the starting setup for one of the eight demos.
  *
- * A preset is the complete set of parameters needed to reproduce a
- * named classical case (Euler's top, Dzhanibekov, sleeping top, ...).
- * PRESETS[] holds the 8 entries; gyro_set_preset() loads a chosen
- * entry into the live Gyro state at startup and on r-reset.
+ * Each preset is everything we need to recreate a named classic case
+ * (Euler's top, Dzhanibekov flip, sleeping top, ...): the body's shape,
+ * how fast and which way it starts spinning, how far it's tilted, and
+ * whether gravity is acting.  PRESETS[] holds all eight; gyro_set_preset()
+ * loads one into the live simulation at startup and whenever you reset.
+ * It's a plain record because every preset answers the same few questions —
+ * to add one, append to PRESETS[] and bump N_PRESETS.
  *
- * Why a flat record (not a class with virtual methods):
- *   Every preset answers the same two questions — "what initial state?"
- *   and "what torque law?" — so a tagged-union or polymorphism would
- *   just add ceremony.  Add a new preset by appending to PRESETS[] and
- *   bumping N_PRESETS.
+ * The fields, plainly:
  *
- * Field semantics (Euler's equations [1, 2]):
+ *   Body shape — I1, I2, I3:
+ *     How hard the body is to spin about each of its three axes (kg·m²).
+ *     Two equal → a symmetric, top-like body; all three different → an
+ *     asymmetric body that can do the tennis-racket flip (presets 2, 6, 7).
  *
- *   Inertia tensor (diagonal in principal axes [1]):
- *     I1, I2, I3 — principal moments along body X, Y, Z (kg·m²).
- *                  Equal pair → SYMMETRIC top (Euler's-top family);
- *                  all distinct → ASYMMETRIC body (Dzhanibekov family
- *                  — preset 2, 6, 7).
+ *   How it starts:
+ *     omega[3]   — starting spin rate about each body axis (rad/s).  Where
+ *                  you put the spin chooses the behaviour: all on Z → a
+ *                  clean spinning top; mostly on the middle axis of an
+ *                  asymmetric body → the unstable flip [3].
+ *     tilt_deg   — how far to lean the body over at the start (degrees).
+ *                  Gravity can only act on a leaning top, so the gravity
+ *                  presets need a nonzero tilt to get going.
+ *     tilt_axis  — which direction to lean it in (auto-normalised on load).
  *
- *   Initial state (body frame):
- *     omega[3]   — initial angular velocity ω₀ in rad/s; the component
- *                  distribution chooses the spin regime — pure ω_z →
- *                  pure-spin top, large ω_y on asymmetric body →
- *                  intermediate-axis instability [3].
- *     tilt_deg   — initial nutation angle: rotates body-Z away from
- *                  world-Z by this angle, around tilt_axis.  Needed
- *                  for any gravity preset (gravity torque vanishes
- *                  when the top is exactly upright).
- *     tilt_axis  — world unit-vector to tilt around (auto-normalised
- *                  in gyro_set_preset if not exactly unit length).
- *
- *   External torque:
- *     gravity    — false → torque-free (Euler's equations alone);
- *                  true → add Lagrange-top gravity torque [1].
- *     mgl        — mass × g × l (N·m); strength of the gravity torque
- *                  when gravity is on.  Drives the precession rate
- *                  ω_p ≈ mgl / (I₃·ω_z) of a sleeping-stable
- *                  symmetric top.
+ *   Gravity:
+ *     gravity    — false: nothing pulls on it (free spin).
+ *                  true:  gravity tugs the leaning top, making it precess.
+ *     mgl        — how strong that gravity tug is (N·m).  Bigger means a
+ *                  faster, wider precession wobble.
  */
 typedef struct {
-  const char *name;   /* preset display name (HUD row 1)             */
-  float I1, I2, I3;   /* principal moments of inertia                */
-  float omega[3];     /* initial angular velocity, body frame (rad/s)*/
-  float tilt_deg;     /* initial nutation: tilt body-Z from world-Z  */
-  float tilt_axis[3]; /* world axis to tilt around (auto-normalised) */
-  bool gravity;       /* false=Euler torque-free; true=Lagrange top  */
-  float mgl;          /* mg·l (gravity torque scale, N·m)            */
+  const char *name;   /* shown in the HUD                             */
+  float I1, I2, I3;   /* how hard to spin about each body axis        */
+  float omega[3];     /* starting spin rate per body axis (rad/s)     */
+  float tilt_deg;     /* starting lean of the body (degrees)          */
+  float tilt_axis[3]; /* direction to lean in (auto-normalised)       */
+  bool gravity;       /* does gravity act on it?                      */
+  float mgl;          /* strength of the gravity tug (N·m)            */
 } GPreset;
 
 /*
- * Preset 0 — Euler's Top (symmetric, torque-free)
- *   I1=I2=2 (oblate "saucer"), I3=1.
- *   ωz=8 rad/s (fast spin); small ωx seeds the initial wobble.
- *   L is conserved; body-Z precesses at Euler freq ≈ (I1-I3)/I1·ωz = 4 rad/s.
+ * The eight presets, in plain terms (numbers picked to make each effect
+ * obvious on screen):
  *
- * Preset 1 — Gravity Top (symmetric, with gravity)
- *   Same inertia.  ωz=12 rad/s; mgl=1.5.
- *   Precession rate ≈ mgl/(I3·ωz) ≈ 0.125 rad/s (slow circle).
- *   Nutation freq   ≈ I3·ωz/I1 = 6 rad/s (fast wobble).
+ * 0 Euler's Top — a saucer-shaped top spinning freely.  Its axis sweeps
+ *     out a steady cone; the momentum arrow L stays fixed while the body
+ *     circles around it.
  *
- * Preset 2 — Dzhanibekov / Tennis-Racket
- *   I1<I2<I3; rotation near INTERMEDIATE axis (I2) is unstable.
- *   Flip period T ≈ 2π / (ωy·√((I2-I1)(I3-I2)/(I1·I3))) ≈ 1.1 s.
- *   ~1 dramatic 180° flip per second.
+ * 1 Gravity Top — same body, now under gravity.  It precesses (a slow
+ *     circle) while bobbing (a fast small wobble) — the textbook top.
  *
- * Preset 3 — Oblate Top (symmetric, torque-free, OPPOSITE precession)
- *   I1=I2=2, I3=3 (inverted ratio from preset 0).  Euler precession
- *   rate ≈ (I3-I1)/I1·ωz = 2.5 rad/s — SAME magnitude order as
- *   preset 0 but OPPOSITE sign: body cone now precesses OUTSIDE
- *   the space cone.  Direct visual comparison to preset 0.
+ * 2 Dzhanibekov — an asymmetric body spun about its middle axis.  It
+ *     keeps flipping a full half-turn, roughly once a second.  The
+ *     famous tennis-racket / T-handle effect.
  *
- * Preset 4 — Sleeping Top (gravity, very fast spin)
- *   Same inertia as 1; ωz=25 rad/s, tilt=3°, mgl=1.5.
- *   Precession ≈ mgl/(I3·ωz) = 0.06 rad/s — extremely slow.
- *   The classic "sleeping top": stays nearly upright, the spin
- *   axis barely traces a circle.  Demonstrates the stability
- *   threshold ω² > 4·mgl·I1/I3² for the upright position.
+ * 3 Oblate Top — like preset 0 but with the shape ratio flipped, so the
+ *     axis sweeps its cone the OTHER way.  Set side by side with 0 to see
+ *     the difference.
  *
- * Preset 5 — Slow Heavy Top (gravity, slow spin)
- *   Same inertia; ωz=4 rad/s, tilt=40°, mgl=2.0.
- *   Precession ≈ 0.5 rad/s — wide visible circles, with clearly
- *   visible nutation cusps from the body-Z tip dipping down and
- *   recovering each precession period.  Opposite limit of 4.
+ * 4 Sleeping Top — gravity plus a very fast spin.  It barely moves and
+ *     stays nearly upright; spin a top hard enough and it "sleeps".
  *
- * Preset 6 — Stable Major (asymmetric, spin on largest-I axis)
- *   Same I as preset 2 (1, 2.5, 3.5); ω initially along Z (largest I).
- *   Intermediate-axis theorem: rotation about the largest principal
- *   axis is STABLE — tiny perturbations stay tiny.  Pair with
- *   preset 2 to see why only the MIDDLE eigenvalue is unstable.
+ * 5 Slow Heavy Top — gravity plus a slow spin.  Wide lazy precession
+ *     circles with a clear dip-and-recover bob each lap.  The opposite
+ *     extreme of preset 4.
  *
- * Preset 7 — Stable Minor (asymmetric, spin on smallest-I axis)
- *   Same I; ω initially along X (smallest I).
- *   Rotation about the smallest principal axis is ALSO stable.
- *   Both endpoints of the inertia spectrum are stable — only the
- *   middle one isn't.  Together with presets 2 and 6, this is the
- *   complete intermediate-axis-theorem demo.
+ * 6 Stable Major — the asymmetric body from preset 2, but spun about its
+ *     biggest axis.  Rock steady — small nudges stay small.
+ *
+ * 7 Stable Minor — same body spun about its smallest axis.  Also rock
+ *     steady.  Presets 2, 6, 7 together make the point: only the MIDDLE
+ *     axis is unstable; the two extremes are fine.
  */
 static const GPreset PRESETS[N_PRESETS] = {
     {/* Euler's Top */
@@ -471,9 +335,7 @@ static const GPreset PRESETS[N_PRESETS] = {
      0.0f},
 };
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ────────────────────────────────────────────────────────── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -491,14 +353,12 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  themes + color                                                     */
-/* ===================================================================== */
+/* ── §3  themes + color ───────────────────────────────────────────────── */
 
 /*
- * Color-pair indices — fixed across all themes; only the underlying RGB
- * changes when theme cycles via t / T.  The drawing code references
- * these enum names; theme cycling re-runs init_pair() to remap them.
+ * Color-pair slots — the drawing code always asks for these by name, and
+ * the actual colour behind each one is swapped when you cycle themes (t/T).
+ * Keeping the slot numbers fixed means no drawing code has to change.
  */
 enum {
   CP_AXIS_X = 1, /* body X axis                                     */
@@ -513,57 +373,31 @@ enum {
 };
 
 /*
- * Theme palette — MULTICOLOR, all-bright.
+ * Theme — one colour palette, shared with charged_particles.c.
  *
- * Each theme is an 8-step BIPOLAR ramp (cool family → bright neutral
- * midpoint → warm family).  Structure inherited from
- * charged_particles.c where the ramp encodes signed charge, but every
- * slot has been pulled up into the VIVID half of the cube — the
- * "cool extreme" is now bright-cool (not dark-cool) so the dim slots
- * stay readable on every terminal background.  Bipolar character is
- * carried by HUE, not brightness.
+ * Each theme is an 8-step gradient that runs cool → bright middle → warm.
+ * The drawing code pulls specific slots out of that gradient for each
+ * element (see color_apply_theme below for which slot goes where).  The
+ * gradient tells the elements apart by HUE, not by brightness — every slot
+ * is deliberately kept in the bright half of the colour range so nothing
+ * vanishes against a dark terminal even when drawn dim.
  *
- * Ramp slot semantics:
- *   slot 0..3  cool half  (bright saturated → light)
- *   slot 3..4  bright neutral midpoint
- *   slot 4..7  warm half  (light → bright saturated)
- *
- * Role → ramp-slot mapping (same across every theme):
- *
- *   ax_x   ← ramp[1]   cool side, mid-saturation
- *   ax_y   ← ramp[6]   warm side, mid-saturation
- *                      → X and Y get DIFFERENT hues
- *   ax_z   ← ramp[7]   warm extreme — spin axis (the focal element)
- *   mom    ← ramp[0]   cool extreme — L vector, set OPPOSITE the
- *                                     spin axis so the conserved
- *                                     angular-momentum direction
- *                                     reads against ax_z
- *   ground ← ramp[3]   bright cool-neutral (gets A_DIM at draw time
- *                                            but still visible)
- *   disc   ← ramp[4]   bright warm-neutral (gets A_DIM at draw time)
- *   trail  ← trail     dedicated polhode-trail color
- *
- * The bipolar palette is canonical for signed/diverging data because
- * a single-hue ramp loses orientation under eye fatigue (Ware [5] in
- * charged_particles.c).  In the gyroscope it gives the body axes
- * three intuitively distinct directions: cool-mid / warm-mid / hot.
- *
- * Brightness floor: every cube index is ≥ 75 and every gray-ramp
- * index ≥ 247 — well clear of CLAUDE.md's "NEVER" zone (16-23 /
- * 232-239) AND the "lowest tier only" zone (24-29 / 240-243).
+ *   name  — what the theme is called (shown in the HUD)
+ *   ramp  — the 8-step cool-to-warm gradient
+ *   trail — the colour used for the spin-axis trail
+ *   sky   — not used here; kept so this table matches charged_particles.c
  */
 typedef struct {
   const char *name;
-  short ramp[8]; /* 8-step bipolar gradient (cool → bright → warm) */
-  short trail;   /* dedicated polhode trail color                  */
-  short sky;     /* unused in gyroscope; kept for table parity     */
+  short ramp[8];
+  short trail;
+  short sky;
 } Theme;
 
 #define N_THEMES 12
 
 static const Theme THEMES[N_THEMES] = {
-    /*  name        ramp[0..7]  (cool extreme → neutral → warm extreme) trail
-       sky */
+    /*  name        ramp[0..7]  (cool → neutral → warm)   trail  sky */
     {"VOLT",
      {81, 117, 123, 159, 230, 220, 214, 203},
      250,
@@ -615,37 +449,36 @@ static const Theme THEMES[N_THEMES] = {
 };
 
 /*
- * color_apply_theme — re-init the colour pairs from THEMES[idx].
+ * color_apply_theme — point each colour slot at the chosen theme's colours.
  *
- * Pair indices are fixed (CP_*); only the foreground RGB changes.
- * Called once at startup and again each time the user cycles theme,
- * so already-drawn cells repaint with the new palette on the very
- * next frame without touching any drawing code.
- *
- * 8-color fallback uses standard ANSI colours; cycling has no effect
- * on terminals that can't reach the 256-cube.
+ * Run once at startup and again on every theme change, so the next frame
+ * just repaints in the new colours with no other code involved.  Terminals
+ * that can't do 256 colours fall back to the basic eight, where cycling
+ * themes has no visible effect.
  */
 static void color_apply_theme(int idx) {
   if (idx < 0 || idx >= N_THEMES)
     idx = 0;
   const Theme *th = &THEMES[idx];
   if (COLORS >= 256) {
-    /* Bipolar ramp → role mapping (see Theme docstring above) */
-    init_pair(CP_AXIS_X, th->ramp[1], -1); /* cool side mid          */
-    init_pair(CP_AXIS_Y, th->ramp[6], -1); /* warm side mid          */
-    init_pair(CP_AXIS_Z, th->ramp[7], -1); /* warm extreme — spin    */
-    init_pair(CP_MOM, th->ramp[0], -1);    /* cool extreme — L       */
-    init_pair(CP_GROUND, th->ramp[3], -1); /* cool neutral (A_DIM)   */
-    init_pair(CP_TRAIL, th->trail, -1);    /* dedicated trail colour */
-    init_pair(CP_DISC, th->ramp[4], -1);   /* warm neutral (A_DIM)   */
+    /* Pull each element's colour from a different spot in the gradient
+     * so the spin axis (Z) and momentum arrow (L) get the boldest extremes
+     * and the X / Y axes get distinct cool / warm mid-tones. */
+    init_pair(CP_AXIS_X, th->ramp[1], -1); /* cool mid               */
+    init_pair(CP_AXIS_Y, th->ramp[6], -1); /* warm mid               */
+    init_pair(CP_AXIS_Z, th->ramp[7], -1); /* warmest — spin axis    */
+    init_pair(CP_MOM, th->ramp[0], -1);    /* coolest — momentum L   */
+    init_pair(CP_GROUND, th->ramp[3], -1); /* cool neutral           */
+    init_pair(CP_TRAIL, th->trail, -1);    /* trail colour           */
+    init_pair(CP_DISC, th->ramp[4], -1);   /* warm neutral           */
     init_pair(PAIR_HUD, 226, -1);
     init_pair(PAIR_HINT, 51, -1);
   } else {
-    /* 8-color fallback: keep axes distinguishable on legacy terminals */
-    init_pair(CP_AXIS_X, COLOR_BLUE, -1);   /* cool side             */
-    init_pair(CP_AXIS_Y, COLOR_YELLOW, -1); /* warm side             */
-    init_pair(CP_AXIS_Z, COLOR_RED, -1);    /* warm extreme — spin   */
-    init_pair(CP_MOM, COLOR_CYAN, -1);      /* cool extreme — L      */
+    /* Basic eight-colour terminals: just keep the elements telling apart */
+    init_pair(CP_AXIS_X, COLOR_BLUE, -1);
+    init_pair(CP_AXIS_Y, COLOR_YELLOW, -1);
+    init_pair(CP_AXIS_Z, COLOR_RED, -1);
+    init_pair(CP_MOM, COLOR_CYAN, -1);
     init_pair(CP_GROUND, COLOR_WHITE, -1);
     init_pair(CP_TRAIL, COLOR_MAGENTA, -1);
     init_pair(CP_DISC, COLOR_GREEN, -1);
@@ -660,22 +493,16 @@ static void color_init(int theme) {
   color_apply_theme(theme);
 }
 
-/* ===================================================================== */
-/* §4  coords — aspect correction + 3-D orthographic projection          */
-/* ===================================================================== */
+/* ── §4  coords — flatten 3-D points onto the terminal grid ───────────── */
 
 /*
- * ASPECT CORRECTION
- * Terminal cells are ~2× taller than wide (CELL_H/CELL_W ≈ 2).
- * When converting a 3-D screen-Y coordinate to a terminal row, we
- * multiply by ASPECT = CELL_W/CELL_H ≈ 0.5 so that unit-length axes
- * appear equal length in all directions.  Only applied at draw time.
- *
- * PROJECTION
- * Two sequential rotations applied to world coordinates:
- *   1. Azimuth φ: rotate around world Z (panning left/right).
- *   2. Elevation θ: tilt the scene so the viewer is above the horizon.
- * Depth (sz) is used for depth-cueing (A_BOLD for near, A_DIM for far).
+ * Two jobs here.  First, terminal cells are about twice as tall as they are
+ * wide, so circles would look like ovals; ASPECT ≈ 0.5 squashes the vertical
+ * at draw time to fix that.  Second, project() turns a 3-D world point into
+ * a screen cell: it spins the scene left/right (azimuth) and tilts it up/down
+ * (elevation) to set the camera angle, then drops the depth onto the page.
+ * It also hands back how near/far the point is, which the drawing code uses
+ * to make close things bold and far things dim.
  */
 #define CELL_W 8
 #define CELL_H 16
@@ -741,33 +568,31 @@ static void draw_seg3d(WINDOW *w, float ox3, float oy3, float oz3, float ex3,
   }
 }
 
-/* ===================================================================== */
-/* §5  entity — Gyro                                                      */
-/* ===================================================================== */
+/* ── §5  entity — the gyro ────────────────────────────────────────────── */
 
-/* ── RK4 state vector [ωx, ωy, ωz, qw, qx, qy, qz] ─────────────────── */
+/* ── the moving state, packed for the solver ──────────────────────────── */
 
 /*
- * State7 — the 7-component vector RK4 [6] integrates each tick.
+ * State7 — the 7 numbers that describe the spinning body right now,
+ * laid flat in one array so the solver can step them all the same way.
  *
- * Layout (positional — order matters across gyro_deriv / gyro_step):
- *   v[0..2]  =  ωx, ωy, ωz        angular velocity (body frame, rad/s)
- *   v[3..6]  =  qw, qx, qy, qz    orientation quaternion (unit-length)
+ * The slots are positional — the order has to match between gyro_deriv
+ * and gyro_step:
+ *   v[0..2]  =  the spin rate about each body axis (rad/s)
+ *   v[3..6]  =  the orientation, stored as a quaternion (kept length-1)
  *
- * Why a flat array (not separate ω-vector and quaternion structs):
- *   RK4 needs the SAME element-wise operations (add, scalar multiply)
- *   on every component to compute k₁..k₄ and the weighted sum.  A
- *   split layout would force gyro_deriv to return two values and the
- *   RK4 step to add them piecewise.  Flat array → s7_add / s7_scale
- *   are trivial 7-iteration loops; cost is that callers must know the
- *   positional layout, which stays contained in two functions.
+ * Why one flat array instead of a separate spin vector and orientation:
+ *   The solver does the same simple arithmetic to every number (add two
+ *   states, scale a state). A flat array makes s7_add / s7_scale tiny
+ *   7-element loops. The price is that two functions have to remember
+ *   which slot is which — and only those two do.
  *
- * Why ω and q in ONE state (not integrated separately):
- *   They're COUPLED — Euler's equations [1] give ω̇ in terms of ω
- *   (and torque), and quaternion kinematics [4] give q̇ in terms of
- *   BOTH q and ω: q̇ = ½ · q ⊗ (0, ω).  RK4 needs a coherent
- *   intermediate state to evaluate k₂, k₃, k₄; integrating them in
- *   two separate passes would break the implicit coupling.
+ * Why spin and orientation travel together in one state:
+ *   They feed each other. How the spin changes depends on the spin (and
+ *   any gravity tug); how the orientation changes depends on BOTH the
+ *   orientation and the spin. The solver needs a single, consistent
+ *   snapshot to take its trial steps, so they can't be advanced in two
+ *   separate passes. References: spin rules [1], orientation rules [4].
  */
 typedef struct {
   float v[7];
@@ -786,19 +611,18 @@ static State7 s7_scale(State7 a, float s) {
   return r;
 }
 
-/* ── physics building blocks (consumed by gyro_deriv below) ───────── */
+/* ── physics building blocks (used by gyro_deriv below) ───────────────── */
 
 /*
- * gravity_torque_body_frame — Lagrange-top gravity torque [1].
+ * gravity_torque_body_frame — how hard gravity twists a leaning top [1].
  *
- * Centre of mass sits at l·ez (body-Z) in world frame.  In the body
- * frame, world-Z is the third row of R, which from the quaternion
- * formula [4] is (gz_bx, gz_by, gz_bz) = (2(qx·qz − qw·qy),
- * 2(qy·qz + qw·qx), 1 − 2(qx² + qy²)).
- *
- * Torque = (0, 0, l) × m·g·(−Ẑ_body)  = mgl · (gz_by, −gz_bx, 0)
- * The z-component is identically zero (gravity can't twist about
- * its own axis), so only tau_x and tau_y are returned.
+ * Gravity pulls straight down on the top's centre of mass. When the top
+ * leans, that pull acts off to one side and tries to twist it — the
+ * sideways twist is what makes a top precess instead of just falling.
+ * We work out which way "down" points in the body's own frame, then turn
+ * that into the twist. Gravity can't twist the top about the very axis it
+ * pulls along, so that part is always zero and only tau_x / tau_y come
+ * back. Quaternion-to-direction formula from [4].
  */
 static void gravity_torque_body_frame(float qw, float qx, float qy, float qz,
                                       float mgl, float *tau_x, float *tau_y) {
@@ -809,16 +633,19 @@ static void gravity_torque_body_frame(float qw, float qx, float qy, float qz,
 }
 
 /*
- * euler_equations_omega_dot — Euler's equations of motion [1, 2].
+ * euler_equations_omega_dot — how the spin changes from moment to moment.
+ *
+ * These are Euler's equations [1, 2]: the rule that says how a rigid
+ * body's spin speeds up or slows down about each axis, given its current
+ * spin and any twist acting on it. The key part is that spinning about
+ * one axis bleeds into the others when the body isn't equally hard to
+ * spin all ways. That cross-talk is the whole show — it's where the
+ * wobble, the precession, and the tennis-racket flip [3] come from. The
+ * formulas are kept below for reference.
  *
  *   I₁·ω̇x = (I₂ − I₃)·ωy·ωz + τx
  *   I₂·ω̇y = (I₃ − I₁)·ωz·ωx + τy
- *   I₃·ω̇z = (I₁ − I₂)·ωx·ωy + τz       (τz ≡ 0 in this demo)
- *
- * The cross-product terms (I₂ − I₃)·ωy·ωz etc. are what couple the
- * three components — without them ω̇ would be a linear ODE; with
- * them you get Euler precession, nutation, AND the intermediate-axis
- * instability [3] for free.
+ *   I₃·ω̇z = (I₁ − I₂)·ωx·ωy + τz       (τz is always 0 in this demo)
  */
 static void euler_equations_omega_dot(float I1, float I2, float I3, float wx,
                                       float wy, float wz, float tau_x,
@@ -830,19 +657,18 @@ static void euler_equations_omega_dot(float I1, float I2, float I3, float wx,
 }
 
 /*
- * quaternion_kinematics — q̇ from quaternion and body-frame ω [4].
+ * quaternion_kinematics — how the orientation changes as the body spins.
  *
- *   q̇ = ½ · q ⊗ (0, ω)
+ * Given which way the body currently faces and how fast it's spinning,
+ * this gives the rate at which its facing turns. Stepping it forward a
+ * little nudges the orientation slightly off "valid" each time, so
+ * project_quaternion_to_unit tidies it back up after every step. The
+ * exact formulas (the standard quaternion rate from [4]) are below.
  *
- * Expanded component-by-component (Hamilton product):
  *   q̇w = ½ · (−qx·ωx − qy·ωy − qz·ωz)
  *   q̇x = ½ · ( qw·ωx + qy·ωz − qz·ωy)
  *   q̇y = ½ · ( qw·ωy − qx·ωz + qz·ωx)
  *   q̇z = ½ · ( qw·ωz + qx·ωy − qy·ωx)
- *
- * Lives on the tangent space of S³ ⊂ ℝ⁴; integrating it with RK4
- * drifts off S³ by O(dt⁵) per step — fixed by project_quaternion
- * after each integration step.
  */
 static void quaternion_kinematics(float qw, float qx, float qy, float qz,
                                   float wx, float wy, float wz, float *dqw,
@@ -854,37 +680,32 @@ static void quaternion_kinematics(float qw, float qx, float qy, float qz,
 }
 
 /*
- * gyro_deriv — time derivative of the 7-component state.
- *
- * Input:  s = [ωx, ωy, ωz, qw, qx, qy, qz]
- * Output: ṡ = [ω̇x, ω̇y, ω̇z, q̇w, q̇x, q̇y, q̇z]
- *
- * Pseudocode:
- *   1. compute external torque (gravity, or zero)
- *   2. Euler's equations → ω̇
- *   3. quaternion kinematics → q̇
- *   4. pack ω̇ and q̇ into State7
+ * gyro_deriv — given the body's state right now, hand back how fast every
+ * part of it is changing. This is the one function the solver calls over
+ * and over to feel out its next step. It bundles the three rules above:
+ * the gravity twist (if any), how the spin changes, and how the facing
+ * changes — then packs all seven rates into one State7.
  */
 static State7 gyro_deriv(State7 s, float I1, float I2, float I3, float mgl,
                          bool gravity) {
   float wx = s.v[0], wy = s.v[1], wz = s.v[2];
   float qw = s.v[3], qx = s.v[4], qy = s.v[5], qz = s.v[6];
 
-  /* 1. external torque (Lagrange-top gravity, or zero) */
+  /* the twist from gravity (zero unless this preset has gravity on) */
   float tau_x = 0.0f, tau_y = 0.0f;
   if (gravity)
     gravity_torque_body_frame(qw, qx, qy, qz, mgl, &tau_x, &tau_y);
 
-  /* 2. Euler's equations → angular acceleration */
+  /* how the spin is changing right now */
   float dwx, dwy, dwz;
   euler_equations_omega_dot(I1, I2, I3, wx, wy, wz, tau_x, tau_y, &dwx, &dwy,
                             &dwz);
 
-  /* 3. quaternion kinematics → quaternion rate */
+  /* how the facing is changing right now */
   float dqw, dqx, dqy, dqz;
   quaternion_kinematics(qw, qx, qy, qz, wx, wy, wz, &dqw, &dqx, &dqy, &dqz);
 
-  /* 4. pack into State7 (same positional layout as input s) */
+  /* pack the seven rates back in the same slot order as the input */
   State7 d;
   d.v[0] = dwx;
   d.v[1] = dwy;
@@ -896,17 +717,13 @@ static State7 gyro_deriv(State7 s, float I1, float I2, float I3, float mgl,
   return d;
 }
 
-/* ── quaternion → rotation axes ─────────────────────────────────────── */
+/* ── turn the orientation back into three pointing directions ─────────── */
 
 /*
- * quat_to_axes() — extract body frame axes in world coordinates.
- *
- * The rotation matrix R (body→world) has these columns:
- *   ex = first  column = body X in world
- *   ey = second column = body Y in world
- *   ez = third  column = body Z in world (the spin axis)
- *
- * Standard formula from unit quaternion q = (qw, qx, qy, qz):
+ * quat_to_axes — read the orientation and hand back the three directions
+ * the body's own axes are pointing in world space: ex and ey lie in the
+ * disc, ez is the spin axis. The drawing code needs these to know which
+ * way to draw the body. Standard quaternion-to-axes formula.
  */
 static void quat_to_axes(const float q[4], float ex[3], float ey[3],
                          float ez[3]) {
@@ -925,18 +742,15 @@ static void quat_to_axes(const float q[4], float ex[3], float ey[3],
 }
 
 /*
- * gram_schmidt — re-orthonormalise three axis vectors in place [5].
+ * gram_schmidt — straighten the three axis directions back up [5].
  *
- * Prevents floating-point round-off in quat_to_axes from accumulating
- * into non-orthogonal frame axes.  Always invoked via refresh_body_axes
- * (preset load + every RK4 step), never called directly elsewhere.
- *
- *   e1 ← normalize(e1)
- *   e2 ← normalize(e2 − (e2·e1)·e1)
- *   e3 ← e1 × e2                       (always exactly orthogonal)
+ * Tiny rounding errors creep in each step, so the three axes slowly stop
+ * being unit-length and at right angles to each other. This nudges them
+ * back to clean, square, length-1 directions so the body never looks
+ * skewed or stretched. Only refresh_body_axes calls it.
  */
 static void gram_schmidt(float e1[3], float e2[3], float e3[3]) {
-  /* Normalise e1 */
+  /* make e1 length 1 */
   float n = sqrtf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
   if (n > 1e-9f) {
     e1[0] /= n;
@@ -944,7 +758,7 @@ static void gram_schmidt(float e1[3], float e2[3], float e3[3]) {
     e1[2] /= n;
   }
 
-  /* Remove e1 component from e2, normalise */
+  /* lean e2 so it's square to e1, then make it length 1 */
   float d = e2[0] * e1[0] + e2[1] * e1[1] + e2[2] * e1[2];
   e2[0] -= d * e1[0];
   e2[1] -= d * e1[1];
@@ -956,7 +770,7 @@ static void gram_schmidt(float e1[3], float e2[3], float e3[3]) {
     e2[2] /= n;
   }
 
-  /* e3 = e1 × e2 (guaranteed orthonormal) */
+  /* e3 is whatever direction is square to both — the cross product */
   e3[0] = e1[1] * e2[2] - e1[2] * e2[1];
   e3[1] = e1[2] * e2[0] - e1[0] * e2[2];
   e3[2] = e1[0] * e2[1] - e1[1] * e2[0];
@@ -965,128 +779,106 @@ static void gram_schmidt(float e1[3], float e2[3], float e3[3]) {
 /* ── trail ring-buffer ───────────────────────────────────────────────── */
 
 /*
- * TrailPt — one captured screen position of the body-Z (spin axis)
- * tip, stored in the ring-buffer Gyro.trail[].
+ * TrailPt — one dot in the fading trail the spin axis leaves behind.
  *
- * Stored in SCREEN space (cell row / col), not world space.  The
- * trail is purely visual — it's the locus the spin axis traces out
- * on the current viewport as the body precesses / wobbles.  Storing
- * world-space points would force re-projection every frame even
- * though the view rotation is slow; screen-space captures the
- * polhode on the active viewport directly and lets gyro_draw plot
- * it in one pass with no math.
- *
- * Reset when: (a) the view resizes (SIGWINCH — old screen coords
- * stale), (b) the user toggles trail off, (c) preset switch / reset
- * (the polhode belongs to the previous body state).
+ * We save where the tip of the spin axis landed ON SCREEN (a cell row and
+ * column), not where it was in the 3-D world. The trail is just eye candy
+ * showing the path the axis has swept. Saving the screen spot directly
+ * means gyro_draw can plot the whole trail with no extra math; the catch
+ * is the saved spots only make sense for the current view, so we throw
+ * the trail away whenever that changes: on resize, when the user turns
+ * the trail off, and on a preset switch or reset (the old path belonged
+ * to a different motion).
  */
 typedef struct {
   int col, row;
 } TrailPt;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Gyro — the complete state of one rigid-body simulation.
+/*
+ * Gyro — everything about one spinning body, in one place.
  *
- * Bundles the PHYSICS state (omega + quat) with DERIVED rendering
- * helpers (ex / ey / ez / L), BODY PARAMETERS (inertia + gravity), the
- * trail RING BUFFER, the VIEW camera, and the per-instance CONTROL
- * flags.  One Gyro lives inside Scene (§6); App (§8) holds the Scene.
+ * It holds the live motion (spin + facing), a few values worked out from
+ * that motion for the drawing code, the body's shape and gravity setting,
+ * the fading trail, the camera angle, and the per-body control flags. One
+ * Gyro lives inside Scene (§6), which lives inside App (§8).
  *
- * Why a single owner (physics + derived + UI all in one struct):
- *   The derived axes ex / ey / ez and the world-frame angular momentum
- *   L are pointer-free reads from quat / omega after each step — they
- *   live next to their source so quat_to_axes + gram_schmidt + the
- *   L-recompute can run in one tail pass at the end of gyro_step.
- *   The trail and view live here because they're meaningless without
- *   the body that produced them; r-reset memsets the whole struct in
- *   one call.
+ * Why keep it all together: the worked-out values and the trail are
+ * meaningless without the body that produced them, so they sit right next
+ * to it — and "reset" (r) just zeroes the whole struct in one go.
  *
- * Sleeping-top stability threshold (symmetric top under gravity [1]):
- *   ω_z² > 4·mgl·I₁ / I₃²  ⇒ upright position is stable.
- *   Preset 4 (Sleeping Top) sits well above the threshold; preset 5
- *   (Slow Heavy Top) sits below it on purpose to expose the wide
- *   precession + nutation cusps.
+ * A fun thing to watch for: spin a top fast enough under gravity and it
+ * stands almost still and upright — it "sleeps". Preset 4 spins fast
+ * enough to sleep; preset 5 is deliberately too slow, so it wobbles
+ * wide instead. The exact spin-fast-enough threshold is in [1].
  *
  * Field groups (mirrored by the layout below):
  *
- *   Physics state    — omega, quat.  The 7 floats RK4 [6] integrates,
- *                       copied into State7 inside gyro_step and back
- *                       out after the step.  See Euler's equations
- *                       [1, 2] and quaternion kinematics [4].
+ *   Live motion      — omega, quat. The spin rate and the facing: the
+ *                      seven numbers the solver steps forward each tick.
  *
- *   Derived (cached) — ex, ey, ez, L.  Recomputed in gyro_step from
- *                       quat (axes via [4]) and omega
- *                       (L = Σ Ii·ωi·ei).  Cached because draw + HUD
- *                       read them every frame; recomputing on every
- *                       read would multiply atan / sqrt calls inside
- *                       draw_seg3d.
+ *   Worked out       — ex, ey, ez, L. The three body-axis directions and
+ *                      the angular momentum arrow, recomputed each step.
+ *                      Kept here so draw and the HUD can just read them
+ *                      every frame instead of redoing the math.
  *
- *   Body parameters  — I1, I2, I3, gravity, mgl.  Loaded from the
- *                       active GPreset.  Persistent across r-reset
- *                       unless the user picks a new preset (n / p)
- *                       or toggles gravity (g).
+ *   Body parameters  — I1, I2, I3, gravity, mgl. The body's shape and
+ *                      whether gravity acts. Loaded from the active
+ *                      preset; survive a reset unless you switch preset
+ *                      (n / p) or toggle gravity (g).
  *
- *   Polhode trail    — trail[], trail_head, trail_fill, show_trail.
- *                       Classic circular log: trail_head walks around
- *                       overwriting oldest entries once full;
- *                       trail_fill saturates at TRAIL_LEN.  No
- *                       allocation, no shifts.
+ *   Trail            — trail[], trail_head, trail_fill, show_trail. A
+ *                      fixed ring of past tip positions: trail_head walks
+ *                      around overwriting the oldest once it fills up. No
+ *                      allocation, no shuffling.
  *
- *   View camera      — view_phi (azimuth), view_theta (elevation).
- *                       Auto-rotated at 0.15 rad/s in scene_tick +
- *                       nudged by arrow keys.  Owned by Gyro (not
- *                       Scene) so r-reset preserves the user's view.
+ *   View camera      — view_phi (turn left/right), view_theta (tilt up/
+ *                      down). Drifts on its own for a cinematic spin and
+ *                      nudges with the arrow keys. Lives on Gyro so a
+ *                      reset keeps the angle you were looking from.
  *
- *   Control flags    — preset (active index into PRESETS[]), paused
- *                       (space toggle).  Live here so the HUD and
- *                       app_handle_key reach them through one Gyro
- *                       pointer.
- * ─────────────────────────────────────────────────────────────────────── */
+ *   Control flags    — preset (which demo is active), paused. Here so the
+ *                      HUD and key handler reach them through one pointer.
+ */
 typedef struct {
-  /* ── Physics state (integrated by gyro_step) ──────────────────── */
-  float omega[3]; /* angular velocity in body frame (rad/s)   */
-  float quat[4];  /* orientation quaternion [qw,qx,qy,qz];
-                   * |q|=1 maintained by post-step projection */
+  /* ── Live motion (stepped forward each tick) ──────────────────── */
+  float omega[3]; /* spin rate about each body axis (rad/s)    */
+  float quat[4];  /* which way the body faces, as a quaternion;
+                   * kept length-1 after every step            */
 
-  /* ── Derived (recomputed in gyro_step from quat / omega) ──────── */
-  float ex[3]; /* body X axis in world frame               */
-  float ey[3]; /* body Y axis in world frame               */
-  float ez[3]; /* body Z axis (spin axis) in world frame   */
-  float L[3];  /* angular momentum L = Σ Ii·ωi·ei (world)  */
+  /* ── Worked out from the motion, for drawing ──────────────────── */
+  float ex[3]; /* where body X points, in world space      */
+  float ey[3]; /* where body Y points, in world space      */
+  float ez[3]; /* where the spin axis points, in world     */
+  float L[3];  /* the angular-momentum arrow, in world     */
 
-  /* ── Body parameters (loaded from active GPreset) ─────────────── */
-  float I1, I2, I3; /* principal moments of inertia (kg·m²)     */
+  /* ── Body parameters (from the active preset) ─────────────────── */
+  float I1, I2, I3; /* how hard to spin about each axis (kg·m²)  */
 
-  bool gravity; /* false → Euler torque-free
-                 * true  → Lagrange top, gravity torque on  */
-  float mgl;    /* mass·g·l, gravity-torque scale (N·m)     */
+  bool gravity; /* false: free spin; true: gravity acts     */
+  float mgl;    /* strength of the gravity tug (N·m)        */
 
-  /* ── Polhode trail (ring buffer in SCREEN space) ──────────────── */
-  TrailPt trail[TRAIL_LEN]; /* body-Z tip positions, oldest first       */
-  int trail_head;           /* next-write index (mod TRAIL_LEN)         */
-  int trail_fill;           /* live entries; saturates at TRAIL_LEN     */
-  bool show_trail;          /* l / L toggles                            */
+  /* ── Fading trail (ring of past screen positions) ─────────────── */
+  TrailPt trail[TRAIL_LEN]; /* spin-axis tip spots, oldest first        */
+  int trail_head;           /* where the next spot gets written         */
+  int trail_fill;           /* how many spots are live (caps at full)   */
+  bool show_trail;          /* l / L turn it on and off                 */
 
-  /* ── View camera (preserved across r-reset) ───────────────────── */
-  float view_phi;   /* azimuth, radians; auto-rotates slowly    */
-  float view_theta; /* elevation, radians; clamped to [0.1,1.4] */
+  /* ── View camera (kept across a reset) ────────────────────────── */
+  float view_phi;   /* turn left/right; drifts on its own       */
+  float view_theta; /* tilt up/down; held between 0.1 and 1.4   */
 
   /* ── Control flags ────────────────────────────────────────────── */
-  int preset;  /* active index into PRESETS[]; n / p cycle */
-  bool paused; /* space toggles; scene_tick is a no-op
-                * when true                                */
+  int preset;  /* which demo is active; n / p cycle        */
+  bool paused; /* space toggles; frozen while true         */
 } Gyro;
 
-/* ── initialisation building blocks ──────────────────────────────────── */
+/* ── setup helpers ────────────────────────────────────────────────────── */
 
 /*
- * axis_angle_to_quat — build a unit quaternion from an axis-angle
- * rotation [4]:
- *
- *   q = (cos(θ/2),  sin(θ/2) · â)        where â = axis / |axis|
- *
- * Used to construct the initial tilt of each preset (rotates the
- * body-Z away from world-Z by tilt_deg so gravity has a lever arm).
+ * axis_angle_to_quat — "lean this far around this direction" turned into
+ * an orientation. Each preset starts the top tilted over by some angle so
+ * gravity has something to act on; this builds that starting tilt.
+ * Axis-angle to quaternion formula from [4].
  */
 static void axis_angle_to_quat(float angle_rad, const float axis[3],
                                float q[4]) {
@@ -1103,13 +895,10 @@ static void axis_angle_to_quat(float angle_rad, const float axis[3],
 }
 
 /*
- * refresh_body_axes — recompute (ex, ey, ez) from the current
- * quaternion, then Gram-Schmidt re-orthonormalise [5] to drag the
- * frame back onto SO(3) after floating-point round-off.
- *
- * Called every time quat changes (preset load, RK4 step) so the
- * cached body axes that draw / HUD read are always consistent with
- * the live orientation.
+ * refresh_body_axes — re-read the three body-axis directions from the
+ * current orientation and straighten them back up. Called every time the
+ * orientation changes so the directions draw and the HUD read always
+ * match where the body actually faces.
  */
 static void refresh_body_axes(Gyro *g) {
   quat_to_axes(g->quat, g->ex, g->ey, g->ez);
@@ -1117,9 +906,9 @@ static void refresh_body_axes(Gyro *g) {
 }
 
 /*
- * clear_polhode_trail — drop all captured trail points.  Called on
- * preset switch, r-reset, l-trail-toggle-off, and resize — the
- * stored screen-space points are stale in every one of those cases.
+ * clear_polhode_trail — throw the whole trail away. Done on a preset
+ * switch, reset, trail-off, and resize — in every one of those cases the
+ * saved screen spots no longer mean anything.
  */
 static void clear_polhode_trail(Gyro *g) {
   g->trail_head = 0;
@@ -1127,10 +916,9 @@ static void clear_polhode_trail(Gyro *g) {
 }
 
 /*
- * load_body_parameters — copy inertia tensor + initial angular
- * velocity + gravity flag + mgl from the preset record into the live
- * Gyro.  Does NOT touch quat or the trail (those are reset by their
- * own helpers in gyro_set_preset).
+ * load_body_parameters — copy the body's shape, starting spin, and
+ * gravity setting from a preset into the live Gyro. Leaves the facing and
+ * the trail alone — gyro_set_preset resets those separately.
  */
 static void load_body_parameters(Gyro *g, const GPreset *pr) {
   g->gravity = pr->gravity;
@@ -1144,14 +932,9 @@ static void load_body_parameters(Gyro *g, const GPreset *pr) {
 }
 
 /*
- * gyro_set_preset — load initial conditions from a preset record.
- *
- * Pseudocode:
- *   1. record active preset index
- *   2. load body parameters (I, ω, gravity, mgl) from preset
- *   3. quat ← axis_angle_to_quat(tilt_deg, tilt_axis)
- *   4. refresh body axes from the new quaternion
- *   5. clear polhode trail (belongs to the previous body state)
+ * gyro_set_preset — start one of the eight demos from scratch: load its
+ * body and spin, tilt it to its starting lean, work out the body axes,
+ * and clear the old trail (it belonged to the previous demo).
  */
 static void gyro_set_preset(Gyro *g, int p) {
   const GPreset *pr = &PRESETS[p];
@@ -1174,9 +957,9 @@ static void gyro_init(Gyro *g) {
   gyro_set_preset(g, 0);
 }
 
-/* ── RK4 building blocks (consumed by gyro_step below) ─────────────── */
+/* ── stepping the motion forward (used by gyro_step below) ────────────── */
 
-/* Pack the live Gyro state into the flat RK4 vector. */
+/* Copy the live spin + facing into the flat array the solver works on. */
 static State7 pack_gyro_into_state7(const Gyro *g) {
   State7 s;
   s.v[0] = g->omega[0];
@@ -1189,7 +972,7 @@ static State7 pack_gyro_into_state7(const Gyro *g) {
   return s;
 }
 
-/* Inverse of pack_gyro_into_state7 — store the RK4 result back. */
+/* Copy the stepped values back out of the flat array into the Gyro. */
 static void unpack_state7_into_gyro(State7 s, Gyro *g) {
   g->omega[0] = s.v[0];
   g->omega[1] = s.v[1];
@@ -1201,18 +984,14 @@ static void unpack_state7_into_gyro(State7 s, Gyro *g) {
 }
 
 /*
- * rk4_classical_step — one classical 4th-order Runge-Kutta step [6].
+ * rk4_classical_step — take one accurate step forward in time [6].
  *
- *   k₁ = f(s)
- *   k₂ = f(s + ½·dt·k₁)
- *   k₃ = f(s + ½·dt·k₂)
- *   k₄ = f(s + dt·k₃)
- *   s_{n+1} = s + (dt/6) · (k₁ + 2·k₂ + 2·k₃ + k₄)
- *
- * Local truncation error O(dt⁵), global O(dt⁴).  With SUB_STEPS=8
- * sub-steps per render frame at 60 Hz, the effective dt ≈ 2 ms — far
- * below the fastest oscillation period in any preset (Dzhanibekov
- * flips at ~1 Hz, nutation at ~6 Hz, ω_z up to 25 rad/s).
+ * Instead of trusting a single guess of how things are changing, it takes
+ * four trial peeks across the step and blends them, which cancels out
+ * most of the error. We need the accuracy because the spin equations feed
+ * back on themselves and the cheap one-peek method visibly drifts within
+ * seconds. The four-peek recipe (k₁..k₄, weighted ⅙·(k₁+2k₂+2k₃+k₄)) is
+ * the standard one, in the code below.
  */
 static State7 rk4_classical_step(State7 s, float dt, float I1, float I2,
                                  float I3, float mgl, bool gravity) {
@@ -1229,11 +1008,9 @@ static State7 rk4_classical_step(State7 s, float dt, float I1, float I2,
 }
 
 /*
- * project_quaternion_to_unit — divide quaternion by its length,
- * snapping it back onto the unit sphere S³ ⊂ ℝ⁴.  Each RK4 step
- * drifts off S³ by O(dt⁵); this projection is the cheapest case of
- * the geometric-integration projection method [5] and is enough to
- * stay on the manifold for our integration horizons.
+ * project_quaternion_to_unit — rescale the orientation back to length 1.
+ * Each step nudges it slightly off being a valid rotation; dividing by
+ * its own length snaps it back, which is all that's needed here [5].
  */
 static void project_quaternion_to_unit(float q[4]) {
   float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
@@ -1246,13 +1023,13 @@ static void project_quaternion_to_unit(float q[4]) {
 }
 
 /*
- * recompute_angular_momentum_world — L = Σ Ii·ωi·ei.
+ * recompute_angular_momentum_world — work out the angular-momentum arrow.
  *
- * Each principal axis ei carries inertia Ii and rotates at ωi; the
- * angular momentum is the vector sum of these contributions in world
- * coordinates.  L̇ = 0 when there's no external torque (Euler
- * presets) — a free visual sanity check: in preset 0 the L vector
- * stays put while the body precesses around it.
+ * Add up each axis's share — how hard it is to spin times how fast it's
+ * spinning, pointed along that axis — to get one arrow in world space.
+ * With no gravity this arrow never moves, which is a nice thing to watch:
+ * in preset 0 the L arrow sits dead still while the body circles around
+ * it. Each axis's share is Ii·ωi along ei; the sum is below.
  */
 static void recompute_angular_momentum_world(Gyro *g) {
   for (int k = 0; k < 3; k++) {
@@ -1262,15 +1039,10 @@ static void recompute_angular_momentum_world(Gyro *g) {
 }
 
 /*
- * gyro_step — advance the rigid-body simulation by dt.
- *
- * Pseudocode:
- *   1. pack Gyro state into State7
- *   2. RK4 classical step (k1..k4 weighted sum [6])
- *   3. unpack State7 back into Gyro
- *   4. project quaternion to unit length (S³ drift removal [5])
- *   5. refresh body axes from the new quaternion (+ Gram-Schmidt)
- *   6. recompute world-frame angular momentum L
+ * gyro_step — move the whole simulation forward by one small slice of
+ * time. Steps the spin and facing ahead, then cleans up the rounding
+ * (rescale the facing, straighten the axes) and re-derives the
+ * angular-momentum arrow for the drawing code.
  */
 static void gyro_step(Gyro *g, float dt) {
   State7 s = pack_gyro_into_state7(g);
@@ -1283,12 +1055,17 @@ static void gyro_step(Gyro *g, float dt) {
   recompute_angular_momentum_world(g);
 }
 
-/* ── drawing — viewport + per-layer helpers consumed by gyro_draw ──── */
+/* ── drawing — the camera bundle and the per-layer painters ───────────── */
 
 /*
- * Viewport — every projection parameter the draw layers need in one
- * bundle.  Computed once at the top of gyro_draw and passed by const
- * pointer to each layer helper so they don't drag 7+ args around.
+ * Viewport — all the camera settings the drawing code needs, in one
+ * bundle. Worked out once at the top of gyro_draw and handed to each
+ * painter, so they don't each have to carry seven separate arguments.
+ *
+ *   phi, theta — which way the camera looks (turn, then tilt)
+ *   scale      — how many screen cells one world unit spans
+ *   cx, cy     — the centre cell everything is drawn around
+ *   cols, rows — the screen size, used to clip lines at the edges
  */
 typedef struct {
   float phi, theta; /* camera azimuth + elevation (radians)        */
@@ -1298,10 +1075,9 @@ typedef struct {
 } Viewport;
 
 /*
- * Pixels-per-world-unit so that a unit-length axis fits in roughly
- * 1/7 of the smaller screen dimension.  rows is multiplied by 2
- * because terminal cells are ~2× taller than wide (ASPECT correction
- * is applied later inside project()).
+ * Pick a zoom so a unit-length axis fills about a seventh of the smaller
+ * screen side. Height counts double because cells are about twice as tall
+ * as wide (project() squashes the vertical back later).
  */
 static float compute_render_scale(int cols, int rows) {
   float sc_h = (float)cols / 7.0f;
@@ -1343,9 +1119,9 @@ static void draw_ground_ring(WINDOW *w, const Viewport *v) {
 }
 
 /*
- * draw_world_z_reference — vertical line from origin to (0,0,1.3).
- * Together with the ground ring it makes "upright" visually concrete,
- * so the tilt of body-Z away from world-Z reads as nutation angle.
+ * draw_world_z_reference — a straight-up line marking "upright". With the
+ * ground ring it gives the eye a true vertical, so you can see how far the
+ * top's own axis is leaning away from it.
  */
 static void draw_world_z_reference(WINDOW *w, const Viewport *v) {
   draw_seg3d(w, 0, 0, 0, 0, 0, 1.3f, v->phi, v->theta, v->scale, v->cx, v->cy,
@@ -1353,12 +1129,9 @@ static void draw_world_z_reference(WINDOW *w, const Viewport *v) {
 }
 
 /*
- * draw_body_disc_equator — ring around the body XY plane.
- *
- * DISC_PTS dots laid out on a circle of radius dr in the BODY frame,
- * each transformed to world coords via the body axes ex / ey.  Makes
- * the body's orientation visually concrete — you literally watch the
- * disc wobble — without committing to any particular rigid shape.
+ * draw_body_disc_equator — a ring of dots lying flat in the body, so the
+ * body has a visible face you can watch wobble. It stands in for the
+ * shape without committing to any particular one.
  */
 static void draw_body_disc_equator(WINDOW *w, const Gyro *g,
                                    const Viewport *v) {
@@ -1382,13 +1155,11 @@ static void draw_body_disc_equator(WINDOW *w, const Gyro *g,
 }
 
 /*
- * draw_polhode_trail — body-Z tip locus, fading with age.
- *
- * Newest 1/4 = A_BOLD, middle 1/4 = normal, oldest = A_DIM.  Reveals
- * the body-cone trace: clean circles for preset 1 (steady precession),
- * cusps for preset 5 (nutation), figure-eights or wild swings for the
- * intermediate-axis presets.  Trail points are stored in screen space
- * (see TrailPt docstring), so this loop is pure ncurses output.
+ * draw_polhode_trail — the path the spin axis has swept, fading as it
+ * ages (newest dots bold, oldest dim). The shape is the tell: clean
+ * circles for a steady top, dipped scallops for a wobbling one, and wild
+ * loops for the flipping ones. The dots are already in screen positions
+ * (see TrailPt), so this just paints them.
  */
 static void draw_polhode_trail(WINDOW *w, const Gyro *g, const Viewport *v) {
   if (!g->show_trail || g->trail_fill == 0)
@@ -1415,13 +1186,11 @@ static void draw_polhode_trail(WINDOW *w, const Gyro *g, const Viewport *v) {
 }
 
 /*
- * draw_body_axes_depth_sorted — body X / Y / Z axes with tip labels.
- *
- * Painter's algorithm: project each tip, sort by depth descending,
- * draw farthest first so nearer axes paint OVER farther ones.
- * Within each axis, depth < 0 (near) → A_BOLD; depth > 0 (far) →
- * normal.  Tip label sits 15 % beyond the unit-length tip so it
- * doesn't fight the line glyph for the last cell.
+ * draw_body_axes_depth_sorted — the body's three axes, labelled at the
+ * tips. We draw the farthest one first so the nearer ones paint over it,
+ * which is what makes them look layered in 3-D. Nearer axes are drawn
+ * bold so they read as closer. The label sits a little past the tip so it
+ * doesn't land on top of the line.
  */
 static void draw_body_axes_depth_sorted(WINDOW *w, const Gyro *g,
                                         const Viewport *v) {
@@ -1435,7 +1204,7 @@ static void draw_body_axes_depth_sorted(WINDOW *w, const Gyro *g,
       {g->ez, "Z", CP_AXIS_Z},
   };
 
-  /* Probe tip depth for each axis */
+  /* how near/far each axis tip is from the camera */
   float depths[3];
   for (int i = 0; i < 3; i++) {
     int c, r;
@@ -1445,7 +1214,7 @@ static void draw_body_axes_depth_sorted(WINDOW *w, const Gyro *g,
     depths[i] = d;
   }
 
-  /* Bubble-sort indices by depth descending (farthest first) */
+  /* order them farthest-first so nearer axes paint last */
   int order[3] = {0, 1, 2};
   for (int i = 0; i < 2; i++)
     for (int j = i + 1; j < 3; j++)
@@ -1464,7 +1233,7 @@ static void draw_body_axes_depth_sorted(WINDOW *w, const Gyro *g,
     draw_seg3d(w, 0, 0, 0, ax[0], ax[1], ax[2], v->phi, v->theta, v->scale,
                v->cx, v->cy, v->cols, v->rows, attr);
 
-    /* Tip label, slightly beyond the unit-length tip */
+    /* drop the label just past the tip so it clears the line */
     int c, r;
     float d;
     project(ax[0] * 1.15f, ax[1] * 1.15f, ax[2] * 1.15f, v->phi, v->theta,
@@ -1478,12 +1247,12 @@ static void draw_body_axes_depth_sorted(WINDOW *w, const Gyro *g,
 }
 
 /*
- * draw_angular_momentum_vector — L vector, normalised to unit length.
+ * draw_angular_momentum_vector — the L arrow, shrunk to a tidy length.
  *
- * In torque-free presets L is conserved (vector fixed in space) —
- * the body axes precess AROUND it.  Under gravity, L itself traces
- * a circle around world-Z and the precession axis is world-Z.  Tip
- * label 'L' 15 % beyond the unit tip, matching the body-axis style.
+ * With no gravity this arrow is pinned in space and the body circles
+ * around it — the clearest way to see precession. Under gravity the arrow
+ * itself swings around the upright direction. Labelled 'L' just past the
+ * tip, like the body axes.
  */
 static void draw_angular_momentum_vector(WINDOW *w, const Gyro *g,
                                          const Viewport *v) {
@@ -1507,19 +1276,10 @@ static void draw_angular_momentum_vector(WINDOW *w, const Gyro *g,
 }
 
 /*
- * gyro_draw — render the complete scene, painter's order (far → near).
- *
- * Depth-cuing throughout: A_BOLD for elements closer to the viewer
- * (depth < 0), A_DIM or normal for elements receding (depth > 0).
- *
- * Pseudocode:
- *   viewport = make_viewport(g, cols, rows)
- *   draw_ground_ring                 // world floor reference
- *   draw_world_z_reference           // upright direction
- *   draw_body_disc_equator           // body XY plane (wobble visible)
- *   draw_polhode_trail               // spin-axis history
- *   draw_body_axes_depth_sorted      // X / Y / Z with tip labels
- *   draw_angular_momentum_vector     // top — L vector with tip label
+ * gyro_draw — paint the whole scene back-to-front, so nearer parts cover
+ * farther ones: ground ring, the upright marker, the body's disc, the
+ * trail, the body axes, and finally the L arrow on top. Closer things are
+ * drawn bold throughout, which reads as depth.
  */
 static void gyro_draw(const Gyro *g, WINDOW *w, int cols, int rows) {
   Viewport vp = make_viewport(g, cols, rows);
@@ -1534,6 +1294,7 @@ static void gyro_draw(const Gyro *g, WINDOW *w, int cols, int rows) {
 
 /* ── trail update ────────────────────────────────────────────────────── */
 
+/* Save where the spin-axis tip lands on screen this tick, for the trail. */
 static void gyro_update_trail(Gyro *g, int cx, int cy, float scale, int cols,
                               int rows) {
   int c, r;
@@ -1549,61 +1310,32 @@ static void gyro_update_trail(Gyro *g, int cx, int cy, float scale, int cols,
   (void)rows;
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6  scene ────────────────────────────────────────────────────────── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Scene — top-level state spanning physics ticks, draw calls, and the
- * main loop.  Wraps the gyro simulation together with the cosmetic
- * theme selection.
+/*
+ * Scene — the gyro simulation plus the one cosmetic choice (the theme).
  *
- * The struct splits into two clearly-labelled groups:
+ * The two parts are split on purpose, for whoever reads this next: one
+ * group is the actual physics, the other is purely how it looks. When you
+ * add a field, ask "does this change how the body moves?" If yes it's
+ * physics; if it only changes colours it's rendering. Putting a physics
+ * knob in the rendering group by mistake would quietly tie the look to the
+ * motion — which is exactly the bug this split guards against. Switching
+ * themes while paused must leave the motion untouched; only the colours
+ * swap.
  *
- *   Simulation parameters  — consumed by scene_tick / gyro_step.
- *     Anything that affects the PHYSICS lives here.  Mutated by
- *     physics-affecting keys: r (reset), space (pause), n / p
- *     (preset cycle), g (gravity toggle), l / L (trail toggle),
- *     arrows (view), ] / [ (sim Hz).
- *
- *   Rendering parameters   — consumed by gyro_draw / draw_seg3d
- *     and by color_apply_theme.  Toggling these while paused must
- *     leave the gyro state byte-identical; only the palette swaps.
- *     Mutated by purely cosmetic keys: t / T (theme cycle).
- *
- * Locality rationale (the contract that matters, not the byte layout):
- *   The split is for the READER, not the CPU.  When adding a field,
- *   ask: does this change what gyro_step / scene_tick produces?  If
- *   yes → simulation; if purely visual → rendering.  A new knob
- *   landing in the rendering group when it actually steers gyro_step
- *   would silently couple display to physics — exactly the bug this
- *   separation is here to prevent.
- *
- * What stays OUTSIDE this struct (intentionally):
- *   App.sim_fps                       sim/render tick rate; lives on
- *                                     the App because the main-loop
- *                                     accumulator owns the tick clock.
- *   App.running / App.need_resize     volatile sig_atomic_t flags
- *                                     written from signal handlers;
- *                                     must stay on file-scope App for
- *                                     async-signal-safety.
- *   App.screen (cols, rows)           terminal geometry tracked by
- *                                     the main loop; Scene stays
- *                                     window-agnostic so resize is
- *                                     the main loop's concern.
- *
- * Single instance: lives inside file-scope `g_app` (§8).  Gyro.trail[]
- * alone is ~2.4 KB (300 × 8 B), so the whole App sits in BSS rather
- * than being passed by value anywhere.
- * ─────────────────────────────────────────────────────────────────────── */
+ * The tick rate, the quit/resize flags, and the terminal size live on App
+ * (§8) instead, since the main loop owns the clock and the window. One
+ * Scene lives inside the single file-scope App (§8); the trail alone is a
+ * couple of kilobytes, so nothing here is ever copied by value.
+ */
 typedef struct {
-  /* ── Simulation parameters (read & written by scene_tick) ──────── */
-  Gyro gyro; /* physics state — see Gyro docstring §5         */
+  /* ── the physics (read & written by scene_tick) ───────────────── */
+  Gyro gyro; /* the spinning body — see Gyro in §5            */
 
-  /* ── Rendering parameters (no physics side-effects) ────────────── */
-  int theme; /* index into THEMES[] in §3; t / T cycles.
-              * Purely cosmetic — physics is identical
-              * across all 12 themes                          */
+  /* ── how it looks (no effect on the physics) ──────────────────── */
+  int theme; /* which palette; t / T cycle. Cosmetic only —
+              * the motion is identical across all 12        */
 } Scene;
 
 static void scene_init(Scene *s) {
@@ -1613,13 +1345,10 @@ static void scene_init(Scene *s) {
 }
 
 /*
- * scene_tick() — advance the simulation by one fixed timestep dt.
- *
- * SUB_STEPS RK4 steps are taken within each sim tick.  This keeps
- * the individual RK4 step small relative to the rotation period,
- * ensuring accurate integration even at the default 60 Hz tick rate.
- *
- * The view azimuth auto-rotates at 0.15 rad/s for a cinematic view.
+ * scene_tick — move everything forward one tick. It splits the tick into
+ * several smaller physics steps so even the fastest wobble is captured,
+ * drifts the camera a touch for a cinematic feel, and adds one dot to the
+ * trail.
  */
 static void scene_tick(Scene *s, float dt, int cols, int rows) {
   Gyro *g = &s->gyro;
@@ -1630,10 +1359,10 @@ static void scene_tick(Scene *s, float dt, int cols, int rows) {
   for (int i = 0; i < SUB_STEPS; i++)
     gyro_step(g, sub_dt);
 
-  /* Slow auto-rotation of view */
+  /* let the camera drift slowly on its own */
   g->view_phi += 0.15f * dt;
 
-  /* Update polhode trail (once per tick, not sub-step) */
+  /* add one trail dot per tick (not per sub-step) */
   if (g->show_trail) {
     float sc_h = (float)cols / 7.0f;
     float sc_v = (float)(rows - 2) * 2.0f / 7.0f;
@@ -1643,11 +1372,10 @@ static void scene_tick(Scene *s, float dt, int cols, int rows) {
 }
 
 /*
- * scene_draw() — render the gyroscope into WINDOW *w.
- *
- * alpha accepted for framework signature compatibility but unused —
- * the gyroscope uses rigid-body physics where the draw position IS
- * the physics position (no separate interpolation needed at 60 Hz).
+ * scene_draw — draw the gyroscope. The alpha argument is ignored: this
+ * demo draws the body right where the physics put it, with no smoothing
+ * between frames, but the argument stays so the signature matches the
+ * shared framework.
  */
 static void scene_draw(Scene *s, WINDOW *w, int cols, int rows, float alpha,
                        float dt_sec) {
@@ -1656,18 +1384,13 @@ static void scene_draw(Scene *s, WINDOW *w, int cols, int rows, float alpha,
   gyro_draw(&s->gyro, w, cols, rows);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7  screen ───────────────────────────────────────────────────────── */
 
 /*
- * Screen — current terminal geometry, refreshed on SIGWINCH.
- *
- * Kept separate from Scene so that resize handling (a main-loop
- * concern) doesn't touch the simulation state.  Every frame the HUD
- * layout reads cols / rows from here for right-alignment on row 0,
- * left-alignment on row 1, and last-row positioning of the key
- * legend.  gyro_draw also reads them to clip line segments.
+ * Screen — the terminal's current size, re-read whenever the window
+ * resizes. Kept apart from Scene so resizing never touches the physics.
+ * The HUD reads it to place text against the edges, and the drawing code
+ * reads it to clip lines that run off-screen.
  */
 typedef struct {
   int cols, rows;
@@ -1695,11 +1418,9 @@ static void screen_resize(Screen *s) {
 }
 
 /*
- * Canonical two-row HUD (CLAUDE.md):
- *   Row 0 right : fps / sim Hz / paused — PAIR_HUD + A_BOLD
- *   Row 1 left  : preset + inertia + |ω| + gravity + theme —
- *                 PAIR_HUD without A_BOLD so row 0 stays dominant
- *   Last row    : key legend — PAIR_HINT + A_BOLD
+ * screen_draw — paint the frame and the two info bars: top-right shows
+ * speed and pause state, the line under it shows which demo and its
+ * settings, and the bottom row lists the keys.
  */
 static void screen_draw(Screen *s, Scene *sc, double fps, int sim_fps,
                         float alpha, float dt_sec) {
@@ -1744,50 +1465,38 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8  app ──────────────────────────────────────────────────────────── */
 
 /*
- * App — top-of-process container holding everything the main loop
- * touches.  Single file-scope instance `g_app` so the signal handlers
- * can write to running / need_resize without a context parameter
- * (POSIX signal handlers can't carry one).
- *
- * Why a single struct (not separate file-scope globals):
- *   Bundling scene / screen / sim_fps / signal flags under one `g_app`
- *   makes the read sites tidy (`g_app.running`, `g_app.need_resize`)
- *   and lets the main loop take ONE pointer (`App *app = &g_app`)
- *   instead of juggling four globals.  Forward declarations stay
- *   simple and the lifetime is unambiguous: born at program start,
- *   dies at exit.
+ * App — one box holding everything the main loop touches. There's a
+ * single one, at file scope, because the signal handlers have to reach
+ * the quit and resize flags and a signal handler can't be handed a
+ * pointer. Bundling it all together also lets the main loop pass one
+ * pointer around instead of juggling several loose globals.
  *
  * Field groups (mirrored by the layout below):
  *
- *   Owned subsystems    — scene, screen.  Heavy state; passed by
- *                         pointer to every helper.
- *   Tick rate knob      — sim_fps.  Lives on App (not Scene) because
- *                         the main-loop accumulator owns the tick
- *                         clock; Scene stays clock-agnostic so the
- *                         simulation contract is rate-independent.
- *   Signal-handler I/O  — running, need_resize.  volatile sig_atomic_t
- *                         per POSIX — only the simplest atomic loads
- *                         and stores are guaranteed safe between
- *                         signal handler and main thread.
+ *   Owned parts        — scene, screen. The big state, passed by pointer.
+ *   Tick-rate knob     — sim_fps. Lives here, not on Scene, because the
+ *                        main loop owns the clock; the simulation itself
+ *                        doesn't care how fast it's ticked.
+ *   Signal flags       — running, need_resize. The only things the signal
+ *                        handlers write. They're the special volatile
+ *                        kind so it's safe to share them between a handler
+ *                        and the main loop.
  */
 typedef struct {
-  /* ── Owned subsystems ─────────────────────────────────────────── */
-  Scene scene;   /* sim + render state (§6)      */
-  Screen screen; /* terminal geometry (§7)       */
+  /* ── owned parts ──────────────────────────────────────────────── */
+  Scene scene;   /* the simulation + its look (§6)  */
+  Screen screen; /* the terminal size (§7)          */
 
-  /* ── Tick-rate knob ───────────────────────────────────────────── */
-  int sim_fps; /* fixed-dt sim Hz; ] / [ keys
-                * clamped [SIM_FPS_MIN, MAX]  */
+  /* ── tick-rate knob ───────────────────────────────────────────── */
+  int sim_fps; /* how many physics ticks per second;
+                * ] / [ adjust it within limits  */
 
-  /* ── Signal-handler I/O (async-signal-safe access only) ───────── */
-  volatile sig_atomic_t running;     /* 0 ⇒ main loop exits         */
-  volatile sig_atomic_t need_resize; /* 1 ⇒ main loop calls
-                                      *      app_do_resize next tick */
+  /* ── signal flags (touched by handlers only) ──────────────────── */
+  volatile sig_atomic_t running;     /* goes 0 to quit the main loop    */
+  volatile sig_atomic_t need_resize; /* set to 1 when the window resizes */
 } App;
 
 static App g_app;
@@ -1893,13 +1602,13 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
-/* ── main-loop building blocks ───────────────────────────────────────── */
+/* ── main-loop pieces ─────────────────────────────────────────────────── */
 
 /*
- * install_signal_handlers — register atexit cleanup and the three
- * POSIX signals we care about.  SIGINT / SIGTERM trigger graceful
- * shutdown; SIGWINCH triggers a viewport rebuild on the next tick.
- * Handlers must be async-signal-safe — they only flip volatile flags.
+ * install_signal_handlers — wire up clean shutdown. Ctrl-C / kill ask the
+ * loop to quit, a window resize asks it to re-measure, and an exit handler
+ * restores the terminal. The handlers only flip a flag, which is all
+ * that's safe to do from inside a signal.
  */
 static void install_signal_handlers(void) {
   atexit(cleanup);
@@ -1909,11 +1618,9 @@ static void install_signal_handlers(void) {
 }
 
 /*
- * handle_resize_pending — process the SIGWINCH flag if it's set.
- * Re-queries terminal geometry, drops the stale screen-space trail,
- * and rebaselines the timing locals (wall clock advanced while the
- * resize handler was running; pretend we're starting fresh so the
- * next dt doesn't blow up).
+ * handle_resize_pending — if the window just resized, re-measure it, drop
+ * the now-meaningless trail, and reset the frame clock so the next frame's
+ * time gap isn't a huge jump from before the resize.
  */
 static void handle_resize_pending(App *app, int64_t *frame_time,
                                   int64_t *sim_accum) {
@@ -1925,17 +1632,11 @@ static void handle_resize_pending(App *app, int64_t *frame_time,
 }
 
 /*
- * step_simulation_fixed_dt — classic fixed-dt accumulator.
- *
- *   sim_accum += wall_dt
- *   while (sim_accum >= tick_ns):
- *     scene_tick(dt_sec)
- *     sim_accum -= tick_ns
- *
- * Decouples sim rate from render rate: the integration step is always
- * exactly dt_sec wide regardless of how fast the renderer is running,
- * so accuracy (per the RK4 truncation bound) is independent of frame
- * rate.  sim_accum carries any leftover < tick_ns to the next frame.
+ * step_simulation_fixed_dt — keep the physics on its own steady clock,
+ * separate from the drawing. It banks the real time that passed and spends
+ * it in fixed-size ticks, so each physics step is always the same width no
+ * matter how fast or slow the screen is updating. Any leftover time under
+ * one tick is carried into the next frame.
  */
 static void step_simulation_fixed_dt(Scene *scene, int64_t *sim_accum,
                                      int64_t dt_ns, int64_t tick_ns,
@@ -1948,10 +1649,9 @@ static void step_simulation_fixed_dt(Scene *scene, int64_t *sim_accum,
 }
 
 /*
- * update_fps_counter — rolling average FPS, refreshed every
- * FPS_UPDATE_MS (500 ms) so the displayed number is stable enough to
- * read.  Without the averaging window the readout would jitter wildly
- * frame-to-frame even at steady throughput.
+ * update_fps_counter — work out the frames-per-second figure as an
+ * average over the last half-second. Averaging keeps the number steady
+ * enough to read; a raw per-frame figure would flicker too fast to see.
  */
 static void update_fps_counter(int64_t dt_ns, int64_t *fps_accum,
                                int *frame_count, double *fps_display) {
@@ -1966,11 +1666,11 @@ static void update_fps_counter(int64_t dt_ns, int64_t *fps_accum,
 }
 
 /*
- * cap_to_render_framerate — sleep before the render write so each
- * frame takes ~1/60 s regardless of how fast sim + draw completed.
- * Cap is INDEPENDENT of sim_fps — sim runs at its own rate via the
- * accumulator above; the renderer is held at a steady 60 fps for
- * consistent visual cadence on every terminal.
+ * cap_to_render_framerate — wait a moment before drawing so each frame
+ * takes about a sixtieth of a second, however quickly the physics and
+ * drawing finished. This is separate from the physics tick rate: the
+ * physics runs at its own pace, while the screen always refreshes at a
+ * steady 60 frames a second so the motion looks smooth on any terminal.
  */
 static void cap_to_render_framerate(int64_t frame_start_ns,
                                     int64_t prev_frame_dt_ns) {
@@ -2029,9 +1729,10 @@ int main(void) {
     step_simulation_fixed_dt(&app->scene, &sim_accum, dt_ns, tick_ns, dt_sec,
                              app->screen.cols, app->screen.rows);
 
-    /* alpha ∈ [0,1) — render interpolation factor for sub-tick
-     * smoothing.  gyroscope draws at physics position directly
-     * (alpha unused), kept for framework signature parity. */
+    /* how far we are between two physics ticks (0 to just under 1).
+     * Other demos use it to smooth motion between ticks; this one draws
+     * the body right where the physics put it, so it's unused here and
+     * only kept so the function signatures match the shared framework. */
     float alpha = (float)sim_accum / (float)tick_ns;
 
     update_fps_counter(dt_ns, &fps_accum, &frame_count, &fps_display);

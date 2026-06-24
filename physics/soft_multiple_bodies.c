@@ -1,173 +1,37 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * soft_multiple_bodies.c — Destructible Jelly Demos
- *                          (Position-Based Dynamics, anchored + tearable)
+ * soft_multiple_bodies.c — destructible jelly towers you can knock over.
  *
- * Each preset stages ONE big soft-body structure standing on the floor,
- * its bottom row pinned to the ground.  The user fires a soft projectile
- * ball with SPACE.  When the ball impacts the structure, distance
- * constraints near the impact get stretched past their break threshold
- * and SNAP — the upper portion tears off, falls under gravity (it's still
- * a soft body, just no longer connected to the anchored base), and
- * jiggles as it lands.  The anchored base remains standing, ripples from
- * the shock, settles.
+ * A jelly-like tower stands on the floor with its feet glued down.  Press
+ * SPACE to fling a soft ball at it.  Where the ball hits, the links holding
+ * the tower together stretch too far and snap, so the top breaks off and
+ * flops to the ground while the glued base wobbles and settles.
  *
- * Design from first principles:
- *
- *   1. Each STRUCTURE is one big monolithic body (or, for the multi-
- *      structure presets, a few independent big bodies — Twin Towers
- *      has two, Big + Small has one of each).  We never STACK bodies
- *      vertically: multi-body stacks have inter-body contact pressure
- *      that compounds upward and liquefies under PBD [1, §3].  Each
- *      independent big body has zero internal body-vs-body contacts,
- *      so the stack-pressure problem doesn't exist.
- *
- *   2. Bottom row pinned (kinematic anchor).  Pinned nodes ignore
- *      gravity, integration, and PBD position changes — they are
- *      infinite-mass anchors [1, eq. 7].  The body is rooted to the
- *      floor and cannot slide or fall over.
- *
- *   3. Breakable distance constraints.  Each Con has a break_thresh;
- *      when |x_b − x_a| > rest · break_thresh the constraint is
- *      permanently removed.  Ball impact stress concentrates near
- *      the contact, those constraints break first, fracture propagates
- *      outward — exactly how real brittle material cracks.
- *
- *   4. PBD + collision INTERLEAVED.  Each substep runs pbd_iters
- *      alternations of (project distance constraints) and (resolve
- *      pair penetrations).  Every collision push is followed by an
- *      immediate constraint-relaxation pass before the next collision,
- *      so the body's shape stays close to its rest configuration
- *      between contacts.
- *
- * Presets (cycled with n / N):
- *
- *   1. Big Tower    — one massive 6×18 tower, dominating the right
- *                     two-thirds of the world.  Ball at chest height
- *                     tears the middle and the top 60 % falls.
- *   2. Twin Towers  — two medium 5×14 towers in line.  Ball passes
- *                     through (or breaks) the first, then strikes
- *                     the second with whatever energy remains.
- *   3. Mini Tower   — one short 4×10 tower.  Easy single-hit topple;
- *                     useful for fine-tuning break_thresh with b/B.
- *   4. Big + Small  — a small 4×10 + a big 6×18, side by side.
- *                     Ball hits small first, loses energy, then
- *                     reaches big with reduced impact.
- *
- * Keys:
- *   SPACE   fire soft ball at the structure
- *   n/N     next / previous preset             r     reset current preset
- *   p       pause                               q/ESC quit
- *   g       toggle gravity
- *   i / I   PBD iteration count ± 1            t/T   theme cycle
- *   b / B   break threshold ± 0.1              x     remove last spawned ball
+ * The trick that keeps it from melting into goo: each tower is ONE big body,
+ * never a stack of separate bodies, and its bottom row is pinned in place so
+ * it can't slide or topple.  The "springs" between points can tear once
+ * stretched too far, which is what gives the breaking effect.
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/soft_multiple_bodies.c -o
- * soft_multiple_bodies -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra physics/soft_multiple_bodies.c \
+ *       -o soft_multiple_bodies -lncurses -lm
  *
- * Sections:
- *   §1  config           §2  clock            §3  color / theme
- *   §4  state            — Node, Con, Blob, Scene structs + g_scene
- *   §5  physics          — Verlet predict + PBD relaxation + boundary
- *   §6  collision        — point-in-polygon + edge-resolve + Newton-3
- *   §7  scene            — builders + presets + projectile + scene_step
- *   §8  draw             — body + HUD
- *   §9  screen           §10 app
+ * The ideas behind the physics (cited inline as [n]):
+ *   [1] Müller et al. (2007) "Position Based Dynamics" — the move-the-points-
+ *       to-satisfy-distances solver, and the pinning trick (a glued point has
+ *       zero weight so it never moves).
+ *   [2] Bender, Müller, Macklin (2017) "A Survey on Position-Based Simulation
+ *       Methods in Computer Graphics" — modern overview of pinning + tearing.
+ *   [3] Jakobsen (2001) "Advanced Character Physics" — store last position
+ *       instead of velocity; speed is just (now − last).
+ *   [4] Ericson (2005) Real-Time Collision Detection §5.1.5 — closest point
+ *       on a line segment.
+ *   [5] Sunday (2001) "Inclusion of a Point in a Polygon" — the ray-cast
+ *       inside/outside test.
+ *   [6] Provot (1995) cloth-tearing paper — snip a link once it stretches
+ *       past a length threshold; that's our break threshold.
+ *   [7] Padala, NCURSES Programming HOWTO — the terminal drawing layer.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Position-Based Dynamics with breakable constraints
- *                  and kinematic pinning [1][2].  Each body is a
- *                  network of mass-points connected by distance
- *                  constraints.  Verlet predicts free-flight positions
- *                  [3]; PBD then relaxes the constraints by projecting
- *                  particles toward their rest-distance neighbours.
- *
- * Pinning        : A node with `pinned = true` has effective INVERSE
- *                  MASS = 0.  In Müller's mass-weighted projection
- *                  [1, eq. 7] the corrections distribute by inverse
- *                  mass, so a 0-mass node never moves.  All forces
- *                  (gravity, collision push, distance projection) are
- *                  ignored for pinned nodes.
- *
- * Tearing        : Each constraint carries a break threshold T.  If
- *                  current_length > rest_length · T at any iteration,
- *                  the constraint sets its k = 0 and is permanently
- *                  ignored thereafter.  Connectivity DEGRADES rather
- *                  than the body splitting into separate Blobs — we
- *                  keep a single Blob struct but its constraint graph
- *                  becomes disconnected.  Disconnected sub-regions
- *                  evolve independently because their constraints no
- *                  longer reach across the fracture line.
- *
- * Collision      : Point-in-polygon (Jordan curve [5]) detection,
- *                  symmetric position-split resolution [1, §5].  Pinned
- *                  edge nodes don't get pushed (they're anchors).
- *                  Interleaved with PBD passes so visible jelly squish
- *                  recovers between contacts.
- *
- * Rendering      : Body wireframe (constraint segments) + scan-fill
- *                  interior + boundary nodes (bold 'O' for free, '*'
- *                  for pinned).  Broken constraints are skipped — the
- *                  fracture line becomes visually obvious as the gap
- *                  between still-connected wire segments.
- *
- * References (cite inline as [n]):
- *
- *   [1] Müller, M.; Heidelberger, B.; Hennix, M.; Ratcliff, J. (2007) —
- *       "Position Based Dynamics", J. Visual Communication and Image
- *       Representation 18 (2), 109–118.  The foundational PBD paper.
- *       Specifically used:
- *         §3  the predict / project / update outer loop in scene_step
- *         eq.  6  per-particle distance correction (un-weighted form)
- *         eq.  7  inverse-mass-weighted distance projection — what
- *                 project_all_distance_constraints implements; setting
- *                 w_i = 0 recovers the "pinned anchor" behaviour with
- *                 no special-case code
- *         §5  position-space collision constraints (the symmetric
- *                 push pattern in resolve_penetration)
- *
- *   [2] Bender, J.; Müller, M.; Macklin, M. (2017) — "A Survey on
- *       Position-Based Simulation Methods in Computer Graphics",
- *       Computer Graphics Forum 36 (6).  Modern PBD overview covering
- *       attachment constraints (the pinning we use, §3.1), tearable
- *       constraints (§4.3), and the standard "interleave constraint
- *       projection across all constraint types per iteration" recipe
- *       (§2.2) — which is exactly what scene_step does with distance
- *       and collision constraints.
- *
- *   [3] Jakobsen, T. (2001) — "Advanced Character Physics", GDC.
- *       Verlet two-position storage: velocity is implicit in
- *       (x − x_prev), no separate velocity array needed.  Used by
- *       verlet_predict_all in §5 and by fire_projectile in §7 to
- *       inject the ball's initial horizontal velocity (px = x − v0).
- *
- *   [4] Ericson, C. (2005) — Real-Time Collision Detection, Morgan
- *       Kaufmann.  §5.1.5 "closest point on segment" — the parametric
- *       t = clamp((P − A)·(B − A) / |B − A|², 0, 1) formula used by
- *       nearest_polygon_edge in §6.
- *
- *   [5] Sunday, D. (2001) — "Inclusion of a Point in a Polygon",
- *       geomalgorithms.com.  Even-odd ray-cast test (Jordan curve
- *       theorem).  Implemented in point_in_polygon_jordan in §6 with
- *       Sunday's asymmetric (ay ≤ py < by) endpoint convention that
- *       avoids the vertex-grazing double-count.
- *
- *   [6] Provot, X. (1995) — "Deformation Constraints in a Mass-Spring
- *       Model to Describe Rigid Cloth Behaviour", Graphics Interface.
- *       The classic source for "spring/constraint with break length":
- *       Provot defined cloth tearing as snipping a spring once it
- *       stretches past a length threshold.  Our `break_thresh` field
- *       on Con and the break-check in project_all_distance_constraints
- *       are a direct port of Provot's flag to the PBD framework.
- *
- *   [7] Padala, P. — NCURSES Programming HOWTO, The Linux
- *       Documentation Project.  Reference for the render layer in §8:
- *       init_pair / COLOR_PAIR semantics, the wnoutrefresh + doupdate
- *       diff model, signal-safe SIGWINCH handling.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -179,109 +43,95 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 #define ROWS_MAX 128
 #define COLS_MAX 512
 
-/* ── Body geometry capacities  (per Blob, statically allocated) ────────── */
+/* How big one body can get.  Everything is sized statically (no malloc), so
+ * these are the hard ceilings.  The biggest tower is 6 wide by 18 tall, which
+ * is 108 points and 362 links, and these caps leave room to spare. */
+#define BLOB_NODES_MAX 256 /* mass points per body   */
+#define BLOB_CONS_MAX 900  /* links per body         */
+#define BLOB_BND_MAX 128   /* points on the outline  */
 
-/* BLOB_NODES_MAX — max mass points per body.  256 covers the biggest
- * preset tower (6×18 = 108 nodes) with comfortable headroom; the
- * Big + Small preset's two towers (108 + 40 = 148 nodes COMBINED
- * across two Blobs) easily fit since each Blob has its own array. */
-#define BLOB_NODES_MAX 256
-
-/* BLOB_CONS_MAX — max distance constraints per body.  A 6×18 big-tower
- * grid has 6·17 + 18·5 = 192 structural + 2·17·5 = 170 shear = 362
- * cons.  900 leaves comfortable headroom for the biggest preset. */
-#define BLOB_CONS_MAX 900
-
-/* BLOB_BND_MAX — max boundary polygon length.  Perimeter of a 6×18
- * grid is 2·(5+17) = 44 nodes; 128 is generous. */
-#define BLOB_BND_MAX 128
-
-/* MAX_BLOBS — pool size for Scene.blobs[].  Need up to 2 preset bodies
- * (Twin Towers / Big + Small) + ~14 fired soft balls before old balls
- * roll off screen.  Could go higher but the pair-collision loop is
- * O(MAX_BLOBS²) so 16 is the sweet spot for our ~20 Hz simulation. */
+/* How many bodies can exist at once: a preset can spawn up to 2 towers, plus
+ * the balls you fire before old ones drift off.  The collision check compares
+ * every pair of bodies, so keeping this small keeps it fast. */
 #define MAX_BLOBS 16
 
-/* ── Sphere (projectile ball)  ───────────────────────────────────────── */
-#define SPH_RING 12 /* ring nodes (node 0 is centre)        */
+/* The projectile ball — a ring of points around a centre. */
+#define SPH_RING 12 /* points around the rim (point 0 is the centre) */
 #define SPH_NODES (SPH_RING + 1)
-#define SPH_R 4.0f /* visual col-radius                    */
+#define SPH_R 4.0f /* radius in columns */
 
-/* ── Stiffness factors  (PBD k values) ───────────────────────────────── */
-/* k = 1.0 means "full distance correction every iteration"; k = 0.5
- * means "half correction" → softer.  These are STIFFNESS, not break
- * thresholds — they don't determine when a constraint snaps. */
-#define STRUCT_K 1.0f /* edges of the grid: full stiffness   */
-#define SHEAR_K 0.7f  /* diagonals: slightly softer = jelly  */
+/* How firmly a link pulls its two points back to the right distance each
+ * pass.  1.0 = pull all the way (stiff); lower = springier.  This is about
+ * stiffness only; it has nothing to do with when a link snaps. */
+#define STRUCT_K 1.0f /* the grid's edges: stiff   */
+#define SHEAR_K 0.7f  /* the diagonals: a bit soft */
 
-/* ── Break thresholds  (stretch ratio before constraint snaps) ───────── */
-/* A constraint with rest length L breaks when current length > L · T.
- * T = 1.0 means "break immediately on any stretch" (catastrophic).
- * T = ∞  means "never break" (rubber).
- * Sweet spot for visible tearing on ball impact is 1.4 - 2.0. */
+/* How far a link can stretch before it snaps, as a multiple of its rest
+ * length.  1.0 means it breaks the instant it stretches at all; bigger means
+ * it can stretch more first.  1.4–2.0 looks like brittle material that
+ * shatters on a hard hit.  Tunable live with b / B. */
 #define BREAK_THRESH_DEF 1.6f
 #define BREAK_THRESH_MIN 1.1f
 #define BREAK_THRESH_MAX 3.0f
 #define BREAK_THRESH_STEP 0.1f
 
-/* ── Physics knobs  (per sub-step) ───────────────────────────────────── */
-#define GRAVITY_DEF 0.06f  /* downward accel (px / sub-step²)     */
-#define DAMPING_DEF 0.985f /* velocity retention each sub-step    */
-#define FLOOR_REST 0.10f   /* bounce restitution on floor         */
-#define WALL_REST 0.10f    /* bounce restitution on walls         */
-#define FLOOR_FRIC 0.85f   /* horizontal velocity retained on floor */
+/* The feel of the physics, applied each sub-step. */
+#define GRAVITY_DEF 0.06f  /* pull downward                       */
+#define DAMPING_DEF 0.985f /* fraction of speed kept (drag)       */
+#define FLOOR_REST 0.10f   /* bounciness off the floor            */
+#define WALL_REST 0.10f    /* bounciness off the walls            */
+#define FLOOR_FRIC 0.85f   /* sideways speed kept on the floor    */
 
-/* PBD_ITERS controls effective body stiffness AND collision tightness
- * (because PBD + collision are interleaved — see scene_step in §7).
- * More iters = stiffer body + tighter contacts.  10 is enough for an
- * anchored jelly slab to look rigid until the ball hits it. */
+/* How many times per sub-step we nudge all the links back toward their rest
+ * lengths.  More passes = a stiffer, more solid-feeling body (and, since
+ * collisions are interleaved with these passes, tighter contacts too).  10
+ * makes the tower feel rigid right up until the ball hits it. */
 #define PBD_ITERS_DEF 10
 #define PBD_ITERS_MIN 2
 #define PBD_ITERS_MAX 30
 
-/* STEPS_DEF — physics sub-steps per render frame.  3 keeps fast-moving
- * projectile balls from tunneling through thin parts of the wall. */
+/* Physics sub-steps per drawn frame.  Splitting one frame into smaller chunks
+ * stops a fast ball from skipping straight through a thin wall. */
 #define STEPS_DEF 3
 
-/* PROJECTILE_VX — initial Verlet velocity of a SPACE-fired ball.
- * Applied as px = x − v0 on every node so the whole ball translates at
- * v0 from frame 1.  Tuned high enough to deform AND tear the wall. */
+/* The ball's starting sideways speed when you fire it.  Fast enough to dent
+ * and tear the tower it hits. */
 #define PROJECTILE_VX 3.5f
 
-/* ── World mapping  (physics units → terminal cells) ─────────────────── */
-/* One cell-column = 1 px in x; one cell-row = 2 px in y (terminal cells
- * are ~2× taller than wide).  HUD_TOP_PX = 2 reserves the top cell-row
- * (row 0) for the status bar so bodies never draw into it. */
+/* Turning physics positions into terminal cells.  Each column is 1 unit
+ * across; each row is 2 units tall, because terminal characters are about
+ * twice as tall as they are wide.  We keep the top row clear for the status
+ * bar so bodies never draw over it. */
 #define HUD_TOP_PX 2.0f
 #define PHY_TO_ROW(y) ((int)((y) * 0.5f + 0.5f))
 #define PHY_TO_COL(x) ((int)((x) + 0.5f))
 
-/* ── Timing  ─────────────────────────────────────────────────────────── */
+/* Timing. */
 #define SIM_FPS 20
 #define NS_PER_SEC 1000000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* ── Themes (5 palettes; theme cycles theme indices, not k_themes size) */
+/* Colour themes you can cycle through with t / T. */
 #define N_THEMES 5
 
-/* ── Presets ─────────────────────────────────────────────────────────── */
+/* Tower layouts you can cycle through with n / N. */
 #define N_PRESETS 4
 
 typedef enum {
-  PRESET_BIG_TOWER = 0, /* one big single tower (6×18)             */
-  PRESET_TWIN_TOWERS,   /* two medium towers (each 5×15)           */
-  PRESET_MINI_TOWER,    /* one short tower (4×10)                  */
-  PRESET_BIG_AND_SMALL, /* one mini + one big tower side by side   */
+  PRESET_BIG_TOWER = 0, /* one big tower            */
+  PRESET_TWIN_TOWERS,   /* two medium towers        */
+  PRESET_MINI_TOWER,    /* one short tower          */
+  PRESET_BIG_AND_SMALL, /* a small and a big tower  */
 } Preset;
 
-/* ── Color slots (3 cubes + 3 spheres + chrome) ──────────────────────── */
+/* Which numbered colour-pair each thing draws with.  6 slots for body
+ * colours, then fixed slots for the floor, pinned feet, and the two HUD
+ * bars. */
 #define N_BSLOTS 6
 #define CP_BSURF(i) (1 + (i))            /* pairs 1-6  */
 #define CP_BFILL(i) (1 + N_BSLOTS + (i)) /* pairs 7-12 */
@@ -290,9 +140,7 @@ typedef enum {
 #define CP_HUD (3 + 2 * N_BSLOTS)        /* 15 — top status    */
 #define CP_HINT (4 + 2 * N_BSLOTS)       /* 16 — bottom hints  */
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec ts;
@@ -307,71 +155,41 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color / theme — 5 brightness-safe palettes + fixed HUD chrome     */
-/* ===================================================================== */
+/* ── §3 color / theme ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Theme — palette for one rendering of the destructible-jelly scene.
+/* Theme — one colour scheme for the whole scene.
  *
- * Intent:
- *   Pure visual change.  Cycling themes (t / T keys) MUST leave the
- *   simulation byte-identical: every blob, every node position, every
- *   constraint stays exactly where it was — only the colour-pair RGB
- *   shifts.  This is what justifies `theme` living in the Rendering
- *   group on Scene (§4) and never on the Blob / Node themselves.
+ * Switching themes (t / T) only changes colours; nothing about the physics
+ * moves.  That's why the chosen theme lives with the scene's drawing settings
+ * and never on a body or a point.
  *
- * Why TWO arrays (surf + fill) per slot:
- *   Each body is rendered in three layers (see draw_blob in §8):
- *     1. scan-fill INTERIOR — dim, fill_cp colour, ':' character
- *     2. constraint WIREFRAME — bright, surf_cp colour, '|/-\' chars
- *     3. boundary NODES — bold, surf_cp colour, 'O' (free) or '*' (pinned)
- *   Splitting surf vs fill gives the body a 3-D "shaded" look — the
- *   silhouette pops against the dimmer interior.  A single-colour
- *   theme would still work but loses the depth cue.
+ * Two colours per slot give bodies a shaded, 3-D look:
+ *   - surf[i]  the brighter outline colour, used for the wire mesh and the
+ *              bold 'O'/'*' point markers.
+ *   - fill[i]  a dimmer colour for the ':' speckle filling the inside, so the
+ *              outline pops against it.
+ * There are 6 slots: 0–2 are a cool family for the towers, 3–5 a warm family
+ * for the balls, so each new body gets a different colour as you spawn them.
  *
- * Why 6 slots:
- *   Bodies are tagged with one of 6 colour-pair indices at spawn:
- *     slots 0..2  — cool family, used for slabs / towers
- *     slots 3..5  — warm family, used for projectile spheres
- *   Cycling is round-robin (`nblobs % 3` for slabs, `nballs % 3` for
- *   balls) so each new body gets a fresh distinguishable colour
- *   without needing more than 3 hues per family.
- *
- * Brightness safety (CLAUDE.md, see documentation/COLOR.md):
- *   All palette entries sit at 256-cube index ≥ 24.  Indices in
- *   16–23 / 232–239 are forbidden — they render as background-black
- *   on default-bg terminals and the body disappears.
- *
- * Refs:
- *   256-colour cube structure   — XTerm Control Sequences §
- *                                 "ISO-8613-3 Controls".
- *   Colour-pair semantics       — Padala NCURSES HOWTO [7].
- * ─────────────────────────────────────────────────────────────────────── */
+ * Every colour sits in the bright half of the 256-colour set (index 24 and
+ * up).  The darkest entries would otherwise blend into a black background and
+ * the body would vanish (see CLAUDE.md / documentation/COLOR.md). */
 typedef struct {
-  /* Human-readable label shown in the top HUD's `theme:` field.
-   * ≤ 7 chars so the full status line fits an 80-col terminal
-   * alongside the other HUD fields (preset:, bodies:, iters:, …). */
+  /* Short name shown in the HUD's theme field.  Keep it under ~7 characters
+   * so the whole status line still fits an 80-column terminal. */
   const char *name;
 
-  /* surf[i] — surface colour for slot i.  Used for the boundary
-   * wireframe (constraint segments) AND the bold 'O' node glyphs.
-   * Chosen as the BRIGHTER end of the palette so the body's
-   * silhouette reads clearly against the dimmer interior fill. */
+  /* Outline colour for each of the 6 slots: the wire mesh and the bold point
+   * markers.  The brighter of the two so the silhouette reads clearly. */
   short surf[N_BSLOTS];
 
-  /* fill[i] — interior scan-fill colour for slot i.  Dimmer / darker
-   * than surf[i] so the wireframe pops on top.  Typically a tonal
-   * variant of the matching surf colour (e.g. 51 surf → 24 fill in
-   * the Ocean theme).  Cells inside the body are stippled with ':'
-   * in this colour. */
+  /* Inside-fill colour for each slot: the dim ':' speckle within the body.
+   * Darker than surf so the outline stands out on top of it. */
   short fill[N_BSLOTS];
 
-  /* pin — accent colour for anchored / pinned nodes ('*' glyphs).
-   * Independent of the 6 body slots so all bodies show their
-   * pinned base in the same eye-catching colour.  Typically a
-   * bright accent (yellow / white) that contrasts with every
-   * surf[] colour in the theme. */
+  /* Colour for the pinned (glued-down) feet, drawn as '*'.  Kept separate
+   * from the body slots so every tower shows its anchored base in the same
+   * eye-catching accent that contrasts with all the body colours. */
   short pin;
 } Theme;
 
@@ -406,400 +224,249 @@ static void theme_apply(int ti) {
   init_pair(CP_HINT, g_has_256 ? CHROME_HINT : COLOR_CYAN, -1);
 }
 
-/* ===================================================================== */
-/* §4  state — Node, Con, Blob, Scene                                    */
-/* ===================================================================== */
+/* ── §4 state — Node, Con, Blob, Scene ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Node — one mass point of a soft body.
+/* Node — one tiny point of mass in a soft body.
  *
- * Intent:
- *   The atomic element of the simulation.  A soft body is just a cloud
- *   of Nodes connected by Cons (distance constraints).  The body's
- *   "shape" and "stiffness" are entirely emergent from the constraint
- *   network; the Node itself carries only POSITION (Jakobsen [3] Verlet
- *   form) and an OPTIONAL pinning flag.
+ * A whole body is just a crowd of these points held together by links
+ * (Con, below).  The body's shape and how stiff it feels both come from
+ * the web of links — a single point doesn't know any of that.  All it
+ * carries is where it is now, where it was a moment ago, and whether it's
+ * glued in place.
  *
- * Verlet two-position storage (Jakobsen [3]):
- *   We don't store velocity explicitly.  Verlet integration says
+ * Why keep the old position instead of a speed?  If you know where a point
+ * was and where it is now, the gap between them already tells you its speed
+ * and direction — no separate speed field needed.  That's the Verlet trick
+ * (Jakobsen [3]).  It has a nice bonus: whenever a link yanks a point to a
+ * new spot, the next step automatically treats that jump as motion, so we
+ * never have to patch up a speed by hand (Müller [1]).
  *
- *       x_{n+1} = x_n + (x_n − x_{n-1}) · damping + a · dt²
- *
- *   so velocity is recoverable as (x − x_prev) at any time.  Saving
- *   one float pair per node by NOT having a velocity field is the
- *   classical Verlet trick — and it has a subtle PBD bonus: any
- *   position constraint that snaps the node to a new x AUTOMATICALLY
- *   gets absorbed into the next step's implicit velocity, with no
- *   separate velocity-update needed (Müller [1, §3]).
- *
- * Pinning (Müller [1, eq. 7]):
- *   When `pinned == true` the node has effective inverse mass w = 0.
- *   Every physics pass checks this and skips the node:
- *     - verlet_predict_all:           no gravity, no integration
- *     - project_all_distance_constraints:  w = 0 ⇒ zero correction
- *     - clamp_all_nodes_to_world:     skipped (already at valid pos)
- *     - apply_boundary_velocity_response:  skipped
- *     - resolve_penetration:          can't be pushed (anchor)
- *   Pinned nodes are placed once at scene_init and never move.  They
- *   are the FOUNDATION the rest of the body hangs from — without them
- *   gravity would pull the entire body to the floor and disintegrate
- *   it against the bottom wall.
- * ─────────────────────────────────────────────────────────────────────── */
+ * Glued points (pinned == true) simply never move — every physics step
+ * checks the flag and leaves them alone.  They're the anchor the rest of
+ * the body hangs from; without them gravity would drag the whole tower to
+ * the floor and pile it up against the bottom (Müller [1]). */
 typedef struct {
-  /* x, y — current world position in pixel space.
-   * Mutated EVERY substep by:
-   *   - verlet_predict_all (gravity + free flight)
-   *   - project_all_distance_constraints (constraint relaxation)
-   *   - clamp_all_nodes_to_world (arena clamp)
-   *   - resolve_penetration (collision push out / inward squish)
-   * Read by every rendering pass (PHY_TO_COL/PHY_TO_ROW in §8). */
+  /* Where the point is right now, in physics units.  Almost every step
+   * nudges this: gravity, the links pulling it back into shape, the
+   * walls, and collisions.  Drawing reads it to find the screen cell. */
   float x, y;
 
-  /* px, py — position from the PREVIOUS substep.  Saved at the
-   * start of verlet_predict_all (right before x/y change) so the
-   * implicit velocity v = (x − px) survives across the step.
-   * Also tweaked by apply_boundary_velocity_response to reflect
-   * velocity off walls/floor without touching x/y directly. */
+  /* Where the point was on the previous step.  We save it just before
+   * moving, so the gap (x - px) tells us this point's speed.  The wall
+   * and floor bounce works by tweaking this old position to flip the
+   * speed, rather than touching x/y directly. */
   float px, py;
 
-  /* pinned — kinematic-anchor flag.  Set ONCE at preset build time
-   * (pin_grid_bottom_row, §7) and never toggled at runtime.  When
-   * true, the node behaves as if it had infinite mass: nothing
-   * moves it.  Read by all five physics passes in §5 + by §6
-   * resolve_penetration, and rendered with a distinct glyph ('*'
-   * in CP_PIN colour) so the foundation is visually obvious. */
+  /* True if this point is glued in place and must never move.  Set once
+   * when the tower is built (its bottom row) and never changed after.
+   * A glued point acts as if it weighed infinitely much — no force budges
+   * it.  Drawn with a different mark ('*') so the anchored base stands out. */
   bool pinned;
 } Node;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Con — one breakable distance constraint between two Nodes.
+/* Con — one stretchy link between two points, the kind that can snap.
  *
- * Intent:
- *   The "spring" of the soft body — except in PBD there are no springs,
- *   only POSITION INVARIANTS.  Each Con says: "node `a` and node `b`
- *   should be exactly `rest` apart."  Each PBD iteration looks at the
- *   constraint, computes how badly the invariant is violated, and
- *   geometrically moves the two endpoints to satisfy it.
+ * Links are what hold a body together.  A link just remembers two points
+ * and how far apart they're supposed to be; every physics pass measures
+ * the real gap and slides the points to fix it.  Both points free? Each
+ * moves halfway.  One point glued? The free one does all the moving — so
+ * "glued in place" falls out of the math for free, no special case
+ * (Müller [1]).
  *
- * The PBD distance correction (Müller [1, eq. 7]):
- *
- *       d   = |x_b − x_a|
- *       err = d − rest
- *       w_a = pinned(a) ? 0 : 1
- *       w_b = pinned(b) ? 0 : 1
- *       Δa  = + (w_a / (w_a + w_b)) · (err / d) · k · (x_b − x_a)
- *       Δb  = − (w_b / (w_a + w_b)) · (err / d) · k · (x_b − x_a)
- *       x_a += Δa ;  x_b += Δb
- *
- *   When both nodes are free, the correction splits half-and-half.
- *   When one is pinned (w = 0), the free node takes the FULL correction
- *   — this is how anchoring works without special-case code.
- *
- * Breakability (Provot [6]):
- *   At the top of every projection iteration we test
- *
- *       if (break_thresh > 0 && d > rest · break_thresh)
- *           c.k = 0  →  permanently broken
- *
- *   Once a constraint's k is zero, all subsequent iterations skip it
- *   AND the wireframe renderer skips it (so the fracture line becomes
- *   visually obvious).  Fracture is one-way: no constraint ever
- *   reactivates.  This matches Provot's cloth-tearing flag from his
- *   1995 paper — porting the idea from springs to PBD distance
- *   constraints is direct (Bender survey [2, §4.3] discusses the
- *   modern variants).
- * ─────────────────────────────────────────────────────────────────────── */
+ * Snapping: if a link gets stretched past its breaking ratio, we set its
+ * stiffness to 0 to mark it dead.  After that the physics and the drawing
+ * both ignore it, so a torn link shows up as a gap in the mesh.  Once
+ * broken it stays broken — links never heal (Provot's cloth-tearing
+ * trick [6]). */
 typedef struct {
-  /* a, b — endpoint node indices into the OWNING Blob's nodes[] array.
-   * Convention: blob_add_con (§7) is called with the lower index
-   * first but the projection math is symmetric so swapping a/b
-   * makes no functional difference.  Indices must be valid
-   * (0 ≤ a, b < n_nodes) at the time blob_build_grid runs — they
-   * are NEVER re-validated thereafter, so don't shrink n_nodes
-   * after constraints have been added. */
+  /* a, b — which two points this link connects, given as their slots in
+   * the body's nodes[] array.  Set once when the body is built and never
+   * checked again, so don't shrink the node count after links exist. */
   int a, b;
 
-  /* rest — target distance between the two nodes.  Set ONCE at build
-   * time as the initial |x_b − x_a| from blob_add_con.  Never
-   * mutated afterwards — there's no support for "plastic" deformation
-   * (where the rest length adapts to the current configuration); a
-   * stretched-then-released constraint pulls back toward its
-   * original length, giving the body its elastic memory. */
+  /* rest — the distance the two points "want" to be apart, measured once
+   * when the link is created.  Never changes, which is what gives the
+   * body its springy memory: stretch it, let go, it pulls back to this. */
   float rest;
 
-  /* k — stiffness factor in [0, 1].  Multiplies the correction each
-   * iteration, so larger k = stiffer.  0 is a SENTINEL meaning
-   * "constraint is broken" — both the projector and the wireframe
-   * draw skip it.  Practical values are STRUCT_K = 1.0 for edges
-   * and SHEAR_K = 0.7 for diagonals; lower k anywhere gives a
-   * "rubbery" softer feel. */
+  /* k — how hard the link pulls, from 0 to 1.  Higher = stiffer.  0 is
+   * special: it means "this link is broken" — the physics and the
+   * drawing both skip it.  We use 1.0 for the grid edges and 0.7 for the
+   * softer diagonals. */
   float k;
 
-  /* break_thresh — stretch ratio at which the constraint snaps.
-   * Concretely: when current_d > rest · break_thresh, k is set to 0.
-   *   0       → constraint NEVER breaks (used for the projectile
-   *             ball — we don't want the ball to fall apart).
-   *   1.0     → breaks on any stretch (impossibly fragile).
-   *   1.4–2.0 → "destructible material" feel: deforms visibly,
-   *             snaps under heavy impact.  Default 1.6.
-   * Tuned interactively at runtime with the b / B keys. */
+  /* break_thresh — how far the link can stretch before it snaps, as a
+   * multiple of its rest length.  0 means "never snaps" (the ball uses
+   * this so it survives impacts).  1.0 snaps the moment it stretches;
+   * 1.4–2.0 feels like brittle stuff that holds, then shatters on a hard
+   * hit.  Live-tunable with the b / B keys. */
   float break_thresh;
 } Con;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * BKind — body shape discriminator.
+/* BKind — what shape a body is: a grid (the towers) or a ball.
  *
- * Currently only used by blob_color cycling in §7 to pick a colour
- * family: SLAB → cool palette (slots 0..2), SPHERE → warm (slots 3..5).
- * Physics, collision, and rendering paths are UNIFORM across kinds
- * (both shapes use the same generic point-in-polygon collision and
- * scan-fill render).  Adding a new shape means: extend this enum,
- * write a builder (like blob_build_sphere), pick a colour slot.
- * ─────────────────────────────────────────────────────────────────────── */
+ * This only steers which colour family the body gets — towers get cool
+ * colours, balls get warm ones.  The physics, collisions, and drawing
+ * treat both shapes exactly the same.  To add a new shape: add it here,
+ * write a builder, pick a colour. */
 typedef enum { BKIND_SLAB, BKIND_SPHERE } BKind;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Blob — one soft body (one preset structure OR one projectile ball).
+/* Blob — one whole soft body: either a tower or a fired ball.
  *
- * Intent:
- *   A complete self-contained simulation entity.  A Blob bundles every
- *   piece of state needed to integrate its physics, collide against
- *   other Blobs, and render itself.  No pointers, no dynamic alloc —
- *   the whole thing lives in BSS via the Scene struct (§ below).
+ * A Blob carries everything one body needs to move, bump into other
+ * bodies, and draw itself.  No pointers and no malloc — every array is a
+ * fixed size, so a body is just a chunk of memory.
  *
- * Architectural note — "big monolithic bodies, never stacked":
- *   Multi-body soft stacks (the previous architecture) liquefy under
- *   PBD because inter-body contact pressure compounds upward faster
- *   than constraint relaxation can recover.  This file's design
- *   avoids that entirely: each STRUCTURE in a preset is one big Blob
- *   with its bottom row of nodes PINNED to the floor.  Multi-structure
- *   presets (Twin Towers, Big + Small) spawn several such Blobs side
- *   by side but NEVER vertically stacked, so the only inter-Blob
- *   contact is between the projectile ball and a structure — a single
- *   transient impact, not a sustained stack-load.
+ * The key design choice is "one big body, never a stack of small ones".
+ * The old approach stacked separate bodies and they melted into goo: the
+ * weight piling up from above pushes harder than the links can recover
+ * each frame.  So instead each tower is a SINGLE body with its bottom row
+ * glued to the floor.  Presets with two towers just place two such bodies
+ * side by side, never one on top of another — the only time two bodies
+ * touch is when the ball hits a tower, a quick one-off bump rather than a
+ * constant load.
  *
- * Capacities (BLOB_NODES_MAX = 256, BLOB_CONS_MAX = 900,
- *   BLOB_BND_MAX = 128):
- *   Sized so the largest preset (6×18 = 108-node big tower with 362
- *   constraints) fits as one body.  Static allocation; no malloc.
+ * The array sizes are set so the biggest tower (6×18 points, 362 links)
+ * fits in one body with room to spare.
  *
- * Boundary contract (load-bearing for §6 collision):
- *   bnd[0..n_bnd) holds the indices of the outer polygon, ordered
- *   COUNTER-CLOCKWISE.  Consumed by:
- *     - point_in_polygon_jordan (§6): Jordan curve test [5]
- *     - nearest_polygon_edge    (§6): closest-point-on-segment [4]
- *     - draw_blob               (§8): scan-fill interior
- *   The boundary INDICES don't change when constraints break — but
- *   the COORDINATES of those nodes evolve with deformation, so the
- *   polygon literally distorts.  Post-fracture this means the
- *   point-in-polygon test is approximate (the polygon may not match
- *   the true visible silhouette of the fractured body).  We accept
- *   this imperfection because the alternative — splitting a Blob
- *   into connected components after each fracture — is ~200 lines
- *   of code for marginal visual gain in this demo.
+ * About the outline (bnd): it's the list of points around the body's edge,
+ * walked counter-clockwise.  Collisions and the inside-fill both use it.
+ * One wrinkle — when links snap, the outline's point list stays the same,
+ * but those points have drifted, so the outline can stop matching the real
+ * jagged shape of a shattered body.  We live with that: tracking the true
+ * shape of every broken-off piece would be a lot of code for little gain
+ * in a demo.
  *
- * Refs:
- *   PBD constraint network    — Müller [1, §3]
- *   Cloth + pinning analogy   — Bender survey [2, §3.1]
- *   Verlet (no velocity field) — Jakobsen [3]
- *   Tearable cloth flag       — Provot [6]
- * ─────────────────────────────────────────────────────────────────────── */
+ * The ideas behind it: links + gluing from Müller [1], the no-velocity
+ * point trick from Jakobsen [3], snappable links from Provot [6]. */
 typedef struct {
-  /* ── Mesh: nodes + constraints + outer ring ───────────────────────
-   * The three arrays together define the body's mass distribution
-   * (nodes), elastic structure (cons), and visible / collidable
-   * silhouette (bnd).  All three are filled at build time and the
-   * sizes (n_nodes, n_cons, n_bnd) are set once — only the contents
-   * mutate thereafter (nodes move, cons may break, bnd indices stay).
-   */
+  /* The three arrays below ARE the body: where its weight sits (nodes),
+   * what holds it together (cons), and its outline (bnd).  All three are
+   * filled in once when the body is built; afterward the points move and
+   * links may snap, but the counts never change. */
 
-  /* nodes[0..n_nodes) — the body's mass points.  Indexed by Con.a/b
-   * and bnd[].  Indices are STABLE for the lifetime of the body;
-   * nothing ever shifts the array. */
+  /* nodes — the body's points.  Slots never move around, so the indices
+   * in cons[] and bnd[] stay valid for the body's whole life. */
   Node nodes[BLOB_NODES_MAX];
   int n_nodes;
 
-  /* cons[0..n_cons) — distance constraints.  PROJECTION ORDER
-   * (Gauss-Seidel-style) is the order constraints were appended:
-   * blob_build_grid adds structural cons row-major, then shear cons
-   * row-major.  Reordering would subtly change convergence behaviour
-   * at low pbd_iters — keep build order deterministic. */
+  /* cons — the links.  They're fixed each pass in the order they were
+   * added (grid edges first, then diagonals); keep that order stable
+   * because changing it slightly changes how the body settles. */
   Con cons[BLOB_CONS_MAX];
   int n_cons;
 
-  /* bnd[0..n_bnd) — outer-polygon node indices, CCW ordered.  See
-   * the boundary contract in the top docstring.  Read-only after
-   * build; mutating these breaks point_in_polygon_jordan and
-   * draw_blob's scan-fill simultaneously. */
+  /* bnd — the outline: which points sit on the body's edge, in counter-
+   * clockwise order.  Set once at build time; don't touch it afterward
+   * or both collision and inside-fill break. */
   int bnd[BLOB_BND_MAX];
   int n_bnd;
 
-  /* ── Render metadata ─────────────────────────────────────────────
-   * Assigned at spawn by blob_build_*; survives theme cycles because
-   * theme_apply rewrites the SAME pair indices with new RGB rather
-   * than re-tagging bodies.
-   */
+  /* The two colour slots below are picked when the body is built.  They
+   * survive a theme change because switching themes just repaints the
+   * same slot numbers with new colours rather than re-tagging bodies. */
 
-  /* surf_cp — ncurses colour-pair index for the boundary wireframe
-   * AND the bold 'O' node glyphs.  Brighter end of the theme. */
+  /* surf_cp — colour for the outline mesh and the bold 'O' point marks.
+   * The brighter of the body's two colours. */
   int surf_cp;
 
-  /* fill_cp — ncurses colour-pair index for the scan-fill ':' chars
-   * inside the polygon.  Dimmer than surf so the silhouette pops. */
+  /* fill_cp — colour for the ':' speckle inside the body.  Dimmer than
+   * surf_cp so the outline stands out on top of it. */
   int fill_cp;
 
-  /* kind — BKIND_SLAB or BKIND_SPHERE.  Only consulted by colour-
-   * slot cycling (blob_color in §7) and as a possible future hook
-   * for kind-specific rendering.  Physics + collision treat all
-   * kinds uniformly. */
+  /* kind — tower or ball.  Only used to pick a colour family; the
+   * physics and collisions don't care which it is. */
   BKind kind;
 } Blob;
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * Scene — top-level demo state spanning physics ticks, draw calls, and
- * the main loop.  Single instance `g_scene` in BSS; passing by pointer
- * everywhere would just clutter helper signatures without buying any
- * encapsulation.
+/* Scene — all the demo's state in one place: the bodies plus the knobs
+ * that control them.  There's exactly one of these (g_scene), so helpers
+ * just reach for it directly instead of passing it around.
  *
- * The struct splits into two clearly-labelled groups:
+ * The fields fall into two groups, and the split is for the reader.  The
+ * simulation group decides what the bodies actually do; the rendering
+ * group only changes how things look.  The test for which group a new
+ * field belongs in: would changing it move a single point differently?
+ * If yes it's simulation, if no it's rendering.  Keeping a colour-only
+ * flag out of the simulation group is what guarantees that switching
+ * themes can never accidentally nudge the physics.
  *
- *   Simulation parameters — consumed by scene_step (§7), the §5 physics
- *     helpers, scene_init / fire_projectile / preset_*() (§7).  Anything
- *     that changes WHAT THE BODIES DO belongs here.  Mutated by physics-
- *     affecting keys: SPACE, n/N (preset), r (reset), p (pause), g
- *     (gravity), i/I (iter count), b/B (break threshold), x (delete).
- *
- *   Rendering parameters — consumed only by §8 draw_*() helpers and
- *     theme_apply (§3).  Mutating these must leave every Blob byte-
- *     identical: positions, constraints, broken flags, pinned flags
- *     all stay exactly the same; only colour-pair RGB / HUD text change.
- *     Mutated by purely cosmetic keys: t / T (theme).
- *
- * Locality rationale (this contract matters, not the bytes):
- *   The split exists for the READER, not the CPU.  A new flag landing
- *   in the rendering group when it actually changes how scene_step
- *   advances state would silently couple display to physics — exactly
- *   the bug the separation prevents.  When adding a field, ask: does
- *   this change what scene_step produces given the same body pool and
- *   the same dt?  If yes, simulation; if no, rendering.
- *
- * What stays OUTSIDE Scene (intentionally):
- *
- *   g_rows / g_cols       screen geometry tracked by the main loop's
- *                         SIGWINCH handler; Scene stays geometry-
- *                         agnostic so resize logic is the main loop's
- *                         concern, not the simulator's.
- *
- *   g_quit / g_resize     volatile sig_atomic_t flags written by the
- *                         signal handler; must stay file-scope for
- *                         async-signal-safety (the C standard
- *                         guarantees atomic load/store only for
- *                         objects of that type at file scope).
- *
- *   g_has_256             boot-time terminal capability probed once
- *                         in screen_init; not state that evolves.
- *
- *   g_mincol[] / g_maxcol[]   per-row scan-fill scratch arrays used
- *                         only inside draw_blob; not persistent state.
- * ─────────────────────────────────────────────────────────────────────── */
+ * A few things deliberately live outside Scene: the screen size
+ * (g_rows/g_cols) belongs to the resize logic in the main loop; the
+ * quit/resize flags must be file-scope to be safe to set from a signal
+ * handler; and the scan-fill scratch arrays are just throwaway workspace
+ * for drawing. */
 typedef struct {
-  /* ── Simulation parameters ──────────────────────────────────────── */
+  /* ── simulation: what the bodies do ── */
 
-  /* blobs[0..nblobs) — the body pool.  Index 0 is typically a
-   * preset structure (one big tower, or first of two towers);
-   * subsequent indices are projectile balls or additional preset
-   * bodies.  Insertion appends; deletion (scene_remove_last)
-   * decrements nblobs (LIFO, no compaction).  All blobs share the
-   * same physics treatment in scene_step — no special-casing for
-   * "structure" vs "projectile". */
+  /* blobs — the live bodies.  Slot 0 is usually the tower(s) from the
+   * current preset; later slots are the balls you fire.  New bodies get
+   * added on the end, and the x key drops the most recent one.  Every
+   * body gets the same physics — towers aren't special-cased. */
   Blob blobs[MAX_BLOBS];
   int nblobs;
 
-  /* nballs — cumulative count of balls EVER fired since boot (NOT
-   * the current number alive).  Drives the colour-slot cycle in
-   * fire_projectile so consecutive balls get distinguishable
-   * colours; decoupled from nblobs so removing a ball with `x`
-   * still leaves the next-fired ball with a fresh colour. */
+  /* nballs — how many balls have been fired since boot, ever (not how
+   * many are alive now).  Used only to give each new ball a fresh
+   * colour, even after you've deleted some. */
   int nballs;
 
-  /* preset — which canned tower-layout is currently loaded.  Index
-   * in [0, N_PRESETS).  Cycling preset via n/N triggers a full
-   * scene_init which tears down the body pool and rebuilds.
-   * Stored normalised to [0, N_PRESETS) by the n/N key handlers;
-   * scene_init still wraps defensively as a safety net. */
+  /* preset — which tower layout is loaded, a number in [0, N_PRESETS).
+   * Switching it (n/N keys) rebuilds the whole scene from scratch. */
   int preset;
 
-  /* paused — when true, scene_step is skipped entirely each frame.
-   * Bodies stay frozen at their current positions; unpause continues
-   * from the exact same state with no discontinuity.  Mirrored to
-   * the HUD via the "PAUSED " badge. */
+  /* paused — when true, the physics is skipped each frame so everything
+   * freezes; unpausing picks up exactly where it left off. */
   bool paused;
 
-  /* steps — physics sub-steps per render frame.  At STEPS_DEF=3 the
-   * solver runs 3× per scene_draw, giving the PBD iteration loop
-   * three chances to relax constraints per displayed frame.  More
-   * sub-steps = smaller effective dt = less projectile tunneling
-   * through thin walls. */
+  /* steps — how many physics sub-steps run per drawn frame.  Splitting a
+   * frame into smaller chunks stops a fast ball from skipping through a
+   * thin wall. */
   int steps;
 
-  /* tick — monotonically increasing physics-step counter, reset by
-   * scene_init.  Surface for future "every N ticks" hooks; not read
-   * by physics math itself. */
+  /* tick — a simple step counter, reset on rebuild.  Nothing reads it
+   * yet; it's here for future "do something every N steps" hooks. */
   long tick;
 
-  /* rng — xorshift / LCG state for any future spawn jitter.  Re-seeded
-   * only at boot; currently unused (all spawn positions are
-   * deterministic preset coordinates) but kept on Scene so future
-   * features that need RNG don't pollute file scope. */
+  /* rng — random-number state, seeded at boot.  Currently unused (every
+   * tower sits at a fixed spot); kept here so future random features
+   * don't need a new global. */
   uint32_t rng;
 
-  /* gravity_on — global gravity gate.  When false, verlet_predict_all
-   * adds 0.f to vy instead of `gravity`; existing motion still
-   * decays via `damping` so bodies coast to rest. */
+  /* gravity_on — the g key's on/off switch for gravity.  Turned off,
+   * bodies keep whatever motion they had and gently coast to a stop. */
   bool gravity_on;
 
-  /* gravity — downward acceleration per sub-step in px / sub-step².
-   * Sized for SIM_FPS=20 with 3 sub-steps: GRAVITY_DEF=0.06
-   * produces a comfortable terminal velocity without bodies
-   * tunneling through thin walls. */
+  /* gravity — how hard things are pulled down each sub-step.  Tuned so
+   * bodies fall at a nice pace without punching through thin walls. */
   float gravity;
 
-  /* damping — velocity retained per sub-step ∈ [0, 1].  Applied at
-   * the start of verlet_predict_all on the implicit velocity:
-   *   v = (x − x_prev) · damping
-   * 0.985 ⇒ retain ~73 %/sec at 20 Hz × 3 sub-steps = 60 Hz —
-   * bodies coast visibly but settle within a few seconds. */
+  /* damping — the fraction of speed a point keeps each sub-step (a touch
+   * of drag).  0.985 lets bodies coast a bit but settle within a few
+   * seconds. */
   float damping;
 
-  /* pbd_iters — number of constraint-projection passes per sub-step.
-   * In our interleaved scene_step this ALSO controls collision-pass
-   * count (one collision pass per PBD iter), so it has DOUBLE the
-   * impact on stiffness compared to a non-interleaved solver.
-   * Default 10 makes the anchored slabs feel rigid until ball
-   * impact tears constraints; user nudges with i/I at runtime. */
+  /* pbd_iters — how many times per sub-step we nudge all the links back
+   * toward their rest lengths.  More passes = a stiffer, more solid body
+   * (and, since collisions happen between these passes, firmer contacts
+   * too).  Nudge it live with i/I. */
   int pbd_iters;
 
-  /* break_thresh — global stretch-ratio threshold copied to every
-   * new constraint via blob_add_con.  Mutating this DOESN'T affect
-   * already-built bodies (their cons captured the old value at
-   * build time); to apply a new threshold you re-build the preset.
-   * The r key does exactly this, so the b/B → r workflow is
-   * "lower threshold, reset, observe more fragile behaviour". */
+  /* break_thresh — the breaking ratio handed to every NEW link.
+   * Changing it doesn't affect bodies already built — they captured the
+   * old value — so the workflow is: change it with b/B, then press r to
+   * rebuild and feel the difference. */
   float break_thresh;
 
-  /* ── Rendering parameters ───────────────────────────────────────── */
+  /* ── rendering: how things look ── */
 
-  /* theme — index into k_themes[] (§3); cycled forward by 't',
-   * backward by 'T'.  Both handlers call theme_apply() which
-   * overwrites the colour-pair RGB.  Body positions, broken
-   * constraints, pinned flags, and rng state are all UNTOUCHED —
-   * this is what makes theme purely cosmetic. */
+  /* theme — which colour scheme is active; cycled with t/T.  Changing it
+   * only repaints colours, leaving every body's positions and links
+   * exactly as they were. */
   int theme;
 
-  /* fps_disp — rolling 1-second frame-rate readout displayed on the
-   * top HUD.  Updated by main()'s frame counter once per second;
-   * the renderer just reads it.  Decoupled from physics tick rate
-   * — measures pure render-loop throughput. */
+  /* fps_disp — the frame rate shown in the HUD, refreshed once a second
+   * by the main loop.  The drawing code just reads it. */
   int fps_disp;
 } Scene;
 
@@ -817,35 +484,21 @@ static Scene g_scene = {
 /* Screen geometry — main-loop bookkeeping, not Scene state. */
 static int g_rows, g_cols;
 
-/* ===================================================================== */
-/* §5  physics — Verlet predict + PBD relaxation + boundary response     */
-/* ===================================================================== */
+/* ── §5 physics — move points, fix links, bounce off walls ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * The textbook PBD step (Müller [1, §3]):
- *
- *     for each body:  verlet_predict_all
- *     for k in 0..pbd_iters:
- *         for each body:  project_distance_constraints + clamp_world
- *         for each pair:  resolve_penetration(A,B) + resolve_penetration(B,A)
- *     for each body:  apply_boundary_velocity_response
- *
- * scene_step (§7) is this loop verbatim.  Helpers below implement each
- * pipeline stage with explicit handling of pinned nodes (skip them) and
- * broken constraints (skip k=0).
- * ─────────────────────────────────────────────────────────────────────── */
+/* One physics pass goes: let every point drift under gravity, then nudge
+ * all the links back to length a bunch of times (fixing collisions in
+ * between), then bounce anything that hit a wall.  scene_step (§7) runs
+ * exactly this.  The helpers below handle the two special cases: glued
+ * points never move, and broken links (stiffness 0) are skipped. */
 
-/*
- * verlet_predict_all — advance free-flight positions using Verlet:
+/* verlet_predict_all — let each free point coast for one step.
  *
- *     v ≈ (x − x_prev) * damping
- *     x_prev = x                    (save for next step's velocity)
- *     x = x + v + gravity            (move under inertia + gravity)
- *
- * Pinned nodes skip entirely — they don't have velocity, gravity, or
- * inertia.  We still update px = x so a future un-pin doesn't inherit
- * a stale velocity from before pinning.
- */
+ * We never store a speed.  Instead, the gap between where a point is and
+ * where it was last step already tells us how fast it's going, so we just
+ * carry it forward by that same gap and add gravity (Jakobsen [3]).
+ * Glued points don't move; we still copy their old spot forward so they'd
+ * start from rest if they were ever un-glued. */
 static void verlet_predict_all(Blob *bl) {
   float g = g_scene.gravity_on ? g_scene.gravity : 0.f;
   for (int i = 0; i < bl->n_nodes; i++) {
@@ -865,35 +518,19 @@ static void verlet_predict_all(Blob *bl) {
   }
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * project_all_distance_constraints pipeline — one PBD iteration.
- *
- * For each constraint we run a 4-stage pipeline:
- *
- *     1. constraint_is_alive(c)          — broken-constraint early-out
- *     2. measure_constraint_distance(a, b) → (dx, dy, d)
- *     3. check_and_break_if_overstretched(c, d)  → maybe set k = 0
- *     4. project_pbd_distance(a, b, c, dx, dy, d)
- *
- * Stage (3) before stage (4) is essential — Provot's flag trick [6]:
- * a constraint exceeding the break threshold gets removed BEFORE the
- * solver applies a correction that might mask the stretch.
- *
- * Stage (4) implements Müller's mass-weighted distance projection
- * [1, eq. 7], which handles pinning uniformly: a pinned node has
- * inverse mass 0 so it absorbs none of the correction; the free
- * counterpart takes the full correction.  No special-case code for
- * pinned vs free pairs — the math handles both.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Fixing the links, once over the whole body.  For each link: skip it if
+ * it's already broken, measure how far apart its two points are, snap it
+ * if it's overstretched, otherwise slide the points back toward the right
+ * distance.  We check for breaking BEFORE fixing, so a link that's about
+ * to snap doesn't get quietly pulled back into shape first (Provot [6]). */
 
-/* constraint_is_alive — sentinel check: k = 0 means "broken
- * permanently" (Provot's flag).  Skips ~half of constraints on tall
- * fractured presets, so the early-out is worth the branch. */
+/* constraint_is_alive — false once a link has snapped (stiffness 0).
+ * Worth the check: on a shattered tower it skips about half the links. */
 static inline bool constraint_is_alive(const Con *c) { return c->k != 0.f; }
 
-/* measure_constraint_distance — Euclidean distance between two nodes,
- * with the component-wise vector returned too because both the break
- * check (uses d alone) and the projection (uses dx, dy, d) need it. */
+/* measure_constraint_distance — how far apart the two points are, handing
+ * back both the straight-line gap and its x/y parts (the break test needs
+ * the gap, the fix-up needs the parts). */
 static inline void measure_constraint_distance(const Node *a, const Node *b,
                                                float *dx, float *dy, float *d) {
   *dx = b->x - a->x;
@@ -901,10 +538,10 @@ static inline void measure_constraint_distance(const Node *a, const Node *b,
   *d = sqrtf((*dx) * (*dx) + (*dy) * (*dy));
 }
 
-/* check_and_break_if_overstretched — Provot [6] flag: if the current
- * length exceeds rest · break_thresh, set k = 0 (permanent fracture)
- * and signal the caller to skip this iteration.  break_thresh == 0
- * means "never breaks" (used by projectile sphere). */
+/* check_and_break_if_overstretched — if a link is stretched past its
+ * breaking ratio, kill it (stiffness 0, permanent) and tell the caller to
+ * skip it this pass.  A breaking ratio of 0 means "never snaps", which is
+ * what the ball uses (Provot [6]). */
 static inline bool check_and_break_if_overstretched(Con *c, float d) {
   if (c->break_thresh > 0.f && d > c->rest * c->break_thresh) {
     c->k = 0.f;
@@ -913,16 +550,12 @@ static inline bool check_and_break_if_overstretched(Con *c, float d) {
   return false;
 }
 
-/* project_pbd_distance — Müller [1, eq. 7] mass-weighted distance
- * correction.  Pinned nodes have w = 0 and absorb zero correction; if
- * BOTH endpoints are pinned (sum_w = 0) the constraint is rigid
- * between two anchors and we skip it.  Otherwise the correction
- * fraction (err / d) · k splits between the endpoints inversely with
- * their masses.
- *
- * For two free nodes (w_a = w_b = 1), the correction halves between
- * them — the classical Jakobsen [3] half-half split.  For one pinned
- * and one free, the free node takes the full correction. */
+/* project_pbd_distance — slide the two points back toward the link's rest
+ * distance.  A glued point counts as weightless so it never moves: if
+ * both ends are glued there's nothing to do, if one end is glued the free
+ * end does all the moving, and if both are free they each move halfway.
+ * That single weight trick handles all three cases with no branching
+ * (Müller [1]). */
 static inline void project_pbd_distance(Node *a, Node *b, const Con *c,
                                         float dx, float dy, float d) {
   float wa = a->pinned ? 0.f : 1.f;
@@ -938,10 +571,6 @@ static inline void project_pbd_distance(Node *a, Node *b, const Con *c,
   b->y -= dy * corr * wb;
 }
 
-/*
- * project_all_distance_constraints — top-level orchestrator over the
- * pipeline above.  Reads as pseudocode.
- */
 static void project_all_distance_constraints(Blob *bl) {
   for (int i = 0; i < bl->n_cons; i++) {
     Con *c = &bl->cons[i];
@@ -954,7 +583,7 @@ static void project_all_distance_constraints(Blob *bl) {
     float dx, dy, d;
     measure_constraint_distance(a, b, &dx, &dy, &d);
     if (d < 1e-6f)
-      continue; /* degenerate */
+      continue; /* points on top of each other — no direction to push */
 
     if (check_and_break_if_overstretched(c, d))
       continue;
@@ -963,11 +592,9 @@ static void project_all_distance_constraints(Blob *bl) {
   }
 }
 
-/*
- * clamp_all_nodes_to_world — keep free nodes inside the rectangular
- * arena.  Pinned nodes are presumed to be already in valid positions
- * (the preset builder sets them).
- */
+/* clamp_all_nodes_to_world — shove any point that has wandered off-screen
+ * back inside the play area.  Glued points are left alone; the builder
+ * already placed them somewhere valid. */
 static void clamp_all_nodes_to_world(Blob *bl, float ww, float wh) {
   for (int i = 0; i < bl->n_nodes; i++) {
     Node *n = &bl->nodes[i];
@@ -984,12 +611,11 @@ static void clamp_all_nodes_to_world(Blob *bl, float ww, float wh) {
   }
 }
 
-/*
- * apply_boundary_velocity_response — wall / floor bounce, applied to
- * free nodes only.  Reflects the implicit Verlet velocity by tweaking
- * px/py so that (x − px) flips sign with a restitution factor.  Floor
- * additionally damps horizontal velocity (Coulomb-ish friction).
- */
+/* apply_boundary_velocity_response — bounce free points off the walls and
+ * floor.  Since a point's speed is just the gap to its old spot, we bounce
+ * it by moving that old spot to the other side, which flips the direction
+ * it's heading.  The floor also bleeds off sideways speed, so things slow
+ * down and stop instead of sliding forever. */
 static void apply_boundary_velocity_response(Blob *bl, float ww, float wh) {
   for (int i = 0; i < bl->n_nodes; i++) {
     Node *n = &bl->nodes[i];
@@ -1015,16 +641,13 @@ static void apply_boundary_velocity_response(Blob *bl, float ww, float wh) {
   }
 }
 
-/* ===================================================================== */
-/* §6  collision — body-vs-body                                          */
-/* ===================================================================== */
+/* ── §6 collision — when one body overlaps another ── */
 
-/*
- * point_in_polygon_jordan — Jordan curve theorem ray-cast (Sunday [5]).
- * Counts horizontal-ray crossings against the boundary polygon edges;
- * odd = inside, even = outside.  Edge endpoint handling avoids the
- * vertex-grazing degeneracy via the asymmetric (ay <= py < by) test.
- */
+/* point_in_polygon_jordan — is a point inside a body's outline?  Shoot an
+ * imaginary ray sideways from the point and count how many times it
+ * crosses the outline: an odd number means inside, even means outside.
+ * The slightly lopsided edge test (touch the bottom end, miss the top)
+ * keeps a ray that grazes a corner from being counted twice (Sunday [5]). */
 static bool point_in_polygon_jordan(const Blob *bl, float px, float py) {
   int crossings = 0, nb = bl->n_bnd;
   for (int i = 0; i < nb; i++) {
@@ -1040,27 +663,15 @@ static bool point_in_polygon_jordan(const Blob *bl, float px, float py) {
   return (crossings & 1) != 0;
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * nearest_polygon_edge pipeline — closest-point-on-polygon search.
- *
- * For each boundary edge (A, B) of the polygon:
- *
- *     1. parametric_projection_clamped(P, A, B)    → t ∈ [0, 1]
- *     2. point_on_segment_at(A, B, t)              → closest cell point
- *     3. euclidean_distance(P, closest)            → distance d
- *     4. if d < best: keep_as_new_best
- *
- * The clamped-parametric form (Ericson [4, §5.1.5]) handles edges
- * where the foot-of-perpendicular falls outside the segment: instead
- * of returning the perpendicular projection (which would be on the
- * infinite line), we clamp t to [0, 1] so the closest point is one
- * of the two endpoints when the perpendicular misses.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Finding the closest spot on a body's outline to a given point.  We walk
+ * every edge of the outline, find the nearest spot on that edge, and keep
+ * the closest one overall.  That spot tells us which way to push the
+ * overlapping point back out, and how far (Ericson [4]). */
 
-/* parametric_projection_clamped — foot-of-perpendicular t for P onto
- * segment A→B, clamped to [0, 1] so the result stays on the segment.
- * Returns the canonical parametric coordinate where t=0 is A, t=1 is B
- * (Ericson [4, §5.1.5]). */
+/* parametric_projection_clamped — for a point and one edge, how far along
+ * the edge its closest spot sits, as a fraction from 0 (start) to 1 (end).
+ * If the point is off the end of the edge we clamp to 0 or 1, so the
+ * answer always lands on the edge itself, not off into space. */
 static inline float parametric_projection_clamped(float px, float py, float ax,
                                                   float ay, float edx,
                                                   float edy, float len2) {
@@ -1072,25 +683,24 @@ static inline float parametric_projection_clamped(float px, float py, float ax,
   return t;
 }
 
-/* point_on_segment_at — linear interpolation along edge: c = A + t·edge.
- * Writes the cell coordinates into the out-params. */
+/* point_on_segment_at — turn that fraction back into an actual spot:
+ * start, plus the fraction of the way along the edge. */
 static inline void point_on_segment_at(float ax, float ay, float edx, float edy,
                                        float t, float *cx, float *cy) {
   *cx = ax + t * edx;
   *cy = ay + t * edy;
 }
 
-/* euclidean_distance — √(Δx² + Δy²) in 2D. */
+/* euclidean_distance — straight-line distance between two points. */
 static inline float euclidean_distance(float px, float py, float qx, float qy) {
   float dx = px - qx, dy = py - qy;
   return sqrtf(dx * dx + dy * dy);
 }
 
-/* outward_unit_normal — from a closest-point on the polygon edge, the
- * unit vector pointing TOWARD the query point (i.e. "outward" from
- * the polygon if the query is outside, "the direction we'd push OUT"
- * if inside).  Degenerate d ≈ 0 falls back to (0, 1) so callers always
- * get a unit-length result. */
+/* outward_unit_normal — which way to push the overlapping point to get it
+ * out: the direction from the closest spot on the edge back to the point.
+ * If they're right on top of each other we just pick straight down, so the
+ * caller always gets a usable direction. */
 static inline void outward_unit_normal(float px, float py, float cx, float cy,
                                        float d, float *nx, float *ny) {
   if (d > 1e-6f) {
@@ -1102,13 +712,10 @@ static inline void outward_unit_normal(float px, float py, float cx, float cy,
   }
 }
 
-/*
- * nearest_polygon_edge — orchestrator.  Reads as the pipeline at the
- * top of this block: clamp t, interpolate, distance, keep-best.
- * Returns through out-params (nx, ny, depth, ea, eb) so resolve_
- * penetration can use the same query result for both the push
- * direction AND identifying the two B nodes to deform inward.
- */
+/* nearest_polygon_edge — finds the closest spot on the outline and hands
+ * back the push direction, how deep the overlap is, and which two edge
+ * points to dent inward.  The caller reuses all of that, so it's one
+ * search rather than two. */
 static void nearest_polygon_edge(const Blob *bl, float px, float py, float *nx,
                                  float *ny, float *depth, int *ea, int *eb) {
   float best = 1e9f;
@@ -1126,7 +733,7 @@ static void nearest_polygon_edge(const Blob *bl, float px, float py, float *nx,
     float edx = bx - ax, edy = by - ay;
     float len2 = edx * edx + edy * edy;
     if (len2 < 1e-8f)
-      continue; /* degenerate edge */
+      continue; /* zero-length edge — skip it */
 
     float t = parametric_projection_clamped(px, py, ax, ay, edx, edy, len2);
     float cx, cy;
@@ -1143,57 +750,40 @@ static void nearest_polygon_edge(const Blob *bl, float px, float py, float *nx,
   }
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * resolve_penetration pipeline — A→B directional pass.
+/* Pushing two overlapping bodies apart.  For each of body A's points that
+ * has poked inside body B, we find how deep it went, shove that point back
+ * out, and dent B's nearest edge inward a little.  Splitting the push
+ * between both bodies (rather than moving just one) keeps the shove fair
+ * and stops energy appearing from nowhere (Müller [1]).  Glued points on
+ * either side don't budge.
  *
- * For each free (un-pinned) node of A:
- *
- *     1. point_in_polygon_jordan(B, node)        — detect overlap
- *     2. nearest_polygon_edge(B, node)           — outward normal + depth
- *     3. compute_newton3_push_split(depth)       — (push_out, push_in)
- *     4. push_penetrator_outward(A.node, n, mag)
- *     5. squish_receiver_polygon_inward(B, ea, eb, n, mag)
- *
- * The Newton's-3rd-law split (Müller [1, §5]) gives 50 % of the
- * separation to A and 25 % to each of B's two nearest edge nodes —
- * total displacement equals the depth, no momentum injection.  Pinned
- * nodes on either side skip; they're infinite-mass anchors and Newton's
- * 3rd partner has nothing to grip on the receiving side.
- *
- * Interleaved with PBD passes in scene_step (§7): each inward-squish
- * of B is immediately relaxed by B's own distance constraints before
- * the next collision push — that's what makes the receiving body look
- * "jelly-elastic" without devolving into liquid.
- * ─────────────────────────────────────────────────────────────────────── */
+ * scene_step weaves these collision pushes in between the link-fixing
+ * passes, so right after B gets dented its own links pull it back toward
+ * shape.  That back-and-forth is what makes a hit body wobble like jelly
+ * instead of smearing into liquid. */
 
-/* compute_newton3_push_split — given a penetration depth, decide how
- * much to push the penetrator OUT vs how much to squish each of the
- * receiver's two nearest edge nodes IN.
- *
- *   push_out = (depth + skin) / 2     half goes to the penetrator
- *   push_in  = depth / 4              quarter to each of B's two nodes
- *
- * Total displacement: push_out + 2·push_in = depth + skin/2 ≈ depth,
- * so the bodies separate cleanly with a small skin gap that prevents
- * re-overlap on the next sub-step's Verlet velocity. */
+/* compute_newton3_push_split — divide the overlap depth into how far to
+ * push the poking point back out versus how far to dent each of the two
+ * edge points inward.  The point gets half, each edge point a quarter,
+ * with a tiny extra nudge so they separate with a hair of breathing room
+ * and don't immediately re-overlap next step. */
 static inline void compute_newton3_push_split(float depth, float *push_out,
                                               float *push_in) {
   *push_out = (depth + 0.5f) * 0.5f;
   *push_in = depth * 0.25f;
 }
 
-/* push_penetrator_outward — move a node along the outward unit normal
- * by `mag` pixels.  Caller has already verified the node is not pinned. */
+/* push_penetrator_outward — slide the poking point straight back out by
+ * the given amount.  The caller already checked it isn't glued. */
 static inline void push_penetrator_outward(Node *node, float nx, float ny,
                                            float mag) {
   node->x -= nx * mag;
   node->y -= ny * mag;
 }
 
-/* squish_receiver_polygon_inward — push both endpoints of the receiver's
- * closest edge INWARD along the outward normal direction (i.e. in the
- * +n direction, which moves the polygon boundary toward the polygon
- * interior).  Pinned endpoints are skipped — anchors don't deform. */
+/* squish_receiver_polygon_inward — dent the hit body by pushing both ends
+ * of its nearest edge inward, which is what makes a struck tower visibly
+ * cave in where the ball lands.  Glued ends don't move. */
 static inline void squish_receiver_polygon_inward(Blob *b, int ea, int eb,
                                                   float nx, float ny,
                                                   float mag) {
@@ -1209,17 +799,14 @@ static inline void squish_receiver_polygon_inward(Blob *b, int ea, int eb,
   }
 }
 
-/*
- * resolve_penetration — orchestrator for one directional pass A→B.
- * The caller (scene_step) alternates resolve_penetration(A, B) and
- * resolve_penetration(B, A) so both bodies get a chance to push
- * symmetrically — Newton's 3rd across the pair, not just per call.
- */
+/* resolve_penetration — handles A poking into B.  The caller runs it both
+ * ways (A into B, then B into A) so neither body gets pushed around while
+ * the other sits still. */
 static void resolve_penetration(Blob *a, Blob *b) {
   for (int i = 0; i < a->n_nodes; i++) {
     Node *ni = &a->nodes[i];
     if (ni->pinned)
-      continue; /* anchors immovable */
+      continue; /* glued points don't move */
 
     if (!point_in_polygon_jordan(b, ni->x, ni->y))
       continue;
@@ -1236,9 +823,7 @@ static void resolve_penetration(Blob *a, Blob *b) {
   }
 }
 
-/* ===================================================================== */
-/* §7  scene — preset builders + projectile + scene_step                 */
-/* ===================================================================== */
+/* ── §7 scene — build the towers, fire the ball, run one frame ── */
 
 static const char *k_preset_names[N_PRESETS] = {
     "Big Tower",
@@ -1247,11 +832,9 @@ static const char *k_preset_names[N_PRESETS] = {
     "Big + Small",
 };
 
-/*
- * blob_add_con — append one distance constraint with rest length
- * computed from the current node positions.  break_thresh = 0 makes
- * it permanent (never snaps); positive values activate tearing.
- */
+/* blob_add_con — add one link between two points, taking its rest length
+ * from where the points sit right now.  A breaking ratio of 0 makes the
+ * link permanent (never snaps). */
 static void blob_add_con(Blob *bl, int a, int b, float k, float break_thresh) {
   if (bl->n_cons >= BLOB_CONS_MAX)
     return;
@@ -1264,26 +847,14 @@ static void blob_add_con(Blob *bl, int a, int b, float k, float break_thresh) {
                                  .break_thresh = break_thresh};
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * blob_build_grid pipeline — generic w×h grid soft-body builder.
- *
- *     1. blob_clear_and_metadata          — wipe + assign render slots
- *     2. lay_out_grid_node_positions      — w·h mass points on a lattice
- *     3. wire_grid_axis_aligned_edges     — STRUCT_K horizontal+vertical pairs
- *     4. wire_grid_cell_diagonals         — SHEAR_K cross-bracing
- *     5. trace_grid_boundary_ccw          — outer ring for collision/render
- *
- * Steps 3-4 define the body's MECHANICAL STIFFNESS: axis-aligned cons
- * resist stretch, diagonal cons resist shear (parallelogram squish).
- * Together they make the grid behave like a quad-mesh continuum.
- * Step 5 defines its COLLISION SILHOUETTE and SCAN-FILL CONTOUR.
- *
- * All cons inherit the same break_thresh so fracture is uniform.
- * Caller pins specific rows after build via pin_grid_bottom_row.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Building a tower: lay out a grid of points, link each point to its
+ * neighbours so the grid keeps its shape, add diagonal links so it can't
+ * shear into a squashed diamond, then trace its outline for collisions and
+ * drawing.  Every link gets the same breaking ratio, so the whole tower is
+ * equally fragile.  The caller glues the bottom row afterward. */
 
-/* blob_clear_and_metadata — wipe the struct and stamp the render-side
- * tags that the renderer will pick up for colouring. */
+/* blob_clear_and_metadata — start a fresh body: zero it out and stamp on
+ * its colours and shape. */
 static void blob_clear_and_metadata(Blob *bl, int scp, int fcp, BKind kind,
                                     int n_nodes) {
   memset(bl, 0, sizeof *bl);
@@ -1293,11 +864,9 @@ static void blob_clear_and_metadata(Blob *bl, int scp, int fcp, BKind kind,
   bl->n_nodes = n_nodes;
 }
 
-/* lay_out_grid_node_positions — w×h mass points on a regular lattice
- * with cell spacing `sp`.  Origin (ox, oy) is the top-left node;
- * column c, row r is placed at (ox + c·sp, oy + r·sp).  Verlet's
- * previous-position is initialised equal to current, so the initial
- * implicit velocity is zero (body at rest). */
+/* lay_out_grid_node_positions — drop the points onto an evenly-spaced grid
+ * starting from the top-left corner.  Each point's old spot starts equal
+ * to its current spot, so the tower begins at rest. */
 static void lay_out_grid_node_positions(Blob *bl, float ox, float oy, int w,
                                         int h, float sp) {
   for (int r = 0; r < h; r++)
@@ -1308,9 +877,9 @@ static void lay_out_grid_node_positions(Blob *bl, float ox, float oy, int w,
     }
 }
 
-/* wire_grid_axis_aligned_edges — STRUCTURAL cons connecting each node
- * to its right and bottom neighbour.  These resist STRETCH along the
- * grid axes; together they form the visible outline of every cell. */
+/* wire_grid_axis_aligned_edges — link each point to its right and bottom
+ * neighbour.  These are the stiff edges that keep the grid from stretching
+ * and form the outline of every cell. */
 static void wire_grid_axis_aligned_edges(Blob *bl, int w, int h,
                                          float break_thresh) {
   for (int r = 0; r < h; r++)
@@ -1323,11 +892,10 @@ static void wire_grid_axis_aligned_edges(Blob *bl, int w, int h,
     }
 }
 
-/* wire_grid_cell_diagonals — SHEAR cons across both diagonals of every
- * (r, c)–(r+1, c+1) cell.  These resist parallelogram-squish: without
- * them the grid would collapse into a diamond under load, even with
- * structural edges holding lengths constant.  Cell count = (w-1)·(h-1),
- * cons per cell = 2 → total shear cons = 2·(w-1)·(h-1). */
+/* wire_grid_cell_diagonals — link both diagonals across every grid cell.
+ * Without these the grid would flop over into a leaning diamond even with
+ * the edges holding their lengths; the diagonals are what keep the cells
+ * square. */
 static void wire_grid_cell_diagonals(Blob *bl, int w, int h,
                                      float break_thresh) {
   for (int r = 0; r < h - 1; r++)
@@ -1338,17 +906,10 @@ static void wire_grid_cell_diagonals(Blob *bl, int w, int h,
     }
 }
 
-/* trace_grid_boundary_ccw — write the outer-perimeter node indices
- * into bl->bnd[] in counter-clockwise order:
- *
- *     top edge      left → right          (row 0)
- *     right edge    top → bottom          (col w-1)
- *     bottom edge   right → left          (row h-1, reversed)
- *     left edge     bottom → top          (col 0, reversed)
- *
- * Used by §6 collision (Jordan curve + closest-point) AND §8 render
- * (scan-fill walks edges to find row-extent bounds).  Both functions
- * tolerate any consistent winding; CCW is the convention here. */
+/* trace_grid_boundary_ccw — list the points around the grid's edge,
+ * walking the rim counter-clockwise: across the top, down the right side,
+ * back along the bottom, up the left.  Collisions and the inside-fill both
+ * walk this list. */
 static void trace_grid_boundary_ccw(Blob *bl, int w, int h) {
   bl->n_bnd = 0;
   for (int c = 0; c < w; c++)
@@ -1361,12 +922,6 @@ static void trace_grid_boundary_ccw(Blob *bl, int w, int h) {
     bl->bnd[bl->n_bnd++] = r * w;
 }
 
-/*
- * blob_build_grid — orchestrator.  Reads as the 5-stage pseudocode
- * pinned at the top of this block.  All five helpers operate on the
- * same Blob* — no cross-stage data dependencies beyond what's already
- * captured in `bl->nodes[]`.
- */
 static void blob_build_grid(Blob *bl, float ox, float oy, int w, int h,
                             float sp, int scp, int fcp, float break_thresh) {
   blob_clear_and_metadata(bl, scp, fcp, BKIND_SLAB, w * h);
@@ -1376,54 +931,32 @@ static void blob_build_grid(Blob *bl, float ox, float oy, int w, int h,
   trace_grid_boundary_ccw(bl, w, h);
 }
 
-/*
- * pin_grid_bottom_row — mark every node in the last row (r = h-1) as
- * pinned.  Those nodes become kinematic anchors: gravity, integration,
- * constraint projection, world clamp, and collision push all skip them.
- * Net effect: the body cannot slide horizontally or fall over.
- */
+/* pin_grid_bottom_row — glue the tower's bottom row to the floor so it
+ * can't slide or topple.  Glued points are skipped by every physics step,
+ * which is exactly what makes them act like a fixed foundation. */
 static void pin_grid_bottom_row(Blob *bl, int w, int h) {
   for (int c = 0; c < w; c++) {
     bl->nodes[(h - 1) * w + c].pinned = true;
   }
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * blob_build_sphere pipeline — wheel-and-spoke soft sphere builder.
- *
- *     1. blob_clear_and_metadata          — wipe + render slot
- *     2. place_sphere_center_node         — node 0 at (cx, cy)
- *     3. place_sphere_ring_nodes          — SPH_RING nodes on the rim
- *     4. wire_sphere_hoop_cons            — adjacent ring nodes
- *     5. wire_sphere_spoke_cons           — every ring node ↔ centre
- *     6. wire_sphere_diameter_cons        — opposite ring pairs (shear)
- *     7. trace_sphere_ring_boundary       — boundary = ring (centre is
- * interior)
- *
- * Geometry trick (step 3): the ring is an ELLIPSE in pixel space with
- * y-radius = 2·SPH_R because terminal cells are ~2× taller than wide.
- * PHY_TO_ROW halves y, so the ellipse renders as a visual CIRCLE.
- *
- * The projectile ball uses break_thresh = 0 on every constraint — the
- * ball must survive impact and bounce off, not disintegrate.  This is
- * the only kind of body in the demo with non-breakable cons.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Building the ball, like a wagon wheel: one point at the centre, a ring
+ * of points around the rim, then links along the rim, spokes to the
+ * centre, and a few straight across.  The rim is drawn as a tall oval
+ * because terminal cells are about twice as tall as they are wide — once
+ * squashed onto the screen it reads as a round circle.  Every link on the
+ * ball is unbreakable so it survives a hit and bounces; it's the only body
+ * in the demo whose links can't snap. */
 
-/* place_sphere_center_node — node 0 sits at the geometric centre.  It
- * has no rendering glyph of its own (the boundary is the ring, centre
- * is interior to the polygon), but it anchors the spokes that keep
- * the body from collapsing radially under load. */
+/* place_sphere_center_node — the hub at the middle.  It isn't drawn, but
+ * the spokes hang off it so the ball can't collapse inward. */
 static void place_sphere_center_node(Blob *bl, float cx, float cy) {
   bl->nodes[0].x = bl->nodes[0].px = cx;
   bl->nodes[0].y = bl->nodes[0].py = cy;
 }
 
-/* place_sphere_ring_nodes — SPH_RING nodes evenly spaced around an
- * ellipse with x-radius = SPH_R, y-radius = 2·SPH_R.  Indexed 1..N
- * (node 0 is the centre).  Angular parameter goes 0 → 2π counter-
- * clockwise in math-y; with y-down screen coords this paints CCW on
- * screen too (sin flips sign, so + sin advances y downward which is
- * forward-CCW under y-down). */
+/* place_sphere_ring_nodes — the rim points, spaced evenly around a tall
+ * oval so the ball looks round once it's drawn on screen. */
 static void place_sphere_ring_nodes(Blob *bl, float cx, float cy) {
   for (int i = 0; i < SPH_RING; i++) {
     float a = 6.2831853f * i / SPH_RING;
@@ -1433,47 +966,37 @@ static void place_sphere_ring_nodes(Blob *bl, float cx, float cy) {
   }
 }
 
-/* wire_sphere_hoop_cons — STRUCT_K distance cons between adjacent ring
- * nodes, closing the hoop with the (i, (i+1) mod N) wrap.  These hold
- * the rim's circumference roughly constant — without them the ring
- * would bunch up. */
+/* wire_sphere_hoop_cons — link each rim point to the next one around,
+ * closing the loop.  These hold the rim's size steady so it doesn't bunch
+ * up. */
 static void wire_sphere_hoop_cons(Blob *bl) {
   for (int i = 0; i < SPH_RING; i++)
     blob_add_con(bl, 1 + i, 1 + (i + 1) % SPH_RING, STRUCT_K, 0.f);
 }
 
-/* wire_sphere_spoke_cons — STRUCT_K cons from EVERY ring node to the
- * centre.  These resist RADIAL deformation: without them, the centre
- * is unconstrained and the body would collapse into the rim. */
+/* wire_sphere_spoke_cons — link every rim point to the centre, like
+ * spokes.  These keep the ball from caving in toward the middle. */
 static void wire_sphere_spoke_cons(Blob *bl) {
   for (int i = 0; i < SPH_RING; i++)
     blob_add_con(bl, 0, 1 + i, STRUCT_K, 0.f);
 }
 
-/* wire_sphere_diameter_cons — SHEAR_K cons between OPPOSITE ring nodes
- * (i, i + N/2).  These resist asymmetric squish (oval collapse) by
- * coupling the two sides of the ring directly across the centre.
- * Only N/2 diameters are added — adding more would double-count
- * the same pair. */
+/* wire_sphere_diameter_cons — link points on opposite sides of the rim,
+ * straight across.  These stop the ball from squashing lopsided.  We only
+ * need half as many as there are rim points, since each line covers two. */
 static void wire_sphere_diameter_cons(Blob *bl) {
   for (int i = 0; i < SPH_RING / 2; i++)
     blob_add_con(bl, 1 + i, 1 + i + SPH_RING / 2, SHEAR_K, 0.f);
 }
 
-/* trace_sphere_ring_boundary — the visible / collidable silhouette is
- * exactly the ring; the centre node is interior to the polygon and is
- * never on the boundary.  Same CCW orientation as place_sphere_ring_nodes
- * produces, so collision and scan-fill agree on inside vs outside. */
+/* trace_sphere_ring_boundary — the ball's outline is just its rim; the
+ * centre point sits inside and never counts as part of the edge. */
 static void trace_sphere_ring_boundary(Blob *bl) {
   for (int i = 0; i < SPH_RING; i++)
     bl->bnd[i] = 1 + i;
   bl->n_bnd = SPH_RING;
 }
 
-/*
- * blob_build_sphere — orchestrator.  Reads as the 7-stage pseudocode
- * pinned at the top of this block.
- */
 static void blob_build_sphere(Blob *bl, float cx, float cy, int scp, int fcp) {
   blob_clear_and_metadata(bl, scp, fcp, BKIND_SPHERE, SPH_NODES);
   place_sphere_center_node(bl, cx, cy);
@@ -1484,64 +1007,38 @@ static void blob_build_sphere(Blob *bl, float cx, float cy, int scp, int fcp) {
   trace_sphere_ring_boundary(bl);
 }
 
-/* ── Preset builders  (each spawns 1 or 2 anchored towers) ───────────── */
+/* ── preset builders — each stands up one or two towers ── */
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * TowerSpec — declarative description of one anchored tower.
+/* TowerSpec — a little recipe for one tower: how wide, how tall, how
+ * spread out, and where to stand it.
  *
- * Intent:
- *   The preset_*() builders each compose 1 OR 2 of these and hand them
- *   to place_tower().  Decoupling the SHAPE description (TowerSpec)
- *   from the PLACEMENT logic (place_tower) means adding a preset is
- *   a 4-line operation: declare the TowerSpec(s), call place_tower().
- *
- * Coordinates are PIXEL space (one cell-row = 2 px); place_tower
- * converts the centre to a top-left origin internally.  The vertical
- * coordinate is implicit — every tower's base sits 0.5 px above the
- * floor regardless of height — because the preset concept is "anchored
- * to the ground".  Floating towers would need a more general spec.
- *
- * Why a struct (vs four positional arguments to place_tower):
- *   - Named fields make preset builders self-documenting:
- *       TowerSpec t = { .w = 6, .h = 18, .sp = 2.5f, .cx = ww * 0.65f };
- *     reads better than place_tower(6, 18, 2.5f, ww * 0.65f).
- *   - Future extensions (e.g. .pin_top, .colour_slot_override) can be
- *     added without touching every preset call-site.
- * ─────────────────────────────────────────────────────────────────────── */
+ * The preset builders fill in one or two of these and hand them to
+ * place_tower.  Keeping the "what it looks like" recipe separate from the
+ * "go build it" code means adding a new preset is just a couple of lines.
+ * Towers always sit on the floor — there's no field for height off the
+ * ground, because every tower in this demo is anchored to it. */
 typedef struct {
-  /* w — grid COLUMNS of nodes.  Determines horizontal density of the
-   * mesh; a 6-column tower has 5 horizontal cells across, 5 columns
-   * of structural cons.  Must satisfy w · h ≤ BLOB_NODES_MAX. */
+  /* w — how many points wide the grid is. */
   int w;
 
-  /* h — grid ROWS of nodes.  Determines tower height; bottom row
-   * (r = h - 1) is automatically pinned by place_tower so the
-   * tower is anchored to the floor. */
+  /* h — how many points tall the grid is.  place_tower glues the bottom
+   * row to the floor. */
   int h;
 
-  /* sp — px between adjacent nodes (horizontal AND vertical
-   * spacing — square cells).  Bigger sp → taller / wider visible
-   * tower without changing the node count, but constraint count
-   * stays the same.  2.0-2.5 is the sweet spot for the destructible
-   * jelly aesthetic. */
+  /* sp — the gap between neighbouring points.  Bigger = a physically
+   * larger tower from the same number of points.  2.0–2.5 looks best. */
   float sp;
 
-  /* cx — tower's horizontal CENTRE in world pixel space.  place_tower
-   * subtracts half the tower's width to compute the actual ox.  Use
-   * `ww * fraction` to make presets terminal-width-agnostic. */
+  /* cx — where to centre the tower across the screen.  Use a fraction of
+   * the screen width (like ww * 0.65) so it lands in the right place on
+   * any terminal size. */
   float cx;
 } TowerSpec;
 
-/*
- * place_tower — append one anchored tower to g_scene.blobs[].
- *   1. build a w × h soft grid at the requested horizontal centre,
- *      base just above floor
- *   2. pin its bottom row to the ground
- *   3. assign a color slot cycling through the cool family (0..2)
- *
- * Returns silently on a full pool so preset builders can stay free
- * of capacity checks.
- */
+/* place_tower — build one tower from a recipe and stand it on the floor:
+ * make the grid, glue its bottom row down, give it a colour.  Quietly does
+ * nothing if there's no room left, so the preset builders don't each have
+ * to check. */
 static void place_tower(const TowerSpec *t) {
   if (g_scene.nblobs >= MAX_BLOBS)
     return;
@@ -1553,29 +1050,23 @@ static void place_tower(const TowerSpec *t) {
   float oy = wh - bh - 0.5f; /* base just above floor */
 
   Blob *bl = &g_scene.blobs[g_scene.nblobs];
-  int slot = g_scene.nblobs % 3; /* cycle through cool color family */
+  int slot = g_scene.nblobs % 3; /* rotate through the cool colours */
   blob_build_grid(bl, ox, oy, t->w, t->h, t->sp, CP_BSURF(slot), CP_BFILL(slot),
                   g_scene.break_thresh);
   pin_grid_bottom_row(bl, t->w, t->h);
   g_scene.nblobs++;
 }
 
-/*
- * preset_big_tower — one massive tower dominating the right two-thirds
- * of the world.  Ball-at-chest-height hits its lower-middle and the top
- * 60 % tears off.  Most dramatic single-target demo.
- */
+/* preset_big_tower — one tall tower on the right.  The ball hits it low
+ * and the whole top half tears off — the most dramatic single target. */
 static void preset_big_tower(void) {
   float ww = (float)g_cols;
   TowerSpec t = {.w = 6, .h = 18, .sp = 2.5f, .cx = ww * 0.65f};
   place_tower(&t);
 }
 
-/*
- * preset_twin_towers — two medium towers in line.  Ball passes the
- * first (may shatter through it), continues to the second.  Tests
- * pair-collision propagation under fracture.
- */
+/* preset_twin_towers — two medium towers in a row.  The ball smashes
+ * through the first and carries on into the second. */
 static void preset_twin_towers(void) {
   float ww = (float)g_cols;
   TowerSpec left = {.w = 5, .h = 14, .sp = 2.5f, .cx = ww * 0.45f};
@@ -1584,24 +1075,17 @@ static void preset_twin_towers(void) {
   place_tower(&right);
 }
 
-/*
- * preset_mini_tower — one short tower, easy to topple in a single hit.
- * Good for fine-tuning break_thresh: lower it with B until even the
- * mini tower disintegrates, raise with b to make it bouncy.
- */
+/* preset_mini_tower — one short tower that goes down in a single hit.
+ * Handy for tuning how fragile things are with the b / B keys. */
 static void preset_mini_tower(void) {
   float ww = (float)g_cols;
   TowerSpec t = {.w = 4, .h = 10, .sp = 2.0f, .cx = ww * 0.70f};
   place_tower(&t);
 }
 
-/*
- * preset_big_and_small — David and Goliath: a small tower on the left
- * and a big one on the right.  Ball hits the small tower first
- * (probably knocks it over completely), loses energy, then hits the
- * big tower with a weaker impact (tears off less).  Demonstrates how
- * the projectile's accumulated damage modulates downstream destruction.
- */
+/* preset_big_and_small — David and Goliath: a small tower on the left, a
+ * big one on the right.  The ball flattens the small one, loses some
+ * steam, and only dents the big one. */
 static void preset_big_and_small(void) {
   float ww = (float)g_cols;
   TowerSpec small_t = {.w = 4, .h = 10, .sp = 2.0f, .cx = ww * 0.40f};
@@ -1610,25 +1094,19 @@ static void preset_big_and_small(void) {
   place_tower(&big_t);
 }
 
-/*
- * fire_projectile — SPACE-bound action.  Builds a soft sphere just
- * inside the left wall at chest height (cy = wh − 3·SPH_R − 1 so the
- * ball doesn't immediately touch the floor and get friction-killed),
- * then injects horizontal Verlet velocity by setting every node's
- * px = x − PROJECTILE_VX (Jakobsen [3]: vel ≈ x − px so this is a
- * uniform translation velocity).
- *
- * The ball is NOT pinned and its constraints have break_thresh = 0,
- * so it survives impact and bounces around as a soft ball should.
- */
+/* fire_projectile — what SPACE does: drop a ball just inside the left
+ * wall, up off the floor so it doesn't immediately stick, then give it a
+ * rightward shove.  The shove is done by placing each point's "old spot"
+ * to its left, so the body reads as already moving right.  The ball can't
+ * snap or stick, so it survives the hit and bounces. */
 static void fire_projectile(void) {
   if (g_scene.nblobs >= MAX_BLOBS)
     return;
   float wh = (float)(g_rows - 2) * 2.f;
-  float cx = SPH_R + 1.f;            /* just inside left wall */
-  float cy = wh - SPH_R * 3.f - 1.f; /* chest height          */
+  float cx = SPH_R + 1.f;            /* just inside the left wall */
+  float cy = wh - SPH_R * 3.f - 1.f; /* up off the floor         */
 
-  /* Color slot 3..5 for spheres (warm family). */
+  /* the warm colours, for balls */
   int slot = 3 + (g_scene.nballs % 3);
   Blob *bl = &g_scene.blobs[g_scene.nblobs];
   blob_build_sphere(bl, cx, cy, CP_BSURF(slot), CP_BFILL(slot));
@@ -1640,20 +1118,16 @@ static void fire_projectile(void) {
   g_scene.nballs++;
 }
 
-/*
- * scene_remove_last — drop the last spawned body.  Useful for clearing
- * old projectile balls without resetting the preset.
- */
+/* scene_remove_last — delete the most recent body, handy for clearing old
+ * balls without rebuilding the towers. */
 static void scene_remove_last(void) {
   if (g_scene.nblobs > 0)
     g_scene.nblobs--;
 }
 
-/*
- * scene_init — dispatch: clear the body pool, build the preset structure,
- * reset clocks.  Called at boot, on r/R reset, on every n/N preset cycle,
- * and after SIGWINCH resize (so the new structure scales to the viewport).
- */
+/* scene_init — wipe everything and build the chosen preset from scratch.
+ * Runs at startup, on reset, when you switch presets, and after a window
+ * resize so the towers re-fit the new size. */
 static void scene_init(int preset) {
   g_scene.nblobs = 0;
   g_scene.nballs = 0;
@@ -1676,38 +1150,24 @@ static void scene_init(int preset) {
   }
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * scene_step pipeline — INTERLEAVED PBD + collision (Müller [1, §3]).
- *
- *     for substep in 1..steps:
- *         predict_all_free_flight()              // Verlet predict per body
- *         for k in 1..pbd_iters:
- *             relax_all_distance_constraints()   // PBD per body
- *             resolve_all_pairwise_contacts()    // collision per pair (×2)
- *         apply_arena_velocity_response()         // walls/floor reflection
- *     tick++
- *
- * Interleaving (steps 2-3 alternating inside the k loop) is the entire
- * reason multi-body stacks don't liquefy — every collision push gets
- * an immediate PBD pass before the next collision happens, so receiving
- * bodies can recover shape between contacts.  The OUTER substep loop
- * exists separately for fast projectiles: at high vx the per-substep
- * displacement must stay smaller than the receiver's wall thickness
- * to avoid tunneling.
- * ─────────────────────────────────────────────────────────────────────── */
+/* One frame of physics, split into a few sub-steps.  Each sub-step lets
+ * every body drift, then loops several times over "fix the links, fix the
+ * collisions", and finally bounces anything off the walls.  Fixing
+ * collisions and links over and over in the same loop is the whole reason
+ * the towers stay solid instead of melting: every time a body gets dented,
+ * its links pull it back before the next dent lands.  The sub-steps exist
+ * so a fast ball moves in small hops and can't skip through a thin wall. */
 
-/* predict_all_free_flight — apply Verlet predict to every body.  Skips
- * pinned nodes internally (verlet_predict_all checks). */
+/* predict_all_free_flight — let every body coast one step (glued points
+ * are skipped inside). */
 static void predict_all_free_flight(void) {
   for (int i = 0; i < g_scene.nblobs; i++)
     verlet_predict_all(&g_scene.blobs[i]);
 }
 
-/* relax_all_distance_constraints — one PBD iteration over every body's
- * constraint network, followed by an arena-clamp so post-projection
- * positions stay inside the world.  Clamping AFTER projection ensures
- * the projection's correction isn't undone by a stale clamp from a
- * previous iter. */
+/* relax_all_distance_constraints — fix every body's links once, then shove
+ * any point that ended up off-screen back inside.  Clamping after the fix
+ * (not before) means the fix's work isn't immediately undone. */
 static void relax_all_distance_constraints(float ww, float wh) {
   for (int i = 0; i < g_scene.nblobs; i++) {
     project_all_distance_constraints(&g_scene.blobs[i]);
@@ -1715,10 +1175,9 @@ static void relax_all_distance_constraints(float ww, float wh) {
   }
 }
 
-/* resolve_all_pairwise_contacts — for each unordered body pair, do both
- * directional passes A→B and B→A so Newton's 3rd is enforced across
- * the pair.  O(nblobs²) inner loop; small N (≤ MAX_BLOBS = 16) so this
- * doesn't dominate. */
+/* resolve_all_pairwise_contacts — check every pair of bodies for overlap,
+ * pushing both ways so neither one gets shoved around unfairly.  It
+ * compares all pairs, which is fine since there are never many bodies. */
 static void resolve_all_pairwise_contacts(void) {
   for (int i = 0; i < g_scene.nblobs; i++) {
     for (int j = i + 1; j < g_scene.nblobs; j++) {
@@ -1728,21 +1187,15 @@ static void resolve_all_pairwise_contacts(void) {
   }
 }
 
-/* apply_arena_velocity_response — after the inner PBD+collision loop
- * has converged, reflect velocities off the arena walls/floor for
- * every body (skipping pinned nodes internally).  Runs ONCE per
- * substep at the END so reflection sees the final post-projection
- * velocity, not an intermediate. */
+/* apply_arena_velocity_response — bounce every body off the walls and
+ * floor.  Runs once at the end of each sub-step, after the links and
+ * collisions have settled, so the bounce reacts to the body's real final
+ * motion. */
 static void apply_arena_velocity_response(float ww, float wh) {
   for (int i = 0; i < g_scene.nblobs; i++)
     apply_boundary_velocity_response(&g_scene.blobs[i], ww, wh);
 }
 
-/*
- * scene_step — orchestrator.  Reads as the pseudocode pinned at the
- * top of this block.  3 substeps × 10 PBD-iters = 30 distance-and-
- * collision relaxation passes per render frame at defaults.
- */
 static void scene_step(void) {
   float ww = (float)g_cols - 1.f;
   float wh = (float)(g_rows - 2) * 2.f;
@@ -1760,18 +1213,14 @@ static void scene_step(void) {
   g_scene.tick++;
 }
 
-/* ===================================================================== */
-/* §8  draw — body + HUD                                                  */
-/*                                                                       */
-/* Pure ncurses output (Padala [7]) — init_pair already wired in §3,    */
-/* this section just calls attron/mvaddch/clrtoeol against stdscr.       */
-/* ===================================================================== */
+/* ── §8 draw — paint the bodies and the status bars ── */
 
 static int g_mincol[ROWS_MAX], g_maxcol[ROWS_MAX];
 
-/* Bresenham-style edge walk that updates the scan-fill bounds [g_mincol[r],
- * g_maxcol[r]] for each row the edge crosses.  Used to scan-fill the
- * polygon interior after walking all boundary edges. */
+/* scanfill_edge — walk one outline edge and, for each screen row it
+ * crosses, remember the leftmost and rightmost column it touches.  Do this
+ * for every edge and you know how wide the body is on each row, which is
+ * what the inside-fill needs. */
 static void scanfill_edge(int x0, int y0, int x1, int y1, int fr, int cols) {
   int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
   int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
@@ -1801,7 +1250,8 @@ static void scanfill_edge(int x0, int y0, int x1, int y1, int fr, int cols) {
   }
 }
 
-/* Standard Bresenham line draw — used for the constraint wireframe. */
+/* bresenham — draw a straight line of characters between two cells.  Used
+ * to draw each link of the mesh. */
 static void bresenham(int x0, int y0, int x1, int y1, int fr, int cols,
                       chtype ch) {
   int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
@@ -1828,27 +1278,13 @@ static void bresenham(int x0, int y0, int x1, int y1, int fr, int cols,
   }
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * draw_blob pipeline — 3-layer body render.
- *
- *     layer 1: paint_scanfill_interior      (fill_cp, ':' inside polygon)
- *     layer 2: stroke_constraint_wireframe  (surf_cp, '|/-\' on each con)
- *     layer 3: dot_boundary_nodes           ('*' pinned / 'O' free, bold)
- *
- * Order matters because ncurses overwrites cells:
- *   - Interior first (bottom layer, lightest)
- *   - Wireframe second (mid layer, brighter)
- *   - Boundary nodes last (top layer, bold accents on top)
- *
- * Broken constraints (k = 0) are skipped at layer 2 — fracture lines
- * become visible as gaps in the wire mesh.
- * ─────────────────────────────────────────────────────────────────────── */
+/* A body is drawn in three passes, bottom to top, because each pass paints
+ * over the one before: first the ':' speckle inside, then the link mesh,
+ * then the bold 'O' and '*' point marks on top.  Broken links are left out
+ * of the mesh, so a torn spot shows up as a hole. */
 
-/* compute_polygon_row_extents — walk every boundary edge with a
- * scan-conversion Bresenham, tracking the leftmost and rightmost
- * column visited on each screen row.  Populates the file-scope
- * g_mincol[r] / g_maxcol[r] arrays so the interior fill knows the
- * horizontal extent of the polygon at every row. */
+/* compute_polygon_row_extents — figure out how wide the body is on every
+ * row by walking its whole outline, so the fill pass knows where to paint. */
 static void compute_polygon_row_extents(const Blob *bl, int floor_row,
                                         int cols) {
   for (int r = 0; r < floor_row; r++) {
@@ -1864,10 +1300,9 @@ static void compute_polygon_row_extents(const Blob *bl, int floor_row,
   }
 }
 
-/* paint_scanfill_interior — for every row that the polygon covers,
- * fill cells strictly INSIDE the boundary (mincol+1 .. maxcol-1) with
- * ':' in the fill colour.  The boundary cells themselves are left
- * blank so the wireframe in layer 2 paints them. */
+/* paint_scanfill_interior — fill the inside of the body with ':',
+ * stopping just short of the edges so the mesh pass can draw the outline
+ * on top. */
 static void paint_scanfill_interior(const Blob *bl, int floor_row, int cols) {
   compute_polygon_row_extents(bl, floor_row, cols);
 
@@ -1881,15 +1316,9 @@ static void paint_scanfill_interior(const Blob *bl, int floor_row, int cols) {
   attroff(COLOR_PAIR(bl->fill_cp));
 }
 
-/* slope_glyph_for_edge — pick the ASCII slash character that best
- * matches a line's direction:
- *
- *     vertical          → '|'
- *     horizontal        → '-'
- *     down-right slope  → '\\'  (Δx and Δy same sign)
- *     down-left slope   → '/'   (Δx and Δy opposite sign)
- *
- * The classic "diagonal arrows in ASCII" mapping. */
+/* slope_glyph_for_edge — pick the character that best matches a line's
+ * tilt: '|' for vertical, '-' for horizontal, '/' or '\' for the two
+ * diagonals. */
 static inline chtype slope_glyph_for_edge(int x0, int y0, int x1, int y1) {
   int adx = abs(x1 - x0), ady = abs(y1 - y0);
   if (adx == 0)
@@ -1899,16 +1328,15 @@ static inline chtype slope_glyph_for_edge(int x0, int y0, int x1, int y1) {
   return ((x1 - x0) * (y1 - y0) > 0) ? '\\' : '/';
 }
 
-/* stroke_constraint_wireframe — for every INTACT constraint (k > 0),
- * Bresenham a line between its two endpoints using the slope-derived
- * glyph.  Broken constraints (k = 0) are skipped so torn regions
- * appear as gaps in the wire mesh — the visual signature of fracture. */
+/* stroke_constraint_wireframe — draw a line for every link that's still
+ * intact.  Snapped links are skipped, so a torn region shows up as a gap
+ * in the mesh — the visible sign of damage. */
 static void stroke_constraint_wireframe(const Blob *bl, int floor_row,
                                         int cols) {
   attron(COLOR_PAIR(bl->surf_cp));
   for (int ci = 0; ci < bl->n_cons; ci++) {
     if (bl->cons[ci].k == 0.f)
-      continue; /* broken */
+      continue; /* snapped — leave a gap */
     const Node *a = &bl->nodes[bl->cons[ci].a];
     const Node *b = &bl->nodes[bl->cons[ci].b];
     int x0 = PHY_TO_COL(a->x), y0 = PHY_TO_ROW(a->y);
@@ -1919,9 +1347,8 @@ static void stroke_constraint_wireframe(const Blob *bl, int floor_row,
   attroff(COLOR_PAIR(bl->surf_cp));
 }
 
-/* draw_one_boundary_node — bold 'O' for free nodes, bold '*' in the
- * theme's pin accent for pinned (anchored) nodes.  Distinct glyph
- * makes the foundation immediately visible. */
+/* draw_one_boundary_node — a bold 'O' for a normal point, a bold '*' for a
+ * glued one, so the anchored base stands out at a glance. */
 static inline void draw_one_boundary_node(const Node *nd, int row, int col,
                                           int surf_cp) {
   if (nd->pinned) {
@@ -1935,10 +1362,9 @@ static inline void draw_one_boundary_node(const Node *nd, int row, int col,
   }
 }
 
-/* dot_boundary_nodes — render every boundary node on top of the
- * preceding two layers.  Bound-checked so off-screen nodes (which can
- * happen for projectile balls partially in the HUD or floor row) are
- * silently dropped. */
+/* dot_boundary_nodes — draw the point marks on top of everything else.
+ * Anything that's drifted off-screen (a ball poking into the status bar or
+ * floor) is just skipped. */
 static void dot_boundary_nodes(const Blob *bl, int floor_row, int cols) {
   for (int i = 0; i < bl->n_bnd; i++) {
     const Node *nd = &bl->nodes[bl->bnd[i]];
@@ -1950,21 +1376,14 @@ static void dot_boundary_nodes(const Blob *bl, int floor_row, int cols) {
   }
 }
 
-/*
- * draw_blob — orchestrator.  Three layers in deliberate bottom-to-top
- * order so the boundary nodes land on top of the wireframe which
- * lands on top of the scan-fill.
- */
 static void draw_blob(const Blob *bl, int floor_row, int cols) {
   paint_scanfill_interior(bl, floor_row, cols);
   stroke_constraint_wireframe(bl, floor_row, cols);
   dot_boundary_nodes(bl, floor_row, cols);
 }
 
-/* ─────────────────────────────────────────────────────────────────────── *
- * HUD — top status (row 0, right-aligned, yellow + bold) and bottom
- * action bar (row rows-1, left, cyan + bold).  CLAUDE.md convention.
- * ─────────────────────────────────────────────────────────────────────── */
+/* The two status bars: parameters along the top row, key hints along the
+ * bottom. */
 
 static int count_intact_cons(const Blob *bl) {
   int n = 0;
@@ -1975,8 +1394,8 @@ static int count_intact_cons(const Blob *bl) {
 }
 
 static void draw_hud_top(int fps) {
-  /* Count broken constraints across all bodies to give the user
-   * direct feedback on "how much damage has happened". */
+  /* tally up broken links across every body so the bar can show how much
+   * damage there's been */
   int total = 0, broken = 0;
   for (int i = 0; i < g_scene.nblobs; i++) {
     total += g_scene.blobs[i].n_cons;
@@ -2013,24 +1432,22 @@ static void scene_draw(void) {
   erase();
   int rows = g_rows, cols = g_cols, floor_row = rows - 2;
 
-  /* Floor line. */
+  /* the floor */
   attron(COLOR_PAIR(CP_FLOOR));
   for (int c = 0; c < cols; c++)
     mvaddch(floor_row, c, '=');
   attroff(COLOR_PAIR(CP_FLOOR));
 
-  /* Bodies. */
+  /* the bodies */
   for (int i = 0; i < g_scene.nblobs; i++)
     draw_blob(&g_scene.blobs[i], floor_row, cols);
 
-  /* HUD chrome. */
+  /* the status bars */
   draw_hud_top(g_scene.fps_disp);
   draw_hud_bottom();
 }
 
-/* ===================================================================== */
-/* §9  screen                                                             */
-/* ===================================================================== */
+/* ── §9 screen — set up ncurses and handle resizing ── */
 
 static volatile sig_atomic_t g_resize = 0, g_quit = 0;
 static void on_sigwinch(int s) {
@@ -2067,9 +1484,7 @@ static void screen_resize(void) {
   g_resize = 0;
 }
 
-/* ===================================================================== */
-/* §10  app                                                               */
-/* ===================================================================== */
+/* ── §10 app — the main loop ── */
 
 int main(void) {
   signal(SIGWINCH, on_sigwinch);
@@ -2158,7 +1573,7 @@ int main(void) {
       next_tick = now + TICK_NS(SIM_FPS);
     }
 
-    /* rolling 1-second fps window */
+    /* count frames; once a second, publish the rate to the HUD */
     fps_frames++;
     if (now - fps_window_start >= NS_PER_SEC) {
       g_scene.fps_disp = fps_frames;

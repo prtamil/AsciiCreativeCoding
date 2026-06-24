@@ -1,252 +1,28 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * physics/membrane.c — 2-D Vibrating Membrane Wave Equation Simulator
+ * physics/membrane.c — a vibrating drumhead in the terminal.
  *
- * Solves the damped scalar wave equation on the terminal grid:
+ * Strike the membrane and watch ripples spread out, bounce off the
+ * edges, cross through each other, and slowly fade. The terminal grid
+ * IS the drum: one character cell = one point on the surface. Warm
+ * colours show points pushed up (crests), cool colours show points
+ * pushed down (troughs). The maths is the classic damped wave equation
+ * solved by stepping forward in small time slices.
  *
- *   ∂²u/∂t² = c² ∇²u − γ ∂u/∂t
- *
- * using an explicit 5-point finite-difference Laplacian and a
- * symplectic (velocity-form) time integrator.  The terminal itself
- * IS the simulation grid — one terminal cell = one grid point.
- *
- * Strike the membrane (b / e / f / m) and watch travelling waves
- * expand, hit the edges, reflect with or without phase inversion
- * depending on the boundary condition, interfere, and slowly fade as
- * damping converts the motion to "heat" the model does not represent.
- *
- * ═════════════════════════════════════════════════════════════════════
- *  WHAT YOU ARE SEEING ON SCREEN
- * ═════════════════════════════════════════════════════════════════════
- *
- *  ┌──────────────────────────────────────────────────────────────────┐
- *  │ membrane  60.0 fps  sim:60 Hz  c=25  g=0.003  BC=Dirichlet  …    │ ← row 0
- * STATUS HUD │   . . . . . . . . . . . . . . . . . . . . . . │ (bright yellow +
- * bold) │   . .            ████████                . . .                   │ │
- * . .       ████████████████████         . .                     │ │   . .
- * ██████████████████████████      . .                     │ ← cells colored by
- * displacement u(x,y,t): │   . .    ████████  · · · · · · ░░░░      . . │     ⊕
- * warm  (red/orange/yellow/white) = crest (u > 0) │   . .    ▓▓░░░░  · · · · ·
- * · · · ░▒▒     . .                     │     ⊖  cool  (blue/cyan/violet) =
- * trough (u < 0) │   . .    ░░░░ · · · · · · · · · · ░░     . . │ brightness ∝
- * |u| / max_amplitude │   . .       · · · · · · · · · · · ·      . . │ │   . .
- * ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒            . .                     │ ← faint '·' on dim gray
- * = NODAL LINES │   . .             ▓▓▓▓▓▓▓                . . │ (zero-crossing
- * curves where u changes sign; │   . . . . . . . . . . . . . . . . . . . . . .
- * │      the geometry of the standing-wave mode) │ +--- MEMBRANE WAVE -------+
- * │ │ | max_amp   0.94          |                                      │ ←
- * bottom-left overlay panel: │ | energy    0.012         | │     numerical
- * readouts of the wave's state │ | mode     (1, 1)         | │     and the CFL
- * stability indicator │ | CFL_2D   0.589 STABLE   | │     (green=STABLE,
- * yellow=MARGINAL, red=UNSTABLE) │ | …                       | │ │ q:quit
- * spc:pause  s:step  r:reset  b:center  e:edge  m:mode  …  │ ← row n-1
- * ACTION-KEYS HUD
- *  └──────────────────────────────────────────────────────────────────┘ (bright
- * cyan + bold)
- *
- *   READING THE PATTERNS:
- *     • A pulse travels at c cells/s, so on an 80-wide grid with c=25
- *       it reaches the wall in (W/2)/c ≈ 1.6 s.  Count the reflections
- *       per second to verify c by eye.
- *     • DIRICHLET BC → reflected wave is INVERTED (phase flips at the
- *       wall) — what was a crest comes back as a trough.
- *     • NEUMANN BC   → reflected wave keeps its sign (free edge).
- *     • PERIODIC BC  → no reflection at all; wave exits one side and
- *       re-enters the opposite — the grid acts as a torus.
- *     • CENTER strike → symmetric ring of waves; perfect example of
- *       Huygens-like radial propagation.
- *     • EDGE / DOUBLE strikes → asymmetric superposition; interference
- *       crests where two ring fronts meet.
- *     • MODE press 'm' → directly initialises a standing-wave eigenmode
- *       (nx, ny); the cycle table picks visually distinct shapes —
- *       these are the discrete cousins of the analytical modes Rayleigh
- *       derived [ref 1] and that Chladni first visualised [ref 8] with
- *       sand-on-plate nodal patterns.
- *     • Watch the side panel: `energy` falls monotonically as damping
- *       acts; `max_amp` decays too but oscillates inside its envelope.
- *
- * ═════════════════════════════════════════════════════════════════════
- *  SECTION MAP
- * ═════════════════════════════════════════════════════════════════════
- *  §1  config      — all tunable constants
- *  §2  clock       — monotonic nanosecond clock + sleep
- *  §3  theme       — signed-amplitude color pipeline; ASCII ramp; LUT
- *  §4  grid        — static field arrays (height + velocity)
- *  §5  solver      — init_grid, update_wave, apply_bc, compute_stats
- *  §6  excitation  — apply_excitation, preset functions, mode cycle
- *  §7  render      — render_membrane, render_overlay
- *  §8  scene       — Scene struct, scene_init/tick/draw/reset
- *  §9  screen      — ncurses double-buffer display layer + two-row HUD
- *  §10 app         — signals, resize, input, main loop
- *
- * Keys:
- *   q / ESC      quit                 space     pause / resume
- *   s            single step          r         reset current preset
- *   b            centre strike        e         edge strike
- *   f            double strike        m         next resonance mode
- *   c / C        wave speed ±         d / D     damping ±
- *   n            cycle boundary       l         toggle nodal lines
- *   p / P        cycle preset         t         cycle theme
- *   [ / ]        sim Hz ±
- *
- * ═════════════════════════════════════════════════════════════════════
- *  REFERENCES   (cite inline as [n])
- * ═════════════════════════════════════════════════════════════════════
- *
- *  ── Wave physics & vibrating membranes ─────────────────────────────
- *
- *   [1] Rayleigh, J. W. S. (1877) — *The Theory of Sound*, Vol. I,
- *       Macmillan, London.  Chapters IX-X derive the eigenmodes of
- *       vibrating membranes — the analytical counterpart to the
- *       (nx, ny) standing waves that the 'm' key excites here.
- *       The classical primary reference for everything this demo
- *       computes.
- *
- *   [2] Morse, P. M.; Ingard, K. U. (1968) — *Theoretical Acoustics*,
- *       McGraw-Hill (reprinted Princeton 1986).  Modern treatment of
- *       the wave equation in finite domains with the three boundary
- *       conditions used here (Dirichlet/Neumann/periodic).  Read this
- *       AFTER Rayleigh for a 20th-century perspective with the same
- *       analytical depth.
- *
- *   [3] Strauss, W. A. (2008) — *Partial Differential Equations: An
- *       Introduction*, 2nd ed., Wiley.  Ch.2-4 cover the 1-D and 2-D
- *       wave equation accessibly, including separation of variables,
- *       reflection at boundaries, and the d'Alembert formula.  The
- *       gentle starting point if Rayleigh is too dense.
- *
- *  ── Numerical methods: finite differences & stability ──────────────
- *
- *   [4] Courant, R.; Friedrichs, K.; Lewy, H. (1928) —
- *       "Über die partiellen Differenzengleichungen der mathematischen
- *       Physik", *Mathematische Annalen* 100, 32-74.  THE original
- *       paper deriving the stability condition c·dt/dx ≤ 1 (now
- *       universally called the CFL condition) for explicit
- *       finite-difference wave solvers.  The "CFL_2D" gauge in our
- *       overlay is exactly the quantity these three authors showed
- *       must stay ≤ 1.  Historical primary.
- *
- *   [5] LeVeque, R. J. (2007) — *Finite Difference Methods for Ordinary
- *       and Partial Differential Equations: Steady-State and
- *       Time-Dependent Problems*, SIAM.  The standard modern reference
- *       for the 5-point Laplacian stencil (§5 update_wave), its O(dx²)
- *       truncation error, and the von Neumann stability analysis that
- *       gives the √2 factor in the 2-D CFL bound.
- *
- *   [6] Strikwerda, J. C. (2004) — *Finite Difference Schemes and
- *       Partial Differential Equations*, 2nd ed., SIAM.  Chapter 9
- *       specifically analyses explicit wave-equation schemes and their
- *       dispersion relations — useful for understanding why a discrete
- *       wave on a finite grid moves slightly slower than the
- *       continuous c, especially at short wavelengths.
- *
- *   [7] Hairer, E.; Lubich, C.; Wanner, G. (2006) — *Geometric
- *       Numerical Integration*, 2nd ed., Springer.  Chapters I-VI
- *       cover SYMPLECTIC INTEGRATORS — why the "velocity-first" Euler
- *       in §5 conserves a shadow Hamiltonian over thousands of steps
- *       while plain explicit Euler injects spurious energy.
- *
- *  ── Visualisation & nodal-line history ─────────────────────────────
- *
- *   [8] Chladni, E. F. F. (1787) — *Entdeckungen über die Theorie des
- *       Klanges*, Weidmanns, Leipzig.  Chladni sprinkled sand on
- *       vibrating plates and observed it migrating to the NODAL LINES
- *       — the curves where displacement stays zero.  The same lines
- *       the 'l' key toggles here in the renderer.  Historical primary
- *       for nodal-pattern visualisation.
- *
- *   [9] Ware, C. (2020) — *Information Visualization: Perception for
- *       Design*, 4th ed., Morgan Kaufmann.  Ch.4 on DIVERGING colour
- *       maps backs the warm/cool split for ±u (perceptually symmetric
- *       around zero so the eye reads sign before magnitude); Ch.5 on
- *       pre-attentive luminance contrast backs the brightness-from-|u|
- *       ramp used inside each sign.
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/membrane.c \
- *       -o membrane -lncurses -lm
+ * References worth keeping (the code can't hand you these):
+ *   [1] Rayleigh, *The Theory of Sound*, Vol. I (1877) — the standing-wave
+ *       shapes the 'm' key plays.
+ *   [4] Courant, Friedrichs, Lewy (1928) — the stability limit shown as
+ *       "CFL_2D" in the overlay; the sim blows up if it exceeds 1.
+ *   [5] LeVeque, *Finite Difference Methods* (2007) — the 5-point stencil
+ *       and where the √2 in the 2-D limit comes from.
+ *   [7] Hairer/Lubich/Wanner, *Geometric Numerical Integration* (2006) —
+ *       why updating velocity before position keeps energy from drifting.
+ *   [8] Chladni, *Entdeckungen über die Theorie des Klanges* (1787) — sand
+ *       on a plate revealing the still "nodal lines" the 'l' key draws.
+ *   [9] Ware, *Information Visualization* (2020) — the warm/cool split so
+ *       the eye reads "up vs down" before it reads "how much".
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Wave equation (§5 update_wave) — Rayleigh [ref 1], Morse & Ingard [ref 2]:
- *   ∂²u/∂t² = c² ∇²u − γ ∂u/∂t
- *   u(x,y,t) — vertical displacement of the membrane at point (x,y)
- *   c         — wave speed [cells / second]; higher → faster propagation
- *   ∇²u       — 2-D Laplacian; measures how curved u is at each point
- *   γ         — damping coefficient [1/s]; bleeds energy out of the system
- *   Strauss [ref 3] gives the gentle textbook derivation.
- *
- * Finite difference stencil (§5) — LeVeque [ref 5]:
- *   The 5-point Laplacian approximates ∇²u at interior grid point (r,c):
- *
- *              u[r-1][c]
- *                  |
- *   u[r][c-1] — u[r][c] — u[r][c+1]
- *                  |
- *              u[r+1][c]
- *
- *   ∇²u[r,c] ≈ u[r-1,c] + u[r+1,c] + u[r,c-1] + u[r,c+1] − 4·u[r,c]
- *
- *   With grid spacing dx = dy = 1 cell, the /dx² factor is 1 and drops out.
- *   Truncation error is O(dx²) — second-order accurate in space.
- *   Strikwerda [ref 6] analyses the resulting numerical dispersion (waves
- *   shorter than ~8 cells travel slower than the continuous c).
- *
- * Velocity-field time integrator (§5) — Hairer/Lubich/Wanner [ref 7]:
- *   We maintain an explicit velocity field v = ∂u/∂t alongside u.
- *   At each timestep dt:
- *
- *     v[r,c] += ( c² · ∇²u[r,c]  −  γ · v[r,c] ) · dt   ← force on membrane
- *     u[r,c] += v[r,c] · dt                              ← displacement update
- *
- *   Updating v BEFORE u (symplectic Euler) conserves a SHADOW HAMILTONIAN
- *   over thousands of steps; plain explicit Euler would inject phantom
- *   energy and the wave would grow without bound.
- *
- * Wave speed meaning:
- *   c is the speed at which small disturbances travel across the grid.
- *   Physically: c = √(T/ρ) where T = membrane tension, ρ = area density.
- *   A pulse initiated at the centre reaches the wall in (W/2)/c seconds.
- *   Example: c=25, W=80 → first reflection arrives after 80/(2·25) = 1.6 s.
- *
- * CFL stability condition (§5, §7) — Courant, Friedrichs, Lewy [ref 4]:
- *   The explicit scheme is conditionally stable.  For 2-D with dx=dy=1:
- *     CFL_2D = c · dt · √2  must satisfy  CFL_2D ≤ 1
- *   If CFL_2D > 1, errors grow exponentially — the simulation "blows up".
- *   The √2 factor comes from von Neumann stability analysis of the 2-D
- *   5-point stencil [ref 5].  The overlay displays CFL_2D and flags it
- *   STABLE / MARGINAL / UNSTABLE — the exact quantity the 1928 CFL paper
- *   bounded.  Default: c=25, dt=1/60 → CFL_2D = 25·(1/60)·√2 ≈ 0.589  ✓
- *
- * Boundary conditions (§5 apply_bc) — Morse & Ingard [ref 2] Ch.5:
- *   DIRICHLET — u=0 at all 4 edges.  Models a clamped drumhead rim.
- *               Wave reflects with INVERSION (phase reversal).
- *               Supports the cleanest standing-wave eigenmodes [ref 1].
- *   NEUMANN   — ∂u/∂n=0 (zero normal gradient) at edges.
- *               Models a free membrane edge.
- *               Wave reflects WITHOUT inversion (no phase reversal).
- *               Implemented by copying adjacent interior values to the border.
- *   PERIODIC  — top wraps to bottom, left wraps to right.
- *               No reflections at all — the grid acts as a torus.
- *
- * Nodal lines (§7) — Chladni [ref 8], Rayleigh [ref 1]:
- *   In a standing wave, NODAL LINES are the curves where u = 0 at all
- *   times.  They separate regions oscillating in opposite phase (+ vs −)
- *   and form the geometric "fingerprint" of each eigenmode.  Historically,
- *   Chladni revealed them experimentally by sprinkling sand on vibrating
- *   plates — the sand migrated to the still nodes.  We detect them by
- *   checking sign changes between adjacent cells and mark them with a
- *   dim glyph so the mode shape is visible even when positive and
- *   negative regions have similar brightness.
- *
- * Signed colour pipeline (§3, §7) — Ware [ref 9]:
- *   The renderer uses a DIVERGING colour map: warm hues for u > 0, cool
- *   hues for u < 0, perceptually symmetric around zero so the eye reads
- *   sign before magnitude.  Within each sign, a 9-tier brightness ramp
- *   encodes |u|/max_amplitude (pre-attentive luminance contrast).
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -263,11 +39,9 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
-/* ── loop / display ─────────────────────────────────────────────────── */
+/* ── loop / display ── */
 enum {
   SIM_FPS_MIN = 5,
   SIM_FPS_DEFAULT = 60,
@@ -279,102 +53,85 @@ enum {
   HUD_COLS = 80,
 };
 
-/* ── grid limits ────────────────────────────────────────────────────── */
+/* ── grid limits ── */
 /*
- * Physics runs directly in terminal-cell coordinates.  Unlike particle
- * simulations (which use a separate pixel space), the membrane grid IS
- * the character grid: g_grid.u[row][col] is drawn at terminal cell (col, row).
- *
- * GRID_MAX_W × GRID_MAX_H × 2 fields × 4 bytes = 300×100×8 = 240 KB (BSS).
+ * The drum surface IS the character grid: the value at g_grid.u[row][col]
+ * is drawn directly at terminal cell (col, row). No separate pixel space
+ * like the moving-particle demos use. The two fields at max size take
+ * about 240 KB, which lives quietly in zeroed static memory.
  */
 #define GRID_MAX_W 300
 #define GRID_MAX_H 100
 
-/* ── wave physics defaults ──────────────────────────────────────────── */
+/* ── wave physics defaults ── */
 /*
- * WAVE_SPEED is in cells/second.  The CFL stability limit at 60 Hz is:
- *   c_max = 1 / (dt · √2) = 60 / √2 ≈ 42 cells/s.
- * Default 25 gives CFL_2D ≈ 0.59 — comfortable margin.
+ * Wave speed is in cells per second. Push it too high for the chosen
+ * frame rate and the sim goes unstable; at 60 Hz the ceiling is about
+ * 42. The default of 25 sits comfortably below that.
  */
 #define WAVE_SPEED_DEFAULT 25.0f
 #define WAVE_SPEED_MIN 5.0f
-#define WAVE_SPEED_MAX 42.0f /* hard limit: CFL_2D → 1 at 60 Hz */
+#define WAVE_SPEED_MAX 42.0f /* above this the sim goes unstable at 60 Hz */
 #define WAVE_SPEED_STEP 3.0f
 
-#define DAMPING_DEFAULT 0.003f /* gentle decay; τ ≈ 1/γ ≈ 333 ticks */
+#define DAMPING_DEFAULT 0.003f /* gentle fade — a strike rings for ~5 s */
 #define DAMPING_MIN 0.000f
 #define DAMPING_MAX 0.060f
 #define DAMPING_STEP 0.003f
 
-/* ── excitation ─────────────────────────────────────────────────────── */
-#define EXCITE_AMP 1.2f    /* peak amplitude of a strike         */
-#define EXCITE_RADIUS 3.5f /* Gaussian half-width in cells       */
-#define RESONANCE_AMP 1.0f /* amplitude for mode-shape presets   */
+/* ── excitation (how a strike is shaped) ── */
+#define EXCITE_AMP 1.2f    /* how hard a strike pushes the surface */
+#define EXCITE_RADIUS 3.5f /* how wide the dimple is, in cells     */
+#define RESONANCE_AMP 1.0f /* strength of a played standing-wave shape */
 
-/* ── rendering ──────────────────────────────────────────────────────── */
-#define NODAL_SIGN_THRESH 0.015f /* |u| below this treated as near-zero */
-#define DISPLAY_RANGE 1.5f       /* u values outside ±DISPLAY_RANGE clipped */
+/* ── rendering ── */
+#define NODAL_SIGN_THRESH 0.015f /* below this |u| counts as "basically zero" */
+#define DISPLAY_RANGE 1.5f       /* clip displayed values to this range */
 #define DISPLAY_MAX_FLOOR                                                      \
-  0.05f /* min normaliser — keeps inv_max finite                             \
-         * when the field is nearly silent      */
+  0.05f /* smallest brightness scale we'll use, so a near-silent      \
+         * surface doesn't divide by something tiny                   */
 
-/* ── math constants used by the solver / stats ──────────────────────── *
- * Named so the formulas read like the textbook expressions they
- * implement, not like "what does this 0.7071 mean again".                */
-#define HALF 0.5f /* ½ in KE = ½·m·v², PE = ½·c²|∇u|²    */
+/* ── named numbers the formulas below lean on ── */
+#define HALF 0.5f /* the ½ in energy = ½·v² and ½·c²·(slope)² */
 #define CDIFF_FACTOR                                                           \
-  0.5f /* centred-difference: (f[i+1] - f[i-1])                                \
-        * / (2·dx)  — with dx=1, divide by 2,                               \
-        * i.e. multiply by 0.5 [LeVeque ref 5] */
-#define SQRT2 1.41421356f
-/* √2 — appears in CFL_2D = c·dt·√2
- * for the 2-D 5-point stencil [ref 4] */
+  0.5f /* slope = (value ahead − value behind) / 2, since cells   \
+        * are one apart [LeVeque ref 5]                           */
+#define SQRT2 1.41421356f /* shows up in the stability limit c·dt·√2 [ref 4] */
 #define INV_SQRT2 0.70710678f
-/* 1/√2 — splits a unit amplitude into
- * (cos·A, sin·A) at the 45° phase
- * point of a harmonic oscillator      */
+/* 1/√2 — starts a played mode halfway through its swing (both
+ * position and speed already non-zero) so it animates on frame one */
 
-/* ── strike-position constants ──────────────────────────────────────── *
- * Each preset places its Gaussian pulse at a fraction of the grid
- * spanning (cols-1) × (rows-1).  Names describe WHERE on the membrane.  */
+/* ── where each strike preset lands ── *
+ * Positions are fractions of the surface: 0.5 is dead centre, 0.0 the
+ * top/left edge, 1.0 the bottom/right.                                   */
 #define STRIKE_X_CENTRE 0.50f
 #define STRIKE_Y_CENTRE 0.50f
 #define STRIKE_X_LEFT_EDGE                                                     \
-  0.15f                         /* 15% in from the left wall —               \
-                                 * asymmetric enough to excite many            \
-                                 * harmonics, not so close that the            \
-                                 * Gaussian tail touches the boundary  */
-#define STRIKE_X_DOUBLE_L 0.30f /* DOUBLE preset, left strike  */
+  0.15f /* in from the left, off-centre enough to wake up many       \
+         * overtones but not so close it touches the wall            */
+#define STRIKE_X_DOUBLE_L 0.30f /* left hit of the double strike  */
 #define STRIKE_Y_DOUBLE_L 0.35f
-#define STRIKE_X_DOUBLE_R                                                      \
-  0.70f /* DOUBLE preset, right strike —                                     \
-         * 0.30 and 0.70 are symmetric about                                   \
-         * the centre, but the y-offsets        */
+#define STRIKE_X_DOUBLE_R 0.70f /* right hit — mirrored left/right but the  */
 #define STRIKE_Y_DOUBLE_R                                                      \
-  0.65f /* (0.35, 0.65) make the line through                                  \
-         * the two strikes NOT pass through                                    \
-         * the centre — that produces a                                      \
-         * richer non-symmetric interference                                   \
-         * pattern.                              */
+  0.65f /* vertical offsets tilt the pair off-centre, giving a       \
+         * livelier, lopsided interference pattern                   */
 
-/* Canonical reference wave speed used inside preset_resonance() to set
- * an initial KINETIC amplitude for the velocity kick.  The actual
- * simulation `wave_speed` may differ — that's fine, the kick just
- * provides a tasteful starting velocity; the real c drives the
- * subsequent integration.                                                */
+/* Speed used to set the starting "kick" for a played standing wave. The
+ * real wave_speed may differ — this just picks a tasteful initial swing;
+ * the actual speed takes over from there.                               */
 #define RESONANCE_KICK_REF_C WAVE_SPEED_DEFAULT
 
-/* ── boundary conditions ────────────────────────────────────────────── */
+/* ── boundary conditions: what the edges do to a wave ── */
 enum {
-  BC_DIRICHLET = 0, /* clamped rim: u=0 at edges                    */
-  BC_NEUMANN = 1,   /* free edge:   du/dn=0 at edges                */
-  BC_PERIODIC = 2,  /* torus:       top↔bottom, left↔right          */
+  BC_DIRICHLET = 0, /* pinned rim — wave bounces back flipped upside down */
+  BC_NEUMANN = 1,   /* free rim   — wave bounces back the same way up     */
+  BC_PERIODIC = 2,  /* wrap-around — leaves one side, enters the other    */
   BC_COUNT = 3,
 };
 static const char *const k_bc_names[BC_COUNT] = {"dirichlet", "neumann",
                                                  "periodic"};
 
-/* ── presets ────────────────────────────────────────────────────────── */
+/* ── presets (the canned strikes the keys trigger) ── */
 enum {
   PRESET_CENTER = 0,
   PRESET_EDGE = 1,
@@ -385,25 +142,22 @@ enum {
 static const char *const k_preset_names[PRESET_COUNT] = {"center", "edge",
                                                          "double", "resonance"};
 
-/* ── resonance-mode cycle table ─────────────────────────────────────── *
- * Successive presses of 'm' cycle through these (nx, ny) standing-wave
- * modes.  The (1,1) fundamental is included LAST because it oscillates
- * slowest and has the least spatial structure — starting the cycle
- * with (2,2) gives a more visually obvious mode on the first press.  */
+/* ── the standing-wave shapes 'm' cycles through ── *
+ * Each (nx, ny) names how many half-waves span the width and height. The
+ * plain (1,1) fundamental is last because it's the dullest to look at —
+ * starting on (2,2) gives an obvious shape on the very first press.    */
 static const int k_mode_table[][2] = {
     {2, 2}, {3, 2}, {2, 3}, {3, 3}, {4, 3},
     {3, 4}, {4, 4}, {1, 2}, {2, 1}, {1, 1},
 };
 #define MODE_TABLE_LEN ((int)(sizeof k_mode_table / sizeof k_mode_table[0]))
 
-/* ── timing ─────────────────────────────────────────────────────────── */
+/* ── timing ── */
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -421,34 +175,31 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&r, NULL);
 }
 
-/* ===================================================================== */
-/* §3  theme — signed-amplitude color pipeline; ASCII ramp; LUT          */
-/* ===================================================================== */
+/* ── §3 theme — colours and characters for the wave height ── */
 
 /*
- * ASCII ramp — characters ordered by visual ink density (sparse → dense).
- * Used identically for positive and negative amplitude; color encodes sign.
+ * The character ramp: from blank at rest to solid at full push, the glyph
+ * gets denser the harder the surface moves.  The same characters serve
+ * both up and down — colour is what tells crest from trough.
  *
- *   ' '   0%   at rest / nodal
- *   '.'   3%   barely displaced
- *   ':'  10%   slight ripple
- *   '+'  22%   medium wave
- *   'x'  38%   strong wave
- *   '*'  55%   intense oscillation
- *   'X'  72%   near-peak
- *   '#'  87%   peak displacement
- *   '@'  96%   maximum (clipped)
+ *   ' '  at rest          '*'  strong
+ *   '.'  barely moving     'X'  near-peak
+ *   ':'  slight ripple     '#'  peak
+ *   '+'  medium             '@'  maxed out
+ *   'x'  strong
  */
 static const char k_ramp[] = " .:+x*X#@";
 #define RAMP_N (int)(sizeof k_ramp - 1) /* 9 levels */
 
-/* LUT breakpoints on normalised |amplitude| ∈ [0, 1] after gamma correction */
+/* How far up the brightness scale [0..1] each character takes over. */
 static const float k_breaks[RAMP_N] = {
     0.000f, 0.030f, 0.090f, 0.200f, 0.340f, 0.500f, 0.660f, 0.820f, 0.940f,
 };
 
+/* Pick which ramp character a 0..1 brightness maps to.  The little power
+ * curve spreads the steps so they look evenly spaced to the eye rather
+ * than evenly spaced in the raw numbers. */
 static int lut_index(float v) {
-  /* v is already in [0,1]; gamma correct for perceptual uniformity */
   if (v <= 0.0f)
     return 0;
   if (v >= 1.0f)
@@ -461,28 +212,18 @@ static int lut_index(float v) {
 }
 
 /*
- * Themes — 3 palettes for signed amplitude.
+ * Three colour schemes, each with a warm set for crests (up) and a cool
+ * set for troughs (down):
+ *   "wave"    — blue down,   red/yellow up
+ *   "thermal" — violet down, yellow/white up
+ *   "ocean"   — deep-blue down, cyan/white up
  *
- * Each palette has RAMP_N fg colors for POSITIVE amplitude (crest)
- * and RAMP_N fg colors for NEGATIVE amplitude (trough).
- *
- *   theme 0  "wave"    — blue troughs  ↔  red/orange crests (classical)
- *   theme 1  "thermal" — violet troughs ↔ yellow/white crests
- *   theme 2  "ocean"   — deep-blue troughs ↔ cyan/white crests
- *
- * Color pair layout (all themes defined at startup, switched by index):
- *   theme t, positive level i : CP_POS(t,i) = 1 + t*(RAMP_N*2) + i
- *   theme t, negative level i : CP_NEG(t,i) = 1 + t*(RAMP_N*2) + RAMP_N + i
- *   nodal line marker         : CP_NODAL = 1 + N_THEMES*(RAMP_N*2)
- *   HUD STATUS  (row 0)       : CP_HUD   = CP_NODAL + 1   (bright yellow)
- *   HUD HINT    (row n-1)     : CP_HINT  = CP_NODAL + 2   (bright cyan)
- *
- * CP_HUD / CP_HINT are CANONICAL per CLAUDE.md HUD Standard — fixed
- * bright yellow / bright cyan, A_BOLD at the call site, NEVER A_DIM
- * so they stay legible against any wave palette.
- *
- * With 3 themes × 9 levels × 2 signs = 54 pairs + 3 = 57 pairs total.
- */
+ * ncurses can't colour a character directly; it makes you register each
+ * foreground/background combination in a numbered slot first.  The macros
+ * below work out the slot number for a given theme, up/down sign, and
+ * brightness, so we register every combination once at startup and just
+ * switch by theme afterward.  The HUD and nodal-line colours sit past the
+ * themed slots and never change. */
 #define N_THEMES 3
 #define CP_POS(t, i) (1 + (t) * (RAMP_N * 2) + (i))
 #define CP_NEG(t, i) (1 + (t) * (RAMP_N * 2) + RAMP_N + (i))
@@ -491,62 +232,36 @@ static int lut_index(float v) {
 #define CP_HINT (CP_NODAL + 2)
 
 /*
- * WaveTheme — one named DIVERGING colour map (Ware [ref 9], Ch.4).
+ * WaveTheme — one colour scheme: a warm set of shades for crests (up) and
+ * a cool set for troughs (down), getting brighter as the surface moves
+ * harder.  Splitting warm vs cool this way lets the eye read up-or-down
+ * from the colour and how-much from the brightness, without checking a
+ * legend. (Ware [ref 9].)
  *
- * The wave equation produces a signed scalar field u(x,y,t) — crests
- * (u > 0) and troughs (u < 0) are physically opposite quantities that
- * must read as visually opposite.  Diverging maps split into two
- * perceptually monotone luminance ramps that meet at a NEUTRAL midpoint
- * (background black, here): a WARM ramp for crests, a COOL ramp for
- * troughs.  The eye reads SIGN from hue and MAGNITUDE from luminance —
- * pre-attentive contrast (Ware [ref 9], Ch.5).
+ * Why one struct holds all four arrays: the up set and down set must stay
+ * in step — same number of brightness steps, same dark-to-bright march —
+ * so a half-up crest looks as strong as a half-down trough.  Bundling them
+ * makes it hard to edit one out of sync with the other.
  *
- * WHY a struct (not loose const arrays):
- *   The crest ramp and trough ramp must be CORRELATED — same number of
- *   tiers (RAMP_N=9), same brightness progression from dark to bright,
- *   so |u|=0.3·max in red corresponds to the same eye-perceived
- *   intensity as |u|=0.3·max in blue.  Bundling the four arrays in one
- *   struct forbids editing one ramp out of sync with its partner.
+ * Two copies of each set: a rich 256-colour version for modern terminals,
+ * and a coarse 8-colour fallback for plain ones.  color_init() checks what
+ * the terminal supports and uses whichever fits.  The one thing both
+ * guarantee is that up and down never look alike.
  *
- * WHY dual palettes (256 + 8):
- *   Modern terminals expose 256 indexed colours so each tier can have
- *   its own luminance step; legacy / minimal TTYs ($TERM = "linux",
- *   "dumb") expose only 8, where the LO/HI tiers necessarily collapse
- *   onto fewer distinct colours.  color_init() inspects ncurses COLORS
- *   at runtime and binds the matching set.  Sign discrimination is
- *   preserved in both cases — that's the one property that MUST
- *   survive even on 8-colour terminals.
- *
- * WHY ramps go DARK → BRIGHT (not dark → bright → dark):
- *   "Sequential within each sign" is what makes |u| readable.  Using a
- *   non-monotone ramp (rainbow / jet) would scramble magnitude
- *   ordering and force a viewer to memorise the legend.  Both ramps
- *   end at COLOR 231 (near-white) so the brightest crest and brightest
- *   trough are equally salient — visual "fairness" between signs.
- *
- * WHY this struct does NOT include CP_HUD / CP_HINT / CP_NODAL:
- *   Those are CANONICAL pairs (CLAUDE.md HUD Standard for CP_HUD/HINT
- *   in bright yellow/cyan; CP_NODAL is dim grey across every theme so
- *   the geometry of standing-wave modes reads the same regardless of
- *   theme).  Keeping them outside means theme cycling doesn't disturb
- *   the HUD or the nodal-line overlay.
+ * The HUD and nodal-line colours live OUTSIDE this struct so that cycling
+ * themes never disturbs them.
  */
 typedef struct {
-  const char *name; /* shown in HUD theme field; theme cycle label   */
+  const char *name; /* label shown in the HUD when cycling themes */
 
-  /* 256-colour palette (used when COLORS >= 256) ─────────────────── *
-   * Index i runs 0..RAMP_N-1 from FAINTEST to BRIGHTEST tier.  Ramp
-   * i = lut_index(|u|/max) selects which entry to use; A_BOLD is
-   * added by wave_attr() for the top two tiers to amplify the
-   * brightest cells against any background. */
-  int pos256[RAMP_N]; /* CREST  ramp — u > 0, "warm" diverging side    */
-  int neg256[RAMP_N]; /* TROUGH ramp — u < 0, "cool" diverging side    */
+  /* the rich palette, used on 256-colour terminals.  Index 0 is the
+   * faintest shade, RAMP_N-1 the brightest; the brightest couple also
+   * get A_BOLD (added in wave_attr) so peaks pop against any background. */
+  int pos256[RAMP_N]; /* crest shades — the warm (up) set   */
+  int neg256[RAMP_N]; /* trough shades — the cool (down) set */
 
-  /* 8-colour ANSI fallback ────────────────────────────────────── *
-   * Coarser bins; typically several adjacent tiers share a colour
-   * with only the highest one or two ramping toward WHITE.  Sign
-   * discrimination is preserved — magnitude discrimination relies
-   * more on cell density than colour at this resolution. */
+  /* the plain 8-colour fallback.  Coarser — several brightness steps may
+   * share one colour — but up still never looks like down. */
   int pos8[RAMP_N];
   int neg8[RAMP_N];
 } WaveTheme;
@@ -604,25 +319,26 @@ static void color_init(void) {
       }
     }
   }
-  /* Nodal line: dim gray (or dim yellow fallback) */
+  /* nodal-line dots: neutral grey, same in every theme */
   if (COLORS >= 256)
-    init_pair(CP_NODAL, 240, COLOR_BLACK); /* dark gray */
+    init_pair(CP_NODAL, 240, COLOR_BLACK);
   else
     init_pair(CP_NODAL, COLOR_WHITE, COLOR_BLACK);
-  /* HUD STATUS row 0 — canonical bright yellow + A_BOLD at call site */
+  /* HUD status line — bright yellow (project standard) */
   if (COLORS >= 256)
     init_pair(CP_HUD, 226, -1);
   else
     init_pair(CP_HUD, COLOR_YELLOW, -1);
 
-  /* HUD HINT row n-1 — canonical bright cyan + A_BOLD at call site */
+  /* HUD key-hints line — bright cyan (project standard) */
   if (COLORS >= 256)
     init_pair(CP_HINT, 51, -1);
   else
     init_pair(CP_HINT, COLOR_CYAN, -1);
 }
 
-/* Return ncurses attribute for (theme, sign, ramp_level). */
+/* Pick the colour for a cell from its theme, up/down sign, and brightness
+ * step.  The brightest steps also get bold so peaks really stand out. */
 static attr_t wave_attr(int theme, bool positive, int level) {
   attr_t a = positive ? COLOR_PAIR(CP_POS(theme, level))
                       : COLOR_PAIR(CP_NEG(theme, level));
@@ -631,121 +347,64 @@ static attr_t wave_attr(int theme, bool positive, int level) {
   return a;
 }
 
-/* ===================================================================== */
-/* §4  grid — Grid struct (fields + live dimensions)                      */
-/* ===================================================================== */
+/* ── §4 grid — the membrane's state: two fields plus its live size ── */
 
 /*
- * Grid — the membrane's PHYSICAL STATE: two scalar fields plus the
- *        live dimensions that bound them.
+ * Grid — everything that describes the drum surface right now: how high
+ *        each point is, how fast it's moving, and how big the grid is.
  *
- * ALGORITHM context — Rayleigh [ref 1], Morse & Ingard [ref 2]:
- *   The continuous wave equation ∂²u/∂t² = c²∇²u − γ∂u/∂t is
- *   second-order in time.  We turn it into a FIRST-ORDER pair by
- *   introducing the velocity field v = ∂u/∂t:
+ * The wave equation is naturally about acceleration (how the height's
+ * rate-of-change itself changes), which is awkward to step forward
+ * directly.  So we track TWO things per point instead: its height (u)
+ * and its up/down speed (v).  Each tick we nudge the speed using the
+ * heights around it, then move the height by that speed.  Two simple
+ * steps replace one second-order one.  (Rayleigh [ref 1], and the
+ * energy-friendly ordering is from Hairer/Lubich/Wanner [ref 7].)
  *
- *       ∂v/∂t = c²∇²u − γv         (force on the membrane)
- *       ∂u/∂t = v                  (kinematic definition)
+ * Why bundle u, v, cols, rows into one struct: they're always used
+ * together, so packing them means a function can never accidentally
+ * pair the fields with a stale width or height — resizing is one
+ * atomic update, and every helper just takes a Grid* and reads its
+ * own dimensions.
  *
- *   The solver discretises BOTH equations on the same grid.  That's
- *   why TWO fields are needed — without v we'd need a "previous
- *   timestep" buffer to estimate ∂²u/∂t² by finite differences (the
- *   "leapfrog" alternative).  The velocity-field form is cleaner and
- *   plays nicely with symplectic Euler [ref 7] for energy conservation.
+ * The fields are plain fixed-size arrays, not pointers-to-pointers.
+ * That keeps them in zeroed static memory: the program starts with a
+ * membrane already at rest (all zeros) with no setup code, and nothing
+ * on the hot path ever calls malloc.  At max size the two arrays are
+ * about 240 KB, which sits quietly in that static memory.
  *
- * WHY one struct (not two separate arrays + scattered dims):
- *   • Cohesion — u, v, cols, rows are ALWAYS used together.  Pulling
- *     them into one type makes the unit of physical state explicit.
- *   • Self-describing — `g->cols` is INSIDE the struct that owns the
- *     fields, so a function operating on a Grid can't accidentally
- *     pair u/v with stale dimensions.
- *   • Atomic resize — re-fitting the grid for a new terminal size is
- *     a single struct update; no risk of "I updated rows but forgot
- *     to invalidate the field contents".
- *   • Cleaner function signatures — every function that touches the
- *     grid now takes `Grid *g` (or `const Grid *g`) and reads dims
- *     via `g->cols / g->rows`, dropping the `(cols, rows)` param pair
- *     that previously rode along with every call.
+ * Layout is row-major (u[row][col]) to match how the renderer and the
+ * edge loops walk the grid — rows outside, columns inside — so each
+ * inner scan stays friendly to the CPU cache.
  *
- * WHY 2-D static arrays inside the struct (not pointer-to-pointer):
- *   • BSS-resident — the OS zero-fills the pages at exec time, so the
- *     initial state is already u = v = 0 (membrane at rest) without
- *     any code running.  No init phase, no malloc on the hot path
- *     (CLAUDE.md Memory rule).
- *   • Static dimensions GRID_MAX_W × GRID_MAX_H × 4 bytes × 2 fields
- *     ≈ 240 KB per Grid — fits comfortably in BSS.
- *   • Indexing g->u[row][col] reads naturally as "row r, column c"
- *     matching the way the renderer steps over the grid.
- *
- * WHY ROW-MAJOR (u[row][col], not u[col][row]):
- *   The renderer and the BC loops iterate column-within-row (the
- *   outer loop is rows, inner is cols).  Row-major layout keeps each
- *   inner-loop scan in a single cache line — the 5-point Laplacian's
- *   u[r±1, c] reads cost one cache line each, but the u[r, c±1] reads
- *   come for free from the cache line the iterator is already
- *   streaming.
- *
- * WHY cols/rows live HERE (not in Scene):
- *   They are the dimensions OF THIS GRID — every solver loop bounds
- *   itself with them, and apply_bc indexes the last row/col via them.
- *   Keeping them next to u/v guarantees the three values can never
- *   diverge.  Scene used to carry duplicate copies; those are gone.
- *
- * Interior / boundary split:
- *   • Interior cells: rows 1..rows-2, cols 1..cols-2 — written by the
- *                     wave solver each tick.
- *   • Boundary cells: row 0, row rows-1, col 0, col cols-1 — written
- *                     by apply_bc() per the active BC policy
- *                     (Dirichlet zero / Neumann mirror / periodic wrap).
- *   The split is enforced by the loop bounds in update_wave (1..N-1).
- *
- * WHY bc is NOT in Grid:
- *   The boundary CONDITION is a user-tunable policy (toggled with 'n')
- *   and belongs in Scene's SIMULATION PARAMS region.  The boundary
- *   CELLS belong to the grid; the policy choice does not.
+ * The grid owns the four edge rows/columns (the rim) but doesn't decide
+ * how they behave on a bounce — that choice (the boundary condition) is
+ * a user setting and lives in Scene, not here.
  */
 typedef struct {
-  float u[GRID_MAX_H][GRID_MAX_W]; /* u(x,y,t) — DISPLACEMENT field
-                                    * [cells].  Sign convention: > 0
-                                    * above the rest plane (crest),
-                                    * < 0 below (trough).  Read by
-                                    * every render pass; written by
-                                    * update_wave + apply_bc +
-                                    * apply_excitation + presets.      */
-  float v[GRID_MAX_H][GRID_MAX_W]; /* v(x,y,t) — VELOCITY field ∂u/∂t.
-                                    * Updated FIRST each tick (the
-                                    * symplectic-Euler half-step);
-                                    * sign indicates upward (>0) vs
-                                    * downward (<0) motion at that
-                                    * instant.                          */
-  int cols;                        /* live width  (≤ GRID_MAX_W) —
-                                    * matches the terminal column
-                                    * count; the renderer indexes one
-                                    * cell per column.                  */
-  int rows;                        /* live height (≤ GRID_MAX_H) —
-                                    * matches the terminal row count.   */
+  /* height of each point, in cells.  Positive means pushed up (a
+   * crest), negative means pushed down (a trough).  Read by every
+   * draw pass; written by the solver, the edge rules, and strikes. */
+  float u[GRID_MAX_H][GRID_MAX_W];
+  /* up/down speed of each point — how fast its height is changing.
+   * Updated first each tick, before the heights move.  Positive means
+   * moving up right now, negative means moving down. */
+  float v[GRID_MAX_H][GRID_MAX_W];
+  int cols; /* live width  — one cell per terminal column (≤ GRID_MAX_W) */
+  int rows; /* live height — one cell per terminal row    (≤ GRID_MAX_H) */
 } Grid;
 
-/* THE single grid instance — file-scope BSS, no malloc.  Every
- * physics/render helper below takes `Grid *g` (or `const Grid *g`)
- * and accesses fields via `g->u / g->v / g->cols / g->rows`.  Scene
- * carries a pointer to this object so higher-level code can pass
- * `&scene.grid` interchangeably.                                       */
+/* The one and only grid.  Lives in static memory, never malloc'd.  Every
+ * physics and render helper reaches it through g_grid.u / .v / .cols /
+ * .rows. */
 static Grid g_grid;
 
-/* ===================================================================== */
-/* §5  solver                                                             */
-/* ===================================================================== */
+/* ── §5 solver ── */
 
-/*
- * init_grid() — set live dims, zero both fields, apply initial BC.
- *
- * Called at startup and on resize.  No heap allocation.
- */
-static void init_grid(int bc, int cols, int rows); /* forward decl */
+static void init_grid(int bc, int cols, int rows); /* defined below */
 
-/* Zero u and v across the live grid (cells outside cols/rows are
- * irrelevant — the solver loops never touch them). */
+/* Reset every point to flat and motionless across the live grid.  Cells
+ * past the current width/height are left alone — nothing ever reads them. */
 static void grid_zero(void) {
   for (int r = 0; r < g_grid.rows; r++) {
     memset(g_grid.u[r], 0, (size_t)g_grid.cols * sizeof(float));
@@ -753,10 +412,9 @@ static void grid_zero(void) {
   }
 }
 
-/* DIRICHLET BC — clamped rim.  u = v = 0 at all 4 borders.  Physical
- * analogue: a drumhead glued to a rigid frame; the rim cannot move,
- * so any wave reaching it is reflected back with a 180° phase flip
- * (crest → trough).  Morse & Ingard [ref 2] §5.2. */
+/* Pinned rim: hold all four edges flat and still.  Like a drumhead glued
+ * to a rigid frame — the edge can't move, so a wave hitting it bounces
+ * back flipped upside down (a crest returns as a trough). */
 static void apply_dirichlet_bc(float (*u)[GRID_MAX_W], float (*v)[GRID_MAX_W],
                                int cols, int rows) {
   for (int c = 0; c < cols; c++) {
@@ -773,11 +431,9 @@ static void apply_dirichlet_bc(float (*u)[GRID_MAX_W], float (*v)[GRID_MAX_W],
   }
 }
 
-/* NEUMANN BC — free edge.  ∂u/∂n = 0 at the rim, i.e. the FIRST
- * derivative normal to the boundary vanishes.  Implemented by copying
- * each border cell from its one interior neighbour so the discrete
- * gradient across the boundary is zero.  Waves reflect WITHOUT phase
- * inversion (crest reflects as crest).  Morse & Ingard [ref 2] §5.3. */
+/* Free rim: let the edges float instead of pinning them.  We copy each
+ * edge cell from its inner neighbour so there's no slope across the rim.
+ * A wave bounces back the same way up (a crest returns as a crest). */
 static void apply_neumann_bc(float (*u)[GRID_MAX_W], float (*v)[GRID_MAX_W],
                              int cols, int rows) {
   for (int c = 0; c < cols; c++) {
@@ -794,12 +450,10 @@ static void apply_neumann_bc(float (*u)[GRID_MAX_W], float (*v)[GRID_MAX_W],
   }
 }
 
-/* PERIODIC BC — toroidal wrap.  No reflections at all: a wave leaving
- * the right edge re-enters at the left, top↔bottom likewise.  We use
- * `rows-2` / `cols-2` (not `rows-1` / `cols-1`) so the wrap maps each
- * boundary cell to its OPPOSITE INTERIOR neighbour — that way the
- * 5-point Laplacian sees a consistent neighbourhood from both sides
- * of the seam.  Strauss [ref 3] Ch.4 covers the torus geometry. */
+/* Wrap-around rim: no bouncing at all.  A wave leaving the right edge
+ * comes back in on the left, and top wraps to bottom.  We copy from the
+ * far INNER cell (cols-2, not cols-1) so the cell just across the seam
+ * sees the same neighbours it would on a seamless loop. */
 static void apply_periodic_bc(float (*u)[GRID_MAX_W], float (*v)[GRID_MAX_W],
                               int cols, int rows) {
   for (int c = 0; c < cols; c++) {
@@ -816,8 +470,7 @@ static void apply_periodic_bc(float (*u)[GRID_MAX_W], float (*v)[GRID_MAX_W],
   }
 }
 
-/* Dispatch to the chosen boundary policy.  Reads as pure selection;
- * each named helper holds one self-contained BC implementation. */
+/* Pick the edge rule the user has selected and run it. */
 static void apply_bc(int bc) {
   float(*u)[GRID_MAX_W] = g_grid.u;
   float(*v)[GRID_MAX_W] = g_grid.v;
@@ -837,29 +490,21 @@ static void apply_bc(int bc) {
   }
 }
 
-/* 5-POINT DISCRETE LAPLACIAN [LeVeque ref 5] —
- *      ∇²u[r,c] ≈ u[r-1,c] + u[r+1,c] + u[r,c-1] + u[r,c+1] − 4·u[r,c]
- *
- * Geometric reading: L is the SUM of differences to each of the four
- * Manhattan neighbours.  If all four neighbours match u[r,c], L=0
- * and no restoring force acts (the cell is at a local extremum); if
- * neighbours pull the cell toward their average, L has the sign of
- * that average and the wave equation pushes u back toward equilibrium.
- *
- * `static inline` so the compiler can fold this into the hot velocity
- * loop without function-call overhead.                                  */
+/* How out-of-step a cell is with its four nearest neighbours: add up
+ * each neighbour's height and compare to this cell's.  Zero means the
+ * cell already matches its surroundings (no push); otherwise the sign
+ * tells the wave which way to nudge it back toward its neighbours'
+ * average.  This is what spreads a bump outward.  (LeVeque [ref 5].)
+ * Inlined so it folds straight into the tight speed loop. */
 static inline float laplacian5(const float (*u)[GRID_MAX_W], int r, int c) {
   return u[r - 1][c] + u[r + 1][c] + u[r][c - 1] + u[r][c + 1] - 4.0f * u[r][c];
 }
 
-/* SYMPLECTIC HALF-STEP 1 — velocity update on every INTERIOR cell.
- * Reads u, writes v.  Force breakdown:
- *     restoring   = c² · ∇²u    (wave equation, always present)
- *     drag        = −γ · v      (damping, drains energy gradually)
- *     v_new = v + (restoring + drag) · dt
- * Doing the velocity update FIRST (using the current u) is what makes
- * this scheme SYMPLECTIC [Hairer/Lubich/Wanner ref 7] — it conserves a
- * shadow Hamiltonian instead of leaking energy like explicit Euler.    */
+/* Step 1 of the tick: update each inner cell's up/down speed.  Two
+ * pushes combine — one pulling it toward its neighbours (the wave
+ * spreading) and a gentle drag that bleeds off energy so strikes fade.
+ * Doing speed first, off the current heights, is the trick that keeps
+ * the sim from slowly gaining or losing energy [ref 7]. */
 static void velocity_half_step(float (*u)[GRID_MAX_W], float (*v)[GRID_MAX_W],
                                int cols, int rows, float c2, float damping,
                                float dt) {
@@ -871,12 +516,10 @@ static void velocity_half_step(float (*u)[GRID_MAX_W], float (*v)[GRID_MAX_W],
   }
 }
 
-/* SYMPLECTIC HALF-STEP 2 — displacement update using the NEW velocity.
- *     u_new = u + v_new · dt
- * Must be a SEPARATE loop from STEP 1 — if it were merged, updating
- * u[r,c] would corrupt the Laplacian computation for u[r+1,c] still to
- * come in step 1.  The price is one extra pass over the interior; the
- * benefit is correctness.                                              */
+/* Step 2 of the tick: move each height by the speed we just computed.
+ * This has to be its own loop — if we moved heights while still updating
+ * speeds, a cell we already moved would feed wrong values into its
+ * neighbours' speed calculation.  One extra pass buys correctness. */
 static void displacement_half_step(float (*u)[GRID_MAX_W],
                                    const float (*v)[GRID_MAX_W], int cols,
                                    int rows, float dt) {
@@ -887,14 +530,9 @@ static void displacement_half_step(float (*u)[GRID_MAX_W],
   }
 }
 
-/*
- * update_wave — advance the damped wave equation by one fixed dt.
- *
- * Pseudocode (symplectic Euler on the first-order pair):
- *     step 1   v ← v + (c²∇²u − γv) · dt        (velocity half-step)
- *     step 2   u ← u + v · dt                    (displacement half-step)
- *     step 3   apply_bc                          (consistent boundary)
- */
+/* Move the whole membrane forward by one time slice: nudge the speeds,
+ * move the heights, then fix up the edges so they obey the chosen rim
+ * rule. */
 static void update_wave(float dt, float wave_speed, float damping, int bc) {
   float c2 = wave_speed * wave_speed;
   float(*u)[GRID_MAX_W] = g_grid.u;
@@ -907,16 +545,12 @@ static void update_wave(float dt, float wave_speed, float damping, int bc) {
   apply_bc(bc);
 }
 
-/* PEAK + ENERGY SCAN — one pass over the interior collects:
- *   • mx   = peak |u|        (display normaliser)
- *   • ke   = Σ ½·v²          (kinetic energy density × area; m = 1)
- *   • pe   = Σ ½·c²·|∇u|²    (elastic potential energy density × area)
- *
- * The gradient is estimated by centred differences [LeVeque ref 5]:
- *   ∂u/∂x ≈ (u[c+1] − u[c-1]) · CDIFF_FACTOR     (factor = 1/(2·dx) = ½)
- *
- * One pass instead of three keeps the iteration friendly to the
- * prefetcher — each cache line of u/v gets read once per frame. */
+/* One sweep that gathers three numbers the HUD wants:
+ *   • the tallest crest/trough (used to scale the colours)
+ *   • energy of motion — how fast everything is moving
+ *   • energy of tension — how stretched/bent the surface is
+ * Both energies add up to the total the demo watches decay as a strike
+ * fades.  We do it in a single pass so each cell is read once a frame. */
 static void scan_peak_and_energy(const float (*u)[GRID_MAX_W],
                                  const float (*v)[GRID_MAX_W], int cols,
                                  int rows, float c2, float *out_max_amp,
@@ -932,10 +566,10 @@ static void scan_peak_and_energy(const float (*u)[GRID_MAX_W],
       if (a > mx)
         mx = a;
 
-      /* KE density:  ½·m·v²  with m = 1 per cell */
+      /* energy of motion at this cell — grows with speed squared */
       ke += (double)HALF * (double)(vv * vv);
 
-      /* PE density:  ½·c²·|∇u|²   (centred differences) */
+      /* energy of tension — grows with how steeply the surface tilts here */
       float gx = (u[r][c + 1] - u[r][c - 1]) * CDIFF_FACTOR;
       float gy = (u[r + 1][c] - u[r - 1][c]) * CDIFF_FACTOR;
       pe += (double)HALF * (double)c2 * (double)(gx * gx + gy * gy);
@@ -946,13 +580,11 @@ static void scan_peak_and_energy(const float (*u)[GRID_MAX_W],
   *out_pe = pe;
 }
 
-/* MODE ESTIMATION — count sign changes (zero crossings) along the
- * centre row and centre column.  Rayleigh [ref 1]: for a pure
- * (nx, ny) standing wave, the centre row holds exactly nx half-waves,
- * each contributing one zero crossing — so crossing_count ≈ nx.
- * A pulse-superposition state has many simultaneous modes and the
- * count is "the dominant nx that fits".  Bounded below at 1 so the
- * HUD never reads (0, 0) when the field is at rest. */
+/* Guess the standing-wave shape by counting how many times the surface
+ * crosses zero along the middle row and middle column.  A clean (nx, ny)
+ * pattern crosses zero nx times across and ny times down, so the counts
+ * read straight off as the shape numbers shown in the HUD.  Floored at 1
+ * so a flat membrane never reads (0, 0).  (Rayleigh [ref 1].) */
 static void estimate_mode_numbers(const float (*u)[GRID_MAX_W], int cols,
                                   int rows, int *out_nx, int *out_ny) {
   int cr = rows / 2;
@@ -971,25 +603,15 @@ static void estimate_mode_numbers(const float (*u)[GRID_MAX_W], int cols,
   *out_ny = (crossings_y < 1) ? 1 : crossings_y;
 }
 
-/* CFL_2D — Courant-Friedrichs-Lewy stability gauge for the 2-D
- * explicit 5-point scheme [CFL ref 4, LeVeque ref 5].  Bound:
- *     c · dt · √2  ≤  1     (with dx = dy = 1)
- * The √2 = SQRT2 falls out of von Neumann stability analysis on the
- * 5-point Laplacian.  Render_overlay traffic-lights this value:
- *   < 0.70 green (STABLE),  < 0.90 yellow (MARGINAL),  else red.   */
+/* A health number for the sim: how far a wave travels in one time slice,
+ * scaled so 1.0 is the danger line.  Stay under it and the simulation is
+ * stable; cross it and the numbers blow up.  The overlay shows it as a
+ * green/yellow/red light.  (Courant-Friedrichs-Lewy [ref 4].) */
 static float cfl_2d_stability(float wave_speed, float dt_sec) {
   return wave_speed * dt_sec * SQRT2;
 }
 
-/*
- * compute_stats — derive every per-tick overlay quantity from u and v.
- *
- * Pseudocode:
- *     one pass over interior  → peak |u|, KE, PE
- *     centre-line zero-cross  → (mode_nx, mode_ny)
- *     wave_speed · dt · √2    → CFL_2D gauge
- *     normalise (KE+PE) by interior cell count → per-cell energy
- */
+/* Work out all the numbers the side panel shows, once per tick. */
 static void compute_stats(float wave_speed, float dt_sec, float *max_amplitude,
                           float *energy_est, int *mode_nx, int *mode_ny,
                           float *cfl_2d) {
@@ -1007,7 +629,8 @@ static void compute_stats(float wave_speed, float dt_sec, float *max_amplitude,
   *cfl_2d = cfl_2d_stability(wave_speed, dt_sec);
 }
 
-/* Set live grid dims, then zero u/v and stamp the boundary policy. */
+/* Resize the grid, flatten it, and set the edges per the chosen rim rule.
+ * Used at startup and on every terminal resize. */
 static void init_grid(int bc, int cols, int rows) {
   g_grid.cols = cols;
   g_grid.rows = rows;
@@ -1015,24 +638,12 @@ static void init_grid(int bc, int cols, int rows) {
   apply_bc(bc);
 }
 
-/* ===================================================================== */
-/* §6  excitation                                                          */
-/* ===================================================================== */
+/* ── §6 excitation ── */
 
-/*
- * apply_excitation() — add a Gaussian displacement pulse to g_grid.u.
- *
- * The pulse shape is:
- *   Δu(x,y) = amp · exp( −[(x−cx)² + (y−cy)²] / (2·r²) )
- *
- * We ADD to the current field rather than replacing it so that multiple
- * strikes accumulate (useful for the double-strike preset).
- *
- * Only the displacement field is perturbed; g_grid.v is left unchanged.
- * This models an impulsive displacement (a drumstick hit) rather than
- * an impulse of momentum.  To model a momentum impulse, add to g_grid.v
- * instead.
- */
+/* Press a smooth round dimple into the surface — a drumstick hit.  The
+ * bump is tallest at the centre and fades out with distance.  We ADD to
+ * whatever's already there, so two strikes can overlap.  Only heights are
+ * touched, not speeds — like pushing the surface down and letting go. */
 static void apply_excitation(float cx, float cy, float amp, float radius) {
   float(*u)[GRID_MAX_W] = g_grid.u;
   int cols = g_grid.cols;
@@ -1049,37 +660,28 @@ static void apply_excitation(float cx, float cy, float amp, float radius) {
   }
 }
 
-/* WAVENUMBERS for the (nx, ny) Dirichlet eigenmode on a (cols × rows)
- * grid.  An n-half-wave standing pattern across a span L has spatial
- * frequency k = nπ/L; we use the discrete length L = (cols-1) for the
- * x-axis (cells 0..cols-1 inclusive) and similarly for y. */
+/* How tightly the (nx, ny) standing-wave pattern ripples across the
+ * grid — more half-waves across the width or height means tighter
+ * ripples.  Feeds the sine shapes used to stamp a clean mode. */
 static void mode_wavenumbers(int nx, int ny, int cols, int rows, float *out_kx,
                              float *out_ky) {
   *out_kx = (float)nx * (float)M_PI / (float)(cols - 1);
   *out_ky = (float)ny * (float)M_PI / (float)(rows - 1);
 }
 
-/* EIGEN-FREQUENCY of a 2-D Dirichlet (nx, ny) mode at wave speed c
- * [Rayleigh ref 1, Crawford ref 6]:
- *     ω_mn = c · π · √(nx²/W² + ny²/H²)
- *          = c · √(kx² + ky²)         (since k_i = n_i·π/L_i)
- * Used here only to scale the velocity kick — see preset_resonance. */
+/* How fast a given standing-wave shape swings up and down.  Tighter
+ * ripples swing faster.  We only use it to pick a tasteful starting
+ * speed for a played mode (see preset_resonance).  (Rayleigh [ref 1].) */
 static float mode_eigen_frequency(float c, float kx, float ky) {
   return c * sqrtf(kx * kx + ky * ky);
 }
 
-/* STAMP the (nx, ny) standing-wave EIGENMODE onto u and v.
- *
- * Spatial shape: ψ(x,y) = sin(kx·x) · sin(ky·y)  (Dirichlet, Rayleigh [1]).
- *
- * Temporal phase:  We don't start from rest (u = amp·ψ, v = 0); we
- * start at the 45° phase point of the harmonic oscillation:
- *     u(t=0) = (amp · cos 45°) · ψ = amp/√2 · ψ
- *     v(t=0) = (amp · ω · sin 45°) · ψ = amp·ω/√2 · ψ
- * INV_SQRT2 = cos(π/4) = sin(π/4) makes this a single multiplier per
- * field.  Result: the FIRST rendered frame already shows non-zero
- * motion — the eye sees the mode animating immediately instead of
- * staring at a frozen extremum waiting for the half-period to pass. */
+/* Paint a clean standing-wave pattern onto the surface, both its shape
+ * and its motion.  The shape is two sine ripples multiplied together.
+ * Instead of starting it frozen at full height (which would look static
+ * for a moment), we start it halfway through its swing — already part
+ * way down and moving — so it animates on the very first frame.
+ * (Rayleigh [ref 1].) */
 static void stamp_standing_wave_state(float (*u)[GRID_MAX_W],
                                       float (*v)[GRID_MAX_W], int cols,
                                       int rows, float kx, float ky, float amp,
@@ -1098,15 +700,8 @@ static void stamp_standing_wave_state(float (*u)[GRID_MAX_W],
   }
 }
 
-/*
- * preset_resonance — initialise the field to a single eigenmode of
- *                    the wave equation, mid-oscillation.
- *
- * Pseudocode:
- *     k_x, k_y ← wavenumbers for mode (nx, ny)
- *     ω       ← eigen-frequency at the reference wave speed
- *     stamp standing-wave state with 45°-phase scaling
- */
+/* Set the whole surface to one clean (nx, ny) standing-wave shape, caught
+ * mid-swing so it's already moving. */
 static void preset_resonance(int nx, int ny, float amp) {
   float(*u)[GRID_MAX_W] = g_grid.u;
   float(*v)[GRID_MAX_W] = g_grid.v;
@@ -1116,38 +711,26 @@ static void preset_resonance(int nx, int ny, float amp) {
   float kx, ky;
   mode_wavenumbers(nx, ny, cols, rows, &kx, &ky);
 
-  /* Use the CANONICAL reference wave speed (not the current
-   * scene.wave_speed) — this only sets a tasteful starting kinetic
-   * amplitude; the real c still drives the subsequent integration,
-   * so the visible frequency follows whatever the user has set. */
+  /* Use a fixed reference speed here, not the user's current one — this
+   * only picks a nice starting swing.  The real speed takes over from the
+   * next tick, so the visible motion still follows the user's setting. */
   float omega = mode_eigen_frequency(RESONANCE_KICK_REF_C, kx, ky);
 
   stamp_standing_wave_state(u, v, cols, rows, kx, ky, amp, omega);
 }
 
-/* ── preset application helpers ─────────────────────────────────────── */
-
-typedef struct Scene Scene; /* forward declaration for preset callbacks */
+typedef struct Scene Scene; /* defined in §8; presets take it by pointer */
 
 static void preset_apply(Scene *s, int preset_id);
 
-/* ===================================================================== */
-/* §7  render                                                             */
-/* ===================================================================== */
+/* ── §7 render ── */
 
-/* NODAL-CELL TEST — is cell (r,c) ON a Chladni nodal line?
- *
- * Two conditions BOTH have to hold [Chladni ref 8, Rayleigh ref 1]:
- *   1. |u| at this cell is below `near_zero_thresh` (it's a candidate
- *      zero of the field).
- *   2. At least one Manhattan neighbour has u > +near_zero_thresh AND
- *      at least one has u < −near_zero_thresh — i.e. the cell sits
- *      BETWEEN regions of opposite phase, which is the geometric
- *      definition of a nodal curve.
- *
- * Without condition (2), every "calm" cell would be flagged — but
- * those are just background, not nodes.  The two-side test is what
- * makes the dim '·' overlay trace the actual mode-shape geometry. */
+/* Is this cell sitting on a "nodal line" — a still seam where up and down
+ * regions meet?  Two things must be true: the cell itself is basically
+ * flat, AND it has a raised neighbour on one side and a sunken one on the
+ * other.  The second test matters — without it every calm background cell
+ * would count.  These seams are the modern echo of Chladni's old trick of
+ * sprinkling sand on a vibrating plate. (Chladni [ref 8].) */
 static bool cell_is_nodal_line(const float (*u)[GRID_MAX_W], int r, int c,
                                int cols, int rows, float near_zero_thresh) {
   if (fabsf(u[r][c]) >= near_zero_thresh)
@@ -1173,25 +756,19 @@ static bool cell_is_nodal_line(const float (*u)[GRID_MAX_W], int r, int c,
   return near_pos && near_neg;
 }
 
-/* Paint one nodal-line marker — dim '·' in the neutral CP_NODAL pair.
- * Stays the same colour across every theme so the geometric overlay
- * doesn't compete with the diverging amplitude colours. */
+/* Mark one nodal-line cell with a dim dot.  Always the same neutral grey
+ * whatever theme is active, so the seams don't fight the wave colours. */
 static void paint_nodal_cell(WINDOW *w, int r, int c) {
   wattron(w, COLOR_PAIR(CP_NODAL) | A_DIM);
   mvwaddch(w, r, c, '.');
   wattroff(w, COLOR_PAIR(CP_NODAL) | A_DIM);
 }
 
-/* Paint one AMPLITUDE cell using the diverging warm/cool ramp.
- *
- * Steps (Ware [ref 9]):
- *   1. Sign of u  → choose WARM (positive) or COOL (negative) family
- *   2. |u|/dmax   → normalised magnitude ∈ [0, 1]
- *   3. lut_index  → bucket into ramp tier (0..RAMP_N-1) via gamma LUT
- *   4. tier 0 cells are below the display threshold — skip drawing
- *      (leaves the cell black background; this is how rest-state
- *      cells disappear, making wave fronts pop)
- *   5. tier ≥ 1 → fetch glyph from k_ramp + attribute from wave_attr */
+/* Draw one cell coloured by its height.  Pushed up gets a warm colour,
+ * pushed down a cool one; how far it's moved picks how bright and how
+ * solid the character is.  Cells barely off flat are skipped entirely,
+ * left as black background — which is exactly what makes the moving wave
+ * fronts stand out. (Ware [ref 9].) */
 static void paint_amplitude_cell(WINDOW *w, int r, int c, float u, int theme,
                                  float inv_max) {
   bool positive = (u >= 0.0f);
@@ -1201,7 +778,7 @@ static void paint_amplitude_cell(WINDOW *w, int r, int c, float u, int theme,
 
   int lvl = lut_index(norm);
   if (lvl == 0)
-    return; /* below display threshold — skip */
+    return; /* too faint to bother drawing — leave it black */
 
   attr_t attr = wave_attr(theme, positive, lvl);
   wattron(w, attr);
@@ -1209,17 +786,10 @@ static void paint_amplitude_cell(WINDOW *w, int r, int c, float u, int theme,
   wattroff(w, attr);
 }
 
-/*
- * render_membrane — paint g_grid.u into the ncurses window.
- *
- * Pseudocode per cell:
- *     if show_nodal and cell sits on a sign-change boundary:
- *         paint dim '·' (nodal marker)
- *     else:
- *         paint by signed amplitude (warm/cool ramp)
- *
- * The display normaliser `display_max` is clamped to DISPLAY_MAX_FLOOR
- * so dividing by it stays finite when the field is near silence. */
+/* Draw the whole membrane: each cell shows either a nodal-seam dot (if the
+ * overlay is on and it's on a seam) or its height as a warm/cool colour.
+ * display_max is the tallest point right now, used to scale the colours;
+ * we floor it so a nearly-silent surface doesn't divide by almost zero. */
 static void render_membrane(WINDOW *w, int theme, bool show_nodal,
                             float display_max) {
   const float(*u)[GRID_MAX_W] = (const float(*)[GRID_MAX_W])g_grid.u;
@@ -1243,19 +813,9 @@ static void render_membrane(WINDOW *w, int theme, bool show_nodal,
   }
 }
 
-/*
- * render_overlay() — stats panel in the bottom-left corner.
- *
- * Displays:
- *   max_amplitude  — peak |u|; indicates energy still in the system
- *   energy_est     — mean (KE + PE) per cell; decays with damping
- *   mode (nx, ny)  — estimated standing wave mode from zero-crossing count
- *   CFL_2D         — c·dt·√2; stability indicator with colour coding
- *   BC             — active boundary condition name
- *   wave_speed     — current c in cells/s
- *   damping        — current γ
- *   sim_time       — total elapsed simulation time
- */
+/* Draw the little stats box in the bottom-left: tallest point, leftover
+ * energy, guessed wave shape, the stability light, and the current
+ * settings. */
 static void render_overlay(WINDOW *w, int cols, int rows, float max_amp,
                            float energy, int mode_nx, int mode_ny, float cfl,
                            float wave_speed, float damping, int bc,
@@ -1270,7 +830,7 @@ static void render_overlay(WINDOW *w, int cols, int rows, float max_amp,
   if (ox + pw > cols)
     return;
 
-  /* CFL stability colour: green < 0.7, yellow < 0.9, red ≥ 0.9 */
+  /* stability light: green when safe, yellow when close, red when risky */
   int cfl_color;
   const char *cfl_label;
   if (cfl < 0.70f) {
@@ -1291,7 +851,7 @@ static void render_overlay(WINDOW *w, int cols, int rows, float max_amp,
   mvwprintw(w, oy + 3, ox, "| mode    (%3d, %3d)         |", mode_nx, mode_ny);
   wattroff(w, COLOR_PAIR(CP_HUD) | A_DIM);
 
-  /* CFL row: coloured by stability */
+  /* the stability row, tinted by the light chosen above */
   wattron(w, COLOR_PAIR(CP_HUD) | A_DIM);
   mvwprintw(w, oy + 4, ox, "| CFL_2D  ");
   wattroff(w, COLOR_PAIR(CP_HUD) | A_DIM);
@@ -1313,156 +873,78 @@ static void render_overlay(WINDOW *w, int cols, int rows, float max_amp,
   wattroff(w, COLOR_PAIR(CP_HUD) | A_DIM);
 }
 
-/* ===================================================================== */
-/* §8  scene                                                              */
-/* ===================================================================== */
+/* ── §8 scene ── */
 
 /*
- * Scene — every piece of mutable SCALAR state for one running session.
+ * Scene — all the loose, changeable state for one run: the physics knobs,
+ * the UI flags, the visual choices, and the latest stats for the HUD.  It
+ * does NOT hold the height/speed fields or the grid size — those live in
+ * the §4 Grid (g_grid).  Splitting them keeps each struct small: Grid is
+ * the membrane itself, Scene is everything around it.
  *
- * Owns the SIMULATION knobs, the UI / VISUAL state, and the per-tick
- * STATS.  Does NOT own the field arrays or the grid dimensions —
- * those live in the §4 Grid struct (g_grid).  The split keeps each
- * struct readable on one screen: Grid is the PHYSICAL STATE of the
- * membrane, Scene is the RUN STATE around it.
+ * Scene doesn't set up ncurses; it just steps the physics and draws into a
+ * window it's handed.  That keeps the solver easy to run headless and
+ * makes resizing a one-liner (scene_resize rebuilds Grid at the new size).
  *
- * Knows nothing about ncurses setup — it only performs physics updates
- * and draws into a passed WINDOW*.  That separation makes the solver
- * testable headlessly and makes resize handling simple (call
- * scene_resize, which re-initialises Grid to the new dimensions).
+ * Fields are grouped into four blocks, in the order a frame touches them:
+ *   (A) physics knobs — wave speed, damping, edge rule
+ *   (B) flow & presets — paused, single-step, which strike, which mode
+ *   (C) visuals — theme, nodal overlay
+ *   (D) stats — the numbers compute_stats fills in each tick for the HUD
  *
- * LAYOUT — fields are grouped into FOUR locality regions ordered the
- * way each per-frame pass touches them:
- *
- *   ┌─────────────────────────────────────────────────────────────────┐
- *   │ (A) SIMULATION PARAMS  — wave_speed, damping, bc                 │
- *   │     read by  : update_wave + apply_bc (HOT, per tick)            │
- *   │     written  : input handler (c/C, d/D, n keys)                  │
- *   │                                                                  │
- *   │ (B) UI / CONTROL       — paused, step_requested, preset_id,      │
- *   │                          mode_idx                                │
- *   │     read by  : scene_tick (paused gate), preset_apply,           │
- *   │                render_overlay (preset_id readout)                │
- *   │     written  : input handler (q/space/s/r/p/m)                   │
- *   │                                                                  │
- *   │ (C) RENDERING / VISUAL — theme, show_nodal                       │
- *   │     read by  : render_membrane, render_overlay                   │
- *   │     written  : input handler (t, l keys)                         │
- *   │                                                                  │
- *   │ (D) STATS              — max_amplitude, energy_est, mode_nx/ny,  │
- *   │                          cfl_2d, simulation_time, dt_sec         │
- *   │     read by  : render_overlay (every frame, HUD readouts)        │
- *   │     written  : compute_stats at the end of every scene_tick      │
- *   └─────────────────────────────────────────────────────────────────┘
- *
- * GEOMETRY (cols, rows) lives in §4 Grid, NOT here — see the §4 Grid
- * doc for the rationale (dims travel with the field arrays they bound).
- *
- * WHY this grouping (locality + clarity):
- *   • Each per-frame pass touches a CONTIGUOUS region, friendly to
- *     the prefetcher and to a reader scanning top-to-bottom.
- *   • Region (A) is HOT (read every substep) and tiny — fits in
- *     registers across the inner update_wave loop.
- *   • Region (B) is COLD (only changes on keypress) but its bits
- *     gate big behaviours (paused stops physics, mode_idx selects a
- *     standing-wave mode shape on 'm' press).
- *   • Region (C) is read-only in the render pass, written only on
- *     theme/nodal toggle — no physics path touches it.
- *   • Region (D) is the BRIDGE: physics writes, render reads.  Caching
- *     these once in compute_stats means the renderer never has to
- *     re-scan the field arrays to draw the HUD overlay.
- *
- * WHY a separate Grid struct (not embedded in Scene):
- *   The field arrays are ~240 KB; embedding Grid would make Scene
- *   240 KB and obscure where the SIMULATION STATE actually lives.
- *   Keeping Grid distinct lets a reader open the §4 block and see
- *   "everything that defines the membrane right now" without wading
- *   through UI flags and stats.  Scene fits in one screen this way.
- *
- * WHY one big Scene (not split SimScene + RenderScene + UIScene):
- *   The simulation rebuilds atomically on resize / reset / preset
- *   change — `memset(s, 0, sizeof *s)` + a few field writes is the
- *   cleanest possible reset.  Splitting would force coordinated
- *   resets across multiple structs and risk drift between them
- *   (e.g. resize that rebuilds physics but forgets to clear stats).
+ * It's one struct rather than three because a reset is then just
+ * memset-to-zero plus a few writes; splitting would risk a resize
+ * rebuilding the physics but forgetting to clear the stats.
  */
 struct Scene {
-  /* ── (A) SIMULATION PARAMS — hot-loop physics knobs ────────────── *
-   * Read every tick by update_wave.  Mutated by the user via the
-   * keyboard handler (c/C, d/D, n).  Independent of g_grid: changing
-   * wave_speed doesn't rewrite g_grid.u, it just changes the forces
-   * update_wave generates next tick.                                  */
-  float wave_speed; /* c in cells/s — propagation speed of small
-                     * disturbances.  Sets ω for every mode; the
-                     * CFL bound c·dt·√2 ≤ 1 caps how high it
-                     * can go for a given sim_fps [refs 4, 5]. */
-  float damping;    /* γ in 1/s — coefficient of the −γ·v drag
-                     * term.  Time-constant for free decay is
-                     * τ ≈ 1/γ; default γ=0.003 gives τ ≈ 333
-                     * ticks ≈ 5.5 s at 60 Hz.                  */
-  int bc;           /* boundary condition enum — DIRICHLET (0,
-                     * clamped rim, phase-flipped reflection),
-                     * NEUMANN (1, free edge, no flip), or
-                     * PERIODIC (2, toroidal wrap).  Switched
-                     * by 'n'; reset triggers a fresh preset.   */
+  /* (A) physics knobs — read every tick by the solver, changed by the
+   * c/C, d/D, n keys.  These don't rewrite the field; they just change
+   * the forces the next tick produces. */
+  float wave_speed; /* how fast disturbances travel, in cells/sec.  Higher
+                     * = faster ripples and faster swinging, but push it
+                     * too high for the frame rate and the sim goes
+                     * unstable (watch the stability light). */
+  float damping;    /* how quickly strikes fade.  0 rings forever; the
+                     * default ~0.003 lets a hit fade over about 5 sec. */
+  int bc;           /* which edge rule is active: 0 pinned (flips on
+                     * bounce), 1 free (no flip), 2 wrap-around.  Cycled
+                     * by 'n'. */
 
-  /* ── (B) UI / CONTROL — flow + preset state ──────────────────── *
-   * Owned by the input handler.  scene_tick reads `paused` /
-   * `step_requested` to decide whether to advance physics this
-   * frame.  Preset bookkeeping lives here too so the renderer can
-   * label the current preset in the side overlay.                   */
-  bool paused;         /* freeze update_wave each tick; HUD shows
-                        * "PAUSED" when set.  Toggled by space/p. */
-  bool step_requested; /* one-shot: when both `paused` and this
-                        * are true, scene_tick runs ONCE then
-                        * clears this flag.  The 's' key sets it. */
-  int preset_id;       /* 0..PRESET_COUNT-1 — last preset triggered;
-                        * used as the reset target for 'r' and as
-                        * a readout in render_overlay.            */
-  int mode_idx;        /* index into k_mode_table[] — advances on
-                        * every 'm' press so successive resonance
-                        * triggers pick visibly different (nx,ny)
-                        * modes [ref 1].  -1 before first 'm'.    */
+  /* (B) flow & preset state — owned by the keyboard handler.  scene_tick
+   * checks paused / step_requested to decide whether to advance. */
+  bool paused;         /* freeze the physics; HUD shows "PAUSED".  Toggled
+                        * by space. */
+  bool step_requested; /* one-shot: while paused, run exactly one tick
+                        * then clear.  Set by 's' for frame-by-frame. */
+  int preset_id;       /* the last canned strike triggered; 'r' replays it
+                        * and the HUD shows its name. */
+  int mode_idx;        /* where we are in the standing-wave list; 'm'
+                        * advances it so each press shows a new shape.
+                        * -1 until the first 'm'. */
 
-  /* ── (C) RENDERING / VISUAL — palette + overlay knobs ──────── *
-   * Read by render_membrane (theme picks the colour ramp) and the
-   * nodal-line detector in render_membrane.  No physics function
-   * touches this region.                                              */
-  int theme;       /* 0..N_THEMES-1 — index into k_themes[];
-                    * cycles on 't'.  Pure visual: changes
-                    * colour-pair bindings, does NOT touch
-                    * g_grid or any solver value.              */
-  bool show_nodal; /* draw dim '·' on zero-crossing cells so
-                    * the geometry of each standing-wave mode
-                    * is visible — the discrete analogue of
-                    * Chladni's sand patterns [ref 8].         */
+  /* (C) visuals — read by the renderer, changed by t and l.  No physics
+   * touches these. */
+  int theme;       /* which colour scheme; cycles on 't'. */
+  bool show_nodal; /* draw the dim dots on the still seams so the wave
+                    * shape is visible — the modern echo of Chladni's
+                    * sand trick [ref 8].  Toggled by 'l'. */
 
-  /* ── (D) STATS — physics-to-HUD bridge ─────────────────────── *
-   * compute_stats() WRITES these once at the end of every tick;
-   * render_overlay() READS them every frame to populate the HUD
-   * panel.  Caching here avoids re-scanning g_grid.u every frame.     */
-  float max_amplitude;   /* peak |u| across the grid — the display
-                          * normaliser so the colour ramp uses the
-                          * full dynamic range even as the wave
-                          * decays.                                  */
-  float energy_est;      /* mean (½v² + ½c²|∇u|²) per cell — the
-                          * total mechanical energy, falls
-                          * monotonically with damping [ref 1].      */
-  int mode_nx, mode_ny;  /* estimated mode numbers from zero-crossing
-                          * count along the centre row / column —
-                          * for a pure (n,m) standing wave these
-                          * match exactly.                           */
-  float cfl_2d;          /* c·dt·√2 — CFL stability gauge [ref 4].
-                          * Coloured green/yellow/red in the overlay
-                          * by render_overlay.                       */
-  float simulation_time; /* total seconds advanced since last reset;
-                          * grows by dt per scene_tick.              */
-  float dt_sec;          /* last tick's dt — exposed so the overlay
-                          * can show "actual dt" if substepping or
-                          * frame-pacing diverged.                   */
+  /* (D) stats — compute_stats fills these at the end of each tick, the
+   * HUD reads them every frame.  Caching here saves re-scanning the
+   * field just to draw the panel. */
+  float max_amplitude;   /* tallest crest/trough right now — also used to
+                          * scale the colours so they stay vivid as the
+                          * wave fades. */
+  float energy_est;      /* leftover energy per cell — drifts down toward
+                          * zero as damping eats the strike. */
+  int mode_nx, mode_ny;  /* guessed wave shape, from the zero-crossing
+                          * counts; exact for a clean standing wave. */
+  float cfl_2d;          /* the stability number — green/yellow/red in the
+                          * overlay [ref 4]. */
+  float simulation_time; /* seconds of sim time since the last reset. */
+  float dt_sec;          /* the last tick's time slice, shown in the HUD. */
 
-  /* GEOMETRY — owned by Grid, NOT Scene.  Read via g_grid.cols /
-   * g_grid.rows everywhere else in the file.                        */
+  /* grid width/height live in §4 Grid, reached via g_grid.cols/.rows. */
 };
 
 static void scene_init(Scene *s, int cols, int rows) {
@@ -1488,17 +970,9 @@ static void scene_resize(Scene *s, int cols, int rows) {
   init_grid(s->bc, cols, rows);
 }
 
-/*
- * scene_tick() — advance the simulation by one fixed timestep.
- *
- * Called from the accumulator loop in §10.  dt is always exactly
- * 1/sim_fps seconds.  The order of operations is:
- *   1. Solve wave PDE for one step (update_wave)
- *   2. Compute stats for the overlay (compute_stats)
- *
- * If paused and no step is requested, return immediately — the
- * physics state is frozen but the display continues to render.
- */
+/* Advance the sim by one tick: move the wave forward, then refresh the
+ * HUD numbers.  While paused (and not single-stepping) it does nothing,
+ * so the picture freezes but still keeps drawing. */
 static void scene_tick(Scene *s, float dt) {
   if (s->paused && !s->step_requested)
     return;
@@ -1515,7 +989,7 @@ static void scene_tick(Scene *s, float dt) {
 
 static void scene_draw(const Scene *s, WINDOW *w, float alpha, float dt_sec) {
   (void)alpha;
-  (void)dt_sec; /* membrane has no continuous-motion interpolation */
+  (void)dt_sec; /* nothing slides smoothly here, so no between-frame blend */
 
   render_membrane(w, s->theme, s->show_nodal, s->max_amplitude);
 
@@ -1525,22 +999,16 @@ static void scene_draw(const Scene *s, WINDOW *w, float alpha, float dt_sec) {
                  s->preset_id);
 }
 
-/* ── preset implementations ─────────────────────────────────────────── */
-
-/* Map a fractional position (fx, fy) ∈ [0,1] to actual cell coords on
- * the live grid.  Centralised so every strike helper expresses its
- * position as "30 % from the left, 35 % from the top" instead of
- * doing the (cols-1)·fx arithmetic inline. */
+/* Turn a "fraction across, fraction down" position into actual cell
+ * coordinates, so each strike can just say "30% from the left" and not
+ * repeat the size arithmetic. */
 static void cell_at_fraction(float fx, float fy, float *out_x, float *out_y) {
   *out_x = (float)(g_grid.cols - 1) * fx;
   *out_y = (float)(g_grid.rows - 1) * fy;
 }
 
-/* STRIKE 0 — CENTRE PULSE.  One Gaussian impulse at the geometric
- * centre of the membrane.  Produces a symmetric expanding ring that
- * reflects repeatedly off all four walls.  Under Dirichlet BC each
- * reflection inverts phase — count crest↔trough flips at a corner to
- * verify the wall round-trip time. */
+/* One hit dead centre.  Makes a clean ring that spreads out and bounces
+ * off all four walls. */
 static void strike_centre_pulse(int bc) {
   float x, y;
   cell_at_fraction(STRIKE_X_CENTRE, STRIKE_Y_CENTRE, &x, &y);
@@ -1548,11 +1016,8 @@ static void strike_centre_pulse(int bc) {
   apply_bc(bc);
 }
 
-/* STRIKE 1 — LEFT-EDGE PULSE.  Single impulse 15% in from the left wall,
- * centred vertically.  The asymmetric position drives a RICH
- * superposition of modes (many harmonics simultaneously) — under
- * Dirichlet BC and zero damping the long-term state would settle into
- * quasi-periodic Chladni-like patterns [ref 8]. */
+/* One hit near the left wall.  Being off to the side wakes up lots of
+ * overlapping wave shapes at once, giving a busier, lopsided pattern. */
 static void strike_left_edge_pulse(int bc) {
   float x, y;
   cell_at_fraction(STRIKE_X_LEFT_EDGE, STRIKE_Y_CENTRE, &x, &y);
@@ -1560,12 +1025,9 @@ static void strike_left_edge_pulse(int bc) {
   apply_bc(bc);
 }
 
-/* STRIKE 2 — DOUBLE OFF-CENTRE.  Two simultaneous Gaussian pulses at
- * (0.30, 0.35) and (0.70, 0.65) cell-fractions.  Symmetric about the
- * centre in x but offset in y, so the line through the two strikes
- * does NOT pass through the centre — that produces a richer
- * non-symmetric interference pattern (Crawford [ref 6] §9.3,
- * two-source addition/cancellation fringes). */
+/* Two hits at once, off-centre and not lined up through the middle.  The
+ * two spreading rings cross and interfere, building a richer pattern of
+ * reinforcing and cancelling ripples. */
 static void strike_double_offcentre_pulses(int bc) {
   float x, y;
   cell_at_fraction(STRIKE_X_DOUBLE_L, STRIKE_Y_DOUBLE_L, &x, &y);
@@ -1575,10 +1037,8 @@ static void strike_double_offcentre_pulses(int bc) {
   apply_bc(bc);
 }
 
-/* STRIKE 3 — NEXT STANDING-WAVE MODE.  Reads (nx, ny) from the mode
- * cycle table at the scene's current mode_idx, then stamps the
- * matching eigenmode onto the field.  See preset_resonance() for the
- * 45°-phase scaling and Rayleigh-eigenfrequency derivation. */
+/* Paint the next clean standing-wave shape from the cycle list onto the
+ * surface.  See preset_resonance for why it starts mid-swing. */
 static void strike_next_standing_wave_mode(const Scene *s, int bc) {
   int idx = s->mode_idx;
   if (idx < 0 || idx >= MODE_TABLE_LEN)
@@ -1587,9 +1047,8 @@ static void strike_next_standing_wave_mode(const Scene *s, int bc) {
   apply_bc(bc);
 }
 
-/* Dispatch the preset id to the matching strike helper.  Body reads
- * as pure SELECTION; the resetting + preset-id bookkeeping happens
- * once at the top, all impulse placement lives in the named helpers. */
+/* Run one of the canned strikes by id: clear the surface, remember which
+ * preset this was, then hand off to the matching strike helper. */
 static void preset_apply(Scene *s, int id) {
   scene_reset(s);
   s->preset_id = id;
@@ -1610,42 +1069,26 @@ static void preset_apply(Scene *s, int id) {
   }
 }
 
-/* ===================================================================== */
-/* §9  screen — ncurses double-buffer display layer                      */
-/* ===================================================================== */
+/* ── §9 screen — drawing through ncurses ── */
 
 /*
- * Screen — the ncurses display layer's minimal mutable state.
+ * Screen — just how big the terminal is right now.  Everything else the
+ * drawing needs (the window itself, the colour slots) lives inside
+ * ncurses, set up once by color_init, so there's nothing else to keep
+ * here.
  *
- * Holds ONLY the current terminal dimensions.  Everything else needed
- * for rendering (the active WINDOW, the colour pairs, attribute
- * masks) lives in ncurses-managed globals (stdscr, the colour-pair
- * table set up by color_init).
+ * Why wrap two ints in a struct: width and height always belong
+ * together, so passing them as one Screen means a resize updates both
+ * at once — you can't accidentally change one and forget the other.
  *
- * WHY a struct around two ints (not just file-scope globals):
- *   • Group ownership — `cols` and `rows` always belong together;
- *     packaging them prevents accidental "I updated one but not the
- *     other" bugs on resize.
- *   • Pass-by-pointer semantics — screen_init / screen_resize take a
- *     Screen* and write both fields atomically, so the call site
- *     never sees a half-updated state.
- *   • Future-proof — if a future variant adds a second WINDOW (e.g.
- *     a status pad) the new field lives here without further code
- *     surgery elsewhere.
- *
- * WHY this is DIFFERENT from Grid.cols / Grid.rows:
- *   Grid's dims track the SIMULATION grid (which equals the terminal
- *   for this demo, but conceptually doesn't have to — another variant
- *   could simulate a smaller fixed grid centred in a larger terminal).
- *   Screen's dims track what ncurses thinks the terminal is.  They are
- *   kept in sync by app_do_resize(), which is the single point of
- *   truth for resize handling: it reads the new terminal dims into
- *   Screen, then calls scene_resize → init_grid to push the same dims
- *   into Grid.
+ * These two are NOT the same as the grid's cols/rows.  The grid's size
+ * is the membrane's size; Screen's size is whatever ncurses says the
+ * terminal is.  For this demo they happen to match, and app_do_resize
+ * is the one place that keeps them in step on a resize.
  */
 typedef struct {
-  int cols; /* current terminal width  (from getmaxyx) */
-  int rows; /* current terminal height (from getmaxyx) */
+  int cols; /* terminal width  in characters (from getmaxyx) */
+  int rows; /* terminal height in characters (from getmaxyx) */
 } Screen;
 
 static void screen_init(Screen *s) {
@@ -1676,10 +1119,9 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
   erase();
   scene_draw(sc, stdscr, alpha, dt_sec);
 
-  /* ── Row 0  STATUS HUD ──────────────────────────────────────────── *
-   * Canonical CLAUDE.md HUD: bright yellow + A_BOLD, full row cleared
-   * first so the wave never bleeds through.  Shows fps, sim Hz, wave
-   * params, BC, and the paused / running state.                        */
+  /* Top status line: fps, settings, and paused/running.  We wipe the
+   * whole row first so the wave underneath doesn't show through, and
+   * draw it bright so it stays readable over any colours. */
   char status[HUD_COLS + 1];
   snprintf(status, sizeof status,
            " membrane  %5.1f fps  sim:%3d Hz  c=%.0f  "
@@ -1695,10 +1137,9 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
   mvprintw(0, hx, "%s", status);
   attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-  /* ── Row n-1  ACTION-KEYS HUD ───────────────────────────────────── *
-   * Canonical CLAUDE.md HUD: bright cyan + A_BOLD (NEVER A_DIM — dim
-   * text vanishes against any animated palette).  Full row cleared
-   * first so the wave never bleeds through the legend.                 */
+  /* Bottom key-hints line.  Wipe the row first so the wave doesn't show
+   * through, and draw it bright (not dim — dim text disappears against
+   * the moving colours). */
   int hint_row = s->rows - 1;
   move(hint_row, 0);
   clrtoeol();
@@ -1715,67 +1156,42 @@ static void screen_present(void) {
   doupdate();
 }
 
-/* ===================================================================== */
-/* §10 app — signals, resize, input, main loop                           */
-/* ===================================================================== */
+/* ── §10 app — signals, resize, input, main loop ── */
 
 /*
- * App — the top-level container holding everything that lives across
- *       the lifetime of the running program.
+ * App — everything the running program keeps alive from start to finish:
+ * the simulation (Scene), the terminal size (Screen), how many physics
+ * steps to run per second, and two little flags the signal handlers use
+ * to talk back to the main loop.
  *
- * Owns the Scene (simulation), the Screen (terminal display layer),
- * the simulation-Hz knob (separate from Scene because it's a loop
- * pacing parameter, not a physics quantity), and two volatile signal
- * flags that the SIGINT/SIGTERM/SIGWINCH handlers use to communicate
- * back to the main loop.
+ * Why one struct: it gives the program a single home for its state, so
+ * main() can grab one pointer and reach everything through it.
  *
- * WHY group Scene + Screen + signal flags in one struct:
- *   • Single point of truth for the whole running program — `g_app`
- *     is the only true file-scope global the loop touches.
- *   • Cleaner signal handling — the C standard requires signal handlers
- *     to use `volatile sig_atomic_t` for flags they set; keeping those
- *     flags inside the App struct means the rest of the codebase can
- *     pass `App*` around without worrying about which globals to
- *     access (the handlers themselves still need file scope, hence
- *     `static App g_app`).
- *   • `App *app = &g_app` at the top of main() is the only place
- *     anyone touches the global by name — the rest of main() reads
- *     `app->scene`, `app->running`, etc., which makes the code easy
- *     to refactor toward fully heap-allocated apps later.
+ * The sim-steps-per-second knob lives here rather than in Scene because
+ * it's about pacing the loop, not about the wave itself.
  *
- * Signal-handler discipline:
- *   • Both `running` and `need_resize` are `volatile sig_atomic_t` —
- *     mandatory for cross-thread / signal-context flag passing (C11
- *     §7.14.1.1).  Anything else (locks, function calls, struct
- *     writes) is UNDEFINED BEHAVIOUR from a signal handler.
- *   • The handlers (`on_exit_signal`, `on_resize_signal`) do the
- *     ABSOLUTE MINIMUM: flip a flag.  All real work — calling
- *     endwin(), getmaxyx, rebuilding the scene — happens
- *     synchronously from the main loop's next iteration.
+ * About the two flags: a signal can fire at any instant, even mid-line.
+ * The only safe thing a handler may do is flip a simple flag of this
+ * exact type (volatile sig_atomic_t) — anything fancier is undefined.
+ * So the handlers just set a flag and return; the main loop notices on
+ * its next pass and does the real work (quitting, or rebuilding for a
+ * new terminal size) at a safe moment.
  *
- * Storage:
- *   `static App g_app` at file scope so the signal handlers (which
- *   take no user pointer) can reach the flags.  Despite the name,
- *   nothing in the per-frame critical path reads `g_app` by name —
- *   main() takes its address once and uses `app->...` from there on.
+ * g_app sits at file scope because the signal handlers get no argument
+ * and have no other way to reach these flags.
  */
 typedef struct {
-  Scene scene;                       /* full simulation state         */
-  Screen screen;                     /* terminal display geometry     */
-  int sim_fps;                       /* physics-step rate [Hz].
-                                      * Independent of TARGET_FPS (the
-                                      * render-frame cap) — the
-                                      * accumulator loop in main()
-                                      * runs `sim_fps` substeps per
-                                      * wall-clock second regardless of
-                                      * how fast frames render.       */
-  volatile sig_atomic_t running;     /* 0 → main loop exits next iter.
-                                      * Set by SIGINT/SIGTERM handler
-                                      * AND by the 'q'/ESC key path.   */
-  volatile sig_atomic_t need_resize; /* 1 → app_do_resize() runs next
-                                      * iter to rebuild Scene + Screen
-                                      * for the new terminal size.
-                                      * Set by the SIGWINCH handler.   */
+  Scene scene;   /* the whole simulation        */
+  Screen screen; /* current terminal size       */
+  int sim_fps;   /* physics steps per second; set apart from the render
+                  * frame rate so the wave advances the same amount of
+                  * sim time per second no matter how fast frames draw. */
+  volatile sig_atomic_t running;     /* set to 0 to make the loop quit on
+                                      * its next pass; flipped by the
+                                      * quit signal or the q/ESC key. */
+  volatile sig_atomic_t need_resize; /* set to 1 when the terminal was
+                                      * resized; the loop rebuilds for
+                                      * the new size on its next pass. */
 } App;
 
 static App g_app;
@@ -1796,21 +1212,14 @@ static void app_do_resize(App *app) {
   app->need_resize = 0;
 }
 
-/*
- * app_handle_key() — dispatch all user input in one place.
- *
- * Groups:
- *   flow control  — q, ESC, space, s (single step)
- *   excitation    — b (center), e (edge), f (double), m (resonance)
- *   physics       — c/C (wave speed), d/D (damping), n (BC)
- *   simulation    — r (reset), p/P (cycle preset)
- *   visual        — l (nodal), t (theme), ]/[ (sim Hz)
- */
+/* All keyboard handling in one place: each key either changes a setting,
+ * strikes the membrane, or controls the loop.  Returns false only on
+ * quit. */
 static bool app_handle_key(App *app, int ch) {
   Scene *s = &app->scene;
 
   switch (ch) {
-  /* ── flow control ───────────────────────────────────────────── */
+  /* ── flow control ── */
   case 'q':
   case 'Q':
   case 27:
@@ -1822,16 +1231,16 @@ static bool app_handle_key(App *app, int ch) {
 
   case 's':
   case 'S':
-    /* Single-step: pause if running, then request one tick.
-     * Useful for studying wave propagation frame by frame.     */
+    /* Pause, then ask for exactly one tick — lets you walk the wave
+     * forward a frame at a time. */
     s->paused = true;
     s->step_requested = true;
     break;
 
-  /* ── manual excitation ──────────────────────────────────────── */
+  /* ── manual strikes ── */
   case 'b':
   case 'B':
-    /* Center strike — works regardless of paused state */
+    /* Hit the centre — works even while paused. */
     apply_excitation((float)(g_grid.cols - 1) * 0.5f,
                      (float)(g_grid.rows - 1) * 0.5f, EXCITE_AMP,
                      EXCITE_RADIUS);
@@ -1859,20 +1268,18 @@ static bool app_handle_key(App *app, int ch) {
 
   case 'm':
   case 'M':
-    /* Advance the mode cycle BEFORE applying — first press picks
-     * k_mode_table[0] (an interesting non-fundamental mode), every
-     * subsequent press picks the next shape.  Clearing s->paused
-     * guarantees the user sees the new mode animate immediately,
-     * even if they pressed 's' (single-step) at some earlier point. */
+    /* Step to the next standing-wave shape, then paint it.  We move the
+     * list pointer first so the very first press already shows a shape,
+     * and we un-pause so it actually animates even if you'd been
+     * single-stepping. */
     s->mode_idx = (s->mode_idx + 1) % MODE_TABLE_LEN;
     s->paused = false;
     preset_apply(s, PRESET_RESONANCE);
     break;
 
-  /* ── wave speed (c) ─────────────────────────────────────────── *
-   * Increasing c raises all eigenfrequencies proportionally,
-   * shortening the oscillation period of every mode.
-   * The CFL_2D indicator shows how close to instability we are.  */
+  /* ── wave speed ── *
+   * Faster waves swing every shape quicker — but push too fast for the
+   * frame rate and it goes unstable; watch the stability light. */
   case 'c':
     s->wave_speed += WAVE_SPEED_STEP;
     if (s->wave_speed > WAVE_SPEED_MAX)
@@ -1884,10 +1291,9 @@ static bool app_handle_key(App *app, int ch) {
       s->wave_speed = WAVE_SPEED_MIN;
     break;
 
-  /* ── damping (γ) ────────────────────────────────────────────── *
-   * Higher damping drains energy faster; at max γ the wave
-   * decays in a handful of oscillation periods.
-   * At γ=0 the wave bounces indefinitely (ideal membrane).       */
+  /* ── damping ── *
+   * More damping makes strikes fade faster; at zero the wave rings on
+   * forever, like a perfect drumhead with no friction. */
   case 'd':
     s->damping += DAMPING_STEP;
     if (s->damping > DAMPING_MAX)
@@ -1899,17 +1305,16 @@ static bool app_handle_key(App *app, int ch) {
       s->damping = DAMPING_MIN;
     break;
 
-  /* ── boundary conditions ────────────────────────────────────── *
-   * Switching BC changes reflection behaviour immediately.
-   * After switching, trigger a fresh reset so the new BC applies
-   * to a clean grid (the old field may have incompatible values). */
+  /* ── edge rule ── *
+   * Cycle how the rim behaves on a bounce.  We replay the current
+   * strike on a clean grid so the new rule starts from a tidy state. */
   case 'n':
   case 'N':
     s->bc = (s->bc + 1) % BC_COUNT;
     preset_apply(s, s->preset_id);
     break;
 
-  /* ── reset / presets ────────────────────────────────────────── */
+  /* ── reset / presets ── */
   case 'r':
   case 'R':
     preset_apply(s, s->preset_id);
@@ -1922,7 +1327,7 @@ static bool app_handle_key(App *app, int ch) {
     preset_apply(s, (s->preset_id + PRESET_COUNT - 1) % PRESET_COUNT);
     break;
 
-  /* ── visual ─────────────────────────────────────────────────── */
+  /* ── visual ── */
   case 'l':
   case 'L':
     s->show_nodal = !s->show_nodal;
@@ -1933,10 +1338,9 @@ static bool app_handle_key(App *app, int ch) {
     s->theme = (s->theme + 1) % N_THEMES;
     break;
 
-  /* ── simulation Hz ──────────────────────────────────────────── *
-   * Changing sim_fps changes dt = 1/sim_fps, which changes CFL.
-   * Raising Hz shrinks dt → smaller CFL → safer but more CPU.
-   * Lowering Hz increases dt → larger CFL → may go unstable.    */
+  /* ── simulation rate ── *
+   * More steps per second use a smaller time slice: steadier and safer,
+   * but more work.  Fewer steps use a bigger slice and can go unstable. */
   case ']':
     app->sim_fps += SIM_FPS_STEP;
     if (app->sim_fps > SIM_FPS_MAX)
@@ -1954,11 +1358,9 @@ static bool app_handle_key(App *app, int ch) {
   return true;
 }
 
-/* ─────────────────────────────────────────────────────────────────────
- * main() — fixed-timestep accumulator game loop
- * Same structure as framework.c §8 main().  See that file for the
- * detailed walk-through of each loop phase.
- * ───────────────────────────────────────────────────────────────────── */
+/* The main loop.  It keeps sim time and real time in sync: each pass it
+ * runs as many fixed physics steps as the elapsed time calls for, draws
+ * a frame, then handles a keypress.  Same shape as framework.c's loop. */
 int main(void) {
   srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
   atexit(cleanup);
@@ -1981,21 +1383,21 @@ int main(void) {
 
   while (app->running) {
 
-    /* ── resize ──────────────────────────────────────────────── */
+    /* ── rebuild on resize ── */
     if (app->need_resize) {
       app_do_resize(app);
       frame_time = clock_ns();
       sim_accum = 0;
     }
 
-    /* ── dt measurement ──────────────────────────────────────── */
+    /* ── how much real time passed since last frame ── */
     int64_t now = clock_ns();
     int64_t dt = now - frame_time;
     frame_time = now;
     if (dt > 100 * NS_PER_MS)
-      dt = 100 * NS_PER_MS; /* pause guard */
+      dt = 100 * NS_PER_MS; /* cap it so a long pause can't fast-forward */
 
-    /* ── fixed-timestep accumulator ──────────────────────────── */
+    /* ── run physics in fixed steps to match that time ── */
     int64_t tick_ns = TICK_NS(app->sim_fps);
     float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
 
@@ -2005,10 +1407,11 @@ int main(void) {
       sim_accum -= tick_ns;
     }
 
-    /* ── render interpolation factor ─────────────────────────── */
+    /* leftover fraction of a step — would blend frames if anything slid
+     * smoothly here, but nothing does, so it's unused by the draw */
     float alpha = (float)sim_accum / (float)tick_ns;
 
-    /* ── FPS counter (500 ms sliding window) ─────────────────── */
+    /* ── fps counter, averaged over half a second ── */
     frame_count++;
     fps_accum += dt;
     if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -2018,16 +1421,16 @@ int main(void) {
       fps_accum = 0;
     }
 
-    /* ── frame cap — sleep BEFORE render ─────────────────────── */
+    /* ── hold the frame rate by sleeping before we draw ── */
     int64_t elapsed = clock_ns() - frame_time + dt;
     clock_sleep_ns(NS_PER_SEC / TARGET_FPS - elapsed);
 
-    /* ── draw + present ──────────────────────────────────────── */
+    /* ── draw the frame ── */
     screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps, alpha,
                 dt_sec);
     screen_present();
 
-    /* ── input ───────────────────────────────────────────────── */
+    /* ── read one keypress, if any ── */
     int ch = getch();
     if (ch != ERR && !app_handle_key(app, ch))
       app->running = 0;
